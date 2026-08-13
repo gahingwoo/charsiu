@@ -8,6 +8,22 @@ the execution path.
 being built from and the first thing it measured, both below. This file will say what
 runs the moment anything does.
 
+## On the name
+
+A 叉烧炉 is the oven; 叉烧 is what comes out of it. [kiln](https://github.com/gahingwoo/kiln)
+runs the **vendor** LLM stack on a mainline kernel and is the oven this was cooked
+in: it is what makes a vendor `.rkllm` readable, what a live dispatch is captured
+with, and the number this project has to beat. charsiu is meant to be the thing you
+actually eat, an open runtime with nothing closed left in the path.
+
+## The three repositories
+
+| repo | what it is |
+|---|---|
+| [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu) | the open RK3576 NPU driver and Mesa work: `rocket` upstream, and where every register name used here was established |
+| [kiln](https://github.com/gahingwoo/kiln) | the vendor RKLLM/RKNN stack on a mainline kernel. The measuring stick, and the capture harness |
+| **charsiu** | this one: an open LLM runtime on top of the open driver |
+
 ## Why this exists, and why it is not a port
 
 Two open stacks already drive a Rockchip NPU for LLM work, both on the **RK3588**:
@@ -83,9 +99,8 @@ and the driver plus the Mesa work it comes from is
 [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu), which is where the
 RK3576 register knowledge in this repository was established.
 
-[kiln](https://github.com/gahingwoo/kiln) is the other side of the same board: it runs
-the **vendor** RKLLM stack on a mainline kernel. That makes it the measuring stick here,
-and its capture patch is how a live dispatch is read when the file is not enough.
+kiln's `capture/rknpu-regcmd-dump.patch` is how a live vendor dispatch is read when
+the model file is not enough.
 
 ## Licence
 
