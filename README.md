@@ -10,11 +10,12 @@ runs the moment anything does.
 
 ## On the name
 
-A 叉烧炉 is the oven; 叉烧 is what comes out of it. [kiln](https://github.com/gahingwoo/kiln)
-runs the **vendor** LLM stack on a mainline kernel and is the oven this was cooked
-in: it is what makes a vendor `.rkllm` readable, what a live dispatch is captured
-with, and the number this project has to beat. charsiu is meant to be the thing you
-actually eat, an open runtime with nothing closed left in the path.
+Char siu is Cantonese barbecue pork, a staple of Hong Kong and Malaysia. A kiln is
+the oven it is roasted in. [kiln](https://github.com/gahingwoo/kiln) runs the
+**vendor** LLM stack on a mainline kernel and is that oven here: it is what makes a
+vendor `.rkllm` readable, what a live dispatch is captured with, and the number this
+project has to beat. charsiu is what comes out of it and what you actually eat, an
+open runtime with nothing closed left in the path.
 
 ## The three repositories
 
