@@ -10,7 +10,7 @@ runs the moment anything does.
 
 ## On the name
 
-Char siu is Cantonese barbecue pork, a staple of Hong Kong and Malaysia. A kiln is
+Char siu is Cantonese barbecue pork, eaten across Guangdong, Hong Kong and Malaysia. A kiln is
 the oven it is roasted in. [kiln](https://github.com/gahingwoo/kiln) runs the
 **vendor** LLM stack on a mainline kernel and is that oven here: it is what makes a
 vendor `.rkllm` readable, what a live dispatch is captured with, and the number this
