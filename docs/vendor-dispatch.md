@@ -99,6 +99,53 @@ unit, against 16 for int8 and 8 for fp16. That matches the RK3588 tile-layout ta
 exactly, which is a useful independent check that the IP-level layouts are shared and
 only the machine parameters differ.
 
+## The 12724 DPU-only streams are six programs
+
+Grouping them by their configuration registers rather than their shape, there are
+only **six** distinct kinds in the whole model:
+
+| 0x4010 | 0x4050 | entries | count | shape (ow, oh, oc) |
+|---|---|---:|---:|---|
+| a0000002 | 00023333 | 71 | 8268 | 1 x 1 x 1024 |
+| 40000002 | 00020000 | 87 | 4096 | 4 x 32 x 16 |
+| a0000005 | 00020000 | 31/33/35 | 320 | 96 and 64 wide |
+| 80000000 | 00027777 | 71 | 40 | 1 x 1 x 8160 |
+
+The first is the decode path's elementwise work: one pixel, 1024 channels, which is
+half the hidden size, matching the same two-core split the projections use. The last
+is the LM head's 8160 channels. So the vendor keeps the norms, the residual adds and
+the activations on the NPU rather than handing the vector back to the cores between
+projections.
+
+Note the high nibble of 0x4050 is 0 in all of them, where a regular convolution on
+this hardware carries 8. The DPU is being driven in a different mode here, and which
+mode is not decoded yet.
+
+## Attention is precompiled per KV length, one program every 32 tokens
+
+The 2908 fp16 attention dispatches have oc = 64, the head dimension, and their input
+channel count is the KV cache length. Those lengths are:
+
+```
+32, 64, 96, 128, ... 4032, 4064, 4096      128 buckets, every one a multiple of 32
+```
+
+That is the whole design in one line. The vendor cannot build a register program at
+run time, so it **ships one per 32 tokens of context**, up to 4096, per attention
+matmul. It is why a 1.3 GB file holds 21532 dispatch programs for a 1.2 GB model.
+
+An open runtime does not have to do this. Building the register stream is what the
+Mesa driver already does per operation, so charsiu can emit the exact geometry for
+the KV length it actually has, and neither pay for 128 buckets nor be capped at 4096.
+
+**And the M ladder goes below four.** The attention dispatches use M = 2, 3, 4, 5, 7
+and on up to 128. The RK3588 notes record that a feature height below four computes
+output uncorrelated with the reference, on every datatype, and that it is a hardware
+constraint rather than a stride bug. The RK3576 vendor dispatches heights of two and
+three as a matter of course. Either the constraint is not present on this chip or the
+vendor is configuring around it, and that is a question a single board round can
+answer.
+
 ## What this does not say
 
 - **Nothing about speed.** The file says what is dispatched, not how long it takes or
