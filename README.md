@@ -5,8 +5,9 @@ hardware through the mainline `rocket` DRM-accel driver with no vendor userspace
 the execution path.
 
 **Status: day one.** There is no runtime yet. What exists is the instrument this is
-being built from and the first thing it measured, both below. This file will say what
-runs the moment anything does.
+being built from, the first thing it measured, and one board result: **an LLM
+projection's shape computes on this NPU at M = 1**, which is the assumption the whole
+project rests on. Both below. This file will say what runs the moment anything does.
 
 ## On the name
 
@@ -51,6 +52,30 @@ but **"what does the RK3576 actually do, and can an open runtime match it"**. Th
 RK3576 is not the same machine: 1 MiB of CBUF against the RK3588's 384 KiB, two cores
 rather than three, a 16 bit task number, and a different weight tile stride. A
 negative result measured on the other chip is a hypothesis here, not a conclusion.
+
+### Measured on hardware, 2026-08-14
+
+Through the open driver and Mesa's own delegate, on a ROCK 4D, single 1x1
+convolutions at an LLM projection's shape:
+
+| shape | M | result |
+|---|---|---|
+| 512 to 1024 | 1 | 1024 of 1024 channels exact, 146 distinct values against the CPU's 146 |
+| 512 to 1024 | 2 | 1024 of 1024, 357 of them computed |
+| 512 to 1024 | 3 | 1024 of 1024, 416 computed |
+| 512 to 1024 | 4 | 1024 of 1024, 465 computed |
+| 512 to 1024 | 8 | 1024 of 1024, 518 computed |
+| 512 to 512 | 1 | 512 of 512 |
+| 256 to 1024 | 1 | 1024 of 1024 |
+
+**Heights of one, two and three are exact.** The RK3588 constraint is not on this
+silicon, which is what the vendor dispatching M = 1, 2 and 3 in its own `.rkllm`
+already implied. A one row surface has nothing to vary within a channel, so the
+evidence at M = 1 is the per channel match count and the distinct count; M = 2 and
+up carry the computed confirmation.
+
+What this does **not** yet say is anything about speed, or about int4. Both are the
+next board round.
 
 ## The instrument
 

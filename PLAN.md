@@ -28,6 +28,16 @@ Offline, and cheap.
   diff them against the file, so the ordering and the sync/broadcast entries the file
   does not resolve are known too.
 
+## 1b. M = 1 at an LLM's width (done, 2026-08-14)
+
+Answered before step 2 rather than inside it, because it was cheap: seven 1x1
+convolutions at 512 to 1024, 512 to 512 and 256 to 1024, walking M through 1, 2, 3,
+4 and 8, all exact through the open driver on a ROCK 4D. The RK3588 height-below-four
+constraint is not on this chip, so an LLM projection is a shape this hardware
+computes and the premise holds.
+
+Still unproven: **int4 weights**, and anything at all about **speed**.
+
 ## 2. Reproduce one vendor matmul, bit exact
 
 On the board, through mainline `rocket`.
@@ -41,8 +51,7 @@ The RK3576 pieces this needs are already established in the driver work: the wei
 tile layout, the CBUF row cost, the coefficient buffer alignment, the output channel
 pair rounding, and the split pair rule.
 
-What is new and unproven here: **int4 weights** and **M = 1**. Neither has ever been
-run on this board through the open path.
+What is new and unproven here is **int4 weights**. M = 1 was settled in 1b.
 
 ## 3. The measurement that decides the architecture
 
