@@ -19,6 +19,7 @@
  * ic = K, and never depthwise.
  */
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "charsiu.h"
@@ -80,7 +81,42 @@ static struct requant requant_of(const struct charsiu_job *job)
 
 	r.scale = scale;
 	r.shift = shift - 1;
-	r.offset = job->output_zero_point - 0x80;
+	/*
+	 * THE OUTPUT ZERO POINT, and a gap in what is understood.
+	 *
+	 * Mesa writes out_zp - 0x80 here and computes correctly, which reads as
+	 * the hardware adding an implicit 0x80 of its own. Board, round 152,
+	 * says otherwise for charsiu's configuration: with the input held at the
+	 * zero point so the MAC is exactly zero, a bias ramp came back as the
+	 * requantised ramp with NO zero point added, its negative half clamped
+	 * at zero, its slope right to within rounding.
+	 *
+	 * So the measurement says out_zp and the port says out_zp - 0x80, and
+	 * both cannot be right about the same hardware. Rather than pick by
+	 * argument, CHARSIU_OUT_OFF overrides it and the round runs both.
+	 */
+	{
+		const char *o = getenv("CHARSIU_OUT_OFF");
+
+		/*
+		 * MEASURED, round 155. The hardware computes
+		 *
+		 *     out = clamp(requant(acc + A) - offset, 0, 255)
+		 *
+		 * so the register is an output domain addend with the sign the
+		 * other way round from the name it was given here. Sweeping it
+		 * on a bias ramp: 0 caps the output at 127 and loses the top
+		 * half of the byte, -128 gives the full 0 to 255 with every
+		 * value exactly 128 higher, and +127 or +128 saturate the whole
+		 * surface flat.
+		 *
+		 * -0x80 is therefore what makes the byte reachable, and the
+		 * output zero point rides in A only for the part that is not
+		 * this 128. For an output zero point of 128 that is nothing at
+		 * all, which is why the fold is off by default now.
+		 */
+		r.offset = o ? (int32_t)strtol(o, NULL, 0) : -0x80;
+	}
 	return r;
 }
 
@@ -121,7 +157,29 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
 
 size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 {
-	return table_bytes(mm) + scale_table_bytes(mm) + 4;
+	/*
+	 * THE BUFFER IS FAR BIGGER THAN WHAT IS WRITTEN INTO IT, and that is not
+	 * slack, it is the difference between computing and hanging.
+	 *
+	 * The DPU_RDMA reads a per channel float surface from 0x5024 onwards for
+	 * all output channels, and it reads it whether or not anything put data
+	 * there. Under allocate and the read runs off the end of the buffer
+	 * object, the IOMMU faults, the RDMA stalls, and the job times out with
+	 * every register correct. The driver work hit exactly this and wrote it
+	 * down: a coefficient buffer of 1280 bytes against a read of 20800 was
+	 * the whole of one wall.
+	 *
+	 * The size is the record table plus a float region bounded by the weight
+	 * count, floored at 8192 floats because a small matmul's own weight
+	 * count under-allocates it, plus a page of margin. Round 147 gave this
+	 * buffer 4.7 KB where the hardware reads 33 KB, and the symptom was a
+	 * job that timed out with a register stream identical to Mesa's.
+	 */
+	size_t elems = (size_t)mm->k * mm->n;
+
+	if (elems < 8192)
+		elems = 8192;
+	return table_bytes(mm) + elems * sizeof(float) + 0x100;
 }
 
 void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
@@ -146,7 +204,34 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 		 * sum((in - in_zp)(w - wt_zp)), and the difference is a per
 		 * channel constant, (in_zp - 0x80) times the weight sum.
 		 */
-		*a = bias[oc] - (job->input_zero_point - 0x80) * weight_sums[oc];
+		/*
+		 * A carries the bias, the input zero point correction, AND the
+		 * OUTPUT zero point.
+		 *
+		 * The last of those is a measured workaround, not an
+		 * understanding. Board, round 152: with the MAC held at exactly
+		 * zero, the output came back as the requantised bias with no
+		 * zero point added, its negative half clamped at zero. Round
+		 * 153 then wrote the zero point into 0x40ac directly and the
+		 * whole surface saturated to a flat 127, so that register is
+		 * not an output domain addend, whatever it is.
+		 *
+		 * A is added to the accumulator before the requant, so adding
+		 * out_zp / mult there puts out_zp on the output exactly, in
+		 * integer arithmetic. It costs one rounding at the edge and it
+		 * is honest about being a workaround: Mesa writes out_zp - 0x80
+		 * into 0x40ac and is byte exact on models with both zero
+		 * points, so there is something about that register this does
+		 * not yet know.
+		 */
+		float mult = job->input_scale * job->weight_scale /
+			     job->output_scale;
+
+		*a = bias[oc] - (job->input_zero_point - 0x80) * weight_sums[oc]
+		   + (getenv("CHARSIU_ZP_FOLD")
+		      ? (int32_t)((float)(job->output_zero_point - 0x80) / mult
+				  + 0.5f)
+		      : 0);
 		*b = (int16_t)(0x80 - job->weight_zero_point);
 		*c = 16;                /* per tensor: every channel at the max */
 	}
@@ -164,6 +249,8 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 			*(int16_t *)(dst + lg * 64 + 48 + li * 2);
 	}
 
+	/* The scale table and the operand live between the record table and the
+	 * float region, which the size above covers with room to spare. */
 	scales = (uint16_t *)(dst + tb);
 	for (oc = 0; oc < sb / 2; oc++)
 		scales[oc] = float_to_half(job->weight_scale);
@@ -192,11 +279,22 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * carry 0x0e in each. */
 	emit(&e, CNA, 0x1004, 0x0000000e);
 	emit(&e, CORE, 0x3004, 0x0000000e);
+	emit(&e, CNA, 0x1038, 0x00000007);
 	emit(&e, DPU, 0x4004, 0x0000000e);
 	emit(&e, RDMA, 0x5004, 0x0000000e);
-	emit(&e, CNA, 0x1038, 0x00000007);
+	/*
+	 * CONV_CON1. Zero for a plain int8 convolution, and the fp16 processing
+	 * precision when the activations are 16 bit.
+	 *
+	 * This used to carry the vendor's own value, 0x00600120 on its int4
+	 * projections and 0x20200120 on its fp16 attention, copied because it
+	 * was not decoded. On an int8 job Mesa's proven path writes ZERO here,
+	 * and round 144's stream diff caught it: charsiu was asking for a
+	 * precision mode its operands were not in. Copying a constant from a
+	 * different regime is not the same as not guessing.
+	 */
 	emit(&e, CNA, 0x100c,
-	     mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x20200120u);
+	     mm->adtype == CHARSIU_FP16 ? (2u << 12) : 0x00000000u);
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
 	emit(&e, CNA, 0x1018, 0x40000404);
@@ -205,8 +303,24 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1024, n_pad - 1);
 	emit(&e, CNA, 0x1028, ((surf * rows) << 16) | (mm->k - 1));
 	emit(&e, CNA, 0x102c, rows - 1);        /* (width - 1) << 16 is zero */
-	emit(&e, CNA, 0x1030, ((uint32_t)(wbytes / n_pad) << 16) | 0);
+	/*
+	 * Bytes per kernel, DOUBLED for int8 and not for int4.
+	 *
+	 * The vendor's int4 projections carry it undoubled, which is where the
+	 * "never doubled" reading came from, and Mesa's int8 stream for the very
+	 * same shape carries twice the kernel size: 0x80 against our 0x40 at
+	 * K=64. Both are right for their own precision.
+	 */
+	emit(&e, CNA, 0x1030,
+	     ((uint32_t)(wbytes / n_pad * (mm->wdtype == CHARSIU_INT4 ? 1u : 2u))
+	      << 16) | 0);
 	emit(&e, CNA, 0x1034, rows - 1);
+	/* Mesa writes 0x1038 a SECOND time here, after the geometry and before
+	 * the surface stride, and that is the only ordering difference the
+	 * stream diff had left. Matched rather than reasoned about: the value is
+	 * the same both times, so the position is the only thing it can be
+	 * carrying. */
+	emit(&e, CNA, 0x1038, 0x00000007);
 	emit(&e, CNA, 0x103c, surf << 16);
 	emit(&e, CNA, 0x1040, 0x10000000);
 	emit(&e, CNA, 0x1044, (1u << 16) | surf);
@@ -223,7 +337,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x108c, 0x000f000f);
 	emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
 	emit(&e, CNA, 0x1094, rows);            /* inw * full_inh */
-	emit(&e, CNA, 0x1098, rows);
+	/*
+	 * Rounded UP to a multiple of four. The vendor's single row matmuls
+	 * carry a plain 1 here and Mesa's working stream for the same shape
+	 * carries 4, so the hardware takes either and Mesa's is the one proven
+	 * on this path.
+	 */
+	emit(&e, CNA, 0x1098, (rows * 1 + 3) & ~3u);
 	emit(&e, CNA, 0x109c, 0x00000000);
 	emit(&e, CNA, 0x1100, 0x00000000);
 	emit(&e, CNA, 0x1104, 0x00000000);
@@ -246,9 +366,27 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4024, lines);
 	emit(&e, DPU, 0x4028, 0x00000000);
 	emit(&e, DPU, 0x402c, mm->n - 1);
-	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) | 0x0710);
+	/*
+	 * 0x4030's low half. Mesa uses 0x0710 for a regular convolution and
+	 * 0x0310 for a depthwise one, and the VENDOR'S OWN MATMULS use 0x0310:
+	 * it is the only DPU register its convolution streams carry at all, and
+	 * it reads 0x03ff0310 at 1024 output channels and 0x003f0310 at 64.
+	 *
+	 * That matters here because the output stage is where charsiu is stuck:
+	 * the requant result is clamped into 0 to 127 before the offset is
+	 * applied, and this field is on the output side of the same unit.
+	 */
+	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) |
+	     (uint32_t)(getenv("CHARSIU_DPU_4030")
+			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
+			: 0x0710u));
 	emit(&e, DPU, 0x4034, (lines << 16) | 0);
-	emit(&e, DPU, 0x4038, 0x00120080);
+	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
+	 * here, but those are elementwise ops rather than convolutions, so it
+	 * is a candidate to sweep and not a value to copy. */
+	emit(&e, DPU, 0x4038, (uint32_t)(getenv("CHARSIU_DPU_4038")
+					 ? strtoul(getenv("CHARSIU_DPU_4038"), NULL, 0)
+					 : 0x00120080u));
 	emit(&e, DPU, 0x403c, 0x00000000);
 	emit(&e, DPU, 0x4044, 0x00000001);
 	emit(&e, DPU, 0x4048, 0x80000000);
@@ -327,17 +465,22 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * stall on the way down.
 	 *
 	 * Each unit is enabled at its OWN op enable with the 0x1d mask, in
-	 * REVERSE data flow order so the downstream units are ready before the
-	 * input DMA starts feeding them. The broadcast form, target 0x81 on the
-	 * PC's own enable, restarts the program counter mid stream and engages
-	 * the units before the geometry is committed, which runs them on an
-	 * empty window. Both of those were established on hardware in the
-	 * driver work; this is the form that computes.
+	 * FORWARD order: CNA, CORE, DPU, RDMA. The broadcast form, target 0x81
+	 * on the PC's own enable, restarts the program counter mid stream and
+	 * engages the units before the geometry is committed, which runs them on
+	 * an empty window.
+	 *
+	 * This was written in REVERSE order first, from a comment in the driver
+	 * describing what the NVDLA programming guide asks for. That comment
+	 * belongs to a KNOB. The default, and the order in the stream that
+	 * computes on this hardware, is forward, and the stream diff is what
+	 * said so. Reasoning from a comment about an option is not the same as
+	 * matching what runs.
 	 */
-	emit(&e, DPU, 0x4008, 0x0000001d);      /* output first */
+	emit(&e, CNA, 0x1008, 0x0000001d);
+	emit(&e, CORE, 0x3008, 0x0000001d);
+	emit(&e, DPU, 0x4008, 0x0000001d);
 	emit(&e, RDMA, 0x5008, 0x0000001d);
-	emit(&e, CORE, 0x3008, 0x0000001d);     /* the MAC */
-	emit(&e, CNA, 0x1008, 0x0000001d);      /* input LAST */
 
 	return e.n > max ? 0 : e.n;
 }

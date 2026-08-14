@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "charsiu.h"
@@ -34,6 +35,7 @@
 
 struct charsiu_device {
 	int fd;
+	struct charsiu_bo reserve;   /* holds IOVA 0 so nothing real lands there */
 };
 
 struct charsiu_device *charsiu_open(const char *path)
@@ -51,6 +53,23 @@ struct charsiu_device *charsiu_open(const char *path)
 		return NULL;
 	}
 	dev->fd = fd;
+
+	/*
+	 * Burn the first allocation.
+	 *
+	 * rocket hands out IOVA from a per fd drm_mm started at the IOMMU
+	 * aperture, so the FIRST buffer object of an fd sits at address 0. That
+	 * is a legal address for data, but the program counter is pointed at
+	 * the register stream by writing its address into BASE_ADDRESS, and a
+	 * stream at 0 is the one thing that cannot be told from an unset
+	 * pointer. Mesa never meets this because it has allocated a dozen
+	 * buffers before it builds a stream.
+	 *
+	 * Round 146 had a stream identical to Mesa's, entry for entry, and still
+	 * timed out with its register stream at IOVA 0. Holding the address
+	 * costs one page and removes the question.
+	 */
+	charsiu_bo_alloc(dev, 4096, &dev->reserve);
 	return dev;
 }
 
@@ -58,6 +77,7 @@ void charsiu_close(struct charsiu_device *dev)
 {
 	if (!dev)
 		return;
+	charsiu_bo_free(dev, &dev->reserve);
 	close(dev->fd);
 	free(dev);
 }
@@ -99,6 +119,23 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 		    int64_t timeout_ns)
 {
 	struct drm_rocket_prep_bo req = { 0 };
+	struct timespec now;
+
+	/*
+	 * THE KERNEL WANTS AN ABSOLUTE DEADLINE, not a duration.
+	 * drm_timeout_abs_to_jiffies() reads this field as CLOCK_MONOTONIC
+	 * nanoseconds, so passing a duration asks it to wait until a moment
+	 * that has already gone, it computes a timeout of zero, and the wait
+	 * returns -EBUSY immediately without waiting for anything.
+	 *
+	 * Round 148: every one of charsiu's submits reported "wait FAILED -16"
+	 * and that was read as the job hanging. The job may well have been
+	 * running; the tool then exited, closing the fd and tearing down the
+	 * buffers under an NPU that was still reading them. This function takes
+	 * a duration, which is what a caller means, and converts it.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	timeout_ns += (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
 
 	req.handle = bo->handle;
 	req.timeout_ns = timeout_ns;

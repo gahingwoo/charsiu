@@ -11,13 +11,16 @@ CROSS  ?= $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-bui
 
 SRC    := src/regcmd.c src/device.c src/job.c
 
-all: $(BUILD)/emit_dump
+all: $(BUILD)/emit_dump $(BUILD)/emit_job
 
 $(BUILD):
 	@mkdir -p $(BUILD)
 
 $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64
 

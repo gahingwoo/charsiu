@@ -87,6 +87,51 @@ int main(int argc, char **argv)
 	for (i = 0; i < m * k; i++) a_raw[i] = (uint8_t)(128 + (int)(i * 7 % 61) - 30);
 	for (i = 0; i < n * k; i++) b_raw[i] = (uint8_t)(128 + (int)(i * 13 % 41) - 20);
 	for (i = 0; i < n; i++) bias[i] = (int)i * 3 - 40;
+
+	/*
+	 * CHARSIU_IMPULSE: one live weight per output channel and a zero bias,
+	 * so output channel c is input channel c mod K and nothing else.
+	 *
+	 * A dense matmul that comes out wrong cannot say WHICH of the two
+	 * packings is wrong, or whether it is the arithmetic. An impulse can:
+	 * the output IS the layout, read directly. This is the probe that
+	 * decoded the weight layout for the Mesa driver, and the reason it works
+	 * is that a single live tap has nothing to sum and nothing to cancel.
+	 */
+	/*
+	 * CHARSIU_CONST: every input byte at the zero point and a bias ramp.
+	 *
+	 * The MAC computes sum((in - 0x80) * w), so an input held at 0x80 makes
+	 * it exactly zero by construction whatever the weights are, and the
+	 * output can only be requant(A). Walking the bias then draws the whole
+	 * output stage as a line: its slope is the scale and its intercept is
+	 * the offset, both solved rather than guessed.
+	 *
+	 * This is how the driver work calibrated the same stage. It is worth
+	 * more than another reading of the formula, because it does not depend
+	 * on any layout being right.
+	 */
+	if (getenv("CHARSIU_CONST")) {
+		unsigned c;
+
+		for (i = 0; i < m * k; i++)
+			a_raw[i] = (uint8_t)job.input_zero_point;
+		for (c = 0; c < n; c++)
+			bias[c] = (int)c * 2000 - 60000;
+		printf("const: input at the zero point, bias ramp %d..%d\n",
+		       bias[0], bias[n - 1]);
+	}
+
+	if (getenv("CHARSIU_IMPULSE")) {
+		unsigned c, j;
+
+		for (c = 0; c < n; c++)
+			for (j = 0; j < k; j++)
+				b_raw[c * k + j] =
+					(uint8_t)(j == c % k ? 128 + 100 : 128);
+		memset(bias, 0, n * sizeof(*bias));
+		printf("impulse: weight[c][c mod K] live, bias zero\n");
+	}
 	for (i = 0; i < n; i++) {
 		unsigned j;
 		for (j = 0; j < k; j++)
@@ -161,6 +206,8 @@ int main(int argc, char **argv)
 	in_handles[1] = wt.handle;
 	in_handles[2] = coef.handle;
 	out_handles[0] = outbo.handle;
+	if (!regcmd.dma_address)
+		printf("WARNING: the register stream is at IOVA 0\n");
 	ret = charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles, 3,
 			     out_handles, 1);
 	if (ret) { printf("submit FAILED %d\n", ret); return 1; }
@@ -179,11 +226,59 @@ int main(int argc, char **argv)
 	}
 	printf("output: %u of %u bytes written, %u differ from the CPU by more than 1\n",
 	       nonzero, m * n, bad);
-	printf("  npu[0..7] ");
-	for (i = 0; i < 8 && i < m * n; i++) printf("%4u", ((uint8_t *)outbo.map)[i]);
-	printf("\n  cpu[0..7] ");
-	for (i = 0; i < 8 && i < m * n; i++) printf("%4u", ref[i]);
+	printf("  npu[0..15] ");
+	for (i = 0; i < 16 && i < m * n; i++) printf("%4u", ((uint8_t *)outbo.map)[i]);
+	printf("\n  cpu[0..15] ");
+	for (i = 0; i < 16 && i < m * n; i++) printf("%4u", ref[i]);
 	printf("\n");
+	/* Where the npu's own values sit, which says whether it computed
+	 * something wrong or nothing at all. */
+	{
+		unsigned lo = 255, hi = 0, seen[256] = { 0 }, distinct = 0;
+
+		for (i = 0; i < m * n; i++) {
+			uint8_t v = ((uint8_t *)outbo.map)[i];
+
+			if (v < lo) lo = v;
+			if (v > hi) hi = v;
+			if (!seen[v]++) distinct++;
+		}
+		printf("  npu range %u..%u, %u distinct\n", lo, hi, distinct);
+	}
+	/*
+	 * The WHOLE output when it is small enough to read. A ramp that comes
+	 * back with its first channels flat and its variation somewhere else is
+	 * a layout that moved, not a scale that changed, and only the whole
+	 * vector tells those apart.
+	 */
+	if (m * n <= 128) {
+		printf("  npu all:");
+		for (i = 0; i < m * n; i++)
+			printf("%s%4u", i % 16 ? "" : "\n         ",
+			       ((uint8_t *)outbo.map)[i]);
+		printf("\n  cpu all:");
+		for (i = 0; i < m * n; i++)
+			printf("%s%4u", i % 16 ? "" : "\n         ", ref[i]);
+		printf("\n");
+	}
+	{
+		/* A least squares fit of the npu against the reference, which
+		 * turns "wrong" into a slope and an intercept. A slope of one
+		 * with a nonzero intercept is an offset; a slope that is a
+		 * power of two is a shift. */
+		double sx = 0, sy = 0, sxx = 0, sxy = 0, nn = m * n, den;
+
+		for (i = 0; i < m * n; i++) {
+			double x = ((uint8_t *)outbo.map)[i], y = ref[i];
+
+			sx += x; sy += y; sxx += x * x; sxy += x * y;
+		}
+		den = nn * sxx - sx * sx;
+		if (den != 0)
+			printf("  fit cpu = %.4f * npu + %.2f\n",
+			       (nn * sxy - sx * sy) / den,
+			       (sy * sxx - sx * sxy) / den);
+	}
 	charsiu_bo_fini(dev, &outbo);
 	charsiu_close(dev);
 	return bad ? 1 : 0;

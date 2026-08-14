@@ -184,7 +184,24 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 				   + (size_t)(n % ng) * kgsz
 				   + (k % kg);
 
-			dst[off] = src[(size_t)n * mm->k + k];
+			/*
+			 * STORED BIASED BY -0x80, as a signed byte.
+			 *
+			 * The MAC computes sum((in - 0x80) * w_stored) with the
+			 * input taken raw and the weight taken as it lies, so
+			 * the weight has to carry its own subtraction. Storing
+			 * the raw uint8 instead makes a weight at the zero
+			 * point, 128, read as -128, and every dead tap in an
+			 * impulse then contributes the largest negative value
+			 * a byte has.
+			 *
+			 * Board, round 150: with the raw form, an impulse whose
+			 * every output channel has exactly one live weight came
+			 * back all zeros, because the live taps were swamped
+			 * and clamped. Mesa's line, one file over, is
+			 * weights_out[n] = weights_in[...] - 0x80.
+			 */
+			dst[off] = (uint8_t)(src[(size_t)n * mm->k + k] - 0x80);
 		}
 	}
 }
