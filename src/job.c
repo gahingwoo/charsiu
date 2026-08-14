@@ -187,8 +187,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	size_t wbytes = charsiu_weight_bytes(mm);
 	unsigned r;
 
+	/* The S_POINTER each unit latches its geometry against. Every unit gets
+	 * it, not just the CNA: mesa writes all four and the vendor's streams
+	 * carry 0x0e in each. */
 	emit(&e, CNA, 0x1004, 0x0000000e);
 	emit(&e, CORE, 0x3004, 0x0000000e);
+	emit(&e, DPU, 0x4004, 0x0000000e);
+	emit(&e, RDMA, 0x5004, 0x0000000e);
 	emit(&e, CNA, 0x1038, 0x00000007);
 	emit(&e, CNA, 0x100c,
 	     mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x20200120u);
@@ -294,6 +299,25 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, RDMA, 0x5020, job->coef_addr);
 	emit(&e, RDMA, 0x5024, job->coef_addr +
 	     (uint32_t)(table_bytes(mm) + scale_table_bytes(mm)));
+
+	/*
+	 * ENGAGE THE UNITS. Without this nothing runs: round 141 submitted a
+	 * complete and correct looking stream with no op enable in it, the
+	 * kernel accepted it, and the job timed out with the IOMMU failing its
+	 * stall on the way down.
+	 *
+	 * Each unit is enabled at its OWN op enable with the 0x1d mask, in
+	 * REVERSE data flow order so the downstream units are ready before the
+	 * input DMA starts feeding them. The broadcast form, target 0x81 on the
+	 * PC's own enable, restarts the program counter mid stream and engages
+	 * the units before the geometry is committed, which runs them on an
+	 * empty window. Both of those were established on hardware in the
+	 * driver work; this is the form that computes.
+	 */
+	emit(&e, DPU, 0x4008, 0x0000001d);      /* output first */
+	emit(&e, RDMA, 0x5008, 0x0000001d);
+	emit(&e, CORE, 0x3008, 0x0000001d);     /* the MAC */
+	emit(&e, CNA, 0x1008, 0x0000001d);      /* input LAST */
 
 	return e.n > max ? 0 : e.n;
 }
