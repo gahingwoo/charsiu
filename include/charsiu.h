@@ -101,6 +101,45 @@ size_t charsiu_weight_bytes(const struct charsiu_matmul *mm);
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
 
 
+
+/* ---- a complete, submittable stream --------------------------------------- */
+
+/*
+ * Everything a real submit needs beyond the geometry: where the operands are,
+ * and how the accumulator becomes an output byte.
+ *
+ * The register values behind this come from the Mesa Teflon driver's RK3576
+ * path in linux-rk3576-npu, which is verified byte exact on this silicon over
+ * a long series of board rounds. They are ported rather than re-derived: a
+ * value nobody can point at the origin of is exactly what this project refuses
+ * to write.
+ */
+struct charsiu_job {
+	struct charsiu_matmul mm;
+
+	uint32_t input_addr;         /* A, in the NPU address space */
+	uint32_t weight_addr;        /* B, packed */
+	uint32_t output_addr;        /* C */
+	uint32_t coef_addr;          /* the per channel record table */
+
+	float input_scale;
+	float weight_scale;
+	float output_scale;
+	int input_zero_point;
+	int weight_zero_point;
+	int output_zero_point;
+};
+
+/* The whole stream, addresses and requant included. */
+size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max);
+
+/* Build the coefficient buffer the DPU reads: the per channel A/B/C records,
+ * the fp16 scale table, and the second operand word after it. Without it the
+ * convolution comes back empty. */
+size_t charsiu_coef_bytes(const struct charsiu_matmul *mm);
+void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
+			 const int32_t *weight_sums, uint8_t *dst);
+
 /* ---- the device ---------------------------------------------------------- */
 
 struct charsiu_device;

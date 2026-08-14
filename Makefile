@@ -9,20 +9,23 @@ CFLAGS ?= -O2 -Wall -Wextra -std=c11 -Iinclude
 BUILD  := build
 CROSS  ?= $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 
-SRC    := src/regcmd.c src/device.c
+SRC    := src/regcmd.c src/device.c src/job.c
 
 all: $(BUILD)/emit_dump
 
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-$(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c | $(BUILD)
+$(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 
-board: $(BUILD)/charsiu_probe.aarch64
+board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64
 
 $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^
+
+$(BUILD)/charsiu_matmul.aarch64: tools/charsiu_matmul.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
 clean:
 	rm -rf $(BUILD)
