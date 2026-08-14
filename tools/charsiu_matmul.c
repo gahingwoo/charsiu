@@ -13,8 +13,8 @@
  * beside the failure.
  */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "charsiu.h"
 
@@ -137,6 +137,25 @@ int main(int argc, char **argv)
 	charsiu_bo_fini(dev, &regcmd);
 	if (!nreg) { printf("emit FAILED\n"); return 1; }
 	printf("register stream: %zu entries\n", nreg);
+
+	/*
+	 * With CHARSIU_DUMP set, print the stream in the same format the Mesa
+	 * driver's ROCKET_DUMP_REGCMD uses, so the two can be diffed line for
+	 * line on a shape both can run. Three rounds of adding what looked
+	 * missing did not find why the job hangs; a value diff against a stream
+	 * that is known to compute will.
+	 */
+	if (getenv("CHARSIU_DUMP")) {
+		charsiu_bo_prep(dev, &regcmd, 1000000000);
+		for (i = 0; i < nreg; i++) {
+			uint64_t ent = ((uint64_t *)regcmd.map)[i];
+
+			printf("CS %02u t=%04x r=%04x v=%08x\n", i,
+			       (unsigned)(ent >> 48), (unsigned)(ent & 0xffff),
+			       (unsigned)((ent >> 16) & 0xffffffff));
+		}
+		charsiu_bo_fini(dev, &regcmd);
+	}
 
 	in_handles[0] = in.handle;
 	in_handles[1] = wt.handle;
