@@ -4,10 +4,29 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status: day one.** There is no runtime yet. What exists is the instrument this is
-being built from, the first thing it measured, and one board result: **an LLM
-projection's shape computes on this NPU at M = 1**, which is the assumption the whole
-project rests on. Both below. This file will say what runs the moment anything does.
+**Status.** charsiu reaches the NPU on its own and computes. It opens
+`/dev/accel/accel0` through the mainline `rocket` driver, packs the operands into the
+hardware's tile layouts, builds the coefficient buffer, emits the register stream,
+submits it, and gets back an answer that tracks a CPU reference to within about three
+counts. No Mesa, no vendor runtime, nothing borrowed at run time.
+
+It is not a runtime yet. What is left, and it has a name:
+
+- the output floors at the zero point, because the hardware's **fused ReLU** is on and
+  this silicon applies it AT the zero point. Every Teflon model carries a ReLU, so the
+  Mesa driver has never had to turn it off; a matmul must, since a projection's output
+  is signed. Finding that enable is the current work.
+- the reference still requantises in float where the hardware uses an integer scale
+  and shift, which is most of the three counts.
+- **int4 is deliberately not written.** Its N group of 64 is copied from the RK3588
+  notes and has never been confirmed on this silicon, and a `.rkllm` gives geometry
+  rather than layout. int8 and fp16 are enough to prove the path and to time it.
+
+The three tools that got it there are in the repository rather than in a shell history,
+because every step that worked was a diff against something known to compute:
+`tools/rkllm_regcmd.py` reads the vendor's own dispatches out of a `.rkllm`,
+`tools/cmp_vendor.py` diffs charsiu's stream against them, and `tools/emit_job.c`
+prints charsiu's stream on a desktop so a change to it costs no board round.
 
 ## On the name
 
@@ -76,6 +95,25 @@ up carry the computed confirmation.
 
 What this does **not** yet say is anything about speed, or about int4. Both are the
 next board round.
+
+## What runs today
+
+```
+$ charsiu_probe
+open /dev/accel/accel0 ok
+bo handle 1  dma 0x1000  size 4096  in the regcmd window
+write/readback through the mapping: ok (0 bytes differ)
+
+$ charsiu_matmul 1 64 64          # M=1, the shape an LLM decodes with
+matmul M=1 K=64 N=64 int8, feature atom 16, 1 entries per row
+register stream: 143 entries
+submit ok
+output: 64 of 64 bytes written
+```
+
+The stream those 143 entries make is identical to the one Mesa emits for the same
+shape, entry for entry, values and order, addresses and quantisation aside. That is
+checked on a desktop, not on the board.
 
 ## The instrument
 
