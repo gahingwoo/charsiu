@@ -9,6 +9,13 @@
  * trips. Nothing here computes anything. It fails loudly if the IOVA is above
  * the 32 bit window a register stream can address, because that is a real limit
  * and a confusing one to hit later.
+ *
+ * Board, round 140: the first BO comes back at IOVA 0, and that is correct. The
+ * driver hands out addresses from a per fd drm_mm started at the IOMMU
+ * aperture, so ZERO IS A VALID ADDRESS HERE. An address register reading 0
+ * cannot be taken to mean unset on this driver, which is the opposite of how
+ * the same zero reads in a vendor model file, where it is an unpatched
+ * placeholder.
  */
 #include <stdio.h>
 #include <string.h>
@@ -35,9 +42,11 @@ int main(int argc, char **argv)
 		printf("create bo FAILED: %d\n", ret);
 		return 1;
 	}
-	printf("bo handle %u  dma 0x%llx  size %zu  %s\n", bo.handle,
+	printf("bo handle %u  dma 0x%llx  size %zu  %s%s\n", bo.handle,
 	       (unsigned long long)bo.dma_address, bo.size,
-	       (bo.dma_address >> 32) ? "ABOVE the 32 bit regcmd window" : "in the regcmd window");
+	       (bo.dma_address >> 32) ? "ABOVE the 32 bit regcmd window"
+				      : "in the regcmd window",
+	       bo.dma_address ? "" : "  (zero is a valid IOVA here)");
 
 	ret = charsiu_bo_prep(dev, &bo, 1000000000);
 	if (ret) {
