@@ -299,6 +299,26 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, RDMA, 0x5020, job->coef_addr);
 	emit(&e, RDMA, 0x5024, job->coef_addr +
 	     (uint32_t)(table_bytes(mm) + scale_table_bytes(mm)));
+	/*
+	 * The rest of the DPU_RDMA. Round 142 emitted the first seven of these
+	 * and stopped, and the job timed out: the unit that fetches the per
+	 * channel records was half configured, so the DPU waited for data that
+	 * never arrived. A stream can be geometrically perfect, engage every
+	 * unit, and still hang on the one unit nobody finished programming.
+	 */
+	emit(&e, RDMA, 0x5028, 0x00000000);
+	emit(&e, RDMA, 0x502c, 0x00000000);
+	emit(&e, RDMA, 0x5030, 0x00000000);
+	emit(&e, RDMA, 0x5034, 0x00000041);
+	emit(&e, RDMA, 0x5038, 0x00000000);
+	emit(&e, RDMA, 0x5040, 0x00000000);
+	emit(&e, RDMA, 0x5044, 0x40000010);
+	emit(&e, RDMA, 0x5048, 0x00000000);
+	emit(&e, RDMA, 0x504c, 0x00000000);
+	emit(&e, RDMA, 0x5064, 0x00000000);
+	emit(&e, RDMA, 0x506c, 0x00000000);
+	emit(&e, RDMA, 0x5078, 0x00000000);
+	emit(&e, RDMA, 0x507c, 0x00000000);
 
 	/*
 	 * ENGAGE THE UNITS. Without this nothing runs: round 141 submitted a
