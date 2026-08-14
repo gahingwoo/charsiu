@@ -100,6 +100,36 @@ size_t charsiu_weight_bytes(const struct charsiu_matmul *mm);
  * unit holding exactly three atoms does not pack and costs a whole unit. */
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
 
+
+/* ---- the device ---------------------------------------------------------- */
+
+struct charsiu_device;
+
+struct charsiu_bo {
+	uint32_t handle;
+	uint64_t dma_address;   /* what a register in the stream points at */
+	size_t size;
+	void *map;              /* the CPU mapping; valid between prep and fini */
+};
+
+struct charsiu_device *charsiu_open(const char *path);
+void charsiu_close(struct charsiu_device *dev);
+
+int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo *bo);
+void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo);
+
+/* Take CPU ownership before touching bo->map, and give it back before submitting.
+ * These are the cache maintenance; skipping them returns stale data rather than
+ * failing. */
+int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
+		    int64_t timeout_ns);
+int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo);
+
+int charsiu_submit(struct charsiu_device *dev, const struct charsiu_bo *regcmd,
+		   unsigned regcmd_count, const uint32_t *in_handles,
+		   unsigned in_count, const uint32_t *out_handles,
+		   unsigned out_count);
+
 #ifdef __cplusplus
 }
 #endif
