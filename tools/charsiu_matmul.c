@@ -51,9 +51,15 @@ static int cpu_reference(const struct charsiu_job *job, const uint8_t *a,
 			int64_t acc = bias[n];
 			float v;
 
-			for (k = 0; k < mm->k; k++)
+			for (k = 0; k < mm->k; k++) {
+				int w = (int)b[n * mm->k + k];
+
+				/* a nibble is two's complement in four bits */
+				if (mm->wdtype == CHARSIU_INT4)
+					w = (w & 0x8) ? (w & 0xf) - 16 : (w & 0xf);
 				acc += ((int)a[m * mm->k + k] - job->input_zero_point) *
-				       ((int)b[n * mm->k + k] - job->weight_zero_point);
+				       (w - job->weight_zero_point);
+			}
 
 			/* The hardware rounds one shift half up; the reference
 			 * has to do the same or every value is off by one, and
@@ -90,7 +96,14 @@ int main(int argc, char **argv)
 	job.mm.m = argc > 1 ? (unsigned)atoi(argv[1]) : 4;
 	job.mm.k = argc > 2 ? (unsigned)atoi(argv[2]) : 64;
 	job.mm.n = argc > 3 ? (unsigned)atoi(argv[3]) : 32;
-	job.mm.wdtype = CHARSIU_INT8;
+	/*
+	 * CHARSIU_W4 runs the same test with int4 weights. The layout came off
+	 * the board in rounds 167 and 168 and the packer is unit checked on the
+	 * host; this is the first thing to ask it for a NUMBER rather than a
+	 * pattern, so the weights are confined to a nibble and the reference
+	 * uses the same values.
+	 */
+	job.mm.wdtype = getenv("CHARSIU_W4") ? CHARSIU_INT4 : CHARSIU_INT8;
 	job.mm.adtype = CHARSIU_INT8;
 	job.input_scale = 0.02f;
 	job.weight_scale = 0.01f;
@@ -107,8 +120,9 @@ int main(int argc, char **argv)
 	m = job.mm.m; k = job.mm.k; n = job.mm.n;
 	atom = charsiu_feature_atom(job.mm.adtype);
 
-	printf("matmul M=%u K=%u N=%u int8, feature atom %u, %u entries per row\n",
-	       m, k, n, atom, charsiu_entries_per_row(&job.mm));
+	printf("matmul M=%u K=%u N=%u w%s a8, feature atom %u, %u entries per row\n",
+	       m, k, n, job.mm.wdtype == CHARSIU_INT4 ? "4" : "8", atom,
+	       charsiu_entries_per_row(&job.mm));
 
 	dev = charsiu_open(NULL);
 	if (!dev) { printf("open FAILED\n"); return 1; }
@@ -120,6 +134,18 @@ int main(int argc, char **argv)
 	wsums = calloc(n, sizeof(*wsums));
 	for (i = 0; i < m * k; i++) a_raw[i] = (uint8_t)(128 + (int)(i * 7 % 61) - 30);
 	for (i = 0; i < n * k; i++) b_raw[i] = (uint8_t)(128 + (int)(i * 13 % 41) - 20);
+	if (job.mm.wdtype == CHARSIU_INT4) {
+		/*
+		 * A nibble is signed, -8 to 7, and it is NOT biased the way a
+		 * byte weight is: the packer stores it as it lies. So the zero
+		 * point is 0 here and b_raw holds the two's complement nibble
+		 * in its low four bits, which is what both the packer and the
+		 * reference then read.
+		 */
+		job.weight_zero_point = 0;
+		for (i = 0; i < n * k; i++)
+			b_raw[i] = (uint8_t)(((int)(i * 13 % 15) - 7) & 0xf);
+	}
 	for (i = 0; i < n; i++) bias[i] = (int)i * 3 - 40;
 
 	/*
@@ -219,8 +245,14 @@ int main(int argc, char **argv)
 	}
 	for (i = 0; i < n; i++) {
 		unsigned j;
-		for (j = 0; j < k; j++)
-			wsums[i] += (int)b_raw[i * k + j] - job.weight_zero_point;
+
+		for (j = 0; j < k; j++) {
+			int w = b_raw[i * k + j];
+
+			if (job.mm.wdtype == CHARSIU_INT4)
+				w = (w & 0x8) ? (w & 0xf) - 16 : (w & 0xf);
+			wsums[i] += w - job.weight_zero_point;
+		}
 	}
 
 	ret = charsiu_bo_alloc(dev, 4096, &regcmd);

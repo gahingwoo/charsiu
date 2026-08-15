@@ -252,7 +252,21 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 		*a = bias[oc] - (job->input_zero_point - 0x80) * weight_sums[oc]
 		   + (getenv("CHARSIU_NO_LIFT")
 		      ? 0 : (int32_t)(128.0f / mult + 0.5f));
-		*b = (int16_t)(0x80 - job->weight_zero_point);
+		/*
+		 * B carries the weight zero point correction, in the same
+		 * biased domain the weight is stored in. For int8 the weight
+		 * goes in as w - 0x80, so the correction is 0x80 - wt_zp.
+		 *
+		 * A NIBBLE IS NOT BIASED, so int4's is 0 and not 0x80. Round
+		 * 167 measured what getting this wrong looks like: with every
+		 * weight nibble dead and the input held 32 above its zero
+		 * point, the output came back 105 rather than the 0 the output
+		 * stage says, and 0x80 * 2048 * mult is 210, which is twice it.
+		 * The input was contributing through a correction that should
+		 * not have been there.
+		 */
+		*b = (int16_t)((mm->wdtype == CHARSIU_INT4 ? 0 : 0x80)
+			       - job->weight_zero_point);
 		*c = 16;                /* per tensor: every channel at the max */
 	}
 	/* Carry the last real record across the rest of its group, so the group
@@ -313,8 +327,30 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * precision mode its operands were not in. Copying a constant from a
 	 * different regime is not the same as not guessing.
 	 */
+	/*
+	 * THE PRECISION REGISTER, read out of the vendor's own file rather than
+	 * guessed, and this line was wrong for int4 until now.
+	 *
+	 * Diffing the .rkllm's int4 streams against its int8 ones
+	 * (vendor-capture/int4_regs.py in the driver repository):
+	 *
+	 *   int8 weights                    0x00000000
+	 *   int4 weights                    0x00600120
+	 *   int4 weights, 16 bit activations 0x20600120
+	 *   fp16 weights, 16 bit activations 0x20200120
+	 *
+	 * The int8 value is 0 and is confirmed twice, by the .rkllm's own int8
+	 * LM head and by a vendor .rknn compiled at charsiu's exact shape.
+	 *
+	 * This wrote 0 for int4 as well, so an int4 job asked the hardware for
+	 * an int8 weight fetch and would have read a layout out of nonsense.
+	 * regcmd.c, the geometry only emitter, had the right constant and this
+	 * one did not, which is the first time having two emitters has actually
+	 * cost anything.
+	 */
 	emit(&e, CNA, 0x100c,
-	     mm->adtype == CHARSIU_FP16 ? (2u << 12) : 0x00000000u);
+	     (mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x00000000u) |
+	     (mm->adtype == CHARSIU_FP16 ? 0x20000000u : 0x00000000u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
 	emit(&e, CNA, 0x1018, 0x40000404);

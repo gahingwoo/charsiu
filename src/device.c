@@ -108,11 +108,25 @@ int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo 
 
 void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo)
 {
-	(void)dev;
+	struct drm_gem_close req = { 0 };
+
 	if (!bo || !bo->map)
 		return;
 	munmap(bo->map, bo->size);
 	bo->map = NULL;
+	/*
+	 * And give the HANDLE back, which this did not do. rocket has no
+	 * DESTROY_BO of its own, so the generic GEM close is it, and without it
+	 * anything that allocates per shape rather than once leaks every buffer
+	 * until the process exits. The shape sweep in charsiu_bench is the first
+	 * thing here that allocates in a loop, and it would have leaked about
+	 * 300 MB of IOVA in seven iterations.
+	 */
+	if (dev && bo->handle) {
+		req.handle = bo->handle;
+		ioctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &req);
+		bo->handle = 0;
+	}
 }
 
 int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
@@ -161,39 +175,99 @@ int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)
 	return 0;
 }
 
+/*
+ * THE TWO AXES OF BATCHING, and why this takes a list rather than one stream.
+ *
+ * A submit carries jobs and a job carries tasks, and they are not the same
+ * lever. Tasks inside one job are CHAINED on a single core: the program counter
+ * walks them without the driver being asked again, which is the thing the
+ * PC_TASK_CON field layout work in the driver repository had to fix before it
+ * worked at all. Jobs are what the scheduler can hand to different cores.
+ *
+ * This matters more here than anywhere else in charsiu. A projection at M = 1
+ * with K = 2048 and N = 1024 is about 4 MOP, which at this hardware's rated 6
+ * TOPS is under a microsecond of arithmetic. Anything measurable around it is
+ * dispatch, so the interesting number is not how fast one submit is, it is what
+ * the SECOND task in the same submit costs. The RK3588 stacks concluded a single
+ * row matmul belongs on the CPU; if that is true here it will be visible as a
+ * per submit floor that batching cannot get under.
+ */
+int charsiu_submit_jobs(struct charsiu_device *dev,
+			const struct charsiu_joblist *jobs, unsigned job_count)
+{
+	struct drm_rocket_submit submit = { 0 };
+	struct drm_rocket_job *kj;
+	struct drm_rocket_task *kt;
+	unsigned total = 0, i, t, at = 0;
+	int ret = 0;
+
+	if (!dev || !jobs || !job_count)
+		return -EINVAL;
+	for (i = 0; i < job_count; i++)
+		total += jobs[i].task_count;
+	if (!total)
+		return -EINVAL;
+
+	kj = calloc(job_count, sizeof(*kj));
+	kt = calloc(total, sizeof(*kt));
+	if (!kj || !kt) {
+		free(kj); free(kt);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < job_count; i++) {
+		kj[i].tasks = (uint64_t)(uintptr_t)(kt + at);
+		kj[i].task_count = jobs[i].task_count;
+		kj[i].task_struct_size = sizeof(*kt);
+		kj[i].in_bo_handles = (uint64_t)(uintptr_t)jobs[i].in_handles;
+		kj[i].in_bo_handle_count = jobs[i].in_count;
+		kj[i].out_bo_handles = (uint64_t)(uintptr_t)jobs[i].out_handles;
+		kj[i].out_bo_handle_count = jobs[i].out_count;
+
+		/*
+		 * struct charsiu_task carries regcmd as a uint32_t already,
+		 * which is the whole of the range check: the field the driver
+		 * takes is 32 bits because the program counter fetches from a
+		 * 32 bit IOVA window per fd. The narrowing happens where a
+		 * dma_address is turned into one, in charsiu_submit below and
+		 * in whatever builds a task list.
+		 */
+		for (t = 0; t < jobs[i].task_count; t++, at++) {
+			kt[at].regcmd = jobs[i].tasks[t].regcmd;
+			kt[at].regcmd_count = jobs[i].tasks[t].regcmd_count;
+		}
+	}
+
+	submit.jobs = (uint64_t)(uintptr_t)kj;
+	submit.job_count = job_count;
+	submit.job_struct_size = sizeof(*kj);
+	if (ioctl(dev->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit))
+		ret = -errno;
+	free(kj);
+	free(kt);
+	return ret;
+}
+
 int charsiu_submit(struct charsiu_device *dev, const struct charsiu_bo *regcmd,
 		   unsigned regcmd_count, const uint32_t *in_handles,
 		   unsigned in_count, const uint32_t *out_handles,
 		   unsigned out_count)
 {
-	struct drm_rocket_task task = { 0 };
-	struct drm_rocket_job job = { 0 };
-	struct drm_rocket_submit submit = { 0 };
+	struct charsiu_task task;
+	struct charsiu_joblist job;
 
-	/*
-	 * The task's regcmd field is 32 bits: it is the DMA address the NPU's
-	 * program counter fetches from, and the driver hands out a 32 bit IOVA
-	 * window per fd. A BO above 4 GiB of IOVA cannot be a register stream.
-	 */
 	if (regcmd->dma_address >> 32)
 		return -ERANGE;
 
 	task.regcmd = (uint32_t)regcmd->dma_address;
 	task.regcmd_count = regcmd_count;
 
-	job.tasks = (uint64_t)(uintptr_t)&task;
+	job.tasks = &task;
 	job.task_count = 1;
-	job.task_struct_size = sizeof(task);
-	job.in_bo_handles = (uint64_t)(uintptr_t)in_handles;
-	job.in_bo_handle_count = in_count;
-	job.out_bo_handles = (uint64_t)(uintptr_t)out_handles;
-	job.out_bo_handle_count = out_count;
+	job.in_handles = in_handles;
+	job.in_count = in_count;
+	job.out_handles = out_handles;
+	job.out_count = out_count;
 
-	submit.jobs = (uint64_t)(uintptr_t)&job;
-	submit.job_count = 1;
-	submit.job_struct_size = sizeof(job);
-
-	if (ioctl(dev->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit))
-		return -errno;
-	return 0;
+	return charsiu_submit_jobs(dev, &job, 1);
 }

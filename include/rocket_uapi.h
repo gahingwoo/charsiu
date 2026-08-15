@@ -58,6 +58,18 @@ struct drm_rocket_submit {
 	uint64_t reserved;
 };
 
+/*
+ * Not rocket's, but the only way to give a buffer object back. rocket has no
+ * DESTROY_BO of its own; a GEM handle is released with the generic call, and
+ * without it a process that allocates per shape leaks every one of them until
+ * it exits. charsiu_bo_free needs it as soon as anything allocates in a loop.
+ */
+struct drm_gem_close {
+	uint32_t handle;
+	uint32_t pad;
+};
+#define DRM_IOCTL_GEM_CLOSE  _IOW('d', 0x09, struct drm_gem_close)
+
 #define DRM_IOCTL_ROCKET_CREATE_BO \
 	_IOWR('d', DRM_COMMAND_BASE + DRM_ROCKET_CREATE_BO, struct drm_rocket_create_bo)
 #define DRM_IOCTL_ROCKET_SUBMIT \

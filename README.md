@@ -19,7 +19,7 @@ close to it:
 | negative MAC, output -66 to +63 | M=1 K=64 N=64 | 64 of 64 bytes exact |
 | bias ramp | M=1 K=64 N=64 | 64 of 64 bytes exact |
 | impulse | M=1 K=64 N=64 | 64 of 64 bytes exact |
-| dense, a projection's shape | M=1 K=512 N=1024 | 1024 of 1024, fit slope 1.0000 |
+| dense, a projection's shape | M=1 K=512 N=1024 | 1023 of 1024 exact, the last off by one |
 
 The two things that had to be understood to get there are worth stating because both
 were wrong in this file before:
@@ -43,14 +43,64 @@ It is not a runtime yet. What is left:
 - **int4 is deliberately not written.** Its N group of 64 is copied from the RK3588
   notes and has never been confirmed on this silicon, and a `.rkllm` gives geometry
   rather than layout. int8 and fp16 are enough to prove the path and to time it.
-- **nothing has been timed.** There is no performance number here yet, and the target
-  is the vendor's own on the same board and model.
+- the runtime work has not started: no KV cache, no sampler, no per token geometry.
 
 The three tools that got it there are in the repository rather than in a shell history,
 because every step that worked was a diff against something known to compute:
 `tools/rkllm_regcmd.py` reads the vendor's own dispatches out of a `.rkllm`,
 `tools/cmp_vendor.py` diffs charsiu's stream against them, and `tools/emit_job.c`
 prints charsiu's stream on a desktop so a change to it costs no board round.
+
+## What it costs, and what the cost is OF
+
+Measured on the same board, 2026-08-15. A submit carries jobs, a job carries tasks;
+tasks in one job are chained on a single core with no further ioctl. Sweeping seven
+shapes at 32 chained tasks and fitting all of them at once:
+
+```
+us per task = 26.3 + weight_MB * 84.3        i.e. 11.9 GB/s, plus 26 us per task
+```
+
+with every point inside 10% of that line and most inside 4%. **The cost is the weight
+fetch.** Three things say so and each of them could have said otherwise:
+
+- **M is nearly free.** The same 2.10 MB of weights costs 201.9 us at M = 1 and
+  217.6 us at M = 32, which is 1.08 times the time for 32 times the arithmetic.
+- **the same bytes in different shapes cost the same.** K=1024 N=1024 and K=2048 N=512
+  are both 1.05 MB and came out 111.56 and 111.24 us, 0.3% apart. K=2048 N=1024 and
+  K=1024 N=2048 are both 2.10 MB, 208.06 and 211.21 us, 1.5% apart. That test was run
+  to break the reading above and did not.
+- **a second core does not help.** Two jobs of eight tasks were about 5% *worse* than
+  one job of sixteen at every shape, which is what a bandwidth bound workload does.
+
+On top of the per task cost sits about 172 us per submit, which chaining removes. That
+is why a 0.5 MB projection gains 4.4x from batching and a 2 MB one only 1.9x.
+
+### What that means for a token
+
+Llama-3.2-1B reads about 973 M projection weights per token, once each, so decode is
+DRAM bound and not MAC bound:
+
+| weights | bytes per token | time | tokens/s |
+|---|---|---|---|
+| int8 | 973 MB | 85 ms | **11.8** |
+| int4 | 487 MB | 44 ms | **22.7** |
+
+The vendor ships about 13 tokens a second on this board. **So int4 is not a
+nice-to-have, it is the only 2x available**, which is why it moves to the front of the
+queue despite its layout still being unconfirmed here.
+
+Prefill is a different machine entirely: at M = 32 the same weights are amortised over
+32 rows, 604 GOP/s and 6.9 us per row against 200 us per row at M = 1.
+
+### The honest denominator
+
+The same matmul on one CPU thread, a naive scalar loop, takes 5078 us against the
+NPU's 201 us. That ratio is **not** 25x in any useful sense: the loop has no NEON in
+it, and more importantly the CPU has to read the same 2.10 MB, so a tuned kernel would
+run into the same wall from the other side. What the measurement does settle is the
+RK3588 stacks' conclusion that a single row matmul belongs on the CPU. On RK3576 it
+does not.
 
 ## On the name
 
@@ -179,8 +229,9 @@ The rest of what the file says is in [docs/vendor-dispatch.md](docs/vendor-dispa
 - **Out**: no vendor `librkllmrt` or `librknnrt` in the execution path, and no claim
   about any SoC this has not been run on.
 - **Honest about performance**: the target is the vendor's own number on the same
-  board and model, and this file will carry both figures side by side as soon as there
-  is one to carry.
+  board and model. The projection cost is measured above and the arithmetic to a token
+  rate is written out; **there is still no end to end number here**, because no model
+  runs yet, and a projected rate is not a measured one.
 
 ## Prerequisite
 

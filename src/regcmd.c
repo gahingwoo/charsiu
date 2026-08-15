@@ -208,8 +208,54 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 */
 	memset(dst, 0, charsiu_weight_bytes(mm));
 
-	if (mm->wdtype == CHARSIU_INT4)
-		return;                 /* int4 packing is not written yet */
+	/*
+	 * INT4, READ OFF THE HARDWARE IN ROUNDS 167 AND 168.
+	 *
+	 * The tile is the int8 one with its k group doubled and the two halves
+	 * of that group folded into the two nibbles of the same byte:
+	 *
+	 *   [n/32][k/64][n%32][k%64],  byte = k % 32,  nibble = (k % 64) / 32
+	 *
+	 * so a row is 32 bytes either way and the tile shape does not change
+	 * with precision. Both numbers were measured rather than assumed.
+	 *
+	 * Round 167: low nibbles live and high nibbles live gave the IDENTICAL
+	 * output across all 64 channels, which rules out every N pairing. Both
+	 * nibbles of a byte are one output channel. So charsiu_weight_ngroup's
+	 * 64 for int4, taken from the RK3588 notes, is wrong here and it is 32.
+	 *
+	 * Round 168: with the low nibbles live, an input impulse walking k moved
+	 * the output for k = 0 to 31 and did nothing for k = 32 to 63. So the
+	 * low nibble is the first half of the group and the high nibble the
+	 * second, and NOT k with k+1 interleaved.
+	 *
+	 * EDGE TILES ARE EXTRAPOLATED, not measured. A k that is not a multiple
+	 * of 64 gives a short row here, by the same rule the int8 path uses for
+	 * a short k group. Nothing has been run at such a shape.
+	 */
+	if (mm->wdtype == CHARSIU_INT4) {
+		for (n = 0; n < mm->n; n++) {
+			unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
+
+			for (k = 0; k < mm->k; k++) {
+				unsigned kgi = k / kg;
+				unsigned kgsz = MIN2(mm->k - kgi * kg, kg);
+				unsigned kbytes = (kgsz + 1) / 2;
+				unsigned kin = k % kg;
+				size_t off = (size_t)ngi * ng * mm->k / 2
+					   + (size_t)kgi * kbytes * ngsz
+					   + (size_t)(n % ng) * kbytes
+					   + kin % (kg / 2);
+				unsigned nib = src[(size_t)n * mm->k + k] & 0xf;
+
+				if (kin >= kg / 2)
+					dst[off] |= (uint8_t)(nib << 4);
+				else
+					dst[off] |= (uint8_t)nib;
+			}
+		}
+		return;
+	}
 
 	for (n = 0; n < mm->n; n++) {
 		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);

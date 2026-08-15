@@ -22,7 +22,8 @@ $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64
+board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
+       $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64
 
 $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^
@@ -30,7 +31,19 @@ $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 $(BUILD)/charsiu_matmul.aarch64: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
+$(BUILD)/charsiu_bench.aarch64: tools/charsiu_bench.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
+$(BUILD)/charsiu_int4.aarch64: tools/charsiu_int4.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
+test: $(BUILD)/pack_int4
+	./$(BUILD)/pack_int4
+
+$(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all board clean
+.PHONY: all board test clean

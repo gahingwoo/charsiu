@@ -40,12 +40,19 @@ static inline unsigned charsiu_feature_atom(enum charsiu_dtype dt)
 
 /* The weight tile: the buffer is [N/ng][K/kg][N%ng][K%kg], cut short at the
  * edges rather than padded. Established against the vendor's own compiler at
- * 64 by 64, 64 by 34, 64 by 56 and 48 by 40 for the int8 case; the int4 N group
- * is the RK3588 table's and is NOT yet confirmed on this silicon. */
+ * 64 by 64, 64 by 34, 64 by 56 and 48 by 40 for the int8 case, and on the board
+ * in rounds 167 and 168 for int4, where the K group doubles to 64 and its two
+ * halves become the two nibbles of one byte. */
 static inline unsigned charsiu_weight_ngroup(enum charsiu_dtype dt)
 {
 	switch (dt) {
-	case CHARSIU_INT4: return 64;
+	/*
+	 * 32, not the 64 the RK3588 notes give. Round 167 measured it: low
+	 * nibbles live and high nibbles live produced the identical output
+	 * across every channel, which no N pairing can do. int4 keeps int8's
+	 * output channel group and doubles the K one instead.
+	 */
+	case CHARSIU_INT4: return 32;
 	case CHARSIU_INT8: return 32;
 	default:           return 16;
 	}
@@ -53,8 +60,12 @@ static inline unsigned charsiu_weight_ngroup(enum charsiu_dtype dt)
 
 static inline unsigned charsiu_weight_kgroup(enum charsiu_dtype dt)
 {
-	(void)dt;
-	return 32;
+	/*
+	 * 64 for int4, because a byte holds k and k+32 rather than k and k+1.
+	 * Round 168: with the low nibbles live, an input impulse moved the
+	 * output for k = 0 to 31 and did nothing for k = 32 to 63.
+	 */
+	return dt == CHARSIU_INT4 ? 64 : 32;
 }
 
 /*
@@ -171,6 +182,29 @@ void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo);
 int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 		    int64_t timeout_ns);
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo);
+
+/*
+ * One task is one register stream. Tasks inside a job are chained on a single
+ * core; jobs are what the scheduler can spread across cores. At M = 1 the
+ * arithmetic is under a microsecond, so which of those two a runtime uses is the
+ * whole performance question.
+ */
+struct charsiu_task {
+	uint32_t regcmd;          /* IOVA of the stream, must be under 4 GiB */
+	uint32_t regcmd_count;
+};
+
+struct charsiu_joblist {
+	const struct charsiu_task *tasks;
+	unsigned task_count;
+	const uint32_t *in_handles;
+	unsigned in_count;
+	const uint32_t *out_handles;
+	unsigned out_count;
+};
+
+int charsiu_submit_jobs(struct charsiu_device *dev,
+			const struct charsiu_joblist *jobs, unsigned job_count);
 
 int charsiu_submit(struct charsiu_device *dev, const struct charsiu_bo *regcmd,
 		   unsigned regcmd_count, const uint32_t *in_handles,
