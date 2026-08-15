@@ -22,30 +22,35 @@ int main(void)
 {
 	struct charsiu_matmul mm = { 1, 64, 64, CHARSIU_INT4, CHARSIU_INT8 };
 	uint8_t *src = calloc(64 * 64, 1), *dst = calloc(charsiu_weight_bytes(&mm), 1);
-	unsigned n, k, bad = 0;
+	unsigned n, k, bad = 0, checked = 0;
 
-	/* one live weight at a time, and check it lands where rounds 167 and 168
-	 * say: byte = k%32 within the row, nibble = (k%64)/32 */
+	/*
+	 * The MEASURED row: channel n starts at (n / 32) * 512 + (n % 32) * 8 and
+	 * runs eight bytes. Only k = 0 to 15 are placed, because only that much
+	 * of the map is data.
+	 */
 	for (n = 0; n < 64; n++) {
-		for (k = 0; k < 64; k++) {
-			size_t off, want;
-			unsigned hi;
+		for (k = 0; k < 16; k++) {
+			size_t row = (size_t)(n / 32) * 512 + (size_t)(n % 32) * 8;
+			size_t want = row + k / 2, off;
+			unsigned high = k & 1, live = 0;
 
 			memset(src, 0, 64 * 64);
 			src[n * 64 + k] = 0x7;
 			charsiu_pack_weights(&mm, src, dst);
-			want = (size_t)(n / 32) * 32 * 64 / 2 + (size_t)(n % 32) * 32 + (k % 32);
-			hi = (k % 64) >= 32;
-			if (dst[want] != (hi ? 0x70 : 0x07)) {
+			checked++;
+			if (dst[want] != (high ? 0x70 : 0x07)) {
 				if (bad < 5)
 					printf("  n=%2u k=%2u expected byte %zu %s nibble, got %02x\n",
-					       n, k, want, hi ? "high" : "low", dst[want]);
+					       n, k, want, high ? "high" : "low", dst[want]);
 				bad++;
+				continue;
 			}
 			for (off = 0; off < charsiu_weight_bytes(&mm); off++)
 				if (off != want && dst[off]) { bad++; break; }
 		}
 	}
-	printf("  int4 packer: %u of %u placements wrong\n", bad, 64 * 64);
+	printf("  int4 packer: %u of %u placements wrong (k < 16 only, which is\n"
+	       "  all the map is data for)\n", bad, checked);
 	return bad != 0;
 }

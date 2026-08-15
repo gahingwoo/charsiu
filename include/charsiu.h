@@ -124,6 +124,26 @@ size_t charsiu_weight_bytes(const struct charsiu_matmul *mm);
 /* The 64 byte units one row of A occupies in the CBUF. A column costs
  * DIV_ROUND_UP(K, 16) atoms of 16 bytes, four to a unit, except that a last
  * unit holding exactly three atoms does not pack and costs a whole unit. */
+/*
+ * What the hardware actually treats the activation as. int4 weights consume it
+ * as 16 bits whatever the stream asks for; round 178 measured the pairing as
+ * k_hardware = 2 * k_ours + 1, which is a 16 bit element read out of an 8 bit
+ * buffer. The atom, the surface stride and the packing all have to come from
+ * this one place or they describe different buffers.
+ */
+enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm);
+
+/* An IEEE half, for building fp16 activations. The DPU already needed one for
+ * the coefficient buffer's scale table; this is the same conversion exposed,
+ * because int4 weights consume the activation as a 16 bit float and a runtime
+ * has to be able to produce one. */
+uint16_t charsiu_float_to_half(float f);
+
+/* Pack A[M][K] as real fp16, which is what int4 weights consume. No zero point:
+ * a float carries its own sign, so pass the dequantised values. */
+void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
+			    uint8_t *dst, size_t dst_size);
+
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
 
 

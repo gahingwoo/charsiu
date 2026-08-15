@@ -210,6 +210,75 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	charsiu_bo_fini(dev, outbo);
 }
 
+/*
+ * --kpair: sparse on BOTH sides, which is the one thing never tried.
+ *
+ * Every probe so far has been sparse in one operand and dense in the other. The
+ * map fixes one live nibble and feeds a full input, so its output is a SUM over
+ * whatever k that nibble touches and its value cannot name a single k. Round
+ * 177's impulse has one live nibble per channel and a full input, and came back
+ * saturated at the rails, which is what cross talk between channels would do.
+ *
+ * Both of those are explained by one unmeasured thing: a nibble reaching more
+ * than one input. So measure it. Hold ONE live nibble in the whole buffer, make
+ * the input ONE HOT at a single k, and sweep k. The output is nonzero exactly
+ * when that nibble is paired with that k, so the set of k a nibble touches is
+ * read off directly with no arithmetic and no summation to unpick.
+ *
+ *   exactly one k lights per nibble    the pairing is one to one and the layout
+ *                                      is a permutation after all
+ *   several k light                    a nibble is broadcast across inputs, and
+ *                                      how many says by how much
+ *   no k lights                        the nibble is not fetched at that offset
+ */
+static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
+			struct charsiu_bo *wt, struct charsiu_bo *in,
+			struct charsiu_bo *outbo, struct charsiu_bo *regcmd,
+			size_t nreg, const uint32_t *in_h, const uint32_t *out_h,
+			size_t byte, unsigned high, uint8_t *a_raw)
+{
+	unsigned k, i, hits = 0;
+	unsigned firstn = 0;
+
+	charsiu_bo_prep(dev, wt, 1000000000);
+	memset(wt->map, 0, charsiu_weight_bytes(&job->mm));
+	((uint8_t *)wt->map)[byte] = (uint8_t)(high ? (LIVE << 4) : LIVE);
+	charsiu_bo_fini(dev, wt);
+
+	printf("  byte %-5zu %-5s pairs with k =", byte, high ? "high" : "low");
+	for (k = 0; k < job->mm.k; k++) {
+		uint8_t *o;
+		int any = 0;
+
+		for (i = 0; i < job->mm.k; i++)
+			a_raw[i] = (uint8_t)(job->input_zero_point + (i == k ? 100 : 0));
+		charsiu_bo_prep(dev, in, 1000000000);
+		charsiu_pack_input(&job->mm, a_raw, in->map, in->size,
+				   (uint8_t)job->input_zero_point);
+		charsiu_bo_fini(dev, in);
+
+		charsiu_bo_prep(dev, outbo, 1000000000);
+		memset(outbo->map, 0, (size_t)job->mm.m * job->mm.n);
+		charsiu_bo_fini(dev, outbo);
+
+		if (charsiu_submit(dev, regcmd, (unsigned)nreg, in_h, 3, out_h, 1) ||
+		    charsiu_bo_prep(dev, outbo, 2000000000))
+			continue;
+		o = outbo->map;
+		for (i = 0; i < job->mm.n; i++)
+			if (o[i]) { any = 1; if (!hits) firstn = i; break; }
+		charsiu_bo_fini(dev, outbo);
+		if (any) {
+			printf(" %u", k);
+			hits++;
+		}
+	}
+	printf("   (%u of %u", hits, job->mm.k);
+	if (hits)
+		printf(", first channel %u", firstn);
+	printf(")\n");
+}
+
 int main(int argc, char **argv)
 {
 	static const enum pattern pats[] = { PAT_DEAD, PAT_ALL, PAT_LOW,
@@ -373,6 +442,101 @@ int main(int argc, char **argv)
 	 * chosen so that one live nibble makes the output value k + 1 on channel
 	 * n, so a whole layout can be read off a console log with no arithmetic.
 	 */
+	/*
+	 * --kpair: one live nibble, a one hot input, sweep k. Reads which inputs
+	 * a nibble is paired with, which every other probe here has had to infer
+	 * from a sum.
+	 */
+	/*
+	 * --f16: the direct test of round 179's conclusion. int4 weights consume
+	 * the activation as fp16, so feed a real one.
+	 *
+	 * One live nibble per channel at k = c mod 16, the same impulse the
+	 * integer path runs, but the input is packed as actual halves. The
+	 * reference is then a float multiply, which is what the reference for an
+	 * fp16 activation has to be: acc = weight * activation, and the requant
+	 * turns it into a byte.
+	 *
+	 *   the output tracks the reference
+	 *             int4 computes, and w4a16 is the configuration it needs.
+	 *   the output is still at the rails
+	 *             the element being 16 bits is measured and its being a
+	 *             FLOAT is not, so that is the part that comes down.
+	 */
+	if (argc > 4 && !strcmp(argv[4], "--f16")) {
+		float *af = malloc((size_t)m * k * sizeof(*af));
+		unsigned c, j;
+		uint8_t *o;
+
+		/* an input a half can hold exactly, so the packing adds no
+		 * error of its own: small integers */
+		for (i = 0; i < m * k; i++)
+			af[i] = (float)((int)(i % 32) - 16);
+		charsiu_bo_prep(dev, &in, 1000000000);
+		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
+		charsiu_bo_fini(dev, &in);
+
+		/* one live nibble per channel, as the impulse */
+		charsiu_bo_prep(dev, &wt, 1000000000);
+		memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
+		for (c = 0; c < n; c++) {
+			size_t row = (size_t)(c / 32) * 512 + (size_t)(c % 32) * 8;
+			unsigned kk = c % 16;
+
+			((uint8_t *)wt.map)[row + kk / 2] |=
+				(uint8_t)((kk & 1) ? (LIVE << 4) : LIVE);
+		}
+		charsiu_bo_fini(dev, &wt);
+
+		charsiu_bo_prep(dev, &outbo, 1000000000);
+		memset(outbo.map, 0xa5, (size_t)m * n);
+		charsiu_bo_fini(dev, &outbo);
+		if (charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles, 3,
+				   out_handles, 1) ||
+		    charsiu_bo_prep(dev, &outbo, 2000000000)) {
+			printf("  f16 submit or wait FAILED\n");
+			charsiu_close(dev);
+			return 1;
+		}
+		o = outbo.map;
+		printf("\n  --f16: a REAL fp16 activation, one live nibble of %d per\n"
+		       "  channel at k = c mod 16. activation[k] = (k mod 32) - 16.\n\n",
+		       LIVE);
+		printf("  %-4s %-10s %-10s %-10s\n", "c", "act[c%%16]", "npu", "npu*");
+		for (c = 0; c < 16 && c < n; c++) {
+			int v = o[c] > 127 ? o[c] - 256 : o[c];
+
+			printf("  %-4u %-10.1f %-10d %-10d\n", c,
+			       af[c % 16], (int)o[c], v);
+		}
+		j = 0;
+		for (c = 0; c < n; c++)
+			if (o[c] == 0xa5) j++;
+		printf("\n  %u of %u bytes still hold the sentinel\n", j, m * n);
+		charsiu_close(dev);
+		return 0;
+	}
+
+	if (argc > 4 && !strcmp(argv[4], "--kpair")) {
+		static const size_t bytes[] = { 0, 1, 2, 3, 4, 7, 8, 512 };
+		unsigned j;
+
+		printf("\n  --kpair: ONE live nibble, a ONE HOT input, sweeping k.\n"
+		       "  A nibble that pairs with more than one k is broadcast, and\n"
+		       "  that would explain both the map's unusable k column and the\n"
+		       "  impulse saturating at the rails.\n\n");
+		for (j = 0; j < sizeof(bytes) / sizeof(bytes[0]); j++) {
+			if (bytes[j] >= charsiu_weight_bytes(&job.mm))
+				continue;
+			kpair_probe(dev, &job, &wt, &in, &outbo, &regcmd, nreg,
+				    in_handles, out_handles, bytes[j], 0, a_raw);
+			kpair_probe(dev, &job, &wt, &in, &outbo, &regcmd, nreg,
+				    in_handles, out_handles, bytes[j], 1, a_raw);
+		}
+		charsiu_close(dev);
+		return 0;
+	}
+
 	if (argc > 4 && !strcmp(argv[4], "--map")) {
 		/*
 		 * SWEEP, do not sample. Round 171 probed eight byte offsets and

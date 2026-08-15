@@ -136,7 +136,7 @@ static struct requant requant_of(const struct charsiu_job *job)
  * when the channel count is a multiple of 8, and every layer that missed came
  * back an EMPTY convolution. That cost rounds 136 to 138 to find.
  */
-static uint16_t float_to_half(float f)
+uint16_t charsiu_float_to_half(float f)
 {
 	union { float f; uint32_t u; } v = { .f = f };
 	uint32_t sign = (v.u >> 16) & 0x8000;
@@ -287,7 +287,7 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 	 * float region, which the size above covers with room to spare. */
 	scales = (uint16_t *)(dst + tb);
 	for (oc = 0; oc < sb / 2; oc++)
-		scales[oc] = float_to_half(job->weight_scale);
+		scales[oc] = charsiu_float_to_half(job->weight_scale);
 
 	/* The second operand. 0x1004 is fp16 0.00049, a value this hardware's
 	 * own configuration accepts; the vendor's 0x0E0E does not, under ours. */

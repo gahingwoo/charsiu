@@ -251,13 +251,41 @@ int main(int argc, char **argv)
 	if (getenv("CHARSIU_IMPULSE")) {
 		unsigned c, j;
 
+		/*
+		 * For int4 the live tap goes at k = c mod 16, not c mod K.
+		 * Only k = 0 to 15 has a measured placement, so an impulse
+		 * anywhere else would be testing a guess. Every channel still
+		 * gets exactly one live weight, which is what the probe needs.
+		 */
+		unsigned span = job.mm.wdtype == CHARSIU_INT4 ? 16 : k;
+
+		/*
+		 * AND THE IMPULSE NEEDS ITS OWN SCALE, which round 176 did not
+		 * give it. The dense int4 test was rescaled in round 170 and the
+		 * impulse was left behind: one live nibble of 7 against an input
+		 * spanning 30 either side of the zero point puts the whole
+		 * reference in SEVEN distinct values, and both intra row orders
+		 * came back TOO FLAT TO JUDGE A MATCH. The same mistake as round
+		 * 169, one probe over.
+		 *
+		 * A multiplier of 1/7 and an input spanning 120 makes the
+		 * reference a nibble of 7 times the input, so it fills the byte
+		 * and one count means one count.
+		 */
+		if (job.mm.wdtype == CHARSIU_INT4) {
+			job.weight_scale = 1.7857f;
+			for (i = 0; i < m * k; i++)
+				a_raw[i] = (uint8_t)(job.input_zero_point
+						     + (int)(i * 37 % 241) - 120);
+		}
+
 		for (c = 0; c < n; c++)
 			for (j = 0; j < k; j++)
 				b_raw[c * k + j] = job.mm.wdtype == CHARSIU_INT4
-					? (uint8_t)(j == c % k ? 7 : 0)
-					: (uint8_t)(j == c % k ? 128 + 100 : 128);
+					? (uint8_t)(j == c % span ? 7 : 0)
+					: (uint8_t)(j == c % span ? 128 + 100 : 128);
 		memset(bias, 0, n * sizeof(*bias));
-		printf("impulse: weight[c][c mod K] live, bias zero\n");
+		printf("impulse: weight[c][c mod %u] live, bias zero\n", span);
 	}
 	for (i = 0; i < n; i++) {
 		unsigned j;
@@ -270,6 +298,13 @@ int main(int argc, char **argv)
 			wsums[i] += w - job.weight_zero_point;
 		}
 	}
+
+	/* the scales go in the log too. Round 174 lost a whole comparison to a
+	 * probe setting that existed only in the source, and rounds 169 and 176
+	 * lost two to a scale nobody could see from the console. */
+	printf("  scales in %.4f wt %.4f out %.4f  zp in %u wt %u out %u\n",
+	       job.input_scale, job.weight_scale, job.output_scale,
+	       job.input_zero_point, job.weight_zero_point, job.output_zero_point);
 
 	ret = charsiu_bo_alloc(dev, 4096, &regcmd);
 	ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096, &in);

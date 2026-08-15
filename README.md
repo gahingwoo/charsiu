@@ -47,13 +47,8 @@ It is not a runtime yet. What is left:
 - the reference still requantises in float where the hardware uses an integer scale and
   shift. It agrees to the byte on everything measured so far, which does not mean it
   will at every scale.
-- **int4's weight layout is still unknown.** Its registers are confirmed, read out of
-  a vendor `.rkllm` by diffing its 3328 four bit streams against its 40 eight bit
-  ones, and its output stage is byte exact on a probe that holds the MAC at zero. The
-  LAYOUT is not: two rounds of full buffer patterns appeared to decode it and were
-  withdrawn, because a probe that fills every byte cannot see a permutation. It is
-  being read again with a sparse probe, one live nibble at a time, which is how the
-  int8 layout was read.
+- **int4 does not compute yet**, and what is left is the activation format rather
+  than the layout. See below.
 - the runtime work has not started: no KV cache, no sampler, no per token geometry.
 
 The three tools that got it there are in the repository rather than in a shell history,
@@ -112,6 +107,54 @@ it, and more importantly the CPU has to read the same 2.10 MB, so a tuned kernel
 run into the same wall from the other side. What the measurement does settle is the
 RK3588 stacks' conclusion that a single row matmul belongs on the CPU. On RK3576 it
 does not.
+
+## Reading a weight layout off the hardware
+
+A weight layout used to be inferred here from whether an output came out right.
+It can be asked directly instead: put **one** live weight in the whole buffer, sweep
+it, and record which output channel lights. `tools/charsiu_int4.c --map` does that,
+and the point of it is that it was validated against int8, which is byte exact on
+this silicon:
+
+```
+int8   K=64 N=64, 4096 bytes    512 of 512 probes light exactly one channel,
+                                no dead region, n = byte / 32, k = byte % 32
+```
+
+which is exactly what `src/regcmd.c` packs. The instrument agrees with a case whose
+answer is already known, which is what makes its answer on int4 worth anything.
+
+`--kpair` goes further and is sparse on **both** sides: one live nibble, a one hot
+input, sweeping k. Every nibble pairs with exactly one k, so nothing is broadcast and
+the pairing can be read with no sum to unpick.
+
+### What int4's layout turned out to be
+
+```
+channel n is read from byte (n / 32) * 512 + (n % 32) * 8, eight bytes
+byte b nibble h is k = 2b + h
+an activation element is TWO bytes wide
+```
+
+Each part measured, then confirmed by a second and different probe. The element width
+was found the hard way: with an 8 bit input packing every nibble paired with
+`k = 2 * k_ours + 1`, and with a 16 bit one it pairs with `k` exactly.
+
+That last also retires a reading this project carried for eight rounds. The hardware
+appeared to fetch only a **quarter** of the weight buffer; it never did. It fetches
+half as many elements, each twice as wide.
+
+### What is still open
+
+The values are wrong. A one hot of 100 placed in the **low** byte of an element never
+lights a channel, which a 16 bit integer cannot do and a float must, so the activation
+is very likely an fp16 here, which is the only way the vendor runs int4 (`w4a16`).
+Feeding real halves through a stream still configured for int8 activations does not
+compute either, and that test could not have worked: only the packing was changed, not
+the stream. The fp16 activation path is not written yet.
+
+Where `k = 16` and above live is also unknown, because those bytes are dead in the map
+and there is no data about them.
 
 ## On the name
 

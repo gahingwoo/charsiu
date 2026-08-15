@@ -14,6 +14,7 @@
  * with addresses. This emits geometry, so that it can be diffed against the
  * vendor's streams on a desktop before any of it runs.
  */
+#include <stdlib.h>
 #include <string.h>
 
 #include "charsiu.h"
@@ -42,9 +43,24 @@ static void emit(struct emitter *e, unsigned target, unsigned reg, uint32_t val)
 	e->out[e->n++] = ((uint64_t)target << 48) | ((uint64_t)val << 16) | reg;
 }
 
+/*
+ * The effective activation element size. int4 weights consume the activation as
+ * 16 bits whatever the stream asks for, measured in round 178 by holding one
+ * live nibble and sweeping a one hot input: every nibble paired with k = 2 *
+ * k_ours + 1, which is a 16 bit element read out of an 8 bit buffer. Everything
+ * that derives from the atom has to agree with that or the surface stride and
+ * the packing describe different buffers.
+ */
+enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm)
+{
+	if (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_A8_STRIDE1"))
+		return CHARSIU_FP16;    /* any 2 byte type: the atom is 8 */
+	return mm->adtype;
+}
+
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm)
 {
-	unsigned atom = charsiu_feature_atom(mm->adtype);
+	unsigned atom = charsiu_feature_atom(charsiu_effective_adtype(mm));
 	unsigned total = DIV_ROUND_UP(mm->k, atom);
 	unsigned last = total % 4;
 	unsigned width = 1;             /* one column, always */
@@ -178,14 +194,93 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 			uint8_t *dst, size_t dst_size, uint8_t input_zero_point)
 {
-	unsigned atom = charsiu_feature_atom(mm->adtype);
+	/*
+	 * INT4 WEIGHTS CONSUME THE ACTIVATION AS SIXTEEN BITS, whatever this
+	 * asks for, and that is measured rather than assumed.
+	 *
+	 * Round 178 held ONE live nibble in the whole weight buffer and swept a
+	 * ONE HOT input across k. Every nibble paired with exactly one k, so the
+	 * layout is a permutation and nothing is broadcast, and the pairing is
+	 *
+	 *   byte b nibble h  ->  k = 4b + 2h + 1
+	 *
+	 * on all twelve offsets probed, with no exception. Against what this
+	 * packer intends, k = 2b + h, that is exactly
+	 *
+	 *   k_hardware = 2 * k_ours + 1
+	 *
+	 * which is what a 16 bit element does to an 8 bit buffer: the hardware's
+	 * element k is our bytes 2k and 2k+1, and it pairs with the high one. It
+	 * also explains the rest at a stroke. A row of 8 bytes is 16 nibbles and
+	 * therefore 16 of the hardware's elements, not 16 of ours, so channel 0
+	 * takes our k = 1..31 odd and channel 1 our k = 33..63 odd, which is
+	 * what byte 8 measured. The vendor only ever runs int4 as w4a16.
+	 *
+	 * So for int4 the atom is the 16 bit one and each value goes in the high
+	 * byte of its pair. CHARSIU_A8_STRIDE1 restores the old packing as the
+	 * control: with it the fault must come back.
+	 */
+	enum charsiu_dtype eff = charsiu_effective_adtype(mm);
+	unsigned atom = charsiu_feature_atom(eff);
+	int wide = eff != mm->adtype;
+	unsigned esz = wide ? 2 : 1;
 	unsigned i, kk;
 
-	memset(dst, (uint8_t)(input_zero_point - 0x80), dst_size);
+	/*
+	 * ROUND 179 SETTLED THE PAIRING and pointed past it. With each value in
+	 * the high byte of a 16 bit slot, --kpair reads byte b nibble h paired
+	 * with k = 2b + h, exactly what the packer intends, where the 8 bit
+	 * packing read 2k + 1. So the element is 16 bits wide and this much is
+	 * measured twice.
+	 *
+	 * What it also showed is that the LOW byte contributes nothing at all: a
+	 * one hot of 100 placed there never lit a channel, and a 16 bit INTEGER
+	 * cannot do that, since 100 would have been about 100 output counts. A
+	 * float can and must, because a value with a zero exponent byte is a
+	 * subnormal near zero. So the activation is an fp16 in this mode, which
+	 * is also the only way the vendor runs int4, as w4a16.
+	 *
+	 * That is why the values are still wrong: writing an int8 byte into the
+	 * high half of an fp16 makes a float with that byte as its sign and
+	 * exponent, which is garbage of a wildly varying magnitude, and the
+	 * impulse duly comes back at the rails. A real fp16 activation is the
+	 * next step and is what charsiu_pack_input_f16 below is for.
+	 */
+	memset(dst, wide ? 0 : (uint8_t)(input_zero_point - 0x80), dst_size);
 	for (i = 0; i < mm->m; i++)
-		for (kk = 0; kk < mm->k; kk++)
-			dst[(kk / atom) * mm->m * atom + i * atom + kk % atom] =
+		for (kk = 0; kk < mm->k; kk++) {
+			size_t off = ((size_t)(kk / atom) * mm->m * atom
+				      + (size_t)i * atom + kk % atom) * esz;
+
+			dst[off + esz - 1] =
 				(uint8_t)(src[i * mm->k + kk] - 0x80);
+		}
+}
+
+/*
+ * Pack A[M][K] as real fp16, which is what int4 weights consume.
+ *
+ * Same tiling as the integer packer, an element being two bytes rather than one,
+ * and the value being an actual half rather than a byte dropped into half of
+ * one. There is no zero point: a float carries its own sign, so the caller
+ * passes the dequantised values it means.
+ */
+void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
+			    uint8_t *dst, size_t dst_size)
+{
+	unsigned atom = charsiu_feature_atom(CHARSIU_FP16);
+	unsigned i, kk;
+
+	memset(dst, 0, dst_size);
+	for (i = 0; i < mm->m; i++)
+		for (kk = 0; kk < mm->k; kk++) {
+			size_t off = ((size_t)(kk / atom) * mm->m * atom
+				      + (size_t)i * atom + kk % atom) * 2;
+			uint16_t h = charsiu_float_to_half(src[i * mm->k + kk]);
+
+			dst[off] = (uint8_t)(h & 0xff);
+			dst[off + 1] = (uint8_t)(h >> 8);
+		}
 }
 
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
@@ -209,54 +304,58 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	memset(dst, 0, charsiu_weight_bytes(mm));
 
 	/*
-	 * INT4 IS WRONG HERE AND THIS IS NOT THE LAYOUT. Left in place because
-	 * something has to be written and a placeholder that computes nothing
-	 * hides worse than one that computes the wrong thing loudly.
+	 * INT4, PLACED WHERE THE HARDWARE WAS MEASURED TO LOOK, and no further.
 	 *
-	 * What it writes is [n/32][k/64][n%32][k%64] with byte = k % 32 and
-	 * nibble = (k % 64) / 32, which rounds 167 and 168 appeared to measure
-	 * and round 171 WITHDREW. Those two rounds filled the whole weight
-	 * buffer, every low nibble and then every high nibble, and a full fill
-	 * is invariant under any layout that is a bijection: it can only show
-	 * that the layout IS a permutation, never which one.
+	 * The sparse map (tools/charsiu_int4.c --map) reads the fetch directly,
+	 * one live nibble at a time. At K = 64 and N = 64 it says:
 	 *
-	 * WHAT A SPARSE PROBE HAS SINCE MEASURED, one live nibble at a time
-	 * (tools/charsiu_int4.c --map), at K = 64 and N = 64:
+	 *   channel n is read from byte (n / 32) * 512 + (n % 32) * 8,
+	 *   eight bytes, and NOTHING ELSE in the buffer is fetched at all
 	 *
-	 *   int8, for comparison   512 of 512 probes light, no dead region,
-	 *                          n = byte / 32 and k = byte % 32, which is
-	 *                          exactly what the int8 path below writes
-	 *   int4                   128 of 512 light, a QUARTER of the buffer,
-	 *                          and the row is 8 bytes rather than 32
+	 * with the same 8 byte row at K = 32, 64 and 128 and at N = 32 and 64, so
+	 * the row does not grow with K. The same probe on int8 lights 512 of 512
+	 * with n = byte / 32 and k = byte % 32, which is what the int8 path below
+	 * writes, so the probe is known good on a case whose answer is known.
 	 *
-	 * So the hardware's int4 k group is 16 weights where int8's is 32, and
-	 * this code's 64 is wrong. The n grouping does not fit either: channels
-	 * 0 to 31 are read from bytes 0 to 255 and 32 to 63 from 512 to 767,
-	 * a group stride of 512 where a k group of 16 predicts 1024.
+	 * WHAT IS NOT KNOWN, and is therefore not written here: which k those 16
+	 * nibbles are, in what order, and where k = 16 and above go. The map's k
+	 * column is unusable for int4 because a nibble reaches more than one
+	 * input, and every byte outside the rows above is dead, so there is no
+	 * data about the rest. Rounds 167, 168, 171 and 173 all went wrong by
+	 * filling that gap with a guess.
 	 *
-	 * Where k = 16 and above live is NOT KNOWN. Those regions are dead in
-	 * the map, so there is no data about them, and guessing is what the two
-	 * withdrawn rounds did.
+	 * So this places k = 0 to 15 into the measured row and REFUSES the rest.
+	 * A K above 16 comes back short on purpose: a packer that quietly invents
+	 * placements is what produced three withdrawn results.
+	 *
+	 * CHARSIU_INT4_ORDER picks the intra row order, which is the one thing
+	 * left to guess and is therefore a knob rather than a decision:
+	 *   0 (default)  byte j holds k = 2j low and k = 2j+1 high, interleaved
+	 *   1            low nibbles are k = 0..7 and high are k = 8..15, halved
 	 */
 	if (mm->wdtype == CHARSIU_INT4) {
+		unsigned order = getenv("CHARSIU_INT4_ORDER")
+			? (unsigned)atoi(getenv("CHARSIU_INT4_ORDER")) : 0;
+
 		for (n = 0; n < mm->n; n++) {
-			unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
+			size_t row = (size_t)(n / 32) * 512 + (size_t)(n % 32) * 8;
 
-			for (k = 0; k < mm->k; k++) {
-				unsigned kgi = k / kg;
-				unsigned kgsz = MIN2(mm->k - kgi * kg, kg);
-				unsigned kbytes = (kgsz + 1) / 2;
-				unsigned kin = k % kg;
-				size_t off = (size_t)ngi * ng * mm->k / 2
-					   + (size_t)kgi * kbytes * ngsz
-					   + (size_t)(n % ng) * kbytes
-					   + kin % (kg / 2);
+			for (k = 0; k < mm->k && k < 16; k++) {
 				unsigned nib = src[(size_t)n * mm->k + k] & 0xf;
+				size_t b;
+				unsigned high;
 
-				if (kin >= kg / 2)
-					dst[off] |= (uint8_t)(nib << 4);
+				if (order) {
+					b = row + (k % 8);
+					high = k >= 8;
+				} else {
+					b = row + k / 2;
+					high = k & 1;
+				}
+				if (high)
+					dst[b] |= (uint8_t)(nib << 4);
 				else
-					dst[off] |= (uint8_t)nib;
+					dst[b] |= (uint8_t)nib;
 			}
 		}
 		return;
