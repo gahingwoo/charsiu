@@ -90,6 +90,14 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
  * Pack B[N][K] row major into the NPU's weight tile order, for `dtype`.
  * `dst` must hold charsiu_weight_bytes(mm) bytes.
  */
+/*
+ * Pack A[M][K] row major into [K/atom][M][atom], biased by -0x80. `dst_size` is
+ * the whole buffer, which is filled with the biased zero point first because
+ * the CBUF reads past what a matmul writes.
+ */
+void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
+			uint8_t *dst, size_t dst_size, uint8_t input_zero_point);
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst);
 

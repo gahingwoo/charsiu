@@ -82,40 +82,45 @@ static struct requant requant_of(const struct charsiu_job *job)
 	r.scale = scale;
 	r.shift = shift - 1;
 	/*
-	 * THE OUTPUT ZERO POINT, and a gap in what is understood.
+	 * THE OUTPUT STAGE, solved. Rounds 160 to 162 put three entries on it
+	 * that move the accumulator, the bias and this register independently,
+	 * and ONE model accounts for all 192 bytes with nothing off by a single
+	 * count:
 	 *
-	 * Mesa writes out_zp - 0x80 here and computes correctly, which reads as
-	 * the hardware adding an implicit 0x80 of its own. Board, round 152,
-	 * says otherwise for charsiu's configuration: with the input held at the
-	 * zero point so the MAC is exactly zero, a bias ramp came back as the
-	 * requantised ramp with NO zero point added, its negative half clamped
-	 * at zero, its slope right to within rounding.
+	 *     out = clamp(requant + offset, -128, 127), stored as int8
 	 *
-	 * So the measurement says out_zp and the port says out_zp - 0x80, and
-	 * both cannot be right about the same hardware. Rather than pick by
-	 * argument, CHARSIU_OUT_OFF overrides it and the round runs both.
+	 * Two things fall out of it, and both correct this file.
+	 *
+	 * ROUND 163 CORRECTED ROUND 163. Its first entry was written to be the
+	 * milestone and instead it falsified the model that entry was based on:
+	 * with the offset at 0, the negative half came back at 0 rather than
+	 * negative, while the positive half was exact to the byte. The three
+	 * entries the earlier model was fitted to all had an offset that made a
+	 * floor at zero and a rail at -128 predict the same output, so they
+	 * could not tell them apart. This one could. The floor is real.
+	 *
+	 * out = clamp(max(requant, 0) + offset, -128, 127), stored as int8
+	 *
+	 * 64 of 64 on all three of round 163's entries; without the floor, 32
+	 * and 34 of 64 on the two that distinguish. So there IS a fused ReLU,
+	 * the thing this file said twice there was not.
+	 *
+	 * It does not matter, and that is the useful part. Lift the accumulator
+	 * by 128 in the requant domain before the floor and take the same 128
+	 * back here, and the floor never reaches anything while the offset
+	 * undoes the lift exactly:
+	 *
+	 *     max(rq + 128, 0) + (out_zp - 128) = rq + out_zp for rq >= -128
+	 *
+	 * which is the whole signed range. See the lift in charsiu_build_coefs.
+	 * The rule that falls out, offset = out_zp - 0x80, is the one Mesa has
+	 * used all along.
 	 */
 	{
 		const char *o = getenv("CHARSIU_OUT_OFF");
 
-		/*
-		 * MEASURED, round 155. The hardware computes
-		 *
-		 *     out = clamp(requant(acc + A) - offset, 0, 255)
-		 *
-		 * so the register is an output domain addend with the sign the
-		 * other way round from the name it was given here. Sweeping it
-		 * on a bias ramp: 0 caps the output at 127 and loses the top
-		 * half of the byte, -128 gives the full 0 to 255 with every
-		 * value exactly 128 higher, and +127 or +128 saturate the whole
-		 * surface flat.
-		 *
-		 * -0x80 is therefore what makes the byte reachable, and the
-		 * output zero point rides in A only for the part that is not
-		 * this 128. For an output zero point of 128 that is nothing at
-		 * all, which is why the fold is off by default now.
-		 */
-		r.offset = o ? (int32_t)strtol(o, NULL, 0) : -0x80;
+		r.offset = o ? (int32_t)strtol(o, NULL, 0)
+			     : (int32_t)job->output_zero_point - 0x80;
 	}
 	return r;
 }
@@ -208,30 +213,45 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 		 * A carries the bias, the input zero point correction, AND the
 		 * OUTPUT zero point.
 		 *
-		 * The last of those is a measured workaround, not an
-		 * understanding. Board, round 152: with the MAC held at exactly
-		 * zero, the output came back as the requantised bias with no
-		 * zero point added, its negative half clamped at zero. Round
-		 * 153 then wrote the zero point into 0x40ac directly and the
-		 * whole surface saturated to a flat 127, so that register is
-		 * not an output domain addend, whatever it is.
+		 * The last of those is now derived rather than guessed. Rounds
+		 * 160 and 161 measured the output stage end to end, on two
+		 * probes that between them move the accumulator and the bias
+		 * independently, and it is
 		 *
-		 * A is added to the accumulator before the requant, so adding
-		 * out_zp / mult there puts out_zp on the output exactly, in
-		 * integer arithmetic. It costs one rounding at the edge and it
-		 * is honest about being a workaround: Mesa writes out_zp - 0x80
-		 * into 0x40ac and is byte exact on models with both zero
-		 * points, so there is something about that register this does
-		 * not yet know.
+		 *     out = (clamp(mult * (acc + A), 0, 255) - offset) mod 256
+		 *
+		 * with the clamp BEFORE the offset. The floor at zero is that
+		 * clamp's lower end, and it is why a projection loses its
+		 * negative half: nothing about the offset can put back a number
+		 * that was clamped away before the offset was applied.
+		 *
+		 * THE LIFT, which is what makes a signed result survive the
+		 * hardware's floor at zero.
+		 *
+		 * The output stage is
+		 *
+		 *     out = clamp(max(requant, 0) + offset, -128, 127)
+		 *
+		 * so a negative requant is lost before the offset can do
+		 * anything about it. Adding 128/mult to A raises the whole
+		 * surface by exactly 128 in the requant domain, which puts every
+		 * value a signed byte can hold above the floor, and the offset
+		 * takes the same 128 back. Nothing is approximated: the lift is
+		 * added to an int32 accumulator and removed in the output
+		 * domain, so the only cost is the one rounding the requant
+		 * already had.
+		 *
+		 * CHARSIU_NO_LIFT is the control. Without it the negative half
+		 * of any two sided result comes back flat at the output zero
+		 * point, which is what rounds 152 to 163 were looking at and
+		 * calling a blocker.
 		 */
 		float mult = job->input_scale * job->weight_scale /
 			     job->output_scale;
 
 		*a = bias[oc] - (job->input_zero_point - 0x80) * weight_sums[oc]
-		   + (getenv("CHARSIU_ZP_FOLD")
-		      ? (int32_t)((float)(job->output_zero_point - 0x80) / mult
-				  + 0.5f)
-		      : 0);
+		   + (getenv("CHARSIU_NO_LIFT")
+		      ? 0 : (int32_t)(128.0f / mult + 0.5f));
 		*b = (int16_t)(0x80 - job->weight_zero_point);
 		*c = 16;                /* per tensor: every channel at the max */
 	}
@@ -338,12 +358,18 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
 	emit(&e, CNA, 0x1094, rows);            /* inw * full_inh */
 	/*
-	 * Rounded UP to a multiple of four. The vendor's single row matmuls
-	 * carry a plain 1 here and Mesa's working stream for the same shape
-	 * carries 4, so the hardware takes either and Mesa's is the one proven
-	 * on this path.
+	 * Rounded UP to a multiple of four, which is Mesa's rule.
+	 *
+	 * This is the ONLY register where charsiu's whole stream differs from a
+	 * vendor int8 convolution compiled at this exact shape, once addresses,
+	 * this model's quantisation and the four op enables are set aside:
+	 * charsiu writes 4 and the vendor writes 1. Mesa's value is the one
+	 * proven on this path, so it stays the default, and CHARSIU_CNA_1098
+	 * asks the board whether the difference matters.
 	 */
-	emit(&e, CNA, 0x1098, (rows * 1 + 3) & ~3u);
+	emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
+	     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
+	     : ((rows * 1 + 3) & ~3u));
 	emit(&e, CNA, 0x109c, 0x00000000);
 	emit(&e, CNA, 0x1100, 0x00000000);
 	emit(&e, CNA, 0x1104, 0x00000000);
@@ -368,13 +394,16 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x402c, mm->n - 1);
 	/*
 	 * 0x4030's low half. Mesa uses 0x0710 for a regular convolution and
-	 * 0x0310 for a depthwise one, and the VENDOR'S OWN MATMULS use 0x0310:
-	 * it is the only DPU register its convolution streams carry at all, and
-	 * it reads 0x03ff0310 at 1024 output channels and 0x003f0310 at 64.
+	 * 0x0310 for a depthwise one, and 0x0710 is right here.
 	 *
-	 * That matters here because the output stage is where charsiu is stuck:
-	 * the requant result is clamped into 0 to 127 before the offset is
-	 * applied, and this field is on the output side of the same unit.
+	 * THE COMMENT THIS REPLACES WAS WRONG, and it cost round 158. It said
+	 * the vendor's own matmuls use 0x0310, read off the .rkllm streams that
+	 * carry 0x03ff0310 and 0x003f0310. Those streams have ONE output
+	 * channel and zero weight bytes: they are not matmuls at all, and the
+	 * 8308 streams that ARE the projections do not write this register.
+	 * Compiling the vendor's own int8 convolution at this exact shape
+	 * (vendor-capture/gen_act.py, geom/a_lin_m1) settles it: 0x003f0710,
+	 * which is what this line already emitted.
 	 */
 	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) |
 	     (uint32_t)(getenv("CHARSIU_DPU_4030")
@@ -394,9 +423,44 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4050, 0x80011111);
 	emit(&e, DPU, 0x4058, 0x80000000);
 	emit(&e, DPU, 0x405c, 0x7fffffff);
+	/*
+	 * THE ACTIVATION, and it is already off.
+	 *
+	 * Compiling one int8 convolution twice, with and without a ReLU, and
+	 * diffing the two register streams (vendor-capture/gen_act.py) names the
+	 * control exactly: 0x4060 is 0x0902 with the ReLU and 0x0903 without,
+	 * and 0x406c and 0x4074 are the two stage minimums, 0 with the ReLU and
+	 * INT32_MIN without. The maximums at 0x4070 and 0x4078 do not move,
+	 * which is what a ReLU is: a floor, not a ceiling. A third model, linear
+	 * again with different weights, is the control that separates these from
+	 * the quantisation registers, and it does: 0x40ac and 0x40b0 move
+	 * between the two linears and these three do not.
+	 *
+	 * charsiu already emitted all three at their linear values, so whatever
+	 * confines its output is NOT the fused ReLU. CHARSIU_DPU_406C forces the
+	 * minimum so a board round can check that this register reaches the
+	 * hardware at all: setting it to 0 must cost the output its low half, and
+	 * if it changes nothing the identification above is wrong.
+	 */
 	emit(&e, DPU, 0x4060, 0x00000903);
-	emit(&e, DPU, 0x406c, 0x80000000);
-	emit(&e, DPU, 0x4070, 0x7fffffff);
+	emit(&e, DPU, 0x406c, (uint32_t)(getenv("CHARSIU_DPU_406C")
+					 ? strtoul(getenv("CHARSIU_DPU_406C"), NULL, 0)
+					 : 0x80000000u));
+	/*
+	 * CHARSIU_DPU_4070, the other half of the liveness test. Round 159's
+	 * control was UNFALSIFIABLE and that is worth writing down: it set the
+	 * minimum to 0, which can only floor the channels whose accumulator is
+	 * already negative, and those are exactly the channels the symptom
+	 * already floors. Both branches of the rule predicted the same bytes,
+	 * and the run duly produced them.
+	 *
+	 * A control has to bite where the output is currently RIGHT. A maximum
+	 * BELOW the whole range, or a minimum ABOVE it, flattens a surface that
+	 * is otherwise correct, so a stage that is connected cannot hide.
+	 */
+	emit(&e, DPU, 0x4070, (uint32_t)(getenv("CHARSIU_DPU_4070")
+					 ? strtoul(getenv("CHARSIU_DPU_4070"), NULL, 0)
+					 : 0x7fffffffu));
 	emit(&e, DPU, 0x4074, 0x80000000);
 	emit(&e, DPU, 0x4078, 0x7fffffff);
 	emit(&e, DPU, 0x407c, 0x010041c1);

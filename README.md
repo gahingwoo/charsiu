@@ -4,23 +4,47 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** charsiu reaches the NPU on its own and computes. It opens
-`/dev/accel/accel0` through the mainline `rocket` driver, packs the operands into the
-hardware's tile layouts, builds the coefficient buffer, emits the register stream,
-submits it, and gets back an answer that tracks a CPU reference to within about three
-counts. No Mesa, no vendor runtime, nothing borrowed at run time.
+**Status.** charsiu computes a signed int8 matmul on the NPU, **byte exact** against a
+CPU reference. It opens `/dev/accel/accel0` through the mainline `rocket` driver, packs
+the operands into the hardware's tile layouts, builds the coefficient buffer, emits the
+register stream and submits it. No Mesa, no vendor runtime, nothing borrowed at run
+time.
 
-It is not a runtime yet. What is left, and it has a name:
+Measured on a ROCK 4D, 2026-08-15, every value identical to the reference rather than
+close to it:
 
-- the output floors at the zero point, because the hardware's **fused ReLU** is on and
-  this silicon applies it AT the zero point. Every Teflon model carries a ReLU, so the
-  Mesa driver has never had to turn it off; a matmul must, since a projection's output
-  is signed. Finding that enable is the current work.
-- the reference still requantises in float where the hardware uses an integer scale
-  and shift, which is most of the three counts.
+| probe | shape | result |
+|---|---|---|
+| dense | M=1 K=64 N=64 | 64 of 64 bytes exact |
+| negative MAC, output -66 to +63 | M=1 K=64 N=64 | 64 of 64 bytes exact |
+| bias ramp | M=1 K=64 N=64 | 64 of 64 bytes exact |
+| impulse | M=1 K=64 N=64 | 64 of 64 bytes exact |
+| dense, a projection's shape | M=1 K=512 N=1024 | 1024 of 1024, fit slope 1.0000 |
+
+The two things that had to be understood to get there are worth stating because both
+were wrong in this file before:
+
+- **both operands are signed bytes.** The weight is stored biased by `-0x80` and so is
+  the input; storing the input raw makes a byte of 168, meaning +40 against a zero
+  point of 128, arrive as -88.
+- **the output stage is** `out = clamp(max(requant, 0) + offset, -128, 127)`, an int8
+  with a floor under it. The floor is a real fused ReLU and it does not need to be
+  switched off: lifting the accumulator by 128 in the requant domain puts every value a
+  signed byte can hold above it, and the offset takes the same 128 back, which is
+  exactly Mesa's `out_zp - 0x80`.
+
+It is not a runtime yet. What is left:
+
+- **no model runs.** The matmul is correct; the KV cache, the sampler, the per token
+  geometry and the CPU/NPU split are not written.
+- the reference still requantises in float where the hardware uses an integer scale and
+  shift. It agrees to the byte on everything measured so far, which does not mean it
+  will at every scale.
 - **int4 is deliberately not written.** Its N group of 64 is copied from the RK3588
   notes and has never been confirmed on this silicon, and a `.rkllm` gives geometry
   rather than layout. int8 and fp16 are enough to prove the path and to time it.
+- **nothing has been timed.** There is no performance number here yet, and the target
+  is the vendor's own on the same board and model.
 
 The three tools that got it there are in the repository rather than in a shell history,
 because every step that worked was a diff against something known to compute:
@@ -108,12 +132,15 @@ $ charsiu_matmul 1 64 64          # M=1, the shape an LLM decodes with
 matmul M=1 K=64 N=64 int8, feature atom 16, 1 entries per row
 register stream: 143 entries
 submit ok
-output: 64 of 64 bytes written
+output: 64 of 64 bytes written, 64 BYTE EXACT, 0 differ by more than 1
 ```
 
 The stream those 143 entries make is identical to the one Mesa emits for the same
-shape, entry for entry, values and order, addresses and quantisation aside. That is
-checked on a desktop, not on the board.
+shape, entry for entry, values and order, addresses and quantisation aside, and it is
+also identical to what the vendor's own compiler produces for that shape with no
+activation. Both are checked on a desktop, not on the board:
+`vendor-capture/cmp_charsiu.py` in the driver repository diffs the whole stream against
+a vendor `.rknn` compiled at charsiu's exact geometry.
 
 ## The instrument
 

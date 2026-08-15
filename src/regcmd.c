@@ -151,6 +151,43 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	return e.n > max ? 0 : e.n;
 }
 
+/*
+ * Pack A[M][K] into [K/atom][M][atom], BIASED BY -0x80 like the weights.
+ *
+ * ROUND 161 MEASURED THIS, and it corrects what the weight packer below still
+ * says about the input. The MAC does not take the input raw and subtract 0x80
+ * itself: it reads the byte as a SIGNED value, exactly as it reads the weight.
+ * Writing the raw uint8 makes an input of 168, which means +40 against a zero
+ * point of 128, arrive as -88.
+ *
+ * The board says so with no room left in it. A probe with a zero bias and a MAC
+ * walking through zero (CHARSIU_NEG) came back matching
+ *
+ *     out = (clamp(int8(in) * K * d * mult, 0, 255) + 128) mod 256
+ *
+ * on 64 of 64 channels with no value off by even one, where the raw reading
+ * misses 63 of the 64. The same model, at the much smaller amplitude the bias
+ * ramp probe uses, also accounts for the residual that had been written off as
+ * three counts of rounding: an input held at 128 arrives as -128 rather than 0,
+ * so the MAC is -128 * weight_sum instead of exactly zero, which is +-3 at that
+ * scale. It was never rounding.
+ *
+ * The CNA's own pad register agrees, and did all along. It carries
+ * in_zp - 0x80, not in_zp.
+ */
+void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
+			uint8_t *dst, size_t dst_size, uint8_t input_zero_point)
+{
+	unsigned atom = charsiu_feature_atom(mm->adtype);
+	unsigned i, kk;
+
+	memset(dst, (uint8_t)(input_zero_point - 0x80), dst_size);
+	for (i = 0; i < mm->m; i++)
+		for (kk = 0; kk < mm->k; kk++)
+			dst[(kk / atom) * mm->m * atom + i * atom + kk % atom] =
+				(uint8_t)(src[i * mm->k + kk] - 0x80);
+}
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst)
 {
@@ -187,9 +224,12 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			/*
 			 * STORED BIASED BY -0x80, as a signed byte.
 			 *
-			 * The MAC computes sum((in - 0x80) * w_stored) with the
-			 * input taken raw and the weight taken as it lies, so
-			 * the weight has to carry its own subtraction. Storing
+			 * The MAC computes sum(in_stored * w_stored) with BOTH
+			 * operands taken as signed bytes, so each has to carry
+			 * its own subtraction. Round 150 established that for
+			 * the weight; round 161 established the same for the
+			 * input, which this comment used to say was taken raw
+			 * and was wrong about for eleven rounds. Storing
 			 * the raw uint8 instead makes a weight at the zero
 			 * point, 128, read as -128, and every dead tap in an
 			 * impulse then contributes the largest negative value
