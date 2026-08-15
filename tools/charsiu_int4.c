@@ -439,7 +439,18 @@ int main(int argc, char **argv)
 	in_handles[2] = coef.handle;
 	out_handles[0] = outbo.handle;
 
-	for (p = 0; p < sizeof(pats) / sizeof(pats[0]); p++) {
+	/*
+	 * THE PATTERN PROBES SUBMIT, and that is why round 187's --wedge could
+	 * not answer its own question. --wedge asked how many w4a16 jobs it
+	 * takes before the NPU cannot start an int8 one, and its N = 0 row had
+	 * FIVE behind it, because this loop runs before every sub command and
+	 * the weight dtype is int4. Its control caught it. Any sub command now
+	 * gets a clean device.
+	 */
+	if (argc > 4)
+		printf("  pattern probes SKIPPED for a sub command: no job has run\n"
+		       "  on this device yet\n\n");
+	for (p = 0; argc <= 4 && p < sizeof(pats) / sizeof(pats[0]); p++) {
 		unsigned live = 0, distinct = 0, seen[256] = { 0 };
 		unsigned even = 0, odd = 0;
 		uint8_t *o;
