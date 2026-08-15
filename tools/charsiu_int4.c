@@ -412,7 +412,7 @@ int main(int argc, char **argv)
 	ret |= charsiu_bo_alloc(dev, charsiu_weight_bytes(&job.mm) + 4096, &wt);
 	/* w4a16 writes a FLOAT out, two bytes an element, so the output buffer
 	 * is twice what an int8 job needs */
-	ret |= charsiu_bo_alloc(dev, (size_t)m * n * 2 + 4096, &outbo);
+	ret |= charsiu_bo_alloc(dev, (size_t)m * n * 4 + 4096, &outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef);
 	if (ret) { printf("bo alloc FAILED %d\n", ret); return 1; }
 
@@ -514,6 +514,148 @@ int main(int argc, char **argv)
 	 *             the element being 16 bits is measured and its being a
 	 *             FLOAT is not, so that is the part that comes down.
 	 */
+	/*
+	 * --osweep: read the OUTPUT format the same way the weight layout was
+	 * read, by making the input sparse and looking at where the answer
+	 * lands. Round 184 spent four runs fitting lines against an output whose
+	 * element width was assumed and wrong.
+	 *
+	 * WHAT ROUND 184 ACTUALLY SHOWED. Read as 16 halves, the outputs fell
+	 * into a period of four: index %4==0 moved with the activation, %4==1
+	 * was always 0xffff, %4==2 moved with the nibble but not the activation,
+	 * and %4==3 was always 0x0000. Pair them up little endian and that is
+	 * eight 32 bit integers, alternating sign, with 0xffff and 0x0000 as the
+	 * high halves of negative and positive values:
+	 *
+	 *   [94 f1][ff ff] -> 0xfffff194 = -3692
+	 *   [a4 10][00 00] -> 0x000010a4 = +4260
+	 *
+	 * That also corrects round 181. The registers 0x40b0 = 1 and 0x40b4 = 0
+	 * say the stage does not REQUANTISE. "So the output is a float" was
+	 * added on top of that and never measured. An un-requantised output is
+	 * the raw accumulator, which is an integer.
+	 *
+	 * SO STOP ASSUMING. One live nibble in the entire weight buffer, in one
+	 * channel, and dump the output bytes. Sweep the channel.
+	 *
+	 *   one run of bytes moves, and its start tracks the channel
+	 *             the run length is the element width and the difference
+	 *             between starts is the channel stride, both read rather
+	 *             than fitted.
+	 *   the same bytes move whatever the channel is
+	 *             the output is not written per channel and every per
+	 *             channel reading in this file is wrong.
+	 *   nothing is non zero for any channel
+	 *             one nibble against this activation is below whatever the
+	 *             stage keeps, and the probe needs a bigger one.
+	 *
+	 * THE CONTROL THAT CAN FAIL is the first entry, with NO live nibble
+	 * anywhere. Round 184 measured that as all zero, so anything non zero
+	 * here means the output does not come from the weight buffer and the
+	 * whole sweep is unreadable.
+	 *
+	 * The activation is a single constant, so nothing in the output can
+	 * track an activation index; the only thing left varying is the channel.
+	 */
+	if (argc > 4 && !strcmp(argv[4], "--osweep")) {
+		static const unsigned probe[] = { 64, 0, 1, 2, 3, 4, 5, 8, 16, 32, 63 };
+		float *af = malloc((size_t)m * k * sizeof(*af));
+		size_t obytes = (size_t)m * n * 4;
+		unsigned pi;
+
+		for (i = 0; i < m * k; i++)
+			af[i] = 8.0f;
+		charsiu_bo_prep(dev, &in, 1000000000);
+		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
+		charsiu_bo_fini(dev, &in);
+
+		printf("\n  --osweep: ONE live nibble of %u in the whole weight buffer,\n"
+		       "  at k = 0 of one channel, activation a constant 8.0 everywhere,\n"
+		       "  and %zu output bytes dumped with NO assumption about how wide\n"
+		       "  an element is. The first row has no live nibble at all and is\n"
+		       "  the control: it must come back with nothing non zero.\n\n",
+		       g_live, obytes);
+
+		for (pi = 0; pi < sizeof(probe) / sizeof(probe[0]); pi++) {
+			unsigned n0 = probe[pi];
+			unsigned sent = 0, nz = 0, first = 0, last = 0, seen = 0;
+			uint8_t *o;
+
+			charsiu_bo_prep(dev, &wt, 1000000000);
+			memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
+			if (n0 < n) {
+				size_t row = (size_t)(n0 / 32) * 512 +
+					     (size_t)(n0 % 32) * 8;
+
+				((uint8_t *)wt.map)[row] = (uint8_t)g_live;
+			}
+			charsiu_bo_fini(dev, &wt);
+
+			charsiu_bo_prep(dev, &outbo, 1000000000);
+			memset(outbo.map, 0xa5, obytes);
+			charsiu_bo_fini(dev, &outbo);
+
+			if (charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles,
+					   3, out_handles, 1) ||
+			    charsiu_bo_prep(dev, &outbo, 2000000000)) {
+				printf("  channel %-4u  submit or wait FAILED\n", n0);
+				continue;
+			}
+			o = outbo.map;
+			for (i = 0; i < obytes; i++) {
+				if (o[i] == 0xa5)
+					sent++;
+				if (o[i]) {
+					nz++;
+					if (!seen) { first = i; seen = 1; }
+					last = i;
+				}
+			}
+			if (n0 >= n)
+				printf("  NO live nibble  ");
+			else
+				printf("  channel %-7u ", n0);
+			printf("sentinel %3u/%3zu  nonzero %3u", sent, obytes, nz);
+			if (seen)
+				printf("  bytes %u..%u", first, last);
+			printf("\n");
+			if (seen) {
+				unsigned b;
+
+				printf("      ");
+				for (b = first & ~3u; b <= (last | 3u) && b < obytes; b++) {
+					printf("%02x", o[b]);
+					if ((b & 3) == 3)
+						printf(" ");
+				}
+				printf("   (from byte %u)\n", first & ~3u);
+			}
+			charsiu_bo_fini(dev, &outbo);
+		}
+		/*
+		 * The whole buffer once, so the reader can see what the stage
+		 * writes into the bytes that are not the answer.
+		 */
+		printf("\n  and the whole buffer for the last channel above:\n");
+		{
+			uint8_t *o = outbo.map;
+
+			charsiu_bo_prep(dev, &outbo, 1000000000);
+			o = outbo.map;
+			for (i = 0; i < obytes; i += 16) {
+				unsigned b;
+
+				printf("      %3u  ", i);
+				for (b = i; b < i + 16 && b < obytes; b++)
+					printf("%02x%s", o[b], (b & 3) == 3 ? " " : "");
+				printf("\n");
+			}
+			charsiu_bo_fini(dev, &outbo);
+		}
+		charsiu_close(dev);
+		return 0;
+	}
+
 	if (argc > 4 && !strcmp(argv[4], "--f16")) {
 		/*
 		 * ROUND 184 BREAKS A CONFOUND THIS PROBE HAS CARRIED SINCE
@@ -577,7 +719,7 @@ int main(int argc, char **argv)
 		charsiu_bo_fini(dev, &wt);
 
 		charsiu_bo_prep(dev, &outbo, 1000000000);
-		memset(outbo.map, 0xa5, (size_t)m * n * 2);
+		memset(outbo.map, 0xa5, (size_t)m * n * 4);
 		charsiu_bo_fini(dev, &outbo);
 		if (charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles, 3,
 				   out_handles, 1) ||
@@ -605,9 +747,27 @@ int main(int argc, char **argv)
 			       af[c % 16], af[c % 16] * (float)g_live, got, h);
 		}
 		j = 0;
-		for (c = 0; c < m * n * 2; c++)
+		for (c = 0; c < m * n * 4; c++)
 			if (((uint8_t *)outbo.map)[c] == 0xa5) j++;
-		printf("\n  %u of %u bytes still hold the sentinel\n", j, m * n * 2);
+		printf("\n  %u of %u bytes still hold the sentinel\n", j, m * n * 4);
+		/*
+		 * THE SAME BYTES READ AS 32 BIT INTEGERS. Round 184's halves
+		 * came out in a period of four, with 0xffff and 0x0000 sitting
+		 * in every second slot, which is what the high half of a signed
+		 * 32 bit value looks like. The registers only say the stage does
+		 * not requantise; an un-requantised output is the accumulator,
+		 * and that is an integer. Both readings are printed so the one
+		 * that is wrong can be seen to be wrong.
+		 */
+		printf("\n  the same bytes as 32 bit integers, which is what an\n"
+		       "  un-requantised accumulator would be:\n");
+		for (c = 0; c < 8 && c * 4 + 3 < m * n * 4; c++) {
+			uint32_t u = (uint32_t)o[c * 4] | ((uint32_t)o[c * 4 + 1] << 8) |
+				     ((uint32_t)o[c * 4 + 2] << 16) |
+				     ((uint32_t)o[c * 4 + 3] << 24);
+
+			printf("    element %-3u 0x%08x  %12d\n", c, u, (int32_t)u);
+		}
 		for (c = 0; c < 16 && c < n; c++) {
 			uint16_t h = (uint16_t)(o[c * 2] | (o[c * 2 + 1] << 8));
 
@@ -637,7 +797,15 @@ int main(int argc, char **argv)
 				yy[nn] = got;
 				nn++;
 			}
-			printf("\n  %u finite varying channels\n", nn);
+			/*
+			 * NOT "varying". Round 184 called these varying and
+			 * four of the eight were constants that did not move
+			 * between two runs with different activations, which
+			 * poisoned both fits. Whether a slot varies can only be
+			 * seen ACROSS runs, never within one.
+			 */
+			printf("\n  %u finite non zero halves"
+			       "  (whether they VARY needs two runs to say)\n", nn);
 			fit_line("the activation", xa, yy, nn, (double)g_live);
 			fit_line("the channel index", xc, yy, nn, 0);
 			printf("\n  THE RULE, WRITTEN BEFORE THE RUN.\n"
