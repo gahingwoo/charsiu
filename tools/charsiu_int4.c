@@ -361,7 +361,9 @@ int main(int argc, char **argv)
 	ret = charsiu_bo_alloc(dev, 4096, &regcmd);
 	ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096, &in);
 	ret |= charsiu_bo_alloc(dev, charsiu_weight_bytes(&job.mm) + 4096, &wt);
-	ret |= charsiu_bo_alloc(dev, (size_t)m * n + 4096, &outbo);
+	/* w4a16 writes a FLOAT out, two bytes an element, so the output buffer
+	 * is twice what an int8 job needs */
+	ret |= charsiu_bo_alloc(dev, (size_t)m * n * 2 + 4096, &outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef);
 	if (ret) { printf("bo alloc FAILED %d\n", ret); return 1; }
 
@@ -489,7 +491,7 @@ int main(int argc, char **argv)
 		charsiu_bo_fini(dev, &wt);
 
 		charsiu_bo_prep(dev, &outbo, 1000000000);
-		memset(outbo.map, 0xa5, (size_t)m * n);
+		memset(outbo.map, 0xa5, (size_t)m * n * 2);
 		charsiu_bo_fini(dev, &outbo);
 		if (charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles, 3,
 				   out_handles, 1) ||
@@ -499,20 +501,55 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		o = outbo.map;
-		printf("\n  --f16: a REAL fp16 activation, one live nibble of %d per\n"
-		       "  channel at k = c mod 16. activation[k] = (k mod 32) - 16.\n\n",
-		       LIVE);
-		printf("  %-4s %-10s %-10s %-10s\n", "c", "act[c%%16]", "npu", "npu*");
+		printf("\n  --f16: w4a16. A real fp16 activation, one live nibble of\n"
+		       "  %d per channel at k = c mod 16, and the output read as HALVES\n"
+		       "  because the vendor's own configuration requantises with\n"
+		       "  0x40b0 = 1 and 0x40b4 = 0, which is identity.\n\n", LIVE);
+		printf("  %-4s %-12s %-12s %-12s %-10s\n",
+		       "c", "act[c%%16]", "expected", "npu (half)", "raw");
 		for (c = 0; c < 16 && c < n; c++) {
-			int v = o[c] > 127 ? o[c] - 256 : o[c];
+			uint16_t h = (uint16_t)(o[c * 2] | (o[c * 2 + 1] << 8));
+			float got = charsiu_half_to_float(h);
 
-			printf("  %-4u %-10.1f %-10d %-10d\n", c,
-			       af[c % 16], (int)o[c], v);
+			printf("  %-4u %-12.3f %-12.3f %-12.3f 0x%04x\n", c,
+			       af[c % 16], af[c % 16] * (float)LIVE, got, h);
 		}
 		j = 0;
-		for (c = 0; c < n; c++)
-			if (o[c] == 0xa5) j++;
-		printf("\n  %u of %u bytes still hold the sentinel\n", j, m * n);
+		for (c = 0; c < m * n * 2; c++)
+			if (((uint8_t *)outbo.map)[c] == 0xa5) j++;
+		printf("\n  %u of %u bytes still hold the sentinel\n", j, m * n * 2);
+		/*
+		 * THE FIT GOES IN THE LOG, over the channels that came back
+		 * finite and varying. Round 181 was read by eyeballing four
+		 * numbers off a table and computing the slope by hand, which is
+		 * how a sweep stride got read as a row size two rounds earlier.
+		 * The expected slope is LIVE and the expected intercept is 0.
+		 */
+		{
+			double sx = 0, sy = 0, sxx = 0, sxy = 0, nn = 0;
+
+			for (c = 0; c < 16 && c < n; c++) {
+				uint16_t h = (uint16_t)(o[c * 2] | (o[c * 2 + 1] << 8));
+				float got = charsiu_half_to_float(h);
+
+				if (!(got > -1e30f && got < 1e30f) || got == 0.0f)
+					continue;       /* nan, inf and the dead ones */
+				sx += af[c % 16]; sy += got;
+				sxx += (double)af[c % 16] * af[c % 16];
+				sxy += (double)af[c % 16] * got;
+				nn++;
+			}
+			if (nn >= 2) {
+				double den = nn * sxx - sx * sx;
+				double slope = den ? (nn * sxy - sx * sy) / den : 0;
+
+				printf("  fit over %g finite varying channels:"
+				       " npu = %.3f * act + %.1f   (want %d * act + 0)\n",
+				       nn, slope, (sy - slope * sx) / nn, LIVE);
+			} else {
+				printf("  fewer than two finite varying channels: no fit\n");
+			}
+		}
 		charsiu_close(dev);
 		return 0;
 	}

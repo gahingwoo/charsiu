@@ -138,6 +138,7 @@ enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm);
  * because int4 weights consume the activation as a 16 bit float and a runtime
  * has to be able to produce one. */
 uint16_t charsiu_float_to_half(float f);
+float charsiu_half_to_float(uint16_t h);
 
 /* Pack A[M][K] as real fp16, which is what int4 weights consume. No zero point:
  * a float carries its own sign, so pass the dequantised values. */

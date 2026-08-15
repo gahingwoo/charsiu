@@ -136,6 +136,28 @@ static struct requant requant_of(const struct charsiu_job *job)
  * when the channel count is a multiple of 8, and every layer that missed came
  * back an EMPTY convolution. That cost rounds 136 to 138 to find.
  */
+/* and back, for reading an fp16 output */
+float charsiu_half_to_float(uint16_t h)
+{
+	union { float f; uint32_t u; } v;
+	uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+	int32_t exp = (h >> 10) & 0x1f;
+	uint32_t man = h & 0x3ff;
+
+	if (!exp) {
+		if (!man) { v.u = sign; return v.f; }
+		/* subnormal: normalise it the slow, obvious way */
+		exp = 1;
+		while (!(man & 0x400)) { man <<= 1; exp--; }
+		man &= 0x3ff;
+	} else if (exp == 0x1f) {
+		v.u = sign | 0x7f800000 | (man << 13);
+		return v.f;
+	}
+	v.u = sign | ((uint32_t)(exp - 15 + 127) << 23) | (man << 13);
+	return v.f;
+}
+
 uint16_t charsiu_float_to_half(float f)
 {
 	union { float f; uint32_t u; } v = { .f = f };
@@ -267,7 +289,15 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 		 */
 		*b = (int16_t)((mm->wdtype == CHARSIU_INT4 ? 0 : 0x80)
 			       - job->weight_zero_point);
-		*c = 16;                /* per tensor: every channel at the max */
+		/*
+		 * 16 is Q4 for a relative scale of 1, which is the int8
+		 * convention. Whether it means the same thing on the w4a16 path
+		 * is unknown, and round 181 came back with a slope 20.3 times
+		 * what it should be, so CHARSIU_COEF_C makes it a knob: if the
+		 * slope moves with this, C is the gain.
+		 */
+		*c = (int16_t)(getenv("CHARSIU_COEF_C")
+			       ? atoi(getenv("CHARSIU_COEF_C")) : 16);
 	}
 	/* Carry the last real record across the rest of its group, so the group
 	 * holds no zero requant multiplier beside live channels. */
@@ -306,6 +336,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned rows = mm->m;
 	unsigned lines = rows - 1;              /* the DPU's line count */
 	size_t wbytes = charsiu_weight_bytes(mm);
+	int w4a16 = 0;
 	unsigned r;
 
 	/* The S_POINTER each unit latches its geometry against. Every unit gets
@@ -350,7 +381,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	emit(&e, CNA, 0x100c,
 	     (mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x00000000u) |
-	     (mm->adtype == CHARSIU_FP16 ? 0x20000000u : 0x00000000u));
+	     (charsiu_effective_adtype(mm) == CHARSIU_FP16 ? 0x20000000u : 0u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
 	emit(&e, CNA, 0x1018, 0x40000404);
@@ -419,8 +450,38 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CORE, 0x3020, mm->n - 1);
 	emit(&e, CORE, 0x3024, 0x00000000);
 
+	/*
+	 * THE w4a16 OUTPUT STAGE, ported from the vendor's own configuration.
+	 *
+	 * The .rkllm's int4 convolution streams carry NO DPU registers at all,
+	 * 3328 of them, because the vendor sets the DPU up in a separate stream
+	 * and lets the state stand for every projection after it. Those
+	 * configuration streams are in the same file: 2908 copies of one 71
+	 * register block, and it is not the int8 stage with a bit changed.
+	 *
+	 *   0x4010  a0000002   int8 writes 0.  PROC_PRECISION 2, which is fp16
+	 *   0x4030  ..0310     int8's low half is 0710
+	 *   0x4038  00000053   int8 writes 00120080
+	 *   0x4044  00000002   int8 writes 1
+	 *   0x4050  00023333   int8's is oc dependent, 80011111 here
+	 *   0x40ac  00000000  |
+	 *   0x40b0  00000001  |  an IDENTITY requant. w4a16 does not requantise
+	 *   0x40b4  00000000  |  at all, the output is a float
+	 *
+	 * These are not independent knobs and are not swept one at a time: an
+	 * identity requant behind an integer output stage means nothing. The
+	 * unit is the whole stage, and the control is that int8 must be
+	 * untouched, which it is, since every one of these is inside the int4
+	 * branch.
+	 *
+	 * The geometry registers are still computed rather than copied. Only the
+	 * precision dependent ones come from the vendor.
+	 */
+	if (mm->wdtype == CHARSIU_INT4)
+		w4a16 = 1;
+
 	emit(&e, DPU, 0x400c, 0x40000004);
-	emit(&e, DPU, 0x4010, 0x00000000);
+	emit(&e, DPU, 0x4010, w4a16 ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
 	emit(&e, DPU, 0x401c, rows);            /* ow * full_oh */
@@ -444,19 +505,19 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) |
 	     (uint32_t)(getenv("CHARSIU_DPU_4030")
 			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
-			: 0x0710u));
+			: (w4a16 ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, (lines << 16) | 0);
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
 	 * here, but those are elementwise ops rather than convolutions, so it
 	 * is a candidate to sweep and not a value to copy. */
 	emit(&e, DPU, 0x4038, (uint32_t)(getenv("CHARSIU_DPU_4038")
 					 ? strtoul(getenv("CHARSIU_DPU_4038"), NULL, 0)
-					 : 0x00120080u));
+					 : (w4a16 ? 0x00000053u : 0x00120080u)));
 	emit(&e, DPU, 0x403c, 0x00000000);
-	emit(&e, DPU, 0x4044, 0x00000001);
+	emit(&e, DPU, 0x4044, w4a16 ? 0x00000002u : 0x00000001u);
 	emit(&e, DPU, 0x4048, 0x80000000);
 	emit(&e, DPU, 0x404c, 0x7fffffff);
-	emit(&e, DPU, 0x4050, 0x80011111);
+	emit(&e, DPU, 0x4050, w4a16 ? 0x00023333u : 0x80011111u);
 	emit(&e, DPU, 0x4058, 0x80000000);
 	emit(&e, DPU, 0x405c, 0x7fffffff);
 	/*
@@ -509,9 +570,11 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x409c, 0x00000000);
 	emit(&e, DPU, 0x40a4, 0x80000000);
 	emit(&e, DPU, 0x40a8, 0x7fffffff);
-	emit(&e, DPU, 0x40ac, (uint32_t)rq.offset);
-	emit(&e, DPU, 0x40b0, rq.scale);
-	emit(&e, DPU, 0x40b4, rq.shift);
+	/* w4a16 does not requantise: the vendor writes 0, 1, 0 here and the
+	 * output leaves as a float. */
+	emit(&e, DPU, 0x40ac, w4a16 ? 0u : (uint32_t)rq.offset);
+	emit(&e, DPU, 0x40b0, w4a16 ? 1u : rq.scale);
+	emit(&e, DPU, 0x40b4, w4a16 ? 0u : rq.shift);
 	emit(&e, DPU, 0x40b8, 1 * (2 * rows - rows));   /* ow * (2*oh - window) */
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
@@ -533,7 +596,30 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, RDMA, 0x5010, lines);
 	emit(&e, RDMA, 0x5014, mm->n - 1);
 	emit(&e, RDMA, 0x5018, 0x00000000);
-	emit(&e, RDMA, 0x501c, 0x00000710);
+	/*
+	 * THE COEFFICIENT SURFACE, and w4a16 configures it differently too.
+	 *
+	 * Round 182 proved charsiu's coefficient buffer is not being read at all
+	 * on this path: CHARSIU_NO_LIFT and CHARSIU_COEF_C both changed nothing,
+	 * four runs byte identical, so neither A nor C reaches the output. The
+	 * DPU stage had already been ported; the DPU_RDMA that FETCHES the
+	 * surface had not.
+	 *
+	 * The vendor keeps that configuration in its own stream as well, 21 RDMA
+	 * registers, and against what this emitted exactly four differ, none of
+	 * them geometry:
+	 *
+	 *   0x501c   0 where int8 writes 0710
+	 *   0x5034   4000004c where int8 writes 41
+	 *   0x5040   the ROW COUNT. Another vendor stream carries 0x20 beside a
+	 *            0x1f in 0x500c, so it is 0x500c + 1, and this wrote 0
+	 *   0x5044   000280a1 where int8 writes 40000010
+	 *
+	 * Which makes round 182's two dead knobs the control for this round: if
+	 * the surface is now fetched, CHARSIU_NO_LIFT and CHARSIU_COEF_C have to
+	 * stop being inert.
+	 */
+	emit(&e, RDMA, 0x501c, w4a16 ? 0x00000000u : 0x00000710u);
 	emit(&e, RDMA, 0x5020, job->coef_addr);
 	emit(&e, RDMA, 0x5024, job->coef_addr +
 	     (uint32_t)(table_bytes(mm) + scale_table_bytes(mm)));
@@ -547,10 +633,10 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, RDMA, 0x5028, 0x00000000);
 	emit(&e, RDMA, 0x502c, 0x00000000);
 	emit(&e, RDMA, 0x5030, 0x00000000);
-	emit(&e, RDMA, 0x5034, 0x00000041);
+	emit(&e, RDMA, 0x5034, w4a16 ? 0x4000004cu : 0x00000041u);
 	emit(&e, RDMA, 0x5038, 0x00000000);
-	emit(&e, RDMA, 0x5040, 0x00000000);
-	emit(&e, RDMA, 0x5044, 0x40000010);
+	emit(&e, RDMA, 0x5040, w4a16 ? rows : 0x00000000u);
+	emit(&e, RDMA, 0x5044, w4a16 ? 0x000280a1u : 0x40000010u);
 	emit(&e, RDMA, 0x5048, 0x00000000);
 	emit(&e, RDMA, 0x504c, 0x00000000);
 	emit(&e, RDMA, 0x5064, 0x00000000);
