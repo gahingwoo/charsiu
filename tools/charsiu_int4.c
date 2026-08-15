@@ -569,38 +569,73 @@ int main(int argc, char **argv)
 	 * track an activation index; the only thing left varying is the channel.
 	 */
 	/*
-	 * --wedge: how many w4a16 jobs it takes before the NPU cannot start an
-	 * int8 one, measured IN ONE PROCESS so nothing depends on a recovery
-	 * that may or may not have happened.
+	 * --pre N: submit N w4a16 jobs and exit, so that the int8 job which
+	 * follows is charsiu_matmul's OWN, run from the shell as its own
+	 * process.
 	 *
-	 * ROUND 186 COULD NOT ANSWER THIS and said so. Its bisection ran the
-	 * two halves of the port in separate processes with a Mesa model in
-	 * between to put the NPU back, and three things went wrong at once: the
-	 * first Mesa run was itself broken, so by its own written rule the
-	 * entries either side of it said nothing; the NO_DPU run wrote not one
-	 * byte of output, so "int8 was fine after it" only means no w4a16 job
-	 * ever ran; and the job COUNT was never controlled, with the failing
-	 * case having 65 w4a16 jobs behind it and the passing ones one.
+	 * WHY NOT --wedge, WHICH THIS REPLACES. --wedge built an int8 job here
+	 * by hand and ran it in the same process, and its N = 0 control failed
+	 * in round 187 and again in round 188 after the pattern probes were
+	 * taken out of the way. Zero w4a16 jobs and the hand built int8 job
+	 * still came back with its output holding the sentinel, so the thing
+	 * being measured with was broken and the table it produced could not be
+	 * read. Two rounds of that is enough: the int8 side goes back to the
+	 * code path that has been byte exact since round 164 and has not been
+	 * touched since.
 	 *
-	 * So: same fd, same process, no Mesa in between, and the count is the
-	 * only thing that moves. Submit N w4a16 jobs, then one int8 job, and
-	 * report whether the int8 job completed.
-	 *
-	 * THE COUNTS ACCUMULATE. Nothing resets the NPU between rows, so the
-	 * running total is printed beside N and it is the total, not N, that a
-	 * threshold would be in terms of.
-	 *
-	 *   N = 0 fails
-	 *             the int8 job is broken on its own and has nothing to do
-	 *             with w4a16. This is the control that can fail.
-	 *   int8 first fails at some row
-	 *             the threshold is between that row's total and the one
-	 *             before it.
-	 *   every row passes
-	 *             a plain w4a16 job does not wedge anything, and whatever
-	 *             round 185 hit is in what --osweep does differently, not
-	 *             in the count.
+	 * The cost is that this is two processes again. That is a real cost,
+	 * because round 186 lost its bisection to exactly that. It is paid
+	 * differently here: nothing is asked to RECOVER between the two, the
+	 * counts run from small to large, and the first row is N = 0, which is
+	 * charsiu_matmul on its own and is already known to pass from the
+	 * entry above it in the same log.
 	 */
+	if (argc > 4 && !strcmp(argv[4], "--pre")) {
+		unsigned N = argc > 5 ? (unsigned)atoi(argv[5]) : 1;
+		size_t obytes = (size_t)m * n * 4;
+		unsigned q, wrote = 0, failed = 0, empty = 0;
+		float *af = malloc((size_t)m * k * sizeof(*af));
+
+		for (i = 0; i < m * k; i++)
+			af[i] = 8.0f;
+		charsiu_bo_prep(dev, &in, 1000000000);
+		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
+		charsiu_bo_fini(dev, &in);
+		charsiu_bo_prep(dev, &wt, 1000000000);
+		memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
+		((uint8_t *)wt.map)[0] = (uint8_t)g_live;
+		charsiu_bo_fini(dev, &wt);
+
+		for (q = 0; q < N; q++) {
+			uint8_t *o;
+			unsigned touched = 0;
+
+			charsiu_bo_prep(dev, &outbo, 1000000000);
+			memset(outbo.map, 0xa5, obytes);
+			charsiu_bo_fini(dev, &outbo);
+			if (charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles,
+					   3, out_handles, 1) ||
+			    charsiu_bo_prep(dev, &outbo, 2000000000)) {
+				failed++;
+				continue;
+			}
+			o = outbo.map;
+			for (i = 0; i < obytes; i++)
+				if (o[i] != 0xa5)
+					touched++;
+			if (touched)
+				wrote++;
+			else
+				empty++;
+			charsiu_bo_fini(dev, &outbo);
+		}
+		printf("\n  --pre %u: %u w4a16 jobs wrote, %u completed without\n"
+		       "  writing, %u failed outright. The int8 job that judges this\n"
+		       "  is the next process, not this one.\n", N, wrote, empty, failed);
+		charsiu_close(dev);
+		return 0;
+	}
+
 	/*
 	 * --bmap: which output slot each WEIGHT BYTE feeds, on the w4a16 path.
 	 *
@@ -634,17 +669,20 @@ int main(int argc, char **argv)
 		size_t wb = charsiu_weight_bytes(&job.mm), byte;
 		size_t obytes = (size_t)m * n * 4;
 		unsigned step = argc > 5 ? (unsigned)atoi(argv[5]) : 1;
-		unsigned slot_cnt[64], slot_lo[64], slot_hi[64];
-		int32_t slot_val[64];
-		unsigned lit = 0, dark = 0, multi = 0, printed = 0, s;
+		unsigned slot_cnt[512], slot_lo[512], slot_hi[512], slot_nz[512];
+		int32_t slot_val[512];
+		unsigned nzhist[17];
+		unsigned lit = 0, dark = 0, printed = 0, s;
 		float *af = malloc((size_t)m * k * sizeof(*af));
 
 		if (!step)
 			step = 1;
-		for (s = 0; s < 64; s++) {
+		for (s = 0; s < 512; s++) {
 			slot_cnt[s] = 0; slot_lo[s] = ~0u; slot_hi[s] = 0;
-			slot_val[s] = 0;
+			slot_val[s] = 0; slot_nz[s] = 0;
 		}
+		for (s = 0; s < 17; s++)
+			nzhist[s] = 0;
 		for (i = 0; i < m * k; i++)
 			af[i] = 8.0f;
 		charsiu_bo_prep(dev, &in, 1000000000);
@@ -706,161 +744,51 @@ int main(int argc, char **argv)
 				continue;
 			}
 			lit++;
-			if (nz > 4)
-				multi++;
-			s = first / 4;
-			if (s < 64) {
+			/*
+			 * THE OUTPUT BYTE ITSELF, not a slot. Round 188 divided
+			 * this by four and the six geometries then contradicted
+			 * each other: at K = 16 only even slots appeared and at
+			 * K = 32 slot 0's first byte came out as 257. The width
+			 * of an element is what is being measured here, so it
+			 * cannot also be an input to the measurement.
+			 */
+			s = first;
+			nzhist[nz < 17 ? nz : 16]++;
+			if (s < 512) {
 				slot_cnt[s]++;
+				slot_nz[s] = nz;
 				if (byte < slot_lo[s]) slot_lo[s] = (unsigned)byte;
 				if (byte > slot_hi[s]) slot_hi[s] = (unsigned)byte;
 				slot_val[s] = (int32_t)u;
 			}
-			if (printed < 48) {
-				printf("  byte %4zu -> slot %2u  %11d%s\n", byte, s,
-				       (int32_t)u, nz > 4 ? "   MORE THAN ONE SLOT" : "");
+			if (printed < 24) {
+				printf("  weight byte %4zu -> output byte %3u,"
+				       " %u bytes non zero\n", byte, s, nz);
 				printed++;
 			}
 		}
-		printf("\n  %u bytes lit something, %u lit nothing, %u lit more than one slot\n",
-		       lit, dark, multi);
-		printf("\n  %-6s %-8s %-10s %-10s %s\n",
-		       "slot", "bytes", "first", "last", "value");
-		for (s = 0; s < 64; s++)
+		printf("\n  %u weight bytes lit something, %u lit nothing\n", lit, dark);
+		/*
+		 * THE HISTOGRAM IS THE ELEMENT WIDTH. Every probe writes one
+		 * value, so how many output bytes come back non zero is how
+		 * wide that value is, with the one caveat that a zero byte
+		 * INSIDE a value is invisible here. Round 186's sweep printed
+		 * "bytes 0..1" all along and this project read 4 off a hex dump
+		 * that was aligned to 4.
+		 */
+		printf("\n  how many output bytes a single live nibble makes non zero:\n");
+		for (s = 1; s < 17; s++)
+			if (nzhist[s])
+				printf("    %2u byte%s  %6u probes%s\n", s,
+				       s == 1 ? " " : "s", nzhist[s],
+				       s == 16 ? " or more" : "");
+		printf("\n  %-12s %-8s %-10s %-10s %-4s %s\n",
+		       "output byte", "weights", "first", "last", "nz", "value");
+		for (s = 0; s < 512; s++)
 			if (slot_cnt[s])
-				printf("  %-6u %-8u %-10u %-10u %d\n", s,
+				printf("  %-12u %-8u %-10u %-10u %-4u %d\n", s,
 				       slot_cnt[s], slot_lo[s], slot_hi[s],
-				       slot_val[s]);
-		charsiu_close(dev);
-		return 0;
-	}
-
-	if (argc > 4 && !strcmp(argv[4], "--wedge")) {
-		static const unsigned counts[] = { 0, 1, 2, 4, 8, 16, 32, 64 };
-		struct charsiu_job j8 = job;
-		struct charsiu_bo rc8 = { 0 }, wt8 = { 0 }, in8 = { 0 },
-				  out8 = { 0 }, cf8 = { 0 };
-		uint32_t h8[3], o8[1];
-		float *af = malloc((size_t)m * k * sizeof(*af));
-		uint8_t *a8 = malloc((size_t)m * k);
-		size_t nreg8, obytes = (size_t)m * n * 4;
-		unsigned ci, total = 0;
-		int wedged = 0;
-
-		/* the w4a16 side is what `job` already is */
-		for (i = 0; i < m * k; i++)
-			af[i] = 8.0f;
-		charsiu_bo_prep(dev, &in, 1000000000);
-		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
-		charsiu_bo_fini(dev, &in);
-		charsiu_bo_prep(dev, &wt, 1000000000);
-		memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
-		((uint8_t *)wt.map)[0] = (uint8_t)g_live;
-		charsiu_bo_fini(dev, &wt);
-
-		/* and a COMPLETE int8 job of its own, buffers included, so the
-		 * two never share anything and neither has to be re-emitted */
-		j8.mm.wdtype = CHARSIU_INT8;
-		j8.mm.adtype = CHARSIU_INT8;
-		j8.weight_zero_point = 0x80;
-		ret  = charsiu_bo_alloc(dev, 4096, &rc8);
-		ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&j8.mm)
-					     * 64 * m + 4096, &in8);
-		ret |= charsiu_bo_alloc(dev, charsiu_weight_bytes(&j8.mm) + 4096, &wt8);
-		ret |= charsiu_bo_alloc(dev, obytes + 4096, &out8);
-		ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&j8.mm) + 4096, &cf8);
-		if (ret) {
-			printf("  --wedge: int8 bo alloc FAILED %d\n", ret);
-			charsiu_close(dev);
-			return 1;
-		}
-		j8.input_addr = (uint32_t)in8.dma_address;
-		j8.weight_addr = (uint32_t)wt8.dma_address;
-		j8.output_addr = (uint32_t)out8.dma_address;
-		j8.coef_addr = (uint32_t)cf8.dma_address;
-		for (i = 0; i < m * k; i++)
-			a8[i] = (uint8_t)(j8.input_zero_point + 1 + (i % k));
-		charsiu_bo_prep(dev, &in8, 1000000000);
-		charsiu_pack_input(&j8.mm, a8, in8.map, in8.size,
-				   (uint8_t)j8.input_zero_point);
-		charsiu_bo_fini(dev, &in8);
-		charsiu_bo_prep(dev, &wt8, 1000000000);
-		memset(wt8.map, 0x81, charsiu_weight_bytes(&j8.mm));
-		charsiu_bo_fini(dev, &wt8);
-		charsiu_bo_prep(dev, &cf8, 1000000000);
-		charsiu_build_coefs(&j8, bias, wsums, cf8.map);
-		charsiu_bo_fini(dev, &cf8);
-		charsiu_bo_prep(dev, &rc8, 1000000000);
-		nreg8 = charsiu_emit_job(&j8, rc8.map, 4096 / 8);
-		charsiu_bo_fini(dev, &rc8);
-		if (!nreg8) {
-			printf("  --wedge: int8 emit FAILED\n");
-			charsiu_close(dev);
-			return 1;
-		}
-		h8[0] = in8.handle; h8[1] = wt8.handle; h8[2] = cf8.handle;
-		o8[0] = out8.handle;
-
-		printf("\n  --wedge: N w4a16 jobs then ONE int8 job, all in this\n"
-		       "  process on one fd, with nothing in between and nothing\n"
-		       "  shared. int8 stream %zu entries, w4a16 stream %zu.\n"
-		       "  Row N = 0 is the control: its int8 MUST complete.\n\n",
-		       nreg8, nreg);
-		printf("  %-4s %-8s %-22s %s\n", "N", "total", "w4a16 jobs", "the int8 job after them");
-		for (ci = 0; ci < sizeof(counts) / sizeof(counts[0]); ci++) {
-			unsigned N = counts[ci], q, wrote = 0, failed = 0, sent8 = 0;
-			int done8;
-
-			for (q = 0; q < N; q++) {
-				uint8_t *o;
-				unsigned s = 0;
-
-				charsiu_bo_prep(dev, &outbo, 1000000000);
-				memset(outbo.map, 0xa5, obytes);
-				charsiu_bo_fini(dev, &outbo);
-				if (charsiu_submit(dev, &regcmd, (unsigned)nreg,
-						   in_handles, 3, out_handles, 1) ||
-				    charsiu_bo_prep(dev, &outbo, 2000000000)) {
-					failed++;
-					continue;
-				}
-				o = outbo.map;
-				for (i = 0; i < obytes; i++)
-					if (o[i] != 0xa5)
-						s++;
-				if (s)
-					wrote++;
-				charsiu_bo_fini(dev, &outbo);
-			}
-			total += N;
-
-			charsiu_bo_prep(dev, &out8, 1000000000);
-			memset(out8.map, 0xa5, (size_t)m * n);
-			charsiu_bo_fini(dev, &out8);
-			done8 = !(charsiu_submit(dev, &rc8, (unsigned)nreg8, h8, 3,
-						 o8, 1) ||
-				  charsiu_bo_prep(dev, &out8, 2000000000));
-			if (done8) {
-				uint8_t *o = out8.map;
-
-				for (i = 0; i < (size_t)m * n; i++)
-					if (o[i] == 0xa5)
-						sent8++;
-			}
-			printf("  %-4u %-8u %2u wrote, %2u failed     %s",
-			       N, total, wrote, failed,
-			       !done8 ? "TIMED OUT" :
-			       sent8 ? "completed but wrote NOTHING" : "completed and wrote");
-			if (N == 0 && (!done8 || sent8))
-				printf("   <- THE CONTROL FAILED, read no further");
-			if (!wedged && (!done8 || sent8)) {
-				wedged = 1;
-				if (N)
-					printf("   <- FIRST FAILURE, threshold at or below %u",
-					       total);
-			}
-			printf("\n");
-			charsiu_bo_fini(dev, &out8);
-		}
+				       slot_nz[s], slot_val[s]);
 		charsiu_close(dev);
 		return 0;
 	}
