@@ -46,6 +46,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "charsiu.h"
 
@@ -72,6 +73,50 @@ static const char *pat_name(enum pattern p)
  */
 #define LIVE 0x7
 #define DEAD 0x0
+
+/*
+ * The live nibble is a RUNTIME value on the --f16 path, and a compile time one
+ * everywhere else. Every w4a16 round so far ran at a constant 7, so no run has
+ * ever shown that the output depends on the weights; CHARSIU_INT4_LIVE is the
+ * knob that asks. The other probes are left alone, because one variable.
+ */
+static unsigned g_live = LIVE;
+
+/*
+ * A least squares line and the RMS of what it leaves behind. The residual is
+ * the whole point of round 184: two candidate explanatory variables get fitted
+ * against the same outputs, and the one that does not explain them shows up
+ * here rather than in the slope.
+ */
+static void fit_line(const char *what, const double *x, const double *y,
+		     unsigned nn, double want)
+{
+	double sx = 0, sy = 0, sxx = 0, sxy = 0, den, slope, icept, res = 0;
+	unsigned i;
+
+	if (nn < 2) {
+		printf("  fit vs %-18s fewer than two points, no fit\n", what);
+		return;
+	}
+	for (i = 0; i < nn; i++) {
+		sx += x[i]; sy += y[i];
+		sxx += x[i] * x[i]; sxy += x[i] * y[i];
+	}
+	den = nn * sxx - sx * sx;
+	slope = den ? (nn * sxy - sx * sy) / den : 0;
+	icept = (sy - slope * sx) / nn;
+	for (i = 0; i < nn; i++) {
+		double e = y[i] - (slope * x[i] + icept);
+
+		res += e * e;
+	}
+	res = sqrt(res / nn);
+	printf("  fit vs %-18s npu = %10.3f * x + %10.1f   rms residual %10.3f",
+	       what, slope, icept, res);
+	if (want != 0)
+		printf("   (a real MAC wants a slope of %g)", want);
+	printf("\n");
+}
 
 static void fill(uint8_t *dst, size_t bytes, enum pattern p)
 {
@@ -312,6 +357,8 @@ int main(int argc, char **argv)
 	 * positive weight in the biased domain the packer would have produced.
 	 */
 	job.mm.wdtype = getenv("CHARSIU_MAP_W8") ? CHARSIU_INT8 : CHARSIU_INT4;
+	if (getenv("CHARSIU_INT4_LIVE"))
+		g_live = (unsigned)atoi(getenv("CHARSIU_INT4_LIVE")) & 0xf;
 	job.mm.adtype = CHARSIU_INT8;
 	job.input_scale = 0.02f;
 	/*
@@ -341,9 +388,11 @@ int main(int argc, char **argv)
 	/* the configuration goes in the log, because round 174's whole
 	 * comparison was lost to a weight zero point that was right for a nibble
 	 * and wrong for a byte, and nothing printed said which was in use */
-	printf("layout probe M=%u K=%u N=%u  w%s  wt_zp %u  %zu weight bytes\n",
+	printf("layout probe M=%u K=%u N=%u  w%s  wt_zp %u  %zu weight bytes"
+	       "  live nibble %u  activation %s\n",
 	       m, k, n, job.mm.wdtype == CHARSIU_INT4 ? "4" : "8",
-	       job.weight_zero_point, charsiu_weight_bytes(&job.mm));
+	       job.weight_zero_point, charsiu_weight_bytes(&job.mm), g_live,
+	       getenv("CHARSIU_INT4_PERM") ? "PERMUTED" : "plain ramp");
 
 	dev = charsiu_open(NULL);
 	if (!dev) { printf("open FAILED\n"); return 1; }
@@ -466,14 +515,51 @@ int main(int argc, char **argv)
 	 *             FLOAT is not, so that is the part that comes down.
 	 */
 	if (argc > 4 && !strcmp(argv[4], "--f16")) {
+		/*
+		 * ROUND 184 BREAKS A CONFOUND THIS PROBE HAS CARRIED SINCE
+		 * ROUND 181, and everything read off it until now is in doubt
+		 * until this run comes back.
+		 *
+		 * The activation was (c mod 16) - 16, which is LINEAR IN THE
+		 * CHANNEL INDEX, and the live nibble was a constant 7 in every
+		 * run. So "the output varies with the activation" and "the
+		 * output varies with the channel index" were the same sentence,
+		 * and nothing has ever shown the output depends on the WEIGHTS
+		 * at all. Round 181's fit, npu = 319 * act - 2412, can be
+		 * rewritten as 319 * (c mod 16) + a constant without touching a
+		 * single measured number.
+		 *
+		 * Two knobs, and each one has a branch that kills the reading.
+		 *
+		 *   CHARSIU_INT4_PERM=1 permutes which k holds which activation
+		 *     VALUE. The value set, the range and the packing are all
+		 *     unchanged; only the pairing moves, so this is one
+		 *     variable. Both fits are then printed side by side and the
+		 *     RESIDUALS decide it, not the slopes.
+		 *
+		 *   CHARSIU_INT4_LIVE=3 changes the live nibble from 7 to 3.
+		 *     A real MAC has to scale with it and the slope has to fall
+		 *     from 7 to 3. A slope that does not move means the weights
+		 *     are not in the arithmetic, whatever the activation does.
+		 */
+		static const unsigned perm[16] = {
+			9, 2, 14, 5, 11, 0, 7, 13, 3, 15, 6, 8, 1, 12, 4, 10
+		};
+		int permute = getenv("CHARSIU_INT4_PERM") != NULL;
 		float *af = malloc((size_t)m * k * sizeof(*af));
-		unsigned c, j;
+		unsigned c, j, seen16[65536] = { 0 }, distinct = 0;
 		uint8_t *o;
 
 		/* an input a half can hold exactly, so the packing adds no
-		 * error of its own: small integers */
-		for (i = 0; i < m * k; i++)
-			af[i] = (float)((int)(i % 32) - 16);
+		 * error of its own: small integers. Permuted or not, the values
+		 * are the same sixteen. */
+		for (i = 0; i < m * k; i++) {
+			unsigned slot = i % 32;
+
+			if (permute && slot < 16)
+				slot = perm[slot];
+			af[i] = (float)((int)slot - 16);
+		}
 		charsiu_bo_prep(dev, &in, 1000000000);
 		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
 		charsiu_bo_fini(dev, &in);
@@ -486,7 +572,7 @@ int main(int argc, char **argv)
 			unsigned kk = c % 16;
 
 			((uint8_t *)wt.map)[row + kk / 2] |=
-				(uint8_t)((kk & 1) ? (LIVE << 4) : LIVE);
+				(uint8_t)((kk & 1) ? (g_live << 4) : g_live);
 		}
 		charsiu_bo_fini(dev, &wt);
 
@@ -502,31 +588,43 @@ int main(int argc, char **argv)
 		}
 		o = outbo.map;
 		printf("\n  --f16: w4a16. A real fp16 activation, one live nibble of\n"
-		       "  %d per channel at k = c mod 16, and the output read as HALVES\n"
+		       "  %u per channel at k = c mod 16, and the output read as HALVES\n"
 		       "  because the vendor's own configuration requantises with\n"
-		       "  0x40b0 = 1 and 0x40b4 = 0, which is identity.\n\n", LIVE);
+		       "  0x40b0 = 1 and 0x40b4 = 0, which is identity.\n",
+		       g_live);
+		printf("  live nibble %u   activation %s\n\n", g_live,
+		       permute ? "PERMUTED, so its value no longer tracks c"
+			       : "the plain ramp, which tracks c exactly");
 		printf("  %-4s %-12s %-12s %-12s %-10s\n",
-		       "c", "act[c%%16]", "expected", "npu (half)", "raw");
+		       "c", "act[c%16]", "expected", "npu (half)", "raw");
 		for (c = 0; c < 16 && c < n; c++) {
 			uint16_t h = (uint16_t)(o[c * 2] | (o[c * 2 + 1] << 8));
 			float got = charsiu_half_to_float(h);
 
 			printf("  %-4u %-12.3f %-12.3f %-12.3f 0x%04x\n", c,
-			       af[c % 16], af[c % 16] * (float)LIVE, got, h);
+			       af[c % 16], af[c % 16] * (float)g_live, got, h);
 		}
 		j = 0;
 		for (c = 0; c < m * n * 2; c++)
 			if (((uint8_t *)outbo.map)[c] == 0xa5) j++;
 		printf("\n  %u of %u bytes still hold the sentinel\n", j, m * n * 2);
+		for (c = 0; c < 16 && c < n; c++) {
+			uint16_t h = (uint16_t)(o[c * 2] | (o[c * 2 + 1] << 8));
+
+			if (!seen16[h]++)
+				distinct++;
+		}
+		printf("  %u distinct values over the 16 channels%s\n", distinct,
+		       distinct < 8 ? "   TOO FLAT TO JUDGE A FIT" : "");
 		/*
-		 * THE FIT GOES IN THE LOG, over the channels that came back
-		 * finite and varying. Round 181 was read by eyeballing four
-		 * numbers off a table and computing the slope by hand, which is
-		 * how a sweep stride got read as a row size two rounds earlier.
-		 * The expected slope is LIVE and the expected intercept is 0.
+		 * BOTH FITS GO IN THE LOG. Round 181 was read by eyeballing four
+		 * numbers off a table and computing a slope by hand, which is
+		 * how a sweep stride got read as a row size two rounds earlier,
+		 * and it fitted only the variable it already believed in.
 		 */
 		{
-			double sx = 0, sy = 0, sxx = 0, sxy = 0, nn = 0;
+			double xa[64], xc[64], yy[64];
+			unsigned nn = 0;
 
 			for (c = 0; c < 16 && c < n; c++) {
 				uint16_t h = (uint16_t)(o[c * 2] | (o[c * 2 + 1] << 8));
@@ -534,21 +632,20 @@ int main(int argc, char **argv)
 
 				if (!(got > -1e30f && got < 1e30f) || got == 0.0f)
 					continue;       /* nan, inf and the dead ones */
-				sx += af[c % 16]; sy += got;
-				sxx += (double)af[c % 16] * af[c % 16];
-				sxy += (double)af[c % 16] * got;
+				xa[nn] = af[c % 16];
+				xc[nn] = (double)c;
+				yy[nn] = got;
 				nn++;
 			}
-			if (nn >= 2) {
-				double den = nn * sxx - sx * sx;
-				double slope = den ? (nn * sxy - sx * sy) / den : 0;
-
-				printf("  fit over %g finite varying channels:"
-				       " npu = %.3f * act + %.1f   (want %d * act + 0)\n",
-				       nn, slope, (sy - slope * sx) / nn, LIVE);
-			} else {
-				printf("  fewer than two finite varying channels: no fit\n");
-			}
+			printf("\n  %u finite varying channels\n", nn);
+			fit_line("the activation", xa, yy, nn, (double)g_live);
+			fit_line("the channel index", xc, yy, nn, 0);
+			printf("\n  THE RULE, WRITTEN BEFORE THE RUN.\n"
+			       "  The smaller rms residual names what the output depends on.\n"
+			       "  If the channel index fits and the activation does not, this\n"
+			       "  path is not computing and rounds 181 to 183 are read wrong.\n"
+			       "  And between the two live nibble runs the activation slope\n"
+			       "  must fall from 7 to 3, or the weights are not in the MAC.\n");
 		}
 		charsiu_close(dev);
 		return 0;
