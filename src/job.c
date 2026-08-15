@@ -337,6 +337,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned lines = rows - 1;              /* the DPU's line count */
 	size_t wbytes = charsiu_weight_bytes(mm);
 	int w4a16 = 0, w4_dpu = 0, w4_rdma = 0;
+	unsigned rdma_mask;
 	unsigned r;
 
 	/* The S_POINTER each unit latches its geometry against. Every unit gets
@@ -494,6 +495,26 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	w4_dpu = w4a16 && !getenv("CHARSIU_W4_NO_DPU");
 	w4_rdma = w4a16 && !getenv("CHARSIU_W4_NO_RDMA");
+	/*
+	 * ROUND 191 SPLITS THE RDMA GROUP TO ONE REGISTER PER BIT, because
+	 * round 190 named the group and the group is four registers.
+	 *
+	 * 190's bisection: with the full port one w4a16 job wedges the next int8
+	 * job, and with this group taken back out it does not, with that job
+	 * still writing its output so it really ran. The group also changes
+	 * NOTHING about the output, which rounds 182, 183 and 186 all measured
+	 * separately. So these four are pure liability right now and which one
+	 * of them it is, is worth one round.
+	 *
+	 *   bit 0  0x501c    bit 1  0x5034    bit 2  0x5040    bit 3  0x5044
+	 *
+	 * A clear bit writes int8's value for that register, which is what
+	 * NO_RDMA does for all four.
+	 */
+	rdma_mask = w4_rdma ? 0xf : 0;
+	if (w4_rdma && getenv("CHARSIU_W4_RDMA_MASK"))
+		rdma_mask = (unsigned)strtoul(getenv("CHARSIU_W4_RDMA_MASK"),
+					      NULL, 0);
 
 	emit(&e, DPU, 0x400c, 0x40000004);
 	emit(&e, DPU, 0x4010, w4_dpu ? 0xa0000002u : 0x00000000u);
@@ -634,7 +655,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * the surface is now fetched, CHARSIU_NO_LIFT and CHARSIU_COEF_C have to
 	 * stop being inert.
 	 */
-	emit(&e, RDMA, 0x501c, w4_rdma ? 0x00000000u : 0x00000710u);
+	emit(&e, RDMA, 0x501c, (rdma_mask & 1) ? 0x00000000u : 0x00000710u);
 	emit(&e, RDMA, 0x5020, job->coef_addr);
 	emit(&e, RDMA, 0x5024, job->coef_addr +
 	     (uint32_t)(table_bytes(mm) + scale_table_bytes(mm)));
@@ -648,10 +669,10 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, RDMA, 0x5028, 0x00000000);
 	emit(&e, RDMA, 0x502c, 0x00000000);
 	emit(&e, RDMA, 0x5030, 0x00000000);
-	emit(&e, RDMA, 0x5034, w4_rdma ? 0x4000004cu : 0x00000041u);
+	emit(&e, RDMA, 0x5034, (rdma_mask & 2) ? 0x4000004cu : 0x00000041u);
 	emit(&e, RDMA, 0x5038, 0x00000000);
-	emit(&e, RDMA, 0x5040, w4_rdma ? rows : 0x00000000u);
-	emit(&e, RDMA, 0x5044, w4_rdma ? 0x000280a1u : 0x40000010u);
+	emit(&e, RDMA, 0x5040, (rdma_mask & 4) ? rows : 0x00000000u);
+	emit(&e, RDMA, 0x5044, (rdma_mask & 8) ? 0x000280a1u : 0x40000010u);
 	emit(&e, RDMA, 0x5048, 0x00000000);
 	emit(&e, RDMA, 0x504c, 0x00000000);
 	emit(&e, RDMA, 0x5064, 0x00000000);
