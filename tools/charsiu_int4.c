@@ -673,10 +673,18 @@ int main(int argc, char **argv)
 		int32_t slot_val[512];
 		unsigned nzhist[17];
 		unsigned lit = 0, dark = 0, printed = 0, s;
+		float act = 8.0f;
 		float *af = malloc((size_t)m * k * sizeof(*af));
 
 		if (!step)
 			step = 1;
+		/*
+		 * THE ACTIVATION IS A KNOB NOW, because out(w) and out(a) are
+		 * the two curves that say what the output actually is, and this
+		 * probe has only ever run at one point of each.
+		 */
+		if (getenv("CHARSIU_BMAP_ACT"))
+			act = (float)atof(getenv("CHARSIU_BMAP_ACT"));
 		for (s = 0; s < 512; s++) {
 			slot_cnt[s] = 0; slot_lo[s] = ~0u; slot_hi[s] = 0;
 			slot_val[s] = 0; slot_nz[s] = 0;
@@ -684,15 +692,17 @@ int main(int argc, char **argv)
 		for (s = 0; s < 17; s++)
 			nzhist[s] = 0;
 		for (i = 0; i < m * k; i++)
-			af[i] = 8.0f;
+			af[i] = act;
 		charsiu_bo_prep(dev, &in, 1000000000);
 		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
 		charsiu_bo_fini(dev, &in);
 
-		printf("\n  --bmap: ONE live nibble of %u in ONE byte, walking all\n"
-		       "  %zu weight bytes in steps of %u, activation a constant 8.0.\n"
-		       "  The first row is the all zero control and must light nothing.\n\n",
-		       g_live, wb, step);
+		printf("\n  --bmap: ONE live nibble of %u (signed %d) in ONE byte,\n"
+		       "  walking %zu weight bytes in steps of %u, activation a\n"
+		       "  constant %.3f. The first row is the all zero control and\n"
+		       "  must light nothing.\n\n",
+		       g_live, g_live > 7 ? (int)g_live - 16 : (int)g_live, wb,
+		       step, act);
 
 		for (byte = 0; byte <= wb; byte += step) {
 			unsigned written = 0, first = 0, seen = 0, nz = 0;
