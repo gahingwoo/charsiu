@@ -184,6 +184,33 @@ no byte lights more than one slot
 
 The control, an all zero weight buffer, lights nothing.
 
+### What the output actually is, exactly
+
+`out = ((int16)fp16bits(w) * (int16)fp16bits(a)) >> 16`, **18 of 18 measured
+points exact**, both negative nibbles included. The hardware multiplies the two
+operands' fp16 **bit patterns as signed 16 bit integers** and shifts right 16.
+charsiu packs a genuine fp16 and the hardware never reads it as a float.
+
+Getting there needed a confound broken first. Doubling an input ADDS a constant
+to the output rather than scaling it: +284 for the activation three times over,
++288 for the weight twice, exact each time. So the output is linear in log2 of
+its inputs, which is why changing a nibble from 7 to 3 scaled the result by
+0.930 instead of 3/7 and why no line ever fit two points of it.
+
+Two readings then fit everything measured, and they separate only on values
+that are not powers of two, by 20 to 24 counts. The predicted numbers for both
+went into the board script before the run:
+
+```
+   a      fp16 bits   integer reading   true logarithm   measured
+  1.5         15872              4402             4426       4402
+  3.0         16896              4686             4710       4686
+  5.0         17664              4899             4919       4899
+  6.0         17920              4970             4994       4970
+```
+
+Four for four on the integer reading, zero error.
+
 ### What is still open on int4
 
 **The weights are read.** With no live nibble anywhere the output comes back all zero,
@@ -197,21 +224,35 @@ two separate knobs on it, four runs, byte identical output.
 Where `k = 16` and above live is still unknown, because those bytes are dead in the map
 and there is no data about them.
 
-### The defect this project put there
+### The defect this project put there, and its fix
 
-**A w4a16 job leaves the NPU unable to start the next one.** The same int8 binary, the
+**A w4a16 job used to leave the NPU unable to start the next one.** The same int8 binary, the
 same register stream, the same shape and the same boot: byte exact when it runs first,
 `NPU job timed out` when it runs after w4a16 jobs, with the output still holding its
 0xa5 sentinel and an `rk_iommu` reset error beside it. Mesa's own models run fine
 afterwards, so the driver recovers and nothing is permanently broken.
 
-It is not the stream: int8's register stream is byte identical before and after the
-w4a16 port, at both shapes, checked offline. Which half of the port does it is not yet
-known, and both attempts to bisect it were killed by their own written controls, once
-by a recovery step that was itself broken and once by a probe whose "zero jobs" row had
-five jobs behind it. Both of those are recorded in the board scripts rather than
-quietly fixed, because the controls are the only reason the wrong answers were not
-published.
+It was not the stream: int8's register stream is byte identical before and after the
+w4a16 port, at both shapes, checked offline. It took a one job repro to bisect, and two
+earlier attempts were killed by their own written controls first, once by a recovery
+step that was itself broken and once by a probe whose "zero jobs" row had five jobs
+behind it. Both are recorded in the board scripts rather than quietly fixed, because
+those controls are the only reason the wrong answers were not published.
+
+**It is the RDMA coefficient fetch group, and within it `0x5034` and `0x5044`
+each on their own.** One w4a16 job per mask, judged by a separate process running
+the int8 path that has been byte exact since round 164:
+
+```
+mask 0xf  all four     int8 TIMED OUT        mask 2  0x5034 only  int8 TIMED OUT
+mask 0    none         int8 byte exact       mask 4  0x5040 only  int8 byte exact
+mask 1    0x501c only  int8 byte exact       mask 8  0x5044 only  int8 TIMED OUT
+```
+
+That group is out of the default stream now. It buys nothing: the byte map with it
+off and the byte map with it forced on are identical line for line. It stays reachable
+one bit per register through `CHARSIU_W4_RDMA_MASK`, because fetching the coefficient
+surface will have to start there.
 
 ## On the name
 
