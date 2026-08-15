@@ -761,10 +761,20 @@ int main(int argc, char **argv)
 				if (byte > slot_hi[s]) slot_hi[s] = (unsigned)byte;
 				slot_val[s] = (int32_t)u;
 			}
-			if (printed < 24) {
+			/*
+			 * AN OUTLIER PRINTS WHATEVER THE LIMIT SAYS. K=16 N=64
+			 * came back twice with 159 probes at 2 non zero output
+			 * bytes and exactly ONE at 16 or more, the same numbers
+			 * both times, so it is a feature of the layout rather
+			 * than noise, and which weight byte does it is the whole
+			 * question about it.
+			 */
+			if (printed < 24 || nz > 4) {
 				printf("  weight byte %4zu -> output byte %3u,"
-				       " %u bytes non zero\n", byte, s, nz);
-				printed++;
+				       " %u bytes non zero%s\n", byte, s, nz,
+				       nz > 4 ? "   <- OUTLIER" : "");
+				if (printed < 24)
+					printed++;
 			}
 		}
 		printf("\n  %u weight bytes lit something, %u lit nothing\n", lit, dark);

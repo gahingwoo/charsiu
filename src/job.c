@@ -336,7 +336,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned rows = mm->m;
 	unsigned lines = rows - 1;              /* the DPU's line count */
 	size_t wbytes = charsiu_weight_bytes(mm);
-	int w4a16 = 0, w4_dpu = 0, w4_rdma = 0;
+	int w4a16 = 0, w4_dpu = 0;
 	unsigned rdma_mask;
 	unsigned r;
 
@@ -494,25 +494,42 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * without it the run is not w4a16 at all.
 	 */
 	w4_dpu = w4a16 && !getenv("CHARSIU_W4_NO_DPU");
-	w4_rdma = w4a16 && !getenv("CHARSIU_W4_NO_RDMA");
 	/*
-	 * ROUND 191 SPLITS THE RDMA GROUP TO ONE REGISTER PER BIT, because
-	 * round 190 named the group and the group is four registers.
+	 * THE RDMA COEFFICIENT FETCH GROUP IS OFF BY DEFAULT SINCE ROUND 192,
+	 * because two of its four registers each leave the NPU unable to start
+	 * the next job and the group changes nothing about the output.
 	 *
-	 * 190's bisection: with the full port one w4a16 job wedges the next int8
-	 * job, and with this group taken back out it does not, with that job
-	 * still writing its output so it really ran. The group also changes
-	 * NOTHING about the output, which rounds 182, 183 and 186 all measured
-	 * separately. So these four are pure liability right now and which one
-	 * of them it is, is worth one round.
+	 * Measured rather than argued. One w4a16 job then one int8 job in its
+	 * own process, six masks, every row with its baseline recovered and its
+	 * w4a16 job confirmed to have written:
+	 *
+	 *   0xf   all four        int8 timed out
+	 *   0     none            int8 byte exact
+	 *   1     0x501c only     int8 byte exact
+	 *   2     0x5034 only     int8 TIMED OUT
+	 *   4     0x5040 only     int8 byte exact
+	 *   8     0x5044 only     int8 TIMED OUT
+	 *
+	 * And it buys nothing: rounds 182 and 183 put two knobs on the
+	 * coefficient buffer and got four byte identical runs with this group
+	 * on, and round 186's run without it produced element 0 = -3692, the
+	 * same value as with it. A group that alters no result and wedges the
+	 * next job does not go in the default stream.
+	 *
+	 * It stays reachable, one bit per register, because when the
+	 * coefficient surface does eventually have to be fetched this is where
+	 * that starts:
 	 *
 	 *   bit 0  0x501c    bit 1  0x5034    bit 2  0x5040    bit 3  0x5044
 	 *
-	 * A clear bit writes int8's value for that register, which is what
-	 * NO_RDMA does for all four.
+	 * A clear bit writes int8's value for that register. 0x5034 and 0x5044
+	 * are the two that wedge, and both of them differ from int8 in bit 30
+	 * and in opposite directions, which is a lead and not an explanation:
+	 * mask 0xf sets both of them the way the vendor's own stream does and
+	 * still wedges.
 	 */
-	rdma_mask = w4_rdma ? 0xf : 0;
-	if (w4_rdma && getenv("CHARSIU_W4_RDMA_MASK"))
+	rdma_mask = 0;
+	if (w4a16 && getenv("CHARSIU_W4_RDMA_MASK"))
 		rdma_mask = (unsigned)strtoul(getenv("CHARSIU_W4_RDMA_MASK"),
 					      NULL, 0);
 
