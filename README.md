@@ -47,9 +47,11 @@ It is not a runtime yet. What is left:
 - the reference still requantises in float where the hardware uses an integer scale and
   shift. It agrees to the byte on everything measured so far, which does not mean it
   will at every scale.
-- **int4 does not compute yet**, and what is left is the activation format rather
-  than the layout. See below.
-- the runtime work has not started: no KV cache, no sampler, no per token geometry.
+- **int4 does not compute yet.** Its layout is read, the `w4a16` stage is ported, and
+  the weights are demonstrably in the arithmetic, but the output is not weight times
+  activation. See below.
+- **a w4a16 job leaves the NPU unable to start the next one**, which is a defect this
+  project put there itself and has not yet localised. See below.
 
 The three tools that got it there are in the repository rather than in a shell history,
 because every step that worked was a diff against something known to compute:
@@ -144,17 +146,72 @@ That last also retires a reading this project carried for eight rounds. The hard
 appeared to fetch only a **quarter** of the weight buffer; it never did. It fetches
 half as many elements, each twice as wide.
 
-### What is still open
+### The w4a16 stage, and what the output actually is
 
-The values are wrong. A one hot of 100 placed in the **low** byte of an element never
-lights a channel, which a 16 bit integer cannot do and a float must, so the activation
-is very likely an fp16 here, which is the only way the vendor runs int4 (`w4a16`).
-Feeding real halves through a stream still configured for int8 activations does not
-compute either, and that test could not have worked: only the packing was changed, not
-the stream. The fp16 activation path is not written yet.
+The vendor never runs int4 against an int8 activation. It runs `w4a16`, and that path
+has its own DPU output stage **and** its own RDMA coefficient fetch, both of which live
+in vendor streams separate from the 3328 int4 convolution streams, which carry no DPU
+and no RDMA registers at all. Both are ported. The line worth writing down is:
 
-Where `k = 16` and above live is also unknown, because those bytes are dead in the map
+```
+0x40ac = 0    0x40b0 = 1    0x40b4 = 0        an IDENTITY requant
+```
+
+`w4a16` does not requantise. This file used to say "so the output is a float", and that
+was an addition rather than a measurement. An un-requantised output is the raw
+accumulator, and an accumulator is an integer. Read as halves the outputs came back in
+a period of four, with `0xffff` and `0x0000` filling every second slot; paired up
+little endian they are 32 bit integers of alternating sign:
+
+```
+[94 f1][ff ff] -> 0xfffff194 = -3692
+[a4 10][00 00] -> 0x000010a4 = +4260
+```
+
+### Reading the output layout the same way
+
+One live nibble in the entire weight buffer, one byte at a time, all 2048 of them, the
+activation held at a single constant so nothing in the output can track an activation
+index, and the output bytes dumped with nothing assumed about how wide an element is:
+
+```
+byte b feeds output slot b / 8       eight consecutive bytes per slot
+each slot is fed by 16 bytes         two runs of eight, 256 apart
+640 bytes light something            1408 light nothing, and the entire
+                                     second half of the buffer is dark
+no byte lights more than one slot
+```
+
+The control, an all zero weight buffer, lights nothing.
+
+### What is still open on int4
+
+**The weights are read.** With no live nibble anywhere the output comes back all zero,
+and the sign of the result follows the sign of the nibble: 7 gives +5112, and 15, which
+is -1 as a signed nibble, gives -4896. **The magnitude does not follow it.** Changing
+the nibble from 7 to 3 has to scale the output by 3/7 and instead scales it by 0.930,
+identically in every slot. So the weights are in the arithmetic without the output
+being weight times activation. The coefficient buffer is not read on this path at all:
+two separate knobs on it, four runs, byte identical output.
+
+Where `k = 16` and above live is still unknown, because those bytes are dead in the map
 and there is no data about them.
+
+### The defect this project put there
+
+**A w4a16 job leaves the NPU unable to start the next one.** The same int8 binary, the
+same register stream, the same shape and the same boot: byte exact when it runs first,
+`NPU job timed out` when it runs after w4a16 jobs, with the output still holding its
+0xa5 sentinel and an `rk_iommu` reset error beside it. Mesa's own models run fine
+afterwards, so the driver recovers and nothing is permanently broken.
+
+It is not the stream: int8's register stream is byte identical before and after the
+w4a16 port, at both shapes, checked offline. Which half of the port does it is not yet
+known, and both attempts to bisect it were killed by their own written controls, once
+by a recovery step that was itself broken and once by a probe whose "zero jobs" row had
+five jobs behind it. Both of those are recorded in the board scripts rather than
+quietly fixed, because the controls are the only reason the wrong answers were not
+published.
 
 ## On the name
 
