@@ -558,7 +558,6 @@ int main(int argc, char **argv)
 	 * track an activation index; the only thing left varying is the channel.
 	 */
 	if (argc > 4 && !strcmp(argv[4], "--osweep")) {
-		static const unsigned probe[] = { 64, 0, 1, 2, 3, 4, 5, 8, 16, 32, 63 };
 		float *af = malloc((size_t)m * k * sizeof(*af));
 		size_t obytes = (size_t)m * n * 4;
 		unsigned pi;
@@ -576,10 +575,21 @@ int main(int argc, char **argv)
 		       "  the control: it must come back with nothing non zero.\n\n",
 		       g_live, obytes);
 
-		for (pi = 0; pi < sizeof(probe) / sizeof(probe[0]); pi++) {
-			unsigned n0 = probe[pi];
-			unsigned sent = 0, nz = 0, first = 0, last = 0, seen = 0;
+		/*
+		 * ROUND 186 SWEEPS EVERY CHANNEL. Round 185 swept nine and the
+		 * nine did not agree: channels 0 to 5 landed at byte 4n, but 16
+		 * landed at 32 and 32 at 64, which is 2n, and 63 landed at 156,
+		 * which is neither. Nine points cannot carry a rule, and fitting
+		 * one to part of a map is what cost rounds 171 and 173. So read
+		 * the whole map and let the table say it.
+		 *
+		 * Entry n == mm->n is the control with NO live nibble anywhere.
+		 */
+		for (pi = 0; pi <= n; pi++) {
+			unsigned n0 = pi == 0 ? n : pi - 1;
+			unsigned written = 0, nz = 0, first = 0, last = 0, seen = 0;
 			uint8_t *o;
+			uint32_t u = 0;
 
 			charsiu_bo_prep(dev, &wt, 1000000000);
 			memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
@@ -602,41 +612,42 @@ int main(int argc, char **argv)
 				continue;
 			}
 			o = outbo.map;
-			for (i = 0; i < obytes; i++) {
-				if (o[i] == 0xa5)
-					sent++;
+			/* the sentinel is itself non zero, so the write extent
+			 * has to be found before anything is counted */
+			for (i = 0; i < obytes; i++)
+				if (o[i] != 0xa5)
+					written = i + 1;
+			for (i = 0; i < written; i++)
 				if (o[i]) {
 					nz++;
 					if (!seen) { first = i; seen = 1; }
 					last = i;
 				}
+			if (seen) {
+				unsigned b = first & ~3u;
+
+				u = (uint32_t)o[b] | ((uint32_t)o[b + 1] << 8) |
+				    ((uint32_t)o[b + 2] << 16) |
+				    ((uint32_t)o[b + 3] << 24);
 			}
 			if (n0 >= n)
-				printf("  NO live nibble  ");
+				printf("  NO live nibble  written %3u  nonzero %3u   "
+				       "THE CONTROL: nonzero must be 0\n", written, nz);
+			else if (!seen)
+				printf("  channel %-3u     written %3u  nothing non zero\n",
+				       n0, written);
 			else
-				printf("  channel %-7u ", n0);
-			printf("sentinel %3u/%3zu  nonzero %3u", sent, obytes, nz);
-			if (seen)
-				printf("  bytes %u..%u", first, last);
-			printf("\n");
-			if (seen) {
-				unsigned b;
-
-				printf("      ");
-				for (b = first & ~3u; b <= (last | 3u) && b < obytes; b++) {
-					printf("%02x", o[b]);
-					if ((b & 3) == 3)
-						printf(" ");
-				}
-				printf("   (from byte %u)\n", first & ~3u);
-			}
+				printf("  channel %-3u     written %3u  bytes %3u..%-3u"
+				       "  slot %2u  0x%08x %12d%s\n",
+				       n0, written, first, last, first / 4, u,
+				       (int32_t)u, nz > 4 ? "   MORE THAN ONE SLOT" : "");
 			charsiu_bo_fini(dev, &outbo);
 		}
 		/*
 		 * The whole buffer once, so the reader can see what the stage
 		 * writes into the bytes that are not the answer.
 		 */
-		printf("\n  and the whole buffer for the last channel above:\n");
+		printf("\n  and the whole buffer for the last channel swept:\n");
 		{
 			uint8_t *o = outbo.map;
 

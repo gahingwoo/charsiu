@@ -336,7 +336,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned rows = mm->m;
 	unsigned lines = rows - 1;              /* the DPU's line count */
 	size_t wbytes = charsiu_weight_bytes(mm);
-	int w4a16 = 0;
+	int w4a16 = 0, w4_dpu = 0, w4_rdma = 0;
 	unsigned r;
 
 	/* The S_POINTER each unit latches its geometry against. Every unit gets
@@ -479,9 +479,24 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	if (mm->wdtype == CHARSIU_INT4)
 		w4a16 = 1;
+	/*
+	 * ROUND 186 SPLITS THE PORT IN TWO, so the board can say WHICH HALF
+	 * leaves the NPU unable to start the next job.
+	 *
+	 * Round 185 measured that cleanly. The same int8 binary, the same
+	 * register stream and the same boot: FIRST it is 1023 of 1024 byte
+	 * exact, LAST, after five w4a16 jobs, it times out with the output
+	 * still holding the sentinel. The port went in as two groups from two
+	 * separate vendor streams, the DPU output stage and the RDMA
+	 * coefficient fetch, so each one can be taken back out on its own.
+	 * 0x100c is NOT in either group: it is the int4 weight format and
+	 * without it the run is not w4a16 at all.
+	 */
+	w4_dpu = w4a16 && !getenv("CHARSIU_W4_NO_DPU");
+	w4_rdma = w4a16 && !getenv("CHARSIU_W4_NO_RDMA");
 
 	emit(&e, DPU, 0x400c, 0x40000004);
-	emit(&e, DPU, 0x4010, w4a16 ? 0xa0000002u : 0x00000000u);
+	emit(&e, DPU, 0x4010, w4_dpu ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
 	emit(&e, DPU, 0x401c, rows);            /* ow * full_oh */
@@ -505,19 +520,19 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) |
 	     (uint32_t)(getenv("CHARSIU_DPU_4030")
 			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
-			: (w4a16 ? 0x0310u : 0x0710u)));
+			: (w4_dpu ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, (lines << 16) | 0);
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
 	 * here, but those are elementwise ops rather than convolutions, so it
 	 * is a candidate to sweep and not a value to copy. */
 	emit(&e, DPU, 0x4038, (uint32_t)(getenv("CHARSIU_DPU_4038")
 					 ? strtoul(getenv("CHARSIU_DPU_4038"), NULL, 0)
-					 : (w4a16 ? 0x00000053u : 0x00120080u)));
+					 : (w4_dpu ? 0x00000053u : 0x00120080u)));
 	emit(&e, DPU, 0x403c, 0x00000000);
-	emit(&e, DPU, 0x4044, w4a16 ? 0x00000002u : 0x00000001u);
+	emit(&e, DPU, 0x4044, w4_dpu ? 0x00000002u : 0x00000001u);
 	emit(&e, DPU, 0x4048, 0x80000000);
 	emit(&e, DPU, 0x404c, 0x7fffffff);
-	emit(&e, DPU, 0x4050, w4a16 ? 0x00023333u : 0x80011111u);
+	emit(&e, DPU, 0x4050, w4_dpu ? 0x00023333u : 0x80011111u);
 	emit(&e, DPU, 0x4058, 0x80000000);
 	emit(&e, DPU, 0x405c, 0x7fffffff);
 	/*
@@ -572,9 +587,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x40a8, 0x7fffffff);
 	/* w4a16 does not requantise: the vendor writes 0, 1, 0 here and the
 	 * output leaves as a float. */
-	emit(&e, DPU, 0x40ac, w4a16 ? 0u : (uint32_t)rq.offset);
-	emit(&e, DPU, 0x40b0, w4a16 ? 1u : rq.scale);
-	emit(&e, DPU, 0x40b4, w4a16 ? 0u : rq.shift);
+	emit(&e, DPU, 0x40ac, w4_dpu ? 0u : (uint32_t)rq.offset);
+	emit(&e, DPU, 0x40b0, w4_dpu ? 1u : rq.scale);
+	emit(&e, DPU, 0x40b4, w4_dpu ? 0u : rq.shift);
 	emit(&e, DPU, 0x40b8, 1 * (2 * rows - rows));   /* ow * (2*oh - window) */
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
@@ -619,7 +634,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * the surface is now fetched, CHARSIU_NO_LIFT and CHARSIU_COEF_C have to
 	 * stop being inert.
 	 */
-	emit(&e, RDMA, 0x501c, w4a16 ? 0x00000000u : 0x00000710u);
+	emit(&e, RDMA, 0x501c, w4_rdma ? 0x00000000u : 0x00000710u);
 	emit(&e, RDMA, 0x5020, job->coef_addr);
 	emit(&e, RDMA, 0x5024, job->coef_addr +
 	     (uint32_t)(table_bytes(mm) + scale_table_bytes(mm)));
@@ -633,10 +648,10 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, RDMA, 0x5028, 0x00000000);
 	emit(&e, RDMA, 0x502c, 0x00000000);
 	emit(&e, RDMA, 0x5030, 0x00000000);
-	emit(&e, RDMA, 0x5034, w4a16 ? 0x4000004cu : 0x00000041u);
+	emit(&e, RDMA, 0x5034, w4_rdma ? 0x4000004cu : 0x00000041u);
 	emit(&e, RDMA, 0x5038, 0x00000000);
-	emit(&e, RDMA, 0x5040, w4a16 ? rows : 0x00000000u);
-	emit(&e, RDMA, 0x5044, w4a16 ? 0x000280a1u : 0x40000010u);
+	emit(&e, RDMA, 0x5040, w4_rdma ? rows : 0x00000000u);
+	emit(&e, RDMA, 0x5044, w4_rdma ? 0x000280a1u : 0x40000010u);
 	emit(&e, RDMA, 0x5048, 0x00000000);
 	emit(&e, RDMA, 0x504c, 0x00000000);
 	emit(&e, RDMA, 0x5064, 0x00000000);
