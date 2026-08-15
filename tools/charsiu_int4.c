@@ -137,6 +137,79 @@ static void input_impulse(const struct charsiu_matmul *mm, uint8_t *dst,
 	}
 }
 
+/*
+ * --map: ONE nibble live in the whole buffer, and read where it lands.
+ *
+ * ROUNDS 167 AND 168 ARE WITHDRAWN. Their probes filled the WHOLE weight buffer,
+ * every low nibble or every high nibble, and a full fill cannot see a
+ * permutation: any layout that is a bijection answers "all channels equal" to
+ * it. The --kmap probe had the same defect, testing which half of k sits in the
+ * low nibble while still filling everything. Both were invariant to the thing
+ * they were built to measure, so their agreement proved nothing, and round 170b
+ * showed it: with a scale that actually discriminates, the int4 impulse lights
+ * 14 of 64 channels at strided positions where the reference lights nearly all
+ * of them.
+ *
+ * A layout can only be read with a SPARSE probe. That is how the int8 one was
+ * read, with position encoded models, and it is what this does.
+ *
+ * The scales are chosen so the answer is legible without arithmetic. One live
+ * nibble of 7, an input whose value at k is k + 1 above the zero point, and a
+ * requant multiplier of 1/7, so
+ *
+ *     the output CHANNEL that lights is n, and its VALUE is k + 1
+ *
+ * for one probe at a time. Nothing has to be inferred from a pattern.
+ */
+static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
+		      struct charsiu_bo *wt, struct charsiu_bo *outbo,
+		      struct charsiu_bo *regcmd, size_t nreg,
+		      const uint32_t *in_h, const uint32_t *out_h,
+		      size_t byte, unsigned high)
+{
+	unsigned i, n = job->mm.n, lit = 0, first_n = 0, first_v = 0;
+	uint8_t *o;
+
+	charsiu_bo_prep(dev, wt, 1000000000);
+	memset(wt->map, 0, charsiu_weight_bytes(&job->mm));
+	/* an int8 weight buffer has no nibbles: the whole byte is the weight,
+	 * and the high pass is skipped by the caller */
+	((uint8_t *)wt->map)[byte] = job->mm.wdtype == CHARSIU_INT4
+		? (uint8_t)(high ? (LIVE << 4) : LIVE)
+		: (uint8_t)LIVE;
+	charsiu_bo_fini(dev, wt);
+
+	charsiu_bo_prep(dev, outbo, 1000000000);
+	memset(outbo->map, 0, (size_t)job->mm.m * n);
+	charsiu_bo_fini(dev, outbo);
+
+	if (charsiu_submit(dev, regcmd, (unsigned)nreg, in_h, 3, out_h, 1) ||
+	    charsiu_bo_prep(dev, outbo, 2000000000)) {
+		printf("  byte %-6zu %-5s submit or wait FAILED\n",
+		       byte, high ? "high" : "low");
+		return;
+	}
+	o = outbo->map;
+	for (i = 0; i < n; i++) {
+		int v = o[i] > 127 ? o[i] - 256 : o[i];
+
+		if (v) {
+			if (!lit) { first_n = i; first_v = (unsigned)(v < 0 ? -v : v); }
+			lit++;
+		}
+	}
+	if (lit == 1)
+		printf("  byte %-6zu %-5s -> n = %-4u v = %-4u\n",
+		       byte, high ? "high" : "low", first_n, first_v);
+	else if (!lit)
+		printf("  byte %-6zu %-5s -> NOTHING LIT\n", byte,
+		       high ? "high" : "low");
+	else
+		printf("  byte %-6zu %-5s -> %u channels lit, first n = %u v = %u\n",
+		       byte, high ? "high" : "low", lit, first_n, first_v);
+	charsiu_bo_fini(dev, outbo);
+}
+
 int main(int argc, char **argv)
 {
 	static const enum pattern pats[] = { PAT_DEAD, PAT_ALL, PAT_LOW,
@@ -155,18 +228,53 @@ int main(int argc, char **argv)
 	job.mm.m = argc > 1 ? (unsigned)atoi(argv[1]) : 1;
 	job.mm.k = argc > 2 ? (unsigned)atoi(argv[2]) : 64;
 	job.mm.n = argc > 3 ? (unsigned)atoi(argv[3]) : 64;
-	job.mm.wdtype = CHARSIU_INT4;
+	/*
+	 * CHARSIU_MAP_W8 maps an INT8 weight buffer with the same probe.
+	 *
+	 * int8 is byte exact on this hardware, so its map is what a correct one
+	 * looks like, and diffing the two says what int4 does differently
+	 * instead of leaving it to be inferred. Round 171 and round 173 both
+	 * went wrong by fitting a rule to part of a map; this is the method that
+	 * has worked every time here, which is to diff against something known
+	 * to compute.
+	 *
+	 * The probe writes raw bytes into the weight buffer either way. For int8
+	 * a live byte is 0x07 rather than a nibble, which is a legal small
+	 * positive weight in the biased domain the packer would have produced.
+	 */
+	job.mm.wdtype = getenv("CHARSIU_MAP_W8") ? CHARSIU_INT8 : CHARSIU_INT4;
 	job.mm.adtype = CHARSIU_INT8;
 	job.input_scale = 0.02f;
-	job.weight_scale = 0.01f;
+	/*
+	 * 1.7857 makes the requant multiplier 1/7, so one live nibble of 7
+	 * against an input of (k + 1) above the zero point puts exactly k + 1 on
+	 * the output. The pattern probes below do not care; --map does.
+	 */
+	job.weight_scale = 1.7857f;
 	job.output_scale = 0.25f;
 	job.input_zero_point = 128;
-	job.weight_zero_point = 0;      /* a signed nibble is its own zero */
+	/*
+	 * THE WEIGHT ZERO POINT IS PER PRECISION, and getting it wrong wasted
+	 * round 174's whole comparison.
+	 *
+	 * A nibble is not biased, so int4's is 0 and its B record comes out 0.
+	 * An int8 weight IS biased by 0x80, so its zero point is 0x80 and its B
+	 * record is likewise 0. Setting 0 for both, which is what this line did,
+	 * gives int8 a B of 0x80, and 0x80 * 2080 * mult saturates every channel
+	 * at 127 whatever the weight buffer holds. Round 174's int8 map lit all
+	 * 64 channels at every offset INCLUDING the all zero one, which is that
+	 * and not the hardware.
+	 */
+	job.weight_zero_point = job.mm.wdtype == CHARSIU_INT4 ? 0 : 0x80;
 	job.output_zero_point = 0;
 	m = job.mm.m; k = job.mm.k; n = job.mm.n;
 
-	printf("int4 layout probe M=%u K=%u N=%u, %zu weight bytes\n",
-	       m, k, n, charsiu_weight_bytes(&job.mm));
+	/* the configuration goes in the log, because round 174's whole
+	 * comparison was lost to a weight zero point that was right for a nibble
+	 * and wrong for a byte, and nothing printed said which was in use */
+	printf("layout probe M=%u K=%u N=%u  w%s  wt_zp %u  %zu weight bytes\n",
+	       m, k, n, job.mm.wdtype == CHARSIU_INT4 ? "4" : "8",
+	       job.weight_zero_point, charsiu_weight_bytes(&job.mm));
 
 	dev = charsiu_open(NULL);
 	if (!dev) { printf("open FAILED\n"); return 1; }
@@ -176,8 +284,10 @@ int main(int argc, char **argv)
 	wsums = calloc(n, sizeof(*wsums));
 	/* Every input the same, so a difference between output channels can only
 	 * come from the weights. */
+	/* value k + 1 above the zero point at position k, so the output of a
+	 * single live tap names its own k */
 	for (i = 0; i < m * k; i++)
-		a_raw[i] = (uint8_t)(job.input_zero_point + 32);
+		a_raw[i] = (uint8_t)(job.input_zero_point + 1 + (i % k));
 
 	ret = charsiu_bo_alloc(dev, 4096, &regcmd);
 	ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096, &in);
@@ -258,6 +368,42 @@ int main(int argc, char **argv)
 	 * The baseline is the same weights with no impulse at all, so the column
 	 * that matters is the DIFFERENCE and not the value.
 	 */
+	/*
+	 * --map: the sparse read. The scales here are not the caller's; they are
+	 * chosen so that one live nibble makes the output value k + 1 on channel
+	 * n, so a whole layout can be read off a console log with no arithmetic.
+	 */
+	if (argc > 4 && !strcmp(argv[4], "--map")) {
+		/*
+		 * SWEEP, do not sample. Round 171 probed eight byte offsets and
+		 * the map inferred from them did not survive its own data: byte
+		 * 512 lit channel 32 where n = byte / 8 predicts 64, and every
+		 * offset from 1023 up lit nothing at all while channel 32 was
+		 * reachable from below. Eight points is not a map, it is an
+		 * invitation to theorise, and that is what happened.
+		 *
+		 * The whole buffer at a stride instead. The default of 8 gives
+		 * 256 probes across a 64 by 64 int4 weight buffer, which is one
+		 * boot, and the result is data rather than inference.
+		 */
+		size_t stride = argc > 5 ? (size_t)atoi(argv[5]) : 8;
+		size_t wb = charsiu_weight_bytes(&job.mm), b;
+
+		printf("\n  --map: ONE live nibble at a time, every %zu bytes of %zu.\n"
+		       "  n is the channel that lights; the value is printed raw\n"
+		       "  because round 171's k calibration was wrong and a nibble\n"
+		       "  reaches more than one input.\n\n", stride, wb);
+		for (b = 0; b < wb; b += stride) {
+			map_probe(dev, &job, &wt, &outbo, &regcmd, nreg,
+				  in_handles, out_handles, b, 0);
+			if (job.mm.wdtype == CHARSIU_INT4)
+				map_probe(dev, &job, &wt, &outbo, &regcmd, nreg,
+					  in_handles, out_handles, b, 1);
+		}
+		charsiu_close(dev);
+		return 0;
+	}
+
 	if (argc > 4 && !strcmp(argv[4], "--kmap")) {
 		static const unsigned ks[] = { 0, 1, 2, 3, 15, 16, 30, 31,
 					       32, 33, 62, 63 };

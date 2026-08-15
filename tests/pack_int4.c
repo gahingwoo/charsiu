@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 /*
- * The int4 packer against the layout the board measured, on the host.
+ * The int4 packer against ITS OWN layout, on the host, which is not the same as
+ * against the hardware's.
  *
  * One live weight at a time, 4096 of them, each checked to land at the byte and
- * the nibble that rounds 167 and 168 established and NOWHERE else. An off by one
- * in a packer is invisible in an output vector and costs a whole board round; it
- * is visible here in a second.
+ * the nibble the packer intends and nowhere else. That catches an off by one,
+ * which is invisible in an output vector and costs a whole board round.
+ *
+ * IT DOES NOT CATCH THE LAYOUT BEING WRONG, and the layout IS wrong: rounds 167
+ * and 168 were withdrawn in 171, and a sparse map since measures the hardware's
+ * int4 row at 8 bytes against the 32 this packs. So a pass here means the packer
+ * does what it says, not that what it says is right. It is kept because when the
+ * real layout is known this is the check that it was implemented without a slip.
  */
 #include <stdio.h>
 #include <stdlib.h>

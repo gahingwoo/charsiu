@@ -19,7 +19,14 @@ close to it:
 | negative MAC, output -66 to +63 | M=1 K=64 N=64 | 64 of 64 bytes exact |
 | bias ramp | M=1 K=64 N=64 | 64 of 64 bytes exact |
 | impulse | M=1 K=64 N=64 | 64 of 64 bytes exact |
-| dense, a projection's shape | M=1 K=512 N=1024 | 1023 of 1024 exact, the last off by one |
+| dense, a projection's shape | M=1 K=512 N=1024 | 1023 of 1024 exact, but see the note |
+
+**A note on that last row, added when the tooling grew a way to see it.** Its
+reference has only 7 distinct values across the 1024 channels, so most of those 1023
+matches are channels where both sides hold the same common value rather than channels
+that were computed. The 64 wide rows above are the strong evidence: 64 distinct
+reference values, 64 of 64 exact. A matching channel is not a computed one, and this
+table now says which is which.
 
 The two things that had to be understood to get there are worth stating because both
 were wrong in this file before:
@@ -40,9 +47,13 @@ It is not a runtime yet. What is left:
 - the reference still requantises in float where the hardware uses an integer scale and
   shift. It agrees to the byte on everything measured so far, which does not mean it
   will at every scale.
-- **int4 is deliberately not written.** Its N group of 64 is copied from the RK3588
-  notes and has never been confirmed on this silicon, and a `.rkllm` gives geometry
-  rather than layout. int8 and fp16 are enough to prove the path and to time it.
+- **int4's weight layout is still unknown.** Its registers are confirmed, read out of
+  a vendor `.rkllm` by diffing its 3328 four bit streams against its 40 eight bit
+  ones, and its output stage is byte exact on a probe that holds the MAC at zero. The
+  LAYOUT is not: two rounds of full buffer patterns appeared to decode it and were
+  withdrawn, because a probe that fills every byte cannot see a permutation. It is
+  being read again with a sparse probe, one live nibble at a time, which is how the
+  int8 layout was read.
 - the runtime work has not started: no KV cache, no sampler, no per token geometry.
 
 The three tools that got it there are in the repository rather than in a shell history,

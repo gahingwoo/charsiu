@@ -143,6 +143,21 @@ int main(int argc, char **argv)
 		 * reference then read.
 		 */
 		job.weight_zero_point = 0;
+		/*
+		 * AND THE SCALE HAS TO MOVE WITH IT, which round 169 did not do
+		 * and which made that round unreadable. A nibble spans -7 to 7
+		 * where a byte spans -128 to 127, so at int8's weight scale the
+		 * whole reference vector fitted in -1 to +1: 54 of 64 channels
+		 * "matched" because both sides were zero, and every channel
+		 * that carried any signal was wrong by half of full scale. A
+		 * matching channel is not a computed one.
+		 *
+		 * 18 times the weight scale puts int4's accumulator range where
+		 * int8's is. CHARSIU_W4_SMALLSCALE restores round 169's setting
+		 * as the control.
+		 */
+		if (!getenv("CHARSIU_W4_SMALLSCALE"))
+			job.weight_scale = 0.18f;
 		for (i = 0; i < n * k; i++)
 			b_raw[i] = (uint8_t)(((int)(i * 13 % 15) - 7) & 0xf);
 	}
@@ -238,8 +253,9 @@ int main(int argc, char **argv)
 
 		for (c = 0; c < n; c++)
 			for (j = 0; j < k; j++)
-				b_raw[c * k + j] =
-					(uint8_t)(j == c % k ? 128 + 100 : 128);
+				b_raw[c * k + j] = job.mm.wdtype == CHARSIU_INT4
+					? (uint8_t)(j == c % k ? 7 : 0)
+					: (uint8_t)(j == c % k ? 128 + 100 : 128);
 		memset(bias, 0, n * sizeof(*bias));
 		printf("impulse: weight[c][c mod K] live, bias zero\n");
 	}
@@ -357,8 +373,27 @@ int main(int argc, char **argv)
 	/* BYTE EXACT is the claim worth making, and it is not the same as
 	 * "within one count": a shape too large to print elementwise can only be
 	 * reported honestly if the count is kept here. */
+	/*
+	 * COMPUTED against TRIVIAL. A channel where the reference is zero and
+	 * the hardware is zero has matched nothing: round 169 read 54 of 64 on
+	 * an int4 impulse whose reference was zero on 54 channels and called the
+	 * layout confirmed. The reference's own spread goes beside the match
+	 * count so that cannot happen quietly again.
+	 */
 	printf("output: %u of %u bytes written, %u BYTE EXACT, %u differ by more than 1\n",
 	       nonzero, m * n, exact, bad);
+	{
+		unsigned rmin = 255, rmax = 0, rdist = 0, rseen[256] = { 0 };
+
+		for (i = 0; i < m * n; i++) {
+			if (ref[i] < rmin) rmin = ref[i];
+			if (ref[i] > rmax) rmax = ref[i];
+			if (!rseen[ref[i]]++) rdist++;
+		}
+		printf("  reference spread: %u distinct, %u..%u%s\n",
+		       rdist, rmin, rmax,
+		       rdist < 8 ? "   TOO FLAT TO JUDGE A MATCH" : "");
+	}
 	printf("  npu[0..15] ");
 	for (i = 0; i < 16 && i < m * n; i++) printf("%4u", ((uint8_t *)outbo.map)[i]);
 	printf("\n  cpu[0..15] ");

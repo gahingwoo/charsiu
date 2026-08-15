@@ -40,17 +40,21 @@ static inline unsigned charsiu_feature_atom(enum charsiu_dtype dt)
 
 /* The weight tile: the buffer is [N/ng][K/kg][N%ng][K%kg], cut short at the
  * edges rather than padded. Established against the vendor's own compiler at
- * 64 by 64, 64 by 34, 64 by 56 and 48 by 40 for the int8 case, and on the board
- * in rounds 167 and 168 for int4, where the K group doubles to 64 and its two
- * halves become the two nibbles of one byte. */
+ * 64 by 64, 64 by 34, 64 by 56 and 48 by 40 for the int8 case, and CONFIRMED
+ * directly on the hardware by a sparse map: one live byte at a time gives
+ * n = byte / 32 and k = byte % 32 on all 512 probes of a 64 by 64 buffer.
+ * The int4 numbers below are not confirmed and are known to be wrong. */
 static inline unsigned charsiu_weight_ngroup(enum charsiu_dtype dt)
 {
 	switch (dt) {
 	/*
-	 * 32, not the 64 the RK3588 notes give. Round 167 measured it: low
-	 * nibbles live and high nibbles live produced the identical output
-	 * across every channel, which no N pairing can do. int4 keeps int8's
-	 * output channel group and doubles the K one instead.
+	 * 32 here is NOT confirmed. Round 167's argument for it, that low
+	 * nibbles live and high nibbles live give the identical output, was
+	 * withdrawn in round 171: a full buffer fill cannot distinguish one
+	 * permutation from another. A sparse map does show 32 channels in the
+	 * first block, at 8 bytes each, but their group stride is 512 where
+	 * everything else about the tile predicts 1024, so the grouping is not
+	 * understood.
 	 */
 	case CHARSIU_INT4: return 32;
 	case CHARSIU_INT8: return 32;
@@ -61,9 +65,12 @@ static inline unsigned charsiu_weight_ngroup(enum charsiu_dtype dt)
 static inline unsigned charsiu_weight_kgroup(enum charsiu_dtype dt)
 {
 	/*
-	 * 64 for int4, because a byte holds k and k+32 rather than k and k+1.
-	 * Round 168: with the low nibbles live, an input impulse moved the
-	 * output for k = 0 to 31 and did nothing for k = 32 to 63.
+	 * 64 for int4 is WRONG and known to be. Round 168's argument for it was
+	 * withdrawn with round 167's, and a sparse map since measures the int4
+	 * row at 8 bytes against int8's 32 at the same K, so the hardware's k
+	 * group is 16 weights and not 64. It is left as it is because the rest
+	 * of the tile is not understood either and a half corrected layout would
+	 * be harder to reason about than a wholly wrong one.
 	 */
 	return dt == CHARSIU_INT4 ? 64 : 32;
 }

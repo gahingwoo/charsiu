@@ -209,29 +209,34 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	memset(dst, 0, charsiu_weight_bytes(mm));
 
 	/*
-	 * INT4, READ OFF THE HARDWARE IN ROUNDS 167 AND 168.
+	 * INT4 IS WRONG HERE AND THIS IS NOT THE LAYOUT. Left in place because
+	 * something has to be written and a placeholder that computes nothing
+	 * hides worse than one that computes the wrong thing loudly.
 	 *
-	 * The tile is the int8 one with its k group doubled and the two halves
-	 * of that group folded into the two nibbles of the same byte:
+	 * What it writes is [n/32][k/64][n%32][k%64] with byte = k % 32 and
+	 * nibble = (k % 64) / 32, which rounds 167 and 168 appeared to measure
+	 * and round 171 WITHDREW. Those two rounds filled the whole weight
+	 * buffer, every low nibble and then every high nibble, and a full fill
+	 * is invariant under any layout that is a bijection: it can only show
+	 * that the layout IS a permutation, never which one.
 	 *
-	 *   [n/32][k/64][n%32][k%64],  byte = k % 32,  nibble = (k % 64) / 32
+	 * WHAT A SPARSE PROBE HAS SINCE MEASURED, one live nibble at a time
+	 * (tools/charsiu_int4.c --map), at K = 64 and N = 64:
 	 *
-	 * so a row is 32 bytes either way and the tile shape does not change
-	 * with precision. Both numbers were measured rather than assumed.
+	 *   int8, for comparison   512 of 512 probes light, no dead region,
+	 *                          n = byte / 32 and k = byte % 32, which is
+	 *                          exactly what the int8 path below writes
+	 *   int4                   128 of 512 light, a QUARTER of the buffer,
+	 *                          and the row is 8 bytes rather than 32
 	 *
-	 * Round 167: low nibbles live and high nibbles live gave the IDENTICAL
-	 * output across all 64 channels, which rules out every N pairing. Both
-	 * nibbles of a byte are one output channel. So charsiu_weight_ngroup's
-	 * 64 for int4, taken from the RK3588 notes, is wrong here and it is 32.
+	 * So the hardware's int4 k group is 16 weights where int8's is 32, and
+	 * this code's 64 is wrong. The n grouping does not fit either: channels
+	 * 0 to 31 are read from bytes 0 to 255 and 32 to 63 from 512 to 767,
+	 * a group stride of 512 where a k group of 16 predicts 1024.
 	 *
-	 * Round 168: with the low nibbles live, an input impulse walking k moved
-	 * the output for k = 0 to 31 and did nothing for k = 32 to 63. So the
-	 * low nibble is the first half of the group and the high nibble the
-	 * second, and NOT k with k+1 interleaved.
-	 *
-	 * EDGE TILES ARE EXTRAPOLATED, not measured. A k that is not a multiple
-	 * of 64 gives a short row here, by the same rule the int8 path uses for
-	 * a short k group. Nothing has been run at such a shape.
+	 * Where k = 16 and above live is NOT KNOWN. Those regions are dead in
+	 * the map, so there is no data about them, and guessing is what the two
+	 * withdrawn rounds did.
 	 */
 	if (mm->wdtype == CHARSIU_INT4) {
 		for (n = 0; n < mm->n; n++) {
