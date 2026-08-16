@@ -389,7 +389,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
 	emit(&e, CNA, 0x1024, n_pad - 1);
-	emit(&e, CNA, 0x1028, ((surf * rows) << 16) | (mm->k - 1));
+	emit(&e, CNA, 0x1028, ((surf * rows) << 16) | (charsiu_k_eff(mm) - 1));
 	emit(&e, CNA, 0x102c, rows - 1);        /* (width - 1) << 16 is zero */
 	/*
 	 * Bytes per kernel, DOUBLED for int8 and not for int4.
@@ -418,7 +418,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	for (r = 0x1054; r <= 0x1074; r += 4)
 		emit(&e, CNA, r, 0x00000000);
 	emit(&e, CNA, 0x1078, rows - 1);
-	emit(&e, CNA, 0x107c, mm->k - 1);
+	emit(&e, CNA, 0x107c, charsiu_k_eff(mm) - 1);
 	emit(&e, CNA, 0x1080, 0x00000000);      /* a matmul has no padding */
 	emit(&e, CNA, 0x1084, 0x00000000);
 	emit(&e, CNA, 0x1088, job->input_addr);

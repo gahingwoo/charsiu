@@ -69,6 +69,13 @@ unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm)
 	       (last == 3 ? width : DIV_ROUND_UP(last * width, 4));
 }
 
+unsigned charsiu_k_eff(const struct charsiu_matmul *mm)
+{
+	if (getenv("CHARSIU_NO_KALIGN"))
+		return mm->k;
+	return charsiu_k_padded(mm->k, charsiu_effective_adtype(mm));
+}
+
 size_t charsiu_weight_bytes(const struct charsiu_matmul *mm)
 {
 	/* The CNA counts output channels in PAIRS and reads the weights for the
@@ -76,11 +83,12 @@ size_t charsiu_weight_bytes(const struct charsiu_matmul *mm)
 	 * round 139: doing this took every odd output channel count from wrong
 	 * across its second tile to exact. */
 	unsigned n = ALIGN_UP(mm->n, 2);
+	unsigned k = charsiu_k_eff(mm);
 
 	switch (mm->wdtype) {
-	case CHARSIU_INT4: return (size_t)mm->k * n / 2;
-	case CHARSIU_INT8: return (size_t)mm->k * n;
-	default:           return (size_t)mm->k * n * 2;
+	case CHARSIU_INT4: return (size_t)k * n / 2;
+	case CHARSIU_INT8: return (size_t)k * n;
+	default:           return (size_t)k * n * 2;
 	}
 }
 
@@ -289,6 +297,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	unsigned ng = charsiu_weight_ngroup(mm->wdtype);
 	unsigned kg = charsiu_weight_kgroup(mm->wdtype);
 	unsigned n_pad = ALIGN_UP(mm->n, 2);
+	unsigned ke = charsiu_k_eff(mm);
 	unsigned n, k;
 
 	/*
@@ -364,9 +373,19 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	for (n = 0; n < mm->n; n++) {
 		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
 
+		/*
+		 * THE GROUPS ARE LAID OUT AGAINST THE PADDED K. The input
+		 * surface is already padded to the feature atom by the memset
+		 * in charsiu_pack_input, and round 195 measured that every K
+		 * which is a multiple of 16 is byte exact and every K which is
+		 * not is wrong, 40 included, so it is not 8 either. The weights
+		 * for the padding stay at the weight zero point that the memset
+		 * above wrote, so they meet the padded inputs' zero point and
+		 * contribute nothing.
+		 */
 		for (k = 0; k < mm->k; k++) {
-			unsigned kgi = k / kg, kgsz = MIN2(mm->k - kgi * kg, kg);
-			size_t off = (size_t)ngi * ng * mm->k
+			unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
+			size_t off = (size_t)ngi * ng * ke
 				   + (size_t)kgi * kg * ngsz
 				   + (size_t)(n % ng) * kgsz
 				   + (k % kg);

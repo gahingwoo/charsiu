@@ -38,6 +38,34 @@ static inline unsigned charsiu_feature_atom(enum charsiu_dtype dt)
 	}
 }
 
+/*
+ * THE K THE HARDWARE ACTUALLY READS, which is K rounded UP to the feature atom.
+ *
+ * Round 195 swept K across the boundary at N = 64, int8, and the line is at 16
+ * and not at 32:
+ *
+ *   16, 32, 48, 64, 96   byte exact
+ *   31, 33, 40, 63, 65   not, and 40 is a multiple of 8 so it is not 8 either
+ *
+ * 16 is the int8 feature atom. The input packer already pads to it: it memsets
+ * the whole surface to the zero point first, so the tail of the last atom
+ * contributes nothing. The WEIGHT packer did not, it cut the last k group short
+ * at the real K, so the two sides disagreed about where every group after the
+ * first begins.
+ *
+ * Padding costs nothing arithmetically: the padded inputs sit at the zero point
+ * and the padded weights at theirs, so their products are zero. It costs a
+ * little buffer.
+ *
+ * CHARSIU_NO_KALIGN restores the old behaviour, which is the control.
+ */
+static inline unsigned charsiu_k_padded(unsigned k, enum charsiu_dtype adt)
+{
+	unsigned atom = charsiu_feature_atom(adt);
+
+	return (k + atom - 1) / atom * atom;
+}
+
 /* The weight tile: the buffer is [N/ng][K/kg][N%ng][K%kg], cut short at the
  * edges rather than padded. Established against the vendor's own compiler at
  * 64 by 64, 64 by 34, 64 by 56 and 48 by 40 for the int8 case, and CONFIRMED
@@ -119,6 +147,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst);
 
+unsigned charsiu_k_eff(const struct charsiu_matmul *mm);
 size_t charsiu_weight_bytes(const struct charsiu_matmul *mm);
 
 /* The 64 byte units one row of A occupies in the CBUF. A column costs
