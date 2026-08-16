@@ -309,7 +309,13 @@ int main(int argc, char **argv)
 	ret = charsiu_bo_alloc(dev, 4096, &regcmd);
 	ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096, &in);
 	ret |= charsiu_bo_alloc(dev, charsiu_weight_bytes(&job.mm) + 4096, &wt);
-	ret |= charsiu_bo_alloc(dev, (size_t)m * n + 4096, &outbo);
+	/* the surface is ALIGN(N, atom) wide, not N, so an N off the atom needs
+	 * more than m*n bytes. Round 199's N = 40 came back "0 of 40 bytes
+	 * written", which is what a short output buffer looks like. */
+	ret |= charsiu_bo_alloc(dev,
+		(size_t)((n + charsiu_feature_atom(CHARSIU_INT8) - 1)
+			 / charsiu_feature_atom(CHARSIU_INT8))
+		* charsiu_feature_atom(CHARSIU_INT8) * m + 4096, &outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef);
 	if (ret) { printf("bo alloc FAILED %d\n", ret); return 1; }
 	printf("bo iova: regcmd 0x%llx  in 0x%llx  wt 0x%llx  out 0x%llx  coef 0x%llx\n",
@@ -397,13 +403,47 @@ int main(int argc, char **argv)
 	if (ret) { printf("wait FAILED %d\n", ret); return 1; }
 
 	cpu_reference(&job, a_raw, b_raw, bias, ref);
-	for (i = 0; i < m * n; i++) {
-		uint8_t got = ((uint8_t *)outbo.map)[i];
-		int d = (int)got - (int)ref[i];
+	/*
+	 * WHERE OUTPUT ROW m CHANNEL n LANDS.
+	 *
+	 * Round 199 measured that charsiu is wrong at EVERY M above 1, at a flat
+	 * rate: 32.0% byte exact at K=64 from M=8 all the way to M=3136, and
+	 * 38.7% at K=33. It does not degrade with size, which is what a wrong
+	 * LAYOUT looks like and not what a wrong computation looks like. Every
+	 * correctness run this project ever did was at M = 1.
+	 *
+	 * The input surface is [k/atom][m][k%atom]. If the output is the mirror
+	 * of that, it is [n/atom][m][n%atom], and at M = 1 that collapses to
+	 * exactly n, which is why a row major reading has been right all along
+	 * and only at M = 1.
+	 *
+	 * This changes only how the result is READ. The register stream, the
+	 * packing and the buffers are untouched, so if the surface reading is
+	 * byte exact then the hardware was computing correctly the whole time.
+	 * CHARSIU_OUT_ROWMAJOR forces the old reading, and at M = 1 the two are
+	 * the same expression and must agree.
+	 */
+	{
+		unsigned atom = charsiu_feature_atom(CHARSIU_INT8);
+		int surf = !getenv("CHARSIU_OUT_ROWMAJOR");
+		unsigned mi, ni;
 
-		if (got != 0xa5) nonzero++;
-		if (d < -1 || d > 1) bad++;
-		if (d == 0) exact++;
+		printf("  reading the output as %s\n",
+		       surf ? "[n/atom][m][n%atom], the mirror of the input surface"
+			    : "[m][n] row major");
+		for (mi = 0; mi < m; mi++)
+			for (ni = 0; ni < n; ni++) {
+				size_t at = surf
+					? (size_t)(ni / atom) * m * atom
+					  + (size_t)mi * atom + ni % atom
+					: (size_t)mi * n + ni;
+				uint8_t got = ((uint8_t *)outbo.map)[at];
+				int d = (int)got - (int)ref[(size_t)mi * n + ni];
+
+				if (got != 0xa5) nonzero++;
+				if (d < -1 || d > 1) bad++;
+				if (d == 0) exact++;
+			}
 	}
 	/* BYTE EXACT is the claim worth making, and it is not the same as
 	 * "within one count": a shape too large to print elementwise can only be
