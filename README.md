@@ -20,8 +20,17 @@ close to it:
 | bias ramp | M=1 K=64 N=64 | 64 of 64 bytes exact |
 | impulse | M=1 K=64 N=64 | 64 of 64 bytes exact |
 | dense, a projection's shape | M=1 K=512 N=1024 | 1023 of 1024 exact, but see the note |
+| dense, **many rows** | M=224 K=64 N=64 | 14313 of 14336, none off by more than 1 |
+| dense, a whole 56x56 surface | **M=3136 K=33 N=64** | 200344 of 200704, 51 off by more than 1 |
 
-**A note on that last row, added when the tooling grew a way to see it.** Its
+**The rows above M = 1 were wrong for 36 rounds and the hardware was not.** The
+output surface is `[n/atom][m][n%atom]`, the mirror of the input's, and at M = 1
+that expression collapses to exactly `n`. So a row major reading was right at one
+row and only there, and every correctness run this project had done was at one
+row. Nothing about the job changed when this was found: same register stream,
+same packing, same buffers, only which byte the checker reads.
+
+**A note on the K=512 row, added when the tooling grew a way to see it.** Its
 reference has only 7 distinct values across the 1024 channels, so most of those 1023
 matches are channels where both sides hold the same common value rather than channels
 that were computed. The 64 wide rows above are the strong evidence: 64 distinct
