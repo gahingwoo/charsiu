@@ -30,12 +30,36 @@ row and only there, and every correctness run this project had done was at one
 row. Nothing about the job changed when this was found: same register stream,
 same packing, same buffers, only which byte the checker reads.
 
-**A note on the K=512 row, added when the tooling grew a way to see it.** Its
-reference has only 7 distinct values across the 1024 channels, so most of those 1023
-matches are channels where both sides hold the same common value rather than channels
-that were computed. The 64 wide rows above are the strong evidence: 64 distinct
-reference values, 64 of 64 exact. A matching channel is not a computed one, and this
-table now says which is which.
+**Which of these rows is evidence, and which is not.** A matching channel is not a
+computed one: if the reference is flat, both sides can hold the same common value
+without a single multiply having been right. Computed with the tool's own
+cpu_reference() at M = 1, K = 64, N = 64:
+
+| probe | distinct reference values | range | reads as evidence |
+|---|---|---|---|
+| negative MAC | 64 | -66 to 63 | yes |
+| bias ramp | 64 | -48 to 53 | yes |
+| dense | 5 | -2 to 2 | no |
+| impulse | 5 | -2 to 2 | no, until the scale fix below |
+
+The K=512 row is the same problem again, 7 distinct values across 1024 channels.
+
+This file used to say the four 64 wide rows were all strong evidence because they
+had 64 distinct reference values. Two of them do. The other two put the whole
+reference inside four counts, which is under the tool's own TOO FLAT TO JUDGE A
+MATCH threshold, so those two 64 of 64 results were never readable.
+
+It matters which two. The two that hold are the ones that exercise the output
+stage, one walking the MAC through zero and one holding it at zero and walking
+the bias. The two that do not are the ones that exercise the WEIGHT LAYOUT. So
+the layout evidence is the weaker half, which is the opposite of what this file
+implied.
+
+The impulse now sets its own weight scale, the way the int4 probes learned to in
+rounds 170 and 176, and its reference spans 62 values across -115 to 115.
+CHARSIU_I8_IMPULSE_SMALLSCALE restores the old setting as a control. The dense
+probe has the same problem and has deliberately not been touched in the same
+change, so that whichever result moves can be attributed.
 
 The two things that had to be understood to get there are worth stating because both
 were wrong in this file before:

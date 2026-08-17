@@ -277,6 +277,44 @@ int main(int argc, char **argv)
 			for (i = 0; i < m * k; i++)
 				a_raw[i] = (uint8_t)(job.input_zero_point
 						     + (int)(i * 37 % 241) - 120);
+		} else if (!getenv("CHARSIU_I8_IMPULSE_SMALLSCALE")) {
+			/*
+			 * AND THE INT8 IMPULSE WAS LEFT BEHIND THE SAME WAY.
+			 *
+			 * Its live weight is 100 above the zero point and its
+			 * input spanned 30 either side, so the accumulator only
+			 * reached 3000 and the multiplier of 0.0008 put the
+			 * whole reference in FIVE distinct values across four
+			 * counts, -2 to +2. The tool's own check calls anything
+			 * under eight TOO FLAT TO JUDGE A MATCH, so this probe
+			 * has been failing its own readability test while its
+			 * 64 of 64 was being read as evidence. Third time for
+			 * the same mistake: round 169 on the int4 dense probe,
+			 * round 176 on the int4 impulse, this one on int8.
+			 *
+			 * A weight scale of 0.12 with the wide input fills the
+			 * byte without touching either rail. 0.1323 reaches
+			 * exactly -127 to 127 but leaves a value sitting on the
+			 * rail, and a saturated channel cannot be told from a
+			 * wrong one. Computed with the tool's own
+			 * cpu_reference() at M=1 K=64 N=64, M=1 K=32 N=64 and
+			 * M=8 K=64 N=64 before this was ever flashed.
+			 *
+			 *   scale    distinct   range        at a rail
+			 *   0.01          5     -2 to 2          0     old
+			 *   0.10         54    -96 to 96         0
+			 *   0.12         62   -115 to 115        0     this
+			 *   0.1323       64   -127 to 127        1
+			 *   0.14         61   -128 to 127        5
+			 *
+			 * CHARSIU_I8_IMPULSE_SMALLSCALE restores the old
+			 * setting as the control, the way CHARSIU_W4_SMALLSCALE
+			 * does for int4.
+			 */
+			job.weight_scale = 0.12f;
+			for (i = 0; i < m * k; i++)
+				a_raw[i] = (uint8_t)(job.input_zero_point
+						     + (int)(i * 37 % 241) - 120);
 		}
 
 		for (c = 0; c < n; c++)
@@ -285,7 +323,25 @@ int main(int argc, char **argv)
 					? (uint8_t)(j == c % span ? 7 : 0)
 					: (uint8_t)(j == c % span ? 128 + 100 : 128);
 		memset(bias, 0, n * sizeof(*bias));
-		printf("impulse: weight[c][c mod %u] live, bias zero\n", span);
+		/*
+		 * ⚠ IT SAYS WHICH BRANCH IT TOOK AND WHAT IT SET.
+		 *
+		 * Five knobs in this family have turned out to miss the code
+		 * they were meant to reach and returned a clean negative that
+		 * was then read as evidence. A knob that cannot be seen working
+		 * is not a knob, so print the scale, the input span and the
+		 * branch rather than trusting that the string is in the binary.
+		 */
+		printf("impulse: weight[c][c mod %u] live, bias zero, "
+		       "%s branch, weight_scale %g, input span %s\n",
+		       span,
+		       job.mm.wdtype == CHARSIU_INT4 ? "int4"
+		       : getenv("CHARSIU_I8_IMPULSE_SMALLSCALE") ? "int8 SMALLSCALE"
+								 : "int8",
+		       job.weight_scale,
+		       job.mm.wdtype == CHARSIU_INT4 ||
+		       !getenv("CHARSIU_I8_IMPULSE_SMALLSCALE")
+			       ? "128 +- 120" : "128 +- 30");
 	}
 	for (i = 0; i < n; i++) {
 		unsigned j;
