@@ -341,11 +341,28 @@ project can tell the two forms apart, and the `N` sweep is the first thing that
 could. It says the map scales with the buffer: at `N = 24` the second group of
 `g2` lands at byte 768, which is exactly the size of that buffer.
 
-The stride is `wbytes/4` now and the second group sits half a stride on rather
-than a fixed 256. ⚠ **A hypothesis, not a reading** — it agrees with everything
-measured and disagrees with the failures, which is all that can be said for it.
-The odd member offsets, 128 for a middle pair and 64 for the last, are still
-constants read only at `N = 64`.
+`wbytes/4` was tried and is **refuted**, and not narrowly. It did not fix the
+three that were wrong and it broke the three that were right:
+
+```
+            8*K      wbytes/4
+N = 16    16/16          0/16
+N = 32    32/32          0/32
+N = 48    48/48          8/48
+N = 64    64/64         64/64     equal here by construction, so proves nothing
+N = 24    16/24          0/24
+N = 40    24/40          0/40
+N = 56    32/56          0/56
+```
+
+So `8*K` is right everywhere there is data and the failures at 24, 40 and 56 are
+something else. The reasoning that produced `wbytes/4` was tidy — the map must
+scale with the buffer, and at `N = 24` the second group of `g2` lands at 768
+which is exactly that buffer's size — and it did not survive one round.
+
+The `N = 64` table came off a `--map` sweep, so the next step is the same sweep
+at an `N` that is not 64, rather than a third form fitted to the same seven
+numbers.
 
 ### Where int4 stands
 
@@ -355,7 +372,8 @@ works, no override, byte exact against a CPU reference
   64 channels, 32 real k each, out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
 open
-  N not a multiple of 16 places the top groups wrong  (the stride above)
+  N = 24, 40, 56 place the top groups wrong, and the address rule is unmeasured
+    anywhere but N = 64
   half the k reaches any channel, and which half is its parity
   M has only ever been 1
 ```

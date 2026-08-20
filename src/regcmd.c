@@ -430,13 +430,18 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * N = 24 the second group of g2 lands at 768, which is
 			 * exactly the size of that buffer.
 			 *
-			 * So this uses wbytes/4, which agrees with everything
-			 * measured and does not agree with the failures. It has
-			 * not been confirmed on hardware and the odd member
-			 * offsets, 128 and 64, are still constants read only at
-			 * N = 64.
+			 * ⚠ wbytes/4 WAS TRIED IN ROUND 284 AND IT IS REFUTED.
+			 * It did not fix 24, 40 and 56 and it broke 16, 32 and
+			 * 48, which 8*K had exact: 0 of 16, 0 of 32 and 8 of
+			 * 48. Only N = 64 survived, and it survives either way
+			 * by construction. So 8*K is right wherever there is
+			 * data and the failures are something else.
+			 *
+			 * Not guessing a third form. The N = 64 table came off
+			 * a --map sweep and the thing to do is run the same
+			 * sweep at an N that is not 64.
 			 */
-			size_t stride = charsiu_weight_bytes(mm) / 4;
+			size_t stride = (size_t)8 * mm->k;
 			size_t row = (size_t)(g / 2) * stride
 				     + ((g & 1) ? (g == glast ? 64 : 128) : 0)
 				     + (size_t)(n % 8) * 8;
@@ -448,7 +453,6 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
 			 */
 			for (half = 0; half < (mm->k > 32 ? 2u : 1u); half++) {
-				/* half the pair stride, by the same argument */
 				size_t gb = row + (size_t)half * (stride / 2);
 				unsigned j;
 
