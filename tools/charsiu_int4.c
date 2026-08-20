@@ -282,19 +282,52 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 			size_t nreg, const uint32_t *in_h, const uint32_t *out_h,
 			size_t byte, unsigned high, uint8_t *a_raw)
 {
+	/*
+	 * ⚠ ROUND 265 WIDENED THE READ, and every "channel" this probe printed
+	 * before it is an OUTPUT BYTE OFFSET.
+	 *
+	 * It cleared and read m*n BYTES on a path whose output element is not a
+	 * byte. 0x4010 carries a non zero OUT_PRECISION for w4a16, and 0x40ac,
+	 * 0x40b0, 0x40b4 are 0, 1, 0, an identity requant, so nothing narrows
+	 * the accumulator to a byte. Every other w4a16 probe in this file reads
+	 * m*n*4 and only this one read m*n, which is the int8 era reading that
+	 * round 189 already removed once from --bmap. The buffer is allocated
+	 * m*n*4 under a comment that says two bytes an element, so the file has
+	 * carried three different widths at once.
+	 *
+	 * Two of round 264's three anomalies fall straight out of that. "Two
+	 * consecutive channels, and only c mod 4 in {0,1}" is the two low bytes
+	 * of one little endian word: a single live nibble of 7 measured +5112,
+	 * which is 000013f8, nonzero at offsets 0 and 1 and zero at 2 and 3.
+	 * "Everything at b >= 64 is dead" is an element that fell outside a
+	 * window m*n bytes wide, and at N of 16, 32 and 64 that window is
+	 * exactly where r264's dead rows begin.
+	 *
+	 * So report the word, its index, and WHICH bytes of it are live. The
+	 * word index is the channel candidate. How many bytes light says how
+	 * wide an element is. And re running with CHARSIU_INT4_LIVE=15 says
+	 * whether the value is a signed 32 bit integer at all, because -4896
+	 * lights four bytes where +5112 lights two. The live nibble is g_live
+	 * here for that reason; it used to be the LIVE macro, which is why the
+	 * environment variable did nothing for --kpair.
+	 */
 	unsigned k, i, hits = 0;
-	unsigned firstn = 0;
-	unsigned chs[8], nch;
+	unsigned firstw = 0;
+	size_t obytes = (size_t)job->mm.m * job->mm.n * 4;
+
+	if (obytes > outbo->size)
+		obytes = outbo->size;
 
 	charsiu_bo_prep(dev, wt, 1000000000);
 	memset(wt->map, 0, charsiu_weight_bytes(&job->mm));
-	((uint8_t *)wt->map)[byte] = (uint8_t)(high ? (LIVE << 4) : LIVE);
+	((uint8_t *)wt->map)[byte] = (uint8_t)(high ? (g_live << 4) : g_live);
 	charsiu_bo_fini(dev, wt);
 
 	printf("  byte %-5zu %-5s pairs with k =", byte, high ? "high" : "low");
 	for (k = 0; k < job->mm.k; k++) {
 		uint8_t *o;
 		int any = 0;
+		unsigned nw = 0;
 
 		for (i = 0; i < job->mm.k; i++)
 			a_raw[i] = (uint8_t)(job->input_zero_point + (i == k ? 100 : 0));
@@ -304,46 +337,48 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		charsiu_bo_fini(dev, in);
 
 		charsiu_bo_prep(dev, outbo, 1000000000);
-		memset(outbo->map, 0, (size_t)job->mm.m * job->mm.n);
+		memset(outbo->map, 0, obytes);
 		charsiu_bo_fini(dev, outbo);
 
 		if (charsiu_submit(dev, regcmd, (unsigned)nreg, in_h, 3, out_h, 1) ||
 		    charsiu_bo_prep(dev, outbo, 2000000000))
 			continue;
-		/*
-		 * ⚠ ALL the channels, not the first. Round 262 resolved the k
-		 * dimension exactly, 88 of 88 points, but every live byte
-		 * reported a channel that is a multiple of four, which
-		 * addresses 16 of 64. Reporting only the first cannot tell a
-		 * nibble that feeds channel 4j from one that feeds 4j to
-		 * 4j+3, and those are completely different maps.
-		 */
+
 		o = outbo->map;
-		nch = 0;
-		for (i = 0; i < job->mm.n; i++)
-			if (o[i]) {
+		for (i = 0; (size_t)i + 4 <= obytes; i += 4) {
+			uint32_t w;
+			unsigned b, mask = 0;
+
+			memcpy(&w, o + i, 4);
+			if (!w)
+				continue;
+			for (b = 0; b < 4; b++)
+				if (o[i + b])
+					mask |= 1u << b;
+			if (!any) {
 				any = 1;
-				if (!hits) firstn = i;
-				if (nch < (unsigned)(sizeof(chs) / sizeof(chs[0])))
-					chs[nch] = i;
-				nch++;
+				if (!hits)
+					firstw = i / 4;
+				printf(" %u[", k);
 			}
+			if (nw < 4)
+				printf("%sw%u=%08x/b%u%u%u%u", nw ? " " : "",
+				       i / 4, w,
+				       !!(mask & 1), !!(mask & 2),
+				       !!(mask & 4), !!(mask & 8));
+			nw++;
+		}
 		charsiu_bo_fini(dev, outbo);
 		if (any) {
-			unsigned q;
-
-			printf(" %u[ch", k);
-			for (q = 0; q < nch && q < 8; q++)
-				printf(" %u", chs[q]);
-			if (nch > 8)
-				printf(" ...%u total", nch);
+			if (nw > 4)
+				printf(" ...%u words", nw);
 			printf("]");
 			hits++;
 		}
 	}
 	printf("   (%u of %u", hits, job->mm.k);
 	if (hits)
-		printf(", first channel %u", firstn);
+		printf(", first word %u", firstw);
 	printf(")\n");
 }
 
@@ -1219,15 +1254,26 @@ int main(int argc, char **argv)
 			0, 8, 16, 24, 32, 40, 48, 56,
 			64, 65, 66, 72, 80, 88, 96, 104, 112, 120, 127,
 			128, 136,
+			/*
+			 * 256 and 384 are r263's two K invariant rows, kept as
+			 * the check that widening the read did not move a byte
+			 * that was already being read inside the window. 512 is
+			 * an IN BAND CONTROL: at K of 64 it is k 64, past the
+			 * end, so it has to stay dark on a correct read. If it
+			 * lights, the window is not the story and the address
+			 * function is wrong somewhere else.
+			 */
+			256, 384, 512,
 		};
 
 		unsigned j;
 
 		printf("\n  --kpair: ONE live nibble, a ONE HOT input, sweeping k.\n"
-		       "  Reads BOTH the k a nibble pairs with and the first channel\n"
-		       "  it lights, which is what separates a contiguous sixteen\n"
-		       "  bytes per channel from eight bytes plus a k block\n"
-		       "  elsewhere. Bytes 8 and 256 each decide it alone.\n\n");
+		       "  Reads the k a nibble pairs with, and the output WORD it\n"
+		       "  lights: w<index>=<value>/b<which of the four bytes>.\n"
+		       "  The word index is the channel candidate, the byte pattern\n"
+		       "  says how wide an element is, and the value says whether it\n"
+		       "  is a signed 32 bit integer. Live nibble %x.\n\n", g_live);
 		for (j = 0; j < sizeof(bytes) / sizeof(bytes[0]); j++) {
 			if (bytes[j] >= charsiu_weight_bytes(&job.mm))
 				continue;
