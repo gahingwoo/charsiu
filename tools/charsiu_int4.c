@@ -1087,13 +1087,47 @@ int main(int argc, char **argv)
 	}
 
 	if (argc > 4 && !strcmp(argv[4], "--kpair")) {
-		static const size_t bytes[] = { 0, 1, 2, 3, 4, 7, 8, 512 };
+		/*
+		 * ROUND 261. The layout this project has is
+		 *
+		 *   channel n at (n / 32) * 512 + (n % 32) * 8, eight bytes
+		 *   byte b nibble h is k = 2b + h
+		 *
+		 * and eight bytes is sixteen nibbles, so it describes k = 0 to
+		 * 15 and nothing above. At the default 64 by 64 the buffer is
+		 * 2048 bytes and that formula accounts for 512 of them, so
+		 * three quarters of it is unexplained and k = 16 upward has to
+		 * live in there somewhere. The map calls those bytes dead
+		 * because it never had an input past k = 15 to pair them with.
+		 *
+		 * This probe already answers it. One live nibble at a byte, a
+		 * one hot input walking k, and it prints BOTH the k it pairs
+		 * with and the first channel that lights. The only thing it was
+		 * missing is bytes in the unexplained region.
+		 *
+		 * The bytes below are one per candidate block boundary rather
+		 * than a dense sweep, since each costs k submits. 8 and 256
+		 * are the two that separate the readings on their own:
+		 *
+		 *   byte 8    contiguous 16 bytes per channel  channel 0, k=16
+		 *             eight bytes per channel          channel 1, k=0
+		 *   byte 256  a k block at +256                channel 0, k=16
+		 *             a k block at +1024               nothing, or 32
+		 */
+		static const size_t bytes[] = {
+			0, 1, 2, 3, 4, 7,
+			8, 16, 248, 255,
+			256, 257, 264,
+			512, 520,
+			768, 1024, 1032, 1280, 1536, 2040,
+		};
 		unsigned j;
 
 		printf("\n  --kpair: ONE live nibble, a ONE HOT input, sweeping k.\n"
-		       "  A nibble that pairs with more than one k is broadcast, and\n"
-		       "  that would explain both the map's unusable k column and the\n"
-		       "  impulse saturating at the rails.\n\n");
+		       "  Reads BOTH the k a nibble pairs with and the first channel\n"
+		       "  it lights, which is what separates a contiguous sixteen\n"
+		       "  bytes per channel from eight bytes plus a k block\n"
+		       "  elsewhere. Bytes 8 and 256 each decide it alone.\n\n");
 		for (j = 0; j < sizeof(bytes) / sizeof(bytes[0]); j++) {
 			if (bytes[j] >= charsiu_weight_bytes(&job.mm))
 				continue;
