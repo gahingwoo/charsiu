@@ -475,10 +475,43 @@ w=3  16896*256>>16 = 66      w=15 (signed -1) -17408*256>>16 = -68
 w=4  17408*256>>16 = 68      and the high nibble, abits 512, is 2x each
 ```
 
-`PP = 0` is `127 * w` with `w` a signed nibble, linear and exact at all seven,
-which is what an int4 matmul wants **except for the 127**: the output does not
-depend on the activation at all. `--map` with a ramp and `--kpair` with a one hot
-of 100 both return 889 for a nibble of 7, so that is measured twice.
+`PP = 0` is `127 * w` with `w` a signed nibble, linear and exact at all seven.
+With a **one byte activation** it becomes the real thing. Sweeping the one hot
+amplitude against a nibble of 7:
+
+```
+amp     1    2     5    10   100
+out     7   14    35    70   700        out = a * w, exact at five of five
+```
+
+A plain integer multiply, no fp16 bit pattern and no logarithm, which is the
+operation an int4 matmul wants. The paired second k still returns `127 * w`
+whatever the amplitude, so it reads something that is not in the activation
+buffer, and that is a separate defect.
+
+### The channel count has a source, and it is 0x3020
+
+`CORE 0x3020` set to 127, claiming 128 channels at `N = 64`, gives 72 written.
+`0x402c` and `0x5014` carry the same `n-1` and are inert, `CONV_CON2` is inert,
+`SIZE_E_0` is inert or hangs, `CBUF_CON0` turns the fetch dark without moving the
+count:
+
+```
+channels = ceil((v+1)/2) + extra(SIZE_E_2)     v = 0x3020, extra 0, 0, 4, 8
+v = 63  -> 32 + 8 = 40         v = 127 -> 64 + 8 = 72        both measured
+```
+
+Five rounds of sweeping and the answer was in a register excluded for being
+**identical on both paths**. The sweep list came from diffing int8's stream
+against int4's, and a register that is the same in both cannot cause the
+difference, but it can be the bound one path reaches and the other does not.
+
+⚠ The two fixes fight: `0x3020 = 127` with the k fix comes back at 40. With the
+k fix a channel eats 32 weight bytes rather than 16, so 72 channels want 2304
+out of a buffer holding 2048. `v = 111` gives 64 channels, and 64 times 32 is
+exactly 2048.
+
+### The activation packing
 
 It was the packing, at least partly. charsiu packs the activation as a 2 byte
 fp16 whenever the weight is int4, int8 value in the high byte and the low byte
