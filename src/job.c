@@ -38,12 +38,58 @@ struct emitter {
 	size_t n;
 };
 
+/*
+ * CHARSIU_OVERRIDE lets one register be changed from the environment without a
+ * rebuild, so a single field can be swept from a board script.
+ *
+ * The format is a comma separated list of reg=value, both accepted in any base
+ * strtoul takes, and the register is matched on its address alone rather than
+ * on unit, because no two units in this stream share an address:
+ *
+ *   CHARSIU_OVERRIDE="0x1030=0x00800000,0x402c=63"
+ *
+ * The last matching entry wins, which makes it safe to append. This exists
+ * because rounds 265 through 268 established two shortfalls that both point at
+ * a size register, and answering which one needs a sweep of one field at a
+ * time, which is the method that worked on 0x4050 in round 260.
+ */
+static int override_for(unsigned reg, uint32_t *out)
+{
+	const char *p = getenv("CHARSIU_OVERRIDE");
+	int found = 0;
+
+	while (p && *p) {
+		unsigned long r, v;
+		char *end;
+
+		r = strtoul(p, &end, 0);
+		if (end == p || *end != '=')
+			break;
+		p = end + 1;
+		v = strtoul(p, &end, 0);
+		if (end == p)
+			break;
+		p = end;
+		if (r == reg) {
+			*out = (uint32_t)v;
+			found = 1;
+		}
+		while (*p == ',' || *p == ' ')
+			p++;
+	}
+	return found;
+}
+
 static void emit(struct emitter *e, unsigned target, unsigned reg, uint32_t val)
 {
+	uint32_t ov;
+
 	if (e->n >= e->max) {
 		e->n = e->max + 1;
 		return;
 	}
+	if (override_for(reg, &ov))
+		val = ov;
 	e->out[e->n++] = ((uint64_t)target << 48) | ((uint64_t)val << 16) | reg;
 }
 

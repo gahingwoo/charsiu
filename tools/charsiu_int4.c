@@ -512,6 +512,38 @@ int main(int argc, char **argv)
 	       job.weight_zero_point, charsiu_weight_bytes(&job.mm), g_live,
 	       getenv("CHARSIU_INT4_PERM") ? "PERMUTED" : "plain ramp");
 
+	/*
+	 * --stream dumps the register stream and exits, with no device and no
+	 * submit. Rounds 265 to 268 turned two shortfalls into two size
+	 * register questions, and answering those needs the baseline values in
+	 * the same log as the sweep that varies them, so that a value can be
+	 * checked rather than recomputed from the source by hand.
+	 *
+	 * The addresses are zero here because no bo is allocated, which is
+	 * exactly what makes it safe to run before the device is opened.
+	 */
+	if (argc > 4 && !strcmp(argv[4], "--stream")) {
+		uint64_t stream[512];
+		size_t ns = charsiu_emit_job(&job, stream, 512), si;
+
+		printf("\n  register stream, %zu entries", ns);
+		if (getenv("CHARSIU_OVERRIDE"))
+			printf("   OVERRIDE=%s", getenv("CHARSIU_OVERRIDE"));
+		printf("\n\n");
+		for (si = 0; si < ns; si++) {
+			unsigned tg = (unsigned)(stream[si] >> 48) & 0xffff;
+			unsigned rg = (unsigned)(stream[si] & 0xffff);
+			uint32_t vl = (uint32_t)(stream[si] >> 16);
+			const char *u = tg == 0x0201 ? "CNA"
+				      : tg == 0x0801 ? "CORE"
+				      : tg == 0x1001 ? "DPU"
+				      : tg == 0x2001 ? "DPU_RDMA" : "?";
+
+			printf("    %-8s 0x%04x = 0x%08x  %u\n", u, rg, vl, vl);
+		}
+		return 0;
+	}
+
 	dev = charsiu_open(NULL);
 	if (!dev) { printf("open FAILED\n"); return 1; }
 
@@ -1392,6 +1424,15 @@ int main(int argc, char **argv)
 		 */
 		size_t stride = argc > 5 ? (size_t)atoi(argv[5]) : 8;
 		size_t wb = charsiu_weight_bytes(&job.mm), b;
+		/*
+		 * An optional byte LIMIT. A sweep that only has to read the run
+		 * length and the channel count needs the first block or two, not
+		 * the whole buffer, and the channel count is on every line, so a
+		 * register sweep arm costs sixteen submits rather than five
+		 * hundred.
+		 */
+		if (argc > 6 && (size_t)atoi(argv[6]) < wb)
+			wb = (size_t)atoi(argv[6]);
 
 		printf("\n  --map: ONE live nibble at a time, every %zu bytes of %zu.\n"
 		       "  n is the channel that lights; the value is printed raw\n"

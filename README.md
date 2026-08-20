@@ -334,13 +334,47 @@ writes a channel it does not compute.
 Two numbers come out of that map and they are **different problems**:
 
 ```
-channels reached = N/2 + 8    16, 24 and 40 at N of 16, 32 and 64
-k per channel    = 32         two eight byte groups, at B and B+256,
-                              sixteen nibbles each, while K is 64
+channels reached = 8 * (N/16 + 1)    16, 24, 32, 40 and 72 at N of 16, 32,
+                                     48, 64 and 128. 48 and 128 were derived
+                                     from the other three, not fitted to.
+k per channel    = 32                two eight byte groups, at B and B+256,
+                                     sixteen nibbles each, while K is 64
 ```
 
 The second is not the first in disguise. Every channel that exists at all gets
-exactly half of its k, whatever `N` is.
+exactly half of its k, whatever `N` is. And `N/8` groups of eight would be every
+channel, so the count is halved and then incremented.
+
+### int8 is the oracle, and it computes everything it is asked for
+
+The same probe, the same `K`, the same `N`, one flag:
+
+```
+int8:  channel = 32*(B/2048) + (B/32) mod 32
+       k       = B mod 32 + 32*((B/1024) mod 2)
+       64 bytes a channel, 64 k, no dead byte anywhere, highest byte written N-1
+```
+
+The two paths are the **same shape with int4's runs half as long**. int8 reads
+32 bytes a channel a pass and takes two passes to cover 64 k. int4 reads 8 and
+takes two, so it covers 32. To cover 64 it would have to read 16.
+
+Diffing the two register streams at the same geometry leaves **fourteen**
+registers, of which three are the requant and settled and one is the precision
+itself:
+
+```
+CNA 0x100c  0 -> 0x20600120        DPU 0x4030  ..0710 -> ..0310
+CNA 0x101c  0x1000 -> 0x800        DPU 0x4038  0x00120080 -> 0x53
+CNA 0x1020  64 -> 32               DPU 0x4044  1 -> 2
+CNA 0x1028  surf 1 -> 2            DPU 0x4050  0x80011111 -> 0x00023333
+CNA 0x1030  128<<16 -> 32<<16      DPU 0x4010  0 -> 0xa0000002
+CNA 0x103c, 0x1044  surf 1 -> 2    DPU 0x40ac, 0x40b0, 0x40b4  requant
+```
+
+`--stream` dumps that list from the tool and `CHARSIU_OVERRIDE` sets any single
+register from the environment, so the ten that are left can be flipped to their
+int8 value one at a time without a rebuild.
 
 ### The hardware writes fewer channels than the job declares
 
