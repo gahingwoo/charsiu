@@ -226,11 +226,11 @@ no byte lights more than one slot
 
 The control, an all zero weight buffer, lights nothing.
 
-⚠ The first two lines are confirmed by `--kpair`, which reaches word 0 from
-bytes 0 to 7 and again from 256 to 263. **The third is in doubt.** Byte 384 and
-byte 512 both light, and the layout read below predicts the second half is live
-throughout, so either the count is wrong or `--bmap` was reading a window too
-small to see it, which is a mistake this probe has now made twice.
+⚠ Round 266 put the third line in doubt and it was wrong to. `--kpair` swept
+bytes 1024, 1536 and 1920, predicted words 32, 48 and 56 for them, and all three
+lit nothing. **The second half of the weight buffer really is dark.** What is
+confirmed instead is that the boundary sits at 1024 rather than at 512: bytes
+512, 640, 768 and 896 all light, at words 16, 24, 16 and 24.
 
 ### What the output actually is, exactly
 
@@ -307,6 +307,22 @@ had guessed at: **four byte signed little endian, one per channel**. A live
 nibble of 7 gives `00001bbc`, which is `+7100` and lights two bytes; a nibble of
 15 gives `ffffe570`, which is `-6800` and lights four. The two arms agree on
 every word and every k across 48 points.
+
+### The hardware writes fewer channels than the job declares
+
+Filling the output buffer with a sentinel rather than zero, and reading the
+whole of it, says how far the write actually reaches. It is not `N`:
+
+```
+N = 16   ->  16 words written        N = 64   ->  40 words written
+N = 32   ->  24 words written        which is N/2 + 8
+```
+
+Three geometries, and the fit is exact. At `N = 16` it happens to equal `N`,
+which is why every closed result in this file is at `N = 16`. At `N = 32` eight
+declared channels are never written and at `N = 64` it is twenty four. This is
+an output side fact and none of the weight address arithmetic above is needed to
+state it.
 
 ### The defect this project put there, and its fix
 

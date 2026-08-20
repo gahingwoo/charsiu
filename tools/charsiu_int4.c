@@ -212,7 +212,24 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		      const uint32_t *in_h, const uint32_t *out_h,
 		      size_t byte, unsigned high)
 {
-	unsigned i, n = job->mm.n, lit = 0, first_n = 0, first_v = 0;
+	/*
+	 * ⚠ ROUND 267. This had the same defect --kpair did, and it is the
+	 * THIRD place in this file to carry it: it cleared and read m*n BYTES
+	 * on the w4a16 path, whose element is a four byte signed integer.
+	 * --bmap, --osweep and --pre all read m*n*4. It is correct as written
+	 * for int8, where a channel really is a byte, which is how it passed
+	 * its int8 validation and kept the bug.
+	 *
+	 * Read the whole bo against a 0xa5 sentinel, so a word the hardware
+	 * wrote 0 into is distinguishable from one it never touched. The count
+	 * of written words is the point of round 267: at N of 16, 32 and 64
+	 * --kpair measured 16, 24 and 40, which is N/2 + 8, so the hardware
+	 * writes FEWER channels than the job declares and at N = 16 that
+	 * happens to equal N, which is why every clean result so far is at 16.
+	 */
+	unsigned i, lit = 0, first_w = 0, wrote = 0, hi = 0;
+	int32_t first_v = 0;
+	size_t obytes = outbo->size;
 	uint8_t *o;
 
 	charsiu_bo_prep(dev, wt, 1000000000);
@@ -220,12 +237,12 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	/* an int8 weight buffer has no nibbles: the whole byte is the weight,
 	 * and the high pass is skipped by the caller */
 	((uint8_t *)wt->map)[byte] = job->mm.wdtype == CHARSIU_INT4
-		? (uint8_t)(high ? (LIVE << 4) : LIVE)
-		: (uint8_t)LIVE;
+		? (uint8_t)(high ? (g_live << 4) : g_live)
+		: (uint8_t)g_live;
 	charsiu_bo_fini(dev, wt);
 
 	charsiu_bo_prep(dev, outbo, 1000000000);
-	memset(outbo->map, 0, (size_t)job->mm.m * n);
+	memset(outbo->map, 0xa5, obytes);
 	charsiu_bo_fini(dev, outbo);
 
 	if (charsiu_submit(dev, regcmd, (unsigned)nreg, in_h, 3, out_h, 1) ||
@@ -235,23 +252,30 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		return;
 	}
 	o = outbo->map;
-	for (i = 0; i < n; i++) {
-		int v = o[i] > 127 ? o[i] - 256 : o[i];
+	for (i = 0; (size_t)i + 4 <= obytes; i += 4) {
+		uint32_t u;
+		int32_t v;
 
-		if (v) {
-			if (!lit) { first_n = i; first_v = (unsigned)(v < 0 ? -v : v); }
-			lit++;
-		}
+		memcpy(&u, o + i, 4);
+		if (u == 0xa5a5a5a5u)
+			continue;
+		wrote++;
+		hi = i / 4;
+		if (!u)
+			continue;
+		memcpy(&v, &u, 4);
+		if (!lit) { first_w = i / 4; first_v = v; }
+		lit++;
 	}
 	if (lit == 1)
-		printf("  byte %-6zu %-5s -> n = %-4u v = %-4u\n",
-		       byte, high ? "high" : "low", first_n, first_v);
+		printf("  byte %-6zu %-5s -> w %-4u v %-8d   wrote %u hi %u\n",
+		       byte, high ? "high" : "low", first_w, first_v, wrote, hi);
 	else if (!lit)
-		printf("  byte %-6zu %-5s -> NOTHING LIT\n", byte,
-		       high ? "high" : "low");
+		printf("  byte %-6zu %-5s -> NOTHING LIT            wrote %u hi %u\n",
+		       byte, high ? "high" : "low", wrote, hi);
 	else
-		printf("  byte %-6zu %-5s -> %u channels lit, first n = %u v = %u\n",
-		       byte, high ? "high" : "low", lit, first_n, first_v);
+		printf("  byte %-6zu %-5s -> %u words lit, first w %u v %d   wrote %u hi %u\n",
+		       byte, high ? "high" : "low", lit, first_w, first_v, wrote, hi);
 	charsiu_bo_fini(dev, outbo);
 }
 
