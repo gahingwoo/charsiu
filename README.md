@@ -416,13 +416,33 @@ Sixteen weight bytes a channel a pass instead of eight is 32 nibbles, and with
 the pass at `B+256` that is 64 k, exactly the half that was missing. Both arms
 left the channel count at 40, so the split holds.
 
-⚠ **That is a word pattern, not a k measurement.** `--map` says which word
-lights and nothing more, so two groups feeding one channel at the *same* k looks
-identical to two groups feeding it at k 0-15 and k 16-31. Only `--kpair` can
-tell those apart and it has not been run under the fix yet.
+That was a word pattern, not a k measurement, and `--kpair` separated the two
+arms in one entry. **They are not the same thing.**
 
-`SIZE_E_2` contributes an additive term, 8 at 3 and 0 at 1, so it is the `+1` in
-`8*(N/16 + 1)`. **It is not the halving**: int8 runs `SIZE_E_2 = 1` and gets all
+```
+RESERVED_1 = 0        byte 0 low k0, byte 0 HIGH ALSO k0 with a different
+                      value, byte 8 k8, k = byte mod 32
+                      the byte is read as ONE weight. This does not fix int4,
+                      it turns it off.
+
+PROC_PRECISION = 0    byte 0 low k0 high k1, byte 8 low k16 high k17,
+                      byte 16 -> w1 k0
+                      nibble packing intact, 32 k a pass. This one is real.
+```
+
+The derived prediction was byte 8 at k 16 and the second arm did exactly that,
+four of six points. The other two moved meaning: bytes 256 and 264 used to be
+the same channel at `k+32` and are now channel 8 at k 0 and 16, so where k 32
+through 63 lives is open again.
+
+⚠ **And it may be a trade rather than a fix.** `PROC_PRECISION` is the
+arithmetic mode, and under it the value at byte 0 fell from 7100 to 889, so the
+multiply is not the same operation. The output formula above was solved at 18 of
+18 points under the shipped setting and has no standing under this one.
+
+`SIZE_E_2` swept across all eight values gives `0 -> 32, 1 -> 32, 2 -> 36,
+3 -> 40`, and 4 upward hang: an additive 0, 0, 4, 8 on top of `N/2`, so it is
+the `+1` in `8*(N/16 + 1)`. **No value gives 64.** **It is not the halving**: int8 runs `SIZE_E_2 = 1` and gets all
 64 channels where int4 runs the same value and gets 32. `RGP_CNTER`, `SIZE_E_1`
 and `OD_BYPASS` are inert, `RESERVED_0` hangs, `0x4038`'s `NOTCH_ADDR_0` hangs
 and `NOTCH_ADDR_1` is inert, and `0x4058` is inert in both its fields, which
