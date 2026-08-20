@@ -1186,11 +1186,41 @@ int main(int argc, char **argv)
 		 * channels that are multiples of four, which is 16 of the 64
 		 * this shape has.
 		 */
+		/*
+		 * ROUND 264. Half the channels have no home.
+		 *
+		 * The rule, now confirmed by six predictions for six on the k
+		 * side and measured two channels wide:
+		 *
+		 *   G = B/128,  b = B%128,  blk = b/8
+		 *   b >= 64                       dead
+		 *   channel = 4*blk + 32*(G & 1)  and that channel + 1
+		 *   k = 16*(blk & 1) + 2*(b % 8) + 32*(G >> 1), high +1
+		 *
+		 * It addresses c mod 4 in {0, 1}, which is 32 of 64, and the
+		 * b >= 64 half of every 128 byte region is dead. Two halves
+		 * missing, one of channels and one of bytes, and no reason yet
+		 * to think they are the same half.
+		 *
+		 * Two things get swept. The dead half densely, because four
+		 * points is not a sweep and 64 and 72 were both blk boundaries.
+		 * And N, from the harness, because a map that covers half the
+		 * channels at every N is a different animal from one that
+		 * covers all of a small N.
+		 *
+		 * ⚠ No two-option prediction here on purpose. Three rounds
+		 * running, the answer was outside the two I wrote down: byte 8
+		 * was channel 4 at k 16 when the options were channel 1 or
+		 * channel 0, and the channel width was two when the options
+		 * were one and four. What is written instead is what each
+		 * observation would mean, with room for it to be none of them.
+		 */
 		static const size_t bytes[] = {
-			0, 8, 16, 24,
-			57, 100, 140, 200, 384, 392,
-			128, 136, 256, 264,
+			0, 8, 16, 24, 32, 40, 48, 56,
+			64, 65, 66, 72, 80, 88, 96, 104, 112, 120, 127,
+			128, 136,
 		};
+
 		unsigned j;
 
 		printf("\n  --kpair: ONE live nibble, a ONE HOT input, sweeping k.\n"
