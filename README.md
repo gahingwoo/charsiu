@@ -69,9 +69,17 @@ were wrong in this file before:
   point of 128, arrive as -88.
 - **the output stage is** `out = clamp(max(requant, 0) + offset, -128, 127)`, an int8
   with a floor under it. The floor is a real fused ReLU and it does not need to be
-  switched off: lifting the accumulator by 128 in the requant domain puts every value a
-  signed byte can hold above it, and the offset takes the same 128 back, which is
-  exactly Mesa's `out_zp - 0x80`.
+  switched off: lifting the accumulator clears it, and the offset takes the same
+  amount back.
+
+  ⚠ **The lift is the output zero point, not 128.** 128 is right here only because
+  charsiu's own zero point is 0, which makes its offset `-128` already. Reading this
+  as a constant is what took the driver project a board round to undo: it lifted by
+  128 on a tensor whose zero point was 128, where the offset is 0 and nothing takes
+  the lift back, and the whole surface railed at the top. `out_zp` is the smallest
+  lift that clears the floor, and with it the offset is a constant `-128` and the
+  expression collapses to `clamp(requant + out_zp, 0, 255)`, which is what the
+  operation means.
 
 It is not a runtime yet. What is left:
 
@@ -80,11 +88,12 @@ It is not a runtime yet. What is left:
 - the reference still requantises in float where the hardware uses an integer scale and
   shift. It agrees to the byte on everything measured so far, which does not mean it
   will at every scale.
-- **int4 does not compute yet.** Its layout is read, the `w4a16` stage is ported, and
-  the weights are demonstrably in the arithmetic, but the output is not weight times
-  activation. See below.
-- **a w4a16 job leaves the NPU unable to start the next one**, which is a defect this
-  project put there itself and has not yet localised. See below.
+- **int4 does not compute end to end yet**, though what it does is no longer a
+  mystery. The layout is read, the `w4a16` stage is ported, and the output is
+  `((int16)fp16bits(w) * (int16)fp16bits(a)) >> 16` exactly, 18 measured points with
+  no error and a four point prediction written into the board script before the run.
+  What is missing is the layout for `k = 16` and above, whose bytes are dead in the
+  map with no data about them. See below.
 
 The three tools that got it there are in the repository rather than in a shell history,
 because every step that worked was a diff against something known to compute:
@@ -248,14 +257,18 @@ Four for four on the integer reading, zero error.
 
 **The weights are read.** With no live nibble anywhere the output comes back all zero,
 and the sign of the result follows the sign of the nibble: 7 gives +5112, and 15, which
-is -1 as a signed nibble, gives -4896. **The magnitude does not follow it.** Changing
-the nibble from 7 to 3 has to scale the output by 3/7 and instead scales it by 0.930,
-identically in every slot. So the weights are in the arithmetic without the output
-being weight times activation. The coefficient buffer is not read on this path at all:
-two separate knobs on it, four runs, byte identical output.
+is -1 as a signed nibble, gives -4896.
 
-Where `k = 16` and above live is still unknown, because those bytes are dead in the map
-and there is no data about them.
+⚠ This section used to end here saying the magnitude did not follow, because changing
+the nibble from 7 to 3 scales the output by 0.930 where 3/7 was expected. That is
+answered by the section above and the text was left behind when the answer arrived.
+The output is linear in log2 of its inputs, so 0.930 is what the formula predicts and
+no line was ever going to fit two points of it. The coefficient buffer being unread on
+this path is consistent rather than a defect, since `w4a16` does not requantise.
+
+**What is genuinely left is the layout for `k = 16` and above.** Those bytes are dead
+in the map and there is no data about them, and nothing has probed them since
+2026-08-16. That is the one thing between here and an int4 projection.
 
 ### The defect this project put there, and its fix
 
