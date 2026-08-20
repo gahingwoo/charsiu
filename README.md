@@ -303,9 +303,30 @@ group only at `N = 64`; at 32 it is 3 and at 16 it is 1, and those are the sizes
 of the shortfalls. So the irregular term belongs to the highest group in use,
 `g == (n-1)/8`.
 
-That is **fitted to two failures and one success, not read**. Every `N` tried has
-an odd highest group — 7, 3 and 1 — and at an `N` whose highest group is even the
-rule predicts no 64 anywhere. Nothing has run there.
+**Confirmed.** Every `N` whose highest group is odd is now exact, with every
+group at 8 of 8:
+
+```
+N = 16  16/16      N = 32  32/32      N = 48  48/48      N = 64  64/64
+```
+
+32 and 16 were 24 and 8 before the fix, and 48 had never been run and was exact
+first time.
+
+### The write quantises to sixteen channels
+
+The `N` with an even highest group — 24, 40 and 56 — failed, and **not on the
+packing**. Whole groups came back 0 of 8 at the top and the count of words
+*written* was short by the same amount:
+
+```
+n      16  24  32  40  48  56  64
+wrote  16  16  32  32  48  48  64      = floor(n/16) * 16, seven for seven
+```
+
+Their weights were placed correctly and the channels were never written. So
+`0x3020` asks for the next multiple of sixteen, `2*(ALIGN_UP(n,16) - 8) - 1`, and
+the extra channels are computed and thrown away.
 
 ### What is still open on int4
 

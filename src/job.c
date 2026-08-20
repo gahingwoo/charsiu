@@ -503,10 +503,23 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * which is 40 of 64 and is why every int4 result before round 280 was
 	 * short. Inverting it, v = 2*(n - 8) - 1, and at n = 64 that is 111,
 	 * which is the value the whole layout above was measured at.
+	 *
+	 * ⚠ AND THE WRITE QUANTISES TO 16 CHANNELS. Round 282 ran seven values
+	 * of n and the number of words the hardware wrote was floor(n/16) * 16
+	 * every time:
+	 *
+	 *   n     16  24  32  40  48  56  64
+	 *   wrote 16  16  32  32  48  48  64
+	 *
+	 * so n of 24, 40 and 56 lost their top eight channels to the write and
+	 * not to the packing: their weights were placed correctly and the
+	 * channels were never written at all. Asking for the next multiple of
+	 * 16 covers the real count, and the extra channels are computed and
+	 * ignored.
 	 */
 	emit(&e, CORE, 0x3020,
 	     mm->wdtype == CHARSIU_INT4 && mm->n > 8
-		     ? (uint32_t)(2 * (mm->n - 8) - 1)
+		     ? (uint32_t)(2 * (ALIGN_UP(mm->n, 16) - 8) - 1)
 		     : mm->n - 1);
 	emit(&e, CORE, 0x3024, 0x00000000);
 

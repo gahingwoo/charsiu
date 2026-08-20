@@ -401,7 +401,16 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * is not read: nothing has run at an N whose highest
 			 * group is EVEN, where this predicts no 64 anywhere.
 			 */
-			unsigned g = n / 8, glast = (mm->n - 1) / 8;
+			/*
+			 * glast comes off the count the HARDWARE is told, which
+			 * is n rounded up to 16, not the caller's n. On every
+			 * case measured so far the two give the same base, since
+			 * they can only differ on a group the rounding adds, but
+			 * the register and the table should be reading the same
+			 * number.
+			 */
+			unsigned g = n / 8;
+			unsigned glast = (ALIGN_UP(mm->n, 16) - 1) / 8;
 			size_t row = (size_t)(g / 2) * 8 * mm->k
 				     + ((g & 1) ? (g == glast ? 64 : 128) : 0)
 				     + (size_t)(n % 8) * 8;
