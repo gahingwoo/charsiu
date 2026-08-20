@@ -403,10 +403,18 @@ int main(int argc, char **argv)
 	/* the surface is ALIGN(N, atom) wide, not N, so an N off the atom needs
 	 * more than m*n bytes. Round 199's N = 40 came back "0 of 40 bytes
 	 * written", which is what a short output buffer looks like. */
+	/*
+	 * ⚠ FOUR BYTES AN ELEMENT ON THE int4 PATH. w4a16 does not requantise:
+	 * 0x40ac, 0x40b0 and 0x40b4 are 0, 1, 0, so what lands is the raw
+	 * accumulator, a signed 32 bit integer per channel. Rounds 265, 267 and
+	 * 278 each found a probe in this repo reading it as bytes; this is the
+	 * fourth place and the last one that had not been fixed.
+	 */
 	ret |= charsiu_bo_alloc(dev,
 		(size_t)((n + charsiu_feature_atom(CHARSIU_INT8) - 1)
 			 / charsiu_feature_atom(CHARSIU_INT8))
-		* charsiu_feature_atom(CHARSIU_INT8) * m + 4096, &outbo);
+		* charsiu_feature_atom(CHARSIU_INT8) * m
+		* (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1) + 4096, &outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef);
 	if (ret) { printf("bo alloc FAILED %d\n", ret); return 1; }
 	printf("bo iova: regcmd 0x%llx  in 0x%llx  wt 0x%llx  out 0x%llx  coef 0x%llx\n",
@@ -514,6 +522,74 @@ int main(int argc, char **argv)
 	 * CHARSIU_OUT_ROWMAJOR forces the old reading, and at M = 1 the two are
 	 * the same expression and must agree.
 	 */
+	if (job.mm.wdtype == CHARSIU_INT4) {
+		/*
+		 * ⚠ THE int4 COMPARISON IS NOT THE int8 ONE AND ROUND 278 RAN
+		 * IT ANYWAY. Two things were wrong at once. The output was read
+		 * as bytes, and the giveaway is in 278's own log: every group of
+		 * four reads "X Y 255 255" or "X Y 0 0", which is a little
+		 * endian int32 pulled apart. And cpu_reference() returns a
+		 * REQUANTISED int8 while w4a16 returns a raw accumulator, so the
+		 * two were never in the same domain and the round could not have
+		 * passed whatever the hardware did.
+		 *
+		 * The arithmetic is measured, seven nibbles for seven, once the
+		 * activation is read as the raw 16 bit slot rather than an fp16
+		 * of the value:
+		 *
+		 *   out = ((int16)fp16bits(w) * (int16)abits) >> 16
+		 *
+		 * charsiu packs an int8 into the HIGH byte of a 2 byte slot, so
+		 * abits is (a - 0x80) << 8.
+		 *
+		 * ⚠ WHERE THE SHIFT GOES IS NOT MEASURED. Every point behind
+		 * that formula had ONE live nibble, so a shift per element and a
+		 * shift on the sum are indistinguishable in all of them. Both
+		 * are computed here and both counts are printed, because picking
+		 * one and reporting its score is how a fit gets mistaken for a
+		 * reading.
+		 */
+		unsigned ni, mi, ex_pe = 0, ex_sum = 0, written = 0;
+		const int32_t *o = (const int32_t *)outbo.map;
+
+		printf("  int4: reading the output as %u signed 32 bit words\n",
+		       m * n);
+		for (mi = 0; mi < m; mi++)
+			for (ni = 0; ni < n; ni++) {
+				int64_t pe = 0, sm = 0;
+				int32_t got;
+				unsigned j;
+
+				for (j = 0; j < k; j++) {
+					int wv = b_raw[ni * k + j];
+					int16_t wb, ab;
+
+					wv = (wv & 0x8) ? (wv & 0xf) - 16
+							: (wv & 0xf);
+					wb = (int16_t)charsiu_float_to_half(
+						(float)wv);
+					ab = (int16_t)((((int)a_raw[mi * k + j]
+							 - 0x80) & 0xff) << 8);
+					pe += ((int32_t)wb * (int32_t)ab) >> 16;
+					sm += (int32_t)wb * (int32_t)ab;
+				}
+				sm >>= 16;
+				got = o[(size_t)mi * n + ni];
+				if ((uint32_t)got != 0xa5a5a5a5u) written++;
+				if (got == (int32_t)pe) ex_pe++;
+				if (got == (int32_t)sm) ex_sum++;
+				if (ni < 8 && !mi)
+					printf("    ch %2u  npu %8d   shift/elem %8d   shift/sum %8d\n",
+					       ni, got, (int)pe, (int)sm);
+			}
+		printf("int4 output: %u of %u words written, "
+		       "%u EXACT with the shift per element, "
+		       "%u EXACT with the shift on the sum\n",
+		       written, m * n, ex_pe, ex_sum);
+		charsiu_close(dev);
+		return 0;
+	}
+
 	{
 		unsigned atom = charsiu_feature_atom(CHARSIU_INT8);
 		int surf = !getenv("CHARSIU_OUT_ROWMAJOR");

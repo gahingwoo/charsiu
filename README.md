@@ -538,6 +538,24 @@ matmul on all 64 channels with the arithmetic already known exact, at the cost o
 half the weight buffer, and it needs no packer change and no `CONV_CON1` change.
 `CHARSIU_W4_HALFK` does the zeroing.
 
+⚠ **Round 278 ran that comparison and it was void, for two reasons that are both
+instrument.** The matmul harness read the output as **bytes**, and the giveaway
+is in its own log: every group of four reads `X Y 255 255` or `X Y 0 0`, which is
+a little endian int32 pulled apart, `159 229 255 255` being `0xFFFFE59F`. And
+`cpu_reference()` returns a requantised int8 where w4a16 returns a raw
+accumulator, so the two were never in the same domain and the round could not
+have passed whatever the hardware did.
+
+That is the **fourth** place in this repo to read a four byte output as bytes,
+after `--kpair`, `--map` and the matmul. Every one was correct for int8, which is
+how each passed its int8 validation and kept the bug; 278's int8 arm was 64 of 64
+byte exact in the same log.
+
+⚠ **Where the shift goes has never been measured.** Every point behind the
+formula had one live nibble, and with a single term a shift per element and a
+shift on the sum are the same number. A dense buffer is the first thing that can
+tell them apart.
+
 Five rounds of sweeping and the answer was in a register excluded for being
 **identical on both paths**. The sweep list came from diffing int8's stream
 against int4's, and a register that is the same in both cannot cause the
