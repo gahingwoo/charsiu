@@ -498,18 +498,35 @@ count:
 
 ```
 channels = ceil((v+1)/2) + extra(SIZE_E_2)     v = 0x3020, extra 0, 0, 4, 8
-v = 63  -> 32 + 8 = 40         v = 127 -> 64 + 8 = 72        both measured
+
+v =  31 -> 24    v =  79 -> 48    v = 111 -> 64
+v =  47 -> 32    v =  95 -> 56    v = 127 -> 72
 ```
+
+Six for six, derived from two measured points rather than fitted to six. **So
+`0x3020 = 111` writes all 64 channels at `N = 64`**, and the channel shortfall
+is not a wall, it is a value.
+
+⚠ That is the extent of the WRITE. Whether 64 distinct channels can be lit by a
+weight byte has not been measured: every arm ran `--map` with a 128 byte limit,
+which reaches `w0` to `w7`.
 
 Five rounds of sweeping and the answer was in a register excluded for being
 **identical on both paths**. The sweep list came from diffing int8's stream
 against int4's, and a register that is the same in both cannot cause the
 difference, but it can be the bound one path reaches and the other does not.
 
-⚠ The two fixes fight: `0x3020 = 127` with the k fix comes back at 40. With the
-k fix a channel eats 32 weight bytes rather than 16, so 72 channels want 2304
-out of a buffer holding 2048. `v = 111` gives 64 channels, and 64 times 32 is
-exactly 2048.
+⚠ **The two fixes do not combine, and the buffer explanation for it was wrong.**
+The prediction was that `v = 111` would not fight, since 64 channels times 32
+bytes is exactly the 2048 the buffer holds. It hung: 235 groups swept and 4
+alive. The other route to 64, `v = 127` with `SIZE_E_2 = 1`, drops to 32 under
+the k fix rather than hanging. Three points, no explanation:
+
+```
+v = 63,  extra 8, k fix  ->  40      unchanged from without the fix
+v = 127, extra 0, k fix  ->  32      halved from 64
+v = 111, extra 8, k fix  ->  hangs
+```
 
 ### The activation packing
 
