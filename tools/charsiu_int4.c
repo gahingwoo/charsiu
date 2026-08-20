@@ -284,6 +284,7 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 {
 	unsigned k, i, hits = 0;
 	unsigned firstn = 0;
+	unsigned chs[8], nch;
 
 	charsiu_bo_prep(dev, wt, 1000000000);
 	memset(wt->map, 0, charsiu_weight_bytes(&job->mm));
@@ -309,12 +310,34 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		if (charsiu_submit(dev, regcmd, (unsigned)nreg, in_h, 3, out_h, 1) ||
 		    charsiu_bo_prep(dev, outbo, 2000000000))
 			continue;
+		/*
+		 * ⚠ ALL the channels, not the first. Round 262 resolved the k
+		 * dimension exactly, 88 of 88 points, but every live byte
+		 * reported a channel that is a multiple of four, which
+		 * addresses 16 of 64. Reporting only the first cannot tell a
+		 * nibble that feeds channel 4j from one that feeds 4j to
+		 * 4j+3, and those are completely different maps.
+		 */
 		o = outbo->map;
+		nch = 0;
 		for (i = 0; i < job->mm.n; i++)
-			if (o[i]) { any = 1; if (!hits) firstn = i; break; }
+			if (o[i]) {
+				any = 1;
+				if (!hits) firstn = i;
+				if (nch < (unsigned)(sizeof(chs) / sizeof(chs[0])))
+					chs[nch] = i;
+				nch++;
+			}
 		charsiu_bo_fini(dev, outbo);
 		if (any) {
-			printf(" %u", k);
+			unsigned q;
+
+			printf(" %u[ch", k);
+			for (q = 0; q < nch && q < 8; q++)
+				printf(" %u", chs[q]);
+			if (nch > 8)
+				printf(" ...%u total", nch);
+			printf("]");
 			hits++;
 		}
 	}
@@ -1137,13 +1160,36 @@ int main(int argc, char **argv)
 		 * has had to retract before. 9 through 15 and 17 through 31
 		 * decide it outright, so they get measured instead.
 		 */
+		/*
+		 * ROUND 263. Two jobs, and the second is the one that matters.
+		 *
+		 * The rule round 262 fitted, 88 of 88 points and no miss:
+		 *
+		 *   G = B/128,  b = B%128,  blk = b/8
+		 *   b >= 64             dead
+		 *   channel = 4*blk + 32*(G & 1)
+		 *   k       = 16*(blk & 1) + 2*(b % 8) + 32*(G >> 1), high +1
+		 *
+		 * It is still a fit. These four bytes were never measured and
+		 * the rule's answers for them are written here BEFORE the run,
+		 * which is the only thing that turns a fit into a reading:
+		 *
+		 *   byte  57   channel 28   k 18
+		 *   byte 140   channel 36   k 24
+		 *   byte 384   channel 32   k 32
+		 *   byte 392   channel 36   k 48
+		 *   byte 100   dead
+		 *   byte 200   dead
+		 *
+		 * And the probe now prints every channel a nibble lights
+		 * rather than the first, because the rule addresses only
+		 * channels that are multiples of four, which is 16 of the 64
+		 * this shape has.
+		 */
 		static const size_t bytes[] = {
-			0,  1,  2,  3,  4,  5,  6,  7,
-			8,  9, 10, 11, 12, 13, 14, 15,
-			16, 17, 18, 19, 20, 21, 22, 23,
-			24, 25, 26, 27, 28, 29, 30, 31,
-			32, 40, 48, 56, 64, 72,
-			128, 136, 248, 255, 256, 264,
+			0, 8, 16, 24,
+			57, 100, 140, 200, 384, 392,
+			128, 136, 256, 264,
 		};
 		unsigned j;
 
