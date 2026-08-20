@@ -1114,12 +1114,36 @@ int main(int argc, char **argv)
 		 *   byte 256  a k block at +256                channel 0, k=16
 		 *             a k block at +1024               nothing, or 32
 		 */
+		/*
+		 * ROUND 262. Round 261 established that k = 16 and above are
+		 * reachable and live in the first 256 bytes, that the byte to
+		 * (k, channel) map does not depend on K at all, and that every
+		 * live byte pairs with exactly one k. What it could not do is
+		 * name the map, because fourteen points with gaps do not.
+		 *
+		 * The points that exist, low nibble, both at K = 64 and 128:
+		 *
+		 *   byte    0  1  2  3  4  7    8   16  256  257  264
+		 *   k       0  2  4  6  8 14   16    0   32   34   48
+		 *   channel 0  0  0  0  0  0    4    8    0    0    4
+		 *
+		 * Bytes 248 and 255 are dead, so the live set inside the first
+		 * 256 is not contiguous either.
+		 *
+		 * ⚠ No formula is fitted here on purpose. Every reading tried
+		 * against those points has bit 3 of the byte contributing to
+		 * BOTH the k and the channel, which is not how a bitfield
+		 * splits, and a fit through gaps is exactly what this project
+		 * has had to retract before. 9 through 15 and 17 through 31
+		 * decide it outright, so they get measured instead.
+		 */
 		static const size_t bytes[] = {
-			0, 1, 2, 3, 4, 7,
-			8, 16, 248, 255,
-			256, 257, 264,
-			512, 520,
-			768, 1024, 1032, 1280, 1536, 2040,
+			0,  1,  2,  3,  4,  5,  6,  7,
+			8,  9, 10, 11, 12, 13, 14, 15,
+			16, 17, 18, 19, 20, 21, 22, 23,
+			24, 25, 26, 27, 28, 29, 30, 31,
+			32, 40, 48, 56, 64, 72,
+			128, 136, 248, 255, 256, 264,
 		};
 		unsigned j;
 
