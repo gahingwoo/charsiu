@@ -1390,6 +1390,31 @@ int main(int argc, char **argv)
 		};
 
 		unsigned j;
+		/*
+		 * CHARSIU_KPAIR_BYTES picks the byte list from the environment,
+		 * comma separated. The built in list is a full sweep and costs
+		 * sixty four submits a byte; a round that is testing ONE claim
+		 * about six bytes should not pay for forty.
+		 */
+		const char *envb = getenv("CHARSIU_KPAIR_BYTES");
+		size_t custom[32];
+		unsigned ncustom = 0;
+
+		if (envb) {
+			const char *q = envb;
+
+			while (*q && ncustom < 32) {
+				char *end;
+				unsigned long b = strtoul(q, &end, 0);
+
+				if (end == q)
+					break;
+				custom[ncustom++] = (size_t)b;
+				q = end;
+				while (*q == ',' || *q == ' ')
+					q++;
+			}
+		}
 
 		printf("\n  --kpair: ONE live nibble, a ONE HOT input, sweeping k.\n"
 		       "  Reads the k a nibble pairs with, and the output WORD it\n"
@@ -1397,13 +1422,16 @@ int main(int argc, char **argv)
 		       "  The word index is the channel candidate, the byte pattern\n"
 		       "  says how wide an element is, and the value says whether it\n"
 		       "  is a signed 32 bit integer. Live nibble %x.\n\n", g_live);
-		for (j = 0; j < sizeof(bytes) / sizeof(bytes[0]); j++) {
-			if (bytes[j] >= charsiu_weight_bytes(&job.mm))
+		for (j = 0; j < (ncustom ? ncustom
+				 : sizeof(bytes) / sizeof(bytes[0])); j++) {
+			size_t b = ncustom ? custom[j] : bytes[j];
+
+			if (b >= charsiu_weight_bytes(&job.mm))
 				continue;
 			kpair_probe(dev, &job, &wt, &in, &outbo, &regcmd, nreg,
-				    in_handles, out_handles, bytes[j], 0, a_raw);
+				    in_handles, out_handles, b, 0, a_raw);
 			kpair_probe(dev, &job, &wt, &in, &outbo, &regcmd, nreg,
-				    in_handles, out_handles, bytes[j], 1, a_raw);
+				    in_handles, out_handles, b, 1, a_raw);
 		}
 		charsiu_close(dev);
 		return 0;

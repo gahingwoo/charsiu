@@ -402,6 +402,33 @@ channels is 8*(N/16+1) not N/8      DPU, since no CNA arm touched it.
 round 260 found on `0x4050`, where four of five fields were load bearing and two
 of them were in the reserved range.
 
+### Two fields that move the two numbers
+
+Sweeping those two registers by field found one each:
+
+```
+CNA 0x100C  RESERVED_1     48 -> 0    one group a channel becomes TWO
+            PROC_PRECISION  2 -> 0    the same, from a different field
+DPU 0x4050  SIZE_E_2        3 -> 1    channels 40 -> 32
+```
+
+Sixteen weight bytes a channel a pass instead of eight is 32 nibbles, and with
+the pass at `B+256` that is 64 k, exactly the half that was missing. Both arms
+left the channel count at 40, so the split holds.
+
+⚠ **That is a word pattern, not a k measurement.** `--map` says which word
+lights and nothing more, so two groups feeding one channel at the *same* k looks
+identical to two groups feeding it at k 0-15 and k 16-31. Only `--kpair` can
+tell those apart and it has not been run under the fix yet.
+
+`SIZE_E_2` contributes an additive term, 8 at 3 and 0 at 1, so it is the `+1` in
+`8*(N/16 + 1)`. **It is not the halving**: int8 runs `SIZE_E_2 = 1` and gets all
+64 channels where int4 runs the same value and gets 32. `RGP_CNTER`, `SIZE_E_1`
+and `OD_BYPASS` are inert, `RESERVED_0` hangs, `0x4038`'s `NOTCH_ADDR_0` hangs
+and `NOTCH_ADDR_1` is inert, and `0x4058` is inert in both its fields, which
+settles that the register naming the output channel count is not what bounds
+it.
+
 ### The hardware writes fewer channels than the job declares
 
 Filling the output buffer with a sentinel rather than zero, and reading the
