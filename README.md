@@ -226,6 +226,12 @@ no byte lights more than one slot
 
 The control, an all zero weight buffer, lights nothing.
 
+⚠ The first two lines are confirmed by `--kpair`, which reaches word 0 from
+bytes 0 to 7 and again from 256 to 263. **The third is in doubt.** Byte 384 and
+byte 512 both light, and the layout read below predicts the second half is live
+throughout, so either the count is wrong or `--bmap` was reading a window too
+small to see it, which is a mistake this probe has now made twice.
+
 ### What the output actually is, exactly
 
 `out = ((int16)fp16bits(w) * (int16)fp16bits(a)) >> 16`, **18 of 18 measured
@@ -266,9 +272,41 @@ The output is linear in log2 of its inputs, so 0.930 is what the formula predict
 no line was ever going to fit two points of it. The coefficient buffer being unread on
 this path is consistent rather than a defect, since `w4a16` does not requantise.
 
-**What is genuinely left is the layout for `k = 16` and above.** Those bytes are dead
-in the map and there is no data about them, and nothing has probed them since
-2026-08-16. That is the one thing between here and an int4 projection.
+**What is genuinely left is the layout.** `k = 16` and above is no longer the
+open part; rounds 262 to 265 read it. What replaced it is narrower and sharper.
+
+Two geometries close on their own data, 40 of 40 points at `N = 16` and 48 of 48
+at `N = 64`, with `nib` 0 for the low nibble and 1 for the high:
+
+```
+N=16, B<128:  word = B/8
+              k    = 16*((B/8)&1) + 2*(B%8) + nib
+
+N=64:         G = B/128, b = B%128,  b >= 64 fetches nothing
+              word = b/8 + 8*(G&1) + 16*(G>>2)
+              k    = 16*((b/8)&1) + 32*((G>>1)&1) + nib
+```
+
+Written as bits, one address bit does two jobs and one does none:
+
+```
+k    bit 0   = the nibble        word bit 0    = B bit 3     <- the same bit
+k    bits1-3 = B bits 0,1,2      word bits 1,2 = B bits 4,5
+k    bit 4   = B bit 3           word bit 3    = B bit 7
+k    bit 5   = B bit 8           word bits 4+  = B bits 9+
+                                 B bit 6 must be 0 at N = 64
+```
+
+So exactly half the `(channel, k)` pairs have no nibble feeding them, at both
+`N`. `0x1020` says 32 weight bytes per channel and only 16 of them are ever
+reached. That is one folded address bit, not a shape, and it is the whole of
+what stands between here and an int4 projection.
+
+Round 265 also settled what an output element is, which every reading before it
+had guessed at: **four byte signed little endian, one per channel**. A live
+nibble of 7 gives `00001bbc`, which is `+7100` and lights two bytes; a nibble of
+15 gives `ffffe570`, which is `-6800` and lights four. The two arms agree on
+every word and every k across 48 points.
 
 ### The defect this project put there, and its fix
 

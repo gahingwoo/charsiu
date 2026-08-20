@@ -310,13 +310,28 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	 * lights four bytes where +5112 lights two. The live nibble is g_live
 	 * here for that reason; it used to be the LIVE macro, which is why the
 	 * environment variable did nothing for --kpair.
+	 *
+	 * ⚠ ROUND 266 WIDENED IT AGAIN, because 265 left the same hole one
+	 * level up. It read m*n*4, which is words 0 to n-1, and the buffer is
+	 * allocated m*n*4 + 4096. A byte whose element landed at word n or
+	 * beyond would have come back "dead" for the second round running, and
+	 * eleven bytes did come back dead. Read the WHOLE bo.
+	 *
+	 * And fill with 0xa5 rather than 0, which is what every other probe in
+	 * this file already does. Zero fill cannot tell a word the hardware
+	 * wrote 0 into from one it never touched, so 265 could not say how far
+	 * the write actually extends. That extent bounds the channel count and
+	 * the element width on its own, without any of the address arithmetic.
+	 *
+	 * 265 settled the element: +7100 came back 00001bbc lighting two bytes
+	 * and -6800 came back ffffe570 lighting four, with both arms agreeing
+	 * on every word and every k across 48 points. Four byte signed little
+	 * endian, and the word index is the channel. The negative arm has done
+	 * its job and is not repeated here.
 	 */
 	unsigned k, i, hits = 0;
-	unsigned firstw = 0;
-	size_t obytes = (size_t)job->mm.m * job->mm.n * 4;
-
-	if (obytes > outbo->size)
-		obytes = outbo->size;
+	unsigned firstw = 0, maxwrote = 0, maxhi = 0;
+	size_t obytes = outbo->size;
 
 	charsiu_bo_prep(dev, wt, 1000000000);
 	memset(wt->map, 0, charsiu_weight_bytes(&job->mm));
@@ -327,7 +342,7 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	for (k = 0; k < job->mm.k; k++) {
 		uint8_t *o;
 		int any = 0;
-		unsigned nw = 0;
+		unsigned nw = 0, wrote = 0, hi = 0;
 
 		for (i = 0; i < job->mm.k; i++)
 			a_raw[i] = (uint8_t)(job->input_zero_point + (i == k ? 100 : 0));
@@ -337,7 +352,7 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		charsiu_bo_fini(dev, in);
 
 		charsiu_bo_prep(dev, outbo, 1000000000);
-		memset(outbo->map, 0, obytes);
+		memset(outbo->map, 0xa5, obytes);
 		charsiu_bo_fini(dev, outbo);
 
 		if (charsiu_submit(dev, regcmd, (unsigned)nreg, in_h, 3, out_h, 1) ||
@@ -345,11 +360,17 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 			continue;
 
 		o = outbo->map;
+		wrote = 0;
+		hi = 0;
 		for (i = 0; (size_t)i + 4 <= obytes; i += 4) {
 			uint32_t w;
 			unsigned b, mask = 0;
 
 			memcpy(&w, o + i, 4);
+			if (w == 0xa5a5a5a5u)
+				continue;
+			wrote++;
+			hi = i / 4;
 			if (!w)
 				continue;
 			for (b = 0; b < 4; b++)
@@ -369,6 +390,10 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 			nw++;
 		}
 		charsiu_bo_fini(dev, outbo);
+		if (wrote > maxwrote)
+			maxwrote = wrote;
+		if (hi > maxhi)
+			maxhi = hi;
 		if (any) {
 			if (nw > 4)
 				printf(" ...%u words", nw);
@@ -379,7 +404,7 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	printf("   (%u of %u", hits, job->mm.k);
 	if (hits)
 		printf(", first word %u", firstw);
-	printf(")\n");
+	printf(", hw wrote %u words, highest %u)\n", maxwrote, maxhi);
 }
 
 int main(int argc, char **argv)
@@ -1255,15 +1280,46 @@ int main(int argc, char **argv)
 			64, 65, 66, 72, 80, 88, 96, 104, 112, 120, 127,
 			128, 136,
 			/*
-			 * 256 and 384 are r263's two K invariant rows, kept as
-			 * the check that widening the read did not move a byte
-			 * that was already being read inside the window. 512 is
-			 * an IN BAND CONTROL: at K of 64 it is k 64, past the
-			 * end, so it has to stay dark on a correct read. If it
-			 * lights, the window is not the story and the address
-			 * function is wrong somewhere else.
+			 * 256 and 384 are r263's two K invariant rows. 512 was
+			 * round 265's control, and it FIRED: the rule then in
+			 * force put it at k 64, past the end of a K of 64, and
+			 * it came back live at word 16, k 0. What that killed
+			 * is the G term. 32*(G>>1) and 32*((G>>1)&1) agree at
+			 * G of 0, 1, 2 and 3 and first differ at G of 4, which
+			 * is byte 512, and the second one is right.
 			 */
 			256, 384, 512,
+			/*
+			 * b MOD 8 INSIDE THE LIVE HALF AT N = 64. Round 265 has
+			 * no point at all for this: its only b%8 samples were
+			 * bytes 65 and 66, which sit in the half that is dead at
+			 * N = 64, so they only ever read at N = 16. The N = 16
+			 * rule carried over predicts word 0 throughout with
+			 * k = 2*(b%8), which is 2, 4, 6, 8, 10, 12 and 14.
+			 */
+			1, 2, 3, 4, 5, 6, 7,
+			/*
+			 * THE DEAD HALF AT A DIFFERENT G. Every dead point in
+			 * 265 was in G = 0, so "bit 6 of the address is dead"
+			 * is fitted on one region. 192 is G = 1 and 320 is G = 2
+			 * at the same b of 64. If the bit is the reason, both
+			 * are dark; if only G = 0 has a hole, it is not a bit.
+			 */
+			192, 320,
+			/*
+			 * THE G BITS ACROSS THE WHOLE BUFFER. The rule assigns
+			 * G bit 0 to word +8, G bit 1 to k +32 and G bits 2 and
+			 * up to word +16 each, which was read off five G values
+			 * and predicts six more, at b = 0:
+			 *
+			 *   640  G 5  -> word 24 k 0     1024 G 8  -> word 32 k 0
+			 *   768  G 6  -> word 16 k 32    1536 G 12 -> word 48 k 0
+			 *   896  G 7  -> word 24 k 32    1920 G 15 -> word 56 k 32
+			 *
+			 * Six points, and they span to the end of a 2048 byte
+			 * buffer rather than stopping a quarter of the way in.
+			 */
+			640, 768, 896, 1024, 1536, 1920,
 		};
 
 		unsigned j;
