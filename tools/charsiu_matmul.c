@@ -366,15 +366,24 @@ int main(int argc, char **argv)
 	if (getenv("CHARSIU_W4_HALFK")) {
 		unsigned j, zeroed = 0;
 
+		/*
+		 * ⚠ THE MASK IS PER CHANNEL AND 278 AND 279 BOTH GOT IT WRONG.
+		 * They zeroed (k mod 32) >= 16 for every channel, which is what
+		 * an EVEN channel is fed. An odd channel is fed the other half,
+		 * k 16..31 and 48..63, so the mask was exactly backwards on half
+		 * the output. byte 0 pairs with k 0 on channel 0 and byte 8 with
+		 * k 16 on channel 1, measured at K = 64 and again at K = 32.
+		 */
 		for (i = 0; i < n; i++)
 			for (j = 0; j < k; j++)
-				if (j % 32 >= 16) {
+				if (((j >> 4) & 1) != (i & 1)) {
 					b_raw[i * k + j] =
 						(uint8_t)job.weight_zero_point;
 					zeroed++;
 				}
-		printf("HALFK: zeroed %u of %u weights, the ones with "
-		       "(k mod 32) >= 16, which the fetch never reads\n",
+		printf("HALFK: zeroed %u of %u weights. A channel is fed "
+		       "k with bit4 equal to its own parity, so even channels "
+		       "keep 0..15 and 32..47 and odd keep 16..31 and 48..63\n",
 		       zeroed, n * k);
 	}
 

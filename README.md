@@ -556,6 +556,44 @@ formula had one live nibble, and with a single term a shift per element and a
 shift on the sum are the same number. A dense buffer is the first thing that can
 tell them apart.
 
+### Why every int4 matmul arm returned the same numbers
+
+Channels 0 to 7 came back as -6753, -4633, -7670, -9732, -3554, -12306, -706 and
+-8100 in every arm of two rounds: `HALFK` on and off, `0x3020 = 111` and not, and
+`N` of 64, 32 and 16. The output did not move by one count while `HALFK` zeroed
+2048 of 4096 weights.
+
+Not the hardware. `charsiu_pack_weights` **refuses to place k >= 16 for int4**,
+deliberately since round 173, and `HALFK` only ever touched k the packer never
+wrote, so both buffers were byte identical. The `N` invariance falls out of the
+same thing: the row it used, `(n/32)*512 + (n%32)*8`, has no `N` in it — and it
+came from `--map` before the byte width defect was fixed, so it was the stale map
+as well as an incomplete one.
+
+### The layout the packer writes now
+
+```
+ADDRESS   c 0..7  -> 0      c 16..23 -> 512    c 32..39 -> 1024   c 48..55 -> 1536
+          c 8..15 -> 128    c 24..31 -> 640    c 40..47 -> 1152   c 56..63 -> 1600
+          plus a second eight byte group 256 bytes later
+
+k         an EVEN channel is fed k 0..15 and 32..47
+          an ODD  channel is fed k 16..31 and 48..63
+```
+
+A table and not a formula on purpose: seven of the eight steps are 128 or 384 and
+the last is 64, so a closed form would be fitted to one point. The parity rule is
+read off byte 0 pairing with k 0 on channel 0, byte 8 with k 16 on channel 1 and
+byte 16 with k 0 on channel 2, and confirmed independently at `K = 32`.
+
+⚠ So the `HALFK` mask in rounds 278 and 279 was **backwards on half the
+channels**: both zeroed `(k mod 32) >= 16` everywhere, which is what an even
+channel is fed.
+
+⚠ And the address map was read at `0x3020 = 111`. charsiu emits `n - 1` there,
+which gives 40 channels, so this layout describes the hardware only when that
+register is overridden.
+
 Five rounds of sweeping and the answer was in a register excluded for being
 **identical on both paths**. The sweep list came from diffing int8's stream
 against int4's, and a register that is the same in both cannot cause the

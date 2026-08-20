@@ -326,45 +326,93 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * with n = byte / 32 and k = byte % 32, which is what the int8 path below
 	 * writes, so the probe is known good on a case whose answer is known.
 	 *
-	 * WHAT IS NOT KNOWN, and is therefore not written here: which k those 16
-	 * nibbles are, in what order, and where k = 16 and above go. The map's k
-	 * column is unusable for int4 because a nibble reaches more than one
-	 * input, and every byte outside the rows above is dead, so there is no
-	 * data about the rest. Rounds 167, 168, 171 and 173 all went wrong by
-	 * filling that gap with a guess.
+	 * ⚠ WHAT WAS NOT KNOWN IS NOW MEASURED. Rounds 265 to 277 fixed a byte
+	 * width defect in the probe itself, which had been reading a four byte
+	 * output as bytes, and re-read the whole fetch densely. Two things came
+	 * out that this branch was written without:
 	 *
-	 * So this places k = 0 to 15 into the measured row and REFUSES the rest.
-	 * A K above 16 comes back short on purpose: a packer that quietly invents
-	 * placements is what produced three withdrawn results.
+	 *   the ADDRESS. With CORE 0x3020 = 111 every one of 64 channels is
+	 *   written and reachable, and each is fed by TWO eight byte groups, one
+	 *   at its own offset and one 256 bytes later. The group bases came off
+	 *   a stride 8 sweep of the whole buffer, 128 live groups of 256.
 	 *
-	 * CHARSIU_INT4_ORDER picks the intra row order, which is the one thing
-	 * left to guess and is therefore a knob rather than a decision:
-	 *   0 (default)  byte j holds k = 2j low and k = 2j+1 high, interleaved
-	 *   1            low nibbles are k = 0..7 and high are k = 8..15, halved
+	 *   the k, and it is per channel PARITY. byte 0 pairs with k 0 on
+	 *   channel 0, byte 8 with k 16 on channel 1, byte 16 with k 0 on
+	 *   channel 2. So an EVEN channel is fed k 0..15 and 32..47 and an ODD
+	 *   channel is fed k 16..31 and 48..63. Confirmed independently at
+	 *   K = 32, where channel 0 takes k 0..15 and channel 1 takes k 16..31.
+	 *
+	 * Half the reduction reaches any given channel, and WHICH half depends
+	 * on the channel. That is why a global mask over k is wrong: rounds 278
+	 * and 279 masked (k mod 32) < 16 for every channel, which is right for
+	 * the even ones and exactly backwards for the odd.
+	 *
+	 * The group bases are a TABLE and not a formula on purpose. Seven of the
+	 * eight steps are 128 or 384 and the last is 64, so any closed form for
+	 * it would be fitted to one point. This is what was measured:
+	 *
+	 *   c 0..7   ->    0     c 16..23 ->  512     c 32..39 -> 1024
+	 *   c 8..15  ->  128     c 24..31 ->  640     c 40..47 -> 1152
+	 *   c 48..55 -> 1536     c 56..63 -> 1600
+	 *
+	 * and it is refused outside K = 64 or 32 with N up to 64, because that
+	 * is where it was read. Rounds 167, 168, 171 and 173 all went wrong by
+	 * filling a gap with a guess and this branch is not going to be the
+	 * fifth.
+	 *
+	 * ⚠ THE ADDRESS MAP WAS READ AT 0x3020 = 111. charsiu emits n - 1
+	 * there, which gives 40 channels, so this layout only describes the
+	 * hardware when that register is overridden. Until the driver sets it,
+	 * a job packed this way and run without the override reaches only its
+	 * first 40 channels.
 	 */
 	if (mm->wdtype == CHARSIU_INT4) {
+		static const unsigned base[8] = {
+			0, 128, 512, 640, 1024, 1152, 1536, 1600
+		};
 		unsigned order = getenv("CHARSIU_INT4_ORDER")
 			? (unsigned)atoi(getenv("CHARSIU_INT4_ORDER")) : 0;
 
+		if ((mm->k != 64 && mm->k != 32) || mm->n > 64) {
+			/* refuse rather than invent, and say so */
+			return;
+		}
+
 		for (n = 0; n < mm->n; n++) {
-			size_t row = (size_t)(n / 32) * 512 + (size_t)(n % 32) * 8;
+			size_t row = base[n / 8] + (size_t)(n % 8) * 8;
+			unsigned half;
 
-			for (k = 0; k < mm->k && k < 16; k++) {
-				unsigned nib = src[(size_t)n * mm->k + k] & 0xf;
-				size_t b;
-				unsigned high;
+			/*
+			 * half 0 is the group at row, half 1 the one 256 bytes
+			 * on, which exists only when K is 64. Each carries 16
+			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
+			 */
+			for (half = 0; half < (mm->k > 32 ? 2u : 1u); half++) {
+				size_t g = row + (size_t)half * 256;
+				unsigned j;
 
-				if (order) {
-					b = row + (k % 8);
-					high = k >= 8;
-				} else {
-					b = row + k / 2;
-					high = k & 1;
+				for (j = 0; j < 16; j++) {
+					unsigned kk = 16 * (n & 1) + 32 * half
+						      + j;
+					unsigned nib;
+					size_t b;
+					unsigned high;
+
+					if (kk >= mm->k)
+						continue;
+					nib = src[(size_t)n * mm->k + kk] & 0xf;
+					if (order) {
+						b = g + (j % 8);
+						high = j >= 8;
+					} else {
+						b = g + j / 2;
+						high = j & 1;
+					}
+					if (high)
+						dst[b] |= (uint8_t)(nib << 4);
+					else
+						dst[b] |= (uint8_t)nib;
 				}
-				if (high)
-					dst[b] |= (uint8_t)(nib << 4);
-				else
-					dst[b] |= (uint8_t)nib;
 			}
 		}
 		return;
