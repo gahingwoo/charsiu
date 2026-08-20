@@ -376,6 +376,32 @@ CNA 0x103c, 0x1044  surf 1 -> 2    DPU 0x40ac, 0x40b0, 0x40b4  requant
 register from the environment, so the ten that are left can be flipped to their
 int8 value one at a time without a rebuild.
 
+Nine of those ten arms came back clean and **not one moved either number**:
+
+```
+0x1020 0x1028 0x1030 0x103c 0x1044   five CNA size registers, excluded
+0x4030 0x4044                        excluded
+0x4038 0x4050                        both HANG when set to int8's value
+0x100c                               wrote stays 40, every byte goes dark
+```
+
+`0x1020` set to int8's 64 and `0x1030` to int8's 128 left the eight byte run
+exactly where it was, so bytes per kernel is not what bounds the fetch.
+
+**The last line is the structural result.** The write extent does not depend on
+the weights being read at all, so the two shortfalls are in different units:
+
+```
+k per channel is 32 and not 64      CNA. 0x100C CONV_CON1 is the only CNA
+                                    register that did anything.
+channels is 8*(N/16+1) not N/8      DPU, since no CNA arm touched it.
+```
+
+`CONV_CON1` reads `CONV_MODE 0, IN_PRECISION 2, PROC_PRECISION 2, RESERVED_1
+48, GROUP_LINE_OFF 1`, and a field called RESERVED holding 48 is the same shape
+round 260 found on `0x4050`, where four of five fields were load bearing and two
+of them were in the reserved range.
+
 ### The hardware writes fewer channels than the job declares
 
 Filling the output buffer with a sentinel rather than zero, and reading the
