@@ -435,10 +435,56 @@ four of six points. The other two moved meaning: bytes 256 and 264 used to be
 the same channel at `k+32` and are now channel 8 at k 0 and 16, so where k 32
 through 63 lives is open again.
 
-⚠ **And it may be a trade rather than a fix.** `PROC_PRECISION` is the
-arithmetic mode, and under it the value at byte 0 fell from 7100 to 889, so the
-multiply is not the same operation. The output formula above was solved at 18 of
-18 points under the shipped setting and has no standing under this one.
+**`PROC_PRECISION = 0` closes the k side completely.** The full sweep under it:
+
+```
+   0- 127: w0..w7      512- 639: w0..w7  k+32      1024-1151: w16..w23
+ 128- 255: dark        640- 767: dark              1280-1407: w24..w31
+ 256- 383: w8..w15     768- 895: w8..w15 k+32      1408-1535: w32..w39
+ 384- 511: dark        896-1023: dark              1536-2047: the k+32 half
+```
+
+Four groups of eight bytes a channel: 32 bytes, 64 nibbles, **64 k**. `0x1020`
+says 32 bytes a kernel and 32 is now what gets fetched. The dark 768 bytes are
+exactly 24 channels times 32, so the buffer is the right size and 24 channels'
+worth is never read. What is left is only the channel count.
+
+The channel count scales with `M`: 40 words at `M = 1` and 80 at `M = 2`, so it
+is `M * (N/2 + 8)` and the halving is not about `M`.
+
+### The two arithmetic modes, measured
+
+`PROC_PRECISION` is the arithmetic mode and the two are different operations,
+not a working one and a broken one. Sweeping the live nibble under both:
+
+```
+nibble        1    2    3    4    5    7    15
+shipped      60   64   66   68   69   71   -68
+PP = 0      127  254  381  508  635  889  -127
+```
+
+The shipped column is the formula above, exact at all seven, once the activation
+is read as the **raw 16 bit slot** rather than as an fp16 of the value. `--map`
+packs an int8 into the high byte of a 2 byte slot, so `abits` is 256 for `a = 1`:
+
+```
+out = ((int16)fp16bits(w) * (int16)abits) >> 16
+w=1  15360*256>>16 = 60      w=5  17664*256>>16 = 69
+w=2  16384*256>>16 = 64      w=7  18176*256>>16 = 71
+w=3  16896*256>>16 = 66      w=15 (signed -1) -17408*256>>16 = -68
+w=4  17408*256>>16 = 68      and the high nibble, abits 512, is 2x each
+```
+
+`PP = 0` is `127 * w` with `w` a signed nibble, linear and exact at all seven,
+which is what an int4 matmul wants **except for the 127**: the output does not
+depend on the activation at all. `--map` with a ramp and `--kpair` with a one hot
+of 100 both return 889 for a nibble of 7, so that is measured twice.
+
+That may be the packing rather than the mode. charsiu packs the activation as a
+2 byte fp16 whenever the weight is int4, int8 value in the high byte and the low
+byte zero, and an integer mode reading a 1 byte activation would read the zero.
+`CHARSIU_A8_STRIDE1` switches to a 1 byte element with atom 16 and has never
+been run against `PROC_PRECISION = 0`.
 
 `SIZE_E_2` swept across all eight values gives `0 -> 32, 1 -> 32, 2 -> 36,
 3 -> 40`, and 4 upward hang: an additive 0, 0, 4, 8 on top of `N/2`, so it is
