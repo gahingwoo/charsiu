@@ -480,11 +480,22 @@ which is what an int4 matmul wants **except for the 127**: the output does not
 depend on the activation at all. `--map` with a ramp and `--kpair` with a one hot
 of 100 both return 889 for a nibble of 7, so that is measured twice.
 
-That may be the packing rather than the mode. charsiu packs the activation as a
-2 byte fp16 whenever the weight is int4, int8 value in the high byte and the low
-byte zero, and an integer mode reading a 1 byte activation would read the zero.
-`CHARSIU_A8_STRIDE1` switches to a 1 byte element with atom 16 and has never
-been run against `PROC_PRECISION = 0`.
+It was the packing, at least partly. charsiu packs the activation as a 2 byte
+fp16 whenever the weight is int4, int8 value in the high byte and the low byte
+zero. Switching to a 1 byte element with `CHARSIU_A8_STRIDE1` makes a nibble
+pair with **two** k, and the two do different things:
+
+```
+byte 0 low  ->  k0 = 700 = 100 * 7    the one hot amplitude times the nibble.
+                                      a * w, exactly.
+            ->  k1 = 889 = 127 * 7    the constant again.
+```
+
+So the mode can multiply by the activation. Whatever the 127 is, it is not "this
+mode ignores the activation", because one of the two k did not ignore it.
+
+⚠ It costs half the k back: 80 live groups where `PROC_PRECISION = 0` alone gave
+160, and byte 512 goes dark.
 
 `SIZE_E_2` swept across all eight values gives `0 -> 32, 1 -> 32, 2 -> 36,
 3 -> 40`, and 4 upward hang: an additive 0, 0, 4, 8 on top of `N/2`, so it is

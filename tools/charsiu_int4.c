@@ -81,6 +81,13 @@ static const char *pat_name(enum pattern p)
  * knob that asks. The other probes are left alone, because one variable.
  */
 static unsigned g_live = LIVE;
+/*
+ * The one hot amplitude --kpair drives. It was hardcoded at 100 for eleven
+ * rounds, which was fine while the question was WHICH k a nibble touches and
+ * useless the moment the question became whether the output depends on the
+ * activation at all. CHARSIU_KPAIR_AMP sweeps it.
+ */
+static unsigned g_amp = 100;
 
 /*
  * A least squares line and the RMS of what it leaves behind. The residual is
@@ -380,7 +387,8 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		unsigned nw = 0, wrote = 0, hi = 0;
 
 		for (i = 0; i < job->mm.k; i++)
-			a_raw[i] = (uint8_t)(job->input_zero_point + (i == k ? 100 : 0));
+			a_raw[i] = (uint8_t)(job->input_zero_point
+					     + (i == k ? (int)g_amp : 0));
 		charsiu_bo_prep(dev, in, 1000000000);
 		charsiu_pack_input(&job->mm, a_raw, in->map, in->size,
 				   (uint8_t)job->input_zero_point);
@@ -477,6 +485,8 @@ int main(int argc, char **argv)
 	job.mm.wdtype = getenv("CHARSIU_MAP_W8") ? CHARSIU_INT8 : CHARSIU_INT4;
 	if (getenv("CHARSIU_INT4_LIVE"))
 		g_live = (unsigned)atoi(getenv("CHARSIU_INT4_LIVE")) & 0xf;
+	if (getenv("CHARSIU_KPAIR_AMP"))
+		g_amp = (unsigned)atoi(getenv("CHARSIU_KPAIR_AMP")) & 0x7f;
 	job.mm.adtype = CHARSIU_INT8;
 	job.input_scale = 0.02f;
 	/*
