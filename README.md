@@ -507,9 +507,21 @@ Six for six, derived from two measured points rather than fitted to six. **So
 `0x3020 = 111` writes all 64 channels at `N = 64`**, and the channel shortfall
 is not a wall, it is a value.
 
-⚠ That is the extent of the WRITE. Whether 64 distinct channels can be lit by a
-weight byte has not been measured: every arm ran `--map` with a 128 byte limit,
-which reaches `w0` to `w7`.
+**Written and reachable.** The full sweep at `v = 111`: 256 groups, 128 live, 64
+distinct words lit, range 0 to 63, exactly the derived prediction. The channel
+shortfall is solved.
+
+So without any other change that configuration is, today:
+
+```
+64 channels, each fed by 16 weight bytes = 32 nibbles = 32 k
+the SHIPPED arithmetic, whose formula is known exactly and exact at seven points
+```
+
+⚠ **K has been 64 in every round of this file.** If bytes per channel is `K/4`
+rather than a fixed 16, then at `K = 32` those same 16 bytes are all 32 of the
+k, and that is a complete and correct matmul with no `CONV_CON1` change at all,
+with `K = 64` becoming two chained jobs rather than a defect. Unmeasured.
 
 Five rounds of sweeping and the answer was in a register excluded for being
 **identical on both paths**. The sweep list came from diffing int8's stream
@@ -525,8 +537,12 @@ the k fix rather than hanging. Three points, no explanation:
 ```
 v = 63,  extra 8, k fix  ->  40      unchanged from without the fix
 v = 127, extra 0, k fix  ->  32      halved from 64
-v = 111, extra 8, k fix  ->  hangs
+v = 71, 79, 87, 95, 103, 111  ->  all hang
 ```
+
+The only two values that have ever survived the k fix are 63 and 127. **Both are
+`2^n - 1` and none of the six that hang is.** A clean split on eight points, and
+untested as a rule.
 
 ### The activation packing
 
