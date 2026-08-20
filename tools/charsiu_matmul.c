@@ -343,6 +343,41 @@ int main(int argc, char **argv)
 		       !getenv("CHARSIU_I8_IMPULSE_SMALLSCALE")
 			       ? "128 +- 120" : "128 +- 30");
 	}
+	/*
+	 * CHARSIU_W4_HALFK: zero every weight the int4 fetch does not read.
+	 *
+	 * Rounds 265 to 277 mapped which k each channel actually gets. With
+	 * CORE 0x3020 = 111 at N = 64 every one of the 64 channels is written
+	 * and reachable, and each is fed by 16 weight bytes in two runs, one at
+	 * its own offset and one 256 bytes later, which is k 0..15 and k 32..47.
+	 * Half the reduction, but a KNOWN half:
+	 *
+	 *   fetched  <=>  (j mod 32) < 16
+	 *
+	 * The hardware not reading a weight is only wrong if the weight matters.
+	 * Zero the ones it never reads and the partial sum it computes IS the
+	 * full sum, so cpu_reference() and the hardware are answering the same
+	 * question with no change to the packer at all. A real 32 deep int4
+	 * matmul on all 64 channels, at the cost of half the buffer.
+	 *
+	 * This is a data shape, not a workaround for a defect in the packing.
+	 * The unfetched half stays open.
+	 */
+	if (getenv("CHARSIU_W4_HALFK")) {
+		unsigned j, zeroed = 0;
+
+		for (i = 0; i < n; i++)
+			for (j = 0; j < k; j++)
+				if (j % 32 >= 16) {
+					b_raw[i * k + j] =
+						(uint8_t)job.weight_zero_point;
+					zeroed++;
+				}
+		printf("HALFK: zeroed %u of %u weights, the ones with "
+		       "(k mod 32) >= 16, which the fetch never reads\n",
+		       zeroed, n * k);
+	}
+
 	for (i = 0; i < n; i++) {
 		unsigned j;
 

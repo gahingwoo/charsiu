@@ -518,10 +518,25 @@ So without any other change that configuration is, today:
 the SHIPPED arithmetic, whose formula is known exactly and exact at seven points
 ```
 
-⚠ **K has been 64 in every round of this file.** If bytes per channel is `K/4`
-rather than a fixed 16, then at `K = 32` those same 16 bytes are all 32 of the
-k, and that is a complete and correct matmul with no `CONV_CON1` change at all,
-with `K = 64` becoming two chained jobs rather than a defect. Unmeasured.
+Bytes per channel is `K/4`, measured at two `K`: 8 at `K = 32` and 16 at
+`K = 64`. So half the k is missing at **every** `K` and it is not a fixed cap.
+`K = 16` lights nothing at all.
+
+### The fetched half is a known half
+
+With `0x3020 = 111` at `N = 64, K = 64`, every channel gets 16 bytes in two runs,
+its own and one 256 bytes later, which `--kpair` reads as k 0..15 and k 32..47:
+
+```
+fetched  <=>  (k mod 32) < 16
+```
+
+A weight the hardware never reads is only wrong if it matters. **Zero the ones
+it does not read and the partial sum it computes is the full sum**, so a CPU
+reference and the hardware answer the same question. That is a real 32 deep int4
+matmul on all 64 channels with the arithmetic already known exact, at the cost of
+half the weight buffer, and it needs no packer change and no `CONV_CON1` change.
+`CHARSIU_W4_HALFK` does the zeroing.
 
 Five rounds of sweeping and the answer was in a register excluded for being
 **identical on both paths**. The sweep list came from diffing int8's stream
@@ -540,9 +555,11 @@ v = 127, extra 0, k fix  ->  32      halved from 64
 v = 71, 79, 87, 95, 103, 111  ->  all hang
 ```
 
-The only two values that have ever survived the k fix are 63 and 127. **Both are
-`2^n - 1` and none of the six that hang is.** A clean split on eight points, and
-untested as a rule.
+`2^n - 1` looked like the rule on eight points and is **refuted**: 15 and 31 are
+`2^n - 1` and both hang. The predicate that fits all twelve is `(v+1) mod 64 ==
+0`. And under the k fix `v` stops driving the count entirely, since 63, 127 and
+255 all give 40 and only `SIZE_E_2` moves it, so the k fix pins the channels at
+32 plus `SIZE_E_2`'s term. **The two halves cannot be had together.**
 
 ### The activation packing
 
