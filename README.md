@@ -308,6 +308,40 @@ nibble of 7 gives `00001bbc`, which is `+7100` and lights two bytes; a nibble of
 15 gives `ffffe570`, which is `-6800` and lights four. The two arms agree on
 every word and every k across 48 points.
 
+### The whole weight map, read densely
+
+`--map` needs one submit per byte where `--kpair` needs sixty four to sweep k,
+and a nibble pairing with exactly one k is now measured at over a hundred
+points, which retires the summation objection `--map` was written under. That
+buys the whole buffer at a stride of 8 at three geometries in one boot:
+
+```
+N=64                         N=32                N=16
+   0: w0-7    512: w16-23       0: w0-7             0: w0-7
+  64: .       576: .           64: .               64: w8-15
+ 128: w8-15   640: w24-31     128: w8-15          128: .
+ 192: .       704: w32-39     192: w16-23         192: .
+ 256: w0-7'   768: w16-23'    256: w0-7'          256: w0-7'
+ 320: .       832: .          320: .              320: w8-15'
+ 384: w8-15'  896: w24-31'    384: w8-15'         384: .
+ 448: .       960: w32-39'    448: w16-23'        448: .
+             1024+: dark      512+: dark          (' is the same channel, k+32)
+```
+
+Every word that gets written gets lit: 16 of 16, 24 of 24, 40 of 40. Nothing
+writes a channel it does not compute.
+
+Two numbers come out of that map and they are **different problems**:
+
+```
+channels reached = N/2 + 8    16, 24 and 40 at N of 16, 32 and 64
+k per channel    = 32         two eight byte groups, at B and B+256,
+                              sixteen nibbles each, while K is 64
+```
+
+The second is not the first in disguise. Every channel that exists at all gets
+exactly half of its k, whatever `N` is.
+
 ### The hardware writes fewer channels than the job declares
 
 Filling the output buffer with a sentinel rather than zero, and reading the

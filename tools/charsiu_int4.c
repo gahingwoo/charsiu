@@ -227,7 +227,7 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	 * writes FEWER channels than the job declares and at N = 16 that
 	 * happens to equal N, which is why every clean result so far is at 16.
 	 */
-	unsigned i, lit = 0, first_w = 0, wrote = 0, hi = 0;
+	unsigned i, lit = 0, first_w = 0, wrote = 0, hi = 0, hib = 0;
 	int32_t first_v = 0;
 	size_t obytes = outbo->size;
 	uint8_t *o;
@@ -255,12 +255,23 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	for (i = 0; (size_t)i + 4 <= obytes; i += 4) {
 		uint32_t u;
 		int32_t v;
+		unsigned b;
 
 		memcpy(&u, o + i, 4);
 		if (u == 0xa5a5a5a5u)
 			continue;
 		wrote++;
 		hi = i / 4;
+		/*
+		 * The highest written BYTE, not just the word. int8 writes one
+		 * byte a channel, so a 64 channel int8 job touches 16 words and
+		 * 64 bytes; reading only the word count cannot tell that from a
+		 * 16 channel job. The int8 arm is the oracle here and it has to
+		 * be readable in its own units.
+		 */
+		for (b = 0; b < 4; b++)
+			if (o[i + b] != 0xa5)
+				hib = i + b;
 		if (!u)
 			continue;
 		memcpy(&v, &u, 4);
@@ -268,14 +279,14 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		lit++;
 	}
 	if (lit == 1)
-		printf("  byte %-6zu %-5s -> w %-4u v %-8d   wrote %u hi %u\n",
-		       byte, high ? "high" : "low", first_w, first_v, wrote, hi);
+		printf("  byte %-6zu %-5s -> w %-4u v %-8d   wrote %u hi %u hib %u\n",
+		       byte, high ? "high" : "low", first_w, first_v, wrote, hi, hib);
 	else if (!lit)
-		printf("  byte %-6zu %-5s -> NOTHING LIT            wrote %u hi %u\n",
-		       byte, high ? "high" : "low", wrote, hi);
+		printf("  byte %-6zu %-5s -> NOTHING LIT            wrote %u hi %u hib %u\n",
+		       byte, high ? "high" : "low", wrote, hi, hib);
 	else
-		printf("  byte %-6zu %-5s -> %u words lit, first w %u v %d   wrote %u hi %u\n",
-		       byte, high ? "high" : "low", lit, first_w, first_v, wrote, hi);
+		printf("  byte %-6zu %-5s -> %u words lit, first w %u v %d   wrote %u hi %u hib %u\n",
+		       byte, high ? "high" : "low", lit, first_w, first_v, wrote, hi, hib);
 	charsiu_bo_fini(dev, outbo);
 }
 
