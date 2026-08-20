@@ -411,7 +411,33 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 */
 			unsigned g = n / 8;
 			unsigned glast = (ALIGN_UP(mm->n, 16) - 1) / 8;
-			size_t row = (size_t)(g / 2) * 8 * mm->k
+			/*
+			 * ⚠ THE PAIR STRIDE IS A HYPOTHESIS, NOT A READING,
+			 * and this is where round 283 stopped.
+			 *
+			 * Both measured tables were swept at N = 64, and at
+			 * N = 64 the buffer is k*32, so 8*K and wbytes/4 are
+			 * THE SAME NUMBER. 512 at K = 64, 256 at K = 32, both
+			 * ways. No data taken so far can tell them apart.
+			 *
+			 * 283's N sweep is the first thing that could, and it
+			 * says 8*K is wrong away from 64: with the write
+			 * quantum fixed so every channel is written, N of 24,
+			 * 40 and 56 still come back with whole groups at 0 of 8
+			 * at the top, which is a placement fault now and not a
+			 * write one. A map that does not scale with the buffer
+			 * would run past the end of a smaller one, and at
+			 * N = 24 the second group of g2 lands at 768, which is
+			 * exactly the size of that buffer.
+			 *
+			 * So this uses wbytes/4, which agrees with everything
+			 * measured and does not agree with the failures. It has
+			 * not been confirmed on hardware and the odd member
+			 * offsets, 128 and 64, are still constants read only at
+			 * N = 64.
+			 */
+			size_t stride = charsiu_weight_bytes(mm) / 4;
+			size_t row = (size_t)(g / 2) * stride
 				     + ((g & 1) ? (g == glast ? 64 : 128) : 0)
 				     + (size_t)(n % 8) * 8;
 			unsigned half;
@@ -422,7 +448,8 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
 			 */
 			for (half = 0; half < (mm->k > 32 ? 2u : 1u); half++) {
-				size_t gb = row + (size_t)half * 4 * mm->k;
+				/* half the pair stride, by the same argument */
+				size_t gb = row + (size_t)half * (stride / 2);
 				unsigned j;
 
 				for (j = 0; j < 16; j++) {

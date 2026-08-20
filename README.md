@@ -324,9 +324,41 @@ n      16  24  32  40  48  56  64
 wrote  16  16  32  32  48  48  64      = floor(n/16) * 16, seven for seven
 ```
 
-Their weights were placed correctly and the channels were never written. So
-`0x3020` asks for the next multiple of sixteen, `2*(ALIGN_UP(n,16) - 8) - 1`, and
-the extra channels are computed and thrown away.
+So `0x3020` asks for the next multiple of sixteen,
+`2*(ALIGN_UP(n,16) - 8) - 1`, and the extra channels are computed and thrown
+away. That fixed the write: 24, 40 and 56 now report every word written.
+
+### The pair stride was only ever measured at N = 64
+
+The same three `N` are **still wrong**, and with the write fixed that is now a
+placement fault: whole groups at 0 of 8 at the top, `g2` at `N = 24`, `g3` and
+`g4` at 40, `g4` to `g6` at 56.
+
+The base expression used a pair stride of `8*K`. The weight buffer is `k*n/2`
+bytes, so at `N = 64` it is `k*32`, and **at `N = 64` `8*K` and `wbytes/4` are the
+same number**. Both measured tables were swept at `N = 64`, so no data in this
+project can tell the two forms apart, and the `N` sweep is the first thing that
+could. It says the map scales with the buffer: at `N = 24` the second group of
+`g2` lands at byte 768, which is exactly the size of that buffer.
+
+The stride is `wbytes/4` now and the second group sits half a stride on rather
+than a fixed 256. ⚠ **A hypothesis, not a reading** — it agrees with everything
+measured and disagrees with the failures, which is all that can be said for it.
+The odd member offsets, 128 for a middle pair and 64 for the last, are still
+constants read only at `N = 64`.
+
+### Where int4 stands
+
+```
+works, no override, byte exact against a CPU reference
+  N = 16, 32, 48, 64 at K = 64        and N = 64 at K = 32
+  64 channels, 32 real k each, out = ((int16)fp16bits(w) * (int16)abits) >> 16
+
+open
+  N not a multiple of 16 places the top groups wrong  (the stride above)
+  half the k reaches any channel, and which half is its parity
+  M has only ever been 1
+```
 
 ### What is still open on int4
 
