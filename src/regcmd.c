@@ -367,9 +367,6 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * first 40 channels.
 	 */
 	if (mm->wdtype == CHARSIU_INT4) {
-		static const unsigned base[8] = {
-			0, 128, 512, 640, 1024, 1152, 1536, 1600
-		};
 		unsigned order = getenv("CHARSIU_INT4_ORDER")
 			? (unsigned)atoi(getenv("CHARSIU_INT4_ORDER")) : 0;
 
@@ -379,7 +376,23 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		}
 
 		for (n = 0; n < mm->n; n++) {
-			size_t row = base[n / 8] + (size_t)(n % 8) * 8;
+			/*
+			 * ONE EXPRESSION FOR BOTH MEASURED TABLES, 16 points.
+			 *
+			 *   K=64  0 128 512 640 1024 1152 1536 1600
+			 *   K=32  0 128 256 384  512  640  768  832
+			 *
+			 * Groups of eight channels pair up, the pair stride is
+			 * 8*K, and the odd member of a pair sits 128 bytes into
+			 * it. The LAST pair sits 64 bytes in rather than 128,
+			 * in both tables independently, so that is read rather
+			 * than fitted and it is not a cap: 3*512 + 128 + 56 is
+			 * well inside a 2048 byte buffer.
+			 */
+			unsigned g = n / 8;
+			size_t row = (size_t)(g / 2) * 8 * mm->k
+				     + ((g & 1) ? (g == 7 ? 64 : 128) : 0)
+				     + (size_t)(n % 8) * 8;
 			unsigned half;
 
 			/*
@@ -388,7 +401,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
 			 */
 			for (half = 0; half < (mm->k > 32 ? 2u : 1u); half++) {
-				size_t g = row + (size_t)half * 256;
+				size_t gb = row + (size_t)half * 4 * mm->k;
 				unsigned j;
 
 				for (j = 0; j < 16; j++) {
@@ -402,10 +415,10 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 						continue;
 					nib = src[(size_t)n * mm->k + kk] & 0xf;
 					if (order) {
-						b = g + (j % 8);
+						b = gb + (j % 8);
 						high = j >= 8;
 					} else {
-						b = g + j / 2;
+						b = gb + j / 2;
 						high = j & 1;
 					}
 					if (high)

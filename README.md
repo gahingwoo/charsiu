@@ -259,6 +259,41 @@ went into the board script before the run:
 
 Four for four on the integer reading, zero error.
 
+## An int4 matmul that computes
+
+**Round 280: `int4 output: 64 of 64 words written, 64 EXACT`.** Every channel,
+against `cpu_reference`, on a dense buffer. The pieces:
+
+```
+charsiu_pack_weights writes the measured layout   address table + k parity
+CORE 0x3020 = 2*(n-8) - 1                          111 at n = 64
+weights zeroed outside each channel's fed half     CHARSIU_W4_HALFK
+```
+
+The controls behaved. `CHARSIU_INT4_ORDER=1` scored 0 of 64, so the intra group
+order is settled at `byte j holds k = 2j low and k = 2j+1 high`. The no-`HALFK`
+control scored 0 of 64 **with npu values identical to the passing arm**, which is
+the model confirming itself: the hardware computed the same thing and only the
+reference moved. int8 stayed 64 of 64 byte exact throughout.
+
+Both shift placements scored 64, and that is not a weak test. fp16 bits of an
+integer have a zero low byte and `abits` is `(a-0x80) << 8`, so every product is
+a multiple of 65536 and the shift loses nothing per element. **The two readings
+are identically equal for this packing** rather than undecided.
+
+### The base table is one expression at both K
+
+```
+K=64  0 128 512 640 1024 1152 1536 1600
+K=32  0 128 256 384  512  640  768  832
+
+base[g] = (g/2) * 8K + (g odd ? (g == 7 ? 64 : 128) : 0)
+```
+
+Sixteen points, one expression, and the last pair sitting 64 bytes in rather than
+128 appears in **both** tables independently, so it is read and not fitted. It is
+not a cap either: `3*512 + 128 + 56` is well inside 2048.
+
 ### What is still open on int4
 
 **The weights are read.** With no live nibble anywhere the output comes back all zero,

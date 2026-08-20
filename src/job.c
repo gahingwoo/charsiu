@@ -494,7 +494,20 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 
 	emit(&e, CORE, 0x3018, 0x10000001);
 	emit(&e, CORE, 0x301c, (lines << 16) | 0);
-	emit(&e, CORE, 0x3020, mm->n - 1);
+	/*
+	 * ⚠ int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
+	 * that carries it. Rounds 274 to 276 read it directly: the DPU writes
+	 * ceil((v+1)/2) + extra(SIZE_E_2) channels, six for six across v of 31,
+	 * 47, 79, 95, 111 and 127, with SIZE_E_2 at its shipped 3 contributing
+	 * 8. int8 wants n-1 and gets all n; int4 asking for n-1 gets n/2 + 8,
+	 * which is 40 of 64 and is why every int4 result before round 280 was
+	 * short. Inverting it, v = 2*(n - 8) - 1, and at n = 64 that is 111,
+	 * which is the value the whole layout above was measured at.
+	 */
+	emit(&e, CORE, 0x3020,
+	     mm->wdtype == CHARSIU_INT4 && mm->n > 8
+		     ? (uint32_t)(2 * (mm->n - 8) - 1)
+		     : mm->n - 1);
 	emit(&e, CORE, 0x3024, 0x00000000);
 
 	/*
