@@ -595,6 +595,47 @@ int main(int argc, char **argv)
 		       "%u EXACT with the shift per element, "
 		       "%u EXACT with the shift on the sum\n",
 		       written, m * n, ex_pe, ex_sum);
+		/*
+		 * ⚠ WHICH channels, in groups of eight, because the layout is
+		 * indexed by n/8 and a whole group being wrong is a different
+		 * fault from a scatter. Round 281 printed only channels 0 to 7
+		 * and its two partial results, 24 of 32 and 8 of 16, could not
+		 * be read past the count.
+		 */
+		{
+			unsigned gi;
+
+			printf("  per group of 8:");
+			for (gi = 0; gi * 8 < n; gi++) {
+				unsigned ok = 0, ci;
+
+				for (ci = gi * 8; ci < (gi + 1) * 8 && ci < n;
+				     ci++) {
+					int64_t pe = 0;
+					unsigned j;
+
+					for (j = 0; j < k; j++) {
+						int wv = b_raw[ci * k + j];
+						int16_t wb, ab;
+
+						wv = (wv & 0x8)
+							? (wv & 0xf) - 16
+							: (wv & 0xf);
+						wb = (int16_t)
+						  charsiu_float_to_half((float)wv);
+						ab = (int16_t)((((int)
+						  a_raw[j] - 0x80) & 0xff) << 8);
+						pe += ((int32_t)wb
+						       * (int32_t)ab) >> 16;
+					}
+					if (((const int32_t *)outbo.map)[ci]
+					    == (int32_t)pe)
+						ok++;
+				}
+				printf("  g%u %u/8", gi, ok);
+			}
+			printf("\n");
+		}
 		charsiu_close(dev);
 		return 0;
 	}

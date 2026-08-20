@@ -294,6 +294,19 @@ Sixteen points, one expression, and the last pair sitting 64 bytes in rather tha
 128 appears in **both** tables independently, so it is read and not fitted. It is
 not a cap either: `3*512 + 128 + 56` is well inside 2048.
 
+Both hold on hardware with **no override at all**: `K = 64` and `K = 32` at
+`N = 64` are each 64 of 64 exact with `0x3020` emitted as `2*(n-8) - 1`.
+
+⚠ `N = 32` and `N = 16` came back 24 of 32 and 8 of 16, short by exactly one
+group of eight each. "The last pair" was written as `g == 7`, which is the last
+group only at `N = 64`; at 32 it is 3 and at 16 it is 1, and those are the sizes
+of the shortfalls. So the irregular term belongs to the highest group in use,
+`g == (n-1)/8`.
+
+That is **fitted to two failures and one success, not read**. Every `N` tried has
+an odd highest group — 7, 3 and 1 — and at an `N` whose highest group is even the
+rule predicts no 64 anywhere. Nothing has run there.
+
 ### What is still open on int4
 
 **The weights are read.** With no live nibble anywhere the output comes back all zero,

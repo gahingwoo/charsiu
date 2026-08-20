@@ -388,10 +388,22 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * in both tables independently, so that is read rather
 			 * than fitted and it is not a cap: 3*512 + 128 + 56 is
 			 * well inside a 2048 byte buffer.
+			 *
+			 * ⚠ "LAST" IS THE HIGHEST GROUP IN USE, NOT g == 7.
+			 * Round 281 wrote 7 because the map was read at N = 64
+			 * where the two coincide, and N = 32 came back 24 of 32
+			 * and N = 16 came back 8 of 16, which is one group of
+			 * eight wrong in each: g 3 at N = 32 and g 1 at N = 16,
+			 * the highest group in both. So the 64 belongs to
+			 * whichever odd group is last.
+			 *
+			 * That is fitted to two failures and one success and it
+			 * is not read: nothing has run at an N whose highest
+			 * group is EVEN, where this predicts no 64 anywhere.
 			 */
-			unsigned g = n / 8;
+			unsigned g = n / 8, glast = (mm->n - 1) / 8;
 			size_t row = (size_t)(g / 2) * 8 * mm->k
-				     + ((g & 1) ? (g == 7 ? 64 : 128) : 0)
+				     + ((g & 1) ? (g == glast ? 64 : 128) : 0)
 				     + (size_t)(n % 8) * 8;
 			unsigned half;
 
