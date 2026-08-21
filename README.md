@@ -454,11 +454,24 @@ open, and both are measured rather than untried
     bytes spaced a constant 256 — 1, 2 and 4 at K of 32, 64 and 128 — where the
     packer wrote two at an offset of 4*K, which equals 256 only when K is 64.
     That was the same trap as `8*K` against `wbytes/4`.
-    At K = 256 the score is exactly half, and the reason is above the score:
-    `wrote 40 of 64` and `wrote 24 of 32`, which are `N/2 + 8`, the count from
-    before `0x3020` was fixed. The register gives 64 channels at K = 64 and
-    K = 128 and 40 at K = 256, so something caps it between those two, and that
-    is what an LLM shape at K = 2048 would hit.
+    At K = 256 thirty-two channels are correct whatever gets written: `0x3020`
+    swept over six values gives 40, 40, 56, 56, 40, 40 written with `exact` at
+    `wrote - 8` throughout, and `SIZE_E_2` moves what is written, 32/36/40, with
+    `exact` stuck at 32. Beside the K that work, in bytes of weight actually
+    fetched, which is `K/2` a channel:
+
+    ```
+    K =  64  N = 88 correct    88 x 32  = 2816
+    K = 128  N = 64 correct    64 x 64  = 4096
+    K = 256  N = 32 correct    32 x 128 = 4096
+    ```
+
+    Two land on 4096 exactly and the third is under it, so a **4096 byte weight
+    fetch budget a job** covers all three — a bound to tile an LLM projection
+    against rather than a mystery. Untested.
+  ⚠ K = 192 is a separate fault: every channel is written and none is correct,
+    where the budget would have capped it. It is the first K tried that is not a
+    power of two.
   charsiu_bench has no int4 path, so "what does int4 buy" still cannot be asked.
 ```
 
