@@ -432,7 +432,18 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 * is indexed by, so the guard belongs on the group count and it
 		 * is below.
 		 */
-		if (mm->k != 64 && mm->k != 32)
+		/*
+		 * ⚠ K = 32 AND 64 ARE THE ONLY TWO EVER SWEPT, and an LLM wants
+		 * K in the thousands. The skeleton is K independent where it has
+		 * been checked: the slot table by group count reproduces both,
+		 * and only the block stride 8*K and the k+ offset 4*K scale. So
+		 * 128 and 256 are ALLOWED here as a prediction, not a reading,
+		 * and refused above that until swept.
+		 *
+		 * At K = 128, N = 64 the prediction is bases 0, 128, 1024, 1152,
+		 * 2048, 2176, 3072, 3136 with the k+ group 512 bytes on.
+		 */
+		if (mm->k != 64 && mm->k != 32 && mm->k != 128 && mm->k != 256)
 			return;
 
 		for (n = 0; n < mm->n; n++) {

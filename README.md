@@ -435,21 +435,26 @@ open, and both are measured rather than untried
     and **as matmuls all three are 16 of 32, identical to changing nothing.**
     `0x1094` breaks row 0 as well and `0x118c` is the baseline. Six registers,
     none of them a row count.
-    ⚠ The packing is not inert but neither guess is right. `[m][k/atom][atom]`
-    and `[k/atom][atom][m]` are both **0 of 32** at M = 2, where the shipped
-    `[k/atom][m][atom]` is 16 of 32: they light row 1 and break row 0 doing it.
-    All three are exact at M = 1, which they must be, since `m` drops out there.
-    Two of them are the ENDS of one axis — the granularity at which rows
-    interleave, every 8 elements for the shipped one and every 64 for "rows
-    outermost" — and nothing between has been written. 32 is the value with a
-    reason: `entries_per_row` is 2 and the input bo is `surf * 64 * m`, so an
-    entry is 64 bytes, which is 32 two-byte elements.
+    The packing is not inert and no arrangement is right either. Sweeping the
+    granularity at which rows interleave over 1, 2, 4, 8, 16, 32 and 64 elements,
+    with the shipped value 8 and "rows outermost" 64 in the sweep as controls and
+    both reproducing, **only 8 gives 16 of 32 and every other value gives 0**.
+    ⚠ **M > 1 is closed with a negative**: six registers and nine packings, and
+    the hardware computes M rows while feeding every one from row 0's activation.
+    It does not block the project — decoding LLM tokens is M = 1, and int4 at
+    M = 1 is exact across eleven geometries. M > 1 is a chaining problem.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
     12-15 and 20-23 into them. Both match the mismatch lists exactly. Measured at
     two N, no rule written.
-  K other than 32 and 64 is refused
+  ⚠ K is the one that blocks the goal. Every int4 measurement here is at K = 32
+    or 64 and a projection in a small model is K = 2048 by N = 1024. The
+    skeleton is K independent everywhere it has been checked — the slot table
+    reproduces both K and only the block stride 8*K and the k+ offset 4*K scale
+    — so 128 and 256 are allowed as a prediction and refused above that.
+    charsiu_bench has no int4 path at all, so "what does int4 buy" cannot be
+    asked yet.
 ```
 
 ### "Half the k" is not half the weights
