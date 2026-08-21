@@ -452,6 +452,114 @@ struct block_q6_K {
 	uint16_t d;
 };
 
+/*
+ * The inner loops.
+ *
+ * The NEON versions are plain ARMv8.0: 128 bit vectors, half to single
+ * conversion, and nothing from v8.2 -- no fp16 arithmetic and no SDOT. That is
+ * deliberate. The RK3576 is a Cortex-A72 plus a Cortex-A53, both ARMv8.0, so a
+ * kernel written against v8.2 would run on this development machine and not on
+ * the board it is a baseline FOR.
+ *
+ * A slow CPU path would flatter the NPU. The comparison in step 3 is only
+ * worth making against a CPU that is being asked to try.
+ */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+
+static float dot_f32(const float *w, const float *x, uint64_t n)
+{
+	float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+	uint64_t i = 0;
+	float s;
+
+	for (; i + 8 <= n; i += 8) {
+		a0 = vfmaq_f32(a0, vld1q_f32(w + i), vld1q_f32(x + i));
+		a1 = vfmaq_f32(a1, vld1q_f32(w + i + 4), vld1q_f32(x + i + 4));
+	}
+	s = vaddvq_f32(vaddq_f32(a0, a1));
+	for (; i < n; i++)
+		s += w[i] * x[i];
+	return s;
+}
+
+static float dot_f16(const uint16_t *w, const float *x, uint64_t n)
+{
+	float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+	uint64_t i = 0;
+	float s;
+
+	for (; i + 8 <= n; i += 8) {
+		uint16x8_t h = vld1q_u16(w + i);
+		float32x4_t lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(h)));
+		float32x4_t hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(h)));
+
+		a0 = vfmaq_f32(a0, lo, vld1q_f32(x + i));
+		a1 = vfmaq_f32(a1, hi, vld1q_f32(x + i + 4));
+	}
+	s = vaddvq_f32(vaddq_f32(a0, a1));
+	for (; i < n; i++)
+		s += half_to_float(w[i]) * x[i];
+	return s;
+}
+
+/* sixteen int8 against sixteen floats, widened rather than dotted */
+static inline float32x4_t fma_i8x16(float32x4_t acc[4], int8x16_t q, const float *x)
+{
+	int16x8_t l = vmovl_s8(vget_low_s8(q));
+	int16x8_t h = vmovl_s8(vget_high_s8(q));
+
+	acc[0] = vfmaq_f32(acc[0], vcvtq_f32_s32(vmovl_s16(vget_low_s16(l))),  vld1q_f32(x));
+	acc[1] = vfmaq_f32(acc[1], vcvtq_f32_s32(vmovl_s16(vget_high_s16(l))), vld1q_f32(x + 4));
+	acc[2] = vfmaq_f32(acc[2], vcvtq_f32_s32(vmovl_s16(vget_low_s16(h))),  vld1q_f32(x + 8));
+	acc[3] = vfmaq_f32(acc[3], vcvtq_f32_s32(vmovl_s16(vget_high_s16(h))), vld1q_f32(x + 12));
+	return acc[0];
+}
+
+static float dot_q8_0(const struct block_q8_0 *b, const float *x, uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		float32x4_t acc[4] = { vdupq_n_f32(0), vdupq_n_f32(0),
+				       vdupq_n_f32(0), vdupq_n_f32(0) };
+
+		fma_i8x16(acc, vld1q_s8(b[i].qs),      x + i * 32);
+		fma_i8x16(acc, vld1q_s8(b[i].qs + 16), x + i * 32 + 16);
+
+		s += half_to_float(b[i].d) *
+		     vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]),
+					  vaddq_f32(acc[2], acc[3])));
+	}
+	return s;
+}
+
+static float dot_q4_0(const struct block_q4_0 *b, const float *x, uint64_t nb)
+{
+	const int8x16_t bias = vdupq_n_s8(8);
+	const uint8x16_t mask = vdupq_n_u8(0x0f);
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		float32x4_t acc[4] = { vdupq_n_f32(0), vdupq_n_f32(0),
+				       vdupq_n_f32(0), vdupq_n_f32(0) };
+		uint8x16_t p = vld1q_u8(b[i].qs);
+
+		/* the low nibbles are elements 0..15, the high ones 16..31 */
+		fma_i8x16(acc, vsubq_s8(vreinterpretq_s8_u8(vandq_u8(p, mask)), bias),
+			  x + i * 32);
+		fma_i8x16(acc, vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(p, 4)), bias),
+			  x + i * 32 + 16);
+
+		s += half_to_float(b[i].d) *
+		     vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]),
+					  vaddq_f32(acc[2], acc[3])));
+	}
+	return s;
+}
+
+#else /* the portable versions, which are also what the NEON ones are read against */
+
 static float dot_f32(const float *w, const float *x, uint64_t n)
 {
 	float s = 0.0f;
@@ -505,6 +613,8 @@ static float dot_q4_0(const struct block_q4_0 *b, const float *x, uint64_t nb)
 	}
 	return s;
 }
+
+#endif
 
 static float dot_q4_1(const struct block_q4_1 *b, const float *x, uint64_t nb)
 {
