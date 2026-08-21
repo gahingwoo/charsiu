@@ -443,7 +443,24 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 * At K = 128, N = 64 the prediction is bases 0, 128, 1024, 1152,
 		 * 2048, 2176, 3072, 3136 with the k+ group 512 bytes on.
 		 */
-		if (mm->k != 64 && mm->k != 32 && mm->k != 128 && mm->k != 256)
+		/*
+		 * ⚠ K MUST BE A MULTIPLE OF 32, which is the run count K/32
+		 * being a whole number. Round 302 ran every multiple of 16
+		 * between 128 and 192:
+		 *
+		 *   K = 144, K/32 = 4.5    8 of 64 exact
+		 *   K = 160, K/32 = 5     64 of 64
+		 *   K = 176, K/32 = 5.5    8 of 64 exact
+		 *   K = 192, K/32 = 6     64 of 64
+		 *
+		 * ⚠ AND K = 192 WAS NEVER A LAYOUT FAULT. Rounds 300 and 301
+		 * recorded it as "writes every channel and computes none, the
+		 * first non power of two K", and it was this guard: 192 was not
+		 * in the whitelist, so the packer returned without writing a
+		 * byte. --map lit anyway because it writes raw bytes and does
+		 * not go through here.
+		 */
+		if (mm->k < 32 || mm->k > 256 || (mm->k & 31))
 			return;
 
 		for (n = 0; n < mm->n; n++) {

@@ -408,8 +408,9 @@ N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
 
 ```
 works, no override, byte exact against a CPU reference
-  K = 32, 64 and 128, at every N that is a multiple of 8 that has been tried:
-    16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 128, 160
+  K = 32, 64, 128, 160 and 192 — K must be a MULTIPLE OF 32, which is the run
+    count K/32 being whole: 144 and 176 give 8 of 64 where 160 and 192 give 64
+  every N that is a multiple of 8 that has been tried, 16 through 160
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
@@ -473,9 +474,14 @@ open, and both are measured rather than untried
     up to 128 works at every N tried and K of 192 and 256 fail**, in two
     different ways. `N = 160` is also `G = 20`, well past the `G = 11` the slot
     form was read at, so that part generalises far.
-  ⚠ K = 192 is a separate fault: every channel is written and none is correct,
-    where the budget would have capped it. It is the first K tried that is not a
-    power of two.
+  ⚠ K = 192 was never a fault. Rounds 300 and 301 recorded it as "writes every
+    channel and computes none, the first non-power-of-two K"; it was the packer's
+    K whitelist, which did not contain 192, so it returned without writing a
+    byte, while `--map` lit anyway because it writes raw bytes. With the guard
+    widened to multiples of 32 it is 64 of 64.
+  ⚠ K = 256 is a real one, and a count rather than a layout fault: `K/32` is
+    whole there, so the layout is fine, and the channel count falls back to
+    `N/2 + 8`. It sits between K = 192, which writes all 64, and itself.
   charsiu_bench has no int4 path, so "what does int4 buy" still cannot be asked.
 ```
 
