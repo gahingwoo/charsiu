@@ -51,6 +51,16 @@ static double now_us(void)
 }
 
 /*
+ * The weight bytes a shape actually moves. int4 packs two weights to a byte, so
+ * k*n is right for int8 and twice the truth for int4, and a GB/s that means
+ * different things on the two paths is worse than none.
+ */
+static double wbytes_of(unsigned k, unsigned n)
+{
+	return (double)k * n / (getenv("CHARSIU_W4") ? 2.0 : 1.0);
+}
+
+/*
  * The same matmul on one core, as the denominator.
  *
  * ROUND 165's VERSION MEASURED 0.0 us, because the compiler deleted the whole
@@ -117,13 +127,24 @@ static int bench_setup(struct bench *b, struct charsiu_device *dev,
 	memset(b, 0, sizeof(*b));
 	b->dev = dev;
 	b->job.mm.m = m; b->job.mm.k = k; b->job.mm.n = n;
-	b->job.mm.wdtype = CHARSIU_INT8;
+	/*
+	 * ⚠ CHARSIU_W4 BENCHES THE int4 PATH, which this file has never had.
+	 * The whole int4 line, rounds 265 to 303, exists to answer "what does it
+	 * buy", and until now the only benchmark in the repo was int8 only, so
+	 * the question could not be asked at all.
+	 *
+	 * The envelope it is valid in is measured: K a multiple of 32 up to 224,
+	 * N a multiple of 8 up to 160, M = 1. Outside that the packer refuses
+	 * and the numbers would be timing an empty weight buffer.
+	 */
+	b->job.mm.wdtype = getenv("CHARSIU_W4") ? CHARSIU_INT4 : CHARSIU_INT8;
 	b->job.mm.adtype = CHARSIU_INT8;
 	b->job.input_scale = 0.02f;
 	b->job.weight_scale = 0.01f;
 	b->job.output_scale = 0.25f;
 	b->job.input_zero_point = 128;
-	b->job.weight_zero_point = 128;
+	b->job.weight_zero_point =
+		b->job.mm.wdtype == CHARSIU_INT4 ? 0 : 128;
 	b->job.output_zero_point = 0;
 
 	b->a_raw = malloc((size_t)m * k);
@@ -135,18 +156,27 @@ static int bench_setup(struct bench *b, struct charsiu_device *dev,
 	for (i = 0; i < m * k; i++)
 		b->a_raw[i] = (uint8_t)(128 + (int)(i * 7 % 61) - 30);
 	for (i = 0; i < n * k; i++)
-		b->b_raw[i] = (uint8_t)(128 + (int)(i * 13 % 41) - 20);
+		b->b_raw[i] = b->job.mm.wdtype == CHARSIU_INT4
+			? (uint8_t)(((int)(i * 13 % 15) - 7) & 0xf)
+			: (uint8_t)(128 + (int)(i * 13 % 41) - 20);
 	for (i = 0; i < n; i++) {
 		unsigned j;
 
-		for (j = 0; j < k; j++)
-			b->wsums[i] += (int)b->b_raw[(size_t)i * k + j] - 128;
+		for (j = 0; j < k; j++) {
+			int wv = b->b_raw[(size_t)i * k + j];
+
+			if (b->job.mm.wdtype == CHARSIU_INT4)
+				wv = (wv & 0x8) ? (wv & 0xf) - 16 : (wv & 0xf);
+			b->wsums[i] += wv - (int)b->job.weight_zero_point;
+		}
 	}
 
 	ret = charsiu_bo_alloc(dev, stride * MAX_TASKS, &b->regcmd);
 	ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&b->job.mm) * 64 * m + 4096, &b->in);
 	ret |= charsiu_bo_alloc(dev, charsiu_weight_bytes(&b->job.mm) + 4096, &b->wt);
-	ret |= charsiu_bo_alloc(dev, (size_t)m * n * MAX_TASKS + 4096, &b->outbo);
+	/* four bytes an element on the int4 path, as everywhere else */
+	ret |= charsiu_bo_alloc(dev, (size_t)m * n * MAX_TASKS
+		* (b->job.mm.wdtype == CHARSIU_INT4 ? 4 : 1) + 4096, &b->outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&b->job.mm) + 4096, &b->coef);
 	if (ret)
 		return ret;
@@ -289,8 +319,10 @@ int main(int argc, char **argv)
 	n = argc > 3 ? (unsigned)atoi(argv[3]) : 1024;
 	reps = argc > 4 ? (unsigned)atoi(argv[4]) : 200;
 
-	printf("bench M=%u K=%u N=%u int8, %u reps, %.2f MOP, %.2f MB of weights\n",
-	       m, k, n, reps, 2.0 * m * k * n / 1e6, (double)k * n / 1e6);
+	printf("bench M=%u K=%u N=%u %s, %u reps, %.2f MOP, %.2f MB of weights\n",
+	       m, k, n, getenv("CHARSIU_W4") ? "int4" : "int8", reps,
+	       2.0 * m * k * n / 1e6,
+	       (double)k * n / (getenv("CHARSIU_W4") ? 2e6 : 1e6));
 	if (bench_setup(&b, dev, m, k, n)) { printf("setup FAILED\n"); return 1; }
 
 	printf("\n  %-8s %-12s %-12s %-12s %-12s\n",
@@ -302,8 +334,9 @@ int main(int argc, char **argv)
 		if (t == 1)
 			one = us;
 		printf("  %-8u %-12.1f %-12.2f %-12.2f %-12.1f\n", t, us, us / t,
-		       (double)k * n / (us / t) / 1e3, 2.0 * m * k * n * t / us / 1e3);
-		/* k*n bytes over us microseconds is GB/s directly. */
+		       wbytes_of(k, n) / (us / t) / 1e3,
+		       2.0 * m * k * n * t / us / 1e3);
+		/* the weight bytes over us microseconds is GB/s directly. */
 	}
 
 	/*
@@ -318,7 +351,7 @@ int main(int argc, char **argv)
 			printf("\n  marginal cost of one task: %.1f us  (%.2f GB/s)\n"
 			       "  fixed cost of a submit:    %.1f us\n",
 			       (a128 - a64) / 64,
-			       (double)k * n / ((a128 - a64) / 64) / 1e3,
+			       wbytes_of(k, n) / ((a128 - a64) / 64) / 1e3,
 			       one - (a128 - a64) / 64);
 	}
 

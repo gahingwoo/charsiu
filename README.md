@@ -408,8 +408,8 @@ N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
 
 ```
 works, no override, byte exact against a CPU reference
-  K = 32, 64, 128, 160 and 192 — K must be a MULTIPLE OF 32, which is the run
-    count K/32 being whole: 144 and 176 give 8 of 64 where 160 and 192 give 64
+  K = 32, 64, 128, 160, 192 and 224 — K must be a MULTIPLE OF 32, which is the
+    run count K/32 being whole: 144 and 176 give 8 of 64 where 160 and 192 give 64
   every N that is a multiple of 8 that has been tried, 16 through 160
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
@@ -479,9 +479,13 @@ open, and both are measured rather than untried
     K whitelist, which did not contain 192, so it returned without writing a
     byte, while `--map` lit anyway because it writes raw bytes. With the guard
     widened to multiples of 32 it is 64 of 64.
-  ⚠ K = 256 is a real one, and a count rather than a layout fault: `K/32` is
-    whole there, so the layout is fine, and the channel count falls back to
-    `N/2 + 8`. It sits between K = 192, which writes all 64, and itself.
+  ⚠ K = 256 is a count fault, and it is now exact: the channel count is `N/2`
+    and `SIZE_E_2`'s additive 8 writes garbage on top, so `wrote` is `N/2 + 8`
+    and `exact` is `N/2`. At `N = 16` those coincide with `N`, which is why
+    `N = 16` alone comes back 16 of 16 there. K = 224 is full, so 256 is where
+    it stops.
+  charsiu_bench has an int4 path now, with the GB/s column counting the weight
+    bytes a shape really moves — `k*n/2` for int4 against `k*n` for int8.
   charsiu_bench has no int4 path, so "what does int4 buy" still cannot be asked.
 ```
 
