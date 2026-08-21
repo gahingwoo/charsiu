@@ -390,25 +390,32 @@ ODD G    one block of three at b3 = (G-1)/4, slots 0 and 2 before it and 1 and 3
          after it, the three itself {0,2,3} when G mod 4 is 3, {0,1,3} when it is 1
 ```
 
-⚠ **This is the third closed form written for this layout and the first two died
-in the round after they were written.** `wbytes/4`, which also broke three working
+This is the third closed form written for this layout. The first two died in the
+round after they were written — `wbytes/4`, which also broke three working
 geometries, and "the last block takes the odd slots", which put `g4` of `N = 56`
-at 1024 where `--map` found it at 704. Both were fitted to a single point. This
-one has eight tables behind it — four points on the even arm, four on `b3`, two on
-each arm of the mod 4 — which is better and is not proof. It predicts `G = 10` and
-`G = 11` outright and those decide it.
+at 1024 where `--map` found it at 704 — and both were fitted to a single point.
+
+**This one predicted `G = 10` and `G = 11` before either was swept, and both
+landed.** `N = 80` and `N = 88` came back 80 of 80 and 88 of 88 against the CPU
+reference, and their `--map` grids reproduce all 21 predicted bases exactly:
+
+```
+N=80  0 128 512 640 1024 1152 1536 1664 2048 2112
+N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
+```
 
 ### Where int4 stands
 
 ```
-works, no override, byte exact against a CPU reference, all in one boot
-  N = 16, 24, 32, 40, 48, 56, 64 at K = 64,  and N = 64 at K = 32
+works, no override, byte exact against a CPU reference, eleven geometries
+  N = 16, 24, 32, 40, 48, 56, 64, 72, 80, 88 at K = 64,  and N = 64 at K = 32
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
 open
-  G = 10 and above are predicted by the closed form and not measured
   M has only ever been 1
+  K other than 32 and 64 is refused
+  N that is not a multiple of 8 has never been tried
 ```
 
 ### "Half the k" is not half the weights
