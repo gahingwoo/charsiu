@@ -423,9 +423,13 @@ open, and both are measured rather than untried
     group in the packer's own placement, while slots 0 and 1 all pass. N = 16 has
     no slot 2 group, which is why its row 0 is clean — and at N = 24, which has
     a slot 2 AND a slot 3, both fail, so at M > 1 only slots 0 and 1 work.
-    ⚠ The weight layout itself has an M term the packer does not model. --map at
-    M = 2, N = 16 lights EIGHT groups in a 512 byte buffer where M = 1 lights 32,
-    at channel 2j+1 and byte 264 + 16j against M = 1's channel c at byte 8c.
+    ⚠ The weight layout has NO M term — that reading came from a probe that
+    drove every row at once and printed only the first lit word. Holding one row
+    live at a time: row 0 alone has byte 8j lighting channel j in BOTH rows, at
+    the same address M = 1 uses, and **row 1 alone lights nothing at all**. So
+    the hardware only ever reads row 0's activation, and that is the whole of
+    what is left. CNA 0x1044, CBUF_CON1, whose only field is DATA_ENTRIES, is
+    emitted as entries per ROW and never multiplied by m.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
