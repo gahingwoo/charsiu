@@ -558,11 +558,19 @@ int main(int argc, char **argv)
 		 * one and reporting its score is how a fit gets mistaken for a
 		 * reading.
 		 */
+		/*
+		 * ⚠ THE SURFACE READING, not row major. Every int4 matmul in
+		 * this project has been M = 1, where [n/atom][m][n%atom]
+		 * collapses to n and a row major read is accidentally right.
+		 * The int8 path has read the surface since round 199 and this
+		 * one never had to. It does now.
+		 */
+		unsigned atom = charsiu_feature_atom(CHARSIU_INT8);
 		unsigned ni, mi, ex_pe = 0, ex_sum = 0, written = 0;
 		const int32_t *o = (const int32_t *)outbo.map;
 
-		printf("  int4: reading the output as %u signed 32 bit words\n",
-		       m * n);
+		printf("  int4: reading the output as %u signed 32 bit words, "
+		       "surface [n/%u][m][n%%%u]\n", m * n, atom, atom);
 		for (mi = 0; mi < m; mi++)
 			for (ni = 0; ni < n; ni++) {
 				int64_t pe = 0, sm = 0;
@@ -583,7 +591,8 @@ int main(int argc, char **argv)
 					sm += (int32_t)wb * (int32_t)ab;
 				}
 				sm >>= 16;
-				got = o[(size_t)mi * n + ni];
+				got = o[(size_t)(ni / atom) * m * atom
+					+ (size_t)mi * atom + ni % atom];
 				if ((uint32_t)got != 0xa5a5a5a5u) written++;
 				if (got == (int32_t)pe) ex_pe++;
 				if (got == (int32_t)sm) ex_sum++;
@@ -605,7 +614,7 @@ int main(int argc, char **argv)
 		{
 			unsigned gi;
 
-			printf("  per group of 8:");
+			printf("  per group of 8 (row 0):");
 			for (gi = 0; gi * 8 < n; gi++) {
 				unsigned ok = 0, ci;
 
@@ -628,8 +637,9 @@ int main(int argc, char **argv)
 						pe += ((int32_t)wb
 						       * (int32_t)ab) >> 16;
 					}
-					if (((const int32_t *)outbo.map)[ci]
-					    == (int32_t)pe)
+					if (((const int32_t *)outbo.map)
+					    [(size_t)(ci / atom) * m * atom
+					     + ci % atom] == (int32_t)pe)
 						ok++;
 				}
 				printf("  g%u %u/8", gi, ok);
