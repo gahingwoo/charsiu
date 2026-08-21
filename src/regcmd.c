@@ -254,15 +254,52 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 	 * impulse duly comes back at the rails. A real fp16 activation is the
 	 * next step and is what charsiu_pack_input_f16 below is for.
 	 */
-	memset(dst, wide ? 0 : (uint8_t)(input_zero_point - 0x80), dst_size);
-	for (i = 0; i < mm->m; i++)
-		for (kk = 0; kk < mm->k; kk++) {
-			size_t off = ((size_t)(kk / atom) * mm->m * atom
-				      + (size_t)i * atom + kk % atom) * esz;
+	/*
+	 * ⚠ THE ROW TERM IN THIS LAYOUT HAS NEVER BEEN TESTED. Every matmul in
+	 * this project ran M = 1 until round 289, where m drops out of the
+	 * expression entirely and any arrangement of the rows is correct.
+	 *
+	 * Rounds 293 to 295 narrowed M > 1 to one thing: both output rows are
+	 * computed from ROW 0's activation slot and row 1's bytes are never
+	 * fetched. Six registers were swept for it, three of which light row 1
+	 * on --map, and NONE of them makes it read its own data. So the place
+	 * left is the arrangement itself.
+	 *
+	 * CHARSIU_A_LAYOUT picks it:
+	 *   0 (default)  [k/atom][m][atom], rows inside a k group
+	 *   1            [m][k/atom][atom], rows outermost
+	 *   2            [k/atom][atom][m], rows innermost, element interleaved
+	 */
+	{
+		unsigned lay = getenv("CHARSIU_A_LAYOUT")
+			? (unsigned)atoi(getenv("CHARSIU_A_LAYOUT")) : 0;
+		unsigned kg = DIV_ROUND_UP(mm->k, atom);
 
-			dst[off + esz - 1] =
-				(uint8_t)(src[i * mm->k + kk] - 0x80);
-		}
+		memset(dst, wide ? 0 : (uint8_t)(input_zero_point - 0x80),
+		       dst_size);
+		for (i = 0; i < mm->m; i++)
+			for (kk = 0; kk < mm->k; kk++) {
+				size_t e;
+
+				switch (lay) {
+				case 1:
+					e = (size_t)i * kg * atom
+					    + (size_t)(kk / atom) * atom
+					    + kk % atom;
+					break;
+				case 2:
+					e = (size_t)(kk / atom) * atom * mm->m
+					    + (size_t)(kk % atom) * mm->m + i;
+					break;
+				default:
+					e = (size_t)(kk / atom) * mm->m * atom
+					    + (size_t)i * atom + kk % atom;
+					break;
+				}
+				dst[e * esz + esz - 1] =
+					(uint8_t)(src[i * mm->k + kk] - 0x80);
+			}
+	}
 }
 
 /*

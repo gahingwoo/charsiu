@@ -430,11 +430,14 @@ open, and both are measured rather than untried
     IS computed — in the row-0-only baseline its words come back nonzero with its
     own activation at the zero point — so both output rows are computed from
     row 0's activation slot and row 1's bytes are never fetched.
-    Three registers wake row 1 up and all three light the right words: `0x1044`
-    (CBUF_CON1's DATA_ENTRIES) set to `surf*m` instead of `surf`, `0x103c` set to
-    `surf*m << 16`, and `0x1078` set to 0, where charsiu emits `rows-1` into a
-    field mesa calls DATA_BURST_LEN. ⚠ Their values all differ and none is the
-    one the reference wants, so all three make row 1 read *something*.
+    Three registers wake row 1 up on the map — `0x1044`'s DATA_ENTRIES at
+    `surf*m`, `0x103c` at `surf*m << 16`, and `0x1078` back at its M = 1 value —
+    and **as matmuls all three are 16 of 32, identical to changing nothing.**
+    `0x1094` breaks row 0 as well and `0x118c` is the baseline. Six registers,
+    none of them a row count.
+    ⚠ What has never been tested is the packing. charsiu writes the activation as
+    `[k/atom][m][atom]` and until round 289 every matmul ran `M = 1`, where `m`
+    drops out of that expression and any arrangement of the rows is correct.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
