@@ -580,8 +580,22 @@ int main(int argc, char **argv)
 		 * atom is corrected here and the surface is DUMPED below rather
 		 * than guessed at a second time.
 		 */
-		unsigned atom = charsiu_feature_atom(
-					charsiu_effective_adtype(&job.mm));
+		/*
+		 * ⚠ THE SURFACE GROUPS BY SIXTEEN BYTES, NOT SIXTEEN ELEMENTS.
+		 * Round 290 dumped the raw surface at M = 2, N = 16 and read it
+		 * off directly: row 0's channels 0 to 3 are at words 0 to 3 and
+		 * its channels 4 to 7 are at words 8 to 11, so an atom group is
+		 * FOUR elements and the stride between groups is 4*m.
+		 *
+		 * int8 writes one byte an element and its atom is 16 elements;
+		 * w4a16 writes four and its atom is 4. Sixteen bytes either way,
+		 * which is one statement covering both paths, where "atom 16"
+		 * and "the feature atom" were two guesses that each covered one.
+		 *
+		 * At M = 1 every atom collapses to n, which is why eleven
+		 * geometries passed without this mattering.
+		 */
+		unsigned atom = 16 / (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1);
 		unsigned ni, mi, ex_pe = 0, ex_sum = 0, written = 0;
 		const int32_t *o = (const int32_t *)outbo.map;
 
@@ -700,6 +714,46 @@ int main(int argc, char **argv)
 				printf("  g%u %u/8", gi, ok);
 			}
 			printf("\n");
+
+			/*
+			 * ⚠ AND WHICH ONES. "g1 4/8" is as consistent with the
+			 * even channels failing as with the odd, and round 289's
+			 * N = 20 and round 290's M > 1 both come down to that
+			 * distinction. Name them.
+			 */
+			printf("  row 0 mismatches:");
+			{
+				unsigned ci, shown = 0;
+
+				for (ci = 0; ci < n; ci++) {
+					int64_t pe = 0;
+					unsigned j;
+
+					for (j = 0; j < k; j++) {
+						int wv = b_raw[ci * k + j];
+						int16_t wb, ab;
+
+						wv = (wv & 0x8) ? (wv & 0xf) - 16
+								: (wv & 0xf);
+						wb = (int16_t)charsiu_float_to_half((float)wv);
+						ab = (int16_t)((((int)a_raw[j]
+								 - 0x80) & 0xff) << 8);
+						pe += ((int32_t)wb * (int32_t)ab) >> 16;
+					}
+					if (((const int32_t *)outbo.map)
+					    [(size_t)(ci / atom) * m * atom
+					     + ci % atom] != (int32_t)pe) {
+						if (shown < 24)
+							printf(" %u", ci);
+						shown++;
+					}
+				}
+				if (!shown)
+					printf(" none");
+				else if (shown > 24)
+					printf(" ... %u total", shown);
+				printf("\n");
+			}
 		}
 		charsiu_close(dev);
 		return 0;

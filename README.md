@@ -412,14 +412,16 @@ works, no override, byte exact against a CPU reference, eleven geometries
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
-open, and both are now measured rather than untried
-  M > 1 is int4 only. int8 at M = 4 is 256 of 256 byte exact; int4 at M of 2, 4
-    and 8 puts every correct value in row 0 and gets rows 1+ wrong outright.
-    One cause found: the output reader hardcoded atom 16, which is int8's, where
-    w4a16's is 8 — invisible at M = 1, where both collapse to n. Not the whole
-    story: the groups where the two readings AGREE also came back half wrong.
+open, and both are measured rather than untried
+  M > 1 is int4 only — int8 at M = 4 is 256 of 256 byte exact. Two faults, now
+    separated. The surface groups by SIXTEEN BYTES, read straight off a raw dump
+    at M = 2: row 0's channels 0-3 are at words 0-3 and 4-7 at words 8-11, so an
+    atom is 4 elements for w4a16 and 16 for int8, and at M = 1 every atom
+    collapses to n. Separately, row 1's reference values appear NOWHERE in the
+    surface, which points at the input packing, not the read.
   N not a multiple of 8 is close but not exact: 16 of 20 and 32 of 36 at M = 1.
-    The short last group is correct and a FULL group in the middle loses four.
+    --map says the bases are exactly what the packer places, so the four channels
+    each loses are placed correctly and come back wrong anyway.
   K other than 32 and 64 is refused
 ```
 
