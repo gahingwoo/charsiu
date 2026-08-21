@@ -407,9 +407,9 @@ N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
 ### Where int4 stands
 
 ```
-works, no override, byte exact against a CPU reference, fourteen geometries
-  N = 16, 24, 32, 40, 48, 56, 64, 72, 80, 88 at K = 64
-  N = 64 at K = 32,  and N = 64, 32, 24 at K = 128
+works, no override, byte exact against a CPU reference
+  K = 32, 64 and 128, at every N that is a multiple of 8 that has been tried:
+    16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 128, 160
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
@@ -466,9 +466,13 @@ open, and both are measured rather than untried
     K = 256  N = 32 correct    32 x 128 = 4096
     ```
 
-    Two land on 4096 exactly and the third is under it, so a **4096 byte weight
-    fetch budget a job** covers all three — a bound to tile an LLM projection
-    against rather than a mystery. Untested.
+    Two land on 4096 exactly and the third is under it, which looked like a 4096
+    byte weight fetch budget. ⚠ **Refuted, usefully.** `K = 64` at `N = 160` is
+    5120 bytes and comes back 160 of 160, `K = 128` at `N = 96` is 6144 and comes
+    back 96 of 96, and both were predicted to cap. There is no byte budget: **K
+    up to 128 works at every N tried and K of 192 and 256 fail**, in two
+    different ways. `N = 160` is also `G = 20`, well past the `G = 11` the slot
+    form was read at, so that part generalises far.
   ⚠ K = 192 is a separate fault: every channel is written and none is correct,
     where the budget would have capped it. It is the first K tried that is not a
     power of two.
