@@ -553,8 +553,21 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			unsigned blk, slot;
 			size_t row;
 
-			if (ngrp < 2 || ngrp > 32)
-				return;                 /* never swept */
+			/*
+			 * ⚠ THIS GUARD WAS READ AS A HARDWARE RESULT ONCE
+			 * ALREADY. Round 306 ran K = 2048 at N = 512 and 1024
+			 * and got exact 0, which is this line refusing: G is 64
+			 * and 128 there. The same mistake as the K whitelist in
+			 * rounds 300 and 301, where K = 192 was recorded as a
+			 * layout fault for two rounds and was my own refusal.
+			 *
+			 * So it goes to 256 groups, which is N = 2048. The slot
+			 * form was read at G up to 11 and has since held at 20
+			 * and at 32, so it is extrapolation above that and says
+			 * so here rather than by returning silently.
+			 */
+			if (ngrp < 2 || ngrp > 256)
+				return;
 
 			if (!(ngrp & 1)) {
 				blk = g / 2;

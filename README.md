@@ -291,10 +291,21 @@ int8   NK   MACs for NK   bytes                  1 MAC  a byte
 
 int4 really is twice the work per byte, which is what a 4-bit weight should buy.
 It pays in **jobs**: four times as many for the same work, each with a fixed
-cost. Whether the 2x survives that turns on one thing — how big a job can be,
-which is the largest N at a large K. At `N = 1024, K = 2048` it would be four
-int4 jobs of 262 kB against one int8 job of 2 MB at 201.5 us, or about 164 us
-against 201; if N caps at 64 it is 64 jobs and an order of magnitude worse.
+cost.
+
+⚠ **Measured at the shape that matters, it does not survive that.** At
+`K = 2048, N = 256` a single job is **222.7 us for int4 against 224.2 us for
+int8** — half the weight bytes, the same time. int8 is genuinely bytes-bound
+there, 9.14 GB/s marginal; int4 moves 0.26 MB in the same 223 us, which is
+1.18 GB/s. The 2x per byte is real on paper and none of it reaches the clock.
+And chaining hangs: the second task of that shape times out and takes the block
+with it.
+
+The layout itself is fine that far out — `K = 2048` at `N` of 64, 128, 160 and
+256 all give `wrote = N/2 + 8` and `exact = N/2`, so 128 usable channels a job at
+`N = 256`. `N = 512` and above were recorded as failures and were **this packer's
+own group-count guard**, the same mistake as the K whitelist that had `K = 192`
+down as a layout fault for two rounds.
 
 ## An int4 matmul that computes
 
