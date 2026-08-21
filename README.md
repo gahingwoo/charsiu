@@ -174,10 +174,40 @@ The first guess had been register spilling in the q4_0 kernel. Rewriting it chan
 nothing, which refuted it, and the answer turned out to be in the file rather than in the
 code.
 
-For scale, llama.cpp on the same host and file is 48.3 tok/s. It quantises the activation
-to int8 once per matvec and then does integer dot products; charsiu converts each weight
-to f32 instead. That gap is the next structural piece of work, and it is also exactly the
-interface the NPU path needs, since the NPU consumes an int8 activation with a zero point.
+### The activation is quantised, not the weights converted
+
+The first version converted every **weight** to a float in order to multiply it by a float
+activation. That is the expensive way round: a matvec has `N*K` weights and only `K`
+activations. So the activation is quantised to signed int8 once per matvec, in blocks of
+32 with a scale each, and the dot product becomes **integer**, with one float multiply per
+block at the end. Q, K and V all read one RMSNorm output and so do gate and up, so six of
+the nine quantisations in a layer are of a vector already done and are skipped.
+
+| host, q4_0, 4 threads | tok/s |
+|---|---|
+| exact f32 activation | 17.99 |
+| quantised | 31.50 |
+| plus the deduplication | **36.85** |
+
+**The order flipped**: q4_0 36.85 now beats q8_0 34.80, where q8_0 used to win. Thread
+scaling flattened as well (1 → 18.4, 2 → 30.2, 4 → 33.4, 6 → 30.8). Both are what a
+kernel that has stopped being ALU bound looks like. llama.cpp on the same host and file
+is 48.3 tok/s; charsiu was at 39% of it and is now at 76%.
+
+This matters beyond speed. **An int8 activation with a scale is exactly what the NPU
+consumes**, so the CPU fallback and an NPU job can be fed from the same buffer, and the
+CPU path is the reference the NPU path gets diffed against rather than a separate design.
+
+It is an approximation, so it has controls. `CHARSIU_NO_QACT` restores the exact path, and
+that path is proven untouched: the logits it prints are byte identical to the values
+recorded before the change. `tests/qact_control.py` measures what the approximation costs
+without needing any reference implementation — q4_0 moves a logit by at most 0.055 with 48
+greedy tokens unchanged, q8_0 by at most 0.103.
+
+One detail worth writing down: ggml's **reference C** quantises with `roundf`, ties away
+from zero, but its **ARM path** uses `vcvtnq_s32_f32`, which is ties to even, and the ARM
+path is the one that runs. Matching `roundf` made the worst logit disagreement with
+llama.cpp twice as large and cost 9% of the tokens per second.
 
 ## What it costs, and what the cost is OF
 
