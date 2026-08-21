@@ -426,10 +426,15 @@ open, and both are measured rather than untried
     ⚠ The weight layout has NO M term — that reading came from a probe that
     drove every row at once and printed only the first lit word. Holding one row
     live at a time: row 0 alone has byte 8j lighting channel j in BOTH rows, at
-    the same address M = 1 uses, and **row 1 alone lights nothing at all**. So
-    the hardware only ever reads row 0's activation, and that is the whole of
-    what is left. CNA 0x1044, CBUF_CON1, whose only field is DATA_ENTRIES, is
-    emitted as entries per ROW and never multiplied by m.
+    the same address M = 1 uses, and **row 1 alone lights nothing at all**. Row 1
+    IS computed — in the row-0-only baseline its words come back nonzero with its
+    own activation at the zero point — so both output rows are computed from
+    row 0's activation slot and row 1's bytes are never fetched.
+    Three registers wake row 1 up and all three light the right words: `0x1044`
+    (CBUF_CON1's DATA_ENTRIES) set to `surf*m` instead of `surf`, `0x103c` set to
+    `surf*m << 16`, and `0x1078` set to 0, where charsiu emits `rows-1` into a
+    field mesa calls DATA_BURST_LEN. ⚠ Their values all differ and none is the
+    one the reference wants, so all three make row 1 read *something*.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
