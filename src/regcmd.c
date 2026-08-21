@@ -460,7 +460,18 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 * byte. --map lit anyway because it writes raw bytes and does
 		 * not go through here.
 		 */
-		if (mm->k < 32 || mm->k > 256 || (mm->k & 31))
+		/*
+		 * ⚠ THE UPPER BOUND HERE IS MINE, NOT THE HARDWARE'S. 256 was
+		 * the largest K anything had been run at, and K = 256 fails on
+		 * the CHANNEL COUNT rather than the layout, so nothing has ever
+		 * said the layout stops. Round 305 lifts it to 2048, which is
+		 * the K a real projection wants, because round 304 measured what
+		 * the small envelope costs: int4 is 7 to 19 percent faster than
+		 * int8 inside it and a K = 2048 by N = 1024 projection needs
+		 * about 133 jobs against int8's one, which is twelve times
+		 * slower overall.
+		 */
+		if (mm->k < 32 || mm->k > 2048 || (mm->k & 31))
 			return;
 
 		for (n = 0; n < mm->n; n++) {

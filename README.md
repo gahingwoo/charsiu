@@ -259,6 +259,30 @@ went into the board script before the run:
 
 Four for four on the integer reading, zero error.
 
+## What int4 buys, measured
+
+```
+                    int8 us/task   int4 us/task
+K=224 N=160            22.7           18.4        -19%
+K=128 N=160            16.0           14.9        - 7%
+K=224 N= 64            14.7           13.3        -10%
+K=2048 N=1024         201.5          cannot run this shape
+```
+
+⚠ **Not 2x, and the reason is that the envelope never reaches the regime where
+halving the bytes would pay.** At 0.04 MB of weights the achieved bandwidth is
+1.58 GB/s; at 2.10 MB it is 10.41. These shapes are latency bound, not bytes
+bound, so int4's halved weight traffic buys almost nothing.
+
+And the tiling is worse than the per-job number. A `K = 2048 by N = 1024`
+projection is one int8 job at 201.5 us. int4's envelope caps K at 224 with `K/2`
+real k a job, so 2048 needs 19 K-tiles, and N caps at 160, so 1024 needs 7:
+**133 jobs at 18.4 us is 2447 us, twelve times slower than int8.**
+
+⚠ The K ceiling that forces this is **not known to be the hardware's** — 256 is
+simply the largest K anything had been run at, and it fails on the channel count
+rather than the layout.
+
 ## An int4 matmul that computes
 
 **Round 280: `int4 output: 64 of 64 words written, 64 EXACT`.** Every channel,
