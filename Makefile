@@ -27,6 +27,9 @@ $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/charsiu_run: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
+$(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
+
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 

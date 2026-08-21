@@ -452,6 +452,32 @@ struct block_q6_K {
 	uint16_t d;
 };
 
+/* Shared by both paths: q6_K is unpacked to f32 first either way. */
+static void deq_q6_K(const struct block_q6_K *b, float *dst)
+{
+	float d = half_to_float(b->d);
+
+	for (unsigned n = 0; n < 2; n++) {
+		const uint8_t *ql = b->ql + n * 64;
+		const uint8_t *qh = b->qh + n * 32;
+		const int8_t *sc = b->scales + n * 8;
+		float *y = dst + n * 128;
+
+		for (unsigned l = 0; l < 32; l++) {
+			int is = l / 16;
+			int8_t q1 = (int8_t)((ql[l]      & 0xf) | (((qh[l] >> 0) & 3) << 4)) - 32;
+			int8_t q2 = (int8_t)((ql[l + 32] & 0xf) | (((qh[l] >> 2) & 3) << 4)) - 32;
+			int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+			int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+			y[l]      = d * sc[is + 0] * q1;
+			y[l + 32] = d * sc[is + 2] * q2;
+			y[l + 64] = d * sc[is + 4] * q3;
+			y[l + 96] = d * sc[is + 6] * q4;
+		}
+	}
+}
+
 /*
  * The inner loops.
  *
@@ -503,33 +529,39 @@ static float dot_f16(const uint16_t *w, const float *x, uint64_t n)
 	return s;
 }
 
-/* sixteen int8 against sixteen floats, widened rather than dotted */
-static inline float32x4_t fma_i8x16(float32x4_t acc[4], int8x16_t q, const float *x)
-{
-	int16x8_t l = vmovl_s8(vget_low_s8(q));
-	int16x8_t h = vmovl_s8(vget_high_s8(q));
+/*
+ * Sixteen int8 against sixteen floats.
+ *
+ * A macro rather than a function taking float32x4_t acc[4]: an array parameter
+ * is a pointer, so gcc spilled the accumulators to the stack and reloaded them
+ * on every call. That cost q4_0 more than the nibble unpacking did -- it came
+ * out at half of q8_0's tokens per second while reading half the bytes, which
+ * is the wrong way round for a kernel that is supposed to be bandwidth bound.
+ */
+#define FMA_I8X16(a0, a1, a2, a3, q, xp) do {                                  \
+	int16x8_t _l = vmovl_s8(vget_low_s8(q));                               \
+	int16x8_t _h = vmovl_s8(vget_high_s8(q));                              \
+	(a0) = vfmaq_f32((a0), vcvtq_f32_s32(vmovl_s16(vget_low_s16(_l))),  vld1q_f32((xp)));      \
+	(a1) = vfmaq_f32((a1), vcvtq_f32_s32(vmovl_s16(vget_high_s16(_l))), vld1q_f32((xp) + 4));  \
+	(a2) = vfmaq_f32((a2), vcvtq_f32_s32(vmovl_s16(vget_low_s16(_h))),  vld1q_f32((xp) + 8));  \
+	(a3) = vfmaq_f32((a3), vcvtq_f32_s32(vmovl_s16(vget_high_s16(_h))), vld1q_f32((xp) + 12)); \
+} while (0)
 
-	acc[0] = vfmaq_f32(acc[0], vcvtq_f32_s32(vmovl_s16(vget_low_s16(l))),  vld1q_f32(x));
-	acc[1] = vfmaq_f32(acc[1], vcvtq_f32_s32(vmovl_s16(vget_high_s16(l))), vld1q_f32(x + 4));
-	acc[2] = vfmaq_f32(acc[2], vcvtq_f32_s32(vmovl_s16(vget_low_s16(h))),  vld1q_f32(x + 8));
-	acc[3] = vfmaq_f32(acc[3], vcvtq_f32_s32(vmovl_s16(vget_high_s16(h))), vld1q_f32(x + 12));
-	return acc[0];
-}
+#define HSUM4(a0, a1, a2, a3) \
+	vaddvq_f32(vaddq_f32(vaddq_f32((a0), (a1)), vaddq_f32((a2), (a3))))
 
 static float dot_q8_0(const struct block_q8_0 *b, const float *x, uint64_t nb)
 {
 	float s = 0.0f;
 
 	for (uint64_t i = 0; i < nb; i++) {
-		float32x4_t acc[4] = { vdupq_n_f32(0), vdupq_n_f32(0),
-				       vdupq_n_f32(0), vdupq_n_f32(0) };
+		float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+		float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
 
-		fma_i8x16(acc, vld1q_s8(b[i].qs),      x + i * 32);
-		fma_i8x16(acc, vld1q_s8(b[i].qs + 16), x + i * 32 + 16);
+		FMA_I8X16(a0, a1, a2, a3, vld1q_s8(b[i].qs),      x + i * 32);
+		FMA_I8X16(a0, a1, a2, a3, vld1q_s8(b[i].qs + 16), x + i * 32 + 16);
 
-		s += half_to_float(b[i].d) *
-		     vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]),
-					  vaddq_f32(acc[2], acc[3])));
+		s += half_to_float(b[i].d) * HSUM4(a0, a1, a2, a3);
 	}
 	return s;
 }
@@ -541,19 +573,119 @@ static float dot_q4_0(const struct block_q4_0 *b, const float *x, uint64_t nb)
 	float s = 0.0f;
 
 	for (uint64_t i = 0; i < nb; i++) {
-		float32x4_t acc[4] = { vdupq_n_f32(0), vdupq_n_f32(0),
-				       vdupq_n_f32(0), vdupq_n_f32(0) };
+		float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+		float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
 		uint8x16_t p = vld1q_u8(b[i].qs);
+		int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(p, mask)), bias);
+		int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(p, 4)), bias);
 
 		/* the low nibbles are elements 0..15, the high ones 16..31 */
-		fma_i8x16(acc, vsubq_s8(vreinterpretq_s8_u8(vandq_u8(p, mask)), bias),
-			  x + i * 32);
-		fma_i8x16(acc, vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(p, 4)), bias),
-			  x + i * 32 + 16);
+		FMA_I8X16(a0, a1, a2, a3, lo, x + i * 32);
+		FMA_I8X16(a0, a1, a2, a3, hi, x + i * 32 + 16);
 
-		s += half_to_float(b[i].d) *
-		     vaddvq_f32(vaddq_f32(vaddq_f32(acc[0], acc[1]),
-					  vaddq_f32(acc[2], acc[3])));
+		s += half_to_float(b[i].d) * HSUM4(a0, a1, a2, a3);
+	}
+	return s;
+}
+
+static float dot_q4_1(const struct block_q4_1 *b, const float *x, uint64_t nb)
+{
+	const uint8x16_t mask = vdupq_n_u8(0x0f);
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+		float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+		float32x4_t x0 = vdupq_n_f32(0), x1 = vdupq_n_f32(0);
+		uint8x16_t p = vld1q_u8(b[i].qs);
+		const float *xp = x + i * 32;
+
+		/* q4_1 nibbles are unsigned and the offset is a separate term */
+		FMA_I8X16(a0, a1, a2, a3,
+			  vreinterpretq_s8_u8(vandq_u8(p, mask)), xp);
+		FMA_I8X16(a0, a1, a2, a3,
+			  vreinterpretq_s8_u8(vshrq_n_u8(p, 4)), xp + 16);
+
+		for (unsigned j = 0; j < 32; j += 8) {
+			x0 = vaddq_f32(x0, vld1q_f32(xp + j));
+			x1 = vaddq_f32(x1, vld1q_f32(xp + j + 4));
+		}
+
+		s += half_to_float(b[i].d) * HSUM4(a0, a1, a2, a3) +
+		     half_to_float(b[i].m) * vaddvq_f32(vaddq_f32(x0, x1));
+	}
+	return s;
+}
+
+/* one int8x16 against sixteen floats, summed */
+static inline float dot_i8x16_f32(int8x16_t q, const float *x)
+{
+	int16x8_t l = vmovl_s8(vget_low_s8(q));
+	int16x8_t h = vmovl_s8(vget_high_s8(q));
+	float32x4_t a0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(l))),  vld1q_f32(x));
+	float32x4_t a1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(l))), vld1q_f32(x + 4));
+	float32x4_t a2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h))),  vld1q_f32(x + 8));
+	float32x4_t a3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(h))), vld1q_f32(x + 12));
+
+	return HSUM4(a0, a1, a2, a3);
+}
+
+/*
+ * q6_K matters more than its share of the tensor count suggests: llama.cpp
+ * quantises token_embd (and so the tied output head) to q6_K even in a q4_0
+ * file, and at a 128256 vocabulary that one tensor is a fifth of the weights
+ * and the single biggest matmul in a decode step. Leaving it scalar made a
+ * q4_0 model run at HALF a q8_0 model's tokens per second while reading half
+ * the bytes -- backwards for a kernel that should be bandwidth bound, and the
+ * reason to look at the file's actual types rather than its name.
+ *
+ * The dot is folded INTO the unpacking rather than run over a dequantised
+ * buffer: a q6_K scale covers sixteen weights, so sixteen is also the group
+ * this sums over, and the scale multiplies one number at the end of it.
+ */
+static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
+{
+	const uint8x16_t m4 = vdupq_n_u8(0x0f);
+	const uint8x16_t m3 = vdupq_n_u8(0x03);
+	const int8x16_t bias = vdupq_n_s8(32);
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		float d = half_to_float(b[i].d);
+
+		for (unsigned n = 0; n < 2; n++) {
+			const uint8_t *ql = b[i].ql + n * 64;
+			const uint8_t *qh = b[i].qh + n * 32;
+			const int8_t *sc = b[i].scales + n * 8;
+			const float *y = x + i * 256 + n * 128;
+
+			/* g = 0 is l 0..15 and g = 1 is l 16..31, one scale each */
+			for (unsigned g = 0; g < 2; g++) {
+				unsigned l0 = g * 16;
+				uint8x16_t a = vld1q_u8(ql + l0);
+				uint8x16_t c = vld1q_u8(ql + 32 + l0);
+				uint8x16_t hb = vld1q_u8(qh + l0);
+				int8x16_t q1, q2, q3, q4;
+
+				q1 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vandq_u8(a, m4),
+					vshlq_n_u8(vandq_u8(hb, m3), 4))), bias);
+				q2 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vandq_u8(c, m4),
+					vshlq_n_u8(vandq_u8(vshrq_n_u8(hb, 2), m3), 4))), bias);
+				q3 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vshrq_n_u8(a, 4),
+					vshlq_n_u8(vandq_u8(vshrq_n_u8(hb, 4), m3), 4))), bias);
+				q4 = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vshrq_n_u8(c, 4),
+					vshlq_n_u8(vandq_u8(vshrq_n_u8(hb, 6), m3), 4))), bias);
+
+				s += d * (float)sc[g]     * dot_i8x16_f32(q1, y + l0);
+				s += d * (float)sc[g + 2] * dot_i8x16_f32(q2, y + 32 + l0);
+				s += d * (float)sc[g + 4] * dot_i8x16_f32(q3, y + 64 + l0);
+				s += d * (float)sc[g + 6] * dot_i8x16_f32(q4, y + 96 + l0);
+			}
+		}
 	}
 	return s;
 }
@@ -614,8 +746,6 @@ static float dot_q4_0(const struct block_q4_0 *b, const float *x, uint64_t nb)
 	return s;
 }
 
-#endif
-
 static float dot_q4_1(const struct block_q4_1 *b, const float *x, uint64_t nb)
 {
 	float s = 0.0f;
@@ -635,31 +765,6 @@ static float dot_q4_1(const struct block_q4_1 *b, const float *x, uint64_t nb)
 	return s;
 }
 
-static void deq_q6_K(const struct block_q6_K *b, float *dst)
-{
-	float d = half_to_float(b->d);
-
-	for (unsigned n = 0; n < 2; n++) {
-		const uint8_t *ql = b->ql + n * 64;
-		const uint8_t *qh = b->qh + n * 32;
-		const int8_t *sc = b->scales + n * 8;
-		float *y = dst + n * 128;
-
-		for (unsigned l = 0; l < 32; l++) {
-			int is = l / 16;
-			int8_t q1 = (int8_t)((ql[l]      & 0xf) | (((qh[l] >> 0) & 3) << 4)) - 32;
-			int8_t q2 = (int8_t)((ql[l + 32] & 0xf) | (((qh[l] >> 2) & 3) << 4)) - 32;
-			int8_t q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
-			int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
-
-			y[l]      = d * sc[is + 0] * q1;
-			y[l + 32] = d * sc[is + 2] * q2;
-			y[l + 64] = d * sc[is + 4] * q3;
-			y[l + 96] = d * sc[is + 6] * q4;
-		}
-	}
-}
-
 static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 {
 	float s = 0.0f;
@@ -677,6 +782,8 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 	}
 	return s;
 }
+
+#endif
 
 void gguf_matvec(const struct gguf_tensor *w, const float *x, float *y,
 		 uint64_t row0, uint64_t nrows)

@@ -288,11 +288,25 @@ int main(int argc, char **argv)
 
 	{
 		double t_gen = now_ms() - t0;
+		long hwm = 0;
+		FILE *st = fopen("/proc/self/status", "r");
+
+		if (st) {
+			char line[256];
+
+			while (fgets(line, sizeof(line), st))
+				if (!strncmp(line, "VmHWM:", 6)) {
+					hwm = strtol(line + 6, NULL, 10);
+					break;
+				}
+			fclose(st);
+		}
 
 		printf("\n\n[load %.0f ms | prompt %d tok in %.0f ms, %.2f tok/s"
-		       " | gen %d tok in %.0f ms, %.2f tok/s]\n",
+		       " | gen %d tok in %.0f ms, %.2f tok/s | peak %ld MB]\n",
 		       t_load, n_ids, t_prompt, n_ids * 1000.0 / (t_prompt ? t_prompt : 1),
-		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1));
+		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1),
+		       hwm / 1024);
 	}
 
 	llama_state_free(st);
