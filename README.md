@@ -274,14 +274,27 @@ halving the bytes would pay.** At 0.04 MB of weights the achieved bandwidth is
 1.58 GB/s; at 2.10 MB it is 10.41. These shapes are latency bound, not bytes
 bound, so int4's halved weight traffic buys almost nothing.
 
-And the tiling is worse than the per-job number. A `K = 2048 by N = 1024`
-projection is one int8 job at 201.5 us. int4's envelope caps K at 224 with `K/2`
-real k a job, so 2048 needs 19 K-tiles, and N caps at 160, so 1024 needs 7:
-**133 jobs at 18.4 us is 2447 us, twelve times slower than int8.**
+⚠ **The twelve-times figure that first followed from that was wrong, and the K
+ceiling was charsiu's own guard.** The layout works at every K tried up to 2048:
+288, 384, 512, 1024 and 2048 all give `wrote 40 of 64, exact 32` at N = 64, and
+K = 512 at N = 16 is 16 of 16. `exact` is `N/2` at all of them, independent of K
+— a working half-width job, not a failure. Benched at K = 512, N = 64: int8 24.6
+us against int4 16.7, **int4 by 32%**.
 
-⚠ The K ceiling that forces this is **not known to be the hardware's** — 256 is
-simply the largest K anything had been run at, and it fails on the channel count
-rather than the layout.
+So the arithmetic is per job. An int4 job at a declared `K` and `N` gives `K/2`
+real k a channel and `N/2` usable channels:
+
+```
+int4   NK/4 MACs for NK/8 weight bytes fetched   2 MACs a byte
+int8   NK   MACs for NK   bytes                  1 MAC  a byte
+```
+
+int4 really is twice the work per byte, which is what a 4-bit weight should buy.
+It pays in **jobs**: four times as many for the same work, each with a fixed
+cost. Whether the 2x survives that turns on one thing — how big a job can be,
+which is the largest N at a large K. At `N = 1024, K = 2048` it would be four
+int4 jobs of 262 kB against one int8 job of 2 MB at 201.5 us, or about 164 us
+against 201; if N caps at 64 it is 64 jobs and an order of magnitude worse.
 
 ## An int4 matmul that computes
 
