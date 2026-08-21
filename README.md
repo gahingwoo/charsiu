@@ -204,6 +204,30 @@ recorded before the change. `tests/qact_control.py` measures what the approximat
 without needing any reference implementation — q4_0 moves a logit by at most 0.055 with 48
 greedy tokens unchanged, q8_0 by at most 0.103.
 
+### What a file's name does not tell you, twice
+
+The comparison "q4_0 against q8_0" was never a bytes-against-bytes comparison, and it took
+two board rounds to see why. llama.cpp quantises `token_embd` to **q6_K** in a q4_0 file
+and to **q8_0** in a q8_0 file. Llama 3.2 ties the output head to that tensor, and at a
+128256 vocabulary it is a fifth of the weights — so the two files differ in the format of
+their single largest matmul, and q6_K costs far more arithmetic per byte than q8_0 does.
+
+A third file, built with `llama-quantize --pure`, holds one format all the way through.
+Host, 4 threads:
+
+| | q4_0 (q6_K head) | q4_0 `--pure` | q8_0 |
+|---|---|---|---|
+| tok/s | 35.29 | **40.70** | 34.43 |
+
+The head alone was worth 15%. With it gone the crossover disappears — pure q4_0 leads at
+every thread count, by more as threads are added (t=1 21.67/21.45, t=2 34.26/32.92,
+t=4 40.70/34.74, t=8 31.73/30.41, pure against q8_0), which is what bytes mattering more
+per core looks like.
+
+The `--pure` file is **an instrument, not a good model**: it was requantised from the q8_0
+file, so it is quantised twice, and its output head is 4 bit. It holds one variable still.
+Its text is only ever compared against itself.
+
 One detail worth writing down: ggml's **reference C** quantises with `roundf`, ties away
 from zero, but its **ARM path** uses `vcvtnq_s32_f32`, which is ties to even, and the ARM
 path is the one that runs. Matching `roundf` made the worst logit disagreement with
