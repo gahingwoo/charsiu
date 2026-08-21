@@ -82,15 +82,47 @@ const struct gguf_tensor *gguf_tensor(const struct gguf *g, const char *name);
 const char *ggml_type_name(uint32_t type);
 
 /*
+ * The activation vector, in both the forms a weight type might want it.
+ *
+ * `f` is always the f32 original. `q`/`d` are the same vector quantised to
+ * signed int8 in blocks of 32 with a scale each, which is what lets a
+ * quantised weight be multiplied WITHOUT converting every weight to a float
+ * first: the whole dot product becomes integer, and one multiply at the end of
+ * a block puts it back on scale.
+ *
+ * The quantisation happens ONCE per matvec and is shared by every row and
+ * every thread, so its cost is amortised over N rows.
+ *
+ * This is also the shape the NPU wants -- charsiu_job carries an
+ * input_scale and an input_zero_point for exactly this -- so the CPU path and
+ * the NPU path can take the same operand.
+ */
+struct charsiu_act {
+	const float *f;      /* the f32 original, always valid */
+	int n;
+	int nb;              /* blocks of 32, n rounded up */
+	int8_t *q;           /* nb * 32 */
+	float *d;            /* nb scales */
+	float *bs;           /* nb block sums of f, for the types with an offset */
+	int quantised;
+};
+
+/* `max_n` is the widest vector this will ever hold: one allocation serves
+ * every matvec in a model. */
+int  charsiu_act_alloc(struct charsiu_act *a, int max_n);
+void charsiu_act_free(struct charsiu_act *a);
+/* Fill q/d/bs from x[0..n). Skipped when CHARSIU_NO_QACT is set: the control. */
+void charsiu_act_set(struct charsiu_act *a, const float *x, int n);
+
+/*
  * The one primitive the whole model is built out of: y[row] = dot(W[row], x).
- * W is [ne[1] rows][ne[0] columns] and x has ne[0] elements. Every quantised
- * type is dequantised inside the inner loop, which is what llama.cpp does too.
+ * W is [ne[1] rows][ne[0] columns] and x has ne[0] elements.
  *
  * This is EXACTLY the operation step 2 replaces with charsiu_emit_job(), so
  * keeping every model matmul behind this one call is deliberate.
  */
-void gguf_matvec(const struct gguf_tensor *w, const float *x, float *y,
-		 uint64_t row0, uint64_t nrows);
+void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
+		 float *y, uint64_t row0, uint64_t nrows);
 
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */
 void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst);
@@ -166,6 +198,8 @@ struct llama_state {
 	float *k, *v;          /* n_head_kv * head_dim */
 	float *att;            /* n_head * n_ctx */
 	float *logits;         /* n_vocab */
+
+	struct charsiu_act act; /* the activation, quantised once per matvec */
 };
 
 int  llama_load(struct llama_model *m, const char *path);

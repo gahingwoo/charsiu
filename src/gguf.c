@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -785,11 +786,366 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 
 #endif
 
-void gguf_matvec(const struct gguf_tensor *w, const float *x, float *y,
-		 uint64_t row0, uint64_t nrows)
+/* ---- the activation, quantised once per matvec --------------------------- */
+
+/*
+ * Converting every WEIGHT to a float to multiply it by a float activation is
+ * the expensive way round: there are N*K weights and only K activations. Quantise
+ * the activation once instead and the dot product becomes integer, with one
+ * multiply per 32 element block to put it back on scale.
+ *
+ * This is what makes llama.cpp roughly two and a half times faster than the
+ * f32 path here, and it is also the operand shape the NPU wants, so the CPU
+ * fallback and the NPU job can be fed from the same buffer.
+ *
+ * It is an APPROXIMATION and the exact path is kept: CHARSIU_NO_QACT restores
+ * it, and that is the control.
+ */
+int charsiu_act_alloc(struct charsiu_act *a, int max_n)
+{
+	int nb = (max_n + 31) / 32;
+
+	memset(a, 0, sizeof(*a));
+	a->q = calloc((size_t)nb * 32, 1);
+	a->d = calloc((size_t)nb, sizeof(float));
+	a->bs = calloc((size_t)nb, sizeof(float));
+	if (!a->q || !a->d || !a->bs) {
+		charsiu_act_free(a);
+		return -1;
+	}
+	return 0;
+}
+
+void charsiu_act_free(struct charsiu_act *a)
+{
+	free(a->q);
+	free(a->d);
+	free(a->bs);
+	memset(a, 0, sizeof(*a));
+}
+
+void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
+{
+	static int off = -1;
+
+	if (off < 0) {
+		const char *e = getenv("CHARSIU_NO_QACT");
+
+		off = e && *e != '0';
+	}
+
+	a->f = x;
+	a->n = n;
+	a->nb = (n + 31) / 32;
+	if (off || !a->q) {
+		a->quantised = 0;
+		return;
+	}
+
+	for (int i = 0; i < a->nb; i++) {
+		int base = i * 32;
+		float amax = 0.0f, sum = 0.0f, d, id;
+
+		for (int j = 0; j < 32; j++) {
+			float v = base + j < n ? x[base + j] : 0.0f;
+			float av = v < 0.0f ? -v : v;
+
+			if (av > amax)
+				amax = av;
+			sum += v;
+		}
+		d = amax / 127.0f;
+		id = d != 0.0f ? 1.0f / d : 0.0f;
+		a->d[i] = d;
+		a->bs[i] = sum;
+		for (int j = 0; j < 32; j++) {
+			float v = base + j < n ? x[base + j] : 0.0f;
+
+			/*
+			 * lrintf, not roundf. ggml's REFERENCE C uses roundf
+			 * (ties away from zero) but its ARM path quantises with
+			 * vcvtnq_s32_f32, which is ties to EVEN, and the ARM
+			 * path is the one that runs. Matching roundf here made
+			 * the worst logit disagreement with it twice as large
+			 * and cost 9% of the tokens per second.
+			 */
+			a->q[base + j] = (int8_t)lrintf(v * id);
+		}
+	}
+	a->quantised = 1;
+}
+
+/* ---- integer dot products ------------------------------------------------ */
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+
+/* No SDOT on an ARMv8.0 core, so widen and pairwise accumulate. int8 by int8
+ * is at most 16129, which an int16 lane holds, and 32 of those an int32. */
+static inline int32x4_t iacc16(int32x4_t acc, int8x16_t w, int8x16_t x)
+{
+	acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w),  vget_low_s8(x)));
+	acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w), vget_high_s8(x)));
+	return acc;
+}
+
+static inline int32_t idot16(int8x16_t w, const int8_t *x)
+{
+	return vaddvq_s32(iacc16(vdupq_n_s32(0), w, vld1q_s8(x)));
+}
+
+static inline int32_t idot32(const int8_t *w, const int8_t *x)
+{
+	int32x4_t acc = vdupq_n_s32(0);
+
+	acc = iacc16(acc, vld1q_s8(w), vld1q_s8(x));
+	acc = iacc16(acc, vld1q_s8(w + 16), vld1q_s8(x + 16));
+	return vaddvq_s32(acc);
+}
+
+static inline void q4_0_nibbles(const uint8_t *qs, int8x16_t *lo, int8x16_t *hi)
+{
+	const uint8x16_t m4 = vdupq_n_u8(0x0f);
+	const int8x16_t eight = vdupq_n_s8(8);
+	uint8x16_t p = vld1q_u8(qs);
+
+	*lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(p, m4)), eight);
+	*hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(p, 4)), eight);
+}
+
+static float dotq_q4_0(const struct block_q4_0 *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		int8x16_t lo, hi;
+		int32x4_t acc = vdupq_n_s32(0);
+
+		q4_0_nibbles(b[i].qs, &lo, &hi);
+		acc = iacc16(acc, lo, vld1q_s8(a->q + i * 32));
+		acc = iacc16(acc, hi, vld1q_s8(a->q + i * 32 + 16));
+		s += half_to_float(b[i].d) * a->d[i] * (float)vaddvq_s32(acc);
+	}
+	return s;
+}
+
+static float dotq_q4_1(const struct block_q4_1 *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	const uint8x16_t m4 = vdupq_n_u8(0x0f);
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		uint8x16_t p = vld1q_u8(b[i].qs);
+		int32x4_t acc = vdupq_n_s32(0);
+
+		acc = iacc16(acc, vreinterpretq_s8_u8(vandq_u8(p, m4)),
+			     vld1q_s8(a->q + i * 32));
+		acc = iacc16(acc, vreinterpretq_s8_u8(vshrq_n_u8(p, 4)),
+			     vld1q_s8(a->q + i * 32 + 16));
+		s += half_to_float(b[i].d) * a->d[i] * (float)vaddvq_s32(acc) +
+		     half_to_float(b[i].m) * a->bs[i];
+	}
+	return s;
+}
+
+static float dotq_q8_0(const struct block_q8_0 *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++)
+		s += half_to_float(b[i].d) * a->d[i] *
+		     (float)idot32(b[i].qs, a->q + i * 32);
+	return s;
+}
+
+/*
+ * A q6_K scale covers sixteen weights and an activation block covers
+ * thirty-two, so a sixteen run is always one half of one activation block and
+ * the two scales multiply out to a single float at the end of it.
+ */
+static float dotq_q6_K(const struct block_q6_K *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	const uint8x16_t m4 = vdupq_n_u8(0x0f);
+	const uint8x16_t m3 = vdupq_n_u8(0x03);
+	const int8x16_t bias = vdupq_n_s8(32);
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		float d = half_to_float(b[i].d);
+
+		for (unsigned n = 0; n < 2; n++) {
+			const uint8_t *ql = b[i].ql + n * 64;
+			const uint8_t *qh = b[i].qh + n * 32;
+			const int8_t *sc = b[i].scales + n * 8;
+			const int8_t *xq = a->q + i * 256 + n * 128;
+			const float *xd = a->d + i * 8 + n * 4;
+
+			for (unsigned g = 0; g < 2; g++) {
+				unsigned l0 = g * 16;
+				uint8x16_t p0 = vld1q_u8(ql + l0);
+				uint8x16_t p1 = vld1q_u8(ql + 32 + l0);
+				uint8x16_t hb = vld1q_u8(qh + l0);
+				int8x16_t q[4];
+
+				q[0] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vandq_u8(p0, m4),
+					vshlq_n_u8(vandq_u8(hb, m3), 4))), bias);
+				q[1] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vandq_u8(p1, m4),
+					vshlq_n_u8(vandq_u8(vshrq_n_u8(hb, 2), m3), 4))), bias);
+				q[2] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vshrq_n_u8(p0, 4),
+					vshlq_n_u8(vandq_u8(vshrq_n_u8(hb, 4), m3), 4))), bias);
+				q[3] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(
+					vshrq_n_u8(p1, 4),
+					vshlq_n_u8(vandq_u8(vshrq_n_u8(hb, 6), m3), 4))), bias);
+
+				for (unsigned t = 0; t < 4; t++)
+					s += d * (float)sc[g + 2 * t] * xd[t] *
+					     (float)idot16(q[t], xq + t * 32 + l0);
+			}
+		}
+	}
+	return s;
+}
+
+#else /* the portable integer kernels */
+
+static inline int32_t idot_n(const int8_t *w, const int8_t *x, int n)
+{
+	int32_t t = 0;
+
+	for (int j = 0; j < n; j++)
+		t += (int32_t)w[j] * (int32_t)x[j];
+	return t;
+}
+
+static float dotq_q4_0(const struct block_q4_0 *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		const int8_t *x = a->q + i * 32;
+		int32_t t = 0;
+
+		for (unsigned j = 0; j < 16; j++) {
+			t += (int32_t)((b[i].qs[j] & 0x0f) - 8) * x[j];
+			t += (int32_t)((b[i].qs[j] >> 4) - 8) * x[j + 16];
+		}
+		s += half_to_float(b[i].d) * a->d[i] * (float)t;
+	}
+	return s;
+}
+
+static float dotq_q4_1(const struct block_q4_1 *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		const int8_t *x = a->q + i * 32;
+		int32_t t = 0;
+
+		for (unsigned j = 0; j < 16; j++) {
+			t += (int32_t)(b[i].qs[j] & 0x0f) * x[j];
+			t += (int32_t)(b[i].qs[j] >> 4) * x[j + 16];
+		}
+		s += half_to_float(b[i].d) * a->d[i] * (float)t +
+		     half_to_float(b[i].m) * a->bs[i];
+	}
+	return s;
+}
+
+static float dotq_q8_0(const struct block_q8_0 *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++)
+		s += half_to_float(b[i].d) * a->d[i] *
+		     (float)idot_n(b[i].qs, a->q + i * 32, 32);
+	return s;
+}
+
+static float dotq_q6_K(const struct block_q6_K *b, const struct charsiu_act *a,
+		       uint64_t nb)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < nb; i++) {
+		float d = half_to_float(b[i].d);
+
+		for (unsigned n = 0; n < 2; n++) {
+			const uint8_t *ql = b[i].ql + n * 64;
+			const uint8_t *qh = b[i].qh + n * 32;
+			const int8_t *sc = b[i].scales + n * 8;
+			const int8_t *xq = a->q + i * 256 + n * 128;
+			const float *xd = a->d + i * 8 + n * 4;
+
+			for (unsigned g = 0; g < 2; g++) {
+				int32_t t[4] = { 0, 0, 0, 0 };
+
+				for (unsigned j = 0; j < 16; j++) {
+					unsigned l = g * 16 + j;
+					int q1 = (int8_t)((ql[l]      & 0xf) | (((qh[l] >> 0) & 3) << 4)) - 32;
+					int q2 = (int8_t)((ql[l + 32] & 0xf) | (((qh[l] >> 2) & 3) << 4)) - 32;
+					int q3 = (int8_t)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+					int q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+					t[0] += q1 * xq[0 * 32 + l];
+					t[1] += q2 * xq[1 * 32 + l];
+					t[2] += q3 * xq[2 * 32 + l];
+					t[3] += q4 * xq[3 * 32 + l];
+				}
+				for (unsigned k = 0; k < 4; k++)
+					s += d * (float)sc[g + 2 * k] * xd[k] * (float)t[k];
+			}
+		}
+	}
+	return s;
+}
+
+#endif
+
+void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
+		 float *y, uint64_t row0, uint64_t nrows)
 {
 	uint64_t nc = w->ne[0];
 	const uint8_t *base = w->data;
+	const float *x = a->f;
+
+	/*
+	 * A quantised weight meets the quantised activation and the dot product
+	 * is integer. A float weight does not: quantising the activation for it
+	 * would lose accuracy and buy nothing, since the weight has to be read
+	 * as a float either way.
+	 */
+	if (a->quantised) {
+		switch (w->type) {
+		case GGML_Q8_0:
+			for (uint64_t r = 0; r < nrows; r++)
+				y[row0 + r] = dotq_q8_0((const struct block_q8_0 *)(base + (row0 + r) * nc / 32 * 34), a, nc / 32);
+			return;
+		case GGML_Q4_0:
+			for (uint64_t r = 0; r < nrows; r++)
+				y[row0 + r] = dotq_q4_0((const struct block_q4_0 *)(base + (row0 + r) * nc / 32 * 18), a, nc / 32);
+			return;
+		case GGML_Q4_1:
+			for (uint64_t r = 0; r < nrows; r++)
+				y[row0 + r] = dotq_q4_1((const struct block_q4_1 *)(base + (row0 + r) * nc / 32 * 20), a, nc / 32);
+			return;
+		case GGML_Q6_K:
+			for (uint64_t r = 0; r < nrows; r++)
+				y[row0 + r] = dotq_q6_K((const struct block_q6_K *)(base + (row0 + r) * nc / 256 * 210), a, nc / 256);
+			return;
+		default:
+			break;
+		}
+	}
 
 	switch (w->type) {
 	case GGML_F32:

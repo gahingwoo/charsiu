@@ -32,7 +32,7 @@ struct pool {
 	int gen, done, stop;
 
 	const struct gguf_tensor *w;
-	const float *x;
+	const struct charsiu_act *a;
 	float *y;
 	uint64_t nrows;
 };
@@ -63,7 +63,7 @@ static void *worker(void *arg)
 		if (n > per)
 			n = per;
 		if (n)
-			gguf_matvec(g_pool.w, g_pool.x, g_pool.y, r0, n);
+			gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
 
 		pthread_mutex_lock(&g_pool.mu);
 		if (++g_pool.done == g_pool.n)
@@ -97,17 +97,45 @@ static void pool_start(int nthreads)
 		pthread_create(&g_pool.th[i], NULL, worker, (void *)i);
 }
 
-/* y = W x, over all of W's rows. */
-static void matvec(const struct gguf_tensor *w, const float *x, float *y)
+static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
+			 float *y);
+
+/*
+ * y = W x, over all of W's rows.
+ *
+ * The activation is quantised ONCE here, before the fan out, so its cost is
+ * paid per matvec rather than per row and every thread reads the same buffer.
+ */
+static void matvec(struct llama_state *s, const struct gguf_tensor *w,
+		   const float *x, float *y)
 {
+	charsiu_act_set(&s->act, x, (int)w->ne[0]);
+	matvec_again(s, w, y);
+}
+
+/*
+ * The same, for a weight that multiplies the activation the PREVIOUS call just
+ * quantised. Q, K and V all read one RMSNorm output, and so do gate and up, so
+ * six of the nine quantisations in a layer are of a vector already done.
+ *
+ * Only valid directly after matvec() on the same x, which is why it is a
+ * separate name rather than a cache keyed on a pointer: the buffer is reused
+ * between the attention and the feed forward halves, so pointer equality would
+ * be wrong in exactly the place it looks right.
+ */
+static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
+			 float *y)
+{
+	struct charsiu_act *a = &s->act;
+
 	if (g_pool.n <= 1) {
-		gguf_matvec(w, x, y, 0, w->ne[1]);
+		gguf_matvec(w, a, y, 0, w->ne[1]);
 		return;
 	}
 
 	pthread_mutex_lock(&g_pool.mu);
 	g_pool.w = w;
-	g_pool.x = x;
+	g_pool.a = a;
 	g_pool.y = y;
 	g_pool.nrows = w->ne[1];
 	g_pool.done = 0;
@@ -353,6 +381,15 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->att = calloc((size_t)m->n_head * s->n_ctx, sizeof(float));
 	s->logits = calloc(m->n_vocab, sizeof(float));
 
+	{
+		uint32_t widest = m->n_embd > m->n_ff ? m->n_embd : m->n_ff;
+
+		if (charsiu_act_alloc(&s->act, (int)widest) < 0) {
+			llama_state_free(s);
+			return NULL;
+		}
+	}
+
 	if (!s->kcache || !s->vcache || !s->x || !s->xb || !s->xb2 || !s->hb ||
 	    !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits) {
 		llama_state_free(s);
@@ -372,6 +409,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->hb); free(s->hb2);
 	free(s->q); free(s->k); free(s->v);
 	free(s->att); free(s->logits);
+	charsiu_act_free(&s->act);
 	free(s);
 }
 
@@ -406,9 +444,9 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 
-		matvec(L->wq, s->xb, s->q);
-		matvec(L->wk, s->xb, s->k);
-		matvec(L->wv, s->xb, s->v);
+		matvec(s, L->wq, s->xb, s->q);
+		matvec_again(s, L->wk, s->k);
+		matvec_again(s, L->wv, s->v);
 
 		rope(s->q, m->n_head, hd, pos, m->rope_base, freqf);
 		rope(s->k, m->n_head_kv, hd, pos, m->rope_base, freqf);
@@ -444,26 +482,26 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			}
 		}
 
-		matvec(L->wo, s->xb, s->xb2);
+		matvec(s, L->wo, s->xb, s->xb2);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
 
 		rmsnorm(s->xb, s->x, L->ffn_norm, m->n_embd, m->rms_eps);
-		matvec(L->gate, s->xb, s->hb);
-		matvec(L->up, s->xb, s->hb2);
+		matvec(s, L->gate, s->xb, s->hb);
+		matvec_again(s, L->up, s->hb2);
 		for (uint32_t i = 0; i < m->n_ff; i++) {
 			float g = s->hb[i];
 
 			g *= 1.0f / (1.0f + expf(-g));       /* SiLU */
 			s->hb[i] = g * s->hb2[i];
 		}
-		matvec(L->down, s->hb, s->xb2);
+		matvec(s, L->down, s->hb, s->xb2);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
 	}
 
 	rmsnorm(s->xb, s->x, m->out_norm, m->n_embd, m->rms_eps);
-	matvec(m->output, s->xb, s->logits);
+	matvec(s, m->output, s->xb, s->logits);
 
 	s->pos = pos + 1;
 	return s->logits;
