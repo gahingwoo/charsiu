@@ -563,9 +563,27 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * on, which exists only when K is 64. Each carries 16
 			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
 			 */
-			for (half = 0; half < (mm->k > 32 ? 2u : 1u); half++) {
-				/* four slots on, which is half a block */
-				size_t gb = row + (size_t)half * 4 * mm->k;
+			/*
+			 * ⚠ THE GROUP COUNT IS K/32 AND THE SPACING IS A
+			 * CONSTANT 256, and both were K = 64 coincidences.
+			 *
+			 * Round 298 swept K = 128 and the group bases landed
+			 * exactly where 8*K predicted, so the block stride does
+			 * scale. What did not was the rest: channel 0 is fed by
+			 * FOUR eight byte runs there, at 0, 256, 512 and 768,
+			 * where K = 64 has two at 0 and 256.
+			 *
+			 * The old code wrote half * 4 * K for the second run's
+			 * offset, and 4*K is 256 exactly when K is 64. That is
+			 * the same trap as 8*K against wbytes/4 in round 284: an
+			 * expression fitted at the one K everything was measured
+			 * at. The spacing is 256 at both K and the COUNT is what
+			 * scales, K/32, which is 1, 2 and 4 at K of 32, 64 and
+			 * 128, and matches the K/2 k per channel already known.
+			 */
+			for (half = 0; half < (mm->k / 32 ? mm->k / 32 : 1u);
+			     half++) {
+				size_t gb = row + (size_t)half * 256;
 				unsigned j;
 
 				for (j = 0; j < 16; j++) {

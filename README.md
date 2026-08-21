@@ -448,13 +448,14 @@ open, and both are measured rather than untried
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
     12-15 and 20-23 into them. Both match the mismatch lists exactly. Measured at
     two N, no rule written.
-  ⚠ K is the one that blocks the goal. Every int4 measurement here is at K = 32
-    or 64 and a projection in a small model is K = 2048 by N = 1024. The
-    skeleton is K independent everywhere it has been checked — the slot table
-    reproduces both K and only the block stride 8*K and the k+ offset 4*K scale
-    — so 128 and 256 are allowed as a prediction and refused above that.
-    charsiu_bench has no int4 path at all, so "what does int4 buy" cannot be
-    asked yet.
+  ⚠ K blocks the goal: a projection in a small model is K = 2048 by N = 1024 and
+    every int4 measurement was at 32 or 64. K = 128 swept clean — group bases
+    0, 128, 1024, 1152, 2048, 2176, 3072, 3136, which is 8*K exactly — so the
+    block stride scales. The GROUP COUNT was another K = 64 coincidence: a
+    channel is fed by K/32 runs of eight bytes spaced a constant 256, which is
+    1, 2 and 4 at K of 32, 64 and 128, and the packer wrote two at an offset of
+    4*K, which equals 256 only when K is 64. charsiu_bench has no int4 path, so
+    "what does int4 buy" still cannot be asked.
 ```
 
 ### "Half the k" is not half the weights
