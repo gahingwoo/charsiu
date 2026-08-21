@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com> */
+
+/*
+ * The decode loop, on the CPU, in f32.
+ *
+ * Nothing here is fast and nothing here is meant to be. It is the reference:
+ * the sequence of tokens this produces is what a version with the NPU under
+ * the projections has to reproduce exactly, and the intermediate tensors are
+ * what a disagreement is bisected against.
+ *
+ * Every matmul goes through gguf_matvec(), one call per weight tensor, so
+ * there is exactly one place to change when a projection moves to the NPU.
+ */
+
+#include <math.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "charsiu_llm.h"
+
+/* ---- a fixed pool, so a token is not 144 thread creations ---------------- */
+
+struct pool {
+	int n;
+	pthread_t *th;
+	pthread_mutex_t mu;
+	pthread_cond_t cv_work, cv_done;
+	int gen, done, stop;
+
+	const struct gguf_tensor *w;
+	const float *x;
+	float *y;
+	uint64_t nrows;
+};
+
+static struct pool g_pool;
+
+static void *worker(void *arg)
+{
+	long id = (long)arg;
+	int mygen = 0;
+
+	for (;;) {
+		uint64_t per, r0, n;
+
+		pthread_mutex_lock(&g_pool.mu);
+		while (g_pool.gen == mygen && !g_pool.stop)
+			pthread_cond_wait(&g_pool.cv_work, &g_pool.mu);
+		if (g_pool.stop) {
+			pthread_mutex_unlock(&g_pool.mu);
+			return NULL;
+		}
+		mygen = g_pool.gen;
+		pthread_mutex_unlock(&g_pool.mu);
+
+		per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
+		r0 = per * (uint64_t)id;
+		n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
+		if (n > per)
+			n = per;
+		if (n)
+			gguf_matvec(g_pool.w, g_pool.x, g_pool.y, r0, n);
+
+		pthread_mutex_lock(&g_pool.mu);
+		if (++g_pool.done == g_pool.n)
+			pthread_cond_signal(&g_pool.cv_done);
+		pthread_mutex_unlock(&g_pool.mu);
+	}
+}
+
+static void pool_start(int nthreads)
+{
+	const char *env = getenv("CHARSIU_THREADS");
+
+	if (g_pool.n)
+		return;
+	if (nthreads < 1 && env)
+		nthreads = atoi(env);
+	if (nthreads < 1) {
+		long c = sysconf(_SC_NPROCESSORS_ONLN);
+
+		nthreads = c > 0 ? (int)c : 1;
+	}
+	g_pool.n = nthreads;
+	if (nthreads == 1)
+		return;
+
+	pthread_mutex_init(&g_pool.mu, NULL);
+	pthread_cond_init(&g_pool.cv_work, NULL);
+	pthread_cond_init(&g_pool.cv_done, NULL);
+	g_pool.th = calloc((size_t)nthreads, sizeof(*g_pool.th));
+	for (long i = 0; i < nthreads; i++)
+		pthread_create(&g_pool.th[i], NULL, worker, (void *)i);
+}
+
+/* y = W x, over all of W's rows. */
+static void matvec(const struct gguf_tensor *w, const float *x, float *y)
+{
+	if (g_pool.n <= 1) {
+		gguf_matvec(w, x, y, 0, w->ne[1]);
+		return;
+	}
+
+	pthread_mutex_lock(&g_pool.mu);
+	g_pool.w = w;
+	g_pool.x = x;
+	g_pool.y = y;
+	g_pool.nrows = w->ne[1];
+	g_pool.done = 0;
+	g_pool.gen++;
+	pthread_cond_broadcast(&g_pool.cv_work);
+	while (g_pool.done < g_pool.n)
+		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
+	pthread_mutex_unlock(&g_pool.mu);
+}
+
+/* ---- the small pieces ---------------------------------------------------- */
+
+static void rmsnorm(float *out, const float *x, const struct gguf_tensor *g,
+		    uint32_t n, float eps)
+{
+	float ss = 0.0f, scale;
+	float gw[1];
+
+	(void)gw;
+	for (uint32_t i = 0; i < n; i++)
+		ss += x[i] * x[i];
+	scale = 1.0f / sqrtf(ss / (float)n + eps);
+
+	/*
+	 * The gain is one row of a tensor, and it is f32 in every file seen so
+	 * far. Read it through gguf_row_f32 anyway rather than assuming.
+	 */
+	{
+		static float *buf;
+		static uint32_t bufn;
+
+		if (bufn < n) {
+			buf = realloc(buf, n * sizeof(float));
+			bufn = n;
+		}
+		gguf_row_f32(g, 0, buf);
+		for (uint32_t i = 0; i < n; i++)
+			out[i] = x[i] * scale * buf[i];
+	}
+}
+
+static void softmax(float *x, int n)
+{
+	float mx = x[0], sum = 0.0f;
+
+	for (int i = 1; i < n; i++)
+		if (x[i] > mx)
+			mx = x[i];
+	for (int i = 0; i < n; i++) {
+		x[i] = expf(x[i] - mx);
+		sum += x[i];
+	}
+	for (int i = 0; i < n; i++)
+		x[i] /= sum;
+}
+
+/*
+ * RoPE, the interleaved form: element 2i and element 2i+1 of a head are one
+ * complex number. llama.cpp's convert step permutes Q and K so this is the
+ * right pairing for a gguf, even though the HF checkpoint it came from pairs
+ * i with i + d/2 instead.
+ */
+static void rope(float *v, uint32_t nheads, uint32_t hd, int pos,
+		 float base, const float *freq_factors)
+{
+	for (uint32_t h = 0; h < nheads; h++) {
+		float *p = v + h * hd;
+
+		for (uint32_t i = 0; i < hd / 2; i++) {
+			float theta = (float)pos * powf(base, -2.0f * (float)i / (float)hd);
+			float c, s, x0, x1;
+
+			if (freq_factors)
+				theta /= freq_factors[i];
+			c = cosf(theta);
+			s = sinf(theta);
+			x0 = p[2 * i];
+			x1 = p[2 * i + 1];
+			p[2 * i]     = x0 * c - x1 * s;
+			p[2 * i + 1] = x0 * s + x1 * c;
+		}
+	}
+}
+
+/* ---- load ---------------------------------------------------------------- */
+
+static const struct gguf_tensor *need(const struct gguf *g, const char *name)
+{
+	const struct gguf_tensor *t = gguf_tensor(g, name);
+
+	if (!t)
+		fprintf(stderr, "llama: the file has no tensor %s\n", name);
+	else if (!t->nbytes)
+		fprintf(stderr, "llama: %s is %s, which this build cannot read\n",
+			name, ggml_type_name(t->type));
+	return t && t->nbytes ? t : NULL;
+}
+
+int llama_load(struct llama_model *m, const char *path)
+{
+	char arch[64] = "llama";
+	char key[128];
+	uint32_t v;
+	float f;
+
+	memset(m, 0, sizeof(*m));
+	if (gguf_open(&m->gguf, path) < 0)
+		return -1;
+
+	gguf_get_str(&m->gguf, "general.architecture", arch, sizeof(arch));
+	if (strcmp(arch, "llama")) {
+		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
+		goto fail;
+	}
+
+#define GETU(suffix, dst, dflt) do {                                    \
+		snprintf(key, sizeof(key), "%s." suffix, arch);          \
+		if (gguf_get_u32(&m->gguf, key, &v))                     \
+			v = (dflt);                                      \
+		(dst) = v;                                               \
+	} while (0)
+#define GETF(suffix, dst, dflt) do {                                    \
+		snprintf(key, sizeof(key), "%s." suffix, arch);          \
+		if (gguf_get_f32(&m->gguf, key, &f))                     \
+			f = (dflt);                                      \
+		(dst) = f;                                               \
+	} while (0)
+
+	GETU("embedding_length", m->n_embd, 0);
+	GETU("block_count", m->n_layer, 0);
+	GETU("attention.head_count", m->n_head, 0);
+	GETU("attention.head_count_kv", m->n_head_kv, m->n_head);
+	GETU("feed_forward_length", m->n_ff, 0);
+	GETU("context_length", m->n_ctx_train, 2048);
+	GETU("rope.dimension_count", m->head_dim, m->n_head ? m->n_embd / m->n_head : 0);
+	GETF("attention.layer_norm_rms_epsilon", m->rms_eps, 1e-5f);
+	GETF("rope.freq_base", m->rope_base, 10000.0f);
+#undef GETU
+#undef GETF
+
+	if (!m->n_embd || !m->n_layer || !m->n_head || !m->n_ff) {
+		fprintf(stderr, "llama: the file is missing a shape key\n");
+		goto fail;
+	}
+	if (m->head_dim & 1) {
+		fprintf(stderr, "llama: an odd head dimension has no rope pairing\n");
+		goto fail;
+	}
+
+	m->tk = tokenizer_from_gguf(&m->gguf);
+	if (!m->tk)
+		goto fail;
+	m->n_vocab = tokenizer_n_vocab(m->tk);
+
+	m->tok_embd = need(&m->gguf, "token_embd.weight");
+	m->out_norm = need(&m->gguf, "output_norm.weight");
+	if (!m->tok_embd || !m->out_norm)
+		goto fail;
+
+	/* Llama 3.2 1B ties the output head to the embedding; larger ones do not */
+	m->output = gguf_tensor(&m->gguf, "output.weight");
+	if (!m->output || !m->output->nbytes)
+		m->output = m->tok_embd;
+
+	m->rope_freqs = gguf_tensor(&m->gguf, "rope_freqs.weight");
+	if (m->rope_freqs && !m->rope_freqs->nbytes)
+		m->rope_freqs = NULL;
+
+	m->layers = calloc(m->n_layer, sizeof(*m->layers));
+	if (!m->layers)
+		goto fail;
+	for (uint32_t l = 0; l < m->n_layer; l++) {
+		struct llama_layer *L = &m->layers[l];
+
+#define T(field, suffix) do {                                            \
+		snprintf(key, sizeof(key), "blk.%u." suffix ".weight", l); \
+		L->field = need(&m->gguf, key);                          \
+		if (!L->field)                                           \
+			goto fail;                                       \
+	} while (0)
+		T(attn_norm, "attn_norm");
+		T(wq, "attn_q");
+		T(wk, "attn_k");
+		T(wv, "attn_v");
+		T(wo, "attn_output");
+		T(ffn_norm, "ffn_norm");
+		T(gate, "ffn_gate");
+		T(up, "ffn_up");
+		T(down, "ffn_down");
+#undef T
+	}
+
+	return 0;
+
+fail:
+	llama_free(m);
+	return -1;
+}
+
+void llama_free(struct llama_model *m)
+{
+	if (!m)
+		return;
+	free(m->layers);
+	tokenizer_free(m->tk);
+	gguf_close(&m->gguf);
+	memset(m, 0, sizeof(*m));
+}
+
+/* ---- state --------------------------------------------------------------- */
+
+struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
+{
+	struct llama_state *s = calloc(1, sizeof(*s));
+	size_t kvn;
+
+	if (!s)
+		return NULL;
+	s->m = m;
+	s->n_ctx = n_ctx > 0 ? n_ctx : (int)m->n_ctx_train;
+	s->pos = 0;
+
+	kvn = (size_t)m->n_layer * (size_t)s->n_ctx * m->n_head_kv * m->head_dim;
+	s->kcache = calloc(kvn, sizeof(float));
+	s->vcache = calloc(kvn, sizeof(float));
+	s->x   = calloc(m->n_embd, sizeof(float));
+	s->xb  = calloc(m->n_embd, sizeof(float));
+	s->xb2 = calloc(m->n_embd, sizeof(float));
+	s->hb  = calloc(m->n_ff, sizeof(float));
+	s->hb2 = calloc(m->n_ff, sizeof(float));
+	s->q   = calloc((size_t)m->n_head * m->head_dim, sizeof(float));
+	s->k   = calloc((size_t)m->n_head_kv * m->head_dim, sizeof(float));
+	s->v   = calloc((size_t)m->n_head_kv * m->head_dim, sizeof(float));
+	s->att = calloc((size_t)m->n_head * s->n_ctx, sizeof(float));
+	s->logits = calloc(m->n_vocab, sizeof(float));
+
+	if (!s->kcache || !s->vcache || !s->x || !s->xb || !s->xb2 || !s->hb ||
+	    !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits) {
+		llama_state_free(s);
+		return NULL;
+	}
+
+	pool_start(0);
+	return s;
+}
+
+void llama_state_free(struct llama_state *s)
+{
+	if (!s)
+		return;
+	free(s->kcache); free(s->vcache);
+	free(s->x); free(s->xb); free(s->xb2);
+	free(s->hb); free(s->hb2);
+	free(s->q); free(s->k); free(s->v);
+	free(s->att); free(s->logits);
+	free(s);
+}
+
+/* ---- the forward pass ---------------------------------------------------- */
+
+const float *llama_forward(struct llama_state *s, int32_t token, int pos)
+{
+	const struct llama_model *m = s->m;
+	uint32_t hd = m->head_dim;
+	uint32_t kvdim = m->n_head_kv * hd;
+	uint32_t gqa = m->n_head / m->n_head_kv;
+	float scale = 1.0f / sqrtf((float)hd);
+	static float *freqbuf;
+	const float *freqf = NULL;
+
+	if (pos >= s->n_ctx)
+		return NULL;
+
+	if (m->rope_freqs) {
+		if (!freqbuf)
+			freqbuf = calloc(hd, sizeof(float));
+		gguf_row_f32(m->rope_freqs, 0, freqbuf);
+		freqf = freqbuf;
+	}
+
+	gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
+
+	for (uint32_t l = 0; l < m->n_layer; l++) {
+		const struct llama_layer *L = &m->layers[l];
+		float *kc = s->kcache + ((size_t)l * s->n_ctx + pos) * kvdim;
+		float *vc = s->vcache + ((size_t)l * s->n_ctx + pos) * kvdim;
+
+		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
+
+		matvec(L->wq, s->xb, s->q);
+		matvec(L->wk, s->xb, s->k);
+		matvec(L->wv, s->xb, s->v);
+
+		rope(s->q, m->n_head, hd, pos, m->rope_base, freqf);
+		rope(s->k, m->n_head_kv, hd, pos, m->rope_base, freqf);
+
+		memcpy(kc, s->k, kvdim * sizeof(float));
+		memcpy(vc, s->v, kvdim * sizeof(float));
+
+		for (uint32_t h = 0; h < m->n_head; h++) {
+			const float *qh = s->q + h * hd;
+			float *att = s->att + (size_t)h * s->n_ctx;
+			uint32_t kvh = h / gqa;
+			float *out = s->xb + h * hd;
+
+			for (int t = 0; t <= pos; t++) {
+				const float *kt = s->kcache +
+					((size_t)l * s->n_ctx + t) * kvdim + kvh * hd;
+				float a = 0.0f;
+
+				for (uint32_t i = 0; i < hd; i++)
+					a += qh[i] * kt[i];
+				att[t] = a * scale;
+			}
+			softmax(att, pos + 1);
+
+			memset(out, 0, hd * sizeof(float));
+			for (int t = 0; t <= pos; t++) {
+				const float *vt = s->vcache +
+					((size_t)l * s->n_ctx + t) * kvdim + kvh * hd;
+				float a = att[t];
+
+				for (uint32_t i = 0; i < hd; i++)
+					out[i] += a * vt[i];
+			}
+		}
+
+		matvec(L->wo, s->xb, s->xb2);
+		for (uint32_t i = 0; i < m->n_embd; i++)
+			s->x[i] += s->xb2[i];
+
+		rmsnorm(s->xb, s->x, L->ffn_norm, m->n_embd, m->rms_eps);
+		matvec(L->gate, s->xb, s->hb);
+		matvec(L->up, s->xb, s->hb2);
+		for (uint32_t i = 0; i < m->n_ff; i++) {
+			float g = s->hb[i];
+
+			g *= 1.0f / (1.0f + expf(-g));       /* SiLU */
+			s->hb[i] = g * s->hb2[i];
+		}
+		matvec(L->down, s->hb, s->xb2);
+		for (uint32_t i = 0; i < m->n_embd; i++)
+			s->x[i] += s->xb2[i];
+	}
+
+	rmsnorm(s->xb, s->x, m->out_norm, m->n_embd, m->rms_eps);
+	matvec(m->output, s->xb, s->logits);
+
+	s->pos = pos + 1;
+	return s->logits;
+}
+
+/* ---- sampling ------------------------------------------------------------ */
+
+int32_t llama_argmax(const float *logits, uint32_t n)
+{
+	int32_t best = 0;
+
+	for (uint32_t i = 1; i < n; i++)
+		if (logits[i] > logits[best])
+			best = (int32_t)i;
+	return best;
+}
+
+struct pair { float p; int32_t i; };
+
+static int pair_desc(const void *a, const void *b)
+{
+	const struct pair *x = a, *y = b;
+
+	return x->p < y->p ? 1 : x->p > y->p ? -1 : 0;
+}
+
+int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
+		     uint64_t *rng)
+{
+	struct pair *p;
+	float sum = 0.0f, mx = logits[0], cum = 0.0f, r;
+	int32_t out;
+	uint32_t keep;
+
+	if (temp <= 0.0f)
+		return llama_argmax(logits, n);
+
+	p = malloc((size_t)n * sizeof(*p));
+	if (!p)
+		return llama_argmax(logits, n);
+
+	for (uint32_t i = 1; i < n; i++)
+		if (logits[i] > mx)
+			mx = logits[i];
+	for (uint32_t i = 0; i < n; i++) {
+		p[i].p = expf((logits[i] - mx) / temp);
+		p[i].i = (int32_t)i;
+		sum += p[i].p;
+	}
+	for (uint32_t i = 0; i < n; i++)
+		p[i].p /= sum;
+
+	qsort(p, n, sizeof(*p), pair_desc);
+
+	if (top_p <= 0.0f || top_p >= 1.0f) {
+		keep = n;
+	} else {
+		keep = n;
+		for (uint32_t i = 0; i < n; i++) {
+			cum += p[i].p;
+			if (cum >= top_p) {
+				keep = i + 1;
+				break;
+			}
+		}
+	}
+
+	cum = 0.0f;
+	for (uint32_t i = 0; i < keep; i++)
+		cum += p[i].p;
+
+	/* xorshift64*, so a seed reproduces a run exactly */
+	*rng ^= *rng >> 12; *rng ^= *rng << 25; *rng ^= *rng >> 27;
+	r = (float)((*rng * 2685821657736338717ull) >> 11) / 9007199254740992.0f;
+	r *= cum;
+
+	out = p[keep - 1].i;
+	cum = 0.0f;
+	for (uint32_t i = 0; i < keep; i++) {
+		cum += p[i].p;
+		if (r < cum) {
+			out = p[i].i;
+			break;
+		}
+	}
+
+	free(p);
+	return out;
+}

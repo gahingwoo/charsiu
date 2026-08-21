@@ -10,8 +10,9 @@ BUILD  := build
 CROSS  ?= $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 
 SRC    := src/regcmd.c src/device.c src/job.c
+LLM    := src/gguf.c src/tokenizer.c src/llama.c
 
-all: $(BUILD)/emit_dump $(BUILD)/emit_job
+all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -22,8 +23,16 @@ $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# the CPU decode loop: the oracle every NPU version is diffed against
+$(BUILD)/charsiu_run: tools/charsiu_run.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
-       $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64
+       $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
+       $(BUILD)/charsiu_run.aarch64
 
 $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^

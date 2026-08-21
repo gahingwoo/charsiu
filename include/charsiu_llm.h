@@ -1,0 +1,188 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com> */
+#ifndef CHARSIU_LLM_H
+#define CHARSIU_LLM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * The CPU decode loop.
+ *
+ * This half of charsiu has NO NPU in it, on purpose. It exists to be the
+ * oracle: a run of it is a known-correct sequence of tokens and a known
+ * sequence of intermediate tensors, and every later version that moves a
+ * matmul onto the NPU is diffed against it rather than against a guess.
+ *
+ * The project's own record is the argument for building it first. Every board
+ * round that had an oracle was readable; every round that guessed at a form
+ * got refuted by the next one.
+ */
+
+/* ---- GGUF ---------------------------------------------------------------- */
+
+enum gguf_vtype {
+	GGUF_V_U8 = 0, GGUF_V_I8, GGUF_V_U16, GGUF_V_I16, GGUF_V_U32,
+	GGUF_V_I32, GGUF_V_F32, GGUF_V_BOOL, GGUF_V_STRING, GGUF_V_ARRAY,
+	GGUF_V_U64, GGUF_V_I64, GGUF_V_F64,
+};
+
+/* ggml tensor types, only the ones this reads. */
+enum ggml_type {
+	GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3,
+	GGML_Q8_0 = 8, GGML_Q6_K = 14,
+};
+
+struct gguf_kv {
+	char *key;
+	uint32_t type;
+	union { uint64_t u; int64_t i; double f; } val;   /* scalars */
+	const char *str;                                  /* GGUF_V_STRING */
+	uint64_t str_len;
+	uint32_t arr_type;                                /* GGUF_V_ARRAY */
+	uint64_t arr_len;
+	const uint8_t *arr;                               /* into the mapping */
+};
+
+struct gguf_tensor {
+	char name[80];
+	unsigned n_dims;
+	uint64_t ne[4];
+	uint32_t type;
+	uint64_t offset;
+	const void *data;      /* into the mapping */
+	uint64_t nbytes;
+};
+
+struct gguf {
+	int fd;
+	const uint8_t *map;
+	size_t map_size;
+	uint32_t version;
+	struct gguf_kv *kv;
+	uint64_t n_kv;
+	struct gguf_tensor *t;
+	uint64_t n_tensors;
+	const uint8_t *data;
+	uint64_t alignment;
+};
+
+int  gguf_open(struct gguf *g, const char *path);
+void gguf_close(struct gguf *g);
+
+const struct gguf_kv *gguf_find(const struct gguf *g, const char *key);
+int gguf_get_u32(const struct gguf *g, const char *key, uint32_t *out);
+int gguf_get_f32(const struct gguf *g, const char *key, float *out);
+int gguf_get_str(const struct gguf *g, const char *key, char *out, size_t max);
+const struct gguf_tensor *gguf_tensor(const struct gguf *g, const char *name);
+const char *ggml_type_name(uint32_t type);
+
+/*
+ * The one primitive the whole model is built out of: y[row] = dot(W[row], x).
+ * W is [ne[1] rows][ne[0] columns] and x has ne[0] elements. Every quantised
+ * type is dequantised inside the inner loop, which is what llama.cpp does too.
+ *
+ * This is EXACTLY the operation step 2 replaces with charsiu_emit_job(), so
+ * keeping every model matmul behind this one call is deliberate.
+ */
+void gguf_matvec(const struct gguf_tensor *w, const float *x, float *y,
+		 uint64_t row0, uint64_t nrows);
+
+/* Dequantise one whole row into f32. Used for the token embedding lookup. */
+void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst);
+
+/* ---- tokenizer ----------------------------------------------------------- */
+
+struct tokenizer;
+
+struct tokenizer *tokenizer_from_gguf(const struct gguf *g);
+void tokenizer_free(struct tokenizer *tk);
+
+/*
+ * Byte level BPE. `text` may contain literal <|...|> control tokens; when the
+ * exact spelling is a control token in the vocabulary it is emitted as that one
+ * id rather than being split, which is how a chat prompt is built without a
+ * template engine.
+ *
+ * Returns the token count, or -1. `out` must hold `max` ids.
+ */
+int tokenizer_encode(const struct tokenizer *tk, const char *text,
+		     int add_bos, int32_t *out, int max);
+
+/* The token's bytes. Not NUL terminated in general; `len` is the truth. */
+const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
+
+int32_t tokenizer_bos(const struct tokenizer *tk);
+int32_t tokenizer_eos(const struct tokenizer *tk);
+int tokenizer_is_eog(const struct tokenizer *tk, int32_t id);
+uint32_t tokenizer_n_vocab(const struct tokenizer *tk);
+
+/* ---- the model ----------------------------------------------------------- */
+
+struct llama_layer {
+	const struct gguf_tensor *attn_norm;
+	const struct gguf_tensor *wq, *wk, *wv, *wo;
+	const struct gguf_tensor *ffn_norm;
+	const struct gguf_tensor *gate, *up, *down;
+};
+
+struct llama_model {
+	struct gguf gguf;
+	struct tokenizer *tk;
+
+	uint32_t n_embd, n_layer, n_head, n_head_kv, n_ff, n_vocab;
+	uint32_t head_dim, n_ctx_train;
+	float rms_eps, rope_base;
+
+	const struct gguf_tensor *tok_embd;
+	const struct gguf_tensor *out_norm;
+	const struct gguf_tensor *output;      /* may alias tok_embd (tied) */
+	const struct gguf_tensor *rope_freqs;  /* llama 3.1 style scaling, or NULL */
+	struct llama_layer *layers;
+};
+
+/*
+ * Everything that changes as tokens are produced. Split from the model so the
+ * weights stay read only and a second state is just another allocation.
+ */
+struct llama_state {
+	const struct llama_model *m;
+	int n_ctx;
+	int pos;               /* how many tokens are in the cache */
+
+	float *kcache;         /* [n_layer][n_ctx][n_head_kv * head_dim] */
+	float *vcache;
+
+	float *x, *xb, *xb2;   /* n_embd */
+	float *hb, *hb2;       /* n_ff */
+	float *q;              /* n_head * head_dim */
+	float *k, *v;          /* n_head_kv * head_dim */
+	float *att;            /* n_head * n_ctx */
+	float *logits;         /* n_vocab */
+};
+
+int  llama_load(struct llama_model *m, const char *path);
+void llama_free(struct llama_model *m);
+
+struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx);
+void llama_state_free(struct llama_state *s);
+
+/* One token in, a full logit vector out. `pos` is where it goes in the cache. */
+const float *llama_forward(struct llama_state *s, int32_t token, int pos);
+
+/* argmax, which is the only sampler an oracle is allowed. */
+int32_t llama_argmax(const float *logits, uint32_t n);
+
+/* Temperature plus top-p, for when a human is reading the output. */
+int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
+		     uint64_t *rng);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CHARSIU_LLM_H */
