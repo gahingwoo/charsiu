@@ -327,7 +327,16 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	if (!s)
 		return NULL;
 	s->m = m;
+	/*
+	 * NOT the training context by default. Llama 3.2 trains at 131072, and
+	 * a KV cache that long is 8.6 GB for a 1B model -- more than the board
+	 * has. calloc gets away with it on a machine with overcommit because
+	 * the pages are never touched, which is exactly the kind of thing that
+	 * works until it is measured somewhere real.
+	 */
 	s->n_ctx = n_ctx > 0 ? n_ctx : (int)m->n_ctx_train;
+	if (n_ctx <= 0 && s->n_ctx > CHARSIU_DEFAULT_CTX)
+		s->n_ctx = CHARSIU_DEFAULT_CTX;
 	s->pos = 0;
 
 	kvn = (size_t)m->n_layer * (size_t)s->n_ctx * m->n_head_kv * m->head_dim;

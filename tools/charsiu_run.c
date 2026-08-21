@@ -49,6 +49,7 @@ static void usage(void)
 "  --logits N    print the top N logits after the prompt and stop\n"
 "  --info        print what the file says about the model and stop\n"
 "  --no-bos      do not prepend the begin-of-text token\n"
+"  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
 "  -q            do not echo the prompt\n");
 }
 
@@ -58,6 +59,7 @@ int main(int argc, char **argv)
 	const char *sys = "You are a helpful assistant.";
 	int n_gen = 64, n_ctx = 0, nthreads = 0, chat = 0, quiet = 0;
 	int show_tokens = 0, show_logits = 0, show_info = 0, add_bos = 1;
+	int ignore_eos = 0;
 	float temp = 0.0f, top_p = 0.9f;
 	uint64_t seed = 1234;
 	struct llama_model m;
@@ -87,6 +89,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--logits")) show_logits = atoi(NEXT());
 		else if (!strcmp(a, "--info")) show_info = 1;
 		else if (!strcmp(a, "--no-bos")) add_bos = 0;
+		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
 		else if (!strcmp(a, "-q")) quiet = 1;
 		else { usage(); return 2; }
 #undef NEXT
@@ -269,7 +272,7 @@ int main(int argc, char **argv)
 		int len;
 		const char *s;
 
-		if (tokenizer_is_eog(m.tk, tok))
+		if (!ignore_eos && tokenizer_is_eog(m.tk, tok))
 			break;
 		s = tokenizer_decode(m.tk, tok, &len);
 		fwrite(s, 1, (size_t)len, stdout);

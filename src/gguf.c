@@ -665,9 +665,15 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 	float s = 0.0f;
 	float tmp[256];
 
+	/*
+	 * A plain loop rather than dot_f32(): inlining a vector kernel over a
+	 * 256 float array on the stack makes gcc warn about the residual
+	 * iteration it can see is unreachable. q6_K is not a hot path here.
+	 */
 	for (uint64_t i = 0; i < nb; i++) {
 		deq_q6_K(&b[i], tmp);
-		s += dot_f32(tmp, x + i * 256, 256);
+		for (unsigned j = 0; j < 256; j++)
+			s += tmp[j] * x[i * 256 + j];
 	}
 	return s;
 }

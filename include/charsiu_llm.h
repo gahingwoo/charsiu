@@ -123,6 +123,9 @@ uint32_t tokenizer_n_vocab(const struct tokenizer *tk);
 
 /* ---- the model ----------------------------------------------------------- */
 
+/* what llama_state_new() uses when the caller does not say */
+#define CHARSIU_DEFAULT_CTX 4096
+
 struct llama_layer {
 	const struct gguf_tensor *attn_norm;
 	const struct gguf_tensor *wq, *wk, *wv, *wo;
