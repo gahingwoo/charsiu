@@ -565,7 +565,23 @@ int main(int argc, char **argv)
 		 * The int8 path has read the surface since round 199 and this
 		 * one never had to. It does now.
 		 */
-		unsigned atom = charsiu_feature_atom(CHARSIU_INT8);
+		/*
+		 * ⚠ THE ATOM IS THE int4 PATH'S OWN, NOT 16. w4a16 packs its
+		 * activation as a 2 byte element whose feature atom is 8, and
+		 * this reader hardcoded charsiu_feature_atom(CHARSIU_INT8),
+		 * which is 16. At M = 1 both collapse to n and the difference
+		 * cannot show; round 289 ran M of 2, 4 and 8 for the first time
+		 * and the odd numbered groups came back 0 of 8 at M = 4, which
+		 * is exactly the set the two readings disagree on.
+		 *
+		 * ⚠ IT IS NOT THE WHOLE STORY. The even groups came back 4 of 8
+		 * where both readings agree, and M = 2 gave every group 4 of 8
+		 * with only g7 at zero, which is a different shape again. So the
+		 * atom is corrected here and the surface is DUMPED below rather
+		 * than guessed at a second time.
+		 */
+		unsigned atom = charsiu_feature_atom(
+					charsiu_effective_adtype(&job.mm));
 		unsigned ni, mi, ex_pe = 0, ex_sum = 0, written = 0;
 		const int32_t *o = (const int32_t *)outbo.map;
 
@@ -600,6 +616,45 @@ int main(int argc, char **argv)
 					printf("    ch %2u  npu %8d   shift/elem %8d   shift/sum %8d\n",
 					       ni, got, (int)pe, (int)sm);
 			}
+		/*
+		 * At M > 1 print the raw surface and both rows' references, so
+		 * the mapping can be READ instead of inferred from a score. Two
+		 * closed forms for the weight layout were guessed and refuted
+		 * before --map was pointed at it; this is the same mistake
+		 * waiting to be made about the output.
+		 */
+		if (m > 1) {
+			unsigned q;
+
+			printf("  raw surface, first %u words:\n   ", 4 * n);
+			for (q = 0; q < 4 * n && q < 128; q++) {
+				printf(" %d", o[q]);
+				if ((q & 7) == 7) printf("\n   ");
+			}
+			printf("\n  reference by row, first 8 channels:\n");
+			for (mi = 0; mi < m && mi < 3; mi++) {
+				printf("    row %u:", mi);
+				for (ni = 0; ni < 8; ni++) {
+					int64_t pe = 0;
+					unsigned j;
+
+					for (j = 0; j < k; j++) {
+						int wv = b_raw[ni * k + j];
+						int16_t wb, ab;
+
+						wv = (wv & 0x8) ? (wv & 0xf) - 16
+								: (wv & 0xf);
+						wb = (int16_t)charsiu_float_to_half((float)wv);
+						ab = (int16_t)((((int)a_raw[mi * k + j]
+								 - 0x80) & 0xff) << 8);
+						pe += ((int32_t)wb * (int32_t)ab) >> 16;
+					}
+					printf(" %d", (int)pe);
+				}
+				printf("\n");
+			}
+		}
+
 		printf("int4 output: %u of %u words written, "
 		       "%u EXACT with the shift per element, "
 		       "%u EXACT with the shift on the sum\n",

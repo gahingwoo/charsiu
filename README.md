@@ -412,10 +412,15 @@ works, no override, byte exact against a CPU reference, eleven geometries
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
-open
-  M has only ever been 1
+open, and both are now measured rather than untried
+  M > 1 is int4 only. int8 at M = 4 is 256 of 256 byte exact; int4 at M of 2, 4
+    and 8 puts every correct value in row 0 and gets rows 1+ wrong outright.
+    One cause found: the output reader hardcoded atom 16, which is int8's, where
+    w4a16's is 8 — invisible at M = 1, where both collapse to n. Not the whole
+    story: the groups where the two readings AGREE also came back half wrong.
+  N not a multiple of 8 is close but not exact: 16 of 20 and 32 of 36 at M = 1.
+    The short last group is correct and a FULL group in the middle loses four.
   K other than 32 and 64 is refused
-  N that is not a multiple of 8 has never been tried
 ```
 
 ### "Half the k" is not half the weights
