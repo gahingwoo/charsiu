@@ -409,41 +409,68 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * the register and the table should be reading the same
 			 * number.
 			 */
-			unsigned g = n / 8;
-			unsigned glast = (ALIGN_UP(mm->n, 16) - 1) / 8;
 			/*
-			 * ⚠ THE PAIR STRIDE IS A HYPOTHESIS, NOT A READING,
-			 * and this is where round 283 stopped.
+			 * ⚠ BLOCKS AND SLOTS, not a stride. Round 285 swept
+			 * --map over the whole buffer at N = 24 and N = 40,
+			 * which is the first time the map was read anywhere but
+			 * N = 64, and both disagreed with 8*K:
 			 *
-			 * Both measured tables were swept at N = 64, and at
-			 * N = 64 the buffer is k*32, so 8*K and wbytes/4 are
-			 * THE SAME NUMBER. 512 at K = 64, 256 at K = 32, both
-			 * ways. No data taken so far can tell them apart.
+			 *   N = 24  measured 0, 128, 192    8*K said 0, 128, 512
+			 *   N = 40  measured 0, 128, 512, 576, 704
 			 *
-			 * 283's N sweep is the first thing that could, and it
-			 * says 8*K is wrong away from 64: with the write
-			 * quantum fixed so every channel is written, N of 24,
-			 * 40 and 56 still come back with whole groups at 0 of 8
-			 * at the top, which is a placement fault now and not a
-			 * write one. A map that does not scale with the buffer
-			 * would run past the end of a smaller one, and at
-			 * N = 24 the second group of g2 lands at 768, which is
-			 * exactly the size of that buffer.
+			 * Laid beside the five geometries that already worked,
+			 * the shape is regular. Groups of eight channels sit two
+			 * to a BLOCK of 8*K bytes, at SLOTS of 64 bytes, and
+			 * only the last block differs:
 			 *
-			 * ⚠ wbytes/4 WAS TRIED IN ROUND 284 AND IT IS REFUTED.
-			 * It did not fix 24, 40 and 56 and it broke 16, 32 and
-			 * 48, which 8*K had exact: 0 of 16, 0 of 32 and 8 of
-			 * 48. Only N = 64 survived, and it survives either way
-			 * by construction. So 8*K is right wherever there is
-			 * data and the failures are something else.
+			 *   block stride  S = 8*K        slot size 64
+			 *   the k+ half   S/2 on, when K > 32
+			 *   a full block  slots 0 and 2
+			 *   last block, 2 left   slots 0, 1
+			 *   last block, 3 left   slots 0, 2, 3 if it is also the
+			 *                        FIRST block, otherwise 0, 1, 3
 			 *
-			 * Not guessing a third form. The N = 64 table came off
-			 * a --map sweep and the thing to do is run the same
-			 * sweep at an N that is not 64.
+			 * That reproduces all seven measured tables, forty bases:
+			 *
+			 *   N=16 K=64  0 64
+			 *   N=24       0 128 192
+			 *   N=32       0 128 512 576
+			 *   N=40       0 128 512 576 704
+			 *   N=48       0 128 512 640 1024 1088
+			 *   N=64       0 128 512 640 1024 1152 1536 1600
+			 *   N=64 K=32  0 128 256 384  512  640  768  832
+			 *
+			 * ⚠ N = 56 IS THE ONE CASE NOT BEHIND THIS. It is the
+			 * only geometry whose last block has three groups and is
+			 * not also the first, so the "0, 1, 3 otherwise" arm
+			 * rests on N = 40 alone. It predicts 1024, 1088, 1216.
 			 */
+			unsigned g = n / 8;
+			unsigned ngrp = DIV_ROUND_UP(mm->n, 8);
+			unsigned nblk = (ngrp & 1) ? (ngrp - 1) / 2 : ngrp / 2;
+			unsigned first_last = 2 * (nblk - 1);
+			unsigned rem = ngrp - first_last;
 			size_t stride = (size_t)8 * mm->k;
-			size_t row = (size_t)(g / 2) * stride
-				     + ((g & 1) ? (g == glast ? 64 : 128) : 0)
+			unsigned blk, slot;
+
+			if (ngrp < 2 || nblk == 0)
+				return;                 /* unmeasured */
+
+			if (g < first_last) {
+				blk = g / 2;
+				slot = (g & 1) ? 2 : 0;
+			} else {
+				static const unsigned s2[2]      = { 0, 1 };
+				static const unsigned s3first[3] = { 0, 2, 3 };
+				static const unsigned s3rest[3]  = { 0, 1, 3 };
+				unsigned idx = g - first_last;
+
+				blk = nblk - 1;
+				slot = rem == 2 ? s2[idx]
+				     : (nblk == 1 ? s3first[idx] : s3rest[idx]);
+			}
+
+			size_t row = (size_t)blk * stride + (size_t)slot * 64
 				     + (size_t)(n % 8) * 8;
 			unsigned half;
 

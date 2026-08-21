@@ -360,9 +360,41 @@ something else. The reasoning that produced `wbytes/4` was tidy — the map must
 scale with the buffer, and at `N = 24` the second group of `g2` lands at 768
 which is exactly that buffer's size — and it did not survive one round.
 
-The `N = 64` table came off a `--map` sweep, so the next step is the same sweep
-at an `N` that is not 64, rather than a third form fitted to the same seven
-numbers.
+### The map away from N = 64, and what it turned out to be
+
+Sweeping `--map` at `N = 24` and `N = 40` — the first time the map was read
+anywhere but 64 — disagreed with `8*K` at both:
+
+```
+N = 24  measured 0, 128, 192              8*K said 0, 128, 512
+N = 40  measured 0, 128, 512, 576, 704    8*K said ... 640, 1024
+```
+
+Laid beside the five geometries that already worked, the shape is regular and it
+is **not a stride at all**. Groups of eight channels sit two to a *block* of
+`8*K` bytes at *slots* of 64 bytes, and only the last block differs:
+
+```
+block stride S = 8*K        slot 64        the k+ half at S/2, when K > 32
+
+a full block            slots 0 and 2
+last block, 2 left      slots 0, 1
+last block, 3 left      slots 0, 2, 3 if it is ALSO the first block
+                        slots 0, 1, 3 otherwise
+```
+
+That reproduces every table measured — forty bases across seven geometries:
+
+```
+N=16  0 64                    N=48  0 128 512 640 1024 1088
+N=24  0 128 192               N=64  0 128 512 640 1024 1152 1536 1600
+N=32  0 128 512 576           N=64 K=32  0 128 256 384 512 640 768 832
+N=40  0 128 512 576 704
+```
+
+⚠ `N = 56` is the one geometry not behind it: the only case whose last block
+holds three groups and is not also the first, so the "otherwise" arm rests on
+`N = 40` alone. It predicts 1024, 1088 and 1216.
 
 ### Where int4 stands
 
@@ -372,8 +404,7 @@ works, no override, byte exact against a CPU reference
   64 channels, 32 real k each, out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
 open
-  N = 24, 40, 56 place the top groups wrong, and the address rule is unmeasured
-    anywhere but N = 64
+  N = 56 is the one geometry the block and slot rule has nothing behind it at
   M has only ever been 1
 ```
 
