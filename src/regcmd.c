@@ -370,10 +370,15 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		unsigned order = getenv("CHARSIU_INT4_ORDER")
 			? (unsigned)atoi(getenv("CHARSIU_INT4_ORDER")) : 0;
 
-		if ((mm->k != 64 && mm->k != 32) || mm->n > 64) {
-			/* refuse rather than invent, and say so */
+		/*
+		 * K is refused outside 64 and 32 because those are the only two
+		 * the fetch has been swept at. N is not capped at 64 any more:
+		 * round 287 swept N = 72 and the group count is what the layout
+		 * is indexed by, so the guard belongs on the group count and it
+		 * is below.
+		 */
+		if (mm->k != 64 && mm->k != 32)
 			return;
-		}
 
 		for (n = 0; n < mm->n; n++) {
 			/*
@@ -410,58 +415,80 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * number.
 			 */
 			/*
-			 * ⚠ A MEASURED TABLE. Two closed forms have now been
-			 * fitted to this and both were refuted by the next
-			 * round: wbytes/4 in 284, and "the last block takes the
-			 * odd slots" in 286, which put g4 of N = 56 at 1024
-			 * where --map found it at 704.
+			 * ⚠ THE THIRD CLOSED FORM, and this one has eight
+			 * measured tables behind it rather than one.
 			 *
-			 * The skeleton IS regular and it is K independent.
-			 * Groups of eight channels sit in BLOCKS of 8*K bytes at
-			 * SLOTS of 64, with a channel's k+ half four slots on,
-			 * and the K = 32 table decomposes exactly like the
-			 * K = 64 one, so only the block stride scales.
+			 * Two died in the round after they were written:
+			 * wbytes/4 in 284, which also broke three working
+			 * geometries, and "the last block takes the odd slots"
+			 * in 286, which put g4 of N = 56 at 1024 where --map
+			 * found it at 704. Both were fitted to a single point.
 			 *
-			 * WHICH slots is not regular. Written as (block, slot):
+			 * What changed is that --map has now swept the whole
+			 * buffer at every N that is a multiple of 8 from 16 to
+			 * 72, so there are eight tables, and G = 9 is what made
+			 * the odd case fall out. Written as flat slot indices,
+			 * block times 8 plus slot:
 			 *
-			 *   G=2  (0,0)(0,1)
-			 *   G=3  (0,0)(0,2)(0,3)
-			 *   G=4  (0,0)(0,2)(1,0)(1,1)
-			 *   G=5  (0,0)(0,2)(1,0)(1,1)(1,3)
-			 *   G=6  (0,0)(0,2)(1,0)(1,2)(2,0)(2,1)
-			 *   G=7  (0,0)(0,2)(1,0)(1,2)(1,3)(2,1)(2,3)
-			 *   G=8  (0,0)(0,2)(1,0)(1,2)(2,0)(2,2)(3,0)(3,1)
+			 *   G=2  0 1              G=3  0 2 3
+			 *   G=4  0 2 8 9          G=5  0 2 8 9 11
+			 *   G=6  0 2 8 10 16 17   G=7  0 2 8 10 11 17 19
+			 *   G=8  0 2 8 10 16 18 24 25
+			 *   G=9  0 2 8 10 16 17 19 25 27
 			 *
-			 * G=5's three group block is {0,1,3} and G=7's is
-			 * {0,2,3}; G=7's last block is {1,3} where every other
-			 * last block of two is {0,1}. Any rule covering both is
-			 * a rule fitted to one point each, which is exactly what
-			 * 284 and 286 were.
+			 * EVEN G is plain: pairs at slots 0 and 2 in every block
+			 * but the last, which takes 0 and 1.
 			 *
-			 * So this is the measurement, from --map sweeps of the
-			 * whole buffer at every N that is a multiple of 8 up to
-			 * 64, and it refuses anything else. G = 9 and above have
-			 * never been swept.
+			 * ODD G has one block of three at b3 = (G-1)/4, with
+			 * slots 0 and 2 before it, slots 1 and 3 after it, and
+			 * the three itself being {0,2,3} when G mod 4 is 3 and
+			 * {0,1,3} when it is 1. Four points on b3, two on each
+			 * arm of the mod 4, and two on the "after" blocks.
+			 *
+			 * A channel's k+ half is four slots on, and the whole
+			 * skeleton is K independent: the K = 32 table decomposes
+			 * the same way, only the block stride 8*K scales.
+			 *
+			 * It predicts G = 10 and G = 11 outright:
+			 *   G=10  0 2 8 10 16 18 24 26 32 33
+			 *   G=11  0 2 8 10 16 18 19 25 27 33 35
+			 * and refuses above 16 blocks, where nothing is swept.
 			 */
-			static const unsigned char tab[9][8][2] = {
-				{{0}}, {{0}},
-				{ {0,0},{0,1} },
-				{ {0,0},{0,2},{0,3} },
-				{ {0,0},{0,2},{1,0},{1,1} },
-				{ {0,0},{0,2},{1,0},{1,1},{1,3} },
-				{ {0,0},{0,2},{1,0},{1,2},{2,0},{2,1} },
-				{ {0,0},{0,2},{1,0},{1,2},{1,3},{2,1},{2,3} },
-				{ {0,0},{0,2},{1,0},{1,2},{2,0},{2,2},{3,0},{3,1} },
-			};
 			unsigned g = n / 8;
 			unsigned ngrp = DIV_ROUND_UP(mm->n, 8);
+			unsigned blk, slot;
 			size_t row;
 
-			if (ngrp < 2 || ngrp > 8)
+			if (ngrp < 2 || ngrp > 32)
 				return;                 /* never swept */
 
-			row = (size_t)tab[ngrp][g][0] * 8 * mm->k
-			      + (size_t)tab[ngrp][g][1] * 64
+			if (!(ngrp & 1)) {
+				blk = g / 2;
+				slot = (blk == ngrp / 2 - 1) ? (g & 1)
+							     : (g & 1) * 2;
+			} else {
+				unsigned b3 = (ngrp - 1) / 4;
+
+				if (g < 2 * b3) {
+					blk = g / 2;
+					slot = (g & 1) * 2;
+				} else if (g < 2 * b3 + 3) {
+					static const unsigned s3a[3] = {0,2,3};
+					static const unsigned s3b[3] = {0,1,3};
+
+					blk = b3;
+					slot = (ngrp % 4 == 3)
+						? s3a[g - 2 * b3]
+						: s3b[g - 2 * b3];
+				} else {
+					unsigned r = g - (2 * b3 + 3);
+
+					blk = b3 + 1 + r / 2;
+					slot = (r & 1) ? 3 : 1;
+				}
+			}
+
+			row = (size_t)blk * 8 * mm->k + (size_t)slot * 64
 			      + (size_t)(n % 8) * 8;
 			unsigned half;
 

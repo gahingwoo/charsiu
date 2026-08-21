@@ -375,35 +375,39 @@ The **skeleton** is regular and K independent. Groups of eight channels sit in
 and the `K = 32` table decomposes exactly like the `K = 64` one — only the block
 stride scales.
 
-**Which slots is not regular.** Written as `(block, slot)`:
+**Which slots** looked irregular until `G = 9` was swept. As flat slot indices,
+block times 8 plus slot:
 
 ```
-G=2  (0,0)(0,1)                 G=6  (0,0)(0,2)(1,0)(1,2)(2,0)(2,1)
-G=3  (0,0)(0,2)(0,3)            G=7  (0,0)(0,2)(1,0)(1,2)(1,3)(2,1)(2,3)
-G=4  (0,0)(0,2)(1,0)(1,1)       G=8  (0,0)(0,2)(1,0)(1,2)(2,0)(2,2)(3,0)(3,1)
-G=5  (0,0)(0,2)(1,0)(1,1)(1,3)
+G=2  0 1              G=3  0 2 3
+G=4  0 2 8 9          G=5  0 2 8 9 11
+G=6  0 2 8 10 16 17   G=7  0 2 8 10 11 17 19
+G=8  0 2 8 10 16 18 24 25
+G=9  0 2 8 10 16 17 19 25 27
+
+EVEN G   pairs at slots 0 and 2 in every block but the last, which takes 0 and 1
+ODD G    one block of three at b3 = (G-1)/4, slots 0 and 2 before it and 1 and 3
+         after it, the three itself {0,2,3} when G mod 4 is 3, {0,1,3} when it is 1
 ```
 
-`G=5`'s three-group block is `{0,1,3}` and `G=7`'s is `{0,2,3}`. `G=7`'s last
-block is `{1,3}` where every other last block of two is `{0,1}`.
-
-⚠ **Two closed forms have been fitted to this and both died in one round.**
-`wbytes/4`, which also broke three working geometries, and "the last block takes
-the odd slots", which put `g4` of `N = 56` at 1024 where `--map` found it at 704.
-So the packer holds the measurement and refuses outside it: `--map` has swept the
-whole buffer at every `N` that is a multiple of 8 up to 64, and `G = 9` and above
-have never been swept.
+⚠ **This is the third closed form written for this layout and the first two died
+in the round after they were written.** `wbytes/4`, which also broke three working
+geometries, and "the last block takes the odd slots", which put `g4` of `N = 56`
+at 1024 where `--map` found it at 704. Both were fitted to a single point. This
+one has eight tables behind it — four points on the even arm, four on `b3`, two on
+each arm of the mod 4 — which is better and is not proof. It predicts `G = 10` and
+`G = 11` outright and those decide it.
 
 ### Where int4 stands
 
 ```
-works, no override, byte exact against a CPU reference
-  N = 16, 32, 48, 64 at K = 64        and N = 64 at K = 32
-  64 channels, 32 real k each, out = ((int16)fp16bits(w) * (int16)abits) >> 16
+works, no override, byte exact against a CPU reference, all in one boot
+  N = 16, 24, 32, 40, 48, 56, 64 at K = 64,  and N = 64 at K = 32
+  every channel, K/2 real k each
+  out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
 open
-  G = 9 and above (N > 64) have never been swept, and the slot pattern has no
-    closed form to extrapolate with
+  G = 10 and above are predicted by the closed form and not measured
   M has only ever been 1
 ```
 
