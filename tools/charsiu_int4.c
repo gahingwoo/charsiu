@@ -288,12 +288,32 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	if (lit == 1)
 		printf("  byte %-6zu %-5s -> w %-4u v %-8d   wrote %u hi %u hib %u\n",
 		       byte, high ? "high" : "low", first_w, first_v, wrote, hi, hib);
-	else if (!lit)
+	else if (lit > 1) {
+		/*
+		 * ⚠ ALL of them, not the first. At M = 1 a live nibble lights
+		 * exactly one word and "first" was the whole answer for eleven
+		 * geometries. Round 292 swept M = 2 and the grid was unreadable
+		 * because a byte can light a word in more than one row and only
+		 * the lowest index was printed.
+		 */
+		unsigned q, shown = 0;
+
+		printf("  byte %-6zu %-5s -> %u words lit:", byte,
+		       high ? "high" : "low", lit);
+		for (q = 0; (size_t)q * 4 + 4 <= obytes && shown < 8; q++) {
+			uint32_t u;
+
+			memcpy(&u, o + (size_t)q * 4, 4);
+			if (u != 0xa5a5a5a5u && u) {
+				printf(" w%u=%d", q, (int32_t)u);
+				shown++;
+			}
+		}
+		printf("   wrote %u hi %u hib %u\n", wrote, hi, hib);
+	}
+	else
 		printf("  byte %-6zu %-5s -> NOTHING LIT            wrote %u hi %u hib %u\n",
 		       byte, high ? "high" : "low", wrote, hi, hib);
-	else
-		printf("  byte %-6zu %-5s -> %u words lit, first w %u v %d   wrote %u hi %u hib %u\n",
-		       byte, high ? "high" : "low", lit, first_w, first_v, wrote, hi, hib);
 	charsiu_bo_fini(dev, outbo);
 }
 
@@ -488,6 +508,12 @@ int main(int argc, char **argv)
 	if (getenv("CHARSIU_KPAIR_AMP"))
 		g_amp = (unsigned)atoi(getenv("CHARSIU_KPAIR_AMP")) & 0x7f;
 	job.mm.adtype = CHARSIU_INT8;
+	/*
+	 * CHARSIU_MAP_ROW isolates one row of the activation, zeroing the rest
+	 * to the input zero point. At M = 1 it does nothing. At M > 1 it is the
+	 * difference between a grid that says which word a nibble reaches and
+	 * one where every row contributes and the answer is a sum.
+	 */
 	job.input_scale = 0.02f;
 	/*
 	 * 1.7857 makes the requant multiplier 1/7, so one live nibble of 7
@@ -566,6 +592,15 @@ int main(int argc, char **argv)
 	 * single live tap names its own k */
 	for (i = 0; i < m * k; i++)
 		a_raw[i] = (uint8_t)(job.input_zero_point + 1 + (i % k));
+	if (getenv("CHARSIU_MAP_ROW")) {
+		unsigned keep = (unsigned)atoi(getenv("CHARSIU_MAP_ROW"));
+
+		for (i = 0; i < m * k; i++)
+			if (i / k != keep)
+				a_raw[i] = (uint8_t)job.input_zero_point;
+		printf("activation: row %u only, the rest at the zero point\n",
+		       keep);
+	}
 
 	ret = charsiu_bo_alloc(dev, 4096, &regcmd);
 	ret |= charsiu_bo_alloc(dev, (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096, &in);

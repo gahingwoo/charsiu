@@ -421,8 +421,11 @@ open, and both are measured rather than untried
     at all. What is left at M > 1 is SLOT 2: row 0 at N = 64 fails on channels
     8-15, 24-31 and 40-47, which are g1, g3 and g5, and those are every slot 2
     group in the packer's own placement, while slots 0 and 1 all pass. N = 16 has
-    no slot 2 group, which is why its row 0 is clean. The weight map has only
-    ever been swept at M = 1.
+    no slot 2 group, which is why its row 0 is clean — and at N = 24, which has
+    a slot 2 AND a slot 3, both fail, so at M > 1 only slots 0 and 1 work.
+    ⚠ The weight layout itself has an M term the packer does not model. --map at
+    M = 2, N = 16 lights EIGHT groups in a 512 byte buffer where M = 1 lights 32,
+    at channel 2j+1 and byte 264 + 16j against M = 1's channel c at byte 8c.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
