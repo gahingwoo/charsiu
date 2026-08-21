@@ -417,11 +417,17 @@ open, and both are measured rather than untried
     separated. The surface groups by SIXTEEN BYTES, read straight off a raw dump
     at M = 2: row 0's channels 0-3 are at words 0-3 and 4-7 at words 8-11, so an
     atom is 4 elements for w4a16 and 16 for int8, and at M = 1 every atom
-    collapses to n. Separately, row 1's reference values appear NOWHERE in the
-    surface, which points at the input packing, not the read.
-  N not a multiple of 8 is close but not exact: 16 of 20 and 32 of 36 at M = 1.
-    --map says the bases are exactly what the packer places, so the four channels
-    each loses are placed correctly and come back wrong anyway.
+    collapses to n. That fix landed: at M = 2, N = 16 row 0 now has no mismatches
+    at all. What is left at M > 1 is SLOT 2: row 0 at N = 64 fails on channels
+    8-15, 24-31 and 40-47, which are g1, g3 and g5, and those are every slot 2
+    group in the packer's own placement, while slots 0 and 1 all pass. N = 16 has
+    no slot 2 group, which is why its row 0 is clean. The weight map has only
+    ever been swept at M = 1.
+  N not a multiple of 8: the hardware does not put the short group LAST. Its live
+    channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
+    so bytes 160-191 and 544-575 are dead and the packer writes logical channels
+    12-15 and 20-23 into them. Both match the mismatch lists exactly. Measured at
+    two N, no rule written.
   K other than 32 and 64 is refused
 ```
 
