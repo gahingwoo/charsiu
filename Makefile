@@ -30,9 +30,14 @@ $(BUILD)/charsiu_run: tools/charsiu_run.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
+# the control: same code with the NEON kernels compiled out. It has to produce
+# the same tokens as the one above and be slower, on the board as well as here.
+$(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
+
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
-       $(BUILD)/charsiu_run.aarch64
+       $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64
 
 $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^
