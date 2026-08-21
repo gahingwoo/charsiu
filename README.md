@@ -435,9 +435,15 @@ open, and both are measured rather than untried
     and **as matmuls all three are 16 of 32, identical to changing nothing.**
     `0x1094` breaks row 0 as well and `0x118c` is the baseline. Six registers,
     none of them a row count.
-    ⚠ What has never been tested is the packing. charsiu writes the activation as
-    `[k/atom][m][atom]` and until round 289 every matmul ran `M = 1`, where `m`
-    drops out of that expression and any arrangement of the rows is correct.
+    ⚠ The packing is not inert but neither guess is right. `[m][k/atom][atom]`
+    and `[k/atom][atom][m]` are both **0 of 32** at M = 2, where the shipped
+    `[k/atom][m][atom]` is 16 of 32: they light row 1 and break row 0 doing it.
+    All three are exact at M = 1, which they must be, since `m` drops out there.
+    Two of them are the ENDS of one axis — the granularity at which rows
+    interleave, every 8 elements for the shipped one and every 64 for "rows
+    outermost" — and nothing between has been written. 32 is the value with a
+    reason: `entries_per_row` is 2 and the input bo is `surf * 64 * m`, so an
+    entry is 64 bytes, which is 32 two-byte elements.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels

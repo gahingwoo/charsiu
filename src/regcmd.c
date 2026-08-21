@@ -265,15 +265,38 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 	 * on --map, and NONE of them makes it read its own data. So the place
 	 * left is the arrangement itself.
 	 *
-	 * CHARSIU_A_LAYOUT picks it:
-	 *   0 (default)  [k/atom][m][atom], rows inside a k group
-	 *   1            [m][k/atom][atom], rows outermost
+	 * ⚠ ROUND 296 RAN THREE ARRANGEMENTS AND THEY ARE THREE POINTS OF ONE
+	 * FAMILY. What separates them is the GRANULARITY at which rows
+	 * interleave: the shipped layout switches rows every atom, 8 elements
+	 * and 16 bytes, and the "rows outermost" one switches every k, the whole
+	 * row. Both are ends of the same axis and nothing between them has ever
+	 * been tried.
+	 *
+	 * 32 elements is the one with a reason behind it. charsiu_entries_per_row
+	 * returns 2 at K = 64 and the input bo is allocated surf * 64 * m, so an
+	 * "entry" is 64 bytes, which at 2 bytes an element is 32 of them. Rows
+	 * interleaving at the entry rather than the atom is the natural reading
+	 * of that allocation and it has never been written.
+	 *
+	 * CHARSIU_A_GRAN is that axis. g elements of row 0, then g of row 1, and
+	 * so on:  e = (kk/g)*m*g + i*g + kk%g
+	 *
+	 *   g = atom (default)   the shipped layout, 296's layout 0
+	 *   g = k                rows outermost, 296's layout 1
+	 *   g = 32               rows per 64 byte entry, never tried
+	 *
+	 * CHARSIU_A_LAYOUT still picks the two non family arrangements:
+	 *   0 (default)  the granularity family above
 	 *   2            [k/atom][atom][m], rows innermost, element interleaved
 	 */
 	{
 		unsigned lay = getenv("CHARSIU_A_LAYOUT")
 			? (unsigned)atoi(getenv("CHARSIU_A_LAYOUT")) : 0;
-		unsigned kg = DIV_ROUND_UP(mm->k, atom);
+		unsigned gran = getenv("CHARSIU_A_GRAN")
+			? (unsigned)atoi(getenv("CHARSIU_A_GRAN")) : atom;
+
+		if (!gran)
+			gran = atom;
 
 		memset(dst, wide ? 0 : (uint8_t)(input_zero_point - 0x80),
 		       dst_size);
@@ -282,18 +305,13 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 				size_t e;
 
 				switch (lay) {
-				case 1:
-					e = (size_t)i * kg * atom
-					    + (size_t)(kk / atom) * atom
-					    + kk % atom;
-					break;
 				case 2:
 					e = (size_t)(kk / atom) * atom * mm->m
 					    + (size_t)(kk % atom) * mm->m + i;
 					break;
 				default:
-					e = (size_t)(kk / atom) * mm->m * atom
-					    + (size_t)i * atom + kk % atom;
+					e = (size_t)(kk / gran) * mm->m * gran
+					    + (size_t)i * gran + kk % gran;
 					break;
 				}
 				dst[e * esz + esz - 1] =
