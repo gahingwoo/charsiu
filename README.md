@@ -374,9 +374,31 @@ works, no override, byte exact against a CPU reference
 open
   N = 24, 40, 56 place the top groups wrong, and the address rule is unmeasured
     anywhere but N = 64
-  half the k reaches any channel, and which half is its parity
   M has only ever been 1
 ```
+
+### "Half the k" is not half the weights
+
+Only half the k reach any channel, but that is a statement about the reduction
+depth and **not** about wasted weights. Every nibble the packer writes is
+fetched: a channel gets two eight byte groups, 32 nibbles, and it is fed exactly
+32 k, one per nibble. So a job declared at `K` computes a correct `K/2` deep
+reduction, and what is wasted is buffer *space*, 2048 bytes allocated to hold
+1024 bytes of live nibbles.
+
+That also puts the two working configurations on a comparable footing:
+
+```
+shipped arithmetic, 0x3020 = 111    64 channels x 32 k  = 2048 MACs a job
+                                    exact, and it runs today
+PROC_PRECISION = 0                  40 channels x 64 k  = 2560 MACs a job
+                                    but out = 127 * w unless the activation is
+                                    one byte wide, and that halves the k back
+```
+
+The second is the larger job if its arithmetic can be made to hold, which is
+what the `A8_STRIDE1` thread was chasing when it found `out = a * w` on one of
+the two paired k.
 
 ### What is still open on int4
 
