@@ -407,8 +407,9 @@ N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
 ### Where int4 stands
 
 ```
-works, no override, byte exact against a CPU reference, eleven geometries
-  N = 16, 24, 32, 40, 48, 56, 64, 72, 80, 88 at K = 64,  and N = 64 at K = 32
+works, no override, byte exact against a CPU reference, fourteen geometries
+  N = 16, 24, 32, 40, 48, 56, 64, 72, 80, 88 at K = 64
+  N = 64 at K = 32,  and N = 64, 32, 24 at K = 128
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
@@ -448,14 +449,17 @@ open, and both are measured rather than untried
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
     12-15 and 20-23 into them. Both match the mismatch lists exactly. Measured at
     two N, no rule written.
-  ⚠ K blocks the goal: a projection in a small model is K = 2048 by N = 1024 and
-    every int4 measurement was at 32 or 64. K = 128 swept clean — group bases
-    0, 128, 1024, 1152, 2048, 2176, 3072, 3136, which is 8*K exactly — so the
-    block stride scales. The GROUP COUNT was another K = 64 coincidence: a
-    channel is fed by K/32 runs of eight bytes spaced a constant 256, which is
-    1, 2 and 4 at K of 32, 64 and 128, and the packer wrote two at an offset of
-    4*K, which equals 256 only when K is 64. charsiu_bench has no int4 path, so
-    "what does int4 buy" still cannot be asked.
+  ⚠ The LAYOUT scales in K and the CHANNEL COUNT does not. K = 128 is exact at
+    three N once the group count is right: a channel is fed by K/32 runs of eight
+    bytes spaced a constant 256 — 1, 2 and 4 at K of 32, 64 and 128 — where the
+    packer wrote two at an offset of 4*K, which equals 256 only when K is 64.
+    That was the same trap as `8*K` against `wbytes/4`.
+    At K = 256 the score is exactly half, and the reason is above the score:
+    `wrote 40 of 64` and `wrote 24 of 32`, which are `N/2 + 8`, the count from
+    before `0x3020` was fixed. The register gives 64 channels at K = 64 and
+    K = 128 and 40 at K = 256, so something caps it between those two, and that
+    is what an LLM shape at K = 2048 would hit.
+  charsiu_bench has no int4 path, so "what does int4 buy" still cannot be asked.
 ```
 
 ### "Half the k" is not half the weights
