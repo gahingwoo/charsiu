@@ -370,31 +370,29 @@ N = 24  measured 0, 128, 192              8*K said 0, 128, 512
 N = 40  measured 0, 128, 512, 576, 704    8*K said ... 640, 1024
 ```
 
-Laid beside the five geometries that already worked, the shape is regular and it
-is **not a stride at all**. Groups of eight channels sit two to a *block* of
-`8*K` bytes at *slots* of 64 bytes, and only the last block differs:
+The **skeleton** is regular and K independent. Groups of eight channels sit in
+*blocks* of `8*K` bytes at *slots* of 64, with a channel's k+ half four slots on,
+and the `K = 32` table decomposes exactly like the `K = 64` one — only the block
+stride scales.
+
+**Which slots is not regular.** Written as `(block, slot)`:
 
 ```
-block stride S = 8*K        slot 64        the k+ half at S/2, when K > 32
-
-a full block            slots 0 and 2
-last block, 2 left      slots 0, 1
-last block, 3 left      slots 0, 2, 3 if it is ALSO the first block
-                        slots 0, 1, 3 otherwise
+G=2  (0,0)(0,1)                 G=6  (0,0)(0,2)(1,0)(1,2)(2,0)(2,1)
+G=3  (0,0)(0,2)(0,3)            G=7  (0,0)(0,2)(1,0)(1,2)(1,3)(2,1)(2,3)
+G=4  (0,0)(0,2)(1,0)(1,1)       G=8  (0,0)(0,2)(1,0)(1,2)(2,0)(2,2)(3,0)(3,1)
+G=5  (0,0)(0,2)(1,0)(1,1)(1,3)
 ```
 
-That reproduces every table measured — forty bases across seven geometries:
+`G=5`'s three-group block is `{0,1,3}` and `G=7`'s is `{0,2,3}`. `G=7`'s last
+block is `{1,3}` where every other last block of two is `{0,1}`.
 
-```
-N=16  0 64                    N=48  0 128 512 640 1024 1088
-N=24  0 128 192               N=64  0 128 512 640 1024 1152 1536 1600
-N=32  0 128 512 576           N=64 K=32  0 128 256 384 512 640 768 832
-N=40  0 128 512 576 704
-```
-
-⚠ `N = 56` is the one geometry not behind it: the only case whose last block
-holds three groups and is not also the first, so the "otherwise" arm rests on
-`N = 40` alone. It predicts 1024, 1088 and 1216.
+⚠ **Two closed forms have been fitted to this and both died in one round.**
+`wbytes/4`, which also broke three working geometries, and "the last block takes
+the odd slots", which put `g4` of `N = 56` at 1024 where `--map` found it at 704.
+So the packer holds the measurement and refuses outside it: `--map` has swept the
+whole buffer at every `N` that is a multiple of 8 up to 64, and `G = 9` and above
+have never been swept.
 
 ### Where int4 stands
 
@@ -404,7 +402,8 @@ works, no override, byte exact against a CPU reference
   64 channels, 32 real k each, out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
 open
-  N = 56 is the one geometry the block and slot rule has nothing behind it at
+  G = 9 and above (N > 64) have never been swept, and the slot pattern has no
+    closed form to extrapolate with
   M has only ever been 1
 ```
 

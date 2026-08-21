@@ -410,68 +410,59 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * number.
 			 */
 			/*
-			 * ⚠ BLOCKS AND SLOTS, not a stride. Round 285 swept
-			 * --map over the whole buffer at N = 24 and N = 40,
-			 * which is the first time the map was read anywhere but
-			 * N = 64, and both disagreed with 8*K:
+			 * ⚠ A MEASURED TABLE. Two closed forms have now been
+			 * fitted to this and both were refuted by the next
+			 * round: wbytes/4 in 284, and "the last block takes the
+			 * odd slots" in 286, which put g4 of N = 56 at 1024
+			 * where --map found it at 704.
 			 *
-			 *   N = 24  measured 0, 128, 192    8*K said 0, 128, 512
-			 *   N = 40  measured 0, 128, 512, 576, 704
+			 * The skeleton IS regular and it is K independent.
+			 * Groups of eight channels sit in BLOCKS of 8*K bytes at
+			 * SLOTS of 64, with a channel's k+ half four slots on,
+			 * and the K = 32 table decomposes exactly like the
+			 * K = 64 one, so only the block stride scales.
 			 *
-			 * Laid beside the five geometries that already worked,
-			 * the shape is regular. Groups of eight channels sit two
-			 * to a BLOCK of 8*K bytes, at SLOTS of 64 bytes, and
-			 * only the last block differs:
+			 * WHICH slots is not regular. Written as (block, slot):
 			 *
-			 *   block stride  S = 8*K        slot size 64
-			 *   the k+ half   S/2 on, when K > 32
-			 *   a full block  slots 0 and 2
-			 *   last block, 2 left   slots 0, 1
-			 *   last block, 3 left   slots 0, 2, 3 if it is also the
-			 *                        FIRST block, otherwise 0, 1, 3
+			 *   G=2  (0,0)(0,1)
+			 *   G=3  (0,0)(0,2)(0,3)
+			 *   G=4  (0,0)(0,2)(1,0)(1,1)
+			 *   G=5  (0,0)(0,2)(1,0)(1,1)(1,3)
+			 *   G=6  (0,0)(0,2)(1,0)(1,2)(2,0)(2,1)
+			 *   G=7  (0,0)(0,2)(1,0)(1,2)(1,3)(2,1)(2,3)
+			 *   G=8  (0,0)(0,2)(1,0)(1,2)(2,0)(2,2)(3,0)(3,1)
 			 *
-			 * That reproduces all seven measured tables, forty bases:
+			 * G=5's three group block is {0,1,3} and G=7's is
+			 * {0,2,3}; G=7's last block is {1,3} where every other
+			 * last block of two is {0,1}. Any rule covering both is
+			 * a rule fitted to one point each, which is exactly what
+			 * 284 and 286 were.
 			 *
-			 *   N=16 K=64  0 64
-			 *   N=24       0 128 192
-			 *   N=32       0 128 512 576
-			 *   N=40       0 128 512 576 704
-			 *   N=48       0 128 512 640 1024 1088
-			 *   N=64       0 128 512 640 1024 1152 1536 1600
-			 *   N=64 K=32  0 128 256 384  512  640  768  832
-			 *
-			 * ⚠ N = 56 IS THE ONE CASE NOT BEHIND THIS. It is the
-			 * only geometry whose last block has three groups and is
-			 * not also the first, so the "0, 1, 3 otherwise" arm
-			 * rests on N = 40 alone. It predicts 1024, 1088, 1216.
+			 * So this is the measurement, from --map sweeps of the
+			 * whole buffer at every N that is a multiple of 8 up to
+			 * 64, and it refuses anything else. G = 9 and above have
+			 * never been swept.
 			 */
+			static const unsigned char tab[9][8][2] = {
+				{{0}}, {{0}},
+				{ {0,0},{0,1} },
+				{ {0,0},{0,2},{0,3} },
+				{ {0,0},{0,2},{1,0},{1,1} },
+				{ {0,0},{0,2},{1,0},{1,1},{1,3} },
+				{ {0,0},{0,2},{1,0},{1,2},{2,0},{2,1} },
+				{ {0,0},{0,2},{1,0},{1,2},{1,3},{2,1},{2,3} },
+				{ {0,0},{0,2},{1,0},{1,2},{2,0},{2,2},{3,0},{3,1} },
+			};
 			unsigned g = n / 8;
 			unsigned ngrp = DIV_ROUND_UP(mm->n, 8);
-			unsigned nblk = (ngrp & 1) ? (ngrp - 1) / 2 : ngrp / 2;
-			unsigned first_last = 2 * (nblk - 1);
-			unsigned rem = ngrp - first_last;
-			size_t stride = (size_t)8 * mm->k;
-			unsigned blk, slot;
+			size_t row;
 
-			if (ngrp < 2 || nblk == 0)
-				return;                 /* unmeasured */
+			if (ngrp < 2 || ngrp > 8)
+				return;                 /* never swept */
 
-			if (g < first_last) {
-				blk = g / 2;
-				slot = (g & 1) ? 2 : 0;
-			} else {
-				static const unsigned s2[2]      = { 0, 1 };
-				static const unsigned s3first[3] = { 0, 2, 3 };
-				static const unsigned s3rest[3]  = { 0, 1, 3 };
-				unsigned idx = g - first_last;
-
-				blk = nblk - 1;
-				slot = rem == 2 ? s2[idx]
-				     : (nblk == 1 ? s3first[idx] : s3rest[idx]);
-			}
-
-			size_t row = (size_t)blk * stride + (size_t)slot * 64
-				     + (size_t)(n % 8) * 8;
+			row = (size_t)tab[ngrp][g][0] * 8 * mm->k
+			      + (size_t)tab[ngrp][g][1] * 64
+			      + (size_t)(n % 8) * 8;
 			unsigned half;
 
 			/*
@@ -480,7 +471,8 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
 			 */
 			for (half = 0; half < (mm->k > 32 ? 2u : 1u); half++) {
-				size_t gb = row + (size_t)half * (stride / 2);
+				/* four slots on, which is half a block */
+				size_t gb = row + (size_t)half * 4 * mm->k;
 				unsigned j;
 
 				for (j = 0; j < 16; j++) {
