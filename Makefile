@@ -10,7 +10,8 @@ BUILD  := build
 CROSS  ?= $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 
 SRC    := src/regcmd.c src/device.c src/job.c
-LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c
+LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
+          src/npudev.c src/device.c src/job.c src/regcmd.c
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run
 

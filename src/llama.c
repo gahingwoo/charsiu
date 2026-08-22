@@ -110,6 +110,13 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
  * the hardware takes, built on first use. A linear lookup over at most 145
  * entries, which is nothing next to the matmul it is about to do.
  */
+static unsigned npu_maxn(void)
+{
+	const char *e = getenv("CHARSIU_NPU_MAXN");
+
+	return e ? (unsigned)atoi(e) : 8192;
+}
+
 static int npu_mode(void)
 {
 	static int m = -1;
@@ -133,6 +140,23 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 		return NULL;
 	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0)
 		return NULL;
+	/*
+	 * And onto the hardware, if this run asked for it and this tensor is
+	 * one of the ones asked for. CHARSIU_NPU_ONLY narrows it to names
+	 * containing a substring, which is how a disagreement gets bisected to
+	 * one projection instead of a hundred and thirteen.
+	 */
+	s->npu_id[s->n_npu] = -1;
+	if (s->dev) {
+		const char *only = getenv("CHARSIU_NPU_ONLY");
+
+		if ((!only || strstr(w->name, only)) &&
+		    w->ne[1] <= (uint64_t)npu_maxn())
+			s->npu_id[s->n_npu] = charsiu_npu_add(s->dev, &s->npu[s->n_npu]);
+		if (getenv("CHARSIU_NPU_VERBOSE"))
+			fprintf(stderr, "  -> %s\n",
+				s->npu_id[s->n_npu] >= 0 ? "on the NPU" : "on the CPU");
+	}
 	if (getenv("CHARSIU_NPU_VERBOSE"))
 		fprintf(stderr, "npu-quant  %-28s  %llu x %llu  rms %.4f%%\n",
 			w->name, (unsigned long long)w->ne[1],
@@ -175,6 +199,27 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	/* f32 and f16 stay where they are: the NPU takes int8 operands */
 	if (npu_mode() && a->q1_valid && w->type != GGML_F32 && w->type != GGML_F16)
 		nt = npu_get(s, w);
+
+	/* the hardware path is one submit and does not fan out */
+	if (nt) {
+		int id = -1;
+
+		for (unsigned i = 0; i < s->n_npu; i++)
+			if (&s->npu[i] == nt) {
+				id = s->npu_id[i];
+				break;
+			}
+		if (id >= 0) {
+			if (charsiu_npu_matvec(s->dev, id, a, y)) {
+				fprintf(stderr, "charsiu: NPU matvec failed on %s\n",
+					nt->name);
+				exit(1);
+			}
+			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
+					    npu_out8_mode());
+			return;
+		}
+	}
 
 	if (g_pool.n <= 1) {
 		if (nt) {
@@ -454,9 +499,26 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->npu_cap = m->n_layer * 9 + 2;
 	s->npu = calloc(s->npu_cap, sizeof(*s->npu));
 	s->npu_key = calloc(s->npu_cap, sizeof(*s->npu_key));
-	if (!s->npu || !s->npu_key) {
+	s->npu_id = calloc(s->npu_cap, sizeof(*s->npu_id));
+	if (!s->npu || !s->npu_key || !s->npu_id) {
 		llama_state_free(s);
 		return NULL;
+	}
+
+	if (getenv("CHARSIU_NPU")) {
+		const char *e = getenv("CHARSIU_NPU_MAXN");
+		unsigned maxn = e ? (unsigned)atoi(e) : 8192;
+		unsigned widest = m->n_embd > m->n_ff ? m->n_embd : m->n_ff;
+
+		if (maxn > m->n_vocab)
+			maxn = m->n_vocab;
+		s->dev = charsiu_npu_open(widest, maxn, s->npu_cap);
+		if (!s->dev) {
+			fprintf(stderr, "charsiu: no NPU; staying on the CPU\n");
+		} else {
+			fprintf(stderr, "charsiu: NPU open, routing tensors with "
+				"n <= %u\n", maxn);
+		}
 	}
 
 	if (!s->kcache || !s->vcache || !s->x || !s->xb || !s->xb2 || !s->hb ||
@@ -481,12 +543,14 @@ void llama_state_free(struct llama_state *s)
 	charsiu_act_free(&s->act);
 	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
 		npu_report(s->npu, s->n_npu);
+	charsiu_npu_close(s->dev);
 	if (s->npu) {
 		for (unsigned i = 0; i < s->n_npu; i++)
 			npu_tensor_free(&s->npu[i]);
 		free(s->npu);
 	}
 	free(s->npu_key);
+	free(s->npu_id);
 	free(s);
 }
 

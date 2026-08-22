@@ -173,6 +173,18 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
  *           a coefficient buffer actually holds. Records what it clips.
  */
 void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode);
+
+/* ---- and the same thing on the hardware ---------------------------------- */
+
+struct charsiu_npu;
+
+struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
+				     unsigned max_tensors);
+void charsiu_npu_close(struct charsiu_npu *g);
+int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
+int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
+			const struct charsiu_act *a, float *y);
+unsigned long charsiu_npu_submits(const struct charsiu_npu *g);
 void npu_report(const struct npu_tensor *t, unsigned count);
 int  npu_out8_mode(void);
 
@@ -267,7 +279,9 @@ struct llama_state {
 	 * format the hardware takes. Built on first use. */
 	struct npu_tensor *npu;
 	const struct gguf_tensor **npu_key;
+	int *npu_id;              /* >= 0 when the tensor is on the hardware */
 	unsigned n_npu, npu_cap;
+	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */
 };
 
 int  llama_load(struct llama_model *m, const char *path);

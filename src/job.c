@@ -593,6 +593,11 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		const char *e8 = getenv("CHARSIU_WIDE8");
 
 		wide8 = e8 ? (unsigned)strtoul(e8, NULL, 0) : 0;
+		if (job->acc_out)
+			wide8 = 0x3f;       /* the whole stage, which is the only
+					     * combination that works: round 311
+					     * wedged the block on 0x4010 alone
+					     * and on 0x4050 alone. */
 		if (mm->wdtype != CHARSIU_INT8)
 			wide8 = 0;
 	}
@@ -731,7 +736,18 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x40ac, WIDE(5) ? 0u : (uint32_t)rq.offset);
 	emit(&e, DPU, 0x40b0, WIDE(5) ? 1u : rq.scale);
 	emit(&e, DPU, 0x40b4, WIDE(5) ? 0u : rq.shift);
-	emit(&e, DPU, 0x40b8, 1 * (2 * rows - rows));   /* ow * (2*oh - window) */
+	/*
+	 * 0x40b8. int8 computes ow * (2*oh - window), which is 1 at M = 1, and
+	 * the vendor's w4a16 output stage writes 3 -- the ONLY register left
+	 * differing after the whole bundle is applied, found by diffing
+	 * emit_job's stream against the .rkllm's 67 register DPU block offline.
+	 *
+	 * Round 312 swept it and 3 is a peak on both columns rather than a
+	 * trend: bytes written 112, 160, 208, 256, 208, 128, 64 and elements
+	 * exact 4, 8, 12, 64, 16, 16, 16 at 0, 1, 2, 3, 4, 7, 15.
+	 */
+	emit(&e, DPU, 0x40b8, job->acc_out ? 3u
+					   : (uint32_t)(1 * (2 * rows - rows)));
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
 	emit(&e, DPU, 0x40c8, 0x00000000);

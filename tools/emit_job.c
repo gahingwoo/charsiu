@@ -25,6 +25,7 @@ int main(int argc, char **argv)
 	if (argc > 5 && !strcmp(argv[5], "fp16")) job.mm.adtype = CHARSIU_FP16;
 	job.input_scale = 0.02f; job.weight_scale = 0.01f; job.output_scale = 0.25f;
 	job.input_zero_point = 128; job.weight_zero_point = 128;
+	job.acc_out = getenv("CHARSIU_ACC_OUT") != NULL;
 	job.output_zero_point = 128;
 	job.input_addr = 0x1000; job.weight_addr = 0x3000;
 	job.output_addr = 0x5000; job.coef_addr = 0x7000;

@@ -204,6 +204,23 @@ struct charsiu_job {
 	int input_zero_point;
 	int weight_zero_point;
 	int output_zero_point;
+
+	/*
+	 * The output is the RAW SIGNED 32 BIT ACCUMULATOR, four bytes an
+	 * element, not a byte requantised through the coefficient buffer.
+	 *
+	 * A projection has to leave the NPU this way. A coefficient buffer's
+	 * output scale is frozen when the buffer is built, and ffn_down's
+	 * output magnitude moves by 2971x between tokens, so a scale sized for
+	 * the largest vector quantises a typical one to nothing -- measured on
+	 * the CPU model of this format, where a frozen scale turns the right
+	 * sentence into "a country".
+	 *
+	 * It is the vendor's own w4a16 output stage, applied to int8 weights.
+	 * Board round 312, M=1 K=2048 N=1024: 4096 of 4096 bytes written and
+	 * 1024 of 1024 elements byte exact against the accumulator.
+	 */
+	int acc_out;
 };
 
 /* The whole stream, addresses and requant included. */
