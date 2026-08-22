@@ -383,6 +383,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned lines = rows - 1;              /* the DPU's line count */
 	size_t wbytes = charsiu_weight_bytes(mm);
 	int w4a16 = 0, w4_dpu = 0;
+	unsigned wide8 = 0;
 	unsigned rdma_mask;
 	unsigned r;
 
@@ -566,6 +567,36 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * without it the run is not w4a16 at all.
 	 */
 	w4_dpu = w4a16 && !getenv("CHARSIU_W4_NO_DPU");
+
+	/*
+	 * CHARSIU_WIDE8 forces parts of the w4a16 OUTPUT STAGE onto an int8
+	 * weight job, one bit per register, so a board round can find which one
+	 * makes the output four bytes wide instead of one.
+	 *
+	 * It is needed because a projection cannot leave the NPU as a byte. The
+	 * coefficient buffer's scale is fixed at build time, and the output
+	 * magnitude of ffn_down varies by up to 2971x between tokens, so a
+	 * scale sized for the largest vector quantises a typical one to nothing.
+	 * Measured on the CPU model of this format, not assumed:
+	 * CHARSIU_NPU_OUT8 with a frozen scale produces "a country" where the
+	 * float output produces the right sentence.
+	 *
+	 *   bit 0  0x4010   bit 1  0x4030 low   bit 2  0x4038
+	 *   bit 3  0x4044   bit 4  0x4050       bit 5  0x40ac/b0/b4 identity
+	 *
+	 * CHARSIU_WIDE8=0x3f is the whole bundle. The bits exist separately
+	 * because "the whole bundle changed something" does not say which
+	 * register the width lives in, and a single field sweep is the method
+	 * that worked on 0x4050 in round 260.
+	 */
+	{
+		const char *e8 = getenv("CHARSIU_WIDE8");
+
+		wide8 = e8 ? (unsigned)strtoul(e8, NULL, 0) : 0;
+		if (mm->wdtype != CHARSIU_INT8)
+			wide8 = 0;
+	}
+#define WIDE(bit) (w4_dpu || (wide8 & (1u << (bit))))
 	/*
 	 * THE RDMA COEFFICIENT FETCH GROUP IS OFF BY DEFAULT SINCE ROUND 192,
 	 * because two of its four registers each leave the NPU unable to start
@@ -606,7 +637,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 					      NULL, 0);
 
 	emit(&e, DPU, 0x400c, 0x40000004);
-	emit(&e, DPU, 0x4010, w4_dpu ? 0xa0000002u : 0x00000000u);
+	emit(&e, DPU, 0x4010, WIDE(0) ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
 	emit(&e, DPU, 0x401c, rows);            /* ow * full_oh */
@@ -630,19 +661,19 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) |
 	     (uint32_t)(getenv("CHARSIU_DPU_4030")
 			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
-			: (w4_dpu ? 0x0310u : 0x0710u)));
+			: (WIDE(1) ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, (lines << 16) | 0);
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
 	 * here, but those are elementwise ops rather than convolutions, so it
 	 * is a candidate to sweep and not a value to copy. */
 	emit(&e, DPU, 0x4038, (uint32_t)(getenv("CHARSIU_DPU_4038")
 					 ? strtoul(getenv("CHARSIU_DPU_4038"), NULL, 0)
-					 : (w4_dpu ? 0x00000053u : 0x00120080u)));
+					 : (WIDE(2) ? 0x00000053u : 0x00120080u)));
 	emit(&e, DPU, 0x403c, 0x00000000);
-	emit(&e, DPU, 0x4044, w4_dpu ? 0x00000002u : 0x00000001u);
+	emit(&e, DPU, 0x4044, WIDE(3) ? 0x00000002u : 0x00000001u);
 	emit(&e, DPU, 0x4048, 0x80000000);
 	emit(&e, DPU, 0x404c, 0x7fffffff);
-	emit(&e, DPU, 0x4050, w4_dpu ? 0x00023333u : 0x80011111u);
+	emit(&e, DPU, 0x4050, WIDE(4) ? 0x00023333u : 0x80011111u);
 	emit(&e, DPU, 0x4058, 0x80000000);
 	emit(&e, DPU, 0x405c, 0x7fffffff);
 	/*
@@ -697,15 +728,16 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x40a8, 0x7fffffff);
 	/* w4a16 does not requantise: the vendor writes 0, 1, 0 here and the
 	 * output leaves as a float. */
-	emit(&e, DPU, 0x40ac, w4_dpu ? 0u : (uint32_t)rq.offset);
-	emit(&e, DPU, 0x40b0, w4_dpu ? 1u : rq.scale);
-	emit(&e, DPU, 0x40b4, w4_dpu ? 0u : rq.shift);
+	emit(&e, DPU, 0x40ac, WIDE(5) ? 0u : (uint32_t)rq.offset);
+	emit(&e, DPU, 0x40b0, WIDE(5) ? 1u : rq.scale);
+	emit(&e, DPU, 0x40b4, WIDE(5) ? 0u : rq.shift);
 	emit(&e, DPU, 0x40b8, 1 * (2 * rows - rows));   /* ow * (2*oh - window) */
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
 	emit(&e, DPU, 0x40c8, 0x00000000);
 	emit(&e, DPU, 0x40cc, 0x00000000);
 	emit(&e, DPU, 0x40d0, 0x0040ffff);
+#undef WIDE
 	for (r = 0x4100; r <= 0x4120; r += 4)
 		emit(&e, DPU, r, 0x00000000);
 	emit(&e, DPU, 0x4130, 0x00000000);
