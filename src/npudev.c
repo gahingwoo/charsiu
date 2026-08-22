@@ -473,7 +473,19 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		charsiu_bo_fini(g->dev, &g->out);
 		g->weight_mb += e->weight_mb;
 
-		if (now_us() - t0 > g->slow_us * (g->nochain ? e->count : 1))
+		/*
+		 * The limit has to scale with what the submit fetches, or a
+		 * legitimate big one is mistaken for a wedge. The output head is
+		 * 263 MB in a single submit; at the measured 10 GB/s that is
+		 * 26 ms, and a flat 100 ms would still be generous -- but at
+		 * 1 ms a megabyte, which is ten times slower than anything this
+		 * hardware has ever done, it cannot be wrong by accident.
+		 */
+		double budget = g->slow_us + e->weight_mb * 1000.0;
+
+		if (g->nochain)
+			budget = g->slow_us * e->count + e->weight_mb * 1000.0;
+		if (now_us() - t0 > budget)
 			g->strikes++;
 		else
 			g->strikes = 0;
