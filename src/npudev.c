@@ -82,6 +82,13 @@ struct charsiu_npu {
 	unsigned n_ent, ent_cap;
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
+	/*
+	 * Wall clock actually spent in the hardware path, submit and read back
+	 * together. Three tokens per second predictions in a row were wrong
+	 * because a cost was assumed rather than measured, so the split between
+	 * the NPU and the CPU stops being an inference here.
+	 */
+	double busy_us;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -231,6 +238,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		g->n_ent, g->slices, g->submits,
 		g->submits ? g->weight_mb / (double)g->submits : 0.0,
 		g->dead ? "  (RETIRED: it stopped answering)" : "");
+	if (g->submits)
+		fprintf(stderr,
+			"charsiu NPU: %.0f ms in the hardware path, %.2f GB/s "
+			"of weights, %.0f us a submit\n",
+			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
+			g->busy_us / (double)g->submits);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -492,6 +505,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		charsiu_bo_fini(g->dev, &e->out);
 		g->weight_mb += e->weight_mb;
+		g->busy_us += now_us() - t0;
 
 		/*
 		 * The limit scales with what the submit fetches, or a legitimate
