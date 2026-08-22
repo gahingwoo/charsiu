@@ -37,47 +37,58 @@
  * Round 313 put every attention projection on the hardware and got tokens
  * identical to the CPU, then wedged the board on the feed forward: ffn_gate is
  * N = 8192 and ffn_down is K = 8192, and the largest shape anything had been
- * measured at was N = 1024, K = 2048. A 16.8 MB job is eight times the biggest
- * one that has ever worked here.
+ * measured at was N = 1024, K = 2048. So a projection is cut into slices of a
+ * shape that HAS been measured. acc_out is what makes that exact: a raw int32
+ * sum means partial sums over a split K add with no rounding at all.
  *
- * So a projection is cut into slices of a shape that HAS been measured. The
- * output makes that exact rather than approximate: acc_out hands back a raw
- * int32 sum, so partial sums over a split K add up with no rounding at all.
+ * ⚠ AND THE SLICES OF ONE PROJECTION GO IN ONE SUBMIT. Round 316 ran all 112
+ * projections correctly at 480 UNCHAINED submits a token, which is about 91 ms
+ * of fixed cost and left the NPU slower than the CPU. Chaining is what the
+ * measurement has been pointing at since round 165: break even is 2.2 MB of
+ * weights a submit, and a whole ffn_gate is 16 MB.
+ *
+ * That needs every slice to write somewhere different, so each one gets its own
+ * region of the output buffer and its own region of the input buffer, baked
+ * into its register stream when it is built.
  */
 struct npu_slot {
 	struct charsiu_bo wt, coef, regcmd;
 	struct charsiu_job job;
 	unsigned nreg;
 	unsigned n0, k0;           /* where this slice starts in the tensor */
+	unsigned out_slot;         /* which output region it writes */
 };
 
 struct npu_entry {
 	const struct npu_tensor *t;
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
+	double weight_mb;          /* what one submit fetches */
 };
 
 struct charsiu_npu {
 	struct charsiu_device *dev;
 	struct charsiu_bo in, out;
-	uint8_t *scratch;          /* unsigned bytes for the packers */
-	int32_t *acc;              /* partial sums over the K slices */
+	unsigned in_stride, out_stride, max_slices;
+	uint8_t *scratch;
+	int32_t *acc;
+	struct charsiu_task *tasks;
+	uint32_t *handles;
 	unsigned nmax, kmax, max_n;
 	struct npu_slot *slot;
 	unsigned n_slot, slot_cap;
 	struct npu_entry *ent;
 	unsigned n_ent, ent_cap;
 	unsigned long submits;
+	double weight_mb;          /* summed over submits, for the report */
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
 	 * the ioctl still returns success, so the only reliable detector is the
-	 * clock. Three slow submits and this path retires itself: the caller
-	 * falls back to the CPU and the run finishes and reports, instead of
-	 * repeating a 1.9 second timeout until someone pulls the power.
+	 * clock. Three slow submits and this path retires itself.
 	 */
 	double slow_us;
-	int strikes, dead, whined;
+	int strikes, dead, whined, nochain;
 	unsigned long slices;
 };
 
@@ -96,10 +107,27 @@ static unsigned env_u(const char *name, unsigned dflt)
 	return e ? (unsigned)strtoul(e, NULL, 0) : dflt;
 }
 
+/*
+ * Say why, out loud, the first time.
+ *
+ * Round 315 ran a whole ladder in which the hardware never engaged, and the
+ * text was right every time because the CPU quietly did the work. A silent
+ * fallback is worse than a loud failure: it produces a result that looks like
+ * evidence.
+ */
+static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned n)
+{
+	if (g->whined)
+		return;
+	g->whined = 1;
+	fprintf(stderr, "charsiu: NOT on the NPU -- %s (K=%u N=%u)\n", what, k, n);
+}
+
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors)
 {
 	struct charsiu_npu *g = calloc(1, sizeof(*g));
+	unsigned ns, ks;
 
 	if (!g)
 		return NULL;
@@ -108,36 +136,42 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 		free(g);
 		return NULL;
 	}
-	/*
-	 * The defaults are the shapes round 312 measured exact, not the shapes
-	 * the model happens to want.
-	 */
+	/* the shapes round 312 measured exact, not the shapes a model wants */
 	g->nmax = env_u("CHARSIU_NPU_NMAX", 1024);
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 2048);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
+	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
 	g->max_n = max_n;
 	g->ent_cap = max_tensors;
-	/* worst case slices per tensor, times the tensors */
-	g->slot_cap = max_tensors *
-		((max_n + g->nmax - 1) / g->nmax) *
-		((max_k + g->kmax - 1) / g->kmax);
-	g->ent = calloc(g->ent_cap, sizeof(*g->ent));
-	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
-	g->scratch = malloc((size_t)g->nmax * g->kmax + max_k);
-	g->acc = calloc(max_n, sizeof(*g->acc));
-	if (!g->ent || !g->slot || !g->scratch || !g->acc)
-		goto fail;
+
+	ns = (max_n + g->nmax - 1) / g->nmax;
+	ks = (max_k + g->kmax - 1) / g->kmax;
+	g->max_slices = ns * ks;
+	g->slot_cap = max_tensors * g->max_slices;
 
 	{
 		struct charsiu_matmul widest = { 1, g->kmax, g->nmax,
 						 CHARSIU_INT8, CHARSIU_INT8 };
 
-		if (charsiu_bo_alloc(g->dev,
-				     (size_t)charsiu_entries_per_row(&widest) * 64 + 4096,
-				     &g->in) ||
-		    charsiu_bo_alloc(g->dev, (size_t)g->nmax * 4 + 4096, &g->out))
-			goto fail;
+		g->in_stride = charsiu_entries_per_row(&widest) * 64;
+		g->out_stride = g->nmax * 4;
 	}
+
+	g->ent = calloc(g->ent_cap, sizeof(*g->ent));
+	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
+	g->scratch = malloc((size_t)g->nmax * g->kmax + max_k);
+	g->acc = calloc(max_n, sizeof(*g->acc));
+	g->tasks = calloc(g->max_slices, sizeof(*g->tasks));
+	/* input + one weight and one coefficient buffer per chained task */
+	g->handles = calloc(1 + 2 * g->max_slices, sizeof(*g->handles));
+	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->tasks ||
+	    !g->handles)
+		goto fail;
+
+	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in) ||
+	    charsiu_bo_alloc(g->dev, (size_t)g->out_stride * g->max_slices + 4096,
+			     &g->out))
+		goto fail;
 	return g;
 
 fail:
@@ -163,6 +197,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->ent);
 	free(g->scratch);
 	free(g->acc);
+	free(g->tasks);
+	free(g->handles);
 	free(g);
 }
 
@@ -175,14 +211,19 @@ unsigned long charsiu_npu_submits(const struct charsiu_npu *g)
  * What the hardware actually did, printed whether it went well or not. A run
  * that cannot say how many jobs it submitted cannot be read as evidence about
  * the hardware, and round 315 was exactly that run.
+ *
+ * The megabytes per submit are here because that is the number the whole
+ * chaining question turns on: break even against the fixed submit cost is 2.2.
  */
 void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)
 		return;
 	fprintf(stderr,
-		"charsiu NPU: %u tensors, %lu slices, %lu submits%s\n",
+		"charsiu NPU: %u tensors, %lu slices, %lu submits, %.2f MB per "
+		"submit%s\n",
 		g->n_ent, g->slices, g->submits,
+		g->submits ? g->weight_mb / (double)g->submits : 0.0,
 		g->dead ? "  (RETIRED: it stopped answering)" : "");
 	if (!g->submits)
 		fprintf(stderr,
@@ -190,26 +231,10 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"in this run came from the CPU.\n");
 }
 
-/* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t. */
-/*
- * Say why, out loud, the first time.
- *
- * Round 315 ran a whole ladder in which the hardware never engaged, and the
- * text was right every time because the CPU quietly did the work. The rung that
- * caught it was the CONTROL THAT WAS SUPPOSED TO FAIL and did not. A silent
- * fallback is worse than a loud failure: it produces a result that looks like
- * evidence.
- */
-static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned n)
-{
-	if (g->whined)
-		return;
-	g->whined = 1;
-	fprintf(stderr, "charsiu: NOT on the NPU -- %s (K=%u N=%u)\n", what, k, n);
-}
-
+/* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t, writing region si. */
 static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
-		     unsigned n0, unsigned n, unsigned k0, unsigned k)
+		     unsigned n0, unsigned n, unsigned k0, unsigned k,
+		     unsigned ki, unsigned si)
 {
 	struct npu_slot *s = &g->slot[g->n_slot];
 	int32_t *bias = NULL, *wsum = NULL;
@@ -218,6 +243,7 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	memset(s, 0, sizeof(*s));
 	s->n0 = n0;
 	s->k0 = k0;
+	s->out_slot = si;
 	s->job.mm.m = 1;
 	s->job.mm.k = k;
 	s->job.mm.n = n;
@@ -238,8 +264,9 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 		goto out;
 	}
 
-	s->job.input_addr = (uint32_t)g->in.dma_address;
-	s->job.output_addr = (uint32_t)g->out.dma_address;
+	/* its own slot in each shared buffer, baked into the stream */
+	s->job.input_addr = (uint32_t)g->in.dma_address + ki * g->in_stride;
+	s->job.output_addr = (uint32_t)g->out.dma_address + si * g->out_stride;
 	s->job.weight_addr = (uint32_t)s->wt.dma_address;
 	s->job.coef_addr = (uint32_t)s->coef.dma_address;
 
@@ -255,18 +282,18 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	charsiu_pack_weights(&s->job.mm, g->scratch, s->wt.map);
 	charsiu_bo_fini(g->dev, &s->wt);
 
-	/* the weight sums this slice's K range accounts for, not the tensor's */
 	bias = calloc(n, sizeof(*bias));
 	wsum = calloc(n, sizeof(*wsum));
 	if (!bias || !wsum)
 		goto out;
+	/* the weight sums this slice's K range accounts for, not the tensor's */
 	for (unsigned r = 0; r < n; r++) {
 		const int8_t *src = t->q + (size_t)(n0 + r) * t->k + k0;
-		int32_t acc = 0;
+		int32_t a = 0;
 
 		for (unsigned c = 0; c < k; c++)
-			acc += src[c];
-		wsum[r] = acc;
+			a += src[c];
+		wsum[r] = a;
 	}
 
 	/*
@@ -299,7 +326,7 @@ out:
 int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 {
 	struct npu_entry *e;
-	unsigned ns, ks, first = g->n_slot;
+	unsigned ns, ks, first = g->n_slot, si = 0;
 
 	if (g->dead) {
 		whine(g, "the hardware path is already retired", (unsigned)t->k,
@@ -318,7 +345,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 
 	ns = (unsigned)((t->n + g->nmax - 1) / g->nmax);
 	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
-	if (first + ns * ks > g->slot_cap) {
+	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
@@ -328,13 +355,12 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		unsigned k = (unsigned)(t->k - k0) < g->kmax
 			   ? (unsigned)(t->k - k0) : g->kmax;
 
-		for (unsigned ni = 0; ni < ns; ni++) {
+		for (unsigned ni = 0; ni < ns; ni++, si++) {
 			unsigned n0 = ni * g->nmax;
 			unsigned n = (unsigned)(t->n - n0) < g->nmax
 				   ? (unsigned)(t->n - n0) : g->nmax;
 
-			if (add_slice(g, t, n0, n, k0, k) < 0) {
-				/* unwind: whatever was allocated is freed on close */
+			if (add_slice(g, t, n0, n, k0, k, ki, si) < 0) {
 				g->n_slot = first;
 				return -1;
 			}
@@ -348,6 +374,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e->count = ns * ks;
 	e->n_slices = ns;
 	e->k_slices = ks;
+	e->weight_mb = (double)t->n * (double)t->k / 1e6;
 	return (int)g->n_ent++;
 }
 
@@ -355,68 +382,110 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		       const struct charsiu_act *a, float *y)
 {
 	struct npu_entry *e;
-	unsigned i;
+	struct charsiu_joblist jl;
+	const int32_t *out;
+	unsigned nh = 0, i;
+	double t0;
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
 	e = &g->ent[id];
-	if ((unsigned)a->n != e->t->k)
+	if ((unsigned)a->n != e->t->k) {
+		whine(g, "the activation is not this tensor's K", (unsigned)a->n,
+		      (unsigned)e->t->n);
 		return -1;
+	}
 
-	memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
+	/* every K slice's activation, each in its own region */
+	charsiu_bo_prep(g->dev, &g->in, 1000000000);
+	for (unsigned ki = 0; ki < e->k_slices; ki++) {
+		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
-	for (unsigned si = 0; si < e->count; si++) {
-		struct npu_slot *s = &g->slot[e->first + si];
-		uint32_t inh[3], outh;
-		const int32_t *out;
-		double t0;
+		for (i = 0; i < s->job.mm.k; i++)
+			g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i] + 128);
+		charsiu_pack_input(&s->job.mm, g->scratch,
+				   (uint8_t *)g->in.map + ki * g->in_stride,
+				   g->in_stride, s->job.input_zero_point);
+	}
+	charsiu_bo_fini(g->dev, &g->in);
 
-		/*
-		 * The activation slice. Repacked per K slice, and the N slices
-		 * inside one K slice reuse it, which is why the loop in
-		 * charsiu_npu_add puts K on the outside.
-		 */
-		if (si % e->n_slices == 0) {
-			charsiu_bo_prep(g->dev, &g->in, 1000000000);
-			for (i = 0; i < s->job.mm.k; i++)
-				g->scratch[i] =
-					(uint8_t)((int)a->q1[s->k0 + i] + 128);
-			charsiu_pack_input(&s->job.mm, g->scratch, g->in.map,
-					   g->in.size, s->job.input_zero_point);
-			charsiu_bo_fini(g->dev, &g->in);
-		}
+	/*
+	 * ONE submit for the whole projection.
+	 *
+	 * CHARSIU_NPU_NOCHAIN puts it back to a submit per slice, so a round can
+	 * carry its own before and after in one boot rather than comparing
+	 * against a different one.
+	 */
+	g->handles[nh++] = g->in.handle;
+	for (i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
 
-		inh[0] = g->in.handle;
-		inh[1] = s->wt.handle;
-		inh[2] = s->coef.handle;
-		outh = g->out.handle;
+		g->tasks[i].regcmd = (uint32_t)s->regcmd.dma_address;
+		g->tasks[i].regcmd_count = s->nreg;
+		g->handles[nh++] = s->wt.handle;
+		g->handles[nh++] = s->coef.handle;
+	}
+	jl.tasks = g->tasks;
+	jl.task_count = e->count;
+	jl.in_handles = g->handles;
+	jl.in_count = nh;
+	jl.out_handles = &g->out.handle;
+	jl.out_count = 1;
 
-		t0 = now_us();
-		if (charsiu_submit(g->dev, &s->regcmd, s->nreg, inh, 3, &outh, 1)) {
-			g->strikes = 3;
-		} else {
-			charsiu_bo_prep(g->dev, &g->out, 2000000000);
-			out = g->out.map;
-			for (i = 0; i < s->job.mm.n; i++)
-				g->acc[s->n0 + i] += out[i];
-			charsiu_bo_fini(g->dev, &g->out);
+	t0 = now_us();
+	if (g->nochain) {
+		for (i = 0; i < e->count; i++) {
+			struct charsiu_joblist one;
+			uint32_t h[3];
+
+			h[0] = g->in.handle;
+			h[1] = g->slot[e->first + i].wt.handle;
+			h[2] = g->slot[e->first + i].coef.handle;
+			one.tasks = &g->tasks[i];
+			one.task_count = 1;
+			one.in_handles = h;
+			one.in_count = 3;
+			one.out_handles = &g->out.handle;
+			one.out_count = 1;
+			if (charsiu_submit_jobs(g->dev, &one, 1)) {
+				g->strikes = 3;
+				break;
+			}
 			g->submits++;
-
-			if (now_us() - t0 > g->slow_us)
-				g->strikes++;
-			else
-				g->strikes = 0;
 		}
+	} else if (charsiu_submit_jobs(g->dev, &jl, 1)) {
+		g->strikes = 3;
+	} else {
+		g->submits++;
+	}
 
-		if (g->strikes >= 3) {
-			g->dead = 1;
-			fprintf(stderr,
-				"charsiu: the NPU stopped answering at K=%u N=%u "
-				"(slice %u of %u); everything from here runs on "
-				"the CPU\n",
-				s->job.mm.k, s->job.mm.n, si + 1, e->count);
-			return -1;
+	if (g->strikes < 3) {
+		charsiu_bo_prep(g->dev, &g->out, 2000000000);
+		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
+		for (i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+
+			out = (const int32_t *)((const uint8_t *)g->out.map +
+						s->out_slot * g->out_stride);
+			for (unsigned j = 0; j < s->job.mm.n; j++)
+				g->acc[s->n0 + j] += out[j];
 		}
+		charsiu_bo_fini(g->dev, &g->out);
+		g->weight_mb += e->weight_mb;
+
+		if (now_us() - t0 > g->slow_us * (g->nochain ? e->count : 1))
+			g->strikes++;
+		else
+			g->strikes = 0;
+	}
+
+	if (g->strikes >= 3) {
+		g->dead = 1;
+		fprintf(stderr,
+			"charsiu: the NPU stopped answering on a %u task submit "
+			"(K=%u N=%u); everything from here runs on the CPU\n",
+			e->count, (unsigned)e->t->k, (unsigned)e->t->n);
+		return -1;
 	}
 
 	for (i = 0; i < (unsigned)e->t->n; i++)
