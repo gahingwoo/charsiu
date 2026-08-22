@@ -4,9 +4,22 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** **Every projection in Llama-3.2-1B runs on the NPU, and the tokens are
-character for character what the CPU produces.** 112 tensors, 480 slices, 18240 jobs over
-38 tokens, on a ROCK 4D with a mainline kernel and the open `rocket` driver.
+**Status.** **Every matmul in Llama-3.2-1B runs on the NPU, the tokens are character for
+character what the CPU produces, and it is 18% faster than the best CPU path on the same
+board.** 113 tensors including the 128256 wide output head, on a ROCK 4D with a mainline
+kernel and the open `rocket` driver.
+
+```
+                          tokens/second
+  charsiu on the NPU          6.55
+  charsiu on the CPU, best    5.53      (pure q4_0, four threads)
+  charsiu on the CPU, q8_0    3.70      (the same file the NPU is running)
+```
+
+A token is 153 ms: 132 in the hardware path and 21 on the CPU. Of the 132, about 119 is
+the weight fetch itself at 9.35 GB/s, against the 10.35 the bench measures as this
+hardware's ceiling. **There is almost no overhead left to remove** -- the fence is 5.5 ms
+above what the bytes need, submitting is 1.7, reading back is 6.0.
 
 That acceptance test is the point of how this was built. The CPU decode loop came first
 and is the oracle; the NPU computes the same integer sum, so the two runs must agree

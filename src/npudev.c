@@ -572,7 +572,15 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			else
 				g->strikes = 0;
 
-			if (!g->slowed && gbs < g->min_gbs) {
+			/*
+			 * ⚠ NOT ON A WARM UP. Round 323's first call to a
+			 * tensor came in at 1.25 GB/s while the run averaged
+			 * 9.35, so the notice fired on a cold buffer and said
+			 * nothing true about the run. A warning that cries wolf
+			 * on every boot is worse than none.
+			 */
+			if (!g->slowed && gbs < g->min_gbs &&
+			    g->submits > g->n_ent * 2) {
 				g->slowed = 1;
 				fprintf(stderr,
 					"charsiu: the NPU is SLOW, %.2f GB/s at "
