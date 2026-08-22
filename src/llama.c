@@ -32,6 +32,7 @@ struct pool {
 	int gen, done, stop;
 
 	const struct gguf_tensor *w;
+	const struct npu_tensor *nt;      /* set instead of w in NPU quant mode */
 	const struct charsiu_act *a;
 	float *y;
 	uint64_t nrows;
@@ -62,8 +63,12 @@ static void *worker(void *arg)
 		n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
 		if (n > per)
 			n = per;
-		if (n)
-			gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
+		if (n) {
+			if (g_pool.nt)
+				npu_matvec(g_pool.nt, g_pool.a, g_pool.y, r0, n);
+			else
+				gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
+		}
 
 		pthread_mutex_lock(&g_pool.mu);
 		if (++g_pool.done == g_pool.n)
@@ -101,6 +106,43 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			 float *y);
 
 /*
+ * NPU quantisation mode: every routed tensor gets a second copy in the format
+ * the hardware takes, built on first use. A linear lookup over at most 145
+ * entries, which is nothing next to the matmul it is about to do.
+ */
+static int npu_mode(void)
+{
+	static int m = -1;
+
+	if (m < 0) {
+		const char *e = getenv("CHARSIU_NPU_QUANT");
+
+		m = e && *e != '0';
+	}
+	return m;
+}
+
+static const struct npu_tensor *npu_get(struct llama_state *s,
+					const struct gguf_tensor *w)
+{
+	for (unsigned i = 0; i < s->n_npu; i++)
+		if (s->npu_key[i] == w)
+			return &s->npu[i];
+
+	if (s->n_npu == s->npu_cap)
+		return NULL;
+	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0)
+		return NULL;
+	if (getenv("CHARSIU_NPU_VERBOSE"))
+		fprintf(stderr, "npu-quant  %-28s  %llu x %llu  rms %.4f%%\n",
+			w->name, (unsigned long long)w->ne[1],
+			(unsigned long long)w->ne[0],
+			s->npu[s->n_npu].rms_rel * 100.0);
+	s->npu_key[s->n_npu] = w;
+	return &s->npu[s->n_npu++];
+}
+
+/*
  * y = W x, over all of W's rows.
  *
  * The activation is quantised ONCE here, before the fan out, so its cost is
@@ -127,14 +169,23 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			 float *y)
 {
 	struct charsiu_act *a = &s->act;
+	const struct npu_tensor *nt = NULL;
+
+	/* f32 and f16 stay where they are: the NPU takes int8 operands */
+	if (npu_mode() && a->q1_valid && w->type != GGML_F32 && w->type != GGML_F16)
+		nt = npu_get(s, w);
 
 	if (g_pool.n <= 1) {
-		gguf_matvec(w, a, y, 0, w->ne[1]);
+		if (nt)
+			npu_matvec(nt, a, y, 0, nt->n);
+		else
+			gguf_matvec(w, a, y, 0, w->ne[1]);
 		return;
 	}
 
 	pthread_mutex_lock(&g_pool.mu);
 	g_pool.w = w;
+	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
 	g_pool.nrows = w->ne[1];
@@ -390,6 +441,15 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 		}
 	}
 
+	/* nine per layer plus the output head */
+	s->npu_cap = m->n_layer * 9 + 2;
+	s->npu = calloc(s->npu_cap, sizeof(*s->npu));
+	s->npu_key = calloc(s->npu_cap, sizeof(*s->npu_key));
+	if (!s->npu || !s->npu_key) {
+		llama_state_free(s);
+		return NULL;
+	}
+
 	if (!s->kcache || !s->vcache || !s->x || !s->xb || !s->xb2 || !s->hb ||
 	    !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits) {
 		llama_state_free(s);
@@ -410,6 +470,12 @@ void llama_state_free(struct llama_state *s)
 	free(s->q); free(s->k); free(s->v);
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
+	if (s->npu) {
+		for (unsigned i = 0; i < s->n_npu; i++)
+			npu_tensor_free(&s->npu[i]);
+		free(s->npu);
+	}
+	free(s->npu_key);
 	free(s);
 }
 

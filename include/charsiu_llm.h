@@ -105,6 +105,17 @@ struct charsiu_act {
 	float *d;            /* nb scales */
 	float *bs;           /* nb block sums of f, for the types with an offset */
 	int quantised;
+
+	/*
+	 * The SAME vector under ONE scale, which is the shape the NPU takes:
+	 * charsiu_job carries a single input_scale and input_zero_point, not a
+	 * scale per 32 weights. Filled only in NPU quantisation mode, because
+	 * it is a coarser quantisation and there is no reason to pay for it on
+	 * the CPU path.
+	 */
+	int8_t *q1;
+	float d1;
+	int q1_valid;
 };
 
 /* `max_n` is the widest vector this will ever hold: one allocation serves
@@ -113,6 +124,34 @@ int  charsiu_act_alloc(struct charsiu_act *a, int max_n);
 void charsiu_act_free(struct charsiu_act *a);
 /* Fill q/d/bs from x[0..n). Skipped when CHARSIU_NO_QACT is set: the control. */
 void charsiu_act_set(struct charsiu_act *a, const float *x, int n);
+
+/* ---- the NPU's number format, on the CPU ---------------------------------- */
+
+/*
+ * A weight tensor as the NPU would take it: signed int8 with ONE scale per
+ * OUTPUT CHANNEL, which is what the coefficient buffer applies, against an
+ * activation with one scale for the whole vector. Both zero points are 128 in
+ * the hardware's unsigned bytes, so the arithmetic the DPU does is exactly
+ *
+ *     acc[n] = sum_k a_q[k] * w_q[n][k]
+ *     y[n]   = acc[n] * a_scale * w_scale[n]
+ *
+ * This exists to answer, on the host and before any NPU plumbing, whether that
+ * number format costs the model anything. If it does, no amount of correct
+ * register streams will fix it.
+ */
+struct npu_tensor {
+	int8_t *q;         /* [n][k], row major */
+	float *scale;      /* n, per output channel */
+	int32_t *wsum;     /* n, sum of q over k: the coefficient buffer wants it */
+	uint64_t n, k;
+	double rms_rel;    /* what the quantisation cost this tensor */
+};
+
+int  npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w);
+void npu_tensor_free(struct npu_tensor *t);
+void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
+		float *y, uint64_t row0, uint64_t nrows);
 
 /*
  * The one primitive the whole model is built out of: y[row] = dot(W[row], x).
@@ -200,6 +239,12 @@ struct llama_state {
 	float *logits;         /* n_vocab */
 
 	struct charsiu_act act; /* the activation, quantised once per matvec */
+
+	/* CHARSIU_NPU_QUANT: a second copy of each routed tensor, in the
+	 * format the hardware takes. Built on first use. */
+	struct npu_tensor *npu;
+	const struct gguf_tensor **npu_key;
+	unsigned n_npu, npu_cap;
 };
 
 int  llama_load(struct llama_model *m, const char *path);

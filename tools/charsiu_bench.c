@@ -199,7 +199,16 @@ static int bench_setup(struct bench *b, struct charsiu_device *dev,
 	for (t = 0; t < MAX_TASKS; t++) {
 		uint64_t *stream = (uint64_t *)((uint8_t *)b->regcmd.map + t * stride);
 
-		b->job.output_addr = (uint32_t)b->outbo.dma_address + t * m * n;
+		/*
+		 * The int4 output element is FOUR bytes, so the per task stride
+		 * is four times the element count. It was m*n here, which made
+		 * every chained int4 task write over the one before it. Found by
+		 * inspection, not by a hang -- the allocation already had the
+		 * factor of four in it, so nothing ran off the end and no
+		 * correctness check has ever been run on a chained int4 job.
+		 */
+		b->job.output_addr = (uint32_t)b->outbo.dma_address
+			+ t * m * n * (b->job.mm.wdtype == CHARSIU_INT4 ? 4 : 1);
 		nreg = charsiu_emit_job(&b->job, stream, stride / 8);
 		if (!nreg)
 			return -1;
@@ -297,15 +306,82 @@ static void shape_table(struct charsiu_device *dev, unsigned tasks, unsigned rep
 	}
 }
 
+/*
+ * THE MARGINAL COST WITHOUT CHAINING.
+ *
+ * The task sweep gets the marginal from the difference between two task counts,
+ * which needs chaining to work. int4 chaining hangs from two tasks up, so every
+ * int4 marginal this project has ever had is missing -- round 306 compared a
+ * SINGLE task against a single task, where two thirds of the time is the fixed
+ * submit cost and a halving of the weight bytes is worth 12% of the number.
+ *
+ * A shape whose only variable is N gives the same two constants from single
+ * task runs alone: fit us against weight megabytes, and the slope is the
+ * marginal cost per byte and the intercept is everything that does not depend
+ * on them. int8 runs it too and is the control -- its slope has to reproduce
+ * the marginal the chained sweep already measured, about 10.3 GB/s.
+ */
+static void n_sweep(struct charsiu_device *dev, unsigned k, unsigned reps)
+{
+	static const unsigned ns[] = { 128, 256, 512, 1024, 2048 };
+	double sx = 0, sy = 0, sxx = 0, sxy = 0;
+	unsigned got = 0, i;
+
+	printf("  single task, K = %u, %u reps, M = 1%s\n\n", k, reps,
+	       getenv("CHARSIU_W4") ? "   [int4]" : "   [int8]");
+	printf("  %-6s %-11s %-12s %-11s\n", "N", "weight MB", "us", "GB/s");
+
+	for (i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+		unsigned n = ns[i];
+		double mb = wbytes_of(k, n) / 1e6, us;
+		struct bench b;
+
+		if (bench_setup(&b, dev, 1, k, n)) {
+			printf("  %-6u setup FAILED -- stopping\n", n);
+			bench_free(&b);
+			break;
+		}
+		us = bench_run(&b, 1, reps);
+		bench_free(&b);
+		if (us < 0) {
+			printf("  %-6u run FAILED -- stopping\n", n);
+			break;
+		}
+		printf("  %-6u %-11.3f %-12.1f %-11.2f\n", n, mb, us, mb / us * 1e3);
+		sx += mb; sy += us; sxx += mb * mb; sxy += mb * us;
+		got++;
+	}
+
+	if (got >= 2) {
+		double d = got * sxx - sx * sx;
+		double slope = (got * sxy - sx * sy) / d;      /* us per MB */
+		double icept = (sy - slope * sx) / got;        /* us */
+
+		printf("\n  fit over %u points:  %.1f us/MB  (%.2f GB/s)"
+		       "   +  %.1f us that does not scale with the bytes\n",
+		       got, slope, 1e3 / slope, icept);
+	} else {
+		printf("\n  fewer than two points survived; no fit\n");
+	}
+}
+
 int main(int argc, char **argv)
 {
 	struct charsiu_device *dev;
 	struct bench b;
 	unsigned m, k, n, reps, t;
-	double us, one;
+	unsigned t_last1, t_last2;
+	double us, one, last1, last2;
 
 	dev = charsiu_open(NULL);
 	if (!dev) { printf("open FAILED\n"); return 1; }
+
+	if (argc > 1 && !strcmp(argv[1], "--nsweep")) {
+		n_sweep(dev, argc > 2 ? (unsigned)atoi(argv[2]) : 2048,
+			argc > 3 ? (unsigned)atoi(argv[3]) : 50);
+		charsiu_close(dev);
+		return 0;
+	}
 
 	if (argc > 1 && !strcmp(argv[1], "--shapes")) {
 		shape_table(dev, argc > 2 ? (unsigned)atoi(argv[2]) : 32,
@@ -328,11 +404,21 @@ int main(int argc, char **argv)
 	printf("\n  %-8s %-12s %-12s %-12s %-12s\n",
 	       "tasks", "us/submit", "us/matmul", "GB/s", "GOP/s");
 	one = 0;
+	last2 = last1 = 0.0;
+	t_last2 = t_last1 = 0;
 	for (t = 1; t <= MAX_TASKS; t *= 2) {
 		us = bench_run(&b, t, reps);
-		if (us < 0) { printf("  %-8u FAILED\n", t); continue; }
+		/*
+		 * STOP at the first failure. Round 306 carried on, and a wedged
+		 * block turns every row after it into a timeout printed as a
+		 * measurement -- 10904 us at two tasks, 17541 at one. Nothing
+		 * past the first failure is data.
+		 */
+		if (us < 0) { printf("  %-8u FAILED -- stopping the sweep\n", t); break; }
 		if (t == 1)
 			one = us;
+		last2 = last1; t_last2 = t_last1;
+		last1 = us;    t_last1 = t;
 		printf("  %-8u %-12.1f %-12.2f %-12.2f %-12.1f\n", t, us, us / t,
 		       wbytes_of(k, n) / (us / t) / 1e3,
 		       2.0 * m * k * n * t / us / 1e3);
@@ -344,15 +430,20 @@ int main(int argc, char **argv)
 	 * the difference between 128 and 64 chained tasks has no fixed submit
 	 * cost in it at all.
 	 */
-	{
-		double a128 = bench_run(&b, 128, reps), a64 = bench_run(&b, 64, reps);
+	if (t_last2) {
+		double marg = (last1 - last2) / (double)(t_last1 - t_last2);
 
-		if (a128 > 0 && a64 > 0)
-			printf("\n  marginal cost of one task: %.1f us  (%.2f GB/s)\n"
-			       "  fixed cost of a submit:    %.1f us\n",
-			       (a128 - a64) / 64,
-			       wbytes_of(k, n) / ((a128 - a64) / 64) / 1e3,
-			       one - (a128 - a64) / 64);
+		printf("\n  marginal cost of one task: %.1f us  (%.2f GB/s)"
+		       "   [from %u and %u tasks]\n"
+		       "  fixed cost of a submit:    %.1f us\n",
+		       marg, wbytes_of(k, n) / marg / 1e3, t_last2, t_last1,
+		       one - marg);
+		if (t_last1 < 32)
+			printf("  ** the sweep only reached %u tasks, so this "
+			       "marginal is weak **\n", t_last1);
+	} else {
+		printf("\n  no marginal: the sweep did not survive two task "
+		       "counts\n");
 	}
 
 	printf("\n  cpu, one thread, same matmul: %.1f us   (sink %lld)\n",

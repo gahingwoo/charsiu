@@ -809,7 +809,8 @@ int charsiu_act_alloc(struct charsiu_act *a, int max_n)
 	a->q = calloc((size_t)nb * 32, 1);
 	a->d = calloc((size_t)nb, sizeof(float));
 	a->bs = calloc((size_t)nb, sizeof(float));
-	if (!a->q || !a->d || !a->bs) {
+	a->q1 = calloc((size_t)nb * 32, 1);
+	if (!a->q || !a->d || !a->bs || !a->q1) {
 		charsiu_act_free(a);
 		return -1;
 	}
@@ -821,17 +822,23 @@ void charsiu_act_free(struct charsiu_act *a)
 	free(a->q);
 	free(a->d);
 	free(a->bs);
+	free(a->q1);
 	memset(a, 0, sizeof(*a));
 }
 
 void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
 {
-	static int off = -1;
+	static int off = -1, npu = -1;
 
 	if (off < 0) {
 		const char *e = getenv("CHARSIU_NO_QACT");
 
 		off = e && *e != '0';
+	}
+	if (npu < 0) {
+		const char *e = getenv("CHARSIU_NPU_QUANT");
+
+		npu = e && *e != '0';
 	}
 
 	a->f = x;
@@ -873,6 +880,34 @@ void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
 		}
 	}
 	a->quantised = 1;
+
+	/*
+	 * And the same vector under ONE scale, for the NPU's operand shape.
+	 * Only when asked: it is a strictly coarser quantisation and the CPU
+	 * path has no use for it.
+	 */
+	a->q1_valid = 0;
+	if (npu) {
+		float amax = 0.0f, d, id;
+
+		for (int i = 0; i < n; i++) {
+			float av = x[i] < 0.0f ? -x[i] : x[i];
+
+			if (av > amax)
+				amax = av;
+		}
+		d = amax / 127.0f;
+		id = d != 0.0f ? 1.0f / d : 0.0f;
+		a->d1 = d;
+		for (int i = 0; i < a->nb * 32; i++) {
+			int v = i < n ? (int)lrintf(x[i] * id) : 0;
+
+			if (v > 127) v = 127;
+			if (v < -127) v = -127;
+			a->q1[i] = (int8_t)v;
+		}
+		a->q1_valid = 1;
+	}
 }
 
 /* ---- integer dot products ------------------------------------------------ */
