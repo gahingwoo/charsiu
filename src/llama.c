@@ -603,6 +603,33 @@ void llama_state_free(struct llama_state *s)
 	charsiu_act_free(&s->act);
 	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
 		npu_report(s->npu, s->n_npu);
+	/*
+	 * The calibration dump: one record a tensor, name then k then the sum
+	 * of |x| over every token the run saw. Written here because this is the
+	 * only place that knows the run has finished.
+	 */
+	if (getenv("CHARSIU_CALIB") && s->npu) {
+		FILE *f = fopen(getenv("CHARSIU_CALIB"), "wb");
+		unsigned wrote = 0;
+
+		for (unsigned i = 0; f && i < s->n_npu; i++) {
+			struct npu_tensor *t = &s->npu[i];
+
+			if (!t->astat || !t->acalls)
+				continue;
+			for (uint64_t j = 0; j < t->k; j++)
+				t->astat[j] /= (double)t->acalls;
+			fwrite(t->name, 1, sizeof(t->name), f);
+			fwrite(&t->k, sizeof(t->k), 1, f);
+			fwrite(t->astat, sizeof(double), t->k, f);
+			wrote++;
+		}
+		if (f) {
+			fclose(f);
+			fprintf(stderr, "calib: wrote %u tensors to %s\n",
+				wrote, getenv("CHARSIU_CALIB"));
+		}
+	}
 	llama_stages_report();
 	if (s->dev)
 		charsiu_npu_report(s->dev);

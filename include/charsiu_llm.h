@@ -145,6 +145,8 @@ struct npu_tensor {
 	float *scale;      /* n * ngroup, per output channel per k group */
 	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	float *kscale;     /* k, a factor shared by every channel; NULL when off */
+	double *astat;     /* k, the running sum of |x| over a calibration run */
+	uint64_t acalls;
 	int32_t *wsum;     /* n, sum of q over k: the coefficient buffer wants it */
 	uint64_t n, k;
 	double rms_rel;    /* what the quantisation cost this tensor */

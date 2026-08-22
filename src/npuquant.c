@@ -92,6 +92,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
 
 	memset(t, 0, sizeof(*t));
+	snprintf(t->name, sizeof(t->name), "%s", w->name);
 	t->n = n;
 	t->k = k;
 	t->kgroup = grp;
@@ -108,17 +109,36 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	if (alpha != 0.0) {
 		double *col = calloc(k, sizeof(*col));
 		double gm = 0.0;
+		const char *sf = getenv("CHARSIU_AWQ_STATS");
+		int got = 0;
 
 		if (!col) { free(row); npu_tensor_free(t); return -1; }
-		for (uint64_t r = 0; r < n; r++) {
-			gguf_row_f32(w, r, row);
-			for (uint64_t i = 0; i < k; i++)
-				col[i] += fabs((double)row[i]);
+		if (sf) {
+			FILE *f = fopen(sf, "rb");
+			char nm[80];
+			uint64_t kk;
+
+			while (f && fread(nm, 1, sizeof(nm), f) == sizeof(nm)
+			       && fread(&kk, sizeof(kk), 1, f) == 1) {
+				if (!strcmp(nm, w->name) && kk == k) {
+					got = fread(col, sizeof(*col), k, f) == k;
+					break;
+				}
+				fseek(f, (long)(kk * sizeof(double)), SEEK_CUR);
+			}
+			if (f)
+				fclose(f);
 		}
+		if (!got)
+			for (uint64_t r = 0; r < n; r++) {
+				gguf_row_f32(w, r, row);
+				for (uint64_t i = 0; i < k; i++)
+					col[i] += fabs((double)row[i]);
+			}
 		t->kscale = malloc((size_t)k * sizeof(float));
 		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
 		for (uint64_t i = 0; i < k; i++) {
-			double v = col[i] / (double)n;
+			double v = col[i] / (double)n;   /* the mean, either way */
 
 			col[i] = v > 0.0 ? pow(v, alpha) : 1.0;
 			gm += log(col[i]);
@@ -258,6 +278,7 @@ void npu_tensor_free(struct npu_tensor *t)
 	free(t->q);
 	free(t->scale);
 	free(t->kscale);
+	free(t->astat);
 	free(t->wsum);
 	memset(t, 0, sizeof(*t));
 }
@@ -288,9 +309,35 @@ static int32_t idot(const int8_t *w, const int8_t *x, uint64_t n)
 #endif
 }
 
+/*
+ * ⚠ THE k FACTOR HAS TO COME FROM THE ACTIVATIONS, NOT THE WEIGHTS.
+ *
+ * The first version of this took the column means of |w| and it made the KL
+ * worse. That is not AWQ: AWQ's whole claim is that the weights worth
+ * protecting are the ones multiplying LARGE ACTIVATIONS, so the factor is built
+ * from mean |x_k| over a calibration run. Measuring the wrong signal and
+ * concluding the method does not work is the mistake, not the method.
+ *
+ * Two passes. CHARSIU_CALIB=<file> runs the model and writes the per tensor
+ * mean |x_k|; CHARSIU_AWQ_STATS=<file> reads it back at build time.
+ */
+void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
+{
+	if (!t->astat) {
+		t->astat = calloc(t->k, sizeof(*t->astat));
+		if (!t->astat)
+			return;
+	}
+	for (uint64_t i = 0; i < t->k; i++)
+		t->astat[i] += fabs((double)a->f[i]);
+	t->acalls++;
+}
+
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		float *y, uint64_t row0, uint64_t nrows)
 {
+	if (getenv("CHARSIU_CALIB") && row0 == 0)
+		npu_calib_note((struct npu_tensor *)t, a);
 	for (uint64_t r = 0; r < nrows; r++) {
 		uint64_t n = row0 + r;
 
