@@ -89,7 +89,7 @@ int main(int argc, char **argv)
 	uint8_t *a_raw, *b_raw, *ref;
 	int32_t *bias, *wsums;
 	uint32_t in_handles[3], out_handles[1];
-	unsigned m, n, k, i, atom, bad = 0, nonzero = 0, exact = 0;
+	unsigned m, n, k, i, ci, atom, bad = 0, nonzero = 0, exact = 0;
 	size_t nreg;
 	int ret;
 
@@ -158,8 +158,31 @@ int main(int argc, char **argv)
 		 */
 		if (!getenv("CHARSIU_W4_SMALLSCALE"))
 			job.weight_scale = 0.18f;
-		for (i = 0; i < n * k; i++)
-			b_raw[i] = (uint8_t)(((int)(i * 13 % 15) - 7) & 0xf);
+		/*
+		 * ⚠ ROUND 324 CAUGHT THIS WITH ITS OWN CONTROL. The generator
+		 * was `i * 13 % 15`, which has FIFTEEN residues, so channel c
+		 * and channel c + 15 hold an identical weight vector, and the
+		 * halfk parity doubles that to thirty. Every reference value
+		 * therefore repeats every 30 channels: round 324's search for
+		 * "where did this value go" found channel 30's value sitting at
+		 * channel 0's word and reported it found. Round 312's "the
+		 * survivors are g0 and g30" is the same artifact, because
+		 * ref[240] IS ref[0], not a wrapping stride.
+		 *
+		 * A per channel hash instead, so that no two channels agree.
+		 * The old ramp is CHARSIU_W4_RAMPW, because every int4 round up
+		 * to 324 was measured with it and a regression has to stay
+		 * reproducible.
+		 */
+		for (ci = 0; ci < n; ci++)
+			for (i = 0; i < k; i++) {
+				unsigned h = getenv("CHARSIU_W4_RAMPW")
+					? (unsigned)(((size_t)ci * k + i) * 13 % 15)
+					: ((ci * 2654435761u) ^ (i * 40503u)) % 15u;
+
+				b_raw[(size_t)ci * k + i] =
+					(uint8_t)(((int)h - 7) & 0xf);
+			}
 	}
 	for (i = 0; i < n; i++) bias[i] = (int)i * 3 - 40;
 
@@ -774,8 +797,9 @@ int main(int argc, char **argv)
 		{
 			const int32_t *ow = (const int32_t *)outbo.map;
 			size_t owords = outbo.size / 4, q;
-			unsigned found = 0, dup = 0, nz = 0, ident = 0;
-			unsigned wr_all = 0, hi_all = 0, ci, shown = 0;
+			unsigned found = 0, dup = 0, nz = 0, ident = 0, distinct = 0;
+			unsigned wr_all = 0, hi_all = 0, shown = 0;
+			int64_t *refv = malloc((size_t)n * sizeof(*refv));
 
 			for (q = 0; q < owords; q++)
 				if ((uint32_t)ow[q] != 0xa5a5a5a5u) {
@@ -784,15 +808,13 @@ int main(int argc, char **argv)
 				}
 			printf("  placement: %u words written in the whole %zu word buffer,"
 			       " highest index %u\n", wr_all, owords, hi_all);
-			printf("  placement: channel -> the word that holds its expected"
-			       " value (-- = that value is nowhere in the buffer)\n   ");
-			for (ci = 0; ci < n; ci++) {
+
+			for (ci = 0; ci < n && refv; ci++) {
 				int64_t pe = 0;
-				unsigned j, hits = 0;
-				size_t at = 0;
+				unsigned j;
 
 				for (j = 0; j < k; j++) {
-					int wv = b_raw[ci * k + j];
+					int wv = b_raw[(size_t)ci * k + j];
 					int16_t wb, ab;
 
 					wv = (wv & 0x8) ? (wv & 0xf) - 16 : (wv & 0xf);
@@ -800,29 +822,71 @@ int main(int argc, char **argv)
 					ab = (int16_t)((((int)a_raw[j] - 0x80) & 0xff) << 8);
 					pe += ((int32_t)wb * (int32_t)ab) >> 16;
 				}
-				if (!pe)
+				refv[ci] = pe;
+			}
+			/*
+			 * ⚠ HOW MANY OF THE REFERENCES ARE EVEN DIFFERENT FROM EACH
+			 * OTHER. This is the line round 324 needed and did not have:
+			 * its generator gave only 30 distinct channel patterns, so a
+			 * search for a value found a DUPLICATE and every count below
+			 * was inflated for free. If this is less than the channel
+			 * count, nothing under it can be read as placement.
+			 */
+			for (ci = 0; ci < n && refv; ci++) {
+				unsigned q2, seen = 0;
+
+				for (q2 = 0; q2 < ci; q2++)
+					if (refv[q2] == refv[ci]) { seen = 1; break; }
+				if (!seen)
+					distinct++;
+			}
+			printf("  placement: %u of %u references are distinct%s\n",
+			       distinct, n,
+			       distinct == n ? "" :
+			       "   !! DUPLICATES: the placement below is NOT readable");
+
+			printf("  placement: channel -> the word that holds its expected"
+			       " value (= its own, -- = nowhere)\n   ");
+			for (ci = 0; ci < n && refv; ci++) {
+				unsigned hits = 0, own = 0;
+				size_t at = 0, mine = (size_t)(ci / atom) * m * atom
+						+ ci % atom;
+
+				if (!refv[ci])
 					continue;
 				nz++;
+				/*
+				 * ⚠ THE OWN INDEX IS CHECKED AGAINST ALL THE HITS, not
+				 * against the first one. Round 324 printed ident = 30 on
+				 * a run whose score was 64 of 64, because a duplicate at
+				 * a lower index won the search. A metric that disagrees
+				 * with a known answer is the metric that is wrong.
+				 */
 				for (q = 0; q < owords; q++)
 					if ((uint32_t)ow[q] != 0xa5a5a5a5u
-					    && ow[q] == (int32_t)pe) {
+					    && ow[q] == (int32_t)refv[ci]) {
 						if (!hits)
 							at = q;
+						if (q == mine)
+							own = 1;
 						hits++;
 					}
 				if (hits) {
 					found++;
-					if (at == (size_t)(ci / atom) * m * atom
-					    + ci % atom)
+					if (own) {
 						ident++;
+						at = mine;
+					}
 				}
 				if (hits > 1)
 					dup++;
 				if (shown < 64) {
-					if (hits)
-						printf(" %u->w%zu", ci, at);
-					else
+					if (!hits)
 						printf(" %u->--", ci);
+					else if (own)
+						printf(" %u->=", ci);
+					else
+						printf(" %u->w%zu", ci, at);
 					if ((shown & 7) == 7)
 						printf("\n   ");
 					shown++;
@@ -837,6 +901,7 @@ int main(int argc, char **argv)
 			       "    found near nz/2               still half width, permuted\n"
 			       "    found tiny                    the hardware computed"
 			       " something else\n");
+			free(refv);
 		}
 		charsiu_close(dev);
 		return 0;
