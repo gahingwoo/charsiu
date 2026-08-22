@@ -543,7 +543,37 @@ int main(int argc, char **argv)
 	 * reproduce the old wrong numbers exactly. A fix whose control does not
 	 * bring the fault back has not been shown to be the fix.
 	 */
-	if (getenv("CHARSIU_INPUT_RAW")) {
+	/*
+	 * ⚠ CHARSIU_W4_AF16: A REAL HALF IN THE SLOT, not an int8 in its high
+	 * byte.
+	 *
+	 * The int4 arithmetic this tree measured is
+	 *
+	 *     out = ((int16)fp16bits(w) * (int16)abits) >> 16
+	 *
+	 * and fp16bits is NOT proportional to the nibble. The effective weights
+	 * it can represent are 0 and the band 1.000, 1.067, 1.100, 1.133,
+	 * 1.150, 1.167, 1.183, which is sixteen levels crammed into eighteen
+	 * percent. **That is not a grid a matmul can use**, so every int4 result
+	 * in this tree is exact against a NONLINEAR reference rather than
+	 * against a weighted sum.
+	 *
+	 * The shape of that formula is what a HALF weight multiplied by an
+	 * INTEGER activation looks like, and charsiu puts an int8 in the high
+	 * byte of a sixteen bit slot rather than a half. The vendor is W4A16
+	 * with real halves. So fill the slot properly and print both references
+	 * side by side: whichever the hardware matches is the answer.
+	 */
+	if (getenv("CHARSIU_W4_AF16")) {
+		float *af = malloc((size_t)m * k * sizeof(*af));
+
+		for (i = 0; i < m * k; i++)
+			af[i] = (float)((int)a_raw[i] - 128);
+		charsiu_pack_input_f16(&job.mm, af, in.map, in.size);
+		free(af);
+		printf("input packed as REAL halves, values %d..%d\n",
+		       (int)a_raw[0] - 128, (int)a_raw[m * k - 1] - 128);
+	} else if (getenv("CHARSIU_INPUT_RAW")) {
 		unsigned kk;
 
 		memset(in.map, job.input_zero_point, in.size);
@@ -786,6 +816,63 @@ int main(int argc, char **argv)
 			}
 		}
 
+		/*
+		 * THE SECOND REFERENCE: a plain weighted sum, which is what an
+		 * LLM needs and what the bit pattern formula is not. Fitted to
+		 * one global scale, because the hardware's units are its own.
+		 */
+		{
+			double num = 0.0, den = 0.0;
+			unsigned ci, hit = 0, nz = 0;
+
+			for (ci = 0; ci < n; ci++) {
+				double lin = 0.0;
+				unsigned j;
+				int32_t got2;
+
+				for (j = 0; j < k; j++) {
+					int wv = b_raw[(size_t)ci * k + j];
+
+					wv = (wv & 0x8) ? (wv & 0xf) - 16
+							: (wv & 0xf);
+					lin += (double)wv
+					       * ((double)a_raw[j] - 128.0);
+				}
+				got2 = o[(size_t)(ci / atom) * m * atom
+					 + ci % atom];
+				num += lin * (double)got2;
+				den += lin * lin;
+			}
+			if (den > 0.0) {
+				double sc = num / den;
+
+				for (ci = 0; ci < n; ci++) {
+					double lin = 0.0;
+					unsigned j;
+					int32_t got2;
+
+					for (j = 0; j < k; j++) {
+						int wv = b_raw[(size_t)ci * k + j];
+
+						wv = (wv & 0x8) ? (wv & 0xf) - 16
+								: (wv & 0xf);
+						lin += (double)wv
+						       * ((double)a_raw[j] - 128.0);
+					}
+					got2 = o[(size_t)(ci / atom) * m * atom
+						 + ci % atom];
+					if (lin != 0.0)
+						nz++;
+					if (lin != 0.0 && fabs((double)got2
+							       - sc * lin)
+					    <= 0.01 * fabs(sc * lin))
+						hit++;
+				}
+				printf("  PLAIN WEIGHTED SUM: %u of %u channels "
+				       "within 1%% of one global scale %.6f\n",
+				       hit, nz, sc);
+			}
+		}
 		printf("int4 output: %u of %u words written, "
 		       "%u EXACT with the shift per element, "
 		       "%u EXACT with the shift on the sum\n",
