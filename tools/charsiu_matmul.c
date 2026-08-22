@@ -755,6 +755,89 @@ int main(int argc, char **argv)
 				printf("\n");
 			}
 		}
+		/*
+		 * ⚠ WHERE THE VALUES WENT, which a score cannot say. Round 312
+		 * set 0x40b8 = 3 on int4: the words WRITTEN went from 136 to 256
+		 * and the exact count FELL from 128 to 16, with the survivors at
+		 * group 0 and group 30. Those two numbers together are equally
+		 * consistent with "the hardware now computes something else" and
+		 * with "it computes the same thing and puts it somewhere else",
+		 * and only the second one leaves int4's 2x intact.
+		 *
+		 * So look, do not fit. Every expected value is searched for across
+		 * the WHOLE output buffer rather than read at the one index the
+		 * surface formula picks, and what gets printed is where each
+		 * channel actually landed. A reference of zero is skipped: it
+		 * matches any untouched-but-zeroed word and would inflate the
+		 * count for nothing, which is the round 169 mistake.
+		 */
+		{
+			const int32_t *ow = (const int32_t *)outbo.map;
+			size_t owords = outbo.size / 4, q;
+			unsigned found = 0, dup = 0, nz = 0, ident = 0;
+			unsigned wr_all = 0, hi_all = 0, ci, shown = 0;
+
+			for (q = 0; q < owords; q++)
+				if ((uint32_t)ow[q] != 0xa5a5a5a5u) {
+					wr_all++;
+					hi_all = (unsigned)q;
+				}
+			printf("  placement: %u words written in the whole %zu word buffer,"
+			       " highest index %u\n", wr_all, owords, hi_all);
+			printf("  placement: channel -> the word that holds its expected"
+			       " value (-- = that value is nowhere in the buffer)\n   ");
+			for (ci = 0; ci < n; ci++) {
+				int64_t pe = 0;
+				unsigned j, hits = 0;
+				size_t at = 0;
+
+				for (j = 0; j < k; j++) {
+					int wv = b_raw[ci * k + j];
+					int16_t wb, ab;
+
+					wv = (wv & 0x8) ? (wv & 0xf) - 16 : (wv & 0xf);
+					wb = (int16_t)charsiu_float_to_half((float)wv);
+					ab = (int16_t)((((int)a_raw[j] - 0x80) & 0xff) << 8);
+					pe += ((int32_t)wb * (int32_t)ab) >> 16;
+				}
+				if (!pe)
+					continue;
+				nz++;
+				for (q = 0; q < owords; q++)
+					if ((uint32_t)ow[q] != 0xa5a5a5a5u
+					    && ow[q] == (int32_t)pe) {
+						if (!hits)
+							at = q;
+						hits++;
+					}
+				if (hits) {
+					found++;
+					if (at == (size_t)(ci / atom) * m * atom
+					    + ci % atom)
+						ident++;
+				}
+				if (hits > 1)
+					dup++;
+				if (shown < 64) {
+					if (hits)
+						printf(" %u->w%zu", ci, at);
+					else
+						printf(" %u->--", ci);
+					if ((shown & 7) == 7)
+						printf("\n   ");
+					shown++;
+				}
+			}
+			printf("\n  placement: %u of %u channels with a nonzero reference"
+			       " (of %u) are present somewhere, %u of them at the index the"
+			       " surface formula reads, %u at more than one index\n",
+			       found, nz, n, ident, dup);
+			printf("    found == nz and ident small   the values are all there and"
+			       " only the PLACEMENT moved\n"
+			       "    found near nz/2               still half width, permuted\n"
+			       "    found tiny                    the hardware computed"
+			       " something else\n");
+		}
 		charsiu_close(dev);
 		return 0;
 	}
