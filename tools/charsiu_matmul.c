@@ -110,6 +110,9 @@ static void pack_phantom(const struct charsiu_matmul *mm, const uint8_t *b_raw,
 			 uint8_t *dst)
 {
 	unsigned k = mm->k, n = mm->n, w, m;
+	int split = getenv("CHARSIU_W4_PH_SPLIT")
+		? atoi(getenv("CHARSIU_W4_PH_SPLIT")) : 0;
+	int order = getenv("CHARSIU_W4_PH_ORDER") != NULL;
 	size_t bytes = (size_t)n * k / 2;
 
 	memset(dst, 0, bytes);
@@ -120,12 +123,30 @@ static void pack_phantom(const struct charsiu_matmul *mm, const uint8_t *b_raw,
 		for (m = 0; m < k / 2; m++) {
 			unsigned j = m / 16, r = m % 16;
 			size_t slot = (size_t)k * (w / 32) + 32 * j + (w % 32);
-			size_t at = slot * 8 + r / 2;
-			unsigned v = b_raw[(size_t)c * k + kbase + m] & 0xf;
+			size_t at = slot * 8 + (order ? r % 8 : r / 2);
+			unsigned kk, v;
 
+			/*
+			 * WHICH k this position carries. The map fixes the
+			 * SLOTS a word owns and says nothing about the k inside
+			 * them, so both knobs are swept rather than assumed.
+			 */
+			if (split == 1)
+				kk = 2 * m + (w >= n ? 1 : 0);
+			else if (split == 2)
+				kk = (m & ~15u) * 2 + (m & 15u)
+				     + (w >= n ? 16 : 0);
+			else
+				kk = kbase + m;
+			if (kk >= k)
+				continue;
+			v = b_raw[(size_t)c * k + kk] & 0xf;
 			if (at >= bytes)
 				continue;
-			dst[at] |= (uint8_t)(r % 2 ? v << 4 : v);
+			if (order)
+				dst[at] |= (uint8_t)(r >= 8 ? v << 4 : v);
+			else
+				dst[at] |= (uint8_t)(r % 2 ? v << 4 : v);
 		}
 	}
 }
@@ -957,6 +978,53 @@ int main(int argc, char **argv)
 						printf("\n   ");
 					shown++;
 				}
+			}
+			/*
+			 * ⚠ READ THE PAIRING, DO NOT GUESS IT. Round 330 packed
+			 * the second half of each channel's k into word c+N and
+			 * added out[c] + out[c+N], and got zero of 64 -- but the
+			 * hardware DID write 2N words (128 at N=64, exactly 2N,
+			 * the first time charsiu has made it do that). So the
+			 * words are there and the pairing is wrong.
+			 *
+			 * So look for it. For every channel, every written word
+			 * i, ask whether ref - o[i] is also a written word. That
+			 * is O(2N) a channel with a lookup and it prints the
+			 * rule instead of testing one.
+			 */
+			if (phantom) {
+				unsigned ci2, shown2 = 0, hit = 0;
+
+				printf("  pairing: channel -> the two words that"
+				       " sum to its reference\n   ");
+				for (ci2 = 0; ci2 < n; ci2++) {
+					unsigned a, b2, found2 = 0;
+
+					for (a = 0; a < 2 * n && !found2; a++) {
+						if ((uint32_t)ow[a] == 0xa5a5a5a5u)
+							continue;
+						for (b2 = a; b2 < 2 * n; b2++) {
+							if ((uint32_t)ow[b2] == 0xa5a5a5a5u)
+								continue;
+							if ((int64_t)ow[a] + ow[b2]
+							    != refv[ci2])
+								continue;
+							if (shown2 < 24)
+								printf(" %u=w%u+w%u",
+								       ci2, a, b2);
+							found2 = 1;
+							hit++;
+							break;
+						}
+					}
+					if (!found2 && shown2 < 24)
+						printf(" %u=--", ci2);
+					if (shown2 < 24 && (shown2 & 3) == 3)
+						printf("\n   ");
+					shown2++;
+				}
+				printf("\n  pairing: %u of %u channels are the sum"
+				       " of two written words\n", hit, n);
 			}
 			printf("\n  placement: %u of %u channels with a nonzero reference"
 			       " (of %u) are present somewhere, %u of them at the index the"
