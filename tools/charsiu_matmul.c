@@ -109,44 +109,49 @@ static int cpu_reference(const struct charsiu_job *job, const uint8_t *a,
 static void pack_phantom(const struct charsiu_matmul *mm, const uint8_t *b_raw,
 			 uint8_t *dst)
 {
-	unsigned k = mm->k, n = mm->n, w, m;
-	int split = getenv("CHARSIU_W4_PH_SPLIT")
-		? atoi(getenv("CHARSIU_W4_PH_SPLIT")) : 0;
-	int order = getenv("CHARSIU_W4_PH_ORDER") != NULL;
+	unsigned k = mm->k, n = mm->n, w, j, byt;
 	size_t bytes = (size_t)n * k / 2;
+	unsigned slots = k / 32;                 /* slots a word owns */
 
+	/*
+	 * THE PAIRED PACKING, and every term in it was MEASURED, not assumed.
+	 *
+	 * Round 332 pointed --kpair at the phantom settings and read which k
+	 * each byte multiplies with. At K=64 N=64:
+	 *
+	 *   w0   byte 0 -> k 0,1    byte 4 -> k 8,9    byte 256 -> k 32,33
+	 *   w1   byte 8 -> k 16,17                     byte 264 -> k 48,49
+	 *   w64  byte 1024 -> k 0,1                    byte 1280 -> k 32,33
+	 *
+	 * So **w0 and w1 together cover all 64 k**, and w64 is a duplicate of
+	 * w0's k in a different part of the buffer. ⚠ That kills round 330's
+	 * pairing -- c with c+N is two copies of the same half -- and hands
+	 * over the real one: **a channel is the pair (2r, 2r+1)**. With
+	 * 0x3020 = 2N-1 there are 2N words, so N real channels each with the
+	 * whole of K, and N*K nibbles is exactly the N*K/2 byte buffer.
+	 *
+	 *   k = 16*(w mod 2) + 32*j + 2*byte_in_slot + nibble
+	 *
+	 * where j indexes the slots the map gives word w:
+	 *   slot = K*(w/32) + 32*j + (w mod 32),  byte = 8*slot + byte_in_slot
+	 */
 	memset(dst, 0, bytes);
-	for (w = 0; w < 2 * n; w++) {
-		unsigned c = w < n ? w : w - n;          /* the real channel */
-		unsigned kbase = w < n ? 0 : k / 2;      /* which half of its k */
+	for (w = 0; w < 2 * n && w / 2 < n; w++) {
+		unsigned c = w / 2;                    /* the real channel */
 
-		for (m = 0; m < k / 2; m++) {
-			unsigned j = m / 16, r = m % 16;
+		for (j = 0; j < slots; j++) {
 			size_t slot = (size_t)k * (w / 32) + 32 * j + (w % 32);
-			size_t at = slot * 8 + (order ? r % 8 : r / 2);
-			unsigned kk, v;
 
-			/*
-			 * WHICH k this position carries. The map fixes the
-			 * SLOTS a word owns and says nothing about the k inside
-			 * them, so both knobs are swept rather than assumed.
-			 */
-			if (split == 1)
-				kk = 2 * m + (w >= n ? 1 : 0);
-			else if (split == 2)
-				kk = (m & ~15u) * 2 + (m & 15u)
-				     + (w >= n ? 16 : 0);
-			else
-				kk = kbase + m;
-			if (kk >= k)
-				continue;
-			v = b_raw[(size_t)c * k + kk] & 0xf;
-			if (at >= bytes)
-				continue;
-			if (order)
-				dst[at] |= (uint8_t)(r >= 8 ? v << 4 : v);
-			else
-				dst[at] |= (uint8_t)(r % 2 ? v << 4 : v);
+			for (byt = 0; byt < 8; byt++) {
+				size_t at = slot * 8 + byt;
+				unsigned kk = 16 * (w % 2) + 32 * j + 2 * byt;
+
+				if (at >= bytes || kk + 1 >= k)
+					continue;
+				dst[at] = (uint8_t)
+					((b_raw[(size_t)c * k + kk] & 0xf) |
+					 ((b_raw[(size_t)c * k + kk + 1] & 0xf) << 4));
+			}
 		}
 	}
 }
@@ -728,10 +733,12 @@ int main(int argc, char **argv)
 				 * surface formula at channel ni + n.
 				 */
 				if (phantom) {
-					unsigned p2 = ni + n;
+					unsigned a2 = 2 * ni, b3 = 2 * ni + 1;
 
-					got += o[(size_t)(p2 / atom) * m * atom
-						 + (size_t)mi * atom + p2 % atom];
+					got = o[(size_t)(a2 / atom) * m * atom
+						+ (size_t)mi * atom + a2 % atom]
+					    + o[(size_t)(b3 / atom) * m * atom
+						+ (size_t)mi * atom + b3 % atom];
 				}
 				if ((uint32_t)got != 0xa5a5a5a5u) written++;
 				if (got == (int32_t)pe) ex_pe++;
