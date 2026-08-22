@@ -137,15 +137,38 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			}
 		t->kscale = malloc((size_t)k * sizeof(float));
 		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
-		for (uint64_t i = 0; i < k; i++) {
-			double v = col[i] / (double)n;   /* the mean, either way */
+		/*
+		 * ⚠ FLOOR THE STATISTIC AND CLAMP THE FACTOR. The first version
+		 * did neither and produced KL of 8 to 12, which is not a method
+		 * failing, it is a divide by nearly zero: a k whose mean |x| is
+		 * tiny gets a tiny factor, the weights of that column are
+		 * divided by it, and every one of them clips to the rail. The
+		 * floor is relative to the mean so it scales with the tensor,
+		 * and the clamp is what AWQ does for the same reason.
+		 */
+		{
+			double mean = 0.0;
 
-			col[i] = v > 0.0 ? pow(v, alpha) : 1.0;
-			gm += log(col[i]);
+			for (uint64_t i = 0; i < k; i++)
+				mean += col[i];
+			mean /= (double)n * (double)k;
+			for (uint64_t i = 0; i < k; i++) {
+				double v = col[i] / (double)n;
+
+				if (v < 1e-3 * mean)
+					v = 1e-3 * mean;
+				col[i] = pow(v, alpha);
+				gm += log(col[i]);
+			}
 		}
 		gm = exp(gm / (double)k);            /* keep the mean factor at 1 */
-		for (uint64_t i = 0; i < k; i++)
-			t->kscale[i] = (float)(col[i] / gm);
+		for (uint64_t i = 0; i < k; i++) {
+			double f = col[i] / gm;
+
+			if (f < 0.125) f = 0.125;
+			if (f > 8.0) f = 8.0;
+			t->kscale[i] = (float)f;
+		}
 		free(col);
 	}
 
@@ -279,6 +302,7 @@ void npu_tensor_free(struct npu_tensor *t)
 	free(t->scale);
 	free(t->kscale);
 	free(t->astat);
+	free(t->acov);
 	free(t->wsum);
 	memset(t, 0, sizeof(*t));
 }
@@ -331,6 +355,39 @@ void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
 	for (uint64_t i = 0; i < t->k; i++)
 		t->astat[i] += fabs((double)a->f[i]);
 	t->acalls++;
+
+	/*
+	 * ⚠ THE ONE MEASUREMENT THAT DECIDES WHETHER GPTQ IS WORTH DAYS.
+	 *
+	 * GPTQ's whole premise is that the activations are CORRELATED, so the
+	 * error made rounding one weight can be pushed onto the others through
+	 * the inverse Hessian. If the activations of this model are close to
+	 * uncorrelated, H is nearly diagonal, there is nothing to push the
+	 * error into, and GPTQ degenerates to round-to-nearest.
+	 *
+	 * A synthetic testbed cannot answer that, because iid Gaussian inputs
+	 * have H = I by construction, which is exactly the case where the
+	 * method cannot help. So accumulate the real thing for ONE tensor:
+	 * CHARSIU_CALIB_H names it, and the covariance is dumped beside the
+	 * means.
+	 */
+	{
+		const char *hn = getenv("CHARSIU_CALIB_H");
+
+		if (hn && !strcmp(hn, t->name)) {
+			if (!t->acov)
+				t->acov = calloc((size_t)t->k * t->k,
+						 sizeof(*t->acov));
+			if (t->acov)
+				for (uint64_t i = 0; i < t->k; i++) {
+					double ai = a->f[i];
+
+					for (uint64_t j = i; j < t->k; j++)
+						t->acov[i * t->k + j] +=
+							ai * a->f[j];
+				}
+		}
+	}
 }
 
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
@@ -384,6 +441,42 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 			free_after = tmp;
 		}
 
+		/*
+		 * ⚠ WHAT PRECISION IS THE ACTIVATION, REALLY.
+		 *
+		 * charsiu's int4 path already tells the hardware 16 bit
+		 * activations: charsiu_effective_adtype returns FP16 and 0x100c
+		 * carries bit 29. But the PACKING puts an int8 value in the high
+		 * byte of that 16 bit slot, so the container is sixteen bits and
+		 * the precision is eight. Every quality number measured so far
+		 * used a->q1, which is that eight bit value, so the table is a
+		 * measurement of w4a8.
+		 *
+		 * CHARSIU_NPU_A16 fills the slot instead: the activation stays
+		 * at full precision and only the weights are four bits, which is
+		 * what the vendor's W4A16 is and what makes a k factor possible
+		 * at all, since spreading an eight bit activation's range is
+		 * what destroyed it here.
+		 */
+		if (getenv("CHARSIU_NPU_A16")) {
+			for (uint64_t g = 0; g < ngrp; g++) {
+				uint64_t lo = g * grp;
+				uint64_t len = lo + grp < t->k ? grp : t->k - lo;
+				double part = 0.0;
+
+				for (uint64_t i = lo; i < lo + len; i++) {
+					double av = a->f[i];
+
+					if (t->kscale)
+						av *= t->kscale[i];
+					part += (double)t->q[n * t->k + i] * av;
+				}
+				acc += part * t->scale[n * ngrp + g];
+			}
+			y[n] = (float)acc;
+			free(free_after);
+			continue;
+		}
 		for (uint64_t g = 0; g < ngrp; g++) {
 			uint64_t lo = g * grp;
 			uint64_t len = lo + grp < t->k ? grp : t->k - lo;

@@ -623,6 +623,23 @@ void llama_state_free(struct llama_state *s)
 			fwrite(&t->k, sizeof(t->k), 1, f);
 			fwrite(t->astat, sizeof(double), t->k, f);
 			wrote++;
+			if (t->acov) {
+				char hp[256];
+				FILE *hf;
+
+				snprintf(hp, sizeof(hp), "%s.cov",
+					 getenv("CHARSIU_CALIB"));
+				hf = fopen(hp, "wb");
+				if (hf) {
+					fwrite(&t->k, sizeof(t->k), 1, hf);
+					fwrite(t->acov, sizeof(double),
+					       (size_t)t->k * t->k, hf);
+					fclose(hf);
+					fprintf(stderr, "calib: covariance of %s"
+						" (%llu^2) to %s\n", t->name,
+						(unsigned long long)t->k, hp);
+				}
+			}
 		}
 		if (f) {
 			fclose(f);
