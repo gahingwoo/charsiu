@@ -142,7 +142,8 @@ void charsiu_act_set(struct charsiu_act *a, const float *x, int n);
  */
 struct npu_tensor {
 	int8_t *q;         /* [n][k], row major */
-	float *scale;      /* n, per output channel */
+	float *scale;      /* n * ngroup, per output channel per k group */
+	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	int32_t *wsum;     /* n, sum of q over k: the coefficient buffer wants it */
 	uint64_t n, k;
 	double rms_rel;    /* what the quantisation cost this tensor */

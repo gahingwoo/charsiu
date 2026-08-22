@@ -36,11 +36,35 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	float *row;
 	double se = 0.0, sw = 0.0;
 
+	/*
+	 * ⚠ THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
+	 * IN. The hardware's coefficient buffer carries ONE multiplier per
+	 * output channel, so charsiu's NPU weights are quantised per channel --
+	 * fine at eight bits, and q4_0 uses a scale every 32 weights precisely
+	 * because four bits per channel is not.
+	 *
+	 * But K is sliced anyway (KMAX), and acc_out makes a K split exact, so
+	 * a slice can carry its own scale for free. CHARSIU_NPU_W4_GROUP asks
+	 * what that buys: the weights are quantised in groups of that many k,
+	 * with a scale each, which is what the runtime would actually get.
+	 * CHARSIU_NPU_W4 alone is one scale for the whole row, the worst case.
+	 */
+	unsigned bits = getenv("CHARSIU_NPU_W4") ? 4 : 8;
+	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
+		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
+	uint64_t ngrp;
+	float qmax = bits == 4 ? 7.0f : 127.0f;
+
+	if (grp == 0 || grp > k)
+		grp = k;
+	ngrp = (k + grp - 1) / grp;
+
 	memset(t, 0, sizeof(*t));
 	t->n = n;
 	t->k = k;
+	t->kgroup = grp;
 	t->q = malloc((size_t)n * k);
-	t->scale = malloc((size_t)n * sizeof(float));
+	t->scale = malloc((size_t)n * ngrp * sizeof(float));
 	t->wsum = malloc((size_t)n * sizeof(int32_t));
 	row = malloc((size_t)k * sizeof(float));
 	if (!t->q || !t->scale || !t->wsum || !row) {
@@ -51,11 +75,14 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 
 	for (uint64_t r = 0; r < n; r++) {
 		int8_t *dst = t->q + r * k;
-		float amax = 0.0f, d, id;
 		int32_t sum = 0;
 
 		gguf_row_f32(w, r, row);
-		for (uint64_t i = 0; i < k; i++) {
+		for (uint64_t g = 0; g < ngrp; g++) {
+		uint64_t lo = g * grp, hi = lo + grp < k ? lo + grp : k;
+		float amax = 0.0f, d, id;
+
+		for (uint64_t i = lo; i < hi; i++) {
 			float a = fabsf(row[i]);
 
 			if (a > amax)
@@ -67,15 +94,15 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * scale built on it would make the largest weight unreachable in
 		 * one direction.
 		 */
-		d = amax / 127.0f;
+		d = amax / qmax;
 		id = d != 0.0f ? 1.0f / d : 0.0f;
-		t->scale[r] = d;
+		t->scale[r * ngrp + g] = d;
 
-		for (uint64_t i = 0; i < k; i++) {
+		for (uint64_t i = lo; i < hi; i++) {
 			int v = (int)lrintf(row[i] * id);
 
-			if (v > 127) v = 127;
-			if (v < -127) v = -127;
+			if (v > (int)qmax) v = (int)qmax;
+			if (v < -(int)qmax) v = -(int)qmax;
 			dst[i] = (int8_t)v;
 			sum += v;
 			{
@@ -84,6 +111,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 				se += e * e;
 				sw += (double)row[i] * (double)row[i];
 			}
+		}
 		}
 		t->wsum[r] = sum;
 	}
@@ -135,7 +163,18 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 	for (uint64_t r = 0; r < nrows; r++) {
 		uint64_t n = row0 + r;
 
-		y[n] = (float)idot(t->q + n * t->k, a->q1, t->k) * a->d1 * t->scale[n];
+		uint64_t grp = t->kgroup ? t->kgroup : t->k;
+		uint64_t ngrp = (t->k + grp - 1) / grp;
+		double acc = 0.0;
+
+		for (uint64_t g = 0; g < ngrp; g++) {
+			uint64_t lo = g * grp;
+			uint64_t len = lo + grp < t->k ? grp : t->k - lo;
+
+			acc += (double)idot(t->q + n * t->k + lo, a->q1 + lo,
+					    len) * t->scale[n * ngrp + g];
+		}
+		y[n] = (float)(acc * a->d1);
 	}
 }
 
