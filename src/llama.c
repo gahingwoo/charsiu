@@ -209,12 +209,15 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 				id = s->npu_id[i];
 				break;
 			}
-		if (id >= 0) {
-			if (charsiu_npu_matvec(s->dev, id, a, y)) {
-				fprintf(stderr, "charsiu: NPU matvec failed on %s\n",
-					nt->name);
-				exit(1);
-			}
+		/*
+		 * A failure here FALLS BACK rather than aborting. Round 313
+		 * wedged the block on the first feed forward projection and the
+		 * loop kept resubmitting a job that timed out every 1.9 seconds
+		 * until the board was power cycled. A run that degrades to the
+		 * CPU still finishes and still reports which shape stopped
+		 * answering, which is worth more than either a hang or a crash.
+		 */
+		if (id >= 0 && !charsiu_npu_matvec(s->dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
 					    npu_out8_mode());
 			return;
