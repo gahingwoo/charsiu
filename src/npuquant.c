@@ -20,6 +20,7 @@
  */
 
 #include <math.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +50,16 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * with a scale each, which is what the runtime would actually get.
 	 * CHARSIU_NPU_W4 alone is one scale for the whole row, the worst case.
 	 */
-	unsigned bits = getenv("CHARSIU_NPU_W4") ? 4 : 8;
+	/*
+	 * CHARSIU_NPU_W4_ONLY narrows int4 to the tensors whose name contains a
+	 * substring, so "ffn" puts the feed forward -- which is 65% of the
+	 * bytes a token moves -- at four bits and leaves attention at eight.
+	 * Most of the saving for a fraction of the error, if the error turns
+	 * out to live in attention.
+	 */
+	const char *w4only = getenv("CHARSIU_NPU_W4_ONLY");
+	unsigned bits = getenv("CHARSIU_NPU_W4")
+		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
 	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
 		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
 	uint64_t ngrp;
@@ -58,6 +68,28 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	if (grp == 0 || grp > k)
 		grp = k;
 	ngrp = (k + grp - 1) / grp;
+
+	/*
+	 * ⚠ THE k FACTOR, and why it is free.
+	 *
+	 * charsiu reads the RAW int32 accumulator (acc_out), so the hardware's
+	 * per channel multiplier is not in the path at all: the dequantise
+	 * happens on the CPU. The only real constraint is that one job's
+	 * accumulator sums all of K under one scale a channel.
+	 *
+	 * But a factor that depends on k ALONE cancels inside the product. Put
+	 * c_k into the weights as a divide and into the activation as a
+	 * multiply and the accumulator is unchanged, while the weights lose
+	 * whatever part of their spread across k is common to every channel --
+	 * which is the part one scale a row cannot cover. That is the AWQ and
+	 * SmoothQuant trick, and here it costs one multiply a k on a vector of
+	 * 2048 and nothing on the hardware.
+	 *
+	 * CHARSIU_NPU_AWQ is the exponent, 0 for off and 0.5 for the usual
+	 * square root balance.
+	 */
+	double alpha = getenv("CHARSIU_NPU_AWQ")
+		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
 
 	memset(t, 0, sizeof(*t));
 	t->n = n;
@@ -73,11 +105,38 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		return -1;
 	}
 
+	if (alpha != 0.0) {
+		double *col = calloc(k, sizeof(*col));
+		double gm = 0.0;
+
+		if (!col) { free(row); npu_tensor_free(t); return -1; }
+		for (uint64_t r = 0; r < n; r++) {
+			gguf_row_f32(w, r, row);
+			for (uint64_t i = 0; i < k; i++)
+				col[i] += fabs((double)row[i]);
+		}
+		t->kscale = malloc((size_t)k * sizeof(float));
+		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
+		for (uint64_t i = 0; i < k; i++) {
+			double v = col[i] / (double)n;
+
+			col[i] = v > 0.0 ? pow(v, alpha) : 1.0;
+			gm += log(col[i]);
+		}
+		gm = exp(gm / (double)k);            /* keep the mean factor at 1 */
+		for (uint64_t i = 0; i < k; i++)
+			t->kscale[i] = (float)(col[i] / gm);
+		free(col);
+	}
+
 	for (uint64_t r = 0; r < n; r++) {
 		int8_t *dst = t->q + r * k;
 		int32_t sum = 0;
 
 		gguf_row_f32(w, r, row);
+		if (t->kscale)
+			for (uint64_t i = 0; i < k; i++)
+				row[i] /= t->kscale[i];
 		for (uint64_t g = 0; g < ngrp; g++) {
 		uint64_t lo = g * grp, hi = lo + grp < k ? lo + grp : k;
 		float amax = 0.0f, d, id;
@@ -94,15 +153,86 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * scale built on it would make the largest weight unreachable in
 		 * one direction.
 		 */
-		d = amax / qmax;
+		/*
+		 * ⚠ USE ALL SIXTEEN LEVELS. amax/7 is symmetric and throws away
+		 * -8, which is one level of the sixteen a nibble has -- and
+		 * q4_0, the yardstick this is measured against, takes the
+		 * element of largest magnitude and divides by -8 so the range is
+		 * [-8, 7]. Round 335's first int4 numbers were a fifteen level
+		 * quantiser being compared against a sixteen level one.
+		 * CHARSIU_NPU_W4_SYM restores the symmetric version.
+		 */
+		if (bits == 4 && !getenv("CHARSIU_NPU_W4_SYM")) {
+			float vmax = 0.0f;
+
+			for (uint64_t i = lo; i < hi; i++)
+				if (fabsf(row[i]) > fabsf(vmax))
+					vmax = row[i];
+			d = vmax / -8.0f;
+			/*
+			 * ⚠ absmax IS THE WRONG SCALE FOR FOUR BITS, and it is
+			 * the cheapest thing to fix. One outlier in two thousand
+			 * weights sets the step for all of them, so every other
+			 * weight rounds into a grid that is far too coarse.
+			 *
+			 * Search the clip instead: try the scale shrunk by a
+			 * factor and keep whichever minimises the squared error
+			 * of the row. Nothing is stored -- the chosen d is the
+			 * per channel scale that would have been stored anyway
+			 * -- and nothing changes on the hardware. This is the
+			 * cheap half of what a calibrating quantiser does.
+			 *
+			 * ⚠ MEASURED AND IT IS WORSE: KL went 0.0989 to 0.2084
+			 * and 0.3660 to 0.5535 on two prompts. Minimising the
+			 * WEIGHT error clips exactly the large weights that
+			 * carry the output, which is why AWQ and GPTQ optimise
+			 * the OUTPUT error against calibration activations
+			 * instead. Off by default, kept as the control that
+			 * says a weight space objective is the wrong one.
+			 */
+			if (getenv("CHARSIU_NPU_W4_CLIP")) {
+				double bestе = -1.0;
+				float bestd = d;
+				int ci;
+
+				for (ci = 0; ci <= 20; ci++) {
+					float dc = d * (1.0f - 0.025f * ci);
+					double err = 0.0;
+
+					if (dc == 0.0f)
+						continue;
+					for (uint64_t i = lo; i < hi; i++) {
+						int v = (int)lrintf(row[i] / dc);
+						double e;
+
+						if (v > 7) v = 7;
+						if (v < -8) v = -8;
+						e = (double)row[i] - (double)v * dc;
+						err += e * e;
+					}
+					if (bestе < 0.0 || err < bestе) {
+						bestе = err;
+						bestd = dc;
+					}
+				}
+				d = bestd;
+			}
+		} else {
+			d = amax / qmax;
+		}
 		id = d != 0.0f ? 1.0f / d : 0.0f;
 		t->scale[r * ngrp + g] = d;
 
 		for (uint64_t i = lo; i < hi; i++) {
 			int v = (int)lrintf(row[i] * id);
 
-			if (v > (int)qmax) v = (int)qmax;
-			if (v < -(int)qmax) v = -(int)qmax;
+			if (bits == 4 && !getenv("CHARSIU_NPU_W4_SYM")) {
+				if (v > 7) v = 7;
+				if (v < -8) v = -8;
+			} else {
+				if (v > (int)qmax) v = (int)qmax;
+				if (v < -(int)qmax) v = -(int)qmax;
+			}
 			dst[i] = (int8_t)v;
 			sum += v;
 			{
@@ -127,6 +257,7 @@ void npu_tensor_free(struct npu_tensor *t)
 		return;
 	free(t->q);
 	free(t->scale);
+	free(t->kscale);
 	free(t->wsum);
 	memset(t, 0, sizeof(*t));
 }
@@ -166,15 +297,55 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		uint64_t grp = t->kgroup ? t->kgroup : t->k;
 		uint64_t ngrp = (t->k + grp - 1) / grp;
 		double acc = 0.0;
+		const int8_t *aq = a->q1;
+		int8_t *free_after = NULL;
+		float ad = a->d1;
+
+		/*
+		 * The k factor rides on the ACTIVATION, so a tensor that has one
+		 * needs its own quantisation of the same input vector. On the
+		 * board this is one multiply a k before the pack; here it is
+		 * done straight so the measurement is honest.
+		 */
+		if (t->kscale) {
+			/*
+			 * ⚠ PER CALL, NOT static. npu_matvec runs on the worker
+			 * threads, and a static scratch buffer here was a race
+			 * and a double free: three of the five exponents in the
+			 * first sweep produced no output at all.
+			 */
+			int8_t *tmp = malloc((size_t)t->k);
+			float amax = 0.0f;
+
+			if (!tmp)
+				return;
+			for (uint64_t i = 0; i < t->k; i++) {
+				float v = a->f[i] * t->kscale[i];
+
+				if (fabsf(v) > amax) amax = fabsf(v);
+			}
+			ad = amax / 127.0f;
+			for (uint64_t i = 0; i < t->k; i++) {
+				int v = (int)lrintf(a->f[i] * t->kscale[i]
+						    / (ad != 0.0f ? ad : 1.0f));
+
+				if (v > 127) v = 127;
+				if (v < -127) v = -127;
+				tmp[i] = (int8_t)v;
+			}
+			aq = tmp;
+			free_after = tmp;
+		}
 
 		for (uint64_t g = 0; g < ngrp; g++) {
 			uint64_t lo = g * grp;
 			uint64_t len = lo + grp < t->k ? grp : t->k - lo;
 
-			acc += (double)idot(t->q + n * t->k + lo, a->q1 + lo,
+			acc += (double)idot(t->q + n * t->k + lo, aq + lo,
 					    len) * t->scale[n * ngrp + g];
 		}
-		y[n] = (float)(acc * a->d1);
+		y[n] = (float)(acc * ad);
+		free(free_after);
 	}
 }
 

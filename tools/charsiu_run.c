@@ -233,6 +233,27 @@ int main(int argc, char **argv)
 	 */
 	llama_stages_reset();
 
+	/*
+	 * CHARSIU_LOGIT_DUMP writes the WHOLE logit vector, because the top few
+	 * are not a metric: in this model ranks two to five sit within one
+	 * point of each other, so their ORDER moves under any perturbation and
+	 * says nothing about how large the perturbation is. A quantisation is
+	 * compared against the f32 run over the whole vector or not at all.
+	 */
+	{
+		const char *dp = getenv("CHARSIU_LOGIT_DUMP");
+
+		if (dp) {
+			FILE *f = fopen(dp, "wb");
+
+			if (f) {
+				fwrite(logits, sizeof(float), m.n_vocab, f);
+				fclose(f);
+				fprintf(stderr, "logits: wrote %u floats to %s\n",
+					m.n_vocab, dp);
+			}
+		}
+	}
 	if (show_logits) {
 		int n = show_logits;
 
