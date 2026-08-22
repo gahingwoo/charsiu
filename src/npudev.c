@@ -89,6 +89,12 @@ struct charsiu_npu {
 	 * the NPU and the CPU stops being an inference here.
 	 */
 	double busy_us;
+	/*
+	 * And what that time is MADE of. bo_prep is not a read: it WAITS for the
+	 * job, so the fence and the copy have to be told apart or the 23 ms this
+	 * leaves over stays a residual rather than a measurement.
+	 */
+	double submit_us, fence_us, copy_us;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -241,9 +247,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	if (g->submits)
 		fprintf(stderr,
 			"charsiu NPU: %.0f ms in the hardware path, %.2f GB/s "
-			"of weights, %.0f us a submit\n",
+			"of weights, %.0f us a submit\n"
+			"charsiu NPU: of that, %.0f ms submitting, %.0f ms "
+			"waiting for the fence, %.0f ms reading back\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
-			g->busy_us / (double)g->submits);
+			g->busy_us / (double)g->submits,
+			g->submit_us / 1e3, g->fence_us / 1e3, g->copy_us / 1e3);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -490,10 +499,15 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			}
 			g->submits++;
 		}
+		g->submit_us += now_us() - t0;
 	}
 
 	if (g->strikes < 3) {
+		double t1 = now_us();
+
 		charsiu_bo_prep(g->dev, &e->out, 2000000000);
+		g->fence_us += now_us() - t1;
+		t1 = now_us();
 		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
@@ -504,6 +518,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				g->acc[s->n0 + j] += out[j];
 		}
 		charsiu_bo_fini(g->dev, &e->out);
+		g->copy_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
 		g->busy_us += now_us() - t0;
 
