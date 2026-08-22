@@ -101,8 +101,8 @@ struct charsiu_npu {
 	 * the ioctl still returns success, so the only reliable detector is the
 	 * clock. Three slow submits and this path retires itself.
 	 */
-	double slow_us;
-	int strikes, dead, whined, nochain;
+	double slow_us, min_gbs;
+	int strikes, dead, whined, nochain, slowed;
 	unsigned long slices;
 };
 
@@ -162,10 +162,17 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 *   slices  606    542    319    287
 	 *   tok/s   5.55   5.62   5.83   5.90
 	 *
-	 * N=2048 with K=4096 is 287 slices and produced text character for
-	 * character the CPU's, so it is the default.
+	 * Round 322 pushed it further and found the limit is on K and not on N:
+	 *
+	 *   slices  287    192    144    128
+	 *   tok/s   5.90   6.08   6.09   0.55 <- K=8192, 131 job timeouts
+	 *
+	 * ⚠ N = 8192 DOES NOT WEDGE. That is the shape round 313 needed a power
+	 * cycle to escape, so 313's hang was the requantised byte output or the
+	 * 67 MB coefficient buffer, NOT the width. K = 8192 is the one that
+	 * collapses, to 0.65 GB/s, and it collapses rather than hanging.
 	 */
-	g->nmax = env_u("CHARSIU_NPU_NMAX", 2048);
+	g->nmax = env_u("CHARSIU_NPU_NMAX", 8192);
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 4096);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
 	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
@@ -175,6 +182,20 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 * 4.2 GB/s where an eight task submit reaches 10.
 	 */
 	g->maxtask = env_u("CHARSIU_NPU_MAXTASK", 0);
+	/*
+	 * ⚠ THE RETIREMENT GUARD WAS BLIND TO A THIRTEEN FOLD SLOWDOWN.
+	 *
+	 * Round 322's K = 8192 rung ran at 0.65 GB/s with 131 driver timeouts
+	 * and 3718 IOMMU errors, and nothing printed: the budget is 100 ms plus
+	 * a millisecond a megabyte, which is 1 GB/s, and 0.65 sat just under it
+	 * while every submit stayed inside the flat allowance.
+	 *
+	 * Retiring the path on that would be wrong -- the answers were still
+	 * correct, it was only slow -- so this is a separate, non fatal notice.
+	 * "It stopped answering" and "it is thirteen times slower than it has
+	 * ever been" are different things and a run should say which.
+	 */
+	g->min_gbs = (double)env_u("CHARSIU_NPU_MIN_MBPS", 2000) / 1000.0;
 	g->max_n = max_n;
 	g->ent_cap = max_tensors;
 
@@ -195,9 +216,9 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
 	g->scratch = malloc((size_t)g->nmax * g->kmax + max_k);
 	g->acc = calloc(max_n, sizeof(*g->acc));
-	g->tasks = calloc(g->max_slices, sizeof(*g->tasks));
-	/* input + one weight and one coefficient buffer per chained task */
-	g->handles = calloc(1 + 2 * g->max_slices, sizeof(*g->handles));
+	/* a GROUP can carry several tensors' slices, so four times over */
+	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
+	g->handles = calloc(1 + 8 * g->max_slices, sizeof(*g->handles));
 	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->tasks ||
 	    !g->handles)
 		goto fail;
@@ -541,11 +562,26 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		 * big one is mistaken for a wedge. A millisecond a megabyte is
 		 * ten times slower than this hardware has ever been.
 		 */
-		if (now_us() - t0 > g->slow_us * (g->nochain ? e->count : 1)
-				    + e->weight_mb * 1000.0)
-			g->strikes++;
-		else
-			g->strikes = 0;
+		{
+			double took = now_us() - t0;
+			double gbs = e->weight_mb / took * 1e3;
+
+			if (took > g->slow_us * (g->nochain ? e->count : 1)
+				  + e->weight_mb * 1000.0)
+				g->strikes++;
+			else
+				g->strikes = 0;
+
+			if (!g->slowed && gbs < g->min_gbs) {
+				g->slowed = 1;
+				fprintf(stderr,
+					"charsiu: the NPU is SLOW, %.2f GB/s at "
+					"K=%u N=%u -- correct but degraded, and "
+					"nothing is being retired\n",
+					gbs, (unsigned)e->t->k,
+					(unsigned)e->t->n);
+			}
+		}
 	}
 
 	if (g->strikes >= 3) {
@@ -559,5 +595,114 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 
 	for (i = 0; i < (unsigned)e->t->n; i++)
 		y[i] = (float)g->acc[i] * a->d1 * e->t->scale[i];
+	return 0;
+}
+
+/*
+ * SEVERAL PROJECTIONS, ONE SUBMIT AND ONE FENCE.
+ *
+ * q, k and v all multiply the SAME RMSNorm output, and so do gate and up. They
+ * are independent of each other, so there is no reason to wait for one before
+ * starting the next -- and round 321 measured the fence at 94% of the hardware
+ * path, so a fence removed is worth more than a submit removed.
+ *
+ * 113 fences a token becomes 65. Whether that is worth anything is what the
+ * round measures; the arithmetic is unchanged either way, so the tokens must
+ * stay identical.
+ */
+int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
+			     const struct charsiu_act *a, float **ys)
+{
+	struct npu_entry *e0;
+	struct charsiu_joblist jl;
+	uint32_t outh[8];
+	unsigned nh = 0, ntask = 0, i, j;
+	double t0, t1;
+
+	if (g->dead || !n || n > 8)
+		return -1;
+	for (i = 0; i < n; i++)
+		if (ids[i] < 0 || (unsigned)ids[i] >= g->n_ent)
+			return -1;
+	e0 = &g->ent[ids[0]];
+	for (i = 1; i < n; i++)
+		if (g->ent[ids[i]].t->k != e0->t->k)
+			return -1;       /* a group shares one activation */
+	if ((unsigned)a->n != e0->t->k)
+		return -1;
+
+	/* the activation, once, for every K slice */
+	charsiu_bo_prep(g->dev, &g->in, 1000000000);
+	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
+		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
+
+		for (i = 0; i < s->job.mm.k; i++)
+			g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i] + 128);
+		charsiu_pack_input(&s->job.mm, g->scratch,
+				   (uint8_t *)g->in.map + ki * g->in_stride,
+				   g->in_stride, s->job.input_zero_point);
+	}
+	charsiu_bo_fini(g->dev, &g->in);
+
+	g->handles[nh++] = g->in.handle;
+	for (i = 0; i < n; i++) {
+		struct npu_entry *e = &g->ent[ids[i]];
+
+		outh[i] = e->out.handle;
+		for (j = 0; j < e->count; j++) {
+			const struct npu_slot *s = &g->slot[e->first + j];
+
+			if (ntask >= 4 * g->max_slices)
+				return -1;
+			g->tasks[ntask].regcmd = (uint32_t)s->regcmd.dma_address;
+			g->tasks[ntask].regcmd_count = s->nreg;
+			ntask++;
+			g->handles[nh++] = s->wt.handle;
+			g->handles[nh++] = s->coef.handle;
+		}
+	}
+	jl.tasks = g->tasks;
+	jl.task_count = ntask;
+	jl.in_handles = g->handles;
+	jl.in_count = nh;
+	jl.out_handles = outh;
+	jl.out_count = n;
+
+	t0 = now_us();
+	if (charsiu_submit_jobs(g->dev, &jl, 1)) {
+		g->strikes = 3;
+		g->dead = 1;
+		fprintf(stderr, "charsiu: a %u task group submit failed\n", ntask);
+		return -1;
+	}
+	g->submits++;
+	g->submit_us += now_us() - t0;
+
+	t1 = now_us();
+	for (i = 0; i < n; i++)
+		charsiu_bo_prep(g->dev, &g->ent[ids[i]].out, 2000000000);
+	g->fence_us += now_us() - t1;
+
+	t1 = now_us();
+	for (i = 0; i < n; i++) {
+		struct npu_entry *e = &g->ent[ids[i]];
+		const int32_t *out;
+
+		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
+		for (j = 0; j < e->count; j++) {
+			const struct npu_slot *s = &g->slot[e->first + j];
+
+			out = (const int32_t *)((const uint8_t *)e->out.map +
+						s->out_slot * g->out_stride);
+			for (unsigned q = 0; q < s->job.mm.n; q++)
+				g->acc[s->n0 + q] += out[q];
+		}
+		charsiu_bo_fini(g->dev, &e->out);
+		for (unsigned q = 0; q < (unsigned)e->t->n; q++)
+			ys[i][q] = (float)g->acc[q] * a->d1 * e->t->scale[q];
+		g->weight_mb += e->weight_mb;
+	}
+	g->copy_us += now_us() - t1;
+	g->busy_us += now_us() - t0;
 	return 0;
 }

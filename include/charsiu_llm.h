@@ -184,6 +184,9 @@ void charsiu_npu_close(struct charsiu_npu *g);
 int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
+/* several independent projections of the same activation, one submit, one fence */
+int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
+			      const struct charsiu_act *a, float **ys);
 unsigned long charsiu_npu_submits(const struct charsiu_npu *g);
 void charsiu_npu_report(const struct charsiu_npu *g);
 void npu_report(const struct npu_tensor *t, unsigned count);

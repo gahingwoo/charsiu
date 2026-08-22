@@ -190,6 +190,61 @@ static void matvec(struct llama_state *s, const struct gguf_tensor *w,
  * between the attention and the feed forward halves, so pointer equality would
  * be wrong in exactly the place it looks right.
  */
+/*
+ * Several projections of ONE activation, in one submit and one fence.
+ *
+ * q, k and v all multiply the same RMSNorm output, and so do gate and up. Round
+ * 321 measured the fence at 94% of the hardware path, so a fence removed is
+ * worth more than a submit removed: 113 fences a token becomes 65.
+ *
+ * It falls back to one at a time whenever anything is not on the hardware, so
+ * the arithmetic is the same either way and the tokens have to be identical.
+ * CHARSIU_NPU_NOGROUP forces the fallback, which is the control.
+ */
+static int group_off(void)
+{
+	static int m = -1;
+
+	if (m < 0)
+		m = getenv("CHARSIU_NPU_NOGROUP") != NULL;
+	return m;
+}
+
+static void matvec_pair(struct llama_state *s, const float *x,
+			const struct gguf_tensor *wa, float *ya,
+			const struct gguf_tensor *wb, float *yb,
+			const struct gguf_tensor *wc, float *yc)
+{
+	const struct gguf_tensor *w[3] = { wa, wb, wc };
+	float *y[3] = { ya, yb, yc };
+	const struct npu_tensor *nt[3];
+	int ids[3];
+	unsigned n = wc ? 3 : 2, i;
+
+	charsiu_act_set(&s->act, x, (int)wa->ne[0]);
+
+	if (s->dev && !group_off() && npu_mode() && s->act.q1_valid) {
+		for (i = 0; i < n; i++) {
+			nt[i] = npu_get(s, w[i]);
+			ids[i] = -1;
+			if (nt[i])
+				for (unsigned j = 0; j < s->n_npu; j++)
+					if (&s->npu[j] == nt[i]) {
+						ids[i] = s->npu_id[j];
+						break;
+					}
+			if (ids[i] < 0)
+				break;
+		}
+		if (i == n &&
+		    !charsiu_npu_matvec_group(s->dev, ids, n, &s->act, y))
+			return;
+	}
+
+	for (i = 0; i < n; i++)
+		matvec_again(s, w[i], y[i]);
+}
+
 static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			 float *y)
 {
@@ -590,9 +645,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 
-		matvec(s, L->wq, s->xb, s->q);
-		matvec_again(s, L->wk, s->k);
-		matvec_again(s, L->wv, s->v);
+		matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k, L->wv, s->v);
 
 		rope(s->q, m->n_head, hd, pos, m->rope_base, freqf);
 		rope(s->k, m->n_head_kv, hd, pos, m->rope_base, freqf);
@@ -633,8 +686,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			s->x[i] += s->xb2[i];
 
 		rmsnorm(s->xb, s->x, L->ffn_norm, m->n_embd, m->rms_eps);
-		matvec(s, L->gate, s->xb, s->hb);
-		matvec_again(s, L->up, s->hb2);
+		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
 		for (uint32_t i = 0; i < m->n_ff; i++) {
 			float g = s->hb[i];
 
