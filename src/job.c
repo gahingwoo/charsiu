@@ -53,6 +53,13 @@ struct emitter {
  * a size register, and answering which one needs a sweep of one field at a
  * time, which is the method that worked on 0x4050 in round 260.
  */
+/* the int4 paired recipe, on when CHARSIU_W4_PAIRED is set and the weights are
+ * int4. One place, so the emitter and every probe agree. */
+int charsiu_w4_paired(const struct charsiu_matmul *mm)
+{
+	return mm->wdtype == CHARSIU_INT4 && getenv("CHARSIU_W4_PAIRED") != NULL;
+}
+
 static int override_for(unsigned reg, uint32_t *out)
 {
 	const char *p = getenv("CHARSIU_OVERRIDE");
@@ -535,10 +542,35 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * 16 covers the real count, and the extra channels are computed and
 	 * ignored.
 	 */
+	/*
+	 * ⚠ CHARSIU_W4_PAIRED IS THE int4 RECIPE, and it replaces the round-280
+	 * workaround above rather than adding to it.
+	 *
+	 * Rounds 332 to 334 read the layout off the board instead of guessing
+	 * it. --kpair says an EVEN word takes k 0..15 and 32..47 and an ODD word
+	 * takes 16..31 and 48..63, so the two together are the whole of K and
+	 * **a real channel is the pair (2r, 2r+1)**. Declare 2N channels and
+	 * there are 2N words, which is N real channels each with all of K, and
+	 * N*K nibbles is exactly the N*K/2 byte buffer: nothing padded.
+	 *
+	 * Three registers carry the count and ALL THREE have to say 2N. Round
+	 * 334 found that the hard way: 0x3020 alone and 0x3020 with 0x402c both
+	 * wrote N words and got half the channels, and **0x4030's high half is
+	 * the one that was capping the write**. With all of them:
+	 *
+	 *   N=256  K=2048   512 words   256 EXACT of 256
+	 *   N=512  K=1024  1024 words   512 EXACT of 512
+	 *   N=1024 K=2048  2048 words  1024 EXACT of 1024
+	 *
+	 * The last of those is a projection's shape at 1 MiB of weights, which
+	 * is where int4 used to collapse.
+	 */
 	emit(&e, CORE, 0x3020,
-	     mm->wdtype == CHARSIU_INT4 && mm->n > 8
-		     ? (uint32_t)(2 * (ALIGN_UP(mm->n, 16) - 8) - 1)
-		     : mm->n - 1);
+	     charsiu_w4_paired(mm)
+		     ? (uint32_t)(2 * mm->n - 1)
+		     : (mm->wdtype == CHARSIU_INT4 && mm->n > 8
+			? (uint32_t)(2 * (ALIGN_UP(mm->n, 16) - 8) - 1)
+			: mm->n - 1));
 	emit(&e, CORE, 0x3024, 0x00000000);
 
 	/*
@@ -666,7 +698,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4020, 0x00000000);      /* ow - 1 */
 	emit(&e, DPU, 0x4024, lines);
 	emit(&e, DPU, 0x4028, 0x00000000);
-	emit(&e, DPU, 0x402c, mm->n - 1);
+	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
+					     and it changed nothing */
 	/*
 	 * 0x4030's low half. Mesa uses 0x0710 for a regular convolution and
 	 * 0x0310 for a depthwise one, and 0x0710 is right here.
@@ -680,7 +713,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * (vendor-capture/gen_act.py, geom/a_lin_m1) settles it: 0x003f0710,
 	 * which is what this line already emitted.
 	 */
-	emit(&e, DPU, 0x4030, ((mm->n - 1) << 16) |
+	emit(&e, DPU, 0x4030,
+	     ((uint32_t)(charsiu_w4_paired(mm) ? 2 * mm->n - 1 : mm->n - 1) << 16) |
 	     (uint32_t)(getenv("CHARSIU_DPU_4030")
 			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
 			: (WIDE(1) ? 0x0310u : 0x0710u)));
@@ -763,7 +797,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * trend: bytes written 112, 160, 208, 256, 208, 128, 64 and elements
 	 * exact 4, 8, 12, 64, 16, 16, 16 at 0, 1, 2, 3, 4, 7, 15.
 	 */
-	emit(&e, DPU, 0x40b8, job->acc_out ? 3u
+	emit(&e, DPU, 0x40b8, (job->acc_out || charsiu_w4_paired(&job->mm)) ? 3u
 					   : (uint32_t)(1 * (2 * rows - rows)));
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);

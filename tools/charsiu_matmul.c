@@ -523,7 +523,7 @@ int main(int argc, char **argv)
 			 / charsiu_feature_atom(CHARSIU_INT8))
 		* charsiu_feature_atom(CHARSIU_INT8) * m
 		* (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1)
-		* (getenv("CHARSIU_W4_PHANTOM") ? 2 : 1) + 4096, &outbo);
+		* ((getenv("CHARSIU_W4_PHANTOM") || getenv("CHARSIU_W4_PAIRED")) ? 2 : 1) + 4096, &outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef);
 	if (ret) { printf("bo alloc FAILED %d\n", ret); return 1; }
 	printf("bo iova: regcmd 0x%llx  in 0x%llx  wt 0x%llx  out 0x%llx  coef 0x%llx\n",
@@ -560,7 +560,7 @@ int main(int argc, char **argv)
 	charsiu_bo_fini(dev, &in);
 
 	charsiu_bo_prep(dev, &wt, 1000000000);
-	if (getenv("CHARSIU_W4_PHANTOM"))
+	if ((getenv("CHARSIU_W4_PHANTOM") || getenv("CHARSIU_W4_PAIRED")))
 		pack_phantom(&job.mm, b_raw, wt.map);
 	else
 		charsiu_pack_weights(&job.mm, b_raw, wt.map);
@@ -699,7 +699,7 @@ int main(int argc, char **argv)
 		 * geometries passed without this mattering.
 		 */
 		unsigned atom = 16 / (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1);
-		const int phantom = getenv("CHARSIU_W4_PHANTOM") != NULL;
+		const int phantom = getenv("CHARSIU_W4_PHANTOM") || getenv("CHARSIU_W4_PAIRED");
 		unsigned ni, mi, ex_pe = 0, ex_sum = 0, written = 0;
 		const int32_t *o = (const int32_t *)outbo.map;
 
