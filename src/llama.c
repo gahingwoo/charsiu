@@ -138,6 +138,7 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 			w->name, (unsigned long long)w->ne[1],
 			(unsigned long long)w->ne[0],
 			s->npu[s->n_npu].rms_rel * 100.0);
+	snprintf(s->npu[s->n_npu].name, sizeof(s->npu[s->n_npu].name), "%s", w->name);
 	s->npu_key[s->n_npu] = w;
 	return &s->npu[s->n_npu++];
 }
@@ -176,10 +177,13 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		nt = npu_get(s, w);
 
 	if (g_pool.n <= 1) {
-		if (nt)
+		if (nt) {
 			npu_matvec(nt, a, y, 0, nt->n);
-		else
+			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
+					    npu_out8_mode());
+		} else {
 			gguf_matvec(w, a, y, 0, w->ne[1]);
+		}
 		return;
 	}
 
@@ -195,6 +199,11 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	while (g_pool.done < g_pool.n)
 		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
 	pthread_mutex_unlock(&g_pool.mu);
+
+	/* after the fan in, because the scale is a property of the whole vector */
+	if (nt)
+		npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
+				    npu_out8_mode());
 }
 
 /* ---- the small pieces ---------------------------------------------------- */
@@ -470,6 +479,8 @@ void llama_state_free(struct llama_state *s)
 	free(s->q); free(s->k); free(s->v);
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
+	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
+		npu_report(s->npu, s->n_npu);
 	if (s->npu) {
 		for (unsigned i = 0; i < s->n_npu; i++)
 			npu_tensor_free(&s->npu[i]);

@@ -20,6 +20,7 @@
  */
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -135,5 +136,111 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		uint64_t n = row0 + r;
 
 		y[n] = (float)idot(t->q + n * t->k, a->q1, t->k) * a->d1 * t->scale[n];
+	}
+}
+
+static uint64_t npu_cal_calls(void)
+{
+	static long c = -1;
+
+	if (c < 0) {
+		const char *e = getenv("CHARSIU_NPU_CAL");
+
+		c = e ? atol(e) : 32;
+		if (c < 1)
+			c = 1;
+	}
+	return (uint64_t)c;
+}
+
+int npu_out8_mode(void)
+{
+	static int m = -1;
+
+	if (m < 0) {
+		const char *e = getenv("CHARSIU_NPU_OUT8");
+
+		m = e ? atoi(e) : 0;
+	}
+	return m;
+}
+
+void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
+{
+	float amax = 0.0f, d, id;
+	uint64_t clipped = 0;
+
+	if (mode <= 0)
+		return;
+
+	for (uint64_t i = 0; i < n; i++) {
+		float a = fabsf(y[i]);
+
+		if (a > amax)
+			amax = a;
+	}
+
+	if (t->amax_lo <= 0.0f || amax < t->amax_lo)
+		t->amax_lo = amax;
+	if (amax > t->amax_hi)
+		t->amax_hi = amax;
+
+	if (mode >= 2) {
+		/*
+		 * A coefficient buffer holds ONE set of numbers for the whole
+		 * run, so the scale cannot look at the vector it is about to
+		 * quantise.
+		 *
+		 * mode 2 freezes on the FIRST call, which is the worst possible
+		 * calibration and not a fair test of the idea. mode 3 tracks the
+		 * running maximum over the first CHARSIU_NPU_CAL calls (32 by
+		 * default, so several tokens) and freezes after that, which is
+		 * what a calibration pass would actually produce.
+		 */
+		uint64_t cal = mode >= 3 ? npu_cal_calls() : 1;
+
+		if (t->out_calls < cal) {
+			float want = amax / 127.0f;
+
+			if (want > t->out_scale)
+				t->out_scale = want;
+		}
+		d = t->out_scale;
+	} else {
+		d = amax / 127.0f;
+	}
+
+	id = d != 0.0f ? 1.0f / d : 0.0f;
+	for (uint64_t i = 0; i < n; i++) {
+		int v = (int)lrintf(y[i] * id);
+
+		if (v > 127) { v = 127; clipped++; }
+		if (v < -127) { v = -127; clipped++; }
+		y[i] = (float)v * d;
+	}
+	t->out_clip += (double)clipped / (double)n;
+	t->out_calls++;
+}
+
+/*
+ * What a FIXED output scale is up against.
+ *
+ * The scale a coefficient buffer holds has to cover the largest vector the
+ * model will ever produce, and every other vector then uses 127 divided by how
+ * much larger that one was. This prints that ratio.
+ */
+void npu_report(const struct npu_tensor *t, unsigned count)
+{
+	fprintf(stderr, "\n%-28s  %10s %10s %8s  %8s\n",
+		"tensor", "min |y|", "max |y|", "ratio", "clip%");
+	for (unsigned i = 0; i < count; i++) {
+		const struct npu_tensor *x = &t[i];
+
+		if (!x->out_calls)
+			continue;
+		fprintf(stderr, "%-28s  %10.3f %10.3f %8.1f  %8.3f\n",
+			x->name, (double)x->amax_lo, (double)x->amax_hi,
+			x->amax_lo > 0.0f ? (double)(x->amax_hi / x->amax_lo) : 0.0,
+			x->out_clip / (double)x->out_calls * 100.0);
 	}
 }

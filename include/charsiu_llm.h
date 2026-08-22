@@ -146,12 +146,35 @@ struct npu_tensor {
 	int32_t *wsum;     /* n, sum of q over k: the coefficient buffer wants it */
 	uint64_t n, k;
 	double rms_rel;    /* what the quantisation cost this tensor */
+	float out_scale;   /* CHARSIU_NPU_OUT8>=2: calibrated, then frozen */
+	double out_clip;   /* how much of the output the frozen scale clipped */
+	uint64_t out_calls;
+	float amax_lo, amax_hi;   /* the spread of |y| across calls: the outliers */
+	char name[80];
 };
 
 int  npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w);
 void npu_tensor_free(struct npu_tensor *t);
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		float *y, uint64_t row0, uint64_t nrows);
+
+/*
+ * What the hardware does to the RESULT.
+ *
+ * charsiu's int8 path requantises through the coefficient buffer and writes a
+ * BYTE, so a projection would leave the NPU as int8 with a scale that is baked
+ * into the coefficients and cannot depend on the token. Whether a model
+ * survives that is the question that decides whether the wide output the w4a16
+ * path uses is needed at all, and it is answerable here rather than on a board.
+ *
+ *   mode 1  a per call optimal scale. The BEST case int8 output can ever be;
+ *           if the text breaks here, a fixed scale cannot save it.
+ *   mode 2  a scale calibrated on the first call and then frozen, which is what
+ *           a coefficient buffer actually holds. Records what it clips.
+ */
+void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode);
+void npu_report(const struct npu_tensor *t, unsigned count);
+int  npu_out8_mode(void);
 
 /*
  * The one primitive the whole model is built out of: y[row] = dot(W[row], x).
