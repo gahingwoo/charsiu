@@ -185,6 +185,7 @@ int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
 unsigned long charsiu_npu_submits(const struct charsiu_npu *g);
+void charsiu_npu_report(const struct charsiu_npu *g);
 void npu_report(const struct npu_tensor *t, unsigned count);
 int  npu_out8_mode(void);
 

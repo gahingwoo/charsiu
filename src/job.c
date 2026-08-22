@@ -248,7 +248,24 @@ size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 	 * buffer 4.7 KB where the hardware reads 33 KB, and the symptom was a
 	 * job that timed out with a register stream identical to Mesa's.
 	 */
-	size_t elems = (size_t)mm->k * mm->n;
+	/*
+	 * ⚠ THE k*n BOUND IS A GUESS, AND IT DOES NOT SCALE. It makes the
+	 * coefficient buffer FOUR TIMES the weight buffer -- 8.4 MB for a
+	 * K=2048 N=1024 slice, 67 MB at N=8192 -- so a whole 1B model's
+	 * projections would want 3.9 GB of it on top of 973 MB of weights.
+	 * That is fine for one probe and impossible for a runtime.
+	 *
+	 * The reads this was sized against are tens of kilobytes, not megabytes:
+	 * round 147's wall was 4.7 KB allocated against 33 KB read, and the
+	 * driver's was 1280 bytes against 20800. Nothing has ever measured the
+	 * read growing with k*n; the bound was chosen because under allocating
+	 * hangs the block and nobody wanted to find the edge.
+	 *
+	 * CHARSIU_COEF_ELEMS overrides it so a board round can find that edge
+	 * on purpose. The default is unchanged until one does.
+	 */
+	const char *e = getenv("CHARSIU_COEF_ELEMS");
+	size_t elems = e ? strtoul(e, NULL, 0) : (size_t)mm->k * mm->n;
 
 	if (elems < 8192)
 		elems = 8192;

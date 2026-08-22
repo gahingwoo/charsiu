@@ -64,9 +64,17 @@ int main(int argc, char **argv)
 	job.input_zero_point = 128;
 	job.weight_zero_point = 128;
 	job.output_zero_point = 0;
+	/*
+	 * CHARSIU_ACC uses the first class mode instead of the register mask:
+	 * job.acc_out turns on the whole w4a16 output stage plus 0x40b8 = 3,
+	 * which round 312 measured at 1024 of 1024 elements exact.
+	 */
+	job.acc_out = getenv("CHARSIU_ACC") != NULL;
 
-	printf("wide8 probe  M=%u K=%u N=%u int8   CHARSIU_WIDE8=%s\n",
-	       m, k, n, mask ? mask : "(unset, so this run is the CONTROL)");
+	printf("wide8 probe  M=%u K=%u N=%u int8   acc_out=%d  CHARSIU_WIDE8=%s"
+	       "  coef %zu bytes\n",
+	       m, k, n, job.acc_out, mask ? mask : "(unset)",
+	       charsiu_coef_bytes(&job.mm));
 
 	/*
 	 * No bias and no lift, so the expected accumulator is exactly the sum of

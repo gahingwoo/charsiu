@@ -546,6 +546,8 @@ void llama_state_free(struct llama_state *s)
 	charsiu_act_free(&s->act);
 	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
 		npu_report(s->npu, s->n_npu);
+	if (s->dev)
+		charsiu_npu_report(s->dev);
 	charsiu_npu_close(s->dev);
 	if (s->npu) {
 		for (unsigned i = 0; i < s->n_npu; i++)

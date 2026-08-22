@@ -77,7 +77,8 @@ struct charsiu_npu {
 	 * repeating a 1.9 second timeout until someone pulls the power.
 	 */
 	double slow_us;
-	int strikes, dead;
+	int strikes, dead, whined;
+	unsigned long slices;
 };
 
 static double now_us(void)
@@ -170,7 +171,43 @@ unsigned long charsiu_npu_submits(const struct charsiu_npu *g)
 	return g ? g->submits : 0;
 }
 
+/*
+ * What the hardware actually did, printed whether it went well or not. A run
+ * that cannot say how many jobs it submitted cannot be read as evidence about
+ * the hardware, and round 315 was exactly that run.
+ */
+void charsiu_npu_report(const struct charsiu_npu *g)
+{
+	if (!g)
+		return;
+	fprintf(stderr,
+		"charsiu NPU: %u tensors, %lu slices, %lu submits%s\n",
+		g->n_ent, g->slices, g->submits,
+		g->dead ? "  (RETIRED: it stopped answering)" : "");
+	if (!g->submits)
+		fprintf(stderr,
+			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
+			"in this run came from the CPU.\n");
+}
+
 /* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t. */
+/*
+ * Say why, out loud, the first time.
+ *
+ * Round 315 ran a whole ladder in which the hardware never engaged, and the
+ * text was right every time because the CPU quietly did the work. The rung that
+ * caught it was the CONTROL THAT WAS SUPPOSED TO FAIL and did not. A silent
+ * fallback is worse than a loud failure: it produces a result that looks like
+ * evidence.
+ */
+static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned n)
+{
+	if (g->whined)
+		return;
+	g->whined = 1;
+	fprintf(stderr, "charsiu: NOT on the NPU -- %s (K=%u N=%u)\n", what, k, n);
+}
+
 static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 		     unsigned n0, unsigned n, unsigned k0, unsigned k)
 {
@@ -196,8 +233,10 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 
 	if (charsiu_bo_alloc(g->dev, charsiu_weight_bytes(&s->job.mm) + 4096, &s->wt) ||
 	    charsiu_bo_alloc(g->dev, charsiu_coef_bytes(&s->job.mm) + 4096, &s->coef) ||
-	    charsiu_bo_alloc(g->dev, 4096, &s->regcmd))
+	    charsiu_bo_alloc(g->dev, 4096, &s->regcmd)) {
+		whine(g, "a buffer would not allocate", k, n);
 		goto out;
+	}
 
 	s->job.input_addr = (uint32_t)g->in.dma_address;
 	s->job.output_addr = (uint32_t)g->out.dma_address;
@@ -244,8 +283,10 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	charsiu_bo_prep(g->dev, &s->regcmd, 1000000000);
 	s->nreg = (unsigned)charsiu_emit_job(&s->job, s->regcmd.map, 4096 / 8);
 	charsiu_bo_fini(g->dev, &s->regcmd);
-	if (!s->nreg)
+	if (!s->nreg) {
+		whine(g, "the register stream came back empty", k, n);
 		goto out;
+	}
 
 	g->n_slot++;
 	rc = 0;
@@ -260,13 +301,27 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	struct npu_entry *e;
 	unsigned ns, ks, first = g->n_slot;
 
-	if (g->dead || g->n_ent == g->ent_cap || t->n > g->max_n)
+	if (g->dead) {
+		whine(g, "the hardware path is already retired", (unsigned)t->k,
+		      (unsigned)t->n);
 		return -1;
+	}
+	if (g->n_ent == g->ent_cap) {
+		whine(g, "no tensor slots left", (unsigned)t->k, (unsigned)t->n);
+		return -1;
+	}
+	if (t->n > g->max_n) {
+		whine(g, "wider than the device was opened for", (unsigned)t->k,
+		      (unsigned)t->n);
+		return -1;
+	}
 
 	ns = (unsigned)((t->n + g->nmax - 1) / g->nmax);
 	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
-	if (first + ns * ks > g->slot_cap)
+	if (first + ns * ks > g->slot_cap) {
+		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
 		return -1;
+	}
 
 	for (unsigned ki = 0; ki < ks; ki++) {
 		unsigned k0 = ki * g->kmax;
@@ -283,6 +338,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 				g->n_slot = first;
 				return -1;
 			}
+			g->slices++;
 		}
 	}
 
