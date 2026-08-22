@@ -80,6 +80,56 @@ static int cpu_reference(const struct charsiu_job *job, const uint8_t *a,
 	return 0;
 }
 
+/*
+ * THE PHANTOM PACKING, derived from the map rather than guessed.
+ *
+ * Round 325 measured the hardware's int4 weight address map at every live byte
+ * of three geometries, 1376 points, one form:
+ *
+ *     w = 32 * floor(s / K) + (s mod 32),      s = byte / 8
+ *
+ * Count what that delivers. A declared channel is fed by the slots with
+ * s mod 32 == w mod 32 inside its own block, which is K/32 slots of 16 nibbles,
+ * so **every declared channel gets exactly K/2 nibbles** -- and a buffer of
+ * N*K/2 bytes is N*K nibbles, so the OTHER half of it feeds words N..2N-1.
+ *
+ * That is the whole half width, and it is not a defect: those extra words are
+ * real computed outputs. **So put the second half of each channel's k there and
+ * add the two.** out[c] + out[c+N] is then the full dot product, the buffer
+ * stays exactly N*K/2 bytes, and every nibble in it is used.
+ *
+ * ⚠ Round 329 set 0x40b8 = 3 and 0x3020 = 2N-1, which is what makes the
+ * hardware compute and write those 2N words, but left the PACKING alone -- so
+ * the phantom words held nothing and nothing changed. The registers were half
+ * the change.
+ *
+ * The intra-slot order is round 265's measured one: byte j of a slot holds
+ * k = 2j in its low nibble and k = 2j+1 in its high.
+ */
+static void pack_phantom(const struct charsiu_matmul *mm, const uint8_t *b_raw,
+			 uint8_t *dst)
+{
+	unsigned k = mm->k, n = mm->n, w, m;
+	size_t bytes = (size_t)n * k / 2;
+
+	memset(dst, 0, bytes);
+	for (w = 0; w < 2 * n; w++) {
+		unsigned c = w < n ? w : w - n;          /* the real channel */
+		unsigned kbase = w < n ? 0 : k / 2;      /* which half of its k */
+
+		for (m = 0; m < k / 2; m++) {
+			unsigned j = m / 16, r = m % 16;
+			size_t slot = (size_t)k * (w / 32) + 32 * j + (w % 32);
+			size_t at = slot * 8 + r / 2;
+			unsigned v = b_raw[(size_t)c * k + kbase + m] & 0xf;
+
+			if (at >= bytes)
+				continue;
+			dst[at] |= (uint8_t)(r % 2 ? v << 4 : v);
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	struct charsiu_job job = { 0 };
@@ -446,7 +496,8 @@ int main(int argc, char **argv)
 		(size_t)((n + charsiu_feature_atom(CHARSIU_INT8) - 1)
 			 / charsiu_feature_atom(CHARSIU_INT8))
 		* charsiu_feature_atom(CHARSIU_INT8) * m
-		* (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1) + 4096, &outbo);
+		* (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1)
+		* (getenv("CHARSIU_W4_PHANTOM") ? 2 : 1) + 4096, &outbo);
 	ret |= charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef);
 	if (ret) { printf("bo alloc FAILED %d\n", ret); return 1; }
 	printf("bo iova: regcmd 0x%llx  in 0x%llx  wt 0x%llx  out 0x%llx  coef 0x%llx\n",
@@ -483,7 +534,10 @@ int main(int argc, char **argv)
 	charsiu_bo_fini(dev, &in);
 
 	charsiu_bo_prep(dev, &wt, 1000000000);
-	charsiu_pack_weights(&job.mm, b_raw, wt.map);
+	if (getenv("CHARSIU_W4_PHANTOM"))
+		pack_phantom(&job.mm, b_raw, wt.map);
+	else
+		charsiu_pack_weights(&job.mm, b_raw, wt.map);
 	charsiu_bo_fini(dev, &wt);
 
 	charsiu_bo_prep(dev, &coef, 1000000000);
@@ -619,6 +673,7 @@ int main(int argc, char **argv)
 		 * geometries passed without this mattering.
 		 */
 		unsigned atom = 16 / (job.mm.wdtype == CHARSIU_INT4 ? 4 : 1);
+		const int phantom = getenv("CHARSIU_W4_PHANTOM") != NULL;
 		unsigned ni, mi, ex_pe = 0, ex_sum = 0, written = 0;
 		const int32_t *o = (const int32_t *)outbo.map;
 
@@ -646,6 +701,17 @@ int main(int argc, char **argv)
 				sm >>= 16;
 				got = o[(size_t)(ni / atom) * m * atom
 					+ (size_t)mi * atom + ni % atom];
+				/*
+				 * ⚠ THE PHANTOM WORD IS THE OTHER HALF OF THE
+				 * SUM, not a spare. Its index follows the same
+				 * surface formula at channel ni + n.
+				 */
+				if (phantom) {
+					unsigned p2 = ni + n;
+
+					got += o[(size_t)(p2 / atom) * m * atom
+						 + (size_t)mi * atom + p2 % atom];
+				}
 				if ((uint32_t)got != 0xa5a5a5a5u) written++;
 				if (got == (int32_t)pe) ex_pe++;
 				if (got == (int32_t)sm) ex_sum++;
