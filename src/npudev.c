@@ -61,15 +61,16 @@ struct npu_slot {
 
 struct npu_entry {
 	const struct npu_tensor *t;
+	struct charsiu_bo out;     /* ITS OWN, sized for ITS slices */
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
-	double weight_mb;          /* what one submit fetches */
+	double weight_mb;
 };
 
 struct charsiu_npu {
 	struct charsiu_device *dev;
-	struct charsiu_bo in, out;
-	unsigned in_stride, out_stride, max_slices;
+	struct charsiu_bo in;
+	unsigned in_stride, out_stride, max_slices, maxtask;
 	uint8_t *scratch;
 	int32_t *acc;
 	struct charsiu_task *tasks;
@@ -141,6 +142,12 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 2048);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
 	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
+	/*
+	 * 0 is unlimited. A cap exists because the output head is 126 chained
+	 * tasks and 253 buffer handles in one submit, and it reached only
+	 * 4.2 GB/s where an eight task submit reaches 10.
+	 */
+	g->maxtask = env_u("CHARSIU_NPU_MAXTASK", 0);
 	g->max_n = max_n;
 	g->ent_cap = max_tensors;
 
@@ -168,9 +175,7 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	    !g->handles)
 		goto fail;
 
-	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in) ||
-	    charsiu_bo_alloc(g->dev, (size_t)g->out_stride * g->max_slices + 4096,
-			     &g->out))
+	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in))
 		goto fail;
 	return g;
 
@@ -189,8 +194,9 @@ void charsiu_npu_close(struct charsiu_npu *g)
 			charsiu_bo_free(g->dev, &g->slot[i].coef);
 			charsiu_bo_free(g->dev, &g->slot[i].regcmd);
 		}
+		for (unsigned i = 0; i < g->n_ent; i++)
+			charsiu_bo_free(g->dev, &g->ent[i].out);
 		charsiu_bo_free(g->dev, &g->in);
-		charsiu_bo_free(g->dev, &g->out);
 		charsiu_close(g->dev);
 	}
 	free(g->slot);
@@ -234,7 +240,7 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 /* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t, writing region si. */
 static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 		     unsigned n0, unsigned n, unsigned k0, unsigned k,
-		     unsigned ki, unsigned si)
+		     unsigned ki, unsigned si, uint32_t out_base)
 {
 	struct npu_slot *s = &g->slot[g->n_slot];
 	int32_t *bias = NULL, *wsum = NULL;
@@ -266,7 +272,7 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 
 	/* its own slot in each shared buffer, baked into the stream */
 	s->job.input_addr = (uint32_t)g->in.dma_address + ki * g->in_stride;
-	s->job.output_addr = (uint32_t)g->out.dma_address + si * g->out_stride;
+	s->job.output_addr = out_base + si * g->out_stride;
 	s->job.weight_addr = (uint32_t)s->wt.dma_address;
 	s->job.coef_addr = (uint32_t)s->coef.dma_address;
 
@@ -350,6 +356,25 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		return -1;
 	}
 
+	e = &g->ent[g->n_ent];
+	memset(e, 0, sizeof(*e));
+	/*
+	 * ⚠ ITS OWN OUTPUT BUFFER, AND THIS IS NOT TIDINESS.
+	 *
+	 * One shared buffer had to be sized for the WIDEST tensor, and round
+	 * 318 added the 128256 wide output head, which took it from 128 KB to
+	 * 2.48 MB. charsiu_bo_prep and _fini are cache maintenance over a WHOLE
+	 * buffer object, and every one of the 113 matvecs a token paid it: 280
+	 * MB of cache operations a token where there had been 14. That is most
+	 * of why routing the head made the model 18% SLOWER.
+	 */
+	if (charsiu_bo_alloc(g->dev, (size_t)ns * ks * g->out_stride + 4096,
+			     &e->out)) {
+		whine(g, "an output buffer would not allocate", (unsigned)t->k,
+		      (unsigned)t->n);
+		return -1;
+	}
+
 	for (unsigned ki = 0; ki < ks; ki++) {
 		unsigned k0 = ki * g->kmax;
 		unsigned k = (unsigned)(t->k - k0) < g->kmax
@@ -360,7 +385,8 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			unsigned n = (unsigned)(t->n - n0) < g->nmax
 				   ? (unsigned)(t->n - n0) : g->nmax;
 
-			if (add_slice(g, t, n0, n, k0, k, ki, si) < 0) {
+			if (add_slice(g, t, n0, n, k0, k, ki, si,
+				      (uint32_t)e->out.dma_address) < 0) {
 				g->n_slot = first;
 				return -1;
 			}
@@ -368,7 +394,6 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		}
 	}
 
-	e = &g->ent[g->n_ent];
 	e->t = t;
 	e->first = first;
 	e->count = ns * ks;
@@ -410,82 +435,71 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	charsiu_bo_fini(g->dev, &g->in);
 
 	/*
-	 * ONE submit for the whole projection.
+	 * ONE submit for the whole projection, unless a cap says otherwise.
 	 *
 	 * CHARSIU_NPU_NOCHAIN puts it back to a submit per slice, so a round can
-	 * carry its own before and after in one boot rather than comparing
-	 * against a different one.
+	 * carry its own before and after in one boot. CHARSIU_NPU_MAXTASK caps
+	 * the tasks per submit, which exists to test a specific suspicion: the
+	 * output head is 126 chained tasks and 253 buffer handles in one submit
+	 * and reached 4.2 GB/s, where an eight task submit reaches 10, so the
+	 * driver's per handle work is a candidate for the difference.
 	 */
-	g->handles[nh++] = g->in.handle;
-	for (i = 0; i < e->count; i++) {
-		const struct npu_slot *s = &g->slot[e->first + i];
+	{
+		unsigned per = g->nochain ? 1
+			     : (g->maxtask && g->maxtask < e->count
+				? g->maxtask : e->count);
 
-		g->tasks[i].regcmd = (uint32_t)s->regcmd.dma_address;
-		g->tasks[i].regcmd_count = s->nreg;
-		g->handles[nh++] = s->wt.handle;
-		g->handles[nh++] = s->coef.handle;
-	}
-	jl.tasks = g->tasks;
-	jl.task_count = e->count;
-	jl.in_handles = g->handles;
-	jl.in_count = nh;
-	jl.out_handles = &g->out.handle;
-	jl.out_count = 1;
+		t0 = now_us();
+		for (unsigned base = 0; base < e->count; base += per) {
+			unsigned nt = e->count - base < per ? e->count - base : per;
 
-	t0 = now_us();
-	if (g->nochain) {
-		for (i = 0; i < e->count; i++) {
-			struct charsiu_joblist one;
-			uint32_t h[3];
+			nh = 0;
+			g->handles[nh++] = g->in.handle;
+			for (i = 0; i < nt; i++) {
+				const struct npu_slot *s = &g->slot[e->first + base + i];
 
-			h[0] = g->in.handle;
-			h[1] = g->slot[e->first + i].wt.handle;
-			h[2] = g->slot[e->first + i].coef.handle;
-			one.tasks = &g->tasks[i];
-			one.task_count = 1;
-			one.in_handles = h;
-			one.in_count = 3;
-			one.out_handles = &g->out.handle;
-			one.out_count = 1;
-			if (charsiu_submit_jobs(g->dev, &one, 1)) {
+				g->tasks[base + i].regcmd =
+					(uint32_t)s->regcmd.dma_address;
+				g->tasks[base + i].regcmd_count = s->nreg;
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+			}
+			jl.tasks = &g->tasks[base];
+			jl.task_count = nt;
+			jl.in_handles = g->handles;
+			jl.in_count = nh;
+			jl.out_handles = &e->out.handle;
+			jl.out_count = 1;
+
+			if (charsiu_submit_jobs(g->dev, &jl, 1)) {
 				g->strikes = 3;
 				break;
 			}
 			g->submits++;
 		}
-	} else if (charsiu_submit_jobs(g->dev, &jl, 1)) {
-		g->strikes = 3;
-	} else {
-		g->submits++;
 	}
 
 	if (g->strikes < 3) {
-		charsiu_bo_prep(g->dev, &g->out, 2000000000);
+		charsiu_bo_prep(g->dev, &e->out, 2000000000);
 		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 
-			out = (const int32_t *)((const uint8_t *)g->out.map +
+			out = (const int32_t *)((const uint8_t *)e->out.map +
 						s->out_slot * g->out_stride);
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
-		charsiu_bo_fini(g->dev, &g->out);
+		charsiu_bo_fini(g->dev, &e->out);
 		g->weight_mb += e->weight_mb;
 
 		/*
-		 * The limit has to scale with what the submit fetches, or a
-		 * legitimate big one is mistaken for a wedge. The output head is
-		 * 263 MB in a single submit; at the measured 10 GB/s that is
-		 * 26 ms, and a flat 100 ms would still be generous -- but at
-		 * 1 ms a megabyte, which is ten times slower than anything this
-		 * hardware has ever done, it cannot be wrong by accident.
+		 * The limit scales with what the submit fetches, or a legitimate
+		 * big one is mistaken for a wedge. A millisecond a megabyte is
+		 * ten times slower than this hardware has ever been.
 		 */
-		double budget = g->slow_us + e->weight_mb * 1000.0;
-
-		if (g->nochain)
-			budget = g->slow_us * e->count + e->weight_mb * 1000.0;
-		if (now_us() - t0 > budget)
+		if (now_us() - t0 > g->slow_us * (g->nochain ? e->count : 1)
+				    + e->weight_mb * 1000.0)
 			g->strikes++;
 		else
 			g->strikes = 0;
