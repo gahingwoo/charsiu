@@ -12,12 +12,14 @@
  * Every matmul goes through gguf_matvec(), one call per weight tensor, so
  * there is exactly one place to change when a projection moves to the NPU.
  */
+#define _POSIX_C_SOURCE 200809L
 
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "charsiu_llm.h"
@@ -601,6 +603,7 @@ void llama_state_free(struct llama_state *s)
 	charsiu_act_free(&s->act);
 	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
 		npu_report(s->npu, s->n_npu);
+	llama_stages_report();
 	if (s->dev)
 		charsiu_npu_report(s->dev);
 	charsiu_npu_close(s->dev);
@@ -612,6 +615,57 @@ void llama_state_free(struct llama_state *s)
 	free(s->npu_key);
 	free(s->npu_id);
 	free(s);
+}
+
+/* ---- where the token's time goes ----------------------------------------- *
+ *
+ * The hardware path is measured to the microsecond by npudev and the CPU's
+ * share of a token is not measured at all: it is 21 ms by SUBTRACTION, which is
+ * the kind of number this project has had to withdraw five times. Every stage
+ * of the forward pass is stamped here instead, so the next thing moved off the
+ * CPU is the one that is actually large.
+ *
+ * CHARSIU_STAGES turns it on. Two clock reads a stage, about 5 us a token, and
+ * off by default so it cannot flatter or slow a timing round by accident.
+ */
+enum {
+	ST_EMBD, ST_NORM1, ST_QKV, ST_ROPE, ST_ATTN, ST_WO, ST_RES1,
+	ST_NORM2, ST_GATEUP, ST_SILU, ST_DOWN, ST_RES2, ST_NORMF, ST_HEAD,
+	ST_N
+};
+
+static const char *stage_name[ST_N] = {
+	"token embedding", "attn rmsnorm", "q k v", "rope + kv copy",
+	"attention", "o proj", "residual", "ffn rmsnorm", "gate + up",
+	"silu * up", "down", "residual", "final rmsnorm", "output head",
+};
+
+static double stage_ms[ST_N];
+static unsigned stage_tok;
+static int stage_on = -1;
+
+static double now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+
+void llama_stages_report(void)
+{
+	double tot = 0;
+	unsigned i;
+
+	if (stage_on <= 0 || !stage_tok)
+		return;
+	for (i = 0; i < ST_N; i++)
+		tot += stage_ms[i];
+	printf("charsiu stages: %u tokens, %.1f ms a token\n",
+	       stage_tok, tot / stage_tok);
+	for (i = 0; i < ST_N; i++)
+		printf("  %-16s %8.2f ms a token   %5.1f%%\n", stage_name[i],
+		       stage_ms[i] / stage_tok, 100.0 * stage_ms[i] / tot);
 }
 
 /* ---- the forward pass ---------------------------------------------------- */
@@ -626,8 +680,16 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	static float *freqbuf;
 	const float *freqf = NULL;
 
+	double t0, t1;
+
 	if (pos >= s->n_ctx)
 		return NULL;
+
+	if (stage_on < 0)
+		stage_on = getenv("CHARSIU_STAGES") != NULL;
+#define STAGE(i) do { if (stage_on) { t1 = now_ms(); stage_ms[i] += t1 - t0; \
+			      t0 = t1; } } while (0)
+	t0 = t1 = stage_on ? now_ms() : 0.0;
 
 	if (m->rope_freqs) {
 		if (!freqbuf)
@@ -637,6 +699,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	}
 
 	gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
+	STAGE(ST_EMBD);
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
@@ -644,14 +707,17 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		float *vc = s->vcache + ((size_t)l * s->n_ctx + pos) * kvdim;
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
+		STAGE(ST_NORM1);
 
 		matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k, L->wv, s->v);
+		STAGE(ST_QKV);
 
 		rope(s->q, m->n_head, hd, pos, m->rope_base, freqf);
 		rope(s->k, m->n_head_kv, hd, pos, m->rope_base, freqf);
 
 		memcpy(kc, s->k, kvdim * sizeof(float));
 		memcpy(vc, s->v, kvdim * sizeof(float));
+		STAGE(ST_ROPE);
 
 		for (uint32_t h = 0; h < m->n_head; h++) {
 			const float *qh = s->q + h * hd;
@@ -681,25 +747,39 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			}
 		}
 
+		STAGE(ST_ATTN);
+
 		matvec(s, L->wo, s->xb, s->xb2);
+		STAGE(ST_WO);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
+		STAGE(ST_RES1);
 
 		rmsnorm(s->xb, s->x, L->ffn_norm, m->n_embd, m->rms_eps);
+		STAGE(ST_NORM2);
 		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
+		STAGE(ST_GATEUP);
 		for (uint32_t i = 0; i < m->n_ff; i++) {
 			float g = s->hb[i];
 
 			g *= 1.0f / (1.0f + expf(-g));       /* SiLU */
 			s->hb[i] = g * s->hb2[i];
 		}
+		STAGE(ST_SILU);
 		matvec(s, L->down, s->hb, s->xb2);
+		STAGE(ST_DOWN);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
+		STAGE(ST_RES2);
 	}
 
 	rmsnorm(s->xb, s->x, m->out_norm, m->n_embd, m->rms_eps);
+	STAGE(ST_NORMF);
 	matvec(s, m->output, s->xb, s->logits);
+	STAGE(ST_HEAD);
+	if (stage_on)
+		stage_tok++;
+#undef STAGE
 
 	s->pos = pos + 1;
 	return s->logits;

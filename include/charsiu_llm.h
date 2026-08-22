@@ -295,6 +295,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx);
 void llama_state_free(struct llama_state *s);
 
 /* One token in, a full logit vector out. `pos` is where it goes in the cache. */
+void llama_stages_report(void);
 const float *llama_forward(struct llama_state *s, int32_t token, int pos);
 
 /* argmax, which is the only sampler an oracle is allowed. */
