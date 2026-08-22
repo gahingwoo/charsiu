@@ -150,9 +150,23 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 		free(g);
 		return NULL;
 	}
-	/* the shapes round 312 measured exact, not the shapes a model wants */
-	g->nmax = env_u("CHARSIU_NPU_NMAX", 1024);
-	g->kmax = env_u("CHARSIU_NPU_KMAX", 2048);
+	/*
+	 * The defaults are the widest slice MEASURED to give identical tokens,
+	 * not the narrowest that was ever verified.
+	 *
+	 * Round 321 swept them and the cost turned out to be per TASK rather
+	 * than per submit -- round 319 had varied tasks per submit at a fixed
+	 * 606 slices and got a flat line, so the two sweeps together say the
+	 * submit is nearly free and the task is about 35 us:
+	 *
+	 *   slices  606    542    319    287
+	 *   tok/s   5.55   5.62   5.83   5.90
+	 *
+	 * N=2048 with K=4096 is 287 slices and produced text character for
+	 * character the CPU's, so it is the default.
+	 */
+	g->nmax = env_u("CHARSIU_NPU_NMAX", 2048);
+	g->kmax = env_u("CHARSIU_NPU_KMAX", 4096);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
 	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
 	/*
