@@ -233,6 +233,40 @@ from zero, but its **ARM path** uses `vcvtnq_s32_f32`, which is ties to even, an
 path is the one that runs. Matching `roundf` made the worst logit disagreement with
 llama.cpp twice as large and cost 9% of the tokens per second.
 
+## The NPU's number format, answered on the CPU
+
+Moving a projection onto the NPU means accepting the format the hardware imposes: signed
+int8 weights with **one scale per output channel**, which is what the coefficient buffer
+applies, against an activation with **one scale for the whole vector**, because a
+`charsiu_job` carries a single `input_scale`. Both zero points are 128, so what the DPU
+computes is exactly
+
+```
+acc[n] = sum_k a_q[k] * w_q[n][k]
+y[n]   = acc[n] * a_scale * w_scale[n]
+```
+
+Whether that costs the model its output is not a question about register streams, and the
+CPU decode loop is already the oracle for it. So the whole model runs in it:
+`CHARSIU_NPU_QUANT=1` builds a second copy of every routed tensor in that format and
+multiplies with a widening integer dot.
+
+Llama-3.2-1B from a q8_0 file, **113 tensors routed** — every projection and the tied
+output head — with a per tensor RMS error against the original of **0.85% to 1.57%**. The
+text is coherent, and at this prompt it is the continuation llama.cpp itself produces:
+
+```
+$ CHARSIU_NPU_QUANT=1 charsiu_run Llama-3.2-1B-Instruct-Q8_0.gguf \
+      -p "The capital of France is" -n 32
+Paris. The Eiffel Tower is located in Paris. The Eiffel Tower is one of the most
+famous landmarks in the world. It was built for
+```
+
+So the format is not the problem, and what is left of that step is plumbing rather than
+accuracy. `npu_tensor_build()` in `src/npuquant.c` is also the converter's arithmetic
+already written: it produces `q`, the per channel scale, and the per channel weight sum
+the coefficient buffer wants, verified by the tokens it produces rather than by reading it.
+
 ## What it costs, and what the cost is OF
 
 Measured on the same board, 2026-08-15. A submit carries jobs, a job carries tasks;
