@@ -610,7 +610,7 @@ void llama_state_free(struct llama_state *s)
 	 */
 	if (getenv("CHARSIU_CALIB") && s->npu) {
 		FILE *f = fopen(getenv("CHARSIU_CALIB"), "wb");
-		unsigned wrote = 0;
+		unsigned wrote = 0, xwrote = 0;
 
 		for (unsigned i = 0; f && i < s->n_npu; i++) {
 			struct npu_tensor *t = &s->npu[i];
@@ -623,6 +623,26 @@ void llama_state_free(struct llama_state *s)
 			fwrite(&t->k, sizeof(t->k), 1, f);
 			fwrite(t->astat, sizeof(double), t->k, f);
 			wrote++;
+			if (t->xcal && t->nxcal) {
+				char xp[256];
+				FILE *xf;
+
+				snprintf(xp, sizeof(xp), "%s.x",
+					 getenv("CHARSIU_CALIB"));
+				/* ⚠ truncate on the FIRST tensor that writes, not on tensor 0:
+				 * keyed on i, a run whose first tensor has no vectors
+				 * appends to the previous run's file. */
+				xf = fopen(xp, xwrote++ ? "ab" : "wb");
+				if (xf) {
+					fwrite(t->name, 1, sizeof(t->name), xf);
+					fwrite(&t->n, sizeof(t->n), 1, xf);
+					fwrite(&t->k, sizeof(t->k), 1, xf);
+					fwrite(&t->nxcal, sizeof(t->nxcal), 1, xf);
+					fwrite(t->xcal, sizeof(float),
+					       (size_t)t->nxcal * t->k, xf);
+					fclose(xf);
+				}
+			}
 			if (t->acov) {
 				char hp[256];
 				FILE *hf;

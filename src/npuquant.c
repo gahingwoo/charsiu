@@ -289,6 +289,51 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		t->wsum[r] = sum;
 	}
 
+	/*
+	 * CHARSIU_W4_FILE replaces what was just computed with weights prepared
+	 * offline. The format is one record a tensor: an 80 byte name, n and k
+	 * as u64, then n*k signed bytes of nibble values and n floats of scale.
+	 * Only the VALUES change; the shape, the wsum and everything downstream
+	 * is recomputed here from them, so a bad file cannot quietly disagree
+	 * with the rest of the pipeline.
+	 */
+	if (getenv("CHARSIU_W4_FILE")) {
+		FILE *f = fopen(getenv("CHARSIU_W4_FILE"), "rb");
+		char nm[80];
+		uint64_t fn, fk;
+		int got = 0;
+
+		while (f && fread(nm, 1, sizeof(nm), f) == sizeof(nm)
+		       && fread(&fn, sizeof(fn), 1, f) == 1
+		       && fread(&fk, sizeof(fk), 1, f) == 1) {
+			if (!strcmp(nm, w->name) && fn == n && fk == k) {
+				got = fread(t->q, 1, (size_t)n * k, f)
+					      == (size_t)n * k
+				      && fread(t->scale, sizeof(float), n, f)
+					      == n;
+				break;
+			}
+			fseek(f, (long)((size_t)fn * fk
+					+ fn * sizeof(float)), SEEK_CUR);
+		}
+		if (f)
+			fclose(f);
+		if (got) {
+			t->kgroup = k;               /* one scale a row */
+			for (uint64_t r = 0; r < n; r++) {
+				int32_t sum = 0;
+
+				for (uint64_t i = 0; i < k; i++)
+					sum += t->q[r * k + i];
+				t->wsum[r] = sum;
+			}
+			fprintf(stderr, "w4file: %s loaded\n", w->name);
+		} else {
+			fprintf(stderr, "w4file: %s NOT in the file, "
+				"using the built-in quantiser\n", w->name);
+		}
+	}
+
 	free(row);
 	t->rms_rel = sw > 0.0 ? sqrt(se / sw) : 0.0;
 	return 0;
@@ -303,6 +348,7 @@ void npu_tensor_free(struct npu_tensor *t)
 	free(t->kscale);
 	free(t->astat);
 	free(t->acov);
+	free(t->xcal);
 	free(t->wsum);
 	memset(t, 0, sizeof(*t));
 }
@@ -371,21 +417,29 @@ void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
 	 * CHARSIU_CALIB_H names it, and the covariance is dumped beside the
 	 * means.
 	 */
+	/*
+	 * ⚠ VECTORS, NOT THE COVARIANCE. GPTQ needs H = X^T X, and at k = 8192
+	 * that matrix is 512 MB per tensor in doubles, while the vectors it is
+	 * built from are 8 MB. Keep the vectors, build H offline where numpy
+	 * has BLAS: a Cholesky at k = 8192 is 5.5e11 flops and does not belong
+	 * in a hand written loop.
+	 */
 	{
-		const char *hn = getenv("CHARSIU_CALIB_H");
+		const char *xd = getenv("CHARSIU_CALIB_X");
+		unsigned cap = getenv("CHARSIU_CALIB_N")
+			? (unsigned)atoi(getenv("CHARSIU_CALIB_N")) : 256;
 
-		if (hn && !strcmp(hn, t->name)) {
-			if (!t->acov)
-				t->acov = calloc((size_t)t->k * t->k,
-						 sizeof(*t->acov));
-			if (t->acov)
-				for (uint64_t i = 0; i < t->k; i++) {
-					double ai = a->f[i];
+		if (xd && t->nxcal < cap) {
+			if (!t->xcal)
+				t->xcal = malloc((size_t)cap * t->k
+						 * sizeof(*t->xcal));
+			if (t->xcal) {
+				float *dst = t->xcal + (size_t)t->nxcal * t->k;
 
-					for (uint64_t j = i; j < t->k; j++)
-						t->acov[i * t->k + j] +=
-							ai * a->f[j];
-				}
+				for (uint64_t i = 0; i < t->k; i++)
+					dst[i] = a->f[i];
+				t->nxcal++;
+			}
 		}
 	}
 }

@@ -148,6 +148,8 @@ struct npu_tensor {
 	double *astat;     /* k, the running sum of |x| over a calibration run */
 	uint64_t acalls;
 	double *acov;      /* k*k, upper triangle, one named tensor only */
+	float *xcal;       /* nxcal * k input vectors, for offline GPTQ */
+	unsigned nxcal;
 	int32_t *wsum;     /* n, sum of q over k: the coefficient buffer wants it */
 	uint64_t n, k;
 	double rms_rel;    /* what the quantisation cost this tensor */
