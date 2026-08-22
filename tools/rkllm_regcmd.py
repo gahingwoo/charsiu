@@ -59,9 +59,14 @@ CNA = {
 
 def streams(path, min_len=20):
     """Every maximal run of register command words, as (byte offset, words)."""
-    raw = np.fromfile(path, dtype=np.uint8)
-    n = raw.nbytes // 8
-    words = np.frombuffer(raw[:n * 8].tobytes(), dtype="<u8")
+    # ⚠ MEMORY MAP IT. This read the whole file with np.fromfile and then
+    # called .tobytes(), which is a SECOND full copy, so a 1.3 GB .rkllm asked
+    # for 2.6 GB and the OOM killer took it twice. A memmap is zero copies and
+    # the kernel pages what the scan touches.
+    import os
+
+    n = os.path.getsize(path) // 8
+    words = np.memmap(path, dtype="<u8", mode="r", shape=(n,))
     ok = np.isin((words >> 48).astype(np.uint32), list(TARGETS))
     idx = np.flatnonzero(ok)
     if idx.size == 0:
