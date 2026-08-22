@@ -223,6 +223,15 @@ int main(int argc, char **argv)
 	for (i = 0; i < n_ids; i++)
 		logits = llama_forward(st, ids[i], i);
 	t_prompt = now_ms() - t0;
+	/*
+	 * ⚠ THE STAGE TIMERS START HERE, NOT AT THE FIRST TOKEN. Round 327
+	 * read its own stage table as a decode split and it was 86% the
+	 * PROMPT: six tokens that fault 1.3 GB of weights in off the card
+	 * and build the NPU tensors take 31 seconds, and dividing by 38
+	 * spreads that over every stage. The host check I built it against
+	 * had the same defect and I quoted it anyway.
+	 */
+	llama_stages_reset();
 
 	if (show_logits) {
 		int n = show_logits;

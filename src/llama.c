@@ -652,6 +652,12 @@ static double now_ms(void)
 	return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
 }
 
+void llama_stages_reset(void)
+{
+	memset(stage_ms, 0, sizeof(stage_ms));
+	stage_tok = 0;
+}
+
 void llama_stages_report(void)
 {
 	double tot = 0;

@@ -227,6 +227,15 @@ static int bench_setup(struct bench *b, struct charsiu_device *dev,
 /* Wall time for one submit of `tasks` chained tasks, including the fence,
  * because that is what a runtime pays and a number without it cannot become a
  * token rate. Returns microseconds per submit, or -1. */
+/*
+ * The per rep times, so a mean can be told apart from a stall. BENCH_MAXREPS is
+ * a cap rather than an allocation: a sweep that asks for more gets the cap and
+ * the printed rep count says so.
+ */
+#define BENCH_MAXREPS 1024
+static double g_rep[BENCH_MAXREPS];
+static struct { double mean, min, med, max; unsigned slow, n; } g_stats;
+
 static double bench_run(struct bench *b, unsigned tasks, unsigned reps)
 {
 	struct charsiu_joblist jl;
@@ -248,15 +257,58 @@ static double bench_run(struct bench *b, unsigned tasks, unsigned reps)
 		return -1;
 	charsiu_bo_fini(b->dev, &b->outbo);
 
+	/*
+	 * ⚠ EVERY REP, NOT ONE TIMER ROUND ALL OF THEM. This measured the whole
+	 * loop and divided, which cannot tell "every rep takes 5 ms" from "one
+	 * rep in twenty takes 100 ms and the rest take 200 us" -- and those two
+	 * are completely different faults. int4's collapse above 512 KiB was
+	 * read as a bandwidth for three rounds on a mean that could not say
+	 * which it was, and the same arm has come back at 4.9, 8.0, 9.2, 14.5
+	 * and 17.7 ms across rounds, which is the signature of a count of
+	 * stalls rather than a rate.
+	 */
+	if (reps > BENCH_MAXREPS)
+		reps = BENCH_MAXREPS;
 	t0 = now_us();
 	for (r = 0; r < reps; r++) {
+		double r0 = now_us();
+
 		if (charsiu_submit_jobs(b->dev, &jl, 1))
 			return -1;
 		if (charsiu_bo_prep(b->dev, &b->outbo, 2000000000))
 			return -1;
 		charsiu_bo_fini(b->dev, &b->outbo);
+		g_rep[r] = now_us() - r0;
 	}
-	return (now_us() - t0) / reps;
+	g_stats.mean = (now_us() - t0) / reps;
+	{
+		double *v = malloc(reps * sizeof(*v));
+		unsigned i, j;
+
+		g_stats.n = reps;
+		if (!v) {
+			g_stats.min = g_stats.med = g_stats.max = g_stats.mean;
+			g_stats.slow = 0;
+			return g_stats.mean;
+		}
+		memcpy(v, g_rep, reps * sizeof(*v));
+		for (i = 1; i < reps; i++) {          /* insertion sort, reps is small */
+			double t = v[i];
+
+			for (j = i; j && v[j - 1] > t; j--)
+				v[j] = v[j - 1];
+			v[j] = t;
+		}
+		g_stats.min = v[0];
+		g_stats.med = v[reps / 2];
+		g_stats.max = v[reps - 1];
+		g_stats.slow = 0;
+		for (i = 0; i < reps; i++)
+			if (g_rep[i] > 2.0 * g_stats.med)
+				g_stats.slow++;
+		free(v);
+	}
+	return g_stats.mean;
 }
 
 /*
@@ -329,7 +381,9 @@ static void n_sweep(struct charsiu_device *dev, unsigned k, unsigned reps)
 
 	printf("  single task, K = %u, %u reps, M = 1%s\n\n", k, reps,
 	       getenv("CHARSIU_W4") ? "   [int4]" : "   [int8]");
-	printf("  %-6s %-11s %-12s %-11s\n", "N", "weight MB", "us", "GB/s");
+	printf("  %-6s %-11s %-12s %-11s %-10s %-10s %-10s %s\n", "N",
+	       "weight MB", "mean us", "GB/s", "min", "median", "max",
+	       "reps > 2x median");
 
 	for (i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
 		unsigned n = ns[i];
@@ -347,8 +401,20 @@ static void n_sweep(struct charsiu_device *dev, unsigned k, unsigned reps)
 			printf("  %-6u run FAILED -- stopping\n", n);
 			break;
 		}
-		printf("  %-6u %-11.3f %-12.1f %-11.2f\n", n, mb, us, mb / us * 1e3);
-		sx += mb; sy += us; sxx += mb * mb; sxy += mb * us;
+		printf("  %-6u %-11.3f %-12.1f %-11.2f %-10.1f %-10.1f %-10.1f %u of %u\n",
+		       n, mb, us, mb / us * 1e3, g_stats.min, g_stats.med,
+		       g_stats.max, g_stats.slow, g_stats.n);
+		/*
+		 * ⚠ AND FIT THE MEDIAN, not the mean. One stall in twenty moves
+		 * a mean by the whole stall and a median not at all, and which
+		 * of those the number is decides whether "int4 is slow" or
+		 * "int4 stalls" is the right sentence.
+		 */
+		{
+			double y = g_stats.med;
+
+			sx += mb; sy += y; sxx += mb * mb; sxy += mb * y;
+		}
 		got++;
 	}
 
@@ -357,7 +423,7 @@ static void n_sweep(struct charsiu_device *dev, unsigned k, unsigned reps)
 		double slope = (got * sxy - sx * sy) / d;      /* us per MB */
 		double icept = (sy - slope * sx) / got;        /* us */
 
-		printf("\n  fit over %u points:  %.1f us/MB  (%.2f GB/s)"
+		printf("\n  fit over %u MEDIANS:  %.1f us/MB  (%.2f GB/s)"
 		       "   +  %.1f us that does not scale with the bytes\n",
 		       got, slope, 1e3 / slope, icept);
 	} else {
