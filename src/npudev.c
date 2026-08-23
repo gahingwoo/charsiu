@@ -138,8 +138,16 @@ struct charsiu_npu {
 	 * And what that time is MADE of. bo_prep is not a read: it WAITS for the
 	 * job, so the fence and the copy have to be told apart or the 23 ms this
 	 * leaves over stays a residual rather than a measurement.
+	 *
+	 * ⚠ AND THE FENCE NUMBER IS NOT PURE WAITING. rocket_ioctl_prep_bo is a
+	 * dma_resv_wait_timeout FOLLOWED BY dma_sync_sgtable_for_cpu, so the
+	 * invalidate over the whole output buffer is charged to the fence, not
+	 * to the read back. fini_bo is the other half of that pair, a
+	 * dma_sync_sgtable_for_device, and it IS separable -- so it is separate
+	 * here, because "13 ms reading back" and "13 ms cleaning a cache the CPU
+	 * only read" ask for different fixes.
 	 */
-	double submit_us, fence_us, copy_us;
+	double submit_us, fence_us, copy_us, fini_us;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -147,7 +155,7 @@ struct charsiu_npu {
 	 * clock. Three slow submits and this path retires itself.
 	 */
 	double slow_us, min_gbs;
-	int strikes, dead, whined, nochain, slowed;
+	int strikes, dead, whined, nochain, slowed, nofini;
 	unsigned long slices;
 };
 
@@ -276,6 +284,21 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->ent_cap = max_tensors;
 
 	g->w4 = getenv("CHARSIU_NPU_W4V") != NULL;
+	/*
+	 * SKIP THE FLUSH ON A BUFFER THE CPU ONLY READ.
+	 *
+	 * fini_bo is dma_sync_sgtable_for_device, which on arm64 CLEANS every
+	 * line of the buffer to the point of coherency. That is what a buffer
+	 * the CPU WROTE needs -- the activation buffer does need it -- but an
+	 * output buffer is only ever read here, so its lines are clean already
+	 * and the walk writes nothing back. What makes skipping it safe is that
+	 * the next read is preceded by prep_bo, whose sync_for_cpu invalidates
+	 * those stale clean lines before the CPU can see them.
+	 *
+	 * It is env gated rather than simply removed because the argument above
+	 * is an argument, and the sentence the model writes is the check on it.
+	 */
+	g->nofini = getenv("CHARSIU_NPU_NOFINI") != NULL;
 	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
@@ -382,10 +405,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"charsiu NPU: %.0f ms in the hardware path, %.2f GB/s "
 			"of weights, %.0f us a submit\n"
 			"charsiu NPU: of that, %.0f ms submitting, %.0f ms "
-			"waiting for the fence, %.0f ms reading back\n",
+			"waiting for the fence (the invalidate is in there), "
+			"%.0f ms summing the slices, %.0f ms in the flush\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
 			g->busy_us / (double)g->submits,
-			g->submit_us / 1e3, g->fence_us / 1e3, g->copy_us / 1e3);
+			g->submit_us / 1e3, g->fence_us / 1e3,
+			g->copy_us / 1e3, g->fini_us / 1e3);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -771,8 +796,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		t1 = now_us();
 		int grp = tensor_grouped(g, e->t);
 
-		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
-		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
+		/*
+		 * ONE OF THESE, NOT BOTH. int4 sums into accf and int8 into
+		 * acc, and clearing the other one is 2 MB a token of writes
+		 * for an array nothing will read: the 128256 wide head alone
+		 * is half a megabyte of it. It also lands inside the read back
+		 * timer, which is the number this round is trying to read.
+		 */
+		if (g->w4)
+			memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
+		else
+			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
@@ -804,9 +838,12 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
-		for (unsigned d = 0; d < g->ndev; d++)
-			charsiu_bo_fini(g->dev[d], &e->out[d]);
 		g->copy_us += now_us() - t1;
+		t1 = now_us();
+		if (!g->nofini)
+			for (unsigned d = 0; d < g->ndev; d++)
+				charsiu_bo_fini(g->dev[d], &e->out[d]);
+		g->fini_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
 		g->busy_us += now_us() - t0;
 
@@ -895,7 +932,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	struct charsiu_joblist jl;
 	uint32_t outh[8];
 	unsigned nh = 0, ntask = 0, i, j;
-	double t0, t1;
+	double t0, t1, fspent = 0.0;
 
 	if (g->dead || !n || n > 8)
 		return -1;
@@ -1032,8 +1069,17 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 
 		int grp = tensor_grouped(g, e->t);
 
-		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
-		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
+		/*
+		 * ONE OF THESE, NOT BOTH. int4 sums into accf and int8 into
+		 * acc, and clearing the other one is 2 MB a token of writes
+		 * for an array nothing will read: the 128256 wide head alone
+		 * is half a megabyte of it. It also lands inside the read back
+		 * timer, which is the number this round is trying to read.
+		 */
+		if (g->w4)
+			memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
+		else
+			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (j = 0; j < e->count; j++) {
 			const struct npu_slot *s = &g->slot[e->first + j];
 			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
@@ -1064,8 +1110,14 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			for (unsigned q = 0; q < s->job.mm.n; q++)
 				g->acc[s->n0 + q] += out[q];
 		}
-		for (unsigned d = 0; d < g->ndev; d++)
-			charsiu_bo_fini(g->dev[d], &e->out[d]);
+		{
+			double tf = now_us();
+
+			if (!g->nofini)
+				for (unsigned d = 0; d < g->ndev; d++)
+					charsiu_bo_fini(g->dev[d], &e->out[d]);
+			fspent += now_us() - tf;
+		}
 		{
 			double hsu = 0.0;
 
@@ -1082,7 +1134,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		}
 		g->weight_mb += e->weight_mb;
 	}
-	g->copy_us += now_us() - t1;
+	g->copy_us += now_us() - t1 - fspent;
+	g->fini_us += fspent;
 	g->busy_us += now_us() - t0;
 	return 0;
 }
