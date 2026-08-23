@@ -307,6 +307,59 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/*
+	 * THE SLOPE MAP. Round 344 showed the contribution of one nibble is
+	 * EXACTLY s times a constant, and that constant is the activation the
+	 * nibble meets -- 8744 at byte 0's low half, 10312 at its high half,
+	 * 3532 at byte 1024. So sweeping the BYTE instead of the value maps the
+	 * layout directly: which activation each nibble of the weight buffer is
+	 * multiplied by, and which output word it lands in.
+	 *
+	 * Two submits a byte, v = 0 then v = 1, and the difference is the slope.
+	 */
+	if (getenv("CHARSIU_SLOPE_MAP")) {
+		unsigned nb = (unsigned)strtoul(getenv("CHARSIU_SLOPE_MAP"),
+						NULL, 0);
+		size_t b;
+
+		printf("\nslope map, %u bytes, both halves\n", nb);
+		printf("  %-8s %-5s %-12s %-8s %-6s\n",
+		       "byte", "half", "slope", "first", "words");
+		for (b = 0; b < nb; b++) {
+			int h;
+
+			for (h = 0; h < 2; h++) {
+				unsigned l0, l1;
+				uint8_t keepb;
+
+				charsiu_bo_prep(c.dev, &c.wt, 1000000000);
+				keepb = ((uint8_t *)c.wt.map)[b];
+				charsiu_bo_fini(c.dev, &c.wt);
+
+				poke(&c, b, h, 0);
+				l0 = run(&c, v0, words);
+				poke(&c, b, h, 1);
+				l1 = run(&c, cur, words);
+				changed = diff(v0, cur, words, &first, &delta);
+
+				/* put the byte back before moving on */
+				charsiu_bo_prep(c.dev, &c.wt, 1000000000);
+				((uint8_t *)c.wt.map)[b] = keepb;
+				charsiu_bo_fini(c.dev, &c.wt);
+
+				if (l0 != l1 || !l0) {
+					printf("  %-8zu %-5s %-12s %-8s %-6s  "
+					       "DEAD\n", b, h ? "high" : "low",
+					       "-", "-", "-");
+					continue;
+				}
+				printf("  %-8zu %-5s %-12lld %-8u %-6u\n",
+				       b, h ? "high" : "low",
+				       (long long)delta, first, changed);
+			}
+		}
+	}
+
 	/* CONTROL 2: put it back */
 	poke(&c, byte, high, high ? orig >> 4 : orig & 0xf);
 	keep = run(&c, cur, words);

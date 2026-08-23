@@ -541,12 +541,28 @@ static size_t merge_vendor_values(uint64_t *out, size_t n, size_t max)
 			at = i;
 			break;
 		}
+	/*
+	 * CHARSIU_MERGE_UNITS narrows the merge to one register range, so the
+	 * twenty registers that turn the multiply from a bit pattern product
+	 * into a real weighted sum can be bisected: "1" is CNA 0x1xxx, "2" the
+	 * five at 0x2810, "3" CORE 0x3xxx, "4" DPU 0x4xxx. Default is all.
+	 */
+	{
+		const char *only = getenv("CHARSIU_MERGE_UNITS");
+
+		if (only)
+			printf("MERGE: units %s only\n", only);
+	}
 	for (i = 0; i < got; i++) {
 		unsigned reg = (unsigned)(v[i] & 0xffff);
+		const char *only = getenv("CHARSIU_MERGE_UNITS");
+		char unit = (char)('0' + ((reg >> 12) & 0xf));
 		int found = 0;
 
 		/* the addresses stay OURS; only values are taken */
 		if (reg == 0x1088 || reg == 0x1110 || reg == 0x4018)
+			continue;
+		if (only && !strchr(only, unit))
 			continue;
 		for (j = 0; j < n; j++) {
 			if ((unsigned)(out[j] & 0xffff) != reg)
