@@ -868,9 +868,29 @@ int main(int argc, char **argv)
 					    <= 0.01 * fabs(sc * lin))
 						hit++;
 				}
-				printf("  PLAIN WEIGHTED SUM: %u of %u channels "
-				       "within 1%% of one global scale %.6f\n",
-				       hit, nz, sc);
+				/*
+				 * ⚠ A DEAD OUTPUT SCORED n OF n. Round 339's
+				 * 3d timed out, every word came back zero, the
+				 * least squares scale fitted to 0.000000 and
+				 * every channel was "within 1% of zero". That
+				 * is a check that cannot fail, which is the
+				 * one kind this file is not allowed to print.
+				 */
+				unsigned live = 0;
+
+				for (ci = 0; ci < n; ci++)
+					if (o[(size_t)(ci / atom) * m * atom
+					      + ci % atom])
+						live++;
+				if (!live || sc == 0.0)
+					printf("  PLAIN WEIGHTED SUM: VOID, "
+					       "the output is dead (%u live "
+					       "words, scale %.6f)\n", live, sc);
+				else
+					printf("  PLAIN WEIGHTED SUM: %u of %u "
+					       "channels within 1%% of one "
+					       "global scale %.6f  (%u live)\n",
+					       hit, nz, sc, live);
 			}
 		}
 		printf("int4 output: %u of %u words written, "
