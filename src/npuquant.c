@@ -31,6 +31,219 @@
 #include <arm_neon.h>
 #endif
 
+
+/*
+ * THE WEIGHT CACHE: slow once, fast after, and the user converts nothing.
+ *
+ * charsiu dequantises 1.24 billion Q8_0 weights to float and re-quantises them
+ * at EVERY start, which measured 10 s of pure CPU on the board after round
+ * 356's one pass fix and buys nothing the second time. The vendor is fast for
+ * exactly one reason: a .rkllm holds weights that are already quantised, so
+ * their runtime mmaps and DMAs. This does the same thing for a gguf without
+ * asking anyone to convert a model -- the first run writes a sidecar and every
+ * run after it reads one.
+ *
+ * On the SSD this is meant for, 620 MB reads in about a second against 10 s of
+ * quantising. On the test SD card it is closer to a wash, which is why round
+ * 356 measures the card as well.
+ *
+ * ⚠ IT MUST NEVER SILENTLY DISAGREE WITH THE CODE. The header carries a format
+ * version, the quantiser's own version, the bit width, the group size and a
+ * stamp of the model file, and every record re-checks n, k and the group count.
+ * Anything that does not match rebuilds from scratch rather than being patched
+ * up: a cache that is subtly wrong is worse than no cache, because the failure
+ * shows up as a slightly wrong sentence rather than as an error.
+ *
+ * The nibbles are packed two to a byte on the way out, so an int4 cache is half
+ * the size of the codes in memory and half the size of the gguf it replaces.
+ */
+#define WCACHE_MAGIC  0x43535743u        /* "CSWC" */
+#define WCACHE_FORMAT 1u
+/* ⚠ BUMP THIS whenever the quantiser's arithmetic changes, or an old cache
+ * will quietly feed the new code the old numbers. */
+#define WCACHE_QUANT  1u
+
+struct wcache_head {
+	uint32_t magic, format, quant, bits;
+	uint64_t group;
+	char stamp[64];
+};
+
+static struct {
+	FILE *f;
+	int writing;
+	int checked;
+} wc;
+
+static void wcache_setup(unsigned bits, uint64_t grp)
+{
+	const char *path = getenv("CHARSIU_NPU_CACHE");
+	const char *stamp = getenv("CHARSIU_NPU_CACHE_STAMP");
+	struct wcache_head h, want;
+
+	if (wc.checked)
+		return;
+	wc.checked = 1;
+	if (!path || !*path)
+		return;
+
+	memset(&want, 0, sizeof(want));
+	want.magic = WCACHE_MAGIC;
+	want.format = WCACHE_FORMAT;
+	want.quant = WCACHE_QUANT;
+	want.bits = bits;
+	want.group = grp;
+	snprintf(want.stamp, sizeof(want.stamp), "%s", stamp ? stamp : "");
+
+	wc.f = fopen(path, "rb");
+	if (wc.f) {
+		if (fread(&h, sizeof(h), 1, wc.f) == 1 &&
+		    !memcmp(&h, &want, sizeof(h))) {
+			fprintf(stderr, "charsiu: weight cache %s, reading\n",
+				path);
+			return;
+		}
+		fclose(wc.f);
+		wc.f = NULL;
+		fprintf(stderr, "charsiu: weight cache %s does not match this "
+			"model or this quantiser, rebuilding\n", path);
+	}
+	wc.f = fopen(path, "wb");
+	if (!wc.f) {
+		fprintf(stderr, "charsiu: cannot write the weight cache %s\n",
+			path);
+		return;
+	}
+	if (fwrite(&want, sizeof(want), 1, wc.f) != 1) {
+		fclose(wc.f);
+		wc.f = NULL;
+		return;
+	}
+	wc.writing = 1;
+	fprintf(stderr, "charsiu: weight cache %s, writing\n", path);
+}
+
+/* one record's payload size, nibbles packed two to a byte for int4 */
+static size_t wcache_qbytes(unsigned bits, uint64_t n, uint64_t k)
+{
+	return bits == 4 ? (size_t)((n * k + 1) / 2) : (size_t)(n * k);
+}
+
+static int wcache_read(struct npu_tensor *t, unsigned bits, const char *name)
+{
+	char nm[80];
+	uint64_t n, k, ngrp;
+	size_t qb;
+
+	if (!wc.f || wc.writing)
+		return 0;
+	if (fread(nm, 1, sizeof(nm), wc.f) != sizeof(nm) ||
+	    fread(&n, sizeof(n), 1, wc.f) != 1 ||
+	    fread(&k, sizeof(k), 1, wc.f) != 1 ||
+	    fread(&ngrp, sizeof(ngrp), 1, wc.f) != 1)
+		return 0;
+	/*
+	 * The records are written in the order the tensors are built and are
+	 * read back in the same order, so a mismatch means the two runs did not
+	 * ask for the same thing. Stop using the cache rather than hunt for the
+	 * record: an out of order cache is a bug, not a case to handle.
+	 */
+	if (strcmp(nm, name) || n != t->n || k != t->k ||
+	    ngrp != (t->kgroup ? (t->k + t->kgroup - 1) / t->kgroup : 1)) {
+		fprintf(stderr, "charsiu: weight cache is out of step at %s, "
+			"ignoring the rest of it\n", name);
+		fclose(wc.f);
+		wc.f = NULL;
+		return 0;
+	}
+	qb = wcache_qbytes(bits, n, k);
+	if (bits == 4) {
+		uint8_t *packed = malloc(qb);
+		size_t i;
+
+		if (!packed)
+			return 0;
+		if (fread(packed, 1, qb, wc.f) != qb ||
+		    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
+			    != (size_t)(n * ngrp)) {
+			free(packed);
+			return 0;
+		}
+		for (i = 0; i < (size_t)(n * k); i++) {
+			int v = (i & 1) ? (packed[i >> 1] >> 4)
+					: (packed[i >> 1] & 0xf);
+
+			t->q[i] = (int8_t)(v < 8 ? v : v - 16);
+		}
+		free(packed);
+	} else {
+		if (fread(t->q, 1, qb, wc.f) != qb ||
+		    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
+			    != (size_t)(n * ngrp))
+			return 0;
+	}
+	/* wsum is n int32 and recomputing it is a whole pass over the codes */
+	if (fread(t->wsum, sizeof(int32_t), (size_t)n, wc.f) != (size_t)n)
+		return 0;
+	return 1;
+}
+
+static void wcache_write(const struct npu_tensor *t, unsigned bits,
+			 const char *name)
+{
+	char nm[80];
+	uint64_t n = t->n, k = t->k;
+	uint64_t ngrp = t->kgroup ? (k + t->kgroup - 1) / t->kgroup : 1;
+	size_t qb = wcache_qbytes(bits, n, k);
+
+	if (!wc.f || !wc.writing)
+		return;
+	memset(nm, 0, sizeof(nm));
+	snprintf(nm, sizeof(nm), "%s", name);
+	if (fwrite(nm, 1, sizeof(nm), wc.f) != sizeof(nm) ||
+	    fwrite(&n, sizeof(n), 1, wc.f) != 1 ||
+	    fwrite(&k, sizeof(k), 1, wc.f) != 1 ||
+	    fwrite(&ngrp, sizeof(ngrp), 1, wc.f) != 1)
+		goto bad;
+	if (bits == 4) {
+		uint8_t *packed = calloc(qb, 1);
+		size_t i;
+
+		if (!packed)
+			goto bad;
+		for (i = 0; i < (size_t)(n * k); i++) {
+			uint8_t v = (uint8_t)(t->q[i] & 0xf);
+
+			if (i & 1)
+				packed[i >> 1] |= (uint8_t)(v << 4);
+			else
+				packed[i >> 1] |= v;
+		}
+		if (fwrite(packed, 1, qb, wc.f) != qb) {
+			free(packed);
+			goto bad;
+		}
+		free(packed);
+	} else if (fwrite(t->q, 1, qb, wc.f) != qb) {
+		goto bad;
+	}
+	if (fwrite(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
+	    != (size_t)(n * ngrp) ||
+	    fwrite(t->wsum, sizeof(int32_t), (size_t)n, wc.f) != (size_t)n)
+		goto bad;
+	return;
+bad:
+	/* a truncated cache would be read back as garbage next time, and the
+	 * header would still match. Drop it. */
+	fprintf(stderr, "charsiu: the weight cache could not be written; "
+		"removing it\n");
+	fclose(wc.f);
+	wc.f = NULL;
+	wc.writing = 0;
+	if (getenv("CHARSIU_NPU_CACHE"))
+		remove(getenv("CHARSIU_NPU_CACHE"));
+}
+
 int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 {
 	uint64_t n = w->ne[1], k = w->ne[0];
@@ -120,6 +333,21 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		free(row);
 		npu_tensor_free(t);
 		return -1;
+	}
+
+	/*
+	 * ⚠ THE CACHE IS SKIPPED WHENEVER SOMETHING ELSE DECIDES THE WEIGHTS.
+	 * AWQ folds a per k factor into them and keeps it in t->kscale, and
+	 * CHARSIU_W4_FILE replaces them outright; neither is in the record, so
+	 * caching either would store weights that cannot be reproduced from
+	 * what the header claims.
+	 */
+	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE")) {
+		wcache_setup(bits, grp);
+		if (wcache_read(t, bits, w->name)) {
+			free(row);
+			return 0;
+		}
 	}
 
 	if (alpha != 0.0) {
@@ -322,6 +550,9 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		}
 		t->wsum[r] = sum;
 	}
+
+	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE"))
+		wcache_write(t, bits, w->name);
 
 	/*
 	 * CHARSIU_W4_FILE replaces what was just computed with weights prepared

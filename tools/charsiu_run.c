@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "charsiu_llm.h"
@@ -67,6 +68,14 @@ int main(int argc, char **argv)
 	int32_t *ids;
 	int n_ids, max_ids;
 	char *text = NULL;
+	/*
+	 * --cache writes the quantised weights beside the model the first time
+	 * and reads them back after, which is the difference between 20 seconds
+	 * of startup and about five. It is OPT IN because it puts 620 MB next
+	 * to somebody's model file and doing that unasked is rude.
+	 */
+	const char *cache = NULL;
+	char cachepath[1024];
 	double t_load, t0, t_prompt;
 	int i;
 
@@ -90,6 +99,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--info")) show_info = 1;
 		else if (!strcmp(a, "--no-bos")) add_bos = 0;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
+		else if (!strcmp(a, "--cache")) cache = "";
+		else if (!strcmp(a, "--cache-at")) cache = NEXT();
 		else if (!strcmp(a, "-q")) quiet = 1;
 		else { usage(); return 2; }
 #undef NEXT
@@ -107,6 +118,31 @@ int main(int argc, char **argv)
 	}
 
 	t0 = now_ms();
+	if (cache) {
+		struct stat sb;
+		char stamp[64];
+
+		if (!*cache) {
+			snprintf(cachepath, sizeof(cachepath), "%s.wcache",
+				 path ? path : "model");
+			cache = cachepath;
+		}
+		/*
+		 * The stamp is the model's size and mtime. A cache whose header
+		 * does not match it is rebuilt rather than trusted: the failure
+		 * mode of a stale cache is a slightly wrong sentence, which is
+		 * far worse than a slow start.
+		 */
+		if (path && !stat(path, &sb))
+			snprintf(stamp, sizeof(stamp), "%llu:%llu",
+				 (unsigned long long)sb.st_size,
+				 (unsigned long long)sb.st_mtime);
+		else
+			snprintf(stamp, sizeof(stamp), "nostat");
+		setenv("CHARSIU_NPU_CACHE", cache, 1);
+		setenv("CHARSIU_NPU_CACHE_STAMP", stamp, 1);
+	}
+
 	if (llama_load(&m, path) < 0)
 		return 1;
 	t_load = now_ms() - t0;
