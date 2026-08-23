@@ -160,6 +160,15 @@ struct npu_tensor {
 	char name[80];
 };
 
+/*
+ * Run fn over [0, n) split across the decode's thread pool, and wait. The
+ * pool lives in llama.c because that is what starts it; quantisation wants it
+ * too, and starting a second one would fight the first for the same cores.
+ * With one thread, or before the pool exists, fn simply runs inline.
+ */
+void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
+			  void *ctx, uint64_t n);
+
 int  npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w);
 void npu_tensor_free(struct npu_tensor *t);
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,

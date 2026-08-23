@@ -255,180 +255,44 @@ bad:
 		remove(getenv("CHARSIU_NPU_CACHE"));
 }
 
-int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
+/*
+ * ONE RANGE OF OUTPUT CHANNELS. Rows do not talk to each other: each writes
+ * its own k bytes of q, its own ngrp scales and its own wsum, and reads the
+ * weight file through gguf_row_f32, which only ever writes the buffer it is
+ * handed. So the whole of quantisation splits over the pool that the decode
+ * already has -- and a cold start was 7.9 seconds of it on the board, on one
+ * core, while three sat idle.
+ *
+ * ⚠ THE ONE THING THAT DOES CROSS ROWS is the squared error the --info
+ * diagnostic accumulates, so a run that asks for it stays serial rather than
+ * growing a lock for a number nothing in the decode reads.
+ */
+struct qrows {
+	struct npu_tensor *t;
+	const struct gguf_tensor *w;
+	uint64_t k, ngrp, grp;
+	unsigned bits;
+	float qmax;
+	int w4sym, w4clip, rms, midrise;
+	double se, sw;
+};
+
+static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 {
-	uint64_t n = w->ne[1], k = w->ne[0];
-	float *row;
+	struct qrows *c = vc;
+	struct npu_tensor *t = c->t;
+	const struct gguf_tensor *w = c->w;
+	const uint64_t k = c->k, ngrp = c->ngrp, grp = c->grp;
+	const unsigned bits = c->bits;
+	const float qmax = c->qmax;
+	const int w4sym = c->w4sym, w4clip = c->w4clip;
+	const int rms = c->rms, midrise = c->midrise;
 	double se = 0.0, sw = 0.0;
+	float *row = malloc((size_t)k * sizeof(float));
 
-	/*
-	 * ⚠ THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
-	 * IN. The hardware's coefficient buffer carries ONE multiplier per
-	 * output channel, so charsiu's NPU weights are quantised per channel --
-	 * fine at eight bits, and q4_0 uses a scale every 32 weights precisely
-	 * because four bits per channel is not.
-	 *
-	 * But K is sliced anyway (KMAX), and acc_out makes a K split exact, so
-	 * a slice can carry its own scale for free. CHARSIU_NPU_W4_GROUP asks
-	 * what that buys: the weights are quantised in groups of that many k,
-	 * with a scale each, which is what the runtime would actually get.
-	 * CHARSIU_NPU_W4 alone is one scale for the whole row, the worst case.
-	 */
-	/*
-	 * CHARSIU_NPU_W4_ONLY narrows int4 to the tensors whose name contains a
-	 * substring, so "ffn" puts the feed forward -- which is 65% of the
-	 * bytes a token moves -- at four bits and leaves attention at eight.
-	 * Most of the saving for a fraction of the error, if the error turns
-	 * out to live in attention.
-	 */
-	const char *w4only = getenv("CHARSIU_NPU_W4_ONLY");
-	/* CHARSIU_NPU_W4V, the int4 DECODE path, implies int4 weights: one
-	 * switch cannot select the layout and registers while another leaves
-	 * the quantiser at eight bits. */
-	unsigned bits = (getenv("CHARSIU_NPU_W4") || getenv("CHARSIU_NPU_W4V"))
-		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
-	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
-		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
-	/*
-	 * ⚠⚠ READ ONCE. These two sat inside loops over every weight in the
-	 * tensor, and getenv walks the environment with a strcmp per entry.
-	 * Round 354's heartbeat split settled where 114 to 144 seconds of
-	 * staging went: 4 to 5 s inside charsiu_npu_add and ALL THE REST in
-	 * npu_tensor_build. int8 never noticed because "bits == 4 &&" short
-	 * circuits before the call, which is also why it looked like an int4
-	 * hardware or layout problem for two rounds. It was 1.24 billion
-	 * getenv calls.
-	 */
-	const int w4sym = getenv("CHARSIU_NPU_W4_SYM") != NULL;
-	const int w4clip = getenv("CHARSIU_NPU_W4_CLIP") != NULL;
-	const int rms = getenv("CHARSIU_NPU_RMS") != NULL;
-	const int midrise = midrise_grid();
-	uint64_t ngrp;
-	float qmax = bits == 4 ? 7.0f : 127.0f;
-
-	if (grp == 0 || grp > k)
-		grp = k;
-	ngrp = (k + grp - 1) / grp;
-
-	/*
-	 * ⚠ THE k FACTOR, and why it is free.
-	 *
-	 * charsiu reads the RAW int32 accumulator (acc_out), so the hardware's
-	 * per channel multiplier is not in the path at all: the dequantise
-	 * happens on the CPU. The only real constraint is that one job's
-	 * accumulator sums all of K under one scale a channel.
-	 *
-	 * But a factor that depends on k ALONE cancels inside the product. Put
-	 * c_k into the weights as a divide and into the activation as a
-	 * multiply and the accumulator is unchanged, while the weights lose
-	 * whatever part of their spread across k is common to every channel --
-	 * which is the part one scale a row cannot cover. That is the AWQ and
-	 * SmoothQuant trick, and here it costs one multiply a k on a vector of
-	 * 2048 and nothing on the hardware.
-	 *
-	 * CHARSIU_NPU_AWQ is the exponent, 0 for off and 0.5 for the usual
-	 * square root balance.
-	 */
-	double alpha = getenv("CHARSIU_NPU_AWQ")
-		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
-
-	memset(t, 0, sizeof(*t));
-	snprintf(t->name, sizeof(t->name), "%s", w->name);
-	t->n = n;
-	t->k = k;
-	t->kgroup = grp;
-	t->q = malloc((size_t)n * k);
-	t->scale = malloc((size_t)n * ngrp * sizeof(float));
-	t->wsum = malloc((size_t)n * sizeof(int32_t));
-	row = malloc((size_t)k * sizeof(float));
-	if (!t->q || !t->scale || !t->wsum || !row) {
-		free(row);
-		npu_tensor_free(t);
-		return -1;
-	}
-
-	/*
-	 * ⚠ THE CACHE IS SKIPPED WHENEVER SOMETHING ELSE DECIDES THE WEIGHTS.
-	 * AWQ folds a per k factor into them and keeps it in t->kscale, and
-	 * CHARSIU_W4_FILE replaces them outright; neither is in the record, so
-	 * caching either would store weights that cannot be reproduced from
-	 * what the header claims.
-	 */
-	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE")) {
-		wcache_setup(bits, grp);
-		if (wcache_read(t, bits, w->name)) {
-			free(row);
-			return 0;
-		}
-	}
-
-	if (alpha != 0.0) {
-		double *col = calloc(k, sizeof(*col));
-		double gm = 0.0;
-		const char *sf = getenv("CHARSIU_AWQ_STATS");
-		int got = 0;
-
-		if (!col) { free(row); npu_tensor_free(t); return -1; }
-		if (sf) {
-			FILE *f = fopen(sf, "rb");
-			char nm[80];
-			uint64_t kk;
-
-			while (f && fread(nm, 1, sizeof(nm), f) == sizeof(nm)
-			       && fread(&kk, sizeof(kk), 1, f) == 1) {
-				if (!strcmp(nm, w->name) && kk == k) {
-					got = fread(col, sizeof(*col), k, f) == k;
-					break;
-				}
-				fseek(f, (long)(kk * sizeof(double)), SEEK_CUR);
-			}
-			if (f)
-				fclose(f);
-		}
-		if (!got)
-			for (uint64_t r = 0; r < n; r++) {
-				gguf_row_f32(w, r, row);
-				for (uint64_t i = 0; i < k; i++)
-					col[i] += fabs((double)row[i]);
-			}
-		t->kscale = malloc((size_t)k * sizeof(float));
-		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
-		/*
-		 * ⚠ FLOOR THE STATISTIC AND CLAMP THE FACTOR. The first version
-		 * did neither and produced KL of 8 to 12, which is not a method
-		 * failing, it is a divide by nearly zero: a k whose mean |x| is
-		 * tiny gets a tiny factor, the weights of that column are
-		 * divided by it, and every one of them clips to the rail. The
-		 * floor is relative to the mean so it scales with the tensor,
-		 * and the clamp is what AWQ does for the same reason.
-		 */
-		{
-			double mean = 0.0;
-
-			for (uint64_t i = 0; i < k; i++)
-				mean += col[i];
-			mean /= (double)n * (double)k;
-			for (uint64_t i = 0; i < k; i++) {
-				double v = col[i] / (double)n;
-
-				if (v < 1e-3 * mean)
-					v = 1e-3 * mean;
-				col[i] = pow(v, alpha);
-				gm += log(col[i]);
-			}
-		}
-		gm = exp(gm / (double)k);            /* keep the mean factor at 1 */
-		for (uint64_t i = 0; i < k; i++) {
-			double f = col[i] / gm;
-
-			if (f < 0.125) f = 0.125;
-			if (f > 8.0) f = 8.0;
-			t->kscale[i] = (float)f;
-		}
-		free(col);
-	}
-
-	for (uint64_t r = 0; r < n; r++) {
+	if (!row)
+		return;
+	for (uint64_t r = r0; r < r0 + nr; r++) {
 		int8_t *dst = t->q + r * k;
 		int32_t sum = 0;
 
@@ -613,6 +477,196 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		}
 		}
 		t->wsum[r] = sum;
+	}
+	c->se += se;
+	c->sw += sw;
+	free(row);
+}
+
+int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
+{
+	uint64_t n = w->ne[1], k = w->ne[0];
+	float *row;
+	double se = 0.0, sw = 0.0;
+
+	/*
+	 * ⚠ THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
+	 * IN. The hardware's coefficient buffer carries ONE multiplier per
+	 * output channel, so charsiu's NPU weights are quantised per channel --
+	 * fine at eight bits, and q4_0 uses a scale every 32 weights precisely
+	 * because four bits per channel is not.
+	 *
+	 * But K is sliced anyway (KMAX), and acc_out makes a K split exact, so
+	 * a slice can carry its own scale for free. CHARSIU_NPU_W4_GROUP asks
+	 * what that buys: the weights are quantised in groups of that many k,
+	 * with a scale each, which is what the runtime would actually get.
+	 * CHARSIU_NPU_W4 alone is one scale for the whole row, the worst case.
+	 */
+	/*
+	 * CHARSIU_NPU_W4_ONLY narrows int4 to the tensors whose name contains a
+	 * substring, so "ffn" puts the feed forward -- which is 65% of the
+	 * bytes a token moves -- at four bits and leaves attention at eight.
+	 * Most of the saving for a fraction of the error, if the error turns
+	 * out to live in attention.
+	 */
+	const char *w4only = getenv("CHARSIU_NPU_W4_ONLY");
+	/* CHARSIU_NPU_W4V, the int4 DECODE path, implies int4 weights: one
+	 * switch cannot select the layout and registers while another leaves
+	 * the quantiser at eight bits. */
+	unsigned bits = (getenv("CHARSIU_NPU_W4") || getenv("CHARSIU_NPU_W4V"))
+		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
+	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
+		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
+	/*
+	 * ⚠⚠ READ ONCE. These two sat inside loops over every weight in the
+	 * tensor, and getenv walks the environment with a strcmp per entry.
+	 * Round 354's heartbeat split settled where 114 to 144 seconds of
+	 * staging went: 4 to 5 s inside charsiu_npu_add and ALL THE REST in
+	 * npu_tensor_build. int8 never noticed because "bits == 4 &&" short
+	 * circuits before the call, which is also why it looked like an int4
+	 * hardware or layout problem for two rounds. It was 1.24 billion
+	 * getenv calls.
+	 */
+	const int w4sym = getenv("CHARSIU_NPU_W4_SYM") != NULL;
+	const int w4clip = getenv("CHARSIU_NPU_W4_CLIP") != NULL;
+	const int rms = getenv("CHARSIU_NPU_RMS") != NULL;
+	const int midrise = midrise_grid();
+	uint64_t ngrp;
+	float qmax = bits == 4 ? 7.0f : 127.0f;
+
+	if (grp == 0 || grp > k)
+		grp = k;
+	ngrp = (k + grp - 1) / grp;
+
+	/*
+	 * ⚠ THE k FACTOR, and why it is free.
+	 *
+	 * charsiu reads the RAW int32 accumulator (acc_out), so the hardware's
+	 * per channel multiplier is not in the path at all: the dequantise
+	 * happens on the CPU. The only real constraint is that one job's
+	 * accumulator sums all of K under one scale a channel.
+	 *
+	 * But a factor that depends on k ALONE cancels inside the product. Put
+	 * c_k into the weights as a divide and into the activation as a
+	 * multiply and the accumulator is unchanged, while the weights lose
+	 * whatever part of their spread across k is common to every channel --
+	 * which is the part one scale a row cannot cover. That is the AWQ and
+	 * SmoothQuant trick, and here it costs one multiply a k on a vector of
+	 * 2048 and nothing on the hardware.
+	 *
+	 * CHARSIU_NPU_AWQ is the exponent, 0 for off and 0.5 for the usual
+	 * square root balance.
+	 */
+	double alpha = getenv("CHARSIU_NPU_AWQ")
+		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
+
+	memset(t, 0, sizeof(*t));
+	snprintf(t->name, sizeof(t->name), "%s", w->name);
+	t->n = n;
+	t->k = k;
+	t->kgroup = grp;
+	t->q = malloc((size_t)n * k);
+	t->scale = malloc((size_t)n * ngrp * sizeof(float));
+	t->wsum = malloc((size_t)n * sizeof(int32_t));
+	row = malloc((size_t)k * sizeof(float));
+	if (!t->q || !t->scale || !t->wsum || !row) {
+		free(row);
+		npu_tensor_free(t);
+		return -1;
+	}
+
+	/*
+	 * ⚠ THE CACHE IS SKIPPED WHENEVER SOMETHING ELSE DECIDES THE WEIGHTS.
+	 * AWQ folds a per k factor into them and keeps it in t->kscale, and
+	 * CHARSIU_W4_FILE replaces them outright; neither is in the record, so
+	 * caching either would store weights that cannot be reproduced from
+	 * what the header claims.
+	 */
+	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE")) {
+		wcache_setup(bits, grp);
+		if (wcache_read(t, bits, w->name)) {
+			free(row);
+			return 0;
+		}
+	}
+
+	if (alpha != 0.0) {
+		double *col = calloc(k, sizeof(*col));
+		double gm = 0.0;
+		const char *sf = getenv("CHARSIU_AWQ_STATS");
+		int got = 0;
+
+		if (!col) { free(row); npu_tensor_free(t); return -1; }
+		if (sf) {
+			FILE *f = fopen(sf, "rb");
+			char nm[80];
+			uint64_t kk;
+
+			while (f && fread(nm, 1, sizeof(nm), f) == sizeof(nm)
+			       && fread(&kk, sizeof(kk), 1, f) == 1) {
+				if (!strcmp(nm, w->name) && kk == k) {
+					got = fread(col, sizeof(*col), k, f) == k;
+					break;
+				}
+				fseek(f, (long)(kk * sizeof(double)), SEEK_CUR);
+			}
+			if (f)
+				fclose(f);
+		}
+		if (!got)
+			for (uint64_t r = 0; r < n; r++) {
+				gguf_row_f32(w, r, row);
+				for (uint64_t i = 0; i < k; i++)
+					col[i] += fabs((double)row[i]);
+			}
+		t->kscale = malloc((size_t)k * sizeof(float));
+		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
+		/*
+		 * ⚠ FLOOR THE STATISTIC AND CLAMP THE FACTOR. The first version
+		 * did neither and produced KL of 8 to 12, which is not a method
+		 * failing, it is a divide by nearly zero: a k whose mean |x| is
+		 * tiny gets a tiny factor, the weights of that column are
+		 * divided by it, and every one of them clips to the rail. The
+		 * floor is relative to the mean so it scales with the tensor,
+		 * and the clamp is what AWQ does for the same reason.
+		 */
+		{
+			double mean = 0.0;
+
+			for (uint64_t i = 0; i < k; i++)
+				mean += col[i];
+			mean /= (double)n * (double)k;
+			for (uint64_t i = 0; i < k; i++) {
+				double v = col[i] / (double)n;
+
+				if (v < 1e-3 * mean)
+					v = 1e-3 * mean;
+				col[i] = pow(v, alpha);
+				gm += log(col[i]);
+			}
+		}
+		gm = exp(gm / (double)k);            /* keep the mean factor at 1 */
+		for (uint64_t i = 0; i < k; i++) {
+			double f = col[i] / gm;
+
+			if (f < 0.125) f = 0.125;
+			if (f > 8.0) f = 8.0;
+			t->kscale[i] = (float)f;
+		}
+		free(col);
+	}
+
+	{
+		struct qrows c = { t, w, k, ngrp, grp, bits, qmax,
+				   w4sym, w4clip, rms, midrise, 0.0, 0.0 };
+
+		/* the diagnostic is the only thing that crosses rows */
+		if (rms)
+			quant_rows(&c, 0, n);
+		else
+			charsiu_parallel_for(quant_rows, &c, n);
+		se = c.se;
+		sw = c.sw;
 	}
 
 	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE"))

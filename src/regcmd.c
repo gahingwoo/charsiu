@@ -420,6 +420,77 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 		}
 }
 
+/*
+ * ROWS [n0, n0 + nrows) ONLY, AND NO MEMSET.
+ *
+ * The two live layouts write disjoint bytes per output channel -- int4 puts
+ * channel nn at (nn/16)*512*(kb/32) + (nn%16)*32 and writes whole bytes from
+ * there, int8 indexes dst by n as well -- so a range of channels can be packed
+ * without touching any other range's bytes. That is what lets staging split
+ * over the pool: about 620 MB of nibbles for this model, 4.4 seconds of a cold
+ * start on the board, on one core.
+ *
+ * ⚠ THE CALLER OWNS THE ZEROING, once, before any range runs. And the legacy
+ * bit pattern layout is NOT in here: it accumulates with |=, so two channels
+ * can share a byte and ranges would race. charsiu_pack_weights below keeps it.
+ */
+void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
+			       const uint8_t *src, uint8_t *dst,
+			       unsigned n0, unsigned nrows)
+{
+	unsigned ng = charsiu_weight_ngroup(mm->wdtype);
+	unsigned kg = charsiu_weight_kgroup(mm->wdtype);
+	unsigned n_pad = ALIGN_UP(mm->n, 2);
+	unsigned ke = charsiu_k_eff(mm);
+	unsigned n, k;
+
+	if (mm->wdtype == CHARSIU_INT4) {
+		size_t cap = charsiu_weight_bytes(mm);
+		unsigned kb = ALIGN_UP(ke, 32);
+		unsigned kmax = mm->k < ke ? mm->k : ke;
+		unsigned nn, kk;
+
+		for (nn = n0; nn < n0 + nrows; nn++) {
+			size_t nbase = (size_t)(nn / 16) * 512 * (kb / 32)
+				     + (size_t)(nn % 16) * 32;
+			const uint8_t *row = src + (size_t)nn * mm->k;
+
+			for (kk = 0; kk < kmax; kk += 32) {
+				size_t i = nbase + (size_t)(kk / 32) * 512;
+				unsigned run = kmax - kk < 32 ? kmax - kk : 32;
+				uint8_t *d;
+				unsigned c;
+
+				if ((i + run - 1) >> 1 >= cap)
+					break;
+				d = dst + (i >> 1);
+				for (c = 0; c + 1 < run; c += 2)
+					*d++ = (uint8_t)((row[kk + c] & 0xf) |
+							 ((row[kk + c + 1] & 0xf)
+							  << 4));
+				if (c < run)
+					*d = (uint8_t)((*d & 0xf0) |
+						       (row[kk + c] & 0xf));
+			}
+		}
+		return;
+	}
+
+	for (n = n0; n < n0 + nrows; n++) {
+		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
+
+		for (k = 0; k < mm->k; k++) {
+			unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
+			size_t off = (size_t)ngi * ng * ke
+				   + (size_t)kgi * kg * ngsz
+				   + (size_t)(n % ng) * kgsz
+				   + (k % kg);
+
+			dst[off] = (uint8_t)(src[(size_t)n * mm->k + k] - 0x80);
+		}
+	}
+}
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst)
 {

@@ -178,6 +178,7 @@ struct charsiu_npu {
 	 */
 	double slow_us, min_gbs;
 	int strikes, dead, whined, nochain, slowed, nofini, inprep, plain;
+	int serialpack;
 	unsigned long slices;
 };
 
@@ -390,6 +391,14 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 * did it, which is the lesson round 368's attention arm taught.
 	 */
 	g->plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
+	/*
+	 * ⚠ THE LEGACY BIT PATTERN LAYOUT CANNOT BE SPLIT. It accumulates with
+	 * |=, so two channels can share a byte and two threads would race for
+	 * it. charsiu_pack_weights_rows does not implement that layout at all,
+	 * which would silently produce the CURRENT one instead, so the check
+	 * belongs here rather than in a comment.
+	 */
+	g->serialpack = g->plain || getenv("CHARSIU_W4_BITPAT") != NULL;
 	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
@@ -512,6 +521,36 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"in this run came from the CPU.\n");
 }
 
+/*
+ * One range of a slice's output channels: gather the quantised bytes into the
+ * shape the packer wants, then pack them. Both are indexed by channel and both
+ * write disjoint bytes, so the ranges do not meet.
+ */
+struct wrows {
+	struct charsiu_npu *g;
+	const struct npu_tensor *t;
+	const struct charsiu_matmul *mm;
+	unsigned n0, k0, k;
+};
+
+static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
+{
+	const struct wrows *w = vw;
+	struct charsiu_npu *g = w->g;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const int8_t *src = w->t->q
+				  + (size_t)(w->n0 + r) * w->t->k + w->k0;
+		uint8_t *dst = g->scratch + (size_t)r * w->k;
+
+		for (unsigned c = 0; c < w->k; c++)
+			dst[c] = g->w4 ? (uint8_t)(src[c] & 0xf)
+				       : (uint8_t)((int)src[c] + 128);
+	}
+	charsiu_pack_weights_rows(w->mm, g->scratch, g->wpack,
+				  (unsigned)r0, (unsigned)nr);
+}
+
 /* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t, writing region si. */
 static int add_slice(struct charsiu_npu *g, unsigned di,
 		     const struct npu_tensor *t,
@@ -578,14 +617,23 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	 * int8 wants unsigned bytes around a zero point of 128; int4 wants the
 	 * signed code in the low nibble, which is what two's complement already
 	 * puts there for a value in [-8, 7].
+	 *
+	 * ⚠ AND THIS IS THE OTHER HALF OF A COLD START. Round 369's board log
+	 * reads 4.4 seconds "adding" against 7.9 "quantising", and where the
+	 * quantiser now splits over the pool this did not: 620 MB of nibbles
+	 * gathered and packed on one core. Both steps index by output channel
+	 * and write disjoint bytes, so a range of channels is a whole unit of
+	 * work -- checked byte for byte against the whole matrix call at nine
+	 * shapes and five split counts.
 	 */
-	for (unsigned r = 0; r < n; r++) {
-		const int8_t *src = t->q + (size_t)(n0 + r) * t->k + k0;
-		uint8_t *dst = g->scratch + (size_t)r * k;
+	{
+		struct wrows wr = { g, t, &s->job.mm, n0, k0, k };
 
-		for (unsigned c = 0; c < k; c++)
-			dst[c] = g->w4 ? (uint8_t)(src[c] & 0xf)
-				       : (uint8_t)((int)src[c] + 128);
+		memset(g->wpack, 0, charsiu_weight_bytes(&s->job.mm));
+		if (g->serialpack)
+			pack_rows(&wr, 0, n);
+		else
+			charsiu_parallel_for(pack_rows, &wr, n);
 	}
 	/*
 	 * ⚠ PACK INTO ORDINARY MEMORY AND THEN COPY, because the int4 layout
@@ -596,8 +644,6 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	 * second a tensor, and int8 only escapes it because its layout is
 	 * nearly sequential. The copy afterwards is one sequential pass.
 	 */
-	memset(g->wpack, 0, charsiu_weight_bytes(&s->job.mm));
-	charsiu_pack_weights(&s->job.mm, g->scratch, g->wpack);
 	charsiu_bo_prep(g->dev[di], &s->wt, 1000000000);
 	memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm));
 	charsiu_bo_fini(g->dev[di], &s->wt);

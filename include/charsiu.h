@@ -144,6 +144,11 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 			uint8_t *dst, size_t dst_size, uint8_t input_zero_point);
 
+/* one range of output channels, no memset: the caller zeroes once */
+void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
+			       const uint8_t *src, uint8_t *dst,
+			       unsigned n0, unsigned nrows);
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst);
 

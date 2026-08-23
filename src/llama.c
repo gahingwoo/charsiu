@@ -315,6 +315,12 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 	pthread_mutex_unlock(&g_pool.mu);
 }
 
+void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
+			  void *ctx, uint64_t n)
+{
+	pool_run(fn, ctx, n);
+}
+
 static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			 float *y);
 
