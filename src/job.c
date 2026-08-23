@@ -29,6 +29,7 @@
 #define CORE  0x0801u
 #define DPU   0x1001u
 #define RDMA  0x2001u
+#define U28   0x0401u   /* the CBUF block the vendor writes at 0x2810 */
 
 #define DIV_ROUND_UP(n, d)  (((n) + (d) - 1) / (d))
 #define ALIGN_UP(n, a)      (DIV_ROUND_UP((n), (a)) * (a))
@@ -782,6 +783,43 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * CHARSIU_W4_BITPAT restores the old behaviour, so the round that
 	 * claims this can show the fault coming back.
 	 */
+	/*
+	 * THE FIVE AT 0x2810, WHICH THE VENDOR WRITES AND THIS TREE NEVER DID.
+	 *
+	 * They cost nothing -- round 357 measured 270.1 us against a 275.9
+	 * baseline with them inserted -- and on core 0 the vendor's values are
+	 * all zero, so emitting them changes nothing today. They are here so
+	 * that they CAN be changed, because they are the only registers whose
+	 * value differs between the vendor's core 0 stream and its core 1
+	 * stream, and CHARSIU_OVERRIDE can only reach a register that is
+	 * actually emitted.
+	 *
+	 * The vendor's two captured streams for the same op differ in exactly
+	 * seven entries and every one of them is CBUF:
+	 *
+	 *          task 16 (core 0)   task 17 (core 1)
+	 *   0x1038   00000007           0000010e
+	 *   0x1018   40000404           4000040b
+	 *   0x103c   08000000           08001c00
+	 *   0x1040   10000000           2c001c00
+	 *   0x2818   00000000           1c000000
+	 *   0x2820   00000000           00000038
+	 *
+	 * 0x1c00 is 7168 and it reads like a CBUF base offset: each core is
+	 * told where ITS part of the buffer starts. rocket's own uapi says a
+	 * job's tasks stay on one core "to benefit from memory residency in
+	 * SRAM", and round 361 showed two processes on ONE core are clean six
+	 * times out of six while two on TWO cores corrupt three times out of
+	 * four. Two cores given the SAME CBUF configuration is the shape of
+	 * that.
+	 */
+	if (mm->wdtype == CHARSIU_INT4) {
+		unsigned r2;
+
+		for (r2 = 0x2810; r2 <= 0x2820; r2 += 4)
+			emit(&e, U28, r2, 0x00000000);
+	}
+
 	{
 		int w4v = mm->wdtype == CHARSIU_INT4 &&
 			  !getenv("CHARSIU_W4_BITPAT");
