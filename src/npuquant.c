@@ -58,7 +58,10 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * out to live in attention.
 	 */
 	const char *w4only = getenv("CHARSIU_NPU_W4_ONLY");
-	unsigned bits = getenv("CHARSIU_NPU_W4")
+	/* CHARSIU_NPU_W4V, the int4 DECODE path, implies int4 weights: one
+	 * switch cannot select the layout and registers while another leaves
+	 * the quantiser at eight bits. */
+	unsigned bits = (getenv("CHARSIU_NPU_W4") || getenv("CHARSIU_NPU_W4V"))
 		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
 	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
 		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;

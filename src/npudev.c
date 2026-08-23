@@ -73,6 +73,24 @@ struct charsiu_npu {
 	unsigned in_stride, out_stride, max_slices, maxtask;
 	uint8_t *scratch;
 	int32_t *acc;
+	/*
+	 * CHARSIU_NPU_W4V, the int4 decode path. Rounds 344 to 351 settled that
+	 * this hardware computes a real int4 by fp16 dot product into float32
+	 * once CORE 0x3018, 0x301c and 0x3020 carry the vendor's values, and
+	 * that it is 1.42 to 1.78 times faster than int8 at every shape swept.
+	 *
+	 * It is OPT IN. The int8 path here produces tokens identical to the CPU
+	 * at 6.55 tok/s and is not going to be replaced by a path that has never
+	 * decoded a sentence.
+	 *
+	 * The activation goes in as the REAL float, not the int8 quantised one,
+	 * so this mode has no input zero point, no wsum correction and no d1 in
+	 * the dequantisation -- and it skips charsiu_act's quantisation
+	 * entirely, which is 10.1 ms of a 153 ms token on the CPU side.
+	 */
+	int w4;
+	float *fscr;
+	float *accf;
 	struct charsiu_task *tasks;
 	uint32_t *handles;
 	unsigned nmax, kmax, max_n;
@@ -199,6 +217,7 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->max_n = max_n;
 	g->ent_cap = max_tensors;
 
+	g->w4 = getenv("CHARSIU_NPU_W4V") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	g->max_slices = ns * ks;
@@ -210,17 +229,22 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 
 		g->in_stride = charsiu_entries_per_row(&widest) * 64;
 		g->out_stride = g->nmax * 4;
+		/* an fp16 activation is two bytes where an int8 one is one */
+		if (g->w4)
+			g->in_stride *= 2;
 	}
 
 	g->ent = calloc(g->ent_cap, sizeof(*g->ent));
 	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
 	g->scratch = malloc((size_t)g->nmax * g->kmax + max_k);
 	g->acc = calloc(max_n, sizeof(*g->acc));
+	g->accf = calloc(max_n, sizeof(*g->accf));
+	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
 	g->handles = calloc(1 + 8 * g->max_slices, sizeof(*g->handles));
-	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->tasks ||
-	    !g->handles)
+	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->accf ||
+	    !g->fscr || !g->tasks || !g->handles)
 		goto fail;
 
 	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in))
@@ -251,6 +275,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->ent);
 	free(g->scratch);
 	free(g->acc);
+	free(g->accf);
+	free(g->fscr);
 	free(g->tasks);
 	free(g->handles);
 	free(g);
@@ -310,8 +336,8 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	s->job.mm.m = 1;
 	s->job.mm.k = k;
 	s->job.mm.n = n;
-	s->job.mm.wdtype = CHARSIU_INT8;
-	s->job.mm.adtype = CHARSIU_INT8;
+	s->job.mm.wdtype = g->w4 ? CHARSIU_INT4 : CHARSIU_INT8;
+	s->job.mm.adtype = g->w4 ? CHARSIU_FP16 : CHARSIU_INT8;
 	s->job.input_zero_point = 128;
 	s->job.weight_zero_point = 128;
 	s->job.output_zero_point = 0;
@@ -333,13 +359,18 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	s->job.weight_addr = (uint32_t)s->wt.dma_address;
 	s->job.coef_addr = (uint32_t)s->coef.dma_address;
 
-	/* gather the slice as unsigned bytes around a zero point of 128 */
+	/*
+	 * int8 wants unsigned bytes around a zero point of 128; int4 wants the
+	 * signed code in the low nibble, which is what two's complement already
+	 * puts there for a value in [-8, 7].
+	 */
 	for (unsigned r = 0; r < n; r++) {
 		const int8_t *src = t->q + (size_t)(n0 + r) * t->k + k0;
 		uint8_t *dst = g->scratch + (size_t)r * k;
 
 		for (unsigned c = 0; c < k; c++)
-			dst[c] = (uint8_t)((int)src[c] + 128);
+			dst[c] = g->w4 ? (uint8_t)(src[c] & 0xf)
+				       : (uint8_t)((int)src[c] + 128);
 	}
 	charsiu_bo_prep(g->dev, &s->wt, 1000000000);
 	charsiu_pack_weights(&s->job.mm, g->scratch, s->wt.map);
@@ -349,8 +380,10 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	wsum = calloc(n, sizeof(*wsum));
 	if (!bias || !wsum)
 		goto out;
-	/* the weight sums this slice's K range accounts for, not the tensor's */
-	for (unsigned r = 0; r < n; r++) {
+	/* the weight sums this slice's K range accounts for, not the tensor's.
+	 * int4 has no input zero point, so there is nothing for them to
+	 * correct and they stay at zero. */
+	for (unsigned r = 0; r < n && !g->w4; r++) {
 		const int8_t *src = t->q + (size_t)(n0 + r) * t->k + k0;
 		int32_t a = 0;
 
@@ -483,11 +516,23 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
-		for (i = 0; i < s->job.mm.k; i++)
-			g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i] + 128);
-		charsiu_pack_input(&s->job.mm, g->scratch,
-				   (uint8_t *)g->in.map + ki * g->in_stride,
-				   g->in_stride, s->job.input_zero_point);
+		if (g->w4) {
+			for (i = 0; i < s->job.mm.k; i++)
+				g->fscr[i] = a->f[s->k0 + i];
+			charsiu_pack_input_f16(&s->job.mm, g->fscr,
+					       (uint8_t *)g->in.map
+					       + ki * g->in_stride,
+					       g->in_stride);
+		} else {
+			for (i = 0; i < s->job.mm.k; i++)
+				g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i]
+							  + 128);
+			charsiu_pack_input(&s->job.mm, g->scratch,
+					   (uint8_t *)g->in.map
+					   + ki * g->in_stride,
+					   g->in_stride,
+					   s->job.input_zero_point);
+		}
 	}
 	charsiu_bo_fini(g->dev, &g->in);
 
@@ -544,11 +589,21 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
 		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
+		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
+			const uint8_t *base = (const uint8_t *)e->out.map +
+					      s->out_slot * g->out_stride;
 
-			out = (const int32_t *)((const uint8_t *)e->out.map +
-						s->out_slot * g->out_stride);
+			/* int4 writes float32, int8 the raw int32 accumulator */
+			if (g->w4) {
+				const float *fo = (const float *)base;
+
+				for (unsigned j = 0; j < s->job.mm.n; j++)
+					g->accf[s->n0 + j] += fo[j];
+				continue;
+			}
+			out = (const int32_t *)base;
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
@@ -601,8 +656,14 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		return -1;
 	}
 
+	/*
+	 * int4 took the REAL activation, so there is no d1 to undo: the block
+	 * returns sum_k code(n,k) * a(k) in float and only the weight scale is
+	 * left. int8 took a->q1 and needs both.
+	 */
 	for (i = 0; i < (unsigned)e->t->n; i++)
-		y[i] = (float)g->acc[i] * a->d1 * e->t->scale[i];
+		y[i] = g->w4 ? g->accf[i] * e->t->scale[i]
+			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
 	return 0;
 }
 
@@ -644,11 +705,23 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
 
-		for (i = 0; i < s->job.mm.k; i++)
-			g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i] + 128);
-		charsiu_pack_input(&s->job.mm, g->scratch,
-				   (uint8_t *)g->in.map + ki * g->in_stride,
-				   g->in_stride, s->job.input_zero_point);
+		if (g->w4) {
+			for (i = 0; i < s->job.mm.k; i++)
+				g->fscr[i] = a->f[s->k0 + i];
+			charsiu_pack_input_f16(&s->job.mm, g->fscr,
+					       (uint8_t *)g->in.map
+					       + ki * g->in_stride,
+					       g->in_stride);
+		} else {
+			for (i = 0; i < s->job.mm.k; i++)
+				g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i]
+							  + 128);
+			charsiu_pack_input(&s->job.mm, g->scratch,
+					   (uint8_t *)g->in.map
+					   + ki * g->in_stride,
+					   g->in_stride,
+					   s->job.input_zero_point);
+		}
 	}
 	charsiu_bo_fini(g->dev, &g->in);
 
@@ -697,17 +770,28 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		const int32_t *out;
 
 		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
+		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
 		for (j = 0; j < e->count; j++) {
 			const struct npu_slot *s = &g->slot[e->first + j];
+			const uint8_t *base = (const uint8_t *)e->out.map +
+					      s->out_slot * g->out_stride;
 
-			out = (const int32_t *)((const uint8_t *)e->out.map +
-						s->out_slot * g->out_stride);
+			if (g->w4) {
+				const float *fo = (const float *)base;
+
+				for (unsigned q = 0; q < s->job.mm.n; q++)
+					g->accf[s->n0 + q] += fo[q];
+				continue;
+			}
+			out = (const int32_t *)base;
 			for (unsigned q = 0; q < s->job.mm.n; q++)
 				g->acc[s->n0 + q] += out[q];
 		}
 		charsiu_bo_fini(g->dev, &e->out);
 		for (unsigned q = 0; q < (unsigned)e->t->n; q++)
-			ys[i][q] = (float)g->acc[q] * a->d1 * e->t->scale[q];
+			ys[i][q] = g->w4
+				 ? g->accf[q] * e->t->scale[q]
+				 : (float)g->acc[q] * a->d1 * e->t->scale[q];
 		g->weight_mb += e->weight_mb;
 	}
 	g->copy_us += now_us() - t1;
