@@ -254,24 +254,53 @@ int main(int argc, char **argv)
 	 */
 	printf("\nnibble at byte %zu, %s half (was 0x%x)\n",
 	       byte, high ? "high" : "low", high ? orig >> 4 : orig & 0xf);
-	printf("  %-4s %-10s %-14s %-8s\n", "v", "words", "delta[first]", "first");
-	for (v = 0; v < 16; v++) {
-		poke(&c, byte, high, v);
-		live0 = run(&c, cur, words);
-		if (!v) {
-			memcpy(v0, cur, (size_t)words * 4);
-			printf("  %-4u %-10s %-14s %-8s  (reference, %u live)\n",
-			       v, "-", "-", "-", live0);
-			continue;
+	printf("  %-4s %-8s %-10s %-14s %-8s\n",
+	       "v", "live", "words", "delta[first]", "first");
+	{
+		unsigned ref_live = 0;
+
+		for (v = 0; v < 16; v++) {
+			unsigned tries;
+
+			poke(&c, byte, high, v);
+			/*
+			 * ⚠ A ROW WHOSE LIVE COUNT IS NOT THE REFERENCE'S DID
+			 * NOT COMPUTE. Round 342 printed three impossible
+			 * values -- v = 3, 9 and 10, two of them sharing a
+			 * delta to the digit -- because the job timed out and
+			 * the tool still subtracted whatever was in the buffer.
+			 * Retry once, then say so rather than printing a
+			 * number that is not a measurement.
+			 */
+			for (tries = 0; tries < 2; tries++) {
+				live0 = run(&c, cur, words);
+				if (!v || live0 == ref_live)
+					break;
+			}
+			if (!v) {
+				ref_live = live0;
+				memcpy(v0, cur, (size_t)words * 4);
+				printf("  %-4u %-8u %-10s %-14s %-8s  (reference)\n",
+				       v, live0, "-", "-", "-");
+				continue;
+			}
+			changed = diff(v0, cur, words, &first, &delta);
+			if (live0 != ref_live) {
+				printf("  %-4u %-8u %-10u %-14s %-8s  DEAD ROW, "
+				       "not a measurement\n",
+				       v, live0, changed, "-", "-");
+				continue;
+			}
+			printf("  %-4u %-8u %-10u %-14lld %-8u\n", v, live0,
+			       changed, (long long)delta, first);
 		}
-		changed = diff(v0, cur, words, &first, &delta);
-		printf("  %-4u %-10u %-14lld %-8u\n", v, changed,
-		       (long long)delta, first);
 	}
 
 	/* CONTROL 2: put it back */
 	poke(&c, byte, high, high ? orig >> 4 : orig & 0xf);
 	keep = run(&c, cur, words);
+	if (!keep)
+		keep = run(&c, cur, words);   /* once, in case the block reset */
 	changed = diff(base, cur, words, &first, &delta);
 	printf("\nCONTROL restore, %u live: %u words differ%s\n", keep, changed,
 	       changed ? "  <-- the buffer or the job drifted" : "  (ok)");
