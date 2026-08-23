@@ -57,6 +57,35 @@ struct emitter {
  */
 /* the int4 paired recipe, on when CHARSIU_W4_PAIRED is set and the weights are
  * int4. One place, so the emitter and every probe agree. */
+/*
+ * WHICH PART OF THE SHARED CBUF THIS STREAM USES.
+ *
+ * Round 362, with a control that could have failed and did: two concurrent jobs
+ * on the two NPU cores corrupt each other three times in four when they carry
+ * the SAME CBUF configuration, and are clean four times in four when they carry
+ * DIFFERENT ones. Giving BOTH of them core 1's values is just as bad as giving
+ * both core 0's, which is what rules out "core 1's numbers are simply kinder".
+ *
+ * So the CBUF is shared between the cores and each concurrent job needs its own
+ * window. Note what this does NOT need: it does not matter which core gets
+ * which window, only that two jobs in flight together do not collide -- so no
+ * core selection in the uapi is required.
+ *
+ * Window 1's values are the vendor's own, read off task 17 of the capture
+ * against task 16, the same op prepared for the other core. 0x1c00 is 7168 and
+ * appears in three of them as what reads like a base offset.
+ *
+ * ⚠ 0x1040 is taken LITERALLY rather than derived. Its two halves both change,
+ * 0x1000 to 0x2c00 and 0 to 0x1c00, and one capture is not enough to say what
+ * either half means. The others are a clean substitution on charsiu's own value.
+ */
+int charsiu_cbuf_window(void)
+{
+	const char *e = getenv("CHARSIU_CBUF_WINDOW");
+
+	return e ? atoi(e) : 0;
+}
+
 int charsiu_w4_paired(const struct charsiu_matmul *mm)
 {
 	return mm->wdtype == CHARSIU_INT4 && getenv("CHARSIU_W4_PAIRED") != NULL;
@@ -642,7 +671,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * carry 0x0e in each. */
 	emit(&e, CNA, 0x1004, 0x0000000e);
 	emit(&e, CORE, 0x3004, 0x0000000e);
-	emit(&e, CNA, 0x1038, 0x00000007);
+	emit(&e, CNA, 0x1038,
+	     charsiu_cbuf_window() == 1 ? 0x0000010eu : 0x00000007u);
 	emit(&e, DPU, 0x4004, 0x0000000e);
 	emit(&e, RDMA, 0x5004, 0x0000000e);
 	/*
@@ -682,7 +712,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     (charsiu_effective_adtype(mm) == CHARSIU_FP16 ? 0x20000000u : 0u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
-	emit(&e, CNA, 0x1018, 0x40000404);
+	emit(&e, CNA, 0x1018,
+	     charsiu_cbuf_window() == 1 ? 0x4000040bu : 0x40000404u);
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
 	emit(&e, CNA, 0x1024, n_pad - 1);
@@ -705,9 +736,12 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * stream diff had left. Matched rather than reasoned about: the value is
 	 * the same both times, so the position is the only thing it can be
 	 * carrying. */
-	emit(&e, CNA, 0x1038, 0x00000007);
-	emit(&e, CNA, 0x103c, surf << 16);
-	emit(&e, CNA, 0x1040, 0x10000000);
+	emit(&e, CNA, 0x1038,
+	     charsiu_cbuf_window() == 1 ? 0x0000010eu : 0x00000007u);
+	emit(&e, CNA, 0x103c,
+	     (surf << 16) | (charsiu_cbuf_window() == 1 ? 0x1c00u : 0u));
+	emit(&e, CNA, 0x1040,
+	     charsiu_cbuf_window() == 1 ? 0x2c001c00u : 0x10000000u);
 	emit(&e, CNA, 0x1044, (1u << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);
 	emit(&e, CNA, 0x104c, 0x00010001);
@@ -815,9 +849,14 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	if (mm->wdtype == CHARSIU_INT4) {
 		unsigned r2;
+		(void)0;
+
+		int w1 = charsiu_cbuf_window() == 1;
 
 		for (r2 = 0x2810; r2 <= 0x2820; r2 += 4)
-			emit(&e, U28, r2, 0x00000000);
+			emit(&e, U28, r2,
+			     w1 && r2 == 0x2818 ? 0x1c000000u :
+			     w1 && r2 == 0x2820 ? 0x00000038u : 0x00000000u);
 	}
 
 	{

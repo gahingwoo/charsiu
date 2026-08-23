@@ -149,6 +149,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 
 unsigned charsiu_k_eff(const struct charsiu_matmul *mm);
 int charsiu_w4_paired(const struct charsiu_matmul *mm);
+int charsiu_cbuf_window(void);
 size_t charsiu_weight_bytes(const struct charsiu_matmul *mm);
 
 /* The 64 byte units one row of A occupies in the CBUF. A column costs
