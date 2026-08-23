@@ -91,6 +91,7 @@ struct charsiu_npu {
 	int w4;
 	float *fscr;
 	float *accf;
+	uint8_t *wpack;
 	struct charsiu_task *tasks;
 	uint32_t *handles;
 	unsigned nmax, kmax, max_n;
@@ -147,6 +148,28 @@ static unsigned env_u(const char *name, unsigned dflt)
  * fallback is worse than a loud failure: it produces a result that looks like
  * evidence.
  */
+/*
+ * GROUPED SCALES FOR FREE, when the K slice IS the quantisation group.
+ *
+ * charsiu already cuts K into slices and sums their accumulators, so if each
+ * slice covers exactly one group of the quantiser, the group's scale can be
+ * applied to that slice's contribution on the way in and nothing extra has to
+ * run on the hardware. Round 352's int4 sentence was English, on topic and
+ * repetitive, which is what ONE absmax scale for a whole 2048 long row does to
+ * four bits: measured offline, per channel RTN is 0.1067 relative error against
+ * group 32's 0.0666.
+ *
+ * Set CHARSIU_NPU_KMAX and CHARSIU_NPU_W4_GROUP to the same value. The
+ * condition is deliberately strict -- the slice must BE the group -- because a
+ * slice covering part of a group would need a scale per part and there is
+ * nowhere to put one.
+ */
+static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
+{
+	return g->w4 && t->kgroup && t->kgroup < t->k &&
+	       (t->k % t->kgroup) == 0 && t->kgroup == (uint64_t)g->kmax;
+}
+
 static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned n)
 {
 	if (g->whined)
@@ -240,11 +263,12 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->acc = calloc(max_n, sizeof(*g->acc));
 	g->accf = calloc(max_n, sizeof(*g->accf));
 	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
+	g->wpack = malloc((size_t)g->nmax * g->kmax + 4096);
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
 	g->handles = calloc(1 + 8 * g->max_slices, sizeof(*g->handles));
 	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->accf ||
-	    !g->fscr || !g->tasks || !g->handles)
+	    !g->fscr || !g->wpack || !g->tasks || !g->handles)
 		goto fail;
 
 	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in))
@@ -277,6 +301,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->acc);
 	free(g->accf);
 	free(g->fscr);
+	free(g->wpack);
 	free(g->tasks);
 	free(g->handles);
 	free(g);
@@ -372,8 +397,19 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 			dst[c] = g->w4 ? (uint8_t)(src[c] & 0xf)
 				       : (uint8_t)((int)src[c] + 128);
 	}
+	/*
+	 * ⚠ PACK INTO ORDINARY MEMORY AND THEN COPY, because the int4 layout
+	 * writes STRIDED into the buffer -- sixteen consecutive bytes, then a
+	 * jump of 256 -- and a buffer object's mapping does not absorb that the
+	 * way a sequential write is absorbed. Round 352 spent 101 SECONDS
+	 * staging 113 tensors this way against int8's 303 ms, at a steady
+	 * second a tensor, and int8 only escapes it because its layout is
+	 * nearly sequential. The copy afterwards is one sequential pass.
+	 */
+	memset(g->wpack, 0, charsiu_weight_bytes(&s->job.mm));
+	charsiu_pack_weights(&s->job.mm, g->scratch, g->wpack);
 	charsiu_bo_prep(g->dev, &s->wt, 1000000000);
-	charsiu_pack_weights(&s->job.mm, g->scratch, s->wt.map);
+	memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm));
 	charsiu_bo_fini(g->dev, &s->wt);
 
 	bias = calloc(n, sizeof(*bias));
@@ -602,6 +638,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		charsiu_bo_prep(g->dev, &e->out, 2000000000);
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
+		int grp = tensor_grouped(g, e->t);
+
 		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
 		for (i = 0; i < e->count; i++) {
@@ -613,8 +651,18 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			if (g->w4) {
 				const float *fo = (const float *)base;
 
-				for (unsigned j = 0; j < s->job.mm.n; j++)
-					g->accf[s->n0 + j] += fo[j];
+				if (grp) {
+					uint64_t ng = e->t->k / e->t->kgroup;
+					uint64_t gi = s->k0 / e->t->kgroup;
+
+					for (unsigned j = 0; j < s->job.mm.n; j++)
+						g->accf[s->n0 + j] += fo[j] *
+						  e->t->scale[(s->n0 + j) * ng
+							      + gi];
+				} else {
+					for (unsigned j = 0; j < s->job.mm.n; j++)
+						g->accf[s->n0 + j] += fo[j];
+				}
 				continue;
 			}
 			out = (const int32_t *)base;
@@ -675,9 +723,14 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * returns sum_k code(n,k) * a(k) in float and only the weight scale is
 	 * left. int8 took a->q1 and needs both.
 	 */
-	for (i = 0; i < (unsigned)e->t->n; i++)
-		y[i] = g->w4 ? g->accf[i] * e->t->scale[i]
+	{
+		int grp = tensor_grouped(g, e->t);
+
+		for (i = 0; i < (unsigned)e->t->n; i++)
+			y[i] = g->w4
+			     ? (grp ? g->accf[i] : g->accf[i] * e->t->scale[i])
 			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
+	}
 	return 0;
 }
 
@@ -783,6 +836,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		struct npu_entry *e = &g->ent[ids[i]];
 		const int32_t *out;
 
+		int grp = tensor_grouped(g, e->t);
+
 		memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
 		for (j = 0; j < e->count; j++) {
@@ -793,8 +848,18 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			if (g->w4) {
 				const float *fo = (const float *)base;
 
-				for (unsigned q = 0; q < s->job.mm.n; q++)
-					g->accf[s->n0 + q] += fo[q];
+				if (grp) {
+					uint64_t ng = e->t->k / e->t->kgroup;
+					uint64_t gi = s->k0 / e->t->kgroup;
+
+					for (unsigned q = 0; q < s->job.mm.n; q++)
+						g->accf[s->n0 + q] += fo[q] *
+						  e->t->scale[(s->n0 + q) * ng
+							      + gi];
+				} else {
+					for (unsigned q = 0; q < s->job.mm.n; q++)
+						g->accf[s->n0 + q] += fo[q];
+				}
 				continue;
 			}
 			out = (const int32_t *)base;
@@ -804,7 +869,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		charsiu_bo_fini(g->dev, &e->out);
 		for (unsigned q = 0; q < (unsigned)e->t->n; q++)
 			ys[i][q] = g->w4
-				 ? g->accf[q] * e->t->scale[q]
+				 ? (grp ? g->accf[q]
+				        : g->accf[q] * e->t->scale[q])
 				 : (float)g->acc[q] * a->d1 * e->t->scale[q];
 		g->weight_mb += e->weight_mb;
 	}
