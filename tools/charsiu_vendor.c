@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "charsiu.h"
 
@@ -358,6 +359,80 @@ int main(int argc, char **argv)
 				       (long long)delta, first, changed);
 			}
 		}
+	}
+
+	/*
+	 * THE CORRECTNESS CHECK, against a CPU reference rather than against a
+	 * fitted model. Round 345's slope map decoded the whole layout, and the
+	 * eight words the log printed check out on the host to one fp32 ulp.
+	 * This does the same for EVERY live word, on the board, in one arm.
+	 *
+	 *   out[n][m] = sum_k  s(n,k) * a(k,m)      in float
+	 *   weight nibble(n,k) = 32*16*(K/32)*(n/16) + 512*(k/32)
+	 *                        + 32*(n%16) + (k%32)
+	 *   activation (k,m)   = fp16 slot  8*M*(k/8) + 8*m + (k%8)
+	 *   output word (n,m)  = 4*(M*(n/4) + m) + (n%4)
+	 *
+	 * ⚠ The comparison is RELATIVE and the tolerance is one part in 1e-5,
+	 * because the board returns float32 and this sums in double. An exact
+	 * equality test here would fail on rounding and read as a wrong layout.
+	 */
+	if (getenv("CHARSIU_VERIFY")) {
+		unsigned kk, nn, mm, w, ok = 0, seen = 0, dead = 0;
+		unsigned Kd = 2048, Nd = 1024, Md = 32;
+		const uint8_t *wp;
+		const uint16_t *ap;
+		double worst = 0.0;
+
+		charsiu_vendor_stream_shape(&Kd, &Nd, NULL);
+		if (getenv("CHARSIU_VERIFY_M"))
+			Md = (unsigned)atoi(getenv("CHARSIU_VERIFY_M"));
+		printf("\nVERIFY: K=%u N=%u M=%u against a CPU reference\n",
+		       Kd, Nd, Md);
+		charsiu_bo_prep(c.dev, &c.wt, 1000000000);
+		charsiu_bo_prep(c.dev, &c.in, 1000000000);
+		wp = c.wt.map;
+		ap = c.in.map;
+		for (w = 0; w < words; w++) {
+			double acc = 0.0;
+			float got;
+
+			mm = (w / 4) % Md;
+			nn = 4 * (w / (4 * Md)) + w % 4;
+			if (nn >= Nd)
+				continue;
+			for (kk = 0; kk < Kd; kk++) {
+				size_t ni = (size_t)32 * 16 * (Kd / 32) * (nn / 16)
+					  + (size_t)512 * (kk / 32)
+					  + 32 * (nn % 16) + (kk % 32);
+				uint8_t byt = wp[ni >> 1];
+				int v = (ni & 1) ? (byt >> 4) : (byt & 0xf);
+				size_t ai = (size_t)8 * Md * (kk / 8) + 8 * mm
+					  + (kk % 8);
+
+				acc += (double)(v < 8 ? v : v - 16)
+				     * (double)charsiu_half_to_float(ap[ai]);
+			}
+			memcpy(&got, &base[w], 4);
+			if (!base[w] && acc == 0.0) { dead++; continue; }
+			seen++;
+			{
+				double d = fabs((double)got - acc)
+					 / (fabs(acc) > 1e-9 ? fabs(acc) : 1.0);
+
+				if (d > worst) worst = d;
+				if (d < 1e-5) ok++;
+				else if (seen - ok <= 4)
+					printf("  w=%-6u n=%-5u m=%-3u board %+.6f "
+					       "ref %+.6f  rel %.2e\n",
+					       w, nn, mm, got, acc, d);
+			}
+		}
+		printf("VERIFY: %u of %u words within 1e-5 relative "
+		       "(%u skipped as zero), worst %.2e\n",
+		       ok, seen, dead, worst);
+		charsiu_bo_fini(c.dev, &c.in);
+		charsiu_bo_fini(c.dev, &c.wt);
 	}
 
 	/* CONTROL 2: put it back */
