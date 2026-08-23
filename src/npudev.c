@@ -552,14 +552,28 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * MB of cache operations a token where there had been 14. That is most
 	 * of why routing the head made the model 18% SLOWER.
 	 */
-	for (unsigned d = 0; d < g->ndev; d++)
+	/*
+	 * ⚠ SIZED FOR THE SLICES THIS DEVICE ACTUALLY GETS, not for all of them.
+	 *
+	 * The slices alternate, so each device holds half of ns*ks, and
+	 * allocating both buffers at the full size doubled the cache
+	 * maintenance a matvec pays: charsiu_bo_prep and _fini work over a WHOLE
+	 * buffer object, and round 366 measured 13.4 ms a token in the readback
+	 * against 11.6 on the one device build. The output head alone is 512 KB
+	 * a buffer, so this is half a megabyte of cache operations a token
+	 * bought back for nothing.
+	 */
+	for (unsigned d = 0; d < g->ndev; d++) {
+		size_t slots = ((size_t)ns * ks + 1) / (g->ndev > 1 ? 2 : 1) + 1;
+
 		if (charsiu_bo_alloc(g->dev[d],
-				     (size_t)ns * ks * g->out_stride + 4096,
+				     slots * g->out_stride + 4096,
 				     &e->out[d])) {
 			whine(g, "an output buffer would not allocate",
 			      (unsigned)t->k, (unsigned)t->n);
 			return -1;
 		}
+	}
 
 	/*
 	 * ⚠ THE SLICES OF ONE TENSOR SPLIT TOO, not just the members of a
