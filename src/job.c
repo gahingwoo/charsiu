@@ -483,6 +483,92 @@ int charsiu_vendor_stream_shape(unsigned *k, unsigned *n, size_t *wbytes)
 	return 1;
 }
 
+/* the three addresses the replay substitutes, and nothing else */
+static void patch_addr(const struct charsiu_job *job, uint64_t *e)
+{
+	unsigned reg = (unsigned)(*e & 0xffff);
+	uint32_t val;
+
+	switch (reg) {
+	case 0x1088: val = job->input_addr;  break;
+	case 0x1110: val = job->weight_addr; break;
+	case 0x4018: val = job->output_addr; break;
+	default: return;
+	}
+	*e = (*e & ~0x0000ffffffff0000ULL) | ((uint64_t)val << 16);
+}
+
+/*
+ * MERGE: this tree's stream, carrying the vendor's VALUES.
+ *
+ * Round 343 replayed the vendor's 123 registers verbatim and the job timed out
+ * at every byte, 0 live words, four arms out of four. The reason is almost
+ * certainly that nothing enabled the units: mainline rocket's drm_rocket_task
+ * has only regcmd and regcmd_count, so there is no enable_mask for the vendor's
+ * 0xd to go in, and the vendor stream carries no 0x1d trailer of its own.
+ *
+ * So come at it from the side that is known to run. Emit charsiu's stream,
+ * overwrite every register the vendor also writes with the vendor's value, and
+ * insert the registers only the vendor writes -- the five at 0x2810 -- BEFORE
+ * the enable trailer, because they are configuration and the trailer is the go.
+ * What is left of charsiu's own is exactly the two groups the vendor does not
+ * write at all: the DPU_RDMA block and the trailer itself.
+ */
+static size_t merge_vendor_values(uint64_t *out, size_t n, size_t max)
+{
+	const char *path = getenv("CHARSIU_VENDOR_MERGE");
+	uint64_t v[512];
+	size_t got, i, j, at, added = 0, overwrote = 0;
+	FILE *f;
+
+	if (!path)
+		return n;
+	f = fopen(path, "rb");
+	if (!f) {
+		fprintf(stderr, "CHARSIU_VENDOR_MERGE: cannot open %s\n", path);
+		exit(2);
+	}
+	got = fread(v, sizeof(*v), sizeof(v) / sizeof(v[0]), f);
+	fclose(f);
+	if (!got) {
+		fprintf(stderr, "CHARSIU_VENDOR_MERGE: %s is empty\n", path);
+		exit(2);
+	}
+	/* where the enable trailer starts, so the inserts land before it */
+	at = n;
+	for (i = 0; i < n; i++)
+		if ((unsigned)(out[i] & 0xffff) == 0x1008) {
+			at = i;
+			break;
+		}
+	for (i = 0; i < got; i++) {
+		unsigned reg = (unsigned)(v[i] & 0xffff);
+		int found = 0;
+
+		/* the addresses stay OURS; only values are taken */
+		if (reg == 0x1088 || reg == 0x1110 || reg == 0x4018)
+			continue;
+		for (j = 0; j < n; j++) {
+			if ((unsigned)(out[j] & 0xffff) != reg)
+				continue;
+			if (out[j] != v[i])
+				overwrote++;
+			out[j] = v[i];
+			found = 1;
+			break;
+		}
+		if (found || n >= max)
+			continue;
+		memmove(&out[at + 1], &out[at], (n - at) * sizeof(*out));
+		out[at++] = v[i];
+		n++;
+		added++;
+	}
+	printf("MERGE: %zu vendor values applied, %zu registers inserted, "
+	       "%zu entries out\n", overwrote, added, n);
+	return n;
+}
+
 static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
 				 size_t max)
 {
@@ -493,18 +579,20 @@ static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
 		return 0;
 	printf("REGISTER STREAM: the vendor's own, %zu entries from %s\n",
 	       got, vendor_stream_path());
-	for (i = 0; i < got; i++) {
-		unsigned reg = (unsigned)(out[i] & 0xffff);
-		uint32_t val;
-
-		switch (reg) {
-		case 0x1088: val = job->input_addr;  break;
-		case 0x1110: val = job->weight_addr; break;
-		case 0x4018: val = job->output_addr; break;
-		default: continue;
-		}
-		out[i] = (out[i] & ~0x0000ffffffff0000ULL) |
-			 ((uint64_t)val << 16);
+	for (i = 0; i < got; i++)
+		patch_addr(job, &out[i]);
+	/*
+	 * CHARSIU_VENDOR_TRAILER appends the per unit op enable this tree ends
+	 * its own stream with. The vendor does not write it because their driver
+	 * puts 0xd in the task's enable_mask, and mainline rocket has no such
+	 * field -- so a verbatim replay has nothing that turns the units on, and
+	 * round 343 timed out on all four arms with zero live words.
+	 */
+	if (getenv("CHARSIU_VENDOR_TRAILER") && got + 3 <= max) {
+		out[got++] = ((uint64_t)CNA  << 48) | ((uint64_t)0x1du << 16) | 0x1008;
+		out[got++] = ((uint64_t)CORE << 48) | ((uint64_t)0x1du << 16) | 0x3008;
+		out[got++] = ((uint64_t)DPU  << 48) | ((uint64_t)0x1du << 16) | 0x4008;
+		printf("  + the 0x1d enable trailer, three units\n");
 	}
 	return got;
 }
@@ -1010,5 +1098,5 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4008, 0x0000001d);
 	emit(&e, RDMA, 0x5008, 0x0000001d);
 
-	return e.n > max ? 0 : e.n;
+	return e.n > max ? 0 : merge_vendor_values(out, e.n, max);
 }

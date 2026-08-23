@@ -163,6 +163,17 @@ int main(int argc, char **argv)
 		unsetenv("CHARSIU_VENDOR_STREAM");
 		printf("STREAM: charsiu's own, M=32 K=2048 N=1024 int4/fp16 "
 		       "(this is the CONTROL arm)\n");
+	} else if (*stream == '+') {
+		/*
+		 * "+<file>" is the MERGE arm: charsiu's stream carrying the
+		 * vendor's values. The verbatim replay timed out on all four
+		 * arms in round 343 because nothing enables the units, so this
+		 * comes at the same 20 registers from the side that runs.
+		 */
+		unsetenv("CHARSIU_VENDOR_STREAM");
+		setenv("CHARSIU_VENDOR_MERGE", stream + 1, 1);
+		printf("STREAM: charsiu's own, MERGED with the vendor's values "
+		       "from %s\n", stream + 1);
 	} else {
 		setenv("CHARSIU_VENDOR_STREAM", stream, 1);
 	}
