@@ -672,7 +672,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1004, 0x0000000e);
 	emit(&e, CORE, 0x3004, 0x0000000e);
 	emit(&e, CNA, 0x1038,
-	     charsiu_cbuf_window() == 1 ? 0x0000010eu : 0x00000007u);
+	     job->cbuf_window == 1 ? 0x0000010eu : 0x00000007u);
 	emit(&e, DPU, 0x4004, 0x0000000e);
 	emit(&e, RDMA, 0x5004, 0x0000000e);
 	/*
@@ -713,7 +713,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
 	emit(&e, CNA, 0x1018,
-	     charsiu_cbuf_window() == 1 ? 0x4000040bu : 0x40000404u);
+	     job->cbuf_window == 1 ? 0x4000040bu : 0x40000404u);
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
 	emit(&e, CNA, 0x1024, n_pad - 1);
@@ -737,11 +737,11 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * the same both times, so the position is the only thing it can be
 	 * carrying. */
 	emit(&e, CNA, 0x1038,
-	     charsiu_cbuf_window() == 1 ? 0x0000010eu : 0x00000007u);
+	     job->cbuf_window == 1 ? 0x0000010eu : 0x00000007u);
 	emit(&e, CNA, 0x103c,
-	     (surf << 16) | (charsiu_cbuf_window() == 1 ? 0x1c00u : 0u));
+	     (surf << 16) | (job->cbuf_window == 1 ? 0x1c00u : 0u));
 	emit(&e, CNA, 0x1040,
-	     charsiu_cbuf_window() == 1 ? 0x2c001c00u : 0x10000000u);
+	     job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u);
 	emit(&e, CNA, 0x1044, (1u << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);
 	emit(&e, CNA, 0x104c, 0x00010001);
@@ -851,7 +851,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		unsigned r2;
 		(void)0;
 
-		int w1 = charsiu_cbuf_window() == 1;
+		int w1 = job->cbuf_window == 1;
 
 		for (r2 = 0x2810; r2 <= 0x2820; r2 += 4)
 			emit(&e, U28, r2,

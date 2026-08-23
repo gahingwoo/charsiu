@@ -57,6 +57,7 @@ struct npu_slot {
 	unsigned nreg;
 	unsigned n0, k0;           /* where this slice starts in the tensor */
 	unsigned out_slot;         /* which output region it writes */
+	unsigned di;               /* which device its buffers live on */
 };
 
 struct npu_entry {
@@ -64,12 +65,29 @@ struct npu_entry {
 	struct charsiu_bo out;     /* ITS OWN, sized for ITS slices */
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
+	unsigned di;               /* which device, and so which CBUF window */
 	double weight_mb;
 };
 
 struct charsiu_npu {
-	struct charsiu_device *dev;
-	struct charsiu_bo in;
+	/*
+	 * TWO DEVICES, BECAUSE TWO OPEN FILES ARE WHAT REACH TWO CORES.
+	 *
+	 * rocket gives every open DRM file its own drm_sched_entity, built over
+	 * the list of every core, and an entity runs one job at a time. One file
+	 * therefore never uses more than one core no matter how deep the queue.
+	 *
+	 * The two cores share the CBUF, so the two devices also carry different
+	 * CBUF windows -- round 363: six concurrent processes on split windows,
+	 * every one 1024 of 1024 exact, against three of four corrupt when they
+	 * share a window.
+	 *
+	 * CHARSIU_NPU_ONEDEV puts it back to a single device, which is the
+	 * control for every number this buys.
+	 */
+	struct charsiu_device *dev[2];
+	unsigned ndev;
+	struct charsiu_bo in[2];      /* one per device: they cannot be shared */
 	unsigned in_stride, out_stride, max_slices, maxtask;
 	uint8_t *scratch;
 	int32_t *acc;
@@ -195,8 +213,17 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 
 	if (!g)
 		return NULL;
-	g->dev = charsiu_open("/dev/accel/accel0");
-	if (!g->dev) {
+	g->dev[0] = charsiu_open("/dev/accel/accel0");
+	g->ndev = 1;
+	if (g->dev[0] && !getenv("CHARSIU_NPU_ONEDEV")) {
+		g->dev[1] = charsiu_open("/dev/accel/accel0");
+		if (g->dev[1])
+			g->ndev = 2;
+		else
+			fprintf(stderr, "charsiu: only one NPU file could be "
+				"opened; the second core stays idle\n");
+	}
+	if (!g->dev[0]) {
 		free(g);
 		return NULL;
 	}
@@ -282,8 +309,12 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	    !g->fscr || !g->wpack || !g->asum || !g->tasks || !g->handles)
 		goto fail;
 
-	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in))
-		goto fail;
+	/* one activation buffer per device: a buffer object belongs to the file
+	 * that made it, so the two cannot share one */
+	for (unsigned d = 0; d < g->ndev; d++)
+		if (charsiu_bo_alloc(g->dev[d],
+				     (size_t)g->in_stride * ks + 4096, &g->in[d]))
+			goto fail;
 	return g;
 
 fail:
@@ -295,16 +326,20 @@ void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
-	if (g->dev) {
+	if (g->dev[0]) {
 		for (unsigned i = 0; i < g->n_slot; i++) {
-			charsiu_bo_free(g->dev, &g->slot[i].wt);
-			charsiu_bo_free(g->dev, &g->slot[i].coef);
-			charsiu_bo_free(g->dev, &g->slot[i].regcmd);
+			unsigned d = g->slot[i].di;
+
+			charsiu_bo_free(g->dev[d], &g->slot[i].wt);
+			charsiu_bo_free(g->dev[d], &g->slot[i].coef);
+			charsiu_bo_free(g->dev[d], &g->slot[i].regcmd);
 		}
 		for (unsigned i = 0; i < g->n_ent; i++)
-			charsiu_bo_free(g->dev, &g->ent[i].out);
-		charsiu_bo_free(g->dev, &g->in);
-		charsiu_close(g->dev);
+			charsiu_bo_free(g->dev[g->ent[i].di], &g->ent[i].out);
+		for (unsigned d = 0; d < g->ndev; d++) {
+			charsiu_bo_free(g->dev[d], &g->in[d]);
+			charsiu_close(g->dev[d]);
+		}
 	}
 	free(g->slot);
 	free(g->ent);
@@ -358,7 +393,8 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 }
 
 /* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t, writing region si. */
-static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
+static int add_slice(struct charsiu_npu *g, unsigned di,
+		     const struct npu_tensor *t,
 		     unsigned n0, unsigned n, unsigned k0, unsigned k,
 		     unsigned ki, unsigned si, uint32_t out_base)
 {
@@ -370,6 +406,10 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	s->n0 = n0;
 	s->k0 = k0;
 	s->out_slot = si;
+	s->di = di;
+	/* the two cores share the CBUF, so the two devices take different
+	 * windows -- see charsiu_job.cbuf_window */
+	s->job.cbuf_window = di;
 	s->job.mm.m = 1;
 	s->job.mm.k = k;
 	s->job.mm.n = n;
@@ -383,15 +423,15 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	s->job.output_scale = 1.0f;
 	s->job.acc_out = 1;
 
-	if (charsiu_bo_alloc(g->dev, charsiu_weight_bytes(&s->job.mm) + 4096, &s->wt) ||
-	    charsiu_bo_alloc(g->dev, charsiu_coef_bytes(&s->job.mm) + 4096, &s->coef) ||
-	    charsiu_bo_alloc(g->dev, 4096, &s->regcmd)) {
+	if (charsiu_bo_alloc(g->dev[di], charsiu_weight_bytes(&s->job.mm) + 4096, &s->wt) ||
+	    charsiu_bo_alloc(g->dev[di], charsiu_coef_bytes(&s->job.mm) + 4096, &s->coef) ||
+	    charsiu_bo_alloc(g->dev[di], 4096, &s->regcmd)) {
 		whine(g, "a buffer would not allocate", k, n);
 		goto out;
 	}
 
 	/* its own slot in each shared buffer, baked into the stream */
-	s->job.input_addr = (uint32_t)g->in.dma_address + ki * g->in_stride;
+	s->job.input_addr = (uint32_t)g->in[di].dma_address + ki * g->in_stride;
 	s->job.output_addr = out_base + si * g->out_stride;
 	s->job.weight_addr = (uint32_t)s->wt.dma_address;
 	s->job.coef_addr = (uint32_t)s->coef.dma_address;
@@ -420,9 +460,9 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	 */
 	memset(g->wpack, 0, charsiu_weight_bytes(&s->job.mm));
 	charsiu_pack_weights(&s->job.mm, g->scratch, g->wpack);
-	charsiu_bo_prep(g->dev, &s->wt, 1000000000);
+	charsiu_bo_prep(g->dev[di], &s->wt, 1000000000);
 	memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm));
-	charsiu_bo_fini(g->dev, &s->wt);
+	charsiu_bo_fini(g->dev[di], &s->wt);
 
 	bias = calloc(n, sizeof(*bias));
 	wsum = calloc(n, sizeof(*wsum));
@@ -446,14 +486,14 @@ static int add_slice(struct charsiu_npu *g, const struct npu_tensor *t,
 	 * that domain, so adding it here would only corrupt the sum.
 	 */
 	setenv("CHARSIU_NO_LIFT", "1", 1);
-	charsiu_bo_prep(g->dev, &s->coef, 1000000000);
+	charsiu_bo_prep(g->dev[di], &s->coef, 1000000000);
 	charsiu_build_coefs(&s->job, bias, wsum, s->coef.map);
-	charsiu_bo_fini(g->dev, &s->coef);
+	charsiu_bo_fini(g->dev[di], &s->coef);
 	unsetenv("CHARSIU_NO_LIFT");
 
-	charsiu_bo_prep(g->dev, &s->regcmd, 1000000000);
+	charsiu_bo_prep(g->dev[di], &s->regcmd, 1000000000);
 	s->nreg = (unsigned)charsiu_emit_job(&s->job, s->regcmd.map, 4096 / 8);
-	charsiu_bo_fini(g->dev, &s->regcmd);
+	charsiu_bo_fini(g->dev[di], &s->regcmd);
 	if (!s->nreg) {
 		whine(g, "the register stream came back empty", k, n);
 		goto out;
@@ -503,6 +543,12 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e = &g->ent[g->n_ent];
 	memset(e, 0, sizeof(*e));
 	/*
+	 * Alternate. A group is q, k, v or gate, up -- consecutive adds -- so
+	 * alternating puts a group's members on different devices, which is
+	 * exactly where the overlap has to come from.
+	 */
+	e->di = g->ndev > 1 ? (g->n_ent & 1) : 0;
+	/*
 	 * ⚠ ITS OWN OUTPUT BUFFER, AND THIS IS NOT TIDINESS.
 	 *
 	 * One shared buffer had to be sized for the WIDEST tensor, and round
@@ -512,7 +558,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * MB of cache operations a token where there had been 14. That is most
 	 * of why routing the head made the model 18% SLOWER.
 	 */
-	if (charsiu_bo_alloc(g->dev, (size_t)ns * ks * g->out_stride + 4096,
+	if (charsiu_bo_alloc(g->dev[e->di], (size_t)ns * ks * g->out_stride + 4096,
 			     &e->out)) {
 		whine(g, "an output buffer would not allocate", (unsigned)t->k,
 		      (unsigned)t->n);
@@ -529,7 +575,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			unsigned n = (unsigned)(t->n - n0) < g->nmax
 				   ? (unsigned)(t->n - n0) : g->nmax;
 
-			if (add_slice(g, t, n0, n, k0, k, ki, si,
+			if (add_slice(g, e->di, t, n0, n, k0, k, ki, si,
 				      (uint32_t)e->out.dma_address) < 0) {
 				g->n_slot = first;
 				return -1;
@@ -600,7 +646,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	}
 
 	/* every K slice's activation, each in its own region */
-	charsiu_bo_prep(g->dev, &g->in, 1000000000);
+	charsiu_bo_prep(g->dev[e->di], &g->in[e->di], 1000000000);
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
@@ -614,7 +660,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			/* the half step of the midrise grid rides on this */
 			g->asum[ki] = as;
 			charsiu_pack_input_f16(&s->job.mm, g->fscr,
-					       (uint8_t *)g->in.map
+					       (uint8_t *)g->in[e->di].map
 					       + ki * g->in_stride,
 					       g->in_stride);
 		} else {
@@ -622,13 +668,13 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i]
 							  + 128);
 			charsiu_pack_input(&s->job.mm, g->scratch,
-					   (uint8_t *)g->in.map
+					   (uint8_t *)g->in[e->di].map
 					   + ki * g->in_stride,
 					   g->in_stride,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev, &g->in);
+	charsiu_bo_fini(g->dev[e->di], &g->in[e->di]);
 
 	/*
 	 * ONE submit for the whole projection, unless a cap says otherwise.
@@ -650,7 +696,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			unsigned nt = e->count - base < per ? e->count - base : per;
 
 			nh = 0;
-			g->handles[nh++] = g->in.handle;
+			g->handles[nh++] = g->in[e->di].handle;
 			for (i = 0; i < nt; i++) {
 				const struct npu_slot *s = &g->slot[e->first + base + i];
 
@@ -667,7 +713,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			jl.out_handles = &e->out.handle;
 			jl.out_count = 1;
 
-			if (charsiu_submit_jobs(g->dev, &jl, 1)) {
+			if (charsiu_submit_jobs(g->dev[e->di], &jl, 1)) {
 				g->strikes = 3;
 				break;
 			}
@@ -679,7 +725,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	if (g->strikes < 3) {
 		double t1 = now_us();
 
-		charsiu_bo_prep(g->dev, &e->out, 2000000000);
+		charsiu_bo_prep(g->dev[e->di], &e->out, 2000000000);
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
 		int grp = tensor_grouped(g, e->t);
@@ -717,7 +763,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
-		charsiu_bo_fini(g->dev, &e->out);
+		charsiu_bo_fini(g->dev[e->di], &e->out);
 		g->copy_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
 		g->busy_us += now_us() - t0;
@@ -821,8 +867,23 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	if ((unsigned)a->n != e0->t->k)
 		return -1;
 
-	/* the activation, once, for every K slice */
-	charsiu_bo_prep(g->dev, &g->in, 1000000000);
+	/*
+	 * The activation, once for every K slice, INTO EVERY DEVICE THE GROUP
+	 * USES. A group shares one input vector but its entries may sit on
+	 * different devices, and a buffer object belongs to the file that
+	 * created it. Packing it twice is a few kilobytes against the megabytes
+	 * of weights each submit fetches.
+	 */
+	{
+	unsigned nd = 0, dmask = 0;
+
+	for (i = 0; i < n; i++)
+		dmask |= 1u << g->ent[ids[i]].di;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		if (!(dmask & (1u << d)))
+			continue;
+		nd++;
+	charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
 
@@ -836,7 +897,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			/* the half step of the midrise grid rides on this */
 			g->asum[ki] = as;
 			charsiu_pack_input_f16(&s->job.mm, g->fscr,
-					       (uint8_t *)g->in.map
+					       (uint8_t *)g->in[d].map
 					       + ki * g->in_stride,
 					       g->in_stride);
 		} else {
@@ -844,51 +905,79 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i]
 							  + 128);
 			charsiu_pack_input(&s->job.mm, g->scratch,
-					   (uint8_t *)g->in.map
+					   (uint8_t *)g->in[d].map
 					   + ki * g->in_stride,
 					   g->in_stride,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev, &g->in);
-
-	g->handles[nh++] = g->in.handle;
-	for (i = 0; i < n; i++) {
-		struct npu_entry *e = &g->ent[ids[i]];
-
-		outh[i] = e->out.handle;
-		for (j = 0; j < e->count; j++) {
-			const struct npu_slot *s = &g->slot[e->first + j];
-
-			if (ntask >= 4 * g->max_slices)
-				return -1;
-			g->tasks[ntask].regcmd = (uint32_t)s->regcmd.dma_address;
-			g->tasks[ntask].regcmd_count = s->nreg;
-			ntask++;
-			g->handles[nh++] = s->wt.handle;
-			g->handles[nh++] = s->coef.handle;
-		}
+	charsiu_bo_fini(g->dev[d], &g->in[d]);
 	}
-	jl.tasks = g->tasks;
-	jl.task_count = ntask;
-	jl.in_handles = g->handles;
-	jl.in_count = nh;
-	jl.out_handles = outh;
-	jl.out_count = n;
+	(void)nd;
+	}
 
+	/*
+	 * ONE JOBLIST PER DEVICE, BOTH SUBMITTED BEFORE EITHER IS WAITED ON.
+	 *
+	 * This is the whole point of the second file. Submitting is a queueing
+	 * ioctl and the fence is waited separately, so issuing device 0's work
+	 * and then device 1's leaves both cores running at once without a
+	 * thread anywhere.
+	 *
+	 * Round 356 put 89 ms of a 117 ms token inside the fence, so this is
+	 * the only place in the decode where a second core can be worth
+	 * anything.
+	 */
 	t0 = now_us();
-	if (charsiu_submit_jobs(g->dev, &jl, 1)) {
-		g->strikes = 3;
-		g->dead = 1;
-		fprintf(stderr, "charsiu: a %u task group submit failed\n", ntask);
-		return -1;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned no = 0;
+
+		nh = 0;
+		ntask = 0;
+		g->handles[nh++] = g->in[d].handle;
+		for (i = 0; i < n; i++) {
+			struct npu_entry *e = &g->ent[ids[i]];
+
+			if (e->di != d)
+				continue;
+			outh[no++] = e->out.handle;
+			for (j = 0; j < e->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[e->first + j];
+
+				if (ntask >= 4 * g->max_slices)
+					return -1;
+				g->tasks[ntask].regcmd =
+					(uint32_t)s->regcmd.dma_address;
+				g->tasks[ntask].regcmd_count = s->nreg;
+				ntask++;
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+			}
+		}
+		if (!no)
+			continue;
+		jl.tasks = g->tasks;
+		jl.task_count = ntask;
+		jl.in_handles = g->handles;
+		jl.in_count = nh;
+		jl.out_handles = outh;
+		jl.out_count = no;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			g->dead = 1;
+			fprintf(stderr, "charsiu: a %u task group submit "
+				"failed on device %u\n", ntask, d);
+			return -1;
+		}
+		g->submits++;
 	}
-	g->submits++;
 	g->submit_us += now_us() - t0;
 
 	t1 = now_us();
 	for (i = 0; i < n; i++)
-		charsiu_bo_prep(g->dev, &g->ent[ids[i]].out, 2000000000);
+		charsiu_bo_prep(g->dev[g->ent[ids[i]].di],
+				&g->ent[ids[i]].out, 2000000000);
 	g->fence_us += now_us() - t1;
 
 	t1 = now_us();
@@ -930,7 +1019,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			for (unsigned q = 0; q < s->job.mm.n; q++)
 				g->acc[s->n0 + q] += out[q];
 		}
-		charsiu_bo_fini(g->dev, &e->out);
+		charsiu_bo_fini(g->dev[e->di], &e->out);
 		{
 			double hsu = 0.0;
 

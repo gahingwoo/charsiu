@@ -485,6 +485,7 @@ int main(int argc, char **argv)
 	size_t nreg;
 	int ret;
 
+	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = argc > 1 ? (unsigned)atoi(argv[1]) : 1;
 	job.mm.k = argc > 2 ? (unsigned)atoi(argv[2]) : 64;
 	job.mm.n = argc > 3 ? (unsigned)atoi(argv[3]) : 64;

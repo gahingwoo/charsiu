@@ -53,6 +53,7 @@ int main(int argc, char **argv)
 	const char *mask = getenv("CHARSIU_WIDE8");
 
 	memset(&job, 0, sizeof(job));
+	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = m;
 	job.mm.k = k;
 	job.mm.n = n;

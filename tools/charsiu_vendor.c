@@ -253,6 +253,7 @@ int main(int argc, char **argv)
 	 * slot collapses to k and the output word to n. So the mode has to be
 	 * asked the question at M = 1 rather than assumed to survive it.
 	 */
+	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = getenv("CHARSIU_M") ? (unsigned)atoi(getenv("CHARSIU_M")) : 32;
 	job.mm.k = getenv("CHARSIU_K") ? (unsigned)atoi(getenv("CHARSIU_K")) : 2048;
 	job.mm.n = getenv("CHARSIU_N") ? (unsigned)atoi(getenv("CHARSIU_N")) : 1024;

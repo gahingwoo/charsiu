@@ -208,6 +208,21 @@ struct charsiu_job {
 	int output_zero_point;
 
 	/*
+	 * WHICH PART OF THE SHARED CBUF THIS JOB USES, 0 or 1.
+	 *
+	 * The two NPU cores share the CBUF. Round 363: two concurrent jobs are
+	 * byte exact and repeatable when they carry DIFFERENT windows -- six
+	 * processes, 1024 of 1024 each, worst 0.00e+00 -- and corrupt each
+	 * other when they carry the same one, on either core's values.
+	 *
+	 * It is a field rather than an environment variable because one process
+	 * has to be able to hold both at once, which is the whole point.
+	 * charsiu_cbuf_window() is still the default for tools that only ever
+	 * want one.
+	 */
+	unsigned cbuf_window;
+
+	/*
 	 * The output is the RAW SIGNED 32 BIT ACCUMULATOR, four bytes an
 	 * element, not a byte requantised through the coefficient buffer.
 	 *

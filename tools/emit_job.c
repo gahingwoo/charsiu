@@ -16,6 +16,7 @@ int main(int argc, char **argv)
 	uint64_t buf[512];
 	size_t n, i;
 
+	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = argc > 1 ? (unsigned)atoi(argv[1]) : 1;
 	job.mm.k = argc > 2 ? (unsigned)atoi(argv[2]) : 64;
 	job.mm.n = argc > 3 ? (unsigned)atoi(argv[3]) : 64;
