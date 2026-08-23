@@ -89,6 +89,14 @@ struct charsiu_npu {
 	 * entirely, which is 10.1 ms of a 153 ms token on the CPU side.
 	 */
 	int w4;
+	/*
+	 * CHARSIU_NPU_W4_MIDRISE: the vendor's grid, w = (s + 0.5) * d, with no
+	 * code for zero. The hardware still computes sum(s * a), so the half
+	 * step is 0.5 * d * sum(a) -- one number per K slice per token, shared
+	 * by every output channel, which is why it is nearly free here.
+	 */
+	int midrise;
+	double *asum;      /* per K slice, the sum of the activation */
 	float *fscr;
 	float *accf;
 	uint8_t *wpack;
@@ -242,6 +250,7 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->ent_cap = max_tensors;
 
 	g->w4 = getenv("CHARSIU_NPU_W4V") != NULL;
+	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	g->max_slices = ns * ks;
@@ -265,11 +274,12 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->accf = calloc(max_n, sizeof(*g->accf));
 	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
 	g->wpack = malloc((size_t)g->nmax * g->kmax + 4096);
+	g->asum = calloc(ks ? ks : 1, sizeof(*g->asum));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
 	g->handles = calloc(1 + 8 * g->max_slices, sizeof(*g->handles));
 	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->accf ||
-	    !g->fscr || !g->wpack || !g->tasks || !g->handles)
+	    !g->fscr || !g->wpack || !g->asum || !g->tasks || !g->handles)
 		goto fail;
 
 	if (charsiu_bo_alloc(g->dev, (size_t)g->in_stride * ks + 4096, &g->in))
@@ -303,6 +313,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->accf);
 	free(g->fscr);
 	free(g->wpack);
+	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
 	free(g);
@@ -532,7 +543,16 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e->count = ns * ks;
 	e->n_slices = ns;
 	e->k_slices = ks;
-	e->weight_mb = (double)t->n * (double)t->k / 1e6;
+	/*
+	 * ⚠ BYTES, NOT ELEMENTS. This counted n*k for both precisions, so every
+	 * "GB/s of weights" this project has printed for int4 was DOUBLE the
+	 * real figure -- 13.4 GB/s in round 356's log is 6.7. int8 was right by
+	 * accident, one byte an element. The honest comparison is int4 at 6.7
+	 * GB/s against int8's 9.46, which is what it looked like from the
+	 * outside and what the shape sweep said.
+	 */
+	e->weight_mb = (double)t->n * (double)t->k
+		     / (g->w4 ? 2.0 : 1.0) / 1e6;
 	/*
 	 * A HEARTBEAT WHILE THE WEIGHTS ARE STAGED. Round 352's int4 arm printed
 	 * nothing for minutes and there was no way to tell a slow load from a
@@ -585,8 +605,14 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
 		if (g->w4) {
-			for (i = 0; i < s->job.mm.k; i++)
+			double as = 0.0;
+
+			for (i = 0; i < s->job.mm.k; i++) {
 				g->fscr[i] = a->f[s->k0 + i];
+				as += (double)g->fscr[i];
+			}
+			/* the half step of the midrise grid rides on this */
+			g->asum[ki] = as;
 			charsiu_pack_input_f16(&s->job.mm, g->fscr,
 					       (uint8_t *)g->in.map
 					       + ki * g->in_stride,
@@ -672,11 +698,15 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				if (grp) {
 					uint64_t ng = e->t->k / e->t->kgroup;
 					uint64_t gi = s->k0 / e->t->kgroup;
+					double hs = g->midrise
+						  ? 0.5 * g->asum[s->k0 / g->kmax]
+						  : 0.0;
 
 					for (unsigned j = 0; j < s->job.mm.n; j++)
-						g->accf[s->n0 + j] += fo[j] *
-						  e->t->scale[(s->n0 + j) * ng
-							      + gi];
+						g->accf[s->n0 + j] +=
+						  (float)((fo[j] + hs) *
+						   e->t->scale[(s->n0 + j) * ng
+							       + gi]);
 				} else {
 					for (unsigned j = 0; j < s->job.mm.n; j++)
 						g->accf[s->n0 + j] += fo[j];
@@ -743,10 +773,16 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 */
 	{
 		int grp = tensor_grouped(g, e->t);
+		double hs = 0.0;
 
+		if (g->midrise && !grp)
+			for (unsigned ki = 0; ki < e->k_slices; ki++)
+				hs += 0.5 * g->asum[ki];
 		for (i = 0; i < (unsigned)e->t->n; i++)
 			y[i] = g->w4
-			     ? (grp ? g->accf[i] : g->accf[i] * e->t->scale[i])
+			     ? (grp ? g->accf[i]
+				    : (float)(((double)g->accf[i] + hs)
+					      * e->t->scale[i]))
 			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
 	}
 	return 0;
@@ -791,8 +827,14 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
 
 		if (g->w4) {
-			for (i = 0; i < s->job.mm.k; i++)
+			double as = 0.0;
+
+			for (i = 0; i < s->job.mm.k; i++) {
 				g->fscr[i] = a->f[s->k0 + i];
+				as += (double)g->fscr[i];
+			}
+			/* the half step of the midrise grid rides on this */
+			g->asum[ki] = as;
 			charsiu_pack_input_f16(&s->job.mm, g->fscr,
 					       (uint8_t *)g->in.map
 					       + ki * g->in_stride,
@@ -869,11 +911,15 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				if (grp) {
 					uint64_t ng = e->t->k / e->t->kgroup;
 					uint64_t gi = s->k0 / e->t->kgroup;
+					double hs = g->midrise
+						  ? 0.5 * g->asum[s->k0 / g->kmax]
+						  : 0.0;
 
 					for (unsigned q = 0; q < s->job.mm.n; q++)
-						g->accf[s->n0 + q] += fo[q] *
-						  e->t->scale[(s->n0 + q) * ng
-							      + gi];
+						g->accf[s->n0 + q] +=
+						  (float)((fo[q] + hs) *
+						   e->t->scale[(s->n0 + q) * ng
+							       + gi]);
 				} else {
 					for (unsigned q = 0; q < s->job.mm.n; q++)
 						g->accf[s->n0 + q] += fo[q];
@@ -885,11 +931,20 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				g->acc[s->n0 + q] += out[q];
 		}
 		charsiu_bo_fini(g->dev, &e->out);
-		for (unsigned q = 0; q < (unsigned)e->t->n; q++)
-			ys[i][q] = g->w4
-				 ? (grp ? g->accf[q]
-				        : g->accf[q] * e->t->scale[q])
-				 : (float)g->acc[q] * a->d1 * e->t->scale[q];
+		{
+			double hsu = 0.0;
+
+			if (g->midrise && !grp)
+				for (unsigned ki = 0; ki < e->k_slices; ki++)
+					hsu += 0.5 * g->asum[ki];
+			for (unsigned q = 0; q < (unsigned)e->t->n; q++)
+				ys[i][q] = g->w4
+					 ? (grp ? g->accf[q]
+					        : (float)(((double)g->accf[q]
+						   + hsu) * e->t->scale[q]))
+					 : (float)g->acc[q] * a->d1
+					   * e->t->scale[q];
+		}
 		g->weight_mb += e->weight_mb;
 	}
 	g->copy_us += now_us() - t1;

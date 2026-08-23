@@ -57,11 +57,21 @@
  * The nibbles are packed two to a byte on the way out, so an int4 cache is half
  * the size of the codes in memory and half the size of the gguf it replaces.
  */
+/* one getenv, cached: this is asked inside loops over the whole tensor */
+static int midrise_grid(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
+	return v;
+}
+
 #define WCACHE_MAGIC  0x43535743u        /* "CSWC" */
 #define WCACHE_FORMAT 1u
 /* ⚠ BUMP THIS whenever the quantiser's arithmetic changes, or an old cache
  * will quietly feed the new code the old numbers. */
-#define WCACHE_QUANT  1u
+#define WCACHE_QUANT  2u
 
 struct wcache_head {
 	uint32_t magic, format, quant, bits;
@@ -92,7 +102,8 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 	want.format = WCACHE_FORMAT;
 	want.quant = WCACHE_QUANT;
 	want.bits = bits;
-	want.group = grp;
+	/* the grid is part of what the codes mean, so it is part of the key */
+	want.group = grp | (midrise_grid() ? (1ull << 63) : 0);
 	snprintf(want.stamp, sizeof(want.stamp), "%s", stamp ? stamp : "");
 
 	wc.f = fopen(path, "rb");
@@ -291,6 +302,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	const int w4sym = getenv("CHARSIU_NPU_W4_SYM") != NULL;
 	const int w4clip = getenv("CHARSIU_NPU_W4_CLIP") != NULL;
 	const int rms = getenv("CHARSIU_NPU_RMS") != NULL;
+	const int midrise = midrise_grid();
 	uint64_t ngrp;
 	float qmax = bits == 4 ? 7.0f : 127.0f;
 
@@ -461,7 +473,55 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * quantiser being compared against a sixteen level one.
 		 * CHARSIU_NPU_W4_SYM restores the symmetric version.
 		 */
-		if (bits == 4 && !w4sym) {
+		if (bits == 4 && midrise) {
+			/*
+			 * THE VENDOR'S GRID, and it has no code for zero.
+			 *
+			 * Their weight bytes, read straight out of the capture,
+			 * are symmetric under u -> ~u: counts 232704 at code 0
+			 * against 231852 at code 15, 152658 at 1 against 156566
+			 * at 14, all the way in. Read as two's complement s the
+			 * mean is -0.5; read as s + 0.5 it is -0.026, and three
+			 * separate megabytes agree. So their levels are
+			 * +-0.5, +-1.5 ... +-7.5 times a step: sixteen levels
+			 * used symmetrically, with no code spent on an exact
+			 * zero that a Gaussian almost never lands on.
+			 *
+			 * w = (s + 0.5) * d, so d is the largest magnitude over
+			 * 7.5 and s = w/d - 0.5 rounded. The hardware computes
+			 * sum(s * a) either way; the half step becomes
+			 * 0.5 * d * sum(a), one number a channel a token, which
+			 * npudev adds at the accumulate.
+			 *
+			 * ⛔ AND IT MEASURED WORSE, so it is OFF by default and
+			 * kept only as the record of a refuted idea. On the
+			 * host with the real model:
+			 *
+			 *   RTN     g2048  "Paris is the most populous city...
+			 *                   most famous... most beautiful"
+			 *   MIDRISE g2048  "a property property one time
+			 *                   around. I can make it happen"
+			 *   RTN     g1024  "The Eiffel Tower... The Louvre
+			 *                   Museum... The Mona Lisa"
+			 *   MIDRISE g1024  "the total number of employees of
+			 *                   the company is the total number"
+			 *
+			 * ⚠ AND THE NEGATIVE WAS PREDICTABLE, which is the part
+			 * worth remembering. A grid with no zero forces every
+			 * near zero weight to +-0.5d, and network weights are
+			 * strongly peaked at zero, so midtread beats midrise on
+			 * exactly this kind of distribution. I reasoned from
+			 * "the vendor's histogram is symmetric, so their grid
+			 * must be better" and had the implication backwards.
+			 *
+			 * Their histogram is still symmetric about the 15/0
+			 * boundary. That is as consistent with a CALIBRATED
+			 * quantiser whose codes come out shifted as it is with
+			 * a midrise grid, and the calibrated reading is the one
+			 * that also explains their quality at one scale a row.
+			 */
+			d = amax / 7.5f;
+		} else if (bits == 4 && !w4sym) {
 			d = vmax / -8.0f;
 			/*
 			 * ⚠ absmax IS THE WRONG SCALE FOR FOUR BITS, and it is
@@ -518,9 +578,11 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		t->scale[r * ngrp + g] = d;
 
 		for (uint64_t i = lo; i < hi; i++) {
-			int v = (int)lrintf(row[i] * id);
+			int v = (int)lrintf(midrise && bits == 4
+					    ? row[i] * id - 0.5f
+					    : row[i] * id);
 
-			if (bits == 4 && !w4sym) {
+			if (bits == 4 && (!w4sym || midrise)) {
 				if (v > 7) v = 7;
 				if (v < -8) v = -8;
 			} else {
@@ -541,7 +603,9 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			 * want it.
 			 */
 			if (rms) {
-				double e = (double)row[i] - (double)v * d;
+				double e = (double)row[i]
+					 - ((double)v + (midrise && bits == 4
+							 ? 0.5 : 0.0)) * d;
 
 				se += e * e;
 				sw += (double)row[i] * (double)row[i];
@@ -789,6 +853,8 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 					if (t->kscale)
 						av *= t->kscale[i];
 					part += (double)t->q[n * t->k + i] * av;
+					if (midrise_grid())
+						part += 0.5 * av;
 				}
 				acc += part * t->scale[n * ngrp + g];
 			}
@@ -799,9 +865,26 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		for (uint64_t g = 0; g < ngrp; g++) {
 			uint64_t lo = g * grp;
 			uint64_t len = lo + grp < t->k ? grp : t->k - lo;
+			double part = (double)idot(t->q + n * t->k + lo,
+						   aq + lo, len);
 
-			acc += (double)idot(t->q + n * t->k + lo, aq + lo,
-					    len) * t->scale[n * ngrp + g];
+			/*
+			 * ⚠ THE MIDRISE HALF STEP BELONGS HERE TOO. This is the
+			 * CPU reference for the same weights, and it computed
+			 * sum(s * a) while scaling by a d that means
+			 * w = (s + 0.5) * d. The first host test of the grid
+			 * produced nothing but <|begin_of_text|> because of it,
+			 * which is what a reference that disagrees with its own
+			 * quantiser looks like.
+			 */
+			if (midrise_grid()) {
+				double as = 0.0;
+
+				for (uint64_t i = lo; i < lo + len; i++)
+					as += (double)aq[i];
+				part += 0.5 * as;
+			}
+			acc += part * t->scale[n * ngrp + g];
 		}
 		y[n] = (float)(acc * ad);
 		free(free_after);
