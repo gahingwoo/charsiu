@@ -42,7 +42,7 @@ $(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
        $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64 \
-       $(BUILD)/charsiu_wide.aarch64
+       $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64
 
 $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^
@@ -55,6 +55,9 @@ $(BUILD)/charsiu_bench.aarch64: tools/charsiu_bench.c $(SRC) | $(BUILD)
 
 $(BUILD)/charsiu_int4.aarch64: tools/charsiu_int4.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
+$(BUILD)/charsiu_vendor.aarch64: tools/charsiu_vendor.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/charsiu_wide.aarch64: tools/charsiu_wide.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm

@@ -226,6 +226,7 @@ struct charsiu_job {
 
 /* The whole stream, addresses and requant included. */
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max);
+int charsiu_vendor_stream_shape(unsigned *k, unsigned *n, size_t *wbytes);
 
 /* Build the coefficient buffer the DPU reads: the per channel A/B/C records,
  * the fp16 scale table, and the second operand word after it. Without it the

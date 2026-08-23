@@ -19,6 +19,7 @@
  * ic = K, and never depthwise.
  */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -396,8 +397,122 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 
 /* ---- the stream ----------------------------------------------------------- */
 
+/*
+ * REPLAY THE VENDOR'S OWN STREAM, byte for byte, with only the three addresses
+ * changed.
+ *
+ * Round 342. The capture from the vendor's LLM runtime (vendor-capture/llmcap in
+ * the driver repository) is 123 registers for one int4 projection, K = 2048,
+ * N = 1024, weights 1 MiB. Diffed against what this file emits for the same
+ * shape, 15 registers differ and three whole groups do not exist on one side or
+ * the other: the vendor writes five registers at 0x2810 that nothing here has
+ * ever written, and does NOT write the DPU_RDMA block or the 0x1d enable
+ * trailer that this file ends with.
+ *
+ * Every previous int4 round changed one of those at a time and measured the same
+ * bit pattern product. This changes all of them at once by not deciding any of
+ * them: the stream is the vendor's, and the only thing substituted is where the
+ * input, the weights and the output live.
+ *
+ *   0x1088  CNA   input
+ *   0x1110  CNA   weights
+ *   0x4018  DPU   output
+ *
+ * The shape is then whatever the captured stream says, NOT what mm asks for, so
+ * the caller has to size its buffers to the stream. charsiu_vendor_stream_shape()
+ * reads it back out for exactly that.
+ */
+static const char *vendor_stream_path(void)
+{
+	return getenv("CHARSIU_VENDOR_STREAM");
+}
+
+static size_t vendor_stream_load(uint64_t *out, size_t max)
+{
+	const char *path = vendor_stream_path();
+	FILE *f;
+	size_t n;
+
+	if (!path)
+		return 0;
+	f = fopen(path, "rb");
+	if (!f) {
+		/*
+		 * LOUD, because a silent fall back to the emitter's own stream
+		 * would make the round read as a vendor replay while running
+		 * something else, and a check that cannot fail has already cost
+		 * this project a round.
+		 */
+		fprintf(stderr, "CHARSIU_VENDOR_STREAM: cannot open %s\n", path);
+		exit(2);
+	}
+	n = fread(out, sizeof(*out), max, f);
+	fclose(f);
+	if (!n) {
+		fprintf(stderr, "CHARSIU_VENDOR_STREAM: %s is empty\n", path);
+		exit(2);
+	}
+	return n;
+}
+
+/*
+ * The geometry the captured stream describes, so the probe can size its buffers
+ * from the stream rather than from its own idea of the shape. Returns 0 if there
+ * is no stream to read.
+ */
+int charsiu_vendor_stream_shape(unsigned *k, unsigned *n, size_t *wbytes)
+{
+	uint64_t buf[512];
+	size_t got = vendor_stream_load(buf, sizeof(buf) / sizeof(buf[0]));
+	uint32_t v101c = 0, v1024 = 0, v1028 = 0;
+	size_t i;
+
+	if (!got)
+		return 0;
+	for (i = 0; i < got; i++) {
+		unsigned reg = (unsigned)(buf[i] & 0xffff);
+		uint32_t val = (uint32_t)((buf[i] >> 16) & 0xffffffff);
+
+		if (reg == 0x101c) v101c = val;
+		else if (reg == 0x1024) v1024 = val;
+		else if (reg == 0x1028) v1028 = val;
+	}
+	if (k) *k = (v1028 & 0xffff) + 1;
+	if (n) *n = (v1024 & 0xffff) + 1;
+	if (wbytes) *wbytes = v101c;
+	return 1;
+}
+
+static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
+				 size_t max)
+{
+	size_t got = vendor_stream_load(out, max);
+	size_t i;
+
+	if (!got)
+		return 0;
+	printf("REGISTER STREAM: the vendor's own, %zu entries from %s\n",
+	       got, vendor_stream_path());
+	for (i = 0; i < got; i++) {
+		unsigned reg = (unsigned)(out[i] & 0xffff);
+		uint32_t val;
+
+		switch (reg) {
+		case 0x1088: val = job->input_addr;  break;
+		case 0x1110: val = job->weight_addr; break;
+		case 0x4018: val = job->output_addr; break;
+		default: continue;
+		}
+		out[i] = (out[i] & ~0x0000ffffffff0000ULL) |
+			 ((uint64_t)val << 16);
+	}
+	return got;
+}
+
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max)
 {
+	size_t vend = emit_vendor_stream(job, out, max);
+
 	const struct charsiu_matmul *mm = &job->mm;
 	struct emitter e = { out, max, 0 };
 	struct requant rq = requant_of(job);
@@ -410,6 +525,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned wide8 = 0;
 	unsigned rdma_mask;
 	unsigned r;
+
+	if (vend)
+		return vend;
 
 	/* The S_POINTER each unit latches its geometry against. Every unit gets
 	 * it, not just the CNA: mesa writes all four and the vendor's streams
