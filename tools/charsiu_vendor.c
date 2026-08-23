@@ -219,9 +219,10 @@ int main(int argc, char **argv)
 	job.mm.m = getenv("CHARSIU_M") ? (unsigned)atoi(getenv("CHARSIU_M")) : 32;
 	job.mm.k = getenv("CHARSIU_K") ? (unsigned)atoi(getenv("CHARSIU_K")) : 2048;
 	job.mm.n = getenv("CHARSIU_N") ? (unsigned)atoi(getenv("CHARSIU_N")) : 1024;
+	/* ⚠ the two lines that used to sit here reassigned k and n to 2048 and
+	 * 1024, so round 350's whole N sweep ran four times at the same shape
+	 * and printed four nearly equal times as if they were a slope. */
 	printf("M = %u K = %u N = %u\n", job.mm.m, job.mm.k, job.mm.n);
-	job.mm.k = 2048;
-	job.mm.n = 1024;
 	/*
 	 * CHARSIU_W8 times an int8 job at the SAME shape through the SAME code,
 	 * so the int4 speed claim is measured against something rather than
@@ -283,11 +284,20 @@ int main(int argc, char **argv)
 				gw[(size_t)nn * job.mm.k + kk] =
 					(uint8_t)((nn * 2654435761u + kk * 40503u
 						   + (nn ^ kk)) & 0xf);
+		/*
+		 * ⚠ EXACTLY REPRESENTABLE IN fp16, in sixteenths. Round 350
+		 * generated multiples of 0.05, which fp16 cannot hold, so the
+		 * hardware multiplied by the rounded value while the reference
+		 * multiplied by the float -- 256 of 1024 "failed" at 2.4e-04
+		 * and the board was right every time. The reference now also
+		 * rounds through fp16, and the values are chosen so that it
+		 * does not have to.
+		 */
 		for (nn = 0; nn < job.mm.m; nn++)
 			for (kk = 0; kk < job.mm.k; kk++)
 				ga[(size_t)nn * job.mm.k + kk] =
 					(float)((int)((nn * 97u + kk * 31u) % 41)
-						- 20) * 0.05f;
+						- 20) / 16.0f;
 		charsiu_bo_prep(c.dev, &c.wt, 1000000000);
 		memset(c.wt.map, 0, c.wt.size);
 		charsiu_pack_weights(&job.mm, gw, c.wt.map);
@@ -525,7 +535,11 @@ int main(int argc, char **argv)
 
 				if (gw) {
 					v = gw[(size_t)nn * Kd + kk] & 0xf;
-					av = (double)ga[(size_t)mm * Kd + kk];
+					/* through fp16, because that is what the
+					 * packer gave the hardware */
+					av = (double)charsiu_half_to_float(
+						charsiu_float_to_half(
+						  ga[(size_t)mm * Kd + kk]));
 				} else {
 					size_t ni = (size_t)32 * 16 * (Kd / 32)
 						  * (nn / 16)
