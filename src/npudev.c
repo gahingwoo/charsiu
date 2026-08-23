@@ -490,6 +490,20 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e->n_slices = ns;
 	e->k_slices = ks;
 	e->weight_mb = (double)t->n * (double)t->k / 1e6;
+	/*
+	 * A HEARTBEAT WHILE THE WEIGHTS ARE STAGED. Round 352's int4 arm printed
+	 * nothing for minutes and there was no way to tell a slow load from a
+	 * wedge: charsiu_run's own output does not appear until the generation
+	 * is done. Four lines for a 113 tensor model is not noise.
+	 */
+	if ((g->n_ent % 16) == 15) {
+		static double t_first;
+
+		if (t_first == 0.0)
+			t_first = now_us();
+		fprintf(stderr, "charsiu NPU: %u tensors staged, %.0f ms\n",
+			g->n_ent + 1, (now_us() - t_first) / 1000.0);
+	}
 	return (int)g->n_ent++;
 }
 

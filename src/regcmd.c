@@ -455,27 +455,55 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * that restores the old CORE registers, so the two cannot disagree.
 	 */
 	if (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_W4_BITPAT")) {
+		/*
+		 * ⚠ THE BOUND AND THE DIVISIONS ARE HOISTED. The first version
+		 * called charsiu_weight_bytes() inside the inner loop, which is
+		 * one function call per nibble -- about 1.4 billion of them for
+		 * this model -- and round 352's int4 arm never finished loading.
+		 * The int8 branch below does one add per element, so the two
+		 * were not remotely comparable.
+		 *
+		 * Blocks of 32 k for each of 16 channels, so walk the blocks and
+		 * let the inner loop be a straight run of 32.
+		 */
+		size_t cap = charsiu_weight_bytes(mm);
 		unsigned kb = ALIGN_UP(ke, 32);
+		unsigned kmax = mm->k < ke ? mm->k : ke;
 		unsigned nn, kk;
 
-		for (nn = 0; nn < mm->n; nn++)
-			for (kk = 0; kk < mm->k && kk < ke; kk++) {
-				size_t i = (size_t)(nn / 16) * 512 * (kb / 32)
-					 + (size_t)(kk / 32) * 512
-					 + (size_t)(nn % 16) * 32
-					 + (kk % 32);
-				uint8_t v = (uint8_t)(src[(size_t)nn * mm->k + kk]
-						      & 0xf);
+		for (nn = 0; nn < mm->n; nn++) {
+			size_t nbase = (size_t)(nn / 16) * 512 * (kb / 32)
+				     + (size_t)(nn % 16) * 32;
+			const uint8_t *row = src + (size_t)nn * mm->k;
 
-				if ((i >> 1) >= charsiu_weight_bytes(mm))
-					continue;
-				if (i & 1)
-					dst[i >> 1] = (uint8_t)((dst[i >> 1] & 0x0f)
-								| (v << 4));
-				else
-					dst[i >> 1] = (uint8_t)((dst[i >> 1] & 0xf0)
-								| v);
+			for (kk = 0; kk < kmax; kk += 32) {
+				size_t i = nbase + (size_t)(kk / 32) * 512;
+				unsigned run = kmax - kk < 32 ? kmax - kk : 32;
+				uint8_t *d;
+				unsigned c;
+
+				if ((i + run - 1) >> 1 >= cap)
+					break;
+				/*
+				 * i is always EVEN here -- nbase and the block
+				 * step are both multiples of 32 -- so a run
+				 * writes whole bytes and never has to read one
+				 * back. That matters: this runs over every
+				 * weight in the model at load, about 1.2
+				 * billion nibbles, and the read modify write
+				 * version made round 352's int4 arm take
+				 * minutes where int8 took 303 ms.
+				 */
+				d = dst + (i >> 1);
+				for (c = 0; c + 1 < run; c += 2)
+					*d++ = (uint8_t)((row[kk + c] & 0xf) |
+							 ((row[kk + c + 1] & 0xf)
+							  << 4));
+				if (c < run)
+					*d = (uint8_t)((*d & 0xf0) |
+						       (row[kk + c] & 0xf));
 			}
+		}
 		return;
 	}
 
