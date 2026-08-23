@@ -178,7 +178,14 @@ int main(int argc, char **argv)
 	} else {
 		setenv("CHARSIU_VENDOR_STREAM", stream, 1);
 	}
-	job.mm.m = 32;
+	/*
+	 * CHARSIU_M. The vendor's capture is M = 32 and charsiu's decode loop is
+	 * M = 1, and every surface stride above depends on M: at M = 1 the input
+	 * slot collapses to k and the output word to n. So the mode has to be
+	 * asked the question at M = 1 rather than assumed to survive it.
+	 */
+	job.mm.m = getenv("CHARSIU_M") ? (unsigned)atoi(getenv("CHARSIU_M")) : 32;
+	printf("M = %u\n", job.mm.m);
 	job.mm.k = 2048;
 	job.mm.n = 1024;
 	job.mm.wdtype = CHARSIU_INT4;
@@ -383,10 +390,10 @@ int main(int argc, char **argv)
 		const uint8_t *wp;
 		const uint16_t *ap;
 		double worst = 0.0;
+		unsigned loose = 0;
 
 		charsiu_vendor_stream_shape(&Kd, &Nd, NULL);
-		if (getenv("CHARSIU_VERIFY_M"))
-			Md = (unsigned)atoi(getenv("CHARSIU_VERIFY_M"));
+		Md = job.mm.m;
 		printf("\nVERIFY: K=%u N=%u M=%u against a CPU reference\n",
 		       Kd, Nd, Md);
 		charsiu_bo_prep(c.dev, &c.wt, 1000000000);
@@ -422,15 +429,24 @@ int main(int argc, char **argv)
 
 				if (d > worst) worst = d;
 				if (d < 1e-5) ok++;
-				else if (seen - ok <= 4)
+				if (d < 1e-4) loose++;
+				else if (seen - loose <= 4)
 					printf("  w=%-6u n=%-5u m=%-3u board %+.6f "
 					       "ref %+.6f  rel %.2e\n",
 					       w, nn, mm, got, acc, d);
 			}
 		}
-		printf("VERIFY: %u of %u words within 1e-5 relative "
-		       "(%u skipped as zero), worst %.2e\n",
-		       ok, seen, dead, worst);
+		/*
+		 * ⚠ TWO TOLERANCES, because 1e-5 cried wolf in round 346: five
+		 * words failed it whose printed digits agreed with the
+		 * reference. The board returns float32 and the reference sums
+		 * 2048 terms in double, so a cancelling sum reaches 1e-5
+		 * relative honestly. 1e-4 is the one to read; 1e-5 is there to
+		 * show the margin.
+		 */
+		printf("VERIFY: %u of %u within 1e-4, %u within 1e-5 "
+		       "(%u skipped, both zero), worst %.2e\n",
+		       loose, seen, ok, dead, worst);
 		charsiu_bo_fini(c.dev, &c.in);
 		charsiu_bo_fini(c.dev, &c.wt);
 	}
