@@ -62,7 +62,7 @@ struct npu_slot {
 
 struct npu_entry {
 	const struct npu_tensor *t;
-	struct charsiu_bo out;     /* ITS OWN, sized for ITS slices */
+	struct charsiu_bo out[2];  /* ITS OWN, one per device */
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
 	unsigned di;               /* which device, and so which CBUF window */
@@ -335,7 +335,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 			charsiu_bo_free(g->dev[d], &g->slot[i].regcmd);
 		}
 		for (unsigned i = 0; i < g->n_ent; i++)
-			charsiu_bo_free(g->dev[g->ent[i].di], &g->ent[i].out);
+			for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
 			charsiu_close(g->dev[d]);
@@ -558,12 +559,25 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * MB of cache operations a token where there had been 14. That is most
 	 * of why routing the head made the model 18% SLOWER.
 	 */
-	if (charsiu_bo_alloc(g->dev[e->di], (size_t)ns * ks * g->out_stride + 4096,
-			     &e->out)) {
-		whine(g, "an output buffer would not allocate", (unsigned)t->k,
-		      (unsigned)t->n);
-		return -1;
-	}
+	for (unsigned d = 0; d < g->ndev; d++)
+		if (charsiu_bo_alloc(g->dev[d],
+				     (size_t)ns * ks * g->out_stride + 4096,
+				     &e->out[d])) {
+			whine(g, "an output buffer would not allocate",
+			      (unsigned)t->k, (unsigned)t->n);
+			return -1;
+		}
+
+	/*
+	 * ⚠ THE SLICES OF ONE TENSOR SPLIT TOO, not just the members of a
+	 * group. Round 364 put the second core in and got only 7%, because the
+	 * o_proj, the down_proj and the 128256 wide output head all go through
+	 * the single projection path -- more than 40% of the weight traffic in
+	 * tensors that were never grouped with anything. Alternating the SLICES
+	 * gives those two cores as well.
+	 */
+	{
+	unsigned sid[2] = { 0, 0 };
 
 	for (unsigned ki = 0; ki < ks; ki++) {
 		unsigned k0 = ki * g->kmax;
@@ -575,14 +589,18 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			unsigned n = (unsigned)(t->n - n0) < g->nmax
 				   ? (unsigned)(t->n - n0) : g->nmax;
 
-			if (add_slice(g, e->di, t, n0, n, k0, k, ki, si,
-				      (uint32_t)e->out.dma_address) < 0) {
+			unsigned d = g->ndev > 1 ? ((ki * ns + ni) & 1) : 0;
+
+			if (add_slice(g, d, t, n0, n, k0, k, ki, sid[d]++,
+				      (uint32_t)e->out[d].dma_address) < 0) {
 				g->n_slot = first;
 				return -1;
 			}
 			g->slices++;
 		}
 	}
+	}
+	(void)si;
 
 	e->t = t;
 	e->first = first;
@@ -686,46 +704,49 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * and reached 4.2 GB/s, where an eight task submit reaches 10, so the
 	 * driver's per handle work is a candidate for the difference.
 	 */
-	{
-		unsigned per = g->nochain ? 1
-			     : (g->maxtask && g->maxtask < e->count
-				? g->maxtask : e->count);
+	/*
+	 * ONE JOBLIST PER DEVICE, BOTH ISSUED BEFORE EITHER IS WAITED ON. The
+	 * slices of this tensor alternate between the devices, so a projection
+	 * that is not part of a group still uses both cores.
+	 */
+	t0 = now_us();
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned nt = 0;
 
-		t0 = now_us();
-		for (unsigned base = 0; base < e->count; base += per) {
-			unsigned nt = e->count - base < per ? e->count - base : per;
+		nh = 0;
+		g->handles[nh++] = g->in[d].handle;
+		for (i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
 
-			nh = 0;
-			g->handles[nh++] = g->in[e->di].handle;
-			for (i = 0; i < nt; i++) {
-				const struct npu_slot *s = &g->slot[e->first + base + i];
-
-				g->tasks[base + i].regcmd =
-					(uint32_t)s->regcmd.dma_address;
-				g->tasks[base + i].regcmd_count = s->nreg;
-				g->handles[nh++] = s->wt.handle;
-				g->handles[nh++] = s->coef.handle;
-			}
-			jl.tasks = &g->tasks[base];
-			jl.task_count = nt;
-			jl.in_handles = g->handles;
-			jl.in_count = nh;
-			jl.out_handles = &e->out.handle;
-			jl.out_count = 1;
-
-			if (charsiu_submit_jobs(g->dev[e->di], &jl, 1)) {
-				g->strikes = 3;
-				break;
-			}
-			g->submits++;
+			if (s->di != d)
+				continue;
+			g->tasks[nt].regcmd = (uint32_t)s->regcmd.dma_address;
+			g->tasks[nt].regcmd_count = s->nreg;
+			nt++;
+			g->handles[nh++] = s->wt.handle;
+			g->handles[nh++] = s->coef.handle;
 		}
-		g->submit_us += now_us() - t0;
+		if (!nt)
+			continue;
+		jl.tasks = g->tasks;
+		jl.task_count = nt;
+		jl.in_handles = g->handles;
+		jl.in_count = nh;
+		jl.out_handles = &e->out[d].handle;
+		jl.out_count = 1;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			break;
+		}
+		g->submits++;
 	}
+	g->submit_us += now_us() - t0;
 
 	if (g->strikes < 3) {
 		double t1 = now_us();
 
-		charsiu_bo_prep(g->dev[e->di], &e->out, 2000000000);
+		for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_prep(g->dev[d], &e->out[d], 2000000000);
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
 		int grp = tensor_grouped(g, e->t);
@@ -734,7 +755,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
-			const uint8_t *base = (const uint8_t *)e->out.map +
+			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
 					      s->out_slot * g->out_stride;
 
 			/* int4 writes float32, int8 the raw int32 accumulator */
@@ -763,7 +784,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
-		charsiu_bo_fini(g->dev[e->di], &e->out);
+		for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_fini(g->dev[d], &e->out[d]);
 		g->copy_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
 		g->busy_us += now_us() - t0;
@@ -875,13 +897,9 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	 * of weights each submit fetches.
 	 */
 	{
-	unsigned nd = 0, dmask = 0;
+	unsigned nd = 0;
 
-	for (i = 0; i < n; i++)
-		dmask |= 1u << g->ent[ids[i]].di;
 	for (unsigned d = 0; d < g->ndev; d++) {
-		if (!(dmask & (1u << d)))
-			continue;
 		nd++;
 	charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
@@ -937,14 +955,17 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		g->handles[nh++] = g->in[d].handle;
 		for (i = 0; i < n; i++) {
 			struct npu_entry *e = &g->ent[ids[i]];
+			unsigned any = 0;
 
-			if (e->di != d)
-				continue;
-			outh[no++] = e->out.handle;
 			for (j = 0; j < e->count; j++) {
 				const struct npu_slot *s =
 					&g->slot[e->first + j];
 
+				/* ⚠ filter by the SLICE's device, not the
+				 * entry's: since round 365 a tensor's slices
+				 * are spread across both. */
+				if (s->di != d)
+					continue;
 				if (ntask >= 4 * g->max_slices)
 					return -1;
 				g->tasks[ntask].regcmd =
@@ -953,7 +974,10 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				ntask++;
 				g->handles[nh++] = s->wt.handle;
 				g->handles[nh++] = s->coef.handle;
+				any = 1;
 			}
+			if (any)
+				outh[no++] = e->out[d].handle;
 		}
 		if (!no)
 			continue;
@@ -976,8 +1000,9 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 
 	t1 = now_us();
 	for (i = 0; i < n; i++)
-		charsiu_bo_prep(g->dev[g->ent[ids[i]].di],
-				&g->ent[ids[i]].out, 2000000000);
+		for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_prep(g->dev[d], &g->ent[ids[i]].out[d],
+					2000000000);
 	g->fence_us += now_us() - t1;
 
 	t1 = now_us();
@@ -991,7 +1016,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
 		for (j = 0; j < e->count; j++) {
 			const struct npu_slot *s = &g->slot[e->first + j];
-			const uint8_t *base = (const uint8_t *)e->out.map +
+			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
 					      s->out_slot * g->out_stride;
 
 			if (g->w4) {
@@ -1019,7 +1044,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			for (unsigned q = 0; q < s->job.mm.n; q++)
 				g->acc[s->n0 + q] += out[q];
 		}
-		charsiu_bo_fini(g->dev[e->di], &e->out);
+		for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_fini(g->dev[d], &e->out[d]);
 		{
 			double hsu = 0.0;
 
