@@ -42,7 +42,16 @@ $(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
        $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64 \
-       $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64
+       $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64 \
+       $(BUILD)/charsiu_membw.aarch64
+
+# what the memory controller has left, which is the only question that decides
+# whether splitting work across the CPU, the GPU and the NPU can pay
+$(BUILD)/charsiu_membw.aarch64: tools/charsiu_membw.c | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lpthread
+
+$(BUILD)/charsiu_membw: tools/charsiu_membw.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
 $(BUILD)/charsiu_probe.aarch64: tools/charsiu_probe.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^
