@@ -19,6 +19,42 @@
 
 #include "charsiu.h"
 
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+/*
+ * float to half FOUR AT A TIME, and it TRUNCATES, exactly as
+ * charsiu_float_to_half does.
+ *
+ * ⚠ NOT vcvt_f16_f32. The hardware instruction rounds to nearest even and this
+ * project's converter drops the low thirteen mantissa bits, which is a
+ * different number by up to half a last place -- about 5e-4 relative in half
+ * precision, four thousand times the gap that moved a token in the SiLU
+ * experiment. Rounding would very likely be the BETTER choice and it is not
+ * this change's business to make it: this is the same arithmetic, faster.
+ *
+ * Checked against the scalar converter over 464 million float bit patterns
+ * spanning the whole 32 bit space: zero differ.
+ */
+static inline uint16x4_t charsiu_vhalf(float32x4_t x)
+{
+	uint32x4_t u = vreinterpretq_u32_f32(x);
+	uint32x4_t sign = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(0x8000));
+	int32x4_t exp = vsubq_s32(vreinterpretq_s32_u32(
+					  vandq_u32(vshrq_n_u32(u, 23),
+						    vdupq_n_u32(0xff))),
+				  vdupq_n_s32(112));
+	uint32x4_t man = vandq_u32(u, vdupq_n_u32(0x7fffff));
+	uint32x4_t h = vorrq_u32(sign,
+			 vorrq_u32(vshlq_n_u32(vreinterpretq_u32_s32(exp), 10),
+				   vshrq_n_u32(man, 13)));
+
+	h = vbslq_u32(vcleq_s32(exp, vdupq_n_s32(0)), sign, h);
+	h = vbslq_u32(vcgeq_s32(exp, vdupq_n_s32(0x1f)),
+		      vorrq_u32(sign, vdupq_n_u32(0x7c00)), h);
+	return vmovn_u32(h);
+}
+#endif
+
 #define CNA   0x0201u
 #define CORE  0x0801u
 #define DPU   0x1001u
@@ -334,6 +370,44 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 	unsigned atom = charsiu_feature_atom(CHARSIU_FP16);
 	unsigned i, kk;
 
+	/*
+	 * ONE ROW IS THE WHOLE OF DECODE, AND ONE ROW IS CONTIGUOUS.
+	 *
+	 * At m = 1 the offset collapses: (kk/atom)*atom + kk%atom is kk, so the
+	 * destination is just k halves in order. A token packs about 463
+	 * thousand of them -- every K slice of every projection, into both
+	 * devices -- and round 368 left 10.6 ms a token unaccounted between
+	 * what the stage table charges to a projection and what npudev
+	 * measures inside it. A scalar call per element is the obvious
+	 * suspect.
+	 *
+	 * Only the tail is cleared: the region past k is padding the hardware
+	 * still reads, and everything before it is about to be overwritten.
+	 */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	{
+	static int plain = -1;
+
+	if (plain < 0)
+		plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
+	if (mm->m == 1 && !plain) {
+		size_t used = (size_t)mm->k * 2;
+
+		if (dst_size > used)
+			memset(dst + used, 0, dst_size - used);
+		for (kk = 0; kk + 4 <= mm->k; kk += 4)
+			vst1_u16((uint16_t *)(dst + (size_t)kk * 2),
+				 charsiu_vhalf(vld1q_f32(src + kk)));
+		for (; kk < mm->k; kk++) {
+			uint16_t h = charsiu_float_to_half(src[kk]);
+
+			dst[kk * 2] = (uint8_t)(h & 0xff);
+			dst[kk * 2 + 1] = (uint8_t)(h >> 8);
+		}
+		return;
+	}
+	}
+#endif
 	memset(dst, 0, dst_size);
 	for (i = 0; i < mm->m; i++)
 		for (kk = 0; kk < mm->k; kk++) {

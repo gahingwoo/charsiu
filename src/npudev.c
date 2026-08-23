@@ -162,6 +162,14 @@ struct charsiu_npu {
 	 * only read" ask for different fixes.
 	 */
 	double submit_us, fence_us, copy_us, fini_us;
+	/*
+	 * ⚠ ON TOP OF busy_us, NOT INSIDE IT. Packing the activation happens
+	 * before the timer that covers a submit, so round 368 left 10.6 ms a
+	 * token between what the stage table charges to a projection and what
+	 * this file measures inside one. This is the missing piece, measured
+	 * rather than derived.
+	 */
+	double pack_us;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -169,7 +177,7 @@ struct charsiu_npu {
 	 * clock. Three slow submits and this path retires itself.
 	 */
 	double slow_us, min_gbs;
-	int strikes, dead, whined, nochain, slowed, nofini, inprep;
+	int strikes, dead, whined, nochain, slowed, nofini, inprep, plain;
 	unsigned long slices;
 };
 
@@ -333,6 +341,17 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 * walks. CHARSIU_NPU_INPREP puts them back.
 	 */
 	g->inprep = getenv("CHARSIU_NPU_INPREP") != NULL;
+	/*
+	 * ONE SWITCH FOR THE THREE THINGS ROUND 369 CHANGED that have no
+	 * behaviour of their own to show: the vectorised half conversion, the
+	 * activation reaching the packer without a copy, and the sum landing in
+	 * the caller's buffer instead of a staging one. All three are provably
+	 * neutral -- the packer was compared byte for byte against the old loop
+	 * at thirteen shapes -- so the control is not about whether they are
+	 * right. It is so a round that comes out SLOWER can say which of them
+	 * did it, which is the lesson round 368's attention arm taught.
+	 */
+	g->plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
 	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
@@ -442,11 +461,13 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"of weights, %.0f us a submit\n"
 			"charsiu NPU: of that, %.0f ms submitting, %.0f ms "
 			"waiting for the fence (the invalidate is in there), "
-			"%.0f ms summing the slices, %.0f ms in the flush\n",
+			"%.0f ms summing the slices, %.0f ms in the flush\n"
+			"charsiu NPU: and %.0f ms packing the activation, "
+			"which is ON TOP of the hardware path above\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
 			g->busy_us / (double)g->submits,
 			g->submit_us / 1e3, g->fence_us / 1e3,
-			g->copy_us / 1e3, g->fini_us / 1e3);
+			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -737,7 +758,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	struct charsiu_joblist jl;
 	const int32_t *out;
 	unsigned nh = 0, i;
-	double t0;
+	double t0, tpack;
+	float *af;
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
@@ -761,6 +783,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * sharing one: it has to be packed twice. That is a few kilobytes
 	 * against the megabytes of weights a submit fetches.
 	 */
+	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
 	if (g->inprep)
 		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
@@ -768,15 +791,28 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
 		if (g->w4) {
-			double as = 0.0;
+			const float *src = a->f + s->k0;
 
-			for (i = 0; i < s->job.mm.k; i++) {
-				g->fscr[i] = a->f[s->k0 + i];
-				as += (double)g->fscr[i];
+			/*
+			 * STRAIGHT FROM THE ACTIVATION, NO COPY. The packer
+			 * reads src[kk] at m = 1, so the scratch buffer was
+			 * 463 thousand float copies a token to hand it bytes
+			 * it could already see. The running total is the
+			 * midrise grid's half step, and midrise is off by
+			 * default and measured worse when it was on, so it no
+			 * longer costs a double add per element either.
+			 */
+			if (g->midrise || g->plain) {
+				double as = 0.0;
+
+				for (i = 0; i < s->job.mm.k; i++) {
+					g->fscr[i] = src[i];
+					as += (double)g->fscr[i];
+				}
+				g->asum[ki] = as;
+				src = g->fscr;
 			}
-			/* the half step of the midrise grid rides on this */
-			g->asum[ki] = as;
-			charsiu_pack_input_f16(&s->job.mm, g->fscr,
+			charsiu_pack_input_f16(&s->job.mm, src,
 					       (uint8_t *)g->in[d].map
 					       + ki * g->in_stride,
 					       g->in_stride);
@@ -793,6 +829,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	}
 	charsiu_bo_fini(g->dev[d], &g->in[d]);
 	}
+	g->pack_us += now_us() - tpack;
 
 	/*
 	 * ONE submit for the whole projection, unless a cap says otherwise.
@@ -855,11 +892,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		 * ONE OF THESE, NOT BOTH. int4 sums into accf and int8 into
 		 * acc, and clearing the other one is 2 MB a token of writes
 		 * for an array nothing will read: the 128256 wide head alone
-		 * is half a megabyte of it. It also lands inside the read back
-		 * timer, which is the number this round is trying to read.
+		 * is half a megabyte of it.
+		 *
+		 * AND WHEN THE LAST STEP WOULD BE A COPY, SUM WHERE THE ANSWER
+		 * GOES. A grouped int4 tensor applies its scale per slice on
+		 * the way in, so the conversion at the end of this function is
+		 * y[i] = accf[i] and nothing else: a staging buffer read and
+		 * written for no reason.
 		 */
+		af = (g->w4 && grp && !g->plain) ? y : g->accf;
 		if (g->w4)
-			memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
+			memset(af, 0, (size_t)e->t->n * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (i = 0; i < e->count; i++) {
@@ -882,11 +925,11 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 					 * question, and a gather that will not
 					 * allocate fails the staging */
 					for (unsigned j = 0; j < s->job.mm.n; j++)
-						g->accf[s->n0 + j] +=
+						af[s->n0 + j] +=
 						  (float)((fo[j] + hs) * sc[j]);
 				} else {
 					for (unsigned j = 0; j < s->job.mm.n; j++)
-						g->accf[s->n0 + j] += fo[j];
+						af[s->n0 + j] += fo[j];
 				}
 				continue;
 			}
@@ -956,6 +999,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		int grp = tensor_grouped(g, e->t);
 		double hs = 0.0;
 
+		if (g->w4 && grp && !g->plain)
+			return 0;              /* it was summed into y */
 		if (g->midrise && !grp)
 			for (unsigned ki = 0; ki < e->k_slices; ki++)
 				hs += 0.5 * g->asum[ki];
@@ -988,7 +1033,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	struct charsiu_joblist jl;
 	uint32_t outh[8];
 	unsigned nh = 0, ntask = 0, i, j;
-	double t0, t1, fspent = 0.0;
+	double t0, t1, tpack, fspent = 0.0;
 
 	if (g->dead || !n || n > 8)
 		return -1;
@@ -1012,6 +1057,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	{
 	unsigned nd = 0;
 
+	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
 		nd++;
 	if (g->inprep)
@@ -1020,15 +1066,28 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
 
 		if (g->w4) {
-			double as = 0.0;
+			const float *src = a->f + s->k0;
 
-			for (i = 0; i < s->job.mm.k; i++) {
-				g->fscr[i] = a->f[s->k0 + i];
-				as += (double)g->fscr[i];
+			/*
+			 * STRAIGHT FROM THE ACTIVATION, NO COPY. The packer
+			 * reads src[kk] at m = 1, so the scratch buffer was
+			 * 463 thousand float copies a token to hand it bytes
+			 * it could already see. The running total is the
+			 * midrise grid's half step, and midrise is off by
+			 * default and measured worse when it was on, so it no
+			 * longer costs a double add per element either.
+			 */
+			if (g->midrise || g->plain) {
+				double as = 0.0;
+
+				for (i = 0; i < s->job.mm.k; i++) {
+					g->fscr[i] = src[i];
+					as += (double)g->fscr[i];
+				}
+				g->asum[ki] = as;
+				src = g->fscr;
 			}
-			/* the half step of the midrise grid rides on this */
-			g->asum[ki] = as;
-			charsiu_pack_input_f16(&s->job.mm, g->fscr,
+			charsiu_pack_input_f16(&s->job.mm, src,
 					       (uint8_t *)g->in[d].map
 					       + ki * g->in_stride,
 					       g->in_stride);
@@ -1045,6 +1104,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	}
 	charsiu_bo_fini(g->dev[d], &g->in[d]);
 	}
+	g->pack_us += now_us() - tpack;
 	(void)nd;
 	}
 
@@ -1125,16 +1185,21 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		const int32_t *out;
 
 		int grp = tensor_grouped(g, e->t);
+		float *af = (g->w4 && grp && !g->plain) ? ys[i] : g->accf;
 
 		/*
 		 * ONE OF THESE, NOT BOTH. int4 sums into accf and int8 into
 		 * acc, and clearing the other one is 2 MB a token of writes
 		 * for an array nothing will read: the 128256 wide head alone
-		 * is half a megabyte of it. It also lands inside the read back
-		 * timer, which is the number this round is trying to read.
+		 * is half a megabyte of it.
+		 *
+		 * AND WHEN THE LAST STEP WOULD BE A COPY, SUM WHERE THE ANSWER
+		 * GOES. A grouped int4 tensor applies its scale per slice on
+		 * the way in, so the conversion below is ys[i][q] = accf[q]
+		 * and nothing else.
 		 */
 		if (g->w4)
-			memset(g->accf, 0, (size_t)e->t->n * sizeof(*g->accf));
+			memset(af, 0, (size_t)e->t->n * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (j = 0; j < e->count; j++) {
@@ -1156,11 +1221,11 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					 * question, and a gather that will not
 					 * allocate fails the staging */
 					for (unsigned q = 0; q < s->job.mm.n; q++)
-						g->accf[s->n0 + q] +=
+						af[s->n0 + q] +=
 						  (float)((fo[q] + hs) * sc[q]);
 				} else {
 					for (unsigned q = 0; q < s->job.mm.n; q++)
-						g->accf[s->n0 + q] += fo[q];
+						af[s->n0 + q] += fo[q];
 				}
 				continue;
 			}
@@ -1176,12 +1241,20 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					charsiu_bo_fini(g->dev[d], &e->out[d]);
 			fspent += now_us() - tf;
 		}
-		{
+		if (af != ys[i]) {
 			double hsu = 0.0;
 
 			if (g->midrise && !grp)
 				for (unsigned ki = 0; ki < e->k_slices; ki++)
 					hsu += 0.5 * g->asum[ki];
+			/*
+			 * ⚠ grp STILL HAS TO BE ASKED HERE. This branch is
+			 * reached with CHARSIU_NPU_PLAIN, and a grouped tensor
+			 * has already had a scale applied per slice on the way
+			 * in: multiplying by the row scale as well would give
+			 * the control a wrong answer, which is worse than
+			 * having no control.
+			 */
 			for (unsigned q = 0; q < (unsigned)e->t->n; q++)
 				ys[i][q] = g->w4
 					 ? (grp ? g->accf[q]

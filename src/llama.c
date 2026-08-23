@@ -78,6 +78,15 @@ static int cpu_plain(void)
 	return v;
 }
 
+static int attn_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_ATTN_POOL") != NULL && !cpu_plain();
+	return v;
+}
+
 /*
  * ⚠ OPT IN, AND IT MOVES TOKENS.
  *
@@ -1063,12 +1072,26 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			struct attn_job aj = { s, l, pos, hd, kvdim, gqa,
 					       scale };
 
-			/* CHARSIU_CPU_PLAIN keeps it on the calling thread, so
-			 * a round can carry its own control */
-			if (cpu_plain())
-				attn_heads(&aj, 0, m->n_head);
-			else
+			/*
+			 * ⚠ SERIAL, AND ROUND 368 IS WHY.
+			 *
+			 * Splitting these heads over the pool was measured at
+			 * 22.70 ms a token against 7.75 serial when the
+			 * process was left where the scheduler put it, and at
+			 * 7.42 against 7.75 when it was pinned to the four
+			 * A72s. So it costs 15 ms in the ordinary case and
+			 * buys 0.33 ms in the best one: the work per layer is
+			 * two milliseconds and a fan out and fan in around it
+			 * is not free.
+			 *
+			 * The path stays, because attention grows with the
+			 * context and 38 positions is not where this question
+			 * gets settled. CHARSIU_ATTN_POOL turns it on.
+			 */
+			if (attn_pool())
 				pool_run(attn_heads, &aj, m->n_head);
+			else
+				attn_heads(&aj, 0, m->n_head);
 		}
 
 		STAGE(ST_ATTN);
