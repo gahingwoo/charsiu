@@ -65,6 +65,18 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
 	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
 		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
+	/*
+	 * ⚠⚠ READ ONCE. These two sat inside loops over every weight in the
+	 * tensor, and getenv walks the environment with a strcmp per entry.
+	 * Round 354's heartbeat split settled where 114 to 144 seconds of
+	 * staging went: 4 to 5 s inside charsiu_npu_add and ALL THE REST in
+	 * npu_tensor_build. int8 never noticed because "bits == 4 &&" short
+	 * circuits before the call, which is also why it looked like an int4
+	 * hardware or layout problem for two rounds. It was 1.24 billion
+	 * getenv calls.
+	 */
+	const int w4sym = getenv("CHARSIU_NPU_W4_SYM") != NULL;
+	const int w4clip = getenv("CHARSIU_NPU_W4_CLIP") != NULL;
 	uint64_t ngrp;
 	float qmax = bits == 4 ? 7.0f : 127.0f;
 
@@ -208,7 +220,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * quantiser being compared against a sixteen level one.
 		 * CHARSIU_NPU_W4_SYM restores the symmetric version.
 		 */
-		if (bits == 4 && !getenv("CHARSIU_NPU_W4_SYM")) {
+		if (bits == 4 && !w4sym) {
 			float vmax = 0.0f;
 
 			for (uint64_t i = lo; i < hi; i++)
@@ -236,7 +248,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			 * instead. Off by default, kept as the control that
 			 * says a weight space objective is the wrong one.
 			 */
-			if (getenv("CHARSIU_NPU_W4_CLIP")) {
+			if (w4clip) {
 				double bestе = -1.0;
 				float bestd = d;
 				int ci;
@@ -272,7 +284,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		for (uint64_t i = lo; i < hi; i++) {
 			int v = (int)lrintf(row[i] * id);
 
-			if (bits == 4 && !getenv("CHARSIU_NPU_W4_SYM")) {
+			if (bits == 4 && !w4sym) {
 				if (v > 7) v = 7;
 				if (v < -8) v = -8;
 			} else {

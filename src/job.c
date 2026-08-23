@@ -284,6 +284,10 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 			 const int32_t *weight_sums, uint8_t *dst)
 {
 	const struct charsiu_matmul *mm = &job->mm;
+	/* ⚠ once, not once an output channel. The same shape of mistake cost
+	 * round 354 two minutes a run in the quantiser. */
+	const int16_t coef_c = (int16_t)(getenv("CHARSIU_COEF_C")
+					 ? atoi(getenv("CHARSIU_COEF_C")) : 16);
 	size_t tb = table_bytes(mm), sb = scale_table_bytes(mm);
 	uint16_t *scales;
 	unsigned oc;
@@ -367,8 +371,7 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 		 * what it should be, so CHARSIU_COEF_C makes it a knob: if the
 		 * slope moves with this, C is the gain.
 		 */
-		*c = (int16_t)(getenv("CHARSIU_COEF_C")
-			       ? atoi(getenv("CHARSIU_COEF_C")) : 16);
+		*c = coef_c;
 	}
 	/* Carry the last real record across the rest of its group, so the group
 	 * holds no zero requant multiplier beside live channels. */
