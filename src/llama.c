@@ -103,6 +103,15 @@ static int attn_pool(void)
  * stays behind a switch until a round measures what it buys.
  */
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+static int fast_attn(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_FAST_ATTN") != NULL;
+	return v;
+}
+
 static int fast_silu(void)
 {
 	static int v = -1;
@@ -984,6 +993,9 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 	struct llama_state *s = j->s;
 	uint32_t hd = j->hd, kvdim = j->kvdim;
 	int pos = j->pos;
+	int plain = cpu_plain();
+
+	(void)plain;    /* the scalar build has no vector path to switch off */
 
 	for (uint64_t h = h0; h < h0 + nh; h++) {
 		const float *qh = s->q + h * hd;
@@ -995,8 +1007,31 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			const float *kt = s->kcache +
 				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
 			float a = 0.0f;
+			uint32_t i = 0;
 
-			for (uint32_t i = 0; i < hd; i++)
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+			/*
+			 * ⚠ OPT IN, because a dot product IS a reduction and
+			 * four lanes add it up in a different ORDER. That is a
+			 * last bit, and a last bit moved a token when the SiLU
+			 * experiment tried it. The other half of this function
+			 * needs no switch: it lands each element in its own
+			 * accumulator, so there is no order to change.
+			 */
+			if (fast_attn() && !plain) {
+				float32x4_t a0 = vdupq_n_f32(0.0f);
+				float32x4_t a1 = vdupq_n_f32(0.0f);
+
+				for (; i + 8 <= hd; i += 8) {
+					a0 = vfmaq_f32(a0, vld1q_f32(qh + i),
+						       vld1q_f32(kt + i));
+					a1 = vfmaq_f32(a1, vld1q_f32(qh + i + 4),
+						       vld1q_f32(kt + i + 4));
+				}
+				a = vaddvq_f32(vaddq_f32(a0, a1));
+			}
+#endif
+			for (; i < hd; i++)
 				a += qh[i] * kt[i];
 			att[t] = a * j->scale;
 		}
@@ -1007,8 +1042,31 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			const float *vt = s->vcache +
 				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
 			float a = att[t];
+			uint32_t i = 0;
 
-			for (uint32_t i = 0; i < hd; i++)
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+			/*
+			 * Each i lands in its own accumulator, so there is no
+			 * reduction and no order to change. The barrier keeps
+			 * the multiply and the add separately rounded, which
+			 * is what the scalar line below compiles to: there is
+			 * no fmla anywhere in this function today.
+			 */
+			if (!plain) {
+				float32x4_t av = vdupq_n_f32(a);
+
+				for (; i + 4 <= hd; i += 4) {
+					float32x4_t p = vmulq_f32(av,
+							vld1q_f32(vt + i));
+
+					__asm__("" : "+w"(p));
+					vst1q_f32(out + i,
+						  vaddq_f32(vld1q_f32(out + i),
+							    p));
+				}
+			}
+#endif
+			for (; i < hd; i++)
 				out[i] += a * vt[i];
 		}
 	}

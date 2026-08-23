@@ -220,6 +220,44 @@ static unsigned env_u(const char *name, unsigned dflt)
  * slice covering part of a group would need a scale per part and there is
  * nowhere to put one.
  */
+/*
+ * acc[j] += fo[j] * sc[j], AND BIT FOR BIT WHAT THE SCALAR LOOP DID.
+ *
+ * Two things make that claim checkable rather than hopeful. The elements are
+ * independent -- each j lands in its own accumulator, so there is no reduction
+ * whose order could change. And the product of two floats has at most 48
+ * significant bits, which is exact in a double, so the scalar loop's
+ * (float)((double)a * (double)b) is the correctly rounded float product and
+ * nothing else.
+ *
+ * ⚠ THE BARRIER IS LOAD BEARING. Without it the compiler fuses the multiply
+ * and the add into fmla, which rounds ONCE where the source rounds twice, and
+ * 460190 of 20.5 million accumulations came out different in the host check.
+ * The cast in the scalar tail is the same barrier written in C.
+ */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+static void scaled_add(float *acc, const float *fo, const float *sc, unsigned n)
+{
+	unsigned j = 0;
+
+	for (; j + 4 <= n; j += 4) {
+		float32x4_t p = vmulq_f32(vld1q_f32(fo + j), vld1q_f32(sc + j));
+
+		__asm__("" : "+w"(p));
+		vst1q_f32(acc + j, vaddq_f32(vld1q_f32(acc + j), p));
+	}
+	for (; j < n; j++)
+		acc[j] += (float)((double)fo[j] * (double)sc[j]);
+}
+#else
+static void scaled_add(float *acc, const float *fo, const float *sc, unsigned n)
+{
+	for (unsigned j = 0; j < n; j++)
+		acc[j] += (float)((double)fo[j] * (double)sc[j]);
+}
+#endif
+
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
 	return g->w4 && t->kgroup && t->kgroup < t->k &&
@@ -924,6 +962,11 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 					 * ask tensor_grouped the same
 					 * question, and a gather that will not
 					 * allocate fails the staging */
+					if (hs == 0.0 && !g->plain) {
+						scaled_add(af + s->n0, fo, sc,
+							   s->job.mm.n);
+						continue;
+					}
 					for (unsigned j = 0; j < s->job.mm.n; j++)
 						af[s->n0 + j] +=
 						  (float)((fo[j] + hs) * sc[j]);
@@ -1220,6 +1263,11 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					 * ask tensor_grouped the same
 					 * question, and a gather that will not
 					 * allocate fails the staging */
+					if (hs == 0.0 && !g->plain) {
+						scaled_add(af + s->n0, fo, sc,
+							   s->job.mm.n);
+						continue;
+					}
 					for (unsigned q = 0; q < s->job.mm.n; q++)
 						af[s->n0 + q] +=
 						  (float)((fo[q] + hs) * sc[q]);
