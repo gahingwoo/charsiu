@@ -78,6 +78,8 @@ static size_t load(const char *path, void *dst, size_t max)
 	return n;
 }
 
+static int reread;
+
 struct ctx {
 	struct charsiu_device *dev;
 	struct charsiu_bo regcmd, in, wt, out, coef;
@@ -104,7 +106,42 @@ static unsigned run(struct ctx *c, int32_t *dst, unsigned words)
 		printf("wait FAILED %d -- the job did not complete\n", ret);
 		exit(1);
 	}
+	/*
+	 * ⚠ DID THE DATA ARRIVE LATE, OR WAS IT NEVER WRITTEN.
+	 *
+	 * Round 359: a solo process is clean three times out of three, but with
+	 * two running concurrently some output words come back ZERO that should
+	 * be live -- 1020 and 1022 of 1024 -- and the repeat control differs by
+	 * tens to hundreds of words. Missing writes, not swapped data, and only
+	 * ever in the bigger of the two jobs.
+	 *
+	 * CHARSIU_REREAD takes the buffer through another cache round trip and
+	 * reads it again. If the missing words are there the second time, the
+	 * fence signalled before the NPU's writes had landed and the fix is
+	 * ordering in the driver. If they are still missing, they were never
+	 * written and the fix is somewhere else entirely.
+	 *
+	 * A plain second memcpy would prove nothing: the lines are in cache by
+	 * then and would read back exactly what the first one saw.
+	 */
 	memcpy(dst, c->out.map, (size_t)words * 4);
+	if (reread) {
+		static int32_t *again;
+		unsigned d = 0, w;
+
+		if (!again)
+			again = malloc((size_t)words * 4);
+		charsiu_bo_fini(c->dev, &c->out);
+		charsiu_bo_prep(c->dev, &c->out, 5000000000LL);
+		memcpy(again, c->out.map, (size_t)words * 4);
+		for (w = 0; w < words; w++)
+			if (again[w] != dst[w])
+				d++;
+		if (d)
+			printf("  REREAD: %u words CHANGED after a second cache "
+			       "round trip -- the data was still landing\n", d);
+		memcpy(dst, again, (size_t)words * 4);
+	}
 	for (i = 0; i < words; i++)
 		if (dst[i])
 			live++;
@@ -239,6 +276,7 @@ int main(int argc, char **argv)
 	job.output_zero_point = 0;
 	job.acc_out = 1;
 
+	reread = getenv("CHARSIU_REREAD") != NULL;
 	c.dev = charsiu_open(NULL);
 	if (!c.dev) { printf("open FAILED\n"); return 1; }
 	if (charsiu_bo_alloc(c.dev, 8192, &c.regcmd) ||
