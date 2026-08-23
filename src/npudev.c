@@ -58,6 +58,20 @@ struct npu_slot {
 	unsigned n0, k0;           /* where this slice starts in the tensor */
 	unsigned out_slot;         /* which output region it writes */
 	unsigned di;               /* which device its buffers live on */
+	/*
+	 * THIS SLICE'S GROUP SCALES, ONE PER CHANNEL, LAID OUT AS THE SUM READS
+	 * THEM.
+	 *
+	 * A grouped tensor keeps its scales as scale[channel * ngroups + group],
+	 * so the read back walked them with a stride of ngroups: eight cache
+	 * lines apart on the down projection, and unvectorisable everywhere.
+	 * The values are the same values, gathered once when the tensor is
+	 * staged rather than once a token for the life of the process.
+	 *
+	 * It costs what the scale array itself costs, 4.8 MB for this model,
+	 * against 620 MB of weights.
+	 */
+	float *sc;
 };
 
 struct npu_entry {
@@ -155,7 +169,7 @@ struct charsiu_npu {
 	 * clock. Three slow submits and this path retires itself.
 	 */
 	double slow_us, min_gbs;
-	int strikes, dead, whined, nochain, slowed, nofini;
+	int strikes, dead, whined, nochain, slowed, nofini, inprep;
 	unsigned long slices;
 };
 
@@ -295,10 +309,30 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 * the next read is preceded by prep_bo, whose sync_for_cpu invalidates
 	 * those stale clean lines before the CPU can see them.
 	 *
-	 * It is env gated rather than simply removed because the argument above
-	 * is an argument, and the sentence the model writes is the check on it.
+	 * ROUND 367 RAN IT: 3.4 ms a token of flush went to 0.02, the sentence
+	 * came back word for word identical to the arm that kept the flush and
+	 * to the one device control, and the run went 9.86 to 10.26 tok/s. So it
+	 * is the default now, and CHARSIU_NPU_FINI puts the clean back.
 	 */
-	g->nofini = getenv("CHARSIU_NPU_NOFINI") != NULL;
+	g->nofini = getenv("CHARSIU_NPU_FINI") == NULL;
+	/*
+	 * AND THE SAME ARGUMENT ON THE OTHER SIDE, which round 367 did NOT run.
+	 *
+	 * prep_bo on the ACTIVATION buffer waits for a write fence and then
+	 * invalidates. Neither is needed: the device only ever READS that
+	 * buffer, so there is no write fence to wait for, and the CPU is about
+	 * to overwrite every byte the next job will read, so there is nothing
+	 * stale worth dropping first. Its fini stays -- the CPU wrote it, and
+	 * that clean is what makes the bytes visible to the hardware.
+	 *
+	 * What makes it safe to write at all is the ORDER: the previous job on
+	 * this buffer finished before this call, because its output prep waited
+	 * on the fence that covers the whole job, reads included.
+	 *
+	 * It is 65 entries a token times two devices: 130 ioctls and 130 cache
+	 * walks. CHARSIU_NPU_INPREP puts them back.
+	 */
+	g->inprep = getenv("CHARSIU_NPU_INPREP") != NULL;
 	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
@@ -356,6 +390,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 			charsiu_bo_free(g->dev[d], &g->slot[i].coef);
 			charsiu_bo_free(g->dev[d], &g->slot[i].regcmd);
 		}
+		for (unsigned i = 0; i < g->n_slot; i++)
+			free(g->slot[i].sc);
 		for (unsigned i = 0; i < g->n_ent; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
@@ -453,6 +489,24 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	    charsiu_bo_alloc(g->dev[di], 4096, &s->regcmd)) {
 		whine(g, "a buffer would not allocate", k, n);
 		goto out;
+	}
+
+	/*
+	 * Gather this slice's scales into the order the sum wants. Only a
+	 * grouped tensor has a scale per (channel, group); an ungrouped one is
+	 * scaled once at the end, where the stride does not arise.
+	 */
+	if (tensor_grouped(g, t)) {
+		uint64_t ng = t->k / t->kgroup;
+		uint64_t gi = k0 / t->kgroup;
+
+		s->sc = malloc((size_t)n * sizeof(float));
+		if (!s->sc) {
+			whine(g, "the scale gather would not allocate", k, n);
+			goto out;
+		}
+		for (unsigned j = 0; j < n; j++)
+			s->sc[j] = t->scale[(uint64_t)(n0 + j) * ng + gi];
 	}
 
 	/* its own slot in each shared buffer, baked into the stream */
@@ -708,7 +762,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * against the megabytes of weights a submit fetches.
 	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
-	charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
+	if (g->inprep)
+		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
@@ -817,17 +872,18 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				const float *fo = (const float *)base;
 
 				if (grp) {
-					uint64_t ng = e->t->k / e->t->kgroup;
-					uint64_t gi = s->k0 / e->t->kgroup;
 					double hs = g->midrise
 						  ? 0.5 * g->asum[s->k0 / g->kmax]
 						  : 0.0;
+					const float *sc = s->sc;
 
+					/* non null whenever grp is: the two
+					 * ask tensor_grouped the same
+					 * question, and a gather that will not
+					 * allocate fails the staging */
 					for (unsigned j = 0; j < s->job.mm.n; j++)
 						g->accf[s->n0 + j] +=
-						  (float)((fo[j] + hs) *
-						   e->t->scale[(s->n0 + j) * ng
-							       + gi]);
+						  (float)((fo[j] + hs) * sc[j]);
 				} else {
 					for (unsigned j = 0; j < s->job.mm.n; j++)
 						g->accf[s->n0 + j] += fo[j];
@@ -958,7 +1014,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 
 	for (unsigned d = 0; d < g->ndev; d++) {
 		nd++;
-	charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
+	if (g->inprep)
+		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
 
@@ -1089,17 +1146,18 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				const float *fo = (const float *)base;
 
 				if (grp) {
-					uint64_t ng = e->t->k / e->t->kgroup;
-					uint64_t gi = s->k0 / e->t->kgroup;
 					double hs = g->midrise
 						  ? 0.5 * g->asum[s->k0 / g->kmax]
 						  : 0.0;
+					const float *sc = s->sc;
 
+					/* non null whenever grp is: the two
+					 * ask tensor_grouped the same
+					 * question, and a gather that will not
+					 * allocate fails the staging */
 					for (unsigned q = 0; q < s->job.mm.n; q++)
 						g->accf[s->n0 + q] +=
-						  (float)((fo[q] + hs) *
-						   e->t->scale[(s->n0 + q) * ng
-							       + gi]);
+						  (float)((fo[q] + hs) * sc[q]);
 				} else {
 					for (unsigned q = 0; q < s->job.mm.n; q++)
 						g->accf[s->n0 + q] += fo[q];

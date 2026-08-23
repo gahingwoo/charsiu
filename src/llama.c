@@ -13,6 +13,8 @@
  * there is exactly one place to change when a projection moves to the NPU.
  */
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE                 /* sched_setaffinity, for the big cores */
+#include <sched.h>
 
 #include <math.h>
 #include <pthread.h>
@@ -23,6 +25,108 @@
 #include <unistd.h>
 
 #include "charsiu_llm.h"
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+/*
+ * e^x four at a time, the cephes range reduction: n = round(x/ln2), then a
+ * degree six polynomial on the remainder and a shift of the exponent field.
+ * About 1e-7 relative, which is under a float's own last bit for these
+ * magnitudes.
+ *
+ * It exists for SiLU. The feed forward is 8192 wide and there are 16 of them,
+ * so a token asks for 131072 exponentials, and round 367 measured that at 3.08
+ * ms on the board -- 23 ns an element, more than the rmsnorms and the residuals
+ * and the rope put together.
+ */
+static inline float32x4_t vexpq(float32x4_t x)
+{
+	const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
+	const float32x4_t ln2hi = vdupq_n_f32(0.693359375f);
+	const float32x4_t ln2lo = vdupq_n_f32(-2.12194440e-4f);
+	float32x4_t n, r, rr, y;
+	int32x4_t k;
+
+	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
+	n = vrndaq_f32(vmulq_f32(x, log2e));
+	r = vmlsq_f32(vmlsq_f32(x, n, ln2hi), n, ln2lo);
+	rr = vmulq_f32(r, r);
+
+	y = vdupq_n_f32(1.9875691500e-4f);
+	y = vmlaq_f32(vdupq_n_f32(1.3981999507e-3f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(8.3334519073e-3f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(4.1665795894e-2f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(1.6666665459e-1f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(5.0000001201e-1f), y, r);
+	y = vaddq_f32(vmlaq_f32(r, y, rr), vdupq_n_f32(1.0f));
+
+	k = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
+	return vmulq_f32(y, vreinterpretq_f32_s32(vshlq_n_s32(k, 23)));
+}
+#endif
+
+/*
+ * The plain paths, for a round that wants its own before and after in one boot.
+ * Read once: this is asked per feed forward, not per element.
+ */
+static int cpu_plain(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_CPU_PLAIN") != NULL;
+	return v;
+}
+
+/*
+ * ⚠ OPT IN, AND IT MOVES TOKENS.
+ *
+ * vexpq is accurate to about one last bit and glibc's expf is correctly
+ * rounded, so the vector path is the slightly WORSE of the two. That is
+ * nothing next to int4 weights -- but greedy decoding turns a near tie into a
+ * different word, and on the host it did: "Claude Monet painted the water
+ * lilies" became "Claude Monet was born in Paris" at token 25.
+ *
+ * Both continuations are fine and neither is a bug. What it costs is the
+ * anchor: every round since 352 has quoted the same Louvre sentence, and a
+ * sentence that changes for a reason unrelated to the hardware makes the next
+ * regression harder to see, not easier. 3 ms of 100 is not worth that, so it
+ * stays behind a switch until a round measures what it buys.
+ */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+static int fast_silu(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_FAST_SILU") != NULL;
+	return v;
+}
+#endif
+
+/* hb = silu(hb) * hb2, which is the gate and the up projection joined */
+static void silu_mul(float *hb, const float *hb2, uint32_t n)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_silu())
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t g = vld1q_f32(hb + i);
+			float32x4_t d = vaddq_f32(vdupq_n_f32(1.0f),
+						  vexpq(vnegq_f32(g)));
+
+			vst1q_f32(hb + i, vmulq_f32(vdivq_f32(g, d),
+						    vld1q_f32(hb2 + i)));
+		}
+#endif
+	for (; i < n; i++) {
+		float g = hb[i];
+
+		g *= 1.0f / (1.0f + expf(-g));
+		hb[i] = g * hb2[i];
+	}
+}
 
 /* ---- a fixed pool, so a token is not 144 thread creations ---------------- */
 
@@ -38,6 +142,18 @@ struct pool {
 	const struct charsiu_act *a;
 	float *y;
 	uint64_t nrows;
+
+	/*
+	 * A MATVEC IS NOT THE ONLY THING WORTH SPLITTING FOUR WAYS.
+	 *
+	 * In NPU mode the pool barely runs: every projection is routed to the
+	 * hardware and returns from the calling thread, so the whole CPU side of
+	 * a token -- 13 ms of it in round 367 -- is one core's work while three
+	 * sit idle. attention is 7.7 ms of that and splits over heads exactly,
+	 * because each head writes its own slice of xb and its own row of att.
+	 */
+	void (*fn)(void *ctx, uint64_t r0, uint64_t n);
+	void *ctx;
 };
 
 static struct pool g_pool;
@@ -66,7 +182,9 @@ static void *worker(void *arg)
 		if (n > per)
 			n = per;
 		if (n) {
-			if (g_pool.nt)
+			if (g_pool.fn)
+				g_pool.fn(g_pool.ctx, r0, n);
+			else if (g_pool.nt)
 				npu_matvec(g_pool.nt, g_pool.a, g_pool.y, r0, n);
 			else
 				gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
@@ -79,12 +197,62 @@ static void *worker(void *arg)
 	}
 }
 
+/*
+ * WHICH CORES. RK3576 is four Cortex-A53 at 0..3 and four Cortex-A72 at 4..7,
+ * and nothing in this runtime has ever said which it wants.
+ *
+ * It matters more in NPU mode than it looks. Every projection is routed to the
+ * hardware and returns from the CALLING thread, so the pool is nearly idle and
+ * the CPU's whole 13 ms a token -- attention, the rmsnorms, the rope, the sum
+ * over slices -- is one thread's work. If the scheduler has parked that thread
+ * on an A53 it is running at roughly half the rate it could.
+ *
+ * CHARSIU_CPUS takes a list like "4-7" or "0,2,4" and applies it before the
+ * pool exists, so the workers inherit it. Opt in: which cores a deployment
+ * wants is its call, and a wrong guess baked in as a default would be a
+ * regression nobody could see.
+ */
+static void cpus_pin(void)
+{
+	const char *spec = getenv("CHARSIU_CPUS");
+	cpu_set_t set;
+	const char *p;
+
+	if (!spec || !*spec)
+		return;
+	CPU_ZERO(&set);
+	for (p = spec; *p; ) {
+		char *end;
+		long a = strtol(p, &end, 10), b;
+
+		if (end == p)
+			break;
+		p = end;
+		b = a;
+		if (*p == '-') {
+			b = strtol(p + 1, &end, 10);
+			p = end;
+		}
+		for (long c = a; c <= b && c < CPU_SETSIZE; c++)
+			if (c >= 0)
+				CPU_SET((size_t)c, &set);
+		while (*p == ',' || *p == ' ')
+			p++;
+	}
+	if (CPU_COUNT(&set) && sched_setaffinity(0, sizeof(set), &set))
+		fprintf(stderr, "charsiu: CHARSIU_CPUS=%s did not apply\n", spec);
+	else
+		fprintf(stderr, "charsiu: pinned to CPUs %s, %d of them\n",
+			spec, CPU_COUNT(&set));
+}
+
 static void pool_start(int nthreads)
 {
 	const char *env = getenv("CHARSIU_THREADS");
 
 	if (g_pool.n)
 		return;
+	cpus_pin();
 	if (nthreads < 1 && env)
 		nthreads = atoi(env);
 	if (nthreads < 1) {
@@ -102,6 +270,31 @@ static void pool_start(int nthreads)
 	g_pool.th = calloc((size_t)nthreads, sizeof(*g_pool.th));
 	for (long i = 0; i < nthreads; i++)
 		pthread_create(&g_pool.th[i], NULL, worker, (void *)i);
+}
+
+/*
+ * Fan a range out over the pool and wait. The single thread case runs it
+ * inline rather than paying a broadcast and a condition variable to reach
+ * itself.
+ */
+static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
+		     uint64_t n)
+{
+	if (g_pool.n <= 1) {
+		fn(ctx, 0, n);
+		return;
+	}
+	pthread_mutex_lock(&g_pool.mu);
+	g_pool.fn = fn;
+	g_pool.ctx = ctx;
+	g_pool.nrows = n;
+	g_pool.done = 0;
+	g_pool.gen++;
+	pthread_cond_broadcast(&g_pool.cv_work);
+	while (g_pool.done < g_pool.n)
+		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
+	g_pool.fn = NULL;
+	pthread_mutex_unlock(&g_pool.mu);
 }
 
 static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
@@ -293,6 +486,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	}
 
 	pthread_mutex_lock(&g_pool.mu);
+	g_pool.fn = NULL;
 	g_pool.w = w;
 	g_pool.nt = nt;
 	g_pool.a = a;
@@ -363,22 +557,41 @@ static void softmax(float *x, int n)
  * right pairing for a gguf, even though the HF checkpoint it came from pairs
  * i with i + d/2 instead.
  */
-static void rope(float *v, uint32_t nheads, uint32_t hd, int pos,
-		 float base, const float *freq_factors)
+/*
+ * ONE ANGLE TABLE A TOKEN, NOT ONE A HEAD A LAYER.
+ *
+ * theta depends on the dimension pair and the position and on nothing else, so
+ * the powf, the cosf and the sinf are the same numbers for every head of every
+ * layer. This model asked for them 20480 times a token -- 40 head passes times
+ * 32 pairs times 16 layers -- and needs 32. Round 367 measured the difference
+ * as 1.79 ms a token, second only to attention on the CPU side.
+ *
+ * The values are identical, not approximated: same theta, same libm call, so
+ * the tokens cannot move.
+ */
+static void rope_table(float *cs, uint32_t hd, int pos, float base,
+		       const float *freq_factors)
+{
+	for (uint32_t i = 0; i < hd / 2; i++) {
+		float theta = (float)pos * powf(base, -2.0f * (float)i / (float)hd);
+
+		if (freq_factors)
+			theta /= freq_factors[i];
+		cs[2 * i]     = cosf(theta);
+		cs[2 * i + 1] = sinf(theta);
+	}
+}
+
+static void rope(float *v, uint32_t nheads, uint32_t hd, const float *cs)
 {
 	for (uint32_t h = 0; h < nheads; h++) {
 		float *p = v + h * hd;
 
 		for (uint32_t i = 0; i < hd / 2; i++) {
-			float theta = (float)pos * powf(base, -2.0f * (float)i / (float)hd);
-			float c, s, x0, x1;
+			float c = cs[2 * i], s = cs[2 * i + 1];
+			float x0 = p[2 * i];
+			float x1 = p[2 * i + 1];
 
-			if (freq_factors)
-				theta /= freq_factors[i];
-			c = cosf(theta);
-			s = sinf(theta);
-			x0 = p[2 * i];
-			x1 = p[2 * i + 1];
 			p[2 * i]     = x0 * c - x1 * s;
 			p[2 * i + 1] = x0 * s + x1 * c;
 		}
@@ -740,6 +953,58 @@ void llama_stages_report(void)
 
 /* ---- the forward pass ---------------------------------------------------- */
 
+/*
+ * ATTENTION, ONE RANGE OF HEADS AT A TIME.
+ *
+ * Each head reads the whole K and V cache but writes only its own hd floats of
+ * xb and its own row of att, so the heads are independent and the split needs
+ * no locking and changes no arithmetic: the sum over t inside a head keeps its
+ * order, which is what would have moved the tokens.
+ */
+struct attn_job {
+	struct llama_state *s;
+	uint32_t l;
+	int pos;
+	uint32_t hd, kvdim, gqa;
+	float scale;
+};
+
+static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
+{
+	const struct attn_job *j = vj;
+	struct llama_state *s = j->s;
+	uint32_t hd = j->hd, kvdim = j->kvdim;
+	int pos = j->pos;
+
+	for (uint64_t h = h0; h < h0 + nh; h++) {
+		const float *qh = s->q + h * hd;
+		float *att = s->att + (size_t)h * s->n_ctx;
+		uint32_t kvh = (uint32_t)h / j->gqa;
+		float *out = s->xb + h * hd;
+
+		for (int t = 0; t <= pos; t++) {
+			const float *kt = s->kcache +
+				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
+			float a = 0.0f;
+
+			for (uint32_t i = 0; i < hd; i++)
+				a += qh[i] * kt[i];
+			att[t] = a * j->scale;
+		}
+		softmax(att, pos + 1);
+
+		memset(out, 0, hd * sizeof(float));
+		for (int t = 0; t <= pos; t++) {
+			const float *vt = s->vcache +
+				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
+			float a = att[t];
+
+			for (uint32_t i = 0; i < hd; i++)
+				out[i] += a * vt[i];
+		}
+	}
+}
+
 const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 {
 	const struct llama_model *m = s->m;
@@ -748,6 +1013,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	uint32_t gqa = m->n_head / m->n_head_kv;
 	float scale = 1.0f / sqrtf((float)hd);
 	static float *freqbuf;
+	static float *ropecs;
 	const float *freqf = NULL;
 
 	double t0, t1;
@@ -768,6 +1034,10 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		freqf = freqbuf;
 	}
 
+	if (!ropecs)
+		ropecs = calloc(hd, sizeof(float));
+	rope_table(ropecs, hd, pos, m->rope_base, freqf);
+
 	gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
 	STAGE(ST_EMBD);
 
@@ -782,39 +1052,23 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k, L->wv, s->v);
 		STAGE(ST_QKV);
 
-		rope(s->q, m->n_head, hd, pos, m->rope_base, freqf);
-		rope(s->k, m->n_head_kv, hd, pos, m->rope_base, freqf);
+		rope(s->q, m->n_head, hd, ropecs);
+		rope(s->k, m->n_head_kv, hd, ropecs);
 
 		memcpy(kc, s->k, kvdim * sizeof(float));
 		memcpy(vc, s->v, kvdim * sizeof(float));
 		STAGE(ST_ROPE);
 
-		for (uint32_t h = 0; h < m->n_head; h++) {
-			const float *qh = s->q + h * hd;
-			float *att = s->att + (size_t)h * s->n_ctx;
-			uint32_t kvh = h / gqa;
-			float *out = s->xb + h * hd;
+		{
+			struct attn_job aj = { s, l, pos, hd, kvdim, gqa,
+					       scale };
 
-			for (int t = 0; t <= pos; t++) {
-				const float *kt = s->kcache +
-					((size_t)l * s->n_ctx + t) * kvdim + kvh * hd;
-				float a = 0.0f;
-
-				for (uint32_t i = 0; i < hd; i++)
-					a += qh[i] * kt[i];
-				att[t] = a * scale;
-			}
-			softmax(att, pos + 1);
-
-			memset(out, 0, hd * sizeof(float));
-			for (int t = 0; t <= pos; t++) {
-				const float *vt = s->vcache +
-					((size_t)l * s->n_ctx + t) * kvdim + kvh * hd;
-				float a = att[t];
-
-				for (uint32_t i = 0; i < hd; i++)
-					out[i] += a * vt[i];
-			}
+			/* CHARSIU_CPU_PLAIN keeps it on the calling thread, so
+			 * a round can carry its own control */
+			if (cpu_plain())
+				attn_heads(&aj, 0, m->n_head);
+			else
+				pool_run(attn_heads, &aj, m->n_head);
 		}
 
 		STAGE(ST_ATTN);
@@ -829,12 +1083,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_NORM2);
 		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
 		STAGE(ST_GATEUP);
-		for (uint32_t i = 0; i < m->n_ff; i++) {
-			float g = s->hb[i];
-
-			g *= 1.0f / (1.0f + expf(-g));       /* SiLU */
-			s->hb[i] = g * s->hb2[i];
-		}
+		silu_mul(s->hb, s->hb2, m->n_ff);
 		STAGE(ST_SILU);
 		matvec(s, L->down, s->hb, s->xb2);
 		STAGE(ST_DOWN);
