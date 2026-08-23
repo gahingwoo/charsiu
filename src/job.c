@@ -739,8 +739,53 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1144, 0x00000000);
 	emit(&e, CNA, 0x118c, rows - 1);        /* (inw - 1) << 16 is zero */
 
-	emit(&e, CORE, 0x3018, 0x10000001);
-	emit(&e, CORE, 0x301c, (lines << 16) | 0);
+	/*
+	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
+	 * 347.
+	 *
+	 * Every int4 result in this tree from round 265 to round 343 was exact
+	 * against a NONLINEAR reference: the effective weight was
+	 * (int16) fp16bits(s), a band from 1.00 to 1.18 plus zero, because the
+	 * DPU was multiplying the two fp16 bit patterns as integers. Bisecting
+	 * the vendor's captured stream by register range found the switch is
+	 * CORE, not the DPU where I had guessed it:
+	 *
+	 *     0x3018   this tree 10000001   vendor 10000200
+	 *     0x301c   this tree 001f0000   vendor 0000001f   (M-1, LOW half)
+	 *     0x3020   this tree 000007ef   vendor 000003ff   (N-1, plainly)
+	 *
+	 * 0x3018 is the one that changes the arithmetic -- with it alone the
+	 * output's first four words are already the correct ones -- and the
+	 * other two are needed for the job to run: alone, 0x301c is VOID and
+	 * 0x3020 fails its repeat control.
+	 *
+	 * ⚠ 0x3018 was recorded as "hangs" in rounds 339 and 341. It was tried
+	 * ALONE, at a different shape, without the other two. A register judged
+	 * dead in one configuration is not dead.
+	 *
+	 * With these three and nothing else, at M = 1, the board computes
+	 *
+	 *     out[n] = sum_k s(n,k) * a(k)     in float32
+	 *
+	 * and round 347 checked all 1024 output words against a CPU reference:
+	 * 1024 of 1024 within 1e-4 relative, 1017 within 1e-5, worst 5.46e-05.
+	 *
+	 * ⚠ M > 1 IS NOT THIS. At M = 8 the same three give 8 of 4096, because
+	 * the vendor puts M on the WIDTH axis and this file puts it on the
+	 * height axis, and at M = 1 alone the two collapse to the same thing.
+	 * LLM decode is M = 1, so this is enough to be useful and is NOT enough
+	 * to be called general.
+	 *
+	 * CHARSIU_W4_BITPAT restores the old behaviour, so the round that
+	 * claims this can show the fault coming back.
+	 */
+	{
+		int w4v = mm->wdtype == CHARSIU_INT4 &&
+			  !getenv("CHARSIU_W4_BITPAT");
+
+		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
+		emit(&e, CORE, 0x301c, w4v ? lines : ((uint32_t)lines << 16));
+	}
 	/*
 	 * ⚠ int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
 	 * that carries it. Rounds 274 to 276 read it directly: the DPU writes
@@ -788,11 +833,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * is where int4 used to collapse.
 	 */
 	emit(&e, CORE, 0x3020,
-	     charsiu_w4_paired(mm)
-		     ? (uint32_t)(2 * mm->n - 1)
-		     : (mm->wdtype == CHARSIU_INT4 && mm->n > 8
-			? (uint32_t)(2 * (ALIGN_UP(mm->n, 16) - 8) - 1)
-			: mm->n - 1));
+	     (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_W4_BITPAT"))
+		     ? mm->n - 1
+		     : (charsiu_w4_paired(mm)
+			? (uint32_t)(2 * mm->n - 1)
+			: (mm->wdtype == CHARSIU_INT4 && mm->n > 8
+			   ? (uint32_t)(2 * (ALIGN_UP(mm->n, 16) - 8) - 1)
+			   : mm->n - 1)));
 	emit(&e, CORE, 0x3024, 0x00000000);
 
 	/*

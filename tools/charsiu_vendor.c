@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #include "charsiu.h"
 
@@ -188,8 +189,14 @@ int main(int argc, char **argv)
 	printf("M = %u\n", job.mm.m);
 	job.mm.k = 2048;
 	job.mm.n = 1024;
-	job.mm.wdtype = CHARSIU_INT4;
-	job.mm.adtype = CHARSIU_FP16;
+	/*
+	 * CHARSIU_W8 times an int8 job at the SAME shape through the SAME code,
+	 * so the int4 speed claim is measured against something rather than
+	 * against a number from a different tool and a different boot. Its
+	 * output is not checked -- the layout differs -- only its time.
+	 */
+	job.mm.wdtype = getenv("CHARSIU_W8") ? CHARSIU_INT8 : CHARSIU_INT4;
+	job.mm.adtype = getenv("CHARSIU_W8") ? CHARSIU_INT8 : CHARSIU_FP16;
 	job.input_scale = 0.02f;
 	job.weight_scale = 0.01f;
 	job.output_scale = 0.25f;
@@ -257,6 +264,35 @@ int main(int argc, char **argv)
 	printf("  first eight: %d %d %d %d %d %d %d %d\n",
 	       base[0], base[1], base[2], base[3],
 	       base[4], base[5], base[6], base[7]);
+
+	/*
+	 * THE TIME, which is the question int4 has never been able to answer
+	 * honestly: every previous measurement was taken on a configuration
+	 * that did not compute a weighted sum. Weight bytes are the thing int4
+	 * halves, so the rate is reported over them.
+	 */
+	if (getenv("CHARSIU_TIME")) {
+		unsigned reps = (unsigned)strtoul(getenv("CHARSIU_TIME"),
+						  NULL, 0);
+		size_t wb = (size_t)job.mm.k * job.mm.n
+			  / (job.mm.wdtype == CHARSIU_INT4 ? 2 : 1);
+		struct timespec t0, t1;
+		double us;
+		unsigned r;
+
+		run(&c, cur, words);                    /* warm */
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (r = 0; r < reps; r++)
+			run(&c, cur, words);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		us = ((double)(t1.tv_sec - t0.tv_sec) * 1e6
+		      + (double)(t1.tv_nsec - t0.tv_nsec) / 1e3) / reps;
+		printf("TIME: %s K=%u N=%u  %.1f us/submit over %u reps, "
+		       "%zu weight bytes = %.2f GB/s\n",
+		       job.mm.wdtype == CHARSIU_INT4 ? "int4" : "int8",
+		       job.mm.k, job.mm.n, us, reps, wb,
+		       (double)wb / us / 1000.0);
+	}
 
 	/* CONTROL 1: the same job twice */
 	run(&c, cur, words);
