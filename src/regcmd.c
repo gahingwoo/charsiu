@@ -421,6 +421,64 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * a job packed this way and run without the override reaches only its
 	 * first 40 channels.
 	 */
+	/*
+	 * ⚠⚠ THE int4 LAYOUT, AS THE HARDWARE ACTUALLY FETCHES IT. Round 345.
+	 *
+	 * Everything in the block below this one describes how the hardware
+	 * fetched while CORE 0x3018 was wrong and the DPU was multiplying fp16
+	 * bit patterns as integers. It was measured honestly and it is not the
+	 * layout of a machine that computes a weighted sum.
+	 *
+	 * This one was read off a SLOPE MAP: change one nibble, submit, and the
+	 * difference in the output is that nibble's contribution, which is
+	 * exactly its activation times its int4 value. Divide by that output
+	 * word's float32 ulp -- per word, and sign flipped for a negative word,
+	 * because a negative float's integer image runs backwards -- and the
+	 * activation index falls out. 122 of 128 nibbles landed on
+	 *
+	 *     k = i mod 32,  channel = i / 32
+	 *
+	 * the six misses being small activations lost to float32 rounding. In
+	 * closed form, with 16 channels and 32 k to a block:
+	 *
+	 *     nibble(n,k) = (n/16)*512*(K/32) + (k/32)*512 + (n%16)*32 + k%32
+	 *
+	 * which is exactly N*K/2 nibbles with nothing left over. Round 346 had
+	 * the board check every live word of a real projection against a CPU
+	 * reference: 1280 of 1280 at M = 32 under the vendor's own registers,
+	 * and round 347 got 1024 of 1024 at M = 1, which is the decode case.
+	 *
+	 * Sixteen is the feature atom this project has met before, in the Mesa
+	 * channel work and in 0x4050's parity.
+	 *
+	 * CHARSIU_W4_BITPAT selects the old layout, and it is the same switch
+	 * that restores the old CORE registers, so the two cannot disagree.
+	 */
+	if (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_W4_BITPAT")) {
+		unsigned kb = ALIGN_UP(ke, 32);
+		unsigned nn, kk;
+
+		for (nn = 0; nn < mm->n; nn++)
+			for (kk = 0; kk < mm->k && kk < ke; kk++) {
+				size_t i = (size_t)(nn / 16) * 512 * (kb / 32)
+					 + (size_t)(kk / 32) * 512
+					 + (size_t)(nn % 16) * 32
+					 + (kk % 32);
+				uint8_t v = (uint8_t)(src[(size_t)nn * mm->k + kk]
+						      & 0xf);
+
+				if ((i >> 1) >= charsiu_weight_bytes(mm))
+					continue;
+				if (i & 1)
+					dst[i >> 1] = (uint8_t)((dst[i >> 1] & 0x0f)
+								| (v << 4));
+				else
+					dst[i >> 1] = (uint8_t)((dst[i >> 1] & 0xf0)
+								| v);
+			}
+		return;
+	}
+
 	if (mm->wdtype == CHARSIU_INT4) {
 		unsigned order = getenv("CHARSIU_INT4_ORDER")
 			? (unsigned)atoi(getenv("CHARSIU_INT4_ORDER")) : 0;

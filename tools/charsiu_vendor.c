@@ -44,7 +44,7 @@
 
 #include "charsiu.h"
 
-#define WT_BYTES   (2u << 20)
+#define WT_BYTES   (8u << 20)   /* N=2048 K=2048 int8 is 4 MiB */
 #define IN_BYTES   (1u << 20)
 /*
  * ⚠ THE OUTPUT BO IS SIZED FROM THE ENVIRONMENT because round 348's timing
@@ -176,6 +176,8 @@ int main(int argc, char **argv)
 	int64_t delta;
 	uint8_t orig;
 	unsigned v;
+	uint8_t *gw = NULL;
+	float *ga = NULL;
 
 	if (!stream || !wtf || !inf) {
 		printf("usage: charsiu_vendor <regcmd|-> <weights> <input> "
@@ -215,7 +217,9 @@ int main(int argc, char **argv)
 	 * asked the question at M = 1 rather than assumed to survive it.
 	 */
 	job.mm.m = getenv("CHARSIU_M") ? (unsigned)atoi(getenv("CHARSIU_M")) : 32;
-	printf("M = %u\n", job.mm.m);
+	job.mm.k = getenv("CHARSIU_K") ? (unsigned)atoi(getenv("CHARSIU_K")) : 2048;
+	job.mm.n = getenv("CHARSIU_N") ? (unsigned)atoi(getenv("CHARSIU_N")) : 1024;
+	printf("M = %u K = %u N = %u\n", job.mm.m, job.mm.k, job.mm.n);
 	job.mm.k = 2048;
 	job.mm.n = 1024;
 	/*
@@ -258,6 +262,45 @@ int main(int argc, char **argv)
 	memset(c.coef.map, 0, c.coef.size);
 	charsiu_bo_fini(c.dev, &c.coef);
 
+	/*
+	 * CHARSIU_GEN builds the operands with the PRODUCTION packers --
+	 * charsiu_pack_weights and charsiu_pack_input_f16, the same two the LLM
+	 * path calls -- instead of loading the vendor's captured buffers. The
+	 * captured buffers proved the hardware; this proves the code that will
+	 * feed it, which is a different claim and the one that matters next.
+	 *
+	 * The reference is then computed from the SOURCE arrays, not from the
+	 * packed ones, so a packer that is wrong in the same way as the
+	 * reference cannot pass.
+	 */
+	if (getenv("CHARSIU_GEN")) {
+		unsigned nn, kk;
+
+		gw = malloc((size_t)job.mm.n * job.mm.k);
+		ga = malloc((size_t)job.mm.m * job.mm.k * sizeof(*ga));
+		for (nn = 0; nn < job.mm.n; nn++)
+			for (kk = 0; kk < job.mm.k; kk++)
+				gw[(size_t)nn * job.mm.k + kk] =
+					(uint8_t)((nn * 2654435761u + kk * 40503u
+						   + (nn ^ kk)) & 0xf);
+		for (nn = 0; nn < job.mm.m; nn++)
+			for (kk = 0; kk < job.mm.k; kk++)
+				ga[(size_t)nn * job.mm.k + kk] =
+					(float)((int)((nn * 97u + kk * 31u) % 41)
+						- 20) * 0.05f;
+		charsiu_bo_prep(c.dev, &c.wt, 1000000000);
+		memset(c.wt.map, 0, c.wt.size);
+		charsiu_pack_weights(&job.mm, gw, c.wt.map);
+		orig = ((uint8_t *)c.wt.map)[byte];
+		charsiu_bo_fini(c.dev, &c.wt);
+
+		charsiu_bo_prep(c.dev, &c.in, 1000000000);
+		memset(c.in.map, 0, c.in.size);
+		charsiu_pack_input_f16(&job.mm, ga, c.in.map, c.in.size);
+		charsiu_bo_fini(c.dev, &c.in);
+		printf("operands GENERATED through charsiu_pack_weights and "
+		       "charsiu_pack_input_f16\n");
+	} else {
 	charsiu_bo_prep(c.dev, &c.wt, 1000000000);
 	memset(c.wt.map, 0, c.wt.size);
 	printf("weights: %zu bytes from %s\n", load(wtf, c.wt.map, WT_BYTES), wtf);
@@ -268,6 +311,7 @@ int main(int argc, char **argv)
 	memset(c.in.map, 0, c.in.size);
 	printf("input:   %zu bytes from %s\n", load(inf, c.in.map, IN_BYTES), inf);
 	charsiu_bo_fini(c.dev, &c.in);
+	}
 
 	charsiu_bo_prep(c.dev, &c.regcmd, 1000000000);
 	c.nreg = charsiu_emit_job(&job, c.regcmd.map, 8192 / 8);
@@ -459,6 +503,8 @@ int main(int argc, char **argv)
 
 		charsiu_vendor_stream_shape(&Kd, &Nd, NULL);
 		Md = job.mm.m;
+		Kd = job.mm.k;
+		Nd = job.mm.n;
 		printf("\nVERIFY: K=%u N=%u M=%u against a CPU reference\n",
 		       Kd, Nd, Md);
 		charsiu_bo_prep(c.dev, &c.wt, 1000000000);
@@ -474,16 +520,25 @@ int main(int argc, char **argv)
 			if (nn >= Nd)
 				continue;
 			for (kk = 0; kk < Kd; kk++) {
-				size_t ni = (size_t)32 * 16 * (Kd / 32) * (nn / 16)
-					  + (size_t)512 * (kk / 32)
-					  + 32 * (nn % 16) + (kk % 32);
-				uint8_t byt = wp[ni >> 1];
-				int v = (ni & 1) ? (byt >> 4) : (byt & 0xf);
-				size_t ai = (size_t)8 * Md * (kk / 8) + 8 * mm
-					  + (kk % 8);
+				int v;
+				double av;
 
-				acc += (double)(v < 8 ? v : v - 16)
-				     * (double)charsiu_half_to_float(ap[ai]);
+				if (gw) {
+					v = gw[(size_t)nn * Kd + kk] & 0xf;
+					av = (double)ga[(size_t)mm * Kd + kk];
+				} else {
+					size_t ni = (size_t)32 * 16 * (Kd / 32)
+						  * (nn / 16)
+						  + (size_t)512 * (kk / 32)
+						  + 32 * (nn % 16) + (kk % 32);
+					uint8_t byt = wp[ni >> 1];
+					size_t ai = (size_t)8 * Md * (kk / 8)
+						  + 8 * mm + (kk % 8);
+
+					v = (ni & 1) ? (byt >> 4) : (byt & 0xf);
+					av = (double)charsiu_half_to_float(ap[ai]);
+				}
+				acc += (double)(v < 8 ? v : v - 16) * av;
 			}
 			memcpy(&got, &base[w], 4);
 			if (!base[w] && acc == 0.0) { dead++; continue; }
