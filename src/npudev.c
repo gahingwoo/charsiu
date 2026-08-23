@@ -92,6 +92,7 @@ struct charsiu_npu {
 	float *fscr;
 	float *accf;
 	uint8_t *wpack;
+	double add_us, t_first;
 	struct charsiu_task *tasks;
 	uint32_t *handles;
 	unsigned nmax, kmax, max_n;
@@ -457,7 +458,13 @@ out:
 
 int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 {
+	double t_add = now_us();
 	struct npu_entry *e;
+
+	/* ⚠ start the clock on the FIRST tensor, not the first heartbeat, or
+	 * the first sixteen are free and round 353's log said "0 ms". */
+	if (g->t_first == 0.0)
+		g->t_first = t_add;
 	unsigned ns, ks, first = g->n_slot, si = 0;
 
 	if (g->dead) {
@@ -532,13 +539,24 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * wedge: charsiu_run's own output does not appear until the generation
 	 * is done. Four lines for a 113 tensor model is not noise.
 	 */
+	/*
+	 * ⚠ THE HEARTBEAT SPLITS THE TIME NOW. Round 353 showed int4 staging at
+	 * 102 s against int8's 16 s -- SIX times, not the three hundred I first
+	 * read, because int8's own staging is 16 s and its "load 345 ms" line is
+	 * only the gguf mmap. Packing into ordinary memory and copying did NOT
+	 * move it, so the strided write to the buffer object was not the cause
+	 * and I have no second guess. This measures instead: g->add_us is time
+	 * inside charsiu_npu_add, and whatever is left of the wall clock between
+	 * heartbeats belongs to npu_tensor_build, which is the quantiser.
+	 */
+	g->add_us += now_us() - t_add;
 	if ((g->n_ent % 16) == 15) {
-		static double t_first;
-
-		if (t_first == 0.0)
-			t_first = now_us();
-		fprintf(stderr, "charsiu NPU: %u tensors staged, %.0f ms\n",
-			g->n_ent + 1, (now_us() - t_first) / 1000.0);
+		fprintf(stderr,
+			"charsiu NPU: %u tensors staged, %.0f ms of which "
+			"%.0f ms adding and %.0f ms quantising\n",
+			g->n_ent + 1, (now_us() - g->t_first) / 1000.0,
+			g->add_us / 1000.0,
+			((now_us() - g->t_first) - g->add_us) / 1000.0);
 	}
 	return (int)g->n_ent++;
 }
