@@ -65,7 +65,6 @@ struct npu_entry {
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
-	unsigned di;               /* which device, and so which CBUF window */
 	double weight_mb;
 };
 
@@ -544,12 +543,6 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e = &g->ent[g->n_ent];
 	memset(e, 0, sizeof(*e));
 	/*
-	 * Alternate. A group is q, k, v or gate, up -- consecutive adds -- so
-	 * alternating puts a group's members on different devices, which is
-	 * exactly where the overlap has to come from.
-	 */
-	e->di = g->ndev > 1 ? (g->n_ent & 1) : 0;
-	/*
 	 * ⚠ ITS OWN OUTPUT BUFFER, AND THIS IS NOT TIDINESS.
 	 *
 	 * One shared buffer had to be sized for the WIDEST tensor, and round
@@ -600,7 +593,6 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		}
 	}
 	}
-	(void)si;
 
 	e->t = t;
 	e->first = first;
@@ -664,7 +656,20 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	}
 
 	/* every K slice's activation, each in its own region */
-	charsiu_bo_prep(g->dev[e->di], &g->in[e->di], 1000000000);
+	/*
+	 * ⚠ THE ACTIVATION GOES INTO EVERY DEVICE, and round 365 shipped without
+	 * it. The slices of one tensor are spread across both devices now, so
+	 * the ones on the other device read an input buffer nobody wrote --
+	 * and the decode came back as word salad on BOTH int8 and int4 while
+	 * the one device control was perfect. The grouped path had already been
+	 * fixed for exactly this and the single path was not.
+	 *
+	 * A buffer object belongs to the file that created it, so there is no
+	 * sharing one: it has to be packed twice. That is a few kilobytes
+	 * against the megabytes of weights a submit fetches.
+	 */
+	for (unsigned d = 0; d < g->ndev; d++) {
+	charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
@@ -678,7 +683,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			/* the half step of the midrise grid rides on this */
 			g->asum[ki] = as;
 			charsiu_pack_input_f16(&s->job.mm, g->fscr,
-					       (uint8_t *)g->in[e->di].map
+					       (uint8_t *)g->in[d].map
 					       + ki * g->in_stride,
 					       g->in_stride);
 		} else {
@@ -686,13 +691,14 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				g->scratch[i] = (uint8_t)((int)a->q1[s->k0 + i]
 							  + 128);
 			charsiu_pack_input(&s->job.mm, g->scratch,
-					   (uint8_t *)g->in[e->di].map
+					   (uint8_t *)g->in[d].map
 					   + ki * g->in_stride,
 					   g->in_stride,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev[e->di], &g->in[e->di]);
+	charsiu_bo_fini(g->dev[d], &g->in[d]);
+	}
 
 	/*
 	 * ONE submit for the whole projection, unless a cap says otherwise.
