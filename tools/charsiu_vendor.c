@@ -46,7 +46,19 @@
 
 #define WT_BYTES   (2u << 20)
 #define IN_BYTES   (1u << 20)
-#define OUT_BYTES  (4u << 20)
+/*
+ * ⚠ THE OUTPUT BO IS SIZED FROM THE ENVIRONMENT because round 348's timing
+ * measured this tool and not the hardware: run() memsets the whole output
+ * buffer and cache-maintains it twice a submit, and at 4 MiB that is most of
+ * the 1418 us it reported. int8 came out at 1.31 GB/s against a standing 9.38,
+ * which is the giveaway.
+ */
+static size_t out_bytes(void)
+{
+	const char *e = getenv("CHARSIU_OUT_KB");
+
+	return (size_t)(e ? strtoul(e, NULL, 0) : 4096) << 10;
+}
 
 static size_t load(const char *path, void *dst, size_t max)
 {
@@ -97,6 +109,23 @@ static unsigned run(struct ctx *c, int32_t *dst, unsigned words)
 		if (dst[i])
 			live++;
 	return live;
+}
+
+/*
+ * The submit alone: no memset of the output, no copy back. Everything run()
+ * does around the submit is this tool's own bookkeeping, and round 348 timed
+ * all of it. The overhead is REMOVED rather than subtracted -- round 327 was
+ * lost to a subtraction.
+ */
+static void run_bare(struct ctx *c)
+{
+	if (charsiu_bo_fini(c->dev, &c->out) ||
+	    charsiu_submit(c->dev, &c->regcmd, (unsigned)c->nreg,
+			   c->in_h, 3, c->out_h, 1) ||
+	    charsiu_bo_prep(c->dev, &c->out, 5000000000LL)) {
+		printf("timed submit FAILED\n");
+		exit(1);
+	}
 }
 
 /* set one nibble of the weight buffer and push it back to the device */
@@ -210,7 +239,7 @@ int main(int argc, char **argv)
 	if (charsiu_bo_alloc(c.dev, 8192, &c.regcmd) ||
 	    charsiu_bo_alloc(c.dev, IN_BYTES, &c.in) ||
 	    charsiu_bo_alloc(c.dev, WT_BYTES, &c.wt) ||
-	    charsiu_bo_alloc(c.dev, OUT_BYTES, &c.out) ||
+	    charsiu_bo_alloc(c.dev, out_bytes(), &c.out) ||
 	    charsiu_bo_alloc(c.dev, 1 << 20, &c.coef)) {
 		printf("bo alloc FAILED\n");
 		return 1;
@@ -280,17 +309,17 @@ int main(int argc, char **argv)
 		double us;
 		unsigned r;
 
-		run(&c, cur, words);                    /* warm */
+		run_bare(&c);                           /* warm */
 		clock_gettime(CLOCK_MONOTONIC, &t0);
 		for (r = 0; r < reps; r++)
-			run(&c, cur, words);
+			run_bare(&c);
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		us = ((double)(t1.tv_sec - t0.tv_sec) * 1e6
 		      + (double)(t1.tv_nsec - t0.tv_nsec) / 1e3) / reps;
-		printf("TIME: %s K=%u N=%u  %.1f us/submit over %u reps, "
-		       "%zu weight bytes = %.2f GB/s\n",
+		printf("TIME: %s K=%u N=%u out_bo=%zuKB  %.1f us/submit over "
+		       "%u reps, %zu weight bytes = %.2f GB/s\n",
 		       job.mm.wdtype == CHARSIU_INT4 ? "int4" : "int8",
-		       job.mm.k, job.mm.n, us, reps, wb,
+		       job.mm.k, job.mm.n, out_bytes() >> 10, us, reps, wb,
 		       (double)wb / us / 1000.0);
 	}
 
