@@ -77,6 +77,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 */
 	const int w4sym = getenv("CHARSIU_NPU_W4_SYM") != NULL;
 	const int w4clip = getenv("CHARSIU_NPU_W4_CLIP") != NULL;
+	const int rms = getenv("CHARSIU_NPU_RMS") != NULL;
 	uint64_t ngrp;
 	float qmax = bits == 4 ? 7.0f : 127.0f;
 
@@ -197,13 +198,25 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 				row[i] /= t->kscale[i];
 		for (uint64_t g = 0; g < ngrp; g++) {
 		uint64_t lo = g * grp, hi = lo + grp < k ? lo + grp : k;
-		float amax = 0.0f, d, id;
+		float amax = 0.0f, vmax = 0.0f, d, id;
 
+		/*
+		 * ONE PASS, and it carries the SIGNED extreme with it.
+		 *
+		 * The int4 branch below used to walk the group a SECOND time to
+		 * find the signed value of largest magnitude, calling fabsf on
+		 * the running maximum every iteration as well. That second pass
+		 * is the whole of int4's extra load cost: 3.37 ns a weight
+		 * against int8's 2.00, measured over 440 million weights of the
+		 * real model with three repeats.
+		 */
 		for (uint64_t i = lo; i < hi; i++) {
 			float a = fabsf(row[i]);
 
-			if (a > amax)
+			if (a > amax) {
 				amax = a;
+				vmax = row[i];
+			}
 		}
 		/*
 		 * SYMMETRIC, and 127 rather than 128: the hardware's operand is
@@ -221,11 +234,6 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * CHARSIU_NPU_W4_SYM restores the symmetric version.
 		 */
 		if (bits == 4 && !w4sym) {
-			float vmax = 0.0f;
-
-			for (uint64_t i = lo; i < hi; i++)
-				if (fabsf(row[i]) > fabsf(vmax))
-					vmax = row[i];
 			d = vmax / -8.0f;
 			/*
 			 * ⚠ absmax IS THE WRONG SCALE FOR FOUR BITS, and it is
@@ -293,7 +301,18 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			}
 			dst[i] = (int8_t)v;
 			sum += v;
-			{
+			/*
+			 * ⚠ A DIAGNOSTIC, AND IT COSTS ABOUT 3%. I guessed a
+			 * third before measuring it, and three repeats on the
+			 * real model say 3.37 ns a weight against 3.46. Two
+			 * doubles multiplied and accumulated for every
+			 * weight in the model, 1.24 billion times, to produce
+			 * ONE number per tensor that nothing in the decode
+			 * reads: t->rms_rel, which is printed by --info.
+			 * CHARSIU_NPU_RMS turns it back on for the rounds that
+			 * want it.
+			 */
+			if (rms) {
 				double e = (double)row[i] - (double)v * d;
 
 				se += e * e;
