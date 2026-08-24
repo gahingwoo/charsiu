@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "charsiu_llm.h"
 
@@ -53,6 +54,9 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
+"  --hold-secs N  after generating, stay alive N seconds with the model\n"
+"                 still mapped and the NPU still open, so an idle session\n"
+"                 can be measured from outside\n"
 "  -q            do not echo the prompt\n");
 }
 
@@ -85,6 +89,7 @@ int main(int argc, char **argv)
 	 * to somebody's model file and doing that unasked is rude.
 	 */
 	const char *cache = NULL;
+	int hold_secs = 0;
 	char cachepath[1024];
 	double t_load, t0, t_prompt;
 	int i;
@@ -111,6 +116,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bos")) add_bos = 1;
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
+		else if (!strcmp(a, "--hold-secs")) hold_secs = atoi(NEXT());
 		else if (!strcmp(a, "--cache")) cache = "";
 		else if (!strcmp(a, "--cache-at")) cache = NEXT();
 		else if (!strcmp(a, "-q")) quiet = 1;
@@ -480,6 +486,21 @@ next:
 			       "the other %d are --ignore-eos continuing a "
 			       "finished turn]\n", eog_at + 1,
 			       produced - eog_at - 1);
+	}
+
+	/*
+	 * A battery device spends most of its life here: the model is loaded,
+	 * the NPU file descriptors are open, the worker pool exists, and nobody
+	 * is talking. Whether the rails drop in this state is the whole question
+	 * for an idle session, and it cannot be asked from outside a process
+	 * that has already exited. Hold before freeing anything.
+	 */
+	if (hold_secs > 0) {
+		printf("[holding %d s with the model resident]\n", hold_secs);
+		fflush(stdout);
+		sleep((unsigned int)hold_secs);
+		printf("[hold done]\n");
+		fflush(stdout);
 	}
 
 	llama_state_free(st);
