@@ -4,35 +4,32 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** **Every matmul in Llama-3.2-1B runs on the NPU, the tokens are character for
-character what the CPU produces, and it is 18% faster than the best CPU path on the same
-board.** 113 tensors including the 128256 wide output head, on a ROCK 4D with a mainline
-kernel and the open `rocket` driver.
+**Status.** **Every matmul in Llama-3.2-1B runs on the NPU at four bits, the sentence is
+identical to the one the exact arithmetic writes, and it is 2.3x the int8 baseline on the
+same board.** 113 tensors including the 128256 wide output head, on a ROCK 4D with a
+mainline kernel and the open `rocket` driver.
 
 ```
-                          tokens/second
-  charsiu on the NPU          6.55
-  charsiu on the CPU, best    5.53      (pure q4_0, four threads)
-  charsiu on the CPU, q8_0    3.70      (the same file the NPU is running)
+                                     tokens/second
+  charsiu, int4, 64 tokens                14.70
+  charsiu, int4, 384 tokens               11.98      (attention grows with the context)
+  charsiu, int8                            6.40
+  charsiu on the CPU, best                 5.53      (pure q4_0, four threads)
 ```
 
-A token is 153 ms: 132 in the hardware path and 21 on the CPU. Of the 132, about 119 is
-the weight fetch itself at 9.35 GB/s, against the 10.35 the bench measures as this
-hardware's ceiling. **There is almost no overhead left to remove** -- the fence is 5.5 ms
-above what the bytes need, submitting is 1.7, reading back is 6.0.
+A 64 token generation is 67.7 ms a token, and 54 of that is the weight fetch itself at
+10.3 GB/s -- which is what this hardware's own bandwidth bench measures. **The fence is
+the floor**: 620 MB of int4 weights have to cross the bus for every token, and no amount
+of software makes that cheaper. What is left on the CPU is about 13 ms, and the last
+eight rounds took it there from about 40.
 
 That acceptance test is the point of how this was built. The CPU decode loop came first
-and is the oracle; the NPU computes the same integer sum, so the two runs must agree
-exactly, and "the text looks fine" was never allowed to count.
+and is the oracle; the NPU computes the same sum, so the two runs must agree exactly, and
+"the text looks fine" was never allowed to count.
 
 Still on the CPU: the embedding lookup, RMSNorm, RoPE, the attention score, softmax and
-weighted sum, SwiGLU, the residuals, the 128256-wide output head, and sampling. The
-projections are 973M of the 1236M matmul weights, so 79% of the work has moved.
-
-It is not yet faster. 4.20 tokens a second against the CPU's best 5.53, because there are
-480 **unchained** submits per token and each carries about 190us of fixed cost. Chaining is
-the next piece and the acceptance test for it was written before any of this:
-at least 2.2 MB of weights fetched per submit.
+weighted sum, SwiGLU, the residuals and sampling. Every projection, including the output
+head, is on the hardware.
 
 Two halves, and only one of them touches the NPU.
 
@@ -1259,24 +1256,49 @@ next board round.
 ## What runs today
 
 ```
-$ charsiu_probe
-open /dev/accel/accel0 ok
-bo handle 1  dma 0x1000  size 4096  in the regcmd window
-write/readback through the mapping: ok (0 bytes differ)
+$ charsiu_run models/Llama-3.2-1B-Instruct-Q8_0.gguf -p "The capital of France is" \
+      -n 64 --ignore-eos -c 512 -t 4
+ Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also located in
+ Paris. The famous painting "The Mona Lisa" is on display at the Louvre Museum. ...
 
-$ charsiu_matmul 1 64 64          # M=1, the shape an LLM decodes with
-matmul M=1 K=64 N=64 int8, feature atom 16, 1 entries per row
-register stream: 143 entries
-submit ok
-output: 64 of 64 bytes written, 64 BYTE EXACT, 0 differ by more than 1
+[load 127 ms | gen 64 tok in 4353 ms, 14.70 tok/s | peak 2531 MB]
 ```
 
-The stream those 143 entries make is identical to the one Mesa emits for the same
-shape, entry for entry, values and order, addresses and quantisation aside, and it is
-also identical to what the vendor's own compiler produces for that shape with no
-activation. Both are checked on a desktop, not on the board:
-`vendor-capture/cmp_charsiu.py` in the driver repository diffs the whole stream against
-a vendor `.rknn` compiled at charsiu's exact geometry.
+with the hardware taking every projection:
+
+```
+CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=131072
+```
+
+`CHARSIU_STAGES=1` prints where a token goes. On a ROCK 4D at 64 tokens:
+
+```
+  q k v                9.9 ms      gate + up          22.4
+  o proj               8.0         down               20.3
+  output head          8.8         attention           3.3
+  everything else      2.6         of which silu       1.9
+```
+
+Five of those rows are the hardware; the fence inside them is 54 ms of the 67.7.
+
+### The parts that are not the hardware
+
+Each of these was a board round with a control that could fail, and each is in
+`board-logs/` in the driver repository:
+
+| | before | after |
+|---|---|---|
+| weight packing into the NPU's layout | 8.5 ms a token | 2.8 |
+| summing the K slices | 8.6 | 3.5 |
+| the activation quantised for consumers that never read it | 8.1 | 0.01 |
+| attention, at 384 tokens | 37.9 | 16.2 |
+
+The last one is two changes. Four query heads share every key/value row in this
+model, and the loop was reading each row four times; and the cache was laid out
+`[layer][position][head]` while attention walks one head across every position.
+Neither changes a number -- the tokens are byte identical either way -- and both
+were measured against a control that put the old behaviour back.
 
 ## The instrument
 
