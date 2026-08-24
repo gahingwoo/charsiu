@@ -403,6 +403,16 @@ void tokenizer_free(struct tokenizer *tk)
  * usually meant to be seen; the encoder's special list takes both because it
  * is matching literal spellings in a prompt, which is a different question.
  */
+/*
+ * The id of a token by its exact spelling, or -1. Used to find the two header
+ * markers, which cannot be hard coded: they are Llama 3's names and another
+ * family spells its roles differently.
+ */
+int32_t tokenizer_find(const struct tokenizer *tk, const char *spelling)
+{
+	return smap_get(&tk->vocab, spelling, strlen(spelling));
+}
+
 int tokenizer_is_control(const struct tokenizer *tk, int32_t id)
 {
 	return id >= 0 && (uint32_t)id < tk->n_vocab && tk->type[id] == 3;

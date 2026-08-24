@@ -342,6 +342,45 @@ int main(int argc, char **argv)
 
 	t0 = now_ms();
 	int produced = 0;
+	/*
+	 * ⚠ A ROLE MARKER IS THREE TOKENS AND ONLY TWO OF THEM ARE CONTROL.
+	 *
+	 * Llama 3 writes a turn header as <|start_header_id|>assistant
+	 * <|end_header_id|>, and the middle one is an ORDINARY TEXT token.
+	 * Round 374 hid the two markers by type and left the word, so from
+	 * round 374 to 377 the long generation arms printed a bare "assistant"
+	 * glued to the previous sentence -- which reads as if the model had
+	 * said it, and is worse than showing the tags was.
+	 *
+	 * The whole header is suppressed now, markers and content.
+	 *
+	 * ⚠ AND IT BUFFERS RATHER THAN DROPS, because the first two attempts at
+	 * this both lost text. Pushed past its own end with --ignore-eos on a
+	 * prompt that was never in chat format, this model opens a header and
+	 * NEVER CLOSES IT: the stream reads
+	 * <|eot_id|><|start_header_id|>assistant | and then plain text, with
+	 * <|end_header_id|> appearing ZERO times in 384 tokens.
+	 *
+	 * Suppressing until the close latched and ate everything after. Giving
+	 * up after a budget ate the budget. So the tokens after the marker are
+	 * HELD: if the close arrives they are dropped, and if it does not they
+	 * are printed. A state machine reading model output must assume the
+	 * closing token may never come, and must not lose anything when it
+	 * does not.
+	 */
+	int32_t hdr0 = tokenizer_find(m.tk, "<|start_header_id|>");
+	int32_t hdr1 = tokenizer_find(m.tk, "<|end_header_id|>");
+	int in_header = 0, eog_at = -1, nheld = 0, heldn = 0;
+	const int HDR_MAX = 8;
+	/*
+	 * ⚠ THE BYTES, NOT THE POINTER. tokenizer_decode hands back a pointer
+	 * into a single reused per-thread buffer for anything that is not a
+	 * control token, so holding the pointer and printing it later prints
+	 * whatever the LATEST call left there. The second attempt at this did
+	 * exactly that and emitted "el\0\0\0ribeel\0\0el" where the text
+	 * should have been.
+	 */
+	char held[1024];
 
 	for (i = 0; i < n_gen; i++) {
 		int32_t tok = temp > 0.0f
@@ -350,9 +389,48 @@ int main(int argc, char **argv)
 		int len;
 		const char *s;
 
-		if (!ignore_eos && tokenizer_is_eog(m.tk, tok))
-			break;
+		if (tokenizer_is_eog(m.tk, tok)) {
+			if (!ignore_eos)
+				break;
+			/*
+			 * ⚠ WHERE THE MODEL WANTED TO STOP. Past this point
+			 * the text is a continuation of a finished turn, and
+			 * greedy decoding on an unchanged context regenerates
+			 * near-identical paragraphs -- which is what every 384
+			 * token arm since round 372 has shown and what
+			 * --ignore-eos means. Reporting it stops the log from
+			 * reading as though the model had lost the thread.
+			 */
+			if (eog_at < 0)
+				eog_at = i;
+		}
 		s = tokenizer_decode(m.tk, tok, &len);
+		if (tok == hdr0 && !show_special) {
+			in_header = 1;
+			nheld = heldn = 0;
+			produced++;
+			goto next;
+		}
+		if (in_header) {
+			if (tok == hdr1) {          /* a whole header: drop it */
+				in_header = 0;
+				nheld = heldn = 0;
+				produced++;
+				goto next;
+			}
+			if (nheld < HDR_MAX &&
+			    heldn + len <= (int)sizeof(held)) {
+				memcpy(held + heldn, s, (size_t)len);
+				heldn += len;
+				nheld++;
+				produced++;
+				goto next;
+			}
+			/* it never closed -- print what was held and carry on */
+			in_header = 0;
+			fwrite(held, 1, (size_t)heldn, stdout);
+			nheld = heldn = 0;
+		}
 		/*
 		 * ⚠ A CONTROL TOKEN IS NOT TEXT. decode hands back its literal
 		 * spelling, and this loop used to write whatever came back, so
@@ -367,6 +445,7 @@ int main(int argc, char **argv)
 			fflush(stdout);
 		}
 		produced++;
+next:
 
 		if (st->pos >= st->n_ctx)
 			break;
@@ -396,6 +475,11 @@ int main(int argc, char **argv)
 		       t_load, n_ids, t_prompt, n_ids * 1000.0 / (t_prompt ? t_prompt : 1),
 		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1),
 		       hwm / 1024);
+		if (eog_at >= 0)
+			printf("[the model reached its own end at token %d; "
+			       "the other %d are --ignore-eos continuing a "
+			       "finished turn]\n", eog_at + 1,
+			       produced - eog_at - 1);
 	}
 
 	llama_state_free(st);
