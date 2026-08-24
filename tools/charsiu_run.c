@@ -54,6 +54,9 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
+"  -i, --interactive  a conversation: the model and the NPU tensors stay\n"
+"                 staged, so every turn after the first costs a token and\n"
+"                 not the twenty seconds staging takes\n"
 "  --hold-secs N  after generating, stay alive N seconds with the model\n"
 "                 still mapped and the NPU still open, so an idle session\n"
 "                 can be measured from outside\n"
@@ -90,6 +93,7 @@ int main(int argc, char **argv)
 	 */
 	const char *cache = NULL;
 	int hold_secs = 0;
+	int interactive = 0, turn;
 	char cachepath[1024];
 	double t_load, t0, t_prompt;
 	int i;
@@ -117,6 +121,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
 		else if (!strcmp(a, "--hold-secs")) hold_secs = atoi(NEXT());
+		else if (!strcmp(a, "-i") || !strcmp(a, "--interactive"))
+			interactive = 1;
 		else if (!strcmp(a, "--cache")) cache = "";
 		else if (!strcmp(a, "--cache-at")) cache = NEXT();
 		else if (!strcmp(a, "-q")) quiet = 1;
@@ -208,10 +214,22 @@ int main(int argc, char **argv)
 		fclose(fp);
 		prompt = text;
 	}
+	/* whether -p was actually given decides if turn 0 asks for a line */
+	int prompt_given = prompt != NULL;
+
 	if (!prompt)
 		prompt = "The capital of France is";
 
-	if (chat) {
+	/*
+	 * ⚠ INTERACTIVE IMPLIES THE CHAT TEMPLATE. A conversation fed as raw
+	 * completion text has no turn structure for the model to close, which
+	 * is exactly how rounds 372-377 ended up with a model that opens a
+	 * header and never shuts it.
+	 */
+	if (interactive)
+		chat = 1;
+
+	if (chat && !interactive) {
 		size_t n = strlen(prompt) + strlen(sys) + 256;
 		char *c = malloc(n);
 
@@ -223,9 +241,81 @@ int main(int argc, char **argv)
 		prompt = c;
 	}
 
-	max_ids = (int)strlen(prompt) + 64;
+	/*
+	 * ⚠ THE STATE IS BUILT ONCE AND EVERY TURN SHARES IT. That is the whole
+	 * point of -i: staging the NPU tensors takes about twenty seconds, so a
+	 * conversation that reloaded per turn would be unusable. The kv cache
+	 * carries the history, which is also why the second turn feeds its
+	 * tokens at st->pos rather than at zero.
+	 */
+	st = llama_state_new(&m, n_ctx);
+	if (!st) {
+		fprintf(stderr, "charsiu_run: no room for a %d token context\n",
+			n_ctx ? n_ctx : (int)m.n_ctx_train);
+		return 1;
+	}
+
+	max_ids = 8192;
 	ids = malloc((size_t)max_ids * sizeof(*ids));
-	n_ids = tokenizer_encode(m.tk, prompt, add_bos, ids, max_ids);
+	if (!ids)
+		return 1;
+
+	char *turnbuf = NULL;
+	size_t turnbuf_n = 0;
+
+	for (turn = 0; ; turn++) {
+	const char *feed = prompt;
+
+	if (interactive) {
+		char line[4096];
+
+		if (turn > 0 || !prompt_given) {
+			fputs("\n> ", stdout);
+			fflush(stdout);
+			if (!fgets(line, sizeof(line), stdin)) {
+				fputs("\n", stdout);
+				break;
+			}
+			line[strcspn(line, "\n")] = 0;
+			if (!*line)
+				continue;
+			if (!strcmp(line, "/quit") || !strcmp(line, "/exit"))
+				break;
+		} else {
+			snprintf(line, sizeof(line), "%s", prompt);
+		}
+
+		/*
+		 * ⚠ Turn 0 opens with the system message; later turns must
+		 * first CLOSE the assistant turn the model just finished. The
+		 * generation loop breaks ON the end-of-turn token without
+		 * feeding it, so <|eot_id|> is not in the cache yet and the
+		 * next turn has to supply it.
+		 */
+		size_t need = strlen(line) + strlen(sys) + 512;
+		if (need > turnbuf_n) {
+			free(turnbuf);
+			turnbuf = malloc(need);
+			if (!turnbuf)
+				break;
+			turnbuf_n = need;
+		}
+		if (turn == 0)
+			snprintf(turnbuf, turnbuf_n,
+				 "<|start_header_id|>system<|end_header_id|>\n\n%s<|eot_id|>"
+				 "<|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
+				 "<|start_header_id|>assistant<|end_header_id|>\n\n",
+				 sys, line);
+		else
+			snprintf(turnbuf, turnbuf_n,
+				 "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
+				 "<|start_header_id|>assistant<|end_header_id|>\n\n",
+				 line);
+		feed = turnbuf;
+	}
+
+	/* ⚠ add_bos only once: a second one mid-conversation is a new document */
+	n_ids = tokenizer_encode(m.tk, feed, turn == 0 ? add_bos : 0, ids, max_ids);
 	if (n_ids < 0) {
 		fprintf(stderr, "charsiu_run: the prompt did not tokenize\n");
 		return 1;
@@ -250,18 +340,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	st = llama_state_new(&m, n_ctx);
-	if (!st) {
-		fprintf(stderr, "charsiu_run: no room for a %d token context\n",
-			n_ctx ? n_ctx : (int)m.n_ctx_train);
-		return 1;
-	}
-	if (n_ids >= st->n_ctx) {
+	/* ⚠ what is LEFT, not what the context is: turn five starts at st->pos */
+	if (st->pos + n_ids + n_gen >= st->n_ctx) {
+		if (interactive) {
+			printf("\n[the %d token context is full -- /quit and start again]\n",
+			       st->n_ctx);
+			break;
+		}
 		fprintf(stderr, "charsiu_run: the prompt is longer than the context\n");
 		return 1;
 	}
 
-	if (!quiet) {
+	/*
+	 * Echo the prompt in one-shot mode so a log reads as one piece of text.
+	 * In a conversation the user just typed it, and echoing it back with the
+	 * template markers around it would be noise.
+	 */
+	if (!quiet && !interactive) {
 		for (i = 0; i < n_ids; i++) {
 			int len;
 			const char *s = tokenizer_decode(m.tk, ids[i], &len);
@@ -274,8 +369,9 @@ int main(int argc, char **argv)
 	t0 = now_ms();
 	const float *logits = NULL;
 
+	/* ⚠ st->pos, not i: turn two starts where turn one stopped */
 	for (i = 0; i < n_ids; i++)
-		logits = llama_forward(st, ids[i], i);
+		logits = llama_forward(st, ids[i], st->pos);
 	t_prompt = now_ms() - t0;
 	/*
 	 * ⚠ THE STAGE TIMERS START HERE, NOT AT THE FIRST TOKEN. Round 327
@@ -463,30 +559,42 @@ next:
 	{
 		double t_gen = now_ms() - t0;
 		long hwm = 0;
-		FILE *st = fopen("/proc/self/status", "r");
+		/* ⚠ NOT `st`: that is the llama state, and shadowing it here
+		 * made the interactive report read st->pos off a FILE. */
+		FILE *pf = fopen("/proc/self/status", "r");
 
-		if (st) {
+		if (pf) {
 			char line[256];
 
-			while (fgets(line, sizeof(line), st))
+			while (fgets(line, sizeof(line), pf))
 				if (!strncmp(line, "VmHWM:", 6)) {
 					hwm = strtol(line + 6, NULL, 10);
 					break;
 				}
-			fclose(st);
+			fclose(pf);
 		}
 
+		if (interactive)
+			printf("\n[%d tok, %.1f tok/s, %d/%d context]\n",
+			       produced, produced * 1000.0 / (t_gen ? t_gen : 1),
+			       st->pos, st->n_ctx);
+		else
 		printf("\n\n[load %.0f ms | prompt %d tok in %.0f ms, %.2f tok/s"
 		       " | gen %d tok in %.0f ms, %.2f tok/s | peak %ld MB]\n",
 		       t_load, n_ids, t_prompt, n_ids * 1000.0 / (t_prompt ? t_prompt : 1),
 		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1),
 		       hwm / 1024);
-		if (eog_at >= 0)
+		if (!interactive && eog_at >= 0)
 			printf("[the model reached its own end at token %d; "
 			       "the other %d are --ignore-eos continuing a "
 			       "finished turn]\n", eog_at + 1,
 			       produced - eog_at - 1);
 	}
+
+	if (!interactive)
+		break;
+	}   /* the turn loop */
+	free(turnbuf);
 
 	/*
 	 * A battery device spends most of its life here: the model is loaded,

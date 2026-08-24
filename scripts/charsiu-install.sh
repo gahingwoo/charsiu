@@ -354,6 +354,21 @@ fi
 ui_hdr "checking"
 CHARSIU_CONFIG="$ETC/config.ini" "$SBIN/charsiu-doctor" || true
 
+# ⚠ A REPORT IS NOT A DEMONSTRATION. Ending on a list of ticks leaves someone
+# who has waited through a build and a download with no evidence the thing
+# talks. One sentence is cheap and it is the whole point of installing it.
+if [ -n "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ] && [ "$NPU_OK" = 1 ]; then
+	if ui_yesno "Ask it something, to see it work?
+
+The first run stages the NPU tensors, which takes about twenty
+seconds before the first word." ; then
+		ui_hdr "asking: the capital of France is"
+		CHARSIU_CONFIG="$ETC/config.ini" CHARSIU_LIB="$BIN" \
+			"$SBIN/charsiu" -p "The capital of France is" -n 32 -q || true
+		printf '\n'
+	fi
+fi
+
 ui_msg "Done.
 
   charsiu-config     pick a model, threads, context

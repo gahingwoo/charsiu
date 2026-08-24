@@ -184,7 +184,15 @@ fetch_and_gate() {
 	fi
 
 	say "fetching $base"
-	get_url "$url" "$part" || die "download failed (it resumes: run the same command again)"
+	if ! get_url "$url" "$part"; then
+		got=$(stat -c%s "$part" 2>/dev/null || echo 0)
+		die "the download stopped after $((got / 1048576)) MB of about ${want_mb} MB.
+
+  ⚠ IT DOES NOT START OVER. The part that arrived is kept in
+    $part
+  and running the SAME command again picks up where it stopped
+  (curl -C - / wget -c). On a board's link that is normal, not a fault."
+	fi
 
 	say "checking what actually came down"
 	if "$CK" "$part"; then

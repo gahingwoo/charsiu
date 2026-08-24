@@ -17,22 +17,32 @@
 # `t->kgroup == g->kmax`; set them differently and the tensor silently takes
 # the other path. config.ini keeps one value and writes both.
 #
-# Usage:  charsiu [-p PROMPT] [-n N] [any other charsiu_run flag]
-#         charsiu --show          print the command it would run, and stop
-#         charsiu --config FILE   use a different config
+# Usage:  charsiu                    a conversation (the model stays staged)
+#         charsiu -p PROMPT [-n N]   one answer and out
+#         charsiu bench              what this board does, in tok/s
+#         charsiu --show             print the command it would run, and stop
+#         charsiu --config FILE      use a different config
 set -eu
 
 CONF="${CHARSIU_CONFIG:-/etc/charsiu/config.ini}"
 RUN="${CHARSIU_RUN_BIN:-}"
 SHOW=0
 
+BENCH=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--config) CONF="$2"; shift 2 ;;
 	--show)   SHOW=1; shift ;;
+	bench)    BENCH=1; shift ;;
 	*)        break ;;
 	esac
 done
+
+# ⚠ NO ARGUMENTS MEANS A CONVERSATION, not the built-in demo prompt. Staging
+# costs about twenty seconds and a one-shot pays it for a single answer, so the
+# default has to be the mode that pays it once.
+INTERACTIVE=0
+[ $# -eq 0 ] && [ "$BENCH" = 0 ] && [ "$SHOW" = 0 ] && INTERACTIVE=1
 
 [ -f "$CONF" ] || { echo "charsiu: no config at $CONF (run charsiu-config)" >&2; exit 1; }
 
@@ -92,6 +102,54 @@ EX=$(awk '/^[ \t]*\[extra\][ \t]*$/{f=1;next} /^[ \t]*\[/{f=0}
 	}' "$CONF")
 [ -n "$EX" ] && E="$E $EX"
 
+# ⚠ TWENTY SECONDS OF SILENCE IS THE MOST OFF-PUTTING PART OF A FIRST RUN, and
+# the runtime already says enough to draw a bar: it announces how many tensors
+# it will stage (n_layer * 7 + 1 -- seven projections a layer plus the output
+# head, 113 for the model every board round uses, which is exactly what its logs
+# say) and then heartbeats every sixteen. Progress goes to stderr, the generated
+# text to stdout, so the two never mix.
+stage_filter() {
+	awk '
+	/staging [0-9]+$/ {
+		match($0, /staging [0-9]+$/); tot = substr($0, RSTART + 8) + 0
+		printf "  staging %d NPU tensors\n", tot > "/dev/stderr"; next
+	}
+	/tensors staged/ {
+		n = $3 + 0
+		if (tot > 0) {
+			pct = int(n * 100 / tot); if (pct > 100) pct = 100
+			printf "\r  [%-24s] %3d%%  %d/%d",
+			       substr("########################", 1, int(pct/4.2)),
+			       pct, n, tot > "/dev/stderr"
+			fflush("/dev/stderr"); bar = 1
+		}
+		next
+	}
+	# ⚠ a pass-through line lands mid-bar unless the bar is closed first,
+	# and \r leaves the cursor at column 0 of a line that still has a bar on it.
+	{ if (bar) { printf "\n" > "/dev/stderr"; bar = 0 }
+	  print > "/dev/stderr" }
+	END { if (bar) printf "\r  [########################] 100%%  %d/%d\n", tot, tot > "/dev/stderr" }
+	'
+}
+
+if [ "$BENCH" = 1 ]; then
+	printf '\n  charsiu bench -- %s\n' "$(basename "$MODEL")"
+	printf '  %s, %s threads, context %s\n\n' \
+	       "$(case "$NPU" in yes|1|true|on) echo "NPU int4";; *) echo "CPU";; esac)" \
+	       "$THREADS" "$CTX"
+	# ⚠ 64 tokens is what every board round measures, so the number here is
+	# comparable with the logs rather than being a new metric nobody can
+	# check. --ignore-eos so a short answer does not shorten the sample.
+	out=$( { env $E "$RUN" "$MODEL" -p "The capital of France is" -n 64 \
+		--ignore-eos -q -c "$CTX" -t "$THREADS" 2>&1 1>&3 | stage_filter; } 3>&1 )
+	echo "$out" | grep -oE 'gen 64 tok in [0-9]+ ms, [0-9.]+ tok/s' \
+		| sed 's/^/  /' || echo "  (no rate reported)"
+	echo "$out" | grep -oE '[0-9.]+ GB/s of weights' | sed 's/^/  /' || true
+	printf '\n'
+	exit 0
+fi
+
 if [ "$SHOW" = 1 ]; then
 	printf 'env %s \\\n  %s %s -c %s -t %s' "$E" "$RUN" "$MODEL" "$CTX" "$THREADS"
 	[ $# -gt 0 ] && printf ' %s' "$@"
@@ -99,5 +157,15 @@ if [ "$SHOW" = 1 ]; then
 	exit 0
 fi
 
+[ "$INTERACTIVE" = 1 ] && set -- -i "$@"
+
 # shellcheck disable=SC2086
+if [ -t 2 ] && [ -z "${CHARSIU_NO_PROGRESS:-}" ]; then
+	# stderr through the bar, stdout straight to the terminal. ⚠ The exit
+	# status has to come from charsiu_run and not from awk, hence the
+	# explicit plumbing rather than a plain pipeline.
+	{ env $E "$RUN" "$MODEL" -c "$CTX" -t "$THREADS" "$@" 2>&1 1>&3 \
+		| stage_filter; } 3>&1
+	exit $?
+fi
 exec env $E "$RUN" "$MODEL" -c "$CTX" -t "$THREADS" "$@"
