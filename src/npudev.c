@@ -80,6 +80,24 @@ struct npu_entry {
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
 	double weight_mb;
+	/*
+	 * THE ROWS THE CPU KEEPS, IF ANY.
+	 *
+	 * Round 370 measured what the memory controller has spare: the NPU
+	 * alone pulls 10.46 GB/s, and with four threads reading DRAM beside it
+	 * the pair reach 15.46, so about 5 GB/s is going unused. Decode is a
+	 * dependency chain, so the only way to spend that is to give a second
+	 * engine part of the SAME tensor -- and the cheapest second engine is
+	 * the CPU, which is already here and is already BLOCKED in prep_bo for
+	 * most of the fence.
+	 *
+	 * cq holds those rows' weights packed two to a byte, row major. It has
+	 * to be packed: t->q keeps one BYTE per int4 weight, so reading rows
+	 * out of it costs twice the bytes the NPU pays for the same weights,
+	 * and the whole idea is bandwidth.
+	 */
+	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
+	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
 };
 
 struct charsiu_npu {
@@ -170,6 +188,13 @@ struct charsiu_npu {
 	 * rather than derived.
 	 */
 	double pack_us;
+	/*
+	 * And the CPU's share of the projections, which runs INSIDE the fence
+	 * window rather than beside it: it is time the calling thread used to
+	 * spend blocked. It is charged here so a round can see what it cost as
+	 * well as what it bought.
+	 */
+	double cpu_us;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -179,6 +204,12 @@ struct charsiu_npu {
 	double slow_us, min_gbs;
 	int strikes, dead, whined, nochain, slowed, nofini, inprep, plain;
 	int serialpack;
+	/*
+	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
+	 * 0 is the hardware doing all of it, which is every round before 371.
+	 */
+	double cpu_frac;
+	float *afscr;              /* the activation, rounded through fp16 */
 	unsigned long slices;
 };
 
@@ -258,6 +289,107 @@ static void scaled_add(float *acc, const float *fo, const float *sc, unsigned n)
 		acc[j] += (float)((double)fo[j] * (double)sc[j]);
 }
 #endif
+
+/*
+ * THE CPU'S SHARE OF A PROJECTION, run in the window the calling thread
+ * currently spends BLOCKED in prep_bo.
+ *
+ * y[r] = sum over groups of scale[r][g] * sum over the group of code * a,
+ * which is the same arithmetic the hardware does: the same int4 codes, the
+ * same per group scale, and an activation rounded through fp16 first so both
+ * halves of the split see the same numbers.
+ *
+ * ⚠ ONE THREAD, DELIBERATELY. Round 370 measured the CPU reading memory at
+ * 7.13 GB/s on one thread, 6.65 on two and 6.32 on four: a single thread
+ * already saturates the controller, so a fan out here would cost a
+ * synchronisation and buy nothing. It is also why this is worth trying at all
+ * -- the same round found the NPU and a CPU reader reaching 15.46 GB/s
+ * together against 10.46 for the NPU alone.
+ */
+static void cpu_rows(const struct npu_entry *e, const float *af, float *y)
+{
+	const struct npu_tensor *t = e->t;
+	uint64_t k = t->k;
+	uint64_t grp = t->kgroup ? t->kgroup : k;
+	uint64_t ngrp = (k + grp - 1) / grp;
+	size_t per = ((size_t)k + 1) / 2;
+	unsigned nc = (unsigned)t->n - e->n_npu;
+
+	for (unsigned r = 0; r < nc; r++) {
+		const uint8_t *row = e->cq + (size_t)r * per;
+		const float *sc = t->scale + (size_t)(e->n_npu + r) * ngrp;
+		double acc = 0.0;
+
+		for (uint64_t gi = 0; gi < ngrp; gi++) {
+			uint64_t lo = gi * grp;
+			uint64_t hi = lo + grp < k ? lo + grp : k;
+			uint64_t i = lo;
+			float part = 0.0f;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+			{
+			float32x4_t a0 = vdupq_n_f32(0.0f);
+			float32x4_t a1 = vdupq_n_f32(0.0f);
+			float32x4_t a2 = vdupq_n_f32(0.0f);
+			float32x4_t a3 = vdupq_n_f32(0.0f);
+
+			/*
+			 * ⚠ THE VECTOR PATH READS BYTE i/2 AND TAKES ITS LOW
+			 * NIBBLE AS WEIGHT i, so it only means that when i is
+			 * EVEN. Every group in this runtime starts on a
+			 * multiple of kmax and is even, but a group that
+			 * started odd would silently read every weight off by
+			 * one: at k = 34 with groups of 17 the test measured
+			 * 2.26 relative against 1e-6 elsewhere. One scalar
+			 * step fixes the alignment.
+			 */
+			if ((i & 1) && i < hi) {
+				part += (float)(((row[i >> 1] >> 4) >= 8)
+					? (row[i >> 1] >> 4) - 16
+					: (row[i >> 1] >> 4)) * af[i];
+				i++;
+			}
+			for (; i + 16 <= hi; i += 16) {
+				uint8x8_t b = vld1_u8(row + (i >> 1));
+				int8x8_t l = vshr_n_s8(vshl_n_s8(
+					vreinterpret_s8_u8(vand_u8(b,
+						vdup_n_u8(0x0f))), 4), 4);
+				int8x8_t h = vshr_n_s8(vreinterpret_s8_u8(b), 4);
+				int8x8x2_t z = vzip_s8(l, h);
+				int16x8_t w;
+
+				w = vmovl_s8(z.val[0]);
+				a0 = vfmaq_f32(a0,
+					vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))),
+					vld1q_f32(af + i));
+				a1 = vfmaq_f32(a1,
+					vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))),
+					vld1q_f32(af + i + 4));
+				w = vmovl_s8(z.val[1]);
+				a2 = vfmaq_f32(a2,
+					vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))),
+					vld1q_f32(af + i + 8));
+				a3 = vfmaq_f32(a3,
+					vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))),
+					vld1q_f32(af + i + 12));
+			}
+			/* four accumulators, not two: it halves the
+			 * dependency chain and the summation error with it */
+			part += vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1),
+						     vaddq_f32(a2, a3)));
+			}
+#endif
+			for (; i < hi; i++) {
+				uint8_t byte = row[i >> 1];
+				int v = (i & 1) ? (byte >> 4) : (byte & 0xf);
+
+				part += (float)(v >= 8 ? v - 16 : v) * af[i];
+			}
+			acc += (double)part * (double)sc[gi];
+		}
+		y[e->n_npu + r] = (float)acc;
+	}
+}
 
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
@@ -399,6 +531,15 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 * belongs here rather than in a comment.
 	 */
 	g->serialpack = g->plain || getenv("CHARSIU_W4_BITPAT") != NULL;
+	{
+		const char *e = getenv("CHARSIU_NPU_CPU_FRAC");
+
+		g->cpu_frac = e ? atof(e) : 0.0;
+		if (g->cpu_frac < 0.0)
+			g->cpu_frac = 0.0;
+		if (g->cpu_frac > 0.9)
+			g->cpu_frac = 0.9;
+	}
 	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
@@ -422,13 +563,14 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->acc = calloc(max_n, sizeof(*g->acc));
 	g->accf = calloc(max_n, sizeof(*g->accf));
 	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
+	g->afscr = calloc(max_k ? max_k : 1, sizeof(*g->afscr));
 	g->wpack = malloc((size_t)g->nmax * g->kmax + 4096);
 	g->asum = calloc(ks ? ks : 1, sizeof(*g->asum));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
 	g->handles = calloc(1 + 8 * g->max_slices, sizeof(*g->handles));
 	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->accf ||
-	    !g->fscr || !g->wpack || !g->asum || !g->tasks || !g->handles)
+	    !g->fscr || !g->afscr || !g->wpack || !g->asum || !g->tasks || !g->handles)
 		goto fail;
 
 	/* one activation buffer per device: a buffer object belongs to the file
@@ -459,6 +601,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_slot; i++)
 			free(g->slot[i].sc);
 		for (unsigned i = 0; i < g->n_ent; i++)
+			free(g->ent[i].cq);
+		for (unsigned i = 0; i < g->n_ent; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
 		for (unsigned d = 0; d < g->ndev; d++) {
@@ -472,6 +616,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->acc);
 	free(g->accf);
 	free(g->fscr);
+	free(g->afscr);
 	free(g->wpack);
 	free(g->asum);
 	free(g->tasks);
@@ -510,11 +655,14 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"waiting for the fence (the invalidate is in there), "
 			"%.0f ms summing the slices, %.0f ms in the flush\n"
 			"charsiu NPU: and %.0f ms packing the activation, "
-			"which is ON TOP of the hardware path above\n",
+			"which is ON TOP of the hardware path above; "
+			"%.0f ms was the CPU's own share of the projections, "
+			"inside the fence window\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
 			g->busy_us / (double)g->submits,
 			g->submit_us / 1e3, g->fence_us / 1e3,
-			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3);
+			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3,
+			g->cpu_us / 1e3);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -695,6 +843,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 {
 	double t_add = now_us();
 	struct npu_entry *e;
+	unsigned e_n_npu;
 
 	/* ⚠ start the clock on the FIRST tensor, not the first heartbeat, or
 	 * the first sixteen are free and round 353's log said "0 ms". */
@@ -717,7 +866,35 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		return -1;
 	}
 
-	ns = (unsigned)((t->n + g->nmax - 1) / g->nmax);
+	/*
+	 * DECIDE THE SPLIT FIRST, because everything below is geometry over the
+	 * hardware's share.
+	 *
+	 * Rounded DOWN to sixteen: sixteen output channels is the feature atom
+	 * the int4 weight layout blocks by, and giving the hardware a ragged
+	 * count to save the CPU a handful of rows is a bad trade. A tensor too
+	 * narrow to split keeps all of it.
+	 */
+	e_n_npu = (unsigned)t->n;
+	/*
+	 * ⚠ ONLY WHERE THE SUM ALREADY LANDS IN THE CALLER'S BUFFER. The split
+	 * writes the CPU's rows into y before the fence, and the read back then
+	 * fills the rest; that only works on the path where the hardware's rows
+	 * go straight into y and the conversion at the end is skipped, which is
+	 * grouped int4 with the vector paths on.
+	 */
+	if (g->cpu_frac > 0.0 && g->w4 && !g->plain && tensor_grouped(g, t) &&
+	    t->n >= 64) {
+		unsigned keep = (unsigned)((double)t->n * (1.0 - g->cpu_frac));
+
+		keep &= ~15u;
+		if (keep < 16)
+			keep = 16;
+		if (keep < (unsigned)t->n)
+			e_n_npu = keep;
+	}
+
+	ns = (unsigned)((e_n_npu + g->nmax - 1) / g->nmax);
 	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
 	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
@@ -777,8 +954,8 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
 			unsigned n0 = ni * g->nmax;
-			unsigned n = (unsigned)(t->n - n0) < g->nmax
-				   ? (unsigned)(t->n - n0) : g->nmax;
+			unsigned n = (e_n_npu - n0) < g->nmax
+				   ? (e_n_npu - n0) : g->nmax;
 
 			unsigned d = g->ndev > 1 ? ((ki * ns + ni) & 1) : 0;
 
@@ -797,6 +974,42 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e->count = ns * ks;
 	e->n_slices = ns;
 	e->k_slices = ks;
+	e->n_npu = e_n_npu;
+	/*
+	 * THE CPU'S ROWS, PACKED TWO WEIGHTS TO A BYTE.
+	 *
+	 * t->q keeps one whole byte per int4 weight, which is what the
+	 * quantiser hands everything downstream. Reading the CPU's share out of
+	 * it would cost twice the bytes the hardware pays for the same weights,
+	 * and bandwidth is the entire point of the split, so those rows get
+	 * their own packed copy: low nibble first, row major, nothing
+	 * scrambled. It is f * n * k / 2 bytes, 136 MB of this model at a
+	 * quarter of the rows, against 620 MB of weights already resident.
+	 */
+	if (e_n_npu < (unsigned)t->n) {
+		unsigned nc = (unsigned)t->n - e_n_npu;
+		size_t per = ((size_t)t->k + 1) / 2;
+
+		e->cq = malloc((size_t)nc * per);
+		if (!e->cq) {
+			whine(g, "the CPU's share would not allocate",
+			      (unsigned)t->k, (unsigned)t->n);
+			e->n_npu = (unsigned)t->n;   /* fall back to all NPU */
+		} else {
+			for (unsigned r = 0; r < nc; r++) {
+				const int8_t *src = t->q
+					+ (size_t)(e_n_npu + r) * t->k;
+				uint8_t *dst = e->cq + (size_t)r * per;
+				uint64_t i;
+
+				for (i = 0; i + 1 < t->k; i += 2)
+					dst[i >> 1] = (uint8_t)((src[i] & 0xf) |
+						((src[i + 1] & 0xf) << 4));
+				if (i < t->k)
+					dst[i >> 1] = (uint8_t)(src[i] & 0xf);
+			}
+		}
+	}
 	/*
 	 * ⚠ BYTES, NOT ELEMENTS. This counted n*k for both precisions, so every
 	 * "GB/s of weights" this project has printed for int4 was DOUBLE the
@@ -805,7 +1018,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * GB/s against int8's 9.46, which is what it looked like from the
 	 * outside and what the shape sweep said.
 	 */
-	e->weight_mb = (double)t->n * (double)t->k
+	e->weight_mb = (double)e_n_npu * (double)t->k
 		     / (g->w4 ? 2.0 : 1.0) / 1e6;
 	/*
 	 * A HEARTBEAT WHILE THE WEIGHTS ARE STAGED. Round 352's int4 arm printed
@@ -963,6 +1176,22 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	}
 	g->submit_us += now_us() - t0;
 
+	/*
+	 * THE CPU'S ROWS, WHILE THE HARDWARE HAS THE REST. The submit above is
+	 * asynchronous, so from here until prep_bo the calling thread has
+	 * nothing to do but block. Nothing is scheduled and nothing is waited
+	 * on: the work simply fills a window that was already being spent.
+	 */
+	if (e->cq && e->n_npu < (unsigned)e->t->n) {
+		double tc = now_us();
+
+		for (uint64_t i = 0; i < e->t->k; i++)
+			g->afscr[i] = charsiu_half_to_float(
+					charsiu_float_to_half(a->f[i]));
+		cpu_rows(e, g->afscr, y);
+		g->cpu_us += now_us() - tc;
+	}
+
 	if (g->strikes < 3) {
 		double t1 = now_us();
 
@@ -985,8 +1214,9 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		 * written for no reason.
 		 */
 		af = (g->w4 && grp && !g->plain) ? y : g->accf;
+		/* ⚠ the hardware's rows only: the CPU's are already written */
 		if (g->w4)
-			memset(af, 0, (size_t)e->t->n * sizeof(*af));
+			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (i = 0; i < e->count; i++) {
@@ -1261,6 +1491,32 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	}
 	g->submit_us += now_us() - t0;
 
+	/*
+	 * The group's CPU rows, in the same window. A group shares one
+	 * activation, so it is rounded through fp16 once for all of them.
+	 */
+	{
+		unsigned any = 0;
+
+		for (i = 0; i < n; i++)
+			if (g->ent[ids[i]].cq)
+				any = 1;
+		if (any) {
+			double tc = now_us();
+
+			for (uint64_t q = 0; q < e0->t->k; q++)
+				g->afscr[q] = charsiu_half_to_float(
+					charsiu_float_to_half(a->f[q]));
+			for (i = 0; i < n; i++) {
+				struct npu_entry *e = &g->ent[ids[i]];
+
+				if (e->cq && e->n_npu < (unsigned)e->t->n)
+					cpu_rows(e, g->afscr, ys[i]);
+			}
+			g->cpu_us += now_us() - tc;
+		}
+	}
+
 	t1 = now_us();
 	for (i = 0; i < n; i++)
 		for (unsigned d = 0; d < g->ndev; d++)
@@ -1287,8 +1543,9 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		 * the way in, so the conversion below is ys[i][q] = accf[q]
 		 * and nothing else.
 		 */
+		/* ⚠ the hardware's rows only: the CPU's are already written */
 		if (g->w4)
-			memset(af, 0, (size_t)e->t->n * sizeof(*af));
+			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (j = 0; j < e->count; j++) {
