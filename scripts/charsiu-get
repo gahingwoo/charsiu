@@ -1,0 +1,226 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+#
+# charsiu-get -- get a model charsiu can actually run, from Hugging Face or a URL.
+#
+#   charsiu-get                       the zoo: models verified to load
+#   charsiu-get llama3.2-1b-q4        fetch one of them
+#   charsiu-get bartowski/Foo-GGUF    list a repo's gguf files and their sizes
+#   charsiu-get bartowski/Foo-GGUF F  fetch that exact file
+#   charsiu-get https://host/m.gguf   fetch a URL
+#   charsiu-get --check FILE          just gate a local file
+#
+# ⚠ WHY THIS IS NOT "curl the file and be done".
+#
+# charsiu reads six ggml types (f32 f16 q4_0 q4_1 q8_0 q6_K) and builds ONE
+# graph shape (general.architecture == "llama"). Hugging Face is full of files
+# whose NAMES pass a substring test and whose CONTENTS do not:
+#
+#   ...-Q4_0_4_4.gguf   measured: type 31 in 210 tensors. A Q4_0 REPACKED for
+#                       ARM dotprod -- same block size, interleaved weights.
+#   ...-Q4_K_M.gguf     measured: type 6 (q5_0) in 166 tensors, among others.
+#   Qwen2.5-*.gguf      measured: architecture qwen2. Loads nothing here.
+#
+# So every download is verified by charsiu_check, which uses the RUNTIME's own
+# gguf parser -- the gate cannot drift from what will actually load. A file that
+# fails is DELETED, never left where the runtime would find it.
+#
+# ⚠ And a name that looks unsupported may be fine: ...-Q6_K_L.gguf MEASURED as
+# runnable, because every type in that particular file is one charsiu reads.
+# Only the contents decide. That is the whole point.
+#
+# Env: CHARSIU_MODELS_DIR (default /opt/charsiu/models), CHARSIU_CHECK (path to
+#      charsiu_check), HF_ENDPOINT (default https://huggingface.co).
+set -eu
+
+MODELS_DIR="${CHARSIU_MODELS_DIR:-/opt/charsiu/models}"
+HF="${HF_ENDPOINT:-https://huggingface.co}"
+
+if [ -t 1 ]; then
+	C_C=$(printf '\033[1;36m'); C_R=$(printf '\033[1;31m')
+	C_Y=$(printf '\033[33m');   C_G=$(printf '\033[1;32m')
+	C_D=$(printf '\033[2m');    C_0=$(printf '\033[0m')
+else C_C=; C_R=; C_Y=; C_G=; C_D=; C_0=; fi
+say()  { printf '%s[charsiu-get]%s %s\n' "$C_C" "$C_0" "$*"; }
+warn() { printf '%s[charsiu-get] WARN:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
+die()  { printf '%s[charsiu-get] ERROR:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# THE ZOO. Every row was verified against the live repo on 2026-08-25: the size
+# comes from the HF tree API and general.architecture was read out of the file's
+# own header over a range request. Nothing here is guessed.
+#
+#   name | repo | file | MB | note
+# ---------------------------------------------------------------------------
+zoo() {
+cat <<'ZOO'
+smollm2-135m-q4|bartowski/SmolLM2-135M-Instruct-GGUF|SmolLM2-135M-Instruct-Q4_0.gguf|92|smallest thing that talks; good for a first run
+smollm2-135m-q8|bartowski/SmolLM2-135M-Instruct-GGUF|SmolLM2-135M-Instruct-Q8_0.gguf|145|same, at eight bits
+smollm2-360m-q4|bartowski/SmolLM2-360M-Instruct-GGUF|SmolLM2-360M-Instruct-Q4_0.gguf|230|
+smollm2-1.7b-q4|bartowski/SmolLM2-1.7B-Instruct-GGUF|SmolLM2-1.7B-Instruct-Q4_0.gguf|994|
+tinyllama-1.1b-q4|TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF|tinyllama-1.1b-chat-v1.0.Q4_0.gguf|638|
+llama3.2-1b-q4|bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_0.gguf|773|
+llama3.2-1b-q8|bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q8_0.gguf|1321|THE ONE EVERY BOARD ROUND USES
+llama3.2-1b-q4_1|unsloth/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_1.gguf|832|
+llama3.2-3b-q4|bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_0.gguf|1922|check the card has room
+ZOO
+}
+
+# Families that are NOT runnable, listed on purpose so the answer is instant
+# instead of arriving after a gigabyte. Architecture read from the file header.
+known_bad() {
+cat <<'BAD'
+qwen|qwen2|measured: Qwen2.5-1.5B-Instruct declares architecture qwen2
+gemma|gemma2|measured: gemma-2-2b-it declares architecture gemma2
+phi|phi3|measured: Phi-3.5-mini-instruct declares architecture phi3
+BAD
+}
+
+find_check() {
+	[ -n "${CHARSIU_CHECK:-}" ] && { echo "$CHARSIU_CHECK"; return; }
+	d=$(dirname "$0")
+	for c in "$d/charsiu_check" "$d/../build/charsiu_check" \
+		 /opt/charsiu/charsiu_check charsiu_check; do
+		command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
+		[ -x "$c" ] && { echo "$c"; return; }
+	done
+	echo ""
+}
+
+fetcher() {
+	command -v curl >/dev/null 2>&1 && { echo curl; return; }
+	command -v wget >/dev/null 2>&1 && { echo wget; return; }
+	echo ""
+}
+
+# GET url outfile  -- resumable, because a gigabyte over a board's link is not
+# a single uninterrupted event.
+get_url() {
+	# a progress bar on a terminal, silence in a log -- curl's default meter
+	# redraws with \r and a captured log turns into one unreadable line.
+	if [ -t 2 ]; then P="--progress-bar"; else P="-sS"; fi
+	case "$(fetcher)" in
+	curl) curl -fL $P --retry 3 --connect-timeout 15 -C - -o "$2" "$1" ;;
+	wget) if [ -t 2 ]; then wget -c -O "$2" "$1"; else wget -q -c -O "$2" "$1"; fi ;;
+	*)    die "neither curl nor wget is installed" ;;
+	esac
+}
+
+api() {
+	case "$(fetcher)" in
+	curl) curl -fsL --connect-timeout 15 "$1" ;;
+	wget) wget -qO- "$1" ;;
+	*)    die "neither curl nor wget is installed" ;;
+	esac
+}
+
+free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+
+list_zoo() {
+	printf '\n%sModels verified to load on charsiu%s   (into %s)\n\n' \
+		"$C_G" "$C_0" "$MODELS_DIR"
+	printf '  %-19s %7s  %s\n' NAME SIZE WHERE
+	zoo | while IFS='|' read -r n repo file mb note; do
+		have=""
+		[ -f "$MODELS_DIR/$file" ] && have=" ${C_G}[have]${C_0}"
+		printf '  %-19s %6sM  %s%s\n' "$n" "$mb" "$repo" "$have"
+		[ -n "$note" ] && printf '  %-19s %7s  %s%s%s\n' "" "" "$C_D" "$note" "$C_0"
+	done
+	printf '\n%sNot runnable, whatever the file says%s\n' "$C_Y" "$C_0"
+	known_bad | while IFS='|' read -r fam arch why; do
+		printf '  %-19s %7s  %s\n' "$fam" "" "$why"
+	done
+	printf '\n  charsiu-get <name>              fetch one\n'
+	printf '  charsiu-get <user/repo>         list any repo instead\n'
+	printf '  charsiu-get --check FILE        gate a file you already have\n\n'
+}
+
+# list the gguf files in an arbitrary repo
+list_repo() {
+	say "listing $1"
+	api "$HF/api/models/$1/tree/main" | tr ',' '\n' | grep -o '"path":"[^"]*\.gguf"' \
+		| sed 's/.*:"//;s/"$//' | sort | while read -r f; do
+		printf '  %s\n' "$f"
+	done
+	printf '\n  %sSizes and types are not shown because only the file decides.%s\n' "$C_D" "$C_0"
+	printf '  charsiu-get %s <file>   downloads, gates, and keeps it only if it runs.\n\n' "$1"
+}
+
+# fetch URL into MODELS_DIR under BASENAME, gate it, keep it only if it passes
+fetch_and_gate() {
+	url="$1"; base="$2"; want_mb="${3:-0}"
+	CK=$(find_check)
+	[ -z "$CK" ] && die "charsiu_check not found; build it (make charsiu_check) or set CHARSIU_CHECK"
+
+	mkdir -p "$MODELS_DIR" || die "cannot create $MODELS_DIR"
+	out="$MODELS_DIR/$base"
+	part="$out.part"
+
+	if [ -f "$out" ]; then
+		say "already here: $out"
+		"$CK" -q "$out" && return 0
+		warn "...but it does not pass the gate; re-fetching"
+		rm -f "$out"
+	fi
+
+	if [ "$want_mb" -gt 0 ]; then
+		fm=$(free_mb "$MODELS_DIR")
+		if [ -n "$fm" ] && [ "$fm" -lt $((want_mb + 128)) ]; then
+			die "$MODELS_DIR has ${fm}M free and this needs about ${want_mb}M"
+		fi
+	fi
+
+	say "fetching $base"
+	get_url "$url" "$part" || die "download failed (it resumes: run the same command again)"
+
+	say "checking what actually came down"
+	if "$CK" "$part"; then
+		mv "$part" "$out"
+		say "${C_G}kept${C_0} $out"
+		return 0
+	fi
+	rm -f "$part"
+	die "charsiu cannot run that file, so it was deleted rather than left in $MODELS_DIR"
+}
+
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+""|--list|list) list_zoo; exit 0 ;;
+-h|--help)      sed -n '4,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+--check)
+	[ $# -ge 2 ] || die "--check needs a file"
+	CK=$(find_check); [ -z "$CK" ] && die "charsiu_check not found"
+	exec "$CK" "$2" ;;
+esac
+
+ARG="$1"
+
+# a zoo name?
+row=$(zoo | grep "^$ARG|" || true)
+if [ -n "$row" ]; then
+	repo=$(echo "$row" | cut -d'|' -f2)
+	file=$(echo "$row" | cut -d'|' -f3)
+	mb=$(echo "$row"   | cut -d'|' -f4)
+	fetch_and_gate "$HF/$repo/resolve/main/$file" "$file" "$mb"
+	exit 0
+fi
+
+# a known-bad family, answered without a download
+if known_bad | grep -qi "^$ARG|"; then
+	why=$(known_bad | grep -i "^$ARG|" | cut -d'|' -f3)
+	die "$why -- charsiu only builds a llama graph, so there is nothing to download"
+fi
+
+case "$ARG" in
+http://*|https://*)
+	fetch_and_gate "$ARG" "$(basename "$ARG")" 0 ;;
+*/*)
+	if [ $# -ge 2 ]; then
+		fetch_and_gate "$HF/$ARG/resolve/main/$2" "$2" 0
+	else
+		list_repo "$ARG"
+	fi ;;
+*)
+	die "no zoo entry called '$ARG'. Run charsiu-get with no arguments for the list." ;;
+esac

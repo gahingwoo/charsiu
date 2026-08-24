@@ -1,0 +1,103 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+#
+# charsiu -- run the model named in /etc/charsiu/config.ini.
+#
+# The runtime reads 109 CHARSIU_* environment variables. Six of them decide
+# whether a decode goes to the NPU at all, and getting one wrong does not fail
+# loudly -- it quietly falls back to the CPU and runs a third as fast. Nobody
+# should have to remember this:
+#
+#   CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_KMAX=1024 \
+#   CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=131072 CHARSIU_COEF_ELEMS=65536 \
+#   charsiu_run /opt/charsiu/models/....gguf -p "..." -n 64 -c 512 -t 4
+#
+# ⚠ KMAX AND GROUP MUST BE EQUAL. npudev.c gates the int4 path on
+# `t->kgroup == g->kmax`; set them differently and the tensor silently takes
+# the other path. config.ini keeps one value and writes both.
+#
+# Usage:  charsiu [-p PROMPT] [-n N] [any other charsiu_run flag]
+#         charsiu --show          print the command it would run, and stop
+#         charsiu --config FILE   use a different config
+set -eu
+
+CONF="${CHARSIU_CONFIG:-/etc/charsiu/config.ini}"
+RUN="${CHARSIU_RUN_BIN:-}"
+SHOW=0
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--config) CONF="$2"; shift 2 ;;
+	--show)   SHOW=1; shift ;;
+	*)        break ;;
+	esac
+done
+
+[ -f "$CONF" ] || { echo "charsiu: no config at $CONF (run charsiu-config)" >&2; exit 1; }
+
+# ini_get SECTION KEY -- strips inline comments, tolerates a hand-edited file.
+ini_get() {
+	awk -v s="$1" -v k="$2" '
+		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
+		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
+		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
+	' "$CONF"
+}
+
+MODEL=$(ini_get model path)
+[ -n "$MODEL" ] || { echo "charsiu: [model] path is not set in $CONF" >&2; exit 1; }
+[ -f "$MODEL" ] || { echo "charsiu: $MODEL does not exist (charsiu-get fetches one)" >&2; exit 1; }
+
+if [ -z "$RUN" ]; then
+	d=$(dirname "$0")
+	for c in "$d/charsiu_run" "$d/../build/charsiu_run" /opt/charsiu/charsiu_run; do
+		[ -x "$c" ] && { RUN="$c"; break; }
+	done
+	[ -n "$RUN" ] || RUN=$(command -v charsiu_run || true)
+fi
+[ -n "$RUN" ] || { echo "charsiu: charsiu_run not found" >&2; exit 1; }
+
+THREADS=$(ini_get run threads);  : "${THREADS:=4}"
+CTX=$(ini_get run context);      : "${CTX:=512}"
+CPUS=$(ini_get run cpus)
+NPU=$(ini_get npu enable);       : "${NPU:=yes}"
+KSLICE=$(ini_get npu kslice);    : "${KSLICE:=1024}"
+MAXN=$(ini_get npu maxn);        : "${MAXN:=131072}"
+COEF=$(ini_get npu coef_elems);  : "${COEF:=65536}"
+
+set -- "$@"
+E=""
+case "$NPU" in
+yes|1|true|on)
+	# ⚠ kslice writes BOTH, and they must match. See the note above.
+	E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"
+	E="$E CHARSIU_NPU_KMAX=$KSLICE CHARSIU_NPU_W4_GROUP=$KSLICE"
+	E="$E CHARSIU_NPU_MAXN=$MAXN CHARSIU_COEF_ELEMS=$COEF" ;;
+esac
+[ -n "$CPUS" ] && E="$E CHARSIU_CPUS=$CPUS"
+
+# anything under [extra] is passed through verbatim, which is the escape hatch
+# for the other hundred variables without putting them in the TUI.
+# ⚠ A line that STARTS with # is a comment too. An earlier version only
+# stripped ` #...` and so passed the section's own comment to env as an
+# argument. Anything that is not literally CHARSIU_NAME=VALUE is dropped.
+EX=$(awk '/^[ \t]*\[extra\][ \t]*$/{f=1;next} /^[ \t]*\[/{f=0}
+	f {
+		sub(/^[ \t]+/,""); sub(/[ \t]+#.*$/,"");
+		if ($0 ~ /^#/) next;
+		gsub(/[ \t]/,"");
+		if ($0 ~ /^CHARSIU_[A-Za-z0-9_]+=/) printf "%s ", $0;
+		else if (length($0)) printf "" > "/dev/stderr";
+	}' "$CONF")
+[ -n "$EX" ] && E="$E $EX"
+
+if [ "$SHOW" = 1 ]; then
+	printf 'env %s \\\n  %s %s -c %s -t %s' "$E" "$RUN" "$MODEL" "$CTX" "$THREADS"
+	[ $# -gt 0 ] && printf ' %s' "$@"
+	printf '\n'
+	exit 0
+fi
+
+# shellcheck disable=SC2086
+exec env $E "$RUN" "$MODEL" -c "$CTX" -t "$THREADS" "$@"

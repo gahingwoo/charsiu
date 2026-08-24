@@ -13,7 +13,8 @@ SRC    := src/regcmd.c src/device.c src/job.c
 LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
           src/npudev.c src/device.c src/job.c src/regcmd.c
 
-all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run
+all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
+     $(BUILD)/charsiu_check
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -54,7 +55,7 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
        $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64 \
        $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64 \
-       $(BUILD)/charsiu_membw.aarch64
+       $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64
 
 # what the memory controller has left, which is the only question that decides
 # whether splitting work across the CPU, the GPU and the NPU can pay
@@ -80,6 +81,14 @@ $(BUILD)/charsiu_vendor.aarch64: tools/charsiu_vendor.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/charsiu_wide.aarch64: tools/charsiu_wide.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
+# The gate charsiu-get calls before it keeps a download. It uses the RUNTIME's
+# own gguf parser, so what it accepts cannot drift from what will load.
+$(BUILD)/charsiu_check: tools/charsiu_check.c src/gguf.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+$(BUILD)/charsiu_check.aarch64: tools/charsiu_check.c src/gguf.c | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
 test: $(BUILD)/pack_int4

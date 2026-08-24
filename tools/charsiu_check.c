@@ -1,0 +1,175 @@
+/*
+ * Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+ * SPDX-License-Identifier: GPL-2.0
+ *
+ * charsiu_check -- can charsiu actually run this gguf?
+ *
+ * The question sounds like it should be answerable from the filename and it is
+ * not. Hugging Face is full of files whose names promise a type charsiu reads
+ * and whose contents are something else:
+ *
+ *   Llama-3.2-1B-Instruct-Q4_0_4_4.gguf   a Q4_0 REPACKED for ARM dotprod --
+ *                                         same block size, interleaved weights
+ *   Llama-3.2-1B-Instruct-Q6_K_L.gguf     mostly Q6_K, some tensors elsewhere
+ *   ...-UD-Q6_K_XL.gguf                   likewise
+ *
+ * Every one of those matches a substring test for a supported type and none of
+ * them is one. So this opens the file and reads the tensors.
+ *
+ * It is deliberately the SAME parser the runtime uses -- gguf_open() and
+ * ggml_type_name() out of src/gguf.c -- so the gate cannot drift away from what
+ * charsiu will actually accept at load time. A type charsiu has no traits for
+ * comes back as "unsupported" here for the same reason it would fail there.
+ *
+ * Exit codes, because charsiu-get branches on them:
+ *   0  charsiu can run this
+ *   1  it is a readable gguf that charsiu cannot run (wrong arch, or a type)
+ *   2  it is not a gguf, or it cannot be opened at all
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "charsiu_llm.h"
+
+/*
+ * For the REPORT only. charsiu's own table (traits_of) decides what is
+ * supported; this exists so "type 12" reads as "q4_K" in the message instead of
+ * leaving someone to look it up. Anything not listed prints as a bare number,
+ * which is the honest answer for a slot whose meaning has changed across
+ * llama.cpp versions -- the repacked Q4_0 variants in particular.
+ */
+static const char *ggml_name_hint(uint32_t t)
+{
+	static const char *n[] = {
+		"f32", "f16", "q4_0", "q4_1", NULL, NULL, "q5_0", "q5_1",
+		"q8_0", "q8_1", "q2_K", "q3_K", "q4_K", "q5_K", "q6_K", "q8_K",
+		"iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl", "iq3_s",
+		"iq2_s", "iq4_xs",
+	};
+	if (t < sizeof(n) / sizeof(n[0]) && n[t])
+		return n[t];
+	if (t == 30)
+		return "bf16";
+	return NULL;
+}
+
+struct seen {
+	uint32_t type;
+	unsigned long count;
+	int ok;
+};
+
+int main(int argc, char **argv)
+{
+	const char *path = NULL;
+	int quiet = 0, i;
+	struct gguf g;
+	struct seen seen[64];
+	unsigned nseen = 0;
+	char arch[64] = "", name[128] = "";
+	int bad_types = 0, bad_arch = 0;
+	unsigned long j;
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-q"))
+			quiet = 1;
+		else if (!path)
+			path = argv[i];
+		else
+			path = NULL;
+	}
+	if (!path) {
+		fprintf(stderr,
+"usage: charsiu_check [-q] MODEL.gguf\n"
+"  Reads the file, not the name, and says whether charsiu can run it.\n"
+"  -q  one line: OK or the first reason it is not\n"
+"  exit 0 runnable, 1 readable but not runnable, 2 not a gguf\n");
+		return 2;
+	}
+
+	if (gguf_open(&g, path)) {
+		if (quiet)
+			printf("NOT-A-GGUF %s\n", path);
+		else
+			fprintf(stderr, "charsiu_check: cannot read %s as a gguf\n", path);
+		return 2;
+	}
+
+	gguf_get_str(&g, "general.architecture", arch, sizeof(arch));
+	gguf_get_str(&g, "general.name", name, sizeof(name));
+
+	/*
+	 * ⚠ charsiu's loader compares this with strcmp against "llama" and
+	 * refuses anything else, so qwen2, gemma, phi3 and the rest are out --
+	 * not because they are exotic but because llama.c only builds a llama
+	 * graph. Saying so here saves a 2 GB download.
+	 */
+	if (strcmp(arch, "llama"))
+		bad_arch = 1;
+
+	for (j = 0; j < g.n_tensors; j++) {
+		uint32_t t = g.t[j].type;
+		unsigned k;
+
+		for (k = 0; k < nseen; k++)
+			if (seen[k].type == t)
+				break;
+		if (k == nseen) {
+			if (nseen == sizeof(seen) / sizeof(seen[0]))
+				continue;
+			seen[nseen].type = t;
+			seen[nseen].count = 0;
+			/* THE gate: charsiu's own table, not a name match. */
+			seen[nseen].ok = strcmp(ggml_type_name(t), "unsupported") != 0;
+			if (!seen[nseen].ok)
+				bad_types++;
+			nseen++;
+		}
+		seen[k].count++;   /* k is the slot, new or found */
+	}
+
+	if (quiet) {
+		if (bad_arch)
+			printf("NO arch=%s (charsiu only builds a llama graph)\n", arch);
+		else if (bad_types) {
+			for (i = 0; (unsigned)i < nseen; i++)
+				if (!seen[i].ok) {
+					const char *h = ggml_name_hint(seen[i].type);
+
+					printf("NO type %u%s%s%s in %lu tensors\n",
+					       seen[i].type, h ? " (" : "", h ? h : "",
+					       h ? ")" : "", seen[i].count);
+					break;
+				}
+		} else {
+			printf("OK %s %s\n", arch, name[0] ? name : "-");
+		}
+		gguf_close(&g);
+		return bad_arch || bad_types ? 1 : 0;
+	}
+
+	printf("file          %s\n", path);
+	printf("name          %s\n", name[0] ? name : "(unnamed)");
+	printf("architecture  %s%s\n", arch[0] ? arch : "(missing)",
+	       bad_arch ? "   <-- charsiu only builds a llama graph" : "");
+	printf("gguf          v%u, %llu tensors\n", g.version,
+	       (unsigned long long)g.n_tensors);
+	printf("tensor types\n");
+	for (i = 0; (unsigned)i < nseen; i++) {
+		const char *h = ggml_name_hint(seen[i].type);
+		const char *cs = ggml_type_name(seen[i].type);
+
+		printf("  %-10s type %-3u %6lu tensors   %s\n",
+		       seen[i].ok ? cs : (h ? h : "?"), seen[i].type,
+		       seen[i].count,
+		       seen[i].ok ? "charsiu reads this"
+				  : "NOT one charsiu reads");
+	}
+	if (bad_arch || bad_types)
+		printf("\nVERDICT  charsiu CANNOT run this file.\n");
+	else
+		printf("\nVERDICT  charsiu can run this file.\n");
+
+	gguf_close(&g);
+	return bad_arch || bad_types ? 1 : 0;
+}
