@@ -364,6 +364,42 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 	pool_run(fn, ctx, n);
 }
 
+/*
+ * ⚠ NOT A STAGE, A SLICE THROUGH THEM. charsiu_act_set runs at the top of
+ * every matvec, inside whichever row the stage table is counting, so it is
+ * accumulated separately and printed as a note rather than a row.
+ *
+ * It exists because round 375 finally split the residue correctly: 8 ms a
+ * token that npudev does not do and the hardware does not do, and CONSTANT at
+ * both context lengths, so it is neither attention's nor the fence's. This is
+ * the first suspect -- 231 thousand elements a token quantised into blocks of
+ * 32, for an int4 path that reads the FLOAT activation and never looks at the
+ * result.
+ */
+static double act_ms;
+static int stage_on = -1;
+
+static double now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+
+static void act_set_timed(struct charsiu_act *a, const float *x, int n)
+{
+	double t;
+
+	if (stage_on <= 0) {
+		charsiu_act_set(a, x, n);
+		return;
+	}
+	t = now_ms();
+	charsiu_act_set(a, x, n);
+	act_ms += now_ms() - t;
+}
+
 static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			 float *y);
 
@@ -438,7 +474,7 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 static void matvec(struct llama_state *s, const struct gguf_tensor *w,
 		   const float *x, float *y)
 {
-	charsiu_act_set(&s->act, x, (int)w->ne[0]);
+	act_set_timed(&s->act, x, (int)w->ne[0]);
 	matvec_again(s, w, y);
 }
 
@@ -483,7 +519,7 @@ static void matvec_pair(struct llama_state *s, const float *x,
 	int ids[3];
 	unsigned n = wc ? 3 : 2, i;
 
-	charsiu_act_set(&s->act, x, (int)wa->ne[0]);
+	act_set_timed(&s->act, x, (int)wa->ne[0]);
 
 	if (s->dev && !group_off() && npu_mode() && s->act.q1_valid) {
 		for (i = 0; i < n; i++) {
@@ -986,19 +1022,11 @@ static const char *stage_name[ST_N] = {
 
 static double stage_ms[ST_N];
 static unsigned stage_tok;
-static int stage_on = -1;
-
-static double now_ms(void)
-{
-	struct timespec t;
-
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
-}
 
 void llama_stages_reset(void)
 {
 	memset(stage_ms, 0, sizeof(stage_ms));
+	act_ms = 0.0;
 	stage_tok = 0;
 }
 
@@ -1016,6 +1044,8 @@ void llama_stages_report(void)
 	for (i = 0; i < ST_N; i++)
 		printf("  %-16s %8.2f ms a token   %5.1f%%\n", stage_name[i],
 		       stage_ms[i] / stage_tok, 100.0 * stage_ms[i] / tot);
+	printf("  %-16s %8.2f ms a token          (inside the rows above)\n",
+	       "quantising x", act_ms / stage_tok);
 }
 
 /* ---- the forward pass ---------------------------------------------------- */
