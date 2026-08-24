@@ -400,6 +400,38 @@ static void act_set_timed(struct charsiu_act *a, const float *x, int n)
 	act_ms += now_ms() - t;
 }
 
+/*
+ * ⚠ THE REALISERS ARE TIMED TOO, and they have to be. Once the work became
+ * lazy, timing only charsiu_act_set would read 0.00 whether the quantisation
+ * VANISHED or merely MOVED to a fallback -- and those are the two answers this
+ * number exists to tell apart. The instrument follows the work.
+ */
+static void act_q1_timed(struct charsiu_act *a)
+{
+	double t;
+
+	if (stage_on <= 0) {
+		act_q1_timed(a);
+		return;
+	}
+	t = now_ms();
+	charsiu_act_q1(a);
+	act_ms += now_ms() - t;
+}
+
+static void act_blocks_timed(struct charsiu_act *a)
+{
+	double t;
+
+	if (stage_on <= 0) {
+		act_blocks_timed(a);
+		return;
+	}
+	t = now_ms();
+	charsiu_act_blocks(a);
+	act_ms += now_ms() - t;
+}
+
 static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			 float *y);
 
@@ -521,7 +553,10 @@ static void matvec_pair(struct llama_state *s, const float *x,
 
 	act_set_timed(&s->act, x, (int)wa->ne[0]);
 
-	if (s->dev && !group_off() && npu_mode() && s->act.q1_valid) {
+	if (s->dev && !group_off() && npu_mode() && s->act.npu_ok) {
+		/* int8 takes q1; int4 takes the float and never looks */
+		if (charsiu_npu_needs_q1(s->dev))
+			act_q1_timed(&s->act);
 		for (i = 0; i < n; i++) {
 			nt[i] = npu_get(s, w[i]);
 			ids[i] = -1;
@@ -550,7 +585,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	const struct npu_tensor *nt = NULL;
 
 	/* f32 and f16 stay where they are: the NPU takes int8 operands */
-	if (npu_mode() && a->q1_valid && w->type != GGML_F32 && w->type != GGML_F16)
+	if (npu_mode() && a->npu_ok && w->type != GGML_F32 && w->type != GGML_F16)
 		nt = npu_get(s, w);
 
 	/* the hardware path is one submit and does not fan out */
@@ -570,12 +605,26 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		 * CPU still finishes and still reports which shape stopped
 		 * answering, which is worth more than either a hang or a crash.
 		 */
+		if (id >= 0 && charsiu_npu_needs_q1(s->dev))
+			act_q1_timed(a);
 		if (id >= 0 && !charsiu_npu_matvec(s->dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
 					    npu_out8_mode());
 			return;
 		}
 	}
+
+	/*
+	 * ⚠ REALISE BEFORE THE FAN OUT, not inside the kernels: gguf_matvec and
+	 * npu_matvec both run on the pool, and filling a shared buffer from
+	 * four threads would be a race. Everything below this line is a
+	 * FALLBACK -- the hardware path returned above -- so it is also the
+	 * only place the CPU forms are needed at all.
+	 */
+	if (nt)
+		act_q1_timed(a);
+	else
+		act_blocks_timed(a);
 
 	if (g_pool.n <= 1) {
 		if (nt) {

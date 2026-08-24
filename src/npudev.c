@@ -678,6 +678,17 @@ unsigned long charsiu_npu_submits(const struct charsiu_npu *g)
  * The megabytes per submit are here because that is the number the whole
  * chaining question turns on: break even against the fixed submit cost is 2.2.
  */
+/*
+ * Does the hardware path need the int8 activation? int4 takes the float one
+ * and never looks at q1, so llama.c can skip realising it -- but only npudev
+ * knows which mode it opened in, and duplicating the getenv in the caller is
+ * how two switches drift apart.
+ */
+int charsiu_npu_needs_q1(const struct charsiu_npu *g)
+{
+	return !g || !g->w4;
+}
+
 void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)

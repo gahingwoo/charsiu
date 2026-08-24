@@ -826,29 +826,31 @@ void charsiu_act_free(struct charsiu_act *a)
 	memset(a, 0, sizeof(*a));
 }
 
-void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
+/*
+ * LAZY SINCE ROUND 377, and round 376 is why: this cost 8.09 ms a token on
+ * the board, 11 percent of a 64 token one, and the int4 path reads the FLOAT
+ * activation and looks at neither result.
+ *
+ * Two quantisations happen here. The blocks of 32 are what gguf_matvec dot
+ * kernels take; the single scale q1 is the shape the NPU int8 operand wants
+ * and is what npu_matvec falls back on. In a fully routed int4 run NOTHING
+ * reads either, and they were computed 65 times a token anyway: 231 thousand
+ * elements, twice over.
+ *
+ * So this records the vector and the consumers ask. The realise calls live in
+ * llama.c BEFORE the pool fans out, never inside gguf_matvec or npu_matvec --
+ * those run on four worker threads and filling a shared buffer from all of
+ * them would be a race.
+ *
+ * CHARSIU_ACT_EAGER does both up front, which is every round before 377.
+ */
+void charsiu_act_blocks(struct charsiu_act *a)
 {
-	static int off = -1, npu = -1;
+	const float *x = a->f;
+	int n = a->n;
 
-	if (off < 0) {
-		const char *e = getenv("CHARSIU_NO_QACT");
-
-		off = e && *e != '0';
-	}
-	if (npu < 0) {
-		const char *e = getenv("CHARSIU_NPU_QUANT");
-
-		npu = e && *e != '0';
-	}
-
-	a->f = x;
-	a->n = n;
-	a->nb = (n + 31) / 32;
-	if (off || !a->q) {
-		a->quantised = 0;
+	if (a->quantised || !a->q)
 		return;
-	}
-
 	for (int i = 0; i < a->nb; i++) {
 		int base = i * 32;
 		float amax = 0.0f, sum = 0.0f, d, id;
@@ -880,33 +882,64 @@ void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
 		}
 	}
 	a->quantised = 1;
+}
 
-	/*
-	 * And the same vector under ONE scale, for the NPU's operand shape.
-	 * Only when asked: it is a strictly coarser quantisation and the CPU
-	 * path has no use for it.
-	 */
+void charsiu_act_q1(struct charsiu_act *a)
+{
+	const float *x = a->f;
+	int n = a->n;
+
+	if (a->q1_valid || !a->npu_ok)
+		return;
+	float amax = 0.0f, d, id;
+
+	for (int i = 0; i < n; i++) {
+		float av = x[i] < 0.0f ? -x[i] : x[i];
+
+		if (av > amax)
+			amax = av;
+	}
+	d = amax / 127.0f;
+	id = d != 0.0f ? 1.0f / d : 0.0f;
+	a->d1 = d;
+	for (int i = 0; i < a->nb * 32; i++) {
+		int v = i < n ? (int)lrintf(x[i] * id) : 0;
+
+		if (v > 127) v = 127;
+		if (v < -127) v = -127;
+		a->q1[i] = (int8_t)v;
+	}
+	a->q1_valid = 1;
+}
+
+void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
+{
+	static int off = -1, npu = -1, eager = -1;
+
+	if (off < 0) {
+		const char *e = getenv("CHARSIU_NO_QACT");
+
+		off = e && *e != '0';
+	}
+	if (npu < 0) {
+		const char *e = getenv("CHARSIU_NPU_QUANT");
+
+		npu = e && *e != '0';
+	}
+	if (eager < 0)
+		eager = getenv("CHARSIU_ACT_EAGER") != NULL;
+
+	a->f = x;
+	a->n = n;
+	a->nb = (n + 31) / 32;
+	a->quantised = 0;
 	a->q1_valid = 0;
-	if (npu) {
-		float amax = 0.0f, d, id;
-
-		for (int i = 0; i < n; i++) {
-			float av = x[i] < 0.0f ? -x[i] : x[i];
-
-			if (av > amax)
-				amax = av;
-		}
-		d = amax / 127.0f;
-		id = d != 0.0f ? 1.0f / d : 0.0f;
-		a->d1 = d;
-		for (int i = 0; i < a->nb * 32; i++) {
-			int v = i < n ? (int)lrintf(x[i] * id) : 0;
-
-			if (v > 127) v = 127;
-			if (v < -127) v = -127;
-			a->q1[i] = (int8_t)v;
-		}
-		a->q1_valid = 1;
+	a->npu_ok = npu && !off && a->q1 != NULL;
+	if (off || !a->q)
+		return;
+	if (eager) {
+		charsiu_act_blocks(a);
+		charsiu_act_q1(a);
 	}
 }
 

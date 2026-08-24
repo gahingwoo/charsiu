@@ -116,14 +116,34 @@ struct charsiu_act {
 	int8_t *q1;
 	float d1;
 	int q1_valid;
+	/*
+	 * Whether the NPU could take this activation at all -- NPU quantisation
+	 * mode is on, the buffer exists, and nothing switched it off. It used
+	 * to be q1_valid that answered that, which stopped working when q1
+	 * became lazy: "the hardware may have it" and "it has been computed"
+	 * are different questions and only one of them gates routing.
+	 */
+	int npu_ok;
 };
 
 /* `max_n` is the widest vector this will ever hold: one allocation serves
  * every matvec in a model. */
 int  charsiu_act_alloc(struct charsiu_act *a, int max_n);
 void charsiu_act_free(struct charsiu_act *a);
-/* Fill q/d/bs from x[0..n). Skipped when CHARSIU_NO_QACT is set: the control. */
+/*
+ * Record x[0..n). NOTHING is quantised here: the two forms below are filled on
+ * demand, because a fully routed int4 run reads neither and round 376 measured
+ * that at 8.09 ms a token. CHARSIU_ACT_EAGER fills both up front, which is the
+ * control; CHARSIU_NO_QACT still switches the blocks off entirely.
+ */
 void charsiu_act_set(struct charsiu_act *a, const float *x, int n);
+/*
+ * ⚠ CALL THESE ON THE CALLING THREAD, BEFORE ANY FAN OUT. They fill a buffer
+ * shared by every worker, so realising one from inside gguf_matvec or
+ * npu_matvec -- both of which run on the pool -- is a race.
+ */
+void charsiu_act_blocks(struct charsiu_act *a);
+void charsiu_act_q1(struct charsiu_act *a);
 
 /* ---- the NPU's number format, on the CPU ---------------------------------- */
 
@@ -198,6 +218,8 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors);
 void charsiu_npu_close(struct charsiu_npu *g);
 int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
+/* int4 takes the float activation; int8 needs q1 realised first */
+int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
 /* several independent projections of the same activation, one submit, one fence */
