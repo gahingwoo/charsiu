@@ -195,6 +195,21 @@ struct charsiu_npu {
 	 * well as what it bought.
 	 */
 	double cpu_us;
+	/*
+	 * ⚠ THE WHOLE CALL, entry to return, so the residue stops being a
+	 * SUBTRACTION.
+	 *
+	 * The stage table's five NPU rows minus the hardware path minus the
+	 * packing left 1.95 ms a token at 64 tokens and 7.22 at 384 -- and the
+	 * hardware path itself was 3.16 ms a token FASTER at the longer
+	 * context, which is time moving from inside these timers to outside
+	 * them rather than any work being done. Two derived quantities have
+	 * already been read wrong today. This one is measured.
+	 *
+	 * What is left over after THIS is only what llama.c does around the
+	 * call: finding the tensor and quantising the output.
+	 */
+	double call_us;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -202,6 +217,32 @@ struct charsiu_npu {
 	 * clock. Three slow submits and this path retires itself.
 	 */
 	double slow_us, min_gbs;
+	/*
+	 * ⚠ AND HOW OFTEN, because the one-shot message on its own is a
+	 * MISLEADING INSTRUMENT and it cost two rounds of wrong hypothesis.
+	 *
+	 * Rounds 373, 374 and 374's repeat each printed one notice, always at
+	 * K=2048 N=2048, and only ever in a long context run. That looked like
+	 * the NPU idling across attention's 16 to 38 ms gaps and paying to wake
+	 * up. It is not, and arithmetic settles it without a board round:
+	 *
+	 *   - the floor is a RATE, so the stall needed to trip it scales with
+	 *     the tensor. o_proj is 2.1 MB and trips on 1.0 ms; down is 8.4 MB
+	 *     and needs 4.2; the output head is 131 MB and needs 65.7. o_proj
+	 *     is simply the most sensitive thing being watched.
+	 *   - the GROUPED path has no check at all, so q, k, v, gate and up can
+	 *     never trip it. Only three tensors are watched and o_proj is the
+	 *     smallest of them.
+	 *   - and it cannot be per token: o_proj at 0.84 GB/s would take 98 ms
+	 *     rather than 8, and the token would be 180 ms instead of 90.
+	 *
+	 * So it is a rare stall, and a long run trips it because it has six
+	 * times as many submits, not because of the gaps. Counting them says
+	 * that outright instead of leaving it to be re-guessed.
+	 */
+	unsigned long slow_n;
+	double slow_worst;
+	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, whined, nochain, slowed, nofini, inprep, plain;
 	int serialpack;
 	/*
@@ -657,12 +698,25 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"charsiu NPU: and %.0f ms packing the activation, "
 			"which is ON TOP of the hardware path above; "
 			"%.0f ms was the CPU's own share of the projections, "
-			"inside the fence window\n",
+			"inside the fence window\n"
+			"charsiu NPU: %.0f ms in these calls end to end, so "
+			"%.0f ms of them is neither hardware nor packing\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
 			g->busy_us / (double)g->submits,
 			g->submit_us / 1e3, g->fence_us / 1e3,
 			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3,
-			g->cpu_us / 1e3);
+			g->cpu_us / 1e3, g->call_us / 1e3,
+			(g->call_us - g->busy_us - g->pack_us) / 1e3);
+	if (g->slow_n)
+		fprintf(stderr,
+			"charsiu NPU: %lu of %lu submits came in under %.1f "
+			"GB/s, worst %.2f at K=%u N=%u\n"
+			"charsiu NPU: ⚠ the floor is a RATE, so the stall that "
+			"trips it scales with the tensor -- and only the three "
+			"UNGROUPED ones are watched at all, of which K=2048 "
+			"N=2048 is the smallest and trips on a 1 ms hiccup\n",
+			g->slow_n, g->submits, g->min_gbs, g->slow_worst,
+			g->slow_worst_k, g->slow_worst_n);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -1055,7 +1109,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	struct charsiu_joblist jl;
 	const int32_t *out;
 	unsigned nh = 0, i;
-	double t0, tpack;
+	double t0, tpack, tcall = now_us();
 	float *af;
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent)
@@ -1287,6 +1341,14 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			 * nothing true about the run. A warning that cries wolf
 			 * on every boot is worse than none.
 			 */
+			if (gbs < g->min_gbs && g->submits > g->n_ent * 2) {
+				g->slow_n++;
+				if (g->slow_worst == 0.0 || gbs < g->slow_worst) {
+					g->slow_worst = gbs;
+					g->slow_worst_k = (unsigned)e->t->k;
+					g->slow_worst_n = (unsigned)e->t->n;
+				}
+			}
 			if (!g->slowed && gbs < g->min_gbs &&
 			    g->submits > g->n_ent * 2) {
 				g->slowed = 1;
@@ -1318,8 +1380,10 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		int grp = tensor_grouped(g, e->t);
 		double hs = 0.0;
 
-		if (g->w4 && grp && !g->plain)
+		if (g->w4 && grp && !g->plain) {
+			g->call_us += now_us() - tcall;
 			return 0;              /* it was summed into y */
+		}
 		if (g->midrise && !grp)
 			for (unsigned ki = 0; ki < e->k_slices; ki++)
 				hs += 0.5 * g->asum[ki];
@@ -1330,6 +1394,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 					      * e->t->scale[i]))
 			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
 	}
+	g->call_us += now_us() - tcall;
 	return 0;
 }
 
@@ -1352,7 +1417,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	struct charsiu_joblist jl;
 	uint32_t outh[8];
 	unsigned nh = 0, ntask = 0, i, j;
-	double t0, t1, tpack, fspent = 0.0;
+	double t0, t1, tpack, fspent = 0.0, tcall = now_us();
 
 	if (g->dead || !n || n > 8)
 		return -1;
@@ -1619,5 +1684,6 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	g->copy_us += now_us() - t1 - fspent;
 	g->fini_us += fspent;
 	g->busy_us += now_us() - t0;
+	g->call_us += now_us() - tcall;
 	return 0;
 }
