@@ -78,6 +78,20 @@ static int cpu_plain(void)
 	return v;
 }
 
+/*
+ * CHARSIU_KV_POSMAJOR puts the cache back to [layer][position][kv dim], which
+ * is what it was before round 374. A layout change moves no values, so there
+ * is nothing else that could tell the two apart and the round needs a control.
+ */
+static int kv_posmajor(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_KV_POSMAJOR") != NULL;
+	return v;
+}
+
 static int attn_perhead(void)
 {
 	static int v = -1;
@@ -1018,7 +1032,7 @@ struct attn_job {
 	struct llama_state *s;
 	uint32_t l;
 	int pos;
-	uint32_t hd, kvdim, gqa;
+	uint32_t hd, kvdim, gqa, nkv;
 	float scale;
 };
 
@@ -1046,9 +1060,11 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 {
 	const struct attn_job *j = vj;
 	struct llama_state *s = j->s;
-	uint32_t hd = j->hd, kvdim = j->kvdim, gqa = j->gqa;
+	uint32_t hd = j->hd, gqa = j->gqa, nkv = j->nkv;
 	int pos = j->pos;
 	uint64_t h = h0, end = h0 + nh;
+	const float *kbase, *vbase;
+	size_t kstride;
 
 	while (h < end) {
 		uint32_t kvh = (uint32_t)h / gqa;
@@ -1068,12 +1084,31 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			g1 = g0 + 1;
 		if (g1 > end)
 			g1 = end;
+
+		/*
+		 * ONE BRANCH A GROUP, NOT ONE A POSITION. Both layouts are a
+		 * base and a stride; picking them here keeps the t loop free
+		 * of the question.
+		 */
+		if (kv_posmajor()) {
+			size_t b = (size_t)j->l * s->n_ctx * j->kvdim
+				 + (size_t)kvh * hd;
+
+			kbase = s->kcache + b;
+			vbase = s->vcache + b;
+			kstride = j->kvdim;
+		} else {
+			size_t b = (size_t)(j->l * nkv + kvh) * s->n_ctx * hd;
+
+			kbase = s->kcache + b;
+			vbase = s->vcache + b;
+			kstride = hd;
+		}
 		n = (unsigned)(g1 - g0);
 		h = g1;
 
 		for (int t = 0; t <= pos; t++) {
-			const float *kt = s->kcache +
-				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
+			const float *kt = kbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
 				const float *qh = s->q + (g0 + q) * hd;
@@ -1117,8 +1152,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 		}
 
 		for (int t = 0; t <= pos; t++) {
-			const float *vt = s->vcache +
-				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
+			const float *vt = vbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
 				float *out = s->xb + (g0 + q) * hd;
@@ -1192,8 +1226,6 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
-		float *kc = s->kcache + ((size_t)l * s->n_ctx + pos) * kvdim;
-		float *vc = s->vcache + ((size_t)l * s->n_ctx + pos) * kvdim;
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 		STAGE(ST_NORM1);
@@ -1204,13 +1236,44 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		rope(s->q, m->n_head, hd, ropecs);
 		rope(s->k, m->n_head_kv, hd, ropecs);
 
-		memcpy(kc, s->k, kvdim * sizeof(float));
-		memcpy(vc, s->v, kvdim * sizeof(float));
+		/*
+		 * ⚠ HEAD MAJOR: [layer][kv head][position][head dim].
+		 *
+		 * The cache used to be [layer][position][kv dim], which puts
+		 * one kv head's consecutive positions 2048 bytes apart -- and
+		 * attention walks exactly that way, one head over every
+		 * position. Round 373 measured the walk at 2.65 GB/s where
+		 * this CPU reads sequentially at 7.13, with 4.9 ms a token in
+		 * it at 384 tokens.
+		 *
+		 * Head major makes the walk contiguous. The cost is that the
+		 * write is now one memcpy a kv head rather than one a layer:
+		 * eight copies of 256 bytes instead of one of 2048, 128 a
+		 * token, which is nothing against 12.9 MB of reading.
+		 *
+		 * The VALUES are untouched, so this cannot move a token.
+		 */
+		if (kv_posmajor()) {
+			size_t off = ((size_t)l * s->n_ctx + pos) * kvdim;
+
+			memcpy(s->kcache + off, s->k, kvdim * sizeof(float));
+			memcpy(s->vcache + off, s->v, kvdim * sizeof(float));
+		} else {
+			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+				size_t off = ((size_t)(l * m->n_head_kv + kh)
+					      * s->n_ctx + pos) * hd;
+
+				memcpy(s->kcache + off, s->k + kh * hd,
+				       hd * sizeof(float));
+				memcpy(s->vcache + off, s->v + kh * hd,
+				       hd * sizeof(float));
+			}
+		}
 		STAGE(ST_ROPE);
 
 		{
 			struct attn_job aj = { s, l, pos, hd, kvdim, gqa,
-					       scale };
+					       m->n_head_kv, scale };
 
 			/*
 			 * ⚠ SERIAL, AND ROUND 368 IS WHY.
