@@ -42,6 +42,18 @@ if [ -t 1 ]; then
 	C_Y=$(printf '\033[33m');   C_G=$(printf '\033[1;32m')
 	C_D=$(printf '\033[2m');    C_0=$(printf '\033[0m')
 else C_C=; C_R=; C_Y=; C_G=; C_D=; C_0=; fi
+# ⚠ The TUI layer has to be findable from every layout this ships in: a source
+# tree, a real install under /opt/charsiu, and a staged --prefix install where
+# /opt is not at the root. CHARSIU_LIB names it outright; the rest are guesses
+# in the order they are likely to be right.
+for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
+	 "$(dirname "$0")/charsiu-tui.sh" \
+	 "$(dirname "$0")/../scripts/charsiu-tui.sh" \
+	 "$(dirname "$0")/../opt/charsiu/charsiu-tui.sh" \
+	 /opt/charsiu/charsiu-tui.sh; do
+	[ -r "$t" ] && { . "$t"; break; }
+done
+
 say()  { printf '%s[charsiu-get]%s %s\n' "$C_C" "$C_0" "$*"; }
 warn() { printf '%s[charsiu-get] WARN:%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
 die()  { printf '%s[charsiu-get] ERROR:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
@@ -184,9 +196,42 @@ fetch_and_gate() {
 	die "charsiu cannot run that file, so it was deleted rather than left in $MODELS_DIR"
 }
 
+# The first-run picker. A menu of the zoo with sizes, so the first thing a new
+# board asks for is a choice and not a filename.
+#
+# ⚠ It offers to SKIP. A 1.3 GB download over a board's link is not something to
+# start by accident, and an install with no model is still a working install.
+wizard() {
+	command -v ui_menu >/dev/null 2>&1 || { list_zoo; return 0; }
+	CTUI_TITLE="charsiu -- a model"
+	set --
+	while IFS='|' read -r n repo file mb note; do
+		[ -n "$n" ] || continue
+		if [ -f "$MODELS_DIR/$file" ]; then d="${mb}M  (already here)"
+		else d="${mb}M  ${note}"; fi
+		set -- "$@" "$n" "$d"
+	done <<ZOOEOF
+$(zoo)
+ZOOEOF
+	set -- "$@" "skip" "decide later; charsiu-get lists them all"
+	sel=$(ui_menu "Which model?
+
+charsiu re-quantises whatever it loads, so a smaller file is a faster
+first run rather than a worse one. The 135M model talks in 92 MB.
+The 1B one is what every board measurement uses." "$@") || return 0
+	[ "$sel" = skip ] || [ -z "$sel" ] && return 0
+	row=$(zoo | grep "^$sel|")
+	repo=$(echo "$row" | cut -d'|' -f2)
+	file=$(echo "$row" | cut -d'|' -f3)
+	mb=$(echo "$row"   | cut -d'|' -f4)
+	fetch_and_gate "$HF/$repo/resolve/main/$file" "$file" "$mb" || return 1
+	return 0
+}
+
 # ---------------------------------------------------------------------------
 case "${1:-}" in
 ""|--list|list) list_zoo; exit 0 ;;
+--wizard)       wizard; exit $? ;;
 -h|--help)      sed -n '4,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 --check)
 	[ $# -ge 2 ] || die "--check needs a file"

@@ -17,8 +17,15 @@ set -u
 
 CONF="${CHARSIU_CONFIG:-/etc/charsiu/config.ini}"
 MODELS_DIR="${CHARSIU_MODELS_DIR:-/opt/charsiu/models}"
-UI=plain
-command -v whiptail >/dev/null 2>&1 && UI=whiptail
+for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
+	 "$(dirname "$0")/charsiu-tui.sh" \
+	 "$(dirname "$0")/../scripts/charsiu-tui.sh" \
+	 "$(dirname "$0")/../opt/charsiu/charsiu-tui.sh" \
+	 /opt/charsiu/charsiu-tui.sh; do
+	[ -r "$t" ] && { . "$t"; break; }
+done
+command -v ui_menu >/dev/null 2>&1 || { echo "charsiu-tui.sh not found" >&2; exit 1; }
+CTUI_TITLE="charsiu"
 
 here=$(dirname "$0")
 tool() {
@@ -79,17 +86,14 @@ ini_set() {
 	}' "$CONF" > "$t" && mv "$t" "$CONF"
 }
 
-ask() {   # ask PROMPT DEFAULT  -> echoes the answer (default on empty)
-	if [ "$UI" = whiptail ]; then
-		whiptail --inputbox "$1" 10 70 "$2" 3>&1 1>&2 2>&3 || echo "$2"
-	else
-		printf '%s [%s]: ' "$1" "$2" >&2
-		read -r a || a=""
-		[ -n "$a" ] && echo "$a" || echo "$2"
-	fi
+# ⚠ A cancelled ui_input must not silently write an empty value into the
+# config. ask keeps the old value when the user backs out.
+ask() {   # ask PROMPT DEFAULT -> the answer, or DEFAULT if cancelled
+	v=$(ui_input "$1" "$2") || v="$2"
+	[ -n "$v" ] && echo "$v" || echo "$2"
 }
 
-pause() { printf '\n%spress enter%s ' "$C_D" "$C_0"; read -r _ || true; }
+pause() { [ "$CTUI" = whiptail ] || { printf '\n%spress enter%s ' "$C_D" "$C_0"; read -r _ || true; }; }
 
 # ---------------------------------------------------------------------------
 page_status() {
@@ -102,43 +106,39 @@ page_status() {
 page_model() {
 	while :; do
 		cur=$(ini_get model path)
-		printf '\n%sModel%s\n  now: %s\n\n' "$C_B" "$C_0" "${cur:-(unset)}"
-		i=0
-		# ⚠ scan, do not make anyone type a path
 		set --
 		for f in "$MODELS_DIR"/*.gguf; do
 			[ -f "$f" ] || continue
-			i=$((i + 1)); set -- "$@" "$f"
-			mark=" "; [ "$f" = "$cur" ] && mark="*"
-			printf '  %s %d) %-46s %6s MB\n' "$mark" "$i" "$(basename "$f")" \
-				"$(( $(stat -c%s "$f" 2>/dev/null || echo 0) / 1048576 ))"
+			mb=$(( $(stat -c%s "$f" 2>/dev/null || echo 0) / 1048576 ))
+			mark=""; [ "$f" = "$cur" ] && mark="  <- in use"
+			set -- "$@" "$(basename "$f")" "${mb}M$mark"
 		done
-		[ "$i" = 0 ] && printf '  %s(none in %s)%s\n' "$C_D" "$MODELS_DIR" "$C_0"
-		printf '\n    g) get a model (charsiu-get)\n    c) check a file\n    b) back\n\n> '
-		read -r c || return
-		case "$c" in
-		b|"") return ;;
-		g)  G=$(tool charsiu-get)
-		    [ -n "$G" ] && CHARSIU_MODELS_DIR="$MODELS_DIR" "$G" || echo "charsiu-get not found"
-		    n=$(ask "zoo name, user/repo, or blank to skip" "")
-		    [ -n "$n" ] && CHARSIU_MODELS_DIR="$MODELS_DIR" "$G" "$n"
-		    pause ;;
-		c)  CK=$(tool charsiu_check)
-		    f=$(ask "file to check" "$cur")
-		    [ -n "$CK" ] && "$CK" "$f"; pause ;;
-		*)  case "$c" in
-		    ''|*[!0-9]*) continue ;;
-		    esac
-		    [ "$c" -ge 1 ] && [ "$c" -le "$i" ] || continue
-		    eval "sel=\${$c}"
-		    # ⚠ do not point the config at a file the runtime cannot load
-		    CK=$(tool charsiu_check)
-		    if [ -n "$CK" ] && ! "$CK" -q "$sel"; then
-			    printf '  %snot selected: charsiu cannot run that file%s\n' "$C_Y" "$C_0"
-			    pause; continue
-		    fi
-		    ini_set model path "$sel"
-		    printf '  %sset%s %s\n' "$C_G" "$C_0" "$sel"; pause ;;
+		set -- "$@" "[get]" "download one" "[check]" "gate a file by hand" "[back]" ""
+		sel=$(ui_menu "Model
+now: ${cur:-(unset)}" "$@") || return
+		case "$sel" in
+		"[back]"|"") return ;;
+		"[get]")
+			G=$(tool charsiu-get)
+			[ -n "$G" ] && CHARSIU_MODELS_DIR="$MODELS_DIR" CHARSIU_LIB="${CHARSIU_LIB:-/opt/charsiu}" "$G" --wizard
+			pause ;;
+		"[check]")
+			CK=$(tool charsiu_check)
+			f=$(ask "file to check" "$cur")
+			[ -n "$CK" ] && "$CK" "$f"; pause ;;
+		*)
+			sel="$MODELS_DIR/$sel"
+			# ⚠ never point the config at a file the runtime cannot load
+			CK=$(tool charsiu_check)
+			if [ -n "$CK" ] && ! out=$("$CK" -q "$sel" 2>&1); then
+				ui_msg "Not selected.
+
+charsiu cannot run that file:
+  $out"
+				continue
+			fi
+			ini_set model path "$sel"
+			ui_note "set: $(basename "$sel")" ;;
 		esac
 	done
 }
@@ -172,23 +172,68 @@ page_show() {
 	pause
 }
 
+# ---------------------------------------------------------------------------
+# FIRST RUN. Not a separate program and not an init script: an init script would
+# fight the round harness for the console on a test board, and a second program
+# would drift from this one. `charsiu-config --setup` walks the same pages in
+# the order a new board needs them.
+# ---------------------------------------------------------------------------
+setup_walk() {
+	ui_msg "charsiu
+
+An open runtime for the RK3576 NPU. Nothing here is the vendor's
+stack: the kernel driver is mainline rocket and the userspace is
+this.
+
+A few questions, then it runs."
+
+	D=$(tool charsiu-doctor)
+	if [ -n "$D" ] && ! CHARSIU_CONFIG="$CONF" "$D" -q; then
+		ui_yesno "Something critical is wrong (above).
+
+Carry on with the setup anyway?" defaultno || return 1
+	fi
+
+	if [ -z "$(ls "$MODELS_DIR"/*.gguf 2>/dev/null || true)" ]; then
+		G=$(tool charsiu-get)
+		[ -n "$G" ] && CHARSIU_MODELS_DIR="$MODELS_DIR" \
+			CHARSIU_LIB="${CHARSIU_LIB:-/opt/charsiu}" "$G" --wizard
+	fi
+	page_model
+	t=$(ask "How many threads? RK3576 has four A72s and charsiu uses one thread's worth of work." "$(ini_get run threads)")
+	ini_set run threads "$t"
+	mkdir -p "$(dirname "$STAMP")" 2>/dev/null || true
+	: > "$STAMP" 2>/dev/null || true
+	ui_msg "Set up.
+
+  charsiu -p \"...\"    ask it something
+  charsiu-config     come back here
+  charsiu-doctor     when something looks wrong"
+	return 0
+}
+
+STAMP="${CHARSIU_STAMP:-$(dirname "$CONF")/.setup-done}"
+case "${1:-}" in
+--setup)      setup_walk; exit $? ;;
+--setup-once) [ -e "$STAMP" ] && exit 0; setup_walk; exit $? ;;
+esac
+
 while :; do
-	printf '\n%scharsiu-config%s   %s\n' "$C_B" "$C_0" "$CONF"
-	printf '  1) status      what works and what does not\n'
-	printf '  2) model       pick, fetch, or check one\n'
-	printf '  3) run         threads, context, cores\n'
-	printf '  4) npu         the six switches that decide the fast path\n'
-	printf '  5) show        the exact command this produces\n'
-	printf '  6) chat        run it now\n'
-	printf '  q) quit\n\n> '
-	read -r c || exit 0
+	c=$(ui_menu "charsiu-config    $CONF" \
+		status "what works and what does not" \
+		model  "pick, fetch, or check one" \
+		run    "threads, context, cores" \
+		npu    "the switches that decide the fast path" \
+		show   "the exact command this produces" \
+		chat   "run it now" \
+		quit   "") || exit 0
 	case "$c" in
-	1) page_status ;;
-	2) page_model ;;
-	3) page_run ;;
-	4) page_npu ;;
-	5) page_show ;;
-	6) L=$(tool charsiu); [ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --chat || echo "not found"; pause ;;
-	q|Q) exit 0 ;;
+	status) page_status ;;
+	model)  page_model ;;
+	run)    page_run ;;
+	npu)    page_npu ;;
+	show)   page_show ;;
+	chat)   L=$(tool charsiu); [ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --chat || true; pause ;;
+	quit|"") exit 0 ;;
 	esac
 done
