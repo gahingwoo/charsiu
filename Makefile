@@ -34,8 +34,19 @@ $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-# the control: same code with the NEON kernels compiled out. It has to produce
-# the same tokens as the one above and be slower, on the board as well as here.
+# The control: same code with the NEON kernels compiled out, and slower.
+#
+# ⚠ SINCE ROUND 372 IT NO LONGER MATCHES THE DEFAULT BUILD, and the invariant
+# is written differently rather than quietly dropped. Two of the vector paths
+# reorder arithmetic on purpose -- the q.k dot product sums in four lanes and
+# the exponential is a polynomial rather than glibc's -- and neither has a
+# scalar twin. So:
+#
+#   charsiu_run_scalar  ==  charsiu_run with CHARSIU_EXACT_ATTN and
+#                           CHARSIU_EXACT_SILU set
+#
+# which is checked on the host and is still a NEON bug detector: every vector
+# path that is meant to be bit identical still has to reproduce it.
 $(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
 

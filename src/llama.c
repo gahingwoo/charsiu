@@ -103,21 +103,41 @@ static int attn_pool(void)
  * stays behind a switch until a round measures what it buys.
  */
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+/*
+ * ON BY DEFAULT SINCE ROUND 372, and the board is why.
+ *
+ * Vectorising the q.k dot product adds it up in a different ORDER, which is a
+ * last bit, and a last bit is enough to move a token at a near tie. It did on
+ * the host. It did NOT on the board, twice: round 370 ran it against the
+ * unvectorised arm and the two wrote the same sentence word for word, as round
+ * 368 had already found for the exponential.
+ *
+ * Two boards rounds agreeing is not a proof that no prompt will ever diverge --
+ * nothing here can prove that, and the rounds said so before they ran. What it
+ * is, is enough to stop paying 2.1 ms a token for a switch nobody turns on.
+ *
+ * CHARSIU_EXACT_ATTN puts the sequential sum back.
+ */
 static int fast_attn(void)
 {
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_FAST_ATTN") != NULL;
+		v = getenv("CHARSIU_EXACT_ATTN") == NULL && !cpu_plain();
 	return v;
 }
 
+/*
+ * The same, for the exponential: 1.0 ms a token, one last bit against glibc's
+ * correctly rounded expf, and the same sentence on the board in rounds 368 and
+ * 370. CHARSIU_EXACT_SILU goes back to expf.
+ */
 static int fast_silu(void)
 {
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_FAST_SILU") != NULL;
+		v = getenv("CHARSIU_EXACT_SILU") == NULL && !cpu_plain();
 	return v;
 }
 #endif
@@ -1024,7 +1044,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			 * needs no switch: it lands each element in its own
 			 * accumulator, so there is no order to change.
 			 */
-			if (fast_attn() && !plain) {
+			if (fast_attn()) {
 				float32x4_t a0 = vdupq_n_f32(0.0f);
 				float32x4_t a1 = vdupq_n_f32(0.0f);
 
