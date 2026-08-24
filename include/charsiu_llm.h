@@ -242,6 +242,8 @@ int tokenizer_encode(const struct tokenizer *tk, const char *text,
 /* The token's bytes. Not NUL terminated in general; `len` is the truth. */
 const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
 
+/* type 3, CONTROL: the model steers with it and it must not be printed */
+int  tokenizer_is_control(const struct tokenizer *tk, int32_t id);
 int32_t tokenizer_bos(const struct tokenizer *tk);
 int32_t tokenizer_eos(const struct tokenizer *tk);
 int tokenizer_is_eog(const struct tokenizer *tk, int32_t id);

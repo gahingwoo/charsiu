@@ -388,6 +388,26 @@ void tokenizer_free(struct tokenizer *tk)
 	free(tk);
 }
 
+/*
+ * A CONTROL token is one the model steers with and nobody reads: Llama 3's
+ * <|eot_id|>, <|start_header_id|> and the reserved specials are all type 3.
+ *
+ * It matters because tokenizer_decode hands back a control token's literal
+ * SPELLING, and the generation loop used to write whatever came back straight
+ * to stdout. Only end-of-generation was ever intercepted, so a sampled
+ * <|start_header_id|> was printed as those nineteen characters -- which is
+ * exactly what round 372's 384 token arm shows, the model closing a turn it
+ * was never given and the tags landing in the text.
+ *
+ * ⚠ TYPE 3 ONLY, not 4. USER_DEFINED tokens are added vocabulary that is
+ * usually meant to be seen; the encoder's special list takes both because it
+ * is matching literal spellings in a prompt, which is a different question.
+ */
+int tokenizer_is_control(const struct tokenizer *tk, int32_t id)
+{
+	return id >= 0 && (uint32_t)id < tk->n_vocab && tk->type[id] == 3;
+}
+
 int32_t tokenizer_bos(const struct tokenizer *tk) { return tk->bos; }
 int32_t tokenizer_eos(const struct tokenizer *tk) { return tk->eos; }
 uint32_t tokenizer_n_vocab(const struct tokenizer *tk) { return tk->n_vocab; }

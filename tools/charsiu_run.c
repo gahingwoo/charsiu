@@ -50,6 +50,8 @@ static void usage(void)
 "  --logits N    print the top N logits after the prompt and stop\n"
 "  --info        print what the file says about the model and stop\n"
 "  --no-bos      do not prepend the begin-of-text token\n"
+"  --bos         prepend it even if the file says not to\n"
+"  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
 "  -q            do not echo the prompt\n");
 }
@@ -59,7 +61,15 @@ int main(int argc, char **argv)
 	const char *path = NULL, *prompt = NULL, *promptfile = NULL;
 	const char *sys = "You are a helpful assistant.";
 	int n_gen = 64, n_ctx = 0, nthreads = 0, chat = 0, quiet = 0;
-	int show_tokens = 0, show_logits = 0, show_info = 0, add_bos = 1;
+	int show_tokens = 0, show_logits = 0, show_info = 0;
+	/*
+	 * ⚠ -1 MEANS ASK THE FILE. tokenizer_encode has always taken that and
+	 * gguf's tokenizer.ggml.add_bos_token has always been read into the
+	 * tokenizer, but this tool passed a hard 1, so a model whose file says
+	 * not to prepend one got one anyway. Llama 3 says true, which is why it
+	 * never showed.
+	 */
+	int add_bos = -1, show_special = 0;
 	int ignore_eos = 0;
 	float temp = 0.0f, top_p = 0.9f;
 	uint64_t seed = 1234;
@@ -98,6 +108,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--logits")) show_logits = atoi(NEXT());
 		else if (!strcmp(a, "--info")) show_info = 1;
 		else if (!strcmp(a, "--no-bos")) add_bos = 0;
+		else if (!strcmp(a, "--bos")) add_bos = 1;
+		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
 		else if (!strcmp(a, "--cache")) cache = "";
 		else if (!strcmp(a, "--cache-at")) cache = NEXT();
@@ -341,8 +353,19 @@ int main(int argc, char **argv)
 		if (!ignore_eos && tokenizer_is_eog(m.tk, tok))
 			break;
 		s = tokenizer_decode(m.tk, tok, &len);
-		fwrite(s, 1, (size_t)len, stdout);
-		fflush(stdout);
+		/*
+		 * ⚠ A CONTROL TOKEN IS NOT TEXT. decode hands back its literal
+		 * spelling, and this loop used to write whatever came back, so
+		 * a sampled <|eot_id|> or <|start_header_id|> was printed as
+		 * those characters. It STILL COUNTS and it still goes back into
+		 * the model: it cost a forward pass and it is real context.
+		 * Only the printing is suppressed. --show-special prints it
+		 * anyway, which is how this was diagnosed.
+		 */
+		if (show_special || !tokenizer_is_control(m.tk, tok)) {
+			fwrite(s, 1, (size_t)len, stdout);
+			fflush(stdout);
+		}
 		produced++;
 
 		if (st->pos >= st->n_ctx)
