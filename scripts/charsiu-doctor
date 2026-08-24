@@ -47,13 +47,16 @@ findbin() {
 
 hdr "the hardware"
 # The mainline rocket driver is an accel device, not a render node.
-if [ -e /dev/accel/accel0 ]; then
-	ok "/dev/accel/accel0 is present"
-	[ -r /dev/accel/accel0 ] && [ -w /dev/accel/accel0 ] \
+# CHARSIU_ACCEL_DEV names it, as it does for charsiu-install.sh -- a board with
+# more than one accel device should not need the two tools to disagree.
+ACCEL="${CHARSIU_ACCEL_DEV:-/dev/accel/accel0}"
+if [ -e "$ACCEL" ]; then
+	ok "$ACCEL is present"
+	[ -r "$ACCEL" ] && [ -w "$ACCEL" ] \
 		&& ok "and this user can open it" \
-		|| bad "but this user cannot open it (group/permissions on /dev/accel/accel0)"
+		|| bad "but this user cannot open it (group/permissions on $ACCEL)"
 else
-	bad "/dev/accel/accel0 is missing -- the rocket driver did not bind"
+	bad "$ACCEL is missing -- the rocket driver did not bind"
 fi
 
 ncore=0
