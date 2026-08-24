@@ -78,6 +78,15 @@ static int cpu_plain(void)
 	return v;
 }
 
+static int attn_perhead(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_ATTN_PERHEAD") != NULL;
+	return v;
+}
+
 static int attn_pool(void)
 {
 	static int v = -1;
@@ -1013,87 +1022,134 @@ struct attn_job {
 	float scale;
 };
 
+/*
+ * ⚠ ONE PASS OVER THE KV CACHE PER GROUP, NOT PER HEAD.
+ *
+ * This model has 32 query heads and 8 key/value heads, so four queries share
+ * every kv row -- and the loop below used to walk the whole cache once for each
+ * of them, reading every row four times. That was invisible at the sixty-odd
+ * positions every round since 352 has run at, and round 372 made it visible:
+ * at 384 tokens attention was 36.90 ms a token, 33% of the whole thing and the
+ * largest single row in the table, against 4.53 ms at 64.
+ *
+ * It also grew 8.15x while the average position grew 5.27x. Superlinear is the
+ * signature of falling out of cache: the kv cache is 4.6 MB at position 70 and
+ * 25.6 MB at 390, so the redundant reads stop being free exactly when there
+ * start to be a lot of them.
+ *
+ * Processing a group together reads each row once. The ARITHMETIC IS
+ * UNTOUCHED: every head still sums over the same i in the same order and over
+ * the same t in the same order, and only the interleaving changes, so this
+ * cannot move a token.
+ */
 static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 {
 	const struct attn_job *j = vj;
 	struct llama_state *s = j->s;
-	uint32_t hd = j->hd, kvdim = j->kvdim;
+	uint32_t hd = j->hd, kvdim = j->kvdim, gqa = j->gqa;
 	int pos = j->pos;
-	int plain = cpu_plain();
+	uint64_t h = h0, end = h0 + nh;
 
-	(void)plain;    /* the scalar build has no vector path to switch off */
+	while (h < end) {
+		uint32_t kvh = (uint32_t)h / gqa;
+		/* the queries of this kv head that fall inside the range */
+		uint64_t g0 = h, g1 = (uint64_t)(kvh + 1) * gqa;
+		unsigned n, q;
 
-	for (uint64_t h = h0; h < h0 + nh; h++) {
-		const float *qh = s->q + h * hd;
-		float *att = s->att + (size_t)h * s->n_ctx;
-		uint32_t kvh = (uint32_t)h / j->gqa;
-		float *out = s->xb + h * hd;
+		/*
+		 * CHARSIU_ATTN_PERHEAD takes the group back down to one, which
+		 * IS the old walk: dot loop, softmax, accumulate loop, per
+		 * head, reading every kv row once for each of the four queries
+		 * that share it. It is here so the round can measure this
+		 * change rather than assume it -- the arithmetic is identical
+		 * either way, so nothing else could tell them apart.
+		 */
+		if (attn_perhead())
+			g1 = g0 + 1;
+		if (g1 > end)
+			g1 = end;
+		n = (unsigned)(g1 - g0);
+		h = g1;
 
 		for (int t = 0; t <= pos; t++) {
 			const float *kt = s->kcache +
 				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
-			float a = 0.0f;
-			uint32_t i = 0;
+
+			for (q = 0; q < n; q++) {
+				const float *qh = s->q + (g0 + q) * hd;
+				float a = 0.0f;
+				uint32_t i = 0;
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-			/*
-			 * ⚠ OPT IN, because a dot product IS a reduction and
-			 * four lanes add it up in a different ORDER. That is a
-			 * last bit, and a last bit moved a token when the SiLU
-			 * experiment tried it. The other half of this function
-			 * needs no switch: it lands each element in its own
-			 * accumulator, so there is no order to change.
-			 */
-			if (fast_attn()) {
-				float32x4_t a0 = vdupq_n_f32(0.0f);
-				float32x4_t a1 = vdupq_n_f32(0.0f);
+				/*
+				 * ⚠ OPT OUT ONLY. A dot product is a reduction
+				 * and four lanes add it up in a different
+				 * ORDER; that is a last bit, and a last bit
+				 * moved a token on the host. It did not on the
+				 * board in round 370, and it is the default
+				 * since 372. CHARSIU_EXACT_ATTN goes back.
+				 */
+				if (fast_attn()) {
+					float32x4_t a0 = vdupq_n_f32(0.0f);
+					float32x4_t a1 = vdupq_n_f32(0.0f);
 
-				for (; i + 8 <= hd; i += 8) {
-					a0 = vfmaq_f32(a0, vld1q_f32(qh + i),
-						       vld1q_f32(kt + i));
-					a1 = vfmaq_f32(a1, vld1q_f32(qh + i + 4),
-						       vld1q_f32(kt + i + 4));
+					for (; i + 8 <= hd; i += 8) {
+						a0 = vfmaq_f32(a0,
+							vld1q_f32(qh + i),
+							vld1q_f32(kt + i));
+						a1 = vfmaq_f32(a1,
+							vld1q_f32(qh + i + 4),
+							vld1q_f32(kt + i + 4));
+					}
+					a = vaddvq_f32(vaddq_f32(a0, a1));
 				}
-				a = vaddvq_f32(vaddq_f32(a0, a1));
-			}
 #endif
-			for (; i < hd; i++)
-				a += qh[i] * kt[i];
-			att[t] = a * j->scale;
+				for (; i < hd; i++)
+					a += qh[i] * kt[i];
+				s->att[(size_t)(g0 + q) * s->n_ctx + t] =
+					a * j->scale;
+			}
 		}
-		softmax(att, pos + 1);
 
-		memset(out, 0, hd * sizeof(float));
+		for (q = 0; q < n; q++) {
+			softmax(s->att + (size_t)(g0 + q) * s->n_ctx, pos + 1);
+			memset(s->xb + (g0 + q) * hd, 0, hd * sizeof(float));
+		}
+
 		for (int t = 0; t <= pos; t++) {
 			const float *vt = s->vcache +
 				((size_t)j->l * s->n_ctx + t) * kvdim + kvh * hd;
-			float a = att[t];
-			uint32_t i = 0;
+
+			for (q = 0; q < n; q++) {
+				float *out = s->xb + (g0 + q) * hd;
+				float a = s->att[(size_t)(g0 + q) * s->n_ctx + t];
+				uint32_t i = 0;
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-			/*
-			 * Each i lands in its own accumulator, so there is no
-			 * reduction and no order to change. The barrier keeps
-			 * the multiply and the add separately rounded, which
-			 * is what the scalar line below compiles to: there is
-			 * no fmla anywhere in this function today.
-			 */
-			if (!plain) {
-				float32x4_t av = vdupq_n_f32(a);
+				/*
+				 * Each i lands in its own accumulator, so there
+				 * is no reduction and no order to change. The
+				 * barrier keeps the multiply and the add
+				 * separately rounded, which is what the scalar
+				 * line below compiles to.
+				 */
+				if (!cpu_plain()) {
+					float32x4_t av = vdupq_n_f32(a);
 
-				for (; i + 4 <= hd; i += 4) {
-					float32x4_t p = vmulq_f32(av,
+					for (; i + 4 <= hd; i += 4) {
+						float32x4_t p = vmulq_f32(av,
 							vld1q_f32(vt + i));
 
-					__asm__("" : "+w"(p));
-					vst1q_f32(out + i,
-						  vaddq_f32(vld1q_f32(out + i),
-							    p));
+						__asm__("" : "+w"(p));
+						vst1q_f32(out + i,
+							vaddq_f32(vld1q_f32(out + i),
+								  p));
+					}
 				}
-			}
 #endif
-			for (; i < hd; i++)
-				out[i] += a * vt[i];
+				for (; i < hd; i++)
+					out[i] += a * vt[i];
+			}
 		}
 	}
 }
