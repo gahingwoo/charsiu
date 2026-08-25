@@ -63,7 +63,11 @@ for a in "$@"; do
 done
 ip=$(ip -4 addr show scope global 2>/dev/null \
      | awk '/inet /{sub("/.*","",$2); print $2; exit}')
-[ -n "$ip" ] && printf '\n  reachable at  http://%s:%s/v1\n' "$ip" "$PORT" >&2
+if [ -n "$ip" ]; then
+	printf '\n  reachable at  http://%s:%s\n' "$ip" "$PORT" >&2
+	printf '    OpenAI     %s/v1/chat/completions\n' "http://$ip:$PORT" >&2
+	printf '    Anthropic  %s/v1/messages\n' "http://$ip:$PORT" >&2
+fi
 
 # shellcheck disable=SC2086
 exec env $E "$BIN" "$MODEL" -c "$CTX" -t "$THREADS" "$@"

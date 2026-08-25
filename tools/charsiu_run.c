@@ -167,9 +167,12 @@ int main(int argc, char **argv)
 		setenv("CHARSIU_NPU_CACHE_STAMP", stamp, 1);
 	}
 
+	enum chat_fmt fmt = CHAT_LLAMA3;
+
 	if (llama_load(&m, path) < 0)
 		return 1;
 	t_load = now_ms() - t0;
+	fmt = chat_format_of(m.tk);
 
 	if (show_info) {
 		printf("file        %s\n", path);
@@ -233,11 +236,10 @@ int main(int argc, char **argv)
 		size_t n = strlen(prompt) + strlen(sys) + 256;
 		char *c = malloc(n);
 
-		snprintf(c, n,
-			 "<|start_header_id|>system<|end_header_id|>\n\n%s<|eot_id|>"
-			 "<|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
-			 "<|start_header_id|>assistant<|end_header_id|>\n\n",
-			 sys, prompt);
+		size_t k = chat_turn(c, n, fmt, "system", sys);
+
+		k += chat_turn(c + k, n - k, fmt, "user", prompt);
+		chat_open(c + k, n - k, fmt, "assistant");
 		prompt = c;
 	}
 
@@ -300,17 +302,16 @@ int main(int argc, char **argv)
 				break;
 			turnbuf_n = need;
 		}
-		if (turn == 0)
-			snprintf(turnbuf, turnbuf_n,
-				 "<|start_header_id|>system<|end_header_id|>\n\n%s<|eot_id|>"
-				 "<|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
-				 "<|start_header_id|>assistant<|end_header_id|>\n\n",
-				 sys, line);
+		size_t k = 0;
+
+		/* turn two onwards has to close the reply the model just gave:
+		 * generation stops AT the end marker without emitting it. */
+		if (turn > 0)
+			k = chat_close(turnbuf, turnbuf_n, fmt);
 		else
-			snprintf(turnbuf, turnbuf_n,
-				 "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n%s<|eot_id|>"
-				 "<|start_header_id|>assistant<|end_header_id|>\n\n",
-				 line);
+			k = chat_turn(turnbuf, turnbuf_n, fmt, "system", sys);
+		k += chat_turn(turnbuf + k, turnbuf_n - k, fmt, "user", line);
+		chat_open(turnbuf + k, turnbuf_n - k, fmt, "assistant");
 		feed = turnbuf;
 	}
 

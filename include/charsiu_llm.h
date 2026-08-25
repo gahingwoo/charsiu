@@ -264,6 +264,24 @@ int tokenizer_encode(const struct tokenizer *tk, const char *text,
 /* The token's bytes. Not NUL terminated in general; `len` is the truth. */
 const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
 
+/*
+ * ⚠ THE CHAT TEMPLATE IS NOT THE SAME FOR EVERY MODEL, and both tools wrote
+ * the Llama 3 one for all of them. SmolLM2, which is what the setup wizard
+ * downloads by default, uses ChatML, saw the Llama headers as ordinary text
+ * and answered with them. The gguf carries a Jinja template in
+ * tokenizer.chat_template, which is far more than this can run, but the
+ * markers themselves are tokens, so ask the vocabulary which family it is.
+ */
+enum chat_fmt { CHAT_LLAMA3 = 0, CHAT_CHATML = 1 };
+enum chat_fmt chat_format_of(const struct tokenizer *tk);
+/* one complete turn */
+size_t chat_turn(char *out, size_t max, enum chat_fmt f,
+		 const char *role, const char *text);
+/* the opening of a turn with no content, for the model to continue */
+size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role);
+/* close the turn the model just generated, before starting the next one */
+size_t chat_close(char *out, size_t max, enum chat_fmt f);
+
 /* the id of an exact spelling, or -1 */
 int32_t tokenizer_find(const struct tokenizer *tk, const char *spelling);
 /* type 3, CONTROL: the model steers with it and it must not be printed */

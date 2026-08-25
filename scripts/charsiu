@@ -91,7 +91,7 @@ charsiu $VERSION, an open LLM runtime for the RK3576 NPU
   $SELF ps                    is anything running
   $SELF bench                 tokens per second on this board
   $SELF doctor [--paste]      what works and what does not
-  $SELF serve [--port N]      an OpenAI compatible endpoint
+  $SELF serve [--port N]      an OpenAI and Anthropic compatible endpoint
   $SELF setup                 the guided screen, on purpose
 
   models  $MODELS  (and $SYSMODELS)

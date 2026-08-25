@@ -413,6 +413,36 @@ int32_t tokenizer_find(const struct tokenizer *tk, const char *spelling)
 	return smap_get(&tk->vocab, spelling, strlen(spelling));
 }
 
+enum chat_fmt chat_format_of(const struct tokenizer *tk)
+{
+	if (tokenizer_find(tk, "<|im_start|>") >= 0) return CHAT_CHATML;
+	return CHAT_LLAMA3;
+}
+
+size_t chat_turn(char *out, size_t max, enum chat_fmt f,
+		 const char *role, const char *text)
+{
+	if (f == CHAT_CHATML)
+		return (size_t)snprintf(out, max, "<|im_start|>%s\n%s<|im_end|>\n",
+					role, text);
+	return (size_t)snprintf(out, max,
+		"<|start_header_id|>%s<|end_header_id|>\n\n%s<|eot_id|>", role, text);
+}
+
+size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
+{
+	if (f == CHAT_CHATML)
+		return (size_t)snprintf(out, max, "<|im_start|>%s\n", role);
+	return (size_t)snprintf(out, max,
+		"<|start_header_id|>%s<|end_header_id|>\n\n", role);
+}
+
+size_t chat_close(char *out, size_t max, enum chat_fmt f)
+{
+	return (size_t)snprintf(out, max,
+				f == CHAT_CHATML ? "<|im_end|>\n" : "<|eot_id|>");
+}
+
 int tokenizer_is_control(const struct tokenizer *tk, int32_t id)
 {
 	return id >= 0 && (uint32_t)id < tk->n_vocab && tk->type[id] == 3;

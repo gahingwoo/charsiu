@@ -45,6 +45,7 @@ static struct llama_state *ST;
 static const char *MODEL_NAME = "charsiu";
 static int N_CTX = 2048, N_THREADS = 4;
 static float TEMP = 0.0f, TOP_P = 0.9f;
+static enum chat_fmt CHAT = CHAT_LLAMA3;   /* set from the vocabulary at load */
 static uint64_t SEED = 1234;
 
 /* ---- just enough JSON ---------------------------------------------------- */
@@ -128,6 +129,48 @@ static size_t j_str(const char *p, const char *end, char *dst, size_t max)
 	return n;
 }
 
+/*
+ * Copy a message's content.
+ *
+ * ⚠ OPENAI SENDS A STRING, ANTHROPIC SENDS EITHER. Its content is often an
+ * array of typed blocks, and reading that with j_str() returns nothing at all,
+ * so the turn arrives empty and the model answers a question nobody asked.
+ * Take the text out of every text block and ignore the rest: an image or a
+ * tool_result is not something this can run.
+ */
+static size_t j_content(const char *p, const char *end, char *dst, size_t max)
+{
+	int depth = 0, instr = 0;
+	const char *obj = NULL;
+	size_t n = 0;
+
+	if (p >= end) return 0;
+	if (*p == '"') return j_str(p, end, dst, max);
+	if (*p != '[') return 0;
+
+	for (p++; p < end; p++) {
+		if (instr) {
+			if (*p == '\\') { p++; continue; }
+			if (*p == '"') instr = 0;
+			continue;
+		}
+		if (*p == '"') { instr = 1; continue; }
+		if (*p == '{') { if (depth++ == 0) obj = p; continue; }
+		if (*p == '}') {
+			if (--depth == 0 && obj) {
+				const char *t = j_find(obj, p + 1, "text");
+
+				if (t && *t == '"' && n + 8 < max)
+					n += j_str(t, p + 1, dst + n, max - n);
+			}
+			continue;
+		}
+		if (*p == ']' && depth == 0) break;
+	}
+	dst[n] = 0;
+	return n;
+}
+
 static void j_escape(FILE *f, const char *s, size_t n)
 {
 	for (size_t i = 0; i < n; i++) {
@@ -165,6 +208,19 @@ static size_t build_prompt(const char *body, const char *end, char *out, size_t 
 
 	if (!msgs || *msgs != '[') return 0;
 
+	/*
+	 * ⚠ ANTHROPIC PUTS THE SYSTEM PROMPT AT THE TOP LEVEL, not in the
+	 * messages array. Dropping it means ignoring every instruction a client
+	 * like Claude Code sends, while looking like it worked.
+	 */
+	const char *sys = j_find(body, end, "system");
+	if (sys) {
+		static char sbuf[16384];
+
+		if (j_content(sys, end, sbuf, sizeof(sbuf)) > 0)
+			n += chat_turn(out + n, max - n, CHAT, "system", sbuf);
+	}
+
 	const char *p = msgs + 1;
 	int depth = 0, instr = 0;
 	const char *obj = NULL;
@@ -186,18 +242,15 @@ static size_t build_prompt(const char *body, const char *end, char *out, size_t 
 
 				if (r) j_str(r, p + 1, role, sizeof(role));
 				content[0] = 0;
-				if (c) j_str(c, p + 1, content, sizeof(content));
-				n += (size_t)snprintf(out + n, max - n,
-					"<|start_header_id|>%s<|end_header_id|>\n\n%s<|eot_id|>",
-					role, content);
+				if (c) j_content(c, p + 1, content, sizeof(content));
+				n += chat_turn(out + n, max - n, CHAT, role, content);
 				if (n + 256 >= max) break;
 			}
 			continue;
 		}
 		if (*p == ']' && depth == 0) break;
 	}
-	n += (size_t)snprintf(out + n, max - n,
-			      "<|start_header_id|>assistant<|end_header_id|>\n\n");
+	n += chat_open(out + n, max - n, CHAT, "assistant");
 	return n;
 }
 
@@ -222,7 +275,36 @@ static void send_models(FILE *f)
 		MODEL_NAME, (long)time(NULL));
 }
 
-static void chat(FILE *f, const char *body, size_t blen)
+/*
+ * One generation loop, two dialects. `anth` selects Anthropic's /v1/messages
+ * shape over OpenAI's /v1/chat/completions; everything between the two is the
+ * wrapping, so duplicating the sampling loop to serve both would be two places
+ * to get temperature and EOG wrong instead of one.
+ */
+static void send_health(FILE *f)
+{
+	hdr(f, "application/json", 0);
+	fprintf(f, "{\"status\":\"ok\",\"model\":\"%s\",\"context\":%d}\n",
+		MODEL_NAME, N_CTX);
+}
+
+/* Anthropic clients ask how big a conversation is before sending it. */
+static void count_tokens(FILE *f, const char *body, size_t blen)
+{
+	static char prompt[65536];
+	static int32_t ids[8192];
+	size_t plen = build_prompt(body, body + blen, prompt, sizeof(prompt));
+	int n = 0;
+
+	if (plen)
+		n = tokenizer_encode(M.tk, prompt, 1, ids,
+				     (int)(sizeof(ids) / sizeof(ids[0])));
+	if (n < 0) n = 0;
+	hdr(f, "application/json", 0);
+	fprintf(f, "{\"input_tokens\":%d}\n", n);
+}
+
+static void chat(FILE *f, const char *body, size_t blen, int anth)
 {
 	const char *end = body + blen;
 	static char prompt[65536];
@@ -245,8 +327,10 @@ static void chat(FILE *f, const char *body, size_t blen)
 	if (!plen) {
 		fputs("HTTP/1.1 400 Bad Request\r\n"
 		      "Access-Control-Allow-Origin: *\r\n"
-		      "Content-Type: application/json\r\n\r\n"
-		      "{\"error\":{\"message\":\"no messages\"}}\n", f);
+		      "Content-Type: application/json\r\n\r\n", f);
+		fputs(anth ? "{\"type\":\"error\",\"error\":{\"type\":"
+			     "\"invalid_request_error\",\"message\":\"no messages\"}}\n"
+			   : "{\"error\":{\"message\":\"no messages\"}}\n", f);
 		return;
 	}
 
@@ -264,9 +348,12 @@ static void chat(FILE *f, const char *body, size_t blen)
 	if (n_ids < 1 || n_ids + 8 >= ST->n_ctx) {
 		fprintf(f, "HTTP/1.1 400 Bad Request\r\n"
 			   "Access-Control-Allow-Origin: *\r\n"
-			   "Content-Type: application/json\r\n\r\n"
-			   "{\"error\":{\"message\":\"the conversation does not fit in %d tokens\"}}\n",
-			ST->n_ctx);
+			   "Content-Type: application/json\r\n\r\n");
+		fprintf(f, anth ? "{\"type\":\"error\",\"error\":{\"type\":"
+				  "\"invalid_request_error\",\"message\":\"the "
+				  "conversation does not fit in %d tokens\"}}\n"
+				: "{\"error\":{\"message\":\"the conversation "
+				  "does not fit in %d tokens\"}}\n", ST->n_ctx);
 		return;
 	}
 	if (n_ids + n_gen >= ST->n_ctx) n_gen = ST->n_ctx - n_ids - 1;
@@ -276,9 +363,22 @@ static void chat(FILE *f, const char *body, size_t blen)
 		logits = llama_forward(ST, ids[i], ST->pos);
 
 	if (stream) hdr(f, "text/event-stream", 1);
+	if (stream && anth) {
+		fprintf(f, "event: message_start\ndata: {\"type\":\"message_start\","
+			   "\"message\":{\"id\":\"msg_%ld\",\"type\":\"message\","
+			   "\"role\":\"assistant\",\"model\":\"%s\",\"content\":[],"
+			   "\"stop_reason\":null,\"stop_sequence\":null,"
+			   "\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}\n\n",
+			created, MODEL_NAME, n_ids);
+		fputs("event: content_block_start\ndata: {\"type\":"
+		      "\"content_block_start\",\"index\":0,\"content_block\":"
+		      "{\"type\":\"text\",\"text\":\"\"}}\n\n", f);
+		fflush(f);
+	}
 
 	static char acc[65536];
 	size_t alen = 0;
+	int hit_eog = 0;
 
 	for (i = 0; i < n_gen; i++) {
 		int32_t tok = temp > 0.0f
@@ -287,10 +387,17 @@ static void chat(FILE *f, const char *body, size_t blen)
 		int len;
 		const char *s;
 
-		if (tokenizer_is_eog(M.tk, tok)) break;
+		if (tokenizer_is_eog(M.tk, tok)) { hit_eog = 1; break; }
 		s = tokenizer_decode(M.tk, tok, &len);
 		if (!tokenizer_is_control(M.tk, tok) && len > 0) {
-			if (stream) {
+			if (stream && anth) {
+				fputs("event: content_block_delta\ndata: {\"type\":"
+				      "\"content_block_delta\",\"index\":0,\"delta\":"
+				      "{\"type\":\"text_delta\",\"text\":\"", f);
+				j_escape(f, s, (size_t)len);
+				fputs("\"}}\n\n", f);
+				fflush(f);
+			} else if (stream) {
 				fprintf(f, "data: {\"id\":\"chatcmpl-%ld\",\"object\":"
 					   "\"chat.completion.chunk\",\"created\":%ld,"
 					   "\"model\":\"%s\",\"choices\":[{\"index\":0,"
@@ -310,12 +417,35 @@ static void chat(FILE *f, const char *body, size_t blen)
 		if (!logits) break;
 	}
 
-	if (stream) {
+	/* ⚠ Both dialects distinguish "it finished" from "it ran out of room",
+	 * and this reported "stop" either way, so a truncated answer looked
+	 * complete to any client that checks. */
+	const char *why = anth ? (hit_eog ? "end_turn" : "max_tokens")
+			       : (hit_eog ? "stop" : "length");
+
+	if (stream && anth) {
+		fputs("event: content_block_stop\ndata: {\"type\":"
+		      "\"content_block_stop\",\"index\":0}\n\n", f);
+		fprintf(f, "event: message_delta\ndata: {\"type\":\"message_delta\","
+			   "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
+			   "\"usage\":{\"output_tokens\":%d}}\n\n", why, produced);
+		fputs("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", f);
+	} else if (stream) {
 		fprintf(f, "data: {\"id\":\"chatcmpl-%ld\",\"object\":"
 			   "\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
 			   "\"choices\":[{\"index\":0,\"delta\":{},"
-			   "\"finish_reason\":\"stop\"}]}\n\n"
-			   "data: [DONE]\n\n", created, created, MODEL_NAME);
+			   "\"finish_reason\":\"%s\"}]}\n\n"
+			   "data: [DONE]\n\n", created, created, MODEL_NAME, why);
+	} else if (anth) {
+		hdr(f, "application/json", 0);
+		fprintf(f, "{\"id\":\"msg_%ld\",\"type\":\"message\","
+			   "\"role\":\"assistant\",\"model\":\"%s\","
+			   "\"content\":[{\"type\":\"text\",\"text\":\"",
+			created, MODEL_NAME);
+		j_escape(f, acc, alen);
+		fprintf(f, "\"}],\"stop_reason\":\"%s\",\"stop_sequence\":null,"
+			   "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d}}\n",
+			why, n_ids, produced);
 	} else {
 		hdr(f, "application/json", 0);
 		fprintf(f, "{\"id\":\"chatcmpl-%ld\",\"object\":\"chat.completion\","
@@ -323,10 +453,10 @@ static void chat(FILE *f, const char *body, size_t blen)
 			   "\"message\":{\"role\":\"assistant\",\"content\":\"",
 			created, created, MODEL_NAME);
 		j_escape(f, acc, alen);
-		fprintf(f, "\"},\"finish_reason\":\"stop\"}],\"usage\":{"
+		fprintf(f, "\"},\"finish_reason\":\"%s\"}],\"usage\":{"
 			   "\"prompt_tokens\":%d,\"completion_tokens\":%d,"
 			   "\"total_tokens\":%d}}\n",
-			n_ids, produced, n_ids + produced);
+			why, n_ids, produced, n_ids + produced);
 	}
 	fflush(f);
 }
@@ -352,19 +482,31 @@ static void serve_one(int fd)
 		hdr(f, "text/plain", 0);
 	} else if (!strcmp(method, "GET") && strstr(path, "/v1/models")) {
 		send_models(f);
+	} else if (!strcmp(method, "GET") &&
+		   (!strcmp(path, "/health") || !strcmp(path, "/v1/health"))) {
+		/* Nearly every client probes this before it will talk. */
+		send_health(f);
 	} else if (!strcmp(method, "GET") && !strcmp(path, "/")) {
 		hdr(f, "text/plain", 0);
 		fprintf(f, "charsiu, model %s, context %d\n"
-			   "POST /v1/chat/completions   GET /v1/models\n",
+			   "POST /v1/chat/completions      (OpenAI)\n"
+			   "POST /v1/messages              (Anthropic)\n"
+			   "POST /v1/messages/count_tokens\n"
+			   "GET  /v1/models   GET /health\n",
 			MODEL_NAME, N_CTX);
-	} else if (!strcmp(method, "POST") && strstr(path, "/chat/completions")) {
+	} else if (!strcmp(method, "POST") &&
+		   (strstr(path, "/chat/completions") || strstr(path, "/messages"))) {
 		char *body = malloc(clen + 1);
 
 		if (!body) { fclose(f); return; }
 		size_t got = clen ? fread(body, 1, clen, f) : 0;
 		body[got] = 0;
-		fprintf(stderr, "  POST /v1/chat/completions  %zu bytes\n", got);
-		chat(f, body, got);
+		fprintf(stderr, "  POST %s  %zu bytes\n", path, got);
+		/* ⚠ count_tokens must be tested BEFORE /messages: it contains it. */
+		if (strstr(path, "/count_tokens"))
+			count_tokens(f, body, got);
+		else
+			chat(f, body, got, strstr(path, "/messages") != NULL);
 		free(body);
 	} else {
 		fputs("HTTP/1.1 404 Not Found\r\n"
@@ -401,6 +543,9 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "charsiu_serve: loading %s\n", path);
 	if (llama_load(&M, path) < 0) return 1;
+	CHAT = chat_format_of(M.tk);
+	fprintf(stderr, "  chat format: %s\n",
+		CHAT == CHAT_CHATML ? "chatml" : "llama3");
 	if (!MODEL_NAME[0] || !strcmp(MODEL_NAME, "charsiu")) {
 		const char *b = strrchr(path, '/');
 		MODEL_NAME = b ? b + 1 : path;
