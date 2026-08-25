@@ -11,7 +11,11 @@ printf '%-8s %-9s %s\n' PID STATE WHAT
 found=0
 for p in /proc/[0-9]*; do
 	[ -r "$p/cmdline" ] || continue
-	c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+	# ⚠ 2>/dev/null MUST COME BEFORE THE INPUT REDIRECT. Redirections are
+	# processed left to right, so with it after, the shell reports the
+	# failed open on a stderr that is still the terminal -- and a process
+	# exiting between the glob and this read is normal, not exceptional.
+	c=$(tr '\0' ' ' 2>/dev/null < "$p/cmdline") || continue
 	case "$c" in
 	*charsiu_run*|*charsiu-runner*)
 		found=1

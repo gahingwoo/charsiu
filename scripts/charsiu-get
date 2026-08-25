@@ -255,7 +255,7 @@ about ${want_mb} MB"
 		get_url "$url" "$part" || _dlfail=1
 	fi
 	if [ "$_dlfail" = 1 ]; then
-		got=$(wc -c < "$part" 2>/dev/null || echo 0)
+		got=$([ -f "$part" ] && wc -c < "$part" || echo 0)
 		die "the download stopped after $((got / 1048576)) MB of about ${want_mb} MB.
 
   ⚠ IT DOES NOT START OVER. The part that arrived is kept in

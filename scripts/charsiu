@@ -58,8 +58,11 @@ libexec() {
 
 # every gguf we can see, user directory first
 all_models() {
+	_seen=""
 	for d in "$MODELS" "$SYSMODELS"; do
 		[ -d "$d" ] || continue
+		case " $_seen " in *" $d "*) continue ;; esac
+		_seen="$_seen $d"
 		for f in "$d"/*.gguf; do [ -f "$f" ] && echo "$f"; done
 	done
 }

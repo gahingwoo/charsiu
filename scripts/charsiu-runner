@@ -41,11 +41,67 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# ⚠⚠ A BARE WORD IS THE PROMPT, and it was not. `charsiu "what is a bandgap"`
+# is line two of --help and the second line of the front door's own header,
+# and the words went to charsiu_run as a positional it does not accept, so the
+# most prominently documented form of this command answered with charsiu_run's
+# usage. `charsiu run MODEL PROMPT` was broken the same way.
+#
+# ⚠ Flags and their values pass through untouched, so `charsiu -n 32 "hello"`
+# still means what it looks like and `charsiu -n 32` does not treat 32 as a
+# question. The list of value-taking flags is charsiu_run's own.
+_skip=0; _hasp=0; _bare=0
+for a in "$@"; do
+	if [ "$_skip" = 1 ]; then _skip=0; continue; fi
+	case "$a" in
+	-p|-f) _hasp=1; _skip=1 ;;
+	--sys|-n|-c|-t|--temp|--top-p|--seed|--hold-secs|--cache-at) _skip=1 ;;
+	-*) ;;
+	*) _bare=1 ;;
+	esac
+done
+if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
+	_skip=0; _p=""; _n=$#
+	while [ "$_n" -gt 0 ]; do
+		a=$1; shift; _n=$((_n - 1))
+		if [ "$_skip" = 1 ]; then set -- "$@" "$a"; _skip=0; continue; fi
+		case "$a" in
+		--sys|-n|-c|-t|--temp|--top-p|--seed|--hold-secs|--cache-at)
+			_skip=1; set -- "$@" "$a" ;;
+		-*) set -- "$@" "$a" ;;
+		*)  if [ -z "$_p" ]; then _p="$a"; else set -- "$@" "$a"; fi ;;
+		esac
+	done
+	if [ -n "$_p" ]; then
+		set -- "$@" -p "$_p"
+		# ⚠ ASKING IS NOT COMPLETING. --help draws exactly this line:
+		# `charsiu "what is a bandgap"` asks once, `charsiu -p "..."` is
+		# print mode for a pipe. Without the chat template the question was
+		# echoed back and continued as a document -- "Name one color." came
+		# back as "Name one color.\n3. A bold and bolder design...".
+		# An explicit -p is left alone: that form chose completion.
+		case " $* " in *" --chat "*|*" -i "*|*" --interactive "*) ;;
+		*) set -- "$@" --chat ;; esac
+		# ⚠ AND -q, OR THE QUESTION COMES BACK WITH THE ANSWER. Without it
+		# charsiu_run echoes the prompt it was given, which for a chat turn
+		# is the whole template: somebody who asked "Name one color." got
+		# "<|im_start|>system ... <|im_end|> ..." and then the answer.
+		case " $* " in *" -q "*) ;; *) set -- "$@" -q ;; esac
+	fi
+fi
+
 # ⚠ NO ARGUMENTS MEANS A CONVERSATION, not the built-in demo prompt. Staging
 # costs about twenty seconds and a one-shot pays it for a single answer, so the
 # default has to be the mode that pays it once.
+# ⚠ NO PROMPT MEANS A CONVERSATION, and the test used to be "no arguments
+# at all". `charsiu -n 10` therefore ran the built-in demo prompt instead
+# of talking, which is not what anyone typing that meant. Reuse the scan
+# above: a bare word or -p/-f is a question, anything else is not.
 INTERACTIVE=0
-[ $# -eq 0 ] && [ "$BENCH" = 0 ] && [ "$SHOW" = 0 ] && INTERACTIVE=1
+_askish=0
+case " $* " in *" --info "*|*" --tokens "*|*" --logits "*) _askish=1 ;; esac
+[ "$_bare" = 0 ] && [ "$_hasp" = 0 ] && [ "$_askish" = 0 ] \
+	&& [ "$BENCH" = 0 ] && [ "$SHOW" = 0 ] && INTERACTIVE=1
 
 [ -f "$CONF" ] || { echo "charsiu: no config at $CONF (run charsiu-config)" >&2; exit 1; }
 

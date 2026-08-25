@@ -141,7 +141,7 @@ else
 	# built without it, so a 1321 MB model reported as 0 MB and the memory
 	# check below became meaningless. wc -c is in every shell environment
 	# there is.
-	sz=$(( $(wc -c < "$M" 2>/dev/null || echo 0) / 1048576 ))
+	sz=$(( $([ -f "$M" ] && wc -c < "$M" || echo 0) / 1048576 ))
 	ok "$M (${sz} MB)"
 	if [ -n "$CK" ]; then
 		if out=$("$CK" -q "$M" 2>&1); then
