@@ -118,10 +118,16 @@ if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
 			# disposable instead, and throw it away on the way out.
 			DIR="${TMPDIR:-/tmp}/charsiu-dryrun.$$"
 			CHARSIU_DRY_SRC="$DIR"; export CHARSIU_DRY_SRC
-		elif [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+		elif [ "$(id -u)" -eq 0 ]; then
 			DIR=/opt/charsiu/src
 		else
-			DIR="$HOME/charsiu"
+			# ⚠ HAVING sudo IS NOT A REASON TO PUT THE SOURCE WHERE YOU
+			# CANNOT BUILD. This used to fetch into /opt/charsiu/src with
+			# sudo, leaving a root-owned tree, and then ran `make` as the
+			# user, which could not even create build/. On the board that
+			# came out as "the build failed" with the reason discarded.
+			# The source is not a system asset; only the install is.
+			DIR="${XDG_CACHE_HOME:-$HOME/.cache}/charsiu/src"
 		fi
 	fi
 	if [ "$_BOOT_DRY" = 1 ]; then
@@ -137,8 +143,15 @@ It will be fetched into
 Continue?" || { echo "  stopped."; exit 1; }
 	fi
 
+	# ⚠ `-w` ON A PATH THAT DOES NOT EXIST YET IS ALWAYS FALSE. This asked for
+	# a sudo password to create a directory inside the user's own home, which
+	# on the board arrived as a bare "[sudo] password for" right after a
+	# dialog had cleared the screen. Try to make it first; only a real failure
+	# is a reason to escalate.
 	_sudo=""
-	[ -w "$(dirname "$DIR")" ] || [ "$(id -u)" -eq 0 ] || _sudo=$(command -v sudo || true)
+	if [ "$(id -u)" -ne 0 ] && ! mkdir -p "$(dirname "$DIR")" 2>/dev/null; then
+		_sudo=$(command -v sudo || true)
+	fi
 	if [ -d "$DIR/.git" ]; then
 		printf '  updating %s\n' "$DIR"
 		$_sudo git -C "$DIR" pull --ff-only --quiet || true
@@ -256,7 +269,15 @@ PDISP="${PREFIX:-/}"
 BIN="$PREFIX/opt/charsiu"
 SBIN="$PREFIX/usr/bin"
 ETC="$PREFIX/etc/charsiu"
-MODELS="$BIN/models"
+# ⚠ THE MODELS DIRECTORY MUST NOT NEED A CHOWN AT ALL. Under /opt it lands
+# root-owned, and then charsiu-get, which nobody should have to run as root to
+# download a file, fails at the last step, after the download. A user's models
+# belong in the user's own directory; only a root install puts them in /opt.
+if [ -n "$PREFIX" ] || [ "$(id -u)" -eq 0 ]; then
+	MODELS="$BIN/models"
+else
+	MODELS="${CHARSIU_MODELS:-$HOME/.charsiu/models}"
+fi
 
 die() { ui_msg "$1"; exit 1; }
 
@@ -277,6 +298,18 @@ if [ "$NEEDROOT" = 1 ] && [ "$(id -u)" -ne 0 ]; then
 		die "$PDISP needs root and sudo is not installed."
 	fi
 	[ -z "$SUDO" ] && ui_warn "not root and no sudo: a real run would need one"
+fi
+# ⚠ A BARE "[sudo] password for ..." APPEARING AFTER A DIALOG HAS CLEARED THE
+# SCREEN LOOKS LIKE THE INSTALLER BROKE. Ask once, deliberately, with the
+# reason still on screen, and let sudo's own timestamp cover everything after.
+if [ -n "$SUDO" ] && [ "$DRY" = 0 ] && ! $SUDO -n true 2>/dev/null; then
+	ui_msg "Installing into
+  $BIN
+  $SBIN
+needs root, so sudo will ask for your password on the next screen.
+
+Nothing else in this install asks for it."
+	$SUDO -v || die "sudo was declined, so nothing was installed."
 fi
 # ⚠ EVERY MUTATION GOES THROUGH THIS. --dry-run prints the command instead of
 # running it, so the difference between a rehearsal and the real thing is one
@@ -622,9 +655,43 @@ if [ "$DOBUILD" = 1 ]; then
 	if [ "$DRY" = 1 ]; then
 		would "make all   (in $SRC)"
 	else
-		ui_note "building charsiu..."
-		( cd "$SRC" && make all ) >/dev/null 2>&1 \
-			|| die "the build failed. Run 'make all' in $SRC to see why."
+		# ⚠ A BUILD IS THE LONGEST SILENT STRETCH OF THE WHOLE INSTALL, and
+		# it used to print one line and then nothing for minutes. Drive a
+		# gauge off the binaries as they actually appear in build/, which is
+		# a real measure rather than an animation.
+		BLOG="${TMPDIR:-/tmp}/charsiu-build.$$"
+		TARGETS="emit_dump emit_job charsiu_run charsiu_check charsiu_serve"
+		ntot=0; for t in $TARGETS; do ntot=$((ntot + 1)); done
+		( cd "$SRC" && make -j"$(nproc 2>/dev/null || echo 2)" all ) \
+			> "$BLOG" 2>&1 &
+		_mpid=$!
+		{
+			while kill -0 "$_mpid" 2>/dev/null; do
+				n=0
+				for t in $TARGETS; do
+					[ -x "$SRC/build/$t" ] && n=$((n + 1))
+				done
+				echo $(( n * 100 / ntot ))
+				sleep 1
+			done
+			echo 100
+		} | ui_progress "Building charsiu in $SRC
+
+This is C, not a download: a minute or two on a board."
+		if ! wait "$_mpid"; then
+			# ⚠ `>/dev/null 2>&1` ON THE BUILD MEANT THE ONE MESSAGE THAT
+			# COULD HAVE EXPLAINED IT WAS THROWN AWAY, and the board only
+			# ever said "the build failed".
+			printf '\n%s\n' "$(tail -n 12 "$BLOG")" >&2
+			ui_msg "The build failed. The last lines were printed above, and
+the whole log is in
+
+  $BLOG
+
+Run 'make all' in $SRC to see it live."
+			exit 1
+		fi
+		rm -f "$BLOG"
 		ui_ok "built"
 	fi
 fi
@@ -680,6 +747,23 @@ if [ -f "$ETC/config.ini" ]; then
 else
 	as_root cp "$SRC/etc/config.ini" "$ETC/config.ini"
 fi
+# ⚠ THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
+# root's, so charsiu-get could not record the model it had just downloaded and
+# every later run went looking for the placeholder in the shipped template. The
+# front door already prefers ~/.charsiu/config.ini, so put one there, pointing
+# at the models directory that user will actually fill.
+if [ "$DRY" = 0 ] && [ -z "$PREFIX" ] && [ "$(id -u)" -ne 0 ]; then
+	UCONF="${CHARSIU_HOME:-$HOME/.charsiu}/config.ini"
+	if [ ! -f "$UCONF" ]; then
+		mkdir -p "$(dirname "$UCONF")" "$MODELS"
+		sed "s|^path *=.*|path = $MODELS/$(basename "$(sed -n 's|^path *= *||p' "$SRC/etc/config.ini" | head -1)")|" \
+			"$SRC/etc/config.ini" > "$UCONF"
+		ui_ok "your config is $UCONF, and your models are $MODELS"
+	fi
+	CONFDISP="$UCONF"
+else
+	CONFDISP="$ETC/config.ini"
+fi
 [ "$DRY" = 0 ] && ui_ok "installed into $BIN and $SBIN"
 
 # ---------------------------------------------------------------------------
@@ -687,8 +771,15 @@ if [ "$DOMODEL" = 1 ] && [ -z "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ]; th
 	if [ "$DRY" = 1 ]; then
 		would "charsiu-get --wizard   (pick and download a model into $MODELS)"
 	else
+		# ⚠ charsiu-get RECORDS WHAT IT FETCHED, so it has to be told which
+		# config is in effect. Left to guess it looked at ~/.charsiu and then
+		# /etc, found neither in a staged install, and the download went
+		# unrecorded, which is the bug that shipped a working install unable
+		# to name its own model.
 		CHARSIU_MODELS_DIR="$MODELS" CHARSIU_CHECK="$BIN/charsiu_check" \
-			CHARSIU_LIB="$BIN" "$SBIN/charsiu-get" --wizard || true
+			CHARSIU_LIB="$BIN" \
+			CHARSIU_CONFIG="${CONFDISP:-$ETC/config.ini}" \
+			"$SBIN/charsiu-get" --wizard || true
 	fi
 fi
 
@@ -700,7 +791,14 @@ if [ "$DRY" = 1 ]; then
 	CHARSIU_CONFIG="$SRC/etc/config.ini" CHARSIU_LIB="$SRC/scripts" \
 		"$SRC/scripts/charsiu-doctor" || true
 else
-	CHARSIU_CONFIG="$ETC/config.ini" "$SBIN/charsiu-doctor" || true
+	# ⚠ THE LONGEST STRETCH OF LOOSE TEXT IN THE WHOLE INSTALL. On a serial
+	# console it scrolls past between two dialogs and reads as the wizard
+	# having given up. Keep printing it, so it is in the log and in a pipe,
+	# and also put it on screen as something you can read and scroll.
+	DLOG="${TMPDIR:-/tmp}/charsiu-doctor.$$"
+	CHARSIU_CONFIG="${CONFDISP:-$ETC/config.ini}" "$SBIN/charsiu-doctor" 2>&1 | tee "$DLOG" >&2 || true
+	ui_pane "$DLOG"
+	rm -f "$DLOG"
 fi
 
 # ⚠ A REPORT IS NOT A DEMONSTRATION. Ending on a list of ticks leaves someone
@@ -714,7 +812,7 @@ elif [ -n "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ] && [ "$NPU_OK" = 1 ]; t
 The first run stages the NPU tensors, which takes about twenty
 seconds before the first word." ; then
 		ui_hdr "asking: the capital of France is"
-		CHARSIU_CONFIG="$ETC/config.ini" CHARSIU_LIB="$BIN" \
+		CHARSIU_CONFIG="${CONFDISP:-$ETC/config.ini}" CHARSIU_LIB="$BIN" \
 			"$SBIN/charsiu" -p "The capital of France is" -n 32 -q || true
 		printf '\n'
 	fi
@@ -739,6 +837,6 @@ ui_msg "Done.
   charsiu-doctor     what works and what does not
   charsiu-get        more models
 
-  config  $ETC/config.ini
+  config  ${CONFDISP:-$ETC/config.ini}
   models  $MODELS"
 }

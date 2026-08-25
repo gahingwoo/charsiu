@@ -157,6 +157,15 @@ ui_progress() {
 	fi
 }
 
+# ui_pane FILE: a scrollable pane for output that is a report rather than a
+# question. Plain mode does nothing, because there the text already went to the
+# screen in the order it was produced.
+ui_pane() {
+	if [ "$CTUI" = whiptail ] && [ -s "$1" ]; then
+		whiptail --title "$CTUI_TITLE" --scrolltext --textbox "$1" 22 76
+	fi
+}
+
 # ui_ok / ui_bad / ui_warn: one line of report, for the plain path and for
 # anything a dialog would be too heavy for.
 ui_ok()   { printf '  %s[ OK ]%s %s\n' "$T_G" "$T_0" "$*" >&2; }
