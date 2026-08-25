@@ -24,6 +24,19 @@
 # ⚠ AND IT KEEPS THE ONE ALREADY THERE. The new kernel becomes the default boot
 # entry and the previous one stays on the card as a second entry, because a
 # kernel that does not boot is not a thing to discover with no way back.
+# ⚠⚠ THE WHOLE SCRIPT IS ONE BRACE GROUP, ON PURPOSE.
+#
+# `sh` reads a piped script in chunks and runs each one as it arrives. This
+# script reattaches the terminal with `exec < /dev/tty`, which CLOSES the pipe
+# curl is still writing into, and curl then dies with
+#
+#     curl: (23) Failure writing output to destination, passed 1378 returned 1311
+#
+# Measured, not theorised: that is what the first `curl ... | sh` run printed.
+# A brace group has to be parsed to its closing brace before any of it runs, so
+# the shell drains the whole stream first and curl finishes cleanly. It also
+# means a truncated download runs nothing at all instead of half of something.
+{
 set -eu
 
 # ---------------------------------------------------------------------------
@@ -154,16 +167,25 @@ if ! command -v whiptail >/dev/null 2>&1 && [ -z "${CHARSIU_PLAIN:-}" ]; then
 	elif command -v pacman  >/dev/null 2>&1; then _pm="pacman -S --noconfirm libnewt"
 	fi
 	if [ -n "$_pm" ]; then
-		if [ "$_BOOT_DRY" = 1 ]; then
-			printf '\n  would  %s   (so the wizard is a dialog, not shell prompts)\n' "$_pm"
-		elif _boot_yesno "This wizard draws dialogs with whiptail and it is not
-installed, so every page would be a plain shell prompt instead.
-
-Install it?
+		# ⚠ THE ONE THING A DRY RUN DOES FOR REAL, AND WHY. whiptail is the
+		# MEDIUM, not the content. Deferring it made the rehearsal run
+		# entirely in text, so it rehearsed everything except the interface
+		# it exists to show. A dry run that cannot draw the wizard is not
+		# rehearsing the wizard.
+		_why="This wizard draws dialogs with whiptail and it is not installed,
+so every page would be a plain shell prompt instead.
 
   $_pm
 
-Answering no is fine. Everything still works, in text." ; then
+Answering no is fine. Everything still works, in text."
+		[ "$_BOOT_DRY" = 1 ] && _why="$_why
+
+⚠ This is the ONE thing this dry run would actually do. Without it
+there is no dialog to show you, and the rehearsal would be text."
+		if [ "$_BOOT_NOTTY" = 1 ]; then
+			printf '\n  no terminal, so whiptail is not installed and this runs in text\n'
+			printf '  (%s, if you want the dialogs)\n' "$_pm"
+		elif _boot_yesno "$_why" ; then
 			_bs=""
 			[ "$(id -u)" -eq 0 ] || _bs=$(command -v sudo || true)
 			command -v apt-get >/dev/null 2>&1 && $_bs apt-get update -qq >/dev/null 2>&1
@@ -644,3 +666,4 @@ ui_msg "Done.
 
   config  $ETC/config.ini
   models  $MODELS"
+}
