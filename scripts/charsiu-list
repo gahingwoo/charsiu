@@ -16,9 +16,14 @@ CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
 CUR=$(awk '/^[ \t]*\[model\]/{f=1;next} /^[ \t]*\[/{f=0} f && /^[ \t]*path[ \t]*=/{
 	sub(/^[^=]*=[ \t]*/,""); sub(/[ \t]#.*$/,""); print; exit}' "$CONF" 2>/dev/null || true)
 
+# ⚠ RUNS IS THE WHOLE POINT OF THIS COMMAND, and without charsiu_check every
+# row says "?". These are the same places the front door's libexec() looks,
+# CHARSIU_LIB and the staged ../../opt/charsiu included: a --prefix install
+# put the binary somewhere none of the old three looked.
 ck=""
-for c in "$(dirname "$0")/charsiu_check" "$(dirname "$0")/../build/charsiu_check" \
-	 /opt/charsiu/charsiu_check; do
+for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_check"} \
+	 "$(dirname "$0")/charsiu_check" "$(dirname "$0")/../build/charsiu_check" \
+	 "$(dirname "$0")/../../opt/charsiu/charsiu_check" /opt/charsiu/charsiu_check; do
 	[ -x "$c" ] && { ck="$c"; break; }
 done
 

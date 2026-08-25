@@ -23,14 +23,33 @@ ini_get() {
 }
 
 BIN=""
-for c in "$here/charsiu_serve" "$here/../build/charsiu_serve" /opt/charsiu/charsiu_serve; do
+for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_serve"} "$here/charsiu_serve" \
+	 "$here/../build/charsiu_serve" "$here/../../opt/charsiu/charsiu_serve" \
+	 /opt/charsiu/charsiu_serve; do
 	[ -x "$c" ] && { BIN="$c"; break; }
 done
 [ -n "$BIN" ] || { echo "charsiu serve: charsiu_serve is not built" >&2; exit 1; }
 
 MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
+# ⚠ THE SAME FALLBACK THE RUNNER HAS. It was added there and not here, so a
+# config naming a model that is gone worked from `charsiu` and died from
+# `charsiu serve`, which is a worse place to find out.
+if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
+	_found=""; _n=0
+	for d in "${CHARSIU_MODELS:-$HOME/.charsiu/models}" /opt/charsiu/models; do
+		[ -d "$d" ] || continue
+		for f in "$d"/*.gguf; do
+			[ -f "$f" ] || continue
+			_n=$((_n + 1)); [ -z "$_found" ] && _found="$f"
+		done
+	done
+	if [ "$_n" -eq 1 ]; then
+		[ -n "$MODEL" ] && echo "charsiu serve: $MODEL is gone; serving ${_found##*/}" >&2
+		MODEL="$_found"
+	fi
+fi
 [ -n "$MODEL" ] || { echo "charsiu serve: no model set. Try: charsiu setup" >&2; exit 1; }
-[ -f "$MODEL" ] || { echo "charsiu serve: $MODEL does not exist" >&2; exit 1; }
+[ -f "$MODEL" ] || { echo "charsiu serve: $MODEL does not exist (charsiu pull)" >&2; exit 1; }
 
 CTX=$(ini_get run context);      : "${CTX:=2048}"
 THREADS=$(ini_get run threads);  : "${THREADS:=4}"

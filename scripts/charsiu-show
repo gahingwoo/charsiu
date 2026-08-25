@@ -15,7 +15,8 @@ CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
 [ -f "$CONF" ] || CONF=/etc/charsiu/config.ini
 # ⚠ may still not exist; every reader below tolerates that.
 here=$(dirname "$0")
-find1() { for c in "$here/$1" "$here/../build/$1" "/opt/charsiu/$1"; do
+find1() { for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/$1"} "$here/$1" \
+		  "$here/../build/$1" "$here/../../opt/charsiu/$1" "/opt/charsiu/$1"; do
 	[ -x "$c" ] && { echo "$c"; return; }; done; command -v "$1" 2>/dev/null || true; }
 
 M="${1:-}"
