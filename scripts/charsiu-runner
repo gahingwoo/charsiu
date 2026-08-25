@@ -101,8 +101,13 @@ fi
 [ -f "$MODEL" ] || { echo "charsiu: $MODEL does not exist (charsiu pull fetches one)" >&2; exit 1; }
 
 if [ -z "$RUN" ]; then
+	# ⚠ Mirror the front door's libexec() search, CHARSIU_LIB and the staged
+	# ../opt/charsiu layout included. Without them a --prefix install put the
+	# binary somewhere none of these looked and every run said it was missing.
 	d=$(dirname "$0")
-	for c in "$d/charsiu_run" "$d/../build/charsiu_run" /opt/charsiu/charsiu_run; do
+	for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_run"} \
+		 "$d/charsiu_run" "$d/../build/charsiu_run" \
+		 "$d/../opt/charsiu/charsiu_run" /opt/charsiu/charsiu_run; do
 		[ -x "$c" ] && { RUN="$c"; break; }
 	done
 	[ -n "$RUN" ] || RUN=$(command -v charsiu_run || true)

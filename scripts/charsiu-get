@@ -225,7 +225,6 @@ fetch_and_gate() {
 		fi
 	fi
 
-	say "fetching $base"
 	# ⚠ A 1.3 GB DOWNLOAD WITH NO PROGRESS LOOKS LIKE A HANG. curl draws its
 	# own bar on a terminal, but a whiptail install has just cleared the
 	# screen around it. When the size is known, drive a real gauge off the
@@ -247,6 +246,7 @@ fetch_and_gate() {
 about ${want_mb} MB"
 		wait "$_gpid" || _dlfail=1
 	else
+		say "fetching $base"
 		get_url "$url" "$part" || _dlfail=1
 	fi
 	if [ "$_dlfail" = 1 ]; then
