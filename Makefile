@@ -18,7 +18,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
           src/npudev.c src/device.c src/job.c src/regcmd.c
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
-     $(BUILD)/charsiu_check
+     $(BUILD)/charsiu_check $(BUILD)/charsiu_serve
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -59,7 +59,8 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
        $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64 \
        $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64 \
-       $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64
+       $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64 \
+       $(BUILD)/charsiu_serve.aarch64
 
 # what the memory controller has left, which is the only question that decides
 # whether splitting work across the CPU, the GPU and the NPU can pay
@@ -94,6 +95,14 @@ $(BUILD)/charsiu_check: tools/charsiu_check.c src/gguf.c | $(BUILD)
 
 $(BUILD)/charsiu_check.aarch64: tools/charsiu_check.c src/gguf.c | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
+# An OpenAI compatible endpoint, so every chat front end that already exists
+# works against this board without anyone writing a GUI first.
+$(BUILD)/charsiu_serve: tools/charsiu_serve.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
 test: $(BUILD)/pack_int4
 	./$(BUILD)/pack_int4

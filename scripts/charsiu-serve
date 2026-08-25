@@ -1,0 +1,69 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+# `charsiu serve`. Not meant to be run directly; charsiu dispatches to it.
+#
+# It exists to turn config.ini into the environment the NPU path needs, which is
+# the same job the runner does for a conversation. ⚠ Six variables decide whether
+# a decode reaches the NPU at all, and getting one wrong does not fail loudly, it
+# quietly runs a third as fast on the CPU. KMAX and W4_GROUP must be EQUAL.
+set -eu
+
+CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
+[ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
+here=$(dirname "$0")
+
+ini_get() {
+	[ -f "$CONF" ] || return 0
+	awk -v s="$1" -v k="$2" '
+		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
+		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
+		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
+	' "$CONF" 2>/dev/null || true
+}
+
+BIN=""
+for c in "$here/charsiu_serve" "$here/../build/charsiu_serve" /opt/charsiu/charsiu_serve; do
+	[ -x "$c" ] && { BIN="$c"; break; }
+done
+[ -n "$BIN" ] || { echo "charsiu serve: charsiu_serve is not built" >&2; exit 1; }
+
+MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
+[ -n "$MODEL" ] || { echo "charsiu serve: no model set. Try: charsiu setup" >&2; exit 1; }
+[ -f "$MODEL" ] || { echo "charsiu serve: $MODEL does not exist" >&2; exit 1; }
+
+CTX=$(ini_get run context);      : "${CTX:=2048}"
+THREADS=$(ini_get run threads);  : "${THREADS:=4}"
+CPUS=$(ini_get run cpus)
+NPU=$(ini_get npu enable);       : "${NPU:=yes}"
+KSLICE=$(ini_get npu kslice);    : "${KSLICE:=1024}"
+MAXN=$(ini_get npu maxn);        : "${MAXN:=131072}"
+COEF=$(ini_get npu coef_elems);  : "${COEF:=65536}"
+
+E=""
+case "$NPU" in
+yes|1|true|on)
+	E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"
+	E="$E CHARSIU_NPU_KMAX=$KSLICE CHARSIU_NPU_W4_GROUP=$KSLICE"
+	E="$E CHARSIU_NPU_MAXN=$MAXN CHARSIU_COEF_ELEMS=$COEF" ;;
+esac
+[ -n "$CPUS" ] && E="$E CHARSIU_CPUS=$CPUS"
+
+# ⚠ Tell whoever started it where to point a browser. "listening on 0.0.0.0" is
+# not an address anybody can type.
+#
+# ⚠ AND THE PORT HAS TO BE THE REAL ONE. The first version printed the default
+# whatever --port said, which is worse than printing nothing: it hands somebody
+# an address that does not answer and sends them looking for a network fault.
+PORT=11434
+prev=""
+for a in "$@"; do
+	[ "$prev" = "--port" ] && { PORT="$a"; break; }
+	prev="$a"
+done
+ip=$(ip -4 addr show scope global 2>/dev/null \
+     | awk '/inet /{sub("/.*","",$2); print $2; exit}')
+[ -n "$ip" ] && printf '\n  reachable at  http://%s:%s/v1\n' "$ip" "$PORT" >&2
+
+# shellcheck disable=SC2086
+exec env $E "$BIN" "$MODEL" -c "$CTX" -t "$THREADS" "$@"
