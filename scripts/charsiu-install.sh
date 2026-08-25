@@ -358,7 +358,7 @@ entry in the boot menu instead, then remove it by hand." defaultno || exit 0
 	# written. The install side makes the same mistake if it is spelled out.
 	as_root rm -f "$SBIN/charsiu"
 	for f in "$SBIN"/charsiu-*; do [ -e "$f" ] && as_root rm -f "$f"; done
-	for f in charsiu_run charsiu_check charsiu_serve charsiu-tui.sh; do
+	for f in charsiu_run charsiu_check charsiu_serve charsiu-tui.sh charsiu-lib.sh; do
 		as_root rm -f "$BIN/$f"
 	done
 	ui_msg "Removed. Models and config kept."
@@ -714,11 +714,16 @@ for f in charsiu_run charsiu_check charsiu_serve; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
-as_root cp "$SRC/scripts/charsiu-tui.sh" "$BIN/charsiu-tui.sh"
+# ⚠ BOTH LIBRARIES, OR EVERY COMMAND EXITS ON THE FIRST LINE. charsiu-lib.sh
+# is where ini_get and find_bin live now; a script that cannot source it
+# says so and stops rather than guessing.
+for f in charsiu-tui.sh charsiu-lib.sh; do
+	as_root cp "$SRC/scripts/$f" "$BIN/$f"
+done
 for p in "$SRC"/scripts/charsiu "$SRC"/scripts/charsiu-*; do
 	f=${p##*/}
 	# the installer is not a subcommand, and the TUI layer is a library
-	case "$f" in charsiu-install.sh|charsiu-tui.sh) continue ;; esac
+	case "$f" in charsiu-install.sh|charsiu-tui.sh|charsiu-lib.sh) continue ;; esac
 	as_root cp "$p" "$SBIN/$f"
 	as_root chmod 0755 "$SBIN/$f"
 done

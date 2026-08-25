@@ -15,29 +15,24 @@
 # an in-place editor that preserves comments and keys this script never heard of.
 set -u
 
-# ⚠ USER FIRST. Writing to /etc needs root, and a setup screen that cannot
-# save the choice it just made loops on the same step forever, which is exactly
-# what happened. The system file is still read when there is one.
-CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-[ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
-# ⚠⚠ WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION, and this
-# collapsed them. As an ordinary user /etc/charsiu/config.ini is not writable,
-# so the name was simply REPLACED by ~/.charsiu/config.ini, which does not
-# exist -- and the model screen then said "now: (unset)" on a board whose
-# config was fine and whose model was running. Copy it instead of renaming it,
-# so the user gets a writable one that already says what the system one said.
-if [ -e "$CONF" ] && [ ! -w "$CONF" ] && [ ! -w "$(dirname "$CONF")" ]; then
-	_uc="$HOME/.charsiu/config.ini"
-	if [ ! -f "$_uc" ]; then
-		mkdir -p "$(dirname "$_uc")" 2>/dev/null \
-			&& cp "$CONF" "$_uc" 2>/dev/null || true
-	fi
-	# and if even that failed, keep reading the system one
-	[ -f "$_uc" ] && CONF="$_uc"
-fi
-# ⚠ user first, system as a fallback, matching the front door. Pointing this
-# at /opt alone meant a model in the user's own directory read as "none".
-MODELS_DIR="${CHARSIU_MODELS_DIR:-${CHARSIU_MODELS:-$HOME/.charsiu/models}}"
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
+
+# ⚠ WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION. charsiu_conf_w
+# copies an unwritable system config into $HOME rather than replacing the NAME
+# with one that does not exist, which is what made this screen say
+# "now: (unset)" on a board whose config was fine and whose model was running.
+CONF=$(charsiu_conf_w)
+[ -f "$CONF" ] || CONF=$(charsiu_conf)
+MODELS_DIR="${CHARSIU_MODELS_DIR:-${CHARSIU_MODELS:-$CHARSIU_HOME/models}}"
 for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
 	 "$(dirname "$0")/charsiu-tui.sh" \
 	 "$(dirname "$0")/../scripts/charsiu-tui.sh" \
@@ -49,12 +44,6 @@ command -v ui_menu >/dev/null 2>&1 || { echo "charsiu-tui.sh not found" >&2; exi
 CTUI_TITLE="charsiu"
 
 here=$(dirname "$0")
-tool() {
-	for c in "$here/$1" "$here/../build/$1" "/opt/charsiu/$1"; do
-		[ -x "$c" ] && { echo "$c"; return; }
-	done
-	command -v "$1" 2>/dev/null || true
-}
 
 if [ -t 1 ]; then
 	C_B=$(printf '\033[1m'); C_G=$(printf '\033[1;32m')
@@ -69,14 +58,6 @@ else C_B=; C_G=; C_Y=; C_D=; C_0=; fi
 # is missing, and corrupts the file when the value contains / or &. The value is
 # passed to awk as a VARIABLE, never interpolated into a pattern.
 # ---------------------------------------------------------------------------
-ini_get() {
-	[ -f "$CONF" ] || return 0
-	awk -v s="$1" -v k="$2" '
-		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
-		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
-		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
-	' "$CONF"
-}
 
 ini_set() {
 	sec=$1; key=$2; val=$3
@@ -118,7 +99,7 @@ pause() { [ "$CTUI" = whiptail ] || { printf '\n%spress enter%s ' "$C_D" "$C_0";
 
 # ---------------------------------------------------------------------------
 page_status() {
-	D=$(tool charsiu-doctor)
+	D=$(find_bin charsiu-doctor)
 	if [ -n "$D" ]; then CHARSIU_CONFIG="$CONF" "$D" || true
 	else echo "  charsiu-doctor not found"; fi
 	pause
@@ -145,11 +126,11 @@ now: ${cur:-(unset)}" "$@") || return
 		case "$sel" in
 		"[back]"|"") return ;;
 		"[get]")
-			G=$(tool charsiu-get)
+			G=$(find_bin charsiu-get)
 			[ -n "$G" ] && CHARSIU_MODELS_DIR="$MODELS_DIR" CHARSIU_LIB="${CHARSIU_LIB:-/opt/charsiu}" "$G" --wizard
 			pause ;;
 		"[check]")
-			CK=$(tool charsiu_check)
+			CK=$(find_bin charsiu_check)
 			f=$(ask "file to check" "$cur")
 			[ -n "$CK" ] && "$CK" "$f"; pause ;;
 		*)
@@ -157,7 +138,7 @@ now: ${cur:-(unset)}" "$@") || return
 				[ -f "$_d/$sel" ] && { sel="$_d/$sel"; break; }
 			done
 			# ⚠ never point the config at a file the runtime cannot load
-			CK=$(tool charsiu_check)
+			CK=$(find_bin charsiu_check)
 			if [ -n "$CK" ] && ! out=$("$CK" -q "$sel" 2>&1); then
 				ui_msg "Not selected.
 
@@ -193,7 +174,7 @@ page_npu() {
 }
 
 page_show() {
-	L=$(tool charsiu)
+	L=$(find_bin charsiu)
 	printf '\n%sThe command this config produces%s\n\n' "$C_B" "$C_0"
 	[ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --show -p "The capital of France is" -n 64 \
 		     || echo "  charsiu launcher not found"
@@ -248,7 +229,7 @@ step_model_label() {
 	[ "$n" -gt 0 ] && echo "$n model(s) on this board" || echo "no model yet"
 }
 step_model_do() {
-	G=$(tool charsiu-get)
+	G=$(find_bin charsiu-get)
 	[ -n "$G" ] || { ui_msg "charsiu-get is missing."; return 1; }
 	CHARSIU_MODELS_DIR="$MODELS_DIR" CHARSIU_LIB="${CHARSIU_LIB:-/opt/charsiu}" \
 		"$G" --wizard
@@ -389,7 +370,7 @@ while :; do
 	run)    page_run ;;
 	npu)    page_npu ;;
 	show)   page_show ;;
-	chat)   L=$(tool charsiu); [ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --chat || true; pause ;;
+	chat)   L=$(find_bin charsiu); [ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --chat || true; pause ;;
 	quit|"") exit 0 ;;
 	esac
 done

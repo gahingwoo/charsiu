@@ -7,22 +7,24 @@
 # twice. Removing the thing the next `charsiu` was going to run, silently, is
 # not a convenience.
 set -eu
-MODELS="${CHARSIU_MODELS:-$HOME/.charsiu/models}"
-SYS=/opt/charsiu/models
-CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-[ -f "$CONF" ] || CONF=/etc/charsiu/config.ini
-# ⚠ may still not exist; every reader below tolerates that.
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
+
 FORCE=0
 [ "${1:-}" = "-f" ] && { FORCE=1; shift; }
 [ $# -ge 1 ] || { echo "charsiu rm: which model? (charsiu list)" >&2; exit 2; }
-CUR=$(awk '/^[ \t]*\[model\]/{f=1;next} /^[ \t]*\[/{f=0} f && /^[ \t]*path[ \t]*=/{
-	sub(/^[^=]*=[ \t]*/,""); sub(/[ \t]#.*$/,""); print; exit}' "$CONF" 2>/dev/null || true)
+CUR=$(current_model)
 rc=0
 for a in "$@"; do
-	t=""
-	for c in "$a" "$MODELS/$a" "$SYS/$a" "$MODELS/$a.gguf" "$SYS/$a.gguf"; do
-		[ -f "$c" ] && { t="$c"; break; }
-	done
+	t=$(resolve_model "$a")
 	[ -n "$t" ] || { echo "charsiu rm: no such model: $a" >&2; rc=1; continue; }
 	if [ "$t" = "$CUR" ] && [ "$FORCE" = 0 ]; then
 		echo "charsiu rm: $a is the model in use. -f to remove it anyway." >&2

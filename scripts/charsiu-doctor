@@ -11,7 +11,18 @@
 #   charsiu-doctor --run  also generate a few tokens (slow: staging is ~20 s)
 set -u
 
-CONF="${CHARSIU_CONFIG:-/etc/charsiu/config.ini}"
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
+
+CONF=$(charsiu_conf)
 QUIET=0; DORUN=0; PASTE=0
 for a in "$@"; do
 	case "$a" in
@@ -64,26 +75,6 @@ warn() { printf '  %s[WARN]%s %s\n' "$C_Y" "$C_0" "$*"; WARN=$((WARN+1)); }
 info() { [ "$QUIET" = 1 ] || printf '  %s[INFO]%s %s\n' "$C_D" "$C_0" "$*"; }
 hdr()  { [ "$QUIET" = 1 ] || printf '\n%s%s%s\n' "$C_B" "$*" "$C_0"; }
 
-ini_get() {
-	[ -f "$CONF" ] || return 0
-	awk -v s="$1" -v k="$2" '
-		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
-		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
-		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
-	' "$CONF"
-}
-findbin() {
-	# Same list as the front door's libexec() and the runner's: CHARSIU_LIB
-	# and the staged ../opt/charsiu layout included, or a --prefix install
-	# reports its own binaries missing.
-	d=$(dirname "$0")
-	# ⚠ from $PREFIX/usr/bin the staged /opt is TWO levels up, not one.
-	for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/$1"} "$d/$1" "$d/../build/$1" \
-		 "$d/../../opt/charsiu/$1" "/opt/charsiu/$1"; do
-		[ -x "$c" ] && { echo "$c"; return; }
-	done
-	command -v "$1" 2>/dev/null || true
-}
 
 hdr "the hardware"
 # The mainline rocket driver is an accel device, not a render node.
@@ -131,7 +122,7 @@ KS=$(ini_get npu kslice)
 
 hdr "the model"
 M=$(ini_get model path)
-CK=$(findbin charsiu_check)
+CK=$(find_bin charsiu_check)
 if [ -z "$M" ]; then
 	bad "[model] path is not set"
 elif [ ! -f "$M" ]; then
@@ -180,7 +171,7 @@ fi
 
 if [ "$DORUN" = 1 ] && [ "$CRIT" = 0 ]; then
 	hdr "an actual decode"
-	L=$(findbin charsiu); [ -n "$L" ] || L=$(dirname "$0")/charsiu
+	L=$(find_bin charsiu); [ -n "$L" ] || L=$(dirname "$0")/charsiu
 	info "staging takes about 20 s before the first token"
 	if o=$("$L" -p "The capital of France is" -n 8 -q 2>&1); then
 		r=$(echo "$o" | grep -oE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' || true)

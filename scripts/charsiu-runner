@@ -24,10 +24,18 @@
 #         charsiu --config FILE      use a different config
 set -eu
 
-# ⚠ USER FIRST, SYSTEM AS A FALLBACK, same order as the front door. A plain
-# user could not previously configure anything without root.
-CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-[ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
+
+CONF=$(charsiu_conf)
 RUN="${CHARSIU_RUN_BIN:-}"
 SHOW=0
 
@@ -105,50 +113,22 @@ case " $* " in *" --info "*|*" --tokens "*|*" --logits "*) _askish=1 ;; esac
 
 [ -f "$CONF" ] || { echo "charsiu: no config at $CONF (run charsiu-config)" >&2; exit 1; }
 
-# ini_get SECTION KEY. Strips inline comments, tolerates a hand-edited file.
-ini_get() {
-	awk -v s="$1" -v k="$2" '
-		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
-		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
-		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
-	' "$CONF"
-}
-
 # `charsiu run MODEL ...` names it outright; otherwise the config decides.
 MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
-case "$MODEL" in
-*/*) : ;;
-"")  : ;;
-*)   # a bare name: look where the models are before giving up
-     for d in "${CHARSIU_MODELS:-$HOME/.charsiu/models}" /opt/charsiu/models; do
-         for c in "$d/$MODEL" "$d/$MODEL.gguf"; do
-             [ -f "$c" ] && { MODEL="$c"; break 2; }
-         done
-     done ;;
-esac
+[ -n "$MODEL" ] && MODEL=$(resolve_model "$MODEL")
+
 # ⚠ THE SHIPPED CONFIG NAMES A MODEL NOBODY HAS YET. A clean install where the
 # wizard downloaded SmolLM2 still ended at "Llama-3.2-1B-Instruct-Q8_0.gguf does
 # not exist", because the default path is a placeholder and the download never
 # wrote over it. What is on disk beats what the config guessed.
-if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
-	_found=""; _n=0
-	for d in "${CHARSIU_MODELS:-$HOME/.charsiu/models}" /opt/charsiu/models; do
-		[ -d "$d" ] || continue
-		for f in "$d"/*.gguf; do
-			[ -f "$f" ] || continue
-			_n=$((_n + 1)); [ -z "$_found" ] && _found="$f"
-		done
-	done
+if [ -z "$MODEL" ]; then
+	_n=$(all_models | wc -l)
 	if [ "$_n" -eq 1 ]; then
-		[ -n "$MODEL" ] && [ "$SHOW" = 0 ] && \
-			echo "charsiu: $MODEL is gone; using the only model here, ${_found##*/}" >&2
-		MODEL="$_found"
+		MODEL=$(all_models | head -1)
+		[ "$SHOW" = 0 ] && echo "charsiu: using the only model here, ${MODEL##*/}" >&2
 	elif [ "$_n" -gt 1 ]; then
-		echo "charsiu: ${MODEL:-[model] path} is not here. $_n models are:" >&2
-		for d in "${CHARSIU_MODELS:-$HOME/.charsiu/models}" /opt/charsiu/models; do
-			[ -d "$d" ] || continue
-			for f in "$d"/*.gguf; do [ -f "$f" ] && echo "  ${f##*/}" >&2; done
-		done
+		echo "charsiu: the configured model is not here. $_n models are:" >&2
+		all_models | while IFS= read -r f; do echo "  ${f##*/}" >&2; done
 		echo "  pick one with:  charsiu run NAME     or set it with:  charsiu-config" >&2
 		exit 1
 	fi
@@ -157,16 +137,7 @@ fi
 [ -f "$MODEL" ] || { echo "charsiu: $MODEL does not exist (charsiu pull fetches one)" >&2; exit 1; }
 
 if [ -z "$RUN" ]; then
-	# ⚠ Mirror the front door's libexec() search, CHARSIU_LIB and the staged
-	# ../opt/charsiu layout included. Without them a --prefix install put the
-	# binary somewhere none of these looked and every run said it was missing.
-	d=$(dirname "$0")
-	for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_run"} \
-		 "$d/charsiu_run" "$d/../build/charsiu_run" \
-		 "$d/../../opt/charsiu/charsiu_run" /opt/charsiu/charsiu_run; do
-		[ -x "$c" ] && { RUN="$c"; break; }
-	done
-	[ -n "$RUN" ] || RUN=$(command -v charsiu_run || true)
+	RUN=$(find_bin charsiu_run)
 fi
 [ -n "$RUN" ] || { echo "charsiu: charsiu_run not found" >&2; exit 1; }
 

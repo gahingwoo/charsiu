@@ -33,6 +33,16 @@
 # Env: CHARSIU_MODELS_DIR (default /opt/charsiu/models), CHARSIU_CHECK (path to
 #      charsiu_check), HF_ENDPOINT (default https://huggingface.co).
 set -eu
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
 MODELS_DIR="${CHARSIU_MODELS_DIR:-/opt/charsiu/models}"
 HF="${HF_ENDPOINT:-https://huggingface.co}"
@@ -90,14 +100,8 @@ BAD
 }
 
 find_check() {
-	[ -n "${CHARSIU_CHECK:-}" ] && { echo "$CHARSIU_CHECK"; return; }
-	d=$(dirname "$0")
-	for c in "$d/charsiu_check" "$d/../build/charsiu_check" \
-		 /opt/charsiu/charsiu_check charsiu_check; do
-		command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
-		[ -x "$c" ] && { echo "$c"; return; }
-	done
-	echo ""
+	if [ -n "${CHARSIU_CHECK:-}" ]; then echo "$CHARSIU_CHECK"; return 0; fi
+	find_bin charsiu_check
 }
 
 fetcher() {
@@ -168,15 +172,16 @@ list_repo() {
 # a model meant it, and a second download should not silently switch them.
 claim_config() {
 	got="$1"
-	conf="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-	[ -f "$conf" ] || conf=/etc/charsiu/config.ini
-	[ -f "$conf" ] || return 0
-	cur=$(awk '
-		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h=="model"); next }
-		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
-		    if (n=="path") { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
-	' "$conf")
+	cur=$(current_model)
 	if [ -n "$cur" ] && [ -f "$cur" ]; then
+		return 0
+	fi
+	conf=$(charsiu_conf_w)
+	[ -n "$conf" ] || { say "no config to record ${got##*/} in"; return 0; }
+	if [ ! -f "$conf" ]; then
+		printf '[model]\npath = %s\n' "$got" > "$conf" 2>/dev/null \
+			&& say "config now runs ${got##*/}" \
+			|| say "could not write $conf; charsiu will still find ${got##*/}"
 		return 0
 	fi
 

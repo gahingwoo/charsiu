@@ -9,25 +9,20 @@
 # quietly runs a third as fast on the CPU. KMAX and W4_GROUP must be EQUAL.
 set -eu
 
-CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-[ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
-here=$(dirname "$0")
-
-ini_get() {
-	[ -f "$CONF" ] || return 0
-	awk -v s="$1" -v k="$2" '
-		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
-		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
-		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
-	' "$CONF" 2>/dev/null || true
-}
-
-BIN=""
-for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_serve"} "$here/charsiu_serve" \
-	 "$here/../build/charsiu_serve" "$here/../../opt/charsiu/charsiu_serve" \
-	 /opt/charsiu/charsiu_serve; do
-	[ -x "$c" ] && { BIN="$c"; break; }
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
 done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
+
+CONF=$(charsiu_conf)
+
+BIN=$(find_bin charsiu_serve)
 [ -n "$BIN" ] || { echo "charsiu serve: charsiu_serve is not built" >&2; exit 1; }
 
 MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
@@ -35,15 +30,9 @@ MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
 # config naming a model that is gone worked from `charsiu` and died from
 # `charsiu serve`, which is a worse place to find out.
 if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
-	_found=""; _n=0
-	for d in "${CHARSIU_MODELS:-$HOME/.charsiu/models}" /opt/charsiu/models; do
-		[ -d "$d" ] || continue
-		for f in "$d"/*.gguf; do
-			[ -f "$f" ] || continue
-			_n=$((_n + 1)); [ -z "$_found" ] && _found="$f"
-		done
-	done
+	_n=$(all_models | wc -l)
 	if [ "$_n" -eq 1 ]; then
+		_found=$(all_models | head -1)
 		[ -n "$MODEL" ] && echo "charsiu serve: $MODEL is gone; serving ${_found##*/}" >&2
 		MODEL="$_found"
 	fi

@@ -23,11 +23,20 @@ set -eu
 
 VERSION=0.1
 SELF=$(basename "$0")
-here=$(dirname "$0")
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
 for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
-	 "$here/charsiu-tui.sh" "$here/../scripts/charsiu-tui.sh" \
-	 "$here/../opt/charsiu/charsiu-tui.sh" /opt/charsiu/charsiu-tui.sh; do
+	 "$CHARSIU_HERE/charsiu-tui.sh" "$CHARSIU_HERE/../scripts/charsiu-tui.sh" \
+	 "$CHARSIU_HERE/../../opt/charsiu/charsiu-tui.sh" /opt/charsiu/charsiu-tui.sh; do
 	[ -r "$t" ] && { . "$t"; break; }
 done
 command -v ui_menu >/dev/null 2>&1 || { echo "$SELF: charsiu-tui.sh not found" >&2; exit 1; }
@@ -42,40 +51,12 @@ CTUI_TITLE="charsiu"
 # keep per-user state under $HOME and so does this. The system paths are still
 # read, because the board image ships models there.
 # ---------------------------------------------------------------------------
-CHARSIU_HOME="${CHARSIU_HOME:-$HOME/.charsiu}"
-CONF="${CHARSIU_CONFIG:-$CHARSIU_HOME/config.ini}"
-[ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
+CONF=$(charsiu_conf)
 MODELS="${CHARSIU_MODELS:-$CHARSIU_HOME/models}"
-SYSMODELS=/opt/charsiu/models
+SYSMODELS=$CHARSIU_SYS_MODELS
 
-libexec() {
-	for d in ${CHARSIU_LIBEXEC:+"$CHARSIU_LIBEXEC"} "$here" "$here/../libexec" \
-		 /opt/charsiu/libexec /opt/charsiu; do
-		[ -x "$d/$1" ] && { echo "$d/$1"; return; }
-	done
-	command -v "$1" 2>/dev/null || true
-}
 
-# every gguf we can see, user directory first
-all_models() {
-	_seen=""
-	for d in "$MODELS" "$SYSMODELS"; do
-		[ -d "$d" ] || continue
-		case " $_seen " in *" $d "*) continue ;; esac
-		_seen="$_seen $d"
-		for f in "$d"/*.gguf; do [ -f "$f" ] && echo "$f"; done
-	done
-}
 have_model() { [ -n "$(all_models | head -1)" ]; }
-
-ini_get() {
-	[ -f "$CONF" ] || return 0
-	awk -v s="$1" -v k="$2" '
-		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
-		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
-		    if (n==k) { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
-	' "$CONF"
-}
 configured() { m=$(ini_get model path); [ -n "$m" ] && [ -f "$m" ]; }
 
 usage() {
@@ -105,23 +86,23 @@ USAGE
 case "${1:-}" in
 -h|--help|help)  usage; exit 0 ;;
 -V|--version)    echo "charsiu $VERSION"; exit 0 ;;
-setup)           exec "$(libexec charsiu-config)" --setup ;;
-doctor)          shift; exec "$(libexec charsiu-doctor)" "$@" ;;
+setup)           exec "$(find_bin charsiu-config)" --setup ;;
+doctor)          shift; exec "$(find_bin charsiu-doctor)" "$@" ;;
 pull)            shift
                  # ⚠ ${1:+"$@"} ${1:-x} repeats the first argument. Set the
                  # default by replacing the list instead.
                  [ $# -gt 0 ] || set -- --wizard
-                 exec env CHARSIU_MODELS_DIR="$MODELS" "$(libexec charsiu-get)" "$@" ;;
-list|ls)         shift; exec "$(libexec charsiu-list)" "$@" ;;
-rm)              shift; exec "$(libexec charsiu-rm)" "$@" ;;
-show)            shift; exec "$(libexec charsiu-show)" "$@" ;;
-ps)              shift; exec "$(libexec charsiu-ps)" "$@" ;;
-bench)           shift; exec "$(libexec charsiu-runner)" bench "$@" ;;
-serve)           shift; exec "$(libexec charsiu-serve)" "$@" ;;
+                 exec env CHARSIU_MODELS_DIR="$MODELS" "$(find_bin charsiu-get)" "$@" ;;
+list|ls)         shift; exec "$(find_bin charsiu-list)" "$@" ;;
+rm)              shift; exec "$(find_bin charsiu-rm)" "$@" ;;
+show)            shift; exec "$(find_bin charsiu-show)" "$@" ;;
+ps)              shift; exec "$(find_bin charsiu-ps)" "$@" ;;
+bench)           shift; exec "$(find_bin charsiu-runner)" bench "$@" ;;
+serve)           shift; exec "$(find_bin charsiu-serve)" "$@" ;;
 run)             shift
                  [ $# -ge 1 ] || { echo "$SELF run: which model?" >&2; exit 2; }
                  M="$1"; shift
-                 exec env CHARSIU_MODEL="$M" "$(libexec charsiu-runner)" "$@" ;;
+                 exec env CHARSIU_MODEL="$M" "$(find_bin charsiu-runner)" "$@" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -130,7 +111,7 @@ esac
 if [ $# -eq 0 ] && { ! configured || ! have_model; }; then
 	# ⚠ Not an error and not a lecture. A board with nothing on it should walk
 	# somebody through it, once, and never mention it again.
-	exec "$(libexec charsiu-config)" --setup
+	exec "$(find_bin charsiu-config)" --setup
 fi
 
-exec "$(libexec charsiu-runner)" "$@"
+exec "$(find_bin charsiu-runner)" "$@"

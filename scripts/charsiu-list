@@ -8,46 +8,29 @@
 # the one that matters here and no other runner has it: whether the file can
 # actually run, read out of the file rather than off its name.
 set -eu
-MODELS="${CHARSIU_MODELS:-$HOME/.charsiu/models}"
-SYS=/opt/charsiu/models
-CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-[ -f "$CONF" ] || CONF=/etc/charsiu/config.ini
-# ⚠ may still not exist; every reader below tolerates that.
-CUR=$(awk '/^[ \t]*\[model\]/{f=1;next} /^[ \t]*\[/{f=0} f && /^[ \t]*path[ \t]*=/{
-	sub(/^[^=]*=[ \t]*/,""); sub(/[ \t]#.*$/,""); print; exit}' "$CONF" 2>/dev/null || true)
-
-# ⚠ RUNS IS THE WHOLE POINT OF THIS COMMAND, and without charsiu_check every
-# row says "?". These are the same places the front door's libexec() looks,
-# CHARSIU_LIB and the staged ../../opt/charsiu included: a --prefix install
-# put the binary somewhere none of the old three looked.
-ck=""
-for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_check"} \
-	 "$(dirname "$0")/charsiu_check" "$(dirname "$0")/../build/charsiu_check" \
-	 "$(dirname "$0")/../../opt/charsiu/charsiu_check" /opt/charsiu/charsiu_check; do
-	[ -x "$c" ] && { ck="$c"; break; }
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
 done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
-n=0
+CUR=$(current_model)
+CK=$(find_bin charsiu_check)
+
 printf '%-44s %8s  %-9s %s\n' NAME SIZE RUNS WHERE
-# ⚠ THE SAME DIRECTORY TWICE LISTS EVERY MODEL TWICE, and that is not a
-# corner case: the installer and charsiu-serve both set CHARSIU_MODELS to
-# /opt/charsiu/models, which is exactly $SYS.
-seen=""
-for d in "$MODELS" "$SYS"; do
-	[ -d "$d" ] || continue
-	case " $seen " in *" $d "*) continue ;; esac
-	seen="$seen $d"
-	for f in "$d"/*.gguf; do
-		[ -f "$f" ] || continue
-		n=$((n + 1))
-		# ⚠ wc -c, not stat: busybox is often built without the stat applet
-		# and `stat -c%s || echo 0` then reports every model as 0 MB.
-		mb=$(( $(wc -c < "$f") / 1048576 ))
-		runs="?"
-		[ -n "$ck" ] && { "$ck" -q "$f" >/dev/null 2>&1 && runs="yes" || runs="NO"; }
-		mark=""; [ "$f" = "$CUR" ] && mark=" *"
-		printf '%-44s %7sM  %-9s %s%s\n' "$(basename "$f")" "$mb" "$runs" "$d" "$mark"
-	done
+all_models | while IFS= read -r f; do
+	# ⚠ wc -c, not stat: busybox is often built without the stat applet
+	# and `stat -c%s || echo 0` then reports every model as 0 MB.
+	mb=$(( $(wc -c < "$f") / 1048576 ))
+	runs="?"
+	[ -n "$CK" ] && { "$CK" -q "$f" >/dev/null 2>&1 && runs="yes" || runs="NO"; }
+	mark=""; [ "$f" = "$CUR" ] && mark=" *"
+	printf '%-44s %7sM  %-9s %s%s\n' "$(basename "$f")" "$mb" "$runs" "$(dirname "$f")" "$mark"
 done
-[ "$n" = 0 ] && printf '\n  nothing yet. `charsiu pull` fetches one.\n'
+[ -n "$(all_models | head -1)" ] || printf '\n  nothing yet. `charsiu pull` fetches one.\n'
 exit 0

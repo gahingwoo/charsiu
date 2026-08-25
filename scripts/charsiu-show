@@ -9,29 +9,25 @@
 # perfectly runnable although the suffix looks exotic. Only the contents decide,
 # so this reads them with the runtime's own parser.
 set -eu
-MODELS="${CHARSIU_MODELS:-$HOME/.charsiu/models}"
-SYS=/opt/charsiu/models
-CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
-[ -f "$CONF" ] || CONF=/etc/charsiu/config.ini
-# ⚠ may still not exist; every reader below tolerates that.
-here=$(dirname "$0")
-find1() { for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/$1"} "$here/$1" \
-		  "$here/../build/$1" "$here/../../opt/charsiu/$1" "/opt/charsiu/$1"; do
-	[ -x "$c" ] && { echo "$c"; return; }; done; command -v "$1" 2>/dev/null || true; }
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
 M="${1:-}"
-if [ -z "$M" ]; then
-	M=$(awk '/^[ \t]*\[model\]/{f=1;next} /^[ \t]*\[/{f=0} f && /^[ \t]*path[ \t]*=/{
-		sub(/^[^=]*=[ \t]*/,""); sub(/[ \t]#.*$/,""); print; exit}' "$CONF" 2>/dev/null || true)
-	[ -n "$M" ] || { echo "charsiu show: no model set and none named" >&2; exit 2; }
-fi
-for c in "$M" "$MODELS/$M" "$SYS/$M" "$MODELS/$M.gguf" "$SYS/$M.gguf"; do
-	[ -f "$c" ] && { M="$c"; break; }
-done
-[ -f "$M" ] || { echo "charsiu show: no such model: $M" >&2; exit 2; }
+[ -n "$M" ] || M=$(current_model)
+[ -n "$M" ] || { echo "charsiu show: no model set and none named" >&2; exit 2; }
+M=$(resolve_model "$M")
+[ -n "$M" ] || { echo "charsiu show: no such model: ${1:-$(current_model)}" >&2; exit 2; }
 
-R=$(find1 charsiu_run); [ -n "$R" ] && "$R" "$M" --info 2>/dev/null
-C=$(find1 charsiu_check)
+R=$(find_bin charsiu_run);   [ -n "$R" ] && "$R" "$M" --info 2>/dev/null
+C=$(find_bin charsiu_check)
 if [ -n "$C" ]; then
 	echo
 	"$C" "$M"
