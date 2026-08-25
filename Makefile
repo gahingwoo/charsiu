@@ -3,11 +3,15 @@
 # make            host tools (the emitter dump, for the offline vendor diff)
 # make board      the same plus charsiu_probe, cross compiled for the board
 #
-# CROSS is buildroot's toolchain from the linux-rk3576-npu tree by default,
-# because that is what builds the image this runs in.
+# CROSS was buildroot's toolchain from the linux-rk3576-npu tree. That tree was
+# cleared when the project moved to a debootstrap Debian image, so the default
+# is now: use it if it is still there, otherwise build NATIVELY, which works
+# because the development host is itself aarch64. Override CROSS= for anything
+# else.
 CFLAGS ?= -O2 -Wall -Wextra -std=c11 -Iinclude
 BUILD  := build
-CROSS  ?= $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
+BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
+CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
 
 SRC    := src/regcmd.c src/device.c src/job.c
 LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
