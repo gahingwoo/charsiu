@@ -162,7 +162,12 @@ ui_progress() {
 # screen in the order it was produced.
 ui_pane() {
 	if [ "$CTUI" = whiptail ] && [ -s "$1" ]; then
-		whiptail --title "$CTUI_TITLE" --scrolltext --textbox "$1" 22 76
+		# ⚠ NOT --scrolltext. It moves focus off the button, so Enter stops
+		# dismissing the dialog and the install hangs on its last screen with
+		# no way out that a serial console makes obvious. A plain --textbox
+		# already scrolls with the arrow keys AND still exits on Enter;
+		# --scrolltext only forces the scrollbar to be drawn.
+		whiptail --title "$CTUI_TITLE" --textbox "$1" 22 76
 	fi
 }
 

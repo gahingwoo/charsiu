@@ -830,12 +830,16 @@ Run it again without --dry-run to do it for real."
 	exit 0
 fi
 
+# ⚠ The closing screen still named the old scripts one by one, from before the
+# front door existed. Say the commands a user will actually type.
 ui_msg "Done.
 
-  charsiu-config     pick a model, threads, context
-  charsiu -p \"...\"    run it
-  charsiu-doctor     what works and what does not
-  charsiu-get        more models
+  charsiu             a conversation
+  charsiu \"...\"       ask once and exit
+  charsiu list        what is here
+  charsiu pull        fetch another model
+  charsiu doctor      what works and what does not
+  charsiu serve       an OpenAI compatible endpoint on :11434
 
   config  ${CONFDISP:-$ETC/config.ini}
   models  $MODELS"

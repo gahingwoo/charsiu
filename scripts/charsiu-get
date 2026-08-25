@@ -235,7 +235,12 @@ fetch_and_gate() {
 		_gpid=$!
 		{
 			while kill -0 "$_gpid" 2>/dev/null; do
-				_sz=$(wc -c < "$part" 2>/dev/null || echo 0)
+				# ⚠ `wc -c < missing 2>/dev/null` DOES NOT GO QUIET. The
+				# redirection is the shell's, and it reports the failure on
+				# its own stderr before wc ever runs, so the first seconds
+				# of every download printed an error straight over the
+				# gauge. Ask whether the file is there instead.
+				if [ -f "$part" ]; then _sz=$(wc -c < "$part"); else _sz=0; fi
 				_p=$(( _sz / 1048576 * 100 / want_mb ))
 				[ "$_p" -gt 99 ] && _p=99
 				echo "$_p"
