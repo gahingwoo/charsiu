@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+# `charsiu rm NAME...`
+#
+# ⚠ It will not delete the model the config is pointing at without being told
+# twice. Removing the thing the next `charsiu` was going to run, silently, is
+# not a convenience.
+set -eu
+MODELS="${CHARSIU_MODELS:-$HOME/.charsiu/models}"
+SYS=/opt/charsiu/models
+CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
+[ -f "$CONF" ] || CONF=/etc/charsiu/config.ini
+# ⚠ may still not exist; every reader below tolerates that.
+FORCE=0
+[ "${1:-}" = "-f" ] && { FORCE=1; shift; }
+[ $# -ge 1 ] || { echo "charsiu rm: which model? (charsiu list)" >&2; exit 2; }
+CUR=$(awk '/^[ \t]*\[model\]/{f=1;next} /^[ \t]*\[/{f=0} f && /^[ \t]*path[ \t]*=/{
+	sub(/^[^=]*=[ \t]*/,""); sub(/[ \t]#.*$/,""); print; exit}' "$CONF" 2>/dev/null || true)
+rc=0
+for a in "$@"; do
+	t=""
+	for c in "$a" "$MODELS/$a" "$SYS/$a" "$MODELS/$a.gguf" "$SYS/$a.gguf"; do
+		[ -f "$c" ] && { t="$c"; break; }
+	done
+	[ -n "$t" ] || { echo "charsiu rm: no such model: $a" >&2; rc=1; continue; }
+	if [ "$t" = "$CUR" ] && [ "$FORCE" = 0 ]; then
+		echo "charsiu rm: $a is the model in use. -f to remove it anyway." >&2
+		rc=1; continue
+	fi
+	rm -f "$t" && echo "removed $t"
+done
+exit $rc

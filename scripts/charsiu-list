@@ -1,0 +1,42 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+# `charsiu list`. Not meant to be run directly; charsiu dispatches to it.
+#
+# ⚠ Columns, in the order ollama uses, so the output is legible to anyone who
+# has used that: NAME, SIZE, then what is particular to us. The last column is
+# the one that matters here and no other runner has it: whether the file can
+# actually run, read out of the file rather than off its name.
+set -eu
+MODELS="${CHARSIU_MODELS:-$HOME/.charsiu/models}"
+SYS=/opt/charsiu/models
+CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
+[ -f "$CONF" ] || CONF=/etc/charsiu/config.ini
+# ⚠ may still not exist; every reader below tolerates that.
+CUR=$(awk '/^[ \t]*\[model\]/{f=1;next} /^[ \t]*\[/{f=0} f && /^[ \t]*path[ \t]*=/{
+	sub(/^[^=]*=[ \t]*/,""); sub(/[ \t]#.*$/,""); print; exit}' "$CONF" 2>/dev/null || true)
+
+ck=""
+for c in "$(dirname "$0")/charsiu_check" "$(dirname "$0")/../build/charsiu_check" \
+	 /opt/charsiu/charsiu_check; do
+	[ -x "$c" ] && { ck="$c"; break; }
+done
+
+n=0
+printf '%-44s %8s  %-9s %s\n' NAME SIZE RUNS WHERE
+for d in "$MODELS" "$SYS"; do
+	[ -d "$d" ] || continue
+	for f in "$d"/*.gguf; do
+		[ -f "$f" ] || continue
+		n=$((n + 1))
+		# ⚠ wc -c, not stat: busybox is often built without the stat applet
+		# and `stat -c%s || echo 0` then reports every model as 0 MB.
+		mb=$(( $(wc -c < "$f" 2>/dev/null || echo 0) / 1048576 ))
+		runs="?"
+		[ -n "$ck" ] && { "$ck" -q "$f" >/dev/null 2>&1 && runs="yes" || runs="NO"; }
+		mark=""; [ "$f" = "$CUR" ] && mark=" *"
+		printf '%-44s %7sM  %-9s %s%s\n' "$(basename "$f")" "$mb" "$runs" "$d" "$mark"
+	done
+done
+[ "$n" = 0 ] && printf '\n  nothing yet. `charsiu pull` fetches one.\n'
+exit 0

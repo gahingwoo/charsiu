@@ -15,8 +15,17 @@
 # an in-place editor that preserves comments and keys this script never heard of.
 set -u
 
-CONF="${CHARSIU_CONFIG:-/etc/charsiu/config.ini}"
-MODELS_DIR="${CHARSIU_MODELS_DIR:-/opt/charsiu/models}"
+# ⚠ USER FIRST. Writing to /etc needs root, and a setup screen that cannot
+# save the choice it just made loops on the same step forever, which is exactly
+# what happened. The system file is still read when there is one.
+CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
+[ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
+# ⚠ and if the system file is not writable either, fall back to the user's.
+[ -w "$CONF" ] || [ ! -e "$CONF" ] || [ -w "$(dirname "$CONF")" ] \
+	|| CONF="$HOME/.charsiu/config.ini"
+# ⚠ user first, system as a fallback, matching the front door. Pointing this
+# at /opt alone meant a model in the user's own directory read as "none".
+MODELS_DIR="${CHARSIU_MODELS_DIR:-${CHARSIU_MODELS:-$HOME/.charsiu/models}}"
 for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
 	 "$(dirname "$0")/charsiu-tui.sh" \
 	 "$(dirname "$0")/../scripts/charsiu-tui.sh" \
@@ -178,37 +187,142 @@ page_show() {
 # would drift from this one. `charsiu-config --setup` walks the same pages in
 # the order a new board needs them.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# FIRST RUN, as a list of steps rather than a queue of questions.
+#
+# ⚠ Taken from codex's onboarding (codex-rs/tui/src/onboarding/): a list of
+# steps, each of which ASSESSES ITSELF as hidden, complete or in progress. A
+# step that is already satisfied is never shown, a finished one stays on screen
+# as a record of what happened, and exactly one is being worked on. Somebody
+# coming back a second time sees only what is left, which is the difference
+# between a wizard and an interrogation.
+#
+# ⚠ And from crush's splash: the empty state SHOWS EXAMPLES. A bare ">" teaches
+# a new owner of this board nothing at all; three things they can type teach
+# them the whole idea.
+#
+#   step_<name>_state  -> hidden | done | todo
+#   step_<name>_label  -> one line, for the trail
+#   step_<name>_do     -> make it done
+# ---------------------------------------------------------------------------
+STEPS="kernel model pick ready"
+
+# ⚠ NOT A TODO. Nothing this screen can do makes an NPU appear, and a step that
+# reports "todo" forever is picked again on every pass -- which is exactly what
+# the first version did, looping on the same message. codex's model has a place
+# for this: a COMPLETE step whose label carries the finding. It is checked, it
+# is reported, and the run continues on the CPU.
+step_kernel_state() { echo done; }
+step_kernel_label() {
+	if [ -e "${CHARSIU_ACCEL_DEV:-/dev/accel/accel0}" ]; then
+		echo "the NPU is here and this kernel drives it"
+	else
+		echo "no NPU here: it will run on the CPU, about three times slower"
+	fi
+}
+step_model_state() {
+	[ -n "$(ls "$MODELS_DIR"/*.gguf /opt/charsiu/models/*.gguf 2>/dev/null | head -1)" ] \
+		&& echo done || echo todo
+}
+step_model_label() {
+	n=$(ls "$MODELS_DIR"/*.gguf /opt/charsiu/models/*.gguf 2>/dev/null | wc -l)
+	[ "$n" -gt 0 ] && echo "$n model(s) on this board" || echo "no model yet"
+}
+step_model_do() {
+	G=$(tool charsiu-get)
+	[ -n "$G" ] || { ui_msg "charsiu-get is missing."; return 1; }
+	CHARSIU_MODELS_DIR="$MODELS_DIR" CHARSIU_LIB="${CHARSIU_LIB:-/opt/charsiu}" \
+		"$G" --wizard
+}
+
+step_pick_state() {
+	[ "$(step_model_state)" = done ] || { echo hidden; return; }
+	cur=$(ini_get model path)
+	[ -n "$cur" ] && [ -f "$cur" ] && echo done || echo todo
+}
+step_pick_label() {
+	cur=$(ini_get model path)
+	[ -n "$cur" ] && [ -f "$cur" ] && echo "using $(basename "$cur")" \
+	                              || echo "no model chosen"
+}
+step_pick_do() {
+	# ⚠ One model and nothing to decide: choose it and say so, rather than
+	# opening a menu with one row in it.
+	only=$(ls "$MODELS_DIR"/*.gguf /opt/charsiu/models/*.gguf 2>/dev/null)
+	n=$(echo "$only" | wc -l)
+	if [ "$n" = 1 ]; then
+		ini_set model path "$only"
+		ui_note "using $(basename "$only")"
+		return 0
+	fi
+	page_model
+}
+
+step_ready_state() {
+	[ "$(step_pick_state)" = done ] && echo todo || echo hidden
+}
+step_ready_label() { echo "ready"; }
+step_ready_do() {
+	mkdir -p "$(dirname "$STAMP")" 2>/dev/null || true
+	: > "$STAMP" 2>/dev/null || true
+	# ⚠ crush's lesson: do not hand anyone an empty prompt.
+	hint=""
+	[ -e "${CHARSIU_ACCEL_DEV:-/dev/accel/accel0}" ] || hint="
+
+⚠ There is no NPU on this kernel, so this runs on the CPU. To fix
+that, /opt/charsiu/charsiu-install.sh can fetch a kernel that has
+the driver."
+	ui_msg "Ready.$hint
+
+Type  charsiu  and ask it something. To start with, try:
+
+    what can you do
+    explain what an NPU is, briefly
+    write a haiku about a circuit board
+
+  charsiu list     what is on this board
+  charsiu pull     get another model
+  charsiu doctor   when something looks wrong"
+	return 0
+}
+
 setup_walk() {
 	ui_msg "charsiu
 
-An open runtime for the RK3576 NPU. Nothing here is the vendor's
-stack: the kernel driver is mainline rocket and the userspace is
-this.
+An open runtime for the RK3576 NPU. The kernel driver is mainline
+rocket and the userspace is this: no vendor stack anywhere in the
+path.
 
-A few questions, then it runs."
+A few things to check, then it runs."
 
-	D=$(tool charsiu-doctor)
-	if [ -n "$D" ] && ! CHARSIU_CONFIG="$CONF" "$D" -q; then
-		ui_yesno "Something critical is wrong (above).
+	# up to one pass per step, plus one more so a step that was unblocked by
+	# an earlier one gets its turn
+	pass=0
+	while [ "$pass" -lt 3 ]; do
+		pass=$((pass + 1))
+		todo=0
+		trail=""
+		for st in $STEPS; do
+			s=$("step_${st}_state")
+			l=$("step_${st}_label")
+			case "$s" in
+			hidden) continue ;;
+			done)   trail="$trail
+  ${T_G}done${T_0}  $l" ;;
+			todo)   trail="$trail
+  ${T_Y}next${T_0}  $l" ;;
+			esac
+		done
+		[ -n "$trail" ] && printf '%s\n' "$trail" >&2
 
-Carry on with the setup anyway?" defaultno || return 1
-	fi
-
-	if [ -z "$(ls "$MODELS_DIR"/*.gguf 2>/dev/null || true)" ]; then
-		G=$(tool charsiu-get)
-		[ -n "$G" ] && CHARSIU_MODELS_DIR="$MODELS_DIR" \
-			CHARSIU_LIB="${CHARSIU_LIB:-/opt/charsiu}" "$G" --wizard
-	fi
-	page_model
-	t=$(ask "How many threads? RK3576 has four A72s and charsiu uses one thread's worth of work." "$(ini_get run threads)")
-	ini_set run threads "$t"
-	mkdir -p "$(dirname "$STAMP")" 2>/dev/null || true
-	: > "$STAMP" 2>/dev/null || true
-	ui_msg "Set up.
-
-  charsiu -p \"...\"    ask it something
-  charsiu-config     come back here
-  charsiu-doctor     when something looks wrong"
+		for st in $STEPS; do
+			[ "$("step_${st}_state")" = todo ] || continue
+			todo=1
+			"step_${st}_do" || true
+			break
+		done
+		[ "$todo" = 0 ] && break
+	done
 	return 0
 }
 
