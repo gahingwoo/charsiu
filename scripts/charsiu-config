@@ -109,7 +109,7 @@ page_model() {
 		set --
 		for f in "$MODELS_DIR"/*.gguf; do
 			[ -f "$f" ] || continue
-			mb=$(( $(stat -c%s "$f" 2>/dev/null || echo 0) / 1048576 ))
+			mb=$(( $(wc -c < "$f" 2>/dev/null || echo 0) / 1048576 ))
 			mark=""; [ "$f" = "$cur" ] && mark="  <- in use"
 			set -- "$@" "$(basename "$f")" "${mb}M$mark"
 		done
@@ -214,8 +214,31 @@ Carry on with the setup anyway?" defaultno || return 1
 
 STAMP="${CHARSIU_STAMP:-$(dirname "$CONF")/.setup-done}"
 case "${1:-}" in
+"")           : ;;
 --setup)      setup_walk; exit $? ;;
 --setup-once) [ -e "$STAMP" ] && exit 0; setup_walk; exit $? ;;
+-h|--help)
+	# ⚠ THIS WAS NOT HANDLED, so `charsiu-config --help` fell through to the
+	# menu and opened a full-screen dialog. On a board whose test harness
+	# logs to the same console that is not a small thing: whiptail clears the
+	# screen, and round 381 lost its first two arms to it.
+	cat <<'USAGE'
+charsiu-config: pick a model, threads, context, and the NPU switches.
+
+  charsiu-config              the menu
+  charsiu-config --setup      the first-run walkthrough
+  charsiu-config --setup-once the same, but only if it has never been run
+  charsiu-config --help       this
+
+  CHARSIU_CONFIG      the file to edit (default /etc/charsiu/config.ini)
+  CHARSIU_MODELS_DIR  where to look for models
+  CHARSIU_PLAIN=1     no full-screen dialogs, plain text instead
+USAGE
+	exit 0 ;;
+*)
+	echo "charsiu-config: unknown argument: $1" >&2
+	echo "try: charsiu-config --help" >&2
+	exit 2 ;;
 esac
 
 while :; do

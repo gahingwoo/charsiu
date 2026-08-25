@@ -185,7 +185,7 @@ fetch_and_gate() {
 
 	say "fetching $base"
 	if ! get_url "$url" "$part"; then
-		got=$(stat -c%s "$part" 2>/dev/null || echo 0)
+		got=$(wc -c < "$part" 2>/dev/null || echo 0)
 		die "the download stopped after $((got / 1048576)) MB of about ${want_mb} MB.
 
   ⚠ IT DOES NOT START OVER. The part that arrived is kept in

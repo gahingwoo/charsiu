@@ -118,10 +118,22 @@ stage_filter() {
 		n = $3 + 0
 		if (tot > 0) {
 			pct = int(n * 100 / tot); if (pct > 100) pct = 100
-			printf "\r  [%-24s] %3d%%  %d/%d",
-			       substr("########################", 1, int(pct/4.2)),
-			       pct, n, tot > "/dev/stderr"
-			fflush("/dev/stderr"); bar = 1
+			# ⚠ THE HEARTBEAT ONLY FIRES EVERY SIXTEENTH TENSOR, so for
+			# 113 the last one is 112 and the bar stops at 99% with no
+			# later stderr line to close it. The generated text then
+			# lands on the same line: "99%  112/113OK, Bob!". Close it
+			# on the last heartbeat there is going to be.
+			if (n + 16 > tot) {
+				printf "\r  [########################] 100%%  %d/%d\n",
+				       tot, tot > "/dev/stderr"
+				bar = 0
+			} else {
+				printf "\r  [%-24s] %3d%%  %d/%d",
+				       substr("########################", 1, int(pct/4.2)),
+				       pct, n, tot > "/dev/stderr"
+				bar = 1
+			}
+			fflush("/dev/stderr")
 		}
 		next
 	}
