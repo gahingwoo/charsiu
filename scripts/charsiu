@@ -2,11 +2,11 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu -- run the model named in /etc/charsiu/config.ini.
+# charsiu: run the model named in /etc/charsiu/config.ini.
 #
 # The runtime reads 109 CHARSIU_* environment variables. Six of them decide
 # whether a decode goes to the NPU at all, and getting one wrong does not fail
-# loudly -- it quietly falls back to the CPU and runs a third as fast. Nobody
+# loudly. It quietly falls back to the CPU and runs a third as fast. Nobody
 # should have to remember this:
 #
 #   CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_KMAX=1024 \
@@ -46,7 +46,7 @@ INTERACTIVE=0
 
 [ -f "$CONF" ] || { echo "charsiu: no config at $CONF (run charsiu-config)" >&2; exit 1; }
 
-# ini_get SECTION KEY -- strips inline comments, tolerates a hand-edited file.
+# ini_get SECTION KEY. Strips inline comments, tolerates a hand-edited file.
 ini_get() {
 	awk -v s="$1" -v k="$2" '
 		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h==s); next }
@@ -104,7 +104,7 @@ EX=$(awk '/^[ \t]*\[extra\][ \t]*$/{f=1;next} /^[ \t]*\[/{f=0}
 
 # ⚠ TWENTY SECONDS OF SILENCE IS THE MOST OFF-PUTTING PART OF A FIRST RUN, and
 # the runtime already says enough to draw a bar: it announces how many tensors
-# it will stage (n_layer * 7 + 1 -- seven projections a layer plus the output
+# it will stage (n_layer * 7 + 1, seven projections a layer plus the output
 # head, 113 for the model every board round uses, which is exactly what its logs
 # say) and then heartbeats every sixteen. Progress goes to stderr, the generated
 # text to stdout, so the two never mix.
@@ -134,7 +134,7 @@ stage_filter() {
 }
 
 if [ "$BENCH" = 1 ]; then
-	printf '\n  charsiu bench -- %s\n' "$(basename "$MODEL")"
+	printf '\n  charsiu bench: %s\n' "$(basename "$MODEL")"
 	printf '  %s, %s threads, context %s\n\n' \
 	       "$(case "$NPU" in yes|1|true|on) echo "NPU int4";; *) echo "CPU";; esac)" \
 	       "$THREADS" "$CTX"

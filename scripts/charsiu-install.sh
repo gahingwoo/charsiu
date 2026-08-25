@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu-install.sh -- set up charsiu on a Rockchip RK3576 board.
+# charsiu-install.sh: set up charsiu on a Rockchip RK3576 board.
 #
 #   sh charsiu-install.sh              the wizard
 #   sh charsiu-install.sh --kernel     only offer the kernel step
@@ -17,7 +17,7 @@
 # The rocket driver is mainline for RK3588. The commit adding
 # `rockchip,rk3576-rknn-core` is ours, from 2026-08-06, and is not reachable
 # from any tag. An earlier version of this script checked for a working NPU and
-# stopped when it did not find one -- which was every machine on earth, so the
+# stopped when it did not find one. That was every machine on earth, so the
 # check was a dead end wearing a helpful expression. It now OFFERS A KERNEL:
 # CI builds linux-next plus the v9 series and publishes it, and this fetches it.
 #
@@ -27,9 +27,13 @@
 set -eu
 
 # ---------------------------------------------------------------------------
-# BOOTSTRAP -- the `curl ... | sh` case, before anything else can need it.
+# BOOTSTRAP: the `curl ... | sh` case, before anything else can need it.
 # ---------------------------------------------------------------------------
 #
+# ⚠ Read before the terminal check, which branches on it.
+_BOOT_DRY=0; _BOOT_NOTTY=0
+for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
+
 CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
 CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh"
 
@@ -40,21 +44,51 @@ CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scrip
 if [ ! -t 0 ]; then
 	# ⚠ A FAILED REDIRECTION ON `exec` KILLS THE SHELL. Testing with
 	# `exec < /dev/tty` meant that when there was no controlling terminal the
-	# script exited silently instead of saying why -- and `[ -r /dev/tty ]`
+	# script exited silently instead of saying why. And `[ -r /dev/tty ]`
 	# is not the test either: the device node can be readable while opening
 	# it returns ENXIO. Probe in a subshell, where a failure costs nothing.
 	if ( : < /dev/tty ) 2>/dev/null; then
 		exec < /dev/tty
+	elif [ "$_BOOT_DRY" = 1 ]; then
+		# ⚠ A REHEARSAL NEEDS NO CONSENT. It writes nothing, so refusing to
+		# run for want of a terminal would be refusing the one thing asked
+		# for, and piping this into a container is exactly how it gets
+		# rehearsed. Answer every question with yes and carry on.
+		CTUI_ASSUME=yes; export CTUI_ASSUME
+		_BOOT_NOTTY=1
 	else
 		echo "charsiu-install: there is no terminal to ask questions on." >&2
 		echo "" >&2
 		echo "  curl -fsSL $CHARSIU_SELF_URL -o install.sh && sh install.sh" >&2
 		echo "" >&2
+		echo "  or rehearse it without one:" >&2
+		echo "  curl -fsSL $CHARSIU_SELF_URL | sh -s -- --dry-run" >&2
+		echo "" >&2
 		exit 1
 	fi
 fi
 
-# ⚠ Piped in, "$(dirname "$0")" is meaningless -- there is no tree beside us.
+# ⚠ THE TUI LAYER DOES NOT EXIST YET. It lives in the source, which is the very
+# thing this stage is here to fetch, so the bootstrap cannot source it. But
+# whiptail may well be installed already, and a wizard that opens with a bare
+# shell prompt and only becomes a dialog later is worse than one that is a
+# dialog throughout. These two use whiptail when it is there.
+_boot_ui() { command -v whiptail >/dev/null 2>&1 && [ -n "${TERM:-}" ] && \
+             [ "${TERM:-}" != dumb ] && [ -z "${CHARSIU_PLAIN:-}" ]; }
+_boot_msg() {
+	if _boot_ui; then whiptail --title "charsiu setup" --msgbox "$1" 16 72
+	else printf '\n%s\n' "$1"; fi
+}
+_boot_yesno() {
+	if _boot_ui; then whiptail --title "charsiu setup" --yesno "$1" 16 72
+	else
+		printf '\n%s\n\n  [Y/n] ' "$1"
+		read -r _a || _a=n
+		case "${_a:-y}" in n|N|no|NO) return 1 ;; *) return 0 ;; esac
+	fi
+}
+
+# ⚠ Piped in, "$(dirname "$0")" is meaningless: there is no tree beside us.
 # Anything that needs the source (the build, the scripts, the TUI layer) has to
 # come from somewhere, so fetch it and hand over to the copy that has neighbours.
 _boot_src=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || echo "")
@@ -68,11 +102,13 @@ if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
 			DIR="$HOME/charsiu"
 		fi
 	fi
-	printf '\n  charsiu needs its source to build from.\n'
-	printf '  It will be fetched into %s\n\n' "$DIR"
-	printf '  continue? [Y/n] '
-	read -r _a || _a=n
-	case "${_a:-y}" in n|N|no|NO) echo "  stopped."; exit 1 ;; esac
+	[ "$_BOOT_NOTTY" = 1 ] && printf '\n  fetching the source into %s\n' "$DIR"
+	[ "$_BOOT_NOTTY" = 1 ] || _boot_yesno "charsiu needs its source to build from.
+
+It will be fetched into
+  $DIR
+
+Continue?" || { echo "  stopped."; exit 1; }
 
 	_sudo=""
 	[ -w "$(dirname "$DIR")" ] || [ "$(id -u)" -eq 0 ] || _sudo=$(command -v sudo || true)
@@ -98,6 +134,44 @@ if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
 	exec sh "$DIR/scripts/charsiu-install.sh" "$@"
 fi
 unset _boot_src
+
+# ---------------------------------------------------------------------------
+# THE DIALOG ITSELF
+# ---------------------------------------------------------------------------
+#
+# ⚠ WITHOUT whiptail EVERY PAGE SILENTLY BECOMES A SHELL PROMPT. charsiu-tui.sh
+# falls back on purpose, because a serial console with no TERM has to work, but
+# a fresh Debian or Ubuntu has no whiptail and falling back there is not a
+# feature, it is the wizard quietly not being one. So ask, once, and install it.
+#
+# The package is named differently everywhere: whiptail on Debian and Ubuntu,
+# newt on Fedora and Alpine, libnewt on Arch.
+if ! command -v whiptail >/dev/null 2>&1 && [ -z "${CHARSIU_PLAIN:-}" ]; then
+	_pm=""
+	if   command -v apt-get >/dev/null 2>&1; then _pm="apt-get install -y whiptail"
+	elif command -v dnf     >/dev/null 2>&1; then _pm="dnf install -y newt"
+	elif command -v apk     >/dev/null 2>&1; then _pm="apk add newt"
+	elif command -v pacman  >/dev/null 2>&1; then _pm="pacman -S --noconfirm libnewt"
+	fi
+	if [ -n "$_pm" ]; then
+		if [ "$_BOOT_DRY" = 1 ]; then
+			printf '\n  would  %s   (so the wizard is a dialog, not shell prompts)\n' "$_pm"
+		elif _boot_yesno "This wizard draws dialogs with whiptail and it is not
+installed, so every page would be a plain shell prompt instead.
+
+Install it?
+
+  $_pm
+
+Answering no is fine. Everything still works, in text." ; then
+			_bs=""
+			[ "$(id -u)" -eq 0 ] || _bs=$(command -v sudo || true)
+			command -v apt-get >/dev/null 2>&1 && $_bs apt-get update -qq >/dev/null 2>&1
+			# shellcheck disable=SC2086
+			$_bs $_pm >/dev/null 2>&1 || printf '  could not install it; carrying on in text\n'
+		fi
+	fi
+fi
 
 REPO="${CHARSIU_REPO:-gahingwoo/linux-rk3576-npu}"
 PREFIX="/"
@@ -139,7 +213,7 @@ CTUI_TITLE="charsiu setup"
 # ⚠ --prefix / gives //opt/charsiu without this. Harmless to the kernel and
 # ugly in a dry run's summary, which is the one place people read these paths.
 # ⚠ Two different needs. For BUILDING paths the trailing slash has to go, and
-# "/" trimmed to "" is exactly right -- "$PREFIX/opt/..." then gives /opt/...
+# "/" trimmed to "" is exactly right, because "$PREFIX/opt/..." then gives /opt/...
 # rather than //opt/... . For SHOWING it, the empty string reads as a blank.
 PREFIX=$(printf '%s' "$PREFIX" | sed 's|/*$||')
 PDISP="${PREFIX:-/}"
@@ -209,7 +283,7 @@ if [ "$UNINSTALL" = 1 ]; then
 	ui_yesno "Remove charsiu?
 
 The models in $MODELS and your $ETC/config.ini are LEFT ALONE.
-A kernel this installed is NOT removed either -- pick the previous
+A kernel this installed is NOT removed either. Pick the previous
 entry in the boot menu instead, then remove it by hand." defaultno || exit 0
 	for f in charsiu charsiu-get charsiu-config charsiu-doctor; do
 		as_root rm -f "$SBIN/$f"
@@ -234,12 +308,12 @@ if [ "$DRY" = 1 ]; then
 Nothing is written, downloaded, built or chowned. Every action is
 printed as \"would ...\" and a summary follows at the end.
 
-Read-only checks still run for real -- that is the point: this is
+Read-only checks still run for real. That is the point: this is
 what the installer SEES on this machine."
 fi
 
 if [ "$DOKERNEL" != only ]; then
-	ui_msg "charsiu -- an open LLM runtime for the RK3576 NPU
+	ui_msg "charsiu, an open LLM runtime for the RK3576 NPU
 
 This will:
   * check whether this kernel can drive the NPU, and offer one if not
@@ -258,7 +332,7 @@ install_kernel() {
 	# extlinux, writing an extlinux.conf achieves nothing at best and
 	# confuses the next person at worst. Say so and leave the board alone.
 	# CHARSIU_BOOTDIR names it outright, for a boot partition mounted
-	# somewhere else -- and for rehearsing this on a machine that has none.
+	# somewhere else, and for rehearsing this on a machine that has none.
 	BOOTDIR=""
 	for b in ${CHARSIU_BOOTDIR:+"$CHARSIU_BOOTDIR"} /boot /boot/firmware /mnt/boot; do
 		[ -f "$b/extlinux/extlinux.conf" ] && { BOOTDIR="$b"; break; }
@@ -309,7 +383,7 @@ one becomes the default; if it misbehaves, interrupt the boot and
 pick the old one.
 
 ⚠ This rewrites $BOOTDIR/extlinux/extlinux.conf. The kernel command
-line already in it is carried over unchanged -- root=, console= and
+line already in it is carried over unchanged. root=, console= and
 the rest are board-specific and are not re-invented here." || return 1
 
 	if [ "$DRY" = 1 ]; then
@@ -321,7 +395,7 @@ the rest are board-specific and are not re-invented here." || return 1
 		would "cp <new> $BOOTDIR/Image  and the dtb"
 		would "tar -C / -xzf modules-*.tar.gz"
 		would "rewrite $BOOTDIR/extlinux/extlinux.conf with two entries, default the new one"
-		ui_msg "DRY RUN -- the kernel step stops here.
+		ui_msg "DRY RUN. The kernel step stops here.
 
   release  $TAG
   boot     $BOOTDIR
@@ -352,7 +426,7 @@ the rest are board-specific and are not re-invented here." || return 1
 
 	# ⚠ Do not clobber a good backup with a bad one. If .previous already
 	# exists, the kernel currently in place may itself be one of ours from a
-	# previous run -- keep the ORIGINAL as the fallback.
+	# previous run, so keep the ORIGINAL as the fallback.
 	if [ ! -f "$BOOTDIR/Image.previous" ] && [ -f "$BOOTDIR/Image" ]; then
 		as_root cp "$BOOTDIR/Image" "$BOOTDIR/Image.previous"
 		[ -f "$BOOTDIR/$DTBNAME" ] && \
@@ -412,7 +486,7 @@ Reboot, then run this again to finish the userspace."
 }
 
 if [ "$NPU_OK" = 1 ]; then
-	ui_ok "$ACCEL is here -- this kernel already drives the NPU"
+	ui_ok "$ACCEL is here, so this kernel already drives the NPU"
 	[ "$DOKERNEL" = only ] && { ui_msg "Nothing to do: the NPU already works."; exit 0; }
 elif [ "$DOKERNEL" = no ]; then
 	ui_warn "no NPU and --no-kernel was given; charsiu will fall back to the CPU"
@@ -426,7 +500,7 @@ the running kernel simply has no driver bound to it."
 		WHY="There is no rknn-core node in the device tree either, so this
 dtb does not describe the NPU at all."
 	fi
-	ui_yesno "$ACCEL is missing -- this kernel cannot drive the NPU.
+	ui_yesno "$ACCEL is missing, so this kernel cannot drive the NPU.
 
 $WHY
 
@@ -446,7 +520,7 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$DOBUILD" = 1 ]; then
 	# ⚠ A DRY RUN MUST NOT STOP AT A MISSING TOOL. Finding out what is absent
-	# is most of the reason to rehearse -- dying on the first gap shows one
+	# is most of the reason to rehearse. Dying on the first gap shows one
 	# problem where the run could have shown all of them.
 	miss=""
 	command -v make >/dev/null 2>&1 || miss="$miss make"
@@ -454,7 +528,7 @@ if [ "$DOBUILD" = 1 ]; then
 	[ -f "$SRC/Makefile" ] || miss="$miss the-charsiu-source"
 	if [ -n "$miss" ]; then
 		if [ "$DRY" = 1 ]; then
-			ui_bad "missing:$miss  -- a real run would stop here"
+			ui_bad "missing:$miss  (a real run would stop here)"
 			DOBUILD=0
 		else
 			die "missing:$miss"
@@ -489,15 +563,15 @@ for f in charsiu charsiu-get charsiu-config charsiu-doctor; do
 done
 
 # ⚠ THE MODELS DIRECTORY MUST BELONG TO WHOEVER WILL FILL IT. Installed under
-# sudo it lands root-owned, and then charsiu-get -- which nobody should have to
-# run as root to download a file -- fails at the last step, after the download.
+# sudo it lands root-owned, and then charsiu-get, which nobody should have to
+# run as root to download a file, fails at the last step, after the download.
 OWNER="${SUDO_USER:-$(id -un)}"
 if [ "$OWNER" != root ] && id "$OWNER" >/dev/null 2>&1; then
 	# ⚠ as_root RETURNS 0 IN A DRY RUN, so a `&& ui_ok "..."` here announced
 	# a chown that never happened. A rehearsal that claims work it did not do
 	# is worse than no rehearsal.
 	# ⚠ `2>/dev/null` on the as_root call SWALLOWS the dry run's own notice,
-	# which goes to stderr -- the action then appeared in the final summary
+	# which goes to stderr. The action then appeared in the final summary
 	# but not in the live output. Split the two cases.
 	if [ "$DRY" = 1 ]; then
 		as_root chown -R "$OWNER" "$MODELS"
@@ -526,7 +600,7 @@ fi
 
 ui_hdr "checking"
 if [ "$DRY" = 1 ]; then
-	# ⚠ the doctor is READ-ONLY, so a dry run should still run it -- what it
+	# ⚠ the doctor is READ-ONLY, so a dry run should still run it. What it
 	# reports is the most useful thing this rehearsal produces. It is pointed
 	# at the SOURCE tree's tools, since nothing was installed.
 	CHARSIU_CONFIG="$SRC/etc/config.ini" CHARSIU_LIB="$SRC/scripts" \
@@ -553,7 +627,7 @@ seconds before the first word." ; then
 fi
 
 if [ "$DRY" = 1 ]; then
-	printf '\n%sDRY RUN -- nothing above was done. In order, it would have:%s\n%s\n\n' \
+	printf '\n%sDRY RUN. Nothing above was done. In order, it would have:%s\n%s\n\n' \
 	       "$T_B" "$T_0" "$DRYLOG"
 	ui_msg "Dry run finished. Nothing was written.
 

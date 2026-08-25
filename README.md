@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/char
 ```
 
 It fetches the source, checks whether the running kernel can drive the NPU, and
-**offers a kernel if it cannot** — because RK3576 NPU support is not upstream yet,
+**offers a kernel if it cannot**, because RK3576 NPU support is not upstream yet,
 so no distribution kernel anywhere will bind this hardware. A kernel it installs
 becomes the default boot entry and **the one already on the card stays selectable**,
 five seconds into the boot, in case the new one misbehaves.
@@ -55,11 +55,11 @@ charsiu-doctor --paste      the block to put in a bug report
 ```
 
 ⚠ **A gguf's name does not tell you whether charsiu can run it**, in either
-direction — see [What a file's name does not tell you, twice](#what-a-files-name-does-not-tell-you-twice).
+direction, see [What a file's name does not tell you, twice](#what-a-files-name-does-not-tell-you-twice).
 `charsiu-get` gates every download by reading the file, and deletes what it cannot run.
 
 A 64 token generation is 67.7 ms a token, and 54 of that is the weight fetch itself at
-10.3 GB/s -- which is what this hardware's own bandwidth bench measures. **The fence is
+10.3 GB/s, which is what this hardware's own bandwidth bench measures. **The fence is
 the floor**: 620 MB of int4 weights have to cross the bus for every token, and no amount
 of software makes that cheaper. What is left on the CPU is about 13 ms, and the last
 eight rounds took it there from about 40.
@@ -269,7 +269,7 @@ CPU path is the reference the NPU path gets diffed against rather than a separat
 It is an approximation, so it has controls. `CHARSIU_NO_QACT` restores the exact path, and
 that path is proven untouched: the logits it prints are byte identical to the values
 recorded before the change. `tests/qact_control.py` measures what the approximation costs
-without needing any reference implementation — q4_0 moves a logit by at most 0.055 with 48
+without needing any reference implementation, q4_0 moves a logit by at most 0.055 with 48
 greedy tokens unchanged, q8_0 by at most 0.103.
 
 ### What a file's name does not tell you, twice
@@ -277,7 +277,7 @@ greedy tokens unchanged, q8_0 by at most 0.103.
 The comparison "q4_0 against q8_0" was never a bytes-against-bytes comparison, and it took
 two board rounds to see why. llama.cpp quantises `token_embd` to **q6_K** in a q4_0 file
 and to **q8_0** in a q8_0 file. Llama 3.2 ties the output head to that tensor, and at a
-128256 vocabulary it is a fifth of the weights — so the two files differ in the format of
+128256 vocabulary it is a fifth of the weights, so the two files differ in the format of
 their single largest matmul, and q6_K costs far more arithmetic per byte than q8_0 does.
 
 A third file, built with `llama-quantize --pure`, holds one format all the way through.
@@ -287,7 +287,7 @@ Host, 4 threads:
 |---|---|---|---|
 | tok/s | 35.29 | **40.70** | 34.43 |
 
-The head alone was worth 15%. With it gone the crossover disappears — pure q4_0 leads at
+The head alone was worth 15%. With it gone the crossover disappears, pure q4_0 leads at
 every thread count, by more as threads are added (t=1 21.67/21.45, t=2 34.26/32.92,
 t=4 40.70/34.74, t=8 31.73/30.41, pure against q8_0), which is what bytes mattering more
 per core looks like.
@@ -319,8 +319,8 @@ CPU decode loop is already the oracle for it. So the whole model runs in it:
 `CHARSIU_NPU_QUANT=1` builds a second copy of every routed tensor in that format and
 multiplies with a widening integer dot.
 
-Llama-3.2-1B from a q8_0 file, **113 tensors routed** — every projection and the tied
-output head — with a per tensor RMS error against the original of **0.85% to 1.57%**. The
+Llama-3.2-1B from a q8_0 file, **113 tensors routed**, every projection and the tied
+output head, with a per tensor RMS error against the original of **0.85% to 1.57%**. The
 text is coherent, and at this prompt it is the continuation llama.cpp itself produces:
 
 ```
@@ -511,8 +511,7 @@ bound, so int4's halved weight traffic buys almost nothing.
 ⚠ **The twelve-times figure that first followed from that was wrong, and the K
 ceiling was charsiu's own guard.** The layout works at every K tried up to 2048:
 288, 384, 512, 1024 and 2048 all give `wrote 40 of 64, exact 32` at N = 64, and
-K = 512 at N = 16 is 16 of 16. `exact` is `N/2` at all of them, independent of K
-— a working half-width job, not a failure. Benched at K = 512, N = 64: int8 24.6
+K = 512 at N = 16 is 16 of 16. `exact` is `N/2` at all of them, independent of K, a working half-width job, not a failure. Benched at K = 512, N = 64: int8 24.6
 us against int4 16.7, **int4 by 32%**.
 
 So the arithmetic is per job. An int4 job at a declared `K` and `N` gives `K/2`
@@ -529,13 +528,13 @@ cost.
 
 ⚠ **Measured at the shape that matters, it does not survive that.** At
 `K = 2048, N = 256` a single job is **222.7 us for int4 against 224.2 us for
-int8** — half the weight bytes, the same time. int8 is genuinely bytes-bound
+int8**, half the weight bytes, the same time. int8 is genuinely bytes-bound
 there, 9.14 GB/s marginal; int4 moves 0.26 MB in the same 223 us, which is
 1.18 GB/s. The 2x per byte is real on paper and none of it reaches the clock.
 And chaining hangs: the second task of that shape times out and takes the block
 with it.
 
-The layout itself is fine that far out — `K = 2048` at `N` of 64, 128, 160 and
+The layout itself is fine that far out, `K = 2048` at `N` of 64, 128, 160 and
 256 all give `wrote = N/2 + 8` and `exact = N/2`, so 128 usable channels a job at
 `N = 256`. `N = 512` and above were recorded as failures and were **this packer's
 own group-count guard**, the same mistake as the K whitelist that had `K = 192`
@@ -597,7 +596,7 @@ first time.
 
 ### The write quantises to sixteen channels
 
-The `N` with an even highest group — 24, 40 and 56 — failed, and **not on the
+The `N` with an even highest group, 24, 40 and 56, failed, and **not on the
 packing**. Whole groups came back 0 of 8 at the top and the count of words
 *written* was short by the same amount:
 
@@ -638,14 +637,14 @@ N = 56    32/56          0/56
 ```
 
 So `8*K` is right everywhere there is data and the failures at 24, 40 and 56 are
-something else. The reasoning that produced `wbytes/4` was tidy — the map must
+something else. The reasoning that produced `wbytes/4` was tidy, the map must
 scale with the buffer, and at `N = 24` the second group of `g2` lands at 768
-which is exactly that buffer's size — and it did not survive one round.
+which is exactly that buffer's size, and it did not survive one round.
 
 ### The map away from N = 64, and what it turned out to be
 
-Sweeping `--map` at `N = 24` and `N = 40` — the first time the map was read
-anywhere but 64 — disagreed with `8*K` at both:
+Sweeping `--map` at `N = 24` and `N = 40`, the first time the map was read
+anywhere but 64, disagreed with `8*K` at both:
 
 ```
 N = 24  measured 0, 128, 192              8*K said 0, 128, 512
@@ -654,7 +653,7 @@ N = 40  measured 0, 128, 512, 576, 704    8*K said ... 640, 1024
 
 The **skeleton** is regular and K independent. Groups of eight channels sit in
 *blocks* of `8*K` bytes at *slots* of 64, with a channel's k+ half four slots on,
-and the `K = 32` table decomposes exactly like the `K = 64` one — only the block
+and the `K = 32` table decomposes exactly like the `K = 64` one, only the block
 stride scales.
 
 **Which slots** looked irregular until `G = 9` was swept. As flat slot indices,
@@ -673,9 +672,9 @@ ODD G    one block of three at b3 = (G-1)/4, slots 0 and 2 before it and 1 and 3
 ```
 
 This is the third closed form written for this layout. The first two died in the
-round after they were written — `wbytes/4`, which also broke three working
+round after they were written, `wbytes/4`, which also broke three working
 geometries, and "the last block takes the odd slots", which put `g4` of `N = 56`
-at 1024 where `--map` found it at 704 — and both were fitted to a single point.
+at 1024 where `--map` found it at 704, and both were fitted to a single point.
 
 **This one predicted `G = 10` and `G = 11` before either was swept, and both
 landed.** `N = 80` and `N = 88` came back 80 of 80 and 88 of 88 against the CPU
@@ -690,14 +689,14 @@ N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
 
 ```
 works, no override, byte exact against a CPU reference
-  K = 32, 64, 128, 160, 192 and 224 — K must be a MULTIPLE OF 32, which is the
+  K = 32, 64, 128, 160, 192 and 224. K must be a MULTIPLE OF 32, which is the
     run count K/32 being whole: 144 and 176 give 8 of 64 where 160 and 192 give 64
   every N that is a multiple of 8 that has been tried, 16 through 160
   every channel, K/2 real k each
   out = ((int16)fp16bits(w) * (int16)abits) >> 16
 
 open, and both are measured rather than untried
-  M > 1 is int4 only — int8 at M = 4 is 256 of 256 byte exact. Two faults, now
+  M > 1 is int4 only, int8 at M = 4 is 256 of 256 byte exact. Two faults, now
     separated. The surface groups by SIXTEEN BYTES, read straight off a raw dump
     at M = 2: row 0's channels 0-3 are at words 0-3 and 4-7 at words 8-11, so an
     atom is 4 elements for w4a16 and 16 for int8, and at M = 1 every atom
@@ -705,18 +704,17 @@ open, and both are measured rather than untried
     at all. What is left at M > 1 is SLOT 2: row 0 at N = 64 fails on channels
     8-15, 24-31 and 40-47, which are g1, g3 and g5, and those are every slot 2
     group in the packer's own placement, while slots 0 and 1 all pass. N = 16 has
-    no slot 2 group, which is why its row 0 is clean — and at N = 24, which has
+    no slot 2 group, which is why its row 0 is clean, and at N = 24, which has
     a slot 2 AND a slot 3, both fail, so at M > 1 only slots 0 and 1 work.
-    ⚠ The weight layout has NO M term — that reading came from a probe that
+    ⚠ The weight layout has NO M term, that reading came from a probe that
     drove every row at once and printed only the first lit word. Holding one row
     live at a time: row 0 alone has byte 8j lighting channel j in BOTH rows, at
     the same address M = 1 uses, and **row 1 alone lights nothing at all**. Row 1
-    IS computed — in the row-0-only baseline its words come back nonzero with its
-    own activation at the zero point — so both output rows are computed from
+    IS computed, in the row-0-only baseline its words come back nonzero with its
+    own activation at the zero point, so both output rows are computed from
     row 0's activation slot and row 1's bytes are never fetched.
-    Three registers wake row 1 up on the map — `0x1044`'s DATA_ENTRIES at
-    `surf*m`, `0x103c` at `surf*m << 16`, and `0x1078` back at its M = 1 value —
-    and **as matmuls all three are 16 of 32, identical to changing nothing.**
+    Three registers wake row 1 up on the map, `0x1044`'s DATA_ENTRIES at
+    `surf*m`, `0x103c` at `surf*m << 16`, and `0x1078` back at its M = 1 value, and **as matmuls all three are 16 of 32, identical to changing nothing.**
     `0x1094` breaks row 0 as well and `0x118c` is the baseline. Six registers,
     none of them a row count.
     The packing is not inert and no arrangement is right either. Sweeping the
@@ -725,7 +723,7 @@ open, and both are measured rather than untried
     both reproducing, **only 8 gives 16 of 32 and every other value gives 0**.
     ⚠ **M > 1 is closed with a negative**: six registers and nine packings, and
     the hardware computes M rows while feeding every one from row 0's activation.
-    It does not block the project — decoding LLM tokens is M = 1, and int4 at
+    It does not block the project, decoding LLM tokens is M = 1, and int4 at
     M = 1 is exact across eleven geometries. M > 1 is a chaining problem.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
@@ -734,7 +732,7 @@ open, and both are measured rather than untried
     two N, no rule written.
   ⚠ The LAYOUT scales in K and the CHANNEL COUNT does not. K = 128 is exact at
     three N once the group count is right: a channel is fed by K/32 runs of eight
-    bytes spaced a constant 256 — 1, 2 and 4 at K of 32, 64 and 128 — where the
+    bytes spaced a constant 256, 1, 2 and 4 at K of 32, 64 and 128, where the
     packer wrote two at an offset of 4*K, which equals 256 only when K is 64.
     That was the same trap as `8*K` against `wbytes/4`.
     At K = 256 thirty-two channels are correct whatever gets written: `0x3020`
@@ -767,7 +765,7 @@ open, and both are measured rather than untried
     `N = 16` alone comes back 16 of 16 there. K = 224 is full, so 256 is where
     it stops.
   charsiu_bench has an int4 path now, with the GB/s column counting the weight
-    bytes a shape really moves — `k*n/2` for int4 against `k*n` for int8.
+    bytes a shape really moves, `k*n/2` for int4 against `k*n` for int8.
   charsiu_bench has no int4 path, so "what does int4 buy" still cannot be asked.
 ```
 
@@ -1101,7 +1099,7 @@ Channels 0 to 7 came back as -6753, -4633, -7670, -9732, -3554, -12306, -706 and
 Not the hardware. `charsiu_pack_weights` **refuses to place k >= 16 for int4**,
 deliberately since round 173, and `HALFK` only ever touched k the packer never
 wrote, so both buffers were byte identical. The `N` invariance falls out of the
-same thing: the row it used, `(n/32)*512 + (n%32)*8`, has no `N` in it — and it
+same thing: the row it used, `(n/32)*512 + (n%32)*8`, has no `N` in it, and it
 came from `--map` before the byte width defect was fixed, so it was the stale map
 as well as an incomplete one.
 
@@ -1338,7 +1336,7 @@ Each of these was a board round with a control that could fail, and each is in
 The last one is two changes. Four query heads share every key/value row in this
 model, and the loop was reading each row four times; and the cache was laid out
 `[layer][position][head]` while attention walks one head across every position.
-Neither changes a number -- the tokens are byte identical either way -- and both
+Neither changes a number (the tokens are byte identical either way) and both
 were measured against a control that put the old behaviour back.
 
 ## The instrument

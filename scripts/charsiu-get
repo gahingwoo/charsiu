@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu-get -- get a model charsiu can actually run, from Hugging Face or a URL.
+# charsiu-get: get a model charsiu can actually run, from Hugging Face or a URL.
 #
 #   charsiu-get                       the zoo: models verified to load
 #   charsiu-get llama3.2-1b-q4        fetch one of them
@@ -18,12 +18,12 @@
 # whose NAMES pass a substring test and whose CONTENTS do not:
 #
 #   ...-Q4_0_4_4.gguf   measured: type 31 in 210 tensors. A Q4_0 REPACKED for
-#                       ARM dotprod -- same block size, interleaved weights.
+#                       ARM dotprod: same block size, interleaved weights.
 #   ...-Q4_K_M.gguf     measured: type 6 (q5_0) in 166 tensors, among others.
 #   Qwen2.5-*.gguf      measured: architecture qwen2. Loads nothing here.
 #
 # So every download is verified by charsiu_check, which uses the RUNTIME's own
-# gguf parser -- the gate cannot drift from what will actually load. A file that
+# gguf parser, so the gate cannot drift from what will actually load. A file that
 # fails is DELETED, never left where the runtime would find it.
 #
 # ⚠ And a name that looks unsupported may be fine: ...-Q6_K_L.gguf MEASURED as
@@ -106,10 +106,10 @@ fetcher() {
 	echo ""
 }
 
-# GET url outfile  -- resumable, because a gigabyte over a board's link is not
+# GET url outfile. Resumable, because a gigabyte over a board's link is not
 # a single uninterrupted event.
 get_url() {
-	# a progress bar on a terminal, silence in a log -- curl's default meter
+	# a progress bar on a terminal, silence in a log. curl's default meter
 	# redraws with \r and a captured log turns into one unreadable line.
 	if [ -t 2 ]; then P="--progress-bar"; else P="-sS"; fi
 	case "$(fetcher)" in
@@ -211,7 +211,7 @@ fetch_and_gate() {
 # start by accident, and an install with no model is still a working install.
 wizard() {
 	command -v ui_menu >/dev/null 2>&1 || { list_zoo; return 0; }
-	CTUI_TITLE="charsiu -- a model"
+	CTUI_TITLE="charsiu: a model"
 	set --
 	while IFS='|' read -r n repo file mb note; do
 		[ -n "$n" ] || continue
@@ -262,7 +262,7 @@ fi
 # a known-bad family, answered without a download
 if known_bad | grep -qi "^$ARG|"; then
 	why=$(known_bad | grep -i "^$ARG|" | cut -d'|' -f3)
-	die "$why -- charsiu only builds a llama graph, so there is nothing to download"
+	die "$why. charsiu only builds a llama graph, so there is nothing to download"
 fi
 
 case "$ARG" in

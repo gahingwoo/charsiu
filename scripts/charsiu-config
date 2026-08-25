@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu-config -- a front end to /etc/charsiu/config.ini and the charsiu tools.
+# charsiu-config: a front end to /etc/charsiu/config.ini and the charsiu tools.
 #
 # ⚠ NO CURSES. kiln's equivalent is a whiptail TUI because kiln runs on Armbian,
 # which has one. charsiu's rootfs is a minimal buildroot with no whiptail, no

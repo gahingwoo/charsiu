@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu-doctor -- is this board able to run charsiu on the NPU, and if not,
+# charsiu-doctor: is this board able to run charsiu on the NPU, and if not,
 # which part is missing? Prints a plain report and exits non-zero if anything
 # CRITICAL failed, so it is scriptable and is the thing to paste into an issue.
 #
@@ -82,7 +82,7 @@ findbin() {
 
 hdr "the hardware"
 # The mainline rocket driver is an accel device, not a render node.
-# CHARSIU_ACCEL_DEV names it, as it does for charsiu-install.sh -- a board with
+# CHARSIU_ACCEL_DEV names it, as it does for charsiu-install.sh. A board with
 # more than one accel device should not need the two tools to disagree.
 ACCEL="${CHARSIU_ACCEL_DEV:-/dev/accel/accel0}"
 if [ -e "$ACCEL" ]; then
@@ -91,7 +91,7 @@ if [ -e "$ACCEL" ]; then
 		&& ok "and this user can open it" \
 		|| bad "but this user cannot open it (group/permissions on $ACCEL)"
 else
-	bad "$ACCEL is missing -- the rocket driver did not bind"
+	bad "$ACCEL is missing, so the rocket driver did not bind"
 fi
 
 ncore=0
@@ -102,12 +102,12 @@ for d in /sys/bus/platform/devices/27700000.npu /sys/bus/platform/devices/277080
 done
 case "$ncore" in
 2) ok "both NPU cores are present (27700000.npu, 27708000.npu)" ;;
-1) warn "only ONE NPU core is enabled -- charsiu's int4 decode wants both, and one core is about 1.4x slower" ;;
+1) warn "only ONE NPU core is enabled. charsiu's int4 decode wants both, and one core is about 1.4x slower" ;;
 0) bad "no NPU core in the device tree" ;;
 esac
 
 # Informational: with the rail handed to the power domain it reads disabled at
-# rest, and that is CORRECT -- it does not mean the NPU is broken.
+# rest, and that is CORRECT. It does not mean the NPU is broken.
 for r in /sys/class/regulator/regulator.*; do
 	[ -r "$r/name" ] || continue
 	[ "$(cat "$r/name")" = "vdd_npu_s0" ] || continue
@@ -119,7 +119,7 @@ hdr "the configuration"
 if [ -f "$CONF" ]; then
 	ok "config at $CONF"
 else
-	bad "no config at $CONF -- run charsiu-config"
+	bad "no config at $CONF. Run charsiu-config"
 fi
 KS=$(ini_get npu kslice)
 [ -n "$KS" ] && info "K slice $KS (written to both CHARSIU_NPU_KMAX and CHARSIU_NPU_W4_GROUP; they must match)"
@@ -130,7 +130,7 @@ CK=$(findbin charsiu_check)
 if [ -z "$M" ]; then
 	bad "[model] path is not set"
 elif [ ! -f "$M" ]; then
-	bad "$M does not exist -- charsiu-get fetches one"
+	bad "$M does not exist. charsiu-get fetches one"
 else
 	sz=$(( $(stat -c%s "$M" 2>/dev/null || echo 0) / 1048576 ))
 	ok "$M (${sz} MB)"

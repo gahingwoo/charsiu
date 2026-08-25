@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu-tui.sh -- the dialog layer. Sourced, not run.
+# charsiu-tui.sh: the dialog layer. Sourced, not run.
 #
 # whiptail when it is there, plain prompts when it is not. Both paths are real:
 # the board image ships whiptail (newt, 1.8 MB), Debian and Armbian have it, and
@@ -20,7 +20,7 @@ CTUI=plain
 command -v whiptail >/dev/null 2>&1 && CTUI=whiptail
 [ -t 0 ] && [ -t 2 ] || CTUI=plain          # no terminal, no full screen
 # ⚠ whiptail REFUSES to run without TERM and prints "TERM environment variable
-# needs set." -- which a serial console often is. Measured: without this guard
+# needs set.", which a serial console often is. Measured: without this guard
 # every dialog fails and, worse, the error text arrives where the answer should
 # be (see the fd note below). Fall back rather than fail.
 case "${TERM:-}" in ""|dumb|unknown) CTUI=plain ;; esac
@@ -28,13 +28,22 @@ case "${TERM:-}" in ""|dumb|unknown) CTUI=plain ;; esac
 
 CTUI_TITLE="charsiu"
 
+# ⚠ CTUI_ASSUME makes every question answer itself, without a terminal. That is
+# what a rehearsal piped into a container needs: a dry run writes nothing, so
+# there is nothing to consent to, and refusing to run for want of a tty would
+# be refusing to do the one thing that was asked.
+#   CTUI_ASSUME=yes   take the affirmative
+#   CTUI_ASSUME=no    take the negative
+CTUI_ASSUME="${CTUI_ASSUME:-}"
+
 if [ -t 2 ]; then
 	T_B=$(printf '\033[1m'); T_G=$(printf '\033[1;32m'); T_R=$(printf '\033[1;31m')
 	T_Y=$(printf '\033[1;33m'); T_D=$(printf '\033[2m'); T_0=$(printf '\033[0m')
 else T_B=; T_G=; T_R=; T_Y=; T_D=; T_0=; fi
 
-# ui_msg TEXT           -- say something and wait for acknowledgement
+# ui_msg TEXT           say something and wait for acknowledgement
 ui_msg() {
+	if [ -n "$CTUI_ASSUME" ]; then printf '\n%s\n' "$1" >&2; return 0; fi
 	if [ "$CTUI" = whiptail ]; then
 		whiptail --title "$CTUI_TITLE" --msgbox "$1" 20 74
 	else
@@ -43,7 +52,7 @@ ui_msg() {
 	fi
 }
 
-# ui_note TEXT          -- say something and keep going
+# ui_note TEXT          say something and keep going
 ui_note() {
 	if [ "$CTUI" = whiptail ]; then
 		whiptail --title "$CTUI_TITLE" --infobox "$1" 12 74
@@ -53,8 +62,12 @@ ui_note() {
 	fi
 }
 
-# ui_yesno TEXT [defaultno]  -- 0 for yes
+# ui_yesno TEXT [defaultno]  returns 0 for yes
 ui_yesno() {
+	if [ -n "$CTUI_ASSUME" ]; then
+		printf '\n%s\n  [assuming %s]\n' "$1" "$CTUI_ASSUME" >&2
+		[ "$CTUI_ASSUME" = yes ] && return 0 || return 1
+	fi
 	if [ "$CTUI" = whiptail ]; then
 		if [ "${2:-}" = defaultno ]; then
 			whiptail --title "$CTUI_TITLE" --defaultno --yesno "$1" 20 74
@@ -74,14 +87,15 @@ ui_yesno() {
 	fi
 }
 
-# ui_input PROMPT DEFAULT   -- the answer on stdout; non-zero if cancelled
+# ui_input PROMPT DEFAULT   the answer on stdout; non-zero if cancelled
 #
 # ⚠⚠ THE fd DANCE PUTS whiptail's ERRORS WHERE THE ANSWER GOES. 3>&1 1>&2 2>&3
-# swaps stdout and stderr so the selection comes back on stdout -- and so does
+# swaps stdout and stderr so the selection comes back on stdout, and so does
 # any diagnostic whiptail decides to print. Measured: with TERM unset the caller
 # received the string "TERM environment variable needs set." as the user's
 # answer. Capture first, echo only if whiptail actually succeeded.
 ui_input() {
+	if [ -n "$CTUI_ASSUME" ]; then echo "$2"; return 0; fi
 	if [ "$CTUI" = whiptail ]; then
 		_o=$(whiptail --title "$CTUI_TITLE" --inputbox "$1" 12 74 "$2" 3>&1 1>&2 2>&3) \
 			|| return 1
@@ -93,9 +107,12 @@ ui_input() {
 	fi
 }
 
-# ui_menu TEXT  tag1 desc1  tag2 desc2 ...   -- the chosen tag on stdout
+# ui_menu TEXT  tag1 desc1  tag2 desc2 ...   the chosen tag on stdout
 ui_menu() {
 	text="$1"; shift
+	# ⚠ assuming an ANSWER to a menu is not possible, so it declines instead
+	# of guessing which entry someone meant.
+	if [ -n "$CTUI_ASSUME" ]; then printf '\n%s\n  [skipped]\n' "$text" >&2; return 1; fi
 	if [ "$CTUI" = whiptail ]; then
 		n=$(( $# / 2 ))
 		[ "$n" -gt 12 ] && n=12
@@ -128,7 +145,7 @@ ui_menu() {
 	fi
 }
 
-# ui_progress TEXT  -- run the rest of a pipeline under a gauge. Reads
+# ui_progress TEXT  run the rest of a pipeline under a gauge. Reads
 # percentages on stdin, one integer per line.
 ui_progress() {
 	if [ "$CTUI" = whiptail ]; then
@@ -140,7 +157,7 @@ ui_progress() {
 	fi
 }
 
-# ui_ok / ui_bad / ui_warn -- one line of report, for the plain path and for
+# ui_ok / ui_bad / ui_warn: one line of report, for the plain path and for
 # anything a dialog would be too heavy for.
 ui_ok()   { printf '  %s[ OK ]%s %s\n' "$T_G" "$T_0" "$*" >&2; }
 ui_bad()  { printf '  %s[FAIL]%s %s\n' "$T_R" "$T_0" "$*" >&2; }
