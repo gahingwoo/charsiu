@@ -7,6 +7,7 @@
 #   sh charsiu-install.sh              the wizard
 #   sh charsiu-install.sh --kernel     only offer the kernel step
 #   sh charsiu-install.sh --no-kernel  skip it
+#   sh charsiu-install.sh --dry-run    say what it would do, change nothing
 #   sh charsiu-install.sh --prefix DIR stage instead of installing
 #   sh charsiu-install.sh --uninstall  remove what this installed
 #   CHARSIU_PLAIN=1 ...                no full-screen dialogs
@@ -27,6 +28,7 @@ set -eu
 
 REPO="${CHARSIU_REPO:-gahingwoo/linux-rk3576-npu}"
 PREFIX="/"
+DRY=0
 DOKERNEL=ask
 DOMODEL=1
 DOBUILD=1
@@ -35,6 +37,7 @@ UNINSTALL=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--prefix)    PREFIX="$2"; shift 2 ;;
+	--dry-run|-n) DRY=1; shift ;;
 	--kernel)    DOKERNEL=only; shift ;;
 	--no-kernel) DOKERNEL=no; shift ;;
 	--no-model)  DOMODEL=0; shift ;;
@@ -60,6 +63,13 @@ done
 command -v ui_msg >/dev/null 2>&1 || { echo "charsiu-tui.sh not found" >&2; exit 1; }
 CTUI_TITLE="charsiu setup"
 
+# ⚠ --prefix / gives //opt/charsiu without this. Harmless to the kernel and
+# ugly in a dry run's summary, which is the one place people read these paths.
+# ⚠ Two different needs. For BUILDING paths the trailing slash has to go, and
+# "/" trimmed to "" is exactly right -- "$PREFIX/opt/..." then gives /opt/...
+# rather than //opt/... . For SHOWING it, the empty string reads as a blank.
+PREFIX=$(printf '%s' "$PREFIX" | sed 's|/*$||')
+PDISP="${PREFIX:-/}"
 BIN="$PREFIX/opt/charsiu"
 SBIN="$PREFIX/usr/bin"
 ETC="$PREFIX/etc/charsiu"
@@ -77,9 +87,34 @@ writable "$BIN" && writable "$SBIN" && writable "$ETC" || NEEDROOT=1
 SUDO=""
 if [ "$NEEDROOT" = 1 ] && [ "$(id -u)" -ne 0 ]; then
 	SUDO=$(command -v sudo || true)
-	[ -n "$SUDO" ] || die "$PREFIX needs root and sudo is not installed."
+	# ⚠ A DRY RUN WRITES NOTHING, so it has no business demanding root. This
+	# refused to even rehearse as an ordinary user, which is the one case a
+	# rehearsal is most wanted.
+	if [ -z "$SUDO" ] && [ "$DRY" = 0 ]; then
+		die "$PDISP needs root and sudo is not installed."
+	fi
+	[ -z "$SUDO" ] && ui_warn "not root and no sudo: a real run would need one"
 fi
-as_root() { if [ -n "$SUDO" ]; then $SUDO "$@"; else "$@"; fi; }
+# ⚠ EVERY MUTATION GOES THROUGH THIS. --dry-run prints the command instead of
+# running it, so the difference between a rehearsal and the real thing is one
+# branch in one place rather than a flag threaded through twenty call sites --
+# which is how a dry run ends up writing something anyway.
+DRYLOG=""
+as_root() {
+	if [ "$DRY" = 1 ]; then
+		printf '  %swould%s  %s\n' "$T_Y" "$T_0" "$*" >&2
+		DRYLOG="$DRYLOG
+  $*"
+		return 0
+	fi
+	if [ -n "$SUDO" ]; then $SUDO "$@"; else "$@"; fi
+}
+# for things that are not a single command: a network fetch, a build, a child tool
+would() {
+	printf '  %swould%s  %s\n' "$T_Y" "$T_0" "$*" >&2
+	DRYLOG="$DRYLOG
+  $*"
+}
 
 fetch() {  # fetch URL OUT
 	if command -v curl >/dev/null 2>&1; then
@@ -120,6 +155,16 @@ NPU_OK=0
 
 [ "$(uname -m)" = "aarch64" ] || die "charsiu's NPU path is aarch64 only; this is $(uname -m)."
 
+if [ "$DRY" = 1 ]; then
+	ui_msg "DRY RUN
+
+Nothing is written, downloaded, built or chowned. Every action is
+printed as \"would ...\" and a summary follows at the end.
+
+Read-only checks still run for real -- that is the point: this is
+what the installer SEES on this machine."
+fi
+
 if [ "$DOKERNEL" != only ]; then
 	ui_msg "charsiu -- an open LLM runtime for the RK3576 NPU
 
@@ -139,8 +184,10 @@ install_kernel() {
 	# ⚠ THE ONE THING NOT TO GUESS. If this board does not boot through
 	# extlinux, writing an extlinux.conf achieves nothing at best and
 	# confuses the next person at worst. Say so and leave the board alone.
+	# CHARSIU_BOOTDIR names it outright, for a boot partition mounted
+	# somewhere else -- and for rehearsing this on a machine that has none.
 	BOOTDIR=""
-	for b in /boot /boot/firmware /mnt/boot; do
+	for b in ${CHARSIU_BOOTDIR:+"$CHARSIU_BOOTDIR"} /boot /boot/firmware /mnt/boot; do
 		[ -f "$b/extlinux/extlinux.conf" ] && { BOOTDIR="$b"; break; }
 	done
 	if [ -z "$BOOTDIR" ]; then
@@ -192,6 +239,22 @@ pick the old one.
 line already in it is carried over unchanged -- root=, console= and
 the rest are board-specific and are not re-invented here." || return 1
 
+	if [ "$DRY" = 1 ]; then
+		for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
+			would "fetch $u"
+		done
+		would "verify SHA256SUMS before touching $BOOTDIR"
+		would "cp $BOOTDIR/Image $BOOTDIR/Image.previous   (only if it does not exist)"
+		would "cp <new> $BOOTDIR/Image  and the dtb"
+		would "tar -C / -xzf modules-*.tar.gz"
+		would "rewrite $BOOTDIR/extlinux/extlinux.conf with two entries, default the new one"
+		ui_msg "DRY RUN -- the kernel step stops here.
+
+  release  $TAG
+  boot     $BOOTDIR
+  append   carried over from the file already there"
+		return 0
+	fi
 	TMP=$(mktemp -d)
 	trap 'rm -rf "$TMP"' EXIT
 	for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
@@ -309,15 +372,39 @@ fi
 # USERSPACE
 # ---------------------------------------------------------------------------
 if [ "$DOBUILD" = 1 ]; then
-	command -v make >/dev/null 2>&1 || die "make is not installed."
-	{ command -v cc || command -v gcc; } >/dev/null 2>&1 || die "no C compiler."
-	[ -f "$SRC/Makefile" ] || die "no charsiu source at $SRC."
-	ui_note "building charsiu..."
-	( cd "$SRC" && make all ) >/dev/null 2>&1 || die "the build failed. Run 'make all' in $SRC to see why."
-	ui_ok "built"
+	# ⚠ A DRY RUN MUST NOT STOP AT A MISSING TOOL. Finding out what is absent
+	# is most of the reason to rehearse -- dying on the first gap shows one
+	# problem where the run could have shown all of them.
+	miss=""
+	command -v make >/dev/null 2>&1 || miss="$miss make"
+	{ command -v cc || command -v gcc; } >/dev/null 2>&1 || miss="$miss a-C-compiler"
+	[ -f "$SRC/Makefile" ] || miss="$miss the-charsiu-source"
+	if [ -n "$miss" ]; then
+		if [ "$DRY" = 1 ]; then
+			ui_bad "missing:$miss  -- a real run would stop here"
+			DOBUILD=0
+		else
+			die "missing:$miss"
+		fi
+	fi
+fi
+if [ "$DOBUILD" = 1 ]; then
+	if [ "$DRY" = 1 ]; then
+		would "make all   (in $SRC)"
+	else
+		ui_note "building charsiu..."
+		( cd "$SRC" && make all ) >/dev/null 2>&1 \
+			|| die "the build failed. Run 'make all' in $SRC to see why."
+		ui_ok "built"
+	fi
 fi
 RUNBIN="$SRC/build/charsiu_run"; CHKBIN="$SRC/build/charsiu_check"
-[ -x "$RUNBIN" ] || die "$RUNBIN does not exist."
+if [ ! -x "$RUNBIN" ]; then
+	# ⚠ In a dry run the build did not happen, so the binary legitimately is
+	# not there yet. Saying so is useful; dying is not.
+	[ "$DRY" = 1 ] && ui_info "$RUNBIN is not built yet (the build was skipped)" \
+		|| die "$RUNBIN does not exist."
+fi
 
 as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 as_root cp "$RUNBIN" "$BIN/charsiu_run"
@@ -333,31 +420,54 @@ done
 # run as root to download a file -- fails at the last step, after the download.
 OWNER="${SUDO_USER:-$(id -un)}"
 if [ "$OWNER" != root ] && id "$OWNER" >/dev/null 2>&1; then
-	as_root chown -R "$OWNER" "$MODELS" 2>/dev/null && \
+	# ⚠ as_root RETURNS 0 IN A DRY RUN, so a `&& ui_ok "..."` here announced
+	# a chown that never happened. A rehearsal that claims work it did not do
+	# is worse than no rehearsal.
+	# ⚠ `2>/dev/null` on the as_root call SWALLOWS the dry run's own notice,
+	# which goes to stderr -- the action then appeared in the final summary
+	# but not in the live output. Split the two cases.
+	if [ "$DRY" = 1 ]; then
+		as_root chown -R "$OWNER" "$MODELS"
+	elif as_root chown -R "$OWNER" "$MODELS" 2>/dev/null; then
 		ui_ok "$MODELS belongs to $OWNER, so charsiu-get needs no sudo"
+	fi
 fi
 
 if [ -f "$ETC/config.ini" ]; then
 	as_root cp "$SRC/etc/config.ini" "$ETC/config.ini.default"
-	ui_info "your $ETC/config.ini was left alone (template: config.ini.default)"
+	[ "$DRY" = 0 ] && ui_info "your $ETC/config.ini was left alone (template: config.ini.default)"
 else
 	as_root cp "$SRC/etc/config.ini" "$ETC/config.ini"
 fi
-ui_ok "installed into $BIN and $SBIN"
+[ "$DRY" = 0 ] && ui_ok "installed into $BIN and $SBIN"
 
 # ---------------------------------------------------------------------------
 if [ "$DOMODEL" = 1 ] && [ -z "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ]; then
-	CHARSIU_MODELS_DIR="$MODELS" CHARSIU_CHECK="$BIN/charsiu_check" \
-		CHARSIU_LIB="$BIN" "$SBIN/charsiu-get" --wizard || true
+	if [ "$DRY" = 1 ]; then
+		would "charsiu-get --wizard   (pick and download a model into $MODELS)"
+	else
+		CHARSIU_MODELS_DIR="$MODELS" CHARSIU_CHECK="$BIN/charsiu_check" \
+			CHARSIU_LIB="$BIN" "$SBIN/charsiu-get" --wizard || true
+	fi
 fi
 
 ui_hdr "checking"
-CHARSIU_CONFIG="$ETC/config.ini" "$SBIN/charsiu-doctor" || true
+if [ "$DRY" = 1 ]; then
+	# ⚠ the doctor is READ-ONLY, so a dry run should still run it -- what it
+	# reports is the most useful thing this rehearsal produces. It is pointed
+	# at the SOURCE tree's tools, since nothing was installed.
+	CHARSIU_CONFIG="$SRC/etc/config.ini" CHARSIU_LIB="$SRC/scripts" \
+		"$SRC/scripts/charsiu-doctor" || true
+else
+	CHARSIU_CONFIG="$ETC/config.ini" "$SBIN/charsiu-doctor" || true
+fi
 
 # ⚠ A REPORT IS NOT A DEMONSTRATION. Ending on a list of ticks leaves someone
 # who has waited through a build and a download with no evidence the thing
 # talks. One sentence is cheap and it is the whole point of installing it.
-if [ -n "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ] && [ "$NPU_OK" = 1 ]; then
+if [ "$DRY" = 1 ]; then
+	would "charsiu -p 'The capital of France is' -n 32   (one sentence, to prove it works)"
+elif [ -n "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ] && [ "$NPU_OK" = 1 ]; then
 	if ui_yesno "Ask it something, to see it work?
 
 The first run stages the NPU tensors, which takes about twenty
@@ -367,6 +477,15 @@ seconds before the first word." ; then
 			"$SBIN/charsiu" -p "The capital of France is" -n 32 -q || true
 		printf '\n'
 	fi
+fi
+
+if [ "$DRY" = 1 ]; then
+	printf '\n%sDRY RUN -- nothing above was done. In order, it would have:%s\n%s\n\n' \
+	       "$T_B" "$T_0" "$DRYLOG"
+	ui_msg "Dry run finished. Nothing was written.
+
+Run it again without --dry-run to do it for real."
+	exit 0
 fi
 
 ui_msg "Done.
