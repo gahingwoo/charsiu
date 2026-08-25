@@ -17,6 +17,47 @@ mainline kernel and the open `rocket` driver.
   charsiu on the CPU, best                 5.53      (pure q4_0, four threads)
 ```
 
+## Install
+
+```
+curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh | sh
+```
+
+It fetches the source, checks whether the running kernel can drive the NPU, and
+**offers a kernel if it cannot** — because RK3576 NPU support is not upstream yet,
+so no distribution kernel anywhere will bind this hardware. A kernel it installs
+becomes the default boot entry and **the one already on the card stays selectable**,
+five seconds into the boot, in case the new one misbehaves.
+
+Then it builds charsiu, fetches a model that charsiu can actually run, and asks it
+something so you can see it work.
+
+Rehearse it first if you would rather:
+
+```
+curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh -o install.sh
+sh install.sh --dry-run
+```
+
+`--dry-run` prints every action as `would ...` and changes nothing. The read-only
+checks still run, which is the point: it is what the installer *sees* on your machine.
+
+After that:
+
+```
+charsiu                     a conversation (the model stays staged between turns)
+charsiu -p "..." -n 64      one answer
+charsiu bench               what this board does, in tok/s
+charsiu-config              pick a model, threads, context
+charsiu-get                 more models
+charsiu-doctor              what works and what does not
+charsiu-doctor --paste      the block to put in a bug report
+```
+
+⚠ **A gguf's name does not tell you whether charsiu can run it**, in either
+direction — see [What a file's name does not tell you, twice](#what-a-files-name-does-not-tell-you-twice).
+`charsiu-get` gates every download by reading the file, and deletes what it cannot run.
+
 A 64 token generation is 67.7 ms a token, and 54 of that is the weight fetch itself at
 10.3 GB/s -- which is what this hardware's own bandwidth bench measures. **The fence is
 the floor**: 620 MB of int4 weights have to cross the bus for every token, and no amount

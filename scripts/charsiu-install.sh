@@ -26,6 +26,79 @@
 # kernel that does not boot is not a thing to discover with no way back.
 set -eu
 
+# ---------------------------------------------------------------------------
+# BOOTSTRAP -- the `curl ... | sh` case, before anything else can need it.
+# ---------------------------------------------------------------------------
+#
+CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
+CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh"
+
+# ⚠⚠ PIPED IN, STDIN IS THE SCRIPT ITSELF. Every `read` would eat the rest of
+# this file, and a wizard that asks questions cannot run that way. Reattach the
+# terminal first, and if there is not one, say so rather than silently
+# consuming ourselves.
+if [ ! -t 0 ]; then
+	# ⚠ A FAILED REDIRECTION ON `exec` KILLS THE SHELL. Testing with
+	# `exec < /dev/tty` meant that when there was no controlling terminal the
+	# script exited silently instead of saying why -- and `[ -r /dev/tty ]`
+	# is not the test either: the device node can be readable while opening
+	# it returns ENXIO. Probe in a subshell, where a failure costs nothing.
+	if ( : < /dev/tty ) 2>/dev/null; then
+		exec < /dev/tty
+	else
+		echo "charsiu-install: there is no terminal to ask questions on." >&2
+		echo "" >&2
+		echo "  curl -fsSL $CHARSIU_SELF_URL -o install.sh && sh install.sh" >&2
+		echo "" >&2
+		exit 1
+	fi
+fi
+
+# ⚠ Piped in, "$(dirname "$0")" is meaningless -- there is no tree beside us.
+# Anything that needs the source (the build, the scripts, the TUI layer) has to
+# come from somewhere, so fetch it and hand over to the copy that has neighbours.
+_boot_src=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || echo "")
+if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
+   [ ! -f "$_boot_src/scripts/charsiu-tui.sh" ]; then
+	DIR="${CHARSIU_DIR:-}"
+	if [ -z "$DIR" ]; then
+		if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+			DIR=/opt/charsiu/src
+		else
+			DIR="$HOME/charsiu"
+		fi
+	fi
+	printf '\n  charsiu needs its source to build from.\n'
+	printf '  It will be fetched into %s\n\n' "$DIR"
+	printf '  continue? [Y/n] '
+	read -r _a || _a=n
+	case "${_a:-y}" in n|N|no|NO) echo "  stopped."; exit 1 ;; esac
+
+	_sudo=""
+	[ -w "$(dirname "$DIR")" ] || [ "$(id -u)" -eq 0 ] || _sudo=$(command -v sudo || true)
+	if [ -d "$DIR/.git" ]; then
+		printf '  updating %s\n' "$DIR"
+		$_sudo git -C "$DIR" pull --ff-only --quiet || true
+	elif command -v git >/dev/null 2>&1; then
+		$_sudo mkdir -p "$(dirname "$DIR")"
+		$_sudo git clone --depth 1 --quiet "$CHARSIU_SRC_REPO" "$DIR" \
+			|| { echo "  clone failed: $CHARSIU_SRC_REPO" >&2; exit 1; }
+	else
+		# ⚠ no git is a normal state on a minimal rootfs, and a tarball
+		# needs neither git nor a key.
+		printf '  git is not installed; taking a tarball instead\n'
+		$_sudo mkdir -p "$DIR"
+		curl -fsSL "$CHARSIU_SRC_REPO/archive/refs/heads/main.tar.gz" \
+		 | $_sudo tar -xz -C "$DIR" --strip-components=1 \
+			|| { echo "  download failed" >&2; exit 1; }
+	fi
+	[ -f "$DIR/scripts/charsiu-install.sh" ] \
+		|| { echo "  $DIR does not look like charsiu" >&2; exit 1; }
+	printf '  handing over to %s\n\n' "$DIR/scripts/charsiu-install.sh"
+	exec sh "$DIR/scripts/charsiu-install.sh" "$@"
+fi
+unset _boot_src
+
 REPO="${CHARSIU_REPO:-gahingwoo/linux-rk3576-npu}"
 PREFIX="/"
 DRY=0
