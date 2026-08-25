@@ -20,9 +20,21 @@ set -u
 # what happened. The system file is still read when there is one.
 CONF="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
 [ -f "$CONF" ] || [ ! -f /etc/charsiu/config.ini ] || CONF=/etc/charsiu/config.ini
-# ⚠ and if the system file is not writable either, fall back to the user's.
-[ -w "$CONF" ] || [ ! -e "$CONF" ] || [ -w "$(dirname "$CONF")" ] \
-	|| CONF="$HOME/.charsiu/config.ini"
+# ⚠⚠ WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION, and this
+# collapsed them. As an ordinary user /etc/charsiu/config.ini is not writable,
+# so the name was simply REPLACED by ~/.charsiu/config.ini, which does not
+# exist -- and the model screen then said "now: (unset)" on a board whose
+# config was fine and whose model was running. Copy it instead of renaming it,
+# so the user gets a writable one that already says what the system one said.
+if [ -e "$CONF" ] && [ ! -w "$CONF" ] && [ ! -w "$(dirname "$CONF")" ]; then
+	_uc="$HOME/.charsiu/config.ini"
+	if [ ! -f "$_uc" ]; then
+		mkdir -p "$(dirname "$_uc")" 2>/dev/null \
+			&& cp "$CONF" "$_uc" 2>/dev/null || true
+	fi
+	# and if even that failed, keep reading the system one
+	[ -f "$_uc" ] && CONF="$_uc"
+fi
 # ⚠ user first, system as a fallback, matching the front door. Pointing this
 # at /opt alone meant a model in the user's own directory read as "none".
 MODELS_DIR="${CHARSIU_MODELS_DIR:-${CHARSIU_MODELS:-$HOME/.charsiu/models}}"
@@ -116,8 +128,13 @@ page_model() {
 	while :; do
 		cur=$(ini_get model path)
 		set --
-		for f in "$MODELS_DIR"/*.gguf; do
+		# ⚠ BOTH DIRECTORIES. Every other place in this file already looks
+		# in /opt/charsiu/models as well, and only this screen did not, so
+		# the board's own model was invisible to the one page whose job is
+		# to pick it: the menu offered [get] and nothing else.
+		for f in "$MODELS_DIR"/*.gguf /opt/charsiu/models/*.gguf; do
 			[ -f "$f" ] || continue
+			case " $* " in *" $(basename "$f") "*) continue ;; esac
 			mb=$(( $(wc -c < "$f" 2>/dev/null || echo 0) / 1048576 ))
 			mark=""; [ "$f" = "$cur" ] && mark="  <- in use"
 			set -- "$@" "$(basename "$f")" "${mb}M$mark"
@@ -136,7 +153,9 @@ now: ${cur:-(unset)}" "$@") || return
 			f=$(ask "file to check" "$cur")
 			[ -n "$CK" ] && "$CK" "$f"; pause ;;
 		*)
-			sel="$MODELS_DIR/$sel"
+			for _d in "$MODELS_DIR" /opt/charsiu/models; do
+				[ -f "$_d/$sel" ] && { sel="$_d/$sel"; break; }
+			done
 			# ⚠ never point the config at a file the runtime cannot load
 			CK=$(tool charsiu_check)
 			if [ -n "$CK" ] && ! out=$("$CK" -q "$sel" 2>&1); then

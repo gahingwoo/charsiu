@@ -154,11 +154,35 @@ EX=$(awk '/^[ \t]*\[extra\][ \t]*$/{f=1;next} /^[ \t]*\[/{f=0}
 # head, 113 for the model every board round uses, which is exactly what its logs
 # say) and then heartbeats every sixteen. Progress goes to stderr, the generated
 # text to stdout, so the two never mix.
+# mawk batches its output and its fflush() does not help; -Winteractive does.
+# Probe for the flag rather than sniffing which awk this is, and fall back
+# quietly for the awks that reject it.
+CHARSIU_AWK=awk
+if awk -Winteractive '' </dev/null >/dev/null 2>&1; then
+	CHARSIU_AWK="awk -Winteractive"
+fi
+
 stage_filter() {
-	awk '
+	# ⚠⚠ DO NOT WRITE TO "/dev/stderr" FROM awk. mawk, which is Debian's awk,
+	# opens it as an ordinary file and buffers it whole, and fflush() on that
+	# name does not help. Measured: three lines fed a second apart all came
+	# out together at the end. Meanwhile stdout goes straight to the terminal
+	# with no filter in the way, so the ANSWER printed before the staging
+	# messages that must precede it -- the board log has the bar and the
+	# whole NPU report arriving after the generation summary.
+	#
+	# Write to plain stdout, flush every line, and let the caller point that
+	# at stderr.
+	#
+	# ⚠⚠ AND fflush() IS NOT ENOUGH, BECAUSE mawk IGNORES IT. Measured on
+	# mawk 1.3.4: two lines fed a second apart came out 1 ms apart with
+	# `{ print; fflush() }`, and a second apart with `-Winteractive`. So the
+	# flag is what does the work; the fflush() calls stay for awks that
+	# honour them and have no such flag.
+	$CHARSIU_AWK '''
 	/staging [0-9]+$/ {
 		match($0, /staging [0-9]+$/); tot = substr($0, RSTART + 8) + 0
-		printf "  staging %d NPU tensors\n", tot > "/dev/stderr"; next
+		printf "  staging %d NPU tensors\n", tot; fflush(); next
 	}
 	/tensors staged/ {
 		n = $3 + 0
@@ -166,29 +190,29 @@ stage_filter() {
 			pct = int(n * 100 / tot); if (pct > 100) pct = 100
 			# ⚠ THE HEARTBEAT ONLY FIRES EVERY SIXTEENTH TENSOR, so for
 			# 113 the last one is 112 and the bar stops at 99% with no
-			# later stderr line to close it. The generated text then
-			# lands on the same line: "99%  112/113OK, Bob!". Close it
-			# on the last heartbeat there is going to be.
+			# later line to close it. The generated text then lands on
+			# the same line: "99%  112/113OK, Bob!". Close it on the
+			# last heartbeat there is going to be.
 			if (n + 16 > tot) {
 				printf "\r  [########################] 100%%  %d/%d\n",
-				       tot, tot > "/dev/stderr"
+				       tot, tot
 				bar = 0
 			} else {
 				printf "\r  [%-24s] %3d%%  %d/%d",
 				       substr("########################", 1, int(pct/4.2)),
-				       pct, n, tot > "/dev/stderr"
+				       pct, n, tot
 				bar = 1
 			}
-			fflush("/dev/stderr")
+			fflush()
 		}
 		next
 	}
 	# ⚠ a pass-through line lands mid-bar unless the bar is closed first,
 	# and \r leaves the cursor at column 0 of a line that still has a bar on it.
-	{ if (bar) { printf "\n" > "/dev/stderr"; bar = 0 }
-	  print > "/dev/stderr" }
-	END { if (bar) printf "\r  [########################] 100%%  %d/%d\n", tot, tot > "/dev/stderr" }
-	'
+	{ if (bar) { printf "\n"; bar = 0 }
+	  print; fflush() }
+	END { if (bar) printf "\r  [########################] 100%%  %d/%d\n", tot, tot; fflush() }
+	'''
 }
 
 if [ "$BENCH" = 1 ]; then
@@ -200,7 +224,7 @@ if [ "$BENCH" = 1 ]; then
 	# comparable with the logs rather than being a new metric nobody can
 	# check. --ignore-eos so a short answer does not shorten the sample.
 	out=$( { env $E "$RUN" "$MODEL" -p "The capital of France is" -n 64 \
-		--ignore-eos -q -c "$CTX" -t "$THREADS" 2>&1 1>&3 | stage_filter; } 3>&1 )
+		--ignore-eos -q -c "$CTX" -t "$THREADS" 2>&1 1>&3 | stage_filter >&2; } 3>&1 )
 	echo "$out" | grep -oE 'gen 64 tok in [0-9]+ ms, [0-9.]+ tok/s' \
 		| sed 's/^/  /' || echo "  (no rate reported)"
 	echo "$out" | grep -oE '[0-9.]+ GB/s of weights' | sed 's/^/  /' || true
@@ -223,7 +247,7 @@ if [ -t 2 ] && [ -z "${CHARSIU_NO_PROGRESS:-}" ]; then
 	# status has to come from charsiu_run and not from awk, hence the
 	# explicit plumbing rather than a plain pipeline.
 	{ env $E "$RUN" "$MODEL" -c "$CTX" -t "$THREADS" "$@" 2>&1 1>&3 \
-		| stage_filter; } 3>&1
+		| stage_filter >&2; } 3>&1
 	exit $?
 fi
 exec env $E "$RUN" "$MODEL" -c "$CTX" -t "$THREADS" "$@"
