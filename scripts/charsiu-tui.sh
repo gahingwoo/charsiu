@@ -42,10 +42,42 @@ if [ -t 2 ]; then
 else T_B=; T_G=; T_R=; T_Y=; T_D=; T_0=; fi
 
 # ui_msg TEXT           say something and wait for acknowledgement
+# ⚠ A THREE LINE MESSAGE IN A TWENTY ROW BOX LOOKS BROKEN, and every dialog
+# here was a fixed 20x74 whatever it held. whiptail will not size itself, so
+# measure the text: the widest line for the width, the wrapped line count for
+# the height, both clamped to the terminal.
+#
+# ⚠ AND `stty size` REPORTS 0 0 ON A SERIAL CONSOLE, which has no way to tell
+# anyone how big it is. Falling through with zero would ask for a box of no
+# rows; 24x80 is what a serial terminal is until told otherwise.
+ctui_size() {   # ctui_size TEXT EXTRA_ROWS  ->  sets BOX_H, BOX_W
+	_sz=$(stty size 2>/dev/null || echo "0 0")
+	_r=${_sz%% *}; _c=${_sz##* }
+	case "$_r" in ''|*[!0-9]*) _r=0 ;; esac
+	case "$_c" in ''|*[!0-9]*) _c=0 ;; esac
+	[ "$_r" -ge 10 ] || _r=24
+	[ "$_c" -ge 40 ] || _c=80
+
+	_inner=$((_c - 8))
+	[ "$_inner" -gt 72 ] && _inner=72
+
+	BOX_W=$(printf '%s\n' "$1" | awk -v m="$_inner" '
+		{ w = length($0); if (w > m) w = m; if (w > b) b = w }
+		END { print b + 6 }')
+	BOX_H=$(printf '%s\n' "$1" | awk -v m="$_inner" -v x="${2:-2}" '
+		{ n = length($0); t += (n == 0 ? 1 : int((n + m - 1) / m)) }
+		END { print t + 4 + x }')
+	[ "$BOX_W" -ge 40 ] || BOX_W=40
+	[ "$BOX_W" -le $((_c - 4)) ] || BOX_W=$((_c - 4))
+	[ "$BOX_H" -ge 7 ] || BOX_H=7
+	[ "$BOX_H" -le $((_r - 2)) ] || BOX_H=$((_r - 2))
+}
+
 ui_msg() {
 	if [ -n "$CTUI_ASSUME" ]; then printf '\n%s\n' "$1" >&2; return 0; fi
 	if [ "$CTUI" = whiptail ]; then
-		whiptail --title "$CTUI_TITLE" --msgbox "$1" 20 74
+		ctui_size "$1" 2
+		whiptail --title "$CTUI_TITLE" --msgbox "$1" "$BOX_H" "$BOX_W"
 	else
 		printf '\n%s\n\n%spress enter%s ' "$1" "$T_D" "$T_0" >&2
 		read -r _ || true
@@ -55,7 +87,8 @@ ui_msg() {
 # ui_note TEXT          say something and keep going
 ui_note() {
 	if [ "$CTUI" = whiptail ]; then
-		whiptail --title "$CTUI_TITLE" --infobox "$1" 12 74
+		ctui_size "$1" 0
+		whiptail --title "$CTUI_TITLE" --infobox "$1" "$BOX_H" "$BOX_W"
 		sleep 1
 	else
 		printf '\n%s\n' "$1" >&2
@@ -69,10 +102,11 @@ ui_yesno() {
 		[ "$CTUI_ASSUME" = yes ] && return 0 || return 1
 	fi
 	if [ "$CTUI" = whiptail ]; then
+		ctui_size "$1" 2
 		if [ "${2:-}" = defaultno ]; then
-			whiptail --title "$CTUI_TITLE" --defaultno --yesno "$1" 20 74
+			whiptail --title "$CTUI_TITLE" --defaultno --yesno "$1" "$BOX_H" "$BOX_W"
 		else
-			whiptail --title "$CTUI_TITLE" --yesno "$1" 20 74
+			whiptail --title "$CTUI_TITLE" --yesno "$1" "$BOX_H" "$BOX_W"
 		fi
 	else
 		if [ "${2:-}" = defaultno ]; then d="y/N"; else d="Y/n"; fi
@@ -97,7 +131,8 @@ ui_yesno() {
 ui_input() {
 	if [ -n "$CTUI_ASSUME" ]; then echo "$2"; return 0; fi
 	if [ "$CTUI" = whiptail ]; then
-		_o=$(whiptail --title "$CTUI_TITLE" --inputbox "$1" 12 74 "$2" 3>&1 1>&2 2>&3) \
+		ctui_size "$1" 4
+		_o=$(whiptail --title "$CTUI_TITLE" --inputbox "$1" "$BOX_H" "$BOX_W" "$2" 3>&1 1>&2 2>&3) \
 			|| return 1
 		echo "$_o"
 	else
@@ -149,7 +184,8 @@ ui_menu() {
 # percentages on stdin, one integer per line.
 ui_progress() {
 	if [ "$CTUI" = whiptail ]; then
-		whiptail --title "$CTUI_TITLE" --gauge "$1" 8 74 0
+		ctui_size "$1" 3
+		whiptail --title "$CTUI_TITLE" --gauge "$1" "$BOX_H" "$BOX_W" 0
 	else
 		printf '\n%s\n' "$1" >&2
 		while read -r pct; do printf '\r  %3s%%' "$pct" >&2; done
