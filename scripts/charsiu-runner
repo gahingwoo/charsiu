@@ -107,7 +107,7 @@ if [ -z "$RUN" ]; then
 	d=$(dirname "$0")
 	for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu_run"} \
 		 "$d/charsiu_run" "$d/../build/charsiu_run" \
-		 "$d/../opt/charsiu/charsiu_run" /opt/charsiu/charsiu_run; do
+		 "$d/../../opt/charsiu/charsiu_run" /opt/charsiu/charsiu_run; do
 		[ -x "$c" ] && { RUN="$c"; break; }
 	done
 	[ -n "$RUN" ] || RUN=$(command -v charsiu_run || true)

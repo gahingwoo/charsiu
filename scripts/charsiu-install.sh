@@ -796,7 +796,8 @@ else
 	# having given up. Keep printing it, so it is in the log and in a pipe,
 	# and also put it on screen as something you can read and scroll.
 	DLOG="${TMPDIR:-/tmp}/charsiu-doctor.$$"
-	CHARSIU_CONFIG="${CONFDISP:-$ETC/config.ini}" "$SBIN/charsiu-doctor" 2>&1 | tee "$DLOG" >&2 || true
+	CHARSIU_CONFIG="${CONFDISP:-$ETC/config.ini}" CHARSIU_LIB="$BIN" \
+		"$SBIN/charsiu-doctor" 2>&1 | tee "$DLOG" >&2 || true
 	ui_pane "$DLOG"
 	rm -f "$DLOG"
 fi

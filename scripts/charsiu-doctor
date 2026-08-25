@@ -77,8 +77,9 @@ findbin() {
 	# and the staged ../opt/charsiu layout included, or a --prefix install
 	# reports its own binaries missing.
 	d=$(dirname "$0")
+	# ⚠ from $PREFIX/usr/bin the staged /opt is TWO levels up, not one.
 	for c in ${CHARSIU_LIB:+"$CHARSIU_LIB/$1"} "$d/$1" "$d/../build/$1" \
-		 "$d/../opt/charsiu/$1" "/opt/charsiu/$1"; do
+		 "$d/../../opt/charsiu/$1" "/opt/charsiu/$1"; do
 		[ -x "$c" ] && { echo "$c"; return; }
 	done
 	command -v "$1" 2>/dev/null || true
