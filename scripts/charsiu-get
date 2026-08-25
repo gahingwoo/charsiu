@@ -160,6 +160,40 @@ list_repo() {
 }
 
 # fetch URL into MODELS_DIR under BASENAME, gate it, keep it only if it passes
+# ⚠ DOWNLOADING A MODEL AND NOT SAYING SO IN THE CONFIG LEAVES A WORKING
+# INSTALL THAT CANNOT RUN. The shipped config names a 1B Llama as a placeholder;
+# a first run that fetched the 135M model still died on the Llama path, because
+# nothing connected the two. Point the config at what was fetched when what it
+# names is not here. An existing, present choice is left alone: someone who set
+# a model meant it, and a second download should not silently switch them.
+claim_config() {
+	got="$1"
+	conf="${CHARSIU_CONFIG:-$HOME/.charsiu/config.ini}"
+	[ -f "$conf" ] || conf=/etc/charsiu/config.ini
+	[ -f "$conf" ] || return 0
+	cur=$(awk '
+		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h=="model"); next }
+		t { if (match($0,/^[ \t]*[^=]*=/)) { n=substr($0,1,RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n);
+		    if (n=="path") { v=substr($0,RLENGTH+1); sub(/[ \t]#.*$/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit } } }
+	' "$conf")
+	[ -n "$cur" ] && [ -f "$cur" ] && return 0
+
+	t="$conf.tmp.$$"
+	# ⚠ Writing to /etc needs root, and nobody should need root to download a
+	# file. Failing here is not fatal: the runner falls back to the only
+	# model on disk, so say what happened and carry on.
+	if awk -v v="$got" '
+		/^[ \t]*\[.*\][ \t]*$/ { h=$0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h); t=(h=="model"); print; next }
+		t && !done && match($0,/^[ \t]*path[ \t]*=/) { print "path = " v; done=1; next }
+		{ print }
+	' "$conf" > "$t" 2>/dev/null && mv "$t" "$conf" 2>/dev/null; then
+		say "config now runs ${got##*/}"
+	else
+		rm -f "$t"
+		say "could not write $conf; charsiu will still find ${got##*/}"
+	fi
+}
+
 fetch_and_gate() {
 	url="$1"; base="$2"; want_mb="${3:-0}"
 	CK=$(find_check)
@@ -198,6 +232,7 @@ fetch_and_gate() {
 	if "$CK" "$part"; then
 		mv "$part" "$out"
 		say "${C_G}kept${C_0} $out"
+		claim_config "$out"
 		return 0
 	fi
 	rm -f "$part"

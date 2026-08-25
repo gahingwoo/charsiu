@@ -109,19 +109,33 @@ if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
    [ ! -f "$_boot_src/scripts/charsiu-tui.sh" ]; then
 	DIR="${CHARSIU_DIR:-}"
 	if [ -z "$DIR" ]; then
-		if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+		if [ "$_BOOT_DRY" = 1 ]; then
+			# ⚠ A REHEARSAL THAT WRITES 900 KB INTO /opt IS NOT A
+			# REHEARSAL. The dialog says nothing is written or
+			# downloaded, and on a real Debian this stage was quietly
+			# doing both, into a root-owned directory, before the
+			# dry-run flag was ever looked at. Fetch somewhere
+			# disposable instead, and throw it away on the way out.
+			DIR="${TMPDIR:-/tmp}/charsiu-dryrun.$$"
+			CHARSIU_DRY_SRC="$DIR"; export CHARSIU_DRY_SRC
+		elif [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
 			DIR=/opt/charsiu/src
 		else
 			DIR="$HOME/charsiu"
 		fi
 	fi
-	[ "$_BOOT_NOTTY" = 1 ] && printf '\n  fetching the source into %s\n' "$DIR"
-	[ "$_BOOT_NOTTY" = 1 ] || _boot_yesno "charsiu needs its source to build from.
+	if [ "$_BOOT_DRY" = 1 ]; then
+		printf '\n  dry run: fetching the source into %s (deleted on exit)\n' "$DIR"
+	elif [ "$_BOOT_NOTTY" = 1 ]; then
+		printf '\n  fetching the source into %s\n' "$DIR"
+	else
+		_boot_yesno "charsiu needs its source to build from.
 
 It will be fetched into
   $DIR
 
 Continue?" || { echo "  stopped."; exit 1; }
+	fi
 
 	_sudo=""
 	[ -w "$(dirname "$DIR")" ] || [ "$(id -u)" -eq 0 ] || _sudo=$(command -v sudo || true)
@@ -161,7 +175,7 @@ unset _boot_src
 # newt on Fedora and Alpine, libnewt on Arch.
 if ! command -v whiptail >/dev/null 2>&1 && [ -z "${CHARSIU_PLAIN:-}" ]; then
 	_pm=""
-	if   command -v apt-get >/dev/null 2>&1; then _pm="apt-get install -y whiptail"
+	if   command -v apt-get >/dev/null 2>&1; then _pm="apt-get install -y --no-install-recommends whiptail"
 	elif command -v dnf     >/dev/null 2>&1; then _pm="dnf install -y newt"
 	elif command -v apk     >/dev/null 2>&1; then _pm="apk add newt"
 	elif command -v pacman  >/dev/null 2>&1; then _pm="pacman -S --noconfirm libnewt"
@@ -307,10 +321,13 @@ if [ "$UNINSTALL" = 1 ]; then
 The models in $MODELS and your $ETC/config.ini are LEFT ALONE.
 A kernel this installed is NOT removed either. Pick the previous
 entry in the boot menu instead, then remove it by hand." defaultno || exit 0
-	for f in charsiu charsiu-get charsiu-config charsiu-doctor; do
-		as_root rm -f "$SBIN/$f"
+	# Remove what is there, not what the list happened to say when it was
+	# written. The install side makes the same mistake if it is spelled out.
+	as_root rm -f "$SBIN/charsiu"
+	for f in "$SBIN"/charsiu-*; do [ -e "$f" ] && as_root rm -f "$f"; done
+	for f in charsiu_run charsiu_check charsiu_serve charsiu-tui.sh; do
+		as_root rm -f "$BIN/$f"
 	done
-	for f in charsiu_run charsiu_check charsiu-tui.sh; do as_root rm -f "$BIN/$f"; done
 	ui_msg "Removed. Models and config kept."
 	exit 0
 fi
@@ -549,9 +566,53 @@ if [ "$DOBUILD" = 1 ]; then
 	{ command -v cc || command -v gcc; } >/dev/null 2>&1 || miss="$miss a-C-compiler"
 	[ -f "$SRC/Makefile" ] || miss="$miss the-charsiu-source"
 	if [ -n "$miss" ]; then
+		# ⚠ A STOCK DEBIAN HAS NO COMPILER. This is not an edge case, it is
+		# what every `curl ... | sh` into a fresh install hits, and stopping
+		# here left the reader to work out the package name themselves.
+		# Offer it the same way whiptail is offered at the bootstrap.
+		_pm=""; _pmname=""
+		case "$miss" in
+		*make*|*C-compiler*)
+			if   command -v apt-get >/dev/null 2>&1; then
+				_pm="apt-get install -y --no-install-recommends build-essential"; _pmname="build-essential"
+			elif command -v dnf >/dev/null 2>&1; then
+				_pm="dnf install -y gcc make"; _pmname="gcc and make"
+			elif command -v apk >/dev/null 2>&1; then
+				_pm="apk add build-base"; _pmname="build-base"
+			elif command -v pacman >/dev/null 2>&1; then
+				_pm="pacman -S --noconfirm base-devel"; _pmname="base-devel"
+			fi ;;
+		esac
 		if [ "$DRY" = 1 ]; then
-			ui_bad "missing:$miss  (a real run would stop here)"
+			ui_bad "missing:$miss"
+			if [ -n "$_pm" ]; then would "$_pm   (to supply$miss)"
+			else ui_bad "  and no package manager here knows how to supply it"; fi
 			DOBUILD=0
+		elif [ -n "$_pm" ] && ui_yesno "charsiu is built from source, and this machine has no compiler.
+
+Missing:$miss
+
+Install it now?
+  $_pm"; then
+			ui_note "installing $_pmname..."
+			command -v apt-get >/dev/null 2>&1 && \
+				as_root apt-get update -qq >/dev/null 2>&1 || true
+			# ⚠ SWALLOWING APT'S OUTPUT LEAVES "it failed" AND NOTHING TO ACT
+			# ON. It fails for ordinary reasons (no network, a held
+			# package, another apt holding the lock) and each one has a
+			# different fix, so keep the last lines and show them.
+			_aptlog="${TMPDIR:-/tmp}/charsiu-apt.$$"
+			if ! as_root $_pm >"$_aptlog" 2>&1; then
+				printf '\n%s\n' "$(tail -n 6 "$_aptlog")" >&2
+				rm -f "$_aptlog"
+				die "installing $_pmname failed (see above). Install it by hand and run this again."
+			fi
+			rm -f "$_aptlog"
+			miss=""
+			command -v make >/dev/null 2>&1 || miss="$miss make"
+			{ command -v cc || command -v gcc; } >/dev/null 2>&1 || miss="$miss a-C-compiler"
+			[ -n "$miss" ] && die "still missing:$miss"
+			ui_ok "$_pmname installed"
 		else
 			die "missing:$miss"
 		fi
@@ -576,11 +637,22 @@ if [ ! -x "$RUNBIN" ]; then
 fi
 
 as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
-as_root cp "$RUNBIN" "$BIN/charsiu_run"
-as_root cp "$CHKBIN" "$BIN/charsiu_check"
+
+# ⚠ SPELLING THIS LIST OUT IS HOW `charsiu list` SHIPPED BROKEN. The front door
+# execs one helper per subcommand, and six of them (list, ps, rm, show, runner,
+# serve) arrived after the list was written. A fresh Debian install got a
+# charsiu that printed --help and then died with "exec: : Permission denied" on
+# every subcommand. Install whatever the source actually has.
+for f in charsiu_run charsiu_check charsiu_serve; do
+	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
+	as_root cp "$SRC/build/$f" "$BIN/$f"
+done
 as_root cp "$SRC/scripts/charsiu-tui.sh" "$BIN/charsiu-tui.sh"
-for f in charsiu charsiu-get charsiu-config charsiu-doctor; do
-	as_root cp "$SRC/scripts/$f" "$SBIN/$f"
+for p in "$SRC"/scripts/charsiu "$SRC"/scripts/charsiu-*; do
+	f=${p##*/}
+	# the installer is not a subcommand, and the TUI layer is a library
+	case "$f" in charsiu-install.sh|charsiu-tui.sh) continue ;; esac
+	as_root cp "$p" "$SBIN/$f"
 	as_root chmod 0755 "$SBIN/$f"
 done
 
@@ -654,6 +726,9 @@ if [ "$DRY" = 1 ]; then
 	ui_msg "Dry run finished. Nothing was written.
 
 Run it again without --dry-run to do it for real."
+	# Deleting the tree we are running from is fine: the shell already has
+	# the file open, and this is the only way a rehearsal leaves nothing.
+	[ -n "${CHARSIU_DRY_SRC:-}" ] && rm -rf "$CHARSIU_DRY_SRC"
 	exit 0
 fi
 
