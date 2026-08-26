@@ -405,14 +405,24 @@ install_kernel() {
 	# confuses the next person at worst. Say so and leave the board alone.
 	# CHARSIU_BOOTDIR names it outright, for a boot partition mounted
 	# somewhere else, and for rehearsing this on a machine that has none.
-	BOOTDIR=""
+	BOOTDIR=""; BOOTKIND=""
 	for b in ${CHARSIU_BOOTDIR:+"$CHARSIU_BOOTDIR"} /boot /boot/firmware /mnt/boot; do
-		[ -f "$b/extlinux/extlinux.conf" ] && { BOOTDIR="$b"; break; }
+		if [ -f "$b/extlinux/extlinux.conf" ]; then
+			BOOTDIR="$b"; BOOTKIND=extlinux; break
+		fi
+		# ⚠ ARMBIAN IS THE OTHER LAYOUT WORTH KNOWING, and it is what most
+		# of these boards actually run: boot.scr reads armbianEnv.txt and
+		# loads ${prefix}Image and dtb/${fdtfile}. Since no distro kernel
+		# binds this NPU, refusing here left the one thing charsiu needs
+		# switched off on the commonest install there is.
+		if [ -f "$b/armbianEnv.txt" ]; then
+			BOOTDIR="$b"; BOOTKIND=armbian; break
+		fi
 	done
 	if [ -z "$BOOTDIR" ]; then
-		ui_msg "No extlinux.conf found under /boot.
+		ui_msg "No extlinux.conf and no armbianEnv.txt under /boot.
 
-This board boots some other way (a boot.scr, a distro's own kernel
+This board boots some other way (its own boot.scr, a distro kernel
 package, or U-Boot environment variables), and guessing at it would
 be worse than doing nothing.
 
@@ -445,10 +455,11 @@ Nothing was changed."
 		return 1
 	fi
 
-	ui_yesno "Install this kernel?
+	if [ "$BOOTKIND" = extlinux ]; then
+		ui_yesno "Install this kernel?
 
   release   $TAG
-  into      $BOOTDIR
+  into      $BOOTDIR  (extlinux)
 
 The kernel now on this board is kept as a SECOND boot entry. The new
 one becomes the default; if it misbehaves, interrupt the boot and
@@ -457,6 +468,33 @@ pick the old one.
 ⚠ This rewrites $BOOTDIR/extlinux/extlinux.conf. The kernel command
 line already in it is carried over unchanged. root=, console= and
 the rest are board-specific and are not re-invented here." || return 1
+	else
+		# ⚠ SAY THE PART THAT IS WORSE HERE. boot.scr loads one Image and
+		# there is no menu, so unlike extlinux the old kernel cannot be
+		# offered at boot. It is kept as a file, and putting it back needs
+		# either a system that still boots or the card in another machine.
+		# Promising a fallback that does not exist would be the worst thing
+		# this screen could do.
+		ui_yesno "Install this kernel?
+
+  release   $TAG
+  into      $BOOTDIR  (armbian: armbianEnv.txt + boot.scr)
+
+The kernel now on this board is copied aside as Image.previous, and
+the dtb likewise.
+
+⚠ THIS LAYOUT HAS NO BOOT MENU. boot.scr loads one Image, so the old
+kernel cannot be offered at boot the way extlinux can. If the new one
+does not boot, put the old file back:
+
+  cp $BOOTDIR/Image.previous $BOOTDIR/Image
+
+which needs a system that still boots, or this card in another
+machine. Have a way to do that before saying yes.
+
+⚠ armbianEnv.txt is NOT touched. root=, console= and the rest stay
+exactly as Armbian set them." || return 1
+	fi
 
 	if [ "$DRY" = 1 ]; then
 		for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
@@ -466,7 +504,12 @@ the rest are board-specific and are not re-invented here." || return 1
 		would "cp $BOOTDIR/Image $BOOTDIR/Image.previous   (only if it does not exist)"
 		would "cp <new> $BOOTDIR/Image  and the dtb"
 		would "tar -C / -xzf modules-*.tar.gz"
-		would "rewrite $BOOTDIR/extlinux/extlinux.conf with two entries, default the new one"
+		if [ "$BOOTKIND" = extlinux ]; then
+			would "rewrite $BOOTDIR/extlinux/extlinux.conf with two entries, default the new one"
+		else
+			would "leave $BOOTDIR/armbianEnv.txt alone; boot.scr picks up the new Image"
+		fi
+		would "depmod -a for the installed module tree"
 		ui_msg "DRY RUN. The kernel step stops here.
 
   release  $TAG
@@ -492,68 +535,122 @@ the rest are board-specific and are not re-invented here." || return 1
 	fi
 
 	DTBNAME=$(basename "$DTB")
-	APPEND=$(awk '/^[ \t]*append /{sub(/^[ \t]*append[ \t]*/,""); print; exit}' \
-		"$BOOTDIR/extlinux/extlinux.conf")
-	[ -n "$APPEND" ] || { ui_msg "Could not read the current kernel command line. Nothing was written."; return 1; }
+	if [ "$BOOTKIND" = extlinux ]; then
+		DTBDEST="$BOOTDIR/$DTBNAME"
+		APPEND=$(awk '/^[ \t]*append /{sub(/^[ \t]*append[ \t]*/,""); print; exit}' \
+			"$BOOTDIR/extlinux/extlinux.conf")
+		[ -n "$APPEND" ] || { ui_msg "Could not read the current kernel command line. Nothing was written."; return 1; }
+	else
+		# ⚠ WRITE THE DTB WHERE fdtfile ALREADY POINTS, and do not edit
+		# armbianEnv.txt. boot.scr loads dtb/${fdtfile}; putting ours at a
+		# name of our own choosing would load the OLD one and look like the
+		# new kernel had simply failed.
+		FDT=$(awk -F= '/^[ \t]*fdtfile[ \t]*=/{sub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' \
+			"$BOOTDIR/armbianEnv.txt")
+		if [ -n "$FDT" ]; then
+			DTBDEST="$BOOTDIR/dtb/$FDT"
+		elif [ -d "$BOOTDIR/dtb/rockchip" ]; then
+			DTBDEST="$BOOTDIR/dtb/rockchip/$DTBNAME"
+		else
+			DTBDEST="$BOOTDIR/dtb/$DTBNAME"
+		fi
+		[ -d "$(dirname "$DTBDEST")" ] || {
+			ui_msg "$(dirname "$DTBDEST") does not exist, so this is not the
+Armbian layout after all. Nothing was written."
+			return 1
+		}
+		APPEND=""
+	fi
 
 	# ⚠ Do not clobber a good backup with a bad one. If .previous already
 	# exists, the kernel currently in place may itself be one of ours from a
 	# previous run, so keep the ORIGINAL as the fallback.
-	if [ ! -f "$BOOTDIR/Image.previous" ] && [ -f "$BOOTDIR/Image" ]; then
-		as_root cp "$BOOTDIR/Image" "$BOOTDIR/Image.previous"
-		[ -f "$BOOTDIR/$DTBNAME" ] && \
-			as_root cp "$BOOTDIR/$DTBNAME" "$BOOTDIR/$DTBNAME.previous"
+	if [ ! -f "$BOOTDIR/Image.previous" ] && [ -e "$BOOTDIR/Image" ]; then
+		# ⚠ `cp` FOLLOWS THE SYMLINK ON PURPOSE. On Armbian /boot/Image is
+		# usually a link to vmlinuz-<version>, and copying the link itself
+		# would leave a fallback that points at whatever replaces the
+		# target later. -L takes the bytes.
+		as_root cp -L "$BOOTDIR/Image" "$BOOTDIR/Image.previous"
+		[ -e "$DTBDEST" ] && as_root cp -L "$DTBDEST" "$DTBDEST.previous"
 		ui_ok "kept the current kernel as Image.previous"
 	else
 		ui_info "Image.previous already exists and was left as it is"
 	fi
 
+	# ⚠ REMOVE BEFORE COPYING. Writing through a symlink would overwrite
+	# whatever it points at, which on Armbian is the distro's own
+	# vmlinuz-<version> and is not ours to replace.
+	as_root rm -f "$BOOTDIR/Image"
 	as_root cp "$TMP/Image" "$BOOTDIR/Image"
-	as_root cp "$TMP/$DTBNAME" "$BOOTDIR/$DTBNAME"
+	as_root rm -f "$DTBDEST"
+	as_root cp "$TMP/$DTBNAME" "$DTBDEST"
 	if [ -n "$MODS" ]; then
 		as_root tar -C / -xzf "$TMP/$(basename "$MODS")"
-		ui_ok "modules installed"
+		# ⚠ MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD, and neither
+		# layout was running it. The version is whatever the tarball says,
+		# not `uname -r`: the running kernel is still the old one.
+		KVER=$(tar tzf "$TMP/$(basename "$MODS")" \
+			| awk -F/ '/^lib\/modules\//{print $3; exit}')
+		[ -n "$KVER" ] && as_root depmod -a "$KVER" 2>/dev/null || true
+		ui_ok "modules installed${KVER:+ for $KVER}"
 	fi
 
-	CONF=$(mktemp)
-	{
-		echo "default charsiu"
-		echo "prompt 1"
-		# tenths of a second. Long enough to catch it on a serial
-		# console, which is how these boards are usually watched.
-		echo "timeout 50"
-		echo "menu title  which kernel?"
-		echo ""
-		echo "label charsiu"
-		echo "    menu label charsiu NPU kernel ($TAG)"
-		echo "    kernel /Image"
-		echo "    fdt /$DTBNAME"
-		echo "    append $APPEND"
-		if [ -f "$BOOTDIR/Image.previous" ]; then
+	if [ "$BOOTKIND" = extlinux ]; then
+		CONF=$(mktemp)
+		{
+			echo "default charsiu"
+			echo "prompt 1"
+			# tenths of a second. Long enough to catch it on a serial
+			# console, which is how these boards are usually watched.
+			echo "timeout 50"
+			echo "menu title  which kernel?"
 			echo ""
-			echo "label previous"
-			echo "    menu label the kernel that was here before"
-			echo "    kernel /Image.previous"
-			if [ -f "$BOOTDIR/$DTBNAME.previous" ]; then
-				echo "    fdt /$DTBNAME.previous"
-			else
-				echo "    fdt /$DTBNAME"
-			fi
+			echo "label charsiu"
+			echo "    menu label charsiu NPU kernel ($TAG)"
+			echo "    kernel /Image"
+			echo "    fdt /$DTBNAME"
 			echo "    append $APPEND"
-		fi
-	} > "$CONF"
-	as_root cp "$BOOTDIR/extlinux/extlinux.conf" "$BOOTDIR/extlinux/extlinux.conf.bak" 2>/dev/null || true
-	as_root cp "$CONF" "$BOOTDIR/extlinux/extlinux.conf"
-	rm -f "$CONF"
-	sync
+			if [ -f "$BOOTDIR/Image.previous" ]; then
+				echo ""
+				echo "label previous"
+				echo "    menu label the kernel that was here before"
+				echo "    kernel /Image.previous"
+				if [ -f "$BOOTDIR/$DTBNAME.previous" ]; then
+					echo "    fdt /$DTBNAME.previous"
+				else
+					echo "    fdt /$DTBNAME"
+				fi
+				echo "    append $APPEND"
+			fi
+		} > "$CONF"
+		as_root cp "$BOOTDIR/extlinux/extlinux.conf" "$BOOTDIR/extlinux/extlinux.conf.bak" 2>/dev/null || true
+		as_root cp "$CONF" "$BOOTDIR/extlinux/extlinux.conf"
+		rm -f "$CONF"
+		sync
+	fi
 
-	ui_msg "Kernel installed.
+	if [ "$BOOTKIND" = extlinux ]; then
+		ui_msg "Kernel installed.
 
   default    charsiu NPU kernel ($TAG)
   fallback   the kernel that was here before
   menu       5 seconds at boot, on the serial console
 
 Reboot, then run this again to finish the userspace."
+	else
+		ui_msg "Kernel installed.
+
+  kernel     $BOOTDIR/Image        ($TAG)
+  dtb        $DTBDEST
+  fallback   $BOOTDIR/Image.previous
+
+⚠ There is no boot menu on this layout. If it does not come back,
+put the old kernel back with
+
+  cp $BOOTDIR/Image.previous $BOOTDIR/Image
+
+Reboot, then run this again to finish the userspace."
+	fi
 	return 0
 }
 
@@ -581,7 +678,9 @@ still under review on the kernel lists. There is no distribution
 kernel anywhere that will bind this hardware.
 
 Fetch a prebuilt one from $REPO?
-The kernel now on this board is kept and stays selectable at boot." \
+The kernel now on this board is kept either way; whether it stays
+SELECTABLE at boot depends on how this board boots, and the next
+screen says which it is." \
 	&& { install_kernel && exit 0; }
 	[ "$DOKERNEL" = only ] && exit 0
 	ui_warn "continuing without the NPU; charsiu will run on the CPU"
