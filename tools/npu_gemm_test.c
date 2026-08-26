@@ -16,7 +16,8 @@
  * this test is wrong and says so, rather than blaming a field it was built to
  * examine. Only m=1 passing makes an m=2 failure mean anything.
  *
- *   npu_gemm_test [K] [N]
+ *   npu_gemm_test [K] [N]              sweeps M = 1, 2, 4, 8, 32
+ *   CHARSIU_M_LEGACY=1 npu_gemm_test  the control: must fail
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -240,11 +241,22 @@ static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *wa
 
 int main(int argc, char **argv)
 {
+	/*
+	 * ⚠ M IS A SWEEP NOW, NOT A PAIR. Round 379 ran m=1 and m=2 only and
+	 * concluded "m>1 does not work" from one failing width. The register
+	 * fix in 2184557 is about the input surface block, which is degenerate
+	 * at m=1 and rounds to four at m=2, so those two widths are the two
+	 * least informative ones to stop at: m=4, 8 and 32 are where a
+	 * batched prefill would actually live.
+	 */
+	static const unsigned MS[] = { 1, 2, 4, 8, 32 };
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 256;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 64;
+	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
 	struct charsiu_device *dev;
 	uint8_t *A, *B;
 	int32_t *got, *want;
+	unsigned passed = 0, tried = 0;
 	int fail = 0;
 
 	dev = charsiu_open(NULL);
@@ -252,44 +264,89 @@ int main(int argc, char **argv)
 		fprintf(stderr, "no /dev/accel/accel0\n");
 		return 77;
 	}
-	A = malloc((size_t)2 * k);
+	A = malloc((size_t)maxm * k);
 	B = malloc((size_t)n * k);
-	got = malloc((size_t)2 * n * 4);
-	want = malloc((size_t)2 * n * 4);
-	/* ⚠ THE TWO ROWS OF A MUST DIFFER, or m=2 could be right by copying */
-	for (unsigned i = 0; i < k; i++) {
-		A[i]     = (uint8_t)(128 + (int)(i % 7) - 3);
-		A[k + i] = (uint8_t)(128 - (int)(i % 5) + 2);
+	got = malloc((size_t)maxm * n * 4);
+	want = malloc((size_t)maxm * n * 4);
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		return 1;
 	}
+	/*
+	 * ⚠ EVERY ROW OF A MUST DIFFER, or a wide m could be right by copying
+	 * one row over the rest. The stride is coprime with the row length so
+	 * no two rows repeat.
+	 */
+	for (unsigned r = 0; r < maxm; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] =
+				(uint8_t)(128 + (int)((i + 3 * r) % 7) - 3
+					  + (int)(r % 3) - 1);
 	for (unsigned c = 0; c < n; c++)
 		for (unsigned i = 0; i < k; i++)
 			B[(size_t)c * k + i] = (uint8_t)(128 + (int)((c + i) % 9) - 4);
 
 	printf("K=%u N=%u, int8 weights and activations, raw accumulator\n", k, n);
+	printf("%s\n\n", getenv("CHARSIU_M_LEGACY")
+	       ? "CHARSIU_M_LEGACY=1: the input surface block before 2184557"
+	       : "default geometry (0x1094=1, 0x1098=M, 0x118c=0 when M>1)");
 
-	reference(1, k, n, A, B, want);
-	if (run(dev, 1, k, n, A, B, got))
-		fail = 1;
-	else
-		fail |= check("m=1  (the control)", 1, n, got, want);
+	for (unsigned x = 0; x < sizeof(MS) / sizeof(*MS); x++) {
+		unsigned m = MS[x];
+		char what[32];
 
-	if (fail) {
-		printf("\n  m=1 already disagrees, so this test cannot say anything\n"
-		       "  about m=2. Fix the control first.\n");
+		snprintf(what, sizeof(what), "m=%-3u%s", m,
+			 m == 1 ? " (the control)" : "");
+		reference(m, k, n, A, B, want);
+		if (run(dev, m, k, n, A, B, got)) {
+			printf("  %-22s submit failed\n", what);
+			fail = 1;
+			if (m == 1)
+				break;
+			continue;
+		}
+		tried++;
+		if (check(what, m, n, got, want))
+			fail = 1;
+		else
+			passed++;
+
+		/*
+		 * ⚠ m=1 IS THE CONTROL AND NOTHING BELOW IT MEANS ANYTHING.
+		 * If the one width this tree has always run disagrees with the
+		 * CPU, the test is broken and says so rather than blaming a
+		 * field it was built to examine.
+		 */
+		if (m == 1 && fail) {
+			printf("\n  m=1 already disagrees, so this run cannot say\n"
+			       "  anything about m>1. Fix the control first.\n");
+			charsiu_close(dev);
+			return 1;
+		}
+	}
+
+	printf("\n  %u of %u widths exact\n", passed, tried);
+
+	if (passed == tried && tried > 1) {
+		printf("\n  M>1 COMPUTES CORRECTLY. A batched prefill has somewhere\n"
+		       "  to go: at M=32 the same weight bytes serve 32 rows.\n"
+		       "\n  Now run the control, which is what makes this evidence:\n"
+		       "      CHARSIU_M_LEGACY=1 %s %u %u\n"
+		       "  It must FAIL. If it passes, the geometry was never the\n"
+		       "  problem and this result has another cause.\n",
+		       argv[0], k, n);
 		charsiu_close(dev);
-		return 1;
+		return 0;
 	}
 
 	/*
-	 * ⚠ THE ACTIVATION LAYOUT FOR m>1 WAS NEVER DETERMINED. regcmd.c packs
-	 * A behind two knobs, CHARSIU_A_LAYOUT and CHARSIU_A_GRAN, which is
-	 * what a set of candidates looks like rather than a decision. And m=1
-	 * cannot choose between them: at m=1 both formulas collapse to e = kk,
-	 * which is exactly why the control passes and tells us nothing.
-	 *
-	 * So sweep them. One submit each, and a full match is both the answer
-	 * to "does m>1 work" and the layout it wants.
+	 * Only now is the activation layout worth asking about. It was the
+	 * first thing round 379 swept and the wrong first thing: at m=1 both
+	 * formulas collapse to e = kk, so the control could not choose between
+	 * them, and a wrong SURFACE cannot be fixed by any packing of it.
 	 */
+	printf("\n  m>1 is not exact. Sweeping the activation layout at m=2,\n"
+	       "  which is only worth doing now that the geometry is fixed.\n");
 	reference(2, k, n, A, B, want);
 	{
 		static const struct { const char *lay, *gran; } cand[] = {
@@ -299,7 +356,6 @@ int main(int argc, char **argv)
 		};
 		unsigned best = 0, bi = 0;
 
-		printf("\n  sweeping the m>1 activation layout\n");
 		for (unsigned c = 0; c < sizeof(cand) / sizeof(*cand); c++) {
 			unsigned ok = 0;
 			char name[32];
@@ -326,23 +382,21 @@ int main(int argc, char **argv)
 		unsetenv("CHARSIU_A_GRAN");
 
 		if (best == 2 * n) {
-			printf("\n  m=2 COMPUTES CORRECTLY with lay=%s gran=%s.\n"
-			       "  A batched prefill has somewhere to go.\n",
+			printf("\n  m=2 is correct with lay=%s gran=%s -- the geometry\n"
+			       "  needed the layout as well. Re-run the sweep at m=4\n"
+			       "  and m=32 before trusting it.\n",
 			       cand[bi].lay, cand[bi].gran ? cand[bi].gran : "atom");
 			charsiu_close(dev);
-			return 0;
+			return 1;
 		}
-		printf("\n  best was %u of %u; no candidate layout makes m=2 correct.\n",
+		printf("\n  best was %u of %u; no candidate layout makes m=2 correct\n"
+		       "  either, so the surface is still not described right.\n",
 		       best, 2 * n);
-		/* still worth knowing whether the values are merely elsewhere */
 		run(dev, 2, k, n, A, B, got);
 		layouts(2, n, got, want);
-		fail = 1;
 	}
 
-	printf("\n  %s\n", fail
-	       ? "m=2 is NOT usable as it stands: a batched prefill would be wrong."
-	       : "m=2 computes correctly. A batched prefill has somewhere to go.");
+	printf("\n  m>1 is NOT usable as it stands: a batched prefill would be wrong.\n");
 	charsiu_close(dev);
-	return fail;
+	return 1;
 }

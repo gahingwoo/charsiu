@@ -811,7 +811,11 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # every subcommand. Install whatever the source actually has.
 # ⚠ bench_batch too: [debug] enable makes `charsiu bench` reach for it, and a
 # setting that points at a binary nobody installed is a setting that lies.
-for f in charsiu_run charsiu_check charsiu_serve bench_batch; do
+# ⚠ npu_gemm_test as well: it is the only thing that can answer whether the
+# hardware does a matmul with more than one row, which is the whole of prefill,
+# and asking somebody to go find it under ~/.cache is how a board round does
+# not happen.
+for f in charsiu_run charsiu_check charsiu_serve bench_batch npu_gemm_test; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
