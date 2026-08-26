@@ -755,65 +755,52 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1088, job->input_addr);
 	emit(&e, CNA, 0x108c, 0x000f000f);
 	/*
-	 * ⚠⚠ M > 1: THREE REGISTERS THE VENDOR HOLDS STILL AND THIS TREE MOVES.
+	 * ⚠⚠ DO NOT "FIX" THESE FROM THE VENDOR'S .rkllm. Round 380 did, and
+	 * the board said no.
 	 *
-	 * Read out of the vendor's own .rkllm with tools/rkllm_mdiff.py, which
-	 * takes one shape it dispatches at five different M and prints the
-	 * block. At ic=1312 oc=64 fp16, M = 4, 32, 64, 96, 124:
+	 * The reasoning was: the vendor dispatches thousands of ops at M = 2
+	 * to 128, tools/rkllm_mdiff.py shows which registers track M across
+	 * them, and this tree disagrees on three -- 0x1094 (vendor holds it at
+	 * 1), 0x1098 (vendor writes M exactly) and 0x118c (vendor holds it at
+	 * 0). Changing them made no difference at all: m = 2, 4, 8 and 32 were
+	 * as wrong after as before, at both K=256 N=64 and K=2048 N=1024.
 	 *
-	 *              vendor                    this tree
-	 *   0x1028     surf*M | ic-1             same
-	 *   0x102c     M-1                       same
-	 *   0x1034     M-1                       same
-	 *   0x1078     M-1                       same
-	 *   0x1090     0xa4, CONSTANT in M       4, constant
-	 *   0x1094     1,    CONSTANT in M       M          <-- moves
-	 *   0x1098     M,    exactly             (M+3) & ~3 <-- rounds
-	 *   0x118c     0,    CONSTANT in M       M-1        <-- moves
+	 * ⚠ WHAT THE INFERENCE MISSED. Every vendor stream at M > 1 is fp16,
+	 * against the KV cache; its int4 and int8 weight matmuls are M = 1
+	 * without exception, all 3368 of them. Those fp16 ops were never
+	 * identified -- ic=1312 matches no dimension of the model -- so three
+	 * registers were changed on the strength of an op nobody had named.
 	 *
-	 * So M is not the width and not the height: the vendor's inw * inh is
-	 * 1 at every M and the count lives in 0x1098 alone. This tree spread it
-	 * across three registers instead, and every one of them is DEGENERATE
-	 * at M = 1 -- a stride over one row, a count of one, a last index of
-	 * zero -- which is why nine activation layout candidates could all fail
-	 * for a reason no layout could fix.
+	 * ⚠ AND THE VALUES BELOW ARE NOT A GUESS. They are Mesa's generic
+	 * RK3576 encoder, rkt_regcmd.c, with inw = 1 and full_inh = M:
 	 *
-	 * ⚠ THE FIX APPLIES ONLY WHEN M > 1. At M = 1 this stream is byte
-	 * identical to a vendor convolution at the same shape except 0x1098,
-	 * where Mesa's round-to-four is the value proven on this path; decode
-	 * is M = 1 and nothing here may move it. CHARSIU_M_LEGACY restores the
-	 * old arithmetic so a round can show the fault coming back.
+	 *     R_CNA(0x1090, inw * 4);
+	 *     R_CNA(0x1094, inw * full_inh);
+	 *     R_CNA(0x1098, (inw * stg_irows + 3) & ~3u);
+	 *     R_CNA(0x118c, ((inw - 1) << 16) | (full_inh - 1));
 	 *
-	 * ⚠ NOT PROVEN FOR int4 PROJECTIONS. Every vendor stream at M > 1 is
-	 * fp16 attention against the KV cache -- its int4 projections are M = 1
-	 * without exception -- so carrying these three across to a weight
-	 * matmul is an inference from one dtype to another, not a measurement.
-	 * That is exactly what the next board round is for.
+	 * That encoder is the one this board ran M = 1, 2, 3, 4 and 8 through
+	 * EXACTLY, at 512 to 1024, on 2026-08-14. So the two emitters already
+	 * agree on the input surface, one of them computes M > 1 correctly and
+	 * this one does not, and the difference is therefore NOT here. That is
+	 * a better place to be than before the round: the geometry is excluded
+	 * with data rather than assumed.
+	 *
+	 * CHARSIU_CNA_1098 still reaches the one register whose value Mesa
+	 * rounds and regcmd.c does not.
 	 */
-	{
-		int mfix = rows > 1 && !getenv("CHARSIU_M_LEGACY");
-
-		emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
-		emit(&e, CNA, 0x1094, mfix ? 1u : rows);
-		/*
-		 * regcmd.c, the geometry only emitter, has written plain `rows`
-		 * here since it was written. The two emitters disagreeing has
-		 * cost this tree once already -- 0x100c's int4 constant -- and
-		 * the other one was right that time too.
-		 */
-		emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
-		     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
-		     : mfix ? rows : ((rows * 1 + 3) & ~3u));
-	}
+	emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
+	emit(&e, CNA, 0x1094, rows);            /* inw * full_inh */
+	emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
+	     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
+	     : ((rows * 1 + 3) & ~3u));
 	emit(&e, CNA, 0x109c, 0x00000000);
 	emit(&e, CNA, 0x1100, 0x00000000);
 	emit(&e, CNA, 0x1104, 0x00000000);
 	emit(&e, CNA, 0x1110, job->weight_addr);
 	emit(&e, CNA, 0x1140, 0x00000000);
 	emit(&e, CNA, 0x1144, 0x00000000);
-	/* 0 at M = 1 either way; the vendor holds it at 0 for every M. */
-	emit(&e, CNA, 0x118c,
-	     (rows > 1 && !getenv("CHARSIU_M_LEGACY")) ? 0u : rows - 1);
+	emit(&e, CNA, 0x118c, rows - 1);        /* (inw - 1) << 16 is zero */
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to

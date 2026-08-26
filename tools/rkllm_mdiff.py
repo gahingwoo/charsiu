@@ -22,6 +22,20 @@ outright -- no board, no sweep.
     rkllm_mdiff.py <model.rkllm> --all        every register that varies with M
 
 ⚠ NEEDS numpy < 2 on this VM: the 2.x aarch64 wheel dies with SIGILL.
+
+⚠⚠ WHAT THIS TOOL CANNOT TELL YOU, learned by acting on it and being wrong.
+Every vendor stream at M > 1 is fp16, against the KV cache; its int4 and int8
+weight matmuls are M = 1 without exception. The fp16 ops were never identified
+-- ic=1312 matches no dimension of Llama-3.2-1B -- so a register that tracks M
+in them is a register that tracks M in SOME op, not in a weight matmul. Round
+380 changed three of them on that basis and the board computed exactly as
+wrong as before.
+
+The M > 1 emitter to copy is Mesa's, not the vendor's: rkt_regcmd.c's generic
+RK3576 encoder is what this board ran M = 1, 2, 3, 4 and 8 through exactly, and
+charsiu already emits its formula with inw = 1 and full_inh = M. Use this tool
+for what the vendor BATCHES -- which is the strategic finding, and holds -- not
+for how it configures a matmul it never batches.
 """
 import os
 import sys

@@ -16,8 +16,7 @@
  * this test is wrong and says so, rather than blaming a field it was built to
  * examine. Only m=1 passing makes an m=2 failure mean anything.
  *
- *   npu_gemm_test [K] [N]              sweeps M = 1, 2, 4, 8, 32
- *   CHARSIU_M_LEGACY=1 npu_gemm_test  the control: must fail
+ *   npu_gemm_test [K] [N]     sweeps M = 1, 2, 4, 8, 32
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -287,9 +286,18 @@ int main(int argc, char **argv)
 			B[(size_t)c * k + i] = (uint8_t)(128 + (int)((c + i) % 9) - 4);
 
 	printf("K=%u N=%u, int8 weights and activations, raw accumulator\n", k, n);
-	printf("%s\n\n", getenv("CHARSIU_M_LEGACY")
-	       ? "CHARSIU_M_LEGACY=1: the input surface block before 2184557"
-	       : "default geometry (0x1094=1, 0x1098=M, 0x118c=0 when M>1)");
+	/*
+	 * ⚠ SAY WHICH GEOMETRY RAN. Round 380's "control" was typed as
+	 *
+	 *     CHARSIU_M_LEGACY=1
+	 *     /opt/charsiu/npu_gemm_test 256 64
+	 *
+	 * on two lines, which sets a SHELL variable and exports nothing, so the
+	 * binary never saw it and the run was a second copy of the default. The
+	 * line below is the only thing that would have said so.
+	 */
+	printf("geometry: Mesa's generic RK3576 encoder, inw=1 inh=M%s\n\n",
+	       getenv("CHARSIU_CNA_1098") ? " (CHARSIU_CNA_1098 set)" : "");
 
 	for (unsigned x = 0; x < sizeof(MS) / sizeof(*MS); x++) {
 		unsigned m = MS[x];
@@ -329,12 +337,7 @@ int main(int argc, char **argv)
 
 	if (passed == tried && tried > 1) {
 		printf("\n  M>1 COMPUTES CORRECTLY. A batched prefill has somewhere\n"
-		       "  to go: at M=32 the same weight bytes serve 32 rows.\n"
-		       "\n  Now run the control, which is what makes this evidence:\n"
-		       "      CHARSIU_M_LEGACY=1 %s %u %u\n"
-		       "  It must FAIL. If it passes, the geometry was never the\n"
-		       "  problem and this result has another cause.\n",
-		       argv[0], k, n);
+		       "  to go: at M=32 the same weight bytes serve 32 rows.\n");
 		charsiu_close(dev);
 		return 0;
 	}
