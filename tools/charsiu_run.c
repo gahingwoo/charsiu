@@ -605,8 +605,41 @@ int main(int argc, char **argv)
 		produced++;
 		/* ⚠ counted in PRODUCED tokens, not iterations: a control
 		 * token that is not printed still costs a forward pass. */
-		if (!t_half && produced * 2 >= n_gen)
+		if (!t_half && produced * 2 >= n_gen) {
 			t_half = now_ms();
+			/*
+			 * ⚠ AND THE STAGE TABLE FOR THIS HALF, while it still
+			 * describes only this half.
+			 *
+			 * Round 390 measured 17.31 tok/s over the first 32
+			 * tokens and 14.85 over the next 32, on a board that
+			 * COOLED from 53 C to 50 and whose governor was
+			 * already at 2208 MHz. So it is neither heat nor a
+			 * clock -- something in the token grows with the
+			 * context. Attention does, and the averaged table
+			 * accounts for about two of the nine and a half
+			 * milliseconds. One table per half says which stage
+			 * has the other seven, and a table averaged over the
+			 * whole run can never say it.
+			 */
+			/*
+			 * ⚠ ON THE SAME STREAM AS THE TABLE, which is stdout.
+			 * A label on stderr sorts ahead of every table in a
+			 * pipe, because stdout is block buffered there and
+			 * stderr is not -- both labels came out before both
+			 * tables, which is worse than no label at all.
+			 */
+			if (!quiet && getenv("CHARSIU_STAGES")) {
+				printf("\n--- the first %d tokens ---\n",
+				       produced);
+				llama_stages_report();
+				llama_stages_reset();
+				printf("--- and the last %d, whose table is"
+				       " at the end ---\n",
+				       n_gen - produced);
+				fflush(stdout);
+			}
+		}
 next:
 
 		if (st->pos >= st->n_ctx)
