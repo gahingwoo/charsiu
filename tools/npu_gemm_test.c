@@ -212,7 +212,8 @@ static int check(const char *what, unsigned m, unsigned n,
  * writes exactly that many, which is what makes the count a measurement of the
  * strides rather than a symptom.
  */
-static size_t g_live_at_n;   /* words the board wrote at the full N */
+static size_t g_live_at_n;    /* words the board wrote at the full N */
+static size_t g_live_at_m4;   /* and the same at m = 4 */
 
 static size_t addr_range(unsigned n, unsigned m, unsigned R, unsigned S)
 {
@@ -732,10 +733,29 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * The same question at half the width. Two points is the whole
-	 * experiment: a fixed count means a capacity, a fixed fraction means
-	 * an arithmetic error on a stride.
+	 * ⚠ AND THE SAME COUNT AT m=4, because two widths ruled out N and two
+	 * K values have now ruled out K.
+	 *
+	 * K=256 has surf 4 and gave a row stride of 20, which is 5 * surf and
+	 * looked like an answer. K=512 has surf 8 and gave 20 again -- a ratio
+	 * of 2.5, so the stride follows neither N nor K nor the input slice.
+	 * What is left that it could be computed from is m itself, or a
+	 * literal. One more count says which, and a third constraint makes the
+	 * search over-determined rather than merely unique.
 	 */
+	if (n >= 16) {
+		size_t tot4 = (size_t)4 * n, live4 = 0;
+
+		reference(4, k, n, A, B, want);
+		if (!run(dev, 4, k, n, A, B, got)) {
+			for (size_t i = 0; i < tot4; i++)
+				for (size_t q = 0; q < tot4; q++)
+					if (want[q] == got[i]) { live4++; break; }
+			printf("\n  at N=%u, m=4: the board wrote %zu of %zu"
+			       " words\n", n, live4, tot4);
+			g_live_at_m4 = live4;
+		}
+	}
 	if (n >= 16) {
 		unsigned n2 = n / 2;
 		size_t tot2 = (size_t)2 * n2, live = 0;
@@ -772,12 +792,18 @@ int main(int argc, char **argv)
 			{
 				unsigned hits = 0, fr = 0, fs = 0;
 
-				for (unsigned R = 1; R < 128; R++)
-					for (unsigned S = 1; S < 256; S++)
-						if (addr_range(n, 2, R, S) == g_live_at_n &&
-						    addr_range(n2, 2, R, S) == live) {
-							hits++; fr = R; fs = S;
-						}
+				for (unsigned R = 1; R < 256; R++)
+					for (unsigned S = 1; S < 512; S++) {
+						if (addr_range(n, 2, R, S) != g_live_at_n ||
+						    addr_range(n2, 2, R, S) != live)
+							continue;
+						/* the third constraint, when
+						 * the m=4 run produced one */
+						if (g_live_at_m4 &&
+						    addr_range(n, 4, R, S) != g_live_at_m4)
+							continue;
+						hits++; fr = R; fs = S;
+					}
 				if (hits == 1) {
 					struct charsiu_matmul sm = {
 						1, k, n, CHARSIU_INT8,
