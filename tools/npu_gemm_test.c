@@ -388,7 +388,7 @@ static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *wa
  * exactly. 4 stays the default because every correct result in this tree was
  * measured with it; this is the round that asks.
  */
-static int sweep(struct charsiu_device *dev, unsigned ape,
+static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 		 const unsigned *MS, unsigned nms, unsigned k, unsigned n,
 		 const uint8_t *A, const uint8_t *B,
 		 int32_t *got, int32_t *want, unsigned *passed, unsigned *tried)
@@ -398,8 +398,13 @@ static int sweep(struct charsiu_device *dev, unsigned ape,
 
 	snprintf(apes, sizeof(apes), "%u", ape);
 	setenv("CHARSIU_ENTRY_ATOMICS", apes, 1);
-	printf("\n  CHARSIU_ENTRY_ATOMICS=%u  (%s)\n", ape,
-	       ape == 8 ? "Mesa's constant" : "this tree's, and every result so far");
+	if (axis == 'w')
+		setenv("CHARSIU_M_AXIS", "w", 1);
+	else
+		unsetenv("CHARSIU_M_AXIS");
+	printf("\n  M on the %s, CHARSIU_ENTRY_ATOMICS=%u%s\n",
+	       axis == 'w' ? "WIDTH " : "height", ape,
+	       ape == 8 ? "  (Mesa's constant)" : "");
 
 	*passed = *tried = 0;
 	for (unsigned x = 0; x < nms; x++) {
@@ -505,35 +510,48 @@ int main(int argc, char **argv)
 	printf("geometry: Mesa's generic RK3576 encoder, inw=1 inh=M%s\n\n",
 	       getenv("CHARSIU_CNA_1098") ? " (CHARSIU_CNA_1098 set)" : "");
 
+	/*
+	 * ⚠ FOUR CONFIGURATIONS, AND THE AXIS IS THE INTERESTING ONE. Round
+	 * 384's output map showed the second position being spent on output
+	 * CHANNEL c+16 rather than row 1, and 0x4020 -- the DPU's output width
+	 * -- is 0 at every M on the height axis. CHARSIU_M_AXIS=w is Mesa's
+	 * same encoder with inw = ow = M, which tools/mesa_mdiff.py --axis w
+	 * matches word for word.
+	 */
 	{
+		static const struct { unsigned ape; char axis; } CFG[] = {
+			{ 4, 'h' }, { 8, 'h' }, { 4, 'w' }, { 8, 'w' },
+		};
 		unsigned nms = sizeof(MS) / sizeof(*MS);
+		unsigned best_p = 0, best_t = 0, bi = 0;
 
-		fail = sweep(dev, 4, MS, nms, k, n, A, B, got, want,
-			     &passed, &tried);
-		if (fail && tried > 1) {
-			unsigned p8 = 0, t8 = 0;
-			int f8 = sweep(dev, 8, MS, nms, k, n, A, B, got, want,
-				       &p8, &t8);
+		for (unsigned c = 0; c < sizeof(CFG) / sizeof(*CFG); c++) {
+			unsigned p = 0, t = 0;
 
-			if (!f8) {
-				printf("\n  ⚑ MESA'S CONSTANT IS THE ONE.\n"
-				       "  %u of %u widths exact at "
-				       "CHARSIU_ENTRY_ATOMICS=8, and %u of %u "
-				       "at 4.\n"
-				       "  Decode has only ever run with 4, so "
-				       "check tokens before\n"
-				       "  changing the default: "
-				       "CHARSIU_ENTRY_ATOMICS=8 charsiu run ...\n",
-				       p8, t8, passed, tried);
+			fail = sweep(dev, CFG[c].ape, CFG[c].axis, MS, nms,
+				     k, n, A, B, got, want, &p, &t);
+			if (!fail && t > 1) {
+				printf("\n  ⚑ THIS ONE WORKS: M on the %s, "
+				       "CHARSIU_ENTRY_ATOMICS=%u.\n"
+				       "  %u of %u widths exact.\n"
+				       "  ⚠ Decode has only ever run at M = 1 "
+				       "on the height axis with 4,\n"
+				       "  so check TOKENS before changing any "
+				       "default.\n",
+				       CFG[c].axis == 'w' ? "width" : "height",
+				       CFG[c].ape, p, t);
 				charsiu_close(dev);
 				return 0;
 			}
-			printf("\n  8 does not fix it either "
-			       "(%u of %u exact). The geometry now\n"
-			       "  matches Mesa word for word, so what is left "
-			       "is not geometry.\n", p8, t8);
-			passed = p8; tried = t8;
+			if (p > best_p) { best_p = p; best_t = t; bi = c; }
 		}
+		printf("\n  none of the four configurations is exact; best was "
+		       "%u of %u\n  (M on the %s, CHARSIU_ENTRY_ATOMICS=%u).\n",
+		       best_p, best_t, CFG[bi].axis == 'w' ? "width" : "height",
+		       CFG[bi].ape);
+		unsetenv("CHARSIU_M_AXIS");
+		setenv("CHARSIU_ENTRY_ATOMICS", "4", 1);
+		passed = best_p; tried = best_t;
 	}
 	printf("\n  %u of %u widths exact\n", passed, tried);
 

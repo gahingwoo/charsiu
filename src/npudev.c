@@ -1695,6 +1695,29 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			base = (const uint8_t *)e->out[s->di].map +
 			       s->out_slot * g->out_stride;
 
+			/*
+			 * ⚠ THE SLICE'S OWN WIDTH AND OFFSET, which decide how
+			 * far the two loops below walk. The guard above proved
+			 * the base pointer is a real mapping; a garbage n or n0
+			 * walks off the end of it, or off the accumulator, and
+			 * looks exactly the same from outside.
+			 */
+			charsiu_note("a group: a slice's width and offset",
+				     (unsigned long)s->job.mm.n,
+				     (unsigned long)s->n0);
+			if (s->n0 + s->job.mm.n > g->max_n ||
+			    s->job.mm.n > g->nmax ||
+			    (s->out_slot + 1) * (size_t)g->out_stride
+				    > e->out[s->di].size) {
+				fprintf(stderr, "charsiu: slice %u of tensor "
+					"%u wants n0 %u + n %u of %u, slot %u "
+					"of a %zu byte buffer\n",
+					j, i, s->n0, s->job.mm.n, g->max_n,
+					s->out_slot, (size_t)e->out[s->di].size);
+				g->dead = 1;
+				return -1;
+			}
+
 			if (g->w4) {
 				const float *fo = (const float *)base;
 

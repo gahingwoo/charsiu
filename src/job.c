@@ -646,6 +646,14 @@ static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
 	return got;
 }
 
+/* CHARSIU_M_AXIS=w puts the M rows on the width axis instead of the height. */
+static int charsiu_m_axis_w(void)
+{
+	const char *e = getenv("CHARSIU_M_AXIS");
+
+	return e && (*e == 'w' || *e == 'W');
+}
+
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max)
 {
 	size_t vend = emit_vendor_stream(job, out, max);
@@ -654,9 +662,49 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	struct emitter e = { out, max, 0 };
 	struct requant rq = requant_of(job);
 	unsigned n_pad = ALIGN_UP(mm->n, 2);
-	unsigned surf = charsiu_entries_per_row(mm);
-	unsigned rows = mm->m;
-	unsigned lines = rows - 1;              /* the DPU's line count */
+	/*
+	 * ⚠⚠ WHICH AXIS THE M ROWS GO ON, and the board says the current one
+	 * is not producing rows at all.
+	 *
+	 * This tree puts M on the HEIGHT: one column, M rows. Round 384 read
+	 * the whole output buffer back at m=2 and fitted the address function
+	 * to it, 35 of 35 unique cells with no misses:
+	 *
+	 *     flat = (v/4)*8 + (u%2)*4 + (v%4) + (u/2)*40,  c = 16u + v
+	 *
+	 * The (u%2)*4 term is the slot a [n/4][m][4] surface reserves for ROW
+	 * 1, and what lands in it is CHANNEL c + 16 of row 0. Sixteen is the
+	 * int8 feature atom. So the hardware is spending the second position
+	 * on the next atom of OUTPUT CHANNELS, and row 1 is absent everywhere
+	 * -- eight sampled channels of it, all missing, against a reference
+	 * with 121 distinct values in 128.
+	 *
+	 * The register that says so is 0x4020, the DPU's output width, which
+	 * this tree writes as ow - 1 = 0 at every M. The DPU is told its
+	 * output is one position wide, so one position is what it writes.
+	 *
+	 * CHARSIU_M_AXIS=w moves M to the width, which is Mesa's own generic
+	 * encoder with inw = ow = M and the heights at 1. tools/mesa_mdiff.py
+	 * --axis w prints the eleven words that changes and they are exactly
+	 * the ones that carry an axis. M = 1 is IDENTICAL either way, so decode
+	 * cannot move: the default stays the height until a board round says
+	 * otherwise.
+	 */
+	unsigned wide = mm->m > 1 && charsiu_m_axis_w();
+	unsigned inw = wide ? mm->m : 1;
+	unsigned irows = wide ? 1 : mm->m;
+	unsigned ow = inw;
+	struct charsiu_matmul surfmm = *mm;
+	unsigned surf;
+	unsigned rows = irows;
+	unsigned lines = (wide ? ow : rows) - 1;   /* the DPU's line count */
+
+	/*
+	 * ⚠ surf IS PER SLICE OF THE INPUT SURFACE, so it counts inw columns.
+	 * charsiu_entries_per_row() hard codes one column, which is right for
+	 * the height axis and undercounts by exactly inw for the width one.
+	 */
+	surf = charsiu_entries_per_row(&surfmm) * inw;
 	size_t wbytes = charsiu_weight_bytes(mm);
 	int w4a16 = 0, w4_dpu = 0;
 	unsigned wide8 = 0;
@@ -718,7 +766,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
 	emit(&e, CNA, 0x1024, n_pad - 1);
 	emit(&e, CNA, 0x1028, ((surf * rows) << 16) | (charsiu_k_eff(mm) - 1));
-	emit(&e, CNA, 0x102c, rows - 1);        /* (width - 1) << 16 is zero */
+	emit(&e, CNA, 0x102c, ((inw - 1) << 16) | (rows - 1));
 	/*
 	 * Bytes per kernel, DOUBLED for int8 and not for int4.
 	 *
@@ -729,8 +777,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	emit(&e, CNA, 0x1030,
 	     ((uint32_t)(wbytes / n_pad * (mm->wdtype == CHARSIU_INT4 ? 1u : 2u))
-	      << 16) | 0);
-	emit(&e, CNA, 0x1034, rows - 1);
+	      << 16) | (ow - 1));
+	emit(&e, CNA, 0x1034, ow * rows - 1);
 	/* Mesa writes 0x1038 a SECOND time here, after the geometry and before
 	 * the surface stride, and that is the only ordering difference the
 	 * stream diff had left. Matched rather than reasoned about: the value is
@@ -742,13 +790,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     (surf << 16) | (job->cbuf_window == 1 ? 0x1c00u : 0u));
 	emit(&e, CNA, 0x1040,
 	     job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u);
-	emit(&e, CNA, 0x1044, (1u << 16) | surf);
+	emit(&e, CNA, 0x1044, (inw << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);
 	emit(&e, CNA, 0x104c, 0x00010001);
 	emit(&e, CNA, 0x1050, 0x00010001);
 	for (r = 0x1054; r <= 0x1074; r += 4)
 		emit(&e, CNA, r, 0x00000000);
-	emit(&e, CNA, 0x1078, rows - 1);
+	emit(&e, CNA, 0x1078, ((inw - 1) << 16) | (rows - 1));
 	emit(&e, CNA, 0x107c, charsiu_k_eff(mm) - 1);
 	emit(&e, CNA, 0x1080, 0x00000000);      /* a matmul has no padding */
 	emit(&e, CNA, 0x1084, 0x00000000);
@@ -789,18 +837,18 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * CHARSIU_CNA_1098 still reaches the one register whose value Mesa
 	 * rounds and regcmd.c does not.
 	 */
-	emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
-	emit(&e, CNA, 0x1094, rows);            /* inw * full_inh */
+	emit(&e, CNA, 0x1090, inw * 4);
+	emit(&e, CNA, 0x1094, inw * rows);      /* inw * full_inh */
 	emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
 	     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
-	     : ((rows * 1 + 3) & ~3u));
+	     : ((inw * rows + 3) & ~3u));
 	emit(&e, CNA, 0x109c, 0x00000000);
 	emit(&e, CNA, 0x1100, 0x00000000);
 	emit(&e, CNA, 0x1104, 0x00000000);
 	emit(&e, CNA, 0x1110, job->weight_addr);
 	emit(&e, CNA, 0x1140, 0x00000000);
 	emit(&e, CNA, 0x1144, 0x00000000);
-	emit(&e, CNA, 0x118c, rows - 1);        /* (inw - 1) << 16 is zero */
+	emit(&e, CNA, 0x118c, ((inw - 1) << 16) | (rows - 1));
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
@@ -889,7 +937,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 			  !getenv("CHARSIU_W4_BITPAT");
 
 		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
-		emit(&e, CORE, 0x301c, w4v ? lines : ((uint32_t)lines << 16));
+		emit(&e, CORE, 0x301c,
+		     wide ? ((uint32_t)(rows - 1) << 16) | (ow - 1)
+			  : (w4v ? lines : ((uint32_t)lines << 16)));
 	}
 	/*
 	 * ⚠ int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
@@ -1068,9 +1118,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4010, WIDE(0) ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
-	emit(&e, DPU, 0x401c, rows);            /* ow * full_oh */
-	emit(&e, DPU, 0x4020, 0x00000000);      /* ow - 1 */
-	emit(&e, DPU, 0x4024, lines);
+	emit(&e, DPU, 0x401c, ow * rows);       /* ow * full_oh */
+	emit(&e, DPU, 0x4020, ow - 1);
+	emit(&e, DPU, 0x4024, wide ? rows - 1 : lines);
 	emit(&e, DPU, 0x4028, 0x00000000);
 	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
 					     and it changed nothing */
@@ -1092,7 +1142,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     (uint32_t)(getenv("CHARSIU_DPU_4030")
 			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
 			: (WIDE(1) ? 0x0310u : 0x0710u)));
-	emit(&e, DPU, 0x4034, (lines << 16) | 0);
+	emit(&e, DPU, 0x4034, wide ? (((uint32_t)(rows - 1) << 16) | (ow - 1))
+				   : ((lines << 16) | 0));
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
 	 * here, but those are elementwise ops rather than convolutions, so it
 	 * is a candidate to sweep and not a value to copy. */
@@ -1171,8 +1222,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * trend: bytes written 112, 160, 208, 256, 208, 128, 64 and elements
 	 * exact 4, 8, 12, 64, 16, 16, 16 at 0, 1, 2, 3, 4, 7, 15.
 	 */
+	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
 	emit(&e, DPU, 0x40b8, (job->acc_out || charsiu_w4_paired(&job->mm)) ? 3u
-					   : (uint32_t)(1 * (2 * rows - rows)));
+					   : (uint32_t)(ow * (2 * rows - rows)));
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
 	emit(&e, DPU, 0x40c8, 0x00000000);
