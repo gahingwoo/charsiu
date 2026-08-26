@@ -67,7 +67,8 @@ int main(int argc, char **argv)
 	struct seen seen[64];
 	unsigned nseen = 0;
 	char arch[64] = "", name[128] = "";
-	int bad_types = 0, bad_arch = 0;
+	int bad_types = 0, bad_graph = 0, bad_tok = 0;
+	char tokmodel[64] = "";
 	unsigned long j;
 
 	for (i = 1; i < argc; i++) {
@@ -110,8 +111,29 @@ int main(int argc, char **argv)
 	 * final_logit_softcapping 30.0 and a 4096 sliding window, and phi3
 	 * fuses QKV into one tensor and gate+up into another.
 	 */
-	if (strcmp(arch, "llama") && strcmp(arch, "qwen2"))
-		bad_arch = 1;
+	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") && strcmp(arch, "phi3"))
+		bad_graph = 1;
+
+	/*
+	 * ⚠ THE GRAPH IS NOT THE ONLY THING THAT HAS TO MATCH. charsiu's
+	 * tokenizer is BPE and needs a merge table; a file that declares
+	 * tokenizer.ggml.model = llama carries SentencePiece scores instead and
+	 * will load its weights and then fail to turn text into tokens.
+	 * Measured on Phi-3.5-mini, which is why this check exists: the
+	 * architecture passed, the tensors split correctly, and it still could
+	 * not read a prompt. Saying so here saves a 2 GB download.
+	 */
+	{
+		char *tok = tokmodel;
+
+		gguf_get_str(&g, "tokenizer.ggml.model", tok, 64);
+		if (tok[0] && strcmp(tok, "gpt2") && !gguf_find(&g, "tokenizer.ggml.merges")) {
+			if (!quiet)
+				printf("tokenizer     %s   <-- charsiu's is BPE, "
+				       "with a merge table\n", tok);
+			bad_tok = 1;
+		}
+	}
 
 	for (j = 0; j < g.n_tensors; j++) {
 		uint32_t t = g.t[j].type;
@@ -135,8 +157,11 @@ int main(int argc, char **argv)
 	}
 
 	if (quiet) {
-		if (bad_arch)
-			printf("NO arch=%s (charsiu only builds a llama graph)\n", arch);
+		if (bad_graph)
+			printf("NO arch=%s (charsiu builds llama, qwen2 and phi3)\n", arch);
+		else if (bad_tok)
+			printf("NO tokenizer=%s (charsiu's is BPE, with a merge table)\n",
+			       tokmodel);
 		else if (bad_types) {
 			for (i = 0; (unsigned)i < nseen; i++)
 				if (!seen[i].ok) {
@@ -151,13 +176,13 @@ int main(int argc, char **argv)
 			printf("OK %s %s\n", arch, name[0] ? name : "-");
 		}
 		gguf_close(&g);
-		return bad_arch || bad_types ? 1 : 0;
+		return bad_graph || bad_types || bad_tok ? 1 : 0;
 	}
 
 	printf("file          %s\n", path);
 	printf("name          %s\n", name[0] ? name : "(unnamed)");
 	printf("architecture  %s%s\n", arch[0] ? arch : "(missing)",
-	       bad_arch ? "   <-- charsiu only builds a llama graph" : "");
+	       bad_graph ? "   <-- charsiu builds llama, qwen2 and phi3" : "");
 	printf("gguf          v%u, %llu tensors\n", g.version,
 	       (unsigned long long)g.n_tensors);
 	printf("tensor types\n");
@@ -171,11 +196,11 @@ int main(int argc, char **argv)
 		       seen[i].ok ? "charsiu reads this"
 				  : "NOT one charsiu reads");
 	}
-	if (bad_arch || bad_types)
+	if (bad_graph || bad_types || bad_tok)
 		printf("\nVERDICT  charsiu CANNOT run this file.\n");
 	else
 		printf("\nVERDICT  charsiu can run this file.\n");
 
 	gguf_close(&g);
-	return bad_arch || bad_types ? 1 : 0;
+	return bad_graph || bad_types || bad_tok ? 1 : 0;
 }

@@ -779,6 +779,28 @@ static const struct gguf_tensor *need(const struct gguf *g, const char *name)
 	return t && t->nbytes ? t : NULL;
 }
 
+/*
+ * A row range of a row-major tensor, without copying: rows are contiguous and
+ * every quantised type here has a fixed number of bytes per row, so a slice is
+ * the same data pointer moved forward with fewer rows.
+ */
+static int subtensor(struct gguf_tensor *dst, const struct gguf_tensor *src,
+		     uint64_t row0, uint64_t nrows)
+{
+	uint64_t per;
+
+	if (!src || !src->ne[1] || src->nbytes % src->ne[1])
+		return -1;
+	per = src->nbytes / src->ne[1];
+	if (row0 + nrows > src->ne[1])
+		return -1;
+	*dst = *src;
+	dst->ne[1] = nrows;
+	dst->data = (const uint8_t *)src->data + row0 * per;
+	dst->nbytes = nrows * per;
+	return 0;
+}
+
 int llama_load(struct llama_model *m, const char *path)
 {
 	char arch[64] = "llama";
@@ -805,7 +827,8 @@ int llama_load(struct llama_model *m, const char *path)
 	 * final_logit_softcapping 30.0 and a 4096 sliding window, and phi3
 	 * fuses QKV into one tensor and gate+up into another.
 	 */
-	if (strcmp(arch, "llama") && strcmp(arch, "qwen2")) {
+	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
+	    strcmp(arch, "phi3")) {
 		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
 		goto fail;
 	}
@@ -874,6 +897,18 @@ int llama_load(struct llama_model *m, const char *path)
 		m->output = m->tok_embd;
 
 	m->rope_freqs = gguf_tensor(&m->gguf, "rope_freqs.weight");
+	/*
+	 * ⚠ phi3 CALLS THEM SOMETHING ELSE, and has two sets: short factors for
+	 * a context within its original 4096 and long ones beyond. rope_table
+	 * already divides theta by factor[i] over hd/2, which is exactly the
+	 * 48 floats phi3 stores, so the short set plugs straight in.
+	 *
+	 * ⚠ Only the short set. A context past the original length wants the
+	 * long one and would be wrong here; charsiu's default is 2048 and this
+	 * refuses to pretend otherwise.
+	 */
+	if (!m->rope_freqs)
+		m->rope_freqs = gguf_tensor(&m->gguf, "rope_factors_short.weight");
 	if (m->rope_freqs && !m->rope_freqs->nbytes)
 		m->rope_freqs = NULL;
 
@@ -890,9 +925,37 @@ int llama_load(struct llama_model *m, const char *path)
 			goto fail;                                       \
 	} while (0)
 		T(attn_norm, "attn_norm");
-		T(wq, "attn_q");
-		T(wk, "attn_k");
-		T(wv, "attn_v");
+		if (!strcmp(arch, "phi3")) {
+			const struct gguf_tensor *qkv, *fu;
+			uint64_t hq = (uint64_t)m->n_head * m->head_dim;
+			uint64_t hk = (uint64_t)m->n_head_kv * m->head_dim;
+
+			snprintf(key, sizeof(key), "blk.%u.attn_qkv.weight", l);
+			qkv = need(&m->gguf, key);
+			snprintf(key, sizeof(key), "blk.%u.ffn_up.weight", l);
+			fu = need(&m->gguf, key);
+			if (!qkv || !fu)
+				goto fail;
+			/* q, then k, then v; gate, then up */
+			if (subtensor(&L->split[0], qkv, 0, hq) ||
+			    subtensor(&L->split[1], qkv, hq, hk) ||
+			    subtensor(&L->split[2], qkv, hq + hk, hk) ||
+			    subtensor(&L->split[3], fu, 0, m->n_ff) ||
+			    subtensor(&L->split[4], fu, m->n_ff, m->n_ff)) {
+				fprintf(stderr, "llama: %s will not split into "
+					"q k v and gate up\n", qkv->name);
+				goto fail;
+			}
+			L->wq = &L->split[0];
+			L->wk = &L->split[1];
+			L->wv = &L->split[2];
+			L->gate = &L->split[3];
+			L->up = &L->split[4];
+		} else {
+			T(wq, "attn_q");
+			T(wk, "attn_k");
+			T(wv, "attn_v");
+		}
 		T(wo, "attn_output");
 		/* optional: llama has none, qwen2 has all three */
 #define B(field, suffix) do {                                            \
@@ -906,8 +969,10 @@ int llama_load(struct llama_model *m, const char *path)
 		B(bv, "attn_v");
 #undef B
 		T(ffn_norm, "ffn_norm");
-		T(gate, "ffn_gate");
-		T(up, "ffn_up");
+		if (strcmp(arch, "phi3")) {
+			T(gate, "ffn_gate");
+			T(up, "ffn_up");
+		}
 		T(down, "ffn_down");
 #undef T
 	}

@@ -316,6 +316,13 @@ struct llama_layer {
 	const struct gguf_tensor *bq, *bk, *bv;
 	const struct gguf_tensor *ffn_norm;
 	const struct gguf_tensor *gate, *up, *down;
+	/*
+	 * ⚠ phi3 STACKS ITS PROJECTIONS: one attn_qkv holding q, k and v, and
+	 * one ffn_up holding gate and up. A row range of a row-major tensor is
+	 * contiguous, so the halves are the same bytes at an offset -- these
+	 * are the descriptors the pointers above are aimed at, not copies.
+	 */
+	struct gguf_tensor split[5];
 };
 
 struct llama_model {
