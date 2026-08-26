@@ -778,13 +778,42 @@ int main(int argc, char **argv)
 						    addr_range(n2, 2, R, S) == live) {
 							hits++; fr = R; fs = S;
 						}
-				if (hits == 1)
+				if (hits == 1) {
+					struct charsiu_matmul sm = {
+						1, k, n, CHARSIU_INT8,
+						CHARSIU_INT8
+					};
+					unsigned surf =
+						charsiu_entries_per_row(&sm);
+
 					printf("\n  ⚑ exactly one stride pair"
 					       " reproduces both counts:\n"
 					       "  row stride %u, block stride"
 					       " %u -- an injective surface"
 					       " needs %u and %u at N=%u.\n",
 					       fr, fs, 2 * n / 4, 4 * n / 4, n);
+					/*
+					 * ⚠ AND surf BESIDE IT, because the
+					 * whole question is what the wrong
+					 * stride was computed FROM. It does
+					 * not move with N -- two widths said
+					 * so -- and surf is the obvious thing
+					 * that does not either: it depends on
+					 * K alone. At K=256 surf is 4 and the
+					 * row stride is 20, which is 5 * surf.
+					 * Running this at another K is the
+					 * one-line test of that: if the stride
+					 * follows surf it is computed from the
+					 * INPUT slice, and if it stays at 20
+					 * it is a constant.
+					 */
+					printf("  surf at K=%u is %u, so the"
+					       " row stride is %.2f * surf;"
+					       " re-run at\n  another K to see"
+					       " whether that ratio holds.\n",
+					       k, surf,
+					       surf ? (double)fr / surf : 0.0);
+				}
 				else
 					printf("\n  %u stride pairs fit both"
 					       " counts; not pinned.\n", hits);
