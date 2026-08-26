@@ -238,6 +238,70 @@ static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *wa
 	return 0;
 }
 
+/*
+ * One pass of the M sweep. `ape` is CHARSIU_ENTRY_ATOMICS: how many channel
+ * atoms this tree thinks fit in a CBUF entry.
+ *
+ * ⚠ 4 IS WHAT THIS TREE HAS ALWAYS SAID AND 8 IS WHAT MESA SAYS. Same
+ * function, one constant apart -- rkt_task.c divides by CBUF_ENTRY_SIZE /
+ * FEATURE_ATOMIC_SIZE = 128/16 = 8. With 8, charsiu's stream agrees with
+ * Mesa's generic RK3576 encoder on ALL 25 geometry words at M = 1, 2, 4 and
+ * 32, at every shape tried; with 4 it differs on the three that carry `surf`,
+ * and surf enters 0x1028 as `surf * rows`, so the error scales with M.
+ *
+ * Mesa's encoder is the one this board ran M = 1, 2, 3, 4 and 8 through
+ * exactly. 4 stays the default because every correct result in this tree was
+ * measured with it; this is the round that asks.
+ */
+static int sweep(struct charsiu_device *dev, unsigned ape,
+		 const unsigned *MS, unsigned nms, unsigned k, unsigned n,
+		 const uint8_t *A, const uint8_t *B,
+		 int32_t *got, int32_t *want, unsigned *passed, unsigned *tried)
+{
+	char apes[8];
+	int fail = 0;
+
+	snprintf(apes, sizeof(apes), "%u", ape);
+	setenv("CHARSIU_ENTRY_ATOMICS", apes, 1);
+	printf("\n  CHARSIU_ENTRY_ATOMICS=%u  (%s)\n", ape,
+	       ape == 8 ? "Mesa's constant" : "this tree's, and every result so far");
+
+	*passed = *tried = 0;
+	for (unsigned x = 0; x < nms; x++) {
+		unsigned m = MS[x];
+		char what[32];
+
+		snprintf(what, sizeof(what), "m=%-3u%s", m,
+			 m == 1 ? " (the control)" : "");
+		reference(m, k, n, A, B, want);
+		if (run(dev, m, k, n, A, B, got)) {
+			printf("  %-22s submit failed\n", what);
+			fail = 1;
+			if (m == 1)
+				break;
+			continue;
+		}
+		(*tried)++;
+		if (check(what, m, n, got, want))
+			fail = 1;
+		else
+			(*passed)++;
+
+		/*
+		 * ⚠ m=1 IS THE CONTROL AND NOTHING BELOW IT MEANS ANYTHING. If
+		 * the one width this tree has always run disagrees with the
+		 * CPU, the pass is broken and says so rather than blaming a
+		 * field it was built to examine.
+		 */
+		if (m == 1 && fail) {
+			printf("      m=1 disagrees, so this pass says nothing "
+			       "about m>1\n");
+			break;
+		}
+	}
+	return fail;
+}
+
 int main(int argc, char **argv)
 {
 	/*
@@ -299,40 +363,36 @@ int main(int argc, char **argv)
 	printf("geometry: Mesa's generic RK3576 encoder, inw=1 inh=M%s\n\n",
 	       getenv("CHARSIU_CNA_1098") ? " (CHARSIU_CNA_1098 set)" : "");
 
-	for (unsigned x = 0; x < sizeof(MS) / sizeof(*MS); x++) {
-		unsigned m = MS[x];
-		char what[32];
+	{
+		unsigned nms = sizeof(MS) / sizeof(*MS);
 
-		snprintf(what, sizeof(what), "m=%-3u%s", m,
-			 m == 1 ? " (the control)" : "");
-		reference(m, k, n, A, B, want);
-		if (run(dev, m, k, n, A, B, got)) {
-			printf("  %-22s submit failed\n", what);
-			fail = 1;
-			if (m == 1)
-				break;
-			continue;
-		}
-		tried++;
-		if (check(what, m, n, got, want))
-			fail = 1;
-		else
-			passed++;
+		fail = sweep(dev, 4, MS, nms, k, n, A, B, got, want,
+			     &passed, &tried);
+		if (fail && tried > 1) {
+			unsigned p8 = 0, t8 = 0;
+			int f8 = sweep(dev, 8, MS, nms, k, n, A, B, got, want,
+				       &p8, &t8);
 
-		/*
-		 * ⚠ m=1 IS THE CONTROL AND NOTHING BELOW IT MEANS ANYTHING.
-		 * If the one width this tree has always run disagrees with the
-		 * CPU, the test is broken and says so rather than blaming a
-		 * field it was built to examine.
-		 */
-		if (m == 1 && fail) {
-			printf("\n  m=1 already disagrees, so this run cannot say\n"
-			       "  anything about m>1. Fix the control first.\n");
-			charsiu_close(dev);
-			return 1;
+			if (!f8) {
+				printf("\n  ⚑ MESA'S CONSTANT IS THE ONE.\n"
+				       "  %u of %u widths exact at "
+				       "CHARSIU_ENTRY_ATOMICS=8, and %u of %u "
+				       "at 4.\n"
+				       "  Decode has only ever run with 4, so "
+				       "check tokens before\n"
+				       "  changing the default: "
+				       "CHARSIU_ENTRY_ATOMICS=8 charsiu run ...\n",
+				       p8, t8, passed, tried);
+				charsiu_close(dev);
+				return 0;
+			}
+			printf("\n  8 does not fix it either "
+			       "(%u of %u exact). The geometry now\n"
+			       "  matches Mesa word for word, so what is left "
+			       "is not geometry.\n", p8, t8);
+			passed = p8; tried = t8;
 		}
 	}
-
 	printf("\n  %u of %u widths exact\n", passed, tried);
 
 	if (passed == tried && tried > 1) {

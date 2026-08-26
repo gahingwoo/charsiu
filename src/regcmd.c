@@ -94,15 +94,53 @@ enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm)
 	return mm->adtype;
 }
 
+/*
+ * How many channel atoms fit in one CBUF entry.
+ *
+ * ⚠ MESA SAYS EIGHT AND THIS TREE HAS ALWAYS SAID FOUR. Same function, same
+ * shape, one constant apart: rkt_task.c's calc_entries_per_slice() divides by
+ * CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE = 128 / 16 = 8, and this divides by 4,
+ * which is a 64 byte entry.
+ *
+ * At K=256 int8 that is 16 atoms, so Mesa gets surf = 2 and this gets 4 --
+ * exactly double, at every K that is a multiple of eight atoms. surf is not a
+ * decorative number: it goes into 0x1028 as `surf * rows`, so at M = 1 the
+ * error is a factor of two on one word the hardware evidently tolerates, and
+ * at M = 32 it is a factor of two on the stride between thirty two staged
+ * rows. Every row after the first would then be read from the wrong place,
+ * which produces WRONG VALUES rather than misplaced ones -- and the board's
+ * m>1 output is wrong values: only 27% of the wanted numbers appear anywhere
+ * in it.
+ *
+ * Mesa's generic RK3576 encoder is the one this board ran M = 1, 2, 3, 4 and 8
+ * through exactly. The default stays 4 because that is what every correct
+ * result in this tree was measured with; CHARSIU_ENTRY_ATOMICS=8 is the
+ * question, and npu_gemm_test asks it.
+ */
+/*
+ * ⚠ NOT CACHED IN A STATIC. npu_gemm_test sweeps this between phases in one
+ * process, and a value latched on the first matmul would make the second phase
+ * a silent copy of the first -- which is exactly how round 380's control ran
+ * twice with the same geometry and nobody noticed until the log was read.
+ */
+static unsigned entry_atomics(void)
+{
+	const char *e = getenv("CHARSIU_ENTRY_ATOMICS");
+	int v = e ? atoi(e) : 4;
+
+	return (v == 8) ? 8u : 4u;
+}
+
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm)
 {
 	unsigned atom = charsiu_feature_atom(charsiu_effective_adtype(mm));
+	unsigned ape = entry_atomics();
 	unsigned total = DIV_ROUND_UP(mm->k, atom);
-	unsigned last = total % 4;
+	unsigned last = total % ape;
 	unsigned width = 1;             /* one column, always */
 
-	return (total / 4) * width +
-	       (last == 3 ? width : DIV_ROUND_UP(last * width, 4));
+	return (total / ape) * width +
+	       (last == 3 ? width : DIV_ROUND_UP(last * width, ape));
 }
 
 unsigned charsiu_k_eff(const struct charsiu_matmul *mm)
