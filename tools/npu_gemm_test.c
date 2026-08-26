@@ -416,7 +416,9 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 				if (seen) { live++; last = i + 1; }
 			}
 			printf("  the board wrote %zu of %zu words, the last at"
-			       " %zu (%.0f%%)\n", live, total, last,
+			       " %zu (%.0f%%)\n\n"
+			       "  how many words each extra row is worth:\n",
+			       live, total, last,
 			       100.0 * (double)live / (double)total);
 			g_live_at_n = live;
 		}
@@ -743,18 +745,42 @@ int main(int argc, char **argv)
 	 * literal. One more count says which, and a third constraint makes the
 	 * search over-determined rather than merely unique.
 	 */
-	if (n >= 16) {
-		size_t tot4 = (size_t)4 * n, live4 = 0;
+	/*
+	 * ⚠⚠ THE SERIES IN m, WHICH IS WHAT THE COUNTS ACTUALLY FIT.
+	 *
+	 *     N=64 m=2   92 of 128     N=32 m=2   52 of  64
+	 *     N=64 m=4  148 of 256
+	 *
+	 * written = N + inc * (m - 1), with inc = 28 at N=64 and 20 at N=32.
+	 * Three points, exact, and the m part is exact on three of them: the
+	 * FIRST row gets all N words and every row after it gets 28, not
+	 * another 64.
+	 *
+	 * That is not a stride. A stride puts values in the wrong place and
+	 * this leaves them uncomputed; a shape like "one row whole and the
+	 * rest a fixed share" is a BUDGET being divided. Mesa bounds exactly
+	 * this -- rkt_task.c splits a task's staged rows when
+	 * (cbuf_rows + staged) * entries_per_slice > total_entries -- and
+	 * charsiu submits all m rows as one task and never checks.
+	 *
+	 * So extend the series. If it stays linear the increment is the number
+	 * to explain; if it flattens, something saturates and the cap is the
+	 * number. m=8 predicts 260 of 512 on the linear reading.
+	 */
+	for (unsigned mm = 2; mm <= 8 && n >= 16; mm *= 2) {
+		size_t tot = (size_t)mm * n, livem = 0;
 
-		reference(4, k, n, A, B, want);
-		if (!run(dev, 4, k, n, A, B, got)) {
-			for (size_t i = 0; i < tot4; i++)
-				for (size_t q = 0; q < tot4; q++)
-					if (want[q] == got[i]) { live4++; break; }
-			printf("\n  at N=%u, m=4: the board wrote %zu of %zu"
-			       " words\n", n, live4, tot4);
-			g_live_at_m4 = live4;
-		}
+		reference(mm, k, n, A, B, want);
+		if (run(dev, mm, k, n, A, B, got))
+			continue;
+		for (size_t i = 0; i < tot; i++)
+			for (size_t q = 0; q < tot; q++)
+				if (want[q] == got[i]) { livem++; break; }
+		printf("  at N=%u, m=%-2u: wrote %4zu of %4zu, so %4.0f words"
+		       " a row after the first\n", n, mm, livem, tot,
+		       mm > 1 ? (double)(livem - n) / (mm - 1) : 0.0);
+		if (mm == 4)
+			g_live_at_m4 = livem;
 	}
 	if (n >= 16) {
 		unsigned n2 = n / 2;
@@ -765,8 +791,8 @@ int main(int argc, char **argv)
 			for (size_t i = 0; i < tot2; i++)
 				for (size_t q = 0; q < tot2; q++)
 					if (want[q] == got[i]) { live++; break; }
-			printf("\n  at N=%u, m=2: the board wrote %zu of %zu"
-			       " words (%.0f%%)\n", n2, live, tot2,
+			printf("  at N=%u, m=2 : wrote %4zu of %4zu"
+			       " (%.0f%%)\n", n2, live, tot2,
 			       100.0 * (double)live / (double)tot2);
 			printf("  against N=%u: the same COUNT would be a"
 			       " capacity, the same PERCENTAGE a stride.\n", n);
