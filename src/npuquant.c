@@ -589,6 +589,20 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	t->wsum = malloc((size_t)n * sizeof(int32_t));
 	row = malloc((size_t)k * sizeof(float));
 	if (!t->q || !t->scale || !t->wsum || !row) {
+		/*
+		 * ⚠ SAY WHICH TENSOR AND HOW MUCH. This returns -1 into a
+		 * caller that returns NULL into a matvec that quietly runs on
+		 * the CPU, so a tensor whose quantised copy would not fit
+		 * looked exactly like a tensor nobody had asked to route.
+		 *
+		 * The copy is one BYTE a weight whatever the bit width -- the
+		 * nibbles are packed later, in npudev -- so an output head is
+		 * 302 MB here even at four bits.
+		 */
+		fprintf(stderr, "charsiu: %s stays on the CPU -- its %llu x %llu "
+			"quantised copy needs %.0f MB and would not allocate\n",
+			w->name, (unsigned long long)n, (unsigned long long)k,
+			(double)((size_t)n * k) / 1e6);
 		free(row);
 		npu_tensor_free(t);
 		return -1;

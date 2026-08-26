@@ -610,13 +610,20 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 		if (s->npu_key[i] == w)
 			return &s->npu[i];
 
-	if (s->n_npu == s->npu_cap)
+	if (s->n_npu == s->npu_cap) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: %s stays on the CPU -- all %u "
+				"tensor slots are taken\n", w->name, s->npu_cap);
 		return NULL;
+	}
 	/*
 	 * ⚠ w->name IS INSIDE THE MAPPED FILE for a whole tensor and inside
 	 * the layer for one of phi3's slices; both outlive a crash.
 	 */
 	charsiu_note(w->name, (unsigned long)w->ne[1], (unsigned long)w->ne[0]);
+	/* npu_tensor_build says why on its own way out */
 	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0)
 		return NULL;
 	/*
@@ -630,8 +637,30 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 		const char *only = getenv("CHARSIU_NPU_ONLY");
 
 		if ((!only || strstr(w->name, only)) &&
-		    w->ne[1] <= (uint64_t)npu_maxn())
+		    w->ne[1] <= (uint64_t)npu_maxn()) {
 			s->npu_id[s->n_npu] = charsiu_npu_add(s->dev, &s->npu[s->n_npu]);
+		} else if (!only && w->ne[1] > (uint64_t)npu_maxn()) {
+			/*
+			 * ⚠ THE ONE REFUSAL THAT COST THE MOST AND SAID THE
+			 * LEAST. Every other way onto the hardware whines when
+			 * it declines; this one only spoke under
+			 * CHARSIU_NPU_VERBOSE, and it is the gate the output
+			 * head hits -- gemma3's is 262144 rows against a
+			 * default of 8192, and the runner's own default of
+			 * 131072 still refuses it. That head is 44% of the
+			 * token, and the board log for a round that set
+			 * CHARSIU_NPU_MAXN on purpose carried no line saying
+			 * the number had not arrived.
+			 */
+			static int said;
+
+			if (!said++)
+				fprintf(stderr, "charsiu: %s stays on the CPU "
+					"-- %llu rows is over CHARSIU_NPU_MAXN=%u "
+					"(charsiu-config, [npu] maxn)\n",
+					w->name,
+					(unsigned long long)w->ne[1], npu_maxn());
+		}
 		if (getenv("CHARSIU_NPU_VERBOSE"))
 			fprintf(stderr, "  -> %s\n",
 				s->npu_id[s->n_npu] >= 0 ? "on the NPU" : "on the CPU");
