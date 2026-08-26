@@ -331,6 +331,8 @@ struct llama_model {
 
 	uint32_t n_embd, n_layer, n_head, n_head_kv, n_ff, n_vocab;
 	uint32_t head_dim, n_ctx_train;
+	/* which of the two RoPE pairings this file's weights were saved for */
+	int rope_neox;
 	float rms_eps, rope_base;
 
 	const struct gguf_tensor *tok_embd;

@@ -704,10 +704,19 @@ static void softmax(float *x, int n)
 }
 
 /*
- * RoPE, the interleaved form: element 2i and element 2i+1 of a head are one
- * complex number. llama.cpp's convert step permutes Q and K so this is the
- * right pairing for a gguf, even though the HF checkpoint it came from pairs
- * i with i + d/2 instead.
+ * RoPE, in BOTH pairings, because a gguf can want either and the wrong one is
+ * not a crash.
+ *
+ * The HF checkpoints pair element i of a head with element i + d/2. For llama
+ * and smollm3 the convert step PERMUTES Q and K so that pairing becomes the
+ * interleaved (2i, 2i+1) one, and the runtime rotates interleaved. For qwen2
+ * and phi3 it does not permute, so the runtime has to rotate halves.
+ *
+ * ⚠ THE WRONG PAIRING STILL PRODUCES WORDS. Every element is still rotated by
+ * an angle from the right table, just partnered with the wrong neighbour, so
+ * the output stays inside the model's vocabulary and reads as English -- it
+ * just loses track of position and repeats. That is what "the the capital of
+ * of France" was: not a broken norm, a rotation against the wrong partner.
  */
 /*
  * ONE ANGLE TABLE A TOKEN, NOT ONE A HEAD A LAYER.
@@ -749,18 +758,21 @@ static void add_bias(float *y, const struct gguf_tensor *b, uint32_t n)
 		y[i] += v[i];
 }
 
-static void rope(float *v, uint32_t nheads, uint32_t hd, const float *cs)
+static void rope(float *v, uint32_t nheads, uint32_t hd, const float *cs,
+		 int neox)
 {
 	for (uint32_t h = 0; h < nheads; h++) {
 		float *p = v + h * hd;
 
 		for (uint32_t i = 0; i < hd / 2; i++) {
 			float c = cs[2 * i], s = cs[2 * i + 1];
-			float x0 = p[2 * i];
-			float x1 = p[2 * i + 1];
+			uint32_t a = neox ? i : 2 * i;
+			uint32_t b = neox ? i + hd / 2 : 2 * i + 1;
+			float x0 = p[a];
+			float x1 = p[b];
 
-			p[2 * i]     = x0 * c - x1 * s;
-			p[2 * i + 1] = x0 * s + x1 * c;
+			p[a] = x0 * c - x1 * s;
+			p[b] = x0 * s + x1 * c;
 		}
 	}
 }
@@ -874,6 +886,25 @@ int llama_load(struct llama_model *m, const char *path)
 	if (m->head_dim & 1) {
 		fprintf(stderr, "llama: an odd head dimension has no rope pairing\n");
 		goto fail;
+	}
+	/*
+	 * ⚠ BY ARCHITECTURE, and there is no key in the file that says it --
+	 * llama.cpp carries the same thing as a switch over the architecture
+	 * enum. llama and smollm3 are the permuted, interleaved ones; qwen2
+	 * and phi3 are not.
+	 */
+	m->rope_neox = !strcmp(arch, "qwen2") || !strcmp(arch, "phi3");
+	/*
+	 * The control. The two pairings are the whole difference between
+	 * "Paris. It is the largest city in France" and "a country in the
+	 * world. The capital of the world", and a round that wants to see that
+	 * for itself should not have to rebuild.
+	 */
+	{
+		const char *e = getenv("CHARSIU_ROPE_NEOX");
+
+		if (e)
+			m->rope_neox = atoi(e);
 	}
 
 	/*
@@ -1461,8 +1492,8 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		}
 		STAGE(ST_QKV);
 
-		rope(s->q, m->n_head, hd, ropecs);
-		rope(s->k, m->n_head_kv, hd, ropecs);
+		rope(s->q, m->n_head, hd, ropecs, m->rope_neox);
+		rope(s->k, m->n_head_kv, hd, ropecs, m->rope_neox);
 
 		/*
 		 * ⚠ HEAD MAJOR: [layer][kv head][position][head dim].
