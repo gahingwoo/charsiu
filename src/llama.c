@@ -294,6 +294,64 @@ static void *worker(void *arg)
  * wants is its call, and a wrong guess baked in as a default would be a
  * regression nobody could see.
  */
+/*
+ * ⚠ SAY WHAT THE CORES WERE DOING, because a tokens-per-second number is not
+ * comparable without it.
+ *
+ * Round 389 measured 15.91 tok/s where an earlier board run on a different
+ * rootfs had 17.1 at the same model, and the difference could not be attributed
+ * to anything: the governor, the clock and the token count were in none of the
+ * logs. Eighty percent of this token is the NPU sitting on the DRAM roof and
+ * cannot move, so the whole question is about the twelve milliseconds the CPU
+ * spends -- and a core parked at half its clock is a bigger effect than
+ * anything in that twelve.
+ *
+ * One read of sysfs at startup. If the files are not there, say nothing rather
+ * than pretend.
+ */
+static void cpu_clock_report(const cpu_set_t *set)
+{
+	char path[128], gov[32] = "";
+	long khz = 0;
+	int first = -1;
+
+	for (int c = 0; c < CPU_SETSIZE && first < 0; c++)
+		if (CPU_ISSET((size_t)c, set))
+			first = c;
+	if (first < 0)
+		return;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", first);
+	{
+		FILE *f = fopen(path, "r");
+
+		if (f) {
+			if (fgets(gov, sizeof(gov), f)) {
+				char *nl = strchr(gov, '\n');
+
+				if (nl)
+					*nl = 0;
+			}
+			fclose(f);
+		}
+	}
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", first);
+	{
+		FILE *f = fopen(path, "r");
+
+		if (f) {
+			if (fscanf(f, "%ld", &khz) != 1)
+				khz = 0;
+			fclose(f);
+		}
+	}
+	if (gov[0] || khz)
+		fprintf(stderr, "charsiu: cpu%d governor %s, %ld MHz\n",
+			first, gov[0] ? gov : "(unknown)", khz / 1000);
+}
+
 static void cpus_pin(void)
 {
 	const char *spec = getenv("CHARSIU_CPUS");
@@ -326,6 +384,7 @@ static void cpus_pin(void)
 	else
 		fprintf(stderr, "charsiu: pinned to CPUs %s, %d of them\n",
 			spec, CPU_COUNT(&set));
+	cpu_clock_report(&set);
 }
 
 static void pool_start(int nthreads)
