@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "charsiu.h"
 
@@ -168,6 +169,75 @@ static int check(const char *what, unsigned m, unsigned n,
 	return bad != 0;
 }
 
+/*
+ * ⚠ "WRONG" AND "SOMEWHERE ELSE" ARE DIFFERENT ANSWERS, and only one of them
+ * means m>1 is unusable. The first m=2 run had its first four outputs exactly
+ * right and then diverged, which is what a layout looks like rather than an
+ * arithmetic fault. So before concluding anything, ask whether the numbers are
+ * all THERE.
+ */
+static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *want)
+{
+	size_t total = (size_t)m * n;
+	static const unsigned G[] = { 2, 4, 8, 16, 32 };
+	unsigned best = 0;
+	const char *bestname = NULL;
+
+	/* are the values even present, in any order? */
+	{
+		int32_t *a = malloc(total * 4), *b = malloc(total * 4);
+		size_t i, j, hit = 0;
+
+		memcpy(a, got, total * 4);
+		memcpy(b, want, total * 4);
+		for (i = 0; i < total; i++)
+			for (j = 0; j < total; j++)
+				if (b[j] == a[i]) { b[j] = INT32_MIN; hit++; break; }
+		printf("\n  as a multiset: %zu of %zu values are present somewhere\n",
+		       hit, total);
+		free(a); free(b);
+	}
+
+	/* [n][m] instead of [m][n] */
+	{
+		unsigned ok = 0;
+
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++)
+				if (got[(size_t)c * m + r] == want[(size_t)r * n + c]) ok++;
+		if (ok > best) { best = ok; bestname = "[n][m], column major"; }
+	}
+
+	/* [n/G][m][G]: G output channels, then the rows, then the next G */
+	for (unsigned gi = 0; gi < sizeof(G) / sizeof(*G); gi++) {
+		unsigned g = G[gi], ok = 0;
+
+		if (n % g)
+			continue;
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++) {
+				size_t off = (size_t)(c / g) * m * g + (size_t)r * g + (c % g);
+
+				if (off < total && got[off] == want[(size_t)r * n + c]) ok++;
+			}
+		if (ok > best) {
+			static char nm[48];
+
+			snprintf(nm, sizeof(nm), "[n/%u][m][%u]", g, g);
+			best = ok; bestname = nm;
+		}
+	}
+
+	printf("  best layout tried: %s, %u of %zu\n",
+	       bestname ? bestname : "(none)", best, total);
+	if (best == total) {
+		printf("\n  THE ARITHMETIC IS RIGHT. Only the output layout differs\n"
+		       "  from [m][n]; m>1 is usable once the reader matches it.\n");
+		return 1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 256;
@@ -211,10 +281,13 @@ int main(int argc, char **argv)
 	}
 
 	reference(2, k, n, A, B, want);
-	if (run(dev, 2, k, n, A, B, got))
+	if (run(dev, 2, k, n, A, B, got)) {
 		fail = 1;
-	else
+	} else {
 		fail |= check("m=2  (the question)", 2, n, got, want);
+		if (fail)
+			fail = !layouts(2, n, got, want);
+	}
 
 	printf("\n  %s\n", fail
 	       ? "m=2 is NOT usable as it stands: a batched prefill would be wrong."
