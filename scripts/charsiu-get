@@ -20,7 +20,9 @@
 #   ...-Q4_0_4_4.gguf   measured: type 31 in 210 tensors. A Q4_0 REPACKED for
 #                       ARM dotprod: same block size, interleaved weights.
 #   ...-Q4_K_M.gguf     measured: type 6 (q5_0) in 166 tensors, among others.
-#   Qwen2.5-*.gguf      measured: architecture qwen2. Loads nothing here.
+#   gemma-2-*.gguf      measured: architecture gemma2, and it declares
+#                       attn_logit_softcapping 50.0 and a 4096 sliding window,
+#                       which are behaviours and not weights.
 #
 # So every download is verified by charsiu_check, which uses the RUNTIME's own
 # gguf parser, so the gate cannot drift from what will actually load. A file that
@@ -86,6 +88,8 @@ llama3.2-1b-q4|bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_0.g
 llama3.2-1b-q8|bartowski/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q8_0.gguf|1321|THE ONE EVERY BOARD ROUND USES
 llama3.2-1b-q4_1|unsloth/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_1.gguf|832|
 llama3.2-3b-q4|bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_0.gguf|1922|check the card has room
+qwen2.5-1.5b-q4|bartowski/Qwen2.5-1.5B-Instruct-GGUF|Qwen2.5-1.5B-Instruct-Q4_0.gguf|894|answers better than the 1B llamas
+qwen2.5-coder-1.5b-q4|bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF|Qwen2.5-Coder-1.5B-Instruct-Q4_0.gguf|894|the same size, tuned for code
 ZOO
 }
 
@@ -93,7 +97,6 @@ ZOO
 # instead of arriving after a gigabyte. Architecture read from the file header.
 known_bad() {
 cat <<'BAD'
-qwen|qwen2|measured: Qwen2.5-1.5B-Instruct declares architecture qwen2
 gemma|gemma2|measured: gemma-2-2b-it declares architecture gemma2
 phi|phi3|measured: Phi-3.5-mini-instruct declares architecture phi3
 BAD
@@ -136,11 +139,11 @@ free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
 list_zoo() {
 	printf '\n%sModels verified to load on charsiu%s   (into %s)\n\n' \
 		"$C_G" "$C_0" "$MODELS_DIR"
-	printf '  %-19s %7s  %s\n' NAME SIZE WHERE
+	printf '  %-22s %7s  %s\n' NAME SIZE WHERE
 	zoo | while IFS='|' read -r n repo file mb note; do
 		have=""
 		[ -f "$MODELS_DIR/$file" ] && have=" ${C_G}[have]${C_0}"
-		printf '  %-19s %6sM  %s%s\n' "$n" "$mb" "$repo" "$have"
+		printf '  %-22s %6sM  %s%s\n' "$n" "$mb" "$repo" "$have"
 		[ -n "$note" ] && printf '  %-19s %7s  %s%s%s\n' "" "" "$C_D" "$note" "$C_0"
 	done
 	printf '\n%sNot runnable, whatever the file says%s\n' "$C_Y" "$C_0"
