@@ -189,6 +189,26 @@ static void silu_mul(float *hb, const float *hb2, uint32_t n)
 	}
 }
 
+/*
+ * hb = gelu(hb) * hb2, which is the same join with gemma's activation.
+ *
+ * ⚠ THE TANH APPROXIMATION, not the exact erf one. ggml's GGML_OP_GELU is the
+ * tanh form and that is what the gemma files were quantised against; the two
+ * differ by about 1e-3 in the middle of the range, which is small and is not
+ * nothing when it is applied 3072 times a layer.
+ */
+static void gelu_mul(float *hb, const float *hb2, uint32_t n)
+{
+	const float k = 0.7978845608028654f;   /* sqrt(2/pi) */
+
+	for (uint32_t i = 0; i < n; i++) {
+		float g = hb[i];
+
+		g = 0.5f * g * (1.0f + tanhf(k * (g + 0.044715f * g * g * g)));
+		hb[i] = g * hb2[i];
+	}
+}
+
 /* ---- a fixed pool, so a token is not 144 thread creations ---------------- */
 
 struct pool {
@@ -897,7 +917,7 @@ int llama_load(struct llama_model *m, const char *path)
 	 * sliding window, none of which this graph does.
 	 */
 	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
-	    strcmp(arch, "qwen3") &&
+	    strcmp(arch, "qwen3") && strcmp(arch, "gemma3") &&
 	    strcmp(arch, "phi3") && strcmp(arch, "smollm3")) {
 		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
 		goto fail;
@@ -958,7 +978,7 @@ int llama_load(struct llama_model *m, const char *path)
 	 * qwen3 and phi3 are not.
 	 */
 	m->rope_neox = !strcmp(arch, "qwen2") || !strcmp(arch, "qwen3") ||
-		       !strcmp(arch, "phi3");
+		       !strcmp(arch, "gemma3") || !strcmp(arch, "phi3");
 	/*
 	 * The control. The two pairings are the whole difference between
 	 * "Paris. It is the largest city in France" and "a country in the
@@ -970,6 +990,89 @@ int llama_load(struct llama_model *m, const char *path)
 
 		if (e)
 			m->rope_neox = atoi(e);
+	}
+
+	/*
+	 * ---- what gemma3 adds, all of it optional and absent elsewhere ----
+	 *
+	 * Read out of the file rather than switched on the architecture name
+	 * wherever the file says it: a gemma3 with no sliding_window key is a
+	 * full attention model and this makes it one.
+	 */
+	m->embd_scale = 1.0f;
+	/*
+	 * ⚠ 10000, NOT rope_base, WHEN THE FILE DOES NOT SAY. gemma-3-1b-it
+	 * carries sliding_window but no rope.freq_base_swa, and llama.cpp's
+	 * gemma3 path -- unlike its gemma2, olmo2 and cohere2 paths -- does
+	 * NOT seed the field from the model's own base first, so it keeps the
+	 * struct default of 10000. That is the documented Gemma 3 design: the
+	 * local layers rotate at 10k and the global ones at 1M. Defaulting to
+	 * rope_base instead is invisible over a short prompt, where theta is
+	 * small either way, and diverges as the context grows.
+	 */
+	m->rope_base_swa = 10000.0f;
+#define GETU(suffix, dst, dflt) do {                                    \
+		snprintf(key, sizeof(key), "%s." suffix, arch);          \
+		if (gguf_get_u32(&m->gguf, key, &v))                     \
+			v = (dflt);                                      \
+		(dst) = v;                                               \
+	} while (0)
+#define GETF(suffix, dst, dflt) do {                                    \
+		snprintf(key, sizeof(key), "%s." suffix, arch);          \
+		if (gguf_get_f32(&m->gguf, key, &f))                     \
+			f = (dflt);                                      \
+		(dst) = f;                                               \
+	} while (0)
+	GETU("attention.sliding_window", m->n_swa, 0);
+	/*
+	 * ⚠ THE PATTERN COUNTS FROM THE WINDOW LAYERS. llama.cpp's
+	 * set_swa_pattern is `il % n < n - 1`, so with the gemma default of 6
+	 * layers 0..4 slide and layer 5 sees everything -- five windows and a
+	 * full one, not one window in six.
+	 */
+	GETU("attention.sliding_window_pattern", m->swa_pattern, 6);
+	GETF("rope.freq_base_swa", m->rope_base_swa, 10000.0f);
+	GETF("final_logit_softcapping", m->final_softcap, 0.0f);
+#undef GETU
+#undef GETF
+	if (!m->n_swa)
+		m->swa_pattern = 0;
+	/*
+	 * The controls, and they are real ones. CHARSIU_SWA=0 makes every
+	 * layer a full one; a large CHARSIU_SWA_PATTERN makes every layer a
+	 * window one, because the rule is `l % P < P - 1` and no layer index
+	 * reaches P - 1. The second is what tells a long-context result apart
+	 * from luck: with all 26 layers windowed to 512 there is no path for a
+	 * fact 950 tokens back, so a run that still answers was never using
+	 * the window in the first place.
+	 */
+	{
+		const char *e = getenv("CHARSIU_SWA");
+
+		if (e) {
+			m->n_swa = (uint32_t)atoi(e);
+			if (!m->n_swa)
+				m->swa_pattern = 0;
+			else if (!m->swa_pattern)
+				m->swa_pattern = 6;
+		}
+		e = getenv("CHARSIU_SWA_PATTERN");
+		if (e && m->n_swa)
+			m->swa_pattern = (uint32_t)atoi(e);
+	}
+	if (!strcmp(arch, "gemma3")) {
+		/*
+		 * ⚠ sqrt(n_embd) ON THE EMBEDDING, and it is not a detail: at
+		 * n_embd 1152 it is a factor of 34, so leaving it out feeds
+		 * the first norm a vector 34 times too small.
+		 *
+		 * The norm GAINS need no such treatment. Gemma stores them as
+		 * (w - 1) and the convert step adds the 1 back -- see
+		 * conversion/gemma.py -- so what is in the gguf is already the
+		 * gain this code multiplies by.
+		 */
+		m->embd_scale = sqrtf((float)m->n_embd);
+		m->ffn_gelu = 1;
 	}
 
 	/*
@@ -1085,6 +1188,8 @@ int llama_load(struct llama_model *m, const char *path)
 	} while (0)
 		OW(q_norm, "attn_q_norm");
 		OW(k_norm, "attn_k_norm");
+		OW(attn_post_norm, "post_attention_norm");
+		OW(ffn_post_norm, "post_ffw_norm");
 #undef OW
 		if (!L->q_norm != !L->k_norm) {
 			fprintf(stderr, "llama: layer %u norms one of q and k "
@@ -1387,6 +1492,11 @@ struct attn_job {
 	struct llama_state *s;
 	uint32_t l;
 	int pos;
+	/*
+	 * The OLDEST position this layer may look at. 0 on a full layer, which
+	 * is every layer of every architecture but gemma3's window ones.
+	 */
+	int t0;
 	uint32_t hd, kvdim, gqa, nkv;
 	float scale;
 };
@@ -1416,7 +1526,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 	const struct attn_job *j = vj;
 	struct llama_state *s = j->s;
 	uint32_t hd = j->hd, gqa = j->gqa, nkv = j->nkv;
-	int pos = j->pos;
+	int pos = j->pos, t0 = j->t0;
 	uint64_t h = h0, end = h0 + nh;
 	const float *kbase, *vbase;
 	size_t kstride;
@@ -1462,7 +1572,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 		n = (unsigned)(g1 - g0);
 		h = g1;
 
-		for (int t = 0; t <= pos; t++) {
+		for (int t = t0; t <= pos; t++) {
 			const float *kt = kbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
@@ -1502,11 +1612,18 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 		}
 
 		for (q = 0; q < n; q++) {
-			softmax(s->att + (size_t)(g0 + q) * s->n_ctx, pos + 1);
+			/*
+			 * ⚠ SOFTMAX OVER THE WINDOW, not over the cache. The
+			 * positions before t0 were never scored, so including
+			 * them would normalise against whatever the buffer
+			 * happens to hold from an earlier token.
+			 */
+			softmax(s->att + (size_t)(g0 + q) * s->n_ctx + t0,
+				pos + 1 - t0);
 			memset(s->xb + (g0 + q) * hd, 0, hd * sizeof(float));
 		}
 
-		for (int t = 0; t <= pos; t++) {
+		for (int t = t0; t <= pos; t++) {
 			const float *vt = vbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
@@ -1551,7 +1668,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	uint32_t gqa = m->n_head / m->n_head_kv;
 	float scale = 1.0f / sqrtf((float)hd);
 	static float *freqbuf;
-	static float *ropecs;
+	static float *ropecs, *ropecs_swa;
 	const float *freqf = NULL;
 
 	double t0, t1;
@@ -1575,12 +1692,39 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	if (!ropecs)
 		ropecs = calloc(hd, sizeof(float));
 	rope_table(ropecs, hd, pos, m->rope_base, freqf);
+	/*
+	 * The second table exists only when the two bases differ, which is
+	 * gemma3 and nothing else. Both are still one table a TOKEN, not one a
+	 * layer: theta depends on the base, the pair and the position.
+	 */
+	if (m->swa_pattern && m->rope_base_swa != m->rope_base) {
+		if (!ropecs_swa)
+			ropecs_swa = calloc(hd, sizeof(float));
+		rope_table(ropecs_swa, hd, pos, m->rope_base_swa, freqf);
+	}
 
 	gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
+	if (m->embd_scale != 1.0f)
+		for (uint32_t i = 0; i < m->n_embd; i++)
+			s->x[i] *= m->embd_scale;
 	STAGE(ST_EMBD);
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
+		/*
+		 * ⚠ `il % n < n - 1` IS THE PATTERN, taken from llama.cpp's
+		 * set_swa_pattern: with the gemma default of 6 that is five
+		 * window layers and then a full one, not one window in six.
+		 */
+		int swa = m->swa_pattern &&
+			  (l % m->swa_pattern) < m->swa_pattern - 1;
+		const float *cs = swa && ropecs_swa ? ropecs_swa : ropecs;
+		/*
+		 * A window layer may look at the last n_swa positions
+		 * INCLUDING this one: llama.cpp masks when pos - t >= n_swa.
+		 */
+		int t0 = swa && pos + 1 > (int)m->n_swa ?
+			 pos + 1 - (int)m->n_swa : 0;
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 		STAGE(ST_NORM1);
@@ -1611,8 +1755,8 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		}
 		STAGE(ST_QKV);
 
-		rope(s->q, m->n_head, hd, ropecs, m->rope_neox);
-		rope(s->k, m->n_head_kv, hd, ropecs, m->rope_neox);
+		rope(s->q, m->n_head, hd, cs, m->rope_neox);
+		rope(s->k, m->n_head_kv, hd, cs, m->rope_neox);
 
 		/*
 		 * ⚠ HEAD MAJOR: [layer][kv head][position][head dim].
@@ -1650,7 +1794,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_ROPE);
 
 		{
-			struct attn_job aj = { s, l, pos, hd, kvdim, gqa,
+			struct attn_job aj = { s, l, pos, t0, hd, kvdim, gqa,
 					       m->n_head_kv, scale };
 
 			/*
@@ -1679,6 +1823,14 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 		matvec(s, L->wo, s->xb, s->xb2);
 		STAGE(ST_WO);
+		/*
+		 * ⚠ ON THE BRANCH, BEFORE THE RESIDUAL ADD. Normalising after
+		 * the add would normalise the residual stream as well, which
+		 * is a different model.
+		 */
+		if (L->attn_post_norm)
+			rmsnorm(s->xb2, s->xb2, L->attn_post_norm, m->n_embd,
+				m->rms_eps);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
 		STAGE(ST_RES1);
@@ -1687,10 +1839,16 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_NORM2);
 		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
 		STAGE(ST_GATEUP);
-		silu_mul(s->hb, s->hb2, m->n_ff);
+		if (m->ffn_gelu)
+			gelu_mul(s->hb, s->hb2, m->n_ff);
+		else
+			silu_mul(s->hb, s->hb2, m->n_ff);
 		STAGE(ST_SILU);
 		matvec(s, L->down, s->hb, s->xb2);
 		STAGE(ST_DOWN);
+		if (L->ffn_post_norm)
+			rmsnorm(s->xb2, s->xb2, L->ffn_post_norm, m->n_embd,
+				m->rms_eps);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
 		STAGE(ST_RES2);
@@ -1699,6 +1857,16 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	rmsnorm(s->xb, s->x, m->out_norm, m->n_embd, m->rms_eps);
 	STAGE(ST_NORMF);
 	matvec(s, m->output, s->xb, s->logits);
+	/*
+	 * Squash the logits into (-c, c) with a tanh. gemma2 does this to the
+	 * attention scores as well; gemma3 caps only the output, and the files
+	 * measured leave even that off, so this is here for the ones that
+	 * declare it rather than as something every gemma needs.
+	 */
+	if (m->final_softcap > 0.0f)
+		for (uint32_t i = 0; i < m->n_vocab; i++)
+			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
+				       m->final_softcap;
 	STAGE(ST_HEAD);
 	if (stage_on)
 		stage_tok++;

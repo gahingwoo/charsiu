@@ -185,7 +185,8 @@ int main(int argc, char **argv)
 	 * above; the others are unchanged, and an explicit --sys wins over both.
 	 */
 	if (!sys)
-		sys = (fmt == CHAT_PHI3) ? "" : "You are a helpful assistant.";
+		sys = (fmt == CHAT_PHI3 || fmt == CHAT_GEMMA) ?
+		      "" : "You are a helpful assistant.";
 
 	if (show_info) {
 		printf("file        %s\n", path);

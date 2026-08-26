@@ -452,7 +452,17 @@ enum chat_fmt chat_format_of(const struct tokenizer *tk)
 	/* phi3: <|user|> ... <|end|> and no header markers at all */
 	if (tokenizer_find(tk, "<|end|>") >= 0 &&
 	    tokenizer_find(tk, "<|assistant|>") >= 0) return CHAT_PHI3;
+	if (tokenizer_find(tk, "<start_of_turn>") >= 0) return CHAT_GEMMA;
 	return CHAT_LLAMA3;
+}
+
+/*
+ * ⚠ GEMMA CALLS THE ASSISTANT "model", and a turn opened with the word
+ * "assistant" is a turn the model has never seen.
+ */
+static const char *gemma_role(const char *role)
+{
+	return strcmp(role, "assistant") ? role : "model";
 }
 
 size_t chat_turn(char *out, size_t max, enum chat_fmt f,
@@ -468,6 +478,21 @@ size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 		return 0;
 	}
 
+	/*
+	 * ⚠ GEMMA HAS NO SYSTEM ROLE AT ALL. Its template alternates user and
+	 * model and nothing else; Google's own rendering folds a system
+	 * message into the first user turn. Writing a third role would hand
+	 * the model a marker sequence it has never seen, which is the phi3
+	 * lesson again, so this drops it -- and charsiu_run does not offer a
+	 * default system message for this format in the first place.
+	 */
+	if (f == CHAT_GEMMA) {
+		if (!strcmp(role, "system"))
+			return 0;
+		return (size_t)snprintf(out, max,
+			"<start_of_turn>%s\n%s<end_of_turn>\n",
+			gemma_role(role), text);
+	}
 	if (f == CHAT_PHI3)
 		return (size_t)snprintf(out, max, "<|%s|>\n%s<|end|>\n", role, text);
 	if (f == CHAT_CHATML)
@@ -479,6 +504,9 @@ size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 
 size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
 {
+	if (f == CHAT_GEMMA)
+		return (size_t)snprintf(out, max, "<start_of_turn>%s\n",
+					gemma_role(role));
 	if (f == CHAT_PHI3)
 		return (size_t)snprintf(out, max, "<|%s|>\n", role);
 	if (f == CHAT_CHATML)
@@ -490,6 +518,7 @@ size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
 size_t chat_close(char *out, size_t max, enum chat_fmt f)
 {
 	return (size_t)snprintf(out, max,
+				f == CHAT_GEMMA  ? "<end_of_turn>\n" :
 				f == CHAT_PHI3   ? "<|end|>\n" :
 				f == CHAT_CHATML ? "<|im_end|>\n" : "<|eot_id|>");
 }

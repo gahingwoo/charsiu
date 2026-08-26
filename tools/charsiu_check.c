@@ -108,12 +108,13 @@ int main(int argc, char **argv)
 	 * qwen2 runs on the llama graph -- same nine weights a layer, tied
 	 * output head, plus a bias on Q, K and V. qwen3 drops those biases and
 	 * adds a norm on Q and K. phi3 fuses QKV into one tensor and gate+up
-	 * into another. gemma2 is none of these and is refused, not over tensor
-	 * names: it declares attn_logit_softcapping 50.0, final_logit_softcapping
-	 * 30.0 and a 4096 sliding window.
+	 * into another. gemma3 adds a sliding window, a second norm on each
+	 * branch and GELU. gemma2 is still refused: it softcaps the ATTENTION
+	 * scores as well as the logits, which is a third thing this graph does
+	 * not do.
 	 */
 	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
-	    strcmp(arch, "qwen3") &&
+	    strcmp(arch, "qwen3") && strcmp(arch, "gemma3") &&
 	    strcmp(arch, "phi3") && strcmp(arch, "smollm3"))
 		bad_graph = 1;
 
@@ -167,8 +168,8 @@ int main(int argc, char **argv)
 
 	if (quiet) {
 		if (bad_graph)
-			printf("NO arch=%s (charsiu builds llama, qwen2, qwen3, phi3 and smollm3)\n",
-			       arch);
+			printf("NO arch=%s (charsiu builds llama, qwen2, qwen3,"
+			       " gemma3, phi3 and smollm3)\n", arch);
 		else if (bad_tok)
 			printf("NO tokenizer=%s (charsiu's is BPE, with a merge table)\n",
 			       tokmodel);
@@ -193,7 +194,7 @@ int main(int argc, char **argv)
 	printf("name          %s\n", name[0] ? name : "(unnamed)");
 	printf("architecture  %s%s\n", arch[0] ? arch : "(missing)",
 	       bad_graph ? "   <-- charsiu builds llama, qwen2, qwen3, "
-			   "phi3 and smollm3" : "");
+			   "gemma3, phi3 and smollm3" : "");
 	printf("gguf          v%u, %llu tensors\n", g.version,
 	       (unsigned long long)g.n_tensors);
 	printf("tensor types\n");

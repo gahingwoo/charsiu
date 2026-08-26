@@ -280,7 +280,7 @@ const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
  * tokenizer.chat_template, which is far more than this can run, but the
  * markers themselves are tokens, so ask the vocabulary which family it is.
  */
-enum chat_fmt { CHAT_LLAMA3 = 0, CHAT_CHATML = 1, CHAT_PHI3 = 2 };
+enum chat_fmt { CHAT_LLAMA3 = 0, CHAT_CHATML = 1, CHAT_PHI3 = 2, CHAT_GEMMA = 3 };
 enum chat_fmt chat_format_of(const struct tokenizer *tk);
 /* one complete turn */
 size_t chat_turn(char *out, size_t max, enum chat_fmt f,
@@ -323,6 +323,13 @@ struct llama_layer {
 	 * NULL on llama, qwen2 and phi3, which have neither.
 	 */
 	const struct gguf_tensor *q_norm, *k_norm;
+	/*
+	 * ⚠ gemma NORMALISES THE BRANCH, NOT JUST THE INPUT TO IT. These sit
+	 * between the projection and the residual add -- after attn_output and
+	 * after ffn_down -- which is a second norm a layer that no llama has.
+	 * NULL everywhere else.
+	 */
+	const struct gguf_tensor *attn_post_norm, *ffn_post_norm;
 	const struct gguf_tensor *ffn_norm;
 	const struct gguf_tensor *gate, *up, *down;
 	/*
@@ -350,6 +357,26 @@ struct llama_model {
 	uint32_t n_embd_attn;
 	/* which of the two RoPE pairings this file's weights were saved for */
 	int rope_neox;
+
+	/*
+	 * Sliding window attention, gemma3's shape of it: most layers see only
+	 * the last n_swa positions and every swa_pattern'th one sees all of
+	 * them. n_swa 0 means every layer is a full one, which is every
+	 * architecture before this.
+	 *
+	 * ⚠ The two kinds of layer also ROTATE DIFFERENTLY. A window layer
+	 * uses rope_base_swa (10000 in the files measured) and a full one
+	 * rope_base (1000000), so a token needs two angle tables, not one.
+	 */
+	uint32_t n_swa, swa_pattern;
+	float rope_base_swa;
+
+	/* logits -> tanh(logits / c) * c. 0 turns it off. */
+	float final_softcap;
+	/* the embedding is multiplied by this on the way in. 1 turns it off. */
+	float embd_scale;
+	/* gemma's feed forward is GELU where llama's is SiLU */
+	int ffn_gelu;
 	float rms_eps, rope_base;
 
 	const struct gguf_tensor *tok_embd;
