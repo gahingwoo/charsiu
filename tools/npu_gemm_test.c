@@ -767,6 +767,19 @@ int main(int argc, char **argv)
 	 * to explain; if it flattens, something saturates and the cap is the
 	 * number. m=8 predicts 260 of 512 on the linear reading.
 	 */
+	for (unsigned nn = n / 2; nn >= 16 && nn > n / 5; nn /= 2) {
+		size_t tot = (size_t)2 * nn, livem = 0;
+
+		reference(2, k, nn, A, B, want);
+		if (run(dev, 2, k, nn, A, B, got))
+			continue;
+		for (size_t i = 0; i < tot; i++)
+			for (size_t q = 0; q < tot; q++)
+				if (want[q] == got[i]) { livem++; break; }
+		printf("  at N=%u, m=2 : wrote %4zu of %4zu, so %4.0f words"
+		       " a row after the first\n", nn, livem, tot,
+		       (double)(livem - nn));
+	}
 	for (unsigned mm = 2; mm <= 8 && n >= 16; mm *= 2) {
 		size_t tot = (size_t)mm * n, livem = 0;
 
@@ -782,6 +795,34 @@ int main(int argc, char **argv)
 		if (mm == 4)
 			g_live_at_m4 = livem;
 	}
+	/*
+	 * ⚠⚠ THE PREDICTION THIS WHOLE SERIES MAKES, AND IT CAN FAIL.
+	 *
+	 * The budget per extra row measured 28 words at N=64 and 20 at N=32,
+	 * which is N/4 + 12 through both. A row needs N. The two meet at
+	 * N = 16, so at sixteen output channels and narrower every row gets
+	 * everything it needs and m>1 should be EXACT -- the first correct
+	 * batched matmul this project has seen.
+	 *
+	 * If it is exact, the deficit is an output allowance that grows too
+	 * slowly with N and the hardware was never the problem. If it is not,
+	 * "a budget divided between rows" is the wrong reading of three counts
+	 * that happened to fit a line, and this says so before another round
+	 * is spent on it.
+	 */
+	if (n > 16) {
+		unsigned p = 0, t = 0;
+		unsigned nms = sizeof(MS) / sizeof(*MS);
+
+		printf("\n  ===== the prediction: N=16, where the budget is"
+		       " enough =====\n");
+		sweep(dev, 4, 'h', MS, nms, k, 16, A, B, got, want, &p, &t);
+		printf("  %u of %u widths exact at N=16.%s\n", p, t,
+		       p == t && t > 1
+		       ? "  ⚑ m>1 IS EXACT WHERE THE BUDGET REACHES."
+		       : "  The budget reading does not hold.");
+	}
+
 	if (n >= 16) {
 		unsigned n2 = n / 2;
 		size_t tot2 = (size_t)2 * n2, live = 0;
