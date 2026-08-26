@@ -46,6 +46,30 @@ static const char *MODEL_NAME = "charsiu";
 static int N_CTX = 2048, N_THREADS = 4;
 static float TEMP = 0.0f, TOP_P = 0.9f;
 static enum chat_fmt CHAT = CHAT_LLAMA3;   /* set from the vocabulary at load */
+
+/*
+ * ⚠ WHAT THE KV CACHE ACTUALLY HOLDS, prompt and reply both, so the next
+ * request can keep the part that has not changed.
+ *
+ * The API is stateless and the client resends the whole history every turn, so
+ * the previous version threw the cache away and re-ran all of it: turn ten
+ * re-prefilled the nine turns before it. That is O(n^2) on exactly the workload
+ * where prefill hurts, and prefill cannot be made faster here -- the NPU is
+ * already at this board's memory roof, and both batching levers measured dead.
+ * So it is made to happen once instead.
+ */
+static int32_t CACHED[16384];
+static int CACHED_N;
+
+/* forward one token and remember that the cache now holds it */
+static const float *feed(int32_t tok)
+{
+	const float *l = llama_forward(ST, tok, ST->pos);
+
+	if (CACHED_N < (int)(sizeof(CACHED) / sizeof(CACHED[0])))
+		CACHED[CACHED_N++] = tok;
+	return l;
+}
 static uint64_t SEED = 1234;
 
 /* ---- just enough JSON ---------------------------------------------------- */
@@ -334,14 +358,10 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 		return;
 	}
 
-	/*
-	 * ⚠ A FRESH STATE PER REQUEST. The API is stateless and the client sends
-	 * the whole history every time, so keeping a previous kv cache would
-	 * make the two disagree about what was said. The MODEL and the staged
-	 * NPU tensors are what persist, and they are the expensive part.
-	 */
-	llama_state_free(ST);
-	ST = llama_state_new(&M, N_CTX);
+	if (!ST) {
+		ST = llama_state_new(&M, N_CTX);
+		CACHED_N = 0;
+	}
 	if (!ST) { fputs("HTTP/1.1 500 Internal Server Error\r\n\r\n", f); return; }
 
 	int n_ids = tokenizer_encode(M.tk, prompt, 1, ids, (int)(sizeof(ids)/sizeof(ids[0])));
@@ -358,9 +378,38 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 	}
 	if (n_ids + n_gen >= ST->n_ctx) n_gen = ST->n_ctx - n_ids - 1;
 
+	/*
+	 * ⚠ COMPARE THE TOKENS, DO NOT TRUST THE HISTORY. The client may edit,
+	 * branch or truncate what it sends, so the only safe thing is the
+	 * longest prefix that is IDENTICAL token for token. Anything after the
+	 * first difference is recomputed, which is the same answer the old
+	 * code gave -- it just no longer recomputes the part that matched.
+	 *
+	 * ⚠ AND AT LEAST ONE TOKEN MUST BE FED, or there are no logits to
+	 * sample from. Keeping all n would return whatever the last request
+	 * left in the buffer.
+	 */
+	int keep = 0;
+	/* ⚠ the control, so a round can measure against the old behaviour
+	 * without rebuilding: CHARSIU_NO_KV_REUSE throws the cache away the
+	 * way this used to. */
+	static int noreuse = -1;
+
+	if (noreuse < 0)
+		noreuse = getenv("CHARSIU_NO_KV_REUSE") != NULL;
+	while (!noreuse && keep < CACHED_N && keep < n_ids - 1 &&
+	       CACHED[keep] == ids[keep])
+		keep++;
+	if (keep > ST->pos)
+		keep = ST->pos;          /* never claim more than the cache holds */
+	ST->pos = keep;
+	CACHED_N = keep;
+
 	const float *logits = NULL;
-	for (i = 0; i < n_ids; i++)
-		logits = llama_forward(ST, ids[i], ST->pos);
+	for (i = keep; i < n_ids; i++)
+		logits = feed(ids[i]);
+	if (keep)
+		fprintf(stderr, "  kv: kept %d of %d prompt tokens\n", keep, n_ids);
 
 	if (stream) hdr(f, "text/event-stream", 1);
 	if (stream && anth) {
@@ -413,7 +462,7 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 		}
 		produced++;
 		if (ST->pos >= ST->n_ctx) break;
-		logits = llama_forward(ST, tok, ST->pos);
+		logits = feed(tok);
 		if (!logits) break;
 	}
 
