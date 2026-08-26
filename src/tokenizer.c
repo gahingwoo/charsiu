@@ -838,27 +838,98 @@ static int32_t spm_byte(const struct tokenizer *tk, unsigned char b)
 	return smap_get(&tk->vocab, name, strlen(name));
 }
 
+/*
+ * SentencePiece, as the gguf format actually means it: a GREEDY BIGRAM MERGE,
+ * not a Viterbi over the piece scores.
+ *
+ * ⚠ THE SCORES ARE NOT ALWAYS LOG PROBABILITIES, and that is the whole reason
+ * this is not the shortest-path search it looks like it should be. Llama 2 and
+ * phi3 store real unigram log probabilities, where adding them along a
+ * segmentation means something. Gemma stores what is effectively MINUS A RANK:
+ * measured in gemma-3-1b-it-Q4_0, "▁The" scores -175 while "▁T" and "he" score
+ * -64 and -5, so the additive objective prefers the two small pieces by a wide
+ * margin and the prompt comes out as " T | he | c | ap | it | al". It reads
+ * like a broken vocabulary and is a correct search over the wrong objective.
+ *
+ * llama.cpp merges instead: seed a max-heap with every adjacent pair whose
+ * concatenation is in the vocabulary, keyed on the MERGED piece's score, then
+ * pop and merge until the heap is empty, pushing the two new neighbours each
+ * time. Under that rule "he" merges first, then "▁T", then the pair of them
+ * into "▁The" -- the low score does not lose the merge, it only delays it.
+ * Ties go to the leftmost pair.
+ */
+struct spm_sym {
+	const char *text;
+	size_t n;             /* 0 once this symbol has been merged away */
+	int prev, next;
+};
+
+struct spm_bigram {
+	int left, right;
+	float score;
+	size_t size;          /* what left->n + right->n was when pushed */
+};
+
+/* higher score first; equal scores, leftmost first */
+static int spm_better(const struct spm_bigram *a, const struct spm_bigram *b)
+{
+	if (a->score != b->score)
+		return a->score > b->score;
+	return a->left < b->left;
+}
+
+static void spm_heap_push(struct spm_bigram *h, int *n, struct spm_bigram v)
+{
+	int i = (*n)++;
+
+	h[i] = v;
+	while (i > 0) {
+		int p = (i - 1) / 2;
+
+		if (!spm_better(&h[i], &h[p]))
+			break;
+		v = h[p]; h[p] = h[i]; h[i] = v;
+		i = p;
+	}
+}
+
+static struct spm_bigram spm_heap_pop(struct spm_bigram *h, int *n)
+{
+	struct spm_bigram top = h[0], t;
+	int i = 0;
+
+	h[0] = h[--(*n)];
+	for (;;) {
+		int l = 2 * i + 1, r = l + 1, b = i;
+
+		if (l < *n && spm_better(&h[l], &h[b]))
+			b = l;
+		if (r < *n && spm_better(&h[r], &h[b]))
+			b = r;
+		if (b == i)
+			break;
+		t = h[b]; h[b] = h[i]; h[i] = t;
+		i = b;
+	}
+	return top;
+}
+
 static int encode_span_spm(const struct tokenizer *tk, const char *s, size_t n,
 			   int32_t *out, int max, int cnt, int at_start)
 {
 	static const char MARK[3] = { (char)0xe2, (char)0x96, (char)0x81 };
 	char *buf;
 	size_t bn = 0, i;
-	float *best;
-	int32_t *from, *piece;
-	int rc = cnt;
+	struct spm_sym *sym = NULL;
+	struct spm_bigram *heap = NULL;
+	int nsym = 0, nheap = 0, heapcap, rc = cnt;
 
 	if (!n)
 		return cnt;
 	/* the text with every space, and one prepended, written as U+2581 */
 	buf = malloc(n * 3 + 3);
-	best = malloc((n * 3 + 4) * sizeof(float));
-	from = malloc((n * 3 + 4) * sizeof(int32_t));
-	piece = malloc((n * 3 + 4) * sizeof(int32_t));
-	if (!buf || !best || !from || !piece) {
-		free(buf); free(best); free(from); free(piece);
+	if (!buf)
 		return -1;
-	}
 	/*
 	 * ⚠ THE PREPENDED MARKER IS FOR THE START OF THE TEXT, NOT EVERY SPAN.
 	 * Prepending it to each run between special tokens put a space after
@@ -872,63 +943,120 @@ static int encode_span_spm(const struct tokenizer *tk, const char *s, size_t n,
 		else buf[bn++] = s[i];
 	}
 
-	for (i = 0; i <= bn; i++) { best[i] = -1e30f; from[i] = -1; piece[i] = -1; }
-	best[0] = 0.0f;
-	for (i = 0; i < bn; i++) {
-		size_t j;
-
-		if (best[i] <= -1e29f)
-			continue;
-		/* ⚠ the longest piece in these vocabularies is well under 64
-		 * bytes; capping the window keeps this linear in n */
-		for (j = 1; j <= 64 && i + j <= bn; j++) {
-			int32_t id = smap_get(&tk->vocab, buf + i, j);
-			float v;
-
-			if (id < 0)
-				continue;
-			v = best[i] + tk->score[id];
-			if (v > best[i + j]) {
-				best[i + j] = v;
-				from[i + j] = (int32_t)i;
-				piece[i + j] = id;
-			}
-		}
-		/* nothing matched from here: spend one byte and carry on */
-		if (best[i + 1] <= -1e29f) {
-			int32_t id = spm_byte(tk, (unsigned char)buf[i]);
-
-			if (id >= 0) {
-				best[i + 1] = best[i] - 10.0f;
-				from[i + 1] = (int32_t)i;
-				piece[i + 1] = id;
-			}
-		}
-	}
-
-	if (best[bn] <= -1e29f) {
-		free(buf); free(best); free(from); free(piece);
+	/* one symbol per utf-8 character, in a doubly linked list */
+	sym = malloc((bn + 1) * sizeof(*sym));
+	if (!sym) {
+		free(buf);
 		return -1;
 	}
-	{
-		size_t at = bn, k = 0;
-		int32_t *rev = malloc((bn + 1) * sizeof(int32_t));
+	for (i = 0; i < bn; ) {
+		unsigned char c = (unsigned char)buf[i];
+		size_t len = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
 
-		if (!rev) {
-			free(buf); free(best); free(from); free(piece);
-			return -1;
-		}
-		while (at > 0 && from[at] >= 0) {
-			rev[k++] = piece[at];
-			at = (size_t)from[at];
-		}
-		while (k > 0) {
-			if (rc >= max) { free(rev); rc = -1; break; }
-			out[rc++] = rev[--k];
-		}
-		free(rev);
+		if (i + len > bn)
+			len = bn - i;
+		sym[nsym].text = buf + i;
+		sym[nsym].n = len;
+		sym[nsym].prev = nsym - 1;
+		sym[nsym].next = (i + len == bn) ? -1 : nsym + 1;
+		nsym++;
+		i += len;
 	}
-	free(buf); free(best); free(from); free(piece);
+
+	/*
+	 * Every merge pops one and pushes at most two, and there are fewer
+	 * than nsym merges, so 3 * nsym is a bound rather than a guess.
+	 */
+	heapcap = 3 * nsym + 8;
+	heap = malloc((size_t)heapcap * sizeof(*heap));
+	if (!heap) {
+		free(buf); free(sym);
+		return -1;
+	}
+
+	/*
+	 * ⚠ THE ARGUMENTS ARE COPIED FIRST, and the local is not called bg.
+	 * The obvious spelling of this macro declares a `struct spm_bigram bg`
+	 * and is then called as TRY_BIGRAM(bg.left, ...) from a loop that has
+	 * its own bg: the inner one shadows it, `bg_.left = (L)` becomes an
+	 * uninitialised self-assignment, and the merge is applied to two
+	 * symbols picked at random. It shows up as a chain with holes in it --
+	 * "The capital of France is" tokenising to four pieces -- rather than
+	 * as a crash.
+	 */
+#define TRY_BIGRAM(L, R) do {                                                 \
+		int l_ = (L), r_ = (R);                                       \
+									      \
+		if (l_ >= 0 && r_ >= 0 && nheap < heapcap) {                  \
+			size_t sz = sym[l_].n + sym[r_].n;                    \
+			int32_t id = smap_get(&tk->vocab, sym[l_].text, sz);  \
+									      \
+			if (id >= 0) {                                        \
+				struct spm_bigram bg_;                        \
+									      \
+				bg_.left = l_; bg_.right = r_;                \
+				bg_.score = tk->score[id];                    \
+				bg_.size = sz;                                \
+				spm_heap_push(heap, &nheap, bg_);             \
+			}                                                     \
+		}                                                             \
+	} while (0)
+
+	for (int k = 1; k < nsym; k++)
+		TRY_BIGRAM(k - 1, k);
+
+	while (nheap > 0) {
+		struct spm_bigram bg = spm_heap_pop(heap, &nheap);
+		struct spm_sym *l = &sym[bg.left], *r = &sym[bg.right];
+
+		/* one of the two has already been merged into something else */
+		if (!l->n || !r->n || l->n + r->n != bg.size)
+			continue;
+
+		l->n += r->n;
+		r->n = 0;
+		l->next = r->next;
+		if (r->next >= 0)
+			sym[r->next].prev = bg.left;
+
+		TRY_BIGRAM(l->prev, bg.left);
+		TRY_BIGRAM(bg.left, l->next);
+	}
+#undef TRY_BIGRAM
+
+	if (getenv("CHARSIU_SPM_DEBUG")) {
+		fprintf(stderr, "spm: nsym=%d bn=%zu chain:", nsym, bn);
+		for (int k = 0; k != -1; k = sym[k].next)
+			fprintf(stderr, " [%d]'%.*s'(%zu)", k,
+				(int)sym[k].n, sym[k].text, sym[k].n);
+		fprintf(stderr, "\n");
+	}
+	for (int k = 0; k != -1; k = sym[k].next) {
+		int32_t id = smap_get(&tk->vocab, sym[k].text, sym[k].n);
+
+		if (id >= 0) {
+			if (rc >= max) { rc = -1; break; }
+			out[rc++] = id;
+			continue;
+		}
+		/*
+		 * A symbol the vocabulary does not carry. Only an unmerged
+		 * character can get here -- every merge required a hit -- and
+		 * the file spells those out a byte at a time as <0xNN>.
+		 */
+		for (size_t j = 0; j < sym[k].n; j++) {
+			int32_t b = spm_byte(tk, (unsigned char)sym[k].text[j]);
+
+			if (b < 0)
+				continue;
+			if (rc >= max) { rc = -1; break; }
+			out[rc++] = b;
+		}
+		if (rc < 0)
+			break;
+	}
+
+	free(buf); free(sym); free(heap);
 	return rc;
 }
 
