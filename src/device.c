@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,8 +39,83 @@ struct charsiu_device {
 	struct charsiu_bo reserve;   /* holds IOVA 0 so nothing real lands there */
 };
 
+/*
+ * ⚠ A BOARD WITH NO DEBUGGER DESERVES BETTER THAN "Segmentation fault".
+ *
+ * Every crash this project has had on hardware arrived as that one word and
+ * nothing else: no tensor, no shape, no stage. Two rounds went into narrowing
+ * one of them to a four line function by rebuilding on the host under ASan,
+ * which only worked because that particular bug also reproduced there. A bug
+ * in the ioctl path does not.
+ *
+ * So leave a breadcrumb. charsiu_note() stores a pointer to a STATIC string
+ * plus two numbers; the handler writes them and re-raises, so the shell still
+ * reports the real signal and a core file is still produced.
+ *
+ * ⚠ ASYNC SIGNAL SAFE, which rules out printf and every string function that
+ * allocates. write() and a hand rolled integer are all that is allowed here,
+ * and the note must point at a string literal or a buffer that outlives the
+ * crash -- never at something on a stack that is about to be unwound.
+ */
+static const char *volatile note_what = "nothing yet";
+static volatile unsigned long note_a, note_b;
+
+void charsiu_note(const char *what, unsigned long a, unsigned long b)
+{
+	note_what = what;
+	note_a = a;
+	note_b = b;
+}
+
+static void note_num(char *buf, size_t *at, unsigned long v)
+{
+	char t[24];
+	int n = 0;
+
+	if (!v) { buf[(*at)++] = '0'; return; }
+	while (v && n < 24) { t[n++] = (char)('0' + v % 10); v /= 10; }
+	while (n) buf[(*at)++] = t[--n];
+}
+
+static void note_crash(int sig)
+{
+	char buf[256];
+	size_t at = 0;
+	const char *w = note_what;
+	const char *p = "\ncharsiu: died in ";
+
+	while (*p) buf[at++] = *p++;
+	while (w && *w && at < sizeof(buf) - 48) buf[at++] = *w++;
+	buf[at++] = ' '; buf[at++] = '(';
+	note_num(buf, &at, note_a);
+	buf[at++] = ','; buf[at++] = ' ';
+	note_num(buf, &at, note_b);
+	buf[at++] = ')'; buf[at++] = ' '; buf[at++] = 's'; buf[at++] = 'i';
+	buf[at++] = 'g'; buf[at++] = '=';
+	note_num(buf, &at, (unsigned long)sig);
+	buf[at++] = '\n';
+	if (write(2, buf, at) < 0) { /* nothing useful to do */ }
+
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+void charsiu_note_install(void)
+{
+	static int done;
+
+	if (done || getenv("CHARSIU_NO_CRASH_NOTE"))
+		return;
+	done = 1;
+	signal(SIGSEGV, note_crash);
+	signal(SIGBUS, note_crash);
+	signal(SIGILL, note_crash);
+	signal(SIGFPE, note_crash);
+}
+
 struct charsiu_device *charsiu_open(const char *path)
 {
+	charsiu_note_install();
 	struct charsiu_device *dev;
 	int fd;
 

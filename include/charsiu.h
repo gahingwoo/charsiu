@@ -270,6 +270,14 @@ struct charsiu_bo {
 struct charsiu_device *charsiu_open(const char *path);
 void charsiu_close(struct charsiu_device *dev);
 
+/*
+ * Leave a breadcrumb for the crash handler. `what` MUST outlive the crash: a
+ * string literal, or a buffer that is not on a stack about to be unwound.
+ * CHARSIU_NO_CRASH_NOTE turns the handler off.
+ */
+void charsiu_note(const char *what, unsigned long a, unsigned long b);
+void charsiu_note_install(void);
+
 int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo *bo);
 void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo);
 

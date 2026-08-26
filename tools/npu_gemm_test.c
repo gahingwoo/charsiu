@@ -201,12 +201,26 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	size_t total = (size_t)m * n;
 	unsigned shown = 0;
 
+	/*
+	 * ⚠ ROW 0 ACROSS THE WHOLE ROW, not its first six channels. Round 381
+	 * sampled six, saw them land at 0 1 2 3 8 9 -- which is exactly
+	 * [n/4][m][4] -- and then had to explain why the same layout scored
+	 * only 15 of 128. Six channels cannot say where a pattern STOPS.
+	 */
 	printf("\n  where each wanted value landed  (flat index in the output)\n");
-	printf("    %-10s %-12s %-10s %s\n", "(row,ch)", "want", "at flat", "hits");
-	for (unsigned r = 0; r < m && shown < 12; r++) {
-		for (unsigned c = 0; c < n && shown < 12; c++) {
+	printf("    %-10s %-12s %-10s %-8s %s\n",
+	       "(row,ch)", "want", "at flat", "hits", "[n/4][m][4] predicts");
+	for (unsigned pass = 0; pass < 2; pass++) {
+		unsigned r = pass;          /* row 0 in full, then row 1 */
+		unsigned step = pass ? (n / 8 ? n / 8 : 1) : 1;
+
+		if (r >= m)
+			break;
+		for (unsigned c = 0; c < n; c += step) {
 			int32_t v = want[(size_t)r * n + c];
 			size_t first = total, hits = 0;
+			size_t pred = (size_t)(c / 4) * m * 4 + (size_t)r * 4
+				      + (c % 4);
 
 			for (size_t i = 0; i < total; i++)
 				if (got[i] == v) {
@@ -214,16 +228,21 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 						first = i;
 					hits++;
 				}
-			if (c > 5 && r == 0)
-				continue;      /* a few of row 0, then move on */
+			/* row 0 is dense; print it thinned once it is boring */
+			if (!pass && c >= 16 && (c % 4))
+				continue;
 			printf("    (%u,%-3u)    %-12d ", r, c, v);
 			if (!hits)
-				printf("%-10s -\n", "nowhere");
+				printf("%-10s %-8s ", "nowhere", "-");
 			else
-				printf("%-10zu %zu%s\n", first, hits,
-				       hits > 1 ? "  (ambiguous)" : "");
+				printf("%-10zu %-8zu ", first, hits);
+			printf("%zu%s\n", pred,
+			       hits && first == pred ? "  <= matches" : "");
 			shown++;
+			if (shown > 40)
+				break;
 		}
+		shown = 0;
 	}
 	printf("    a contiguous [m][n] would put (r,c) at r*%u + c\n", n);
 }

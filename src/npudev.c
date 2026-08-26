@@ -771,6 +771,8 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 		     unsigned ki, unsigned si, uint32_t out_base)
 {
 	struct npu_slot *s = &g->slot[g->n_slot];
+
+	charsiu_note("staging a slice", (unsigned long)n, (unsigned long)k);
 	int32_t *bias = NULL, *wsum = NULL;
 	int rc = -1;
 
@@ -914,6 +916,11 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * the first sixteen are free and round 353's log said "0 ms". */
 	if (g->t_first == 0.0)
 		g->t_first = t_add;
+	/*
+	 * ⚠ t->name IS A FIXED ARRAY INSIDE npu_tensor, not a stack buffer, so
+	 * it is still readable from a signal handler after this frame is gone.
+	 */
+	charsiu_note(t->name, (unsigned long)t->n, (unsigned long)t->k);
 	unsigned ns, ks, first = g->n_slot, si = 0;
 
 	if (g->dead) {
@@ -1143,6 +1150,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
+	charsiu_note("a matvec on one tensor", (unsigned long)id,
+		     (unsigned long)a->n);
 	e = &g->ent[id];
 	if ((unsigned)a->n != e->t->k) {
 		whine(g, "the activation is not this tensor's K", (unsigned)a->n,
@@ -1453,6 +1462,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (i = 0; i < n; i++)
 		if (ids[i] < 0 || (unsigned)ids[i] >= g->n_ent)
 			return -1;
+	charsiu_note("a matvec on a group of tensors", (unsigned long)n,
+		     (unsigned long)a->n);
 	e0 = &g->ent[ids[0]];
 	for (i = 1; i < n; i++)
 		if (g->ent[ids[i]].t->k != e0->t->k)
