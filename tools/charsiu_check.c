@@ -111,7 +111,8 @@ int main(int argc, char **argv)
 	 * final_logit_softcapping 30.0 and a 4096 sliding window, and phi3
 	 * fuses QKV into one tensor and gate+up into another.
 	 */
-	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") && strcmp(arch, "phi3"))
+	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
+	    strcmp(arch, "phi3") && strcmp(arch, "smollm3"))
 		bad_graph = 1;
 
 	/*

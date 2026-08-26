@@ -91,6 +91,7 @@ llama3.2-3b-q4|bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_0.g
 qwen2.5-1.5b-q4|bartowski/Qwen2.5-1.5B-Instruct-GGUF|Qwen2.5-1.5B-Instruct-Q4_0.gguf|894|answers better than the 1B llamas
 qwen2.5-coder-1.5b-q4|bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF|Qwen2.5-Coder-1.5B-Instruct-Q4_0.gguf|894|the same size, tuned for code
 phi3.5-mini-q4|bartowski/Phi-3.5-mini-instruct-GGUF|Phi-3.5-mini-instruct-Q4_0.gguf|2114|3.8B; check the card has room
+smollm3-3b-q4|unsloth/SmolLM3-3B-GGUF|SmolLM3-3B-Q4_0.gguf|1727|3B, reasoning, 65K context; the newest one that fits
 ZOO
 }
 

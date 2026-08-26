@@ -785,7 +785,7 @@ static const struct gguf_tensor *need(const struct gguf *g, const char *name)
  * the same data pointer moved forward with fewer rows.
  */
 static int subtensor(struct gguf_tensor *dst, const struct gguf_tensor *src,
-		     uint64_t row0, uint64_t nrows)
+		     uint64_t row0, uint64_t nrows, const char *part)
 {
 	uint64_t per;
 
@@ -795,6 +795,15 @@ static int subtensor(struct gguf_tensor *dst, const struct gguf_tensor *src,
 	if (row0 + nrows > src->ne[1])
 		return -1;
 	*dst = *src;
+	/*
+	 * ⚠ A SLICE NEEDS ITS OWN NAME. The weight cache is keyed on name, n
+	 * and k, and phi3's three slices of attn_qkv agree on all three: q's
+	 * weights would come back for k and for v. Nothing reads it today
+	 * because the cache is opt-in, which is exactly the kind of bug that
+	 * waits.
+	 */
+	snprintf(dst->name, sizeof(dst->name), "%.*s.%s",
+		 (int)(sizeof(dst->name) - strlen(part) - 2), src->name, part);
 	dst->ne[1] = nrows;
 	dst->data = (const uint8_t *)src->data + row0 * per;
 	dst->nbytes = nrows * per;
@@ -828,7 +837,7 @@ int llama_load(struct llama_model *m, const char *path)
 	 * fuses QKV into one tensor and gate+up into another.
 	 */
 	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
-	    strcmp(arch, "phi3")) {
+	    strcmp(arch, "phi3") && strcmp(arch, "smollm3")) {
 		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
 		goto fail;
 	}
@@ -937,11 +946,11 @@ int llama_load(struct llama_model *m, const char *path)
 			if (!qkv || !fu)
 				goto fail;
 			/* q, then k, then v; gate, then up */
-			if (subtensor(&L->split[0], qkv, 0, hq) ||
-			    subtensor(&L->split[1], qkv, hq, hk) ||
-			    subtensor(&L->split[2], qkv, hq + hk, hk) ||
-			    subtensor(&L->split[3], fu, 0, m->n_ff) ||
-			    subtensor(&L->split[4], fu, m->n_ff, m->n_ff)) {
+			if (subtensor(&L->split[0], qkv, 0, hq, "q") ||
+			    subtensor(&L->split[1], qkv, hq, hk, "k") ||
+			    subtensor(&L->split[2], qkv, hq + hk, hk, "v") ||
+			    subtensor(&L->split[3], fu, 0, m->n_ff, "gate") ||
+			    subtensor(&L->split[4], fu, m->n_ff, m->n_ff, "up")) {
 				fprintf(stderr, "llama: %s will not split into "
 					"q k v and gate up\n", qkv->name);
 				goto fail;
