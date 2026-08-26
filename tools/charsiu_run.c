@@ -66,7 +66,14 @@ static void usage(void)
 int main(int argc, char **argv)
 {
 	const char *path = NULL, *prompt = NULL, *promptfile = NULL;
-	const char *sys = "You are a helpful assistant.";
+	/*
+	 * ⚠ MEASURED: Phi-3.5-mini answers NOTHING AT ALL when given a system
+	 * turn -- six generated tokens, every one a newline -- and answers
+	 * properly without one. The template and the token count are identical
+	 * either way, checked against a hand-written prompt, so this is the
+	 * model and not the rendering. --sys is still honoured if asked for.
+	 */
+	const char *sys = NULL;
 	int n_gen = 64, n_ctx = 0, nthreads = 0, chat = 0, quiet = 0;
 	int show_tokens = 0, show_logits = 0, show_info = 0;
 	/*
@@ -173,6 +180,12 @@ int main(int argc, char **argv)
 		return 1;
 	t_load = now_ms() - t0;
 	fmt = chat_format_of(m.tk);
+	/*
+	 * The default, once the format is known. phi3 gets none for the reason
+	 * above; the others are unchanged, and an explicit --sys wins over both.
+	 */
+	if (!sys)
+		sys = (fmt == CHAT_PHI3) ? "" : "You are a helpful assistant.";
 
 	if (show_info) {
 		printf("file        %s\n", path);

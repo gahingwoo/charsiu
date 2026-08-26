@@ -127,10 +127,16 @@ int main(int argc, char **argv)
 		char *tok = tokmodel;
 
 		gguf_get_str(&g, "tokenizer.ggml.model", tok, 64);
-		if (tok[0] && strcmp(tok, "gpt2") && !gguf_find(&g, "tokenizer.ggml.merges")) {
+		/*
+		 * ⚠ TWO FAMILIES ARE FINE NOW: BPE with merges, and
+		 * SentencePiece with a score per piece. What is not fine is
+		 * NEITHER, which is a file this cannot turn into tokens.
+		 */
+		if (tok[0] && !gguf_find(&g, "tokenizer.ggml.merges") &&
+		    !gguf_find(&g, "tokenizer.ggml.scores")) {
 			if (!quiet)
-				printf("tokenizer     %s   <-- charsiu's is BPE, "
-				       "with a merge table\n", tok);
+				printf("tokenizer     %s   <-- neither merges nor "
+				       "piece scores\n", tok);
 			bad_tok = 1;
 		}
 	}

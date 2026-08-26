@@ -244,6 +244,17 @@ struct tokenizer {
 
 	int32_t bos, eos, eot;
 	int add_bos;
+
+	/*
+	 * ⚠ TWO FAMILIES, NOT ONE. A gguf that says tokenizer.ggml.model = gpt2
+	 * carries BPE merges; one that says llama carries SentencePiece pieces
+	 * with a SCORE each and no merges at all, and the two are segmented by
+	 * different algorithms. Phi-3.5 and Gemma are the second kind, and this
+	 * used to stop at "the file has no merge table".
+	 */
+	float *score;          /* n_vocab, higher is better; SPM only */
+	int spm;
+	int32_t unk;
 };
 
 static const uint8_t *arr_next_str(const uint8_t *p, uint64_t *len)
@@ -341,11 +352,32 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 			q += n;
 		}
 	} else {
-		fprintf(stderr, "tokenizer: the file has no merge table\n");
-		goto fail;
+		/*
+		 * ⚠ NO MERGES IS NOT NECESSARILY A BROKEN FILE. SentencePiece
+		 * carries a score per piece instead, and the segmentation is a
+		 * search over those rather than a sequence of merges. Take that
+		 * path when the scores are there, and only give up when neither
+		 * is.
+		 */
+		const struct gguf_kv *sc = gguf_find(g, "tokenizer.ggml.scores");
+
+		if (!sc || sc->type != GGUF_V_ARRAY || sc->arr_len != toks->arr_len) {
+			fprintf(stderr, "tokenizer: the file has neither a merge "
+				"table nor piece scores\n");
+			goto fail;
+		}
+		tk->score = malloc((size_t)tk->n_vocab * sizeof(float));
+		if (!tk->score)
+			goto fail;
+		for (uint64_t i = 0; i < tk->n_vocab; i++)
+			memcpy(&tk->score[i], sc->arr + i * 4, 4);
+		tk->spm = 1;
 	}
 
 	tk->bos = tk->eos = tk->eot = -1;
+	tk->unk = -1;
+	if (!gguf_get_u32(g, "tokenizer.ggml.unknown_token_id", &v))
+		tk->unk = (int32_t)v;
 	if (!gguf_get_u32(g, "tokenizer.ggml.bos_token_id", &v))
 		tk->bos = (int32_t)v;
 	if (!gguf_get_u32(g, "tokenizer.ggml.eos_token_id", &v))
@@ -381,6 +413,7 @@ void tokenizer_free(struct tokenizer *tk)
 	}
 	free(tk->toklen);
 	free(tk->type);
+	free(tk->score);
 	free(tk->special);
 	free(tk->merge_store);
 	smap_free(&tk->vocab);
@@ -416,12 +449,27 @@ int32_t tokenizer_find(const struct tokenizer *tk, const char *spelling)
 enum chat_fmt chat_format_of(const struct tokenizer *tk)
 {
 	if (tokenizer_find(tk, "<|im_start|>") >= 0) return CHAT_CHATML;
+	/* phi3: <|user|> ... <|end|> and no header markers at all */
+	if (tokenizer_find(tk, "<|end|>") >= 0 &&
+	    tokenizer_find(tk, "<|assistant|>") >= 0) return CHAT_PHI3;
 	return CHAT_LLAMA3;
 }
 
 size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 		 const char *role, const char *text)
 {
+	/*
+	 * ⚠ AN EMPTY TURN IS NO TURN. phi3's own template guards its system
+	 * message with `if role == 'system' and message['content']`, and this
+	 * wrote the markers with nothing between them.
+	 */
+	if (!text || !*text) {
+		if (max) out[0] = 0;
+		return 0;
+	}
+
+	if (f == CHAT_PHI3)
+		return (size_t)snprintf(out, max, "<|%s|>\n%s<|end|>\n", role, text);
 	if (f == CHAT_CHATML)
 		return (size_t)snprintf(out, max, "<|im_start|>%s\n%s<|im_end|>\n",
 					role, text);
@@ -431,6 +479,8 @@ size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 
 size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
 {
+	if (f == CHAT_PHI3)
+		return (size_t)snprintf(out, max, "<|%s|>\n", role);
 	if (f == CHAT_CHATML)
 		return (size_t)snprintf(out, max, "<|im_start|>%s\n", role);
 	return (size_t)snprintf(out, max,
@@ -440,6 +490,7 @@ size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
 size_t chat_close(char *out, size_t max, enum chat_fmt f)
 {
 	return (size_t)snprintf(out, max,
+				f == CHAT_PHI3   ? "<|end|>\n" :
 				f == CHAT_CHATML ? "<|im_end|>\n" : "<|eot_id|>");
 }
 
@@ -762,11 +813,134 @@ static int32_t special_at(const struct tokenizer *tk, const char *s, size_t n,
 	return best;
 }
 
+/*
+ * SentencePiece: the best-scoring way to cut the text into pieces.
+ *
+ * Unigram segmentation is a shortest-path problem, not a sequence of merges.
+ * best[i] is the score of the best segmentation of the first i bytes; for each
+ * end i, every piece that could finish there is tried against the best way of
+ * reaching its start. One pass, and the pieces are recovered by walking the
+ * back pointers.
+ *
+ * ⚠ SPM SPELLS A SPACE AS U+2581, and prepends one to the text. Feeding raw
+ * spaces finds no piece at all, since the vocabulary contains none: every
+ * word-initial piece begins with the marker.
+ *
+ * ⚠ AND A BYTE THAT NO PIECE COVERS IS NOT AN ERROR. The vocabulary carries
+ * <0x00> through <0xff> for exactly that, so an unmatched byte becomes its own
+ * token rather than <unk>, and no input is unrepresentable.
+ */
+static int32_t spm_byte(const struct tokenizer *tk, unsigned char b)
+{
+	char name[8];
+
+	snprintf(name, sizeof(name), "<0x%02X>", b);
+	return smap_get(&tk->vocab, name, strlen(name));
+}
+
+static int encode_span_spm(const struct tokenizer *tk, const char *s, size_t n,
+			   int32_t *out, int max, int cnt, int at_start)
+{
+	static const char MARK[3] = { (char)0xe2, (char)0x96, (char)0x81 };
+	char *buf;
+	size_t bn = 0, i;
+	float *best;
+	int32_t *from, *piece;
+	int rc = cnt;
+
+	if (!n)
+		return cnt;
+	/* the text with every space, and one prepended, written as U+2581 */
+	buf = malloc(n * 3 + 3);
+	best = malloc((n * 3 + 4) * sizeof(float));
+	from = malloc((n * 3 + 4) * sizeof(int32_t));
+	piece = malloc((n * 3 + 4) * sizeof(int32_t));
+	if (!buf || !best || !from || !piece) {
+		free(buf); free(best); free(from); free(piece);
+		return -1;
+	}
+	/*
+	 * ⚠ THE PREPENDED MARKER IS FOR THE START OF THE TEXT, NOT EVERY SPAN.
+	 * Prepending it to each run between special tokens put a space after
+	 * every one of them: the prompt echoed as "<|system|> \nYou are..."
+	 * and the model, handed a template it had never seen, answered nothing
+	 * at all.
+	 */
+	if (at_start) { memcpy(buf + bn, MARK, 3); bn += 3; }
+	for (i = 0; i < n; i++) {
+		if (s[i] == ' ') { memcpy(buf + bn, MARK, 3); bn += 3; }
+		else buf[bn++] = s[i];
+	}
+
+	for (i = 0; i <= bn; i++) { best[i] = -1e30f; from[i] = -1; piece[i] = -1; }
+	best[0] = 0.0f;
+	for (i = 0; i < bn; i++) {
+		size_t j;
+
+		if (best[i] <= -1e29f)
+			continue;
+		/* ⚠ the longest piece in these vocabularies is well under 64
+		 * bytes; capping the window keeps this linear in n */
+		for (j = 1; j <= 64 && i + j <= bn; j++) {
+			int32_t id = smap_get(&tk->vocab, buf + i, j);
+			float v;
+
+			if (id < 0)
+				continue;
+			v = best[i] + tk->score[id];
+			if (v > best[i + j]) {
+				best[i + j] = v;
+				from[i + j] = (int32_t)i;
+				piece[i + j] = id;
+			}
+		}
+		/* nothing matched from here: spend one byte and carry on */
+		if (best[i + 1] <= -1e29f) {
+			int32_t id = spm_byte(tk, (unsigned char)buf[i]);
+
+			if (id >= 0) {
+				best[i + 1] = best[i] - 10.0f;
+				from[i + 1] = (int32_t)i;
+				piece[i + 1] = id;
+			}
+		}
+	}
+
+	if (best[bn] <= -1e29f) {
+		free(buf); free(best); free(from); free(piece);
+		return -1;
+	}
+	{
+		size_t at = bn, k = 0;
+		int32_t *rev = malloc((bn + 1) * sizeof(int32_t));
+
+		if (!rev) {
+			free(buf); free(best); free(from); free(piece);
+			return -1;
+		}
+		while (at > 0 && from[at] >= 0) {
+			rev[k++] = piece[at];
+			at = (size_t)from[at];
+		}
+		while (k > 0) {
+			if (rc >= max) { free(rev); rc = -1; break; }
+			out[rc++] = rev[--k];
+		}
+		free(rev);
+	}
+	free(buf); free(best); free(from); free(piece);
+	return rc;
+}
+
 /* Byte-encode a raw span, then pre-tokenize and merge it. */
 static int encode_span(const struct tokenizer *tk, const char *s, size_t n,
-		       int32_t *out, int max, int cnt)
+		       int32_t *out, int max, int cnt, int at_start)
 {
 	uint32_t *cp;
+
+	if (tk->spm)
+		return encode_span_spm(tk, s, n, out, max, cnt, at_start);
+
 	size_t ncp = 0, i = 0;
 	char *word;
 	int rc = cnt;
@@ -843,7 +1017,8 @@ int tokenizer_encode(const struct tokenizer *tk, const char *text,
 			i++;
 			continue;
 		}
-		cnt = encode_span(tk, text + i - run, run, out, max, cnt);
+		cnt = encode_span(tk, text + i - run, run, out, max, cnt,
+				  text + i - run == text);
 		if (cnt < 0)
 			return -1;
 		if (cnt >= max)
@@ -852,8 +1027,17 @@ int tokenizer_encode(const struct tokenizer *tk, const char *text,
 		i += slen;
 		run = 0;
 	}
-	cnt = encode_span(tk, text + i - run, run, out, max, cnt);
+	cnt = encode_span(tk, text + i - run, run, out, max, cnt,
+			  text + i - run == text);
 	return cnt;
+}
+
+static int hexval(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
 }
 
 /* ---- decode -------------------------------------------------------------- */
@@ -875,6 +1059,37 @@ const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len)
 	if (tk->type[id] == 3) {
 		*len = (int)n;
 		return s;
+	}
+
+	/*
+	 * ⚠ SentencePiece PIECES ARE NOT BYTE-ENCODED. They are the text
+	 * itself, with U+2581 standing in for a space, and a byte the
+	 * vocabulary could not spell written as the four characters <0xNN>.
+	 * Running them through the GPT-2 byte map would mangle every one.
+	 */
+	if (tk->spm) {
+		if (n == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>') {
+			int hi = hexval(s[3]), lo = hexval(s[4]);
+
+			if (hi >= 0 && lo >= 0) {
+				buf[0] = (char)(hi * 16 + lo);
+				*len = 1;
+				return buf;
+			}
+		}
+		while (i < n && w + 4 < sizeof(buf)) {
+			if (n - i >= 3 && (unsigned char)s[i] == 0xe2 &&
+			    (unsigned char)s[i + 1] == 0x96 &&
+			    (unsigned char)s[i + 2] == 0x81) {
+				buf[w++] = ' ';
+				i += 3;
+				continue;
+			}
+			buf[w++] = s[i++];
+		}
+		buf[w] = 0;
+		*len = (int)w;
+		return buf;
 	}
 
 	while (i < n && w + 4 < sizeof(buf)) {

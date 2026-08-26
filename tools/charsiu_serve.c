@@ -594,7 +594,7 @@ int main(int argc, char **argv)
 	if (llama_load(&M, path) < 0) return 1;
 	CHAT = chat_format_of(M.tk);
 	fprintf(stderr, "  chat format: %s\n",
-		CHAT == CHAT_CHATML ? "chatml" : "llama3");
+		CHAT == CHAT_PHI3 ? "phi3" : CHAT == CHAT_CHATML ? "chatml" : "llama3");
 	if (!MODEL_NAME[0] || !strcmp(MODEL_NAME, "charsiu")) {
 		const char *b = strrchr(path, '/');
 		MODEL_NAME = b ? b + 1 : path;

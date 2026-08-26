@@ -280,7 +280,7 @@ const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
  * tokenizer.chat_template, which is far more than this can run, but the
  * markers themselves are tokens, so ask the vocabulary which family it is.
  */
-enum chat_fmt { CHAT_LLAMA3 = 0, CHAT_CHATML = 1 };
+enum chat_fmt { CHAT_LLAMA3 = 0, CHAT_CHATML = 1, CHAT_PHI3 = 2 };
 enum chat_fmt chat_format_of(const struct tokenizer *tk);
 /* one complete turn */
 size_t chat_turn(char *out, size_t max, enum chat_fmt f,

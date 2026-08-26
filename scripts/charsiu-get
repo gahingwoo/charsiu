@@ -90,6 +90,7 @@ llama3.2-1b-q4_1|unsloth/Llama-3.2-1B-Instruct-GGUF|Llama-3.2-1B-Instruct-Q4_1.g
 llama3.2-3b-q4|bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_0.gguf|1922|check the card has room
 qwen2.5-1.5b-q4|bartowski/Qwen2.5-1.5B-Instruct-GGUF|Qwen2.5-1.5B-Instruct-Q4_0.gguf|894|answers better than the 1B llamas
 qwen2.5-coder-1.5b-q4|bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF|Qwen2.5-Coder-1.5B-Instruct-Q4_0.gguf|894|the same size, tuned for code
+phi3.5-mini-q4|bartowski/Phi-3.5-mini-instruct-GGUF|Phi-3.5-mini-instruct-Q4_0.gguf|2114|3.8B; check the card has room
 ZOO
 }
 
@@ -98,7 +99,6 @@ ZOO
 known_bad() {
 cat <<'BAD'
 gemma|gemma2|measured: gemma-2-2b-it declares architecture gemma2
-phi|phi3|measured: Phi-3.5-mini-instruct declares architecture phi3
 BAD
 }
 

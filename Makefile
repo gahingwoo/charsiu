@@ -19,7 +19,8 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
-     $(BUILD)/npu_gemm_test
+     $(BUILD)/npu_gemm_test \
+     $(BUILD)/tokenizer_roundtrip
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -106,6 +107,9 @@ $(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
