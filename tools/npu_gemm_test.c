@@ -280,13 +280,64 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * ⚠ THE ACTIVATION LAYOUT FOR m>1 WAS NEVER DETERMINED. regcmd.c packs
+	 * A behind two knobs, CHARSIU_A_LAYOUT and CHARSIU_A_GRAN, which is
+	 * what a set of candidates looks like rather than a decision. And m=1
+	 * cannot choose between them: at m=1 both formulas collapse to e = kk,
+	 * which is exactly why the control passes and tells us nothing.
+	 *
+	 * So sweep them. One submit each, and a full match is both the answer
+	 * to "does m>1 work" and the layout it wants.
+	 */
 	reference(2, k, n, A, B, want);
-	if (run(dev, 2, k, n, A, B, got)) {
+	{
+		static const struct { const char *lay, *gran; } cand[] = {
+			{ "0", NULL }, { "0", "1" }, { "0", "2" }, { "0", "4" },
+			{ "0", "8" }, { "0", "16" }, { "0", "32" }, { "0", "64" },
+			{ "2", NULL },
+		};
+		unsigned best = 0, bi = 0;
+
+		printf("\n  sweeping the m>1 activation layout\n");
+		for (unsigned c = 0; c < sizeof(cand) / sizeof(*cand); c++) {
+			unsigned ok = 0;
+			char name[32];
+
+			setenv("CHARSIU_A_LAYOUT", cand[c].lay, 1);
+			if (cand[c].gran)
+				setenv("CHARSIU_A_GRAN", cand[c].gran, 1);
+			else
+				unsetenv("CHARSIU_A_GRAN");
+			snprintf(name, sizeof(name), "lay=%s gran=%s",
+				 cand[c].lay, cand[c].gran ? cand[c].gran : "atom");
+
+			if (run(dev, 2, k, n, A, B, got)) {
+				printf("    %-18s submit failed\n", name);
+				continue;
+			}
+			for (size_t i = 0; i < (size_t)2 * n; i++)
+				if (got[i] == want[i]) ok++;
+			printf("    %-18s %4u of %4u correct%s\n", name, ok, 2 * n,
+			       ok == 2 * n ? "   <== THIS ONE" : "");
+			if (ok > best) { best = ok; bi = c; }
+		}
+		unsetenv("CHARSIU_A_LAYOUT");
+		unsetenv("CHARSIU_A_GRAN");
+
+		if (best == 2 * n) {
+			printf("\n  m=2 COMPUTES CORRECTLY with lay=%s gran=%s.\n"
+			       "  A batched prefill has somewhere to go.\n",
+			       cand[bi].lay, cand[bi].gran ? cand[bi].gran : "atom");
+			charsiu_close(dev);
+			return 0;
+		}
+		printf("\n  best was %u of %u; no candidate layout makes m=2 correct.\n",
+		       best, 2 * n);
+		/* still worth knowing whether the values are merely elsewhere */
+		run(dev, 2, k, n, A, B, got);
+		layouts(2, n, got, want);
 		fail = 1;
-	} else {
-		fail |= check("m=2  (the question)", 2, n, got, want);
-		if (fail)
-			fail = !layouts(2, n, got, want);
 	}
 
 	printf("\n  %s\n", fail
