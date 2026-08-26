@@ -128,11 +128,11 @@ if [ -z "$M" ]; then
 elif [ ! -f "$M" ]; then
 	bad "$M does not exist. charsiu-get fetches one"
 else
-	# ⚠ busybox's stat needs FEATURE_STAT_FORMAT for -c and this rootfs is
+	# ⚠ busybox's stat needs FEATURE_STAT_FORMAT for -c and a rootfs here was
 	# built without it, so a 1321 MB model reported as 0 MB and the memory
-	# check below became meaningless. wc -c is in every shell environment
-	# there is.
-	sz=$(( $([ -f "$M" ] && wc -c < "$M" || echo 0) / 1048576 ))
+	# check below became meaningless. That is why file_bytes falls back to
+	# ls -ln rather than to wc -c: busybox's wc READS THE WHOLE FILE.
+	sz=$(( $(file_bytes "$M") / 1048576 ))
 	ok "$M (${sz} MB)"
 	if [ -n "$CK" ]; then
 		if out=$("$CK" -q "$M" 2>&1); then

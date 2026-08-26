@@ -117,7 +117,7 @@ page_model() {
 		for f in "$MODELS_DIR"/*.gguf /opt/charsiu/models/*.gguf; do
 			[ -f "$f" ] || continue
 			case " $* " in *" $(basename "$f") "*) continue ;; esac
-			mb=$(( $(wc -c < "$f") / 1048576 ))
+			mb=$(( $(file_bytes "$f") / 1048576 ))
 			mark=""; [ "$f" = "$cur" ] && mark="  <- in use"
 			set -- "$@" "$(basename "$f")" "${mb}M$mark"
 		done

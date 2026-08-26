@@ -77,6 +77,32 @@ find_bin() {
 	command -v "$1" 2>/dev/null || true
 }
 
+# file_bytes FILE: the size, without reading the file.
+#
+# ⚠⚠ NOT `wc -c`. Two of these scripts chose wc over stat on purpose, with the
+# comment "busybox is often built without the stat applet and `stat -c%s ||
+# echo 0` then reports every model as 0 MB". The reasoning was right and the
+# conclusion was backwards: BUSYBOX wc -c READS THE WHOLE FILE. GNU coreutils
+# fstats it and answers in three syscalls; busybox counts bytes, and measured
+# here that is 532831 read() calls and 1.55 seconds for one 2.2 GB model with
+# the page cache already warm. On a card it is tens of seconds, per model, and
+# it is why charsiu-config's model picker got slow after a `charsiu pull`.
+#
+# So try stat, and fall back to ls -ln rather than to wc. ls is in every shell
+# environment there is, its fifth field is the size whatever the file is
+# called, and it never opens the file.
+file_bytes() {
+	[ -f "$1" ] || { echo 0; return; }
+	_sz=$(stat -c %s "$1" 2>/dev/null) || _sz=""
+	case "$_sz" in
+	''|*[!0-9]*) _sz=$(ls -ln "$1" 2>/dev/null | awk 'NR==1 {print $5}') ;;
+	esac
+	case "$_sz" in
+	''|*[!0-9]*) _sz=0 ;;
+	esac
+	echo "$_sz"
+}
+
 # --- models ---------------------------------------------------------------
 
 # model_dirs: every directory to look in, user first, each at most once.

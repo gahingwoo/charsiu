@@ -24,9 +24,7 @@ CK=$(find_bin charsiu_check)
 
 printf '%-44s %8s  %-9s %s\n' NAME SIZE RUNS WHERE
 all_models | while IFS= read -r f; do
-	# ⚠ wc -c, not stat: busybox is often built without the stat applet
-	# and `stat -c%s || echo 0` then reports every model as 0 MB.
-	mb=$(( $(wc -c < "$f") / 1048576 ))
+	mb=$(( $(file_bytes "$f") / 1048576 ))
 	runs="?"
 	[ -n "$CK" ] && { "$CK" -q "$f" >/dev/null 2>&1 && runs="yes" || runs="NO"; }
 	mark=""; [ "$f" = "$CUR" ] && mark=" *"

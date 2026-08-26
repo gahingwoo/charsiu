@@ -250,12 +250,16 @@ fetch_and_gate() {
 		_gpid=$!
 		{
 			while kill -0 "$_gpid" 2>/dev/null; do
-				# ⚠ `wc -c < missing 2>/dev/null` DOES NOT GO QUIET. The
-				# redirection is the shell's, and it reports the failure on
-				# its own stderr before wc ever runs, so the first seconds
-				# of every download printed an error straight over the
-				# gauge. Ask whether the file is there instead.
-				if [ -f "$part" ]; then _sz=$(wc -c < "$part"); else _sz=0; fi
+				# ⚠ file_bytes, NOT wc -c, and the reason is worse than
+				# tidiness: busybox wc READS THE WHOLE FILE, so this loop
+				# re-read a growing multi-gigabyte download once a second
+				# to draw its own progress bar. It also handles a missing
+				# file quietly -- `wc -c < missing 2>/dev/null` does not,
+				# because the redirection is the shell's and it reports the
+				# failure on its own stderr before wc ever runs, which
+				# printed an error straight over the gauge for the first
+				# seconds of every download.
+				_sz=$(file_bytes "$part")
 				_p=$(( _sz / 1048576 * 100 / want_mb ))
 				[ "$_p" -gt 99 ] && _p=99
 				echo "$_p"
@@ -270,7 +274,7 @@ about ${want_mb} MB"
 		get_url "$url" "$part" || _dlfail=1
 	fi
 	if [ "$_dlfail" = 1 ]; then
-		got=$([ -f "$part" ] && wc -c < "$part" || echo 0)
+		got=$(file_bytes "$part")
 		die "the download stopped after $((got / 1048576)) MB of about ${want_mb} MB.
 
   ⚠ IT DOES NOT START OVER. The part that arrived is kept in
