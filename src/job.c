@@ -754,28 +754,66 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1084, 0x00000000);
 	emit(&e, CNA, 0x1088, job->input_addr);
 	emit(&e, CNA, 0x108c, 0x000f000f);
-	emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
-	emit(&e, CNA, 0x1094, rows);            /* inw * full_inh */
 	/*
-	 * Rounded UP to a multiple of four, which is Mesa's rule.
+	 * ⚠⚠ M > 1: THREE REGISTERS THE VENDOR HOLDS STILL AND THIS TREE MOVES.
 	 *
-	 * This is the ONLY register where charsiu's whole stream differs from a
-	 * vendor int8 convolution compiled at this exact shape, once addresses,
-	 * this model's quantisation and the four op enables are set aside:
-	 * charsiu writes 4 and the vendor writes 1. Mesa's value is the one
-	 * proven on this path, so it stays the default, and CHARSIU_CNA_1098
-	 * asks the board whether the difference matters.
+	 * Read out of the vendor's own .rkllm with tools/rkllm_mdiff.py, which
+	 * takes one shape it dispatches at five different M and prints the
+	 * block. At ic=1312 oc=64 fp16, M = 4, 32, 64, 96, 124:
+	 *
+	 *              vendor                    this tree
+	 *   0x1028     surf*M | ic-1             same
+	 *   0x102c     M-1                       same
+	 *   0x1034     M-1                       same
+	 *   0x1078     M-1                       same
+	 *   0x1090     0xa4, CONSTANT in M       4, constant
+	 *   0x1094     1,    CONSTANT in M       M          <-- moves
+	 *   0x1098     M,    exactly             (M+3) & ~3 <-- rounds
+	 *   0x118c     0,    CONSTANT in M       M-1        <-- moves
+	 *
+	 * So M is not the width and not the height: the vendor's inw * inh is
+	 * 1 at every M and the count lives in 0x1098 alone. This tree spread it
+	 * across three registers instead, and every one of them is DEGENERATE
+	 * at M = 1 -- a stride over one row, a count of one, a last index of
+	 * zero -- which is why nine activation layout candidates could all fail
+	 * for a reason no layout could fix.
+	 *
+	 * ⚠ THE FIX APPLIES ONLY WHEN M > 1. At M = 1 this stream is byte
+	 * identical to a vendor convolution at the same shape except 0x1098,
+	 * where Mesa's round-to-four is the value proven on this path; decode
+	 * is M = 1 and nothing here may move it. CHARSIU_M_LEGACY restores the
+	 * old arithmetic so a round can show the fault coming back.
+	 *
+	 * ⚠ NOT PROVEN FOR int4 PROJECTIONS. Every vendor stream at M > 1 is
+	 * fp16 attention against the KV cache -- its int4 projections are M = 1
+	 * without exception -- so carrying these three across to a weight
+	 * matmul is an inference from one dtype to another, not a measurement.
+	 * That is exactly what the next board round is for.
 	 */
-	emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
-	     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
-	     : ((rows * 1 + 3) & ~3u));
+	{
+		int mfix = rows > 1 && !getenv("CHARSIU_M_LEGACY");
+
+		emit(&e, CNA, 0x1090, 1 * 4);           /* inw * 4 */
+		emit(&e, CNA, 0x1094, mfix ? 1u : rows);
+		/*
+		 * regcmd.c, the geometry only emitter, has written plain `rows`
+		 * here since it was written. The two emitters disagreeing has
+		 * cost this tree once already -- 0x100c's int4 constant -- and
+		 * the other one was right that time too.
+		 */
+		emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
+		     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
+		     : mfix ? rows : ((rows * 1 + 3) & ~3u));
+	}
 	emit(&e, CNA, 0x109c, 0x00000000);
 	emit(&e, CNA, 0x1100, 0x00000000);
 	emit(&e, CNA, 0x1104, 0x00000000);
 	emit(&e, CNA, 0x1110, job->weight_addr);
 	emit(&e, CNA, 0x1140, 0x00000000);
 	emit(&e, CNA, 0x1144, 0x00000000);
-	emit(&e, CNA, 0x118c, rows - 1);        /* (inw - 1) << 16 is zero */
+	/* 0 at M = 1 either way; the vendor holds it at 0 for every M. */
+	emit(&e, CNA, 0x118c,
+	     (rows > 1 && !getenv("CHARSIU_M_LEGACY")) ? 0u : rows - 1);
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
