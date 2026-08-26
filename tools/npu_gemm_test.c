@@ -841,9 +841,44 @@ int main(int argc, char **argv)
 					       surf ? (double)fr / surf : 0.0);
 				}
 				else
-					printf("\n  %u stride pairs fit both"
-					       " counts; not pinned.\n", hits);
+					printf("\n  %u stride pairs fit all"
+					       " the counts.\n"
+					       "  ⚠ The function that fits the"
+					       " m=2 MAP exactly -- 80 of 80\n"
+					       "  cells, R=20 S=40 -- predicts"
+					       " %zu words at m=4 and the board\n"
+					       "  wrote %zu. So the layout"
+					       " depends on m in a way one map\n"
+					       "  at one m cannot show, and"
+					       " counts are too weak to fit it.\n"
+					       "  The map at m=4 follows.\n",
+					       hits, addr_range(n, 4, 20, 40),
+					       g_live_at_m4);
 			}
+		}
+	}
+
+	/*
+	 * ⚠ THE MAP AT m=4 AS WELL, because three counts turned out to be too
+	 * weak to fit what one map pinned exactly.
+	 *
+	 * At m=2 the address function is unique: searching a four parameter
+	 * family against the 80 unique cells leaves one, R=20 S=40 with the
+	 * channel group at 16. It reproduces both m=2 counts and then predicts
+	 * 132 words at m=4 where the board wrote 148. A model that fits one
+	 * width perfectly and misses the next is a model of that width, so the
+	 * m dependence has to be read rather than extrapolated.
+	 *
+	 * ⚠ And the layout is not the critical path anyway. At m=2 thirty six
+	 * reference values were never computed and at m=4 it is a hundred and
+	 * eight, so no permutation recovers them; what the second map is for
+	 * is which ones are missing and in what pattern.
+	 */
+	if (n >= 16 && !getenv("CHARSIU_NO_M4_MAP")) {
+		reference(4, k, n, A, B, want);
+		if (!run(dev, 4, k, n, A, B, got)) {
+			printf("\n  ===== the same, at m=4 =====\n");
+			locate(4, n, got, want);
 		}
 	}
 
