@@ -18,7 +18,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
           src/npudev.c src/device.c src/job.c src/regcmd.c
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
-     $(BUILD)/charsiu_check $(BUILD)/charsiu_serve
+     $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -99,6 +99,9 @@ $(BUILD)/charsiu_check.aarch64: tools/charsiu_check.c src/gguf.c | $(BUILD)
 # An OpenAI compatible endpoint, so every chat front end that already exists
 # works against this board without anyone writing a GUI first.
 $(BUILD)/charsiu_serve: tools/charsiu_serve.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)

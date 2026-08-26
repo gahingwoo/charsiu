@@ -237,6 +237,14 @@ int  npu_out8_mode(void);
  * This is EXACTLY the operation step 2 replaces with charsiu_emit_job(), so
  * keeping every model matmul behind this one call is deliberate.
  */
+/* the widest batch a prefill chunk will use; sizes a small on-stack array */
+#define CHARSIU_BATCH_MAX 16
+
+/* M activations against one weight, reading the weight once. y is [m][nrows]
+ * with stride ystride between tokens. */
+void gguf_matmul(const struct gguf_tensor *w, const struct charsiu_act *a,
+		 unsigned m, float *y, uint64_t ystride,
+		 uint64_t row0, uint64_t nrows);
 void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 		 float *y, uint64_t row0, uint64_t nrows);
 

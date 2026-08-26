@@ -997,6 +997,67 @@ static float dotq_q4_0(const struct block_q4_0 *b, const struct charsiu_act *a,
 	return s;
 }
 
+/*
+ * ⚠ THE WEIGHT ROW IS THE EXPENSIVE PART, AND PREFILL WAS PAYING FOR IT ONCE A
+ * TOKEN. Measured: prompt throughput was FLAT at ~64-68 tok/s whatever the
+ * length, which is the signature of no batching -- 241 prompt tokens read the
+ * whole weight set 241 times. These take M activations against one row, so the
+ * row is unpacked and, more to the point, LOADED FROM MEMORY once for all M.
+ *
+ * The arithmetic is unchanged: each output is the same sum in the same order
+ * as the single-vector kernel, so a batch of one is bit-identical to it.
+ */
+static void dotq_q4_0_m(const struct block_q4_0 *b, const struct charsiu_act *a,
+			unsigned m, uint64_t nb, float *out, uint64_t ostride)
+{
+	float s[CHARSIU_BATCH_MAX];
+	unsigned j;
+
+	for (j = 0; j < m; j++)
+		s[j] = 0.0f;
+	for (uint64_t i = 0; i < nb; i++) {
+		int8x16_t lo, hi;
+		float d;
+
+		q4_0_nibbles(b[i].qs, &lo, &hi);
+		d = half_to_float(b[i].d);
+		for (j = 0; j < m; j++) {
+			int32x4_t acc = vdupq_n_s32(0);
+
+			acc = iacc16(acc, lo, vld1q_s8(a[j].q + i * 32));
+			acc = iacc16(acc, hi, vld1q_s8(a[j].q + i * 32 + 16));
+			s[j] += d * a[j].d[i] * (float)vaddvq_s32(acc);
+		}
+	}
+	for (j = 0; j < m; j++)
+		out[j * ostride] = s[j];
+}
+
+static void dotq_q8_0_m(const struct block_q8_0 *b, const struct charsiu_act *a,
+			unsigned m, uint64_t nb, float *out, uint64_t ostride)
+{
+	float s[CHARSIU_BATCH_MAX];
+	unsigned j;
+
+	for (j = 0; j < m; j++)
+		s[j] = 0.0f;
+	for (uint64_t i = 0; i < nb; i++) {
+		int8x16_t w0 = vld1q_s8(b[i].qs);
+		int8x16_t w1 = vld1q_s8(b[i].qs + 16);
+		float d = half_to_float(b[i].d);
+
+		for (j = 0; j < m; j++) {
+			int32x4_t acc = vdupq_n_s32(0);
+
+			acc = iacc16(acc, w0, vld1q_s8(a[j].q + i * 32));
+			acc = iacc16(acc, w1, vld1q_s8(a[j].q + i * 32 + 16));
+			s[j] += d * a[j].d[i] * (float)vaddvq_s32(acc);
+		}
+	}
+	for (j = 0; j < m; j++)
+		out[j * ostride] = s[j];
+}
+
 static float dotq_q4_1(const struct block_q4_1 *b, const struct charsiu_act *a,
 		       uint64_t nb)
 {
@@ -1177,7 +1238,68 @@ static float dotq_q6_K(const struct block_q6_K *b, const struct charsiu_act *a,
 	return s;
 }
 
+
+/* the portable batched pair; read against the NEON ones above */
+static void dotq_q4_0_m(const struct block_q4_0 *b, const struct charsiu_act *a,
+			unsigned m, uint64_t nb, float *out, uint64_t ostride)
+{
+	unsigned j;
+
+	for (j = 0; j < m; j++)
+		out[j * ostride] = dotq_q4_0(b, &a[j], nb);
+}
+
+static void dotq_q8_0_m(const struct block_q8_0 *b, const struct charsiu_act *a,
+			unsigned m, uint64_t nb, float *out, uint64_t ostride)
+{
+	unsigned j;
+
+	for (j = 0; j < m; j++)
+		out[j * ostride] = dotq_q8_0(b, &a[j], nb);
+}
+
 #endif
+
+/*
+ * M activations against one weight, reading the weight ONCE.
+ *
+ * ⚠ IT FALLS BACK PER TOKEN FOR ANYTHING IT DOES NOT HAVE A BATCHED KERNEL
+ * FOR, so the answer is the same everywhere and only the speed differs. A
+ * shape that quietly took a different arithmetic path would be the one bug
+ * this is least able to notice.
+ */
+void gguf_matmul(const struct gguf_tensor *w, const struct charsiu_act *a,
+		 unsigned m, float *y, uint64_t ystride,
+		 uint64_t row0, uint64_t nrows)
+{
+	uint64_t nc = w->ne[0];
+	const uint8_t *base = w->data;
+
+	if (m == 1) {
+		gguf_matvec(w, a, y, row0, nrows);
+		return;
+	}
+	if (a->quantised) {
+		switch (w->type) {
+		case GGML_Q4_0:
+			for (uint64_t r = 0; r < nrows; r++)
+				dotq_q4_0_m((const struct block_q4_0 *)
+					    (base + (row0 + r) * nc / 32 * 18),
+					    a, m, nc / 32, y + row0 + r, ystride);
+			return;
+		case GGML_Q8_0:
+			for (uint64_t r = 0; r < nrows; r++)
+				dotq_q8_0_m((const struct block_q8_0 *)
+					    (base + (row0 + r) * nc / 32 * 34),
+					    a, m, nc / 32, y + row0 + r, ystride);
+			return;
+		default:
+			break;
+		}
+	}
+	for (unsigned j = 0; j < m; j++)
+		gguf_matvec(w, &a[j], y + j * ystride, row0, nrows);
+}
 
 void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 		 float *y, uint64_t row0, uint64_t nrows)
