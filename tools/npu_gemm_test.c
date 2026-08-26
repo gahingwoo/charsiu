@@ -176,6 +176,58 @@ static int check(const char *what, unsigned m, unsigned n,
  * arithmetic fault. So before concluding anything, ask whether the numbers are
  * all THERE.
  */
+/*
+ * WHERE DID EACH WANTED VALUE ACTUALLY LAND?
+ *
+ * Guessing layouts stopped paying. Round 381 tried nine activation
+ * arrangements and five output ones and the best was 15 of 128, while the
+ * FIRST FOUR words of the output were exact at m = 2, 4, 8 and 32 alike --
+ * four int32 is sixteen bytes, one output atom. Something writes atom zero of
+ * row zero where this reads it and everything after somewhere else, and no
+ * amount of candidate formulas will say where if none of them is the one.
+ *
+ * So print the address function instead of hypothesising it: for each of the
+ * first few (row, channel) pairs, the flat index in the output buffer that
+ * holds the value the CPU computed for it. A layout is then read off the
+ * table rather than matched against a list.
+ *
+ * ⚠ AMBIGUOUS HITS ARE MARKED. A dot product of 256 int8 pairs can repeat, so
+ * a value found at three places is three candidates and not a fact; the count
+ * is printed so a reader can discount it.
+ */
+static void locate(unsigned m, unsigned n, const int32_t *got,
+		   const int32_t *want)
+{
+	size_t total = (size_t)m * n;
+	unsigned shown = 0;
+
+	printf("\n  where each wanted value landed  (flat index in the output)\n");
+	printf("    %-10s %-12s %-10s %s\n", "(row,ch)", "want", "at flat", "hits");
+	for (unsigned r = 0; r < m && shown < 12; r++) {
+		for (unsigned c = 0; c < n && shown < 12; c++) {
+			int32_t v = want[(size_t)r * n + c];
+			size_t first = total, hits = 0;
+
+			for (size_t i = 0; i < total; i++)
+				if (got[i] == v) {
+					if (!hits)
+						first = i;
+					hits++;
+				}
+			if (c > 5 && r == 0)
+				continue;      /* a few of row 0, then move on */
+			printf("    (%u,%-3u)    %-12d ", r, c, v);
+			if (!hits)
+				printf("%-10s -\n", "nowhere");
+			else
+				printf("%-10zu %zu%s\n", first, hits,
+				       hits > 1 ? "  (ambiguous)" : "");
+			shown++;
+		}
+	}
+	printf("    a contiguous [m][n] would put (r,c) at r*%u + c\n", n);
+}
+
 static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *want)
 {
 	size_t total = (size_t)m * n;
@@ -457,6 +509,7 @@ int main(int argc, char **argv)
 		       best, 2 * n);
 		run(dev, 2, k, n, A, B, got);
 		layouts(2, n, got, want);
+		locate(2, n, got, want);
 	}
 
 	printf("\n  m>1 is NOT usable as it stands: a batched prefill would be wrong.\n");

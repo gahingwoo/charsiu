@@ -8,7 +8,13 @@
 # is now: use it if it is still there, otherwise build NATIVELY, which works
 # because the development host is itself aarch64. Override CROSS= for anything
 # else.
-CFLAGS ?= -O2 -Wall -Wextra -std=c11 -Iinclude
+# ⚠ -Winfinite-recursion IS NOT IN -Wall OR -Wextra, and it would have caught
+# the one that mattered: act_q1_timed called itself instead of charsiu_act_q1,
+# which killed every NPU run on the board and was invisible in an -O2 build
+# because the compiler is entitled to delete an infinite recursion. Named
+# explicitly so a gcc that lacks it is not a silent downgrade; ?= means a
+# caller can still override the whole line.
+CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
 BUILD  := build
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)

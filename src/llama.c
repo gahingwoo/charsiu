@@ -426,12 +426,33 @@ static void act_set_timed(struct charsiu_act *a, const float *x, int n)
  * VANISHED or merely MOVED to a fallback -- and those are the two answers this
  * number exists to tell apart. The instrument follows the work.
  */
+/*
+ * ⚠⚠ THE UNTIMED BRANCH CALLS THE REAL FUNCTION, NOT ITSELF. Both of these
+ * recursed instead, which is one word in a wrapper whose whole body is four
+ * lines, and it was fatal in one place and silent in the other.
+ *
+ * On the NPU path act_q1_timed is reached on every routed projection, so with
+ * CHARSIU_STAGES unset -- which is every ordinary run -- the first forward
+ * recursed until the stack ran out. On the board that is a bare "Segmentation
+ * fault" after "pinned to CPUs", with nothing to say where.
+ *
+ * On the CPU path act_blocks_timed is reached for every block quantised
+ * weight, and there it was worse than a crash: an infinite recursion with no
+ * side effect is undefined behaviour, so an optimising build is entitled to
+ * delete it, and this one did. The blocks were then never realised, gguf_matvec
+ * quietly took its float fallback, and the answers stayed CORRECT while the
+ * quantised path this project exists to measure never ran.
+ *
+ * Found with ASan, which does not tail-call away the recursion and so reported
+ * the stack overflow by name. An -O2 build cannot: it turns one of these into
+ * a hang and the other into nothing at all.
+ */
 static void act_q1_timed(struct charsiu_act *a)
 {
 	double t;
 
 	if (stage_on <= 0) {
-		act_q1_timed(a);
+		charsiu_act_q1(a);
 		return;
 	}
 	t = now_ms();
@@ -444,7 +465,7 @@ static void act_blocks_timed(struct charsiu_act *a)
 	double t;
 
 	if (stage_on <= 0) {
-		act_blocks_timed(a);
+		charsiu_act_blocks(a);
 		return;
 	}
 	t = now_ms();
