@@ -278,6 +278,37 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 		shown = 0;
 	}
 	printf("    a contiguous [m][n] would put (r,c) at r*%u + c\n", n);
+
+	/*
+	 * ⚠ AND THE WHOLE BUFFER, not a sample of it. Thirty sampled rows say
+	 * where a pattern holds and cannot say where it STOPS, which is the
+	 * only interesting thing left: round 383's samples were exact for
+	 * channels 0 to 11 and then broke, and no sampling density would have
+	 * found the edge on its own.
+	 *
+	 * One line per eight words: for each flat index, which (row, channel)
+	 * the reference says that value belongs to, or a dot. Read down the
+	 * columns and the address function is simply visible.
+	 */
+	printf("\n  the whole output, as the (row,channel) each word holds\n");
+	for (size_t i = 0; i < total; i += 8) {
+		printf("    %4zu ", i);
+		for (size_t j = i; j < i + 8 && j < total; j++) {
+			size_t hits = 0, at = 0;
+
+			for (size_t q = 0; q < total; q++)
+				if (want[q] == got[j]) { if (!hits) at = q; hits++; }
+			if (!hits)
+				printf("  .    ");
+			else if (hits > 1)
+				printf(" ?%zu,%-3zu", at / n, at % n);
+			else
+				printf(" %zu,%-4zu", at / n, at % n);
+		}
+		printf("\n");
+	}
+	printf("    a leading ? means that value is not unique in the"
+	       " reference\n");
 }
 
 static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *want)

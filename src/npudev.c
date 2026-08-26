@@ -1668,10 +1668,32 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (j = 0; j < e->count; j++) {
 			charsiu_note("a group: reading a slice back",
-				     (unsigned long)i, (unsigned long)j);
+				     (unsigned long)i, (unsigned long)e->count);
 			const struct npu_slot *s = &g->slot[e->first + j];
-			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
-					      s->out_slot * g->out_stride;
+			const uint8_t *base;
+
+			/*
+			 * ⚠ THE TWO NUMBERS THAT CAN MAKE THE NEXT LINE A NULL
+			 * DEREFERENCE. e->out is an array of ndev buffers, so
+			 * a slot whose di is not a device index reads past it
+			 * and takes whatever .map happens to be there. Naming
+			 * them here costs one store and turns a segfault into
+			 * a sentence.
+			 */
+			charsiu_note("a group: a slice's device and out slot",
+				     (unsigned long)s->di,
+				     (unsigned long)s->out_slot);
+			if (s->di >= g->ndev || !e->out[s->di].map) {
+				fprintf(stderr, "charsiu: slice %u of tensor "
+					"%u has device %u of %u and map %p\n",
+					j, i, s->di, g->ndev,
+					s->di < g->ndev ? e->out[s->di].map
+							: NULL);
+				g->dead = 1;
+				return -1;
+			}
+			base = (const uint8_t *)e->out[s->di].map +
+			       s->out_slot * g->out_stride;
 
 			if (g->w4) {
 				const float *fo = (const float *)base;
