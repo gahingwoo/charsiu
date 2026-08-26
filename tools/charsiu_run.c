@@ -63,6 +63,45 @@ static void usage(void)
 "  -q            do not echo the prompt\n");
 }
 
+/*
+ * ⚠ THE BOARD'S TEMPERATURE, AND THE RATE IN TWO HALVES.
+ *
+ * An earlier run of the same model at the same weight width reached 17.1 tok/s
+ * and was not kept; the likeliest reason is that the board had just been
+ * switched on. Four fifths of a token is the NPU sitting on the DRAM roof and
+ * will not move with a clock, but the twelve milliseconds of CPU around it
+ * will, and so will the DDR.
+ *
+ * "Maybe it was cold" is not a measurement and cannot be argued with. A
+ * temperature at each end of the run, and the generation rate split in half,
+ * turn it into one: a run that starts at 45 and ends at 78 with the second half
+ * slower than the first has throttled, and the log says so without needing a
+ * second run to compare against.
+ *
+ * Reads the hottest thermal zone. Says nothing if sysfs has none, which is what
+ * happens on the build host.
+ */
+static double board_temp_c(void)
+{
+	double hottest = 0.0;
+
+	for (int z = 0; z < 16; z++) {
+		char path[80];
+		FILE *f;
+		long milli = 0;
+
+		snprintf(path, sizeof(path),
+			 "/sys/class/thermal/thermal_zone%d/temp", z);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (fscanf(f, "%ld", &milli) == 1 && milli / 1000.0 > hottest)
+			hottest = milli / 1000.0;
+		fclose(f);
+	}
+	return hottest;
+}
+
 int main(int argc, char **argv)
 {
 	const char *path = NULL, *prompt = NULL, *promptfile = NULL;
@@ -103,6 +142,7 @@ int main(int argc, char **argv)
 	int interactive = 0, turn;
 	char cachepath[1024];
 	double t_load, t0, t_prompt;
+	double temp_start = 0.0, t_half = 0.0;
 	int i;
 
 	for (i = 1; i < argc; i++) {
@@ -457,6 +497,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	temp_start = board_temp_c();
 	t0 = now_ms();
 	int produced = 0;
 	/*
@@ -562,6 +603,10 @@ int main(int argc, char **argv)
 			fflush(stdout);
 		}
 		produced++;
+		/* ⚠ counted in PRODUCED tokens, not iterations: a control
+		 * token that is not printed still costs a forward pass. */
+		if (!t_half && produced * 2 >= n_gen)
+			t_half = now_ms();
 next:
 
 		if (st->pos >= st->n_ctx)
@@ -573,6 +618,7 @@ next:
 
 	{
 		double t_gen = now_ms() - t0;
+		double temp_end = board_temp_c();
 		long hwm = 0;
 		/* ⚠ NOT `st`: that is the llama state, and shadowing it here
 		 * made the interactive report read st->pos off a FILE. */
@@ -599,6 +645,26 @@ next:
 		       t_load, n_ids, t_prompt, n_ids * 1000.0 / (t_prompt ? t_prompt : 1),
 		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1),
 		       hwm / 1024);
+		/*
+		 * ⚠ THE HALVES, NOT A ROLLING AVERAGE. Attention grows with the
+		 * context too, so the second half is expected to be a little
+		 * slower on its own; what a throttle looks like is a gap wider
+		 * than that alongside a temperature that climbed.
+		 */
+		if (!interactive && produced >= 8 && t_half > 0.0) {
+			int h = produced / 2;
+			double first = t_half - t0;
+			double second = t_gen - first;
+
+			printf("[first %d tok %.2f tok/s, last %d tok %.2f"
+			       " tok/s", h, h * 1000.0 / (first ? first : 1),
+			       produced - h,
+			       (produced - h) * 1000.0 / (second ? second : 1));
+			if (temp_start > 0.0)
+				printf(", board %.0f -> %.0f C",
+				       temp_start, temp_end);
+			printf("]\n");
+		}
 		if (!interactive && eog_at >= 0)
 			printf("[the model reached its own end at token %d; "
 			       "the other %d are --ignore-eos continuing a "
