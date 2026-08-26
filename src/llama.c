@@ -844,6 +844,20 @@ int llama_load(struct llama_model *m, const char *path)
 		goto fail;
 	}
 
+	/*
+	 * ⚠ SAY WHICH MODEL, because the output is the only clue otherwise. A
+	 * board decoding nonsense looked like a broken runtime until it turned
+	 * out to be a particular file; the name and the architecture would have
+	 * said so on the first line. The basename only: the full path is in the
+	 * config and this is a status line, not a report.
+	 */
+	{
+		const char *base = strrchr(path, '/');
+
+		fprintf(stderr, "charsiu: %s (%s, %u layers)\n",
+			base ? base + 1 : path, arch, m->n_layer);
+	}
+
 	m->tk = tokenizer_from_gguf(&m->gguf);
 	if (!m->tk)
 		goto fail;

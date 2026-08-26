@@ -536,6 +536,25 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 
 	if (grp == 0 || grp > k)
 		grp = k;
+	/*
+	 * ⚠⚠ A PARTIAL LAST GROUP IS QUANTISED HERE AND CONSUMED AS THOUGH IT
+	 * DID NOT EXIST. npudev's tensor_grouped() requires k % kgroup == 0, so
+	 * a tensor with a remainder is treated as UNGROUPED and its scales are
+	 * read as scale[row] -- but this had already written them as
+	 * scale[row * ngrp + group]. Every row then gets some other row's
+	 * scale.
+	 *
+	 * It never showed up because every llama dimension is a power of two
+	 * and divides the 1024 slice exactly. Qwen2.5-1.5B is n_embd 1536 and
+	 * n_ff 8960, neither of which does, and on the board it decoded
+	 * "otasiculoshci.syič希opol staticollect..." while the same file on the
+	 * CPU answered properly.
+	 *
+	 * One scale a row is what the consumer will apply, so it is what gets
+	 * written. Coarser for these shapes, and correct.
+	 */
+	if (k % grp)
+		grp = k;
 	ngrp = (k + grp - 1) / grp;
 
 	/*

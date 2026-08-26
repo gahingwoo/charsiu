@@ -930,6 +930,24 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		      (unsigned)t->n);
 		return -1;
 	}
+	/*
+	 * ⚠ THE TWO SIDES MUST AGREE ABOUT GROUPING, and when they did not the
+	 * answer was wrong rather than absent. The quantiser rounded a partial
+	 * last group up and wrote scales as scale[row * ngrp + group];
+	 * tensor_grouped() below refuses a remainder, so the consumer read the
+	 * same array as scale[row] and every row took some other row's scale.
+	 * Qwen2.5-1.5B (k 1536 and 8960 against a 1024 slice) decoded fluent
+	 * nonsense on the board while the same file was correct on the CPU.
+	 *
+	 * The quantiser no longer emits that state. This is here so that if it
+	 * ever does again, the tensor falls back to the CPU and says why,
+	 * instead of returning numbers nobody can tell are wrong.
+	 */
+	if (t->kgroup && t->kgroup < t->k && (t->k % t->kgroup)) {
+		whine(g, "a partial weight group would be read as one scale a row",
+		      (unsigned)t->k, (unsigned)t->n);
+		return -1;
+	}
 
 	/*
 	 * DECIDE THE SPLIT FIRST, because everything below is geometry over the
