@@ -66,23 +66,52 @@ now.
 
 ## 2. The output head, which is two fifths of a gemma token
 
-262144 wide, tied at q8_0, 428 MB every token, and on the CPU because it will not
-route:
+262144 wide, 151 MB every token, and on the CPU: the stage table for gemma3 charges
+it 49.8 ms of a 113 ms token, at 3 GB/s, where the NPU moves weights at 6 to 10.
 
-```
-  weights       151 MB    32 slices at N=8192, int4
-  coefficients 1210 MB    <-- charsiu_coef_bytes bounds it by k*n
-```
+**It was not the coefficient bound.** The shipped runner already passes
+`CHARSIU_COEF_ELEMS=65536`, which puts the head's coefficients at 10.5 MB and well
+inside what allocates. What refused it was `maxn`: the config default was 131072,
+picked to clear llama 3.2's 128256 vocabulary, and gemma3's is 262144.
 
-The bound is a guess and its own comment has said so since it was written: the two
-walls it was sized against were tens of KILObytes, and nothing has ever measured the
-read growing with `k*n`. At 65536 elements the same head wants 10.5 MB and fits.
+Two things made that cost four board rounds to see:
+
+- the runtime declined **silently**. Every other refusal in npudev whines once per
+  reason; this gate only spoke under `CHARSIU_NPU_VERBOSE`. All three silent paths
+  now say which tensor, why, and which setting to change.
+- the round that set `CHARSIU_NPU_MAXN=262144` on the command line **did not set it**.
+  `charsiu run` builds its environment from config.ini and passes it through
+  `env NAME=VALUE`, which is put in front of the inherited environment, so the
+  config's 131072 overwrote the caller's 262144 without a word. The config is the
+  default now and the environment is the override.
+
+**Next**: a board round with `charsiu run gemma-3-1b-it-Q4_0.gguf` and nothing else,
+on a config that has the new `maxn = 262144`. If the head routes, the token should
+lose most of 49.8 ms and gemma3 should go from 8.76 tok/s to somewhere near 12.
+
+The coefficient bound is still a guess and still worth measuring, but it is no longer
+in the way of anything.
 
 **Control**: `npu_gemm_test K N --coef` walks the bound downward and stops at the
 first value that is not exact. ⚠ It walks DOWN because under-allocating does not
 return an error -- the RDMA reads past the buffer, the IOMMU faults, and the job times
 out with every register correct. The last exact value is the floor; everything below
 it is unexplored rather than known bad.
+
+## 2b. gemma3 runs the NPU at 6.16 GB/s where llama reaches 10.3
+
+Same board, same int4 path, and the difference is the shape. n_embd 1152 does not
+divide the 1024 K slice, so q, k, v, gate and up each split 1024 + 128 and the second
+slice carries a ninth of a slice of work for a whole task's cost. 468 slices where
+338 would do, five of the extras in every one of 26 layers.
+
+`CHARSIU_NPU_KFIT=1` gives the last slice the remainder instead, so 1152 is one slice.
+Ungrouped tensors only: a grouped tensor's scale gather reads one group per slice.
+Off by default, unrun.
+
+**Control**: the same prompt with and without it in one boot. Identical tokens is the
+correctness bar, since acc_out sums int32 across K slices and any split of the same K
+has to give the same accumulator; slices and GB/s in the NPU report are the win.
 
 ## 3. Upstreaming
 
@@ -98,6 +127,6 @@ Stated in advance, so it is a decision rather than a slow fade:
 
 - if prefill cannot be batched after a fair attempt, that is a written negative result
   and decode stands on its own -- it already beats the vendor;
-- if the coefficient bound turns out to be real rather than a guess, the output head
-  stays on the CPU and gemma-shaped models are simply expensive on this board, which
-  is worth saying rather than working around.
+- if the output head routes and gemma3 does not get faster, the head belongs on the
+  CPU on this board and gemma-shaped models are simply expensive here, which is worth
+  saying rather than working around.

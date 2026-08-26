@@ -171,8 +171,8 @@ were wrong in this file before:
 question, and they are kept because the reasoning in them is still the reasoning.**
 What they say is left has since been done: models run, int4 computes end to end, and
 the numbers at the top of this file are measured rather than projected. What is still
-open is further down -- prefill above M = 1, and an output head the coefficient bound
-keeps on the CPU.
+open is further down -- prefill above M = 1, and an output head that a stale width cap
+had been keeping on the CPU.
 
 One thing on that list has not moved: the reference still requantises in float where
 the hardware uses an integer scale and shift. It agrees to the byte on everything
@@ -1346,7 +1346,7 @@ with the hardware taking every projection:
 
 ```
 CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=131072
+CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=262144
 ```
 
 `CHARSIU_STAGES=1` prints where a token goes, and prints it once per half of the run,
@@ -1398,25 +1398,47 @@ the 4.6B stored. What is left is the head, and it is **two fifths of the token
 on a CPU that reads at 6.5 GB/s**. At the board's measured rates that is about
 167 ms a token, or 6 tok/s, against Llama-3.2-1B's measured 60.4.
 
-### Why the output head cannot be routed, and what would move it
+### Why the output head was not routed, which was not what it looked like
 
-```
-  weights       151 MB    32 slices at N=8192, int4
-  coefficients 1210 MB    <-- and this is why the allocation fails
-```
+The suspect was the coefficient buffer. `charsiu_coef_bytes` bounds the
+coefficient surface by `k*n`, which makes it four times the weight buffer and
+would put this head at 1210 MB against 151 MB of weights. That bound is a guess
+and its own comment has said so since it was written: the two walls it was sized
+against were tens of KILObytes -- 4.7 KB allocated against 33 KB read, and 1280
+bytes against 20800 -- and nothing has ever measured the read growing with
+`k*n`.
 
-`charsiu_coef_bytes` bounds the coefficient surface by `k*n`, which makes it
-four times the weight buffer. The bound is a guess and its own comment has said
-so since it was written: the two walls it was sized against were tens of
-KILObytes -- 4.7 KB allocated against 33 KB read, and 1280 bytes against 20800
--- and nothing has ever measured the read growing with `k*n`. At 65536 elements
-the same head wants 10.5 MB and fits.
+**It was not the coefficient buffer.** The shipped runner has passed
+`CHARSIU_COEF_ELEMS=65536` all along, which puts the same head at 10.5 MB. What
+refused it was `maxn`: the config default was 131072, chosen to clear Llama
+3.2's 128256 vocabulary, and gemma3's is 262144. The runtime clamps the cap to
+the model's own vocabulary anyway, so a wider number costs nothing, and the one
+reason to keep a wide head off -- it used to share one output buffer with every
+other tensor, so all 113 matvecs a token paid for its size -- stopped being true
+when each tensor got its own.
 
-`npu_gemm_test K N --coef` walks the bound downward and stops at the first value
-that is not exact. ⚠ It walks DOWN because under-allocating does not return an
-error: the RDMA reads past the buffer, the IOMMU faults, and the job times out
-with every register correct. The last exact value is the floor; everything below
-it is unexplored rather than known bad.
+Two things kept that invisible for four board rounds:
+
+- the runtime **declined without saying so**. Every other refusal in npudev
+  whines once per reason; this gate only spoke under `CHARSIU_NPU_VERBOSE`. The
+  three silent paths -- the cap, the tensor slots, and the quantised copy
+  failing to allocate -- now each name the tensor, the reason and the setting.
+- the round that put `CHARSIU_NPU_MAXN=262144` on the command line **did not set
+  it**. `charsiu run` builds its environment from config.ini and hands it to
+  `env NAME=VALUE`, which goes in front of the inherited environment, so the
+  config's 131072 silently won. The config file is the default now and the
+  environment is the override; `charsiu --show` names anything it deferred to.
+
+The staging bar hid the arithmetic too: its denominator is a prediction and its
+heartbeat fires every sixteenth tensor, so it drew `183/183` over a run that
+staged 182. It reconciles against the runtime's own count now.
+
+The coefficient bound is still unmeasured and still worth measuring.
+`npu_gemm_test K N --coef` walks it downward and stops at the first value that is
+not exact. ⚠ It walks DOWN because under-allocating does not return an error: the
+RDMA reads past the buffer, the IOMMU faults, and the job times out with every
+register correct. The last exact value is the floor; everything below it is
+unexplored rather than known bad.
 
 ### gemma3-1b is slower here, and the reason is not the graph
 
@@ -1429,9 +1451,18 @@ Llama-3.2-1B's 128256, and its head is **tied to `token_embd` at q8_0**, so it r
 that lands on a CPU whose sequential read is about 6.5 GB/s, and 321 MB at 6.5 GB/s is
 49 ms. The arithmetic closes; there is no bug in it.
 
-The rest is size. gemma3-1b's embedding is 1152 against llama's 2048, so its submits
-carry **1.92 MB against llama's 4.75** for roughly the same fixed cost per submit, and
-the hardware rate falls from 10.82 GB/s to 6.16.
+The rest is size, and part of it is a remainder. gemma3-1b's embedding is 1152 against
+llama's 2048, so its submits carry **1.92 MB against llama's 4.75** for roughly the
+same fixed cost per submit, and the hardware rate falls from 10.82 GB/s to 6.16.
+
+1152 also does not divide the 1024 K slice. `ceil(k / KMAX)` leaves the remainder in a
+slice of its own, so q, k, v, gate and up each split 1024 + 128 and the second slice
+carries a ninth of a slice of work for a whole task's cost -- five extra tasks in every
+one of 26 layers, and 468 slices where 338 would do. Every llama dimension is a power
+of two and divides 1024 exactly, which is why this had never come up.
+`CHARSIU_NPU_KFIT=1` gives the last slice the remainder instead. Ungrouped tensors
+only: a grouped tensor carries one scale per (channel, K group) and a slice spanning
+two groups would apply the first group's scale to both. Off by default, unrun.
 
 ### More than one architecture, and two things that were quietly wrong
 
