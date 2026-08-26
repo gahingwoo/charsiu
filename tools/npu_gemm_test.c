@@ -290,7 +290,23 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	 * the reference says that value belongs to, or a dot. Read down the
 	 * columns and the address function is simply visible.
 	 */
-	printf("\n  the whole output, as the (row,channel) each word holds\n");
+	{
+		const char *ax = getenv("CHARSIU_M_AXIS");
+		const char *ap = getenv("CHARSIU_ENTRY_ATOMICS");
+
+		/*
+		 * ⚠ SAY WHICH CONFIGURATION THIS MAP IS OF. Round 384's map
+		 * was printed with CHARSIU_ENTRY_ATOMICS left at 8 by the
+		 * sweep and round 385's at 4, and the two look nothing alike
+		 * -- which read as the hardware being non-deterministic until
+		 * the difference turned out to be an environment variable
+		 * nobody reset.
+		 */
+		printf("\n  the whole output, as the (row,channel) each word"
+		       " holds\n  (M on the %s, CHARSIU_ENTRY_ATOMICS=%s)\n",
+		       ax && (*ax == 'w' || *ax == 'W') ? "width" : "height",
+		       ap ? ap : "4");
+	}
 	for (size_t i = 0; i < total; i += 8) {
 		printf("    %4zu ", i);
 		for (size_t j = i; j < i + 8 && j < total; j++) {
@@ -309,6 +325,53 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	}
 	printf("    a leading ? means that value is not unique in the"
 	       " reference\n");
+
+	/*
+	 * ⚠⚠ THE QUESTION THIS WHOLE FILE IS ACTUALLY ASKING. If every value
+	 * the reference computes appears exactly once in the buffer, then the
+	 * ARITHMETIC IS RIGHT and only the read order is wrong -- and a
+	 * batched prefill is available today, through a permutation, without
+	 * another register. If values are missing, the hardware did not
+	 * compute them and no read order will help.
+	 *
+	 * Counted, not eyeballed: a map that fits every cell it can see can
+	 * still be an overfit on the cells it cannot.
+	 */
+	{
+		size_t placed = 0, absent = 0, ambiguous = 0;
+		int injective = 1;
+		unsigned char *used = calloc(total, 1);
+
+		for (size_t q = 0; q < total; q++) {
+			size_t hits = 0, at = 0;
+
+			for (size_t i = 0; i < total; i++)
+				if (got[i] == want[q]) { if (!hits) at = i; hits++; }
+			if (!hits) absent++;
+			else if (hits > 1) ambiguous++;
+			else {
+				placed++;
+				if (used && used[at])
+					injective = 0;
+				if (used)
+					used[at] = 1;
+			}
+		}
+		free(used);
+		printf("\n  of %zu reference values: %zu land in exactly one slot,"
+		       " %zu in several,\n  %zu are absent from the buffer"
+		       " altogether%s\n", total, placed, ambiguous, absent,
+		       placed && injective ? "; the unique ones collide with"
+					     " nothing" : "");
+		if (!absent && injective)
+			printf("\n  ⚑ THE ARITHMETIC IS RIGHT AND ONLY THE READ"
+			       " ORDER IS WRONG.\n  A batched prefill is"
+			       " available through a permutation, with no\n"
+			       "  further register work.\n");
+		else if (absent)
+			printf("\n  %zu values were never computed, so no read"
+			       " order recovers them.\n", absent);
+	}
 }
 
 static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *want)

@@ -1420,7 +1420,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 
 		if (g->w4 && grp && !g->plain) {
 			g->call_us += now_us() - tcall;
-			return 0;              /* it was summed into y */
+			charsiu_note("something outside the NPU code", 0, 0);
+	return 0;              /* it was summed into y */
 		}
 		if (g->midrise && !grp)
 			for (unsigned ki = 0; ki < e->k_slices; ki++)
@@ -1433,6 +1434,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
 	}
 	g->call_us += now_us() - tcall;
+	charsiu_note("something outside the NPU code", 0, 0);
 	return 0;
 }
 
@@ -1745,6 +1747,9 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				}
 				continue;
 			}
+			charsiu_note("a group: summing an int8 slice",
+				     (unsigned long)s->job.mm.n,
+				     (unsigned long)s->n0);
 			out = (const int32_t *)base;
 			for (unsigned q = 0; q < s->job.mm.n; q++)
 				g->acc[s->n0 + q] += out[q];
@@ -1759,6 +1764,10 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		}
 		if (af != ys[i]) {
 			double hsu = 0.0;
+
+			charsiu_note("a group: converting to the caller's rows",
+				     (unsigned long)e->t->n,
+				     (unsigned long)(uintptr_t)e->t->scale);
 
 			if (g->midrise && !grp)
 				for (unsigned ki = 0; ki < e->k_slices; ki++)
@@ -1785,5 +1794,13 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	g->fini_us += fspent;
 	g->busy_us += now_us() - t0;
 	g->call_us += now_us() - tcall;
+	/*
+	 * ⚠⚠ CLEAR THE BREADCRUMB ON THE WAY OUT, or it outlives the function
+	 * and every crash in the CALLER is reported against the last thing
+	 * this did. Round 385 spent a board run on "a slice's width and offset
+	 * (512, 0)" where both numbers were legal and every bound around them
+	 * held -- which is exactly what a stale note looks like.
+	 */
+	charsiu_note("something outside the NPU code", 0, 0);
 	return 0;
 }
