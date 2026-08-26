@@ -1767,12 +1767,24 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 * INCLUDING this one: llama.cpp masks when pos - t >= n_swa.
 		 */
 		/*
-		 * ⚠ NOT t0. llama_forward's timing variable is a double called
-		 * t0, and the STAGE macro assigns to it; an int t0 declared
-		 * inside the layer loop shadows it, so with CHARSIU_STAGES set
-		 * the window start would be handed a millisecond timestamp
-		 * converted to int. Stages are off by default, which is the
-		 * only reason this had not bitten.
+		 * ⚠⚠ NOT t0, AND THIS ONE COST FOUR BOARD ROUNDS.
+		 *
+		 * llama_forward's timing variable is a double called t0 and the
+		 * STAGE macro assigns to it. An int t0 declared inside the
+		 * layer loop shadows it, so every stage handed the sliding
+		 * window's start a millisecond timestamp converted to int --
+		 * and attention then calls
+		 *
+		 *     softmax(s->att + (g0 + q) * n_ctx + t0, pos + 1 - t0)
+		 *
+		 * on a pointer megabytes past the buffer. That is a SIGSEGV in
+		 * the attention block of layer 0, which is exactly where the
+		 * breadcrumbs put it.
+		 *
+		 * It needs CHARSIU_STAGES to trigger, and the board has it on,
+		 * so "off by default" was never the protection it looked like.
+		 * It arrived with sliding window attention in the gemma3
+		 * commit and every NPU run since then died on it.
 		 */
 		int tlo = swa && pos + 1 > (int)m->n_swa ?
 			  pos + 1 - (int)m->n_swa : 0;

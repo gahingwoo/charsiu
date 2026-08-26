@@ -41,6 +41,14 @@ WANT="Paris"
 
 make -C "$ROOT" build/charsiu_run >/dev/null
 
+# ⚠ ONCE WITH CHARSIU_STAGES, because a crash that needs an environment
+# variable is still a crash. The sliding window's start was shadowed by
+# llama_forward's timing variable, which only the STAGE macro assigns to, so
+# every run with stages on took a wild pointer into softmax -- and the board
+# has stages on, so every NPU run died on it while every test here passed.
+# Four board rounds went into that. One extra pass here would have caught it.
+: "${CHARSIU_STAGES_PASS:=1}"
+
 bad=0
 n=0
 for m in "$DIR"/*.gguf; do
@@ -54,6 +62,20 @@ for m in "$DIR"/*.gguf; do
 	out=$("$RUN" "$m" -p "$PROMPT" -n 24 -c 512 -q 2>/dev/null | head -1)
 	case "$out" in
 	*"$WANT"*)
+		if [ "$CHARSIU_STAGES_PASS" = 1 ]; then
+			sout=$(CHARSIU_STAGES=1 "$RUN" "$m" -p "$PROMPT" -n 8 \
+				-c 512 -q 2>/dev/null | head -1) || sout=""
+			case "$sout" in
+			*"$WANT"*) ;;
+			*)
+				printf 'BAD  %-16s %s  (only with CHARSIU_STAGES=1)\n' \
+					"${arch:-?}" "$(basename "$m")"
+				printf '       %s\n' "$sout"
+				bad=$((bad + 1))
+				continue
+				;;
+			esac
+		fi
 		printf 'ok   %-16s %s\n' "${arch:-?}" "$(basename "$m")"
 		;;
 	*)

@@ -693,6 +693,15 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)
 		return;
+	/*
+	 * ⚠ SAY WHICH WEIGHT WIDTH THIS WAS. A tokens-per-second number is not
+	 * comparable without it -- int4 moves half the bytes of int8 and this
+	 * report is where a board log gets read from months later. Round 389's
+	 * 16.39 tok/s could not be placed against the README's 14.70 because
+	 * neither line said.
+	 */
+	fprintf(stderr, "charsiu NPU: weights are %s, %u devices\n",
+		g->w4 ? "int4" : "int8", g->ndev);
 	fprintf(stderr,
 		"charsiu NPU: %u tensors, %lu slices, %lu submits, %.2f MB per "
 		"submit%s\n",
