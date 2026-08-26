@@ -371,6 +371,30 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 		else if (absent)
 			printf("\n  %zu values were never computed, so no read"
 			       " order recovers them.\n", absent);
+
+		/*
+		 * ⚠ AND THE ONE NUMBER THAT SAYS WHAT IT RAN OUT OF. If the
+		 * hardware always writes the same COUNT of words whatever N
+		 * is, something has a fixed capacity -- a CBUF bank, a task's
+		 * output allowance. If it always writes the same FRACTION,
+		 * a stride or a count is scaled wrong. Those want different
+		 * fixes and one number tells them apart, so print it rather
+		 * than leaving it to be inferred from two logs.
+		 */
+		{
+			size_t last = 0, live = 0;
+
+			for (size_t i = 0; i < total; i++) {
+				int seen = 0;
+
+				for (size_t q = 0; q < total; q++)
+					if (want[q] == got[i]) { seen = 1; break; }
+				if (seen) { live++; last = i + 1; }
+			}
+			printf("  the board wrote %zu of %zu words, the last at"
+			       " %zu (%.0f%%)\n", live, total, last,
+			       100.0 * (double)live / (double)total);
+		}
 	}
 }
 
@@ -681,6 +705,30 @@ int main(int argc, char **argv)
 		run(dev, 2, k, n, A, B, got);
 		layouts(2, n, got, want);
 		locate(2, n, got, want);
+	}
+
+	/*
+	 * The same question at half the width. Two points is the whole
+	 * experiment: a fixed count means a capacity, a fixed fraction means
+	 * an arithmetic error on a stride.
+	 */
+	if (n >= 16) {
+		unsigned n2 = n / 2;
+		size_t tot2 = (size_t)2 * n2, live = 0;
+
+		reference(2, k, n2, A, B, want);
+		if (!run(dev, 2, k, n2, A, B, got)) {
+			for (size_t i = 0; i < tot2; i++)
+				for (size_t q = 0; q < tot2; q++)
+					if (want[q] == got[i]) { live++; break; }
+			printf("\n  at N=%u, m=2: the board wrote %zu of %zu"
+			       " words (%.0f%%)\n", n2, live, tot2,
+			       100.0 * (double)live / (double)tot2);
+			printf("  compare the count and the percentage against"
+			       " N=%u above:\n"
+			       "  the same COUNT is a capacity, the same"
+			       " PERCENTAGE is a stride.\n", n);
+		}
 	}
 
 	printf("\n  m>1 is NOT usable as it stands: a batched prefill would be wrong.\n");

@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "charsiu.h"
 #include "charsiu_llm.h"
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
@@ -509,6 +510,11 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 
 	if (s->n_npu == s->npu_cap)
 		return NULL;
+	/*
+	 * ⚠ w->name IS INSIDE THE MAPPED FILE for a whole tensor and inside
+	 * the layer for one of phi3's slices; both outlive a crash.
+	 */
+	charsiu_note(w->name, (unsigned long)w->ne[1], (unsigned long)w->ne[0]);
 	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0)
 		return NULL;
 	/*
@@ -1693,13 +1699,27 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	const float *freqf = NULL;
 
 	double t0, t1;
+	unsigned long cur_layer = 0;
 
 	if (pos >= s->n_ctx)
 		return NULL;
 
 	if (stage_on < 0)
 		stage_on = getenv("CHARSIU_STAGES") != NULL;
-#define STAGE(i) do { if (stage_on) { t1 = now_ms(); stage_ms[i] += t1 - t0; \
+	/*
+	 * ⚠ THE STAGE IS ALSO THE BREADCRUMB. A crash anywhere in the forward
+	 * pass used to arrive as "Segmentation fault" with nothing else, and
+	 * once charsiu_note started clearing itself on the way out of the NPU
+	 * code, everything that was NOT the NPU became "something outside the
+	 * NPU code (0, 0)" -- true, and one bit of information.
+	 *
+	 * One store a stage, sixteen stages a layer, is nothing next to a
+	 * projection, and it turns the same crash into a layer number and the
+	 * name of the step. The note points at a string in stage_name[], which
+	 * is static and outlives any crash.
+	 */
+#define STAGE(i) do { charsiu_note(stage_name[i], cur_layer, (unsigned long)pos); \
+		      if (stage_on) { t1 = now_ms(); stage_ms[i] += t1 - t0; \
 			      t0 = t1; } } while (0)
 	t0 = t1 = stage_on ? now_ms() : 0.0;
 
@@ -1732,6 +1752,8 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
+
+		cur_layer = l;
 		/*
 		 * ⚠ `il % n < n - 1` IS THE PATTERN, taken from llama.cpp's
 		 * set_swa_pattern: with the gemma default of 6 that is five
