@@ -207,6 +207,29 @@ static int check(const char *what, unsigned m, unsigned n,
  * a value found at three places is three candidates and not a fact; the count
  * is printed so a reader can discount it.
  */
+/*
+ * How many words the fitted address function spans at this shape. The board
+ * writes exactly that many, which is what makes the count a measurement of the
+ * strides rather than a symptom.
+ */
+static size_t g_live_at_n;   /* words the board wrote at the full N */
+
+static size_t addr_range(unsigned n, unsigned m, unsigned R, unsigned S)
+{
+	size_t hi = 0;
+
+	for (unsigned r = 0; r < m; r++)
+		for (unsigned c = 0; c < n; c++) {
+			unsigned u = c / 16, v = c % 16;
+			size_t f = (size_t)S * (u / 2) + (size_t)R * r
+				 + 8 * (v / 4) + 4 * (u % 2) + (v % 4);
+
+			if (f > hi)
+				hi = f;
+		}
+	return hi + 1;
+}
+
 static void locate(unsigned m, unsigned n, const int32_t *got,
 		   const int32_t *want)
 {
@@ -394,6 +417,7 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 			printf("  the board wrote %zu of %zu words, the last at"
 			       " %zu (%.0f%%)\n", live, total, last,
 			       100.0 * (double)live / (double)total);
+			g_live_at_n = live;
 		}
 	}
 }
@@ -724,10 +748,47 @@ int main(int argc, char **argv)
 			printf("\n  at N=%u, m=2: the board wrote %zu of %zu"
 			       " words (%.0f%%)\n", n2, live, tot2,
 			       100.0 * (double)live / (double)tot2);
-			printf("  compare the count and the percentage against"
-			       " N=%u above:\n"
-			       "  the same COUNT is a capacity, the same"
-			       " PERCENTAGE is a stride.\n", n);
+			printf("  against N=%u: the same COUNT would be a"
+			       " capacity, the same PERCENTAGE a stride.\n", n);
+
+			/*
+			 * ⚠⚠ AND SOLVE FOR THE STRIDES, because two counts
+			 * pin them. The address function fitted to the r385
+			 * map, 80 of 80 cells:
+			 *
+			 *   flat = S*(u/2) + R*r + 8*(v/4) + 4*(u%2) + (v%4)
+			 *
+			 * with c = 16u + v. Its RANGE is what decides how many
+			 * words the board writes, so a search over R and S for
+			 * the pair that reproduces both counts is a
+			 * measurement rather than a fit. Offline on the r387
+			 * numbers -- 92 at N=64 and 52 at N=32 -- exactly one
+			 * pair survives: R=20, S=40, where an injective
+			 * surface needs 32 and 64 at N=64.
+			 *
+			 * A stride that does not move with N is set from
+			 * something that is not N, which is the whole finding.
+			 */
+			{
+				unsigned hits = 0, fr = 0, fs = 0;
+
+				for (unsigned R = 1; R < 128; R++)
+					for (unsigned S = 1; S < 256; S++)
+						if (addr_range(n, 2, R, S) == g_live_at_n &&
+						    addr_range(n2, 2, R, S) == live) {
+							hits++; fr = R; fs = S;
+						}
+				if (hits == 1)
+					printf("\n  ⚑ exactly one stride pair"
+					       " reproduces both counts:\n"
+					       "  row stride %u, block stride"
+					       " %u -- an injective surface"
+					       " needs %u and %u at N=%u.\n",
+					       fr, fs, 2 * n / 4, 4 * n / 4, n);
+				else
+					printf("\n  %u stride pairs fit both"
+					       " counts; not pinned.\n", hits);
+			}
 		}
 	}
 

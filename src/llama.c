@@ -1766,8 +1766,16 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 * A window layer may look at the last n_swa positions
 		 * INCLUDING this one: llama.cpp masks when pos - t >= n_swa.
 		 */
-		int t0 = swa && pos + 1 > (int)m->n_swa ?
-			 pos + 1 - (int)m->n_swa : 0;
+		/*
+		 * ⚠ NOT t0. llama_forward's timing variable is a double called
+		 * t0, and the STAGE macro assigns to it; an int t0 declared
+		 * inside the layer loop shadows it, so with CHARSIU_STAGES set
+		 * the window start would be handed a millisecond timestamp
+		 * converted to int. Stages are off by default, which is the
+		 * only reason this had not bitten.
+		 */
+		int tlo = swa && pos + 1 > (int)m->n_swa ?
+			  pos + 1 - (int)m->n_swa : 0;
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 		STAGE(ST_NORM1);
@@ -1798,8 +1806,13 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		}
 		STAGE(ST_QKV);
 
+		charsiu_note("rope on q", cur_layer, (unsigned long)m->n_head);
 		rope(s->q, m->n_head, hd, cs, m->rope_neox);
+		charsiu_note("rope on k", cur_layer,
+			     (unsigned long)m->n_head_kv);
 		rope(s->k, m->n_head_kv, hd, cs, m->rope_neox);
+		charsiu_note("the kv cache copy", cur_layer,
+			     (unsigned long)kvdim);
 
 		/*
 		 * ⚠ HEAD MAJOR: [layer][kv head][position][head dim].
@@ -1837,8 +1850,11 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_ROPE);
 
 		{
-			struct attn_job aj = { s, l, pos, t0, hd, kvdim, gqa,
+			struct attn_job aj = { s, l, pos, tlo, hd, kvdim, gqa,
 					       m->n_head_kv, scale };
+
+			charsiu_note("attention: entering", cur_layer,
+				     (unsigned long)m->n_head);
 
 			/*
 			 * ⚠ SERIAL, AND ROUND 368 IS WHY.
@@ -1856,10 +1872,15 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			 * context and 38 positions is not where this question
 			 * gets settled. CHARSIU_ATTN_POOL turns it on.
 			 */
-			if (attn_pool())
+			if (attn_pool()) {
+				charsiu_note("attention over the pool",
+					     cur_layer, (unsigned long)g_pool.n);
 				pool_run(attn_heads, &aj, m->n_head);
-			else
+			} else {
 				attn_heads(&aj, 0, m->n_head);
+			}
+			charsiu_note("attention: done", cur_layer,
+				     (unsigned long)pos);
 		}
 
 		STAGE(ST_ATTN);
