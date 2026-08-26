@@ -490,6 +490,13 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
  * result.
  */
 static double act_ms;
+/* ⚠ NOT stage_ms: that name is the per stage table further down */
+static double npu_stage_ms;
+
+double llama_stage_ms(void)
+{
+	return npu_stage_ms;
+}
 static int stage_on = -1;
 
 /* CHARSIU_DBG_LAYERS: the RMS of the residual stream after every layer */
@@ -606,6 +613,8 @@ static int npu_mode(void)
 static const struct npu_tensor *npu_get(struct llama_state *s,
 					const struct gguf_tensor *w)
 {
+	double t_stage;
+
 	for (unsigned i = 0; i < s->n_npu; i++)
 		if (s->npu_key[i] == w)
 			return &s->npu[i];
@@ -623,9 +632,12 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 	 * the layer for one of phi3's slices; both outlive a crash.
 	 */
 	charsiu_note(w->name, (unsigned long)w->ne[1], (unsigned long)w->ne[0]);
+	t_stage = now_ms();
 	/* npu_tensor_build says why on its own way out */
-	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0)
+	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0) {
+		npu_stage_ms += now_ms() - t_stage;
 		return NULL;
+	}
 	/*
 	 * And onto the hardware, if this run asked for it and this tensor is
 	 * one of the ones asked for. CHARSIU_NPU_ONLY narrows it to names
@@ -672,6 +684,7 @@ static const struct npu_tensor *npu_get(struct llama_state *s,
 			s->npu[s->n_npu].rms_rel * 100.0);
 	snprintf(s->npu[s->n_npu].name, sizeof(s->npu[s->n_npu].name), "%s", w->name);
 	s->npu_key[s->n_npu] = w;
+	npu_stage_ms += now_ms() - t_stage;
 	return &s->npu[s->n_npu++];
 }
 

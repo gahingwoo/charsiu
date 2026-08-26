@@ -505,6 +505,17 @@ void llama_free(struct llama_model *m);
 struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx);
 void llama_state_free(struct llama_state *s);
 
+/*
+ * Milliseconds spent turning weights into what the hardware takes, which
+ * happens lazily inside the FIRST forward pass that touches each tensor.
+ *
+ * ⚠ THAT LANDS INSIDE THE PROMPT AND IT IS NOT PREFILL. A gemma3 board round
+ * read "prompt 6 tok in 6516 ms, 0.92 tok/s" where the six tokens were 678 ms
+ * of it and the rest was staging 182 tensors. Prefill is the number this
+ * project has left to move, so it has to be reported without staging in it.
+ */
+double llama_stage_ms(void);
+
 /* One token in, a full logit vector out. `pos` is where it goes in the cache. */
 void llama_stages_reset(void);
 void llama_stages_report(void);

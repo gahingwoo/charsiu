@@ -673,12 +673,28 @@ next:
 			printf("\n[%d tok, %.1f tok/s, %d/%d context]\n",
 			       produced, produced * 1000.0 / (t_gen ? t_gen : 1),
 			       st->pos, st->n_ctx);
-		else
-		printf("\n\n[load %.0f ms | prompt %d tok in %.0f ms, %.2f tok/s"
+		else {
+		/*
+		 * ⚠ STAGING IS NOT PREFILL, AND IT LANDS INSIDE IT. The NPU
+		 * copies are built lazily, on the first forward pass that
+		 * touches each tensor, so all of it is charged to the prompt: a
+		 * gemma3 round read "prompt 6 tok in 6516 ms, 0.92 tok/s" for
+		 * six tokens that took 678 ms. Prefill is the number this
+		 * project has left to move and it cannot be read off a line
+		 * that has twenty seconds of quantising in it.
+		 */
+		double t_stage = llama_stage_ms();
+		double t_pre = t_prompt > t_stage ? t_prompt - t_stage : t_prompt;
+
+		printf("\n\n[load %.0f ms | ", t_load);
+		if (t_stage > 1.0)
+			printf("staging %.0f ms | ", t_stage);
+		printf("prompt %d tok in %.0f ms, %.2f tok/s"
 		       " | gen %d tok in %.0f ms, %.2f tok/s | peak %ld MB]\n",
-		       t_load, n_ids, t_prompt, n_ids * 1000.0 / (t_prompt ? t_prompt : 1),
+		       n_ids, t_pre, n_ids * 1000.0 / (t_pre ? t_pre : 1),
 		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1),
 		       hwm / 1024);
+		}
 		/*
 		 * ⚠ THE HALVES, NOT A ROLLING AVERAGE. Attention grows with the
 		 * context too, so the second half is expected to be a little
