@@ -314,6 +314,15 @@ struct llama_layer {
 	 * like the projections they follow. NULL on llama, which has none.
 	 */
 	const struct gguf_tensor *bq, *bk, *bv;
+	/*
+	 * ⚠ qwen3 DROPPED THE BIASES AND ADDED THESE. One gain of head_dim
+	 * each, shared by every head, applied to q and k AFTER the projection
+	 * and BEFORE rope -- the same order the bias has to keep, and for the
+	 * same reason: normalising a rotated vector is not normalising it.
+	 *
+	 * NULL on llama, qwen2 and phi3, which have neither.
+	 */
+	const struct gguf_tensor *q_norm, *k_norm;
 	const struct gguf_tensor *ffn_norm;
 	const struct gguf_tensor *gate, *up, *down;
 	/*
@@ -331,6 +340,14 @@ struct llama_model {
 
 	uint32_t n_embd, n_layer, n_head, n_head_kv, n_ff, n_vocab;
 	uint32_t head_dim, n_ctx_train;
+	/*
+	 * ⚠ n_head * head_dim, WHICH IS NOT ALWAYS n_embd. It is on llama,
+	 * qwen2 and phi3, and assuming so is what sized every buffer here for
+	 * three architectures. Qwen3-0.6B is 16 heads of 128 against an
+	 * embedding of 1024, so attention produces 2048 floats and feeds them
+	 * to attn_output -- twice what an n_embd buffer holds.
+	 */
+	uint32_t n_embd_attn;
 	/* which of the two RoPE pairings this file's weights were saved for */
 	int rope_neox;
 	float rms_eps, rope_base;

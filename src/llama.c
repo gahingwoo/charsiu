@@ -709,8 +709,8 @@ static void softmax(float *x, int n)
  *
  * The HF checkpoints pair element i of a head with element i + d/2. For llama
  * and smollm3 the convert step PERMUTES Q and K so that pairing becomes the
- * interleaved (2i, 2i+1) one, and the runtime rotates interleaved. For qwen2
- * and phi3 it does not permute, so the runtime has to rotate halves.
+ * interleaved (2i, 2i+1) one, and the runtime rotates interleaved. For qwen2,
+ * qwen3 and phi3 it does not permute, so the runtime has to rotate halves.
  *
  * ⚠ THE WRONG PAIRING STILL PRODUCES WORDS. Every element is still rotated by
  * an angle from the right table, just partnered with the wrong neighbour, so
@@ -756,6 +756,50 @@ static void add_bias(float *y, const struct gguf_tensor *b, uint32_t n)
 		return;
 	for (i = 0; i < n; i++)
 		y[i] += v[i];
+}
+
+/*
+ * RMS normalise EACH HEAD on its own, against one gain shared by all of them.
+ *
+ * This is qwen3's QK norm. It is not the layer norm applied to a longer
+ * vector: the sum of squares is taken over one head's head_dim elements, so a
+ * head with large values is not scaled down by its quiet neighbours. Doing it
+ * over the whole q vector instead produces text that still reads fluently,
+ * which is why this is written out rather than routed through rmsnorm().
+ */
+static void qk_norm(float *v, uint32_t nheads, uint32_t hd,
+		    const struct gguf_tensor *g, float eps)
+{
+	static float *gain;
+	static uint32_t gainn;
+	static const struct gguf_tensor *cached;
+
+	if (gainn < hd) {
+		gain = realloc(gain, hd * sizeof(float));
+		gainn = hd;
+		cached = NULL;
+	}
+	if (!gain)
+		return;
+	/*
+	 * The gain is re-read once per call rather than once per head: it is
+	 * the same row for all of them, and a layer asks for two of these.
+	 */
+	if (cached != g) {
+		gguf_row_f32(g, 0, gain);
+		cached = g;
+	}
+
+	for (uint32_t h = 0; h < nheads; h++) {
+		float *p = v + (size_t)h * hd;
+		float ss = 0.0f, scale;
+
+		for (uint32_t i = 0; i < hd; i++)
+			ss += p[i] * p[i];
+		scale = 1.0f / sqrtf(ss / (float)hd + eps);
+		for (uint32_t i = 0; i < hd; i++)
+			p[i] = p[i] * scale * gain[i];
+	}
 }
 
 static void rope(float *v, uint32_t nheads, uint32_t hd, const float *cs,
@@ -843,12 +887,17 @@ int llama_load(struct llama_model *m, const char *path)
 	 *
 	 * ⚠ THE ARCH NAME IS ALSO THE KEY PREFIX, so it has to stay whatever
 	 * the file said: qwen2.embedding_length, not llama.embedding_length.
-	 * gemma2 and phi3 are NOT this, and are refused for reasons that are
-	 * not tensor names -- gemma2 declares attn_logit_softcapping 50.0,
-	 * final_logit_softcapping 30.0 and a 4096 sliding window, and phi3
-	 * fuses QKV into one tensor and gate+up into another.
+	 *
+	 * ⚠ qwen3 IS THE SAME GRAPH AGAIN, with the biases gone and a norm on
+	 * Q and K instead. It is also the first one here whose head is not
+	 * n_embd / n_head: 16 heads of 128 against an embedding of 1024.
+	 *
+	 * gemma2 is refused, and not over tensor names -- it declares
+	 * attn_logit_softcapping 50.0, final_logit_softcapping 30.0 and a 4096
+	 * sliding window, none of which this graph does.
 	 */
 	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
+	    strcmp(arch, "qwen3") &&
 	    strcmp(arch, "phi3") && strcmp(arch, "smollm3")) {
 		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
 		goto fail;
@@ -888,12 +937,28 @@ int llama_load(struct llama_model *m, const char *path)
 		goto fail;
 	}
 	/*
+	 * ⚠ READ attention.key_length RATHER THAN TRUSTING rope.dimension_count
+	 * TO BE THE HEAD. They agree on every architecture here -- qwen3 rotates
+	 * the whole head -- but they are different questions, and a model that
+	 * rotates part of a head would size the KV cache wrong if this used the
+	 * rope width for it.
+	 */
+	{
+		uint32_t kl;
+
+		snprintf(key, sizeof(key), "%s.attention.key_length", arch);
+		if (!gguf_get_u32(&m->gguf, key, &kl) && kl && !(kl & 1))
+			m->head_dim = kl;
+	}
+	m->n_embd_attn = m->n_head * m->head_dim;
+	/*
 	 * ⚠ BY ARCHITECTURE, and there is no key in the file that says it --
 	 * llama.cpp carries the same thing as a switch over the architecture
-	 * enum. llama and smollm3 are the permuted, interleaved ones; qwen2
-	 * and phi3 are not.
+	 * enum. llama and smollm3 are the permuted, interleaved ones; qwen2,
+	 * qwen3 and phi3 are not.
 	 */
-	m->rope_neox = !strcmp(arch, "qwen2") || !strcmp(arch, "phi3");
+	m->rope_neox = !strcmp(arch, "qwen2") || !strcmp(arch, "qwen3") ||
+		       !strcmp(arch, "phi3");
 	/*
 	 * The control. The two pairings are the whole difference between
 	 * "Paris. It is the largest city in France" and "a country in the
@@ -1008,6 +1073,24 @@ int llama_load(struct llama_model *m, const char *path)
 		B(bk, "attn_k");
 		B(bv, "attn_v");
 #undef B
+		/*
+		 * optional WEIGHTS, not biases: qwen3 has both of these and
+		 * nothing older has either.
+		 */
+#define OW(field, suffix) do {                                             \
+		snprintf(key, sizeof(key), "blk.%u." suffix ".weight", l); \
+		L->field = gguf_tensor(&m->gguf, key);                     \
+		if (L->field && !L->field->nbytes)                         \
+			L->field = NULL;                                   \
+	} while (0)
+		OW(q_norm, "attn_q_norm");
+		OW(k_norm, "attn_k_norm");
+#undef OW
+		if (!L->q_norm != !L->k_norm) {
+			fprintf(stderr, "llama: layer %u norms one of q and k "
+				"and not the other\n", l);
+			goto fail;
+		}
 		T(ffn_norm, "ffn_norm");
 		if (strcmp(arch, "phi3")) {
 			T(gate, "ffn_gate");
@@ -1036,6 +1119,22 @@ void llama_free(struct llama_model *m)
 
 /* ---- state --------------------------------------------------------------- */
 
+/*
+ * The widest vector any matvec in this model takes as its INPUT: n_embd for
+ * the projections, n_ff for ffn_down, and n_head * head_dim for attn_output,
+ * which is the one that is not always n_embd.
+ */
+static uint32_t state_widest(const struct llama_model *m)
+{
+	uint32_t w = m->n_embd;
+
+	if (m->n_ff > w)
+		w = m->n_ff;
+	if (m->n_embd_attn > w)
+		w = m->n_embd_attn;
+	return w;
+}
+
 struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 {
 	struct llama_state *s = calloc(1, sizeof(*s));
@@ -1060,7 +1159,15 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->kcache = calloc(kvn, sizeof(float));
 	s->vcache = calloc(kvn, sizeof(float));
 	s->x   = calloc(m->n_embd, sizeof(float));
-	s->xb  = calloc(m->n_embd, sizeof(float));
+	/*
+	 * ⚠ xb IS BOTH the normalised embedding and the attention output, and
+	 * those are two different widths. Attention writes n_head * head_dim,
+	 * which on qwen3 is larger than n_embd; sizing this by n_embd alone
+	 * was correct for three architectures and is a heap overflow on the
+	 * fourth.
+	 */
+	s->xb  = calloc(m->n_embd > m->n_embd_attn ? m->n_embd : m->n_embd_attn,
+			sizeof(float));
 	s->xb2 = calloc(m->n_embd, sizeof(float));
 	s->hb  = calloc(m->n_ff, sizeof(float));
 	s->hb2 = calloc(m->n_ff, sizeof(float));
@@ -1071,7 +1178,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->logits = calloc(m->n_vocab, sizeof(float));
 
 	{
-		uint32_t widest = m->n_embd > m->n_ff ? m->n_embd : m->n_ff;
+		uint32_t widest = state_widest(m);
 
 		if (charsiu_act_alloc(&s->act, (int)widest) < 0) {
 			llama_state_free(s);
@@ -1092,7 +1199,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	if (getenv("CHARSIU_NPU")) {
 		const char *e = getenv("CHARSIU_NPU_MAXN");
 		unsigned maxn = e ? (unsigned)atoi(e) : 8192;
-		unsigned widest = m->n_embd > m->n_ff ? m->n_embd : m->n_ff;
+		unsigned widest = state_widest(m);
 
 		if (maxn > m->n_vocab)
 			maxn = m->n_vocab;
@@ -1489,6 +1596,18 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			add_bias(s->q, L->bq, m->n_head * hd);
 			add_bias(s->k, L->bk, m->n_head_kv * hd);
 			add_bias(s->v, L->bv, m->n_head_kv * hd);
+		}
+		/*
+		 * ⚠ AFTER THE BIAS AND BEFORE ROPE, which is the one order
+		 * that is not interchangeable: rope mixes element 2i with
+		 * 2i+1, so normalising afterwards divides a rotated pair by a
+		 * sum of squares that rotation already changed. V is NOT
+		 * normed -- only q and k are, because only they meet in a dot
+		 * product.
+		 */
+		if (L->q_norm) {
+			qk_norm(s->q, m->n_head, hd, L->q_norm, m->rms_eps);
+			qk_norm(s->k, m->n_head_kv, hd, L->k_norm, m->rms_eps);
 		}
 		STAGE(ST_QKV);
 
