@@ -244,6 +244,7 @@ struct charsiu_npu {
 	double slow_worst;
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
+	int kfit;
 	/* one message per REASON; the pointer identifies it, see whine() */
 	const char *whined[8];
 	unsigned n_whined;
@@ -603,13 +604,39 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 			g->cpu_frac = 0.9;
 	}
 	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
+	/*
+	 * ⚠ THE RUNT K SLICE, AND WHAT IT COSTS. ceil(k / KMAX) leaves the
+	 * remainder in a slice of its own, and a slice costs about a task --
+	 * round 321 measured 35 us of it -- whatever its width.
+	 *
+	 * Every llama dimension is a power of two and divides the 1024 slice
+	 * exactly, so this never arose. gemma3 is n_embd 1152: q, k, v, gate
+	 * and up all split 1024 + 128, which is five slices a layer that carry
+	 * an ninth of a slice of work. Its board log reads 468 slices where 338
+	 * would do, and 6.16 GB/s where llama reaches 10.3.
+	 *
+	 * KFIT lets the LAST slice absorb the remainder instead, so 1152 is one
+	 * slice rather than two. A slice can then be up to 2 * KMAX - 1 wide,
+	 * which is what the sizes below have to allow for.
+	 *
+	 * ⚠ UNGROUPED TENSORS ONLY. A grouped tensor carries one scale per
+	 * (channel, K group) and the gather in add_slice reads the group at
+	 * k0 / kgroup, so a slice that spans two groups would apply the first
+	 * group's scale to both. Ungrouped ones are scaled once at the end and
+	 * their K split is free: acc_out sums int32 across the slices, so any
+	 * split of the same K gives the same accumulator.
+	 *
+	 * Off until a board round says it is both correct and faster.
+	 */
+	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	g->max_slices = ns * ks;
 	g->slot_cap = max_tensors * g->max_slices;
 
 	{
-		struct charsiu_matmul widest = { 1, g->kmax, g->nmax,
+		unsigned kwide = g->kfit ? 2 * g->kmax : g->kmax;
+		struct charsiu_matmul widest = { 1, kwide, g->nmax,
 						 CHARSIU_INT8, CHARSIU_INT8 };
 
 		g->in_stride = charsiu_entries_per_row(&widest) * 64;
@@ -621,12 +648,13 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 
 	g->ent = calloc(g->ent_cap, sizeof(*g->ent));
 	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
-	g->scratch = malloc((size_t)g->nmax * g->kmax + max_k);
+	/* ⚠ the widest a slice can be, which KFIT doubles -- see above */
+	g->scratch = malloc((size_t)g->nmax * g->kmax * (g->kfit ? 2 : 1) + max_k);
 	g->acc = calloc(max_n, sizeof(*g->acc));
 	g->accf = calloc(max_n, sizeof(*g->accf));
 	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
 	g->afscr = calloc(max_k ? max_k : 1, sizeof(*g->afscr));
-	g->wpack = malloc((size_t)g->nmax * g->kmax + 4096);
+	g->wpack = malloc((size_t)g->nmax * g->kmax * (g->kfit ? 2 : 1) + 4096);
 	g->asum = calloc(ks ? ks : 1, sizeof(*g->asum));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
@@ -1034,6 +1062,9 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 
 	ns = (unsigned)((e_n_npu + g->nmax - 1) / g->nmax);
 	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
+	/* the last slice absorbs the remainder rather than being it */
+	if (g->kfit && ks > 1 && (t->k % g->kmax) && !tensor_grouped(g, t))
+		ks--;
 	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
 		return -1;
@@ -1087,8 +1118,10 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 
 	for (unsigned ki = 0; ki < ks; ki++) {
 		unsigned k0 = ki * g->kmax;
-		unsigned k = (unsigned)(t->k - k0) < g->kmax
-			   ? (unsigned)(t->k - k0) : g->kmax;
+		/* ⚠ THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is
+		 * more than KMAX, and clamping it here would drop the tail of
+		 * the tensor without a word. */
+		unsigned k = ki + 1 == ks ? (unsigned)(t->k - k0) : g->kmax;
 
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
 			unsigned n0 = ni * g->nmax;
