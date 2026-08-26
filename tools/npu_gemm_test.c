@@ -536,10 +536,40 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 			continue;
 		}
 		(*tried)++;
-		if (check(what, m, n, got, want))
+		if (check(what, m, n, got, want)) {
+			/*
+			 * ⚠⚠ WRONG VALUES AND WRONG ORDER ARE NOT THE SAME
+			 * ANSWER, and check() cannot tell them apart because
+			 * it compares position by position.
+			 *
+			 * Round 393 printed "1 of 5 widths exact at N=16. The
+			 * budget reading does not hold" while its own
+			 * increment line three screens up said "at N=16, m=2:
+			 * wrote 32 of 32". Every value was there. The flat
+			 * comparison called it wrong because the layout is a
+			 * permutation, and the verdict was the opposite of the
+			 * data that had already been measured.
+			 *
+			 * So say which of the two it is. All present means the
+			 * arithmetic is right and a batched prefill needs a
+			 * read order, not a register.
+			 */
+			size_t total = (size_t)m * n, live = 0;
+
+			for (size_t q = 0; q < total; q++)
+				for (size_t i = 0; i < total; i++)
+					if (got[i] == want[q]) { live++; break; }
+			if (live == total)
+				printf("      ⚑ but ALL %zu values are in the"
+				       " buffer: right arithmetic, wrong"
+				       " order\n", total);
+			else
+				printf("      %zu of %zu values are in the"
+				       " buffer at all\n", live, total);
 			fail = 1;
-		else
+		} else {
 			(*passed)++;
+		}
 
 		/*
 		 * ⚠ m=1 IS THE CONTROL AND NOTHING BELOW IT MEANS ANYTHING. If
@@ -817,10 +847,18 @@ int main(int argc, char **argv)
 		printf("\n  ===== the prediction: N=16, where the budget is"
 		       " enough =====\n");
 		sweep(dev, 4, 'h', MS, nms, k, 16, A, B, got, want, &p, &t);
-		printf("  %u of %u widths exact at N=16.%s\n", p, t,
-		       p == t && t > 1
-		       ? "  ⚑ m>1 IS EXACT WHERE THE BUDGET REACHES."
-		       : "  The budget reading does not hold.");
+		/*
+		 * ⚠ "exact" here still means position by position. Read the
+		 * per-width lines above for whether the values are all
+		 * present, which is the question the budget makes a prediction
+		 * about; a permutation is a pass for the budget and a fail for
+		 * check().
+		 */
+		printf("  %u of %u widths exact position by position at"
+		       " N=16.\n"
+		       "  ⚠ The budget predicts every VALUE is present here,"
+		       " not that the order is\n"
+		       "  right -- the lines above say which.\n", p, t);
 	}
 
 	if (n >= 16) {
