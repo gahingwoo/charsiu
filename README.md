@@ -11,11 +11,15 @@ mainline kernel and the open `rocket` driver.
 
 ```
                                      tokens/second
-  charsiu, int4, 64 tokens                14.70
+  charsiu, int4, 64 tokens                15.91      (14.70 when this was first written)
   charsiu, int4, 384 tokens               11.98      (attention grows with the context)
   charsiu, int8                            6.40
   charsiu on the CPU, best                 5.53      (pure q4_0, four threads)
 ```
+
+It reads **llama, qwen2, qwen3, gemma3, phi3 and smollm3** gguf files. Decode is at the
+board's DRAM roof: 10.8 GB/s of weights, 1661 ms of a 1792 ms hardware path spent waiting
+on the fence, and one millisecond of a token unaccounted for.
 
 ## Install
 
@@ -49,7 +53,7 @@ charsiu                     a conversation (the model stays staged between turns
 charsiu -p "..." -n 64      one answer
 charsiu bench               what this board does, in tok/s
 charsiu-config              pick a model, threads, context
-charsiu-get                 more models
+charsiu-get                 more models: llama, qwen2, qwen3, gemma3, phi3, smollm3
 charsiu-doctor              what works and what does not
 charsiu-doctor --paste      the block to put in a bug report
 ```
@@ -58,11 +62,12 @@ charsiu-doctor --paste      the block to put in a bug report
 direction, see [What a file's name does not tell you, twice](#what-a-files-name-does-not-tell-you-twice).
 `charsiu-get` gates every download by reading the file, and deletes what it cannot run.
 
-A 64 token generation is 67.7 ms a token, and 54 of that is the weight fetch itself at
-10.3 GB/s, which is what this hardware's own bandwidth bench measures. **The fence is
+A 64 token generation is 62.3 ms a token, and 49.7 of that is the weight fetch itself at
+10.8 GB/s, which is what this hardware's own bandwidth bench measures. **The fence is
 the floor**: 620 MB of int4 weights have to cross the bus for every token, and no amount
-of software makes that cheaper. What is left on the CPU is about 13 ms, and the last
-eight rounds took it there from about 40.
+of software makes that cheaper. What is left on the CPU is about 12.6 ms, and the last
+eight rounds took it there from about 40. One millisecond of the token is neither the
+hardware nor the packing, which is as closed as this account gets.
 
 That acceptance test is the point of how this was built. The CPU decode loop came first
 and is the oracle; the NPU computes the same sum, so the two runs must agree exactly, and
@@ -1292,6 +1297,42 @@ up carry the computed confirmation.
 What this does **not** yet say is anything about speed, or about int4. Both are the
 next board round.
 
+### What charsiu's own M > 1 turned out to be
+
+charsiu asks the hardware for one row. A batched prefill wants thirty two, where the
+same weight bytes serve thirty two rows instead of one, and this tree has never got a
+correct answer above M = 1.
+
+Four rounds went into fitting an address function to the output, because the values
+came back in the wrong places and that looks like a layout. Against a reference with
+121 distinct values in 128 the fit is unique -- one function, 80 of 80 cells, no misses
+-- and then it predicts 132 words at M = 4 where the board writes 148. A model that
+fits one width perfectly and misses the next is a model of that width.
+
+Counting instead of fitting says what it actually is:
+
+```
+N=64 m=2   92 of 128       N=64 m=4  148 of 256      N=64 m=8  260 of 512
+N=32 m=2   52 of  64       N=16 m=2   32 of  32
+```
+
+`written = N + inc * (m - 1)`, with `inc = N/4 + 12` through all three widths. **The
+first row gets all N words. Every row after it gets N/4 + 12, and needs N.** They meet
+at sixteen, and at sixteen nothing is missing -- every value present, none of them
+where a contiguous read expects it.
+
+So it is not a stride. A stride puts values in the wrong place; this leaves them
+uncomputed, and "one row whole and the rest a fixed share" is a budget being divided.
+Mesa bounds exactly this and charsiu does not: `rkt_task.c` splits a task's staged rows
+when `(cbuf_rows + staged) * entries_per_slice > total_entries`, and charsiu submits
+all m rows as one task and never checks. That is the difference between the emitter
+that runs M = 1..8 correctly on this board and this one.
+
+⚠ The test that measured all of this printed the opposite of its own data first: "1 of
+5 widths exact at N=16, the budget reading does not hold", while its own increment line
+three screens up said `at N=16, m=2: wrote 32 of 32`. `check()` compares position by
+position and could not tell a wrong value from a wrong order. It says which now.
+
 ## What runs today
 
 ```
@@ -1300,7 +1341,8 @@ $ charsiu_run models/Llama-3.2-1B-Instruct-Q8_0.gguf -p "The capital of France i
  Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also located in
  Paris. The famous painting "The Mona Lisa" is on display at the Louvre Museum. ...
 
-[load 127 ms | gen 64 tok in 4353 ms, 14.70 tok/s | peak 2531 MB]
+[load 138 ms | gen 64 tok in 4008 ms, 15.97 tok/s | peak 2018 MB]
+[first 32 tok 16.84 tok/s, last 32 tok 15.18 tok/s, board 53 -> 51 C, cpu 2208 MHz under load]
 ```
 
 with the hardware taking every projection:
@@ -1310,16 +1352,108 @@ CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=131072
 ```
 
-`CHARSIU_STAGES=1` prints where a token goes. On a ROCK 4D at 64 tokens:
+`CHARSIU_STAGES=1` prints where a token goes, and prints it once per half of the run,
+because a table averaged over the whole of it cannot answer a question about how the
+run changed. On a ROCK 4D at 64 tokens:
 
 ```
-  q k v                9.9 ms      gate + up          22.4
-  o proj               8.0         down               20.3
-  output head          8.8         attention           3.3
-  everything else      2.6         of which silu       1.9
+  stage            first 31   last 33
+  q k v              9.02       9.21
+  o proj             5.42       5.62
+  gate + up         19.87      20.18
+  down              14.72      15.14
+  output head        8.53       8.41
+  attention          1.18       2.94
+  total             60.4       63.3
 ```
 
-Five of those rows are the hardware; the fence inside them is 54 ms of the 67.7.
+Five of those rows are the hardware; the fence inside them is 1661 ms of the 1792.
+
+Attention is 1.76 ms of the 2.9 ms between the halves, which is sixty percent of it and
+is what a cost linear in the context looks like. The rest is a fifth of a millisecond
+here and there across the projections -- the KV cache growing into the same DRAM the
+weights are streaming through. Nothing else moved, the board **cooled** 53 C to 51
+across the run, and the A72 held 2208 MHz throughout. So 60.4 ms is 16.6 tok/s and 63.3
+is 15.8, and a remembered 17.1 is a shorter window on the same curve.
+
+### gemma3-1b is slower here, and the reason is not the graph
+
+113 ms a token against llama's 60, on the same board. On a host where everything runs
+on the CPU the two are within ten percent of each other, so it is not the model.
+
+`output head 49.8 ms, 44% of the token`. Gemma-3-1B's vocabulary is 262144 against
+Llama-3.2-1B's 128256, and its head is **tied to `token_embd` at q8_0**, so it reads
+**321 MB every token**. It is not routed -- the gate is `n <= CHARSIU_NPU_MAXN` -- so
+that lands on a CPU whose sequential read is about 6.5 GB/s, and 321 MB at 6.5 GB/s is
+49 ms. The arithmetic closes; there is no bug in it.
+
+The rest is size. gemma3-1b's embedding is 1152 against llama's 2048, so its submits
+carry **1.92 MB against llama's 4.75** for roughly the same fixed cost per submit, and
+the hardware rate falls from 10.82 GB/s to 6.16.
+
+### More than one architecture, and two things that were quietly wrong
+
+`llama_load` reads **llama, qwen2, qwen3, gemma3, phi3 and smollm3**. `charsiu_check`'s
+gate has to match it exactly: it exists to save a two gigabyte download and is wrong in
+both directions if it drifts.
+
+qwen3 is the llama graph with the three QKV biases dropped and a norm added on Q and K
+-- per head, over one head's head_dim, before rope. It is also the first architecture
+here whose head is not `n_embd / n_head`: Qwen3-0.6B is 16 heads of 128 against an
+embedding of 1024, so attention produces 2048 floats and hands them to `attn_output`,
+and the buffer that held both was sized by `n_embd` alone.
+
+gemma3 adds a sliding window over most of its attention, **two rope bases** -- the
+window layers rotate at 10000 and the full ones at the model's own 1000000, and the
+file carries no key for it -- a second norm on each branch before the residual add, the
+embedding times sqrt(n_embd), GELU, and a fourth chat format whose assistant is spelled
+`model` and which has no system role at all.
+
+Two bugs found on the way, both of which produced **fluent English** rather than
+anything that looks like a fault:
+
+**The RoPE pairing.** There are two, and no gguf key says which one a file wants;
+llama.cpp carries it as a switch over the architecture enum. llama and smollm3 are the
+permuted, interleaved ones. qwen2, qwen3, phi3 and every gemma are not. charsiu had only
+the interleaved form and applied it to all of them. Asked for the capital of France,
+Qwen2.5-0.5B answered *"a country in the world. The capital of the world."* before and
+*"Paris. It is the largest city in France"* after; Phi-3.5-mini answered *"the most
+important city in the country"* and then *"Paris."* Llama is unchanged, which is the
+control.
+
+**The SentencePiece tokenizer.** charsiu segmented with a Viterbi over the piece scores,
+which is the unigram objective and is not what a gguf means -- llama.cpp does a greedy
+bigram merge. The two agree only when the scores really are log probabilities. Gemma
+stores what is effectively minus a rank: `▁The` scores -175 while `▁T` and `he` score
+-64 and -5, so the additive objective prefers the two small pieces by more than a
+hundred and the prompt segments as `▁T | he | ▁c | ap | it | al`.
+
+`tests/arch_sanity.sh` catches both. It asks every gguf in a directory one factual
+question and reports the ones that miss it -- no llama.cpp build, no f32 copy -- and it
+makes a second pass with `CHARSIU_STAGES=1`, because a crash that needs an environment
+variable is still a crash and one of them cost four board rounds.
+
+### What a tokens-per-second number needs before it can be compared
+
+Four things, and every one of them has been the answer to a "why is this slower than I
+remember" at least once:
+
+| | how it is reported |
+|---|---|
+| the weight width | `charsiu NPU: weights are int4, 2 devices` |
+| how many tokens | already in the summary; attention grows with the context |
+| the CPU's clock | `cpu 2208 MHz under load`, read AFTER the work |
+| the board's temperature | `board 53 -> 51 C`, at both ends of the generation |
+
+⚠ The clock has to be read under load. Two consecutive runs of the same command
+reported 2208 MHz and 1200 MHz from the same line, both with the governor at ondemand,
+purely because it was read at startup before ondemand had seen any work.
+
+⚠ And the second half of a run is slower anyway. On a host with no thermal zones and no
+way to throttle, 32 tokens split 34.28 and 29.59 tok/s -- fourteen percent, entirely
+from attention. A throttle is a gap wider than that alongside a temperature that
+climbed, which is why the temperature is printed next to the halves and not somewhere
+else.
 
 ### The parts that are not the hardware
 
