@@ -172,6 +172,14 @@ yes|1|true|on)
 esac
 [ -n "$CPUS" ] && E="$E CHARSIU_CPUS=$CPUS"
 
+# ⚠ ONE SWITCH, NOT A SET OF ENVIRONMENT VARIABLES NOBODY WILL REMEMBER. The
+# stage timings existed only as CHARSIU_STAGES, which meant they were reachable
+# by whoever already knew the name. [debug] enable makes them a setting.
+DEBUG=$(ini_get debug enable)
+case "$DEBUG" in
+yes|1|true|on) E="$E CHARSIU_STAGES=1" ;;
+esac
+
 # anything under [extra] is passed through verbatim, which is the escape hatch
 # for the other hundred variables without putting them in the TUI.
 # ⚠ A line that STARTS with # is a comment too. An earlier version only
@@ -267,6 +275,24 @@ if [ "$BENCH" = 1 ]; then
 	echo "$out" | grep -oE 'gen 64 tok in [0-9]+ ms, [0-9.]+ tok/s' \
 		| sed 's/^/  /' || echo "  (no rate reported)"
 	echo "$out" | grep -oE '[0-9.]+ GB/s of weights' | sed 's/^/  /' || true
+
+	# ⚠ THE ONE NUMBER THAT DECIDES THE NEXT PIECE OF WORK, and it differs
+	# between a development host and the board. Batching the projections
+	# measured 1.1x to 1.4x on a host with cache and memory to spare; the
+	# board is 10 GB/s of LPDDR5 behind four A72s, where the same kernel
+	# sits much closer to the memory roof. Only under debug, because it
+	# walks every layer twice and takes a while.
+	case "$DEBUG" in
+	yes|1|true|on)
+		BB=$(find_bin bench_batch)
+		if [ -n "$BB" ]; then
+			printf '\n  batching the projections, M=8\n'
+			"$BB" "$MODEL" 8 2>/dev/null | grep -E "at a time|batched" \
+				|| echo "  (bench_batch would not run)"
+		else
+			printf '\n  bench_batch is not installed\n'
+		fi ;;
+	esac
 	printf '\n'
 	exit 0
 fi

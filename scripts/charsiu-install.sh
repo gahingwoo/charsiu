@@ -358,7 +358,7 @@ entry in the boot menu instead, then remove it by hand." defaultno || exit 0
 	# written. The install side makes the same mistake if it is spelled out.
 	as_root rm -f "$SBIN/charsiu"
 	for f in "$SBIN"/charsiu-*; do [ -e "$f" ] && as_root rm -f "$f"; done
-	for f in charsiu_run charsiu_check charsiu_serve charsiu-tui.sh charsiu-lib.sh; do
+	for f in charsiu_run charsiu_check charsiu_serve bench_batch charsiu-tui.sh charsiu-lib.sh; do
 		as_root rm -f "$BIN/$f"
 	done
 	ui_msg "Removed. Models and config kept."
@@ -809,7 +809,9 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # serve) arrived after the list was written. A fresh Debian install got a
 # charsiu that printed --help and then died with "exec: : Permission denied" on
 # every subcommand. Install whatever the source actually has.
-for f in charsiu_run charsiu_check charsiu_serve; do
+# ⚠ bench_batch too: [debug] enable makes `charsiu bench` reach for it, and a
+# setting that points at a binary nobody installed is a setting that lies.
+for f in charsiu_run charsiu_check charsiu_serve bench_batch; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
