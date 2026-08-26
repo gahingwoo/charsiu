@@ -309,6 +309,38 @@ static void *worker(void *arg)
  * One read of sysfs at startup. If the files are not there, say nothing rather
  * than pretend.
  */
+static int g_pinned_cpu = -1;
+
+/*
+ * ⚠⚠ scaling_cur_freq AT STARTUP IS AN IDLE CPU, and ondemand has not seen any
+ * work yet. Two consecutive board runs of the same command reported 2208 MHz
+ * and 1200 MHz from this line, both with the governor at ondemand, purely
+ * because of when it was read. A number that swings by a factor of two on the
+ * same machine doing the same thing is not a measurement of anything.
+ *
+ * charsiu_cpu_mhz() is what a caller uses AFTER the work, which is the reading
+ * that decides whether a slow run was a slow clock.
+ */
+long charsiu_cpu_mhz(void)
+{
+	char path[128];
+	FILE *f;
+	long khz = 0;
+
+	if (g_pinned_cpu < 0)
+		return 0;
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",
+		 g_pinned_cpu);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+	if (fscanf(f, "%ld", &khz) != 1)
+		khz = 0;
+	fclose(f);
+	return khz / 1000;
+}
+
 static void cpu_clock_report(const cpu_set_t *set)
 {
 	char path[128], gov[32] = "";
@@ -320,6 +352,7 @@ static void cpu_clock_report(const cpu_set_t *set)
 			first = c;
 	if (first < 0)
 		return;
+	g_pinned_cpu = first;
 
 	snprintf(path, sizeof(path),
 		 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", first);
@@ -348,7 +381,7 @@ static void cpu_clock_report(const cpu_set_t *set)
 		}
 	}
 	if (gov[0] || khz)
-		fprintf(stderr, "charsiu: cpu%d governor %s, %ld MHz\n",
+		fprintf(stderr, "charsiu: cpu%d governor %s, %ld MHz idle\n",
 			first, gov[0] ? gov : "(unknown)", khz / 1000);
 }
 

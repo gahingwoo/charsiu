@@ -428,6 +428,12 @@ void llama_stages_report(void);
 const float *llama_forward(struct llama_state *s, int32_t token, int pos);
 
 /* argmax, which is the only sampler an oracle is allowed. */
+/*
+ * The clock of the first pinned CPU, in MHz, or 0 where sysfs has none. Read it
+ * AFTER the work: at startup ondemand has not seen any and reports idle.
+ */
+long charsiu_cpu_mhz(void);
+
 int32_t llama_argmax(const float *logits, uint32_t n);
 
 /* Temperature plus top-p, for when a human is reading the output. */

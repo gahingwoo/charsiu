@@ -696,6 +696,12 @@ next:
 			if (temp_start > 0.0)
 				printf(", board %.0f -> %.0f C",
 				       temp_start, temp_end);
+			{
+				long mhz = charsiu_cpu_mhz();
+
+				if (mhz)
+					printf(", cpu %ld MHz under load", mhz);
+			}
 			printf("]\n");
 		}
 		if (!interactive && eog_at >= 0)
