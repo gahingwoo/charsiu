@@ -61,6 +61,10 @@ static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
 		fprintf(stderr, "  a buffer would not allocate\n");
 		goto out;
 	}
+	if (!wt.map || !in.map || !ob.map || !coef.map || !reg.map) {
+		fprintf(stderr, "  a buffer allocated but did not map\n");
+		goto out;
+	}
 
 	charsiu_bo_prep(dev, &wt, 1000000000);
 	memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
@@ -71,9 +75,23 @@ static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
 	charsiu_pack_input(&job.mm, A, in.map, insz, job.input_zero_point);
 	charsiu_bo_fini(dev, &in);
 
-	charsiu_bo_prep(dev, &coef, 1000000000);
-	charsiu_build_coefs(&job, NULL, NULL, coef.map);
-	charsiu_bo_fini(dev, &coef);
+	/*
+	 * ⚠ NEITHER OF THESE MAY BE NULL. charsiu_build_coefs dereferences
+	 * bias[oc] and weight_sums[oc] unconditionally, and passing NULL
+	 * segfaulted on the board before the control had printed a single
+	 * result. Zeros are the right values here anyway: input_zero_point is
+	 * 0x80, so the (in_zp - 0x80) factor that multiplies the weight sum is
+	 * exactly zero, and there is no bias in this test.
+	 */
+	{
+		int32_t *zero = calloc(n, sizeof(int32_t));
+
+		if (!zero) { fprintf(stderr, "  out of memory\n"); goto out; }
+		charsiu_bo_prep(dev, &coef, 1000000000);
+		charsiu_build_coefs(&job, zero, zero, coef.map);
+		charsiu_bo_fini(dev, &coef);
+		free(zero);
+	}
 
 	job.input_addr = (uint32_t)in.dma_address;
 	job.output_addr = (uint32_t)ob.dma_address;
