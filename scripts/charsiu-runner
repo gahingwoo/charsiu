@@ -82,6 +82,18 @@ if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
 	done
 	if [ -n "$_p" ]; then
 		set -- "$@" -p "$_p"
+		# ⚠ A SINGLE BARE WORD IS AMBIGUOUS, AND GETTING IT WRONG WAS
+		# SILENT. On an install predating a subcommand, `charsiu update`
+		# was read as a question and the model answered with a cheerful
+		# paragraph about workouts, which looks like the update ran and
+		# printed something odd. One line on stderr says which way it
+		# was read; a word with a space in it is plainly a question and
+		# says nothing.
+		case "$_p" in
+		*[!A-Za-z0-9_-]*) ;;
+		*) echo "charsiu: reading \"$_p\" as a question, not a command." \
+			"\`charsiu --help\` lists the commands." >&2 ;;
+		esac
 		# ⚠ ASKING IS NOT COMPLETING. --help draws exactly this line:
 		# `charsiu "what is a bandgap"` asks once, `charsiu -p "..."` is
 		# print mode for a pipe. Without the chat template the question was
