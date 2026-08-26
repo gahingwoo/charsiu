@@ -734,6 +734,21 @@ static void rope_table(float *cs, uint32_t hd, int pos, float base,
 	}
 }
 
+/*
+ * y += bias. f32 and one dimensional in every qwen2 file measured, so this
+ * refuses anything else rather than reading a quantised block as floats.
+ */
+static void add_bias(float *y, const struct gguf_tensor *b, uint32_t n)
+{
+	const float *v = (const float *)b->data;
+	uint32_t i;
+
+	if (b->type != 0 || b->nbytes < (uint64_t)n * sizeof(float))
+		return;
+	for (i = 0; i < n; i++)
+		y[i] += v[i];
+}
+
 static void rope(float *v, uint32_t nheads, uint32_t hd, const float *cs)
 {
 	for (uint32_t h = 0; h < nheads; h++) {
@@ -776,7 +791,21 @@ int llama_load(struct llama_model *m, const char *path)
 		return -1;
 
 	gguf_get_str(&m->gguf, "general.architecture", arch, sizeof(arch));
-	if (strcmp(arch, "llama")) {
+	/*
+	 * ⚠ qwen2 RUNS ON THE LLAMA GRAPH. Read out of the files rather than
+	 * assumed: Qwen2.5-1.5B-Instruct declares the same nine weights a
+	 * layer under the same names, ties its output head to the embedding
+	 * the way Llama 3.2 1B does, and carries no softcapping or sliding
+	 * window key at all. The whole difference is a bias on Q, K and V.
+	 *
+	 * ⚠ THE ARCH NAME IS ALSO THE KEY PREFIX, so it has to stay whatever
+	 * the file said: qwen2.embedding_length, not llama.embedding_length.
+	 * gemma2 and phi3 are NOT this, and are refused for reasons that are
+	 * not tensor names -- gemma2 declares attn_logit_softcapping 50.0,
+	 * final_logit_softcapping 30.0 and a 4096 sliding window, and phi3
+	 * fuses QKV into one tensor and gate+up into another.
+	 */
+	if (strcmp(arch, "llama") && strcmp(arch, "qwen2")) {
 		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
 		goto fail;
 	}
@@ -851,6 +880,17 @@ int llama_load(struct llama_model *m, const char *path)
 		T(wk, "attn_k");
 		T(wv, "attn_v");
 		T(wo, "attn_output");
+		/* optional: llama has none, qwen2 has all three */
+#define B(field, suffix) do {                                            \
+		snprintf(key, sizeof(key), "blk.%u." suffix ".bias", l); \
+		L->field = gguf_tensor(&m->gguf, key);                   \
+		if (L->field && !L->field->nbytes)                       \
+			L->field = NULL;                                 \
+	} while (0)
+		B(bq, "attn_q");
+		B(bk, "attn_k");
+		B(bv, "attn_v");
+#undef B
 		T(ffn_norm, "ffn_norm");
 		T(gate, "ffn_gate");
 		T(up, "ffn_up");
@@ -1320,6 +1360,17 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_NORM1);
 
 		matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k, L->wv, s->v);
+		/*
+		 * ⚠ BEFORE ROPE, NOT AFTER. The bias is part of the projection;
+		 * rotating a biased vector is not the same as biasing a rotated
+		 * one, and the wrong order is the kind of mistake that still
+		 * produces fluent-looking text.
+		 */
+		if (L->bq) {
+			add_bias(s->q, L->bq, m->n_head * hd);
+			add_bias(s->k, L->bk, m->n_head_kv * hd);
+			add_bias(s->v, L->bv, m->n_head_kv * hd);
+		}
 		STAGE(ST_QKV);
 
 		rope(s->q, m->n_head, hd, ropecs);

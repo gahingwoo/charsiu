@@ -1,0 +1,72 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+# `charsiu update`. Not meant to be run directly; charsiu dispatches to it.
+#
+# Bring the source up to date and reinstall from it. The installer already
+# knows how to build and where things go, so this does not reimplement any of
+# that: it updates the tree and hands over.
+#
+# ⚠ THE KERNEL AND THE MODEL ARE NOT TOUCHED. Updating the runtime should not
+# reboot the board or spend an hour of somebody's link, so --no-kernel and
+# --no-model are not optional here.
+set -eu
+CHARSIU_HERE=$(dirname "$0")
+for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \
+	  "$CHARSIU_HERE/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../scripts/charsiu-lib.sh" \
+	  "$CHARSIU_HERE/../../opt/charsiu/charsiu-lib.sh" \
+	  /opt/charsiu/charsiu-lib.sh; do
+	[ -r "$_l" ] && { . "$_l"; break; }
+done
+command -v ini_get >/dev/null 2>&1 \
+	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
+
+SRC=""
+for d in ${CHARSIU_SRC:+"$CHARSIU_SRC"} \
+	 "${XDG_CACHE_HOME:-$HOME/.cache}/charsiu/src" \
+	 "$HOME/charsiu" /opt/charsiu/src; do
+	[ -f "$d/scripts/charsiu-install.sh" ] && { SRC="$d"; break; }
+done
+if [ -z "$SRC" ]; then
+	echo "charsiu update: no source tree to update." >&2
+	echo "  Install again and it will fetch one:" >&2
+	echo "  curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh -o install.sh && sh install.sh" >&2
+	exit 1
+fi
+
+was=$(cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || echo "")
+echo "  source  $SRC${was:+  ($was)}"
+
+# ⚠ `git pull` INTO A TREE SOMEBODY EDITED would either fail or merge. This is
+# a working copy of ours, not theirs, so --ff-only: if it will not fast forward
+# something is going on that a script should not resolve on its own.
+if [ -d "$SRC/.git" ] && command -v git >/dev/null 2>&1; then
+	if ! ( cd "$SRC" && git pull --ff-only --quiet ); then
+		echo "charsiu update: $SRC will not fast forward." >&2
+		echo "  It has local commits or changes. Sort those out, or delete it" >&2
+		echo "  and install again." >&2
+		exit 1
+	fi
+else
+	# no git, or a tarball checkout: take a fresh tarball over the top
+	echo "  fetching a fresh tarball"
+	T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL "${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}/archive/refs/heads/main.tar.gz" -o "$T/s.tgz"
+	else
+		wget -qO "$T/s.tgz" "${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}/archive/refs/heads/main.tar.gz"
+	fi || { echo "charsiu update: the download failed. Nothing was changed." >&2; exit 1; }
+	tar -xzf "$T/s.tgz" -C "$SRC" --strip-components=1
+fi
+
+now=$(cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || echo "")
+if [ -n "$was" ] && [ "$was" = "$now" ]; then
+	echo "  already up to date ($now)"
+else
+	echo "  updated${now:+ to $now}"
+fi
+
+# ⚠ HAND OVER RATHER THAN REBUILD HERE. The installer is the one place that
+# knows how to build, where the binaries go, and how to ask for root once.
+exec sh "$SRC/scripts/charsiu-install.sh" --no-kernel --no-model "$@"

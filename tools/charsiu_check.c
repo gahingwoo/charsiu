@@ -99,12 +99,18 @@ int main(int argc, char **argv)
 	gguf_get_str(&g, "general.name", name, sizeof(name));
 
 	/*
-	 * ⚠ charsiu's loader compares this with strcmp against "llama" and
-	 * refuses anything else, so qwen2, gemma, phi3 and the rest are out --
-	 * not because they are exotic but because llama.c only builds a llama
-	 * graph. Saying so here saves a 2 GB download.
+	 * ⚠ THIS LIST MUST MATCH llama_load's. It exists to save a 2 GB
+	 * download, so it is wrong in both directions: refusing something that
+	 * runs wastes a model, and accepting something that does not wastes the
+	 * download this is here to prevent.
+	 *
+	 * qwen2 runs on the llama graph -- same nine weights a layer, tied
+	 * output head, plus a bias on Q, K and V. gemma2 and phi3 do not, and
+	 * not over tensor names: gemma2 declares attn_logit_softcapping 50.0,
+	 * final_logit_softcapping 30.0 and a 4096 sliding window, and phi3
+	 * fuses QKV into one tensor and gate+up into another.
 	 */
-	if (strcmp(arch, "llama"))
+	if (strcmp(arch, "llama") && strcmp(arch, "qwen2"))
 		bad_arch = 1;
 
 	for (j = 0; j < g.n_tensors; j++) {

@@ -33,6 +33,7 @@ command -v ini_get >/dev/null 2>&1 \
 CONF=$(charsiu_conf_w)
 [ -f "$CONF" ] || CONF=$(charsiu_conf)
 MODELS_DIR="${CHARSIU_MODELS_DIR:-${CHARSIU_MODELS:-$CHARSIU_HOME/models}}"
+SELFURL=https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh
 for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
 	 "$(dirname "$0")/charsiu-tui.sh" \
 	 "$(dirname "$0")/../scripts/charsiu-tui.sh" \
@@ -363,6 +364,7 @@ while :; do
 		npu    "the switches that decide the fast path" \
 		show   "the exact command this produces" \
 		chat   "run it now" \
+		update "fetch the latest charsiu and reinstall it" \
 		quit   "") || exit 0
 	case "$c" in
 	status) page_status ;;
@@ -371,6 +373,20 @@ while :; do
 	npu)    page_npu ;;
 	show)   page_show ;;
 	chat)   L=$(find_bin charsiu); [ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --chat || true; pause ;;
+	update)
+		# ⚠ IT REPLACES THE SCRIPTS THIS MENU IS RUNNING FROM, so hand
+		# over with exec rather than returning into a page that is no
+		# longer the one on disk.
+		U=$(find_bin charsiu-update)
+		if [ -z "$U" ]; then
+			ui_msg "charsiu-update is not installed.
+
+This charsiu predates it. Install again and it will be there:
+  curl -fsSL $SELFURL -o install.sh && sh install.sh"
+			pause
+		else
+			exec "$U"
+		fi ;;
 	quit|"") exit 0 ;;
 	esac
 done

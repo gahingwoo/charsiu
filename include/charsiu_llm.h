@@ -299,6 +299,13 @@ uint32_t tokenizer_n_vocab(const struct tokenizer *tk);
 struct llama_layer {
 	const struct gguf_tensor *attn_norm;
 	const struct gguf_tensor *wq, *wk, *wv, *wo;
+	/*
+	 * ⚠ qwen2 IS A LLAMA WITH THREE MORE TENSORS. Measured against
+	 * Qwen2.5-1.5B-Instruct-Q4_0: identical nine weights a layer, plus a
+	 * bias on each of Q, K and V, f32 and one dimensional, sized exactly
+	 * like the projections they follow. NULL on llama, which has none.
+	 */
+	const struct gguf_tensor *bq, *bk, *bv;
 	const struct gguf_tensor *ffn_norm;
 	const struct gguf_tensor *gate, *up, *down;
 };
