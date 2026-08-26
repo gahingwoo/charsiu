@@ -45,17 +45,24 @@ THREADS=$(ini_get run threads);  : "${THREADS:=4}"
 CPUS=$(ini_get run cpus)
 NPU=$(ini_get npu enable);       : "${NPU:=yes}"
 KSLICE=$(ini_get npu kslice);    : "${KSLICE:=1024}"
-MAXN=$(ini_get npu maxn);        : "${MAXN:=131072}"
+MAXN=$(ini_get npu maxn);        : "${MAXN:=262144}"
 COEF=$(ini_get npu coef_elems);  : "${COEF:=65536}"
 
 E=""
+INHERITED=""
+# See env_default in charsiu-lib.sh: the config file is the default and an
+# exported CHARSIU_* is the override.
 case "$NPU" in
 yes|1|true|on)
-	E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"
-	E="$E CHARSIU_NPU_KMAX=$KSLICE CHARSIU_NPU_W4_GROUP=$KSLICE"
-	E="$E CHARSIU_NPU_MAXN=$MAXN CHARSIU_COEF_ELEMS=$COEF" ;;
+	env_default CHARSIU_NPU 1
+	env_default CHARSIU_NPU_QUANT 1
+	env_default CHARSIU_NPU_W4V 1
+	env_default CHARSIU_NPU_KMAX "$KSLICE"
+	env_default CHARSIU_NPU_W4_GROUP "$KSLICE"
+	env_default CHARSIU_NPU_MAXN "$MAXN"
+	env_default CHARSIU_COEF_ELEMS "$COEF" ;;
 esac
-[ -n "$CPUS" ] && E="$E CHARSIU_CPUS=$CPUS"
+[ -n "$CPUS" ] && env_default CHARSIU_CPUS "$CPUS"
 
 # ⚠ Tell whoever started it where to point a browser. "listening on 0.0.0.0" is
 # not an address anybody can type.

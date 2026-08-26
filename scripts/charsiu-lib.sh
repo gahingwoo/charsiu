@@ -144,3 +144,29 @@ resolve_model() {
 
 # current_model: what the config names, or empty.
 current_model() { ini_get model path; }
+
+# ⚠⚠ AN EXPORTED VARIABLE WINS OVER THE CONFIG FILE, and it did not.
+#
+# Callers build a list of NAME=VALUE for `env`, and an assignment there is put
+# in FRONT of the inherited environment -- so a caller who exported one of these names had it
+# overwritten without a word. A board round ran
+#
+#   CHARSIU_NPU_MAXN=262144 charsiu run gemma-3-1b-it-Q4_0.gguf
+#
+# to route gemma3's 262144 wide output head, got the config default of 131072
+# instead, and the head stayed on the CPU costing 44% of every token. Nothing
+# in the log said which number had been used, so the round measured the change
+# it was already measuring.
+#
+# The config file is the default; the environment is the override. That is the
+# order every other tool uses, and --show now names anything it deferred to.
+#
+# Appends to the caller's $E, and names what it skipped in $INHERITED.
+env_default() {
+	eval "_set=\${$1+yes}"
+	if [ "${_set:-}" = yes ]; then
+		INHERITED="$INHERITED $1"
+	else
+		E="$E $1=$2"
+	fi
+}

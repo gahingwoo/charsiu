@@ -10,7 +10,7 @@
 # should have to remember this:
 #
 #   CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_KMAX=1024 \
-#   CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=131072 CHARSIU_COEF_ELEMS=65536 \
+#   CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 #   charsiu_run /opt/charsiu/models/....gguf -p "..." -n 64 -c 512 -t 4
 #
 # ⚠ KMAX AND GROUP MUST BE EQUAL. npudev.c gates the int4 path on
@@ -158,26 +158,35 @@ CTX=$(ini_get run context);      : "${CTX:=512}"
 CPUS=$(ini_get run cpus)
 NPU=$(ini_get npu enable);       : "${NPU:=yes}"
 KSLICE=$(ini_get npu kslice);    : "${KSLICE:=1024}"
-MAXN=$(ini_get npu maxn);        : "${MAXN:=131072}"
+MAXN=$(ini_get npu maxn);        : "${MAXN:=262144}"
 COEF=$(ini_get npu coef_elems);  : "${COEF:=65536}"
 
 set -- "$@"
 E=""
+INHERITED=""
+
+# See env_default in charsiu-lib.sh: the config file is the default and an
+# exported CHARSIU_* is the override, which is why these are not plain
+# assignments into $E.
 case "$NPU" in
 yes|1|true|on)
+	env_default CHARSIU_NPU 1
+	env_default CHARSIU_NPU_QUANT 1
+	env_default CHARSIU_NPU_W4V 1
 	# ⚠ kslice writes BOTH, and they must match. See the note above.
-	E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"
-	E="$E CHARSIU_NPU_KMAX=$KSLICE CHARSIU_NPU_W4_GROUP=$KSLICE"
-	E="$E CHARSIU_NPU_MAXN=$MAXN CHARSIU_COEF_ELEMS=$COEF" ;;
+	env_default CHARSIU_NPU_KMAX "$KSLICE"
+	env_default CHARSIU_NPU_W4_GROUP "$KSLICE"
+	env_default CHARSIU_NPU_MAXN "$MAXN"
+	env_default CHARSIU_COEF_ELEMS "$COEF" ;;
 esac
-[ -n "$CPUS" ] && E="$E CHARSIU_CPUS=$CPUS"
+[ -n "$CPUS" ] && env_default CHARSIU_CPUS "$CPUS"
 
 # ⚠ ONE SWITCH, NOT A SET OF ENVIRONMENT VARIABLES NOBODY WILL REMEMBER. The
 # stage timings existed only as CHARSIU_STAGES, which meant they were reachable
 # by whoever already knew the name. [debug] enable makes them a setting.
 DEBUG=$(ini_get debug enable)
 case "$DEBUG" in
-yes|1|true|on) E="$E CHARSIU_STAGES=1" ;;
+yes|1|true|on) env_default CHARSIU_STAGES 1 ;;
 esac
 
 # anything under [extra] is passed through verbatim, which is the escape hatch
@@ -254,6 +263,21 @@ stage_filter() {
 		}
 		next
 	}
+	# ⚠ THE DENOMINATOR IS A PREDICTION AND THE BAR CLOSES ITSELF, so the
+	# bar cannot notice a tensor that never staged. The heartbeat fires
+	# every sixteenth tensor, the last one for 183 lands at 176, and the
+	# rule above prints 183/183 to keep the answer off the bar line. A
+	# gemma3 round drew a full bar while 182 of 183 had staged, and the one
+	# missing was the output head -- 44% of that token, on the CPU, with a
+	# 100% bar over it. The runtime says the real count when it is done.
+	/^charsiu NPU: [0-9]+ tensors,/ {
+		if (bar) { printf "\n"; bar = 0 }
+		print; fflush()
+		if (tot > 0 && $3 + 0 < tot)
+			printf "  %d of the %d it meant to stage stayed on the CPU\n",
+			       tot - ($3 + 0), tot
+		fflush(); next
+	}
 	# ⚠ a pass-through line lands mid-bar unless the bar is closed first,
 	# and \r leaves the cursor at column 0 of a line that still has a bar on it.
 	{ if (bar) { printf "\n"; bar = 0 }
@@ -298,9 +322,12 @@ if [ "$BENCH" = 1 ]; then
 fi
 
 if [ "$SHOW" = 1 ]; then
-	printf 'env %s \\\n  %s %s -c %s -t %s' "$E" "$RUN" "$MODEL" "$CTX" "$THREADS"
+	printf 'env%s \\\n  %s %s -c %s -t %s' "$E" "$RUN" "$MODEL" "$CTX" "$THREADS"
 	[ $# -gt 0 ] && printf ' %s' "$@"
 	printf '\n'
+	# what the environment is already deciding, which the line above cannot
+	# show because those names are not being passed at all.
+	[ -n "$INHERITED" ] && printf '# from the environment, not the config:%s\n' "$INHERITED"
 	exit 0
 fi
 
