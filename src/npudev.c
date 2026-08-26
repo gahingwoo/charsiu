@@ -1462,7 +1462,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (i = 0; i < n; i++)
 		if (ids[i] < 0 || (unsigned)ids[i] >= g->n_ent)
 			return -1;
-	charsiu_note("a matvec on a group of tensors", (unsigned long)n,
+	charsiu_note("a group: checking the entries", (unsigned long)n,
 		     (unsigned long)a->n);
 	e0 = &g->ent[ids[0]];
 	for (i = 1; i < n; i++)
@@ -1484,6 +1484,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
 		nd++;
+	charsiu_note("a group: packing the activation", (unsigned long)d,
+		     (unsigned long)e0->k_slices);
 	if (g->inprep)
 		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
@@ -1548,6 +1550,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned no = 0;
 
+		charsiu_note("a group: building the joblist", (unsigned long)d,
+			     (unsigned long)n);
 		nh = 0;
 		ntask = 0;
 		g->handles[nh++] = g->in[d].handle;
@@ -1585,6 +1589,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		jl.in_count = nh;
 		jl.out_handles = outh;
 		jl.out_count = no;
+		charsiu_note("a group: submitting", (unsigned long)ntask,
+			     (unsigned long)nh);
 		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
 			g->strikes = 3;
 			g->dead = 1;
@@ -1609,6 +1615,8 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		if (any) {
 			double tc = now_us();
 
+			charsiu_note("a group: the CPU's own rows",
+				     (unsigned long)n, (unsigned long)e0->t->k);
 			for (uint64_t q = 0; q < e0->t->k; q++)
 				g->afscr[q] = charsiu_half_to_float(
 					charsiu_float_to_half(a->f[q]));
@@ -1624,9 +1632,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 
 	t1 = now_us();
 	for (i = 0; i < n; i++)
-		for (unsigned d = 0; d < g->ndev; d++)
+		for (unsigned d = 0; d < g->ndev; d++) {
+			charsiu_note("a group: waiting on the fence",
+				     (unsigned long)i, (unsigned long)d);
 			charsiu_bo_prep(g->dev[d], &g->ent[ids[i]].out[d],
 					2000000000);
+		}
 	g->fence_us += now_us() - t1;
 
 	t1 = now_us();
@@ -1649,11 +1660,15 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		 * and nothing else.
 		 */
 		/* ⚠ the hardware's rows only: the CPU's are already written */
+		charsiu_note("a group: clearing the accumulator",
+			     (unsigned long)e->t->n, (unsigned long)e->n_npu);
 		if (g->w4)
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
 		for (j = 0; j < e->count; j++) {
+			charsiu_note("a group: reading a slice back",
+				     (unsigned long)i, (unsigned long)j);
 			const struct npu_slot *s = &g->slot[e->first + j];
 			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
 					      s->out_slot * g->out_stride;

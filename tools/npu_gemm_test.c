@@ -132,6 +132,18 @@ out:
 }
 
 /* what the hardware is being asked for: (a - zp) . (b - zp) per output */
+/*
+ * A byte around 128 that depends on BOTH indices with no short period. Small
+ * enough that a dot product of a few thousand terms stays well inside int32.
+ */
+static uint8_t mix(unsigned a, unsigned b, unsigned span)
+{
+	uint32_t h = a * 2654435761u ^ (b + 0x9e3779b9u) * 40503u;
+
+	h ^= h >> 13;
+	return (uint8_t)(128 + (int)(h % span) - (int)(span / 2));
+}
+
 static void reference(unsigned m, unsigned k, unsigned n,
 		      const uint8_t *A, const uint8_t *B, int32_t *out)
 {
@@ -207,7 +219,28 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	 * [n/4][m][4] -- and then had to explain why the same layout scored
 	 * only 15 of 128. Six channels cannot say where a pattern STOPS.
 	 */
-	printf("\n  where each wanted value landed  (flat index in the output)\n");
+	/*
+	 * ⚠ SAY HOW TRUSTWORTHY THIS TABLE IS. Every row of it reports the
+	 * FIRST index holding a value, so a value the reference produces twice
+	 * gives an answer that is one of two and reads like one of one.
+	 */
+	{
+		size_t uniq = 0;
+
+		for (size_t i = 0; i < total; i++) {
+			size_t j;
+
+			for (j = 0; j < i; j++)
+				if (want[j] == want[i])
+					break;
+			if (j == i)
+				uniq++;
+		}
+		printf("\n  the reference has %zu distinct values in %zu"
+		       " (a table below is only as good as this)\n",
+		       uniq, total);
+	}
+	printf("  where each wanted value landed  (flat index in the output)\n");
 	printf("    %-10s %-12s %-10s %-8s %s\n",
 	       "(row,ch)", "want", "at flat", "hits", "[n/4][m][4] predicts");
 	for (unsigned pass = 0; pass < 2; pass++) {
@@ -413,12 +446,19 @@ int main(int argc, char **argv)
 	 */
 	for (unsigned r = 0; r < maxm; r++)
 		for (unsigned i = 0; i < k; i++)
-			A[(size_t)r * k + i] =
-				(uint8_t)(128 + (int)((i + 3 * r) % 7) - 3
-					  + (int)(r % 3) - 1);
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	/*
+	 * ⚠ EVERY OUTPUT CHANNEL MUST BE A DIFFERENT NUMBER, and the obvious
+	 * B[c][i] = (c + i) % 9 is not: it has PERIOD NINE in c, so channel 9
+	 * computes the same dot product as channel 0. Round 382's locator then
+	 * reported the first flat index holding each value, which for a
+	 * repeated value is always the earliest channel's slot -- the table
+	 * looked like a layout and was an artefact of the test data. A hash of
+	 * (c, i) has no period worth finding.
+	 */
 	for (unsigned c = 0; c < n; c++)
 		for (unsigned i = 0; i < k; i++)
-			B[(size_t)c * k + i] = (uint8_t)(128 + (int)((c + i) % 9) - 4);
+			B[(size_t)c * k + i] = mix(c, i, 15);
 
 	printf("K=%u N=%u, int8 weights and activations, raw accumulator\n", k, n);
 	/*
