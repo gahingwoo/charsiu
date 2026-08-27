@@ -1688,6 +1688,65 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
+/*
+ * ⚠ WHOLE ROWS, ACROSS EVERY SLOT OF ONE DEVICE.
+ *
+ * The read back is 283 ms of a 738 ms batched pass at m = 32 and it is the
+ * plainest loop in the file, so it goes on the pool. Rows are the axis because
+ * they are the only one that is disjoint everywhere: a row owns its stripe of
+ * Y, and the K slices that have to SUM into the same channels are all in the
+ * same row and therefore on the same thread. Splitting by slot instead would
+ * put two summands of one channel on two threads.
+ */
+struct bread {
+	struct charsiu_npu *g;
+	const struct npu_entry *e;
+	unsigned d, m;
+	float *Y;
+};
+
+static void bread_rows(void *vb, uint64_t r0, uint64_t nr)
+{
+	const struct bread *b = vb;
+	struct charsiu_npu *g = b->g;
+	const struct npu_entry *e = b->e;
+	unsigned m = b->m, nt = 0;
+	int grp = tensor_grouped(g, e->t);
+
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+		unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+		const float *fo;
+		const int32_t *io;
+
+		if (s->di != b->d)
+			continue;
+		fo = (const float *)((uint8_t *)e->bout[b->d].map
+				     + (size_t)nt * g->bout_stride);
+		io = (const int32_t *)fo;
+		for (uint64_t r = r0; r < r0 + nr; r++) {
+			const uint32_t *mp = g->bmap + (size_t)r * sn;
+			float *yr = b->Y + (size_t)r * e->t->n + s->n0;
+
+			if (g->w4 && grp) {
+				const float *sc = s->sc;
+
+				for (unsigned j = 0; j < sn; j++)
+					yr[j] += fo[mp[j]] * sc[j];
+			} else if (g->w4) {
+				for (unsigned j = 0; j < sn; j++)
+					yr[j] += fo[mp[j]];
+			} else {
+				float d1 = g->bd1[(size_t)ki * m + r];
+
+				for (unsigned j = 0; j < sn; j++)
+					yr[j] += (float)io[mp[j]] * d1;
+			}
+		}
+		nt++;
+	}
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
@@ -1759,7 +1818,6 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
 	t0 = now_us();
-	{ double tp = now_us(); (void)tp; }
 
 	/*
 	 * ⚠ ONE SUBMIT PER DEVICE FOR THE WHOLE PROJECTION, and both issued
@@ -1886,72 +1944,48 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 	/* ⚠ both submitted, then both waited on: that is the point */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		unsigned nt = 0;
 		double tf = now_us();
+		struct bread b = { g, e, d, m, Y };
+		unsigned wide = 0;
 
 		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
 		g->bfence_us += now_us() - tf;
 		tf = now_us();
-		for (unsigned i = 0; i < e->count; i++) {
-			const struct npu_slot *s = &g->slot[e->first + i];
-			unsigned sn = s->job.mm.n;
-			const float *fo;
-			const int32_t *io;
-			int grp = tensor_grouped(g, e->t);
-
-			if (s->di != d)
-				continue;
-			fo = (const float *)((uint8_t *)e->bout[d].map
-					     + (size_t)nt * g->bout_stride);
-			io = (const int32_t *)fo;
+		for (unsigned i = 0; i < e->count; i++)
+			if (g->slot[e->first + i].di == d &&
+			    g->slot[e->first + i].job.mm.n > wide)
+				wide = (unsigned)g->slot[e->first + i].job.mm.n;
+		if (wide) {
 			/*
-			 * ⚠ THE TABLE, NOT THE FUNCTION. Same mapping, four
-			 * divisions fewer per element, and the mapping depends
-			 * on nothing but (m, n) so it survives every slice of
-			 * every tensor of that shape.
+			 * ⚠ THE TABLE, NOT THE FUNCTION. charsiu_acc_index is
+			 * four integer divisions and the read runs it once per
+			 * output element -- 23 million in one m = 32 pass over
+			 * a 1B model. It depends on nothing but (m, n).
 			 */
-			if (g->bmap_m != m || g->bmap_n != sn) {
+			if (g->bmap_m != m || g->bmap_n != wide) {
 				uint32_t *t2 = realloc(g->bmap,
-						       (size_t)m * sn * sizeof(*t2));
+						(size_t)m * wide * sizeof(*t2));
 
 				if (!t2) {
 					whine(g, "the read order table would not allocate",
-					      m, sn);
+					      m, wide);
 					return -1;
 				}
 				g->bmap = t2;
 				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < sn; j++)
-						g->bmap[(size_t)r * sn + j] =
+					for (unsigned j = 0; j < wide; j++)
+						g->bmap[(size_t)r * wide + j] =
 						  (uint32_t)charsiu_acc_index(r, j, m);
 				g->bmap_m = m;
-				g->bmap_n = sn;
+				g->bmap_n = wide;
 			}
-			for (unsigned r = 0; r < m; r++) {
-				const uint32_t *mp = g->bmap + (size_t)r * sn;
-				float *yr = Y + (size_t)r * e->t->n + s->n0;
-				float d1 = g->w4 ? 0.0f
-						 : g->bd1[(size_t)(i / e->n_slices) * m + r];
-
-				if (g->w4 && grp) {
-					const float *sc = s->sc;
-
-					for (unsigned j = 0; j < sn; j++)
-						yr[j] += fo[mp[j]] * sc[j];
-				} else if (g->w4) {
-					for (unsigned j = 0; j < sn; j++)
-						yr[j] += fo[mp[j]];
-				} else {
-					for (unsigned j = 0; j < sn; j++)
-						yr[j] += (float)io[mp[j]] * d1;
-				}
-			}
-			nt++;
+			charsiu_parallel_for(bread_rows, &b, m);
 		}
 		g->bread_us += now_us() - tf;
 		if (!g->nofini)
 			charsiu_bo_fini(g->dev[d], &e->bout[d]);
 	}
+
 	g->busy_us += now_us() - t0;
 
 	/* an ungrouped tensor is scaled once, per channel, at the end; int8
