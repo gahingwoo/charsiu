@@ -433,9 +433,22 @@ int main(int argc, char **argv)
 	t0 = now_ms();
 	const float *logits = NULL;
 
-	/* ⚠ st->pos, not i: turn two starts where turn one stopped */
-	for (i = 0; i < n_ids; i++)
-		logits = llama_forward(st, ids[i], st->pos);
+	/*
+	 * ⚠ THE PROMPT IN ONE GO WHERE THE MODEL ALLOWS IT, and a token at a
+	 * time where it does not. llama_prefill_batch refuses any architecture
+	 * it does not implement rather than computing something else, so the
+	 * fallback below is not an error path, it is the other half of the
+	 * same decision.
+	 *
+	 * CHARSIU_NO_BATCH_PREFILL forces the token loop, which is the control
+	 * every round of this needs: the generated text has to be identical.
+	 */
+	if (getenv("CHARSIU_NO_BATCH_PREFILL") || n_ids < 2 ||
+	    llama_prefill_batch(st, &m, ids, n_ids, st->pos))
+		for (i = 0; i < n_ids; i++)
+			logits = llama_forward(st, ids[i], st->pos);
+	else
+		logits = st->logits;
 	t_prompt = now_ms() - t0;
 
 	/*

@@ -490,6 +490,13 @@ struct llama_state {
 	float *vcache;
 
 	float *x, *xb, *xb2;   /* n_embd */
+	/*
+	 * ⚠ THE BATCHED PREFILL'S OWN ROWS, allocated only if a prompt takes
+	 * that path and never touched by a decode, which is one row and uses
+	 * the three above.
+	 */
+	float *bx, *bxb, *bhb, *bhb2, *bxo, *bcs;
+	unsigned bx_n;
 	float *hb, *hb2;       /* n_ff */
 	float *q;              /* n_head * head_dim */
 	float *k, *v;          /* n_head_kv * head_dim */
@@ -532,6 +539,15 @@ double llama_stage_ms(void);
  */
 int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		      unsigned mrows);
+
+/*
+ * A prompt in chunks of n, batching the feed forward across the rows. Returns
+ * 0 having advanced s->pos and left the LAST row's logits in s->logits, or -1
+ * if it will not take this model -- in which case the caller loops
+ * llama_forward, which is correct for every architecture and merely slower.
+ */
+int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
+			const int32_t *toks, int n, int pos0);
 
 /* One token in, a full logit vector out. `pos` is where it goes in the cache. */
 void llama_stages_reset(void);

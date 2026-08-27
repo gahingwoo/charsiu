@@ -2719,6 +2719,182 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 	}
 }
 
+/*
+ * A PROMPT IN CHUNKS, WHICH IS WHERE THE BATCHED MATMUL PAYS.
+ *
+ * Every projection in a prompt is the same weights against a different row, so
+ * a token at a time re-streams the whole model per token. The probe measures
+ * 5.14x at m = 32 on the projections alone.
+ *
+ * ⚠⚠ THIS IS A SECOND COPY OF THE LAYER LOOP AND IT IS DELIBERATELY BLIND.
+ *
+ * llama_forward carries seven architectures: gemma3's sliding window and two
+ * rope bases, gemma4's per layer embeddings and shared KV, qwen3's q and k
+ * norms, biases, post norms, the softcaps. Reimplementing all of that here is
+ * how two copies quietly stop agreeing. So this handles the plain case and
+ * REFUSES the rest, once and up front, and the caller falls back to the token
+ * loop -- which is correct for all seven and merely slower.
+ *
+ * ⚠ WHAT IS BATCHED: the feed forward, 63% of the projection time (gate and up
+ * 39%, down 24%). q, k, v and o stay one row at a time, because batching those
+ * means duplicating the attention half too, and that is where the architectures
+ * differ. Rows are still walked in order inside a layer: row r's attention
+ * reads the KV that the rows before it wrote.
+ *
+ * ⚠ AND THE HEAD IS NOT BATCHED AT ALL. A prompt needs logits for its last
+ * token and no other, so the widest projection in the model is skipped n - 1
+ * times rather than made n times wider.
+ */
+static int npu_id_for(struct llama_state *s, const struct gguf_tensor *w)
+{
+	const struct npu_tensor *nt;
+
+	if (!npu_mode() || !s->dev || w->type == GGML_F32 || w->type == GGML_F16)
+		return -1;
+	nt = npu_get(s, w);
+	if (!nt)
+		return -1;
+	for (unsigned i = 0; i < s->n_npu; i++)
+		if (&s->npu[i] == nt)
+			return s->npu_id[i];
+	return -1;
+}
+
+/* n rows through one set of weights, or the same thing a row at a time */
+static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
+		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
+{
+	int id = npu_id_for(s, w);
+
+	if (id >= 0 && !charsiu_npu_matmul(s->dev, id, X, (unsigned)n, Y))
+		return 0;
+	/*
+	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
+	 * above can only ever be checked on the board. matvec is the same call
+	 * llama_forward makes, so a run with no hardware at all compares the
+	 * two layer loops and nothing else.
+	 */
+	for (int r = 0; r < n; r++)
+		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	return 0;
+}
+
+static int batch_ok(const struct llama_model *m)
+{
+	if (m->n_swa || m->v_norm || m->n_embd_pl || m->final_softcap > 0.0f ||
+	    kv_posmajor())
+		return 0;
+	for (uint32_t l = 0; l < m->n_layer; l++) {
+		const struct llama_layer *L = &m->layers[l];
+
+		if (!L->wk || !L->wv || L->bq || L->q_norm || L->kv_from >= 0 ||
+		    L->attn_post_norm || L->ffn_post_norm ||
+		    L->n_ff != m->layers[0].n_ff)
+			return 0;
+	}
+	return 1;
+}
+
+int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
+			const int32_t *toks, int n, int pos0)
+{
+	uint32_t hd = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
+	uint32_t kvdim = m->n_head_kv * hd, nff = m->layers[0].n_ff;
+	uint32_t gqa = m->n_head / m->n_head_kv;
+	float scale = m->attn_scale != 0.0f ? m->attn_scale
+					    : 1.0f / sqrtf((float)hd);
+
+	if (n < 2 || !batch_ok(m))
+		return -1;
+	if (s->bx_n < (unsigned)n) {
+		free(s->bx); free(s->bxb); free(s->bhb);
+		free(s->bhb2); free(s->bxo); free(s->bcs);
+		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
+		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
+		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
+		s->bhb = malloc((size_t)n * nff * sizeof(float));
+		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
+		s->bcs = malloc((size_t)hd * sizeof(float));
+		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
+		    !s->bcs) {
+			s->bx_n = 0;
+			return -1;
+		}
+		s->bx_n = n;
+	}
+
+	for (int r = 0; r < n; r++) {
+		float *xr = s->bx + (size_t)r * m->n_embd;
+
+		gguf_row_f32(m->tok_embd, (uint64_t)toks[r], xr);
+		if (m->embd_scale != 1.0f)
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				xr[i] *= m->embd_scale;
+	}
+
+	for (uint32_t l = 0; l < m->n_layer; l++) {
+		const struct llama_layer *L = &m->layers[l];
+
+		for (int r = 0; r < n; r++) {
+			float *xr = s->bx + (size_t)r * m->n_embd;
+			int pos = pos0 + r;
+
+			rope_table(s->bcs, hd, pos, m->rope_base, NULL);
+			rmsnorm(s->xb, xr, L->attn_norm, m->n_embd, m->rms_eps);
+			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
+				    L->wv, s->v);
+			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
+			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
+			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+				size_t off = ((size_t)(l * m->n_head_kv + kh)
+					      * s->n_ctx + pos) * hd;
+
+				memcpy(s->kcache + off, s->k + kh * hd,
+				       hd * sizeof(float));
+				memcpy(s->vcache + off, s->v + kh * hd,
+				       hd * sizeof(float));
+			}
+			{
+				struct attn_job aj = { s, l, pos, 0, hd, hd,
+						       kvdim, gqa,
+						       m->n_head_kv, scale };
+
+				attn_heads(&aj, 0, m->n_head);
+			}
+			matvec(s, L->wo, s->xb, s->xb2);
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				xr[i] += s->xb2[i];
+			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
+				m->n_embd, m->rms_eps);
+		}
+
+		matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd, nff);
+		matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd, nff);
+		for (int r = 0; r < n; r++) {
+			if (m->ffn_gelu)
+				gelu_mul(s->bhb + (size_t)r * nff,
+					 s->bhb2 + (size_t)r * nff, nff);
+			else
+				silu_mul(s->bhb + (size_t)r * nff,
+					 s->bhb2 + (size_t)r * nff, nff);
+		}
+		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
+		for (int r = 0; r < n; r++) {
+			float *xr = s->bx + (size_t)r * m->n_embd;
+			const float *o = s->bxo + (size_t)r * m->n_embd;
+
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				xr[i] += o[i];
+		}
+	}
+
+	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
+		m->n_embd, m->rms_eps);
+	matvec(s, m->output, s->xb, s->logits);
+	s->pos = pos0 + n;
+	return 0;
+}
+
 const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 {
 	const struct llama_model *m = s->m;
