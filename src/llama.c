@@ -563,7 +563,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	printf("\n  batching %u layers, checked before it is timed\n",
 	       m->n_layer);
 	printf("    m  tensors    worst rel   rows that agree"
-	       "     one row    batched  speedup  us a row\n");
+	       "     one row    batched  speedup  us a row    GB/s\n");
 
 	/*
 	 * ⚠⚠ TWO AXES AND SEVEN READINGS, at m = 2 on one tensor, before any
@@ -933,7 +933,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
-		double t_one = 0.0, t_bat = 0.0, worst = 0.0;
+		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
 			break;
@@ -1080,15 +1080,24 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       r, have, (unsigned)t->n);
 				}
 			}
+			/* what the hardware moved: the weights, once */
+			mb += (double)t->k * t->n / 1e6;
 			tested++;
 		}
 		if (!tested)
 			continue;
+		/*
+		 * ⚠ GB/s, BECAUSE A SPEEDUP CANNOT SAY WHETHER THERE IS ROOM
+		 * LEFT. 3.73x against a one row loop sounds finished; the same
+		 * run at 1.3 GB/s against a 9.5 GB/s hardware path says most of
+		 * the time is not the hardware at all.
+		 */
 		printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms %7.0f ms"
-		       "  %5.2fx  %7.1f\n",
+		       "  %5.2fx  %7.1f  %6.2f\n",
 		       mr, tested, worst, rows_ok, rows_tot, t_one, t_bat,
 		       t_bat > 0 ? t_one / t_bat : 0.0,
-		       t_bat * 1e3 / (tested * (double)mr));
+		       t_bat * 1e3 / (tested * (double)mr),
+		       t_bat > 0 ? mb / t_bat : 0.0);
 		rc = 0;
 	}
 	printf("\n  ⚠ a speed with rows that do not agree is the speed of a"

@@ -182,6 +182,15 @@ struct charsiu_npu {
 	size_t bin_stride, bout_stride;
 	float *bscr;               /* m rows of one slice's K, gathered */
 	uint8_t *bq;               /* and quantised, for the int8 path */
+	/*
+	 * ⚠ THE READ ORDER AS A TABLE, because charsiu_acc_index costs four
+	 * integer divisions and the read back runs it once per output element:
+	 * 23 million of them for one m = 32 pass over a 1B model, which on an
+	 * A72 is most of a second. The mapping depends only on (m, n), so it is
+	 * built once and looked up.
+	 */
+	uint32_t *bmap;
+	unsigned bmap_m, bmap_n;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -758,6 +767,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bscr);
 	free(g->bq);
 	free(g->bd1);
+	free(g->bmap);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1856,16 +1866,48 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			fo = (const float *)((uint8_t *)e->bout[d].map
 					     + (size_t)nt * g->bout_stride);
 			io = (const int32_t *)fo;
-			for (unsigned r = 0; r < m; r++)
-				for (unsigned j = 0; j < sn; j++) {
-					size_t at = charsiu_acc_index(r, j, m);
-					float v = g->w4 ? fo[at]
-							: (float)io[at]
-							  * g->bd1[(size_t)nt * m + r];
+			/*
+			 * ⚠ THE TABLE, NOT THE FUNCTION. Same mapping, four
+			 * divisions fewer per element, and the mapping depends
+			 * on nothing but (m, n) so it survives every slice of
+			 * every tensor of that shape.
+			 */
+			if (g->bmap_m != m || g->bmap_n != sn) {
+				uint32_t *t2 = realloc(g->bmap,
+						       (size_t)m * sn * sizeof(*t2));
 
-					Y[(size_t)r * e->t->n + s->n0 + j] +=
-						(g->w4 && grp) ? v * s->sc[j] : v;
+				if (!t2) {
+					whine(g, "the read order table would not allocate",
+					      m, sn);
+					return -1;
 				}
+				g->bmap = t2;
+				for (unsigned r = 0; r < m; r++)
+					for (unsigned j = 0; j < sn; j++)
+						g->bmap[(size_t)r * sn + j] =
+						  (uint32_t)charsiu_acc_index(r, j, m);
+				g->bmap_m = m;
+				g->bmap_n = sn;
+			}
+			for (unsigned r = 0; r < m; r++) {
+				const uint32_t *mp = g->bmap + (size_t)r * sn;
+				float *yr = Y + (size_t)r * e->t->n + s->n0;
+				float d1 = g->w4 ? 0.0f
+						 : g->bd1[(size_t)nt * m + r];
+
+				if (g->w4 && grp) {
+					const float *sc = s->sc;
+
+					for (unsigned j = 0; j < sn; j++)
+						yr[j] += fo[mp[j]] * sc[j];
+				} else if (g->w4) {
+					for (unsigned j = 0; j < sn; j++)
+						yr[j] += fo[mp[j]];
+				} else {
+					for (unsigned j = 0; j < sn; j++)
+						yr[j] += (float)io[mp[j]] * d1;
+				}
+			}
 			nt++;
 		}
 		if (!g->nofini)
