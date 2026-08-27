@@ -296,6 +296,22 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
  * ⚠ P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
  * map has been printed. m = 8 is scored by the sweep and has not been read.
  */
+/*
+ * The running commentary switch. See charsiu.h: on for a one-shot run, which is
+ * what a board log is, and off inside a conversation.
+ */
+static int diag_on = 1;
+
+void charsiu_diag_quiet(int on)
+{
+	diag_on = !on;
+}
+
+int charsiu_diag(void)
+{
+	return diag_on;
+}
+
 size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
 {
 	unsigned P, G, c, a, t, j;

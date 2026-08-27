@@ -522,6 +522,14 @@ static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned 
 {
 	unsigned i;
 
+	/*
+	 * ⚠ NOT INTO A CONVERSATION. "NOT on the NPU -- int4 computes one row
+	 * (K=2048 N=8192)" is exactly the line a board round needs and exactly
+	 * the line somebody who typed a question should never see. It is not an
+	 * error: the tensor took the CPU and the answer is correct.
+	 */
+	if (!charsiu_diag())
+		return;
 	for (i = 0; i < g->n_whined; i++)
 		if (g->whined[i] == what)
 			return;
