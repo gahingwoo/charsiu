@@ -637,41 +637,48 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * nothing about surf at all.
  */
 /*
- * ⚠⚠ THE ACCUMULATOR'S READ ORDER. Solved in N, open in m.
+ * ⚠⚠ THE ACCUMULATOR'S READ ORDER, SOLVED.
  *
  * With 0x40b8 following the row count every wanted value is in the buffer at
- * every shape and every m measured -- "0 are absent" at K=64 N=64, K=256 N=128
- * and K=1024 N=32 -- so the arithmetic is right and only the order is wrong.
+ * every shape and every m measured, so the arithmetic is right and this is all
+ * that was left. locate() printed the map at m = 2 and again at m = 4, and one
+ * expression reproduces both, all 128 positions each, with nothing left over.
  *
- * locate() printed the map at m=2 and it falls out exactly. Channels are taken
- * in groups of sixteen, A of those groups are interleaved, and inside the
- * interleave the four word runs alternate between them:
+ * Channels go in super groups of 32. Inside a super group the rows pair up P at
+ * a time, and inside a pair the four word runs alternate between the rows and
+ * between the two sixteen channel halves:
  *
- *   blk = 16A,  g = ni/blk,  c = ni%blk,  a = c/16,  t = c%16
- *   j     = (t/4) * 4A  +  a*4  +  t%4
- *   index = g * m*blk  +  mi*blk  +  j
+ *   P = m/2
+ *   G = ni/32,  c = ni%32,  a = c/16,  t = c%16
+ *   j     = (t/4)*8P  +  (mi%P)*8  +  a*4  +  t%4
+ *   index = G*(m*32)  +  (mi/P)*(32P)  +  j
  *
- * so at A = 2 the order is channels 0..3, 16..19, 4..7, 20..23, and so on.
+ * At m = 2 that is P = 1: each row is its own block of 32 and the halves
+ * interleave, channels 0..3, 16..19, 4..7, 20..23. At m = 4 it is P = 2: rows
+ * pair into blocks of 64 and the two rows of a pair alternate every eight
+ * words. Both are what the board printed.
  *
- * ⚠ WHAT A IS, IS THE OPEN PART. A = 2 reproduces all 128 positions of the
- * m = 2 map and scores 2n -- every value in place -- at m = 2 on all three
- * shapes. It scores n/4 at m = 1, n at m = 4 and 2n at m = 8, and those three
- * numbers are IDENTICAL once divided by n across N = 32, 64 and 128. So N is
- * settled and m is not.
+ * ⚠ m = 1 IS FLAT AND IS NOT THIS. P would be zero, and the expression does not
+ * collapse to the identity at P = 1 either. Decode has read m = 1 flat for
+ * hundreds of rounds and the sweep scores it 64 of 64 flat, so it is a separate
+ * case rather than a limit of this one.
  *
- * A = 1 is the identity, which is what m = 1 wants. A = m would give that for
- * free and is the obvious guess, which is exactly why it is one candidate here
- * rather than the answer: the last five rounds each had an obvious guess that
- * was right at one width.
+ * ⚠ P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
+ * map has been printed. m = 8 is scored by the sweep and has not been read.
  */
-static size_t acc_index(unsigned mi, unsigned ni, unsigned m, unsigned A)
+static size_t acc_index(unsigned mi, unsigned ni, unsigned m)
 {
-	unsigned blk = 16u * A;
-	unsigned g = ni / blk, c = ni % blk;
-	unsigned a = c / 16u, t = c % 16u;
-	unsigned j = (t / 4u) * (4u * A) + a * 4u + (t % 4u);
+	unsigned P, G, c, a, t, j;
 
-	return (size_t)g * m * blk + (size_t)mi * blk + j;
+	if (m < 2)
+		return ni;                      /* flat, and measured so */
+	P = m / 2;
+	G = ni / 32u;
+	c = ni % 32u;
+	a = c / 16u;
+	t = c % 16u;
+	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * 4u + (t % 4u);
+	return (size_t)G * m * 32u + (size_t)(mi / P) * (32u * P) + j;
 }
 
 /*
@@ -806,7 +813,6 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 		      unsigned mapm)
 {
 	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };  /* 0 = flat */
-	static const unsigned AS[] = { 1, 2, 4, 8 };
 	static const unsigned MS[] = { 1, 2, 4, 8 };
 	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
 	uint8_t *A = malloc((size_t)maxm * k);
@@ -833,9 +839,7 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 	printf("   m   distinct  present        flat");
 	for (unsigned a = 1; a < sizeof(ATOMS) / sizeof(*ATOMS); a++)
 		printf("   atom %-2u", ATOMS[a]);
-	for (unsigned x = 0; x < sizeof(AS) / sizeof(*AS); x++)
-		printf("     A=%-2u", AS[x]);
-	printf("     A=m\n");
+	printf("     acc_index\n");
 
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned m = MS[y];
@@ -884,19 +888,19 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 				}
 			printf("  %4zu/%-4zu", ex, total);
 		}
-		for (unsigned x = 0; x <= sizeof(AS) / sizeof(*AS); x++) {
-			unsigned A = x < sizeof(AS) / sizeof(*AS) ? AS[x] : m;
+		{
 			size_t ex = 0;
 
 			for (unsigned mi = 0; mi < m; mi++)
 				for (unsigned ni = 0; ni < n; ni++) {
-					size_t at = acc_index(mi, ni, m, A);
+					size_t at = acc_index(mi, ni, m);
 
 					if (at < total &&
 					    got[at] == want[(size_t)mi * n + ni])
 						ex++;
 				}
-			printf("  %5zu%s", ex, ex == total ? "*" : " ");
+			printf("   %5zu/%-5zu%s", ex, total,
+			       ex == total ? " EXACT" : "");
 		}
 		printf("\n");
 	}
