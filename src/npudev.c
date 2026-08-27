@@ -1678,6 +1678,67 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
 		nreg = charsiu_emit_job(&job, g->breg[d].map, 4096 / 8);
+		/*
+		 * ⚠⚠ ONE DIFFERENCE AT A TIME, AGAINST A STREAM THAT WORKS.
+		 *
+		 * The int8 accumulator computes m = 2 correctly at this very
+		 * shape -- npu_gemm_test is EXACT at N = 2048 -- and its DPU
+		 * and RDMA blocks are IDENTICAL to int4's, all 69 and all 22
+		 * registers. So the DPU is told to write two rows either way,
+		 * and what differs is seven CNA words and two CORE ones. 0x301c
+		 * is inert on the board and 0x3018 is the w4a16 arithmetic
+		 * switch, which leaves the CNA: the side that feeds the MAC,
+		 * which is where "row 1 was never produced" belongs.
+		 *
+		 * Rather than hardcode seven values that are only right for one
+		 * shape, emit the int8 variant of THIS job, diff it, and apply
+		 * one difference. CHARSIU_BATCH_CNADIFF is the index; -1 lists
+		 * them. This is round 260's single field sweep, on a stream
+		 * instead of a register.
+		 *
+		 * ⚠ Row 0 is the control. A difference that breaks it is a
+		 * difference about the weight format, not about rows.
+		 */
+		{
+			const char *ed = getenv("CHARSIU_BATCH_CNADIFF");
+
+			if (ed) {
+				uint64_t ref[512];
+				struct charsiu_job j8 = job;
+				size_t n8, ai, bi, seen = 0;
+				int want = atoi(ed);
+
+				j8.mm.wdtype = CHARSIU_INT8;
+				j8.mm.adtype = CHARSIU_INT8;
+				n8 = charsiu_emit_job(&j8, ref,
+						      sizeof(ref) / sizeof(*ref));
+				for (ai = 0; ai < nreg; ai++) {
+					uint64_t *w = (uint64_t *)g->breg[d].map + ai;
+					uint32_t tgt = (uint32_t)(*w >> 48);
+					uint32_t rg = (uint32_t)(*w & 0xffff);
+
+					if (tgt != 0x0201)      /* CNA only */
+						continue;
+					for (bi = 0; bi < n8; bi++)
+						if ((uint32_t)(ref[bi] >> 48) == tgt &&
+						    (uint32_t)(ref[bi] & 0xffff) == rg)
+							break;
+					if (bi == n8 || ref[bi] == *w)
+						continue;
+					if (want < 0 && i == 0)
+						fprintf(stderr,
+							"  cnadiff %zu: 0x%04x"
+							"  int4 %08x  int8 %08x\n",
+							seen, rg,
+							(uint32_t)((*w >> 16) & 0xffffffff),
+							(uint32_t)((ref[bi] >> 16) & 0xffffffff));
+					if ((int)seen == want)
+						*w = (*w & 0xffff00000000ffffULL)
+						   | (ref[bi] & 0x0000ffffffff0000ULL);
+					seen++;
+				}
+			}
+		}
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
 		if (!nreg) {
 			whine(g, "the batched register stream came back empty",

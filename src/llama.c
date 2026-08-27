@@ -813,6 +813,45 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       ? "   <== both rows" : "");
 				}
 				unsetenv("CHARSIU_W4_301C");
+				/*
+				 * ⚠⚠ THE CNA, ONE WORD AT A TIME, AGAINST A
+				 * STREAM THAT PRODUCES TWO ROWS.
+				 *
+				 * Five knobs are swept and settled and row 1 is
+				 * still absent, so stop turning knobs. The int8
+				 * accumulator computes m = 2 at this shape and
+				 * its DPU and RDMA blocks are identical to
+				 * int4's, so the difference is seven CNA words.
+				 * Each is put back to the int8 value on its
+				 * own, which is round 260's method.
+				 */
+				printf("\n    CNA against the int8 stream,"
+				       " one word at a time\n");
+				setenv("CHARSIU_BATCH_CNADIFF", "-1", 1);
+				charsiu_npu_matmul(s->dev, s->npu_id[i0], X, 2, Y);
+				for (int q = 0; q < 8; q++) {
+					char b[8];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%d", q);
+					setenv("CHARSIU_BATCH_CNADIFF", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      cnadiff %d   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s\n", q,
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       ok1 > 100 ? "   <== rows appear" : "");
+				}
+				unsetenv("CHARSIU_BATCH_CNADIFF");
 				unsetenv("CHARSIU_BATCH_READ");
 			}
 		}
