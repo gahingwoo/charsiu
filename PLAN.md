@@ -31,69 +31,67 @@ they were for is the answers.
 - **The product layer.** `charsiu`, `charsiu-get`, `charsiu-config`, `charsiu-doctor`,
   `charsiu serve`, and an installer.
 
-## 1. Prefill: the hardware was never the problem. CLOSED as a defect, open as work
+## 1. Prefill: batched, correct, and 3.63x. The route is int8
 
-Decode is closed: four fifths of a token is the hardware on the DRAM roof, the CPU
-side is about twelve milliseconds, and the whole token is accounted for to within one.
-Prefill is where the vendor is beatable rather than matched -- **every one of its 3328
-int4 projection dispatches is M = 1**, so it re-streams all 487 MB of weights for every
-prompt token. At M = 32 the same bytes serve thirty two rows, and the board measured
-6.9 us a row against 200.
-
-Five rounds looked for a hardware wall above one row. There is none. Two things were
-wrong, both in this tree.
-
-### One register was a literal where it should have followed the row count
+The vendor dispatches every one of its 3328 int4 projections at M = 1, so it
+re-streams all 487 MB of weights for every prompt token. charsiu now does not:
 
 ```
-emit(DPU, 0x40b8, acc_out ? 3 : ow * rows)
+    m   tensors   worst rel    rows that agree    one row   batched   speedup
+    2     113     5.03e-05      226 of 226         227 ms    218 ms    1.04x
+    4     113     5.03e-05      452 of 452         451 ms    266 ms    1.70x
+    8     113     5.03e-05      904 of 904         899 ms    365 ms    2.46x
+   16     113     5.03e-05     1808 of 1808       1812 ms    570 ms    3.18x
+   32     113     5.03e-05     3616 of 3616       3590 ms    990 ms    3.63x
 ```
 
-On the height axis `ow` is 1 and `rows` is m, so the int8 arm writes the row count.
-The acc_out arm wrote 3 at every m, and round 312 chose that 3 by sweeping 0 to 15 at
-**M = 1**, the one width where a value that should follow M cannot show that it does.
-Swept again where it can move, the peak walks: 3 at m = 1, 6 at m = 2, 12 at m = 4.
-It is `3 * rows`, and 3 * rows is 3 at m = 1, so decode cannot change.
+Every row of every tensor, checked against the one row path before anything is
+timed, on a real model's own staged weights. 5.03e-05 is two float sums of two
+thousand terms in different orders.
 
-With that, **every wanted value is in the buffer at every shape and every m measured**.
-The board prints "0 are absent from the buffer altogether" at K = 64 N = 64,
-K = 256 N = 128 and K = 1024 N = 32, at m = 1, 2, 4 and 8. The arithmetic was never
-wrong above one row; the register was.
+Per token of prompt, the projections go from 112 ms to 31 ms.
 
-### And the read order was not the one anybody guessed
+### It took five rounds to find out that the int4 path cannot do it
 
-```
-P = m/2
-G = ni/32, c = ni%32, a = c/16, t = c%16
-j     = (t/4)*8P + (mi%P)*8 + a*4 + t%4
-index = G*(m*32) + (mi/P)*(32P) + j
-```
+w4a16 produces exactly ONE row and nothing makes it produce two. Fed the same
+activation twice, row 1 comes back matching row 0 in 1 of 2048. The DPU and
+RDMA blocks are identical to a stream that does two rows, all 69 and all 22
+registers; the four CNA geometry words were each put back to the int8 value
+with a liveness check between them and none produced row 1; CORE 0x301c is
+inert in either half and 0x3018 is the arithmetic switch. job.c has said since
+round 347 that the vendor runs w4a16 on the width axis, and the vendor never
+batches a weight matmul at all, so there is no M > 1 int4 stream to copy.
 
-Channels go in super groups of 32. Inside one the rows pair up P at a time, and inside
-a pair the four word runs alternate between the rows and between the two sixteen
-channel halves. At m = 2 that is P = 1, each row its own block of 32 with the halves
-interleaved: channels 0..3, 16..19, 4..7, 20..23. At m = 4 it is P = 2, rows pairing
-into blocks of 64 that alternate every eight words.
+Two registers on that path were literals chosen at M = 1, the one width where a
+value that follows the row count cannot show that it does: 0x40b8's 3, which
+is 3 * rows, and 0x301c's half, which is zero either way at m = 1. Finding the
+first cost five rounds and it was not even the answer.
 
-Solved from the printed maps at m = 2 and m = 4, then **confirmed at m = 8, which it
-was not fitted on**, and at m = 1, which is flat and a separate case:
+### ⚠ And the thing that is not settled: decode wants int4
 
-```
-  K=1024 N=32     m=1  32/32    m=2   64/64    m=4  128/128   m=8   256/256   all EXACT
-  K=256  N=128    m=1 128/128   m=2  256/256   m=4  512/512   m=8  1024/1024  all EXACT
-```
+Batching works on int8 and decode is int4 -- 14.70 tok/s against int8's 9.71,
+because decode is one row at the DRAM roof where halving the bytes nearly
+doubles the rate. Prefill is not at that roof, which is why int8's extra byte
+costs it nothing: at m = 32 the same weights serve thirty two rows.
 
-`charsiu_acc_index()` is that expression, in the library rather than the probe, because
-the runtime needs the same copy.
+A model is staged once, in one format. Reconciling those is a design question
+and not an implementation detail:
 
-**Next, and it is engineering rather than investigation.** The runtime bakes
-`mm.m = 1` into every slice's register stream at staging time, so a batched submit has
-to re-emit the stream at the width it wants. The weights and the coefficients do not
-depend on m and do not move; the regcmd, the activation packing and the output read do.
-Then llama.c has to feed the prompt in chunks of M rather than one token at a time.
+- **all int8**: prefill 3.6x, decode loses a third. Right for long prompts,
+  wrong for chat.
+- **both staged**: 620 MB of int4 plus 1240 MB of int8, which this board does
+  not have to spare.
+- **per run**: the format becomes a setting, which is honest but pushes the
+  choice onto somebody who cannot make it.
 
-**Control**: decode is m = 1 and must stay byte identical. The same sentence, and the
-same tok/s, before and after.
+**Next**, and it is the cheap half: the batched path submits one slice at a
+time and waits a full fence on each. Decode chains a projection's slices into
+one submit for exactly this reason, and the report says 5072 ms of 7448 is
+fence. Chaining is worth more than any of the above and does not need the
+format question answered.
+
+**Control**: decode is m = 1 and goes through charsiu_npu_matvec, which the
+batched path does not touch. Same sentence, same tok/s.
 
 ## 2. The output head: routed, and it was worth 49 ms a token. DONE
 
