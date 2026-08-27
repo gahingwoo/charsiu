@@ -720,6 +720,57 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       ? "   <== both rows" : "");
 				}
 				unsetenv("CHARSIU_BATCH_PACK");
+				/*
+				 * ⚠⚠ AND 0x40b8, WHICH IS THE ONE REGISTER
+				 * WITH A KNOWN m DEPENDENCE.
+				 *
+				 * Everything else is now confirmed on this
+				 * path: the input surface (pack 0 is the only
+				 * one that gets row 0 at all), the weights, the
+				 * coefficients, the output group stride, and
+				 * the whole of row 0. Row 1 is absent at every
+				 * row step and every reading, which is not a
+				 * misplaced row, it is a row that was never
+				 * produced.
+				 *
+				 * 0x40b8 is ow * (2 * full_oh - win_orows), an
+				 * output height quantity, and 3 * rows was
+				 * swept on the int8 accumulator. w4a16 has its
+				 * own output stage -- wide8 is forced to zero
+				 * for int4 and w4_dpu takes over -- and nothing
+				 * has swept it there.
+				 *
+				 * ⚠ Row 0 is the control and it is a real one:
+				 * 2048 of 2048, and it has survived twelve row
+				 * steps and three packings without moving.
+				 */
+				printf("\n    DPU 0x40b8 on the int4 path,"
+				       " atom 4 read (6 = 3*rows today)\n");
+				for (unsigned v = 0; v <= 16; v++) {
+					char b[16];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%u", v);
+					setenv("CHARSIU_DPU_40B8", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      0x40b8 %3u   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s%s\n", v,
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       v == 6 ? "   <- today" : "",
+					       (ok0 == t->n && ok1 == t->n)
+					       ? "   <== both rows" : "");
+				}
+				unsetenv("CHARSIU_DPU_40B8");
 				unsetenv("CHARSIU_BATCH_READ");
 			}
 		}
