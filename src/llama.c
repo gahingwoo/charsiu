@@ -518,104 +518,135 @@ static double now_ms(void)
 }
 
 /*
- * WHAT BATCHING BUYS, ON THIS BOARD, ON THESE WEIGHTS.
+ * WHAT BATCHING BUYS ON THIS BOARD, AND WHETHER IT IS RIGHT, which the first
+ * run said it is not.
  *
  * Not a synthetic matmul: the staged tensors of a real model, walked once so
- * the weights come from memory the way a forward pass makes them. The vendor
- * dispatches all 3328 of its int4 projections at M = 1, so this is the number
- * that says whether a batched forward pass is worth building.
+ * the weights come from memory the way a forward pass makes them.
  *
- * ⚠ IT CHECKS BEFORE IT TIMES. m calls to charsiu_npu_matvec and one call to
- * charsiu_npu_matmul have to agree, or the speed is the speed of a wrong
- * answer. The bar is relative: these are float sums of thousands of terms in
- * two different orders, so they will not be bit identical, and a tolerance
- * that admits a wrong row is no bar at all. It prints the worst it saw.
+ * ⚠ IT SWEEPS m, and that is the point rather than a convenience. m = 2 and
+ * m = 4 are the widths charsiu_acc_index was solved on and m = 8 is the one it
+ * was confirmed on. 32 extrapolates both that expression and 0x40b8 = 3 * rows,
+ * which was swept to m = 4. If the small widths agree and the large ones do
+ * not, the plumbing is right and one of those two formulas stops somewhere. If
+ * m = 2 disagrees, it is the plumbing.
+ *
+ * ⚠ AND IT SAYS WHICH ROWS. A wrong permutation puts a neighbour's value in a
+ * slot; a wrong scale multiplies every slot. "Row 0 agrees and the rest do
+ * not" and "everything is off by a factor" are different faults, and one
+ * worst-case number cannot tell them apart.
  */
 int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
-		      unsigned mrows)
+		      unsigned mmax)
 {
-	unsigned tested = 0;
-	double t_one = 0.0, t_bat = 0.0, mb = 0.0, worst = 0.0;
+	static const unsigned MS[] = { 2, 4, 8, 16, 32 };
 	float *X = NULL, *Y = NULL, *Yref = NULL;
+	struct charsiu_act a;
+	unsigned widest = 0;
+	int rc = -1;
 
 	if (!s->dev) {
 		fprintf(stderr, "charsiu: no NPU staged; nothing to batch\n");
 		return -1;
 	}
-	for (unsigned i = 0; i < s->n_npu; i++) {
-		const struct npu_tensor *t = &s->npu[i];
-		size_t nx, ny;
-
-		if (s->npu_id[i] < 0)
-			continue;
-		nx = (size_t)mrows * t->k;
-		ny = (size_t)mrows * t->n;
-		X = realloc(X, nx * sizeof(*X));
-		Y = realloc(Y, ny * sizeof(*Y));
-		Yref = realloc(Yref, ny * sizeof(*Yref));
-		if (!X || !Y || !Yref)
-			break;
-		/* ⚠ EVERY ROW DIFFERENT, or a batch could be right by copying
-		 * one row over the rest and nobody would see it. */
-		for (size_t j = 0; j < nx; j++)
-			X[j] = (float)(((j * 2654435761u) >> 9) & 0xff) / 255.0f
-			     - 0.5f;
-
-		{
-			struct charsiu_act a;
-			double t0 = now_ms();
-
-			for (unsigned r = 0; r < mrows; r++) {
-				if (charsiu_act_alloc(&a, (int)t->k) < 0)
-					break;
-				charsiu_act_set(&a, X + (size_t)r * t->k,
-						(int)t->k);
-				charsiu_act_blocks(&a);
-				charsiu_npu_matvec(s->dev, s->npu_id[i], &a,
-						   Yref + (size_t)r * t->n);
-				charsiu_act_free(&a);
-			}
-			t_one += now_ms() - t0;
-		}
-		{
-			double t0 = now_ms();
-
-			if (charsiu_npu_matmul(s->dev, s->npu_id[i], X, mrows,
-					       Y)) {
-				fprintf(stderr, "charsiu: %s would not batch\n",
-					t->name);
-				continue;
-			}
-			t_bat += now_ms() - t0;
-		}
-		for (size_t j = 0; j < ny; j++) {
-			double d = fabs((double)Y[j] - (double)Yref[j]);
-			double sc = fabs((double)Yref[j]);
-			double rel = sc > 1e-3 ? d / sc : d;
-
-			if (rel > worst)
-				worst = rel;
-		}
-		mb += (double)t->k * t->n / 2e6;   /* int4 */
-		tested++;
-	}
-	free(X); free(Y); free(Yref);
-	if (!tested) {
-		fprintf(stderr, "charsiu: no tensor was batched\n");
+	for (unsigned i = 0; i < s->n_npu; i++)
+		if (s->npu_id[i] >= 0 && s->npu[i].k > widest)
+			widest = (unsigned)s->npu[i].k;
+	/*
+	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
+	 * activation inside the timing loop and charged all of it to the one
+	 * row path, which is the side it was trying to beat.
+	 */
+	if (charsiu_act_alloc(&a, (int)widest) < 0)
 		return -1;
+
+	printf("\n  batching %u layers, checked before it is timed\n",
+	       m->n_layer);
+	printf("    m  tensors    worst rel   rows that agree"
+	       "     one row    batched  speedup  us a row\n");
+
+	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
+		double t_one = 0.0, t_bat = 0.0, worst = 0.0;
+
+		if (mr > mmax)
+			break;
+		for (unsigned i = 0; i < s->n_npu; i++) {
+			const struct npu_tensor *t = &s->npu[i];
+			size_t nx, ny;
+
+			if (s->npu_id[i] < 0)
+				continue;
+			nx = (size_t)mr * t->k;
+			ny = (size_t)mr * t->n;
+			X = realloc(X, nx * sizeof(*X));
+			Y = realloc(Y, ny * sizeof(*Y));
+			Yref = realloc(Yref, ny * sizeof(*Yref));
+			if (!X || !Y || !Yref)
+				goto out;
+			/* every row different, or a batch could be right by
+			 * copying one row over the rest */
+			for (size_t j = 0; j < nx; j++)
+				X[j] = (float)(((j * 2654435761u) >> 9) & 0xff)
+				     / 255.0f - 0.5f;
+
+			{
+				double t0 = now_ms();
+
+				for (unsigned r = 0; r < mr; r++) {
+					charsiu_act_set(&a, X + (size_t)r * t->k,
+							(int)t->k);
+					charsiu_act_blocks(&a);
+					charsiu_npu_matvec(s->dev, s->npu_id[i],
+						&a, Yref + (size_t)r * t->n);
+				}
+				t_one += now_ms() - t0;
+			}
+			{
+				double t0 = now_ms();
+
+				if (charsiu_npu_matmul(s->dev, s->npu_id[i], X,
+						       mr, Y))
+					continue;
+				t_bat += now_ms() - t0;
+			}
+			for (unsigned r = 0; r < mr; r++) {
+				int ok = 1;
+
+				for (unsigned j = 0; j < (unsigned)t->n; j++) {
+					size_t o = (size_t)r * t->n + j;
+					double d = fabs((double)Y[o]
+							- (double)Yref[o]);
+					double sc = fabs((double)Yref[o]);
+					double rel = sc > 1e-3 ? d / sc : d;
+
+					if (rel > worst)
+						worst = rel;
+					if (rel > 1e-3)
+						ok = 0;
+				}
+				rows_ok += ok;
+				rows_tot++;
+			}
+			tested++;
+		}
+		if (!tested)
+			continue;
+		printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms %7.0f ms"
+		       "  %5.2fx  %7.1f\n",
+		       mr, tested, worst, rows_ok, rows_tot, t_one, t_bat,
+		       t_bat > 0 ? t_one / t_bat : 0.0,
+		       t_bat * 1e3 / (tested * (double)mr));
+		rc = 0;
 	}
-	printf("\n  batched %u tensors at M=%u, %u layers\n",
-	       tested, mrows, m->n_layer);
-	printf("  worst relative difference against the one row path: %.2e%s\n",
-	       worst, worst < 1e-3 ? "" : "   ⚠ THAT IS NOT AGREEMENT");
-	printf("  %6.0f ms  one row at a time, %u calls each\n", t_one, mrows);
-	printf("  %6.0f ms  batched, one call each\n", t_bat);
-	printf("  %6.2fx, and %.0f MB of weights either way\n",
-	       t_bat > 0 ? t_one / t_bat : 0.0, mb);
-	printf("  %6.1f us a row batched against %.1f at one row\n",
-	       t_bat * 1e3 / (tested * (double)mrows),
-	       t_one * 1e3 / (tested * (double)mrows));
-	return 0;
+	printf("\n  ⚠ a speed with rows that do not agree is the speed of a"
+	       " wrong answer.\n  the bar is relative and 1e-3: these are float"
+	       " sums of thousands of\n  terms in two orders and will not be bit"
+	       " identical.\n");
+out:
+	charsiu_act_free(&a);
+	free(X); free(Y); free(Yref);
+	return rc;
 }
 
 
