@@ -1714,9 +1714,30 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			 * together: acc for the solved expression, flat, or an
 			 * atom for a plain [n/atom][m][n%atom].
 			 */
+			/*
+			 * ⚠⚠ THE INT4 OUTPUT IS A PLAIN ATOM OF FOUR, and it is
+			 * not what the int8 accumulator does.
+			 *
+			 * Board, m = 2, N = 2048, both axes against seven
+			 * readings: on the height axis a plain [n/4][m][4]
+			 * returns row 0 COMPLETE, 2048 of 2048. Every other
+			 * reading is a fraction of that -- acc 1025, atom 2 and
+			 * atom 8 both 1024, atom 16 512, atom 32 256 -- which
+			 * is how much of the atom four layout each of them
+			 * happens to agree with. charsiu_acc_index's super
+			 * group of 32 and its intra-32 interleave belong to the
+			 * int8 accumulator and do not carry to w4a16.
+			 *
+			 * Row 1 under the same reading is 3 of 2048, so the
+			 * group stride is right and the ROW term is not.
+			 * CHARSIU_BATCH_ROWSTEP replaces it, and row 0 is a
+			 * real control now rather than six values: it cannot
+			 * move, whatever the step.
+			 */
 			const char *er = getenv("CHARSIU_BATCH_READ");
+			const char *es = getenv("CHARSIU_BATCH_ROWSTEP");
 			unsigned atom = 0;
-			int flat = 0;
+			int flat = 0, step = es ? atoi(es) : 0;
 
 			if (er && !strcmp(er, "flat"))
 				flat = 1;
@@ -1731,7 +1752,9 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 						at = (size_t)r * sn + j;
 					else if (atom)
 						at = (size_t)(j / atom) * m * atom
-						   + (size_t)r * atom + j % atom;
+						   + (size_t)r * (step ? (unsigned)step
+								       : atom)
+						   + j % atom;
 					else
 						at = charsiu_acc_index(r, j, m);
 					v = fo[at];

@@ -10,7 +10,14 @@
 #   sh charsiu-install.sh --dry-run    say what it would do, change nothing
 #   sh charsiu-install.sh --prefix DIR stage instead of installing
 #   sh charsiu-install.sh --uninstall  remove what this installed
+#   sh charsiu-install.sh --dev        the probes too, and track main
 #   CHARSIU_PLAIN=1 ...                no full-screen dialogs
+#
+# ⚠ TWO CHANNELS. stable is the runtime and is what a fresh install gets. dev
+# adds npu_gemm_test, charsiu_matmul and bench_batch, which exist to ask the
+# hardware questions and have wedged the block doing it, and tracks the branch
+# the work happens on. `charsiu update dev` switches later; nothing here needs
+# reinstalling to change channel.
 #
 # ⚠⚠ RK3576 NPU SUPPORT IS NOT UPSTREAM, SO NO STOCK KERNEL CAN RUN THIS.
 #
@@ -241,6 +248,8 @@ while [ $# -gt 0 ]; do
 	--no-build)  DOBUILD=0; shift ;;
 	# stable installs the runtime; dev adds the probes. See INSTALL_BINS.
 	--channel)   CHANNEL="$2"; shift 2 ;;
+	--dev)       CHANNEL=dev; shift ;;
+	--stable)    CHANNEL=stable; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	-h|--help)   sed -n '4,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*)           echo "unknown option: $1" >&2; exit 2 ;;
@@ -871,6 +880,10 @@ if [ -f "$ETC/config.ini" ]; then
 	[ "$DRY" = 0 ] && ui_info "your $ETC/config.ini was left alone (template: config.ini.default)"
 else
 	as_root cp "$SRC/etc/config.ini" "$ETC/config.ini"
+	# ⚠ so that a later plain `charsiu update` stays on the channel that
+	# was installed rather than quietly going back to stable.
+	[ "$CHANNEL" = stable ] || as_root sh -c \
+		"sed -i 's/^channel = .*/channel = $CHANNEL/' '$ETC/config.ini'"
 fi
 # ⚠ THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
 # root's, so charsiu-get could not record the model it had just downloaded and
@@ -966,6 +979,8 @@ ui_msg "Done.
   charsiu pull        fetch another model
   charsiu doctor      what works and what does not
   charsiu serve       an OpenAI compatible endpoint on :11434
+
+  channel $CHANNEL$([ "$CHANNEL" = stable ] && echo "      charsiu update dev  adds the hardware probes" || echo "         charsiu update stable  goes back to the runtime alone")
 
   config  ${CONFDISP:-$ETC/config.ini}
   models  $MODELS"

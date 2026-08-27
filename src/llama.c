@@ -614,6 +614,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				       " %u channels a row\n",
 				       t->name, (unsigned)t->n);
 				printf("    axis  read     row0        row1\n");
+				setenv("CHARSIU_BATCH_ROWSTEP", "0", 1);
 				for (unsigned ax = 0; ax < 2; ax++) {
 					if (AXES[ax][0] == 'w')
 						setenv("CHARSIU_M_AXIS", "w", 1);
@@ -642,8 +643,46 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						       ? "   <== both rows" : "");
 					}
 				}
-				unsetenv("CHARSIU_BATCH_READ");
+				/*
+				 * ⚠ AND THE ROW TERM, on the reading that just
+				 * returned a whole row. Row 0 contributes
+				 * nothing to it, so it is a control that
+				 * cannot move: a step that changes row 0 is
+				 * measuring something else.
+				 */
 				unsetenv("CHARSIU_M_AXIS");
+				setenv("CHARSIU_BATCH_READ", "4", 1);
+				printf("\n    row step on the height axis,"
+				       " atom 4\n");
+				{
+				static const int STEPS[] = { 1, 2, 4, 8, 16, 32,
+							     64, 128, 256, 512,
+							     1024, 2048 };
+				for (unsigned q = 0; q < sizeof(STEPS)/sizeof(*STEPS); q++) {
+					char b[16];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%d", STEPS[q]);
+					setenv("CHARSIU_BATCH_ROWSTEP", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      step %5d   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s\n",
+					       STEPS[q], ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       ok1 == t->n ? "   <== that is it" : "");
+				}
+				}
+				unsetenv("CHARSIU_BATCH_ROWSTEP");
+				unsetenv("CHARSIU_BATCH_READ");
 			}
 		}
 	}
