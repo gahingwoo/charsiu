@@ -78,15 +78,59 @@ retrieval -- where the prompt is several times the answer.
 
 ⚠ The batched prefill helps int4 too, and not because the matmul batches: it
 refuses there. It is that a prompt needs logits for its last token only, so the
-head is skipped n - 1 times whatever the format. 19.24 against a decode of
-15.46 is most of that.
+head is skipped n - 1 times whatever the format.
+
+That was written here as an inference for a fortnight. It is now measured.
+`tests/prefill_control.sh` runs batched -> control -> batched on the same
+binary, one flag apart, and the two batched samples bracket the control so a
+board that warms over a minute cannot be mistaken for the flag:
+
+```
+  control   65 tok / 4304 ms   66.22 ms a token   15.10 tok/s
+  batched   65 tok / 3498 ms   53.82 ms a token   18.59 tok/s   (18.63, 18.54)
+                               ---------
+  saved                        12.40 ms a token
+```
+
+⚠ AND THE SAVING IS THE OUTPUT HEAD, TO WITHIN 1.4%, BY AN ARITHMETIC THAT
+NEVER SAW THESE TIMINGS. The head runs once instead of 65 times, so the saving
+per token is H * 64/65 and H is 12.59 ms. Llama-3.2-1B's head is 128256 x 2048,
+which at int4 is 131.3 MB of weights, and
+
+  131.3 MB / 12.59 ms = 10.43 GB/s
+
+against the 10.58 GB/s this model's own NPU summary reports for weight
+bandwidth. The time the batched prompt does not spend is exactly the time it
+takes to stream the head's weights, once per token, at the rate this board
+moves weights.
+
+⚠ And the control says what the baseline was: 15.10 tok/s prefill against a
+decode of 15.70. Without batching a prompt token costs what a generated one
+costs, which is where this started.
 
 ⚠ It is a second copy of the layer loop and it is deliberately blind. It
 handles the plain case and REFUSES the rest -- gemma3's window and two rope
 bases, gemma4's per layer embeddings and shared KV, qwen3's q and k norms,
-biases, post norms, softcaps -- and the caller falls back to the token loop,
-which is correct for all seven architectures and merely slower. Refusing is not
-an error path, it is the other half of the same decision.
+phi3's fused K and V, biases, post norms, softcaps -- and the caller falls back
+to the token loop, which is correct for all seven architectures and merely
+slower. Refusing is not an error path, it is the other half of the same
+decision.
+
+⚠ SO PHI-3.5 HAS NO BATCHED PREFILL, and that is a real gap rather than a note.
+Its K and V arrive as one fused tensor, llama_prefill_batch refuses on the
+first layer, and its prompt costs 4.96 tok/s -- what a generated token costs.
+Splitting a fused qkv into three views is the whole of what it would take. It
+has not been done because nothing had measured what it was worth until the
+control above put a number on the head skip, and 12.4 ms a token is what phi3
+is leaving.
+
+⚠ And a refusal has to be AUDIBLE. batch_ok used to return 0 and the caller
+fell back in silence, so "the flag did nothing" and "this model was never
+batchable" looked identical from outside -- which is how the first attempt at
+the control above spent four minutes on Phi-3.5 and produced 4.96, 5.00 and
+5.10 tok/s, three numbers that agree and mean nothing. llama_batch_why_not
+returns the reason as a phrase now and every run prints one line saying which
+path its prompt took.
 
 ⚠ And it runs without the NPU, which is what makes the risky half checkable off
 the board: matmul_rows falls back to matvec, so a host with no hardware
