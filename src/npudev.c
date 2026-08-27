@@ -1670,10 +1670,52 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			 * establishing which order, and it is in one place so
 			 * that this and the probe cannot disagree.
 			 */
+			/*
+			 * ⚠⚠ THE ROW TERM IS THE ONLY UNKNOWN LEFT.
+			 *
+			 * charsiu_acc_index was solved on the int8 accumulator,
+			 * four byte words out of a stage the int4 path does not
+			 * use: w4a16 writes float32 through its own output
+			 * stage. On the board row 0 comes back EXACT, including
+			 * the channels the intra-32 interleave moves -- index 4
+			 * is read from word 8 and it matched -- so the super
+			 * group and the interleave carry over. Every row above
+			 * zero is wrong, and the row term is what row 0 cannot
+			 * test, because it contributes nothing at mi = 0.
+			 *
+			 * CHARSIU_BATCH_ROWSTEP replaces it so a board round can
+			 * sweep it with row 0 as the control: whatever the step,
+			 * row 0 must stay exact, and the step that makes row 1
+			 * exact as well is the answer.
+			 */
+			/*
+			 * ⚠ NOT CACHED IN A STATIC. The probe sweeps this
+			 * between calls in one process, and a value latched on
+			 * the first would make every later step a silent copy
+			 * of the first -- which is how round 380's control ran
+			 * twice with the same geometry and nobody noticed until
+			 * the log was read. The same note is already on
+			 * entry_atomics() and I wrote this one anyway.
+			 */
+			const char *e8 = getenv("CHARSIU_BATCH_ROWSTEP");
+			int step = e8 ? atoi(e8) : 0;
 			for (unsigned r = 0; r < m; r++)
 				for (unsigned j = 0; j < sn; j++) {
-					float v = fo[charsiu_acc_index(r, j, m)];
+					size_t at;
+					float v;
 
+					if (step > 0) {
+						unsigned G = j / 32u, c = j % 32u;
+						unsigned aa = c / 16u, tt = c % 16u;
+
+						at = (size_t)G * m * 32u
+						   + (size_t)r * (unsigned)step
+						   + (tt / 4u) * 8u + aa * 4u
+						   + (tt % 4u);
+					} else {
+						at = charsiu_acc_index(r, j, m);
+					}
+					v = fo[at];
 					Y[(size_t)r * e->t->n + s->n0 + j] +=
 						grp ? v * s->sc[j] : v;
 				}

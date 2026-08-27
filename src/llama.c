@@ -565,6 +565,66 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	printf("    m  tensors    worst rel   rows that agree"
 	       "     one row    batched  speedup  us a row\n");
 
+	/*
+	 * ⚠ THE ROW STEP SWEEP, at m = 2 and on one tensor, before the timings.
+	 * Row 0 is the control: it contributes nothing to the row term, so it
+	 * has to stay exact whatever the step, and a step that breaks it is
+	 * measuring something other than the step.
+	 */
+	if (getenv("CHARSIU_BATCH_SWEEP")) {
+		static const int STEPS[] = { 8, 16, 32, 64, 128, 256, 0 };
+		unsigned i0 = 0;
+
+		while (i0 < s->n_npu && s->npu_id[i0] < 0)
+			i0++;
+		if (i0 < s->n_npu) {
+			const struct npu_tensor *t = &s->npu[i0];
+			size_t nx = (size_t)2 * t->k, ny = (size_t)2 * t->n;
+
+			X = realloc(X, nx * sizeof(*X));
+			Y = realloc(Y, ny * sizeof(*Y));
+			Yref = realloc(Yref, ny * sizeof(*Yref));
+			if (X && Y && Yref) {
+				for (size_t j = 0; j < nx; j++)
+					X[j] = (float)(((j * 2654435761u) >> 9)
+						       & 0xff) / 255.0f - 0.5f;
+				for (unsigned r = 0; r < 2; r++) {
+					charsiu_act_set(&a, X + (size_t)r * t->k,
+							(int)t->k);
+					charsiu_act_blocks(&a);
+					charsiu_npu_matvec(s->dev, s->npu_id[i0],
+						&a, Yref + (size_t)r * t->n);
+				}
+				printf("\n  row step sweep on %s at m=2"
+				       " (0 = charsiu_acc_index)\n", t->name);
+				for (unsigned q = 0; q < sizeof(STEPS)/sizeof(*STEPS); q++) {
+					char b[16];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%d", STEPS[q]);
+					setenv("CHARSIU_BATCH_ROWSTEP", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+							s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j], w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3
+						    ? fabs(w0) * 1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n + j] - w1) <= (fabs(w1) > 1e-3
+						    ? fabs(w1) * 1e-3 : 1e-3)) ok1++;
+					}
+					printf("    step %4d   row0 %5u of %-5u"
+					       "   row1 %5u of %-5u%s\n",
+					       STEPS[q], ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       ok1 == (unsigned)t->n ? "  <== that is it" : "");
+				}
+				unsetenv("CHARSIU_BATCH_ROWSTEP");
+			}
+		}
+	}
+
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0;
@@ -660,16 +720,49 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				printf("  %s at m=%u: %zu of %zu wanted values"
 				       " are somewhere in the batch\n",
 				       t->name, mr, live, tot);
-				printf("    row0 batched  ");
-				for (unsigned j = 0; j < 6 && j < t->n; j++)
-					printf("%9.3f", Y[j]);
-				printf("\n    row0 one row  ");
-				for (unsigned j = 0; j < 6 && j < t->n; j++)
-					printf("%9.3f", Yref[j]);
-				printf("\n    row1 one row  ");
-				for (unsigned j = 0; j < 6 && j < t->n; j++)
-					printf("%9.3f", Yref[t->n + j]);
-				printf("\n");
+				/*
+				 * ⚠ BOTH ROWS OF BOTH PATHS. Row 0 came back
+				 * exact and the run still agreed on nothing,
+				 * so the question is what row 1 is: a copy of
+				 * row 0 means the activation was packed once,
+				 * and numbers belonging to neither row mean it
+				 * was computed wrong.
+				 */
+				for (unsigned r = 0; r < mr && r < 3; r++) {
+					printf("    row%u batched  ", r);
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%9.3f",
+						       Y[(size_t)r * t->n + j]);
+					printf("\n    row%u one row  ", r);
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%9.3f",
+						       Yref[(size_t)r * t->n + j]);
+					printf("\n");
+				}
+				/*
+				 * ⚠ AND WHERE THE MISSING ONES ARE. 74% present
+				 * with row 0 exact says the loss is not spread
+				 * evenly, and a per row count says which row
+				 * lost them.
+				 */
+				for (unsigned r = 0; r < mr && r < 4; r++) {
+					size_t have = 0;
+
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w = Yref[(size_t)r * t->n + j];
+						double lim = fabs(w) > 1e-3
+							   ? fabs(w) * 1e-3 : 1e-3;
+
+						for (size_t o = 0; o < tot; o++)
+							if (fabs((double)Y[o] - w) <= lim) {
+								have++;
+								break;
+							}
+					}
+					printf("    row%u: %zu of %u of its values"
+					       " are in the batch\n",
+					       r, have, (unsigned)t->n);
+				}
 			}
 			tested++;
 		}
