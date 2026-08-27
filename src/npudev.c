@@ -76,6 +76,17 @@ struct npu_slot {
 };
 
 struct npu_entry {
+	/*
+	 * ⚠ THE BATCHED OUTPUT IS PER TENSOR, and that is the lesson decode
+	 * already paid for two hundred rounds ago: bo_prep and bo_fini are
+	 * cache maintenance over a WHOLE buffer object, so one buffer shared
+	 * across tensors has to be sized for the widest and every call pays
+	 * for all of it. Sized for nmax * m it reached 35 MB a device with the
+	 * head staged, and the chain that was supposed to remove the fence
+	 * spent more than it saved: 3.63x at m = 32 became 3.07x.
+	 */
+	struct charsiu_bo bout[2];
+	unsigned bout_m;
 	const struct npu_tensor *t;
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
 	unsigned first, count;     /* slots, n fastest */
@@ -165,7 +176,7 @@ struct charsiu_npu {
 	 * output all do, so the batched path brings its own rather than
 	 * disturbing the ones decode has been reading for hundreds of rounds.
 	 */
-	struct charsiu_bo bin[2], bout[2], breg[2];
+	struct charsiu_bo bin[2], breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
 	size_t bin_stride, bout_stride;
@@ -724,11 +735,14 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_ent; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
+		for (unsigned i = 0; i < g->n_ent; i++)
+			for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_free(g->dev[d], &g->ent[i].bout[d]);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
-			/* the batched path's, which a decode never allocates */
+			/* the batched path's, which a decode never allocates.
+			 * Its output is per entry and freed with them. */
 			charsiu_bo_free(g->dev[d], &g->bin[d]);
-			charsiu_bo_free(g->dev[d], &g->bout[d]);
 			charsiu_bo_free(g->dev[d], &g->breg[d]);
 			charsiu_close(g->dev[d]);
 		}
@@ -1607,17 +1621,14 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	/* the f16 packer writes k * 2 bytes a row; int8 writes one */
 	g->bin_stride = (size_t)g->kmax * m * (g->w4 ? 2 : 1);
-	g->bout_stride = (size_t)g->nmax * m * 4;
 	ins = g->bin_stride * nks + 4096;
-	outs = g->bout_stride * nslots + 4096;
 	regs = (size_t)nslots * 4096;
+	outs = 0;
 
 	for (unsigned d = 0; d < g->ndev; d++) {
 		charsiu_bo_free(g->dev[d], &g->bin[d]);
-		charsiu_bo_free(g->dev[d], &g->bout[d]);
 		charsiu_bo_free(g->dev[d], &g->breg[d]);
 		if (charsiu_bo_alloc(g->dev[d], ins, &g->bin[d]) ||
-		    charsiu_bo_alloc(g->dev[d], outs, &g->bout[d]) ||
 		    charsiu_bo_alloc(g->dev[d], regs, &g->breg[d])) {
 			fprintf(stderr, "charsiu: the batch buffers wanted "
 				"%.1f MB and would not allocate\n",
@@ -1684,13 +1695,37 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		return -1;
 	}
 	{
-		unsigned nslots[2] = { 0, 0 };
+		unsigned nslots[2] = { 0, 0 }, wide = 0, most;
 
-		for (unsigned i = 0; i < e->count; i++)
-			nslots[g->slot[e->first + i].di]++;
-		if (batch_bufs(g, m, e->k_slices,
-			       nslots[0] > nslots[1] ? nslots[0] : nslots[1]))
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+
+			nslots[s->di]++;
+			if (s->job.mm.n > wide)
+				wide = (unsigned)s->job.mm.n;
+		}
+		most = nslots[0] > nslots[1] ? nslots[0] : nslots[1];
+		if (batch_bufs(g, m, e->k_slices, most))
 			return -1;
+		/*
+		 * ⚠ SIZED FOR THIS TENSOR'S OWN WIDEST SLICE, not for nmax.
+		 * attn_q is 2048 wide and the head is 8192; one buffer for both
+		 * makes attn_q pay the head's cache maintenance on every call.
+		 */
+		g->bout_stride = (size_t)wide * m * 4;
+		if (e->bout_m < m) {
+			for (unsigned d = 0; d < g->ndev; d++) {
+				if (charsiu_bo_alloc(g->dev[d],
+						     g->bout_stride * most + 4096,
+						     &e->bout[d])) {
+					whine(g, "the batched output would not allocate",
+					      (unsigned)e->t->k, wide * m);
+					e->bout_m = 0;
+					return -1;
+				}
+			}
+			e->bout_m = m;
+		}
 	}
 
 	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
@@ -1724,7 +1759,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			job.mm.m = m;
 			job.input_addr = (uint32_t)g->bin[d].dma_address
 				       + (uint32_t)(ki * g->bin_stride);
-			job.output_addr = (uint32_t)g->bout[d].dma_address
+			job.output_addr = (uint32_t)e->bout[d].dma_address
 					+ (uint32_t)(nt * g->bout_stride);
 
 			if (!g->w4) {
@@ -1794,7 +1829,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
 		jl.in_count = nh;
-		jl.out_handles = &g->bout[d].handle;
+		jl.out_handles = &e->bout[d].handle;
 		jl.out_count = 1;
 		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
 			g->strikes = 3;
@@ -1808,7 +1843,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0;
 
-		charsiu_bo_prep(g->dev[d], &g->bout[d], 2000000000);
+		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			unsigned sn = s->job.mm.n;
@@ -1818,7 +1853,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 			if (s->di != d)
 				continue;
-			fo = (const float *)((uint8_t *)g->bout[d].map
+			fo = (const float *)((uint8_t *)e->bout[d].map
 					     + (size_t)nt * g->bout_stride);
 			io = (const int32_t *)fo;
 			for (unsigned r = 0; r < m; r++)
@@ -1834,7 +1869,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			nt++;
 		}
 		if (!g->nofini)
-			charsiu_bo_fini(g->dev[d], &g->bout[d]);
+			charsiu_bo_fini(g->dev[d], &e->bout[d]);
 	}
 	g->busy_us += now_us() - t0;
 
