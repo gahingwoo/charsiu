@@ -229,6 +229,9 @@ int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
  */
 int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			unsigned m, float *Y);
+/* what the batched calls spent, in ms: packing, submitting, the fence, reading */
+void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
+			     double *fence, double *read, int reset);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);

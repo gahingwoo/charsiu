@@ -191,6 +191,14 @@ struct charsiu_npu {
 	 */
 	uint32_t *bmap;
 	unsigned bmap_m, bmap_n;
+	/*
+	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
+	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
+	 * extra is linear in the rows, about 20 ms a row, and a speedup against
+	 * a one row loop cannot say whether that is the hardware computing more
+	 * or this file preparing more, because both sides pay the CPU part.
+	 */
+	double bpack_us, bsub_us, bfence_us, bread_us;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -1669,6 +1677,17 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	return 0;
 }
 
+void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
+			     double *fence, double *read, int reset)
+{
+	*pack = g->bpack_us / 1e3;
+	*sub = g->bsub_us / 1e3;
+	*fence = g->bfence_us / 1e3;
+	*read = g->bread_us / 1e3;
+	if (reset)
+		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
@@ -1740,6 +1759,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
 	t0 = now_us();
+	{ double tp = now_us(); (void)tp; }
 
 	/*
 	 * ⚠ ONE SUBMIT PER DEVICE FOR THE WHOLE PROJECTION, and both issued
@@ -1748,6 +1768,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0, nh = 0;
+
+		double tp = now_us();
 
 		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
@@ -1833,8 +1855,10 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		}
 		charsiu_bo_fini(g->dev[d], &g->bin[d]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_us += now_us() - tp;
 		if (!nt)
 			continue;
+		tp = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
@@ -1847,13 +1871,17 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			return -1;
 		}
 		g->submits++;
+		g->bsub_us += now_us() - tp;
 	}
 
 	/* ⚠ both submitted, then both waited on: that is the point */
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0;
+		double tf = now_us();
 
 		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
+		g->bfence_us += now_us() - tf;
+		tf = now_us();
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			unsigned sn = s->job.mm.n;
@@ -1910,6 +1938,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			}
 			nt++;
 		}
+		g->bread_us += now_us() - tf;
 		if (!g->nofini)
 			charsiu_bo_fini(g->dev[d], &e->bout[d]);
 	}
