@@ -815,7 +815,11 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # hardware does a matmul with more than one row, which is the whole of prefill,
 # and asking somebody to go find it under ~/.cache is how a board round does
 # not happen.
-for f in charsiu_run charsiu_check charsiu_serve bench_batch npu_gemm_test; do
+# ⚠ charsiu_matmul too, and for the same reason: it is the OTHER m > 1 probe,
+# the one that reads a requantised int8 output as a surface rather than the raw
+# accumulator flat, and the two have to be runnable side by side in one session.
+for f in charsiu_run charsiu_check charsiu_serve bench_batch npu_gemm_test \
+	 charsiu_matmul; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
