@@ -157,6 +157,16 @@ struct charsiu_npu {
 	unsigned n_slot, slot_cap;
 	struct npu_entry *ent;
 	unsigned n_ent, ent_cap;
+	/*
+	 * ⚠ THE BATCHED PATH'S OWN BUFFERS, allocated on first use and never by
+	 * a decode. A slice's weights and coefficients do not depend on m and
+	 * are reused as staged; the register stream, the activation and the
+	 * output all do, so the batched path brings its own rather than
+	 * disturbing the ones decode has been reading for hundreds of rounds.
+	 */
+	struct charsiu_bo bin[2], bout[2], breg[2];
+	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
+	float *bscr;               /* m rows of one slice's K, gathered */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
 	/*
@@ -697,6 +707,10 @@ void charsiu_npu_close(struct charsiu_npu *g)
 			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
+			/* the batched path's, which a decode never allocates */
+			charsiu_bo_free(g->dev[d], &g->bin[d]);
+			charsiu_bo_free(g->dev[d], &g->bout[d]);
+			charsiu_bo_free(g->dev[d], &g->breg[d]);
 			charsiu_close(g->dev[d]);
 		}
 	}
@@ -708,6 +722,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->fscr);
 	free(g->afscr);
 	free(g->wpack);
+	free(g->bscr);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1516,6 +1531,164 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	}
 	g->call_us += now_us() - tcall;
 	charsiu_note("something outside the NPU code", 0, 0);
+	return 0;
+}
+
+/*
+ * M ROWS THROUGH ONE SET OF WEIGHTS, which is the whole of prefill.
+ *
+ * The vendor dispatches every one of its 3328 int4 projections at M = 1, so it
+ * re-streams all 487 MB of weights for every prompt token. At M = 32 the same
+ * bytes serve thirty two rows.
+ *
+ * ⚠ THIS DOES NOT TOUCH THE DECODE PATH. charsiu_npu_matvec is unchanged, and
+ * the control for every board round here is that the sentence and the tok/s do
+ * not move. A slice's weights and coefficients do not depend on m and are read
+ * exactly as staged; what does depend on m is the register stream, the packed
+ * activation and the output, so this brings its own buffers.
+ *
+ * ⚠ ONE SUBMIT PER SLICE, deliberately. Decode chains a projection's slices
+ * into one submit and that is worth having, but the first version of a path
+ * that has never run has no business also being the first version of a chained
+ * one. The weight bytes dominate either way.
+ *
+ * ⚠ int4 ONLY for now. That is what CHARSIU_NPU_W4V selects and what the
+ * runtime uses; int8 batched would need its own d1 handling and has no caller.
+ */
+static int batch_bufs(struct charsiu_npu *g, unsigned m)
+{
+	if (g->bm >= m)
+		return 0;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		charsiu_bo_free(g->dev[d], &g->bin[d]);
+		charsiu_bo_free(g->dev[d], &g->bout[d]);
+		charsiu_bo_free(g->dev[d], &g->breg[d]);
+		/* the f16 packer writes k * 2 bytes a row, interleaved */
+		if (charsiu_bo_alloc(g->dev[d], (size_t)g->kmax * m * 2 + 4096,
+				     &g->bin[d]) ||
+		    charsiu_bo_alloc(g->dev[d], (size_t)g->nmax * m * 4 + 4096,
+				     &g->bout[d]) ||
+		    charsiu_bo_alloc(g->dev[d], 4096, &g->breg[d])) {
+			whine(g, "the batch buffers would not allocate",
+			      g->kmax, g->nmax * m);
+			return -1;
+		}
+	}
+	free(g->bscr);
+	g->bscr = malloc((size_t)g->kmax * m * sizeof(*g->bscr));
+	if (!g->bscr) {
+		whine(g, "the batch scratch would not allocate", g->kmax, m);
+		return -1;
+	}
+	g->bm = m;
+	return 0;
+}
+
+int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
+		       unsigned m, float *Y)
+{
+	struct npu_entry *e;
+	struct charsiu_joblist jl;
+	double t0;
+
+	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
+		return -1;
+	if (!g->w4) {
+		whine(g, "batched is int4 only", 0, m);
+		return -1;
+	}
+	e = &g->ent[id];
+	if (e->n_npu != (unsigned)e->t->n) {
+		/* a CPU share would have to be batched too, and is not */
+		whine(g, "batched cannot split rows with the CPU",
+		      (unsigned)e->t->k, (unsigned)e->t->n);
+		return -1;
+	}
+	if (batch_bufs(g, m))
+		return -1;
+
+	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
+	t0 = now_us();
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+		unsigned d = s->di, sk = s->job.mm.k, sn = s->job.mm.n;
+		struct charsiu_job job = s->job;
+		size_t nreg;
+
+		/* m rows of THIS slice's K, contiguous, which is what the
+		 * packer's m > 1 branch reads */
+		for (unsigned r = 0; r < m; r++)
+			memcpy(g->bscr + (size_t)r * sk,
+			       X + (size_t)r * e->t->k + s->k0,
+			       sk * sizeof(*g->bscr));
+
+		job.mm.m = m;
+		job.input_addr = (uint32_t)g->bin[d].dma_address;
+		job.output_addr = (uint32_t)g->bout[d].dma_address;
+
+		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+		charsiu_pack_input_f16(&job.mm, g->bscr, g->bin[d].map,
+				       (size_t)g->kmax * m * 2);
+		charsiu_bo_fini(g->dev[d], &g->bin[d]);
+
+		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		nreg = charsiu_emit_job(&job, g->breg[d].map, 4096 / 8);
+		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		if (!nreg) {
+			whine(g, "the batched register stream came back empty",
+			      sk, sn);
+			return -1;
+		}
+
+		g->tasks[0].regcmd = (uint32_t)g->breg[d].dma_address;
+		g->tasks[0].regcmd_count = (unsigned)nreg;
+		g->handles[0] = g->bin[d].handle;
+		g->handles[1] = s->wt.handle;
+		g->handles[2] = s->coef.handle;
+		jl.tasks = g->tasks;
+		jl.task_count = 1;
+		jl.in_handles = g->handles;
+		jl.in_count = 3;
+		jl.out_handles = &g->bout[d].handle;
+		jl.out_count = 1;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			g->dead = 1;
+			return -1;
+		}
+		g->submits++;
+
+		charsiu_bo_prep(g->dev[d], &g->bout[d], 2000000000);
+		{
+			const float *fo = (const float *)g->bout[d].map;
+			int grp = tensor_grouped(g, e->t);
+
+			/*
+			 * ⚠ charsiu_acc_index, not a flat read. The block
+			 * writes every row and writes them in an order a
+			 * contiguous read cannot see; five rounds went into
+			 * establishing which order, and it is in one place so
+			 * that this and the probe cannot disagree.
+			 */
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < sn; j++) {
+					float v = fo[charsiu_acc_index(r, j, m)];
+
+					Y[(size_t)r * e->t->n + s->n0 + j] +=
+						grp ? v * s->sc[j] : v;
+				}
+		}
+		if (!g->nofini)
+			charsiu_bo_fini(g->dev[d], &g->bout[d]);
+		g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
+	}
+	g->busy_us += now_us() - t0;
+
+	/* an ungrouped tensor is scaled once, per channel, at the end */
+	if (!tensor_grouped(g, e->t))
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned j = 0; j < (unsigned)e->t->n; j++)
+				Y[(size_t)r * e->t->n + j] *= e->t->scale[j];
 	return 0;
 }
 

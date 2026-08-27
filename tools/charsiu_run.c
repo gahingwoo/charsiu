@@ -124,6 +124,7 @@ int main(int argc, char **argv)
 	 */
 	int add_bos = -1, show_special = 0;
 	int ignore_eos = 0;
+	unsigned batch_probe = 0;
 	float temp = 0.0f, top_p = 0.9f;
 	uint64_t seed = 1234;
 	struct llama_model m;
@@ -167,6 +168,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bos")) add_bos = 1;
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
+		/*
+		 * ⚠ AFTER STAGING AND INSTEAD OF GENERATING. The question is
+		 * what batching buys on this board's own weights, and a token
+		 * loop would only add noise to it.
+		 */
+		else if (!strcmp(a, "--batch-probe") && i + 1 < argc)
+			batch_probe = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(a, "--hold-secs")) hold_secs = atoi(NEXT());
 		else if (!strcmp(a, "-i") || !strcmp(a, "--interactive"))
 			interactive = 1;
@@ -429,6 +437,19 @@ int main(int argc, char **argv)
 	for (i = 0; i < n_ids; i++)
 		logits = llama_forward(st, ids[i], st->pos);
 	t_prompt = now_ms() - t0;
+
+	/*
+	 * ⚠ AFTER THE PROMPT, because the NPU tensors are staged lazily on the
+	 * first forward pass that touches each one. Probing before it would
+	 * find nothing routed and say so.
+	 */
+	if (batch_probe) {
+		llama_batch_probe(st, &m, batch_probe);
+		llama_state_free(st);
+		llama_free(&m);
+		return 0;
+	}
+
 	/*
 	 * ⚠ THE STAGE TIMERS START HERE, NOT AT THE FIRST TOKEN. Round 327
 	 * read its own stage table as a decode split and it was 86% the

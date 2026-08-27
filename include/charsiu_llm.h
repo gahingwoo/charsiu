@@ -222,6 +222,13 @@ int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
+/*
+ * M rows through one set of weights, which is the whole of prefill. X is m by
+ * the tensor's K and Y is m by its N, both row major. Decode does not use this
+ * and charsiu_npu_matvec is unchanged.
+ */
+int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
+			unsigned m, float *Y);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);
@@ -515,6 +522,13 @@ void llama_state_free(struct llama_state *s);
  * project has left to move, so it has to be reported without staging in it.
  */
 double llama_stage_ms(void);
+
+/*
+ * What batching buys on this board: m calls to matvec against one call to
+ * matmul, over the model's own staged tensors, checked for agreement first.
+ */
+int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
+		      unsigned mrows);
 
 /* One token in, a full logit vector out. `pos` is where it goes in the cache. */
 void llama_stages_reset(void);
