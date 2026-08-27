@@ -771,6 +771,48 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       ? "   <== both rows" : "");
 				}
 				unsetenv("CHARSIU_DPU_40B8");
+				/*
+				 * ⚠⚠ THE LAST REGISTER THAT COUNTS ROWS, and
+				 * the second one on this path chosen at a width
+				 * where it cannot show.
+				 *
+				 * 0x301c is lines, which is rows - 1, so at
+				 * M = 1 both halves of the word are zero and
+				 * the w4v form and the int8 form are the same
+				 * word. The w4v form puts M in the LOW half,
+				 * from a vendor capture that is M = 32 on the
+				 * WIDTH axis; everything else this file emits
+				 * is the height axis. CHARSIU_W4_301C=high puts
+				 * it in the half the rest of the stream uses.
+				 */
+				printf("\n    CORE 0x301c half, atom 4 read\n");
+				for (unsigned q = 0; q < 2; q++) {
+					unsigned ok0 = 0, ok1 = 0;
+
+					if (q)
+						setenv("CHARSIU_W4_301C", "high", 1);
+					else
+						unsetenv("CHARSIU_W4_301C");
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      M in the %-4s half   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s%s\n",
+					       q ? "high" : "low",
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       q ? "" : "   <- today",
+					       (ok0 == t->n && ok1 == t->n)
+					       ? "   <== both rows" : "");
+				}
+				unsetenv("CHARSIU_W4_301C");
 				unsetenv("CHARSIU_BATCH_READ");
 			}
 		}

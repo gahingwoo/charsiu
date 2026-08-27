@@ -981,10 +981,35 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		int w4v = mm->wdtype == CHARSIU_INT4 &&
 			  !getenv("CHARSIU_W4_BITPAT");
 
+		/*
+		 * ⚠⚠ AND THE w4v FORM OF 0x301c WAS CHOSEN WHERE IT CANNOT
+		 * SHOW, EXACTLY LIKE 0x40b8's LITERAL 3.
+		 *
+		 * lines is rows - 1, so at M = 1 it is ZERO and the two forms
+		 * -- lines, and lines << 16 -- are the SAME WORD. Round 347
+		 * picked the low half from a vendor capture, and that capture
+		 * is M = 32 on the WIDTH axis, where the low half is where M
+		 * belongs. This file's geometry is the height axis everywhere
+		 * else, so the low half makes the job disagree with itself
+		 * above one row, and at one row nothing could tell.
+		 *
+		 * On the board at m = 2 the batched path returns row 0 whole
+		 * and row 1 not at all, under every reading, every row step,
+		 * every input packing and every 0x40b8. A row that is misplaced
+		 * turns up somewhere; a row the block was never told to produce
+		 * does not.
+		 *
+		 * CHARSIU_W4_301C=high puts M back in the half the rest of this
+		 * stream uses. The default does not move until a board round
+		 * says which.
+		 */
+		const char *e31 = getenv("CHARSIU_W4_301C");
+		int high = e31 && !strcmp(e31, "high");
+
 		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
 		emit(&e, CORE, 0x301c,
 		     wide ? ((uint32_t)(rows - 1) << 16) | (ow - 1)
-			  : (w4v ? lines : ((uint32_t)lines << 16)));
+			  : ((w4v && !high) ? lines : ((uint32_t)lines << 16)));
 	}
 	/*
 	 * ⚠ int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
