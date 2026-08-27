@@ -1717,7 +1717,28 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					uint32_t tgt = (uint32_t)(*w >> 48);
 					uint32_t rg = (uint32_t)(*w & 0xffff);
 
+					/*
+					 * ⚠⚠ GEOMETRY ONLY, NOT THE WEIGHT
+					 * FORMAT.
+					 *
+					 * 0x101c is the weight byte count and
+					 * 0x1020 is bytes per channel; putting
+					 * an int8 value in either makes the CNA
+					 * fetch past its buffer, and the first
+					 * sweep that did so faulted the IOMMU,
+					 * timed out, and left the block dead --
+					 * "MMU_DTE_ADDR is not functioning" --
+					 * so every step after it measured a
+					 * corpse and returned the same numbers.
+					 * 0x100c is the int4 weight format.
+					 *
+					 * None of the three can be about rows.
+					 * These four can.
+					 */
 					if (tgt != 0x0201)      /* CNA only */
+						continue;
+					if (rg != 0x1028 && rg != 0x1030 &&
+					    rg != 0x103c && rg != 0x1044)
 						continue;
 					for (bi = 0; bi < n8; bi++)
 						if ((uint32_t)(ref[bi] >> 48) == tgt &&

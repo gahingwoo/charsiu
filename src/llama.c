@@ -825,13 +825,49 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * Each is put back to the int8 value on its
 				 * own, which is round 260's method.
 				 */
-				printf("\n    CNA against the int8 stream,"
-				       " one word at a time\n");
+				/*
+				 * ⚠⚠ IS ROW 1 PRODUCED AT ALL? Ask before
+				 * explaining why it is wrong.
+				 *
+				 * Feed both rows the SAME activation. If the
+				 * block computes two rows, row 1 must come back
+				 * equal to row 0, which is already known exact.
+				 * If it stays absent, row 1 was never produced
+				 * and no amount of reading or placing it will
+				 * help. I asserted that for two rounds without
+				 * testing it.
+				 */
+				{
+					unsigned same = 0;
+
+					memcpy(X + t->k, X, t->k * sizeof(*X));
+					if (!charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y)) {
+						for (unsigned j = 0; j < (unsigned)t->n; j++) {
+							double w = Yref[j];
+
+							if (fabs(Y[t->n+j] - w) <= (fabs(w) > 1e-3 ? fabs(w)*1e-3 : 1e-3)) same++;
+						}
+						printf("\n    both rows fed the SAME"
+						       " activation: row1 matches"
+						       " row0 in %u of %u\n",
+						       same, (unsigned)t->n);
+						printf("      %s\n", same > 100
+						       ? "so two rows ARE produced and row 1 is misplaced"
+						       : "so row 1 is NOT produced at all");
+					}
+					for (size_t j = 0; j < nx; j++)
+						X[j] = (float)(((j * 2654435761u) >> 9)
+							       & 0xff) / 255.0f - 0.5f;
+				}
+
+				printf("\n    CNA geometry against the int8"
+				       " stream, one word at a time\n");
 				setenv("CHARSIU_BATCH_CNADIFF", "-1", 1);
 				charsiu_npu_matmul(s->dev, s->npu_id[i0], X, 2, Y);
-				for (int q = 0; q < 8; q++) {
+				for (int q = 0; q < 4; q++) {
 					char b[8];
-					unsigned ok0 = 0, ok1 = 0;
+					unsigned ok0 = 0, ok1 = 0, well = 0;
 
 					snprintf(b, sizeof(b), "%d", q);
 					setenv("CHARSIU_BATCH_CNADIFF", b, 1);
@@ -845,11 +881,37 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
 						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
 					}
+					/*
+					 * ⚠⚠ A HEALTH CHECK BETWEEN STEPS, and
+					 * this sweep exists because there was
+					 * not one. One override faulted the
+					 * IOMMU, the reset left the block with
+					 * MMU_DTE_ADDR not functioning, and the
+					 * seven steps after it returned the
+					 * same two numbers off a corpse. A
+					 * sweep without a liveness check is a
+					 * sweep that reports its first crash
+					 * seven more times.
+					 */
+					unsetenv("CHARSIU_BATCH_CNADIFF");
+					charsiu_act_set(&a, X, (int)t->k);
+					charsiu_act_blocks(&a);
+					if (!charsiu_npu_matvec(s->dev,
+						s->npu_id[i0], &a, Y))
+						for (unsigned j = 0; j < (unsigned)t->n; j++) {
+							double w = Yref[j];
+
+							if (fabs(Y[j] - w) <= (fabs(w) > 1e-3 ? fabs(w)*1e-3 : 1e-3)) well++;
+						}
 					printf("      cnadiff %d   row0 %5u/%-5u"
-					       "   row1 %5u/%-5u%s\n", q,
+					       "   row1 %5u/%-5u   alive %u/%u%s\n", q,
 					       ok0, (unsigned)t->n,
 					       ok1, (unsigned)t->n,
-					       ok1 > 100 ? "   <== rows appear" : "");
+					       well, (unsigned)t->n,
+					       well < t->n ? "   ⚠ THE BLOCK IS GONE, stop reading here"
+					       : ok1 > 100 ? "   <== rows appear" : "");
+					if (well < t->n)
+						break;
 				}
 				unsetenv("CHARSIU_BATCH_CNADIFF");
 				unsetenv("CHARSIU_BATCH_READ");
