@@ -637,38 +637,41 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * nothing about surf at all.
  */
 /*
- * ⚠⚠ THE ACCUMULATOR'S READ ORDER, SOLVED FROM THE BOARD'S OWN MAP.
+ * ⚠⚠ THE ACCUMULATOR'S READ ORDER. Solved in N, open in m.
  *
- * With 0x40b8 following the row count every wanted value is in the buffer --
- * 128 of 128 at m=2, 256 of 256 at m=4, 512 of 512 at m=8 -- so the arithmetic
- * is right and only the order is wrong. locate() printed where each one landed
- * and this reproduces all 128 positions of that table with nothing left over.
+ * With 0x40b8 following the row count every wanted value is in the buffer at
+ * every shape and every m measured -- "0 are absent" at K=64 N=64, K=256 N=128
+ * and K=1024 N=32 -- so the arithmetic is right and only the order is wrong.
  *
- * It is [n/32][m][32], a surface whose atom is 32 words, and inside each 32 the
- * two sixteen channel halves interleave in groups of four:
+ * locate() printed the map at m=2 and it falls out exactly. Channels are taken
+ * in groups of sixteen, A of those groups are interleaved, and inside the
+ * interleave the four word runs alternate between them:
  *
- *   c = ni % 32,  h = c/16,  q = (c%16)/4,  s = c%4
- *   j = 8q + 4h + s
+ *   blk = 16A,  g = ni/blk,  c = ni%blk,  a = c/16,  t = c%16
+ *   j     = (t/4) * 4A  +  a*4  +  t%4
+ *   index = g * m*blk  +  mi*blk  +  j
  *
- * so channels 0..3 then 16..19 then 4..7 then 20..23, and so on. That is why
- * every plain [n/atom][m][n%atom] candidate scored partial marks: atom 32 gets
- * the blocks right and the inside wrong, atom 4 gets the inside right and the
- * blocks wrong.
+ * so at A = 2 the order is channels 0..3, 16..19, 4..7, 20..23, and so on.
  *
- * ⚠ 32, 16 and 4 are the constants this was solved at, on one shape. 16 is the
- * feature atom and 4 is the words in sixteen bytes, so the shape of the guess
- * is not arbitrary, but N = 64 is two super groups and m = 2 is two rows, and a
- * formula fitted where two of its divisors are also two is a formula to check
- * at other widths before it is believed.
+ * ⚠ WHAT A IS, IS THE OPEN PART. A = 2 reproduces all 128 positions of the
+ * m = 2 map and scores 2n -- every value in place -- at m = 2 on all three
+ * shapes. It scores n/4 at m = 1, n at m = 4 and 2n at m = 8, and those three
+ * numbers are IDENTICAL once divided by n across N = 32, 64 and 128. So N is
+ * settled and m is not.
+ *
+ * A = 1 is the identity, which is what m = 1 wants. A = m would give that for
+ * free and is the obvious guess, which is exactly why it is one candidate here
+ * rather than the answer: the last five rounds each had an obvious guess that
+ * was right at one width.
  */
-static size_t acc_index(unsigned mi, unsigned ni, unsigned m)
+static size_t acc_index(unsigned mi, unsigned ni, unsigned m, unsigned A)
 {
-	const unsigned atom = 32, feat = 16, word = 4;
-	unsigned g = ni / atom, c = ni % atom;
-	unsigned h = c / feat, q = (c % feat) / word, sub = c % word;
-	unsigned j = (atom / word) * q + word * h + sub;
+	unsigned blk = 16u * A;
+	unsigned g = ni / blk, c = ni % blk;
+	unsigned a = c / 16u, t = c % 16u;
+	unsigned j = (t / 4u) * (4u * A) + a * 4u + (t % 4u);
 
-	return (size_t)g * m * atom + (size_t)mi * atom + j;
+	return (size_t)g * m * blk + (size_t)mi * blk + j;
 }
 
 /*
@@ -799,9 +802,11 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	return rc;
 }
 
-static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
+static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
+		      unsigned mapm)
 {
 	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };  /* 0 = flat */
+	static const unsigned AS[] = { 1, 2, 4, 8 };
 	static const unsigned MS[] = { 1, 2, 4, 8 };
 	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
 	uint8_t *A = malloc((size_t)maxm * k);
@@ -828,7 +833,9 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	printf("   m   distinct  present        flat");
 	for (unsigned a = 1; a < sizeof(ATOMS) / sizeof(*ATOMS); a++)
 		printf("   atom %-2u", ATOMS[a]);
-	printf("     acc_index\n");
+	for (unsigned x = 0; x < sizeof(AS) / sizeof(*AS); x++)
+		printf("     A=%-2u", AS[x]);
+	printf("     A=m\n");
 
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned m = MS[y];
@@ -877,19 +884,19 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 				}
 			printf("  %4zu/%-4zu", ex, total);
 		}
-		{
+		for (unsigned x = 0; x <= sizeof(AS) / sizeof(*AS); x++) {
+			unsigned A = x < sizeof(AS) / sizeof(*AS) ? AS[x] : m;
 			size_t ex = 0;
 
 			for (unsigned mi = 0; mi < m; mi++)
 				for (unsigned ni = 0; ni < n; ni++) {
-					size_t at = acc_index(mi, ni, m);
+					size_t at = acc_index(mi, ni, m, A);
 
 					if (at < total &&
 					    got[at] == want[(size_t)mi * n + ni])
 						ex++;
 				}
-			printf("   %5zu/%-5zu%s", ex, total,
-			       ex == total ? " EXACT" : "");
+			printf("  %5zu%s", ex, ex == total ? "*" : " ");
 		}
 		printf("\n");
 	}
@@ -904,10 +911,15 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	 * 112, and locate() prints that count beside the table so the next
 	 * reader can check rather than take my word.
 	 */
-	printf("\n  and the map at m=2, which is the permutation itself:\n");
-	reference(2, k, n, A, B, want);
-	if (!run(dev, 2, k, n, A, B, got))
-		locate(2, n, got, want);
+	/*
+	 * ⚠ THE MAP AT THE m THAT IS OPEN, not always at 2. m = 2 is solved and
+	 * printing it again says nothing; the fourth argument picks the width,
+	 * so `--read 4` returns the table that would settle A.
+	 */
+	printf("\n  and the map at m=%u, which is the permutation itself:\n", mapm);
+	reference(mapm, k, n, A, B, want);
+	if (!run(dev, mapm, k, n, A, B, got))
+		locate(mapm, n, got, want);
 	free(A); free(B); free(got); free(want);
 	return rc;
 }
@@ -1117,7 +1129,8 @@ int main(int argc, char **argv)
 	 * layout rather than the input geometry.
 	 */
 	if (argc > 3 && !strcmp(argv[3], "--read")) {
-		int rc = read_sweep(dev, k, n);
+		unsigned mapm = argc > 4 ? (unsigned)atoi(argv[4]) : 2;
+		int rc = read_sweep(dev, k, n, mapm ? mapm : 2);
 
 		charsiu_close(dev);
 		return rc;
