@@ -764,6 +764,86 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	return rc;
 }
 
+/*
+ * ⚠⚠ DOES charsiu_acc_index HOLD AT A PROJECTION'S WIDTH?
+ *
+ * It was solved at N = 32 and confirmed at 64 and 128. A projection is 2048
+ * wide, sixteen times the largest N it has ever seen, and the batched runtime
+ * path built on it comes back with row 0 half right at N = 2048: 1025 of 2048.
+ * Half is the shape of a super group term that stops scaling, and the super
+ * group is the only part of that expression N touches.
+ *
+ * So walk N at m = 2, on the int8 accumulator this was solved on, where there
+ * is no float output stage and no runtime plumbing to blame. N = 32 is the
+ * control: it has one super group and has been exact from the start, so a run
+ * where it fails is measuring something else.
+ */
+static int nwide_sweep(struct charsiu_device *dev, unsigned k)
+{
+	static const unsigned NS[] = { 32, 64, 128, 256, 512, 1024, 2048 };
+	unsigned maxn = NS[sizeof(NS) / sizeof(*NS) - 1];
+	uint8_t *A = malloc((size_t)2 * k);
+	uint8_t *B = malloc((size_t)maxn * k);
+	int32_t *got = malloc((size_t)2 * maxn * 4);
+	int32_t *want = malloc((size_t)2 * maxn * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	for (unsigned r = 0; r < 2; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	printf("K=%u, m=2, int8 accumulator. charsiu_acc_index against N.\n"
+	       "N=32 is the control: one super group, exact since it was\n"
+	       "solved there.\n\n", k);
+	printf("      N   distinct   present         exact\n");
+	for (unsigned x = 0; x < sizeof(NS) / sizeof(*NS); x++) {
+		unsigned n = NS[x];
+		size_t total = (size_t)2 * n, ex = 0, live = 0, uniq = 0;
+
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] = mix(c, i, 15);
+		reference(2, k, n, A, B, want);
+		if (run(dev, 2, k, n, A, B, got)) {
+			printf("  %5u   submit failed\n", n);
+			rc = 1;
+			continue;
+		}
+		for (size_t q = 0; q < total; q++) {
+			size_t j;
+
+			for (j = 0; j < q; j++)
+				if (want[j] == want[q])
+					break;
+			if (j == q)
+				uniq++;
+		}
+		for (size_t q = 0; q < total; q++)
+			for (size_t i = 0; i < total; i++)
+				if (got[i] == want[q]) { live++; break; }
+		for (unsigned mi = 0; mi < 2; mi++)
+			for (unsigned ni = 0; ni < n; ni++) {
+				size_t at = charsiu_acc_index(mi, ni, 2);
+
+				if (at < total &&
+				    got[at] == want[(size_t)mi * n + ni])
+					ex++;
+			}
+		printf("  %5u   %8zu   %5zu/%-5zu   %5zu/%-5zu%s\n",
+		       n, uniq, live, total, ex, total,
+		       ex == total ? "  EXACT" : "");
+	}
+	printf("\n  ⚠ present is reading independent: if it stays at m*n while\n"
+	       "  exact falls away, the arithmetic is fine and the expression's\n"
+	       "  super group term is what stops.\n");
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
 static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 		      unsigned mapm)
 {
@@ -1087,6 +1167,12 @@ int main(int argc, char **argv)
 	 * The reading sweep keeps K and N, because the question is the output
 	 * layout rather than the input geometry.
 	 */
+	if (argc > 3 && !strcmp(argv[3], "--nwide")) {
+		int rc = nwide_sweep(dev, k);
+
+		charsiu_close(dev);
+		return rc;
+	}
 	if (argc > 3 && !strcmp(argv[3], "--read")) {
 		unsigned mapm = argc > 4 ? (unsigned)atoi(argv[4]) : 2;
 		int rc = read_sweep(dev, k, n, mapm ? mapm : 2);
