@@ -243,7 +243,10 @@ struct charsiu_npu {
 	unsigned long slow_n;
 	double slow_worst;
 	unsigned slow_worst_k, slow_worst_n;
-	int strikes, dead, whined, nochain, slowed, nofini, inprep, plain;
+	int strikes, dead, nochain, slowed, nofini, inprep, plain;
+	/* one message per REASON; the pointer identifies it, see whine() */
+	const char *whined[8];
+	unsigned n_whined;
 	int serialpack;
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
@@ -438,11 +441,29 @@ static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *
 	       (t->k % t->kgroup) == 0 && t->kgroup == (uint64_t)g->kmax;
 }
 
+/*
+ * ⚠⚠ ONCE PER REASON, NOT ONCE PER RUN.
+ *
+ * This printed the first refusal and then went silent for the rest of the
+ * process, which is exactly backwards: the first refusal is usually a tensor
+ * nobody cares about and the interesting one comes later. A gemma3 run with
+ * CHARSIU_NPU_MAXN=262144 staged 182 tensors of 183 -- the 128256 wide output
+ * head, forty percent of its token, silently stayed on the CPU -- and the log
+ * carried no reason at all because something earlier had already used up the
+ * one message.
+ *
+ * A reason is a string literal here, so comparing the POINTER is enough to
+ * tell two apart, and eight of them is more than this file has.
+ */
 static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned n)
 {
-	if (g->whined)
-		return;
-	g->whined = 1;
+	unsigned i;
+
+	for (i = 0; i < g->n_whined; i++)
+		if (g->whined[i] == what)
+			return;
+	if (g->n_whined < sizeof(g->whined) / sizeof(*g->whined))
+		g->whined[g->n_whined++] = what;
 	fprintf(stderr, "charsiu: NOT on the NPU -- %s (K=%u N=%u)\n", what, k, n);
 }
 
