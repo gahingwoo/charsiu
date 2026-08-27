@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "charsiu.h"
 #include "charsiu_llm.h"
 
 static double now_ms(void)
@@ -195,6 +196,20 @@ int main(int argc, char **argv)
 		snprintf(buf, sizeof(buf), "%d", nthreads);
 		setenv("CHARSIU_THREADS", buf, 1);
 	}
+
+	/*
+	 * ⚠ A CONVERSATION SHOWS THE CONVERSATION. Everything this tree prints
+	 * to explain itself -- the CPU pin, the governor, which tensors did not
+	 * reach the hardware and why, which path the prompt took -- is written
+	 * for a board log, and in a chat it lands in front of somebody who
+	 * typed a question and is waiting. A stable install is somebody's way
+	 * to run a model, not a probe.
+	 *
+	 * ⚠ BEFORE THE LOAD, because the thread pool pins and reports on its
+	 * way up and that happens inside it.
+	 */
+	if (interactive)
+		charsiu_diag_quiet(1);
 
 	t0 = now_ms();
 	if (cache) {
@@ -492,7 +507,7 @@ int main(int argc, char **argv)
 		 * numbers that agreed and said nothing. One line, always, and
 		 * the reason when there is one.
 		 */
-		if (!quiet) {
+		if (!quiet && charsiu_diag()) {
 			const char *why = llama_batch_why_not(&m);
 
 			if (done >= n_ids)

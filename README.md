@@ -17,6 +17,25 @@ mainline kernel and the open `rocket` driver.
   charsiu on the CPU, best                 5.53      (pure q4_0, four threads)
 ```
 
+A prompt is a different job from a generated token: its tokens are all known at once,
+so the same weight bytes can serve more than one of them. **Prefill used to cost more
+per token than decode and now costs a third of it.**
+
+```
+                            a prompt, batched   a token at a time
+  charsiu, int8                    26.60               9.04       tokens/second
+  charsiu, int4                    18.59              15.10
+```
+
+Both columns are the same binary one environment variable apart, generating identical
+text, with two batched samples bracketing the control so a warming board cannot be
+mistaken for the flag. int4 gains less because **w4a16 computes exactly one row** and no
+register makes it compute two -- so an int4 prompt batches nothing and gains only the
+output head, which a prompt needs for its last token alone. That saving is 12.40 ms a
+token, and the head is 131.3 MB of int4 weights: 131.3 / 12.59 = 10.43 GB/s against the
+10.58 GB/s this board measures for weight bandwidth. The time a batched prompt does not
+spend is the time it takes to stream the head once per token.
+
 It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files. Decode is at the
 board's DRAM roof: 10.8 GB/s of weights, 1661 ms of a 1792 ms hardware path spent waiting
 on the fence, and one millisecond of a token unaccounted for.
@@ -51,10 +70,21 @@ checks still run, which is the point: it is what the installer *sees* on your ma
 **stable** is what the line above installs: the runtime, and nothing else.
 
 **dev** adds the hardware probes -- `npu_gemm_test`, `charsiu_matmul`,
-`bench_batch` -- and tracks `main`, where the work happens. They exist to ask the
-silicon questions, and asking has wedged the block, timed out and printed the
-opposite of its own data on the way to the answers. They are not something to
-install on a board you want to rely on.
+`bench_batch`, `prefill_control.sh` -- and tracks `main`, where the work happens.
+They exist to ask the silicon questions, and asking has wedged the block, timed out
+and printed the opposite of its own data on the way to the answers. They are not
+something to install on a board you want to rely on.
+
+⚠ The channel decides what is **installed**, not what is in the tree, and the two
+build from the same sources. It is not a fork.
+
+⚠ And a conversation shows the conversation. This tree prints a running commentary
+on stderr -- which CPUs it pinned, what the governor is reading, which tensors did
+not reach the hardware and why, which path the prompt took -- and every one of those
+lines exists because a board log could not be read without it. In front of somebody
+who typed a question they are noise, so `charsiu` turns them off in interactive mode
+and a one-shot run, which is what a board log is, keeps them. Errors, the model
+banner and the staging progress are not commentary and always print.
 
 ```
 sh install.sh --dev          the probes too, from the start
@@ -1326,9 +1356,29 @@ next board round.
 
 ### What charsiu's own M > 1 turned out to be
 
+**Solved, and there was never a hardware wall.** Two defects of ours, both invisible at
+the only width they had ever been exercised at:
+
+- `0x40b8` was the literal `3` where it must be `3 * rows`. It was fitted at M = 1,
+  which is the one width at which a value that follows the row count cannot show that
+  it does.
+- the accumulator's read order was unknown. It is `charsiu_acc_index()`: `P = m / 2`,
+  super groups of 32, rows pairing P at a time, four word runs alternating. Confirmed
+  at m = 8 and N = 2048, both widths it was not fitted on.
+
+int8 batches correctly from m = 2 to 32 and a batched prompt is 2.94x on the board.
+**w4a16 still computes exactly one row**, and that one is silicon rather than a
+literal: fed the same activation twice, row 1 matches row 0 in 1 of 2048; the DPU and
+RDMA blocks are identical to a stream that does two rows; every CNA word that differs
+was put back one at a time. The vendor never batches a weight matmul either, so there
+is no M > 1 int4 stream to copy.
+
+**What follows is the record of the search**, kept because the reasoning in it is still
+the reasoning and because most of a fortnight was spent fitting models to the symptom.
+
 charsiu asks the hardware for one row. A batched prefill wants thirty two, where the
 same weight bytes serve thirty two rows instead of one, and at a projection's K this
-tree has never got a correct answer above M = 1.
+tree had never got a correct answer above M = 1.
 
 Four rounds went into fitting an address function to the output, because the values
 came back in the wrong places and that looks like a layout. Against a reference with
@@ -1390,9 +1440,12 @@ atom. It predicts 8 exact at m = 2, which is what the board wrote, and 16 at m =
 where the board wrote 8. Right at one width and wrong at the next is what the last
 four rounds kept producing, so it is recorded and not acted on.
 
-The next run is both probes at one shape in one session: `charsiu_matmul 2 64 64`
-against `npu_gemm_test 64 64 --surf`, with `CHARSIU_OUT_ROWMAJOR=1` as the control
-that has to fail.
+That was right, and it is what settled it: both probes at one shape in one session,
+`charsiu_matmul` against `npu_gemm_test --surf`, with `CHARSIU_OUT_ROWMAJOR=1` as the
+control that had to fail. The accumulator does not mirror the int8 surface with a four
+word atom. It is `charsiu_acc_index` above, and the reason every earlier fit died at
+the next width is that `0x40b8` was writing a row budget for one row whatever m was --
+so the counting was measuring a truncation, not a layout.
 
 ⚠ The test that measured all of this printed the opposite of its own data first: "1 of
 5 widths exact at N=16, the budget reading does not hold", while its own increment line
@@ -1553,6 +1606,25 @@ two groups would apply the first group's scale to both. Off by default, unrun.
 `llama_load` reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3**. `charsiu_check`'s
 gate has to match it exactly: it exists to save a two gigabyte download and is wrong in
 both directions if it drifts.
+
+⚠ All seven decode. **Only the plain ones batch a prompt**, and the batched layer loop
+refuses the rest rather than computing something else -- gemma3's window and two rope
+bases, gemma4's per layer embeddings and shared KV, qwen3's q and k norms, phi3's fused
+K and V, and any bias, post norm or softcap. A refused model falls back to the token
+loop, which is correct everywhere and merely slower: phi3's prompt runs at 4.96 tok/s,
+what a generated token costs. Splitting a fused qkv into three views is the whole of
+what phi3 needs, and the control above says it is worth 12.4 ms a token.
+
+⚠ And a refusal has to be audible. It used to be a `return 0` the caller swallowed, so
+"the flag did nothing" and "this architecture was never batchable" looked identical from
+outside -- which is how a board round spent four minutes on Phi-3.5 and produced 4.96,
+5.00 and 5.10 tok/s, three numbers that agree and mean nothing. Every run prints one
+line now saying which path its prompt took, and the reason when it fell back:
+
+```
+charsiu: prompt batched, 64 tokens in chunks of 32
+charsiu: prompt a token at a time -- this model is not batched: fused or absent K and V projections
+```
 
 qwen3 is the llama graph with the three QKV biases dropped and a norm added on Q and K
 -- per head, over one head's head_dim, before rope. It is also the first architecture

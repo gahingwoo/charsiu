@@ -380,7 +380,7 @@ static void cpu_clock_report(const cpu_set_t *set)
 			fclose(f);
 		}
 	}
-	if (gov[0] || khz)
+	if ((gov[0] || khz) && charsiu_diag())
 		fprintf(stderr, "charsiu: cpu%d governor %s, %ld MHz idle\n",
 			first, gov[0] ? gov : "(unknown)", khz / 1000);
 }
@@ -412,9 +412,11 @@ static void cpus_pin(void)
 		while (*p == ',' || *p == ' ')
 			p++;
 	}
+	/* ⚠ the FAILURE still speaks. A pin that did not apply changes the
+	 * numbers and is not a running commentary. */
 	if (CPU_COUNT(&set) && sched_setaffinity(0, sizeof(set), &set))
 		fprintf(stderr, "charsiu: CHARSIU_CPUS=%s did not apply\n", spec);
-	else
+	else if (charsiu_diag())
 		fprintf(stderr, "charsiu: pinned to CPUs %s, %d of them\n",
 			spec, CPU_COUNT(&set));
 	cpu_clock_report(&set);

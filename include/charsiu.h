@@ -191,6 +191,22 @@ unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
  */
 size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m);
 
+/*
+ * ⚠ A CONVERSATION SHOWS THE CONVERSATION, AND NOTHING ELSE.
+ *
+ * This tree prints a running commentary on stderr -- which CPUs it pinned, what
+ * the governor is, which tensors did not reach the hardware and why, which path
+ * the prompt took. Every one of those lines exists because a board round could
+ * not be read without it, and every one of them is noise in front of somebody
+ * who typed a question and is waiting for an answer. `charsiu` in interactive
+ * mode turns them off; a one-shot run, which is what a board log is, keeps them.
+ *
+ * It does NOT silence errors, the model banner, or the staging progress. Those
+ * are things a person waiting is entitled to see.
+ */
+void charsiu_diag_quiet(int on);
+int charsiu_diag(void);
+
 
 
 /* ---- a complete, submittable stream --------------------------------------- */
