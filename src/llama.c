@@ -492,6 +492,16 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 static double act_ms;
 static int stage_on = -1;
 
+/* CHARSIU_DBG_LAYERS: the RMS of the residual stream after every layer */
+static int dbg_layers(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_DBG_LAYERS") != NULL;
+	return v;
+}
+
 static double now_ms(void)
 {
 	struct timespec t;
@@ -921,6 +931,24 @@ static void qk_norm(float *v, uint32_t nheads, uint32_t hd,
 	if (!gain)
 		return;
 	/*
+	 * ⚠ NO GAIN IS A REAL CASE, not a missing argument. gemma4 normalises
+	 * V with a bare RMS and no weight at all, so a NULL here means one
+	 * rather than nothing.
+	 */
+	if (!g) {
+		for (uint32_t h = 0; h < nheads; h++) {
+			float *p = v + (size_t)h * hd;
+			float ss = 0.0f, sc;
+
+			for (uint32_t i = 0; i < hd; i++)
+				ss += p[i] * p[i];
+			sc = 1.0f / sqrtf(ss / (float)hd + eps);
+			for (uint32_t i = 0; i < hd; i++)
+				p[i] *= sc;
+		}
+		return;
+	}
+	/*
 	 * The gain is re-read once per call rather than once per head: it is
 	 * the same row for all of them, and a layer asks for two of these.
 	 */
@@ -1037,6 +1065,7 @@ int llama_load(struct llama_model *m, const char *path)
 	 */
 	if (strcmp(arch, "llama") && strcmp(arch, "qwen2") &&
 	    strcmp(arch, "qwen3") && strcmp(arch, "gemma3") &&
+	    strcmp(arch, "gemma4") &&
 	    strcmp(arch, "phi3") && strcmp(arch, "smollm3")) {
 		fprintf(stderr, "llama: architecture %s is not supported\n", arch);
 		goto fail;
@@ -1060,6 +1089,32 @@ int llama_load(struct llama_model *m, const char *path)
 	GETU("attention.head_count", m->n_head, 0);
 	GETU("attention.head_count_kv", m->n_head_kv, m->n_head);
 	GETU("feed_forward_length", m->n_ff, 0);
+	snprintf(key, sizeof(key), "%s.feed_forward_length", arch);
+	{
+		const struct gguf_kv *ff = gguf_find(&m->gguf, key);
+
+		if (ff && ff->type == GGUF_V_ARRAY &&
+		    ff->arr_len >= m->n_layer) {
+			uint32_t i32, mx = 0;
+
+			m->ff_arr = ff;
+			/*
+			 * ⚠ THE LARGEST, not the first. Every buffer
+			 * below is sized from m->n_ff and the widest
+			 * layer is the one that has to fit; taking
+			 * arr[0] gives 6144 where a later layer wants
+			 * 12288, and the overrun is silent.
+			 */
+			for (uint32_t q = 0; q < m->n_layer; q++) {
+				memcpy(&i32, (const uint8_t *)ff->arr
+					     + (size_t)q * 4, 4);
+				if (i32 > mx)
+					mx = i32;
+			}
+			if (mx)
+				m->n_ff = mx;
+		}
+	}
 	GETU("context_length", m->n_ctx_train, 2048);
 	GETU("rope.dimension_count", m->head_dim, m->n_head ? m->n_embd / m->n_head : 0);
 	GETF("attention.layer_norm_rms_epsilon", m->rms_eps, 1e-5f);
@@ -1090,14 +1145,27 @@ int llama_load(struct llama_model *m, const char *path)
 			m->head_dim = kl;
 	}
 	m->n_embd_attn = m->n_head * m->head_dim;
+	m->head_dim_swa = m->head_dim;
+	m->attn_scale = 1.0f / sqrtf((float)m->head_dim);
+	m->n_layer_kv = m->n_layer;
 	/*
 	 * ⚠ BY ARCHITECTURE, and there is no key in the file that says it --
 	 * llama.cpp carries the same thing as a switch over the architecture
 	 * enum. llama and smollm3 are the permuted, interleaved ones; qwen2,
 	 * qwen3 and phi3 are not.
 	 */
+	/*
+	 * ⚠ EVERY BUFFER TAKES THE WIDER HEAD. gemma4's window layers are 256
+	 * where its full ones are 512, and q, the KV cache and xb are one
+	 * allocation each for all of them.
+	 */
+	if (m->head_dim_swa > m->head_dim)
+		m->head_dim = m->head_dim_swa;
+	m->n_embd_attn = m->n_head * m->head_dim;
+
 	m->rope_neox = !strcmp(arch, "qwen2") || !strcmp(arch, "qwen3") ||
-		       !strcmp(arch, "gemma3") || !strcmp(arch, "phi3");
+		       !strcmp(arch, "gemma3") || !strcmp(arch, "gemma4") ||
+		       !strcmp(arch, "phi3");
 	/*
 	 * The control. The two pairings are the whole difference between
 	 * "Paris. It is the largest city in France" and "a country in the
@@ -1150,6 +1218,25 @@ int llama_load(struct llama_model *m, const char *path)
 	 * full one, not one window in six.
 	 */
 	GETU("attention.sliding_window_pattern", m->swa_pattern, 6);
+	/*
+	 * ⚠⚠ gemma4 WRITES THE SAME KEY AS AN ARRAY, one flag a layer, where
+	 * gemma3 writes a scalar period. llama.cpp reads it with
+	 * get_key_or_arr into is_swa_impl[] for exactly that reason.
+	 *
+	 * A scalar period cannot express what gemma4 does -- its pattern is
+	 * not periodic -- so read the array where there is one and fall back
+	 * to the period where there is not. The per layer flag is what the
+	 * forward pass actually asks, so both forms end up in the same place.
+	 */
+	{
+		const struct gguf_kv *sw;
+
+		snprintf(key, sizeof(key), "%s.attention.sliding_window_pattern",
+			 arch);
+		sw = gguf_find(&m->gguf, key);
+		if (sw && sw->type == GGUF_V_ARRAY && sw->arr_len >= m->n_layer)
+			m->swa_arr = sw;
+	}
 	GETF("rope.freq_base_swa", m->rope_base_swa, 10000.0f);
 	GETF("final_logit_softcapping", m->final_softcap, 0.0f);
 #undef GETU
@@ -1179,7 +1266,48 @@ int llama_load(struct llama_model *m, const char *path)
 		if (e && m->n_swa)
 			m->swa_pattern = (uint32_t)atoi(e);
 	}
-	if (!strcmp(arch, "gemma3")) {
+	if (!strcmp(arch, "gemma4")) {
+		uint32_t v2;
+
+		/*
+		 * ⚠ gemma4 SETS THE ATTENTION SCALE TO ONE. Its python is
+		 * `self.scaling = 1.0`; the factor that would be 1/sqrt(head)
+		 * is folded into the QK norms instead. Leaving 1/sqrt(head)
+		 * here does not crash and does not read as wrong -- it
+		 * flattens every softmax in the model by a constant.
+		 */
+		m->attn_scale = 1.0f;
+		/*
+		 * ⚠ THE KEY IS embedding_length_per_layer_INPUT. llama.cpp's
+		 * LLM_KV_EMBEDDING_LENGTH_PER_LAYER renders to that string, and
+		 * the shorter name it reads like is in no file.
+		 */
+		snprintf(key, sizeof(key),
+			 "%s.embedding_length_per_layer_input", arch);
+		if (gguf_get_u32(&m->gguf, key, &v2))
+			v2 = 0;
+		m->n_embd_pl = v2;
+		/*
+		 * ⚠ A WINDOW LAYER MAY HAVE A SHORTER HEAD. gemma4 declares
+		 * attention.key_length_swa on its own, and the KV cache has to
+		 * be sized for whichever of the two is larger.
+		 */
+		snprintf(key, sizeof(key), "%s.attention.key_length_swa", arch);
+		if (gguf_get_u32(&m->gguf, key, &v2) || !v2 || (v2 & 1))
+			v2 = m->head_dim;
+		m->head_dim_swa = v2;
+		/*
+		 * ⚠ THE LAYERS PAST THIS SHARE AN EARLIER LAYER'S KV, and have
+		 * no wk or wv of their own. The key counts the SHARED ones, so
+		 * the first that shares is n_layer minus it.
+		 */
+		snprintf(key, sizeof(key), "%s.attention.shared_kv_layers", arch);
+		if (gguf_get_u32(&m->gguf, key, &v2))
+			v2 = 0;
+		m->n_layer_kv = v2 < m->n_layer ? m->n_layer - v2 : m->n_layer;
+		m->v_norm = 1;
+	}
+	if (!strcmp(arch, "gemma3") || !strcmp(arch, "gemma4")) {
 		/*
 		 * ⚠ sqrt(n_embd) ON THE EMBEDDING, and it is not a detail: at
 		 * n_embd 1152 it is a factor of 34, so leaving it out feeds
@@ -1239,11 +1367,67 @@ int llama_load(struct llama_model *m, const char *path)
 	if (m->rope_freqs && !m->rope_freqs->nbytes)
 		m->rope_freqs = NULL;
 
+	/*
+	 * gemma4's per layer embedding tables. Absent everywhere else, and
+	 * absent on a gemma4 that declares no per layer width.
+	 */
+	if (m->n_embd_pl) {
+		m->pl_tok_embd = need(&m->gguf, "per_layer_token_embd.weight");
+		m->pl_model_proj = need(&m->gguf, "per_layer_model_proj.weight");
+		m->pl_proj_norm = need(&m->gguf, "per_layer_proj_norm.weight");
+		if (!m->pl_tok_embd || !m->pl_model_proj || !m->pl_proj_norm)
+			goto fail;
+	}
+
 	m->layers = calloc(m->n_layer, sizeof(*m->layers));
 	if (!m->layers)
 		goto fail;
+	int last_kv[2] = { -1, -1 };   /* [0] full attention, [1] window */
+
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		struct llama_layer *L = &m->layers[l];
+
+		/*
+		 * ⚠ RESOLVE THE WINDOW FLAG ONCE, HERE. The forward pass asks
+		 * it every layer of every token and there are two ways a file
+		 * can say it; deciding in the loop would put the two forms in
+		 * the hot path and in two places.
+		 */
+		if (m->swa_arr) {
+			const uint8_t *a = m->swa_arr->arr;
+			unsigned w = m->swa_arr->arr_type == GGUF_V_U32 ||
+				     m->swa_arr->arr_type == GGUF_V_I32 ? 4 :
+				     m->swa_arr->arr_type == GGUF_V_U16 ||
+				     m->swa_arr->arr_type == GGUF_V_I16 ? 2 : 1;
+			uint32_t v32 = 0;
+
+			memcpy(&v32, a + (size_t)l * w, w);
+			L->swa = m->n_swa && v32 != 0;
+		} else {
+			L->swa = m->swa_pattern &&
+				 (l % m->swa_pattern) < m->swa_pattern - 1;
+		}
+		/*
+		 * ⚠ WHOSE KV THIS LAYER READS. gemma4's last few layers carry
+		 * no wk or wv and attend against the last layer that had them.
+		 * -1 is "its own", which is every layer of everything else.
+		 */
+		L->kv_from = -1;
+		/*
+		 * ⚠ THE LAYER'S OWN SHAPES, resolved here so the forward pass
+		 * reads a field instead of a rule. Everything before gemma4
+		 * takes the model's, which is what the fallback is.
+		 */
+		L->n_ff = m->n_ff;
+		if (m->ff_arr) {
+			uint32_t v32 = 0;
+
+			memcpy(&v32, (const uint8_t *)m->ff_arr->arr
+				     + (size_t)l * 4, 4);
+			if (v32)
+				L->n_ff = v32;
+		}
+		L->head_dim = L->swa ? m->head_dim_swa : m->head_dim;
 
 #define T(field, suffix) do {                                            \
 		snprintf(key, sizeof(key), "blk.%u." suffix ".weight", l); \
@@ -1278,6 +1462,51 @@ int llama_load(struct llama_model *m, const char *path)
 			L->wv = &L->split[2];
 			L->gate = &L->split[3];
 			L->up = &L->split[4];
+		} else if (!strcmp(arch, "gemma4")) {
+			/*
+			 * ⚠ ONLY wq IS ALWAYS THERE.
+			 *
+			 * gemma4's last layers share an earlier layer's KV and
+			 * carry no attn_k at all; and attn_v is optional in
+			 * EVERY layer, where its absence means V is K -- which
+			 * llama.cpp spells `Vcur = Kcur` rather than as a
+			 * separate projection.
+			 */
+			T(wq, "attn_q");
+			snprintf(key, sizeof(key), "blk.%u.attn_k.weight", l);
+			L->wk = gguf_tensor(&m->gguf, key);
+			if (L->wk && !L->wk->nbytes)
+				L->wk = NULL;
+			snprintf(key, sizeof(key), "blk.%u.attn_v.weight", l);
+			L->wv = gguf_tensor(&m->gguf, key);
+			if (L->wv && !L->wv->nbytes)
+				L->wv = NULL;
+			/*
+			 * ⚠⚠ THE LAST LAYER OF THE SAME KIND, not simply the
+			 * last one.
+			 *
+			 * gemma4 keeps two caches, one for its window layers
+			 * and one for its full ones -- llama.cpp builds it with
+			 * build_attn_inp_kv_iswa -- and they are not even the
+			 * same shape here: a window layer's head is 256 and a
+			 * full one's is 512. E2B's first shared layer is 15,
+			 * which is a WINDOW layer, and the last layer with a
+			 * KV of its own is 14, which is a FULL one. Pointing
+			 * the first at the second has it read 256 floats out
+			 * of a slot written as 512, which is not a crash and
+			 * not obviously wrong in the residual stream: the
+			 * norms stayed between 0.75 and 2 the whole way down.
+			 */
+			if (L->wk) {
+				last_kv[L->swa ? 1 : 0] = (int)l;
+			} else if (last_kv[L->swa ? 1 : 0] < 0) {
+				fprintf(stderr, "llama: layer %u shares a %s KV "
+					"and no earlier layer has one\n", l,
+					L->swa ? "window" : "full");
+				goto fail;
+			} else {
+				L->kv_from = last_kv[L->swa ? 1 : 0];
+			}
 		} else {
 			T(wq, "attn_q");
 			T(wk, "attn_k");
@@ -1309,10 +1538,47 @@ int llama_load(struct llama_model *m, const char *path)
 		OW(k_norm, "attn_k_norm");
 		OW(attn_post_norm, "post_attention_norm");
 		OW(ffn_post_norm, "post_ffw_norm");
+		/*
+		 * ⚠ gemma4 only, and the names are SHORTER than the model wide
+		 * ones they belong to: per_layer_token_embd and
+		 * per_layer_model_proj sit at the top level, but a layer's
+		 * three are blk.N.inp_gate, blk.N.proj and blk.N.post_norm.
+		 * Guessing per_layer_* here found nothing, three times, and a
+		 * tensor that is not found is simply not used -- the whole
+		 * per-layer path was skipped and the model answered in a
+		 * different language every token.
+		 */
+		OW(pl_inp_gate, "inp_gate");
+		OW(pl_proj, "proj");
+		OW(pl_post_norm, "post_norm");
+		OW(out_scale, "layer_output_scale");
+		OW(rope_freqs, "rope_freqs");
 #undef OW
-		if (!L->q_norm != !L->k_norm) {
+		/*
+		 * ⚠ EXCEPT WHERE THERE IS NO K. gemma4's shared KV layers carry
+		 * neither attn_k nor attn_k_norm, and layer 15 of E2B is the
+		 * first of them, so the symmetry this checks is the wrong
+		 * symmetry there: it is q_norm against a K THAT EXISTS.
+		 */
+		if (L->wk && !L->q_norm != !L->k_norm) {
 			fprintf(stderr, "llama: layer %u norms one of q and k "
 				"and not the other\n", l);
+			goto fail;
+		}
+		/*
+		 * ⚠ REFUSE A MIXTURE OF EXPERTS RATHER THAN COMPUTE HALF OF IT.
+		 *
+		 * A gemma4 MoE layer runs a dense MLP and an expert branch in
+		 * PARALLEL and adds them. The dense half is the nine weights
+		 * this graph already knows, so loading it and ignoring
+		 * ffn_gate_inp would produce a model that runs, answers, and
+		 * is quietly missing half of every expert layer. gemma-4-26B
+		 * -A4B is the one that has them; E2B and E4B are dense.
+		 */
+		snprintf(key, sizeof(key), "blk.%u.ffn_gate_inp.weight", l);
+		if (gguf_tensor(&m->gguf, key)) {
+			fprintf(stderr, "llama: layer %u is a mixture of "
+				"experts, which this graph does not build\n", l);
 			goto fail;
 		}
 		T(ffn_norm, "ffn_norm");
@@ -1400,6 +1666,19 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->v   = calloc((size_t)m->n_head_kv * m->head_dim, sizeof(float));
 	s->att = calloc((size_t)m->n_head * s->n_ctx, sizeof(float));
 	s->logits = calloc(m->n_vocab, sizeof(float));
+	/*
+	 * gemma4's per layer embeddings: one slice a layer, built once per
+	 * token, plus two scratch vectors of the per layer width.
+	 */
+	if (m->n_embd_pl) {
+		s->pl = calloc((size_t)m->n_embd_pl * m->n_layer, sizeof(float));
+		s->plb = calloc((size_t)m->n_embd_pl * m->n_layer, sizeof(float));
+		s->plc = calloc(m->n_embd_pl, sizeof(float));
+		if (!s->pl || !s->plb || !s->plc) {
+			llama_state_free(s);
+			return NULL;
+		}
+	}
 
 	{
 		uint32_t widest = state_widest(m);
@@ -1464,6 +1743,9 @@ void llama_state_free(struct llama_state *s)
 	free(s->x); free(s->xb); free(s->xb2);
 	free(s->hb); free(s->hb2);
 	free(s->q); free(s->k); free(s->v);
+	free(s->pl);
+	free(s->plb);
+	free(s->plc);
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
 	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
@@ -1616,7 +1898,14 @@ struct attn_job {
 	 * is every layer of every architecture but gemma3's window ones.
 	 */
 	int t0;
-	uint32_t hd, kvdim, gqa, nkv;
+	/*
+	 * ⚠ hd IS THIS LAYER'S HEAD AND hdmax IS THE CACHE'S STRIDE, and on
+	 * gemma4 they differ: its window layers have a 256 long head and its
+	 * full ones 512, while the KV cache is one allocation with one stride
+	 * for all of them. Indexing the cache by the live head would make
+	 * layer 4 read where layer 0 wrote.
+	 */
+	uint32_t hd, hdmax, kvdim, gqa, nkv;
 	float scale;
 };
 
@@ -1644,7 +1933,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 {
 	const struct attn_job *j = vj;
 	struct llama_state *s = j->s;
-	uint32_t hd = j->hd, gqa = j->gqa, nkv = j->nkv;
+	uint32_t hd = j->hd, hdmax = j->hdmax, gqa = j->gqa, nkv = j->nkv;
 	int pos = j->pos, t0 = j->t0;
 	uint64_t h = h0, end = h0 + nh;
 	const float *kbase, *vbase;
@@ -1682,11 +1971,12 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			vbase = s->vcache + b;
 			kstride = j->kvdim;
 		} else {
-			size_t b = (size_t)(j->l * nkv + kvh) * s->n_ctx * hd;
+			size_t b = (size_t)(j->l * nkv + kvh) * s->n_ctx
+				 * hdmax;
 
 			kbase = s->kcache + b;
 			vbase = s->vcache + b;
-			kstride = hd;
+			kstride = hdmax;
 		}
 		n = (unsigned)(g1 - g0);
 		h = g1;
@@ -1782,10 +2072,9 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 {
 	const struct llama_model *m = s->m;
-	uint32_t hd = m->head_dim;
-	uint32_t kvdim = m->n_head_kv * hd;
+	uint32_t hdmax = m->head_dim;
 	uint32_t gqa = m->n_head / m->n_head_kv;
-	float scale = 1.0f / sqrtf((float)hd);
+	float scale = m->attn_scale;
 	static float *freqbuf;
 	static float *ropecs, *ropecs_swa;
 	const float *freqf = NULL;
@@ -1817,29 +2106,80 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 	if (m->rope_freqs) {
 		if (!freqbuf)
-			freqbuf = calloc(hd, sizeof(float));
+			freqbuf = calloc(hdmax, sizeof(float));
 		gguf_row_f32(m->rope_freqs, 0, freqbuf);
 		freqf = freqbuf;
 	}
 
 	if (!ropecs)
-		ropecs = calloc(hd, sizeof(float));
-	rope_table(ropecs, hd, pos, m->rope_base, freqf);
+		ropecs = calloc(hdmax, sizeof(float));
+	rope_table(ropecs, hdmax, pos, m->rope_base, freqf);
 	/*
 	 * The second table exists only when the two bases differ, which is
 	 * gemma3 and nothing else. Both are still one table a TOKEN, not one a
 	 * layer: theta depends on the base, the pair and the position.
 	 */
-	if (m->swa_pattern && m->rope_base_swa != m->rope_base) {
+	/*
+	 * ⚠ THE WINDOW TABLE IS ITS OWN LENGTH AND HAS NO FACTORS. gemma4
+	 * rotates 256 of a window layer's head against 512 of a full one, and
+	 * llama.cpp gives rope_freqs to the FULL layers only -- a window layer
+	 * gets the plain rotation. Handing it the full layers' factors would
+	 * scale a frequency table it was never built for.
+	 */
+	if ((m->swa_pattern || m->swa_arr) &&
+	    (m->rope_base_swa != m->rope_base ||
+	     m->head_dim_swa != m->head_dim)) {
 		if (!ropecs_swa)
-			ropecs_swa = calloc(hd, sizeof(float));
-		rope_table(ropecs_swa, hd, pos, m->rope_base_swa, freqf);
+			ropecs_swa = calloc(hdmax, sizeof(float));
+		rope_table(ropecs_swa, m->head_dim_swa, pos, m->rope_base_swa,
+			   NULL);
 	}
 
 	gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
 	if (m->embd_scale != 1.0f)
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] *= m->embd_scale;
+
+	/*
+	 * ⚠ gemma4's PER LAYER EMBEDDINGS, built once for the whole token.
+	 *
+	 *   pl[l][j] = ( proj[l][j] + tok[l][j] * sqrt(n_embd_pl) ) / sqrt(2)
+	 *
+	 * where proj is per_layer_model_proj applied to the SCALED embedding
+	 * and divided by sqrt(n_embd), then RMS normalised a layer at a time
+	 * against per_layer_proj_norm. tok is a row of a second embedding
+	 * table, n_embd_pl * n_layer wide, looked up by the same token.
+	 *
+	 * ⚠ THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
+	 * is n_embd_pl long and llama.cpp reshapes to [n_embd_pl][n_layer]
+	 * before normalising. Doing it over the concatenation would divide
+	 * every layer by every other layer's magnitude.
+	 */
+	if (m->n_embd_pl) {
+		uint32_t np = m->n_embd_pl, nl = m->n_layer, l, j;
+		float ts = sqrtf((float)np);
+		float ps = 1.0f / sqrtf((float)m->n_embd);
+		float half = 1.0f / sqrtf(2.0f);
+
+		gguf_row_f32(m->pl_tok_embd, (uint64_t)token, s->plb);
+		charsiu_act_set(&s->act, s->x, (int)m->n_embd);
+		matvec_again(s, m->pl_model_proj, s->pl);
+		for (l = 0; l < nl; l++) {
+			float *row = s->pl + (size_t)l * np;
+			float ss = 0.0f, sc;
+
+			for (j = 0; j < np; j++) {
+				row[j] *= ps;
+				ss += row[j] * row[j];
+			}
+			sc = 1.0f / sqrtf(ss / (float)np + m->rms_eps);
+			gguf_row_f32(m->pl_proj_norm, 0, s->plc);
+			for (j = 0; j < np; j++)
+				row[j] = (row[j] * sc * s->plc[j]
+					  + s->plb[(size_t)l * np + j] * ts)
+					 * half;
+		}
+	}
 	STAGE(ST_EMBD);
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
@@ -1851,8 +2191,18 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 * set_swa_pattern: with the gemma default of 6 that is five
 		 * window layers and then a full one, not one window in six.
 		 */
-		int swa = m->swa_pattern &&
-			  (l % m->swa_pattern) < m->swa_pattern - 1;
+		/*
+		 * ⚠ RESOLVED AT LOAD, not here. gemma3 states a period and
+		 * gemma4 states one flag a layer, and the forward pass should
+		 * not have to know which form the file used.
+		 */
+		int swa = L->swa;
+		/*
+		 * ⚠ THIS LAYER'S HEAD, not the model's. gemma4 is the first
+		 * architecture here whose layers disagree about it.
+		 */
+		uint32_t hd = L->head_dim;
+		uint32_t kvdim = m->n_head_kv * hd;
 		const float *cs = swa && ropecs_swa ? ropecs_swa : ropecs;
 		/*
 		 * A window layer may look at the last n_swa positions
@@ -1884,7 +2234,24 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 		STAGE(ST_NORM1);
 
-		matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k, L->wv, s->v);
+		/*
+		 * ⚠ A SHARED KV LAYER PROJECTS ONLY Q. gemma4's last layers
+		 * carry no attn_k and attend against an earlier layer's cache,
+		 * so asking matvec_pair for k and v would dereference NULL.
+		 * And where attn_v is absent but attn_k is not, V IS K -- that
+		 * is llama.cpp's `Vcur = Kcur`, not a missing projection.
+		 */
+		if (!L->wk) {
+			matvec(s, L->wq, s->xb, s->q);
+		} else if (!L->wv) {
+			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
+				    NULL, NULL);
+			memcpy(s->v, s->k,
+			       (size_t)m->n_head_kv * hd * sizeof(float));
+		} else {
+			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
+				    L->wv, s->v);
+		}
 		/*
 		 * ⚠ BEFORE ROPE, NOT AFTER. The bias is part of the projection;
 		 * rotating a biased vector is not the same as biasing a rotated
@@ -1906,15 +2273,26 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 */
 		if (L->q_norm) {
 			qk_norm(s->q, m->n_head, hd, L->q_norm, m->rms_eps);
-			qk_norm(s->k, m->n_head_kv, hd, L->k_norm, m->rms_eps);
+			if (L->wk)
+				qk_norm(s->k, m->n_head_kv, hd, L->k_norm,
+					m->rms_eps);
 		}
+		/*
+		 * ⚠ gemma4 NORMS V TOO, AND WITH NO GAIN. llama.cpp writes it
+		 * as a bare ggml_rms_norm rather than a build_norm, so there is
+		 * no weight to look for and nothing in the tensor list to
+		 * notice it by -- the only place it exists is the graph.
+		 */
+		if (m->v_norm && L->wk)
+			qk_norm(s->v, m->n_head_kv, hd, NULL, m->rms_eps);
 		STAGE(ST_QKV);
 
 		charsiu_note("rope on q", cur_layer, (unsigned long)m->n_head);
 		rope(s->q, m->n_head, hd, cs, m->rope_neox);
 		charsiu_note("rope on k", cur_layer,
 			     (unsigned long)m->n_head_kv);
-		rope(s->k, m->n_head_kv, hd, cs, m->rope_neox);
+		if (L->wk)
+			rope(s->k, m->n_head_kv, hd, cs, m->rope_neox);
 		charsiu_note("the kv cache copy", cur_layer,
 			     (unsigned long)kvdim);
 
@@ -1935,7 +2313,9 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 *
 		 * The VALUES are untouched, so this cannot move a token.
 		 */
-		if (kv_posmajor()) {
+		if (!L->wk) {
+			/* nothing of its own to store: it reads L->kv_from's */
+		} else if (kv_posmajor()) {
 			size_t off = ((size_t)l * s->n_ctx + pos) * kvdim;
 
 			memcpy(s->kcache + off, s->k, kvdim * sizeof(float));
@@ -1943,7 +2323,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		} else {
 			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
-					      * s->n_ctx + pos) * hd;
+					      * s->n_ctx + pos) * hdmax;
 
 				memcpy(s->kcache + off, s->k + kh * hd,
 				       hd * sizeof(float));
@@ -1954,8 +2334,11 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_ROPE);
 
 		{
-			struct attn_job aj = { s, l, pos, tlo, hd, kvdim, gqa,
-					       m->n_head_kv, scale };
+			struct attn_job aj = { s,
+					       L->kv_from >= 0
+					       ? (uint32_t)L->kv_from : l,
+					       pos, tlo, hd, hdmax, kvdim,
+					       gqa, m->n_head_kv, scale };
 
 			charsiu_note("attention: entering", cur_layer,
 				     (unsigned long)m->n_head);
@@ -2008,9 +2391,9 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
 		STAGE(ST_GATEUP);
 		if (m->ffn_gelu)
-			gelu_mul(s->hb, s->hb2, m->n_ff);
+			gelu_mul(s->hb, s->hb2, L->n_ff);
 		else
-			silu_mul(s->hb, s->hb2, m->n_ff);
+			silu_mul(s->hb, s->hb2, L->n_ff);
 		STAGE(ST_SILU);
 		matvec(s, L->down, s->hb, s->xb2);
 		STAGE(ST_DOWN);
@@ -2019,6 +2402,63 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				m->rms_eps);
 		for (uint32_t i = 0; i < m->n_embd; i++)
 			s->x[i] += s->xb2[i];
+
+		/*
+		 * ⚠ gemma4's PER LAYER EMBEDDING, and it is a RESIDUAL of its
+		 * own rather than a replacement:
+		 *
+		 *   g = gelu(per_layer_inp_gate . x)      [n_embd_pl]
+		 *   g = g * pl[l]                          elementwise
+		 *   x = x + rmsnorm(per_layer_proj . g, per_layer_post_norm)
+		 *
+		 * This is the whole of what "E2B" means -- the model carries
+		 * far more parameters than it activates and this is the path
+		 * that chooses, per layer and per token, which of them matter.
+		 * Leaving it out gives a model that loads, runs and answers,
+		 * with every layer missing the half of itself that the name is
+		 * about.
+		 */
+		if (L->pl_inp_gate) {
+			uint32_t np = m->n_embd_pl, i;
+			const float *plr = s->pl + (size_t)l * np;
+
+			matvec(s, L->pl_inp_gate, s->x, s->plc);
+			for (i = 0; i < np; i++) {
+				float g = s->plc[i];
+
+				g = 0.5f * g * (1.0f + tanhf(0.7978845608028654f
+						* (g + 0.044715f * g * g * g)));
+				s->plc[i] = g * plr[i];
+			}
+			matvec(s, L->pl_proj, s->plc, s->xb2);
+			if (L->pl_post_norm)
+				rmsnorm(s->xb2, s->xb2, L->pl_post_norm,
+					m->n_embd, m->rms_eps);
+			for (i = 0; i < m->n_embd; i++)
+				s->x[i] += s->xb2[i];
+		}
+		/*
+		 * One scalar the whole layer output is multiplied by. f32 and
+		 * one element; read it through gguf_row_f32 rather than
+		 * assuming the type, the way every other gain here is read.
+		 */
+		if (L->out_scale) {
+			float sc = 1.0f;
+
+			gguf_row_f32(L->out_scale, 0, &sc);
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				s->x[i] *= sc;
+		}
+		if (dbg_layers()) {
+			double n2 = 0.0;
+			uint32_t i;
+
+			for (i = 0; i < m->n_embd; i++)
+				n2 += (double)s->x[i] * s->x[i];
+			fprintf(stderr, "  layer %2u  swa=%d hd=%3u ff=%5u "
+				"kv=%2d  |x| = %.4f\n", l, L->swa, hd, L->n_ff,
+				L->kv_from, sqrt(n2 / m->n_embd));
+		}
 		STAGE(ST_RES2);
 	}
 

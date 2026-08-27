@@ -596,6 +596,7 @@ int main(int argc, char **argv)
 	fprintf(stderr, "  chat format: %s\n",
 		CHAT == CHAT_PHI3  ? "phi3"  :
 		CHAT == CHAT_GEMMA ? "gemma" :
+		CHAT == CHAT_GEMMA4 ? "gemma4" :
 		CHAT == CHAT_CHATML ? "chatml" : "llama3");
 	if (!MODEL_NAME[0] || !strcmp(MODEL_NAME, "charsiu")) {
 		const char *b = strrchr(path, '/');

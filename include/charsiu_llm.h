@@ -34,7 +34,7 @@ enum gguf_vtype {
 /* ggml tensor types, only the ones this reads. */
 enum ggml_type {
 	GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3,
-	GGML_Q8_0 = 8, GGML_Q6_K = 14,
+	GGML_Q8_0 = 8, GGML_Q6_K = 14, GGML_BF16 = 30,
 };
 
 struct gguf_kv {
@@ -280,7 +280,20 @@ const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
  * tokenizer.chat_template, which is far more than this can run, but the
  * markers themselves are tokens, so ask the vocabulary which family it is.
  */
-enum chat_fmt { CHAT_LLAMA3 = 0, CHAT_CHATML = 1, CHAT_PHI3 = 2, CHAT_GEMMA = 3 };
+enum chat_fmt {
+	CHAT_LLAMA3 = 0, CHAT_CHATML = 1, CHAT_PHI3 = 2, CHAT_GEMMA = 3,
+	/*
+	 * ⚠ gemma4 IS NOT gemma3's FORMAT. It opens a turn with <|turn> and
+	 * closes it with <turn|> -- the same four characters mirrored -- where
+	 * gemma3 used <start_of_turn> and <end_of_turn>, and neither of those
+	 * is in gemma4's vocabulary at all. A file whose markers are not found
+	 * falls through to Llama 3's headers, which is what E2B was being
+	 * handed: 75 tokens of <|start_header_id|> that the model has never
+	 * seen, and it still answered correctly, which is exactly how this
+	 * kind of mistake survives.
+	 */
+	CHAT_GEMMA4 = 4,
+};
 enum chat_fmt chat_format_of(const struct tokenizer *tk);
 /* one complete turn */
 size_t chat_turn(char *out, size_t max, enum chat_fmt f,
@@ -330,6 +343,41 @@ struct llama_layer {
 	 * NULL everywhere else.
 	 */
 	const struct gguf_tensor *attn_post_norm, *ffn_post_norm;
+	/*
+	 * ⚠ gemma4's PER LAYER EMBEDDING, which is where its "E2B" name comes
+	 * from: the model carries more parameters than it activates, and this
+	 * is the path that decides which. After the feed forward's residual a
+	 * layer gates itself against a slice of a second embedding table, and
+	 * the result is added back.
+	 *
+	 * NULL on every other architecture, including gemma3.
+	 */
+	const struct gguf_tensor *pl_inp_gate, *pl_proj, *pl_post_norm;
+	/* one scalar the whole layer output is multiplied by, gemma4 only */
+	const struct gguf_tensor *out_scale;
+	/*
+	 * ⚠ PER LAYER ROPE FACTORS, and only the FULL attention layers have
+	 * them. gemma4 gives its window layers a plain rotation and its global
+	 * ones a scaled one, which is a second axis on top of the two bases
+	 * gemma3 already needed.
+	 */
+	const struct gguf_tensor *rope_freqs;
+	/*
+	 * ⚠ gemma4 GIVES EVERY LAYER ITS OWN SHAPE. feed_forward_length is an
+	 * ARRAY -- 6144 for its first fifteen layers and 12288 after -- and a
+	 * window layer's head is 256 where a full layer's is 512. Nothing
+	 * before this had either, so n_ff and head_dim were model wide and are
+	 * still the fallback: a layer that says nothing takes the model's.
+	 */
+	uint32_t n_ff, head_dim;
+	/*
+	 * ⚠ WHICH LAYER'S KV THIS ONE READS. gemma4 shares the cache: the
+	 * layers past attention.shared_kv_layers have no wk or wv at all and
+	 * attend against an earlier layer's. -1 means its own.
+	 */
+	int kv_from;
+	/* 1 when this layer's attention only sees the last n_swa positions */
+	int swa;
 	const struct gguf_tensor *ffn_norm;
 	const struct gguf_tensor *gate, *up, *down;
 	/*
@@ -369,6 +417,14 @@ struct llama_model {
 	 * rope_base (1000000), so a token needs two angle tables, not one.
 	 */
 	uint32_t n_swa, swa_pattern;
+	/*
+	 * ⚠ gemma4 writes sliding_window_pattern as an ARRAY, one flag a
+	 * layer, where gemma3 writes a scalar period. When this is set it wins:
+	 * gemma4's pattern is not periodic and a period cannot express it.
+	 */
+	const struct gguf_kv *swa_arr;
+	/* and feed_forward_length, which gemma4 also writes one a layer */
+	const struct gguf_kv *ff_arr;
 	float rope_base_swa;
 
 	/* logits -> tanh(logits / c) * c. 0 turns it off. */
@@ -377,6 +433,31 @@ struct llama_model {
 	float embd_scale;
 	/* gemma's feed forward is GELU where llama's is SiLU */
 	int ffn_gelu;
+	/* gemma4 RMS normalises V as well, with no gain */
+	int v_norm;
+
+	/*
+	 * ⚠ THE ATTENTION SCALE IS NOT ALWAYS 1/sqrt(head_dim). gemma4 sets it
+	 * to 1.0 -- its python calls that self.scaling = 1.0 -- and folds the
+	 * scaling into the QK norms instead. Getting this wrong does not crash
+	 * and does not look wrong; it flattens or sharpens every softmax in
+	 * the model by a constant.
+	 */
+	float attn_scale;
+
+	/* ---- gemma4's per layer embeddings, or 0 and NULL everywhere else --- */
+	uint32_t n_embd_pl;                    /* per layer embedding width */
+	const struct gguf_tensor *pl_tok_embd; /* [n_embd_pl * n_layer][vocab] */
+	const struct gguf_tensor *pl_model_proj;
+	const struct gguf_tensor *pl_proj_norm;
+	/*
+	 * ⚠ A SWA LAYER MAY HAVE A DIFFERENT HEAD LENGTH from a full one.
+	 * gemma4 declares attention.key_length_swa separately, and the KV cache
+	 * has to be sized for the larger of the two.
+	 */
+	uint32_t head_dim_swa;
+	/* layers from this index up read an earlier layer's KV cache */
+	uint32_t n_layer_kv;
 	float rms_eps, rope_base;
 
 	const struct gguf_tensor *tok_embd;
@@ -404,6 +485,8 @@ struct llama_state {
 	float *k, *v;          /* n_head_kv * head_dim */
 	float *att;            /* n_head * n_ctx */
 	float *logits;         /* n_vocab */
+	/* gemma4's per layer embeddings: [n_layer][n_embd_pl], and scratch */
+	float *pl, *plb, *plc;
 
 	struct charsiu_act act; /* the activation, quantised once per matvec */
 

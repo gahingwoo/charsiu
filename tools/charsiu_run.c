@@ -225,7 +225,8 @@ int main(int argc, char **argv)
 	 * above; the others are unchanged, and an explicit --sys wins over both.
 	 */
 	if (!sys)
-		sys = (fmt == CHAT_PHI3 || fmt == CHAT_GEMMA) ?
+		sys = (fmt == CHAT_PHI3 || fmt == CHAT_GEMMA ||
+		       fmt == CHAT_GEMMA4) ?
 		      "" : "You are a helpful assistant.";
 
 	if (show_info) {

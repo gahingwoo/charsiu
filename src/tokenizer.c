@@ -323,6 +323,34 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 		if (tk->type[i] == 3 || tk->type[i] == 4)
 			tk->special[tk->n_special++] = (int32_t)i;
 
+	/*
+	 * ⚠⚠ gemma4 HAS BOTH, AND THE SCORES ARE THE ONES TO USE.
+	 *
+	 * Its tokenizer.ggml.model is "gemma4", which llama.cpp reads as BPE
+	 * with escape_whitespaces on: spaces become U+2581 the way
+	 * SentencePiece does them, and the pieces are NOT GPT-2 byte encoded.
+	 * charsiu's BPE path assumes that byte map, so taking it here printed
+	 * "▁the" and "▁Colgate" as literal text.
+	 *
+	 * The SPM path already escapes and decodes exactly right, and its
+	 * greedy bigram merge orders by the merged piece's SCORE -- which in
+	 * this file is minus a rank, so the highest score is the lowest rank,
+	 * which is the order BPE merges in. The two arrive at the same
+	 * segmentation from the two halves of the same table.
+	 *
+	 * ⚠ THIS IS A CLAIM THAT CAN BE WRONG, and tools/tokenizer_roundtrip.c
+	 * is where it gets checked: a file whose scores are not ranks would
+	 * segment differently and the round trip would still pass, so the
+	 * check that matters is the model answering in words.
+	 */
+	{
+		char tmodel[32] = "";
+
+		gguf_get_str(g, "tokenizer.ggml.model", tmodel, sizeof(tmodel));
+		if (!strcmp(tmodel, "gemma4"))
+			merges = NULL;
+	}
+
 	if (merges && merges->type == GGUF_V_ARRAY && merges->arr_type == GGUF_V_STRING) {
 		uint64_t total = 0;
 		const uint8_t *q = merges->arr;
@@ -453,6 +481,8 @@ enum chat_fmt chat_format_of(const struct tokenizer *tk)
 	if (tokenizer_find(tk, "<|end|>") >= 0 &&
 	    tokenizer_find(tk, "<|assistant|>") >= 0) return CHAT_PHI3;
 	if (tokenizer_find(tk, "<start_of_turn>") >= 0) return CHAT_GEMMA;
+	if (tokenizer_find(tk, "<|turn>") >= 0 &&
+	    tokenizer_find(tk, "<turn|>") >= 0) return CHAT_GEMMA4;
 	return CHAT_LLAMA3;
 }
 
@@ -493,6 +523,13 @@ size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 			"<start_of_turn>%s\n%s<end_of_turn>\n",
 			gemma_role(role), text);
 	}
+	/* gemma4: <|turn>role, then the text, then <turn|> */
+	if (f == CHAT_GEMMA4) {
+		if (!strcmp(role, "system"))
+			return 0;
+		return (size_t)snprintf(out, max, "<|turn>%s\n%s<turn|>\n",
+					gemma_role(role), text);
+	}
 	if (f == CHAT_PHI3)
 		return (size_t)snprintf(out, max, "<|%s|>\n%s<|end|>\n", role, text);
 	if (f == CHAT_CHATML)
@@ -507,6 +544,9 @@ size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
 	if (f == CHAT_GEMMA)
 		return (size_t)snprintf(out, max, "<start_of_turn>%s\n",
 					gemma_role(role));
+	if (f == CHAT_GEMMA4)
+		return (size_t)snprintf(out, max, "<|turn>%s\n",
+					gemma_role(role));
 	if (f == CHAT_PHI3)
 		return (size_t)snprintf(out, max, "<|%s|>\n", role);
 	if (f == CHAT_CHATML)
@@ -518,6 +558,7 @@ size_t chat_open(char *out, size_t max, enum chat_fmt f, const char *role)
 size_t chat_close(char *out, size_t max, enum chat_fmt f)
 {
 	return (size_t)snprintf(out, max,
+				f == CHAT_GEMMA4 ? "<turn|>\n" :
 				f == CHAT_GEMMA  ? "<end_of_turn>\n" :
 				f == CHAT_PHI3   ? "<|end|>\n" :
 				f == CHAT_CHATML ? "<|im_end|>\n" : "<|eot_id|>");

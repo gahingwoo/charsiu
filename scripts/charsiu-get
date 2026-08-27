@@ -98,6 +98,7 @@ qwen3-4b-q4|unsloth/Qwen3-4B-Instruct-2507-GGUF|Qwen3-4B-Instruct-2507-Q4_0.gguf
 gemma3-270m-q8|unsloth/gemma-3-270m-it-GGUF|gemma-3-270m-it-Q8_0.gguf|278|tiny, and it still answers
 gemma3-1b-q4|unsloth/gemma-3-1b-it-GGUF|gemma-3-1b-it-Q4_0.gguf|689|32K context on a 512 sliding window
 gemma3-4b-q4|unsloth/gemma-3-4b-it-GGUF|gemma-3-4b-it-Q4_0.gguf|2260|check the card has room; the text half only
+gemma4-e2b-q4|ggml-org/gemma-4-E2B-it-GGUF|gemma-4-E2B-it-Q4_0.gguf|2710|per-layer embeddings; 2B of a 4.6B model is active
 ZOO
 }
 
@@ -106,6 +107,7 @@ ZOO
 known_bad() {
 cat <<'BAD'
 gemma2|gemma2|measured: gemma-2-2b-it softcaps the attention scores, not just the logits
+gemma4-moe|gemma4|the 26B-A4B is a mixture of experts; E2B and E4B are dense and do run
 BAD
 }
 

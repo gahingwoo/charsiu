@@ -62,6 +62,15 @@ struct type_traits {
 	unsigned size;
 };
 
+/* bf16 is f32's top half: put it back and the bottom sixteen bits are zero */
+static inline float bf16_to_float(uint16_t h)
+{
+	union { uint32_t u; float f; } v;
+
+	v.u = (uint32_t)h << 16;
+	return v.f;
+}
+
 static const struct type_traits g_traits[] = {
 	[GGML_F32]  = { "f32",  1,   4 },
 	[GGML_F16]  = { "f16",  1,   2 },
@@ -69,6 +78,16 @@ static const struct type_traits g_traits[] = {
 	[GGML_Q4_1] = { "q4_1", 32, 20 },
 	[GGML_Q8_0] = { "q8_0", 32, 34 },
 	[GGML_Q6_K] = { "q6_K", 256, 210 },
+	/*
+	 * ⚠ bf16 IS f32 WITH THE BOTTOM SIXTEEN BITS THROWN AWAY, not a
+	 * different float. gemma4's per_layer_model_proj arrives as this and
+	 * nothing else in any file here has, which is why it is the only
+	 * non-quantised type that had to be added rather than already being
+	 * present: converting one is a shift, and reading it as f16 -- same
+	 * width, different exponent -- would give numbers that are wrong by
+	 * factors of 2^112 without anything failing.
+	 */
+	[GGML_BF16] = { "bf16", 1,   2 },
 };
 
 static const struct type_traits *traits_of(uint32_t t)
@@ -1346,6 +1365,17 @@ void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 		for (uint64_t r = 0; r < nrows; r++)
 			y[row0 + r] = dot_f16((const uint16_t *)(base + (row0 + r) * nc * 2), x, nc);
 		break;
+	case GGML_BF16:
+		for (uint64_t r = 0; r < nrows; r++) {
+			const uint16_t *w = (const uint16_t *)
+				(base + (row0 + r) * nc * 2);
+			float acc = 0.0f;
+
+			for (uint64_t i = 0; i < nc; i++)
+				acc += bf16_to_float(w[i]) * x[i];
+			y[row0 + r] = acc;
+		}
+		break;
 	case GGML_Q8_0:
 		for (uint64_t r = 0; r < nrows; r++)
 			y[row0 + r] = dot_q8_0((const struct block_q8_0 *)(base + (row0 + r) * nc / 32 * 34), x, nc / 32);
@@ -1383,6 +1413,13 @@ void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst)
 
 		for (uint64_t i = 0; i < nc; i++)
 			dst[i] = half_to_float(r[i]);
+		break;
+	}
+	case GGML_BF16: {
+		const uint16_t *r = (const uint16_t *)(base + row * nc * 2);
+
+		for (uint64_t i = 0; i < nc; i++)
+			dst[i] = bf16_to_float(r[i]);
 		break;
 	}
 	case GGML_Q8_0: {
