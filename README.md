@@ -109,6 +109,12 @@ close to it:
 | dense, **many rows** | M=224 K=64 N=64 | 14313 of 14336, none off by more than 1 |
 | dense, a whole 56x56 surface | **M=3136 K=33 N=64** | 200344 of 200704, 51 off by more than 1 |
 
+⚠ **The last two rows are the int8 output path, not the accumulator one.** They were
+measured by `charsiu_matmul`, which requantises to int8 and reads the result as a
+surface. The runtime's decode path sets `acc_out` for the raw int32 accumulator and
+reads it flat, and on that path nothing above one row has ever been correct. Do not
+read these two rows as "m > 1 works"; they say it works in the path they measured.
+
 **The rows above M = 1 were wrong for 36 rounds and the hardware was not.** The
 output surface is `[n/atom][m][n%atom]`, the mirror of the input's, and at M = 1
 that expression collapses to exactly `n`. So a row major reading was right at one
@@ -1329,23 +1335,40 @@ that is **128 entries against 2560**. Mesa's over-budget test needs m > 320, its
 needs m > 640, and its row-window path needs a surface at least 112 wide. Mesa does
 not split these shapes either, so not splitting is not the difference.
 
-**What the record does partition on is `surf`.** Every shape this tree has ever
-computed correctly above one row -- M = 224 at K = 64, and M = 3136 at K = 33, both in
-the table near the top of this file -- has `charsiu_entries_per_row() == 1`. Every
-shape that fails is K = 256 or K = 512, which are surf 4 and surf 8. There is no
-measurement at surf 2 anywhere, and none at surf > 1 that ever worked at any m.
+**It is not `surf` either, and the control said so.** The reading before that was
+that every shape ever correct above one row has `charsiu_entries_per_row() == 1`, so
+the axis is entries per row rather than m. The rule was written down before the run:
+K = 48 and K = 64 are surf 1 and have to be exact at m = 2 and m = 4, or the axis is
+not surf. They were not.
 
-That is a narrower claim than "M > 1 is broken", which M = 3136 computing 99.8% of a
-56x56 surface already contradicts. The statement that survives the whole record is
-**entries per row above one is broken once there is more than one row**. `surf` is the
-stride between staged rows -- it reaches the hardware as `surf * rows` in `0x1028` --
-so at surf 1 a wrong multiplier is invisible however many rows there are. It is also
-why `CHARSIU_ENTRY_ATOMICS=8` changed nothing: at K = 256 it takes surf from 4 to 2.
+```
+     K  surf   m   exact of      all values present
+    48     1   2       8 of 128       99 of 128
+    64     1   2       8 of 128       97 of 128
+   128     2   2       8 of 128       93 of 128
+   256     4   2       8 of 128       92 of 128
+  1024    16   2       8 of 128       95 of 128
+```
 
-`npu_gemm_test K N --surf` walks K with N and m held, in one process and one build,
-which matters because the surf 1 successes were measured ten days before the surf 4
-failures. K = 48 and K = 64 are the control and have to be exact at m = 2 and m = 4;
-K = 80 and K = 128 are surf 2, which nothing has ever measured.
+Flat from surf 1 to surf 16, **8 words exact at m = 2 and 8 at m = 4 at every K**. The
+`N + (N/4 + 12)(m - 1)` budget above fitted one K and does not survive the rest.
+
+**What the record was comparing is two different output paths.** M = 224 and M = 3136,
+the rows in the table near the top of this file, were measured by `charsiu_matmul`,
+which takes the requantised **int8** output and reads it as `[n/atom][m][n%atom]` with
+a 16 byte atom. Every m > 1 failure was measured by `npu_gemm_test`, which sets
+`acc_out = 1` for the **raw int32 accumulator** and reads it flat. Those are not the
+same experiment, and the runtime's decode path uses the accumulator, so the layout
+that matters above one row has never been established.
+
+⚠ The obvious guess is that the accumulator mirrors the same surface with a four word
+atom. It predicts 8 exact at m = 2, which is what the board wrote, and 16 at m = 4,
+where the board wrote 8. Right at one width and wrong at the next is what the last
+four rounds kept producing, so it is recorded and not acted on.
+
+The next run is both probes at one shape in one session: `charsiu_matmul 2 64 64`
+against `npu_gemm_test 64 64 --surf`, with `CHARSIU_OUT_ROWMAJOR=1` as the control
+that has to fail.
 
 ⚠ The test that measured all of this printed the opposite of its own data first: "1 of
 5 widths exact at N=16, the budget reading does not hold", while its own increment line
@@ -1420,7 +1443,21 @@ the 4.6B stored. What is left is the head, and it is **two fifths of the token
 on a CPU that reads at 6.5 GB/s**. At the board's measured rates that is about
 167 ms a token, or 6 tok/s, against Llama-3.2-1B's measured 60.4.
 
-### Why the output head was not routed, which was not what it looked like
+### The output head is routed now, and it was worth 49 ms a token
+
+```
+                    before      after
+  output head       49.81 ms    11.53 ms      44.2% of the token -> 15.6%
+  a token          112.7  ms    73.9  ms
+  generation         8.76 tok/s 13.07 tok/s
+  weights           6.16 GB/s   7.18 GB/s
+```
+
+Same prompt, same tokens, on a ROCK 4D. Staging is also out of the prompt figure
+now, so the same run reads `staging 15081 ms | prompt 6 tok in 829 ms, 7.24 tok/s`
+where it used to charge all fifteen seconds of quantising to prefill and report 0.92.
+
+### Why it was not routed before, which was not what it looked like
 
 The suspect was the coefficient buffer. `charsiu_coef_bytes` bounds the
 coefficient surface by `k*n`, which makes it four times the weight buffer and
@@ -1433,7 +1470,8 @@ bytes against 20800 -- and nothing has ever measured the read growing with
 **It was not the coefficient buffer.** The shipped runner has passed
 `CHARSIU_COEF_ELEMS=65536` all along, which puts the same head at 10.5 MB. What
 refused it was `maxn`: the config default was 131072, chosen to clear Llama
-3.2's 128256 vocabulary, and gemma3's is 262144. The runtime clamps the cap to
+3.2's 128256 vocabulary, and gemma3's is 262144. Raising it is the whole fix, and
+the table above is the result. The runtime clamps the cap to
 the model's own vocabulary anyway, so a wider number costs nothing, and the one
 reason to keep a wide head off -- it used to share one output buffer with every
 other tensor, so all 113 matvecs a token paid for its size -- stopped being true

@@ -56,7 +56,7 @@ symptom.
 
 ### The CBUF split is not it, and the arithmetic says so without a board
 
-The step this section named next was: Mesa splits a task's staged rows when
+The step this section once named next was: Mesa splits a task's staged rows when
 `(cbuf_rows + staged) * entries_per_slice > total_entries` and charsiu never checks.
 Put the numbers in and it cannot fire.
 
@@ -66,80 +66,93 @@ The RK3576 CBUF is 16 banks of 512 entries; Mesa's own budget is five banks usab
 and ten total. At m = 8 and K = 1024 that is **128 entries against 2560**. The
 over-budget test needs m > 320 and the split test needs m > 640; the row-window path
 needs `input_width >= 112`, and this shape is one wide. **Mesa does not split these
-either.** Not splitting is not the difference.
+either.** That much still stands.
 
-### What the record actually partitions on: `surf`, not `m`
+### And `surf` is not it either. The control failed.
 
-Every shape this tree has ever computed correctly above one row:
+The next step after that was: every shape ever correct above one row has
+`charsiu_entries_per_row() == 1`, so the axis is entries per row rather than m. The
+rule was stated before the run -- K = 48 and K = 64 are surf 1 and have to be exact
+at m = 2 and m = 4, or the axis is not surf. **They were not.**
 
-| shape | surf | result |
-|---|---|---|
-| M=224 K=64 N=64 | **1** | 14313 of 14336, none off by more than 1 |
-| M=3136 K=33 N=64 | **1** | 200344 of 200704, 51 off by more than 1 |
+```
+     K  surf   m   exact of      all values present
+    48     1   2       8 of 128       99 of 128
+    64     1   2       8 of 128       97 of 128
+   128     2   2       8 of 128       93 of 128
+   256     4   2       8 of 128       92 of 128
+  1024    16   2       8 of 128       95 of 128
+```
 
-Every shape that fails is K = 256 or K = 512, which are `surf` **4** and **8**. There
-is no measurement at surf 2 anywhere, and **no measurement at surf > 1 that ever
-worked at any m**.
+Flat across the whole sweep, surf 1 to surf 16. **8 words exact at m = 2 and 8 at
+m = 4, at every K.** Whatever this is, it does not scale with K, and the `written =
+N + (N/4 + 12)(m - 1)` budget that fitted one K does not survive the others either.
 
-So "M > 1 is broken" is contradicted by M = 3136 computing 99.8% of a 56x56 surface,
-and the statement that survives the whole record is narrower: **entries per row above
-one is broken once there is more than one row.** `surf` is the stride between staged
-rows -- it goes into `0x1028` as `surf * rows` -- and at surf 1 a wrong multiplier is
-invisible however many rows there are, which is exactly the shape of a fault that
-hides at m = 1 and hides again at K = 64.
+### What the record was actually comparing: two different output paths
 
-It also explains the one result that had no explanation: `CHARSIU_ENTRY_ATOMICS=8`
-changed nothing because at K = 256 it takes surf from 4 to 2, and 2 is not 1.
+The shapes that computed correctly above one row -- M = 224 at K = 64, M = 3136 at
+K = 33 -- were measured by `tools/charsiu_matmul.c`, which takes the **requantised
+int8 output** and reads it as `[n/atom][m][n%atom]` with a 16 byte atom. Every m > 1
+failure was measured by `tools/npu_gemm_test.c`, which sets `acc_out = 1` for the
+**raw int32 accumulator** and reads it flat.
 
-**Next**: `npu_gemm_test K N --surf` walks K itself with N and m held (the K argument is ignored), so surf is the only
-thing moving, and it does it in **one process and one build** -- the surf 1 successes
-were measured on 2026-08-16 and the surf 4 failures ten days later, which is the one
-way this partition could still be two different faults wearing one name.
+They have never run the same experiment. The runtime's decode path uses `acc_out`,
+so the layout that matters has never been established above one row, and the layout
+that was established does not apply to it.
 
-**Control**: K = 48 and K = 64 are surf 1 and have to be exact at m = 2 and m = 4. If
-they are not, the axis is not surf and the table means nothing. K = 80 and K = 128 are
-surf 2, which nothing has ever measured, and they are what says whether the boundary
-is "surf 1" or "surf small".
+⚠ The obvious guess is that the accumulator mirrors the same surface with a four
+word atom. It predicts 8 exact at m = 2, which is what the board wrote, and 16 at
+m = 4, where the board wrote 8. Right at one width and wrong at the next is the same
+shape of wrong answer the last four rounds produced, so it is written down here and
+not acted on.
 
-**If it holds**, a batched prefill has a cheap route that needs no new register: K is
-already sliced by KMAX and `acc_out` sums int32 across slices exactly, so a KMAX that
-keeps surf at 1 (64 for int8, 32 for fp16) makes every slice a working shape. That
-buys many more tasks per projection, which at m = 32 is paid for thirty two times
-over.
+**Next**: run both probes at the same shape in one session, `charsiu_matmul 2 64 64`
+against `npu_gemm_test 64 64 --surf`. If the int8 path is exact at m = 2 where the
+accumulator path is not, then m > 1 is a reading problem in the accumulator path
+rather than a hardware wall, and the search collapses to one address function with a
+control that already works. If the int8 path fails too, the README's own table is
+stale and that has to be said.
 
-## 2. The output head, which is two fifths of a gemma token
+**Control**: `CHARSIU_OUT_ROWMAJOR=1 charsiu_matmul 2 64 64` reads the same run flat.
+It has to fail where the surface reading passes, or the surface reading is not doing
+any work.
 
-262144 wide, 151 MB every token, and on the CPU: the stage table for gemma3 charges
-it 49.8 ms of a 113 ms token, at 3 GB/s, where the NPU moves weights at 6 to 10.
+## 2. The output head: routed, and it was worth 49 ms a token. DONE
 
-**It was not the coefficient bound.** The shipped runner already passes
-`CHARSIU_COEF_ELEMS=65536`, which puts the head's coefficients at 10.5 MB and well
-inside what allocates. What refused it was `maxn`: the config default was 131072,
-picked to clear llama 3.2's 128256 vocabulary, and gemma3's is 262144.
+gemma3's head is 262144 wide and was spending 49.8 ms of a 113 ms token on the CPU.
+It is on the NPU now, and the tokens are identical:
 
-Two things made that cost four board rounds to see:
+```
+                    before      after
+  output head       49.81 ms    11.53 ms      44.2% of the token -> 15.6%
+  a token          112.7  ms    73.9  ms
+  generation         8.76 tok/s 13.07 tok/s
+  tensors staged      182         183
+  slices              468         532
+  weights           6.16 GB/s   7.18 GB/s
+```
 
-- the runtime declined **silently**. Every other refusal in npudev whines once per
-  reason; this gate only spoke under `CHARSIU_NPU_VERBOSE`. All three silent paths
-  now say which tensor, why, and which setting to change.
-- the round that set `CHARSIU_NPU_MAXN=262144` on the command line **did not set it**.
-  `charsiu run` builds its environment from config.ini and passes it through
-  `env NAME=VALUE`, which is put in front of the inherited environment, so the
-  config's 131072 overwrote the caller's 262144 without a word. The config is the
-  default now and the environment is the override.
+**It was not the coefficient bound**, which is what this section said for four
+rounds. The shipped runner has passed `CHARSIU_COEF_ELEMS=65536` all along, putting
+the head's coefficients at 10.5 MB. What refused it was `maxn`, defaulted to 131072
+to clear Llama 3.2's 128256 vocabulary against gemma3's 262144, and two things kept
+that invisible: the gate was the only refusal in the runtime that did not say why,
+and the round that set `CHARSIU_NPU_MAXN` on the command line did not set it, because
+`charsiu run` built its environment from config.ini and handed it to `env NAME=VALUE`
+in front of the caller's.
 
-**Next**: a board round with `charsiu run gemma-3-1b-it-Q4_0.gguf` and nothing else,
-on a config that has the new `maxn = 262144`. If the head routes, the token should
-lose most of 49.8 ms and gemma3 should go from 8.76 tok/s to somewhere near 12.
+Prefill is also a real number now rather than a slander: staging is built lazily
+inside the first forward pass, so all 15 seconds of it were charged to the prompt.
+Reported separately, the same run reads `staging 15081 ms | prompt 6 tok in 829 ms,
+7.24 tok/s` where it used to read 0.92.
 
-The coefficient bound is still a guess and still worth measuring, but it is no longer
-in the way of anything.
+⚠ One number to keep an eye on. 151 MB of int4 head in 11.5 ms is 13.1 GB/s, which is
+above the 10.8 GB/s this board's DRAM roof was measured at. Either the roof is higher
+for this access pattern or the stage timer is not charging the head everything it
+costs. The tokens are right either way, so this is a measurement question.
 
-**Control**: `npu_gemm_test K N --coef` walks the bound downward and stops at the
-first value that is not exact. ⚠ It walks DOWN because under-allocating does not
-return an error -- the RDMA reads past the buffer, the IOMMU faults, and the job times
-out with every register correct. The last exact value is the floor; everything below
-it is unexplored rather than known bad.
+The coefficient bound is still a guess and still unmeasured; `npu_gemm_test K N
+--coef` walks it down. It is no longer in the way of anything.
 
 ## 2b. gemma3 runs the NPU at 6.16 GB/s where llama reaches 10.3
 
