@@ -27,6 +27,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
@@ -167,6 +168,8 @@ struct charsiu_npu {
 	struct charsiu_bo bin[2], bout[2], breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	float *bscr;               /* m rows of one slice's K, gathered */
+	uint8_t *bq;               /* and quantised, for the int8 path */
+	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
 	/*
@@ -723,6 +726,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->afscr);
 	free(g->wpack);
 	free(g->bscr);
+	free(g->bq);
+	free(g->bd1);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1575,8 +1580,12 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m)
 		}
 	}
 	free(g->bscr);
+	free(g->bq);
+	free(g->bd1);
 	g->bscr = malloc((size_t)g->kmax * m * sizeof(*g->bscr));
-	if (!g->bscr) {
+	g->bq = malloc((size_t)g->kmax * m);
+	g->bd1 = malloc((size_t)m * sizeof(*g->bd1));
+	if (!g->bscr || !g->bq || !g->bd1) {
 		whine(g, "the batch scratch would not allocate", g->kmax, m);
 		return -1;
 	}
@@ -1593,10 +1602,25 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
 		return -1;
-	if (!g->w4) {
-		whine(g, "batched is int4 only", 0, m);
-		return -1;
-	}
+	/*
+	 * ⚠⚠ int8 IS THE PATH THAT DOES MORE THAN ONE ROW, and that is not a
+	 * preference, it is the only thing on this board with evidence.
+	 *
+	 * npu_gemm_test is EXACT on the int8 accumulator at m = 1, 2, 4 and 8
+	 * and at every N from 32 to 2048. w4a16 produces ONE row and no
+	 * register makes it produce two: fed the same activation twice, row 1
+	 * comes back matching row 0 in 1 of 2048, and every word that differs
+	 * between the two streams has been put back one at a time -- the DPU
+	 * and RDMA blocks are identical to begin with, the CNA differences are
+	 * datatype scaling, CORE 0x301c is inert and 0x3018 is the arithmetic
+	 * switch. job.c has said since round 347 that the vendor runs w4a16 on
+	 * the WIDTH axis, and the vendor never batches a weight matmul at all,
+	 * so there is no M > 1 int4 stream anywhere to copy.
+	 *
+	 * Batching amortises the weight bytes over m rows, which is exactly
+	 * what makes int8's extra byte cheap: at m = 32 the same weights serve
+	 * thirty two rows either way.
+	 */
 	e = &g->ent[id];
 	if (e->n_npu != (unsigned)e->t->n) {
 		/* a CPU share would have to be batched too, and is not */
@@ -1647,7 +1671,36 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		 * occupies in the CBUF.
 		 */
 		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
-		{
+		if (!g->w4) {
+			/*
+			 * int8 takes a quantised activation and the scale is
+			 * per ROW, so each row is quantised over its own K
+			 * range and its d1 kept for the conversion at the end.
+			 */
+			for (unsigned r = 0; r < m; r++) {
+				float mx = 0.0f;
+
+				for (unsigned kk = 0; kk < sk; kk++) {
+					float v = fabsf(g->bscr[(size_t)r * sk + kk]);
+
+					if (v > mx)
+						mx = v;
+				}
+				g->bd1[r] = mx > 0.0f ? mx / 127.0f : 1.0f;
+				for (unsigned kk = 0; kk < sk; kk++) {
+					int q = (int)lrintf(g->bscr[(size_t)r * sk + kk]
+							    / g->bd1[r]);
+
+					if (q > 127) q = 127;
+					if (q < -127) q = -127;
+					g->bq[(size_t)r * sk + kk] =
+						(uint8_t)(q + 128);
+				}
+			}
+			charsiu_pack_input(&job.mm, g->bq, g->bin[d].map,
+					   (size_t)g->kmax * m,
+					   job.input_zero_point);
+		} else {
 			const char *ep = getenv("CHARSIU_BATCH_PACK");
 			int pk = ep ? atoi(ep) : 0;
 
@@ -1788,6 +1841,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		charsiu_bo_prep(g->dev[d], &g->bout[d], 2000000000);
 		{
 			const float *fo = (const float *)g->bout[d].map;
+			const int32_t *io = (const int32_t *)g->bout[d].map;
 			int grp = tensor_grouped(g, e->t);
 
 			/*
@@ -1884,9 +1938,12 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 						   + j % atom;
 					else
 						at = charsiu_acc_index(r, j, m);
-					v = fo[at];
+					/* int8 writes the raw accumulator and
+					 * carries the row's own d1 */
+					v = g->w4 ? fo[at]
+						  : (float)io[at] * g->bd1[r];
 					Y[(size_t)r * e->t->n + s->n0 + j] +=
-						grp ? v * s->sc[j] : v;
+						(g->w4 && grp) ? v * s->sc[j] : v;
 				}
 		}
 		if (!g->nofini)
@@ -1895,8 +1952,9 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	}
 	g->busy_us += now_us() - t0;
 
-	/* an ungrouped tensor is scaled once, per channel, at the end */
-	if (!tensor_grouped(g, e->t))
+	/* an ungrouped tensor is scaled once, per channel, at the end; int8
+	 * always is, because its d1 went in above */
+	if (!g->w4 || !tensor_grouped(g, e->t))
 		for (unsigned r = 0; r < m; r++)
 			for (unsigned j = 0; j < (unsigned)e->t->n; j++)
 				Y[(size_t)r * e->t->n + j] *= e->t->scale[j];
