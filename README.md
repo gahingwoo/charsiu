@@ -197,9 +197,12 @@ were wrong in this file before:
 ⚠ **The three paragraphs above are where this stood when the matmul was the whole
 question, and they are kept because the reasoning in them is still the reasoning.**
 What they say is left has since been done: models run, int4 computes end to end, and
-the numbers at the top of this file are measured rather than projected. What is still
-open is further down -- prefill above M = 1, and an output head that a stale width cap
-had been keeping on the CPU.
+the numbers at the top of this file are measured rather than projected. The two items
+this paragraph used to name as open have closed since -- prefill batches above M = 1,
+and the stale width cap that kept an output head on the CPU is gone. What is still
+open is narrower and further down: w4a16 computes exactly one row whatever it is
+asked for, so an int4 prompt gains only the skipped output head, and phi3 does not
+batch at all because its K and V arrive fused.
 
 One thing on that list has not moved: the reference still requantises in float where
 the hardware uses an integer scale and shift. It agrees to the byte on everything
