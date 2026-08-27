@@ -566,13 +566,28 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	       "     one row    batched  speedup  us a row\n");
 
 	/*
-	 * ⚠ THE ROW STEP SWEEP, at m = 2 and on one tensor, before the timings.
-	 * Row 0 is the control: it contributes nothing to the row term, so it
-	 * has to stay exact whatever the step, and a step that breaks it is
-	 * measuring something other than the step.
+	 * ⚠⚠ TWO AXES AND SEVEN READINGS, at m = 2 on one tensor, before any
+	 * timing.
+	 *
+	 * charsiu_acc_index is solved and confirmed on the int8 accumulator on
+	 * the HEIGHT axis: exact at every N to 2048 and every m to 8. The
+	 * runtime's path is w4a16 int4, and job.c has known since round 347
+	 * that the vendor puts M on the WIDTH axis for that one, and that at
+	 * M = 1 the two axes collapse -- which is why decode never noticed and
+	 * why the comment saying so sat there while I looked everywhere else.
+	 *
+	 * So the axis and the reading are one question with two knobs, and this
+	 * asks both at once rather than fitting either.
+	 *
+	 * ⚠ ROW 0 IS NOT A CONTROL HERE. On the wrong axis it is wrong too --
+	 * the last round read "row 0 is exact" off six of two thousand values
+	 * and spent itself on the one term row 0 cannot see. Both rows are
+	 * counted and both are printed.
 	 */
 	if (getenv("CHARSIU_BATCH_SWEEP")) {
-		static const int STEPS[] = { 8, 16, 32, 64, 128, 256, 0 };
+		static const char *READS[] = { "acc", "flat", "2", "4", "8",
+					       "16", "32" };
+		static const char *AXES[] = { "h", "w" };
 		unsigned i0 = 0;
 
 		while (i0 < s->n_npu && s->npu_id[i0] < 0)
@@ -595,32 +610,40 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					charsiu_npu_matvec(s->dev, s->npu_id[i0],
 						&a, Yref + (size_t)r * t->n);
 				}
-				printf("\n  row step sweep on %s at m=2"
-				       " (0 = charsiu_acc_index)\n", t->name);
-				for (unsigned q = 0; q < sizeof(STEPS)/sizeof(*STEPS); q++) {
-					char b[16];
-					unsigned ok0 = 0, ok1 = 0;
+				printf("\n  axis and reading, %s at m=2,"
+				       " %u channels a row\n",
+				       t->name, (unsigned)t->n);
+				printf("    axis  read     row0        row1\n");
+				for (unsigned ax = 0; ax < 2; ax++) {
+					if (AXES[ax][0] == 'w')
+						setenv("CHARSIU_M_AXIS", "w", 1);
+					else
+						unsetenv("CHARSIU_M_AXIS");
+					for (unsigned q = 0; q < sizeof(READS)/sizeof(*READS); q++) {
+						unsigned ok0 = 0, ok1 = 0;
 
-					snprintf(b, sizeof(b), "%d", STEPS[q]);
-					setenv("CHARSIU_BATCH_ROWSTEP", b, 1);
-					if (charsiu_npu_matmul(s->dev,
+						setenv("CHARSIU_BATCH_READ",
+						       READS[q], 1);
+						if (charsiu_npu_matmul(s->dev,
 							s->npu_id[i0], X, 2, Y))
-						continue;
-					for (unsigned j = 0; j < (unsigned)t->n; j++) {
-						double w0 = Yref[j], w1 = Yref[t->n + j];
+							continue;
+						for (unsigned j = 0; j < (unsigned)t->n; j++) {
+							double w0 = Yref[j];
+							double w1 = Yref[t->n + j];
 
-						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3
-						    ? fabs(w0) * 1e-3 : 1e-3)) ok0++;
-						if (fabs(Y[t->n + j] - w1) <= (fabs(w1) > 1e-3
-						    ? fabs(w1) * 1e-3 : 1e-3)) ok1++;
+							if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+							if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+						}
+						printf("      %s  %-5s  %5u/%-5u  %5u/%-5u%s\n",
+						       AXES[ax], READS[q],
+						       ok0, (unsigned)t->n,
+						       ok1, (unsigned)t->n,
+						       (ok0 == t->n && ok1 == t->n)
+						       ? "   <== both rows" : "");
 					}
-					printf("    step %4d   row0 %5u of %-5u"
-					       "   row1 %5u of %-5u%s\n",
-					       STEPS[q], ok0, (unsigned)t->n,
-					       ok1, (unsigned)t->n,
-					       ok1 == (unsigned)t->n ? "  <== that is it" : "");
 				}
-				unsetenv("CHARSIU_BATCH_ROWSTEP");
+				unsetenv("CHARSIU_BATCH_READ");
+				unsetenv("CHARSIU_M_AXIS");
 			}
 		}
 	}

@@ -1691,30 +1691,49 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			/*
 			 * ⚠ NOT CACHED IN A STATIC. The probe sweeps this
 			 * between calls in one process, and a value latched on
-			 * the first would make every later step a silent copy
+			 * the first would make every later call a silent copy
 			 * of the first -- which is how round 380's control ran
 			 * twice with the same geometry and nobody noticed until
 			 * the log was read. The same note is already on
-			 * entry_atomics() and I wrote this one anyway.
+			 * entry_atomics() and I wrote a static here anyway.
 			 */
-			const char *e8 = getenv("CHARSIU_BATCH_ROWSTEP");
-			int step = e8 ? atoi(e8) : 0;
+			/*
+			 * ⚠⚠ THE READ ORDER IS NOT SETTLED ON THIS PATH.
+			 *
+			 * charsiu_acc_index was solved and confirmed on the
+			 * int8 accumulator, on the HEIGHT axis, and it holds
+			 * there at every N up to 2048 and every m up to 8. The
+			 * runtime's int4 path is w4a16 and this file has known
+			 * since round 347 that the vendor puts M on the WIDTH
+			 * axis for it -- the comment above CORE 0x301c says so,
+			 * and says that at M = 1 the two axes collapse, which
+			 * is why decode never noticed.
+			 *
+			 * So the axis and the reading are two open questions
+			 * and CHARSIU_BATCH_READ is how a round asks them
+			 * together: acc for the solved expression, flat, or an
+			 * atom for a plain [n/atom][m][n%atom].
+			 */
+			const char *er = getenv("CHARSIU_BATCH_READ");
+			unsigned atom = 0;
+			int flat = 0;
+
+			if (er && !strcmp(er, "flat"))
+				flat = 1;
+			else if (er && *er >= '0' && *er <= '9')
+				atom = (unsigned)atoi(er);
 			for (unsigned r = 0; r < m; r++)
 				for (unsigned j = 0; j < sn; j++) {
 					size_t at;
 					float v;
 
-					if (step > 0) {
-						unsigned G = j / 32u, c = j % 32u;
-						unsigned aa = c / 16u, tt = c % 16u;
-
-						at = (size_t)G * m * 32u
-						   + (size_t)r * (unsigned)step
-						   + (tt / 4u) * 8u + aa * 4u
-						   + (tt % 4u);
-					} else {
+					if (flat)
+						at = (size_t)r * sn + j;
+					else if (atom)
+						at = (size_t)(j / atom) * m * atom
+						   + (size_t)r * atom + j % atom;
+					else
 						at = charsiu_acc_index(r, j, m);
-					}
 					v = fo[at];
 					Y[(size_t)r * e->t->n + s->n0 + j] +=
 						grp ? v * s->sc[j] : v;
