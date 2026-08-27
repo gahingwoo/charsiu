@@ -190,21 +190,26 @@ struct charsiu_npu {
 	 * built once and looked up.
 	 */
 	/*
-	 * ⚠⚠ THE READ ORDER INVERTED, so the BUFFER is walked in order.
+	 * ⚠⚠ BUILT ONCE, AT THE WIDEST SLICE THERE CAN BE.
 	 *
-	 * The forward map gathers: for one row it reads four contiguous words
-	 * and then jumps 8P of them, which at m = 32 is 512 bytes -- sixteen
-	 * bytes used out of every sixty four byte line. 283 ms of a 738 ms pass
-	 * went there, and putting it on the pool made it 463: 226 dispatches of
-	 * a few rows each is barrier latency, not throughput.
+	 * charsiu_acc_index costs four integer divisions and there is one
+	 * output element per call of it, so it is a table. What made the table
+	 * cost more than the loop it saved is that it was keyed on the tensor's
+	 * width and so REBUILT for every tensor: 113 of them twice over, each
+	 * m * n entries, which at m = 32 is most of the 283 ms the split
+	 * charged to reading.
 	 *
-	 * Inverted, fo is read straight through and Y is written scattered,
-	 * which is the cheaper way round. m fits a byte and a slice's channel
-	 * count fits a short.
+	 * charsiu_acc_index does not depend on n AT ALL -- it is
+	 * (ni/32)*(m*32) + (mi/P)*(32P) + j, and n appears nowhere. So one
+	 * table at nmax serves every tensor, and a narrower slice just uses
+	 * fewer of each row's entries. It is rebuilt only when m changes.
+	 *
+	 * ⚠ INDEX IT AT THE STRIDE IT WAS BUILT WITH, never at the slice's own
+	 * width. Doing that cost exactly one tensor -- the head, whose last n
+	 * slice is 5376 against 8192 -- and 3585 rows of 3616.
 	 */
-	uint8_t *bir;
-	uint16_t *bij;
-	unsigned bmap_m, bmap_n;
+	uint32_t *bmap;
+	unsigned bmap_m;
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
@@ -789,8 +794,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bscr);
 	free(g->bq);
 	free(g->bd1);
-	free(g->bir);
-	free(g->bij);
+	free(g->bmap);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1901,44 +1905,27 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	/* ⚠ both submitted, then both waited on: that is the point */
 	for (unsigned d = 0; d < g->ndev; d++) {
 		double tf = now_us();
-		unsigned wide = 0, nt;
+		unsigned nt;
 
 		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
 		g->bfence_us += now_us() - tf;
 		tf = now_us();
-		for (unsigned i = 0; i < e->count; i++)
-			if (g->slot[e->first + i].di == d &&
-			    g->slot[e->first + i].job.mm.n > wide)
-				wide = (unsigned)g->slot[e->first + i].job.mm.n;
-		if (wide) {
-			/*
-			 * ⚠ THE TABLE, NOT THE FUNCTION. charsiu_acc_index is
-			 * four integer divisions and the read runs it once per
-			 * output element -- 23 million in one m = 32 pass over
-			 * a 1B model. It depends on nothing but (m, n).
-			 */
-			if (g->bmap_m != m || g->bmap_n != wide) {
-				uint8_t *ir = realloc(g->bir, (size_t)m * wide);
-				uint16_t *ij = realloc(g->bij,
-						(size_t)m * wide * sizeof(*ij));
+		{
+			if (g->bmap_m != m) {
+				uint32_t *t2 = realloc(g->bmap,
+					(size_t)m * g->nmax * sizeof(*t2));
 
-				if (!ir || !ij) {
-					free(ir);
+				if (!t2) {
 					whine(g, "the read order table would not allocate",
-					      m, wide);
+					      m, g->nmax);
 					return -1;
 				}
-				g->bir = ir;
-				g->bij = ij;
+				g->bmap = t2;
 				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < wide; j++) {
-						size_t at = charsiu_acc_index(r, j, m);
-
-						g->bir[at] = (uint8_t)r;
-						g->bij[at] = (uint16_t)j;
-					}
+					for (unsigned j = 0; j < g->nmax; j++)
+						g->bmap[(size_t)r * g->nmax + j] =
+						  (uint32_t)charsiu_acc_index(r, j, m);
 				g->bmap_m = m;
-				g->bmap_n = wide;
 			}
 			nt = 0;
 			for (unsigned i = 0; i < e->count; i++) {
@@ -1964,18 +1951,26 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				 * instead cost exactly one tensor: 3585 rows of
 				 * 3616.
 				 */
-				for (size_t at = 0; at < (size_t)m * wide; at++) {
-					unsigned j = g->bij[at];
-					unsigned r = g->bir[at];
-					float v;
+				for (unsigned r = 0; r < m; r++) {
+					const uint32_t *mp = g->bmap
+							  + (size_t)r * g->nmax;
+					float *yr = Y + (size_t)r * e->t->n
+						  + s->n0;
 
-					if (j >= sn)
-						continue;
-					v = g->w4 ? fo[at]
-						  : (float)io[at]
-						    * g->bd1[(size_t)ki * m + r];
-					Y[(size_t)r * e->t->n + s->n0 + j] +=
-						(g->w4 && grp) ? v * s->sc[j] : v;
+					if (g->w4 && grp) {
+						const float *sc = s->sc;
+
+						for (unsigned j = 0; j < sn; j++)
+							yr[j] += fo[mp[j]] * sc[j];
+					} else if (g->w4) {
+						for (unsigned j = 0; j < sn; j++)
+							yr[j] += fo[mp[j]];
+					} else {
+						float d1 = g->bd1[(size_t)ki * m + r];
+
+						for (unsigned j = 0; j < sn; j++)
+							yr[j] += (float)io[mp[j]] * d1;
+					}
 				}
 				nt++;
 			}
