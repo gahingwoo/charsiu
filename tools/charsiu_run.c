@@ -443,12 +443,47 @@ int main(int argc, char **argv)
 	 * CHARSIU_NO_BATCH_PREFILL forces the token loop, which is the control
 	 * every round of this needs: the generated text has to be identical.
 	 */
-	if (getenv("CHARSIU_NO_BATCH_PREFILL") || n_ids < 2 ||
-	    llama_prefill_batch(st, &m, ids, n_ids, st->pos))
-		for (i = 0; i < n_ids; i++)
+	{
+		/*
+		 * ⚠ IN CHUNKS, BECAUSE THE BUFFERS SCALE WITH THE CHUNK. A
+		 * whole prompt as one batch means n rows of every intermediate
+		 * and n rows of the batched output buffer, which at a 512 token
+		 * prompt is tens of megabytes for nothing: the probe's own
+		 * sweep flattens after m = 16, so a longer batch buys almost no
+		 * rate and costs memory linearly.
+		 *
+		 * ⚠ AND THE FALLBACK IS DECIDED ONCE. If the first chunk is
+		 * refused the whole prompt goes through the token loop, rather
+		 * than half of it taking one path and half the other.
+		 */
+		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
+		int chunk = ec ? atoi(ec) : 32;
+		int done = 0;
+
+		if (chunk < 2)
+			chunk = 2;
+		if (!getenv("CHARSIU_NO_BATCH_PREFILL") && n_ids >= 2) {
+			int probe = n_ids < chunk ? n_ids : chunk;
+
+			if (!llama_prefill_batch(st, &m, ids, probe, st->pos)) {
+				done = probe;
+				while (done < n_ids) {
+					int c = n_ids - done < chunk
+					      ? n_ids - done : chunk;
+
+					if (c < 2 ||
+					    llama_prefill_batch(st, &m,
+							ids + done, c, st->pos))
+						break;
+					done += c;
+				}
+				logits = st->logits;
+			}
+		}
+		/* whatever is left, and everything if nothing was batched */
+		for (i = done; i < n_ids; i++)
 			logits = llama_forward(st, ids[i], st->pos);
-	else
-		logits = st->logits;
+	}
 	t_prompt = now_ms() - t0;
 
 	/*
