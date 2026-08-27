@@ -637,6 +637,41 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * nothing about surf at all.
  */
 /*
+ * ⚠⚠ THE ACCUMULATOR'S READ ORDER, SOLVED FROM THE BOARD'S OWN MAP.
+ *
+ * With 0x40b8 following the row count every wanted value is in the buffer --
+ * 128 of 128 at m=2, 256 of 256 at m=4, 512 of 512 at m=8 -- so the arithmetic
+ * is right and only the order is wrong. locate() printed where each one landed
+ * and this reproduces all 128 positions of that table with nothing left over.
+ *
+ * It is [n/32][m][32], a surface whose atom is 32 words, and inside each 32 the
+ * two sixteen channel halves interleave in groups of four:
+ *
+ *   c = ni % 32,  h = c/16,  q = (c%16)/4,  s = c%4
+ *   j = 8q + 4h + s
+ *
+ * so channels 0..3 then 16..19 then 4..7 then 20..23, and so on. That is why
+ * every plain [n/atom][m][n%atom] candidate scored partial marks: atom 32 gets
+ * the blocks right and the inside wrong, atom 4 gets the inside right and the
+ * blocks wrong.
+ *
+ * ⚠ 32, 16 and 4 are the constants this was solved at, on one shape. 16 is the
+ * feature atom and 4 is the words in sixteen bytes, so the shape of the guess
+ * is not arbitrary, but N = 64 is two super groups and m = 2 is two rows, and a
+ * formula fitted where two of its divisors are also two is a formula to check
+ * at other widths before it is believed.
+ */
+static size_t acc_index(unsigned mi, unsigned ni, unsigned m)
+{
+	const unsigned atom = 32, feat = 16, word = 4;
+	unsigned g = ni / atom, c = ni % atom;
+	unsigned h = c / feat, q = (c % feat) / word, sub = c % word;
+	unsigned j = (atom / word) * q + word * h + sub;
+
+	return (size_t)g * m * atom + (size_t)mi * atom + j;
+}
+
+/*
  * ⚠⚠ THE HARDWARE COMPUTES m > 1. THE READING IS WHAT IS WRONG.
  *
  * charsiu_matmul asks for the REQUANTISED INT8 output and reads it as
@@ -793,7 +828,7 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	printf("   m   distinct  present        flat");
 	for (unsigned a = 1; a < sizeof(ATOMS) / sizeof(*ATOMS); a++)
 		printf("   atom %-2u", ATOMS[a]);
-	printf("\n");
+	printf("     acc_index\n");
 
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned m = MS[y];
@@ -841,6 +876,20 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 						ex++;
 				}
 			printf("  %4zu/%-4zu", ex, total);
+		}
+		{
+			size_t ex = 0;
+
+			for (unsigned mi = 0; mi < m; mi++)
+				for (unsigned ni = 0; ni < n; ni++) {
+					size_t at = acc_index(mi, ni, m);
+
+					if (at < total &&
+					    got[at] == want[(size_t)mi * n + ni])
+						ex++;
+				}
+			printf("   %5zu/%-5zu%s", ex, total,
+			       ex == total ? " EXACT" : "");
 		}
 		printf("\n");
 	}
