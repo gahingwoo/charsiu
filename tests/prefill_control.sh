@@ -23,6 +23,9 @@
 # numbers disagree by more than the gap being measured, this round says
 # nothing and the answer is to run it again cold.
 #
+# `charsiu update dev` installs this at /opt/charsiu/prefill_control.sh, next
+# to the other probes, because that is how this board tests.
+#
 # Usage: prefill_control.sh [MODEL.gguf] [N_GEN]
 set -eu
 
@@ -39,8 +42,10 @@ done
 
 # --- the model -------------------------------------------------------------
 # ⚠ int4. An int8 gguf here measures the OTHER path and the run will look fine.
+# ⚠ ~/.charsiu/models FIRST: that is where the installer puts the directory it
+# chowns to the user, and it is the one charsiu-get fills.
 if [ -z "$MODEL" ]; then
-	for d in "$HOME/models" /opt/charsiu/models; do
+	for d in "$HOME/.charsiu/models" "$HOME/models" /opt/charsiu/models; do
 		for f in "$d"/*Q4_0*.gguf; do
 			[ -f "$f" ] && { MODEL="$f"; break 2; }
 		done

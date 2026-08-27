@@ -848,6 +848,7 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # on the way to the answers. `charsiu update dev` asks for them.
 RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve"
 PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
+PROBE_SCRIPTS="prefill_control.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
@@ -856,6 +857,19 @@ for f in $INSTALL_BINS; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
+# ⚠ AND THE PROBES THAT ARE SHELL RATHER THAN C. prefill_control.sh is a probe
+# by everything that matters -- it asks the hardware a question the runtime
+# cannot answer about itself, and it is dev only for the same reason the other
+# three are. It goes next to them, because the paragraph above is right: a
+# probe that lives only in the source tree under ~/.cache is a board round that
+# does not happen, and `charsiu update dev` is how this board tests.
+case "$CHANNEL" in
+dev)	for f in $PROBE_SCRIPTS; do
+		[ "$DRY" = 1 ] || [ -r "$SRC/tests/$f" ] || continue
+		as_root cp "$SRC/tests/$f" "$BIN/$f"
+		as_root chmod 0755 "$BIN/$f"
+	done ;;
+esac
 # ⚠ BOTH LIBRARIES, OR EVERY COMMAND EXITS ON THE FIRST LINE. charsiu-lib.sh
 # is where ini_get and find_bin live now; a script that cannot source it
 # says so and stops rather than guessing.
@@ -993,7 +1007,8 @@ ui_msg "Done.
   charsiu doctor      what works and what does not
   charsiu serve       an OpenAI compatible endpoint on :11434
 
-  channel $CHANNEL$([ "$CHANNEL" = stable ] && echo "      charsiu update dev  adds the hardware probes" || echo "         charsiu update stable  goes back to the runtime alone")
+  channel $CHANNEL$([ "$CHANNEL" = stable ] && echo "      charsiu update dev  adds the hardware probes" || echo "         charsiu update stable  goes back to the runtime alone")$([ "$CHANNEL" = dev ] && echo "
+  probes  $BIN: $PROBE_BINS $PROBE_SCRIPTS")
 
   config  ${CONFDISP:-$ETC/config.ini}
   models  $MODELS"
