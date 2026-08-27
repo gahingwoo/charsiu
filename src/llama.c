@@ -682,6 +682,44 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				}
 				}
 				unsetenv("CHARSIU_BATCH_ROWSTEP");
+				/*
+				 * ⚠ AND THE INPUT. Row 1 came back the right
+				 * magnitude and the wrong number at every row
+				 * step, which is a real dot product of the
+				 * wrong activation rather than a misplaced
+				 * one. Row 0 stays a control for pack 0; for
+				 * the others it moves, and that is information
+				 * too.
+				 */
+				printf("\n    input packing, height axis,"
+				       " atom 4 read\n");
+				for (int pk = 0; pk < 3; pk++) {
+					char b[8];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%d", pk);
+					setenv("CHARSIU_BATCH_PACK", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      pack %d %-22s row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s\n", pk,
+					       pk == 0 ? "[k/atom][m][atom]" :
+					       pk == 1 ? "rows contiguous" :
+							 "rows at the CBUF stride",
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       (ok0 == t->n && ok1 == t->n)
+					       ? "   <== both rows" : "");
+				}
+				unsetenv("CHARSIU_BATCH_PACK");
 				unsetenv("CHARSIU_BATCH_READ");
 			}
 		}

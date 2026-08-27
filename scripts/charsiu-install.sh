@@ -53,6 +53,14 @@ set -eu
 # ⚠ Read before the terminal check, which branches on it.
 _BOOT_DRY=0; _BOOT_NOTTY=0
 for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
+# ⚠ THE CHANNEL HAS TO BE KNOWN BEFORE THE SOURCE IS FETCHED, because it
+# decides which ref to fetch. The full argument parsing happens much later, in
+# the tree this is about to download.
+_BOOT_REF=stable
+for _a in "$@"; do case "$_a" in
+	--dev) _BOOT_REF=main ;;
+	--stable) _BOOT_REF=stable ;;
+esac; done
 
 CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
 CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh"
@@ -160,18 +168,23 @@ Continue?" || { echo "  stopped."; exit 1; }
 		_sudo=$(command -v sudo || true)
 	fi
 	if [ -d "$DIR/.git" ]; then
-		printf '  updating %s\n' "$DIR"
-		$_sudo git -C "$DIR" pull --ff-only --quiet || true
+		printf '  updating %s (%s)\n' "$DIR" "$_BOOT_REF"
+		# ⚠ fetch and move to the ref rather than pull, or a tree that
+		# is on main stays on main however stable was asked for.
+		$_sudo git -C "$DIR" fetch --quiet origin "$_BOOT_REF" \
+			&& $_sudo git -C "$DIR" checkout --quiet -B "$_BOOT_REF" FETCH_HEAD \
+			|| true
 	elif command -v git >/dev/null 2>&1; then
 		$_sudo mkdir -p "$(dirname "$DIR")"
-		$_sudo git clone --depth 1 --quiet "$CHARSIU_SRC_REPO" "$DIR" \
-			|| { echo "  clone failed: $CHARSIU_SRC_REPO" >&2; exit 1; }
+		$_sudo git clone --depth 1 --quiet --branch "$_BOOT_REF" \
+			"$CHARSIU_SRC_REPO" "$DIR" \
+			|| { echo "  clone failed: $CHARSIU_SRC_REPO ($_BOOT_REF)" >&2; exit 1; }
 	else
 		# ⚠ no git is a normal state on a minimal rootfs, and a tarball
 		# needs neither git nor a key.
 		printf '  git is not installed; taking a tarball instead\n'
 		$_sudo mkdir -p "$DIR"
-		curl -fsSL "$CHARSIU_SRC_REPO/archive/refs/heads/main.tar.gz" \
+		curl -fsSL "$CHARSIU_SRC_REPO/archive/refs/heads/$_BOOT_REF.tar.gz" \
 		 | $_sudo tar -xz -C "$DIR" --strip-components=1 \
 			|| { echo "  download failed" >&2; exit 1; }
 	fi

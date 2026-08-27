@@ -1626,9 +1626,54 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		job.input_addr = (uint32_t)g->bin[d].dma_address;
 		job.output_addr = (uint32_t)g->bout[d].dma_address;
 
+		/*
+		 * ⚠⚠ AND NOW THE INPUT, WHICH IS WHERE THE EVIDENCE POINTS.
+		 *
+		 * Board, m = 2, N = 2048, height axis, a plain [n/4][m][4]
+		 * read: row 0 is COMPLETE, 2048 of 2048, and row 1 is 0 to 3
+		 * at every row step from 1 to 2048. Row 1's numbers are not
+		 * garbage either -- they are the right magnitude, which is what
+		 * a real dot product of the WRONG ACTIVATION looks like.
+		 *
+		 * So the weights, the coefficients, the output group stride and
+		 * row 0's whole path are right, and what row 1 multiplies is
+		 * not. charsiu_pack_input_f16's m > 1 branch writes
+		 * [k/atom][m][atom], which is Mesa's int8 convolution input
+		 * surface. Nothing has ever checked that w4a16 reads the same
+		 * one.
+		 *
+		 * CHARSIU_BATCH_PACK asks: 0 is that surface, 1 is each row
+		 * contiguous, 2 is each row contiguous at the stride one row
+		 * occupies in the CBUF.
+		 */
 		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
-		charsiu_pack_input_f16(&job.mm, g->bscr, g->bin[d].map,
-				       (size_t)g->kmax * m * 2);
+		{
+			const char *ep = getenv("CHARSIU_BATCH_PACK");
+			int pk = ep ? atoi(ep) : 0;
+
+			if (pk == 0) {
+				charsiu_pack_input_f16(&job.mm, g->bscr,
+						       g->bin[d].map,
+						       (size_t)g->kmax * m * 2);
+			} else {
+				uint8_t *dst = g->bin[d].map;
+				size_t stride = pk == 2
+					      ? (size_t)charsiu_entries_per_row(&job.mm) * 64
+					      : (size_t)sk * 2;
+
+				memset(dst, 0, (size_t)g->kmax * m * 2);
+				for (unsigned r = 0; r < m; r++)
+					for (unsigned kk = 0; kk < sk; kk++) {
+						uint16_t h = charsiu_float_to_half(
+							g->bscr[(size_t)r * sk + kk]);
+						uint8_t *o = dst + r * stride
+							   + (size_t)kk * 2;
+
+						o[0] = (uint8_t)(h & 0xff);
+						o[1] = (uint8_t)(h >> 8);
+					}
+			}
+		}
 		charsiu_bo_fini(g->dev[d], &g->bin[d]);
 
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);

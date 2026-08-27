@@ -24,7 +24,7 @@ on the fence, and one millisecond of a token unaccounted for.
 ## Install
 
 ```
-curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh | sh
 ```
 
 It fetches the source, checks whether the running kernel can drive the NPU, and
@@ -39,12 +39,33 @@ something so you can see it work.
 Rehearse it first if you would rather:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh -o install.sh
 sh install.sh --dry-run
 ```
 
 `--dry-run` prints every action as `would ...` and changes nothing. The read-only
 checks still run, which is the point: it is what the installer *sees* on your machine.
+
+### Two channels
+
+**stable** is what the line above installs: the runtime, and nothing else.
+
+**dev** adds the hardware probes -- `npu_gemm_test`, `charsiu_matmul`,
+`bench_batch` -- and tracks `main`, where the work happens. They exist to ask the
+silicon questions, and asking has wedged the block, timed out and printed the
+opposite of its own data on the way to the answers. They are not something to
+install on a board you want to rely on.
+
+```
+sh install.sh --dev          the probes too, from the start
+charsiu update dev           switch an existing install, no reinstall needed
+charsiu update stable        go back
+charsiu update               whichever it was last told, remembered
+```
+
+`charsiu doctor` says which channel it is on, which matters when a log gets
+pasted somewhere: "it hung" from a board with the probes on it and from one
+without are not the same report.
 
 After that:
 
