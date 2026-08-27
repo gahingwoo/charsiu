@@ -1234,15 +1234,32 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * npu_gemm_test, which takes the acc_out arm, has never been right
 	 * above one row under any reading.
 	 *
-	 * CHARSIU_DPU_40B8 replaces the value so a board round can sweep it
-	 * the way round 260 swept 0x4050, one number at a time with everything
-	 * else held. The default does not move until one does.
+	 * ⚠⚠ AND THE BOARD SAID IT IS 3 * rows.
+	 *
+	 * Swept 0 to 16 at three widths, scoring every candidate under every
+	 * reading. The peak walks with M and nothing else comes near it:
+	 *
+	 *   m = 1   value  3   64 of 64     every other value 4, 8, 12 or 16
+	 *   m = 2   value  6   64 of 128    every other value 8 to 21
+	 *   m = 4   value 12   68 of 256    every other value 9 to 40
+	 *
+	 * 3, 6, 12 at m = 1, 2, 4. The literal was the m = 1 case of a value
+	 * that follows the row count, exactly as the int8 arm's does, and
+	 * round 312 could not have seen that: it swept at M = 1.
+	 *
+	 * ⚠ IT IS NOT THE WHOLE FIX. Each peak is worth about ONE ROW -- 64
+	 * values whatever m is -- so the other rows are still wrong. What this
+	 * buys is a reproducible signal well clear of the 8 to 20 noise floor,
+	 * and a default that cannot change decode, since 3 * rows is 3 at
+	 * m = 1.
+	 *
+	 * CHARSIU_DPU_40B8 replaces the value so the next sweep can hold it.
 	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
 	{
 		const char *e8b = getenv("CHARSIU_DPU_40B8");
 		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
-			   ? 3u : (uint32_t)(ow * (2 * rows - rows));
+			   ? 3u * rows : (uint32_t)(ow * (2 * rows - rows));
 
 		if (e8b)
 			v = (uint32_t)strtoul(e8b, NULL, 0);

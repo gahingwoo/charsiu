@@ -707,6 +707,7 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	for (unsigned v = 0; v <= 16; v++) {
 		char buf[16];
 		size_t best[3] = { 0, 0, 0 };
+		char hbuf[3][16] = { "", "", "" };
 		const char *how[3] = { "", "", "" };
 		static const unsigned MS[] = { 1, 2, 4 };
 
@@ -738,7 +739,16 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 					}
 				if (ex > best[y]) {
 					best[y] = ex;
-					how[y] = atom ? "surf" : "flat";
+					/* ⚠ NAME THE READING. "surf" alone
+					 * cannot be acted on: the next round
+					 * has to hold the atom. */
+					if (atom)
+						snprintf(hbuf[y], sizeof(hbuf[y]),
+							 "a%u", atom);
+					else
+						snprintf(hbuf[y], sizeof(hbuf[y]),
+							 "flat");
+					how[y] = hbuf[y];
 				}
 			}
 		}
@@ -837,6 +847,18 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 	printf("\n  A column that reads m*n at every m is the reading. If none\n"
 	       "  does, the accumulator surface is not this shape and the\n"
 	       "  present column says whether the values are even there.\n");
+	/*
+	 * ⚠ AND THEN STOP GUESSING SHAPES AND READ THE MAP. locate() prints the
+	 * index each wanted value came back at, which is the permutation itself
+	 * rather than a candidate for it. It was untrustworthy while the
+	 * reference had fifteen distinct values in 128; at K = 64 N = 64 it has
+	 * 112, and locate() prints that count beside the table so the next
+	 * reader can check rather than take my word.
+	 */
+	printf("\n  and the map at m=2, which is the permutation itself:\n");
+	reference(2, k, n, A, B, want);
+	if (!run(dev, 2, k, n, A, B, got))
+		locate(2, n, got, want);
 	free(A); free(B); free(got); free(want);
 	return rc;
 }
