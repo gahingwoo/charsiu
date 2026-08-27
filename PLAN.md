@@ -31,91 +31,69 @@ they were for is the answers.
 - **The product layer.** `charsiu`, `charsiu-get`, `charsiu-config`, `charsiu-doctor`,
   `charsiu serve`, and an installer.
 
-## 1. Prefill, which is the only number left that can move
+## 1. Prefill: the hardware was never the problem. CLOSED as a defect, open as work
 
 Decode is closed: four fifths of a token is the hardware on the DRAM roof, the CPU
 side is about twelve milliseconds, and the whole token is accounted for to within one.
-Prefill is not, and it is where the vendor is beatable rather than matched -- **every
-one of its 3328 int4 projection dispatches is M = 1**, so it re-streams all 487 MB of
-weights for every prompt token. At M = 32 the same bytes serve thirty two rows, and
-the board measured 6.9 us a row against 200.
+Prefill is where the vendor is beatable rather than matched -- **every one of its 3328
+int4 projection dispatches is M = 1**, so it re-streams all 487 MB of weights for every
+prompt token. At M = 32 the same bytes serve thirty two rows, and the board measured
+6.9 us a row against 200.
 
-What is in the way is measured and is not a layout:
+Five rounds looked for a hardware wall above one row. There is none. Two things were
+wrong, both in this tree.
 
-```
-N=64 m=2   92 of 128      N=64 m=4  148 of 256      N=64 m=8  260 of 512
-N=32 m=2   52 of  64      N=16 m=2   32 of  32
-```
-
-`written = N + inc * (m - 1)`, with `inc = N/4 + 12` through all three widths. **The
-first row gets all N words; every row after it gets N/4 + 12 and needs N.** They meet
-at sixteen, and at sixteen nothing is missing -- every value present, none of them
-where a contiguous read expects it. That is a budget being divided, not a stride, and
-the four rounds spent fitting an address function to the output were fitting the
-symptom.
-
-### The CBUF split is not it, and the arithmetic says so without a board
-
-The step this section once named next was: Mesa splits a task's staged rows when
-`(cbuf_rows + staged) * entries_per_slice > total_entries` and charsiu never checks.
-Put the numbers in and it cannot fire.
-
-An LLM matmul reaches the encoder as `input_width = 1`, `input_height = m`,
-`input_channels = K`, so `entries_per_slice` is 16 at K = 1024 and 32 at K = 2048.
-The RK3576 CBUF is 16 banks of 512 entries; Mesa's own budget is five banks usable
-and ten total. At m = 8 and K = 1024 that is **128 entries against 2560**. The
-over-budget test needs m > 320 and the split test needs m > 640; the row-window path
-needs `input_width >= 112`, and this shape is one wide. **Mesa does not split these
-either.** That much still stands.
-
-### And `surf` is not it either. The control failed.
-
-The next step after that was: every shape ever correct above one row has
-`charsiu_entries_per_row() == 1`, so the axis is entries per row rather than m. The
-rule was stated before the run -- K = 48 and K = 64 are surf 1 and have to be exact
-at m = 2 and m = 4, or the axis is not surf. **They were not.**
+### One register was a literal where it should have followed the row count
 
 ```
-     K  surf   m   exact of      all values present
-    48     1   2       8 of 128       99 of 128
-    64     1   2       8 of 128       97 of 128
-   128     2   2       8 of 128       93 of 128
-   256     4   2       8 of 128       92 of 128
-  1024    16   2       8 of 128       95 of 128
+emit(DPU, 0x40b8, acc_out ? 3 : ow * rows)
 ```
 
-Flat across the whole sweep, surf 1 to surf 16. **8 words exact at m = 2 and 8 at
-m = 4, at every K.** Whatever this is, it does not scale with K, and the `written =
-N + (N/4 + 12)(m - 1)` budget that fitted one K does not survive the others either.
+On the height axis `ow` is 1 and `rows` is m, so the int8 arm writes the row count.
+The acc_out arm wrote 3 at every m, and round 312 chose that 3 by sweeping 0 to 15 at
+**M = 1**, the one width where a value that should follow M cannot show that it does.
+Swept again where it can move, the peak walks: 3 at m = 1, 6 at m = 2, 12 at m = 4.
+It is `3 * rows`, and 3 * rows is 3 at m = 1, so decode cannot change.
 
-### What the record was actually comparing: two different output paths
+With that, **every wanted value is in the buffer at every shape and every m measured**.
+The board prints "0 are absent from the buffer altogether" at K = 64 N = 64,
+K = 256 N = 128 and K = 1024 N = 32, at m = 1, 2, 4 and 8. The arithmetic was never
+wrong above one row; the register was.
 
-The shapes that computed correctly above one row -- M = 224 at K = 64, M = 3136 at
-K = 33 -- were measured by `tools/charsiu_matmul.c`, which takes the **requantised
-int8 output** and reads it as `[n/atom][m][n%atom]` with a 16 byte atom. Every m > 1
-failure was measured by `tools/npu_gemm_test.c`, which sets `acc_out = 1` for the
-**raw int32 accumulator** and reads it flat.
+### And the read order was not the one anybody guessed
 
-They have never run the same experiment. The runtime's decode path uses `acc_out`,
-so the layout that matters has never been established above one row, and the layout
-that was established does not apply to it.
+```
+P = m/2
+G = ni/32, c = ni%32, a = c/16, t = c%16
+j     = (t/4)*8P + (mi%P)*8 + a*4 + t%4
+index = G*(m*32) + (mi/P)*(32P) + j
+```
 
-⚠ The obvious guess is that the accumulator mirrors the same surface with a four
-word atom. It predicts 8 exact at m = 2, which is what the board wrote, and 16 at
-m = 4, where the board wrote 8. Right at one width and wrong at the next is the same
-shape of wrong answer the last four rounds produced, so it is written down here and
-not acted on.
+Channels go in super groups of 32. Inside one the rows pair up P at a time, and inside
+a pair the four word runs alternate between the rows and between the two sixteen
+channel halves. At m = 2 that is P = 1, each row its own block of 32 with the halves
+interleaved: channels 0..3, 16..19, 4..7, 20..23. At m = 4 it is P = 2, rows pairing
+into blocks of 64 that alternate every eight words.
 
-**Next**: run both probes at the same shape in one session, `charsiu_matmul 2 64 64`
-against `npu_gemm_test 64 64 --surf`. If the int8 path is exact at m = 2 where the
-accumulator path is not, then m > 1 is a reading problem in the accumulator path
-rather than a hardware wall, and the search collapses to one address function with a
-control that already works. If the int8 path fails too, the README's own table is
-stale and that has to be said.
+Solved from the printed maps at m = 2 and m = 4, then **confirmed at m = 8, which it
+was not fitted on**, and at m = 1, which is flat and a separate case:
 
-**Control**: `CHARSIU_OUT_ROWMAJOR=1 charsiu_matmul 2 64 64` reads the same run flat.
-It has to fail where the surface reading passes, or the surface reading is not doing
-any work.
+```
+  K=1024 N=32     m=1  32/32    m=2   64/64    m=4  128/128   m=8   256/256   all EXACT
+  K=256  N=128    m=1 128/128   m=2  256/256   m=4  512/512   m=8  1024/1024  all EXACT
+```
+
+`charsiu_acc_index()` is that expression, in the library rather than the probe, because
+the runtime needs the same copy.
+
+**Next, and it is engineering rather than investigation.** The runtime bakes
+`mm.m = 1` into every slice's register stream at staging time, so a batched submit has
+to re-emit the stream at the width it wants. The weights and the coefficients do not
+depend on m and do not move; the regcmd, the activation packing and the output read do.
+Then llama.c has to feed the prompt in chunks of M rather than one token at a time.
+
+**Control**: decode is m = 1 and must stay byte identical. The same sentence, and the
+same tok/s, before and after.
 
 ## 2. The output head: routed, and it was worth 49 ms a token. DONE
 

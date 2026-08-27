@@ -266,6 +266,51 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
 	return (size_t)ALIGN_UP(mm->n, 8) * 2;
 }
 
+/*
+ * ⚠⚠ THE ACCUMULATOR'S READ ORDER, SOLVED.
+ *
+ * With 0x40b8 following the row count every wanted value is in the buffer at
+ * every shape and every m measured, so the arithmetic is right and this is all
+ * that was left. locate() printed the map at m = 2 and again at m = 4, and one
+ * expression reproduces both, all 128 positions each, with nothing left over.
+ *
+ * Channels go in super groups of 32. Inside a super group the rows pair up P at
+ * a time, and inside a pair the four word runs alternate between the rows and
+ * between the two sixteen channel halves:
+ *
+ *   P = m/2
+ *   G = ni/32,  c = ni%32,  a = c/16,  t = c%16
+ *   j     = (t/4)*8P  +  (mi%P)*8  +  a*4  +  t%4
+ *   index = G*(m*32)  +  (mi/P)*(32P)  +  j
+ *
+ * At m = 2 that is P = 1: each row is its own block of 32 and the halves
+ * interleave, channels 0..3, 16..19, 4..7, 20..23. At m = 4 it is P = 2: rows
+ * pair into blocks of 64 and the two rows of a pair alternate every eight
+ * words. Both are what the board printed.
+ *
+ * ⚠ m = 1 IS FLAT AND IS NOT THIS. P would be zero, and the expression does not
+ * collapse to the identity at P = 1 either. Decode has read m = 1 flat for
+ * hundreds of rounds and the sweep scores it 64 of 64 flat, so it is a separate
+ * case rather than a limit of this one.
+ *
+ * ⚠ P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
+ * map has been printed. m = 8 is scored by the sweep and has not been read.
+ */
+size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
+{
+	unsigned P, G, c, a, t, j;
+
+	if (m < 2)
+		return ni;                      /* flat, and measured so */
+	P = m / 2;
+	G = ni / 32u;
+	c = ni % 32u;
+	a = c / 16u;
+	t = c % 16u;
+	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * 4u + (t % 4u);
+	return (size_t)G * m * 32u + (size_t)(mi / P) * (32u * P) + j;
+}
+
 size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 {
 	/*

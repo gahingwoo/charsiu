@@ -182,6 +182,14 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 			    uint8_t *dst, size_t dst_size);
 
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
+/*
+ * Where the raw int32 accumulator puts row mi's channel ni, in words.
+ *
+ * The block writes every row correctly and in an order the flat read cannot
+ * see; this is that order, solved from the board's own maps at m = 2 and m = 4
+ * and confirmed at m = 8 and m = 1, at N = 32, 64 and 128. m = 1 is flat.
+ */
+size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m);
 
 
 
