@@ -586,6 +586,78 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 	return fail;
 }
 
+/*
+ * ⚠⚠ HOW SMALL CAN THE COEFFICIENT BUFFER BE?
+ *
+ * charsiu_coef_bytes bounds the coefficient surface by k*n, which makes it
+ * four times the weight buffer -- 67 MB for an N=8192 slice. A 262144 wide
+ * output head is 32 such slices, so routing it asks for 1210 MB of
+ * coefficients against 151 MB of weights, the allocation fails, and a tensor
+ * worth forty percent of a gemma token stays on the CPU.
+ *
+ * The bound is a guess and its own comment says so. The two walls it was sized
+ * against were tens of KILObytes -- 4.7 KB allocated against 33 KB read, and
+ * 1280 bytes against 20800 -- and nothing has ever measured the read growing
+ * with k*n. At 65536 elements the same head would want 10.5 MB.
+ *
+ * ⚠ UNDER ALLOCATING DOES NOT RETURN AN ERROR. The RDMA reads past the buffer,
+ * the IOMMU faults and the job times out with every register correct, so this
+ * walks DOWNWARD from the current bound and stops at the first value that is
+ * not exact. The last good one is the answer, and everything below it is
+ * unexplored rather than known bad.
+ */
+static int coef_floor(struct charsiu_device *dev, unsigned k, unsigned n,
+		      const uint8_t *A, const uint8_t *B,
+		      int32_t *got, int32_t *want)
+{
+	size_t full = (size_t)k * n;
+	size_t last_ok = 0;
+
+	printf("K=%u N=%u: the k*n bound is %zu elements, %.1f MB a slice\n",
+	       k, n, full, (double)(full * 4) / 1e6);
+	printf("walking down; the last exact value is the floor\n\n");
+
+	reference(1, k, n, A, B, want);
+	for (size_t e = full; e >= 4096; e /= 2) {
+		char buf[32];
+		unsigned bad = 0;
+
+		snprintf(buf, sizeof(buf), "%zu", e);
+		setenv("CHARSIU_COEF_ELEMS", buf, 1);
+		if (run(dev, 1, k, n, A, B, got)) {
+			printf("  %10zu elements  %6.2f MB   SUBMIT FAILED\n",
+			       e, (double)(e * 4) / 1e6);
+			break;
+		}
+		for (unsigned i = 0; i < n; i++)
+			if (got[i] != want[i])
+				bad++;
+		printf("  %10zu elements  %6.2f MB   %u of %u wrong%s\n",
+		       e, (double)(e * 4) / 1e6, bad, n,
+		       bad ? "   <== stop here" : "");
+		if (bad)
+			break;
+		last_ok = e;
+	}
+	unsetenv("CHARSIU_COEF_ELEMS");
+
+	if (!last_ok) {
+		printf("\nnot even the current bound is exact, so this says"
+		       " nothing about the floor.\n");
+		return 1;
+	}
+	printf("\n  ⚑ the smallest exact bound here is %zu elements, %.2f MB.\n"
+	       "  A 262144 wide head is 32 slices, so that is %.1f MB of"
+	       " coefficients\n  against 151 MB of weights, where the k*n bound"
+	       " asks for 1210.\n",
+	       last_ok, (double)(last_ok * 4) / 1e6,
+	       (double)(last_ok * 4 * 32) / 1e6);
+	printf("\n  ⚠ Everything below that is UNEXPLORED, not known bad: the"
+	       " walk stops at\n  the first failure and an under-allocated"
+	       " surface faults rather than\n  returning an error.\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	/*
@@ -639,6 +711,18 @@ int main(int argc, char **argv)
 	for (unsigned c = 0; c < n; c++)
 		for (unsigned i = 0; i < k; i++)
 			B[(size_t)c * k + i] = mix(c, i, 15);
+
+	/*
+	 * The coefficient floor is a different question from M > 1 and wants
+	 * the whole run to itself: it changes an allocation that every submit
+	 * below would then inherit.
+	 */
+	if (argc > 3 && !strcmp(argv[3], "--coef")) {
+		int rc = coef_floor(dev, k, n, A, B, got, want);
+
+		charsiu_close(dev);
+		return rc;
+	}
 
 	printf("K=%u N=%u, int8 weights and activations, raw accumulator\n", k, n);
 	/*

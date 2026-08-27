@@ -830,6 +830,24 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	if (charsiu_bo_alloc(g->dev[di], charsiu_weight_bytes(&s->job.mm) + 4096, &s->wt) ||
 	    charsiu_bo_alloc(g->dev[di], charsiu_coef_bytes(&s->job.mm) + 4096, &s->coef) ||
 	    charsiu_bo_alloc(g->dev[di], 4096, &s->regcmd)) {
+		/*
+		 * ⚠ SAY WHICH BUFFER AND HOW BIG, because one of the three is
+		 * enormous and it is not the weights.
+		 *
+		 * charsiu_coef_bytes bounds the coefficient surface by k*n,
+		 * which makes it FOUR TIMES the weight buffer: 67 MB for an
+		 * N=8192 slice. A 262144 wide output head is 32 such slices,
+		 * so routing it asks for two gigabytes of coefficients on top
+		 * of 150 MB of weights, and the allocation that fails is the
+		 * reason a head worth forty percent of a gemma token stays on
+		 * the CPU. The k*n bound is a guess nobody has measured -- see
+		 * the comment on charsiu_coef_bytes -- and CHARSIU_COEF_ELEMS
+		 * is how a board round finds the real one.
+		 */
+		fprintf(stderr, "charsiu: this slice wanted %.1f MB of weights "
+			"and %.1f MB of coefficients\n",
+			charsiu_weight_bytes(&s->job.mm) / 1e6,
+			charsiu_coef_bytes(&s->job.mm) / 1e6);
 		whine(g, "a buffer would not allocate", k, n);
 		goto out;
 	}

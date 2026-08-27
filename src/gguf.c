@@ -549,6 +549,33 @@ static float dot_f16(const uint16_t *w, const float *x, uint64_t n)
 	return s;
 }
 
+
+/*
+ * bf16, which is f32 with the bottom sixteen bits gone. Widening is a SHIFT,
+ * not a conversion: interleave each half with a zero vector and the result is
+ * already the float. There is no vcvt for it and none is needed.
+ */
+static float dot_bf16(const uint16_t *w, const float *x, uint64_t n)
+{
+	float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+	uint16x8_t z = vdupq_n_u16(0);
+	uint64_t i = 0;
+	float s;
+
+	for (; i + 8 <= n; i += 8) {
+		uint16x8_t h = vld1q_u16(w + i);
+		float32x4_t lo = vreinterpretq_f32_u16(vzip1q_u16(z, h));
+		float32x4_t hi = vreinterpretq_f32_u16(vzip2q_u16(z, h));
+
+		a0 = vfmaq_f32(a0, lo, vld1q_f32(x + i));
+		a1 = vfmaq_f32(a1, hi, vld1q_f32(x + i + 4));
+	}
+	s = vaddvq_f32(vaddq_f32(a0, a1));
+	for (; i < n; i++)
+		s += bf16_to_float(w[i]) * x[i];
+	return s;
+}
+
 /*
  * Sixteen int8 against sixteen floats.
  *
@@ -727,6 +754,15 @@ static float dot_f16(const uint16_t *w, const float *x, uint64_t n)
 
 	for (uint64_t i = 0; i < n; i++)
 		s += half_to_float(w[i]) * x[i];
+	return s;
+}
+
+static float dot_bf16(const uint16_t *w, const float *x, uint64_t n)
+{
+	float s = 0.0f;
+
+	for (uint64_t i = 0; i < n; i++)
+		s += bf16_to_float(w[i]) * x[i];
 	return s;
 }
 
@@ -1366,15 +1402,9 @@ void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 			y[row0 + r] = dot_f16((const uint16_t *)(base + (row0 + r) * nc * 2), x, nc);
 		break;
 	case GGML_BF16:
-		for (uint64_t r = 0; r < nrows; r++) {
-			const uint16_t *w = (const uint16_t *)
-				(base + (row0 + r) * nc * 2);
-			float acc = 0.0f;
-
-			for (uint64_t i = 0; i < nc; i++)
-				acc += bf16_to_float(w[i]) * x[i];
-			y[row0 + r] = acc;
-		}
+		for (uint64_t r = 0; r < nrows; r++)
+			y[row0 + r] = dot_bf16((const uint16_t *)
+				(base + (row0 + r) * nc * 2), x, nc);
 		break;
 	case GGML_Q8_0:
 		for (uint64_t r = 0; r < nrows; r++)
