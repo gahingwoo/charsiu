@@ -31,67 +31,58 @@ they were for is the answers.
 - **The product layer.** `charsiu`, `charsiu-get`, `charsiu-config`, `charsiu-doctor`,
   `charsiu serve`, and an installer.
 
-## 1. Prefill: batched, correct, and 3.63x. The route is int8
+## 1. Prefill: batched, correct, 2.94x on hardware. DONE
 
 The vendor dispatches every one of its 3328 int4 projections at M = 1, so it
-re-streams all 487 MB of weights for every prompt token. charsiu now does not:
+re-streams all 487 MB of weights for every prompt token. charsiu does not.
+
+A 64 token prompt on an int8 staged Llama-3.2-1B, on a ROCK 4D, same binary,
+one flag apart:
 
 ```
-    m   tensors   worst rel    rows that agree    one row   batched   speedup
-    2     113     5.03e-05      226 of 226         227 ms    218 ms    1.04x
-    4     113     5.03e-05      452 of 452         451 ms    266 ms    1.70x
-    8     113     5.03e-05      904 of 904         899 ms    365 ms    2.46x
-   16     113     5.03e-05     1808 of 1808       1812 ms    570 ms    3.18x
-   32     113     5.03e-05     3616 of 3616       3590 ms    990 ms    3.63x
+  batched   prompt 64 tok in 2406 ms   26.60 tok/s    37.6 ms a token
+  control   prompt 64 tok in 7078 ms    9.04 tok/s   110.6 ms a token
 ```
 
-Every row of every tensor, checked against the one row path before anything is
-timed, on a real model's own staged weights. 5.03e-05 is two float sums of two
-thousand terms in different orders.
+**2.94x, and the two runs generate the same text word for word.** Prefill used
+to cost more per token than decode; it now costs a third of it.
 
-Per token of prompt, the projections go from 112 ms to 31 ms.
+`llama_prefill_batch` runs the layer loop with n rows, batching the feed
+forward -- gate, up and down, 63% of the projection time -- and leaving q, k, v
+and o a row at a time. Rows are walked in order inside a layer because row r's
+attention reads the KV the rows before it wrote, and the head is not batched at
+all: a prompt needs logits for its last token and no other, so the widest
+projection in the model is skipped n - 1 times rather than made n times wider.
+The prompt goes in chunks of 32, because the buffers scale with the batch and
+the probe's sweep flattens after 16.
 
-### It took five rounds to find out that the int4 path cannot do it
+⚠ It is a second copy of the layer loop and it is deliberately blind. It
+handles the plain case and REFUSES the rest -- gemma3's window and two rope
+bases, gemma4's per layer embeddings and shared KV, qwen3's q and k norms,
+biases, post norms, softcaps -- and the caller falls back to the token loop,
+which is correct for all seven architectures and merely slower. Refusing is not
+an error path, it is the other half of the same decision.
 
-w4a16 produces exactly ONE row and nothing makes it produce two. Fed the same
-activation twice, row 1 comes back matching row 0 in 1 of 2048. The DPU and
-RDMA blocks are identical to a stream that does two rows, all 69 and all 22
-registers; the four CNA geometry words were each put back to the int8 value
-with a liveness check between them and none produced row 1; CORE 0x301c is
-inert in either half and 0x3018 is the arithmetic switch. job.c has said since
-round 347 that the vendor runs w4a16 on the width axis, and the vendor never
-batches a weight matmul at all, so there is no M > 1 int4 stream to copy.
+⚠ And it runs without the NPU, which is what makes the risky half checkable off
+the board: matmul_rows falls back to matvec, so a host with no hardware
+compares the two layer loops and nothing else.
+
+### What it took, and the shape of every wrong turn
+
+Five rounds went into establishing that the int4 path cannot do this at all.
+w4a16 produces exactly ONE row: fed the same activation twice, row 1 comes back
+matching row 0 in 1 of 2048. The DPU and RDMA blocks are identical to a stream
+that does two rows, all 69 and all 22 registers, and every CNA word that
+differs was put back one at a time with a liveness check between them. The
+vendor never batches a weight matmul, so there is no M > 1 int4 stream to copy.
 
 Two registers on that path were literals chosen at M = 1, the one width where a
-value that follows the row count cannot show that it does: 0x40b8's 3, which
-is 3 * rows, and 0x301c's half, which is zero either way at m = 1. Finding the
-first cost five rounds and it was not even the answer.
+value that follows the row count cannot show that it does: 0x40b8's 3, which is
+3 * rows, and 0x301c's half, which is zero either way at m = 1.
 
-### ⚠ And the thing that is not settled: decode wants int4
-
-Batching works on int8 and decode is int4 -- 14.70 tok/s against int8's 9.71,
-because decode is one row at the DRAM roof where halving the bytes nearly
-doubles the rate. Prefill is not at that roof, which is why int8's extra byte
-costs it nothing: at m = 32 the same weights serve thirty two rows.
-
-A model is staged once, in one format. Reconciling those is a design question
-and not an implementation detail:
-
-- **all int8**: prefill 3.6x, decode loses a third. Right for long prompts,
-  wrong for chat.
-- **both staged**: 620 MB of int4 plus 1240 MB of int8, which this board does
-  not have to spare.
-- **per run**: the format becomes a setting, which is honest but pushes the
-  choice onto somebody who cannot make it.
-
-**Next**, and it is the cheap half: the batched path submits one slice at a
-time and waits a full fence on each. Decode chains a projection's slices into
-one submit for exactly this reason, and the report says 5072 ms of 7448 is
-fence. Chaining is worth more than any of the above and does not need the
-format question answered.
-
-**Control**: decode is m = 1 and goes through charsiu_npu_matvec, which the
-batched path does not touch. Same sentence, same tok/s.
+The read order is `P = m/2`, super groups of 32, rows pairing P at a time with
+the four word runs alternating. Solved from two printed maps and confirmed at a
+width it was not fitted on.
 
 ## 2. The output head: routed, and it was worth 49 ms a token. DONE
 
