@@ -167,19 +167,16 @@ were wrong in this file before:
   expression collapses to `clamp(requant + out_zp, 0, 255)`, which is what the
   operation means.
 
-It is not a runtime yet. What is left:
+⚠ **The three paragraphs above are where this stood when the matmul was the whole
+question, and they are kept because the reasoning in them is still the reasoning.**
+What they say is left has since been done: models run, int4 computes end to end, and
+the numbers at the top of this file are measured rather than projected. What is still
+open is further down -- prefill above M = 1, and an output head the coefficient bound
+keeps on the CPU.
 
-- **no model runs.** The matmul is correct; the KV cache, the sampler, the per token
-  geometry and the CPU/NPU split are not written.
-- the reference still requantises in float where the hardware uses an integer scale and
-  shift. It agrees to the byte on everything measured so far, which does not mean it
-  will at every scale.
-- **int4 does not compute end to end yet**, though what it does is no longer a
-  mystery. The layout is read, the `w4a16` stage is ported, and the output is
-  `((int16)fp16bits(w) * (int16)fp16bits(a)) >> 16` exactly, 18 measured points with
-  no error and a four point prediction written into the board script before the run.
-  What is missing is the layout for `k = 16` and above, whose bytes are dead in the
-  map with no data about them. See below.
+One thing on that list has not moved: the reference still requantises in float where
+the hardware uses an integer scale and shift. It agrees to the byte on everything
+measured so far, which does not mean it will at every scale.
 
 The three tools that got it there are in the repository rather than in a shell history,
 because every step that worked was a diff against something known to compute:
@@ -1578,15 +1575,20 @@ The rest of what the file says is in [docs/vendor-dispatch.md](docs/vendor-dispa
 - **Out**: no vendor `librkllmrt` or `librknnrt` in the execution path, and no claim
   about any SoC this has not been run on.
 - **Honest about performance**: the target is the vendor's own number on the same
-  board and model. The projection cost is measured above and the arithmetic to a token
-  rate is written out; **there is still no end to end number here**, because no model
-  runs yet, and a projected rate is not a measured one.
+  board and model, and it is met. **15.91 tok/s at int4 and 64 tokens against the
+  vendor's roughly 13**, on the same ROCK 4D and the same Llama-3.2-1B. Every number
+  in this file is measured; where one is projected it says so and gives the
+  arithmetic.
 
 ## Prerequisite
 
 The RK3576 support in `rocket` is not upstream yet. It is on the list as
-[PATCH v7](https://lore.kernel.org/all/20260812094106.1391698-1-gahing@gahingwoo.com/),
-and the driver plus the Mesa work it comes from is
+[PATCH v9](https://lore.kernel.org/all/cover.1787568658.git.gahing@gahingwoo.com/),
+which has collected an Acked-by from Conor Dooley on both dt-bindings, a Reviewed-by
+from Abel Vesa on both pmdomain patches, and a Tested-by from Igor Paunovic on the two
+reset-race patches -- his testing on RK3588 reproduced, once in 102 induced resets, an
+inference that signalled success while its output buffer was never written, and only
+on the arm without them. The driver plus the Mesa work it comes from is
 [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu), which is where the
 RK3576 register knowledge in this repository was established.
 

@@ -8,85 +8,96 @@ carried over from the driver work applies here too: **a board round states its
 decision rule before the run and carries a control that can fail**, and a proxy
 metric is not a correctness oracle.
 
-## 0. The instrument (done)
+## What the first five steps turned out to be
 
-`tools/rkllm_regcmd.py` reads the vendor's dispatch plan out of a `.rkllm` with no
-board. First reading is in [docs/vendor-dispatch.md](docs/vendor-dispatch.md): three
-precisions by role, projections split across the two cores, and 3752 dispatches at
-M = 1.
+They are kept as one section rather than five because they are answered, and what
+they were for is the answers.
 
-## 1. Finish reading the vendor
+- **The instrument.** `tools/rkllm_regcmd.py` reads the vendor's dispatch plan out of
+  a `.rkllm` with no board: three precisions by role, projections split across two
+  cores, and 3752 dispatches at M = 1. It is still how a question about the vendor
+  gets settled, and it is how the M > 1 register geometry was read.
+- **M = 1 at an LLM's width.** Exact, and M = 2, 3, 4 and 8 are exact too through
+  Mesa's own delegate. The RK3588 height constraint is not on this silicon.
+- **One vendor matmul, bit exact.** Done, in int4, and then every matmul in
+  Llama-3.2-1B.
+- **The measurement that decides the architecture.** Answered in the NPU's favour,
+  and not marginally: **15.91 tok/s at int4 and 64 tokens against the vendor's
+  roughly 13**, with the hardware moving weights at 10.8 GB/s, which is this board's
+  DRAM roof. The RK3588 conclusion that decode belongs on the CPU is not this board's
+  conclusion.
+- **The runtime.** It exists, it is standalone rather than a ggml backend, and it
+  reads llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3.
+- **The product layer.** `charsiu`, `charsiu-get`, `charsiu-config`, `charsiu-doctor`,
+  `charsiu serve`, and an installer.
 
-Offline, and cheap.
+## 1. Prefill, which is the only number left that can move
 
-- Decode the 12724 DPU-only streams. Those are the elementwise and activation work,
-  and they say how much of RMSNorm, RoPE, softmax and the residual adds the vendor
-  keeps on the NPU rather than the cores.
-- Read a second model, ideally a different architecture, to separate what is
-  Llama-shaped from what is runtime policy.
-- Pull the same streams from a live run with kiln's `rknpu-regcmd-dump.patch` and
-  diff them against the file, so the ordering and the sync/broadcast entries the file
-  does not resolve are known too.
+Decode is closed: four fifths of a token is the hardware on the DRAM roof, the CPU
+side is about twelve milliseconds, and the whole token is accounted for to within one.
+Prefill is not, and it is where the vendor is beatable rather than matched -- **every
+one of its 3328 int4 projection dispatches is M = 1**, so it re-streams all 487 MB of
+weights for every prompt token. At M = 32 the same bytes serve thirty two rows, and
+the board measured 6.9 us a row against 200.
 
-## 1b. M = 1 at an LLM's width (done, 2026-08-14)
+What is in the way is measured and is not a layout:
 
-Answered before step 2 rather than inside it, because it was cheap: seven 1x1
-convolutions at 512 to 1024, 512 to 512 and 256 to 1024, walking M through 1, 2, 3,
-4 and 8, all exact through the open driver on a ROCK 4D. The RK3588 height-below-four
-constraint is not on this chip, so an LLM projection is a shape this hardware
-computes and the premise holds.
+```
+N=64 m=2   92 of 128      N=64 m=4  148 of 256      N=64 m=8  260 of 512
+N=32 m=2   52 of  64      N=16 m=2   32 of  32
+```
 
-Still unproven: **int4 weights**, and anything at all about **speed**.
+`written = N + inc * (m - 1)`, with `inc = N/4 + 12` through all three widths. **The
+first row gets all N words; every row after it gets N/4 + 12 and needs N.** They meet
+at sixteen, and at sixteen nothing is missing -- every value present, none of them
+where a contiguous read expects it. That is a budget being divided, not a stride, and
+the four rounds spent fitting an address function to the output were fitting the
+symptom.
 
-## 2. Reproduce one vendor matmul, bit exact
+**Next**: find what makes the per-row allowance `N/4 + 12` rather than `N`. Mesa
+bounds exactly this and charsiu does not -- `rkt_task.c` splits a task's staged rows
+when `(cbuf_rows + staged) * entries_per_slice > total_entries`, and charsiu submits
+all m rows as one task and never checks.
 
-On the board, through mainline `rocket`.
+**Control**: `npu_gemm_test` sweeps M and both entry-atomic constants, prints the
+whole output as the (row, channel) each word holds, and separates *wrong values* from
+*right values in the wrong order*. It has been wrong in both directions and says so
+now.
 
-Take one int4 projection from the file, 2048 to 1024 at M = 1, build the same
-register stream from our own code, feed it operands we control, and compare against a
-CPU reference. This is the whole project in miniature: if a single vendor-shaped
-matmul comes out exact, everything after it is engineering rather than discovery.
+## 2. The output head, which is two fifths of a gemma token
 
-The RK3576 pieces this needs are already established in the driver work: the weight
-tile layout, the CBUF row cost, the coefficient buffer alignment, the output channel
-pair rounding, and the split pair rule.
+262144 wide, tied at q8_0, 428 MB every token, and on the CPU because it will not
+route:
 
-What is new and unproven here is **int4 weights**. M = 1 was settled in 1b.
+```
+  weights       151 MB    32 slices at N=8192, int4
+  coefficients 1210 MB    <-- charsiu_coef_bytes bounds it by k*n
+```
 
-## 3. The measurement that decides the architecture
+The bound is a guess and its own comment has said so since it was written: the two
+walls it was sized against were tens of KILObytes, and nothing has ever measured the
+read growing with `k*n`. At 65536 elements the same head wants 10.5 MB and fits.
 
-Time one projection on the NPU against the same matmul on four A72 cores, at M = 1
-and at M = 32.
+**Control**: `npu_gemm_test K N --coef` walks the bound downward and stops at the
+first value that is not exact. ⚠ It walks DOWN because under-allocating does not
+return an error -- the RDMA reads past the buffer, the IOMMU faults, and the job times
+out with every register correct. The last exact value is the floor; everything below
+it is unexplored rather than known bad.
 
-The RK3588 open stack concluded decode belongs on the CPU. The RK3576 vendor
-dispatches decode to the NPU. Both cannot be the right answer for this board, and one
-number settles which, before any runtime is designed around either.
+## 3. Upstreaming
 
-## 4. The runtime
-
-Only after 3. The shape it takes depends on what 3 says:
-
-- if M = 1 is competitive on this hardware, charsiu can run a whole model on the NPU,
-  which is what the vendor does;
-- if it is not, charsiu runs prefill and attention on the NPU and decode on the cores,
-  which is what the RK3588 stack does.
-
-Either way it needs: tiled weight packing, the two-core fan-out, a KV cache, and a
-frontend. The frontend question, whether that is a ggml backend or a standalone
-runtime, is deliberately left open until 3.
-
-## 5. The product layer
-
-Reusable from [kiln](https://github.com/gahingwoo/kiln) with the NPU half replaced:
-the installer, the OpenAI-compatible API server, the model conversion path, the
-health check. None of that is NPU code and none of it needs rewriting.
+- The driver is [PATCH v9](https://lore.kernel.org/all/cover.1787568658.git.gahing@gahingwoo.com/),
+  with an Acked-by on both dt-bindings, a Reviewed-by on both pmdomain patches and a
+  Tested-by on the two reset-race patches. v10 is tag collection and the git note that
+  v9's cover letter promised and did not carry.
+- The Mesa side is [mesa!43804](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43804).
 
 ## What would make this stop
 
 Stated in advance, so it is a decision rather than a slow fade:
 
-- if step 2 cannot make one vendor-shaped matmul exact after a fair attempt, the
-  honest outcome is a written negative result and a return to the driver work;
-- if step 3 says the NPU cannot beat four A72 cores at any shape an LLM needs, then
-  the answer for this board is llama.cpp on the CPU, and saying so is worth more than
-  a runtime nobody should use.
+- if prefill cannot be batched after a fair attempt, that is a written negative result
+  and decode stands on its own -- it already beats the vendor;
+- if the coefficient bound turns out to be real rather than a guess, the output head
+  stays on the CPU and gemma-shaped models are simply expensive on this board, which
+  is worth saying rather than working around.
