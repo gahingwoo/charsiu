@@ -10,7 +10,14 @@
 #   sh charsiu-install.sh --dry-run    say what it would do, change nothing
 #   sh charsiu-install.sh --prefix DIR stage instead of installing
 #   sh charsiu-install.sh --uninstall  remove what this installed
+#   sh charsiu-install.sh --dev        the probes too, and track main
 #   CHARSIU_PLAIN=1 ...                no full-screen dialogs
+#
+# ⚠ TWO CHANNELS. stable is the runtime and is what a fresh install gets. dev
+# adds npu_gemm_test, charsiu_matmul and bench_batch, which exist to ask the
+# hardware questions and have wedged the block doing it, and tracks the branch
+# the work happens on. `charsiu update dev` switches later; nothing here needs
+# reinstalling to change channel.
 #
 # ⚠⚠ RK3576 NPU SUPPORT IS NOT UPSTREAM, SO NO STOCK KERNEL CAN RUN THIS.
 #
@@ -46,6 +53,14 @@ set -eu
 # ⚠ Read before the terminal check, which branches on it.
 _BOOT_DRY=0; _BOOT_NOTTY=0
 for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
+# ⚠ THE CHANNEL HAS TO BE KNOWN BEFORE THE SOURCE IS FETCHED, because it
+# decides which ref to fetch. The full argument parsing happens much later, in
+# the tree this is about to download.
+_BOOT_REF=stable
+for _a in "$@"; do case "$_a" in
+	--dev) _BOOT_REF=main ;;
+	--stable) _BOOT_REF=stable ;;
+esac; done
 
 CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
 CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh"
@@ -153,18 +168,23 @@ Continue?" || { echo "  stopped."; exit 1; }
 		_sudo=$(command -v sudo || true)
 	fi
 	if [ -d "$DIR/.git" ]; then
-		printf '  updating %s\n' "$DIR"
-		$_sudo git -C "$DIR" pull --ff-only --quiet || true
+		printf '  updating %s (%s)\n' "$DIR" "$_BOOT_REF"
+		# ⚠ fetch and move to the ref rather than pull, or a tree that
+		# is on main stays on main however stable was asked for.
+		$_sudo git -C "$DIR" fetch --quiet origin "$_BOOT_REF" \
+			&& $_sudo git -C "$DIR" checkout --quiet -B "$_BOOT_REF" FETCH_HEAD \
+			|| true
 	elif command -v git >/dev/null 2>&1; then
 		$_sudo mkdir -p "$(dirname "$DIR")"
-		$_sudo git clone --depth 1 --quiet "$CHARSIU_SRC_REPO" "$DIR" \
-			|| { echo "  clone failed: $CHARSIU_SRC_REPO" >&2; exit 1; }
+		$_sudo git clone --depth 1 --quiet --branch "$_BOOT_REF" \
+			"$CHARSIU_SRC_REPO" "$DIR" \
+			|| { echo "  clone failed: $CHARSIU_SRC_REPO ($_BOOT_REF)" >&2; exit 1; }
 	else
 		# ⚠ no git is a normal state on a minimal rootfs, and a tarball
 		# needs neither git nor a key.
 		printf '  git is not installed; taking a tarball instead\n'
 		$_sudo mkdir -p "$DIR"
-		curl -fsSL "$CHARSIU_SRC_REPO/archive/refs/heads/main.tar.gz" \
+		curl -fsSL "$CHARSIU_SRC_REPO/archive/refs/heads/$_BOOT_REF.tar.gz" \
 		 | $_sudo tar -xz -C "$DIR" --strip-components=1 \
 			|| { echo "  download failed" >&2; exit 1; }
 	fi
@@ -241,6 +261,8 @@ while [ $# -gt 0 ]; do
 	--no-build)  DOBUILD=0; shift ;;
 	# stable installs the runtime; dev adds the probes. See INSTALL_BINS.
 	--channel)   CHANNEL="$2"; shift 2 ;;
+	--dev)       CHANNEL=dev; shift ;;
+	--stable)    CHANNEL=stable; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	-h|--help)   sed -n '4,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*)           echo "unknown option: $1" >&2; exit 2 ;;
@@ -825,7 +847,8 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # have wedged the block, timed out and printed the opposite of their own data
 # on the way to the answers. `charsiu update dev` asks for them.
 RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve"
-PROBE_BINS="bench_batch npu_gemm_test"
+PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
+PROBE_SCRIPTS="prefill_control.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
@@ -834,6 +857,19 @@ for f in $INSTALL_BINS; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
+# ⚠ AND THE PROBES THAT ARE SHELL RATHER THAN C. prefill_control.sh is a probe
+# by everything that matters -- it asks the hardware a question the runtime
+# cannot answer about itself, and it is dev only for the same reason the other
+# three are. It goes next to them, because the paragraph above is right: a
+# probe that lives only in the source tree under ~/.cache is a board round that
+# does not happen, and `charsiu update dev` is how this board tests.
+case "$CHANNEL" in
+dev)	for f in $PROBE_SCRIPTS; do
+		[ "$DRY" = 1 ] || [ -r "$SRC/tests/$f" ] || continue
+		as_root cp "$SRC/tests/$f" "$BIN/$f"
+		as_root chmod 0755 "$BIN/$f"
+	done ;;
+esac
 # ⚠ BOTH LIBRARIES, OR EVERY COMMAND EXITS ON THE FIRST LINE. charsiu-lib.sh
 # is where ini_get and find_bin live now; a script that cannot source it
 # says so and stops rather than guessing.
@@ -871,6 +907,10 @@ if [ -f "$ETC/config.ini" ]; then
 	[ "$DRY" = 0 ] && ui_info "your $ETC/config.ini was left alone (template: config.ini.default)"
 else
 	as_root cp "$SRC/etc/config.ini" "$ETC/config.ini"
+	# ⚠ so that a later plain `charsiu update` stays on the channel that
+	# was installed rather than quietly going back to stable.
+	[ "$CHANNEL" = stable ] || as_root sh -c \
+		"sed -i 's/^channel = .*/channel = $CHANNEL/' '$ETC/config.ini'"
 fi
 # ⚠ THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
 # root's, so charsiu-get could not record the model it had just downloaded and
@@ -966,6 +1006,9 @@ ui_msg "Done.
   charsiu pull        fetch another model
   charsiu doctor      what works and what does not
   charsiu serve       an OpenAI compatible endpoint on :11434
+
+  channel $CHANNEL$([ "$CHANNEL" = stable ] && echo "      charsiu update dev  adds the hardware probes" || echo "         charsiu update stable  goes back to the runtime alone")$([ "$CHANNEL" = dev ] && echo "
+  probes  $BIN: $PROBE_BINS $PROBE_SCRIPTS")
 
   config  ${CONFDISP:-$ETC/config.ini}
   models  $MODELS"

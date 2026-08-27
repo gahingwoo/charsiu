@@ -31,91 +31,127 @@ they were for is the answers.
 - **The product layer.** `charsiu`, `charsiu-get`, `charsiu-config`, `charsiu-doctor`,
   `charsiu serve`, and an installer.
 
-## 1. Prefill, which is the only number left that can move
+## 1. Prefill: batched, correct, 2.94x on hardware. DONE
 
-Decode is closed: four fifths of a token is the hardware on the DRAM roof, the CPU
-side is about twelve milliseconds, and the whole token is accounted for to within one.
-Prefill is not, and it is where the vendor is beatable rather than matched -- **every
-one of its 3328 int4 projection dispatches is M = 1**, so it re-streams all 487 MB of
-weights for every prompt token. At M = 32 the same bytes serve thirty two rows, and
-the board measured 6.9 us a row against 200.
+The vendor dispatches every one of its 3328 int4 projections at M = 1, so it
+re-streams all 487 MB of weights for every prompt token. charsiu does not.
 
-What is in the way is measured and is not a layout:
+A 64 token prompt on an int8 staged Llama-3.2-1B, on a ROCK 4D, same binary,
+one flag apart:
 
 ```
-N=64 m=2   92 of 128      N=64 m=4  148 of 256      N=64 m=8  260 of 512
-N=32 m=2   52 of  64      N=16 m=2   32 of  32
+  batched   prompt 64 tok in 2406 ms   26.60 tok/s    37.6 ms a token
+  control   prompt 64 tok in 7078 ms    9.04 tok/s   110.6 ms a token
 ```
 
-`written = N + inc * (m - 1)`, with `inc = N/4 + 12` through all three widths. **The
-first row gets all N words; every row after it gets N/4 + 12 and needs N.** They meet
-at sixteen, and at sixteen nothing is missing -- every value present, none of them
-where a contiguous read expects it. That is a budget being divided, not a stride, and
-the four rounds spent fitting an address function to the output were fitting the
-symptom.
+**2.94x, and the two runs generate the same text word for word.** Prefill used
+to cost more per token than decode; it now costs a third of it.
 
-### The CBUF split is not it, and the arithmetic says so without a board
+`llama_prefill_batch` runs the layer loop with n rows, batching the feed
+forward -- gate, up and down, 63% of the projection time -- and leaving q, k, v
+and o a row at a time. Rows are walked in order inside a layer because row r's
+attention reads the KV the rows before it wrote, and the head is not batched at
+all: a prompt needs logits for its last token and no other, so the widest
+projection in the model is skipped n - 1 times rather than made n times wider.
+The prompt goes in chunks of 32, because the buffers scale with the batch and
+the probe's sweep flattens after 16.
 
-The step this section once named next was: Mesa splits a task's staged rows when
-`(cbuf_rows + staged) * entries_per_slice > total_entries` and charsiu never checks.
-Put the numbers in and it cannot fire.
+### Which weight format, answered
 
-An LLM matmul reaches the encoder as `input_width = 1`, `input_height = m`,
-`input_channels = K`, so `entries_per_slice` is 16 at K = 1024 and 32 at K = 2048.
-The RK3576 CBUF is 16 banks of 512 entries; Mesa's own budget is five banks usable
-and ten total. At m = 8 and K = 1024 that is **128 entries against 2560**. The
-over-budget test needs m > 320 and the split test needs m > 640; the row-window path
-needs `input_width >= 112`, and this shape is one wide. **Mesa does not split these
-either.** That much still stands.
-
-### And `surf` is not it either. The control failed.
-
-The next step after that was: every shape ever correct above one row has
-`charsiu_entries_per_row() == 1`, so the axis is entries per row rather than m. The
-rule was stated before the run -- K = 48 and K = 64 are surf 1 and have to be exact
-at m = 2 and m = 4, or the axis is not surf. **They were not.**
+Four numbers off the board, same model, same prompt, same 16 generated tokens:
 
 ```
-     K  surf   m   exact of      all values present
-    48     1   2       8 of 128       99 of 128
-    64     1   2       8 of 128       97 of 128
-   128     2   2       8 of 128       93 of 128
-   256     4   2       8 of 128       92 of 128
-  1024    16   2       8 of 128       95 of 128
+              int4     int8
+  prefill    19.24    26.60 tok/s
+  decode     15.46     9.16 tok/s
 ```
 
-Flat across the whole sweep, surf 1 to surf 16. **8 words exact at m = 2 and 8 at
-m = 4, at every K.** Whatever this is, it does not scale with K, and the `written =
-N + (N/4 + 12)(m - 1)` budget that fitted one K does not survive the others either.
+int8 is ahead on prefill and behind on decode, so it depends on the shape of
+the work. For a prompt of P tokens and G generated,
 
-### What the record was actually comparing: two different output paths
+  int8 wins  when  P * (1/19.24 - 1/26.60) > G * (1/9.16 - 1/15.46)
+             i.e.  P > 3.1 * G
 
-The shapes that computed correctly above one row -- M = 224 at K = 64, M = 3136 at
-K = 33 -- were measured by `tools/charsiu_matmul.c`, which takes the **requantised
-int8 output** and reads it as `[n/atom][m][n%atom]` with a 16 byte atom. Every m > 1
-failure was measured by `tools/npu_gemm_test.c`, which sets `acc_out = 1` for the
-**raw int32 accumulator** and reads it flat.
+**So int4 stays the default.** Chat is a short prompt and a long answer and int4
+wins it outright; int8 is for prompt-heavy work -- summarising a document,
+retrieval -- where the prompt is several times the answer.
 
-They have never run the same experiment. The runtime's decode path uses `acc_out`,
-so the layout that matters has never been established above one row, and the layout
-that was established does not apply to it.
+⚠ The batched prefill helps int4 too, and not because the matmul batches: it
+refuses there. It is that a prompt needs logits for its last token only, so the
+head is skipped n - 1 times whatever the format.
 
-⚠ The obvious guess is that the accumulator mirrors the same surface with a four
-word atom. It predicts 8 exact at m = 2, which is what the board wrote, and 16 at
-m = 4, where the board wrote 8. Right at one width and wrong at the next is the same
-shape of wrong answer the last four rounds produced, so it is written down here and
-not acted on.
+That was written here as an inference for a fortnight. It is now measured.
+`tests/prefill_control.sh` runs batched -> control -> batched on the same
+binary, one flag apart, and the two batched samples bracket the control so a
+board that warms over a minute cannot be mistaken for the flag:
 
-**Next**: run both probes at the same shape in one session, `charsiu_matmul 2 64 64`
-against `npu_gemm_test 64 64 --surf`. If the int8 path is exact at m = 2 where the
-accumulator path is not, then m > 1 is a reading problem in the accumulator path
-rather than a hardware wall, and the search collapses to one address function with a
-control that already works. If the int8 path fails too, the README's own table is
-stale and that has to be said.
+```
+  control   65 tok / 4304 ms   66.22 ms a token   15.10 tok/s
+  batched   65 tok / 3498 ms   53.82 ms a token   18.59 tok/s   (18.63, 18.54)
+                               ---------
+  saved                        12.40 ms a token
+```
 
-**Control**: `CHARSIU_OUT_ROWMAJOR=1 charsiu_matmul 2 64 64` reads the same run flat.
-It has to fail where the surface reading passes, or the surface reading is not doing
-any work.
+⚠ AND THE SAVING IS THE OUTPUT HEAD, TO WITHIN 1.4%, BY AN ARITHMETIC THAT
+NEVER SAW THESE TIMINGS. The head runs once instead of 65 times, so the saving
+per token is H * 64/65 and H is 12.59 ms. Llama-3.2-1B's head is 128256 x 2048,
+which at int4 is 131.3 MB of weights, and
+
+  131.3 MB / 12.59 ms = 10.43 GB/s
+
+against the 10.58 GB/s this model's own NPU summary reports for weight
+bandwidth. The time the batched prompt does not spend is exactly the time it
+takes to stream the head's weights, once per token, at the rate this board
+moves weights.
+
+⚠ And the control says what the baseline was: 15.10 tok/s prefill against a
+decode of 15.70. Without batching a prompt token costs what a generated one
+costs, which is where this started.
+
+⚠ It is a second copy of the layer loop and it is deliberately blind. It
+handles the plain case and REFUSES the rest -- gemma3's window and two rope
+bases, gemma4's per layer embeddings and shared KV, qwen3's q and k norms,
+phi3's fused K and V, biases, post norms, softcaps -- and the caller falls back
+to the token loop, which is correct for all seven architectures and merely
+slower. Refusing is not an error path, it is the other half of the same
+decision.
+
+⚠ SO PHI-3.5 HAS NO BATCHED PREFILL, and that is a real gap rather than a note.
+Its K and V arrive as one fused tensor, llama_prefill_batch refuses on the
+first layer, and its prompt costs 4.96 tok/s -- what a generated token costs.
+Splitting a fused qkv into three views is the whole of what it would take. It
+has not been done because nothing had measured what it was worth until the
+control above put a number on the head skip, and 12.4 ms a token is what phi3
+is leaving.
+
+⚠ And a refusal has to be AUDIBLE. batch_ok used to return 0 and the caller
+fell back in silence, so "the flag did nothing" and "this model was never
+batchable" looked identical from outside -- which is how the first attempt at
+the control above spent four minutes on Phi-3.5 and produced 4.96, 5.00 and
+5.10 tok/s, three numbers that agree and mean nothing. llama_batch_why_not
+returns the reason as a phrase now and every run prints one line saying which
+path its prompt took.
+
+⚠ And it runs without the NPU, which is what makes the risky half checkable off
+the board: matmul_rows falls back to matvec, so a host with no hardware
+compares the two layer loops and nothing else.
+
+### What it took, and the shape of every wrong turn
+
+Five rounds went into establishing that the int4 path cannot do this at all.
+w4a16 produces exactly ONE row: fed the same activation twice, row 1 comes back
+matching row 0 in 1 of 2048. The DPU and RDMA blocks are identical to a stream
+that does two rows, all 69 and all 22 registers, and every CNA word that
+differs was put back one at a time with a liveness check between them. The
+vendor never batches a weight matmul, so there is no M > 1 int4 stream to copy.
+
+Two registers on that path were literals chosen at M = 1, the one width where a
+value that follows the row count cannot show that it does: 0x40b8's 3, which is
+3 * rows, and 0x301c's half, which is zero either way at m = 1.
+
+The read order is `P = m/2`, super groups of 32, rows pairing P at a time with
+the four word runs alternating. Solved from two printed maps and confirmed at a
+width it was not fitted on.
 
 ## 2. The output head: routed, and it was worth 49 ms a token. DONE
 

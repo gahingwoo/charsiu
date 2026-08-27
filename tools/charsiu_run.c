@@ -124,6 +124,7 @@ int main(int argc, char **argv)
 	 */
 	int add_bos = -1, show_special = 0;
 	int ignore_eos = 0;
+	unsigned batch_probe = 0;
 	float temp = 0.0f, top_p = 0.9f;
 	uint64_t seed = 1234;
 	struct llama_model m;
@@ -167,6 +168,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bos")) add_bos = 1;
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
+		/*
+		 * ⚠ AFTER STAGING AND INSTEAD OF GENERATING. The question is
+		 * what batching buys on this board's own weights, and a token
+		 * loop would only add noise to it.
+		 */
+		else if (!strcmp(a, "--batch-probe") && i + 1 < argc)
+			batch_probe = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(a, "--hold-secs")) hold_secs = atoi(NEXT());
 		else if (!strcmp(a, "-i") || !strcmp(a, "--interactive"))
 			interactive = 1;
@@ -425,10 +433,103 @@ int main(int argc, char **argv)
 	t0 = now_ms();
 	const float *logits = NULL;
 
-	/* ⚠ st->pos, not i: turn two starts where turn one stopped */
-	for (i = 0; i < n_ids; i++)
-		logits = llama_forward(st, ids[i], st->pos);
+	/*
+	 * ⚠ THE PROMPT IN ONE GO WHERE THE MODEL ALLOWS IT, and a token at a
+	 * time where it does not. llama_prefill_batch refuses any architecture
+	 * it does not implement rather than computing something else, so the
+	 * fallback below is not an error path, it is the other half of the
+	 * same decision.
+	 *
+	 * CHARSIU_NO_BATCH_PREFILL forces the token loop, which is the control
+	 * every round of this needs: the generated text has to be identical.
+	 */
+	{
+		/*
+		 * ⚠ IN CHUNKS, BECAUSE THE BUFFERS SCALE WITH THE CHUNK. A
+		 * whole prompt as one batch means n rows of every intermediate
+		 * and n rows of the batched output buffer, which at a 512 token
+		 * prompt is tens of megabytes for nothing: the probe's own
+		 * sweep flattens after m = 16, so a longer batch buys almost no
+		 * rate and costs memory linearly.
+		 *
+		 * ⚠ AND THE FALLBACK IS DECIDED ONCE. If the first chunk is
+		 * refused the whole prompt goes through the token loop, rather
+		 * than half of it taking one path and half the other.
+		 */
+		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
+		int chunk = ec ? atoi(ec) : 32;
+		int done = 0;
+
+		if (chunk < 2)
+			chunk = 2;
+		if (!getenv("CHARSIU_NO_BATCH_PREFILL") && n_ids >= 2) {
+			int probe = n_ids < chunk ? n_ids : chunk;
+
+			if (!llama_prefill_batch(st, &m, ids, probe, st->pos)) {
+				done = probe;
+				while (done < n_ids) {
+					int c = n_ids - done < chunk
+					      ? n_ids - done : chunk;
+
+					if (c < 2 ||
+					    llama_prefill_batch(st, &m,
+							ids + done, c, st->pos))
+						break;
+					done += c;
+				}
+				logits = st->logits;
+			}
+		}
+		/* whatever is left, and everything if nothing was batched */
+		for (i = done; i < n_ids; i++)
+			logits = llama_forward(st, ids[i], st->pos);
+
+		/*
+		 * ⚠ AND SAY WHICH PATH IT TOOK. A run could not tell you this,
+		 * so a batched run and a control run at the same rate could
+		 * mean the flag did nothing OR the architecture was never
+		 * batchable, and a board round went on Phi-3.5 producing three
+		 * numbers that agreed and said nothing. One line, always, and
+		 * the reason when there is one.
+		 */
+		if (!quiet) {
+			const char *why = llama_batch_why_not(&m);
+
+			if (done >= n_ids)
+				fprintf(stderr, "charsiu: prompt batched, %d "
+					"tokens in chunks of %d\n",
+					n_ids, chunk);
+			else if (done > 0)
+				fprintf(stderr, "charsiu: prompt batched for "
+					"%d of %d tokens, the rest a token at "
+					"a time\n", done, n_ids);
+			else if (getenv("CHARSIU_NO_BATCH_PREFILL"))
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time (CHARSIU_NO_BATCH_PREFILL)\n");
+			else if (n_ids < 2)
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time (it is one token)\n");
+			else
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time -- this model is not batched: "
+					"%s\n", why ? why : "the batch was "
+					"refused at run time");
+		}
+	}
 	t_prompt = now_ms() - t0;
+
+	/*
+	 * ⚠ AFTER THE PROMPT, because the NPU tensors are staged lazily on the
+	 * first forward pass that touches each one. Probing before it would
+	 * find nothing routed and say so.
+	 */
+	if (batch_probe) {
+		llama_batch_probe(st, &m, batch_probe);
+		llama_state_free(st);
+		llama_free(&m);
+		return 0;
+	}
+
 	/*
 	 * ⚠ THE STAGE TIMERS START HERE, NOT AT THE FIRST TOKEN. Round 327
 	 * read its own stage table as a decode split and it was 86% the

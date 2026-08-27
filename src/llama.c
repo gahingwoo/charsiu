@@ -517,6 +517,614 @@ static double now_ms(void)
 	return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
 }
 
+/*
+ * WHAT BATCHING BUYS ON THIS BOARD, AND WHETHER IT IS RIGHT, which the first
+ * run said it is not.
+ *
+ * Not a synthetic matmul: the staged tensors of a real model, walked once so
+ * the weights come from memory the way a forward pass makes them.
+ *
+ * ⚠ IT SWEEPS m, and that is the point rather than a convenience. m = 2 and
+ * m = 4 are the widths charsiu_acc_index was solved on and m = 8 is the one it
+ * was confirmed on. 32 extrapolates both that expression and 0x40b8 = 3 * rows,
+ * which was swept to m = 4. If the small widths agree and the large ones do
+ * not, the plumbing is right and one of those two formulas stops somewhere. If
+ * m = 2 disagrees, it is the plumbing.
+ *
+ * ⚠ AND IT SAYS WHICH ROWS. A wrong permutation puts a neighbour's value in a
+ * slot; a wrong scale multiplies every slot. "Row 0 agrees and the rest do
+ * not" and "everything is off by a factor" are different faults, and one
+ * worst-case number cannot tell them apart.
+ */
+int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
+		      unsigned mmax)
+{
+	static const unsigned MS[] = { 2, 4, 8, 16, 32 };
+	float *X = NULL, *Y = NULL, *Yref = NULL;
+	struct charsiu_act a;
+	unsigned widest = 0;
+	int rc = -1;
+
+	if (!s->dev) {
+		fprintf(stderr, "charsiu: no NPU staged; nothing to batch\n");
+		return -1;
+	}
+	for (unsigned i = 0; i < s->n_npu; i++)
+		if (s->npu_id[i] >= 0 && s->npu[i].k > widest)
+			widest = (unsigned)s->npu[i].k;
+	/*
+	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
+	 * activation inside the timing loop and charged all of it to the one
+	 * row path, which is the side it was trying to beat.
+	 */
+	if (charsiu_act_alloc(&a, (int)widest) < 0)
+		return -1;
+
+	printf("\n  batching %u layers, checked before it is timed\n",
+	       m->n_layer);
+	printf("    m  tensors    worst rel   rows that agree"
+	       "     one row    batched  speedup  us a row    GB/s"
+	       "   where the batched time went, ms\n");
+
+	/*
+	 * ⚠⚠ TWO AXES AND SEVEN READINGS, at m = 2 on one tensor, before any
+	 * timing.
+	 *
+	 * charsiu_acc_index is solved and confirmed on the int8 accumulator on
+	 * the HEIGHT axis: exact at every N to 2048 and every m to 8. The
+	 * runtime's path is w4a16 int4, and job.c has known since round 347
+	 * that the vendor puts M on the WIDTH axis for that one, and that at
+	 * M = 1 the two axes collapse -- which is why decode never noticed and
+	 * why the comment saying so sat there while I looked everywhere else.
+	 *
+	 * So the axis and the reading are one question with two knobs, and this
+	 * asks both at once rather than fitting either.
+	 *
+	 * ⚠ ROW 0 IS NOT A CONTROL HERE. On the wrong axis it is wrong too --
+	 * the last round read "row 0 is exact" off six of two thousand values
+	 * and spent itself on the one term row 0 cannot see. Both rows are
+	 * counted and both are printed.
+	 */
+	if (getenv("CHARSIU_BATCH_SWEEP")) {
+		static const char *READS[] = { "acc", "flat", "2", "4", "8",
+					       "16", "32" };
+		static const char *AXES[] = { "h", "w" };
+		unsigned i0 = 0;
+
+		while (i0 < s->n_npu && s->npu_id[i0] < 0)
+			i0++;
+		if (i0 < s->n_npu) {
+			const struct npu_tensor *t = &s->npu[i0];
+			size_t nx = (size_t)2 * t->k, ny = (size_t)2 * t->n;
+
+			X = realloc(X, nx * sizeof(*X));
+			Y = realloc(Y, ny * sizeof(*Y));
+			Yref = realloc(Yref, ny * sizeof(*Yref));
+			if (X && Y && Yref) {
+				for (size_t j = 0; j < nx; j++)
+					X[j] = (float)(((j * 2654435761u) >> 9)
+						       & 0xff) / 255.0f - 0.5f;
+				for (unsigned r = 0; r < 2; r++) {
+					charsiu_act_set(&a, X + (size_t)r * t->k,
+							(int)t->k);
+					charsiu_act_blocks(&a);
+					/*
+					 * ⚠ int8's matvec READS a->q1 and the
+					 * float path does not, so without this
+					 * the reference came back all zeros on
+					 * an int8 model -- and the run that
+					 * finally produced both batched rows
+					 * scored 0 of 224 against it.
+					 */
+					if (charsiu_npu_needs_q1(s->dev))
+						charsiu_act_q1(&a);
+					charsiu_npu_matvec(s->dev, s->npu_id[i0],
+						&a, Yref + (size_t)r * t->n);
+				}
+				printf("\n  axis and reading, %s at m=2,"
+				       " %u channels a row\n",
+				       t->name, (unsigned)t->n);
+				printf("    axis  read     row0        row1\n");
+				setenv("CHARSIU_BATCH_ROWSTEP", "0", 1);
+				for (unsigned ax = 0; ax < 2; ax++) {
+					if (AXES[ax][0] == 'w')
+						setenv("CHARSIU_M_AXIS", "w", 1);
+					else
+						unsetenv("CHARSIU_M_AXIS");
+					for (unsigned q = 0; q < sizeof(READS)/sizeof(*READS); q++) {
+						unsigned ok0 = 0, ok1 = 0;
+
+						setenv("CHARSIU_BATCH_READ",
+						       READS[q], 1);
+						if (charsiu_npu_matmul(s->dev,
+							s->npu_id[i0], X, 2, Y))
+							continue;
+						for (unsigned j = 0; j < (unsigned)t->n; j++) {
+							double w0 = Yref[j];
+							double w1 = Yref[t->n + j];
+
+							if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+							if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+						}
+						printf("      %s  %-5s  %5u/%-5u  %5u/%-5u%s\n",
+						       AXES[ax], READS[q],
+						       ok0, (unsigned)t->n,
+						       ok1, (unsigned)t->n,
+						       (ok0 == t->n && ok1 == t->n)
+						       ? "   <== both rows" : "");
+					}
+				}
+				/*
+				 * ⚠ AND THE ROW TERM, on the reading that just
+				 * returned a whole row. Row 0 contributes
+				 * nothing to it, so it is a control that
+				 * cannot move: a step that changes row 0 is
+				 * measuring something else.
+				 */
+				unsetenv("CHARSIU_M_AXIS");
+				setenv("CHARSIU_BATCH_READ", "4", 1);
+				printf("\n    row step on the height axis,"
+				       " atom 4\n");
+				{
+				static const int STEPS[] = { 1, 2, 4, 8, 16, 32,
+							     64, 128, 256, 512,
+							     1024, 2048 };
+				for (unsigned q = 0; q < sizeof(STEPS)/sizeof(*STEPS); q++) {
+					char b[16];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%d", STEPS[q]);
+					setenv("CHARSIU_BATCH_ROWSTEP", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      step %5d   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s\n",
+					       STEPS[q], ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       ok1 == t->n ? "   <== that is it" : "");
+				}
+				}
+				unsetenv("CHARSIU_BATCH_ROWSTEP");
+				/*
+				 * ⚠ AND THE INPUT. Row 1 came back the right
+				 * magnitude and the wrong number at every row
+				 * step, which is a real dot product of the
+				 * wrong activation rather than a misplaced
+				 * one. Row 0 stays a control for pack 0; for
+				 * the others it moves, and that is information
+				 * too.
+				 */
+				printf("\n    input packing, height axis,"
+				       " atom 4 read\n");
+				for (int pk = 0; pk < 3; pk++) {
+					char b[8];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%d", pk);
+					setenv("CHARSIU_BATCH_PACK", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      pack %d %-22s row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s\n", pk,
+					       pk == 0 ? "[k/atom][m][atom]" :
+					       pk == 1 ? "rows contiguous" :
+							 "rows at the CBUF stride",
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       (ok0 == t->n && ok1 == t->n)
+					       ? "   <== both rows" : "");
+				}
+				unsetenv("CHARSIU_BATCH_PACK");
+				/*
+				 * ⚠⚠ AND 0x40b8, WHICH IS THE ONE REGISTER
+				 * WITH A KNOWN m DEPENDENCE.
+				 *
+				 * Everything else is now confirmed on this
+				 * path: the input surface (pack 0 is the only
+				 * one that gets row 0 at all), the weights, the
+				 * coefficients, the output group stride, and
+				 * the whole of row 0. Row 1 is absent at every
+				 * row step and every reading, which is not a
+				 * misplaced row, it is a row that was never
+				 * produced.
+				 *
+				 * 0x40b8 is ow * (2 * full_oh - win_orows), an
+				 * output height quantity, and 3 * rows was
+				 * swept on the int8 accumulator. w4a16 has its
+				 * own output stage -- wide8 is forced to zero
+				 * for int4 and w4_dpu takes over -- and nothing
+				 * has swept it there.
+				 *
+				 * ⚠ Row 0 is the control and it is a real one:
+				 * 2048 of 2048, and it has survived twelve row
+				 * steps and three packings without moving.
+				 */
+				printf("\n    DPU 0x40b8 on the int4 path,"
+				       " atom 4 read (6 = 3*rows today)\n");
+				for (unsigned v = 0; v <= 16; v++) {
+					char b[16];
+					unsigned ok0 = 0, ok1 = 0;
+
+					snprintf(b, sizeof(b), "%u", v);
+					setenv("CHARSIU_DPU_40B8", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      0x40b8 %3u   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s%s\n", v,
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       v == 6 ? "   <- today" : "",
+					       (ok0 == t->n && ok1 == t->n)
+					       ? "   <== both rows" : "");
+				}
+				unsetenv("CHARSIU_DPU_40B8");
+				/*
+				 * ⚠⚠ THE LAST REGISTER THAT COUNTS ROWS, and
+				 * the second one on this path chosen at a width
+				 * where it cannot show.
+				 *
+				 * 0x301c is lines, which is rows - 1, so at
+				 * M = 1 both halves of the word are zero and
+				 * the w4v form and the int8 form are the same
+				 * word. The w4v form puts M in the LOW half,
+				 * from a vendor capture that is M = 32 on the
+				 * WIDTH axis; everything else this file emits
+				 * is the height axis. CHARSIU_W4_301C=high puts
+				 * it in the half the rest of the stream uses.
+				 */
+				printf("\n    CORE 0x301c half, atom 4 read\n");
+				for (unsigned q = 0; q < 2; q++) {
+					unsigned ok0 = 0, ok1 = 0;
+
+					if (q)
+						setenv("CHARSIU_W4_301C", "high", 1);
+					else
+						unsetenv("CHARSIU_W4_301C");
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					printf("      M in the %-4s half   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u%s%s\n",
+					       q ? "high" : "low",
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       q ? "" : "   <- today",
+					       (ok0 == t->n && ok1 == t->n)
+					       ? "   <== both rows" : "");
+				}
+				unsetenv("CHARSIU_W4_301C");
+				/*
+				 * ⚠⚠ THE CNA, ONE WORD AT A TIME, AGAINST A
+				 * STREAM THAT PRODUCES TWO ROWS.
+				 *
+				 * Five knobs are swept and settled and row 1 is
+				 * still absent, so stop turning knobs. The int8
+				 * accumulator computes m = 2 at this shape and
+				 * its DPU and RDMA blocks are identical to
+				 * int4's, so the difference is seven CNA words.
+				 * Each is put back to the int8 value on its
+				 * own, which is round 260's method.
+				 */
+				/*
+				 * ⚠⚠ IS ROW 1 PRODUCED AT ALL? Ask before
+				 * explaining why it is wrong.
+				 *
+				 * Feed both rows the SAME activation. If the
+				 * block computes two rows, row 1 must come back
+				 * equal to row 0, which is already known exact.
+				 * If it stays absent, row 1 was never produced
+				 * and no amount of reading or placing it will
+				 * help. I asserted that for two rounds without
+				 * testing it.
+				 */
+				{
+					unsigned same = 0;
+
+					memcpy(X + t->k, X, t->k * sizeof(*X));
+					if (!charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y)) {
+						for (unsigned j = 0; j < (unsigned)t->n; j++) {
+							double w = Yref[j];
+
+							if (fabs(Y[t->n+j] - w) <= (fabs(w) > 1e-3 ? fabs(w)*1e-3 : 1e-3)) same++;
+						}
+						printf("\n    both rows fed the SAME"
+						       " activation: row1 matches"
+						       " row0 in %u of %u\n",
+						       same, (unsigned)t->n);
+						printf("      %s\n", same > 100
+						       ? "so two rows ARE produced and row 1 is misplaced"
+						       : "so row 1 is NOT produced at all");
+					}
+					for (size_t j = 0; j < nx; j++)
+						X[j] = (float)(((j * 2654435761u) >> 9)
+							       & 0xff) / 255.0f - 0.5f;
+				}
+
+				printf("\n    CNA geometry against the int8"
+				       " stream, one word at a time\n");
+				setenv("CHARSIU_BATCH_CNADIFF", "-1", 1);
+				charsiu_npu_matmul(s->dev, s->npu_id[i0], X, 2, Y);
+				for (int q = 0; q < 4; q++) {
+					char b[8];
+					unsigned ok0 = 0, ok1 = 0, well = 0;
+
+					snprintf(b, sizeof(b), "%d", q);
+					setenv("CHARSIU_BATCH_CNADIFF", b, 1);
+					if (charsiu_npu_matmul(s->dev,
+						s->npu_id[i0], X, 2, Y))
+						continue;
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w0 = Yref[j];
+						double w1 = Yref[t->n + j];
+
+						if (fabs(Y[j] - w0) <= (fabs(w0) > 1e-3 ? fabs(w0)*1e-3 : 1e-3)) ok0++;
+						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
+					}
+					/*
+					 * ⚠⚠ A HEALTH CHECK BETWEEN STEPS, and
+					 * this sweep exists because there was
+					 * not one. One override faulted the
+					 * IOMMU, the reset left the block with
+					 * MMU_DTE_ADDR not functioning, and the
+					 * seven steps after it returned the
+					 * same two numbers off a corpse. A
+					 * sweep without a liveness check is a
+					 * sweep that reports its first crash
+					 * seven more times.
+					 */
+					unsetenv("CHARSIU_BATCH_CNADIFF");
+					charsiu_act_set(&a, X, (int)t->k);
+					charsiu_act_blocks(&a);
+					if (charsiu_npu_needs_q1(s->dev))
+						charsiu_act_q1(&a);
+					if (!charsiu_npu_matvec(s->dev,
+						s->npu_id[i0], &a, Y))
+						for (unsigned j = 0; j < (unsigned)t->n; j++) {
+							double w = Yref[j];
+
+							if (fabs(Y[j] - w) <= (fabs(w) > 1e-3 ? fabs(w)*1e-3 : 1e-3)) well++;
+						}
+					printf("      cnadiff %d   row0 %5u/%-5u"
+					       "   row1 %5u/%-5u   alive %u/%u%s\n", q,
+					       ok0, (unsigned)t->n,
+					       ok1, (unsigned)t->n,
+					       well, (unsigned)t->n,
+					       well < t->n ? "   ⚠ THE BLOCK IS GONE, stop reading here"
+					       : ok1 > 100 ? "   <== rows appear" : "");
+					if (well < t->n)
+						break;
+				}
+				unsetenv("CHARSIU_BATCH_CNADIFF");
+				unsetenv("CHARSIU_BATCH_READ");
+			}
+		}
+	}
+
+	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
+		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
+
+		if (mr > mmax)
+			break;
+		{
+			double z;
+
+			charsiu_npu_batch_split(s->dev, &z, &z, &z, &z, 1);
+		}
+		for (unsigned i = 0; i < s->n_npu; i++) {
+			const struct npu_tensor *t = &s->npu[i];
+			size_t nx, ny;
+
+			if (s->npu_id[i] < 0)
+				continue;
+			nx = (size_t)mr * t->k;
+			ny = (size_t)mr * t->n;
+			X = realloc(X, nx * sizeof(*X));
+			Y = realloc(Y, ny * sizeof(*Y));
+			Yref = realloc(Yref, ny * sizeof(*Yref));
+			if (!X || !Y || !Yref)
+				goto out;
+			/* every row different, or a batch could be right by
+			 * copying one row over the rest */
+			for (size_t j = 0; j < nx; j++)
+				X[j] = (float)(((j * 2654435761u) >> 9) & 0xff)
+				     / 255.0f - 0.5f;
+
+			{
+				double t0 = now_ms();
+
+				for (unsigned r = 0; r < mr; r++) {
+					charsiu_act_set(&a, X + (size_t)r * t->k,
+							(int)t->k);
+					charsiu_act_blocks(&a);
+					/*
+					 * ⚠ int8's matvec READS a->q1 and the
+					 * float path does not, so without this
+					 * the reference came back all zeros on
+					 * an int8 model -- and the run that
+					 * finally produced both batched rows
+					 * scored 0 of 224 against it.
+					 */
+					if (charsiu_npu_needs_q1(s->dev))
+						charsiu_act_q1(&a);
+					charsiu_npu_matvec(s->dev, s->npu_id[i],
+						&a, Yref + (size_t)r * t->n);
+				}
+				t_one += now_ms() - t0;
+			}
+			{
+				double t0 = now_ms();
+
+				if (charsiu_npu_matmul(s->dev, s->npu_id[i], X,
+						       mr, Y))
+					continue;
+				t_bat += now_ms() - t0;
+			}
+			for (unsigned r = 0; r < mr; r++) {
+				int ok = 1;
+
+				for (unsigned j = 0; j < (unsigned)t->n; j++) {
+					size_t o = (size_t)r * t->n + j;
+					double d = fabs((double)Y[o]
+							- (double)Yref[o]);
+					double sc = fabs((double)Yref[o]);
+					double rel = sc > 1e-3 ? d / sc : d;
+
+					if (rel > worst)
+						worst = rel;
+					if (rel > 1e-3)
+						ok = 0;
+				}
+				rows_ok += ok;
+				rows_tot++;
+			}
+			/*
+			 * ⚠⚠ WRONG PLACE OR WRONG NUMBER, which are different
+			 * faults and the row count above cannot tell apart.
+			 *
+			 * This is the question that cracked the accumulator's
+			 * layout twice: are the wanted values IN the buffer at
+			 * all? If they are, the arithmetic is right and only
+			 * the order is wrong, and an order is something a map
+			 * can be read for. If they are not, the order is
+			 * irrelevant until the numbers are fixed.
+			 *
+			 * Only the first tensor, and only at the narrowest m,
+			 * because it is O(n^2) in the row.
+			 */
+			if (!tested && mr == MS[0]) {
+				size_t live = 0, tot = (size_t)mr * t->n;
+
+				for (size_t q = 0; q < tot; q++)
+					for (size_t o = 0; o < tot; o++) {
+						double d = fabs((double)Y[o]
+							  - (double)Yref[q]);
+						double sc = fabs((double)Yref[q]);
+
+						if (d <= (sc > 1e-3 ? sc * 1e-3
+								    : 1e-3)) {
+							live++;
+							break;
+						}
+					}
+				printf("  %s at m=%u: %zu of %zu wanted values"
+				       " are somewhere in the batch\n",
+				       t->name, mr, live, tot);
+				/*
+				 * ⚠ BOTH ROWS OF BOTH PATHS. Row 0 came back
+				 * exact and the run still agreed on nothing,
+				 * so the question is what row 1 is: a copy of
+				 * row 0 means the activation was packed once,
+				 * and numbers belonging to neither row mean it
+				 * was computed wrong.
+				 */
+				for (unsigned r = 0; r < mr && r < 3; r++) {
+					printf("    row%u batched  ", r);
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%9.3f",
+						       Y[(size_t)r * t->n + j]);
+					printf("\n    row%u one row  ", r);
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%9.3f",
+						       Yref[(size_t)r * t->n + j]);
+					printf("\n");
+				}
+				/*
+				 * ⚠ AND WHERE THE MISSING ONES ARE. 74% present
+				 * with row 0 exact says the loss is not spread
+				 * evenly, and a per row count says which row
+				 * lost them.
+				 */
+				for (unsigned r = 0; r < mr && r < 4; r++) {
+					size_t have = 0;
+
+					for (unsigned j = 0; j < (unsigned)t->n; j++) {
+						double w = Yref[(size_t)r * t->n + j];
+						double lim = fabs(w) > 1e-3
+							   ? fabs(w) * 1e-3 : 1e-3;
+
+						for (size_t o = 0; o < tot; o++)
+							if (fabs((double)Y[o] - w) <= lim) {
+								have++;
+								break;
+							}
+					}
+					printf("    row%u: %zu of %u of its values"
+					       " are in the batch\n",
+					       r, have, (unsigned)t->n);
+				}
+			}
+			/* what the hardware moved: the weights, once */
+			mb += (double)t->k * t->n / 1e6;
+			tested++;
+		}
+		if (!tested)
+			continue;
+		/*
+		 * ⚠ GB/s, BECAUSE A SPEEDUP CANNOT SAY WHETHER THERE IS ROOM
+		 * LEFT. 3.73x against a one row loop sounds finished; the same
+		 * run at 1.3 GB/s against a 9.5 GB/s hardware path says most of
+		 * the time is not the hardware at all.
+		 */
+		{
+			double pk, sb, fn, rd;
+
+			charsiu_npu_batch_split(s->dev, &pk, &sb, &fn, &rd, 1);
+			printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms"
+			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
+			       "   pack %4.0f  submit %3.0f  fence %5.0f"
+			       "  read %4.0f\n",
+			       mr, tested, worst, rows_ok, rows_tot, t_one,
+			       t_bat, t_bat > 0 ? t_one / t_bat : 0.0,
+			       t_bat * 1e3 / (tested * (double)mr),
+			       t_bat > 0 ? mb / t_bat : 0.0,
+			       pk, sb, fn, rd);
+		}
+		rc = 0;
+	}
+	printf("\n  ⚠ a speed with rows that do not agree is the speed of a"
+	       " wrong answer.\n  the bar is relative and 1e-3: these are float"
+	       " sums of thousands of\n  terms in two orders and will not be bit"
+	       " identical.\n");
+out:
+	charsiu_act_free(&a);
+	free(X); free(Y); free(Yref);
+	return rc;
+}
+
+
 static void act_set_timed(struct charsiu_act *a, const float *x, int n)
 {
 	double t;
@@ -2109,6 +2717,214 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			}
 		}
 	}
+}
+
+/*
+ * A PROMPT IN CHUNKS, WHICH IS WHERE THE BATCHED MATMUL PAYS.
+ *
+ * Every projection in a prompt is the same weights against a different row, so
+ * a token at a time re-streams the whole model per token. The probe measures
+ * 5.14x at m = 32 on the projections alone.
+ *
+ * ⚠⚠ THIS IS A SECOND COPY OF THE LAYER LOOP AND IT IS DELIBERATELY BLIND.
+ *
+ * llama_forward carries seven architectures: gemma3's sliding window and two
+ * rope bases, gemma4's per layer embeddings and shared KV, qwen3's q and k
+ * norms, biases, post norms, the softcaps. Reimplementing all of that here is
+ * how two copies quietly stop agreeing. So this handles the plain case and
+ * REFUSES the rest, once and up front, and the caller falls back to the token
+ * loop -- which is correct for all seven and merely slower.
+ *
+ * ⚠ WHAT IS BATCHED: the feed forward, 63% of the projection time (gate and up
+ * 39%, down 24%). q, k, v and o stay one row at a time, because batching those
+ * means duplicating the attention half too, and that is where the architectures
+ * differ. Rows are still walked in order inside a layer: row r's attention
+ * reads the KV that the rows before it wrote.
+ *
+ * ⚠ AND THE HEAD IS NOT BATCHED AT ALL. A prompt needs logits for its last
+ * token and no other, so the widest projection in the model is skipped n - 1
+ * times rather than made n times wider.
+ */
+static int npu_id_for(struct llama_state *s, const struct gguf_tensor *w)
+{
+	const struct npu_tensor *nt;
+
+	if (!npu_mode() || !s->dev || w->type == GGML_F32 || w->type == GGML_F16)
+		return -1;
+	nt = npu_get(s, w);
+	if (!nt)
+		return -1;
+	for (unsigned i = 0; i < s->n_npu; i++)
+		if (&s->npu[i] == nt)
+			return s->npu_id[i];
+	return -1;
+}
+
+/* n rows through one set of weights, or the same thing a row at a time */
+static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
+		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
+{
+	int id = npu_id_for(s, w);
+
+	if (id >= 0 && !charsiu_npu_matmul(s->dev, id, X, (unsigned)n, Y))
+		return 0;
+	/*
+	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
+	 * above can only ever be checked on the board. matvec is the same call
+	 * llama_forward makes, so a run with no hardware at all compares the
+	 * two layer loops and nothing else.
+	 */
+	for (int r = 0; r < n; r++)
+		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	return 0;
+}
+
+/*
+ * ⚠ WHY IT WILL NOT, NOT JUST THAT IT WILL NOT. A refusal that returns 0 makes
+ * the caller fall back silently, and a board log then shows a batched run and a
+ * control run at the same rate with nothing to say which of the two things that
+ * means: the flag did nothing, or the architecture was never batchable and both
+ * halves ran the same code. That cost a whole round on Phi-3.5, where wk and wv
+ * are fused and this refuses on the first layer.
+ *
+ * The string is the reason and NULL means it will batch.
+ */
+const char *llama_batch_why_not(const struct llama_model *m)
+{
+	if (m->n_swa)
+		return "sliding window attention";
+	if (m->v_norm)
+		return "a value norm";
+	if (m->n_embd_pl)
+		return "per layer embeddings";
+	if (m->final_softcap > 0.0f)
+		return "a final softcap";
+	if (kv_posmajor())
+		return "a position major KV cache";
+	for (uint32_t l = 0; l < m->n_layer; l++) {
+		const struct llama_layer *L = &m->layers[l];
+
+		if (!L->wk || !L->wv)
+			return "fused or absent K and V projections";
+		if (L->bq)
+			return "a query bias";
+		if (L->q_norm)
+			return "a query norm";
+		if (L->kv_from >= 0)
+			return "KV shared between layers";
+		if (L->attn_post_norm)
+			return "a post attention norm";
+		if (L->ffn_post_norm)
+			return "a post feed forward norm";
+		if (L->n_ff != m->layers[0].n_ff)
+			return "a feed forward width that varies by layer";
+	}
+	return NULL;
+}
+
+static int batch_ok(const struct llama_model *m)
+{
+	return llama_batch_why_not(m) == NULL;
+}
+
+int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
+			const int32_t *toks, int n, int pos0)
+{
+	uint32_t hd = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
+	uint32_t kvdim = m->n_head_kv * hd, nff = m->layers[0].n_ff;
+	uint32_t gqa = m->n_head / m->n_head_kv;
+	float scale = m->attn_scale != 0.0f ? m->attn_scale
+					    : 1.0f / sqrtf((float)hd);
+
+	if (n < 2 || !batch_ok(m))
+		return -1;
+	if (s->bx_n < (unsigned)n) {
+		free(s->bx); free(s->bxb); free(s->bhb);
+		free(s->bhb2); free(s->bxo); free(s->bcs);
+		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
+		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
+		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
+		s->bhb = malloc((size_t)n * nff * sizeof(float));
+		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
+		s->bcs = malloc((size_t)hd * sizeof(float));
+		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
+		    !s->bcs) {
+			s->bx_n = 0;
+			return -1;
+		}
+		s->bx_n = n;
+	}
+
+	for (int r = 0; r < n; r++) {
+		float *xr = s->bx + (size_t)r * m->n_embd;
+
+		gguf_row_f32(m->tok_embd, (uint64_t)toks[r], xr);
+		if (m->embd_scale != 1.0f)
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				xr[i] *= m->embd_scale;
+	}
+
+	for (uint32_t l = 0; l < m->n_layer; l++) {
+		const struct llama_layer *L = &m->layers[l];
+
+		for (int r = 0; r < n; r++) {
+			float *xr = s->bx + (size_t)r * m->n_embd;
+			int pos = pos0 + r;
+
+			rope_table(s->bcs, hd, pos, m->rope_base, NULL);
+			rmsnorm(s->xb, xr, L->attn_norm, m->n_embd, m->rms_eps);
+			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
+				    L->wv, s->v);
+			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
+			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
+			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+				size_t off = ((size_t)(l * m->n_head_kv + kh)
+					      * s->n_ctx + pos) * hd;
+
+				memcpy(s->kcache + off, s->k + kh * hd,
+				       hd * sizeof(float));
+				memcpy(s->vcache + off, s->v + kh * hd,
+				       hd * sizeof(float));
+			}
+			{
+				struct attn_job aj = { s, l, pos, 0, hd, hd,
+						       kvdim, gqa,
+						       m->n_head_kv, scale };
+
+				attn_heads(&aj, 0, m->n_head);
+			}
+			matvec(s, L->wo, s->xb, s->xb2);
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				xr[i] += s->xb2[i];
+			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
+				m->n_embd, m->rms_eps);
+		}
+
+		matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd, nff);
+		matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd, nff);
+		for (int r = 0; r < n; r++) {
+			if (m->ffn_gelu)
+				gelu_mul(s->bhb + (size_t)r * nff,
+					 s->bhb2 + (size_t)r * nff, nff);
+			else
+				silu_mul(s->bhb + (size_t)r * nff,
+					 s->bhb2 + (size_t)r * nff, nff);
+		}
+		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
+		for (int r = 0; r < n; r++) {
+			float *xr = s->bx + (size_t)r * m->n_embd;
+			const float *o = s->bxo + (size_t)r * m->n_embd;
+
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				xr[i] += o[i];
+		}
+	}
+
+	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
+		m->n_embd, m->rms_eps);
+	matvec(s, m->output, s->xb, s->logits);
+	s->pos = pos0 + n;
+	return 0;
 }
 
 const float *llama_forward(struct llama_state *s, int32_t token, int pos)

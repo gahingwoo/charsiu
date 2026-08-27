@@ -25,7 +25,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
-     $(BUILD)/npu_gemm_test \
+     $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
      $(BUILD)/tokenizer_roundtrip
 
 $(BUILD):
@@ -35,6 +35,18 @@ $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# ⚠ THE OTHER m > 1 PROBE, AND IT HAD NO NATIVE TARGET AT ALL.
+#
+# npu_gemm_test asks the hardware for the raw int32 accumulator and reads it
+# flat; this one takes the requantised int8 output and reads it as a surface,
+# and it is the only thing that has ever computed more than one row correctly
+# (M = 224 and M = 3136, August). Those two answers have to be comparable in one
+# session on one build, and until now this could only be reached through
+# `make board`, which cross compiles. A board round asking for it got
+# "No such file or directory".
+$(BUILD)/charsiu_matmul: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the CPU decode loop: the oracle every NPU version is diffed against

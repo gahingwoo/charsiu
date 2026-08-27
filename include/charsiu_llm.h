@@ -222,6 +222,16 @@ int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
+/*
+ * M rows through one set of weights, which is the whole of prefill. X is m by
+ * the tensor's K and Y is m by its N, both row major. Decode does not use this
+ * and charsiu_npu_matvec is unchanged.
+ */
+int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
+			unsigned m, float *Y);
+/* what the batched calls spent, in ms: packing, submitting, the fence, reading */
+void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
+			     double *fence, double *read, int reset);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);
@@ -480,6 +490,13 @@ struct llama_state {
 	float *vcache;
 
 	float *x, *xb, *xb2;   /* n_embd */
+	/*
+	 * ⚠ THE BATCHED PREFILL'S OWN ROWS, allocated only if a prompt takes
+	 * that path and never touched by a decode, which is one row and uses
+	 * the three above.
+	 */
+	float *bx, *bxb, *bhb, *bhb2, *bxo, *bcs;
+	unsigned bx_n;
 	float *hb, *hb2;       /* n_ff */
 	float *q;              /* n_head * head_dim */
 	float *k, *v;          /* n_head_kv * head_dim */
@@ -515,6 +532,29 @@ void llama_state_free(struct llama_state *s);
  * project has left to move, so it has to be reported without staging in it.
  */
 double llama_stage_ms(void);
+
+/*
+ * What batching buys on this board: m calls to matvec against one call to
+ * matmul, over the model's own staged tensors, checked for agreement first.
+ */
+int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
+		      unsigned mrows);
+
+/*
+ * A prompt in chunks of n, batching the feed forward across the rows. Returns
+ * 0 having advanced s->pos and left the LAST row's logits in s->logits, or -1
+ * if it will not take this model -- in which case the caller loops
+ * llama_forward, which is correct for every architecture and merely slower.
+ */
+int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
+			const int32_t *toks, int n, int pos0);
+
+/*
+ * Why llama_prefill_batch will refuse this model, as a short phrase, or NULL
+ * if it will take it. A caller that falls back should SAY which of the two
+ * happened: two runs at the same rate mean nothing without it.
+ */
+const char *llama_batch_why_not(const struct llama_model *m);
 
 /* One token in, a full logit vector out. `pos` is where it goes in the cache. */
 void llama_stages_reset(void);

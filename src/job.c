@@ -266,6 +266,51 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
 	return (size_t)ALIGN_UP(mm->n, 8) * 2;
 }
 
+/*
+ * ⚠⚠ THE ACCUMULATOR'S READ ORDER, SOLVED.
+ *
+ * With 0x40b8 following the row count every wanted value is in the buffer at
+ * every shape and every m measured, so the arithmetic is right and this is all
+ * that was left. locate() printed the map at m = 2 and again at m = 4, and one
+ * expression reproduces both, all 128 positions each, with nothing left over.
+ *
+ * Channels go in super groups of 32. Inside a super group the rows pair up P at
+ * a time, and inside a pair the four word runs alternate between the rows and
+ * between the two sixteen channel halves:
+ *
+ *   P = m/2
+ *   G = ni/32,  c = ni%32,  a = c/16,  t = c%16
+ *   j     = (t/4)*8P  +  (mi%P)*8  +  a*4  +  t%4
+ *   index = G*(m*32)  +  (mi/P)*(32P)  +  j
+ *
+ * At m = 2 that is P = 1: each row is its own block of 32 and the halves
+ * interleave, channels 0..3, 16..19, 4..7, 20..23. At m = 4 it is P = 2: rows
+ * pair into blocks of 64 and the two rows of a pair alternate every eight
+ * words. Both are what the board printed.
+ *
+ * ⚠ m = 1 IS FLAT AND IS NOT THIS. P would be zero, and the expression does not
+ * collapse to the identity at P = 1 either. Decode has read m = 1 flat for
+ * hundreds of rounds and the sweep scores it 64 of 64 flat, so it is a separate
+ * case rather than a limit of this one.
+ *
+ * ⚠ P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
+ * map has been printed. m = 8 is scored by the sweep and has not been read.
+ */
+size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
+{
+	unsigned P, G, c, a, t, j;
+
+	if (m < 2)
+		return ni;                      /* flat, and measured so */
+	P = m / 2;
+	G = ni / 32u;
+	c = ni % 32u;
+	a = c / 16u;
+	t = c % 16u;
+	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * 4u + (t % 4u);
+	return (size_t)G * m * 32u + (size_t)(mi / P) * (32u * P) + j;
+}
+
 size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 {
 	/*
@@ -936,10 +981,35 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		int w4v = mm->wdtype == CHARSIU_INT4 &&
 			  !getenv("CHARSIU_W4_BITPAT");
 
+		/*
+		 * ⚠⚠ AND THE w4v FORM OF 0x301c WAS CHOSEN WHERE IT CANNOT
+		 * SHOW, EXACTLY LIKE 0x40b8's LITERAL 3.
+		 *
+		 * lines is rows - 1, so at M = 1 it is ZERO and the two forms
+		 * -- lines, and lines << 16 -- are the SAME WORD. Round 347
+		 * picked the low half from a vendor capture, and that capture
+		 * is M = 32 on the WIDTH axis, where the low half is where M
+		 * belongs. This file's geometry is the height axis everywhere
+		 * else, so the low half makes the job disagree with itself
+		 * above one row, and at one row nothing could tell.
+		 *
+		 * On the board at m = 2 the batched path returns row 0 whole
+		 * and row 1 not at all, under every reading, every row step,
+		 * every input packing and every 0x40b8. A row that is misplaced
+		 * turns up somewhere; a row the block was never told to produce
+		 * does not.
+		 *
+		 * CHARSIU_W4_301C=high puts M back in the half the rest of this
+		 * stream uses. The default does not move until a board round
+		 * says which.
+		 */
+		const char *e31 = getenv("CHARSIU_W4_301C");
+		int high = e31 && !strcmp(e31, "high");
+
 		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
 		emit(&e, CORE, 0x301c,
 		     wide ? ((uint32_t)(rows - 1) << 16) | (ow - 1)
-			  : (w4v ? lines : ((uint32_t)lines << 16)));
+			  : ((w4v && !high) ? lines : ((uint32_t)lines << 16)));
 	}
 	/*
 	 * ⚠ int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
@@ -1222,9 +1292,49 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * trend: bytes written 112, 160, 208, 256, 208, 128, 64 and elements
 	 * exact 4, 8, 12, 64, 16, 16, 16 at 0, 1, 2, 3, 4, 7, 15.
 	 */
+	/*
+	 * ⚠⚠ AND ROUND 312 SWEPT IT AT M = 1, WHERE IT CANNOT VARY.
+	 *
+	 * The int8 arm computes ow * rows, which is the row count on the height
+	 * axis and does scale with M. The acc_out arm is a literal 3 at every
+	 * M, fitted on the one width where the two arms cannot be told apart.
+	 *
+	 * That is the shape of the m > 1 defect: charsiu_matmul, which takes
+	 * the int8 arm, is 128 of 128 bytes exact at M = 2 on the board, and
+	 * npu_gemm_test, which takes the acc_out arm, has never been right
+	 * above one row under any reading.
+	 *
+	 * ⚠⚠ AND THE BOARD SAID IT IS 3 * rows.
+	 *
+	 * Swept 0 to 16 at three widths, scoring every candidate under every
+	 * reading. The peak walks with M and nothing else comes near it:
+	 *
+	 *   m = 1   value  3   64 of 64     every other value 4, 8, 12 or 16
+	 *   m = 2   value  6   64 of 128    every other value 8 to 21
+	 *   m = 4   value 12   68 of 256    every other value 9 to 40
+	 *
+	 * 3, 6, 12 at m = 1, 2, 4. The literal was the m = 1 case of a value
+	 * that follows the row count, exactly as the int8 arm's does, and
+	 * round 312 could not have seen that: it swept at M = 1.
+	 *
+	 * ⚠ IT IS NOT THE WHOLE FIX. Each peak is worth about ONE ROW -- 64
+	 * values whatever m is -- so the other rows are still wrong. What this
+	 * buys is a reproducible signal well clear of the 8 to 20 noise floor,
+	 * and a default that cannot change decode, since 3 * rows is 3 at
+	 * m = 1.
+	 *
+	 * CHARSIU_DPU_40B8 replaces the value so the next sweep can hold it.
+	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
-	emit(&e, DPU, 0x40b8, (job->acc_out || charsiu_w4_paired(&job->mm)) ? 3u
-					   : (uint32_t)(ow * (2 * rows - rows)));
+	{
+		const char *e8b = getenv("CHARSIU_DPU_40B8");
+		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
+			   ? 3u * rows : (uint32_t)(ow * (2 * rows - rows));
+
+		if (e8b)
+			v = (uint32_t)strtoul(e8b, NULL, 0);
+		emit(&e, DPU, 0x40b8, v);
+	}
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
 	emit(&e, DPU, 0x40c8, 0x00000000);

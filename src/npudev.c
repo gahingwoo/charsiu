@@ -27,6 +27,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
@@ -75,6 +76,17 @@ struct npu_slot {
 };
 
 struct npu_entry {
+	/*
+	 * ⚠ THE BATCHED OUTPUT IS PER TENSOR, and that is the lesson decode
+	 * already paid for two hundred rounds ago: bo_prep and bo_fini are
+	 * cache maintenance over a WHOLE buffer object, so one buffer shared
+	 * across tensors has to be sized for the widest and every call pays
+	 * for all of it. Sized for nmax * m it reached 35 MB a device with the
+	 * head staged, and the chain that was supposed to remove the fence
+	 * spent more than it saved: 3.63x at m = 32 became 3.07x.
+	 */
+	struct charsiu_bo bout[2];
+	unsigned bout_m;
 	const struct npu_tensor *t;
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
 	unsigned first, count;     /* slots, n fastest */
@@ -157,6 +169,56 @@ struct charsiu_npu {
 	unsigned n_slot, slot_cap;
 	struct npu_entry *ent;
 	unsigned n_ent, ent_cap;
+	/*
+	 * ⚠ THE BATCHED PATH'S OWN BUFFERS, allocated on first use and never by
+	 * a decode. A slice's weights and coefficients do not depend on m and
+	 * are reused as staged; the register stream, the activation and the
+	 * output all do, so the batched path brings its own rather than
+	 * disturbing the ones decode has been reading for hundreds of rounds.
+	 */
+	struct charsiu_bo bin[2], breg[2];
+	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
+	unsigned bnks, bnslots;    /* and how many K slices and slots */
+	size_t bin_stride, bout_stride;
+	float *bscr;               /* m rows of one slice's K, gathered */
+	uint8_t *bq;               /* and quantised, for the int8 path */
+	/*
+	 * ⚠ THE READ ORDER AS A TABLE, because charsiu_acc_index costs four
+	 * integer divisions and the read back runs it once per output element:
+	 * 23 million of them for one m = 32 pass over a 1B model, which on an
+	 * A72 is most of a second. The mapping depends only on (m, n), so it is
+	 * built once and looked up.
+	 */
+	/*
+	 * ⚠⚠ BUILT ONCE, AT THE WIDEST SLICE THERE CAN BE.
+	 *
+	 * charsiu_acc_index costs four integer divisions and there is one
+	 * output element per call of it, so it is a table. What made the table
+	 * cost more than the loop it saved is that it was keyed on the tensor's
+	 * width and so REBUILT for every tensor: 113 of them twice over, each
+	 * m * n entries, which at m = 32 is most of the 283 ms the split
+	 * charged to reading.
+	 *
+	 * charsiu_acc_index does not depend on n AT ALL -- it is
+	 * (ni/32)*(m*32) + (mi/P)*(32P) + j, and n appears nowhere. So one
+	 * table at nmax serves every tensor, and a narrower slice just uses
+	 * fewer of each row's entries. It is rebuilt only when m changes.
+	 *
+	 * ⚠ INDEX IT AT THE STRIDE IT WAS BUILT WITH, never at the slice's own
+	 * width. Doing that cost exactly one tensor -- the head, whose last n
+	 * slice is 5376 against 8192 -- and 3585 rows of 3616.
+	 */
+	uint32_t *bmap;
+	unsigned bmap_m;
+	/*
+	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
+	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
+	 * extra is linear in the rows, about 20 ms a row, and a speedup against
+	 * a one row loop cannot say whether that is the hardware computing more
+	 * or this file preparing more, because both sides pay the CPU part.
+	 */
+	double bpack_us, bsub_us, bfence_us, bread_us;
+	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
 	/*
@@ -539,7 +601,21 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->max_n = max_n;
 	g->ent_cap = max_tensors;
 
-	g->w4 = getenv("CHARSIU_NPU_W4V") != NULL;
+	/*
+	 * ⚠ AN EMPTY VALUE MEANS OFF, and it did not. `!= NULL` makes
+	 * CHARSIU_NPU_W4V= turn int4 ON, which is the opposite of what anybody
+	 * types it for, and there is no other way to get int8 past a runner
+	 * that sets the variable itself. A board round meant to measure the
+	 * int8 batched path ran int4 and said so in its own report, which is
+	 * the only reason it was caught.
+	 *
+	 * `*e != '0'` is what npu_mode() and act_set() in this tree already do.
+	 */
+	{
+		const char *e4 = getenv("CHARSIU_NPU_W4V");
+
+		g->w4 = e4 && *e4 && *e4 != '0';
+	}
 	/*
 	 * SKIP THE FLUSH ON A BUFFER THE CPU ONLY READ.
 	 *
@@ -695,8 +771,15 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_ent; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
+		for (unsigned i = 0; i < g->n_ent; i++)
+			for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_free(g->dev[d], &g->ent[i].bout[d]);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
+			/* the batched path's, which a decode never allocates.
+			 * Its output is per entry and freed with them. */
+			charsiu_bo_free(g->dev[d], &g->bin[d]);
+			charsiu_bo_free(g->dev[d], &g->breg[d]);
 			charsiu_close(g->dev[d]);
 		}
 	}
@@ -708,6 +791,10 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->fscr);
 	free(g->afscr);
 	free(g->wpack);
+	free(g->bscr);
+	free(g->bq);
+	free(g->bd1);
+	free(g->bmap);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1516,6 +1603,435 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	}
 	g->call_us += now_us() - tcall;
 	charsiu_note("something outside the NPU code", 0, 0);
+	return 0;
+}
+
+/*
+ * M ROWS THROUGH ONE SET OF WEIGHTS, which is the whole of prefill.
+ *
+ * The vendor dispatches every one of its 3328 int4 projections at M = 1, so it
+ * re-streams all 487 MB of weights for every prompt token. At M = 32 the same
+ * bytes serve thirty two rows.
+ *
+ * ⚠ THIS DOES NOT TOUCH THE DECODE PATH. charsiu_npu_matvec is unchanged, and
+ * the control for every board round here is that the sentence and the tok/s do
+ * not move. A slice's weights and coefficients do not depend on m and are read
+ * exactly as staged; what does depend on m is the register stream, the packed
+ * activation and the output, so this brings its own buffers.
+ *
+ * ⚠ ONE SUBMIT PER SLICE, deliberately. Decode chains a projection's slices
+ * into one submit and that is worth having, but the first version of a path
+ * that has never run has no business also being the first version of a chained
+ * one. The weight bytes dominate either way.
+ *
+ * ⚠ int4 ONLY for now. That is what CHARSIU_NPU_W4V selects and what the
+ * runtime uses; int8 batched would need its own d1 handling and has no caller.
+ */
+/*
+ * ⚠⚠ SIZED FOR A CHAIN, NOT FOR ONE SLICE.
+ *
+ * The first version submitted a slice and waited a full fence on it, which the
+ * report priced: 5072 ms of 7448 was fence. Decode has chained a projection's
+ * slices into one submit per device since round 321 for exactly this reason,
+ * and the fence is what a chain removes.
+ *
+ * So every slice needs its own region rather than sharing one: its own packed
+ * activation (by K slice, since slices of the same K share it), its own output,
+ * and its own register stream. The three grow with m and with how many slices
+ * land on a device, so they are reallocated when either does and never by a
+ * decode, which uses none of them.
+ */
+static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
+		      unsigned nslots)
+{
+	size_t ins, outs, regs;
+
+	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
+		return 0;
+	if (m > g->bm)
+		g->bm = m;
+	if (nks > g->bnks)
+		g->bnks = nks;
+	if (nslots > g->bnslots)
+		g->bnslots = nslots;
+	m = g->bm; nks = g->bnks; nslots = g->bnslots;
+
+	/* the f16 packer writes k * 2 bytes a row; int8 writes one */
+	g->bin_stride = (size_t)g->kmax * m * (g->w4 ? 2 : 1);
+	ins = g->bin_stride * nks + 4096;
+	regs = (size_t)nslots * 4096;
+	outs = 0;
+
+	for (unsigned d = 0; d < g->ndev; d++) {
+		charsiu_bo_free(g->dev[d], &g->bin[d]);
+		charsiu_bo_free(g->dev[d], &g->breg[d]);
+		if (charsiu_bo_alloc(g->dev[d], ins, &g->bin[d]) ||
+		    charsiu_bo_alloc(g->dev[d], regs, &g->breg[d])) {
+			fprintf(stderr, "charsiu: the batch buffers wanted "
+				"%.1f MB and would not allocate\n",
+				(double)(ins + outs + regs) / 1e6);
+			whine(g, "the batch buffers would not allocate",
+			      g->kmax, g->nmax * m);
+			g->bm = 0;
+			return -1;
+		}
+	}
+	free(g->bscr);
+	free(g->bq);
+	free(g->bd1);
+	g->bscr = malloc((size_t)g->kmax * m * sizeof(*g->bscr));
+	g->bq = malloc((size_t)g->kmax * m);
+	/*
+	 * ⚠ ONE d1 PER SLOT PER ROW, not one per row. int8's activation scale
+	 * is per row AND is recomputed over each K slice's own range, and the
+	 * read back happens after every slice has been packed -- so a single
+	 * array would hand every slice the last one's scales.
+	 */
+	g->bd1 = malloc((size_t)nks * m * sizeof(*g->bd1));
+	if (!g->bscr || !g->bq || !g->bd1) {
+		whine(g, "the batch scratch would not allocate", g->kmax, m);
+		g->bm = 0;
+		return -1;
+	}
+	return 0;
+}
+
+void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
+			     double *fence, double *read, int reset)
+{
+	*pack = g->bpack_us / 1e3;
+	*sub = g->bsub_us / 1e3;
+	*fence = g->bfence_us / 1e3;
+	*read = g->bread_us / 1e3;
+	if (reset)
+		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
+}
+
+int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
+		       unsigned m, float *Y)
+{
+	struct npu_entry *e;
+	struct charsiu_joblist jl;
+	double t0;
+
+	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
+		return -1;
+	/*
+	 * ⚠⚠ int8 IS THE PATH THAT DOES MORE THAN ONE ROW, and that is not a
+	 * preference, it is the only thing on this board with evidence.
+	 *
+	 * npu_gemm_test is EXACT on the int8 accumulator at m = 1, 2, 4 and 8
+	 * and at every N from 32 to 2048. w4a16 produces ONE row and no
+	 * register makes it produce two: fed the same activation twice, row 1
+	 * comes back matching row 0 in 1 of 2048, and every word that differs
+	 * between the two streams has been put back one at a time -- the DPU
+	 * and RDMA blocks are identical to begin with, the CNA differences are
+	 * datatype scaling, CORE 0x301c is inert and 0x3018 is the arithmetic
+	 * switch. job.c has said since round 347 that the vendor runs w4a16 on
+	 * the WIDTH axis, and the vendor never batches a weight matmul at all,
+	 * so there is no M > 1 int4 stream anywhere to copy.
+	 *
+	 * Batching amortises the weight bytes over m rows, which is exactly
+	 * what makes int8's extra byte cheap: at m = 32 the same weights serve
+	 * thirty two rows either way.
+	 */
+	/*
+	 * ⚠⚠ int4 PRODUCES ONE ROW AND MUST REFUSE, and this guard was removed
+	 * by the commit that taught this function int8.
+	 *
+	 * w4a16 computes exactly one row whatever it is asked for. Five rounds
+	 * established that: fed the SAME activation twice, row 1 comes back
+	 * matching row 0 in 1 of 2048, the DPU and RDMA blocks are identical to
+	 * a stream that does two rows, and every CNA word that differs was put
+	 * back one at a time. Adding int8 replaced the refusal with a comment
+	 * about int8 being the path with evidence, and left nothing stopping
+	 * int4 from taking it.
+	 *
+	 * The board said so immediately and in the only way that counts. An
+	 * int4 prompt came back "ITES  (un- a- -  ( -  ' \ l'" at a very
+	 * respectable 37.46 tok/s, which is the speed of a wrong answer, and
+	 * the default config passes CHARSIU_NPU_W4V=1 -- so this was every
+	 * int4 model with a prompt of two tokens or more.
+	 *
+	 * The caller falls back to a row at a time, which is correct and is
+	 * what int4 did before any of this existed.
+	 */
+	if (g->w4) {
+		whine(g, "int4 computes one row: batching is int8 only",
+		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
+		return -1;
+	}
+	e = &g->ent[id];
+	if (e->n_npu != (unsigned)e->t->n) {
+		/* a CPU share would have to be batched too, and is not */
+		whine(g, "batched cannot split rows with the CPU",
+		      (unsigned)e->t->k, (unsigned)e->t->n);
+		return -1;
+	}
+	{
+		unsigned nslots[2] = { 0, 0 }, wide = 0, most;
+
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+
+			nslots[s->di]++;
+			if (s->job.mm.n > wide)
+				wide = (unsigned)s->job.mm.n;
+		}
+		most = nslots[0] > nslots[1] ? nslots[0] : nslots[1];
+		if (batch_bufs(g, m, e->k_slices, most))
+			return -1;
+		/*
+		 * ⚠ SIZED FOR THIS TENSOR'S OWN WIDEST SLICE, not for nmax.
+		 * attn_q is 2048 wide and the head is 8192; one buffer for both
+		 * makes attn_q pay the head's cache maintenance on every call.
+		 */
+		g->bout_stride = (size_t)wide * m * 4;
+		if (e->bout_m < m) {
+			for (unsigned d = 0; d < g->ndev; d++) {
+				if (charsiu_bo_alloc(g->dev[d],
+						     g->bout_stride * most + 4096,
+						     &e->bout[d])) {
+					whine(g, "the batched output would not allocate",
+					      (unsigned)e->t->k, wide * m);
+					e->bout_m = 0;
+					return -1;
+				}
+			}
+			e->bout_m = m;
+		}
+	}
+
+	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
+	t0 = now_us();
+
+	/*
+	 * ⚠ ONE SUBMIT PER DEVICE FOR THE WHOLE PROJECTION, and both issued
+	 * before either is waited on, which is what decode does. The fence was
+	 * 5072 ms of a 7448 ms report when this waited on every slice.
+	 */
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned nt = 0, nh = 0, done_ki = 0;
+		double tp = now_us();
+
+		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		g->handles[nh++] = g->bin[d].handle;
+
+		/*
+		 * ⚠⚠ ONCE PER K SLICE, NOT ONCE PER SLOT.
+		 *
+		 * A tensor's slots are n_slices wide by k_slices deep, and every
+		 * slot in a K column reads the SAME activation. Packing inside
+		 * the slot loop packed it n_slices times over -- sixteen times
+		 * for the output head -- and the time split says packing is 259
+		 * ms of a 758 ms pass at m = 32. The regions were already
+		 * indexed by K slice; this stops writing each one repeatedly.
+		 */
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+			unsigned sk = s->job.mm.k, ki = i / e->n_slices;
+			struct charsiu_matmul mm = s->job.mm;
+
+			if (s->di != d || ((done_ki >> ki) & 1u))
+				continue;
+			done_ki |= 1u << ki;
+			mm.m = m;
+			for (unsigned r = 0; r < m; r++)
+				memcpy(g->bscr + (size_t)r * sk,
+				       X + (size_t)r * e->t->k + s->k0,
+				       sk * sizeof(*g->bscr));
+			if (!g->w4) {
+				/*
+				 * int8's scale is per row and taken over THIS K
+				 * slice's own range, so it is kept per K slice
+				 * for the read back.
+				 */
+				for (unsigned r = 0; r < m; r++) {
+					float mx = 0.0f, d1;
+
+					for (unsigned kk = 0; kk < sk; kk++) {
+						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
+
+						if (v > mx)
+							mx = v;
+					}
+					d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+					g->bd1[(size_t)ki * m + r] = d1;
+					for (unsigned kk = 0; kk < sk; kk++) {
+						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] / d1);
+
+						if (q > 127) q = 127;
+						if (q < -127) q = -127;
+						g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
+					}
+				}
+				charsiu_pack_input(&mm, g->bq,
+						   (uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						   g->bin_stride, s->job.input_zero_point);
+			} else {
+				charsiu_pack_input_f16(&mm, g->bscr,
+						       (uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						       g->bin_stride);
+			}
+		}
+
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+			unsigned ki = i / e->n_slices;
+			struct charsiu_job job = s->job;
+			size_t nreg;
+
+			if (s->di != d)
+				continue;
+			job.mm.m = m;
+			job.input_addr = (uint32_t)g->bin[d].dma_address
+				       + (uint32_t)(ki * g->bin_stride);
+			job.output_addr = (uint32_t)e->bout[d].dma_address
+					+ (uint32_t)(nt * g->bout_stride);
+			nreg = charsiu_emit_job(&job,
+					(uint64_t *)((uint8_t *)g->breg[d].map + (size_t)nt * 4096),
+					4096 / 8);
+			if (!nreg) {
+				whine(g, "the batched register stream came back empty",
+				      (unsigned)job.mm.k, (unsigned)job.mm.n);
+				charsiu_bo_fini(g->dev[d], &g->bin[d]);
+				charsiu_bo_fini(g->dev[d], &g->breg[d]);
+				return -1;
+			}
+			g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
+					    + (uint32_t)(nt * 4096);
+			g->tasks[nt].regcmd_count = (unsigned)nreg;
+			g->handles[nh++] = s->wt.handle;
+			g->handles[nh++] = s->coef.handle;
+			nt++;
+			g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
+		}
+		charsiu_bo_fini(g->dev[d], &g->bin[d]);
+		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_us += now_us() - tp;
+		if (!nt)
+			continue;
+		tp = now_us();
+		jl.tasks = g->tasks;
+		jl.task_count = nt;
+		jl.in_handles = g->handles;
+		jl.in_count = nh;
+		jl.out_handles = &e->bout[d].handle;
+		jl.out_count = 1;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			g->dead = 1;
+			return -1;
+		}
+		g->submits++;
+		g->bsub_us += now_us() - tp;
+	}
+
+	/* ⚠ both submitted, then both waited on: that is the point */
+	for (unsigned d = 0; d < g->ndev; d++) {
+		double tf = now_us();
+		unsigned nt;
+
+		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
+		g->bfence_us += now_us() - tf;
+		tf = now_us();
+		{
+			if (g->bmap_m != m) {
+				uint32_t *t2 = realloc(g->bmap,
+					(size_t)m * g->nmax * sizeof(*t2));
+
+				if (!t2) {
+					whine(g, "the read order table would not allocate",
+					      m, g->nmax);
+					return -1;
+				}
+				g->bmap = t2;
+				for (unsigned r = 0; r < m; r++)
+					for (unsigned j = 0; j < g->nmax; j++)
+						g->bmap[(size_t)r * g->nmax + j] =
+						  (uint32_t)charsiu_acc_index(r, j, m);
+				g->bmap_m = m;
+			}
+			/*
+			 * ⚠⚠ NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
+			 * LOST TWICE.
+			 *
+			 * Round one: 283 ms became 463, and I blamed the table
+			 * being rebuilt inside every dispatch. Round two, with
+			 * the table built once and nothing in the worker but
+			 * the gather: 241 ms became 430. Same 190 ms either
+			 * time, which is what says it is the pool and not the
+			 * work -- 226 dispatches a pass, one per tensor per
+			 * device, at about 0.84 ms of barrier each.
+			 *
+			 * The work per dispatch is one tensor's rows, and there
+			 * is not enough of it to pay for a wakeup. Parallelism
+			 * here would have to be at a coarser grain than a
+			 * tensor, which means the caller's loop rather than
+			 * this one.
+			 */
+			nt = 0;
+			for (unsigned i = 0; i < e->count; i++) {
+				const struct npu_slot *s = &g->slot[e->first + i];
+				unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+				const float *fo;
+				const int32_t *io;
+				int grp = tensor_grouped(g, e->t);
+
+				if (s->di != d)
+					continue;
+				fo = (const float *)((uint8_t *)e->bout[d].map
+						     + (size_t)nt * g->bout_stride);
+				io = (const int32_t *)fo;
+				/*
+				 * ⚠ THE TABLE IS BUILT AT `wide` AND A SLICE
+				 * CAN BE NARROWER -- the head's last one is
+				 * 5376 against 8192. charsiu_acc_index does not
+				 * depend on n at all, so the table is valid for
+				 * any narrower slice, but only if the entries
+				 * beyond its width are skipped rather than the
+				 * stride being changed. Indexing it at sn
+				 * instead cost exactly one tensor: 3585 rows of
+				 * 3616.
+				 */
+				for (unsigned r = 0; r < m; r++) {
+					const uint32_t *mp = g->bmap
+							  + (size_t)r * g->nmax;
+					float *yr = Y + (size_t)r * e->t->n
+						  + s->n0;
+
+					if (g->w4 && grp) {
+						const float *sc = s->sc;
+
+						for (unsigned j = 0; j < sn; j++)
+							yr[j] += fo[mp[j]] * sc[j];
+					} else if (g->w4) {
+						for (unsigned j = 0; j < sn; j++)
+							yr[j] += fo[mp[j]];
+					} else {
+						float d1 = g->bd1[(size_t)ki * m + r];
+
+						for (unsigned j = 0; j < sn; j++)
+							yr[j] += (float)io[mp[j]] * d1;
+					}
+				}
+				nt++;
+			}
+		}
+		g->bread_us += now_us() - tf;
+		if (!g->nofini)
+			charsiu_bo_fini(g->dev[d], &e->bout[d]);
+	}
+
+	g->busy_us += now_us() - t0;
+
+	/* an ungrouped tensor is scaled once, per channel, at the end; int8
+	 * always is, because its d1 went in above */
+	if (!g->w4 || !tensor_grouped(g, e->t))
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned j = 0; j < (unsigned)e->t->n; j++)
+				Y[(size_t)r * e->t->n + j] *= e->t->scale[j];
 	return 0;
 }
 

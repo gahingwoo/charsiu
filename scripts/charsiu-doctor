@@ -114,6 +114,15 @@ done
 hdr "the configuration"
 if [ -f "$CONF" ]; then
 	ok "config at $CONF"
+	# ⚠ SAY WHICH CHANNEL. A dev install has the probes on it and a paste
+	# from one is a different thing to read: npu_gemm_test and
+	# charsiu_matmul can wedge the block, so "it hung" from a dev board and
+	# from a stable one are not the same report.
+	_ch=$(ini_get update channel); : "${_ch:=stable}"
+	case "$_ch" in
+	dev) info "channel dev: the hardware probes are installed" ;;
+	*)   ok "channel $_ch" ;;
+	esac
 else
 	bad "no config at $CONF. Run charsiu-config"
 fi

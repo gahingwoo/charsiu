@@ -24,7 +24,7 @@ on the fence, and one millisecond of a token unaccounted for.
 ## Install
 
 ```
-curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh | sh
 ```
 
 It fetches the source, checks whether the running kernel can drive the NPU, and
@@ -39,12 +39,33 @@ something so you can see it work.
 Rehearse it first if you would rather:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh -o install.sh
 sh install.sh --dry-run
 ```
 
 `--dry-run` prints every action as `would ...` and changes nothing. The read-only
 checks still run, which is the point: it is what the installer *sees* on your machine.
+
+### Two channels
+
+**stable** is what the line above installs: the runtime, and nothing else.
+
+**dev** adds the hardware probes -- `npu_gemm_test`, `charsiu_matmul`,
+`bench_batch` -- and tracks `main`, where the work happens. They exist to ask the
+silicon questions, and asking has wedged the block, timed out and printed the
+opposite of its own data on the way to the answers. They are not something to
+install on a board you want to rely on.
+
+```
+sh install.sh --dev          the probes too, from the start
+charsiu update dev           switch an existing install, no reinstall needed
+charsiu update stable        go back
+charsiu update               whichever it was last told, remembered
+```
+
+`charsiu doctor` says which channel it is on, which matters when a log gets
+pasted somewhere: "it hung" from a board with the probes on it and from one
+without are not the same report.
 
 After that:
 
@@ -176,9 +197,12 @@ were wrong in this file before:
 ⚠ **The three paragraphs above are where this stood when the matmul was the whole
 question, and they are kept because the reasoning in them is still the reasoning.**
 What they say is left has since been done: models run, int4 computes end to end, and
-the numbers at the top of this file are measured rather than projected. What is still
-open is further down -- prefill above M = 1, and an output head that a stale width cap
-had been keeping on the CPU.
+the numbers at the top of this file are measured rather than projected. The two items
+this paragraph used to name as open have closed since -- prefill batches above M = 1,
+and the stale width cap that kept an output head on the CPU is gone. What is still
+open is narrower and further down: w4a16 computes exactly one row whatever it is
+asked for, so an int4 prompt gains only the skipped output head, and phi3 does not
+batch at all because its K and V arrive fused.
 
 One thing on that list has not moved: the reference still requantises in float where
 the hardware uses an integer scale and shift. It agrees to the byte on everything

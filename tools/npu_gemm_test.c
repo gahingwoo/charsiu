@@ -636,6 +636,333 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * surf 1 entries are the control, and they have to pass or the run says
  * nothing about surf at all.
  */
+/*
+ * ⚠⚠ THE HARDWARE COMPUTES m > 1. THE READING IS WHAT IS WRONG.
+ *
+ * charsiu_matmul asks for the REQUANTISED INT8 output and reads it as
+ * [n/atom][m][n%atom] with a 16 byte atom. On the board at M=2 K=64 N=64 that
+ * is 128 of 128 bytes exact, and the same run read flat
+ * (CHARSIU_OUT_ROWMAJOR=1) is 52 of 128. So the surface reading is doing real
+ * work and the block is computing both rows.
+ *
+ * This tool asks for acc_out, the raw int32 accumulator, and reads it flat. It
+ * has never been right above one row. The accumulator is four bytes where the
+ * int8 output is one, so if the surface is the same shape the atom is a
+ * different number of ELEMENTS, and nobody has measured which.
+ *
+ * ⚠ DO NOT GUESS IT. The nearest guess -- a 16 byte atom, so four words --
+ * predicts 8 positions surviving a flat read at m=2, which is what the board
+ * writes, and 16 at m=4, where the board writes 8. Right at one width and
+ * wrong at the next is what four rounds of fitting produced. So this asks the
+ * board instead: same buffer, every candidate reading, one exact count each.
+ *
+ * m=1 is the control. Every reading collapses to the identity there, so all of
+ * them must score n; a candidate that does not is a bug in this function.
+ */
+/*
+ * ⚠⚠ ONE REGISTER, SWEPT AT A WIDTH WHERE IT CAN VARY.
+ *
+ * 0x40b8 is ow * rows on the int8 arm, which is the row count and scales with
+ * M, and a literal 3 on the acc_out arm at every M. Round 312 chose that 3 by
+ * sweeping 0 to 15 at M = 1, which is the one width where a value that should
+ * follow M cannot show that it does. charsiu_matmul takes the int8 arm and is
+ * 128 of 128 exact at M = 2; this tool takes the acc_out arm and is wrong at
+ * every M above one under every reading.
+ *
+ * So sweep it at M = 2, and score each candidate under EVERY reading rather
+ * than only the flat one: a value that fixes the arithmetic should show up
+ * whatever the layout turns out to be, and the layout is not known.
+ *
+ * ⚠ THE CONTROL IS M = 1. The default 3 has to score n there, or the sweep is
+ * measuring a broken build rather than a register.
+ */
+static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
+{
+	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };
+	unsigned maxm = 8;
+	uint8_t *A = malloc((size_t)maxm * k);
+	uint8_t *B = malloc((size_t)n * k);
+	int32_t *got = malloc((size_t)maxm * n * 4);
+	int32_t *want = malloc((size_t)maxm * n * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	for (unsigned r = 0; r < maxm; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	for (unsigned c = 0; c < n; c++)
+		for (unsigned i = 0; i < k; i++)
+			B[(size_t)c * k + i] = mix(c, i, 15);
+
+	printf("K=%u N=%u, acc_out. DPU 0x40b8 swept; the int8 arm computes\n"
+	       "ow * rows, which is m here, and acc_out writes a literal 3.\n"
+	       "Each candidate is scored under every reading; the best one is\n"
+	       "shown with the reading that produced it.\n\n", k, n);
+	printf("  0x40b8    m=1 (control)        m=2 best      m=4 best\n");
+
+	for (unsigned v = 0; v <= 16; v++) {
+		char buf[16];
+		size_t best[3] = { 0, 0, 0 };
+		char hbuf[3][16] = { "", "", "" };
+		const char *how[3] = { "", "", "" };
+		static const unsigned MS[] = { 1, 2, 4 };
+
+		snprintf(buf, sizeof(buf), "%u", v);
+		setenv("CHARSIU_DPU_40B8", buf, 1);
+		for (unsigned y = 0; y < 3; y++) {
+			unsigned m = MS[y];
+			size_t total = (size_t)m * n;
+
+			reference(m, k, n, A, B, want);
+			if (run(dev, m, k, n, A, B, got)) {
+				how[y] = "submit failed";
+				continue;
+			}
+			for (unsigned a = 0; a < sizeof(ATOMS) / sizeof(*ATOMS); a++) {
+				unsigned atom = ATOMS[a];
+				size_t ex = 0;
+
+				for (unsigned mi = 0; mi < m; mi++)
+					for (unsigned ni = 0; ni < n; ni++) {
+						size_t at = atom
+						  ? (size_t)(ni / atom) * m * atom
+						    + (size_t)mi * atom + ni % atom
+						  : (size_t)mi * n + ni;
+
+						if (at < total &&
+						    got[at] == want[(size_t)mi * n + ni])
+							ex++;
+					}
+				if (ex > best[y]) {
+					best[y] = ex;
+					/* ⚠ NAME THE READING. "surf" alone
+					 * cannot be acted on: the next round
+					 * has to hold the atom. */
+					if (atom)
+						snprintf(hbuf[y], sizeof(hbuf[y]),
+							 "a%u", atom);
+					else
+						snprintf(hbuf[y], sizeof(hbuf[y]),
+							 "flat");
+					how[y] = hbuf[y];
+				}
+			}
+		}
+		printf("  %6u   %5zu/%-5u %-4s  %5zu/%-5u %-4s  %5zu/%-5u %-4s%s\n",
+		       v, best[0], n, how[0], best[1], 2 * n, how[1],
+		       best[2], 4 * n, how[2], v == 3 ? "   <- today's default" : "");
+	}
+	unsetenv("CHARSIU_DPU_40B8");
+	printf("\n  ⚠ the m=1 column is the CONTROL and 3 must score %u there.\n"
+	       "  A candidate that scores 2n at m=2 is the answer; check it at\n"
+	       "  m=4 in the same row before believing it.\n", n);
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
+/*
+ * ⚠⚠ DOES charsiu_acc_index HOLD AT A PROJECTION'S WIDTH?
+ *
+ * It was solved at N = 32 and confirmed at 64 and 128. A projection is 2048
+ * wide, sixteen times the largest N it has ever seen, and the batched runtime
+ * path built on it comes back with row 0 half right at N = 2048: 1025 of 2048.
+ * Half is the shape of a super group term that stops scaling, and the super
+ * group is the only part of that expression N touches.
+ *
+ * So walk N at m = 2, on the int8 accumulator this was solved on, where there
+ * is no float output stage and no runtime plumbing to blame. N = 32 is the
+ * control: it has one super group and has been exact from the start, so a run
+ * where it fails is measuring something else.
+ */
+static int nwide_sweep(struct charsiu_device *dev, unsigned k)
+{
+	static const unsigned NS[] = { 32, 64, 128, 256, 512, 1024, 2048 };
+	unsigned maxn = NS[sizeof(NS) / sizeof(*NS) - 1];
+	uint8_t *A = malloc((size_t)2 * k);
+	uint8_t *B = malloc((size_t)maxn * k);
+	int32_t *got = malloc((size_t)2 * maxn * 4);
+	int32_t *want = malloc((size_t)2 * maxn * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	for (unsigned r = 0; r < 2; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	printf("K=%u, m=2, int8 accumulator. charsiu_acc_index against N.\n"
+	       "N=32 is the control: one super group, exact since it was\n"
+	       "solved there.\n\n", k);
+	printf("      N   distinct   present         exact\n");
+	for (unsigned x = 0; x < sizeof(NS) / sizeof(*NS); x++) {
+		unsigned n = NS[x];
+		size_t total = (size_t)2 * n, ex = 0, live = 0, uniq = 0;
+
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] = mix(c, i, 15);
+		reference(2, k, n, A, B, want);
+		if (run(dev, 2, k, n, A, B, got)) {
+			printf("  %5u   submit failed\n", n);
+			rc = 1;
+			continue;
+		}
+		for (size_t q = 0; q < total; q++) {
+			size_t j;
+
+			for (j = 0; j < q; j++)
+				if (want[j] == want[q])
+					break;
+			if (j == q)
+				uniq++;
+		}
+		for (size_t q = 0; q < total; q++)
+			for (size_t i = 0; i < total; i++)
+				if (got[i] == want[q]) { live++; break; }
+		for (unsigned mi = 0; mi < 2; mi++)
+			for (unsigned ni = 0; ni < n; ni++) {
+				size_t at = charsiu_acc_index(mi, ni, 2);
+
+				if (at < total &&
+				    got[at] == want[(size_t)mi * n + ni])
+					ex++;
+			}
+		printf("  %5u   %8zu   %5zu/%-5zu   %5zu/%-5zu%s\n",
+		       n, uniq, live, total, ex, total,
+		       ex == total ? "  EXACT" : "");
+	}
+	printf("\n  ⚠ present is reading independent: if it stays at m*n while\n"
+	       "  exact falls away, the arithmetic is fine and the expression's\n"
+	       "  super group term is what stops.\n");
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
+static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
+		      unsigned mapm)
+{
+	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };  /* 0 = flat */
+	static const unsigned MS[] = { 1, 2, 4, 8 };
+	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
+	uint8_t *A = malloc((size_t)maxm * k);
+	uint8_t *B = malloc((size_t)n * k);
+	int32_t *got = malloc((size_t)maxm * n * 4);
+	int32_t *want = malloc((size_t)maxm * n * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	for (unsigned r = 0; r < maxm; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	for (unsigned c = 0; c < n; c++)
+		for (unsigned i = 0; i < k; i++)
+			B[(size_t)c * k + i] = mix(c, i, 15);
+
+	printf("K=%u N=%u, int8, raw accumulator. One submit per m, then the\n"
+	       "same buffer read every way. exact of m*n; m=1 is the control\n"
+	       "and every column must score n there.\n\n", k, n);
+	printf("   m   distinct  present        flat");
+	for (unsigned a = 1; a < sizeof(ATOMS) / sizeof(*ATOMS); a++)
+		printf("   atom %-2u", ATOMS[a]);
+	printf("     acc_index\n");
+
+	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+		unsigned m = MS[y];
+		size_t total = (size_t)m * n, live = 0, uniq = 0;
+
+		reference(m, k, n, A, B, want);
+		if (run(dev, m, k, n, A, B, got)) {
+			printf("  %2u   submit failed\n", m);
+			rc = 1;
+			continue;
+		}
+		/*
+		 * ⚠ HOW MANY DISTINCT VALUES THE REFERENCE HAS, printed beside
+		 * the score. charsiu_matmul's own data is five distinct values
+		 * in 128 and it says so; a match count means nothing without
+		 * this number next to it.
+		 */
+		for (size_t q = 0; q < total; q++) {
+			size_t j;
+
+			for (j = 0; j < q; j++)
+				if (want[j] == want[q])
+					break;
+			if (j == q)
+				uniq++;
+		}
+		for (size_t q = 0; q < total; q++)
+			for (size_t i = 0; i < total; i++)
+				if (got[i] == want[q]) { live++; break; }
+
+		printf("  %2u   %6zu   %4zu/%-4zu", m, uniq, live, total);
+		for (unsigned a = 0; a < sizeof(ATOMS) / sizeof(*ATOMS); a++) {
+			unsigned atom = ATOMS[a];
+			size_t ex = 0;
+
+			for (unsigned mi = 0; mi < m; mi++)
+				for (unsigned ni = 0; ni < n; ni++) {
+					size_t at = atom
+						? (size_t)(ni / atom) * m * atom
+						  + (size_t)mi * atom + ni % atom
+						: (size_t)mi * n + ni;
+
+					if (at < total &&
+					    got[at] == want[(size_t)mi * n + ni])
+						ex++;
+				}
+			printf("  %4zu/%-4zu", ex, total);
+		}
+		{
+			size_t ex = 0;
+
+			for (unsigned mi = 0; mi < m; mi++)
+				for (unsigned ni = 0; ni < n; ni++) {
+					size_t at = charsiu_acc_index(mi, ni, m);
+
+					if (at < total &&
+					    got[at] == want[(size_t)mi * n + ni])
+						ex++;
+				}
+			printf("   %5zu/%-5zu%s", ex, total,
+			       ex == total ? " EXACT" : "");
+		}
+		printf("\n");
+	}
+	printf("\n  A column that reads m*n at every m is the reading. If none\n"
+	       "  does, the accumulator surface is not this shape and the\n"
+	       "  present column says whether the values are even there.\n");
+	/*
+	 * ⚠ AND THEN STOP GUESSING SHAPES AND READ THE MAP. locate() prints the
+	 * index each wanted value came back at, which is the permutation itself
+	 * rather than a candidate for it. It was untrustworthy while the
+	 * reference had fifteen distinct values in 128; at K = 64 N = 64 it has
+	 * 112, and locate() prints that count beside the table so the next
+	 * reader can check rather than take my word.
+	 */
+	/*
+	 * ⚠ THE MAP AT THE m THAT IS OPEN, not always at 2. m = 2 is solved and
+	 * printing it again says nothing; the fourth argument picks the width,
+	 * so `--read 4` returns the table that would settle A.
+	 */
+	printf("\n  and the map at m=%u, which is the permutation itself:\n", mapm);
+	reference(mapm, k, n, A, B, want);
+	if (!run(dev, mapm, k, n, A, B, got))
+		locate(mapm, n, got, want);
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
 static int surf_sweep(struct charsiu_device *dev, unsigned n)
 {
 	static const unsigned KS[] = { 48, 64, 80, 128, 256, 512, 1024 };
@@ -832,6 +1159,29 @@ int main(int argc, char **argv)
 	 */
 	if (argc > 3 && !strcmp(argv[3], "--surf")) {
 		int rc = surf_sweep(dev, n);
+
+		charsiu_close(dev);
+		return rc;
+	}
+	/*
+	 * The reading sweep keeps K and N, because the question is the output
+	 * layout rather than the input geometry.
+	 */
+	if (argc > 3 && !strcmp(argv[3], "--nwide")) {
+		int rc = nwide_sweep(dev, k);
+
+		charsiu_close(dev);
+		return rc;
+	}
+	if (argc > 3 && !strcmp(argv[3], "--read")) {
+		unsigned mapm = argc > 4 ? (unsigned)atoi(argv[4]) : 2;
+		int rc = read_sweep(dev, k, n, mapm ? mapm : 2);
+
+		charsiu_close(dev);
+		return rc;
+	}
+	if (argc > 3 && !strcmp(argv[3], "--b8")) {
+		int rc = b8_sweep(dev, k, n);
 
 		charsiu_close(dev);
 		return rc;
