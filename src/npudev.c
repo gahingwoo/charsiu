@@ -167,6 +167,8 @@ struct charsiu_npu {
 	 */
 	struct charsiu_bo bin[2], bout[2], breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
+	unsigned bnks, bnslots;    /* and how many K slices and slots */
+	size_t bin_stride, bout_stride;
 	float *bscr;               /* m rows of one slice's K, gathered */
 	uint8_t *bq;               /* and quantised, for the int8 path */
 	float *bd1;                /* each row's own quantisation scale */
@@ -1574,22 +1576,55 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * ⚠ int4 ONLY for now. That is what CHARSIU_NPU_W4V selects and what the
  * runtime uses; int8 batched would need its own d1 handling and has no caller.
  */
-static int batch_bufs(struct charsiu_npu *g, unsigned m)
+/*
+ * ⚠⚠ SIZED FOR A CHAIN, NOT FOR ONE SLICE.
+ *
+ * The first version submitted a slice and waited a full fence on it, which the
+ * report priced: 5072 ms of 7448 was fence. Decode has chained a projection's
+ * slices into one submit per device since round 321 for exactly this reason,
+ * and the fence is what a chain removes.
+ *
+ * So every slice needs its own region rather than sharing one: its own packed
+ * activation (by K slice, since slices of the same K share it), its own output,
+ * and its own register stream. The three grow with m and with how many slices
+ * land on a device, so they are reallocated when either does and never by a
+ * decode, which uses none of them.
+ */
+static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
+		      unsigned nslots)
 {
-	if (g->bm >= m)
+	size_t ins, outs, regs;
+
+	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
+	if (m > g->bm)
+		g->bm = m;
+	if (nks > g->bnks)
+		g->bnks = nks;
+	if (nslots > g->bnslots)
+		g->bnslots = nslots;
+	m = g->bm; nks = g->bnks; nslots = g->bnslots;
+
+	/* the f16 packer writes k * 2 bytes a row; int8 writes one */
+	g->bin_stride = (size_t)g->kmax * m * (g->w4 ? 2 : 1);
+	g->bout_stride = (size_t)g->nmax * m * 4;
+	ins = g->bin_stride * nks + 4096;
+	outs = g->bout_stride * nslots + 4096;
+	regs = (size_t)nslots * 4096;
+
 	for (unsigned d = 0; d < g->ndev; d++) {
 		charsiu_bo_free(g->dev[d], &g->bin[d]);
 		charsiu_bo_free(g->dev[d], &g->bout[d]);
 		charsiu_bo_free(g->dev[d], &g->breg[d]);
-		/* the f16 packer writes k * 2 bytes a row, interleaved */
-		if (charsiu_bo_alloc(g->dev[d], (size_t)g->kmax * m * 2 + 4096,
-				     &g->bin[d]) ||
-		    charsiu_bo_alloc(g->dev[d], (size_t)g->nmax * m * 4 + 4096,
-				     &g->bout[d]) ||
-		    charsiu_bo_alloc(g->dev[d], 4096, &g->breg[d])) {
+		if (charsiu_bo_alloc(g->dev[d], ins, &g->bin[d]) ||
+		    charsiu_bo_alloc(g->dev[d], outs, &g->bout[d]) ||
+		    charsiu_bo_alloc(g->dev[d], regs, &g->breg[d])) {
+			fprintf(stderr, "charsiu: the batch buffers wanted "
+				"%.1f MB and would not allocate\n",
+				(double)(ins + outs + regs) / 1e6);
 			whine(g, "the batch buffers would not allocate",
 			      g->kmax, g->nmax * m);
+			g->bm = 0;
 			return -1;
 		}
 	}
@@ -1598,12 +1633,18 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m)
 	free(g->bd1);
 	g->bscr = malloc((size_t)g->kmax * m * sizeof(*g->bscr));
 	g->bq = malloc((size_t)g->kmax * m);
-	g->bd1 = malloc((size_t)m * sizeof(*g->bd1));
+	/*
+	 * ⚠ ONE d1 PER SLOT PER ROW, not one per row. int8's activation scale
+	 * is per row AND is recomputed over each K slice's own range, and the
+	 * read back happens after every slice has been packed -- so a single
+	 * array would hand every slice the last one's scales.
+	 */
+	g->bd1 = malloc((size_t)nslots * m * sizeof(*g->bd1));
 	if (!g->bscr || !g->bq || !g->bd1) {
 		whine(g, "the batch scratch would not allocate", g->kmax, m);
+		g->bm = 0;
 		return -1;
 	}
-	g->bm = m;
 	return 0;
 }
 
@@ -1642,207 +1683,117 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		      (unsigned)e->t->k, (unsigned)e->t->n);
 		return -1;
 	}
-	if (batch_bufs(g, m))
-		return -1;
+	{
+		unsigned nslots[2] = { 0, 0 };
+
+		for (unsigned i = 0; i < e->count; i++)
+			nslots[g->slot[e->first + i].di]++;
+		if (batch_bufs(g, m, e->k_slices,
+			       nslots[0] > nslots[1] ? nslots[0] : nslots[1]))
+			return -1;
+	}
 
 	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
 	t0 = now_us();
-	for (unsigned i = 0; i < e->count; i++) {
-		const struct npu_slot *s = &g->slot[e->first + i];
-		unsigned d = s->di, sk = s->job.mm.k, sn = s->job.mm.n;
-		struct charsiu_job job = s->job;
-		size_t nreg;
 
-		/* m rows of THIS slice's K, contiguous, which is what the
-		 * packer's m > 1 branch reads */
-		for (unsigned r = 0; r < m; r++)
-			memcpy(g->bscr + (size_t)r * sk,
-			       X + (size_t)r * e->t->k + s->k0,
-			       sk * sizeof(*g->bscr));
+	/*
+	 * ⚠ ONE SUBMIT PER DEVICE FOR THE WHOLE PROJECTION, and both issued
+	 * before either is waited on, which is what decode does. The fence was
+	 * 5072 ms of a 7448 ms report when this waited on every slice.
+	 */
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned nt = 0, nh = 0;
 
-		job.mm.m = m;
-		job.input_addr = (uint32_t)g->bin[d].dma_address;
-		job.output_addr = (uint32_t)g->bout[d].dma_address;
-
-		/*
-		 * ⚠⚠ AND NOW THE INPUT, WHICH IS WHERE THE EVIDENCE POINTS.
-		 *
-		 * Board, m = 2, N = 2048, height axis, a plain [n/4][m][4]
-		 * read: row 0 is COMPLETE, 2048 of 2048, and row 1 is 0 to 3
-		 * at every row step from 1 to 2048. Row 1's numbers are not
-		 * garbage either -- they are the right magnitude, which is what
-		 * a real dot product of the WRONG ACTIVATION looks like.
-		 *
-		 * So the weights, the coefficients, the output group stride and
-		 * row 0's whole path are right, and what row 1 multiplies is
-		 * not. charsiu_pack_input_f16's m > 1 branch writes
-		 * [k/atom][m][atom], which is Mesa's int8 convolution input
-		 * surface. Nothing has ever checked that w4a16 reads the same
-		 * one.
-		 *
-		 * CHARSIU_BATCH_PACK asks: 0 is that surface, 1 is each row
-		 * contiguous, 2 is each row contiguous at the stride one row
-		 * occupies in the CBUF.
-		 */
 		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
-		if (!g->w4) {
-			/*
-			 * int8 takes a quantised activation and the scale is
-			 * per ROW, so each row is quantised over its own K
-			 * range and its d1 kept for the conversion at the end.
-			 */
-			for (unsigned r = 0; r < m; r++) {
-				float mx = 0.0f;
+		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		g->handles[nh++] = g->bin[d].handle;
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+			unsigned sk = s->job.mm.k;
+			unsigned ki = i / e->n_slices;
+			struct charsiu_job job = s->job;
+			size_t nreg;
 
-				for (unsigned kk = 0; kk < sk; kk++) {
-					float v = fabsf(g->bscr[(size_t)r * sk + kk]);
+			if (s->di != d)
+				continue;
+			for (unsigned r = 0; r < m; r++)
+				memcpy(g->bscr + (size_t)r * sk,
+				       X + (size_t)r * e->t->k + s->k0,
+				       sk * sizeof(*g->bscr));
 
-					if (v > mx)
-						mx = v;
-				}
-				g->bd1[r] = mx > 0.0f ? mx / 127.0f : 1.0f;
-				for (unsigned kk = 0; kk < sk; kk++) {
-					int q = (int)lrintf(g->bscr[(size_t)r * sk + kk]
-							    / g->bd1[r]);
+			job.mm.m = m;
+			job.input_addr = (uint32_t)g->bin[d].dma_address
+				       + (uint32_t)(ki * g->bin_stride);
+			job.output_addr = (uint32_t)g->bout[d].dma_address
+					+ (uint32_t)(nt * g->bout_stride);
 
-					if (q > 127) q = 127;
-					if (q < -127) q = -127;
-					g->bq[(size_t)r * sk + kk] =
-						(uint8_t)(q + 128);
-				}
-			}
-			charsiu_pack_input(&job.mm, g->bq, g->bin[d].map,
-					   (size_t)g->kmax * m,
-					   job.input_zero_point);
-		} else {
-			const char *ep = getenv("CHARSIU_BATCH_PACK");
-			int pk = ep ? atoi(ep) : 0;
+			if (!g->w4) {
+				/*
+				 * int8 takes a quantised activation and the
+				 * scale is per ROW, so each row is quantised
+				 * over its own K range and its d1 kept for the
+				 * conversion at the end.
+				 */
+				for (unsigned r = 0; r < m; r++) {
+					float mx = 0.0f;
 
-			if (pk == 0) {
-				charsiu_pack_input_f16(&job.mm, g->bscr,
-						       g->bin[d].map,
-						       (size_t)g->kmax * m * 2);
-			} else {
-				uint8_t *dst = g->bin[d].map;
-				size_t stride = pk == 2
-					      ? (size_t)charsiu_entries_per_row(&job.mm) * 64
-					      : (size_t)sk * 2;
-
-				memset(dst, 0, (size_t)g->kmax * m * 2);
-				for (unsigned r = 0; r < m; r++)
 					for (unsigned kk = 0; kk < sk; kk++) {
-						uint16_t h = charsiu_float_to_half(
-							g->bscr[(size_t)r * sk + kk]);
-						uint8_t *o = dst + r * stride
-							   + (size_t)kk * 2;
+						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
 
-						o[0] = (uint8_t)(h & 0xff);
-						o[1] = (uint8_t)(h >> 8);
+						if (v > mx)
+							mx = v;
 					}
+					g->bd1[(size_t)nt * m + r] =
+						mx > 0.0f ? mx / 127.0f : 1.0f;
+					for (unsigned kk = 0; kk < sk; kk++) {
+						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk]
+								    / g->bd1[(size_t)nt * m + r]);
+
+						if (q > 127) q = 127;
+						if (q < -127) q = -127;
+						g->bq[(size_t)r * sk + kk] =
+							(uint8_t)(q + 128);
+					}
+				}
+				charsiu_pack_input(&job.mm, g->bq,
+						   (uint8_t *)g->bin[d].map
+						   + ki * g->bin_stride,
+						   g->bin_stride,
+						   job.input_zero_point);
+			} else {
+				charsiu_pack_input_f16(&job.mm, g->bscr,
+						       (uint8_t *)g->bin[d].map
+						       + ki * g->bin_stride,
+						       g->bin_stride);
 			}
+
+			nreg = charsiu_emit_job(&job,
+					(uint64_t *)((uint8_t *)g->breg[d].map
+						     + (size_t)nt * 4096),
+					4096 / 8);
+			if (!nreg) {
+				whine(g, "the batched register stream came back empty",
+				      sk, (unsigned)s->job.mm.n);
+				charsiu_bo_fini(g->dev[d], &g->bin[d]);
+				charsiu_bo_fini(g->dev[d], &g->breg[d]);
+				return -1;
+			}
+			g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
+					    + (uint32_t)(nt * 4096);
+			g->tasks[nt].regcmd_count = (unsigned)nreg;
+			g->handles[nh++] = s->wt.handle;
+			g->handles[nh++] = s->coef.handle;
+			nt++;
+			g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
 		}
 		charsiu_bo_fini(g->dev[d], &g->bin[d]);
-
-		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
-		nreg = charsiu_emit_job(&job, g->breg[d].map, 4096 / 8);
-		/*
-		 * ⚠⚠ ONE DIFFERENCE AT A TIME, AGAINST A STREAM THAT WORKS.
-		 *
-		 * The int8 accumulator computes m = 2 correctly at this very
-		 * shape -- npu_gemm_test is EXACT at N = 2048 -- and its DPU
-		 * and RDMA blocks are IDENTICAL to int4's, all 69 and all 22
-		 * registers. So the DPU is told to write two rows either way,
-		 * and what differs is seven CNA words and two CORE ones. 0x301c
-		 * is inert on the board and 0x3018 is the w4a16 arithmetic
-		 * switch, which leaves the CNA: the side that feeds the MAC,
-		 * which is where "row 1 was never produced" belongs.
-		 *
-		 * Rather than hardcode seven values that are only right for one
-		 * shape, emit the int8 variant of THIS job, diff it, and apply
-		 * one difference. CHARSIU_BATCH_CNADIFF is the index; -1 lists
-		 * them. This is round 260's single field sweep, on a stream
-		 * instead of a register.
-		 *
-		 * ⚠ Row 0 is the control. A difference that breaks it is a
-		 * difference about the weight format, not about rows.
-		 */
-		{
-			const char *ed = getenv("CHARSIU_BATCH_CNADIFF");
-
-			if (ed) {
-				uint64_t ref[512];
-				struct charsiu_job j8 = job;
-				size_t n8, ai, bi, seen = 0;
-				int want = atoi(ed);
-
-				j8.mm.wdtype = CHARSIU_INT8;
-				j8.mm.adtype = CHARSIU_INT8;
-				n8 = charsiu_emit_job(&j8, ref,
-						      sizeof(ref) / sizeof(*ref));
-				for (ai = 0; ai < nreg; ai++) {
-					uint64_t *w = (uint64_t *)g->breg[d].map + ai;
-					uint32_t tgt = (uint32_t)(*w >> 48);
-					uint32_t rg = (uint32_t)(*w & 0xffff);
-
-					/*
-					 * ⚠⚠ GEOMETRY ONLY, NOT THE WEIGHT
-					 * FORMAT.
-					 *
-					 * 0x101c is the weight byte count and
-					 * 0x1020 is bytes per channel; putting
-					 * an int8 value in either makes the CNA
-					 * fetch past its buffer, and the first
-					 * sweep that did so faulted the IOMMU,
-					 * timed out, and left the block dead --
-					 * "MMU_DTE_ADDR is not functioning" --
-					 * so every step after it measured a
-					 * corpse and returned the same numbers.
-					 * 0x100c is the int4 weight format.
-					 *
-					 * None of the three can be about rows.
-					 * These four can.
-					 */
-					if (tgt != 0x0201)      /* CNA only */
-						continue;
-					if (rg != 0x1028 && rg != 0x1030 &&
-					    rg != 0x103c && rg != 0x1044)
-						continue;
-					for (bi = 0; bi < n8; bi++)
-						if ((uint32_t)(ref[bi] >> 48) == tgt &&
-						    (uint32_t)(ref[bi] & 0xffff) == rg)
-							break;
-					if (bi == n8 || ref[bi] == *w)
-						continue;
-					if (want < 0 && i == 0)
-						fprintf(stderr,
-							"  cnadiff %zu: 0x%04x"
-							"  int4 %08x  int8 %08x\n",
-							seen, rg,
-							(uint32_t)((*w >> 16) & 0xffffffff),
-							(uint32_t)((ref[bi] >> 16) & 0xffffffff));
-					if ((int)seen == want)
-						*w = (*w & 0xffff00000000ffffULL)
-						   | (ref[bi] & 0x0000ffffffff0000ULL);
-					seen++;
-				}
-			}
-		}
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
-		if (!nreg) {
-			whine(g, "the batched register stream came back empty",
-			      sk, sn);
-			return -1;
-		}
-
-		g->tasks[0].regcmd = (uint32_t)g->breg[d].dma_address;
-		g->tasks[0].regcmd_count = (unsigned)nreg;
-		g->handles[0] = g->bin[d].handle;
-		g->handles[1] = s->wt.handle;
-		g->handles[2] = s->coef.handle;
+		if (!nt)
+			continue;
 		jl.tasks = g->tasks;
-		jl.task_count = 1;
+		jl.task_count = nt;
 		jl.in_handles = g->handles;
-		jl.in_count = 3;
+		jl.in_count = nh;
 		jl.out_handles = &g->bout[d].handle;
 		jl.out_count = 1;
 		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
@@ -1851,118 +1802,39 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			return -1;
 		}
 		g->submits++;
+	}
+
+	/* ⚠ both submitted, then both waited on: that is the point */
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned nt = 0;
 
 		charsiu_bo_prep(g->dev[d], &g->bout[d], 2000000000);
-		{
-			const float *fo = (const float *)g->bout[d].map;
-			const int32_t *io = (const int32_t *)g->bout[d].map;
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+			unsigned sn = s->job.mm.n;
+			const float *fo;
+			const int32_t *io;
 			int grp = tensor_grouped(g, e->t);
 
-			/*
-			 * ⚠ charsiu_acc_index, not a flat read. The block
-			 * writes every row and writes them in an order a
-			 * contiguous read cannot see; five rounds went into
-			 * establishing which order, and it is in one place so
-			 * that this and the probe cannot disagree.
-			 */
-			/*
-			 * ⚠⚠ THE ROW TERM IS THE ONLY UNKNOWN LEFT.
-			 *
-			 * charsiu_acc_index was solved on the int8 accumulator,
-			 * four byte words out of a stage the int4 path does not
-			 * use: w4a16 writes float32 through its own output
-			 * stage. On the board row 0 comes back EXACT, including
-			 * the channels the intra-32 interleave moves -- index 4
-			 * is read from word 8 and it matched -- so the super
-			 * group and the interleave carry over. Every row above
-			 * zero is wrong, and the row term is what row 0 cannot
-			 * test, because it contributes nothing at mi = 0.
-			 *
-			 * CHARSIU_BATCH_ROWSTEP replaces it so a board round can
-			 * sweep it with row 0 as the control: whatever the step,
-			 * row 0 must stay exact, and the step that makes row 1
-			 * exact as well is the answer.
-			 */
-			/*
-			 * ⚠ NOT CACHED IN A STATIC. The probe sweeps this
-			 * between calls in one process, and a value latched on
-			 * the first would make every later call a silent copy
-			 * of the first -- which is how round 380's control ran
-			 * twice with the same geometry and nobody noticed until
-			 * the log was read. The same note is already on
-			 * entry_atomics() and I wrote a static here anyway.
-			 */
-			/*
-			 * ⚠⚠ THE READ ORDER IS NOT SETTLED ON THIS PATH.
-			 *
-			 * charsiu_acc_index was solved and confirmed on the
-			 * int8 accumulator, on the HEIGHT axis, and it holds
-			 * there at every N up to 2048 and every m up to 8. The
-			 * runtime's int4 path is w4a16 and this file has known
-			 * since round 347 that the vendor puts M on the WIDTH
-			 * axis for it -- the comment above CORE 0x301c says so,
-			 * and says that at M = 1 the two axes collapse, which
-			 * is why decode never noticed.
-			 *
-			 * So the axis and the reading are two open questions
-			 * and CHARSIU_BATCH_READ is how a round asks them
-			 * together: acc for the solved expression, flat, or an
-			 * atom for a plain [n/atom][m][n%atom].
-			 */
-			/*
-			 * ⚠⚠ THE INT4 OUTPUT IS A PLAIN ATOM OF FOUR, and it is
-			 * not what the int8 accumulator does.
-			 *
-			 * Board, m = 2, N = 2048, both axes against seven
-			 * readings: on the height axis a plain [n/4][m][4]
-			 * returns row 0 COMPLETE, 2048 of 2048. Every other
-			 * reading is a fraction of that -- acc 1025, atom 2 and
-			 * atom 8 both 1024, atom 16 512, atom 32 256 -- which
-			 * is how much of the atom four layout each of them
-			 * happens to agree with. charsiu_acc_index's super
-			 * group of 32 and its intra-32 interleave belong to the
-			 * int8 accumulator and do not carry to w4a16.
-			 *
-			 * Row 1 under the same reading is 3 of 2048, so the
-			 * group stride is right and the ROW term is not.
-			 * CHARSIU_BATCH_ROWSTEP replaces it, and row 0 is a
-			 * real control now rather than six values: it cannot
-			 * move, whatever the step.
-			 */
-			const char *er = getenv("CHARSIU_BATCH_READ");
-			const char *es = getenv("CHARSIU_BATCH_ROWSTEP");
-			unsigned atom = 0;
-			int flat = 0, step = es ? atoi(es) : 0;
-
-			if (er && !strcmp(er, "flat"))
-				flat = 1;
-			else if (er && *er >= '0' && *er <= '9')
-				atom = (unsigned)atoi(er);
+			if (s->di != d)
+				continue;
+			fo = (const float *)((uint8_t *)g->bout[d].map
+					     + (size_t)nt * g->bout_stride);
+			io = (const int32_t *)fo;
 			for (unsigned r = 0; r < m; r++)
 				for (unsigned j = 0; j < sn; j++) {
-					size_t at;
-					float v;
+					size_t at = charsiu_acc_index(r, j, m);
+					float v = g->w4 ? fo[at]
+							: (float)io[at]
+							  * g->bd1[(size_t)nt * m + r];
 
-					if (flat)
-						at = (size_t)r * sn + j;
-					else if (atom)
-						at = (size_t)(j / atom) * m * atom
-						   + (size_t)r * (step ? (unsigned)step
-								       : atom)
-						   + j % atom;
-					else
-						at = charsiu_acc_index(r, j, m);
-					/* int8 writes the raw accumulator and
-					 * carries the row's own d1 */
-					v = g->w4 ? fo[at]
-						  : (float)io[at] * g->bd1[r];
 					Y[(size_t)r * e->t->n + s->n0 + j] +=
 						(g->w4 && grp) ? v * s->sc[j] : v;
 				}
+			nt++;
 		}
 		if (!g->nofini)
 			charsiu_bo_fini(g->dev[d], &g->bout[d]);
-		g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
 	}
 	g->busy_us += now_us() - t0;
 
