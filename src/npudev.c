@@ -1735,6 +1735,32 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * what makes int8's extra byte cheap: at m = 32 the same weights serve
 	 * thirty two rows either way.
 	 */
+	/*
+	 * ⚠⚠ int4 PRODUCES ONE ROW AND MUST REFUSE, and this guard was removed
+	 * by the commit that taught this function int8.
+	 *
+	 * w4a16 computes exactly one row whatever it is asked for. Five rounds
+	 * established that: fed the SAME activation twice, row 1 comes back
+	 * matching row 0 in 1 of 2048, the DPU and RDMA blocks are identical to
+	 * a stream that does two rows, and every CNA word that differs was put
+	 * back one at a time. Adding int8 replaced the refusal with a comment
+	 * about int8 being the path with evidence, and left nothing stopping
+	 * int4 from taking it.
+	 *
+	 * The board said so immediately and in the only way that counts. An
+	 * int4 prompt came back "ITES  (un- a- -  ( -  ' \ l'" at a very
+	 * respectable 37.46 tok/s, which is the speed of a wrong answer, and
+	 * the default config passes CHARSIU_NPU_W4V=1 -- so this was every
+	 * int4 model with a prompt of two tokens or more.
+	 *
+	 * The caller falls back to a row at a time, which is correct and is
+	 * what int4 did before any of this existed.
+	 */
+	if (g->w4) {
+		whine(g, "int4 computes one row: batching is int8 only",
+		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
+		return -1;
+	}
 	e = &g->ent[id];
 	if (e->n_npu != (unsigned)e->t->n) {
 		/* a CPU share would have to be batched too, and is not */
