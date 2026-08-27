@@ -56,6 +56,31 @@ projection in the model is skipped n - 1 times rather than made n times wider.
 The prompt goes in chunks of 32, because the buffers scale with the batch and
 the probe's sweep flattens after 16.
 
+### Which weight format, answered
+
+Four numbers off the board, same model, same prompt, same 16 generated tokens:
+
+```
+              int4     int8
+  prefill    19.24    26.60 tok/s
+  decode     15.46     9.16 tok/s
+```
+
+int8 is ahead on prefill and behind on decode, so it depends on the shape of
+the work. For a prompt of P tokens and G generated,
+
+  int8 wins  when  P * (1/19.24 - 1/26.60) > G * (1/9.16 - 1/15.46)
+             i.e.  P > 3.1 * G
+
+**So int4 stays the default.** Chat is a short prompt and a long answer and int4
+wins it outright; int8 is for prompt-heavy work -- summarising a document,
+retrieval -- where the prompt is several times the answer.
+
+⚠ The batched prefill helps int4 too, and not because the matmul batches: it
+refuses there. It is that a prompt needs logits for its last token only, so the
+head is skipped n - 1 times whatever the format. 19.24 against a decode of
+15.46 is most of that.
+
 ⚠ It is a second copy of the layer loop and it is deliberately blind. It
 handles the plain case and REFUSES the rest -- gemma3's window and two rope
 bases, gemma4's per layer embeddings and shared KV, qwen3's q and k norms,
