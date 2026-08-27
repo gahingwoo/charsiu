@@ -189,7 +189,21 @@ struct charsiu_npu {
 	 * A72 is most of a second. The mapping depends only on (m, n), so it is
 	 * built once and looked up.
 	 */
-	uint32_t *bmap;
+	/*
+	 * ⚠⚠ THE READ ORDER INVERTED, so the BUFFER is walked in order.
+	 *
+	 * The forward map gathers: for one row it reads four contiguous words
+	 * and then jumps 8P of them, which at m = 32 is 512 bytes -- sixteen
+	 * bytes used out of every sixty four byte line. 283 ms of a 738 ms pass
+	 * went there, and putting it on the pool made it 463: 226 dispatches of
+	 * a few rows each is barrier latency, not throughput.
+	 *
+	 * Inverted, fo is read straight through and Y is written scattered,
+	 * which is the cheaper way round. m fits a byte and a slice's channel
+	 * count fits a short.
+	 */
+	uint8_t *bir;
+	uint16_t *bij;
 	unsigned bmap_m, bmap_n;
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
@@ -775,7 +789,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bscr);
 	free(g->bq);
 	free(g->bd1);
-	free(g->bmap);
+	free(g->bir);
+	free(g->bij);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1688,65 +1703,6 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
-/*
- * ⚠ WHOLE ROWS, ACROSS EVERY SLOT OF ONE DEVICE.
- *
- * The read back is 283 ms of a 738 ms batched pass at m = 32 and it is the
- * plainest loop in the file, so it goes on the pool. Rows are the axis because
- * they are the only one that is disjoint everywhere: a row owns its stripe of
- * Y, and the K slices that have to SUM into the same channels are all in the
- * same row and therefore on the same thread. Splitting by slot instead would
- * put two summands of one channel on two threads.
- */
-struct bread {
-	struct charsiu_npu *g;
-	const struct npu_entry *e;
-	unsigned d, m;
-	float *Y;
-};
-
-static void bread_rows(void *vb, uint64_t r0, uint64_t nr)
-{
-	const struct bread *b = vb;
-	struct charsiu_npu *g = b->g;
-	const struct npu_entry *e = b->e;
-	unsigned m = b->m, nt = 0;
-	int grp = tensor_grouped(g, e->t);
-
-	for (unsigned i = 0; i < e->count; i++) {
-		const struct npu_slot *s = &g->slot[e->first + i];
-		unsigned sn = s->job.mm.n, ki = i / e->n_slices;
-		const float *fo;
-		const int32_t *io;
-
-		if (s->di != b->d)
-			continue;
-		fo = (const float *)((uint8_t *)e->bout[b->d].map
-				     + (size_t)nt * g->bout_stride);
-		io = (const int32_t *)fo;
-		for (uint64_t r = r0; r < r0 + nr; r++) {
-			const uint32_t *mp = g->bmap + (size_t)r * sn;
-			float *yr = b->Y + (size_t)r * e->t->n + s->n0;
-
-			if (g->w4 && grp) {
-				const float *sc = s->sc;
-
-				for (unsigned j = 0; j < sn; j++)
-					yr[j] += fo[mp[j]] * sc[j];
-			} else if (g->w4) {
-				for (unsigned j = 0; j < sn; j++)
-					yr[j] += fo[mp[j]];
-			} else {
-				float d1 = g->bd1[(size_t)ki * m + r];
-
-				for (unsigned j = 0; j < sn; j++)
-					yr[j] += (float)io[mp[j]] * d1;
-			}
-		}
-		nt++;
-	}
-}
-
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
@@ -1945,8 +1901,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	/* ⚠ both submitted, then both waited on: that is the point */
 	for (unsigned d = 0; d < g->ndev; d++) {
 		double tf = now_us();
-		struct bread b = { g, e, d, m, Y };
-		unsigned wide = 0;
+		unsigned wide = 0, nt;
 
 		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
 		g->bfence_us += now_us() - tf;
@@ -1963,23 +1918,67 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			 * a 1B model. It depends on nothing but (m, n).
 			 */
 			if (g->bmap_m != m || g->bmap_n != wide) {
-				uint32_t *t2 = realloc(g->bmap,
-						(size_t)m * wide * sizeof(*t2));
+				uint8_t *ir = realloc(g->bir, (size_t)m * wide);
+				uint16_t *ij = realloc(g->bij,
+						(size_t)m * wide * sizeof(*ij));
 
-				if (!t2) {
+				if (!ir || !ij) {
+					free(ir);
 					whine(g, "the read order table would not allocate",
 					      m, wide);
 					return -1;
 				}
-				g->bmap = t2;
+				g->bir = ir;
+				g->bij = ij;
 				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < wide; j++)
-						g->bmap[(size_t)r * wide + j] =
-						  (uint32_t)charsiu_acc_index(r, j, m);
+					for (unsigned j = 0; j < wide; j++) {
+						size_t at = charsiu_acc_index(r, j, m);
+
+						g->bir[at] = (uint8_t)r;
+						g->bij[at] = (uint16_t)j;
+					}
 				g->bmap_m = m;
 				g->bmap_n = wide;
 			}
-			charsiu_parallel_for(bread_rows, &b, m);
+			nt = 0;
+			for (unsigned i = 0; i < e->count; i++) {
+				const struct npu_slot *s = &g->slot[e->first + i];
+				unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+				const float *fo;
+				const int32_t *io;
+				int grp = tensor_grouped(g, e->t);
+
+				if (s->di != d)
+					continue;
+				fo = (const float *)((uint8_t *)e->bout[d].map
+						     + (size_t)nt * g->bout_stride);
+				io = (const int32_t *)fo;
+				/*
+				 * ⚠ THE TABLE IS BUILT AT `wide` AND A SLICE
+				 * CAN BE NARROWER -- the head's last one is
+				 * 5376 against 8192. charsiu_acc_index does not
+				 * depend on n at all, so the table is valid for
+				 * any narrower slice, but only if the entries
+				 * beyond its width are skipped rather than the
+				 * stride being changed. Indexing it at sn
+				 * instead cost exactly one tensor: 3585 rows of
+				 * 3616.
+				 */
+				for (size_t at = 0; at < (size_t)m * wide; at++) {
+					unsigned j = g->bij[at];
+					unsigned r = g->bir[at];
+					float v;
+
+					if (j >= sn)
+						continue;
+					v = g->w4 ? fo[at]
+						  : (float)io[at]
+						    * g->bd1[(size_t)ki * m + r];
+					Y[(size_t)r * e->t->n + s->n0 + j] +=
+						(g->w4 && grp) ? v * s->sc[j] : v;
+				}
+				nt++;
+			}
 		}
 		g->bread_us += now_us() - tf;
 		if (!g->nofini)
