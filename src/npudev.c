@@ -552,7 +552,21 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	g->max_n = max_n;
 	g->ent_cap = max_tensors;
 
-	g->w4 = getenv("CHARSIU_NPU_W4V") != NULL;
+	/*
+	 * ⚠ AN EMPTY VALUE MEANS OFF, and it did not. `!= NULL` makes
+	 * CHARSIU_NPU_W4V= turn int4 ON, which is the opposite of what anybody
+	 * types it for, and there is no other way to get int8 past a runner
+	 * that sets the variable itself. A board round meant to measure the
+	 * int8 batched path ran int4 and said so in its own report, which is
+	 * the only reason it was caught.
+	 *
+	 * `*e != '0'` is what npu_mode() and act_set() in this tree already do.
+	 */
+	{
+		const char *e4 = getenv("CHARSIU_NPU_W4V");
+
+		g->w4 = e4 && *e4 && *e4 != '0';
+	}
 	/*
 	 * SKIP THE FLUSH ON A BUFFER THE CPU ONLY READ.
 	 *
