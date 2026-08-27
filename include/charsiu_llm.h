@@ -549,6 +549,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);
 
+/*
+ * Why llama_prefill_batch will refuse this model, as a short phrase, or NULL
+ * if it will take it. A caller that falls back should SAY which of the two
+ * happened: two runs at the same rate mean nothing without it.
+ */
+const char *llama_batch_why_not(const struct llama_model *m);
+
 /* One token in, a full logit vector out. `pos` is where it goes in the cache. */
 void llama_stages_reset(void);
 void llama_stages_report(void);

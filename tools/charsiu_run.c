@@ -483,6 +483,38 @@ int main(int argc, char **argv)
 		/* whatever is left, and everything if nothing was batched */
 		for (i = done; i < n_ids; i++)
 			logits = llama_forward(st, ids[i], st->pos);
+
+		/*
+		 * ⚠ AND SAY WHICH PATH IT TOOK. A run could not tell you this,
+		 * so a batched run and a control run at the same rate could
+		 * mean the flag did nothing OR the architecture was never
+		 * batchable, and a board round went on Phi-3.5 producing three
+		 * numbers that agreed and said nothing. One line, always, and
+		 * the reason when there is one.
+		 */
+		if (!quiet) {
+			const char *why = llama_batch_why_not(&m);
+
+			if (done >= n_ids)
+				fprintf(stderr, "charsiu: prompt batched, %d "
+					"tokens in chunks of %d\n",
+					n_ids, chunk);
+			else if (done > 0)
+				fprintf(stderr, "charsiu: prompt batched for "
+					"%d of %d tokens, the rest a token at "
+					"a time\n", done, n_ids);
+			else if (getenv("CHARSIU_NO_BATCH_PREFILL"))
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time (CHARSIU_NO_BATCH_PREFILL)\n");
+			else if (n_ids < 2)
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time (it is one token)\n");
+			else
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time -- this model is not batched: "
+					"%s\n", why ? why : "the batch was "
+					"refused at run time");
+		}
 	}
 	t_prompt = now_ms() - t0;
 

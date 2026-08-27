@@ -2779,20 +2779,52 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 	return 0;
 }
 
-static int batch_ok(const struct llama_model *m)
+/*
+ * ⚠ WHY IT WILL NOT, NOT JUST THAT IT WILL NOT. A refusal that returns 0 makes
+ * the caller fall back silently, and a board log then shows a batched run and a
+ * control run at the same rate with nothing to say which of the two things that
+ * means: the flag did nothing, or the architecture was never batchable and both
+ * halves ran the same code. That cost a whole round on Phi-3.5, where wk and wv
+ * are fused and this refuses on the first layer.
+ *
+ * The string is the reason and NULL means it will batch.
+ */
+const char *llama_batch_why_not(const struct llama_model *m)
 {
-	if (m->n_swa || m->v_norm || m->n_embd_pl || m->final_softcap > 0.0f ||
-	    kv_posmajor())
-		return 0;
+	if (m->n_swa)
+		return "sliding window attention";
+	if (m->v_norm)
+		return "a value norm";
+	if (m->n_embd_pl)
+		return "per layer embeddings";
+	if (m->final_softcap > 0.0f)
+		return "a final softcap";
+	if (kv_posmajor())
+		return "a position major KV cache";
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 
-		if (!L->wk || !L->wv || L->bq || L->q_norm || L->kv_from >= 0 ||
-		    L->attn_post_norm || L->ffn_post_norm ||
-		    L->n_ff != m->layers[0].n_ff)
-			return 0;
+		if (!L->wk || !L->wv)
+			return "fused or absent K and V projections";
+		if (L->bq)
+			return "a query bias";
+		if (L->q_norm)
+			return "a query norm";
+		if (L->kv_from >= 0)
+			return "KV shared between layers";
+		if (L->attn_post_norm)
+			return "a post attention norm";
+		if (L->ffn_post_norm)
+			return "a post feed forward norm";
+		if (L->n_ff != m->layers[0].n_ff)
+			return "a feed forward width that varies by layer";
 	}
-	return 1;
+	return NULL;
+}
+
+static int batch_ok(const struct llama_model *m)
+{
+	return llama_batch_why_not(m) == NULL;
 }
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
