@@ -1668,7 +1668,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	 * read back happens after every slice has been packed -- so a single
 	 * array would hand every slice the last one's scales.
 	 */
-	g->bd1 = malloc((size_t)nslots * m * sizeof(*g->bd1));
+	g->bd1 = malloc((size_t)nks * m * sizeof(*g->bd1));
 	if (!g->bscr || !g->bq || !g->bd1) {
 		whine(g, "the batch scratch would not allocate", g->kmax, m);
 		g->bm = 0;
@@ -1767,42 +1767,44 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * 5072 ms of a 7448 ms report when this waited on every slice.
 	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		unsigned nt = 0, nh = 0;
-
+		unsigned nt = 0, nh = 0, done_ki = 0;
 		double tp = now_us();
 
 		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
 		g->handles[nh++] = g->bin[d].handle;
+
+		/*
+		 * ⚠⚠ ONCE PER K SLICE, NOT ONCE PER SLOT.
+		 *
+		 * A tensor's slots are n_slices wide by k_slices deep, and every
+		 * slot in a K column reads the SAME activation. Packing inside
+		 * the slot loop packed it n_slices times over -- sixteen times
+		 * for the output head -- and the time split says packing is 259
+		 * ms of a 758 ms pass at m = 32. The regions were already
+		 * indexed by K slice; this stops writing each one repeatedly.
+		 */
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
-			unsigned sk = s->job.mm.k;
-			unsigned ki = i / e->n_slices;
-			struct charsiu_job job = s->job;
-			size_t nreg;
+			unsigned sk = s->job.mm.k, ki = i / e->n_slices;
+			struct charsiu_matmul mm = s->job.mm;
 
-			if (s->di != d)
+			if (s->di != d || ((done_ki >> ki) & 1u))
 				continue;
+			done_ki |= 1u << ki;
+			mm.m = m;
 			for (unsigned r = 0; r < m; r++)
 				memcpy(g->bscr + (size_t)r * sk,
 				       X + (size_t)r * e->t->k + s->k0,
 				       sk * sizeof(*g->bscr));
-
-			job.mm.m = m;
-			job.input_addr = (uint32_t)g->bin[d].dma_address
-				       + (uint32_t)(ki * g->bin_stride);
-			job.output_addr = (uint32_t)e->bout[d].dma_address
-					+ (uint32_t)(nt * g->bout_stride);
-
 			if (!g->w4) {
 				/*
-				 * int8 takes a quantised activation and the
-				 * scale is per ROW, so each row is quantised
-				 * over its own K range and its d1 kept for the
-				 * conversion at the end.
+				 * int8's scale is per row and taken over THIS K
+				 * slice's own range, so it is kept per K slice
+				 * for the read back.
 				 */
 				for (unsigned r = 0; r < m; r++) {
-					float mx = 0.0f;
+					float mx = 0.0f, d1;
 
 					for (unsigned kk = 0; kk < sk; kk++) {
 						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
@@ -1810,37 +1812,45 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 						if (v > mx)
 							mx = v;
 					}
-					g->bd1[(size_t)nt * m + r] =
-						mx > 0.0f ? mx / 127.0f : 1.0f;
+					d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+					g->bd1[(size_t)ki * m + r] = d1;
 					for (unsigned kk = 0; kk < sk; kk++) {
-						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk]
-								    / g->bd1[(size_t)nt * m + r]);
+						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] / d1);
 
 						if (q > 127) q = 127;
 						if (q < -127) q = -127;
-						g->bq[(size_t)r * sk + kk] =
-							(uint8_t)(q + 128);
+						g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
 					}
 				}
-				charsiu_pack_input(&job.mm, g->bq,
-						   (uint8_t *)g->bin[d].map
-						   + ki * g->bin_stride,
-						   g->bin_stride,
-						   job.input_zero_point);
+				charsiu_pack_input(&mm, g->bq,
+						   (uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						   g->bin_stride, s->job.input_zero_point);
 			} else {
-				charsiu_pack_input_f16(&job.mm, g->bscr,
-						       (uint8_t *)g->bin[d].map
-						       + ki * g->bin_stride,
+				charsiu_pack_input_f16(&mm, g->bscr,
+						       (uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						       g->bin_stride);
 			}
+		}
 
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+			unsigned ki = i / e->n_slices;
+			struct charsiu_job job = s->job;
+			size_t nreg;
+
+			if (s->di != d)
+				continue;
+			job.mm.m = m;
+			job.input_addr = (uint32_t)g->bin[d].dma_address
+				       + (uint32_t)(ki * g->bin_stride);
+			job.output_addr = (uint32_t)e->bout[d].dma_address
+					+ (uint32_t)(nt * g->bout_stride);
 			nreg = charsiu_emit_job(&job,
-					(uint64_t *)((uint8_t *)g->breg[d].map
-						     + (size_t)nt * 4096),
+					(uint64_t *)((uint8_t *)g->breg[d].map + (size_t)nt * 4096),
 					4096 / 8);
 			if (!nreg) {
 				whine(g, "the batched register stream came back empty",
-				      sk, (unsigned)s->job.mm.n);
+				      (unsigned)job.mm.k, (unsigned)job.mm.n);
 				charsiu_bo_fini(g->dev[d], &g->bin[d]);
 				charsiu_bo_fini(g->dev[d], &g->breg[d]);
 				return -1;
@@ -1921,7 +1931,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				const uint32_t *mp = g->bmap + (size_t)r * sn;
 				float *yr = Y + (size_t)r * e->t->n + s->n0;
 				float d1 = g->w4 ? 0.0f
-						 : g->bd1[(size_t)nt * m + r];
+						 : g->bd1[(size_t)(i / e->n_slices) * m + r];
 
 				if (g->w4 && grp) {
 					const float *sc = s->sc;
