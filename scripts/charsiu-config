@@ -52,42 +52,7 @@ if [ -t 1 ]; then
 else C_B=; C_G=; C_Y=; C_D=; C_0=; fi
 
 # ---------------------------------------------------------------------------
-# INI: read, and write IN PLACE. Present -> replace where it is. Absent -> append
-# to the END OF ITS OWN SECTION, creating the section if there is none.
-#
-# ⚠ A naive `sed -i "s/^key =.*/key = $v/"` silently does NOTHING when the key
-# is missing, and corrupts the file when the value contains / or &. The value is
-# passed to awk as a VARIABLE, never interpolated into a pattern.
-# ---------------------------------------------------------------------------
-
-ini_set() {
-	sec=$1; key=$2; val=$3
-	[ -f "$CONF" ] || { mkdir -p "$(dirname "$CONF")" && : > "$CONF"; }
-	t="${CONF}.tmp.$$"
-	awk -v s="$sec" -v k="$key" -v v="$val" '
-	function flush_pending() {
-		if (in_sec && !done) { print k " = " v; done = 1 }
-	}
-	/^[ \t]*\[.*\][ \t]*$/ {
-		# leaving a section: if it was ours and the key never appeared,
-		# append it at the end of that section rather than the file.
-		flush_pending()
-		h = $0; sub(/^[ \t]*\[/,"",h); sub(/\][ \t]*$/,"",h)
-		in_sec = (h == s); if (in_sec) seen_sec = 1
-		print; next
-	}
-	{
-		if (in_sec && !done && match($0, /^[ \t]*[^=]*=/)) {
-			n = substr($0, 1, RLENGTH-1); gsub(/^[ \t]+|[ \t]+$/,"",n)
-			if (n == k) { print k " = " v; done = 1; next }
-		}
-		print
-	}
-	END {
-		flush_pending()
-		if (!seen_sec) { print ""; print "[" s "]"; print k " = " v }
-	}' "$CONF" > "$t" && mv "$t" "$CONF"
-}
+# ini_set lives in charsiu-lib.sh: charsiu update writes settings too now.
 
 # ⚠ A cancelled ui_input must not silently write an empty value into the
 # config. ask keeps the old value when the user backs out.

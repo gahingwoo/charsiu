@@ -76,7 +76,9 @@ charsiu $VERSION, an open LLM runtime for the RK3576 NPU
   $SELF bench                 tokens per second on this board
   $SELF doctor [--paste]      what works and what does not
   $SELF serve [--port N]      an OpenAI and Anthropic compatible endpoint
-  $SELF update                fetch the latest charsiu and reinstall it
+  $SELF update [dev|stable]   fetch the latest charsiu and reinstall it
+                              dev adds the hardware probes and tracks the
+                              branch the work happens on
   $SELF setup                 the guided screen, on purpose
 
   models  $MODELS  (and $SYSMODELS)

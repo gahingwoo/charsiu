@@ -230,6 +230,7 @@ DOMODEL=1
 DOBUILD=1
 UNINSTALL=0
 
+CHANNEL="${CHARSIU_CHANNEL:-stable}"
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--prefix)    PREFIX="$2"; shift 2 ;;
@@ -238,6 +239,8 @@ while [ $# -gt 0 ]; do
 	--no-kernel) DOKERNEL=no; shift ;;
 	--no-model)  DOMODEL=0; shift ;;
 	--no-build)  DOBUILD=0; shift ;;
+	# stable installs the runtime; dev adds the probes. See INSTALL_BINS.
+	--channel)   CHANNEL="$2"; shift 2 ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	-h|--help)   sed -n '4,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*)           echo "unknown option: $1" >&2; exit 2 ;;
@@ -815,11 +818,19 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # hardware does a matmul with more than one row, which is the whole of prefill,
 # and asking somebody to go find it under ~/.cache is how a board round does
 # not happen.
-# ⚠ charsiu_matmul too, and for the same reason: it is the OTHER m > 1 probe,
-# the one that reads a requantised int8 output as a surface rather than the raw
-# accumulator flat, and the two have to be runnable side by side in one session.
-for f in charsiu_run charsiu_check charsiu_serve bench_batch npu_gemm_test \
-	 charsiu_matmul; do
+# ⚠⚠ THE PROBES ARE A DEV THING, and installing them on somebody who asked for
+# a way to run a model is how a tool stops being trusted. npu_gemm_test,
+# charsiu_matmul and bench_batch exist to ask the hardware questions -- what a
+# register does at a width nobody has run, whether batching pays -- and they
+# have wedged the block, timed out and printed the opposite of their own data
+# on the way to the answers. `charsiu update dev` asks for them.
+RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve"
+PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
+case "$CHANNEL" in
+dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
+*)   INSTALL_BINS="$RUNTIME_BINS" ;;
+esac
+for f in $INSTALL_BINS; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done

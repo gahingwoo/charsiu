@@ -628,6 +628,49 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				rows_ok += ok;
 				rows_tot++;
 			}
+			/*
+			 * ⚠⚠ WRONG PLACE OR WRONG NUMBER, which are different
+			 * faults and the row count above cannot tell apart.
+			 *
+			 * This is the question that cracked the accumulator's
+			 * layout twice: are the wanted values IN the buffer at
+			 * all? If they are, the arithmetic is right and only
+			 * the order is wrong, and an order is something a map
+			 * can be read for. If they are not, the order is
+			 * irrelevant until the numbers are fixed.
+			 *
+			 * Only the first tensor, and only at the narrowest m,
+			 * because it is O(n^2) in the row.
+			 */
+			if (!tested && mr == MS[0]) {
+				size_t live = 0, tot = (size_t)mr * t->n;
+
+				for (size_t q = 0; q < tot; q++)
+					for (size_t o = 0; o < tot; o++) {
+						double d = fabs((double)Y[o]
+							  - (double)Yref[q]);
+						double sc = fabs((double)Yref[q]);
+
+						if (d <= (sc > 1e-3 ? sc * 1e-3
+								    : 1e-3)) {
+							live++;
+							break;
+						}
+					}
+				printf("  %s at m=%u: %zu of %zu wanted values"
+				       " are somewhere in the batch\n",
+				       t->name, mr, live, tot);
+				printf("    row0 batched  ");
+				for (unsigned j = 0; j < 6 && j < t->n; j++)
+					printf("%9.3f", Y[j]);
+				printf("\n    row0 one row  ");
+				for (unsigned j = 0; j < 6 && j < t->n; j++)
+					printf("%9.3f", Yref[j]);
+				printf("\n    row1 one row  ");
+				for (unsigned j = 0; j < 6 && j < t->n; j++)
+					printf("%9.3f", Yref[t->n + j]);
+				printf("\n");
+			}
 			tested++;
 		}
 		if (!tested)
