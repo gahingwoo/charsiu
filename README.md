@@ -17,7 +17,7 @@ mainline kernel and the open `rocket` driver.
   charsiu on the CPU, best                 5.53      (pure q4_0, four threads)
 ```
 
-It reads **llama, qwen2, qwen3, gemma3, phi3 and smollm3** gguf files. Decode is at the
+It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files. Decode is at the
 board's DRAM roof: 10.8 GB/s of weights, 1661 ms of a 1792 ms hardware path spent waiting
 on the fence, and one millisecond of a token unaccounted for.
 
@@ -53,7 +53,7 @@ charsiu                     a conversation (the model stays staged between turns
 charsiu -p "..." -n 64      one answer
 charsiu bench               what this board does, in tok/s
 charsiu-config              pick a model, threads, context
-charsiu-get                 more models: llama, qwen2, qwen3, gemma3, phi3, smollm3
+charsiu-get                 more models: llama, qwen2, qwen3, gemma3, gemma4, phi3, smollm3
 charsiu-doctor              what works and what does not
 charsiu-doctor --paste      the block to put in a bug report
 ```
@@ -1376,6 +1376,51 @@ weights are streaming through. Nothing else moved, the board **cooled** 53 C to 
 across the run, and the A72 held 2208 MHz throughout. So 60.4 ms is 16.6 tok/s and 63.3
 is 15.8, and a remembered 17.1 is a shorter window on the same curve.
 
+### gemma4 costs what a 4.6B model costs, and the head is two fifths of it
+
+Measured on this host, everything on the CPU, 24 tokens:
+
+```
+  Llama-3.2-1B    30.6 ms a token
+  gemma3-1b       30.8
+  gemma-4-E2B     63.8
+```
+
+Twice the time for about twice the weights, which is the model rather than the
+runtime. Per token gemma-4-E2B moves
+
+```
+  projections and the per layer gates  1048 MB   the hardware's
+  per_layer_model_proj, bf16              28     the CPU's, and now vectorised
+  output head, q8_0 and tied             428     the CPU's, because it is not routed
+```
+
+The per layer embedding does what its name says: the 2.35B parameter table is
+looked up one row at a time, so the 1048 MB really is the "2B active" and not
+the 4.6B stored. What is left is the head, and it is **two fifths of the token
+on a CPU that reads at 6.5 GB/s**. At the board's measured rates that is about
+167 ms a token, or 6 tok/s, against Llama-3.2-1B's measured 60.4.
+
+### Why the output head cannot be routed, and what would move it
+
+```
+  weights       151 MB    32 slices at N=8192, int4
+  coefficients 1210 MB    <-- and this is why the allocation fails
+```
+
+`charsiu_coef_bytes` bounds the coefficient surface by `k*n`, which makes it
+four times the weight buffer. The bound is a guess and its own comment has said
+so since it was written: the two walls it was sized against were tens of
+KILObytes -- 4.7 KB allocated against 33 KB read, and 1280 bytes against 20800
+-- and nothing has ever measured the read growing with `k*n`. At 65536 elements
+the same head wants 10.5 MB and fits.
+
+`npu_gemm_test K N --coef` walks the bound downward and stops at the first value
+that is not exact. ⚠ It walks DOWN because under-allocating does not return an
+error: the RDMA reads past the buffer, the IOMMU faults, and the job times out
+with every register correct. The last exact value is the floor; everything below
+it is unexplored rather than known bad.
+
 ### gemma3-1b is slower here, and the reason is not the graph
 
 113 ms a token against llama's 60, on the same board. On a host where everything runs
@@ -1393,7 +1438,7 @@ the hardware rate falls from 10.82 GB/s to 6.16.
 
 ### More than one architecture, and two things that were quietly wrong
 
-`llama_load` reads **llama, qwen2, qwen3, gemma3, phi3 and smollm3**. `charsiu_check`'s
+`llama_load` reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3**. `charsiu_check`'s
 gate has to match it exactly: it exists to save a two gigabyte download and is wrong in
 both directions if it drifts.
 
@@ -1408,6 +1453,21 @@ window layers rotate at 10000 and the full ones at the model's own 1000000, and 
 file carries no key for it -- a second norm on each branch before the residual add, the
 embedding times sqrt(n_embd), GELU, and a fourth chat format whose assistant is spelled
 `model` and which has no system role at all.
+
+gemma4 is the one that needed the most, and almost none of it is the attention.
+gemma-4-E2B is 4.6B parameters of which about two are active, and the mechanism
+that decides which is a **per layer embedding**: a second table that every layer
+gates itself against after its feed forward residual. Around that:
+`feed_forward_length` is an **array**, 6144 for its first fifteen layers and
+12288 after; a window layer's head is **256** where a full layer's is **512**;
+its last twenty layers have no `attn_k` at all and read an earlier layer's KV --
+and gemma4 keeps **two caches, one per kind of attention**, so E2B's first
+shared layer (15, a window layer) reads layer 13 and not layer 14, which is the
+last layer with a KV of its own and is a full one. Pointing it at 14 reads 256
+floats out of a slot written as 512, the residual norms stay between 0.75 and 2
+the whole way down, and the model answers in a different language every token.
+Its attention scale is 1.0 rather than 1/sqrt(head), it RMS normalises V with no
+gain at all, and one of its tensors is bf16.
 
 Two bugs found on the way, both of which produced **fluent English** rather than
 anything that looks like a fault:
@@ -1427,6 +1487,14 @@ bigram merge. The two agree only when the scores really are log probabilities. G
 stores what is effectively minus a rank: `▁The` scores -175 while `▁T` and `he` score
 -64 and -5, so the additive objective prefers the two small pieces by more than a
 hundred and the prompt segments as `▁T | he | ▁c | ap | it | al`.
+
+A third, which is neither: **a tensor that is not found is simply not used.**
+Three of gemma4's per layer names are SHORTER than the model wide ones they
+belong to -- `per_layer_token_embd` and `per_layer_model_proj` are top level,
+but a layer's three are `blk.N.inp_gate`, `blk.N.proj` and `blk.N.post_norm`.
+Guessing `per_layer_*` found nothing three times, so the whole per layer path
+was skipped, and the model loaded, ran, answered and was missing the half of
+itself its name is about.
 
 `tests/arch_sanity.sh` catches both. It asks every gguf in a directory one factual
 question and reports the ones that miss it -- no llama.cpp build, no f32 copy -- and it
