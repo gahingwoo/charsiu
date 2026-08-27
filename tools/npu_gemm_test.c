@@ -659,6 +659,101 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * m=1 is the control. Every reading collapses to the identity there, so all of
  * them must score n; a candidate that does not is a bug in this function.
  */
+/*
+ * ⚠⚠ ONE REGISTER, SWEPT AT A WIDTH WHERE IT CAN VARY.
+ *
+ * 0x40b8 is ow * rows on the int8 arm, which is the row count and scales with
+ * M, and a literal 3 on the acc_out arm at every M. Round 312 chose that 3 by
+ * sweeping 0 to 15 at M = 1, which is the one width where a value that should
+ * follow M cannot show that it does. charsiu_matmul takes the int8 arm and is
+ * 128 of 128 exact at M = 2; this tool takes the acc_out arm and is wrong at
+ * every M above one under every reading.
+ *
+ * So sweep it at M = 2, and score each candidate under EVERY reading rather
+ * than only the flat one: a value that fixes the arithmetic should show up
+ * whatever the layout turns out to be, and the layout is not known.
+ *
+ * ⚠ THE CONTROL IS M = 1. The default 3 has to score n there, or the sweep is
+ * measuring a broken build rather than a register.
+ */
+static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
+{
+	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };
+	unsigned maxm = 8;
+	uint8_t *A = malloc((size_t)maxm * k);
+	uint8_t *B = malloc((size_t)n * k);
+	int32_t *got = malloc((size_t)maxm * n * 4);
+	int32_t *want = malloc((size_t)maxm * n * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	for (unsigned r = 0; r < maxm; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	for (unsigned c = 0; c < n; c++)
+		for (unsigned i = 0; i < k; i++)
+			B[(size_t)c * k + i] = mix(c, i, 15);
+
+	printf("K=%u N=%u, acc_out. DPU 0x40b8 swept; the int8 arm computes\n"
+	       "ow * rows, which is m here, and acc_out writes a literal 3.\n"
+	       "Each candidate is scored under every reading; the best one is\n"
+	       "shown with the reading that produced it.\n\n", k, n);
+	printf("  0x40b8    m=1 (control)        m=2 best      m=4 best\n");
+
+	for (unsigned v = 0; v <= 16; v++) {
+		char buf[16];
+		size_t best[3] = { 0, 0, 0 };
+		const char *how[3] = { "", "", "" };
+		static const unsigned MS[] = { 1, 2, 4 };
+
+		snprintf(buf, sizeof(buf), "%u", v);
+		setenv("CHARSIU_DPU_40B8", buf, 1);
+		for (unsigned y = 0; y < 3; y++) {
+			unsigned m = MS[y];
+			size_t total = (size_t)m * n;
+
+			reference(m, k, n, A, B, want);
+			if (run(dev, m, k, n, A, B, got)) {
+				how[y] = "submit failed";
+				continue;
+			}
+			for (unsigned a = 0; a < sizeof(ATOMS) / sizeof(*ATOMS); a++) {
+				unsigned atom = ATOMS[a];
+				size_t ex = 0;
+
+				for (unsigned mi = 0; mi < m; mi++)
+					for (unsigned ni = 0; ni < n; ni++) {
+						size_t at = atom
+						  ? (size_t)(ni / atom) * m * atom
+						    + (size_t)mi * atom + ni % atom
+						  : (size_t)mi * n + ni;
+
+						if (at < total &&
+						    got[at] == want[(size_t)mi * n + ni])
+							ex++;
+					}
+				if (ex > best[y]) {
+					best[y] = ex;
+					how[y] = atom ? "surf" : "flat";
+				}
+			}
+		}
+		printf("  %6u   %5zu/%-5u %-4s  %5zu/%-5u %-4s  %5zu/%-5u %-4s%s\n",
+		       v, best[0], n, how[0], best[1], 2 * n, how[1],
+		       best[2], 4 * n, how[2], v == 3 ? "   <- today's default" : "");
+	}
+	unsetenv("CHARSIU_DPU_40B8");
+	printf("\n  ⚠ the m=1 column is the CONTROL and 3 must score %u there.\n"
+	       "  A candidate that scores 2n at m=2 is the answer; check it at\n"
+	       "  m=4 in the same row before believing it.\n", n);
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
 static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 {
 	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };  /* 0 = flat */
@@ -952,6 +1047,12 @@ int main(int argc, char **argv)
 	 */
 	if (argc > 3 && !strcmp(argv[3], "--read")) {
 		int rc = read_sweep(dev, k, n);
+
+		charsiu_close(dev);
+		return rc;
+	}
+	if (argc > 3 && !strcmp(argv[3], "--b8")) {
+		int rc = b8_sweep(dev, k, n);
 
 		charsiu_close(dev);
 		return rc;

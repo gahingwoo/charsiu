@@ -1222,9 +1222,32 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * trend: bytes written 112, 160, 208, 256, 208, 128, 64 and elements
 	 * exact 4, 8, 12, 64, 16, 16, 16 at 0, 1, 2, 3, 4, 7, 15.
 	 */
+	/*
+	 * ⚠⚠ AND ROUND 312 SWEPT IT AT M = 1, WHERE IT CANNOT VARY.
+	 *
+	 * The int8 arm computes ow * rows, which is the row count on the height
+	 * axis and does scale with M. The acc_out arm is a literal 3 at every
+	 * M, fitted on the one width where the two arms cannot be told apart.
+	 *
+	 * That is the shape of the m > 1 defect: charsiu_matmul, which takes
+	 * the int8 arm, is 128 of 128 bytes exact at M = 2 on the board, and
+	 * npu_gemm_test, which takes the acc_out arm, has never been right
+	 * above one row under any reading.
+	 *
+	 * CHARSIU_DPU_40B8 replaces the value so a board round can sweep it
+	 * the way round 260 swept 0x4050, one number at a time with everything
+	 * else held. The default does not move until one does.
+	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
-	emit(&e, DPU, 0x40b8, (job->acc_out || charsiu_w4_paired(&job->mm)) ? 3u
-					   : (uint32_t)(ow * (2 * rows - rows)));
+	{
+		const char *e8b = getenv("CHARSIU_DPU_40B8");
+		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
+			   ? 3u : (uint32_t)(ow * (2 * rows - rows));
+
+		if (e8b)
+			v = (uint32_t)strtoul(e8b, NULL, 0);
+		emit(&e, DPU, 0x40b8, v);
+	}
 	emit(&e, DPU, 0x40bc, 0x00000000);
 	emit(&e, DPU, 0x40c0, 0x04440100);
 	emit(&e, DPU, 0x40c8, 0x00000000);
