@@ -1707,6 +1707,68 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
+/*
+ * ⚠ WHOLE ROWS, ACROSS EVERY SLOT OF ONE DEVICE.
+ *
+ * Rows are the axis and not for convenience: a row owns its stripe of Y, and
+ * the K slices that must SUM into the same channels are all inside one row and
+ * therefore on one thread. Splitting by slot would put two summands of a single
+ * channel on two threads.
+ *
+ * ⚠ THIS WAS TRIED ONCE AND MADE IT WORSE, 283 ms to 463, and the reason was
+ * not the pool: the read order table was keyed on the tensor's width and so was
+ * REBUILT inside every dispatch. With the table built once at nmax there is
+ * nothing in here but the gather.
+ */
+struct bread {
+	struct charsiu_npu *g;
+	const struct npu_entry *e;
+	unsigned d, m;
+	float *Y;
+};
+
+static void bread_rows(void *vb, uint64_t r0, uint64_t nr)
+{
+	const struct bread *b = vb;
+	struct charsiu_npu *g = b->g;
+	const struct npu_entry *e = b->e;
+	unsigned m = b->m, nt = 0;
+	int grp = tensor_grouped(g, e->t);
+
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+		unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+		const float *fo;
+		const int32_t *io;
+
+		if (s->di != b->d)
+			continue;
+		fo = (const float *)((uint8_t *)e->bout[b->d].map
+				     + (size_t)nt * g->bout_stride);
+		io = (const int32_t *)fo;
+		for (uint64_t r = r0; r < r0 + nr; r++) {
+			const uint32_t *mp = g->bmap + (size_t)r * g->nmax;
+			float *yr = b->Y + (size_t)r * e->t->n + s->n0;
+
+			if (g->w4 && grp) {
+				const float *sc = s->sc;
+
+				for (unsigned j = 0; j < sn; j++)
+					yr[j] += fo[mp[j]] * sc[j];
+			} else if (g->w4) {
+				for (unsigned j = 0; j < sn; j++)
+					yr[j] += fo[mp[j]];
+			} else {
+				float d1 = g->bd1[(size_t)ki * m + r];
+
+				for (unsigned j = 0; j < sn; j++)
+					yr[j] += (float)io[mp[j]] * d1;
+			}
+		}
+		nt++;
+	}
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
@@ -1905,8 +1967,6 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	/* ⚠ both submitted, then both waited on: that is the point */
 	for (unsigned d = 0; d < g->ndev; d++) {
 		double tf = now_us();
-		unsigned nt;
-
 		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
 		g->bfence_us += now_us() - tf;
 		tf = now_us();
@@ -1927,52 +1987,10 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 						  (uint32_t)charsiu_acc_index(r, j, m);
 				g->bmap_m = m;
 			}
-			nt = 0;
-			for (unsigned i = 0; i < e->count; i++) {
-				const struct npu_slot *s = &g->slot[e->first + i];
-				unsigned sn = s->job.mm.n, ki = i / e->n_slices;
-				const float *fo;
-				const int32_t *io;
-				int grp = tensor_grouped(g, e->t);
+			{
+				struct bread b = { g, e, d, m, Y };
 
-				if (s->di != d)
-					continue;
-				fo = (const float *)((uint8_t *)e->bout[d].map
-						     + (size_t)nt * g->bout_stride);
-				io = (const int32_t *)fo;
-				/*
-				 * ⚠ THE TABLE IS BUILT AT `wide` AND A SLICE
-				 * CAN BE NARROWER -- the head's last one is
-				 * 5376 against 8192. charsiu_acc_index does not
-				 * depend on n at all, so the table is valid for
-				 * any narrower slice, but only if the entries
-				 * beyond its width are skipped rather than the
-				 * stride being changed. Indexing it at sn
-				 * instead cost exactly one tensor: 3585 rows of
-				 * 3616.
-				 */
-				for (unsigned r = 0; r < m; r++) {
-					const uint32_t *mp = g->bmap
-							  + (size_t)r * g->nmax;
-					float *yr = Y + (size_t)r * e->t->n
-						  + s->n0;
-
-					if (g->w4 && grp) {
-						const float *sc = s->sc;
-
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += fo[mp[j]] * sc[j];
-					} else if (g->w4) {
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += fo[mp[j]];
-					} else {
-						float d1 = g->bd1[(size_t)ki * m + r];
-
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += (float)io[mp[j]] * d1;
-					}
-				}
-				nt++;
+				charsiu_parallel_for(bread_rows, &b, m);
 			}
 		}
 		g->bread_us += now_us() - tf;
