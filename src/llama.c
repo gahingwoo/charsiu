@@ -607,6 +607,16 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					charsiu_act_set(&a, X + (size_t)r * t->k,
 							(int)t->k);
 					charsiu_act_blocks(&a);
+					/*
+					 * ⚠ int8's matvec READS a->q1 and the
+					 * float path does not, so without this
+					 * the reference came back all zeros on
+					 * an int8 model -- and the run that
+					 * finally produced both batched rows
+					 * scored 0 of 224 against it.
+					 */
+					if (charsiu_npu_needs_q1(s->dev))
+						charsiu_act_q1(&a);
 					charsiu_npu_matvec(s->dev, s->npu_id[i0],
 						&a, Yref + (size_t)r * t->n);
 				}
@@ -896,6 +906,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					unsetenv("CHARSIU_BATCH_CNADIFF");
 					charsiu_act_set(&a, X, (int)t->k);
 					charsiu_act_blocks(&a);
+					if (charsiu_npu_needs_q1(s->dev))
+						charsiu_act_q1(&a);
 					if (!charsiu_npu_matvec(s->dev,
 						s->npu_id[i0], &a, Y))
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
@@ -951,6 +963,16 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					charsiu_act_set(&a, X + (size_t)r * t->k,
 							(int)t->k);
 					charsiu_act_blocks(&a);
+					/*
+					 * ⚠ int8's matvec READS a->q1 and the
+					 * float path does not, so without this
+					 * the reference came back all zeros on
+					 * an int8 model -- and the run that
+					 * finally produced both batched rows
+					 * scored 0 of 224 against it.
+					 */
+					if (charsiu_npu_needs_q1(s->dev))
+						charsiu_act_q1(&a);
 					charsiu_npu_matvec(s->dev, s->npu_id[i],
 						&a, Yref + (size_t)r * t->n);
 				}
