@@ -636,6 +636,116 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * surf 1 entries are the control, and they have to pass or the run says
  * nothing about surf at all.
  */
+/*
+ * ⚠⚠ THE HARDWARE COMPUTES m > 1. THE READING IS WHAT IS WRONG.
+ *
+ * charsiu_matmul asks for the REQUANTISED INT8 output and reads it as
+ * [n/atom][m][n%atom] with a 16 byte atom. On the board at M=2 K=64 N=64 that
+ * is 128 of 128 bytes exact, and the same run read flat
+ * (CHARSIU_OUT_ROWMAJOR=1) is 52 of 128. So the surface reading is doing real
+ * work and the block is computing both rows.
+ *
+ * This tool asks for acc_out, the raw int32 accumulator, and reads it flat. It
+ * has never been right above one row. The accumulator is four bytes where the
+ * int8 output is one, so if the surface is the same shape the atom is a
+ * different number of ELEMENTS, and nobody has measured which.
+ *
+ * ⚠ DO NOT GUESS IT. The nearest guess -- a 16 byte atom, so four words --
+ * predicts 8 positions surviving a flat read at m=2, which is what the board
+ * writes, and 16 at m=4, where the board writes 8. Right at one width and
+ * wrong at the next is what four rounds of fitting produced. So this asks the
+ * board instead: same buffer, every candidate reading, one exact count each.
+ *
+ * m=1 is the control. Every reading collapses to the identity there, so all of
+ * them must score n; a candidate that does not is a bug in this function.
+ */
+static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
+{
+	static const unsigned ATOMS[] = { 0, 2, 4, 8, 16, 32 };  /* 0 = flat */
+	static const unsigned MS[] = { 1, 2, 4, 8 };
+	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
+	uint8_t *A = malloc((size_t)maxm * k);
+	uint8_t *B = malloc((size_t)n * k);
+	int32_t *got = malloc((size_t)maxm * n * 4);
+	int32_t *want = malloc((size_t)maxm * n * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	for (unsigned r = 0; r < maxm; r++)
+		for (unsigned i = 0; i < k; i++)
+			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+	for (unsigned c = 0; c < n; c++)
+		for (unsigned i = 0; i < k; i++)
+			B[(size_t)c * k + i] = mix(c, i, 15);
+
+	printf("K=%u N=%u, int8, raw accumulator. One submit per m, then the\n"
+	       "same buffer read every way. exact of m*n; m=1 is the control\n"
+	       "and every column must score n there.\n\n", k, n);
+	printf("   m   distinct  present        flat");
+	for (unsigned a = 1; a < sizeof(ATOMS) / sizeof(*ATOMS); a++)
+		printf("   atom %-2u", ATOMS[a]);
+	printf("\n");
+
+	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+		unsigned m = MS[y];
+		size_t total = (size_t)m * n, live = 0, uniq = 0;
+
+		reference(m, k, n, A, B, want);
+		if (run(dev, m, k, n, A, B, got)) {
+			printf("  %2u   submit failed\n", m);
+			rc = 1;
+			continue;
+		}
+		/*
+		 * ⚠ HOW MANY DISTINCT VALUES THE REFERENCE HAS, printed beside
+		 * the score. charsiu_matmul's own data is five distinct values
+		 * in 128 and it says so; a match count means nothing without
+		 * this number next to it.
+		 */
+		for (size_t q = 0; q < total; q++) {
+			size_t j;
+
+			for (j = 0; j < q; j++)
+				if (want[j] == want[q])
+					break;
+			if (j == q)
+				uniq++;
+		}
+		for (size_t q = 0; q < total; q++)
+			for (size_t i = 0; i < total; i++)
+				if (got[i] == want[q]) { live++; break; }
+
+		printf("  %2u   %6zu   %4zu/%-4zu", m, uniq, live, total);
+		for (unsigned a = 0; a < sizeof(ATOMS) / sizeof(*ATOMS); a++) {
+			unsigned atom = ATOMS[a];
+			size_t ex = 0;
+
+			for (unsigned mi = 0; mi < m; mi++)
+				for (unsigned ni = 0; ni < n; ni++) {
+					size_t at = atom
+						? (size_t)(ni / atom) * m * atom
+						  + (size_t)mi * atom + ni % atom
+						: (size_t)mi * n + ni;
+
+					if (at < total &&
+					    got[at] == want[(size_t)mi * n + ni])
+						ex++;
+				}
+			printf("  %4zu/%-4zu", ex, total);
+		}
+		printf("\n");
+	}
+	printf("\n  A column that reads m*n at every m is the reading. If none\n"
+	       "  does, the accumulator surface is not this shape and the\n"
+	       "  present column says whether the values are even there.\n");
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
 static int surf_sweep(struct charsiu_device *dev, unsigned n)
 {
 	static const unsigned KS[] = { 48, 64, 80, 128, 256, 512, 1024 };
@@ -832,6 +942,16 @@ int main(int argc, char **argv)
 	 */
 	if (argc > 3 && !strcmp(argv[3], "--surf")) {
 		int rc = surf_sweep(dev, n);
+
+		charsiu_close(dev);
+		return rc;
+	}
+	/*
+	 * The reading sweep keeps K and N, because the question is the output
+	 * layout rather than the input geometry.
+	 */
+	if (argc > 3 && !strcmp(argv[3], "--read")) {
+		int rc = read_sweep(dev, k, n);
 
 		charsiu_close(dev);
 		return rc;
