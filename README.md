@@ -1297,8 +1297,8 @@ next board round.
 ### What charsiu's own M > 1 turned out to be
 
 charsiu asks the hardware for one row. A batched prefill wants thirty two, where the
-same weight bytes serve thirty two rows instead of one, and this tree has never got a
-correct answer above M = 1.
+same weight bytes serve thirty two rows instead of one, and at a projection's K this
+tree has never got a correct answer above M = 1.
 
 Four rounds went into fitting an address function to the output, because the values
 came back in the wrong places and that looks like a layout. Against a reference with
@@ -1320,10 +1320,32 @@ where a contiguous read expects it.
 
 So it is not a stride. A stride puts values in the wrong place; this leaves them
 uncomputed, and "one row whole and the rest a fixed share" is a budget being divided.
-Mesa bounds exactly this and charsiu does not: `rkt_task.c` splits a task's staged rows
-when `(cbuf_rows + staged) * entries_per_slice > total_entries`, and charsiu submits
-all m rows as one task and never checks. That is the difference between the emitter
-that runs M = 1..8 correctly on this board and this one.
+
+**The budget is not the CBUF, and the arithmetic settles that without a board.** An
+LLM matmul reaches the encoder one column wide, `input_height = m`,
+`input_channels = K`, so `entries_per_slice` is 16 at K = 1024. The RK3576 CBUF is 16
+banks of 512 entries and Mesa's own budget is five banks usable, ten total: at m = 8
+that is **128 entries against 2560**. Mesa's over-budget test needs m > 320, its split
+needs m > 640, and its row-window path needs a surface at least 112 wide. Mesa does
+not split these shapes either, so not splitting is not the difference.
+
+**What the record does partition on is `surf`.** Every shape this tree has ever
+computed correctly above one row -- M = 224 at K = 64, and M = 3136 at K = 33, both in
+the table near the top of this file -- has `charsiu_entries_per_row() == 1`. Every
+shape that fails is K = 256 or K = 512, which are surf 4 and surf 8. There is no
+measurement at surf 2 anywhere, and none at surf > 1 that ever worked at any m.
+
+That is a narrower claim than "M > 1 is broken", which M = 3136 computing 99.8% of a
+56x56 surface already contradicts. The statement that survives the whole record is
+**entries per row above one is broken once there is more than one row**. `surf` is the
+stride between staged rows -- it reaches the hardware as `surf * rows` in `0x1028` --
+so at surf 1 a wrong multiplier is invisible however many rows there are. It is also
+why `CHARSIU_ENTRY_ATOMICS=8` changed nothing: at K = 256 it takes surf from 4 to 2.
+
+`npu_gemm_test K N --surf` walks K with N and m held, in one process and one build,
+which matters because the surf 1 successes were measured ten days before the surf 4
+failures. K = 48 and K = 64 are the control and have to be exact at m = 2 and m = 4;
+K = 80 and K = 128 are surf 2, which nothing has ever measured.
 
 ⚠ The test that measured all of this printed the opposite of its own data first: "1 of
 5 widths exact at N=16, the budget reading does not hold", while its own increment line

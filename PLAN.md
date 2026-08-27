@@ -54,15 +54,58 @@ where a contiguous read expects it. That is a budget being divided, not a stride
 the four rounds spent fitting an address function to the output were fitting the
 symptom.
 
-**Next**: find what makes the per-row allowance `N/4 + 12` rather than `N`. Mesa
-bounds exactly this and charsiu does not -- `rkt_task.c` splits a task's staged rows
-when `(cbuf_rows + staged) * entries_per_slice > total_entries`, and charsiu submits
-all m rows as one task and never checks.
+### The CBUF split is not it, and the arithmetic says so without a board
 
-**Control**: `npu_gemm_test` sweeps M and both entry-atomic constants, prints the
-whole output as the (row, channel) each word holds, and separates *wrong values* from
-*right values in the wrong order*. It has been wrong in both directions and says so
-now.
+The step this section named next was: Mesa splits a task's staged rows when
+`(cbuf_rows + staged) * entries_per_slice > total_entries` and charsiu never checks.
+Put the numbers in and it cannot fire.
+
+An LLM matmul reaches the encoder as `input_width = 1`, `input_height = m`,
+`input_channels = K`, so `entries_per_slice` is 16 at K = 1024 and 32 at K = 2048.
+The RK3576 CBUF is 16 banks of 512 entries; Mesa's own budget is five banks usable
+and ten total. At m = 8 and K = 1024 that is **128 entries against 2560**. The
+over-budget test needs m > 320 and the split test needs m > 640; the row-window path
+needs `input_width >= 112`, and this shape is one wide. **Mesa does not split these
+either.** Not splitting is not the difference.
+
+### What the record actually partitions on: `surf`, not `m`
+
+Every shape this tree has ever computed correctly above one row:
+
+| shape | surf | result |
+|---|---|---|
+| M=224 K=64 N=64 | **1** | 14313 of 14336, none off by more than 1 |
+| M=3136 K=33 N=64 | **1** | 200344 of 200704, 51 off by more than 1 |
+
+Every shape that fails is K = 256 or K = 512, which are `surf` **4** and **8**. There
+is no measurement at surf 2 anywhere, and **no measurement at surf > 1 that ever
+worked at any m**.
+
+So "M > 1 is broken" is contradicted by M = 3136 computing 99.8% of a 56x56 surface,
+and the statement that survives the whole record is narrower: **entries per row above
+one is broken once there is more than one row.** `surf` is the stride between staged
+rows -- it goes into `0x1028` as `surf * rows` -- and at surf 1 a wrong multiplier is
+invisible however many rows there are, which is exactly the shape of a fault that
+hides at m = 1 and hides again at K = 64.
+
+It also explains the one result that had no explanation: `CHARSIU_ENTRY_ATOMICS=8`
+changed nothing because at K = 256 it takes surf from 4 to 2, and 2 is not 1.
+
+**Next**: `npu_gemm_test K N --surf` walks K itself with N and m held (the K argument is ignored), so surf is the only
+thing moving, and it does it in **one process and one build** -- the surf 1 successes
+were measured on 2026-08-16 and the surf 4 failures ten days later, which is the one
+way this partition could still be two different faults wearing one name.
+
+**Control**: K = 48 and K = 64 are surf 1 and have to be exact at m = 2 and m = 4. If
+they are not, the axis is not surf and the table means nothing. K = 80 and K = 128 are
+surf 2, which nothing has ever measured, and they are what says whether the boundary
+is "surf 1" or "surf small".
+
+**If it holds**, a batched prefill has a cheap route that needs no new register: K is
+already sliced by KMAX and `acc_out` sums int32 across slices exactly, so a KMAX that
+keeps surf at 1 (64 for int8, 32 for fp16) makes every slice a working shape. That
+buys many more tasks per projection, which at m = 32 is paid for thirty two times
+over.
 
 ## 2. The output head, which is two fifths of a gemma token
 

@@ -606,6 +606,108 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * not exact. The last good one is the answer, and everything below it is
  * unexplored rather than known bad.
  */
+/*
+ * ⚠⚠ THE PARTITION THAT WAS IN THE RECORD ALL ALONG: m > 1 IS EXACT WHERE
+ * surf IS 1.
+ *
+ * Every shape this tree has ever computed correctly above one row has
+ * charsiu_entries_per_row() == 1:
+ *
+ *   M=224  K=64 N=64   14313 of 14336, none off by more than 1   surf 1
+ *   M=3136 K=33 N=64  200344 of 200704, 51 off by more than 1    surf 1
+ *
+ * and every shape that fails is K = 256 or K = 512, which are surf 4 and
+ * surf 8. There is no measurement at surf 2 at all, and no measurement at
+ * surf > 1 that ever worked at any m.
+ *
+ * That is a different question from the one four rounds asked. "M > 1 is
+ * broken" is contradicted by M = 3136 computing 99.8% of a 56x56 surface;
+ * "entries per row above one is broken once there is more than one row" is
+ * contradicted by nothing on record. surf is not decorative -- it goes into
+ * 0x1028 as `surf * rows`, so it is the stride between staged rows, and at
+ * surf 1 a wrong multiplier is invisible however many rows there are.
+ *
+ * It also explains why CHARSIU_ENTRY_ATOMICS=8 did not fix anything: at
+ * K = 256 that takes surf from 4 to 2, which is still not 1.
+ *
+ * This walks K with N and m fixed so one run produces the whole table. K is
+ * the axis and everything else is held: same N, same m, same buffers, same
+ * process. The K list is chosen so surf goes 1, 1, 2, 4, 8, 16 -- the two
+ * surf 1 entries are the control, and they have to pass or the run says
+ * nothing about surf at all.
+ */
+static int surf_sweep(struct charsiu_device *dev, unsigned n)
+{
+	static const unsigned KS[] = { 48, 64, 80, 128, 256, 512, 1024 };
+	static const unsigned MS[] = { 1, 2, 4 };
+	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
+	unsigned kmax = KS[sizeof(KS) / sizeof(*KS) - 1];
+	uint8_t *A = malloc((size_t)maxm * kmax);
+	uint8_t *B = malloc((size_t)n * kmax);
+	int32_t *got = malloc((size_t)maxm * n * 4);
+	int32_t *want = malloc((size_t)maxm * n * 4);
+	int rc = 0;
+
+	if (!A || !B || !got || !want) {
+		fprintf(stderr, "out of memory\n");
+		free(A); free(B); free(got); free(want);
+		return 1;
+	}
+	printf("N=%u, int8, raw accumulator. K is the axis; surf is\n"
+	       "charsiu_entries_per_row(), the stride between staged rows.\n\n",
+	       n);
+	printf("     K  surf   m   exact of      all values present\n");
+	for (unsigned x = 0; x < sizeof(KS) / sizeof(*KS); x++) {
+		unsigned k = KS[x];
+		struct charsiu_matmul shape = { 1, k, n,
+						CHARSIU_INT8, CHARSIU_INT8 };
+		unsigned surf = charsiu_entries_per_row(&shape);
+
+		for (unsigned r = 0; r < maxm; r++)
+			for (unsigned i = 0; i < k; i++)
+				A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] = mix(c, i, 15);
+
+		for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+			unsigned m = MS[y];
+			size_t total = (size_t)m * n, ex = 0, live = 0;
+
+			reference(m, k, n, A, B, want);
+			if (run(dev, m, k, n, A, B, got)) {
+				printf("  %5u  %4u  %2u   submit failed\n",
+				       k, surf, m);
+				rc = 1;
+				continue;
+			}
+			for (size_t q = 0; q < total; q++)
+				if (got[q] == want[q])
+					ex++;
+			for (size_t q = 0; q < total; q++)
+				for (size_t i = 0; i < total; i++)
+					if (got[i] == want[q]) { live++; break; }
+			printf("  %5u  %4u  %2u   %5zu of %-5zu  %5zu of %-5zu%s\n",
+			       k, surf, m, ex, total, live, total,
+			       ex == total ? "  exact"
+					   : live == total
+					     ? "  all present, wrong order"
+					     : "  VALUES MISSING");
+		}
+	}
+	/*
+	 * ⚠ WHAT WOULD MAKE THIS RUN MEAN NOTHING: the surf 1 rows failing at
+	 * m > 1. They are the control. If K = 48 and K = 64 do not compute at
+	 * m = 2 and m = 4, the partition is not surf and this table is a
+	 * different fault being reported under the wrong name.
+	 */
+	printf("\n  ⚠ K=48 and K=64 are surf 1 and are the CONTROL: they have\n"
+	       "  to be exact at m=2 and m=4, or the axis is not surf.\n"
+	       "  K=80 and K=128 are surf 2, which nothing has ever measured.\n");
+	free(A); free(B); free(got); free(want);
+	return rc;
+}
+
 static int coef_floor(struct charsiu_device *dev, unsigned k, unsigned n,
 		      const uint8_t *A, const uint8_t *B,
 		      int32_t *got, int32_t *want)
@@ -719,6 +821,17 @@ int main(int argc, char **argv)
 	 */
 	if (argc > 3 && !strcmp(argv[3], "--coef")) {
 		int rc = coef_floor(dev, k, n, A, B, got, want);
+
+		charsiu_close(dev);
+		return rc;
+	}
+	/*
+	 * The surf sweep walks K itself, so the K on the command line is
+	 * ignored and only N is taken. It gets the whole run for the same
+	 * reason --coef does: it changes the shape every submit below inherits.
+	 */
+	if (argc > 3 && !strcmp(argv[3], "--surf")) {
+		int rc = surf_sweep(dev, n);
 
 		charsiu_close(dev);
 		return rc;
