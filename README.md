@@ -1423,6 +1423,14 @@ width axis form is now two registers from theirs at M = 32 and 64, fewer than at
 where this board is known to be right; `tests/board_w4_axis.sh` is the round that has
 not happened yet.
 
+The same file settles something about the int8 path too. Its 40 int8 streams are the
+LM head at M of 1, 32, 64, 96 and 128, and every one of them is **one row high** as
+well -- so the vendor puts M on the width for both weight formats and uses the height
+axis for nothing but attention. This tree's int8 batch, which is the one that works,
+runs on the height and stops being exact at 96. `tests/board_rows_sweep.sh` sweeps
+both axes now, height first as the control. If the width arm reaches 128 then the
+ceiling was the arrangement, on the path that already carries the 2.94x.
+
 **What follows is the record of the search**, kept because the reasoning in it is still
 the reasoning and because most of a fortnight was spent fitting models to the symptom.
 

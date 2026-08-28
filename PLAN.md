@@ -280,9 +280,22 @@ wide**, so their row count is 1 whatever M is. Every int4 stream in every
 .rkllm read here therefore reported M = 1, and the file was made to say the
 opposite of what it holds.
 
-⚠ **AND THE LARGEST M THEY EMIT IS 80.** This board's own batched prefill is
-byte exact to m = 80 and wrong from 96. Their compiler never goes above 80.
-Two independent sources, one number, neither of them looking at the other.
+⚠ **AND THE LARGEST M THEY EMIT FOR int4 IS 80**, which is also where this
+board's batched prefill stops being exact. ⚠⚠ **That is not the same fact twice
+and it was written here as if it were.** Ours is int8 on the HEIGHT axis --
+`board_rows_sweep.sh` sweeps the vision tower, whose matmuls are int8, and it
+is exact to 80 and wrong from 96. Theirs is int4 on the WIDTH. Different
+format, different arrangement; the shared 80 is so far a coincidence.
+
+⚠ **AND THEIR int8 GOES TO 128.** All 40 int8 streams in the file are the LM
+head, `ic=2048 oc=8160`, at M of 1, 32, 64, 96 and 128 -- and every one of them
+is ONE ROW HIGH too. So the vendor puts M on the width for **both** weight
+formats and uses the height axis for nothing but its fp16 attention.
+
+That makes our own 80 suspicious rather than confirmed: the arrangement that
+breaks at 96 is the one the vendor never uses for a weight matmul, and the one
+it does use runs the same int8 at 128. `board_rows_sweep.sh` now sweeps both
+axes, height first as the control.
 
 So batching an int4 weight matmul **is** available, and the plan to beat their
 TTFT by doing it was aimed at something they do every layer.

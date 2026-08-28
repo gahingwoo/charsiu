@@ -1788,9 +1788,13 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * height, where rows and pixels agree, which is why the two axes were
 	 * never told apart. tools/cmp_vendor.py compares on the pixel count now.
 	 *
-	 * ⚠ AND THE LARGEST M THE VENDOR EMITS IS 80, which is the ceiling this
-	 * board found on its own: the batched prefill is exact to m = 80 and
-	 * wrong from 96. Two independent sources, one number.
+	 * ⚠ The largest int4 M they emit is 80, which is also where this board's
+	 * batched prefill stops being exact -- but that is NOT the same fact
+	 * twice: ours is int8 on the height axis and theirs is int4 on the
+	 * width. Their int8 head runs 128 rows, one row high like the rest, so
+	 * they put M on the width for both weight formats and use the height
+	 * for nothing but fp16 attention. Our 80 is therefore a property of an
+	 * arrangement they never use, and board_rows_sweep.sh now asks both.
 	 *
 	 * So every word of the paragraph above is about the HEIGHT axis, which
 	 * is the one that produces a single row. What has never run on this

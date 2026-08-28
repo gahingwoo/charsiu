@@ -73,11 +73,31 @@ if [ "$Q" = "0.000000" ]; then
 	exit 1
 fi
 echo
+
+# ⚠ SWEEP BOTH AXES. This tower's matmuls are int8 and this sweep has only ever
+# run them with M on the HEIGHT: one column, M rows. That is the arrangement
+# that stops being exact at 96.
+#
+# The vendor's own file puts M on the WIDTH for BOTH weight formats -- its int4
+# projections reach 80 and its int8 head reaches 128, all of them one row high
+# -- and uses the height axis for nothing but its fp16 attention. So the 80 this
+# sweep found may be a property of the axis rather than of the hardware, and the
+# question costs one more pass.
+#
+# ⚠ THE HEIGHT ARM IS THE CONTROL and runs first. It must reproduce the known
+# bound; if it does not, the board or the build has changed and neither arm
+# means anything.
+for AXIS in h w; do
+case $AXIS in
+h) echo "===== M on the HEIGHT (today's default, known exact to 80) =====" ;;
+w) echo "===== M on the WIDTH (what the vendor's own streams do) =====" ;;
+esac
 printf '%8s  %10s  %12s  %s\n' rows seconds "vs one row" verdict
 
 for R in 4 8 16 32 48 64 80 96 112 128 160 256 512 1024; do
 	t0=$(ms)
-	if ! CHARSIU_NPU=1 CHARSIU_NPU_ROWS_MAX=$R "$VIS" "$MM" --encode \
+	if ! CHARSIU_NPU=1 CHARSIU_NPU_ROWS_MAX=$R CHARSIU_M_AXIS=$AXIS \
+			"$VIS" "$MM" --encode \
 			> "$T/npu.txt" 2>"$T/err.txt"; then
 		printf '%8s  %10s  %12s  %s\n' "$R" "-" "-" "the run failed"
 		continue
@@ -92,6 +112,11 @@ for R in 4 8 16 32 48 64 80 96 112 128 160 256 512 1024; do
 	V=$(awk -v d="$D" 'BEGIN{print (d == 0) ? "identical" : "DIFFERS"}')
 	printf '%8s  %10s  %12s  %s\n' "$R" "$SEC" "$D" "$V"
 done
+echo
+done
+echo "If the two arms have the same bound then the axis is not what limits it."
+echo "If the width arm goes further, the ceiling was the arrangement -- and the"
+echo "vendor's int8 head runs 128 rows wide, so 128 is the number to watch."
 echo
 echo "The first row that DIFFERS is the bound. The sweep before this one put it"
 echo "between 64 and 128 -- 2, 8, 32 and 64 gave the SAME output and 128 did not"
