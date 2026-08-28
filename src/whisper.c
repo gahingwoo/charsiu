@@ -379,6 +379,9 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 	 * rows and is m = 1 anyway, so leaving it out of max_n costs nothing
 	 * and keeps the device small.
 	 */
+	/* ⚠ nothing else starts it outside the language model */
+	charsiu_threads_start(0);
+
 	if (getenv("CHARSIU_NPU") && !w->n_missing) {
 		unsigned A = (unsigned)w->n_audio_state;
 		unsigned nt = (unsigned)(w->n_audio_layer + w->n_text_layer);
@@ -1023,12 +1026,63 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 	return 0;
 }
 
+/*
+ * One (head, query) each: the scores against every key, a softmax, and the
+ * weighted sum of the values.
+ *
+ * ⚠ THE SCRATCH IS PER RANGE, NOT PER ITEM. att is T floats and a range covers
+ * hundreds of items; allocating inside the item loop would be a malloc per
+ * query and the allocator would become the attention.
+ */
+struct wattn {
+	const float *q, *k, *v;
+	float *o;
+	unsigned T, W, hd;
+	float scale;
+};
+
+static void wattn_rows(void *ctx, uint64_t r0, uint64_t n)
+{
+	const struct wattn *c = ctx;
+	float *att = malloc((size_t)c->T * sizeof(float));
+	uint64_t r;
+
+	if (!att)
+		return;
+	for (r = r0; r < r0 + n; r++) {
+		unsigned h = (unsigned)(r / c->T), i = (unsigned)(r % c->T);
+		unsigned off = h * c->hd, j, e;
+		const float *qi = c->q + (size_t)i * c->W + off;
+		float *o = c->o + (size_t)i * c->W + off;
+
+		for (j = 0; j < c->T; j++) {
+			const float *kj = c->k + (size_t)j * c->W + off;
+			float d = 0.0f;
+
+			for (e = 0; e < c->hd; e++)
+				d += qi[e] * kj[e];
+			att[j] = d * c->scale;
+		}
+		wsoftmax(att, c->T);
+		for (e = 0; e < c->hd; e++)
+			o[e] = 0.0f;
+		for (j = 0; j < c->T; j++) {
+			const float *vj = c->v + (size_t)j * c->W + off;
+			float wg = att[j];
+
+			for (e = 0; e < c->hd; e++)
+				o[e] += wg * vj[e];
+		}
+	}
+	free(att);
+}
+
 int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 			   float *out)
 {
 	unsigned W = (unsigned)w->n_audio_state, H = (unsigned)w->n_audio_head;
 	unsigned L = (unsigned)w->n_audio_layer, T = (unsigned)w->n_audio_ctx;
-	unsigned F = 4 * W, hd = W / H, l, i, j, h, e;
+	unsigned F = 4 * W, hd = W / H, l, i, j;
 	float *c1 = NULL, *x = NULL, *xb = NULL, *q = NULL, *k = NULL;
 	float *v = NULL, *ff = NULL, *att = NULL, *g1 = NULL, *b1 = NULL;
 	float *tmp = NULL, scale;
@@ -1130,33 +1184,26 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		WSTAGE(W_QKV, wrows(B->k_w, NULL, xb, T, W, k, W, &a));
 		WSTAGE(W_QKV, wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a));
 
-		if (wstage_on) t_attn = wnow();
-		for (h = 0; h < H; h++) {
-			unsigned off = h * hd;
+		/*
+		 * ⚠ THIS IS 63% OF A TRANSCRIPTION and it is not a matmul
+		 * against a weight, so none of the NPU machinery reaches it:
+		 * 1500 queries against 1500 keys, six heads, four layers. Every
+		 * (head, query) is independent of every other, which is the
+		 * one thing that makes it worth a thread each.
+		 *
+		 * ⚠ ONE DISPATCH A LAYER, over H * T items. The prefill lost
+		 * twice on this pool at 226 dispatches of a fraction of a
+		 * millisecond each; four dispatches of nine thousand rows is
+		 * the other end of that ratio, and the barrier is paid four
+		 * times a clip rather than per row.
+		 */
+		{
+			struct wattn c;
 
-			for (i = 0; i < T; i++) {
-				const float *qi = q + (size_t)i * W + off;
-				float *o = xb + (size_t)i * W + off;
-
-				for (j = 0; j < T; j++) {
-					const float *kj = k + (size_t)j * W + off;
-					float d = 0.0f;
-
-					for (e = 0; e < hd; e++)
-						d += qi[e] * kj[e];
-					att[j] = d * scale;
-				}
-				wsoftmax(att, T);
-				for (e = 0; e < hd; e++)
-					o[e] = 0.0f;
-				for (j = 0; j < T; j++) {
-					const float *vj = v + (size_t)j * W + off;
-					float wg = att[j];
-
-					for (e = 0; e < hd; e++)
-						o[e] += wg * vj[e];
-				}
-			}
+			c.q = q; c.k = k; c.v = v; c.o = xb;
+			c.T = T; c.W = W; c.hd = hd; c.scale = scale;
+			if (wstage_on) t_attn = wnow();
+			charsiu_parallel_for(wattn_rows, &c, (uint64_t)H * T);
 		}
 		if (wstage_on) wstage_ms[W_ATTN] += wnow() - t_attn;
 		WSTAGE(W_PROJ, wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a));

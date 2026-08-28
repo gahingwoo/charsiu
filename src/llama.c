@@ -480,6 +480,22 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 }
 
 /*
+ * ⚠ THE POOL IS STARTED BY llama_state_new AND NOTHING ELSE STARTED IT. A
+ * whisper transcription or a vision tower has no llama_state, so every
+ * charsiu_parallel_for in those graphs ran on one core -- silently, because
+ * pool_run's single thread path is a plain call and looks like success.
+ */
+void charsiu_threads_start(int nthreads)
+{
+	pool_start(nthreads);
+}
+
+int charsiu_threads(void)
+{
+	return g_pool.n ? g_pool.n : 1;
+}
+
+/*
  * ⚠ NOT A STAGE, A SLICE THROUGH THEM. charsiu_act_set runs at the top of
  * every matvec, inside whichever row the stage table is counting, so it is
  * accumulated separately and printed as a note rather than a row.

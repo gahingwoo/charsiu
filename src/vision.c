@@ -333,6 +333,9 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 	 * layer plus the projector; the widest contraction is the projector's,
 	 * which on a pixel shuffled one is n_embd * scale^2.
 	 */
+	/* ⚠ nothing else starts it outside the language model */
+	charsiu_threads_start(0);
+
 	if (getenv("CHARSIU_NPU")) {
 		unsigned wide = v->n_embd > v->n_ff ? v->n_embd : v->n_ff;
 		unsigned rows = v->n_ff > v->proj_dim ? v->n_ff : v->proj_dim;
@@ -668,10 +671,54 @@ static void pixel_shuffle(const float *x, float *out, unsigned grid,
 			}
 }
 
+/* one (head, patch) each; see the note at the call site */
+struct vattn {
+	const float *q, *k, *v;
+	float *o;
+	unsigned n, W, hd;
+	float scale;
+};
+
+static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
+{
+	const struct vattn *c = ctx;
+	float *att = malloc((size_t)c->n * sizeof(float));
+	uint64_t r;
+
+	if (!att)
+		return;
+	for (r = r0; r < r0 + n; r++) {
+		unsigned h = (unsigned)(r / c->n), i = (unsigned)(r % c->n);
+		unsigned off = h * c->hd, j, e;
+		const float *qi = c->q + (size_t)i * c->W + off;
+		float *o = c->o + (size_t)i * c->W + off;
+
+		for (j = 0; j < c->n; j++) {
+			const float *kj = c->k + (size_t)j * c->W + off;
+			float d = 0.0f;
+
+			for (e = 0; e < c->hd; e++)
+				d += qi[e] * kj[e];
+			att[j] = d * c->scale;
+		}
+		vsoftmax(att, c->n);
+		for (e = 0; e < c->hd; e++)
+			o[e] = 0.0f;
+		for (j = 0; j < c->n; j++) {
+			const float *vj = c->v + (size_t)j * c->W + off;
+			float wg = att[j];
+
+			for (e = 0; e < c->hd; e++)
+				o[e] += wg * vj[e];
+		}
+	}
+	free(att);
+}
+
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 {
 	unsigned np = v->n_patches, W = v->n_embd, P = v->patch_size;
-	unsigned pin = 3u * P * P, hd, l, p, i, j, h, e;
+	unsigned pin = 3u * P * P, hd, l, p, i;
 	/*
 	 * ⚠ THE SEQUENCE IS NOT THE PATCHES. CLIP prepends a class token, so
 	 * everything from the position embedding to the attention runs over
@@ -796,33 +843,22 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a);
 		rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a);
 
-		/* full attention, every patch against every patch */
-		for (h = 0; h < v->n_head; h++) {
-			unsigned off = h * hd;
+		/*
+		 * ⚠ FULL ATTENTION, EVERY PATCH AGAINST EVERY PATCH, and on a
+		 * thread each. whisper's identical loop measured 62% of a
+		 * transcription and came down 3.46x on four cores; this one is
+		 * 1025 against 1025, twelve heads, twelve layers.
+		 *
+		 * It is not a matmul against a weight, so nothing built for the
+		 * NPU pool touches it.
+		 */
+		{
+			struct vattn c;
 
-			for (i = 0; i < nt; i++) {
-				const float *qi = q + (size_t)i * W + off;
-				float *o = xb + (size_t)i * W + off;
-
-				for (j = 0; j < nt; j++) {
-					const float *kj = k + (size_t)j * W + off;
-					float d = 0.0f;
-
-					for (e = 0; e < hd; e++)
-						d += qi[e] * kj[e];
-					att[j] = d * scale;
-				}
-				vsoftmax(att, nt);
-				for (e = 0; e < hd; e++)
-					o[e] = 0.0f;
-				for (j = 0; j < nt; j++) {
-					const float *vj = val + (size_t)j * W + off;
-					float w = att[j];
-
-					for (e = 0; e < hd; e++)
-						o[e] += w * vj[e];
-				}
-			}
+			c.q = q; c.k = k; c.v = val; c.o = xb;
+			c.n = nt; c.W = W; c.hd = hd; c.scale = scale;
+			charsiu_parallel_for(vattn_rows, &c,
+					     (uint64_t)v->n_head * nt);
 		}
 
 		rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a);

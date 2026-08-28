@@ -78,7 +78,10 @@ say_result() {  # what, got, want
 
 echo "== 1. hearing: whisper tiny.en on jfk.wav =="
 t0=$(ms)
-OUT=$("$WSP" "$DIR/ggml-tiny.en.bin" --transcribe --audio "$DIR/jfk.wav")
+OUT=$(CHARSIU_STAGES=1 "$WSP" "$DIR/ggml-tiny.en.bin" --transcribe \
+	--audio "$DIR/jfk.wav" 2>"$DIR/.wsp.err")
+grep -E "accounted|ms  " "$DIR/.wsp.err" | sed "s/^/  /" || true
+grep -E "NPU pool|ON THE HARDWARE" "$DIR/.wsp.err" | sed "s/^/  /" || true
 T_WSP=$(took "$t0")
 echo "  $OUT"
 say_result "the words" "$OUT" "ask not what your country can do for you"

@@ -189,6 +189,15 @@ struct npu_tensor {
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 			  void *ctx, uint64_t n);
 
+/*
+ * Start the worker pool. llama_state_new does this; a graph that is not the
+ * language model has to do it itself or every parallel_for runs on one core --
+ * quietly, because the single thread path is an ordinary call.
+ * 0 asks CHARSIU_THREADS, then the machine.
+ */
+void charsiu_threads_start(int nthreads);
+int charsiu_threads(void);
+
 int  npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w);
 void npu_tensor_free(struct npu_tensor *t);
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
