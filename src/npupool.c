@@ -218,7 +218,9 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 {
 	unsigned i, id = 0, found = 0, chunk = rows_max(), done = 0;
 	uint64_t k, n;
+	double t0;
 
+	p->calls++;
 	if (!p->dev || !charsiu_pool_get(p, w))
 		return -1;
 	for (i = 0; i < p->n; i++)
@@ -234,15 +236,48 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 
 	k = w->ne[0];
 	n = w->n_dims ? w->ne[w->n_dims - 1] : 1;
+	t0 = now_ms();
 	while (done < m) {
 		unsigned c = m - done < chunk ? m - done : chunk;
 
 		if (charsiu_npu_matmul(p->dev, (int)id, X + (size_t)done * k, c,
-				       Y + (size_t)done * n))
+				       Y + (size_t)done * n)) {
+			/*
+			 * ⚠ A REFUSAL PART WAY THROUGH LEAVES HALF AN ANSWER,
+			 * and the caller redoes the whole thing on the CPU, so
+			 * the rows already written are overwritten and nothing
+			 * is lost. It is counted separately because "it fell
+			 * back" and "it never tried" are different facts.
+			 */
+			p->fell_back++;
+			p->hw_ms += now_ms() - t0;
 			return -1;
+		}
 		done += c;
 	}
+	p->hw++;
+	p->rows_hw += m;
+	p->hw_ms += now_ms() - t0;
 	return 0;
+}
+
+/*
+ * ⚠ THE ONE LINE THAT SAYS WHETHER ANY OF THIS IS HAPPENING. Without it a run
+ * that quietly fell back to the CPU looks exactly like a run that did not, and
+ * the only visible difference is a wall clock that did not move -- which is how
+ * a 17x got announced from a subtraction.
+ */
+void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out)
+{
+	unsigned i, on = 0;
+
+	for (i = 0; i < p->n; i++)
+		if (p->id[i] >= 0)
+			on++;
+	fprintf(out, "charsiu NPU pool: %u of %u tensors on the hardware; "
+		"%lu matmuls of %lu rows in %.0f ms, %lu asked and %lu fell "
+		"back\n", on, p->n, p->hw, p->rows_hw, p->hw_ms, p->calls,
+		p->fell_back);
 }
 
 /*
@@ -288,6 +323,17 @@ int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
 	for (i = 0; i < n; i++)
 		if (w[i] && charsiu_pool_get(p, w[i]))
 			staged++;
+	/* ⚠ STAGED IS NOT ROUTED. charsiu_pool_get returns the quantised copy
+	 * whether or not the hardware took it, and the first version of this
+	 * message said "on the NPU" about both. */
+	{
+		unsigned k2, on = 0;
+
+		for (k2 = 0; k2 < p->n; k2++)
+			if (p->id[k2] >= 0)
+				on++;
+		staged = on;
+	}
 	/*
 	 * ⚠ HAND IT BACK. The language model stages after this in the same
 	 * process when a picture is part of a prompt, and it has its own file.
@@ -295,7 +341,8 @@ int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
 	if (cache)
 		charsiu_wcache_use(NULL, NULL);
 	if (charsiu_diag())
-		fprintf(stderr, "charsiu: %u tensors on the NPU in %.0f ms%s\n",
-			staged, now_ms() - t0, cache ? "" : " (no cache)");
+		fprintf(stderr, "charsiu: %u of %u tensors ON THE HARDWARE, "
+			"staged in %.0f ms%s\n", staged, n, now_ms() - t0,
+			cache ? "" : " (no cache)");
 	return 0;
 }

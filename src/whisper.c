@@ -384,6 +384,8 @@ void charsiu_whisper_close(struct charsiu_whisper *w)
 	int32_t i;
 	size_t k;
 
+	if (w->npu && charsiu_diag())
+		charsiu_pool_report(&w->pool, stderr);
 	charsiu_pool_fini(&w->pool);
 
 	for (i = 0; i < w->n_vocab && w->vocab; i++)

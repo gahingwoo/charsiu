@@ -515,6 +515,18 @@ struct charsiu_npu_pool {
 	 */
 	const void **src;
 	int *id;                  /* >= 0 when the tensor is on the hardware */
+
+	/*
+	 * ⚠ WHAT ACTUALLY WENT TO THE HARDWARE, counted rather than assumed.
+	 * A board round subtracted a staging figure from a wall clock and
+	 * announced 17x; the next round dropped that staging by 19 seconds and
+	 * the wall clock did not move. Neither number was wrong -- the
+	 * SUBTRACTION was, because nothing was counting how much of the work
+	 * reached the NPU at all.
+	 */
+	unsigned long calls, hw, fell_back;
+	unsigned long rows_hw;
+	double hw_ms;
 	unsigned n, cap;
 	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */
 };
@@ -541,6 +553,9 @@ void charsiu_wcache_use(const char *path, const char *stamp);
 int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
 			   const struct gguf_tensor *const *w, unsigned n,
 			   const char *cache, const char *stamp);
+
+/* One line: how much of the work actually reached the hardware. */
+void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out);
 
 /* $XDG_CACHE_HOME/charsiu/<name>.wq, made if it is not there. NULL on failure. */
 const char *charsiu_cache_path(const char *model, char *buf, size_t max);

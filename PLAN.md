@@ -91,19 +91,31 @@ llama.
 Board, 2026-08-28, after routing the vision tower and the whisper encoder:
 
 ```
-                CPU      NPU     of which staging    the matmuls
-  whisper      34.5 s   30.0 s        19.4 s            ~3.2x
-  SmolVLM     153.1 s   82.4 s        ~76 s            ~17x
-  CLIP          4.7 s    3.9 s         2.5 s            ~3.3x
+                CPU      NPU     with the cache warm
+  whisper      34.5 s   30.0 s        30.0 s
+  SmolVLM     153.1 s   82.4 s        81.3 s
+  CLIP          4.7 s    3.9 s         2.8 s
 ```
 
-⚠ **THE TIME IS IN THE QUANTISER, NOT THE MATMUL.** 75 of the vision tower's
-82 seconds was staging its weights to int8. Take it out and the arithmetic that
-took the CPU 148 s takes the hardware about 9. So the towers stage eagerly into
-a cache now, in `$XDG_CACHE_HOME/charsiu` -- and ⚠ the cache is ONE SEQUENTIAL
-FILE with one static handle, so a caller claims it for its own stretch rather
-than sharing it, because two graphs staging at once interleave and neither can
-read the result back.
+⚠⚠ **AND THAT SUBTRACTION WAS WRONG.** The paragraph here used to read: 75 of
+the vision tower's 82 seconds is the quantiser, so take it out and the matmuls
+are 17x. The next board round put the staging BEHIND A CACHE -- whisper's
+quantising went from 19298 ms to 118 -- and the wall clock did not move at all:
+
+```
+  whisper   30.0 s before the cache,  30.1 s after it, 30.0 s warm
+```
+
+Nineteen seconds left the staging line and the total stayed put, so the two
+numbers were never parts of one sum. Nothing was counting how much of the work
+reached the hardware, and a subtraction cannot be checked against a quantity
+nobody measured. `charsiu_pool_report` counts it now: tensors actually routed,
+matmuls, rows, milliseconds, and how many fell back.
+
+The towers do stage eagerly into a cache in `$XDG_CACHE_HOME/charsiu`, and that
+part works -- ⚠ the cache is ONE SEQUENTIAL FILE with one static handle, so a
+caller claims it for its own stretch rather than sharing it, because two graphs
+staging at once interleave and neither can read the result back.
 
 ⚠ **AND THE BATCH STOPS AT 80.** Swept against the same tower at two rows,
 which is the smallest verified batch:

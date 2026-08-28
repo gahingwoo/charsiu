@@ -396,6 +396,8 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 
 void charsiu_vision_close(struct charsiu_vision *v)
 {
+	if (v->npu && charsiu_diag())
+		charsiu_pool_report(&v->pool, stderr);
 	charsiu_pool_fini(&v->pool);
 	free(v->layer);
 	v->layer = NULL;
