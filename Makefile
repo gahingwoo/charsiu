@@ -27,6 +27,7 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
      $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
+     $(BUILD)/charsiu_whisper \
      $(BUILD)/tokenizer_roundtrip
 
 $(BUILD):
@@ -61,6 +62,12 @@ $(BUILD)/charsiu_vision: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) 
 # model's: causal, pooled at the end of text token, its own BPE.
 $(BUILD)/charsiu_clip: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+# ⚠ WHISPER READS ITS OWN CONTAINER, not a gguf: whisper.cpp's format is what
+# every model anybody has is in, and it carries the mel filterbank and the
+# vocabulary as well as the weights.
+$(BUILD)/charsiu_whisper: tools/charsiu_whisper.c src/whisper.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 # the CPU decode loop: the oracle every NPU version is diffed against
 $(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
