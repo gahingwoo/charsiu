@@ -82,4 +82,25 @@ const char *charsiu_vision_why_not(const struct charsiu_vision *v);
 /* One line per hparam and per missing tensor, for a person to read. */
 void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out);
 
+/* How many embeddings one image becomes, and how wide each one is. */
+unsigned charsiu_vision_tokens(const struct charsiu_vision *v);
+unsigned charsiu_vision_width(const struct charsiu_vision *v);
+
+/*
+ * One image in, its embeddings out.
+ *
+ * `px` is [3][image_size][image_size] f32 ALREADY NORMALISED -- (v - mean) / std
+ * with the tower's own numbers, which charsiu_vision_normalise does. `out` holds
+ * charsiu_vision_tokens() * charsiu_vision_width() floats.
+ *
+ * ⚠ NO CAUSAL MASK. A ViT's attention is full: patch 0 sees patch 255. Carrying
+ * the language model's mask in here would be a picture that can only see up and
+ * to the left of itself, which is a plausible looking answer about the wrong
+ * image.
+ */
+int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out);
+
+/* (v - mean) / std, per channel, in place. */
+void charsiu_vision_normalise(const struct charsiu_vision *v, float *px);
+
 #endif /* CHARSIU_VISION_H */

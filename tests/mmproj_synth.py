@@ -89,8 +89,10 @@ def tensors():
     return t
 
 
-def write(path, drop=()):
-    """drop: names to leave OUT, which is how the reporting gets tested."""
+def write(path, drop=(), data=None):
+    """drop: names to leave OUT, which is how the reporting gets tested.
+    data: {name: flat float32 array}. Absent names are written as zeros, which
+    is enough to test the reader and useless for testing the arithmetic."""
     ts = [t for t in tensors() if t[0] not in drop]
     kvs = b"".join([
         kv_str("general.architecture", "clip"),
@@ -117,7 +119,12 @@ def write(path, drop=()):
         n = 1
         for d in ne:
             n *= d
-        blobs.append(b"\x00" * (4 * n))
+        if data is not None and name in data:
+            a = data[name]
+            assert a.size == n, f"{name}: {a.size} values for {n} slots"
+            blobs.append(a.astype("<f4").tobytes())
+        else:
+            blobs.append(b"\x00" * (4 * n))
         off += 4 * n
         off = (off + 31) // 32 * 32
 
