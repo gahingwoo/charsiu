@@ -2744,8 +2744,6 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		return "a value norm";
 	if (m->n_embd_pl)
 		return "per layer embeddings";
-	if (m->final_softcap > 0.0f)
-		return "a final softcap";
 	if (kv_posmajor())
 		return "a position major KV cache";
 	for (uint32_t l = 0; l < m->n_layer; l++) {
@@ -2753,19 +2751,30 @@ const char *llama_batch_why_not(const struct llama_model *m)
 
 		if (!L->wk || !L->wv)
 			return "fused or absent K and V projections";
-		if (L->bq)
-			return "a query bias";
-		if (L->q_norm)
-			return "a query norm";
 		if (L->kv_from >= 0)
 			return "KV shared between layers";
-		if (L->attn_post_norm)
-			return "a post attention norm";
-		if (L->ffn_post_norm)
-			return "a post feed forward norm";
 		if (L->n_ff != m->layers[0].n_ff)
 			return "a feed forward width that varies by layer";
 	}
+	/*
+	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
+	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
+	 * board; charsiu took 7354, because a query norm sent the whole prompt
+	 * through the token loop. Of the five models in their table that this
+	 * tree can run, FOUR were refused -- biases, a query norm, a fused K
+	 * and V, per layer embeddings -- and only TinyLLAMA batched.
+	 *
+	 * The four removed are the ones that are the SAME PER ROW OPERATION the
+	 * token loop already does, applied in the same order: a bias, a query
+	 * and key norm, the two post norms, and the logit softcap. Refusing
+	 * them was right while they were unwritten and became the dominant cost
+	 * the moment there was a scoreboard.
+	 *
+	 * What is still refused is what would be a different computation:
+	 * fused K and V needs a tensor split, shared KV needs another layer's
+	 * cache, a varying feed forward width needs per layer buffers, and
+	 * sliding window attention needs a mask this loop does not build.
+	 */
 	return NULL;
 }
 
@@ -2822,6 +2831,27 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			rmsnorm(s->xb, xr, L->attn_norm, m->n_embd, m->rms_eps);
 			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
 				    L->wv, s->v);
+			/*
+			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
+			 * here that is not interchangeable, and it is copied
+			 * from the token loop rather than reasoned about
+			 * again. Rope mixes element 2i with 2i+1, so norming
+			 * after it divides a rotated pair by a sum of squares
+			 * the rotation already changed; and rotating a biased
+			 * vector is not biasing a rotated one.
+			 */
+			if (L->bq) {
+				add_bias(s->q, L->bq, m->n_head * hd);
+				add_bias(s->k, L->bk, m->n_head_kv * hd);
+				add_bias(s->v, L->bv, m->n_head_kv * hd);
+			}
+			if (L->q_norm) {
+				qk_norm(s->q, m->n_head, hd, L->q_norm,
+					m->rms_eps);
+				if (L->wk)
+					qk_norm(s->k, m->n_head_kv, hd,
+						L->k_norm, m->rms_eps);
+			}
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
 			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
 			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
@@ -2841,6 +2871,11 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				attn_heads(&aj, 0, m->n_head);
 			}
 			matvec(s, L->wo, s->xb, s->xb2);
+			/* ⚠ on the branch, before the residual add: after it
+			 * would normalise the residual stream too. */
+			if (L->attn_post_norm)
+				rmsnorm(s->xb2, s->xb2, L->attn_post_norm,
+					m->n_embd, m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += s->xb2[i];
 			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
@@ -2860,8 +2895,11 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
 		for (int r = 0; r < n; r++) {
 			float *xr = s->bx + (size_t)r * m->n_embd;
-			const float *o = s->bxo + (size_t)r * m->n_embd;
+			float *o = s->bxo + (size_t)r * m->n_embd;
 
+			if (L->ffn_post_norm)
+				rmsnorm(o, o, L->ffn_post_norm, m->n_embd,
+					m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
 		}
@@ -2870,6 +2908,10 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
+	if (m->final_softcap > 0.0f)
+		for (uint32_t i = 0; i < m->n_vocab; i++)
+			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
+				       m->final_softcap;
 	s->pos = pos0 + n;
 	return 0;
 }

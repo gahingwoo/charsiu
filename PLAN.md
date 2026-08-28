@@ -165,6 +165,39 @@ quarter of the problem.
 The next thing is the attention, and the stage table has to come first from now
 on. It cost three board rounds and a withdrawn number to write one.
 
+### The vendor's own table, and what it says we lose
+
+Rockchip publish RK3576 numbers for their runtime on their driver, w4a16, a 128
+token prompt and 64 new tokens (airockchip/rknn-llm/benchmark.md, 2026-08-28).
+`tests/board_vendor.sh` runs the same protocol and prints both columns.
+
+```
+                 ours    theirs      ours TTFT   theirs
+  Qwen3 0.6B    10.48     24.85         7354 ms   469 ms
+  Phi3 3.8B      4.89      6.58        23354 ms  1829 ms
+  SmolVLM-256M image encoder            10000 ms   768 ms
+```
+
+⚠ **THEIR NUMBERS ARE AT MAXIMUM CPU AND NPU FREQUENCY** and ours are at
+whatever the governor is doing. That is in their header and it is not a small
+difference.
+
+⚠⚠ **AND THE TTFT COLUMN WAS ONE BUG, NOT FIVE.** Of the five models in their
+table this tree can run, FOUR were refused by `batch_ok` -- a bias, a query
+norm, a fused K and V, per layer embeddings -- so their prompts went through the
+token loop one token at a time. Only TinyLLAMA batched.
+
+Four of those refusals were lifted on 2026-08-28 because they are the SAME PER
+ROW OPERATION the token loop already does, in the same order: biases, the query
+and key norms, the two post norms, and the logit softcap. Refusing them was
+right while they were unwritten and became the dominant cost the moment there
+was a scoreboard to read.
+
+What is still refused is what would be a different computation: a fused K and V
+needs a tensor split, shared KV needs another layer's cache, a varying feed
+forward width needs per layer buffers, and a sliding window needs a mask this
+loop does not build.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:
