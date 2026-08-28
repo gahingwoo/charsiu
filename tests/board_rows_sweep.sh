@@ -48,18 +48,34 @@ t0=$(ms)
 "$VIS" "$MM" --encode > "$T/cpu.txt"
 echo "  $(awk -v m="$(( $(ms) - t0 ))" 'BEGIN{printf "%.1f", m/1000}') s, $(wc -l < "$T/cpu.txt") values"
 
-echo "the reference: the same tower on the NPU, ONE row at a time"
+# ⚠⚠ TWO ROWS, NOT ONE. charsiu_npu_matmul REFUSES m = 1 -- a decode has its own
+# path -- so ROWS_MAX=1 falls back to the CPU for every chunk, and the first run
+# of this sweep printed "int8 against the CPU's f32: 0.000e+00" and did not stop.
+# A reference that is secretly the thing it is a reference FOR is worse than no
+# reference: every row then DIFFERS by the quantisation and the real break is
+# just another number in the column.
+#
+# The check below is what catches it: the reference must NOT equal the CPU.
+echo "the reference: the same tower on the NPU, TWO rows at a time"
 t0=$(ms)
-CHARSIU_NPU=1 CHARSIU_NPU_ROWS_MAX=1 "$VIS" "$MM" --encode > "$T/ref.txt" || {
+CHARSIU_NPU=1 CHARSIU_NPU_ROWS_MAX=2 "$VIS" "$MM" --encode > "$T/ref.txt" || {
 	echo "  the NPU run failed; there is nothing to sweep" >&2; exit 1; }
 T1=$(( $(ms) - t0 ))
 echo "  $(awk -v m="$T1" 'BEGIN{printf "%.1f", m/1000}') s"
-echo "  int8 against the CPU's f32: $(paste "$T/cpu.txt" "$T/ref.txt" | awk 'NR==1{next}
-	{d = $1 - $2; if (d < 0) d = -d; if (d > w) w = d} END{printf "%.3e", w}')"
+Q=$(paste "$T/cpu.txt" "$T/ref.txt" | awk 'NR==1{next}
+	{d = $1 - $2; if (d < 0) d = -d; if (d > w) w = d} END{printf "%.6f", w}')
+echo "  int8 against the CPU's f32: $Q"
+if [ "$Q" = "0.000000" ]; then
+	echo >&2
+	echo "  STOP. int8 cannot equal f32 to the last bit, so this reference is" >&2
+	echo "  the CPU: the hardware refused every chunk and nothing said so." >&2
+	echo "  There is nothing to sweep until that is fixed." >&2
+	exit 1
+fi
 echo
 printf '%8s  %10s  %12s  %s\n' rows seconds "vs one row" verdict
 
-for R in 2 8 32 64 128 256 320 512 640 1024; do
+for R in 4 8 16 32 48 64 80 96 112 128 160 256 512 1024; do
 	t0=$(ms)
 	if ! CHARSIU_NPU=1 CHARSIU_NPU_ROWS_MAX=$R "$VIS" "$MM" --encode \
 			> "$T/npu.txt" 2>"$T/err.txt"; then
@@ -77,6 +93,8 @@ for R in 2 8 32 64 128 256 320 512 640 1024; do
 	printf '%8s  %10s  %12s  %s\n' "$R" "$SEC" "$D" "$V"
 done
 echo
-echo "The first row that DIFFERS is the bound. Everything above it is a width"
-echo "this tree has been using without ever asking, and 32 is the only one with"
-echo "evidence behind it today. Mesa's arithmetic predicts 320 and 640."
+echo "The first row that DIFFERS is the bound. The sweep before this one put it"
+echo "between 64 and 128 -- 2, 8, 32 and 64 gave the SAME output and 128 did not"
+echo "-- which is nowhere near the 320 and 640 Mesa's arithmetic predicts, so the"
+echo "prediction is about something else. This one steps 16 at a time through"
+echo "that gap to say which width is the last good one."

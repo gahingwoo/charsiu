@@ -508,6 +508,12 @@ struct llama_model {
 struct charsiu_npu_pool {
 	struct npu_tensor *t;
 	const struct gguf_tensor **key;
+	/*
+	 * ⚠ THE WEIGHTS THAT WERE STAGED, because the key is an address and a
+	 * caller building a temporary tensor on the stack reuses one address
+	 * for several different weights. See charsiu_pool_get.
+	 */
+	const void **src;
 	int *id;                  /* >= 0 when the tensor is on the hardware */
 	unsigned n, cap;
 	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */

@@ -2272,8 +2272,9 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->pool.cap = m->n_layer * 9 + 2;
 	s->pool.t = calloc(s->pool.cap, sizeof(*s->pool.t));
 	s->pool.key = calloc(s->pool.cap, sizeof(*s->pool.key));
+	s->pool.src = calloc(s->pool.cap, sizeof(*s->pool.src));
 	s->pool.id = calloc(s->pool.cap, sizeof(*s->pool.id));
-	if (!s->pool.t || !s->pool.key || !s->pool.id) {
+	if (!s->pool.t || !s->pool.key || !s->pool.src || !s->pool.id) {
 		llama_state_free(s);
 		return NULL;
 	}
@@ -2403,6 +2404,7 @@ void llama_state_free(struct llama_state *s)
 		free(s->pool.t);
 	}
 	free(s->pool.key);
+	free(s->pool.src);
 	free(s->pool.id);
 	free(s);
 }

@@ -48,8 +48,9 @@ int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,
 	p->cap = max_tensors;
 	p->t = calloc(p->cap, sizeof(*p->t));
 	p->key = calloc(p->cap, sizeof(*p->key));
+	p->src = calloc(p->cap, sizeof(*p->src));
 	p->id = calloc(p->cap, sizeof(*p->id));
-	if (!p->t || !p->key || !p->id) {
+	if (!p->t || !p->key || !p->src || !p->id) {
 		charsiu_pool_fini(p);
 		return -1;
 	}
@@ -66,6 +67,7 @@ void charsiu_pool_fini(struct charsiu_npu_pool *p)
 		npu_tensor_free(&p->t[i]);
 	free(p->t);
 	free(p->key);
+	free(p->src);
 	free(p->id);
 	if (p->dev)
 		charsiu_npu_close(p->dev);
@@ -79,8 +81,34 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 	unsigned i;
 
 	for (i = 0; i < p->n; i++)
-		if (p->key[i] == w)
+		if (p->key[i] == w) {
+			/*
+			 * ⚠⚠ THE SAME ADDRESS IS NOT THE SAME TENSOR. This
+			 * keys on the pointer, and a caller that builds a
+			 * temporary struct gguf_tensor on the stack hands over
+			 * the SAME address with different weights behind it
+			 * every call. whisper's conv1d3 does exactly that --
+			 * three taps and two convolutions through one stack
+			 * slot -- so the first tap was staged and then used for
+			 * all six. The transcript came back EMPTY, which is the
+			 * loud version; a smaller error would have come back as
+			 * words.
+			 *
+			 * Refuse, once, out loud. A caller whose weights move
+			 * belongs on the CPU.
+			 */
+			if (p->src[i] != w->data) {
+				static int said;
+
+				if (!said++)
+					fprintf(stderr, "charsiu: %s is staged "
+						"with different weights behind "
+						"the same address -- it stays "
+						"on the CPU\n", w->name);
+				return NULL;
+			}
 			return &p->t[i];
+		}
 
 	if (p->n == p->cap) {
 		static int said;
@@ -136,6 +164,7 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 			(unsigned long long)w->ne[0], p->t[p->n].rms_rel * 100.0);
 	snprintf(p->t[p->n].name, sizeof(p->t[p->n].name), "%s", w->name);
 	p->key[p->n] = w;
+	p->src[p->n] = w->data;
 	charsiu_pool_stage_ms += now_ms() - t_stage;
 	return &p->t[p->n++];
 }

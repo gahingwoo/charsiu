@@ -860,6 +860,21 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 		free(tapw); free(col); free(acc);
 		return -1;
 	}
+	/*
+	 * ⚠⚠ THE TAP TENSORS ARE STACK LOCALS AND THE POOL KEYS ON THE POINTER.
+	 * Three taps and two convolutions all go through this one slot, so
+	 * routing them stages the first tap's weights and then uses them for
+	 * every one after. The board came back with an EMPTY transcript.
+	 *
+	 * The pool refuses this on its own now -- it remembers which weights it
+	 * staged -- but a refusal per call is a message per call and the answer
+	 * is the same either way: the convolutions stay on the CPU. They are
+	 * 0.94 of the encoder's 18.5 G-mac.
+	 */
+	struct charsiu_npu_pool *save = rows_pool;
+
+	rows_pool = NULL;
+
 	memset(out, 0, (size_t)olen * n_out * sizeof(float));
 	memset(&g, 0, sizeof(g));
 
@@ -876,6 +891,7 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 
 		if (!row) {
 			free(tapw); free(col); free(acc);
+			rows_pool = save;   /* the early return owes it back */
 			return -1;
 		}
 		for (i = 0; i < n_out; i++) {
@@ -917,6 +933,7 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 			for (i = 0; i < n_out; i++)
 				out[(size_t)t * n_out + i] += bias[i];
 	free(tapw); free(col); free(acc);
+	rows_pool = save;
 	return 0;
 }
 
