@@ -46,7 +46,7 @@ done
 if [ -z "$SRC" ]; then
 	echo "charsiu update: no source tree to update." >&2
 	echo "  Install again and it will fetch one:" >&2
-	echo "  curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh -o install.sh && sh install.sh" >&2
+	echo "  curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh -o install.sh && sh install.sh" >&2
 	exit 1
 fi
 
@@ -59,8 +59,11 @@ else
 	CHANNEL=$(ini_get update channel 2>/dev/null || echo "")
 	: "${CHANNEL:=stable}"
 fi
+# ⚠ ONE PLACE WHERE A CHANNEL BECOMES A BRANCH. The installer has the same
+# mapping in its bootstrap, and the two drifting apart means `charsiu update`
+# and a fresh install land on different code while both say the same word.
 case "$CHANNEL" in
-dev)    REF=main ;;
+dev)    REF=${CHARSIU_DEV_REF:-main} ;;
 stable) REF=stable ;;
 *)      echo "charsiu update: no channel called $CHANNEL. Try stable or dev." >&2
 	exit 1 ;;

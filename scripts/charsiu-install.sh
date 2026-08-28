@@ -58,12 +58,12 @@ for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
 # the tree this is about to download.
 _BOOT_REF=stable
 for _a in "$@"; do case "$_a" in
-	--dev) _BOOT_REF=main ;;
+	--dev) _BOOT_REF=${CHARSIU_DEV_REF:-main} ;;
 	--stable) _BOOT_REF=stable ;;
 esac; done
 
 CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
-CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh"
+CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh"
 
 # ⚠⚠ PIPED IN, STDIN IS THE SCRIPT ITSELF. Every `read` would eat the rest of
 # this file, and a wizard that asks questions cannot run that way. Reattach the
