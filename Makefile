@@ -26,7 +26,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
      $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
-     $(BUILD)/tokenizer_roundtrip
+     $(BUILD)/charsiu_vision $(BUILD)/tokenizer_roundtrip
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -48,6 +48,13 @@ $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 # "No such file or directory".
 $(BUILD)/charsiu_matmul: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# ⚠ WHAT AN mmproj ACTUALLY CONTAINS, against what this reads. Every vision
+# tensor name in the tree is a guess until a real file says otherwise, and a
+# guess that finds nothing has cost this project a model that answered while
+# missing half of itself. This prints the misses by name.
+$(BUILD)/charsiu_vision: tools/charsiu_vision.c src/vision.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 # the CPU decode loop: the oracle every NPU version is diffed against
 $(BUILD)/charsiu_run: tools/charsiu_run.c $(LLM) | $(BUILD)
