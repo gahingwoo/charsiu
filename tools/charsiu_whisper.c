@@ -153,6 +153,7 @@ int main(int argc, char **argv)
 		rc = 0;
 	}
 done:
+	charsiu_whisper_stages(stderr);
 	free(pcm);
 	free(mel);
 	free(enc);

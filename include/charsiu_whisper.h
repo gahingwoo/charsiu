@@ -156,6 +156,9 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 /* One token's text. Bytes, not a string: whisper's BPE splits UTF-8. */
 const char *charsiu_whisper_token(const struct charsiu_whisper *w, int32_t id);
 
+/* Where the time went, under CHARSIU_STAGES. */
+void charsiu_whisper_stages(FILE *out);
+
 /* A 16 bit PCM WAV, resampled to 16 kHz mono. Returns samples, or NULL. */
 float *charsiu_wav_load(const char *path, size_t *n, char *err, size_t errlen);
 

@@ -3,6 +3,7 @@
 /*
  * Reading whisper.cpp's container, and the mel spectrogram in front of it.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,10 +17,57 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
 #include "charsiu_whisper.h"
+
+/* ---- where the time goes -------------------------------------------------- */
+
+/*
+ * ⚠ STAGES, BECAUSE THE ONLY THING MEASURED SO FAR WAS THE MATMUL. The pool
+ * counter said the encoder's twenty four matmuls took 936 ms of a thirty second
+ * transcription, which settles what the routing bought and says nothing about
+ * the other twenty nine seconds. Guessing where they are is what produced a 17x
+ * that had to be withdrawn.
+ */
+enum { W_MEL, W_CONV, W_QKV, W_ATTN, W_PROJ, W_FFN, W_NORM, W_DEC, W_N };
+static const char *const wstage_name[W_N] = {
+	"mel spectrogram", "the two convolutions", "q k v", "attention",
+	"out proj", "feed forward", "layernorms", "the decoder",
+};
+static double wstage_ms[W_N];
+static int wstage_on = -1;
+
+static double wnow(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+#define WSTAGE(i, expr) do { \
+	double _t = wstage_on ? wnow() : 0.0; \
+	expr; \
+	if (wstage_on) wstage_ms[i] += wnow() - _t; \
+} while (0)
+
+void charsiu_whisper_stages(FILE *out)
+{
+	double tot = 0.0;
+	int i;
+
+	for (i = 0; i < W_N; i++)
+		tot += wstage_ms[i];
+	if (tot <= 0.0)
+		return;
+	fprintf(out, "charsiu whisper: %.1f s accounted for\n", tot / 1e3);
+	for (i = 0; i < W_N; i++)
+		fprintf(out, "  %-22s %8.0f ms  %5.1f%%\n", wstage_name[i],
+			wstage_ms[i], 100.0 * wstage_ms[i] / tot);
+}
 
 static void miss(struct charsiu_whisper *w, const char *fmt, ...)
 {
@@ -523,7 +571,7 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 	const int bins = w->n_fft_bins, nmel = w->n_mel_filt;
 	float *hann = NULL, *frame = NULL, *spec = NULL, *scratch = NULL;
 	float *power = NULL;
-	double mx = -1e30;
+	double mx = -1e30, t_mel = 0.0;
 	int f, i, m, rc = -1;
 
 	hann    = malloc((size_t)nfft * sizeof(float));
@@ -545,6 +593,9 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 		hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI *
 					      (float)i / (float)nfft));
 
+	if (wstage_on < 0)
+		wstage_on = getenv("CHARSIU_STAGES") != NULL;
+	t_mel = wnow();
 	for (f = 0; f < WHISPER_N_FRAMES; f++) {
 		/*
 		 * ⚠⚠ REFLECTED AT THE FRONT AND ZEROS AT THE BACK, WHICH IS NOT
@@ -610,6 +661,8 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 		out[i] = (float)((v + 4.0) / 4.0);
 	}
 	rc = 0;
+	if (wstage_on)
+		wstage_ms[W_MEL] += wnow() - t_mel;
 out:
 	free(hann); free(frame); free(spec); free(scratch); free(power);
 	return rc;
@@ -979,6 +1032,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 	float *c1 = NULL, *x = NULL, *xb = NULL, *q = NULL, *k = NULL;
 	float *v = NULL, *ff = NULL, *att = NULL, *g1 = NULL, *b1 = NULL;
 	float *tmp = NULL, scale;
+	double t_attn = 0.0;
 	struct charsiu_act a;
 	int rc = -1, stop = 0;
 
@@ -1017,10 +1071,16 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		stop = e ? atoi(e) : 0;
 	}
 
-	if (conv1d3(w->conv1_w, wrow1(w->conv1_b, b1), mel,
-		    (unsigned)w->n_mels, WHISPER_N_FRAMES, c1, W, 1, &a))
-		goto out;
-	wgelu(c1, (size_t)WHISPER_N_FRAMES * W);
+	{
+		int cf = 0;
+
+		WSTAGE(W_CONV, cf = conv1d3(w->conv1_w, wrow1(w->conv1_b, b1),
+					    mel, (unsigned)w->n_mels,
+					    WHISPER_N_FRAMES, c1, W, 1, &a));
+		if (cf)
+			goto out;
+	}
+	WSTAGE(W_CONV, wgelu(c1, (size_t)WHISPER_N_FRAMES * W));
 	if (stop == 1) {
 		/* [3000][W], which does not fit `out`: give the first T rows */
 		memcpy(out, c1, (size_t)T * W * sizeof(float));
@@ -1037,10 +1097,16 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		for (j = 0; j < WHISPER_N_FRAMES; j++)
 			tmp[(size_t)i * WHISPER_N_FRAMES + j] =
 				c1[(size_t)j * W + i];
-	if (conv1d3(w->conv2_w, wrow1(w->conv2_b, b1), tmp, W,
-		    WHISPER_N_FRAMES, x, W, 2, &a))
-		goto out;
-	wgelu(x, (size_t)T * W);
+	{
+		int cf = 0;
+
+		WSTAGE(W_CONV, cf = conv1d3(w->conv2_w, wrow1(w->conv2_b, b1),
+					    tmp, W, WHISPER_N_FRAMES, x, W, 2,
+					    &a));
+		if (cf)
+			goto out;
+	}
+	WSTAGE(W_CONV, wgelu(x, (size_t)T * W));
 
 	for (i = 0; i < T; i++) {
 		gguf_row_f32(w->e_pos, i, g1);
@@ -1056,14 +1122,15 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 	for (l = 0; l < L; l++) {
 		struct whisper_block *B = &w->enc[l];
 
-		for (i = 0; i < T; i++)
+		WSTAGE(W_NORM, for (i = 0; i < T; i++)
 			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
 				   wrow1(B->attn_ln_w, g1),
-				   wrow1(B->attn_ln_b, b1), W, 1e-5f);
-		wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, &a);
-		wrows(B->k_w, NULL, xb, T, W, k, W, &a);
-		wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a);
+				   wrow1(B->attn_ln_b, b1), W, 1e-5f));
+		WSTAGE(W_QKV, wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, &a));
+		WSTAGE(W_QKV, wrows(B->k_w, NULL, xb, T, W, k, W, &a));
+		WSTAGE(W_QKV, wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a));
 
+		if (wstage_on) t_attn = wnow();
 		for (h = 0; h < H; h++) {
 			unsigned off = h * hd;
 
@@ -1091,17 +1158,18 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 				}
 			}
 		}
-		wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a);
+		if (wstage_on) wstage_ms[W_ATTN] += wnow() - t_attn;
+		WSTAGE(W_PROJ, wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a));
 		for (i = 0; i < T * W; i++)
 			x[i] += q[i];
 
-		for (i = 0; i < T; i++)
+		WSTAGE(W_NORM, for (i = 0; i < T; i++)
 			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
 				   wrow1(B->mlp_ln_w, g1),
-				   wrow1(B->mlp_ln_b, b1), W, 1e-5f);
-		wrows(B->fc1_w, wrow1(B->fc1_b, b1), xb, T, W, ff, F, &a);
-		wgelu(ff, (size_t)T * F);
-		wrows(B->fc2_w, wrow1(B->fc2_b, b1), ff, T, F, q, W, &a);
+				   wrow1(B->mlp_ln_b, b1), W, 1e-5f));
+		WSTAGE(W_FFN, wrows(B->fc1_w, wrow1(B->fc1_b, b1), xb, T, W, ff, F, &a));
+		WSTAGE(W_FFN, wgelu(ff, (size_t)T * F));
+		WSTAGE(W_FFN, wrows(B->fc2_w, wrow1(B->fc2_b, b1), ff, T, F, q, W, &a));
 		for (i = 0; i < T * W; i++)
 			x[i] += q[i];
 	}
@@ -1346,6 +1414,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 	const float *lg = NULL;
 	int32_t prompt[2];
 	int n = 0, pos, i, np = 2;
+	double t_dec = 0.0;
 
 	/*
 	 * ⚠ REFUSED RATHER THAN GUESSED. A multilingual model wants a language
@@ -1370,6 +1439,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 	 * version of this did -- feeds the marker twice and shifts the whole
 	 * transcript by a token.
 	 */
+	if (wstage_on) t_dec = wnow();
 	for (i = 0; i < np; i++)
 		lg = charsiu_whisper_step(d, prompt[i], i);
 	pos = np;
@@ -1389,5 +1459,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 		lg = charsiu_whisper_step(d, best, pos++);
 	}
 	charsiu_whisper_decoder_free(d);
+	if (wstage_on)
+		wstage_ms[W_DEC] += wnow() - t_dec;
 	return n;
 }

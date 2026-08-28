@@ -133,6 +133,38 @@ spare, and the rate is FLAT from 4 rows to 1024 anyway.
 ⚠ 80 was measured on one tower at K = 768 and 3072. Whether the bound is m alone
 or m against K is not known.
 
+### And then the counter said the matmul was never the cost
+
+`charsiu_pool_report`, added because the 17x above had to be withdrawn:
+
+```
+  whisper   24 of 24 tensors on the hardware; 24 matmuls of 36000 rows in 936 ms
+  CLIP      73 of 73 tensors on the hardware; 72 matmuls of  3600 rows in 210 ms
+```
+
+**936 ms of a 30 second transcription.** So the stage table, which is the thing
+that should have been written before any of the routing:
+
+```
+  attention              2181 ms   62.7%     O(T^2) scalar C, never routed
+  feed forward            670 ms   19.3%     routed
+  q k v                   179 ms    5.2%     routed
+  mel spectrogram         189 ms    5.4%     3000 FFTs
+  the two convolutions     70 ms    2.0%
+  out proj                 59 ms    1.7%     routed
+  the decoder             121 ms    3.5%
+  layernorms                8 ms    0.2%
+```
+
+⚠⚠ **THE WORK THAT WAS ROUTED IS 26% OF THE TIME AND THE ATTENTION IS 63%.**
+1500 positions against 1500, six heads, four layers, in three nested loops --
+and it is not a matmul against a weight, so none of the machinery built for the
+towers touches it. Everything above this heading is correct and was aimed at a
+quarter of the problem.
+
+The next thing is the attention, and the stage table has to come first from now
+on. It cost three board rounds and a withdrawn number to write one.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:
