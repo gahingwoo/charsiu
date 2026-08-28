@@ -41,8 +41,14 @@ get() {   # url, destination
 	curl -fsSL -o "$2.part" "$1" && mv "$2.part" "$2"
 }
 
-ms() { date +%s%3N 2>/dev/null || echo 0; }
+# ⚠ /proc/uptime, NOT `date +%s%3N`. busybox's date has no %N, and it does not
+# fail on it either -- the first board round came back with 34215439249 ms for
+# an eleven second clip and PASSED, because the three checks that mattered were
+# string comparisons and nothing looked at the clock's own answer. /proc/uptime
+# is centiseconds, monotonic, and present on every kernel this runs on.
+ms() { awk '{printf "%d", $1 * 1000}' /proc/uptime 2>/dev/null || echo 0; }
 took() { echo "$(( $(ms) - $1 ))"; }
+secs() { awk -v m="$1" 'BEGIN{printf "%.1f", m/1000}'; }
 
 echo "== what this round needs =="
 HF=https://huggingface.co
@@ -68,7 +74,7 @@ OUT=$("$WSP" "$DIR/ggml-tiny.en.bin" --transcribe --audio "$DIR/jfk.wav")
 T_WSP=$(took "$t0")
 echo "  $OUT"
 say_result "the words" "$OUT" "ask not what your country can do for you"
-echo "  ${T_WSP} ms for 11 s of audio, all of it on the CPU"
+echo "  $(secs "$T_WSP") s for 11 s of audio, all of it on the CPU"
 echo
 
 echo "== 2. seeing: SmolVLM-256M on the llama.cpp logo =="
@@ -79,7 +85,7 @@ Assistant:" -n 8 -c 1024 -t 4 2>/dev/null | sed -n '2p')
 T_VIS=$(took "$t0")
 echo "  $OUT"
 say_result "the animal" "$OUT" "Llama"
-echo "  ${T_VIS} ms, of which the tower is most of it"
+echo "  $(secs "$T_VIS") s end to end; the tower is 1024 patches of it"
 echo
 
 echo "== 3. matching: CLIP against the same picture =="
@@ -90,18 +96,18 @@ T_CLP=$(took "$t0")
 echo "$OUT" | sed 's/^/  /'
 BEST=$(echo "$OUT" | sort -rn | head -1)
 say_result "the best match" "$BEST" "llama"
-echo "  ${T_CLP} ms"
+echo "  $(secs "$T_CLP") s"
 echo
 
 echo "== 4. the decode this all sits on, unchanged? =="
 t0=$(ms)
 OUT=$("$RUN" "$DIR/smolvlm.gguf" -p "The capital of France is" -n 16 --ignore-eos \
-	-c 512 -t 4 2>/dev/null | tail -3 | head -1)
+	-c 512 -t 4 2>/dev/null | grep '^\[')
 echo "  $OUT"
 echo
 
 echo "======================================================================="
-echo "  whisper  ${T_WSP} ms   vision ${T_VIS} ms   clip ${T_CLP} ms"
+echo "  whisper $(secs "$T_WSP") s   vision $(secs "$T_VIS") s   clip $(secs "$T_CLP") s"
 echo "  ⚠ all three are CPU only today. These are the numbers that say what"
 echo "    routing them to the NPU would be worth."
 [ "$FAIL" = 0 ] && echo "  PASS" || echo "  FAILED"
