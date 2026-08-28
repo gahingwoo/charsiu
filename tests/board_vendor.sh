@@ -111,8 +111,15 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	MB=$(echo "$OUT" | sed 's/.*peak \([0-9]*\) MB.*/\1/')
 	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)\n' \
 		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP"
-	grep -E "prompt batched|prompt a token|int4 computes one row|NPU pool" \
+	# ⚠ AND THE DEVICE'S OWN REPORT. "how many submits" is the difference
+	# between a prefill that runs on the hardware one row at a time -- a
+	# fence each, and the fence has been measured at 94% of the hardware
+	# path -- and one that fell back to the CPU. Nothing else in this table
+	# can tell those two apart.
+	grep -E "prompt batched|prompt a token|int4 computes one row" \
 		"$DIR/.v.err" | sed 's/^/     /' | sort -u || true
+	grep -E "^charsiu NPU: .*(submits|hardware path)" "$DIR/.v.err" \
+		| sed 's/^/     /' || true
 done
 
 echo
