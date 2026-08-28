@@ -102,7 +102,21 @@ def geometry(regs):
     return {
         "ic": ic,
         "oc": oc,
+        # ⚠⚠ M IS THE PIXEL COUNT, NOT THE ROW COUNT, and reading the row
+        # count instead is how this file was made to say the vendor never
+        # batches an int4 weight matmul. It does: 85% of them, up to M = 80.
+        #
+        # The two axes agree on every fp16 stream in the file -- 4940 of 4940
+        # have rows == pixels -- because the fp16 attention is emitted as an
+        # M row image. The int4 projections are emitted as a ONE row image M
+        # PIXELS WIDE, so their row count is 1 whatever M is, and a reader
+        # that takes "rows" gets 1 every time and concludes there is no batch.
+        #
+        # "rows" is kept because it is what the register holds and the two
+        # differing is itself the signal.
+        "m": g(0x1034) + 1,
         "rows": (g(0x102c) & 0xffff) + 1,
+        "width": ((g(0x102c) >> 16) & 0xffff) + 1,
         "window": ((g(0x102c) >> 16) & 0xffff) + 1,
         "surf": (g(0x103c) >> 16) & 0xffff,
         "pixels": g(0x1034) + 1,
@@ -156,9 +170,9 @@ def main():
         geo = geometry(decode(ws))
         kinds["conv" if geo else "dpu only"] += 1
         if geo:
-            shapes[(geo["ic"], geo["oc"], geo["surf"], geo["rows"])] += 1
+            shapes[(geo["ic"], geo["oc"], geo["surf"], geo["m"])] += 1
             bits[geo["weight_bits"]] += 1
-            rows[geo["rows"]] += 1
+            rows[geo["m"]] += 1
 
     print("%s" % path)
     print("  streams            %d, of which %d are convolutions and %d DPU only"
