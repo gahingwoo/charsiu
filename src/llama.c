@@ -2342,6 +2342,17 @@ void llama_state_free(struct llama_state *s)
 	free(s->pl);
 	free(s->plb);
 	free(s->plc);
+	/*
+	 * ⚠ THE BATCHED PREFILL'S ROWS WERE NEVER FREED. They are allocated
+	 * lazily on the first prompt that takes that path and nothing here ever
+	 * mentioned them -- six buffers, and at a 32 row chunk of a wide feed
+	 * forward that is megabytes a state. It never showed because a run
+	 * makes one state and then exits, which is the kind of leak that waits
+	 * for the server.
+	 */
+	free(s->bx); free(s->bxb); free(s->bxo);
+	free(s->bhb); free(s->bhb2); free(s->bcs);
+	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
 	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
@@ -2803,8 +2814,33 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		s->bhb = malloc((size_t)n * nff * sizeof(float));
 		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
 		s->bcs = malloc((size_t)hd * sizeof(float));
+		/*
+		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
+		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
+		 * buffer sized by n_embd is half of what the projection
+		 * writes -- the same trap qwen3's attn_output buffer fell into
+		 * when the architecture first landed.
+		 */
+		free(s->bq); free(s->bk); free(s->bv); free(s->bao);
+		s->bq = malloc((size_t)n * m->n_head * hd * sizeof(float));
+		s->bk = malloc((size_t)n * kvdim * sizeof(float));
+		s->bv = malloc((size_t)n * kvdim * sizeof(float));
+		/*
+		 * ⚠⚠ AND THE ATTENTION'S OUTPUT IS n_head * head_dim WIDE TOO,
+		 * WHICH IS THE SAME TRAP A SECOND TIME. Qwen3 0.6B is 16 heads
+		 * of 128 against an embedding of 1024, so attention produces
+		 * 2048 floats and hands them to wo, which contracts over 2048.
+		 * Keeping them in a buffer whose rows are n_embd apart
+		 * truncates every row and overlaps the next -- and the model
+		 * still answered, in fluent English, about the wrong thing.
+		 *
+		 * The first time this was qwen3's own attn_output buffer when
+		 * the architecture landed. It is written down in this file and
+		 * I did it again in the batched copy of the same loop.
+		 */
+		s->bao = malloc((size_t)n * m->n_head * hd * sizeof(float));
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
-		    !s->bcs) {
+		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao) {
 			s->bx_n = 0;
 			return -1;
 		}
@@ -2823,14 +2859,40 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 
+		/*
+		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
+		 * gate, up and down were batched here, which is three of the
+		 * seven matmuls a layer does -- and the board showed what that
+		 * left on the table: Qwen3 0.6B prefilled at 50 ms a token
+		 * against a decode of 65, a 23% saving on work that is four
+		 * fifths batchable.
+		 *
+		 * q, k, v and o are ordinary weight matmuls over n rows and
+		 * batch exactly like the feed forward. What CANNOT batch is
+		 * what sits between them: rope needs the position, the cache
+		 * has to be written in order, and a row's attention reads the
+		 * cache rows before it. So the loop below is the same as it
+		 * was with the projections lifted out of it.
+		 */
+		for (int r = 0; r < n; r++)
+			rmsnorm(s->bxb + (size_t)r * m->n_embd,
+				s->bx + (size_t)r * m->n_embd, L->attn_norm,
+				m->n_embd, m->rms_eps);
+		matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
+			    m->n_head * hd);
+		matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd, kvdim);
+		matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd, kvdim);
+
 		for (int r = 0; r < n; r++) {
-			float *xr = s->bx + (size_t)r * m->n_embd;
 			int pos = pos0 + r;
 
 			rope_table(s->bcs, hd, pos, m->rope_base, NULL);
-			rmsnorm(s->xb, xr, L->attn_norm, m->n_embd, m->rms_eps);
-			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
-				    L->wv, s->v);
+			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
+			       (size_t)m->n_head * hd * sizeof(float));
+			memcpy(s->k, s->bk + (size_t)r * kvdim,
+			       kvdim * sizeof(float));
+			memcpy(s->v, s->bv + (size_t)r * kvdim,
+			       kvdim * sizeof(float));
 			/*
 			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
 			 * here that is not interchangeable, and it is copied
@@ -2870,14 +2932,25 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 
 				attn_heads(&aj, 0, m->n_head);
 			}
-			matvec(s, L->wo, s->xb, s->xb2);
+			/* the attention's own output, kept for one batched
+			 * o projection over every row */
+			memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
+			       (size_t)m->n_head * hd * sizeof(float));
+		}
+
+		matmul_rows(s, L->wo, s->bao, n, s->bxo, m->n_head * hd,
+			    m->n_embd);
+		for (int r = 0; r < n; r++) {
+			float *xr = s->bx + (size_t)r * m->n_embd;
+			float *o = s->bxo + (size_t)r * m->n_embd;
+
 			/* ⚠ on the branch, before the residual add: after it
 			 * would normalise the residual stream too. */
 			if (L->attn_post_norm)
-				rmsnorm(s->xb2, s->xb2, L->attn_post_norm,
-					m->n_embd, m->rms_eps);
+				rmsnorm(o, o, L->attn_post_norm, m->n_embd,
+					m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
-				xr[i] += s->xb2[i];
+				xr[i] += o[i];
 			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
 				m->n_embd, m->rms_eps);
 		}

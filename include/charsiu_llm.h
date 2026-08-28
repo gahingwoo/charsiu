@@ -619,6 +619,13 @@ struct llama_state {
 	 * the three above.
 	 */
 	float *bx, *bxb, *bhb, *bhb2, *bxo, *bcs;
+	/*
+	 * The batched q k v and the attention's output.
+	 * ⚠ bq AND bao ARE n_head * head_dim WIDE, NOT n_embd. Qwen3 0.6B is
+	 * 16 heads of 128 against an embedding of 1024 and the two are not the
+	 * same number; a buffer sized by n_embd truncates every row.
+	 */
+	float *bq, *bk, *bv, *bao;
 	unsigned bx_n;
 	float *hb, *hb2;       /* n_ff */
 	float *q;              /* n_head * head_dim */
