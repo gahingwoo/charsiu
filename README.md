@@ -40,6 +40,46 @@ It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files. D
 board's DRAM roof: 10.8 GB/s of weights, 1661 ms of a 1792 ms hardware path spent waiting
 on the fence, and one millisecond of a token unaccounted for.
 
+**And it sees.** A vision tower read out of llama.cpp's `mmproj` gguf, on the same
+primitives -- a patch embedding is a convolution whose stride equals its kernel, which
+is a gather into rows and one matmul, so nothing outside `(m, k, n)` is needed.
+
+```
+$ charsiu --image llama-logo.png "what animal is this?"
+Llama.
+```
+
+On SmolVLM-256M, a 512x512 picture is 1024 patches and 64 tokens, and the control is
+that without the picture the same prompt makes one up.
+
+**And it hears.** Whisper, out of whisper.cpp's own container -- the mel spectrogram,
+the audio encoder, and a decoder with the first cross attention in this tree.
+
+```
+$ charsiu_whisper ggml-tiny.en.bin --transcribe --audio jfk.wav
+ And so my fellow Americans ask not what your country can do for you, ask what you
+ can do for your country.
+```
+
+Every stage is diffed against numpy on the real weights: the spectrogram at 1.7e-05,
+the encoder at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the
+same argmax.
+
+⚠ On the board it takes **34.5 s for 11 s of audio**, and a picture takes **153 s**,
+because **none of the three new modalities touches the NPU yet** -- they call
+`gguf_matvec` directly and only the language model's projections are routed. Three
+independent graphs measure the same 0.6 G-mac/s, which is the scalar CPU path.
+
+**And it matches pictures to words.** CLIP's two towers land in one space:
+
+```
+$ charsiu_clip clip-vit-base-patch32.gguf --image logo.png \
+      --text "a drawing of a llama" "the statue of liberty" "a dog on grass"
+  0.2537  a drawing of a llama
+  0.1743  the statue of liberty
+  0.1533  a dog on grass
+```
+
 ## Install
 
 ```
@@ -67,10 +107,13 @@ checks still run, which is the point: it is what the installer *sees* on your ma
 
 ### Two channels
 
-**stable** is what the line above installs: the runtime, and nothing else.
+**stable** installs the runtime AND the other modalities: `charsiu_run`,
+`charsiu_check`, `charsiu_serve`, `charsiu_vision`, `charsiu_clip`,
+`charsiu_whisper`. None of those touches an NPU register that the decode path
+does not.
 
 **dev** adds the hardware probes -- `npu_gemm_test`, `charsiu_matmul`,
-`bench_batch`, `prefill_control.sh` -- and tracks `main`, where the work happens.
+`bench_batch`, `prefill_control.sh` -- and tracks `dev`, where the work happens.
 They exist to ask the silicon questions, and asking has wedged the block, timed out
 and printed the opposite of its own data on the way to the answers. They are not
 something to install on a board you want to rely on.
@@ -1684,6 +1727,54 @@ itself its name is about.
 question and reports the ones that miss it -- no llama.cpp build, no f32 copy -- and it
 makes a second pass with `CHARSIU_STAGES=1`, because a crash that needs an environment
 variable is still a crash and one of them cost four board rounds.
+
+### Pictures, and what a real mmproj said about the guesses
+
+The tower is a ViT and a ViT is matmuls, which is why this fitted at all: a patch
+embedding is a `k x k` convolution with **stride k**, so the patches do not overlap and
+it is a gather into rows followed by one matmul. charsiu's job encoder only ever speaks
+`(m, k, n)` and that is enough for the whole of it. The real 2D convolution stays in
+Mesa.
+
+⚠ **And a picture is exactly the batched case.** 1024 patches arrive AT ONCE, which is
+the m > 1 matmul, so the tower is where the batched path pays most. That also settles
+the format: **int8**, because w4a16 computes one row whatever it is asked for and an
+int4 tower would dispatch those patches one at a time.
+
+Every tensor name here was a guess -- llama.cpp's clip naming as we read it -- so the
+loader was written to be **loud** before it was written to be right: it binds what it
+can and reports what it could not, by name, in the order it wanted them. Pointed at
+SmolVLM-256M's real mmproj it printed one missing name out of about two hundred, and
+the file then corrected two things:
+
+- ⚠ **`ffn_up` and `ffn_down` are backwards in a vision tower.** `ffn_down.weight` is
+  `(768, 3072)` -- the FIRST matmul -- and `ffn_up` is `(3072, 768)`, the opposite of
+  the same two words in the language model. The pair is bound **by shape** now:
+  whichever contracts over `n_embd` is fc1, and a file naming them either way reads.
+- ⚠ **A picture is not one token per patch.** The projector is idefics3, and
+  `mm.model.fc.weight` is `(12288, 576)` because a **pixel shuffle** by 4 folds sixteen
+  neighbouring patches into one embedding first. 1024 patches become **64 tokens**.
+
+Binding checks shape as well as name, because a name that exists with the wrong shape
+is the worse case: it contracts over the wrong axis and produces a fluent sentence
+rather than an error.
+
+Three tests, none of which needs a model or a board. `tests/mmproj_synth.py` writes a
+synthetic tower and checks that a removed tensor is reported **by name**;
+`tests/vision_cross.py` diffs both projector paths against numpy at 2.4e-07;
+`tests/resize_cross.py` checks the image resize on its own, because half a pixel of
+shift is invisible in a caption and produces a confident answer about a slightly
+different crop.
+
+⚠ **What those tests cannot see**, written into their own docstrings: the reference was
+written by whoever wrote the C, so a convention they SHARE passes. The patch gather
+order is the one to suspect first if a real model ever describes the wrong picture
+fluently.
+
+⚠ **phi3 and gemma3 do not batch a prompt**, and gemma3 is the family whose vision
+models people will reach for. The tower batches -- it is our own graph -- but the
+embeddings it produces enter the language model one at a time until the sliding window
+case is written.
 
 ### What a tokens-per-second number needs before it can be compared
 

@@ -2929,6 +2929,18 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	return 0;
 }
 
+/*
+ * ⚠ ONE CALL, THEN IT CLEARS ITSELF. A left-over embd_in would silently turn
+ * the next real token into the previous picture, which is a fluent answer about
+ * nothing that was asked.
+ */
+const float *llama_forward_embd(struct llama_state *s, const float *embd,
+				int pos)
+{
+	s->embd_in = embd;
+	return llama_forward(s, 0, pos);
+}
+
 const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 {
 	const struct llama_model *m = s->m;
@@ -2995,10 +3007,16 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			   NULL);
 	}
 
-	gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
-	if (m->embd_scale != 1.0f)
-		for (uint32_t i = 0; i < m->n_embd; i++)
-			s->x[i] *= m->embd_scale;
+	/* see llama_forward_embd: a picture enters here, past the lookup */
+	if (s->embd_in) {
+		memcpy(s->x, s->embd_in, m->n_embd * sizeof(float));
+		s->embd_in = NULL;
+	} else {
+		gguf_row_f32(m->tok_embd, (uint64_t)token, s->x);
+		if (m->embd_scale != 1.0f)
+			for (uint32_t i = 0; i < m->n_embd; i++)
+				s->x[i] *= m->embd_scale;
+	}
 
 	/*
 	 * ⚠ gemma4's PER LAYER EMBEDDINGS, built once for the whole token.

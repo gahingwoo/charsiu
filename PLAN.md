@@ -56,6 +56,36 @@ projection in the model is skipped n - 1 times rather than made n times wider.
 The prompt goes in chunks of 32, because the buffers scale with the batch and
 the probe's sweep flattens after 16.
 
+### The other three modalities, measured on the board 2026-08-28
+
+Seeing, hearing and matching all give the right answer on a ROCK 4D -- jfk.wav
+transcribed word for word, the llama.cpp logo called a llama by both the VLM and
+CLIP -- and all three are SLOW, in the same way:
+
+```
+  whisper tiny.en    34.5 s   for 11 s of audio    ~20 G-mac    0.58 G-mac/s
+  SmolVLM-256M      153.1 s   for one picture      ~90 G-mac    0.59 G-mac/s
+  CLIP ViT-B/32       4.7 s   for one picture     ~4.2 G-mac    0.9  G-mac/s
+  the decode under them, unchanged:  19.75 tok/s
+```
+
+⚠ **NONE OF THEM TOUCHES THE NPU.** vision.c, clip.c and whisper.c call
+gguf_matvec directly; only llama.c's projections are routed. So 0.6 G-mac/s is
+not the hardware being bad at this, it is the scalar CPU path, and three
+independent graphs landing on the same number is the same bottleneck three
+times rather than a coincidence.
+
+⚠ **AND THE SHAPE IS THE ONE ALREADY SOLVED.** A picture is 1024 patches, a
+thirty second clip is 1500 encoder positions, a CLIP image is 50 -- all present
+at once, against weights that do not change. That is the batched matmul measured
+at 2.94x on 2026-08-27, at m values twenty to fifty times larger than a prompt
+chunk. The NPU moves weights at 10.8 GB/s, which at int8 and m = 1 is about
+10 G-mac/s before batching buys anything.
+
+The work is not the arithmetic, which is written and checked. It is that the
+NPU tensor cache lives in struct llama_state and these three graphs are not
+llama.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:

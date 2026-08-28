@@ -144,11 +144,17 @@ else
 	sz=$(( $(file_bytes "$M") / 1048576 ))
 	ok "$M (${sz} MB)"
 	if [ -n "$CK" ]; then
-		if out=$("$CK" -q "$M" 2>&1); then
-			ok "charsiu can run it: $out"
-		else
-			bad "charsiu CANNOT run it: $out"
-		fi
+		# ⚠ EXIT 3 IS NOT A FAILURE, it is "runnable, but not as a chat
+		# model". Reported as CANNOT it sends somebody to re-download a
+		# file that is fine and is simply in the wrong setting.
+		out=$("$CK" -q "$M" 2>&1) && _r=0 || _r=$?
+		case "$_r" in
+		0) ok "charsiu can run it: $out" ;;
+		3) bad "[model] path points at something that is not a chat model:
+     $out
+     charsiu-config, or charsiu pull, to set a chat model" ;;
+		*) bad "charsiu CANNOT run it: $out" ;;
+		esac
 	else
 		warn "charsiu_check not found, so the file was not verified"
 	fi
@@ -165,6 +171,29 @@ else
 		fi
 	fi
 fi
+
+# ⚠ WHAT ELSE IS ON THIS MACHINE, because the models directory stopped holding
+# only chat models and a person who pulled a whisper model has no way to ask
+# whether the binary that runs it got installed.
+hdr "the other things it can run"
+_any=0
+for _f in $(all_models 2>/dev/null) "$(ini_get model path)"; do
+	[ -f "$_f" ] || continue
+	[ -n "$CK" ] || continue
+	_o=$("$CK" -q "$_f" 2>&1) && continue     # 0: an ordinary chat model
+	case "$_o" in
+	VISION-TOWER*) _any=1; info "$(basename "$_f"): a vision tower" ;;
+	WHISPER*)      _any=1; info "$(basename "$_f"): a whisper model" ;;
+	esac
+done
+for _b in charsiu_vision charsiu_clip charsiu_whisper; do
+	if [ -n "$(find_bin $_b)" ]; then
+		ok "$_b is installed"
+	else
+		warn "$_b is NOT installed, so a picture or a clip has nothing to run it"
+	fi
+done
+[ "$_any" = 1 ] || info "no vision towers or whisper models in the models directory"
 
 hdr "the kernel's opinion"
 if command -v dmesg >/dev/null 2>&1; then

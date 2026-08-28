@@ -26,6 +26,8 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
      $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
+     $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
+     $(BUILD)/charsiu_whisper \
      $(BUILD)/tokenizer_roundtrip
 
 $(BUILD):
@@ -49,9 +51,27 @@ $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/charsiu_matmul: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-# the CPU decode loop: the oracle every NPU version is diffed against
-$(BUILD)/charsiu_run: tools/charsiu_run.c $(LLM) | $(BUILD)
+# ⚠ WHAT AN mmproj ACTUALLY CONTAINS, against what this reads. Every vision
+# tensor name in the tree is a guess until a real file says otherwise, and a
+# guess that finds nothing has cost this project a model that answered while
+# missing half of itself. This prints the misses by name.
+$(BUILD)/charsiu_vision: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+# ⚠ CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
+# model's: causal, pooled at the end of text token, its own BPE.
+$(BUILD)/charsiu_clip: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+# ⚠ WHISPER READS ITS OWN CONTAINER, not a gguf: whisper.cpp's format is what
+# every model anybody has is in, and it carries the mel filterbank and the
+# vocabulary as well as the weights.
+$(BUILD)/charsiu_whisper: tools/charsiu_whisper.c src/whisper.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+# the CPU decode loop: the oracle every NPU version is diffed against
+$(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
 
 $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
@@ -80,7 +100,20 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64 \
        $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64 \
        $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64 \
-       $(BUILD)/charsiu_serve.aarch64
+       $(BUILD)/charsiu_serve.aarch64 $(BUILD)/charsiu_vision.aarch64 \
+       $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64
+
+# ⚠ THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
+# round reaches for, and a tool that is only in the native build is one that has
+# to be rebuilt on the card before it can be asked anything.
+$(BUILD)/charsiu_vision.aarch64: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_clip.aarch64: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_whisper.aarch64: tools/charsiu_whisper.c src/whisper.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
 # what the memory controller has left, which is the only question that decides
 # whether splitting work across the CPU, the GPU and the NPU can pay

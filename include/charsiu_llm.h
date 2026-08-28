@@ -491,6 +491,15 @@ struct llama_state {
 
 	float *x, *xb, *xb2;   /* n_embd */
 	/*
+	 * ⚠ AN EMBEDDING THAT DID NOT COME FROM THE VOCABULARY. A picture
+	 * enters the model as rows in this space rather than as token ids, so
+	 * llama_forward_embd parks one here and llama_forward uses it INSTEAD
+	 * of the table lookup, for exactly one call. Doing it this way rather
+	 * than as a second copy of the forward pass means the image path and
+	 * the text path cannot drift.
+	 */
+	const float *embd_in;
+	/*
 	 * ⚠ THE BATCHED PREFILL'S OWN ROWS, allocated only if a prompt takes
 	 * that path and never touched by a decode, which is one row and uses
 	 * the three above.
@@ -560,6 +569,20 @@ const char *llama_batch_why_not(const struct llama_model *m);
 void llama_stages_reset(void);
 void llama_stages_report(void);
 const float *llama_forward(struct llama_state *s, int32_t token, int pos);
+
+/*
+ * One embedding in, a full logit vector out. The same forward pass, entered
+ * past the vocabulary lookup: `embd` is n_embd floats, which is what a vision
+ * projector produces.
+ *
+ * ⚠ NOT SCALED BY embd_scale. That factor belongs to the token embedding table
+ * -- gemma multiplies its lookup by sqrt(n_embd) -- and a projector's output is
+ * already in the model's own space. UNVERIFIED against a gemma vision model,
+ * because the only mmproj this has been run against is llama shaped and has
+ * embd_scale 1, where the two readings are indistinguishable.
+ */
+const float *llama_forward_embd(struct llama_state *s, const float *embd,
+				int pos);
 
 /* argmax, which is the only sampler an oracle is allowed. */
 /*
