@@ -74,6 +74,11 @@ for AXIS in h w; do
 done
 
 echo "======================================================================"
+echo "if the width arm is close but not exact, the knob to sweep next is"
+echo "CHARSIU_DPU_40B8: the vendor writes 3*M on its int4 projections and 7*M"
+echo "on its int8 head, and this tree writes M for both. job.c already takes"
+echo "the override, so it costs one more pass and no rebuild."
+echo "======================================================================"
 echo "what to read: the HEIGHT arm must report rows disagreeing -- that is"
 echo "the control, and if it passes the probe is not discriminating. Only"
 echo "then does the WIDTH arm mean anything."
