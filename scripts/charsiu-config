@@ -33,7 +33,7 @@ command -v ini_get >/dev/null 2>&1 \
 CONF=$(charsiu_conf_w)
 [ -f "$CONF" ] || CONF=$(charsiu_conf)
 MODELS_DIR="${CHARSIU_MODELS_DIR:-${CHARSIU_MODELS:-$CHARSIU_HOME/models}}"
-SELFURL=https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh
+SELFURL=https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh
 for t in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-tui.sh"} \
 	 "$(dirname "$0")/charsiu-tui.sh" \
 	 "$(dirname "$0")/../scripts/charsiu-tui.sh" \

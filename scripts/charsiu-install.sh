@@ -10,7 +10,7 @@
 #   sh charsiu-install.sh --dry-run    say what it would do, change nothing
 #   sh charsiu-install.sh --prefix DIR stage instead of installing
 #   sh charsiu-install.sh --uninstall  remove what this installed
-#   sh charsiu-install.sh --dev        the probes too, and track main
+#   sh charsiu-install.sh --dev        the probes too, and track dev
 #   CHARSIU_PLAIN=1 ...                no full-screen dialogs
 #
 # ⚠ TWO CHANNELS. stable is the runtime and is what a fresh install gets. dev
@@ -58,12 +58,12 @@ for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
 # the tree this is about to download.
 _BOOT_REF=stable
 for _a in "$@"; do case "$_a" in
-	--dev) _BOOT_REF=main ;;
+	--dev) _BOOT_REF=${CHARSIU_DEV_REF:-dev} ;;
 	--stable) _BOOT_REF=stable ;;
 esac; done
 
 CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
-CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh"
+CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh"
 
 # ⚠⚠ PIPED IN, STDIN IS THE SCRIPT ITSELF. Every `read` would eat the rest of
 # this file, and a wizard that asks questions cannot run that way. Reattach the
@@ -171,9 +171,20 @@ Continue?" || { echo "  stopped."; exit 1; }
 		printf '  updating %s (%s)\n' "$DIR" "$_BOOT_REF"
 		# ⚠ fetch and move to the ref rather than pull, or a tree that
 		# is on main stays on main however stable was asked for.
-		$_sudo git -C "$DIR" fetch --quiet origin "$_BOOT_REF" \
-			&& $_sudo git -C "$DIR" checkout --quiet -B "$_BOOT_REF" FETCH_HEAD \
-			|| true
+		# ⚠⚠ A FAILED FETCH USED TO BE SWALLOWED BY `|| true`, so a ref
+		# that does not exist meant building whatever was already in
+		# the directory and printing "updating" while doing it. The
+		# development branch was renamed from main to dev on
+		# 2026-08-28 and every tree older than that hits exactly this.
+		if ! $_sudo git -C "$DIR" fetch --quiet origin "$_BOOT_REF"; then
+			echo "  cannot fetch $_BOOT_REF from $CHARSIU_SRC_REPO." >&2
+			echo "  If this tree predates 2026-08-28 it is on the old" >&2
+			echo "  branch name; the development branch is 'dev' now." >&2
+			echo "  Delete $DIR and install again." >&2
+			exit 1
+		fi
+		$_sudo git -C "$DIR" checkout --quiet -B "$_BOOT_REF" FETCH_HEAD \
+			|| { echo "  $DIR will not move to $_BOOT_REF." >&2; exit 1; }
 	elif command -v git >/dev/null 2>&1; then
 		$_sudo mkdir -p "$(dirname "$DIR")"
 		$_sudo git clone --depth 1 --quiet --branch "$_BOOT_REF" \

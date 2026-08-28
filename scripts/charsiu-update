@@ -46,7 +46,7 @@ done
 if [ -z "$SRC" ]; then
 	echo "charsiu update: no source tree to update." >&2
 	echo "  Install again and it will fetch one:" >&2
-	echo "  curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/main/scripts/charsiu-install.sh -o install.sh && sh install.sh" >&2
+	echo "  curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh -o install.sh && sh install.sh" >&2
 	exit 1
 fi
 
@@ -60,7 +60,10 @@ else
 	: "${CHANNEL:=stable}"
 fi
 case "$CHANNEL" in
-dev)    REF=main ;;
+# ⚠ ONE PLACE WHERE A CHANNEL BECOMES A BRANCH, and the branch was renamed
+# from main to dev on 2026-08-28. A stable install whose update script still
+# says main asks for a ref that does not exist.
+dev)    REF=${CHARSIU_DEV_REF:-dev} ;;
 stable) REF=stable ;;
 *)      echo "charsiu update: no channel called $CHANNEL. Try stable or dev." >&2
 	exit 1 ;;
