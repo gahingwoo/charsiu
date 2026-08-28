@@ -1330,6 +1330,27 @@ void gguf_matmul(const struct gguf_tensor *w, const struct charsiu_act *a,
 	uint64_t nc = w->ne[0];
 	const uint8_t *base = w->data;
 
+	/*
+	 * ⚠ THE BATCHED KERNELS BELOW ACCUMULATE INTO float s[CHARSIU_BATCH_MAX]
+	 * ON THE STACK, and nothing here stopped a caller asking for more. No
+	 * caller in the runtime does -- only bench_batch, which caps itself --
+	 * so this has never fired, which is exactly the kind of check that is
+	 * missing when it is finally needed. Split instead of smashing.
+	 */
+	if (m > CHARSIU_BATCH_MAX) {
+		unsigned done = 0;
+
+		while (done < m) {
+			unsigned c = m - done < CHARSIU_BATCH_MAX
+				   ? m - done : CHARSIU_BATCH_MAX;
+
+			gguf_matmul(w, a + done, c, y + done * ystride, ystride,
+				    row0, nrows);
+			done += c;
+		}
+		return;
+	}
+
 	if (m == 1) {
 		gguf_matvec(w, a, y, row0, nrows);
 		return;

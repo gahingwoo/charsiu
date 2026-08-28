@@ -140,17 +140,60 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 	return &p->t[p->n++];
 }
 
+/*
+ * ⚠⚠ THE BATCH IS CHUNKED, AND 32 IS THE ONLY WIDTH THAT HAS EVER BEEN CHECKED.
+ *
+ * charsiu_npu_matmul was verified at m = 2 to 32, against a CPU reference, value
+ * for value. The towers hand it 1024 patches and 1500 encoder positions, and the
+ * first board round that did so came back with a picture the model called "I am
+ * not sure" and a transcript that was EMPTY -- while CLIP, whose tower is fifty
+ * rows, was right. Fifty is inside the range and a thousand is not.
+ *
+ * Mesa's own arithmetic says where this goes wrong and it is written in the
+ * README already: an LLM matmul reaches the encoder one column wide, so the
+ * CBUF budget test fires above m = 320 and the row split above m = 640. Those
+ * are the shapes Mesa splits and charsiu never has.
+ *
+ * So: chunk. CHARSIU_NPU_ROWS_MAX moves the bound, which is what the sweep that
+ * finds the real one needs, and 32 is the default because it is the number that
+ * has evidence behind it rather than the number that looks safe.
+ */
+static unsigned rows_max(void)
+{
+	const char *e = getenv("CHARSIU_NPU_ROWS_MAX");
+	int v = e ? atoi(e) : 32;
+
+	return v > 0 ? (unsigned)v : 32;
+}
+
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		      const float *X, unsigned m, float *Y)
 {
-	unsigned i;
+	unsigned i, id = 0, found = 0, chunk = rows_max(), done = 0;
+	uint64_t k, n;
 
 	if (!p->dev || !charsiu_pool_get(p, w))
 		return -1;
 	for (i = 0; i < p->n; i++)
-		if (p->key[i] == w)
-			return p->id[i] >= 0
-			     ? charsiu_npu_matmul(p->dev, p->id[i], X, m, Y)
-			     : -1;
-	return -1;
+		if (p->key[i] == w) {
+			if (p->id[i] < 0)
+				return -1;
+			id = (unsigned)p->id[i];
+			found = 1;
+			break;
+		}
+	if (!found)
+		return -1;
+
+	k = w->ne[0];
+	n = w->n_dims ? w->ne[w->n_dims - 1] : 1;
+	while (done < m) {
+		unsigned c = m - done < chunk ? m - done : chunk;
+
+		if (charsiu_npu_matmul(p->dev, (int)id, X + (size_t)done * k, c,
+				       Y + (size_t)done * n))
+			return -1;
+		done += c;
+	}
+	return 0;
 }
