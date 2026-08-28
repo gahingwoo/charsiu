@@ -59,19 +59,27 @@ def kv_str(k, v):
 IMAGE, PATCH, WIDTH, FF, HEADS, LAYERS, PROJ = 64, 16, 32, 64, 4, 2, 48
 GRID = IMAGE // PATCH
 PATCHES = GRID * GRID
+SCALE = 2                      # idefics3's pixel shuffle factor
 
 
-def tensors():
-    """(name, ne) with ne in gguf order: ne[0] is the fastest axis."""
-    t = [
+def tensors(kind="mlp"):
+    """(name, ne) with ne in gguf order: ne[0] is the fastest axis.
+
+    ⚠ THE FEED FORWARD NAMES ARE THE REAL ONES, WHICH ARE BACKWARDS. A real
+    mmproj calls the FIRST matmul ffn_down (n_embd -> n_ff) and the second
+    ffn_up, the opposite way round from the language model. Writing them the
+    intuitive way here would have made the synthetic file the only one the
+    loader could read."""
+    proj = ([("mm.model.fc.weight", [WIDTH * SCALE * SCALE, PROJ])]
+            if kind == "idefics3" else
+            [("mm.0.weight", [WIDTH, PROJ]), ("mm.0.bias", [PROJ])])
+    t = proj + [
         # a patch embedding is [out][in] with in = channels * patch * patch
         ("v.patch_embd.weight", [3 * PATCH * PATCH, WIDTH]),
         ("v.patch_embd.bias", [WIDTH]),
         ("v.position_embd.weight", [WIDTH, PATCHES]),
         ("v.post_ln.weight", [WIDTH]),
         ("v.post_ln.bias", [WIDTH]),
-        ("mm.0.weight", [WIDTH, PROJ]),
-        ("mm.0.bias", [PROJ]),
     ]
     for i in range(LAYERS):
         p = f"v.blk.{i}."
@@ -83,17 +91,17 @@ def tensors():
             (p + "attn_out.weight", [WIDTH, WIDTH]),
             (p + "attn_out.bias", [WIDTH]),
             (p + "ln2.weight", [WIDTH]), (p + "ln2.bias", [WIDTH]),
-            (p + "ffn_up.weight", [WIDTH, FF]), (p + "ffn_up.bias", [FF]),
-            (p + "ffn_down.weight", [FF, WIDTH]), (p + "ffn_down.bias", [WIDTH]),
+            (p + "ffn_down.weight", [WIDTH, FF]), (p + "ffn_down.bias", [FF]),
+            (p + "ffn_up.weight", [FF, WIDTH]), (p + "ffn_up.bias", [WIDTH]),
         ]
     return t
 
 
-def write(path, drop=(), data=None):
+def write(path, drop=(), data=None, kind="mlp"):
     """drop: names to leave OUT, which is how the reporting gets tested.
     data: {name: flat float32 array}. Absent names are written as zeros, which
     is enough to test the reader and useless for testing the arithmetic."""
-    ts = [t for t in tensors() if t[0] not in drop]
+    ts = [t for t in tensors(kind) if t[0] not in drop]
     kvs = b"".join([
         kv_str("general.architecture", "clip"),
         kv_bool("clip.has_vision_encoder", True),
@@ -107,8 +115,11 @@ def write(path, drop=(), data=None):
         kv_f32("clip.vision.attention.layer_norm_epsilon", 1e-6),
         kv_arr_f32("clip.vision.image_mean", [0.5, 0.5, 0.5]),
         kv_arr_f32("clip.vision.image_std", [0.5, 0.5, 0.5]),
-    ])
-    n_kv = 12
+        kv_u32("clip.use_gelu", 1),
+    ] + ([kv_str("clip.projector_type", "idefics3"),
+          kv_u32("clip.vision.projector.scale_factor", SCALE)]
+         if kind == "idefics3" else []))
+    n_kv = 13 + (2 if kind == "idefics3" else 0)
 
     infos, off, blobs = b"", 0, []
     for name, ne in ts:

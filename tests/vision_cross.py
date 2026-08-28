@@ -49,7 +49,20 @@ def layernorm(x, w, b, eps):
     return (x - mu) / np.sqrt(var + eps) * w + b
 
 
-def reference(T, eps=1e-6):
+def pixel_shuffle(x, grid, E, s):
+    """transformers' Idefics3 pixel_shuffle, transcribed from the model file.
+
+    ⚠ TWO RESHAPES WITH A TRANSPOSE BETWEEN THEM, not a block gather. The two
+    differ, and both produce finite numbers."""
+    x = x.reshape(grid, grid, E)
+    x = x.reshape(grid, grid // s, E * s)
+    x = x.transpose(1, 0, 2)
+    x = x.reshape(grid // s, grid // s, E * s * s)
+    x = x.transpose(1, 0, 2)
+    return x.reshape((grid // s) * (grid // s), E * s * s)
+
+
+def reference(T, eps=1e-6, kind="mlp"):
     """The same tower, in numpy. T is {name: array} in gguf shapes."""
     P, G, NP = ms.PATCH, ms.GRID, ms.PATCHES
     W, FF, H = ms.WIDTH, ms.FF, ms.HEADS
@@ -93,24 +106,25 @@ def reference(T, eps=1e-6):
         x = x + o @ w2(p + "attn_out.weight", W, W).T + T[p + "attn_out.bias"]
 
         xb = layernorm(x, T[p + "ln2.weight"], T[p + "ln2.bias"], eps)
-        h1 = xb @ w2(p + "ffn_up.weight", W, FF).T + T[p + "ffn_up.bias"]
+        h1 = xb @ w2(p + "ffn_down.weight", W, FF).T + T[p + "ffn_down.bias"]
         h1 = gelu(h1)
-        x = x + h1 @ w2(p + "ffn_down.weight", FF, W).T + T[p + "ffn_down.bias"]
+        x = x + h1 @ w2(p + "ffn_up.weight", FF, W).T + T[p + "ffn_up.bias"]
 
     x = layernorm(x, T["v.post_ln.weight"], T["v.post_ln.bias"], eps)
-    x = x @ w2("mm.0.weight", W, ms.PROJ).T + T["mm.0.bias"]
+    if kind == "idefics3":
+        s = ms.SCALE
+        x = pixel_shuffle(x, G, W, s)
+        x = x @ w2("mm.model.fc.weight", W * s * s, ms.PROJ).T
+    else:
+        x = x @ w2("mm.0.weight", W, ms.PROJ).T + T["mm.0.bias"]
     return x.astype(np.float32)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    tool = sys.argv[1]
+def one(tool, kind):
     rng = np.random.default_rng(20260828)
 
     data = {}
-    for name, ne in ms.tensors():
+    for name, ne in ms.tensors(kind):
         n = 1
         for d in ne:
             n *= d
@@ -118,7 +132,8 @@ def main():
         data[name] = rng.standard_normal(n).astype(np.float32) * np.float32(0.1)
 
     tmp = tempfile.mkdtemp()
-    path = ms.write(os.path.join(tmp, "mmproj-cross.gguf"), data=data)
+    path = ms.write(os.path.join(tmp, f"mmproj-{kind}.gguf"), data=data,
+                    kind=kind)
 
     r = subprocess.run([tool, path, "--encode"], capture_output=True, text=True)
     if r.returncode != 0:
@@ -130,7 +145,7 @@ def main():
     got = np.array([float(v) for v in lines[1:]], dtype=np.float32)
     got = got.reshape(tok, width)
 
-    want = reference(data)
+    want = reference(data, kind=kind)
     if want.shape != got.shape:
         print(f"FAILED: shape {got.shape} against {want.shape}")
         return 1
@@ -138,15 +153,25 @@ def main():
     err = np.abs(got - want)
     worst = err.max()
     at = np.unravel_index(err.argmax(), err.shape)
-    print(f"{tok} embeddings of {width}")
+    print(f"{kind}: {tok} embeddings of {width}")
     print(f"worst |charsiu - reference| = {worst:.3e} at patch {at[0]} dim {at[1]}")
     print(f"  charsiu {got[at]:.6f}   reference {want[at]:.6f}")
     if worst > TOL:
         bad = int((err > TOL).sum())
         print(f"FAILED: {bad} of {err.size} above {TOL}")
         return 1
-    print("PASS")
     return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    fail = 0
+    for kind in ("mlp", "idefics3"):
+        fail |= one(sys.argv[1], kind)
+    print("FAILED" if fail else "PASS")
+    return fail
 
 
 if __name__ == "__main__":

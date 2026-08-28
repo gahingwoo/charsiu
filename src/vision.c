@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdarg.h>
 
 #include "charsiu_llm.h"
 #include "charsiu_vision.h"
@@ -24,10 +25,45 @@
  * legitimately be without -- a pre-layernorm, a second projector matmul -- so
  * that "absent" and "missing" stay different things.
  */
+static void miss(struct charsiu_vision *v, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (v->n_missing >= sizeof(v->missing) / sizeof(*v->missing))
+		return;
+	va_start(ap, fmt);
+	vsnprintf(v->missing[v->n_missing++], sizeof(v->missing[0]), fmt, ap);
+	va_end(ap);
+}
+
+/* the contraction axis and the row count of a 2D or 4D weight */
+static void wshape(const struct gguf_tensor *t, uint64_t *in, uint64_t *out)
+{
+	unsigned d;
+
+	*in = 1;
+	for (d = 0; d + 1 < (t->n_dims ? t->n_dims : 1); d++)
+		*in *= t->ne[d];
+	*out = t->n_dims ? t->ne[t->n_dims - 1] : 1;
+}
+
+/*
+ * Bind one tensor by name and CHECK ITS SHAPE.
+ *
+ * ⚠ A NAME THAT EXISTS WITH THE WRONG SHAPE IS THE DANGEROUS CASE. A missing
+ * name is loud on its own; a present one that contracts over the wrong axis
+ * produces finite, plausible numbers all the way to a sentence. `in` or `out`
+ * of 0 means "do not check that side".
+ *
+ * `opt` marks the ones a tower can legitimately be without -- a pre-layernorm,
+ * a projector bias -- so that absent and missing stay different things.
+ */
 static const struct gguf_tensor *bind(struct charsiu_vision *v,
-				      const char *fmt, int idx, int opt)
+				      const char *fmt, int idx, int opt,
+				      uint64_t in, uint64_t out)
 {
 	const struct gguf_tensor *t;
+	uint64_t gi, go;
 	char name[80];
 
 	if (idx >= 0)
@@ -35,10 +71,50 @@ static const struct gguf_tensor *bind(struct charsiu_vision *v,
 	else
 		snprintf(name, sizeof(name), "%s", fmt);
 	t = gguf_tensor(&v->g, name);
-	if (!t && !opt && v->n_missing < sizeof(v->missing) / sizeof(*v->missing))
-		snprintf(v->missing[v->n_missing++], sizeof(v->missing[0]),
-			 "%s", name);
+	if (!t) {
+		if (!opt)
+			miss(v, "%s", name);
+		return NULL;
+	}
+	wshape(t, &gi, &go);
+	if ((in && gi != in) || (out && go != out)) {
+		miss(v, "%s is %llux%llu, wanted %llux%llu", name,
+		     (unsigned long long)gi, (unsigned long long)go,
+		     (unsigned long long)in, (unsigned long long)out);
+		return NULL;
+	}
 	return t;
+}
+
+/*
+ * The same lookup with the reporting off: "is there a tensor of this name with
+ * this shape". Used where two names could carry the same matrix and the shape
+ * is what decides, so that asking does not itself count as a miss.
+ */
+static const struct gguf_tensor *probe(struct charsiu_vision *v,
+				       const char *fmt, int idx,
+				       uint64_t in, uint64_t out)
+{
+	const struct gguf_tensor *t;
+	uint64_t gi, go;
+	char name[80];
+
+	snprintf(name, sizeof(name), fmt, idx);
+	t = gguf_tensor(&v->g, name);
+	if (!t)
+		return NULL;
+	wshape(t, &gi, &go);
+	if ((in && gi != in) || (out && go != out))
+		return NULL;
+	return t;
+}
+
+/* a 1D tensor: a bias, or a norm's gain */
+static const struct gguf_tensor *bind1(struct charsiu_vision *v,
+				       const char *fmt, int idx, int opt,
+				       uint64_t n)
+{
+	return bind(v, fmt, idx, opt, 0, n);
 }
 
 /* ⚠ gguf_get_u32 RETURNS 0 ON SUCCESS. Reading it as a truth value inverts
@@ -48,9 +124,7 @@ static int need(struct charsiu_vision *v, const char *key, uint32_t *out)
 {
 	if (gguf_get_u32(&v->g, key, out) == 0)
 		return 0;
-	if (v->n_missing < sizeof(v->missing) / sizeof(*v->missing))
-		snprintf(v->missing[v->n_missing++], sizeof(v->missing[0]),
-			 "%s (a key, not a tensor)", key);
+	miss(v, "%s (a key, not a tensor)", key);
 	return -1;
 }
 
@@ -119,19 +193,67 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 		v->n_patches = v->grid * v->grid;
 	}
 
-	v->patch_w   = bind(v, "v.patch_embd.weight", -1, 0);
-	v->patch_b   = bind(v, "v.patch_embd.bias", -1, 1);
-	v->pos_embd  = bind(v, "v.position_embd.weight", -1, 0);
-	v->pre_ln_w  = bind(v, "v.pre_ln.weight", -1, 1);
-	v->pre_ln_b  = bind(v, "v.pre_ln.bias", -1, 1);
-	v->post_ln_w = bind(v, "v.post_ln.weight", -1, 1);
-	v->post_ln_b = bind(v, "v.post_ln.bias", -1, 1);
+	{
+		uint32_t W = v->n_embd, pin = 3u * v->patch_size * v->patch_size;
 
-	v->mm_w[0] = bind(v, "mm.0.weight", -1, 0);
-	v->mm_b[0] = bind(v, "mm.0.bias", -1, 1);
-	v->mm_w[1] = bind(v, "mm.2.weight", -1, 1);
-	v->mm_b[1] = bind(v, "mm.2.bias", -1, 1);
-	v->proj = v->mm_w[0] ? CHARSIU_PROJ_MLP : CHARSIU_PROJ_UNKNOWN;
+		v->patch_w   = bind(v, "v.patch_embd.weight", -1, 0, pin, W);
+		v->patch_b   = bind1(v, "v.patch_embd.bias", -1, 1, W);
+		v->pos_embd  = bind(v, "v.position_embd.weight", -1, 0, W,
+				    v->n_patches);
+		v->pre_ln_w  = bind1(v, "v.pre_ln.weight", -1, 1, W);
+		v->pre_ln_b  = bind1(v, "v.pre_ln.bias", -1, 1, W);
+		v->post_ln_w = bind1(v, "v.post_ln.weight", -1, 1, W);
+		v->post_ln_b = bind1(v, "v.post_ln.bias", -1, 1, W);
+	}
+
+	/*
+	 * ⚠ THE PROJECTOR IS THE ONE PART THAT IS NOT A ViT, and it differs per
+	 * model family. clip.projector_type says which; a file without the key
+	 * gets the mlp shape, which is what llava writes.
+	 */
+	{
+		char kind[32] = "";
+
+		gguf_get_str(&v->g, "clip.projector_type", kind, sizeof(kind));
+		if (!strcmp(kind, "idefics3")) {
+			uint32_t s2;
+
+			v->proj = CHARSIU_PROJ_IDEFICS3;
+			if (gguf_get_u32(&v->g, "clip.vision.projector.scale_factor",
+					 &v->scale) != 0 || !v->scale)
+				v->scale = 1;
+			s2 = v->scale * v->scale;
+			/*
+			 * ⚠ THE PIXEL SHUFFLE IS WHY THE fc IS SO WIDE. It
+			 * folds scale_factor squared patches into one, so the
+			 * fc contracts over n_embd * scale^2 -- 768 * 16 =
+			 * 12288 on SmolVLM-256M -- and an image becomes
+			 * n_patches / scale^2 tokens.
+			 */
+			v->fc_w = bind(v, "mm.model.fc.weight", -1, 0,
+				       (uint64_t)v->n_embd * s2, v->proj_dim);
+			v->fc_b = bind1(v, "mm.model.fc.bias", -1, 1,
+					v->proj_dim);
+			if (v->n_patches % s2)
+				miss(v, "%u patches do not divide by scale %u squared",
+				     v->n_patches, v->scale);
+		} else {
+			v->proj = CHARSIU_PROJ_MLP;
+			v->scale = 1;
+			v->mm_w[0] = bind(v, "mm.0.weight", -1, 0, v->n_embd, 0);
+			v->mm_b[0] = bind(v, "mm.0.bias", -1, 1, 0, 0);
+			v->mm_w[1] = bind(v, "mm.2.weight", -1, 1, 0, 0);
+			v->mm_b[1] = bind(v, "mm.2.bias", -1, 1, 0, 0);
+		}
+	}
+
+	/* clip.use_gelu is a key rather than a guess; a ViT that says so is 1. */
+	{
+		uint32_t g = 1;
+
+		gguf_get_u32(&v->g, "clip.use_gelu", &g);
+		v->use_gelu = g ? 1 : 0;
+	}
 
 	if (v->n_layer) {
 		v->layer = calloc(v->n_layer, sizeof(*v->layer));
@@ -144,22 +266,40 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 	for (i = 0; i < v->n_layer; i++) {
 		struct charsiu_vision_layer *L = &v->layer[i];
 
-		L->ln1_w  = bind(v, "v.blk.%d.ln1.weight", (int)i, 0);
-		L->ln1_b  = bind(v, "v.blk.%d.ln1.bias", (int)i, 1);
-		L->q_w    = bind(v, "v.blk.%d.attn_q.weight", (int)i, 0);
-		L->q_b    = bind(v, "v.blk.%d.attn_q.bias", (int)i, 1);
-		L->k_w    = bind(v, "v.blk.%d.attn_k.weight", (int)i, 0);
-		L->k_b    = bind(v, "v.blk.%d.attn_k.bias", (int)i, 1);
-		L->v_w    = bind(v, "v.blk.%d.attn_v.weight", (int)i, 0);
-		L->v_b    = bind(v, "v.blk.%d.attn_v.bias", (int)i, 1);
-		L->o_w    = bind(v, "v.blk.%d.attn_out.weight", (int)i, 0);
-		L->o_b    = bind(v, "v.blk.%d.attn_out.bias", (int)i, 1);
-		L->ln2_w  = bind(v, "v.blk.%d.ln2.weight", (int)i, 0);
-		L->ln2_b  = bind(v, "v.blk.%d.ln2.bias", (int)i, 1);
-		L->up_w   = bind(v, "v.blk.%d.ffn_up.weight", (int)i, 0);
-		L->up_b   = bind(v, "v.blk.%d.ffn_up.bias", (int)i, 1);
-		L->down_w = bind(v, "v.blk.%d.ffn_down.weight", (int)i, 0);
-		L->down_b = bind(v, "v.blk.%d.ffn_down.bias", (int)i, 1);
+		uint32_t W = v->n_embd, F = v->n_ff;
+
+		L->ln1_w  = bind1(v, "v.blk.%d.ln1.weight", (int)i, 0, W);
+		L->ln1_b  = bind1(v, "v.blk.%d.ln1.bias", (int)i, 1, W);
+		L->q_w    = bind(v, "v.blk.%d.attn_q.weight", (int)i, 0, W, W);
+		L->q_b    = bind1(v, "v.blk.%d.attn_q.bias", (int)i, 1, W);
+		L->k_w    = bind(v, "v.blk.%d.attn_k.weight", (int)i, 0, W, W);
+		L->k_b    = bind1(v, "v.blk.%d.attn_k.bias", (int)i, 1, W);
+		L->v_w    = bind(v, "v.blk.%d.attn_v.weight", (int)i, 0, W, W);
+		L->v_b    = bind1(v, "v.blk.%d.attn_v.bias", (int)i, 1, W);
+		L->o_w    = bind(v, "v.blk.%d.attn_out.weight", (int)i, 0, W, W);
+		L->o_b    = bind1(v, "v.blk.%d.attn_out.bias", (int)i, 1, W);
+		L->ln2_w  = bind1(v, "v.blk.%d.ln2.weight", (int)i, 0, W);
+		L->ln2_b  = bind1(v, "v.blk.%d.ln2.bias", (int)i, 1, W);
+
+		/*
+		 * ⚠ BY SHAPE, NOT BY NAME. In this file ffn_down is the FIRST
+		 * matmul, n_embd -> n_ff, and ffn_up is the second -- the
+		 * opposite of the language model's use of the same two words.
+		 * Binding by name would have contracted fc1 over 3072 where
+		 * the activation is 768 wide. So ask for the shape and let
+		 * whichever name carries it answer.
+		 */
+		if (probe(v, "v.blk.%d.ffn_down.weight", (int)i, W, F)) {
+			L->fc1_w = bind(v, "v.blk.%d.ffn_down.weight", (int)i, 0, W, F);
+			L->fc1_b = bind1(v, "v.blk.%d.ffn_down.bias", (int)i, 1, F);
+			L->fc2_w = bind(v, "v.blk.%d.ffn_up.weight", (int)i, 0, F, W);
+			L->fc2_b = bind1(v, "v.blk.%d.ffn_up.bias", (int)i, 1, W);
+		} else {
+			L->fc1_w = bind(v, "v.blk.%d.ffn_up.weight", (int)i, 0, W, F);
+			L->fc1_b = bind1(v, "v.blk.%d.ffn_up.bias", (int)i, 1, F);
+			L->fc2_w = bind(v, "v.blk.%d.ffn_down.weight", (int)i, 0, F, W);
+			L->fc2_b = bind1(v, "v.blk.%d.ffn_down.bias", (int)i, 1, W);
+		}
 
 		/*
 		 * ⚠ ONE LAYER'S WORTH OF MISSES IS THE WHOLE STORY. Twenty four
@@ -209,10 +349,17 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
 		v->n_patches);
 	fprintf(out, "  width        %u, ffn %u, heads %u, layers %u\n",
 		v->n_embd, v->n_ff, v->n_head, v->n_layer);
-	fprintf(out, "  projection   %s, to %u\n",
-		v->proj == CHARSIU_PROJ_MLP ? "mlp" : "unrecognised",
-		v->proj_dim);
-	fprintf(out, "  norm eps     %g\n", (double)v->eps);
+	if (v->proj == CHARSIU_PROJ_IDEFICS3)
+		fprintf(out, "  projection   idefics3, pixel shuffle by %u so "
+			"%u patches become %u tokens of %u\n",
+			v->scale, v->n_patches, charsiu_vision_tokens(v),
+			charsiu_vision_width(v));
+	else
+		fprintf(out, "  projection   %s, %u tokens of %u\n",
+			v->proj == CHARSIU_PROJ_MLP ? "mlp" : "unrecognised",
+			charsiu_vision_tokens(v), charsiu_vision_width(v));
+	fprintf(out, "  norm eps     %g, gelu %s\n", (double)v->eps,
+		v->use_gelu ? "on" : "off");
 	fprintf(out, "  pixels       mean %.4f %.4f %.4f  std %.4f %.4f %.4f\n",
 		(double)v->mean[0], (double)v->mean[1], (double)v->mean[2],
 		(double)v->std[0], (double)v->std[1], (double)v->std[2]);
@@ -367,11 +514,15 @@ void charsiu_vision_normalise(const struct charsiu_vision *v, float *px)
 
 unsigned charsiu_vision_tokens(const struct charsiu_vision *v)
 {
-	return v->n_patches;
+	unsigned s2 = v->scale ? v->scale * v->scale : 1;
+
+	return s2 > 1 ? v->n_patches / s2 : v->n_patches;
 }
 
 unsigned charsiu_vision_width(const struct charsiu_vision *v)
 {
+	if (v->proj == CHARSIU_PROJ_IDEFICS3)
+		return v->fc_w ? (unsigned)rows_of(v->fc_w) : 0;
 	if (v->mm_w[1])
 		return (unsigned)rows_of(v->mm_w[1]);
 	if (v->mm_w[0])
@@ -379,11 +530,41 @@ unsigned charsiu_vision_width(const struct charsiu_vision *v)
 	return v->n_embd;
 }
 
+/*
+ * idefics3's pixel shuffle: fold a scale x scale block of neighbouring patches
+ * into one embedding scale^2 times as wide, so an image costs the language
+ * model n_patches / scale^2 tokens instead of n_patches.
+ *
+ * ⚠ THE INDEX MAPPING IS THE WHOLE OF IT, and it is two reshapes with a
+ * transpose between them rather than a plain block gather. Written out from
+ * transformers' Idefics3 pixel_shuffle:
+ *
+ *   out[h2][w2][e3] = x[h2*s + e3/(E*s)][w2*s + (e3 % (E*s))/E][e3 % E]
+ *
+ * Get it wrong and every number stays finite and the sentence stays fluent.
+ */
+static void pixel_shuffle(const float *x, float *out, unsigned grid,
+			  unsigned E, unsigned s)
+{
+	unsigned g2 = grid / s, h2, w2, e3;
+
+	for (h2 = 0; h2 < g2; h2++)
+		for (w2 = 0; w2 < g2; w2++)
+			for (e3 = 0; e3 < E * s * s; e3++) {
+				unsigned d = e3 / (E * s), r = e3 % (E * s);
+				unsigned h = h2 * s + d, w = w2 * s + r / E;
+
+				out[((size_t)h2 * g2 + w2) * E * s * s + e3] =
+					x[((size_t)h * grid + w) * E + r % E];
+			}
+}
+
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 {
 	unsigned np = v->n_patches, W = v->n_embd, P = v->patch_size;
 	unsigned pin = 3u * P * P, hd, l, p, i, j, h, e;
-	unsigned nff = v->n_ff, wide = W > nff ? W : nff;
+	unsigned nff = v->n_ff;
+	unsigned wide = W > nff ? W : nff;
 	float *patch = NULL, *x = NULL, *xb = NULL, *q = NULL, *k = NULL;
 	float *val = NULL, *att = NULL, *ff = NULL, *tmp = NULL, *gain = NULL;
 	float *bias = NULL, scale;
@@ -397,6 +578,15 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		return -1;
 	scale = 1.0f / sqrtf((float)hd);
 
+	/*
+	 * ⚠ THE WIDEST CONTRACTION IS THE PROJECTOR, not the feed forward. A
+	 * pixel shuffled fc contracts over n_embd * scale^2 -- 12288 where
+	 * n_ff is 3072 -- and an activation buffer sized for the ffn would be
+	 * overrun by four times.
+	 */
+	if (v->proj == CHARSIU_PROJ_IDEFICS3 && v->scale)
+		wide = wide > W * v->scale * v->scale
+		     ? wide : W * v->scale * v->scale;
 	if (charsiu_act_alloc(&a, (int)(pin > wide ? pin : wide)))
 		return -1;
 	patch = malloc((size_t)np * pin * sizeof(float));
@@ -523,10 +713,11 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			free(g); free(b);
 		}
 
-		rows_mul(L->up_w, row1(L->up_b, bias, nff), xb, np, W, ff, nff,
-			 &a);
-		gelu(ff, np * nff);
-		rows_mul(L->down_w, row1(L->down_b, bias, W), ff, np, nff, q, W,
+		rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb, np, W, ff,
+			 nff, &a);
+		if (v->use_gelu)
+			gelu(ff, np * nff);
+		rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff, np, nff, q, W,
 			 &a);
 		for (i = 0; i < np * W; i++)
 			x[i] += q[i];
@@ -545,7 +736,18 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		free(g); free(b);
 	}
 
-	if (v->mm_w[0]) {
+	if (v->proj == CHARSIU_PROJ_IDEFICS3) {
+		unsigned s2 = v->scale * v->scale;
+		unsigned tok = np / s2, wide2 = W * s2;
+		float *sh = malloc((size_t)tok * wide2 * sizeof(float));
+
+		if (!sh)
+			goto out;
+		pixel_shuffle(x, sh, v->grid, W, v->scale);
+		rows_mul(v->fc_w, row1(v->fc_b, bias, v->proj_dim), sh, tok,
+			 wide2, out, (unsigned)rows_of(v->fc_w), &a);
+		free(sh);
+	} else if (v->mm_w[0]) {
 		unsigned d0 = (unsigned)rows_of(v->mm_w[0]);
 		float *h0 = malloc((size_t)np * d0 * sizeof(float));
 

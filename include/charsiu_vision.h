@@ -24,15 +24,27 @@
 enum charsiu_proj {
 	CHARSIU_PROJ_NONE = 0,
 	CHARSIU_PROJ_MLP,          /* two matmuls with a GELU between them */
+	CHARSIU_PROJ_IDEFICS3,     /* a pixel shuffle, then one fc */
 	CHARSIU_PROJ_UNKNOWN,
 };
 
+/*
+ * ⚠ fc1 AND fc2, NOT up AND down. In a real mmproj the feed forward is named
+ * the other way round from the language model's: v.blk.N.ffn_down is the FIRST
+ * matmul, n_embd -> n_ff, and ffn_up is the second. Reading a real
+ * SmolVLM-256M mmproj is what said so -- ffn_down.weight is (768, 3072) and
+ * ffn_up.weight is (3072, 768).
+ *
+ * So these are bound BY SHAPE, not by name: whichever of the two contracts over
+ * n_embd is fc1. A square feed forward would make the two indistinguishable,
+ * and there is no such thing in a ViT.
+ */
 struct charsiu_vision_layer {
 	const struct gguf_tensor *ln1_w, *ln1_b;
 	const struct gguf_tensor *q_w, *q_b, *k_w, *k_b, *v_w, *v_b;
 	const struct gguf_tensor *o_w, *o_b;
 	const struct gguf_tensor *ln2_w, *ln2_b;
-	const struct gguf_tensor *up_w, *up_b, *down_w, *down_b;
+	const struct gguf_tensor *fc1_w, *fc1_b, *fc2_w, *fc2_b;
 };
 
 /*
@@ -51,13 +63,23 @@ struct charsiu_vision {
 
 	uint32_t image_size, patch_size, n_embd, n_ff, n_head, n_layer;
 	uint32_t proj_dim, grid, n_patches;
+	/*
+	 * ⚠ AN IMAGE IS NOT ONE TOKEN PER PATCH. idefics3 rearranges the patch
+	 * grid by scale_factor before the projector -- 32 x 32 patches at
+	 * scale 4 is 64 embeddings of 768 * 16, not 1024 of 768 -- so the
+	 * number of tokens an image costs the language model is n_patches
+	 * divided by scale_factor squared.
+	 */
+	uint32_t scale;
+	int use_gelu;
 	float eps;
 	float mean[3], std[3];
 	enum charsiu_proj proj;
 
 	const struct gguf_tensor *patch_w, *patch_b, *pos_embd;
 	const struct gguf_tensor *pre_ln_w, *pre_ln_b, *post_ln_w, *post_ln_b;
-	const struct gguf_tensor *mm_w[2], *mm_b[2];
+	const struct gguf_tensor *mm_w[2], *mm_b[2];   /* the mlp projector */
+	const struct gguf_tensor *fc_w, *fc_b;         /* idefics3's single fc */
 	struct charsiu_vision_layer *layer;
 
 	/* what it wanted and did not find, in the order it wanted them */
