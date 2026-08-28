@@ -2797,11 +2797,25 @@ static int batch_ok(const struct llama_model *m)
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0)
 {
-	uint32_t hd = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
-	uint32_t kvdim = m->n_head_kv * hd, nff = m->layers[0].n_ff;
+	/*
+	 * ⚠ hdmax IS THE CACHE'S STRIDE AND L->head_dim IS THE LAYER'S HEAD,
+	 * and they are two different numbers. gemma4's window layers have a 256
+	 * long head and its full ones 512 while the KV cache is one allocation
+	 * with one stride, so indexing the cache by the live head makes layer 4
+	 * read where layer 0 wrote.
+	 *
+	 * This loop used ONE hd for both, which is right for every architecture
+	 * it currently accepts -- per layer heads only come with a sliding
+	 * window and that is still refused -- and would be wrong the day the
+	 * window is written. It is the same shape as the buffer stride that
+	 * just cost a round on qwen3: correct by a coincidence of the models
+	 * being run rather than by construction.
+	 */
+	uint32_t hdmax = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
+	uint32_t kvdim = m->n_head_kv * hdmax, nff = m->layers[0].n_ff;
 	uint32_t gqa = m->n_head / m->n_head_kv;
 	float scale = m->attn_scale != 0.0f ? m->attn_scale
-					    : 1.0f / sqrtf((float)hd);
+					    : 1.0f / sqrtf((float)hdmax);
 
 	if (n < 2 || !batch_ok(m))
 		return -1;
@@ -2813,7 +2827,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bhb = malloc((size_t)n * nff * sizeof(float));
 		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
-		s->bcs = malloc((size_t)hd * sizeof(float));
+		s->bcs = malloc((size_t)hdmax * sizeof(float));
 		/*
 		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
 		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
@@ -2822,7 +2836,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * when the architecture first landed.
 		 */
 		free(s->bq); free(s->bk); free(s->bv); free(s->bao);
-		s->bq = malloc((size_t)n * m->n_head * hd * sizeof(float));
+		s->bq = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
 		s->bk = malloc((size_t)n * kvdim * sizeof(float));
 		s->bv = malloc((size_t)n * kvdim * sizeof(float));
 		/*
@@ -2838,7 +2852,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * the architecture landed. It is written down in this file and
 		 * I did it again in the batched copy of the same loop.
 		 */
-		s->bao = malloc((size_t)n * m->n_head * hd * sizeof(float));
+		s->bao = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
 		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao) {
 			s->bx_n = 0;
@@ -2858,6 +2872,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
+		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
 
 		/*
 		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
@@ -2880,8 +2895,10 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				m->n_embd, m->rms_eps);
 		matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 			    m->n_head * hd);
-		matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd, kvdim);
-		matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd, kvdim);
+		matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
+			    m->n_head_kv * hd);
+		matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
+			    m->n_head_kv * hd);
 
 		for (int r = 0; r < n; r++) {
 			int pos = pos0 + r;
@@ -2889,10 +2906,10 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			rope_table(s->bcs, hd, pos, m->rope_base, NULL);
 			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
 			       (size_t)m->n_head * hd * sizeof(float));
-			memcpy(s->k, s->bk + (size_t)r * kvdim,
-			       kvdim * sizeof(float));
-			memcpy(s->v, s->bv + (size_t)r * kvdim,
-			       kvdim * sizeof(float));
+			memcpy(s->k, s->bk + (size_t)r * m->n_head_kv * hd,
+			       (size_t)m->n_head_kv * hd * sizeof(float));
+			memcpy(s->v, s->bv + (size_t)r * m->n_head_kv * hd,
+			       (size_t)m->n_head_kv * hd * sizeof(float));
 			/*
 			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
 			 * here that is not interchangeable, and it is copied
@@ -2916,9 +2933,10 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			}
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
 			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
+			/* ⚠ the cache is strided by hdmax, written at hd */
 			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
-					      * s->n_ctx + pos) * hd;
+					      * s->n_ctx + pos) * hdmax;
 
 				memcpy(s->kcache + off, s->k + kh * hd,
 				       hd * sizeof(float));
@@ -2926,9 +2944,11 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				       hd * sizeof(float));
 			}
 			{
-				struct attn_job aj = { s, l, pos, 0, hd, hd,
-						       kvdim, gqa,
-						       m->n_head_kv, scale };
+				struct attn_job aj = { s, l, pos, 0, hd,
+						       hdmax,
+						       m->n_head_kv * hdmax,
+						       gqa, m->n_head_kv,
+						       scale };
 
 				attn_heads(&aj, 0, m->n_head);
 			}
