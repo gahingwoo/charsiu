@@ -1,3 +1,5 @@
 build/
 *.o
 models/
+__pycache__/
+*.pyc
