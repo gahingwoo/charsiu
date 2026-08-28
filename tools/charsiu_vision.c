@@ -128,6 +128,7 @@ int main(int argc, char **argv)
 	}
 	if (want_encode)
 		rc = encode(&v, image);
+	charsiu_vision_stages(stderr);
 	charsiu_vision_close(&v);
 	return rc ? 1 : 0;
 }

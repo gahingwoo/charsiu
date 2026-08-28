@@ -120,6 +120,9 @@ void charsiu_vision_close(struct charsiu_vision *v);
 /* NULL when the tower is usable, otherwise a short phrase. */
 const char *charsiu_vision_why_not(const struct charsiu_vision *v);
 
+/* Where the time went, under CHARSIU_STAGES. */
+void charsiu_vision_stages(FILE *out);
+
 /* One line per hparam and per missing tensor, for a person to read. */
 void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out);
 

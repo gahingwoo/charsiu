@@ -11,10 +11,12 @@
  * nothing, the path was skipped in silence, and the model loaded, ran and
  * answered while missing the half of itself its name is about.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <stdarg.h>
 
 #include "charsiu.h"
@@ -451,6 +453,51 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
 		fprintf(out, "    %s\n", v->missing[i]);
 }
 
+/* ---- where the time goes -------------------------------------------------- */
+
+/*
+ * ⚠ THE SAME INSTRUMENT THAT SETTLED WHISPER. Its stage table said the matmuls
+ * were 26% and the attention 63%, after four commits aimed at the matmuls. This
+ * tower has had no such table and the board says it is 15.5 s against a vendor's
+ * 768 ms for the same model, of which 3.1 s is the hardware.
+ */
+enum { V_PATCH, V_QKV, V_ATTN, V_PROJ, V_FFN, V_NORM, V_SHUF, V_N };
+static const char *const vstage_name[V_N] = {
+	"patch gather + embed", "q k v", "attention", "out proj",
+	"feed forward", "layernorms", "pixel shuffle + projector",
+};
+static double vstage_ms[V_N];
+static int vstage_on = -1;
+
+static double vnow(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+#define VSTAGE(i, expr) do { \
+	double _t = vstage_on ? vnow() : 0.0; \
+	expr; \
+	if (vstage_on) vstage_ms[i] += vnow() - _t; \
+} while (0)
+
+void charsiu_vision_stages(FILE *out)
+{
+	double tot = 0.0;
+	int i;
+
+	for (i = 0; i < V_N; i++)
+		tot += vstage_ms[i];
+	if (tot <= 0.0)
+		return;
+	fprintf(out, "charsiu vision: %.1f s accounted for\n", tot / 1e3);
+	for (i = 0; i < V_N; i++)
+		fprintf(out, "  %-26s %8.0f ms  %5.1f%%\n", vstage_name[i],
+			vstage_ms[i], 100.0 * vstage_ms[i] / tot);
+}
+
 /* ---- the forward pass ---------------------------------------------------- */
 
 /*
@@ -814,8 +861,10 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 						   gx * P + i];
 	}
 
-	rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch, np, pin,
-		 x + (size_t)cls * W, W, &a);
+	if (vstage_on < 0)
+		vstage_on = getenv("CHARSIU_STAGES") != NULL;
+	VSTAGE(V_PATCH, rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch,
+				 np, pin, x + (size_t)cls * W, W, &a));
 	if (cls)
 		gguf_row_f32(v->class_embd, 0, x);
 
@@ -846,17 +895,17 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			if (!g || !b) { free(g); free(b); goto out; }
 			row1(L->ln1_w, g, W);
-			for (p = 0; p < nt; p++)
+			VSTAGE(V_NORM, for (p = 0; p < nt; p++)
 				layernorm(xb + (size_t)p * W, x + (size_t)p * W,
 					  L->ln1_w ? g : NULL,
 					  L->ln1_b ? row1(L->ln1_b, b, W) : NULL,
-					  W, v->eps);
+					  W, v->eps));
 			free(g); free(b);
 		}
 
-		rows_mul(L->q_w, row1(L->q_b, bias, W), xb, nt, W, q, W, &a);
-		rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a);
-		rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a);
+		VSTAGE(V_QKV, rows_mul(L->q_w, row1(L->q_b, bias, W), xb, nt, W, q, W, &a));
+		VSTAGE(V_QKV, rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a));
+		VSTAGE(V_QKV, rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a));
 
 		/*
 		 * ⚠ FULL ATTENTION, EVERY PATCH AGAINST EVERY PATCH, and on a
@@ -872,12 +921,12 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			c.q = q; c.k = k; c.v = val; c.o = xb;
 			c.n = nt; c.W = W; c.hd = hd; c.scale = scale;
-			charsiu_parallel_for(vattn_rows, &c,
+			VSTAGE(V_ATTN, charsiu_parallel_for(vattn_rows, &c,
 					     (uint64_t)v->n_head *
-					     ((nt + VATTN_QB - 1) / VATTN_QB));
+					     ((nt + VATTN_QB - 1) / VATTN_QB)));
 		}
 
-		rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a);
+		VSTAGE(V_PROJ, rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a));
 		for (i = 0; i < nt * W; i++)
 			x[i] += q[i];
 
@@ -887,19 +936,19 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			if (!g || !b) { free(g); free(b); goto out; }
 			row1(L->ln2_w, g, W);
-			for (p = 0; p < nt; p++)
+			VSTAGE(V_NORM, for (p = 0; p < nt; p++)
 				layernorm(xb + (size_t)p * W, x + (size_t)p * W,
 					  L->ln2_w ? g : NULL,
 					  L->ln2_b ? row1(L->ln2_b, b, W) : NULL,
-					  W, v->eps);
+					  W, v->eps));
 			free(g); free(b);
 		}
 
-		rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb, nt, W, ff,
-			 nff, &a);
-		gelu(ff, nt * nff, v->use_gelu);
-		rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff, nt, nff, q, W,
-			 &a);
+		VSTAGE(V_FFN, rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb,
+				       nt, W, ff, nff, &a));
+		VSTAGE(V_FFN, gelu(ff, nt * nff, v->use_gelu));
+		VSTAGE(V_FFN, rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff,
+				       nt, nff, q, W, &a));
 		for (i = 0; i < nt * W; i++)
 			x[i] += q[i];
 	}
@@ -935,9 +984,10 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 		if (!sh)
 			goto out;
-		pixel_shuffle(x, sh, v->grid, W, v->scale);
-		rows_mul(v->fc_w, row1(v->fc_b, bias, v->proj_dim), sh, tok,
-			 wide2, out, (unsigned)rows_of(v->fc_w), &a);
+		VSTAGE(V_SHUF, pixel_shuffle(x, sh, v->grid, W, v->scale));
+		VSTAGE(V_SHUF, rows_mul(v->fc_w, row1(v->fc_b, bias,
+				v->proj_dim), sh, tok, wide2, out,
+				(unsigned)rows_of(v->fc_w), &a));
 		free(sh);
 	} else if (v->mm_w[0]) {
 		unsigned d0 = (unsigned)rows_of(v->mm_w[0]);

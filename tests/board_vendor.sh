@@ -34,14 +34,17 @@ for d in /usr/bin /opt/charsiu "$PWD/build"; do
 done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-# name | file | vendor tok/s (w4a16) | vendor TTFT ms | vendor MB | what they call it
+# ⚠ THE PULL NAME IS IN THE ROW, because "not here" without it is a dead end:
+# the zoo's name and the file's name are not the same string and nobody should
+# have to grep charsiu-get to find out which to type.
+#
+# pull name | file | vendor tok/s (w4a16) | vendor TTFT ms | vendor MB | label
 rows() {
 cat <<'ROWS'
-qwen2-0.5b|Qwen2-0.5B-Instruct-Q4_0.gguf|32.56|342.37|443.44|Qwen2 0.5B
-qwen3-0.6b|Qwen3-0.6B-Q4_0.gguf|24.85|468.61|512.71|Qwen3 0.6B
-tinyllama-1.1b|tinyllama-1.1b-chat-v1.0.Q4_0.gguf|19.71|543.68|601.09|TinyLLAMA 1.1B
-phi3-3.8b|Phi-3.5-mini-instruct-Q4_0.gguf|6.58|1829.12|1995.78|Phi3 3.8B
-gemma4-e2b|gemma-4-E2B-it-Q4_0.gguf|9.23|1219.25|1463.42|Gemma4 E2B
+qwen3-0.6b-q4|Qwen3-0.6B-Q4_0.gguf|24.85|468.61|512.71|Qwen3 0.6B
+tinyllama-1.1b-q4|tinyllama-1.1b-chat-v1.0.Q4_0.gguf|19.71|543.68|601.09|TinyLLAMA 1.1B
+phi3.5-mini-q4|Phi-3.5-mini-instruct-Q4_0.gguf|6.58|1829.12|1995.78|Phi3 3.8B
+gemma4-e2b-q4|gemma-4-E2B-it-Q4_0.gguf|9.23|1219.25|1463.42|Gemma4 E2B
 ROWS
 }
 
@@ -78,8 +81,8 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		[ -f "$d/$file" ] && { M="$d/$file"; break; }
 	done
 	if [ -z "$M" ]; then
-		printf '%-16s %10s %10s   %10s %10s   %8s %8s   (not here: charsiu pull)\n' \
-			"$label" "-" "$vt" "-" "$vttft" "-" "$vmb"
+		printf '%-16s %10s %10s   %10s %10s   %8s %8s   charsiu pull %s\n' \
+			"$label" "-" "$vt" "-" "$vttft" "-" "$vmb" "$name"
 		continue
 	fi
 	OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
@@ -109,8 +112,16 @@ if [ -f "$DIR/mmproj.gguf" ] && [ -f "$DIR/smolvlm.gguf" ]; then
 	done
 	if [ -n "$VIS" ]; then
 		t0=$(awk '{printf "%d", $1 * 1000}' /proc/uptime)
-		CHARSIU_NPU=1 "$VIS" "$DIR/mmproj.gguf" --encode >/dev/null 2>&1
+		CHARSIU_NPU=1 CHARSIU_STAGES=1 "$VIS" "$DIR/mmproj.gguf" \
+			--encode >/dev/null 2>"$DIR/.vis2.err"
 		t1=$(awk '{printf "%d", $1 * 1000}' /proc/uptime)
 		echo "  ours     img-encoder 512x512   $((t1 - t0)) ms   (staging included)"
+		echo
+		# ⚠ WHERE, not just how much. 768 ms against ours is a number to
+		# chase and the table is the only thing that says which part of
+		# it to chase.
+		sed -n '/charsiu vision:/,/pixel shuffle/p' "$DIR/.vis2.err" \
+			| sed 's/^/  /'
+		grep -E "NPU pool|ON THE HARDWARE" "$DIR/.vis2.err" | sed 's/^/  /' || true
 	fi
 fi
