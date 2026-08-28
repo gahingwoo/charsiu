@@ -481,6 +481,50 @@ struct llama_model {
  * Everything that changes as tokens are produced. Split from the model so the
  * weights stay read only and a second state is just another allocation.
  */
+/*
+ * WHAT IS ON THE HARDWARE, and how a weight gets there.
+ *
+ * ⚠ THIS USED TO BE FIVE FIELDS INSIDE struct llama_state, which meant the only
+ * graph that could reach the NPU was the language model. The vision tower, CLIP
+ * and whisper are not llama and were therefore all on the CPU -- measured on the
+ * board at 0.6 G-mac/s, three times, by three graphs that never touched the
+ * hardware they were running on.
+ *
+ * ⚠ ONE STAGING PATH, NOT TWO. Everything a tensor needs to reach the NPU --
+ * the requantised copy, the width refusals, CHARSIU_NPU_ONLY, the maxn gate that
+ * kept an output head on the CPU for a fortnight while saying nothing -- lives
+ * here once. A second copy for the towers is how the two drift.
+ */
+struct charsiu_npu_pool {
+	struct npu_tensor *t;
+	const struct gguf_tensor **key;
+	int *id;                  /* >= 0 when the tensor is on the hardware */
+	unsigned n, cap;
+	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */
+};
+
+/*
+ * `max_tensors` slots, and a device opened for weights up to max_k by max_n.
+ * A pool with no device still quantises, which is the CPU path's own fast form.
+ */
+extern double charsiu_pool_stage_ms;
+
+int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,
+		      unsigned max_k, unsigned max_n);
+void charsiu_pool_fini(struct charsiu_npu_pool *p);
+
+/* The staged form of `w`, staging it on first sight. NULL if it will not go. */
+const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
+					  const struct gguf_tensor *w);
+
+/*
+ * Y[m][n] = X[m][k] * w, on the hardware. Returns 0, or -1 when this tensor is
+ * not on the NPU or the batch will not go -- in which case the caller does what
+ * it did before, one row at a time, which is correct and slower.
+ */
+int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
+		      const float *X, unsigned m, float *Y);
+
 struct llama_state {
 	const struct llama_model *m;
 	int n_ctx;
@@ -518,11 +562,7 @@ struct llama_state {
 
 	/* CHARSIU_NPU_QUANT: a second copy of each routed tensor, in the
 	 * format the hardware takes. Built on first use. */
-	struct npu_tensor *npu;
-	const struct gguf_tensor **npu_key;
-	int *npu_id;              /* >= 0 when the tensor is on the hardware */
-	unsigned n_npu, npu_cap;
-	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */
+	struct charsiu_npu_pool pool;
 };
 
 int  llama_load(struct llama_model *m, const char *path);

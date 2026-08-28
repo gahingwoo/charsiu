@@ -21,7 +21,7 @@ CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
 
 SRC    := src/regcmd.c src/device.c src/job.c
 LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
-          src/npudev.c src/device.c src/job.c src/regcmd.c
+          src/npudev.c src/npupool.c src/device.c src/job.c src/regcmd.c
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \

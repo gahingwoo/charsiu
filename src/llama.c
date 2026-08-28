@@ -493,11 +493,11 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
  */
 static double act_ms;
 /* ⚠ NOT stage_ms: that name is the per stage table further down */
-static double npu_stage_ms;
+/* the staging clock lives in npupool.c with the staging */
 
 double llama_stage_ms(void)
 {
-	return npu_stage_ms;
+	return charsiu_pool_stage_ms;
 }
 static int stage_on = -1;
 
@@ -547,13 +547,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	unsigned widest = 0;
 	int rc = -1;
 
-	if (!s->dev) {
+	if (!s->pool.dev) {
 		fprintf(stderr, "charsiu: no NPU staged; nothing to batch\n");
 		return -1;
 	}
-	for (unsigned i = 0; i < s->n_npu; i++)
-		if (s->npu_id[i] >= 0 && s->npu[i].k > widest)
-			widest = (unsigned)s->npu[i].k;
+	for (unsigned i = 0; i < s->pool.n; i++)
+		if (s->pool.id[i] >= 0 && s->pool.t[i].k > widest)
+			widest = (unsigned)s->pool.t[i].k;
 	/*
 	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
 	 * activation inside the timing loop and charged all of it to the one
@@ -593,10 +593,10 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		static const char *AXES[] = { "h", "w" };
 		unsigned i0 = 0;
 
-		while (i0 < s->n_npu && s->npu_id[i0] < 0)
+		while (i0 < s->pool.n && s->pool.id[i0] < 0)
 			i0++;
-		if (i0 < s->n_npu) {
-			const struct npu_tensor *t = &s->npu[i0];
+		if (i0 < s->pool.n) {
+			const struct npu_tensor *t = &s->pool.t[i0];
 			size_t nx = (size_t)2 * t->k, ny = (size_t)2 * t->n;
 
 			X = realloc(X, nx * sizeof(*X));
@@ -618,9 +618,9 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					 * finally produced both batched rows
 					 * scored 0 of 224 against it.
 					 */
-					if (charsiu_npu_needs_q1(s->dev))
+					if (charsiu_npu_needs_q1(s->pool.dev))
 						charsiu_act_q1(&a);
-					charsiu_npu_matvec(s->dev, s->npu_id[i0],
+					charsiu_npu_matvec(s->pool.dev, s->pool.id[i0],
 						&a, Yref + (size_t)r * t->n);
 				}
 				printf("\n  axis and reading, %s at m=2,"
@@ -638,8 +638,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 						setenv("CHARSIU_BATCH_READ",
 						       READS[q], 1);
-						if (charsiu_npu_matmul(s->dev,
-							s->npu_id[i0], X, 2, Y))
+						if (charsiu_npu_matmul(s->pool.dev,
+							s->pool.id[i0], X, 2, Y))
 							continue;
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
 							double w0 = Yref[j];
@@ -677,8 +677,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					snprintf(b, sizeof(b), "%d", STEPS[q]);
 					setenv("CHARSIU_BATCH_ROWSTEP", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -712,8 +712,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					snprintf(b, sizeof(b), "%d", pk);
 					setenv("CHARSIU_BATCH_PACK", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -765,8 +765,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					snprintf(b, sizeof(b), "%u", v);
 					setenv("CHARSIU_DPU_40B8", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -806,8 +806,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						setenv("CHARSIU_W4_301C", "high", 1);
 					else
 						unsetenv("CHARSIU_W4_301C");
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -854,8 +854,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					unsigned same = 0;
 
 					memcpy(X + t->k, X, t->k * sizeof(*X));
-					if (!charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y)) {
+					if (!charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y)) {
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
 							double w = Yref[j];
 
@@ -877,15 +877,15 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				printf("\n    CNA geometry against the int8"
 				       " stream, one word at a time\n");
 				setenv("CHARSIU_BATCH_CNADIFF", "-1", 1);
-				charsiu_npu_matmul(s->dev, s->npu_id[i0], X, 2, Y);
+				charsiu_npu_matmul(s->pool.dev, s->pool.id[i0], X, 2, Y);
 				for (int q = 0; q < 4; q++) {
 					char b[8];
 					unsigned ok0 = 0, ok1 = 0, well = 0;
 
 					snprintf(b, sizeof(b), "%d", q);
 					setenv("CHARSIU_BATCH_CNADIFF", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -909,10 +909,10 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					unsetenv("CHARSIU_BATCH_CNADIFF");
 					charsiu_act_set(&a, X, (int)t->k);
 					charsiu_act_blocks(&a);
-					if (charsiu_npu_needs_q1(s->dev))
+					if (charsiu_npu_needs_q1(s->pool.dev))
 						charsiu_act_q1(&a);
-					if (!charsiu_npu_matvec(s->dev,
-						s->npu_id[i0], &a, Y))
+					if (!charsiu_npu_matvec(s->pool.dev,
+						s->pool.id[i0], &a, Y))
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
 							double w = Yref[j];
 
@@ -943,13 +943,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		{
 			double z;
 
-			charsiu_npu_batch_split(s->dev, &z, &z, &z, &z, 1);
+			charsiu_npu_batch_split(s->pool.dev, &z, &z, &z, &z, 1);
 		}
-		for (unsigned i = 0; i < s->n_npu; i++) {
-			const struct npu_tensor *t = &s->npu[i];
+		for (unsigned i = 0; i < s->pool.n; i++) {
+			const struct npu_tensor *t = &s->pool.t[i];
 			size_t nx, ny;
 
-			if (s->npu_id[i] < 0)
+			if (s->pool.id[i] < 0)
 				continue;
 			nx = (size_t)mr * t->k;
 			ny = (size_t)mr * t->n;
@@ -979,9 +979,9 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					 * finally produced both batched rows
 					 * scored 0 of 224 against it.
 					 */
-					if (charsiu_npu_needs_q1(s->dev))
+					if (charsiu_npu_needs_q1(s->pool.dev))
 						charsiu_act_q1(&a);
-					charsiu_npu_matvec(s->dev, s->npu_id[i],
+					charsiu_npu_matvec(s->pool.dev, s->pool.id[i],
 						&a, Yref + (size_t)r * t->n);
 				}
 				t_one += now_ms() - t0;
@@ -989,7 +989,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			{
 				double t0 = now_ms();
 
-				if (charsiu_npu_matmul(s->dev, s->npu_id[i], X,
+				if (charsiu_npu_matmul(s->pool.dev, s->pool.id[i], X,
 						       mr, Y))
 					continue;
 				t_bat += now_ms() - t0;
@@ -1103,7 +1103,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		{
 			double pk, sb, fn, rd;
 
-			charsiu_npu_batch_split(s->dev, &pk, &sb, &fn, &rd, 1);
+			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms"
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
 			       "   pack %4.0f  submit %3.0f  fence %5.0f"
@@ -1201,12 +1201,6 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
  * the hardware takes, built on first use. A linear lookup over at most 145
  * entries, which is nothing next to the matmul it is about to do.
  */
-static unsigned npu_maxn(void)
-{
-	const char *e = getenv("CHARSIU_NPU_MAXN");
-
-	return e ? (unsigned)atoi(e) : 8192;
-}
 
 static int npu_mode(void)
 {
@@ -1220,82 +1214,15 @@ static int npu_mode(void)
 	return m;
 }
 
+/*
+ * ⚠ THE BODY OF THIS MOVED TO src/npupool.c, so that a graph which is not the
+ * language model can stage a weight the same way. What is left is the shape the
+ * rest of this file calls it in.
+ */
 static const struct npu_tensor *npu_get(struct llama_state *s,
 					const struct gguf_tensor *w)
 {
-	double t_stage;
-
-	for (unsigned i = 0; i < s->n_npu; i++)
-		if (s->npu_key[i] == w)
-			return &s->npu[i];
-
-	if (s->n_npu == s->npu_cap) {
-		static int said;
-
-		if (!said++)
-			fprintf(stderr, "charsiu: %s stays on the CPU -- all %u "
-				"tensor slots are taken\n", w->name, s->npu_cap);
-		return NULL;
-	}
-	/*
-	 * ⚠ w->name IS INSIDE THE MAPPED FILE for a whole tensor and inside
-	 * the layer for one of phi3's slices; both outlive a crash.
-	 */
-	charsiu_note(w->name, (unsigned long)w->ne[1], (unsigned long)w->ne[0]);
-	t_stage = now_ms();
-	/* npu_tensor_build says why on its own way out */
-	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0) {
-		npu_stage_ms += now_ms() - t_stage;
-		return NULL;
-	}
-	/*
-	 * And onto the hardware, if this run asked for it and this tensor is
-	 * one of the ones asked for. CHARSIU_NPU_ONLY narrows it to names
-	 * containing a substring, which is how a disagreement gets bisected to
-	 * one projection instead of a hundred and thirteen.
-	 */
-	s->npu_id[s->n_npu] = -1;
-	if (s->dev) {
-		const char *only = getenv("CHARSIU_NPU_ONLY");
-
-		if ((!only || strstr(w->name, only)) &&
-		    w->ne[1] <= (uint64_t)npu_maxn()) {
-			s->npu_id[s->n_npu] = charsiu_npu_add(s->dev, &s->npu[s->n_npu]);
-		} else if (!only && w->ne[1] > (uint64_t)npu_maxn()) {
-			/*
-			 * ⚠ THE ONE REFUSAL THAT COST THE MOST AND SAID THE
-			 * LEAST. Every other way onto the hardware whines when
-			 * it declines; this one only spoke under
-			 * CHARSIU_NPU_VERBOSE, and it is the gate the output
-			 * head hits -- gemma3's is 262144 rows against a
-			 * default of 8192, and the runner's own default of
-			 * 131072 still refuses it. That head is 44% of the
-			 * token, and the board log for a round that set
-			 * CHARSIU_NPU_MAXN on purpose carried no line saying
-			 * the number had not arrived.
-			 */
-			static int said;
-
-			if (!said++)
-				fprintf(stderr, "charsiu: %s stays on the CPU "
-					"-- %llu rows is over CHARSIU_NPU_MAXN=%u "
-					"(charsiu-config, [npu] maxn)\n",
-					w->name,
-					(unsigned long long)w->ne[1], npu_maxn());
-		}
-		if (getenv("CHARSIU_NPU_VERBOSE"))
-			fprintf(stderr, "  -> %s\n",
-				s->npu_id[s->n_npu] >= 0 ? "on the NPU" : "on the CPU");
-	}
-	if (getenv("CHARSIU_NPU_VERBOSE"))
-		fprintf(stderr, "npu-quant  %-28s  %llu x %llu  rms %.4f%%\n",
-			w->name, (unsigned long long)w->ne[1],
-			(unsigned long long)w->ne[0],
-			s->npu[s->n_npu].rms_rel * 100.0);
-	snprintf(s->npu[s->n_npu].name, sizeof(s->npu[s->n_npu].name), "%s", w->name);
-	s->npu_key[s->n_npu] = w;
-	npu_stage_ms += now_ms() - t_stage;
-	return &s->npu[s->n_npu++];
+	return charsiu_pool_get(&s->pool, w);
 }
 
 /*
@@ -1354,24 +1281,24 @@ static void matvec_pair(struct llama_state *s, const float *x,
 
 	act_set_timed(&s->act, x, (int)wa->ne[0]);
 
-	if (s->dev && !group_off() && npu_mode() && s->act.npu_ok) {
+	if (s->pool.dev && !group_off() && npu_mode() && s->act.npu_ok) {
 		/* int8 takes q1; int4 takes the float and never looks */
-		if (charsiu_npu_needs_q1(s->dev))
+		if (charsiu_npu_needs_q1(s->pool.dev))
 			act_q1_timed(&s->act);
 		for (i = 0; i < n; i++) {
 			nt[i] = npu_get(s, w[i]);
 			ids[i] = -1;
 			if (nt[i])
-				for (unsigned j = 0; j < s->n_npu; j++)
-					if (&s->npu[j] == nt[i]) {
-						ids[i] = s->npu_id[j];
+				for (unsigned j = 0; j < s->pool.n; j++)
+					if (&s->pool.t[j] == nt[i]) {
+						ids[i] = s->pool.id[j];
 						break;
 					}
 			if (ids[i] < 0)
 				break;
 		}
 		if (i == n &&
-		    !charsiu_npu_matvec_group(s->dev, ids, n, &s->act, y))
+		    !charsiu_npu_matvec_group(s->pool.dev, ids, n, &s->act, y))
 			return;
 	}
 
@@ -1393,9 +1320,9 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	if (nt) {
 		int id = -1;
 
-		for (unsigned i = 0; i < s->n_npu; i++)
-			if (&s->npu[i] == nt) {
-				id = s->npu_id[i];
+		for (unsigned i = 0; i < s->pool.n; i++)
+			if (&s->pool.t[i] == nt) {
+				id = s->pool.id[i];
 				break;
 			}
 		/*
@@ -1406,9 +1333,9 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		 * CPU still finishes and still reports which shape stopped
 		 * answering, which is worth more than either a hang or a crash.
 		 */
-		if (id >= 0 && charsiu_npu_needs_q1(s->dev))
+		if (id >= 0 && charsiu_npu_needs_q1(s->pool.dev))
 			act_q1_timed(a);
-		if (id >= 0 && !charsiu_npu_matvec(s->dev, id, a, y)) {
+		if (id >= 0 && !charsiu_npu_matvec(s->pool.dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
 					    npu_out8_mode());
 			return;
@@ -2342,11 +2269,11 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	}
 
 	/* nine per layer plus the output head */
-	s->npu_cap = m->n_layer * 9 + 2;
-	s->npu = calloc(s->npu_cap, sizeof(*s->npu));
-	s->npu_key = calloc(s->npu_cap, sizeof(*s->npu_key));
-	s->npu_id = calloc(s->npu_cap, sizeof(*s->npu_id));
-	if (!s->npu || !s->npu_key || !s->npu_id) {
+	s->pool.cap = m->n_layer * 9 + 2;
+	s->pool.t = calloc(s->pool.cap, sizeof(*s->pool.t));
+	s->pool.key = calloc(s->pool.cap, sizeof(*s->pool.key));
+	s->pool.id = calloc(s->pool.cap, sizeof(*s->pool.id));
+	if (!s->pool.t || !s->pool.key || !s->pool.id) {
 		llama_state_free(s);
 		return NULL;
 	}
@@ -2358,8 +2285,8 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 
 		if (maxn > m->n_vocab)
 			maxn = m->n_vocab;
-		s->dev = charsiu_npu_open(widest, maxn, s->npu_cap);
-		if (!s->dev) {
+		s->pool.dev = charsiu_npu_open(widest, maxn, s->pool.cap);
+		if (!s->pool.dev) {
 			fprintf(stderr, "charsiu: no NPU; staying on the CPU\n");
 		} else {
 			/*
@@ -2400,19 +2327,19 @@ void llama_state_free(struct llama_state *s)
 	free(s->plc);
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
-	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
-		npu_report(s->npu, s->n_npu);
+	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
+		npu_report(s->pool.t, s->pool.n);
 	/*
 	 * The calibration dump: one record a tensor, name then k then the sum
 	 * of |x| over every token the run saw. Written here because this is the
 	 * only place that knows the run has finished.
 	 */
-	if (getenv("CHARSIU_CALIB") && s->npu) {
+	if (getenv("CHARSIU_CALIB") && s->pool.t) {
 		FILE *f = fopen(getenv("CHARSIU_CALIB"), "wb");
 		unsigned wrote = 0, xwrote = 0;
 
-		for (unsigned i = 0; f && i < s->n_npu; i++) {
-			struct npu_tensor *t = &s->npu[i];
+		for (unsigned i = 0; f && i < s->pool.n; i++) {
+			struct npu_tensor *t = &s->pool.t[i];
 
 			if (!t->astat || !t->acalls)
 				continue;
@@ -2467,16 +2394,16 @@ void llama_state_free(struct llama_state *s)
 		}
 	}
 	llama_stages_report();
-	if (s->dev)
-		charsiu_npu_report(s->dev);
-	charsiu_npu_close(s->dev);
-	if (s->npu) {
-		for (unsigned i = 0; i < s->n_npu; i++)
-			npu_tensor_free(&s->npu[i]);
-		free(s->npu);
+	if (s->pool.dev)
+		charsiu_npu_report(s->pool.dev);
+	charsiu_npu_close(s->pool.dev);
+	if (s->pool.t) {
+		for (unsigned i = 0; i < s->pool.n; i++)
+			npu_tensor_free(&s->pool.t[i]);
+		free(s->pool.t);
 	}
-	free(s->npu_key);
-	free(s->npu_id);
+	free(s->pool.key);
+	free(s->pool.id);
 	free(s);
 }
 
@@ -2751,14 +2678,14 @@ static int npu_id_for(struct llama_state *s, const struct gguf_tensor *w)
 {
 	const struct npu_tensor *nt;
 
-	if (!npu_mode() || !s->dev || w->type == GGML_F32 || w->type == GGML_F16)
+	if (!npu_mode() || !s->pool.dev || w->type == GGML_F32 || w->type == GGML_F16)
 		return -1;
 	nt = npu_get(s, w);
 	if (!nt)
 		return -1;
-	for (unsigned i = 0; i < s->n_npu; i++)
-		if (&s->npu[i] == nt)
-			return s->npu_id[i];
+	for (unsigned i = 0; i < s->pool.n; i++)
+		if (&s->pool.t[i] == nt)
+			return s->pool.id[i];
 	return -1;
 }
 
@@ -2768,7 +2695,7 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 {
 	int id = npu_id_for(s, w);
 
-	if (id >= 0 && !charsiu_npu_matmul(s->dev, id, X, (unsigned)n, Y))
+	if (id >= 0 && !charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y))
 		return 0;
 	/*
 	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
