@@ -2353,6 +2353,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bx); free(s->bxb); free(s->bxo);
 	free(s->bhb); free(s->bhb2); free(s->bcs);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
+	free(s->bfreq);
 
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
@@ -2774,8 +2775,6 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  */
 const char *llama_batch_why_not(const struct llama_model *m)
 {
-	if (m->n_swa)
-		return "sliding window attention";
 	if (m->v_norm)
 		return "a value norm";
 	if (m->n_embd_pl)
@@ -2808,8 +2807,15 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 *
 	 * What is still refused is what would be a different computation:
 	 * fused K and V needs a tensor split, shared KV needs another layer's
-	 * cache, a varying feed forward width needs per layer buffers, and
-	 * sliding window attention needs a mask this loop does not build.
+	 * cache, and a varying feed forward width needs per layer buffers.
+	 *
+	 * ⚠ THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
+	 * and Gemma4 took 23.6 s and 17.6 s to a first token against
+	 * Rockchip's 1.8 and 1.2. It is not a mask this loop had to learn: the
+	 * attention already takes t0, the oldest position a layer may look at,
+	 * because the token loop has passed it since gemma3 landed. What was
+	 * missing was passing it, and choosing the window layers' own rope
+	 * table and head.
 	 */
 	return NULL;
 }
@@ -2839,6 +2845,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	uint32_t hdmax = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
 	uint32_t kvdim = m->n_head_kv * hdmax, nff = m->layers[0].n_ff;
 	uint32_t gqa = m->n_head / m->n_head_kv;
+	const float *freqf = NULL;
 	float scale = m->attn_scale != 0.0f ? m->attn_scale
 					    : 1.0f / sqrtf((float)hdmax);
 
@@ -2887,6 +2894,27 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		s->bx_n = n;
 	}
 
+	/*
+	 * ⚠⚠ THE ROPE FREQUENCY FACTORS, WHICH THIS LOOP HAS NEVER READ. The
+	 * token loop pulls m->rope_freqs into a buffer and hands it to
+	 * rope_table; the batched copy passed NULL from the day it was written.
+	 * Every model that carries that tensor -- Phi-3.5-mini's longrope is
+	 * the one that showed it -- has been prefilled with a rotation that is
+	 * not the one its decode uses.
+	 *
+	 * It went unnoticed because none of the models the batched path was
+	 * checked against has the tensor: llama 3.2, qwen2, qwen3, SmolVLM. The
+	 * control was right and the models were not varied enough.
+	 */
+	if (m->rope_freqs) {
+		if (!s->bfreq)
+			s->bfreq = calloc(hdmax, sizeof(float));
+		if (s->bfreq) {
+			gguf_row_f32(m->rope_freqs, 0, s->bfreq);
+			freqf = s->bfreq;
+		}
+	}
+
 	for (int r = 0; r < n; r++) {
 		float *xr = s->bx + (size_t)r * m->n_embd;
 
@@ -2899,6 +2927,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
+		int swa = L->swa;
 
 		/*
 		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
@@ -2929,7 +2958,17 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		for (int r = 0; r < n; r++) {
 			int pos = pos0 + r;
 
-			rope_table(s->bcs, hd, pos, m->rope_base, NULL);
+			/*
+			 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
+			 * HEAD. gemma3's window layers turn at 10000 and its
+			 * full ones at the model's own 1000000, and the file
+			 * carries no key saying so. Handing a window layer the
+			 * full layers' factors scales a frequency table it was
+			 * never built for.
+			 */
+			rope_table(s->bcs, hd, pos,
+				   swa ? m->rope_base_swa : m->rope_base,
+				   freqf);
 			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
 			       (size_t)m->n_head * hd * sizeof(float));
 			memcpy(s->k, s->bk + (size_t)r * m->n_head_kv * hd,
@@ -2970,7 +3009,21 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				       hd * sizeof(float));
 			}
 			{
-				struct attn_job aj = { s, l, pos, 0, hd,
+				/*
+				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
+				 * READ, and the batched loop passed 0 for every
+				 * layer -- which is a full attention wearing a
+				 * window layer's weights. The token loop's own
+				 * comment says this one cost four board rounds
+				 * when it was first got wrong.
+				 *
+				 * A window layer sees the last n_swa positions
+				 * INCLUDING this one, so the bound is
+				 * pos + 1 - n_swa.
+				 */
+				int tlo = swa && pos + 1 > (int)m->n_swa
+					? pos + 1 - (int)m->n_swa : 0;
+				struct attn_job aj = { s, l, pos, tlo, hd,
 						       hdmax,
 						       m->n_head_kv * hdmax,
 						       gqa, m->n_head_kv,

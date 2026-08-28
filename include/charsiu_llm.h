@@ -626,6 +626,7 @@ struct llama_state {
 	 * same number; a buffer sized by n_embd truncates every row.
 	 */
 	float *bq, *bk, *bv, *bao;
+	float *bfreq;          /* m->rope_freqs, read once a prompt */
 	/*
 	 * ⚠ MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
 	 * read each weight row once for all m. It is four times SLOWER than n
