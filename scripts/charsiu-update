@@ -63,7 +63,7 @@ fi
 # mapping in its bootstrap, and the two drifting apart means `charsiu update`
 # and a fresh install land on different code while both say the same word.
 case "$CHANNEL" in
-dev)    REF=${CHARSIU_DEV_REF:-main} ;;
+dev)    REF=${CHARSIU_DEV_REF:-dev} ;;
 stable) REF=stable ;;
 *)      echo "charsiu update: no channel called $CHANNEL. Try stable or dev." >&2
 	exit 1 ;;

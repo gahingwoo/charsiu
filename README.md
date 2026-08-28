@@ -82,7 +82,7 @@ checks still run, which is the point: it is what the installer *sees* on your ma
 **stable** is what the line above installs: the runtime, and nothing else.
 
 **dev** adds the hardware probes -- `npu_gemm_test`, `charsiu_matmul`,
-`bench_batch`, `prefill_control.sh` -- and tracks `main`, where the work happens.
+`bench_batch`, `prefill_control.sh` -- and tracks `dev`, where the work happens.
 They exist to ask the silicon questions, and asking has wedged the block, timed out
 and printed the opposite of its own data on the way to the answers. They are not
 something to install on a board you want to rely on.
