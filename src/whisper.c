@@ -567,23 +567,81 @@ static void fft_rec(const float *in, int n, float *out, float *scratch)
 	}
 }
 
+struct melctx {
+	const struct charsiu_whisper *w;
+	const float *pcm;
+	size_t n;
+	float *out;
+	const float *hann;
+	int bins, nmel;
+};
+
+/*
+ * One frame each. The scratch is per range: the transform needs a window, a
+ * spectrum and its recursion's workspace, and allocating those per frame would
+ * be three thousand mallocs.
+ */
+static void mel_frames(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct melctx *c = ctx;
+	const int nfft = WHISPER_N_FFT, hop = WHISPER_HOP;
+	float *frame = malloc((size_t)nfft * sizeof(float));
+	float *spec = calloc((size_t)nfft * 2 * 12, sizeof(float));
+	float *scratch = calloc((size_t)nfft * 12, sizeof(float));
+	float *power = malloc((size_t)c->bins * sizeof(float));
+	uint64_t f;
+	int i, m;
+
+	if (!frame || !spec || !scratch || !power)
+		goto out;
+	for (f = r0; f < r0 + nr; f++) {
+		int start = (int)f * hop - nfft / 2;
+
+		for (i = 0; i < nfft; i++) {
+			long sp = start + i;
+
+			if (c->n == 0 || (sp >= 0 && (size_t)sp >= c->n)) {
+				frame[i] = 0.0f;
+				continue;
+			}
+			if (sp < 0)
+				sp = -sp;
+			frame[i] = (size_t)sp >= c->n ? 0.0f
+						      : c->pcm[sp] * c->hann[i];
+		}
+		fft_rec(frame, nfft, spec, scratch);
+		for (i = 0; i < c->bins; i++)
+			power[i] = spec[2 * i] * spec[2 * i] +
+				   spec[2 * i + 1] * spec[2 * i + 1];
+		for (m = 0; m < c->nmel; m++) {
+			const float *filt = c->w->mel_filters +
+					    (size_t)m * c->bins;
+			double sum = 0.0;
+
+			for (i = 0; i < c->bins; i++)
+				sum += (double)filt[i] * power[i];
+			if (sum < 1e-10)
+				sum = 1e-10;
+			c->out[(size_t)m * WHISPER_N_FRAMES + f] =
+				(float)log10(sum);
+		}
+	}
+out:
+	free(frame); free(spec); free(scratch); free(power);
+}
+
 int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 			size_t n, float *out)
 {
-	const int nfft = WHISPER_N_FFT, hop = WHISPER_HOP;
+	const int nfft = WHISPER_N_FFT;
 	const int bins = w->n_fft_bins, nmel = w->n_mel_filt;
-	float *hann = NULL, *frame = NULL, *spec = NULL, *scratch = NULL;
-	float *power = NULL;
+	float *hann = NULL;
 	double mx = -1e30, t_mel = 0.0;
-	int f, i, m, rc = -1;
+	int i, rc = -1;
 
-	hann    = malloc((size_t)nfft * sizeof(float));
-	frame   = malloc((size_t)nfft * sizeof(float));
-	/* the recursion writes its children past the parent's own 2n floats */
-	spec    = calloc((size_t)nfft * 2 * 12, sizeof(float));
-	scratch = calloc((size_t)nfft * 12, sizeof(float));
-	power   = malloc((size_t)bins * sizeof(float));
-	if (!hann || !frame || !spec || !scratch || !power)
+	/* ⚠ the per frame scratch lives in the worker: see mel_frames */
+	hann = malloc((size_t)nfft * sizeof(float));
+	if (!hann)
 		goto out;
 
 	/*
@@ -599,56 +657,33 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 	if (wstage_on < 0)
 		wstage_on = getenv("CHARSIU_STAGES") != NULL;
 	t_mel = wnow();
-	for (f = 0; f < WHISPER_N_FRAMES; f++) {
-		/*
-		 * ⚠⚠ REFLECTED AT THE FRONT AND ZEROS AT THE BACK, WHICH IS NOT
-		 * SYMMETRIC. Frame f is centred on sample f * hop, so the first
-		 * frames read backwards off the start of the clip and whisper
-		 * mirrors them about sample 0. Past the END of the audio it
-		 * pads with SILENCE -- thirty seconds of it -- because the
-		 * model is always fed a thirty second window whatever it was
-		 * given.
-		 *
-		 * Reflecting at both ends instead, which is what
-		 * torch.stft(center=True) and numpy's pad(mode="reflect") do,
-		 * fills the empty part of the window with a repeat of the clip.
-		 * That is not silence, it is the same speech again, and the
-		 * transcript comes back with it in.
-		 */
-		int start = f * hop - nfft / 2;
+	/*
+	 * ⚠ 3000 FRAMES, EACH ONE INDEPENDENT, AND IT WAS SERIAL. On the board
+	 * this was 1625 ms of a 9.4 s transcription -- second only to the
+	 * attention -- and every frame is its own window, its own transform and
+	 * its own eighty dot products against the filterbank. Nothing is shared
+	 * but the filters and the window, both read only.
+	 *
+	 * ⚠ THE MAXIMUM IS NOT REDUCED HERE. It is over the whole spectrogram
+	 * and the clamp below already walks every value, so taking it there
+	 * costs one pass over 240000 floats and saves a reduction that would
+	 * have to be right.
+	 */
+	{
+		struct melctx c;
 
-		for (i = 0; i < nfft; i++) {
-			long s = start + i;
-
-			if (n == 0 || (s >= 0 && (size_t)s >= n)) {
-				frame[i] = 0.0f;
-				continue;
-			}
-			if (s < 0)
-				s = -s;
-			if ((size_t)s >= n)
-				frame[i] = 0.0f;
-			else
-				frame[i] = pcm[s] * hann[i];
-		}
-		fft_rec(frame, nfft, spec, scratch);
-		for (i = 0; i < bins; i++)
-			power[i] = spec[2 * i] * spec[2 * i] +
-				   spec[2 * i + 1] * spec[2 * i + 1];
-		for (m = 0; m < nmel; m++) {
-			const float *filt = w->mel_filters + (size_t)m * bins;
-			double sum = 0.0;
-
-			for (i = 0; i < bins; i++)
-				sum += (double)filt[i] * power[i];
-			if (sum < 1e-10)
-				sum = 1e-10;
-			sum = log10(sum);
-			if (sum > mx)
-				mx = sum;
-			out[(size_t)m * WHISPER_N_FRAMES + f] = (float)sum;
-		}
+		c.w = w;
+		c.pcm = pcm;
+		c.n = n;
+		c.out = out;
+		c.hann = hann;
+		c.bins = bins;
+		c.nmel = nmel;
+		charsiu_parallel_for(mel_frames, &c, WHISPER_N_FRAMES);
 	}
+	for (i = 0; i < nmel * WHISPER_N_FRAMES; i++)
+		if (out[i] > mx)
+			mx = out[i];
 
 	/*
 	 * ⚠ THE CLAMP IS OVER THE WHOLE CLIP, not the frame. Eight decades below
@@ -667,7 +702,7 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 	if (wstage_on)
 		wstage_ms[W_MEL] += wnow() - t_mel;
 out:
-	free(hann); free(frame); free(spec); free(scratch); free(power);
+	free(hann);
 	return rc;
 }
 
