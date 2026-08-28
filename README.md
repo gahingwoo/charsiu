@@ -65,6 +65,11 @@ Every stage is diffed against numpy on the real weights: the spectrogram at 1.7e
 the encoder at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the
 same argmax.
 
+⚠ On the board it takes **34.5 s for 11 s of audio**, and a picture takes **153 s**,
+because **none of the three new modalities touches the NPU yet** -- they call
+`gguf_matvec` directly and only the language model's projections are routed. Three
+independent graphs measure the same 0.6 G-mac/s, which is the scalar CPU path.
+
 **And it matches pictures to words.** CLIP's two towers land in one space:
 
 ```
