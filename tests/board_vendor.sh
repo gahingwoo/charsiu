@@ -85,17 +85,34 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 			"$label" "-" "$vt" "-" "$vttft" "-" "$vmb" "$name"
 		continue
 	fi
+	# ⚠ STDERR IS KEPT. The refusal that decides whether the batched prefill
+	# does anything at all -- "int4 computes one row" -- is on it, and a
+	# comparison that throws it away cannot tell a batched run from a run
+	# that fell back to exactly what it was being compared against.
+	# ⚠⚠ A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
+	# plus OUT=$(cmd) means one model that will not load takes every model
+	# after it with it -- three rounds of this table printed exactly one row
+	# and nobody, me included, asked where the other four went. A row that
+	# fails is a row, and it says so.
 	OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 	      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 	      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-	      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 2>/dev/null \
-	      | grep '^\[load')
+	      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \
+	      2>"$DIR/.v.err" | grep '^\[load') || OUT=""
+	if [ -z "$OUT" ]; then
+		printf '%-16s %10s %10s   %10s %10s   %8s %8s   THE RUN FAILED\n' \
+			"$label" "-" "$vt" "-" "$vttft" "-" "$vmb"
+		tail -3 "$DIR/.v.err" | sed 's/^/     /'
+		continue
+	fi
 	NP=$(echo "$OUT" | sed 's/.*| *prompt \([0-9]*\) tok.*/\1/')
 	TT=$(echo "$OUT" | sed 's/.*prompt [0-9]* tok in \([0-9]*\) ms.*/\1/')
 	TS=$(echo "$OUT" | sed 's/.*| *gen [0-9]* tok in [0-9]* ms, \([0-9.]*\) tok.*/\1/')
 	MB=$(echo "$OUT" | sed 's/.*peak \([0-9]*\) MB.*/\1/')
 	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)\n' \
 		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP"
+	grep -E "prompt batched|prompt a token|int4 computes one row|NPU pool" \
+		"$DIR/.v.err" | sed 's/^/     /' | sort -u || true
 done
 
 echo
