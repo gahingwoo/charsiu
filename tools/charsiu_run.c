@@ -104,6 +104,21 @@ static double board_temp_c(void)
 	return hottest;
 }
 
+/*
+ * ⚠ THERE ARE THREE EXITS AND THE FIRST ONE IN THE FILE IS THE PROBE'S. The
+ * vision tower's close landed there -- a branch an ordinary run never takes --
+ * so the tower was never closed, its pool never freed, and the one line saying
+ * how much of the picture reached the hardware never printed. Three board
+ * rounds went by looking for that line.
+ */
+static void vision_done(struct charsiu_vision *v, int have, float *embd)
+{
+	if (!have)
+		return;
+	charsiu_vision_close(v);
+	free(embd);
+}
+
 int main(int argc, char **argv)
 {
 	const char *path = NULL, *prompt = NULL, *promptfile = NULL;
@@ -677,11 +692,8 @@ int main(int argc, char **argv)
 	 */
 	if (batch_probe) {
 		llama_batch_probe(st, &m, batch_probe);
-		if (have_vision) {
-		charsiu_vision_close(&vis);
-		free(img_embd);
-	}
-	llama_state_free(st);
+		vision_done(&vis, have_vision, img_embd);
+		llama_state_free(st);
 		llama_free(&m);
 		return 0;
 	}
@@ -1019,6 +1031,7 @@ next:
 		fflush(stdout);
 	}
 
+	vision_done(&vis, have_vision, img_embd);
 	llama_state_free(st);
 	llama_free(&m);
 	free(text);

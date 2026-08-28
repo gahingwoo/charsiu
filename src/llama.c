@@ -480,6 +480,22 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 }
 
 /*
+ * ⚠ THE POOL IS STARTED BY llama_state_new AND NOTHING ELSE STARTED IT. A
+ * whisper transcription or a vision tower has no llama_state, so every
+ * charsiu_parallel_for in those graphs ran on one core -- silently, because
+ * pool_run's single thread path is a plain call and looks like success.
+ */
+void charsiu_threads_start(int nthreads)
+{
+	pool_start(nthreads);
+}
+
+int charsiu_threads(void)
+{
+	return g_pool.n ? g_pool.n : 1;
+}
+
+/*
  * ⚠ NOT A STAGE, A SLICE THROUGH THEM. charsiu_act_set runs at the top of
  * every matvec, inside whichever row the stage table is counting, so it is
  * accumulated separately and printed as a note rather than a row.
@@ -493,11 +509,11 @@ void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
  */
 static double act_ms;
 /* ⚠ NOT stage_ms: that name is the per stage table further down */
-static double npu_stage_ms;
+/* the staging clock lives in npupool.c with the staging */
 
 double llama_stage_ms(void)
 {
-	return npu_stage_ms;
+	return charsiu_pool_stage_ms;
 }
 static int stage_on = -1;
 
@@ -547,13 +563,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	unsigned widest = 0;
 	int rc = -1;
 
-	if (!s->dev) {
+	if (!s->pool.dev) {
 		fprintf(stderr, "charsiu: no NPU staged; nothing to batch\n");
 		return -1;
 	}
-	for (unsigned i = 0; i < s->n_npu; i++)
-		if (s->npu_id[i] >= 0 && s->npu[i].k > widest)
-			widest = (unsigned)s->npu[i].k;
+	for (unsigned i = 0; i < s->pool.n; i++)
+		if (s->pool.id[i] >= 0 && s->pool.t[i].k > widest)
+			widest = (unsigned)s->pool.t[i].k;
 	/*
 	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
 	 * activation inside the timing loop and charged all of it to the one
@@ -593,10 +609,10 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		static const char *AXES[] = { "h", "w" };
 		unsigned i0 = 0;
 
-		while (i0 < s->n_npu && s->npu_id[i0] < 0)
+		while (i0 < s->pool.n && s->pool.id[i0] < 0)
 			i0++;
-		if (i0 < s->n_npu) {
-			const struct npu_tensor *t = &s->npu[i0];
+		if (i0 < s->pool.n) {
+			const struct npu_tensor *t = &s->pool.t[i0];
 			size_t nx = (size_t)2 * t->k, ny = (size_t)2 * t->n;
 
 			X = realloc(X, nx * sizeof(*X));
@@ -618,9 +634,9 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					 * finally produced both batched rows
 					 * scored 0 of 224 against it.
 					 */
-					if (charsiu_npu_needs_q1(s->dev))
+					if (charsiu_npu_needs_q1(s->pool.dev))
 						charsiu_act_q1(&a);
-					charsiu_npu_matvec(s->dev, s->npu_id[i0],
+					charsiu_npu_matvec(s->pool.dev, s->pool.id[i0],
 						&a, Yref + (size_t)r * t->n);
 				}
 				printf("\n  axis and reading, %s at m=2,"
@@ -638,8 +654,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 						setenv("CHARSIU_BATCH_READ",
 						       READS[q], 1);
-						if (charsiu_npu_matmul(s->dev,
-							s->npu_id[i0], X, 2, Y))
+						if (charsiu_npu_matmul(s->pool.dev,
+							s->pool.id[i0], X, 2, Y))
 							continue;
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
 							double w0 = Yref[j];
@@ -677,8 +693,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					snprintf(b, sizeof(b), "%d", STEPS[q]);
 					setenv("CHARSIU_BATCH_ROWSTEP", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -712,8 +728,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					snprintf(b, sizeof(b), "%d", pk);
 					setenv("CHARSIU_BATCH_PACK", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -765,8 +781,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					snprintf(b, sizeof(b), "%u", v);
 					setenv("CHARSIU_DPU_40B8", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -806,8 +822,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						setenv("CHARSIU_W4_301C", "high", 1);
 					else
 						unsetenv("CHARSIU_W4_301C");
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -854,8 +870,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					unsigned same = 0;
 
 					memcpy(X + t->k, X, t->k * sizeof(*X));
-					if (!charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y)) {
+					if (!charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y)) {
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
 							double w = Yref[j];
 
@@ -877,15 +893,15 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				printf("\n    CNA geometry against the int8"
 				       " stream, one word at a time\n");
 				setenv("CHARSIU_BATCH_CNADIFF", "-1", 1);
-				charsiu_npu_matmul(s->dev, s->npu_id[i0], X, 2, Y);
+				charsiu_npu_matmul(s->pool.dev, s->pool.id[i0], X, 2, Y);
 				for (int q = 0; q < 4; q++) {
 					char b[8];
 					unsigned ok0 = 0, ok1 = 0, well = 0;
 
 					snprintf(b, sizeof(b), "%d", q);
 					setenv("CHARSIU_BATCH_CNADIFF", b, 1);
-					if (charsiu_npu_matmul(s->dev,
-						s->npu_id[i0], X, 2, Y))
+					if (charsiu_npu_matmul(s->pool.dev,
+						s->pool.id[i0], X, 2, Y))
 						continue;
 					for (unsigned j = 0; j < (unsigned)t->n; j++) {
 						double w0 = Yref[j];
@@ -909,10 +925,10 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					unsetenv("CHARSIU_BATCH_CNADIFF");
 					charsiu_act_set(&a, X, (int)t->k);
 					charsiu_act_blocks(&a);
-					if (charsiu_npu_needs_q1(s->dev))
+					if (charsiu_npu_needs_q1(s->pool.dev))
 						charsiu_act_q1(&a);
-					if (!charsiu_npu_matvec(s->dev,
-						s->npu_id[i0], &a, Y))
+					if (!charsiu_npu_matvec(s->pool.dev,
+						s->pool.id[i0], &a, Y))
 						for (unsigned j = 0; j < (unsigned)t->n; j++) {
 							double w = Yref[j];
 
@@ -943,13 +959,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		{
 			double z;
 
-			charsiu_npu_batch_split(s->dev, &z, &z, &z, &z, 1);
+			charsiu_npu_batch_split(s->pool.dev, &z, &z, &z, &z, 1);
 		}
-		for (unsigned i = 0; i < s->n_npu; i++) {
-			const struct npu_tensor *t = &s->npu[i];
+		for (unsigned i = 0; i < s->pool.n; i++) {
+			const struct npu_tensor *t = &s->pool.t[i];
 			size_t nx, ny;
 
-			if (s->npu_id[i] < 0)
+			if (s->pool.id[i] < 0)
 				continue;
 			nx = (size_t)mr * t->k;
 			ny = (size_t)mr * t->n;
@@ -979,9 +995,9 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					 * finally produced both batched rows
 					 * scored 0 of 224 against it.
 					 */
-					if (charsiu_npu_needs_q1(s->dev))
+					if (charsiu_npu_needs_q1(s->pool.dev))
 						charsiu_act_q1(&a);
-					charsiu_npu_matvec(s->dev, s->npu_id[i],
+					charsiu_npu_matvec(s->pool.dev, s->pool.id[i],
 						&a, Yref + (size_t)r * t->n);
 				}
 				t_one += now_ms() - t0;
@@ -989,7 +1005,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			{
 				double t0 = now_ms();
 
-				if (charsiu_npu_matmul(s->dev, s->npu_id[i], X,
+				if (charsiu_npu_matmul(s->pool.dev, s->pool.id[i], X,
 						       mr, Y))
 					continue;
 				t_bat += now_ms() - t0;
@@ -1103,7 +1119,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		{
 			double pk, sb, fn, rd;
 
-			charsiu_npu_batch_split(s->dev, &pk, &sb, &fn, &rd, 1);
+			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms"
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
 			       "   pack %4.0f  submit %3.0f  fence %5.0f"
@@ -1201,12 +1217,6 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
  * the hardware takes, built on first use. A linear lookup over at most 145
  * entries, which is nothing next to the matmul it is about to do.
  */
-static unsigned npu_maxn(void)
-{
-	const char *e = getenv("CHARSIU_NPU_MAXN");
-
-	return e ? (unsigned)atoi(e) : 8192;
-}
 
 static int npu_mode(void)
 {
@@ -1220,82 +1230,15 @@ static int npu_mode(void)
 	return m;
 }
 
+/*
+ * ⚠ THE BODY OF THIS MOVED TO src/npupool.c, so that a graph which is not the
+ * language model can stage a weight the same way. What is left is the shape the
+ * rest of this file calls it in.
+ */
 static const struct npu_tensor *npu_get(struct llama_state *s,
 					const struct gguf_tensor *w)
 {
-	double t_stage;
-
-	for (unsigned i = 0; i < s->n_npu; i++)
-		if (s->npu_key[i] == w)
-			return &s->npu[i];
-
-	if (s->n_npu == s->npu_cap) {
-		static int said;
-
-		if (!said++)
-			fprintf(stderr, "charsiu: %s stays on the CPU -- all %u "
-				"tensor slots are taken\n", w->name, s->npu_cap);
-		return NULL;
-	}
-	/*
-	 * ⚠ w->name IS INSIDE THE MAPPED FILE for a whole tensor and inside
-	 * the layer for one of phi3's slices; both outlive a crash.
-	 */
-	charsiu_note(w->name, (unsigned long)w->ne[1], (unsigned long)w->ne[0]);
-	t_stage = now_ms();
-	/* npu_tensor_build says why on its own way out */
-	if (npu_tensor_build(&s->npu[s->n_npu], w) < 0) {
-		npu_stage_ms += now_ms() - t_stage;
-		return NULL;
-	}
-	/*
-	 * And onto the hardware, if this run asked for it and this tensor is
-	 * one of the ones asked for. CHARSIU_NPU_ONLY narrows it to names
-	 * containing a substring, which is how a disagreement gets bisected to
-	 * one projection instead of a hundred and thirteen.
-	 */
-	s->npu_id[s->n_npu] = -1;
-	if (s->dev) {
-		const char *only = getenv("CHARSIU_NPU_ONLY");
-
-		if ((!only || strstr(w->name, only)) &&
-		    w->ne[1] <= (uint64_t)npu_maxn()) {
-			s->npu_id[s->n_npu] = charsiu_npu_add(s->dev, &s->npu[s->n_npu]);
-		} else if (!only && w->ne[1] > (uint64_t)npu_maxn()) {
-			/*
-			 * ⚠ THE ONE REFUSAL THAT COST THE MOST AND SAID THE
-			 * LEAST. Every other way onto the hardware whines when
-			 * it declines; this one only spoke under
-			 * CHARSIU_NPU_VERBOSE, and it is the gate the output
-			 * head hits -- gemma3's is 262144 rows against a
-			 * default of 8192, and the runner's own default of
-			 * 131072 still refuses it. That head is 44% of the
-			 * token, and the board log for a round that set
-			 * CHARSIU_NPU_MAXN on purpose carried no line saying
-			 * the number had not arrived.
-			 */
-			static int said;
-
-			if (!said++)
-				fprintf(stderr, "charsiu: %s stays on the CPU "
-					"-- %llu rows is over CHARSIU_NPU_MAXN=%u "
-					"(charsiu-config, [npu] maxn)\n",
-					w->name,
-					(unsigned long long)w->ne[1], npu_maxn());
-		}
-		if (getenv("CHARSIU_NPU_VERBOSE"))
-			fprintf(stderr, "  -> %s\n",
-				s->npu_id[s->n_npu] >= 0 ? "on the NPU" : "on the CPU");
-	}
-	if (getenv("CHARSIU_NPU_VERBOSE"))
-		fprintf(stderr, "npu-quant  %-28s  %llu x %llu  rms %.4f%%\n",
-			w->name, (unsigned long long)w->ne[1],
-			(unsigned long long)w->ne[0],
-			s->npu[s->n_npu].rms_rel * 100.0);
-	snprintf(s->npu[s->n_npu].name, sizeof(s->npu[s->n_npu].name), "%s", w->name);
-	s->npu_key[s->n_npu] = w;
-	npu_stage_ms += now_ms() - t_stage;
-	return &s->npu[s->n_npu++];
+	return charsiu_pool_get(&s->pool, w);
 }
 
 /*
@@ -1354,24 +1297,24 @@ static void matvec_pair(struct llama_state *s, const float *x,
 
 	act_set_timed(&s->act, x, (int)wa->ne[0]);
 
-	if (s->dev && !group_off() && npu_mode() && s->act.npu_ok) {
+	if (s->pool.dev && !group_off() && npu_mode() && s->act.npu_ok) {
 		/* int8 takes q1; int4 takes the float and never looks */
-		if (charsiu_npu_needs_q1(s->dev))
+		if (charsiu_npu_needs_q1(s->pool.dev))
 			act_q1_timed(&s->act);
 		for (i = 0; i < n; i++) {
 			nt[i] = npu_get(s, w[i]);
 			ids[i] = -1;
 			if (nt[i])
-				for (unsigned j = 0; j < s->n_npu; j++)
-					if (&s->npu[j] == nt[i]) {
-						ids[i] = s->npu_id[j];
+				for (unsigned j = 0; j < s->pool.n; j++)
+					if (&s->pool.t[j] == nt[i]) {
+						ids[i] = s->pool.id[j];
 						break;
 					}
 			if (ids[i] < 0)
 				break;
 		}
 		if (i == n &&
-		    !charsiu_npu_matvec_group(s->dev, ids, n, &s->act, y))
+		    !charsiu_npu_matvec_group(s->pool.dev, ids, n, &s->act, y))
 			return;
 	}
 
@@ -1393,9 +1336,9 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	if (nt) {
 		int id = -1;
 
-		for (unsigned i = 0; i < s->n_npu; i++)
-			if (&s->npu[i] == nt) {
-				id = s->npu_id[i];
+		for (unsigned i = 0; i < s->pool.n; i++)
+			if (&s->pool.t[i] == nt) {
+				id = s->pool.id[i];
 				break;
 			}
 		/*
@@ -1406,9 +1349,9 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		 * CPU still finishes and still reports which shape stopped
 		 * answering, which is worth more than either a hang or a crash.
 		 */
-		if (id >= 0 && charsiu_npu_needs_q1(s->dev))
+		if (id >= 0 && charsiu_npu_needs_q1(s->pool.dev))
 			act_q1_timed(a);
-		if (id >= 0 && !charsiu_npu_matvec(s->dev, id, a, y)) {
+		if (id >= 0 && !charsiu_npu_matvec(s->pool.dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
 					    npu_out8_mode());
 			return;
@@ -2342,11 +2285,12 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	}
 
 	/* nine per layer plus the output head */
-	s->npu_cap = m->n_layer * 9 + 2;
-	s->npu = calloc(s->npu_cap, sizeof(*s->npu));
-	s->npu_key = calloc(s->npu_cap, sizeof(*s->npu_key));
-	s->npu_id = calloc(s->npu_cap, sizeof(*s->npu_id));
-	if (!s->npu || !s->npu_key || !s->npu_id) {
+	s->pool.cap = m->n_layer * 9 + 2;
+	s->pool.t = calloc(s->pool.cap, sizeof(*s->pool.t));
+	s->pool.key = calloc(s->pool.cap, sizeof(*s->pool.key));
+	s->pool.src = calloc(s->pool.cap, sizeof(*s->pool.src));
+	s->pool.id = calloc(s->pool.cap, sizeof(*s->pool.id));
+	if (!s->pool.t || !s->pool.key || !s->pool.src || !s->pool.id) {
 		llama_state_free(s);
 		return NULL;
 	}
@@ -2358,8 +2302,8 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 
 		if (maxn > m->n_vocab)
 			maxn = m->n_vocab;
-		s->dev = charsiu_npu_open(widest, maxn, s->npu_cap);
-		if (!s->dev) {
+		s->pool.dev = charsiu_npu_open(widest, maxn, s->pool.cap);
+		if (!s->pool.dev) {
 			fprintf(stderr, "charsiu: no NPU; staying on the CPU\n");
 		} else {
 			/*
@@ -2398,21 +2342,34 @@ void llama_state_free(struct llama_state *s)
 	free(s->pl);
 	free(s->plb);
 	free(s->plc);
+	/*
+	 * ⚠ THE BATCHED PREFILL'S ROWS WERE NEVER FREED. They are allocated
+	 * lazily on the first prompt that takes that path and nothing here ever
+	 * mentioned them -- six buffers, and at a 32 row chunk of a wide feed
+	 * forward that is megabytes a state. It never showed because a run
+	 * makes one state and then exits, which is the kind of leak that waits
+	 * for the server.
+	 */
+	free(s->bx); free(s->bxb); free(s->bxo);
+	free(s->bhb); free(s->bhb2); free(s->bcs);
+	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
+	free(s->bfreq);
+
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
-	if (s->npu && s->n_npu && getenv("CHARSIU_NPU_REPORT"))
-		npu_report(s->npu, s->n_npu);
+	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
+		npu_report(s->pool.t, s->pool.n);
 	/*
 	 * The calibration dump: one record a tensor, name then k then the sum
 	 * of |x| over every token the run saw. Written here because this is the
 	 * only place that knows the run has finished.
 	 */
-	if (getenv("CHARSIU_CALIB") && s->npu) {
+	if (getenv("CHARSIU_CALIB") && s->pool.t) {
 		FILE *f = fopen(getenv("CHARSIU_CALIB"), "wb");
 		unsigned wrote = 0, xwrote = 0;
 
-		for (unsigned i = 0; f && i < s->n_npu; i++) {
-			struct npu_tensor *t = &s->npu[i];
+		for (unsigned i = 0; f && i < s->pool.n; i++) {
+			struct npu_tensor *t = &s->pool.t[i];
 
 			if (!t->astat || !t->acalls)
 				continue;
@@ -2467,16 +2424,17 @@ void llama_state_free(struct llama_state *s)
 		}
 	}
 	llama_stages_report();
-	if (s->dev)
-		charsiu_npu_report(s->dev);
-	charsiu_npu_close(s->dev);
-	if (s->npu) {
-		for (unsigned i = 0; i < s->n_npu; i++)
-			npu_tensor_free(&s->npu[i]);
-		free(s->npu);
+	if (s->pool.dev)
+		charsiu_npu_report(s->pool.dev);
+	charsiu_npu_close(s->pool.dev);
+	if (s->pool.t) {
+		for (unsigned i = 0; i < s->pool.n; i++)
+			npu_tensor_free(&s->pool.t[i]);
+		free(s->pool.t);
 	}
-	free(s->npu_key);
-	free(s->npu_id);
+	free(s->pool.key);
+	free(s->pool.src);
+	free(s->pool.id);
 	free(s);
 }
 
@@ -2751,30 +2709,84 @@ static int npu_id_for(struct llama_state *s, const struct gguf_tensor *w)
 {
 	const struct npu_tensor *nt;
 
-	if (!npu_mode() || !s->dev || w->type == GGML_F32 || w->type == GGML_F16)
+	if (!npu_mode() || !s->pool.dev || w->type == GGML_F32 || w->type == GGML_F16)
 		return -1;
 	nt = npu_get(s, w);
 	if (!nt)
 		return -1;
-	for (unsigned i = 0; i < s->n_npu; i++)
-		if (&s->npu[i] == nt)
-			return s->npu_id[i];
+	for (unsigned i = 0; i < s->pool.n; i++)
+		if (&s->pool.t[i] == nt)
+			return s->pool.id[i];
 	return -1;
 }
 
 /* n rows through one set of weights, or the same thing a row at a time */
+/* whether the hardware would take a batch of this tensor, without trying one */
+static int will_batch(struct llama_state *s, const struct gguf_tensor *w)
+{
+	return npu_id_for(s, w) >= 0 && charsiu_npu_batches(s->pool.dev);
+}
+
+/*
+ * ⚠ OFF BY DEFAULT, and the default is the one the board preferred. See the
+ * long note at the call site: fewer fences lost to more weight refetches.
+ */
+static int prefill_grouped(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_PREFILL_GROUPED") != NULL;
+	return v;
+}
+
+/*
+ * Returns 1 when the hardware took the whole batch and 0 when this fell back to
+ * a row at a time.
+ *
+ * ⚠ THE CALLER NEEDS TO KNOW. q, k and v all multiply one RMSNorm output, and
+ * matvec_pair sends the three of them in ONE submit -- round 321 measured the
+ * fence at 94% of the hardware path and that grouping took 113 fences a token
+ * down to 65. Calling matmul_rows three times instead turns n grouped submits
+ * into 3n separate ones the moment the batch is refused, which on int4 is
+ * always. I did that to this loop two commits ago.
+ */
 static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
 {
 	int id = npu_id_for(s, w);
 
-	if (id >= 0 && !charsiu_npu_matmul(s->dev, id, X, (unsigned)n, Y))
-		return 0;
+	if (id >= 0 && !charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y))
+		return 1;
 	/*
 	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
-	 * above can only ever be checked on the board. matvec is the same call
-	 * llama_forward makes, so a run with no hardware at all compares the
-	 * two layer loops and nothing else.
+	 * above can only ever be checked on the board.
+	 *
+	 * ⚠⚠ BUT NOT ONE ROW AT A TIME. This fell back to n calls to matvec,
+	 * which reads every weight row n times -- and the board's own numbers
+	 * say what that costs: with CHARSIU_NPU_W4V=1, which is the default and
+	 * what Rockchip's table compares against, charsiu_npu_matmul REFUSES
+	 * every batch because w4a16 makes one row, so this fallback IS the
+	 * prefill. Qwen3 0.6B prefilled at 46 ms a token against a decode of
+	 * 63: a token loop with the output head skipped, which is exactly what
+	 * the numbers looked like.
+	 *
+	 * ⚠⚠ AND gguf_matmul IS NOT THE ANSWER, MEASURED. It reads each weight
+	 * row once for all m rows, which is the right idea and the wrong
+	 * function: matvec here is LLAMA'S matvec, not gguf_matvec. It uses the
+	 * requantised NPU copy when npu_mode is on and the activation's own q1
+	 * form, and gguf_matmul knows about neither -- with the activations
+	 * unquantised it falls into the scalar float path and dequantises the
+	 * weight per row anyway.
+	 *
+	 *   tinyllama   4880 ms against 1203        FOUR TIMES SLOWER
+	 *   qwen2.5     1723 ms against  775
+	 *   qwen3       2141 ms against  940, and the text CHANGED
+	 *
+	 * Two of the four also stopped matching the token loop, which is what
+	 * "a different function" looks like from outside. Batching this path
+	 * properly means teaching llama's own matvec to take m rows, not
+	 * routing around it.
 	 */
 	for (int r = 0; r < n; r++)
 		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
@@ -2793,14 +2805,10 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  */
 const char *llama_batch_why_not(const struct llama_model *m)
 {
-	if (m->n_swa)
-		return "sliding window attention";
 	if (m->v_norm)
 		return "a value norm";
 	if (m->n_embd_pl)
 		return "per layer embeddings";
-	if (m->final_softcap > 0.0f)
-		return "a final softcap";
 	if (kv_posmajor())
 		return "a position major KV cache";
 	for (uint32_t l = 0; l < m->n_layer; l++) {
@@ -2808,19 +2816,37 @@ const char *llama_batch_why_not(const struct llama_model *m)
 
 		if (!L->wk || !L->wv)
 			return "fused or absent K and V projections";
-		if (L->bq)
-			return "a query bias";
-		if (L->q_norm)
-			return "a query norm";
 		if (L->kv_from >= 0)
 			return "KV shared between layers";
-		if (L->attn_post_norm)
-			return "a post attention norm";
-		if (L->ffn_post_norm)
-			return "a post feed forward norm";
 		if (L->n_ff != m->layers[0].n_ff)
 			return "a feed forward width that varies by layer";
 	}
+	/*
+	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
+	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
+	 * board; charsiu took 7354, because a query norm sent the whole prompt
+	 * through the token loop. Of the five models in their table that this
+	 * tree can run, FOUR were refused -- biases, a query norm, a fused K
+	 * and V, per layer embeddings -- and only TinyLLAMA batched.
+	 *
+	 * The four removed are the ones that are the SAME PER ROW OPERATION the
+	 * token loop already does, applied in the same order: a bias, a query
+	 * and key norm, the two post norms, and the logit softcap. Refusing
+	 * them was right while they were unwritten and became the dominant cost
+	 * the moment there was a scoreboard.
+	 *
+	 * What is still refused is what would be a different computation:
+	 * fused K and V needs a tensor split, shared KV needs another layer's
+	 * cache, and a varying feed forward width needs per layer buffers.
+	 *
+	 * ⚠ THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
+	 * and Gemma4 took 23.6 s and 17.6 s to a first token against
+	 * Rockchip's 1.8 and 1.2. It is not a mask this loop had to learn: the
+	 * attention already takes t0, the oldest position a layer may look at,
+	 * because the token loop has passed it since gemma3 landed. What was
+	 * missing was passing it, and choosing the window layers' own rope
+	 * table and head.
+	 */
 	return NULL;
 }
 
@@ -2832,11 +2858,26 @@ static int batch_ok(const struct llama_model *m)
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0)
 {
-	uint32_t hd = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
-	uint32_t kvdim = m->n_head_kv * hd, nff = m->layers[0].n_ff;
+	/*
+	 * ⚠ hdmax IS THE CACHE'S STRIDE AND L->head_dim IS THE LAYER'S HEAD,
+	 * and they are two different numbers. gemma4's window layers have a 256
+	 * long head and its full ones 512 while the KV cache is one allocation
+	 * with one stride, so indexing the cache by the live head makes layer 4
+	 * read where layer 0 wrote.
+	 *
+	 * This loop used ONE hd for both, which is right for every architecture
+	 * it currently accepts -- per layer heads only come with a sliding
+	 * window and that is still refused -- and would be wrong the day the
+	 * window is written. It is the same shape as the buffer stride that
+	 * just cost a round on qwen3: correct by a coincidence of the models
+	 * being run rather than by construction.
+	 */
+	uint32_t hdmax = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
+	uint32_t kvdim = m->n_head_kv * hdmax, nff = m->layers[0].n_ff;
 	uint32_t gqa = m->n_head / m->n_head_kv;
+	const float *freqf = NULL;
 	float scale = m->attn_scale != 0.0f ? m->attn_scale
-					    : 1.0f / sqrtf((float)hd);
+					    : 1.0f / sqrtf((float)hdmax);
 
 	if (n < 2 || !batch_ok(m))
 		return -1;
@@ -2848,13 +2889,60 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bhb = malloc((size_t)n * nff * sizeof(float));
 		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
-		s->bcs = malloc((size_t)hd * sizeof(float));
+		s->bcs = malloc((size_t)hdmax * sizeof(float));
+		/*
+		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
+		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
+		 * buffer sized by n_embd is half of what the projection
+		 * writes -- the same trap qwen3's attn_output buffer fell into
+		 * when the architecture first landed.
+		 */
+		free(s->bq); free(s->bk); free(s->bv); free(s->bao);
+		s->bq = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
+		s->bk = malloc((size_t)n * kvdim * sizeof(float));
+		s->bv = malloc((size_t)n * kvdim * sizeof(float));
+		/*
+		 * ⚠⚠ AND THE ATTENTION'S OUTPUT IS n_head * head_dim WIDE TOO,
+		 * WHICH IS THE SAME TRAP A SECOND TIME. Qwen3 0.6B is 16 heads
+		 * of 128 against an embedding of 1024, so attention produces
+		 * 2048 floats and hands them to wo, which contracts over 2048.
+		 * Keeping them in a buffer whose rows are n_embd apart
+		 * truncates every row and overlaps the next -- and the model
+		 * still answered, in fluent English, about the wrong thing.
+		 *
+		 * The first time this was qwen3's own attn_output buffer when
+		 * the architecture landed. It is written down in this file and
+		 * I did it again in the batched copy of the same loop.
+		 */
+		s->bao = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
+
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
-		    !s->bcs) {
+		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao) {
 			s->bx_n = 0;
 			return -1;
 		}
 		s->bx_n = n;
+	}
+
+	/*
+	 * ⚠⚠ THE ROPE FREQUENCY FACTORS, WHICH THIS LOOP HAS NEVER READ. The
+	 * token loop pulls m->rope_freqs into a buffer and hands it to
+	 * rope_table; the batched copy passed NULL from the day it was written.
+	 * Every model that carries that tensor -- Phi-3.5-mini's longrope is
+	 * the one that showed it -- has been prefilled with a rotation that is
+	 * not the one its decode uses.
+	 *
+	 * It went unnoticed because none of the models the batched path was
+	 * checked against has the tensor: llama 3.2, qwen2, qwen3, SmolVLM. The
+	 * control was right and the models were not varied enough.
+	 */
+	if (m->rope_freqs) {
+		if (!s->bfreq)
+			s->bfreq = calloc(hdmax, sizeof(float));
+		if (s->bfreq) {
+			gguf_row_f32(m->rope_freqs, 0, s->bfreq);
+			freqf = s->bfreq;
+		}
 	}
 
 	for (int r = 0; r < n; r++) {
@@ -2868,20 +2956,130 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
+		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
+		int swa = L->swa;
+
+		/*
+		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
+		 * gate, up and down were batched here, which is three of the
+		 * seven matmuls a layer does -- and the board showed what that
+		 * left on the table: Qwen3 0.6B prefilled at 50 ms a token
+		 * against a decode of 65, a 23% saving on work that is four
+		 * fifths batchable.
+		 *
+		 * q, k, v and o are ordinary weight matmuls over n rows and
+		 * batch exactly like the feed forward. What CANNOT batch is
+		 * what sits between them: rope needs the position, the cache
+		 * has to be written in order, and a row's attention reads the
+		 * cache rows before it. So the loop below is the same as it
+		 * was with the projections lifted out of it.
+		 */
+		for (int r = 0; r < n; r++)
+			rmsnorm(s->bxb + (size_t)r * m->n_embd,
+				s->bx + (size_t)r * m->n_embd, L->attn_norm,
+				m->n_embd, m->rms_eps);
+		/*
+		 * ⚠⚠ TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
+		 *
+		 * Three calls to matmul_rows do all n rows of q, then all n of
+		 * k, then all n of v -- the same weight, n submits in a row.
+		 * matvec_pair instead does q, k and v for ONE row in one
+		 * submit, which is fewer fences and a different weight every
+		 * time. Round 321 measured the fence at 94% of the hardware
+		 * path, so grouping should win, and on the board it LOST:
+		 *
+		 *   tensor major   38608 submits   TTFT 5239 ms
+		 *   grouped        35528 submits   TTFT 6302 ms
+		 *
+		 * Eight percent fewer submits and twenty percent slower. The
+		 * only reading that fits is that consecutive submits of the
+		 * SAME weight do not pay for it twice, and grouping threw that
+		 * away to save a fence.
+		 *
+		 * ⚠ It is a reading of two runs on a warming board, so it is a
+		 * switch rather than a deletion: CHARSIU_PREFILL_GROUPED=1
+		 * restores the grouping and the two can be compared in one
+		 * session.
+		 *
+		 * ⚠ AND THIS IS WHAT THE VENDOR DOES TOO. Their own w4a16
+		 * RK3576 model -- the model in the row this is measured
+		 * against -- has 9296 four bit weight matmuls and NOT ONE of
+		 * them is above M = 1. Every batched op in it is fp16 and is
+		 * the attention. Batching an int4 weight matmul is not the
+		 * mechanism behind their 469 ms.
+		 */
+		/*
+		 * ⚠ ASKED, NOT TRIED. A first version wrote this as
+		 * `!grouped() || matmul_rows(wq)`, and the short circuit meant
+		 * that in the tensor major case matmul_rows was never called
+		 * for wq at all -- q was simply not computed, and all three
+		 * models came back DIFFERENT. The control caught it in one run.
+		 */
+		if (!prefill_grouped() || will_batch(s, L->wq)) {
+			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
+				    m->n_head * hd);
+			matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
+				    m->n_head_kv * hd);
+			matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
+				    m->n_head_kv * hd);
+		} else {
+			for (int r = 0; r < n; r++)
+				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
+					    L->wq, s->bq + (size_t)r *
+						   m->n_head * hd,
+					    L->wk, s->bk + (size_t)r *
+						   m->n_head_kv * hd,
+					    L->wv, s->bv + (size_t)r *
+						   m->n_head_kv * hd);
+		}
 
 		for (int r = 0; r < n; r++) {
-			float *xr = s->bx + (size_t)r * m->n_embd;
 			int pos = pos0 + r;
 
-			rope_table(s->bcs, hd, pos, m->rope_base, NULL);
-			rmsnorm(s->xb, xr, L->attn_norm, m->n_embd, m->rms_eps);
-			matvec_pair(s, s->xb, L->wq, s->q, L->wk, s->k,
-				    L->wv, s->v);
+			/*
+			 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
+			 * HEAD. gemma3's window layers turn at 10000 and its
+			 * full ones at the model's own 1000000, and the file
+			 * carries no key saying so. Handing a window layer the
+			 * full layers' factors scales a frequency table it was
+			 * never built for.
+			 */
+			rope_table(s->bcs, hd, pos,
+				   swa ? m->rope_base_swa : m->rope_base,
+				   freqf);
+			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
+			       (size_t)m->n_head * hd * sizeof(float));
+			memcpy(s->k, s->bk + (size_t)r * m->n_head_kv * hd,
+			       (size_t)m->n_head_kv * hd * sizeof(float));
+			memcpy(s->v, s->bv + (size_t)r * m->n_head_kv * hd,
+			       (size_t)m->n_head_kv * hd * sizeof(float));
+			/*
+			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
+			 * here that is not interchangeable, and it is copied
+			 * from the token loop rather than reasoned about
+			 * again. Rope mixes element 2i with 2i+1, so norming
+			 * after it divides a rotated pair by a sum of squares
+			 * the rotation already changed; and rotating a biased
+			 * vector is not biasing a rotated one.
+			 */
+			if (L->bq) {
+				add_bias(s->q, L->bq, m->n_head * hd);
+				add_bias(s->k, L->bk, m->n_head_kv * hd);
+				add_bias(s->v, L->bv, m->n_head_kv * hd);
+			}
+			if (L->q_norm) {
+				qk_norm(s->q, m->n_head, hd, L->q_norm,
+					m->rms_eps);
+				if (L->wk)
+					qk_norm(s->k, m->n_head_kv, hd,
+						L->k_norm, m->rms_eps);
+			}
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
 			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
+			/* ⚠ the cache is strided by hdmax, written at hd */
 			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
-					      * s->n_ctx + pos) * hd;
+					      * s->n_ctx + pos) * hdmax;
 
 				memcpy(s->kcache + off, s->k + kh * hd,
 				       hd * sizeof(float));
@@ -2889,21 +3087,64 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				       hd * sizeof(float));
 			}
 			{
-				struct attn_job aj = { s, l, pos, 0, hd, hd,
-						       kvdim, gqa,
-						       m->n_head_kv, scale };
+				/*
+				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
+				 * READ, and the batched loop passed 0 for every
+				 * layer -- which is a full attention wearing a
+				 * window layer's weights. The token loop's own
+				 * comment says this one cost four board rounds
+				 * when it was first got wrong.
+				 *
+				 * A window layer sees the last n_swa positions
+				 * INCLUDING this one, so the bound is
+				 * pos + 1 - n_swa.
+				 */
+				int tlo = swa && pos + 1 > (int)m->n_swa
+					? pos + 1 - (int)m->n_swa : 0;
+				struct attn_job aj = { s, l, pos, tlo, hd,
+						       hdmax,
+						       m->n_head_kv * hdmax,
+						       gqa, m->n_head_kv,
+						       scale };
 
 				attn_heads(&aj, 0, m->n_head);
 			}
-			matvec(s, L->wo, s->xb, s->xb2);
+			/* the attention's own output, kept for one batched
+			 * o projection over every row */
+			memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
+			       (size_t)m->n_head * hd * sizeof(float));
+		}
+
+		matmul_rows(s, L->wo, s->bao, n, s->bxo, m->n_head * hd,
+			    m->n_embd);
+		for (int r = 0; r < n; r++) {
+			float *xr = s->bx + (size_t)r * m->n_embd;
+			float *o = s->bxo + (size_t)r * m->n_embd;
+
+			/* ⚠ on the branch, before the residual add: after it
+			 * would normalise the residual stream too. */
+			if (L->attn_post_norm)
+				rmsnorm(o, o, L->attn_post_norm, m->n_embd,
+					m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
-				xr[i] += s->xb2[i];
+				xr[i] += o[i];
 			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
 				m->n_embd, m->rms_eps);
 		}
 
-		matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd, nff);
-		matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd, nff);
+		/* gate and up read one norm as well: the same choice */
+		if (!prefill_grouped() || will_batch(s, L->gate)) {
+			matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd,
+				    nff);
+			matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd,
+				    nff);
+		} else {
+			for (int r = 0; r < n; r++)
+				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
+					    L->gate, s->bhb + (size_t)r * nff,
+					    L->up, s->bhb2 + (size_t)r * nff,
+					    NULL, NULL);
+		}
 		for (int r = 0; r < n; r++) {
 			if (m->ffn_gelu)
 				gelu_mul(s->bhb + (size_t)r * nff,
@@ -2915,8 +3156,11 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
 		for (int r = 0; r < n; r++) {
 			float *xr = s->bx + (size_t)r * m->n_embd;
-			const float *o = s->bxo + (size_t)r * m->n_embd;
+			float *o = s->bxo + (size_t)r * m->n_embd;
 
+			if (L->ffn_post_norm)
+				rmsnorm(o, o, L->ffn_post_norm, m->n_embd,
+					m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
 		}
@@ -2925,6 +3169,10 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
+	if (m->final_softcap > 0.0f)
+		for (uint32_t i = 0; i < m->n_vocab; i++)
+			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
+				       m->final_softcap;
 	s->pos = pos0 + n;
 	return 0;
 }

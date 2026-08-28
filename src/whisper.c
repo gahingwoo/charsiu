@@ -3,6 +3,7 @@
 /*
  * Reading whisper.cpp's container, and the mel spectrogram in front of it.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,9 +17,57 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 
+#include "charsiu.h"
 #include "charsiu_llm.h"
 #include "charsiu_whisper.h"
+
+/* ---- where the time goes -------------------------------------------------- */
+
+/*
+ * ⚠ STAGES, BECAUSE THE ONLY THING MEASURED SO FAR WAS THE MATMUL. The pool
+ * counter said the encoder's twenty four matmuls took 936 ms of a thirty second
+ * transcription, which settles what the routing bought and says nothing about
+ * the other twenty nine seconds. Guessing where they are is what produced a 17x
+ * that had to be withdrawn.
+ */
+enum { W_MEL, W_CONV, W_QKV, W_ATTN, W_PROJ, W_FFN, W_NORM, W_DEC, W_N };
+static const char *const wstage_name[W_N] = {
+	"mel spectrogram", "the two convolutions", "q k v", "attention",
+	"out proj", "feed forward", "layernorms", "the decoder",
+};
+static double wstage_ms[W_N];
+static int wstage_on = -1;
+
+static double wnow(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+#define WSTAGE(i, expr) do { \
+	double _t = wstage_on ? wnow() : 0.0; \
+	expr; \
+	if (wstage_on) wstage_ms[i] += wnow() - _t; \
+} while (0)
+
+void charsiu_whisper_stages(FILE *out)
+{
+	double tot = 0.0;
+	int i;
+
+	for (i = 0; i < W_N; i++)
+		tot += wstage_ms[i];
+	if (tot <= 0.0)
+		return;
+	fprintf(out, "charsiu whisper: %.1f s accounted for\n", tot / 1e3);
+	for (i = 0; i < W_N; i++)
+		fprintf(out, "  %-22s %8.0f ms  %5.1f%%\n", wstage_name[i],
+			wstage_ms[i], 100.0 * wstage_ms[i] / tot);
+}
 
 static void miss(struct charsiu_whisper *w, const char *fmt, ...)
 {
@@ -323,6 +372,54 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 	if (misaligned)
 		snprintf(w->why, sizeof(w->why),
 			 "%zu tensors were copied to align them", misaligned);
+
+	/*
+	 * ⚠ int8, AND SIZED FOR THE ENCODER. n_audio_state by 4 * n_audio_state
+	 * covers every 2D weight in it; the decoder's tied output head is 51864
+	 * rows and is m = 1 anyway, so leaving it out of max_n costs nothing
+	 * and keeps the device small.
+	 */
+	/* ⚠ nothing else starts it outside the language model */
+	charsiu_threads_start(0);
+
+	if (getenv("CHARSIU_NPU") && !w->n_missing) {
+		unsigned A = (unsigned)w->n_audio_state;
+		unsigned nt = (unsigned)(w->n_audio_layer + w->n_text_layer);
+
+		if (!charsiu_pool_init(&w->pool, nt * 12 + 8, 4 * A, 4 * A, 0))
+			w->npu = w->pool.dev != NULL;
+		if (w->npu) {
+			/*
+			 * ⚠ THE ENCODER'S WEIGHTS, ALL OF THEM, NOW. Same
+			 * reason as the vision tower: the board spent 19 s of
+			 * a 30 s transcription inside the quantiser. The
+			 * decoder is not here -- it runs one row at a time and
+			 * never reaches the hardware.
+			 */
+			const struct gguf_tensor *list[64 * 6];
+			unsigned nl = 0;
+			int li;
+			char cbuf[512];
+			const char *cache = charsiu_cache_path(path, cbuf,
+							       sizeof(cbuf));
+			char stamp[64];
+
+			snprintf(stamp, sizeof(stamp), "%d:%d:%d",
+				 w->n_audio_state, w->n_audio_layer,
+				 w->n_vocab);
+			for (li = 0; li < w->n_audio_layer &&
+			     nl + 6 < (unsigned)(sizeof(list) / sizeof(*list));
+			     li++) {
+				struct whisper_block *B = &w->enc[li];
+
+				list[nl++] = B->q_w; list[nl++] = B->k_w;
+				list[nl++] = B->v_w; list[nl++] = B->o_w;
+				list[nl++] = B->fc1_w; list[nl++] = B->fc2_w;
+			}
+			charsiu_pool_stage_all(&w->pool, list, nl, cache,
+					       stamp);
+		}
+	}
 	if (w->n_missing) {
 		snprintf(w->why, sizeof(w->why),
 			 "%u of the model's tensors are not in this file under "
@@ -337,6 +434,10 @@ void charsiu_whisper_close(struct charsiu_whisper *w)
 {
 	int32_t i;
 	size_t k;
+
+	if (w->npu && charsiu_diag())
+		charsiu_pool_report(&w->pool, stderr);
+	charsiu_pool_fini(&w->pool);
 
 	for (i = 0; i < w->n_vocab && w->vocab; i++)
 		free(w->vocab[i]);
@@ -466,23 +567,81 @@ static void fft_rec(const float *in, int n, float *out, float *scratch)
 	}
 }
 
+struct melctx {
+	const struct charsiu_whisper *w;
+	const float *pcm;
+	size_t n;
+	float *out;
+	const float *hann;
+	int bins, nmel;
+};
+
+/*
+ * One frame each. The scratch is per range: the transform needs a window, a
+ * spectrum and its recursion's workspace, and allocating those per frame would
+ * be three thousand mallocs.
+ */
+static void mel_frames(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct melctx *c = ctx;
+	const int nfft = WHISPER_N_FFT, hop = WHISPER_HOP;
+	float *frame = malloc((size_t)nfft * sizeof(float));
+	float *spec = calloc((size_t)nfft * 2 * 12, sizeof(float));
+	float *scratch = calloc((size_t)nfft * 12, sizeof(float));
+	float *power = malloc((size_t)c->bins * sizeof(float));
+	uint64_t f;
+	int i, m;
+
+	if (!frame || !spec || !scratch || !power)
+		goto out;
+	for (f = r0; f < r0 + nr; f++) {
+		int start = (int)f * hop - nfft / 2;
+
+		for (i = 0; i < nfft; i++) {
+			long sp = start + i;
+
+			if (c->n == 0 || (sp >= 0 && (size_t)sp >= c->n)) {
+				frame[i] = 0.0f;
+				continue;
+			}
+			if (sp < 0)
+				sp = -sp;
+			frame[i] = (size_t)sp >= c->n ? 0.0f
+						      : c->pcm[sp] * c->hann[i];
+		}
+		fft_rec(frame, nfft, spec, scratch);
+		for (i = 0; i < c->bins; i++)
+			power[i] = spec[2 * i] * spec[2 * i] +
+				   spec[2 * i + 1] * spec[2 * i + 1];
+		for (m = 0; m < c->nmel; m++) {
+			const float *filt = c->w->mel_filters +
+					    (size_t)m * c->bins;
+			double sum = 0.0;
+
+			for (i = 0; i < c->bins; i++)
+				sum += (double)filt[i] * power[i];
+			if (sum < 1e-10)
+				sum = 1e-10;
+			c->out[(size_t)m * WHISPER_N_FRAMES + f] =
+				(float)log10(sum);
+		}
+	}
+out:
+	free(frame); free(spec); free(scratch); free(power);
+}
+
 int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 			size_t n, float *out)
 {
-	const int nfft = WHISPER_N_FFT, hop = WHISPER_HOP;
+	const int nfft = WHISPER_N_FFT;
 	const int bins = w->n_fft_bins, nmel = w->n_mel_filt;
-	float *hann = NULL, *frame = NULL, *spec = NULL, *scratch = NULL;
-	float *power = NULL;
-	double mx = -1e30;
-	int f, i, m, rc = -1;
+	float *hann = NULL;
+	double mx = -1e30, t_mel = 0.0;
+	int i, rc = -1;
 
-	hann    = malloc((size_t)nfft * sizeof(float));
-	frame   = malloc((size_t)nfft * sizeof(float));
-	/* the recursion writes its children past the parent's own 2n floats */
-	spec    = calloc((size_t)nfft * 2 * 12, sizeof(float));
-	scratch = calloc((size_t)nfft * 12, sizeof(float));
-	power   = malloc((size_t)bins * sizeof(float));
-	if (!hann || !frame || !spec || !scratch || !power)
+	/* ⚠ the per frame scratch lives in the worker: see mel_frames */
+	hann = malloc((size_t)nfft * sizeof(float));
+	if (!hann)
 		goto out;
 
 	/*
@@ -495,56 +654,36 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 		hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI *
 					      (float)i / (float)nfft));
 
-	for (f = 0; f < WHISPER_N_FRAMES; f++) {
-		/*
-		 * ⚠⚠ REFLECTED AT THE FRONT AND ZEROS AT THE BACK, WHICH IS NOT
-		 * SYMMETRIC. Frame f is centred on sample f * hop, so the first
-		 * frames read backwards off the start of the clip and whisper
-		 * mirrors them about sample 0. Past the END of the audio it
-		 * pads with SILENCE -- thirty seconds of it -- because the
-		 * model is always fed a thirty second window whatever it was
-		 * given.
-		 *
-		 * Reflecting at both ends instead, which is what
-		 * torch.stft(center=True) and numpy's pad(mode="reflect") do,
-		 * fills the empty part of the window with a repeat of the clip.
-		 * That is not silence, it is the same speech again, and the
-		 * transcript comes back with it in.
-		 */
-		int start = f * hop - nfft / 2;
+	if (wstage_on < 0)
+		wstage_on = getenv("CHARSIU_STAGES") != NULL;
+	t_mel = wnow();
+	/*
+	 * ⚠ 3000 FRAMES, EACH ONE INDEPENDENT, AND IT WAS SERIAL. On the board
+	 * this was 1625 ms of a 9.4 s transcription -- second only to the
+	 * attention -- and every frame is its own window, its own transform and
+	 * its own eighty dot products against the filterbank. Nothing is shared
+	 * but the filters and the window, both read only.
+	 *
+	 * ⚠ THE MAXIMUM IS NOT REDUCED HERE. It is over the whole spectrogram
+	 * and the clamp below already walks every value, so taking it there
+	 * costs one pass over 240000 floats and saves a reduction that would
+	 * have to be right.
+	 */
+	{
+		struct melctx c;
 
-		for (i = 0; i < nfft; i++) {
-			long s = start + i;
-
-			if (n == 0 || (s >= 0 && (size_t)s >= n)) {
-				frame[i] = 0.0f;
-				continue;
-			}
-			if (s < 0)
-				s = -s;
-			if ((size_t)s >= n)
-				frame[i] = 0.0f;
-			else
-				frame[i] = pcm[s] * hann[i];
-		}
-		fft_rec(frame, nfft, spec, scratch);
-		for (i = 0; i < bins; i++)
-			power[i] = spec[2 * i] * spec[2 * i] +
-				   spec[2 * i + 1] * spec[2 * i + 1];
-		for (m = 0; m < nmel; m++) {
-			const float *filt = w->mel_filters + (size_t)m * bins;
-			double sum = 0.0;
-
-			for (i = 0; i < bins; i++)
-				sum += (double)filt[i] * power[i];
-			if (sum < 1e-10)
-				sum = 1e-10;
-			sum = log10(sum);
-			if (sum > mx)
-				mx = sum;
-			out[(size_t)m * WHISPER_N_FRAMES + f] = (float)sum;
-		}
+		c.w = w;
+		c.pcm = pcm;
+		c.n = n;
+		c.out = out;
+		c.hann = hann;
+		c.bins = bins;
+		c.nmel = nmel;
+		charsiu_parallel_for(mel_frames, &c, WHISPER_N_FRAMES);
 	}
+	for (i = 0; i < nmel * WHISPER_N_FRAMES; i++)
+		if (out[i] > mx)
+			mx = out[i];
 
 	/*
 	 * ⚠ THE CLAMP IS OVER THE WHOLE CLIP, not the frame. Eight decades below
@@ -560,8 +699,10 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 		out[i] = (float)((v + 4.0) / 4.0);
 	}
 	rc = 0;
+	if (wstage_on)
+		wstage_ms[W_MEL] += wnow() - t_mel;
 out:
-	free(hann); free(frame); free(spec); free(scratch); free(power);
+	free(hann);
 	return rc;
 }
 
@@ -750,12 +891,33 @@ static struct gguf_tensor wflat(const struct gguf_tensor *t, uint64_t in,
 	return g;
 }
 
+static struct charsiu_npu_pool *rows_pool;
+
 static void wrows(const struct gguf_tensor *t, const float *bias,
 		  const float *X, unsigned m, unsigned k, float *Y,
 		  unsigned nout, struct charsiu_act *a)
 {
 	struct gguf_tensor g = wflat(t, k, nout);
 	unsigned r, i;
+
+	/*
+	 * ⚠ m > 1 IS THE WHOLE GATE, and it is what keeps the decoder out
+	 * without a second condition: it feeds one token at a time and the
+	 * encoder feeds 1500 positions.
+	 *
+	 * ⚠ AND ONLY 2D WEIGHTS. The conv kernels are [tap][in][out] and this
+	 * file already gathers them into a temporary, whose address changes
+	 * every call -- the pool keys on the pointer, so a temporary would
+	 * stage a new tensor each time until the slots ran out.
+	 */
+	if (rows_pool && m > 1 && t->n_dims <= 2 &&
+	    !charsiu_pool_rows(rows_pool, t, X, m, Y)) {
+		if (bias)
+			for (r = 0; r < m; r++)
+				for (i = 0; i < nout; i++)
+					Y[(size_t)r * nout + i] += bias[i];
+		return;
+	}
 
 	for (r = 0; r < m; r++) {
 		float *y = Y + (size_t)r * nout;
@@ -822,6 +984,21 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 		free(tapw); free(col); free(acc);
 		return -1;
 	}
+	/*
+	 * ⚠⚠ THE TAP TENSORS ARE STACK LOCALS AND THE POOL KEYS ON THE POINTER.
+	 * Three taps and two convolutions all go through this one slot, so
+	 * routing them stages the first tap's weights and then uses them for
+	 * every one after. The board came back with an EMPTY transcript.
+	 *
+	 * The pool refuses this on its own now -- it remembers which weights it
+	 * staged -- but a refusal per call is a message per call and the answer
+	 * is the same either way: the convolutions stay on the CPU. They are
+	 * 0.94 of the encoder's 18.5 G-mac.
+	 */
+	struct charsiu_npu_pool *save = rows_pool;
+
+	rows_pool = NULL;
+
 	memset(out, 0, (size_t)olen * n_out * sizeof(float));
 	memset(&g, 0, sizeof(g));
 
@@ -838,6 +1015,7 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 
 		if (!row) {
 			free(tapw); free(col); free(acc);
+			rows_pool = save;   /* the early return owes it back */
 			return -1;
 		}
 		for (i = 0; i < n_out; i++) {
@@ -879,7 +1057,88 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 			for (i = 0; i < n_out; i++)
 				out[(size_t)t * n_out + i] += bias[i];
 	free(tapw); free(col); free(acc);
+	rows_pool = save;
 	return 0;
+}
+
+/*
+ * One (head, query) each: the scores against every key, a softmax, and the
+ * weighted sum of the values.
+ *
+ * ⚠ THE SCRATCH IS PER RANGE, NOT PER ITEM. att is T floats and a range covers
+ * hundreds of items; allocating inside the item loop would be a malloc per
+ * query and the allocator would become the attention.
+ */
+struct wattn {
+	const float *q, *k, *v;
+	float *o;
+	unsigned T, W, hd;
+	float scale;
+};
+
+/*
+ * ⚠⚠ A BLOCK OF QUERIES AT A TIME, BECAUSE THIS IS BOUND BY MEMORY AND NOT BY
+ * ARITHMETIC.
+ *
+ * One query reads every key and every value: 2 * T * head_dim floats, which at
+ * T = 1500 and head_dim = 64 is 768 KB. Doing that per query means 1500 queries
+ * x 6 heads x 4 layers x 768 KB = TWENTY SEVEN GIGABYTES off DRAM for a clip
+ * whose weights are eighty megabytes. The board moves about 10 GB/s, which is
+ * 2.7 s, and the board measured 4.5 s.
+ *
+ * That is why vectorising the inner loops bought 2.9x on a development host and
+ * 1.24x here: the host was short of arithmetic and this board is short of
+ * bandwidth. QB queries share one pass over K and one over V, so the traffic
+ * divides by QB and the arithmetic is unchanged.
+ *
+ * ⚠ THE ORDER WITHIN A DOT PRODUCT IS UNTOUCHED. Only the order the dot
+ * products are ISSUED in changes, so every output is bit identical to the
+ * unblocked form -- which the tests check rather than take on trust.
+ */
+#define WATTN_QB 8
+
+static void wattn_rows(void *ctx, uint64_t r0, uint64_t n)
+{
+	const struct wattn *c = ctx;
+	unsigned nb = (c->T + WATTN_QB - 1) / WATTN_QB;
+	float *att = malloc((size_t)WATTN_QB * c->T * sizeof(float));
+	uint64_t r;
+
+	if (!att)
+		return;
+	for (r = r0; r < r0 + n; r++) {
+		unsigned h = (unsigned)(r / nb), b = (unsigned)(r % nb);
+		unsigned i0 = b * WATTN_QB, off = h * c->hd;
+		unsigned nq = c->T - i0 < WATTN_QB ? c->T - i0 : WATTN_QB;
+		unsigned j, u, e;
+
+		/* one pass over the keys, all nq queries against each */
+		for (j = 0; j < c->T; j++) {
+			const float *kj = c->k + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				att[u * c->T + j] = charsiu_dot_f32(
+					c->q + (size_t)(i0 + u) * c->W + off,
+					kj, c->hd) * c->scale;
+		}
+		for (u = 0; u < nq; u++) {
+			float *o = c->o + (size_t)(i0 + u) * c->W + off;
+
+			wsoftmax(att + u * c->T, c->T);
+			for (e = 0; e < c->hd; e++)
+				o[e] = 0.0f;
+		}
+		/* and one pass over the values */
+		for (j = 0; j < c->T; j++) {
+			const float *vj = c->v + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				charsiu_axpy_f32(c->o + (size_t)(i0 + u) *
+						 c->W + off, vj,
+						 att[u * c->T + j], c->hd);
+		}
+	}
+	free(att);
 }
 
 int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
@@ -887,10 +1146,11 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 {
 	unsigned W = (unsigned)w->n_audio_state, H = (unsigned)w->n_audio_head;
 	unsigned L = (unsigned)w->n_audio_layer, T = (unsigned)w->n_audio_ctx;
-	unsigned F = 4 * W, hd = W / H, l, i, j, h, e;
+	unsigned F = 4 * W, hd = W / H, l, i, j;
 	float *c1 = NULL, *x = NULL, *xb = NULL, *q = NULL, *k = NULL;
 	float *v = NULL, *ff = NULL, *att = NULL, *g1 = NULL, *b1 = NULL;
 	float *tmp = NULL, scale;
+	double t_attn = 0.0;
 	struct charsiu_act a;
 	int rc = -1, stop = 0;
 
@@ -899,6 +1159,8 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 	scale = 1.0f / sqrtf((float)hd);
 	if (charsiu_act_alloc(&a, (int)(F > W ? F : W)))
 		return -1;
+	/* set for the length of one encode; see the note in vision.c */
+	rows_pool = w->npu ? (struct charsiu_npu_pool *)&w->pool : NULL;
 
 	c1  = malloc((size_t)WHISPER_N_FRAMES * W * sizeof(float));
 	x   = malloc((size_t)T * W * sizeof(float));
@@ -927,10 +1189,16 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		stop = e ? atoi(e) : 0;
 	}
 
-	if (conv1d3(w->conv1_w, wrow1(w->conv1_b, b1), mel,
-		    (unsigned)w->n_mels, WHISPER_N_FRAMES, c1, W, 1, &a))
-		goto out;
-	wgelu(c1, (size_t)WHISPER_N_FRAMES * W);
+	{
+		int cf = 0;
+
+		WSTAGE(W_CONV, cf = conv1d3(w->conv1_w, wrow1(w->conv1_b, b1),
+					    mel, (unsigned)w->n_mels,
+					    WHISPER_N_FRAMES, c1, W, 1, &a));
+		if (cf)
+			goto out;
+	}
+	WSTAGE(W_CONV, wgelu(c1, (size_t)WHISPER_N_FRAMES * W));
 	if (stop == 1) {
 		/* [3000][W], which does not fit `out`: give the first T rows */
 		memcpy(out, c1, (size_t)T * W * sizeof(float));
@@ -947,10 +1215,16 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		for (j = 0; j < WHISPER_N_FRAMES; j++)
 			tmp[(size_t)i * WHISPER_N_FRAMES + j] =
 				c1[(size_t)j * W + i];
-	if (conv1d3(w->conv2_w, wrow1(w->conv2_b, b1), tmp, W,
-		    WHISPER_N_FRAMES, x, W, 2, &a))
-		goto out;
-	wgelu(x, (size_t)T * W);
+	{
+		int cf = 0;
+
+		WSTAGE(W_CONV, cf = conv1d3(w->conv2_w, wrow1(w->conv2_b, b1),
+					    tmp, W, WHISPER_N_FRAMES, x, W, 2,
+					    &a));
+		if (cf)
+			goto out;
+	}
+	WSTAGE(W_CONV, wgelu(x, (size_t)T * W));
 
 	for (i = 0; i < T; i++) {
 		gguf_row_f32(w->e_pos, i, g1);
@@ -966,52 +1240,48 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 	for (l = 0; l < L; l++) {
 		struct whisper_block *B = &w->enc[l];
 
-		for (i = 0; i < T; i++)
+		WSTAGE(W_NORM, for (i = 0; i < T; i++)
 			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
 				   wrow1(B->attn_ln_w, g1),
-				   wrow1(B->attn_ln_b, b1), W, 1e-5f);
-		wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, &a);
-		wrows(B->k_w, NULL, xb, T, W, k, W, &a);
-		wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a);
+				   wrow1(B->attn_ln_b, b1), W, 1e-5f));
+		WSTAGE(W_QKV, wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, &a));
+		WSTAGE(W_QKV, wrows(B->k_w, NULL, xb, T, W, k, W, &a));
+		WSTAGE(W_QKV, wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a));
 
-		for (h = 0; h < H; h++) {
-			unsigned off = h * hd;
+		/*
+		 * ⚠ THIS IS 63% OF A TRANSCRIPTION and it is not a matmul
+		 * against a weight, so none of the NPU machinery reaches it:
+		 * 1500 queries against 1500 keys, six heads, four layers. Every
+		 * (head, query) is independent of every other, which is the
+		 * one thing that makes it worth a thread each.
+		 *
+		 * ⚠ ONE DISPATCH A LAYER, over H * T items. The prefill lost
+		 * twice on this pool at 226 dispatches of a fraction of a
+		 * millisecond each; four dispatches of nine thousand rows is
+		 * the other end of that ratio, and the barrier is paid four
+		 * times a clip rather than per row.
+		 */
+		{
+			struct wattn c;
 
-			for (i = 0; i < T; i++) {
-				const float *qi = q + (size_t)i * W + off;
-				float *o = xb + (size_t)i * W + off;
-
-				for (j = 0; j < T; j++) {
-					const float *kj = k + (size_t)j * W + off;
-					float d = 0.0f;
-
-					for (e = 0; e < hd; e++)
-						d += qi[e] * kj[e];
-					att[j] = d * scale;
-				}
-				wsoftmax(att, T);
-				for (e = 0; e < hd; e++)
-					o[e] = 0.0f;
-				for (j = 0; j < T; j++) {
-					const float *vj = v + (size_t)j * W + off;
-					float wg = att[j];
-
-					for (e = 0; e < hd; e++)
-						o[e] += wg * vj[e];
-				}
-			}
+			c.q = q; c.k = k; c.v = v; c.o = xb;
+			c.T = T; c.W = W; c.hd = hd; c.scale = scale;
+			if (wstage_on) t_attn = wnow();
+			charsiu_parallel_for(wattn_rows, &c, (uint64_t)H *
+					     ((T + WATTN_QB - 1) / WATTN_QB));
 		}
-		wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a);
+		if (wstage_on) wstage_ms[W_ATTN] += wnow() - t_attn;
+		WSTAGE(W_PROJ, wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a));
 		for (i = 0; i < T * W; i++)
 			x[i] += q[i];
 
-		for (i = 0; i < T; i++)
+		WSTAGE(W_NORM, for (i = 0; i < T; i++)
 			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
 				   wrow1(B->mlp_ln_w, g1),
-				   wrow1(B->mlp_ln_b, b1), W, 1e-5f);
-		wrows(B->fc1_w, wrow1(B->fc1_b, b1), xb, T, W, ff, F, &a);
-		wgelu(ff, (size_t)T * F);
-		wrows(B->fc2_w, wrow1(B->fc2_b, b1), ff, T, F, q, W, &a);
+				   wrow1(B->mlp_ln_b, b1), W, 1e-5f));
+		WSTAGE(W_FFN, wrows(B->fc1_w, wrow1(B->fc1_b, b1), xb, T, W, ff, F, &a));
+		WSTAGE(W_FFN, wgelu(ff, (size_t)T * F));
+		WSTAGE(W_FFN, wrows(B->fc2_w, wrow1(B->fc2_b, b1), ff, T, F, q, W, &a));
 		for (i = 0; i < T * W; i++)
 			x[i] += q[i];
 	}
@@ -1021,6 +1291,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 			   wrow1(w->e_ln_w, g1), wrow1(w->e_ln_b, b1), W, 1e-5f);
 	rc = 0;
 out:
+	rows_pool = NULL;
 	free(c1); free(x); free(xb); free(q); free(k); free(v);
 	free(ff); free(att); free(g1); free(b1); free(tmp);
 	charsiu_act_free(&a);
@@ -1158,24 +1429,17 @@ const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
 			const float *qi = d->q + off;
 			float *o = d->xb + off;
 
-			for (j = 0; j <= (unsigned)pos; j++) {
-				const float *kj = d->sk[l] + (size_t)j * W + off;
-				float dp = 0.0f;
-
-				for (e = 0; e < hd; e++)
-					dp += qi[e] * kj[e];
-				d->att[j] = dp * scale;
-			}
+			for (j = 0; j <= (unsigned)pos; j++)
+				d->att[j] = charsiu_dot_f32(qi,
+					d->sk[l] + (size_t)j * W + off, hd) *
+					scale;
 			wsoftmax(d->att, (unsigned)pos + 1);
 			for (e = 0; e < hd; e++)
 				o[e] = 0.0f;
-			for (j = 0; j <= (unsigned)pos; j++) {
-				const float *vj = d->sv[l] + (size_t)j * W + off;
-				float wg = d->att[j];
-
-				for (e = 0; e < hd; e++)
-					o[e] += wg * vj[e];
-			}
+			for (j = 0; j <= (unsigned)pos; j++)
+				charsiu_axpy_f32(o,
+					d->sv[l] + (size_t)j * W + off,
+					d->att[j], hd);
 		}
 		wrows(B->o_w, wrow1(B->o_b, d->b1), d->xb, 1, W, d->q, W, &d->a);
 		for (i = 0; i < W; i++)
@@ -1191,24 +1455,19 @@ const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
 			const float *qi = d->q + off;
 			float *o = d->xb + off;
 
-			for (j = 0; j < d->T; j++) {
-				const float *kj = d->xk[l] + (size_t)j * W + off;
-				float dp = 0.0f;
-
-				for (e = 0; e < hd; e++)
-					dp += qi[e] * kj[e];
-				d->att[j] = dp * scale;
-			}
+			/* ⚠ 1500 KEYS PER TOKEN PER HEAD PER LAYER: the cross
+			 * attention is the decoder's whole cost. */
+			for (j = 0; j < d->T; j++)
+				d->att[j] = charsiu_dot_f32(qi,
+					d->xk[l] + (size_t)j * W + off, hd) *
+					scale;
 			wsoftmax(d->att, d->T);
 			for (e = 0; e < hd; e++)
 				o[e] = 0.0f;
-			for (j = 0; j < d->T; j++) {
-				const float *vj = d->xv[l] + (size_t)j * W + off;
-				float wg = d->att[j];
-
-				for (e = 0; e < hd; e++)
-					o[e] += wg * vj[e];
-			}
+			for (j = 0; j < d->T; j++)
+				charsiu_axpy_f32(o,
+					d->xv[l] + (size_t)j * W + off,
+					d->att[j], hd);
 		}
 		wrows(B->xo_w, wrow1(B->xo_b, d->b1), d->xb, 1, W, d->q, W,
 		      &d->a);
@@ -1255,6 +1514,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 	const float *lg = NULL;
 	int32_t prompt[2];
 	int n = 0, pos, i, np = 2;
+	double t_dec = 0.0;
 
 	/*
 	 * ⚠ REFUSED RATHER THAN GUESSED. A multilingual model wants a language
@@ -1279,6 +1539,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 	 * version of this did -- feeds the marker twice and shifts the whole
 	 * transcript by a token.
 	 */
+	if (wstage_on) t_dec = wnow();
 	for (i = 0; i < np; i++)
 		lg = charsiu_whisper_step(d, prompt[i], i);
 	pos = np;
@@ -1298,5 +1559,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 		lg = charsiu_whisper_step(d, best, pos++);
 	}
 	charsiu_whisper_decoder_free(d);
+	if (wstage_on)
+		wstage_ms[W_DEC] += wnow() - t_dec;
 	return n;
 }

@@ -11,12 +11,15 @@
  * nothing, the path was skipped in silence, and the model loaded, ran and
  * answered while missing the half of itself its name is about.
  */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <stdarg.h>
 
+#include "charsiu.h"
 #include "charsiu_llm.h"
 #include "charsiu_vision.h"
 
@@ -326,6 +329,67 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 			 "the names this reads", v->n_missing);
 		return -1;
 	}
+
+	/*
+	 * ⚠ int8, AND ONLY IF CHARSIU_NPU ASKED. The tower is eight weights a
+	 * layer plus the projector; the widest contraction is the projector's,
+	 * which on a pixel shuffled one is n_embd * scale^2.
+	 */
+	/* ⚠ nothing else starts it outside the language model */
+	charsiu_threads_start(0);
+
+	if (getenv("CHARSIU_NPU")) {
+		unsigned wide = v->n_embd > v->n_ff ? v->n_embd : v->n_ff;
+		unsigned rows = v->n_ff > v->proj_dim ? v->n_ff : v->proj_dim;
+
+		if (v->proj == CHARSIU_PROJ_IDEFICS3 && v->scale)
+			wide = wide > v->n_embd * v->scale * v->scale
+			     ? wide : v->n_embd * v->scale * v->scale;
+		if (rows < v->n_embd)
+			rows = v->n_embd;
+		if (!charsiu_pool_init(&v->pool, v->n_layer * 8 + 4, wide,
+				       rows, 0))
+			v->npu = v->pool.dev != NULL;
+		if (!v->npu && charsiu_diag())
+			fprintf(stderr, "charsiu: the vision tower stays on "
+				"the CPU\n");
+		if (v->npu) {
+			/*
+			 * ⚠ ALL OF IT, NOW, AND INTO A CACHE. A board round
+			 * measured 75 s of this tower's 82 s inside the
+			 * quantiser -- the matmuls underneath were about 8 s
+			 * against the CPU's 148. Staging lazily also
+			 * interleaves with the language model's, and the cache
+			 * is one ordered file.
+			 */
+			const struct gguf_tensor *list[26 * 8 + 4];
+			unsigned nl = 0, li;
+			char cbuf[512];
+			const char *cache = charsiu_cache_path(path, cbuf,
+							       sizeof(cbuf));
+			char stamp[64];
+
+			snprintf(stamp, sizeof(stamp), "%u:%u:%u:%u",
+				 v->n_embd, v->n_ff, v->n_layer, v->proj_dim);
+			for (li = 0; li < v->n_layer &&
+			     nl + 8 < sizeof(list) / sizeof(*list); li++) {
+				struct charsiu_vision_layer *L = &v->layer[li];
+
+				list[nl++] = L->q_w; list[nl++] = L->k_w;
+				list[nl++] = L->v_w; list[nl++] = L->o_w;
+				list[nl++] = L->fc1_w; list[nl++] = L->fc2_w;
+			}
+			if (v->fc_w)
+				list[nl++] = v->fc_w;
+			if (v->vproj_w)
+				list[nl++] = v->vproj_w;
+			if (v->mm_w[0])
+				list[nl++] = v->mm_w[0];
+			if (v->mm_w[1])
+				list[nl++] = v->mm_w[1];
+			charsiu_pool_stage_all(&v->pool, list, nl, cache, stamp);
+		}
+	}
 	if (!v->n_patches) {
 		snprintf(v->why, sizeof(v->why),
 			 "image_size %u and patch_size %u give no patch grid",
@@ -337,6 +401,9 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 
 void charsiu_vision_close(struct charsiu_vision *v)
 {
+	if (v->npu && charsiu_diag())
+		charsiu_pool_report(&v->pool, stderr);
+	charsiu_pool_fini(&v->pool);
 	free(v->layer);
 	v->layer = NULL;
 	if (v->opened)
@@ -384,6 +451,51 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
 		v->n_missing);
 	for (i = 0; i < v->n_missing; i++)
 		fprintf(out, "    %s\n", v->missing[i]);
+}
+
+/* ---- where the time goes -------------------------------------------------- */
+
+/*
+ * ⚠ THE SAME INSTRUMENT THAT SETTLED WHISPER. Its stage table said the matmuls
+ * were 26% and the attention 63%, after four commits aimed at the matmuls. This
+ * tower has had no such table and the board says it is 15.5 s against a vendor's
+ * 768 ms for the same model, of which 3.1 s is the hardware.
+ */
+enum { V_PATCH, V_QKV, V_ATTN, V_PROJ, V_FFN, V_NORM, V_SHUF, V_N };
+static const char *const vstage_name[V_N] = {
+	"patch gather + embed", "q k v", "attention", "out proj",
+	"feed forward", "layernorms", "pixel shuffle + projector",
+};
+static double vstage_ms[V_N];
+static int vstage_on = -1;
+
+static double vnow(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+#define VSTAGE(i, expr) do { \
+	double _t = vstage_on ? vnow() : 0.0; \
+	expr; \
+	if (vstage_on) vstage_ms[i] += vnow() - _t; \
+} while (0)
+
+void charsiu_vision_stages(FILE *out)
+{
+	double tot = 0.0;
+	int i;
+
+	for (i = 0; i < V_N; i++)
+		tot += vstage_ms[i];
+	if (tot <= 0.0)
+		return;
+	fprintf(out, "charsiu vision: %.1f s accounted for\n", tot / 1e3);
+	for (i = 0; i < V_N; i++)
+		fprintf(out, "  %-26s %8.0f ms  %5.1f%%\n", vstage_name[i],
+			vstage_ms[i], 100.0 * vstage_ms[i] / tot);
 }
 
 /* ---- the forward pass ---------------------------------------------------- */
@@ -503,12 +615,30 @@ static const float *row1(const struct gguf_tensor *t, float *buf, unsigned n)
 }
 
 /* Y[m][nout] = X[m][k] * W, with the bias added. */
+static struct charsiu_npu_pool *rows_pool;
+
+/*
+ * ⚠ ONLY THE 2D WEIGHTS GO TO THE HARDWARE, and the one that does not is the
+ * patch embedding: it is a 4D convolution kernel, the pool keys on the tensor
+ * POINTER, and a flattened view is a different address every call. It is 1.8 of
+ * the tower's 90 G-mac, so this is two percent left on the CPU rather than a
+ * gap worth a persistent view.
+ */
 static void rows_mul(const struct gguf_tensor *w, const float *bias,
 		     const float *X, unsigned m, unsigned k, float *Y,
 		     unsigned nout, struct charsiu_act *a)
 {
 	struct gguf_tensor t = flat2d(w);
 	unsigned r, i;
+
+	if (rows_pool && m > 1 && w->n_dims <= 2 &&
+	    !charsiu_pool_rows(rows_pool, w, X, m, Y)) {
+		if (bias)
+			for (r = 0; r < m; r++)
+				for (i = 0; i < nout; i++)
+					Y[(size_t)r * nout + i] += bias[i];
+		return;
+	}
 
 	for (r = 0; r < m; r++) {
 		float *y = Y + (size_t)r * nout;
@@ -588,10 +718,69 @@ static void pixel_shuffle(const float *x, float *out, unsigned grid,
 			}
 }
 
+/* one (head, patch) each; see the note at the call site */
+struct vattn {
+	const float *q, *k, *v;
+	float *o;
+	unsigned n, W, hd;
+	float scale;
+};
+
+/*
+ * ⚠ A BLOCK OF PATCHES AT A TIME. One query reads every key and every value, so
+ * doing it per query streams 2 * n * head_dim floats off DRAM 1025 times a head
+ * -- and the board measured this shape as bandwidth bound rather than
+ * arithmetic bound, which is why vectorising it bought 2.9x on a host and 1.24x
+ * there. See the long note in whisper.c.
+ */
+#define VATTN_QB 8
+
+static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
+{
+	const struct vattn *c = ctx;
+	unsigned nb = (c->n + VATTN_QB - 1) / VATTN_QB;
+	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
+	uint64_t r;
+
+	if (!att)
+		return;
+	for (r = r0; r < r0 + n; r++) {
+		unsigned h = (unsigned)(r / nb), b = (unsigned)(r % nb);
+		unsigned i0 = b * VATTN_QB, off = h * c->hd;
+		unsigned nq = c->n - i0 < VATTN_QB ? c->n - i0 : VATTN_QB;
+		unsigned j, u, e;
+
+		for (j = 0; j < c->n; j++) {
+			const float *kj = c->k + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				att[u * c->n + j] = charsiu_dot_f32(
+					c->q + (size_t)(i0 + u) * c->W + off,
+					kj, c->hd) * c->scale;
+		}
+		for (u = 0; u < nq; u++) {
+			float *o = c->o + (size_t)(i0 + u) * c->W + off;
+
+			vsoftmax(att + u * c->n, c->n);
+			for (e = 0; e < c->hd; e++)
+				o[e] = 0.0f;
+		}
+		for (j = 0; j < c->n; j++) {
+			const float *vj = c->v + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				charsiu_axpy_f32(c->o + (size_t)(i0 + u) *
+						 c->W + off, vj,
+						 att[u * c->n + j], c->hd);
+		}
+	}
+	free(att);
+}
+
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 {
 	unsigned np = v->n_patches, W = v->n_embd, P = v->patch_size;
-	unsigned pin = 3u * P * P, hd, l, p, i, j, h, e;
+	unsigned pin = 3u * P * P, hd, l, p, i;
 	/*
 	 * ⚠ THE SEQUENCE IS NOT THE PATCHES. CLIP prepends a class token, so
 	 * everything from the position embedding to the attention runs over
@@ -628,6 +817,14 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		     ? wide : W * v->scale * v->scale;
 	if (charsiu_act_alloc(&a, (int)(pin > wide ? pin : wide)))
 		return -1;
+	/*
+	 * ⚠ A FILE SCOPE POINTER, SET FOR THE LENGTH OF ONE CALL. rows_mul is
+	 * the one place a weight is multiplied and it is called from eleven
+	 * sites; threading a pool through all of them would be eleven more
+	 * arguments for one bit of information. It is cleared on the way out so
+	 * a second tower cannot inherit the first one's device.
+	 */
+	rows_pool = v->npu ? &v->pool : NULL;
 	patch = malloc((size_t)np * pin * sizeof(float));
 	x     = malloc((size_t)nt * W * sizeof(float));
 	xb    = malloc((size_t)nt * W * sizeof(float));
@@ -664,8 +861,10 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 						   gx * P + i];
 	}
 
-	rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch, np, pin,
-		 x + (size_t)cls * W, W, &a);
+	if (vstage_on < 0)
+		vstage_on = getenv("CHARSIU_STAGES") != NULL;
+	VSTAGE(V_PATCH, rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch,
+				 np, pin, x + (size_t)cls * W, W, &a));
 	if (cls)
 		gguf_row_f32(v->class_embd, 0, x);
 
@@ -696,48 +895,38 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			if (!g || !b) { free(g); free(b); goto out; }
 			row1(L->ln1_w, g, W);
-			for (p = 0; p < nt; p++)
+			VSTAGE(V_NORM, for (p = 0; p < nt; p++)
 				layernorm(xb + (size_t)p * W, x + (size_t)p * W,
 					  L->ln1_w ? g : NULL,
 					  L->ln1_b ? row1(L->ln1_b, b, W) : NULL,
-					  W, v->eps);
+					  W, v->eps));
 			free(g); free(b);
 		}
 
-		rows_mul(L->q_w, row1(L->q_b, bias, W), xb, nt, W, q, W, &a);
-		rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a);
-		rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a);
+		VSTAGE(V_QKV, rows_mul(L->q_w, row1(L->q_b, bias, W), xb, nt, W, q, W, &a));
+		VSTAGE(V_QKV, rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a));
+		VSTAGE(V_QKV, rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a));
 
-		/* full attention, every patch against every patch */
-		for (h = 0; h < v->n_head; h++) {
-			unsigned off = h * hd;
+		/*
+		 * ⚠ FULL ATTENTION, EVERY PATCH AGAINST EVERY PATCH, and on a
+		 * thread each. whisper's identical loop measured 62% of a
+		 * transcription and came down 3.46x on four cores; this one is
+		 * 1025 against 1025, twelve heads, twelve layers.
+		 *
+		 * It is not a matmul against a weight, so nothing built for the
+		 * NPU pool touches it.
+		 */
+		{
+			struct vattn c;
 
-			for (i = 0; i < nt; i++) {
-				const float *qi = q + (size_t)i * W + off;
-				float *o = xb + (size_t)i * W + off;
-
-				for (j = 0; j < nt; j++) {
-					const float *kj = k + (size_t)j * W + off;
-					float d = 0.0f;
-
-					for (e = 0; e < hd; e++)
-						d += qi[e] * kj[e];
-					att[j] = d * scale;
-				}
-				vsoftmax(att, nt);
-				for (e = 0; e < hd; e++)
-					o[e] = 0.0f;
-				for (j = 0; j < nt; j++) {
-					const float *vj = val + (size_t)j * W + off;
-					float w = att[j];
-
-					for (e = 0; e < hd; e++)
-						o[e] += w * vj[e];
-				}
-			}
+			c.q = q; c.k = k; c.v = val; c.o = xb;
+			c.n = nt; c.W = W; c.hd = hd; c.scale = scale;
+			VSTAGE(V_ATTN, charsiu_parallel_for(vattn_rows, &c,
+					     (uint64_t)v->n_head *
+					     ((nt + VATTN_QB - 1) / VATTN_QB)));
 		}
 
-		rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a);
+		VSTAGE(V_PROJ, rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a));
 		for (i = 0; i < nt * W; i++)
 			x[i] += q[i];
 
@@ -747,19 +936,19 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			if (!g || !b) { free(g); free(b); goto out; }
 			row1(L->ln2_w, g, W);
-			for (p = 0; p < nt; p++)
+			VSTAGE(V_NORM, for (p = 0; p < nt; p++)
 				layernorm(xb + (size_t)p * W, x + (size_t)p * W,
 					  L->ln2_w ? g : NULL,
 					  L->ln2_b ? row1(L->ln2_b, b, W) : NULL,
-					  W, v->eps);
+					  W, v->eps));
 			free(g); free(b);
 		}
 
-		rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb, nt, W, ff,
-			 nff, &a);
-		gelu(ff, nt * nff, v->use_gelu);
-		rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff, nt, nff, q, W,
-			 &a);
+		VSTAGE(V_FFN, rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb,
+				       nt, W, ff, nff, &a));
+		VSTAGE(V_FFN, gelu(ff, nt * nff, v->use_gelu));
+		VSTAGE(V_FFN, rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff,
+				       nt, nff, q, W, &a));
 		for (i = 0; i < nt * W; i++)
 			x[i] += q[i];
 	}
@@ -795,9 +984,10 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 		if (!sh)
 			goto out;
-		pixel_shuffle(x, sh, v->grid, W, v->scale);
-		rows_mul(v->fc_w, row1(v->fc_b, bias, v->proj_dim), sh, tok,
-			 wide2, out, (unsigned)rows_of(v->fc_w), &a);
+		VSTAGE(V_SHUF, pixel_shuffle(x, sh, v->grid, W, v->scale));
+		VSTAGE(V_SHUF, rows_mul(v->fc_w, row1(v->fc_b, bias,
+				v->proj_dim), sh, tok, wide2, out,
+				(unsigned)rows_of(v->fc_w), &a));
 		free(sh);
 	} else if (v->mm_w[0]) {
 		unsigned d0 = (unsigned)rows_of(v->mm_w[0]);
@@ -822,6 +1012,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	}
 	rc = 0;
 out:
+	rows_pool = NULL;
 	free(patch); free(x); free(xb); free(q); free(k); free(val);
 	free(ff); free(att); free(tmp); free(gain); free(bias);
 	charsiu_act_free(&a);

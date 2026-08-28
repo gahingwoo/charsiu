@@ -4,9 +4,17 @@
 #
 # The first board round for seeing, matching and hearing.
 #
-# ⚠ NONE OF THESE THREE USES THE NPU YET. vision.c, clip.c and whisper.c call
+# ⚠ THE TOWERS REACH THE HARDWARE NOW, and this round is the one that says what
+# that bought. Run it with CHARSIU_NPU=1 in the environment and again without,
+# and the two columns are the answer. The decoder side of whisper and CLIP's
+# text tower are still on the CPU on purpose: both feed one row at a time, which
+# is not the case the batched matmul is for.
+#
+# The round before this one said: vision.c, clip.c and whisper.c call
 # gguf_matvec directly; only llama.c's projections are routed. So this round is
 # not asking whether the hardware is fast at them. It is asking two things:
+#
+#     whisper 34.5 s   vision 153.1 s   clip 4.7 s   -- all CPU, 0.6 G-mac/s
 #
 #   1. do they give the SAME ANSWERS on aarch64 that they give on a host --
 #      the offline tests need numpy and the board may not have it, so the
@@ -70,7 +78,10 @@ say_result() {  # what, got, want
 
 echo "== 1. hearing: whisper tiny.en on jfk.wav =="
 t0=$(ms)
-OUT=$("$WSP" "$DIR/ggml-tiny.en.bin" --transcribe --audio "$DIR/jfk.wav")
+OUT=$(CHARSIU_STAGES=1 "$WSP" "$DIR/ggml-tiny.en.bin" --transcribe \
+	--audio "$DIR/jfk.wav" 2>"$DIR/.wsp.err")
+grep -E "accounted|ms  " "$DIR/.wsp.err" | sed "s/^/  /" || true
+grep -E "NPU pool|ON THE HARDWARE" "$DIR/.wsp.err" | sed "s/^/  /" || true
 T_WSP=$(took "$t0")
 echo "  $OUT"
 say_result "the words" "$OUT" "ask not what your country can do for you"
@@ -79,9 +90,15 @@ echo
 
 echo "== 2. seeing: SmolVLM-256M on the llama.cpp logo =="
 t0=$(ms)
-OUT=$("$RUN" "$DIR/smolvlm.gguf" --mmproj "$DIR/mmproj.gguf" --image "$DIR/logo.png" \
+# ⚠⚠ STDERR IS KEPT NOW. This discarded it, so the vision tower's staging and
+# pool lines -- the only place that says whether the hardware did any of the
+# work -- were thrown away for three board rounds while their numbers were being
+# argued about, and a 17x was announced and withdrawn in between.
+"$RUN" "$DIR/smolvlm.gguf" --mmproj "$DIR/mmproj.gguf" --image "$DIR/logo.png" \
 	-p "User:<image>What animal is this?<end_of_utterance>
-Assistant:" -n 8 -c 1024 -t 4 2>/dev/null | sed -n '2p')
+Assistant:" -n 8 -c 1024 -t 4 >"$DIR/.vis.out" 2>"$DIR/.vis.err" || true
+grep -E "weight cache|ON THE HARDWARE|NPU pool" "$DIR/.vis.err" | sed "s/^/  /" || true
+OUT=$(grep -v "^\[" "$DIR/.vis.out" | sed -n '2p')
 T_VIS=$(took "$t0")
 echo "  $OUT"
 say_result "the animal" "$OUT" "Llama"
@@ -106,10 +123,38 @@ OUT=$("$RUN" "$DIR/smolvlm.gguf" -p "The capital of France is" -n 16 --ignore-eo
 echo "  $OUT"
 echo
 
+echo "== 5. the batched prefill, against the token loop, on this board =="
+# ⚠⚠ THE ONE CHECK THIS ROUND WAS MISSING. The batched prefill is verified byte
+# for byte on a development host across six architectures, and the board has
+# never compared its text against the token loop -- while every round of it runs
+# through hardware the host does not have. Same binary, one flag apart.
+"$RUN" "$DIR/smolvlm.gguf" -p "The history of computing begins long before the
+first electronic machine, and the stored program changed what a machine could be
+told to do. Explain why that mattered." -n 16 --ignore-eos -c 1024 -t 4 \
+	2>/dev/null | grep -v '^\[' > "$DIR/.pa.txt" || true
+CHARSIU_NO_BATCH_PREFILL=1 "$RUN" "$DIR/smolvlm.gguf" -p "The history of computing begins long before the
+first electronic machine, and the stored program changed what a machine could be
+told to do. Explain why that mattered." -n 16 --ignore-eos -c 1024 -t 4 \
+	2>/dev/null | grep -v '^\[' > "$DIR/.pb.txt" || true
+if cmp -s "$DIR/.pa.txt" "$DIR/.pb.txt"; then
+	echo "  PASS  batched and a token at a time say the same words"
+else
+	echo "  FAIL  the batched prefill does not match the token loop"
+	diff "$DIR/.pb.txt" "$DIR/.pa.txt" | head -6 | sed 's/^/     /'
+	FAIL=1
+fi
+echo
+
 echo "======================================================================="
 echo "  whisper $(secs "$T_WSP") s   vision $(secs "$T_VIS") s   clip $(secs "$T_CLP") s"
-echo "  ⚠ all three are CPU only today. These are the numbers that say what"
-echo "    routing them to the NPU would be worth."
+if [ -n "${CHARSIU_NPU:-}" ]; then
+	echo "  CHARSIU_NPU=1 was set: the vision tower and the whisper ENCODER"
+	echo "  went to the hardware. Against the CPU round of 2026-08-28:"
+	echo "    whisper 34.5 s   vision 153.1 s   clip 4.7 s"
+else
+	echo "  ⚠ CHARSIU_NPU was NOT set, so this is the CPU column. Run it"
+	echo "    again with CHARSIU_NPU=1 to get the other one."
+fi
 [ "$FAIL" = 0 ] && echo "  PASS" || echo "  FAILED"
 echo "======================================================================="
 exit $FAIL

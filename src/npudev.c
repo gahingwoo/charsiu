@@ -541,6 +541,22 @@ static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned 
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors)
 {
+	return charsiu_npu_open_mode(max_k, max_n, max_tensors, -1);
+}
+
+/*
+ * ⚠ want_w4 = -1 ASKS THE ENVIRONMENT, 0 AND 1 DECIDE.
+ *
+ * A caller that batches cannot let the environment choose. w4a16 computes
+ * exactly one row whatever it is asked for -- five rounds established that and
+ * no register changes it -- so a vision tower whose device opened in int4
+ * because the runner's config sets CHARSIU_NPU_W4V=1 would dispatch its 1024
+ * patches ONE AT A TIME. It would still be correct, and it would be slower than
+ * the CPU it was moved off.
+ */
+struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
+					  unsigned max_tensors, int want_w4)
+{
 	struct charsiu_npu *g = calloc(1, sizeof(*g));
 	unsigned ns, ks;
 
@@ -619,7 +635,9 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 	 *
 	 * `*e != '0'` is what npu_mode() and act_set() in this tree already do.
 	 */
-	{
+	if (want_w4 >= 0) {
+		g->w4 = want_w4 ? 1 : 0;
+	} else {
 		const char *e4 = getenv("CHARSIU_NPU_W4V");
 
 		g->w4 = e4 && *e4 && *e4 != '0';
@@ -758,6 +776,16 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 fail:
 	charsiu_npu_close(g);
 	return NULL;
+}
+
+/*
+ * ⚠ WILL A BATCH BE TAKEN, ASKED BEFORE ONE IS TRIED. A caller that has two
+ * strategies has to choose before it acts: trying the batch and falling back
+ * has already done the work of one of them.
+ */
+int charsiu_npu_batches(const struct charsiu_npu *g)
+{
+	return g && !g->w4;
 }
 
 void charsiu_npu_close(struct charsiu_npu *g)

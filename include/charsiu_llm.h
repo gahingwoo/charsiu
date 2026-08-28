@@ -189,6 +189,15 @@ struct npu_tensor {
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 			  void *ctx, uint64_t n);
 
+/*
+ * Start the worker pool. llama_state_new does this; a graph that is not the
+ * language model has to do it itself or every parallel_for runs on one core --
+ * quietly, because the single thread path is an ordinary call.
+ * 0 asks CHARSIU_THREADS, then the machine.
+ */
+void charsiu_threads_start(int nthreads);
+int charsiu_threads(void);
+
 int  npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w);
 void npu_tensor_free(struct npu_tensor *t);
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
@@ -213,6 +222,19 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode);
 /* ---- and the same thing on the hardware ---------------------------------- */
 
 struct charsiu_npu;
+
+/*
+ * want_w4: -1 asks CHARSIU_NPU_W4V, 0 forces int8, 1 forces int4.
+ *
+ * ⚠ A CALLER THAT BATCHES MUST FORCE int8. w4a16 makes exactly one row whatever
+ * it is asked for, so a device opened in int4 turns a 1024 row tower into 1024
+ * dispatches -- correct, and slower than the CPU it was moved off.
+ */
+/* Whether this device takes a batch at all: int8 does, w4a16 makes one row. */
+int charsiu_npu_batches(const struct charsiu_npu *g);
+
+struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
+					  unsigned max_tensors, int want_w4);
 
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors);
@@ -257,6 +279,14 @@ void gguf_matmul(const struct gguf_tensor *w, const struct charsiu_act *a,
 		 uint64_t row0, uint64_t nrows);
 void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 		 float *y, uint64_t row0, uint64_t nrows);
+
+/*
+ * The two kernels an attention is made of, which is not a matmul against a
+ * weight and so has none of the machinery above. NEON where there is NEON.
+ * ⚠ The summation order is not the scalar loop's.
+ */
+float charsiu_dot_f32(const float *a, const float *b, uint64_t n);
+void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
 
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */
 void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst);
@@ -481,6 +511,93 @@ struct llama_model {
  * Everything that changes as tokens are produced. Split from the model so the
  * weights stay read only and a second state is just another allocation.
  */
+/*
+ * WHAT IS ON THE HARDWARE, and how a weight gets there.
+ *
+ * ⚠ THIS USED TO BE FIVE FIELDS INSIDE struct llama_state, which meant the only
+ * graph that could reach the NPU was the language model. The vision tower, CLIP
+ * and whisper are not llama and were therefore all on the CPU -- measured on the
+ * board at 0.6 G-mac/s, three times, by three graphs that never touched the
+ * hardware they were running on.
+ *
+ * ⚠ ONE STAGING PATH, NOT TWO. Everything a tensor needs to reach the NPU --
+ * the requantised copy, the width refusals, CHARSIU_NPU_ONLY, the maxn gate that
+ * kept an output head on the CPU for a fortnight while saying nothing -- lives
+ * here once. A second copy for the towers is how the two drift.
+ */
+struct charsiu_npu_pool {
+	struct npu_tensor *t;
+	const struct gguf_tensor **key;
+	/*
+	 * ⚠ THE WEIGHTS THAT WERE STAGED, because the key is an address and a
+	 * caller building a temporary tensor on the stack reuses one address
+	 * for several different weights. See charsiu_pool_get.
+	 */
+	const void **src;
+	int *id;                  /* >= 0 when the tensor is on the hardware */
+
+	/*
+	 * ⚠ WHAT ACTUALLY WENT TO THE HARDWARE, counted rather than assumed.
+	 * A board round subtracted a staging figure from a wall clock and
+	 * announced 17x; the next round dropped that staging by 19 seconds and
+	 * the wall clock did not move. Neither number was wrong -- the
+	 * SUBTRACTION was, because nothing was counting how much of the work
+	 * reached the NPU at all.
+	 */
+	unsigned long calls, hw, fell_back;
+	unsigned long rows_hw;
+	double hw_ms;
+	unsigned n, cap;
+	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */
+};
+
+/*
+ * `max_tensors` slots, and a device opened for weights up to max_k by max_n.
+ * A pool with no device still quantises, which is the CPU path's own fast form.
+ */
+/*
+ * Claim the weight cache for the staging that follows, or NULL to hand it back
+ * to CHARSIU_NPU_CACHE. See the note in npuquant.c: it is one sequential file
+ * and two graphs cannot share it.
+ */
+void charsiu_wcache_use(const char *path, const char *stamp);
+
+/*
+ * Stage every one of `n` tensors now, into `cache` if it is given.
+ *
+ * ⚠ EAGERLY, BECAUSE THE CACHE IS ORDERED. Lazy staging interleaves with
+ * whatever else is running and the records come back in a different order than
+ * they went in; and a board round measured 75 s of the vision tower's 82 s
+ * inside the quantiser, so this is also where the time is.
+ */
+int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
+			   const struct gguf_tensor *const *w, unsigned n,
+			   const char *cache, const char *stamp);
+
+/* One line: how much of the work actually reached the hardware. */
+void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out);
+
+/* $XDG_CACHE_HOME/charsiu/<name>.wq, made if it is not there. NULL on failure. */
+const char *charsiu_cache_path(const char *model, char *buf, size_t max);
+
+extern double charsiu_pool_stage_ms;
+
+int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,
+		      unsigned max_k, unsigned max_n, int want_w4);
+void charsiu_pool_fini(struct charsiu_npu_pool *p);
+
+/* The staged form of `w`, staging it on first sight. NULL if it will not go. */
+const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
+					  const struct gguf_tensor *w);
+
+/*
+ * Y[m][n] = X[m][k] * w, on the hardware. Returns 0, or -1 when this tensor is
+ * not on the NPU or the batch will not go -- in which case the caller does what
+ * it did before, one row at a time, which is correct and slower.
+ */
+int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
+		      const float *X, unsigned m, float *Y);
+
 struct llama_state {
 	const struct llama_model *m;
 	int n_ctx;
@@ -505,6 +622,21 @@ struct llama_state {
 	 * the three above.
 	 */
 	float *bx, *bxb, *bhb, *bhb2, *bxo, *bcs;
+	/*
+	 * The batched q k v and the attention's output.
+	 * ⚠ bq AND bao ARE n_head * head_dim WIDE, NOT n_embd. Qwen3 0.6B is
+	 * 16 heads of 128 against an embedding of 1024 and the two are not the
+	 * same number; a buffer sized by n_embd truncates every row.
+	 */
+	float *bq, *bk, *bv, *bao;
+	float *bfreq;          /* m->rope_freqs, read once a prompt */
+	/*
+	 * ⚠ MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
+	 * read each weight row once for all m. It is four times SLOWER than n
+	 * calls to llama's own matvec and it changes the text, because matvec
+	 * is not gguf_matvec -- see the note in matmul_rows. Kept as fields
+	 * that are never allocated would be worse than kept as a comment.
+	 */
 	unsigned bx_n;
 	float *hb, *hb2;       /* n_ff */
 	float *q;              /* n_head * head_dim */
@@ -518,11 +650,7 @@ struct llama_state {
 
 	/* CHARSIU_NPU_QUANT: a second copy of each routed tensor, in the
 	 * format the hardware takes. Built on first use. */
-	struct npu_tensor *npu;
-	const struct gguf_tensor **npu_key;
-	int *npu_id;              /* >= 0 when the tensor is on the hardware */
-	unsigned n_npu, npu_cap;
-	struct charsiu_npu *dev;  /* CHARSIU_NPU=1 */
+	struct charsiu_npu_pool pool;
 };
 
 int  llama_load(struct llama_model *m, const char *path);

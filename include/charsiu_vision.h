@@ -95,6 +95,16 @@ struct charsiu_vision {
 	char missing[24][80];
 	unsigned n_missing;
 	char why[160];
+
+	/*
+	 * ⚠ THE TOWER'S OWN NPU POOL, opened in int8 whatever the environment
+	 * says. A picture is 1024 patches against weights that do not change,
+	 * which is the batched matmul; w4a16 makes one row, so an int4 device
+	 * here would dispatch those patches one at a time and be slower than
+	 * the CPU it was moved off.
+	 */
+	struct charsiu_npu_pool pool;
+	int npu;
 };
 
 /*
@@ -109,6 +119,9 @@ void charsiu_vision_close(struct charsiu_vision *v);
 
 /* NULL when the tower is usable, otherwise a short phrase. */
 const char *charsiu_vision_why_not(const struct charsiu_vision *v);
+
+/* Where the time went, under CHARSIU_STAGES. */
+void charsiu_vision_stages(FILE *out);
 
 /* One line per hparam and per missing tensor, for a person to read. */
 void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out);

@@ -83,12 +83,41 @@ static struct {
 	FILE *f;
 	int writing;
 	int checked;
+	char path[512];
+	char stamp[64];
+	int overridden;
 } wc;
+
+/*
+ * ⚠ THE CACHE IS ONE SEQUENTIAL FILE AND ONE STATIC HANDLE. Records go in in
+ * the order the tensors are built and come back in the same order, so two
+ * graphs staging into it at once would interleave and neither could read the
+ * result. That was fine while the language model was the only thing that
+ * staged; a vision tower or a whisper encoder in the same process is a second
+ * stream.
+ *
+ * So a caller can claim the cache for its own stretch of staging. It closes
+ * whatever was open, which is what makes the previous owner's file complete.
+ */
+void charsiu_wcache_use(const char *path, const char *stamp)
+{
+	if (wc.f) {
+		fclose(wc.f);
+		wc.f = NULL;
+	}
+	wc.writing = 0;
+	wc.checked = 0;
+	wc.overridden = path != NULL;
+	snprintf(wc.path, sizeof(wc.path), "%s", path ? path : "");
+	snprintf(wc.stamp, sizeof(wc.stamp), "%s", stamp ? stamp : "");
+}
 
 static void wcache_setup(unsigned bits, uint64_t grp)
 {
-	const char *path = getenv("CHARSIU_NPU_CACHE");
-	const char *stamp = getenv("CHARSIU_NPU_CACHE_STAMP");
+	const char *path = wc.overridden ? wc.path
+					 : getenv("CHARSIU_NPU_CACHE");
+	const char *stamp = wc.overridden ? wc.stamp
+					  : getenv("CHARSIU_NPU_CACHE_STAMP");
 	struct wcache_head h, want;
 
 	if (wc.checked)

@@ -86,6 +86,199 @@ The work is not the arithmetic, which is written and checked. It is that the
 NPU tensor cache lives in struct llama_state and these three graphs are not
 llama.
 
+### The towers on the hardware, and where the batch actually stops
+
+Board, 2026-08-28, after routing the vision tower and the whisper encoder:
+
+```
+                CPU      NPU     with the cache warm
+  whisper      34.5 s   30.0 s        30.0 s
+  SmolVLM     153.1 s   82.4 s        81.3 s
+  CLIP          4.7 s    3.9 s         2.8 s
+```
+
+⚠⚠ **AND THAT SUBTRACTION WAS WRONG.** The paragraph here used to read: 75 of
+the vision tower's 82 seconds is the quantiser, so take it out and the matmuls
+are 17x. The next board round put the staging BEHIND A CACHE -- whisper's
+quantising went from 19298 ms to 118 -- and the wall clock did not move at all:
+
+```
+  whisper   30.0 s before the cache,  30.1 s after it, 30.0 s warm
+```
+
+Nineteen seconds left the staging line and the total stayed put, so the two
+numbers were never parts of one sum. Nothing was counting how much of the work
+reached the hardware, and a subtraction cannot be checked against a quantity
+nobody measured. `charsiu_pool_report` counts it now: tensors actually routed,
+matmuls, rows, milliseconds, and how many fell back.
+
+The towers do stage eagerly into a cache in `$XDG_CACHE_HOME/charsiu`, and that
+part works -- ⚠ the cache is ONE SEQUENTIAL FILE with one static handle, so a
+caller claims it for its own stretch rather than sharing it, because two graphs
+staging at once interleave and neither can read the result back.
+
+⚠ **AND THE BATCH STOPS AT 80.** Swept against the same tower at two rows,
+which is the smallest verified batch:
+
+```
+  4 8 16 32 48 64 80    0.000000   identical
+  96 and above          56 to 95   a different tower
+```
+
+Mesa's budget test fires above m = 320 and its split above m = 640, so **that
+prediction is about something else**; this is a different limit and it is
+measured rather than derived. The default is 64: inside the edge with a step to
+spare, and the rate is FLAT from 4 rows to 1024 anyway.
+
+⚠ 80 was measured on one tower at K = 768 and 3072. Whether the bound is m alone
+or m against K is not known.
+
+### And then the counter said the matmul was never the cost
+
+`charsiu_pool_report`, added because the 17x above had to be withdrawn:
+
+```
+  whisper   24 of 24 tensors on the hardware; 24 matmuls of 36000 rows in 936 ms
+  CLIP      73 of 73 tensors on the hardware; 72 matmuls of  3600 rows in 210 ms
+```
+
+**936 ms of a 30 second transcription.** So the stage table, which is the thing
+that should have been written before any of the routing:
+
+```
+  attention              2181 ms   62.7%     O(T^2) scalar C, never routed
+  feed forward            670 ms   19.3%     routed
+  q k v                   179 ms    5.2%     routed
+  mel spectrogram         189 ms    5.4%     3000 FFTs
+  the two convolutions     70 ms    2.0%
+  out proj                 59 ms    1.7%     routed
+  the decoder             121 ms    3.5%
+  layernorms                8 ms    0.2%
+```
+
+⚠⚠ **THE WORK THAT WAS ROUTED IS 26% OF THE TIME AND THE ATTENTION IS 63%.**
+1500 positions against 1500, six heads, four layers, in three nested loops --
+and it is not a matmul against a weight, so none of the machinery built for the
+towers touches it. Everything above this heading is correct and was aimed at a
+quarter of the problem.
+
+The next thing is the attention, and the stage table has to come first from now
+on. It cost three board rounds and a withdrawn number to write one.
+
+### The vendor's own table, and what it says we lose
+
+Rockchip publish RK3576 numbers for their runtime on their driver, w4a16, a 128
+token prompt and 64 new tokens (airockchip/rknn-llm/benchmark.md, 2026-08-28).
+`tests/board_vendor.sh` runs the same protocol and prints both columns.
+
+```
+                 ours    theirs      ours TTFT   theirs
+  Qwen3 0.6B    10.48     24.85         7354 ms   469 ms
+  Phi3 3.8B      4.89      6.58        23354 ms  1829 ms
+  SmolVLM-256M image encoder            10000 ms   768 ms
+```
+
+⚠ **THEIR NUMBERS ARE AT MAXIMUM CPU AND NPU FREQUENCY** and ours are at
+whatever the governor is doing. That is in their header and it is not a small
+difference.
+
+⚠⚠ **AND THE TTFT COLUMN WAS ONE BUG, NOT FIVE.** Of the five models in their
+table this tree can run, FOUR were refused by `batch_ok` -- a bias, a query
+norm, a fused K and V, per layer embeddings -- so their prompts went through the
+token loop one token at a time. Only TinyLLAMA batched.
+
+Four of those refusals were lifted on 2026-08-28 because they are the SAME PER
+ROW OPERATION the token loop already does, in the same order: biases, the query
+and key norms, the two post norms, and the logit softcap. Refusing them was
+right while they were unwritten and became the dominant cost the moment there
+was a scoreboard to read.
+
+What is still refused is what would be a different computation: a fused K and V
+needs a tensor split, shared KV needs another layer's cache, a varying feed
+forward width needs per layer buffers, and a sliding window needs a mask this
+loop does not build.
+
+### What the submit count settled
+
+The device's own report, on Rockchip's protocol, with CHARSIU_NPU_W4V=1:
+
+```
+  Qwen3 0.6B    38608 submits   189 us each   5.97 GB/s   222 submits a token
+  TinyLLAMA     47128           206           9.21
+  Phi3 3.8B     68488           460          10.47
+```
+
+⚠ **THE PREFILL IS ON THE HARDWARE, ONE ROW AT A TIME.** Not a CPU fallback:
+every row of the prompt streams the whole weight again, at 6 to 10.5 GB/s, which
+is the board's roof. The hardware is not being lazy -- 222 submits a token is
+what one row per submit means for 28 layers of 7 projections in 1.5 slices.
+
+⚠ **AND THE VENDOR CANNOT BE DOING THAT.** They publish 469 ms to a first token
+for a 128 token prompt on the same model, and 40 ms a token to decode. A prompt
+token 11 times cheaper than a generated one is not one row per submit: Qwen3's
+weights are 300 MB at int4, and 128 rows of that is 38 GB in 469 ms. They batch
+the prefill, on w4a16.
+
+That contradicts what this tree recorded as "w4a16 makes exactly one row". What
+five rounds established is narrower: **charsiu's** w4a16 stream makes one row,
+and no register in it changes that. Their prefill graph may not be the same
+stream at all.
+
+Three ways out, and only the first is free:
+
+1. **the grouped submit**, which this loop had and lost. q, k and v read one
+   RMSNorm output and matvec_pair sends the three in ONE submit; round 321
+   measured the fence at 94% of the hardware path and that grouping took 113
+   fences a token to 65. Batching them as three separate calls turns n grouped
+   submits into 3n the moment the batch is refused -- which on int4 is always.
+   Restored: matmul_rows says whether the hardware took the batch, and the
+   caller groups when it did not.
+2. **int8 for the prompt**, which batches and was measured at 2.94x. It costs a
+   second copy of every projection -- 600 MB on a model whose whole int4 weight
+   is 300 -- and this board's peak is already twice the vendor's.
+3. **find what their prefill stream does that ours cannot.** The only one that
+   removes the problem rather than paying for it.
+
+### Asked their model, and it does not batch either
+
+`lyvivian/Qwen3-0.6B_rk3576_w4a16_4k.rkllm`, 720 MB -- the same model, the same
+board and the same format as the row above -- read with `tools/rkllm_regcmd.py`:
+
+```
+  bits=4.0   M=1    9296     every int4 weight matmul is ONE ROW
+  bits=16.0  M>1    4984     every batched op is fp16
+  bits=8.0   M=1      88
+  no 4-bit stream has M > 1
+```
+
+⚠⚠ **NOT ONE.** And the batched ops are plainly the attention rather than a
+projection: `ic=128 oc=128` is head_dim against head_dim, and the rest have
+`oc=128` with an `ic` that FALLS as M rises -- 4000 at M=32, 1312 at M=124 --
+which is a query block against a growing context, summing to a constant.
+
+So **batching an int4 weight matmul is not the mechanism behind their 469 ms**,
+and the plan to beat their TTFT by doing it was aimed at something they do not
+do. This confirms what round 380 recorded and extends it to the current
+toolchain and to the exact model in the table.
+
+### And then the board contradicted the fence
+
+Grouping q, k and v into one submit per row is fewer fences -- round 321 put the
+fence at 94% of the hardware path -- and it was SLOWER:
+
+```
+  tensor major (three calls)   38608 submits   TTFT 5239 ms
+  grouped (matvec_pair)        35528 submits   TTFT 6302 ms
+```
+
+Eight percent fewer submits and twenty percent slower. The only reading that
+fits is that **consecutive submits of the same weight do not pay for it twice**,
+and grouping threw that locality away to save a fence. Tensor major is the
+default now and `CHARSIU_PREFILL_GROUPED=1` restores the other, so the two can
+be compared in one session on one board rather than across two.
+
+⚠ Two runs on a warming board is a reading, not a result.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:
