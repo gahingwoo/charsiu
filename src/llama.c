@@ -2721,6 +2721,25 @@ static int npu_id_for(struct llama_state *s, const struct gguf_tensor *w)
 }
 
 /* n rows through one set of weights, or the same thing a row at a time */
+/* whether the hardware would take a batch of this tensor, without trying one */
+static int will_batch(struct llama_state *s, const struct gguf_tensor *w)
+{
+	return npu_id_for(s, w) >= 0 && charsiu_npu_batches(s->pool.dev);
+}
+
+/*
+ * ⚠ OFF BY DEFAULT, and the default is the one the board preferred. See the
+ * long note at the call site: fewer fences lost to more weight refetches.
+ */
+static int prefill_grouped(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_PREFILL_GROUPED") != NULL;
+	return v;
+}
+
 /*
  * Returns 1 when the hardware took the whole batch and 0 when this fell back to
  * a row at a time.
@@ -2960,16 +2979,45 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				s->bx + (size_t)r * m->n_embd, L->attn_norm,
 				m->n_embd, m->rms_eps);
 		/*
-		 * ⚠ THREE BATCHED CALLS, OR ONE GROUPED SUBMIT A ROW. If the
-		 * hardware takes the batch, three calls is right: each moves
-		 * its weights once for all n rows. If it refuses -- and w4a16
-		 * refuses every batch, which is the default configuration and
-		 * what the vendor's table compares against -- then three calls
-		 * are 3n single row submits where matvec_pair does n, and the
-		 * fence is 94% of each.
+		 * ⚠⚠ TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
+		 *
+		 * Three calls to matmul_rows do all n rows of q, then all n of
+		 * k, then all n of v -- the same weight, n submits in a row.
+		 * matvec_pair instead does q, k and v for ONE row in one
+		 * submit, which is fewer fences and a different weight every
+		 * time. Round 321 measured the fence at 94% of the hardware
+		 * path, so grouping should win, and on the board it LOST:
+		 *
+		 *   tensor major   38608 submits   TTFT 5239 ms
+		 *   grouped        35528 submits   TTFT 6302 ms
+		 *
+		 * Eight percent fewer submits and twenty percent slower. The
+		 * only reading that fits is that consecutive submits of the
+		 * SAME weight do not pay for it twice, and grouping threw that
+		 * away to save a fence.
+		 *
+		 * ⚠ It is a reading of two runs on a warming board, so it is a
+		 * switch rather than a deletion: CHARSIU_PREFILL_GROUPED=1
+		 * restores the grouping and the two can be compared in one
+		 * session.
+		 *
+		 * ⚠ AND THIS IS WHAT THE VENDOR DOES TOO. Their own w4a16
+		 * RK3576 model -- the model in the row this is measured
+		 * against -- has 9296 four bit weight matmuls and NOT ONE of
+		 * them is above M = 1. Every batched op in it is fp16 and is
+		 * the attention. Batching an int4 weight matmul is not the
+		 * mechanism behind their 469 ms.
 		 */
-		if (matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
-				m->n_head * hd)) {
+		/*
+		 * ⚠ ASKED, NOT TRIED. A first version wrote this as
+		 * `!grouped() || matmul_rows(wq)`, and the short circuit meant
+		 * that in the tensor major case matmul_rows was never called
+		 * for wq at all -- q was simply not computed, and all three
+		 * models came back DIFFERENT. The control caught it in one run.
+		 */
+		if (!prefill_grouped() || will_batch(s, L->wq)) {
+			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
+				    m->n_head * hd);
 			matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
 				    m->n_head_kv * hd);
 			matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
@@ -3085,7 +3133,9 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		}
 
 		/* gate and up read one norm as well: the same choice */
-		if (matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd, nff)) {
+		if (!prefill_grouped() || will_batch(s, L->gate)) {
+			matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd,
+				    nff);
 			matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd,
 				    nff);
 		} else {

@@ -778,6 +778,16 @@ fail:
 	return NULL;
 }
 
+/*
+ * ⚠ WILL A BATCH BE TAKEN, ASKED BEFORE ONE IS TRIED. A caller that has two
+ * strategies has to choose before it acts: trying the batch and falling back
+ * has already done the work of one of them.
+ */
+int charsiu_npu_batches(const struct charsiu_npu *g)
+{
+	return g && !g->w4;
+}
+
 void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)

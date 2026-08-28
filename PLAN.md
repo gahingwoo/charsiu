@@ -239,6 +239,46 @@ Three ways out, and only the first is free:
 3. **find what their prefill stream does that ours cannot.** The only one that
    removes the problem rather than paying for it.
 
+### Asked their model, and it does not batch either
+
+`lyvivian/Qwen3-0.6B_rk3576_w4a16_4k.rkllm`, 720 MB -- the same model, the same
+board and the same format as the row above -- read with `tools/rkllm_regcmd.py`:
+
+```
+  bits=4.0   M=1    9296     every int4 weight matmul is ONE ROW
+  bits=16.0  M>1    4984     every batched op is fp16
+  bits=8.0   M=1      88
+  no 4-bit stream has M > 1
+```
+
+⚠⚠ **NOT ONE.** And the batched ops are plainly the attention rather than a
+projection: `ic=128 oc=128` is head_dim against head_dim, and the rest have
+`oc=128` with an `ic` that FALLS as M rises -- 4000 at M=32, 1312 at M=124 --
+which is a query block against a growing context, summing to a constant.
+
+So **batching an int4 weight matmul is not the mechanism behind their 469 ms**,
+and the plan to beat their TTFT by doing it was aimed at something they do not
+do. This confirms what round 380 recorded and extends it to the current
+toolchain and to the exact model in the table.
+
+### And then the board contradicted the fence
+
+Grouping q, k and v into one submit per row is fewer fences -- round 321 put the
+fence at 94% of the hardware path -- and it was SLOWER:
+
+```
+  tensor major (three calls)   38608 submits   TTFT 5239 ms
+  grouped (matvec_pair)        35528 submits   TTFT 6302 ms
+```
+
+Eight percent fewer submits and twenty percent slower. The only reading that
+fits is that **consecutive submits of the same weight do not pay for it twice**,
+and grouping threw that locality away to save a fence. Tensor major is the
+default now and `CHARSIU_PREFILL_GROUPED=1` restores the other, so the two can
+be compared in one session on one board rather than across two.
+
+⚠ Two runs on a warming board is a reading, not a result.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:

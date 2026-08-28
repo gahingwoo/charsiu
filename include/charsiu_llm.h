@@ -230,6 +230,9 @@ struct charsiu_npu;
  * it is asked for, so a device opened in int4 turns a 1024 row tower into 1024
  * dispatches -- correct, and slower than the CPU it was moved off.
  */
+/* Whether this device takes a batch at all: int8 does, w4a16 makes one row. */
+int charsiu_npu_batches(const struct charsiu_npu *g);
+
 struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 					  unsigned max_tensors, int want_w4);
 
