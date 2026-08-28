@@ -123,6 +123,28 @@ OUT=$("$RUN" "$DIR/smolvlm.gguf" -p "The capital of France is" -n 16 --ignore-eo
 echo "  $OUT"
 echo
 
+echo "== 5. the batched prefill, against the token loop, on this board =="
+# ⚠⚠ THE ONE CHECK THIS ROUND WAS MISSING. The batched prefill is verified byte
+# for byte on a development host across six architectures, and the board has
+# never compared its text against the token loop -- while every round of it runs
+# through hardware the host does not have. Same binary, one flag apart.
+"$RUN" "$DIR/smolvlm.gguf" -p "The history of computing begins long before the
+first electronic machine, and the stored program changed what a machine could be
+told to do. Explain why that mattered." -n 16 --ignore-eos -c 1024 -t 4 \
+	2>/dev/null | grep -v '^\[' > "$DIR/.pa.txt" || true
+CHARSIU_NO_BATCH_PREFILL=1 "$RUN" "$DIR/smolvlm.gguf" -p "The history of computing begins long before the
+first electronic machine, and the stored program changed what a machine could be
+told to do. Explain why that mattered." -n 16 --ignore-eos -c 1024 -t 4 \
+	2>/dev/null | grep -v '^\[' > "$DIR/.pb.txt" || true
+if cmp -s "$DIR/.pa.txt" "$DIR/.pb.txt"; then
+	echo "  PASS  batched and a token at a time say the same words"
+else
+	echo "  FAIL  the batched prefill does not match the token loop"
+	diff "$DIR/.pb.txt" "$DIR/.pa.txt" | head -6 | sed 's/^/     /'
+	FAIL=1
+fi
+echo
+
 echo "======================================================================="
 echo "  whisper $(secs "$T_WSP") s   vision $(secs "$T_VIS") s   clip $(secs "$T_CLP") s"
 if [ -n "${CHARSIU_NPU:-}" ]; then
