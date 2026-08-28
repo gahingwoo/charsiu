@@ -277,6 +277,14 @@ void gguf_matmul(const struct gguf_tensor *w, const struct charsiu_act *a,
 void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 		 float *y, uint64_t row0, uint64_t nrows);
 
+/*
+ * The two kernels an attention is made of, which is not a matmul against a
+ * weight and so has none of the machinery above. NEON where there is NEON.
+ * ⚠ The summation order is not the scalar loop's.
+ */
+float charsiu_dot_f32(const float *a, const float *b, uint64_t n);
+void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
+
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */
 void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst);
 

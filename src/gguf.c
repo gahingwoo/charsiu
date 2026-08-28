@@ -841,6 +841,46 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 
 #endif
 
+/* ---- the two kernels an attention is made of ------------------------------ */
+
+/*
+ * ⚠ THESE ARE FOR THE ATTENTION, WHICH IS NOT A MATMUL AGAINST A WEIGHT and so
+ * has none of the machinery above. On the board it is 68% of a transcription
+ * with every core already working on it: 1500 queries against 1500 keys, and
+ * the innermost thing is a dot product of head_dim floats and a scaled add of
+ * head_dim floats. Both were written as plain loops.
+ *
+ * ⚠ THE SUMMATION ORDER CHANGES. dot_f32 accumulates in eight lanes, so a
+ * result is not bit identical to the scalar loop -- which is why the transcript
+ * and the numpy cross check are run against this rather than assumed.
+ */
+float charsiu_dot_f32(const float *a, const float *b, uint64_t n)
+{
+	return dot_f32(a, b, n);
+}
+
+void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	float32x4_t va = vdupq_n_f32(a);
+	uint64_t i = 0;
+
+	for (; i + 8 <= n; i += 8) {
+		vst1q_f32(y + i, vfmaq_f32(vld1q_f32(y + i),
+					   vld1q_f32(x + i), va));
+		vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4),
+					       vld1q_f32(x + i + 4), va));
+	}
+	for (; i < n; i++)
+		y[i] += a * x[i];
+#else
+	uint64_t i;
+
+	for (i = 0; i < n; i++)
+		y[i] += a * x[i];
+#endif
+}
+
 /* ---- the activation, quantised once per matvec --------------------------- */
 
 /*

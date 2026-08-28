@@ -1090,24 +1090,15 @@ static void wattn_rows(void *ctx, uint64_t r0, uint64_t n)
 		const float *qi = c->q + (size_t)i * c->W + off;
 		float *o = c->o + (size_t)i * c->W + off;
 
-		for (j = 0; j < c->T; j++) {
-			const float *kj = c->k + (size_t)j * c->W + off;
-			float d = 0.0f;
-
-			for (e = 0; e < c->hd; e++)
-				d += qi[e] * kj[e];
-			att[j] = d * c->scale;
-		}
+		for (j = 0; j < c->T; j++)
+			att[j] = charsiu_dot_f32(qi, c->k + (size_t)j * c->W +
+						 off, c->hd) * c->scale;
 		wsoftmax(att, c->T);
 		for (e = 0; e < c->hd; e++)
 			o[e] = 0.0f;
-		for (j = 0; j < c->T; j++) {
-			const float *vj = c->v + (size_t)j * c->W + off;
-			float wg = att[j];
-
-			for (e = 0; e < c->hd; e++)
-				o[e] += wg * vj[e];
-		}
+		for (j = 0; j < c->T; j++)
+			charsiu_axpy_f32(o, c->v + (size_t)j * c->W + off,
+					 att[j], c->hd);
 	}
 	free(att);
 }
@@ -1399,24 +1390,17 @@ const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
 			const float *qi = d->q + off;
 			float *o = d->xb + off;
 
-			for (j = 0; j <= (unsigned)pos; j++) {
-				const float *kj = d->sk[l] + (size_t)j * W + off;
-				float dp = 0.0f;
-
-				for (e = 0; e < hd; e++)
-					dp += qi[e] * kj[e];
-				d->att[j] = dp * scale;
-			}
+			for (j = 0; j <= (unsigned)pos; j++)
+				d->att[j] = charsiu_dot_f32(qi,
+					d->sk[l] + (size_t)j * W + off, hd) *
+					scale;
 			wsoftmax(d->att, (unsigned)pos + 1);
 			for (e = 0; e < hd; e++)
 				o[e] = 0.0f;
-			for (j = 0; j <= (unsigned)pos; j++) {
-				const float *vj = d->sv[l] + (size_t)j * W + off;
-				float wg = d->att[j];
-
-				for (e = 0; e < hd; e++)
-					o[e] += wg * vj[e];
-			}
+			for (j = 0; j <= (unsigned)pos; j++)
+				charsiu_axpy_f32(o,
+					d->sv[l] + (size_t)j * W + off,
+					d->att[j], hd);
 		}
 		wrows(B->o_w, wrow1(B->o_b, d->b1), d->xb, 1, W, d->q, W, &d->a);
 		for (i = 0; i < W; i++)
@@ -1432,24 +1416,19 @@ const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
 			const float *qi = d->q + off;
 			float *o = d->xb + off;
 
-			for (j = 0; j < d->T; j++) {
-				const float *kj = d->xk[l] + (size_t)j * W + off;
-				float dp = 0.0f;
-
-				for (e = 0; e < hd; e++)
-					dp += qi[e] * kj[e];
-				d->att[j] = dp * scale;
-			}
+			/* ⚠ 1500 KEYS PER TOKEN PER HEAD PER LAYER: the cross
+			 * attention is the decoder's whole cost. */
+			for (j = 0; j < d->T; j++)
+				d->att[j] = charsiu_dot_f32(qi,
+					d->xk[l] + (size_t)j * W + off, hd) *
+					scale;
 			wsoftmax(d->att, d->T);
 			for (e = 0; e < hd; e++)
 				o[e] = 0.0f;
-			for (j = 0; j < d->T; j++) {
-				const float *vj = d->xv[l] + (size_t)j * W + off;
-				float wg = d->att[j];
-
-				for (e = 0; e < hd; e++)
-					o[e] += wg * vj[e];
-			}
+			for (j = 0; j < d->T; j++)
+				charsiu_axpy_f32(o,
+					d->xv[l] + (size_t)j * W + off,
+					d->att[j], hd);
 		}
 		wrows(B->xo_w, wrow1(B->xo_b, d->b1), d->xb, 1, W, d->q, W,
 		      &d->a);

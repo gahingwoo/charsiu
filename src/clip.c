@@ -679,24 +679,17 @@ int charsiu_clip_encode_text(struct charsiu_clip_text *t, const int32_t *ids,
 				const float *qi = q + (size_t)i * W + off;
 				float *o = xb + (size_t)i * W + off;
 
-				for (j = 0; j <= i; j++) {
-					const float *kj = k + (size_t)j * W + off;
-					float d = 0.0f;
-
-					for (e = 0; e < hd; e++)
-						d += qi[e] * kj[e];
-					att[j] = d * scale;
-				}
+				for (j = 0; j <= i; j++)
+					att[j] = charsiu_dot_f32(qi,
+						k + (size_t)j * W + off, hd) *
+						scale;
 				tsoftmax(att, i + 1);
 				for (e = 0; e < hd; e++)
 					o[e] = 0.0f;
-				for (j = 0; j <= i; j++) {
-					const float *vj = v + (size_t)j * W + off;
-					float wgt = att[j];
-
-					for (e = 0; e < hd; e++)
-						o[e] += wgt * vj[e];
-				}
+				for (j = 0; j <= i; j++)
+					charsiu_axpy_f32(o,
+						v + (size_t)j * W + off,
+						att[j], hd);
 			}
 		}
 		trows(L->o_w, trow1(L->o_b, b1), xb, n, W, q, W, &a);

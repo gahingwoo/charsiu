@@ -693,24 +693,15 @@ static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
 		const float *qi = c->q + (size_t)i * c->W + off;
 		float *o = c->o + (size_t)i * c->W + off;
 
-		for (j = 0; j < c->n; j++) {
-			const float *kj = c->k + (size_t)j * c->W + off;
-			float d = 0.0f;
-
-			for (e = 0; e < c->hd; e++)
-				d += qi[e] * kj[e];
-			att[j] = d * c->scale;
-		}
+		for (j = 0; j < c->n; j++)
+			att[j] = charsiu_dot_f32(qi, c->k + (size_t)j * c->W +
+						 off, c->hd) * c->scale;
 		vsoftmax(att, c->n);
 		for (e = 0; e < c->hd; e++)
 			o[e] = 0.0f;
-		for (j = 0; j < c->n; j++) {
-			const float *vj = c->v + (size_t)j * c->W + off;
-			float wg = att[j];
-
-			for (e = 0; e < c->hd; e++)
-				o[e] += wg * vj[e];
-		}
+		for (j = 0; j < c->n; j++)
+			charsiu_axpy_f32(o, c->v + (size_t)j * c->W + off,
+					 att[j], c->hd);
 	}
 	free(att);
 }
