@@ -626,6 +626,13 @@ struct llama_state {
 	 * same number; a buffer sized by n_embd truncates every row.
 	 */
 	float *bq, *bk, *bv, *bao;
+	/*
+	 * ⚠ MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
+	 * read each weight row once for all m. It is four times SLOWER than n
+	 * calls to llama's own matvec and it changes the text, because matvec
+	 * is not gguf_matvec -- see the note in matmul_rows. Kept as fields
+	 * that are never allocated would be worse than kept as a comment.
+	 */
 	unsigned bx_n;
 	float *hb, *hb2;       /* n_ff */
 	float *q;              /* n_head * head_dim */

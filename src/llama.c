@@ -2353,6 +2353,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bx); free(s->bxb); free(s->bxo);
 	free(s->bhb); free(s->bhb2); free(s->bcs);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
+
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
 	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
@@ -2728,9 +2729,33 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		return 0;
 	/*
 	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
-	 * above can only ever be checked on the board. matvec is the same call
-	 * llama_forward makes, so a run with no hardware at all compares the
-	 * two layer loops and nothing else.
+	 * above can only ever be checked on the board.
+	 *
+	 * ⚠⚠ BUT NOT ONE ROW AT A TIME. This fell back to n calls to matvec,
+	 * which reads every weight row n times -- and the board's own numbers
+	 * say what that costs: with CHARSIU_NPU_W4V=1, which is the default and
+	 * what Rockchip's table compares against, charsiu_npu_matmul REFUSES
+	 * every batch because w4a16 makes one row, so this fallback IS the
+	 * prefill. Qwen3 0.6B prefilled at 46 ms a token against a decode of
+	 * 63: a token loop with the output head skipped, which is exactly what
+	 * the numbers looked like.
+	 *
+	 * ⚠⚠ AND gguf_matmul IS NOT THE ANSWER, MEASURED. It reads each weight
+	 * row once for all m rows, which is the right idea and the wrong
+	 * function: matvec here is LLAMA'S matvec, not gguf_matvec. It uses the
+	 * requantised NPU copy when npu_mode is on and the activation's own q1
+	 * form, and gguf_matmul knows about neither -- with the activations
+	 * unquantised it falls into the scalar float path and dequantises the
+	 * weight per row anyway.
+	 *
+	 *   tinyllama   4880 ms against 1203        FOUR TIMES SLOWER
+	 *   qwen2.5     1723 ms against  775
+	 *   qwen3       2141 ms against  940, and the text CHANGED
+	 *
+	 * Two of the four also stopped matching the token loop, which is what
+	 * "a different function" looks like from outside. Batching this path
+	 * properly means teaching llama's own matvec to take m rows, not
+	 * routing around it.
 	 */
 	for (int r = 0; r < n; r++)
 		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
@@ -2853,6 +2878,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * I did it again in the batched copy of the same loop.
 		 */
 		s->bao = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
+
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
 		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao) {
 			s->bx_n = 0;
