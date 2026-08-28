@@ -25,6 +25,7 @@
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
+#include "charsiu_vision.h"
 
 static double now_ms(void)
 {
@@ -115,6 +116,11 @@ int main(int argc, char **argv)
 	 */
 	const char *sys = NULL;
 	int n_gen = 64, n_ctx = 0, nthreads = 0, chat = 0, quiet = 0;
+	const char *image = NULL, *mmproj = NULL;
+	struct charsiu_vision vis;
+	float *img_embd = NULL;
+	unsigned img_tok = 0;
+	int have_vision = 0, n_img_at = -1;
 	int show_tokens = 0, show_logits = 0, show_info = 0;
 	/*
 	 * ⚠ -1 MEANS ASK THE FILE. tokenizer_encode has always taken that and
@@ -182,6 +188,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--cache")) cache = "";
 		else if (!strcmp(a, "--cache-at")) cache = NEXT();
 		else if (!strcmp(a, "-q")) quiet = 1;
+		else if (!strcmp(a, "--image")) image = NEXT();
+		else if (!strcmp(a, "--mmproj")) mmproj = NEXT();
 		else { usage(); return 2; }
 #undef NEXT
 	}
@@ -243,6 +251,71 @@ int main(int argc, char **argv)
 		return 1;
 	t_load = now_ms() - t0;
 	fmt = chat_format_of(m.tk);
+
+	/*
+	 * ⚠ AN mmproj IS A SEPARATE FILE FROM THE MODEL, and it is the most
+	 * likely thing a person does not have. Guess the conventional name
+	 * beside the model before asking for it, and if that fails say the two
+	 * paths tried rather than "no such file".
+	 */
+	if (image) {
+		char guess[1024];
+
+		if (!mmproj && path) {
+			const char *slash = strrchr(path, '/');
+			int dirlen = slash ? (int)(slash - path) + 1 : 0;
+
+			snprintf(guess, sizeof(guess), "%.*smmproj-%s", dirlen,
+				 path, slash ? slash + 1 : path);
+			mmproj = guess;
+		}
+		if (charsiu_vision_open(&vis, mmproj)) {
+			fprintf(stderr, "charsiu_run: %s\n",
+				charsiu_vision_why_not(&vis));
+			charsiu_vision_describe(&vis, stderr);
+			return 1;
+		}
+		have_vision = 1;
+		/*
+		 * ⚠ THE PROJECTOR HAS TO LAND IN THIS MODEL'S SPACE. An mmproj
+		 * from a different model opens, reads and computes, and then
+		 * hands over rows of the wrong width -- which as a memcpy is a
+		 * fluent answer about nothing.
+		 */
+		if (charsiu_vision_width(&vis) != m.n_embd) {
+			fprintf(stderr, "charsiu_run: this tower makes %u wide "
+				"embeddings and the model takes %u -- the "
+				"mmproj belongs to a different model\n",
+				charsiu_vision_width(&vis), m.n_embd);
+			return 1;
+		}
+		{
+			char err[256] = "";
+			float *px = charsiu_image_load(image, vis.image_size,
+						       err, sizeof(err));
+
+			if (!px) {
+				fprintf(stderr, "charsiu_run: %s\n", err);
+				return 1;
+			}
+			charsiu_vision_normalise(&vis, px);
+			img_tok = charsiu_vision_tokens(&vis);
+			img_embd = malloc((size_t)img_tok * m.n_embd *
+					  sizeof(float));
+			if (!img_embd || charsiu_vision_encode(&vis, px,
+							       img_embd)) {
+				fprintf(stderr, "charsiu_run: the tower would "
+					"not run\n");
+				free(px);
+				return 1;
+			}
+			free(px);
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: %s is %u tokens "
+					"through the vision tower\n",
+					image, img_tok);
+		}
+	}
 	/*
 	 * The default, once the format is known. phi3 gets none for the reason
 	 * above; the others are unchanged, and an explicit --sys wins over both.
@@ -394,7 +467,49 @@ int main(int argc, char **argv)
 	}
 
 	/* ⚠ add_bos only once: a second one mid-conversation is a new document */
-	n_ids = tokenizer_encode(m.tk, feed, turn == 0 ? add_bos : 0, ids, max_ids);
+	/*
+	 * ⚠ WHERE THE PICTURE GOES IS PART OF THE PROMPT. Every family spells
+	 * its placeholder differently and puts it somewhere different in its
+	 * template, so this does not guess: `<image>` in the prompt text is
+	 * split on, the two halves are tokenized separately, and the tower's
+	 * embeddings go in the gap. A prompt without the marker puts the
+	 * picture first, after the BOS, which is where every template this has
+	 * seen puts it -- and it says so rather than doing it quietly.
+	 */
+	n_img_at = -1;
+	if (img_embd && turn == 0) {
+		const char *mk = strstr(feed, "<image>");
+
+		if (mk) {
+			char *head = malloc((size_t)(mk - feed) + 1);
+
+			if (!head)
+				return 1;
+			memcpy(head, feed, (size_t)(mk - feed));
+			head[mk - feed] = 0;
+			n_img_at = tokenizer_encode(m.tk, head, add_bos, ids,
+						    max_ids);
+			free(head);
+			if (n_img_at < 0)
+				n_img_at = -1;
+			else
+				n_ids = n_img_at +
+					tokenizer_encode(m.tk, mk + 7, 0,
+							 ids + n_img_at,
+							 max_ids - n_img_at);
+		}
+		if (n_img_at < 0) {
+			n_ids = tokenizer_encode(m.tk, feed, add_bos, ids,
+						 max_ids);
+			n_img_at = add_bos && n_ids > 0 ? 1 : 0;
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: no <image> in the "
+					"prompt, so the picture goes first\n");
+		}
+	} else {
+		n_ids = tokenizer_encode(m.tk, feed,
+					 turn == 0 ? add_bos : 0, ids, max_ids);
+	}
 	if (n_ids < 0) {
 		fprintf(stderr, "charsiu_run: the prompt did not tokenize\n");
 		return 1;
@@ -420,7 +535,8 @@ int main(int argc, char **argv)
 	}
 
 	/* ⚠ what is LEFT, not what the context is: turn five starts at st->pos */
-	if (st->pos + n_ids + n_gen >= st->n_ctx) {
+	if (st->pos + n_ids + (int)(n_img_at >= 0 ? img_tok : 0) + n_gen >=
+	    st->n_ctx) {
 		if (interactive) {
 			printf("\n[the %d token context is full -- /quit and start again]\n",
 			       st->n_ctx);
@@ -477,7 +593,24 @@ int main(int argc, char **argv)
 
 		if (chunk < 2)
 			chunk = 2;
-		if (!getenv("CHARSIU_NO_BATCH_PREFILL") && n_ids >= 2) {
+		/*
+		 * ⚠ A PROMPT WITH A PICTURE IN IT TAKES THE TOKEN LOOP. The
+		 * batched path builds its rows from the embedding table by
+		 * token id, and half of these rows did not come from there.
+		 * Sending them through it would batch the text and drop the
+		 * picture, which is a fluent answer about nothing.
+		 */
+		if (n_img_at >= 0) {
+			unsigned u;
+
+			for (i = 0; i < n_img_at; i++)
+				logits = llama_forward(st, ids[i], st->pos);
+			for (u = 0; u < img_tok; u++)
+				logits = llama_forward_embd(st,
+					img_embd + (size_t)u * m.n_embd,
+					st->pos);
+			done = n_img_at;
+		} else if (!getenv("CHARSIU_NO_BATCH_PREFILL") && n_ids >= 2) {
 			int probe = n_ids < chunk ? n_ids : chunk;
 
 			if (!llama_prefill_batch(st, &m, ids, probe, st->pos)) {
@@ -510,7 +643,11 @@ int main(int argc, char **argv)
 		if (!quiet && charsiu_diag()) {
 			const char *why = llama_batch_why_not(&m);
 
-			if (done >= n_ids)
+			if (n_img_at >= 0)
+				fprintf(stderr, "charsiu: prompt a token at a "
+					"time, with %u picture embeddings after "
+					"token %d\n", img_tok, n_img_at);
+			else if (done >= n_ids)
 				fprintf(stderr, "charsiu: prompt batched, %d "
 					"tokens in chunks of %d\n",
 					n_ids, chunk);
@@ -540,7 +677,11 @@ int main(int argc, char **argv)
 	 */
 	if (batch_probe) {
 		llama_batch_probe(st, &m, batch_probe);
-		llama_state_free(st);
+		if (have_vision) {
+		charsiu_vision_close(&vis);
+		free(img_embd);
+	}
+	llama_state_free(st);
 		llama_free(&m);
 		return 0;
 	}
@@ -805,11 +946,25 @@ next:
 		printf("\n\n[load %.0f ms | ", t_load);
 		if (t_stage > 1.0)
 			printf("staging %.0f ms | ", t_stage);
-		printf("prompt %d tok in %.0f ms, %.2f tok/s"
-		       " | gen %d tok in %.0f ms, %.2f tok/s | peak %ld MB]\n",
-		       n_ids, t_pre, n_ids * 1000.0 / (t_pre ? t_pre : 1),
-		       produced, t_gen, produced * 1000.0 / (t_gen ? t_gen : 1),
-		       hwm / 1024);
+		/*
+		 * ⚠ THE PICTURE'S EMBEDDINGS ARE PROMPT TOKENS. They are 64 of
+		 * the 78 forward passes a SmolVLM caption makes, and counting
+		 * only the 14 that came from the vocabulary reported 15.90
+		 * tok/s for work that ran at 88. A denominator that leaves out
+		 * five sixths of the work is not a slower number, it is a
+		 * different quantity wearing the same unit.
+		 */
+		{
+			int np = n_ids + (int)(n_img_at >= 0 ? img_tok : 0);
+
+			printf("prompt %d tok in %.0f ms, %.2f tok/s"
+			       " | gen %d tok in %.0f ms, %.2f tok/s"
+			       " | peak %ld MB]\n",
+			       np, t_pre, np * 1000.0 / (t_pre ? t_pre : 1),
+			       produced, t_gen,
+			       produced * 1000.0 / (t_gen ? t_gen : 1),
+			       hwm / 1024);
+		}
 		}
 		/*
 		 * ⚠ THE HALVES, NOT A ROLLING AVERAGE. Attention grows with the

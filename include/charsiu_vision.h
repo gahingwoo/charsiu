@@ -125,4 +125,14 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 /* (v - mean) / std, per channel, in place. */
 void charsiu_vision_normalise(const struct charsiu_vision *v, float *px);
 
+/*
+ * A jpeg, png, bmp or gif off the disk as [3][side][side] f32 in 0..1, resized
+ * bilinearly on the half pixel centres. NOT normalised: pass it through
+ * charsiu_vision_normalise, which knows the tower's own mean and std.
+ *
+ * Returns a malloc'd buffer, or NULL with a sentence in `err`.
+ */
+float *charsiu_image_load(const char *path, unsigned side, char *err,
+			  size_t errlen);
+
 #endif /* CHARSIU_VISION_H */

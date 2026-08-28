@@ -33,19 +33,28 @@ static void fake_image(float *px, unsigned n)
 		px[t] = ((float)(t % 251u) / 251.0f) * 2.0f - 1.0f;
 }
 
-static int encode(struct charsiu_vision *v)
+static int encode(struct charsiu_vision *v, const char *image)
 {
 	unsigned n = 3u * v->image_size * v->image_size;
 	unsigned tok = charsiu_vision_tokens(v), w = charsiu_vision_width(v);
-	float *px = malloc((size_t)n * sizeof(float));
+	char err[256] = "";
+	float *px = image ? charsiu_image_load(image, v->image_size, err,
+					       sizeof(err))
+			  : malloc((size_t)n * sizeof(float));
 	float *out = malloc((size_t)tok * w * sizeof(float));
 	unsigned i;
 
-	if (!px || !out) {
-		free(px); free(out);
+	if (!px) {
+		fprintf(stderr, "charsiu_vision: %s\n", err);
+		free(out);
 		return 1;
 	}
-	fake_image(px, n);
+	if (!out) {
+		free(px);
+		return 1;
+	}
+	if (!image)
+		fake_image(px, n);
 	charsiu_vision_normalise(v, px);
 	if (charsiu_vision_encode(v, px, out)) {
 		fprintf(stderr, "charsiu_vision: the tower would not run\n");
@@ -59,18 +68,49 @@ static int encode(struct charsiu_vision *v)
 	return 0;
 }
 
+/*
+ * ⚠ THE RESIZE IS TESTABLE ON ITS OWN, and it has to be: a half pixel shift is
+ * invisible in a caption and fatal to a comparison. This mode needs no model.
+ */
+static int resize_mode(const char *path, unsigned side)
+{
+	char err[256] = "";
+	float *px = charsiu_image_load(path, side, err, sizeof(err));
+	unsigned i;
+
+	if (!px) {
+		fprintf(stderr, "charsiu_vision: %s\n", err);
+		return 1;
+	}
+	printf("pixels 3 %u %u\n", side, side);
+	for (i = 0; i < 3u * side * side; i++)
+		printf("%.7g\n", (double)px[i]);
+	free(px);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct charsiu_vision v;
+	const char *image = NULL;
 	int rc, want_encode = 0, i;
 
-	for (i = 1; i < argc; i++)
+	if (argc >= 4 && !strcmp(argv[1], "--resize"))
+		return resize_mode(argv[2], (unsigned)atoi(argv[3]));
+
+	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--encode"))
 			want_encode = 1;
+		else if (!strcmp(argv[i], "--image") && i + 1 < argc)
+			image = argv[++i];
+	}
+	if (image)
+		want_encode = 1;
 
 	if (argc < 2) {
 		fprintf(stderr,
-			"usage: charsiu_vision MMPROJ.gguf [--encode]\n"
+			"usage: charsiu_vision MMPROJ.gguf [--encode] [--image FILE]\n"
+			"       charsiu_vision --resize FILE SIDE\n"
 			"\n"
 			"  Reads a vision tower's hparams and tensors and says\n"
 			"  whether this build can run it. An mmproj is a\n"
@@ -87,7 +127,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (want_encode)
-		rc = encode(&v);
+		rc = encode(&v, image);
 	charsiu_vision_close(&v);
 	return rc ? 1 : 0;
 }
