@@ -766,6 +766,27 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * the height axis and undercounts by exactly inw for the width one.
 	 */
 	surf = charsiu_entries_per_row(&surfmm) * inw;
+	/*
+	 * ⚠ THE SPLIT WINDOW, AND WHY IT IS SCOPED TO THE WIDTH AXIS.
+	 *
+	 * surf * rows is the whole input surface either way round: inw * M on
+	 * the width axis and 1 * M on the height. Above 4096 of them the
+	 * vendor's stream carries the split CBUF pair.
+	 *
+	 * Read symmetrically across its whole file rather than off the int4
+	 * streams it was noticed in, "more than 4096 implies split" holds on
+	 * all 8692 streams with no exception -- but the CONVERSE fails: 240 of
+	 * its 4940 fp16 streams split below the threshold too. So it is a
+	 * sufficient condition and not a definition, and there is no evidence
+	 * at all for int8, whose 40 streams here never reach 4096.
+	 *
+	 * int8 above 4096 is exactly the batched path that already works on
+	 * this board -- k = 8192 at m = 64 is 8192 atoms and it has been right
+	 * since the 2.94x round -- so a rule read off int4 must not reach it.
+	 * Scoped to `wide`, every stream that runs today is bit identical to
+	 * before this line existed.
+	 */
+	unsigned split = wide && surf * rows > 4096;
 	size_t wbytes = charsiu_weight_bytes(mm);
 	int w4a16 = 0, w4_dpu = 0;
 	unsigned wide8 = 0;
@@ -821,8 +842,22 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     (charsiu_effective_adtype(mm) == CHARSIU_FP16 ? 0x20000000u : 0u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
+	/*
+	 * ⚠ THE SPLIT CBUF PAIR IS A FUNCTION OF surf * M, and this wrote the
+	 * unsplit one at every M.
+	 *
+	 * The rule is exact on the vendor's own file: of its 3328 int4 streams,
+	 * every one with surf * M > 4096 carries the split pair and every one
+	 * at or below carries the unsplit, 0 disagreements. Both of its cbuf
+	 * window variants take it -- 0x0404 becomes 0x0505 and 0x040b becomes
+	 * 0x050c -- so it adds 0x0101 rather than replacing the word.
+	 *
+	 * It is a no-op below the threshold, which is every shape this tree has
+	 * ever run: at M = 1 an ic of 131072 would be needed to reach it.
+	 */
 	emit(&e, CNA, 0x1018,
-	     job->cbuf_window == 1 ? 0x4000040bu : 0x40000404u);
+	     (job->cbuf_window == 1 ? 0x4000040bu : 0x40000404u) +
+	     (split ? 0x0101u : 0u));
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
 	emit(&e, CNA, 0x1024, n_pad - 1);
@@ -850,7 +885,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x103c,
 	     (surf << 16) | (job->cbuf_window == 1 ? 0x1c00u : 0u));
 	emit(&e, CNA, 0x1040,
-	     job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u);
+	     (job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u) +
+	     (split ? 0x04000000u : 0u));
 	emit(&e, CNA, 0x1044, (inw << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);
 	emit(&e, CNA, 0x104c, 0x00010001);
@@ -909,7 +945,18 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1110, job->weight_addr);
 	emit(&e, CNA, 0x1140, 0x00000000);
 	emit(&e, CNA, 0x1144, 0x00000000);
-	emit(&e, CNA, 0x118c, ((inw - 1) << 16) | (rows - 1));
+	/*
+	 * ⚠ BOTH HALVES ARE M - 1 ON THE WIDTH AXIS, not the width and the
+	 * height. The vendor's int4 streams carry 0x004f004f at M = 80 on an
+	 * image ONE ROW HIGH, so the low half is not the row count there; and
+	 * ((M-1) << 16) | (M-1) is exact on all 3328 of them.
+	 *
+	 * Round 380 set this register from the vendor's file and the board said
+	 * it made no difference. That round ran on the HEIGHT axis, where M
+	 * moves nothing at all, so it did not test this and does not excuse it.
+	 */
+	emit(&e, CNA, 0x118c, wide ? (((inw - 1) << 16) | (inw - 1))
+				   : (((inw - 1) << 16) | (rows - 1)));
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to

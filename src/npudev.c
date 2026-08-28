@@ -1677,6 +1677,19 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * land on a device, so they are reallocated when either does and never by a
  * decode, which uses none of them.
  */
+/*
+ * Both switches or neither. An int4 batch on the height axis is the wrong
+ * answer at a very good speed, which is the one failure mode this tree has
+ * already shipped once.
+ */
+static int w4_batch_gate(void)
+{
+	const char *b = getenv("CHARSIU_NPU_W4_BATCH");
+	const char *a = getenv("CHARSIU_M_AXIS");
+
+	return b && *b != '0' && a && (*a == 'w' || *a == 'W');
+}
+
 static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 		      unsigned nslots)
 {
@@ -1763,9 +1776,26 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * between the two streams has been put back one at a time -- the DPU
 	 * and RDMA blocks are identical to begin with, the CNA differences are
 	 * datatype scaling, CORE 0x301c is inert and 0x3018 is the arithmetic
-	 * switch. job.c has said since round 347 that the vendor runs w4a16 on
-	 * the WIDTH axis, and the vendor never batches a weight matmul at all,
-	 * so there is no M > 1 int4 stream anywhere to copy.
+	 * switch.
+	 *
+	 * ⚠⚠ THE LAST SENTENCE OF THIS USED TO BE "the vendor never batches a
+	 * weight matmul at all, so there is no M > 1 int4 stream anywhere to
+	 * copy", AND IT IS FALSE. It came from reading M off the row count.
+	 * The vendor's Llama-3.2-1B .rkllm holds 3328 int4 streams and 2816 of
+	 * them -- 85% -- are batched, at M of 16, 24, 32, 40, 48, 64 and 80.
+	 * They read as one row because the int4 path carries M on the WIDTH,
+	 * so its row count is 1 whatever M is; its fp16 streams put M on the
+	 * height, where rows and pixels agree, which is why the two axes were
+	 * never told apart. tools/cmp_vendor.py compares on the pixel count now.
+	 *
+	 * ⚠ AND THE LARGEST M THE VENDOR EMITS IS 80, which is the ceiling this
+	 * board found on its own: the batched prefill is exact to m = 80 and
+	 * wrong from 96. Two independent sources, one number.
+	 *
+	 * So every word of the paragraph above is about the HEIGHT axis, which
+	 * is the one that produces a single row. What has never run on this
+	 * board is the width axis, and that is now the only form of this the
+	 * vendor is known to use.
 	 *
 	 * Batching amortises the weight bytes over m rows, which is exactly
 	 * what makes int8's extra byte cheap: at m = 32 the same weights serve
@@ -1791,8 +1821,16 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 *
 	 * The caller falls back to a row at a time, which is correct and is
 	 * what int4 did before any of this existed.
+	 *
+	 * ⚠ CHARSIU_NPU_W4_BATCH=1 LIFTS IT, and only together with
+	 * CHARSIU_M_AXIS=w. The height axis is the form five rounds proved
+	 * writes one row, so letting it batch would just reproduce the wrong
+	 * answer at 37 tok/s again. The width axis is what the vendor's own
+	 * stream does and what charsiu now matches it on, and it has never been
+	 * on this board -- so it is an experiment with a switch, not a default.
+	 * llama_batch_probe checks every row before it times anything.
 	 */
-	if (g->w4) {
+	if (g->w4 && !w4_batch_gate()) {
 		whine(g, "int4 computes one row: batching is int8 only",
 		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
 		return -1;

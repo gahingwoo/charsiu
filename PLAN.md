@@ -194,9 +194,9 @@ right while they were unwritten and became the dominant cost the moment there
 was a scoreboard to read.
 
 What is still refused is what would be a different computation: a fused K and V
-needs a tensor split, shared KV needs another layer's cache, a varying feed
-forward width needs per layer buffers, and a sliding window needs a mask this
-loop does not build.
+needs a tensor split, shared KV needs another layer's cache, and a varying feed
+forward width needs per layer buffers. (The sliding window left this list the
+same day; the paragraph above is the state before that.)
 
 ### What the submit count settled
 
@@ -224,6 +224,10 @@ five rounds established is narrower: **charsiu's** w4a16 stream makes one row,
 and no register in it changes that. Their prefill graph may not be the same
 stream at all.
 
+⚠ **ANSWERED, TWO SECTIONS DOWN.** It is the same stream with M on the other
+axis. Way 3 below was the one that removes the problem and it is no longer a
+question.
+
 Three ways out, and only the first is free:
 
 1. **the grouped submit**, which this loop had and lost. q, k and v read one
@@ -239,7 +243,7 @@ Three ways out, and only the first is free:
 3. **find what their prefill stream does that ours cannot.** The only one that
    removes the problem rather than paying for it.
 
-### Asked their model, and it does not batch either
+### Asked their model, and read the wrong axis
 
 `lyvivian/Qwen3-0.6B_rk3576_w4a16_4k.rkllm`, 720 MB -- the same model, the same
 board and the same format as the row above -- read with `tools/rkllm_regcmd.py`:
@@ -247,19 +251,78 @@ board and the same format as the row above -- read with `tools/rkllm_regcmd.py`:
 ```
   bits=4.0   M=1    9296     every int4 weight matmul is ONE ROW
   bits=16.0  M>1    4984     every batched op is fp16
-  bits=8.0   M=1      88
   no 4-bit stream has M > 1
 ```
 
-⚠⚠ **NOT ONE.** And the batched ops are plainly the attention rather than a
-projection: `ic=128 oc=128` is head_dim against head_dim, and the rest have
-`oc=128` with an `ic` that FALLS as M rises -- 4000 at M=32, 1312 at M=124 --
-which is a query block against a growing context, summing to a constant.
+**That reading was wrong, and the next section is the correction.** It is left
+here because the mistake is the useful part: M was taken from the register that
+holds the row count.
 
-So **batching an int4 weight matmul is not the mechanism behind their 469 ms**,
-and the plan to beat their TTFT by doing it was aimed at something they do not
-do. This confirms what round 380 recorded and extends it to the current
-toolchain and to the exact model in the table.
+### They batch int4 after all, up to 80, and 80 is our own ceiling
+
+`Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm` -- a model this tree also has as a
+gguf, so both sides of the comparison are on one desktop. Reading M from the
+PIXEL count (`0x1034`) instead of the row count (`0x102c`):
+
+```
+  bits=4.0    3328 streams   M = 1:512  16:384  24:64  32:512
+                                 40:320 48:384  64:384 80:768
+              2816 of 3328 -- 85% -- are BATCHED
+  bits=16.0   4940 streams   rows == pixels in 4940 of 4940
+  largest int4 M anywhere in the file:  80
+```
+
+⚠⚠ **THE TWO AXES ARE THE WHOLE STORY.** The vendor's fp16 attention is emitted
+as an M row image, so its row count and its pixel count are the same number --
+all 4940 of them -- and a reader that takes rows is right about fp16 and never
+finds out. Its int4 projections are emitted as a **one row image, M pixels
+wide**, so their row count is 1 whatever M is. Every int4 stream in every
+.rkllm read here therefore reported M = 1, and the file was made to say the
+opposite of what it holds.
+
+⚠ **AND THE LARGEST M THEY EMIT IS 80.** This board's own batched prefill is
+byte exact to m = 80 and wrong from 96. Their compiler never goes above 80.
+Two independent sources, one number, neither of them looking at the other.
+
+So batching an int4 weight matmul **is** available, and the plan to beat their
+TTFT by doing it was aimed at something they do every layer.
+
+### What charsiu emits, against what they emit
+
+`tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not
+the geometry-only `regcmd.c` nothing else calls -- and merges the DPU stream
+the vendor puts right behind each CNA one. Same shape, `ic=2048 oc=1024 int4`:
+
+```
+             M=1   M=16  M=32  M=48  M=64  M=80    registers differing
+  height      3     14    12    14    12    16     (today's default)
+  width       3      5     2     5     2     5     (CHARSIU_M_AXIS=w)
+```
+
+At M = 32 and 64 the width axis is **two registers** from the vendor's stream --
+fewer than at M = 1, where this hardware is known to be right. The two are a
+flag that alternates between the vendor's own streams at a fixed M, and one
+DPU register that does the same.
+
+Two differences were real and are fixed:
+
+- **`0x118c` is M-1 in BOTH halves** on the width axis, not width and height.
+  Exact on all 3328. Round 380 set this register from the vendor's file and the
+  board said it changed nothing -- that round ran on the height axis, where M
+  moves nothing at all, so it did not test this.
+- **the split CBUF pair** when the input surface passes 4096 atoms. Read
+  symmetrically across the whole file, "more than 4096 implies split" holds on
+  all 8692 streams; the converse fails on 240 fp16 ones, and int8 has no
+  evidence either way because its 40 streams never reach the threshold. So it
+  is scoped to the width axis, and every stream that runs today is bit
+  identical to before.
+
+⚠ **NONE OF THIS HAS BEEN ON THE BOARD.** `tests/board_w4_axis.sh` is that
+round: the height axis first as a control -- it must fail, or the probe is not
+discriminating -- then the width one, checked row by row before anything is
+timed. `CHARSIU_NPU_W4_BATCH=1` lifts the refusal and only together with
+`CHARSIU_M_AXIS=w`, because an int4 batch on the height axis is the wrong
+answer at 37 tok/s and this tree has already shipped that once.
 
 ### And then the board contradicted the fence
 
@@ -365,8 +428,12 @@ Five rounds went into establishing that the int4 path cannot do this at all.
 w4a16 produces exactly ONE row: fed the same activation twice, row 1 comes back
 matching row 0 in 1 of 2048. The DPU and RDMA blocks are identical to a stream
 that does two rows, all 69 and all 22 registers, and every CNA word that
-differs was put back one at a time with a liveness check between them. The
-vendor never batches a weight matmul, so there is no M > 1 int4 stream to copy.
+differs was put back one at a time with a liveness check between them.
+
+⚠ **ALL FIVE RAN ON THE HEIGHT AXIS**, and the sentence that used to end this
+paragraph -- "the vendor never batches a weight matmul, so there is no M > 1
+int4 stream to copy" -- was false. There are 2816 of them in one file, one row
+high and M pixels wide, and the largest is 80.
 
 Two registers on that path were literals chosen at M = 1, the one width where a
 value that follows the row count cannot show that it does: 0x40b8's 3, which is
