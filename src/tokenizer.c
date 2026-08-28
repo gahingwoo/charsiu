@@ -215,6 +215,9 @@ static void smap_put(struct smap *m, const char *k, uint64_t n, int32_t v)
 	m->used++;
 }
 
+/* defined below, next to the SentencePiece encoder it belongs to */
+static int32_t spm_byte(const struct tokenizer *tk, unsigned char b);
+
 static int32_t smap_get(const struct smap *m, const char *k, uint64_t n)
 {
 	size_t i = fnv(k, n) & (m->cap - 1);
@@ -226,6 +229,7 @@ static int32_t smap_get(const struct smap *m, const char *k, uint64_t n)
 	}
 	return -1;
 }
+
 
 /* ---- the tokenizer ------------------------------------------------------- */
 
@@ -270,6 +274,7 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 {
 	const struct gguf_kv *toks = gguf_find(g, "tokenizer.ggml.tokens");
 	const struct gguf_kv *types = gguf_find(g, "tokenizer.ggml.token_type");
+	int spm_model, sc_present;
 	const struct gguf_kv *merges = gguf_find(g, "tokenizer.ggml.merges");
 	struct tokenizer *tk;
 	const uint8_t *p;
@@ -349,6 +354,31 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 		gguf_get_str(g, "tokenizer.ggml.model", tmodel, sizeof(tmodel));
 		if (!strcmp(tmodel, "gemma4"))
 			merges = NULL;
+	}
+
+	/*
+	 * ⚠⚠ THE MODEL KEY DECIDES, NOT THE PRESENCE OF MERGES. TheBloke's
+	 * TinyLlama-1.1B gguf declares tokenizer.ggml.model = llama --
+	 * SentencePiece -- AND carries a 61249 entry merge table, and this
+	 * chose BPE because the merges were there. So a SentencePiece
+	 * vocabulary, whose pieces are text with U+2581 for a space, was asked
+	 * to match GPT-2 byte encoded symbols, and an ordinary English
+	 * paragraph came back "tokenizer: no id for a 2 byte symbol".
+	 *
+	 * The model was simply unusable, and it is one of the five in
+	 * Rockchip's own benchmark table.
+	 */
+	/* what the file says it is, and whether it has what that needs */
+	{
+		char mdl[32] = "";
+
+		gguf_get_str(g, "tokenizer.ggml.model", mdl, sizeof(mdl));
+		spm_model = !strcmp(mdl, "llama");
+	}
+	sc_present = gguf_find(g, "tokenizer.ggml.scores") != NULL;
+
+	if (spm_model && sc_present) {
+		merges = NULL;
 	}
 
 	if (merges && merges->type == GGUF_V_ARRAY && merges->arr_type == GGUF_V_STRING) {
@@ -841,10 +871,42 @@ static int bpe_word(const struct tokenizer *tk, const char *w, size_t wn,
 		}
 		id = smap_get(&tk->vocab, sy[j].text, sy[j].n);
 		if (id < 0) {
-			fprintf(stderr, "tokenizer: no id for a %zu byte symbol\n", sy[j].n);
-			free(h.a);
-			free(sy);
-			return -1;
+			/*
+			 * ⚠⚠ THE BYTE FALLBACK WAS WRITTEN AND NEVER WIRED IN.
+			 * spm_byte and the paragraph above it say a byte no
+			 * piece covers is not an error -- the vocabulary
+			 * carries <0x00> through <0xff> for exactly this -- and
+			 * this loop returned -1 anyway.
+			 *
+			 * The board found it: TinyLLAMA, which is in
+			 * Rockchip's own table, could not tokenize an ordinary
+			 * English paragraph. "tokenizer: no id for a 2 byte
+			 * symbol", and the model was simply unusable.
+			 */
+			size_t b;
+
+			for (b = 0; b < sy[j].n; b++) {
+				int32_t bid = spm_byte(tk,
+					(unsigned char)sy[j].text[b]);
+
+				if (bid < 0) {
+					fprintf(stderr, "tokenizer: no piece "
+						"and no <0x%02X> for a byte\n",
+						(unsigned char)sy[j].text[b]);
+					free(h.a);
+					free(sy);
+					return -1;
+				}
+				if (cnt >= max) {
+					free(h.a);
+					free(sy);
+					return -1;
+				}
+				out[cnt++] = bid;
+			}
+			if (sy[j].next < 0)
+				break;
+			continue;
 		}
 		if (cnt >= max) {
 			free(h.a);
@@ -900,6 +962,7 @@ static int32_t special_at(const struct tokenizer *tk, const char *s, size_t n,
  * <0x00> through <0xff> for exactly that, so an unmatched byte becomes its own
  * token rather than <unk>, and no input is unrepresentable.
  */
+
 static int32_t spm_byte(const struct tokenizer *tk, unsigned char b)
 {
 	char name[8];
