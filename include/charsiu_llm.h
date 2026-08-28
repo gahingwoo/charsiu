@@ -523,6 +523,28 @@ struct charsiu_npu_pool {
  * `max_tensors` slots, and a device opened for weights up to max_k by max_n.
  * A pool with no device still quantises, which is the CPU path's own fast form.
  */
+/*
+ * Claim the weight cache for the staging that follows, or NULL to hand it back
+ * to CHARSIU_NPU_CACHE. See the note in npuquant.c: it is one sequential file
+ * and two graphs cannot share it.
+ */
+void charsiu_wcache_use(const char *path, const char *stamp);
+
+/*
+ * Stage every one of `n` tensors now, into `cache` if it is given.
+ *
+ * ⚠ EAGERLY, BECAUSE THE CACHE IS ORDERED. Lazy staging interleaves with
+ * whatever else is running and the records come back in a different order than
+ * they went in; and a board round measured 75 s of the vision tower's 82 s
+ * inside the quantiser, so this is also where the time is.
+ */
+int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
+			   const struct gguf_tensor *const *w, unsigned n,
+			   const char *cache, const char *stamp);
+
+/* $XDG_CACHE_HOME/charsiu/<name>.wq, made if it is not there. NULL on failure. */
+const char *charsiu_cache_path(const char *model, char *buf, size_t max);
+
 extern double charsiu_pool_stage_ms;
 
 int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,

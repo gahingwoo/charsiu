@@ -337,6 +337,37 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 
 		if (!charsiu_pool_init(&w->pool, nt * 12 + 8, 4 * A, 4 * A, 0))
 			w->npu = w->pool.dev != NULL;
+		if (w->npu) {
+			/*
+			 * ⚠ THE ENCODER'S WEIGHTS, ALL OF THEM, NOW. Same
+			 * reason as the vision tower: the board spent 19 s of
+			 * a 30 s transcription inside the quantiser. The
+			 * decoder is not here -- it runs one row at a time and
+			 * never reaches the hardware.
+			 */
+			const struct gguf_tensor *list[64 * 6];
+			unsigned nl = 0;
+			int li;
+			char cbuf[512];
+			const char *cache = charsiu_cache_path(path, cbuf,
+							       sizeof(cbuf));
+			char stamp[64];
+
+			snprintf(stamp, sizeof(stamp), "%d:%d:%d",
+				 w->n_audio_state, w->n_audio_layer,
+				 w->n_vocab);
+			for (li = 0; li < w->n_audio_layer &&
+			     nl + 6 < (unsigned)(sizeof(list) / sizeof(*list));
+			     li++) {
+				struct whisper_block *B = &w->enc[li];
+
+				list[nl++] = B->q_w; list[nl++] = B->k_w;
+				list[nl++] = B->v_w; list[nl++] = B->o_w;
+				list[nl++] = B->fc1_w; list[nl++] = B->fc2_w;
+			}
+			charsiu_pool_stage_all(&w->pool, list, nl, cache,
+					       stamp);
+		}
 	}
 	if (w->n_missing) {
 		snprintf(w->why, sizeof(w->why),

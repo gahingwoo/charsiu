@@ -348,6 +348,42 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 		if (!v->npu && charsiu_diag())
 			fprintf(stderr, "charsiu: the vision tower stays on "
 				"the CPU\n");
+		if (v->npu) {
+			/*
+			 * ⚠ ALL OF IT, NOW, AND INTO A CACHE. A board round
+			 * measured 75 s of this tower's 82 s inside the
+			 * quantiser -- the matmuls underneath were about 8 s
+			 * against the CPU's 148. Staging lazily also
+			 * interleaves with the language model's, and the cache
+			 * is one ordered file.
+			 */
+			const struct gguf_tensor *list[26 * 8 + 4];
+			unsigned nl = 0, li;
+			char cbuf[512];
+			const char *cache = charsiu_cache_path(path, cbuf,
+							       sizeof(cbuf));
+			char stamp[64];
+
+			snprintf(stamp, sizeof(stamp), "%u:%u:%u:%u",
+				 v->n_embd, v->n_ff, v->n_layer, v->proj_dim);
+			for (li = 0; li < v->n_layer &&
+			     nl + 8 < sizeof(list) / sizeof(*list); li++) {
+				struct charsiu_vision_layer *L = &v->layer[li];
+
+				list[nl++] = L->q_w; list[nl++] = L->k_w;
+				list[nl++] = L->v_w; list[nl++] = L->o_w;
+				list[nl++] = L->fc1_w; list[nl++] = L->fc2_w;
+			}
+			if (v->fc_w)
+				list[nl++] = v->fc_w;
+			if (v->vproj_w)
+				list[nl++] = v->vproj_w;
+			if (v->mm_w[0])
+				list[nl++] = v->mm_w[0];
+			if (v->mm_w[1])
+				list[nl++] = v->mm_w[1];
+			charsiu_pool_stage_all(&v->pool, list, nl, cache, stamp);
+		}
 	}
 	if (!v->n_patches) {
 		snprintf(v->why, sizeof(v->why),

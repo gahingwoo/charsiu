@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include <time.h>
 
@@ -187,12 +189,28 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
  * finds the real one needs, and 32 is the default because it is the number that
  * has evidence behind it rather than the number that looks safe.
  */
+/*
+ * ⚠ 64, AND THE BOARD SAID WHERE THE EDGE IS: 80 is the last width whose output
+ * is IDENTICAL to two rows, and 96 is the first that is not.
+ *
+ *     4 8 16 32 48 64 80   0.000000   identical
+ *     96 112 128 ... 1024  56 to 95   a different tower
+ *
+ * ⚠ AND THE RATE IS FLAT ACROSS ALL OF THEM -- 78 to 81 s at every width, so
+ * there is nothing to buy by sitting next to the edge. 64 is inside it with a
+ * whole step to spare, and what the sweep also showed is that the time is not
+ * here at all: 75 of the tower's 82 s was the quantiser.
+ *
+ * ⚠ AND 80 WAS MEASURED ON ONE TOWER, at K = 768 and 3072. Whether the limit is
+ * m alone or m against K is not known, which is the other reason not to sit at
+ * the edge.
+ */
 static unsigned rows_max(void)
 {
 	const char *e = getenv("CHARSIU_NPU_ROWS_MAX");
-	int v = e ? atoi(e) : 32;
+	int v = e ? atoi(e) : 64;
 
-	return v > 0 ? (unsigned)v : 32;
+	return v > 0 ? (unsigned)v : 64;
 }
 
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
@@ -224,5 +242,60 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 			return -1;
 		done += c;
 	}
+	return 0;
+}
+
+/*
+ * ⚠ WHERE A CACHE GOES. Not beside the model: that directory is the user's and
+ * an 85 MB file appearing in it unasked is a surprise. XDG_CACHE_HOME is the
+ * place for a file that can be deleted without losing anything, and this one
+ * can -- it rebuilds in the time it saves.
+ */
+const char *charsiu_cache_path(const char *model, char *buf, size_t max)
+{
+	const char *xdg = getenv("XDG_CACHE_HOME");
+	const char *home = getenv("HOME");
+	const char *base;
+	char dir[400];
+
+	if (getenv("CHARSIU_NO_WCACHE"))
+		return NULL;
+	if (xdg && *xdg)
+		snprintf(dir, sizeof(dir), "%s/charsiu", xdg);
+	else if (home && *home)
+		snprintf(dir, sizeof(dir), "%s/.cache/charsiu", home);
+	else
+		return NULL;
+	if (mkdir(dir, 0755) && errno != EEXIST)
+		return NULL;
+	base = strrchr(model, '/');
+	base = base ? base + 1 : model;
+	snprintf(buf, max, "%s/%s.wq", dir, base);
+	return buf;
+}
+
+int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
+			   const struct gguf_tensor *const *w, unsigned n,
+			   const char *cache, const char *stamp)
+{
+	unsigned i, staged = 0;
+	double t0 = now_ms();
+
+	if (!p->dev)
+		return -1;
+	if (cache)
+		charsiu_wcache_use(cache, stamp);
+	for (i = 0; i < n; i++)
+		if (w[i] && charsiu_pool_get(p, w[i]))
+			staged++;
+	/*
+	 * ⚠ HAND IT BACK. The language model stages after this in the same
+	 * process when a picture is part of a prompt, and it has its own file.
+	 */
+	if (cache)
+		charsiu_wcache_use(NULL, NULL);
+	if (charsiu_diag())
+		fprintf(stderr, "charsiu: %u tensors on the NPU in %.0f ms%s\n",
+			staged, now_ms() - t0, cache ? "" : " (no cache)");
 	return 0;
 }

@@ -86,6 +86,41 @@ The work is not the arithmetic, which is written and checked. It is that the
 NPU tensor cache lives in struct llama_state and these three graphs are not
 llama.
 
+### The towers on the hardware, and where the batch actually stops
+
+Board, 2026-08-28, after routing the vision tower and the whisper encoder:
+
+```
+                CPU      NPU     of which staging    the matmuls
+  whisper      34.5 s   30.0 s        19.4 s            ~3.2x
+  SmolVLM     153.1 s   82.4 s        ~76 s            ~17x
+  CLIP          4.7 s    3.9 s         2.5 s            ~3.3x
+```
+
+⚠ **THE TIME IS IN THE QUANTISER, NOT THE MATMUL.** 75 of the vision tower's
+82 seconds was staging its weights to int8. Take it out and the arithmetic that
+took the CPU 148 s takes the hardware about 9. So the towers stage eagerly into
+a cache now, in `$XDG_CACHE_HOME/charsiu` -- and ⚠ the cache is ONE SEQUENTIAL
+FILE with one static handle, so a caller claims it for its own stretch rather
+than sharing it, because two graphs staging at once interleave and neither can
+read the result back.
+
+⚠ **AND THE BATCH STOPS AT 80.** Swept against the same tower at two rows,
+which is the smallest verified batch:
+
+```
+  4 8 16 32 48 64 80    0.000000   identical
+  96 and above          56 to 95   a different tower
+```
+
+Mesa's budget test fires above m = 320 and its split above m = 640, so **that
+prediction is about something else**; this is a different limit and it is
+measured rather than derived. The default is 64: inside the edge with a step to
+spare, and the rate is FLAT from 4 rows to 1024 anyway.
+
+⚠ 80 was measured on one tower at K = 768 and 3072. Whether the bound is m alone
+or m against K is not known.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:
