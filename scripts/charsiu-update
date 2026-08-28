@@ -24,10 +24,13 @@ command -v ini_get >/dev/null 2>&1 \
 
 # ⚠⚠ TWO CHANNELS, BECAUSE THIS TREE IS A LABORATORY AND A PRODUCT AT ONCE.
 #
-# `stable` is what somebody who wants to run a model should get: the runtime and
-# nothing else. `dev` adds the probes -- npu_gemm_test, charsiu_matmul,
-# bench_batch -- and tracks the branch the work happens on, where a register can
-# be a literal that is wrong at every width but one for a fortnight.
+# `stable` is what somebody who wants to run a model should get: the runtime,
+# and the other modalities with it -- charsiu_vision, charsiu_clip and
+# charsiu_whisper are read only and touch no NPU register the decode path does
+# not. `dev` adds the PROBES -- npu_gemm_test, charsiu_matmul, bench_batch,
+# prefill_control.sh -- and tracks the branch the work happens on, where a
+# register can be a literal that is wrong at every width but one for a
+# fortnight.
 #
 # Installing dev on somebody's board without them asking is how a tool stops
 # being trusted. The channel is remembered, so `charsiu update` after

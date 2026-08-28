@@ -66,6 +66,8 @@ charsiu $VERSION, an open LLM runtime for the RK3576 NPU
   $SELF                       a conversation, or the guided setup on a new board
   $SELF "what is a bandgap"   ask once and exit
   $SELF -p "..."              print mode; reads a pipe:  cat f | $SELF -p "sum up"
+  $SELF --image FILE "..."    ask about a picture; needs a model that sees,
+                              which "$SELF pull" marks as SEES PICTURES
 
   $SELF run MODEL [PROMPT]    use a particular model
   $SELF pull [NAME]           fetch one; no NAME opens the picker
@@ -80,6 +82,12 @@ charsiu $VERSION, an open LLM runtime for the RK3576 NPU
                               dev adds the hardware probes and tracks the
                               branch the work happens on
   $SELF setup                 the guided screen, on purpose
+
+  Two things here are not conversations, so they are their own commands:
+
+  charsiu_whisper MODEL --transcribe --audio clip.wav    a clip, in words
+  charsiu_clip MODEL --image FILE --text "a cat" "a dog" which words fit a picture
+  charsiu_vision MMPROJ                                  what a vision tower is
 
   models  $MODELS  (and $SYSMODELS)
   config  $CONF
