@@ -679,29 +679,53 @@ struct vattn {
 	float scale;
 };
 
+/*
+ * ⚠ A BLOCK OF PATCHES AT A TIME. One query reads every key and every value, so
+ * doing it per query streams 2 * n * head_dim floats off DRAM 1025 times a head
+ * -- and the board measured this shape as bandwidth bound rather than
+ * arithmetic bound, which is why vectorising it bought 2.9x on a host and 1.24x
+ * there. See the long note in whisper.c.
+ */
+#define VATTN_QB 8
+
 static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
 {
 	const struct vattn *c = ctx;
-	float *att = malloc((size_t)c->n * sizeof(float));
+	unsigned nb = (c->n + VATTN_QB - 1) / VATTN_QB;
+	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
 	uint64_t r;
 
 	if (!att)
 		return;
 	for (r = r0; r < r0 + n; r++) {
-		unsigned h = (unsigned)(r / c->n), i = (unsigned)(r % c->n);
-		unsigned off = h * c->hd, j, e;
-		const float *qi = c->q + (size_t)i * c->W + off;
-		float *o = c->o + (size_t)i * c->W + off;
+		unsigned h = (unsigned)(r / nb), b = (unsigned)(r % nb);
+		unsigned i0 = b * VATTN_QB, off = h * c->hd;
+		unsigned nq = c->n - i0 < VATTN_QB ? c->n - i0 : VATTN_QB;
+		unsigned j, u, e;
 
-		for (j = 0; j < c->n; j++)
-			att[j] = charsiu_dot_f32(qi, c->k + (size_t)j * c->W +
-						 off, c->hd) * c->scale;
-		vsoftmax(att, c->n);
-		for (e = 0; e < c->hd; e++)
-			o[e] = 0.0f;
-		for (j = 0; j < c->n; j++)
-			charsiu_axpy_f32(o, c->v + (size_t)j * c->W + off,
-					 att[j], c->hd);
+		for (j = 0; j < c->n; j++) {
+			const float *kj = c->k + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				att[u * c->n + j] = charsiu_dot_f32(
+					c->q + (size_t)(i0 + u) * c->W + off,
+					kj, c->hd) * c->scale;
+		}
+		for (u = 0; u < nq; u++) {
+			float *o = c->o + (size_t)(i0 + u) * c->W + off;
+
+			vsoftmax(att + u * c->n, c->n);
+			for (e = 0; e < c->hd; e++)
+				o[e] = 0.0f;
+		}
+		for (j = 0; j < c->n; j++) {
+			const float *vj = c->v + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				charsiu_axpy_f32(c->o + (size_t)(i0 + u) *
+						 c->W + off, vj,
+						 att[u * c->n + j], c->hd);
+		}
 	}
 	free(att);
 }
@@ -849,7 +873,8 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			c.q = q; c.k = k; c.v = val; c.o = xb;
 			c.n = nt; c.W = W; c.hd = hd; c.scale = scale;
 			charsiu_parallel_for(vattn_rows, &c,
-					     (uint64_t)v->n_head * nt);
+					     (uint64_t)v->n_head *
+					     ((nt + VATTN_QB - 1) / VATTN_QB));
 		}
 
 		rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a);

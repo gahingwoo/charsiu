@@ -1076,29 +1076,67 @@ struct wattn {
 	float scale;
 };
 
+/*
+ * ⚠⚠ A BLOCK OF QUERIES AT A TIME, BECAUSE THIS IS BOUND BY MEMORY AND NOT BY
+ * ARITHMETIC.
+ *
+ * One query reads every key and every value: 2 * T * head_dim floats, which at
+ * T = 1500 and head_dim = 64 is 768 KB. Doing that per query means 1500 queries
+ * x 6 heads x 4 layers x 768 KB = TWENTY SEVEN GIGABYTES off DRAM for a clip
+ * whose weights are eighty megabytes. The board moves about 10 GB/s, which is
+ * 2.7 s, and the board measured 4.5 s.
+ *
+ * That is why vectorising the inner loops bought 2.9x on a development host and
+ * 1.24x here: the host was short of arithmetic and this board is short of
+ * bandwidth. QB queries share one pass over K and one over V, so the traffic
+ * divides by QB and the arithmetic is unchanged.
+ *
+ * ⚠ THE ORDER WITHIN A DOT PRODUCT IS UNTOUCHED. Only the order the dot
+ * products are ISSUED in changes, so every output is bit identical to the
+ * unblocked form -- which the tests check rather than take on trust.
+ */
+#define WATTN_QB 8
+
 static void wattn_rows(void *ctx, uint64_t r0, uint64_t n)
 {
 	const struct wattn *c = ctx;
-	float *att = malloc((size_t)c->T * sizeof(float));
+	unsigned nb = (c->T + WATTN_QB - 1) / WATTN_QB;
+	float *att = malloc((size_t)WATTN_QB * c->T * sizeof(float));
 	uint64_t r;
 
 	if (!att)
 		return;
 	for (r = r0; r < r0 + n; r++) {
-		unsigned h = (unsigned)(r / c->T), i = (unsigned)(r % c->T);
-		unsigned off = h * c->hd, j, e;
-		const float *qi = c->q + (size_t)i * c->W + off;
-		float *o = c->o + (size_t)i * c->W + off;
+		unsigned h = (unsigned)(r / nb), b = (unsigned)(r % nb);
+		unsigned i0 = b * WATTN_QB, off = h * c->hd;
+		unsigned nq = c->T - i0 < WATTN_QB ? c->T - i0 : WATTN_QB;
+		unsigned j, u, e;
 
-		for (j = 0; j < c->T; j++)
-			att[j] = charsiu_dot_f32(qi, c->k + (size_t)j * c->W +
-						 off, c->hd) * c->scale;
-		wsoftmax(att, c->T);
-		for (e = 0; e < c->hd; e++)
-			o[e] = 0.0f;
-		for (j = 0; j < c->T; j++)
-			charsiu_axpy_f32(o, c->v + (size_t)j * c->W + off,
-					 att[j], c->hd);
+		/* one pass over the keys, all nq queries against each */
+		for (j = 0; j < c->T; j++) {
+			const float *kj = c->k + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				att[u * c->T + j] = charsiu_dot_f32(
+					c->q + (size_t)(i0 + u) * c->W + off,
+					kj, c->hd) * c->scale;
+		}
+		for (u = 0; u < nq; u++) {
+			float *o = c->o + (size_t)(i0 + u) * c->W + off;
+
+			wsoftmax(att + u * c->T, c->T);
+			for (e = 0; e < c->hd; e++)
+				o[e] = 0.0f;
+		}
+		/* and one pass over the values */
+		for (j = 0; j < c->T; j++) {
+			const float *vj = c->v + (size_t)j * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				charsiu_axpy_f32(c->o + (size_t)(i0 + u) *
+						 c->W + off, vj,
+						 att[u * c->T + j], c->hd);
+		}
 	}
 	free(att);
 }
@@ -1229,7 +1267,8 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 			c.q = q; c.k = k; c.v = v; c.o = xb;
 			c.T = T; c.W = W; c.hd = hd; c.scale = scale;
 			if (wstage_on) t_attn = wnow();
-			charsiu_parallel_for(wattn_rows, &c, (uint64_t)H * T);
+			charsiu_parallel_for(wattn_rows, &c, (uint64_t)H *
+					     ((T + WATTN_QB - 1) / WATTN_QB));
 		}
 		if (wstage_on) wstage_ms[W_ATTN] += wnow() - t_attn;
 		WSTAGE(W_PROJ, wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a));
