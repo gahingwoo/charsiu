@@ -87,9 +87,15 @@ echo
 
 echo "== 2. seeing: SmolVLM-256M on the llama.cpp logo =="
 t0=$(ms)
-OUT=$("$RUN" "$DIR/smolvlm.gguf" --mmproj "$DIR/mmproj.gguf" --image "$DIR/logo.png" \
+# ⚠⚠ STDERR IS KEPT NOW. This discarded it, so the vision tower's staging and
+# pool lines -- the only place that says whether the hardware did any of the
+# work -- were thrown away for three board rounds while their numbers were being
+# argued about, and a 17x was announced and withdrawn in between.
+"$RUN" "$DIR/smolvlm.gguf" --mmproj "$DIR/mmproj.gguf" --image "$DIR/logo.png" \
 	-p "User:<image>What animal is this?<end_of_utterance>
-Assistant:" -n 8 -c 1024 -t 4 2>/dev/null | sed -n '2p')
+Assistant:" -n 8 -c 1024 -t 4 >"$DIR/.vis.out" 2>"$DIR/.vis.err" || true
+grep -E "weight cache|ON THE HARDWARE|NPU pool" "$DIR/.vis.err" | sed "s/^/  /" || true
+OUT=$(grep -v "^\[" "$DIR/.vis.out" | sed -n '2p')
 T_VIS=$(took "$t0")
 echo "  $OUT"
 say_result "the animal" "$OUT" "Llama"
