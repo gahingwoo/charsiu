@@ -328,7 +328,12 @@ Two differences were real and are fixed:
   all 8692 streams; the converse fails on 240 fp16 ones, and int8 has no
   evidence either way because its 40 streams never reach the threshold. So it
   is scoped to the width axis, and every stream that runs today is bit
-  identical to before.
+  identical to before -- checked rather than argued: the emitter from before
+  the change and the one after it were built side by side and asked for 1200
+  shapes on the default axis (2 weight formats x 2 activations x 5 K x 5 N x
+  12 M), and **0 differ**. On the width axis the same pair differs at all 40
+  shapes with M > 1 and at none of the 8 with M = 1, which is the control --
+  a change that touched nothing would have passed the first check too.
 
 ⚠ **NONE OF THIS HAS BEEN ON THE BOARD.** `tests/board_w4_axis.sh` is that
 round: the height axis first as a control -- it must fail, or the probe is not
