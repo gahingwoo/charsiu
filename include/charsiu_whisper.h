@@ -99,6 +99,19 @@ void charsiu_whisper_describe(const struct charsiu_whisper *w, FILE *out);
 int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 			size_t n, float *out);
 
+/*
+ * The audio encoder: [n_mels][3000] in, [n_audio_ctx][n_audio_state] out.
+ *
+ * ⚠ THE TWO CONVOLUTIONS ARE REAL ONES. Kernel 3, stride 1 then 2, padding 1 --
+ * the windows OVERLAP, unlike a patch embedding whose stride equals its kernel.
+ * So each is three matmuls summed over the three kernel taps rather than one,
+ * and the second halves 3000 frames into 1500 positions.
+ *
+ * `out` holds n_audio_ctx * n_audio_state floats.
+ */
+int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
+			   float *out);
+
 /* A 16 bit PCM WAV, resampled to 16 kHz mono. Returns samples, or NULL. */
 float *charsiu_wav_load(const char *path, size_t *n, char *err, size_t errlen);
 

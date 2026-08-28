@@ -682,3 +682,347 @@ fail:
 		fclose(fp);
 	return NULL;
 }
+
+/* ---- the audio encoder --------------------------------------------------- */
+
+static void wlayernorm(float *out, const float *x, const float *w,
+		       const float *b, unsigned n, float eps)
+{
+	float mean = 0.0f, var = 0.0f, inv;
+	unsigned i;
+
+	for (i = 0; i < n; i++)
+		mean += x[i];
+	mean /= (float)n;
+	for (i = 0; i < n; i++) {
+		float d = x[i] - mean;
+
+		var += d * d;
+	}
+	var /= (float)n;
+	inv = 1.0f / sqrtf(var + eps);
+	for (i = 0; i < n; i++)
+		out[i] = (x[i] - mean) * inv * (w ? w[i] : 1.0f) +
+			 (b ? b[i] : 0.0f);
+}
+
+/* ⚠ THE TANH APPROXIMATION. Whisper's reference is torch's exact erf GELU, and
+ * ggml -- which is what every measured whisper output in the world comes from --
+ * uses the tanh one. Following ggml keeps this comparable to the thing people
+ * actually run. */
+static void wgelu(float *x, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		float v = x[i];
+
+		x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f *
+						(v + 0.044715f * v * v * v)));
+	}
+}
+
+static void wsoftmax(float *x, unsigned n)
+{
+	float mx = x[0], sum = 0.0f;
+	unsigned i;
+
+	for (i = 1; i < n; i++)
+		if (x[i] > mx)
+			mx = x[i];
+	for (i = 0; i < n; i++) {
+		x[i] = expf(x[i] - mx);
+		sum += x[i];
+	}
+	for (i = 0; i < n; i++)
+		x[i] /= sum;
+}
+
+static struct gguf_tensor wflat(const struct gguf_tensor *t, uint64_t in,
+				uint64_t out)
+{
+	struct gguf_tensor g = *t;
+
+	g.n_dims = 2;
+	g.ne[0] = in;
+	g.ne[1] = out;
+	g.ne[2] = g.ne[3] = 1;
+	return g;
+}
+
+static void wrows(const struct gguf_tensor *t, const float *bias,
+		  const float *X, unsigned m, unsigned k, float *Y,
+		  unsigned nout, struct charsiu_act *a)
+{
+	struct gguf_tensor g = wflat(t, k, nout);
+	unsigned r, i;
+
+	for (r = 0; r < m; r++) {
+		float *y = Y + (size_t)r * nout;
+
+		charsiu_act_set(a, X + (size_t)r * k, (int)k);
+		gguf_matvec(&g, a, y, 0, nout);
+		if (bias)
+			for (i = 0; i < nout; i++)
+				y[i] += bias[i];
+	}
+}
+
+/*
+ * A whole 1D tensor, whatever shape it claims to be.
+ *
+ * ⚠⚠ THE CONVOLUTION BIASES ARE [1][384], NOT [384]. gguf_row_f32 reads ne[0]
+ * elements, so asking for row 0 of one of those returns ONE value and leaves
+ * the rest of the caller's buffer as whatever was on the heap -- which came out
+ * of the encoder as 3e24 and would, in a quieter model, have come out as a
+ * transcript. Flatten every axis into the row length and read once.
+ */
+static const float *wrow1(const struct gguf_tensor *t, float *buf)
+{
+	struct gguf_tensor g;
+	uint64_t n = 1;
+	unsigned d;
+
+	if (!t)
+		return NULL;
+	g = *t;
+	for (d = 0; d < (t->n_dims ? t->n_dims : 1); d++)
+		n *= t->ne[d];
+	g.n_dims = 2;
+	g.ne[0] = n;
+	g.ne[1] = 1;
+	g.ne[2] = g.ne[3] = 1;
+	gguf_row_f32(&g, 0, buf);
+	return buf;
+}
+
+/*
+ * conv1d, kernel 3, padding 1, stride `stride`.
+ *
+ * ⚠ THE WEIGHT IS [tap][in][out] WITH tap FASTEST, so tap `p`'s slice is not
+ * contiguous: it is every third element. Rather than gather it, this walks the
+ * three taps and treats each as a matmul over `in` with a stride of 3 between
+ * consecutive input channels -- which is what a flattened view of ne[0]=3 makes
+ * gguf_matvec do if it is handed the wrong shape, and is exactly the bug this
+ * comment exists to prevent. The gather is explicit below and costs one pass.
+ */
+static int conv1d3(const struct gguf_tensor *wt, const float *bias,
+		   const float *in, unsigned n_in, unsigned len,
+		   float *out, unsigned n_out, unsigned stride,
+		   struct charsiu_act *a)
+{
+	unsigned olen = (len + stride - 1) / stride;
+	unsigned tap, t, c, i;
+	float *tapw = malloc((size_t)3 * n_out * n_in * sizeof(float));
+	float *col = malloc((size_t)olen * n_in * sizeof(float));
+	float *acc = malloc((size_t)olen * n_out * sizeof(float));
+	struct gguf_tensor g;
+
+	if (!tapw || !col || !acc) {
+		free(tapw); free(col); free(acc);
+		return -1;
+	}
+	memset(out, 0, (size_t)olen * n_out * sizeof(float));
+	memset(&g, 0, sizeof(g));
+
+	/*
+	 * ⚠ READ THE WEIGHT THROUGH gguf_row_f32 RATHER THAN CASTING IT. The
+	 * flattened view is [3 * in][out], so ROW i is output channel i's whole
+	 * kernel, contiguous and already laid out [in][tap] with tap fastest.
+	 * One call an output channel dequantises f16 or f32 without this file
+	 * knowing which, and the three taps fall out of one pass.
+	 */
+	{
+		struct gguf_tensor rv = wflat(wt, 3ull * n_in, n_out);
+		float *row = malloc((size_t)3 * n_in * sizeof(float));
+
+		if (!row) {
+			free(tapw); free(col); free(acc);
+			return -1;
+		}
+		for (i = 0; i < n_out; i++) {
+			gguf_row_f32(&rv, i, row);
+			for (c = 0; c < n_in; c++)
+				for (tap = 0; tap < 3; tap++)
+					tapw[((size_t)tap * n_out + i) * n_in + c] =
+						row[c * 3 + tap];
+		}
+		free(row);
+	}
+
+	for (tap = 0; tap < 3; tap++) {
+		g.n_dims = 2;
+		g.ne[0] = n_in;
+		g.ne[1] = n_out;
+		g.ne[2] = g.ne[3] = 1;
+		g.type = GGML_F32;
+		g.data = tapw + (size_t)tap * n_out * n_in;
+
+		/* the input column this tap sees, zero outside the clip */
+		for (t = 0; t < olen; t++) {
+			long src = (long)t * stride + (long)tap - 1;
+
+			if (src < 0 || src >= (long)len)
+				memset(col + (size_t)t * n_in, 0,
+				       (size_t)n_in * sizeof(float));
+			else
+				for (c = 0; c < n_in; c++)
+					col[(size_t)t * n_in + c] =
+						in[(size_t)c * len + (size_t)src];
+		}
+		wrows(&g, NULL, col, olen, n_in, acc, n_out, a);
+		for (i = 0; i < olen * n_out; i++)
+			out[i] += acc[i];
+	}
+	if (bias)
+		for (t = 0; t < olen; t++)
+			for (i = 0; i < n_out; i++)
+				out[(size_t)t * n_out + i] += bias[i];
+	free(tapw); free(col); free(acc);
+	return 0;
+}
+
+int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
+			   float *out)
+{
+	unsigned W = (unsigned)w->n_audio_state, H = (unsigned)w->n_audio_head;
+	unsigned L = (unsigned)w->n_audio_layer, T = (unsigned)w->n_audio_ctx;
+	unsigned F = 4 * W, hd = W / H, l, i, j, h, e;
+	float *c1 = NULL, *x = NULL, *xb = NULL, *q = NULL, *k = NULL;
+	float *v = NULL, *ff = NULL, *att = NULL, *g1 = NULL, *b1 = NULL;
+	float *tmp = NULL, scale;
+	struct charsiu_act a;
+	int rc = -1, stop = 0;
+
+	if (!hd || hd * H != W || w->n_missing)
+		return -1;
+	scale = 1.0f / sqrtf((float)hd);
+	if (charsiu_act_alloc(&a, (int)(F > W ? F : W)))
+		return -1;
+
+	c1  = malloc((size_t)WHISPER_N_FRAMES * W * sizeof(float));
+	x   = malloc((size_t)T * W * sizeof(float));
+	xb  = malloc((size_t)T * W * sizeof(float));
+	q   = malloc((size_t)T * W * sizeof(float));
+	k   = malloc((size_t)T * W * sizeof(float));
+	v   = malloc((size_t)T * W * sizeof(float));
+	ff  = malloc((size_t)T * F * sizeof(float));
+	att = malloc((size_t)T * sizeof(float));
+	g1  = malloc((size_t)F * sizeof(float));
+	b1  = malloc((size_t)F * sizeof(float));
+	tmp = malloc((size_t)WHISPER_N_FRAMES * W * sizeof(float));
+	if (!c1 || !x || !xb || !q || !k || !v || !ff || !att || !g1 || !b1 ||
+	    !tmp)
+		goto out;
+
+	/*
+	 * ⚠ A STOP AFTER EACH STAGE, because "every one of 576000 values is
+	 * wrong" says nothing about which stage did it. The reference can stop
+	 * at the same places and the first one that disagrees is the one to
+	 * read.
+	 */
+	{
+		const char *e = getenv("CHARSIU_WHISPER_STOP");
+
+		stop = e ? atoi(e) : 0;
+	}
+
+	if (conv1d3(w->conv1_w, wrow1(w->conv1_b, b1), mel,
+		    (unsigned)w->n_mels, WHISPER_N_FRAMES, c1, W, 1, &a))
+		goto out;
+	wgelu(c1, (size_t)WHISPER_N_FRAMES * W);
+	if (stop == 1) {
+		/* [3000][W], which does not fit `out`: give the first T rows */
+		memcpy(out, c1, (size_t)T * W * sizeof(float));
+		rc = 0;
+		goto out;
+	}
+
+	/*
+	 * ⚠ conv2 READS ITS INPUT AS [channel][time] AND conv1 WROTE
+	 * [time][channel]. Feeding one straight into the other transposes the
+	 * whole spectrogram, which stays finite and produces a transcript.
+	 */
+	for (i = 0; i < W; i++)
+		for (j = 0; j < WHISPER_N_FRAMES; j++)
+			tmp[(size_t)i * WHISPER_N_FRAMES + j] =
+				c1[(size_t)j * W + i];
+	if (conv1d3(w->conv2_w, wrow1(w->conv2_b, b1), tmp, W,
+		    WHISPER_N_FRAMES, x, W, 2, &a))
+		goto out;
+	wgelu(x, (size_t)T * W);
+
+	for (i = 0; i < T; i++) {
+		gguf_row_f32(w->e_pos, i, g1);
+		for (j = 0; j < W; j++)
+			x[(size_t)i * W + j] += g1[j];
+	}
+	if (stop == 2) {
+		memcpy(out, x, (size_t)T * W * sizeof(float));
+		rc = 0;
+		goto out;
+	}
+
+	for (l = 0; l < L; l++) {
+		struct whisper_block *B = &w->enc[l];
+
+		for (i = 0; i < T; i++)
+			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
+				   wrow1(B->attn_ln_w, g1),
+				   wrow1(B->attn_ln_b, b1), W, 1e-5f);
+		wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, &a);
+		wrows(B->k_w, NULL, xb, T, W, k, W, &a);
+		wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a);
+
+		for (h = 0; h < H; h++) {
+			unsigned off = h * hd;
+
+			for (i = 0; i < T; i++) {
+				const float *qi = q + (size_t)i * W + off;
+				float *o = xb + (size_t)i * W + off;
+
+				for (j = 0; j < T; j++) {
+					const float *kj = k + (size_t)j * W + off;
+					float d = 0.0f;
+
+					for (e = 0; e < hd; e++)
+						d += qi[e] * kj[e];
+					att[j] = d * scale;
+				}
+				wsoftmax(att, T);
+				for (e = 0; e < hd; e++)
+					o[e] = 0.0f;
+				for (j = 0; j < T; j++) {
+					const float *vj = v + (size_t)j * W + off;
+					float wg = att[j];
+
+					for (e = 0; e < hd; e++)
+						o[e] += wg * vj[e];
+				}
+			}
+		}
+		wrows(B->o_w, wrow1(B->o_b, b1), xb, T, W, q, W, &a);
+		for (i = 0; i < T * W; i++)
+			x[i] += q[i];
+
+		for (i = 0; i < T; i++)
+			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
+				   wrow1(B->mlp_ln_w, g1),
+				   wrow1(B->mlp_ln_b, b1), W, 1e-5f);
+		wrows(B->fc1_w, wrow1(B->fc1_b, b1), xb, T, W, ff, F, &a);
+		wgelu(ff, (size_t)T * F);
+		wrows(B->fc2_w, wrow1(B->fc2_b, b1), ff, T, F, q, W, &a);
+		for (i = 0; i < T * W; i++)
+			x[i] += q[i];
+	}
+
+	for (i = 0; i < T; i++)
+		wlayernorm(out + (size_t)i * W, x + (size_t)i * W,
+			   wrow1(w->e_ln_w, g1), wrow1(w->e_ln_b, b1), W, 1e-5f);
+	rc = 0;
+out:
+	free(c1); free(x); free(xb); free(q); free(k); free(v);
+	free(ff); free(att); free(g1); free(b1); free(tmp);
+	charsiu_act_free(&a);
+	return rc;
+}
