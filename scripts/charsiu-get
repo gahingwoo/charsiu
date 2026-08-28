@@ -75,7 +75,15 @@ die()  { printf '%s[charsiu-get] ERROR:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; 
 # comes from the HF tree API and general.architecture was read out of the file's
 # own header over a range request. Nothing here is guessed.
 #
-#   name | repo | file | MB | note
+#   name | repo | file | MB | note | mmproj file | mmproj MB
+#
+# ⚠ THE LAST TWO FIELDS ARE THE VISION HALF, and a row that has them is a model
+# that SEES. A multimodal download is two files and one without the other is
+# not a smaller version of it, it is a model that cannot do the thing it was
+# chosen for -- so pulling one pulls both, and the size shown is the total.
+#
+# ⚠ The q8_0 mmproj, not the f16: 104 MB against 190, and verified to give the
+# same answer on the same picture ("Llama." for llama.cpp's logo, 2026-08-28).
 # ---------------------------------------------------------------------------
 zoo() {
 cat <<'ZOO'
@@ -99,6 +107,8 @@ gemma3-270m-q8|unsloth/gemma-3-270m-it-GGUF|gemma-3-270m-it-Q8_0.gguf|278|tiny, 
 gemma3-1b-q4|unsloth/gemma-3-1b-it-GGUF|gemma-3-1b-it-Q4_0.gguf|689|32K context on a 512 sliding window
 gemma3-4b-q4|unsloth/gemma-3-4b-it-GGUF|gemma-3-4b-it-Q4_0.gguf|2260|check the card has room; the text half only
 gemma4-e2b-q4|ggml-org/gemma-4-E2B-it-GGUF|gemma-4-E2B-it-Q4_0.gguf|2710|per-layer embeddings; 2B of a 4.6B model is active
+smolvlm-256m|ggml-org/SmolVLM-256M-Instruct-GGUF|SmolVLM-256M-Instruct-Q8_0.gguf|175|SEES PICTURES: pass --image FILE. Smallest one that does|mmproj-SmolVLM-256M-Instruct-Q8_0.gguf|104
+smolvlm-500m|ggml-org/SmolVLM-500M-Instruct-GGUF|SmolVLM-500M-Instruct-Q8_0.gguf|437|SEES PICTURES, and describes them better than the 256M|mmproj-SmolVLM-500M-Instruct-Q8_0.gguf|109
 ZOO
 }
 
@@ -149,7 +159,8 @@ list_zoo() {
 	printf '\n%sModels verified to load on charsiu%s   (into %s)\n\n' \
 		"$C_G" "$C_0" "$MODELS_DIR"
 	printf '  %-22s %7s  %s\n' NAME SIZE WHERE
-	zoo | while IFS='|' read -r n repo file mb note; do
+	zoo | while IFS='|' read -r n repo file mb note mmp mmb; do
+		[ -n "$mmp" ] && mb=$((mb + mmb))
 		have=""
 		[ -f "$MODELS_DIR/$file" ] && have=" ${C_G}[have]${C_0}"
 		printf '  %-22s %6sM  %s%s\n' "$n" "$mb" "$repo" "$have"
@@ -305,8 +316,9 @@ wizard() {
 	command -v ui_menu >/dev/null 2>&1 || { list_zoo; return 0; }
 	CTUI_TITLE="charsiu: a model"
 	set --
-	while IFS='|' read -r n repo file mb note; do
+	while IFS='|' read -r n repo file mb note mmp mmb; do
 		[ -n "$n" ] || continue
+		[ -n "$mmp" ] && mb=$((mb + mmb))
 		if [ -f "$MODELS_DIR/$file" ]; then d="${mb}M  (already here)"
 		else d="${mb}M  ${note}"; fi
 		set -- "$@" "$n" "$d"
@@ -321,10 +333,30 @@ first run rather than a worse one. The 135M model talks in 92 MB.
 The 1B one is what every board measurement uses." "$@") || return 0
 	[ "$sel" = skip ] || [ -z "$sel" ] && return 0
 	row=$(zoo | grep "^$sel|")
-	repo=$(echo "$row" | cut -d'|' -f2)
-	file=$(echo "$row" | cut -d'|' -f3)
-	mb=$(echo "$row"   | cut -d'|' -f4)
-	fetch_and_gate "$HF/$repo/resolve/main/$file" "$file" "$mb" || return 1
+	pull_row "$row" || return 1
+	return 0
+}
+
+# ⚠ A ROW IS PULLED WHOLE. A model that sees is two files, and fetching the
+# language half alone leaves somebody with a model that answers every question
+# about a picture by inventing one -- fluently. So the vision half comes with
+# it, and the message says which is which.
+pull_row() {
+	_row=$1
+	_repo=$(echo "$_row" | cut -d'|' -f2)
+	_file=$(echo "$_row" | cut -d'|' -f3)
+	_mb=$(echo "$_row"   | cut -d'|' -f4)
+	_mmp=$(echo "$_row"  | cut -d'|' -f6)
+	_mmb=$(echo "$_row"  | cut -d'|' -f7)
+
+	fetch_and_gate "$HF/$_repo/resolve/main/$_file" "$_file" "$_mb" || return 1
+	[ -n "$_mmp" ] || return 0
+	echo
+	echo "  and its vision tower, which is the other half of this model:"
+	fetch_and_gate "$HF/$_repo/resolve/main/$_mmp" "$_mmp" "$_mmb" || return 1
+	echo
+	echo "  Both halves are here. To ask it about a picture:"
+	echo "    charsiu --image photo.jpg \"what is in this picture?\""
 	return 0
 }
 
@@ -344,11 +376,8 @@ ARG="$1"
 # a zoo name?
 row=$(zoo | grep "^$ARG|" || true)
 if [ -n "$row" ]; then
-	repo=$(echo "$row" | cut -d'|' -f2)
-	file=$(echo "$row" | cut -d'|' -f3)
-	mb=$(echo "$row"   | cut -d'|' -f4)
-	fetch_and_gate "$HF/$repo/resolve/main/$file" "$file" "$mb"
-	exit 0
+	pull_row "$row"
+	exit $?
 fi
 
 # a known-bad family, answered without a download

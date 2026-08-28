@@ -1007,6 +1007,11 @@ ui_msg "Done.
   charsiu doctor      what works and what does not
   charsiu serve       an OpenAI compatible endpoint on :11434
 
+  This build can also SEE. `charsiu pull` lists the models that take a
+  picture, and they are two files -- it fetches both:
+
+  charsiu --image photo.jpg \"what is in this picture?\" 
+
   channel $CHANNEL$([ "$CHANNEL" = stable ] && echo "      charsiu update dev  adds the hardware probes" || echo "         charsiu update stable  goes back to the runtime alone")$([ "$CHANNEL" = dev ] && echo "
   probes  $BIN: $PROBE_BINS $PROBE_SCRIPTS")
 

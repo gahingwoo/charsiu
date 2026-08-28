@@ -63,7 +63,7 @@ for a in "$@"; do
 	if [ "$_skip" = 1 ]; then _skip=0; continue; fi
 	case "$a" in
 	-p|-f) _hasp=1; _skip=1 ;;
-	--sys|-n|-c|-t|--temp|--top-p|--seed|--hold-secs|--cache-at) _skip=1 ;;
+	--sys|-n|-c|-t|--temp|--top-p|--seed|--hold-secs|--cache-at|--image|--mmproj) _skip=1 ;;
 	-*) ;;
 	*) _bare=1 ;;
 	esac
@@ -74,7 +74,7 @@ if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
 		a=$1; shift; _n=$((_n - 1))
 		if [ "$_skip" = 1 ]; then set -- "$@" "$a"; _skip=0; continue; fi
 		case "$a" in
-		--sys|-n|-c|-t|--temp|--top-p|--seed|--hold-secs|--cache-at)
+		--sys|-n|-c|-t|--temp|--top-p|--seed|--hold-secs|--cache-at|--image|--mmproj)
 			_skip=1; set -- "$@" "$a" ;;
 		-*) set -- "$@" "$a" ;;
 		*)  if [ -z "$_p" ]; then _p="$a"; else set -- "$@" "$a"; fi ;;

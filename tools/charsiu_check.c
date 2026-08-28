@@ -212,6 +212,31 @@ int main(int argc, char **argv)
 		       seen[i].ok ? "charsiu reads this"
 				  : "NOT one charsiu reads");
 	}
+	/*
+	 * ⚠ AN mmproj IS NOT A MODEL AND IT IS NOT A FAILURE EITHER. Before
+	 * this, the vision half of a multimodal download came back as
+	 * "charsiu CANNOT run this file" with the architecture line pointing at
+	 * a list of language graphs -- which is true, unhelpful, and exactly
+	 * the message that sends somebody away from a file that works.
+	 */
+	{
+		uint32_t has = 0;
+
+		if (!strcmp(arch, "clip") ||
+		    gguf_get_u32(&g, "clip.has_vision_encoder", &has) == 0) {
+			printf("\nVERDICT  this is a VISION TOWER (an mmproj), "
+			       "not a model.\n"
+			       "         It is the second half of a multimodal "
+			       "download and charsiu\n"
+			       "         reads it: pass it with --mmproj "
+			       "beside the language half.\n"
+			       "         `charsiu_vision FILE` says whether "
+			       "this build can run it.\n");
+			gguf_close(&g);
+			return 0;
+		}
+	}
+
 	if (bad_graph || bad_types || bad_tok)
 		printf("\nVERDICT  charsiu CANNOT run this file.\n");
 	else
