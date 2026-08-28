@@ -2721,13 +2721,24 @@ static int npu_id_for(struct llama_state *s, const struct gguf_tensor *w)
 }
 
 /* n rows through one set of weights, or the same thing a row at a time */
+/*
+ * Returns 1 when the hardware took the whole batch and 0 when this fell back to
+ * a row at a time.
+ *
+ * ⚠ THE CALLER NEEDS TO KNOW. q, k and v all multiply one RMSNorm output, and
+ * matvec_pair sends the three of them in ONE submit -- round 321 measured the
+ * fence at 94% of the hardware path and that grouping took 113 fences a token
+ * down to 65. Calling matmul_rows three times instead turns n grouped submits
+ * into 3n separate ones the moment the batch is refused, which on int4 is
+ * always. I did that to this loop two commits ago.
+ */
 static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
 {
 	int id = npu_id_for(s, w);
 
 	if (id >= 0 && !charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y))
-		return 0;
+		return 1;
 	/*
 	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
 	 * above can only ever be checked on the board.
@@ -2948,12 +2959,31 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			rmsnorm(s->bxb + (size_t)r * m->n_embd,
 				s->bx + (size_t)r * m->n_embd, L->attn_norm,
 				m->n_embd, m->rms_eps);
-		matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
-			    m->n_head * hd);
-		matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
-			    m->n_head_kv * hd);
-		matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
-			    m->n_head_kv * hd);
+		/*
+		 * ⚠ THREE BATCHED CALLS, OR ONE GROUPED SUBMIT A ROW. If the
+		 * hardware takes the batch, three calls is right: each moves
+		 * its weights once for all n rows. If it refuses -- and w4a16
+		 * refuses every batch, which is the default configuration and
+		 * what the vendor's table compares against -- then three calls
+		 * are 3n single row submits where matvec_pair does n, and the
+		 * fence is 94% of each.
+		 */
+		if (matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
+				m->n_head * hd)) {
+			matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
+				    m->n_head_kv * hd);
+			matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
+				    m->n_head_kv * hd);
+		} else {
+			for (int r = 0; r < n; r++)
+				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
+					    L->wq, s->bq + (size_t)r *
+						   m->n_head * hd,
+					    L->wk, s->bk + (size_t)r *
+						   m->n_head_kv * hd,
+					    L->wv, s->bv + (size_t)r *
+						   m->n_head_kv * hd);
+		}
 
 		for (int r = 0; r < n; r++) {
 			int pos = pos0 + r;
@@ -3054,8 +3084,17 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				m->n_embd, m->rms_eps);
 		}
 
-		matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd, nff);
-		matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd, nff);
+		/* gate and up read one norm as well: the same choice */
+		if (matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd, nff)) {
+			matmul_rows(s, L->up, s->bxb, n, s->bhb2, m->n_embd,
+				    nff);
+		} else {
+			for (int r = 0; r < n; r++)
+				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
+					    L->gate, s->bhb + (size_t)r * nff,
+					    L->up, s->bhb2 + (size_t)r * nff,
+					    NULL, NULL);
+		}
 		for (int r = 0; r < n; r++) {
 			if (m->ffn_gelu)
 				gelu_mul(s->bhb + (size_t)r * nff,

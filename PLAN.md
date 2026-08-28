@@ -198,6 +198,47 @@ needs a tensor split, shared KV needs another layer's cache, a varying feed
 forward width needs per layer buffers, and a sliding window needs a mask this
 loop does not build.
 
+### What the submit count settled
+
+The device's own report, on Rockchip's protocol, with CHARSIU_NPU_W4V=1:
+
+```
+  Qwen3 0.6B    38608 submits   189 us each   5.97 GB/s   222 submits a token
+  TinyLLAMA     47128           206           9.21
+  Phi3 3.8B     68488           460          10.47
+```
+
+⚠ **THE PREFILL IS ON THE HARDWARE, ONE ROW AT A TIME.** Not a CPU fallback:
+every row of the prompt streams the whole weight again, at 6 to 10.5 GB/s, which
+is the board's roof. The hardware is not being lazy -- 222 submits a token is
+what one row per submit means for 28 layers of 7 projections in 1.5 slices.
+
+⚠ **AND THE VENDOR CANNOT BE DOING THAT.** They publish 469 ms to a first token
+for a 128 token prompt on the same model, and 40 ms a token to decode. A prompt
+token 11 times cheaper than a generated one is not one row per submit: Qwen3's
+weights are 300 MB at int4, and 128 rows of that is 38 GB in 469 ms. They batch
+the prefill, on w4a16.
+
+That contradicts what this tree recorded as "w4a16 makes exactly one row". What
+five rounds established is narrower: **charsiu's** w4a16 stream makes one row,
+and no register in it changes that. Their prefill graph may not be the same
+stream at all.
+
+Three ways out, and only the first is free:
+
+1. **the grouped submit**, which this loop had and lost. q, k and v read one
+   RMSNorm output and matvec_pair sends the three in ONE submit; round 321
+   measured the fence at 94% of the hardware path and that grouping took 113
+   fences a token to 65. Batching them as three separate calls turns n grouped
+   submits into 3n the moment the batch is refused -- which on int4 is always.
+   Restored: matmul_rows says whether the hardware took the batch, and the
+   caller groups when it did not.
+2. **int8 for the prompt**, which batches and was measured at 2.94x. It costs a
+   second copy of every projection -- 600 MB on a model whose whole int4 weight
+   is 300 -- and this board's peak is already twice the vendor's.
+3. **find what their prefill stream does that ours cannot.** The only one that
+   removes the problem rather than paying for it.
+
 ### Which weight format, answered
 
 Four numbers off the board, same model, same prompt, same 16 generated tokens:
