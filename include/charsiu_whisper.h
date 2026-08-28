@@ -112,6 +112,39 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 			   float *out);
 
+/*
+ * The text decoder, one token at a time.
+ *
+ * ⚠ CROSS ATTENTION IS THE NEW THING IN THIS TREE. Every attention charsiu had
+ * before this reads its own keys and values from the same sequence; a decoder
+ * block reads them from the ENCODER's 1500 positions instead, and those do not
+ * change from token to token. So they are computed once per clip, per layer,
+ * and cached -- which is the whole reason charsiu_whisper_decoder exists as a
+ * thing to open and close rather than a function to call.
+ */
+struct whisper_decoder;
+
+struct whisper_decoder *charsiu_whisper_decoder_new(const struct charsiu_whisper *w,
+						    const float *encoded);
+void charsiu_whisper_decoder_free(struct whisper_decoder *d);
+
+/*
+ * One token in at position `pos`, a full logit vector out (n_vocab).
+ * The self attention KV cache grows with pos, so tokens must be fed in order.
+ */
+const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
+				  int pos);
+
+/*
+ * Greedy transcription of one 30 second window. Writes at most `max` ids and
+ * returns the count, or -1. The ids do NOT include the prompt.
+ */
+int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
+			       const float *encoded, int32_t *ids, int max);
+
+/* One token's text. Bytes, not a string: whisper's BPE splits UTF-8. */
+const char *charsiu_whisper_token(const struct charsiu_whisper *w, int32_t id);
+
 /* A 16 bit PCM WAV, resampled to 16 kHz mono. Returns samples, or NULL. */
 float *charsiu_wav_load(const char *path, size_t *n, char *err, size_t errlen);
 

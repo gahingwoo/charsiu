@@ -28,7 +28,8 @@ int main(int argc, char **argv)
 {
 	struct charsiu_whisper w;
 	const char *model = NULL, *audio = NULL;
-	int i, want_mel = 0, want_enc = 0, secs = 1, rc = 1;
+	int i, want_mel = 0, want_enc = 0, want_txt = 0, want_lg = 0;
+	int secs = 1, rc = 1;
 	float *pcm = NULL, *mel = NULL, *enc = NULL;
 	size_t n = 0;
 
@@ -37,6 +38,11 @@ int main(int argc, char **argv)
 			want_mel = 1;
 		else if (!strcmp(argv[i], "--encode"))
 			want_enc = want_mel = 1;
+		else if (!strcmp(argv[i], "--transcribe"))
+			want_txt = want_enc = want_mel = 1;
+		/* the logits after the standard prompt: the decoder, checkable */
+		else if (!strcmp(argv[i], "--logits"))
+			want_lg = want_enc = want_mel = 1;
 		else if (!strcmp(argv[i], "--audio") && i + 1 < argc)
 			audio = argv[++i];
 		else if (!strcmp(argv[i], "--seconds") && i + 1 < argc)
@@ -47,7 +53,7 @@ int main(int argc, char **argv)
 	if (!model) {
 		fprintf(stderr,
 			"usage: charsiu_whisper MODEL.bin [--mel] "
-			"[--encode]\n"
+			"[--encode] [--transcribe] [--logits]\n"
 			"       [--audio FILE.wav] [--seconds N]\n"
 			"\n"
 			"  MODEL.bin is a whisper.cpp ggml model, not a gguf.\n");
@@ -99,10 +105,53 @@ int main(int argc, char **argv)
 		fprintf(stderr, "charsiu_whisper: the encoder failed\n");
 		goto done;
 	}
-	printf("encoder %d %d\n", w.n_audio_ctx, w.n_audio_state);
-	for (i = 0; i < w.n_audio_ctx * w.n_audio_state; i++)
-		printf("%.7g\n", (double)enc[i]);
-	rc = 0;
+	if (want_lg) {
+		struct whisper_decoder *d =
+			charsiu_whisper_decoder_new(&w, enc);
+		const float *lg = NULL;
+
+		if (!d)
+			goto done;
+		lg = charsiu_whisper_step(d, w.tok_sot, 0);
+		lg = charsiu_whisper_step(d, w.tok_not, 1);
+		if (!lg) {
+			charsiu_whisper_decoder_free(d);
+			goto done;
+		}
+		printf("logits %d\n", w.n_vocab);
+		for (i = 0; i < w.n_vocab; i++)
+			printf("%.7g\n", (double)lg[i]);
+		charsiu_whisper_decoder_free(d);
+		rc = 0;
+		goto done;
+	}
+
+	if (!want_txt) {
+		printf("encoder %d %d\n", w.n_audio_ctx, w.n_audio_state);
+		for (i = 0; i < w.n_audio_ctx * w.n_audio_state; i++)
+			printf("%.7g\n", (double)enc[i]);
+		rc = 0;
+		goto done;
+	}
+
+	{
+		int32_t ids[448];
+		int n = charsiu_whisper_transcribe(&w, enc, ids,
+						   (int)(sizeof(ids) /
+							 sizeof(*ids)));
+
+		if (n < 0) {
+			fprintf(stderr, "charsiu_whisper: this is a "
+				"multilingual model, and the prompt it needs "
+				"carries a language\n  and a task token that "
+				"this does not build yet. Use an .en model.\n");
+			goto done;
+		}
+		for (i = 0; i < n; i++)
+			fputs(charsiu_whisper_token(&w, ids[i]), stdout);
+		fputc('\n', stdout);
+		rc = 0;
+	}
 done:
 	free(pcm);
 	free(mel);

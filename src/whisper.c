@@ -1026,3 +1026,277 @@ out:
 	charsiu_act_free(&a);
 	return rc;
 }
+
+/* ---- the text decoder ---------------------------------------------------- */
+
+/*
+ * ⚠ THE CROSS ATTENTION KEYS AND VALUES ARE PER CLIP, NOT PER TOKEN. They come
+ * from the encoder's 1500 positions, which do not change while a transcript is
+ * being generated, so computing them inside the token loop would repeat
+ * 1500 x 384 x 384 x 2 multiplies per layer per token -- more work than the
+ * whole rest of the decoder. They are built once, here.
+ */
+struct whisper_decoder {
+	const struct charsiu_whisper *w;
+	unsigned W, H, hd, L, F, T;
+	float **xk, **xv;        /* [layer][1500 * W] */
+	float **sk, **sv;        /* [layer][n_text_ctx * W], the self attention cache */
+	float *logits;
+	struct charsiu_act a;
+	float *x, *xb, *q, *att, *ff, *g1, *b1;
+	int ok;
+};
+
+void charsiu_whisper_decoder_free(struct whisper_decoder *d)
+{
+	unsigned l;
+
+	if (!d)
+		return;
+	for (l = 0; l < d->L; l++) {
+		if (d->xk) free(d->xk[l]);
+		if (d->xv) free(d->xv[l]);
+		if (d->sk) free(d->sk[l]);
+		if (d->sv) free(d->sv[l]);
+	}
+	free(d->xk); free(d->xv); free(d->sk); free(d->sv);
+	free(d->logits); free(d->x); free(d->xb); free(d->q);
+	free(d->att); free(d->ff); free(d->g1); free(d->b1);
+	charsiu_act_free(&d->a);
+	free(d);
+}
+
+struct whisper_decoder *charsiu_whisper_decoder_new(const struct charsiu_whisper *w,
+						    const float *encoded)
+{
+	struct whisper_decoder *d = calloc(1, sizeof(*d));
+	unsigned l;
+
+	if (!d)
+		return NULL;
+	d->w = w;
+	d->W = (unsigned)w->n_text_state;
+	d->H = (unsigned)w->n_text_head;
+	d->L = (unsigned)w->n_text_layer;
+	d->T = (unsigned)w->n_audio_ctx;
+	d->F = 4 * d->W;
+	d->hd = d->W / d->H;
+	if (!d->hd || d->hd * d->H != d->W)
+		goto fail;
+
+	if (charsiu_act_alloc(&d->a, (int)(d->F > d->W ? d->F : d->W)))
+		goto fail;
+	d->xk = calloc(d->L, sizeof(*d->xk));
+	d->xv = calloc(d->L, sizeof(*d->xv));
+	d->sk = calloc(d->L, sizeof(*d->sk));
+	d->sv = calloc(d->L, sizeof(*d->sv));
+	d->logits = malloc((size_t)w->n_vocab * sizeof(float));
+	d->x  = malloc((size_t)d->W * sizeof(float));
+	d->xb = malloc((size_t)d->W * sizeof(float));
+	d->q  = malloc((size_t)d->W * sizeof(float));
+	d->att = malloc((size_t)(d->T > (unsigned)w->n_text_ctx
+				 ? d->T : (unsigned)w->n_text_ctx) *
+			sizeof(float));
+	d->ff = malloc((size_t)d->F * sizeof(float));
+	d->g1 = malloc((size_t)d->F * sizeof(float));
+	d->b1 = malloc((size_t)d->F * sizeof(float));
+	if (!d->xk || !d->xv || !d->sk || !d->sv || !d->logits || !d->x ||
+	    !d->xb || !d->q || !d->att || !d->ff || !d->g1 || !d->b1)
+		goto fail;
+
+	for (l = 0; l < d->L; l++) {
+		struct whisper_block *B = &w->dec[l];
+
+		d->xk[l] = malloc((size_t)d->T * d->W * sizeof(float));
+		d->xv[l] = malloc((size_t)d->T * d->W * sizeof(float));
+		d->sk[l] = malloc((size_t)w->n_text_ctx * d->W * sizeof(float));
+		d->sv[l] = malloc((size_t)w->n_text_ctx * d->W * sizeof(float));
+		if (!d->xk[l] || !d->xv[l] || !d->sk[l] || !d->sv[l])
+			goto fail;
+		/* ⚠ no bias on the key projection, here as everywhere */
+		wrows(B->xk_w, NULL, encoded, d->T, d->W, d->xk[l], d->W, &d->a);
+		wrows(B->xv_w, wrow1(B->xv_b, d->b1), encoded, d->T, d->W,
+		      d->xv[l], d->W, &d->a);
+	}
+	d->ok = 1;
+	return d;
+fail:
+	charsiu_whisper_decoder_free(d);
+	return NULL;
+}
+
+const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
+				  int pos)
+{
+	const struct charsiu_whisper *w = d->w;
+	unsigned W = d->W, H = d->H, hd = d->hd, F = d->F, l, i, j, h, e;
+	float scale = 1.0f / sqrtf((float)hd);
+	struct gguf_tensor emb;
+
+	if (!d->ok || pos < 0 || pos >= w->n_text_ctx)
+		return NULL;
+
+	gguf_row_f32(w->d_tok, (uint64_t)token, d->x);
+	gguf_row_f32(w->d_pos, (uint64_t)pos, d->g1);
+	for (i = 0; i < W; i++)
+		d->x[i] += d->g1[i];
+
+	for (l = 0; l < d->L; l++) {
+		struct whisper_block *B = &w->dec[l];
+		float *krow = d->sk[l] + (size_t)pos * W;
+		float *vrow = d->sv[l] + (size_t)pos * W;
+
+		/* --- self attention, causal by construction ---------------- */
+		wlayernorm(d->xb, d->x, wrow1(B->attn_ln_w, d->g1),
+			   wrow1(B->attn_ln_b, d->b1), W, 1e-5f);
+		wrows(B->q_w, wrow1(B->q_b, d->b1), d->xb, 1, W, d->q, W, &d->a);
+		wrows(B->k_w, NULL, d->xb, 1, W, krow, W, &d->a);
+		wrows(B->v_w, wrow1(B->v_b, d->b1), d->xb, 1, W, vrow, W, &d->a);
+
+		for (h = 0; h < H; h++) {
+			unsigned off = h * hd;
+			const float *qi = d->q + off;
+			float *o = d->xb + off;
+
+			for (j = 0; j <= (unsigned)pos; j++) {
+				const float *kj = d->sk[l] + (size_t)j * W + off;
+				float dp = 0.0f;
+
+				for (e = 0; e < hd; e++)
+					dp += qi[e] * kj[e];
+				d->att[j] = dp * scale;
+			}
+			wsoftmax(d->att, (unsigned)pos + 1);
+			for (e = 0; e < hd; e++)
+				o[e] = 0.0f;
+			for (j = 0; j <= (unsigned)pos; j++) {
+				const float *vj = d->sv[l] + (size_t)j * W + off;
+				float wg = d->att[j];
+
+				for (e = 0; e < hd; e++)
+					o[e] += wg * vj[e];
+			}
+		}
+		wrows(B->o_w, wrow1(B->o_b, d->b1), d->xb, 1, W, d->q, W, &d->a);
+		for (i = 0; i < W; i++)
+			d->x[i] += d->q[i];
+
+		/* --- cross attention, against the clip --------------------- */
+		wlayernorm(d->xb, d->x, wrow1(B->x_ln_w, d->g1),
+			   wrow1(B->x_ln_b, d->b1), W, 1e-5f);
+		wrows(B->xq_w, wrow1(B->xq_b, d->b1), d->xb, 1, W, d->q, W,
+		      &d->a);
+		for (h = 0; h < H; h++) {
+			unsigned off = h * hd;
+			const float *qi = d->q + off;
+			float *o = d->xb + off;
+
+			for (j = 0; j < d->T; j++) {
+				const float *kj = d->xk[l] + (size_t)j * W + off;
+				float dp = 0.0f;
+
+				for (e = 0; e < hd; e++)
+					dp += qi[e] * kj[e];
+				d->att[j] = dp * scale;
+			}
+			wsoftmax(d->att, d->T);
+			for (e = 0; e < hd; e++)
+				o[e] = 0.0f;
+			for (j = 0; j < d->T; j++) {
+				const float *vj = d->xv[l] + (size_t)j * W + off;
+				float wg = d->att[j];
+
+				for (e = 0; e < hd; e++)
+					o[e] += wg * vj[e];
+			}
+		}
+		wrows(B->xo_w, wrow1(B->xo_b, d->b1), d->xb, 1, W, d->q, W,
+		      &d->a);
+		for (i = 0; i < W; i++)
+			d->x[i] += d->q[i];
+
+		/* --- feed forward ------------------------------------------ */
+		wlayernorm(d->xb, d->x, wrow1(B->mlp_ln_w, d->g1),
+			   wrow1(B->mlp_ln_b, d->b1), W, 1e-5f);
+		wrows(B->fc1_w, wrow1(B->fc1_b, d->b1), d->xb, 1, W, d->ff, F,
+		      &d->a);
+		wgelu(d->ff, F);
+		wrows(B->fc2_w, wrow1(B->fc2_b, d->b1), d->ff, 1, F, d->q, W,
+		      &d->a);
+		for (i = 0; i < W; i++)
+			d->x[i] += d->q[i];
+	}
+
+	wlayernorm(d->xb, d->x, wrow1(w->d_ln_w, d->g1),
+		   wrow1(w->d_ln_b, d->b1), W, 1e-5f);
+
+	/*
+	 * ⚠ THE OUTPUT HEAD IS THE EMBEDDING TABLE, transposed -- whisper ties
+	 * them. token_embedding.weight is [n_vocab][n_text_state] and that is
+	 * exactly a matmul against it, one row a vocabulary entry.
+	 */
+	emb = wflat(w->d_tok, (uint64_t)W, (uint64_t)w->n_vocab);
+	charsiu_act_set(&d->a, d->xb, (int)W);
+	gguf_matvec(&emb, &d->a, d->logits, 0, (uint64_t)w->n_vocab);
+	return d->logits;
+}
+
+const char *charsiu_whisper_token(const struct charsiu_whisper *w, int32_t id)
+{
+	if (id < 0 || id >= w->n_vocab || !w->vocab || !w->vocab[id])
+		return "";
+	return w->vocab[id];
+}
+
+int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
+			       const float *encoded, int32_t *ids, int max)
+{
+	struct whisper_decoder *d;
+	const float *lg = NULL;
+	int32_t prompt[2];
+	int n = 0, pos, i, np = 2;
+
+	/*
+	 * ⚠ REFUSED RATHER THAN GUESSED. A multilingual model wants a language
+	 * token and a task token between the two markers, and picking them
+	 * needs a language detection pass this does not do. Transcribing a
+	 * French clip with an English prompt does not fail: it answers in
+	 * fluent English about nothing that was said.
+	 */
+	if (w->multilingual)
+		return -1;
+
+	d = charsiu_whisper_decoder_new(w, encoded);
+	if (!d)
+		return -1;
+
+	prompt[0] = w->tok_sot;
+	prompt[1] = w->tok_not;
+
+	/*
+	 * ⚠ THE LOGITS AFTER THE LAST PROMPT TOKEN ARE THE FIRST PREDICTION.
+	 * There is no extra step for it, and adding one -- which the first
+	 * version of this did -- feeds the marker twice and shifts the whole
+	 * transcript by a token.
+	 */
+	for (i = 0; i < np; i++)
+		lg = charsiu_whisper_step(d, prompt[i], i);
+	pos = np;
+
+	while (lg && n < max && pos < w->n_text_ctx) {
+		int32_t best = 0;
+		float bv = -1e30f;
+
+		for (i = 0; i < w->n_vocab; i++)
+			if (lg[i] > bv) {
+				bv = lg[i];
+				best = (int32_t)i;
+			}
+		if (best == w->tok_eot)
+			break;
+		ids[n++] = best;
+		lg = charsiu_whisper_step(d, best, pos++);
+	}
+	charsiu_whisper_decoder_free(d);
+	return n;
+}

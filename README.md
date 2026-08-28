@@ -52,6 +52,29 @@ Llama.
 On SmolVLM-256M, a 512x512 picture is 1024 patches and 64 tokens, and the control is
 that without the picture the same prompt makes one up.
 
+**And it hears.** Whisper, out of whisper.cpp's own container -- the mel spectrogram,
+the audio encoder, and a decoder with the first cross attention in this tree.
+
+```
+$ charsiu_whisper ggml-tiny.en.bin --transcribe --audio jfk.wav
+ And so my fellow Americans ask not what your country can do for you, ask what you
+ can do for your country.
+```
+
+Every stage is diffed against numpy on the real weights: the spectrogram at 1.7e-05,
+the encoder at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the
+same argmax.
+
+**And it matches pictures to words.** CLIP's two towers land in one space:
+
+```
+$ charsiu_clip clip-vit-base-patch32.gguf --image logo.png \
+      --text "a drawing of a llama" "the statue of liberty" "a dog on grass"
+  0.2537  a drawing of a llama
+  0.1743  the statue of liberty
+  0.1533  a dog on grass
+```
+
 ## Install
 
 ```
