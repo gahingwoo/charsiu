@@ -26,7 +26,8 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
      $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
-     $(BUILD)/charsiu_vision $(BUILD)/tokenizer_roundtrip
+     $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
+     $(BUILD)/tokenizer_roundtrip
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -54,6 +55,11 @@ $(BUILD)/charsiu_matmul: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 # guess that finds nothing has cost this project a model that answered while
 # missing half of itself. This prints the misses by name.
 $(BUILD)/charsiu_vision: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+# ⚠ CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
+# model's: causal, pooled at the end of text token, its own BPE.
+$(BUILD)/charsiu_clip: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
 
 # the CPU decode loop: the oracle every NPU version is diffed against

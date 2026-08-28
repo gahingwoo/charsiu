@@ -109,6 +109,7 @@ gemma3-4b-q4|unsloth/gemma-3-4b-it-GGUF|gemma-3-4b-it-Q4_0.gguf|2260|check the c
 gemma4-e2b-q4|ggml-org/gemma-4-E2B-it-GGUF|gemma-4-E2B-it-Q4_0.gguf|2710|per-layer embeddings; 2B of a 4.6B model is active
 smolvlm-256m|ggml-org/SmolVLM-256M-Instruct-GGUF|SmolVLM-256M-Instruct-Q8_0.gguf|175|SEES PICTURES: pass --image FILE. Smallest one that does|mmproj-SmolVLM-256M-Instruct-Q8_0.gguf|104
 smolvlm-500m|ggml-org/SmolVLM-500M-Instruct-GGUF|SmolVLM-500M-Instruct-Q8_0.gguf|437|SEES PICTURES, and describes them better than the 256M|mmproj-SmolVLM-500M-Instruct-Q8_0.gguf|109
+clip-b32|mys/ggml_clip-vit-base-patch32|clip-vit-base-patch32_ggml-model-q4_0.gguf|90|MATCHES pictures to words -- charsiu_clip, not a chat model
 ZOO
 }
 

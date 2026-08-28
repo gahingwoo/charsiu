@@ -25,6 +25,7 @@ enum charsiu_proj {
 	CHARSIU_PROJ_NONE = 0,
 	CHARSIU_PROJ_MLP,          /* two matmuls with a GELU between them */
 	CHARSIU_PROJ_IDEFICS3,     /* a pixel shuffle, then one fc */
+	CHARSIU_PROJ_CLIP,         /* the class token, then one projection */
 	CHARSIU_PROJ_UNKNOWN,
 };
 
@@ -80,6 +81,14 @@ struct charsiu_vision {
 	const struct gguf_tensor *pre_ln_w, *pre_ln_b, *post_ln_w, *post_ln_b;
 	const struct gguf_tensor *mm_w[2], *mm_b[2];   /* the mlp projector */
 	const struct gguf_tensor *fc_w, *fc_b;         /* idefics3's single fc */
+	/*
+	 * ⚠ CLIP PREPENDS A CLASS TOKEN, so the position embedding has one more
+	 * row than there are patches and the image's single embedding is that
+	 * token's, post normalised and projected -- not the patches at all.
+	 * A tower for a language model hands over every patch; a tower for
+	 * retrieval hands over one vector. The same twelve blocks either way.
+	 */
+	const struct gguf_tensor *class_embd, *vproj_w;
 	struct charsiu_vision_layer *layer;
 
 	/* what it wanted and did not find, in the order it wanted them */

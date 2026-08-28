@@ -51,6 +51,13 @@ def kv_arr_f32(k, vals):
     return out
 
 
+def kv_arr_str(k, vals):
+    out = s(k) + struct.pack("<I", ARR) + struct.pack("<IQ", STR, len(vals))
+    for v in vals:
+        out += s(v)
+    return out
+
+
 def kv_str(k, v):
     return s(k) + struct.pack("<I", STR) + s(v)
 
@@ -62,6 +69,29 @@ PATCHES = GRID * GRID
 SCALE = 2                      # idefics3's pixel shuffle factor
 
 
+TW, TFF, THEADS, TLAYERS, TCTX, TVOCAB = 24, 48, 4, 2, 16, 40
+
+
+def text_tensors():
+    t = [("t.token_embd.weight", [TW, TVOCAB]),
+         ("t.position_embd.weight", [TW, TCTX]),
+         ("t.post_ln.weight", [TW]), ("t.post_ln.bias", [TW]),
+         ("text_projection.weight", [TW, PROJ])]
+    for i in range(TLAYERS):
+        p = f"t.blk.{i}."
+        t += [
+            (p + "ln1.weight", [TW]), (p + "ln1.bias", [TW]),
+            (p + "attn_q.weight", [TW, TW]), (p + "attn_q.bias", [TW]),
+            (p + "attn_k.weight", [TW, TW]), (p + "attn_k.bias", [TW]),
+            (p + "attn_v.weight", [TW, TW]), (p + "attn_v.bias", [TW]),
+            (p + "attn_out.weight", [TW, TW]), (p + "attn_out.bias", [TW]),
+            (p + "ln2.weight", [TW]), (p + "ln2.bias", [TW]),
+            (p + "ffn_down.weight", [TW, TFF]), (p + "ffn_down.bias", [TFF]),
+            (p + "ffn_up.weight", [TFF, TW]), (p + "ffn_up.bias", [TW]),
+        ]
+    return t
+
+
 def tensors(kind="mlp"):
     """(name, ne) with ne in gguf order: ne[0] is the fastest axis.
 
@@ -70,14 +100,18 @@ def tensors(kind="mlp"):
     ffn_up, the opposite way round from the language model. Writing them the
     intuitive way here would have made the synthetic file the only one the
     loader could read."""
-    proj = ([("mm.model.fc.weight", [WIDTH * SCALE * SCALE, PROJ])]
-            if kind == "idefics3" else
-            [("mm.0.weight", [WIDTH, PROJ]), ("mm.0.bias", [PROJ])])
+    if kind == "idefics3":
+        proj = [("mm.model.fc.weight", [WIDTH * SCALE * SCALE, PROJ])]
+    elif kind == "clip":
+        proj = ([("visual_projection.weight", [WIDTH, PROJ]),
+                 ("v.class_embd", [WIDTH])] + text_tensors())
+    else:
+        proj = [("mm.0.weight", [WIDTH, PROJ]), ("mm.0.bias", [PROJ])]
     t = proj + [
         # a patch embedding is [out][in] with in = channels * patch * patch
         ("v.patch_embd.weight", [3 * PATCH * PATCH, WIDTH]),
         ("v.patch_embd.bias", [WIDTH]),
-        ("v.position_embd.weight", [WIDTH, PATCHES]),
+        ("v.position_embd.weight", [WIDTH, PATCHES + (1 if kind == "clip" else 0)]),
         ("v.post_ln.weight", [WIDTH]),
         ("v.post_ln.bias", [WIDTH]),
     ]
@@ -118,8 +152,20 @@ def write(path, drop=(), data=None, kind="mlp"):
         kv_u32("clip.use_gelu", 1),
     ] + ([kv_str("clip.projector_type", "idefics3"),
           kv_u32("clip.vision.projector.scale_factor", SCALE)]
-         if kind == "idefics3" else []))
-    n_kv = 13 + (2 if kind == "idefics3" else 0)
+         if kind == "idefics3" else []) + (
+        [kv_bool("clip.has_text_encoder", True),
+         kv_u32("clip.text.embedding_length", TW),
+         kv_u32("clip.text.feed_forward_length", TFF),
+         kv_u32("clip.text.block_count", TLAYERS),
+         kv_u32("clip.text.attention.head_count", THEADS),
+         kv_u32("clip.text.context_length", TCTX),
+         kv_u32("clip.text.projection_dim", PROJ),
+         kv_f32("clip.text.attention.layer_norm_epsilon", 1e-6),
+         kv_arr_str("tokenizer.ggml.tokens",
+                    [f"t{i}" for i in range(TVOCAB - 2)] +
+                    ["<|startoftext|>", "<|endoftext|>"])]
+        if kind == "clip" else []))
+    n_kv = 13 + (2 if kind == "idefics3" else 0) + (9 if kind == "clip" else 0)
 
     infos, off, blobs = b"", 0, []
     for name, ne in ts:

@@ -198,8 +198,10 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 
 		v->patch_w   = bind(v, "v.patch_embd.weight", -1, 0, pin, W);
 		v->patch_b   = bind1(v, "v.patch_embd.bias", -1, 1, W);
+		v->class_embd = probe(v, "v.class_embd", -1, 0, W)
+			      ? bind1(v, "v.class_embd", -1, 1, W) : NULL;
 		v->pos_embd  = bind(v, "v.position_embd.weight", -1, 0, W,
-				    v->n_patches);
+				    v->n_patches + (v->class_embd ? 1 : 0));
 		v->pre_ln_w  = bind1(v, "v.pre_ln.weight", -1, 1, W);
 		v->pre_ln_b  = bind1(v, "v.pre_ln.bias", -1, 1, W);
 		v->post_ln_w = bind1(v, "v.post_ln.weight", -1, 1, W);
@@ -215,7 +217,15 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 		char kind[32] = "";
 
 		gguf_get_str(&v->g, "clip.projector_type", kind, sizeof(kind));
-		if (!strcmp(kind, "idefics3")) {
+		if (gguf_tensor(&v->g, "visual_projection.weight")) {
+			v->proj = CHARSIU_PROJ_CLIP;
+			v->scale = 1;
+			v->vproj_w = bind(v, "visual_projection.weight", -1, 0,
+					  v->n_embd, v->proj_dim);
+			if (!v->class_embd)
+				miss(v, "v.class_embd (a CLIP tower pools the "
+				     "class token and there is none)");
+		} else if (!strcmp(kind, "idefics3")) {
 			uint32_t s2;
 
 			v->proj = CHARSIU_PROJ_IDEFICS3;
@@ -349,7 +359,10 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
 		v->n_patches);
 	fprintf(out, "  width        %u, ffn %u, heads %u, layers %u\n",
 		v->n_embd, v->n_ff, v->n_head, v->n_layer);
-	if (v->proj == CHARSIU_PROJ_IDEFICS3)
+	if (v->proj == CHARSIU_PROJ_CLIP)
+		fprintf(out, "  projection   CLIP, the class token pooled to "
+			"one embedding of %u\n", charsiu_vision_width(v));
+	else if (v->proj == CHARSIU_PROJ_IDEFICS3)
 		fprintf(out, "  projection   idefics3, pixel shuffle by %u so "
 			"%u patches become %u tokens of %u\n",
 			v->scale, v->n_patches, charsiu_vision_tokens(v),
@@ -358,8 +371,8 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
 		fprintf(out, "  projection   %s, %u tokens of %u\n",
 			v->proj == CHARSIU_PROJ_MLP ? "mlp" : "unrecognised",
 			charsiu_vision_tokens(v), charsiu_vision_width(v));
-	fprintf(out, "  norm eps     %g, gelu %s\n", (double)v->eps,
-		v->use_gelu ? "on" : "off");
+	fprintf(out, "  norm eps     %g, activation %s\n", (double)v->eps,
+		v->use_gelu ? "gelu (tanh)" : "gelu quick");
 	fprintf(out, "  pixels       mean %.4f %.4f %.4f  std %.4f %.4f %.4f\n",
 		(double)v->mean[0], (double)v->mean[1], (double)v->mean[2],
 		(double)v->std[0], (double)v->std[1], (double)v->std[2]);
@@ -451,20 +464,31 @@ static void layernorm(float *out, const float *x, const float *w,
 }
 
 /*
- * ⚠ THE TANH APPROXIMATION, matching gelu_mul in llama.c and ggml's GGML_OP_GELU.
- * This one is NOT gated: a ViT's feed forward is fc1 -> GELU -> fc2, with no
+ * ⚠⚠ clip.use_gelu PICKS AN ACTIVATION, IT DOES NOT SWITCH ONE OFF.
+ *
+ * 1 is the tanh approximation, which is ggml's GGML_OP_GELU and llama.c's
+ * gelu_mul. 0 is GELU QUICK, x * sigmoid(1.702 x), which is what OpenAI's CLIP
+ * uses -- not the absence of a nonlinearity. Reading it as a boolean meant
+ * every CLIP feed forward would have run as two matmuls with nothing between
+ * them: finite, plausible, and a completely different model. SmolVLM has
+ * use_gelu 1, which is why the first tower this ran on could not show it.
+ *
+ * Neither is gated: a ViT's feed forward is fc1 -> activation -> fc2, with no
  * second branch to multiply against.
  */
-static void gelu(float *x, unsigned n)
+static void gelu(float *x, unsigned n, int tanh_form)
 {
 	unsigned i;
 
 	for (i = 0; i < n; i++) {
 		float v = x[i];
 
-		x[i] = 0.5f * v *
-		       (1.0f + tanhf(0.7978845608028654f *
-				     (v + 0.044715f * v * v * v)));
+		if (tanh_form)
+			x[i] = 0.5f * v *
+			       (1.0f + tanhf(0.7978845608028654f *
+					     (v + 0.044715f * v * v * v)));
+		else
+			x[i] = v / (1.0f + expf(-1.702f * v));
 	}
 }
 
@@ -516,11 +540,16 @@ unsigned charsiu_vision_tokens(const struct charsiu_vision *v)
 {
 	unsigned s2 = v->scale ? v->scale * v->scale : 1;
 
+	/* ⚠ ONE, not one per patch: a retrieval tower pools to a single vector */
+	if (v->proj == CHARSIU_PROJ_CLIP)
+		return 1;
 	return s2 > 1 ? v->n_patches / s2 : v->n_patches;
 }
 
 unsigned charsiu_vision_width(const struct charsiu_vision *v)
 {
+	if (v->proj == CHARSIU_PROJ_CLIP)
+		return v->vproj_w ? (unsigned)rows_of(v->vproj_w) : 0;
 	if (v->proj == CHARSIU_PROJ_IDEFICS3)
 		return v->fc_w ? (unsigned)rows_of(v->fc_w) : 0;
 	if (v->mm_w[1])
@@ -563,6 +592,14 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 {
 	unsigned np = v->n_patches, W = v->n_embd, P = v->patch_size;
 	unsigned pin = 3u * P * P, hd, l, p, i, j, h, e;
+	/*
+	 * ⚠ THE SEQUENCE IS NOT THE PATCHES. CLIP prepends a class token, so
+	 * everything from the position embedding to the attention runs over
+	 * np + 1 rows, and only the gather and the pixel shuffle are about
+	 * patches. Sizing the buffers by np was a read one row past every one
+	 * of them.
+	 */
+	unsigned cls, nt;
 	unsigned nff = v->n_ff;
 	unsigned wide = W > nff ? W : nff;
 	float *patch = NULL, *x = NULL, *xb = NULL, *q = NULL, *k = NULL;
@@ -573,6 +610,8 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 	if (!v->opened || v->n_missing || !np || !v->n_head)
 		return -1;
+	cls = v->class_embd ? 1u : 0u;
+	nt = np + cls;
 	hd = W / v->n_head;
 	if (!hd || hd * v->n_head != W)
 		return -1;
@@ -590,13 +629,13 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	if (charsiu_act_alloc(&a, (int)(pin > wide ? pin : wide)))
 		return -1;
 	patch = malloc((size_t)np * pin * sizeof(float));
-	x     = malloc((size_t)np * W * sizeof(float));
-	xb    = malloc((size_t)np * W * sizeof(float));
-	q     = malloc((size_t)np * W * sizeof(float));
-	k     = malloc((size_t)np * W * sizeof(float));
-	val   = malloc((size_t)np * W * sizeof(float));
-	ff    = malloc((size_t)np * (size_t)nff * sizeof(float));
-	att   = malloc((size_t)np * sizeof(float));
+	x     = malloc((size_t)nt * W * sizeof(float));
+	xb    = malloc((size_t)nt * W * sizeof(float));
+	q     = malloc((size_t)nt * W * sizeof(float));
+	k     = malloc((size_t)nt * W * sizeof(float));
+	val   = malloc((size_t)nt * W * sizeof(float));
+	ff    = malloc((size_t)nt * (size_t)nff * sizeof(float));
+	att   = malloc((size_t)nt * sizeof(float));
 	tmp   = malloc((size_t)W * sizeof(float));
 	gain  = malloc((size_t)wide * sizeof(float));
 	bias  = malloc((size_t)wide * sizeof(float));
@@ -625,10 +664,13 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 						   gx * P + i];
 	}
 
-	rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch, np, pin, x, W, &a);
+	rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch, np, pin,
+		 x + (size_t)cls * W, W, &a);
+	if (cls)
+		gguf_row_f32(v->class_embd, 0, x);
 
 	/* the position embedding is one row per patch */
-	for (p = 0; p < np; p++) {
+	for (p = 0; p < nt; p++) {
 		gguf_row_f32(v->pos_embd, p, tmp);
 		for (i = 0; i < W; i++)
 			x[(size_t)p * W + i] += tmp[i];
@@ -638,7 +680,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		const float *g = row1(v->pre_ln_w, gain, W);
 		const float *b = row1(v->pre_ln_b, bias, W);
 
-		for (p = 0; p < np; p++)
+		for (p = 0; p < nt; p++)
 			layernorm(x + (size_t)p * W, x + (size_t)p * W, g, b,
 				  W, v->eps);
 	}
@@ -654,7 +696,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			if (!g || !b) { free(g); free(b); goto out; }
 			row1(L->ln1_w, g, W);
-			for (p = 0; p < np; p++)
+			for (p = 0; p < nt; p++)
 				layernorm(xb + (size_t)p * W, x + (size_t)p * W,
 					  L->ln1_w ? g : NULL,
 					  L->ln1_b ? row1(L->ln1_b, b, W) : NULL,
@@ -662,19 +704,19 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			free(g); free(b);
 		}
 
-		rows_mul(L->q_w, row1(L->q_b, bias, W), xb, np, W, q, W, &a);
-		rows_mul(L->k_w, row1(L->k_b, bias, W), xb, np, W, k, W, &a);
-		rows_mul(L->v_w, row1(L->v_b, bias, W), xb, np, W, val, W, &a);
+		rows_mul(L->q_w, row1(L->q_b, bias, W), xb, nt, W, q, W, &a);
+		rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a);
+		rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a);
 
 		/* full attention, every patch against every patch */
 		for (h = 0; h < v->n_head; h++) {
 			unsigned off = h * hd;
 
-			for (i = 0; i < np; i++) {
+			for (i = 0; i < nt; i++) {
 				const float *qi = q + (size_t)i * W + off;
 				float *o = xb + (size_t)i * W + off;
 
-				for (j = 0; j < np; j++) {
+				for (j = 0; j < nt; j++) {
 					const float *kj = k + (size_t)j * W + off;
 					float d = 0.0f;
 
@@ -682,10 +724,10 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 						d += qi[e] * kj[e];
 					att[j] = d * scale;
 				}
-				vsoftmax(att, np);
+				vsoftmax(att, nt);
 				for (e = 0; e < hd; e++)
 					o[e] = 0.0f;
-				for (j = 0; j < np; j++) {
+				for (j = 0; j < nt; j++) {
 					const float *vj = val + (size_t)j * W + off;
 					float w = att[j];
 
@@ -695,8 +737,8 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			}
 		}
 
-		rows_mul(L->o_w, row1(L->o_b, bias, W), xb, np, W, q, W, &a);
-		for (i = 0; i < np * W; i++)
+		rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a);
+		for (i = 0; i < nt * W; i++)
 			x[i] += q[i];
 
 		{
@@ -705,7 +747,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 			if (!g || !b) { free(g); free(b); goto out; }
 			row1(L->ln2_w, g, W);
-			for (p = 0; p < np; p++)
+			for (p = 0; p < nt; p++)
 				layernorm(xb + (size_t)p * W, x + (size_t)p * W,
 					  L->ln2_w ? g : NULL,
 					  L->ln2_b ? row1(L->ln2_b, b, W) : NULL,
@@ -713,13 +755,12 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			free(g); free(b);
 		}
 
-		rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb, np, W, ff,
+		rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb, nt, W, ff,
 			 nff, &a);
-		if (v->use_gelu)
-			gelu(ff, np * nff);
-		rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff, np, nff, q, W,
+		gelu(ff, nt * nff, v->use_gelu);
+		rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff, nt, nff, q, W,
 			 &a);
-		for (i = 0; i < np * W; i++)
+		for (i = 0; i < nt * W; i++)
 			x[i] += q[i];
 	}
 
@@ -728,15 +769,26 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		float *b = malloc((size_t)W * sizeof(float));
 
 		if (!g || !b) { free(g); free(b); goto out; }
+		/*
+		 * ⚠ CLIP POST NORMALISES THE POOLED TOKEN ONLY. HF takes
+		 * last_hidden_state[:, 0] and then applies post_layernorm; a
+		 * tower feeding a language model applies it to every patch.
+		 * Same tensor, different number of rows.
+		 */
+		unsigned pn = v->proj == CHARSIU_PROJ_CLIP ? 1 : nt;
+
 		row1(v->post_ln_w, g, W);
-		for (p = 0; p < np; p++)
+		for (p = 0; p < pn; p++)
 			layernorm(x + (size_t)p * W, x + (size_t)p * W, g,
 				  v->post_ln_b ? row1(v->post_ln_b, b, W) : NULL,
 				  W, v->eps);
 		free(g); free(b);
 	}
 
-	if (v->proj == CHARSIU_PROJ_IDEFICS3) {
+	if (v->proj == CHARSIU_PROJ_CLIP) {
+		rows_mul(v->vproj_w, NULL, x, 1, W, out,
+			 (unsigned)rows_of(v->vproj_w), &a);
+	} else if (v->proj == CHARSIU_PROJ_IDEFICS3) {
 		unsigned s2 = v->scale * v->scale;
 		unsigned tok = np / s2, wide2 = W * s2;
 		float *sh = malloc((size_t)tok * wide2 * sizeof(float));
@@ -758,7 +810,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		if (v->mm_w[1]) {
 			unsigned d1 = (unsigned)rows_of(v->mm_w[1]);
 
-			gelu(h0, np * d0);
+			gelu(h0, np * d0, v->use_gelu);
 			rows_mul(v->mm_w[1], row1(v->mm_b[1], bias, d1), h0, np,
 				 d0, out, d1, &a);
 		} else {
@@ -766,7 +818,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		}
 		free(h0);
 	} else {
-		memcpy(out, x, (size_t)np * W * sizeof(float));
+		memcpy(out, x, (size_t)nt * W * sizeof(float));
 	}
 	rc = 0;
 out:
