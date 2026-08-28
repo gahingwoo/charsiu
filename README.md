@@ -102,7 +102,10 @@ checks still run, which is the point: it is what the installer *sees* on your ma
 
 ### Two channels
 
-**stable** is what the line above installs: the runtime, and nothing else.
+**stable** installs the runtime AND the other modalities: `charsiu_run`,
+`charsiu_check`, `charsiu_serve`, `charsiu_vision`, `charsiu_clip`,
+`charsiu_whisper`. None of those touches an NPU register that the decode path
+does not.
 
 **dev** adds the hardware probes -- `npu_gemm_test`, `charsiu_matmul`,
 `bench_batch`, `prefill_control.sh` -- and tracks `dev`, where the work happens.

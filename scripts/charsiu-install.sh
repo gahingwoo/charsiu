@@ -393,12 +393,22 @@ if [ "$UNINSTALL" = 1 ]; then
 The models in $MODELS and your $ETC/config.ini are LEFT ALONE.
 A kernel this installed is NOT removed either. Pick the previous
 entry in the boot menu instead, then remove it by hand." defaultno || exit 0
-	# Remove what is there, not what the list happened to say when it was
-	# written. The install side makes the same mistake if it is spelled out.
+	# ⚠⚠ REMOVE WHAT IS THERE, NOT WHAT THE LIST SAID WHEN IT WAS WRITTEN --
+	# which is what the sentence that used to be here promised and the six
+	# hardcoded names underneath it did not do. It missed npu_gemm_test,
+	# charsiu_matmul, prefill_control.sh, charsiu_vision, charsiu_clip and
+	# charsiu_whisper, so an uninstall left most of a dev install behind and
+	# said "Removed."
+	#
+	# ⚠ FILES ONLY, AND NOT RECURSIVELY. $BIN is /opt/charsiu and the
+	# default models directory is /opt/charsiu/models, which the message
+	# above promises to leave alone.
 	as_root rm -f "$SBIN/charsiu"
-	for f in "$SBIN"/charsiu-*; do [ -e "$f" ] && as_root rm -f "$f"; done
-	for f in charsiu_run charsiu_check charsiu_serve bench_batch charsiu-tui.sh charsiu-lib.sh; do
-		as_root rm -f "$BIN/$f"
+	for f in "$SBIN"/charsiu-* "$SBIN"/charsiu_*; do
+		[ -f "$f" ] && as_root rm -f "$f"
+	done
+	for f in "$BIN"/*; do
+		[ -f "$f" ] && as_root rm -f "$f"
 	done
 	ui_msg "Removed. Models and config kept."
 	exit 0
@@ -860,7 +870,14 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # register does at a width nobody has run, whether batching pays -- and they
 # have wedged the block, timed out and printed the opposite of their own data
 # on the way to the answers. `charsiu update dev` asks for them.
-RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve"
+# ⚠⚠ charsiu_vision, charsiu_clip AND charsiu_whisper ARE RUNTIME, NOT PROBES.
+# `charsiu pull` offers whisper-tiny.en and clip-b32 and both are useless
+# without their binary -- and the paragraph above is the record of what leaving
+# a name off this list costs. They are read only, they do not touch the NPU's
+# registers, and none of them has ever wedged the block; the probes above have
+# done all three.
+RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
+	      charsiu_vision charsiu_clip charsiu_whisper"
 PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
 PROBE_SCRIPTS="prefill_control.sh"
 case "$CHANNEL" in
@@ -870,6 +887,18 @@ esac
 for f in $INSTALL_BINS; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
+done
+# ⚠⚠ AND THE ONES A PERSON TYPES GO WHERE A PERSON CAN TYPE THEM. $BIN is
+# /opt/charsiu and is NOT on anybody's PATH -- charsiu_run does not need to be,
+# because the front door execs it by path, but charsiu_whisper and charsiu_clip
+# are commands in their own right and the README tells people to run them by
+# name. Installed only under /opt they are a documented command that does not
+# exist.
+TYPED_BINS="charsiu_check charsiu_vision charsiu_clip charsiu_whisper"
+for f in $TYPED_BINS; do
+	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
+	as_root cp "$SRC/build/$f" "$SBIN/$f"
+	as_root chmod 0755 "$SBIN/$f"
 done
 # ⚠ AND THE PROBES THAT ARE SHELL RATHER THAN C. prefill_control.sh is a probe
 # by everything that matters -- it asks the hardware a question the runtime

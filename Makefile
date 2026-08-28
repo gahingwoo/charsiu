@@ -100,7 +100,20 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_run.aarch64 $(BUILD)/charsiu_run_scalar.aarch64 \
        $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64 \
        $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64 \
-       $(BUILD)/charsiu_serve.aarch64
+       $(BUILD)/charsiu_serve.aarch64 $(BUILD)/charsiu_vision.aarch64 \
+       $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64
+
+# ⚠ THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
+# round reaches for, and a tool that is only in the native build is one that has
+# to be rebuilt on the card before it can be asked anything.
+$(BUILD)/charsiu_vision.aarch64: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_clip.aarch64: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_whisper.aarch64: tools/charsiu_whisper.c src/whisper.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
 # what the memory controller has left, which is the only question that decides
 # whether splitting work across the CPU, the GPU and the NPU can pay

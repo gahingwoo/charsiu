@@ -236,15 +236,28 @@ fetch_and_gate() {
 	out="$MODELS_DIR/$base"
 	part="$out.part"
 
+	# ⚠⚠ EXIT 3 IS "RUNNABLE, BUT NOT A CHAT MODEL", and both ways of not
+	# handling it are bad and opposite. A whisper model is not a gguf at
+	# all, so the gate called a finished 78 MB download unreadable and
+	# DELETED it. A vision tower IS a gguf, so it passed -- and then
+	# claim_config pointed the front door at a file it cannot talk to.
+	# Accept both, claim the config for neither.
+	#
+	# ⚠ THIS PATH HAS TO CLAIM THE CONFIG TOO. Asking for a model you
+	# already have is the most ordinary way to say "run this one", and
+	# returning early left the config pointing at the placeholder.
 	if [ -f "$out" ]; then
 		say "already here: $out"
-		# ⚠ THIS PATH HAS TO CLAIM THE CONFIG TOO. Asking for a model you
-		# already have is the most ordinary way to say "run this one", and
-		# returning early left the config pointing at the placeholder.
-		if "$CK" -q "$out"; then
+		"$CK" -q "$out" >/dev/null 2>&1 || _rc=$?
+		_rc=${_rc:-0}
+		if [ "$_rc" = 0 ]; then
 			claim_config "$out"
 			return 0
 		fi
+		if [ "$_rc" = 3 ]; then
+			return 0
+		fi
+		unset _rc
 		warn "...but it does not pass the gate; re-fetching"
 		rm -f "$out"
 	fi
@@ -300,12 +313,24 @@ about ${want_mb} MB"
 	fi
 
 	say "checking what actually came down"
-	if "$CK" "$part"; then
+	"$CK" "$part" || _grc=$?
+	_grc=${_grc:-0}
+	if [ "$_grc" = 0 ]; then
 		mv "$part" "$out"
 		say "${C_G}kept${C_0} $out"
 		claim_config "$out"
+		unset _grc
 		return 0
 	fi
+	if [ "$_grc" = 3 ]; then
+		mv "$part" "$out"
+		say "${C_G}kept${C_0} $out"
+		say "  ...and the config still points at the chat model: this is"
+		say "  not one, and charsiu_whisper or charsiu_clip runs it."
+		unset _grc
+		return 0
+	fi
+	unset _grc
 	rm -f "$part"
 	die "charsiu cannot run that file, so it was deleted rather than left in $MODELS_DIR"
 }
@@ -353,7 +378,10 @@ pull_row() {
 	_mmb=$(echo "$_row"  | cut -d'|' -f7)
 
 	fetch_and_gate "$HF/$_repo/resolve/main/$_file" "$_file" "$_mb" || return 1
-	[ -n "$_mmp" ] || return 0
+	if [ -z "$_mmp" ]; then
+		say_how "$_file"
+		return 0
+	fi
 	echo
 	echo "  and its vision tower, which is the other half of this model:"
 	fetch_and_gate "$HF/$_repo/resolve/main/$_mmp" "$_mmp" "$_mmb" || return 1
@@ -361,6 +389,22 @@ pull_row() {
 	echo "  Both halves are here. To ask it about a picture:"
 	echo "    charsiu --image photo.jpg \"what is in this picture?\""
 	return 0
+}
+
+# ⚠ A MODEL THAT IS NOT A CHAT MODEL NEEDS A SENTENCE SAYING WHAT RUNS IT.
+# `charsiu` cannot hold a conversation with a whisper model or a CLIP file, so
+# without this the download finishes and the tool goes quiet about the one thing
+# the person now needs to know.
+say_how() {
+	case "$1" in
+	*whisper*|*ggml-*.bin)
+		echo "  To transcribe a clip:"
+		echo "    charsiu_whisper $MODELS_DIR/$1 --transcribe --audio clip.wav" ;;
+	*clip*)
+		echo "  To match a picture against words:"
+		echo "    charsiu_clip $MODELS_DIR/$1 --image photo.jpg \\"
+		echo "        --text \"a cat\" \"a dog\" \"a diagram\"" ;;
+	esac
 }
 
 # ---------------------------------------------------------------------------

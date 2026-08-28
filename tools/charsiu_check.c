@@ -22,13 +22,22 @@
  * comes back as "unsupported" here for the same reason it would fail there.
  *
  * Exit codes, because charsiu-get branches on them:
- *   0  charsiu can run this
+ *   0  charsiu can run this AS A CHAT MODEL
  *   1  it is a readable gguf that charsiu cannot run (wrong arch, or a type)
  *   2  it is not a gguf, or it cannot be opened at all
+ *   3  charsiu can run this, but NOT as a chat model
+ *
+ * ⚠ 3 EXISTS BECAUSE THE ZOO STOPPED BEING ALL CHAT MODELS. A vision tower and
+ * a whisper model are both things charsiu runs and neither is something the
+ * front door can hold a conversation with, and the two failure modes of not
+ * saying so are opposite and both bad: charsiu-get DELETED a whisper download
+ * for failing the gate, and would have pointed the chat config at a CLIP file
+ * for passing it.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include "charsiu_llm.h"
 
 /*
@@ -84,11 +93,37 @@ int main(int argc, char **argv)
 "usage: charsiu_check [-q] MODEL.gguf\n"
 "  Reads the file, not the name, and says whether charsiu can run it.\n"
 "  -q  one line: OK or the first reason it is not\n"
-"  exit 0 runnable, 1 readable but not runnable, 2 not a gguf\n");
+"  exit 0 runnable as a chat model, 1 readable but not runnable,\n"
+"       2 not a gguf, 3 runnable but not as a chat model\n");
 		return 2;
 	}
 
 	if (gguf_open(&g, path)) {
+		/*
+		 * ⚠ A whisper MODEL IS NOT A gguf AND IS NOT A FAILURE. It is
+		 * whisper.cpp's own container, charsiu reads it, and reporting
+		 * it as unreadable made charsiu-get delete a finished 78 MB
+		 * download. Look at the magic before saying no.
+		 */
+		FILE *f = fopen(path, "rb");
+		uint32_t magic = 0;
+
+		if (f) {
+			if (fread(&magic, 4, 1, f) != 1)
+				magic = 0;
+			fclose(f);
+		}
+		if (magic == 0x67676d6cu) {
+			if (quiet)
+				printf("WHISPER %s\n", path);
+			else
+				printf("VERDICT  this is a WHISPER model, in "
+				       "whisper.cpp's own container.\n"
+				       "         charsiu reads it: "
+				       "charsiu_whisper FILE --transcribe "
+				       "--audio clip.wav\n");
+			return 3;
+		}
 		if (quiet)
 			printf("NOT-A-GGUF %s\n", path);
 		else
@@ -170,6 +205,32 @@ int main(int argc, char **argv)
 		seen[k].count++;   /* k is the slot, new or found */
 	}
 
+	/*
+	 * ⚠ BEFORE THE VERDICT, in both modes. A vision tower's architecture is
+	 * "clip", which is not a graph charsiu builds, so the ordinary path
+	 * reported it as unrunnable -- true of a chat, false of the file.
+	 */
+	{
+		uint32_t hasv = 0;
+
+		if (!strcmp(arch, "clip") ||
+		    gguf_get_u32(&g, "clip.has_vision_encoder", &hasv) == 0) {
+			if (quiet)
+				printf("VISION-TOWER %s\n", path);
+			else
+				printf("\nVERDICT  this is a VISION TOWER (an "
+				       "mmproj), not a chat model.\n"
+				       "         It is the second half of a "
+				       "multimodal download and charsiu\n"
+				       "         reads it: pass it with "
+				       "--mmproj beside the language half,\n"
+				       "         or `charsiu_clip` if it "
+				       "carries a text tower too.\n");
+			gguf_close(&g);
+			return 3;
+		}
+	}
+
 	if (quiet) {
 		if (bad_graph)
 			printf("NO arch=%s (charsiu builds llama, qwen2, qwen3,"
@@ -212,31 +273,6 @@ int main(int argc, char **argv)
 		       seen[i].ok ? "charsiu reads this"
 				  : "NOT one charsiu reads");
 	}
-	/*
-	 * ⚠ AN mmproj IS NOT A MODEL AND IT IS NOT A FAILURE EITHER. Before
-	 * this, the vision half of a multimodal download came back as
-	 * "charsiu CANNOT run this file" with the architecture line pointing at
-	 * a list of language graphs -- which is true, unhelpful, and exactly
-	 * the message that sends somebody away from a file that works.
-	 */
-	{
-		uint32_t has = 0;
-
-		if (!strcmp(arch, "clip") ||
-		    gguf_get_u32(&g, "clip.has_vision_encoder", &has) == 0) {
-			printf("\nVERDICT  this is a VISION TOWER (an mmproj), "
-			       "not a model.\n"
-			       "         It is the second half of a multimodal "
-			       "download and charsiu\n"
-			       "         reads it: pass it with --mmproj "
-			       "beside the language half.\n"
-			       "         `charsiu_vision FILE` says whether "
-			       "this build can run it.\n");
-			gguf_close(&g);
-			return 0;
-		}
-	}
-
 	if (bad_graph || bad_types || bad_tok)
 		printf("\nVERDICT  charsiu CANNOT run this file.\n");
 	else
