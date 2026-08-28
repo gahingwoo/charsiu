@@ -4,9 +4,17 @@
 #
 # The first board round for seeing, matching and hearing.
 #
-# ⚠ NONE OF THESE THREE USES THE NPU YET. vision.c, clip.c and whisper.c call
+# ⚠ THE TOWERS REACH THE HARDWARE NOW, and this round is the one that says what
+# that bought. Run it with CHARSIU_NPU=1 in the environment and again without,
+# and the two columns are the answer. The decoder side of whisper and CLIP's
+# text tower are still on the CPU on purpose: both feed one row at a time, which
+# is not the case the batched matmul is for.
+#
+# The round before this one said: vision.c, clip.c and whisper.c call
 # gguf_matvec directly; only llama.c's projections are routed. So this round is
 # not asking whether the hardware is fast at them. It is asking two things:
+#
+#     whisper 34.5 s   vision 153.1 s   clip 4.7 s   -- all CPU, 0.6 G-mac/s
 #
 #   1. do they give the SAME ANSWERS on aarch64 that they give on a host --
 #      the offline tests need numpy and the board may not have it, so the
@@ -108,8 +116,14 @@ echo
 
 echo "======================================================================="
 echo "  whisper $(secs "$T_WSP") s   vision $(secs "$T_VIS") s   clip $(secs "$T_CLP") s"
-echo "  ⚠ all three are CPU only today. These are the numbers that say what"
-echo "    routing them to the NPU would be worth."
+if [ -n "${CHARSIU_NPU:-}" ]; then
+	echo "  CHARSIU_NPU=1 was set: the vision tower and the whisper ENCODER"
+	echo "  went to the hardware. Against the CPU round of 2026-08-28:"
+	echo "    whisper 34.5 s   vision 153.1 s   clip 4.7 s"
+else
+	echo "  ⚠ CHARSIU_NPU was NOT set, so this is the CPU column. Run it"
+	echo "    again with CHARSIU_NPU=1 to get the other one."
+fi
 [ "$FAIL" = 0 ] && echo "  PASS" || echo "  FAILED"
 echo "======================================================================="
 exit $FAIL

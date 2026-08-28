@@ -78,6 +78,17 @@ struct charsiu_whisper {
 	char missing[24][80];
 	unsigned n_missing;
 	char why[192];
+
+	/*
+	 * ⚠ THE ENCODER'S POOL, int8, and the encoder only. Thirty seconds of
+	 * audio is 1500 positions at once against weights that do not change --
+	 * the batched matmul. The DECODER runs one token at a time, so it never
+	 * meets the m > 1 gate and stays where it was; its own weights are a
+	 * tenth of the work and its cross attention keys are already computed
+	 * once per clip rather than per token.
+	 */
+	struct charsiu_npu_pool pool;
+	int npu;
 };
 
 int charsiu_whisper_open(struct charsiu_whisper *w, const char *path);

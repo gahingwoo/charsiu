@@ -42,7 +42,7 @@ static unsigned pool_maxn(void)
 }
 
 int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,
-		      unsigned max_k, unsigned max_n)
+		      unsigned max_k, unsigned max_n, int want_w4)
 {
 	memset(p, 0, sizeof(*p));
 	p->cap = max_tensors;
@@ -54,7 +54,7 @@ int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,
 		return -1;
 	}
 	if (max_k && max_n)
-		p->dev = charsiu_npu_open(max_k, max_n, p->cap);
+		p->dev = charsiu_npu_open_mode(max_k, max_n, p->cap, want_w4);
 	return 0;
 }
 

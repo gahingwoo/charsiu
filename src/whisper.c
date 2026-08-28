@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include "charsiu.h"
 #include "charsiu_llm.h"
 #include "charsiu_whisper.h"
 
@@ -323,6 +324,20 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 	if (misaligned)
 		snprintf(w->why, sizeof(w->why),
 			 "%zu tensors were copied to align them", misaligned);
+
+	/*
+	 * ⚠ int8, AND SIZED FOR THE ENCODER. n_audio_state by 4 * n_audio_state
+	 * covers every 2D weight in it; the decoder's tied output head is 51864
+	 * rows and is m = 1 anyway, so leaving it out of max_n costs nothing
+	 * and keeps the device small.
+	 */
+	if (getenv("CHARSIU_NPU") && !w->n_missing) {
+		unsigned A = (unsigned)w->n_audio_state;
+		unsigned nt = (unsigned)(w->n_audio_layer + w->n_text_layer);
+
+		if (!charsiu_pool_init(&w->pool, nt * 12 + 8, 4 * A, 4 * A, 0))
+			w->npu = w->pool.dev != NULL;
+	}
 	if (w->n_missing) {
 		snprintf(w->why, sizeof(w->why),
 			 "%u of the model's tensors are not in this file under "
@@ -337,6 +352,8 @@ void charsiu_whisper_close(struct charsiu_whisper *w)
 {
 	int32_t i;
 	size_t k;
+
+	charsiu_pool_fini(&w->pool);
 
 	for (i = 0; i < w->n_vocab && w->vocab; i++)
 		free(w->vocab[i]);
@@ -750,12 +767,33 @@ static struct gguf_tensor wflat(const struct gguf_tensor *t, uint64_t in,
 	return g;
 }
 
+static struct charsiu_npu_pool *rows_pool;
+
 static void wrows(const struct gguf_tensor *t, const float *bias,
 		  const float *X, unsigned m, unsigned k, float *Y,
 		  unsigned nout, struct charsiu_act *a)
 {
 	struct gguf_tensor g = wflat(t, k, nout);
 	unsigned r, i;
+
+	/*
+	 * ⚠ m > 1 IS THE WHOLE GATE, and it is what keeps the decoder out
+	 * without a second condition: it feeds one token at a time and the
+	 * encoder feeds 1500 positions.
+	 *
+	 * ⚠ AND ONLY 2D WEIGHTS. The conv kernels are [tap][in][out] and this
+	 * file already gathers them into a temporary, whose address changes
+	 * every call -- the pool keys on the pointer, so a temporary would
+	 * stage a new tensor each time until the slots ran out.
+	 */
+	if (rows_pool && m > 1 && t->n_dims <= 2 &&
+	    !charsiu_pool_rows(rows_pool, t, X, m, Y)) {
+		if (bias)
+			for (r = 0; r < m; r++)
+				for (i = 0; i < nout; i++)
+					Y[(size_t)r * nout + i] += bias[i];
+		return;
+	}
 
 	for (r = 0; r < m; r++) {
 		float *y = Y + (size_t)r * nout;
@@ -899,6 +937,8 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 	scale = 1.0f / sqrtf((float)hd);
 	if (charsiu_act_alloc(&a, (int)(F > W ? F : W)))
 		return -1;
+	/* set for the length of one encode; see the note in vision.c */
+	rows_pool = w->npu ? (struct charsiu_npu_pool *)&w->pool : NULL;
 
 	c1  = malloc((size_t)WHISPER_N_FRAMES * W * sizeof(float));
 	x   = malloc((size_t)T * W * sizeof(float));
@@ -1021,6 +1061,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 			   wrow1(w->e_ln_w, g1), wrow1(w->e_ln_b, b1), W, 1e-5f);
 	rc = 0;
 out:
+	rows_pool = NULL;
 	free(c1); free(x); free(xb); free(q); free(k); free(v);
 	free(ff); free(att); free(g1); free(b1); free(tmp);
 	charsiu_act_free(&a);

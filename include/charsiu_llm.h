@@ -214,6 +214,16 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode);
 
 struct charsiu_npu;
 
+/*
+ * want_w4: -1 asks CHARSIU_NPU_W4V, 0 forces int8, 1 forces int4.
+ *
+ * ⚠ A CALLER THAT BATCHES MUST FORCE int8. w4a16 makes exactly one row whatever
+ * it is asked for, so a device opened in int4 turns a 1024 row tower into 1024
+ * dispatches -- correct, and slower than the CPU it was moved off.
+ */
+struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
+					  unsigned max_tensors, int want_w4);
+
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors);
 void charsiu_npu_close(struct charsiu_npu *g);
@@ -510,7 +520,7 @@ struct charsiu_npu_pool {
 extern double charsiu_pool_stage_ms;
 
 int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,
-		      unsigned max_k, unsigned max_n);
+		      unsigned max_k, unsigned max_n, int want_w4);
 void charsiu_pool_fini(struct charsiu_npu_pool *p);
 
 /* The staged form of `w`, staging it on first sight. NULL if it will not go. */

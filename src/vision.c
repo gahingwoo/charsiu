@@ -17,6 +17,7 @@
 #include <math.h>
 #include <stdarg.h>
 
+#include "charsiu.h"
 #include "charsiu_llm.h"
 #include "charsiu_vision.h"
 
@@ -326,6 +327,28 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 			 "the names this reads", v->n_missing);
 		return -1;
 	}
+
+	/*
+	 * ⚠ int8, AND ONLY IF CHARSIU_NPU ASKED. The tower is eight weights a
+	 * layer plus the projector; the widest contraction is the projector's,
+	 * which on a pixel shuffled one is n_embd * scale^2.
+	 */
+	if (getenv("CHARSIU_NPU")) {
+		unsigned wide = v->n_embd > v->n_ff ? v->n_embd : v->n_ff;
+		unsigned rows = v->n_ff > v->proj_dim ? v->n_ff : v->proj_dim;
+
+		if (v->proj == CHARSIU_PROJ_IDEFICS3 && v->scale)
+			wide = wide > v->n_embd * v->scale * v->scale
+			     ? wide : v->n_embd * v->scale * v->scale;
+		if (rows < v->n_embd)
+			rows = v->n_embd;
+		if (!charsiu_pool_init(&v->pool, v->n_layer * 8 + 4, wide,
+				       rows, 0))
+			v->npu = v->pool.dev != NULL;
+		if (!v->npu && charsiu_diag())
+			fprintf(stderr, "charsiu: the vision tower stays on "
+				"the CPU\n");
+	}
 	if (!v->n_patches) {
 		snprintf(v->why, sizeof(v->why),
 			 "image_size %u and patch_size %u give no patch grid",
@@ -337,6 +360,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 
 void charsiu_vision_close(struct charsiu_vision *v)
 {
+	charsiu_pool_fini(&v->pool);
 	free(v->layer);
 	v->layer = NULL;
 	if (v->opened)
@@ -503,12 +527,30 @@ static const float *row1(const struct gguf_tensor *t, float *buf, unsigned n)
 }
 
 /* Y[m][nout] = X[m][k] * W, with the bias added. */
+static struct charsiu_npu_pool *rows_pool;
+
+/*
+ * ⚠ ONLY THE 2D WEIGHTS GO TO THE HARDWARE, and the one that does not is the
+ * patch embedding: it is a 4D convolution kernel, the pool keys on the tensor
+ * POINTER, and a flattened view is a different address every call. It is 1.8 of
+ * the tower's 90 G-mac, so this is two percent left on the CPU rather than a
+ * gap worth a persistent view.
+ */
 static void rows_mul(const struct gguf_tensor *w, const float *bias,
 		     const float *X, unsigned m, unsigned k, float *Y,
 		     unsigned nout, struct charsiu_act *a)
 {
 	struct gguf_tensor t = flat2d(w);
 	unsigned r, i;
+
+	if (rows_pool && m > 1 && w->n_dims <= 2 &&
+	    !charsiu_pool_rows(rows_pool, w, X, m, Y)) {
+		if (bias)
+			for (r = 0; r < m; r++)
+				for (i = 0; i < nout; i++)
+					Y[(size_t)r * nout + i] += bias[i];
+		return;
+	}
 
 	for (r = 0; r < m; r++) {
 		float *y = Y + (size_t)r * nout;
@@ -628,6 +670,14 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		     ? wide : W * v->scale * v->scale;
 	if (charsiu_act_alloc(&a, (int)(pin > wide ? pin : wide)))
 		return -1;
+	/*
+	 * ⚠ A FILE SCOPE POINTER, SET FOR THE LENGTH OF ONE CALL. rows_mul is
+	 * the one place a weight is multiplied and it is called from eleven
+	 * sites; threading a pool through all of them would be eleven more
+	 * arguments for one bit of information. It is cleared on the way out so
+	 * a second tower cannot inherit the first one's device.
+	 */
+	rows_pool = v->npu ? &v->pool : NULL;
 	patch = malloc((size_t)np * pin * sizeof(float));
 	x     = malloc((size_t)nt * W * sizeof(float));
 	xb    = malloc((size_t)nt * W * sizeof(float));
@@ -822,6 +872,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	}
 	rc = 0;
 out:
+	rows_pool = NULL;
 	free(patch); free(x); free(xb); free(q); free(k); free(val);
 	free(ff); free(att); free(tmp); free(gain); free(bias);
 	charsiu_act_free(&a);
