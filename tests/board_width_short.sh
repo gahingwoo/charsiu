@@ -72,13 +72,19 @@ echo
 
 set -- $(score "")
 BASE=$1
+# ⚠ THE EXPECTED BASELINE MOVED WHEN THE SWEEP SUCCEEDED. It was 92 of 128
+# because 0x40b8 was 3 at every M on this axis. It is 3 * M now, so a correct
+# build writes the full surface with no override at all and this script's own
+# answer became its baseline. CHARSIU_WS_BASE=92 restores the old expectation
+# for a build from before the fix.
+EXPECT=${CHARSIU_WS_BASE:-$WANT}
 echo "baseline (no override):  wrote $1 of $WANT words, $2 values absent"
-if [ "$BASE" != "92" ]; then
+if [ "$BASE" != "$EXPECT" ]; then
 	echo
-	echo "⚠ STOP. The baseline must be 92 of 128 -- that is what the board"
-	echo "  printed on 2026-08-29 and what every row below is measured"
-	echo "  against. It is $BASE. The build or the shape has moved and"
-	echo "  nothing here can be read."
+	echo "⚠ STOP. The baseline must be $EXPECT of $WANT and it is $BASE."
+	echo "  Every row below is measured against it, so nothing here can be"
+	echo "  read. If this is a build from before 0x40b8 was fixed, the old"
+	echo "  expectation is CHARSIU_WS_BASE=92."
 	exit 1
 fi
 echo

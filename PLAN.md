@@ -407,6 +407,46 @@ the sweep refuses to print a table.
 which on this axis are M and 1 rather than 1 and M. The swap is what is under
 suspicion, and the sweep is how it stops being a suspicion.
 
+### 0x40b8 is 3 * M, and `rows` is not M on the width axis
+
+`board_width_short.sh`, 2026-08-29. Seven candidate size registers, one field
+at a time from the baseline, scored by the words the board wrote:
+
+```
+  0x40b8   value    1    2    3    4    6    8   16
+           words   68   80   92  104  128  104   64
+           absent  54   41   31   20    0   21   60
+```
+
+**6 writes the full surface with nothing absent, and 6 is 3 * M at m = 2.**
+0x1090, 0x1098, 0x4028 and RDMA 0x5010 changed nothing at any value in range,
+which is worth printing: four fields excluded with data. 0x1094 and 0x401c move
+the number but never past 100 of 128.
+
+⚠ **AND THE BASELINE WAS 3.** npu_gemm_test takes the acc_out arm, which
+computes `3 * rows`, and `rows` is 1 on the width axis at every M. The
+baseline's 92 and the sweep's `0x40b8 = 3` row are the same number twice, which
+is what says the two are the same setting rather than a coincidence.
+
+⚠⚠ **THIS IS NOT A ONE WIDTH FIT, AND THE RECORD ALREADY SAID SO.** Round 385
+swept this register on the HEIGHT axis at three widths and found 3, 6, 12 at
+m = 1, 2, 4 -- `3 * M` -- and recorded that each peak was worth about ONE ROW,
+64 values whatever m was, so it was filed as "not the whole fix". It is the same
+expression. What the axis decides is whether it completes one row of the surface
+or all of it.
+
+The fix is `3u * (wide ? ow : rows)`, which is M under either arrangement.
+Checked rather than argued: the emitter before and after, across both acc_out
+arms, 2 weight formats, 2 K, 2 N and 6 M -- **96 of 96 bit identical on the
+height axis** -- and on the width axis 0x40b8 goes 3, 6, 12, 24, 96 at
+m = 1, 2, 4, 8, 32 where it was 3 at all of them.
+
+⚠ **A FULL SURFACE IS NECESSARY AND NOT SUFFICIENT.** Every value being
+somewhere is not the same as this tree knowing where. `board_acc_map.sh` runs
+again next -- now at m = 2, 4 **and 8**, a width 3 * M has never been asked at
+-- and if the width arm comes back full then the map under it is the read
+order, which is the last thing between here and a batched int4 prefill.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not

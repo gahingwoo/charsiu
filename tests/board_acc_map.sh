@@ -25,6 +25,17 @@
 # If it does not, the shape or the build moved and the width map cannot be
 # read against anything.
 #
+# ⚠ THE WIDTH ARM WROTE A SHORT SURFACE THE FIRST TIME THIS RAN, 92 of 128
+# words, and that was 0x40b8: it is 3 * the batch count, and `rows` -- which is
+# what the code multiplied -- is 1 on the width axis. Swept on the board, 6 at
+# m = 2 writes all 128 with nothing absent. The default now computes it from
+# whichever of ow and rows carries M, so this run should come back FULL, and
+# the map underneath it is the thing that was never legible before.
+#
+# ⚠ AND IT RUNS m = 8 TOO. 3 * M is confirmed at m = 1, 2 and 4 on the height
+# axis and at m = 2 on the width. m = 8 is a width it has not been seen at,
+# which is the whole point of asking.
+#
 # ⚠ K = 64 N = 64 ON PURPOSE. locate() reports the FIRST index holding a value,
 # so a reference with few distinct values answers a question it was not asked.
 # At this shape it has 112 distinct in 128, and it prints that count itself.
@@ -49,6 +60,7 @@ OUTDIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUTDIR"
 K=${CHARSIU_MAP_K:-64}
 N=${CHARSIU_MAP_N:-64}
+MS=${CHARSIU_MAP_MS:-"2 4 8"}
 
 echo "binary   $GEMM"
 echo "shape    K=$K N=$N   (112 distinct values in 128 -- the map is readable)"
@@ -59,7 +71,7 @@ for AXIS in h w; do
 	h) label="height -- SOLVED, this arm must come back EXACT" ;;
 	w) label="width  -- the map to be read" ;;
 	esac
-	for M in 2 4; do
+	for M in $MS; do
 		echo "===== axis $AXIS, m=$M -- $label ====="
 		out="$OUTDIR/accmap-$AXIS-m$M.txt"
 		env CHARSIU_M_AXIS="$AXIS" "$GEMM" "$K" "$N" --read "$M" \
@@ -86,11 +98,17 @@ for AXIS in h w; do
 done
 
 echo "======================================================================"
-echo "the height arm is solved and must read EXACT. Only then does the width"
-echo "map mean anything -- and it is the whole of what is left: the width axis"
-echo "already computes both rows and returns them somewhere else."
+echo "the height arm is solved and must read EXACT. What to look for on the"
+echo "width arm, in order:"
+echo "  1. does it write the FULL surface now -- m*n words, 0 absent -- at"
+echo "     m = 2, 4 AND 8? 3*M is confirmed at 1, 2, 4 on the height axis and"
+echo "     at 2 on the width; m = 8 is the width it has not been asked at."
+echo "  2. if it does, the map underneath IS the read order, and that is the"
+echo "     last thing between here and a batched int4 prefill."
+echo "a full surface is necessary and not sufficient: every value being"
+echo "somewhere is not the same as this tree knowing where."
 echo
-echo "  full logs: $OUTDIR/accmap-{h,w}-m{2,4}.txt"
-echo "  send all four; the height map at m=2 and m=4 is what the current"
-echo "  expression was fitted on, so the pair is the check on the pair."
+echo "  full logs: $OUTDIR/accmap-{h,w}-m{2,4,8}.txt"
+echo "  send all six; the height maps at m=2 and m=4 are what the current"
+echo "  expression was fitted on, so they are the check on the check."
 echo "======================================================================"

@@ -1388,11 +1388,37 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 *
 	 * CHARSIU_DPU_40B8 replaces the value so the next sweep can hold it.
 	 */
+	/*
+	 * ⚠⚠ AND `rows` IS NOT THE BATCH COUNT ON THE WIDTH AXIS, WHERE IT IS
+	 * 1. 3 * rows is 3 there at every M, and 3 is exactly what the board
+	 * wrote when it produced 92 of 128 words at m = 2: the baseline of the
+	 * sweep and the `0x40b8 = 3` row of it are the same number twice.
+	 *
+	 * Swept on the board on the WIDTH axis at m = 2, K = 64 N = 64:
+	 *
+	 *   value    1    2    3    4    6    8   16
+	 *   words   68   80   92  104  128  104   64
+	 *   absent  54   41   31   20    0   21   60
+	 *
+	 * 6 is 3 * M and it writes the FULL SURFACE with nothing absent. It is
+	 * not a trend either -- 8 is worse than 4 -- so the fill point is a
+	 * point and not a floor.
+	 *
+	 * ⚠ THE SAME VALUE BUYS SOMETHING DIFFERENT ON EACH AXIS. The height
+	 * sweep above found 3, 6, 12 at m = 1, 2, 4 and each peak was worth
+	 * about ONE ROW, 64 values whatever m was. On the width axis 6 at m = 2
+	 * is all 128. Same expression, and the axis is what decides whether it
+	 * completes the surface or one row of it.
+	 *
+	 * `wide ? ow : rows` is M under both arrangements and is bit identical
+	 * on the height axis, where ow is 1 and rows is M.
+	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
 	{
 		const char *e8b = getenv("CHARSIU_DPU_40B8");
+		unsigned batch = wide ? ow : rows;
 		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
-			   ? 3u * rows : (uint32_t)(ow * (2 * rows - rows));
+			   ? 3u * batch : (uint32_t)(ow * (2 * rows - rows));
 
 		if (e8b)
 			v = (uint32_t)strtoul(e8b, NULL, 0);
