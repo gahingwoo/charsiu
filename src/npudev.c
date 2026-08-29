@@ -210,6 +210,7 @@ struct charsiu_npu {
 	 */
 	uint32_t *bmap;
 	unsigned bmap_m;
+	unsigned bmap_n4;	/* the table is one entry per FOUR channels */
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
@@ -2054,9 +2055,29 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			/* ⚠ THE KEY IS m ALONE and that is still right: the
 			 * format and the axis are fixed for the life of a
 			 * pool, so only the width can change under it. */
+			/*
+			 * ⚠⚠ ONE ENTRY PER FOUR CHANNELS, because the read
+			 * order is FOUR CONSECUTIVE SLOTS and always has been.
+			 *
+			 * charsiu_acc_index(r, j+q) == charsiu_acc_index(r, j)
+			 * + q for q of 1, 2 and 3 at every j that is a
+			 * multiple of four: checked at 1503680 groups over
+			 * both formats, m of 2 to 80 and n of 64 to 8192, with
+			 * none broken. The `t % 4` term is the only one that
+			 * moves inside a group of four and it moves by one.
+			 *
+			 * The table was a uint32 per output channel, so the
+			 * gather below read FOUR BYTES OF INDEX FOR EVERY FOUR
+			 * BYTES OF DATA -- half its memory traffic was the
+			 * table. At m = 32 that gather is 368 ms of a 702 ms
+			 * batched matmul and at m = 80 it is 933 of 1746: the
+			 * dominant cost of a batched projection now that the
+			 * hardware part is right.
+			 */
 			if (g->bmap_m != m) {
+				unsigned n4 = (g->nmax + 3) / 4;
 				uint32_t *t2 = realloc(g->bmap,
-					(size_t)m * g->nmax * sizeof(*t2));
+					(size_t)m * n4 * sizeof(*t2));
 
 				if (!t2) {
 					whine(g, "the read order table would not allocate",
@@ -2064,10 +2085,11 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					return -1;
 				}
 				g->bmap = t2;
+				g->bmap_n4 = n4;
 				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < g->nmax; j++)
-						g->bmap[(size_t)r * g->nmax + j] =
-						  (uint32_t)charsiu_acc_index(r, j, m,
+					for (unsigned j = 0; j < n4; j++)
+						g->bmap[(size_t)r * n4 + j] =
+						  (uint32_t)charsiu_acc_index(r, j * 4, m,
 							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
 			}
@@ -2115,23 +2137,59 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				 */
 				for (unsigned r = 0; r < m; r++) {
 					const uint32_t *mp = g->bmap
-							  + (size_t)r * g->nmax;
+							  + (size_t)r * g->bmap_n4;
 					float *yr = Y + (size_t)r * e->t->n
 						  + s->n0;
+					unsigned n4 = sn / 4, j;
 
+					/*
+					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
+					 * tail is whatever a slice's width
+					 * leaves over, and it recomputes its
+					 * own base rather than reading a table
+					 * entry that may not exist.
+					 */
 					if (g->w4 && grp) {
 						const float *sc = s->sc;
 
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += fo[mp[j]] * sc[j];
+						for (j = 0; j < n4; j++) {
+							const float *fp = fo + mp[j];
+							float *yp = yr + j * 4;
+							const float *cp = sc + j * 4;
+
+							yp[0] += fp[0] * cp[0];
+							yp[1] += fp[1] * cp[1];
+							yp[2] += fp[2] * cp[2];
+							yp[3] += fp[3] * cp[3];
+						}
+						for (j = n4 * 4; j < sn; j++)
+							yr[j] += fo[mp[j / 4] + j % 4] * sc[j];
 					} else if (g->w4) {
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += fo[mp[j]];
+						for (j = 0; j < n4; j++) {
+							const float *fp = fo + mp[j];
+							float *yp = yr + j * 4;
+
+							yp[0] += fp[0];
+							yp[1] += fp[1];
+							yp[2] += fp[2];
+							yp[3] += fp[3];
+						}
+						for (j = n4 * 4; j < sn; j++)
+							yr[j] += fo[mp[j / 4] + j % 4];
 					} else {
 						float d1 = g->bd1[(size_t)ki * m + r];
 
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += (float)io[mp[j]] * d1;
+						for (j = 0; j < n4; j++) {
+							const int32_t *ip = io + mp[j];
+							float *yp = yr + j * 4;
+
+							yp[0] += (float)ip[0] * d1;
+							yp[1] += (float)ip[1] * d1;
+							yp[2] += (float)ip[2] * d1;
+							yp[3] += (float)ip[3] * d1;
+						}
+						for (j = n4 * 4; j < sn; j++)
+							yr[j] += (float)io[mp[j / 4] + j % 4] * d1;
 					}
 				}
 				nt++;

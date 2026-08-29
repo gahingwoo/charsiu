@@ -663,6 +663,54 @@ m row count is what would catch it.
 against the height control and the default width. 2048 of 2048 on both rows is
 the read order solved.
 
+### Gemma4's whole list, in one line, because the refusal enumerates now
+
+```
+  not batched: per layer embeddings, fused or absent K and V projections,
+               KV shared between layers, a feed forward width that varies by layer
+```
+
+Four, not one. The value norm that used to be reported first is lifted and was
+never the whole story; returning the first reason would have cost a board round
+for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
+it is the worst number left on the table and it is four separate pieces of work.
+
+## THE GATHER IS NOW THE COST, AND IT IS FOUR AT A TIME
+
+The probe's own breakdown of a batched matmul, which the hardware work has
+turned inside out:
+
+```
+   m     batched     read      read as a share
+   2       79 ms      11             14%
+  16      308        132             43%
+  32      702        368             52%
+  64     1478        846             57%
+  80     1746        933             53%
+```
+
+`read` is `yr[j] += fo[mp[j]] * sc[j]`, the gather through the read order
+table, on the CPU. **More than half of a batched projection at every width a
+prompt uses.** The hardware part is right now and this is what is left.
+
+**And the read order is four consecutive slots.** `charsiu_acc_index(r, j+q)`
+is `charsiu_acc_index(r, j) + q` for q of 1, 2 and 3 at every j that is a
+multiple of four -- the `t % 4` term is the only one that moves inside a group
+of four and it moves by one. Checked at **1503680 groups** over both formats,
+m of 2 to 80 and n of 64 to 8192, none broken.
+
+So the table was carrying a uint32 for every output channel: **four bytes of
+index for every four bytes of data, half the gather's memory traffic being the
+table itself.** It holds one entry per four channels now and the inner loop
+moves four floats off one index.
+
+Checked rather than asserted: the old loop against the new one on the same
+buffers, **84 cases, 0 mismatched**, including slice widths of 61, 255 and 8191
+that exercise the tail.
+
+⚠ This has not been on the board. What it should move is the `read` column
+above, and through it the TTFT column.
+
 ## 🏁🏁🏁 THE PROMPT IS 3.04x AND THE TEXT IS THE SAME. 2026-08-29
 
 `prefill_control.sh`, Llama-3.2-1B int4, run twice against the token loop:
