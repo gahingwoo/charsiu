@@ -675,6 +675,45 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+### The gather on the board: 28% off, and the vendor table cannot see it
+
+Correctness first, because a faster gather that is wrong is the failure this
+tree has already shipped once. Every width still exact: 226, 452, 1808, 3616,
+5424, 7232 and 9040 rows agreeing, worst relative 5.10e-05 at all of them. And
+m = 8 is now visibly refused rather than silently wrong -- `NOT on the NPU --
+int4 at m=8 misses row 0 of the n=8192 tensors` -- and drops out of the table.
+
+The probe's `read` column, which compares inside one run:
+
+```
+   m     before    after    change
+   2        11        7      -36%
+  16       132      104      -21%
+  32       368      269      -27%
+  48       521      370      -29%
+  64       846      620      -27%
+  80       933      645      -31%
+```
+
+About 28% off the gather, and the batched matmul at m = 80 went 1746 to 1440.
+`read` is still 45% of it.
+
+⚠⚠ **AND THE VENDOR TABLE READ WORSE, WHICH IS NOISE AND NOT A REGRESSION.**
+Qwen3's TTFT came back 2055, 1867 and 2191 on three consecutive rounds of
+builds that differ by this change and the one before it -- a spread of 9% on a
+governor left at `ondemand`, with each model run once. A change worth less than
+that cannot be seen in that column at all.
+
+That is a fault in the instrument, not in the reading, and it is the headline
+column. `CHARSIU_BENCH_REPEAT=3` runs each model three times and prints the
+best with its spread beside it, so a number and its noise arrive together. The
+default stays 1 because three times four models is a long round.
+
+⚠ The script also still grepped for `int4 computes one row` to show the path,
+and that string has not existed since the refusal was rewritten -- it matched
+nothing and said nothing for a round. It looks for the m = 8 fallback and the
+`batch_why_not` list now.
+
 ## THE GATHER IS NOW THE COST, AND IT IS FOUR AT A TIME
 
 The probe's own breakdown of a batched matmul, which the hardware work has

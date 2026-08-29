@@ -23,6 +23,7 @@
 #   sh tests/board_vendor.sh
 set -eu
 
+REPEAT=${CHARSIU_BENCH_REPEAT:-1}
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$DIR"
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
@@ -94,29 +95,65 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# after it with it -- three rounds of this table printed exactly one row
 	# and nobody, me included, asked where the other four went. A row that
 	# fails is a row, and it says so.
-	OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-	      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
-	      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-	      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \
-	      2>"$DIR/.v.err" | grep '^\[load') || OUT=""
-	if [ -z "$OUT" ]; then
+	# ⚠⚠ ONE RUN IS A READING AND THIS COLUMN IS THE HEADLINE. Qwen3's TTFT
+	# came back 2055, 1867 and 2191 on three consecutive rounds of the same
+	# build -- a spread of 9% -- because the governor is ondemand and each
+	# model runs once. A change worth less than that cannot be seen here at
+	# all, and the round that added the four-at-a-time gather read WORSE on
+	# this table while the probe's own read column, which compares inside
+	# one run, said 28% better.
+	#
+	# CHARSIU_BENCH_REPEAT=3 runs each model three times and prints the
+	# best with the spread beside it, so a number and its noise arrive
+	# together. The default is still 1, because three times four models is
+	# a long round.
+	BEST_TT=; BEST_TS=; BEST_MB=; BEST_NP=; WORST_TT=; nrun=0
+	while [ $nrun -lt "$REPEAT" ]; do
+		nrun=$((nrun + 1))
+		OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+		      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \
+		      2>"$DIR/.v.err" | grep '^\[load') || OUT=""
+		[ -n "$OUT" ] || continue
+		NP=$(echo "$OUT" | sed 's/.*| *prompt \([0-9]*\) tok.*/\1/')
+		TT=$(echo "$OUT" | sed 's/.*prompt [0-9]* tok in \([0-9]*\) ms.*/\1/')
+		TS=$(echo "$OUT" | sed 's/.*| *gen [0-9]* tok in [0-9]* ms, \([0-9.]*\) tok.*/\1/')
+		MB=$(echo "$OUT" | sed 's/.*peak \([0-9]*\) MB.*/\1/')
+		if [ -z "$BEST_TT" ] || [ "$TT" -lt "$BEST_TT" ] 2>/dev/null; then
+			BEST_TT=$TT; BEST_TS=$TS; BEST_MB=$MB; BEST_NP=$NP
+		fi
+		if [ -z "$WORST_TT" ] || [ "$TT" -gt "$WORST_TT" ] 2>/dev/null; then
+			WORST_TT=$TT
+		fi
+	done
+	# ⚠⚠ A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
+	# plus OUT=$(cmd) means one model that will not load takes every model
+	# after it with it -- three rounds of this table printed exactly one row
+	# and nobody, me included, asked where the other four went. A row that
+	# fails is a row, and it says so.
+	if [ -z "$BEST_TT" ]; then
 		printf '%-16s %10s %10s   %10s %10s   %8s %8s   THE RUN FAILED\n' \
 			"$label" "-" "$vt" "-" "$vttft" "-" "$vmb"
 		tail -3 "$DIR/.v.err" | sed 's/^/     /'
 		continue
 	fi
-	NP=$(echo "$OUT" | sed 's/.*| *prompt \([0-9]*\) tok.*/\1/')
-	TT=$(echo "$OUT" | sed 's/.*prompt [0-9]* tok in \([0-9]*\) ms.*/\1/')
-	TS=$(echo "$OUT" | sed 's/.*| *gen [0-9]* tok in [0-9]* ms, \([0-9.]*\) tok.*/\1/')
-	MB=$(echo "$OUT" | sed 's/.*peak \([0-9]*\) MB.*/\1/')
-	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)\n' \
-		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP"
+	TS=$BEST_TS; TT=$BEST_TT; MB=$BEST_MB; NP=$BEST_NP
+	spread=""
+	[ "$REPEAT" -gt 1 ] && spread=" ttft $BEST_TT..$WORST_TT over $REPEAT runs"
+	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)%s\n' \
+		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP" "$spread"
+	# ⚠ THE REFUSAL STRING MOVED ON 2026-08-29 and this grep did not: it
+	# looked for "int4 computes one row", which no longer exists anywhere,
+	# so it matched nothing and said nothing for a round. It looks for the
+	# m = 8 fallback and the batch_why_not list now.
+	#
 	# ⚠ AND THE DEVICE'S OWN REPORT. "how many submits" is the difference
 	# between a prefill that runs on the hardware one row at a time -- a
 	# fence each, and the fence has been measured at 94% of the hardware
 	# path -- and one that fell back to the CPU. Nothing else in this table
 	# can tell those two apart.
-	grep -E "prompt batched|prompt a token|int4 computes one row" \
+	grep -E "prompt batched|prompt a token|int4 at m=|not batched" \
 		"$DIR/.v.err" | sed 's/^/     /' | sort -u || true
 	grep -E "^charsiu NPU: .*(submits|hardware path)" "$DIR/.v.err" \
 		| sed 's/^/     /' || true
