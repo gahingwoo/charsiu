@@ -3518,6 +3518,28 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
 		}
+		/*
+		 * ⚠ THE LAST ROW, BECAUSE THAT IS THE ONE THE TOKEN LOOP CAN BE
+		 * HELD AGAINST. CHARSIU_DBG_LAYERS makes llama_forward print
+		 * this line for every layer of every token; run a prompt of
+		 * exactly one chunk and its final n_layer lines are the same
+		 * token as these, so a batched path that has gone wrong says
+		 * WHICH LAYER it went wrong at instead of only that the text
+		 * changed. Both loops fall back to the same matvec on a machine
+		 * with no NPU, so the two columns are expected to agree to
+		 * every printed digit and not approximately.
+		 */
+		if (dbg_layers()) {
+			const float *xr = s->bx + (size_t)(n - 1) * m->n_embd;
+			double n2 = 0.0;
+			uint32_t i;
+
+			for (i = 0; i < m->n_embd; i++)
+				n2 += (double)xr[i] * xr[i];
+			fprintf(stderr, "  layer %2u  swa=%d hd=%3u ff=%5u "
+				"kv=%2d  |x| = %.4f\n", l, L->swa, hd, nff,
+				L->kv_from, sqrt(n2 / m->n_embd));
+		}
 	}
 
 	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
