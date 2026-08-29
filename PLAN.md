@@ -663,6 +663,67 @@ m row count is what would catch it.
 against the height control and the default width. 2048 of 2048 on both rows is
 the read order solved.
 
+## 🏁 w4a16 BATCHES. m = 2 is exact, and it was the read order all along
+
+```
+  M axis: w, CHARSIU_ACC_A=roleswap
+    row0 in place: 2048 of 2048 channels agree, the whole row
+    row1 in place: 2048 of 2048 channels agree, the whole row
+    4096 of 4096 wanted values are somewhere in the batch
+
+     m  worst rel   rows that agree   one row   batched  speedup
+     2   5.10e-05     226 of 226       118 ms    77 ms    1.53x
+```
+
+**Five rounds established that w4a16 computes exactly one row. It computes as
+many as it is asked for; this tree was reading the answer out of the wrong
+slots.** Worst relative error 5.10e-05 on a float sum of two thousand terms in
+two orders, every tensor, both rows.
+
+The whole chain, in order: M on the width axis rather than the height, 0x40b8
+counting M so the surface is not short, and then `a` and the row trading places
+in the read order. None of the three shows at m = 1, which is why decode never
+saw any of it.
+
+### Above m = 2 it is 226 rows exactly, which names the last ambiguity
+
+```
+   m     rows that agree
+   2     226 of 226      <- solved
+   4     226 of 452
+   8     194 of 904
+  16     226 of 1808
+  32     226 of 3616
+```
+
+226 is 113 tensors times TWO ROWS, at every width. That is the ambiguity this
+was shipped with and it landed exactly where it was flagged: once `a` takes the
+32P block the row has two slots left, one of stride 8 with P values and one of
+stride 4 with 2, and **at m = 2, P is 1 and the stride 8 slot is a singleton, so
+the two readings are the same function.**
+
+`roleswap2` is the other reading -- `mi/2` at the 8 and `mi%2` at the 4, where
+`roleswap` has `mi%P` and `mi/P`. If it is the truth then roleswap is right
+exactly where they coincide, which is rows 0 and m-1 and nothing else:
+
+```
+   m      shared rows   predicts       board
+   2      0, 1          226 of 226     226 of 226
+   4      0, 3          226 of 452     226 of 452
+  16      0, 15         226 of 1808    226 of 1808
+  32      0, 31         226 of 3616    226 of 3616
+   8      0, 7          226 of 904     194 of 904   <- the one miss
+```
+
+Four of five, and it is identical to roleswap at m = 2, so it cannot lose what
+is already won. It is a permutation at m = 2, 4, 8, 16, 32 and 80.
+
+⚠ **m = 8 IS A SEPARATE FAULT AND THIS DOES NOT EXPLAIN IT.** Its worst
+relative error is four to six orders out in EVERY arm of every round -- 1.3e4,
+3.2e4, 2.9e5, 9.7e3, 7.5e4, 1.7e5, 4.7e4 -- where m = 4 and m = 16 sit at 1e3.
+Something is wrong at that one width, it has been wrong at it all along, and
+194 of 904 is not what either reading predicts.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not

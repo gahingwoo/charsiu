@@ -83,14 +83,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 # that places that half. Of the whole family only a*4 and the two halves
 # SWAPPED are permutations at all, so this is a two horse race and one of them
 # is the control.
-for AXIS in h w wrole; do
+for AXIS in h wrole wrole2; do
 	case $AXIS in
-	h) label="height -- the axis five rounds proved writes ONE row"
+	h) label="height -- the control, and it must still disagree"
 	   AX=h; ACC= ;;
-	w) label="width  -- the default order, right on two quadrants of four"
-	   AX=w; ACC= ;;
-	wrole) label="width, a and the row TRADE PLACES -- CHARSIU_ACC_A=roleswap"
+	wrole) label="width, roleswap -- EXACT at m=2, two rows a tensor above it"
 	   AX=w; ACC=roleswap ;;
+	wrole2) label="width, roleswap2 -- the row's other split"
+	   AX=w; ACC=roleswap2 ;;
 	esac
 	echo "===== M axis: $AXIS -- $label ====="
 	out="$OUTDIR/w4-axis-$AXIS.txt"
@@ -149,17 +149,21 @@ echo "  the line that decides it is 'rowN in place: X of 2048 channels agree'."
 echo "  1024 of 2048 is ONE QUADRANT of (row, half) and nothing else. 2048 of"
 echo "  2048 on BOTH rows is the read order solved."
 echo
-echo "  roleswap is not a guess. The default is right on (row0, a=0) and on"
-echo "  (row1, a=1) and wrong on the other two, which is what 1024 and 1025"
-echo "  are; and the swapped arm, wrong everywhere, printed row 0's a=1"
-echo "  channels at row 1's slot and row 1's a=0 at row 0's. Trading a with"
-echo "  the row reproduces ALL 36 of those printed landings, agrees with the"
-echo "  default on exactly the two quadrants the board calls correct, and is"
-echo "  a permutation at m = 2, 4, 8, 32 and 80."
+echo "  roleswap already did that at m = 2: 2048 of 2048 on BOTH rows and"
+echo "  226 of 226 tensors, worst relative 5.1e-05. That is the first correct"
+echo "  batched w4a16 on this board, after five rounds calling it one row."
 echo
-echo "  ⚠ all 36 are at m = 2, where P = 1 and (mi % P) * 8 is inert, so which"
-echo "  half of the row takes the 4 is a choice at wider m and not a reading."
-echo "  The m column of the timing table is what would catch it."
+echo "  Above m = 2 it holds exactly 226 rows -- 113 tensors times TWO -- at"
+echo "  m = 4, 16 and 32 alike. Once a takes the 32P block the row has two"
+echo "  slots left, one of stride 8 with P values and one of stride 4 with 2,"
+echo "  and at m = 2 the first is a singleton so the two readings are the SAME"
+echo "  FUNCTION. roleswap2 is the other reading, and it predicts exactly that"
+echo "  226: the rows the two share are 0 and m-1 and nothing else."
 echo
-echo "  full logs: $OUTDIR/w4-axis-{h,w,wrole}.txt"
+echo "  ⚠ m = 8 IS A SEPARATE FAULT. Its worst relative error is four to six"
+echo "  orders out in every arm of every round, where its neighbours sit at"
+echo "  1e3, and its 194 of 904 is not what either reading predicts. Nothing"
+echo "  here explains it."
+echo
+echo "  full logs: $OUTDIR/w4-axis-{h,wrole,wrole2}.txt"
 echo "======================================================================"

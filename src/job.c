@@ -344,6 +344,8 @@ static unsigned acc_a_coeff(int *swap)
 			sw = 1;
 		else if (e && !strcmp(e, "roleswap"))
 			sw = 2;
+		else if (e && !strcmp(e, "roleswap2"))
+			sw = 3;
 		else if (e)
 			A = (unsigned)strtoul(e, NULL, 0);
 	}
@@ -386,9 +388,38 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
 	 * is therefore a choice at wider m, not a reading. The probe sweeps m
 	 * to 32 and its per m row count is what would catch it.
 	 */
-	if (swap == 2) {
-		j = (t / 4u) * (8u * P) + (mi % P) * 8u
-		  + (mi / P) * 4u + (t % 4u);
+	/*
+	 * ⚠⚠ AND WHICH PART OF THE ROW TAKES WHICH SLOT, which m = 2 cannot
+	 * see and the board has now said.
+	 *
+	 * Once a takes the 32P block the row has two slots left: one of stride
+	 * 8 with P values and one of stride 4 with 2. At m = 2, P is 1, the
+	 * stride 8 slot is a singleton and the two readings below are the SAME
+	 * FUNCTION -- which is why roleswap scored 2048 of 2048 on both rows
+	 * there and 226 rows of 452 at m = 4.
+	 *
+	 * 226 is 113 tensors times TWO ROWS. If roleswap2 is the truth then
+	 * roleswap is right exactly where they coincide, which is rows 0 and
+	 * m-1 and nothing else:
+	 *
+	 *   m      rows they share    predicts    board
+	 *   2      0, 1               226 of 226  226 of 226
+	 *   4      0, 3               226 of 452  226 of 452
+	 *   16     0, 15              226 of 1808 226 of 1808
+	 *   32     0, 31              226 of 3616 226 of 3616
+	 *   8      0, 7               226 of 904  194 of 904   <-- the one miss
+	 *
+	 * ⚠ m = 8 IS NOT THIS AND HAS NEVER BEEN. Its worst relative error is
+	 * four to six orders out in EVERY arm of every round -- 1.3e4, 3.2e4,
+	 * 2.9e5, 9.7e3, 7.5e4, 1.7e5, 4.7e4 -- where its neighbours sit at 1e3.
+	 * Something else is wrong at that one width and this does not explain
+	 * it or claim to.
+	 */
+	if (swap == 2 || swap == 3) {
+		unsigned hi = swap == 3 ? mi / 2u : mi % P;
+		unsigned lo = swap == 3 ? mi % 2u : mi / P;
+
+		j = (t / 4u) * (8u * P) + hi * 8u + lo * 4u + (t % 4u);
 		return (size_t)G * m * 32u + (size_t)a * (32u * P) + j;
 	}
 	if (swap)
