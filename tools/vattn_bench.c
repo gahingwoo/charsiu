@@ -18,10 +18,16 @@
  * appears at n = 8192 and not at n = 1024 is a BOARD win and a host non result,
  * and saying so is the whole point of running both.
  *
+ * ⚠⚠ AND THE TWO VARIANTS ARE TIMED IN ONE PROCESS, INTERLEAVED. Two builds
+ * run one after the other disagreed by 1.8x on this host with the SAME binary
+ * on both sides, because six cores are shared with an editor and other agents.
+ * -c runs both schedules rep by rep so they meet the same interference.
+ *
  * The numbers are random and the answer is thrown away; tests/vision_cross.py
  * is the correctness oracle and this is not one.
  *
  *   vattn_bench [-n TOKENS] [-W WIDTH] [-H HEADS] [-l LAYERS] [-r REPS]
+ *               [-c]     time EVERY schedule, interleaved, and diff them
  */
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -56,13 +62,24 @@ static void fill(float *p, size_t n, uint32_t seed)
 	}
 }
 
+static double checksum(const float *o, size_t n)
+{
+	double s = 0.0;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		s += o[i];
+	return s;
+}
+
 int main(int argc, char **argv)
 {
-	unsigned n = 1024, W = 768, H = 12, L = 12, reps = 3;
+	unsigned n = 1024, W = 768, H = 12, L = 12, reps = 3, cmp = 0;
+	double best[CHARSIU_VATTN_SCHEDS] = { 0.0 };
+	double chk[CHARSIU_VATTN_SCHEDS] = { 0.0 };
 	size_t sz;
 	float *q, *k, *v, *o;
-	double best = 0.0, chk = 0.0;
-	unsigned i, r;
+	unsigned i, r, s, lo, hi, bad = 0;
 
 	for (i = 1; i < (unsigned)argc; i++) {
 		if (!strcmp(argv[i], "-n") && i + 1 < (unsigned)argc)
@@ -75,6 +92,8 @@ int main(int argc, char **argv)
 			L = (unsigned)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-r") && i + 1 < (unsigned)argc)
 			reps = (unsigned)atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-c"))
+			cmp = 1;
 	}
 	if (!H || W % H) {
 		fprintf(stderr, "vattn_bench: %u heads do not divide %u\n",
@@ -93,29 +112,50 @@ int main(int argc, char **argv)
 	fill(k, (size_t)n * W, 2u);
 	fill(v, (size_t)n * W, 3u);
 
-	for (r = 0; r < reps; r++) {
-		double t0 = now_ms(), dt;
-		unsigned l;
-
-		for (l = 0; l < L; l++)
-			charsiu_vision_attention(q, k, v, o, n, W, H,
-						 1.0f / sqrtf((float)(W / H)));
-		dt = now_ms() - t0;
-		if (!r || dt < best)
-			best = dt;
-	}
-	/*
-	 * ⚠ AND IT HAS TO BE READ. Without a checksum the compiler is entitled
-	 * to notice the results are dead; -O2 has deleted a benchmark before.
-	 */
-	for (i = 0; i < n * W; i++)
-		chk += o[i];
-
 	printf("n %u W %u heads %u layers %u threads %d\n", n, W, H, L,
 	       charsiu_threads());
-	printf("attention %.0f ms best of %u   (%.2f ms a layer)\n",
-	       best, reps, best / L);
-	printf("checksum %.6f\n", chk);
+	lo = cmp ? 0 : (unsigned)charsiu_vision_attn_sched_get();
+	hi = cmp ? CHARSIU_VATTN_SCHEDS : lo + 1;
+	/*
+	 * ⚠ REP OUTSIDE, SCHEDULE INSIDE. The other way round is two benchmarks
+	 * run at two different times, which on a host whose six cores are shared
+	 * with an editor disagreed by 1.8x with the same code on both sides.
+	 */
+	for (r = 0; r < reps; r++)
+		for (s = lo; s < hi; s++) {
+			double t0, dt;
+			unsigned l;
+
+			charsiu_vision_attn_sched_set((int)s);
+			t0 = now_ms();
+			for (l = 0; l < L; l++)
+				charsiu_vision_attention(q, k, v, o, n, W, H,
+					1.0f / sqrtf((float)(W / H)));
+			dt = now_ms() - t0;
+			if (!best[s] || dt < best[s])
+				best[s] = dt;
+			/*
+			 * ⚠ AND THE RESULT HAS TO BE READ. Without a checksum
+			 * -O2 is entitled to notice the output is dead; and the
+			 * schedules are meant to be BIT identical, so a
+			 * difference here is a bug that a stopwatch would have
+			 * reported as a speedup.
+			 */
+			chk[s] = checksum(o, (size_t)n * W);
+		}
+
+	for (s = lo; s < hi; s++) {
+		printf("%-9s %8.0f ms best of %u  (%8.2f ms a layer)",
+		       charsiu_vision_attn_sched_name((int)s), best[s], reps,
+		       best[s] / L);
+		if (cmp && s)
+			printf("   %.2fx", best[0] / best[s]);
+		printf("\n");
+		if (chk[s] != chk[lo])
+			bad = 1;
+	}
+	printf("checksum %.9g%s\n", chk[lo],
+	       bad ? "   ⚠ THE SCHEDULES DISAGREE, THIS IS A BUG" : "");
 	free(q); free(k); free(v); free(o);
-	return 0;
+	return bad ? 1 : 0;
 }

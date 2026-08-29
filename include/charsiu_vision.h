@@ -158,6 +158,22 @@ void charsiu_vision_attention(const float *q, const float *k, const float *v,
 			      float *o, unsigned n, unsigned W,
 			      unsigned n_head, float scale);
 
+/*
+ * Which way the attention's blocks are handed to the thread pool: 0 flat, the
+ * original numbering, which puts every thread on a different head; 1 headwise,
+ * one dispatch per head so every thread is on the same keys, at the cost of a
+ * barrier per head; 2 share, the same locality with one dispatch and no extra
+ * barrier. CHARSIU_VATTN_SCHED=flat|headwise|share picks one. All three are bit
+ * identical and differ only in what stays in cache, so the right answer is the
+ * machine's, not the code's.
+ *
+ * ⚠ A HOST ANSWERS THIS WRONG FOR THE BOARD. Read the note above the function.
+ */
+int charsiu_vision_attn_sched_get(void);
+void charsiu_vision_attn_sched_set(int sched);
+const char *charsiu_vision_attn_sched_name(int sched);
+#define CHARSIU_VATTN_SCHEDS 3
+
 /* (v - mean) / std, per channel, in place. */
 void charsiu_vision_normalise(const struct charsiu_vision *v, float *px);
 

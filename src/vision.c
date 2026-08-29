@@ -718,11 +718,11 @@ static void pixel_shuffle(const float *x, float *out, unsigned grid,
 			}
 }
 
-/* one (head, patch) each; see the note at the call site */
+/* one query block each; see the schedules below */
 struct vattn {
 	const float *q, *k, *v;
 	float *o;
-	unsigned n, W, hd;
+	unsigned n, W, hd, nh, nb;
 	float scale;
 };
 
@@ -732,47 +732,127 @@ struct vattn {
  * -- and the board measured this shape as bandwidth bound rather than
  * arithmetic bound, which is why vectorising it bought 2.9x on a host and 1.24x
  * there. See the long note in whisper.c.
+ *
+ * ⚠ THE NUMBER IS MEASURED, NOT CHOSEN. tests/vattn_sweep.sh times the whole
+ * curve; -DVATTN_QB= is how a board re-asks the question without a patch,
+ * because the answer depends on how much L2 the machine has and this host has
+ * an order of magnitude more of it than the board does.
  */
+#ifndef VATTN_QB
 #define VATTN_QB 8
+#endif
 
-static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
+/* one head's slice of one block of queries; `att` is VATTN_QB * n scratch */
+static void vattn_block(const struct vattn *c, float *att, unsigned off,
+			unsigned b)
+{
+	unsigned i0 = b * VATTN_QB;
+	unsigned nq = c->n - i0 < VATTN_QB ? c->n - i0 : VATTN_QB;
+	unsigned j, u, e;
+
+	for (j = 0; j < c->n; j++) {
+		const float *kj = c->k + (size_t)j * c->W + off;
+
+		for (u = 0; u < nq; u++)
+			att[u * c->n + j] = charsiu_dot_f32(
+				c->q + (size_t)(i0 + u) * c->W + off,
+				kj, c->hd) * c->scale;
+	}
+	for (u = 0; u < nq; u++) {
+		float *o = c->o + (size_t)(i0 + u) * c->W + off;
+
+		vsoftmax(att + u * c->n, c->n);
+		for (e = 0; e < c->hd; e++)
+			o[e] = 0.0f;
+	}
+	for (j = 0; j < c->n; j++) {
+		const float *vj = c->v + (size_t)j * c->W + off;
+
+		for (u = 0; u < nq; u++)
+			charsiu_axpy_f32(c->o + (size_t)(i0 + u) * c->W + off,
+					 vj, att[u * c->n + j], c->hd);
+	}
+}
+
+/*
+ * ⚠⚠ WHICH THREAD IS ON WHICH HEAD, AND IT IS THE WHOLE OF THIS STAGE ON THE
+ * BOARD.
+ *
+ * A head's keys and values are n * head_dim * 2 * 4 bytes -- half a megabyte at
+ * n = 1024 -- and every one of the 128 query blocks of that head reads all of
+ * it. Whether that half megabyte is read once or 128 times is decided by
+ * nothing but which items the pool hands to which thread.
+ *
+ * SCHED_FLAT, the original, is item = head * nb + block, one flat span cut into
+ * contiguous chunks. Six threads land on six DIFFERENT heads and hold three
+ * megabytes of live stream against a board with about one megabyte of L2 for
+ * the whole A72 cluster. Nothing stays resident and every block pays DRAM.
+ *
+ * SCHED_HEADWISE dispatches each head separately, so every thread is on the
+ * same half megabyte at the same instant. It is the strongest form and it costs
+ * n_head barriers a layer instead of one -- and a barrier makes every core wait
+ * for the slowest, which on a big.LITTLE board is an A53 holding up four A72s,
+ * twelve times a layer instead of once.
+ *
+ * SCHED_SHARE is the same locality without the barriers. The item numbering
+ * becomes head = item % n_head, block = item / n_head, so a thread's contiguous
+ * chunk is 1/threads of the BLOCKS and ALL of the heads; the thread then walks
+ * its own chunk head major. Every thread starts at head 0 with its own slice of
+ * the blocks, and they advance through the heads together because each does the
+ * same work per head -- no barrier, and they only drift as far apart as the
+ * cores differ in speed.
+ */
+enum { SCHED_FLAT, SCHED_HEADWISE, SCHED_SHARE };
+
+static void vattn_flat(void *ctx, uint64_t r0, uint64_t n)
 {
 	const struct vattn *c = ctx;
-	unsigned nb = (c->n + VATTN_QB - 1) / VATTN_QB;
 	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
 	uint64_t r;
 
 	if (!att)
 		return;
-	for (r = r0; r < r0 + n; r++) {
-		unsigned h = (unsigned)(r / nb), b = (unsigned)(r % nb);
-		unsigned i0 = b * VATTN_QB, off = h * c->hd;
-		unsigned nq = c->n - i0 < VATTN_QB ? c->n - i0 : VATTN_QB;
-		unsigned j, u, e;
+	for (r = r0; r < r0 + n; r++)
+		vattn_block(c, att, (unsigned)(r / c->nb) * c->hd,
+			    (unsigned)(r % c->nb));
+	free(att);
+}
 
-		for (j = 0; j < c->n; j++) {
-			const float *kj = c->k + (size_t)j * c->W + off;
+/* the head is fixed by the caller; the range is blocks */
+static void vattn_one_head(void *ctx, uint64_t r0, uint64_t n)
+{
+	const struct vattn *c = ctx;
+	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
+	uint64_t r;
 
-			for (u = 0; u < nq; u++)
-				att[u * c->n + j] = charsiu_dot_f32(
-					c->q + (size_t)(i0 + u) * c->W + off,
-					kj, c->hd) * c->scale;
-		}
-		for (u = 0; u < nq; u++) {
-			float *o = c->o + (size_t)(i0 + u) * c->W + off;
+	if (!att)
+		return;
+	for (r = r0; r < r0 + n; r++)
+		vattn_block(c, att, c->nh, (unsigned)r);
+	free(att);
+}
 
-			vsoftmax(att + u * c->n, c->n);
-			for (e = 0; e < c->hd; e++)
-				o[e] = 0.0f;
-		}
-		for (j = 0; j < c->n; j++) {
-			const float *vj = c->v + (size_t)j * c->W + off;
+/*
+ * ⚠ THE RANGE IS WALKED OUT OF ORDER ON PURPOSE. The items are the same items;
+ * visiting the ones with the same head together is what makes all the threads
+ * read one head's keys at one time. The stride is n_head because that is the
+ * numbering, and the first item of head h is the first r >= r0 with r % nh == h.
+ */
+static void vattn_share(void *ctx, uint64_t r0, uint64_t n)
+{
+	const struct vattn *c = ctx;
+	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
+	uint64_t r, end = r0 + n;
+	unsigned h;
 
-			for (u = 0; u < nq; u++)
-				charsiu_axpy_f32(c->o + (size_t)(i0 + u) *
-						 c->W + off, vj,
-						 att[u * c->n + j], c->hd);
-		}
+	if (!att)
+		return;
+	for (h = 0; h < c->nh; h++) {
+		unsigned first = (unsigned)((h + c->nh - r0 % c->nh) % c->nh);
+
+		for (r = r0 + first; r < end; r += c->nh)
+			vattn_block(c, att, h * c->hd,
+				    (unsigned)(r / c->nh));
 	}
 	free(att);
 }
@@ -783,18 +863,72 @@ static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
  * because the board's matmuls go to the NPU and the host's do not. Measuring it
  * through charsiu_vision_encode means reading a 6% row of a stage table and
  * calling the difference a result. tools/vattn_bench.c calls this directly.
+ *
+ * ⚠ THE SCHEDULE IS A KNOB BECAUSE THE ANSWER IS THE MACHINE'S. None of the
+ * three touches the arithmetic or the order within it, so all three are bit
+ * identical to each other and to the unblocked form -- which vattn_bench -c
+ * checks with a checksum rather than assuming.
  */
+static int vattn_sched = -1;
+
+int charsiu_vision_attn_sched_get(void)
+{
+	if (vattn_sched < 0) {
+		const char *e = getenv("CHARSIU_VATTN_SCHED");
+
+		vattn_sched = SCHED_SHARE;
+		if (e && !strcmp(e, "flat"))
+			vattn_sched = SCHED_FLAT;
+		else if (e && !strcmp(e, "headwise"))
+			vattn_sched = SCHED_HEADWISE;
+	}
+	return vattn_sched;
+}
+
+/*
+ * ⚠ SETTABLE BECAUSE THE COMPARISON HAS TO HAPPEN IN ONE PROCESS. This host
+ * runs six cores shared with an editor and two other agents, and two builds
+ * timed one after the other disagreed by 1.8x with the SAME binary on both
+ * sides. Interleaving the schedules inside one run puts them on the same cores,
+ * the same cache state and the same interference.
+ */
+void charsiu_vision_attn_sched_set(int sched)
+{
+	vattn_sched = sched;
+}
+
+const char *charsiu_vision_attn_sched_name(int sched)
+{
+	static const char *const nm[] = { "flat", "headwise", "share" };
+
+	return sched >= 0 && sched < 3 ? nm[sched] : "?";
+}
+
 void charsiu_vision_attention(const float *q, const float *k, const float *v,
 			      float *o, unsigned n, unsigned W,
 			      unsigned n_head, float scale)
 {
+	uint64_t nb = (n + VATTN_QB - 1) / VATTN_QB;
 	struct vattn c;
+	unsigned h;
 
 	c.q = q; c.k = k; c.v = v; c.o = o;
 	c.n = n; c.W = W; c.hd = W / n_head; c.scale = scale;
-	charsiu_parallel_for(vattn_rows, &c,
-			     (uint64_t)n_head * ((n + VATTN_QB - 1) /
-						 VATTN_QB));
+	c.nh = n_head; c.nb = (unsigned)nb;
+	switch (charsiu_vision_attn_sched_get()) {
+	case SCHED_FLAT:
+		charsiu_parallel_for(vattn_flat, &c, (uint64_t)n_head * nb);
+		break;
+	case SCHED_HEADWISE:
+		for (h = 0; h < n_head; h++) {
+			c.nh = h * c.hd;         /* reused as the head offset */
+			charsiu_parallel_for(vattn_one_head, &c, nb);
+		}
+		break;
+	default:
+		charsiu_parallel_for(vattn_share, &c, (uint64_t)n_head * nb);
+		break;
+	}
 }
 
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
