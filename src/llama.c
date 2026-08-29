@@ -2580,6 +2580,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bhb); free(s->bhb2); free(s->bcs);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
 	free(s->bfreq);
+	free(s->bpl); free(s->bplg);
 
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
@@ -3041,6 +3042,14 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	static char buf[256];
 	size_t n = 0;
 
+	/*
+	 * ⚠ THE MODEL IS STILL THE ARGUMENT even though nothing left in the
+	 * list reads it. This is the question "will THIS model batch", and the
+	 * next architecture that cannot will answer it out of m; a signature
+	 * narrowed to match today's body would have to be widened again, and
+	 * every caller changed, on the day it is needed.
+	 */
+	(void)m;
 	buf[0] = 0;
 #define WHY(cond, txt) do {                                                 \
 		if (cond) {                                                 \
@@ -3051,7 +3060,6 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		}                                                           \
 	} while (0)
 
-	WHY(m->n_embd_pl, "per layer embeddings");
 	WHY(kv_posmajor(), "a position major KV cache");
 #undef WHY
 	if (n)
@@ -3086,6 +3094,20 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * layers[0] instead of from the widest layer. m->n_ff has been the max
 	 * since gemma4 landed, so the fix was to allocate from it and read
 	 * L->n_ff in the loop, which is what the token loop already did.
+	 *
+	 * ⚠ PER LAYER EMBEDDINGS LEFT THIS LIST on 2026-08-29 and they WERE a
+	 * computation -- the only one of the five that was. They are a second
+	 * embedding table, a projection of the first, a norm a layer slice, and
+	 * a gated residual at the bottom of every layer, which is the whole of
+	 * what "E2B" means. What made them batchable was that all of it is per
+	 * ROW: two matmuls that take n rows and scalar work that does not.
+	 *
+	 * ⚠⚠ THE LIST IS NOW EMPTY BUT FOR A DEBUG SWITCH, so the next
+	 * architecture will not be refused by it -- it will be MISSED by it,
+	 * the way blk.N.layer_output_scale was: a tensor this loop did not
+	 * apply, on a model nothing else refused. A new architecture means
+	 * reading llama_forward against this loop line by line, not trusting
+	 * a NULL from here.
 	 *
 	 * ⚠ THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
 	 * and Gemma4 took 23.6 s and 17.6 s to a first token against
@@ -3174,9 +3196,25 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * I did it again in the batched copy of the same loop.
 		 */
 		s->bao = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
+		/*
+		 * ⚠ gemma4's PER LAYER EMBEDDINGS ARE PER ROW. s->pl is one
+		 * token's -- looked up by that token's id and projected from
+		 * that token's own embedding -- so a chunk needs n of them.
+		 * Sharing one would give every row of the prompt the last
+		 * row's, which is a model that runs and answers.
+		 */
+		free(s->bpl); free(s->bplg);
+		s->bpl = s->bplg = NULL;
+		if (m->n_embd_pl) {
+			s->bpl = malloc((size_t)n * m->n_embd_pl * m->n_layer
+					* sizeof(float));
+			s->bplg = malloc((size_t)n * m->n_embd_pl
+					 * sizeof(float));
+		}
 
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
-		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao) {
+		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao ||
+		    (m->n_embd_pl && (!s->bpl || !s->bplg))) {
 			s->bx_n = 0;
 			return -1;
 		}
@@ -3211,6 +3249,61 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		if (m->embd_scale != 1.0f)
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] *= m->embd_scale;
+	}
+
+	/*
+	 * ⚠ gemma4's PER LAYER EMBEDDINGS, built once for the whole chunk:
+	 *
+	 *   pl[r][l][j] = ( proj[r][l][j] + tok[r][l][j] * sqrt(n_embd_pl) )
+	 *                 / sqrt(2)
+	 *
+	 * where proj is per_layer_model_proj applied to the SCALED embedding
+	 * and divided by sqrt(n_embd), then RMS normalised a layer at a time
+	 * against per_layer_proj_norm, and tok is a row of a second embedding
+	 * table looked up by the same token. Every line of it is the token
+	 * loop's, in the token loop's order, with one index added.
+	 *
+	 * ⚠ THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
+	 * is n_embd_pl long and llama.cpp reshapes to [n_embd_pl][n_layer]
+	 * before normalising. Over the concatenation every layer would be
+	 * divided by every other layer's magnitude.
+	 *
+	 * ⚠ THE PROJECTION IS THE ONLY PART THAT BATCHES. The rest reads one
+	 * row's table entry and normalises one row's slices, which is n times
+	 * the same scalar code and not a matmul.
+	 */
+	if (m->n_embd_pl) {
+		uint32_t np = m->n_embd_pl, nl = m->n_layer, l, j;
+		float ts = sqrtf((float)np);
+		float ps = 1.0f / sqrtf((float)m->n_embd);
+		float half = 1.0f / sqrtf(2.0f);
+
+		/*
+		 * ⚠ READ ONCE. The token loop reads this gain inside its layer
+		 * loop, which is the same vector every time; here that would be
+		 * n_layer reads a row. Same values, so it cannot move a token.
+		 */
+		gguf_row_f32(m->pl_proj_norm, 0, s->plc);
+		matmul_rows(s, m->pl_model_proj, s->bx, n, s->bpl, m->n_embd,
+			    np * nl);
+		for (int r = 0; r < n; r++) {
+			gguf_row_f32(m->pl_tok_embd, (uint64_t)toks[r], s->plb);
+			for (l = 0; l < nl; l++) {
+				float *row = s->bpl
+					   + ((size_t)r * nl + l) * np;
+				float ss = 0.0f, sc;
+
+				for (j = 0; j < np; j++) {
+					row[j] *= ps;
+					ss += row[j] * row[j];
+				}
+				sc = 1.0f / sqrtf(ss / (float)np + m->rms_eps);
+				for (j = 0; j < np; j++)
+					row[j] = (row[j] * sc * s->plc[j]
+						  + s->plb[(size_t)l * np + j]
+						    * ts) * half;
+			}
+		}
 	}
 
 	for (uint32_t l = 0; l < m->n_layer; l++) {
@@ -3517,6 +3610,86 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 					m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
+		}
+
+		/*
+		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not
+		 * a replacement:
+		 *
+		 *   g = gelu(per_layer_inp_gate . x)      [n_embd_pl]
+		 *   g = g * pl[l]                          elementwise
+		 *   x = x + rmsnorm(per_layer_proj . g, per_layer_post_norm)
+		 *
+		 * This is the whole of what "E2B" means, so a batched prefill
+		 * that skipped it would prompt a different model from the one
+		 * that then decodes -- fluent, and answering about the wrong
+		 * thing. Both matmuls batch; the gelu and the elementwise
+		 * multiply are per row because the gate is.
+		 */
+		if (L->pl_inp_gate) {
+			uint32_t np = m->n_embd_pl, i;
+
+			matmul_rows(s, L->pl_inp_gate, s->bx, n, s->bplg,
+				    m->n_embd, np);
+			for (int r = 0; r < n; r++) {
+				float *g = s->bplg + (size_t)r * np;
+				const float *plr = s->bpl
+						 + ((size_t)r * m->n_layer + l)
+						   * np;
+
+				for (i = 0; i < np; i++) {
+					float v = g[i];
+
+					v = 0.5f * v * (1.0f +
+					     tanhf(0.7978845608028654f
+						   * (v + 0.044715f * v * v
+						      * v)));
+					g[i] = v * plr[i];
+				}
+			}
+			/*
+			 * ⚠ bxo IS FREE HERE. The feed forward's down
+			 * projection went into it and was added into bx on the
+			 * loop above; nothing reads it again this layer, and it
+			 * is already n rows of n_embd, which is this
+			 * projection's shape exactly.
+			 */
+			matmul_rows(s, L->pl_proj, s->bplg, n, s->bxo, np,
+				    m->n_embd);
+			for (int r = 0; r < n; r++) {
+				float *xr = s->bx + (size_t)r * m->n_embd;
+				float *o = s->bxo + (size_t)r * m->n_embd;
+
+				if (L->pl_post_norm)
+					rmsnorm(o, o, L->pl_post_norm,
+						m->n_embd, m->rms_eps);
+				for (i = 0; i < m->n_embd; i++)
+					xr[i] += o[i];
+			}
+		}
+		/*
+		 * ⚠ ONE SCALAR THE WHOLE LAYER OUTPUT IS MULTIPLIED BY, and
+		 * this loop never had it. It is not in llama_batch_why_not
+		 * either, so a model carrying blk.N.layer_output_scale and
+		 * none of the listed refusals would have been prefilled
+		 * without it and decoded with it -- silently, since the two
+		 * differ by a constant per layer and nothing here reads a
+		 * magnitude. gemma4 is the only architecture that has it, and
+		 * gemma4 was refused for other reasons until now.
+		 *
+		 * Read through gguf_row_f32 rather than cast, the way every
+		 * other gain in this file is read.
+		 */
+		if (L->out_scale) {
+			float sc = 1.0f;
+
+			gguf_row_f32(L->out_scale, 0, &sc);
+			for (int r = 0; r < n; r++) {
+				float *xr = s->bx + (size_t)r * m->n_embd;
+
+				for (uint32_t i = 0; i < m->n_embd; i++)
+					xr[i] *= sc;
+			}
 		}
 		/*
 		 * ⚠ THE LAST ROW, BECAUSE THAT IS THE ONE THE TOKEN LOOP CAN BE
