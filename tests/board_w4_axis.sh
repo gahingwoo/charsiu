@@ -83,13 +83,26 @@ for AXIS in h w; do
 	esac
 	echo "===== M axis: $AXIS -- $label ====="
 	out="$OUTDIR/w4-axis-$AXIS.txt"
+	# ⚠ THE CONTROL MUST REACH THE HARDWARE. Round one set W4_BATCH=1 on
+	# both arms, and on the height arm the gate in npudev.c refused it --
+	# so the arm that had to fail failed in software and said nothing about
+	# the silicon. "height" is the value that lets the wrong axis through
+	# on purpose.
+	case $AXIS in h) GATE=height ;; *) GATE=1 ;; esac
 	# shellcheck disable=SC2086
-	env $W4_ENV CHARSIU_M_AXIS="$AXIS" CHARSIU_NPU_W4_BATCH=1 \
+	env $W4_ENV CHARSIU_M_AXIS="$AXIS" CHARSIU_NPU_W4_BATCH="$GATE" \
 	    "$RUN" "$MODEL" --batch-probe 32 >"$out" 2>&1
 	rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "  THE RUN FAILED (exit $rc), last lines:"
 		tail -12 "$out" | sed 's/^/    /'
+		echo
+		continue
+	fi
+	if grep -q "int4 computes one row" "$out"; then
+		echo "  THE GATE REFUSED THIS ARM -- it never reached the NPU."
+		echo "  A control that cannot run is not a control; nothing here"
+		echo "  is a statement about the hardware."
 		echo
 		continue
 	fi
@@ -100,9 +113,7 @@ for AXIS in h w; do
 		echo
 		continue
 	fi
-	sed -n '/batching .* layers/,$p' "$out" | head -14 | sed 's/^/  /'
-	# the refusal, if the gate did not open, is on stderr and in the file
-	grep -i "int4 computes one row" "$out" | head -1 | sed 's/^/  ⚠ /'
+	sed -n '/batching .* layers/,$p' "$out" | head -18 | sed 's/^/  /'
 	echo
 done
 

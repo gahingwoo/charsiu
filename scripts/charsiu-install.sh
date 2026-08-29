@@ -885,7 +885,7 @@ PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
 # listed, so every board_*.sh written since has been exactly that: reachable
 # by a path nobody types.
 PROBE_SCRIPTS="prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
-board_vendor.sh board_modalities.sh board_threads.sh"
+board_acc_map.sh board_vendor.sh board_modalities.sh board_threads.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;

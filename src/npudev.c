@@ -1681,13 +1681,26 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * Both switches or neither. An int4 batch on the height axis is the wrong
  * answer at a very good speed, which is the one failure mode this tree has
  * already shipped once.
+ *
+ * ⚠ AND "height" IS A THIRD VALUE, because the first board round's control was
+ * VACUOUS. tests/board_w4_axis.sh ran the height axis as the arm that must
+ * fail, and it did -- by hitting this refusal, which is a decision in software
+ * and says nothing about the hardware. A control that cannot reach the thing
+ * it is controlling for is not a control.
+ *
+ * CHARSIU_NPU_W4_BATCH=height is "yes, on the axis that is known wrong, I am
+ * running the arm that must fail". Nothing else should ever set it.
  */
 static int w4_batch_gate(void)
 {
 	const char *b = getenv("CHARSIU_NPU_W4_BATCH");
 	const char *a = getenv("CHARSIU_M_AXIS");
 
-	return b && *b != '0' && a && (*a == 'w' || *a == 'W');
+	if (!b || *b == '0')
+		return 0;
+	if (!strcmp(b, "height"))
+		return 1;
+	return a && (*a == 'w' || *a == 'W');
 }
 
 static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,

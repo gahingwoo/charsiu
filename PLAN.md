@@ -300,6 +300,64 @@ axes, height first as the control.
 So batching an int4 weight matmul **is** available, and the plan to beat their
 TTFT by doing it was aimed at something they do every layer.
 
+### The board: the width axis batches, and the read order is what is left
+
+Both rounds ran on 2026-08-29. They disagree about nothing and they move the
+problem from "int4 cannot do more than one row" to "the values come back
+somewhere this tree does not look".
+
+**int4, `board_w4_axis.sh`.** On the width axis the probe ran and the hardware
+batched:
+
+```
+   blk.0.attn_q.weight at m=2: 2526 of 4096 wanted values are in the batch
+     row0 batched   -0.002  0.120  0.182  0.265  0.100  0.317
+     row0 one row   -0.002  0.120  0.182  0.265  0.100  0.317
+     row1 batched   -0.341  0.141  0.052 -0.155 -0.620  0.251
+     row1 one row   -0.104 -0.127 -0.237 -0.390  0.892 -0.450
+     row0: 1239 of 2048 of its values are in the batch
+     row1: 1287 of 2048
+
+     m   worst rel   rows agree   one row   batched  speedup  GB/s
+     2    1.13e+03    0 of 226      118 ms    75 ms   1.58x   16.55
+     4    1.21e+03    0 of 452      230 ms    92 ms   2.51x   13.50
+     8    3.16e+04    0 of 904      461 ms   174 ms   2.66x    7.12
+    16    1.52e+03    0 of 1808    1018 ms   293 ms   3.47x    4.21
+    32    2.00e+03    0 of 3616    2004 ms   581 ms   3.45x    2.13
+```
+
+⚠ **THE SPEEDUP IS NOT THE EVIDENCE.** A run that computes one row and returns
+noise for the rest is also sub-linear in m. The discriminating fact is **row 1**:
+1287 of its 2048 values are in the buffer. Five rounds on the height axis had
+row 1 matching row 0 in 1 of 2048 -- absent, not misplaced. It is being
+computed now.
+
+⚠⚠ **AND THE HEIGHT ARM OF THAT ROUND WAS VACUOUS.** It was the arm that had to
+fail and it failed by hitting `w4_batch_gate()` in npudev.c -- a decision in
+software, which says nothing about silicon. A control that cannot reach the
+thing it controls for is not a control. `CHARSIU_NPU_W4_BATCH=height` now lets
+the wrong axis through on purpose and the script stops if the refusal appears.
+
+**int8, `board_rows_sweep.sh`.** Its height arm is a real control and it passed
+exactly: identical to the one row path at 4, 8, 16, 32, 48, 64 and 80 and
+DIFFERS from 96 -- the known bound, reproduced. Its width arm **DIFFERS at
+every row count from 4 up**.
+
+So both formats say the same thing from opposite sides. `charsiu_acc_index()`
+was solved on the HEIGHT axis, from maps printed at m = 2 and m = 4, and the
+width axis swaps the two image axes underneath it. The arithmetic is right and
+the read order is wrong, which is a smaller problem than the one before it and
+a different one.
+
+⚠ **AND 80 IS STILL int8-ON-THE-HEIGHT.** The width arm does not reach it,
+being wrong at 4, so nothing yet says whether that ceiling is the arrangement.
+That question survives this round.
+
+**Next: `board_acc_map.sh`.** `npu_gemm_test --read` prints the permutation
+itself rather than a candidate for it -- it is what solved the height axis --
+at m = 2 and m = 4, both axes, K = 64 N = 64 where the reference has 112
+distinct values in 128. The height arm is solved and must come back EXACT.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not
