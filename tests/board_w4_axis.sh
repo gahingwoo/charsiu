@@ -60,10 +60,14 @@ fi
 
 OUTDIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUTDIR"
+# ⚠ 80, NOT 32. The probe's widths are 2 4 8 16 32 48 64 80 and this argument
+# CAPS them. It said 32 for one round after the widths were extended, so the
+# round that existed to reach 48, 64 and 80 never left 32.
+MMAX=${CHARSIU_PROBE_MMAX:-80}
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-echo "probe    --batch-probe 32   (m = 2, 4, 8, 16, 32, checked then timed)"
+echo "probe    --batch-probe $MMAX   (widths up to that, checked then timed)"
 echo
 
 # ⚠⚠ THE WHOLE int4 ENVIRONMENT, NOT JUST THE AXIS. This is the set
@@ -101,7 +105,7 @@ for AXIS in h w; do
 	# shellcheck disable=SC2086
 	env $W4_ENV CHARSIU_M_AXIS="$AX" CHARSIU_NPU_W4_BATCH="$GATE" \
 	    ${ACC:+CHARSIU_ACC_A="$ACC"} \
-	    "$RUN" "$MODEL" --batch-probe 32 >"$out" 2>&1
+	    "$RUN" "$MODEL" --batch-probe "$MMAX" >"$out" 2>&1
 	rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "  THE RUN FAILED (exit $rc), last lines:"

@@ -585,8 +585,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	if (charsiu_act_alloc(&a, (int)widest) < 0)
 		return -1;
 
-	printf("\n  batching %u layers, checked before it is timed\n",
+	/*
+	 * ⚠ SAY WHICH WIDTHS, because the caller caps this and the two have
+	 * already disagreed. MS[] was widened to 80 and the board script was
+	 * still passing --batch-probe 32, so a round that was run to reach 48,
+	 * 64 and 80 stopped at 32 and its header said 32 while the reason for
+	 * running it said otherwise. A list that prints cannot do that.
+	 */
+	printf("\n  batching %u layers, checked before it is timed; widths",
 	       m->n_layer);
+	for (unsigned i = 0; i < sizeof(MS) / sizeof(*MS); i++)
+		if (MS[i] <= mmax)
+			printf(" %u", MS[i]);
+	printf("   (--batch-probe caps at %u)\n", mmax);
 	printf("    m  tensors    worst rel   rows that agree"
 	       "     one row    batched  speedup  us a row    GB/s"
 	       "   where the batched time went, ms\n");
@@ -959,6 +970,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
+		unsigned nbad = 0;		/* misses named, capped */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
@@ -1019,6 +1031,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			}
 			for (unsigned r = 0; r < mr; r++) {
 				int ok = 1;
+				double rworst = 0;
 
 				for (unsigned j = 0; j < (unsigned)t->n; j++) {
 					size_t o = (size_t)r * t->n + j;
@@ -1029,11 +1042,30 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					if (rel > worst)
 						worst = rel;
+					if (rel > rworst)
+						rworst = rel;
 					if (rel > 1e-3)
 						ok = 0;
 				}
 				rows_ok += ok;
 				rows_tot++;
+				/*
+				 * ⚠ NAME THE TENSOR AND THE ROW when a width
+				 * that is otherwise exact loses a few. m = 8
+				 * comes back 871 of 904 -- 33 rows, not a
+				 * whole tensor and not a whole row of them --
+				 * where 4 and 16 either side are perfect, and
+				 * a count of 33 cannot say whether it is one
+				 * shape, one row index, or scattered. Eight
+				 * lines is enough to tell those apart.
+				 */
+				if (!ok && nbad < 8) {
+					printf("      MISS %-24s k=%-5u n=%-5u"
+					       " row %u of %u, worst rel %.2e\n",
+					       t->name, (unsigned)t->k,
+					       (unsigned)t->n, r, mr, rworst);
+					nbad++;
+				}
 			}
 			/*
 			 * ⚠⚠ WRONG PLACE OR WRONG NUMBER, which are different

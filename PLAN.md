@@ -663,6 +663,42 @@ m row count is what would catch it.
 against the height control and the default width. 2048 of 2048 on both rows is
 the read order solved.
 
+### The default reproduces it with nothing set, and 48/64/80 still were not asked
+
+```
+  M axis: w, no environment variable at all
+     m   worst rel    rows that agree
+     2   5.10e-05      226 of 226
+     4   5.10e-05      452 of 452
+     8   5.78e+04      871 of 904
+    16   5.10e-05     1808 of 1808
+    32   5.10e-05     3616 of 3616
+```
+
+`charsiu_acc_index` taking the format is enough: the width arm is exact with
+nothing set and the height control is unchanged and still wrong. Same numbers
+as the hand-set round, m = 8 included, so it is reproducible rather than a
+reading.
+
+⚠⚠ **AND THE THREE UNTESTED WIDTHS ARE STILL UNTESTED.** MS[] was widened to
+2, 4, 8, 16, 32, 48, 64, 80 and the board script was still passing
+`--batch-probe 32`, which is the cap. The round that existed to reach 48, 64
+and 80 stopped at 32, and its own header said 32 while the reason for running
+it said otherwise. Changed one half, left the other -- the same shape of
+mistake as the `head` caps.
+
+Both ends are fixed and instrumented rather than just corrected: the script
+passes 80, and the probe now PRINTS the widths it is about to run next to the
+cap it was given, so the two cannot disagree in silence again.
+
+### m = 8 will name itself next time
+
+871 of 904 is 33 rows. Not a whole tensor, not a whole row index across
+tensors, and a count cannot tell those apart. The probe names the first eight
+misses now -- tensor, k, n, which row of which m, and that row's own worst
+relative error -- which separates "one shape", "one row index" and "scattered"
+in one round.
+
 ## 🏁 THE READ ORDER IS SOLVED. w4a16 batches exactly, 2 to 32
 
 `roleswap2`, on the board:
