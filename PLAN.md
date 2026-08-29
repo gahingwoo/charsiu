@@ -675,6 +675,63 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+## Best of three, and the numbers are trustworthy now
+
+```
+                  best     spread          theirs   gap
+  Qwen3 0.6B      1792     1792..1809       469     3.8x
+  TinyLLAMA       2162     2162..2265       544     4.0x
+  Phi3 3.8B       6551     6551..6809      1829     3.6x
+  Gemma4 E2B     17564    17564..17978     1219    14.4x   not batched
+```
+
+`prefill_control`: 50.59 and 52.50 tok/s against the control's 15.26, text
+identical, decode unchanged. The gather change did land -- 47.88 before it.
+
+⚠ **AND THE SPREAD ITSELF SAYS SOMETHING.** Qwen3 moves 1% inside one round and
+moved 9% across three rounds of nearly the same build. The variance is BETWEEN
+rounds -- thermal state at the start, page cache -- not inside one. Best of
+three within a round is the right statistic and comparing single runs across
+rounds was never going to work.
+
+TTFT against where this line started: **7354 to 1792 on Qwen3, 4.1x**.
+
+### What a submit costs, from four points that land on a known number
+
+Per-submit time against the bytes each submit moves, off one round:
+
+```
+  us a submit = 102.7 * MB + 112       marginal 9.74 GB/s, fixed 112 us
+    Qwen3      1.70 MB   357 us   fit 287   +70
+    TinyLLAMA  2.78      390         398     -8
+    Gemma4     2.93      329         413    -84
+    Phi3       6.91      843         822    +21
+```
+
+Four points with visible scatter, so the slope is approximate -- **but it lands
+on 9.74 GB/s, which is this board's known roof**, independently measured at 9.3
+by decode. A fit that arrives at a number nobody fitted it to is worth more
+than the residuals suggest.
+
+The fixed part is what matters:
+
+```
+  Qwen3      11896 submits x 112 us = 1335 ms of 4245 ms hardware   31%
+  TinyLLAMA  12632                   1418 ms of 4933              29%
+  Phi3       18312                   2056 ms of 15432             13%
+```
+
+**A third of Qwen3's hardware time is per-submit overhead**, because it moves
+only 1.70 MB each time. The pool's own report puts it where you would expect:
+13129 ms of a 17956 ms hardware path is waiting on the fence.
+
+⚠⚠ **AND THE OBVIOUS FIX IS NOT FREE.** Fewer submits means a bigger K slice,
+and `CHARSIU_NPU_KMAX` is deliberately tied to `CHARSIU_NPU_W4_GROUP`: the
+slice must BE the quantisation group for the group's scale to be applied on the
+way in with nothing extra on the hardware. Raising it coarsens int4 -- per
+channel RTN measures 0.1067 relative against group 32's 0.0666. Anyone reaching
+for that knob to cut submits is trading the answer for the clock.
+
 ### The gather on the board: 28% off, and the vendor table cannot see it
 
 Correctness first, because a faster gather that is wrong is the failure this
