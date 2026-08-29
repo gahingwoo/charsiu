@@ -29,8 +29,12 @@ mkdir -p "$DIR"
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 [ -d "$MODELS" ] || MODELS=/opt/charsiu/models
 
-RUN=""
-for d in /usr/bin /opt/charsiu "$PWD/build"; do
+# ⚠ CHARSIU_RUN_BIN, so the shell around the table can be exercised without a
+# board. The repeat loop below went in untested because a missing model takes a
+# different branch and a present-but-empty one takes the failure branch, so
+# neither reaches it; a stand-in binary that prints one [load ...] line does.
+RUN=${CHARSIU_RUN_BIN:-}
+[ -n "$RUN" ] || for d in /usr/bin /opt/charsiu "$PWD/build"; do
 	[ -x "$d/charsiu_run" ] && { RUN="$d/charsiu_run"; break; }
 done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
