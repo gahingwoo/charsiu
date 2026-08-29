@@ -3324,13 +3324,29 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
 			 * HEAD. gemma3's window layers turn at 10000 and its
 			 * full ones at the model's own 1000000, and the file
-			 * carries no key saying so. Handing a window layer the
-			 * full layers' factors scales a frequency table it was
-			 * never built for.
+			 * carries no key saying so.
+			 *
+			 * ⚠⚠ AND WITH NO FREQUENCY FACTORS. llama.cpp gives
+			 * rope_freqs to the FULL layers only; this handed them
+			 * to both, which scales a frequency table a window
+			 * layer was never built for. It could not show on
+			 * gemma3, which carries no such tensor, and gemma4 is
+			 * the first model to arrive here with both a window and
+			 * a shorter window head.
+			 *
+			 * The condition is the token loop's, word for word:
+			 * a second table exists only where the base or the head
+			 * actually differs, and where it does not a window
+			 * layer takes the full one, factors and all.
 			 */
-			rope_table(s->bcs, hd, pos,
-				   swa ? m->rope_base_swa : m->rope_base,
-				   freqf);
+			int swatab = swa && (m->swa_pattern || m->swa_arr) &&
+				     (m->rope_base_swa != m->rope_base ||
+				      m->head_dim_swa != m->head_dim);
+
+			rope_table(s->bcs,
+				   swatab ? m->head_dim_swa : hdmax, pos,
+				   swatab ? m->rope_base_swa : m->rope_base,
+				   swatab ? NULL : freqf);
 			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
 			       (size_t)m->n_head * hd * sizeof(float));
 			/* ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, so
