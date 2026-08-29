@@ -54,7 +54,24 @@ done
 # cannot be compared to it, and another architecture may not batch at all.
 # ~/.charsiu/models first: that is the directory the installer chowns to the
 # user and the one charsiu-get fills.
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models"
+# ⚠ THE BOARD DIRECTORY TOO. board_vendor.sh falls back to $CHARSIU_BOARD_DIR
+# and pulls models into it, so a model that table can find was invisible here:
+# a round meant to check gemma4's text came back "no int4 gguf found" while
+# board_vendor.sh had just benchmarked that very file.
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
+# ⚠⚠ AND A PATH THAT WAS PASSED GETS ITS OWN MESSAGE. This said "no int4 gguf
+# found in <dirs> -- pass one" even when one HAD been passed and simply was not
+# there, which sends the reader to look in the wrong place. A search that
+# failed and an argument that is wrong are different faults.
+if [ -n "$MODEL" ] && [ ! -f "$MODEL" ]; then
+	echo "prefill_control: $MODEL does not exist" >&2
+	echo "  (that path was passed on the command line; nothing was searched)" >&2
+	for d in $DIRS; do
+		[ -d "$d" ] && ls "$d"/*.gguf 2>/dev/null | sed 's/^/  found: /'
+	done
+	exit 1
+fi
 if [ -z "$MODEL" ]; then
 	for pat in '*Llama-3.2*Q4_0*.gguf' '*llama*Q4_0*.gguf' '*Q4_0*.gguf'; do
 		for d in $DIRS; do

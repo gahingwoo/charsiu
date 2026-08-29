@@ -818,6 +818,63 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
+## THE BOARD KEPT EVERY ATTENTION DEFAULT, AND THE ROUND IS 10.32x THERE
+
+`vattn_sweep.sh`, on the card, n = 1024 x 12 layers, 8 threads:
+
+```
+  the round as a whole   14507 -> 1406 ms   10.32x   worst diff 1.15e-07
+```
+
+The host measured 3.71x for the same change. **The board is bandwidth bound and
+the host is compute bound, and the change removes bytes** -- 11.81 GB to
+1.12 GB across L1 for one image's attention -- so the board gains nearly three
+times as much. That is the transfer working in the direction it was predicted
+to.
+
+Every knob against its own control, on the card:
+
+```
+  schedule   flat 1.00   share 1.02   headwise 0.76      default: share
+  query blk  qb=64 8.24x  qb=128 8.29x  qb=256 7.74x     default: 64
+  key tile   kt=16 best; 32 0.97x, 256 0.78x, 512 0.56x  default: 16
+  fused      3.50x against the three pass kernel         default: on
+  blocked    1.90x against one pair at a time            default: on
+  poly exp   1.12x against glibc                         default: on
+```
+
+**All three defaults chosen on the desktop survive the board.** qb = 128 is
+0.6% ahead of 64, which is inside the noise even best of five; kt = 16 is the
+board's own best and every larger tile is worse; share is the board's best and
+`headwise` is 24% worse there against 0.76x on the host -- the barrier cost on
+4xA72 + 4xA53 that could not be seen on six equal cores.
+
+⚠ The fused kernel is 3.50x on the board against 1.18x on the host, and it is
+the one change that is not bit identical (8.5e-08). It is also now the single
+largest contributor. `CHARSIU_VATTN_FUSED=0` is the control if a caption ever
+looks wrong.
+
+### The sweep could not have run, and the reason had three parts
+
+`cannot open /opt/charsiu/vattn_sweep.sh`. The script was not in
+`PROBE_SCRIPTS`, its binary was not in `PROBE_BINS`, and the script defaulted to
+`build/vattn_bench` -- a path that only exists where it was compiled. Fixing
+the first alone would have failed at the second, and the first two alone would
+have failed at the third. All three, and the discovery proved from outside the
+source tree by argument and by PATH.
+
+### And prefill_control could not find gemma4, which is why its text is still open
+
+`no int4 gguf found in ... -- pass one`, printed while `board_vendor.sh` had
+just benchmarked that very file. Two faults: it did not look in
+`$CHARSIU_BOARD_DIR`, which is where that table falls back to and pulls models
+into; and when a path IS passed and is not there it blamed the search instead
+of the argument, which sends the reader to the wrong place. Both fixed, and it
+now lists what it did find.
+
+On the host, through the whole harness, gemma4 reads **text IDENTICAL to the
+control**. The board half is still owed.
+
 ## 🏁 m = 8 IS THE CORE PAIR, AND IT IS NOT THE WIDTH
 
 `board_w4_m8.sh`, three arms, one variable each:
