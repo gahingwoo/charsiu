@@ -342,6 +342,8 @@ static unsigned acc_a_coeff(int *swap)
 		done = 1;
 		if (e && !strcmp(e, "swap"))
 			sw = 1;
+		else if (e && !strcmp(e, "roleswap"))
+			sw = 2;
 		else if (e)
 			A = (unsigned)strtoul(e, NULL, 0);
 	}
@@ -362,6 +364,33 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
 	c = ni % 32u;
 	a = c / 16u;
 	t = c % 16u;
+	/*
+	 * ⚠⚠ roleswap: a AND mi/P TRADE PLACES, and the board's own map is
+	 * where it comes from rather than a guess at what might work.
+	 *
+	 * The in place scan says the default is right on exactly two quadrants
+	 * of (row, half): (0, a=0) and (1, a=1) are correct and the two off
+	 * diagonal ones are not, which is what "1024 of 2048 on each row" is.
+	 * Then the swapped arm, which is wrong everywhere, printed WHERE its
+	 * values went: row 0's a=1 channels at row 1's slot and row 1's a=0
+	 * channels at row 0's, same channel both ways.
+	 *
+	 * Those two facts have one expression between them. Putting a where
+	 * mi/P was and mi/P where a was agrees with the default on the two
+	 * quadrants the board calls correct, differs on the two it calls wrong,
+	 * and reproduces all 36 of the swapped arm's printed landings with none
+	 * missed. It is a permutation at m = 2, 4, 8, 32 and 80.
+	 *
+	 * ⚠ EVERY ONE OF THOSE 36 IS AT m = 2, where P is 1 and (mi % P) * 8 is
+	 * inert. Which of the row's two parts takes the 4 and which keeps the 8
+	 * is therefore a choice at wider m, not a reading. The probe sweeps m
+	 * to 32 and its per m row count is what would catch it.
+	 */
+	if (swap == 2) {
+		j = (t / 4u) * (8u * P) + (mi % P) * 8u
+		  + (mi / P) * 4u + (t % 4u);
+		return (size_t)G * m * 32u + (size_t)a * (32u * P) + j;
+	}
 	if (swap)
 		a = 1u - a;
 	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * A + (t % 4u);

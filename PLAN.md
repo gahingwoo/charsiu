@@ -620,6 +620,49 @@ the table is off by a ratio wherever a candidate crosses a group boundary.
 Nearly sound is the kind of instrument this fortnight has already been burned
 by twice.
 
+### The wrong arm printed the answer: a and the row trade places
+
+The swap arm was wrong everywhere -- 0 of 2048 channels in place -- and it is
+the round that solved this, because it printed WHERE its values went:
+
+```
+  (0,16) -> (1,16)   (0,17) -> (1,17)   (0,21) -> (1,21)  ... 23 of them
+  (1,0)  -> (0,0)    (1,1)  -> (0,1)    (1,15) -> (0,15)  ... 13 of them
+```
+
+Row 0's a = 1 channels at row 1's slot, row 1's a = 0 channels at row 0's, same
+channel both ways. And the default arm's in place counts say the same thing
+from the other side: of the four quadrants of (row, half), **(0, a=0) and
+(1, a=1) are correct and the two off diagonal ones are not**, which is exactly
+what 1024 and 1025 of 2048 are.
+
+One expression covers both. Put `a` where `mi / P` was and `mi / P` where `a`
+was:
+
+```
+  j     = (t/4)*(8P) + (mi%P)*8 + (mi/P)*4 + (t%4)
+  index = G*m*32   + a*(32P)   + j
+```
+
+Checked, not fitted:
+
+- it reproduces **all 36** of the swap arm's printed landings, none missed
+- it agrees with the default on **exactly** the two quadrants the board calls
+  correct and differs on **exactly** the two it calls wrong
+- it is a permutation at m = 2, 4, 8, 32 and 80 -- 163840 distinct slots of
+  163840 at the widest
+- the C and the arithmetic that derived it agree index for index at m = 2, 4
+  and 8
+
+⚠ **ALL 36 LANDINGS ARE AT m = 2**, where P is 1 and `(mi % P) * 8` is inert.
+Which half of the row takes the 4 and which keeps the 8 is a choice at wider m
+rather than something the board has said. The probe sweeps m to 32 and its per
+m row count is what would catch it.
+
+`CHARSIU_ACC_A=roleswap`, and `board_w4_axis.sh` runs it as the third arm
+against the height control and the default width. 2048 of 2048 on both rows is
+the read order solved.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not
