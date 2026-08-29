@@ -663,6 +663,59 @@ m row count is what would catch it.
 against the height control and the default width. 2048 of 2048 on both rows is
 the read order solved.
 
+## 🏁🏁🏁 THE PROMPT IS 3.04x AND THE TEXT IS THE SAME. 2026-08-29
+
+`prefill_control.sh`, Llama-3.2-1B int4, run twice against the token loop:
+
+```
+  batched1   65 tok in 1358 ms   47.88 tok/s
+  control    65 tok in 4132 ms   15.73 tok/s
+  batched2   65 tok in 1359 ms   47.83 tok/s
+  decode     16.07 / 15.95 / 15.97 tok/s      unchanged
+  text       IDENTICAL to the control
+```
+
+3.04x on the prompt, reproduced to within a millisecond, and the text is the
+control's. **That is a batched w4a16 prefill, which five rounds said was not
+available on this silicon.**
+
+### The vendor's own table, and how far the gap moved
+
+```
+                    before      now     theirs      gap
+  Qwen3 0.6B TTFT     7354      2055     469       15.7x -> 4.4x
+  Phi3 3.8B          23354      7174    1829       12.8x -> 3.9x
+  TinyLLAMA           ~7000     3441     544
+  Gemma4 E2B         ~17600    18038    1219       unmoved, and it says why
+```
+
+⚠ Ours is the prompt's forward passes and theirs is time to the first token,
+which includes that token's own step -- one token in our favour -- and their
+numbers are at maximum CPU and NPU frequency while this ran on `ondemand`. The
+script prints both caveats itself.
+
+### Gemma4 did not move, and the log named the reason
+
+`prompt a token at a time -- this model is not batched: a value norm`.
+
+The value norm is `qk_norm` with a NULL gain, per row, in the same position the
+token loop puts it -- **the same call the batched loop already makes twice**,
+for q and for k. Refusing a model for a call the loop already makes was a
+statement about the loop and not about the model, exactly like the four lifted
+on 2026-08-28. It is in the batched loop now.
+
+⚠ **THAT ALONE WILL NOT BATCH GEMMA4.** Its last layers carry no `wk` and
+attend against an earlier layer's cache, so the next reason is waiting behind
+this one. `llama_batch_why_not` returns **every** reason now rather than the
+first: returning the first costs a board round for each one fixed, and one line
+should say the whole distance.
+
+⚠ **AND prefill_control.sh's OWN INVARIANT HAD INVERTED.** It said "int4
+refusals in the matmul: batched must be >0" -- true while int4 refused every
+batch, where a refusal proved the batched path had reached the int4 matmul.
+int4 batches now, so zero is what a correct run looks like and the old sentence
+would have condemned this one. It counts the m = 8 fallback and says so.
+
 ## 🏁🏁 EVERY WIDTH A PROMPT USES, EXACT. int4 batching is on by default
 
 ```

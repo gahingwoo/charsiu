@@ -156,15 +156,26 @@ for t in batched1 control batched2; do
 	printf '%-9s decode %s\n' "$t" "$(gen_of "$t")"
 done
 echo
-# ⚠ THE REFUSAL IS THE OTHER HALF OF THE PROOF. It is printed by
-# charsiu_npu_matmul, which only the batched path calls: on an int4 model the
-# batched runs must show it and the control must show none. A batched run that
-# does NOT refuse took the batched matmul on int4, which is the shipped
-# wrong-answer bug coming back.
-echo "int4 refusals in the matmul (batched must be >0, control must be 0)"
+# ⚠⚠ THIS CHECK'S EXPECTATION INVERTED ON 2026-08-29 AND THE OLD ONE WOULD
+# HAVE READ AS A FAILURE.
+#
+# It used to say "batched must be >0, control must be 0", and it was right
+# while int4 refused every batch: a refusal printed by charsiu_npu_matmul was
+# proof the batched path had reached the int4 matmul at all, and a batched run
+# WITHOUT one meant the shipped wrong-answer bug was back.
+#
+# int4 batches now, exact at m = 2, 4, 16, 32, 48, 64 and 80, so zero refusals
+# is what a correct run looks like and the old sentence would have condemned
+# it. What survives is the m = 8 refusal, which is real and which a prompt only
+# meets if a chunk lands on that width.
+#
+# The proof of the batched path is the PATH column and the rate above it, and
+# the proof of correctness is the text comparison below. This line is now the
+# m = 8 fallback counter and says so.
+echo "int4 batch refusals (m=8 falls back; every other width batches)"
 for t in batched1 control batched2; do
 	printf '%-9s %s\n' "$t" \
-		"$(grep -c 'int4 computes one row' "$D/$t.log" || true)"
+		"$(grep -c 'int4 at m=8' "$D/$t.log" || true)"
 done
 echo
 text_of batched1 >"$D/a.txt"; text_of control >"$D/b.txt"

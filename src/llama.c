@@ -3014,23 +3014,47 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  */
 const char *llama_batch_why_not(const struct llama_model *m)
 {
-	if (m->v_norm)
-		return "a value norm";
-	if (m->n_embd_pl)
-		return "per layer embeddings";
-	if (kv_posmajor())
-		return "a position major KV cache";
+	/*
+	 * ⚠⚠ EVERY REASON, NOT THE FIRST ONE. Returning the first costs a
+	 * board round each time it is fixed: gemma4 came back "a value norm",
+	 * and the round after that would have said "KV shared between layers",
+	 * and the one after that something else again. One line should say the
+	 * whole distance to a batched prompt.
+	 */
+	static char buf[256];
+	size_t n = 0;
+	int fused = 0, shared = 0, ffvar = 0;
+
+	buf[0] = 0;
+#define WHY(cond, txt) do {                                                 \
+		if (cond) {                                                 \
+			int w_ = snprintf(buf + n, sizeof(buf) - n, "%s%s",  \
+					  n ? ", " : "", txt);              \
+			if (w_ > 0 && (size_t)w_ < sizeof(buf) - n)         \
+				n += (size_t)w_;                            \
+		}                                                           \
+	} while (0)
+
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 
 		if (!L->wk || !L->wv)
-			return "fused or absent K and V projections";
+			fused = 1;
 		if (L->kv_from >= 0)
-			return "KV shared between layers";
+			shared = 1;
 		if (L->n_ff != m->layers[0].n_ff)
-			return "a feed forward width that varies by layer";
+			ffvar = 1;
 	}
+	WHY(m->n_embd_pl, "per layer embeddings");
+	WHY(kv_posmajor(), "a position major KV cache");
+	WHY(fused, "fused or absent K and V projections");
+	WHY(shared, "KV shared between layers");
+	WHY(ffvar, "a feed forward width that varies by layer");
+#undef WHY
+	if (n)
+		return buf;
 	/*
+	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
 	 * board; charsiu took 7354, because a query norm sent the whole prompt
@@ -3283,6 +3307,18 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 					qk_norm(s->k, m->n_head_kv, hd,
 						L->k_norm, m->rms_eps);
 			}
+			/*
+			 * ⚠ THE VALUE NORM IS THE SAME CALL, and refusing a
+			 * model for it was right only while this line did not
+			 * exist. gemma4 norms V with no gain -- llama.cpp
+			 * writes it as a bare rms_norm, so there is no weight
+			 * to find and the only place it exists is the graph --
+			 * and it is qk_norm with a NULL gain, per row, in the
+			 * same position the token loop puts it.
+			 */
+			if (m->v_norm && L->wk)
+				qk_norm(s->v, m->n_head_kv, hd, NULL,
+					m->rms_eps);
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
 			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
 			/* ⚠ the cache is strided by hdmax, written at hd */
