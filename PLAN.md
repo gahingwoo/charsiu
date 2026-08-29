@@ -675,6 +675,54 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+## prep IS THE OUTPUT ALLOCATION, COUNTED
+
+```
+   m     prep    (alloc   times)
+  16       73    (alloc  72   x113)
+  32      134    (alloc 132   x113)
+  80      324    (alloc 321   x113)
+```
+
+**The allocation is 99% of prep and it happens once per tensor at every new
+width.** So it is real but one-off: a prefill chunks at one fixed 32, so the
+first chunk pays 113 allocations and the rest pay none, and `e->bout_m`
+persists, so a second prompt in the same process pays nothing at all. A 110
+token prompt is four chunks, which puts prep at about 33 ms amortised rather
+than 134.
+
+Which leaves, per batched matmul at m = 32 in a real prefill:
+
+```
+   read    223 ms   51%
+   pack    135      31%
+   fence    39       9%
+   prep     33       8%   one-off
+```
+
+**The gather is half of it.**
+
+## THE GATHER IS ONE VECTOR PER RUN
+
+The read order is four consecutive slots, so a run is `vld1q` from one index,
+`vmulq`, `vst1q` -- and the barrier keeps it a multiply THEN an add.
+
+⚠ **THAT ROUNDING WAS MEASURED, NOT ASSUMED.** The scalar it replaces is
+`yp[0] += fp[0] * cp[0]`, which a compiler is permitted to contract into an
+fmla that rounds once where the source rounds twice -- and this tree has a
+comment about exactly that costing 460190 of 20.5 million accumulations
+elsewhere. On this toolchain, over a million accumulations: mul-then-add
+differs from the C in **0**, fmla differs in **227529**. The C is not
+contracted, so the vector form is bit identical to what the board validated.
+
+Checked the same way: the two forms side by side on the same buffers, all three
+variants and both the assign and the accumulate path, **6 cases and 0
+mismatched**. Both builds compile -- the scalar fallback is still there behind
+`CHARSIU_NO_NEON`.
+
+⚠ Not on the board. What it should move is `read`, which is half of a batched
+matmul at the width a prompt uses.
+
 ## ⚠ prep WAS NOT THE MEMSET, AND THE BOARD SAID SO IMMEDIATELY
 
 The zero of Y is gone -- assign on first write, correctness held at every width
