@@ -83,14 +83,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 # that places that half. Of the whole family only a*4 and the two halves
 # SWAPPED are permutations at all, so this is a two horse race and one of them
 # is the control.
-for AXIS in h wrole wrole2; do
+for AXIS in h w; do
 	case $AXIS in
 	h) label="height -- the control, and it must still disagree"
 	   AX=h; ACC= ;;
-	wrole) label="width, roleswap -- EXACT at m=2, two rows a tensor above it"
-	   AX=w; ACC=roleswap ;;
-	wrole2) label="width, roleswap2 -- the row's other split"
-	   AX=w; ACC=roleswap2 ;;
+	w) label="width -- the DEFAULT read order now picks roleswap2 for w4a16"
+	   AX=w; ACC= ;;
 	esac
 	echo "===== M axis: $AXIS -- $label ====="
 	out="$OUTDIR/w4-axis-$AXIS.txt"
@@ -149,21 +147,21 @@ echo "  the line that decides it is 'rowN in place: X of 2048 channels agree'."
 echo "  1024 of 2048 is ONE QUADRANT of (row, half) and nothing else. 2048 of"
 echo "  2048 on BOTH rows is the read order solved."
 echo
-echo "  roleswap already did that at m = 2: 2048 of 2048 on BOTH rows and"
-echo "  226 of 226 tensors, worst relative 5.1e-05. That is the first correct"
-echo "  batched w4a16 on this board, after five rounds calling it one row."
+echo "  roleswap2 is the read order and it is the DEFAULT now: charsiu_acc_index"
+echo "  takes the format, and w4a16 on the width axis is the one case that"
+echo "  reads differently. int8 keeps a*4 on both axes, which is what its own"
+echo "  raw surface map said. No environment variable is needed for either."
 echo
-echo "  Above m = 2 it holds exactly 226 rows -- 113 tensors times TWO -- at"
-echo "  m = 4, 16 and 32 alike. Once a takes the 32P block the row has two"
-echo "  slots left, one of stride 8 with P values and one of stride 4 with 2,"
-echo "  and at m = 2 the first is a singleton so the two readings are the SAME"
-echo "  FUNCTION. roleswap2 is the other reading, and it predicts exactly that"
-echo "  226: the rows the two share are 0 and m-1 and nothing else."
+echo "  Last round, with the switch set by hand: 226 of 226 at m=2, 452 of 452"
+echo "  at m=4, 1808 of 1808 at m=16 and 3616 of 3616 at m=32, worst relative"
+echo "  5.1e-05 at every one. This round should reproduce that with nothing"
+echo "  set, and it reaches 48, 64 and 80 as well -- the widths a real prompt"
+echo "  actually hands it, which have never been asked."
 echo
-echo "  ⚠ m = 8 IS A SEPARATE FAULT. Its worst relative error is four to six"
-echo "  orders out in every arm of every round, where its neighbours sit at"
-echo "  1e3, and its 194 of 904 is not what either reading predicts. Nothing"
-echo "  here explains it."
+echo "  ⚠ m = 8 IS THE ONE THAT BENDS: 871 of 904, worst 3.1e+04, where every"
+echo "  other width is exact. It has been four to six orders out in every arm"
+echo "  of every round. Nothing here explains it and the refusal stays until"
+echo "  something does."
 echo
-echo "  full logs: $OUTDIR/w4-axis-{h,wrole,wrole2}.txt"
+echo "  full logs: $OUTDIR/w4-axis-{h,w}.txt"
 echo "======================================================================"

@@ -827,7 +827,7 @@ static int nwide_sweep(struct charsiu_device *dev, unsigned k)
 				if (got[i] == want[q]) { live++; break; }
 		for (unsigned mi = 0; mi < 2; mi++)
 			for (unsigned ni = 0; ni < n; ni++) {
-				size_t at = charsiu_acc_index(mi, ni, 2);
+				size_t at = charsiu_acc_index(mi, ni, 2, 0);
 
 				if (at < total &&
 				    got[at] == want[(size_t)mi * n + ni])
@@ -928,7 +928,7 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 
 			for (unsigned mi = 0; mi < m; mi++)
 				for (unsigned ni = 0; ni < n; ni++) {
-					size_t at = charsiu_acc_index(mi, ni, m);
+					size_t at = charsiu_acc_index(mi, ni, m, 0);
 
 					if (at < total &&
 					    got[at] == want[(size_t)mi * n + ni])

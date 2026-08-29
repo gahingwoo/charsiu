@@ -2028,6 +2028,9 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		g->bfence_us += now_us() - tf;
 		tf = now_us();
 		{
+			/* ⚠ THE KEY IS m ALONE and that is still right: the
+			 * format and the axis are fixed for the life of a
+			 * pool, so only the width can change under it. */
 			if (g->bmap_m != m) {
 				uint32_t *t2 = realloc(g->bmap,
 					(size_t)m * g->nmax * sizeof(*t2));
@@ -2041,7 +2044,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				for (unsigned r = 0; r < m; r++)
 					for (unsigned j = 0; j < g->nmax; j++)
 						g->bmap[(size_t)r * g->nmax + j] =
-						  (uint32_t)charsiu_acc_index(r, j, m);
+						  (uint32_t)charsiu_acc_index(r, j, m,
+							g->w4 && charsiu_m_axis_wide());
 				g->bmap_m = m;
 			}
 			/*

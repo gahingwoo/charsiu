@@ -663,6 +663,59 @@ m row count is what would catch it.
 against the height control and the default width. 2048 of 2048 on both rows is
 the read order solved.
 
+## 🏁 THE READ ORDER IS SOLVED. w4a16 batches exactly, 2 to 32
+
+`roleswap2`, on the board:
+
+```
+   m    worst rel    rows that agree
+   2    5.10e-05      226 of 226      every tensor, every row
+   4    5.10e-05      452 of 452
+   8    3.08e+04      871 of 904      <- the one width that bends
+  16    5.10e-05     1808 of 1808
+  32    5.10e-05     3616 of 3616
+```
+
+Four widths exact to 5.1e-05, which is float summation order and nothing else.
+The prediction that named it -- that roleswap is right only on rows 0 and m-1
+if roleswap2 is the truth, giving 226 everywhere -- held at every width it was
+made for.
+
+### And the read order depends on the FORMAT, not only the axis
+
+Both halves of that came off the board:
+
+```
+  int8,  height axis   a * 4       exact to m = 80, the tower sweep
+  int8,  width axis    a * 4       its RAW surface is identical to the
+                                   height one, mapped cell for cell
+  w4a16, width axis    roleswap2   2048 of 2048 on every row
+  w4a16, height axis   neither     row 1 is not written at all
+```
+
+So `charsiu_acc_index` takes the format now and w4a16-on-the-width is the one
+case that reads differently. Every other caller gets exactly the expression it
+had, checked on the desktop at m = 2, 4, 8 and 32. `CHARSIU_ACC_A` still
+overrides, which is how the two readings were told apart.
+
+The whole chain, and not one link of it shows at m = 1 -- which is why decode
+ran for hundreds of rounds without meeting any of it:
+
+1. M on the **width** axis, not the height
+2. **0x40b8 = 3 * M**, so the surface is not short
+3. **`a` and the row trade places**, and the row splits as `mi/2`, `mi%2`
+
+⚠ **m = 8 IS THE ONE THAT BENDS AND NOTHING HERE EXPLAINS IT.** 871 of 904,
+worst 3.1e+04, where 4 and 16 either side of it are exact. It has been four to
+six orders out in every arm of every round since this began. The refusal stays
+until something explains it.
+
+⚠ **AND 48, 64 AND 80 HAVE NEVER BEEN ASKED.** The probe swept 2 to 32 and a
+real prompt hands it chunks up to `CHARSIU_NPU_ROWS_MAX`, which defaults to 64.
+Its widths are 2, 4, 8, 16, 32, 48, 64, 80 now. Flipping the default before
+those are measured would be shipping three untested widths on the strength of
+five tested ones.
+
 ## 🏁 w4a16 BATCHES. m = 2 is exact, and it was the read order all along
 
 ```

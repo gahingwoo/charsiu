@@ -353,7 +353,22 @@ static unsigned acc_a_coeff(int *swap)
 	return A;
 }
 
-size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
+/*
+ * ⚠⚠ THE READ ORDER DEPENDS ON THE FORMAT, NOT ONLY THE AXIS, and the board
+ * said both halves of that.
+ *
+ *   int8, height axis   a * 4        exact to m = 80, the tower sweep
+ *   int8, width axis    a * 4        its RAW surface is identical to the
+ *                                    height one, mapped cell for cell
+ *   w4a16, width axis   roleswap2    2048 of 2048 on every row at m = 2, 4,
+ *                                    16 and 32, worst relative 5.1e-05
+ *   w4a16, height axis  neither      row 1 is not written at all
+ *
+ * So `w4wide` is the one case that reads differently, and every other caller
+ * gets exactly the expression it had. CHARSIU_ACC_A still overrides, which is
+ * how the two readings were told apart in the first place.
+ */
+size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
 {
 	unsigned P, G, c, a, t, j, A;
 	int swap;
@@ -361,6 +376,8 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
 	if (m < 2)
 		return ni;                      /* flat, and measured so */
 	A = acc_a_coeff(&swap);
+	if (!swap && w4wide)
+		swap = 3;                       /* roleswap2, the solved one */
 	P = m / 2;
 	G = ni / 32u;
 	c = ni % 32u;
@@ -814,6 +831,13 @@ static int charsiu_m_axis_w(void)
 	const char *e = getenv("CHARSIU_M_AXIS");
 
 	return e && (*e == 'w' || *e == 'W');
+}
+
+/* the same question from outside job.c: the read order has to agree with the
+ * stream about which axis carries M, and npudev builds that table */
+int charsiu_m_axis_wide(void)
+{
+	return charsiu_m_axis_w();
 }
 
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max)

@@ -557,7 +557,14 @@ static double now_ms(void)
 int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		      unsigned mmax)
 {
-	static const unsigned MS[] = { 2, 4, 8, 16, 32 };
+	/*
+	 * ⚠ THE WIDTHS THE PREFILL WILL ACTUALLY USE, not just the ones the
+	 * read order was solved on. roleswap2 is exact at 2, 4, 16 and 32 and
+	 * m = 8 is 871 of 904, so the question is now where else it bends --
+	 * and a chunk of 48, 64 or 80 is what a real prompt hands it.
+	 * --batch-probe N still caps this.
+	 */
+	static const unsigned MS[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
 	float *X = NULL, *Y = NULL, *Yref = NULL;
 	struct charsiu_act a;
 	unsigned widest = 0;
