@@ -358,6 +358,55 @@ itself rather than a candidate for it -- it is what solved the height axis --
 at m = 2 and m = 4, both axes, K = 64 N = 64 where the reference has 112
 distinct values in 128. The height arm is solved and must come back EXACT.
 
+### The map: the width axis writes a SHORT surface, not a shuffled one
+
+`board_acc_map.sh`, 2026-08-29, straight after the round above.
+
+**The control is exact.** The height arm is the solved one and it came back
+128 of 128 words at m = 2 and 256 of 256 at m = 4, **0 values absent**, the map
+reproducing `charsiu_acc_index` position for position. So the shape, the build
+and the tool are all where they were when that expression was fitted.
+
+**The width arm is not a permutation.**
+
+```
+             words written      reference values absent
+  height     128 of 128 (m=2)   0 of 128
+             256 of 256 (m=4)   0 of 256
+  width       92 of 128 (m=2)   31 of 128
+             148 of 256 (m=4)   87 of 256
+```
+
+npu_gemm_test's verdict on the width arm is the opposite of the one it prints
+on the height arm: *"31 values were never computed, so no read order recovers
+them."*
+
+⚠⚠ **AND THE LINE ABOVE IS A CORRECTION.** The round before this recorded "the
+arithmetic is right and only the read order is wrong". That sentence is the
+tool's, printed on the HEIGHT arm, and it was carried across to the width one on
+the strength of row 1 coming back. Row 1 does come back -- that part stands and
+it is still the first movement in five rounds -- but a third of the surface is
+never written, and no permutation recovers a word that was not produced.
+
+**The shortfall is regular, which is the useful part.** Inside every (row, 32
+channel super group) the width axis writes the FIRST FIVE four word runs --
+channels 0-3, 16-19, 4-7, 20-23, 8-11, in the same interleave the height axis
+uses -- then moves to the next group, dropping 24-27, 12-15 and 28-31 every
+time. Five runs of eight, at every group, at both m. Words written come to
+**36 + 28m** against the height axis's **64m**.
+
+A fixed fraction of every group is a size or a stride, not an address and not a
+read order. `tests/board_width_short.sh` sweeps the candidates one field at a
+time through `CHARSIU_OVERRIDE` -- 0x1090, 0x1094, 0x1098, 0x401c, 0x4028,
+0x40b8 and RDMA 0x5010, which are ours at 8, 2, 4, 2, 0, 2 and 1 on this axis
+at m = 2 -- and scores each by the number that cannot be argued with: how many
+words the board wrote. The baseline runs first and must reproduce 92 of 128 or
+the sweep refuses to print a table.
+
+⚠ Mesa's generic encoder computes the first three from `inw` and `full_inh`,
+which on this axis are M and 1 rather than 1 and M. The swap is what is under
+suspicion, and the sweep is how it stops being a suspicion.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not
