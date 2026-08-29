@@ -575,6 +575,51 @@ went, but it says exactly where a row stops being right -- which is the question
 row 0 has been raising for three rounds by being exact in its first six channels
 and agreeing on no row at all.
 
+### Exactly half, and the first miss is channel 16
+
+The in place scan, which is the instrument the fuzzy one should always have
+been:
+
+```
+  height   row0  1025 of 2048 agree, first wrong at channel 16
+           row1     4 of 2048
+  width    row0  1024 of 2048 agree, first wrong at channel 16
+           row1  1025 of 2048, first wrong at channel 0
+```
+
+**Two things at once.**
+
+The axis, quantified at last: on the width axis **row 1 is as good as row 0**,
+1025 against 4. That is what "the width axis batches" means in a number, and
+the height arm in the same run is the control that makes it one.
+
+And both arms agree on **exactly half** their channels with the first miss at
+**16**. In `charsiu_acc_index` the channel splits as `a = (c % 32) / 16` and
+`t = c % 16`; a = 0 is exactly half the channels and 16 is the first of the
+other half. So the int8 expression is right about w4a16 everywhere except
+**where the second sixteen channel half goes**, and `a * 4` is the only term
+that places it.
+
+⚠ The landing table sampled every 64 channels, so every one of its 32 samples
+had a = 0 and nearly all were correct. It was looking only at the good half.
+It walks 0 to 63 in full now -- the structure repeats every 32, so one pair of
+super groups holds all of it -- with a coarse tail after.
+
+**The family has two members.** Of `a * A` and the two halves swapped, only
+A = 4 and the swap are permutations at all: 128 of 128 distinct slots against
+68, 80, 96 and 64 for A of 8, 1, 2 and 0. A = 4 is the control, so this is a
+two horse race. `CHARSIU_ACC_A` picks, `board_w4_axis.sh` runs both plus the
+height control, and the deciding line is the in place count -- 1024 is the
+a = 0 half and nothing else, 2048 is the read order solved.
+
+⚠⚠ **AN OFFLINE SWEEP OF THIS WAS WRITTEN AND DELETED.** It reconstructed the
+raw buffer from Y and scored candidates with no board round at all. Y is not
+raw: the batched read is `yr[j] += fo[mp[j]] * sc[j]` and **sc is per output
+channel**, so a value scored at a different channel carries the wrong scale and
+the table is off by a ratio wherever a candidate crosses a group boundary.
+Nearly sound is the kind of instrument this fortnight has already been burned
+by twice.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not

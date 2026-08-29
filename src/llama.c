@@ -1179,10 +1179,40 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						printf(", first wrong at channel %ld\n",
 						       first);
 				}
+				/*
+				 * ⚠ AN OFFLINE SWEEP OF THE READ ORDER WAS
+				 * WRITTEN HERE AND REMOVED, and the reason is
+				 * worth keeping.
+				 *
+				 * It reconstructed the raw buffer from Y and
+				 * scored candidate index functions against it
+				 * without a board round. Y is not raw: the
+				 * batched read is `yr[j] += fo[mp[j]] * sc[j]`
+				 * and sc is PER OUTPUT CHANNEL, so a value
+				 * scored at a different channel carries the
+				 * wrong scale and the whole table is off by a
+				 * ratio wherever a candidate crosses a group
+				 * boundary. Nearly sound is exactly the kind of
+				 * instrument this tree has been burned by.
+				 *
+				 * The family is two members anyway. Of a * A
+				 * and the two halves swapped, only A = 4 and
+				 * the swap are permutations at all -- 128 of
+				 * 128 distinct slots against 68, 80, 96 and 64
+				 * for A of 8, 1, 2 and 0 -- and A = 4 is the
+				 * control. So CHARSIU_ACC_A picks between them
+				 * and the board scores both exactly, through
+				 * the real read path with the real scales.
+				 */
 				{
 					size_t uniq = 0, q, o;
+					/* ⚠ NOT A MULTIPLE OF 32, or every sampled
+					 * channel has a = 0 and the half that is
+					 * wrong is never looked at. The last round
+					 * stepped by 64 and every one of its 32
+					 * samples was in the good half. */
 					unsigned step = t->n >= 128
-						      ? (unsigned)t->n / 32 : 4;
+						      ? (unsigned)t->n / 32 + 4 : 4;
 
 					for (q = 0; q < tot; q++) {
 						double w = Yref[q];
@@ -1202,10 +1232,24 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					printf("    %-10s %-12s %-12s %-6s %s\n",
 					       "(row,ch)", "want", "landed at",
 					       "hits", "correct is (row,ch) itself");
+					/*
+					 * ⚠ THE FIRST 64 CHANNELS IN FULL, then
+					 * a coarse tail. The structure repeats
+					 * every 32 -- a is (c%32)/16 and t is
+					 * c%16 -- so one pair of super groups
+					 * holds all of it, and the half that is
+					 * WRONG is in there. A coarse sweep
+					 * alone cannot solve a layout; that is
+					 * how the last round sampled 32 channels
+					 * and every one of them was in the good
+					 * half.
+					 */
 					for (unsigned r = 0; r < mr && r < 2; r++) {
 						unsigned st = r ? step * 4 : step;
+						unsigned c;
 
-						for (unsigned c = 0; c < (unsigned)t->n; c += st) {
+						for (c = 0; c < (unsigned)t->n;
+						     c = c < 64 ? c + 1 : c + st) {
 							double w = Yref[(size_t)r * t->n + c];
 							double lim = fabs(w) > 1e-3
 								   ? fabs(w) * 1e-3 : 1e-3;

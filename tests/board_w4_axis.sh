@@ -76,10 +76,21 @@ W4_ENV="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
-for AXIS in h w; do
+# ⚠ AND THE READ ORDER'S SECOND HALF, which the in place scan pointed at.
+# Row 0 agrees on EXACTLY half its channels and the first it misses is 16;
+# charsiu_acc_index splits the channel as a = (c%32)/16, so a = 0 is exactly
+# half of them and 16 is the first of the other half. `a * 4` is the only term
+# that places that half. Of the whole family only a*4 and the two halves
+# SWAPPED are permutations at all, so this is a two horse race and one of them
+# is the control.
+for AXIS in h w wswap; do
 	case $AXIS in
-	h) label="height -- the axis five rounds proved writes ONE row" ;;
-	w) label="width  -- the axis the vendor's own streams use" ;;
+	h) label="height -- the axis five rounds proved writes ONE row"
+	   AX=h; ACC= ;;
+	w) label="width  -- the axis the vendor's own streams use"
+	   AX=w; ACC= ;;
+	wswap) label="width, halves SWAPPED -- CHARSIU_ACC_A=swap"
+	   AX=w; ACC=swap ;;
 	esac
 	echo "===== M axis: $AXIS -- $label ====="
 	out="$OUTDIR/w4-axis-$AXIS.txt"
@@ -88,9 +99,10 @@ for AXIS in h w; do
 	# so the arm that had to fail failed in software and said nothing about
 	# the silicon. "height" is the value that lets the wrong axis through
 	# on purpose.
-	case $AXIS in h) GATE=height ;; *) GATE=1 ;; esac
+	case $AX in h) GATE=height ;; *) GATE=1 ;; esac
 	# shellcheck disable=SC2086
-	env $W4_ENV CHARSIU_M_AXIS="$AXIS" CHARSIU_NPU_W4_BATCH="$GATE" \
+	env $W4_ENV CHARSIU_M_AXIS="$AX" CHARSIU_NPU_W4_BATCH="$GATE" \
+	    ${ACC:+CHARSIU_ACC_A="$ACC"} \
 	    "$RUN" "$MODEL" --batch-probe 32 >"$out" 2>&1
 	rc=$?
 	if [ $rc -ne 0 ]; then
@@ -133,5 +145,11 @@ echo "CHARSIU_DPU_40B8: the vendor writes 3*M on its int4 projections and 7*M"
 echo "on its int8 head, and this tree writes M for both. job.c already takes"
 echo "the override, so it costs one more pass and no rebuild."
 echo
-echo "  full logs: $OUTDIR/w4-axis-h.txt and $OUTDIR/w4-axis-w.txt"
+echo "  the line that decides it is 'rowN in place: X of 2048 channels agree'."
+echo "  1024 of 2048 is the a = 0 half and nothing else; 2048 of 2048 is the"
+echo "  read order solved. If the swap arm is also half, the second half does"
+echo "  not go where either candidate puts it and the 0..63 landing table"
+echo "  below each arm is what says where it does go."
+echo
+echo "  full logs: $OUTDIR/w4-axis-{h,w,wswap}.txt"
 echo "======================================================================"

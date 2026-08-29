@@ -312,18 +312,59 @@ int charsiu_diag(void)
 	return diag_on;
 }
 
+/*
+ * ⚠ THE a TERM IS SWEEPABLE, because the board says w4a16 needs a different
+ * one and nothing says what.
+ *
+ * The in place scan on the real path: row 0 agrees on EXACTLY HALF its
+ * channels and the first it misses is 16. a is (c % 32) / 16, so a = 0 is
+ * exactly half the channels and 16 is the first of the other half. The int8
+ * expression is right about w4a16 except for where the second sixteen channel
+ * half goes, and `a * 4` is the only term that places it.
+ *
+ * CHARSIU_ACC_A takes a coefficient, or "swap" for the two halves exchanged.
+ * A variant that is not a permutation will collide and score badly, which is
+ * the honest outcome rather than a guard here.
+ *
+ * ⚠ READ ONCE PER PROCESS AND CACHED, which is safe only because the sweep
+ * runs one variant per process. Sweeping it inside one process would need this
+ * cleared and g->bmap_m invalidated -- the read order reaches the hardware path
+ * through a TABLE built once per m, not through this function.
+ */
+static unsigned acc_a_coeff(int *swap)
+{
+	static int done, sw;
+	static unsigned A = 4;
+
+	if (!done) {
+		const char *e = getenv("CHARSIU_ACC_A");
+
+		done = 1;
+		if (e && !strcmp(e, "swap"))
+			sw = 1;
+		else if (e)
+			A = (unsigned)strtoul(e, NULL, 0);
+	}
+	*swap = sw;
+	return A;
+}
+
 size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
 {
-	unsigned P, G, c, a, t, j;
+	unsigned P, G, c, a, t, j, A;
+	int swap;
 
 	if (m < 2)
 		return ni;                      /* flat, and measured so */
+	A = acc_a_coeff(&swap);
 	P = m / 2;
 	G = ni / 32u;
 	c = ni % 32u;
 	a = c / 16u;
 	t = c % 16u;
-	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * 4u + (t % 4u);
+	if (swap)
+		a = 1u - a;
+	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * A + (t % 4u);
 	return (size_t)G * m * 32u + (size_t)(mi / P) * (32u * P) + j;
 }
 
