@@ -191,7 +191,7 @@ unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
  */
 size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m,
 			 int w4wide);
-int charsiu_m_axis_wide(void);
+int charsiu_m_axis_wide_for(int w4);
 
 /*
  * ⚠ A CONVERSATION SHOWS THE CONVERSATION, AND NOTHING ELSE.

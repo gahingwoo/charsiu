@@ -101,9 +101,12 @@ for AXIS in h w; do
 	# so the arm that had to fail failed in software and said nothing about
 	# the silicon. "height" is the value that lets the wrong axis through
 	# on purpose.
-	case $AX in h) GATE=height ;; *) GATE=1 ;; esac
+	# ⚠ int4 batching is ON BY DEFAULT now, so only the control needs a
+	# switch: "height" is what lets the arm that must fail reach the
+	# hardware at all.
+	case $AX in h) GATE=height ;; *) GATE= ;; esac
 	# shellcheck disable=SC2086
-	env $W4_ENV CHARSIU_M_AXIS="$AX" CHARSIU_NPU_W4_BATCH="$GATE" \
+	env $W4_ENV CHARSIU_M_AXIS="$AX" ${GATE:+CHARSIU_NPU_W4_BATCH="$GATE"} \
 	    ${ACC:+CHARSIU_ACC_A="$ACC"} \
 	    "$RUN" "$MODEL" --batch-probe "$MMAX" >"$out" 2>&1
 	rc=$?

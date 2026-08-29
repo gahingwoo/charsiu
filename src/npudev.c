@@ -1691,16 +1691,35 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * CHARSIU_NPU_W4_BATCH=height is "yes, on the axis that is known wrong, I am
  * running the arm that must fail". Nothing else should ever set it.
  */
-static int w4_batch_gate(void)
+static const char *w4_batch_why_not(unsigned m)
 {
 	const char *b = getenv("CHARSIU_NPU_W4_BATCH");
-	const char *a = getenv("CHARSIU_M_AXIS");
 
-	if (!b || *b == '0')
-		return 0;
-	if (!strcmp(b, "height"))
-		return 1;
-	return a && (*a == 'w' || *a == 'W');
+	/* "height" is the board control deliberately reaching the arrangement
+	 * that is known wrong; nothing else should ever set it */
+	if (b && !strcmp(b, "height"))
+		return NULL;
+	if (b && *b == '0')
+		return "int4 batching is switched off";
+	if (!charsiu_m_axis_wide_for(1))
+		return "int4 batches on the width axis and this asked for height";
+	/*
+	 * ⚠⚠ m = 8 IS THE ONE WIDTH THAT IS STILL WRONG, and the board named
+	 * it rather than leaving it as a count.
+	 *
+	 * Every other width the probe reaches is exact -- 2, 4, 16, 32, 48, 64
+	 * and 80, worst relative 5.10e-05 across 113 tensors. m = 8 returns
+	 * 871 rows of 904, and the 33 that miss are not scattered: they are
+	 * ROW 0 of the n = 8192 tensors, every ffn_gate and ffn_up in the
+	 * model, at that width and no other.
+	 *
+	 * One shape and one row is a small enough target to find. Until it is
+	 * found this refuses the width, and the caller falls back to a row at
+	 * a time for that chunk, which is correct and merely slower.
+	 */
+	if (m == 8)
+		return "int4 at m=8 misses row 0 of the n=8192 tensors";
+	return NULL;
 }
 
 static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
@@ -1847,10 +1866,14 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * on this board -- so it is an experiment with a switch, not a default.
 	 * llama_batch_probe checks every row before it times anything.
 	 */
-	if (g->w4 && !w4_batch_gate()) {
-		whine(g, "int4 computes one row: batching is int8 only",
-		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
-		return -1;
+	if (g->w4) {
+		const char *why = w4_batch_why_not(m);
+
+		if (why) {
+			whine(g, why, (unsigned)g->ent[id].t->k,
+			      (unsigned)g->ent[id].t->n);
+			return -1;
+		}
 	}
 	e = &g->ent[id];
 	if (e->n_npu != (unsigned)e->t->n) {
@@ -2045,7 +2068,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					for (unsigned j = 0; j < g->nmax; j++)
 						g->bmap[(size_t)r * g->nmax + j] =
 						  (uint32_t)charsiu_acc_index(r, j, m,
-							g->w4 && charsiu_m_axis_wide());
+							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
 			}
 			/*

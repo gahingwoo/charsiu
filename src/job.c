@@ -825,19 +825,40 @@ static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
 	return got;
 }
 
-/* CHARSIU_M_AXIS=w puts the M rows on the width axis instead of the height. */
-static int charsiu_m_axis_w(void)
+/*
+ * WHICH AXIS CARRIES M, and it is three states rather than two now.
+ *
+ *   CHARSIU_M_AXIS=w   the width, whatever the format
+ *   CHARSIU_M_AXIS=h   the height, whatever the format -- which is how the
+ *                      control arm of a board round reaches the arrangement
+ *                      that is known wrong
+ *   unset              the format decides: w4a16 on the width, int8 on the
+ *                      height, because that is what each of them is right on
+ *
+ * The board, on 113 tensors of Llama-3.2-1B: w4a16 on the width is exact at
+ * m = 2, 4, 16, 32, 48, 64 and 80, worst relative 5.10e-05 at every one, and
+ * int8 on the height is exact to m = 80 in the tower sweep. Neither is right
+ * on the other's arrangement.
+ */
+static int charsiu_m_axis(void)
 {
 	const char *e = getenv("CHARSIU_M_AXIS");
 
-	return e && (*e == 'w' || *e == 'W');
+	if (e && (*e == 'h' || *e == 'H'))
+		return 0;
+	if (e && (*e == 'w' || *e == 'W'))
+		return 1;
+	return -1;                              /* unset: ask the format */
 }
 
-/* the same question from outside job.c: the read order has to agree with the
- * stream about which axis carries M, and npudev builds that table */
-int charsiu_m_axis_wide(void)
+/* the same question from outside job.c, for a given weight format: the read
+ * order has to agree with the stream about which axis carries M, and npudev
+ * builds that table */
+int charsiu_m_axis_wide_for(int w4)
 {
-	return charsiu_m_axis_w();
+	int a = charsiu_m_axis();
+
+	return a < 0 ? w4 : a;
 }
 
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max)
@@ -876,7 +897,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * cannot move: the default stays the height until a board round says
 	 * otherwise.
 	 */
-	unsigned wide = mm->m > 1 && charsiu_m_axis_w();
+	unsigned wide = mm->m > 1 &&
+			charsiu_m_axis_wide_for(mm->wdtype == CHARSIU_INT4);
 	unsigned inw = wide ? mm->m : 1;
 	unsigned irows = wide ? 1 : mm->m;
 	unsigned ow = inw;

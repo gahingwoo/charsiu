@@ -663,6 +663,55 @@ m row count is what would catch it.
 against the height control and the default width. 2048 of 2048 on both rows is
 the read order solved.
 
+## 🏁🏁 EVERY WIDTH A PROMPT USES, EXACT. int4 batching is on by default
+
+```
+  w4a16, width axis, nothing set
+     m   worst rel    rows that agree
+     2   5.10e-05      226 of 226
+     4   5.10e-05      452 of 452
+     8   9.77e+04      871 of 904      <- the only one
+    16   5.10e-05     1808 of 1808
+    32   5.10e-05     3616 of 3616
+    48   5.10e-05     5424 of 5424
+    64   5.10e-05     7232 of 7232
+    80   5.10e-05     9040 of 9040
+```
+
+113 tensors at every width, and 5.10e-05 is float summation order. The height
+control in the same run still agrees on nothing, so the probe is discriminating.
+
+### And m = 8 named itself
+
+```
+  MISS blk.0.ffn_gate.weight  k=2048 n=8192  row 0 of 8
+  MISS blk.0.ffn_up.weight    k=2048 n=8192  row 0 of 8
+  MISS blk.1.ffn_gate.weight  k=2048 n=8192  row 0 of 8
+  ... eight shown, all of them the same shape and the same row
+```
+
+**Row 0 of the n = 8192 tensors, at m = 8 and no other width.** Not scattered,
+not a row index across shapes: one shape and one row. 33 rows of 904 is every
+ffn_gate and ffn_up in the model, once each. That is a small enough target to
+find, and until it is found the batch refuses that one width and the caller
+falls back to a row at a time for that chunk -- correct, and merely slower.
+
+### What is now the default
+
+`CHARSIU_M_AXIS` is three states rather than two: `w`, `h`, or unset, and unset
+asks the format -- w4a16 on the width, int8 on the height, because that is what
+each is right on. `charsiu_acc_index` takes the format for the same reason. The
+int4 batch refusal is gone except at m = 8.
+
+Checked rather than asserted: **int8's stream is bit identical at 54 shapes**
+against the tree from before any of this session's work, and the host
+architecture sanity still passes.
+
+**Next is the number this whole line was for.** `board_vendor.sh` runs
+Rockchip's own protocol -- 128 token prompt, 64 new -- and its TTFT column is
+what a batched int4 prefill was supposed to move. `prefill_control.sh` is the
+correctness half: it compares the batched prompt's TEXT against the token loop.
+
 ### The default reproduces it with nothing set, and 48/64/80 still were not asked
 
 ```
