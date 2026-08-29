@@ -722,6 +722,15 @@ struct llama_state {
 	float *bq, *bk, *bv, *bao;
 	float *bfreq;          /* m->rope_freqs, read once a prompt */
 	/*
+	 * gemma4's per layer embeddings, batched: bpl is [n][n_layer][n_embd_pl]
+	 * and bplg is the gate, [n][n_embd_pl], reused a layer at a time.
+	 *
+	 * ⚠ ONE SET A ROW, NOT ONE A CHUNK. s->pl above is per TOKEN -- it is
+	 * looked up from the token id and projected from that token's own
+	 * embedding -- so a chunk of 32 rows needs 32 of them, not one.
+	 */
+	float *bpl, *bplg;
+	/*
 	 * ⚠ MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
 	 * read each weight row once for all m. It is four times SLOWER than n
 	 * calls to llama's own matvec and it changes the text, because matvec
