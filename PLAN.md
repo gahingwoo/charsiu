@@ -702,26 +702,45 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
-## THE GATHER IS ONE VECTOR PER RUN
+## THE NEON GATHER BOUGHT NOTHING, AND THE ARITHMETIC SAYS WHY
 
-The read order is four consecutive slots, so a run is `vld1q` from one index,
-`vmulq`, `vst1q` -- and the barrier keeps it a multiply THEN an add.
+```
+   m         2    16     32     48     64     80
+  read before 6   103    223    320    580    555
+  read after  6   101    229    337    562    580
+```
 
-⚠ **THAT ROUNDING WAS MEASURED, NOT ASSUMED.** The scalar it replaces is
-`yp[0] += fp[0] * cp[0]`, which a compiler is permitted to contract into an
-fmla that rounds once where the source rounds twice -- and this tree has a
-comment about exactly that costing 460190 of 20.5 million accumulations
-elsewhere. On this toolchain, over a million accumulations: mul-then-add
-differs from the C in **0**, fmla differs in **227529**. The C is not
-contracted, so the vector form is bit identical to what the board validated.
+**Nothing, and some rows worse.** Correctness held at every width, so the
+vector form was right; it just did not matter. It is out of the tree again --
+a change that measures nothing is complexity for free -- and what it taught
+stays in the comment.
 
-Checked the same way: the two forms side by side on the same buffers, all three
-variants and both the assign and the accumulate path, **6 cases and 0
-mismatched**. Both builds compile -- the scalar fallback is still there behind
-`CHARSIU_NO_NEON`.
+### Why: it was never instruction bound
 
-⚠ Not on the board. What it should move is `read`, which is half of a batched
-matmul at the width a prompt uses.
+The gather moves Y once per K slice, read and written: about 403 MB at m = 32
+and 1007 MB at m = 80, in 229 and 580 ms. **1.76 and 1.74 GB/s -- the same rate
+at both widths**, which is the signature of a bandwidth limit rather than a
+per-element cost.
+
+And a run is **16 bytes where a cache line is 64**, and the runs are scattered,
+so the DRAM is asked for four times what is used:
+
+```
+   useful 1.75 GB/s  x4 for the line  =  ~7.0 GB/s   against this board's 9.4
+                                                      roof, 75% of it
+```
+
+Fewer instructions cannot move a number that is already at three quarters of
+the memory roof. **The only lever left on the gather is fewer BYTES**, and
+there is one: the destination is scattered but the SOURCE is contiguous, so
+walking `fo` sequentially and scattering into Y would use whole lines instead of
+a quarter of each. That is a different loop, not a wider one.
+
+⚠ **AND I DID NOT PREDICT A NUMBER THIS TIME**, having said the round before
+that prep would collapse and watched it move 12%. The refusal to predict was
+right and the change was still worth making: it cost one round and it converted
+"the gather is slow" into "the gather is at 75% of the roof and the waste is
+the cache line".
 
 ## ⚠ prep WAS NOT THE MEMSET, AND THE BOARD SAID SO IMMEDIATELY
 

@@ -2249,36 +2249,44 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					 * which times zero is a NaN and not a
 					 * zero.
 					 *
-					 * ⚠⚠ AND THE FOUR ARE ONE VECTOR. The
-					 * read order is four consecutive slots,
-					 * so a run is vld1q from one index,
-					 * vmulq, vst1q -- and the barrier keeps
-					 * it a multiply THEN an add, which is
-					 * what the scalar it replaces does.
-					 * Measured rather than assumed: over a
-					 * million accumulations on this
-					 * toolchain, mul-then-add differs from
-					 * the C in 0 and fmla differs in
-					 * 227529, so the C is not contracted
-					 * and the vector form is bit identical
-					 * to what the board validated.
+					 * ⚠⚠ AND A NEON FORM OF THIS WAS
+					 * WRITTEN, MEASURED AND TAKEN OUT.
+					 *
+					 * The four are one vector, so a run is
+					 * vld1q from one index, vmulq, vst1q,
+					 * and it was bit identical to this --
+					 * checked, including the rounding,
+					 * because the C here is a multiply then
+					 * an add and an fmla rounds once where
+					 * it rounds twice. On this toolchain
+					 * mul-then-add differs from the C in 0
+					 * of a million and fmla in 227529, so
+					 * the C is not contracted and the
+					 * vector form matched.
+					 *
+					 * The board moved by NOTHING: read was
+					 * 223, 320, 555 ms at m of 32, 48 and
+					 * 80 before it and 229, 337, 580 after.
+					 *
+					 * ⚠ AND THE ARITHMETIC SAYS WHY, which
+					 * is the part worth keeping. The gather
+					 * moves about 403 MB at m = 32 and 1007
+					 * at m = 80 -- Y once per K slice, read
+					 * and written -- in 229 and 580 ms,
+					 * which is 1.76 and 1.74 GB/s, the same
+					 * rate at both. A run is 16 BYTES and a
+					 * cache line is 64, and the runs are
+					 * scattered, so the DRAM sees four
+					 * times that: about 7 GB/s against this
+					 * board's 9.4 roof, 75% of it.
+					 *
+					 * It was never instruction bound.
+					 * Fewer instructions cannot help and
+					 * the only lever left is fewer BYTES:
+					 * walking the source sequentially and
+					 * scattering into Y would use whole
+					 * lines instead of a quarter of each.
 					 */
-#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-#define GATHER4(OP, VAL)                                                     \
-					for (j = 0; j < n4; j++) {           \
-						float *yp = yr + j * 4;      \
-						float32x4_t p;               \
-						VAL;                         \
-						__asm__("" : "+w"(p));       \
-						vst1q_f32(yp, VEC_##OP(yp, p)); \
-					}
-#define VEC_ASSIGN(yp, p)  (p)
-#define VEC_ADD(yp, p)     vaddq_f32(vld1q_f32(yp), (p))
-#define W4G  p = vmulq_f32(vld1q_f32(fo + mp[j]), vld1q_f32(s->sc + j * 4))
-#define W4   p = vld1q_f32(fo + mp[j])
-#define I8   p = vmulq_f32(vcvtq_f32_s32(vld1q_s32(io + mp[j])),             \
-			   vdupq_n_f32(d1))
-#else
 #define GATHER4(OP, VAL)                                                     \
 					for (j = 0; j < n4; j++) {           \
 						float *yp = yr + j * 4;      \
@@ -2298,7 +2306,6 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 #define I8   const int32_t *ip = io + mp[j];                                 \
 	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
 		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
-#endif
 					if (g->w4 && grp) {
 						const float *sc = s->sc;
 
@@ -2332,8 +2339,6 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 						}
 					}
 #undef GATHER4
-#undef VEC_ASSIGN
-#undef VEC_ADD
 #undef SC_ASSIGN
 #undef SC_ADD
 #undef W4G
