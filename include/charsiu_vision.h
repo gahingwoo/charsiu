@@ -144,6 +144,20 @@ unsigned charsiu_vision_width(const struct charsiu_vision *v);
  */
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out);
 
+/*
+ * The tower's self attention on its own: q, k, v and o are [n][W] with the
+ * heads laid side by side across W, and `scale` is 1/sqrt(head_dim).
+ *
+ * ⚠ EXPOSED BECAUSE IT IS THE HALF OF THE ENCODE THAT NEEDS MEASURING and the
+ * stage table cannot see it clearly on a host: here the matmuls are CPU and
+ * dwarf it, on the board they are NPU and it is half the run. tools/vattn_bench
+ * drives this directly so a change can be timed at the board's shape without
+ * the other six stages moving underneath it.
+ */
+void charsiu_vision_attention(const float *q, const float *k, const float *v,
+			      float *o, unsigned n, unsigned W,
+			      unsigned n_head, float scale);
+
 /* (v - mean) / std, per channel, in place. */
 void charsiu_vision_normalise(const struct charsiu_vision *v, float *px);
 

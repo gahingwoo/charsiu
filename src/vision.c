@@ -777,6 +777,26 @@ static void vattn_rows(void *ctx, uint64_t r0, uint64_t n)
 	free(att);
 }
 
+/*
+ * ⚠ PUBLIC SO IT CAN BE TIMED WITHOUT THE TOWER AROUND IT. On the board this
+ * is half the encode; on this development host it is under a tenth of it,
+ * because the board's matmuls go to the NPU and the host's do not. Measuring it
+ * through charsiu_vision_encode means reading a 6% row of a stage table and
+ * calling the difference a result. tools/vattn_bench.c calls this directly.
+ */
+void charsiu_vision_attention(const float *q, const float *k, const float *v,
+			      float *o, unsigned n, unsigned W,
+			      unsigned n_head, float scale)
+{
+	struct vattn c;
+
+	c.q = q; c.k = k; c.v = v; c.o = o;
+	c.n = n; c.W = W; c.hd = W / n_head; c.scale = scale;
+	charsiu_parallel_for(vattn_rows, &c,
+			     (uint64_t)n_head * ((n + VATTN_QB - 1) /
+						 VATTN_QB));
+}
+
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 {
 	unsigned np = v->n_patches, W = v->n_embd, P = v->patch_size;
@@ -916,15 +936,8 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		 * It is not a matmul against a weight, so nothing built for the
 		 * NPU pool touches it.
 		 */
-		{
-			struct vattn c;
-
-			c.q = q; c.k = k; c.v = val; c.o = xb;
-			c.n = nt; c.W = W; c.hd = hd; c.scale = scale;
-			VSTAGE(V_ATTN, charsiu_parallel_for(vattn_rows, &c,
-					     (uint64_t)v->n_head *
-					     ((nt + VATTN_QB - 1) / VATTN_QB)));
-		}
+		VSTAGE(V_ATTN, charsiu_vision_attention(q, k, val, xb, nt, W,
+						       v->n_head, scale));
 
 		VSTAGE(V_PROJ, rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a));
 		for (i = 0; i < nt * W; i++)
