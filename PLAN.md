@@ -675,7 +675,45 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
-## THE ACCOUNTING CLOSES, AND prep WAS A MEMSET
+## ⚠ prep WAS NOT THE MEMSET, AND THE BOARD SAID SO IMMEDIATELY
+
+The zero of Y is gone -- assign on first write, correctness held at every width
+-- and `prep` moved 12%:
+
+```
+   m      prep before   after       batched before   after      read before  after
+  32          155        136             600          542           264       224
+  48          224        199             860          799           373       328
+  80          353        333            1425         1306           647       554
+```
+
+**The prediction was that prep would collapse to nothing. It did not.** The
+417 MB/s that looked like a memset rate was a coincidence: anything linear in m
+divided by anything linear in m gives a constant, and that constant was taken
+as evidence.
+
+What the change did buy is 8 to 10% overall, and most of it landed in **`read`,
+which was not predicted at all** -- assigning instead of accumulating means the
+gather never has to fetch Y before writing it, and that read-for-ownership was
+a third of the gather's traffic.
+
+So the change is right and the reason given for it was wrong. Both are worth
+writing down.
+
+### What prep actually is, counted rather than argued
+
+The remaining candidate is the output buffer, whose size is
+`wide * m * 4 * most` and which the kernel zeroes when it allocates. It is
+allocated only when `e->bout_m < m`, so a probe that sweeps m reallocates all
+113 tensors at every width while a real prefill, whose chunk is one fixed 32,
+pays it on the first chunk and never again.
+
+That is countable. `prep` now prints `alloc N xM` beside it -- the time inside
+the allocation and how many times it happened -- so the next round says whether
+prep is a real cost or an artifact of sweeping, instead of another curve being
+argued about.
+
+## THE ACCOUNTING CLOSES, AND prep LOOKED LIKE A MEMSET
 
 `rest` is 0 at every width. The five segments, width arm:
 

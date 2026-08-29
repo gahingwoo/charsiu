@@ -222,6 +222,8 @@ struct charsiu_npu {
 	double bprep_us;	/* buffers and the output zero, before any of it */
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
+	double balloc_us;	/* the output BO allocation, inside prep */
+	unsigned balloc_n;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -1816,6 +1818,19 @@ double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset)
 	return v;
 }
 
+double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
+{
+	double v = g->balloc_us / 1e3;
+
+	if (n)
+		*n = g->balloc_n;
+	if (reset) {
+		g->balloc_us = 0.0;
+		g->balloc_n = 0;
+	}
+	return v;
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
@@ -1929,7 +1944,21 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		 * makes attn_q pay the head's cache maintenance on every call.
 		 */
 		g->bout_stride = (size_t)wide * m * 4;
+		/*
+		 * ⚠⚠ IS THIS THE PROBE OR IS IT REAL? The output buffer is
+		 * allocated only when this tensor has never been asked for this
+		 * many rows, so a sweep that walks m reallocates all 113 of
+		 * them at every width while a real prefill, whose chunk is one
+		 * fixed 32, pays it on the first chunk and never again.
+		 *
+		 * `prep` was 26% of a batched matmul and removing the zero of Y
+		 * -- which was the whole of the hypothesis -- moved it 12%. So
+		 * the rest is this, or it is not, and counting is cheaper than
+		 * another round of arguing about a linear curve.
+		 */
 		if (e->bout_m < m) {
+			double ta = now_us();
+
 			for (unsigned d = 0; d < g->ndev; d++) {
 				if (charsiu_bo_alloc(g->dev[d],
 						     g->bout_stride * most + 4096,
@@ -1941,6 +1970,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				}
 			}
 			e->bout_m = m;
+			g->balloc_us += now_us() - ta;
+			g->balloc_n++;
 		}
 	}
 

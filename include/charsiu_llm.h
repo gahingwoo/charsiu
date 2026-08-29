@@ -256,6 +256,8 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
 /* the fifth segment: buffers and the output zero, before any packing */
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
+/* how much of prep is the output buffer allocation, and how often */
+double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);

@@ -981,6 +981,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 			charsiu_npu_batch_split(s->pool.dev, &z, &z, &z, &z, 1);
 			charsiu_npu_batch_prep(s->pool.dev, 1);
+			charsiu_npu_batch_alloc(s->pool.dev, NULL, 1);
 		}
 		for (unsigned i = 0; i < s->pool.n; i++) {
 			const struct npu_tensor *t = &s->pool.t[i];
@@ -1328,10 +1329,12 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		 * the time is not the hardware at all.
 		 */
 		{
-			double pk, sb, fn, rd, pr;
+			double pk, sb, fn, rd, pr, al;
+			unsigned an = 0;
 
 			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			pr = charsiu_npu_batch_prep(s->pool.dev, 1);
+			al = charsiu_npu_batch_alloc(s->pool.dev, &an, 1);
 			/*
 			 * ⚠ AND WHAT IS STILL MISSING. The five segments are
 			 * printed with the remainder beside them, because the
@@ -1343,13 +1346,14 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			 */
 			printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms"
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
-			       "   prep %4.0f  pack %4.0f  submit %3.0f"
-			       "  fence %5.0f  read %4.0f  rest %4.0f\n",
+			       "   prep %4.0f (alloc %4.0f x%u)  pack %4.0f"
+			       "  submit %3.0f  fence %5.0f  read %4.0f"
+			       "  rest %4.0f\n",
 			       mr, tested, worst, rows_ok, rows_tot, t_one,
 			       t_bat, t_bat > 0 ? t_one / t_bat : 0.0,
 			       t_bat * 1e3 / (tested * (double)mr),
 			       t_bat > 0 ? mb / t_bat : 0.0,
-			       pr, pk, sb, fn, rd,
+			       pr, al, an, pk, sb, fn, rd,
 			       t_bat - (pr + pk + sb + fn + rd));
 		}
 		rc = 0;
