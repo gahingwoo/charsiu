@@ -675,6 +675,122 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+## m = 8 NEEDS BOTH NUMBERS, AND FOUR SUSPECTS ARE OUT
+
+A desktop round on the one width the batched int4 matmul still gets wrong. It
+found no cause. It removed four, and it did it with checks that could have
+failed rather than with argument.
+
+**The shape of the fault, restated as a conjunction.** m = 8 is exact at
+n = 512 and n = 2048. n = 8192 is exact at m = 2, 4, 16, 32, 48, 64 and 80.
+Only the two together fail, and only row 0. So nothing that is a function of
+one of them alone can be the cause -- which is almost everything on this path.
+
+```
+  the read order       a BIJECTION at all 32 (m, n) the probe reaches: m of
+                       2..80 crossed with n of 512, 2048, 5376, 8192. Every
+                       one covers [0, m*n) exactly once, no collision, no
+                       hole, nothing out of range, and the four-in-a-row
+                       property the gather needs unbroken at every j.
+                       ⚠ AND IT TAKES NO n. A channel enters only as
+                       G = ni/32 and its position inside a group of 32, so
+                       the map of an 8192 wide slice restricted to its first
+                       2048 channels IS the map of a 2048 wide one. It
+                       cannot be selective by n, and the board says the
+                       fault is.
+  the input packing    a function of m and k. gate and up have k = 2048 and
+                       so do attn_q, attn_o, attn_k, attn_v and the head,
+                       all exact at m = 8.
+  the register stream  SEPARABLE. 148 words emitted over m of 2..80 crossed
+                       with n of 512, 2048, 5376, 8192: every word moves
+                       with m or with n and NONE with both -- 0 joint
+                       entries. Stronger: not one word of the m=8 n=8192
+                       stream is a word that does not also appear, with the
+                       same value, in a shape the board proved exact.
+  0x40b8               4*T - W on 3328 of 3328 vendor int4 streams. 3 * M is
+                       the single chunk case of it. Confirmed, not fitted.
+```
+
+**And it is not the output surface's SIZE either.** (m=8, n=8192) and
+(m=32, n=2048) are both 262144 bytes and the second is exact, so any product
+of m and n -- bytes, floats, groups times positions -- is the same number for
+a shape that works. Whatever it is wants the two separately.
+
+### The vendor's output block, decoded, which is what settled 0x40b8
+
+Their int4 streams carry a CHUNK and a TOTAL, and that is what makes the rule
+readable. With T = 0x401c and W the stream's own width, exact on all 3328:
+
+```
+  0x4018   output base + 16 * (this chunk's first position)
+  0x401c   T, the TOTAL width -- not this chunk's
+  0x4028   T - W, the positions this chunk does not cover
+  0x40b8   4 * T - W
+  0x4020   W - 1, and 0x4034 the same
+```
+
+They split a prefill and charsiu does not: their (W, T) pairs are (32,32),
+(64,64), (80,96), (16,96), (80,128), (48,128), (40,64), (24,64), (40,96) and
+(40,128), so a 96 token prompt goes 80 then 16. Dispatching the whole width at
+once is T = W, and every one of those registers collapses to what job.c
+already emits -- 0x401c = M, 0x4028 = 0, 0x40b8 = 3M. The int8 head takes a
+different constant, 7 * W, read off their 8160 wide output head at W of 1, 32
+and 64.
+
+⚠ **16 BYTES A POSITION IS THE READ ORDER'S OWN CLAIM**, and this is the first
+time anything other than this board has said it. 0x4018 stepping by 16 for
+each position skipped means consecutive rows sit four floats apart in the
+output surface, which is exactly what `charsiu_acc_index` places at
+`(mi/2)*8 + (mi%2)*4`.
+
+⚠ **AND THEY NEVER DISPATCH int4 WIDER THAN 4096 OUTPUT CHANNELS.** Not once
+in the whole file. `CHARSIU_NPU_NMAX` defaults to 8192, so ffn_gate and ffn_up
+go as one slice twice as wide as anything the vendor asks for -- and they are
+the tensors that fail. That is a lead, not a cause: the same slice is exact at
+every other width.
+
+### What only the board can settle, and it is two environment variables
+
+`tests/board_w4_m8.sh`. Baseline first and it must reproduce 871 of 904, then:
+
+- `CHARSIU_NPU_ONEDEV=1` -- the two K slices stop running concurrently on two
+  cores. The batched path submits both devices before waiting on either, so
+  concurrency is its design, and round 362 measured two cores corrupting each
+  other through the shared CBUF three times in four. Exact at m = 8 on one
+  core means the fault is the PAIR and not the shape.
+- `CHARSIU_NPU_NMAX=4096` -- n = 8192 in two slices, the vendor's own widest.
+  Exact means the fault is the WIDTH.
+
+Both need `CHARSIU_NPU_W4_M8=1`, which is the only thing that lets the refused
+width reach the hardware. Its own name, not a second meaning for
+`CHARSIU_NPU_W4_BATCH`, so a round that sets the batch switch for another
+reason cannot quietly also let the broken width through.
+
+### Two things the probe could not say, and now can
+
+- **THE where-did-it-go SCAN, ON THE ROW THAT MISSED.** The row count says a
+  row is wrong and cannot say why, and absent and misplaced want different
+  next rounds. It reports how many of that row's wanted values are anywhere in
+  the batch and how many of its slots came back exactly zero. On a work budget:
+  the cost is (values scanned) * m * n, which is a second for the whole row at
+  8 by 8192 and 1.3e12 for the head at m = 80, so the line says how many
+  channels it managed to ask about.
+- **THE MISS LINES GO TO FORTY.** 33 rows was written down as "every ffn_gate
+  and ffn_up in the model, once each" and that is 32. There is a thirty third
+  miss nobody has ever seen, because the cap stopped at eight. If it is the
+  output head the rule is "slices 8192 wide"; if it is something with no 8192
+  in it the rule is not the width at all.
+
+### And a leak on the way
+
+`e->bout[d]` was reallocated without being given back. `charsiu_bo_alloc`
+overwrites the handle and the mapping in place, so every widening leaked an
+mmap, a GEM handle and its IOVA, per tensor per device. A prefill never
+notices -- its chunk is one fixed width and it runs once -- but the probe
+sweeps eight widths over 113 tensors on two devices, which on this model is
+about 840 MB thrown away in one run, on top of 620 MB of weights and against a
+32 bit window the batched path narrows addresses into without checking.
+
 ## prep IS THE OUTPUT ALLOCATION, COUNTED
 
 ```

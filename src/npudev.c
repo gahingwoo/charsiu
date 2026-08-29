@@ -1723,8 +1723,58 @@ static const char *w4_batch_why_not(unsigned m)
 	 * One shape and one row is a small enough target to find. Until it is
 	 * found this refuses the width, and the caller falls back to a row at
 	 * a time for that chunk, which is correct and merely slower.
+	 *
+	 * ⚠⚠ IT NEEDS BOTH NUMBERS, AND THAT IS THE WHOLE SHAPE OF IT. m = 8
+	 * is exact at n = 512 and n = 2048; n = 8192 is exact at m = 2, 4, 16,
+	 * 32, 48, 64 and 80. Neither number is wrong on its own, so nothing
+	 * that is a function of only one of them can be the cause -- which is
+	 * most of this path, and a desktop round retired it:
+	 *
+	 *   the read order      A BIJECTION at all 32 (m, n) the probe runs,
+	 *                       and it does not take n at all, so it cannot be
+	 *                       n-selective. See charsiu_acc_index.
+	 *   the input packing   a function of m and k. gate/up share k = 2048
+	 *                       with attn_q, attn_o and the head, which are
+	 *                       exact at m = 8.
+	 *   the register stream SEPARABLE: emitted over m of 2..80 crossed with
+	 *                       n of 512, 2048, 5376 and 8192, every one of its
+	 *                       148 words moves with m or with n and none with
+	 *                       both -- 0 joint entries. Stronger, NOT ONE WORD
+	 *                       of the m=8 n=8192 stream is a word the board
+	 *                       has not already run correctly at some other
+	 *                       shape.
+	 *   0x40b8              4*T - W on 3328 of 3328 vendor int4 streams,
+	 *                       which is 3*M for a single chunk. Confirmed, not
+	 *                       fitted.
+	 *
+	 * What is left is the OUTPUT SURFACE, the one object that is a function
+	 * of m and n together. And even there the size is not it: (m=8,
+	 * n=8192) and (m=32, n=2048) are both 262144 bytes and the second is
+	 * exact, so the fault is not m*n -- it wants the two separately.
+	 *
+	 * ⚠ TWO CONTROLS, EACH ONE ENVIRONMENT VARIABLE, EACH ABLE TO FAIL:
+	 *
+	 *   CHARSIU_NPU_ONEDEV=1   both K slices of a tensor go to one core
+	 *                          instead of running concurrently on two.
+	 *                          Round 362 measured two cores corrupting each
+	 *                          other through the shared CBUF, and the
+	 *                          batched path submits both before waiting on
+	 *                          either -- concurrency is its design. If m=8
+	 *                          comes back exact on one core the fault is
+	 *                          the pair, not the shape.
+	 *   CHARSIU_NPU_NMAX=4096  slice n = 8192 in two. The vendor's widest
+	 *                          int4 dispatch in the whole .rkllm is 4096
+	 *                          output channels -- ours is the only shape
+	 *                          that asks for twice that. If m=8 comes back
+	 *                          exact the fault is the width.
+	 *
+	 * Both need this refusal lifted to say anything, and that is what
+	 * CHARSIU_NPU_W4_M8=1 is for: its own name rather than a second meaning
+	 * for CHARSIU_NPU_W4_BATCH, so a round that sets the batch switch for
+	 * some other reason cannot quietly also let the broken width through.
+	 * Nothing but a control should ever set it.
 	 */
-	if (m == 8)
+	if (m == 8 && !getenv("CHARSIU_NPU_W4_M8"))
 		return "int4 at m=8 misses row 0 of the n=8192 tensors";
 	return NULL;
 }
@@ -1956,10 +2006,24 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		 * the rest is this, or it is not, and counting is cheaper than
 		 * another round of arguing about a linear curve.
 		 */
+		/*
+		 * ⚠⚠ GIVE THE OLD ONE BACK FIRST. charsiu_bo_alloc overwrites
+		 * the handle and the mapping in place, so widening leaked both
+		 * -- an mmap, a GEM handle and its IOVA, per tensor per device,
+		 * every time m grew.
+		 *
+		 * A prefill never notices: its chunk is one fixed width and
+		 * this runs once. The probe sweeps 2, 4, 8, 16, 32, 48, 64, 80
+		 * over 113 tensors on two devices, and the arithmetic on this
+		 * model is about 840 MB of IOVA thrown away in one run -- on
+		 * top of 620 MB of weights, against a 32 bit window the batched
+		 * path narrows addresses into without checking.
+		 */
 		if (e->bout_m < m) {
 			double ta = now_us();
 
 			for (unsigned d = 0; d < g->ndev; d++) {
+				charsiu_bo_free(g->dev[d], &e->bout[d]);
 				if (charsiu_bo_alloc(g->dev[d],
 						     g->bout_stride * most + 4096,
 						     &e->bout[d])) {

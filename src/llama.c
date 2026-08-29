@@ -972,6 +972,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
 		unsigned nbad = 0;		/* misses named, capped */
+		int whered = 0;			/* the where-did-it-go scan, once a width */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
@@ -1061,13 +1062,106 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * a count of 33 cannot say whether it is one
 				 * shape, one row index, or scattered. Eight
 				 * lines is enough to tell those apart.
+				 *
+				 * ⚠ FORTY, NOT EIGHT, AND THE ARITHMETIC IS
+				 * WHY. 33 was written down as "every ffn_gate
+				 * and ffn_up in the model, once each" and that
+				 * is 32 -- there is a thirty third miss nobody
+				 * has ever seen, because the cap stopped at
+				 * eight. Whether it is the output head, whose
+				 * slices are also 8192 wide, or something with
+				 * no 8192 in it at all is the difference
+				 * between two different rules, and one line
+				 * settles it. Forty covers m = 8 whole and is
+				 * still bounded if a width breaks outright.
 				 */
-				if (!ok && nbad < 8) {
+				if (!ok && nbad < 40) {
 					printf("      MISS %-24s k=%-5u n=%-5u"
 					       " row %u of %u, worst rel %.2e\n",
 					       t->name, (unsigned)t->k,
 					       (unsigned)t->n, r, mr, rworst);
 					nbad++;
+				}
+				/*
+				 * ⚠⚠ ABSENT OR MISPLACED, ASKED OF THE ROW
+				 * THAT MISSED. The count above says a row is
+				 * wrong and cannot say why, and the two
+				 * answers want different work.
+				 *
+				 * m = 8 loses row 0 of the n = 8192 tensors
+				 * and nothing else, at that one width. The
+				 * read order is a bijection there and takes no
+				 * n, so it cannot be selective by n and the
+				 * other seven rows being exact leaves row 0's
+				 * values nowhere to be but its own slots. That
+				 * is a deduction; this is the measurement it
+				 * predicts, and it can come back either way:
+				 *
+				 *   absent      the block never wrote them and
+				 *               no reading recovers them --
+				 *               the surface is short
+				 *   somewhere   they were written and put in
+				 *               the wrong place, and the
+				 *               deduction above is wrong
+				 *
+				 * ⚠ ONE ROW OF ONE TENSOR A WIDTH, AND ON A
+				 * WORK BUDGET. Each wanted value is looked for
+				 * in the whole batch, so the cost is
+				 * (values scanned) * m * n. The whole row at
+				 * 8 by 8192 is 5.4e8 and takes about a second;
+				 * the whole row of the 128256 wide head at
+				 * m = 80 would be 1.3e12 and never finish. So
+				 * the budget fixes how many of the row's
+				 * channels are asked about and the line says
+				 * how many that was -- a smaller sample of a
+				 * question that can still be answered beats a
+				 * whole one that hangs the round.
+				 *
+				 * The zero count is one pass and is over the
+				 * whole row either way.
+				 */
+				if (!ok && !whered) {
+					size_t live = 0, zero = 0;
+					size_t tot = (size_t)mr * t->n;
+					size_t look = 1000000000u / (tot ? tot : 1);
+
+					whered = 1;
+					if (look < 64)
+						look = 64;
+					if (look > (size_t)t->n)
+						look = (size_t)t->n;
+					for (unsigned j = 0; j < (unsigned)t->n; j++)
+						if (Y[(size_t)r * t->n + j] == 0.0f)
+							zero++;
+					for (size_t j = 0; j < look; j++) {
+						double w = Yref[(size_t)r * t->n + j];
+						double sc = fabs(w);
+
+						for (size_t o = 0; o < tot; o++)
+							if (fabs((double)Y[o] - w)
+							    <= (sc > 1e-3 ? sc * 1e-3
+									  : 1e-3)) {
+								live++;
+								break;
+							}
+					}
+					printf("      row %u of %s at m=%u:"
+					       " %zu of the first %zu wanted"
+					       " values are somewhere in the"
+					       " batch, and %zu of the row's"
+					       " %u slots came back exactly"
+					       " zero\n",
+					       r, t->name, mr, live, look, zero,
+					       (unsigned)t->n);
+					printf("        wanted ");
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%11.4g",
+						       Yref[(size_t)r * t->n + j]);
+					printf("\n        got    ");
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%11.4g",
+						       Y[(size_t)r * t->n + j]);
+					printf("\n");
 				}
 			}
 			/*
