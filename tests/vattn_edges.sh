@@ -16,7 +16,16 @@
 #
 #     tests/vattn_edges.sh [build/vattn_bench]
 
-B=${1:-build/vattn_bench}
+# ⚠ THE INSTALLED PATH, NOT THE SOURCE TREE'S. `charsiu update dev` puts the
+# binary in /opt/charsiu and this defaulted to build/vattn_bench, which exists
+# only where it was compiled -- so shipping the script alone would have failed
+# a second time, one line further on.
+B=${1:-}
+[ -n "$B" ] || B=$(command -v vattn_bench 2>/dev/null || true)
+[ -n "$B" ] || for d in /opt/charsiu /usr/bin "$PWD/build" ./build .; do
+	[ -x "$d/vattn_bench" ] && { B="$d/vattn_bench"; break; }
+done
+[ -n "${B:-}" ] || { echo "vattn_bench not found; it ships on the dev channel" >&2; exit 1; }
 rc=0
 # n, heads: 1025 is the tower with a class token; 1000 leaves a partial query
 # block; 17 and 3 are shorter than one tile; 64 and 65 straddle the block size

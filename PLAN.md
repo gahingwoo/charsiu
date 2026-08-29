@@ -818,6 +818,85 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
+## 🏁 m = 8 IS THE CORE PAIR, AND IT IS NOT THE WIDTH
+
+`board_w4_m8.sh`, three arms, one variable each:
+
+```
+  baseline    m=8   871 of 904   worst 4.9e+05    (the control, and it failed as it must)
+  onedev      m=8   904 of 904   worst 0.00e+00   <-- every width, bit identical
+  nmax4096    m=8   874 of 904   worst 1.1e+05    still wrong
+```
+
+**One core is exact. Halving the slice width is not.** So the fault is the two
+K slices running concurrently on the two NPU cores, which round 362 had already
+measured corrupting each other through the shared CBUF -- three times in four
+when they carry the same configuration -- and not the 8192 width at all.
+
+And the where-did-it-go line, printed for the first row that missed, says the
+same thing from the other side:
+
+```
+  row 0 at m=8: 8192 of 8192 wanted values are somewhere in the batch,
+                and 0 of the row's 8192 slots came back exactly zero
+    wanted  -0.267  -0.3853  -0.1606  -0.1088  0.09762  0.08508
+    got     -0.267  -0.3853  -0.1606  -0.1088  0.09762  0.08508
+```
+
+**Every value is present, nothing is zero, and the leading six are exact.** The
+row is computed and written and then something steps on part of it. That is the
+shape of a concurrency fault, not of a layout error.
+
+⚠ **AND onedev IS 0.00e+00 AT m = 2 AND m = 4 TOO**, where two devices give
+5.10e-05. So the residual that has been called "float summation order" all
+along is the two devices each summing their own slices -- benign, but it was
+never actually identified until an arm removed it.
+
+### What this does not settle
+
+`CHARSIU_NPU_ONEDEV` is a pool level setting -- slots are assigned to devices
+when the pool is staged -- so "use one core for m = 8 only" is not a switch that
+exists today. And half the hardware for one width is a poor trade against a
+fallback that is already correct. The refusal stays until the shared resource is
+named.
+
+## 🏁 GEMMA4'S PROMPT BATCHES ON THE BOARD: 17564 -> 4977 ms
+
+```
+                before     now     theirs
+  Qwen3          1792      1695     469
+  TinyLLAMA      2162      2076     544
+  Phi3           6551      6110    1829
+  Gemma4        17564      4977    1219     3.5x
+```
+
+⚠⚠ **AND ITS TEXT IS NOT VERIFIED ON THE BOARD.** `board_vendor.sh` compares no
+output, and `prefill_control.sh` ran llama. Gemma4's per layer embedding
+tensors -- `pl_model_proj`, `pl_inp_gate`, `pl_proj` -- had never been asked for
+m > 1 on the NPU before this round, which is exactly where a wrong answer at
+speed would come from. `prefill_control.sh` takes a model argument; point it at
+gemma4 before believing 4977.
+
+## 🏁 THE TOWER'S ATTENTION ON THE BOARD: 4010 -> 1471 ms
+
+```
+                     before            now
+  attention      4010 ms  49.2%    1471 ms  27.0%
+  feed forward   2393     29.4%    2308     42.3%   <-- the target now
+  encoder        9910 ms            6990 ms
+```
+
+2.7x on the stage, and the board confirms what the change predicted: the feed
+forward is what to look at next.
+
+⚠ **AND THE SWEEP DID NOT RUN**: `cannot open /opt/charsiu/vattn_sweep.sh`. Six
+attention knobs are still at defaults chosen on a compute bound desktop while
+the board is bandwidth bound. The script was not in `PROBE_SCRIPTS` and its
+binary was not in `PROBE_BINS` -- **and the script also looked for
+`build/vattn_bench`, a path that exists only where it was compiled**, so
+shipping it alone would have failed one line further on. All three fixed, and
+the discovery proved from outside the source tree, by PATH and by argument.
+
 ## THE OTHER TWO LOOP SHAPES ARE WORSE, MEASURED ON THE DESKTOP
 
 The gather's cache line waste suggested walking the source instead. Both
