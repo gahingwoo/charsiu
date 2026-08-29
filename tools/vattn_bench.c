@@ -33,7 +33,7 @@
  *               [-K]     sweep the fused kernel's key tile
  *               [-B]     the whole round: the code as it was, against as it is
  *               [-E]     glibc's expf against the polynomial one
- *               [-P]     an axpy per query and key, against the blocked one
+ *               [-P]     one pair at a time, against the blocked kernels
  */
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -198,11 +198,11 @@ int main(int argc, char **argv)
 				charsiu_vision_attn_qb_set(s ? 64 : 8);
 				charsiu_vision_attn_kt_set(s ? 16 : 16);
 				charsiu_softmax_exact_set(!s);
-				charsiu_pv_plain_set(!s);
+				charsiu_attn_plain_set(!s);
 			} else if (esw)
 				charsiu_softmax_exact_set(!s);
 			else if (psw)
-				charsiu_pv_plain_set(!s);
+				charsiu_attn_plain_set(!s);
 			else if (qsw)
 				charsiu_vision_attn_qb_set(qbs[s]);
 			else if (ksw)
@@ -240,7 +240,7 @@ int main(int argc, char **argv)
 		else if (esw)
 			snprintf(nm, sizeof(nm), "%s", s ? "poly" : "glibc");
 		else if (psw)
-			snprintf(nm, sizeof(nm), "%s", s ? "blocked" : "axpy");
+			snprintf(nm, sizeof(nm), "%s", s ? "blocked" : "1 pair");
 		else if (qsw)
 			snprintf(nm, sizeof(nm), "qb=%u", qbs[s]);
 		else if (ksw)

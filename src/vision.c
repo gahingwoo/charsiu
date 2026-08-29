@@ -804,14 +804,9 @@ static void vattn_block_fused(const struct vattn *c, float *sc, unsigned off,
 	for (j0 = 0; j0 < c->n; j0 += kt) {
 		unsigned nk = c->n - j0 < kt ? c->n - j0 : kt, j;
 
-		for (j = 0; j < nk; j++) {
-			const float *kj = c->k + (size_t)(j0 + j) * c->W + off;
-
-			for (u = 0; u < nq; u++)
-				s[u * kt + j] = charsiu_dot_f32(
-					c->q + (size_t)(i0 + u) * c->W + off,
-					kj, hd) * c->scale;
-		}
+		charsiu_qk_f32(s, kt, c->q + (size_t)i0 * c->W + off, c->W,
+			       c->k + (size_t)j0 * c->W + off, c->W,
+			       nq, nk, hd, c->scale);
 		for (u = 0; u < nq; u++) {
 			float *su = s + u * kt, m = mx[u], t;
 
@@ -853,16 +848,10 @@ static void vattn_block_exact(const struct vattn *c, float *att, unsigned off,
 {
 	unsigned i0 = b * c->qb;
 	unsigned nq = c->n - i0 < c->qb ? c->n - i0 : c->qb;
-	unsigned j, u, e;
+	unsigned u, e;
 
-	for (j = 0; j < c->n; j++) {
-		const float *kj = c->k + (size_t)j * c->W + off;
-
-		for (u = 0; u < nq; u++)
-			att[u * c->n + j] = charsiu_dot_f32(
-				c->q + (size_t)(i0 + u) * c->W + off,
-				kj, c->hd) * c->scale;
-	}
+	charsiu_qk_f32(att, c->n, c->q + (size_t)i0 * c->W + off, c->W,
+		       c->k + off, c->W, nq, c->n, c->hd, c->scale);
 	for (u = 0; u < nq; u++) {
 		float *o = c->o + (size_t)(i0 + u) * c->W + off;
 

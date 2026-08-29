@@ -360,7 +360,23 @@ float charsiu_expsum_f32(float *x, uint64_t n, float m);
 void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
 		    uint64_t vstride, const float *s, uint64_t sstride,
 		    unsigned nq, unsigned nk, unsigned hd);
-void charsiu_pv_plain_set(int on);      /* CHARSIU_PLAIN_PV: the control */
+
+/*
+ * s[u][j] = (q[u] . k[j]) * scale, for a block of queries against a block of
+ * keys. Same reason as charsiu_pv_f32 and the same shape of answer: a dot
+ * product per pair reloads both operands for every FMA, and four queries
+ * against two keys reuses each.
+ *
+ * ⚠ BIT IDENTICAL, INCLUDING THE LANES. dot_f32 sums in two vectors and
+ * reduces at the end; this keeps two accumulators per pair so it reproduces
+ * that exactly, which is what caps the block at 4 x 2 rather than 4 x 4.
+ */
+void charsiu_qk_f32(float *s, uint64_t sstride, const float *q,
+		    uint64_t qstride, const float *k, uint64_t kstride,
+		    unsigned nq, unsigned nk, unsigned hd, float scale);
+
+/* CHARSIU_PLAIN_ATTN: one pair at a time, the control for both of the above */
+void charsiu_attn_plain_set(int on);
 void charsiu_softmax_exact_set(int on);
 
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */
