@@ -1410,11 +1410,26 @@ the only width they had ever been exercised at:
   at m = 8 and N = 2048, both widths it was not fitted on.
 
 int8 batches correctly from m = 2 to 32 and a batched prompt is 2.94x on the board.
-**w4a16 still computes exactly one row**, and that one is silicon rather than a
-literal: fed the same activation twice, row 1 matches row 0 in 1 of 2048; the DPU and
-RDMA blocks are identical to a stream that does two rows; every CNA word that differs
-was put back one at a time. The vendor never batches a weight matmul either, so there
-is no M > 1 int4 stream to copy.
+**w4a16 computes exactly one row with M on the HEIGHT axis**: fed the same activation
+twice, row 1 matches row 0 in 1 of 2048; the DPU and RDMA blocks are identical to a
+stream that does two rows; every CNA word that differs was put back one at a time.
+
+⚠ That was called silicon rather than a literal, and it is not. The vendor's own
+Llama-3.2-1B file carries 3328 int4 streams and 2816 of them are batched, at M up to
+80 -- one row high and M PIXELS WIDE, which is why anything reading the row count sees
+M = 1 and concludes there is nothing to copy. Their fp16 attention does use the height
+axis, all 4940 streams of it, which is what made the two look like one. charsiu's
+width axis form is now two registers from theirs at M = 32 and 64, fewer than at M = 1
+where this board is known to be right; `tests/board_w4_axis.sh` is the round that has
+not happened yet.
+
+The same file settles something about the int8 path too. Its 40 int8 streams are the
+LM head at M of 1, 32, 64, 96 and 128, and every one of them is **one row high** as
+well -- so the vendor puts M on the width for both weight formats and uses the height
+axis for nothing but attention. This tree's int8 batch, which is the one that works,
+runs on the height and stops being exact at 96. `tests/board_rows_sweep.sh` sweeps
+both axes now, height first as the control. If the width arm reaches 128 then the
+ceiling was the arrangement, on the path that already carries the 2.94x.
 
 **What follows is the record of the search**, kept because the reasoning in it is still
 the reasoning and because most of a fortnight was spent fitting models to the symptom.

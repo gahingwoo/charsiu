@@ -312,18 +312,136 @@ int charsiu_diag(void)
 	return diag_on;
 }
 
-size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m)
+/*
+ * ⚠ THE a TERM IS SWEEPABLE, because the board says w4a16 needs a different
+ * one and nothing says what.
+ *
+ * The in place scan on the real path: row 0 agrees on EXACTLY HALF its
+ * channels and the first it misses is 16. a is (c % 32) / 16, so a = 0 is
+ * exactly half the channels and 16 is the first of the other half. The int8
+ * expression is right about w4a16 except for where the second sixteen channel
+ * half goes, and `a * 4` is the only term that places it.
+ *
+ * CHARSIU_ACC_A takes a coefficient, or "swap" for the two halves exchanged.
+ * A variant that is not a permutation will collide and score badly, which is
+ * the honest outcome rather than a guard here.
+ *
+ * ⚠ READ ONCE PER PROCESS AND CACHED, which is safe only because the sweep
+ * runs one variant per process. Sweeping it inside one process would need this
+ * cleared and g->bmap_m invalidated -- the read order reaches the hardware path
+ * through a TABLE built once per m, not through this function.
+ */
+static unsigned acc_a_coeff(int *swap)
 {
-	unsigned P, G, c, a, t, j;
+	static int done, sw;
+	static unsigned A = 4;
+
+	if (!done) {
+		const char *e = getenv("CHARSIU_ACC_A");
+
+		done = 1;
+		if (e && !strcmp(e, "swap"))
+			sw = 1;
+		else if (e && !strcmp(e, "roleswap"))
+			sw = 2;
+		else if (e && !strcmp(e, "roleswap2"))
+			sw = 3;
+		else if (e)
+			A = (unsigned)strtoul(e, NULL, 0);
+	}
+	*swap = sw;
+	return A;
+}
+
+/*
+ * ⚠⚠ THE READ ORDER DEPENDS ON THE FORMAT, NOT ONLY THE AXIS, and the board
+ * said both halves of that.
+ *
+ *   int8, height axis   a * 4        exact to m = 80, the tower sweep
+ *   int8, width axis    a * 4        its RAW surface is identical to the
+ *                                    height one, mapped cell for cell
+ *   w4a16, width axis   roleswap2    2048 of 2048 on every row at m = 2, 4,
+ *                                    16 and 32, worst relative 5.1e-05
+ *   w4a16, height axis  neither      row 1 is not written at all
+ *
+ * So `w4wide` is the one case that reads differently, and every other caller
+ * gets exactly the expression it had. CHARSIU_ACC_A still overrides, which is
+ * how the two readings were told apart in the first place.
+ */
+size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
+{
+	unsigned P, G, c, a, t, j, A;
+	int swap;
 
 	if (m < 2)
 		return ni;                      /* flat, and measured so */
+	A = acc_a_coeff(&swap);
+	if (!swap && w4wide)
+		swap = 3;                       /* roleswap2, the solved one */
 	P = m / 2;
 	G = ni / 32u;
 	c = ni % 32u;
 	a = c / 16u;
 	t = c % 16u;
-	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * 4u + (t % 4u);
+	/*
+	 * ⚠⚠ roleswap: a AND mi/P TRADE PLACES, and the board's own map is
+	 * where it comes from rather than a guess at what might work.
+	 *
+	 * The in place scan says the default is right on exactly two quadrants
+	 * of (row, half): (0, a=0) and (1, a=1) are correct and the two off
+	 * diagonal ones are not, which is what "1024 of 2048 on each row" is.
+	 * Then the swapped arm, which is wrong everywhere, printed WHERE its
+	 * values went: row 0's a=1 channels at row 1's slot and row 1's a=0
+	 * channels at row 0's, same channel both ways.
+	 *
+	 * Those two facts have one expression between them. Putting a where
+	 * mi/P was and mi/P where a was agrees with the default on the two
+	 * quadrants the board calls correct, differs on the two it calls wrong,
+	 * and reproduces all 36 of the swapped arm's printed landings with none
+	 * missed. It is a permutation at m = 2, 4, 8, 32 and 80.
+	 *
+	 * ⚠ EVERY ONE OF THOSE 36 IS AT m = 2, where P is 1 and (mi % P) * 8 is
+	 * inert. Which of the row's two parts takes the 4 and which keeps the 8
+	 * is therefore a choice at wider m, not a reading. The probe sweeps m
+	 * to 32 and its per m row count is what would catch it.
+	 */
+	/*
+	 * ⚠⚠ AND WHICH PART OF THE ROW TAKES WHICH SLOT, which m = 2 cannot
+	 * see and the board has now said.
+	 *
+	 * Once a takes the 32P block the row has two slots left: one of stride
+	 * 8 with P values and one of stride 4 with 2. At m = 2, P is 1, the
+	 * stride 8 slot is a singleton and the two readings below are the SAME
+	 * FUNCTION -- which is why roleswap scored 2048 of 2048 on both rows
+	 * there and 226 rows of 452 at m = 4.
+	 *
+	 * 226 is 113 tensors times TWO ROWS. If roleswap2 is the truth then
+	 * roleswap is right exactly where they coincide, which is rows 0 and
+	 * m-1 and nothing else:
+	 *
+	 *   m      rows they share    predicts    board
+	 *   2      0, 1               226 of 226  226 of 226
+	 *   4      0, 3               226 of 452  226 of 452
+	 *   16     0, 15              226 of 1808 226 of 1808
+	 *   32     0, 31              226 of 3616 226 of 3616
+	 *   8      0, 7               226 of 904  194 of 904   <-- the one miss
+	 *
+	 * ⚠ m = 8 IS NOT THIS AND HAS NEVER BEEN. Its worst relative error is
+	 * four to six orders out in EVERY arm of every round -- 1.3e4, 3.2e4,
+	 * 2.9e5, 9.7e3, 7.5e4, 1.7e5, 4.7e4 -- where its neighbours sit at 1e3.
+	 * Something else is wrong at that one width and this does not explain
+	 * it or claim to.
+	 */
+	if (swap == 2 || swap == 3) {
+		unsigned hi = swap == 3 ? mi / 2u : mi % P;
+		unsigned lo = swap == 3 ? mi % 2u : mi / P;
+
+		j = (t / 4u) * (8u * P) + hi * 8u + lo * 4u + (t % 4u);
+		return (size_t)G * m * 32u + (size_t)a * (32u * P) + j;
+	}
+	if (swap)
+		a = 1u - a;
+	j = (t / 4u) * (8u * P) + (mi % P) * 8u + a * A + (t % 4u);
 	return (size_t)G * m * 32u + (size_t)(mi / P) * (32u * P) + j;
 }
 
@@ -707,12 +825,40 @@ static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
 	return got;
 }
 
-/* CHARSIU_M_AXIS=w puts the M rows on the width axis instead of the height. */
-static int charsiu_m_axis_w(void)
+/*
+ * WHICH AXIS CARRIES M, and it is three states rather than two now.
+ *
+ *   CHARSIU_M_AXIS=w   the width, whatever the format
+ *   CHARSIU_M_AXIS=h   the height, whatever the format -- which is how the
+ *                      control arm of a board round reaches the arrangement
+ *                      that is known wrong
+ *   unset              the format decides: w4a16 on the width, int8 on the
+ *                      height, because that is what each of them is right on
+ *
+ * The board, on 113 tensors of Llama-3.2-1B: w4a16 on the width is exact at
+ * m = 2, 4, 16, 32, 48, 64 and 80, worst relative 5.10e-05 at every one, and
+ * int8 on the height is exact to m = 80 in the tower sweep. Neither is right
+ * on the other's arrangement.
+ */
+static int charsiu_m_axis(void)
 {
 	const char *e = getenv("CHARSIU_M_AXIS");
 
-	return e && (*e == 'w' || *e == 'W');
+	if (e && (*e == 'h' || *e == 'H'))
+		return 0;
+	if (e && (*e == 'w' || *e == 'W'))
+		return 1;
+	return -1;                              /* unset: ask the format */
+}
+
+/* the same question from outside job.c, for a given weight format: the read
+ * order has to agree with the stream about which axis carries M, and npudev
+ * builds that table */
+int charsiu_m_axis_wide_for(int w4)
+{
+	int a = charsiu_m_axis();
+
+	return a < 0 ? w4 : a;
 }
 
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max)
@@ -751,7 +897,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * cannot move: the default stays the height until a board round says
 	 * otherwise.
 	 */
-	unsigned wide = mm->m > 1 && charsiu_m_axis_w();
+	unsigned wide = mm->m > 1 &&
+			charsiu_m_axis_wide_for(mm->wdtype == CHARSIU_INT4);
 	unsigned inw = wide ? mm->m : 1;
 	unsigned irows = wide ? 1 : mm->m;
 	unsigned ow = inw;
@@ -766,6 +913,27 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * the height axis and undercounts by exactly inw for the width one.
 	 */
 	surf = charsiu_entries_per_row(&surfmm) * inw;
+	/*
+	 * ⚠ THE SPLIT WINDOW, AND WHY IT IS SCOPED TO THE WIDTH AXIS.
+	 *
+	 * surf * rows is the whole input surface either way round: inw * M on
+	 * the width axis and 1 * M on the height. Above 4096 of them the
+	 * vendor's stream carries the split CBUF pair.
+	 *
+	 * Read symmetrically across its whole file rather than off the int4
+	 * streams it was noticed in, "more than 4096 implies split" holds on
+	 * all 8692 streams with no exception -- but the CONVERSE fails: 240 of
+	 * its 4940 fp16 streams split below the threshold too. So it is a
+	 * sufficient condition and not a definition, and there is no evidence
+	 * at all for int8, whose 40 streams here never reach 4096.
+	 *
+	 * int8 above 4096 is exactly the batched path that already works on
+	 * this board -- k = 8192 at m = 64 is 8192 atoms and it has been right
+	 * since the 2.94x round -- so a rule read off int4 must not reach it.
+	 * Scoped to `wide`, every stream that runs today is bit identical to
+	 * before this line existed.
+	 */
+	unsigned split = wide && surf * rows > 4096;
 	size_t wbytes = charsiu_weight_bytes(mm);
 	int w4a16 = 0, w4_dpu = 0;
 	unsigned wide8 = 0;
@@ -821,8 +989,22 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     (charsiu_effective_adtype(mm) == CHARSIU_FP16 ? 0x20000000u : 0u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
+	/*
+	 * ⚠ THE SPLIT CBUF PAIR IS A FUNCTION OF surf * M, and this wrote the
+	 * unsplit one at every M.
+	 *
+	 * The rule is exact on the vendor's own file: of its 3328 int4 streams,
+	 * every one with surf * M > 4096 carries the split pair and every one
+	 * at or below carries the unsplit, 0 disagreements. Both of its cbuf
+	 * window variants take it -- 0x0404 becomes 0x0505 and 0x040b becomes
+	 * 0x050c -- so it adds 0x0101 rather than replacing the word.
+	 *
+	 * It is a no-op below the threshold, which is every shape this tree has
+	 * ever run: at M = 1 an ic of 131072 would be needed to reach it.
+	 */
 	emit(&e, CNA, 0x1018,
-	     job->cbuf_window == 1 ? 0x4000040bu : 0x40000404u);
+	     (job->cbuf_window == 1 ? 0x4000040bu : 0x40000404u) +
+	     (split ? 0x0101u : 0u));
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
 	emit(&e, CNA, 0x1024, n_pad - 1);
@@ -850,7 +1032,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x103c,
 	     (surf << 16) | (job->cbuf_window == 1 ? 0x1c00u : 0u));
 	emit(&e, CNA, 0x1040,
-	     job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u);
+	     (job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u) +
+	     (split ? 0x04000000u : 0u));
 	emit(&e, CNA, 0x1044, (inw << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);
 	emit(&e, CNA, 0x104c, 0x00010001);
@@ -909,7 +1092,18 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1110, job->weight_addr);
 	emit(&e, CNA, 0x1140, 0x00000000);
 	emit(&e, CNA, 0x1144, 0x00000000);
-	emit(&e, CNA, 0x118c, ((inw - 1) << 16) | (rows - 1));
+	/*
+	 * ⚠ BOTH HALVES ARE M - 1 ON THE WIDTH AXIS, not the width and the
+	 * height. The vendor's int4 streams carry 0x004f004f at M = 80 on an
+	 * image ONE ROW HIGH, so the low half is not the row count there; and
+	 * ((M-1) << 16) | (M-1) is exact on all 3328 of them.
+	 *
+	 * Round 380 set this register from the vendor's file and the board said
+	 * it made no difference. That round ran on the HEIGHT axis, where M
+	 * moves nothing at all, so it did not test this and does not excuse it.
+	 */
+	emit(&e, CNA, 0x118c, wide ? (((inw - 1) << 16) | (inw - 1))
+				   : (((inw - 1) << 16) | (rows - 1)));
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
@@ -1341,11 +1535,37 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 *
 	 * CHARSIU_DPU_40B8 replaces the value so the next sweep can hold it.
 	 */
+	/*
+	 * ⚠⚠ AND `rows` IS NOT THE BATCH COUNT ON THE WIDTH AXIS, WHERE IT IS
+	 * 1. 3 * rows is 3 there at every M, and 3 is exactly what the board
+	 * wrote when it produced 92 of 128 words at m = 2: the baseline of the
+	 * sweep and the `0x40b8 = 3` row of it are the same number twice.
+	 *
+	 * Swept on the board on the WIDTH axis at m = 2, K = 64 N = 64:
+	 *
+	 *   value    1    2    3    4    6    8   16
+	 *   words   68   80   92  104  128  104   64
+	 *   absent  54   41   31   20    0   21   60
+	 *
+	 * 6 is 3 * M and it writes the FULL SURFACE with nothing absent. It is
+	 * not a trend either -- 8 is worse than 4 -- so the fill point is a
+	 * point and not a floor.
+	 *
+	 * ⚠ THE SAME VALUE BUYS SOMETHING DIFFERENT ON EACH AXIS. The height
+	 * sweep above found 3, 6, 12 at m = 1, 2, 4 and each peak was worth
+	 * about ONE ROW, 64 values whatever m was. On the width axis 6 at m = 2
+	 * is all 128. Same expression, and the axis is what decides whether it
+	 * completes the surface or one row of it.
+	 *
+	 * `wide ? ow : rows` is M under both arrangements and is bit identical
+	 * on the height axis, where ow is 1 and rows is M.
+	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
 	{
 		const char *e8b = getenv("CHARSIU_DPU_40B8");
+		unsigned batch = wide ? ow : rows;
 		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
-			   ? 3u * rows : (uint32_t)(ow * (2 * rows - rows));
+			   ? 3u * batch : (uint32_t)(ow * (2 * rows - rows));
 
 		if (e8b)
 			v = (uint32_t)strtoul(e8b, NULL, 0);

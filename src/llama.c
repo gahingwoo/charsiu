@@ -557,7 +557,14 @@ static double now_ms(void)
 int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		      unsigned mmax)
 {
-	static const unsigned MS[] = { 2, 4, 8, 16, 32 };
+	/*
+	 * ⚠ THE WIDTHS THE PREFILL WILL ACTUALLY USE, not just the ones the
+	 * read order was solved on. roleswap2 is exact at 2, 4, 16 and 32 and
+	 * m = 8 is 871 of 904, so the question is now where else it bends --
+	 * and a chunk of 48, 64 or 80 is what a real prompt hands it.
+	 * --batch-probe N still caps this.
+	 */
+	static const unsigned MS[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
 	float *X = NULL, *Y = NULL, *Yref = NULL;
 	struct charsiu_act a;
 	unsigned widest = 0;
@@ -578,8 +585,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	if (charsiu_act_alloc(&a, (int)widest) < 0)
 		return -1;
 
-	printf("\n  batching %u layers, checked before it is timed\n",
+	/*
+	 * ⚠ SAY WHICH WIDTHS, because the caller caps this and the two have
+	 * already disagreed. MS[] was widened to 80 and the board script was
+	 * still passing --batch-probe 32, so a round that was run to reach 48,
+	 * 64 and 80 stopped at 32 and its header said 32 while the reason for
+	 * running it said otherwise. A list that prints cannot do that.
+	 */
+	printf("\n  batching %u layers, checked before it is timed; widths",
 	       m->n_layer);
+	for (unsigned i = 0; i < sizeof(MS) / sizeof(*MS); i++)
+		if (MS[i] <= mmax)
+			printf(" %u", MS[i]);
+	printf("   (--batch-probe caps at %u)\n", mmax);
 	printf("    m  tensors    worst rel   rows that agree"
 	       "     one row    batched  speedup  us a row    GB/s"
 	       "   where the batched time went, ms\n");
@@ -952,6 +970,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
+		unsigned nbad = 0;		/* misses named, capped */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
@@ -1012,6 +1031,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			}
 			for (unsigned r = 0; r < mr; r++) {
 				int ok = 1;
+				double rworst = 0;
 
 				for (unsigned j = 0; j < (unsigned)t->n; j++) {
 					size_t o = (size_t)r * t->n + j;
@@ -1022,11 +1042,30 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 					if (rel > worst)
 						worst = rel;
+					if (rel > rworst)
+						rworst = rel;
 					if (rel > 1e-3)
 						ok = 0;
 				}
 				rows_ok += ok;
 				rows_tot++;
+				/*
+				 * ⚠ NAME THE TENSOR AND THE ROW when a width
+				 * that is otherwise exact loses a few. m = 8
+				 * comes back 871 of 904 -- 33 rows, not a
+				 * whole tensor and not a whole row of them --
+				 * where 4 and 16 either side are perfect, and
+				 * a count of 33 cannot say whether it is one
+				 * shape, one row index, or scattered. Eight
+				 * lines is enough to tell those apart.
+				 */
+				if (!ok && nbad < 8) {
+					printf("      MISS %-24s k=%-5u n=%-5u"
+					       " row %u of %u, worst rel %.2e\n",
+					       t->name, (unsigned)t->k,
+					       (unsigned)t->n, r, mr, rworst);
+					nbad++;
+				}
 			}
 			/*
 			 * ⚠⚠ WRONG PLACE OR WRONG NUMBER, which are different
@@ -1102,6 +1141,176 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					printf("    row%u: %zu of %u of its values"
 					       " are in the batch\n",
 					       r, have, (unsigned)t->n);
+				}
+				/*
+				 * ⚠⚠ AND WHERE EACH ONE LANDED, which is the
+				 * permutation itself rather than a count of it.
+				 *
+				 * This is what npu_gemm_test --read does for
+				 * the int8 accumulator, and it is how that
+				 * layout was solved twice. There is no
+				 * equivalent for w4a16: npu_gemm_test has no
+				 * int4 at all and charsiu_int4 runs w4a8, so
+				 * the runtime's own format has never had its
+				 * output surface mapped at m > 1. This is that
+				 * map, on the real path, with the real weights.
+				 *
+				 * ⚠ Y IS ALREADY READ THROUGH charsiu_acc_index.
+				 * The table below is therefore the permutation
+				 * that is LEFT after this tree's read order, so
+				 * "landed at (r, c) itself" is what correct
+				 * looks like and anything else is the residue.
+				 *
+				 * ⚠ THE WHOLE OF ROW 0, not its first six.
+				 * Round 381 sampled six, saw 0 1 2 3 8 9, and
+				 * had to explain afterwards why a layout that
+				 * fit them scored 15 of 128. Six cannot say
+				 * where a pattern stops.
+				 *
+				 * ⚠ AND HOW TRUSTWORTHY IT IS. Every row
+				 * reports the FIRST slot holding the value, so
+				 * a value the reference produces twice gives
+				 * one answer out of two and reads like one out
+				 * of one. The distinct count is printed first
+				 * for exactly that reason.
+				 */
+				/*
+				 * ⚠⚠ POSITION BY POSITION FIRST, because the
+				 * search below is fuzzy and this is not.
+				 *
+				 * "Is the value somewhere in the batch" matches
+				 * on 1e-3 relative, which for a value near zero
+				 * is 1e-3 ABSOLUTE -- so every small output
+				 * matches every other small output and both the
+				 * present count and the landed-at column are
+				 * inflated by it. The board says how much:
+				 * this reference has 1456 unique values in
+				 * 4096, and a table is only as good as that.
+				 *
+				 * Comparing Y[r][c] against Yref[r][c] has no
+				 * such freedom. It cannot say where a value
+				 * WENT, but it says exactly where a row stops
+				 * being right, which is the question row 0 has
+				 * been raising for three rounds by being exact
+				 * in its first six channels and agreeing on no
+				 * row at all.
+				 */
+				for (unsigned r = 0; r < mr && r < 4; r++) {
+					size_t agree = 0;
+					long first = -1;
+
+					for (unsigned c = 0; c < (unsigned)t->n; c++) {
+						double w = Yref[(size_t)r * t->n + c];
+						double d = fabs((double)Y[(size_t)r * t->n + c] - w);
+						double lim = fabs(w) > 1e-3
+							   ? fabs(w) * 1e-3 : 1e-3;
+
+						if (d <= lim)
+							agree++;
+						else if (first < 0)
+							first = c;
+					}
+					printf("    row%u in place: %zu of %u channels agree",
+					       r, agree, (unsigned)t->n);
+					if (first < 0)
+						printf(", the whole row\n");
+					else
+						printf(", first wrong at channel %ld\n",
+						       first);
+				}
+				/*
+				 * ⚠ AN OFFLINE SWEEP OF THE READ ORDER WAS
+				 * WRITTEN HERE AND REMOVED, and the reason is
+				 * worth keeping.
+				 *
+				 * It reconstructed the raw buffer from Y and
+				 * scored candidate index functions against it
+				 * without a board round. Y is not raw: the
+				 * batched read is `yr[j] += fo[mp[j]] * sc[j]`
+				 * and sc is PER OUTPUT CHANNEL, so a value
+				 * scored at a different channel carries the
+				 * wrong scale and the whole table is off by a
+				 * ratio wherever a candidate crosses a group
+				 * boundary. Nearly sound is exactly the kind of
+				 * instrument this tree has been burned by.
+				 *
+				 * The family is two members anyway. Of a * A
+				 * and the two halves swapped, only A = 4 and
+				 * the swap are permutations at all -- 128 of
+				 * 128 distinct slots against 68, 80, 96 and 64
+				 * for A of 8, 1, 2 and 0 -- and A = 4 is the
+				 * control. So CHARSIU_ACC_A picks between them
+				 * and the board scores both exactly, through
+				 * the real read path with the real scales.
+				 */
+				{
+					size_t uniq = 0, q, o;
+					/* ⚠ NOT A MULTIPLE OF 32, or every sampled
+					 * channel has a = 0 and the half that is
+					 * wrong is never looked at. The last round
+					 * stepped by 64 and every one of its 32
+					 * samples was in the good half. */
+					unsigned step = t->n >= 128
+						      ? (unsigned)t->n / 32 + 4 : 4;
+
+					for (q = 0; q < tot; q++) {
+						double w = Yref[q];
+						double lim = fabs(w) > 1e-3
+							   ? fabs(w) * 1e-3 : 1e-3;
+						size_t same = 0;
+
+						for (o = 0; o < tot; o++)
+							if (fabs((double)Yref[o] - w) <= lim)
+								same++;
+						if (same == 1)
+							uniq++;
+					}
+					printf("    the reference has %zu unique"
+					       " values in %zu (the table is only"
+					       " as good as that)\n", uniq, tot);
+					printf("    %-10s %-12s %-12s %-6s %s\n",
+					       "(row,ch)", "want", "landed at",
+					       "hits", "correct is (row,ch) itself");
+					/*
+					 * ⚠ THE FIRST 64 CHANNELS IN FULL, then
+					 * a coarse tail. The structure repeats
+					 * every 32 -- a is (c%32)/16 and t is
+					 * c%16 -- so one pair of super groups
+					 * holds all of it, and the half that is
+					 * WRONG is in there. A coarse sweep
+					 * alone cannot solve a layout; that is
+					 * how the last round sampled 32 channels
+					 * and every one of them was in the good
+					 * half.
+					 */
+					for (unsigned r = 0; r < mr && r < 2; r++) {
+						unsigned st = r ? step * 4 : step;
+						unsigned c;
+
+						for (c = 0; c < (unsigned)t->n;
+						     c = c < 64 ? c + 1 : c + st) {
+							double w = Yref[(size_t)r * t->n + c];
+							double lim = fabs(w) > 1e-3
+								   ? fabs(w) * 1e-3 : 1e-3;
+							size_t at = tot, hits = 0;
+
+							for (o = 0; o < tot; o++)
+								if (fabs((double)Y[o] - w) <= lim) {
+									if (at == tot)
+										at = o;
+									hits++;
+								}
+							if (at == tot)
+								printf("    (%u,%-5u) %12.4f %-12s %-6s\n",
+								       r, c, w, "nowhere", "-");
+							else
+								printf("    (%u,%-5u) %12.4f (%zu,%-5zu) %-6zu%s\n",
+								       r, c, w, at / t->n,
+								       at % t->n, hits,
+								       (at == (size_t)r * t->n + c)
+								       ? "  <= correct" : "");
+						}
+					}
 				}
 			}
 			/* what the hardware moved: the weights, once */
@@ -2805,23 +3014,47 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  */
 const char *llama_batch_why_not(const struct llama_model *m)
 {
-	if (m->v_norm)
-		return "a value norm";
-	if (m->n_embd_pl)
-		return "per layer embeddings";
-	if (kv_posmajor())
-		return "a position major KV cache";
+	/*
+	 * ⚠⚠ EVERY REASON, NOT THE FIRST ONE. Returning the first costs a
+	 * board round each time it is fixed: gemma4 came back "a value norm",
+	 * and the round after that would have said "KV shared between layers",
+	 * and the one after that something else again. One line should say the
+	 * whole distance to a batched prompt.
+	 */
+	static char buf[256];
+	size_t n = 0;
+	int fused = 0, shared = 0, ffvar = 0;
+
+	buf[0] = 0;
+#define WHY(cond, txt) do {                                                 \
+		if (cond) {                                                 \
+			int w_ = snprintf(buf + n, sizeof(buf) - n, "%s%s",  \
+					  n ? ", " : "", txt);              \
+			if (w_ > 0 && (size_t)w_ < sizeof(buf) - n)         \
+				n += (size_t)w_;                            \
+		}                                                           \
+	} while (0)
+
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 
 		if (!L->wk || !L->wv)
-			return "fused or absent K and V projections";
+			fused = 1;
 		if (L->kv_from >= 0)
-			return "KV shared between layers";
+			shared = 1;
 		if (L->n_ff != m->layers[0].n_ff)
-			return "a feed forward width that varies by layer";
+			ffvar = 1;
 	}
+	WHY(m->n_embd_pl, "per layer embeddings");
+	WHY(kv_posmajor(), "a position major KV cache");
+	WHY(fused, "fused or absent K and V projections");
+	WHY(shared, "KV shared between layers");
+	WHY(ffvar, "a feed forward width that varies by layer");
+#undef WHY
+	if (n)
+		return buf;
 	/*
+	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
 	 * board; charsiu took 7354, because a query norm sent the whole prompt
@@ -3074,6 +3307,18 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 					qk_norm(s->k, m->n_head_kv, hd,
 						L->k_norm, m->rms_eps);
 			}
+			/*
+			 * ⚠ THE VALUE NORM IS THE SAME CALL, and refusing a
+			 * model for it was right only while this line did not
+			 * exist. gemma4 norms V with no gain -- llama.cpp
+			 * writes it as a bare rms_norm, so there is no weight
+			 * to find and the only place it exists is the graph --
+			 * and it is qk_norm with a NULL gain, per row, in the
+			 * same position the token loop puts it.
+			 */
+			if (m->v_norm && L->wk)
+				qk_norm(s->v, m->n_head_kv, hd, NULL,
+					m->rms_eps);
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
 			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
 			/* ⚠ the cache is strided by hdmax, written at hd */

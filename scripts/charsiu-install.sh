@@ -879,7 +879,13 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 	      charsiu_vision charsiu_clip charsiu_whisper"
 PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
-PROBE_SCRIPTS="prefill_control.sh"
+# ⚠ EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
+# down says a probe that lives only in the source tree under ~/.cache is a
+# board round that does not happen -- and then only prefill_control.sh was
+# listed, so every board_*.sh written since has been exactly that: reachable
+# by a path nobody types.
+PROBE_SCRIPTS="prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
+board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh board_threads.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;

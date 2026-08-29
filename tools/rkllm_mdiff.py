@@ -46,6 +46,11 @@ from rkllm_regcmd import streams, decode, geometry, TARGETS, CNA   # noqa: E402
 
 # The input surface block. Everything here is degenerate at M = 1: a stride
 # over one row, a count of one, a last index of zero.
+#
+# ⚠ M IS geo["m"], THE PIXEL COUNT, and this file used geo["rows"] -- which is
+# what produced its "4.0 bit weights   M=1 only   3328 dispatches" line and the
+# conclusion that the vendor never batches a weight matmul. It batches 2816 of
+# those 3328, up to M = 80; they are one row high and M pixels wide.
 BLOCK = [0x1028, 0x102c, 0x1034, 0x1078, 0x1090, 0x1094, 0x1098, 0x118c]
 
 
@@ -56,7 +61,7 @@ def collect(path):
         regs = decode(ws)
         geo = geometry(regs)
         if geo:
-            rep.setdefault((geo["ic"], geo["oc"], geo["rows"]), (regs, geo))
+            rep.setdefault((geo["ic"], geo["oc"], geo["m"]), (regs, geo))
     return rep
 
 
@@ -91,7 +96,7 @@ def main():
     for _, ws in streams(path):
         geo = geometry(decode(ws))
         if geo:
-            hist.setdefault(geo["weight_bits"], Counter())[geo["rows"]] += 1
+            hist.setdefault(geo["weight_bits"], Counter())[geo["m"]] += 1
     print("what the vendor batches, by weight width")
     for wb in sorted(hist):
         h = hist[wb]

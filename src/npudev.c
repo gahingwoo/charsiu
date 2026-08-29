@@ -210,6 +210,7 @@ struct charsiu_npu {
 	 */
 	uint32_t *bmap;
 	unsigned bmap_m;
+	unsigned bmap_n4;	/* the table is one entry per FOUR channels */
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
@@ -1677,6 +1678,51 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * land on a device, so they are reallocated when either does and never by a
  * decode, which uses none of them.
  */
+/*
+ * Both switches or neither. An int4 batch on the height axis is the wrong
+ * answer at a very good speed, which is the one failure mode this tree has
+ * already shipped once.
+ *
+ * ⚠ AND "height" IS A THIRD VALUE, because the first board round's control was
+ * VACUOUS. tests/board_w4_axis.sh ran the height axis as the arm that must
+ * fail, and it did -- by hitting this refusal, which is a decision in software
+ * and says nothing about the hardware. A control that cannot reach the thing
+ * it is controlling for is not a control.
+ *
+ * CHARSIU_NPU_W4_BATCH=height is "yes, on the axis that is known wrong, I am
+ * running the arm that must fail". Nothing else should ever set it.
+ */
+static const char *w4_batch_why_not(unsigned m)
+{
+	const char *b = getenv("CHARSIU_NPU_W4_BATCH");
+
+	/* "height" is the board control deliberately reaching the arrangement
+	 * that is known wrong; nothing else should ever set it */
+	if (b && !strcmp(b, "height"))
+		return NULL;
+	if (b && *b == '0')
+		return "int4 batching is switched off";
+	if (!charsiu_m_axis_wide_for(1))
+		return "int4 batches on the width axis and this asked for height";
+	/*
+	 * ⚠⚠ m = 8 IS THE ONE WIDTH THAT IS STILL WRONG, and the board named
+	 * it rather than leaving it as a count.
+	 *
+	 * Every other width the probe reaches is exact -- 2, 4, 16, 32, 48, 64
+	 * and 80, worst relative 5.10e-05 across 113 tensors. m = 8 returns
+	 * 871 rows of 904, and the 33 that miss are not scattered: they are
+	 * ROW 0 of the n = 8192 tensors, every ffn_gate and ffn_up in the
+	 * model, at that width and no other.
+	 *
+	 * One shape and one row is a small enough target to find. Until it is
+	 * found this refuses the width, and the caller falls back to a row at
+	 * a time for that chunk, which is correct and merely slower.
+	 */
+	if (m == 8)
+		return "int4 at m=8 misses row 0 of the n=8192 tensors";
+	return NULL;
+}
+
 static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 		      unsigned nslots)
 {
@@ -1763,9 +1809,30 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * between the two streams has been put back one at a time -- the DPU
 	 * and RDMA blocks are identical to begin with, the CNA differences are
 	 * datatype scaling, CORE 0x301c is inert and 0x3018 is the arithmetic
-	 * switch. job.c has said since round 347 that the vendor runs w4a16 on
-	 * the WIDTH axis, and the vendor never batches a weight matmul at all,
-	 * so there is no M > 1 int4 stream anywhere to copy.
+	 * switch.
+	 *
+	 * ⚠⚠ THE LAST SENTENCE OF THIS USED TO BE "the vendor never batches a
+	 * weight matmul at all, so there is no M > 1 int4 stream anywhere to
+	 * copy", AND IT IS FALSE. It came from reading M off the row count.
+	 * The vendor's Llama-3.2-1B .rkllm holds 3328 int4 streams and 2816 of
+	 * them -- 85% -- are batched, at M of 16, 24, 32, 40, 48, 64 and 80.
+	 * They read as one row because the int4 path carries M on the WIDTH,
+	 * so its row count is 1 whatever M is; its fp16 streams put M on the
+	 * height, where rows and pixels agree, which is why the two axes were
+	 * never told apart. tools/cmp_vendor.py compares on the pixel count now.
+	 *
+	 * ⚠ The largest int4 M they emit is 80, which is also where this board's
+	 * batched prefill stops being exact -- but that is NOT the same fact
+	 * twice: ours is int8 on the height axis and theirs is int4 on the
+	 * width. Their int8 head runs 128 rows, one row high like the rest, so
+	 * they put M on the width for both weight formats and use the height
+	 * for nothing but fp16 attention. Our 80 is therefore a property of an
+	 * arrangement they never use, and board_rows_sweep.sh now asks both.
+	 *
+	 * So every word of the paragraph above is about the HEIGHT axis, which
+	 * is the one that produces a single row. What has never run on this
+	 * board is the width axis, and that is now the only form of this the
+	 * vendor is known to use.
 	 *
 	 * Batching amortises the weight bytes over m rows, which is exactly
 	 * what makes int8's extra byte cheap: at m = 32 the same weights serve
@@ -1791,11 +1858,23 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 *
 	 * The caller falls back to a row at a time, which is correct and is
 	 * what int4 did before any of this existed.
+	 *
+	 * ⚠ CHARSIU_NPU_W4_BATCH=1 LIFTS IT, and only together with
+	 * CHARSIU_M_AXIS=w. The height axis is the form five rounds proved
+	 * writes one row, so letting it batch would just reproduce the wrong
+	 * answer at 37 tok/s again. The width axis is what the vendor's own
+	 * stream does and what charsiu now matches it on, and it has never been
+	 * on this board -- so it is an experiment with a switch, not a default.
+	 * llama_batch_probe checks every row before it times anything.
 	 */
 	if (g->w4) {
-		whine(g, "int4 computes one row: batching is int8 only",
-		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
-		return -1;
+		const char *why = w4_batch_why_not(m);
+
+		if (why) {
+			whine(g, why, (unsigned)g->ent[id].t->k,
+			      (unsigned)g->ent[id].t->n);
+			return -1;
+		}
 	}
 	e = &g->ent[id];
 	if (e->n_npu != (unsigned)e->t->n) {
@@ -1973,9 +2052,32 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		g->bfence_us += now_us() - tf;
 		tf = now_us();
 		{
+			/* ⚠ THE KEY IS m ALONE and that is still right: the
+			 * format and the axis are fixed for the life of a
+			 * pool, so only the width can change under it. */
+			/*
+			 * ⚠⚠ ONE ENTRY PER FOUR CHANNELS, because the read
+			 * order is FOUR CONSECUTIVE SLOTS and always has been.
+			 *
+			 * charsiu_acc_index(r, j+q) == charsiu_acc_index(r, j)
+			 * + q for q of 1, 2 and 3 at every j that is a
+			 * multiple of four: checked at 1503680 groups over
+			 * both formats, m of 2 to 80 and n of 64 to 8192, with
+			 * none broken. The `t % 4` term is the only one that
+			 * moves inside a group of four and it moves by one.
+			 *
+			 * The table was a uint32 per output channel, so the
+			 * gather below read FOUR BYTES OF INDEX FOR EVERY FOUR
+			 * BYTES OF DATA -- half its memory traffic was the
+			 * table. At m = 32 that gather is 368 ms of a 702 ms
+			 * batched matmul and at m = 80 it is 933 of 1746: the
+			 * dominant cost of a batched projection now that the
+			 * hardware part is right.
+			 */
 			if (g->bmap_m != m) {
+				unsigned n4 = (g->nmax + 3) / 4;
 				uint32_t *t2 = realloc(g->bmap,
-					(size_t)m * g->nmax * sizeof(*t2));
+					(size_t)m * n4 * sizeof(*t2));
 
 				if (!t2) {
 					whine(g, "the read order table would not allocate",
@@ -1983,10 +2085,12 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					return -1;
 				}
 				g->bmap = t2;
+				g->bmap_n4 = n4;
 				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < g->nmax; j++)
-						g->bmap[(size_t)r * g->nmax + j] =
-						  (uint32_t)charsiu_acc_index(r, j, m);
+					for (unsigned j = 0; j < n4; j++)
+						g->bmap[(size_t)r * n4 + j] =
+						  (uint32_t)charsiu_acc_index(r, j * 4, m,
+							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
 			}
 			/*
@@ -2033,23 +2137,59 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				 */
 				for (unsigned r = 0; r < m; r++) {
 					const uint32_t *mp = g->bmap
-							  + (size_t)r * g->nmax;
+							  + (size_t)r * g->bmap_n4;
 					float *yr = Y + (size_t)r * e->t->n
 						  + s->n0;
+					unsigned n4 = sn / 4, j;
 
+					/*
+					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
+					 * tail is whatever a slice's width
+					 * leaves over, and it recomputes its
+					 * own base rather than reading a table
+					 * entry that may not exist.
+					 */
 					if (g->w4 && grp) {
 						const float *sc = s->sc;
 
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += fo[mp[j]] * sc[j];
+						for (j = 0; j < n4; j++) {
+							const float *fp = fo + mp[j];
+							float *yp = yr + j * 4;
+							const float *cp = sc + j * 4;
+
+							yp[0] += fp[0] * cp[0];
+							yp[1] += fp[1] * cp[1];
+							yp[2] += fp[2] * cp[2];
+							yp[3] += fp[3] * cp[3];
+						}
+						for (j = n4 * 4; j < sn; j++)
+							yr[j] += fo[mp[j / 4] + j % 4] * sc[j];
 					} else if (g->w4) {
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += fo[mp[j]];
+						for (j = 0; j < n4; j++) {
+							const float *fp = fo + mp[j];
+							float *yp = yr + j * 4;
+
+							yp[0] += fp[0];
+							yp[1] += fp[1];
+							yp[2] += fp[2];
+							yp[3] += fp[3];
+						}
+						for (j = n4 * 4; j < sn; j++)
+							yr[j] += fo[mp[j / 4] + j % 4];
 					} else {
 						float d1 = g->bd1[(size_t)ki * m + r];
 
-						for (unsigned j = 0; j < sn; j++)
-							yr[j] += (float)io[mp[j]] * d1;
+						for (j = 0; j < n4; j++) {
+							const int32_t *ip = io + mp[j];
+							float *yp = yr + j * 4;
+
+							yp[0] += (float)ip[0] * d1;
+							yp[1] += (float)ip[1] * d1;
+							yp[2] += (float)ip[2] * d1;
+							yp[3] += (float)ip[3] * d1;
+						}
+						for (j = n4 * 4; j < sn; j++)
+							yr[j] += (float)io[mp[j / 4] + j % 4] * d1;
 					}
 				}
 				nt++;
