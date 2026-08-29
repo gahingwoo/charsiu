@@ -543,6 +543,38 @@ already, so "landed at (r, c) itself" is what correct looks like.
 That runs on the real path with the real weights, which the two dedicated tools
 cannot do.
 
+### The landing table, and the two things wrong with reading it
+
+The round printed, and then my own script cut it off at eighteen lines -- which
+is exactly where the landing table ends. Row 0 came back sampled to channel 384,
+no row 1, and none of the timing table either. `board_acc_map.sh` lost m = 8 to
+a `head -80` one round earlier. Twice is a pattern: **the deciding output is at
+the bottom of what these tools print, and a cap is a silent cut.** The cap is
+gone; the one left in `board_acc_map.sh` caps the map only, with the three
+deciding lines grepped out ahead of it.
+
+What did print is worth having:
+
+```
+  height   (0,320) landed at (0,63)      the other six sampled channels correct
+  width    (0,320) landed at (0,320)     all seven correct
+           row0 1677 of 2048, row1 1677  against height's 1673 and 1343
+```
+
+⚠⚠ **AND THE ORACLE IS WEAK, WHICH THE BOARD SAID ITSELF:** *the reference has
+1456 unique values in 4096*. The search matches on 1e-3 RELATIVE, which for a
+value near zero is 1e-3 absolute, so every small output matches every other
+small output. Both the present count and the landed-at column are inflated by
+that, and 2640 of 4096 reference values are not unique. A hits column reading
+1 to 4 is saying so on every line.
+
+So the probe now scans **position by position** as well, `Y[r][c]` against
+`Yref[r][c]`, which has no such freedom: how many channels of each row agree
+where they stand, and the first one that does not. It cannot say where a value
+went, but it says exactly where a row stops being right -- which is the question
+row 0 has been raising for three rounds by being exact in its first six channels
+and agreeing on no row at all.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not

@@ -1135,6 +1135,50 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * of one. The distinct count is printed first
 				 * for exactly that reason.
 				 */
+				/*
+				 * ⚠⚠ POSITION BY POSITION FIRST, because the
+				 * search below is fuzzy and this is not.
+				 *
+				 * "Is the value somewhere in the batch" matches
+				 * on 1e-3 relative, which for a value near zero
+				 * is 1e-3 ABSOLUTE -- so every small output
+				 * matches every other small output and both the
+				 * present count and the landed-at column are
+				 * inflated by it. The board says how much:
+				 * this reference has 1456 unique values in
+				 * 4096, and a table is only as good as that.
+				 *
+				 * Comparing Y[r][c] against Yref[r][c] has no
+				 * such freedom. It cannot say where a value
+				 * WENT, but it says exactly where a row stops
+				 * being right, which is the question row 0 has
+				 * been raising for three rounds by being exact
+				 * in its first six channels and agreeing on no
+				 * row at all.
+				 */
+				for (unsigned r = 0; r < mr && r < 4; r++) {
+					size_t agree = 0;
+					long first = -1;
+
+					for (unsigned c = 0; c < (unsigned)t->n; c++) {
+						double w = Yref[(size_t)r * t->n + c];
+						double d = fabs((double)Y[(size_t)r * t->n + c] - w);
+						double lim = fabs(w) > 1e-3
+							   ? fabs(w) * 1e-3 : 1e-3;
+
+						if (d <= lim)
+							agree++;
+						else if (first < 0)
+							first = c;
+					}
+					printf("    row%u in place: %zu of %u channels agree",
+					       r, agree, (unsigned)t->n);
+					if (first < 0)
+						printf(", the whole row\n");
+					else
+						printf(", first wrong at channel %ld\n",
+						       first);
+				}
 				{
 					size_t uniq = 0, q, o;
 					unsigned step = t->n >= 128

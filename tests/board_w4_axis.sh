@@ -113,7 +113,13 @@ for AXIS in h w; do
 		echo
 		continue
 	fi
-	sed -n '/batching .* layers/,$p' "$out" | head -18 | sed 's/^/  /'
+	# ⚠ NO head CAP. This had one at 18 lines and the landing table is
+	# exactly 18 lines long, so the round came back with row 0 sampled to
+	# channel 384 and nothing else -- no row 1, and none of the timing
+	# table either. The round before that lost m = 8 to a head -80 in
+	# board_acc_map.sh. Twice is a pattern: the deciding output is at the
+	# BOTTOM of what these tools print, and a cap is a silent cut.
+	sed -n '/batching .* layers/,$p' "$out" | sed 's/^/  /'
 	echo
 done
 
