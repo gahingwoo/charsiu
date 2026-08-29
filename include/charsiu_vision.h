@@ -169,6 +169,33 @@ void charsiu_vision_attention(const float *q, const float *k, const float *v,
  *
  * ⚠ A HOST ANSWERS THIS WRONG FOR THE BOARD. Read the note above the function.
  */
+/*
+ * How many queries share one pass over the keys and one over the values. The
+ * K and V traffic divides by it; the scores it has to hold are qb * n floats
+ * and stop fitting in cache. CHARSIU_VATTN_QB sets it.
+ *
+ * ⚠ RUNTIME SO IT CAN BE SWEPT IN ONE PROCESS. Two builds compared one after
+ * the other cannot tell a block size apart from the load on the machine.
+ */
+unsigned charsiu_vision_attn_qb(void);
+void charsiu_vision_attn_qb_set(unsigned qb);
+
+/*
+ * The fused kernel: the keys are tiled too, so the scores live qb * kt at a
+ * time in L1 instead of qb * n in L2, and the block size stops being capped by
+ * a scratch array. CHARSIU_VATTN_FUSED=0 restores the three pass kernel and
+ * CHARSIU_VATTN_KT sets the key tile.
+ *
+ * ⚠⚠ THIS IS THE ONE THAT CHANGES THE ANSWER. Everything else here reorders
+ * only the ISSUE of the arithmetic and is bit identical; a running maximum with
+ * a rescale is the same number in exact arithmetic and a few ulp away in f32.
+ * The exact kernel is kept as the control it has to be diffed against.
+ */
+int charsiu_vision_attn_fused(void);
+void charsiu_vision_attn_fused_set(int on);
+unsigned charsiu_vision_attn_kt(void);
+void charsiu_vision_attn_kt_set(unsigned kt);
+
 int charsiu_vision_attn_sched_get(void);
 void charsiu_vision_attn_sched_set(int sched);
 const char *charsiu_vision_attn_sched_name(int sched);

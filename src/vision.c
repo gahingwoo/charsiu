@@ -722,7 +722,7 @@ static void pixel_shuffle(const float *x, float *out, unsigned grid,
 struct vattn {
 	const float *q, *k, *v;
 	float *o;
-	unsigned n, W, hd, nh, nb;
+	unsigned n, W, hd, nh, nb, qb, kt, fused;
 	float scale;
 };
 
@@ -733,21 +733,131 @@ struct vattn {
  * arithmetic bound, which is why vectorising it bought 2.9x on a host and 1.24x
  * there. See the long note in whisper.c.
  *
- * ⚠ THE NUMBER IS MEASURED, NOT CHOSEN. tests/vattn_sweep.sh times the whole
- * curve; -DVATTN_QB= is how a board re-asks the question without a patch,
- * because the answer depends on how much L2 the machine has and this host has
- * an order of magnitude more of it than the board does.
+ * QB queries share one pass over the keys and one over the values, so the K and
+ * V traffic divides by QB and the arithmetic is unchanged. What stops it going
+ * up for ever is the scores: they are QB * n floats and they are written once,
+ * read three times by the softmax and read again by the value pass, so past the
+ * point where they stop fitting in cache the block starts paying for itself.
+ *
+ * ⚠ THE NUMBER IS MEASURED, NOT CHOSEN, AND IT IS THE MACHINE'S ANSWER. It is a
+ * runtime value so vattn_bench -Q can sweep it in ONE process against the same
+ * interference, and so a board can re-ask without a rebuild; nq was already a
+ * runtime bound, so nothing in the inner loops changed shape.
  */
 #ifndef VATTN_QB
-#define VATTN_QB 8
+#define VATTN_QB 64
+#endif
+#ifndef VATTN_KT
+#define VATTN_KT 16
 #endif
 
-/* one head's slice of one block of queries; `att` is VATTN_QB * n scratch */
-static void vattn_block(const struct vattn *c, float *att, unsigned off,
-			unsigned b)
+/*
+ * ⚠⚠ AND THE SCORES ARE WHAT CAPS THE BLOCK, NOT THE KEYS.
+ *
+ * QB queries share one pass over K and one over V, so raising QB divides the
+ * K/V traffic -- but the scores it has to hold are QB * n floats, written once,
+ * read three times by the softmax and read a fourth time by the value pass. At
+ * n = 1024 and head_dim = 64 the two cross at QB = 32:
+ *
+ *   QB    K+V per query   scores resident   scores traffic
+ *    8       64.0 KB           32 KB            160 KB
+ *   16       32.0 KB           64 KB            320 KB
+ *   32       16.0 KB          128 KB            640 KB   <- past K+V's 512 KB
+ *   64        8.0 KB          256 KB           1280 KB
+ *
+ * which is exactly where the measured sweep turns round. So the cap is not the
+ * keys and it is not the arithmetic: it is a scratch array that only exists
+ * because the softmax was written as three passes over a whole row.
+ *
+ * VATTN_FUSED takes the cap away. Tile the KEYS as well, carry a running max
+ * and a running sum, and rescale the accumulator when the max moves -- the
+ * scores then live QB * KT at a time, a few kilobytes, and never leave L1. The
+ * keys and values are still read exactly once per query block, so raising QB
+ * keeps dividing their traffic with nothing growing to pay for it.
+ *
+ * ⚠ IT IS NOT BIT IDENTICAL AND THAT IS THE WHOLE OF THE RISK. Everything else
+ * in this stage reorders only the ISSUE of the arithmetic; this reorders the
+ * arithmetic. exp(x - m) for a running m, rescaled, is the same number in exact
+ * arithmetic and a few ulp away in f32. This tree has shipped one fast wrong
+ * answer, so vattn_bench -c prints the worst element wise disagreement against
+ * the exact kernel rather than a checksum, and vision_cross still has to pass.
+ */
+static void vattn_block_fused(const struct vattn *c, float *sc, unsigned off,
+			      unsigned b)
 {
-	unsigned i0 = b * VATTN_QB;
-	unsigned nq = c->n - i0 < VATTN_QB ? c->n - i0 : VATTN_QB;
+	unsigned i0 = b * c->qb, hd = c->hd, kt = c->kt;
+	unsigned nq = c->n - i0 < c->qb ? c->n - i0 : c->qb;
+	float *s = sc;                       /* qb * kt, the tile of scores */
+	float *acc = s + (size_t)c->qb * kt; /* qb * hd, the running output */
+	float *mx = acc + (size_t)c->qb * hd, *sum = mx + c->qb;
+	unsigned j0, u, e;
+
+	for (u = 0; u < nq; u++) {
+		mx[u] = -INFINITY;
+		sum[u] = 0.0f;
+		for (e = 0; e < hd; e++)
+			acc[u * hd + e] = 0.0f;
+	}
+	for (j0 = 0; j0 < c->n; j0 += kt) {
+		unsigned nk = c->n - j0 < kt ? c->n - j0 : kt, j;
+
+		for (j = 0; j < nk; j++) {
+			const float *kj = c->k + (size_t)(j0 + j) * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				s[u * kt + j] = charsiu_dot_f32(
+					c->q + (size_t)(i0 + u) * c->W + off,
+					kj, hd) * c->scale;
+		}
+		for (u = 0; u < nq; u++) {
+			float *su = s + u * kt, m = mx[u], t = 0.0f;
+
+			for (j = 0; j < nk; j++)
+				if (su[j] > m)
+					m = su[j];
+			/*
+			 * ⚠ ONLY WHEN THE MAX ACTUALLY MOVED. After the first
+			 * few tiles it usually has not, and the rescale is a
+			 * pass over the accumulator -- the one piece of work
+			 * this kernel adds that the three pass form does not.
+			 */
+			if (m > mx[u]) {
+				float r = expf(mx[u] - m);
+
+				for (e = 0; e < hd; e++)
+					acc[u * hd + e] *= r;
+				sum[u] *= r;
+				mx[u] = m;
+			}
+			for (j = 0; j < nk; j++) {
+				su[j] = expf(su[j] - m);
+				t += su[j];
+			}
+			sum[u] += t;
+		}
+		for (j = 0; j < nk; j++) {
+			const float *vj = c->v + (size_t)(j0 + j) * c->W + off;
+
+			for (u = 0; u < nq; u++)
+				charsiu_axpy_f32(acc + (size_t)u * hd, vj,
+						 s[u * kt + j], hd);
+		}
+	}
+	for (u = 0; u < nq; u++) {
+		float *o = c->o + (size_t)(i0 + u) * c->W + off;
+		float inv = sum[u] > 0.0f ? 1.0f / sum[u] : 0.0f;
+
+		for (e = 0; e < hd; e++)
+			o[e] = acc[u * hd + e] * inv;
+	}
+}
+
+/* one head's slice of one block of queries; `att` is c->qb * n scratch */
+static void vattn_block_exact(const struct vattn *c, float *att, unsigned off,
+			      unsigned b)
+{
+	unsigned i0 = b * c->qb;
+	unsigned nq = c->n - i0 < c->qb ? c->n - i0 : c->qb;
 	unsigned j, u, e;
 
 	for (j = 0; j < c->n; j++) {
@@ -772,6 +882,23 @@ static void vattn_block(const struct vattn *c, float *att, unsigned off,
 			charsiu_axpy_f32(c->o + (size_t)(i0 + u) * c->W + off,
 					 vj, att[u * c->n + j], c->hd);
 	}
+}
+
+/* how many floats of scratch one worker needs, for whichever kernel is on */
+static size_t vattn_scratch(const struct vattn *c)
+{
+	if (!c->fused)
+		return (size_t)c->qb * c->n;
+	return (size_t)c->qb * c->kt + (size_t)c->qb * c->hd + 2u * c->qb;
+}
+
+static void vattn_block(const struct vattn *c, float *sc, unsigned off,
+			unsigned b)
+{
+	if (c->fused)
+		vattn_block_fused(c, sc, off, b);
+	else
+		vattn_block_exact(c, sc, off, b);
 }
 
 /*
@@ -807,7 +934,7 @@ enum { SCHED_FLAT, SCHED_HEADWISE, SCHED_SHARE };
 static void vattn_flat(void *ctx, uint64_t r0, uint64_t n)
 {
 	const struct vattn *c = ctx;
-	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
+	float *att = malloc(vattn_scratch(c) * sizeof(float));
 	uint64_t r;
 
 	if (!att)
@@ -822,7 +949,7 @@ static void vattn_flat(void *ctx, uint64_t r0, uint64_t n)
 static void vattn_one_head(void *ctx, uint64_t r0, uint64_t n)
 {
 	const struct vattn *c = ctx;
-	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
+	float *att = malloc(vattn_scratch(c) * sizeof(float));
 	uint64_t r;
 
 	if (!att)
@@ -841,7 +968,7 @@ static void vattn_one_head(void *ctx, uint64_t r0, uint64_t n)
 static void vattn_share(void *ctx, uint64_t r0, uint64_t n)
 {
 	const struct vattn *c = ctx;
-	float *att = malloc((size_t)VATTN_QB * c->n * sizeof(float));
+	float *att = malloc(vattn_scratch(c) * sizeof(float));
 	uint64_t r, end = r0 + n;
 	unsigned h;
 
@@ -870,6 +997,70 @@ static void vattn_share(void *ctx, uint64_t r0, uint64_t n)
  * checks with a checksum rather than assuming.
  */
 static int vattn_sched = -1;
+static unsigned vattn_qb;
+
+unsigned charsiu_vision_attn_qb(void)
+{
+	if (!vattn_qb) {
+		const char *e = getenv("CHARSIU_VATTN_QB");
+		int v = e ? atoi(e) : 0;
+
+		vattn_qb = v > 0 ? (unsigned)v : VATTN_QB;
+	}
+	return vattn_qb;
+}
+
+void charsiu_vision_attn_qb_set(unsigned qb)
+{
+	vattn_qb = qb ? qb : VATTN_QB;
+}
+
+/*
+ * The key tile the fused kernel holds scores for. It wants to be the largest
+ * that keeps qb * kt floats of scores plus qb * head_dim of accumulator inside
+ * L1, because staying there is the entire reason the kernel exists.
+ */
+static unsigned vattn_kt;
+
+unsigned charsiu_vision_attn_kt(void)
+{
+	if (!vattn_kt) {
+		const char *e = getenv("CHARSIU_VATTN_KT");
+		int v = e ? atoi(e) : 0;
+
+		vattn_kt = v > 0 ? (unsigned)v : VATTN_KT;
+	}
+	return vattn_kt;
+}
+
+void charsiu_vision_attn_kt_set(unsigned kt)
+{
+	vattn_kt = kt ? kt : VATTN_KT;
+}
+
+/*
+ * ⚠ THE ONE KNOB THAT CHANGES THE ANSWER. Every other choice in this stage
+ * reorders the issue of the same arithmetic and is bit identical; the fused
+ * kernel reorders the arithmetic itself, and a wrong answer that arrives faster
+ * is the failure this tree has already shipped once. Default on, with the exact
+ * kernel one environment variable away as the control.
+ */
+static int vattn_fused = -1;
+
+int charsiu_vision_attn_fused(void)
+{
+	if (vattn_fused < 0) {
+		const char *e = getenv("CHARSIU_VATTN_FUSED");
+
+		vattn_fused = !(e && (!strcmp(e, "0") || !strcmp(e, "no")));
+	}
+	return vattn_fused;
+}
+
+void charsiu_vision_attn_fused_set(int on)
+{
+	vattn_fused = on ? 1 : 0;
+}
 
 int charsiu_vision_attn_sched_get(void)
 {
@@ -908,13 +1099,18 @@ void charsiu_vision_attention(const float *q, const float *k, const float *v,
 			      float *o, unsigned n, unsigned W,
 			      unsigned n_head, float scale)
 {
-	uint64_t nb = (n + VATTN_QB - 1) / VATTN_QB;
+	unsigned qb = charsiu_vision_attn_qb();
+	uint64_t nb = (n + qb - 1) / qb;
 	struct vattn c;
 	unsigned h;
 
 	c.q = q; c.k = k; c.v = v; c.o = o;
 	c.n = n; c.W = W; c.hd = W / n_head; c.scale = scale;
-	c.nh = n_head; c.nb = (unsigned)nb;
+	c.nh = n_head; c.nb = (unsigned)nb; c.qb = qb;
+	c.kt = charsiu_vision_attn_kt();
+	c.fused = (unsigned)charsiu_vision_attn_fused();
+	if (c.kt > n)
+		c.kt = n;
 	switch (charsiu_vision_attn_sched_get()) {
 	case SCHED_FLAT:
 		charsiu_parallel_for(vattn_flat, &c, (uint64_t)n_head * nb);
