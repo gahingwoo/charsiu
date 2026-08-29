@@ -5,6 +5,46 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+/*
+ * e^x four at a time, the cephes range reduction: n = round(x/ln2), then a
+ * degree six polynomial on the remainder and a shift of the exponent field.
+ * About 1e-7 relative, which is under a float's own last bit for these
+ * magnitudes.
+ *
+ * It exists for SiLU. The feed forward is 8192 wide and there are 16 of them,
+ * so a token asks for 131072 exponentials, and round 367 measured that at 3.08
+ * ms on the board -- 23 ns an element, more than the rmsnorms and the residuals
+ * and the rope put together.
+ */
+static inline float32x4_t charsiu_vexpq(float32x4_t x)
+{
+	const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
+	const float32x4_t ln2hi = vdupq_n_f32(0.693359375f);
+	const float32x4_t ln2lo = vdupq_n_f32(-2.12194440e-4f);
+	float32x4_t n, r, rr, y;
+	int32x4_t k;
+
+	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
+	n = vrndaq_f32(vmulq_f32(x, log2e));
+	r = vmlsq_f32(vmlsq_f32(x, n, ln2hi), n, ln2lo);
+	rr = vmulq_f32(r, r);
+
+	y = vdupq_n_f32(1.9875691500e-4f);
+	y = vmlaq_f32(vdupq_n_f32(1.3981999507e-3f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(8.3334519073e-3f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(4.1665795894e-2f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(1.6666665459e-1f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(5.0000001201e-1f), y, r);
+	y = vaddq_f32(vmlaq_f32(r, y, rr), vdupq_n_f32(1.0f));
+
+	k = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
+	return vmulq_f32(y, vreinterpretq_f32_s32(vshlq_n_s32(k, 23)));
+}
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -291,6 +331,21 @@ void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
  */
 float charsiu_dot_f32(const float *a, const float *b, uint64_t n);
 void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
+
+/*
+ * x[i] <- e^(x[i] - m), in place, returning the sum -- the middle pass of every
+ * softmax in this tree, done in one read of the row instead of two.
+ *
+ * ⚠⚠ THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED. A ViT softmax is n^2 of
+ * them a head, and the vision tower is 1024 against 1024 over twelve heads and
+ * twelve layers: 151 million for one picture, against a feed forward's 131072 a
+ * token. glibc's expf measured 23 ns an element on the board.
+ *
+ * CHARSIU_EXACT_SOFTMAX forces glibc's correctly rounded expf back, which is
+ * the control the polynomial has to be diffed against.
+ */
+float charsiu_expsum_f32(float *x, uint64_t n, float m);
+void charsiu_softmax_exact_set(int on);
 
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */
 void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst);

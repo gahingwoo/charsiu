@@ -841,7 +841,7 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 
 #endif
 
-/* ---- the two kernels an attention is made of ------------------------------ */
+/* ---- the three kernels an attention is made of ---------------------------- */
 
 /*
  * ⚠ THESE ARE FOR THE ATTENTION, WHICH IS NOT A MATMUL AGAINST A WEIGHT and so
@@ -857,6 +857,74 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 float charsiu_dot_f32(const float *a, const float *b, uint64_t n)
 {
 	return dot_f32(a, b, n);
+}
+
+/*
+ * ⚠⚠ AND THE THIRD ONE IS THE EXPONENTIAL, WHICH NOBODY COUNTED.
+ *
+ * A softmax over every patch against every patch asks for n^2 exponentials a
+ * head. The vision tower is 1024 against 1024, twelve heads, twelve layers:
+ * 151 MILLION of them for one picture. Round 367 measured glibc's expf on the
+ * board at 23 ns an element, which puts 3.5 s under a stage the board reports
+ * as 4.0 s -- so the arithmetic nobody had counted was most of a stage everyone
+ * was reading as memory traffic.
+ *
+ * This does the whole of what a softmax's middle pass wants -- e^(x - m) in
+ * place, and the sum back -- because splitting it into an exp pass and a sum
+ * pass reads the row twice.
+ *
+ * ⚠ THE POLYNOMIAL IS THE SLIGHTLY WORSE OF THE TWO. glibc's expf is correctly
+ * rounded and this is about one last bit out, the same trade llama.c's vexpq
+ * makes for SiLU. There it is opt in because a near tie in greedy decoding
+ * changes a word and the project's anchor sentence with it; here the consumer
+ * is an embedding that goes through a projection and twelve more layers, and
+ * the tower's own cross check has 2e-4 of room against a numpy reference that
+ * uses neither. CHARSIU_EXACT_SOFTMAX is the control.
+ */
+static int sm_exact = -1;
+
+static int softmax_exact(void)
+{
+	if (sm_exact < 0)
+		sm_exact = getenv("CHARSIU_EXACT_SOFTMAX") != NULL;
+	return sm_exact;
+}
+
+/*
+ * ⚠ SETTABLE FOR THE SAME REASON THE SCHEDULE IS. Two runs of this host, one
+ * with the polynomial and one without, disagreed with each other by more than
+ * the thing being measured; the only reading worth having interleaves them in
+ * one process.
+ */
+void charsiu_softmax_exact_set(int on)
+{
+	sm_exact = on ? 1 : 0;
+}
+
+float charsiu_expsum_f32(float *x, uint64_t n, float m)
+{
+	uint64_t i = 0;
+	float s = 0.0f;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!softmax_exact()) {
+		float32x4_t vm = vdupq_n_f32(m), acc = vdupq_n_f32(0.0f);
+
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t e = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i),
+								vm));
+
+			vst1q_f32(x + i, e);
+			acc = vaddq_f32(acc, e);
+		}
+		s = vaddvq_f32(acc);
+	}
+#endif
+	for (; i < n; i++) {
+		x[i] = expf(x[i] - m);
+		s += x[i];
+	}
+	return s;
 }
 
 void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n)

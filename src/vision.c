@@ -537,18 +537,21 @@ static uint64_t rows_of(const struct gguf_tensor *w)
  */
 static void vsoftmax(float *x, unsigned n)
 {
-	float mx = x[0], sum = 0.0f;
+	float mx = x[0], sum, inv;
 	unsigned i;
 
 	for (i = 1; i < n; i++)
 		if (x[i] > mx)
 			mx = x[i];
-	for (i = 0; i < n; i++) {
-		x[i] = expf(x[i] - mx);
-		sum += x[i];
-	}
+	/*
+	 * ⚠ THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED, and it is a
+	 * shared kernel now: a picture asks for n^2 per head per layer, 151
+	 * million of them at this tower's shape. See charsiu_expsum_f32.
+	 */
+	sum = charsiu_expsum_f32(x, n, mx);
+	inv = sum > 0.0f ? 1.0f / sum : 0.0f;
 	for (i = 0; i < n; i++)
-		x[i] /= sum;
+		x[i] *= inv;
 }
 
 /* x[n] <- (x - mean) / sqrt(var + eps) * w + b, the mean subtracting kind. */
@@ -810,7 +813,7 @@ static void vattn_block_fused(const struct vattn *c, float *sc, unsigned off,
 					kj, hd) * c->scale;
 		}
 		for (u = 0; u < nq; u++) {
-			float *su = s + u * kt, m = mx[u], t = 0.0f;
+			float *su = s + u * kt, m = mx[u], t;
 
 			for (j = 0; j < nk; j++)
 				if (su[j] > m)
@@ -829,10 +832,7 @@ static void vattn_block_fused(const struct vattn *c, float *sc, unsigned off,
 				sum[u] *= r;
 				mx[u] = m;
 			}
-			for (j = 0; j < nk; j++) {
-				su[j] = expf(su[j] - m);
-				t += su[j];
-			}
+			t = charsiu_expsum_f32(su, nk, m);
 			sum[u] += t;
 		}
 		for (j = 0; j < nk; j++) {

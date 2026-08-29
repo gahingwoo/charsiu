@@ -30,40 +30,11 @@
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
 /*
- * e^x four at a time, the cephes range reduction: n = round(x/ln2), then a
- * degree six polynomial on the remainder and a shift of the exponent field.
- * About 1e-7 relative, which is under a float's own last bit for these
- * magnitudes.
- *
- * It exists for SiLU. The feed forward is 8192 wide and there are 16 of them,
- * so a token asks for 131072 exponentials, and round 367 measured that at 3.08
- * ms on the board -- 23 ns an element, more than the rmsnorms and the residuals
- * and the rope put together.
+ * ⚠ e^x FOUR AT A TIME NOW LIVES IN THE HEADER, as charsiu_vexpq. It was
+ * written here for SiLU and the vision tower's softmax turned out to want it
+ * far more: a picture asks for 151 million exponentials against a feed
+ * forward's 131072 a token.
  */
-static inline float32x4_t vexpq(float32x4_t x)
-{
-	const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
-	const float32x4_t ln2hi = vdupq_n_f32(0.693359375f);
-	const float32x4_t ln2lo = vdupq_n_f32(-2.12194440e-4f);
-	float32x4_t n, r, rr, y;
-	int32x4_t k;
-
-	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
-	n = vrndaq_f32(vmulq_f32(x, log2e));
-	r = vmlsq_f32(vmlsq_f32(x, n, ln2hi), n, ln2lo);
-	rr = vmulq_f32(r, r);
-
-	y = vdupq_n_f32(1.9875691500e-4f);
-	y = vmlaq_f32(vdupq_n_f32(1.3981999507e-3f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(8.3334519073e-3f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(4.1665795894e-2f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(1.6666665459e-1f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(5.0000001201e-1f), y, r);
-	y = vaddq_f32(vmlaq_f32(r, y, rr), vdupq_n_f32(1.0f));
-
-	k = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
-	return vmulq_f32(y, vreinterpretq_f32_s32(vshlq_n_s32(k, 23)));
-}
 #endif
 
 /*
@@ -176,7 +147,7 @@ static void silu_mul(float *hb, const float *hb2, uint32_t n)
 		for (; i + 4 <= n; i += 4) {
 			float32x4_t g = vld1q_f32(hb + i);
 			float32x4_t d = vaddq_f32(vdupq_n_f32(1.0f),
-						  vexpq(vnegq_f32(g)));
+						  charsiu_vexpq(vnegq_f32(g)));
 
 			vst1q_f32(hb + i, vmulq_f32(vdivq_f32(g, d),
 						    vld1q_f32(hb2 + i)));
