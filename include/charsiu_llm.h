@@ -345,6 +345,22 @@ void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
  * the control the polynomial has to be diffed against.
  */
 float charsiu_expsum_f32(float *x, uint64_t n, float m);
+
+/*
+ * acc[u][0..hd) += sum over j < nk of s[u][j] * v[j][0..hd), for a block of
+ * nq queries at once. Every operand takes its own row stride: the values arrive
+ * as [n][n_embd] and the scores as [nq][key_tile], and the accumulator is
+ * either a contiguous block or a slice of the output rows.
+ *
+ * ⚠ THE POINT IS THE ACCUMULATOR STAYING IN REGISTERS. One axpy per (query,
+ * key) pays two vector loads and a store for every FMA; holding four
+ * accumulators across the tile pays half a memory operation per FMA. Bit
+ * identical: the sum over j for any one output element is in the same order.
+ */
+void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
+		    uint64_t vstride, const float *s, uint64_t sstride,
+		    unsigned nq, unsigned nk, unsigned hd);
+void charsiu_pv_plain_set(int on);      /* CHARSIU_PLAIN_PV: the control */
 void charsiu_softmax_exact_set(int on);
 
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */

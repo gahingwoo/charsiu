@@ -33,6 +33,7 @@
  *               [-K]     sweep the fused kernel's key tile
  *               [-B]     the whole round: the code as it was, against as it is
  *               [-E]     glibc's expf against the polynomial one
+ *               [-P]     an axpy per query and key, against the blocked one
  */
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -95,7 +96,7 @@ int main(int argc, char **argv)
 	static const unsigned qbs[] = { 1, 4, 8, 16, 32, 64, 128, 256 };
 	static const unsigned kts[] = { 16, 32, 64, 128, 256, 512 };
 	unsigned n = 1024, W = 768, H = 12, L = 12, reps = 3, cmp = 0, qsw = 0;
-	unsigned nv = CHARSIU_VATTN_SCHEDS, fsw = 0, ksw = 0, bef = 0, esw = 0;
+	unsigned nv = CHARSIU_VATTN_SCHEDS, fsw = 0, ksw = 0, bef = 0, esw = 0, psw = 0;
 	double best[16] = { 0.0 };
 	float diff[16] = { 0.0f };
 	size_t sz;
@@ -125,6 +126,12 @@ int main(int argc, char **argv)
 			bef = 1;
 		else if (!strcmp(argv[i], "-E"))
 			esw = 1;
+		else if (!strcmp(argv[i], "-P"))
+			psw = 1;
+	}
+	if (psw) {
+		cmp = 1;
+		nv = 2;
 	}
 	if (esw) {
 		cmp = 1;
@@ -191,8 +198,11 @@ int main(int argc, char **argv)
 				charsiu_vision_attn_qb_set(s ? 64 : 8);
 				charsiu_vision_attn_kt_set(s ? 16 : 16);
 				charsiu_softmax_exact_set(!s);
+				charsiu_pv_plain_set(!s);
 			} else if (esw)
 				charsiu_softmax_exact_set(!s);
+			else if (psw)
+				charsiu_pv_plain_set(!s);
 			else if (qsw)
 				charsiu_vision_attn_qb_set(qbs[s]);
 			else if (ksw)
@@ -229,6 +239,8 @@ int main(int argc, char **argv)
 			snprintf(nm, sizeof(nm), "%s", s ? "after" : "before");
 		else if (esw)
 			snprintf(nm, sizeof(nm), "%s", s ? "poly" : "glibc");
+		else if (psw)
+			snprintf(nm, sizeof(nm), "%s", s ? "blocked" : "axpy");
 		else if (qsw)
 			snprintf(nm, sizeof(nm), "qb=%u", qbs[s]);
 		else if (ksw)

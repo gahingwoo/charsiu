@@ -835,13 +835,8 @@ static void vattn_block_fused(const struct vattn *c, float *sc, unsigned off,
 			t = charsiu_expsum_f32(su, nk, m);
 			sum[u] += t;
 		}
-		for (j = 0; j < nk; j++) {
-			const float *vj = c->v + (size_t)(j0 + j) * c->W + off;
-
-			for (u = 0; u < nq; u++)
-				charsiu_axpy_f32(acc + (size_t)u * hd, vj,
-						 s[u * kt + j], hd);
-		}
+		charsiu_pv_f32(acc, hd, c->v + (size_t)j0 * c->W + off, c->W,
+			       s, kt, nq, nk, hd);
 	}
 	for (u = 0; u < nq; u++) {
 		float *o = c->o + (size_t)(i0 + u) * c->W + off;
@@ -875,13 +870,8 @@ static void vattn_block_exact(const struct vattn *c, float *att, unsigned off,
 		for (e = 0; e < c->hd; e++)
 			o[e] = 0.0f;
 	}
-	for (j = 0; j < c->n; j++) {
-		const float *vj = c->v + (size_t)j * c->W + off;
-
-		for (u = 0; u < nq; u++)
-			charsiu_axpy_f32(c->o + (size_t)(i0 + u) * c->W + off,
-					 vj, att[u * c->n + j], c->hd);
-	}
+	charsiu_pv_f32(c->o + (size_t)i0 * c->W + off, c->W, c->v + off, c->W,
+		       att, c->n, nq, c->n, c->hd);
 }
 
 /* how many floats of scratch one worker needs, for whichever kernel is on */
