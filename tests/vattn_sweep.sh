@@ -2,24 +2,39 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 #
-# The attention at four working set sizes, both schedules, interleaved.
+# Every knob in the tower's attention, timed against its own control, in one
+# process each.
 #
-# ⚠ THE POINT IS THE SHAPE OF THE CURVE, NOT THE SECONDS. Attention is O(n^2)
-# work, so the per layer time divided by (n/1024)^2 is flat while the machine is
-# compute bound and RISES once the working set stops fitting in cache. Where it
-# rises is where this host starts asking the same question the board asks at
-# n = 1024, because the board has about a megabyte of L2 for a whole cluster and
-# a development host has an order of magnitude more.
+# ⚠⚠ THIS EXISTS BECAUSE THE BOARD IS THE MACHINE THAT DECIDES AND IT IS NOT
+# THIS ONE. Every default in src/vision.c was picked from a development host
+# that is compute bound where the board is bandwidth bound, and holds a 12 MB
+# working set in cache where the board has about a megabyte of L2 for a whole
+# cluster. Two of the six answers below already came out differently at the two
+# ends of this host's own range. Run it on the card and believe the card.
 #
-# ⚠ ON THE BOARD, RUN THIS AT n = 1024 AND BELIEVE THAT ROW. The larger n are a
-# host's only way to reach the board's regime; the board is already in it.
+# ⚠ THE HOST'S ONLY WAY TO REACH THE BOARD'S REGIME IS n. Attention is O(n^2)
+# work, so per layer time over (n/1024)^2 is flat while a machine is compute
+# bound and rises once its cache stops holding the working set. On the board,
+# n = 1024 is already that regime and the larger sizes are just slower.
 #
-#     tests/vattn_sweep.sh [build/vattn_bench] [reps]
+#     tests/vattn_sweep.sh [build/vattn_bench] [reps] [n] [layers]
 
 B=${1:-build/vattn_bench}
-R=${2:-3}
-for spec in "1024 12" "2048 4" "4096 2" "8192 1"; do
-	set -- $spec
-	echo "== n=$1 layers=$2"
-	"$B" -c -n "$1" -l "$2" -r "$R" | sed -n '2,$p'
-done
+R=${2:-5}
+N=${3:-1024}
+L=${4:-12}
+
+run() {
+	echo "-- $2"
+	"$B" "$1" -n "$N" -l "$L" -r "$R" | sed -n '2,$p'
+}
+
+echo "== n=$N layers=$L reps=$R"
+"$B" -n "$N" -l "$L" -r 1 | sed -n '1p'
+run -B "the round as a whole: as it was, against as it is"
+run -c "which thread gets which head"
+run -Q "the query block"
+run -K "the fused kernel's key tile"
+run -F "the three pass kernel against the fused one"
+run -P "one pair at a time, against the blocked kernels"
+run -E "glibc's expf against the polynomial one"
