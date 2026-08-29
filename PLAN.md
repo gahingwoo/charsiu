@@ -447,6 +447,48 @@ again next -- now at m = 2, 4 **and 8**, a width 3 * M has never been asked at
 -- and if the width arm comes back full then the map under it is the read
 order, which is the last thing between here and a batched int4 prefill.
 
+### The width map IS the height map, so the read order was never the problem
+
+`board_acc_map.sh` again with 0x40b8 fixed, 2026-08-29.
+
+**The width arm writes the full surface.** m = 2: 128 of 128 words, 0 absent.
+m = 4: 256 of 256, 0 absent. The height arm, the control, is unchanged and
+exact.
+
+**And the two maps are the same map.** Diffed rather than eyeballed: the m = 2
+tables are identical cell for cell, and so are the m = 4 ones. Then the
+expression itself, against the board's own table:
+
+```
+  charsiu_acc_index agrees on 99 unique slots at m = 2, disagrees on 0
+  (29 duplicates skipped -- locate() reports the FIRST slot holding a value,
+   so a value the reference produces twice is not evidence)
+```
+
+⚠ **SO THERE IS NO WIDTH AXIS READ ORDER TO SOLVE.** The round before this
+called the read order "the last thing between here and a batched int4 prefill".
+It was not a thing at all: once 0x40b8 counts M, the width axis returns the
+same surface in the same order the height axis does, and the expression solved
+on one reads the other with nothing changed.
+
+⚠⚠ **AND THIS ROUND IS ABOUT int8.** npu_gemm_test is the int8 accumulator.
+What it settles is that on the width axis 3 * M is necessary and sufficient for
+a full surface, and that the read order transfers. It says nothing directly
+about w4a16, which is a different weight format and the one five rounds called
+"exactly one row". The runtime takes the same arm -- `npudev.c` sets
+`acc_out = 1` for int4 and int8 alike -- so the fix reaches it, and whether it
+is enough is the next round rather than a conclusion of this one.
+
+⚠ **m = 8 WAS NOT MEASURED AND THE SCRIPT IS WHY.** It printed the map with
+`head -80`, and npu_gemm_test puts its counts AFTER the map, so at 512 words
+the verdict was cut off on both arms. The three lines that decide the round are
+grepped out before the map now. m = 8 is still owed on both axes.
+
+**Next: run the two rounds that were wrong before the fix again** --
+`board_w4_axis.sh` for int4 and `board_rows_sweep.sh` for the int8 ceiling.
+Both last ran with 0x40b8 at 3, which is what made the surface short, so
+neither of their width arms was asking its question.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not

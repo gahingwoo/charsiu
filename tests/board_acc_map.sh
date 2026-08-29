@@ -89,10 +89,19 @@ for AXIS in h w; do
 			echo
 			continue
 		fi
-		# the distinct count first: the table is only as good as it
+		# ⚠ THE VERDICT BEFORE THE MAP, NOT AFTER IT. This printed the
+		# map with head -80 and the summary lines come AFTER the map,
+		# so at m = 8 -- where the map is 512 words -- the counts were
+		# cut off on BOTH arms and that width was silently not
+		# measured. The three lines that decide the round are grepped
+		# out first now, and the map is what gets truncated.
 		grep "distinct values in" "$out" | sed 's/^/  /'
-		sed -n '/where each wanted value landed/,$p' "$out" \
-			| head -80 | sed 's/^/  /'
+		grep "are absent from the buffer" "$out" | sed 's/^/  /'
+		grep "the board wrote" "$out" | sed 's/^/  /'
+		grep "never computed, so no read order" "$out" | sed 's/^/  ⚠ /'
+		echo "  --- the map (first 40 rows of it) ---"
+		sed -n '/the whole output, as the/,$p' "$out" \
+			| head -44 | sed 's/^/  /'
 		echo
 	done
 done
