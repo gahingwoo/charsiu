@@ -219,6 +219,7 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	double bprep_us;	/* buffers and the output zero, before any of it */
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -1778,6 +1779,20 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	return 0;
 }
 
+/*
+ * ⚠⚠ THE SEGMENTS HAVE TO ADD UP, and for a while they did not.
+ *
+ * At m = 32 the four of them came to 451 ms of a 606 ms batched matmul and the
+ * other 155 was unnamed -- 26%, four times the fence. Optimising a 44% share
+ * while a 26% one has no name is how this tree has been caught before, so
+ * `prep` is the fifth: everything from entry to the first packed byte, which
+ * is batch_bufs, the output allocation and the memset of Y.
+ *
+ * ⚠ AND IT MAY BE MOSTLY THE PROBE. The output buffer is allocated when
+ * e->bout_m < m, so a sweep that walks m reallocates every tensor at every
+ * width while a real prefill, whose chunk is one fixed 32, pays it once. This
+ * counter is what tells those apart instead of leaving it to be argued.
+ */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset)
 {
@@ -1789,12 +1804,21 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
+double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset)
+{
+	double v = g->bprep_us / 1e3;
+
+	if (reset)
+		g->bprep_us = 0.0;
+	return v;
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
 	struct npu_entry *e;
 	struct charsiu_joblist jl;
-	double t0;
+	double t0, tprep = now_us();
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
 		return -1;
@@ -1918,6 +1942,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	}
 
 	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
+	g->bprep_us += now_us() - tprep;
 	t0 = now_us();
 
 	/*

@@ -675,6 +675,52 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+## WHERE THE TIME IS NOW: the batched prefill is CPU bound
+
+The probe's own breakdown of a batched matmul, at the widths it sweeps:
+
+```
+   m    batched   read (CPU)   pack (CPU)   fence (HW)  submit   unaccounted
+   2       76 ms    7    9%    24   32%     40   53%      2          3
+   4       91       15  16%    32   35%     38   42%      2          4
+  16      281      104  37%    72   26%     24    9%      3         78
+  32      606      269  44%   139   23%     39    6%      4        155
+  48      858      370  43%   197   23%     56    7%      4        231
+  64     1255      620  49%   268   21%     73    6%      5        289
+  80     1440      645  45%   326   23%     91    6%      6        372
+```
+
+**At m = 32, the width `llama_prefill_batch` actually chunks at: the hardware
+is 7% and the CPU is 67%.** At m = 2 the fence is 53%. Batching did not make
+the hardware faster -- it moved the cost off the hardware and onto the CPU, and
+what is left to win is a gather and a pack, not a register.
+
+⚠⚠ **AND 26% OF IT HAD NO NAME.** The four segments came to 451 ms of 606 and
+the rest was unaccounted, which is four times the fence. Optimising the 44%
+share while a 26% one is anonymous is exactly what this tree has been caught
+doing before, so `prep` is the fifth segment: everything from entry to the
+first packed byte, which is `batch_bufs`, the output allocation and the memset
+of Y. The probe prints all five with the remainder beside them now, so a
+breakdown that stops adding up says so instead of being added up by hand later.
+
+⚠ **AND IT MAY BE MOSTLY THE PROBE.** The output buffer is allocated when
+`e->bout_m < m`, so a sweep that walks m reallocates every tensor at every
+width, while a real prefill chunks at one fixed 32 and pays it once. The
+counter is what tells those apart. Nothing should be done about the 26% until
+the next round says which it is.
+
+### So the order of work, by the board's own numbers
+
+1. **`read`, 44%** -- the accumulator gather. Four consecutive slots already;
+   the inner loop moves four floats, which is one vector, and it is not
+   vectorised. Threading it lost twice on the pool's own grain and the note
+   there says why: the work per dispatch is one tensor's rows, which does not
+   pay for a wakeup. The caller's loop is the grain that might.
+2. **`pack`, 23%** -- the activation into the NPU's input layout, plus the
+   register emission and the bo teardown, which share the timer.
+3. **`prep`, up to 26%** -- name it before touching it.
+4. The fence is 6%. It is not where the time is any more.
+
 ## Best of three, and the numbers are trustworthy now
 
 ```
