@@ -3040,7 +3040,7 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 */
 	static char buf[256];
 	size_t n = 0;
-	int fused = 0, shared = 0, ffvar = 0;
+	int fused = 0, shared = 0;
 
 	buf[0] = 0;
 #define WHY(cond, txt) do {                                                 \
@@ -3059,14 +3059,11 @@ const char *llama_batch_why_not(const struct llama_model *m)
 			fused = 1;
 		if (L->kv_from >= 0)
 			shared = 1;
-		if (L->n_ff != m->layers[0].n_ff)
-			ffvar = 1;
 	}
 	WHY(m->n_embd_pl, "per layer embeddings");
 	WHY(kv_posmajor(), "a position major KV cache");
 	WHY(fused, "fused or absent K and V projections");
 	WHY(shared, "KV shared between layers");
-	WHY(ffvar, "a feed forward width that varies by layer");
 #undef WHY
 	if (n)
 		return buf;
@@ -3086,8 +3083,14 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * the moment there was a scoreboard.
 	 *
 	 * What is still refused is what would be a different computation:
-	 * fused K and V needs a tensor split, shared KV needs another layer's
-	 * cache, and a varying feed forward width needs per layer buffers.
+	 * fused K and V needs a tensor split and shared KV needs another
+	 * layer's cache.
+	 *
+	 * ⚠ A VARYING FEED FORWARD WIDTH LEFT THIS LIST on 2026-08-29, and it
+	 * was never a computation at all -- it was one buffer sized from
+	 * layers[0] instead of from the widest layer. m->n_ff has been the max
+	 * since gemma4 landed, so the fix was to allocate from it and read
+	 * L->n_ff in the loop, which is what the token loop already did.
 	 *
 	 * ⚠ THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
 	 * and Gemma4 took 23.6 s and 17.6 s to a first token against
@@ -3123,7 +3126,18 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	 * being run rather than by construction.
 	 */
 	uint32_t hdmax = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
-	uint32_t kvdim = m->n_head_kv * hdmax, nff = m->layers[0].n_ff;
+	uint32_t kvdim = m->n_head_kv * hdmax;
+	/*
+	 * ⚠ THE WIDEST LAYER'S FEED FORWARD, NOT LAYER ZERO'S. gemma4 states a
+	 * width PER LAYER and E2B uses two of them, so a buffer sized from
+	 * layers[0] and then written L->n_ff floats deep is a heap overflow on
+	 * the first layer that disagrees with the first.
+	 *
+	 * m->n_ff is already the largest of them -- llama_load takes the max
+	 * over the array for exactly this reason and says so -- so the
+	 * allocation asks for that and the loop below uses the layer's own.
+	 */
+	uint32_t nffmax = m->n_ff;
 	uint32_t gqa = m->n_head / m->n_head_kv;
 	const float *freqf = NULL;
 	float scale = m->attn_scale != 0.0f ? m->attn_scale
@@ -3137,8 +3151,8 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
-		s->bhb = malloc((size_t)n * nff * sizeof(float));
-		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
+		s->bhb = malloc((size_t)n * nffmax * sizeof(float));
+		s->bhb2 = malloc((size_t)n * nffmax * sizeof(float));
 		s->bcs = malloc((size_t)hdmax * sizeof(float));
 		/*
 		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
@@ -3207,6 +3221,8 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
+		/* ⚠ THIS LAYER'S WIDTH; m->n_ff is only the fallback */
+		uint32_t nff = L->n_ff ? L->n_ff : m->n_ff;
 		int swa = L->swa;
 
 		/*
