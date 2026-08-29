@@ -49,6 +49,15 @@ done
 [ -n "${RUN:-}" ] || { echo "prefill_control: charsiu_run not found" >&2; exit 1; }
 
 # --- the model -------------------------------------------------------------
+# ⚠⚠ AND IT PREFERS LLAMA EVEN WHEN OTHER MODELS ARE THERE, which is right and
+# is also how a round got wasted: told to "just run it, it will find gemma4",
+# this picked Llama-3.2 because that is the first pattern, ran perfectly, and
+# answered a question nobody had asked. The model IS printed at the top -- read
+# that line against the one you meant before reading the verdict.
+#
+# To check another architecture, PASS ITS PATH. There is no auto-detection that
+# could be right here: the number this script exists to explain is llama's.
+#
 # ⚠ int4, and llama, and SAID OUT LOUD. The 19.24 this exists to explain came
 # off Llama-3.2-1B-Instruct-Q4_0; another model is a different number that
 # cannot be compared to it, and another architecture may not batch at all.
@@ -113,6 +122,8 @@ export CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 # goes on the command line as a prefix and nowhere else.
 unset CHARSIU_NO_BATCH_PREFILL 2>/dev/null || true
 
+# ⚠ THE MODEL FIRST AND ON ITS OWN LINE, because the verdict at the bottom says
+# nothing about which file produced it.
 echo "model    $MODEL"
 echo "prompt   \"1 2 ... 32\",  gen $NGEN,  binary $RUN"
 echo

@@ -818,6 +818,31 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
+## THE PROMPT IS 3.8x ON THE BOARD NOW
+
+`prefill_control.sh`, Llama-3.2-1B int4, on the card:
+
+```
+  batched1   65 tok in 1199 ms   54.23 tok/s
+  control    65 tok in 4399 ms   14.78 tok/s
+  batched2   65 tok in 1146 ms   56.74 tok/s
+  text       IDENTICAL to the control
+```
+
+**3.67x and 3.84x**, against 3.04x when the batched prefill first landed. The
+first write assign and the four entry read order table are what moved it since.
+
+⚠ **AND THIS ROUND WAS MEANT TO BE GEMMA4.** It ran llama, because
+prefill_control prefers `*Llama-3.2*Q4_0*` and always has -- the number it
+exists to explain is llama's -- and the instruction to "just run it, it will
+find gemma4" was simply wrong. The script printed `model ...` at the top the
+whole time. **Read that line against the one you meant before reading the
+verdict at the bottom**; a script that answers a different question perfectly
+looks exactly like a script that answered yours.
+
+Gemma4's board text is still owed, and it is the one thing standing between
+4977 ms and calling it a result.
+
 ## THE BOARD KEPT EVERY ATTENTION DEFAULT, AND THE ROUND IS 10.32x THERE
 
 `vattn_sweep.sh`, on the card, n = 1024 x 12 layers, 8 threads:
