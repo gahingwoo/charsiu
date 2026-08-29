@@ -3040,7 +3040,6 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 */
 	static char buf[256];
 	size_t n = 0;
-	int fused = 0, shared = 0;
 
 	buf[0] = 0;
 #define WHY(cond, txt) do {                                                 \
@@ -3052,18 +3051,8 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		}                                                           \
 	} while (0)
 
-	for (uint32_t l = 0; l < m->n_layer; l++) {
-		const struct llama_layer *L = &m->layers[l];
-
-		if (!L->wk || !L->wv)
-			fused = 1;
-		if (L->kv_from >= 0)
-			shared = 1;
-	}
 	WHY(m->n_embd_pl, "per layer embeddings");
 	WHY(kv_posmajor(), "a position major KV cache");
-	WHY(fused, "fused or absent K and V projections");
-	WHY(shared, "KV shared between layers");
 #undef WHY
 	if (n)
 		return buf;
@@ -3082,9 +3071,15 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * them was right while they were unwritten and became the dominant cost
 	 * the moment there was a scoreboard.
 	 *
-	 * What is still refused is what would be a different computation:
-	 * fused K and V needs a tensor split and shared KV needs another
-	 * layer's cache.
+	 * ⚠ AN ABSENT K OR V AND A SHARED KV LEFT THIS LIST on 2026-08-29, and
+	 * neither was a different computation either. gemma4 makes attn_v
+	 * optional in every layer, where its absence means V IS K, and drops
+	 * attn_k entirely in its last ones, where the layer attends against
+	 * L->kv_from's cache -- both of which the token loop has done since
+	 * gemma4 landed. What the batched loop had to learn was to ask, three
+	 * times, the question the token loop asks: skip the projections that
+	 * are not there, skip the cache write, and read the cache the layer
+	 * names.
 	 *
 	 * ⚠ A VARYING FEED FORWARD WIDTH LEFT THIS LIST on 2026-08-29, and it
 	 * was never a computation at all -- it was one buffer sized from
@@ -3281,13 +3276,26 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * for wq at all -- q was simply not computed, and all three
 		 * models came back DIFFERENT. The control caught it in one run.
 		 */
-		if (!prefill_grouped() || will_batch(s, L->wq)) {
+		/*
+		 * ⚠ A SHARED KV LAYER PROJECTS ONLY Q, and there is nothing to
+		 * group. gemma4's last layers carry no attn_k and attend
+		 * against an earlier layer's cache, so handing matmul_rows
+		 * L->wk here would dereference NULL -- the same three cases the
+		 * token loop spells out, in the same order, because the two
+		 * loops disagreeing about which projections a layer has is the
+		 * kind of difference that still produces fluent text.
+		 */
+		if (!L->wk) {
+			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
+				    m->n_head * hd);
+		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 			matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
 				    m->n_head_kv * hd);
-			matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
-				    m->n_head_kv * hd);
+			if (L->wv)
+				matmul_rows(s, L->wv, s->bxb, n, s->bv,
+					    m->n_embd, m->n_head_kv * hd);
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
@@ -3298,6 +3306,16 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 					    L->wv, s->bv + (size_t)r *
 						   m->n_head_kv * hd);
 		}
+		/*
+		 * ⚠ WHERE attn_v IS ABSENT AND attn_k IS NOT, V IS K. That is
+		 * llama.cpp's `Vcur = Kcur` and not a projection this file
+		 * failed to find, so it is a copy of the rows just computed and
+		 * not a third matmul. gemma4 declares attn_v optional in EVERY
+		 * layer, so this is not only the shared ones.
+		 */
+		if (L->wk && !L->wv)
+			memcpy(s->bv, s->bk,
+			       (size_t)n * m->n_head_kv * hd * sizeof(float));
 
 		for (int r = 0; r < n; r++) {
 			int pos = pos0 + r;
@@ -3315,10 +3333,21 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				   freqf);
 			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
 			       (size_t)m->n_head * hd * sizeof(float));
-			memcpy(s->k, s->bk + (size_t)r * m->n_head_kv * hd,
-			       (size_t)m->n_head_kv * hd * sizeof(float));
-			memcpy(s->v, s->bv + (size_t)r * m->n_head_kv * hd,
-			       (size_t)m->n_head_kv * hd * sizeof(float));
+			/* ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, so
+			 * every line below that touches k or v is asked the
+			 * same question. The token loop leaves s->k and s->v
+			 * from the previous layer and never reads them; this
+			 * leaves them untouched for the same reason. */
+			if (L->wk) {
+				memcpy(s->k, s->bk + (size_t)r * m->n_head_kv
+				       * hd,
+				       (size_t)m->n_head_kv * hd *
+				       sizeof(float));
+				memcpy(s->v, s->bv + (size_t)r * m->n_head_kv
+				       * hd,
+				       (size_t)m->n_head_kv * hd *
+				       sizeof(float));
+			}
 			/*
 			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
 			 * here that is not interchangeable, and it is copied
@@ -3330,8 +3359,17 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			 */
 			if (L->bq) {
 				add_bias(s->q, L->bq, m->n_head * hd);
-				add_bias(s->k, L->bk, m->n_head_kv * hd);
-				add_bias(s->v, L->bv, m->n_head_kv * hd);
+				/* ⚠ NO K MEANS NO K BIAS. The token loop adds
+				 * all three unguarded and would dereference
+				 * NULL here; no file in the zoo has both a
+				 * shared KV and attention biases, so neither
+				 * loop has ever reached it. */
+				if (L->wk) {
+					add_bias(s->k, L->bk,
+						 m->n_head_kv * hd);
+					add_bias(s->v, L->bv,
+						 m->n_head_kv * hd);
+				}
 			}
 			if (L->q_norm) {
 				qk_norm(s->q, m->n_head, hd, L->q_norm,
@@ -3353,17 +3391,25 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				qk_norm(s->v, m->n_head_kv, hd, NULL,
 					m->rms_eps);
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
-			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
-			/* ⚠ the cache is strided by hdmax, written at hd */
-			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
-				size_t off = ((size_t)(l * m->n_head_kv + kh)
-					      * s->n_ctx + pos) * hdmax;
+			if (L->wk)
+				rope(s->k, m->n_head_kv, hd, s->bcs,
+				     m->rope_neox);
+			/* ⚠ the cache is strided by hdmax, written at hd, and
+			 * a shared KV layer has nothing of its own to store:
+			 * it reads what L->kv_from wrote. Writing here would
+			 * put this layer's q-only garbage over the slot the
+			 * layer it borrows from just filled. */
+			if (L->wk)
+				for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+					size_t off = ((size_t)(l * m->n_head_kv
+						      + kh)
+						      * s->n_ctx + pos) * hdmax;
 
-				memcpy(s->kcache + off, s->k + kh * hd,
-				       hd * sizeof(float));
-				memcpy(s->vcache + off, s->v + kh * hd,
-				       hd * sizeof(float));
-			}
+					memcpy(s->kcache + off, s->k + kh * hd,
+					       hd * sizeof(float));
+					memcpy(s->vcache + off, s->v + kh * hd,
+					       hd * sizeof(float));
+				}
 			{
 				/*
 				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
@@ -3379,7 +3425,21 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				 */
 				int tlo = swa && pos + 1 > (int)m->n_swa
 					? pos + 1 - (int)m->n_swa : 0;
-				struct attn_job aj = { s, l, pos, tlo, hd,
+				/*
+				 * ⚠ WHOSE CACHE, and it is not always this
+				 * layer's. gemma4's shared layers name an
+				 * earlier one in L->kv_from; -1 is "its own",
+				 * which is every layer of everything else.
+				 * The head is still THIS layer's, and that is
+				 * sound because kv_from is chosen among layers
+				 * of the same window kind, which is the only
+				 * thing head_dim depends on.
+				 */
+				struct attn_job aj = { s,
+						       L->kv_from >= 0
+						       ? (uint32_t)L->kv_from
+						       : l,
+						       pos, tlo, hd,
 						       hdmax,
 						       m->n_head_kv * hdmax,
 						       gqa, m->n_head_kv,
