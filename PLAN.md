@@ -702,6 +702,44 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
+## THE OTHER TWO LOOP SHAPES ARE WORSE, MEASURED ON THE DESKTOP
+
+The gather's cache line waste suggested walking the source instead. Both
+alternatives were written and timed against the real read order, all three
+producing the same result:
+
+```
+  m=32 n=2048    gather 0.5 ms    scatter 5.1 (0.09x)    blocked 2.7 (0.17x)
+  m=32 n=8192    gather 1.9       scatter 21.7           blocked 10.8
+  m=80 n=2048    gather 1.0       scatter  9.6           blocked  6.4
+```
+
+**scatter** walks `fo` sequentially and writes scattered: 8 to 11 times slower,
+because a partial line WRITE costs a read for ownership and then the write
+while a partial line read costs only the read. **blocked** takes one 32P source
+block at a time, which is m rows by 16 channels -- and 16 floats is exactly one
+cache line, so the reads sit in a 64m byte window and every write is whole:
+still 4 to 6 times slower.
+
+⚠ The first scatter measurement had a division in its inner loop that the
+gather did not have. Removing it changed 0.10x to 0.08x, so it was not what
+made the difference -- but it was a confound in one arm and not the other, and
+it was found by reading the loop rather than by the numbers looking wrong.
+
+⚠⚠ **AND THE DESKTOP CANNOT SETTLE THE BOARD'S VERSION OF THIS.** Here `fo` is
+warm after the first repetition; on the board it is a DMA buffer that was just
+invalidated, so every line is a cold DRAM read. The ordering of three loop
+shapes should carry -- a read for ownership is a read for ownership -- but the
+75% of roof arithmetic is still a hypothesis, and this does not test it.
+
+**What would**: time a pass that reads `fo` sequentially and discards it against
+the gather over the same bytes, on the board. Four times the per byte cost says
+the line waste is real; the same cost says the limit is somewhere else, and the
+invalidate is the obvious somewhere.
+
+Nothing was changed on the strength of any of this. Two loops written, timed
+and thrown away, and the record of it is what stops them being written again.
+
 ## THE NEON GATHER BOUGHT NOTHING, AND THE ARITHMETIC SAYS WHY
 
 ```
