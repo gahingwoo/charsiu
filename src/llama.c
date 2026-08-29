@@ -1103,6 +1103,88 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       " are in the batch\n",
 					       r, have, (unsigned)t->n);
 				}
+				/*
+				 * ⚠⚠ AND WHERE EACH ONE LANDED, which is the
+				 * permutation itself rather than a count of it.
+				 *
+				 * This is what npu_gemm_test --read does for
+				 * the int8 accumulator, and it is how that
+				 * layout was solved twice. There is no
+				 * equivalent for w4a16: npu_gemm_test has no
+				 * int4 at all and charsiu_int4 runs w4a8, so
+				 * the runtime's own format has never had its
+				 * output surface mapped at m > 1. This is that
+				 * map, on the real path, with the real weights.
+				 *
+				 * ⚠ Y IS ALREADY READ THROUGH charsiu_acc_index.
+				 * The table below is therefore the permutation
+				 * that is LEFT after this tree's read order, so
+				 * "landed at (r, c) itself" is what correct
+				 * looks like and anything else is the residue.
+				 *
+				 * ⚠ THE WHOLE OF ROW 0, not its first six.
+				 * Round 381 sampled six, saw 0 1 2 3 8 9, and
+				 * had to explain afterwards why a layout that
+				 * fit them scored 15 of 128. Six cannot say
+				 * where a pattern stops.
+				 *
+				 * ⚠ AND HOW TRUSTWORTHY IT IS. Every row
+				 * reports the FIRST slot holding the value, so
+				 * a value the reference produces twice gives
+				 * one answer out of two and reads like one out
+				 * of one. The distinct count is printed first
+				 * for exactly that reason.
+				 */
+				{
+					size_t uniq = 0, q, o;
+					unsigned step = t->n >= 128
+						      ? (unsigned)t->n / 32 : 4;
+
+					for (q = 0; q < tot; q++) {
+						double w = Yref[q];
+						double lim = fabs(w) > 1e-3
+							   ? fabs(w) * 1e-3 : 1e-3;
+						size_t same = 0;
+
+						for (o = 0; o < tot; o++)
+							if (fabs((double)Yref[o] - w) <= lim)
+								same++;
+						if (same == 1)
+							uniq++;
+					}
+					printf("    the reference has %zu unique"
+					       " values in %zu (the table is only"
+					       " as good as that)\n", uniq, tot);
+					printf("    %-10s %-12s %-12s %-6s %s\n",
+					       "(row,ch)", "want", "landed at",
+					       "hits", "correct is (row,ch) itself");
+					for (unsigned r = 0; r < mr && r < 2; r++) {
+						unsigned st = r ? step * 4 : step;
+
+						for (unsigned c = 0; c < (unsigned)t->n; c += st) {
+							double w = Yref[(size_t)r * t->n + c];
+							double lim = fabs(w) > 1e-3
+								   ? fabs(w) * 1e-3 : 1e-3;
+							size_t at = tot, hits = 0;
+
+							for (o = 0; o < tot; o++)
+								if (fabs((double)Y[o] - w) <= lim) {
+									if (at == tot)
+										at = o;
+									hits++;
+								}
+							if (at == tot)
+								printf("    (%u,%-5u) %12.4f %-12s %-6s\n",
+								       r, c, w, "nowhere", "-");
+							else
+								printf("    (%u,%-5u) %12.4f (%zu,%-5zu) %-6zu%s\n",
+								       r, c, w, at / t->n,
+								       at % t->n, hits,
+								       (at == (size_t)r * t->n + c)
+								       ? "  <= correct" : "");
+						}
+					}
+				}
 			}
 			/* what the hardware moved: the weights, once */
 			mb += (double)t->k * t->n / 1e6;

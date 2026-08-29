@@ -489,6 +489,60 @@ grepped out before the map now. m = 8 is still owed on both axes.
 Both last ran with 0x40b8 at 3, which is what made the surface short, so
 neither of their width arms was asking its question.
 
+### Both rounds again, with 0x40b8 counting M
+
+**int8, the tower sweep. The axis moved the ceiling and the control says so.**
+
+```
+  height (the control)   identical to 80,  DIFFERS from 96
+  width                  identical to 96,  DIFFERS from 112
+```
+
+The height arm reproduced its known bound exactly in the same run, so the +16
+is the arrangement and not the board warming up or the build moving. The true
+bound is now somewhere in (96, 112]; the vendor's int8 head runs 128 wide.
+
+⚠ It buys nothing today. `CHARSIU_NPU_ROWS_MAX` defaults to 64, under both
+bounds, and the sweep's own seconds column is flat at every width -- 9.8 to
+12.8 s from 4 rows to 1024. The default stays on the height axis until
+something needs the room.
+
+**int4, the probe. The axis is NOT the blocker, and now the control says that
+too.**
+
+```
+                    values present   row0     row1     rows agreeing
+  height             3016 of 4096    1673     1343     0 at every m
+  width              3354 of 4096    1677     1677     0 at every m
+```
+
+The height arm ran this time -- `CHARSIU_NPU_W4_BATCH=height` reaches the
+hardware where the last round's control was refused in software -- and it is
+wrong in the same way the width arm is. Row 0 is exact on both; row 1 batched
+is the SAME wrong numbers on both and matches neither row of the reference.
+The width arm's per row counts are symmetric where the height arm's are not,
+which is worth something, and neither agrees on a single row at any m.
+
+So w4a16 batching survives the axis and survives 0x40b8. Those were the two
+things this fortnight had reason to suspect and both are now excluded on the
+board.
+
+⚠⚠ **AND w4a16's OUTPUT SURFACE HAS NEVER BEEN MAPPED ABOVE ONE ROW.**
+npu_gemm_test has no int4 in it at all -- the tool that solved the accumulator
+twice cannot ask this question -- and `charsiu_int4` runs w4a8, an int8
+activation, which is not the runtime's format. Everything known about the read
+order is from the int8 accumulator.
+
+`llama_batch_probe` already held both arrays and counted how many wanted values
+were present. It prints WHERE each one landed now: the whole of row 0 rather
+than six channels of it, the distinct count first because a repeated value
+answers a question it was not asked, and the residue after this tree's own read
+order rather than a raw index -- Y comes back through `charsiu_acc_index`
+already, so "landed at (r, c) itself" is what correct looks like.
+
+That runs on the real path with the real weights, which the two dedicated tools
+cannot do.
+
 ### What charsiu emits, against what they emit
 
 `tools/cmp_vendor.py` now diffs the emitter that actually runs -- `job.c`, not
