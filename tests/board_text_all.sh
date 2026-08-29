@@ -1,0 +1,97 @@
+#!/bin/sh
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+# SPDX-License-Identifier: GPL-2.0
+#
+# Does EVERY model's batched prompt say what its token loop says, ON THE BOARD?
+#
+# ⚠⚠ WHY THIS EXISTS. On 2026-08-30 gemma4's batched prompt came back 3.5x
+# faster and WRONG on the card -- "31 32 1 2 3" where the token loop counted on
+# to 35 -- after passing on a desktop: six architectures, text identical to
+# their token loops, top-12 logits compared, ASAN clean.
+#
+# The desktop could not have caught it. With no NPU `matmul_rows` falls back to
+# a matvec a row, so the batched loop's ORDER runs and the batched MATMUL does
+# not. Every host check exercised the half that was already right.
+#
+# And prefill_control.sh, which is the check that would have caught it, has
+# only ever been pointed at llama -- it prefers *Llama-3.2*Q4_0* by design,
+# because the number it exists to explain is llama's. So four models have been
+# batching on this board with nobody ever comparing their output.
+#
+# This runs that comparison for every model present. It is slow and it is the
+# only thing standing between "it batches" and "it is right".
+#
+# `charsiu update dev` installs this at /opt/charsiu/board_text_all.sh.
+#
+#   sh board_text_all.sh [N_GEN]
+set -u
+
+NGEN=${1:-8}
+RUN=${CHARSIU_RUN_BIN:-}
+[ -n "$RUN" ] || RUN=$(command -v charsiu_run 2>/dev/null || true)
+[ -n "$RUN" ] || for d in /opt/charsiu /usr/bin "$PWD/build" ./build .; do
+	[ -x "$d/charsiu_run" ] && { RUN="$d/charsiu_run"; break; }
+done
+[ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
+
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+
+PROMPT="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32"
+# the int4 environment the board actually runs, same as board_vendor.sh
+W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
+
+echo "binary   $RUN"
+echo "prompt   \"1 2 ... 32\", gen $NGEN, int4 on the NPU"
+echo
+printf '%-38s %-14s %s\n' model path verdict
+printf '%-38s %-14s %s\n' ----- ---- -------
+
+seen=""; nbad=0; nrun=0
+for d in $DIRS; do
+	[ -d "$d" ] || continue
+	for M in "$d"/*.gguf; do
+		[ -f "$M" ] || continue
+		b=$(basename "$M")
+		case " $seen " in *" $b "*) continue ;; esac
+		seen="$seen $b"
+		case "$b" in *Q4_0*|*q4_0*) ;; *) continue ;; esac
+
+		# shellcheck disable=SC2086
+		env $W4 "$RUN" "$M" -p "$PROMPT" -n "$NGEN" --ignore-eos \
+			>"$T/b.out" 2>"$T/b.err"
+		# shellcheck disable=SC2086
+		env $W4 CHARSIU_NO_BATCH_PREFILL=1 "$RUN" "$M" -p "$PROMPT" \
+			-n "$NGEN" --ignore-eos >"$T/c.out" 2>"$T/c.err"
+		p=$(grep -oE "prompt batched|prompt a token" "$T/b.err" | head -1)
+		nrun=$((nrun + 1))
+		# ⚠ strip only the bracketed report lines; the text is the point
+		sed -i 's/^\[.*//' "$T/b.out" "$T/c.out"
+		if cmp -s "$T/b.out" "$T/c.out"; then
+			v="text identical"
+		else
+			v="⚠ TEXT DIFFERS"
+			nbad=$((nbad + 1))
+		fi
+		printf '%-38s %-14s %s\n' "$b" "${p:-?}" "$v"
+		[ "$v" = "text identical" ] || {
+			diff "$T/c.out" "$T/b.out" | head -4 | sed 's/^/     /'
+		}
+	done
+done
+
+echo
+if [ "$nrun" -eq 0 ]; then
+	echo "⚠ NO Q4_0 MODEL FOUND in $DIRS -- nothing was checked, and that is"
+	echo "  not a pass."
+	exit 1
+fi
+echo "$nrun models compared, $nbad differing."
+echo "⚠ A model that says 'prompt a token' is REFUSED, not verified: its"
+echo "  batched path was never exercised, so 'text identical' means only that"
+echo "  the token loop agrees with itself."
+[ "$nbad" -eq 0 ] || exit 1

@@ -3107,14 +3107,6 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	static char buf[256];
 	size_t n = 0;
 
-	/*
-	 * ⚠ THE MODEL IS STILL THE ARGUMENT even though nothing left in the
-	 * list reads it. This is the question "will THIS model batch", and the
-	 * next architecture that cannot will answer it out of m; a signature
-	 * narrowed to match today's body would have to be widened again, and
-	 * every caller changed, on the day it is needed.
-	 */
-	(void)m;
 	buf[0] = 0;
 #define WHY(cond, txt) do {                                                 \
 		if (cond) {                                                 \
@@ -3126,11 +3118,40 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	} while (0)
 
 	WHY(kv_posmajor(), "a position major KV cache");
+	/*
+	 * ⚠⚠ PUT BACK ON 2026-08-30, BY THE BOARD, AFTER THE HOST SAID IT WAS
+	 * FINE.
+	 *
+	 * gemma4's prompt batched and its time to a first token went 17564 ms
+	 * to 4977. Then prefill_control on the card, against the token loop:
+	 *
+	 *   control  ... 30 31 32 33 34 35
+	 *   batched  ... 30 31 32  1 2 3
+	 *
+	 * A wrong answer at 3.5x, which is the failure this tree has shipped
+	 * once before and must not ship twice.
+	 *
+	 * ⚠ AND THE HOST CANNOT SEE IT, WHICH IS THE PART TO REMEMBER. On a
+	 * machine with no NPU `matmul_rows` falls back to a matvec a row, so
+	 * the batched loop's ORDER is exercised and the batched MATMUL is not.
+	 * Every architecture check here -- six models, text identical to their
+	 * token loops, logits compared, ASAN clean -- exercised the half that
+	 * was already right.
+	 *
+	 * gemma4 is the first model whose per layer embedding projections
+	 * (`pl_model_proj`, `pl_inp_gate`, `pl_proj`) are asked for m > 1 on
+	 * the hardware at all. Which of them is wrong is a probe question:
+	 * `board_w4_axis.sh <gemma4>` names the tensor and the row. Until it
+	 * does, this refuses, and the refusal is on the per layer embeddings
+	 * because that is the property that distinguishes the model -- not
+	 * because the tensors are proven guilty.
+	 */
+	WHY(m->n_embd_pl, "per layer embeddings, and the board says the batched"
+	    " matmul is wrong on them (the host cannot see it: no NPU)");
 #undef WHY
 	if (n)
 		return buf;
 	/*
-	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
 	 * board; charsiu took 7354, because a query norm sent the whole prompt

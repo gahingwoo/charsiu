@@ -818,6 +818,44 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
+## ⚠⚠ GEMMA4'S BATCHED PROMPT IS WRONG ON THE BOARD, AND THE HOST COULD NOT SEE IT
+
+`prefill_control.sh` with gemma4's path, on the card:
+
+```
+  control  ... 30 31 32 33 34 35
+  batched  ... 30 31 32  1 2 3
+  text     ⚠ DIFFERS FROM THE CONTROL -- the rate is beside the point
+```
+
+3.5x to a first token, and wrong. **That is the failure this tree has shipped
+once and must not ship twice**, so the per layer embedding refusal is back, with
+this evidence in the comment, until the tensor is named.
+
+### Why every host check passed anyway, which is the part to keep
+
+On a machine with no NPU, `matmul_rows` falls back to a matvec a row. **The
+batched loop's ORDER runs and the batched MATMUL does not.** Six architectures,
+text identical to their token loops, top-12 logits compared, chunk sizes 2 to
+256, ASAN clean -- all of it exercised the half that was already right.
+
+Gemma4 is the first model whose per layer embedding projections
+(`pl_model_proj`, `pl_inp_gate`, `pl_proj`) are asked for m > 1 on the hardware
+at all. That was written down as the first place a board round should look, and
+it was.
+
+### And the check that would have caught it had only ever run llama
+
+`prefill_control.sh` prefers `*Llama-3.2*Q4_0*` by design -- the number it
+exists to explain is llama's. So qwen3, phi3, gemma3 and TinyLLAMA have been
+batching on this board with **nobody ever comparing their output there**. Their
+correctness rests on a host that cannot see this class of fault.
+
+`tests/board_text_all.sh` closes that: every Q4_0 model present, batched against
+its own token loop, in the int4 environment the board actually runs. It also
+says out loud that a model reading `prompt a token` is REFUSED and not verified
+-- "text identical" there means only that the token loop agrees with itself.
+
 ## THE PROMPT IS 3.8x ON THE BOARD NOW
 
 `prefill_control.sh`, Llama-3.2-1B int4, on the card:
