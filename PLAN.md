@@ -675,6 +675,51 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+## THE ACCOUNTING CLOSES, AND prep WAS A MEMSET
+
+`rest` is 0 at every width. The five segments, width arm:
+
+```
+   m   batched   prep   pack   submit  fence   read   rest
+   2       76       3     25      2      40      7      0
+  16      282      80     72      3      24    104      0
+  32      600     155    139      4      38    264      0
+  80     1425     353    329      6      91    647      0
+```
+
+At m = 32: **read 44%, prep 26%, pack 23%, fence 6%, submit 1%.** The CPU is
+93% of a batched matmul and the hardware is 7%.
+
+**And `prep` is the memset of Y, not the allocation beside it.** It grows
+linearly with m -- 3, 5, 80, 155, 224, 284, 353 -- where a per-(tensor, m)
+allocation would be flat. Llama-3.2-1B has 505088 output channels across its
+113 tensors, so Y is 64.6 MB at m = 32 and 161.6 MB at m = 80: 417 and
+458 MB/s. **The same rate at both widths**, which is what says it is one pass
+over the output and not a fixed cost.
+
+### So the output is written twice, and the first pass is for nothing
+
+The gather accumulates because a tensor's K slices each contribute a partial
+sum, which is why Y had to start at zero. The first contribution to an output
+range can assign instead, and then nothing needs zeroing but a byte per n
+slice.
+
+⚠⚠ **AND "ki == 0 ASSIGNS" WOULD HAVE BEEN WRONG.** Slices go to the two
+devices as `(ki * ns + ni) & 1`, which is the slot index's own parity, so for
+an odd `ns` the same output range's ki = 0 and ki = 1 land on DIFFERENT
+devices -- and the read loop walks devices outermost, so ki = 1 can be read
+first and the assignment would have clobbered it. The flag is per output range
+and it is set after the row loop, not inside it, because every row of a slot
+shares it.
+
+Checked before it ships: the two schemes simulated against the real
+interleaving -- 180 cases over ns of 1 to 8, ks of 1 to 8, m of 2 to 32 and one
+or two devices, **0 mismatched** -- with the new scheme's Y starting as NaN, so
+an output range that never gets assigned cannot hide.
+
+⚠ Not on the board. What it should move is `prep`, and through it a quarter of
+every batched matmul.
+
 ## WHERE THE TIME IS NOW: the batched prefill is CPU bound
 
 The probe's own breakdown of a batched matmul, at the widths it sweeps:

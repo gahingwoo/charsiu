@@ -220,6 +220,8 @@ struct charsiu_npu {
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
 	double bprep_us;	/* buffers and the output zero, before any of it */
+	unsigned char *bseen;	/* which n slices of Y have been written */
+	unsigned bseen_n;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -833,6 +835,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bq);
 	free(g->bd1);
 	free(g->bmap);
+	free(g->bseen);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1941,7 +1944,38 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		}
 	}
 
-	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
+	/*
+	 * ⚠⚠ THE ZERO OF Y WAS 26% OF A BATCHED MATMUL, and it was a whole
+	 * extra pass over the output for nothing.
+	 *
+	 * The gather accumulates -- `yr[j] += ...` -- because a tensor's K
+	 * slices each contribute a partial sum, so Y had to start at zero. At
+	 * m = 32 on Llama-3.2-1B that is 64.6 MB zeroed and then 64.6 MB
+	 * written, and the board measured the zero at 155 ms of a 600 ms
+	 * matmul: 417 MB/s, the same rate at every width, which is what says
+	 * it is the memset and not the allocation beside it.
+	 *
+	 * So the FIRST contribution to an output range assigns and the rest
+	 * accumulate, and nothing is zeroed but a byte per n slice.
+	 *
+	 * ⚠ THE FLAG IS PER OUTPUT RANGE, NOT PER K SLICE, and that is not a
+	 * detail. Slices go to the two devices as `(ki * ns + ni) & 1`, so for
+	 * an odd ns the same output range's ki = 0 and ki = 1 land on
+	 * DIFFERENT devices -- and the read loop walks devices outermost, so
+	 * ki = 1 can be read first. "ki == 0 assigns" would have clobbered it.
+	 */
+	if (g->bseen_n < e->n_slices) {
+		unsigned char *t2 = realloc(g->bseen, e->n_slices);
+
+		if (!t2) {
+			whine(g, "the first-write flags would not allocate",
+			      e->n_slices, 0);
+			return -1;
+		}
+		g->bseen = t2;
+		g->bseen_n = e->n_slices;
+	}
+	memset(g->bseen, 0, e->n_slices);
 	g->bprep_us += now_us() - tprep;
 	t0 = now_us();
 
@@ -2166,6 +2200,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					float *yr = Y + (size_t)r * e->t->n
 						  + s->n0;
 					unsigned n4 = sn / 4, j;
+					unsigned ni = s->n0 / g->nmax;
+					int firstw = !g->bseen[ni];
 
 					/*
 					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
@@ -2174,49 +2210,73 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					 * own base rather than reading a table
 					 * entry that may not exist.
 					 */
+/*
+					 * ⚠ THE BRANCH IS OUTSIDE THE LOOP, and
+					 * it cannot be a multiply by zero: Y is
+					 * the caller's buffer and a bit pattern
+					 * in untouched memory can be a NaN,
+					 * which times zero is a NaN and not a
+					 * zero.
+					 */
+#define GATHER4(OP, VAL)                                                     \
+					for (j = 0; j < n4; j++) {           \
+						float *yp = yr + j * 4;      \
+						VAL;                         \
+						yp[0] OP v0;                 \
+						yp[1] OP v1;                 \
+						yp[2] OP v2;                 \
+						yp[3] OP v3;                 \
+					}
+#define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
+	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
+		   v2 = fp[2]*cp[2], v3 = fp[3]*cp[3]
+#define W4   const float *fp = fo + mp[j];                                   \
+	     float v0 = fp[0], v1 = fp[1], v2 = fp[2], v3 = fp[3]
+#define I8   const int32_t *ip = io + mp[j];                                 \
+	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
+		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
 					if (g->w4 && grp) {
 						const float *sc = s->sc;
 
-						for (j = 0; j < n4; j++) {
-							const float *fp = fo + mp[j];
-							float *yp = yr + j * 4;
-							const float *cp = sc + j * 4;
+						if (firstw) { GATHER4(=, W4G) }
+						else        { GATHER4(+=, W4G) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4] * sc[j];
 
-							yp[0] += fp[0] * cp[0];
-							yp[1] += fp[1] * cp[1];
-							yp[2] += fp[2] * cp[2];
-							yp[3] += fp[3] * cp[3];
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
 						}
-						for (j = n4 * 4; j < sn; j++)
-							yr[j] += fo[mp[j / 4] + j % 4] * sc[j];
 					} else if (g->w4) {
-						for (j = 0; j < n4; j++) {
-							const float *fp = fo + mp[j];
-							float *yp = yr + j * 4;
+						if (firstw) { GATHER4(=, W4) }
+						else        { GATHER4(+=, W4) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4];
 
-							yp[0] += fp[0];
-							yp[1] += fp[1];
-							yp[2] += fp[2];
-							yp[3] += fp[3];
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
 						}
-						for (j = n4 * 4; j < sn; j++)
-							yr[j] += fo[mp[j / 4] + j % 4];
 					} else {
 						float d1 = g->bd1[(size_t)ki * m + r];
 
-						for (j = 0; j < n4; j++) {
-							const int32_t *ip = io + mp[j];
-							float *yp = yr + j * 4;
+						if (firstw) { GATHER4(=, I8) }
+						else        { GATHER4(+=, I8) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = (float)io[mp[j / 4] + j % 4] * d1;
 
-							yp[0] += (float)ip[0] * d1;
-							yp[1] += (float)ip[1] * d1;
-							yp[2] += (float)ip[2] * d1;
-							yp[3] += (float)ip[3] * d1;
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
 						}
-						for (j = n4 * 4; j < sn; j++)
-							yr[j] += (float)io[mp[j / 4] + j % 4] * d1;
 					}
+#undef GATHER4
+#undef W4G
+#undef W4
+#undef I8
 				}
+				/* ⚠ AFTER the row loop: every row of this slot
+				 * shares the flag, and setting it inside would
+				 * make row 0 assign and rows 1.. accumulate onto
+				 * whatever was in the caller's buffer. */
+				g->bseen[s->n0 / g->nmax] = 1;
 				nt++;
 			}
 		}
