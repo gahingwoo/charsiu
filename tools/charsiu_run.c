@@ -94,8 +94,23 @@ static int prefill_width(int rem, int cap)
 	 * wrong for a reason the layout knows nothing about. When a split is
 	 * forced anyway, take the arm with the board evidence.
 	 */
+	/*
+	 * ⚠⚠ 10 AS WELL AS 8, and the dense sweep is why. Both come back
+	 * missing ROW 0 of the n = 8192 tensors -- 62 of 64 at m = 8, 79 of 80
+	 * at m = 10 -- so the second fault is not one width, and the version
+	 * of this function that shipped an hour earlier would have handed the
+	 * hardware a 10 and been wrong on one row of every wide projection.
+	 *
+	 * 8 -> 4 + 4 and 10 -> 6 + 4: the same two calls either way, over
+	 * widths the board has measured EXACT (2, 4, 6, 12, 14, 16 ...) rather
+	 * than merely even. An even width the board has never run is trusted
+	 * on the layout proof, and m = 10 is the standing evidence that the
+	 * layout proof alone is not enough.
+	 */
 	if (w == 8)
 		w = 4;
+	else if (w == 10)
+		w = 6;
 	return w >= 2 ? w : 0;
 }
 

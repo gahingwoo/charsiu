@@ -1864,8 +1864,31 @@ static const char *w4_batch_why_not(unsigned m)
 	 * refused above -- which is why it keeps its own reason string and its
 	 * own switch.
 	 */
-	if (m == 8 && !getenv("CHARSIU_NPU_W4_M8"))
-		return "int4 at m=8 misses row 0 of the n=8192 tensors";
+	/*
+	 * ⚠⚠ AND IT IS NOT ONLY m = 8. THE DENSE SWEEP FOUND m = 10 TOO, with
+	 * the same signature, and this refusal was one width wide when it
+	 * shipped.
+	 *
+	 * Llama-3.2-1B, first 8 staged tensors, both cores, widths 2..64:
+	 *
+	 *   2  16/16    4  32/32    6  48/48   12  96/96   14 112/112  ok
+	 *   8  62/64   10  79/80                                       NOT
+	 *   every odd width  0 of N                                    NOT
+	 *
+	 * and the misses at both 8 and 10 are ROW 0 of the n = 8192 tensors --
+	 * blk.0.ffn_gate at m = 8, blk.0.ffn_up at m = 10. One shape, one row,
+	 * two widths. So the second fault is not "m = 8"; it is something
+	 * about row 0 of a wide output that fires at some small even widths,
+	 * and 8 was simply the first one anybody asked about.
+	 *
+	 * ⚠ WHICH MEANS THIS LIST IS A RECORD OF WHAT HAS BEEN MEASURED, NOT A
+	 * RULE. A width missing from it has been measured exact; a width the
+	 * board has never seen is trusted on the layout proof alone, and m =
+	 * 10 is the standing evidence that the layout proof is not enough by
+	 * itself. Widen it the moment a sweep names another.
+	 */
+	if ((m == 8 || m == 10) && !getenv("CHARSIU_NPU_W4_M8"))
+		return "int4 at m=8 and m=10 misses row 0 of the n=8192 tensors";
 	return NULL;
 }
 
