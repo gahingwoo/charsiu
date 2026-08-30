@@ -3343,21 +3343,27 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * width -- 64*P slots per group against the 32*m it needs -- and the
 	 * chunker now only ever emits even ones.
 	 *
-	 * WHAT KEEPS THE REFUSAL is not this reason. It is a residual nobody
-	 * has explained: phi3 with an EVEN tail of 24 was still wrong 2 of 8
-	 * and 3 of 8, low rate, on both the shipped path and with the output
-	 * buffer zeroed. Until a round says an even-only prefill is clean over
-	 * enough runs to mean something, these two stay refused -- and the
-	 * refusal now rests on that measurement rather than on a property of
-	 * the architecture.
+	 * ⚠ AND EVERY ONE OF ITS FAILURES IS ACCOUNTED FOR, which phi3's are
+	 * not -- the two models are NOT in the same position and must not be
+	 * lifted together.
 	 *
-	 * The round that lifts it:
-	 *   sh board_intermittent.sh gemma4 16   (and phi3)
-	 * with the even-only chunker in the binary. 0 of 16 on both arms.
+	 * Sorted by the width each round actually ran, gemma4 is clean at every
+	 * even one and wrong at every odd one, with no exceptions left over.
+	 * The rounds that called it wrong were all reading the trailing-space
+	 * prompt, which is 89 tokens and a tail of 25.
+	 *
+	 * So this refusal is not held up by a measurement any more. It is held
+	 * up only by the fact that no round has yet run gemma4 with the
+	 * even-only chunker in the binary, and a model that has produced wrong
+	 * text on this board does not get un-refused on arithmetic alone.
+	 *
+	 * The round that lifts it, and it is one round:
+	 *   sh board_intermittent.sh gemma4 16
+	 * 0 of 16 on both arms and this line goes.
 	 */
-	WHY(m->n_embd_pl, "an unexplained residual: with the width law fixed"
-	    " this model still came back wrong on some runs, and no round has"
-	    " yet shown an even-only prefill clean (board_intermittent.sh)");
+	WHY(m->n_embd_pl, "no round has yet run it with the even-only chunker;"
+	    " every failure it has is explained by an odd last chunk, so this"
+	    " lifts on one clean board_intermittent.sh run");
 	/*
 	 * ⚠⚠ AND PHI3, FOUND THE SAME DAY BY THE CHECK THAT SHOULD HAVE
 	 * EXISTED ALL ALONG.
@@ -3396,12 +3402,24 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		 * Its 87 token prompt chunked to 32, 32 and TWENTY THREE, and
 		 * an odd width has no expression on the accumulator surface.
 		 *
+		 * ⚠⚠ BUT UNLIKE gemma4, phi3 HAS A RESIDUAL AT EVEN WIDTHS,
+		 * and that is why the two are not lifted together.
+		 *
+		 * At 88 tokens its tail is 24, which is even, and it was still
+		 * wrong 2 of 8 and 3 of 8 -- on the shipped path and with the
+		 * output buffer zeroed alike. board_chunk_sweep says the same
+		 * from the other side: chunk 24 runs 24, 24, 24 and 16, every
+		 * width even, and the text DIFFERED.
+		 *
+		 * Nothing explains that. The width law retires the reason this
+		 * refusal used to give; the residual is what keeps it.
+		 *
 		 * The test is kept because it still selects the model, and the
 		 * reason string no longer claims to know why.
 		 */
-		WHY(views, "an unexplained residual: its odd last chunk is fixed"
-		    " but an even tail of 24 was still wrong 2 of 8 and 3 of 8,"
-		    " and no round has shown an even-only prefill clean");
+		WHY(views, "an unexplained residual at EVEN widths: a tail of 24"
+		    " was still wrong 2 of 8 and 3 of 8, and chunk 24 -- all"
+		    " even widths -- differed too");
 	}
 #undef WHY
 	if (n)
