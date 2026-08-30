@@ -506,8 +506,30 @@ size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 	 * CHARSIU_COEF_ELEMS overrides it so a board round can find that edge
 	 * on purpose. The default is unchanged until one does.
 	 */
+	/*
+	 * ⚠⚠ THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE
+	 * GUESS. This read `mm->k * mm->n` when the variable was unset, and
+	 * the paragraph above already says that bound is a guess that does not
+	 * scale. What it did not say is who was actually exposed to it.
+	 *
+	 * Only scripts/charsiu-runner and scripts/charsiu-serve set the
+	 * variable. Every board test sets it too. So the k*n bound was never
+	 * measured by anything -- it was what a bare ./charsiu_run,
+	 * charsiu_vision, charsiu_whisper or charsiu_clip got, and it asks for
+	 * 2.39 GB of coefficient buffers on Qwen3-0.6B and 14.92 GB on
+	 * Phi-3.5. The allocation fails, whine() fires, and the tensor stays on
+	 * the CPU: quiet, slow, and exactly the symptom recorded at
+	 * npudev.c's "the head worth 40% of a gemma token was on the CPU".
+	 *
+	 * 65536 is what every board round this project has run has used, on
+	 * every model, without one coefficient buffer coming up short. That is
+	 * evidence and k*n is not, so 65536 is the default and k*n is what
+	 * CHARSIU_COEF_ELEMS=0 asks for when a round wants to find the edge on
+	 * purpose.
+	 */
 	const char *e = getenv("CHARSIU_COEF_ELEMS");
-	size_t elems = e ? strtoul(e, NULL, 0) : (size_t)mm->k * mm->n;
+	size_t want = e ? strtoul(e, NULL, 0) : 65536;
+	size_t elems = want ? want : (size_t)mm->k * mm->n;
 
 	if (elems < 8192)
 		elems = 8192;

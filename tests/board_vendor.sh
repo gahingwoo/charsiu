@@ -205,6 +205,36 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 done
 
 echo
+# ⚠⚠ THE MEMORY COLUMN UNDERSTATES US, AND BY MORE THAN THE GAP IT SHOWS.
+#
+# charsiu_run's `peak N MB` is VmHWM, and every DRM buffer object is invisible
+# to it: rocket's objects come from drm_gem_shmem, whose mmap sets VM_PFNMAP
+# and faults with vmf_insert_pfn, and VM_PFNMAP pages are never added to the
+# RSS counters. So the weights on the hardware, the coefficient buffers and
+# the batched output buffers are all absent from this column.
+#
+# Computed from the real shapes at the settings above: Qwen3 holds another
+# 488 MiB of device buffers and Phi-3.5 another 2618 MiB. True DRAM is nearer
+# 1556 and 8528 MiB against the 1068 and 5910 printed here.
+#
+# Three board logs say the same thing from the other side. r382 measured 2526
+# MiB where the host-anon model predicts 2472; adding the device buffers would
+# put the prediction 27% ABOVE a measurement. r364 and r366 change the slice
+# count enough to move the device buffers by 60 MB and the peak does not move.
+# r371 sweeps CPU_FRAC, whose buffer is host anon, and the peak tracks it
+# exactly.
+#
+# ⚠ AND THE UNITS DIFFER. This column is MiB (hwm/1024) and Rockchip's is
+# labelled MB, so 1068 here is 1120 of theirs and the honest ratio is 2.18x
+# rather than 2.08x.
+echo
+echo "⚠ THE MEMORY COLUMN IS VmHWM AND DOES NOT SEE THE DEVICE BUFFERS."
+echo "  Weights on the hardware, coefficient buffers and batched output"
+echo "  buffers are all VM_PFNMAP and never counted. Computed at these"
+echo "  settings that is another 488 MiB on Qwen3 and 2618 MiB on Phi-3.5."
+echo "  It is not the number that decides which models fit on the board."
+echo "  Our column is MiB and theirs is MB, which is a further 5%."
+echo
 echo "⚠ TTFT AND PROMPT TIME ARE NOT THE SAME THING. Theirs is time to the first"
 echo "  token, ours is the prompt's forward passes; the first token's own step is"
 echo "  in theirs and not in ours, which is one token's worth in our favour."
