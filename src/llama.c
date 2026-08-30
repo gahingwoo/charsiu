@@ -3352,6 +3352,11 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * The rounds that called it wrong were all reading the trailing-space
 	 * prompt, which is 89 tokens and a tail of 25.
 	 *
+	 * ⚠ AND ITS TAIL WIDTH IS NOW MEASURED, NOT ARGUED. The dense sweep
+	 * ran m = 24 against the hardware and got 192 of 192 rows at worst
+	 * relative 2.57e-05, on both cores and on one. gemma4's 88 token
+	 * prompt chunks to 32, 32 and exactly that.
+	 *
 	 * So this refusal is not held up by a measurement any more. It is held
 	 * up only by the fact that no round has yet run gemma4 with the
 	 * even-only chunker in the binary, and a model that has produced wrong
@@ -3411,8 +3416,16 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		 * from the other side: chunk 24 runs 24, 24, 24 and 16, every
 		 * width even, and the text DIFFERED.
 		 *
-		 * Nothing explains that. The width law retires the reason this
-		 * refusal used to give; the residual is what keeps it.
+		 * Nothing explains that, and the dense sweep sharpened it
+		 * rather than solving it: on LLAMA's shapes every even width
+		 * from 12 to 62 is exact on both cores, m = 24 included, so
+		 * the residual is not a property of the width alone. phi3's
+		 * shapes were not in that sweep -- it is k = 3072 with q, k
+		 * and v as views of one attn_qkv, where llama is k = 2048 with
+		 * separate tensors. Whatever is left is in that difference.
+		 *
+		 * The width law retires the reason this refusal used to give;
+		 * the residual is what keeps it.
 		 *
 		 * The test is kept because it still selects the model, and the
 		 * reason string no longer claims to know why.

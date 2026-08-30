@@ -1886,6 +1886,25 @@ static const char *w4_batch_why_not(unsigned m)
 	 * board has never seen is trusted on the layout proof alone, and m =
 	 * 10 is the standing evidence that the layout proof is not enough by
 	 * itself. Widen it the moment a sweep names another.
+	 *
+	 * 🏁 AND IT IS THE CORE PAIR, WITH THE DENSE SWEEP'S SECOND ARM AS THE
+	 * PROOF RATHER THAN A GUESS.
+	 *
+	 *   m       two cores          one core (CHARSIU_NPU_ONEDEV=1)
+	 *   8       62 of 64           64 of 64, worst 0.00e+00
+	 *   10      79 of 80           80 of 80, worst 0.00e+00
+	 *   12..62  exact              exact
+	 *   odd     0 of N             0 of N   <- unchanged, so it is NOT this
+	 *
+	 * and the uncapped m = 8 pass over all 113 tensors: 33 MISS on two
+	 * cores, ZERO on one. Every one of the 33 is k=2048 n=8192 row 0.
+	 *
+	 * So this is two cores stepping on row 0 of a wide output, at some
+	 * small even widths, and nothing about the width itself. One core
+	 * makes it bit identical. That is not the fix -- the pool opens one
+	 * device for the whole run or two, so "one core for m = 8 only" is not
+	 * a switch that exists -- but the chunker never emits 8 or 10 anyway,
+	 * so this refusal is the net under a width that should never arrive.
 	 */
 	if ((m == 8 || m == 10) && !getenv("CHARSIU_NPU_W4_M8"))
 		return "int4 at m=8 and m=10 misses row 0 of the n=8192 tensors";
