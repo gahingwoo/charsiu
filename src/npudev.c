@@ -76,17 +76,6 @@ struct npu_slot {
 };
 
 struct npu_entry {
-	/*
-	 * ⚠ THE BATCHED OUTPUT IS PER TENSOR, and that is the lesson decode
-	 * already paid for two hundred rounds ago: bo_prep and bo_fini are
-	 * cache maintenance over a WHOLE buffer object, so one buffer shared
-	 * across tensors has to be sized for the widest and every call pays
-	 * for all of it. Sized for nmax * m it reached 35 MB a device with the
-	 * head staged, and the chain that was supposed to remove the fence
-	 * spent more than it saved: 3.63x at m = 32 became 3.07x.
-	 */
-	struct charsiu_bo bout[2];
-	unsigned bout_m;
 	const struct npu_tensor *t;
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
 	unsigned first, count;     /* slots, n fastest */
@@ -110,6 +99,67 @@ struct npu_entry {
 	 */
 	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
 	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
+};
+
+/*
+ * THE BATCHED OUTPUT, SHARED BY GEOMETRY RATHER THAN OWNED BY A TENSOR.
+ *
+ * ⚠ NOT ONE BUFFER FOR EVERYTHING, and that is the lesson decode already paid
+ * for two hundred rounds ago: bo_prep and bo_fini are cache maintenance over a
+ * WHOLE buffer object, so one buffer shared across every tensor has to be sized
+ * for the widest and every call pays for all of it. Sized for nmax * m it
+ * reached 35 MB a device with the head staged, and the chain that was supposed
+ * to remove the fence spent more than it saved: 3.63x at m = 32 became 3.07x.
+ *
+ * ⚠⚠ BUT ONE BUFFER PER TENSOR WAS PAYING FOR THAT LESSON A HUNDRED TIMES
+ * OVER. A buffer object is an ioctl, an mmap and an IOVA reservation, and the
+ * board timed a pair of them at 2.9 ms: 225 of them at one m came to 652 ms.
+ * That is 36% of an 1811 ms batched matmul, more than the gather, the packing
+ * and the fence, and the largest single line item in a time to first token that
+ * is four to five times the vendor's on the same silicon. The NPU is idle for
+ * 91% of a batched matmul and this was the biggest single reason why.
+ *
+ * What the size depends on is not WHICH tensor it is. It is the widest slice,
+ * how many slots the busier device gets, and m -- and a transformer has a
+ * handful of those, not one per tensor. Llama-3.2-1B's 113 matmul tensors, at
+ * nmax = 8192 and kmax = 4096, want exactly four buffers between them:
+ *
+ *   wide  slots   n  the tensors that want it       bytes a device at m = 32
+ *    512     1   32  attn_k, attn_v                            69632
+ *   2048     1   48  attn_q, attn_output, ffn_down            266240
+ *   8192     1   32  ffn_gate, ffn_up                        1052672
+ *   8192     8    1  the head, 128256 wide in 16 slices      8392704
+ *
+ * So 113 allocations become 4 and 57.1 MB a device becomes 9.8; Qwen3-0.6B is
+ * 198 tensors, also 4, and 65.8 MB a device becomes 11.3. That second number
+ * matters on its own and not only as time: this runtime peaks at 1068 MB on
+ * Qwen3 where Rockchip's peaks at 513, and 109 MB of that peak was output
+ * buffers, all but four of them the same size as one already sitting there.
+ *
+ * ⚠ THE 225 IS PHI-3.5, NOT LLAMA, AND IT IS EXACTLY ONE PER TENSOR. The pass
+ * that printed `alloc 652 x225` was board_w4_axis on Phi-3.5-mini, whose
+ * tensors column reads 225 on the same line -- 32 layers of seven projections
+ * plus the output head. gemma4's run says 277 and llama's says 113, and every
+ * one of them matches its own tensor count. So the old cost was one allocation
+ * per tensor with no second widening anywhere, and the new cost is one per
+ * shape: 225 becomes four.
+ *
+ * ⚠ AND EVERY TENSOR STILL PREPS EXACTLY THE BYTES IT NEEDS, which is what
+ * keeps the lesson at the top of this comment paid rather than re-learned:
+ * attn_output gets a 266 KB buffer and the head gets an 8 MB one, the same two
+ * sizes they had when each owned its own.
+ */
+struct npu_outbuf {
+	unsigned wide;             /* the widest slice, in output channels */
+	unsigned slots;            /* what the busier of the two devices gets */
+	unsigned m;                /* the rows it is sized for, 0 if unbuilt */
+	unsigned busy;             /* a bit per device with a submit outstanding */
+	/*
+	 * ⚠ SEPARATE, ONE PER DEVICE. A buffer object belongs to the file
+	 * that created it, so the two cores -- which are two open files -- can
+	 * never be handed the same one.
+	 */
+	struct charsiu_bo bo[2];
 };
 
 struct charsiu_npu {
@@ -180,6 +230,10 @@ struct charsiu_npu {
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
 	size_t bin_stride, bout_stride;
+	/* the output buffers, one per geometry rather than one per tensor:
+	 * see the comment on struct npu_outbuf */
+	struct npu_outbuf *obuf;
+	unsigned n_obuf, obuf_cap;
 	float *bscr;               /* m rows of one slice's K, gathered */
 	uint8_t *bq;               /* and quantised, for the int8 path */
 	/*
@@ -813,13 +867,13 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_ent; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->ent[i].out[d]);
-		for (unsigned i = 0; i < g->n_ent; i++)
+		for (unsigned i = 0; i < g->n_obuf; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
-			charsiu_bo_free(g->dev[d], &g->ent[i].bout[d]);
+			charsiu_bo_free(g->dev[d], &g->obuf[i].bo[d]);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
 			/* the batched path's, which a decode never allocates.
-			 * Its output is per entry and freed with them. */
+			 * Its output is in the geometry pool freed just above. */
 			charsiu_bo_free(g->dev[d], &g->bin[d]);
 			charsiu_bo_free(g->dev[d], &g->breg[d]);
 			charsiu_close(g->dev[d]);
@@ -837,6 +891,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bq);
 	free(g->bd1);
 	free(g->bmap);
+	free(g->obuf);
 	free(g->bseen);
 	free(g->asum);
 	free(g->tasks);
@@ -1975,10 +2030,14 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
  * `prep` is the fifth: everything from entry to the first packed byte, which
  * is batch_bufs, the output allocation and the memset of Y.
  *
- * ⚠ AND IT MAY BE MOSTLY THE PROBE. The output buffer is allocated when
- * e->bout_m < m, so a sweep that walks m reallocates every tensor at every
- * width while a real prefill, whose chunk is one fixed 32, pays it once. This
- * counter is what tells those apart instead of leaving it to be argued.
+ * ⚠ AND IT WAS NOT MOSTLY THE PROBE, WHICH IS WHY THE COUNTER EXISTS. The
+ * output buffer used to be allocated per tensor on `bout_m < m`, so a sweep
+ * that walks m reallocated all 113 of them at every width while a real
+ * prefill, whose chunk is one fixed 32, paid it once. It was not the sweep:
+ * the counter said 225 allocations and 652 ms at ONE width, 36% of an 1811 ms
+ * batched matmul, and that is what sent the buffers into a pool keyed on
+ * geometry. It still counts, because a pool that quietly reallocates is the
+ * same bug wearing a different name.
  */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset)
@@ -2057,10 +2116,117 @@ static int batch_zero(void)
 	return z;
 }
 
+/*
+ * THE OUTPUT BUFFER FOR ONE TENSOR, OUT OF THE POOL.
+ *
+ * The key is (widest slice, slots on the busier device), which is everything
+ * the size depends on except m -- see the comment on struct npu_outbuf for what
+ * that collapses to on a real model, and for why one buffer for everything is
+ * the wrong answer to the same question.
+ *
+ * ⚠ IT NEVER SHRINKS, and it did not before either: the per tensor version grew
+ * on `bout_m < m` and kept whatever it had, so a prefill that runs 32, 32, 32,
+ * 14 reallocates nothing on the short last chunk. What is new is that the 14
+ * row chunk of ffn_gate and the 14 row chunk of ffn_up are now the SAME buffer,
+ * because they are the same geometry, so neither of them allocates at all.
+ *
+ * ⚠⚠ GIVE THE OLD ONE BACK FIRST. charsiu_bo_alloc overwrites the handle and
+ * the mapping in place, so widening leaked both -- an mmap, a GEM handle and
+ * its IOVA, per tensor per device, every time m grew. The probe sweeps 2, 4, 8,
+ * 16, 32, 48, 64, 80 over 113 tensors on two devices, and that was about 840 MB
+ * of IOVA thrown away in one run, on top of 620 MB of weights, against a 32 bit
+ * window the batched path narrows addresses into without checking. A pool of
+ * four buffers makes the same sweep cost four widenings a step instead of 113,
+ * but the free is still what keeps it honest.
+ *
+ * ⚠ A BUFFER THAT WAS NEVER ALLOCATED HAS TO BE SAFE TO FREE, which is why the
+ * pool is zeroed as it grows: charsiu_bo_free returns immediately on a NULL
+ * map, and every path into the allocation below frees before it allocates.
+ */
+static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
+				       unsigned slots, unsigned m)
+{
+	struct npu_outbuf *ob = NULL;
+	double ta;
+	size_t want;
+
+	for (unsigned i = 0; i < g->n_obuf; i++)
+		if (g->obuf[i].wide == wide && g->obuf[i].slots == slots) {
+			ob = &g->obuf[i];
+			break;
+		}
+	if (!ob) {
+		if (g->n_obuf == g->obuf_cap) {
+			unsigned cap = g->obuf_cap ? g->obuf_cap * 2 : 8;
+			struct npu_outbuf *t2 = realloc(g->obuf,
+						(size_t)cap * sizeof(*t2));
+
+			if (!t2) {
+				whine(g, "the batched output pool would not grow",
+				      wide, m);
+				return NULL;
+			}
+			memset(t2 + g->obuf_cap, 0,
+			       (size_t)(cap - g->obuf_cap) * sizeof(*t2));
+			g->obuf = t2;
+			g->obuf_cap = cap;
+		}
+		ob = &g->obuf[g->n_obuf++];
+		ob->wide = wide;
+		ob->slots = slots;
+	}
+	/*
+	 * ⚠⚠ WAIT FOR ANYTHING STILL WRITING IT BEFORE HANDING IT ON.
+	 *
+	 * The normal path submits, fences and reads inside one call, so the
+	 * hardware has finished with the buffer long before this function can be
+	 * asked for it again -- there is no thread here and no second tensor in
+	 * flight. The paths that are NOT normal are the ones that matter: an
+	 * empty register stream on device 1 returns after device 0 has already
+	 * been submitted, and the read order table failing to allocate returns
+	 * between the two fences. Per tensor those left a job writing a buffer
+	 * that only the same tensor could reach, and its next call fenced it.
+	 * Shared, the next tensor of the same shape is a different caller, and
+	 * it would submit over the top of a job that is still running.
+	 *
+	 * One prep is the whole of the fix -- it is a dma_resv wait -- and the
+	 * fini hands ownership back so the next submit is reading a coherent
+	 * buffer. It costs nothing in the normal path, where `busy` is cleared
+	 * by the fence that was going to happen anyway.
+	 */
+	if (ob->busy) {
+		for (unsigned d = 0; d < g->ndev; d++)
+			if (ob->busy & (1u << d)) {
+				charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+				charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+			}
+		ob->busy = 0;
+	}
+	if (ob->m >= m)
+		return ob;
+
+	ta = now_us();
+	want = (size_t)wide * m * 4 * slots + 4096;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		charsiu_bo_free(g->dev[d], &ob->bo[d]);
+		if (charsiu_bo_alloc(g->dev[d], want, &ob->bo[d])) {
+			whine(g, "the batched output would not allocate",
+			      wide, m);
+			ob->m = 0;
+			return NULL;
+		}
+	}
+	ob->m = m;
+	g->balloc_us += now_us() - ta;
+	g->balloc_n++;
+	return ob;
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
 	struct npu_entry *e;
+	struct npu_outbuf *ob;
 	struct charsiu_joblist jl;
 	double t0, tprep = now_us();
 
@@ -2171,48 +2337,29 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		 */
 		g->bout_stride = (size_t)wide * m * 4;
 		/*
-		 * ⚠⚠ IS THIS THE PROBE OR IS IT REAL? The output buffer is
-		 * allocated only when this tensor has never been asked for this
-		 * many rows, so a sweep that walks m reallocates all 113 of
-		 * them at every width while a real prefill, whose chunk is one
-		 * fixed 32, pays it on the first chunk and never again.
+		 * ⚠⚠ AND SHARED WITH EVERY TENSOR OF THE SAME SHAPE, which is
+		 * where 652 ms of a 1811 ms batched matmul went. The buffer this
+		 * hands back is sized (wide, most, m) and nothing else, so the
+		 * two lines above still decide its bytes -- what changed is that
+		 * ffn_gate and ffn_up, and all 32 of them across the layers, now
+		 * ask for one buffer between them instead of 32.
 		 *
-		 * `prep` was 26% of a batched matmul and removing the zero of Y
-		 * -- which was the whole of the hypothesis -- moved it 12%. So
-		 * the rest is this, or it is not, and counting is cheaper than
-		 * another round of arguing about a linear curve.
-		 */
-		/*
-		 * ⚠⚠ GIVE THE OLD ONE BACK FIRST. charsiu_bo_alloc overwrites
-		 * the handle and the mapping in place, so widening leaked both
-		 * -- an mmap, a GEM handle and its IOVA, per tensor per device,
-		 * every time m grew.
+		 * ⚠ AND THAT CLOSES `prep`. It was 26% of a batched matmul;
+		 * removing the zero of Y, which was the whole of the hypothesis
+		 * at the time, moved it 12%. The allocation was the other half,
+		 * and it was the half nobody had counted.
 		 *
-		 * A prefill never notices: its chunk is one fixed width and
-		 * this runs once. The probe sweeps 2, 4, 8, 16, 32, 48, 64, 80
-		 * over 113 tensors on two devices, and the arithmetic on this
-		 * model is about 840 MB of IOVA thrown away in one run -- on
-		 * top of 620 MB of weights, against a 32 bit window the batched
-		 * path narrows addresses into without checking.
+		 * ⚠ ONE TENSOR IS IN FLIGHT AT A TIME, which is what makes that
+		 * safe. There is no thread in this path: llama.c's prefill calls
+		 * matmul_rows for one projection at a time and charsiu_pool_rows
+		 * walks its chunks in a loop, and this function does not return
+		 * until it has fenced and read every device it submitted to.
+		 * batch_outbuf holds the net under the paths where it returns
+		 * early anyway.
 		 */
-		if (e->bout_m < m) {
-			double ta = now_us();
-
-			for (unsigned d = 0; d < g->ndev; d++) {
-				charsiu_bo_free(g->dev[d], &e->bout[d]);
-				if (charsiu_bo_alloc(g->dev[d],
-						     g->bout_stride * most + 4096,
-						     &e->bout[d])) {
-					whine(g, "the batched output would not allocate",
-					      (unsigned)e->t->k, wide * m);
-					e->bout_m = 0;
-					return -1;
-				}
-			}
-			e->bout_m = m;
-			g->balloc_us += now_us() - ta;
-			g->balloc_n++;
-		}
+		ob = batch_outbuf(g, wide, most, m);
+		if (!ob)
+			return -1;
 	}
 
 	/*
@@ -2352,7 +2499,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			job.mm.m = m;
 			job.input_addr = (uint32_t)g->bin[d].dma_address
 				       + (uint32_t)(ki * g->bin_stride);
-			job.output_addr = (uint32_t)e->bout[d].dma_address
+			job.output_addr = (uint32_t)ob->bo[d].dma_address
 					+ (uint32_t)(nt * g->bout_stride);
 			nreg = charsiu_emit_job(&job,
 					(uint64_t *)((uint8_t *)g->breg[d].map + (size_t)nt * 4096),
@@ -2382,7 +2529,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
 		jl.in_count = nh;
-		jl.out_handles = &e->bout[d].handle;
+		jl.out_handles = &ob->bo[d].handle;
 		jl.out_count = 1;
 		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
 			g->strikes = 3;
@@ -2390,6 +2537,10 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			return -1;
 		}
 		g->submits++;
+		/* ⚠ from here the hardware owns this buffer, and batch_outbuf is
+		 * the one that has to know it if this call returns before the
+		 * fence below clears it again */
+		ob->busy |= 1u << d;
 		g->bsub_us += now_us() - tp;
 		/*
 		 * ⚠⚠ THE CORE PAIR, AND THE ONE KNOB THAT REMOVES IT.
@@ -2420,7 +2571,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		if (batch_serial() && g->ndev > 1) {
 			double tf = now_us();
 
-			charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
+			charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+			ob->busy &= ~(1u << d);
 			g->bfence_us += now_us() - tf;
 		}
 	}
@@ -2430,7 +2582,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		double tf = now_us();
 		unsigned nt;
 
-		charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
+		charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+		ob->busy &= ~(1u << d);
 		g->bfence_us += now_us() - tf;
 		tf = now_us();
 		{
@@ -2503,7 +2656,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 				if (s->di != d)
 					continue;
-				fo = (const float *)((uint8_t *)e->bout[d].map
+				fo = (const float *)((uint8_t *)ob->bo[d].map
 						     + (size_t)nt * g->bout_stride);
 				io = (const int32_t *)fo;
 				/*
@@ -2647,7 +2800,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		}
 		g->bread_us += now_us() - tf;
 		if (!g->nofini)
-			charsiu_bo_fini(g->dev[d], &e->bout[d]);
+			charsiu_bo_fini(g->dev[d], &ob->bo[d]);
 	}
 
 	g->busy_us += now_us() - t0;
