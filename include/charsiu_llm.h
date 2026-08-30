@@ -201,7 +201,17 @@ void charsiu_act_q1(struct charsiu_act *a);
  * register streams will fix it.
  */
 struct npu_tensor {
-	int8_t *q;         /* [n][k], row major */
+	/*
+	 * ⚠ TWO LAYOUTS, AND npu_q_packed() IN src/npuquant.c DECIDES WHICH.
+	 * [n][k] one signed byte a code for int8, or [n][(k+1)/2] with two int4
+	 * codes a byte -- low nibble the even column, each ROW byte aligned so
+	 * a reader strides by npu_q_stride() and the column alone picks the
+	 * half. Row alignment is not free (one padding nibble per row at odd k,
+	 * and zero for every real model, whose k is a multiple of 32) and it is
+	 * what keeps quant_rows' per-row thread split from having two workers
+	 * read-modify-write one shared byte.
+	 */
+	int8_t *q;
 	float *scale;      /* n * ngroup, per output channel per k group */
 	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	float *kscale;     /* k, a factor shared by every channel; NULL when off */

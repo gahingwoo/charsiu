@@ -33,6 +33,40 @@
 #include "charsiu_llm.h"
 
 /*
+ * ⚠⚠ t->q IS NIBBLE PACKED FOR int4 AND THIS FILE IS ITS OTHER READER.
+ *
+ * The quantiser holds an int4 weight in HALF a byte -- 298.0 MB of q on
+ * Qwen3-0.6B rather than 596.0, and 1861.2 rather than 3722.4 on Phi-3.5-mini
+ * -- laid out row major, ((k + 1) / 2) bytes a row, low nibble first. The long
+ * note over npu_q_packed in src/npuquant.c has the layout and, more
+ * importantly, why "is it packed" is ONE process wide bool rather than anything
+ * per tensor: this file only holds t->name, and two files disagreeing by a
+ * nibble about the same buffer is a wrong answer that reads as a right one.
+ *
+ * Declared here rather than in charsiu_llm.h because the width q is held at is
+ * the quantiser's business and nothing outside these two files reads it.
+ *
+ * ⚠ AND IT IS NOT THE SAME QUESTION AS g->w4. g->w4 is what the DEVICE was
+ * opened as and decides which byte the packer is handed; npu_q_packed is how
+ * the weights are stored on the way in. They come apart in a real case: a
+ * vision tower forces charsiu_npu_open_mode(want_w4 = 0) so its batch is not
+ * turned into one dispatch a row, while the quantiser still reads
+ * CHARSIU_NPU_W4V from the runner's config and produces int4 codes. So every
+ * reader below tests them separately.
+ */
+int npu_q_packed(void);
+size_t npu_q_stride(uint64_t k);
+
+/* one int4 code out of a packed row of t->q, by column */
+static inline int q_code(const int8_t *row, uint64_t i)
+{
+	unsigned v = (unsigned)(uint8_t)row[i >> 1];
+
+	v = (i & 1) ? (v >> 4) : (v & 0xfu);
+	return v >= 8 ? (int)v - 16 : (int)v;
+}
+
+/*
  * One SLICE of a projection.
  *
  * Round 313 put every attention projection on the hardware and got tokens
@@ -93,9 +127,17 @@ struct npu_entry {
 	 * most of the fence.
 	 *
 	 * cq holds those rows' weights packed two to a byte, row major. It has
-	 * to be packed: t->q keeps one BYTE per int4 weight, so reading rows
-	 * out of it costs twice the bytes the NPU pays for the same weights,
-	 * and the whole idea is bandwidth.
+	 * to be packed, because the whole idea is bandwidth: reading rows at
+	 * one byte a code would cost twice what the NPU pays for the same
+	 * weights.
+	 *
+	 * ⚠ t->q IS PACKED THE SAME WAY NOW, and identically -- same row major
+	 * order, same ((k + 1) / 2) stride, same low-nibble-first. So on the
+	 * int4 path this is a memcpy of the row rather than a gather and a
+	 * shift, and cpu_rows below could read t->q directly. It is still kept
+	 * as its own array: the CPU's rows want to be contiguous and warm
+	 * rather than strided through a tensor whose other rows the NPU is
+	 * streaming at the same time, which is the whole point of the split.
 	 */
 	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
 	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
@@ -993,18 +1035,105 @@ static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 {
 	const struct wrows *w = vw;
 	struct charsiu_npu *g = w->g;
+	/*
+	 * ⚠ TWO SEPARATE QUESTIONS, and they used to be one. pk is how the
+	 * weight is STORED and g->w4 is what the device wants HANDED to it: an
+	 * unsigned byte around a zero point of 128 for int8, or the signed code
+	 * in the low nibble for int4, which is what two's complement already
+	 * puts there for a value in [-8, 7]. Unpack first, then decide the
+	 * byte, and the two are free to differ -- which they do whenever a
+	 * caller forces int8 on the device while the quantiser is at four bits.
+	 */
+	const int pk = npu_q_packed();
+	const size_t stride = npu_q_stride(w->t->k);
 
 	for (uint64_t r = r0; r < r0 + nr; r++) {
-		const int8_t *src = w->t->q
-				  + (size_t)(w->n0 + r) * w->t->k + w->k0;
+		const int8_t *src = w->t->q + (size_t)(w->n0 + r) * stride;
 		uint8_t *dst = g->scratch + (size_t)r * w->k;
 
-		for (unsigned c = 0; c < w->k; c++)
-			dst[c] = g->w4 ? (uint8_t)(src[c] & 0xf)
-				       : (uint8_t)((int)src[c] + 128);
+		for (unsigned c = 0; c < w->k; c++) {
+			uint64_t i = (uint64_t)w->k0 + c;
+			int v = pk ? q_code(src, i) : src[i];
+
+			dst[c] = g->w4 ? (uint8_t)((unsigned)v & 0xfu)
+				       : (uint8_t)(v + 128);
+		}
 	}
 	charsiu_pack_weights_rows(w->mm, g->scratch, g->wpack,
 				  (unsigned)r0, (unsigned)nr);
+}
+
+/*
+ * THE ZERO POINT CORRECTION FOR ONE SLICE: the sum of this slice's codes,
+ * channel by channel, which charsiu_build_coefs folds into the coefficient
+ * buffer so the hardware's unsigned operand comes back to the signed one.
+ *
+ * ⚠ ITS CALLER'S !g->w4 GATE IS NOT THE SAME QUESTION AS "q IS ONE BYTE A
+ * CODE". This runs when the DEVICE is int8, and an int8 device does not make
+ * the WEIGHTS int8: a tower that forced want_w4 = 0 -- which every batching
+ * caller does, because w4a16 makes exactly one row -- under a config that sets
+ * CHARSIU_NPU_W4V has int4 codes in a packed q and an int8 device reading them.
+ * Summing the bytes there would add two codes at a time and put a wrong
+ * correction into every coefficient, which the hardware applies without
+ * complaint and which comes back as text.
+ *
+ * ⚠ IT IS ALSO WHY THIS IS ITS OWN FUNCTION. Nothing here can be reached from a
+ * host without an NPU -- add_slice needs three buffer objects before it gets
+ * this far -- so the only way to check a reader of q against the layout it
+ * reads is to be able to call it.
+ */
+static void slice_wsum(const struct npu_tensor *t, unsigned n0, unsigned n,
+		       unsigned k0, unsigned k, int32_t *wsum)
+{
+	const int pk = npu_q_packed();
+	const size_t stride = npu_q_stride(t->k);
+
+	for (unsigned r = 0; r < n; r++) {
+		const int8_t *src = t->q + (size_t)(n0 + r) * stride;
+		int32_t a = 0;
+
+		for (unsigned c = 0; c < k; c++) {
+			uint64_t i = (uint64_t)k0 + c;
+
+			a += pk ? q_code(src, i) : src[i];
+		}
+		wsum[r] = a;
+	}
+}
+
+/*
+ * THE CPU'S ROWS, PACKED TWO WEIGHTS TO A BYTE: rows [n0, n) of t into cq,
+ * ((k + 1) / 2) bytes each, low nibble first.
+ *
+ * ⚠ WHICH IS BYTE FOR BYTE WHAT t->q ALREADY HOLDS on the int4 path, so that
+ * case is a memcpy of the row and the loop underneath is what is left for a q
+ * still held one byte a code. That is not dead code and the reason is worth
+ * keeping: an int8 DEVICE never reaches here at all, because the whole split is
+ * gated on g->w4 -- but an int4 device whose quantiser was narrowed by
+ * CHARSIU_NPU_W4_ONLY does, and its q is not packed.
+ */
+static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
+{
+	const int pk = npu_q_packed();
+	const size_t stride = npu_q_stride(t->k);
+	size_t per = ((size_t)t->k + 1) / 2;
+	unsigned nc = (unsigned)t->n - n0;
+
+	for (unsigned r = 0; r < nc; r++) {
+		const int8_t *src = t->q + (size_t)(n0 + r) * stride;
+		uint8_t *dst = cq + (size_t)r * per;
+		uint64_t i;
+
+		if (pk) {
+			memcpy(dst, src, per);
+			continue;
+		}
+		for (i = 0; i + 1 < t->k; i += 2)
+			dst[i >> 1] = (uint8_t)((src[i] & 0xf) |
+						((src[i + 1] & 0xf) << 4));
+		if (i < t->k)
+			dst[i >> 1] = (uint8_t)(src[i] & 0xf);
+	}
 }
 
 /* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t, writing region si. */
@@ -1131,14 +1260,8 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	/* the weight sums this slice's K range accounts for, not the tensor's.
 	 * int4 has no input zero point, so there is nothing for them to
 	 * correct and they stay at zero. */
-	for (unsigned r = 0; r < n && !g->w4; r++) {
-		const int8_t *src = t->q + (size_t)(n0 + r) * t->k + k0;
-		int32_t a = 0;
-
-		for (unsigned c = 0; c < k; c++)
-			a += src[c];
-		wsum[r] = a;
-	}
+	if (!g->w4)
+		slice_wsum(t, n0, n, k0, k, wsum);
 
 	/*
 	 * Zero bias and no lift, so the accumulator arrives unmodified. The
@@ -1334,13 +1457,15 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	/*
 	 * THE CPU'S ROWS, PACKED TWO WEIGHTS TO A BYTE.
 	 *
-	 * t->q keeps one whole byte per int4 weight, which is what the
-	 * quantiser hands everything downstream. Reading the CPU's share out of
-	 * it would cost twice the bytes the hardware pays for the same weights,
-	 * and bandwidth is the entire point of the split, so those rows get
-	 * their own packed copy: low nibble first, row major, nothing
-	 * scrambled. It is f * n * k / 2 bytes, 136 MB of this model at a
-	 * quarter of the rows, against 620 MB of weights already resident.
+	 * Reading the CPU's share at one byte a code would cost twice the bytes
+	 * the hardware pays for the same weights, and bandwidth is the entire
+	 * point of the split, so those rows get their own packed copy: low
+	 * nibble first, row major, nothing scrambled. It is f * n * k / 2 bytes,
+	 * 136 MB of this model at a quarter of the rows.
+	 *
+	 * ⚠ ON THE int4 PATH IT IS A COPY NOW, because t->q is held in exactly
+	 * this layout -- see cq_fill, which is where the packing went so that a
+	 * host with no NPU can still drive it.
 	 */
 	if (e_n_npu < (unsigned)t->n) {
 		unsigned nc = (unsigned)t->n - e_n_npu;
@@ -1352,18 +1477,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			      (unsigned)t->k, (unsigned)t->n);
 			e->n_npu = (unsigned)t->n;   /* fall back to all NPU */
 		} else {
-			for (unsigned r = 0; r < nc; r++) {
-				const int8_t *src = t->q
-					+ (size_t)(e_n_npu + r) * t->k;
-				uint8_t *dst = e->cq + (size_t)r * per;
-				uint64_t i;
-
-				for (i = 0; i + 1 < t->k; i += 2)
-					dst[i >> 1] = (uint8_t)((src[i] & 0xf) |
-						((src[i + 1] & 0xf) << 4));
-				if (i < t->k)
-					dst[i >> 1] = (uint8_t)(src[i] & 0xf);
-			}
+			cq_fill(t, e_n_npu, e->cq);
 		}
 	}
 	/*
