@@ -139,7 +139,17 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	BEST_TT=; BEST_TS=; BEST_MB=; BEST_NP=; WORST_TT=; nrun=0
 	while [ $nrun -lt "$REPEAT" ]; do
 		nrun=$((nrun + 1))
-		OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		# ⚠⚠ env, NOT A BARE ASSIGNMENT PREFIX. A shell only treats
+		# NAME=VALUE as an assignment when it is written literally in
+		# the command position; a VARIABLE that expands to NAME=VALUE is
+		# looked up as a COMMAND. Adding $PRICE_ENV to the prefix form
+		# turned four rows into
+		#
+		#   board_vendor.sh: 142: CHARSIU_NPU_BATCH_PARALLEL=1: not found
+		#
+		# `env` takes them as arguments, so an expanded one works.
+		# shellcheck disable=SC2086
+		OUT=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 		      $PRICE_ENV \
