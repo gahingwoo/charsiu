@@ -99,6 +99,10 @@ CHUNK=${CHARSIU_INT_CHUNK:-32}
 NGEN=${CHARSIU_INT_NGEN:-8}
 ARMS=${CHARSIU_INT_ARMS:-"default onedev serial"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+TMOS=${CHARSIU_INT_TIMEOUT:-300}
+TMO=""
+command -v timeout >/dev/null 2>&1 && TMO="timeout $TMOS"
+WEDGED=0
 # ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
 # board_text_all.sh spelled this literally and every other script built it with
@@ -120,13 +124,18 @@ echo "model    $MODEL"
 echo "binary   $RUN"
 echo "config   chunk $CHUNK, gen $NGEN, $RUNS runs an arm"
 echo "arms     $ARMS"
-echo "  default  as shipped: two NPU cores"
-echo "  onedev   CHARSIU_NPU_ONEDEV=1 -- ONE core; the control for the core pair"
-echo "  serial   CHARSIU_NPU_BATCH_SERIAL=1 -- both cores, but never at the"
-echo "           same time: the candidate FIX, and it keeps decode's second core"
-echo "  zero     CHARSIU_NPU_BATCH_ZERO=1 -- a TIMING perturbation, not a"
-echo "           semantic control: the memset cannot change what the hardware"
-echo "           computes, so a failure only here is a race"
+# ⚠ DESCRIBE ONLY THE ARMS THAT WILL RUN. The header listed all four while
+# ARMS held three, which is the same class of lie as a computed width: the
+# thing on screen has to be the thing that happened.
+for A in $ARMS; do case $A in
+default) echo "  default  as shipped: two NPU cores" ;;
+onedev)  echo "  onedev   CHARSIU_NPU_ONEDEV=1 -- ONE core; the control for the core pair" ;;
+serial)  echo "  serial   CHARSIU_NPU_BATCH_SERIAL=1 -- both cores, never at the same"
+         echo "           time: the candidate FIX, and it keeps decode's second core" ;;
+zero)    echo "  zero     CHARSIU_NPU_BATCH_ZERO=1 -- a TIMING perturbation, not a"
+         echo "           semantic control: the memset cannot change what the"
+         echo "           hardware computes, so a failure only here is a race" ;;
+esac; done
 echo
 
 # --- the control, twice, because the token loop must be stable too ---------
@@ -199,12 +208,39 @@ for ARM in $ARMS; do
 	zero)    EXTRA="CHARSIU_NPU_BATCH_ZERO=1" ;;
 	*) echo "unknown arm '$ARM'" >&2; continue ;;
 	esac
-	bad=0; marks=""; i=1
+	bad=0; marks=""; i=1; did=0
 	while [ "$i" -le "$RUNS" ]; do
+		# ⚠⚠ A CLOCK AND A WEDGE CHECK ON EVERY RUN.
+		#
+		# A round died here having printed nothing at all: the NPU timed
+		# out on the FIRST run of the FIRST arm, the driver's reset path
+		# could not bring the block back ("MMU_DTE_ADDR is not
+		# functioning"), and everything after it was running against
+		# dead hardware. The table header was on screen and no row ever
+		# followed it.
+		#
+		# A wedged NPU does not recover in this loop, so there is
+		# nothing to be gained by continuing -- and a great deal to lose,
+		# because every later arm then measures a fallback and looks
+		# clean. Stop at the first one and say the board needs a reboot.
 		# shellcheck disable=SC2086
-		env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" \
+		$TMO env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" \
 			$EXTRA "$RUN" "$MODEL" -p "$PROMPT" -n "$NGEN" \
-			--ignore-eos >"$T/b.out" 2>/dev/null
+			--ignore-eos >"$T/b.out" 2>"$T/b.err"
+		rc=$?
+		if [ $rc -eq 124 ]; then
+			echo
+			echo "⚠⚠ RUN $i OF THE $ARM ARM DID NOT FINISH IN ${TMOS}s."
+			echo "   Almost certainly a wedged NPU. Nothing measured."
+			WEDGED=1; break
+		fi
+		if grep -qiE "job timed out|not functioning|iommu" "$T/b.err"; then
+			echo
+			echo "⚠⚠ THE NPU WEDGED on run $i of the $ARM arm:"
+			grep -iE "job timed out|not functioning|iommu" "$T/b.err" \
+				| head -3 | sed 's/^/     /'
+			WEDGED=1; break
+		fi
 		sed -i 's/^\[.*//' "$T/b.out"
 		if cmp -s "$T/ref.out" "$T/b.out"; then
 			marks="$marks."
@@ -212,9 +248,15 @@ for ARM in $ARMS; do
 			marks="${marks}X"; bad=$((bad + 1))
 			cp "$T/b.out" "$T/worst-$ARM.out"
 		fi
+		did=$((did + 1))
 		i=$((i + 1))
 	done
-	printf '%-9s %-6s %s\n' "$ARM" "$bad/$RUNS" "$marks"
+	# ⚠ THE DENOMINATOR IS RUNS THAT COMPLETED, not the loop counter and
+	# not RUNS. `$i` is one past the last run, and `$RUNS` would claim
+	# every run happened on an arm that stopped early on a wedged NPU --
+	# the exact case this reporting exists for.
+	printf '%-9s %-6s %s\n' "$ARM" "$bad/$did" "$marks"
+	[ "$WEDGED" -eq 0 ] || break
 	[ "$bad" -eq 0 ] || printf '          a wrong one: ...%s\n' \
 		"$(tr -d '\n' < "$T/worst-$ARM.out" | tail -c 56)"
 	eval "res_$ARM=$bad"
@@ -222,6 +264,18 @@ done
 
 echo
 echo "======================================================================"
+if [ "$WEDGED" -ne 0 ]; then
+	echo "⚠⚠ THE ROUND STOPPED ON A WEDGED NPU. NOTHING HERE IS A RESULT."
+	echo
+	echo "This board's reset path does not recover the block after a job"
+	echo "times out -- the IOMMU says MMU_DTE_ADDR is not functioning and"
+	echo "every job after that fails or falls back to the CPU a row at a"
+	echo "time, which looks exactly like a clean arm."
+	echo
+	echo "  REBOOT THE BOARD and run this again. Numbers taken after a"
+	echo "  timeout, in this round or the one before it, do not count."
+	exit 1
+fi
 d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
 # ⚠ ANY arm firing counts. A fault that shows up only under the timing
 # perturbation is still a fault on this hardware; the perturbation is not a
