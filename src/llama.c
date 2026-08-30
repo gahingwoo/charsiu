@@ -535,7 +535,23 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 * and a chunk of 48, 64 or 80 is what a real prompt hands it.
 	 * --batch-probe N still caps this.
 	 */
-	static const unsigned MS[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
+	static const unsigned MS_DEFAULT[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
+	/*
+	 * ⚠⚠ THE WIDTHS A REAL PROMPT HANDS IT ARE NOT THIS LIST.
+	 *
+	 * phi3's prompt is 87 tokens, which at a chunk of 32 is 32, 32 and
+	 * TWENTY THREE -- a width this sweep has never asked about, on a model
+	 * whose text is wrong on the board while every width here is exact.
+	 * m = 8 was only ever found because 8 happened to be in the list.
+	 *
+	 * CHARSIU_PROBE_WIDTHS takes a space or comma separated list, so a
+	 * round can ask about 23, or sweep 2..32 dense and stop finding broken
+	 * widths by luck.
+	 */
+	unsigned ms_buf[64];
+	const unsigned *MS = MS_DEFAULT;
+	unsigned n_ms = sizeof(MS_DEFAULT) / sizeof(MS_DEFAULT[0]);
+	const char *wenv = getenv("CHARSIU_PROBE_WIDTHS");
 	float *X = NULL, *Y = NULL, *Yref = NULL;
 	struct charsiu_act a;
 	unsigned widest = 0;
@@ -544,6 +560,41 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	if (!s->pool.dev) {
 		fprintf(stderr, "charsiu: no NPU staged; nothing to batch\n");
 		return -1;
+	}
+	if (wenv && *wenv) {
+		unsigned n = 0, top = 0;
+		char *p = (char *)wenv;
+
+		while (*p && n < sizeof(ms_buf) / sizeof(ms_buf[0])) {
+			while (*p == ' ' || *p == ',' || *p == '\t')
+				p++;
+			if (*p < '0' || *p > '9')
+				break;
+			ms_buf[n] = (unsigned)strtoul(p, &p, 10);
+			if (ms_buf[n] >= 2) {
+				if (ms_buf[n] > top)
+					top = ms_buf[n];
+				n++;
+			}
+		}
+		/*
+		 * ⚠ AND THE LIST RAISES THE CAP. --batch-probe caps the sweep,
+		 * and a round that asks for width 87 under a cap of 80 gets 80
+		 * and a table that does not mention it. Asking explicitly is
+		 * the whole point of this switch.
+		 */
+		if (top > mmax)
+			mmax = top;
+		if (!n) {
+			fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS=\"%s\" "
+				"parsed to nothing; refusing to fall back to "
+				"the default list, because a round that "
+				"silently asks a different question is the "
+				"failure this probe exists to avoid\n", wenv);
+			return -1;
+		}
+		MS = ms_buf;
+		n_ms = n;
 	}
 	for (unsigned i = 0; i < s->pool.n; i++)
 		if (s->pool.id[i] >= 0 && s->pool.t[i].k > widest)
@@ -565,7 +616,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 */
 	printf("\n  batching %u layers, checked before it is timed; widths",
 	       m->n_layer);
-	for (unsigned i = 0; i < sizeof(MS) / sizeof(*MS); i++)
+	for (unsigned i = 0; i < n_ms; i++)
 		if (MS[i] <= mmax)
 			printf(" %u", MS[i]);
 	printf("   (--batch-probe caps at %u)\n", mmax);
@@ -940,7 +991,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		}
 	}
 
-	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+	for (unsigned y = 0; y < n_ms; y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
 		unsigned nbad = 0;		/* misses named, capped */
 		int whered = 0;			/* the where-did-it-go scan, once a width */
