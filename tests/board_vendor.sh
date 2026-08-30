@@ -26,6 +26,31 @@ set -eu
 REPEAT=${CHARSIU_BENCH_REPEAT:-1}
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$DIR"
+# ⚠⚠ PRICING THE CORRECTNESS FIX, AND THIS ARM RETURNS WRONG TEXT.
+#
+# The two NPU cores corrupt each other when their batched submits overlap --
+# phi3 at width 24 came back wrong 13 runs of 16 overlapped and 0 of 16
+# serialised -- so serialised is the default and it costs a batched
+# projection's parallelism. How much that costs is a fair question and it has
+# exactly one honest answer: run the broken configuration and read the clock.
+#
+# CHARSIU_VENDOR_PRICE_SERIAL=1 does that. Every number it produces is the
+# speed of an answer that may be wrong, it is not a configuration to ship, and
+# the banner says so on every round that sets it.
+PRICE_ENV=""
+if [ -n "${CHARSIU_VENDOR_PRICE_SERIAL:-}" ]; then
+	PRICE_ENV="CHARSIU_NPU_BATCH_PARALLEL=1"
+	echo "======================================================================"
+	echo "⚠⚠ CHARSIU_VENDOR_PRICE_SERIAL: the two cores' submits OVERLAP in"
+	echo "   this round. That is the configuration measured wrong 13 runs of"
+	echo "   16 on phi3. EVERY NUMBER BELOW IS THE SPEED OF A POSSIBLY WRONG"
+	echo "   ANSWER, and exists only to price what serialising costs."
+	echo "   Compare its TTFT column against a normal round; ship neither"
+	echo "   this build nor this conclusion without board_text_all.sh."
+	echo "======================================================================"
+	echo
+fi
+
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 [ -d "$MODELS" ] || MODELS=/opt/charsiu/models
 
@@ -117,6 +142,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		      $PRICE_ENV \
 		      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \
 		      2>"$DIR/.v.err" | grep '^\[load') || OUT=""
 		[ -n "$OUT" ] || continue
