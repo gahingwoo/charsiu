@@ -180,6 +180,10 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
+"  --repeat N     run the same prompt N times in ONE process, so a rate\n"
+"                 question does not pay for N model loads. The cache is\n"
+"                 reset between them and each is separated by a marker\n"
+"                 line on stdout.\n"
 "  -i, --interactive  a conversation: the model and the NPU tensors stay\n"
 "                 staged, so every turn after the first costs a token and\n"
 "                 not the twenty seconds staging takes\n"
@@ -287,6 +291,23 @@ int main(int argc, char **argv)
 	const char *cache = NULL;
 	int hold_secs = 0;
 	int interactive = 0, turn;
+	/*
+	 * ⚠⚠ --repeat EXISTS BECAUSE THE PROBES WERE PAYING FOR A MODEL LOAD
+	 * PER SAMPLE.
+	 *
+	 * board_intermittent asks a rate question -- how often does the batched
+	 * prompt come back wrong -- and answered it by starting this program
+	 * once per sample: 16 runs an arm, three arms, plus controls, is 51
+	 * loads of a 2.2 GB model. Phi-3.5 stages in about eight seconds, so
+	 * the great majority of that round was spent re-uploading weights that
+	 * had not changed, to measure something that happens after they are
+	 * uploaded.
+	 *
+	 * This runs the same prompt N times in ONE process, resetting the cache
+	 * position between them, which is what -i already does for a
+	 * conversation. The model and the staged NPU tensors stay put.
+	 */
+	int repeat = 1;
 	char cachepath[1024];
 	double t_load, t0, t_prompt;
 	double temp_start = 0.0, t_half = 0.0;
@@ -324,6 +345,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--hold-secs")) hold_secs = atoi(NEXT());
 		else if (!strcmp(a, "-i") || !strcmp(a, "--interactive"))
 			interactive = 1;
+		else if (!strcmp(a, "--repeat") && i + 1 < argc)
+			repeat = atoi(argv[++i]);
 		else if (!strcmp(a, "--cache")) cache = "";
 		else if (!strcmp(a, "--cache-at")) cache = NEXT();
 		else if (!strcmp(a, "-q")) quiet = 1;
@@ -1215,8 +1238,25 @@ next:
 			       produced - eog_at - 1);
 	}
 
-	if (!interactive)
-		break;
+	if (!interactive) {
+		if (turn + 1 >= repeat)
+			break;
+		/*
+		 * ⚠ THE CACHE POSITION, AND NOTHING ELSE. Everything the next
+		 * repeat reads at a position it is about to write is
+		 * overwritten from zero, so the cache contents do not need
+		 * clearing -- but pos does, or repeat two starts where repeat
+		 * one stopped and prefills a different length.
+		 *
+		 * ⚠ AND A MARKER ON STDOUT, because the caller has to be able
+		 * to split N answers out of one stream. Without it a comparison
+		 * would see one long string and call every repeat identical.
+		 */
+		st->pos = 0;
+		printf("\n--- charsiu repeat %d ---\n", turn + 2);
+		fflush(stdout);
+		continue;
+	}
 	}   /* the turn loop */
 	free(turnbuf);
 

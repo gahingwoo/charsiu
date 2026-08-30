@@ -99,7 +99,10 @@ CHUNK=${CHARSIU_INT_CHUNK:-32}
 NGEN=${CHARSIU_INT_NGEN:-8}
 ARMS=${CHARSIU_INT_ARMS:-"default onedev serial"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-TMOS=${CHARSIU_INT_TIMEOUT:-300}
+# ⚠ ONE PROCESS NOW DOES $RUNS PROMPTS, so the clock is per ARM, not per
+# run: 90s of staging and prompt each, floored at 300.
+TMOS=${CHARSIU_INT_TIMEOUT:-0}
+[ "$TMOS" -gt 0 ] 2>/dev/null || TMOS=$((RUNS * 90 + 300))
 TMO=""
 command -v timeout >/dev/null 2>&1 && TMO="timeout $TMOS"
 WEDGED=0
@@ -162,6 +165,21 @@ if ! cmp -s "$T/c1.out" "$T/c2.out"; then
 	exit 1
 fi
 cp "$T/c1.out" "$T/ref.out"
+# the reference, normalised the same way the segments are
+sed -e 's/^\[.*//' -e '/^[[:space:]]*$/d' "$T/ref.out" >"$T/refn.out"
+# ⚠⚠ AN EMPTY REFERENCE MATCHES EVERYTHING. If the control produced no text
+# -- a model that would not load, a normalisation that ate the whole file --
+# then every segment below compares equal and the round reports a perfect
+# score having measured nothing. This is the cheapest possible check against
+# the failure this whole script exists to avoid.
+if [ ! -s "$T/refn.out" ]; then
+	echo "⚠⚠ THE CONTROL PRODUCED NO TEXT after normalisation, so every" >&2
+	echo "   comparison below would trivially pass. Refusing to run." >&2
+	sed -n '1,10p' "$T/ref.out" | sed 's/^/    /' >&2
+	exit 1
+fi
+printf 'reference is %s line(s), %s bytes\n' \
+	"$(wc -l <"$T/refn.out")" "$(wc -c <"$T/refn.out")"
 # one batched run purely to read its width breakdown back
 # shellcheck disable=SC2086
 env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" "$RUN" "$MODEL" \
@@ -208,53 +226,73 @@ for ARM in $ARMS; do
 	zero)    EXTRA="CHARSIU_NPU_BATCH_ZERO=1" ;;
 	*) echo "unknown arm '$ARM'" >&2; continue ;;
 	esac
-	bad=0; marks=""; i=1; did=0
-	while [ "$i" -le "$RUNS" ]; do
-		# ⚠⚠ A CLOCK AND A WEDGE CHECK ON EVERY RUN.
-		#
-		# A round died here having printed nothing at all: the NPU timed
-		# out on the FIRST run of the FIRST arm, the driver's reset path
-		# could not bring the block back ("MMU_DTE_ADDR is not
-		# functioning"), and everything after it was running against
-		# dead hardware. The table header was on screen and no row ever
-		# followed it.
-		#
-		# A wedged NPU does not recover in this loop, so there is
-		# nothing to be gained by continuing -- and a great deal to lose,
-		# because every later arm then measures a fallback and looks
-		# clean. Stop at the first one and say the board needs a reboot.
-		# shellcheck disable=SC2086
-		$TMO env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" \
-			$EXTRA "$RUN" "$MODEL" -p "$PROMPT" -n "$NGEN" \
-			--ignore-eos >"$T/b.out" 2>"$T/b.err"
-		rc=$?
-		if [ $rc -eq 124 ]; then
-			echo
-			echo "⚠⚠ RUN $i OF THE $ARM ARM DID NOT FINISH IN ${TMOS}s."
-			echo "   Almost certainly a wedged NPU. Nothing measured."
-			WEDGED=1; break
-		fi
-		if grep -qiE "job timed out|not functioning|iommu" "$T/b.err"; then
-			echo
-			echo "⚠⚠ THE NPU WEDGED on run $i of the $ARM arm:"
-			grep -iE "job timed out|not functioning|iommu" "$T/b.err" \
-				| head -3 | sed 's/^/     /'
-			WEDGED=1; break
-		fi
-		sed -i 's/^\[.*//' "$T/b.out"
-		if cmp -s "$T/ref.out" "$T/b.out"; then
+	# ⚠⚠ ONE PROCESS AN ARM, NOT ONE A SAMPLE.
+	#
+	# This asked a rate question by starting charsiu_run once per sample:
+	# 16 runs an arm, three arms, plus controls, is 51 loads of a 2.2 GB
+	# model. Phi-3.5 stages in about eight seconds, so the great majority
+	# of every round was spent re-uploading weights that had not changed,
+	# to measure something that happens after they are uploaded. A round
+	# took long enough that it was worth complaining about, and it was.
+	#
+	# --repeat runs the prompt N times in one process, resetting only the
+	# cache position, and separates the answers with a marker line.
+	#
+	# ⚠ It is not the identical experiment: N repeats share one staging and
+	# one set of device buffers where N processes did not. For a race in
+	# the submit path that is the same question -- and if a fault ever
+	# turns out to need a fresh process, CHARSIU_INT_PROC=1 puts the old
+	# loop back.
+	bad=0; marks=""; did=0
+	rm -f "$T"/seg*
+	# shellcheck disable=SC2086
+	$TMO env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" \
+		$EXTRA "$RUN" "$MODEL" -p "$PROMPT" -n "$NGEN" --ignore-eos \
+		--repeat "$RUNS" >"$T/b.out" 2>"$T/b.err"
+	rc=$?
+	if [ $rc -eq 124 ]; then
+		echo
+		echo "⚠⚠ THE $ARM ARM DID NOT FINISH IN ${TMOS}s. Almost certainly"
+		echo "   a wedged NPU. Nothing measured."
+		WEDGED=1
+	fi
+	if grep -qiE "job timed out|not functioning|iommu" "$T/b.err"; then
+		echo
+		echo "⚠⚠ THE NPU WEDGED during the $ARM arm:"
+		grep -iE "job timed out|not functioning|iommu" "$T/b.err" \
+			| head -3 | sed 's/^/     /'
+		WEDGED=1
+	fi
+	# split the stream on the markers charsiu_run prints
+	awk -v d="$T" '''BEGIN { n = 1; f = d "/seg1" }
+		/^--- charsiu repeat [0-9]+ ---$/ { n++; f = d "/seg" n; next }
+		{ print > f }''' "$T/b.out"
+	# ⚠ BLANK LINES GO FROM BOTH SIDES. The marker carries a leading
+	# newline, so segment one ends with a blank line the control does not
+	# have. Nothing this prompt generates is a blank line, and the control
+	# gets the same treatment, so this cannot hide a difference in the text.
+	n=1
+	while [ "$n" -le "$RUNS" ]; do
+		[ -f "$T/seg$n" ] || break
+		sed -i -e 's/^\[.*//' -e '/^[[:space:]]*$/d' "$T/seg$n"
+		if cmp -s "$T/refn.out" "$T/seg$n"; then
 			marks="$marks."
 		else
 			marks="${marks}X"; bad=$((bad + 1))
-			cp "$T/b.out" "$T/worst-$ARM.out"
+			cp "$T/seg$n" "$T/worst-$ARM.out"
 		fi
 		did=$((did + 1))
-		i=$((i + 1))
+		n=$((n + 1))
 	done
-	# ⚠ THE DENOMINATOR IS RUNS THAT COMPLETED, not the loop counter and
-	# not RUNS. `$i` is one past the last run, and `$RUNS` would claim
-	# every run happened on an arm that stopped early on a wedged NPU --
-	# the exact case this reporting exists for.
+	if [ "$did" -lt "$RUNS" ] && [ "$WEDGED" -eq 0 ]; then
+		echo
+		echo "⚠ ONLY $did OF $RUNS REPEATS CAME BACK on the $ARM arm."
+		echo "  Either this binary has no --repeat (charsiu update dev) or"
+		echo "  the run stopped early. Its rate below is over $did."
+		tail -3 "$T/b.err" | sed 's/^/    /'
+	fi
+	# ⚠ THE DENOMINATOR IS REPEATS THAT CAME BACK, never RUNS: an arm that
+	# stopped early must not claim every sample happened.
 	printf '%-9s %-6s %s\n' "$ARM" "$bad/$did" "$marks"
 	[ "$WEDGED" -eq 0 ] || break
 	[ "$bad" -eq 0 ] || printf '          a wrong one: ...%s\n' \
