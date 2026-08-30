@@ -150,9 +150,22 @@ for MODELS_ONE in $MODELS; do
 	printf '===== %s =====\n' "$b"
 	printf '  refused for: %s\n' "$why"
 
+	# ⚠ REPEATS, BECAUSE "AGREES ON THIS RUN" IS NOT A VERDICT. gemma4 has
+	# now been called wrong by one table and right by two, on the same
+	# prompt, which is either two different builds or an intermittent
+	# fault. One number that says how many of N runs agreed settles which.
+	REPS=${CHARSIU_REFUSED_REPS:-1}
 	run_arm "$T/c" CHARSIU_NO_BATCH_PREFILL=1
-	run_arm "$T/f" CHARSIU_BATCH_FORCE=1
-	run_arm "$T/o" CHARSIU_BATCH_FORCE=1 CHARSIU_NPU_ONEDEV=1
+	fagree=0; oagree=0; r=1
+	while [ "$r" -le "$REPS" ]; do
+		run_arm "$T/f" CHARSIU_BATCH_FORCE=1
+		run_arm "$T/o" CHARSIU_BATCH_FORCE=1 CHARSIU_NPU_ONEDEV=1
+		cmp -s "$T/c.out" "$T/f.out" && fagree=$((fagree + 1))
+		cmp -s "$T/c.out" "$T/o.out" && oagree=$((oagree + 1))
+		r=$((r + 1))
+	done
+	[ "$REPS" -eq 1 ] || printf '  over %s runs: two cores agreed %s times, one core %s times\n' \
+		"$REPS" "$fagree" "$oagree"
 
 	for a in f o; do
 		grep -q "prompt batched" "$T/$a.err" || {
@@ -163,20 +176,46 @@ for MODELS_ONE in $MODELS; do
 		}
 	done
 
-	fok=no; ook=no
-	cmp -s "$T/c.out" "$T/f.out" && fok=yes
-	cmp -s "$T/c.out" "$T/o.out" && ook=yes
-	printf '  control (token loop) : %s\n' "$(tr -d '\n' < "$T/c.out" | cut -c1-64)"
-	printf '  forced,  two cores   : %s   [%s]\n' \
-	       "$(tr -d '\n' < "$T/f.out" | cut -c1-64)" "$fok"
-	printf '  forced,  ONE core    : %s   [%s]\n' \
-	       "$(tr -d '\n' < "$T/o.out" | cut -c1-64)" "$ook"
+	# ⚠ EVERY run must agree, not the last one: one disagreement in five is
+	# still a wrong answer shipped one prompt in five.
+	fok=no; ook=no; sok=no
+	[ "$fagree" -eq "$REPS" ] && fok=yes
+	[ "$oagree" -eq "$REPS" ] && ook=yes
+	# ⚠ AND THE TWO FORCED ARMS AGAINST EACH OTHER. Both wrong and
+	# IDENTICAL is a deterministic fault in the model's path; both wrong and
+	# DIFFERENT is intermittent, and then concurrency is not excluded no
+	# matter what the one core arm said. The first round printed neither.
+	cmp -s "$T/f.out" "$T/o.out" && sok=yes
+	# ⚠⚠ THE TAIL, NOT THE HEAD. Round one printed `cut -c1-64` of each
+	# arm, which on a "1 2 ... 32" prompt is 64 characters of prompt echo:
+	# all three lines read identical while cmp said they were not. The
+	# generated text -- the only part that can differ -- is at the END.
+	tail_of() { tr -d '\n' < "$1" | tail -c "${CHARSIU_REFUSED_TAIL:-56}"; }
+	printf '  control (token loop) : ...%s\n' "$(tail_of "$T/c.out")"
+	printf '  forced,  two cores   : ...%s   [%s]\n' \
+	       "$(tail_of "$T/f.out")" "$fok"
+	printf '  forced,  ONE core    : ...%s   [%s]\n' \
+	       "$(tail_of "$T/o.out")" "$ook"
+	printf '  the two forced arms agree with each other: %s\n' "$sok"
+	if [ $fok = no ] || [ $ook = no ]; then
+		echo "  --- control against forced, two cores ---"
+		diff "$T/c.out" "$T/f.out" | head -8 | sed 's/^/    /'
+		echo "  --- control against forced, ONE core ---"
+		diff "$T/c.out" "$T/o.out" | head -8 | sed 's/^/    /'
+	fi
 
 	if [ $fok = yes ] && [ $ook = yes ]; then
-		echo "  → BOTH ARMS AGREE WITH THE CONTROL. This model is refused"
-		echo "    and its batched path is right on this run. One run is not"
-		echo "    a verdict when the fault may be intermittent -- run it"
-		echo "    again before believing it."
+		echo "  → BOTH ARMS AGREE WITH THE CONTROL, $REPS run(s) each."
+		if [ "$REPS" -lt 3 ]; then
+			echo "    That is not yet a verdict when the fault may be"
+			echo "    intermittent. Repeat it:"
+			echo "      CHARSIU_REFUSED_REPS=5 sh $0 $b"
+		else
+			echo "    $REPS clean runs on both arms. If this model was ever"
+			echo "    seen wrong, the difference was the BUILD, not the"
+			echo "    silicon -- and the refusal can be lifted by a round"
+			echo "    that says so."
+		fi
 		nfine=$((nfine + 1))
 	elif [ $fok = no ] && [ $ook = yes ]; then
 		echo "  → THE CORE PAIR. Wrong on two cores, right on one. Nothing"
@@ -184,10 +223,21 @@ for MODELS_ONE in $MODELS; do
 		echo "    wrong property, and the same scheduling fix should also"
 		echo "    unrefuse m = 8."
 		ncore=$((ncore + 1))
+	elif [ $fok = no ] && [ $ook = no ] && [ $sok = yes ]; then
+		echo "  → NOT THE CORE PAIR, AND DETERMINISTIC. Wrong on one core"
+		echo "    too, and the two forced arms are byte identical to each"
+		echo "    other -- so the same wrong answer comes out however the"
+		echo "    work is scheduled. Concurrency is excluded with hard"
+		echo "    data. Next:"
+		echo "      board_w4_axis.sh $b   -- it names the tensor and the row."
+		nmodel=$((nmodel + 1))
 	elif [ $fok = no ] && [ $ook = no ]; then
-		echo "  → NOT THE CORE PAIR. Wrong on one core too, so concurrency"
-		echo "    is excluded for this model with hard data. Next:"
-		echo "    board_w4_axis.sh $b   -- it names the tensor and the row."
+		echo "  → WRONG BOTH WAYS AND WRONG DIFFERENTLY. One core did not"
+		echo "    fix it, but the two arms do not agree with each other"
+		echo "    either, so this is INTERMITTENT and concurrency is NOT"
+		echo "    excluded -- one core still runs two K slices in sequence"
+		echo "    through one queue. Run this again with"
+		echo "    CHARSIU_REFUSED_REPS=5 before reading anything into it."
 		nmodel=$((nmodel + 1))
 	else
 		echo "  → RIGHT ON TWO CORES AND WRONG ON ONE, which no story"
