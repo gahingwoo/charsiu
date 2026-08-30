@@ -157,7 +157,12 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# fence each, and the fence has been measured at 94% of the hardware
 	# path -- and one that fell back to the CPU. Nothing else in this table
 	# can tell those two apart.
-	grep -E "prompt batched|prompt a token|int4 at m=|not batched" \
+	# ⚠ MATCH THE REFUSAL BY ITS PREFIX, NOT BY ONE OF ITS REASONS. This
+	# read "int4 at m=", which is the m = 8 refusal's own words, so the
+	# odd-width refusal added later would have gone through this filter
+	# unseen -- a prefill silently falling back a row at a time, in the
+	# table that exists to tell exactly those two cases apart.
+	grep -E "prompt batched|prompt a token|NOT on the NPU|not batched" \
 		"$DIR/.v.err" | sed 's/^/     /' | sort -u || true
 	grep -E "^charsiu NPU: .*(submits|hardware path)" "$DIR/.v.err" \
 		| sed 's/^/     /' || true

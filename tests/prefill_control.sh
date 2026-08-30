@@ -212,10 +212,16 @@ echo
 # The proof of the batched path is the PATH column and the rate above it, and
 # the proof of correctness is the text comparison below. This line is now the
 # m = 8 fallback counter and says so.
-echo "int4 batch refusals (m=8 falls back; every other width batches)"
+# ⚠ TWO KINDS NOW, COUNTED APART. m = 8 is the core pair and an ODD width is
+# the accumulator read order -- two different faults, and a single total would
+# hide which one a prompt met. Since the chunker only emits even widths, both
+# columns should read 0: an odd refusal here means the chunker let one through.
+echo "int4 batch refusals (both fall back a row at a time; both should be 0)"
+printf '%-9s %8s %8s\n' run "m=8" "odd m"
 for t in batched1 control batched2; do
-	printf '%-9s %s\n' "$t" \
-		"$(grep -c 'int4 at m=8' "$D/$t.log" || true)"
+	printf '%-9s %8s %8s\n' "$t" \
+		"$(grep -c 'int4 at m=8' "$D/$t.log" || true)" \
+		"$(grep -c 'an odd batch width' "$D/$t.log" || true)"
 done
 echo
 text_of batched1 >"$D/a.txt"; text_of control >"$D/b.txt"

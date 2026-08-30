@@ -29,7 +29,7 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
      $(BUILD)/vattn_bench \
-     $(BUILD)/tokenizer_roundtrip
+     $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -171,6 +171,9 @@ $(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 
 $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
+	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread

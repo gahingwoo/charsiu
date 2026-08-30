@@ -1685,6 +1685,59 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * decode, which uses none of them.
  */
 /*
+ * ⚠⚠ AN ODD BATCH WIDTH HAS NO EXPRESSION ON THIS SURFACE, and that is a
+ * property of the layout rather than a pattern in the measurements.
+ *
+ * charsiu_acc_index -- the read order, in src/job.c -- was linked into a
+ * standalone exhaustive checker and swept over m = 2..96 crossed with n = 512,
+ * 2048 and 8192, asking four things of every (m, n): that every index lands in
+ * range, that no two slots collide, that no slot is left unwritten, and that
+ * the four consecutive slots the gather relies on stay consecutive. With no
+ * exceptions at all:
+ *
+ *   m EVEN   a clean bijection, four in a row intact
+ *   m ODD    a COLLISION, at every n
+ *
+ * And it cannot be repaired by fitting a constant. In the roleswap2 branch the
+ * map covers 64 * P slots per group where the group needs 32 * m, so it fits
+ * only when 64P == 32m, i.e. only when P == m/2 -- and no integer P exists for
+ * an odd m. The surface is organised in PAIRS OF ROWS. An odd width is not a
+ * width this arrangement can name.
+ *
+ * ⚠⚠ WHICH SEPARATES TWO FAULTS THAT WERE BEING READ AS ONE, and conflating
+ * them is what made this take four rounds:
+ *
+ *   m = 31, odd          0 of 6975 rows on phi3, 0 of 8587 on gemma4. THE READ
+ *                        ORDER, and now proven offline rather than inferred
+ *                        from wrong text.
+ *   m = 2, 4, 16, 32,    exact on the board, worst relative 1.6e-04 over 225
+ *   48, 64, 80           to 277 real tensors. Even, as the proof requires.
+ *   m = 8, even          871 rows of 904 with two cores and 904 of 904 under
+ *                        CHARSIU_NPU_ONEDEV. NOT the read order -- the read
+ *                        order is a bijection there. The core pair, which is
+ *                        its own fault with its own refusal below.
+ *
+ * This also explains four models at once. Llama-3.2-1B's 65 token prompt used
+ * to chunk to 32, 32 and a tail of 1, which is below the batching minimum and
+ * went to the token loop, and its text has always been right. Phi-3.5's 87
+ * tokens chunked to 32, 32, 23 and Gemma-4-E2B's 88 to 32, 32, 24 -- and only
+ * the odd one produces wrong text. The fault was never the model, it was the
+ * last chunk.
+ *
+ * ⚠⚠ AND THE REFUSAL IS THE SAFETY NET, NOT THE OPTIMISATION. A width this
+ * says no to falls back to a row at a time, which is what int4 did before any
+ * of the batched path existed and is correct. So the worst case of this
+ * predicate being too narrow is SLOW, never wrong. What turns the law into
+ * speed is the chunker in tools/charsiu_run.c, which only ever asks for widths
+ * this accepts; if the two ever fall out of step the result is a refused chunk
+ * run a row at a time -- a slower prefill and the same text.
+ */
+static int w4_width_expressible(unsigned m)
+{
+	return (m % 2) == 0;
+}
+
+/*
  * Both switches or neither. An int4 batch on the height axis is the wrong
  * answer at a very good speed, which is the one failure mode this tree has
  * already shipped once.
@@ -1710,6 +1763,35 @@ static const char *w4_batch_why_not(unsigned m)
 		return "int4 batching is switched off";
 	if (!charsiu_m_axis_wide_for(1))
 		return "int4 batches on the width axis and this asked for height";
+	/*
+	 * ⚠⚠ THE PROBE HAS TO BE ABLE TO ASK ABOUT THE WIDTHS THAT ARE
+	 * REFUSED, because asking is how every line of the table above was
+	 * measured and is the only way it will be re-measured. 23 and 31 are
+	 * widths the runtime will never choose again, and they are precisely
+	 * the widths the next round has to hand the hardware.
+	 *
+	 * CHARSIU_NPU_W4_ANYM=1 lifts the width rule entirely, m = 8 included,
+	 * and nothing but a probe should ever set it. It does NOT lift the axis
+	 * check above: the height axis is the arrangement five rounds proved
+	 * writes one row, and reaching that deliberately has its own switch,
+	 * for the same reason this one has its own name -- a round that sets a
+	 * switch for one reason must not quietly get a second meaning with it.
+	 */
+	if (getenv("CHARSIU_NPU_W4_ANYM"))
+		return NULL;
+	/*
+	 * ⚠⚠ TWO REFUSALS, TWO REASONS, AND THEY ARE NOT THE SAME FAULT. The
+	 * odd widths are the accumulator read order and are proven wrong
+	 * offline; m = 8 is the core pair and the read order is a clean
+	 * bijection there. Giving them one shared string is exactly the
+	 * conflation that cost four rounds -- a round reading "the width is
+	 * refused" cannot tell which of the two it just hit.
+	 */
+	if (!w4_width_expressible(m))
+		return "an odd batch width, which the accumulator read order "
+		       "cannot express: the surface is organised in pairs of "
+		       "rows, and 64*P slots per group can only equal the 32*m "
+		       "it needs when m is even";
 	/*
 	 * ⚠⚠ m = 8 IS THE ONE WIDTH THAT IS STILL WRONG, and the board named
 	 * it rather than leaving it as a count.
@@ -1773,6 +1855,14 @@ static const char *w4_batch_why_not(unsigned m)
 	 * for CHARSIU_NPU_W4_BATCH, so a round that sets the batch switch for
 	 * some other reason cannot quietly also let the broken width through.
 	 * Nothing but a control should ever set it.
+	 *
+	 * ⚠⚠ AND THE READ ORDER LINE ABOVE IS NOW SETTLED RATHER THAN
+	 * ARGUED. The exhaustive sweep of charsiu_acc_index over m = 2..96 and
+	 * n = 512, 2048 and 8192 makes it a bijection at EVERY even width, m =
+	 * 8 included, with the four-in-a-row property intact. So m = 8 is not
+	 * the read order, and it is not the same fault as the odd widths
+	 * refused above -- which is why it keeps its own reason string and its
+	 * own switch.
 	 */
 	if (m == 8 && !getenv("CHARSIU_NPU_W4_M8"))
 		return "int4 at m=8 misses row 0 of the n=8192 tensors";

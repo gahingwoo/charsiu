@@ -552,9 +552,39 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	const unsigned *MS = MS_DEFAULT;
 	unsigned n_ms = sizeof(MS_DEFAULT) / sizeof(MS_DEFAULT[0]);
 	const char *wenv = getenv("CHARSIU_PROBE_WIDTHS");
+	/*
+	 * ⚠⚠ CHARSIU_PROBE_MAXT: HOW MANY STAGED TENSORS A WIDTH COSTS, which
+	 * is what stops a dense sweep from being affordable.
+	 *
+	 * The one row reference is O(m) matvecs per tensor and it runs over
+	 * every staged tensor, so a width costs m * 225 submits before the
+	 * batched side is even asked. At m = 32 the reference alone was
+	 * 5864 ms, and 2..64 dense is sixty three widths -- days, not a round.
+	 * Capping the tensors is the only term that can come down without
+	 * dropping widths, and dropping widths is the whole point of the
+	 * sweep.
+	 *
+	 * ⚠ IT TAKES THE FIRST N STAGED TENSORS, AND THAT IS A BIAS WITH A
+	 * SHAPE. The pool fills lazily in the order the first forward pass
+	 * touches things, so the first N are layer 0's projections -- q, k, v,
+	 * o, then gate, up, down -- and N = 8 reaches into layer 1. That is
+	 * deliberate: it still covers every DISTINCT (k, n) an ordinary layer
+	 * has, including the n = 8192 gate/up pair that m = 8 misses, so a
+	 * width broken the way m = 8 is broken still shows.
+	 *
+	 * What it drops is the OUTPUT HEAD, which is staged last and is the
+	 * one shape nothing else in the model resembles: 128256 channels
+	 * against 8192. A width that is wrong only on the head reads as PASS
+	 * under a cap, and the round after a capped sweep has to be an uncapped
+	 * one on whatever widths it left standing. The table says the cap, on
+	 * every row, so that argument is never made from a number that has
+	 * forgotten it.
+	 */
+	unsigned maxt = 0;
+	const char *tenv = getenv("CHARSIU_PROBE_MAXT");
 	float *X = NULL, *Y = NULL, *Yref = NULL;
 	struct charsiu_act a;
-	unsigned widest = 0;
+	unsigned widest = 0, n_staged = 0;
 	int rc = -1;
 
 	if (!s->pool.dev) {
@@ -565,17 +595,54 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		unsigned n = 0, top = 0;
 		char *p = (char *)wenv;
 
-		while (*p && n < sizeof(ms_buf) / sizeof(ms_buf[0])) {
+		const unsigned cap = sizeof(ms_buf) / sizeof(ms_buf[0]);
+
+		/*
+		 * ⚠⚠ EVERY WAY THIS CAN GO WRONG REFUSES OUT LOUD, and none of
+		 * them shortens the list quietly.
+		 *
+		 * The first draft stopped on a full buffer and stopped on the
+		 * first character it did not like, both without a word. So
+		 * "2 4 x 8" would have measured 2 and 4 and said it had done
+		 * what was asked, and a list of seventy widths would have lost
+		 * the last six -- which are the widest, the slowest to reach
+		 * and the whole reason for passing a list by hand.
+		 *
+		 * This project has now lost four rounds to output that was cut
+		 * without saying so. A probe whose ONE job is to ask an exact
+		 * question must not answer a smaller one.
+		 */
+		for (;;) {
 			while (*p == ' ' || *p == ',' || *p == '\t')
 				p++;
-			if (*p < '0' || *p > '9')
+			if (!*p)
 				break;
-			ms_buf[n] = (unsigned)strtoul(p, &p, 10);
-			if (ms_buf[n] >= 2) {
-				if (ms_buf[n] > top)
-					top = ms_buf[n];
-				n++;
+			if (*p < '0' || *p > '9') {
+				fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS "
+					"stops making sense at \"%s\" -- "
+					"refusing rather than measuring the "
+					"part before it\n", p);
+				return -1;
 			}
+			if (n == cap) {
+				fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS "
+					"holds at most %u widths and there are "
+					"more after \"%s\" -- refusing rather "
+					"than dropping the widest ones\n",
+					cap, p);
+				return -1;
+			}
+			ms_buf[n] = (unsigned)strtoul(p, &p, 10);
+			if (ms_buf[n] < 2) {
+				fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS "
+					"asks for width %u, and 1 is the decode "
+					"path rather than a batch -- refusing\n",
+					ms_buf[n]);
+				return -1;
+			}
+			if (ms_buf[n] > top)
+				top = ms_buf[n];
+			n++;
 		}
 		/*
 		 * ⚠ AND THE LIST RAISES THE CAP. --batch-probe caps the sweep,
@@ -596,13 +663,34 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		MS = ms_buf;
 		n_ms = n;
 	}
-	for (unsigned i = 0; i < s->pool.n; i++)
-		if (s->pool.id[i] >= 0 && s->pool.t[i].k > widest)
+	if (tenv && *tenv) {
+		maxt = (unsigned)strtoul(tenv, NULL, 10);
+		if (!maxt) {
+			fprintf(stderr, "charsiu: CHARSIU_PROBE_MAXT=\"%s\" "
+				"parsed to zero, which would check no tensors "
+				"at all; refusing rather than quietly walking "
+				"all of them, because a round that silently "
+				"asks a different question is the failure this "
+				"probe exists to avoid\n", tenv);
+			return -1;
+		}
+	}
+	for (unsigned i = 0; i < s->pool.n; i++) {
+		if (s->pool.id[i] < 0)
+			continue;
+		n_staged++;
+		if (s->pool.t[i].k > widest)
 			widest = (unsigned)s->pool.t[i].k;
+	}
 	/*
 	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
 	 * activation inside the timing loop and charged all of it to the one
 	 * row path, which is the side it was trying to beat.
+	 *
+	 * ⚠ AND IT IS SIZED OFF THE WIDEST STAGED TENSOR, NOT THE WIDEST
+	 * CHECKED ONE, so CHARSIU_PROBE_MAXT does not reach it. The cap is
+	 * about time; sizing this to the first N as well would make one switch
+	 * quietly change what the tensors it did not check could have been.
 	 */
 	if (charsiu_act_alloc(&a, (int)widest) < 0)
 		return -1;
@@ -620,7 +708,26 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		if (MS[i] <= mmax)
 			printf(" %u", MS[i]);
 	printf("   (--batch-probe caps at %u)\n", mmax);
-	printf("    m  tensors    worst rel   rows that agree"
+	/*
+	 * ⚠⚠ A CAPPED ROUND MUST NEVER BE READABLE AS A FULL ONE. It is said
+	 * here in words and again in the tensors column on every single row,
+	 * because the line that gets pasted out of a round is a table row and
+	 * not a header, and "225" and "8" are both just a number until one of
+	 * them is written as a fraction of the other.
+	 */
+	if (maxt && maxt < n_staged)
+		printf("  ⚠ CHARSIU_PROBE_MAXT=%u: only the FIRST %u of %u"
+		       " staged tensors are checked. Those are layer 0's"
+		       " projections and the start of layer 1, so every shape"
+		       " an ordinary layer has is covered -- but NOT the output"
+		       " head, which is staged last and is the one shape"
+		       " nothing else resembles. A width that is exact here is"
+		       " exact on a layer, not on the model.\n", maxt, maxt,
+		       n_staged);
+	else
+		printf("  all %u staged tensors are checked"
+		       " (CHARSIU_PROBE_MAXT caps this)\n", n_staged);
+	printf("    m    tensors   worst rel   rows that agree"
 	       "     one row    batched  speedup  us a row    GB/s"
 	       "   where the batched time went, ms (prep is buffers and the"
 	       " output zero; rest is what none of them caught)\n");
@@ -993,6 +1100,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 	for (unsigned y = 0; y < n_ms; y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
+		unsigned seen = 0;		/* staged tensors reached, capped */
 		unsigned nbad = 0;		/* misses named, capped */
 		int whered = 0;			/* the where-did-it-go scan, once a width */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
@@ -1012,6 +1120,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 			if (s->pool.id[i] < 0)
 				continue;
+			/*
+			 * ⚠ COUNTED HERE AND NOT OFF `tested`, which is
+			 * incremented at the BOTTOM of the body and is skipped
+			 * by the `continue` a failed matmul takes. A cap read
+			 * off it would let a width whose matmuls are all being
+			 * refused walk the whole pool paying the one row
+			 * reference for every tensor -- the single most
+			 * expensive thing here, spent on a width that measured
+			 * nothing.
+			 */
+			if (maxt && seen >= maxt)
+				break;
+			seen++;
 			nx = (size_t)mr * t->k;
 			ny = (size_t)mr * t->n;
 			X = realloc(X, nx * sizeof(*X));
@@ -1447,6 +1568,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		{
 			double pk, sb, fn, rd, pr, al;
 			unsigned an = 0;
+			char tcol[24];
 
 			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			pr = charsiu_npu_batch_prep(s->pool.dev, 1);
@@ -1460,12 +1582,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			 * account for is an invitation to optimise the wrong
 			 * third.
 			 */
-			printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms"
+			/*
+			 * ⚠ THE TENSOR COUNT IS A FRACTION, ALWAYS. An
+			 * uncapped row reads 225/225 and a capped one 8/225,
+			 * so the two can never be confused for each other by
+			 * anyone reading a single pasted line.
+			 */
+			snprintf(tcol, sizeof(tcol), "%u/%u", tested, n_staged);
+			printf("  %3u  %9s  %10.2e  %6u of %-6u  %7.0f ms"
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
 			       "   prep %4.0f (alloc %4.0f x%u)  pack %4.0f"
 			       "  submit %3.0f  fence %5.0f  read %4.0f"
 			       "  rest %4.0f\n",
-			       mr, tested, worst, rows_ok, rows_tot, t_one,
+			       mr, tcol, worst, rows_ok, rows_tot, t_one,
 			       t_bat, t_bat > 0 ? t_one / t_bat : 0.0,
 			       t_bat * 1e3 / (tested * (double)mr),
 			       t_bat > 0 ? mb / t_bat : 0.0,
@@ -3197,8 +3326,38 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * because that is the property that distinguishes the model -- not
 	 * because the tensors are proven guilty.
 	 */
-	WHY(m->n_embd_pl, "per layer embeddings, and the board says the batched"
-	    " matmul is wrong on them (the host cannot see it: no NPU)");
+	/*
+	 * ⚠⚠ THE STATED CAUSE ABOVE IS DISPROVEN. Read this before believing
+	 * any of it.
+	 *
+	 * The batched matmul is NOT wrong on the per layer embeddings. It is
+	 * exact on every tensor gemma4 has, at every EVEN width, on the board:
+	 * 277 tensors, 8587 of 8587 rows. What was wrong is the width its last
+	 * prompt chunk landed on.
+	 *
+	 *   88 tokens -> 32, 32, tail 24 (even) -> ten clean runs
+	 *   89 tokens -> 32, 32, tail 25 (ODD)  -> eight of eight wrong
+	 *
+	 * and one trailing space in a test script was the whole difference
+	 * between those two lines. charsiu_acc_index cannot express an odd
+	 * width -- 64*P slots per group against the 32*m it needs -- and the
+	 * chunker now only ever emits even ones.
+	 *
+	 * WHAT KEEPS THE REFUSAL is not this reason. It is a residual nobody
+	 * has explained: phi3 with an EVEN tail of 24 was still wrong 2 of 8
+	 * and 3 of 8, low rate, on both the shipped path and with the output
+	 * buffer zeroed. Until a round says an even-only prefill is clean over
+	 * enough runs to mean something, these two stay refused -- and the
+	 * refusal now rests on that measurement rather than on a property of
+	 * the architecture.
+	 *
+	 * The round that lifts it:
+	 *   sh board_intermittent.sh gemma4 16   (and phi3)
+	 * with the even-only chunker in the binary. 0 of 16 on both arms.
+	 */
+	WHY(m->n_embd_pl, "an unexplained residual: with the width law fixed"
+	    " this model still came back wrong on some runs, and no round has"
+	    " yet shown an even-only prefill clean (board_intermittent.sh)");
 	/*
 	 * ⚠⚠ AND PHI3, FOUND THE SAME DAY BY THE CHECK THAT SHOULD HAVE
 	 * EXISTED ALL ALONG.
@@ -3230,8 +3389,19 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		for (uint32_t l = 0; l < m->n_layer; l++)
 			if (m->layers[l].wq == &m->layers[l].split[0])
 				views = 1;
-		WHY(views, "weights that are views into a fused tensor, and the"
-		    " board says the batched matmul is wrong on them");
+		/*
+		 * ⚠⚠ AND THIS CAUSE IS DISPROVEN TOO. phi3's matmul is exact
+		 * at every even width -- 225 tensors, 18000 of 18000 rows at
+		 * m = 80 -- so being a view of attn_qkv was never the fault.
+		 * Its 87 token prompt chunked to 32, 32 and TWENTY THREE, and
+		 * an odd width has no expression on the accumulator surface.
+		 *
+		 * The test is kept because it still selects the model, and the
+		 * reason string no longer claims to know why.
+		 */
+		WHY(views, "an unexplained residual: its odd last chunk is fixed"
+		    " but an even tail of 24 was still wrong 2 of 8 and 3 of 8,"
+		    " and no round has shown an even-only prefill clean");
 	}
 #undef WHY
 	if (n)
