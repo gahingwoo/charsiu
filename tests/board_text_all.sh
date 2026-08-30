@@ -36,6 +36,23 @@ done
 
 DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
+# ⚠⚠ AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
+# falls back to a matvec a row: the batched loop's ORDER runs and the batched
+# MATMUL does not, so every arm agrees and the round reads as a pass. That is
+# precisely the false pass that let gemma4 and phi3 ship wrong -- six
+# architectures, text identical, logits compared, ASAN clean, all of it on a
+# machine that could not see the bug. Refuse rather than reassure.
+if [ ! -e /dev/accel/accel0 ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
+	echo "======================================================================" >&2
+	echo "NO /dev/accel/accel0 -- THIS MACHINE CANNOT ANSWER THIS QUESTION." >&2
+	echo "" >&2
+	echo "Without the NPU the batched matmul never runs, every arm agrees, and" >&2
+	echo "the output reads as a pass. Run this on the board." >&2
+	echo "" >&2
+	echo "  CHARSIU_ALLOW_NO_NPU=1  runs it anyway, to test the script itself." >&2
+	echo "======================================================================" >&2
+	exit 1
+fi
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 

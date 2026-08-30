@@ -3242,7 +3242,38 @@ const char *llama_batch_why_not(const struct llama_model *m)
 
 static int batch_ok(const struct llama_model *m)
 {
-	return llama_batch_why_not(m) == NULL;
+	const char *why = llama_batch_why_not(m);
+
+	if (!why)
+		return 1;
+	/*
+	 * ⚠ A REFUSAL WITH NO WAY PAST IT CANNOT BE TESTED.
+	 *
+	 * gemma4 and phi3 are refused because the board says their batched
+	 * prompt is wrong, and each refusal names the property that
+	 * distinguishes the model -- per layer embeddings, and weights that are
+	 * views. Neither is proven guilty, and the standing alternative is that
+	 * neither is guilty at all: m = 8 was four orders out on EVERY model
+	 * until CHARSIU_NPU_ONEDEV made it bit exact, so this hardware has one
+	 * known way to be wrong at m > 1 that has nothing to do with the model.
+	 * If a forced phi3 comes back right on one core, both refusals are
+	 * about the wrong thing.
+	 *
+	 * That experiment needs the refused arm to REACH the hardware, the same
+	 * way CHARSIU_NPU_W4_BATCH=height lets the wrong axis through. It says
+	 * so on stderr every run: this is a probe switch, and a number measured
+	 * under it is a number about a model that is still refused.
+	 */
+	if (getenv("CHARSIU_BATCH_FORCE")) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CHARSIU_BATCH_FORCE -- "
+				"batching a model that is REFUSED (%s). Its "
+				"output is not trusted; check the text.\n", why);
+		return 1;
+	}
+	return 0;
 }
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,

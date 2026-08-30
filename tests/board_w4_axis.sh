@@ -26,7 +26,10 @@
 #
 # `charsiu update dev` installs this at /opt/charsiu/board_w4_axis.sh.
 #
-# Usage: board_w4_axis.sh [MODEL.gguf]
+# Usage: board_w4_axis.sh [MODEL.gguf | substring]
+#
+#   CHARSIU_AXIS_ARMS=w      run only the width arm
+#   CHARSIU_AXIS_TIMEOUT=600 seconds one arm may take before it is killed
 set -u
 
 MODEL=${1:-}
@@ -43,6 +46,36 @@ done
 # ⚠ int4 AND llama, the same file prefill_control.sh uses, so the two rounds
 # are about one model.
 DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models"
+# ⚠ A SUBSTRING IS ENOUGH. Two rounds have now been spent on a path typed
+# by hand: one ran the wrong model entirely and answered its question
+# perfectly. `board_w4_axis.sh phi3` cannot miss the file it means.
+# ⚠ AND IT FOLDS CASE AND PUNCTUATION. The file is `Phi-3.5-mini-...` and
+# the thing anyone types is `phi3`; a literal substring matches neither that
+# nor `gemma4` against `gemma-4-E2B-it`. Both sides go to lowercase letters
+# and digits before they are compared.
+norm() { echo "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9'; }
+if [ -n "$MODEL" ] && [ ! -r "$MODEL" ]; then
+	want=$(norm "$MODEL")
+	MODEL=
+	for d in $DIRS; do
+		for f in $d/*.gguf; do
+			[ -r "$f" ] || continue
+			case $(norm "${f##*/}") in
+			*"$want"*) MODEL="$f"; break 2 ;;
+			esac
+		done
+	done
+	[ -n "$MODEL" ] || {
+		echo "board_w4_axis: no model matching '$1' in $DIRS" >&2
+		for d in $DIRS; do
+			for f in $d/*.gguf; do
+				[ -r "$f" ] && echo "  $f" >&2
+			done
+		done
+		exit 1
+	}
+	echo "board_w4_axis: '$1' -> $MODEL"
+fi
 if [ -z "$MODEL" ]; then
 	for pat in '*Llama-3.2*Q4_0*.gguf' '*llama*Q4_0*.gguf' '*Q4_0*.gguf'; do
 		for d in $DIRS; do
@@ -64,10 +97,19 @@ mkdir -p "$OUTDIR"
 # CAPS them. It said 32 for one round after the widths were extended, so the
 # round that existed to reach 48, 64 and 80 never left 32.
 MMAX=${CHARSIU_PROBE_MMAX:-80}
+# ⚠⚠ ONE WEDGED ARM MUST NOT TAKE THE OTHER DOWN. The gemma4 round ran the
+# height control first, the control hung the NPU, and the width arm -- the only
+# one with anything to say about that model -- never printed. A refused model is
+# being probed precisely because it is misbehaving, so the control is the arm
+# most likely to hang: give it a clock, and let it be skipped outright.
+ARMS=${CHARSIU_AXIS_ARMS:-"h w"}
+TMO=${CHARSIU_AXIS_TIMEOUT:-600}
+command -v timeout >/dev/null 2>&1 || TMO=
 
 echo "model    $MODEL"
 echo "binary   $RUN"
 echo "probe    --batch-probe $MMAX   (widths up to that, checked then timed)"
+echo "arms     $ARMS${TMO:+   (${TMO}s each, then killed)}"
 echo
 
 # ⚠⚠ THE WHOLE int4 ENVIRONMENT, NOT JUST THE AXIS. This is the set
@@ -87,7 +129,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 # that places that half. Of the whole family only a*4 and the two halves
 # SWAPPED are permutations at all, so this is a two horse race and one of them
 # is the control.
-for AXIS in h w; do
+for AXIS in $ARMS; do
 	case $AXIS in
 	h) label="height -- the control, and it must still disagree"
 	   AX=h; ACC= ;;
@@ -106,10 +148,18 @@ for AXIS in h w; do
 	# hardware at all.
 	case $AX in h) GATE=height ;; *) GATE= ;; esac
 	# shellcheck disable=SC2086
+	${TMO:+timeout $TMO} \
 	env $W4_ENV CHARSIU_M_AXIS="$AX" ${GATE:+CHARSIU_NPU_W4_BATCH="$GATE"} \
 	    ${ACC:+CHARSIU_ACC_A="$ACC"} \
 	    "$RUN" "$MODEL" --batch-probe "$MMAX" >"$out" 2>&1
 	rc=$?
+	if [ $rc -eq 124 ] && [ -n "$TMO" ]; then
+		echo "  THIS ARM RAN OUT OF TIME (${TMO}s) and was killed."
+		echo "  The next arm still runs, which is the point of the clock."
+		tail -12 "$out" | sed 's/^/    /'
+		echo
+		continue
+	fi
 	if [ $rc -ne 0 ]; then
 		echo "  THE RUN FAILED (exit $rc), last lines:"
 		tail -12 "$out" | sed 's/^/    /'
@@ -141,9 +191,23 @@ for AXIS in h w; do
 done
 
 echo "======================================================================"
-echo "what to read: the HEIGHT arm must show rows DISAGREEING. It is the"
-echo "control -- if it passes, the probe is not discriminating and the width"
-echo "arm means nothing either."
+# ⚠ DO NOT TELL A ONE ARM ROUND TO READ AN ARM IT DID NOT RUN. Skipping the
+# control is a real choice on a model whose control hangs, and the footer
+# saying "the height arm must disagree" under an output with no height arm is
+# how a round gets read as inconclusive when it was not.
+case " $ARMS " in
+*" h "*)
+	echo "what to read: the HEIGHT arm must show rows DISAGREEING. It is the"
+	echo "control -- if it passes, the probe is not discriminating and the width"
+	echo "arm means nothing either."
+	;;
+*)
+	echo "what to read: NO HEIGHT CONTROL RAN (arms: $ARMS), so nothing below"
+	echo "is protected against a non discriminating probe. Rows agreeing on the"
+	echo "width arm alone is a result only because earlier rounds ran the"
+	echo "control on llama and it failed there."
+	;;
+esac
 echo
 echo "if the width arm is close but not exact, the knob to sweep next is"
 echo "CHARSIU_DPU_40B8: the vendor writes 3*M on its int4 projections and 7*M"

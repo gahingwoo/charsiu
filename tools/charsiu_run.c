@@ -657,6 +657,15 @@ int main(int argc, char **argv)
 		 */
 		if (!quiet && charsiu_diag()) {
 			const char *why = llama_batch_why_not(&m);
+			/*
+			 * ⚠ AND SAY SO ON THE BATCHED LINE, not only in the
+			 * one time warning far above it. This line is what
+			 * gets pasted out of a round, and "prompt batched" on
+			 * a model this tree refuses reads as good news.
+			 */
+			const char *forced = (why && getenv("CHARSIU_BATCH_FORCE"))
+					   ? " -- FORCED, this model is REFUSED"
+					   : "";
 
 			if (n_img_at >= 0)
 				fprintf(stderr, "charsiu: prompt a token at a "
@@ -664,12 +673,12 @@ int main(int argc, char **argv)
 					"token %d\n", img_tok, n_img_at);
 			else if (done >= n_ids)
 				fprintf(stderr, "charsiu: prompt batched, %d "
-					"tokens in chunks of %d\n",
-					n_ids, chunk);
+					"tokens in chunks of %d%s\n",
+					n_ids, chunk, forced);
 			else if (done > 0)
 				fprintf(stderr, "charsiu: prompt batched for "
 					"%d of %d tokens, the rest a token at "
-					"a time\n", done, n_ids);
+					"a time%s\n", done, n_ids, forced);
 			else if (getenv("CHARSIU_NO_BATCH_PREFILL"))
 				fprintf(stderr, "charsiu: prompt a token at a "
 					"time (CHARSIU_NO_BATCH_PREFILL)\n");
