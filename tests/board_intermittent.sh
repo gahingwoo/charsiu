@@ -151,13 +151,36 @@ if ! cmp -s "$T/c1.out" "$T/c2.out"; then
 	exit 1
 fi
 cp "$T/c1.out" "$T/ref.out"
-printf 'prompt is %s tokens -> chunk %s runs' "${NTOK:-?}" "$CHUNK"
-if [ -n "${NTOK:-}" ]; then
-	rem=$((NTOK % CHUNK)); [ "$rem" -lt 2 ] && rem=0
-	if [ "$rem" -eq 0 ]; then printf ' width %s only\n' "$CHUNK"
-	else printf ' width %s and a tail of %s\n' "$CHUNK" "$rem"; fi
+# one batched run purely to read its width breakdown back
+# shellcheck disable=SC2086
+env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" "$RUN" "$MODEL" \
+	-p "$PROMPT" -n 1 --ignore-eos >/dev/null 2>"$T/w.err"
+# ⚠⚠ ASK THE RUN WHICH WIDTHS IT USED. DO NOT COMPUTE THEM.
+#
+# This line was `NTOK % CHUNK` and it printed "a tail of 23" for a phi3 round
+# that ran a tail of TWENTY TWO -- because the chunker had been changed to
+# emit only even widths and this arithmetic had not. The round then read as a
+# test of the width that was failing when it was a test of a different one.
+#
+# charsiu_run prints the breakdown itself, "(widths 2x32+1x22)". Read that.
+# A number this script derives is a number that can disagree with the binary;
+# a number the binary prints cannot.
+printf 'prompt is %s tokens\n' "${NTOK:-?}"
+WIDTHS=$(sed -n 's/.*(widths \([^)]*\)).*/\1/p' "$T/w.err" | head -1)
+if [ -n "$WIDTHS" ]; then
+	printf 'batched widths, as the binary reports them: %s\n' "$WIDTHS"
+	case $WIDTHS in
+	*x8+*|*x8|*x10+*|*x10)
+		echo "⚠ that includes a width the gate refuses (8 or 10): those"
+		echo "  chunks fall back a row at a time, so this round is not"
+		echo "  measuring them on the batched path at all." ;;
+	esac
 else
-	printf '\n'
+	echo "⚠ THE BATCHED PATH PRINTED NO WIDTH BREAKDOWN. Either this binary"
+	echo "  predates the even-only chunker or the prompt was not batched at"
+	echo "  all -- and either way the arms below are not testing what the"
+	echo "  header says."
+	tail -3 "$T/w.err" | sed 's/^/    /'
 fi
 echo "control (token loop, reproducible over 2 runs):"
 echo "  ...$(tr -d '\n' < "$T/ref.out" | tail -c 56)"
