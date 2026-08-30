@@ -2013,14 +2013,34 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 	return v;
 }
 
+/*
+ * ⚠⚠ ON BY DEFAULT SINCE 2026-08-30, BECAUSE THE PARALLEL DEFAULT WAS WRONG
+ * 13 RUNS IN 16.
+ *
+ * phi3 at width 24, sixteen repeats an arm, on a freshly booted board with no
+ * NPU timeout anywhere in the round:
+ *
+ *   default (two cores, overlapped)     13 of 16 WRONG
+ *   onedev  (one core)                   0 of 16
+ *   serial  (two cores, never at once)   0 of 16
+ *
+ * The overlap is the fault. Serialising costs a batched projection's
+ * parallelism and keeps decode's second core, which CHARSIU_NPU_ONEDEV does
+ * not -- decode measured 14.70 tok/s on two cores against 9.71 on one, so
+ * giving the core up for the whole process was never an acceptable answer.
+ *
+ * CHARSIU_NPU_BATCH_PARALLEL=1 puts the overlap back. It exists to price this
+ * and to reproduce the fault, NOT as a configuration to run: it is the arm
+ * that returns wrong text.
+ */
 static int batch_serial(void)
 {
 	static int z = -1;
 
 	if (z < 0) {
-		const char *e = getenv("CHARSIU_NPU_BATCH_SERIAL");
+		const char *e = getenv("CHARSIU_NPU_BATCH_PARALLEL");
 
-		z = e && *e != '0';
+		z = !(e && *e != '0');
 	}
 	return z;
 }
@@ -2390,17 +2410,12 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		 * m = 1 has never shown this -- and is the only thing a batched
 		 * submit does that a single one does not.
 		 *
-		 * CHARSIU_NPU_BATCH_SERIAL=1 waits on each device before
-		 * submitting the next, so the two never run together. It costs
-		 * the parallelism of a batched projection and keeps decode's,
-		 * which is the trade the numbers above justify -- and unlike
-		 * CHARSIU_NPU_ONEDEV it does not give up the second core for
-		 * the whole process.
-		 *
-		 * ⚠ It is OFF by default until a board round says it is both
-		 * correct and worth its cost. A default changed on an untested
-		 * hypothesis is how this tree shipped a fast wrong answer once
-		 * already.
+		 * Waiting on each device before submitting the next means the
+		 * two never run together. That is ON by default now: the board
+		 * round that priced it found the overlapped default wrong 13 of
+		 * 16 and the serialised one 0 of 16, on the same freshly booted
+		 * card, in the same minute. CHARSIU_NPU_BATCH_PARALLEL=1 puts
+		 * the overlap back, and returns wrong text when it does.
 		 */
 		if (batch_serial() && g->ndev > 1) {
 			double tf = now_us();

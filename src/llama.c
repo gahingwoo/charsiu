@@ -3287,6 +3287,14 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	static char buf[256];
 	size_t n = 0;
 
+	/*
+	 * ⚠ THE MODEL IS UNUSED TODAY AND THE PARAMETER STAYS. Every refusal
+	 * that ever lived here was a property of the model, and the next one
+	 * will be too; taking it out would make putting one back an API change
+	 * across four call sites and two tools, at the moment somebody is
+	 * trying to write down a fault rather than refactor.
+	 */
+	(void)m;
 	buf[0] = 0;
 #define WHY(cond, txt) do {                                                 \
 		if (cond) {                                                 \
@@ -3299,155 +3307,41 @@ const char *llama_batch_why_not(const struct llama_model *m)
 
 	WHY(kv_posmajor(), "a position major KV cache");
 	/*
-	 * ⚠⚠ PUT BACK ON 2026-08-30, BY THE BOARD, AFTER THE HOST SAID IT WAS
-	 * FINE.
+	 * 🏁 GEMMA4 AND PHI3 CAME OFF THIS LIST ON 2026-08-30, and what they
+	 * were refused for was never true of either of them.
 	 *
-	 * gemma4's prompt batched and its time to a first token went 17564 ms
-	 * to 4977. Then prefill_control on the card, against the token loop:
+	 * gemma4 was refused for its per layer embeddings and phi3 for having
+	 * q, k and v as views of one attn_qkv. Both notes said, in as many
+	 * words, that this was a hypothesis about the cause and only a fact
+	 * about the model. Both hypotheses are dead:
 	 *
-	 *   control  ... 30 31 32 33 34 35
-	 *   batched  ... 30 31 32  1 2 3
+	 *  - phi3's batched matmul is EXACT at every even width: 225 tensors,
+	 *    18000 of 18000 rows at m = 80, worst relative 1.61e-04. Being a
+	 *    view had nothing to do with it.
+	 *  - gemma4's failures were every one of them an ODD last chunk. Its
+	 *    88 token prompt tails at 24 and came back clean ten times; the
+	 *    rounds that called it wrong were reading a 89 token prompt --
+	 *    one trailing space in a test script -- which tails at 25.
 	 *
-	 * A wrong answer at 3.5x, which is the failure this tree has shipped
-	 * once before and must not ship twice.
+	 * What was actually wrong is two things, and neither is a property of
+	 * an architecture:
 	 *
-	 * ⚠ AND THE HOST CANNOT SEE IT, WHICH IS THE PART TO REMEMBER. On a
-	 * machine with no NPU `matmul_rows` falls back to a matvec a row, so
-	 * the batched loop's ORDER is exercised and the batched MATMUL is not.
-	 * Every architecture check here -- six models, text identical to their
-	 * token loops, logits compared, ASAN clean -- exercised the half that
-	 * was already right.
+	 *  1. an odd batch width has no expression on the accumulator surface,
+	 *     which is organised in pairs of rows. The chunker only emits even
+	 *     widths now and npudev refuses the rest.
+	 *  2. the two NPU cores corrupt each other when their submits overlap.
+	 *     phi3 at width 24: 13 of 16 wrong overlapped, 0 of 16 with one
+	 *     core, 0 of 16 with the submits serialised. Serialised is the
+	 *     default now.
 	 *
-	 * gemma4 is the first model whose per layer embedding projections
-	 * (`pl_model_proj`, `pl_inp_gate`, `pl_proj`) are asked for m > 1 on
-	 * the hardware at all. Which of them is wrong is a probe question:
-	 * `board_w4_axis.sh <gemma4>` names the tensor and the row. Until it
-	 * does, this refuses, and the refusal is on the per layer embeddings
-	 * because that is the property that distinguishes the model -- not
-	 * because the tensors are proven guilty.
+	 * ⚠ WHAT WOULD PUT SOMETHING BACK HERE. This list is empty but for a
+	 * debug switch, so the next architecture will not be refused by it --
+	 * it will be MISSED by it, the way blk.N.layer_output_scale was: a
+	 * tensor this loop did not apply, on a model nothing refused. A new
+	 * architecture means reading llama_forward against this loop line by
+	 * line, and then board_text_all.sh on the card, which is the check
+	 * that found phi3 on its first run.
 	 */
-	/*
-	 * ⚠⚠ THE STATED CAUSE ABOVE IS DISPROVEN. Read this before believing
-	 * any of it.
-	 *
-	 * The batched matmul is NOT wrong on the per layer embeddings. It is
-	 * exact on every tensor gemma4 has, at every EVEN width, on the board:
-	 * 277 tensors, 8587 of 8587 rows. What was wrong is the width its last
-	 * prompt chunk landed on.
-	 *
-	 *   88 tokens -> 32, 32, tail 24 (even) -> ten clean runs
-	 *   89 tokens -> 32, 32, tail 25 (ODD)  -> eight of eight wrong
-	 *
-	 * and one trailing space in a test script was the whole difference
-	 * between those two lines. charsiu_acc_index cannot express an odd
-	 * width -- 64*P slots per group against the 32*m it needs -- and the
-	 * chunker now only ever emits even ones.
-	 *
-	 * ⚠ AND EVERY ONE OF ITS FAILURES IS ACCOUNTED FOR, which phi3's are
-	 * not -- the two models are NOT in the same position and must not be
-	 * lifted together.
-	 *
-	 * Sorted by the width each round actually ran, gemma4 is clean at every
-	 * even one and wrong at every odd one, with no exceptions left over.
-	 * The rounds that called it wrong were all reading the trailing-space
-	 * prompt, which is 89 tokens and a tail of 25.
-	 *
-	 * ⚠ AND ITS TAIL WIDTH IS NOW MEASURED, NOT ARGUED. The dense sweep
-	 * ran m = 24 against the hardware and got 192 of 192 rows at worst
-	 * relative 2.57e-05, on both cores and on one. gemma4's 88 token
-	 * prompt chunks to 32, 32 and exactly that.
-	 *
-	 * ⚠ AND THE EVEN-ONLY CHUNKER HAS NOW RUN IT: 0 of 16, the shipped
-	 * path, 88 tokens chunking to 32, 32 and 24. But the arm beside it --
-	 * CHARSIU_NPU_BATCH_ZERO=1, which only adds a memset before the submit
-	 * -- came back 1 of 16 WRONG.
-	 *
-	 * A memset cannot change what the hardware computes. It changes
-	 * TIMING. So that arm is not the semantic control it was written as,
-	 * and a fault that appears only under it is a race -- which is exactly
-	 * what the dense sweep proved at m = 8 and m = 10: two cores stepping
-	 * on row 0 of a wide output, bit identical on one core.
-	 *
-	 * ⚠⚠ AND IT MEANS THE SWEEP'S "EVERY EVEN WIDTH EXACT" IS ONE SAMPLE A
-	 * WIDTH. A fault firing one run in sixteen would have been missed at
-	 * every width except the two where it is dense. 12..62 being clean is
-	 * not the same statement as 12..62 being safe.
-	 *
-	 * So this stays refused, and the round that lifts it is now the one
-	 * with the arm that discriminates:
-	 *   CHARSIU_INT_ARMS="default onedev zero" \
-	 *     sh board_intermittent.sh gemma4 16
-	 * Clean on one core and dirty on two is the m = 8 fault at a lower
-	 * rate, and then the answer is scheduling, not this refusal.
-	 */
-	WHY(m->n_embd_pl, "no round has yet run it with the even-only chunker;"
-	    " every failure it has is explained by an odd last chunk, so this"
-	    " lifts on one clean board_intermittent.sh run");
-	/*
-	 * ⚠⚠ AND PHI3, FOUND THE SAME DAY BY THE CHECK THAT SHOULD HAVE
-	 * EXISTED ALL ALONG.
-	 *
-	 * board_text_all.sh, first run, on the card:
-	 *
-	 *   control  ... 30 31 32 33 34 3
-	 *   batched  ... 30 31 32 Dayler DoD pays Difficult
-	 *
-	 * Phi-3.5 has been batching on this board and answering wrongly for as
-	 * long as it has been batching, because prefill_control prefers llama
-	 * and nobody ever pointed it at anything else. Two wrong models in one
-	 * round from one script says the gap was the check, not the luck.
-	 *
-	 * ⚠ WHY THIS TEST AND NOT `!L->wk`. phi3's q, k and v are SUBTENSORS
-	 * of one attn_qkv -- views with an offset into a bigger buffer, made
-	 * by subtensor() -- and it is the only architecture here that has any.
-	 * `L->wk` is not null for it, so the old fused refusal never applied;
-	 * what distinguishes it is that its weights are views, and a staged
-	 * view at m > 1 is the thing that has never been exercised.
-	 *
-	 * That is a hypothesis about the cause and a fact about the model.
-	 * The refusal rests on the fact. `board_w4_axis.sh <phi3>` names the
-	 * tensor.
-	 */
-	{
-		int views = 0;
-
-		for (uint32_t l = 0; l < m->n_layer; l++)
-			if (m->layers[l].wq == &m->layers[l].split[0])
-				views = 1;
-		/*
-		 * ⚠⚠ AND THIS CAUSE IS DISPROVEN TOO. phi3's matmul is exact
-		 * at every even width -- 225 tensors, 18000 of 18000 rows at
-		 * m = 80 -- so being a view of attn_qkv was never the fault.
-		 * Its 87 token prompt chunked to 32, 32 and TWENTY THREE, and
-		 * an odd width has no expression on the accumulator surface.
-		 *
-		 * ⚠⚠ BUT UNLIKE gemma4, phi3 HAS A RESIDUAL AT EVEN WIDTHS,
-		 * and that is why the two are not lifted together.
-		 *
-		 * At 88 tokens its tail is 24, which is even, and it was still
-		 * wrong 2 of 8 and 3 of 8 -- on the shipped path and with the
-		 * output buffer zeroed alike. board_chunk_sweep says the same
-		 * from the other side: chunk 24 runs 24, 24, 24 and 16, every
-		 * width even, and the text DIFFERED.
-		 *
-		 * Nothing explains that, and the dense sweep sharpened it
-		 * rather than solving it: on LLAMA's shapes every even width
-		 * from 12 to 62 is exact on both cores, m = 24 included, so
-		 * the residual is not a property of the width alone. phi3's
-		 * shapes were not in that sweep -- it is k = 3072 with q, k
-		 * and v as views of one attn_qkv, where llama is k = 2048 with
-		 * separate tensors. Whatever is left is in that difference.
-		 *
-		 * The width law retires the reason this refusal used to give;
-		 * the residual is what keeps it.
-		 *
-		 * The test is kept because it still selects the model, and the
-		 * reason string no longer claims to know why.
-		 */
-		WHY(views, "an unexplained residual at EVEN widths: a tail of 24"
-		    " was still wrong 2 of 8 and 3 of 8, and chunk 24 -- all"
-		    " even widths -- differed too");
-	}
 #undef WHY
 	if (n)
 		return buf;
