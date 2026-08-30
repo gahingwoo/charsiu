@@ -136,7 +136,18 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# best with the spread beside it, so a number and its noise arrive
 	# together. The default is still 1, because three times four models is
 	# a long round.
+	# ⚠⚠ THE DECODE COLUMN NEEDS ITS OWN BEST AND WORST, and it had
+	# neither. BEST_TS was whatever the run with the best TTFT happened to
+	# decode at, and no spread was printed for it at any REPEAT -- so the
+	# headline tokens-a-second was an unqualified single reading even when
+	# the round was told to repeat.
+	#
+	# That cost a wrong call. TinyLLAMA read 12.64 t/s here on one round and
+	# 17.39 on the next, same build, same board, minutes apart, and the 12.64
+	# was read as a 24% regression against a 16.54 baseline that was itself
+	# one reading. A 27% spread on the number this table exists to report.
 	BEST_TT=; BEST_TS=; BEST_MB=; BEST_NP=; WORST_TT=; nrun=0
+	BTS=; WTS=
 	while [ $nrun -lt "$REPEAT" ]; do
 		nrun=$((nrun + 1))
 		# ⚠⚠ env, NOT A BARE ASSIGNMENT PREFIX. A shell only treats
@@ -166,6 +177,11 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		if [ -z "$WORST_TT" ] || [ "$TT" -gt "$WORST_TT" ] 2>/dev/null; then
 			WORST_TT=$TT
 		fi
+		# ⚠ awk, because tok/s is a float and the shell cannot compare one
+		[ -n "$BTS" ] || BTS=$TS
+		[ -n "$WTS" ] || WTS=$TS
+		BTS=$(awk -v a="$BTS" -v b="$TS" 'BEGIN{print (b>a)?b:a}')
+		WTS=$(awk -v a="$WTS" -v b="$TS" 'BEGIN{print (b<a)?b:a}')
 	done
 	# ⚠⚠ A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
 	# plus OUT=$(cmd) means one model that will not load takes every model
@@ -178,9 +194,12 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		tail -3 "$DIR/.v.err" | sed 's/^/     /'
 		continue
 	fi
-	TS=$BEST_TS; TT=$BEST_TT; MB=$BEST_MB; NP=$BEST_NP
+	TS=${BTS:-$BEST_TS}; TT=$BEST_TT; MB=$BEST_MB; NP=$BEST_NP
 	spread=""
-	[ "$REPEAT" -gt 1 ] && spread=" ttft $BEST_TT..$WORST_TT over $REPEAT runs"
+	# ⚠ THE DECODE COLUMN NOW REPORTS ITS OWN BEST, not the one that came
+	# with the best prompt. The two are not the same run and there is no
+	# reason they should be.
+	[ "$REPEAT" -gt 1 ] && spread=" ttft $BEST_TT..$WORST_TT, decode $WTS..$BTS over $REPEAT runs"
 	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)%s\n' \
 		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP" "$spread"
 	# ⚠ THE REFUSAL STRING MOVED ON 2026-08-29 and this grep did not: it
@@ -228,6 +247,14 @@ echo
 # labelled MB, so 1068 here is 1120 of theirs and the honest ratio is 2.18x
 # rather than 2.08x.
 echo
+if [ "$REPEAT" -eq 1 ]; then
+	echo "⚠⚠ EVERY NUMBER ABOVE IS ONE READING. TinyLLAMA has read 12.64 and"
+	echo "   17.39 tok/s on the same build minutes apart, and Qwen3's TTFT"
+	echo "   2055, 1867 and 2191 -- so a change worth less than about 25%"
+	echo "   cannot be seen here at all, and a single round must not be read"
+	echo "   as a regression. CHARSIU_BENCH_REPEAT=3 prints best and spread."
+	echo
+fi
 echo "⚠ THE MEMORY COLUMN IS VmHWM AND DOES NOT SEE THE DEVICE BUFFERS."
 echo "  Weights on the hardware, coefficient buffers and batched output"
 echo "  buffers are all VM_PFNMAP and never counted. Computed at these"
