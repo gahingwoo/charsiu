@@ -33,6 +33,151 @@
 
 
 /*
+ * ⚠⚠ FOUR BITS IN MEMORY, NOT EIGHT: WHAT t->q HOLDS, AND WHY THAT IS ONE BOOL.
+ *
+ * t->q used to keep one whole int8_t per int4 code, which is a second copy of
+ * every routed weight at DOUBLE the width of the gguf it was read from and
+ * double the width the hardware is handed. Counted over the tensors llama.c
+ * actually routes, on the real files: Qwen3-0.6B is 595 984 384 codes, so q was
+ * 596.0 MB of it; gemma-3-1b is 999.8 MB and Phi-3.5-mini 3722.4 MB. That is
+ * the largest single line in this runtime's memory and more than half of it,
+ * on a board with 8 GB shared with everything else -- the 1068 MB Qwen3 peak
+ * npudev's output buffer note weighs against Rockchip's 513 has all 596 of
+ * these MB inside it.
+ *
+ * Packed, and measured on the development host, which routes every one of those
+ * tensors through the CPU fallback because it has no NPU:
+ *
+ *   Qwen3-0.6B     953 -> 669 MiB     -284    -29.8%
+ *   gemma-3-1b    1682 -> 1205 MiB    -477    -28.4%
+ *   Phi-3.5-mini  5679 -> 3904 MiB   -1775    -31.3%
+ *
+ * with the generated text of all three byte identical to the same binary built
+ * before the change, and the decode rate unchanged on the two small ones.
+ *
+ * So a row of q is packed two codes to a byte, LOW NIBBLE FIRST: column i of a
+ * row lives in the low half of byte i/2 when i is even and the high half when i
+ * is odd. That is exactly the layout npudev's e->cq already uses for the CPU's
+ * share of a split projection, nibble order included -- which is why that copy
+ * is now a memcpy of the row instead of a gather.
+ *
+ * ⚠ ROW STRIDED, ((k + 1) / 2) BYTES A ROW, and NOT the flat (n*k + 1)/2 the
+ * weight cache file used to hold. Three reasons, and the third is not a
+ * preference:
+ *
+ *   - every reader of q is a ROW reader, and a byte aligned row start means the
+ *     column index alone decides which half of the byte a code is in. Flat
+ *     packing puts row r at nibble r*k, so at an odd k the parity alternates
+ *     from row to row and every reader needs a starts-odd case. cpu_rows in
+ *     npudev records what that costs when it is missed: "at k = 34 with groups
+ *     of 17 the test measured 2.26 relative against 1e-6 elsewhere".
+ *   - it makes e->cq a memcpy rather than a gather and a shift.
+ *   - ⚠⚠ quant_rows RUNS ON THE THREAD POOL, SPLIT BY ROWS. Under flat packing
+ *     at an odd k the last code of row r and the first code of row r+1 share a
+ *     byte, so two workers read-modify-write the same address and one of the
+ *     two nibbles is lost -- silently, and only for the shapes nobody has.
+ *     Row striding makes that byte impossible: no two rows ever meet.
+ *
+ * The cost is one padding nibble a row at odd k: 65 nibbles across the 24
+ * shapes the layout was checked at, and EXACTLY ZERO for every real model,
+ * whose k is a multiple of 32 because that is gguf's own block. Which is also
+ * why the weight cache file did not change length for any model that has one.
+ *
+ * ⚠ AND IT IS A PROCESS WIDE CONSTANT, DELIBERATELY NARROWER THAN bits == 4.
+ *
+ * npu_tensor_build picks four bits per TENSOR: CHARSIU_NPU_W4_ONLY narrows int4
+ * to the tensors whose name contains a substring. npudev has to read q back and
+ * all it holds of a tensor's identity is t->name, an 80 byte copy that a long
+ * enough name truncates -- so under W4_ONLY the two files could disagree about
+ * the width of the same buffer, and a reader that is one nibble out of step
+ * with the writer does not fail. It answers, in fluent sentences. This project
+ * has shipped one fast wrong answer already and it cost four commits.
+ *
+ * So W4_ONLY, which is a diagnostic for WHERE the error lives rather than
+ * anything a deployment runs, keeps the old one byte a code array and gives up
+ * the saving. Every other int4 run -- which is every real one -- packs, and
+ * "is q packed" is then a single bool that both files read from this one
+ * function and that nothing per tensor can make disagree.
+ */
+/*
+ * ⚠⚠ AN EMPTY OR ZERO VALUE MEANS OFF, AND HERE IT DID NOT.
+ *
+ * npudev.c fixed exactly this for the device side and wrote down what it
+ * cost: `!= NULL` makes CHARSIU_NPU_W4V= turn int4 ON, there is no way to get
+ * int8 past a runner that sets the variable itself, and a board round meant
+ * to measure the int8 batched path ran int4 instead -- caught only because it
+ * said so in its own report.
+ *
+ * The quantiser was left on the presence rule, so the two files disagreed
+ * about the same variable: CHARSIU_NPU_W4V=0 opened an INT8 device and built
+ * INT4 codes for it. Both sides read it the same way now, which is what
+ * npu_mode() and act_set() in this tree already do.
+ */
+static int w4_env(void)
+{
+	const char *a = getenv("CHARSIU_NPU_W4");
+	const char *b = getenv("CHARSIU_NPU_W4V");
+
+	return (a && *a && *a != '0') || (b && *b && *b != '0');
+}
+
+int npu_q_packed(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = w4_env() && !getenv("CHARSIU_NPU_W4_ONLY");
+	return v;
+}
+
+/* bytes one row of q occupies, which is what every reader of it strides by */
+size_t npu_q_stride(uint64_t k)
+{
+	return npu_q_packed() ? (size_t)((k + 1) / 2) : (size_t)k;
+}
+
+/*
+ * ONE CODE OUT OF A ROW OF q, BY COLUMN.
+ *
+ * pk is npu_q_packed() hoisted out of the caller's loop. It is constant for the
+ * life of the process, and these sit in loops that run once per weight in the
+ * model -- 1.24 billion times on Llama-3.2-1B, which is the count that made
+ * getenv inside a loop worth two rounds of staging time to find.
+ */
+static inline int q_at(const int8_t *row, uint64_t i, int pk)
+{
+	unsigned v;
+
+	if (!pk)
+		return row[i];
+	v = (unsigned)(uint8_t)row[i >> 1];
+	v = (i & 1) ? (v >> 4) : (v & 0xfu);
+	return v >= 8 ? (int)v - 16 : (int)v;
+}
+
+/*
+ * ⚠ EVEN COLUMNS ASSIGN, ODD COLUMNS OR, and that is what leaves a row fully
+ * defined after ONE ascending pass over its columns. q is malloc'd and not
+ * calloc'd, so a read-modify-write on the even half would be reading
+ * uninitialised memory, and at an odd k it would also leave the row's trailing
+ * padding nibble undefined for the weight cache to write out to a file.
+ *
+ * Every writer here does walk a row's columns in ascending order and cover all
+ * of [0, k): quant_rows goes group by group and the offline weight file is read
+ * a row at a time. A writer that did neither would have to clear the row first.
+ */
+static inline void q_put(int8_t *row, uint64_t i, int v, int pk)
+{
+	if (!pk)
+		row[i] = (int8_t)v;
+	else if (i & 1)
+		row[i >> 1] = (int8_t)((unsigned)(uint8_t)row[i >> 1]
+				       | (((unsigned)v & 0xfu) << 4));
+	else
+		row[i >> 1] = (int8_t)((unsigned)v & 0xfu);
+}
+
+/*
  * THE WEIGHT CACHE: slow once, fast after, and the user converts nothing.
  *
  * charsiu dequantises 1.24 billion Q8_0 weights to float and re-quantises them
@@ -54,8 +199,18 @@
  * up: a cache that is subtly wrong is worse than no cache, because the failure
  * shows up as a slightly wrong sentence rather than as an error.
  *
- * The nibbles are packed two to a byte on the way out, so an int4 cache is half
- * the size of the codes in memory and half the size of the gguf it replaces.
+ * ⚠ THE RECORD IS A STRAIGHT COPY OF q, which is what it was not. It used to
+ * pack the nibbles on the way out and unpack them on the way back in, because
+ * q was one byte a code in memory and half that in the file; now that q is
+ * packed itself the record is an fwrite and the read is an fread. That is the
+ * whole point of the cache getting cheaper rather than only smaller:
+ * gemma-3-1b's 999 751 680 codes came back in 710 to 1054 ms of staging when
+ * every one of them had to be widened on the way in, and in 85 to 93 ms now.
+ *
+ * ⚠⚠ WHICH MEANS THE WIDTH IS PART OF THE KEY. A cache written when q was one
+ * byte a code cannot be read by a build that packs it -- at an odd k the two
+ * are not even the same length -- so npu_q_packed() goes into the group word
+ * below. int8 caches are untouched by any of this and stay valid.
  */
 /* one getenv, cached: this is asked inside loops over the whole tensor */
 static int midrise_grid(void)
@@ -131,8 +286,11 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 	want.format = WCACHE_FORMAT;
 	want.quant = WCACHE_QUANT;
 	want.bits = bits;
-	/* the grid is part of what the codes mean, so it is part of the key */
-	want.group = grp | (midrise_grid() ? (1ull << 63) : 0);
+	/* the grid is part of what the codes mean, so it is part of the key --
+	 * and so is the WIDTH q is held at, because the record is a straight
+	 * copy of it. Bit 63 is the grid, bit 62 is npu_q_packed(). */
+	want.group = grp | (midrise_grid() ? (1ull << 63) : 0)
+			 | (npu_q_packed() ? (1ull << 62) : 0);
 	snprintf(want.stamp, sizeof(want.stamp), "%s", stamp ? stamp : "");
 
 	wc.f = fopen(path, "rb");
@@ -163,13 +321,13 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 	fprintf(stderr, "charsiu: weight cache %s, writing\n", path);
 }
 
-/* one record's payload size, nibbles packed two to a byte for int4 */
-static size_t wcache_qbytes(unsigned bits, uint64_t n, uint64_t k)
+/* one record's payload size: q goes to the file exactly as it is held */
+static size_t wcache_qbytes(uint64_t n, uint64_t k)
 {
-	return bits == 4 ? (size_t)((n * k + 1) / 2) : (size_t)(n * k);
+	return (size_t)n * npu_q_stride(k);
 }
 
-static int wcache_read(struct npu_tensor *t, unsigned bits, const char *name)
+static int wcache_read(struct npu_tensor *t, const char *name)
 {
 	char nm[80];
 	uint64_t n, k, ngrp;
@@ -196,45 +354,23 @@ static int wcache_read(struct npu_tensor *t, unsigned bits, const char *name)
 		wc.f = NULL;
 		return 0;
 	}
-	qb = wcache_qbytes(bits, n, k);
-	if (bits == 4) {
-		uint8_t *packed = malloc(qb);
-		size_t i;
-
-		if (!packed)
-			return 0;
-		if (fread(packed, 1, qb, wc.f) != qb ||
-		    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
-			    != (size_t)(n * ngrp)) {
-			free(packed);
-			return 0;
-		}
-		for (i = 0; i < (size_t)(n * k); i++) {
-			int v = (i & 1) ? (packed[i >> 1] >> 4)
-					: (packed[i >> 1] & 0xf);
-
-			t->q[i] = (int8_t)(v < 8 ? v : v - 16);
-		}
-		free(packed);
-	} else {
-		if (fread(t->q, 1, qb, wc.f) != qb ||
-		    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
-			    != (size_t)(n * ngrp))
-			return 0;
-	}
+	qb = wcache_qbytes(n, k);
+	if (fread(t->q, 1, qb, wc.f) != qb ||
+	    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
+		    != (size_t)(n * ngrp))
+		return 0;
 	/* wsum is n int32 and recomputing it is a whole pass over the codes */
 	if (fread(t->wsum, sizeof(int32_t), (size_t)n, wc.f) != (size_t)n)
 		return 0;
 	return 1;
 }
 
-static void wcache_write(const struct npu_tensor *t, unsigned bits,
-			 const char *name)
+static void wcache_write(const struct npu_tensor *t, const char *name)
 {
 	char nm[80];
 	uint64_t n = t->n, k = t->k;
 	uint64_t ngrp = t->kgroup ? (k + t->kgroup - 1) / t->kgroup : 1;
-	size_t qb = wcache_qbytes(bits, n, k);
+	size_t qb = wcache_qbytes(n, k);
 
 	if (!wc.f || !wc.writing)
 		return;
@@ -245,28 +381,8 @@ static void wcache_write(const struct npu_tensor *t, unsigned bits,
 	    fwrite(&k, sizeof(k), 1, wc.f) != 1 ||
 	    fwrite(&ngrp, sizeof(ngrp), 1, wc.f) != 1)
 		goto bad;
-	if (bits == 4) {
-		uint8_t *packed = calloc(qb, 1);
-		size_t i;
-
-		if (!packed)
-			goto bad;
-		for (i = 0; i < (size_t)(n * k); i++) {
-			uint8_t v = (uint8_t)(t->q[i] & 0xf);
-
-			if (i & 1)
-				packed[i >> 1] |= (uint8_t)(v << 4);
-			else
-				packed[i >> 1] |= v;
-		}
-		if (fwrite(packed, 1, qb, wc.f) != qb) {
-			free(packed);
-			goto bad;
-		}
-		free(packed);
-	} else if (fwrite(t->q, 1, qb, wc.f) != qb) {
+	if (fwrite(t->q, 1, qb, wc.f) != qb)
 		goto bad;
-	}
 	if (fwrite(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
 	    != (size_t)(n * ngrp) ||
 	    fwrite(t->wsum, sizeof(int32_t), (size_t)n, wc.f) != (size_t)n)
@@ -303,6 +419,14 @@ struct qrows {
 	unsigned bits;
 	float qmax;
 	int w4sym, w4clip, rms, midrise;
+	/*
+	 * ⚠ THE ROW STRIDE IS NOT k ANY MORE. Read once here rather than per
+	 * row: npu_q_stride goes through npu_q_packed, which is a getenv behind
+	 * a static, and this struct is what the whole quantiser reads its
+	 * constants out of for exactly that reason.
+	 */
+	size_t stride;
+	int pk;
 	double se, sw;
 };
 
@@ -316,13 +440,15 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 	const float qmax = c->qmax;
 	const int w4sym = c->w4sym, w4clip = c->w4clip;
 	const int rms = c->rms, midrise = c->midrise;
+	const size_t stride = c->stride;
+	const int pk = c->pk;
 	double se = 0.0, sw = 0.0;
 	float *row = malloc((size_t)k * sizeof(float));
 
 	if (!row)
 		return;
 	for (uint64_t r = r0; r < r0 + nr; r++) {
-		int8_t *dst = t->q + r * k;
+		int8_t *dst = t->q + r * stride;
 		int32_t sum = 0;
 
 		gguf_row_f32(w, r, row);
@@ -482,7 +608,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 				if (v > (int)qmax) v = (int)qmax;
 				if (v < -(int)qmax) v = -(int)qmax;
 			}
-			dst[i] = (int8_t)v;
+			q_put(dst, i, v, pk);
 			sum += v;
 			/*
 			 * ⚠ A DIAGNOSTIC, AND IT COSTS ABOUT 3%. I guessed a
@@ -510,6 +636,34 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 	c->se += se;
 	c->sw += sw;
 	free(row);
+}
+
+/*
+ * ⚠ CHARSIU_W4_FILE IS ONE BYTE A CODE AND q MAY NOT BE. The offline format is
+ * documented below as n*k signed bytes and nothing about it changes here -- a
+ * file prepared by tools/gptq.py months ago still loads -- so the rows are read
+ * one at a time into a k byte scratch and packed on the way in. The straight
+ * fread this replaced would now write twice the length of the buffer.
+ */
+static int w4file_codes(FILE *f, struct npu_tensor *t, uint64_t n, uint64_t k)
+{
+	const int pk = npu_q_packed();
+	const size_t stride = npu_q_stride(k);
+	int8_t *scratch = malloc((size_t)k);
+	uint64_t r, i;
+
+	if (!scratch)
+		return 0;
+	for (r = 0; r < n; r++) {
+		if (fread(scratch, 1, (size_t)k, f) != (size_t)k) {
+			free(scratch);
+			return 0;
+		}
+		for (i = 0; i < k; i++)
+			q_put(t->q + r * stride, i, scratch[i], pk);
+	}
+	free(scratch);
+	return 1;
 }
 
 int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
@@ -542,7 +696,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	/* CHARSIU_NPU_W4V, the int4 DECODE path, implies int4 weights: one
 	 * switch cannot select the layout and registers while another leaves
 	 * the quantiser at eight bits. */
-	unsigned bits = (getenv("CHARSIU_NPU_W4") || getenv("CHARSIU_NPU_W4V"))
+	unsigned bits = w4_env()
 		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
 	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
 		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
@@ -613,7 +767,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	t->n = n;
 	t->k = k;
 	t->kgroup = grp;
-	t->q = malloc((size_t)n * k);
+	t->q = malloc((size_t)n * npu_q_stride(k));
 	t->scale = malloc((size_t)n * ngrp * sizeof(float));
 	t->wsum = malloc((size_t)n * sizeof(int32_t));
 	row = malloc((size_t)k * sizeof(float));
@@ -624,14 +778,21 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * the CPU, so a tensor whose quantised copy would not fit
 		 * looked exactly like a tensor nobody had asked to route.
 		 *
-		 * The copy is one BYTE a weight whatever the bit width -- the
-		 * nibbles are packed later, in npudev -- so an output head is
-		 * 302 MB here even at four bits.
+		 * ⚠ AND THE FIGURE IS THE REAL ONE NOW. The copy used to be one
+		 * BYTE a weight whatever the bit width, so gemma3's 262144 by
+		 * 1152 output head asked for 302 MB even at four bits and this
+		 * line said so, while npudev's own weight_mb for the same tensor
+		 * said 151. It is 151 in both places now.
+		 *
+		 * ⚠ WHICH DOES NOT MEAN THE HEAD IS ROUTED. It is refused by the
+		 * maxn gate in charsiu_pool_get long before this, and that is
+		 * still 44% of a gemma token on the CPU -- this line is only
+		 * about what the message claims when the malloc is what fails.
 		 */
 		fprintf(stderr, "charsiu: %s stays on the CPU -- its %llu x %llu "
 			"quantised copy needs %.0f MB and would not allocate\n",
 			w->name, (unsigned long long)n, (unsigned long long)k,
-			(double)((size_t)n * k) / 1e6);
+			(double)((size_t)n * npu_q_stride(k)) / 1e6);
 		free(row);
 		npu_tensor_free(t);
 		return -1;
@@ -646,7 +807,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 */
 	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE")) {
 		wcache_setup(bits, grp);
-		if (wcache_read(t, bits, w->name)) {
+		if (wcache_read(t, w->name)) {
 			free(row);
 			return 0;
 		}
@@ -720,7 +881,8 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 
 	{
 		struct qrows c = { t, w, k, ngrp, grp, bits, qmax,
-				   w4sym, w4clip, rms, midrise, 0.0, 0.0 };
+				   w4sym, w4clip, rms, midrise,
+				   npu_q_stride(k), npu_q_packed(), 0.0, 0.0 };
 
 		/* the diagnostic is the only thing that crosses rows */
 		if (rms)
@@ -732,7 +894,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	}
 
 	if (alpha == 0.0 && !getenv("CHARSIU_W4_FILE"))
-		wcache_write(t, bits, w->name);
+		wcache_write(t, w->name);
 
 	/*
 	 * CHARSIU_W4_FILE replaces what was just computed with weights prepared
@@ -752,8 +914,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		       && fread(&fn, sizeof(fn), 1, f) == 1
 		       && fread(&fk, sizeof(fk), 1, f) == 1) {
 			if (!strcmp(nm, w->name) && fn == n && fk == k) {
-				got = fread(t->q, 1, (size_t)n * k, f)
-					      == (size_t)n * k
+				got = w4file_codes(f, t, n, k)
 				      && fread(t->scale, sizeof(float), n, f)
 					      == n;
 				break;
@@ -764,12 +925,16 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		if (f)
 			fclose(f);
 		if (got) {
+			const int pk = npu_q_packed();
+			const size_t stride = npu_q_stride(k);
+
 			t->kgroup = k;               /* one scale a row */
 			for (uint64_t r = 0; r < n; r++) {
+				const int8_t *qr = t->q + r * stride;
 				int32_t sum = 0;
 
 				for (uint64_t i = 0; i < k; i++)
-					sum += t->q[r * k + i];
+					sum += q_at(qr, i, pk);
 				t->wsum[r] = sum;
 			}
 			fprintf(stderr, "w4file: %s loaded\n", w->name);
@@ -822,6 +987,71 @@ static int32_t idot(const int8_t *w, const int8_t *x, uint64_t n)
 		s += (int32_t)w[i] * (int32_t)x[i];
 	return s;
 #endif
+}
+
+/*
+ * THE SAME DOT PRODUCT AGAINST A PACKED ROW: sum over [lo, lo+len) of
+ * code(row, i) * x[i], with row and x both indexed by absolute column.
+ *
+ * ⚠⚠ THIS IS THE FALLBACK, WHICH IS THE ONE THAT HAS TO BE RIGHT. Everything
+ * routed to the hardware can arrive back here at run time -- a width the batch
+ * refuses, a buffer object that would not allocate, a job that timed out -- and
+ * llama.c's matvec_again takes that path SILENTLY on purpose, because a run
+ * that degrades to the CPU still finishes and still says which shape stopped
+ * answering. Which means a reader one nibble out of step with q_put would not
+ * raise anything. It would answer, in whole sentences, slightly wrong.
+ *
+ * ⚠ THE VECTOR PATH READS BYTE i/2 AND TAKES ITS LOW NIBBLE AS COLUMN i, so it
+ * only means that when the start is EVEN. Groups begin at multiples of
+ * CHARSIU_NPU_W4_GROUP, which is 1024 on the board and even at every shape this
+ * has ever run -- but an odd group size that divides an odd k starts a group on
+ * an odd column: at k = 33 with groups of 11, columns 11 and 22 both do. One
+ * scalar step first fixes the alignment. That is the same correction cpu_rows
+ * in npudev carries, and it is there because the test caught it: 2.26 relative
+ * at k = 34 with groups of 17, against 1e-6 everywhere else.
+ */
+static int32_t qdot(const int8_t *row, const int8_t *x, uint64_t lo,
+		    uint64_t len)
+{
+	uint64_t i = lo, hi = lo + len;
+	int32_t s = 0;
+
+	if ((i & 1) && i < hi) {
+		s += (int32_t)q_at(row, i, 1) * (int32_t)x[i];
+		i++;
+	}
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	{
+	int32x4_t acc = vdupq_n_s32(0);
+
+	for (; i + 16 <= hi; i += 16) {
+		uint8x8_t b = vld1_u8((const uint8_t *)row + (i >> 1));
+		/*
+		 * The low nibbles sign extended by a shift left into the top of
+		 * the byte and an arithmetic shift back, the high nibbles by
+		 * the arithmetic shift alone, then zipped back into column
+		 * order -- val[0] is columns i..i+7 and val[1] is i+8..i+15.
+		 * Same unpack as cpu_rows; this one accumulates in integers
+		 * because the activation here is already the int8 q1 form.
+		 */
+		int8x8_t l = vshr_n_s8(vshl_n_s8(
+			vreinterpret_s8_u8(vand_u8(b, vdup_n_u8(0x0f))), 4), 4);
+		int8x8_t h = vshr_n_s8(vreinterpret_s8_u8(b), 4);
+		int8x8x2_t z = vzip_s8(l, h);
+		int8x16_t w = vcombine_s8(z.val[0], z.val[1]);
+		int8x16_t v = vld1q_s8(x + i);
+
+		/* |code| <= 8 and |x| <= 127, so the widening product is 1016
+		 * at worst and int16 has room for it before the pairwise add */
+		acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w),  vget_low_s8(v)));
+		acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(w), vget_high_s8(v)));
+	}
+	s += vaddvq_s32(acc);
+	}
+#endif
+	for (; i < hi; i++)
+		s += (int32_t)q_at(row, i, 1) * (int32_t)x[i];
+	return s;
 }
 
 /*
@@ -892,10 +1122,14 @@ void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		float *y, uint64_t row0, uint64_t nrows)
 {
+	const int pk = npu_q_packed();
+	const size_t stride = npu_q_stride(t->k);
+
 	if (getenv("CHARSIU_CALIB") && row0 == 0)
 		npu_calib_note((struct npu_tensor *)t, a);
 	for (uint64_t r = 0; r < nrows; r++) {
 		uint64_t n = row0 + r;
+		const int8_t *qr = t->q + n * stride;
 
 		uint64_t grp = t->kgroup ? t->kgroup : t->k;
 		uint64_t ngrp = (t->k + grp - 1) / grp;
@@ -968,7 +1202,7 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 
 					if (t->kscale)
 						av *= t->kscale[i];
-					part += (double)t->q[n * t->k + i] * av;
+					part += (double)q_at(qr, i, pk) * av;
 					if (midrise_grid())
 						part += 0.5 * av;
 				}
@@ -981,8 +1215,9 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		for (uint64_t g = 0; g < ngrp; g++) {
 			uint64_t lo = g * grp;
 			uint64_t len = lo + grp < t->k ? grp : t->k - lo;
-			double part = (double)idot(t->q + n * t->k + lo,
-						   aq + lo, len);
+			double part = pk
+				? (double)qdot(qr, aq, lo, len)
+				: (double)idot(qr + lo, aq + lo, len);
 
 			/*
 			 * ⚠ THE MIDRISE HALF STEP BELONGS HERE TOO. This is the
