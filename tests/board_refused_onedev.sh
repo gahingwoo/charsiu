@@ -76,7 +76,19 @@ fi
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
-PROMPT=$(seq 1 32 | tr '\n' ' ')
+# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+#
+# board_text_all.sh spelled this literally and every other script built it with
+# `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
+# retokenises, and phi3 goes from 87 tokens to 88 -- a different last chunk, so
+# two scripts comparing "the same prompt" were not.
+#
+# It cost a whole reading. gemma4 came back 10 of 10 clean under the literal
+# form and 8 of 8 WRONG under the seq form, and that was written down as the
+# model flipping, on a day when the only code change was inside the probe.
+CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
+PROMPT="$(seq 1 32 | tr '\n' ' ')"
+PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
@@ -137,6 +149,10 @@ run_arm() { # run_arm <outfile-stem> <extra env...>
 	# shellcheck disable=SC2086
 	$PIN env $W4 "$@" "$RUN" "$MODEL" -p "$PROMPT" -n "$NG" \
 		--ignore-eos $EXTRA >"$o.out" 2>"$o.err"
+	# ⚠ BEFORE THE STRIP. Two rounds of this script ran two different
+	# prompts -- one literal, one from seq with a trailing space -- and the
+	# difference was read as the model flipping.
+	NTOK=$(sed -n 's/.*prompt \([0-9]*\) tok in.*/\1/p' "$o.out" | head -1)
 	sed -i 's/^\[.*//' "$o.out"
 }
 
@@ -193,7 +209,8 @@ for MODEL in $MODELS; do
 		# slices in sequence through one queue.
 		cmp -s "$T/f.out" "$T/o.out" && sok=yes
 
-		printf '  -- %-6s ------------------------------------------------\n' "$COND"
+		printf '  -- %-6s -------------------- prompt %s tokens ------\n' \
+		       "$COND" "${NTOK:-?}"
 		printf '     control (token loop) : ...%s\n' "$(tail_of "$T/c.out")"
 		printf '     forced,  two cores   : ...%s  [%s %s/%s]\n' \
 		       "$(tail_of "$T/f.out")" "$fok" "$fagree" "$REPS"

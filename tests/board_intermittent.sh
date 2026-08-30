@@ -85,7 +85,19 @@ CHUNK=${CHARSIU_INT_CHUNK:-32}
 NGEN=${CHARSIU_INT_NGEN:-8}
 ARMS=${CHARSIU_INT_ARMS:-"default zero"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PROMPT=$(seq 1 32 | tr '\n' ' ')
+# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+#
+# board_text_all.sh spelled this literally and every other script built it with
+# `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
+# retokenises, and phi3 goes from 87 tokens to 88 -- a different last chunk, so
+# two scripts comparing "the same prompt" were not.
+#
+# It cost a whole reading. gemma4 came back 10 of 10 clean under the literal
+# form and 8 of 8 WRONG under the seq form, and that was written down as the
+# model flipping, on a day when the only code change was inside the probe.
+CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
+PROMPT="$(seq 1 32 | tr '\n' ' ')"
+PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
@@ -106,6 +118,11 @@ while [ "$i" -le 2 ]; do
 	# shellcheck disable=SC2086
 	env $W4 CHARSIU_NO_BATCH_PREFILL=1 "$RUN" "$MODEL" -p "$PROMPT" \
 		-n "$NGEN" --ignore-eos >"$T/c$i.out" 2>/dev/null
+	# ⚠ BEFORE THE STRIP: the count lives on the bracketed line the next
+	# command deletes, and a prompt whose length nobody prints is how two
+	# rounds compared different prompts and called it a flip.
+	[ "$i" -eq 1 ] && NTOK=$(sed -n 's/.*prompt \([0-9]*\) tok in.*/\1/p' \
+		"$T/c$i.out" | head -1)
 	sed -i 's/^\[.*//' "$T/c$i.out"
 	i=$((i + 1))
 done
@@ -117,6 +134,14 @@ if ! cmp -s "$T/c1.out" "$T/c2.out"; then
 	exit 1
 fi
 cp "$T/c1.out" "$T/ref.out"
+printf 'prompt is %s tokens -> chunk %s runs' "${NTOK:-?}" "$CHUNK"
+if [ -n "${NTOK:-}" ]; then
+	rem=$((NTOK % CHUNK)); [ "$rem" -lt 2 ] && rem=0
+	if [ "$rem" -eq 0 ]; then printf ' width %s only\n' "$CHUNK"
+	else printf ' width %s and a tail of %s\n' "$CHUNK" "$rem"; fi
+else
+	printf '\n'
+fi
 echo "control (token loop, reproducible over 2 runs):"
 echo "  ...$(tr -d '\n' < "$T/ref.out" | tail -c 56)"
 echo

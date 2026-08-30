@@ -73,7 +73,19 @@ fi
 }
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-PROMPT=$(seq 1 32 | tr '\n' ' ')
+# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+#
+# board_text_all.sh spelled this literally and every other script built it with
+# `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
+# retokenises, and phi3 goes from 87 tokens to 88 -- a different last chunk, so
+# two scripts comparing "the same prompt" were not.
+#
+# It cost a whole reading. gemma4 came back 10 of 10 clean under the literal
+# form and 8 of 8 WRONG under the seq form, and that was written down as the
+# model flipping, on a day when the only code change was inside the probe.
+CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
+PROMPT="$(seq 1 32 | tr '\n' ' ')"
+PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 NGEN=${CHARSIU_CHUNK_NGEN:-8}
 CHUNKS=${CHARSIU_CHUNKS:-"32 31 30 29 24 16 4 2"}
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \

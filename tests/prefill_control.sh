@@ -104,7 +104,19 @@ trap 'rm -rf "$D"' EXIT
 
 # The same counting prompt the 19.24 came from: the model continues the
 # sequence, so a wrong answer is visible without a reference.
-PROMPT=$(seq 1 32 | tr '\n' ' ')
+# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+#
+# board_text_all.sh spelled this literally and every other script built it with
+# `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
+# retokenises, and phi3 goes from 87 tokens to 88 -- a different last chunk, so
+# two scripts comparing "the same prompt" were not.
+#
+# It cost a whole reading. gemma4 came back 10 of 10 clean under the literal
+# form and 8 of 8 WRONG under the seq form, and that was written down as the
+# model flipping, on a day when the only code change was inside the probe.
+CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
+PROMPT="$(seq 1 32 | tr '\n' ' ')"
+PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 
 TASK=""
 command -v taskset >/dev/null 2>&1 && TASK="taskset -c 4-7"

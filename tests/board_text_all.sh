@@ -56,7 +56,19 @@ fi
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
-PROMPT="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32"
+# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+#
+# board_text_all.sh spelled this literally and every other script built it with
+# `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
+# retokenises, and phi3 goes from 87 tokens to 88 -- a different last chunk, so
+# two scripts comparing "the same prompt" were not.
+#
+# It cost a whole reading. gemma4 came back 10 of 10 clean under the literal
+# form and 8 of 8 WRONG under the seq form, and that was written down as the
+# model flipping, on a day when the only code change was inside the probe.
+CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
+PROMPT="$(seq 1 32 | tr '\n' ' ')"
+PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 # the int4 environment the board actually runs, same as board_vendor.sh
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
@@ -87,6 +99,11 @@ for d in $DIRS; do
 		p=$(grep -oE "prompt batched|prompt a token" "$T/b.err" | head -1)
 		nrun=$((nrun + 1))
 		# ⚠ strip only the bracketed report lines; the text is the point
+		# -- but read the token count off them FIRST, because a prompt
+		# whose length nobody prints is how this script and its
+		# neighbours came to compare different prompts silently.
+		ntok=$(sed -n 's/.*prompt \([0-9]*\) tok in.*/\1/p' "$T/c.out" \
+		       | head -1)
 		sed -i 's/^\[.*//' "$T/b.out" "$T/c.out"
 		if cmp -s "$T/b.out" "$T/c.out"; then
 			v="text identical"
@@ -94,7 +111,7 @@ for d in $DIRS; do
 			v="⚠ TEXT DIFFERS"
 			nbad=$((nbad + 1))
 		fi
-		printf '%-38s %-14s %s\n' "$b" "${p:-?}" "$v"
+		printf '%-38s %-14s %s\n' "$b" "${p:-?}" "$v  (${ntok:-?} tok)"
 		[ "$v" = "text identical" ] || {
 			diff "$T/c.out" "$T/b.out" | head -4 | sed 's/^/     /'
 		}
