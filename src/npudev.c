@@ -141,6 +141,23 @@ struct npu_entry {
 	 */
 	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
 	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
+	/*
+	 * WHAT EACH DEVICE WAS GIVEN, WORKED OUT ONCE WHERE IT IS DECIDED.
+	 *
+	 * The slice to device assignment is fixed at staging and never moves,
+	 * so the bytes and the task count a call will cost are known before the
+	 * call happens. Summing them here rather than in the matvec keeps the
+	 * per call accounting to a handful of adds over at most eight entries,
+	 * which matters because the thing being measured is a 133 us fixed cost
+	 * and an instrument that costs a microsecond of it is not an instrument.
+	 *
+	 * The two cores are submitted together and waited on together, so the
+	 * call's wall clock follows whichever device got MORE -- see the fit on
+	 * struct charsiu_npu. That is why both are kept per device rather than
+	 * summed: max(d) is the quantity, not the total.
+	 */
+	double mb_dev[2];          /* weight megabytes, per device */
+	unsigned nt_dev[2];        /* chained tasks, per device */
 };
 
 /*
@@ -374,6 +391,101 @@ struct charsiu_npu {
 	 * call: finding the tensor and quantising the output.
 	 */
 	double call_us;
+
+	/*
+	 * ⚠⚠ THE CALL IS THE UNIT OF WALL CLOCK AND `submits` IS NOT, WHICH
+	 * MAKES THE LINE ABOVE IT IN THE REPORT HALF OF WHAT IT LOOKS LIKE.
+	 *
+	 * One call issues one submit PER DEVICE and then waits on both, so
+	 * busy_us covers a window the two submits SHARED while g->submits
+	 * counted two of them. Every "us a submit" this project has printed is
+	 * therefore a call's wall clock divided by the core count, and the fit
+	 * recorded in PLAN.md as `us a submit = 102.7 * MB + 112` is describing
+	 * a call whose fixed cost is 224 us, not 112.
+	 *
+	 * ⚠ ITS PRODUCT IS RIGHT, WHICH IS WORSE THAN BEING WRONG OUTRIGHT:
+	 * 12632 submits x 112 us and 6316 calls x 224 us are the same 1418 ms,
+	 * so the total looks checked while the per unit number it was read off
+	 * is out by a factor of two. Anyone reaching for "112 us a submit" as
+	 * the thing to attack is attacking half a cost.
+	 *
+	 * SO THE MODEL IS FITTED PER CALL, IN THREE TERMS, ON THE BOARD. Read
+	 * off TinyLLAMA's five decode stages against the geometry this file
+	 * cuts -- n_embd 2048, n_ff 5632, 22 layers, KMAX 1024, NMAX 8192, both
+	 * cores, int4 -- the stages and the line through them are
+	 *
+	 *     q k v     1.311 MB  3 tasks   measured  392.7   fit  383.5
+	 *     o         1.049     1         measured  276.4   fit  280.9
+	 *     gate+up   5.767     2         measured  845.0   fit  836.9
+	 *     down      3.146     3         measured  573.6   fit  585.4
+	 *     head     16.777     4         measured 2100.0   fit 2122.1
+	 *
+	 *   us a call = 128.7 + 36.8 * tasks + 110.0 * MB   (busier core)
+	 *
+	 * inside 2.4% at all five. The stages are weighted as a token presents
+	 * them -- twenty two of the first four and one head -- because that is
+	 * what the accumulators below will see, and it moves the line by about
+	 * 3% against fitting the five rows evenly.
+	 *
+	 * ⚠ AND IT AGREES WITH A ROUND THAT NEVER SAW A MODEL. The 2026-08-15
+	 * shape sweep fitted synthetic matmuls at 32 chained tasks and got 26.3
+	 * us a task plus 172 us a submit plus 84.3 us a megabyte. Same three
+	 * terms, same order, from different shapes on a different day.
+	 *
+	 * ⚠⚠ WHAT THAT SPLIT SAYS ABOUT THE ROOF. Per token it is 11.5 ms of
+	 * per call cost, 7.4 ms of per task cost and 29.1 ms of weights. Those
+	 * three add to the 48.0 ms stage total exactly, and that is arithmetic
+	 * rather than agreement -- a least squares fit with an intercept always
+	 * splits its own input exactly. What says the split is real is that a
+	 * typical call sits 9 us off the line, 1.7% of a 540 us mean call. So
+	 * 39% of what decode spends on the hardware is DISPATCH. The 550 MB a
+	 * token over 58.4 ms that reads as "9.4 GB/s, the bandwidth roof" is an
+	 * average over stages that run from 6.67 GB/s (q k v) to 15.60 (the
+	 * head): a roof does not have a 2.3x spread across shapes, a fixed cost
+	 * does. gate+up alone moves 253.8 MB a token in 18.59 ms, which is
+	 * 13.65 GB/s across the two cores WITH its own dispatch still in it, so
+	 * the streaming rate is strictly above that and decode is nowhere near
+	 * it.
+	 *
+	 * ⚠ WHICH IS ALSO THE ANSWER TO "THE VENDOR DOES 19.71 AND WE DO
+	 * 17.39". 19.71 tok/s is 50.7 ms a token; take off the 10.4 ms this
+	 * token spends outside the projections and the weights would have to
+	 * move at 12.8 GB/s, which is BELOW the 13.65 our own gate+up stage
+	 * already demonstrates. They do not need bandwidth we have not got.
+	 * They need fewer of the 89 calls and 202 tasks a token costs.
+	 *
+	 * ⚠ THIS IS AN INSTRUMENT, NOT A FIX. It is here because the numbers
+	 * above had to be fitted by hand from a five row stage table and a
+	 * spreadsheet of assumed shapes, which is not something the next round
+	 * should have to repeat: the board has thousands of calls a run and can
+	 * fit its own line, on its own shapes, for nine adds a call.
+	 *
+	 * ⚠ AND THE OBVIOUS FIX IS STILL NOT FREE, FOR A SECOND REASON NOW.
+	 * PLAN.md already records that raising KMAX to cut the task count
+	 * coarsens int4, because the K slice must BE the quantisation group.
+	 * The geometry says it also COSTS A CORE: slices are dealt to devices
+	 * as `di = (ki * ns + ni) & 1`, which restarts at 0 for every tensor,
+	 * so a tensor that ends up with ONE slice lands entirely on device 0
+	 * and device 1 sits out the call. At KMAX = 2048 every one of
+	 * TinyLLAMA's k = 2048 projections becomes a single slice: q, k and v
+	 * would all queue on core 0 and the group's busier core would carry
+	 * 2.621 MB in 3 tasks instead of 1.311 in 3, which by the line above is
+	 * 527 us against 385. Fewer tasks, half the machine, 37% slower.
+	 */
+	unsigned long calls;       /* matvec and matvec_group entries */
+	unsigned long tasks_hi;    /* tasks on whichever device got more */
+	double mb_hi;              /* and megabytes on that device */
+	/*
+	 * The normal equations for y = A + B * tasks + C * MB, and f_yy so the
+	 * fit can say how well it fits.
+	 *
+	 * ⚠ THE THREE PARTS ADDING TO THE TOTAL PROVES NOTHING. The first
+	 * normal equation IS `A * n + B * sum(tasks) + C * sum(MB) = sum(us)`,
+	 * so a least squares fit with an intercept splits the hardware path
+	 * exactly, always, however badly the line describes the calls. What
+	 * says it describes them is the residual, which needs sum(us * us).
+	 */
+	double f_n, f_t, f_m, f_tt, f_tm, f_mm, f_y, f_ty, f_my, f_yy;
 
 	/*
 	 * A wedged block answers every submit with a driver side timeout and
@@ -703,13 +815,44 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->nmax = env_u("CHARSIU_NPU_NMAX", 8192);
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 4096);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
+	/*
+	 * ⚠ IT DOES NOT SPLIT THE SUBMIT. Whatever its name and its older
+	 * comment suggested, the only thing that reads `nochain` scales the
+	 * slow-job threshold by the chain length. Setting it changes what
+	 * gets WARNED about, never what gets submitted.
+	 */
 	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
 	/*
 	 * 0 is unlimited. A cap exists because the output head is 126 chained
 	 * tasks and 253 buffer handles in one submit, and it reached only
 	 * 4.2 GB/s where an eight task submit reaches 10.
 	 */
+	/*
+	 * ⚠⚠ AND IT HAS NEVER CAPPED ANYTHING. `maxtask` is assigned here and
+	 * read NOWHERE in this tree. The paragraph above describes the
+	 * measurement that motivated it -- the head's 126 chained tasks at
+	 * 4.2 GB/s against an eight task submit's 10 -- and that hypothesis
+	 * has therefore never had a working control: every round that set
+	 * CHARSIU_NPU_MAXTASK to test it measured its own baseline twice.
+	 *
+	 * CHARSIU_NPU_NOCHAIN is the same story with a smaller blast radius:
+	 * it is read once, and only to scale the slow-job threshold, not to
+	 * split the submit its own comment claims it splits.
+	 *
+	 * A variable that is read and then ignored is worse than one that does
+	 * not exist, because a round can be built on it. It says so now, and
+	 * it will keep saying so until something reads it.
+	 */
 	g->maxtask = env_u("CHARSIU_NPU_MAXTASK", 0);
+	if (g->maxtask) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CHARSIU_NPU_MAXTASK=%u is "
+				"IGNORED -- nothing in this tree reads it, so "
+				"this run is the same as one without it\n",
+				g->maxtask);
+	}
 	/*
 	 * ⚠ THE RETIREMENT GUARD WAS BLIND TO A THIRTEEN FOLD SLOWDOWN.
 	 *
@@ -965,6 +1108,71 @@ int charsiu_npu_needs_q1(const struct charsiu_npu *g)
 	return !g || !g->w4;
 }
 
+/*
+ * THE THREE TERM SOLVE, AND WHY IT REFUSES RATHER THAN GUESSES.
+ *
+ * Gaussian elimination with partial pivoting on a 3x3, which is about as much
+ * numerical work as this deserves. What matters is the refusal: a run that
+ * presented only one shape -- a single tensor benchmark, a model whose every
+ * projection happens to be the same size, or a run that made two calls -- has a
+ * singular or nearly singular system, and the fit it produces would be three
+ * numbers with no information in them that a reader would nonetheless quote.
+ *
+ * ⚠ THE THRESHOLD IS RELATIVE. The entries span the call count, the megabytes
+ * and their squares, so an absolute epsilon is meaningless: 1e-9 is small next
+ * to a sum of squares over ten thousand calls and enormous next to one over
+ * three. The pivot is compared against the largest entry the matrix started
+ * with, which is scale free.
+ */
+static int solve3(double m[3][3], double *v, double *x)
+{
+	double big = 0.0;
+	int i, j, r;
+
+	for (i = 0; i < 3; i++)
+		for (j = 0; j < 3; j++)
+			if (fabs(m[i][j]) > big)
+				big = fabs(m[i][j]);
+	if (big <= 0.0)
+		return -1;
+	for (i = 0; i < 3; i++) {
+		int piv = i;
+
+		for (r = i + 1; r < 3; r++)
+			if (fabs(m[r][i]) > fabs(m[piv][i]))
+				piv = r;
+		if (fabs(m[piv][i]) < 1e-12 * big)
+			return -1;
+		if (piv != i) {
+			for (j = 0; j < 3; j++) {
+				double t = m[i][j];
+
+				m[i][j] = m[piv][j];
+				m[piv][j] = t;
+			}
+			{
+				double t = v[i];
+
+				v[i] = v[piv];
+				v[piv] = t;
+			}
+		}
+		for (r = 0; r < 3; r++) {
+			double f;
+
+			if (r == i)
+				continue;
+			f = m[r][i] / m[i][i];
+			for (j = i; j < 3; j++)
+				m[r][j] -= f * m[i][j];
+			v[r] -= f * v[i];
+		}
+	}
+	for (i = 0; i < 3; i++)
+		x[i] = v[i] / m[i][i];
+	return 0;
+}
+
 void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)
@@ -987,7 +1195,9 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	if (g->submits)
 		fprintf(stderr,
 			"charsiu NPU: %.0f ms in the hardware path, %.2f GB/s "
-			"of weights, %.0f us a submit\n"
+			"of weights, %.0f us a submit -- a call issues one per "
+			"core and waits on both, so that is a CALL's wall "
+			"clock over %u\n"
 			"charsiu NPU: of that, %.0f ms submitting, %.0f ms "
 			"waiting for the fence (the invalidate is in there), "
 			"%.0f ms summing the slices, %.0f ms in the flush\n"
@@ -998,11 +1208,94 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"charsiu NPU: %.0f ms in these calls end to end, so "
 			"%.0f ms of them is neither hardware nor packing\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
-			g->busy_us / (double)g->submits,
+			g->busy_us / (double)g->submits, g->ndev,
 			g->submit_us / 1e3, g->fence_us / 1e3,
 			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3,
 			g->cpu_us / 1e3, g->call_us / 1e3,
 			(g->call_us - g->busy_us - g->pack_us) / 1e3);
+	/*
+	 * ⚠⚠ WHERE THE TIME GOES, SPLIT THREE WAYS INSTEAD OF DIVIDED BY A
+	 * SUBMIT COUNT THAT DOUBLE COUNTS THE CORES.
+	 *
+	 * The line above prints megabytes and microseconds "a submit", which is
+	 * a call's wall clock over the number of cores it used -- see the
+	 * comment on g->calls. This is the same run in the units the clock
+	 * actually measured, and it separates the part that scales with the
+	 * bytes from the part that does not.
+	 *
+	 * ⚠ THE FIXED SHARE IS THE WHOLE POINT. If it is small then this
+	 * hardware path is bandwidth bound and the only thing left is to move
+	 * fewer bytes. If it is large -- and on TinyLLAMA decode the offline
+	 * fit puts it at 40% of the hardware path, 11.9 ms per call plus 7.3 ms
+	 * per task against 28.8 ms of weights -- then the tokens per second are
+	 * being spent on dispatch, and the bytes per second figure above is an
+	 * average across shapes rather than a roof anything is pressed against.
+	 *
+	 * The GB/s here is the aggregate across the cores and it does NOT
+	 * assume they were given equal shares: it is the whole run's weight
+	 * megabytes over the time the fit attributes to weights, so an uneven
+	 * split shows up as a lower rate rather than as an invisible one.
+	 */
+	if (g->calls > 3) {
+		double m[3][3], v[3], x[3];
+
+		m[0][0] = g->f_n;  m[0][1] = g->f_t;  m[0][2] = g->f_m;
+		m[1][0] = g->f_t;  m[1][1] = g->f_tt; m[1][2] = g->f_tm;
+		m[2][0] = g->f_m;  m[2][1] = g->f_tm; m[2][2] = g->f_mm;
+		v[0] = g->f_y; v[1] = g->f_ty; v[2] = g->f_my;
+		fprintf(stderr,
+			"charsiu NPU: %lu calls, %lu tasks and %.0f MB on the "
+			"busier core, %.0f us a call\n",
+			g->calls, g->tasks_hi, g->mb_hi,
+			g->busy_us / (double)g->calls);
+		if (!solve3(m, v, x)) {
+			double fix = x[0] * (double)g->calls / 1e3;
+			double tsk = x[1] * (double)g->tasks_hi / 1e3;
+			double byt = x[2] * g->mb_hi / 1e3;
+
+			fprintf(stderr,
+				"charsiu NPU: us a call = %.0f + %.1f a task "
+				"+ %.1f a MB (both on the busier core), so of "
+				"%.0f ms in the hardware path %.0f ms is per "
+				"call, %.0f ms is per task and %.0f ms is the "
+				"weights at %.2f GB/s across %u core%s\n",
+				x[0], x[1], x[2], g->busy_us / 1e3, fix, tsk,
+				byt, byt > 0.0 ? g->weight_mb / byt : 0.0,
+				g->ndev, g->ndev == 1 ? "" : "s");
+			/*
+			 * ⚠ THE RESIDUAL, NOT THE SUM. fix + tsk + byt is the
+			 * hardware path to the last decimal by construction --
+			 * see the comment on f_yy -- so the number that says
+			 * whether to believe the split is how far a typical
+			 * call sits off the line. On TinyLLAMA's five decode
+			 * shapes that is 9 us against a 540 us mean call,
+			 * 1.7%; anything much larger means the calls are not
+			 * three terms and the megabyte figure above should not
+			 * be quoted.
+			 */
+			if (g->busy_us > 0.0) {
+				double ss = g->f_yy - x[0] * g->f_y
+					  - x[1] * g->f_ty - x[2] * g->f_my;
+				double rms = ss > 0.0
+					   ? sqrt(ss / (double)g->calls) : 0.0;
+
+				fprintf(stderr,
+					"charsiu NPU: %.0f%% of the hardware "
+					"path is dispatch rather than bytes, "
+					"and a typical call sits %.0f us off "
+					"that line, %.1f%% of the %.0f us it "
+					"takes\n",
+					100.0 * (fix + tsk) / (g->busy_us / 1e3),
+					rms,
+					100.0 * rms * (double)g->calls / g->f_y,
+					g->f_y / (double)g->calls);
+			}
+		} else {
+			fprintf(stderr,
+				"charsiu NPU: too few distinct shapes to split "
+				"that into a fixed and a per byte part\n");
+		}
+	}
 	if (g->slow_n)
 		fprintf(stderr,
 			"charsiu NPU: %lu of %lu submits came in under %.1f "
@@ -1455,6 +1748,26 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e->k_slices = ks;
 	e->n_npu = e_n_npu;
 	/*
+	 * WHAT EACH CORE ENDED UP WITH, counted where the assignment is made.
+	 *
+	 * The loop above alternates the slices, which balances them by COUNT
+	 * and not by bytes -- so a tensor with a runt K slice is uneven and the
+	 * call waits for the fuller core. TinyLLAMA's down_proj is the case in
+	 * this tree: k = 5632 cuts into five 1024 slices and one of 512, and
+	 * `di = ki & 1` hands device 0 slices 0, 2 and 4 for 3.146 MB against
+	 * device 1's 2.621. (That one cannot be improved -- five whole slices
+	 * and a half do not divide evenly however they are dealt -- but the
+	 * next shape might, and nothing could see it before this.)
+	 */
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *sl = &g->slot[e->first + i];
+		unsigned d = sl->di < 2 ? sl->di : 0;
+
+		e->nt_dev[d]++;
+		e->mb_dev[d] += (double)sl->job.mm.k * (double)sl->job.mm.n
+			      / (g->w4 ? 2.0 : 1.0) / 1e6;
+	}
+	/*
 	 * THE CPU'S ROWS, PACKED TWO WEIGHTS TO A BYTE.
 	 *
 	 * Reading the CPU's share at one byte a code would cost twice the bytes
@@ -1516,6 +1829,60 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			((now_us() - g->t_first) - g->add_us) / 1000.0);
 	}
 	return (int)g->n_ent++;
+}
+
+/*
+ * ONE CALL'S GEOMETRY AND ONE CALL'S WALL CLOCK, INTO THE FIT.
+ *
+ * The three terms the report solves for -- a cost per call, a cost per chained
+ * task and a cost per megabyte -- are not separable from any single run of the
+ * decode loop, because a real model only ever presents five or six shapes and
+ * each of them varies all three at once. They ARE separable across those five,
+ * which is what least squares is for, so every call drops its (tasks, MB, us)
+ * into the normal equations and the report solves them at the end.
+ *
+ * ⚠ THE MAX, NOT THE SUM. The devices are submitted before either is waited
+ * on, so a call ends when the SLOWER core finishes; charging it the total would
+ * fit a line to a quantity the clock never measured.
+ *
+ * ⚠ AND THE MEGABYTES ARE THE HARDWARE'S OWN. mb_dev is summed from the slices'
+ * mm.k * mm.n at the device's own weight width, so the CPU's rows under
+ * CHARSIU_NPU_CPU_FRAC are already out of it and int4 is already halved -- the
+ * mistake that made every int4 GB/s in this project double the real figure for
+ * three rounds.
+ */
+static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
+			 double us)
+{
+	double mb[2] = { 0.0, 0.0 }, hm;
+	double nt[2] = { 0.0, 0.0 }, ht;
+	unsigned i;
+
+	for (i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+
+		mb[0] += e->mb_dev[0];
+		mb[1] += e->mb_dev[1];
+		nt[0] += e->nt_dev[0];
+		nt[1] += e->nt_dev[1];
+	}
+	hm = mb[0] > mb[1] ? mb[0] : mb[1];
+	ht = nt[0] > nt[1] ? nt[0] : nt[1];
+
+	g->calls++;
+	g->tasks_hi += (unsigned long)ht;
+	g->mb_hi += hm;
+
+	g->f_n  += 1.0;
+	g->f_t  += ht;
+	g->f_m  += hm;
+	g->f_tt += ht * ht;
+	g->f_tm += ht * hm;
+	g->f_mm += hm * hm;
+	g->f_y  += us;
+	g->f_ty += ht * us;
+	g->f_my += hm * us;
+	g->f_yy += us * us;
 }
 
 int charsiu_npu_matvec(struct charsiu_npu *g, int id,
@@ -1735,7 +2102,6 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				charsiu_bo_fini(g->dev[d], &e->out[d]);
 		g->fini_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
-		g->busy_us += now_us() - t0;
 
 		/*
 		 * The limit scales with what the submit fetches, or a legitimate
@@ -1745,6 +2111,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		{
 			double took = now_us() - t0;
 			double gbs = e->weight_mb / took * 1e3;
+
+			/*
+			 * ⚠ ONE CLOCK READ FEEDS BOTH. busy_us used to take its
+			 * own a few hundred nanoseconds before this block took
+			 * this one, which is nothing against a 400 us call and
+			 * is still two different numbers for one quantity. The
+			 * fit and the total have to be the SAME measurement or
+			 * a residual between them means nothing.
+			 */
+			g->busy_us += took;
+			account_call(g, &id, 1, took);
 
 			if (took > g->slow_us * (g->nochain ? e->count : 1)
 				  + e->weight_mb * 1000.0)
@@ -3282,7 +3659,20 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	}
 	g->copy_us += now_us() - t1 - fspent;
 	g->fini_us += fspent;
-	g->busy_us += now_us() - t0;
+	{
+		/*
+		 * ⚠ THE GROUP IS ONE CALL, and that is the whole reason it
+		 * exists: q, k and v share a submit and a fence, so charging
+		 * the fit three calls' fixed cost for one fence would say
+		 * grouping bought nothing. account_call sums the three entries
+		 * per device and takes the busier one, which is exactly what
+		 * the clock below measured.
+		 */
+		double took = now_us() - t0;
+
+		g->busy_us += took;
+		account_call(g, ids, n, took);
+	}
 	g->call_us += now_us() - tcall;
 	/*
 	 * ⚠⚠ CLEAR THE BREADCRUMB ON THE WAY OUT, or it outlives the function

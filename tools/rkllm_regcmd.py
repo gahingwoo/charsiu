@@ -13,9 +13,23 @@ Each stream entry is a little-endian u64:
 
     [63:48] target   [47:16] value   [15:0] register
 
-with targets 0x0201 CNA, 0x0801 CORE, 0x1001 DPU, 0x2001 DPU_RDMA, 0x0041 sync
-and 0x0081 broadcast. A stream is a maximal run of such words, and every op the
-model runs is one of them.
+with targets 0x0201 CNA, 0x0801 CORE, 0x1001 DPU, 0x2001 DPU_RDMA, 0x0401 the
+block at 0x2810, 0x0041 sync and 0x0081 broadcast. A stream is a maximal run of
+such words, and every op the model runs is one of them.
+
+⚠ 0x0401 WAS MISSING AND IT CUT EVERY OP INTO THREE. The vendor writes five
+words at 0x2810..0x2820 between its CNA registers and its DPU ones, and a
+target this table does not know ENDS the run: one op came back as a 47 word CNA
+stream, a lost fragment, and a 71 word DPU stream. Two things followed. The
+five registers read as "charsiu only" in a stream diff when the vendor writes
+them too, and every consumer had to guess which DPU stream belonged to which
+convolution. With it listed, one op is one 123 word run.
+
+⚠ THE COUNTS THIS PRINTS CHANGED WITH THAT FIX, so a number quoted from an
+older run will not match: Llama-3.2-1B goes from 21532 streams (8808 conv,
+12724 DPU only) to 13224 (8808 conv, 4416 DPU only). The convolution count and
+every shape census are UNCHANGED -- 8808 either way, and the int4 M=1 census is
+the same 512 in the same four shapes -- because the fix only stops splitting.
 
 Address registers in a static file are unpatched placeholders and read 0, which
 is why this reports geometry and never addresses.
@@ -32,7 +46,7 @@ from collections import Counter
 import numpy as np
 
 TARGETS = {0x0201: "CNA", 0x0801: "CORE", 0x1001: "DPU",
-           0x2001: "RDMA", 0x0041: "SYNC", 0x0081: "BCAST"}
+           0x2001: "RDMA", 0x0401: "U28", 0x0041: "SYNC", 0x0081: "BCAST"}
 
 # The CNA geometry registers, named from the RK3576 conv work in
 # github.com/gahingwoo/linux-rk3576-npu.
