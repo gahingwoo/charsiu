@@ -219,6 +219,11 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	double bprep_us;	/* buffers and the output zero, before any of it */
+	unsigned char *bseen;	/* which n slices of Y have been written */
+	unsigned bseen_n;
+	double balloc_us;	/* the output BO allocation, inside prep */
+	unsigned balloc_n;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -832,6 +837,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bq);
 	free(g->bd1);
 	free(g->bmap);
+	free(g->bseen);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
@@ -1679,6 +1685,59 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * decode, which uses none of them.
  */
 /*
+ * ⚠⚠ AN ODD BATCH WIDTH HAS NO EXPRESSION ON THIS SURFACE, and that is a
+ * property of the layout rather than a pattern in the measurements.
+ *
+ * charsiu_acc_index -- the read order, in src/job.c -- was linked into a
+ * standalone exhaustive checker and swept over m = 2..96 crossed with n = 512,
+ * 2048 and 8192, asking four things of every (m, n): that every index lands in
+ * range, that no two slots collide, that no slot is left unwritten, and that
+ * the four consecutive slots the gather relies on stay consecutive. With no
+ * exceptions at all:
+ *
+ *   m EVEN   a clean bijection, four in a row intact
+ *   m ODD    a COLLISION, at every n
+ *
+ * And it cannot be repaired by fitting a constant. In the roleswap2 branch the
+ * map covers 64 * P slots per group where the group needs 32 * m, so it fits
+ * only when 64P == 32m, i.e. only when P == m/2 -- and no integer P exists for
+ * an odd m. The surface is organised in PAIRS OF ROWS. An odd width is not a
+ * width this arrangement can name.
+ *
+ * ⚠⚠ WHICH SEPARATES TWO FAULTS THAT WERE BEING READ AS ONE, and conflating
+ * them is what made this take four rounds:
+ *
+ *   m = 31, odd          0 of 6975 rows on phi3, 0 of 8587 on gemma4. THE READ
+ *                        ORDER, and now proven offline rather than inferred
+ *                        from wrong text.
+ *   m = 2, 4, 16, 32,    exact on the board, worst relative 1.6e-04 over 225
+ *   48, 64, 80           to 277 real tensors. Even, as the proof requires.
+ *   m = 8, even          871 rows of 904 with two cores and 904 of 904 under
+ *                        CHARSIU_NPU_ONEDEV. NOT the read order -- the read
+ *                        order is a bijection there. The core pair, which is
+ *                        its own fault with its own refusal below.
+ *
+ * This also explains four models at once. Llama-3.2-1B's 65 token prompt used
+ * to chunk to 32, 32 and a tail of 1, which is below the batching minimum and
+ * went to the token loop, and its text has always been right. Phi-3.5's 87
+ * tokens chunked to 32, 32, 23 and Gemma-4-E2B's 88 to 32, 32, 24 -- and only
+ * the odd one produces wrong text. The fault was never the model, it was the
+ * last chunk.
+ *
+ * ⚠⚠ AND THE REFUSAL IS THE SAFETY NET, NOT THE OPTIMISATION. A width this
+ * says no to falls back to a row at a time, which is what int4 did before any
+ * of the batched path existed and is correct. So the worst case of this
+ * predicate being too narrow is SLOW, never wrong. What turns the law into
+ * speed is the chunker in tools/charsiu_run.c, which only ever asks for widths
+ * this accepts; if the two ever fall out of step the result is a refused chunk
+ * run a row at a time -- a slower prefill and the same text.
+ */
+static int w4_width_expressible(unsigned m)
+{
+	return (m % 2) == 0;
+}
+
+/*
  * Both switches or neither. An int4 batch on the height axis is the wrong
  * answer at a very good speed, which is the one failure mode this tree has
  * already shipped once.
@@ -1705,6 +1764,35 @@ static const char *w4_batch_why_not(unsigned m)
 	if (!charsiu_m_axis_wide_for(1))
 		return "int4 batches on the width axis and this asked for height";
 	/*
+	 * ⚠⚠ THE PROBE HAS TO BE ABLE TO ASK ABOUT THE WIDTHS THAT ARE
+	 * REFUSED, because asking is how every line of the table above was
+	 * measured and is the only way it will be re-measured. 23 and 31 are
+	 * widths the runtime will never choose again, and they are precisely
+	 * the widths the next round has to hand the hardware.
+	 *
+	 * CHARSIU_NPU_W4_ANYM=1 lifts the width rule entirely, m = 8 included,
+	 * and nothing but a probe should ever set it. It does NOT lift the axis
+	 * check above: the height axis is the arrangement five rounds proved
+	 * writes one row, and reaching that deliberately has its own switch,
+	 * for the same reason this one has its own name -- a round that sets a
+	 * switch for one reason must not quietly get a second meaning with it.
+	 */
+	if (getenv("CHARSIU_NPU_W4_ANYM"))
+		return NULL;
+	/*
+	 * ⚠⚠ TWO REFUSALS, TWO REASONS, AND THEY ARE NOT THE SAME FAULT. The
+	 * odd widths are the accumulator read order and are proven wrong
+	 * offline; m = 8 is the core pair and the read order is a clean
+	 * bijection there. Giving them one shared string is exactly the
+	 * conflation that cost four rounds -- a round reading "the width is
+	 * refused" cannot tell which of the two it just hit.
+	 */
+	if (!w4_width_expressible(m))
+		return "an odd batch width, which the accumulator read order "
+		       "cannot express: the surface is organised in pairs of "
+		       "rows, and 64*P slots per group can only equal the 32*m "
+		       "it needs when m is even";
+	/*
 	 * ⚠⚠ m = 8 IS THE ONE WIDTH THAT IS STILL WRONG, and the board named
 	 * it rather than leaving it as a count.
 	 *
@@ -1717,9 +1805,109 @@ static const char *w4_batch_why_not(unsigned m)
 	 * One shape and one row is a small enough target to find. Until it is
 	 * found this refuses the width, and the caller falls back to a row at
 	 * a time for that chunk, which is correct and merely slower.
+	 *
+	 * ⚠⚠ IT NEEDS BOTH NUMBERS, AND THAT IS THE WHOLE SHAPE OF IT. m = 8
+	 * is exact at n = 512 and n = 2048; n = 8192 is exact at m = 2, 4, 16,
+	 * 32, 48, 64 and 80. Neither number is wrong on its own, so nothing
+	 * that is a function of only one of them can be the cause -- which is
+	 * most of this path, and a desktop round retired it:
+	 *
+	 *   the read order      A BIJECTION at all 32 (m, n) the probe runs,
+	 *                       and it does not take n at all, so it cannot be
+	 *                       n-selective. See charsiu_acc_index.
+	 *   the input packing   a function of m and k. gate/up share k = 2048
+	 *                       with attn_q, attn_o and the head, which are
+	 *                       exact at m = 8.
+	 *   the register stream SEPARABLE: emitted over m of 2..80 crossed with
+	 *                       n of 512, 2048, 5376 and 8192, every one of its
+	 *                       148 words moves with m or with n and none with
+	 *                       both -- 0 joint entries. Stronger, NOT ONE WORD
+	 *                       of the m=8 n=8192 stream is a word the board
+	 *                       has not already run correctly at some other
+	 *                       shape.
+	 *   0x40b8              4*T - W on 3328 of 3328 vendor int4 streams,
+	 *                       which is 3*M for a single chunk. Confirmed, not
+	 *                       fitted.
+	 *
+	 * What is left is the OUTPUT SURFACE, the one object that is a function
+	 * of m and n together. And even there the size is not it: (m=8,
+	 * n=8192) and (m=32, n=2048) are both 262144 bytes and the second is
+	 * exact, so the fault is not m*n -- it wants the two separately.
+	 *
+	 * ⚠ TWO CONTROLS, EACH ONE ENVIRONMENT VARIABLE, EACH ABLE TO FAIL:
+	 *
+	 *   CHARSIU_NPU_ONEDEV=1   both K slices of a tensor go to one core
+	 *                          instead of running concurrently on two.
+	 *                          Round 362 measured two cores corrupting each
+	 *                          other through the shared CBUF, and the
+	 *                          batched path submits both before waiting on
+	 *                          either -- concurrency is its design. If m=8
+	 *                          comes back exact on one core the fault is
+	 *                          the pair, not the shape.
+	 *   CHARSIU_NPU_NMAX=4096  slice n = 8192 in two. The vendor's widest
+	 *                          int4 dispatch in the whole .rkllm is 4096
+	 *                          output channels -- ours is the only shape
+	 *                          that asks for twice that. If m=8 comes back
+	 *                          exact the fault is the width.
+	 *
+	 * Both need this refusal lifted to say anything, and that is what
+	 * CHARSIU_NPU_W4_M8=1 is for: its own name rather than a second meaning
+	 * for CHARSIU_NPU_W4_BATCH, so a round that sets the batch switch for
+	 * some other reason cannot quietly also let the broken width through.
+	 * Nothing but a control should ever set it.
+	 *
+	 * ⚠⚠ AND THE READ ORDER LINE ABOVE IS NOW SETTLED RATHER THAN
+	 * ARGUED. The exhaustive sweep of charsiu_acc_index over m = 2..96 and
+	 * n = 512, 2048 and 8192 makes it a bijection at EVERY even width, m =
+	 * 8 included, with the four-in-a-row property intact. So m = 8 is not
+	 * the read order, and it is not the same fault as the odd widths
+	 * refused above -- which is why it keeps its own reason string and its
+	 * own switch.
 	 */
-	if (m == 8)
-		return "int4 at m=8 misses row 0 of the n=8192 tensors";
+	/*
+	 * ⚠⚠ AND IT IS NOT ONLY m = 8. THE DENSE SWEEP FOUND m = 10 TOO, with
+	 * the same signature, and this refusal was one width wide when it
+	 * shipped.
+	 *
+	 * Llama-3.2-1B, first 8 staged tensors, both cores, widths 2..64:
+	 *
+	 *   2  16/16    4  32/32    6  48/48   12  96/96   14 112/112  ok
+	 *   8  62/64   10  79/80                                       NOT
+	 *   every odd width  0 of N                                    NOT
+	 *
+	 * and the misses at both 8 and 10 are ROW 0 of the n = 8192 tensors --
+	 * blk.0.ffn_gate at m = 8, blk.0.ffn_up at m = 10. One shape, one row,
+	 * two widths. So the second fault is not "m = 8"; it is something
+	 * about row 0 of a wide output that fires at some small even widths,
+	 * and 8 was simply the first one anybody asked about.
+	 *
+	 * ⚠ WHICH MEANS THIS LIST IS A RECORD OF WHAT HAS BEEN MEASURED, NOT A
+	 * RULE. A width missing from it has been measured exact; a width the
+	 * board has never seen is trusted on the layout proof alone, and m =
+	 * 10 is the standing evidence that the layout proof is not enough by
+	 * itself. Widen it the moment a sweep names another.
+	 *
+	 * 🏁 AND IT IS THE CORE PAIR, WITH THE DENSE SWEEP'S SECOND ARM AS THE
+	 * PROOF RATHER THAN A GUESS.
+	 *
+	 *   m       two cores          one core (CHARSIU_NPU_ONEDEV=1)
+	 *   8       62 of 64           64 of 64, worst 0.00e+00
+	 *   10      79 of 80           80 of 80, worst 0.00e+00
+	 *   12..62  exact              exact
+	 *   odd     0 of N             0 of N   <- unchanged, so it is NOT this
+	 *
+	 * and the uncapped m = 8 pass over all 113 tensors: 33 MISS on two
+	 * cores, ZERO on one. Every one of the 33 is k=2048 n=8192 row 0.
+	 *
+	 * So this is two cores stepping on row 0 of a wide output, at some
+	 * small even widths, and nothing about the width itself. One core
+	 * makes it bit identical. That is not the fix -- the pool opens one
+	 * device for the whole run or two, so "one core for m = 8 only" is not
+	 * a switch that exists -- but the chunker never emits 8 or 10 anyway,
+	 * so this refusal is the net under a width that should never arrive.
+	 */
+	if ((m == 8 || m == 10) && !getenv("CHARSIU_NPU_W4_M8"))
+		return "int4 at m=8 and m=10 misses row 0 of the n=8192 tensors";
 	return NULL;
 }
 
@@ -1778,6 +1966,20 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	return 0;
 }
 
+/*
+ * ⚠⚠ THE SEGMENTS HAVE TO ADD UP, and for a while they did not.
+ *
+ * At m = 32 the four of them came to 451 ms of a 606 ms batched matmul and the
+ * other 155 was unnamed -- 26%, four times the fence. Optimising a 44% share
+ * while a 26% one has no name is how this tree has been caught before, so
+ * `prep` is the fifth: everything from entry to the first packed byte, which
+ * is batch_bufs, the output allocation and the memset of Y.
+ *
+ * ⚠ AND IT MAY BE MOSTLY THE PROBE. The output buffer is allocated when
+ * e->bout_m < m, so a sweep that walks m reallocates every tensor at every
+ * width while a real prefill, whose chunk is one fixed 32, pays it once. This
+ * counter is what tells those apart instead of leaving it to be argued.
+ */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset)
 {
@@ -1789,12 +1991,78 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
+double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset)
+{
+	double v = g->bprep_us / 1e3;
+
+	if (reset)
+		g->bprep_us = 0.0;
+	return v;
+}
+
+double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
+{
+	double v = g->balloc_us / 1e3;
+
+	if (n)
+		*n = g->balloc_n;
+	if (reset) {
+		g->balloc_us = 0.0;
+		g->balloc_n = 0;
+	}
+	return v;
+}
+
+/*
+ * ⚠⚠ ON BY DEFAULT SINCE 2026-08-30, BECAUSE THE PARALLEL DEFAULT WAS WRONG
+ * 13 RUNS IN 16.
+ *
+ * phi3 at width 24, sixteen repeats an arm, on a freshly booted board with no
+ * NPU timeout anywhere in the round:
+ *
+ *   default (two cores, overlapped)     13 of 16 WRONG
+ *   onedev  (one core)                   0 of 16
+ *   serial  (two cores, never at once)   0 of 16
+ *
+ * The overlap is the fault. Serialising costs a batched projection's
+ * parallelism and keeps decode's second core, which CHARSIU_NPU_ONEDEV does
+ * not -- decode measured 14.70 tok/s on two cores against 9.71 on one, so
+ * giving the core up for the whole process was never an acceptable answer.
+ *
+ * CHARSIU_NPU_BATCH_PARALLEL=1 puts the overlap back. It exists to price this
+ * and to reproduce the fault, NOT as a configuration to run: it is the arm
+ * that returns wrong text.
+ */
+static int batch_serial(void)
+{
+	static int z = -1;
+
+	if (z < 0) {
+		const char *e = getenv("CHARSIU_NPU_BATCH_PARALLEL");
+
+		z = !(e && *e != '0');
+	}
+	return z;
+}
+
+static int batch_zero(void)
+{
+	static int z = -1;
+
+	if (z < 0) {
+		const char *e = getenv("CHARSIU_NPU_BATCH_ZERO");
+
+		z = e && *e != '0';
+	}
+	return z;
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
 	struct npu_entry *e;
 	struct charsiu_joblist jl;
-	double t0;
+	double t0, tprep = now_us();
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
 		return -1;
@@ -1902,8 +2170,36 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		 * makes attn_q pay the head's cache maintenance on every call.
 		 */
 		g->bout_stride = (size_t)wide * m * 4;
+		/*
+		 * ⚠⚠ IS THIS THE PROBE OR IS IT REAL? The output buffer is
+		 * allocated only when this tensor has never been asked for this
+		 * many rows, so a sweep that walks m reallocates all 113 of
+		 * them at every width while a real prefill, whose chunk is one
+		 * fixed 32, pays it on the first chunk and never again.
+		 *
+		 * `prep` was 26% of a batched matmul and removing the zero of Y
+		 * -- which was the whole of the hypothesis -- moved it 12%. So
+		 * the rest is this, or it is not, and counting is cheaper than
+		 * another round of arguing about a linear curve.
+		 */
+		/*
+		 * ⚠⚠ GIVE THE OLD ONE BACK FIRST. charsiu_bo_alloc overwrites
+		 * the handle and the mapping in place, so widening leaked both
+		 * -- an mmap, a GEM handle and its IOVA, per tensor per device,
+		 * every time m grew.
+		 *
+		 * A prefill never notices: its chunk is one fixed width and
+		 * this runs once. The probe sweeps 2, 4, 8, 16, 32, 48, 64, 80
+		 * over 113 tensors on two devices, and the arithmetic on this
+		 * model is about 840 MB of IOVA thrown away in one run -- on
+		 * top of 620 MB of weights, against a 32 bit window the batched
+		 * path narrows addresses into without checking.
+		 */
 		if (e->bout_m < m) {
+			double ta = now_us();
+
 			for (unsigned d = 0; d < g->ndev; d++) {
+				charsiu_bo_free(g->dev[d], &e->bout[d]);
 				if (charsiu_bo_alloc(g->dev[d],
 						     g->bout_stride * most + 4096,
 						     &e->bout[d])) {
@@ -1914,10 +2210,64 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				}
 			}
 			e->bout_m = m;
+			g->balloc_us += now_us() - ta;
+			g->balloc_n++;
 		}
 	}
 
-	memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
+	/*
+	 * ⚠⚠ THE ZERO OF Y WAS 26% OF A BATCHED MATMUL, and it was a whole
+	 * extra pass over the output for nothing.
+	 *
+	 * The gather accumulates -- `yr[j] += ...` -- because a tensor's K
+	 * slices each contribute a partial sum, so Y had to start at zero. At
+	 * m = 32 on Llama-3.2-1B that is 64.6 MB zeroed and then 64.6 MB
+	 * written, and the board measured the zero at 155 ms of a 600 ms
+	 * matmul: 417 MB/s, the same rate at every width, which is what says
+	 * it is the memset and not the allocation beside it.
+	 *
+	 * So the FIRST contribution to an output range assigns and the rest
+	 * accumulate, and nothing is zeroed but a byte per n slice.
+	 *
+	 * ⚠ THE FLAG IS PER OUTPUT RANGE, NOT PER K SLICE, and that is not a
+	 * detail. Slices go to the two devices as `(ki * ns + ni) & 1`, so for
+	 * an odd ns the same output range's ki = 0 and ki = 1 land on
+	 * DIFFERENT devices -- and the read loop walks devices outermost, so
+	 * ki = 1 can be read first. "ki == 0 assigns" would have clobbered it.
+	 */
+	if (g->bseen_n < e->n_slices) {
+		unsigned char *t2 = realloc(g->bseen, e->n_slices);
+
+		if (!t2) {
+			whine(g, "the first-write flags would not allocate",
+			      e->n_slices, 0);
+			return -1;
+		}
+		g->bseen = t2;
+		g->bseen_n = e->n_slices;
+	}
+	memset(g->bseen, 0, e->n_slices);
+	/*
+	 * ⚠⚠ THE CONTROL FOR ALL OF THE ABOVE, because assign-on-first-write
+	 * is the one thing here that can hand back a caller's stale buffer.
+	 *
+	 * If an output range never gets a first write -- a slice skipped, a
+	 * count off by one, a flag set for a range nothing covers -- then with
+	 * the memset gone Y keeps whatever was in it, and what was in it is
+	 * the PREVIOUS token's answer. That is invisible on a fresh buffer, it
+	 * is invisible whenever the stale value happens to be close, and it
+	 * looks exactly like the intermittent wrong text gemma4 and phi3 are
+	 * producing: right ten runs, then a sentence about practicing.
+	 *
+	 * CHARSIU_NPU_BATCH_ZERO=1 puts the whole-buffer zero back. It costs
+	 * the 26% this optimisation bought and it decides the question: if the
+	 * text goes right and STAYS right, the first-write bookkeeping is
+	 * wrong; if it stays wrong, this whole family is excluded and nobody
+	 * has to think about it again.
+	 */
+	if (batch_zero())
+		memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
+	g->bprep_us += now_us() - tprep;
 	t0 = now_us();
 
 	/*
@@ -2041,6 +2391,38 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		}
 		g->submits++;
 		g->bsub_us += now_us() - tp;
+		/*
+		 * ⚠⚠ THE CORE PAIR, AND THE ONE KNOB THAT REMOVES IT.
+		 *
+		 * Batched w4a16 is bit exact on ONE core and wrong on two, and
+		 * the board has now said so three ways: m = 8 is 62 of 64 on two
+		 * cores and 64 of 64 at worst 0.00e+00 on one; m = 10 is 79 of
+		 * 80 against 80 of 80; and phi3 at width 24 is wrong 26 runs of
+		 * 32 across two two-core arms and 0 of 16 on one core. The 33
+		 * misses of the uncapped m = 8 pass are all ROW 0 of the n =
+		 * 8192 tensors, and one core has none of them.
+		 *
+		 * The two cores share the CBUF and take different windows
+		 * (charsiu_job.cbuf_window = di), so the collision is not the
+		 * window index. What it IS has not been found, and the shape of
+		 * the evidence says it does not have to be: the loop above puts
+		 * both devices in flight at once, which is right for decode --
+		 * m = 1 has never shown this -- and is the only thing a batched
+		 * submit does that a single one does not.
+		 *
+		 * Waiting on each device before submitting the next means the
+		 * two never run together. That is ON by default now: the board
+		 * round that priced it found the overlapped default wrong 13 of
+		 * 16 and the serialised one 0 of 16, on the same freshly booted
+		 * card, in the same minute. CHARSIU_NPU_BATCH_PARALLEL=1 puts
+		 * the overlap back, and returns wrong text when it does.
+		 */
+		if (batch_serial() && g->ndev > 1) {
+			double tf = now_us();
+
+			charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
+			g->bfence_us += now_us() - tf;
+		}
 	}
 
 	/* ⚠ both submitted, then both waited on: that is the point */
@@ -2141,6 +2523,8 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					float *yr = Y + (size_t)r * e->t->n
 						  + s->n0;
 					unsigned n4 = sn / 4, j;
+					unsigned ni = s->n0 / g->nmax;
+					int firstw = !g->bseen[ni];
 
 					/*
 					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
@@ -2149,49 +2533,115 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 					 * own base rather than reading a table
 					 * entry that may not exist.
 					 */
+/*
+					 * ⚠ THE BRANCH IS OUTSIDE THE LOOP, and
+					 * it cannot be a multiply by zero: Y is
+					 * the caller's buffer and a bit pattern
+					 * in untouched memory can be a NaN,
+					 * which times zero is a NaN and not a
+					 * zero.
+					 *
+					 * ⚠⚠ AND A NEON FORM OF THIS WAS
+					 * WRITTEN, MEASURED AND TAKEN OUT.
+					 *
+					 * The four are one vector, so a run is
+					 * vld1q from one index, vmulq, vst1q,
+					 * and it was bit identical to this --
+					 * checked, including the rounding,
+					 * because the C here is a multiply then
+					 * an add and an fmla rounds once where
+					 * it rounds twice. On this toolchain
+					 * mul-then-add differs from the C in 0
+					 * of a million and fmla in 227529, so
+					 * the C is not contracted and the
+					 * vector form matched.
+					 *
+					 * The board moved by NOTHING: read was
+					 * 223, 320, 555 ms at m of 32, 48 and
+					 * 80 before it and 229, 337, 580 after.
+					 *
+					 * ⚠ AND THE ARITHMETIC SAYS WHY, which
+					 * is the part worth keeping. The gather
+					 * moves about 403 MB at m = 32 and 1007
+					 * at m = 80 -- Y once per K slice, read
+					 * and written -- in 229 and 580 ms,
+					 * which is 1.76 and 1.74 GB/s, the same
+					 * rate at both. A run is 16 BYTES and a
+					 * cache line is 64, and the runs are
+					 * scattered, so the DRAM sees four
+					 * times that: about 7 GB/s against this
+					 * board's 9.4 roof, 75% of it.
+					 *
+					 * It was never instruction bound.
+					 * Fewer instructions cannot help and
+					 * the only lever left is fewer BYTES:
+					 * walking the source sequentially and
+					 * scattering into Y would use whole
+					 * lines instead of a quarter of each.
+					 */
+#define GATHER4(OP, VAL)                                                     \
+					for (j = 0; j < n4; j++) {           \
+						float *yp = yr + j * 4;      \
+						VAL;                         \
+						yp[0] SC_##OP v0;            \
+						yp[1] SC_##OP v1;            \
+						yp[2] SC_##OP v2;            \
+						yp[3] SC_##OP v3;            \
+					}
+#define SC_ASSIGN  =
+#define SC_ADD     +=
+#define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
+	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
+		   v2 = fp[2]*cp[2], v3 = fp[3]*cp[3]
+#define W4   const float *fp = fo + mp[j];                                   \
+	     float v0 = fp[0], v1 = fp[1], v2 = fp[2], v3 = fp[3]
+#define I8   const int32_t *ip = io + mp[j];                                 \
+	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
+		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
 					if (g->w4 && grp) {
 						const float *sc = s->sc;
 
-						for (j = 0; j < n4; j++) {
-							const float *fp = fo + mp[j];
-							float *yp = yr + j * 4;
-							const float *cp = sc + j * 4;
+						if (firstw) { GATHER4(ASSIGN, W4G) }
+						else        { GATHER4(ADD, W4G) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4] * sc[j];
 
-							yp[0] += fp[0] * cp[0];
-							yp[1] += fp[1] * cp[1];
-							yp[2] += fp[2] * cp[2];
-							yp[3] += fp[3] * cp[3];
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
 						}
-						for (j = n4 * 4; j < sn; j++)
-							yr[j] += fo[mp[j / 4] + j % 4] * sc[j];
 					} else if (g->w4) {
-						for (j = 0; j < n4; j++) {
-							const float *fp = fo + mp[j];
-							float *yp = yr + j * 4;
+						if (firstw) { GATHER4(ASSIGN, W4) }
+						else        { GATHER4(ADD, W4) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4];
 
-							yp[0] += fp[0];
-							yp[1] += fp[1];
-							yp[2] += fp[2];
-							yp[3] += fp[3];
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
 						}
-						for (j = n4 * 4; j < sn; j++)
-							yr[j] += fo[mp[j / 4] + j % 4];
 					} else {
 						float d1 = g->bd1[(size_t)ki * m + r];
 
-						for (j = 0; j < n4; j++) {
-							const int32_t *ip = io + mp[j];
-							float *yp = yr + j * 4;
+						if (firstw) { GATHER4(ASSIGN, I8) }
+						else        { GATHER4(ADD, I8) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = (float)io[mp[j / 4] + j % 4] * d1;
 
-							yp[0] += (float)ip[0] * d1;
-							yp[1] += (float)ip[1] * d1;
-							yp[2] += (float)ip[2] * d1;
-							yp[3] += (float)ip[3] * d1;
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
 						}
-						for (j = n4 * 4; j < sn; j++)
-							yr[j] += (float)io[mp[j / 4] + j % 4] * d1;
 					}
+#undef GATHER4
+#undef SC_ASSIGN
+#undef SC_ADD
+#undef W4G
+#undef W4
+#undef I8
 				}
+				/* ⚠ AFTER the row loop: every row of this slot
+				 * shares the flag, and setting it inside would
+				 * make row 0 assign and rows 1.. accumulate onto
+				 * whatever was in the caller's buffer. */
+				g->bseen[s->n0 / g->nmax] = 1;
 				nt++;
 			}
 		}

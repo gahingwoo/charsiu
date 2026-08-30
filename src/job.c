@@ -431,6 +431,31 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
 	 * 2.9e5, 9.7e3, 7.5e4, 1.7e5, 4.7e4 -- where its neighbours sit at 1e3.
 	 * Something else is wrong at that one width and this does not explain
 	 * it or claim to.
+	 *
+	 * ⚠⚠ AND THIS FUNCTION IS NOW EXCLUDED FROM IT, on the desktop, with a
+	 * check that could have failed.
+	 *
+	 * Two facts, and between them there is no room for the read order to be
+	 * the m = 8 fault:
+	 *
+	 *  1. IT IS A BIJECTION AT EVERY WIDTH AND EVERY WIDTH OF OUTPUT the
+	 *     probe reaches. m of 2, 4, 8, 16, 32, 48, 64 and 80 crossed with n
+	 *     of 512, 2048, 5376 and 8192: 32 shapes, every one covering
+	 *     [0, m*n) exactly once, no collision, no hole, nothing out of
+	 *     range, and the four-in-a-row property the gather relies on
+	 *     unbroken at every j.
+	 *
+	 *  2. IT DOES NOT TAKE n. The only way a channel enters is G = ni/32
+	 *     and (a, t) = the position inside a group of 32, so the map of an
+	 *     8192 wide slice restricted to its first 2048 channels IS the map
+	 *     of a 2048 wide one, group for group.
+	 *
+	 * The board says m = 8 is exact at n = 512 and n = 2048 and wrong at
+	 * n = 8192. By (2) this function cannot tell those apart, so whatever
+	 * is wrong is not in here. And by (1), at m = 8 the seven rows that ARE
+	 * exact consume seven eighths of the slots, so row 0's values -- if the
+	 * block wrote them into the surface at all -- can only be in the eighth
+	 * this expression already reads.
 	 */
 	if (swap == 2 || swap == 3) {
 		unsigned hi = swap == 3 ? mi / 2u : mi % P;
@@ -1559,6 +1584,37 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 *
 	 * `wide ? ow : rows` is M under both arrangements and is bit identical
 	 * on the height axis, where ow is 1 and rows is M.
+	 *
+	 * 🏁 AND THE VENDOR'S OWN FILE CONFIRMS IT, all 3328 int4 streams, with
+	 * no exception -- so 3 * M is not a fit to two board points any more.
+	 *
+	 * Their output block carries a CHUNK and a TOTAL, which is what makes
+	 * the rule visible. Reading the four registers that move across those
+	 * 3328 streams, with T = 0x401c and W = this stream's own width:
+	 *
+	 *   0x4018   output base + 16 * (this chunk's first position)   3328/3328
+	 *   0x401c   T, the TOTAL width, not this chunk's               3328/3328
+	 *   0x4028   T - W, the positions this chunk does not cover     3328/3328
+	 *   0x40b8   4 * T - W                                          3328/3328
+	 *   0x4020   W - 1, and 0x4034 the same
+	 *
+	 * They split a prefill and we do not: their (W, T) pairs are (32,32),
+	 * (64,64), (80,96), (16,96), (80,128), (48,128), (40,64), (24,64),
+	 * (40,96) and (40,128), so a 96 token prompt goes 80 then 16. charsiu
+	 * dispatches the whole width at once, which is T = W, and every one of
+	 * those registers collapses to what this file already emits: 0x4018 at
+	 * the base, 0x401c = M, 0x4028 = 0, and 0x40b8 = 4M - M = 3M.
+	 *
+	 * ⚠ THE int8 HEAD TAKES A DIFFERENT CONSTANT -- 7 * W, read off their
+	 * 8160 wide output head at W of 1, 32 and 64. The rule above is the
+	 * int4 one and the 3328 it holds on are exactly the int4 streams.
+	 *
+	 * ⚠ AND 16 BYTES A POSITION IS THE READ ORDER'S OWN CLAIM. 0x4018
+	 * stepping by 16 for each position skipped says consecutive rows sit
+	 * four floats apart in the output surface, which is what
+	 * charsiu_acc_index puts at (mi/2)*8 + (mi%2)*4. That is the first
+	 * confirmation of the row placement from something other than this
+	 * board.
 	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
 	{

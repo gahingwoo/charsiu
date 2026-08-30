@@ -5,6 +5,46 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+/*
+ * e^x four at a time, the cephes range reduction: n = round(x/ln2), then a
+ * degree six polynomial on the remainder and a shift of the exponent field.
+ * About 1e-7 relative, which is under a float's own last bit for these
+ * magnitudes.
+ *
+ * It exists for SiLU. The feed forward is 8192 wide and there are 16 of them,
+ * so a token asks for 131072 exponentials, and round 367 measured that at 3.08
+ * ms on the board -- 23 ns an element, more than the rmsnorms and the residuals
+ * and the rope put together.
+ */
+static inline float32x4_t charsiu_vexpq(float32x4_t x)
+{
+	const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
+	const float32x4_t ln2hi = vdupq_n_f32(0.693359375f);
+	const float32x4_t ln2lo = vdupq_n_f32(-2.12194440e-4f);
+	float32x4_t n, r, rr, y;
+	int32x4_t k;
+
+	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
+	n = vrndaq_f32(vmulq_f32(x, log2e));
+	r = vmlsq_f32(vmlsq_f32(x, n, ln2hi), n, ln2lo);
+	rr = vmulq_f32(r, r);
+
+	y = vdupq_n_f32(1.9875691500e-4f);
+	y = vmlaq_f32(vdupq_n_f32(1.3981999507e-3f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(8.3334519073e-3f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(4.1665795894e-2f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(1.6666665459e-1f), y, r);
+	y = vmlaq_f32(vdupq_n_f32(5.0000001201e-1f), y, r);
+	y = vaddq_f32(vmlaq_f32(r, y, rr), vdupq_n_f32(1.0f));
+
+	k = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
+	return vmulq_f32(y, vreinterpretq_f32_s32(vshlq_n_s32(k, 23)));
+}
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -254,6 +294,10 @@ int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
+/* the fifth segment: buffers and the output zero, before any packing */
+double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
+/* how much of prep is the output buffer allocation, and how often */
+double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);
@@ -287,6 +331,53 @@ void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
  */
 float charsiu_dot_f32(const float *a, const float *b, uint64_t n);
 void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
+
+/*
+ * x[i] <- e^(x[i] - m), in place, returning the sum -- the middle pass of every
+ * softmax in this tree, done in one read of the row instead of two.
+ *
+ * ⚠⚠ THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED. A ViT softmax is n^2 of
+ * them a head, and the vision tower is 1024 against 1024 over twelve heads and
+ * twelve layers: 151 million for one picture, against a feed forward's 131072 a
+ * token. glibc's expf measured 23 ns an element on the board.
+ *
+ * CHARSIU_EXACT_SOFTMAX forces glibc's correctly rounded expf back, which is
+ * the control the polynomial has to be diffed against.
+ */
+float charsiu_expsum_f32(float *x, uint64_t n, float m);
+
+/*
+ * acc[u][0..hd) += sum over j < nk of s[u][j] * v[j][0..hd), for a block of
+ * nq queries at once. Every operand takes its own row stride: the values arrive
+ * as [n][n_embd] and the scores as [nq][key_tile], and the accumulator is
+ * either a contiguous block or a slice of the output rows.
+ *
+ * ⚠ THE POINT IS THE ACCUMULATOR STAYING IN REGISTERS. One axpy per (query,
+ * key) pays two vector loads and a store for every FMA; holding four
+ * accumulators across the tile pays half a memory operation per FMA. Bit
+ * identical: the sum over j for any one output element is in the same order.
+ */
+void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
+		    uint64_t vstride, const float *s, uint64_t sstride,
+		    unsigned nq, unsigned nk, unsigned hd);
+
+/*
+ * s[u][j] = (q[u] . k[j]) * scale, for a block of queries against a block of
+ * keys. Same reason as charsiu_pv_f32 and the same shape of answer: a dot
+ * product per pair reloads both operands for every FMA, and four queries
+ * against two keys reuses each.
+ *
+ * ⚠ BIT IDENTICAL, INCLUDING THE LANES. dot_f32 sums in two vectors and
+ * reduces at the end; this keeps two accumulators per pair so it reproduces
+ * that exactly, which is what caps the block at 4 x 2 rather than 4 x 4.
+ */
+void charsiu_qk_f32(float *s, uint64_t sstride, const float *q,
+		    uint64_t qstride, const float *k, uint64_t kstride,
+		    unsigned nq, unsigned nk, unsigned hd, float scale);
+
+/* CHARSIU_PLAIN_ATTN: one pair at a time, the control for both of the above */
+void charsiu_attn_plain_set(int on);
+void charsiu_softmax_exact_set(int on);
 
 /* Dequantise one whole row into f32. Used for the token embedding lookup. */
 void gguf_row_f32(const struct gguf_tensor *w, uint64_t row, float *dst);
@@ -630,6 +721,15 @@ struct llama_state {
 	 */
 	float *bq, *bk, *bv, *bao;
 	float *bfreq;          /* m->rope_freqs, read once a prompt */
+	/*
+	 * gemma4's per layer embeddings, batched: bpl is [n][n_layer][n_embd_pl]
+	 * and bplg is the gate, [n][n_embd_pl], reused a layer at a time.
+	 *
+	 * ⚠ ONE SET A ROW, NOT ONE A CHUNK. s->pl above is per TOKEN -- it is
+	 * looked up from the token id and projected from that token's own
+	 * embedding -- so a chunk of 32 rows needs 32 of them, not one.
+	 */
+	float *bpl, *bplg;
 	/*
 	 * ⚠ MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
 	 * read each weight row once for all m. It is four times SLOWER than n

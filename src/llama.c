@@ -30,40 +30,11 @@
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
 /*
- * e^x four at a time, the cephes range reduction: n = round(x/ln2), then a
- * degree six polynomial on the remainder and a shift of the exponent field.
- * About 1e-7 relative, which is under a float's own last bit for these
- * magnitudes.
- *
- * It exists for SiLU. The feed forward is 8192 wide and there are 16 of them,
- * so a token asks for 131072 exponentials, and round 367 measured that at 3.08
- * ms on the board -- 23 ns an element, more than the rmsnorms and the residuals
- * and the rope put together.
+ * ⚠ e^x FOUR AT A TIME NOW LIVES IN THE HEADER, as charsiu_vexpq. It was
+ * written here for SiLU and the vision tower's softmax turned out to want it
+ * far more: a picture asks for 151 million exponentials against a feed
+ * forward's 131072 a token.
  */
-static inline float32x4_t vexpq(float32x4_t x)
-{
-	const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
-	const float32x4_t ln2hi = vdupq_n_f32(0.693359375f);
-	const float32x4_t ln2lo = vdupq_n_f32(-2.12194440e-4f);
-	float32x4_t n, r, rr, y;
-	int32x4_t k;
-
-	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
-	n = vrndaq_f32(vmulq_f32(x, log2e));
-	r = vmlsq_f32(vmlsq_f32(x, n, ln2hi), n, ln2lo);
-	rr = vmulq_f32(r, r);
-
-	y = vdupq_n_f32(1.9875691500e-4f);
-	y = vmlaq_f32(vdupq_n_f32(1.3981999507e-3f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(8.3334519073e-3f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(4.1665795894e-2f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(1.6666665459e-1f), y, r);
-	y = vmlaq_f32(vdupq_n_f32(5.0000001201e-1f), y, r);
-	y = vaddq_f32(vmlaq_f32(r, y, rr), vdupq_n_f32(1.0f));
-
-	k = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
-	return vmulq_f32(y, vreinterpretq_f32_s32(vshlq_n_s32(k, 23)));
-}
 #endif
 
 /*
@@ -176,7 +147,7 @@ static void silu_mul(float *hb, const float *hb2, uint32_t n)
 		for (; i + 4 <= n; i += 4) {
 			float32x4_t g = vld1q_f32(hb + i);
 			float32x4_t d = vaddq_f32(vdupq_n_f32(1.0f),
-						  vexpq(vnegq_f32(g)));
+						  charsiu_vexpq(vnegq_f32(g)));
 
 			vst1q_f32(hb + i, vmulq_f32(vdivq_f32(g, d),
 						    vld1q_f32(hb2 + i)));
@@ -564,23 +535,162 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 * and a chunk of 48, 64 or 80 is what a real prompt hands it.
 	 * --batch-probe N still caps this.
 	 */
-	static const unsigned MS[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
+	static const unsigned MS_DEFAULT[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
+	/*
+	 * ⚠⚠ THE WIDTHS A REAL PROMPT HANDS IT ARE NOT THIS LIST.
+	 *
+	 * phi3's prompt is 87 tokens, which at a chunk of 32 is 32, 32 and
+	 * TWENTY THREE -- a width this sweep has never asked about, on a model
+	 * whose text is wrong on the board while every width here is exact.
+	 * m = 8 was only ever found because 8 happened to be in the list.
+	 *
+	 * CHARSIU_PROBE_WIDTHS takes a space or comma separated list, so a
+	 * round can ask about 23, or sweep 2..32 dense and stop finding broken
+	 * widths by luck.
+	 */
+	unsigned ms_buf[64];
+	const unsigned *MS = MS_DEFAULT;
+	unsigned n_ms = sizeof(MS_DEFAULT) / sizeof(MS_DEFAULT[0]);
+	const char *wenv = getenv("CHARSIU_PROBE_WIDTHS");
+	/*
+	 * ⚠⚠ CHARSIU_PROBE_MAXT: HOW MANY STAGED TENSORS A WIDTH COSTS, which
+	 * is what stops a dense sweep from being affordable.
+	 *
+	 * The one row reference is O(m) matvecs per tensor and it runs over
+	 * every staged tensor, so a width costs m * 225 submits before the
+	 * batched side is even asked. At m = 32 the reference alone was
+	 * 5864 ms, and 2..64 dense is sixty three widths -- days, not a round.
+	 * Capping the tensors is the only term that can come down without
+	 * dropping widths, and dropping widths is the whole point of the
+	 * sweep.
+	 *
+	 * ⚠ IT TAKES THE FIRST N STAGED TENSORS, AND THAT IS A BIAS WITH A
+	 * SHAPE. The pool fills lazily in the order the first forward pass
+	 * touches things, so the first N are layer 0's projections -- q, k, v,
+	 * o, then gate, up, down -- and N = 8 reaches into layer 1. That is
+	 * deliberate: it still covers every DISTINCT (k, n) an ordinary layer
+	 * has, including the n = 8192 gate/up pair that m = 8 misses, so a
+	 * width broken the way m = 8 is broken still shows.
+	 *
+	 * What it drops is the OUTPUT HEAD, which is staged last and is the
+	 * one shape nothing else in the model resembles: 128256 channels
+	 * against 8192. A width that is wrong only on the head reads as PASS
+	 * under a cap, and the round after a capped sweep has to be an uncapped
+	 * one on whatever widths it left standing. The table says the cap, on
+	 * every row, so that argument is never made from a number that has
+	 * forgotten it.
+	 */
+	unsigned maxt = 0;
+	const char *tenv = getenv("CHARSIU_PROBE_MAXT");
 	float *X = NULL, *Y = NULL, *Yref = NULL;
 	struct charsiu_act a;
-	unsigned widest = 0;
+	unsigned widest = 0, n_staged = 0;
 	int rc = -1;
 
 	if (!s->pool.dev) {
 		fprintf(stderr, "charsiu: no NPU staged; nothing to batch\n");
 		return -1;
 	}
-	for (unsigned i = 0; i < s->pool.n; i++)
-		if (s->pool.id[i] >= 0 && s->pool.t[i].k > widest)
+	if (wenv && *wenv) {
+		unsigned n = 0, top = 0;
+		char *p = (char *)wenv;
+
+		const unsigned cap = sizeof(ms_buf) / sizeof(ms_buf[0]);
+
+		/*
+		 * ⚠⚠ EVERY WAY THIS CAN GO WRONG REFUSES OUT LOUD, and none of
+		 * them shortens the list quietly.
+		 *
+		 * The first draft stopped on a full buffer and stopped on the
+		 * first character it did not like, both without a word. So
+		 * "2 4 x 8" would have measured 2 and 4 and said it had done
+		 * what was asked, and a list of seventy widths would have lost
+		 * the last six -- which are the widest, the slowest to reach
+		 * and the whole reason for passing a list by hand.
+		 *
+		 * This project has now lost four rounds to output that was cut
+		 * without saying so. A probe whose ONE job is to ask an exact
+		 * question must not answer a smaller one.
+		 */
+		for (;;) {
+			while (*p == ' ' || *p == ',' || *p == '\t')
+				p++;
+			if (!*p)
+				break;
+			if (*p < '0' || *p > '9') {
+				fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS "
+					"stops making sense at \"%s\" -- "
+					"refusing rather than measuring the "
+					"part before it\n", p);
+				return -1;
+			}
+			if (n == cap) {
+				fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS "
+					"holds at most %u widths and there are "
+					"more after \"%s\" -- refusing rather "
+					"than dropping the widest ones\n",
+					cap, p);
+				return -1;
+			}
+			ms_buf[n] = (unsigned)strtoul(p, &p, 10);
+			if (ms_buf[n] < 2) {
+				fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS "
+					"asks for width %u, and 1 is the decode "
+					"path rather than a batch -- refusing\n",
+					ms_buf[n]);
+				return -1;
+			}
+			if (ms_buf[n] > top)
+				top = ms_buf[n];
+			n++;
+		}
+		/*
+		 * ⚠ AND THE LIST RAISES THE CAP. --batch-probe caps the sweep,
+		 * and a round that asks for width 87 under a cap of 80 gets 80
+		 * and a table that does not mention it. Asking explicitly is
+		 * the whole point of this switch.
+		 */
+		if (top > mmax)
+			mmax = top;
+		if (!n) {
+			fprintf(stderr, "charsiu: CHARSIU_PROBE_WIDTHS=\"%s\" "
+				"parsed to nothing; refusing to fall back to "
+				"the default list, because a round that "
+				"silently asks a different question is the "
+				"failure this probe exists to avoid\n", wenv);
+			return -1;
+		}
+		MS = ms_buf;
+		n_ms = n;
+	}
+	if (tenv && *tenv) {
+		maxt = (unsigned)strtoul(tenv, NULL, 10);
+		if (!maxt) {
+			fprintf(stderr, "charsiu: CHARSIU_PROBE_MAXT=\"%s\" "
+				"parsed to zero, which would check no tensors "
+				"at all; refusing rather than quietly walking "
+				"all of them, because a round that silently "
+				"asks a different question is the failure this "
+				"probe exists to avoid\n", tenv);
+			return -1;
+		}
+	}
+	for (unsigned i = 0; i < s->pool.n; i++) {
+		if (s->pool.id[i] < 0)
+			continue;
+		n_staged++;
+		if (s->pool.t[i].k > widest)
 			widest = (unsigned)s->pool.t[i].k;
+	}
 	/*
 	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
 	 * activation inside the timing loop and charged all of it to the one
 	 * row path, which is the side it was trying to beat.
+	 *
+	 * ⚠ AND IT IS SIZED OFF THE WIDEST STAGED TENSOR, NOT THE WIDEST
+	 * CHECKED ONE, so CHARSIU_PROBE_MAXT does not reach it. The cap is
+	 * about time; sizing this to the first N as well would make one switch
+	 * quietly change what the tensors it did not check could have been.
 	 */
 	if (charsiu_act_alloc(&a, (int)widest) < 0)
 		return -1;
@@ -594,13 +704,33 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 */
 	printf("\n  batching %u layers, checked before it is timed; widths",
 	       m->n_layer);
-	for (unsigned i = 0; i < sizeof(MS) / sizeof(*MS); i++)
+	for (unsigned i = 0; i < n_ms; i++)
 		if (MS[i] <= mmax)
 			printf(" %u", MS[i]);
 	printf("   (--batch-probe caps at %u)\n", mmax);
-	printf("    m  tensors    worst rel   rows that agree"
+	/*
+	 * ⚠⚠ A CAPPED ROUND MUST NEVER BE READABLE AS A FULL ONE. It is said
+	 * here in words and again in the tensors column on every single row,
+	 * because the line that gets pasted out of a round is a table row and
+	 * not a header, and "225" and "8" are both just a number until one of
+	 * them is written as a fraction of the other.
+	 */
+	if (maxt && maxt < n_staged)
+		printf("  ⚠ CHARSIU_PROBE_MAXT=%u: only the FIRST %u of %u"
+		       " staged tensors are checked. Those are layer 0's"
+		       " projections and the start of layer 1, so every shape"
+		       " an ordinary layer has is covered -- but NOT the output"
+		       " head, which is staged last and is the one shape"
+		       " nothing else resembles. A width that is exact here is"
+		       " exact on a layer, not on the model.\n", maxt, maxt,
+		       n_staged);
+	else
+		printf("  all %u staged tensors are checked"
+		       " (CHARSIU_PROBE_MAXT caps this)\n", n_staged);
+	printf("    m    tensors   worst rel   rows that agree"
 	       "     one row    batched  speedup  us a row    GB/s"
-	       "   where the batched time went, ms\n");
+	       "   where the batched time went, ms (prep is buffers and the"
+	       " output zero; rest is what none of them caught)\n");
 
 	/*
 	 * ⚠⚠ TWO AXES AND SEVEN READINGS, at m = 2 on one tensor, before any
@@ -968,9 +1098,11 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		}
 	}
 
-	for (unsigned y = 0; y < sizeof(MS) / sizeof(*MS); y++) {
+	for (unsigned y = 0; y < n_ms; y++) {
 		unsigned mr = MS[y], tested = 0, rows_ok = 0, rows_tot = 0;
+		unsigned seen = 0;		/* staged tensors reached, capped */
 		unsigned nbad = 0;		/* misses named, capped */
+		int whered = 0;			/* the where-did-it-go scan, once a width */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
@@ -979,6 +1111,8 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			double z;
 
 			charsiu_npu_batch_split(s->pool.dev, &z, &z, &z, &z, 1);
+			charsiu_npu_batch_prep(s->pool.dev, 1);
+			charsiu_npu_batch_alloc(s->pool.dev, NULL, 1);
 		}
 		for (unsigned i = 0; i < s->pool.n; i++) {
 			const struct npu_tensor *t = &s->pool.t[i];
@@ -986,6 +1120,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 
 			if (s->pool.id[i] < 0)
 				continue;
+			/*
+			 * ⚠ COUNTED HERE AND NOT OFF `tested`, which is
+			 * incremented at the BOTTOM of the body and is skipped
+			 * by the `continue` a failed matmul takes. A cap read
+			 * off it would let a width whose matmuls are all being
+			 * refused walk the whole pool paying the one row
+			 * reference for every tensor -- the single most
+			 * expensive thing here, spent on a width that measured
+			 * nothing.
+			 */
+			if (maxt && seen >= maxt)
+				break;
+			seen++;
 			nx = (size_t)mr * t->k;
 			ny = (size_t)mr * t->n;
 			X = realloc(X, nx * sizeof(*X));
@@ -1058,13 +1205,106 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * a count of 33 cannot say whether it is one
 				 * shape, one row index, or scattered. Eight
 				 * lines is enough to tell those apart.
+				 *
+				 * ⚠ FORTY, NOT EIGHT, AND THE ARITHMETIC IS
+				 * WHY. 33 was written down as "every ffn_gate
+				 * and ffn_up in the model, once each" and that
+				 * is 32 -- there is a thirty third miss nobody
+				 * has ever seen, because the cap stopped at
+				 * eight. Whether it is the output head, whose
+				 * slices are also 8192 wide, or something with
+				 * no 8192 in it at all is the difference
+				 * between two different rules, and one line
+				 * settles it. Forty covers m = 8 whole and is
+				 * still bounded if a width breaks outright.
 				 */
-				if (!ok && nbad < 8) {
+				if (!ok && nbad < 40) {
 					printf("      MISS %-24s k=%-5u n=%-5u"
 					       " row %u of %u, worst rel %.2e\n",
 					       t->name, (unsigned)t->k,
 					       (unsigned)t->n, r, mr, rworst);
 					nbad++;
+				}
+				/*
+				 * ⚠⚠ ABSENT OR MISPLACED, ASKED OF THE ROW
+				 * THAT MISSED. The count above says a row is
+				 * wrong and cannot say why, and the two
+				 * answers want different work.
+				 *
+				 * m = 8 loses row 0 of the n = 8192 tensors
+				 * and nothing else, at that one width. The
+				 * read order is a bijection there and takes no
+				 * n, so it cannot be selective by n and the
+				 * other seven rows being exact leaves row 0's
+				 * values nowhere to be but its own slots. That
+				 * is a deduction; this is the measurement it
+				 * predicts, and it can come back either way:
+				 *
+				 *   absent      the block never wrote them and
+				 *               no reading recovers them --
+				 *               the surface is short
+				 *   somewhere   they were written and put in
+				 *               the wrong place, and the
+				 *               deduction above is wrong
+				 *
+				 * ⚠ ONE ROW OF ONE TENSOR A WIDTH, AND ON A
+				 * WORK BUDGET. Each wanted value is looked for
+				 * in the whole batch, so the cost is
+				 * (values scanned) * m * n. The whole row at
+				 * 8 by 8192 is 5.4e8 and takes about a second;
+				 * the whole row of the 128256 wide head at
+				 * m = 80 would be 1.3e12 and never finish. So
+				 * the budget fixes how many of the row's
+				 * channels are asked about and the line says
+				 * how many that was -- a smaller sample of a
+				 * question that can still be answered beats a
+				 * whole one that hangs the round.
+				 *
+				 * The zero count is one pass and is over the
+				 * whole row either way.
+				 */
+				if (!ok && !whered) {
+					size_t live = 0, zero = 0;
+					size_t tot = (size_t)mr * t->n;
+					size_t look = 1000000000u / (tot ? tot : 1);
+
+					whered = 1;
+					if (look < 64)
+						look = 64;
+					if (look > (size_t)t->n)
+						look = (size_t)t->n;
+					for (unsigned j = 0; j < (unsigned)t->n; j++)
+						if (Y[(size_t)r * t->n + j] == 0.0f)
+							zero++;
+					for (size_t j = 0; j < look; j++) {
+						double w = Yref[(size_t)r * t->n + j];
+						double sc = fabs(w);
+
+						for (size_t o = 0; o < tot; o++)
+							if (fabs((double)Y[o] - w)
+							    <= (sc > 1e-3 ? sc * 1e-3
+									  : 1e-3)) {
+								live++;
+								break;
+							}
+					}
+					printf("      row %u of %s at m=%u:"
+					       " %zu of the first %zu wanted"
+					       " values are somewhere in the"
+					       " batch, and %zu of the row's"
+					       " %u slots came back exactly"
+					       " zero\n",
+					       r, t->name, mr, live, look, zero,
+					       (unsigned)t->n);
+					printf("        wanted ");
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%11.4g",
+						       Yref[(size_t)r * t->n + j]);
+					printf("\n        got    ");
+					for (unsigned j = 0; j < 6 && j < t->n; j++)
+						printf("%11.4g",
+						       Y[(size_t)r * t->n + j]);
+					printf("\n");
 				}
 			}
 			/*
@@ -1326,18 +1566,40 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		 * the time is not the hardware at all.
 		 */
 		{
-			double pk, sb, fn, rd;
+			double pk, sb, fn, rd, pr, al;
+			unsigned an = 0;
+			char tcol[24];
 
 			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
-			printf("  %3u  %5u   %10.2e  %6u of %-6u  %7.0f ms"
+			pr = charsiu_npu_batch_prep(s->pool.dev, 1);
+			al = charsiu_npu_batch_alloc(s->pool.dev, &an, 1);
+			/*
+			 * ⚠ AND WHAT IS STILL MISSING. The five segments are
+			 * printed with the remainder beside them, because the
+			 * four of them came to 451 ms of a 606 ms matmul and
+			 * nobody noticed until the shares were added up by
+			 * hand. A breakdown that does not say what it failed to
+			 * account for is an invitation to optimise the wrong
+			 * third.
+			 */
+			/*
+			 * ⚠ THE TENSOR COUNT IS A FRACTION, ALWAYS. An
+			 * uncapped row reads 225/225 and a capped one 8/225,
+			 * so the two can never be confused for each other by
+			 * anyone reading a single pasted line.
+			 */
+			snprintf(tcol, sizeof(tcol), "%u/%u", tested, n_staged);
+			printf("  %3u  %9s  %10.2e  %6u of %-6u  %7.0f ms"
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
-			       "   pack %4.0f  submit %3.0f  fence %5.0f"
-			       "  read %4.0f\n",
-			       mr, tested, worst, rows_ok, rows_tot, t_one,
+			       "   prep %4.0f (alloc %4.0f x%u)  pack %4.0f"
+			       "  submit %3.0f  fence %5.0f  read %4.0f"
+			       "  rest %4.0f\n",
+			       mr, tcol, worst, rows_ok, rows_tot, t_one,
 			       t_bat, t_bat > 0 ? t_one / t_bat : 0.0,
 			       t_bat * 1e3 / (tested * (double)mr),
 			       t_bat > 0 ? mb / t_bat : 0.0,
-			       pk, sb, fn, rd);
+			       pr, al, an, pk, sb, fn, rd,
+			       t_bat - (pr + pk + sb + fn + rd));
 		}
 		rc = 0;
 	}
@@ -2563,6 +2825,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bhb); free(s->bhb2); free(s->bcs);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
 	free(s->bfreq);
+	free(s->bpl); free(s->bplg);
 
 	free(s->att); free(s->logits);
 	charsiu_act_free(&s->act);
@@ -3023,8 +3286,15 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 */
 	static char buf[256];
 	size_t n = 0;
-	int fused = 0, shared = 0, ffvar = 0;
 
+	/*
+	 * ⚠ THE MODEL IS UNUSED TODAY AND THE PARAMETER STAYS. Every refusal
+	 * that ever lived here was a property of the model, and the next one
+	 * will be too; taking it out would make putting one back an API change
+	 * across four call sites and two tools, at the moment somebody is
+	 * trying to write down a fault rather than refactor.
+	 */
+	(void)m;
 	buf[0] = 0;
 #define WHY(cond, txt) do {                                                 \
 		if (cond) {                                                 \
@@ -3035,26 +3305,47 @@ const char *llama_batch_why_not(const struct llama_model *m)
 		}                                                           \
 	} while (0)
 
-	for (uint32_t l = 0; l < m->n_layer; l++) {
-		const struct llama_layer *L = &m->layers[l];
-
-		if (!L->wk || !L->wv)
-			fused = 1;
-		if (L->kv_from >= 0)
-			shared = 1;
-		if (L->n_ff != m->layers[0].n_ff)
-			ffvar = 1;
-	}
-	WHY(m->n_embd_pl, "per layer embeddings");
 	WHY(kv_posmajor(), "a position major KV cache");
-	WHY(fused, "fused or absent K and V projections");
-	WHY(shared, "KV shared between layers");
-	WHY(ffvar, "a feed forward width that varies by layer");
+	/*
+	 * 🏁 GEMMA4 AND PHI3 CAME OFF THIS LIST ON 2026-08-30, and what they
+	 * were refused for was never true of either of them.
+	 *
+	 * gemma4 was refused for its per layer embeddings and phi3 for having
+	 * q, k and v as views of one attn_qkv. Both notes said, in as many
+	 * words, that this was a hypothesis about the cause and only a fact
+	 * about the model. Both hypotheses are dead:
+	 *
+	 *  - phi3's batched matmul is EXACT at every even width: 225 tensors,
+	 *    18000 of 18000 rows at m = 80, worst relative 1.61e-04. Being a
+	 *    view had nothing to do with it.
+	 *  - gemma4's failures were every one of them an ODD last chunk. Its
+	 *    88 token prompt tails at 24 and came back clean ten times; the
+	 *    rounds that called it wrong were reading a 89 token prompt --
+	 *    one trailing space in a test script -- which tails at 25.
+	 *
+	 * What was actually wrong is two things, and neither is a property of
+	 * an architecture:
+	 *
+	 *  1. an odd batch width has no expression on the accumulator surface,
+	 *     which is organised in pairs of rows. The chunker only emits even
+	 *     widths now and npudev refuses the rest.
+	 *  2. the two NPU cores corrupt each other when their submits overlap.
+	 *     phi3 at width 24: 13 of 16 wrong overlapped, 0 of 16 with one
+	 *     core, 0 of 16 with the submits serialised. Serialised is the
+	 *     default now.
+	 *
+	 * ⚠ WHAT WOULD PUT SOMETHING BACK HERE. This list is empty but for a
+	 * debug switch, so the next architecture will not be refused by it --
+	 * it will be MISSED by it, the way blk.N.layer_output_scale was: a
+	 * tensor this loop did not apply, on a model nothing refused. A new
+	 * architecture means reading llama_forward against this loop line by
+	 * line, and then board_text_all.sh on the card, which is the check
+	 * that found phi3 on its first run.
+	 */
 #undef WHY
 	if (n)
 		return buf;
 	/*
-	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
 	 * board; charsiu took 7354, because a query norm sent the whole prompt
@@ -3068,9 +3359,35 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * them was right while they were unwritten and became the dominant cost
 	 * the moment there was a scoreboard.
 	 *
-	 * What is still refused is what would be a different computation:
-	 * fused K and V needs a tensor split, shared KV needs another layer's
-	 * cache, and a varying feed forward width needs per layer buffers.
+	 * ⚠ AN ABSENT K OR V AND A SHARED KV LEFT THIS LIST on 2026-08-29, and
+	 * neither was a different computation either. gemma4 makes attn_v
+	 * optional in every layer, where its absence means V IS K, and drops
+	 * attn_k entirely in its last ones, where the layer attends against
+	 * L->kv_from's cache -- both of which the token loop has done since
+	 * gemma4 landed. What the batched loop had to learn was to ask, three
+	 * times, the question the token loop asks: skip the projections that
+	 * are not there, skip the cache write, and read the cache the layer
+	 * names.
+	 *
+	 * ⚠ A VARYING FEED FORWARD WIDTH LEFT THIS LIST on 2026-08-29, and it
+	 * was never a computation at all -- it was one buffer sized from
+	 * layers[0] instead of from the widest layer. m->n_ff has been the max
+	 * since gemma4 landed, so the fix was to allocate from it and read
+	 * L->n_ff in the loop, which is what the token loop already did.
+	 *
+	 * ⚠ PER LAYER EMBEDDINGS LEFT THIS LIST on 2026-08-29 and they WERE a
+	 * computation -- the only one of the five that was. They are a second
+	 * embedding table, a projection of the first, a norm a layer slice, and
+	 * a gated residual at the bottom of every layer, which is the whole of
+	 * what "E2B" means. What made them batchable was that all of it is per
+	 * ROW: two matmuls that take n rows and scalar work that does not.
+	 *
+	 * ⚠⚠ THE LIST IS NOW EMPTY BUT FOR A DEBUG SWITCH, so the next
+	 * architecture will not be refused by it -- it will be MISSED by it,
+	 * the way blk.N.layer_output_scale was: a tensor this loop did not
+	 * apply, on a model nothing else refused. A new architecture means
+	 * reading llama_forward against this loop line by line, not trusting
+	 * a NULL from here.
 	 *
 	 * ⚠ THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
 	 * and Gemma4 took 23.6 s and 17.6 s to a first token against
@@ -3085,7 +3402,38 @@ const char *llama_batch_why_not(const struct llama_model *m)
 
 static int batch_ok(const struct llama_model *m)
 {
-	return llama_batch_why_not(m) == NULL;
+	const char *why = llama_batch_why_not(m);
+
+	if (!why)
+		return 1;
+	/*
+	 * ⚠ A REFUSAL WITH NO WAY PAST IT CANNOT BE TESTED.
+	 *
+	 * gemma4 and phi3 are refused because the board says their batched
+	 * prompt is wrong, and each refusal names the property that
+	 * distinguishes the model -- per layer embeddings, and weights that are
+	 * views. Neither is proven guilty, and the standing alternative is that
+	 * neither is guilty at all: m = 8 was four orders out on EVERY model
+	 * until CHARSIU_NPU_ONEDEV made it bit exact, so this hardware has one
+	 * known way to be wrong at m > 1 that has nothing to do with the model.
+	 * If a forced phi3 comes back right on one core, both refusals are
+	 * about the wrong thing.
+	 *
+	 * That experiment needs the refused arm to REACH the hardware, the same
+	 * way CHARSIU_NPU_W4_BATCH=height lets the wrong axis through. It says
+	 * so on stderr every run: this is a probe switch, and a number measured
+	 * under it is a number about a model that is still refused.
+	 */
+	if (getenv("CHARSIU_BATCH_FORCE")) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CHARSIU_BATCH_FORCE -- "
+				"batching a model that is REFUSED (%s). Its "
+				"output is not trusted; check the text.\n", why);
+		return 1;
+	}
+	return 0;
 }
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
@@ -3106,7 +3454,18 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	 * being run rather than by construction.
 	 */
 	uint32_t hdmax = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
-	uint32_t kvdim = m->n_head_kv * hdmax, nff = m->layers[0].n_ff;
+	uint32_t kvdim = m->n_head_kv * hdmax;
+	/*
+	 * ⚠ THE WIDEST LAYER'S FEED FORWARD, NOT LAYER ZERO'S. gemma4 states a
+	 * width PER LAYER and E2B uses two of them, so a buffer sized from
+	 * layers[0] and then written L->n_ff floats deep is a heap overflow on
+	 * the first layer that disagrees with the first.
+	 *
+	 * m->n_ff is already the largest of them -- llama_load takes the max
+	 * over the array for exactly this reason and says so -- so the
+	 * allocation asks for that and the loop below uses the layer's own.
+	 */
+	uint32_t nffmax = m->n_ff;
 	uint32_t gqa = m->n_head / m->n_head_kv;
 	const float *freqf = NULL;
 	float scale = m->attn_scale != 0.0f ? m->attn_scale
@@ -3120,8 +3479,8 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
-		s->bhb = malloc((size_t)n * nff * sizeof(float));
-		s->bhb2 = malloc((size_t)n * nff * sizeof(float));
+		s->bhb = malloc((size_t)n * nffmax * sizeof(float));
+		s->bhb2 = malloc((size_t)n * nffmax * sizeof(float));
 		s->bcs = malloc((size_t)hdmax * sizeof(float));
 		/*
 		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
@@ -3148,9 +3507,25 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * I did it again in the batched copy of the same loop.
 		 */
 		s->bao = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
+		/*
+		 * ⚠ gemma4's PER LAYER EMBEDDINGS ARE PER ROW. s->pl is one
+		 * token's -- looked up by that token's id and projected from
+		 * that token's own embedding -- so a chunk needs n of them.
+		 * Sharing one would give every row of the prompt the last
+		 * row's, which is a model that runs and answers.
+		 */
+		free(s->bpl); free(s->bplg);
+		s->bpl = s->bplg = NULL;
+		if (m->n_embd_pl) {
+			s->bpl = malloc((size_t)n * m->n_embd_pl * m->n_layer
+					* sizeof(float));
+			s->bplg = malloc((size_t)n * m->n_embd_pl
+					 * sizeof(float));
+		}
 
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
-		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao) {
+		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao ||
+		    (m->n_embd_pl && (!s->bpl || !s->bplg))) {
 			s->bx_n = 0;
 			return -1;
 		}
@@ -3187,9 +3562,66 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				xr[i] *= m->embd_scale;
 	}
 
+	/*
+	 * ⚠ gemma4's PER LAYER EMBEDDINGS, built once for the whole chunk:
+	 *
+	 *   pl[r][l][j] = ( proj[r][l][j] + tok[r][l][j] * sqrt(n_embd_pl) )
+	 *                 / sqrt(2)
+	 *
+	 * where proj is per_layer_model_proj applied to the SCALED embedding
+	 * and divided by sqrt(n_embd), then RMS normalised a layer at a time
+	 * against per_layer_proj_norm, and tok is a row of a second embedding
+	 * table looked up by the same token. Every line of it is the token
+	 * loop's, in the token loop's order, with one index added.
+	 *
+	 * ⚠ THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
+	 * is n_embd_pl long and llama.cpp reshapes to [n_embd_pl][n_layer]
+	 * before normalising. Over the concatenation every layer would be
+	 * divided by every other layer's magnitude.
+	 *
+	 * ⚠ THE PROJECTION IS THE ONLY PART THAT BATCHES. The rest reads one
+	 * row's table entry and normalises one row's slices, which is n times
+	 * the same scalar code and not a matmul.
+	 */
+	if (m->n_embd_pl) {
+		uint32_t np = m->n_embd_pl, nl = m->n_layer, l, j;
+		float ts = sqrtf((float)np);
+		float ps = 1.0f / sqrtf((float)m->n_embd);
+		float half = 1.0f / sqrtf(2.0f);
+
+		/*
+		 * ⚠ READ ONCE. The token loop reads this gain inside its layer
+		 * loop, which is the same vector every time; here that would be
+		 * n_layer reads a row. Same values, so it cannot move a token.
+		 */
+		gguf_row_f32(m->pl_proj_norm, 0, s->plc);
+		matmul_rows(s, m->pl_model_proj, s->bx, n, s->bpl, m->n_embd,
+			    np * nl);
+		for (int r = 0; r < n; r++) {
+			gguf_row_f32(m->pl_tok_embd, (uint64_t)toks[r], s->plb);
+			for (l = 0; l < nl; l++) {
+				float *row = s->bpl
+					   + ((size_t)r * nl + l) * np;
+				float ss = 0.0f, sc;
+
+				for (j = 0; j < np; j++) {
+					row[j] *= ps;
+					ss += row[j] * row[j];
+				}
+				sc = 1.0f / sqrtf(ss / (float)np + m->rms_eps);
+				for (j = 0; j < np; j++)
+					row[j] = (row[j] * sc * s->plc[j]
+						  + s->plb[(size_t)l * np + j]
+						    * ts) * half;
+			}
+		}
+	}
+
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
+		/* ⚠ THIS LAYER'S WIDTH; m->n_ff is only the fallback */
+		uint32_t nff = L->n_ff ? L->n_ff : m->n_ff;
 		int swa = L->swa;
 
 		/*
@@ -3248,13 +3680,26 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		 * for wq at all -- q was simply not computed, and all three
 		 * models came back DIFFERENT. The control caught it in one run.
 		 */
-		if (!prefill_grouped() || will_batch(s, L->wq)) {
+		/*
+		 * ⚠ A SHARED KV LAYER PROJECTS ONLY Q, and there is nothing to
+		 * group. gemma4's last layers carry no attn_k and attend
+		 * against an earlier layer's cache, so handing matmul_rows
+		 * L->wk here would dereference NULL -- the same three cases the
+		 * token loop spells out, in the same order, because the two
+		 * loops disagreeing about which projections a layer has is the
+		 * kind of difference that still produces fluent text.
+		 */
+		if (!L->wk) {
+			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
+				    m->n_head * hd);
+		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 			matmul_rows(s, L->wk, s->bxb, n, s->bk, m->n_embd,
 				    m->n_head_kv * hd);
-			matmul_rows(s, L->wv, s->bxb, n, s->bv, m->n_embd,
-				    m->n_head_kv * hd);
+			if (L->wv)
+				matmul_rows(s, L->wv, s->bxb, n, s->bv,
+					    m->n_embd, m->n_head_kv * hd);
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
@@ -3265,6 +3710,16 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 					    L->wv, s->bv + (size_t)r *
 						   m->n_head_kv * hd);
 		}
+		/*
+		 * ⚠ WHERE attn_v IS ABSENT AND attn_k IS NOT, V IS K. That is
+		 * llama.cpp's `Vcur = Kcur` and not a projection this file
+		 * failed to find, so it is a copy of the rows just computed and
+		 * not a third matmul. gemma4 declares attn_v optional in EVERY
+		 * layer, so this is not only the shared ones.
+		 */
+		if (L->wk && !L->wv)
+			memcpy(s->bv, s->bk,
+			       (size_t)n * m->n_head_kv * hd * sizeof(float));
 
 		for (int r = 0; r < n; r++) {
 			int pos = pos0 + r;
@@ -3273,19 +3728,46 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
 			 * HEAD. gemma3's window layers turn at 10000 and its
 			 * full ones at the model's own 1000000, and the file
-			 * carries no key saying so. Handing a window layer the
-			 * full layers' factors scales a frequency table it was
-			 * never built for.
+			 * carries no key saying so.
+			 *
+			 * ⚠⚠ AND WITH NO FREQUENCY FACTORS. llama.cpp gives
+			 * rope_freqs to the FULL layers only; this handed them
+			 * to both, which scales a frequency table a window
+			 * layer was never built for. It could not show on
+			 * gemma3, which carries no such tensor, and gemma4 is
+			 * the first model to arrive here with both a window and
+			 * a shorter window head.
+			 *
+			 * The condition is the token loop's, word for word:
+			 * a second table exists only where the base or the head
+			 * actually differs, and where it does not a window
+			 * layer takes the full one, factors and all.
 			 */
-			rope_table(s->bcs, hd, pos,
-				   swa ? m->rope_base_swa : m->rope_base,
-				   freqf);
+			int swatab = swa && (m->swa_pattern || m->swa_arr) &&
+				     (m->rope_base_swa != m->rope_base ||
+				      m->head_dim_swa != m->head_dim);
+
+			rope_table(s->bcs,
+				   swatab ? m->head_dim_swa : hdmax, pos,
+				   swatab ? m->rope_base_swa : m->rope_base,
+				   swatab ? NULL : freqf);
 			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
 			       (size_t)m->n_head * hd * sizeof(float));
-			memcpy(s->k, s->bk + (size_t)r * m->n_head_kv * hd,
-			       (size_t)m->n_head_kv * hd * sizeof(float));
-			memcpy(s->v, s->bv + (size_t)r * m->n_head_kv * hd,
-			       (size_t)m->n_head_kv * hd * sizeof(float));
+			/* ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, so
+			 * every line below that touches k or v is asked the
+			 * same question. The token loop leaves s->k and s->v
+			 * from the previous layer and never reads them; this
+			 * leaves them untouched for the same reason. */
+			if (L->wk) {
+				memcpy(s->k, s->bk + (size_t)r * m->n_head_kv
+				       * hd,
+				       (size_t)m->n_head_kv * hd *
+				       sizeof(float));
+				memcpy(s->v, s->bv + (size_t)r * m->n_head_kv
+				       * hd,
+				       (size_t)m->n_head_kv * hd *
+				       sizeof(float));
+			}
 			/*
 			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
 			 * here that is not interchangeable, and it is copied
@@ -3297,8 +3779,17 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			 */
 			if (L->bq) {
 				add_bias(s->q, L->bq, m->n_head * hd);
-				add_bias(s->k, L->bk, m->n_head_kv * hd);
-				add_bias(s->v, L->bv, m->n_head_kv * hd);
+				/* ⚠ NO K MEANS NO K BIAS. The token loop adds
+				 * all three unguarded and would dereference
+				 * NULL here; no file in the zoo has both a
+				 * shared KV and attention biases, so neither
+				 * loop has ever reached it. */
+				if (L->wk) {
+					add_bias(s->k, L->bk,
+						 m->n_head_kv * hd);
+					add_bias(s->v, L->bv,
+						 m->n_head_kv * hd);
+				}
 			}
 			if (L->q_norm) {
 				qk_norm(s->q, m->n_head, hd, L->q_norm,
@@ -3320,17 +3811,25 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				qk_norm(s->v, m->n_head_kv, hd, NULL,
 					m->rms_eps);
 			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
-			rope(s->k, m->n_head_kv, hd, s->bcs, m->rope_neox);
-			/* ⚠ the cache is strided by hdmax, written at hd */
-			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
-				size_t off = ((size_t)(l * m->n_head_kv + kh)
-					      * s->n_ctx + pos) * hdmax;
+			if (L->wk)
+				rope(s->k, m->n_head_kv, hd, s->bcs,
+				     m->rope_neox);
+			/* ⚠ the cache is strided by hdmax, written at hd, and
+			 * a shared KV layer has nothing of its own to store:
+			 * it reads what L->kv_from wrote. Writing here would
+			 * put this layer's q-only garbage over the slot the
+			 * layer it borrows from just filled. */
+			if (L->wk)
+				for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+					size_t off = ((size_t)(l * m->n_head_kv
+						      + kh)
+						      * s->n_ctx + pos) * hdmax;
 
-				memcpy(s->kcache + off, s->k + kh * hd,
-				       hd * sizeof(float));
-				memcpy(s->vcache + off, s->v + kh * hd,
-				       hd * sizeof(float));
-			}
+					memcpy(s->kcache + off, s->k + kh * hd,
+					       hd * sizeof(float));
+					memcpy(s->vcache + off, s->v + kh * hd,
+					       hd * sizeof(float));
+				}
 			{
 				/*
 				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
@@ -3346,7 +3845,21 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 				 */
 				int tlo = swa && pos + 1 > (int)m->n_swa
 					? pos + 1 - (int)m->n_swa : 0;
-				struct attn_job aj = { s, l, pos, tlo, hd,
+				/*
+				 * ⚠ WHOSE CACHE, and it is not always this
+				 * layer's. gemma4's shared layers name an
+				 * earlier one in L->kv_from; -1 is "its own",
+				 * which is every layer of everything else.
+				 * The head is still THIS layer's, and that is
+				 * sound because kv_from is chosen among layers
+				 * of the same window kind, which is the only
+				 * thing head_dim depends on.
+				 */
+				struct attn_job aj = { s,
+						       L->kv_from >= 0
+						       ? (uint32_t)L->kv_from
+						       : l,
+						       pos, tlo, hd,
 						       hdmax,
 						       m->n_head_kv * hdmax,
 						       gqa, m->n_head_kv,
@@ -3408,6 +3921,108 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 					m->rms_eps);
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
+		}
+
+		/*
+		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not
+		 * a replacement:
+		 *
+		 *   g = gelu(per_layer_inp_gate . x)      [n_embd_pl]
+		 *   g = g * pl[l]                          elementwise
+		 *   x = x + rmsnorm(per_layer_proj . g, per_layer_post_norm)
+		 *
+		 * This is the whole of what "E2B" means, so a batched prefill
+		 * that skipped it would prompt a different model from the one
+		 * that then decodes -- fluent, and answering about the wrong
+		 * thing. Both matmuls batch; the gelu and the elementwise
+		 * multiply are per row because the gate is.
+		 */
+		if (L->pl_inp_gate) {
+			uint32_t np = m->n_embd_pl, i;
+
+			matmul_rows(s, L->pl_inp_gate, s->bx, n, s->bplg,
+				    m->n_embd, np);
+			for (int r = 0; r < n; r++) {
+				float *g = s->bplg + (size_t)r * np;
+				const float *plr = s->bpl
+						 + ((size_t)r * m->n_layer + l)
+						   * np;
+
+				for (i = 0; i < np; i++) {
+					float v = g[i];
+
+					v = 0.5f * v * (1.0f +
+					     tanhf(0.7978845608028654f
+						   * (v + 0.044715f * v * v
+						      * v)));
+					g[i] = v * plr[i];
+				}
+			}
+			/*
+			 * ⚠ bxo IS FREE HERE. The feed forward's down
+			 * projection went into it and was added into bx on the
+			 * loop above; nothing reads it again this layer, and it
+			 * is already n rows of n_embd, which is this
+			 * projection's shape exactly.
+			 */
+			matmul_rows(s, L->pl_proj, s->bplg, n, s->bxo, np,
+				    m->n_embd);
+			for (int r = 0; r < n; r++) {
+				float *xr = s->bx + (size_t)r * m->n_embd;
+				float *o = s->bxo + (size_t)r * m->n_embd;
+
+				if (L->pl_post_norm)
+					rmsnorm(o, o, L->pl_post_norm,
+						m->n_embd, m->rms_eps);
+				for (i = 0; i < m->n_embd; i++)
+					xr[i] += o[i];
+			}
+		}
+		/*
+		 * ⚠ ONE SCALAR THE WHOLE LAYER OUTPUT IS MULTIPLIED BY, and
+		 * this loop never had it. It is not in llama_batch_why_not
+		 * either, so a model carrying blk.N.layer_output_scale and
+		 * none of the listed refusals would have been prefilled
+		 * without it and decoded with it -- silently, since the two
+		 * differ by a constant per layer and nothing here reads a
+		 * magnitude. gemma4 is the only architecture that has it, and
+		 * gemma4 was refused for other reasons until now.
+		 *
+		 * Read through gguf_row_f32 rather than cast, the way every
+		 * other gain in this file is read.
+		 */
+		if (L->out_scale) {
+			float sc = 1.0f;
+
+			gguf_row_f32(L->out_scale, 0, &sc);
+			for (int r = 0; r < n; r++) {
+				float *xr = s->bx + (size_t)r * m->n_embd;
+
+				for (uint32_t i = 0; i < m->n_embd; i++)
+					xr[i] *= sc;
+			}
+		}
+		/*
+		 * ⚠ THE LAST ROW, BECAUSE THAT IS THE ONE THE TOKEN LOOP CAN BE
+		 * HELD AGAINST. CHARSIU_DBG_LAYERS makes llama_forward print
+		 * this line for every layer of every token; run a prompt of
+		 * exactly one chunk and its final n_layer lines are the same
+		 * token as these, so a batched path that has gone wrong says
+		 * WHICH LAYER it went wrong at instead of only that the text
+		 * changed. Both loops fall back to the same matvec on a machine
+		 * with no NPU, so the two columns are expected to agree to
+		 * every printed digit and not approximately.
+		 */
+		if (dbg_layers()) {
+			const float *xr = s->bx + (size_t)(n - 1) * m->n_embd;
+			double n2 = 0.0;
+			uint32_t i;
+
+			for (i = 0; i < m->n_embd; i++)
+				n2 += (double)xr[i] * xr[i];
+			fprintf(stderr, "  layer %2u  swa=%d hd=%3u ff=%5u "
+				"kv=%2d  |x| = %.4f\n", l, L->swa, hd, nff,
+				L->kv_from, sqrt(n2 / m->n_embd));
 		}
 	}
 

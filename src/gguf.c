@@ -841,7 +841,7 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 
 #endif
 
-/* ---- the two kernels an attention is made of ------------------------------ */
+/* ---- the three kernels an attention is made of ---------------------------- */
 
 /*
  * ⚠ THESE ARE FOR THE ATTENTION, WHICH IS NOT A MATMUL AGAINST A WEIGHT and so
@@ -857,6 +857,363 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 float charsiu_dot_f32(const float *a, const float *b, uint64_t n)
 {
 	return dot_f32(a, b, n);
+}
+
+/*
+ * ⚠⚠ AND THE THIRD ONE IS THE EXPONENTIAL, WHICH NOBODY COUNTED.
+ *
+ * A softmax over every patch against every patch asks for n^2 exponentials a
+ * head. The vision tower is 1024 against 1024, twelve heads, twelve layers:
+ * 151 MILLION of them for one picture. Round 367 measured glibc's expf on the
+ * board at 23 ns an element, which puts 3.5 s under a stage the board reports
+ * as 4.0 s -- so the arithmetic nobody had counted was most of a stage everyone
+ * was reading as memory traffic.
+ *
+ * This does the whole of what a softmax's middle pass wants -- e^(x - m) in
+ * place, and the sum back -- because splitting it into an exp pass and a sum
+ * pass reads the row twice.
+ *
+ * ⚠ THE POLYNOMIAL IS THE SLIGHTLY WORSE OF THE TWO. glibc's expf is correctly
+ * rounded and this is about one last bit out, the same trade llama.c's vexpq
+ * makes for SiLU. There it is opt in because a near tie in greedy decoding
+ * changes a word and the project's anchor sentence with it; here the consumer
+ * is an embedding that goes through a projection and twelve more layers, and
+ * the tower's own cross check has 2e-4 of room against a numpy reference that
+ * uses neither. CHARSIU_EXACT_SOFTMAX is the control.
+ */
+static int sm_exact = -1;
+
+static int softmax_exact(void)
+{
+	if (sm_exact < 0)
+		sm_exact = getenv("CHARSIU_EXACT_SOFTMAX") != NULL;
+	return sm_exact;
+}
+
+/*
+ * ⚠ SETTABLE FOR THE SAME REASON THE SCHEDULE IS. Two runs of this host, one
+ * with the polynomial and one without, disagreed with each other by more than
+ * the thing being measured; the only reading worth having interleaves them in
+ * one process.
+ */
+void charsiu_softmax_exact_set(int on)
+{
+	sm_exact = on ? 1 : 0;
+}
+
+float charsiu_expsum_f32(float *x, uint64_t n, float m)
+{
+	uint64_t i = 0;
+	float s = 0.0f;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!softmax_exact()) {
+		float32x4_t vm = vdupq_n_f32(m), acc = vdupq_n_f32(0.0f);
+
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t e = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i),
+								vm));
+
+			vst1q_f32(x + i, e);
+			acc = vaddq_f32(acc, e);
+		}
+		s = vaddvq_f32(acc);
+	}
+#endif
+	for (; i < n; i++) {
+		x[i] = expf(x[i] - m);
+		s += x[i];
+	}
+	return s;
+}
+
+/*
+ * ⚠⚠ AND THE FOURTH IS THE ONE THE SCALED ADD SHOULD HAVE BEEN ALL ALONG.
+ *
+ * acc[u] += sum over the key tile of s[u][j] * v[j], for a BLOCK of queries at
+ * once. Called one query and one key at a time -- which is what an axpy per
+ * (query, key) is -- every FMA costs two vector loads and a vector store,
+ * because the accumulator is fetched from memory and put back for each single
+ * key. Three memory operations per FMA is not an attention, it is a memcpy with
+ * arithmetic in it.
+ *
+ * Holding four accumulators in registers across the whole tile and reusing each
+ * value row for all four of them makes it four vector loads and four scalar
+ * loads for sixteen FMAs: half a memory operation per FMA, six times fewer.
+ *
+ * ⚠ AND IT IS STILL BIT IDENTICAL. For a given output element the sum over j
+ * is in the same order, starting from the same accumulator; only the order the
+ * ELEMENTS are visited in changes. The bench diffs it element wise against the
+ * unblocked form rather than taking that on trust.
+ *
+ * Everything takes a stride: the values arrive as [n][n_embd] with the heads
+ * side by side, so one head's row is head_dim floats every n_embd, and the
+ * accumulator is either a contiguous block the fused kernel owns or a slice of
+ * the output rows the three pass kernel writes in place.
+ */
+/*
+ * ⚠ THE CONTROL, AND IT IS NOT OPTIONAL. This kernel is meant to be BIT
+ * identical to the axpy per (query, key) it replaces, which means a stopwatch
+ * is the only thing that can tell them apart -- and on a loaded host two builds
+ * timed one after the other cannot. CHARSIU_PLAIN_ATTN puts the one-pair-at-a-
+ * time form of BOTH blocked kernels back, so they can be interleaved in one
+ * process.
+ */
+static int attn_plain = -1;
+
+void charsiu_attn_plain_set(int on)
+{
+	attn_plain = on ? 1 : 0;
+}
+
+static int pv_is_plain(void)
+{
+	if (attn_plain < 0)
+		attn_plain = getenv("CHARSIU_PLAIN_ATTN") != NULL;
+	return attn_plain;
+}
+
+void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
+		    uint64_t vstride, const float *s, uint64_t sstride,
+		    unsigned nq, unsigned nk, unsigned hd)
+{
+	unsigned u, j;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	unsigned e0, u0;
+
+	if (pv_is_plain()) {
+		for (u = 0; u < nq; u++)
+			for (j = 0; j < nk; j++)
+				charsiu_axpy_f32(acc + (uint64_t)u * astride,
+						 v + (uint64_t)j * vstride,
+						 s[(uint64_t)u * sstride + j],
+						 hd);
+		return;
+	}
+	/*
+	 * ⚠⚠ WRITTEN OUT, NOT LOOPED, AND THE FIRST VERSION WAS SLOWER THAN THE
+	 * AXPY IT REPLACED. With the sixteen accumulators in a float32x4_t[4]
+	 * and a `for (i = 0; i < 4; i++)` over them, -O2 does not unroll -- so
+	 * they stayed in memory and the inner loop came out as four FMAs
+	 * against four RELOADS of the accumulator, which is the exact cost this
+	 * kernel exists to remove. It measured 0.94x. Sixteen named variables
+	 * is what keeps them in registers.
+	 */
+#define PV_FMA(b0, b1, b2, b3, cs) do { \
+	b0 = vfmaq_n_f32(b0, w0, cs); b1 = vfmaq_n_f32(b1, w1, cs); \
+	b2 = vfmaq_n_f32(b2, w2, cs); b3 = vfmaq_n_f32(b3, w3, cs); \
+} while (0)
+
+	for (u0 = 0; u0 + 4 <= nq; u0 += 4) {
+		const float *s0 = s + (uint64_t)u0 * sstride;
+		const float *s1 = s0 + sstride, *s2 = s1 + sstride;
+		const float *s3 = s2 + sstride;
+
+		for (e0 = 0; e0 + 16 <= hd; e0 += 16) {
+			float *a0 = acc + (uint64_t)u0 * astride + e0;
+			float *a1 = a0 + astride, *a2 = a1 + astride;
+			float *a3 = a2 + astride;
+			float32x4_t p0 = vld1q_f32(a0), p1 = vld1q_f32(a0 + 4);
+			float32x4_t p2 = vld1q_f32(a0 + 8);
+			float32x4_t p3 = vld1q_f32(a0 + 12);
+			float32x4_t q0 = vld1q_f32(a1), q1 = vld1q_f32(a1 + 4);
+			float32x4_t q2 = vld1q_f32(a1 + 8);
+			float32x4_t q3 = vld1q_f32(a1 + 12);
+			float32x4_t t0 = vld1q_f32(a2), t1 = vld1q_f32(a2 + 4);
+			float32x4_t t2 = vld1q_f32(a2 + 8);
+			float32x4_t t3 = vld1q_f32(a2 + 12);
+			float32x4_t z0 = vld1q_f32(a3), z1 = vld1q_f32(a3 + 4);
+			float32x4_t z2 = vld1q_f32(a3 + 8);
+			float32x4_t z3 = vld1q_f32(a3 + 12);
+
+			for (j = 0; j < nk; j++) {
+				const float *vj = v + (uint64_t)j * vstride + e0;
+				float32x4_t w0 = vld1q_f32(vj);
+				float32x4_t w1 = vld1q_f32(vj + 4);
+				float32x4_t w2 = vld1q_f32(vj + 8);
+				float32x4_t w3 = vld1q_f32(vj + 12);
+
+				PV_FMA(p0, p1, p2, p3, s0[j]);
+				PV_FMA(q0, q1, q2, q3, s1[j]);
+				PV_FMA(t0, t1, t2, t3, s2[j]);
+				PV_FMA(z0, z1, z2, z3, s3[j]);
+			}
+			vst1q_f32(a0, p0); vst1q_f32(a0 + 4, p1);
+			vst1q_f32(a0 + 8, p2); vst1q_f32(a0 + 12, p3);
+			vst1q_f32(a1, q0); vst1q_f32(a1 + 4, q1);
+			vst1q_f32(a1 + 8, q2); vst1q_f32(a1 + 12, q3);
+			vst1q_f32(a2, t0); vst1q_f32(a2 + 4, t1);
+			vst1q_f32(a2 + 8, t2); vst1q_f32(a2 + 12, t3);
+			vst1q_f32(a3, z0); vst1q_f32(a3 + 4, z1);
+			vst1q_f32(a3 + 8, z2); vst1q_f32(a3 + 12, z3);
+		}
+		/*
+		 * ⚠ THE TAIL IS THE OLD KERNEL, not a second copy of the new
+		 * one. head_dim is 64 or 80 in every tower this reads, so this
+		 * runs for the last 0 or 16 lanes and never for the hot part.
+		 */
+		if (e0 < hd)
+			for (j = 0; j < nk; j++)
+				for (u = u0; u < u0 + 4; u++)
+					charsiu_axpy_f32(acc + (uint64_t)u *
+							 astride + e0,
+							 v + (uint64_t)j *
+							 vstride + e0,
+							 s[(uint64_t)u *
+							   sstride + j],
+							 hd - e0);
+	}
+	for (u = u0; u < nq; u++)
+		for (j = 0; j < nk; j++)
+			charsiu_axpy_f32(acc + (uint64_t)u * astride,
+					 v + (uint64_t)j * vstride,
+					 s[(uint64_t)u * sstride + j], hd);
+#undef PV_FMA
+#else
+	for (u = 0; u < nq; u++)
+		for (j = 0; j < nk; j++)
+			charsiu_axpy_f32(acc + (uint64_t)u * astride,
+					 v + (uint64_t)j * vstride,
+					 s[(uint64_t)u * sstride + j], hd);
+#endif
+}
+
+/*
+ * ⚠⚠ AND THE FIFTH IS THE OTHER HALF OF THE SAME MISTAKE.
+ *
+ * s[u][j] = q[u] . k[j] was one dot product per (query, key) pair, and a dot
+ * product of head_dim floats loads head_dim of each operand for head_dim FMAs:
+ * two vector loads per FMA. Every query in a block reads the same key and every
+ * key is read by the same four queries, so eleven of every twelve of those
+ * loads are of something already in a register.
+ *
+ * Four queries against two keys at a time makes it twelve vector loads for
+ * sixteen FMAs -- 0.75 per FMA against 2.00, and 4 x 2 is what fits: sixteen
+ * accumulators, eight query registers and four key registers is 28 of the 32
+ * a64 has.
+ *
+ * ⚠ FOUR BY TWO AND NOT FOUR BY FOUR, BECAUSE THE SUMMATION ORDER IS KEPT.
+ * dot_f32 accumulates in TWO vectors -- eight lanes -- and reduces at the end,
+ * so reproducing it needs two accumulators per pair, and 4 x 4 of those would
+ * be 32 registers before a single operand is loaded. One accumulator per pair
+ * would fit 4 x 4 and reach 0.5 loads per FMA, and it would also change every
+ * score in the last bits. Bit identical is worth more than the last 25%: it is
+ * what lets this be diffed byte for byte against the kernel it replaces instead
+ * of argued about.
+ *
+ * ⚠ AND THE ACCUMULATORS ARE NAMED, NOT INDEXED. -O2 does not unroll a loop
+ * over an array of them, and the version of charsiu_pv_f32 that did that
+ * measured 0.94x -- slower than the code it replaced, because the accumulator
+ * went back to memory.
+ */
+void charsiu_qk_f32(float *s, uint64_t sstride, const float *q,
+		    uint64_t qstride, const float *k, uint64_t kstride,
+		    unsigned nq, unsigned nk, unsigned hd, float scale)
+{
+	unsigned u, j;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	unsigned u0, j0, e, t;
+
+	if (pv_is_plain())
+		goto plain;
+	for (u0 = 0; u0 + 4 <= nq; u0 += 4) {
+		const float *p0 = q + (uint64_t)u0 * qstride;
+		const float *p1 = p0 + qstride, *p2 = p1 + qstride;
+		const float *p3 = p2 + qstride;
+
+		for (j0 = 0; j0 + 2 <= nk; j0 += 2) {
+			const float *c0 = k + (uint64_t)j0 * kstride;
+			const float *c1 = c0 + kstride;
+			float32x4_t z = vdupq_n_f32(0.0f);
+			float32x4_t a0l = z, a0h = z, b0l = z, b0h = z;
+			float32x4_t a1l = z, a1h = z, b1l = z, b1h = z;
+			float32x4_t a2l = z, a2h = z, b2l = z, b2h = z;
+			float32x4_t a3l = z, a3h = z, b3l = z, b3h = z;
+			float r0, r1, r2, r3, r4, r5, r6, r7;
+
+			for (e = 0; e + 8 <= hd; e += 8) {
+				float32x4_t k0l = vld1q_f32(c0 + e);
+				float32x4_t k0h = vld1q_f32(c0 + e + 4);
+				float32x4_t k1l = vld1q_f32(c1 + e);
+				float32x4_t k1h = vld1q_f32(c1 + e + 4);
+				float32x4_t ql, qh;
+
+				ql = vld1q_f32(p0 + e);
+				qh = vld1q_f32(p0 + e + 4);
+				a0l = vfmaq_f32(a0l, ql, k0l);
+				a0h = vfmaq_f32(a0h, qh, k0h);
+				b0l = vfmaq_f32(b0l, ql, k1l);
+				b0h = vfmaq_f32(b0h, qh, k1h);
+
+				ql = vld1q_f32(p1 + e);
+				qh = vld1q_f32(p1 + e + 4);
+				a1l = vfmaq_f32(a1l, ql, k0l);
+				a1h = vfmaq_f32(a1h, qh, k0h);
+				b1l = vfmaq_f32(b1l, ql, k1l);
+				b1h = vfmaq_f32(b1h, qh, k1h);
+
+				ql = vld1q_f32(p2 + e);
+				qh = vld1q_f32(p2 + e + 4);
+				a2l = vfmaq_f32(a2l, ql, k0l);
+				a2h = vfmaq_f32(a2h, qh, k0h);
+				b2l = vfmaq_f32(b2l, ql, k1l);
+				b2h = vfmaq_f32(b2h, qh, k1h);
+
+				ql = vld1q_f32(p3 + e);
+				qh = vld1q_f32(p3 + e + 4);
+				a3l = vfmaq_f32(a3l, ql, k0l);
+				a3h = vfmaq_f32(a3h, qh, k0h);
+				b3l = vfmaq_f32(b3l, ql, k1l);
+				b3h = vfmaq_f32(b3h, qh, k1h);
+			}
+			r0 = vaddvq_f32(vaddq_f32(a0l, a0h));
+			r1 = vaddvq_f32(vaddq_f32(b0l, b0h));
+			r2 = vaddvq_f32(vaddq_f32(a1l, a1h));
+			r3 = vaddvq_f32(vaddq_f32(b1l, b1h));
+			r4 = vaddvq_f32(vaddq_f32(a2l, a2h));
+			r5 = vaddvq_f32(vaddq_f32(b2l, b2h));
+			r6 = vaddvq_f32(vaddq_f32(a3l, a3h));
+			r7 = vaddvq_f32(vaddq_f32(b3l, b3h));
+			/*
+			 * ⚠ THE SAME TAIL dot_f32 HAS, in the same place: the
+			 * lanes are reduced first and the leftover elements are
+			 * then added scalar, one at a time, onto that. Doing
+			 * them before the reduction would be a different sum.
+			 */
+			for (t = e; t < hd; t++) {
+				r0 += p0[t] * c0[t]; r1 += p0[t] * c1[t];
+				r2 += p1[t] * c0[t]; r3 += p1[t] * c1[t];
+				r4 += p2[t] * c0[t]; r5 += p2[t] * c1[t];
+				r6 += p3[t] * c0[t]; r7 += p3[t] * c1[t];
+			}
+			s[(uint64_t)u0 * sstride + j0] = r0 * scale;
+			s[(uint64_t)u0 * sstride + j0 + 1] = r1 * scale;
+			s[(uint64_t)(u0 + 1) * sstride + j0] = r2 * scale;
+			s[(uint64_t)(u0 + 1) * sstride + j0 + 1] = r3 * scale;
+			s[(uint64_t)(u0 + 2) * sstride + j0] = r4 * scale;
+			s[(uint64_t)(u0 + 2) * sstride + j0 + 1] = r5 * scale;
+			s[(uint64_t)(u0 + 3) * sstride + j0] = r6 * scale;
+			s[(uint64_t)(u0 + 3) * sstride + j0 + 1] = r7 * scale;
+		}
+		for (j = j0; j < nk; j++)
+			for (u = u0; u < u0 + 4; u++)
+				s[(uint64_t)u * sstride + j] = charsiu_dot_f32(
+					q + (uint64_t)u * qstride,
+					k + (uint64_t)j * kstride, hd) * scale;
+	}
+	for (u = u0; u < nq; u++)
+		for (j = 0; j < nk; j++)
+			s[(uint64_t)u * sstride + j] = charsiu_dot_f32(
+				q + (uint64_t)u * qstride,
+				k + (uint64_t)j * kstride, hd) * scale;
+	return;
+plain:
+#endif
+	for (u = 0; u < nq; u++)
+		for (j = 0; j < nk; j++)
+			s[(uint64_t)u * sstride + j] = charsiu_dot_f32(
+				q + (uint64_t)u * qstride,
+				k + (uint64_t)j * kstride, hd) * scale;
 }
 
 void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n)

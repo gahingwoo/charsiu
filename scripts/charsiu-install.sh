@@ -878,14 +878,23 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # done all three.
 RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 	      charsiu_vision charsiu_clip charsiu_whisper"
-PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul"
+# ⚠ A SCRIPT WITHOUT ITS BINARY IS A ROUND THAT DOES NOT HAPPEN, and this has
+# now happened twice. vattn_sweep.sh went to the board without vattn_bench and
+# without itself, and came back "cannot open /opt/charsiu/vattn_sweep.sh" -- so
+# six attention defaults chosen on a compute bound desktop are still the
+# defaults on a bandwidth bound board. Anything added to PROBE_SCRIPTS that
+# runs a binary has to add the binary here in the same edit.
+PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul vattn_bench acc_index_check"
 # ⚠ EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
 # down says a probe that lives only in the source tree under ~/.cache is a
 # board round that does not happen -- and then only prefill_control.sh was
 # listed, so every board_*.sh written since has been exactly that: reachable
 # by a path nobody types.
 PROBE_SCRIPTS="prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
-board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh board_threads.sh"
+board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh \
+board_threads.sh board_w4_m8.sh vattn_sweep.sh vattn_edges.sh \
+board_text_all.sh board_refused_onedev.sh board_chunk_sweep.sh board_intermittent.sh \
+board_width_law.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;

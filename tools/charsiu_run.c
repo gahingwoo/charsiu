@@ -35,6 +35,130 @@ static double now_ms(void)
 	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+/*
+ * ⚠⚠ A BATCHED PREFILL CHUNK IS EVEN, AND NEVER EIGHT.
+ *
+ * A batched int4 matmul carries the batch size m on the WIDTH axis, and the
+ * accumulator read order -- charsiu_acc_index, in src/job.c -- can only
+ * express an EVEN width. That is not read off the board's answers: the real
+ * function was linked into a standalone exhaustive checker and swept over
+ * m = 2..96 crossed with n = 512, 2048 and 8192, asking of every (m, n) that
+ * every index be in range, that no two collide, that none be left unwritten
+ * and that the four consecutive slots the gather relies on stay consecutive.
+ * Every even width is a clean bijection; every odd width COLLIDES, at every n,
+ * with no exceptions over 95 widths. Nor can it be patched: the map covers
+ * 64 * P slots per group where the group needs 32 * m, which meets only at
+ * P = m/2, and no integer P exists for an odd m. The surface is organised in
+ * pairs of rows, and an odd width is not a thing it can name.
+ *
+ * That is why two models produced wrong text. Phi-3.5's 87 token prompt at a
+ * chunk of 32 was 32, 32 and TWENTY THREE; Gemma-4-E2B's 88 was 32, 32 and 24
+ * and it was the odd sibling that broke. Llama-3.2-1B's 65 tokens were 32, 32
+ * and a tail of 1, which is below the batching minimum and went to the token
+ * loop, and its text has always been right.
+ *
+ * ⚠ EIGHT IS A DIFFERENT FAULT AND IS EXCLUDED SEPARATELY. m = 8 is even and
+ * its read order is a bijection, and the board still misses 33 rows of 904 at
+ * it -- unless CHARSIU_NPU_ONEDEV puts both K slices on one core, which makes
+ * it exact. That is the core pair, not the layout, and npudev.c refuses it
+ * with its own reason string for exactly that reason.
+ *
+ * ⚠⚠ AND THIS IS THE SPEED HALF, NOT THE SAFETY HALF. The safety half is
+ * w4_batch_why_not() in src/npudev.c, which refuses an odd width and m = 8 and
+ * sends that chunk to a correct row at a time path. This is what stops the
+ * runtime ever asking for one. The two encode the same law and CANNOT SEE EACH
+ * OTHER -- there is no header they can share without exporting a predicate
+ * that only these two callers want -- so they must be kept in step by hand. If
+ * they fall out of step the result is a refused chunk run a row at a time:
+ * slower, and the same text. That asymmetry is the whole design; being too
+ * conservative here costs rate, being too generous costs correctness, and only
+ * npudev.c stands between the two.
+ *
+ * ⚠ IT IS APPLIED WHATEVER THE WEIGHTS ARE. This loop cannot see whether the
+ * device opened int4, int8, or never opened at all, and int8 has no known bad
+ * width. A CPU only or int8 prefill therefore pays an even chunk it does not
+ * need -- one token of a long prompt moved into the token loop, identical
+ * output. That is the cheap direction.
+ */
+static int prefill_width(int rem, int cap)
+{
+	int w = rem < cap ? rem : cap;
+
+	w &= ~1;	/* an odd width has no expression on the surface */
+	/*
+	 * ⚠ 4 + 4 RATHER THAN 6 + 2, and the two cost the same: two batched
+	 * calls over the same eight tokens either way. 4 is a width the board
+	 * has measured EXACT on 225 to 277 real tensors; 6 is even, so the
+	 * layout proof covers it, but it has never been run on this hardware --
+	 * and m = 8 is the standing proof that an even width can still be
+	 * wrong for a reason the layout knows nothing about. When a split is
+	 * forced anyway, take the arm with the board evidence.
+	 */
+	/*
+	 * ⚠⚠ 10 AS WELL AS 8, and the dense sweep is why. Both come back
+	 * missing ROW 0 of the n = 8192 tensors -- 62 of 64 at m = 8, 79 of 80
+	 * at m = 10 -- so the second fault is not one width, and the version
+	 * of this function that shipped an hour earlier would have handed the
+	 * hardware a 10 and been wrong on one row of every wide projection.
+	 *
+	 * 8 -> 4 + 4 and 10 -> 6 + 4: the same two calls either way, over
+	 * widths the board has measured EXACT (2, 4, 6, 12, 14, 16 ...) rather
+	 * than merely even. An even width the board has never run is trusted
+	 * on the layout proof, and m = 10 is the standing evidence that the
+	 * layout proof alone is not enough.
+	 */
+	if (w == 8)
+		w = 4;
+	else if (w == 10)
+		w = 6;
+	return w >= 2 ? w : 0;
+}
+
+/*
+ * ⚠ WHICH WIDTHS ACTUALLY RAN, on the line a round pastes out.
+ *
+ * "chunks of 32" is not a width: on 87 tokens it is 32, 32 and 23, and the 23
+ * was the whole question -- board_chunk_sweep.sh had to reconstruct it from
+ * the token count because nothing printed it. The chunks are not uniform any
+ * more, so they are counted by width and printed, and the line cannot be read
+ * as one number.
+ */
+struct prefill_widths {
+	int w[6];
+	int n[6];
+	int used;
+	int over;		/* more distinct widths than the table holds */
+};
+
+static void prefill_note_width(struct prefill_widths *pw, int w)
+{
+	int i;
+
+	for (i = 0; i < pw->used; i++)
+		if (pw->w[i] == w) {
+			pw->n[i]++;
+			return;
+		}
+	if (pw->used == (int)(sizeof(pw->w) / sizeof(pw->w[0]))) {
+		pw->over = 1;
+		return;
+	}
+	pw->w[pw->used] = w;
+	pw->n[pw->used] = 1;
+	pw->used++;
+}
+
+static void prefill_say_widths(const struct prefill_widths *pw)
+{
+	int i;
+
+	for (i = 0; i < pw->used; i++)
+		fprintf(stderr, "%s%dx%d", i ? "+" : " (widths ",
+			pw->n[i], pw->w[i]);
+	if (pw->used)
+		fprintf(stderr, "%s)", pw->over ? "+.." : "");
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -56,6 +180,10 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
+"  --repeat N     run the same prompt N times in ONE process, so a rate\n"
+"                 question does not pay for N model loads. The cache is\n"
+"                 reset between them and each is separated by a marker\n"
+"                 line on stdout.\n"
 "  -i, --interactive  a conversation: the model and the NPU tensors stay\n"
 "                 staged, so every turn after the first costs a token and\n"
 "                 not the twenty seconds staging takes\n"
@@ -163,6 +291,23 @@ int main(int argc, char **argv)
 	const char *cache = NULL;
 	int hold_secs = 0;
 	int interactive = 0, turn;
+	/*
+	 * ⚠⚠ --repeat EXISTS BECAUSE THE PROBES WERE PAYING FOR A MODEL LOAD
+	 * PER SAMPLE.
+	 *
+	 * board_intermittent asks a rate question -- how often does the batched
+	 * prompt come back wrong -- and answered it by starting this program
+	 * once per sample: 16 runs an arm, three arms, plus controls, is 51
+	 * loads of a 2.2 GB model. Phi-3.5 stages in about eight seconds, so
+	 * the great majority of that round was spent re-uploading weights that
+	 * had not changed, to measure something that happens after they are
+	 * uploaded.
+	 *
+	 * This runs the same prompt N times in ONE process, resetting the cache
+	 * position between them, which is what -i already does for a
+	 * conversation. The model and the staged NPU tensors stay put.
+	 */
+	int repeat = 1;
 	char cachepath[1024];
 	double t_load, t0, t_prompt;
 	double temp_start = 0.0, t_half = 0.0;
@@ -200,6 +345,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--hold-secs")) hold_secs = atoi(NEXT());
 		else if (!strcmp(a, "-i") || !strcmp(a, "--interactive"))
 			interactive = 1;
+		else if (!strcmp(a, "--repeat") && i + 1 < argc)
+			repeat = atoi(argv[++i]);
 		else if (!strcmp(a, "--cache")) cache = "";
 		else if (!strcmp(a, "--cache-at")) cache = NEXT();
 		else if (!strcmp(a, "-q")) quiet = 1;
@@ -605,9 +752,48 @@ int main(int argc, char **argv)
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
 		int chunk = ec ? atoi(ec) : 32;
 		int done = 0;
+		/* which widths ran, for the line at the bottom of this block */
+		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
 
 		if (chunk < 2)
 			chunk = 2;
+		/*
+		 * ⚠ THE CHUNK IS A MAXIMUM, AND IT IS ROUNDED DOWN TO A WIDTH
+		 * THE HARDWARE CAN EXPRESS. CHARSIU_PREFILL_CHUNK is how every
+		 * sweep of this has been steered -- board_chunk_sweep.sh walks
+		 * 32 31 30 29 24 16 4 2 -- so it still has to be honoured, and
+		 * 31 and 29 are exactly the values that produced wrong text. It
+		 * caps the width instead of being used as one.
+		 *
+		 * ⚠ AND IT SAYS SO, ONCE. A sweep that asked for 31, silently
+		 * got 30 and printed "chunks of 31" would be a table indexed by
+		 * a number that never ran, which is the failure that sweep
+		 * exists to avoid.
+		 *
+		 * ⚠ UNDER charsiu_diag(), WHICH A CONVERSATION TURNS OFF. The
+		 * user who set the variable by hand is owed the answer that it
+		 * did not take -- and every probe and sweep runs one shot, with
+		 * diag on, so they all get it. Somebody talking to the model
+		 * with a stale variable in their environment is not owed a line
+		 * of machinery in the middle of the conversation.
+		 */
+		{
+			int want = chunk;
+
+			chunk = prefill_width(chunk, chunk);
+			if (chunk < 2)
+				chunk = 2;
+			if (chunk != want && charsiu_diag()) {
+				static int said;
+
+				if (!said++)
+					fprintf(stderr, "charsiu: "
+						"CHARSIU_PREFILL_CHUNK=%d is "
+						"not a width this hardware can "
+						"batch; using %d\n",
+						want, chunk);
+			}
+		}
 		/*
 		 * ⚠ A PROMPT WITH A PICTURE IN IT TAKES THE TOKEN LOOP. The
 		 * batched path builds its rows from the embedding table by
@@ -626,19 +812,38 @@ int main(int argc, char **argv)
 					st->pos);
 			done = n_img_at;
 		} else if (!getenv("CHARSIU_NO_BATCH_PREFILL") && n_ids >= 2) {
-			int probe = n_ids < chunk ? n_ids : chunk;
+			/*
+			 * ⚠ EVERY CHUNK IS AN EVEN WIDTH, so AT MOST ONE token
+			 * ever falls through to the token loop below -- 87
+			 * tokens at a cap of 32 is 32 + 32 + 22 and a single
+			 * token, where the old form ran a 23 the hardware
+			 * cannot express.
+			 *
+			 * ⚠ THE FALLBACK IS STILL DECIDED ONCE, and the two
+			 * ways out of this loop are not the same thing. A
+			 * REFUSAL by llama_prefill_batch on the first chunk
+			 * leaves done at 0 and sends the whole prompt through
+			 * the token loop, which is what the comment above is
+			 * about. RUNNING OUT of width is not a refusal: it
+			 * happens with at most one token left, and that token
+			 * was always going to the token loop.
+			 */
+			int probe = prefill_width(n_ids, chunk);
 
-			if (!llama_prefill_batch(st, &m, ids, probe, st->pos)) {
+			if (probe >= 2 &&
+			    !llama_prefill_batch(st, &m, ids, probe, st->pos)) {
 				done = probe;
+				prefill_note_width(&pw, probe);
 				while (done < n_ids) {
-					int c = n_ids - done < chunk
-					      ? n_ids - done : chunk;
+					int c = prefill_width(n_ids - done,
+							      chunk);
 
 					if (c < 2 ||
 					    llama_prefill_batch(st, &m,
 							ids + done, c, st->pos))
 						break;
 					done += c;
+					prefill_note_width(&pw, c);
 				}
 				logits = st->logits;
 			}
@@ -657,30 +862,52 @@ int main(int argc, char **argv)
 		 */
 		if (!quiet && charsiu_diag()) {
 			const char *why = llama_batch_why_not(&m);
+			/*
+			 * ⚠ AND SAY SO ON THE BATCHED LINE, not only in the
+			 * one time warning far above it. This line is what
+			 * gets pasted out of a round, and "prompt batched" on
+			 * a model this tree refuses reads as good news.
+			 */
+			const char *forced = (why && getenv("CHARSIU_BATCH_FORCE"))
+					   ? " -- FORCED, this model is REFUSED"
+					   : "";
 
-			if (n_img_at >= 0)
+			/*
+			 * ⚠ THE CHUNKS ARE NO LONGER UNIFORM, so "chunks of
+			 * %d" is the CAP and the widths that ran follow it.
+			 * The line still opens "charsiu: prompt batched" and
+			 * still carries the token count, because that prefix
+			 * and that number are what board_chunk_sweep.sh,
+			 * board_text_all.sh and board_vendor.sh read.
+			 */
+			if (n_img_at >= 0) {
 				fprintf(stderr, "charsiu: prompt a token at a "
 					"time, with %u picture embeddings after "
 					"token %d\n", img_tok, n_img_at);
-			else if (done >= n_ids)
+			} else if (done >= n_ids) {
 				fprintf(stderr, "charsiu: prompt batched, %d "
-					"tokens in chunks of %d\n",
+					"tokens in chunks of %d",
 					n_ids, chunk);
-			else if (done > 0)
+				prefill_say_widths(&pw);
+				fprintf(stderr, "%s\n", forced);
+			} else if (done > 0) {
 				fprintf(stderr, "charsiu: prompt batched for "
 					"%d of %d tokens, the rest a token at "
-					"a time\n", done, n_ids);
-			else if (getenv("CHARSIU_NO_BATCH_PREFILL"))
+					"a time", done, n_ids);
+				prefill_say_widths(&pw);
+				fprintf(stderr, "%s\n", forced);
+			} else if (getenv("CHARSIU_NO_BATCH_PREFILL")) {
 				fprintf(stderr, "charsiu: prompt a token at a "
 					"time (CHARSIU_NO_BATCH_PREFILL)\n");
-			else if (n_ids < 2)
+			} else if (n_ids < 2) {
 				fprintf(stderr, "charsiu: prompt a token at a "
 					"time (it is one token)\n");
-			else
+			} else {
 				fprintf(stderr, "charsiu: prompt a token at a "
 					"time -- this model is not batched: "
 					"%s\n", why ? why : "the batch was "
 					"refused at run time");
+			}
 		}
 	}
 	t_prompt = now_ms() - t0;
@@ -1011,8 +1238,25 @@ next:
 			       produced - eog_at - 1);
 	}
 
-	if (!interactive)
-		break;
+	if (!interactive) {
+		if (turn + 1 >= repeat)
+			break;
+		/*
+		 * ⚠ THE CACHE POSITION, AND NOTHING ELSE. Everything the next
+		 * repeat reads at a position it is about to write is
+		 * overwritten from zero, so the cache contents do not need
+		 * clearing -- but pos does, or repeat two starts where repeat
+		 * one stopped and prefills a different length.
+		 *
+		 * ⚠ AND A MARKER ON STDOUT, because the caller has to be able
+		 * to split N answers out of one stream. Without it a comparison
+		 * would see one long string and call every repeat identical.
+		 */
+		st->pos = 0;
+		printf("\n--- charsiu repeat %d ---\n", turn + 2);
+		fflush(stdout);
+		continue;
+	}
 	}   /* the turn loop */
 	free(turnbuf);
 

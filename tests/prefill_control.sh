@@ -49,12 +49,38 @@ done
 [ -n "${RUN:-}" ] || { echo "prefill_control: charsiu_run not found" >&2; exit 1; }
 
 # --- the model -------------------------------------------------------------
+# ⚠⚠ AND IT PREFERS LLAMA EVEN WHEN OTHER MODELS ARE THERE, which is right and
+# is also how a round got wasted: told to "just run it, it will find gemma4",
+# this picked Llama-3.2 because that is the first pattern, ran perfectly, and
+# answered a question nobody had asked. The model IS printed at the top -- read
+# that line against the one you meant before reading the verdict.
+#
+# To check another architecture, PASS ITS PATH. There is no auto-detection that
+# could be right here: the number this script exists to explain is llama's.
+#
 # ⚠ int4, and llama, and SAID OUT LOUD. The 19.24 this exists to explain came
 # off Llama-3.2-1B-Instruct-Q4_0; another model is a different number that
 # cannot be compared to it, and another architecture may not batch at all.
 # ~/.charsiu/models first: that is the directory the installer chowns to the
 # user and the one charsiu-get fills.
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models"
+# ⚠ THE BOARD DIRECTORY TOO. board_vendor.sh falls back to $CHARSIU_BOARD_DIR
+# and pulls models into it, so a model that table can find was invisible here:
+# a round meant to check gemma4's text came back "no int4 gguf found" while
+# board_vendor.sh had just benchmarked that very file.
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
+# ⚠⚠ AND A PATH THAT WAS PASSED GETS ITS OWN MESSAGE. This said "no int4 gguf
+# found in <dirs> -- pass one" even when one HAD been passed and simply was not
+# there, which sends the reader to look in the wrong place. A search that
+# failed and an argument that is wrong are different faults.
+if [ -n "$MODEL" ] && [ ! -f "$MODEL" ]; then
+	echo "prefill_control: $MODEL does not exist" >&2
+	echo "  (that path was passed on the command line; nothing was searched)" >&2
+	for d in $DIRS; do
+		[ -d "$d" ] && ls "$d"/*.gguf 2>/dev/null | sed 's/^/  found: /'
+	done
+	exit 1
+fi
 if [ -z "$MODEL" ]; then
 	for pat in '*Llama-3.2*Q4_0*.gguf' '*llama*Q4_0*.gguf' '*Q4_0*.gguf'; do
 		for d in $DIRS; do
@@ -78,7 +104,19 @@ trap 'rm -rf "$D"' EXIT
 
 # The same counting prompt the 19.24 came from: the model continues the
 # sequence, so a wrong answer is visible without a reference.
-PROMPT=$(seq 1 32 | tr '\n' ' ')
+# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+#
+# board_text_all.sh spelled this literally and every other script built it with
+# `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
+# retokenises, and phi3 goes from 87 tokens to 88 -- a different last chunk, so
+# two scripts comparing "the same prompt" were not.
+#
+# It cost a whole reading. gemma4 came back 10 of 10 clean under the literal
+# form and 8 of 8 WRONG under the seq form, and that was written down as the
+# model flipping, on a day when the only code change was inside the probe.
+CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
+PROMPT="$(seq 1 32 | tr '\n' ' ')"
+PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 
 TASK=""
 command -v taskset >/dev/null 2>&1 && TASK="taskset -c 4-7"
@@ -96,6 +134,8 @@ export CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 # goes on the command line as a prefix and nowhere else.
 unset CHARSIU_NO_BATCH_PREFILL 2>/dev/null || true
 
+# ⚠ THE MODEL FIRST AND ON ITS OWN LINE, because the verdict at the bottom says
+# nothing about which file produced it.
 echo "model    $MODEL"
 echo "prompt   \"1 2 ... 32\",  gen $NGEN,  binary $RUN"
 echo
@@ -172,10 +212,16 @@ echo
 # The proof of the batched path is the PATH column and the rate above it, and
 # the proof of correctness is the text comparison below. This line is now the
 # m = 8 fallback counter and says so.
-echo "int4 batch refusals (m=8 falls back; every other width batches)"
+# ⚠ TWO KINDS NOW, COUNTED APART. m = 8 is the core pair and an ODD width is
+# the accumulator read order -- two different faults, and a single total would
+# hide which one a prompt met. Since the chunker only emits even widths, both
+# columns should read 0: an odd refusal here means the chunker let one through.
+echo "int4 batch refusals (both fall back a row at a time; both should be 0)"
+printf '%-9s %8s %8s\n' run "m=8" "odd m"
 for t in batched1 control batched2; do
-	printf '%-9s %s\n' "$t" \
-		"$(grep -c 'int4 at m=8' "$D/$t.log" || true)"
+	printf '%-9s %8s %8s\n' "$t" \
+		"$(grep -c 'int4 at m=8' "$D/$t.log" || true)" \
+		"$(grep -c 'an odd batch width' "$D/$t.log" || true)"
 done
 echo
 text_of batched1 >"$D/a.txt"; text_of control >"$D/b.txt"

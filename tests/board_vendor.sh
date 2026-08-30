@@ -26,6 +26,31 @@ set -eu
 REPEAT=${CHARSIU_BENCH_REPEAT:-1}
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$DIR"
+# ⚠⚠ PRICING THE CORRECTNESS FIX, AND THIS ARM RETURNS WRONG TEXT.
+#
+# The two NPU cores corrupt each other when their batched submits overlap --
+# phi3 at width 24 came back wrong 13 runs of 16 overlapped and 0 of 16
+# serialised -- so serialised is the default and it costs a batched
+# projection's parallelism. How much that costs is a fair question and it has
+# exactly one honest answer: run the broken configuration and read the clock.
+#
+# CHARSIU_VENDOR_PRICE_SERIAL=1 does that. Every number it produces is the
+# speed of an answer that may be wrong, it is not a configuration to ship, and
+# the banner says so on every round that sets it.
+PRICE_ENV=""
+if [ -n "${CHARSIU_VENDOR_PRICE_SERIAL:-}" ]; then
+	PRICE_ENV="CHARSIU_NPU_BATCH_PARALLEL=1"
+	echo "======================================================================"
+	echo "⚠⚠ CHARSIU_VENDOR_PRICE_SERIAL: the two cores' submits OVERLAP in"
+	echo "   this round. That is the configuration measured wrong 13 runs of"
+	echo "   16 on phi3. EVERY NUMBER BELOW IS THE SPEED OF A POSSIBLY WRONG"
+	echo "   ANSWER, and exists only to price what serialising costs."
+	echo "   Compare its TTFT column against a normal round; ship neither"
+	echo "   this build nor this conclusion without board_text_all.sh."
+	echo "======================================================================"
+	echo
+fi
+
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 [ -d "$MODELS" ] || MODELS=/opt/charsiu/models
 
@@ -114,9 +139,20 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	BEST_TT=; BEST_TS=; BEST_MB=; BEST_NP=; WORST_TT=; nrun=0
 	while [ $nrun -lt "$REPEAT" ]; do
 		nrun=$((nrun + 1))
-		OUT=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		# ⚠⚠ env, NOT A BARE ASSIGNMENT PREFIX. A shell only treats
+		# NAME=VALUE as an assignment when it is written literally in
+		# the command position; a VARIABLE that expands to NAME=VALUE is
+		# looked up as a COMMAND. Adding $PRICE_ENV to the prefix form
+		# turned four rows into
+		#
+		#   board_vendor.sh: 142: CHARSIU_NPU_BATCH_PARALLEL=1: not found
+		#
+		# `env` takes them as arguments, so an expanded one works.
+		# shellcheck disable=SC2086
+		OUT=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		      $PRICE_ENV \
 		      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \
 		      2>"$DIR/.v.err" | grep '^\[load') || OUT=""
 		[ -n "$OUT" ] || continue
@@ -157,7 +193,12 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# fence each, and the fence has been measured at 94% of the hardware
 	# path -- and one that fell back to the CPU. Nothing else in this table
 	# can tell those two apart.
-	grep -E "prompt batched|prompt a token|int4 at m=|not batched" \
+	# ⚠ MATCH THE REFUSAL BY ITS PREFIX, NOT BY ONE OF ITS REASONS. This
+	# read "int4 at m=", which is the m = 8 refusal's own words, so the
+	# odd-width refusal added later would have gone through this filter
+	# unseen -- a prefill silently falling back a row at a time, in the
+	# table that exists to tell exactly those two cases apart.
+	grep -E "prompt batched|prompt a token|NOT on the NPU|not batched" \
 		"$DIR/.v.err" | sed 's/^/     /' | sort -u || true
 	grep -E "^charsiu NPU: .*(submits|hardware path)" "$DIR/.v.err" \
 		| sed 's/^/     /' || true

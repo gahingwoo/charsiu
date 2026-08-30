@@ -28,7 +28,8 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
-     $(BUILD)/tokenizer_roundtrip
+     $(BUILD)/vattn_bench \
+     $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -57,6 +58,16 @@ $(BUILD)/charsiu_matmul: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 # missing half of itself. This prints the misses by name.
 $(BUILD)/charsiu_vision: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+# ⚠ THE ATTENTION IS HALF THE BOARD'S ENCODE AND 6% OF THE HOST'S, because the
+# board's matmuls go to the NPU and the host's do not. Timing it through the
+# whole tower on a host is reading the feed forward's noise; this drives the
+# one stage, at whatever shape is asked for.
+$(BUILD)/vattn_bench: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+$(BUILD)/vattn_bench.aarch64: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
 # ⚠ CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
 # model's: causal, pooled at the end of text token, its own BPE.
@@ -101,7 +112,8 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_wide.aarch64 $(BUILD)/charsiu_vendor.aarch64 \
        $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64 \
        $(BUILD)/charsiu_serve.aarch64 $(BUILD)/charsiu_vision.aarch64 \
-       $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64
+       $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64 \
+       $(BUILD)/vattn_bench.aarch64
 
 # ⚠ THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
 # round reaches for, and a tool that is only in the native build is one that has
@@ -159,6 +171,9 @@ $(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 
 $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
+	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread

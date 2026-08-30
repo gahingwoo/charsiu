@@ -144,6 +144,63 @@ unsigned charsiu_vision_width(const struct charsiu_vision *v);
  */
 int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out);
 
+/*
+ * The tower's self attention on its own: q, k, v and o are [n][W] with the
+ * heads laid side by side across W, and `scale` is 1/sqrt(head_dim).
+ *
+ * ⚠ EXPOSED BECAUSE IT IS THE HALF OF THE ENCODE THAT NEEDS MEASURING and the
+ * stage table cannot see it clearly on a host: here the matmuls are CPU and
+ * dwarf it, on the board they are NPU and it is half the run. tools/vattn_bench
+ * drives this directly so a change can be timed at the board's shape without
+ * the other six stages moving underneath it.
+ */
+void charsiu_vision_attention(const float *q, const float *k, const float *v,
+			      float *o, unsigned n, unsigned W,
+			      unsigned n_head, float scale);
+
+/*
+ * Which way the attention's blocks are handed to the thread pool: 0 flat, the
+ * original numbering, which puts every thread on a different head; 1 headwise,
+ * one dispatch per head so every thread is on the same keys, at the cost of a
+ * barrier per head; 2 share, the same locality with one dispatch and no extra
+ * barrier. CHARSIU_VATTN_SCHED=flat|headwise|share picks one. All three are bit
+ * identical and differ only in what stays in cache, so the right answer is the
+ * machine's, not the code's.
+ *
+ * ⚠ A HOST ANSWERS THIS WRONG FOR THE BOARD. Read the note above the function.
+ */
+/*
+ * How many queries share one pass over the keys and one over the values. The
+ * K and V traffic divides by it; the scores it has to hold are qb * n floats
+ * and stop fitting in cache. CHARSIU_VATTN_QB sets it.
+ *
+ * ⚠ RUNTIME SO IT CAN BE SWEPT IN ONE PROCESS. Two builds compared one after
+ * the other cannot tell a block size apart from the load on the machine.
+ */
+unsigned charsiu_vision_attn_qb(void);
+void charsiu_vision_attn_qb_set(unsigned qb);
+
+/*
+ * The fused kernel: the keys are tiled too, so the scores live qb * kt at a
+ * time in L1 instead of qb * n in L2, and the block size stops being capped by
+ * a scratch array. CHARSIU_VATTN_FUSED=0 restores the three pass kernel and
+ * CHARSIU_VATTN_KT sets the key tile.
+ *
+ * ⚠⚠ THIS IS THE ONE THAT CHANGES THE ANSWER. Everything else here reorders
+ * only the ISSUE of the arithmetic and is bit identical; a running maximum with
+ * a rescale is the same number in exact arithmetic and a few ulp away in f32.
+ * The exact kernel is kept as the control it has to be diffed against.
+ */
+int charsiu_vision_attn_fused(void);
+void charsiu_vision_attn_fused_set(int on);
+unsigned charsiu_vision_attn_kt(void);
+void charsiu_vision_attn_kt_set(unsigned kt);
+
+int charsiu_vision_attn_sched_get(void);
+void charsiu_vision_attn_sched_set(int sched);
+const char *charsiu_vision_attn_sched_name(int sched);
+#define CHARSIU_VATTN_SCHEDS 3
+
 /* (v - mean) / std, per channel, in place. */
 void charsiu_vision_normalise(const struct charsiu_vision *v, float *px);
 

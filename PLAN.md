@@ -675,6 +675,605 @@ never the whole story; returning the first reason would have cost a board round
 for each of these in turn. 17844 ms to a first token against Rockchip's 1219 --
 it is the worst number left on the table and it is four separate pieces of work.
 
+## m = 8 NEEDS BOTH NUMBERS, AND FOUR SUSPECTS ARE OUT
+
+A desktop round on the one width the batched int4 matmul still gets wrong. It
+found no cause. It removed four, and it did it with checks that could have
+failed rather than with argument.
+
+**The shape of the fault, restated as a conjunction.** m = 8 is exact at
+n = 512 and n = 2048. n = 8192 is exact at m = 2, 4, 16, 32, 48, 64 and 80.
+Only the two together fail, and only row 0. So nothing that is a function of
+one of them alone can be the cause -- which is almost everything on this path.
+
+```
+  the read order       a BIJECTION at all 32 (m, n) the probe reaches: m of
+                       2..80 crossed with n of 512, 2048, 5376, 8192. Every
+                       one covers [0, m*n) exactly once, no collision, no
+                       hole, nothing out of range, and the four-in-a-row
+                       property the gather needs unbroken at every j.
+                       ⚠ AND IT TAKES NO n. A channel enters only as
+                       G = ni/32 and its position inside a group of 32, so
+                       the map of an 8192 wide slice restricted to its first
+                       2048 channels IS the map of a 2048 wide one. It
+                       cannot be selective by n, and the board says the
+                       fault is.
+  the input packing    a function of m and k. gate and up have k = 2048 and
+                       so do attn_q, attn_o, attn_k, attn_v and the head,
+                       all exact at m = 8.
+  the register stream  SEPARABLE. 148 words emitted over m of 2..80 crossed
+                       with n of 512, 2048, 5376, 8192: every word moves
+                       with m or with n and NONE with both -- 0 joint
+                       entries. Stronger: not one word of the m=8 n=8192
+                       stream is a word that does not also appear, with the
+                       same value, in a shape the board proved exact.
+  0x40b8               4*T - W on 3328 of 3328 vendor int4 streams. 3 * M is
+                       the single chunk case of it. Confirmed, not fitted.
+```
+
+**And it is not the output surface's SIZE either.** (m=8, n=8192) and
+(m=32, n=2048) are both 262144 bytes and the second is exact, so any product
+of m and n -- bytes, floats, groups times positions -- is the same number for
+a shape that works. Whatever it is wants the two separately.
+
+### The vendor's output block, decoded, which is what settled 0x40b8
+
+Their int4 streams carry a CHUNK and a TOTAL, and that is what makes the rule
+readable. With T = 0x401c and W the stream's own width, exact on all 3328:
+
+```
+  0x4018   output base + 16 * (this chunk's first position)
+  0x401c   T, the TOTAL width -- not this chunk's
+  0x4028   T - W, the positions this chunk does not cover
+  0x40b8   4 * T - W
+  0x4020   W - 1, and 0x4034 the same
+```
+
+They split a prefill and charsiu does not: their (W, T) pairs are (32,32),
+(64,64), (80,96), (16,96), (80,128), (48,128), (40,64), (24,64), (40,96) and
+(40,128), so a 96 token prompt goes 80 then 16. Dispatching the whole width at
+once is T = W, and every one of those registers collapses to what job.c
+already emits -- 0x401c = M, 0x4028 = 0, 0x40b8 = 3M. The int8 head takes a
+different constant, 7 * W, read off their 8160 wide output head at W of 1, 32
+and 64.
+
+⚠ **16 BYTES A POSITION IS THE READ ORDER'S OWN CLAIM**, and this is the first
+time anything other than this board has said it. 0x4018 stepping by 16 for
+each position skipped means consecutive rows sit four floats apart in the
+output surface, which is exactly what `charsiu_acc_index` places at
+`(mi/2)*8 + (mi%2)*4`.
+
+⚠ **AND THEY NEVER DISPATCH int4 WIDER THAN 4096 OUTPUT CHANNELS.** Not once
+in the whole file. `CHARSIU_NPU_NMAX` defaults to 8192, so ffn_gate and ffn_up
+go as one slice twice as wide as anything the vendor asks for -- and they are
+the tensors that fail. That is a lead, not a cause: the same slice is exact at
+every other width.
+
+### What only the board can settle, and it is two environment variables
+
+`tests/board_w4_m8.sh`. Baseline first and it must reproduce 871 of 904, then:
+
+- `CHARSIU_NPU_ONEDEV=1` -- the two K slices stop running concurrently on two
+  cores. The batched path submits both devices before waiting on either, so
+  concurrency is its design, and round 362 measured two cores corrupting each
+  other through the shared CBUF three times in four. Exact at m = 8 on one
+  core means the fault is the PAIR and not the shape.
+- `CHARSIU_NPU_NMAX=4096` -- n = 8192 in two slices, the vendor's own widest.
+  Exact means the fault is the WIDTH.
+
+Both need `CHARSIU_NPU_W4_M8=1`, which is the only thing that lets the refused
+width reach the hardware. Its own name, not a second meaning for
+`CHARSIU_NPU_W4_BATCH`, so a round that sets the batch switch for another
+reason cannot quietly also let the broken width through.
+
+### Two things the probe could not say, and now can
+
+- **THE where-did-it-go SCAN, ON THE ROW THAT MISSED.** The row count says a
+  row is wrong and cannot say why, and absent and misplaced want different
+  next rounds. It reports how many of that row's wanted values are anywhere in
+  the batch and how many of its slots came back exactly zero. On a work budget:
+  the cost is (values scanned) * m * n, which is a second for the whole row at
+  8 by 8192 and 1.3e12 for the head at m = 80, so the line says how many
+  channels it managed to ask about.
+- **THE MISS LINES GO TO FORTY.** 33 rows was written down as "every ffn_gate
+  and ffn_up in the model, once each" and that is 32. There is a thirty third
+  miss nobody has ever seen, because the cap stopped at eight. If it is the
+  output head the rule is "slices 8192 wide"; if it is something with no 8192
+  in it the rule is not the width at all.
+
+### And a leak on the way
+
+`e->bout[d]` was reallocated without being given back. `charsiu_bo_alloc`
+overwrites the handle and the mapping in place, so every widening leaked an
+mmap, a GEM handle and its IOVA, per tensor per device. A prefill never
+notices -- its chunk is one fixed width and it runs once -- but the probe
+sweeps eight widths over 113 tensors on two devices, which on this model is
+about 840 MB thrown away in one run, on top of 620 MB of weights and against a
+32 bit window the batched path narrows addresses into without checking.
+
+## prep IS THE OUTPUT ALLOCATION, COUNTED
+
+```
+   m     prep    (alloc   times)
+  16       73    (alloc  72   x113)
+  32      134    (alloc 132   x113)
+  80      324    (alloc 321   x113)
+```
+
+**The allocation is 99% of prep and it happens once per tensor at every new
+width.** So it is real but one-off: a prefill chunks at one fixed 32, so the
+first chunk pays 113 allocations and the rest pay none, and `e->bout_m`
+persists, so a second prompt in the same process pays nothing at all. A 110
+token prompt is four chunks, which puts prep at about 33 ms amortised rather
+than 134.
+
+Which leaves, per batched matmul at m = 32 in a real prefill:
+
+```
+   read    223 ms   51%
+   pack    135      31%
+   fence    39       9%
+   prep     33       8%   one-off
+```
+
+**The gather is half of it.**
+
+## ⚠⚠ TWO MODELS WERE WRONG ON THE BOARD, AND THE SECOND WAS FOUND IN ONE ROUND
+
+`board_text_all.sh`, first run, nine models:
+
+```
+  Phi-3.5-mini-instruct-Q4_0   prompt batched   ⚠ TEXT DIFFERS
+       control  ... 30 31 32 33 34 3
+       batched  ... 30 31 32 Dayler DoD pays Difficult
+  Qwen2.5-1.5B, Qwen3-0.6B, SmolLM2-1.7B, SmolLM2-135M,
+  gemma-3-1b, tinyllama-1.1b, Llama-3.2-1B      text identical
+```
+
+**Phi-3.5 has been batching on this board and answering wrongly for as long as
+it has been batching.** Two wrong models in one round, from one script, says
+the gap was the check and not the luck: `prefill_control` prefers llama by
+design and nobody had ever pointed it at anything else.
+
+Refused, on the fact rather than the theory. ⚠ **`!L->wk` would not have caught
+it**: phi3's q, k and v are SUBTENSORS of one `attn_qkv` -- views with an
+offset into a bigger buffer -- so `wk` is not null and the old fused refusal
+never applied. What distinguishes phi3 is that its weights are views, and a
+staged view at m > 1 has never been exercised. The refusal tests for the views;
+whether they are the cause is a probe question.
+
+⚠ **AND THE TWO TABLES DISAGREE ABOUT GEMMA4.** `prefill_control` said its text
+DIFFERS; `board_text_all`, same prompt, said identical. Either the builds
+differed between the two runs or the fault is intermittent -- and intermittent
+is what a concurrency fault looks like, which is also what m = 8 turned out to
+be. Not resolved, and not to be assumed either way.
+
+### What the probe says about gemma4 so far
+
+On the width axis, `per_layer_model_proj` at m = 2 is **8960 of 8960 channels
+in place on both rows**. So the read order is right for it and A's first
+suspect is not obviously the culprit. The log was truncated before the width
+arm's per-m table, so the widths above 2 are unread.
+
+⚠ And the height control arm timed the NPU out:
+
+```
+  rocket 27708000.npu: NPU job timed out
+  rk_iommu: Enable stall request timed out
+  rk_iommu: Error during raw reset. MMU_DTE_ADDR is not functioning
+```
+
+That is the known dead-block state after a timeout. The control arm is the
+deliberately wrong one, so it is not a regression -- but a control that wedges
+the hardware makes everything after it in the same run suspect, and the m = 8
+row of that arm reads 0.70x with 1084 ms in the fence, which is the recovery.
+
+## ⚠⚠ GEMMA4'S BATCHED PROMPT IS WRONG ON THE BOARD, AND THE HOST COULD NOT SEE IT
+
+`prefill_control.sh` with gemma4's path, on the card:
+
+```
+  control  ... 30 31 32 33 34 35
+  batched  ... 30 31 32  1 2 3
+  text     ⚠ DIFFERS FROM THE CONTROL -- the rate is beside the point
+```
+
+3.5x to a first token, and wrong. **That is the failure this tree has shipped
+once and must not ship twice**, so the per layer embedding refusal is back, with
+this evidence in the comment, until the tensor is named.
+
+### Why every host check passed anyway, which is the part to keep
+
+On a machine with no NPU, `matmul_rows` falls back to a matvec a row. **The
+batched loop's ORDER runs and the batched MATMUL does not.** Six architectures,
+text identical to their token loops, top-12 logits compared, chunk sizes 2 to
+256, ASAN clean -- all of it exercised the half that was already right.
+
+Gemma4 is the first model whose per layer embedding projections
+(`pl_model_proj`, `pl_inp_gate`, `pl_proj`) are asked for m > 1 on the hardware
+at all. That was written down as the first place a board round should look, and
+it was.
+
+### And the check that would have caught it had only ever run llama
+
+`prefill_control.sh` prefers `*Llama-3.2*Q4_0*` by design -- the number it
+exists to explain is llama's. So qwen3, phi3, gemma3 and TinyLLAMA have been
+batching on this board with **nobody ever comparing their output there**. Their
+correctness rests on a host that cannot see this class of fault.
+
+`tests/board_text_all.sh` closes that: every Q4_0 model present, batched against
+its own token loop, in the int4 environment the board actually runs. It also
+says out loud that a model reading `prompt a token` is REFUSED and not verified
+-- "text identical" there means only that the token loop agrees with itself.
+
+## THE PROMPT IS 3.8x ON THE BOARD NOW
+
+`prefill_control.sh`, Llama-3.2-1B int4, on the card:
+
+```
+  batched1   65 tok in 1199 ms   54.23 tok/s
+  control    65 tok in 4399 ms   14.78 tok/s
+  batched2   65 tok in 1146 ms   56.74 tok/s
+  text       IDENTICAL to the control
+```
+
+**3.67x and 3.84x**, against 3.04x when the batched prefill first landed. The
+first write assign and the four entry read order table are what moved it since.
+
+⚠ **AND THIS ROUND WAS MEANT TO BE GEMMA4.** It ran llama, because
+prefill_control prefers `*Llama-3.2*Q4_0*` and always has -- the number it
+exists to explain is llama's -- and the instruction to "just run it, it will
+find gemma4" was simply wrong. The script printed `model ...` at the top the
+whole time. **Read that line against the one you meant before reading the
+verdict at the bottom**; a script that answers a different question perfectly
+looks exactly like a script that answered yours.
+
+Gemma4's board text is still owed, and it is the one thing standing between
+4977 ms and calling it a result.
+
+## THE BOARD KEPT EVERY ATTENTION DEFAULT, AND THE ROUND IS 10.32x THERE
+
+`vattn_sweep.sh`, on the card, n = 1024 x 12 layers, 8 threads:
+
+```
+  the round as a whole   14507 -> 1406 ms   10.32x   worst diff 1.15e-07
+```
+
+The host measured 3.71x for the same change. **The board is bandwidth bound and
+the host is compute bound, and the change removes bytes** -- 11.81 GB to
+1.12 GB across L1 for one image's attention -- so the board gains nearly three
+times as much. That is the transfer working in the direction it was predicted
+to.
+
+Every knob against its own control, on the card:
+
+```
+  schedule   flat 1.00   share 1.02   headwise 0.76      default: share
+  query blk  qb=64 8.24x  qb=128 8.29x  qb=256 7.74x     default: 64
+  key tile   kt=16 best; 32 0.97x, 256 0.78x, 512 0.56x  default: 16
+  fused      3.50x against the three pass kernel         default: on
+  blocked    1.90x against one pair at a time            default: on
+  poly exp   1.12x against glibc                         default: on
+```
+
+**All three defaults chosen on the desktop survive the board.** qb = 128 is
+0.6% ahead of 64, which is inside the noise even best of five; kt = 16 is the
+board's own best and every larger tile is worse; share is the board's best and
+`headwise` is 24% worse there against 0.76x on the host -- the barrier cost on
+4xA72 + 4xA53 that could not be seen on six equal cores.
+
+⚠ The fused kernel is 3.50x on the board against 1.18x on the host, and it is
+the one change that is not bit identical (8.5e-08). It is also now the single
+largest contributor. `CHARSIU_VATTN_FUSED=0` is the control if a caption ever
+looks wrong.
+
+### The sweep could not have run, and the reason had three parts
+
+`cannot open /opt/charsiu/vattn_sweep.sh`. The script was not in
+`PROBE_SCRIPTS`, its binary was not in `PROBE_BINS`, and the script defaulted to
+`build/vattn_bench` -- a path that only exists where it was compiled. Fixing
+the first alone would have failed at the second, and the first two alone would
+have failed at the third. All three, and the discovery proved from outside the
+source tree by argument and by PATH.
+
+### And prefill_control could not find gemma4, which is why its text is still open
+
+`no int4 gguf found in ... -- pass one`, printed while `board_vendor.sh` had
+just benchmarked that very file. Two faults: it did not look in
+`$CHARSIU_BOARD_DIR`, which is where that table falls back to and pulls models
+into; and when a path IS passed and is not there it blamed the search instead
+of the argument, which sends the reader to the wrong place. Both fixed, and it
+now lists what it did find.
+
+On the host, through the whole harness, gemma4 reads **text IDENTICAL to the
+control**. The board half is still owed.
+
+## 🏁 m = 8 IS THE CORE PAIR, AND IT IS NOT THE WIDTH
+
+`board_w4_m8.sh`, three arms, one variable each:
+
+```
+  baseline    m=8   871 of 904   worst 4.9e+05    (the control, and it failed as it must)
+  onedev      m=8   904 of 904   worst 0.00e+00   <-- every width, bit identical
+  nmax4096    m=8   874 of 904   worst 1.1e+05    still wrong
+```
+
+**One core is exact. Halving the slice width is not.** So the fault is the two
+K slices running concurrently on the two NPU cores, which round 362 had already
+measured corrupting each other through the shared CBUF -- three times in four
+when they carry the same configuration -- and not the 8192 width at all.
+
+And the where-did-it-go line, printed for the first row that missed, says the
+same thing from the other side:
+
+```
+  row 0 at m=8: 8192 of 8192 wanted values are somewhere in the batch,
+                and 0 of the row's 8192 slots came back exactly zero
+    wanted  -0.267  -0.3853  -0.1606  -0.1088  0.09762  0.08508
+    got     -0.267  -0.3853  -0.1606  -0.1088  0.09762  0.08508
+```
+
+**Every value is present, nothing is zero, and the leading six are exact.** The
+row is computed and written and then something steps on part of it. That is the
+shape of a concurrency fault, not of a layout error.
+
+⚠ **AND onedev IS 0.00e+00 AT m = 2 AND m = 4 TOO**, where two devices give
+5.10e-05. So the residual that has been called "float summation order" all
+along is the two devices each summing their own slices -- benign, but it was
+never actually identified until an arm removed it.
+
+### What this does not settle
+
+`CHARSIU_NPU_ONEDEV` is a pool level setting -- slots are assigned to devices
+when the pool is staged -- so "use one core for m = 8 only" is not a switch that
+exists today. And half the hardware for one width is a poor trade against a
+fallback that is already correct. The refusal stays until the shared resource is
+named.
+
+## 🏁 GEMMA4'S PROMPT BATCHES ON THE BOARD: 17564 -> 4977 ms
+
+```
+                before     now     theirs
+  Qwen3          1792      1695     469
+  TinyLLAMA      2162      2076     544
+  Phi3           6551      6110    1829
+  Gemma4        17564      4977    1219     3.5x
+```
+
+⚠⚠ **AND ITS TEXT IS NOT VERIFIED ON THE BOARD.** `board_vendor.sh` compares no
+output, and `prefill_control.sh` ran llama. Gemma4's per layer embedding
+tensors -- `pl_model_proj`, `pl_inp_gate`, `pl_proj` -- had never been asked for
+m > 1 on the NPU before this round, which is exactly where a wrong answer at
+speed would come from. `prefill_control.sh` takes a model argument; point it at
+gemma4 before believing 4977.
+
+## 🏁 THE TOWER'S ATTENTION ON THE BOARD: 4010 -> 1471 ms
+
+```
+                     before            now
+  attention      4010 ms  49.2%    1471 ms  27.0%
+  feed forward   2393     29.4%    2308     42.3%   <-- the target now
+  encoder        9910 ms            6990 ms
+```
+
+2.7x on the stage, and the board confirms what the change predicted: the feed
+forward is what to look at next.
+
+⚠ **AND THE SWEEP DID NOT RUN**: `cannot open /opt/charsiu/vattn_sweep.sh`. Six
+attention knobs are still at defaults chosen on a compute bound desktop while
+the board is bandwidth bound. The script was not in `PROBE_SCRIPTS` and its
+binary was not in `PROBE_BINS` -- **and the script also looked for
+`build/vattn_bench`, a path that exists only where it was compiled**, so
+shipping it alone would have failed one line further on. All three fixed, and
+the discovery proved from outside the source tree, by PATH and by argument.
+
+## THE OTHER TWO LOOP SHAPES ARE WORSE, MEASURED ON THE DESKTOP
+
+The gather's cache line waste suggested walking the source instead. Both
+alternatives were written and timed against the real read order, all three
+producing the same result:
+
+```
+  m=32 n=2048    gather 0.5 ms    scatter 5.1 (0.09x)    blocked 2.7 (0.17x)
+  m=32 n=8192    gather 1.9       scatter 21.7           blocked 10.8
+  m=80 n=2048    gather 1.0       scatter  9.6           blocked  6.4
+```
+
+**scatter** walks `fo` sequentially and writes scattered: 8 to 11 times slower,
+because a partial line WRITE costs a read for ownership and then the write
+while a partial line read costs only the read. **blocked** takes one 32P source
+block at a time, which is m rows by 16 channels -- and 16 floats is exactly one
+cache line, so the reads sit in a 64m byte window and every write is whole:
+still 4 to 6 times slower.
+
+⚠ The first scatter measurement had a division in its inner loop that the
+gather did not have. Removing it changed 0.10x to 0.08x, so it was not what
+made the difference -- but it was a confound in one arm and not the other, and
+it was found by reading the loop rather than by the numbers looking wrong.
+
+⚠⚠ **AND THE DESKTOP CANNOT SETTLE THE BOARD'S VERSION OF THIS.** Here `fo` is
+warm after the first repetition; on the board it is a DMA buffer that was just
+invalidated, so every line is a cold DRAM read. The ordering of three loop
+shapes should carry -- a read for ownership is a read for ownership -- but the
+75% of roof arithmetic is still a hypothesis, and this does not test it.
+
+**What would**: time a pass that reads `fo` sequentially and discards it against
+the gather over the same bytes, on the board. Four times the per byte cost says
+the line waste is real; the same cost says the limit is somewhere else, and the
+invalidate is the obvious somewhere.
+
+Nothing was changed on the strength of any of this. Two loops written, timed
+and thrown away, and the record of it is what stops them being written again.
+
+## THE NEON GATHER BOUGHT NOTHING, AND THE ARITHMETIC SAYS WHY
+
+```
+   m         2    16     32     48     64     80
+  read before 6   103    223    320    580    555
+  read after  6   101    229    337    562    580
+```
+
+**Nothing, and some rows worse.** Correctness held at every width, so the
+vector form was right; it just did not matter. It is out of the tree again --
+a change that measures nothing is complexity for free -- and what it taught
+stays in the comment.
+
+### Why: it was never instruction bound
+
+The gather moves Y once per K slice, read and written: about 403 MB at m = 32
+and 1007 MB at m = 80, in 229 and 580 ms. **1.76 and 1.74 GB/s -- the same rate
+at both widths**, which is the signature of a bandwidth limit rather than a
+per-element cost.
+
+And a run is **16 bytes where a cache line is 64**, and the runs are scattered,
+so the DRAM is asked for four times what is used:
+
+```
+   useful 1.75 GB/s  x4 for the line  =  ~7.0 GB/s   against this board's 9.4
+                                                      roof, 75% of it
+```
+
+Fewer instructions cannot move a number that is already at three quarters of
+the memory roof. **The only lever left on the gather is fewer BYTES**, and
+there is one: the destination is scattered but the SOURCE is contiguous, so
+walking `fo` sequentially and scattering into Y would use whole lines instead of
+a quarter of each. That is a different loop, not a wider one.
+
+⚠ **AND I DID NOT PREDICT A NUMBER THIS TIME**, having said the round before
+that prep would collapse and watched it move 12%. The refusal to predict was
+right and the change was still worth making: it cost one round and it converted
+"the gather is slow" into "the gather is at 75% of the roof and the waste is
+the cache line".
+
+## ⚠ prep WAS NOT THE MEMSET, AND THE BOARD SAID SO IMMEDIATELY
+
+The zero of Y is gone -- assign on first write, correctness held at every width
+-- and `prep` moved 12%:
+
+```
+   m      prep before   after       batched before   after      read before  after
+  32          155        136             600          542           264       224
+  48          224        199             860          799           373       328
+  80          353        333            1425         1306           647       554
+```
+
+**The prediction was that prep would collapse to nothing. It did not.** The
+417 MB/s that looked like a memset rate was a coincidence: anything linear in m
+divided by anything linear in m gives a constant, and that constant was taken
+as evidence.
+
+What the change did buy is 8 to 10% overall, and most of it landed in **`read`,
+which was not predicted at all** -- assigning instead of accumulating means the
+gather never has to fetch Y before writing it, and that read-for-ownership was
+a third of the gather's traffic.
+
+So the change is right and the reason given for it was wrong. Both are worth
+writing down.
+
+### What prep actually is, counted rather than argued
+
+The remaining candidate is the output buffer, whose size is
+`wide * m * 4 * most` and which the kernel zeroes when it allocates. It is
+allocated only when `e->bout_m < m`, so a probe that sweeps m reallocates all
+113 tensors at every width while a real prefill, whose chunk is one fixed 32,
+pays it on the first chunk and never again.
+
+That is countable. `prep` now prints `alloc N xM` beside it -- the time inside
+the allocation and how many times it happened -- so the next round says whether
+prep is a real cost or an artifact of sweeping, instead of another curve being
+argued about.
+
+## THE ACCOUNTING CLOSES, AND prep LOOKED LIKE A MEMSET
+
+`rest` is 0 at every width. The five segments, width arm:
+
+```
+   m   batched   prep   pack   submit  fence   read   rest
+   2       76       3     25      2      40      7      0
+  16      282      80     72      3      24    104      0
+  32      600     155    139      4      38    264      0
+  80     1425     353    329      6      91    647      0
+```
+
+At m = 32: **read 44%, prep 26%, pack 23%, fence 6%, submit 1%.** The CPU is
+93% of a batched matmul and the hardware is 7%.
+
+**And `prep` is the memset of Y, not the allocation beside it.** It grows
+linearly with m -- 3, 5, 80, 155, 224, 284, 353 -- where a per-(tensor, m)
+allocation would be flat. Llama-3.2-1B has 505088 output channels across its
+113 tensors, so Y is 64.6 MB at m = 32 and 161.6 MB at m = 80: 417 and
+458 MB/s. **The same rate at both widths**, which is what says it is one pass
+over the output and not a fixed cost.
+
+### So the output is written twice, and the first pass is for nothing
+
+The gather accumulates because a tensor's K slices each contribute a partial
+sum, which is why Y had to start at zero. The first contribution to an output
+range can assign instead, and then nothing needs zeroing but a byte per n
+slice.
+
+⚠⚠ **AND "ki == 0 ASSIGNS" WOULD HAVE BEEN WRONG.** Slices go to the two
+devices as `(ki * ns + ni) & 1`, which is the slot index's own parity, so for
+an odd `ns` the same output range's ki = 0 and ki = 1 land on DIFFERENT
+devices -- and the read loop walks devices outermost, so ki = 1 can be read
+first and the assignment would have clobbered it. The flag is per output range
+and it is set after the row loop, not inside it, because every row of a slot
+shares it.
+
+Checked before it ships: the two schemes simulated against the real
+interleaving -- 180 cases over ns of 1 to 8, ks of 1 to 8, m of 2 to 32 and one
+or two devices, **0 mismatched** -- with the new scheme's Y starting as NaN, so
+an output range that never gets assigned cannot hide.
+
+⚠ Not on the board. What it should move is `prep`, and through it a quarter of
+every batched matmul.
+
+## WHERE THE TIME IS NOW: the batched prefill is CPU bound
+
+The probe's own breakdown of a batched matmul, at the widths it sweeps:
+
+```
+   m    batched   read (CPU)   pack (CPU)   fence (HW)  submit   unaccounted
+   2       76 ms    7    9%    24   32%     40   53%      2          3
+   4       91       15  16%    32   35%     38   42%      2          4
+  16      281      104  37%    72   26%     24    9%      3         78
+  32      606      269  44%   139   23%     39    6%      4        155
+  48      858      370  43%   197   23%     56    7%      4        231
+  64     1255      620  49%   268   21%     73    6%      5        289
+  80     1440      645  45%   326   23%     91    6%      6        372
+```
+
+**At m = 32, the width `llama_prefill_batch` actually chunks at: the hardware
+is 7% and the CPU is 67%.** At m = 2 the fence is 53%. Batching did not make
+the hardware faster -- it moved the cost off the hardware and onto the CPU, and
+what is left to win is a gather and a pack, not a register.
+
+⚠⚠ **AND 26% OF IT HAD NO NAME.** The four segments came to 451 ms of 606 and
+the rest was unaccounted, which is four times the fence. Optimising the 44%
+share while a 26% one is anonymous is exactly what this tree has been caught
+doing before, so `prep` is the fifth segment: everything from entry to the
+first packed byte, which is `batch_bufs`, the output allocation and the memset
+of Y. The probe prints all five with the remainder beside them now, so a
+breakdown that stops adding up says so instead of being added up by hand later.
+
+⚠ **AND IT MAY BE MOSTLY THE PROBE.** The output buffer is allocated when
+`e->bout_m < m`, so a sweep that walks m reallocates every tensor at every
+width, while a real prefill chunks at one fixed 32 and pays it once. The
+counter is what tells those apart. Nothing should be done about the 26% until
+the next round says which it is.
+
+### So the order of work, by the board's own numbers
+
+1. **`read`, 44%** -- the accumulator gather. Four consecutive slots already;
+   the inner loop moves four floats, which is one vector, and it is not
+   vectorised. Threading it lost twice on the pool's own grain and the note
+   there says why: the work per dispatch is one tensor's rows, which does not
+   pay for a wakeup. The caller's loop is the grain that might.
+2. **`pack`, 23%** -- the activation into the NPU's input layout, plus the
+   register emission and the bo teardown, which share the timer.
+3. **`prep`, up to 26%** -- name it before touching it.
+4. The fence is 6%. It is not where the time is any more.
+
 ## Best of three, and the numbers are trustworthy now
 
 ```
