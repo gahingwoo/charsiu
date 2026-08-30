@@ -3148,6 +3148,40 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 */
 	WHY(m->n_embd_pl, "per layer embeddings, and the board says the batched"
 	    " matmul is wrong on them (the host cannot see it: no NPU)");
+	/*
+	 * ⚠⚠ AND PHI3, FOUND THE SAME DAY BY THE CHECK THAT SHOULD HAVE
+	 * EXISTED ALL ALONG.
+	 *
+	 * board_text_all.sh, first run, on the card:
+	 *
+	 *   control  ... 30 31 32 33 34 3
+	 *   batched  ... 30 31 32 Dayler DoD pays Difficult
+	 *
+	 * Phi-3.5 has been batching on this board and answering wrongly for as
+	 * long as it has been batching, because prefill_control prefers llama
+	 * and nobody ever pointed it at anything else. Two wrong models in one
+	 * round from one script says the gap was the check, not the luck.
+	 *
+	 * ⚠ WHY THIS TEST AND NOT `!L->wk`. phi3's q, k and v are SUBTENSORS
+	 * of one attn_qkv -- views with an offset into a bigger buffer, made
+	 * by subtensor() -- and it is the only architecture here that has any.
+	 * `L->wk` is not null for it, so the old fused refusal never applied;
+	 * what distinguishes it is that its weights are views, and a staged
+	 * view at m > 1 is the thing that has never been exercised.
+	 *
+	 * That is a hypothesis about the cause and a fact about the model.
+	 * The refusal rests on the fact. `board_w4_axis.sh <phi3>` names the
+	 * tensor.
+	 */
+	{
+		int views = 0;
+
+		for (uint32_t l = 0; l < m->n_layer; l++)
+			if (m->layers[l].wq == &m->layers[l].split[0])
+				views = 1;
+		WHY(views, "weights that are views into a fused tensor, and the"
+		    " board says the batched matmul is wrong on them");
+	}
 #undef WHY
 	if (n)
 		return buf;

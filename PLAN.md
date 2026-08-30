@@ -818,6 +818,56 @@ Which leaves, per batched matmul at m = 32 in a real prefill:
 
 **The gather is half of it.**
 
+## ⚠⚠ TWO MODELS WERE WRONG ON THE BOARD, AND THE SECOND WAS FOUND IN ONE ROUND
+
+`board_text_all.sh`, first run, nine models:
+
+```
+  Phi-3.5-mini-instruct-Q4_0   prompt batched   ⚠ TEXT DIFFERS
+       control  ... 30 31 32 33 34 3
+       batched  ... 30 31 32 Dayler DoD pays Difficult
+  Qwen2.5-1.5B, Qwen3-0.6B, SmolLM2-1.7B, SmolLM2-135M,
+  gemma-3-1b, tinyllama-1.1b, Llama-3.2-1B      text identical
+```
+
+**Phi-3.5 has been batching on this board and answering wrongly for as long as
+it has been batching.** Two wrong models in one round, from one script, says
+the gap was the check and not the luck: `prefill_control` prefers llama by
+design and nobody had ever pointed it at anything else.
+
+Refused, on the fact rather than the theory. ⚠ **`!L->wk` would not have caught
+it**: phi3's q, k and v are SUBTENSORS of one `attn_qkv` -- views with an
+offset into a bigger buffer -- so `wk` is not null and the old fused refusal
+never applied. What distinguishes phi3 is that its weights are views, and a
+staged view at m > 1 has never been exercised. The refusal tests for the views;
+whether they are the cause is a probe question.
+
+⚠ **AND THE TWO TABLES DISAGREE ABOUT GEMMA4.** `prefill_control` said its text
+DIFFERS; `board_text_all`, same prompt, said identical. Either the builds
+differed between the two runs or the fault is intermittent -- and intermittent
+is what a concurrency fault looks like, which is also what m = 8 turned out to
+be. Not resolved, and not to be assumed either way.
+
+### What the probe says about gemma4 so far
+
+On the width axis, `per_layer_model_proj` at m = 2 is **8960 of 8960 channels
+in place on both rows**. So the read order is right for it and A's first
+suspect is not obviously the culprit. The log was truncated before the width
+arm's per-m table, so the widths above 2 are unread.
+
+⚠ And the height control arm timed the NPU out:
+
+```
+  rocket 27708000.npu: NPU job timed out
+  rk_iommu: Enable stall request timed out
+  rk_iommu: Error during raw reset. MMU_DTE_ADDR is not functioning
+```
+
+That is the known dead-block state after a timeout. The control arm is the
+deliberately wrong one, so it is not a regression -- but a control that wedges
+the hardware makes everything after it in the same run suspect, and the m = 8
+row of that arm reads 0.70x with 1084 ms in the fence, which is the recovery.
+
 ## ⚠⚠ GEMMA4'S BATCHED PROMPT IS WRONG ON THE BOARD, AND THE HOST COULD NOT SEE IT
 
 `prefill_control.sh` with gemma4's path, on the card:
