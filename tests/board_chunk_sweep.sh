@@ -101,15 +101,26 @@ echo "prompt is ${NTOK:-?} tokens"
 echo "control (token loop): ...$(tr -d '\n' < "$T/c.out" | tail -c 52)"
 echo
 
-printf '%-7s %-14s %-9s %s\n' chunk widths text path
+# ⚠⚠ REPEATS, BECAUSE ONE RUN A CELL CANNOT SEE AN INTERMITTENT FAULT -- and
+# this one is intermittent. Chunk 32 came back `same` in the sweep that found
+# 29 and 24 wrong, on the same board, in the same minute, from the command that
+# had produced wrong text twice before. A table of one run a cell invites
+# exactly the pattern I then read off it.
+REPS=${CHARSIU_CHUNK_REPS:-3}
+printf '%-7s %-14s %-9s %s\n' chunk widths runs path
 printf '%-7s %-14s %-9s %s\n' ----- ------ ---- ----
-ngood=0; nbad=0; taildiv=""; tailrem=""
+ngood=0; nbad=0; nflaky=0; taildiv=""; tailrem=""; counter=""
 for c in $CHUNKS; do
-	# shellcheck disable=SC2086
-	env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$c" "$RUN" \
-		"$MODEL" -p "$PROMPT" -n "$NGEN" --ignore-eos \
-		>"$T/b.out" 2>"$T/b.err"
-	sed -i 's/^\[.*//' "$T/b.out"
+	agree=0; r=1
+	while [ "$r" -le "$REPS" ]; do
+		# shellcheck disable=SC2086
+		env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$c" "$RUN" \
+			"$MODEL" -p "$PROMPT" -n "$NGEN" --ignore-eos \
+			>"$T/b.out" 2>"$T/b.err"
+		sed -i 's/^\[.*//' "$T/b.out"
+		cmp -s "$T/c.out" "$T/b.out" && agree=$((agree + 1))
+		r=$((r + 1))
+	done
 	# ⚠ WHAT WIDTHS THIS CHUNK ACTUALLY RAN, spelled out. "chunk 32" is
 	# not a width -- on 87 tokens it is 32, 32 and 23, and the 23 is the
 	# whole question.
@@ -124,21 +135,39 @@ for c in $CHUNKS; do
 	# 3" and "chunks of 2", so the column that says which chunk ran
 	# disagreed with the column that asked for it.
 	p=$(grep -oE "prompt batched.*" "$T/b.err" | head -1 | cut -c1-48)
-	if cmp -s "$T/c.out" "$T/b.out"; then
-		v=same; ngood=$((ngood + 1))
-		[ "${rem:-1}" -eq 0 ] && taildiv="$taildiv $c"
+	if [ "$agree" -eq "$REPS" ]; then
+		v="$agree/$REPS same"; ngood=$((ngood + 1))
+		if [ "${rem:-1}" -eq 0 ]; then taildiv="$taildiv $c"
+		else counter="$counter right-with-tail:$c/$rem"; fi
+	elif [ "$agree" -eq 0 ]; then
+		v="0/$REPS DIFFER"; nbad=$((nbad + 1))
+		if [ "${rem:-0}" -ne 0 ]; then tailrem="$tailrem $c/$rem"
+		else counter="$counter wrong-no-tail:$c"; fi
 	else
-		v="DIFFERS"; nbad=$((nbad + 1))
-		[ "${rem:-0}" -ne 0 ] && tailrem="$tailrem $c/$rem"
+		# ⚠ THE MOST IMPORTANT CELL IN THE TABLE. Same command, same
+		# board, both answers. Nothing about widths explains this.
+		v="$agree/$REPS FLAKY"; nflaky=$((nflaky + 1))
 	fi
 	printf '%-7s %-14s %-9s %s\n' "$c" "$w" "$v" "${p:-?}"
-	[ "$v" = same ] || printf '        got: ...%s\n' \
+	[ "$agree" -eq "$REPS" ] || printf '        last wrong: ...%s\n' \
 		"$(tr -d '\n' < "$T/b.out" | tail -c 52)"
 done
 
 echo
 echo "======================================================================"
-if [ "$nbad" -eq 0 ]; then
+# ⚠⚠ INTERMITTENCY OUTRANKS EVERY OTHER READING. If one chunk gave both
+# answers, then no row in this table is a property of its width, and the
+# tail-versus-no-tail story cannot be told at all.
+if [ "$nflaky" -gt 0 ]; then
+	echo "$nflaky CHUNK(S) GAVE BOTH ANSWERS. This fault is INTERMITTENT, so"
+	echo "nothing in the table above is a property of the width -- a chunk"
+	echo "that came back clean may simply not have failed this time."
+	echo
+	echo "Measure the rate before looking for a pattern:"
+	echo "  sh board_intermittent.sh $(basename "$MODEL")"
+	echo "and it also runs the CHARSIU_NPU_BATCH_ZERO control, which decides"
+	echo "whether assign-on-first-write is handing back a stale buffer."
+elif [ "$nbad" -eq 0 ]; then
 	echo "EVERY CHUNK GAVE THE CONTROL'S TEXT. This model's batched prompt is"
 	echo "right at every width tried, so whatever was seen wrong is not the"
 	echo "chunk width -- go back to the round that saw it and copy its exact"
@@ -150,10 +179,20 @@ elif [ "$ngood" -eq 0 ]; then
 	echo "width. Next: CHARSIU_DBG_LAYERS=1 on both paths -- it is the tool"
 	echo "that found gemma4's three, and it names the layer."
 else
-	echo "SOME CHUNKS ARE RIGHT AND SOME ARE WRONG, which is the answer this"
-	echo "sweep exists for. Read the widths column:"
+	echo "SOME CHUNKS ARE RIGHT AND SOME ARE WRONG. Read the widths column:"
 	[ -n "$taildiv" ] && echo "  right with no tail:$taildiv"
 	[ -n "$tailrem" ] && echo "  wrong with a tail (chunk/tail):$tailrem"
+	# ⚠⚠ AND THE ROWS THAT CONTRADICT IT, IN THE SAME BREATH. The first
+	# version of this summary listed only the rows that fitted the tail
+	# story, so a table containing "29, no tail, DIFFERS" and "32, tail 24,
+	# same" printed a verdict that read as clean support for it.
+	if [ -n "$counter" ]; then
+		echo "  ⚠ AGAINST THE TAIL STORY:$counter"
+		echo "    With those in the table the tail is NOT the rule."
+	else
+		echo "  no counter-examples: every wrong row has a tail and every"
+		echo "  right row has none."
+	fi
 	echo
 	echo "  If every wrong row has a tail and every right row has none, the"
 	echo "  fault is the LAST PARTIAL CHUNK -- a width the probe never asks"

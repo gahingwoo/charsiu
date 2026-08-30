@@ -1881,6 +1881,18 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 	return v;
 }
 
+static int batch_zero(void)
+{
+	static int z = -1;
+
+	if (z < 0) {
+		const char *e = getenv("CHARSIU_NPU_BATCH_ZERO");
+
+		z = e && *e != '0';
+	}
+	return z;
+}
+
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
@@ -2071,6 +2083,26 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		g->bseen_n = e->n_slices;
 	}
 	memset(g->bseen, 0, e->n_slices);
+	/*
+	 * ⚠⚠ THE CONTROL FOR ALL OF THE ABOVE, because assign-on-first-write
+	 * is the one thing here that can hand back a caller's stale buffer.
+	 *
+	 * If an output range never gets a first write -- a slice skipped, a
+	 * count off by one, a flag set for a range nothing covers -- then with
+	 * the memset gone Y keeps whatever was in it, and what was in it is
+	 * the PREVIOUS token's answer. That is invisible on a fresh buffer, it
+	 * is invisible whenever the stale value happens to be close, and it
+	 * looks exactly like the intermittent wrong text gemma4 and phi3 are
+	 * producing: right ten runs, then a sentence about practicing.
+	 *
+	 * CHARSIU_NPU_BATCH_ZERO=1 puts the whole-buffer zero back. It costs
+	 * the 26% this optimisation bought and it decides the question: if the
+	 * text goes right and STAYS right, the first-write bookkeeping is
+	 * wrong; if it stays wrong, this whole family is excluded and nobody
+	 * has to think about it again.
+	 */
+	if (batch_zero())
+		memset(Y, 0, (size_t)m * e->t->n * sizeof(*Y));
 	g->bprep_us += now_us() - tprep;
 	t0 = now_us();
 
