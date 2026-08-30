@@ -97,7 +97,7 @@ fi
 RUNS=${2:-8}
 CHUNK=${CHARSIU_INT_CHUNK:-32}
 NGEN=${CHARSIU_INT_NGEN:-8}
-ARMS=${CHARSIU_INT_ARMS:-"default onedev zero"}
+ARMS=${CHARSIU_INT_ARMS:-"default onedev serial"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
@@ -122,6 +122,8 @@ echo "config   chunk $CHUNK, gen $NGEN, $RUNS runs an arm"
 echo "arms     $ARMS"
 echo "  default  as shipped: two NPU cores"
 echo "  onedev   CHARSIU_NPU_ONEDEV=1 -- ONE core; the control for the core pair"
+echo "  serial   CHARSIU_NPU_BATCH_SERIAL=1 -- both cores, but never at the"
+echo "           same time: the candidate FIX, and it keeps decode's second core"
 echo "  zero     CHARSIU_NPU_BATCH_ZERO=1 -- a TIMING perturbation, not a"
 echo "           semantic control: the memset cannot change what the hardware"
 echo "           computes, so a failure only here is a race"
@@ -193,6 +195,7 @@ for ARM in $ARMS; do
 	case $ARM in
 	default) EXTRA="" ;;
 	onedev)  EXTRA="CHARSIU_NPU_ONEDEV=1" ;;
+	serial)  EXTRA="CHARSIU_NPU_BATCH_SERIAL=1" ;;
 	zero)    EXTRA="CHARSIU_NPU_BATCH_ZERO=1" ;;
 	*) echo "unknown arm '$ARM'" >&2; continue ;;
 	esac
@@ -227,6 +230,17 @@ d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
 two=0
 [ -n "$d" ] && [ "$d" -gt 0 ] && two=$((two + d))
 [ -n "$z" ] && [ "$z" -gt 0 ] && two=$((two + z))
+# ⚠ THE SERIAL ARM IS THE CANDIDATE FIX, so it is reported on its own line
+# whatever the rest says -- it is the only arm here that could ship.
+sr=${res_serial:-}
+if [ -n "$sr" ]; then
+	if [ "$sr" -eq 0 ]; then
+		echo "serial (both cores, never at once): $RUNS of $RUNS CLEAN"
+	else
+		echo "serial (both cores, never at once): WRONG $sr of $RUNS --"
+		echo "  so overlapping the two submits is not the whole story."
+	fi
+fi
 if [ -z "$o" ]; then
 	echo "The onedev arm did not run, so the core pair -- the one story that"
 	echo "already explains m = 8 and m = 10 -- was not tested. Run:"

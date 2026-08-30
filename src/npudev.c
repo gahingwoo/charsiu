@@ -2013,6 +2013,18 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 	return v;
 }
 
+static int batch_serial(void)
+{
+	static int z = -1;
+
+	if (z < 0) {
+		const char *e = getenv("CHARSIU_NPU_BATCH_SERIAL");
+
+		z = e && *e != '0';
+	}
+	return z;
+}
+
 static int batch_zero(void)
 {
 	static int z = -1;
@@ -2359,6 +2371,43 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		}
 		g->submits++;
 		g->bsub_us += now_us() - tp;
+		/*
+		 * ⚠⚠ THE CORE PAIR, AND THE ONE KNOB THAT REMOVES IT.
+		 *
+		 * Batched w4a16 is bit exact on ONE core and wrong on two, and
+		 * the board has now said so three ways: m = 8 is 62 of 64 on two
+		 * cores and 64 of 64 at worst 0.00e+00 on one; m = 10 is 79 of
+		 * 80 against 80 of 80; and phi3 at width 24 is wrong 26 runs of
+		 * 32 across two two-core arms and 0 of 16 on one core. The 33
+		 * misses of the uncapped m = 8 pass are all ROW 0 of the n =
+		 * 8192 tensors, and one core has none of them.
+		 *
+		 * The two cores share the CBUF and take different windows
+		 * (charsiu_job.cbuf_window = di), so the collision is not the
+		 * window index. What it IS has not been found, and the shape of
+		 * the evidence says it does not have to be: the loop above puts
+		 * both devices in flight at once, which is right for decode --
+		 * m = 1 has never shown this -- and is the only thing a batched
+		 * submit does that a single one does not.
+		 *
+		 * CHARSIU_NPU_BATCH_SERIAL=1 waits on each device before
+		 * submitting the next, so the two never run together. It costs
+		 * the parallelism of a batched projection and keeps decode's,
+		 * which is the trade the numbers above justify -- and unlike
+		 * CHARSIU_NPU_ONEDEV it does not give up the second core for
+		 * the whole process.
+		 *
+		 * ⚠ It is OFF by default until a board round says it is both
+		 * correct and worth its cost. A default changed on an untested
+		 * hypothesis is how this tree shipped a fast wrong answer once
+		 * already.
+		 */
+		if (batch_serial() && g->ndev > 1) {
+			double tf = now_us();
+
+			charsiu_bo_prep(g->dev[d], &e->bout[d], 2000000000);
+			g->bfence_us += now_us() - tf;
+		}
 	}
 
 	/* ⚠ both submitted, then both waited on: that is the point */
