@@ -461,10 +461,30 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
  * tower has had no such table and the board says it is 15.5 s against a vendor's
  * 768 ms for the same model, of which 3.1 s is the hardware.
  */
-enum { V_PATCH, V_QKV, V_ATTN, V_PROJ, V_FFN, V_NORM, V_SHUF, V_N };
+/*
+ * ⚠⚠ AND "feed forward" WAS TWO DIFFERENT MACHINES UNDER ONE ROW.
+ *
+ * The board's table read 2398 ms against a 5.7 s encode -- the largest single
+ * stage -- and that row was a pair of NPU matmuls AND a scalar libm loop added
+ * together. The two do not respond to the same thing and cannot be reasoned
+ * about as one number: the matmuls are 384 hardware dispatches whose cost is
+ * fixed by the 64 row chunk, and the activation is 3.1 million tanhf calls a
+ * layer on one core. Reading them as one row is how a memory-traffic story got
+ * told about a stage that was arithmetic.
+ *
+ * ⚠ AND THE RESIDUALS AND THE PATCH GATHER WERE IN NO ROW AT ALL. The row
+ * called "patch gather + embed" timed the embed only -- the gather ran above
+ * the line that turns the clock on -- and the two residual adds a layer, 18.9
+ * million elements over the tower, were never counted anywhere. A table whose
+ * rows do not add up to the encode is an instrument that hides its own
+ * remainder, which is exactly the failure it exists to prevent.
+ */
+enum { V_PATCH, V_QKV, V_ATTN, V_PROJ, V_FFN, V_ACT, V_NORM, V_RESID,
+       V_SHUF, V_N };
 static const char *const vstage_name[V_N] = {
 	"patch gather + embed", "q k v", "attention", "out proj",
-	"feed forward", "layernorms", "pixel shuffle + projector",
+	"feed forward matmuls", "ffn bias + activation", "layernorms",
+	"residual + position", "pixel shuffle + projector",
 };
 static double vstage_ms[V_N];
 static int vstage_on = -1;
@@ -477,9 +497,17 @@ static double vnow(void)
 	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
-#define VSTAGE(i, expr) do { \
+/*
+ * ⚠ VARIADIC BECAUSE A BLOCK IS NOT ONE MACRO ARGUMENT. Braces do not protect a
+ * comma from the preprocessor the way parentheses do, so `unsigned gy = a, gx =
+ * b;` inside a timed loop is two arguments and the build stops. Taking the rest
+ * as __VA_ARGS__ and pasting it back is what lets the patch gather -- which was
+ * never in the table at all -- be timed where it stands instead of being moved
+ * into a function for the instrument's convenience.
+ */
+#define VSTAGE(i, ...) do { \
 	double _t = vstage_on ? vnow() : 0.0; \
-	expr; \
+	__VA_ARGS__; \
 	if (vstage_on) vstage_ms[i] += vnow() - _t; \
 } while (0)
 
@@ -591,20 +619,218 @@ static void layernorm(float *out, const float *x, const float *w,
  * Neither is gated: a ViT's feed forward is fc1 -> activation -> fc2, with no
  * second branch to multiply against.
  */
-static void gelu(float *x, unsigned n, int tanh_form)
+/*
+ * ⚠⚠ AND BOTH OF THEM ARE ONE EXPONENTIAL, WHICH IS THE WHOLE OF THIS ROUND.
+ *
+ * The tanh form was written as written, with a tanhf per element, and that is
+ * 0.5 x (1 + tanh y). Since tanh y = 1 - 2/(e^2y + 1),
+ *
+ *     0.5 (1 + tanh y) = 1 / (1 + e^-2y)
+ *
+ * so gelu(x) = x / (1 + e^(-2 k (x + 0.044715 x^3))) -- the SAME function, one
+ * exponential instead of a hyperbolic tangent, and the same shape as gelu
+ * quick, which was already written that way. Not an approximation of the tanh
+ * form: an algebraic identity, and the measured disagreement over 3.1 million
+ * elements is 4.77e-07 absolute at x = 2.43, where gelu is 2.41 -- one float
+ * ulp, which is the summation order and nothing else. A dense sweep of
+ * [-20, 20] finds the same worst absolute and no larger.
+ *
+ * ⚠ GELU QUICK'S FORMULA DID NOT CHANGE AT ALL -- only its expf became
+ * charsiu_vexpq -- so the whole of the risk on that branch is the polynomial,
+ * and a dense sweep of [-25, 25] puts it at 2.24e-07 relative, one ulp again.
+ * It is checked separately because no model on this desk uses it: SmolVLM has
+ * clip.use_gelu 1, and a branch nothing runs is a branch nothing catches.
+ *
+ * ⚠ THE PRICE THIS WAS PAYING. A picture is 1024 patches, the feed forward is
+ * 3072 wide and there are twelve layers: 37.7 MILLION activations. On this
+ * development host, one layer's 3145728 elements:
+ *
+ *     bias pass, then tanhf     34.65 ms      <- what shipped
+ *     bias pass, then expf       2.66 ms
+ *     bias FOLDED IN, NEON       1.97 ms
+ *     the same across 6 threads  0.76 ms
+ *
+ * 45x on the pass, and there is nothing left here: 0.76 ms is what a bias pass
+ * ALONE costs on this host (0.77 ms), so what remains is moving 25.2 MB and no
+ * arithmetic worth naming.
+ *
+ * ⚠ AND IN SITU, in the tower's own table at SmolVLM-256M's shape, which is
+ * the reading that counts because it is the one a board can reproduce. One
+ * binary, one environment variable each, best of five interleaved:
+ *
+ *     CHARSIU_EXACT_GELU=1 CHARSIU_THREADS=1     373 ms   the old arithmetic
+ *     CHARSIU_EXACT_GELU=1                       103 ms
+ *     CHARSIU_THREADS=1                           26 ms   the identity alone
+ *     (default)                                   11 ms
+ *
+ * So 14x of it is the identity, which does not depend on how many cores there
+ * are and is the part certain to transfer, and 2.4x more is the pool on this
+ * host's six. What shipped was the 373 with a separate bias pass on top.
+ *
+ * ⚠ AND DO NOT READ THE WHOLE ENCODE OFF THIS HOST. The ffn matmul row beside
+ * these four numbers came back 4930, 4937, 5016, 5157, 5208, 5328, 5431, 5453,
+ * 5923, 6560 and 6637 ms for the SAME work -- this machine is shared and the
+ * spread is three times the thing being measured. Only the row moves; the wall
+ * clock cannot see it.
+ *
+ * ⚠ THE ANSWER MOVED BY ONE ULP AND THE CONTROL PROVES IT IS ONLY THIS. Over
+ * the 36864 embeddings a 512x512 image leaves as, against the binary from
+ * before this change: worst 3.33e-06 absolute on an output whose rms is 1.53,
+ * and 5.06e-07 of that rms rms-for-rms. With CHARSIU_EXACT_GELU set the two
+ * binaries agree on all 36864 values BIT FOR BIT -- which is what says the
+ * folded bias, the threading and the stage split changed nothing, and the
+ * exponential is the only thing here that touches the numbers.
+ *
+ * ⚠ THE BOARD'S SHARE OF THAT IS AN ESTIMATE, not a reading, and this commit
+ * adds the row that turns it into one. Its pool reported 2680 ms of hardware
+ * across all 73 matmuls, and the two stages that are matmul-and-bias only --
+ * q k v at 1057 ms and out proj at 380 -- price the (1024, 768, 768) shape at
+ * about 29 ms, so the feed forward's own 24 matmuls come to roughly 1270 ms
+ * and the rest of its 2398 ms row, about 1130 ms, is this function plus the
+ * bias pass. That is 27 ns an element, against the 23 ns round 367 measured
+ * for glibc's expf on the same board -- consistent, and tanhf is the slower
+ * of the two everywhere it has been asked.
+ *
+ * ⚠ THE OVERFLOW BEHAVIOUR IS NOT THE SAME CODE BUT IS THE SAME ANSWER, and it
+ * was checked rather than assumed. x^3 overflows f32 above 4.6e12; the cube
+ * then carries an infinity into the exponent, charsiu_vexpq clamps its input
+ * to [-88, 88] so the result stays finite, and x / (1 + e^-88) is x -- which
+ * is what gelu does out there. The scalar tail gets expf(-inf) = 0 and the
+ * same x. Neither path can make a NaN out of a finite input.
+ *
+ * CHARSIU_EXACT_GELU puts the tanhf form back, as the control that the change
+ * has to be diffed against. It is the same switch CHARSIU_EXACT_SILU and
+ * CHARSIU_EXACT_SOFTMAX are, for the same reason.
+ */
+static int gelu_exact(void)
 {
-	unsigned i;
+	static int v = -1;
 
-	for (i = 0; i < n; i++) {
-		float v = x[i];
+	if (v < 0)
+		v = getenv("CHARSIU_EXACT_GELU") != NULL;
+	return v;
+}
+
+/*
+ * y[0..n) <- act(y + b), for ONE row, with the bias folded into the same pass.
+ *
+ * ⚠ FOLDED, NOT SEQUENCED, AND THAT IS A SECOND SAVING ON TOP OF THE FIRST.
+ * rows_mul used to add the bias in a pass of its own and this function then
+ * read the whole intermediate back. At this tower's shape the intermediate is
+ * 1024 x 3072 x 4 = 12.6 MB, which is not in any cache on this board, so that
+ * was 12.6 MB read and 12.6 MB written per layer for an add -- 302 MB over the
+ * tower, about 42 ms of the board's 7.13 GB/s, thrown away to visit the same
+ * numbers twice. It is worth 0.69 ms of the 2.66 above.
+ *
+ * ⚠ b MAY BE NULL and the test is inside the vector loop on purpose: it is one
+ * perfectly predicted branch against a divide and a six term polynomial. The
+ * hand-hoisted form was written and timed interleaved against this one -- 2.13
+ * ms to this one's 2.09 over 3145728 elements -- so removing the branch is not
+ * worth two copies of the kernel.
+ */
+static void act_span(float *y, const float *b, unsigned n, int tanh_form)
+{
+	const float k2 = 2.0f * 0.7978845608028654f;   /* 2 sqrt(2/pi) */
+	unsigned i = 0;
+
+	if (gelu_exact()) {
+		for (; i < n; i++) {
+			float v = y[i] + (b ? b[i] : 0.0f);
+
+			if (tanh_form)
+				y[i] = 0.5f * v *
+				       (1.0f + tanhf(0.7978845608028654f *
+						     (v + 0.044715f * v * v * v)));
+			else
+				y[i] = v / (1.0f + expf(-1.702f * v));
+		}
+		return;
+	}
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	{
+		const float32x4_t one = vdupq_n_f32(1.0f);
+		const float32x4_t c = vdupq_n_f32(0.044715f);
+		const float32x4_t kk = vdupq_n_f32(tanh_form ? -k2 : -1.702f);
+
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t v = vld1q_f32(y + i), e;
+
+			if (b)
+				v = vaddq_f32(v, vld1q_f32(b + i));
+			if (tanh_form) {
+				float32x4_t v3 = vmulq_f32(vmulq_f32(v, v), v);
+
+				e = vmulq_f32(kk, vmlaq_f32(v, c, v3));
+			} else {
+				e = vmulq_f32(kk, v);
+			}
+			vst1q_f32(y + i,
+				  vdivq_f32(v, vaddq_f32(one, charsiu_vexpq(e))));
+		}
+	}
+#endif
+	for (; i < n; i++) {
+		float v = y[i] + (b ? b[i] : 0.0f);
 
 		if (tanh_form)
-			x[i] = 0.5f * v *
-			       (1.0f + tanhf(0.7978845608028654f *
-					     (v + 0.044715f * v * v * v)));
+			v = v / (1.0f + expf(-k2 * (v + 0.044715f * v * v * v)));
 		else
-			x[i] = v / (1.0f + expf(-1.702f * v));
+			v = v / (1.0f + expf(-1.702f * v));
+		y[i] = v;
 	}
+}
+
+/*
+ * The same over a block of m rows sharing one bias, across the thread pool.
+ *
+ * ⚠ A ROW EACH, BECAUSE THE THING BEING DIVIDED IS BYTES. Every row is
+ * independent and every row is n floats read and n written; there is no shared
+ * state, no reduction and no barrier inside the pass. That makes this exactly
+ * the shape the attention round found transfers -- the win there was moving
+ * 11.81 GB to 1.12 GB across L1, and it was 3.71x on this host and 10.32x on
+ * the board, because the board is the one that is short of bandwidth and has
+ * cores sitting idle to pull more of it.
+ *
+ * ⚠ AND A SIZE FLOOR, because npudev has the counter-example written down: a
+ * gather put on this same pool lost twice, 190 ms both times, at about 0.84 ms
+ * of barrier per dispatch with not enough work behind it. Here it is twelve
+ * dispatches for a whole picture with 3.1 million elements behind each, so the
+ * barrier is under a percent -- but a small tower or a narrow projector must
+ * not pay it, hence the floor.
+ */
+struct vact {
+	float *y;
+	const float *b;
+	unsigned n;
+	int tanh_form;
+};
+
+static void vact_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct vact *c = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++)
+		act_span(c->y + r * c->n, c->b, c->n, c->tanh_form);
+}
+
+static void bias_act(float *y, unsigned m, unsigned n, const float *b,
+		     int tanh_form)
+{
+	struct vact c;
+	unsigned r;
+
+	if ((uint64_t)m * n < 65536u) {
+		for (r = 0; r < m; r++)
+			act_span(y + (size_t)r * n, b, n, tanh_form);
+		return;
+	}
+	c.y = y;
+	c.b = b;
+	c.n = n;
+	c.tanh_form = tanh_form;
+	charsiu_parallel_for(vact_rows, &c, m);
 }
 
 /* one row of a 1D tensor, or nothing when the tensor is absent */
@@ -1176,7 +1402,15 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	 * order ggml stores [kw][kh][in_c] in. Get this order wrong and every
 	 * number downstream is still finite and still plausible.
 	 */
-	for (p = 0; p < np; p++) {
+	/*
+	 * ⚠ THE CLOCK GOES ON HERE, NOT BELOW THE GATHER. It used to be turned
+	 * on after this loop, so the row named "patch gather + embed" timed the
+	 * embed and the gather ran outside every row in the table.
+	 */
+	if (vstage_on < 0)
+		vstage_on = getenv("CHARSIU_STAGES") != NULL;
+
+	VSTAGE(V_PATCH, for (p = 0; p < np; p++) {
 		unsigned gy = p / v->grid, gx = p % v->grid;
 		float *dst = patch + (size_t)p * pin;
 		unsigned c, y;
@@ -1188,21 +1422,19 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 						px[((size_t)c * v->image_size +
 						    gy * P + y) * v->image_size +
 						   gx * P + i];
-	}
+	});
 
-	if (vstage_on < 0)
-		vstage_on = getenv("CHARSIU_STAGES") != NULL;
 	VSTAGE(V_PATCH, rows_mul(v->patch_w, row1(v->patch_b, bias, W), patch,
 				 np, pin, x + (size_t)cls * W, W, &a));
 	if (cls)
 		gguf_row_f32(v->class_embd, 0, x);
 
 	/* the position embedding is one row per patch */
-	for (p = 0; p < nt; p++) {
+	VSTAGE(V_RESID, for (p = 0; p < nt; p++) {
 		gguf_row_f32(v->pos_embd, p, tmp);
 		for (i = 0; i < W; i++)
 			x[(size_t)p * W + i] += tmp[i];
-	}
+	});
 
 	if (v->pre_ln_w) {
 		const float *g = row1(v->pre_ln_w, gain, W);
@@ -1249,8 +1481,8 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 						       v->n_head, scale));
 
 		VSTAGE(V_PROJ, rows_mul(L->o_w, row1(L->o_b, bias, W), xb, nt, W, q, W, &a));
-		for (i = 0; i < nt * W; i++)
-			x[i] += q[i];
+		VSTAGE(V_RESID, for (i = 0; i < nt * W; i++)
+			x[i] += q[i]);
 
 		{
 			float *g = malloc((size_t)W * sizeof(float));
@@ -1266,13 +1498,66 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			free(g); free(b);
 		}
 
-		VSTAGE(V_FFN, rows_mul(L->fc1_w, row1(L->fc1_b, bias, nff), xb,
-				       nt, W, ff, nff, &a));
-		VSTAGE(V_FFN, gelu(ff, nt * nff, v->use_gelu));
+		/*
+		 * ⚠⚠ THE FEED FORWARD IS NOT BANDWIDTH BOUND, AND THAT IS THE
+		 * FINDING, not the speedup beside it.
+		 *
+		 * Counted out at SmolVLM-256M's shape -- 1024 patches, 768
+		 * wide, 3072 in the middle, twelve layers, int8 on the NPU with
+		 * charsiu_pool_rows chunking at 64 rows, so sixteen hardware
+		 * dispatches per matmul. Per layer, in MB:
+		 *
+		 *   fc1  weights 2.36 x 16 dispatches         37.7
+		 *        activation read f32 / written int8    3.9
+		 *        NPU reads it back                     0.8
+		 *        NPU writes int32 1024 x 3072         12.6
+		 *        the gather reads it -- 16 byte runs
+		 *        off 64 byte lines, so four times     50.3
+		 *        the gather writes ff                 12.6
+		 *        bias pass, then activation pass      50.4  -> 25.2
+		 *   fc2  weights 2.36 x 16                    37.7
+		 *        ff read f32 / written int8           15.8
+		 *        NPU reads it back / writes int32      6.3
+		 *        the gather, again x4                 15.8
+		 *        bias pass                             6.3
+		 *                                            -----
+		 *                                            249.7  -> 224.5
+		 *
+		 * Twelve layers is 3.00 GB, and 2.69 after the fusion below.
+		 * The board measures 7.13 GB/s, so the ROOF for this stage is
+		 * about 420 ms and it was reported at 2398. It is five and a
+		 * half times off the roof: there is no byte argument for this
+		 * stage's time, and the two things that fill the gap are the
+		 * activation (about 1030 ms, which is what this round removes)
+		 * and 384 hardware dispatches at roughly 3.3 ms each against
+		 * about 1.4 ms of bytes in one.
+		 *
+		 * ⚠ AND 905 MB OF THE 3.00 GB IS THE WEIGHTS READ SIXTEEN
+		 * TIMES. 30% of the traffic exists only because the batch is
+		 * cut into 64 row chunks -- at one chunk it would be 57 MB. It
+		 * is not a thing to fix here: 80 is the last width whose output
+		 * is identical to two rows and 96 is the first that is not, and
+		 * that bound is the board's, written down in npupool.c.
+		 */
+		/*
+		 * ⚠ THE BIAS GOES TO bias_act, NOT TO rows_mul, and that is the
+		 * whole of the fusion. rows_mul's own bias loop is a separate
+		 * full pass over an intermediate that is 12.6 MB at this shape;
+		 * handing it to the activation instead visits those numbers
+		 * once. `bias` is the shared scratch row and fc2's row1 below
+		 * overwrites it, which is why fb is read out before that.
+		 */
+		{
+			const float *fb = row1(L->fc1_b, bias, nff);
+
+			VSTAGE(V_FFN, rows_mul(L->fc1_w, NULL, xb, nt, W, ff,
+					       nff, &a));
+			VSTAGE(V_ACT, bias_act(ff, nt, nff, fb, v->use_gelu));
+		}
 		VSTAGE(V_FFN, rows_mul(L->fc2_w, row1(L->fc2_b, bias, W), ff,
 				       nt, nff, q, W, &a));
-		for (i = 0; i < nt * W; i++)
-			x[i] += q[i];
+		VSTAGE(V_RESID, for (i = 0; i < nt * W; i++)
+			x[i] += q[i]);
 	}
 
 	if (v->post_ln_w) {
@@ -1322,7 +1607,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		if (v->mm_w[1]) {
 			unsigned d1 = (unsigned)rows_of(v->mm_w[1]);
 
-			gelu(h0, np * d0, v->use_gelu);
+			bias_act(h0, np, d0, NULL, v->use_gelu);
 			rows_mul(v->mm_w[1], row1(v->mm_b[1], bias, d1), h0, np,
 				 d0, out, d1, &a);
 		} else {
