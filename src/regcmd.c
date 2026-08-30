@@ -422,6 +422,22 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 	 * Only the tail is cleared: the region past k is padding the hardware
 	 * still reads, and everything before it is about to be overwritten.
 	 */
+	/*
+	 * ⚠⚠ m = 1 IS ON THIS PATH TOO, WHICH IS NOT WHAT IT LOOKS LIKE. The
+	 * diff that added this block deletes nothing, so it reads as an
+	 * insertion that leaves decode alone -- and it is not: the branch
+	 * below takes m == 1 through the vector converter as well. Decode is
+	 * this runtime's headline number, so that had to be proved rather
+	 * than assumed.
+	 *
+	 * ⚠ AND THE PROOF NEEDS TWO PROCESSES. `plain` is cached in a static
+	 * on first use, so setting CHARSIU_NPU_PLAIN between two calls in one
+	 * program compares this path against ITSELF and passes vacuously. A
+	 * 315 shape check written that way came back "0 mismatched" while
+	 * measuring nothing at all. Run the dump twice, once with the variable
+	 * and once without, and diff the files: 315 shapes including m = 1,
+	 * k from 1 to 3072 and every k % 8, byte for byte identical.
+	 */
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 	{
 	static int plain = -1;
@@ -442,6 +458,107 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 			dst[kk * 2] = (uint8_t)(h & 0xff);
 			dst[kk * 2 + 1] = (uint8_t)(h >> 8);
 		}
+		return;
+	}
+	/*
+	 * ⚠⚠ AND m > 1 IS THE BATCHED PATH, WHICH WAS LEFT SCALAR.
+	 *
+	 * The case above was vectorised because it is the whole of decode. The
+	 * rows case underneath it is the whole of PREFILL, and it still went one
+	 * element at a time. On the board a batched matmul at m = 32 over
+	 * Llama-3.2-1B's 225 tensors spends 350 ms of 1811 ms packing -- 19% --
+	 * against 169 ms actually waiting on the NPU.
+	 *
+	 * The disassembly named two costs and neither is arithmetic. `objdump
+	 * -d` of the loop below shows a `bl charsiu_float_to_half` PER ELEMENT:
+	 * the converter lives in job.c, the Makefile carries no -flto, so gcc
+	 * cannot inline across the two units and every single half costs a call
+	 * plus about ten integer instructions of index arithmetic and two
+	 * `strb`. The memset ahead of it is the other: it zeroes the whole
+	 * buffer, and the loop then overwrites almost all of what it zeroed.
+	 *
+	 * ⚠ THE FIRST BENCHMARK OF THIS PUT THE CONVERTER IN THE SAME UNIT and
+	 * so measured a build that does not exist. With it inlined gcc
+	 * auto-vectorises even a plain scalar loop, and a scalar rewrite that
+	 * only hoists the index arithmetic came out fastest of everything tried:
+	 * 27.3 GB/s at k = 2048, m = 32. Rebuilt the way the Makefile builds --
+	 * separate objects, no -flto -- that same rewrite is 7.6 GB/s at that
+	 * same shape, 1.3x, and nothing like a fix. The CALL is the cost, so
+	 * removing the call is the fix, and that means the vector converter.
+	 *
+	 * ⚠⚠ THE LOOP ORDER IS NOT FREE, AND ONLY A COLD DESTINATION SHOWS IT.
+	 *
+	 * A group of 8 consecutive k is 16 contiguous destination bytes, so
+	 * either loop can be the outer one. Walking ROWS outermost keeps the
+	 * source sequential and writes 16 bytes every m * 16; walking GROUPS
+	 * outermost writes the destination straight through and reads m strided
+	 * sources. Warm they are indistinguishable, 26.4 against 26.5 GB/s.
+	 *
+	 * Cold they are not, because the destination is ordinary cached memory
+	 * and a 16 byte store to a cold line still fetches the line. rocket
+	 * builds these buffers with drm_gem_shmem_create() and never sets
+	 * map_wc, so the mmap is write-back, and PREP_BO invalidates the input
+	 * BO immediately before this loop runs -- which is to say the board
+	 * always meets a cold one. Cycling a 96 MB ring of destinations so every
+	 * timed call gets a fresh buffer, at k = 2048 m = 64, rows-outermost
+	 * falls to 6.87 GB/s while groups-outermost holds 24.57. Groups
+	 * outermost is best or tied in every shape measured, warm and cold, so
+	 * it is the one here. Unrolling it four rows deep was worth nothing
+	 * (24.53 against 24.57) and is not carried.
+	 *
+	 * Measured on this aarch64 host, cold destination, before -> after:
+	 *
+	 *   k=2048 m=2    0.0043 -> 0.0010 ms    5.70 ->  24.80 GB/s   4.35x
+	 *   k=2048 m=32   0.0723 -> 0.0160 ms    5.44 ->  24.55 GB/s   4.51x
+	 *   k=2048 m=64   0.1488 -> 0.0320 ms    5.29 ->  24.57 GB/s   4.65x
+	 *   k=1024 m=32   0.0338 -> 0.0079 ms    5.81 ->  24.86 GB/s   4.28x
+	 *   k=1024 m=64   0.0687 -> 0.0160 ms    5.73 ->  24.59 GB/s   4.30x
+	 *   k=2048 m=1    0.0005 ms, 24.64 GB/s, untouched
+	 *
+	 * ⚠ THE VALUES ARE THE SAME VALUES. charsiu_vhalf truncates exactly as
+	 * charsiu_float_to_half does, which was checked again here over all
+	 * 4294967296 float bit patterns, eight threads, ZERO differing --
+	 * denormals, both infinities, quiet and signalling NaN, 65504 and the
+	 * pattern one ulp past it, and the truncation boundary at 0x3f801fff /
+	 * 0x3f802000. Nothing in this rounds where the old path truncated.
+	 *
+	 * ⚠ ONLY THE TAIL IS CLEARED, for the reason the m = 1 case gives: with
+	 * k a multiple of the atom every byte below `base` is written by the
+	 * loop, and everything from `base` up is padding the CBUF reads past the
+	 * end of the data. A k that is NOT a multiple of the atom leaves holes
+	 * in the last group, so `base` starts at that group and it is zeroed
+	 * too. CHARSIU_NPU_PLAIN drops through to the scalar loop below, which
+	 * is unchanged and remains the control for all of this.
+	 */
+	if (mm->m > 1 && !plain && atom == 8) {
+		unsigned m = mm->m, ng = mm->k / atom, tail = mm->k % atom;
+		size_t base = (size_t)ng * m * atom * 2;
+		unsigned g;
+
+		if (dst_size > base)
+			memset(dst + base, 0, dst_size - base);
+		for (g = 0; g < ng; g++) {
+			const float *s = src + (size_t)g * atom;
+			uint8_t *d = dst + (size_t)g * m * atom * 2;
+
+			for (i = 0; i < m; i++, d += 16) {
+				const float *r = s + (size_t)i * mm->k;
+
+				vst1q_u16((uint16_t *)d,
+					  vcombine_u16(charsiu_vhalf(vld1q_f32(r)),
+						       charsiu_vhalf(vld1q_f32(r + 4))));
+			}
+		}
+		for (i = 0; i < m; i++)
+			for (kk = 0; kk < tail; kk++) {
+				uint16_t h = charsiu_float_to_half(
+					src[(size_t)i * mm->k + ng * atom + kk]);
+				uint8_t *p = dst + base + (size_t)i * 16
+					   + (size_t)kk * 2;
+
+				p[0] = (uint8_t)(h & 0xff);
+				p[1] = (uint8_t)(h >> 8);
+			}
 		return;
 	}
 	}
