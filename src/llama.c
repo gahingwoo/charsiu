@@ -3357,14 +3357,28 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * relative 2.57e-05, on both cores and on one. gemma4's 88 token
 	 * prompt chunks to 32, 32 and exactly that.
 	 *
-	 * So this refusal is not held up by a measurement any more. It is held
-	 * up only by the fact that no round has yet run gemma4 with the
-	 * even-only chunker in the binary, and a model that has produced wrong
-	 * text on this board does not get un-refused on arithmetic alone.
+	 * ⚠ AND THE EVEN-ONLY CHUNKER HAS NOW RUN IT: 0 of 16, the shipped
+	 * path, 88 tokens chunking to 32, 32 and 24. But the arm beside it --
+	 * CHARSIU_NPU_BATCH_ZERO=1, which only adds a memset before the submit
+	 * -- came back 1 of 16 WRONG.
 	 *
-	 * The round that lifts it, and it is one round:
-	 *   sh board_intermittent.sh gemma4 16
-	 * 0 of 16 on both arms and this line goes.
+	 * A memset cannot change what the hardware computes. It changes
+	 * TIMING. So that arm is not the semantic control it was written as,
+	 * and a fault that appears only under it is a race -- which is exactly
+	 * what the dense sweep proved at m = 8 and m = 10: two cores stepping
+	 * on row 0 of a wide output, bit identical on one core.
+	 *
+	 * ⚠⚠ AND IT MEANS THE SWEEP'S "EVERY EVEN WIDTH EXACT" IS ONE SAMPLE A
+	 * WIDTH. A fault firing one run in sixteen would have been missed at
+	 * every width except the two where it is dense. 12..62 being clean is
+	 * not the same statement as 12..62 being safe.
+	 *
+	 * So this stays refused, and the round that lifts it is now the one
+	 * with the arm that discriminates:
+	 *   CHARSIU_INT_ARMS="default onedev zero" \
+	 *     sh board_intermittent.sh gemma4 16
+	 * Clean on one core and dirty on two is the m = 8 fault at a lower
+	 * rate, and then the answer is scheduling, not this refusal.
 	 */
 	WHY(m->n_embd_pl, "no round has yet run it with the even-only chunker;"
 	    " every failure it has is explained by an odd last chunk, so this"

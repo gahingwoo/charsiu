@@ -18,19 +18,33 @@
 # sometimes, and every round that runs each cell once will keep drawing a
 # different picture of it. So: one configuration, many runs, one number.
 #
-# ⚠ AND IT RUNS THE CONTROL THAT CAN END IT.
+# ⚠⚠ AND THE ARM THAT MATTERS IS onedev, NOT zero. I had this backwards.
 #
-# The batched matmul does not zero Y any more. The gather assigns on the FIRST
-# contribution to an output range and accumulates after that, tracked by a byte
-# per range -- worth 26% of a batched matmul, and the one thing in this path
-# that can hand back the caller's STALE buffer. If a range never gets its first
-# write, Y keeps the previous token's answer, which is invisible when the stale
-# value is close and reads as a sentence about practicing when it is not.
+# CHARSIU_NPU_BATCH_ZERO=1 puts back the whole-buffer memset that
+# assign-on-first-write removed. It was added here as a SEMANTIC control -- if
+# a range never gets its first write, Y keeps the previous token's answer --
+# and on that reading "wrong without it, right with it" would have meant the
+# first-write bookkeeping.
 #
-#   CHARSIU_NPU_BATCH_ZERO=1 puts the whole-buffer zero back.
+# It does not read that way. gemma4 came back 0 of 16 on the shipped path and
+# 1 of 16 WITH the buffer zeroed, which the semantic story cannot produce: a
+# memset before the submit does not change what the hardware computes. What it
+# changes is TIMING. So this arm is a timing perturbation, and a fault that
+# appears only under one is a race, not a stale read.
 #
-# Wrong without it and right WITH it, over enough runs to mean something, is
-# the first-write bookkeeping. Wrong both ways excludes the whole family.
+# Which lines up with what the dense sweep proved about m = 8 and m = 10: two
+# cores stepping on ROW 0 of a wide output, bit identical the moment
+# CHARSIU_NPU_ONEDEV=1 makes it one core. And the sweep ran each width ONCE,
+# so a fault firing one run in sixteen would have been missed at every width
+# except the two where it is dense.
+#
+# So the discriminating arm is:
+#
+#   onedev   CHARSIU_NPU_ONEDEV=1   one core, the control for the core pair
+#
+# Clean on one core over enough runs and dirty on two is the same fault as
+# m = 8, at a lower rate, and the whole residual collapses into it. Dirty on
+# one core too is something else and keeps its own investigation.
 #
 # ⚠ CHARSIU_BATCH_FORCE IS A PROBE SWITCH: these models are refused.
 #
@@ -83,7 +97,7 @@ fi
 RUNS=${2:-8}
 CHUNK=${CHARSIU_INT_CHUNK:-32}
 NGEN=${CHARSIU_INT_NGEN:-8}
-ARMS=${CHARSIU_INT_ARMS:-"default zero"}
+ARMS=${CHARSIU_INT_ARMS:-"default onedev zero"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
@@ -106,8 +120,11 @@ echo "model    $MODEL"
 echo "binary   $RUN"
 echo "config   chunk $CHUNK, gen $NGEN, $RUNS runs an arm"
 echo "arms     $ARMS"
-echo "  default  as shipped: the gather assigns on first write, Y is not zeroed"
-echo "  zero     CHARSIU_NPU_BATCH_ZERO=1, the whole output buffer zeroed first"
+echo "  default  as shipped: two NPU cores"
+echo "  onedev   CHARSIU_NPU_ONEDEV=1 -- ONE core; the control for the core pair"
+echo "  zero     CHARSIU_NPU_BATCH_ZERO=1 -- a TIMING perturbation, not a"
+echo "           semantic control: the memset cannot change what the hardware"
+echo "           computes, so a failure only here is a race"
 echo
 
 # --- the control, twice, because the token loop must be stable too ---------
@@ -152,6 +169,7 @@ res_default=""; res_zero=""
 for ARM in $ARMS; do
 	case $ARM in
 	default) EXTRA="" ;;
+	onedev)  EXTRA="CHARSIU_NPU_ONEDEV=1" ;;
 	zero)    EXTRA="CHARSIU_NPU_BATCH_ZERO=1" ;;
 	*) echo "unknown arm '$ARM'" >&2; continue ;;
 	esac
@@ -178,33 +196,38 @@ done
 
 echo
 echo "======================================================================"
-d=${res_default:-}; z=${res_zero:-}
-if [ -z "$d" ] || [ -z "$z" ]; then
-	echo "Only one arm ran, so there is no control. Run both:"
-	echo "  CHARSIU_INT_ARMS=\"default zero\" sh $0 $(basename "$MODEL") $RUNS"
-elif [ "$d" -gt 0 ] && [ "$z" -eq 0 ]; then
-	echo "→ THE FIRST WRITE BOOKKEEPING. Wrong $d of $RUNS as shipped and"
-	echo "  RIGHT $RUNS of $RUNS with the output buffer zeroed. An output"
-	echo "  range is not getting its first write, so Y keeps the previous"
-	echo "  token's answer. The fix is in the flag, not the matmul -- the"
-	echo "  matmul is already known exact at every width."
-	echo "  ⚠ $RUNS clean runs is evidence, not proof, for a fault that has"
-	echo "    already gone ten runs without firing. Raise RUNS before"
-	echo "    changing code on the strength of it."
-elif [ "$d" -gt 0 ] && [ "$z" -gt 0 ]; then
-	echo "→ NOT THE ZERO. Wrong $d of $RUNS as shipped and $z of $RUNS with"
-	echo "  the buffer zeroed, so stale output is excluded and the whole"
-	echo "  assign-on-first-write family with it. What is left is the"
-	echo "  batched loop's non matmul work. Next:"
-	echo "    CHARSIU_DBG_LAYERS=1 on both paths -- it names the layer, and"
-	echo "    it is the tool that found gemma4's three."
-elif [ "$d" -eq 0 ] && [ "$z" -eq 0 ]; then
-	echo "→ IT DID NOT FIRE. $RUNS clean runs on both arms. This fault has"
-	echo "  gone ten runs clean before, so this is not a pass -- raise the"
-	echo "  run count, or change the condition (chunk, gen length, taskset)"
-	echo "  until it fires, and only then compare arms."
+d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
+# ⚠ ANY arm firing counts. A fault that shows up only under the timing
+# perturbation is still a fault on this hardware; the perturbation is not a
+# configuration anyone ships, but it is not a fault the perturbation invented
+# either.
+two=0
+[ -n "$d" ] && [ "$d" -gt 0 ] && two=$((two + d))
+[ -n "$z" ] && [ "$z" -gt 0 ] && two=$((two + z))
+if [ -z "$o" ]; then
+	echo "The onedev arm did not run, so the core pair -- the one story that"
+	echo "already explains m = 8 and m = 10 -- was not tested. Run:"
+	echo "  CHARSIU_INT_ARMS=\"default onedev zero\" sh $0 $(basename "$MODEL") $RUNS"
+elif [ "$two" -gt 0 ] && [ "$o" -eq 0 ]; then
+	echo "→ THE CORE PAIR, AT A LOW RATE. Wrong $two time(s) across the two"
+	echo "  core arms and $RUNS of $RUNS clean on ONE core. That is the same"
+	echo "  fault the dense sweep proved at m = 8 and m = 10 -- two cores on"
+	echo "  row 0 of a wide output -- firing rarely at this width instead of"
+	echo "  densely. The residual is not a second bug."
+	echo "  ⚠ It also means the sweep's \"every even width exact\" is ONE"
+	echo "    sample a width, and cannot see a one-in-sixteen fault."
+elif [ "$two" -gt 0 ] && [ "$o" -gt 0 ]; then
+	echo "→ NOT THE CORE PAIR. Wrong $o of $RUNS on one core as well, so"
+	echo "  concurrency is excluded with a rate on both sides and this is a"
+	echo "  fault of its own. Next: CHARSIU_DBG_LAYERS=1 on both paths."
+elif [ "$two" -eq 0 ] && [ "$o" -eq 0 ]; then
+	echo "→ IT DID NOT FIRE, $RUNS runs on each of $ARMS."
+	echo "  Not a pass on its own: this fault has gone ten and sixteen runs"
+	echo "  clean before. Raise the run count or change the condition"
+	echo "  (chunk, gen length, taskset) until it fires, and only then"
+	echo "  compare arms."
 else
-	echo "→ WRONG ONLY WITH THE BUFFER ZEROED, which no story predicts."
+	echo "→ CLEAN ON TWO CORES AND DIRTY ON ONE, which nothing predicts."
 	echo "  Suspect the run before the silicon and repeat it."
 fi
 echo "======================================================================"
