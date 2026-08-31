@@ -203,14 +203,23 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
 		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
-		    -n 32 --ignore-eos >"$OUT/.deal_$arm" 2>&1
+		    -n 32 --ignore-eos >"$OUT/.deal_$arm" \
+		    2>"$OUT/.deal_$arm.err"
 		printf '  %-28s %-6s %s\n' "$b" "$arm" \
-		    "$(grep -oE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' "$OUT/.deal_$arm" | head -1)"
-		grep -oE "the busier core carried [0-9.]+x an even share[^\"]*" \
-		    "$OUT/.deal_$arm" | head -1 | sed 's/^/      /'
+		    "$(grep -hoE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' "$OUT/.deal_$arm" "$OUT/.deal_$arm.err" | head -1)"
+		grep -hoE "the busier core carried [0-9.]+x an even share[^\"]*" \
+		    "$OUT/.deal_$arm" "$OUT/.deal_$arm.err" | head -1 \
+		    | sed 's/^/      /'
 	done
 	# ⚠ AND THE TEXT MUST MATCH BETWEEN THE ARMS. A deal that changes the
 	# answer is not a scheduling change.
+	# ⚠⚠ STDOUT AND STDERR SEPARATELY, OR THE DIAGNOSTICS ARE THE DIFF.
+	# The first version captured 2>&1 into the file it then compared, so the
+	# index arm's own "CHARSIU_NPU_DEAL_INDEX is set" note and the staging
+	# progress lines -- whose millisecond counts differ every run -- made
+	# every pair "differ". Two real wins were reported as two failures.
+	# charsiu_run puts the generated text on stdout and every diagnostic on
+	# stderr, so the split is free.
 	sed -i 's/^\[.*//' "$OUT/.deal_least" "$OUT/.deal_index"
 	cmp -s "$OUT/.deal_least" "$OUT/.deal_index" \
 	    && printf '      text identical between the two deals\n' \
@@ -256,12 +265,28 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
 		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
-		    -n 32 --ignore-eos >"$OUT/.kfit_$arm" 2>&1
-		printf '  %-28s kfit=%-4s %s\n' "$b" "$arm" \
-		    "$(grep -oE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' "$OUT/.kfit_$arm" | head -1)"
+		    -n 32 --ignore-eos >"$OUT/.kfit_$arm" \
+		    2>"$OUT/.kfit_$arm.err"
+		# ⚠ READ THE RATE BEFORE THE STRIP BELOW REMOVES IT. The
+		# summary is a bracketed line on STDOUT, and the sed that
+		# prepares the text for comparison deletes exactly those --
+		# so a check written after it greps for a line it just ate
+		# and reports a healthy run as one that never generated.
+		r=$(grep -hoE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' \
+		    "$OUT/.kfit_$arm" "$OUT/.kfit_$arm.err" | head -1)
+		eval "rate_$arm=\$r"
+		printf '  %-28s kfit=%-4s %s\n' "$b" "$arm" "$r"
 	done
 	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_on"
-	if cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
+	# ⚠ A RUN THAT PRODUCED NO RATE DID NOT RUN, and that is a different
+	# failure from a text difference. Saying "KFIT changes the answer" about
+	# an arm that never generated a token is a wrong diagnosis of a real
+	# problem, which is worse than either alone.
+	if [ -z "${rate_on:-}" ]; then
+		bad "$b: the KFIT arm produced no generation at all"
+		printf '     its stderr, last lines:\n'
+		tail -6 "$OUT/.kfit_on.err" | sed 's/^/       /'
+	elif cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
 		printf '      text identical with and without KFIT\n'
 	else
 		bad "$b: KFIT CHANGES THE ANSWER -- it is a slicing change and must not"
