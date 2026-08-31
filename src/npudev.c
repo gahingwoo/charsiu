@@ -990,6 +990,40 @@ static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned 
 	fprintf(stderr, "charsiu: NOT on the NPU -- %s (K=%u N=%u)\n", what, k, n);
 }
 
+/*
+ * ⚠⚠ THE WIDEST K A SINGLE SLICE CAN CARRY. Every buffer that holds one must
+ * be sized by this and not by kmax.
+ *
+ * CHARSIU_NPU_KFIT makes the last K slice ABSORB the remainder instead of
+ * being it -- the `ks--` in charsiu_npu_add -- so that slice runs from a kmax
+ * boundary to the end of the tensor and is up to 2 * kmax - 1 wide.
+ *
+ * When KFIT was written, scratch and wpack were widened for it and the
+ * BATCHED buffers were not: bin_stride, bscr and bq were all still kmax * m.
+ * The batched packer gathers one slice's whole K into bscr, quantises it into
+ * bq and packs it into bin at bin_stride, so all three overran by up to 2x.
+ * bscr and bq are plain mallocs, so the board answered with
+ *
+ *     malloc(): corrupted top size
+ *     Aborted
+ *
+ * on the first staged model, every time, on gemma-3-1b and gemma-4-E2B alike.
+ *
+ * ⚠ AND NO HOST COULD SEE IT. With no /dev/accel the NPU never opens, nothing
+ * is staged and no batched buffer is allocated, so KFIT measured "text
+ * identical and slightly faster" on the desk while it aborted on the card.
+ * The switch had sat in this tree described as written, legal and default
+ * off, and the round that priced it repeated "already legal". Nothing had
+ * ever run it.
+ *
+ * One function, so the fifth place that needs this bound cannot be the one
+ * that gets forgotten.
+ */
+static size_t kmax_wide(const struct charsiu_npu *g)
+{
+	return (size_t)g->kmax * (g->kfit ? 2 : 1);
+}
+
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors)
 {
@@ -1243,7 +1277,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->slot_cap = max_tensors * g->max_slices;
 
 	{
-		unsigned kwide = g->kfit ? 2 * g->kmax : g->kmax;
+		unsigned kwide = (unsigned)kmax_wide(g);
 		struct charsiu_matmul widest = { 1, kwide, g->nmax,
 						 CHARSIU_INT8, CHARSIU_INT8 };
 
@@ -1257,12 +1291,12 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->ent = calloc(g->ent_cap, sizeof(*g->ent));
 	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
 	/* ⚠ the widest a slice can be, which KFIT doubles -- see above */
-	g->scratch = malloc((size_t)g->nmax * g->kmax * (g->kfit ? 2 : 1) + max_k);
+	g->scratch = malloc((size_t)g->nmax * kmax_wide(g) + max_k);
 	g->acc = calloc(max_n, sizeof(*g->acc));
 	g->accf = calloc(max_n, sizeof(*g->accf));
 	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
 	g->afscr = calloc(max_k ? max_k : 1, sizeof(*g->afscr));
-	g->wpack = malloc((size_t)g->nmax * g->kmax * (g->kfit ? 2 : 1) + 4096);
+	g->wpack = malloc((size_t)g->nmax * kmax_wide(g) + 4096);
 	g->asum = calloc(ks ? ks : 1, sizeof(*g->asum));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
@@ -2909,7 +2943,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	m = g->bm; nks = g->bnks; nslots = g->bnslots;
 
 	/* the f16 packer writes k * 2 bytes a row; int8 writes one */
-	g->bin_stride = (size_t)g->kmax * m * (g->w4 ? 2 : 1);
+	g->bin_stride = kmax_wide(g) * m * (g->w4 ? 2 : 1);
 	ins = g->bin_stride * nks + 4096;
 	regs = (size_t)nslots * 4096;
 	outs = 0;
@@ -2931,8 +2965,8 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	free(g->bscr);
 	free(g->bq);
 	free(g->bd1);
-	g->bscr = malloc((size_t)g->kmax * m * sizeof(*g->bscr));
-	g->bq = malloc((size_t)g->kmax * m);
+	g->bscr = malloc(kmax_wide(g) * m * sizeof(*g->bscr));
+	g->bq = malloc(kmax_wide(g) * m);
 	/*
 	 * ⚠ ONE d1 PER SLOT PER ROW, not one per row. int8's activation scale
 	 * is per row AND is recomputed over each K slice's own range, and the
