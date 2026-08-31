@@ -120,7 +120,22 @@ void charsiu_vision_close(struct charsiu_vision *v);
 /* NULL when the tower is usable, otherwise a short phrase. */
 const char *charsiu_vision_why_not(const struct charsiu_vision *v);
 
-/* Where the time went, under CHARSIU_STAGES. */
+/*
+ * Where the time went, under CHARSIU_STAGES.
+ *
+ * ⚠ "feed forward" IS NOW TWO ROWS, and the split is the point. The board read
+ * 2398 ms under one heading that was a pair of NPU matmuls added to a scalar
+ * libm loop, and the two do not answer to the same thing: the matmuls are 384
+ * hardware dispatches fixed by the 64 row chunk, the activation was 37.7
+ * million tanhf calls on one core. "residual + position" is likewise a row that
+ * did not exist and covered nothing, and the patch gather used to run above the
+ * line that starts the clock, so the row named for it timed only the matmul.
+ *
+ * ⚠ CHARSIU_EXACT_GELU IS THE CONTROL for the activation. The tanh form is
+ * algebraically one sigmoid, so the shipped kernel is one exponential four at a
+ * time instead of a tanhf an element; setting this puts the tanhf back and, as
+ * of this writing, reproduces the previous binary's embeddings bit for bit.
+ */
 void charsiu_vision_stages(FILE *out);
 
 /* One line per hparam and per missing tensor, for a person to read. */

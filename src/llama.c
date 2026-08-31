@@ -135,6 +135,32 @@ static int fast_silu(void)
 		v = getenv("CHARSIU_EXACT_SILU") == NULL && !cpu_plain();
 	return v;
 }
+
+/*
+ * ⚠⚠ AND THE TANH GELU IS THE SAME SIGMOID, WHICH IS AN IDENTITY RATHER THAN
+ * AN APPROXIMATION.
+ *
+ *   0.5 * (1 + tanh y)  ==  1 / (1 + e^-2y)
+ *
+ * exact to machine epsilon over the whole range, so gemma's activation is
+ * x / (1 + e^(-2k(x + 0.044715 x^3))) and goes through the same charsiu_vexpq
+ * silu already uses. It was one tanhf an element on the per token path.
+ *
+ * The vision tower priced the identical loop at its own shape: 34.65 ms with
+ * tanhf against 2.66 with an exponential, one layer of 3145728 elements, and
+ * 14x of the whole win there was this line alone, core count independent.
+ *
+ * CHARSIU_EXACT_GELU is the control, and it is the same variable the tower
+ * takes so one switch covers both.
+ */
+static int fast_gelu(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_EXACT_GELU") == NULL && !cpu_plain();
+	return v;
+}
 #endif
 
 /* hb = silu(hb) * hb2, which is the gate and the up projection joined */
@@ -172,8 +198,24 @@ static void silu_mul(float *hb, const float *hb2, uint32_t n)
 static void gelu_mul(float *hb, const float *hb2, uint32_t n)
 {
 	const float k = 0.7978845608028654f;   /* sqrt(2/pi) */
+	uint32_t i = 0;
 
-	for (uint32_t i = 0; i < n; i++) {
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_gelu())
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t g = vld1q_f32(hb + i);
+			float32x4_t c = vmulq_f32(vmulq_f32(g, g), g);
+			float32x4_t y = vmulq_f32(vdupq_n_f32(-2.0f * k),
+					vaddq_f32(g, vmulq_f32(
+						vdupq_n_f32(0.044715f), c)));
+			float32x4_t d = vaddq_f32(vdupq_n_f32(1.0f),
+						  charsiu_vexpq(y));
+
+			vst1q_f32(hb + i, vmulq_f32(vdivq_f32(g, d),
+						    vld1q_f32(hb2 + i)));
+		}
+#endif
+	for (; i < n; i++) {
 		float g = hb[i];
 
 		g = 0.5f * g * (1.0f + tanhf(k * (g + 0.044715f * g * g * g)));
@@ -3948,15 +3990,11 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 						 + ((size_t)r * m->n_layer + l)
 						   * np;
 
-				for (i = 0; i < np; i++) {
-					float v = g[i];
-
-					v = 0.5f * v * (1.0f +
-					     tanhf(0.7978845608028654f
-						   * (v + 0.044715f * v * v
-						      * v)));
-					g[i] = v * plr[i];
-				}
+				/* ⚠ the same gate, so the same function:
+				 * two open coded copies of this loop were
+				 * still calling tanhf an element after
+				 * gelu_mul stopped. */
+				gelu_mul(g, plr, np);
 			}
 			/*
 			 * ⚠ bxo IS FREE HERE. The feed forward's down
@@ -4409,13 +4447,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			const float *plr = s->pl + (size_t)l * np;
 
 			matvec(s, L->pl_inp_gate, s->x, s->plc);
-			for (i = 0; i < np; i++) {
-				float g = s->plc[i];
-
-				g = 0.5f * g * (1.0f + tanhf(0.7978845608028654f
-						* (g + 0.044715f * g * g * g)));
-				s->plc[i] = g * plr[i];
-			}
+			gelu_mul(s->plc, plr, np);
 			matvec(s, L->pl_proj, s->plc, s->xb2);
 			if (L->pl_post_norm)
 				rmsnorm(s->xb2, s->xb2, L->pl_post_norm,

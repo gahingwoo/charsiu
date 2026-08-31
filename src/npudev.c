@@ -141,6 +141,23 @@ struct npu_entry {
 	 */
 	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
 	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
+	/*
+	 * WHAT EACH DEVICE WAS GIVEN, WORKED OUT ONCE WHERE IT IS DECIDED.
+	 *
+	 * The slice to device assignment is fixed at staging and never moves,
+	 * so the bytes and the task count a call will cost are known before the
+	 * call happens. Summing them here rather than in the matvec keeps the
+	 * per call accounting to a handful of adds over at most eight entries,
+	 * which matters because the thing being measured is a 133 us fixed cost
+	 * and an instrument that costs a microsecond of it is not an instrument.
+	 *
+	 * The two cores are submitted together and waited on together, so the
+	 * call's wall clock follows whichever device got MORE -- see the fit on
+	 * struct charsiu_npu. That is why both are kept per device rather than
+	 * summed: max(d) is the quantity, not the total.
+	 */
+	double mb_dev[2];          /* weight megabytes, per device */
+	unsigned nt_dev[2];        /* chained tasks, per device */
 };
 
 /*
@@ -257,6 +274,62 @@ struct charsiu_npu {
 	struct charsiu_task *tasks;
 	uint32_t *handles;
 	unsigned nmax, kmax, max_n;
+	/*
+	 * ⚠⚠ WHICH CORE THE NEXT SLICE GOES TO, CARRIED ACROSS TENSORS.
+	 *
+	 * A slice's device is fixed when the tensor is STAGED -- its weights,
+	 * its coefficients and its register stream are three buffer objects on
+	 * g->dev[di], and the input and output addresses baked into that stream
+	 * are that device's -- so this is the only place the decision can be
+	 * made. Nothing about the assignment reaches the arithmetic: the sum
+	 * over slices reads e->out[s->di] by s->out_slot and is identical
+	 * whichever way they are dealt.
+	 *
+	 * It used to be `di = (ki * ns + ni) & 1`, which restarts at 0 for
+	 * every tensor. That balances the slices of ONE tensor and can do
+	 * nothing for a call that carries several -- matvec_pair in src/llama.c
+	 * sends q, k and v as one call and gate and up as another -- and it
+	 * balances them by COUNT rather than by bytes. Both failures are real
+	 * on models this tree ships against, and both are invisible on
+	 * Llama-3.2-1B, which is why they survived: every one of its dimensions
+	 * is a power of two, so every tensor cuts into an even number of equal
+	 * slices and the index deal is already optimal.
+	 *
+	 *   Qwen3-0.6B    n_embd 1024, so q, k, v, gate and up are ONE K slice
+	 *                 each at KMAX 1024. q, k and v all land on device 0
+	 *                 and device 1 sits out the call; so do gate and up.
+	 *   gemma-3-1b    n_embd 1152 cuts into 1024 + 128, so ki = 0 is always
+	 *                 device 0 and ki = 1 always device 1. gate+up comes to
+	 *                 2 tasks and 7.078 MB against 2 tasks and 0.885 MB --
+	 *                 the counts are even and the bytes are eight to one.
+	 *
+	 * So the deal is least-loaded instead, over a running cost per device,
+	 * and the cost is the board's own fitted line (see the fit on `calls`
+	 * above). What each device is CHARGED for a slice is the two variable
+	 * terms of that line; the per call intercept is paid by both and
+	 * cancels.
+	 *
+	 * ⚠⚠ AND THE COUNTERS RESET WHEN K CHANGES, WHICH IS NOT A GUESS ABOUT
+	 * LAYER STRUCTURE. charsiu_npu_matvec_group REFUSES a group whose
+	 * entries do not share one K -- `if (g->ent[ids[i]].t->k != e0->t->k)
+	 * return -1`, because a group shares one packed activation -- so two
+	 * tensors of different K can never be in the same call. A change of K
+	 * is therefore a guaranteed call boundary, and it is the only one
+	 * staging can see: charsiu_npu_add is called one tensor at a time by
+	 * charsiu_pool_get on first use, and nothing tells it that the tensor
+	 * it is staging will be dispatched with the next two.
+	 *
+	 * Carrying a residue ACROSS that boundary is what a purely running
+	 * counter gets wrong, and the offline geometry check priced it: without
+	 * the reset the synthetic TinyLLAMA token comes out 8 us WORSE than the
+	 * index deal and gemma4 leaves 415 us on the table, because a call that
+	 * ended uneven pushes the next one off centre. With it, the deal lands
+	 * on the per call optimum -- an exhaustive minimum over every
+	 * two-colouring of the call's slices -- on all six models measured.
+	 */
+	double deal_load[2];
+	uint64_t deal_k;
+	int deal_index;            /* CHARSIU_NPU_DEAL_INDEX, the old deal */
 	struct npu_slot *slot;
 	unsigned n_slot, slot_cap;
 	struct npu_entry *ent;
@@ -376,6 +449,188 @@ struct charsiu_npu {
 	double call_us;
 
 	/*
+	 * ⚠⚠ THE CALL IS THE UNIT OF WALL CLOCK AND `submits` IS NOT, WHICH
+	 * MAKES THE LINE ABOVE IT IN THE REPORT HALF OF WHAT IT LOOKS LIKE.
+	 *
+	 * One call issues one submit PER DEVICE and then waits on both, so
+	 * busy_us covers a window the two submits SHARED while g->submits
+	 * counted two of them. Every "us a submit" this project has printed is
+	 * therefore a call's wall clock divided by the core count, and the fit
+	 * recorded in PLAN.md as `us a submit = 102.7 * MB + 112` is describing
+	 * a call whose fixed cost is 224 us, not 112.
+	 *
+	 * ⚠ ITS PRODUCT IS RIGHT, WHICH IS WORSE THAN BEING WRONG OUTRIGHT:
+	 * 12632 submits x 112 us and 6316 calls x 224 us are the same 1418 ms,
+	 * so the total looks checked while the per unit number it was read off
+	 * is out by a factor of two. Anyone reaching for "112 us a submit" as
+	 * the thing to attack is attacking half a cost.
+	 *
+	 * SO THE MODEL IS FITTED PER CALL, IN THREE TERMS, ON THE BOARD. Read
+	 * off TinyLLAMA's five decode stages against the geometry this file
+	 * cuts -- n_embd 2048, n_ff 5632, 22 layers, KMAX 1024, NMAX 8192, both
+	 * cores, int4 -- the stages and the line through them are
+	 *
+	 *     q k v     1.311 MB  3 tasks   measured  392.7   fit  383.5
+	 *     o         1.049     1         measured  276.4   fit  280.9
+	 *     gate+up   5.767     2         measured  845.0   fit  836.9
+	 *     down      3.146     3         measured  573.6   fit  585.4
+	 *     head     16.777     4         measured 2100.0   fit 2122.1
+	 *
+	 *   us a call = 128.7 + 36.8 * tasks + 110.0 * MB   (busier core)
+	 *
+	 * inside 2.4% at all five. The stages are weighted as a token presents
+	 * them -- twenty two of the first four and one head -- because that is
+	 * what the accumulators below will see, and it moves the line by about
+	 * 3% against fitting the five rows evenly.
+	 *
+	 * ⚠ AND IT AGREES WITH A ROUND THAT NEVER SAW A MODEL. The 2026-08-15
+	 * shape sweep fitted synthetic matmuls at 32 chained tasks and got 26.3
+	 * us a task plus 172 us a submit plus 84.3 us a megabyte. Same three
+	 * terms, same order, from different shapes on a different day.
+	 *
+	 * ⚠⚠ WHAT THAT SPLIT SAYS ABOUT THE ROOF. Per token it is 11.5 ms of
+	 * per call cost, 7.4 ms of per task cost and 29.1 ms of weights. Those
+	 * three add to the 48.0 ms stage total exactly, and that is arithmetic
+	 * rather than agreement -- a least squares fit with an intercept always
+	 * splits its own input exactly. What says the split is real is that a
+	 * typical call sits 9 us off the line, 1.7% of a 540 us mean call. So
+	 * 39% of what decode spends on the hardware is DISPATCH. The 550 MB a
+	 * token over 58.4 ms that reads as "9.4 GB/s, the bandwidth roof" is an
+	 * average over stages that run from 6.67 GB/s (q k v) to 15.60 (the
+	 * head): a roof does not have a 2.3x spread across shapes, a fixed cost
+	 * does. gate+up alone moves 253.8 MB a token in 18.59 ms, which is
+	 * 13.65 GB/s across the two cores WITH its own dispatch still in it, so
+	 * the streaming rate is strictly above that and decode is nowhere near
+	 * it.
+	 *
+	 * ⚠ WHICH IS ALSO THE ANSWER TO "THE VENDOR DOES 19.71 AND WE DO
+	 * 17.39". 19.71 tok/s is 50.7 ms a token; take off the 10.4 ms this
+	 * token spends outside the projections and the weights would have to
+	 * move at 12.8 GB/s, which is BELOW the 13.65 our own gate+up stage
+	 * already demonstrates. They do not need bandwidth we have not got.
+	 * They need fewer of the 89 calls and 202 tasks a token costs.
+	 *
+	 * ⚠ THIS IS AN INSTRUMENT, NOT A FIX. It is here because the numbers
+	 * above had to be fitted by hand from a five row stage table and a
+	 * spreadsheet of assumed shapes, which is not something the next round
+	 * should have to repeat: the board has thousands of calls a run and can
+	 * fit its own line, on its own shapes, for nine adds a call.
+	 *
+	 * ⚠ AND THE OBVIOUS FIX IS STILL NOT FREE, FOR A SECOND REASON NOW.
+	 * PLAN.md already records that raising KMAX to cut the task count
+	 * coarsens int4, because the K slice must BE the quantisation group.
+	 * The geometry said it also COSTS A CORE: slices were dealt as
+	 * `di = (ki * ns + ni) & 1`, which restarts at 0 for every tensor, so a
+	 * tensor that ends up with ONE slice landed entirely on device 0 and
+	 * device 1 sat out the call. At KMAX = 2048 every one of TinyLLAMA's
+	 * k = 2048 projections becomes a single slice: q, k and v all queued on
+	 * core 0 and the group's busier core carried 2.621 MB in 3 tasks
+	 * instead of 1.311 in 3, which by the line above is 527 us against 385.
+	 *
+	 * 🏁 THAT HALF IS FIXED -- the deal is least-loaded across a call now,
+	 * see g->deal_load -- AND RAISING KMAX IS STILL A LOSS. An offline walk
+	 * of the real .gguf geometry, scored with the line above, priced both
+	 * halves separately. It reproduces the five rows of the stage table
+	 * from the shapes alone (383 / 281 / 837 / 585 / 2121 us against the
+	 * measured 392.7 / 276.4 / 845.0 / 573.6 / 2100.0) and it reproduces
+	 * the 527 above, so it is describing this hardware and not a model of
+	 * it. A whole TinyLLAMA token, in microseconds of hardware path:
+	 *
+	 *   KMAX 1024   index deal 48012    least loaded 47969
+	 *   KMAX 2048   index deal 68064    least loaded 50410
+	 *
+	 * The index deal's 68064 is the +42% that was measured as "37% slower"
+	 * on the board, from geometry alone. Fixing the deal takes almost all
+	 * of it back -- and 50410 is still 5.1% WORSE than staying at 1024.
+	 *
+	 * ⚠⚠ WHICH IS ARITHMETIC RATHER THAN A SURPRISE, AND IT CLOSES THE
+	 * IDEA. Merging two K slices into one removes ONE task, worth 36.8 us,
+	 * and hands the surviving slice both halves' bytes -- which on a
+	 * 1.05 MB slice is 115 us. The task term is only 7.4 ms of a token
+	 * against the per call term's 11.5, and the per call term is untouched
+	 * by KMAX: the number of CALLS is set by how many times llama.c comes
+	 * in, 65 or 89 or 113 a token, and no slicing changes it. So there was
+	 * never 11.5 ms in reach here, only some fraction of 7.4 ms, and the
+	 * bytes it moves onto one core cost more than it saves.
+	 *
+	 * Across the five real models the same walk says KMAX 2048 is a win on
+	 * two (gemma3 -8.9%, phi3 -5.1%, both because their K is not a multiple
+	 * of 1024 and a coarser cut spends fewer runt slices) and a loss or a
+	 * wash on the other three. There is no consistent win, and every one of
+	 * them costs the quantiser: the K slice IS the int4 group, and one
+	 * scale for a 2048 long row measured 0.1067 relative error against
+	 * group 32's 0.0666. The coupling stays.
+	 *
+	 * ⚠⚠ ONE CLAUSE OF THAT IS TRUE ONLY OF THIS SLICER, AND IT IS THE ONE
+	 * THAT SOUNDS LIKE A LAW. "The bytes it moves onto one core cost more
+	 * than it saves" describes a cut with ONE GLOBAL KMAX and ONE GLOBAL
+	 * NMAX, where a tensor that stops needing a K cut becomes a SINGLE
+	 * slice and takes a whole core's share of the bytes with it. That is a
+	 * property of the cut this file makes, not of a wider K. Cut N at the
+	 * same time and the bytes do not move at all: a call whose slices come
+	 * out even splits its weight bytes in half whatever the cut, so the
+	 * megabyte term on the busier core is the SAME and only the task term
+	 * falls.
+	 *
+	 * Scored with the line above over the real .gguf geometry, with the cut
+	 * chosen freely PER TENSOR and capped at K <= 4096 and N <= 8192 (the
+	 * widest of each that has ever run on this board -- see round 322 for
+	 * why K = 8192 is not on the list), a decode token's hardware path:
+	 *
+	 *   Llama-3.2-1B    48825 -> 45587 us   -6.6%   tasks_hi 176 -> 88
+	 *   Qwen3-0.6B      38417 -> 36678      -4.5%
+	 *   gemma-3-1b      53556 -> 45958     -14.2%
+	 *   gemma-4-E2B     76583 -> 70311      -8.2%
+	 *   Phi-3.5-mini   142567 -> 123752    -13.2%
+	 *
+	 * Llama's MB_hi is 308.9 on both sides of that, which is the whole
+	 * point: 88 tasks came off and not one byte moved.
+	 *
+	 * ⚠⚠ AND IT IS THE CEILING OF SOMETHING THAT CANNOT BE BUILT. Every one
+	 * of those cuts wants a dispatch of K = 2048 or wider under a group of
+	 * 1024, and one dispatch cannot cover K wider than one group -- see the
+	 * long note above tensor_grouped(), which is now a measurement rather
+	 * than an assertion. Pin K at 1024, keep the same free choice of N, and
+	 * the whole of the win is 0.0% on Llama, +0.3% on Qwen3, -1.9% on
+	 * gemma3 and -0.7% on gemma4. Only Phi-3.5 finds anything, -5.7%, and
+	 * that is the deal balancing its very large tensors rather than fewer
+	 * tasks: its task count goes UP while its MB_hi falls 1014.7 to 930.6.
+	 *
+	 * So the reachable part of the 7.4 ms task term, without touching the
+	 * quantiser, is a couple of percent on four models and a deal fix on
+	 * the fifth. The rest of it is behind the group.
+	 */
+	unsigned long calls;       /* matvec and matvec_group entries */
+	unsigned long tasks_hi;    /* tasks on whichever device got more */
+	double mb_hi;              /* and megabytes on that device */
+	/*
+	 * ⚠ AND THE SAME CALLS' TOTAL, WHICH IS WHAT MAKES mb_hi READABLE.
+	 *
+	 * mb_hi on its own cannot say whether a call was balanced: 16 MB on the
+	 * busier core is perfect if the other core also carried 16 and a wasted
+	 * core if it carried none. mb_hi / (mb_all / ndev) is 1.0 when the deal
+	 * is even and 2.0 when one core did all of it.
+	 *
+	 * ⚠ NOT g->weight_mb, WHICH LOOKS LIKE THE SAME NUMBER AND IS NOT.
+	 * charsiu_npu_matmul adds to weight_mb and never calls account_call, so
+	 * a run with any prefill in it has weight_mb counting bytes mb_hi never
+	 * saw. This is summed in account_call, over exactly the calls the ratio
+	 * is about.
+	 */
+	double mb_all;
+	/*
+	 * The normal equations for y = A + B * tasks + C * MB, and f_yy so the
+	 * fit can say how well it fits.
+	 *
+	 * ⚠ THE THREE PARTS ADDING TO THE TOTAL PROVES NOTHING. The first
+	 * normal equation IS `A * n + B * sum(tasks) + C * sum(MB) = sum(us)`,
+	 * so a least squares fit with an intercept splits the hardware path
+	 * exactly, always, however badly the line describes the calls. What
+	 * says it describes them is the residual, which needs sum(us * us).
+	 */
+	double f_n, f_t, f_m, f_tt, f_tm, f_mm, f_y, f_ty, f_my, f_yy;
+
+	/*
 	 * A wedged block answers every submit with a driver side timeout and
 	 * the ioctl still returns success, so the only reliable detector is the
 	 * clock. Three slow submits and this path retires itself.
@@ -460,6 +715,101 @@ static unsigned env_u(const char *name, unsigned dflt)
  * condition is deliberately strict -- the slice must BE the group -- because a
  * slice covering part of a group would need a scale per part and there is
  * nowhere to put one.
+ */
+/*
+ * ⚠⚠ AND "NOWHERE TO PUT ONE" IS A PROPERTY OF THE BLOCK, NOT A CHOICE THIS
+ * FILE MADE. ONE DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP.
+ *
+ * The sentence above was an assertion for a long time, and the obvious idea it
+ * blocks -- decouple KMAX from W4_GROUP, dispatch K = 4096 with four groups of
+ * 1024 scales in the weights, halve the task count without coarsening the
+ * quantiser -- is worth a re-read of the register map every time somebody
+ * notices the coupling. So here is why it does not work, in the form that
+ * closes it.
+ *
+ * A dispatch produces ONE number per output channel. The CNA and the CORE
+ * reduce over every input channel the dispatch was handed, and everything that
+ * can touch the result afterwards lives in the DPU: BS, BN, EW and the output
+ * convert, in that order, every one of them indexed by OUTPUT channel and every
+ * one of them running AFTER the reduction. Their operand surfaces come from the
+ * DPU_RDMA, whose DATA_CUBE_CHANNEL at 0x5014 is the output channel count.
+ * Nothing in the map segments the K reduction or writes a partial sum per range
+ * of K -- DPU_SURFACE_ADD at 0x40c0 comes closest and it ADDS surfaces, with no
+ * per-surface operand. So the limit is not the coefficient FORMAT, which is
+ * only a table of ceil(n/8) 64 byte records plus one fp16 a channel and could
+ * be widened in an afternoon. It is the accumulator, which cannot.
+ *
+ * On the int4 path charsiu does not even use the DPU's multiplier: acc_out
+ * forces the whole vendor output stage on, the requant reads identity
+ * (0x40ac/b0/b4 = 0, 1, 0), the raw accumulator comes back and the group scale
+ * is applied on the CPU by scaled_add. That is why the gather in add_slice can
+ * take ONE scale a channel for the slice and no more.
+ *
+ * Both ways round it close. A factor folded into the ACTIVATION has to be the
+ * same for every output channel -- which is exactly why the per k AWQ factor in
+ * npuquant.c is free, and exactly why a per (channel, group) scale is not.
+ * Folding it into the WEIGHTS means multiplying a four bit code by a ratio and
+ * rounding it back into four bits, which is per channel quantisation with extra
+ * steps.
+ *
+ * ⚠⚠ AND THE VENDOR'S K = 4096 DISPATCH IS NOT DOING WHAT OURS WOULD HAVE TO.
+ * That is the part worth having, because their compiled streams are the only
+ * evidence available for what this block will accept, and the shape of their
+ * cut -- 2 x K=2048 N=1024 for q and o, 2 x K=2048 N=4096 for gate and up,
+ * 4 x K=4096 N=1024 for down, against our 1024 wide K pieces -- reads like a
+ * demonstration that a wide K under a fine group runs. It is not one.
+ *
+ * Read out of Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm with
+ * tools/rkllm_regcmd.py, three things say so and they agree:
+ *
+ *   - the weight byte count in CNA 0x101c is EXACTLY ic * oc / 2. 0x100000 at
+ *     K=2048 N=1024, 0x200000 at K=4096 N=1024. Nibbles and nothing else;
+ *     there is no room beside them for a scale table;
+ *   - the int4 convolution stream carries no DPU_RDMA registers at all, so no
+ *     coefficient surface is fetched for it -- 0x5020 and 0x5024 are never
+ *     written; and
+ *   - its requant is the identity, 0x40ac/b0/b4 = 0, 1, 0, the same three
+ *     values this file copies.
+ *
+ * So no per group scale enters their dispatch either. And the file says what
+ * their group actually is, in the open: the scales are stored as contiguous
+ * fp32 runs and the length of a run is the tensor's OUTPUT CHANNEL COUNT.
+ * Layer 0 begins at byte 0x1fc77da0 and goes 2048, 512, 512, 2048, 8192, 8192,
+ * 2048 -- q, k, v, o, gate, up, down -- each run followed by an equally long
+ * run of integer valued floats, which is the zero point. That block repeats for
+ * 16 layers, and the embedding and head share one run of 128256. 505088 scales
+ * for 1235746816 weights.
+ *
+ * ⚠ AND THE RUNS WERE IDENTIFIED RATHER THAN GUESSED, because a length on its
+ * own could be a norm. Correlating each run ELEMENT BY ELEMENT against the per
+ * row dynamic range of the matching tensor in the q8_0 copy of the same model
+ * gives +0.93 for attn_q, +0.97 for attn_k, +0.91 for attn_v, +0.97 for
+ * attn_output, +0.99 for ffn_gate, +0.84 for ffn_up and +0.98 for ffn_down.
+ * Row r of the run is the scale of row r of that tensor. (The ratio of range to
+ * scale is not the same constant across the seven -- 4.4 on attn_q against 15.2
+ * on attn_output -- which is the other half of the point: their quantiser is
+ * doing something to the weights before it rounds them, and getting quality out
+ * of one scale a row is a quantiser result, not a dispatch one.)
+ *
+ * ONE SCALE AND ONE ZERO POINT PER ROW. Their group is the whole of K, 8192
+ * long for down. A per row scale factors straight out of a K sum, so their K
+ * cut is free the way an UNGROUPED tensor's K cut is free here, and they choose
+ * 4096 because 8192 does not run (round 322 hit the same wall from the other
+ * side: 0.65 GB/s and 131 job timeouts) and choose N to hand the second core an
+ * equal share. Their wide K is not a finer group surviving a wide dispatch. It
+ * is no group at all.
+ *
+ * ⚠ WHICH ALSO PRICES THE ONLY DOOR LEFT, and it is a quantiser question rather
+ * than a dispatch one: go where the vendor is, one scale a row, and pay for it
+ * with a calibrated quantiser instead of RTN. Measured offline on the real
+ * weights with this file's own rule (d = vmax / -8), relative Frobenius error
+ * of the reconstruction, group 1024 against one scale a row: attn_q 0.1427 ->
+ * 0.1518, attn_output 0.1622 -> 0.1783, ffn_down (K = 8192) 0.1402 -> 0.1707.
+ * The per k AWQ factor takes most of that back on the K = 2048 tensors (attn_q
+ * 0.1409, attn_output 0.1596, both BELOW the grouped number) and does not on
+ * ffn_down, which is the one that would gain the most tasks. Weight error is
+ * not the objective -- npuquant.c says why -- so that is a starting price, not
+ * a verdict.
  */
 /*
  * acc[j] += fo[j] * sc[j], AND BIT FOR BIT WHAT THE SCALAR LOOP DID.
@@ -640,6 +990,40 @@ static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned 
 	fprintf(stderr, "charsiu: NOT on the NPU -- %s (K=%u N=%u)\n", what, k, n);
 }
 
+/*
+ * ⚠⚠ THE WIDEST K A SINGLE SLICE CAN CARRY. Every buffer that holds one must
+ * be sized by this and not by kmax.
+ *
+ * CHARSIU_NPU_KFIT makes the last K slice ABSORB the remainder instead of
+ * being it -- the `ks--` in charsiu_npu_add -- so that slice runs from a kmax
+ * boundary to the end of the tensor and is up to 2 * kmax - 1 wide.
+ *
+ * When KFIT was written, scratch and wpack were widened for it and the
+ * BATCHED buffers were not: bin_stride, bscr and bq were all still kmax * m.
+ * The batched packer gathers one slice's whole K into bscr, quantises it into
+ * bq and packs it into bin at bin_stride, so all three overran by up to 2x.
+ * bscr and bq are plain mallocs, so the board answered with
+ *
+ *     malloc(): corrupted top size
+ *     Aborted
+ *
+ * on the first staged model, every time, on gemma-3-1b and gemma-4-E2B alike.
+ *
+ * ⚠ AND NO HOST COULD SEE IT. With no /dev/accel the NPU never opens, nothing
+ * is staged and no batched buffer is allocated, so KFIT measured "text
+ * identical and slightly faster" on the desk while it aborted on the card.
+ * The switch had sat in this tree described as written, legal and default
+ * off, and the round that priced it repeated "already legal". Nothing had
+ * ever run it.
+ *
+ * One function, so the fifth place that needs this bound cannot be the one
+ * that gets forgotten.
+ */
+static size_t kmax_wide(const struct charsiu_npu *g)
+{
+	return (size_t)g->kmax * (g->kfit ? 2 : 1);
+}
+
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors)
 {
@@ -703,13 +1087,44 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->nmax = env_u("CHARSIU_NPU_NMAX", 8192);
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 4096);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
+	/*
+	 * ⚠ IT DOES NOT SPLIT THE SUBMIT. Whatever its name and its older
+	 * comment suggested, the only thing that reads `nochain` scales the
+	 * slow-job threshold by the chain length. Setting it changes what
+	 * gets WARNED about, never what gets submitted.
+	 */
 	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
 	/*
 	 * 0 is unlimited. A cap exists because the output head is 126 chained
 	 * tasks and 253 buffer handles in one submit, and it reached only
 	 * 4.2 GB/s where an eight task submit reaches 10.
 	 */
+	/*
+	 * ⚠⚠ AND IT HAS NEVER CAPPED ANYTHING. `maxtask` is assigned here and
+	 * read NOWHERE in this tree. The paragraph above describes the
+	 * measurement that motivated it -- the head's 126 chained tasks at
+	 * 4.2 GB/s against an eight task submit's 10 -- and that hypothesis
+	 * has therefore never had a working control: every round that set
+	 * CHARSIU_NPU_MAXTASK to test it measured its own baseline twice.
+	 *
+	 * CHARSIU_NPU_NOCHAIN is the same story with a smaller blast radius:
+	 * it is read once, and only to scale the slow-job threshold, not to
+	 * split the submit its own comment claims it splits.
+	 *
+	 * A variable that is read and then ignored is worse than one that does
+	 * not exist, because a round can be built on it. It says so now, and
+	 * it will keep saying so until something reads it.
+	 */
 	g->maxtask = env_u("CHARSIU_NPU_MAXTASK", 0);
+	if (g->maxtask) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CHARSIU_NPU_MAXTASK=%u is "
+				"IGNORED -- nothing in this tree reads it, so "
+				"this run is the same as one without it\n",
+				g->maxtask);
+	}
 	/*
 	 * ⚠ THE RETIREMENT GUARD WAS BLIND TO A THIRTEEN FOLD SLOWDOWN.
 	 *
@@ -831,15 +1246,38 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * split of the same K gives the same accumulator.
 	 *
 	 * Off until a board round says it is both correct and faster.
+	 *
+	 * ⚠ AND THE "UNGROUPED TENSORS ONLY" RESTRICTION COSTS IT NOTHING ON
+	 * THE MODELS IT IS FOR, which is not obvious and is why it is written
+	 * down. npuquant.c falls back to one scale a row whenever k % grp is
+	 * nonzero -- `if (k % grp) grp = k;` -- so a tensor whose K does not
+	 * divide the slice is ALREADY ungrouped, and a tensor whose K does
+	 * divide it has no remainder for KFIT to absorb. The two conditions are
+	 * complementary. gemma3 (K 1152 and 6912) and gemma4's q, k, v, gate
+	 * and up (K 1536) are ungrouped today, so KFIT applies to every tensor
+	 * it would help and is blocked on nothing but a board round.
+	 *
+	 * The offline walk over the fitted line prices it: gemma3 53556 ->
+	 * 49347 us a token, -7.9%, and gemma4 76583 -> 73870, -3.5%. Llama,
+	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
+	/*
+	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
+	 * assignment every number in this file before round 391 was measured
+	 * with, so it has to stay reachable in one boot beside its replacement
+	 * -- see the long note on g->deal_load. It is exactly neutral on
+	 * Llama-3.2-1B, whose dimensions are all powers of two, which is the
+	 * cheapest way for a board round to check the switch itself works.
+	 */
+	g->deal_index = getenv("CHARSIU_NPU_DEAL_INDEX") != NULL;
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	g->max_slices = ns * ks;
 	g->slot_cap = max_tensors * g->max_slices;
 
 	{
-		unsigned kwide = g->kfit ? 2 * g->kmax : g->kmax;
+		unsigned kwide = (unsigned)kmax_wide(g);
 		struct charsiu_matmul widest = { 1, kwide, g->nmax,
 						 CHARSIU_INT8, CHARSIU_INT8 };
 
@@ -853,12 +1291,12 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->ent = calloc(g->ent_cap, sizeof(*g->ent));
 	g->slot = calloc(g->slot_cap, sizeof(*g->slot));
 	/* ⚠ the widest a slice can be, which KFIT doubles -- see above */
-	g->scratch = malloc((size_t)g->nmax * g->kmax * (g->kfit ? 2 : 1) + max_k);
+	g->scratch = malloc((size_t)g->nmax * kmax_wide(g) + max_k);
 	g->acc = calloc(max_n, sizeof(*g->acc));
 	g->accf = calloc(max_n, sizeof(*g->accf));
 	g->fscr = calloc(max_k ? max_k : 1, sizeof(*g->fscr));
 	g->afscr = calloc(max_k ? max_k : 1, sizeof(*g->afscr));
-	g->wpack = malloc((size_t)g->nmax * g->kmax * (g->kfit ? 2 : 1) + 4096);
+	g->wpack = malloc((size_t)g->nmax * kmax_wide(g) + 4096);
 	g->asum = calloc(ks ? ks : 1, sizeof(*g->asum));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
@@ -965,6 +1403,71 @@ int charsiu_npu_needs_q1(const struct charsiu_npu *g)
 	return !g || !g->w4;
 }
 
+/*
+ * THE THREE TERM SOLVE, AND WHY IT REFUSES RATHER THAN GUESSES.
+ *
+ * Gaussian elimination with partial pivoting on a 3x3, which is about as much
+ * numerical work as this deserves. What matters is the refusal: a run that
+ * presented only one shape -- a single tensor benchmark, a model whose every
+ * projection happens to be the same size, or a run that made two calls -- has a
+ * singular or nearly singular system, and the fit it produces would be three
+ * numbers with no information in them that a reader would nonetheless quote.
+ *
+ * ⚠ THE THRESHOLD IS RELATIVE. The entries span the call count, the megabytes
+ * and their squares, so an absolute epsilon is meaningless: 1e-9 is small next
+ * to a sum of squares over ten thousand calls and enormous next to one over
+ * three. The pivot is compared against the largest entry the matrix started
+ * with, which is scale free.
+ */
+static int solve3(double m[3][3], double *v, double *x)
+{
+	double big = 0.0;
+	int i, j, r;
+
+	for (i = 0; i < 3; i++)
+		for (j = 0; j < 3; j++)
+			if (fabs(m[i][j]) > big)
+				big = fabs(m[i][j]);
+	if (big <= 0.0)
+		return -1;
+	for (i = 0; i < 3; i++) {
+		int piv = i;
+
+		for (r = i + 1; r < 3; r++)
+			if (fabs(m[r][i]) > fabs(m[piv][i]))
+				piv = r;
+		if (fabs(m[piv][i]) < 1e-12 * big)
+			return -1;
+		if (piv != i) {
+			for (j = 0; j < 3; j++) {
+				double t = m[i][j];
+
+				m[i][j] = m[piv][j];
+				m[piv][j] = t;
+			}
+			{
+				double t = v[i];
+
+				v[i] = v[piv];
+				v[piv] = t;
+			}
+		}
+		for (r = 0; r < 3; r++) {
+			double f;
+
+			if (r == i)
+				continue;
+			f = m[r][i] / m[i][i];
+			for (j = i; j < 3; j++)
+				m[r][j] -= f * m[i][j];
+			v[r] -= f * v[i];
+		}
+	}
+	for (i = 0; i < 3; i++)
+		x[i] = v[i] / m[i][i];
+	return 0;
+}
+
 void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)
@@ -987,7 +1490,9 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	if (g->submits)
 		fprintf(stderr,
 			"charsiu NPU: %.0f ms in the hardware path, %.2f GB/s "
-			"of weights, %.0f us a submit\n"
+			"of weights, %.0f us a submit -- a call issues one per "
+			"core and waits on both, so that is a CALL's wall "
+			"clock over %u\n"
 			"charsiu NPU: of that, %.0f ms submitting, %.0f ms "
 			"waiting for the fence (the invalidate is in there), "
 			"%.0f ms summing the slices, %.0f ms in the flush\n"
@@ -998,11 +1503,116 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"charsiu NPU: %.0f ms in these calls end to end, so "
 			"%.0f ms of them is neither hardware nor packing\n",
 			g->busy_us / 1e3, g->weight_mb / g->busy_us * 1e3,
-			g->busy_us / (double)g->submits,
+			g->busy_us / (double)g->submits, g->ndev,
 			g->submit_us / 1e3, g->fence_us / 1e3,
 			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3,
 			g->cpu_us / 1e3, g->call_us / 1e3,
 			(g->call_us - g->busy_us - g->pack_us) / 1e3);
+	/*
+	 * ⚠⚠ WHERE THE TIME GOES, SPLIT THREE WAYS INSTEAD OF DIVIDED BY A
+	 * SUBMIT COUNT THAT DOUBLE COUNTS THE CORES.
+	 *
+	 * The line above prints megabytes and microseconds "a submit", which is
+	 * a call's wall clock over the number of cores it used -- see the
+	 * comment on g->calls. This is the same run in the units the clock
+	 * actually measured, and it separates the part that scales with the
+	 * bytes from the part that does not.
+	 *
+	 * ⚠ THE FIXED SHARE IS THE WHOLE POINT. If it is small then this
+	 * hardware path is bandwidth bound and the only thing left is to move
+	 * fewer bytes. If it is large -- and on TinyLLAMA decode the offline
+	 * fit puts it at 40% of the hardware path, 11.9 ms per call plus 7.3 ms
+	 * per task against 28.8 ms of weights -- then the tokens per second are
+	 * being spent on dispatch, and the bytes per second figure above is an
+	 * average across shapes rather than a roof anything is pressed against.
+	 *
+	 * The GB/s here is the aggregate across the cores and it does NOT
+	 * assume they were given equal shares: it is the whole run's weight
+	 * megabytes over the time the fit attributes to weights, so an uneven
+	 * split shows up as a lower rate rather than as an invisible one.
+	 */
+	if (g->calls > 3) {
+		double m[3][3], v[3], x[3];
+
+		m[0][0] = g->f_n;  m[0][1] = g->f_t;  m[0][2] = g->f_m;
+		m[1][0] = g->f_t;  m[1][1] = g->f_tt; m[1][2] = g->f_tm;
+		m[2][0] = g->f_m;  m[2][1] = g->f_tm; m[2][2] = g->f_mm;
+		v[0] = g->f_y; v[1] = g->f_ty; v[2] = g->f_my;
+		fprintf(stderr,
+			"charsiu NPU: %lu calls, %lu tasks and %.0f MB on the "
+			"busier core, %.0f us a call\n",
+			g->calls, g->tasks_hi, g->mb_hi,
+			g->busy_us / (double)g->calls);
+		/*
+		 * ⚠ HOW LOPSIDED THE CALLS WERE, WHICH mb_hi ALONE CANNOT SAY.
+		 *
+		 * 1.00 is the two cores carrying the same bytes; 2.00 is one
+		 * core doing all of it while the other waits on a fence for
+		 * nothing. Before the least-loaded deal, Qwen3-0.6B ran its
+		 * q/k/v call and its gate/up call at a flat 2.00 -- n_embd 1024
+		 * is one K slice at KMAX 1024, so every one of those five
+		 * tensors was a single slice and every single slice went to
+		 * device 0. It is printed rather than derived because the ratio
+		 * is the whole claim the deal makes, and a run that regressed
+		 * should be able to say in one line whether the deal is why.
+		 */
+		if (g->ndev > 1 && g->mb_all > 0.0)
+			fprintf(stderr,
+				"charsiu NPU: the busier core carried %.2fx an "
+				"even share of the weights (1.00 is balanced, "
+				"2.00 is one core idle)%s\n",
+				g->mb_hi / (g->mb_all / (double)g->ndev),
+				g->deal_index
+				? " -- CHARSIU_NPU_DEAL_INDEX is set, so this "
+				  "is the old per tensor deal" : "");
+		if (!solve3(m, v, x)) {
+			double fix = x[0] * (double)g->calls / 1e3;
+			double tsk = x[1] * (double)g->tasks_hi / 1e3;
+			double byt = x[2] * g->mb_hi / 1e3;
+
+			fprintf(stderr,
+				"charsiu NPU: us a call = %.0f + %.1f a task "
+				"+ %.1f a MB (both on the busier core), so of "
+				"%.0f ms in the hardware path %.0f ms is per "
+				"call, %.0f ms is per task and %.0f ms is the "
+				"weights at %.2f GB/s across %u core%s\n",
+				x[0], x[1], x[2], g->busy_us / 1e3, fix, tsk,
+				byt, byt > 0.0 ? g->weight_mb / byt : 0.0,
+				g->ndev, g->ndev == 1 ? "" : "s");
+			/*
+			 * ⚠ THE RESIDUAL, NOT THE SUM. fix + tsk + byt is the
+			 * hardware path to the last decimal by construction --
+			 * see the comment on f_yy -- so the number that says
+			 * whether to believe the split is how far a typical
+			 * call sits off the line. On TinyLLAMA's five decode
+			 * shapes that is 9 us against a 540 us mean call,
+			 * 1.7%; anything much larger means the calls are not
+			 * three terms and the megabyte figure above should not
+			 * be quoted.
+			 */
+			if (g->busy_us > 0.0) {
+				double ss = g->f_yy - x[0] * g->f_y
+					  - x[1] * g->f_ty - x[2] * g->f_my;
+				double rms = ss > 0.0
+					   ? sqrt(ss / (double)g->calls) : 0.0;
+
+				fprintf(stderr,
+					"charsiu NPU: %.0f%% of the hardware "
+					"path is dispatch rather than bytes, "
+					"and a typical call sits %.0f us off "
+					"that line, %.1f%% of the %.0f us it "
+					"takes\n",
+					100.0 * (fix + tsk) / (g->busy_us / 1e3),
+					rms,
+					100.0 * rms * (double)g->calls / g->f_y,
+					g->f_y / (double)g->calls);
+			}
+		} else {
+			fprintf(stderr,
+				"charsiu NPU: too few distinct shapes to split "
+				"that into a fixed and a per byte part\n");
+		}
+	}
 	if (g->slow_n)
 		fprintf(stderr,
 			"charsiu NPU: %lu of %lu submits came in under %.1f "
@@ -1134,6 +1744,78 @@ static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
 		if (i < t->k)
 			dst[i >> 1] = (uint8_t)(src[i] & 0xf);
 	}
+}
+
+/*
+ * THE EXTENT OF ONE SLICE, IN ONE PLACE.
+ *
+ * charsiu_npu_add walks the (ki, ni) grid TWICE -- once to find out how many
+ * slices each device is about to be given, so the output buffers can be sized
+ * for what they will actually hold, and once to stage them. The two walks have
+ * to agree exactly or a slice writes past the end of a buffer sized for fewer,
+ * so the widths are computed here rather than written out twice.
+ */
+static unsigned slice_k(const struct charsiu_npu *g, uint64_t k, unsigned ks,
+			unsigned ki)
+{
+	/* ⚠ THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is more than
+	 * KMAX, and clamping it here would drop the tail of the tensor without
+	 * a word. */
+	return ki + 1 == ks ? (unsigned)(k - (uint64_t)ki * g->kmax) : g->kmax;
+}
+
+static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni)
+{
+	unsigned n0 = ni * g->nmax;
+
+	return (n_npu - n0) < g->nmax ? (n_npu - n0) : g->nmax;
+}
+
+/* the weight megabytes a slice costs the device it lands on, at its own width */
+static double slice_mb(const struct charsiu_npu *g, unsigned k, unsigned n)
+{
+	return (double)k * (double)n / (g->w4 ? 2.0 : 1.0) / 1e6;
+}
+
+/*
+ * WHICH CORE THIS SLICE GOES TO -- the one decision point, control included.
+ *
+ * The two terms are the board's fitted line for a call, minus its intercept:
+ *
+ *     us a call = 128.7 + 36.8 * tasks + 110.0 * MB      (busier core)
+ *
+ * Both devices pay the 128.7 whatever this returns, so charging it here would
+ * only add a constant to both sides of every comparison. What is left says a
+ * task is worth a third of a megabyte, which is why the deal cannot be by bytes
+ * alone: a run of tiny slices piled on one core costs real time.
+ *
+ * ⚠ CHARSIU_NPU_DEAL_INDEX PUTS THE OLD DEAL BACK, and it has to be here
+ * rather than at the call site because the sizing pass and the staging pass
+ * both ask this question and a switch either of them missed would size a buffer
+ * for one deal and fill it with another.
+ *
+ * ⚠ THE COUNTERS COME IN AS A PARAMETER AND THAT IS DELIBERATE, WHICH IS ALSO
+ * WHY g IS const HERE WHILE THIS FUNCTION STILL CHANGES STATE. The staging pass
+ * hands it g->deal_load and moves the run along; the sizing pass hands it a
+ * copy on the stack and asks the same question without disturbing anything. One
+ * function, two callers, and no way for them to answer differently.
+ */
+#define DEAL_US_TASK   36.8
+#define DEAL_US_MB    110.0
+
+static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
+			  unsigned ki, unsigned ni, unsigned ns,
+			  unsigned k, unsigned n)
+{
+	unsigned d;
+
+	if (g->ndev < 2)
+		return 0;
+	if (g->deal_index)
+		return (ki * ns + ni) & 1;
+	d = load[0] <= load[1] ? 0 : 1;
+	load[d] += DEAL_US_TASK + DEAL_US_MB * slice_mb(g, k, n);
+	return d;
 }
 
 /* One slice: rows [n0, n0+n) and columns [k0, k0+k) of t, writing region si. */
@@ -1306,6 +1988,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 */
 	charsiu_note(t->name, (unsigned long)t->n, (unsigned long)t->k);
 	unsigned ns, ks, first = g->n_slot, si = 0;
+	unsigned nslot[2];         /* what the deal gives each device */
 
 	if (g->dead) {
 		whine(g, "the hardware path is already retired", (unsigned)t->k,
@@ -1378,6 +2061,49 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		return -1;
 	}
 
+	/*
+	 * ⚠⚠ A CHANGE OF K IS A CALL BOUNDARY, and it is the only one staging
+	 * can see. charsiu_npu_matvec_group refuses a group whose entries do
+	 * not share one K, so nothing that follows a K change can be in the
+	 * same call as anything before it, and the running deal starts level.
+	 * See the long note on g->deal_load for why carrying the residue across
+	 * that line measures WORSE than not balancing at all.
+	 */
+	if (g->deal_k != t->k) {
+		g->deal_load[0] = g->deal_load[1] = 0.0;
+		g->deal_k = t->k;
+	}
+
+	/*
+	 * ⚠⚠ DEAL FIRST, THEN SIZE THE BUFFERS FOR WHAT WAS DEALT.
+	 *
+	 * The old assignment alternated, so each device held ceil(count / 2)
+	 * slices and the buffers could be sized from the count alone. A
+	 * least-loaded deal does not: gemma4's q, k and v come out 2 slices on
+	 * one core and 4 on the other, which is the point of it. So the walk
+	 * below is the same walk that stages, run against a COPY of the
+	 * counters, purely to learn how many output regions each device is
+	 * about to be handed.
+	 *
+	 * The two walks share slice_k, slice_n and deal_pick, so they cannot
+	 * disagree about geometry or about the deal. If they ever did, the
+	 * bound check in the group read back -- `(s->out_slot + 1) *
+	 * out_stride > e->out[s->di].size` -- is the net: it prints the slot
+	 * and the buffer size and retires the path rather than writing past it.
+	 */
+	{
+		double probe[2] = { g->deal_load[0], g->deal_load[1] };
+
+		nslot[0] = nslot[1] = 0;
+		for (unsigned ki = 0; ki < ks; ki++) {
+			unsigned kw = slice_k(g, t->k, ks, ki);
+
+			for (unsigned ni = 0; ni < ns; ni++)
+				nslot[deal_pick(g, probe, ki, ni, ns, kw,
+						slice_n(g, e_n_npu, ni))]++;
+		}
+	}
+
 	e = &g->ent[g->n_ent];
 	memset(e, 0, sizeof(*e));
 	/*
@@ -1393,16 +2119,22 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	/*
 	 * ⚠ SIZED FOR THE SLICES THIS DEVICE ACTUALLY GETS, not for all of them.
 	 *
-	 * The slices alternate, so each device holds half of ns*ks, and
-	 * allocating both buffers at the full size doubled the cache
+	 * Allocating both buffers at the full size doubled the cache
 	 * maintenance a matvec pays: charsiu_bo_prep and _fini work over a WHOLE
 	 * buffer object, and round 366 measured 13.4 ms a token in the readback
 	 * against 11.6 on the one device build. The output head alone is 512 KB
 	 * a buffer, so this is half a megabyte of cache operations a token
 	 * bought back for nothing.
+	 *
+	 * ⚠ AND IT IS THE DEAL'S OWN COUNT NOW, not ceil(ns * ks / 2). That
+	 * expression was only ever true because the slices alternated; a
+	 * least-loaded deal can give one device more than half of a tensor, and
+	 * a buffer sized on the old assumption would be written past. It is
+	 * also SMALLER wherever the deal is uneven, which is the same cache
+	 * maintenance argument running the other way.
 	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		size_t slots = ((size_t)ns * ks + 1) / (g->ndev > 1 ? 2 : 1) + 1;
+		size_t slots = (size_t)nslot[d] + 1;
 
 		if (charsiu_bo_alloc(g->dev[d],
 				     slots * g->out_stride + 4096,
@@ -1418,25 +2150,24 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * group. Round 364 put the second core in and got only 7%, because the
 	 * o_proj, the down_proj and the 128256 wide output head all go through
 	 * the single projection path -- more than 40% of the weight traffic in
-	 * tensors that were never grouped with anything. Alternating the SLICES
+	 * tensors that were never grouped with anything. Splitting the SLICES
 	 * gives those two cores as well.
+	 *
+	 * ⚠ AND ACROSS TENSORS AS WELL AS WITHIN ONE, which is what g->deal_load
+	 * carries and what an index that restarted per tensor could not do.
 	 */
 	{
 	unsigned sid[2] = { 0, 0 };
 
 	for (unsigned ki = 0; ki < ks; ki++) {
 		unsigned k0 = ki * g->kmax;
-		/* ⚠ THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is
-		 * more than KMAX, and clamping it here would drop the tail of
-		 * the tensor without a word. */
-		unsigned k = ki + 1 == ks ? (unsigned)(t->k - k0) : g->kmax;
+		unsigned k = slice_k(g, t->k, ks, ki);
 
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
 			unsigned n0 = ni * g->nmax;
-			unsigned n = (e_n_npu - n0) < g->nmax
-				   ? (e_n_npu - n0) : g->nmax;
-
-			unsigned d = g->ndev > 1 ? ((ki * ns + ni) & 1) : 0;
+			unsigned n = slice_n(g, e_n_npu, ni);
+			unsigned d = deal_pick(g, g->deal_load, ki, ni, ns,
+					       k, n);
 
 			if (add_slice(g, d, t, n0, n, k0, k, ki, sid[d]++,
 				      (uint32_t)e->out[d].dma_address) < 0) {
@@ -1454,6 +2185,25 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	e->n_slices = ns;
 	e->k_slices = ks;
 	e->n_npu = e_n_npu;
+	/*
+	 * WHAT EACH CORE ENDED UP WITH, counted where the assignment is made.
+	 *
+	 * ⚠ THIS IS WHAT THE DEAL IS SCORED ON, so it is worth saying what it
+	 * can and cannot fix. TinyLLAMA's down_proj cuts k = 5632 into five
+	 * 1024 slices and one of 512, and no deal divides that evenly: the best
+	 * two-colouring is 3.146 MB against 2.621, which is what the index deal
+	 * already gave. What the least-loaded deal fixes is the case the index
+	 * one could not see at all -- a call carrying several tensors, and a
+	 * tensor whose slices are of different widths.
+	 */
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *sl = &g->slot[e->first + i];
+		unsigned d = sl->di < 2 ? sl->di : 0;
+
+		e->nt_dev[d]++;
+		e->mb_dev[d] += (double)sl->job.mm.k * (double)sl->job.mm.n
+			      / (g->w4 ? 2.0 : 1.0) / 1e6;
+	}
 	/*
 	 * THE CPU'S ROWS, PACKED TWO WEIGHTS TO A BYTE.
 	 *
@@ -1516,6 +2266,61 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			((now_us() - g->t_first) - g->add_us) / 1000.0);
 	}
 	return (int)g->n_ent++;
+}
+
+/*
+ * ONE CALL'S GEOMETRY AND ONE CALL'S WALL CLOCK, INTO THE FIT.
+ *
+ * The three terms the report solves for -- a cost per call, a cost per chained
+ * task and a cost per megabyte -- are not separable from any single run of the
+ * decode loop, because a real model only ever presents five or six shapes and
+ * each of them varies all three at once. They ARE separable across those five,
+ * which is what least squares is for, so every call drops its (tasks, MB, us)
+ * into the normal equations and the report solves them at the end.
+ *
+ * ⚠ THE MAX, NOT THE SUM. The devices are submitted before either is waited
+ * on, so a call ends when the SLOWER core finishes; charging it the total would
+ * fit a line to a quantity the clock never measured.
+ *
+ * ⚠ AND THE MEGABYTES ARE THE HARDWARE'S OWN. mb_dev is summed from the slices'
+ * mm.k * mm.n at the device's own weight width, so the CPU's rows under
+ * CHARSIU_NPU_CPU_FRAC are already out of it and int4 is already halved -- the
+ * mistake that made every int4 GB/s in this project double the real figure for
+ * three rounds.
+ */
+static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
+			 double us)
+{
+	double mb[2] = { 0.0, 0.0 }, hm;
+	double nt[2] = { 0.0, 0.0 }, ht;
+	unsigned i;
+
+	for (i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+
+		mb[0] += e->mb_dev[0];
+		mb[1] += e->mb_dev[1];
+		nt[0] += e->nt_dev[0];
+		nt[1] += e->nt_dev[1];
+	}
+	hm = mb[0] > mb[1] ? mb[0] : mb[1];
+	ht = nt[0] > nt[1] ? nt[0] : nt[1];
+
+	g->calls++;
+	g->tasks_hi += (unsigned long)ht;
+	g->mb_hi += hm;
+	g->mb_all += mb[0] + mb[1];
+
+	g->f_n  += 1.0;
+	g->f_t  += ht;
+	g->f_m  += hm;
+	g->f_tt += ht * ht;
+	g->f_tm += ht * hm;
+	g->f_mm += hm * hm;
+	g->f_y  += us;
+	g->f_ty += ht * us;
+	g->f_my += hm * us;
+	g->f_yy += us * us;
 }
 
 int charsiu_npu_matvec(struct charsiu_npu *g, int id,
@@ -1599,6 +2404,31 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	charsiu_bo_fini(g->dev[d], &g->in[d]);
 	}
 	g->pack_us += now_us() - tpack;
+	/*
+	 * ⚠⚠ WHICH DEVICES WERE ACTUALLY GIVEN WORK, because the sync below
+	 * used to ask both regardless.
+	 *
+	 * The loop below skips a device with no slices of this entry -- `if
+	 * (!nt) continue` -- but the prep and the fini that follow it ran over
+	 * `g->ndev` unconditionally. So a core that was provably never written
+	 * had its whole output buffer invalidated on the way in and cleaned on
+	 * the way out, once per entry, once per token, for nothing.
+	 *
+	 * It is not a small nothing. rknn_core_0 and rknn_core_1 carry no
+	 * dma-coherent in rk3576.dtsi, so these are real cache maintenance over
+	 * the whole buffer object: rocket_ioctl_prep_bo takes a handle and
+	 * nothing else -- no offset, no length, and its one spare word is
+	 * checked to be zero -- and it does dma_sync_sgtable_for_cpu over the
+	 * entire sgtable. Counted on the real gguf shapes that is 10.3 MB a
+	 * token on Qwen3-0.6B alone, and Qwen3 is the model whose single-slice
+	 * projections leave a device idle most often.
+	 *
+	 * ⚠ AND IT GOT WORSE WITH THE LEAST LOADED DEAL, not better. The old
+	 * index deal spread a tensor's slices across both cores by construction,
+	 * so `nt` was rarely zero; a deal that puts a small tensor entirely on
+	 * one core makes the other core's empty buffer the common case.
+	 */
+	unsigned sent = 0;
 
 	/*
 	 * ONE submit for the whole projection, unless a cap says otherwise.
@@ -1634,6 +2464,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		if (!nt)
 			continue;
+		sent |= 1u << d;
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
@@ -1668,7 +2499,9 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		double t1 = now_us();
 
 		for (unsigned d = 0; d < g->ndev; d++)
-			charsiu_bo_prep(g->dev[d], &e->out[d], 2000000000);
+			if (sent & (1u << d))
+				charsiu_bo_prep(g->dev[d], &e->out[d],
+						2000000000);
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
 		int grp = tensor_grouped(g, e->t);
@@ -1730,12 +2563,15 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		g->copy_us += now_us() - t1;
 		t1 = now_us();
+		/* ⚠ the same mask: a buffer nobody prepped must not be finied,
+		 * or the CPU hands back ownership of something it never took. */
 		if (!g->nofini)
 			for (unsigned d = 0; d < g->ndev; d++)
-				charsiu_bo_fini(g->dev[d], &e->out[d]);
+				if (sent & (1u << d))
+					charsiu_bo_fini(g->dev[d],
+							&e->out[d]);
 		g->fini_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
-		g->busy_us += now_us() - t0;
 
 		/*
 		 * The limit scales with what the submit fetches, or a legitimate
@@ -1745,6 +2581,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		{
 			double took = now_us() - t0;
 			double gbs = e->weight_mb / took * 1e3;
+
+			/*
+			 * ⚠ ONE CLOCK READ FEEDS BOTH. busy_us used to take its
+			 * own a few hundred nanoseconds before this block took
+			 * this one, which is nothing against a 400 us call and
+			 * is still two different numbers for one quantity. The
+			 * fit and the total have to be the SAME measurement or
+			 * a residual between them means nothing.
+			 */
+			g->busy_us += took;
+			account_call(g, &id, 1, took);
 
 			if (took > g->slow_us * (g->nochain ? e->count : 1)
 				  + e->weight_mb * 1000.0)
@@ -2096,7 +2943,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	m = g->bm; nks = g->bnks; nslots = g->bnslots;
 
 	/* the f16 packer writes k * 2 bytes a row; int8 writes one */
-	g->bin_stride = (size_t)g->kmax * m * (g->w4 ? 2 : 1);
+	g->bin_stride = kmax_wide(g) * m * (g->w4 ? 2 : 1);
 	ins = g->bin_stride * nks + 4096;
 	regs = (size_t)nslots * 4096;
 	outs = 0;
@@ -2118,8 +2965,8 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	free(g->bscr);
 	free(g->bq);
 	free(g->bd1);
-	g->bscr = malloc((size_t)g->kmax * m * sizeof(*g->bscr));
-	g->bq = malloc((size_t)g->kmax * m);
+	g->bscr = malloc(kmax_wide(g) * m * sizeof(*g->bscr));
+	g->bq = malloc(kmax_wide(g) * m);
 	/*
 	 * ⚠ ONE d1 PER SLOT PER ROW, not one per row. int8's activation scale
 	 * is per row AND is recomputed over each K slice's own range, and the
@@ -2491,10 +3338,11 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	 * accumulate, and nothing is zeroed but a byte per n slice.
 	 *
 	 * ⚠ THE FLAG IS PER OUTPUT RANGE, NOT PER K SLICE, and that is not a
-	 * detail. Slices go to the two devices as `(ki * ns + ni) & 1`, so for
-	 * an odd ns the same output range's ki = 0 and ki = 1 land on
-	 * DIFFERENT devices -- and the read loop walks devices outermost, so
-	 * ki = 1 can be read first. "ki == 0 assigns" would have clobbered it.
+	 * detail. The same output range's ki = 0 and ki = 1 can land on
+	 * DIFFERENT devices -- deal_pick makes no promise at all about which,
+	 * and the index deal it replaced did not either once ns was odd -- and
+	 * the read loop walks devices outermost, so ki = 1 can be read first.
+	 * "ki == 0 assigns" would have clobbered it.
 	 */
 	if (g->bseen_n < e->n_slices) {
 		unsigned char *t2 = realloc(g->bseen, e->n_slices);
@@ -3282,7 +4130,20 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	}
 	g->copy_us += now_us() - t1 - fspent;
 	g->fini_us += fspent;
-	g->busy_us += now_us() - t0;
+	{
+		/*
+		 * ⚠ THE GROUP IS ONE CALL, and that is the whole reason it
+		 * exists: q, k and v share a submit and a fence, so charging
+		 * the fit three calls' fixed cost for one fence would say
+		 * grouping bought nothing. account_call sums the three entries
+		 * per device and takes the busier one, which is exactly what
+		 * the clock below measured.
+		 */
+		double took = now_us() - t0;
+
+		g->busy_us += took;
+		account_call(g, ids, n, took);
+	}
 	g->call_us += now_us() - tcall;
 	/*
 	 * ⚠⚠ CLEAR THE BREADCRUMB ON THE WAY OUT, or it outlives the function
