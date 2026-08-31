@@ -25,6 +25,8 @@
 #                               of this table has a 25% spread
 #   8  CHARSIU_NPU_KFIT         three arms: off / wide buffers only / on
 #   9  where TTFT goes           the five-way split, and the pooled read back
+#  10  KMAX                      read is m*n*ks, so does a wider slice pay --
+#                                and what does the coarser quantiser cost
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -36,10 +38,10 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
-slow) PHASES="6 7 8 9" ;;
+slow) PHASES="6 7 8 9 10" ;;
 esac
 
 BIN=${CHARSIU_BIN_DIR:-/opt/charsiu}
@@ -510,6 +512,95 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	ok "every model printed its split. The row to act on is the last one:"
 	printf '     if `other` is larger than any named share, the next thing to\n'
 	printf '     do is NAME it, not optimise one of the five.\n'
+   fi
+   ;;
+
+10) say "10. KMAX: read is m * n * ks, so buy ks down and see what it costs"
+   # ⚠⚠ THIS IS A TRADE, NOT A FREE WIN, AND THE TREE ALREADY KNEW WHY. The
+   # read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
+   # directly less read work. But npudev's own note closes the obvious version
+   # of this: ONE DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP --
+   # a dispatch produces one number per output channel and nothing in the
+   # register map segments the K reduction. So KMAX and CHARSIU_NPU_W4_GROUP
+   # have to move together, and moving them COARSENS THE QUANTISER.
+   #
+   # ⚠ That is why this phase prints text. A wider group is measured at 0.1067
+   # relative error per channel against group 32's 0.0666, and round 352's
+   # symptom for one absmax over a long row was output that stayed "English, on
+   # topic and repetitive". A differing answer here is EXPECTED and is the
+   # PRICE; it is not a failure, and the phase does not call it one. What it
+   # must not do is show a speed-up without showing what was paid for it.
+   #
+   # ⚠ AND KMAX WAS MEASURED ONCE ALREADY, at 37% SLOWER, which is why the
+   # board settled on 1024. That round is not evidence any more: the reason was
+   # `d = (ki * ns + ni) & 1`, slices dealt to devices by an index that
+   # restarts per tensor, so a single-slice tensor put everything on device 0.
+   # The deal is least-loaded now and this has not been asked since.
+   run 10
+   SW=${KMAX_SWEEP:-1024 2048}
+   printf '  sweeping KMAX = W4_GROUP over: %s\n' "$SW"
+   printf '  the first value is the baseline every later one is compared to\n'
+   n10=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n10=$((n10 + 1))
+	b=$(basename "$M" .gguf)
+	printf '\n  %s\n' "$b"
+	first=1
+	for K in $SW; do
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX="$K" CHARSIU_NPU_W4_GROUP="$K" \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    "$BIN/charsiu_run" "$M" -p "$P9" -n 16 --ignore-eos \
+		    >"$OUT/.k_out" 2>"$OUT/.k_err"
+		# ⚠ READ EVERYTHING OUT BEFORE THE STRIP, which eats the
+		# bracketed line the prompt clause lives on.
+		tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' "$OUT/.k_out" \
+		     | head -1 | grep -oE '[0-9.]+ ms')
+		rd=$(grep -hoE '^ *read +[0-9.]+ ms +[0-9.]+%' "$OUT/.k_err" \
+		     | head -1 | tr -s ' ')
+		fe=$(grep -hoE '^ *fence +[0-9.]+ ms +[0-9.]+%' "$OUT/.k_err" \
+		     | head -1 | tr -s ' ')
+		sed -i 's/^\[.*//' "$OUT/.k_out"
+		# ⚠⚠ A RUN THAT DID NOT RUN IS NOT A TEXT DIFFERENCE. Without
+		# this, a KMAX the hardware refuses leaves an empty .k_out,
+		# which compares unequal to the baseline and gets reported as
+		# "the quantiser changed the answer" -- a wrong diagnosis of a
+		# real problem, which this round has already made once.
+		if [ -z "${tt:-}" ]; then
+			bad "$b at KMAX $K: no prompt line, the run did not generate"
+			tail -4 "$OUT/.k_err" | sed 's/^/       /'
+			continue
+		fi
+		if [ "$first" = 1 ]; then
+			cp "$OUT/.k_out" "$OUT/.k_base"
+			tx="baseline"
+			first=0
+		elif cmp -s "$OUT/.k_base" "$OUT/.k_out"; then
+			tx="text same"
+		else
+			# ⚠ NOT A FAILURE. See the note above: a wider group is
+			# a coarser quantiser and a different answer is what
+			# was bought with the time.
+			tx="⚠ TEXT CHANGED -- this is the price"
+		fi
+		printf '      KMAX %-5s TTFT %-11s %s\n' "$K" "${tt:-?}" "$tx"
+		printf '                 %s\n' "${rd:-  read  (no split printed)}"
+		printf '                 %s\n' "${fe:-  fence (no split printed)}"
+	done
+	# the answer at the widest KMAX, so a coarser quantiser can be judged
+	# rather than inferred from the word "changed"
+	printf '      last answer: %s\n' \
+	    "$(tr '\n' ' ' <"$OUT/.k_out" | cut -c1-96)"
+   done
+   wedged "phase 10" && break
+   if [ "$n10" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   else
+	ok "$n10 model(s) swept. Read the three together: TTFT, the read row,"
+	printf '     and whether the answer changed. A KMAX that halves the read\n'
+	printf '     and keeps the text is free; one that changes the text has to\n'
+	printf '     be judged on the answer, not on the milliseconds.\n'
    fi
    ;;
 esac
