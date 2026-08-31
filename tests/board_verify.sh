@@ -24,6 +24,8 @@
 #   7  the scoreboard           against Rockchip, REPEAT=3 because one reading
 #                               of this table has a 25% spread
 #   8  CHARSIU_NPU_KFIT         three arms: off / wide buffers only / on
+#   9  where TTFT goes           the five-way split of a batched matmul, and
+#                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
 # numbers and are allowed to disappoint.
@@ -34,10 +36,10 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8}
+PHASES=${*:-1 2 3 4 5 6 7 8 9}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
-slow) PHASES="6 7 8" ;;
+slow) PHASES="6 7 8 9" ;;
 esac
 
 BIN=${CHARSIU_BIN_DIR:-/opt/charsiu}
@@ -391,6 +393,78 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	         printf "     the widening is free, so net == slicing and the range is\n     %+.1f%% .. %+.1f%%.\n", worst, best
 	     }' "$OUT/.kfit_rows"
 	[ "$ndead" = 0 ] || printf '\n  – %s model(s) never generated; see above.\n' "$ndead"
+   fi
+   ;;
+
+9) say "9. where TTFT goes: the five shares of a batched matmul, and the sixth"
+   # ⚠⚠ WHY THIS PHASE AND NOT MORE DECODE WORK. The two gaps to the vendor
+   # are not the same size. On Qwen3-0.6B decode is 19.70 tok/s against 24.85,
+   # which is 1.26x; time to first token is 1588 ms against 469, which is
+   # 3.39x. The distance is in prefill, npudev's own note says the NPU is idle
+   # for 91% of a batched matmul, and nothing has ever printed which part of
+   # this side of the ioctl that idle time is.
+   #
+   # ⚠ THE COUNTERS EXISTED AND NOTHING CALLED THEM. charsiu_npu_batch_split
+   # and charsiu_npu_batch_prep have been in the tree with no caller anywhere;
+   # vision and whisper could only have reached them through
+   # charsiu_pool_report, and llama does not call that either. Same shape as
+   # the switch that was "written, legal, default off" and corrupted the heap
+   # the first time hardware ran it.
+   #
+   # ⚠⚠ AND THE HOST CANNOT CHECK THIS ONE EITHER. With no /dev/accel the pool
+   # has no device, the report suppresses itself and a desk run prints nothing
+   # -- which is indistinguishable from the instrument being broken. So the
+   # ABSENCE of the block is a FAILURE here, not a quiet skip.
+   run 9
+   # A long prompt, because a 32 word one spends more time loading than
+   # prefilling and the split would be reading noise. -n 4 keeps generation out
+   # of the way; TTFT is the number this phase is about.
+   P9=$(i=1; while [ $i -le 256 ]; do printf '%d ' "$i"; i=$((i+1)); done)
+   P9=${P9% }
+   printf '  prompt %s words, generation held to 4 tokens\n' \
+       "$(printf '%s' "$P9" | wc -w)"
+   n9=0; nmiss=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n9=$((n9 + 1))
+	b=$(basename "$M" .gguf)
+	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+	    "$BIN/charsiu_run" "$M" -p "$P9" -n 4 --ignore-eos \
+	    >"$OUT/.ttft_out" 2>"$OUT/.ttft_err"
+	# the prompt clause carries TTFT; it is on the bracketed stdout line
+	tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
+	    "$OUT/.ttft_out" "$OUT/.ttft_err" | head -1)
+	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
+	if grep -q "charsiu NPU batched:" "$OUT/.ttft_err"; then
+		# from the header until the first line that is not part of the
+		# block, so the tail line is included when it is there and
+		# nothing is printed twice when it is not
+		awk '/charsiu NPU batched:/ { f = 1 }
+		     f { if (/charsiu NPU batched:/ || /^    /) print; else exit }' \
+		    "$OUT/.ttft_err" | sed 's/^/      /'
+	else
+		# ⚠ NOT A SKIP. On the board this block is the whole phase, and
+		# its absence means either nothing took the batched path or the
+		# instrument did not fire -- and those look identical from here,
+		# which is exactly why it counts as a failure rather than a
+		# blank line someone reads past.
+		bad "$b: NO batched breakdown was printed"
+		printf '     either no prompt took the batched path, or the\n'
+		printf '     counters did not fire. Both need looking at.\n'
+		grep -iE "NOT on the NPU|refus|fell back" "$OUT/.ttft_err" \
+		    | head -3 | sed 's/^/       /'
+		nmiss=$((nmiss + 1))
+	fi
+   done
+   wedged "phase 9" && break
+   if [ "$n9" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   elif [ "$nmiss" = 0 ]; then
+	ok "every model printed its split. The row to act on is the last one:"
+	printf '     if `other` is larger than any named share, the next thing to\n'
+	printf '     do is NAME it, not optimise one of the five.\n'
    fi
    ;;
 esac

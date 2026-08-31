@@ -278,6 +278,78 @@ void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out)
 		"%lu matmuls of %lu rows in %.0f ms, %lu asked and %lu fell "
 		"back\n", on, p->n, p->hw, p->rows_hw, p->hw_ms, p->calls,
 		p->fell_back);
+	charsiu_pool_report_batch(p, out);
+}
+
+/*
+ * ⚠⚠ WHERE A BATCHED MATMUL'S TIME GOES, AND THE PART WITH NO NAME.
+ *
+ * charsiu_npu_batch_split and charsiu_npu_batch_prep have counted five shares
+ * of a batched call since they were written and NOTHING HAS EVER CALLED THEM.
+ * That is the same shape as the switch that was "written, legal, default off"
+ * and turned out to corrupt the heap the first time hardware ran it: an
+ * instrument nobody runs measures nothing, and its absence is why the only
+ * figure anyone can quote about prefill is a whole-run wall clock.
+ *
+ * It matters now because the two gaps to the vendor are not the same size. On
+ * Qwen3-0.6B decode is 19.70 tok/s against 24.85, which is 1.26x, and time to
+ * first token is 1588 ms against 469, which is 3.39x. The distance is in
+ * prefill, and this driver's own note says the NPU is idle for 91% of a
+ * batched matmul -- so the work is on this side of the ioctl and this is the
+ * only thing that can say which part.
+ *
+ * ⚠ THE UNNAMED ROW IS THE POINT, not the five named ones. A previous round
+ * named a 44% share and a 26% one had no name at all; optimising the first
+ * while the second is unaccounted is how this tree has been caught before. The
+ * denominator is charsiu_npu_batch_wall, the clock around every
+ * charsiu_npu_matmul call, so whatever the five do not add up to is printed
+ * rather than left out.
+ *
+ * ⚠ IT IS NOT THE POOL'S hw_ms, WHICH WOULD HAVE BEEN ZERO HERE. hw_ms is only
+ * incremented by charsiu_pool_rows, and only vision and whisper call that --
+ * llama calls charsiu_npu_matmul directly. Dividing by it would have printed
+ * nan or a divide by zero on exactly the workload this was written to explain.
+ */
+void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
+{
+	double pack, sub, fence, read, prep, named, other, wall;
+	unsigned nbuf = 0;
+	double alloc;
+
+	if (!p->dev)
+		return;
+	/* reset = 0: reading this must not disturb a run that is still going */
+	charsiu_npu_batch_split(p->dev, &pack, &sub, &fence, &read, 0);
+	prep = charsiu_npu_batch_prep(p->dev, 0);
+	alloc = charsiu_npu_batch_alloc(p->dev, &nbuf, 0);
+	wall = charsiu_npu_batch_wall(p->dev, 0);
+	named = pack + sub + fence + read + prep;
+	if (named <= 0.0 || wall <= 0.0)
+		return;              /* nothing took the batched path */
+	other = wall - named;
+
+	fprintf(out, "charsiu NPU batched: %.0f ms in the matmul entry, "
+		"accounted:\n", wall);
+	fprintf(out, "    prep  %8.1f ms  %5.1f%%  buffers, output alloc, "
+		"the memset of Y\n", prep, 100.0 * prep / wall);
+	fprintf(out, "    pack  %8.1f ms  %5.1f%%  gather, quantise, pack into "
+		"the input BO\n", pack, 100.0 * pack / wall);
+	fprintf(out, "    sub   %8.1f ms  %5.1f%%  the submit ioctls\n",
+		sub, 100.0 * sub / wall);
+	fprintf(out, "    fence %8.1f ms  %5.1f%%  waiting on the hardware\n",
+		fence, 100.0 * fence / wall);
+	fprintf(out, "    read  %8.1f ms  %5.1f%%  reading the accumulators "
+		"back\n", read, 100.0 * read / wall);
+	fprintf(out, "    ----\n");
+	fprintf(out, "    other %8.1f ms  %5.1f%%  %s\n", other,
+		100.0 * other / wall,
+		other > pack || other > prep
+		? "⚠ LARGER THAN A NAMED SHARE -- name it before optimising one"
+		: "unaccounted");
+	if (nbuf)
+		fprintf(out, "    (%u batch buffer allocations, %.1f ms, inside "
+			"prep -- a pool that quietly reallocates is the old "
+			"bug in new clothes)\n", nbuf, alloc);
 }
 
 /*

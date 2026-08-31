@@ -2938,8 +2938,18 @@ void llama_state_free(struct llama_state *s)
 		}
 	}
 	llama_stages_report();
-	if (s->pool.dev)
+	if (s->pool.dev) {
 		charsiu_npu_report(s->pool.dev);
+		/*
+		 * ⚠ llama had NO batched breakdown at all. The five counters
+		 * behind this have existed since they were written with no
+		 * caller anywhere, and vision and whisper reach them only
+		 * through charsiu_pool_report, which nothing on this path
+		 * calls. It self-suppresses when no prompt took the batched
+		 * path, so a decode-only run prints nothing new.
+		 */
+		charsiu_pool_report_batch(&s->pool, stderr);
+	}
 	charsiu_npu_close(s->pool.dev);
 	if (s->pool.t) {
 		for (unsigned i = 0; i < s->pool.n; i++)

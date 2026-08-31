@@ -388,6 +388,16 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	/*
+	 * ⚠⚠ THE DENOMINATOR, AND IT HAS TO LIVE HERE. The obvious one is
+	 * charsiu_npu_pool::hw_ms, but that is only incremented by
+	 * charsiu_pool_rows, which VISION AND WHISPER call and LLAMA DOES
+	 * NOT -- llama calls charsiu_npu_matmul directly. Using it would
+	 * have divided the five shares by zero on exactly the workload the
+	 * split was added to explain. Timed at this entry instead, so every
+	 * caller is covered and none has to remember.
+	 */
+	double bwall_us;
 	double bprep_us;	/* buffers and the output zero, before any of it */
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
@@ -3047,6 +3057,19 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
+/*
+ * Wall clock across every charsiu_npu_matmul call. This is the denominator the
+ * five shares are read against; see bwall_us for why the pool's hw_ms is not.
+ */
+double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset)
+{
+	double v = g->bwall_us / 1e3;
+
+	if (reset)
+		g->bwall_us = 0.0;
+	return v;
+}
+
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset)
 {
 	double v = g->bprep_us / 1e3;
@@ -3219,8 +3242,13 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	return ob;
 }
 
-int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
-		       unsigned m, float *Y)
+/*
+ * ⚠ THE BODY IS A STATIC INNER SO THE WALL CLOCK CANNOT BE FORGOTTEN. This
+ * function has eleven return points and wrapping each of them is a bug waiting
+ * for the twelfth. See bwall_us.
+ */
+static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
+			    unsigned m, float *Y)
 {
 	struct npu_entry *e;
 	struct npu_outbuf *ob;
@@ -3810,6 +3838,16 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			for (unsigned j = 0; j < (unsigned)e->t->n; j++)
 				Y[(size_t)r * e->t->n + j] *= e->t->scale[j];
 	return 0;
+}
+
+int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
+		       unsigned m, float *Y)
+{
+	double t0 = now_us();
+	int rc = npu_matmul_inner(g, id, X, m, Y);
+
+	g->bwall_us += now_us() - t0;
+	return rc;
 }
 
 /*
