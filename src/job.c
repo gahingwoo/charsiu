@@ -295,6 +295,37 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
  *
  * ⚠ P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
  * map has been printed. m = 8 is scored by the sweep and has not been read.
+ *
+ * ⚠ AND THE SAME EXPRESSION SAYS HOW BIG AN OUTPUT SLOT HAS TO BE, which is
+ * worth writing down here because the place that sizes one is nowhere near it.
+ *
+ * Its range is exactly n * m words. G tops out at (n - 1) / 32, j at 32P - 1
+ * and mi / P at 1, so index_max = n * m - 1: the surface is n * m * 4 bytes
+ * with nothing padded and nothing skipped. At m = 1 the flat case says the
+ * same thing more plainly -- a decode slice occupies n * 4 bytes and not one
+ * byte more. The batched path is already sized from this: g->bout_stride is
+ * wide * m * 4, per tensor, and it is the same number.
+ *
+ * The DECODE path is not. npudev.c gives every output slot g->out_stride =
+ * nmax * 4 = 32 KB whatever the slice is worth, so a 512 wide k projection
+ * writes 2 KB into 32 KB, and the slack is not free: rocket's PREP_BO and
+ * FINI_BO take a HANDLE and nothing else -- no offset, no length, and a
+ * `reserved` word the kernel rejects unless it is zero -- so the cache
+ * maintenance they do is over the whole allocation and not over what was
+ * written. Counted off the gguf shapes at the shipped kslice = 1024, that is
+ * 39.7 MB of prep and fini a token on Llama-3.2-1B where the slices write
+ * 9.7 MB, and a per-entry stride would make it 18.2. Counted, not measured:
+ * no host in this tree has an NPU to measure it on.
+ *
+ * ⚠ A SLOT BASE STILL HAS TO CLEAR 16 BYTES, which is the one thing a tighter
+ * stride could get wrong. The vendor's own streams step 0x4018 by 16 for each
+ * output position skipped -- see the note on 0x40b8, which is where that read
+ * comes from -- so 16 is the granularity the output base has evidence for.
+ * n * 4 clears it for any n that is a multiple of four, and a slice width is
+ * a multiple of sixteen in every model in models/ -- npudev.c rounds a CPU
+ * split DOWN to sixteen on purpose, for the int4 feature atom. A tighter
+ * stride should still round up rather than trust that, because a tower is
+ * free to hand this a width nobody has checked.
  */
 /*
  * The running commentary switch. See charsiu.h: on for a one-shot run, which is

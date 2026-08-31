@@ -2222,6 +2222,31 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	charsiu_bo_fini(g->dev[d], &g->in[d]);
 	}
 	g->pack_us += now_us() - tpack;
+	/*
+	 * ⚠⚠ WHICH DEVICES WERE ACTUALLY GIVEN WORK, because the sync below
+	 * used to ask both regardless.
+	 *
+	 * The loop below skips a device with no slices of this entry -- `if
+	 * (!nt) continue` -- but the prep and the fini that follow it ran over
+	 * `g->ndev` unconditionally. So a core that was provably never written
+	 * had its whole output buffer invalidated on the way in and cleaned on
+	 * the way out, once per entry, once per token, for nothing.
+	 *
+	 * It is not a small nothing. rknn_core_0 and rknn_core_1 carry no
+	 * dma-coherent in rk3576.dtsi, so these are real cache maintenance over
+	 * the whole buffer object: rocket_ioctl_prep_bo takes a handle and
+	 * nothing else -- no offset, no length, and its one spare word is
+	 * checked to be zero -- and it does dma_sync_sgtable_for_cpu over the
+	 * entire sgtable. Counted on the real gguf shapes that is 10.3 MB a
+	 * token on Qwen3-0.6B alone, and Qwen3 is the model whose single-slice
+	 * projections leave a device idle most often.
+	 *
+	 * ⚠ AND IT GOT WORSE WITH THE LEAST LOADED DEAL, not better. The old
+	 * index deal spread a tensor's slices across both cores by construction,
+	 * so `nt` was rarely zero; a deal that puts a small tensor entirely on
+	 * one core makes the other core's empty buffer the common case.
+	 */
+	unsigned sent = 0;
 
 	/*
 	 * ONE submit for the whole projection, unless a cap says otherwise.
@@ -2257,6 +2282,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		if (!nt)
 			continue;
+		sent |= 1u << d;
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
@@ -2291,7 +2317,9 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		double t1 = now_us();
 
 		for (unsigned d = 0; d < g->ndev; d++)
-			charsiu_bo_prep(g->dev[d], &e->out[d], 2000000000);
+			if (sent & (1u << d))
+				charsiu_bo_prep(g->dev[d], &e->out[d],
+						2000000000);
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
 		int grp = tensor_grouped(g, e->t);
@@ -2353,9 +2381,13 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		g->copy_us += now_us() - t1;
 		t1 = now_us();
+		/* ⚠ the same mask: a buffer nobody prepped must not be finied,
+		 * or the CPU hands back ownership of something it never took. */
 		if (!g->nofini)
 			for (unsigned d = 0; d < g->ndev; d++)
-				charsiu_bo_fini(g->dev[d], &e->out[d]);
+				if (sent & (1u << d))
+					charsiu_bo_fini(g->dev[d],
+							&e->out[d]);
 		g->fini_us += now_us() - t1;
 		g->weight_mb += e->weight_mb;
 
