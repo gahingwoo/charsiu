@@ -538,17 +538,133 @@ static void tlayernorm(float *out, const float *x, const float *w,
 			 (b ? b[i] : 0.0f);
 }
 
+/*
+ * ⚠⚠ THE TANH GELU IS A SIGMOID, WHICH IS AN IDENTITY AND NOT AN
+ * APPROXIMATION OF AN APPROXIMATION. tanh y = 1 - 2/(e^2y + 1), so
+ *
+ *     0.5 (1 + tanh y) = 1 / (1 + e^-2y)
+ *
+ * and the activation is x / (1 + e^(-2k(x + 0.044715 x^3))), k = sqrt(2/pi):
+ * the same function with one exponential in place of a hyperbolic tangent,
+ * which is the shape gelu quick was already written in. It goes four at a time
+ * through the charsiu_vexpq the language model's SiLU built. The vision tower
+ * priced the identical loop at its own shape -- 34.65 ms with tanhf against
+ * 2.66 with an exponential over 3145728 elements -- and this is the third and
+ * last copy of it in the tree.
+ *
+ * ⚠ GELU QUICK'S FORMULA DID NOT CHANGE, only its expf became charsiu_vexpq,
+ * so the whole of the risk on that branch is the polynomial. It is worth
+ * saying out loud that nothing here exercises it: clip.use_gelu is 1 on every
+ * checkpoint on this desk and on the synthetic model clip_cross.py builds, so
+ * that branch is one no test catches. It is written to match the tanh branch
+ * line for line for exactly that reason.
+ *
+ * ⚠⚠ AND IT IS DELIBERATELY NOT THREADED, WHICH IS A MEASUREMENT AND NOT AN
+ * OVERSIGHT. The vision tower puts its activation on charsiu_parallel_for and
+ * whisper's encoder does too, because a picture is 1024 patches by 3072 wide
+ * and a mel window is 1500 frames by 1536; A CAPTION IS NEITHER. This tower's
+ * feed forward is n_ff wide -- 2048 on a ViT-B text encoder, 3072 on a ViT-L
+ * -- and n is the number of tokens the caption ACTUALLY HAS, not the context
+ * length, so one call is a few thousand elements. On this six core host, NEON
+ * alone against the same kernel over the pool, best of two hundred:
+ *
+ *     14336   (a 7 token caption)   0.009 ms   0.040 ms   the pool loses 4.4x
+ *    157696   (n_ctx = 77, the       0.088      0.086     a dead heat
+ *              longest input this
+ *              tower can be given)
+ *
+ * A pool dispatch costs about 0.040 ms of broadcast and barrier on this host
+ * whatever is behind it, and the LONGEST caption CLIP can be handed only just
+ * pays for one. So the floor whisper needs -- 262144 elements, swept there --
+ * would exclude every call this tower ever makes, and the code that would
+ * implement it is code that never runs.
+ *
+ * ⚠ AND IT WOULD NOT EVEN HAVE RUN. charsiu_parallel_for on an unstarted pool
+ * is a plain call on one thread -- it looks exactly like success -- and
+ * nothing on the text tower's path calls charsiu_threads_start. The vision
+ * tower and whisper both do it in their open. A parallel_for added here would
+ * have been serial, silently, and measured as a win against tanhf either way.
+ *
+ * ⚠ WHAT THE VECTOR KERNEL ALONE IS WORTH, in situ and not by arithmetic. A
+ * ViT-B/32 text tower is 512 wide, 2048 in the middle and twelve layers deep;
+ * one seven token caption through it, best of thirty, three times interleaved
+ * against a binary built from before this change:
+ *
+ *     before                       21.686  21.600  21.543 ms
+ *     CHARSIU_EXACT_GELU=1         21.582  21.409  21.414     the control
+ *     shipped                      20.066  20.228  20.144
+ *
+ * so about 1.5 ms of a 21.6 ms encode, 6.7%, for one branch and no threads --
+ * and the control lands on the old number, which is what says the 1.5 ms is
+ * the exponential and not the restructuring.
+ *
+ * CHARSIU_EXACT_GELU puts the tanhf form and libm's expf back, on both
+ * branches, as the control this has to be diffed against. It is the same
+ * variable the vision tower and the language model take, so one switch covers
+ * every gelu in the runtime -- and with it set this tower's projection is bit
+ * identical to the binary from before the change.
+ */
+static int gelu_exact(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_EXACT_GELU") != NULL;
+	return v;
+}
+
 static void tgelu(float *x, unsigned n, int tanh_form)
 {
-	unsigned i;
+	const float k2 = 2.0f * 0.7978845608028654f;   /* 2 sqrt(2/pi) */
+	unsigned i = 0;
 
-	for (i = 0; i < n; i++) {
+	if (gelu_exact()) {
+		for (; i < n; i++) {
+			float v = x[i];
+
+			if (tanh_form)
+				x[i] = 0.5f * v *
+				       (1.0f + tanhf(0.7978845608028654f *
+						     (v + 0.044715f * v * v * v)));
+			else
+				x[i] = v / (1.0f + expf(-1.702f * v));
+		}
+		return;
+	}
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	{
+		const float32x4_t one = vdupq_n_f32(1.0f);
+		const float32x4_t c = vdupq_n_f32(0.044715f);
+		const float32x4_t kk = vdupq_n_f32(tanh_form ? -k2 : -1.702f);
+
+		/*
+		 * ⚠ THE BRANCH STAYS INSIDE THE LOOP, as it does in the
+		 * tower. It is one perfectly predicted test against a divide
+		 * and a six term polynomial, and hoisting it means two copies
+		 * of the kernel for a difference the tower measured at 2.13 ms
+		 * against 2.09 over three million elements.
+		 */
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t v = vld1q_f32(x + i), e;
+
+			if (tanh_form) {
+				float32x4_t v3 = vmulq_f32(vmulq_f32(v, v), v);
+
+				e = vmulq_f32(kk, vmlaq_f32(v, c, v3));
+			} else {
+				e = vmulq_f32(kk, v);
+			}
+			vst1q_f32(x + i,
+				  vdivq_f32(v, vaddq_f32(one, charsiu_vexpq(e))));
+		}
+	}
+#endif
+	for (; i < n; i++) {
 		float v = x[i];
 
 		if (tanh_form)
-			x[i] = 0.5f * v *
-			       (1.0f + tanhf(0.7978845608028654f *
-					     (v + 0.044715f * v * v * v)));
+			x[i] = v / (1.0f + expf(-k2 * (v + 0.044715f * v * v * v)));
 		else
 			x[i] = v / (1.0f + expf(-1.702f * v));
 	}

@@ -32,10 +32,20 @@
  * the other twenty nine seconds. Guessing where they are is what produced a 17x
  * that had to be withdrawn.
  */
-enum { W_MEL, W_CONV, W_QKV, W_ATTN, W_PROJ, W_FFN, W_NORM, W_DEC, W_N };
+/*
+ * ⚠⚠ AND "feed forward" WAS TWO DIFFERENT MACHINES UNDER ONE ROW, exactly as
+ * the vision tower's was. Both it and "the two convolutions" were a matmul
+ * added to a scalar libm loop, and the two do not answer to the same thing:
+ * the matmuls are routed to the hardware and priced by the row chunk, and the
+ * activation was 10.94 million tanhf calls a window on one core. The gelu is
+ * its own row now, so a board round can read what the identity below is worth
+ * instead of predicting it.
+ */
+enum { W_MEL, W_CONV, W_QKV, W_ATTN, W_PROJ, W_FFN, W_ACT, W_NORM, W_DEC,
+       W_N };
 static const char *const wstage_name[W_N] = {
 	"mel spectrogram", "the two convolutions", "q k v", "attention",
-	"out proj", "feed forward", "layernorms", "the decoder",
+	"out proj", "feed forward matmuls", "gelu", "layernorms", "the decoder",
 };
 static double wstage_ms[W_N];
 static int wstage_on = -1;
@@ -851,16 +861,186 @@ static void wlayernorm(float *out, const float *x, const float *w,
  * ggml -- which is what every measured whisper output in the world comes from --
  * uses the tanh one. Following ggml keeps this comparable to the thing people
  * actually run. */
-static void wgelu(float *x, size_t n)
+/*
+ * ⚠⚠ AND THE TANH FORM IS A SIGMOID, WHICH IS AN IDENTITY AND NOT A SECOND
+ * APPROXIMATION ON TOP OF THE FIRST.
+ *
+ * tanh y = 1 - 2/(e^2y + 1), so
+ *
+ *     0.5 (1 + tanh y) = 1 / (1 + e^-2y)
+ *
+ * and ggml's gelu is x / (1 + e^(-2k(x + 0.044715 x^3))) with k = sqrt(2/pi).
+ * The SAME function -- one exponential where there was a hyperbolic tangent --
+ * and it goes four at a time through the charsiu_vexpq the language model's
+ * SiLU already uses. Nothing about which approximation whisper is following
+ * changed: this is still ggml's tanh gelu, written the cheap way round.
+ *
+ * ⚠ THE PRICE IT WAS PAYING, AT tiny.en's OWN SHAPE. The encoder calls this
+ * three times: 3000 x 384 after conv1, 1500 x 384 after conv2, and 1500 x 1536
+ * in every one of the four feed forwards -- 10.94 MILLION elements for one
+ * thirty second window, of which 9.2 million are the feed forward's. That last
+ * shape, 2304000 elements, best of seven on the six core development host:
+ *
+ *     tanhf an element            12.065 ms      <- what shipped
+ *     the identity, libm expf      3.505 ms
+ *     the identity, charsiu_vexpq  1.407 ms
+ *     the same across six threads  0.531 ms
+ *
+ * 22.7x on the pass, 8.6x of it before a single extra core is asked for.
+ *
+ * ⚠ AND IN SITU, in this file's own stage table, which is the reading that
+ * counts because it is the one a board can reproduce. tiny.en on jfk.wav, one
+ * binary, one environment variable each, best of five interleaved, the "gelu"
+ * row:
+ *
+ *     CHARSIU_EXACT_GELU=1 CHARSIU_THREADS=1     78 ms   the old arithmetic
+ *     CHARSIU_EXACT_GELU=1                       26 ms
+ *     CHARSIU_THREADS=1                           7 ms   the identity alone
+ *     (default)                                   3 ms
+ *
+ * 26x, of which 11x is the identity and does not depend on how many cores
+ * there are -- that is the part certain to transfer to the board -- and 2.3x
+ * more is this host's six. The whole accounted transcription goes 1.4 s to
+ * 1.3 s, and the two rows the gelu used to hide inside go 84 ms to 69 (the
+ * convolutions) and 772 ms to 692 (the feed forward's matmuls).
+ *
+ * ⚠ THE DISAGREEMENT IS ONE ULP AND IT WAS MEASURED, NOT ASSUMED. Over
+ * 2304000 elements spread across [-6, 6] the worst absolute difference between
+ * the tanhf form and this one is 4.768e-07, at values where gelu is order 1 --
+ * a float's own last bit, which is the summation order and nothing else.
+ *
+ * ⚠ A FINITE INPUT CANNOT BECOME A NaN HERE. x^3 overflows f32 above 4.6e12
+ * and carries an infinity into the exponent; charsiu_vexpq clamps its argument
+ * to [-88, 88] so the divisor stays finite, and x / (1 + e^-88) is x, which is
+ * what gelu does out there. The scalar tail gets expf(-inf) = 0 and the same x.
+ *
+ * CHARSIU_EXACT_GELU puts the tanhf form back, as the control this has to be
+ * diffed against. It is the same variable the vision tower and the language
+ * model take -- one switch for every gelu in the runtime -- and with it set the
+ * encoder's 576000 outputs and the decoder's 51864 logits are BIT IDENTICAL to
+ * the binary from before this change.
+ */
+static int gelu_exact(void)
 {
-	size_t i;
+	static int v = -1;
 
-	for (i = 0; i < n; i++) {
+	if (v < 0)
+		v = getenv("CHARSIU_EXACT_GELU") != NULL;
+	return v;
+}
+
+static void wgelu_span(float *x, size_t n)
+{
+	const float k2 = 2.0f * 0.7978845608028654f;   /* 2 sqrt(2/pi) */
+	size_t i = 0;
+
+	if (gelu_exact()) {
+		for (; i < n; i++) {
+			float v = x[i];
+
+			x[i] = 0.5f * v *
+			       (1.0f + tanhf(0.7978845608028654f *
+					     (v + 0.044715f * v * v * v)));
+		}
+		return;
+	}
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	{
+		const float32x4_t one = vdupq_n_f32(1.0f);
+		const float32x4_t c = vdupq_n_f32(0.044715f);
+		const float32x4_t kk = vdupq_n_f32(-k2);
+
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t v = vld1q_f32(x + i);
+			float32x4_t v3 = vmulq_f32(vmulq_f32(v, v), v);
+			float32x4_t e = vmulq_f32(kk, vmlaq_f32(v, c, v3));
+
+			vst1q_f32(x + i,
+				  vdivq_f32(v, vaddq_f32(one, charsiu_vexpq(e))));
+		}
+	}
+#endif
+	for (; i < n; i++) {
 		float v = x[i];
 
-		x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f *
-						(v + 0.044715f * v * v * v)));
+		x[i] = v / (1.0f + expf(-k2 * (v + 0.044715f * v * v * v)));
 	}
+}
+
+/*
+ * The same span across the thread pool, in blocks.
+ *
+ * ⚠ THE BLOCK IS A MULTIPLE OF FOUR SO THE ANSWER CANNOT DEPEND ON THE
+ * THREAD COUNT. Split anywhere that is not a multiple of the vector width and
+ * the elements either side of the seam fall into the scalar tail instead of the
+ * vector body, which is a different exponential and a different last bit -- so
+ * CHARSIU_THREADS would quietly change the transcript. At 4096 floats every
+ * block but the last is wholly vector work, the tail runs once at the very end
+ * exactly as it does in a single pass, and one binary gives one answer on any
+ * number of cores. 16 KB also keeps a block inside L1 on both machines.
+ */
+#define WGELU_BLK 4096u
+
+struct wact {
+	float *x;
+	size_t n;
+};
+
+static void wgelu_blocks(void *ctx, uint64_t b0, uint64_t nb)
+{
+	const struct wact *c = ctx;
+	uint64_t b;
+
+	for (b = b0; b < b0 + nb; b++) {
+		size_t o = (size_t)b * WGELU_BLK;
+		size_t m = c->n - o < WGELU_BLK ? c->n - o : WGELU_BLK;
+
+		wgelu_span(c->x + o, m);
+	}
+}
+
+/*
+ * ⚠ AND A SIZE FLOOR, BECAUSE THE SAME FUNCTION IS ON THE PER TOKEN PATH.
+ * The encoder's three call sites are 576000, 1152000 and 2304000 elements; the
+ * DECODER calls it once a layer a token at n_text_state * 4, which on tiny.en
+ * is 1536. Measured on this host, a pool dispatch costs 0.040 ms of broadcast
+ * and barrier whatever is behind it, and 1536 elements of this kernel are 0.001
+ * ms of work -- so threading the decoder's call would be forty times slower
+ * than not, on a path that runs four times a token for every token of the
+ * transcript. That is the counter-example npudev already has written down, and
+ * this is the shape that would have walked into it.
+ *
+ * ⚠ THE FLOOR IS WHERE IT IS BECAUSE IT WAS SWEPT, not because 2^18 is a
+ * round number. NEON alone against NEON over six threads, best of three
+ * hundred, on this host:
+ *
+ *      65536    0.036 ms   0.053 ms   the pool loses
+ *      98304    0.055      0.068      still loses
+ *     131072    0.073      0.079      a wash
+ *     196608    0.110      0.091      1.21x
+ *     262144    0.149      0.106      1.41x
+ *
+ * so break even is between 131072 and 196608 and the floor sits at the first
+ * size clearly past it. Nothing whisper actually runs is anywhere near the
+ * line -- the smallest encoder call is 576000 and the decoder's is 1536, three
+ * hundred times apart -- so the exact value decides nothing here and is chosen
+ * to be defensible rather than tuned.
+ */
+#define WGELU_FLOOR 262144u
+
+static void wgelu(float *x, size_t n)
+{
+	struct wact c;
+
+	if (n < WGELU_FLOOR) {
+		wgelu_span(x, n);
+		return;
+	}
+	c.x = x;
+	c.n = n;
+	charsiu_parallel_for(wgelu_blocks, &c,
+			     ((uint64_t)n + WGELU_BLK - 1) / WGELU_BLK);
 }
 
 static void wsoftmax(float *x, unsigned n)
@@ -1198,7 +1378,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		if (cf)
 			goto out;
 	}
-	WSTAGE(W_CONV, wgelu(c1, (size_t)WHISPER_N_FRAMES * W));
+	WSTAGE(W_ACT, wgelu(c1, (size_t)WHISPER_N_FRAMES * W));
 	if (stop == 1) {
 		/* [3000][W], which does not fit `out`: give the first T rows */
 		memcpy(out, c1, (size_t)T * W * sizeof(float));
@@ -1224,7 +1404,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		if (cf)
 			goto out;
 	}
-	WSTAGE(W_CONV, wgelu(x, (size_t)T * W));
+	WSTAGE(W_ACT, wgelu(x, (size_t)T * W));
 
 	for (i = 0; i < T; i++) {
 		gguf_row_f32(w->e_pos, i, g1);
@@ -1280,7 +1460,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 				   wrow1(B->mlp_ln_w, g1),
 				   wrow1(B->mlp_ln_b, b1), W, 1e-5f));
 		WSTAGE(W_FFN, wrows(B->fc1_w, wrow1(B->fc1_b, b1), xb, T, W, ff, F, &a));
-		WSTAGE(W_FFN, wgelu(ff, (size_t)T * F));
+		WSTAGE(W_ACT, wgelu(ff, (size_t)T * F));
 		WSTAGE(W_FFN, wrows(B->fc2_w, wrow1(B->fc2_b, b1), ff, T, F, q, W, &a));
 		for (i = 0; i < T * W; i++)
 			x[i] += q[i];
