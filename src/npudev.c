@@ -709,11 +709,13 @@ struct charsiu_npu {
 	unsigned n_whined;
 	int serialpack;
 	/*
-	 * The control for the read back going wide. It is a parallelisation
-	 * over disjoint rows and nothing else, so it must not move a single
-	 * token -- and if it ever does, that is the finding.
+	 * ⚠⚠ POOLING THE READ BACK IS MEASURED SLOWER AND IS OFF. It is a
+	 * parallelisation over disjoint rows and nothing else -- the text is
+	 * identical on all eight models, so it is CORRECT -- and it lost on
+	 * every one of them, 5% to 18% of the whole prefill, with the read
+	 * itself exactly DOUBLING. See the note above read_rows.
 	 */
-	int serialread;
+	int poolread;
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
 	 * 0 is the hardware doing all of it, which is every round before 371.
@@ -1308,7 +1310,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
-	g->serialread = getenv("CHARSIU_NPU_SERIAL_READ") != NULL;
+	g->poolread = getenv("CHARSIU_NPU_POOL_READ") != NULL;
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -3279,6 +3281,41 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
  * It is macro heavy, and the #undef block at its end is why: re-indenting it
  * broke the directives, and so did closing the function on the same line as
  * the last one.
+ *
+ * ⚠⚠ AND THE POOL LOST. Measured on the board over eight models, the whole
+ * prefill got 5% to 18% SLOWER and the read share went from about 26% to about
+ * 46% -- the read itself exactly doubled, on every model. The text is identical
+ * in both arms, so the split is correct; it is the granularity that is wrong.
+ *
+ *     model            serial      pooled
+ *     Phi-3.5-mini     97973 ms   109269 ms   +11.5%
+ *     Qwen2.5-1.5B     44997 ms    53276 ms   +18.4%
+ *     Qwen3-0.6B       40233 ms    42273 ms    +5.1%
+ *     SmolLM2-1.7B     52831 ms    57827 ms    +9.5%
+ *     SmolLM2-135M     15138 ms    16497 ms    +9.0%
+ *     gemma-3-1b       26033 ms    30498 ms   +17.2%
+ *     gemma-4-E2B      72244 ms    85228 ms   +18.0%
+ *     tinyllama        41346 ms    47722 ms   +15.4%
+ *
+ * Two reasons, and both are about the size of the unit rather than the code:
+ *
+ *   - ONE DISPATCH PER SLICE. A dispatch is a broadcast, eight wakeups and two
+ *     rounds of mutex, and the work it fans out is m = 32 rows of one slice --
+ *     a few hundred microseconds. The pool costs more than that.
+ *   - AN EVEN SPLIT OVER UNEVEN CORES. RK3576 is four A72 and four A53,
+ *     sysconf gives 8, cpus_pin only acts if CHARSIU_CPUS is set, and the
+ *     barrier waits for the A53s.
+ *
+ * ⚠ Hoisting the dispatch out of the slice loop was the obvious next move and
+ * the arithmetic does not support it: it multiplies the work per dispatch by
+ * the slice count, about three, against an overhead that is already larger
+ * than the work. Whisper and the vision tower got 3.3x from this same pool
+ * because their ranges are whole tensors, not 32 rows.
+ *
+ * The read is m * n * ks, and ks is the number of K slices -- so the way to
+ * make it smaller is fewer, wider slices, not more cores. That is KMAX, which
+ * was measured 37% slower once and attributed to the index deal that has since
+ * been fixed, and has not been re-measured against the deal that replaced it.
  */
 struct read_rows {
 	struct charsiu_npu *g;
@@ -3885,10 +3922,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						grp, !g->bseen[ni]
 					};
 
-					if (g->serialread)
-						read_rows(&rr, 0, m);
-					else
+					if (g->poolread)
 						charsiu_parallel_for(read_rows, &rr, m);
+					else
+						read_rows(&rr, 0, m);
 				}
 				/* ⚠ AFTER the row loop: every row of this slot
 				 * shares the flag, and setting it inside would

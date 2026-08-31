@@ -432,13 +432,19 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # difference is not a performance result, it is the parallelisation being
    # wrong, and it is checked before the timing is read.
    n9=0; nmiss=0; ntx=0
+   ARMS9=serial
+   [ "${READ_ARMS:-0}" = 0 ] || ARMS9="serial pool"
    for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
 	n9=$((n9 + 1))
 	b=$(basename "$M" .gguf)
-	for arm in serial pool; do
+	# ⚠ ONE ARM BY DEFAULT. The pooled read back is a settled negative -- it
+	# is correct and 5% to 18% slower on every model -- so a normal round
+	# should not pay double to re-measure it. READ_ARMS=1 asks for the
+	# comparison again, which is what to do after changing the granularity.
+	for arm in $ARMS9; do
 		case $arm in
-		serial) E=CHARSIU_NPU_SERIAL_READ=1 ;;
+		pool)   E=CHARSIU_NPU_POOL_READ=1 ;;
 		*)      E=CHARSIU_READ_DUMMY=1 ;;
 		esac
 		# shellcheck disable=SC2086
@@ -450,13 +456,20 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		eval "t_$arm=\$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' \
 		    '$OUT/.ttft_$arm' | head -1 | grep -oE '[0-9.]+ ms')"
 	done
-	cp "$OUT/.ttft_pool" "$OUT/.ttft_out"
-	cp "$OUT/.ttft_pool.err" "$OUT/.ttft_err"
+	# ⚠⚠ READ THE ARM THAT ACTUALLY RAN. This copied .ttft_pool
+	# unconditionally, and with the pool arm opt-in that file is a STALE
+	# LEFTOVER from an earlier run -- so the split printed below would have
+	# been another model's, or another round's, with nothing to say so.
+	last=${ARMS9##* }
+	cp "$OUT/.ttft_$last" "$OUT/.ttft_out"
+	cp "$OUT/.ttft_$last.err" "$OUT/.ttft_err"
 	tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
 	    "$OUT/.ttft_out" "$OUT/.ttft_err" | head -1)
 	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
-	sed -i 's/^\[.*//' "$OUT/.ttft_serial" "$OUT/.ttft_pool"
-	if cmp -s "$OUT/.ttft_serial" "$OUT/.ttft_pool"; then
+	if [ "$ARMS9" = serial ]; then
+		:
+	elif sed -i 's/^\[.*//' "$OUT/.ttft_serial" "$OUT/.ttft_pool" &&
+	     cmp -s "$OUT/.ttft_serial" "$OUT/.ttft_pool"; then
 		printf '      read back: serial %s   pooled %s   (text same)\n' \
 		    "${t_serial:-?}" "${t_pool:-?}"
 	else
