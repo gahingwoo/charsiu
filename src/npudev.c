@@ -673,6 +673,19 @@ struct charsiu_npu {
 	 * losses and would have kept the switch off for it.
 	 */
 	unsigned kfit_hits, kfit_seen;
+	/*
+	 * ⚠⚠ THE BUFFERS WITHOUT THE SLICING -- the control that separates
+	 * what KFIT COSTS from what it BUYS. Turning KFIT on does two
+	 * independent things: it widens five buffers to 2 * kmax, and it
+	 * makes the last slice absorb the remainder. The first happens
+	 * UNCONDITIONALLY, on every model, including the ones where no
+	 * tensor can fire -- and those models measured a small consistent
+	 * LOSS across two board rounds while their dispatch plan was
+	 * provably identical in both arms. This flag does the widening and
+	 * not the slicing, so the two can be priced apart instead of
+	 * argued about.
+	 */
+	int kwide_only;
 	/* one message per REASON; the pointer identifies it, see whine() */
 	const char *whined[8];
 	unsigned n_whined;
@@ -1030,7 +1043,7 @@ static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned 
  */
 static size_t kmax_wide(const struct charsiu_npu *g)
 {
-	return (size_t)g->kmax * (g->kfit ? 2 : 1);
+	return (size_t)g->kmax * ((g->kfit || g->kwide_only) ? 2 : 1);
 }
 
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
@@ -1271,6 +1284,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
+	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
 	 * assignment every number in this file before round 391 was measured
@@ -1636,6 +1650,10 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		fprintf(stderr,
 			"charsiu NPU: KFIT narrowed %u of %u staged tensors\n",
 			g->kfit_hits, g->kfit_seen);
+	if (g->kwide_only)
+		fprintf(stderr,
+			"charsiu NPU: KFIT narrowed 0 of 0 staged tensors "
+			"(wide buffers only, no slicing)\n");
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "

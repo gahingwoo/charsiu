@@ -23,7 +23,7 @@
 #   6  the deal                 least-loaded against CHARSIU_NPU_DEAL_INDEX=1
 #   7  the scoreboard           against Rockchip, REPEAT=3 because one reading
 #                               of this table has a 25% spread
-#   8  CHARSIU_NPU_KFIT         every model, repeated, to settle the default
+#   8  CHARSIU_NPU_KFIT         three arms: off / wide buffers only / on
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
 # numbers and are allowed to disappoint.
@@ -250,36 +250,49 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ok "scoreboard in $OUT/verify-vendor.txt"
    ;;
 
-8) say "8. KFIT: the runt K slice, on every model and not just the two it helps"
-   # ⚠⚠ WHY IT SHOULD COST NOTHING, WHICH IS NOT OBVIOUS. npuquant falls back
-   # to one scale a row when k % grp is non-zero, so a tensor whose K does not
-   # divide the slice is ALREADY ungrouped, and a tensor whose K DOES divide
-   # has no remainder for KFIT to absorb. The two conditions are complementary,
-   # so on the argument KFIT costs no quantisation quality on any tensor.
+8) say "8. KFIT: what the wider buffers cost, and what the slicing buys"
+   # ⚠⚠ TURNING KFIT ON DOES TWO INDEPENDENT THINGS, and two board rounds
+   # priced them together and could not tell them apart.
    #
-   # ⚠ THAT ARGUMENT IS STRUCTURAL, AND STRUCTURAL ARGUMENTS HAVE BEEN WRONG
-   # HERE. The width law was fitted at nine points, held at all nine, and was
-   # still wrong. So this runs EVERY model rather than the two the offline
-   # pricing said would gain. A model that gains nothing is the cheap half of
-   # the evidence: what can move the default is text identical everywhere.
+   #   1. it widens five buffers to 2 * kmax -- UNCONDITIONALLY, on every
+   #      model, including ones where no tensor can fire. in_stride is one of
+   #      them, so every K slice sits twice as far from the next in the DMA
+   #      buffer, whether or not anything needed the room.
+   #   2. it makes the last slice absorb the remainder, the `ks--`, which is
+   #      the part that is supposed to pay.
    #
-   # ⚠ AND ONE READING IS NOT A MEASUREMENT. The first round ran each arm once
-   # and read gemma-3-1b +5.6% and gemma-4-E2B +0.4%, which is one number above
-   # this board's 1% noise band and one number inside it. --repeat pays the
-   # model load once and generates REP times, so the arm's figure is the best
-   # of REP and the spread is on the record.
+   # The three models that CANNOT fire -- their every K divides KMAX, so the
+   # dispatch plan is byte for byte identical in both arms -- came out at
+   # -0.5%, +0.0% and -0.9%, and SmolLM2-1.7B read -1.0% and -0.9% in two
+   # separate rounds. A reproducible loss on a model where the switch provably
+   # changes no dispatch is not noise, it is (1) with none of (2).
+   #
+   # So there is a third arm: CHARSIU_NPU_KFIT_WIDE widens the buffers and
+   # does NOT slice. Now every model is its own control rather than only the
+   # three that happen to divide evenly:
+   #
+   #   wide - off   what the widening COSTS
+   #   on   - wide  what the slicing BUYS, with the cost already paid
+   #   on   - off   the net, which is what a user would see
+   #
+   # ⚠ ONE READING IS NOT A MEASUREMENT: --repeat pays the model load once and
+   # generates REP times, and the spread is printed under every row.
    run 8
    REP=${KFIT_REPEAT:-3}
-   nk=0; nchg=0; ndead=0; nslow=0
+   nk=0; nchg=0; ndead=0
    : >"$OUT/.kfit_rows"
-   printf '  %-26s %8s %8s %8s %9s  %s\n' model kfit=off kfit=on delta narrowed text
+   printf '  %-30s %7s %7s %7s %9s  %s\n' model off wide on narrowed text
    for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
 	nk=$((nk + 1))
 	b=$(basename "$M" .gguf)
-	rates_off=""; rates_on=""
-	for arm in off on; do
-		case $arm in on) E=CHARSIU_NPU_KFIT=1 ;; *) E=CHARSIU_KFIT_DUMMY=1 ;; esac
+	rates_off=""; rates_wide=""; rates_on=""
+	for arm in off wide on; do
+		case $arm in
+		on)   E=CHARSIU_NPU_KFIT=1 ;;
+		wide) E=CHARSIU_NPU_KFIT_WIDE=1 ;;
+		*)    E=CHARSIU_KFIT_DUMMY=1 ;;
+		esac
 		# shellcheck disable=SC2086
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
@@ -287,120 +300,95 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    "$BIN/charsiu_run" "$M" -p "$P" -n 32 --ignore-eos \
 		    --repeat "$REP" >"$OUT/.kfit_$arm" \
 		    2>"$OUT/.kfit_$arm.err"
-		# ⚠ READ THE RATES BEFORE THE STRIP BELOW EATS THEM. The summary
-		# is a bracketed line on STDOUT and the sed that prepares the
-		# text for comparison deletes exactly those, so a check written
-		# after it greps for a line it has just removed and reports a
-		# healthy run as one that never generated a token.
-		# ⚠ AND ISOLATE THE GENERATION RATE. The summary is one line,
-		# "[load .. | prompt N tok .. R tok/s | gen N tok .. R tok/s |
-		# peak N MB]", and the halves line below it carries two more --
-		# so a bare grep for "tok/s" collects FOUR rates a repeat and a
-		# max over them returns the first-half figure, which is always
-		# the highest and is not what this phase compares.
+		# ⚠ READ THE RATES BEFORE THE STRIP BELOW EATS THEM, and isolate
+		# the GENERATION one. The summary is a single line carrying the
+		# prompt rate and the gen rate, the halves line below it carries
+		# two more, and the sed that prepares the text for comparison
+		# deletes every bracketed line -- so a check written after it
+		# greps for what it just removed, and a bare "tok/s" grep
+		# collects four rates a repeat and maxes to the first-half one.
 		rr=$(grep -hoE 'gen [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
 		    "$OUT/.kfit_$arm" "$OUT/.kfit_$arm.err" \
 		    | sed 's/.*, //; s/ tok.s//' | tr '\n' ' ')
-		if [ "$arm" = off ]; then rates_off=$rr; else rates_on=$rr; fi
+		case $arm in
+		off)  rates_off=$rr ;;
+		wide) rates_wide=$rr ;;
+		on)   rates_on=$rr ;;
+		esac
 	done
-	# ⚠⚠ DID THE SWITCH DO ANYTHING AT ALL. `ks--` needs a REMAINDER, so on
-	# a model whose every K is a multiple of KMAX the dispatch plan is byte
-	# for byte identical and the delta measured is the MEASUREMENT, not
-	# KFIT. The first eight model round scored two such models as losses.
 	hits=$(grep -hoE 'KFIT narrowed [0-9]+ of [0-9]+' "$OUT/.kfit_on.err" \
 	    | head -1 | awk '{print $3"/"$5}')
 	[ -n "$hits" ] || hits="?"
-	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_on"
-	# ⚠ AN ARM THAT PRODUCED NO RATE DID NOT RUN, and that is a different
-	# failure from a text difference. Calling a crash "KFIT changes the
-	# answer" is a wrong diagnosis of a real problem, which is worse than
-	# either alone. This is how the heap corruption was nearly mislabelled.
-	non=$(printf '%s' "$rates_on"  | wc -w)
-	noff=$(printf '%s' "$rates_off" | wc -w)
-	# ⚠⚠ AND A SHORT ARM IS ALSO A DEAD ARM. An arm that crashed on repeat
-	# two of three leaves ONE rate behind, which is not empty, so it reads
-	# as healthy -- and its text is then a third the length of the other
-	# arm's, so the comparison below calls it "KFIT changes the answer".
-	# That is the wrong diagnosis of a real problem, which is the specific
-	# failure this phase exists to not repeat. Count the rates.
-	if [ "$non" -ne "$REP" ] || [ "$noff" -ne "$REP" ]; then
-		if [ "$non" -ne "$REP" ]; then dead=on; n=$non; else dead=off; n=$noff; fi
-		bad "$b: the kfit=$dead arm generated $n of $REP times"
-		tail -6 "$OUT/.kfit_$dead.err" | sed 's/^/       /'
+	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_wide" "$OUT/.kfit_on"
+	# ⚠⚠ A SHORT ARM IS A DEAD ARM. An arm that crashed on repeat two of
+	# three leaves rates behind, which is not empty, so it reads as healthy
+	# -- and its text is then shorter than the others', so the comparison
+	# calls it "KFIT changes the answer". That is the wrong diagnosis of a
+	# real problem, which is the failure this phase was rewritten after.
+	dead=""
+	for arm in off wide on; do
+		eval "n=\$(printf '%s' \"\$rates_$arm\" | wc -w)"
+		[ "$n" -eq "$REP" ] || dead="$arm($n/$REP)"
+	done
+	if [ -n "$dead" ]; then
+		bad "$b: the $dead arm did not generate $REP times"
+		tail -6 "$OUT/.kfit_${dead%%(*}.err" | sed 's/^/       /'
 		ndead=$((ndead + 1))
 		continue
 	fi
-	bo=$(printf '%s' "$rates_off" | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
-	bn=$(printf '%s' "$rates_on"  | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
-	d=$(awk -v a="$bo" -v b="$bn" 'BEGIN{printf "%+.1f%%",(b-a)/a*100}')
-	if cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
+	bo=$(printf '%s' "$rates_off"  | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	bw=$(printf '%s' "$rates_wide" | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	bn=$(printf '%s' "$rates_on"   | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	if cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on" &&
+	   cmp -s "$OUT/.kfit_off" "$OUT/.kfit_wide"; then
 		t=same
 	else
 		t="⚠ DIFFERS"
 		nchg=$((nchg + 1))
 	fi
-	printf '  %-26s %8s %8s %8s %9s  %s\n' "$b" "$bo" "$bn" "$d" "$hits" "$t"
-	printf '      off: %s\n      on : %s\n' "$rates_off" "$rates_on"
-	[ "$t" = same ] || diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'
-	printf '%s %s %s %s\n' "$b" "${hits%%/*}" "$bo" "$bn" >>"$OUT/.kfit_rows"
-	nslow=$((nslow + $(awk -v a="$bo" -v b="$bn" 'BEGIN{print ((b-a)/a*100 < -1.0)?1:0}')))
+	printf '  %-30s %7s %7s %7s %9s  %s\n' "$b" "$bo" "$bw" "$bn" "$hits" "$t"
+	printf '      off : %s\n      wide: %s\n      on  : %s\n' \
+	    "$rates_off" "$rates_wide" "$rates_on"
+	awk -v a="$bo" -v w="$bw" -v n="$bn" 'BEGIN{
+	    printf "      buffers %+.1f%%   slicing %+.1f%%   net %+.1f%%\n",
+	           (w-a)/a*100, (n-w)/w*100, (n-a)/a*100 }'
+	[ "$t" = same ] || { diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'; }
+	printf '%s %s %s %s %s\n' "$b" "${hits%%/*}" "$bo" "$bw" "$bn" >>"$OUT/.kfit_rows"
    done
    wedged "phase 8" && break
-   # ⚠⚠ ZERO MODELS IS NOT ZERO DIFFERENCES -- a loop that ran no iterations
-   # leaves every counter at 0 and reads exactly like a clean sweep.
    if [ "$nk" = 0 ]; then
 	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
 	printf '     pass CHARSIU_MODELS=/path if they live somewhere else.\n'
    elif [ "$nchg" -gt 0 ]; then
-	bad "$nchg of $nk model(s) answer differently under KFIT. It is a"
-	printf '     slicing change and must not move a token: keep it off.\n'
+	bad "$nchg of $nk model(s) answer differently. KFIT is a slicing"
+	printf '     change and the wide arm changes no slicing at all, so\n'
+	printf '     either one moving a token is a bug: keep it off.\n'
    else
-	ok "text identical on $((nk - ndead)) of $((nk - ndead)) -- the switch"
-	printf '     does not change an answer. Speed is a separate question:\n\n'
-	# ⚠⚠ THE MODELS KFIT CANNOT TOUCH ARE THIS ROUND'"'"'S PLACEBO. `ks--`
-	# needs a remainder, so a model whose every K divides KMAX runs the
-	# identical dispatch plan in both arms and its delta is pure
-	# measurement -- arm order, thermals, page cache. Averaging those
-	# gives the round its own bias, for free, with no extra runs, and the
-	# fired models are then read against it rather than against zero.
-	# The first eight model round did not have this and scored two
-	# untouchable models as losses, which nearly kept the switch off.
-	awk '{ n=$1; h=$2+0; o=$3+0; u=$4+0; d=(u-o)/o*100
-	       if (h==0) { ib+=d; ic++; iname[ic]=n; idd[ic]=d }
-	       else      { fc++; fname[fc]=n; fdd[fc]=d; fh[fc]=h } }
+	ok "text identical across all three arms on $((nk - ndead)) model(s)."
+	printf '     Speed is a separate question:\n\n'
+	awk '{ n=$1; h=$2+0; a=$3+0; w=$4+0; u=$5+0
+	       cost[++c] = (w-a)/a*100; cname[c]=n; csum += cost[c]
+	       if (h==0) { zc++; zg += (u-w)/w*100 }
+	       else { fc++; fname[fc]=n; fgain[fc]=(u-w)/w*100
+	              fnet[fc]=(u-a)/a*100; fh[fc]=h } }
 	     END {
-	       bias = ic ? ib/ic : 0
-	       # ⚠ AND THE PLACEBO SETS THE BAND, not a number typed in here.
-	       # The 1% figure came from repeats of ONE arm; what matters for
-	       # an off-vs-on delta is how far apart two arms land when the
-	       # switch provably did nothing, which is what these models are.
-	       for (i=1;i<=ic;i++) { e=idd[i]-bias; if (e<0) e=-e
-	                             if (e>band) band=e }
-	       if (band < 0.5) band = 0.5
-	       printf "     KFIT could not fire on %d model(s) -- the placebo:\n", ic
-	       for (i=1;i<=ic;i++) printf "       %-28s %+6.1f%%\n", iname[i], idd[i]
-	       if (ic) printf "       mean %+.1f%%, spread +/-%.1f%% <- the round%s own bias and\n       band, measured rather than assumed\n\n", bias, band, "'"'"'s"
-	       printf "     it narrowed slices on %d:\n", fc
-	       worst = 999; best = -999
-	       for (i=1;i<=fc;i++) { c = fdd[i] - bias
-	         if (c < worst) worst = c
-	         if (c > best)  best  = c
-	         printf "       %-28s %+6.1f%% raw   %+6.1f%% corrected   %d tensors\n", \
-	                fname[i], fdd[i], c, fh[i] }
+	       printf "     what the WIDER BUFFERS cost, on every model:\n"
+	       for (i=1;i<=c;i++) printf "       %-30s %+6.1f%%\n", cname[i], cost[i]
+	       printf "       mean %+.1f%% -- paid whether or not anything fires\n\n", csum/c
+	       if (zc) printf "     consistency: the %d model(s) that cannot fire gained\n       %+.1f%% mean from the slicing arm, and should have gained 0.\n       That is this round%s measurement error.\n\n", zc, zg/zc, "'"'"'s"
+	       printf "     what the SLICING buys, where it fires:\n"
+	       worst=999; best=-999
+	       for (i=1;i<=fc;i++) {
+	         if (fgain[i]<worst) worst=fgain[i]
+	         if (fgain[i]>best)  best=fgain[i]
+	         printf "       %-30s %+6.1f%%  (net %+.1f%%, %d tensors)\n", \
+	                fname[i], fgain[i], fnet[i], fh[i] }
 	       print ""
-	       if (fc == 0) {
-	         print "     ⚠ NOTHING FIRED ANYWHERE. This round says nothing about"
-	         print "       KFIT at all -- every model divides KMAX evenly. Add a"
-	         print "       model whose K does not, or change KMAX." }
-	       else if (ic == 0) {
-	         printf "     ⚠ NO PLACEBO -- every model fired, so the bias is\n"
-	         printf "       unmeasured and %+.1f%% .. %+.1f%% is raw.\n", worst, best }
-	       else if (worst < -band)
-	         printf "     ⚠ %+.1f%% after correction is past the placebo band of\n     %.1f%%. Not free: it stays a switch.\n", worst, band
-	       else if (best < band)
-	         printf "     nothing loses past the %.1f%% band -- but nothing WINS past\n     it either, so this buys nothing. Leave it off.\n", band
+	       if (fc == 0) { print "     ⚠ NOTHING FIRED. This round says nothing about the slicing."; exit }
+	       if (csum/c < -0.4)
+	         printf "     ⚠ THE WIDENING IS NOT FREE (%+.1f%% mean) and it is paid by\n     every model. Size the buffers by the widest slice actually\n     staged and the net becomes the slicing figure above.\n", csum/c
 	       else
-	         printf "     nothing loses past the %.1f%% band and the best is %+.1f%%.\n     That is the evidence the default was waiting for.\n", band, best
+	         printf "     the widening is free, so net == slicing and the range is\n     %+.1f%% .. %+.1f%%.\n", worst, best
 	     }' "$OUT/.kfit_rows"
 	[ "$ndead" = 0 ] || printf '\n  – %s model(s) never generated; see above.\n' "$ndead"
    fi
