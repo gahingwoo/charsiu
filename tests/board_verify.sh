@@ -23,7 +23,7 @@
 #   6  the deal                 least-loaded against CHARSIU_NPU_DEAL_INDEX=1
 #   7  the scoreboard           against Rockchip, REPEAT=3 because one reading
 #                               of this table has a 25% spread
-#   8  CHARSIU_NPU_KFIT         written, legal, default off, NEVER RUN
+#   8  CHARSIU_NPU_KFIT         every model, repeated, to settle the default
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
 # numbers and are allowed to disappoint.
@@ -46,6 +46,15 @@ MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 OUT=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUT"
 FAIL=0; SKIP=""; RAN=""
+
+# ⚠⚠ ONE PROMPT FOR THE WHOLE ROUND. `seq 1 32 | tr` leaves a TRAILING SPACE,
+# which tokenises differently, and phases 3, 7 and 8 each built their own copy
+# -- two with the space and one without. Inside a phase both arms saw the same
+# string so the comparisons held, but a tok/s from one phase was not comparable
+# to a tok/s from another, and a round has already been read as "gemma4 flipped"
+# when what changed was the prompt. Built once here, stripped once, printed
+# below so a log says what it measured.
+P=$(seq 1 32 | tr '\n' ' '); P=${P% }
 
 say() { printf '\n=========== %s ===========\n' "$*"; }
 bad() { printf '  ⚠⚠ %s\n' "$*"; FAIL=$((FAIL + 1)); }
@@ -76,6 +85,7 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+echo "  prompt    $(printf '%s' "$P" | wc -w) words, no trailing space"
 echo "  ⚠ phase 7 sets the performance governor itself, as their protocol does."
 
 for p in $PHASES; do
@@ -112,7 +122,6 @@ case $p in
    # to run. If it changes a single token, the identity is not an identity
    # here and four commits are wrong. It is the cheapest check in the round.
    run 3
-   P=$(seq 1 32 | tr '\n' ' '); P=${P% }
    W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
@@ -202,7 +211,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
-		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
+		    "$BIN/charsiu_run" "$M" -p "$P" \
 		    -n 32 --ignore-eos >"$OUT/.deal_$arm" \
 		    2>"$OUT/.deal_$arm.err"
 		printf '  %-28s %-6s %s\n' "$b" "$arm" \
@@ -241,60 +250,110 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ok "scoreboard in $OUT/verify-vendor.txt"
    ;;
 
-8) say "8. KFIT: the runt K slice, on the tensors it is free for"
-   # ⚠⚠ WHY IT IS FREE, WHICH IS NOT OBVIOUS. npuquant falls back to one
-   # scale a row when k % grp is non-zero, so a tensor whose K does not
-   # divide the slice is ALREADY ungrouped -- gemma-3-1b is 1152 and 6912,
-   # gemma-4-E2B is 1536 -- and a tensor whose K DOES divide has no remainder
-   # for KFIT to absorb. The two conditions are complementary, so KFIT costs
-   # no quantisation quality on any tensor it can help. Priced offline at
-   # gemma-3-1b -7.9% and gemma-4-E2B -3.5%.
+8) say "8. KFIT: the runt K slice, on every model and not just the two it helps"
+   # ⚠⚠ WHY IT SHOULD COST NOTHING, WHICH IS NOT OBVIOUS. npuquant falls back
+   # to one scale a row when k % grp is non-zero, so a tensor whose K does not
+   # divide the slice is ALREADY ungrouped, and a tensor whose K DOES divide
+   # has no remainder for KFIT to absorb. The two conditions are complementary,
+   # so on the argument KFIT costs no quantisation quality on any tensor.
    #
-   # ⚠ It has never been run on hardware. The text check is the point of this
-   # phase; the tok/s is the reason to look.
+   # ⚠ THAT ARGUMENT IS STRUCTURAL, AND STRUCTURAL ARGUMENTS HAVE BEEN WRONG
+   # HERE. The width law was fitted at nine points, held at all nine, and was
+   # still wrong. So this runs EVERY model rather than the two the offline
+   # pricing said would gain. A model that gains nothing is the cheap half of
+   # the evidence: what can move the default is text identical everywhere.
+   #
+   # ⚠ AND ONE READING IS NOT A MEASUREMENT. The first round ran each arm once
+   # and read gemma-3-1b +5.6% and gemma-4-E2B +0.4%, which is one number above
+   # this board's 1% noise band and one number inside it. --repeat pays the
+   # model load once and generates REP times, so the arm's figure is the best
+   # of REP and the spread is on the record.
    run 8
-   nk=0
-   for M in "$MODELS"/gemma-3-1b*Q4_0*.gguf "$MODELS"/gemma-4*Q4_0*.gguf; do
+   REP=${KFIT_REPEAT:-3}
+   nk=0; nchg=0; ndead=0; nslow=0
+   printf '  %-26s %8s %8s %8s  %s\n' model kfit=off kfit=on delta text
+   for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
 	nk=$((nk + 1))
-	b=$(basename "$M")
+	b=$(basename "$M" .gguf)
+	rates_off=""; rates_on=""
 	for arm in off on; do
 		case $arm in on) E=CHARSIU_NPU_KFIT=1 ;; *) E=CHARSIU_KFIT_DUMMY=1 ;; esac
 		# shellcheck disable=SC2086
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
-		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
-		    -n 32 --ignore-eos >"$OUT/.kfit_$arm" \
+		    "$BIN/charsiu_run" "$M" -p "$P" -n 32 --ignore-eos \
+		    --repeat "$REP" >"$OUT/.kfit_$arm" \
 		    2>"$OUT/.kfit_$arm.err"
-		# ⚠ READ THE RATE BEFORE THE STRIP BELOW REMOVES IT. The
-		# summary is a bracketed line on STDOUT, and the sed that
-		# prepares the text for comparison deletes exactly those --
-		# so a check written after it greps for a line it just ate
-		# and reports a healthy run as one that never generated.
-		r=$(grep -hoE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' \
-		    "$OUT/.kfit_$arm" "$OUT/.kfit_$arm.err" | head -1)
-		eval "rate_$arm=\$r"
-		printf '  %-28s kfit=%-4s %s\n' "$b" "$arm" "$r"
+		# ⚠ READ THE RATES BEFORE THE STRIP BELOW EATS THEM. The summary
+		# is a bracketed line on STDOUT and the sed that prepares the
+		# text for comparison deletes exactly those, so a check written
+		# after it greps for a line it has just removed and reports a
+		# healthy run as one that never generated a token.
+		# ⚠ AND ISOLATE THE GENERATION RATE. The summary is one line,
+		# "[load .. | prompt N tok .. R tok/s | gen N tok .. R tok/s |
+		# peak N MB]", and the halves line below it carries two more --
+		# so a bare grep for "tok/s" collects FOUR rates a repeat and a
+		# max over them returns the first-half figure, which is always
+		# the highest and is not what this phase compares.
+		rr=$(grep -hoE 'gen [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
+		    "$OUT/.kfit_$arm" "$OUT/.kfit_$arm.err" \
+		    | sed 's/.*, //; s/ tok.s//' | tr '\n' ' ')
+		if [ "$arm" = off ]; then rates_off=$rr; else rates_on=$rr; fi
 	done
 	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_on"
-	# ⚠ A RUN THAT PRODUCED NO RATE DID NOT RUN, and that is a different
-	# failure from a text difference. Saying "KFIT changes the answer" about
-	# an arm that never generated a token is a wrong diagnosis of a real
-	# problem, which is worse than either alone.
-	if [ -z "${rate_on:-}" ]; then
-		bad "$b: the KFIT arm produced no generation at all"
-		printf '     its stderr, last lines:\n'
-		tail -6 "$OUT/.kfit_on.err" | sed 's/^/       /'
-	elif cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
-		printf '      text identical with and without KFIT\n'
-	else
-		bad "$b: KFIT CHANGES THE ANSWER -- it is a slicing change and must not"
-		diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'
+	# ⚠ AN ARM THAT PRODUCED NO RATE DID NOT RUN, and that is a different
+	# failure from a text difference. Calling a crash "KFIT changes the
+	# answer" is a wrong diagnosis of a real problem, which is worse than
+	# either alone. This is how the heap corruption was nearly mislabelled.
+	non=$(printf '%s' "$rates_on"  | wc -w)
+	noff=$(printf '%s' "$rates_off" | wc -w)
+	# ⚠⚠ AND A SHORT ARM IS ALSO A DEAD ARM. An arm that crashed on repeat
+	# two of three leaves ONE rate behind, which is not empty, so it reads
+	# as healthy -- and its text is then a third the length of the other
+	# arm's, so the comparison below calls it "KFIT changes the answer".
+	# That is the wrong diagnosis of a real problem, which is the specific
+	# failure this phase exists to not repeat. Count the rates.
+	if [ "$non" -ne "$REP" ] || [ "$noff" -ne "$REP" ]; then
+		if [ "$non" -ne "$REP" ]; then dead=on; n=$non; else dead=off; n=$noff; fi
+		bad "$b: the kfit=$dead arm generated $n of $REP times"
+		tail -6 "$OUT/.kfit_$dead.err" | sed 's/^/       /'
+		ndead=$((ndead + 1))
+		continue
 	fi
+	bo=$(printf '%s' "$rates_off" | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	bn=$(printf '%s' "$rates_on"  | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	d=$(awk -v a="$bo" -v b="$bn" 'BEGIN{printf "%+.1f%%",(b-a)/a*100}')
+	if cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
+		t=same
+	else
+		t="⚠ DIFFERS"
+		nchg=$((nchg + 1))
+	fi
+	printf '  %-26s %8s %8s %8s  %s\n' "$b" "$bo" "$bn" "$d" "$t"
+	printf '      off: %s\n      on : %s\n' "$rates_off" "$rates_on"
+	[ "$t" = same ] || diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'
+	nslow=$((nslow + $(awk -v a="$bo" -v b="$bn" 'BEGIN{print ((b-a)/a*100 < -1.0)?1:0}')))
    done
    wedged "phase 8" && break
-   [ "$nk" -gt 0 ] || bad "phase 8 found no gemma model under $MODELS"
+   # ⚠⚠ ZERO MODELS IS NOT ZERO DIFFERENCES -- a loop that ran no iterations
+   # leaves every counter at 0 and reads exactly like a clean sweep.
+   if [ "$nk" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+	printf '     pass CHARSIU_MODELS=/path if they live somewhere else.\n'
+   elif [ "$nchg" -gt 0 ]; then
+	bad "$nchg of $nk model(s) answer differently under KFIT. It is a"
+	printf '     slicing change and must not move a token: keep it off.\n'
+   elif [ "$ndead" -gt 0 ]; then
+	printf '  – %s model(s) never generated; the rest are above.\n' "$ndead"
+   elif [ "$nslow" -gt 0 ]; then
+	ok "text identical on $nk of $nk, but $nslow lost more than the 1%%"
+	printf '     noise band. Not free, so it stays a switch.\n'
+   else
+	ok "text identical on $nk of $nk and nothing slower than the noise"
+	printf '     band. That is the evidence the default was waiting for.\n'
+   fi
    ;;
 esac
 done
