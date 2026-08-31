@@ -23,6 +23,7 @@
 #   6  the deal                 least-loaded against CHARSIU_NPU_DEAL_INDEX=1
 #   7  the scoreboard           against Rockchip, REPEAT=3 because one reading
 #                               of this table has a 25% spread
+#   8  CHARSIU_NPU_KFIT         written, legal, default off, NEVER RUN
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
 # numbers and are allowed to disappoint.
@@ -33,10 +34,10 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7}
+PHASES=${*:-1 2 3 4 5 6 7 8}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
-slow) PHASES="6 7" ;;
+slow) PHASES="6 7 8" ;;
 esac
 
 BIN=${CHARSIU_BIN_DIR:-/opt/charsiu}
@@ -229,6 +230,46 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    sed -n '/^model /,$p' "$OUT/verify-vendor.txt"
    wedged "phase 7" && break
    ok "scoreboard in $OUT/verify-vendor.txt"
+   ;;
+
+8) say "8. KFIT: the runt K slice, on the tensors it is free for"
+   # ⚠⚠ WHY IT IS FREE, WHICH IS NOT OBVIOUS. npuquant falls back to one
+   # scale a row when k % grp is non-zero, so a tensor whose K does not
+   # divide the slice is ALREADY ungrouped -- gemma-3-1b is 1152 and 6912,
+   # gemma-4-E2B is 1536 -- and a tensor whose K DOES divide has no remainder
+   # for KFIT to absorb. The two conditions are complementary, so KFIT costs
+   # no quantisation quality on any tensor it can help. Priced offline at
+   # gemma-3-1b -7.9% and gemma-4-E2B -3.5%.
+   #
+   # ⚠ It has never been run on hardware. The text check is the point of this
+   # phase; the tok/s is the reason to look.
+   run 8
+   nk=0
+   for M in "$MODELS"/gemma-3-1b*Q4_0*.gguf "$MODELS"/gemma-4*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	nk=$((nk + 1))
+	b=$(basename "$M")
+	for arm in off on; do
+		case $arm in on) E=CHARSIU_NPU_KFIT=1 ;; *) E=CHARSIU_KFIT_DUMMY=1 ;; esac
+		# shellcheck disable=SC2086
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
+		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
+		    -n 32 --ignore-eos >"$OUT/.kfit_$arm" 2>&1
+		printf '  %-28s kfit=%-4s %s\n' "$b" "$arm" \
+		    "$(grep -oE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' "$OUT/.kfit_$arm" | head -1)"
+	done
+	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_on"
+	if cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
+		printf '      text identical with and without KFIT\n'
+	else
+		bad "$b: KFIT CHANGES THE ANSWER -- it is a slicing change and must not"
+		diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'
+	fi
+   done
+   wedged "phase 8" && break
+   [ "$nk" -gt 0 ] || bad "phase 8 found no gemma model under $MODELS"
    ;;
 esac
 done
