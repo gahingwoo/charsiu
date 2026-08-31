@@ -178,6 +178,14 @@ struct npu_entry {
  * is four to five times the vendor's on the same silicon. The NPU is idle for
  * 91% of a batched matmul and this was the biggest single reason why.
  *
+ * ⚠⚠ AND THIS FIX MADE BOTH OF THOSE NUMBERS STALE. The pool worked: measured
+ * on the board across eight models, `prep` is 0.1% to 0.5% of a batched matmul
+ * now, not 36%. The idle figure went with it -- the split reads about 44%
+ * fence, 26% read, 26% pack, 2% submit, 0.2% prep, so the hardware is BUSY for
+ * roughly 44% of the call and idle for 56%, not 91%. The paragraph above is
+ * kept because it is the record of what this fix was worth. Do not quote the
+ * 36% or the 91% as current; charsiu_pool_report_batch prints the live split.
+ *
  * What the size depends on is not WHICH tensor it is. It is the widest slice,
  * how many slots the busier device gets, and m -- and a transformer has a
  * handful of those, not one per tensor. Llama-3.2-1B's 113 matmul tensors, at

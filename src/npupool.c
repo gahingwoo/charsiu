@@ -343,8 +343,17 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 	fprintf(out, "    ----\n");
 	fprintf(out, "    other %8.1f ms  %5.1f%%  %s\n", other,
 		100.0 * other / wall,
-		other > pack || other > prep
-		? "⚠ LARGER THAN A NAMED SHARE -- name it before optimising one"
+		/*
+		 * ⚠ COMPARED AGAINST THE SHARES ANYONE WOULD ACTUALLY TARGET,
+		 * which is pack and read. The first board round tested it
+		 * against `prep` too, and prep collapsed to 0.2% once the
+		 * buffers went into a pool -- so a 3% unnamed share was
+		 * "LARGER THAN A NAMED SHARE" on six models of eight, which is
+		 * a warning that fires when nothing is wrong and teaches the
+		 * reader to skip the line.
+		 */
+		other > pack || other > read
+		? "⚠ LARGER THAN A SHARE WORTH OPTIMISING -- name it first"
 		: "unaccounted");
 	if (nbuf)
 		fprintf(out, "    (%u batch buffer allocations, %.1f ms, inside "
