@@ -560,6 +560,45 @@ struct charsiu_npu {
 	 * them costs the quantiser: the K slice IS the int4 group, and one
 	 * scale for a 2048 long row measured 0.1067 relative error against
 	 * group 32's 0.0666. The coupling stays.
+	 *
+	 * ⚠⚠ ONE CLAUSE OF THAT IS TRUE ONLY OF THIS SLICER, AND IT IS THE ONE
+	 * THAT SOUNDS LIKE A LAW. "The bytes it moves onto one core cost more
+	 * than it saves" describes a cut with ONE GLOBAL KMAX and ONE GLOBAL
+	 * NMAX, where a tensor that stops needing a K cut becomes a SINGLE
+	 * slice and takes a whole core's share of the bytes with it. That is a
+	 * property of the cut this file makes, not of a wider K. Cut N at the
+	 * same time and the bytes do not move at all: a call whose slices come
+	 * out even splits its weight bytes in half whatever the cut, so the
+	 * megabyte term on the busier core is the SAME and only the task term
+	 * falls.
+	 *
+	 * Scored with the line above over the real .gguf geometry, with the cut
+	 * chosen freely PER TENSOR and capped at K <= 4096 and N <= 8192 (the
+	 * widest of each that has ever run on this board -- see round 322 for
+	 * why K = 8192 is not on the list), a decode token's hardware path:
+	 *
+	 *   Llama-3.2-1B    48825 -> 45587 us   -6.6%   tasks_hi 176 -> 88
+	 *   Qwen3-0.6B      38417 -> 36678      -4.5%
+	 *   gemma-3-1b      53556 -> 45958     -14.2%
+	 *   gemma-4-E2B     76583 -> 70311      -8.2%
+	 *   Phi-3.5-mini   142567 -> 123752    -13.2%
+	 *
+	 * Llama's MB_hi is 308.9 on both sides of that, which is the whole
+	 * point: 88 tasks came off and not one byte moved.
+	 *
+	 * ⚠⚠ AND IT IS THE CEILING OF SOMETHING THAT CANNOT BE BUILT. Every one
+	 * of those cuts wants a dispatch of K = 2048 or wider under a group of
+	 * 1024, and one dispatch cannot cover K wider than one group -- see the
+	 * long note above tensor_grouped(), which is now a measurement rather
+	 * than an assertion. Pin K at 1024, keep the same free choice of N, and
+	 * the whole of the win is 0.0% on Llama, +0.3% on Qwen3, -1.9% on
+	 * gemma3 and -0.7% on gemma4. Only Phi-3.5 finds anything, -5.7%, and
+	 * that is the deal balancing its very large tensors rather than fewer
+	 * tasks: its task count goes UP while its MB_hi falls 1014.7 to 930.6.
+	 *
+	 * So the reachable part of the 7.4 ms task term, without touching the
+	 * quantiser, is a couple of percent on four models and a deal fix on
+	 * the fifth. The rest of it is behind the group.
 	 */
 	unsigned long calls;       /* matvec and matvec_group entries */
 	unsigned long tasks_hi;    /* tasks on whichever device got more */
@@ -676,6 +715,101 @@ static unsigned env_u(const char *name, unsigned dflt)
  * condition is deliberately strict -- the slice must BE the group -- because a
  * slice covering part of a group would need a scale per part and there is
  * nowhere to put one.
+ */
+/*
+ * ⚠⚠ AND "NOWHERE TO PUT ONE" IS A PROPERTY OF THE BLOCK, NOT A CHOICE THIS
+ * FILE MADE. ONE DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP.
+ *
+ * The sentence above was an assertion for a long time, and the obvious idea it
+ * blocks -- decouple KMAX from W4_GROUP, dispatch K = 4096 with four groups of
+ * 1024 scales in the weights, halve the task count without coarsening the
+ * quantiser -- is worth a re-read of the register map every time somebody
+ * notices the coupling. So here is why it does not work, in the form that
+ * closes it.
+ *
+ * A dispatch produces ONE number per output channel. The CNA and the CORE
+ * reduce over every input channel the dispatch was handed, and everything that
+ * can touch the result afterwards lives in the DPU: BS, BN, EW and the output
+ * convert, in that order, every one of them indexed by OUTPUT channel and every
+ * one of them running AFTER the reduction. Their operand surfaces come from the
+ * DPU_RDMA, whose DATA_CUBE_CHANNEL at 0x5014 is the output channel count.
+ * Nothing in the map segments the K reduction or writes a partial sum per range
+ * of K -- DPU_SURFACE_ADD at 0x40c0 comes closest and it ADDS surfaces, with no
+ * per-surface operand. So the limit is not the coefficient FORMAT, which is
+ * only a table of ceil(n/8) 64 byte records plus one fp16 a channel and could
+ * be widened in an afternoon. It is the accumulator, which cannot.
+ *
+ * On the int4 path charsiu does not even use the DPU's multiplier: acc_out
+ * forces the whole vendor output stage on, the requant reads identity
+ * (0x40ac/b0/b4 = 0, 1, 0), the raw accumulator comes back and the group scale
+ * is applied on the CPU by scaled_add. That is why the gather in add_slice can
+ * take ONE scale a channel for the slice and no more.
+ *
+ * Both ways round it close. A factor folded into the ACTIVATION has to be the
+ * same for every output channel -- which is exactly why the per k AWQ factor in
+ * npuquant.c is free, and exactly why a per (channel, group) scale is not.
+ * Folding it into the WEIGHTS means multiplying a four bit code by a ratio and
+ * rounding it back into four bits, which is per channel quantisation with extra
+ * steps.
+ *
+ * ⚠⚠ AND THE VENDOR'S K = 4096 DISPATCH IS NOT DOING WHAT OURS WOULD HAVE TO.
+ * That is the part worth having, because their compiled streams are the only
+ * evidence available for what this block will accept, and the shape of their
+ * cut -- 2 x K=2048 N=1024 for q and o, 2 x K=2048 N=4096 for gate and up,
+ * 4 x K=4096 N=1024 for down, against our 1024 wide K pieces -- reads like a
+ * demonstration that a wide K under a fine group runs. It is not one.
+ *
+ * Read out of Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm with
+ * tools/rkllm_regcmd.py, three things say so and they agree:
+ *
+ *   - the weight byte count in CNA 0x101c is EXACTLY ic * oc / 2. 0x100000 at
+ *     K=2048 N=1024, 0x200000 at K=4096 N=1024. Nibbles and nothing else;
+ *     there is no room beside them for a scale table;
+ *   - the int4 convolution stream carries no DPU_RDMA registers at all, so no
+ *     coefficient surface is fetched for it -- 0x5020 and 0x5024 are never
+ *     written; and
+ *   - its requant is the identity, 0x40ac/b0/b4 = 0, 1, 0, the same three
+ *     values this file copies.
+ *
+ * So no per group scale enters their dispatch either. And the file says what
+ * their group actually is, in the open: the scales are stored as contiguous
+ * fp32 runs and the length of a run is the tensor's OUTPUT CHANNEL COUNT.
+ * Layer 0 begins at byte 0x1fc77da0 and goes 2048, 512, 512, 2048, 8192, 8192,
+ * 2048 -- q, k, v, o, gate, up, down -- each run followed by an equally long
+ * run of integer valued floats, which is the zero point. That block repeats for
+ * 16 layers, and the embedding and head share one run of 128256. 505088 scales
+ * for 1235746816 weights.
+ *
+ * ⚠ AND THE RUNS WERE IDENTIFIED RATHER THAN GUESSED, because a length on its
+ * own could be a norm. Correlating each run ELEMENT BY ELEMENT against the per
+ * row dynamic range of the matching tensor in the q8_0 copy of the same model
+ * gives +0.93 for attn_q, +0.97 for attn_k, +0.91 for attn_v, +0.97 for
+ * attn_output, +0.99 for ffn_gate, +0.84 for ffn_up and +0.98 for ffn_down.
+ * Row r of the run is the scale of row r of that tensor. (The ratio of range to
+ * scale is not the same constant across the seven -- 4.4 on attn_q against 15.2
+ * on attn_output -- which is the other half of the point: their quantiser is
+ * doing something to the weights before it rounds them, and getting quality out
+ * of one scale a row is a quantiser result, not a dispatch one.)
+ *
+ * ONE SCALE AND ONE ZERO POINT PER ROW. Their group is the whole of K, 8192
+ * long for down. A per row scale factors straight out of a K sum, so their K
+ * cut is free the way an UNGROUPED tensor's K cut is free here, and they choose
+ * 4096 because 8192 does not run (round 322 hit the same wall from the other
+ * side: 0.65 GB/s and 131 job timeouts) and choose N to hand the second core an
+ * equal share. Their wide K is not a finer group surviving a wide dispatch. It
+ * is no group at all.
+ *
+ * ⚠ WHICH ALSO PRICES THE ONLY DOOR LEFT, and it is a quantiser question rather
+ * than a dispatch one: go where the vendor is, one scale a row, and pay for it
+ * with a calibrated quantiser instead of RTN. Measured offline on the real
+ * weights with this file's own rule (d = vmax / -8), relative Frobenius error
+ * of the reconstruction, group 1024 against one scale a row: attn_q 0.1427 ->
+ * 0.1518, attn_output 0.1622 -> 0.1783, ffn_down (K = 8192) 0.1402 -> 0.1707.
+ * The per k AWQ factor takes most of that back on the K = 2048 tensors (attn_q
+ * 0.1409, attn_output 0.1596, both BELOW the grouped number) and does not on
+ * ffn_down, which is the one that would gain the most tasks. Weight error is
+ * not the objective -- npuquant.c says why -- so that is a starting price, not
+ * a verdict.
  */
 /*
  * acc[j] += fo[j] * sc[j], AND BIT FOR BIT WHAT THE SCALAR LOOP DID.
@@ -1078,6 +1212,20 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * split of the same K gives the same accumulator.
 	 *
 	 * Off until a board round says it is both correct and faster.
+	 *
+	 * ⚠ AND THE "UNGROUPED TENSORS ONLY" RESTRICTION COSTS IT NOTHING ON
+	 * THE MODELS IT IS FOR, which is not obvious and is why it is written
+	 * down. npuquant.c falls back to one scale a row whenever k % grp is
+	 * nonzero -- `if (k % grp) grp = k;` -- so a tensor whose K does not
+	 * divide the slice is ALREADY ungrouped, and a tensor whose K does
+	 * divide it has no remainder for KFIT to absorb. The two conditions are
+	 * complementary. gemma3 (K 1152 and 6912) and gemma4's q, k, v, gate
+	 * and up (K 1536) are ungrouped today, so KFIT applies to every tensor
+	 * it would help and is blocked on nothing but a board round.
+	 *
+	 * The offline walk over the fitted line prices it: gemma3 53556 ->
+	 * 49347 us a token, -7.9%, and gemma4 76583 -> 73870, -3.5%. Llama,
+	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
 	/*
