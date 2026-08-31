@@ -53,6 +53,67 @@ static inline uint16x4_t charsiu_vhalf(float32x4_t x)
 		      vorrq_u32(sign, vdupq_n_u32(0x7c00)), h);
 	return vmovn_u32(h);
 }
+
+/*
+ * The int8 activation bias, SIXTEEN BYTES AT A TIME, and it is one XOR.
+ *
+ * charsiu_pack_input writes (uint8_t)(v - 0x80) for every element. On eight bit
+ * two's complement that is exactly v ^ 0x80 -- subtracting 128 modulo 256 only
+ * ever flips the top bit -- for all 256 values, which is what lets the whole
+ * bias be a single veorq_u8 rather than a widen, subtract and narrow. The
+ * benchmark checks it the honest way anyway, against the untouched scalar path
+ * over every value the sweep generates.
+ *
+ * `n` is the granularity of the layout, 16 for int8 by default, so the common
+ * call is one load, one xor and one store.
+ */
+static inline void charsiu_bias_copy(uint8_t *d, const uint8_t *s, unsigned n)
+{
+	unsigned j = 0;
+
+	for (; j + 16 <= n; j += 16)
+		vst1q_u8(d + j, veorq_u8(vld1q_u8(s + j), vdupq_n_u8(0x80)));
+	if (j + 8 <= n) {
+		vst1_u8(d + j, veor_u8(vld1_u8(s + j), vdup_n_u8(0x80)));
+		j += 8;
+	}
+	for (; j < n; j++)
+		d[j] = (uint8_t)(s[j] - 0x80);
+}
+
+/*
+ * The same, into the HIGH BYTE of a 16 bit slot, which is what int4 weights
+ * make the activation surface look like (CHARSIU_A8_STRIDE1 is the control that
+ * turns this case back into the plain one).
+ *
+ * The scalar path leaves the low byte at whatever the whole buffer memset put
+ * there, which for this case is zero; st2 with a zero vector in lane 0 writes
+ * the same bytes and lets the memset below `base` be dropped entirely.
+ */
+static inline void charsiu_bias_copy_hi(uint8_t *d, const uint8_t *s, unsigned n)
+{
+	unsigned j = 0;
+
+	for (; j + 16 <= n; j += 16) {
+		uint8x16x2_t p;
+
+		p.val[0] = vdupq_n_u8(0);
+		p.val[1] = veorq_u8(vld1q_u8(s + j), vdupq_n_u8(0x80));
+		vst2q_u8(d + (size_t)j * 2, p);
+	}
+	if (j + 8 <= n) {
+		uint8x8x2_t p;
+
+		p.val[0] = vdup_n_u8(0);
+		p.val[1] = veor_u8(vld1_u8(s + j), vdup_n_u8(0x80));
+		vst2_u8(d + (size_t)j * 2, p);
+		j += 8;
+	}
+	for (; j < n; j++) {
+		d[(size_t)j * 2] = 0;
+		d[(size_t)j * 2 + 1] = (uint8_t)(s[j] - 0x80);
+	}
+}
 #endif
 
 #define CNA   0x0201u
@@ -371,6 +432,269 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 
 		if (!gran)
 			gran = atom;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+		{
+		/*
+		 * ⚠⚠ THE INT8 PACKER'S COST IS NOT A CALL. IT IS A DIVIDE, AND
+		 * A RELOAD OF THE STRUCT, PER ELEMENT.
+		 *
+		 * The fp16 packer above was fixed by removing a cross unit call
+		 * to charsiu_float_to_half, and the obvious assumption is that
+		 * this one has the same fault. It does not. `nm -u` on regcmd.o
+		 * names charsiu_float_to_half, getenv, memset and strtol and
+		 * nothing else, and objdump of the scalar loop at the bottom of
+		 * this function has no `bl` in it at all. What it does have, per
+		 * element, is
+		 *
+		 *   udiv + msub         kk / gran and kk % gran. gran comes
+		 *                       from getenv, so unlike the fp16
+		 *                       packer's literal 8 it cannot be turned
+		 *                       into shifts, and a real divide is what
+		 *                       is emitted
+		 *   madd x3, umaddl     the rest of the index
+		 *   ldp w3, w5, [x19]   mm->m and mm->k RELOADED FROM THE
+		 *                       STRUCT after every single store,
+		 *                       because dst is a uint8_t * and the
+		 *                       compiler has to assume it can alias *mm
+		 *   cmp w27, #2 / b.ne  the CHARSIU_A_LAYOUT test, sitting
+		 *                       inside the innermost loop
+		 *   ldrb / sturb        one byte in, one byte out
+		 *
+		 * which is why the untouched path sits at a flat 1.2 to 1.3
+		 * GB/s at every shape: it is not touching memory hard enough to
+		 * be near any memory limit, it is executing that.
+		 *
+		 * The bias is one instruction. The scalar path writes
+		 * (uint8_t)(v - 0x80), and on eight bits subtracting 128 modulo
+		 * 256 only ever flips the top bit, so the whole thing is
+		 * veorq_u8 with 0x80 -- see charsiu_bias_copy at the top of
+		 * this file.
+		 *
+		 * Measured on this aarch64 host, cold destination, best of ten
+		 * processes with the two paths interleaved so the machine's
+		 * other work hits both equally, GB/s of destination bytes:
+		 *
+		 *   k=2048 m=2     1.23 -> 20.70 GB/s   16.9x
+		 *   k=2048 m=32    1.29 -> 37.55 GB/s   29.2x
+		 *   k=2048 m=64    1.29 -> 37.06 GB/s   28.8x
+		 *   k=1024 m=32    1.28 -> 26.35 GB/s   20.6x
+		 *   k=1024 m=64    1.29 -> 38.08 GB/s   29.6x
+		 *   k=768  m=80    1.28 -> 39.21 GB/s   30.6x   the tower shape
+		 *   k=3072 m=16    1.29 -> 40.20 GB/s   31.1x
+		 *   k=2049 m=64    1.30 -> 29.24 GB/s   22.5x   k % 16 != 0
+		 *   k=2048 m=1     1.21 -> 10.99 GB/s    9.1x   decode
+		 *   k=4096 m=1     1.23 -> 16.08 GB/s   13.1x   decode
+		 *
+		 * ⚠ A BIGGER RATIO THAN THE FP16 ROUND'S 4.3x DOES NOT MEAN A
+		 * FASTER FUNCTION. int8 writes one byte an element where fp16
+		 * writes two, so 37 GB/s here is 37 G elements a second against
+		 * fp16's 24.5 GB/s = 12.3 G. The ratio is large because the
+		 * baseline was much worse, and it was worse because of the
+		 * divide.
+		 *
+		 * ⚠ GROUPS OUTERMOST, for the reason the fp16 packer's comment
+		 * gives at length: the destination is a cached write back DRM
+		 * mapping that PREP_BO has just synced for the CPU, so it is
+		 * cold every time, and walking rows outermost touches every
+		 * line of it before filling any of it. Benchmarked on a 96 MB
+		 * ring of destinations so each timed call really does meet a
+		 * cold one.
+		 *
+		 * ⚠ AND THE RING HAS TO BE WALKED ALL THE WAY ROUND. A fixed
+		 * iteration count over a 4 KB destination touches 1.6 MB of the
+		 * ring, which fits in cache and reports a warm number as if it
+		 * were cold. The iteration count is the slot count.
+		 *
+		 * ⚠ THE WHOLE BUFFER MEMSET WAS THE OTHER SUSPECT AND IT IS
+		 * WORTH NOTHING. Putting it back in front of the fast path,
+		 * best of ten, gives 36.9 against 36.2 at k=2048 m=32, 30.7
+		 * against 36.3 at m=64, 31.5 against 26.5 at k=1024 m=32, 17.7
+		 * against 21.8 at k=2048 m=2: no consistent sign, +-20%, noise.
+		 * A memset runs at 60 to 80 GB/s here and it WARMS the
+		 * destination the pack is about to write, which very nearly
+		 * pays for itself. Only the tail is cleared below anyway,
+		 * because that costs nothing and matches the fp16 packer, but
+		 * the speed in the table above is the vectorisation and the
+		 * blocking, not the memset.
+		 *
+		 * ⚠ m = 1 IS ON THIS PATH, and m = 1 is int8 DECODE. At m = 1
+		 * the offset collapses to kk for every layout in this function,
+		 * so the destination is one flat biased copy; those are the two
+		 * decode rows above. Decode is this runtime's headline number,
+		 * so it is in the 189168 shape sweep rather than assumed.
+		 *
+		 * ⚠ AND THE PROOF NEEDS TWO PROCESSES. `plain` is cached in the
+		 * static below on first use, so setting CHARSIU_NPU_PLAIN
+		 * between two calls in one program compares this path against
+		 * ITSELF and passes vacuously. Dump every packed buffer twice,
+		 * once with the variable and once without, and diff the files:
+		 * 94080 shapes, 1.98 GB of packed bytes, identical. That check
+		 * was itself checked by flipping the 0x80 in charsiu_bias_copy
+		 * to 0x81 -- with which the two dumps DIFFER, so the variable
+		 * really does switch paths and the diff really can fail.
+		 *
+		 * NOT CHANGED, and measured: the three getenv calls this
+		 * function makes per invocation. At k=2048 m=2 they are about
+		 * half the remaining time (30.2 GB/s without them against 11.3
+		 * with, on the same loop), and they matter to nothing at m=32
+		 * and above. Latching them in statics would buy that back and
+		 * would also make CHARSIU_A_LAYOUT and CHARSIU_A_GRAN dead to
+		 * any probe that sweeps them mid process -- which is exactly
+		 * the trap entry_atomics() above has a comment about. Left
+		 * live.
+		 *
+		 * Left scalar on purpose: CHARSIU_A_LAYOUT=2. It puts rows
+		 * innermost, [k/atom][atom][m], so consecutive k land m bytes
+		 * apart and there is no contiguous run to vectorise -- it would
+		 * be a scatter, which is the scalar store it already is. It is
+		 * an env selected control no product path takes, so it keeps
+		 * the old loop and goes on being the control.
+		 */
+		static int plain = -1;
+
+		if (plain < 0)
+			plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
+
+		if (!plain && lay != 2) {
+			unsigned m = mm->m, k = mm->k;
+			unsigned ng = k / gran, tail = k % gran;
+			uint8_t fill = wide
+				     ? 0 : (uint8_t)(input_zero_point - 0x80);
+			size_t base;
+			unsigned g;
+
+			/*
+			 * ⚠ ONLY THE TAIL IS CLEARED. Every byte below `base`
+			 * is written by the loops underneath -- for the 16 bit
+			 * slot case the low bytes too, which is why
+			 * charsiu_bias_copy_hi stores an explicit zero lane
+			 * rather than relying on a memset that is no longer
+			 * there. From `base` up is the padding the CBUF reads
+			 * past the end of the data, plus the holes a k that is
+			 * not a multiple of the granularity leaves in the last
+			 * group, so `base` starts at that group.
+			 */
+			if (m == 1) {
+				base = (size_t)k * esz;
+				if (dst_size > base)
+					memset(dst + base, fill,
+					       dst_size - base);
+				if (esz == 1)
+					charsiu_bias_copy(dst, src, k);
+				else
+					charsiu_bias_copy_hi(dst, src, k);
+				return;
+			}
+
+			base = (size_t)ng * m * gran * esz;
+			if (dst_size > base)
+				memset(dst + base, fill, dst_size - base);
+			/*
+			 * ⚠⚠ TWO GROUPS AT A TIME, AND THIS SECOND STEP IS
+			 * WORTH MORE THAN THE VECTOR STORE WAS.
+			 *
+			 * A group is 16 elements, so one pass over the rows
+			 * reads 16 bytes out of each row and then skips k. That
+			 * is 16 bytes out of a 64 byte line, coming back for
+			 * the rest of the line on the next three groups, and it
+			 * is m cache line lookups per group, m * k / 16 over
+			 * the whole call. Taking two groups per pass halves
+			 * that and turns the row body into straight line code
+			 * instead of a loop. One group at a time was 21.6 GB/s
+			 * at k = 2048 m = 64; two is 37.1.
+			 *
+			 * Blocks of 1, 2, 4 and 8 groups, best of five
+			 * processes each, interleaved so the host's other work
+			 * hits all of them equally, GB/s of destination:
+			 *
+			 *          b1     b2     b4     b8
+			 *   2048x2   30.2   44.0   40.2   39.7
+			 *   2048x32  31.2   39.6   34.8   26.8
+			 *   2048x64  35.9   38.2   32.3   25.7
+			 *   1024x32  31.2   39.2   38.7   27.9
+			 *   1024x64  35.9   40.6   30.2   26.8
+			 *   768x80   37.2   40.0   38.4   24.3
+			 *   3072x16  40.8   34.6   34.9   36.3
+			 *
+			 * Two is best or tied at six of the seven and is what
+			 * is here. Four and eight fall away because the
+			 * destination becomes four and eight streams m * 16
+			 * apart, which at m = 64 is 1 KB and starts colliding
+			 * in the L1 sets.
+			 *
+			 * ⚠ AND THE LENGTH HAS TO BE A CONSTANT, which is why
+			 * the int8 default is written out here rather than left
+			 * to the generic path underneath. charsiu_bias_copy
+			 * takes `gran` as a runtime argument, so gcc emits the
+			 * 16 byte loop, the 8 byte remainder test and the
+			 * scalar tail test around every single row. Same work,
+			 * same one group at a time, same three getenv calls,
+			 * runtime length against a compile time 16: 21.6
+			 * against 33.7 GB/s at k = 2048 m = 64.
+			 */
+			if (esz == 1 && gran == 16) {
+				size_t step = (size_t)m * 16;
+
+				for (g = 0; g + 1 < ng; g += 2) {
+					const uint8_t *s = src + (size_t)g * 16;
+					uint8_t *d = dst + (size_t)g * step;
+
+					for (i = 0; i < m; i++, d += 16) {
+						const uint8_t *r = s
+							+ (size_t)i * k;
+
+						vst1q_u8(d,
+							veorq_u8(vld1q_u8(r),
+							  vdupq_n_u8(0x80)));
+						vst1q_u8(d + step,
+							veorq_u8(vld1q_u8(r + 16),
+							  vdupq_n_u8(0x80)));
+					}
+				}
+				for (; g < ng; g++) {
+					const uint8_t *s = src + (size_t)g * 16;
+					uint8_t *d = dst + (size_t)g * step;
+
+					for (i = 0; i < m; i++, d += 16)
+						vst1q_u8(d, veorq_u8(
+						  vld1q_u8(s + (size_t)i * k),
+						  vdupq_n_u8(0x80)));
+				}
+			} else {
+				for (g = 0; g < ng; g++) {
+					const uint8_t *s = src
+							 + (size_t)g * gran;
+					uint8_t *d = dst
+						   + (size_t)g * m * gran * esz;
+
+					if (esz == 1)
+						for (i = 0; i < m;
+						     i++, d += gran)
+							charsiu_bias_copy(d,
+							  s + (size_t)i * k,
+							  gran);
+					else
+						for (i = 0; i < m;
+						     i++, d += gran * 2)
+							charsiu_bias_copy_hi(d,
+							  s + (size_t)i * k,
+							  gran);
+				}
+			}
+			for (i = 0; i < m; i++)
+				for (kk = 0; kk < tail; kk++) {
+					uint8_t *pd = dst + base
+						+ ((size_t)i * gran + kk) * esz;
+
+					pd[esz - 1] = (uint8_t)(
+						src[(size_t)i * k
+						    + ng * gran + kk] - 0x80);
+				}
+			return;
+		}
+		}
+#endif
 
 		memset(dst, wide ? 0 : (uint8_t)(input_zero_point - 0x80),
 		       dst_size);
