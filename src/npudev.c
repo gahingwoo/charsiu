@@ -664,6 +664,15 @@ struct charsiu_npu {
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
 	int kfit;
+	/*
+	 * ⚠⚠ WHETHER KFIT COULD FIRE AT ALL, which is not the same question
+	 * as whether it helped. The `ks--` below needs a REMAINDER: a model
+	 * whose every K is a multiple of kmax has none, so KFIT leaves the
+	 * dispatch plan byte for byte identical and any measured difference
+	 * belongs to the measurement. A board round scored two such models as
+	 * losses and would have kept the switch off for it.
+	 */
+	unsigned kfit_hits, kfit_seen;
 	/* one message per REASON; the pointer identifies it, see whine() */
 	const char *whined[8];
 	unsigned n_whined;
@@ -1623,6 +1632,10 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"N=2048 is the smallest and trips on a 1 ms hiccup\n",
 			g->slow_n, g->submits, g->min_gbs, g->slow_worst,
 			g->slow_worst_k, g->slow_worst_n);
+	if (g->kfit)
+		fprintf(stderr,
+			"charsiu NPU: KFIT narrowed %u of %u staged tensors\n",
+			g->kfit_hits, g->kfit_seen);
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -2054,8 +2067,13 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	ns = (unsigned)((e_n_npu + g->nmax - 1) / g->nmax);
 	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
 	/* the last slice absorbs the remainder rather than being it */
-	if (g->kfit && ks > 1 && (t->k % g->kmax) && !tensor_grouped(g, t))
-		ks--;
+	if (g->kfit) {
+		g->kfit_seen++;
+		if (ks > 1 && (t->k % g->kmax) && !tensor_grouped(g, t)) {
+			ks--;
+			g->kfit_hits++;
+		}
+	}
 	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
 		return -1;

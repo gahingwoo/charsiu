@@ -271,7 +271,8 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    run 8
    REP=${KFIT_REPEAT:-3}
    nk=0; nchg=0; ndead=0; nslow=0
-   printf '  %-26s %8s %8s %8s  %s\n' model kfit=off kfit=on delta text
+   : >"$OUT/.kfit_rows"
+   printf '  %-26s %8s %8s %8s %9s  %s\n' model kfit=off kfit=on delta narrowed text
    for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
 	nk=$((nk + 1))
@@ -302,6 +303,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    | sed 's/.*, //; s/ tok.s//' | tr '\n' ' ')
 		if [ "$arm" = off ]; then rates_off=$rr; else rates_on=$rr; fi
 	done
+	# ⚠⚠ DID THE SWITCH DO ANYTHING AT ALL. `ks--` needs a REMAINDER, so on
+	# a model whose every K is a multiple of KMAX the dispatch plan is byte
+	# for byte identical and the delta measured is the MEASUREMENT, not
+	# KFIT. The first eight model round scored two such models as losses.
+	hits=$(grep -hoE 'KFIT narrowed [0-9]+ of [0-9]+' "$OUT/.kfit_on.err" \
+	    | head -1 | awk '{print $3"/"$5}')
+	[ -n "$hits" ] || hits="?"
 	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_on"
 	# ⚠ AN ARM THAT PRODUCED NO RATE DID NOT RUN, and that is a different
 	# failure from a text difference. Calling a crash "KFIT changes the
@@ -331,9 +339,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		t="⚠ DIFFERS"
 		nchg=$((nchg + 1))
 	fi
-	printf '  %-26s %8s %8s %8s  %s\n' "$b" "$bo" "$bn" "$d" "$t"
+	printf '  %-26s %8s %8s %8s %9s  %s\n' "$b" "$bo" "$bn" "$d" "$hits" "$t"
 	printf '      off: %s\n      on : %s\n' "$rates_off" "$rates_on"
 	[ "$t" = same ] || diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'
+	printf '%s %s %s %s\n' "$b" "${hits%%/*}" "$bo" "$bn" >>"$OUT/.kfit_rows"
 	nslow=$((nslow + $(awk -v a="$bo" -v b="$bn" 'BEGIN{print ((b-a)/a*100 < -1.0)?1:0}')))
    done
    wedged "phase 8" && break
@@ -345,14 +354,55 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    elif [ "$nchg" -gt 0 ]; then
 	bad "$nchg of $nk model(s) answer differently under KFIT. It is a"
 	printf '     slicing change and must not move a token: keep it off.\n'
-   elif [ "$ndead" -gt 0 ]; then
-	printf '  – %s model(s) never generated; the rest are above.\n' "$ndead"
-   elif [ "$nslow" -gt 0 ]; then
-	ok "text identical on $nk of $nk, but $nslow lost more than the 1%%"
-	printf '     noise band. Not free, so it stays a switch.\n'
    else
-	ok "text identical on $nk of $nk and nothing slower than the noise"
-	printf '     band. That is the evidence the default was waiting for.\n'
+	ok "text identical on $((nk - ndead)) of $((nk - ndead)) -- the switch"
+	printf '     does not change an answer. Speed is a separate question:\n\n'
+	# ⚠⚠ THE MODELS KFIT CANNOT TOUCH ARE THIS ROUND'"'"'S PLACEBO. `ks--`
+	# needs a remainder, so a model whose every K divides KMAX runs the
+	# identical dispatch plan in both arms and its delta is pure
+	# measurement -- arm order, thermals, page cache. Averaging those
+	# gives the round its own bias, for free, with no extra runs, and the
+	# fired models are then read against it rather than against zero.
+	# The first eight model round did not have this and scored two
+	# untouchable models as losses, which nearly kept the switch off.
+	awk '{ n=$1; h=$2+0; o=$3+0; u=$4+0; d=(u-o)/o*100
+	       if (h==0) { ib+=d; ic++; iname[ic]=n; idd[ic]=d }
+	       else      { fc++; fname[fc]=n; fdd[fc]=d; fh[fc]=h } }
+	     END {
+	       bias = ic ? ib/ic : 0
+	       # ⚠ AND THE PLACEBO SETS THE BAND, not a number typed in here.
+	       # The 1% figure came from repeats of ONE arm; what matters for
+	       # an off-vs-on delta is how far apart two arms land when the
+	       # switch provably did nothing, which is what these models are.
+	       for (i=1;i<=ic;i++) { e=idd[i]-bias; if (e<0) e=-e
+	                             if (e>band) band=e }
+	       if (band < 0.5) band = 0.5
+	       printf "     KFIT could not fire on %d model(s) -- the placebo:\n", ic
+	       for (i=1;i<=ic;i++) printf "       %-28s %+6.1f%%\n", iname[i], idd[i]
+	       if (ic) printf "       mean %+.1f%%, spread +/-%.1f%% <- the round%s own bias and\n       band, measured rather than assumed\n\n", bias, band, "'"'"'s"
+	       printf "     it narrowed slices on %d:\n", fc
+	       worst = 999; best = -999
+	       for (i=1;i<=fc;i++) { c = fdd[i] - bias
+	         if (c < worst) worst = c
+	         if (c > best)  best  = c
+	         printf "       %-28s %+6.1f%% raw   %+6.1f%% corrected   %d tensors\n", \
+	                fname[i], fdd[i], c, fh[i] }
+	       print ""
+	       if (fc == 0) {
+	         print "     ⚠ NOTHING FIRED ANYWHERE. This round says nothing about"
+	         print "       KFIT at all -- every model divides KMAX evenly. Add a"
+	         print "       model whose K does not, or change KMAX." }
+	       else if (ic == 0) {
+	         printf "     ⚠ NO PLACEBO -- every model fired, so the bias is\n"
+	         printf "       unmeasured and %+.1f%% .. %+.1f%% is raw.\n", worst, best }
+	       else if (worst < -band)
+	         printf "     ⚠ %+.1f%% after correction is past the placebo band of\n     %.1f%%. Not free: it stays a switch.\n", worst, band
+	       else if (best < band)
+	         printf "     nothing loses past the %.1f%% band -- but nothing WINS past\n     it either, so this buys nothing. Leave it off.\n", band
+	       else
+	         printf "     nothing loses past the %.1f%% band and the best is %+.1f%%.\n     That is the evidence the default was waiting for.\n", band, best
+	     }' "$OUT/.kfit_rows"
+	[ "$ndead" = 0 ] || printf '\n  – %s model(s) never generated; see above.\n' "$ndead"
    fi
    ;;
 esac
