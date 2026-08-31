@@ -24,7 +24,7 @@
 #   7  the scoreboard           against Rockchip, REPEAT=3 because one reading
 #                               of this table has a 25% spread
 #   8  CHARSIU_NPU_KFIT         three arms: off / wide buffers only / on
-#   9  where TTFT goes           the five-way split of a batched matmul, and
+#   9  where TTFT goes           the five-way split, and the pooled read back
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -423,20 +423,49 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    P9=${P9% }
    printf '  prompt %s words, generation held to 4 tokens\n' \
        "$(printf '%s' "$P9" | wc -w)"
-   n9=0; nmiss=0
+   # ⚠⚠ TWO ARMS, because the read back is now split across the pool and the
+   # HOST CANNOT PRICE IT. With no /dev/accel read_rows never runs at all, so a
+   # desk comparison of the two arms is two identical serial runs agreeing with
+   # each other -- which looks exactly like a verified parallelisation.
+   #
+   # Rows are disjoint in Y, so the two arms must produce the SAME TEXT. A
+   # difference is not a performance result, it is the parallelisation being
+   # wrong, and it is checked before the timing is read.
+   n9=0; nmiss=0; ntx=0
    for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
 	n9=$((n9 + 1))
 	b=$(basename "$M" .gguf)
-	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-	    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
-	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-	    "$BIN/charsiu_run" "$M" -p "$P9" -n 4 --ignore-eos \
-	    >"$OUT/.ttft_out" 2>"$OUT/.ttft_err"
-	# the prompt clause carries TTFT; it is on the bracketed stdout line
+	for arm in serial pool; do
+		case $arm in
+		serial) E=CHARSIU_NPU_SERIAL_READ=1 ;;
+		*)      E=CHARSIU_READ_DUMMY=1 ;;
+		esac
+		# shellcheck disable=SC2086
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
+		    "$BIN/charsiu_run" "$M" -p "$P9" -n 4 --ignore-eos \
+		    >"$OUT/.ttft_$arm" 2>"$OUT/.ttft_$arm.err"
+		eval "t_$arm=\$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' \
+		    '$OUT/.ttft_$arm' | head -1 | grep -oE '[0-9.]+ ms')"
+	done
+	cp "$OUT/.ttft_pool" "$OUT/.ttft_out"
+	cp "$OUT/.ttft_pool.err" "$OUT/.ttft_err"
 	tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
 	    "$OUT/.ttft_out" "$OUT/.ttft_err" | head -1)
 	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
+	sed -i 's/^\[.*//' "$OUT/.ttft_serial" "$OUT/.ttft_pool"
+	if cmp -s "$OUT/.ttft_serial" "$OUT/.ttft_pool"; then
+		printf '      read back: serial %s   pooled %s   (text same)\n' \
+		    "${t_serial:-?}" "${t_pool:-?}"
+	else
+		bad "$b: the pooled read back CHANGES THE TEXT"
+		printf '     rows are disjoint in Y, so this is the split being\n'
+		printf '     wrong, not a number to weigh against a speed-up.\n'
+		diff "$OUT/.ttft_serial" "$OUT/.ttft_pool" | head -4 | sed 's/^/       /'
+		ntx=$((ntx + 1))
+	fi
 	if grep -q "charsiu NPU batched:" "$OUT/.ttft_err"; then
 		# from the header until the first line that is not part of the
 		# block, so the tail line is included when it is there and
@@ -461,6 +490,9 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    wedged "phase 9" && break
    if [ "$n9" = 0 ]; then
 	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   elif [ "$ntx" -gt 0 ]; then
+	printf '  %s model(s) changed text between the read arms; nothing above\n' "$ntx"
+	printf '  is a speed result until that is fixed.\n'
    elif [ "$nmiss" = 0 ]; then
 	ok "every model printed its split. The row to act on is the last one:"
 	printf '     if `other` is larger than any named share, the next thing to\n'

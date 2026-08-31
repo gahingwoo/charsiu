@@ -709,6 +709,12 @@ struct charsiu_npu {
 	unsigned n_whined;
 	int serialpack;
 	/*
+	 * The control for the read back going wide. It is a parallelisation
+	 * over disjoint rows and nothing else, so it must not move a single
+	 * token -- and if it ever does, that is the finding.
+	 */
+	int serialread;
+	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
 	 * 0 is the hardware doing all of it, which is every round before 371.
 	 */
@@ -1302,6 +1308,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
+	g->serialread = getenv("CHARSIU_NPU_SERIAL_READ") != NULL;
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -3251,6 +3258,173 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 }
 
 /*
+ * ⚠⚠ ONE ROW IS A UNIT OF WORK, AND THE READ BACK NEVER USED THAT. Reading the
+ * accumulators is 26% of a batched matmul measured across eight models on the
+ * board -- 11.0 s of Phi-3.5's 33.8 s -- and it ran on one core while the pool
+ * that llama_state_new starts sat idle. Before this, npudev.c contained exactly
+ * one charsiu_parallel_for, on the weight pack at staging, and none on either
+ * of the two hot batched loops.
+ *
+ * Rows are safe to split and slices are not: for a fixed slot every row writes
+ * Y + r * n + s->n0, which is disjoint, while two K slices of the SAME slot
+ * accumulate into the same elements and must stay ordered. So the slice loop
+ * stays serial and the rows inside it go wide.
+ *
+ * ⚠ firstw IS INVARIANT ACROSS THE ROWS and has to be, which is why it is
+ * passed in rather than recomputed here. g->bseen is only set after the whole
+ * row loop, so every row of a slot sees the same flag; reading it per row from
+ * threads would add a race on top of a correctness bug.
+ *
+ * ⚠ THE BODY BELOW IS THE ORIGINAL LOOP BODY VERBATIM, indentation included.
+ * It is macro heavy, and the #undef block at its end is why: re-indenting it
+ * broke the directives, and so did closing the function on the same line as
+ * the last one.
+ */
+struct read_rows {
+	struct charsiu_npu *g;
+	const struct npu_entry *e;
+	const struct npu_slot *s;
+	const float *fo;
+	const int32_t *io;
+	float *Y;
+	unsigned m, sn, ki;
+	int grp, firstw;
+};
+
+static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct read_rows *c = ctx;
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	const float *fo = c->fo;
+	const int32_t *io = c->io;
+	float *Y = c->Y;
+	unsigned m = c->m, sn = c->sn, ki = c->ki;
+	int grp = c->grp, firstw = c->firstw;
+
+	(void)m; (void)ki; (void)grp; (void)io; (void)fo;
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
+					const uint32_t *mp = g->bmap
+							  + (size_t)r * g->bmap_n4;
+					float *yr = Y + (size_t)r * e->t->n
+						  + s->n0;
+					unsigned n4 = sn / 4, j;
+
+					/*
+					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
+					 * tail is whatever a slice's width
+					 * leaves over, and it recomputes its
+					 * own base rather than reading a table
+					 * entry that may not exist.
+					 */
+/*
+					 * ⚠ THE BRANCH IS OUTSIDE THE LOOP, and
+					 * it cannot be a multiply by zero: Y is
+					 * the caller's buffer and a bit pattern
+					 * in untouched memory can be a NaN,
+					 * which times zero is a NaN and not a
+					 * zero.
+					 *
+					 * ⚠⚠ AND A NEON FORM OF THIS WAS
+					 * WRITTEN, MEASURED AND TAKEN OUT.
+					 *
+					 * The four are one vector, so a run is
+					 * vld1q from one index, vmulq, vst1q,
+					 * and it was bit identical to this --
+					 * checked, including the rounding,
+					 * because the C here is a multiply then
+					 * an add and an fmla rounds once where
+					 * it rounds twice. On this toolchain
+					 * mul-then-add differs from the C in 0
+					 * of a million and fmla in 227529, so
+					 * the C is not contracted and the
+					 * vector form matched.
+					 *
+					 * The board moved by NOTHING: read was
+					 * 223, 320, 555 ms at m of 32, 48 and
+					 * 80 before it and 229, 337, 580 after.
+					 *
+					 * ⚠ AND THE ARITHMETIC SAYS WHY, which
+					 * is the part worth keeping. The gather
+					 * moves about 403 MB at m = 32 and 1007
+					 * at m = 80 -- Y once per K slice, read
+					 * and written -- in 229 and 580 ms,
+					 * which is 1.76 and 1.74 GB/s, the same
+					 * rate at both. A run is 16 BYTES and a
+					 * cache line is 64, and the runs are
+					 * scattered, so the DRAM sees four
+					 * times that: about 7 GB/s against this
+					 * board's 9.4 roof, 75% of it.
+					 *
+					 * It was never instruction bound.
+					 * Fewer instructions cannot help and
+					 * the only lever left is fewer BYTES:
+					 * walking the source sequentially and
+					 * scattering into Y would use whole
+					 * lines instead of a quarter of each.
+					 */
+#define GATHER4(OP, VAL)                                                     \
+					for (j = 0; j < n4; j++) {           \
+						float *yp = yr + j * 4;      \
+						VAL;                         \
+						yp[0] SC_##OP v0;            \
+						yp[1] SC_##OP v1;            \
+						yp[2] SC_##OP v2;            \
+						yp[3] SC_##OP v3;            \
+					}
+#define SC_ASSIGN  =
+#define SC_ADD     +=
+#define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
+	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
+		   v2 = fp[2]*cp[2], v3 = fp[3]*cp[3]
+#define W4   const float *fp = fo + mp[j];                                   \
+	     float v0 = fp[0], v1 = fp[1], v2 = fp[2], v3 = fp[3]
+#define I8   const int32_t *ip = io + mp[j];                                 \
+	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
+		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
+					if (g->w4 && grp) {
+						const float *sc = s->sc;
+
+						if (firstw) { GATHER4(ASSIGN, W4G) }
+						else        { GATHER4(ADD, W4G) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4] * sc[j];
+
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
+						}
+					} else if (g->w4) {
+						if (firstw) { GATHER4(ASSIGN, W4) }
+						else        { GATHER4(ADD, W4) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4];
+
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
+						}
+					} else {
+						float d1 = g->bd1[(size_t)ki * m + r];
+
+						if (firstw) { GATHER4(ASSIGN, I8) }
+						else        { GATHER4(ADD, I8) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = (float)io[mp[j / 4] + j % 4] * d1;
+
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
+						}
+					}
+#undef GATHER4
+#undef SC_ASSIGN
+#undef SC_ADD
+#undef W4G
+#undef W4
+#undef I8
+	}
+}
+
+/*
  * ⚠ THE BODY IS A STATIC INNER SO THE WALL CLOCK CANNOT BE FORGOTTEN. This
  * function has eleven return points and wrapping each of them is a bug waiting
  * for the twelfth. See bwall_us.
@@ -3704,125 +3878,17 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				 * instead cost exactly one tensor: 3585 rows of
 				 * 3616.
 				 */
-				for (unsigned r = 0; r < m; r++) {
-					const uint32_t *mp = g->bmap
-							  + (size_t)r * g->bmap_n4;
-					float *yr = Y + (size_t)r * e->t->n
-						  + s->n0;
-					unsigned n4 = sn / 4, j;
+				{
 					unsigned ni = s->n0 / g->nmax;
-					int firstw = !g->bseen[ni];
+					struct read_rows rr = {
+						g, e, s, fo, io, Y, m, sn, ki,
+						grp, !g->bseen[ni]
+					};
 
-					/*
-					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
-					 * tail is whatever a slice's width
-					 * leaves over, and it recomputes its
-					 * own base rather than reading a table
-					 * entry that may not exist.
-					 */
-/*
-					 * ⚠ THE BRANCH IS OUTSIDE THE LOOP, and
-					 * it cannot be a multiply by zero: Y is
-					 * the caller's buffer and a bit pattern
-					 * in untouched memory can be a NaN,
-					 * which times zero is a NaN and not a
-					 * zero.
-					 *
-					 * ⚠⚠ AND A NEON FORM OF THIS WAS
-					 * WRITTEN, MEASURED AND TAKEN OUT.
-					 *
-					 * The four are one vector, so a run is
-					 * vld1q from one index, vmulq, vst1q,
-					 * and it was bit identical to this --
-					 * checked, including the rounding,
-					 * because the C here is a multiply then
-					 * an add and an fmla rounds once where
-					 * it rounds twice. On this toolchain
-					 * mul-then-add differs from the C in 0
-					 * of a million and fmla in 227529, so
-					 * the C is not contracted and the
-					 * vector form matched.
-					 *
-					 * The board moved by NOTHING: read was
-					 * 223, 320, 555 ms at m of 32, 48 and
-					 * 80 before it and 229, 337, 580 after.
-					 *
-					 * ⚠ AND THE ARITHMETIC SAYS WHY, which
-					 * is the part worth keeping. The gather
-					 * moves about 403 MB at m = 32 and 1007
-					 * at m = 80 -- Y once per K slice, read
-					 * and written -- in 229 and 580 ms,
-					 * which is 1.76 and 1.74 GB/s, the same
-					 * rate at both. A run is 16 BYTES and a
-					 * cache line is 64, and the runs are
-					 * scattered, so the DRAM sees four
-					 * times that: about 7 GB/s against this
-					 * board's 9.4 roof, 75% of it.
-					 *
-					 * It was never instruction bound.
-					 * Fewer instructions cannot help and
-					 * the only lever left is fewer BYTES:
-					 * walking the source sequentially and
-					 * scattering into Y would use whole
-					 * lines instead of a quarter of each.
-					 */
-#define GATHER4(OP, VAL)                                                     \
-					for (j = 0; j < n4; j++) {           \
-						float *yp = yr + j * 4;      \
-						VAL;                         \
-						yp[0] SC_##OP v0;            \
-						yp[1] SC_##OP v1;            \
-						yp[2] SC_##OP v2;            \
-						yp[3] SC_##OP v3;            \
-					}
-#define SC_ASSIGN  =
-#define SC_ADD     +=
-#define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
-	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
-		   v2 = fp[2]*cp[2], v3 = fp[3]*cp[3]
-#define W4   const float *fp = fo + mp[j];                                   \
-	     float v0 = fp[0], v1 = fp[1], v2 = fp[2], v3 = fp[3]
-#define I8   const int32_t *ip = io + mp[j];                                 \
-	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
-		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
-					if (g->w4 && grp) {
-						const float *sc = s->sc;
-
-						if (firstw) { GATHER4(ASSIGN, W4G) }
-						else        { GATHER4(ADD, W4G) }
-						for (j = n4 * 4; j < sn; j++) {
-							float v = fo[mp[j / 4] + j % 4] * sc[j];
-
-							if (firstw) yr[j] = v;
-							else        yr[j] += v;
-						}
-					} else if (g->w4) {
-						if (firstw) { GATHER4(ASSIGN, W4) }
-						else        { GATHER4(ADD, W4) }
-						for (j = n4 * 4; j < sn; j++) {
-							float v = fo[mp[j / 4] + j % 4];
-
-							if (firstw) yr[j] = v;
-							else        yr[j] += v;
-						}
-					} else {
-						float d1 = g->bd1[(size_t)ki * m + r];
-
-						if (firstw) { GATHER4(ASSIGN, I8) }
-						else        { GATHER4(ADD, I8) }
-						for (j = n4 * 4; j < sn; j++) {
-							float v = (float)io[mp[j / 4] + j % 4] * d1;
-
-							if (firstw) yr[j] = v;
-							else        yr[j] += v;
-						}
-					}
-#undef GATHER4
-#undef SC_ASSIGN
-#undef SC_ADD
-#undef W4G
-#undef W4
-#undef I8
+					if (g->serialread)
+						read_rows(&rr, 0, m);
+					else
+						charsiu_parallel_for(read_rows, &rr, m);
 				}
 				/* ⚠ AFTER the row loop: every row of this slot
 				 * shares the flag, and setting it inside would
