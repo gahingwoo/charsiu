@@ -47,14 +47,15 @@ one flag apart:
 **2.94x, and the two runs generate the same text word for word.** Prefill used
 to cost more per token than decode; it now costs a third of it.
 
-`llama_prefill_batch` runs the layer loop with n rows, batching the feed
-forward -- gate, up and down, 63% of the projection time -- and leaving q, k, v
-and o a row at a time. Rows are walked in order inside a layer because row r's
-attention reads the KV the rows before it wrote, and the head is not batched at
-all: a prompt needs logits for its last token and no other, so the widest
-projection in the model is skipped n - 1 times rather than made n times wider.
+`llama_prefill_batch` runs the layer loop with n rows, batching every
+projection -- q, k, v and o as well as gate, up and down. Rows are walked in
+order inside a layer because row r's attention reads the KV the rows before it
+wrote, and the head is not batched at all: a prompt needs logits for its last
+token and no other, so the widest projection in the model is skipped n - 1
+times rather than made n times wider.
 The prompt goes in chunks of 32, because the buffers scale with the batch and
-the probe's sweep flattens after 16.
+the probe's sweep flattens after 16. `CHARSIU_PREFILL_CHUNK` caps that, and the
+cap is rounded down to a width the hardware can express.
 
 ### The other three modalities, measured on the board 2026-08-28
 
@@ -1853,8 +1854,9 @@ above the 10.8 GB/s this board's DRAM roof was measured at. Either the roof is h
 for this access pattern or the stage timer is not charging the head everything it
 costs. The tokens are right either way, so this is a measurement question.
 
-The coefficient bound is still a guess and still unmeasured; `npu_gemm_test K N
---coef` walks it down. It is no longer in the way of anything.
+65536 elements is the default now, because it is what every board round has used;
+`CHARSIU_COEF_ELEMS=0` asks for `k*n`. The bound itself is still unmeasured;
+`npu_gemm_test K N --coef` walks it down. It is no longer in the way of anything.
 
 ## 2b. gemma3 runs the NPU at 6.16 GB/s where llama reaches 10.3
 
@@ -1865,7 +1867,9 @@ slice carries a ninth of a slice of work for a whole task's cost. 468 slices whe
 
 `CHARSIU_NPU_KFIT=1` gives the last slice the remainder instead, so 1152 is one slice.
 Ungrouped tensors only: a grouped tensor's scale gather reads one group per slice.
-Off by default, unrun.
+Off by default. The correctness half of the control below has run: the first run
+on the board overran three batched buffers, and with that fixed the tokens are
+identical on eight models. The speed half is still open.
 
 **Control**: the same prompt with and without it in one boot. Identical tokens is the
 correctness bar, since acc_out sums int32 across K slices and any split of the same K
@@ -1873,10 +1877,11 @@ has to give the same accumulator; slices and GB/s in the NPU report are the win.
 
 ## 3. Upstreaming
 
-- The driver is [PATCH v9](https://lore.kernel.org/all/cover.1787568658.git.gahing@gahingwoo.com/),
-  with an Acked-by on both dt-bindings, a Reviewed-by on both pmdomain patches and a
-  Tested-by on the two reset-race patches. v10 is tag collection and the git note that
-  v9's cover letter promised and did not carry.
+- The driver is [PATCH v11](https://lore.kernel.org/all/20260831081956.84871-1-gahing@gahingwoo.com/),
+  14 patches carrying thirteen review tags. v10 collected tags and added the git note
+  v9's cover letter promised; v11 changed no code at all -- it folds Igor Paunovic's
+  clocks-by-name patch in as 1/14 and drops the `prerequisite-patch-id:` trailer that
+  named it from outside, because the Sashiko CI cannot follow that trailer.
 - The Mesa side is [mesa!43804](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43804).
 
 ## What would make this stop

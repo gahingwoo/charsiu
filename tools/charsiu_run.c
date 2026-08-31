@@ -165,7 +165,7 @@ static void usage(void)
 "usage: charsiu_run MODEL.gguf [options]\n"
 "  -p TEXT       the prompt (default: a short one)\n"
 "  -f FILE       read the prompt from a file\n"
-"  --chat        wrap the prompt in the Llama 3 chat template\n"
+"  --chat        wrap the prompt in the chat template the file asks for\n"
 "  --sys TEXT    the system message, with --chat\n"
 "  -n N          how many tokens to generate (default 64)\n"
 "  -c N          context, in tokens (default: the model's training context)\n"

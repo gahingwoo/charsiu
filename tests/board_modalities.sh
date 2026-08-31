@@ -37,8 +37,8 @@ find_one() {
 	return 1
 }
 RUN=$(find_one charsiu_run) || { echo "charsiu_run not found" >&2; exit 1; }
-WSP=$(find_one charsiu_whisper) || { echo "charsiu_whisper not found -- update to dev" >&2; exit 1; }
-CLP=$(find_one charsiu_clip) || { echo "charsiu_clip not found -- update to dev" >&2; exit 1; }
+WSP=$(find_one charsiu_whisper) || { echo "charsiu_whisper not found" >&2; exit 1; }
+CLP=$(find_one charsiu_clip) || { echo "charsiu_clip not found" >&2; exit 1; }
 
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 [ -d "$MODELS" ] || MODELS=/opt/charsiu/models
