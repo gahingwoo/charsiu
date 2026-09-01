@@ -60,6 +60,16 @@ FAIL=0; SKIP=""; RAN=""
 # below so a log says what it measured.
 P=$(seq 1 32 | tr '\n' ' '); P=${P% }
 
+# ⚠⚠ AND THE LONG ONE TOO, FOR EXACTLY THE SAME REASON THE SHORT ONE IS
+# HERE. P9 was built inside phase 9's own case arm, so `board_verify.sh 10`
+# -- phase 10 alone, which is how a sweep gets run -- died on its first
+# model with "P9: parameter not set". The lesson from hoisting P was that a
+# prompt belongs to the ROUND and not to a phase, and P9 was written after
+# that and did not get it. set -u is what turned it into an error rather
+# than an empty prompt and a table of meaningless numbers.
+P9=$(i=1; while [ $i -le 256 ]; do printf '%d ' "$i"; i=$((i+1)); done)
+P9=${P9% }
+
 say() { printf '\n=========== %s ===========\n' "$*"; }
 bad() { printf '  ⚠⚠ %s\n' "$*"; FAIL=$((FAIL + 1)); }
 ok()  { printf '  ✓ %s\n' "$*"; }
@@ -421,8 +431,6 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # A long prompt, because a 32 word one spends more time loading than
    # prefilling and the split would be reading noise. -n 4 keeps generation out
    # of the way; TTFT is the number this phase is about.
-   P9=$(i=1; while [ $i -le 256 ]; do printf '%d ' "$i"; i=$((i+1)); done)
-   P9=${P9% }
    printf '  prompt %s words, generation held to 4 tokens\n' \
        "$(printf '%s' "$P9" | wc -w)"
    # ⚠⚠ TWO ARMS, because the read back is now split across the pool and the
