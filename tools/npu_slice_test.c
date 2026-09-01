@@ -97,9 +97,63 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * ⚠⚠ charsiu_act_set QUANTISES NOTHING. Its own header says so, and
+	 * npu_matvec reads a->q1 -- so without charsiu_act_q1 the reference is
+	 * computed from an activation that was never realised. The first
+	 * version of this file left it out and the board answered "1536 of 1536
+	 * channels wrong" at every KMAX, which the tool correctly reported as
+	 * ITS OWN fault and stopped on.
+	 */
+	for (r = 0; r < m; r++) {
+		charsiu_act_set(&act, X + (size_t)r * k, (int)k);
+		charsiu_act_q1(&act);
+		npu_matvec(&t, &act, Ycpu + (size_t)r * n, 0, n);
+	}
+
+	/*
+	 * ⚠ AND THE REFERENCE IS CHECKED BEFORE THE HARDWARE IS OPENED, on the
+	 * host, with no NPU in the room. A reference that is all zeros or all
+	 * one value compares against anything and is how a broken harness looks
+	 * exactly like a broken runtime. This is the half of the tool a desk can
+	 * actually verify, so it runs first and it runs everywhere.
+	 */
+	{
+		unsigned nz = 0, nd = 0;
+		float first = Ycpu[0];
+
+		for (size_t i = 0; i < (size_t)m * n; i++) {
+			if (Ycpu[i] != 0.0f)
+				nz++;
+			if (Ycpu[i] != first)
+				nd++;
+		}
+		printf("  reference: %u of %zu non-zero, %u differ from the first\n",
+		       nz, (size_t)m * n, nd);
+		if (nz == 0 || nd == 0) {
+			printf("  ⚠⚠ THE CPU REFERENCE IS DEGENERATE. Nothing below\n"
+			       "     would mean anything; this is the harness, not\n"
+			       "     the hardware.\n"
+			       "     npu_matvec reads a->q1, charsiu_act_set fills\n"
+			       "     nothing, and charsiu_act_q1 only fills it when\n"
+			       "     CHARSIU_NPU_QUANT=1 is set%s.\n",
+			       getenv("CHARSIU_NPU_QUANT") ? " -- and it IS set,"
+			       " so this is something else" : ", which it is NOT");
+			return 1;
+		}
+	}
+
+	/*
+	 * ⚠ THE HARDWARE IS OPENED HERE AND NOT EARLIER. Everything above is
+	 * CPU only, so a desk with no /dev/accel still runs the reference and
+	 * still catches a harness that cannot compute its own answer -- which
+	 * is exactly the bug this file shipped with, and the board found it
+	 * because the desk could not.
+	 */
 	g = charsiu_npu_open(k, n, 1);
 	if (!g) {
-		fprintf(stderr, "no /dev/accel/accel0\n");
+		fprintf(stderr, "no /dev/accel/accel0 -- the reference above is"
+			" still checked, the comparison is not\n");
 		return 1;
 	}
 	id = charsiu_npu_add(g, &t);
@@ -108,14 +162,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* the CPU answer, row by row, from the same quantised weights */
-	for (r = 0; r < m; r++) {
-		charsiu_act_set(&act, X + (size_t)r * k, (int)k);
-		npu_matvec(&t, &act, Ycpu + (size_t)r * n, 0, n);
-	}
-
 	/* ⚠ THE CONTROL FIRST: m=1 through the decode path on the same tensor */
 	charsiu_act_set(&act, X, (int)k);
+	if (charsiu_npu_needs_q1(g))
+		charsiu_act_q1(&act);
 	memset(Ynpu, 0, (size_t)n * sizeof(float));
 	if (charsiu_npu_matvec(g, id, &act, Ynpu)) {
 		printf("  ⚠ the m=1 control did not run at all\n");
