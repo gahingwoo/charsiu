@@ -108,6 +108,12 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+# ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
+# new data when it was the previous version of this file: `charsiu update dev`
+# had not taken, the output was byte identical to the round before, and the only
+# thing that gave it away was one word in a header nobody was checking. A stale
+# probe is a wasted board trip and it looks exactly like a result.
+echo "  script    $(cksum "$0" 2>/dev/null | cut -d" " -f1), $(wc -l <"$0") lines"
 echo "  prompt    $(printf '%s' "$P" | wc -w) words, no trailing space"
 echo "  ⚠ phase 7 sets the performance governor itself, as their protocol does."
 
@@ -834,7 +840,8 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    A13=${K_ARMS:-m80 m32}
    printf '  KMAX = W4_GROUP over %s, on the three models whose weights\n' "$KW"
    printf '  do not move across it. Batched against the token loop.\n'
-   printf '  arms: %s   (onedev = CHARSIU_NPU_ONEDEV=1, the core pair removed)\n' "$A13"
+   printf '  arms: %s\n' "$A13"
+   printf '        m80 = CHARSIU_PREFILL_CHUNK=80, m32 = 32, onedev = one core\n'
    n13=0
    for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
 	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
