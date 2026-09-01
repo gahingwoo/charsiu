@@ -751,8 +751,20 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 13) say "13. the wide K slice: does the CBUF pair fix make it agree with m = 1"
-   # ⚠ THE CAUSE IS FOUND AND FIXED; this phase is now the check on that fix
-   # rather than the hunt for it. regcmd.c emitted the non split CBUF pair
+   # ⚠ ONE CAUSE FOUND AND FIXED, ONE STILL OPEN, and this phase is what
+   # separated them. The CBUF fix bought 2048, which is now the shipped
+   # width for models that can take it. Above it the board says:
+   #
+   #     slice 2816   WRONG   Qwen2.5 at KMAX 3072, surf 88
+   #     slice 3072   right   gemma-3-1b at KMAX 3072, surf 96
+   #     slice 4096   WRONG   both, surf 128
+   #
+   # ⚠⚠ THAT IS NOT A SIZE THRESHOLD. 3072 is wider than 2816 and works, so
+   # whatever is wrong above 2048 is not "too big" and the next round should
+   # not be a bigger sweep of the same axis. K * M does not separate them
+   # either: 245760 works and 225280 does not.
+   #
+   # The old note, still true of the half that IS fixed: regcmd.c emitted the non split CBUF pair
    # unconditionally, and the vendor's own batched dispatches switch to the
    # split pair on K * M > 131072 -- 2048x64 and 4096x32 are its widest non
    # split, both exactly 131072. Our shipped setting is 1024 x 80 = 81920,

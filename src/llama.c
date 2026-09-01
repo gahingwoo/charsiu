@@ -2764,7 +2764,25 @@ static uint32_t state_widest(const struct llama_model *m)
  */
 static void llama_auto_kmax(const struct llama_model *m)
 {
-	static const unsigned cand[] = { 4096, 2048 };
+	/*
+	 * ⚠ 2048 ONLY, AND 4096 IS DELIBERATELY NOT HERE. Phase 13 put the
+	 * batched path against the model's own token loop at 1024, 2048, 3072
+	 * and 4096, on the three models whose K divides none of them -- so the
+	 * quantiser emits the same bytes across the sweep and only the slicing
+	 * moves. 2048 agrees on all three. Above it:
+	 *
+	 *   slice 2816   WRONG   (Qwen2.5 at KMAX 3072, surf 88)
+	 *   slice 3072   right   (gemma-3-1b at KMAX 3072, surf 96)
+	 *   slice 4096   WRONG   (both, surf 128)
+	 *
+	 * which is not a size threshold -- 3072 is larger than 2816 and works.
+	 * Something else is wrong above 2048 and it has not been found, so the
+	 * candidate list stops at the width the board has actually verified.
+	 * CHARSIU_NPU_KMAX by hand still reaches anything.
+	 *
+	 * 2048 is also what the vendor uses for 81% of its own int4 dispatches.
+	 */
+	static const unsigned cand[] = { 2048 };
 	unsigned base = 1024, i, j;
 	uint64_t k[8];
 	char buf[16];
@@ -2790,8 +2808,12 @@ static void llama_auto_kmax(const struct llama_model *m)
 	setenv("CHARSIU_NPU_W4_GROUP", "1024", 1);
 
 	/*
-	 * ⚠⚠ AND THE WIDENING ITSELF IS OFF UNTIL IT IS UNDERSTOOD.
-	 * CHARSIU_NPU_KMAX_AUTO=1 asks for it.
+	 * ⚠ THE WIDENING IS ON, AND WHAT TURNED IT ON WAS ONE PHASE. Phase 13
+	 * compares the batched path against the model's own TOKEN LOOP at each
+	 * width -- phases 10 and 12 compare batched against batched and are
+	 * blind to a batched-path fault by construction, which is how a wide
+	 * slice was called "identical" on three models and shipped wrong.
+	 * CHARSIU_NPU_KMAX_AUTO=0 turns it off.
 	 *
 	 * The reasoning below is sound as far as the QUANTISER goes and the
 	 * board agreed with it: at 1024, 2048 and 4096 the three models whose
@@ -2806,8 +2828,12 @@ static void llama_auto_kmax(const struct llama_model *m)
 	 * a K slice wider than 1024. Until that is found, the widest safe slice
 	 * is the one the board has always run.
 	 */
-	if (!getenv("CHARSIU_NPU_KMAX_AUTO"))
-		return;
+	{
+		const char *a = getenv("CHARSIU_NPU_KMAX_AUTO");
+
+		if (a && *a == '0')
+			return;
+	}
 
 	k[nk++] = m->n_embd;
 	if (m->n_ff)
