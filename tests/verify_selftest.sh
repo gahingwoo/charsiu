@@ -44,6 +44,33 @@ for ph in $PHASES; do
 	fi
 done
 
+# ⚠⚠ AND DOES ANYTHING STILL PIN WHAT THE PRODUCT NOW CHOOSES?
+#
+# board_text_all.sh and board_vendor.sh both set CHARSIU_NPU_KMAX=1024 under a
+# comment claiming it was "the int4 environment the board actually runs". That
+# stopped being true when llama_auto_kmax landed, and nothing said so: a round
+# reported nine of nine models correct and a scoreboard reported a number, and
+# BOTH were measuring a configuration that no longer ships -- the scoreboard
+# scoring us lower than what we ship. It is the guard-in-the-probe-not-the-
+# product mistake, and this tree has already shipped a wrong answer behind it.
+#
+# A probe that SWEEPS an axis has to pin it. A probe that VERIFIES or SCORES the
+# product must not. Only the second kind is checked here, by name, because only
+# that kind is wrong to pin.
+for f in board_text_all.sh board_vendor.sh; do
+	[ -r "$HERE/$f" ] || continue
+	if grep -qE '^[^#]*CHARSIU_NPU_KMAX=' "$HERE/$f"; then
+		printf '  !! %s pins CHARSIU_NPU_KMAX; it verifies or scores the
+' "$f"
+		printf '     product, so it has to run what the product chooses.
+'
+		fail=$((fail + 1))
+	else
+		printf '  ok %s runs the shipped K slice width
+' "$f"
+	fi
+done
+
 if [ "$fail" -gt 0 ]; then
 	printf '\n%s phase(s) cannot be run on their own.\n' "$fail"
 	exit 1

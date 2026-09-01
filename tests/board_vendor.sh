@@ -160,8 +160,14 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		#
 		# `env` takes them as arguments, so an expanded one works.
 		# shellcheck disable=SC2086
+		# ⚠⚠ KMAX IS NOT PINNED, AND THAT IS THE POINT. This set
+		# CHARSIU_NPU_KMAX=1024 and CHARSIU_NPU_W4_GROUP=1024 until
+		# llama_auto_kmax landed, and pinning them turns it off -- so
+		# the scoreboard would have scored a configuration nobody
+		# ships, and scored it LOWER than what does. A probe that
+		# sweeps an axis pins it; a probe that scores the product must
+		# not.
 		OUT=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-		      CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 		      $PRICE_ENV \
 		      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \

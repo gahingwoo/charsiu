@@ -69,9 +69,20 @@ trap 'rm -rf "$T"' EXIT
 CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
 PROMPT="$(seq 1 32 | tr '\n' ' ')"
 PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
+# ⚠⚠ KMAX IS NOT PINNED HERE, AND THAT IS THE POINT. This file used to set
+# CHARSIU_NPU_KMAX=1024 and CHARSIU_NPU_W4_GROUP=1024 under a comment claiming
+# it was "the int4 environment the board actually runs". That stopped being
+# true when llama_auto_kmax landed: the runtime now picks the widest K slice
+# under which no tensor's grouping changes, which is 4096 on gemma-3-1b and
+# 1024 on Phi-3.5, and pinning 1024 turns that off.
+#
+# A probe that SWEEPS an axis has to pin it. A probe that VERIFIES or SCORES
+# the product must not, or it verifies a configuration nobody ships -- which is
+# the guard-in-the-probe-not-the-product mistake this tree has already shipped
+# a wrong answer behind. Phases 8, 9, 10 and 11 pin it because they are
+# sweeping. This one does not, because it is the scoreboard.
 # the int4 environment the board actually runs, same as board_vendor.sh
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "binary   $RUN"
