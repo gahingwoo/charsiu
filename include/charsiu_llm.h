@@ -727,6 +727,10 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
  * packed once and the other two reuse it. Returns 0 with all three Y filled,
  * or -1 having filled none of them, so the caller falls back for all three.
  */
+/* the general form: up to 8 projections of one input, packed once a chunk */
+int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *const *ws, unsigned nw,
+		       const float *X, unsigned m, float *const *Ys);
 int charsiu_pool_rows3(struct charsiu_npu_pool *p,
 		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
 		       const struct gguf_tensor *w2, const float *X, unsigned m,

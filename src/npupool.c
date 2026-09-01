@@ -238,52 +238,68 @@ static int pool_id(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 	return -1;
 }
 
-int charsiu_pool_rows3(struct charsiu_npu_pool *p,
-		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
-		       const struct gguf_tensor *w2, const float *X, unsigned m,
-		       float *Y0, float *Y1, float *Y2)
+int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *const *ws, unsigned nw,
+		       const float *X, unsigned m, float *const *Ys)
 {
-	unsigned id0, id1, id2, chunk = rows_max(), done = 0;
-	uint64_t k, n0, n1, n2;
+	unsigned ids[8], chunk = rows_max(), done = 0, i;
+	uint64_t k, ns[8];
 	double t0;
 
-	p->calls += 3;
-	if (pool_id(p, w0, &id0) || pool_id(p, w1, &id1) || pool_id(p, w2, &id2))
+	if (nw < 1 || nw > 8)
 		return -1;
-	if (w0->ne[0] != w1->ne[0] || w0->ne[0] != w2->ne[0])
-		return -1;             /* one input means one K */
-	k = w0->ne[0];
-	n0 = w0->n_dims ? w0->ne[w0->n_dims - 1] : 1;
-	n1 = w1->n_dims ? w1->ne[w1->n_dims - 1] : 1;
-	n2 = w2->n_dims ? w2->ne[w2->n_dims - 1] : 1;
+	p->calls += nw;
+	for (i = 0; i < nw; i++)
+		if (pool_id(p, ws[i], &ids[i]))
+			return -1;
+	k = ws[0]->ne[0];
+	for (i = 0; i < nw; i++) {
+		if (ws[i]->ne[0] != k)
+			return -1;     /* one input means one K */
+		ns[i] = ws[i]->n_dims ? ws[i]->ne[ws[i]->n_dims - 1] : 1;
+	}
 	t0 = now_ms();
 	while (done < m) {
 		unsigned c = m - done < chunk ? m - done : chunk;
 		const float *x = X + (size_t)done * k;
 
 		/*
-		 * ⚠ THE CHUNK IS THE UNIT OF REUSE. Three whole-tensor calls
-		 * in a row would pack every chunk three times, because the
-		 * input BO only ever holds the LAST chunk packed; q, k and v
-		 * on one chunk before the next is what makes two of the three
-		 * packs vanish.
+		 * ⚠ THE CHUNK IS THE UNIT OF REUSE. Whole-tensor calls in a
+		 * row would pack every chunk once per tensor, because the
+		 * input BO only ever holds the LAST chunk packed; all the
+		 * projections on one chunk before the next is what makes the
+		 * packs after the first vanish.
 		 */
-		if (charsiu_npu_matmul(p->dev, (int)id0, x, c,
-				       Y0 + (size_t)done * n0) ||
-		    charsiu_npu_matmul_same(p->dev, (int)id1, x, c,
-					    Y1 + (size_t)done * n1) ||
-		    charsiu_npu_matmul_same(p->dev, (int)id2, x, c,
-					    Y2 + (size_t)done * n2)) {
-			p->fell_back += 3;
-			p->hw_ms += now_ms() - t0;
-			return -1;
+		for (i = 0; i < nw; i++) {
+			float *y = Ys[i] + (size_t)done * ns[i];
+			int rc = i == 0
+			       ? charsiu_npu_matmul(p->dev, (int)ids[0], x, c, y)
+			       : charsiu_npu_matmul_same(p->dev, (int)ids[i], x,
+							 c, y);
+
+			if (rc) {
+				p->fell_back += nw;
+				p->hw_ms += now_ms() - t0;
+				return -1;
+			}
 		}
 		done += c;
 	}
-	p->hw += 3;
-	p->rows_hw += 3 * m;
+	p->hw += nw;
+	p->rows_hw += nw * m;
 	p->hw_ms += now_ms() - t0;
 	return 0;
+}
+
+int charsiu_pool_rows3(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
+		       const struct gguf_tensor *w2, const float *X, unsigned m,
+		       float *Y0, float *Y1, float *Y2)
+{
+	const struct gguf_tensor *ws[3] = { w0, w1, w2 };
+	float *Ys[3] = { Y0, Y1, Y2 };
+
+	return charsiu_pool_rowsn(p, ws, 3, X, m, Ys);
 }
 
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
