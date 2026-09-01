@@ -38,6 +38,8 @@
 #                                is the bound K, or is it K*N?
 #  16  one tensor, SLICED        the missing rung: several K slices accumulated,
 #                                through npudev, against the CPU
+#  17  where the CBUF window     0x1c00 is 7168 and reads like window 1's base.
+#      actually ends             walk the surface across it and find out
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -49,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1131,6 +1133,53 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    printf '     thing that shows it -- one tensor, no model, no tokenizer. If\n'
    printf '     every KMAX is exact here and phase 13 still fails, then it is\n'
    printf '     not one tensor either: it is several sharing the buffers.\n'
+   ;;
+
+17) say "17. the CBUF window: 0x1c00 is 7168, and is that where it ends"
+   # ⚠⚠ THE MECHANISM, AND IT WAS WRITTEN DOWN HERE BEFORE ANY OF THIS.
+   # job.c on charsiu_cbuf_window: "0x1c00 is 7168 and appears in three of them
+   # as what reads like a base offset", and npudev sets cbuf_window = di, the
+   # device index. So the CBUF is two windows and window 1 starts at entry
+   # 7168 -- which means window 0 holds 7168 entries and a surface past that
+   # runs into the other core's.
+   #
+   # It accounts for every cell measured so far. Surfaces of 1024 through 5120
+   # are exact; 7680 and 10240 are garbage, all rows, all channels, ratios in
+   # the hundreds. And phase 15's raw job at surface 10240 was EXACT because
+   # charsiu_cbuf_window() returns 0 by default and one job has no second
+   # window to collide with -- npudev always has one.
+   #
+   # ⚠ BUT (5120, 7168] HAS NEVER BEEN RUN. The guard shipped at 5120, which is
+   # the vendor's largest observed surface, not the hardware's line. If the
+   # line is 7168 the guard is 40% too tight: it is the difference between
+   # KMAX 2048 at m = 80 and at m = 112.
+   #
+   # K is held at 4096 and m walks, because that makes the surface land on
+   # round numbers: (4096/32) * m = 128m.
+   run 17
+   have npu_slice_test || { skip 17 "npu_slice_test not installed (dev channel)"; break; }
+   printf '  K=N=4096/1536, one slice, m walking. surface = 128 * m.\n'
+   printf '  the guard is lifted; 7168 is the value under test.\n'
+   for M in ${SURF_M:-32 40 48 56 60 64}; do
+	surf=$((128 * M))
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_W4_GROUP=4096 CHARSIU_NPU_MAXN=262144 \
+	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
+	    timeout 600 "$BIN/npu_slice_test" 4096 1536 "$M" 4096 2>&1)
+	if printf '%s' "$r" | grep -q "exact"; then
+		printf '      m=%-4s surface %-6s exact%s\n' "$M" "$surf" \
+		    "$([ "$surf" -gt 7168 ] && echo '   ⚠ past 7168 and still right')"
+	elif printf '%s' "$r" | grep -q "REFUSED"; then
+		bad "m=$M: refused even with the guard lifted"
+	else
+		printf '      m=%-4s surface %-6s ⚠ WRONG%s\n' "$M" "$surf" \
+		    "$([ "$surf" -le 7168 ] && echo '   ⚠ at or below 7168 and already wrong')"
+	fi
+   done
+   wedged "phase 17" && break
+   ok "the last exact surface is the ceiling. If it is 7168 the mechanism is"
+   printf '     window 1 s base and the guard can move there; if it is 5120 the\n'
+   printf '     base is a coincidence and 5120 stands on the vendor evidence.\n'
    ;;
 esac
 done
