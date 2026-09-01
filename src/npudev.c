@@ -3583,14 +3583,33 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * third window state nothing on disk has ever shown -- so it has to be
 	 * searched for, not derived.
 	 *
-	 * ⚠⚠ AND THE STATED MECHANISM IS NOT PROVEN. The bound fits nine model
-	 * cells and 5120 is exactly the vendor's largest split sample, which is
-	 * why it reads as a surface ceiling -- but phase 15 submitted ONE
-	 * dispatch at K = 4096, N = 1536, m = 80, a surface of 10240, and it
-	 * was EXACT. So a wide surface is not wrong by itself. What is wrong is
-	 * a wide surface inside a MULTI-SLICE accumulation, and this guard
-	 * refuses on the number that fits rather than on a cause anybody has
-	 * established. Do not quote the ceiling as an explanation.
+	 * ⚠⚠ 5120 IS MEASURED, AND ITS CAUSE IS NOT KNOWN. Read it as a fence
+	 * post, never as an explanation.
+	 *
+	 * Walking the surface directly, one slice, K held at 4096 so that it is
+	 * 128 * m:
+	 *
+	 *     4096   exact        6144   WRONG
+	 *     5120   exact        7168   WRONG
+	 *                         8192   WRONG
+	 *
+	 * so the line is in (5120, 6144] and 5120 is the last value measured
+	 * good. It is also, independently, the largest surface in the vendor's
+	 * own file. Two lines of evidence landing on one number is why the
+	 * guard sits there.
+	 *
+	 * ⚠ FIVE EXPLANATIONS HAVE FITTED THIS AND DIED, in order: the CBUF
+	 * split pair (already in job.c and already right), K on its own
+	 * (K = 4096 is fine at m = 32), K * N at 2 MiB (killed by a single
+	 * dispatch at 3072 KiB), the core pair (identical on one core), and
+	 * window 1's base at 0x1c00 = 7168, which sat in the gap the data left
+	 * and was killed by 6144 failing. Each fitted everything known when it
+	 * was proposed. The bound has held and every story about it has not.
+	 *
+	 * ⚠ AND TIGHTENING IT BUYS NOTHING. At 6144, the far end of the
+	 * bracket, KMAX 3072 still needs a chunk of 53 and K at m = 80 still
+	 * stops at 2457 -- no width becomes reachable that is not reachable
+	 * now, and phase 11 measured a chunk of 96 tied with 80 anyway.
 	 */
 	{
 		unsigned kw = 0, i;
