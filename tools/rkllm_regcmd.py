@@ -193,7 +193,10 @@ def main():
           % (len(runs), kinds["conv"], kinds["dpu only"]))
     print("  distinct shapes    %d" % len(shapes))
     print("  weight bits        %s" % dict(bits.most_common(5)))
-    print("  M (rows per op)    %s" % dict(rows.most_common(5)))
+    # ⚠ THE LABEL IS THE BUG THIS FILE FIXED. It counts geo["m"], which is
+    # the PIXEL count, and calling it "rows per op" is exactly the reading
+    # that made this tool say the vendor never batches.
+    print("  M (pixels a dispatch) %s" % dict(rows.most_common(5)))
     print()
     n = int(args[1]) if len(args) > 1 and args[0] == "--shapes" else 12
     print("  %-8s %-8s %-8s %-6s %s" % ("ic", "oc", "surf", "M", "count"))
