@@ -51,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1429,6 +1429,58 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '  ⚠ tok/s over passes = the pass cost in decode steps; compare it to tok/pass.\n'
    fi
    wedged "phase 20" && break
+   ;;
+
+21) say "21. the price of a call: where 130 us goes"
+   # ⚠⚠ DECODE'S BIGGEST REMAINING COST IS NOT BYTES. Phase 7's own cost model
+   # on Qwen3 reads `us a call = 130 + 16 a task + 120 a MB`, and a token is
+   # about 150 calls: 19.5 ms of the 51.7 ms token is the per-call floor, more
+   # than the 18.6 ms the weights take at 16 GB/s. Halve the floor and decode
+   # is at 96% of the vendor.
+   #
+   # What is in it, read off the board's own kernel (linux-next, rocket):
+   #
+   #   rocket_job_run     pm_runtime_resume_and_get + iommu_attach_group PER
+   #                      JOB, and iommu_detach_group + put_autosuspend after
+   #                      it. rk_iommu's attach writes the DTE address, resets
+   #                      and polls; the detach disables paging and zeroes it.
+   #   the irq            threaded: hardirq -> irq thread wakeup -> fence
+   #                      signal -> waiter wakeup. Two hops where one would do.
+   #   cpuidle            rk3576.dtsi: CPU_SLEEP exit-latency-us = 250,
+   #                      min-residency-us = 900. A fence wait is ~300 us and
+   #                      the governor guesses; a wrong guess costs 250 us on
+   #                      the wake, and it costs it on the irq thread, the
+   #                      scheduler thread and the waiter alike.
+   #
+   # This phase prices the one of those that needs no new kernel: it runs the
+   # same decode with CPU_SLEEP disabled and reads the cost model line off both
+   # arms. If `a call` drops, the wake latency was in it and the kernel patch
+   # that keeps the IOMMU domain attached is the next arm.
+   run 21
+   SM=""
+   for f in "$MODELS"/Qwen3-0.6B*.gguf "$MODELS"/*.gguf; do [ -r "$f" ] && SM=$f && break; done
+   [ -n "$SM" ] || { skip 21 "no model"; break; }
+   IDLE=/sys/devices/system/cpu/cpu0/cpuidle/state1/disable
+   [ -w "$IDLE" ] || { skip 21 "no cpuidle state1 to toggle at $IDLE"; break; }
+   # ⚠ THE FOURTH ARM NEEDS NO SYSFS AND NO KERNEL: CHARSIU_NPU_SPIN_US polls
+   # the fence for that long before sleeping on it, so the waiter never leaves
+   # C0 and never pays the exit latency. If it matches the cpu-sleep-off arm
+   # the latency was the waiter's; if cpu-sleep-off wins by more, the irq
+   # thread and the scheduler thread were paying it too, and only the kernel
+   # can fix those.
+   for arm in "cpu-sleep on" "cpu-sleep OFF" "cpu-sleep on again" "spin 400 us"; do
+	case "$arm" in *OFF) v=1 ;; *) v=0 ;; esac
+	case "$arm" in spin*) SPIN=400 ;; *) SPIN=0 ;; esac
+	for c in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state1/disable; do echo $v >"$c"; done
+	r=$(CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 2>&1)
+	gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p')
+	cm=$(printf '%s' "$r" | grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" | head -1)
+	printf '  %-20s %-12s %s\n' "$arm" "$gen" "$cm"
+   done
+   wedged "phase 21" && break
+   ok "read `a call` across the arms; the third must match the first"
+   printf '     ⚠ these arms are the wake latency ALONE. The attach/detach per job\n'
+   printf '        is the patched kernel (rocket: keep the domain attached), next round.\n'
    ;;
 esac
 done
