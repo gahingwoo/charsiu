@@ -2769,7 +2769,10 @@ static void llama_auto_kmax(const struct llama_model *m)
 	 * batched path against the model's own token loop at 1024, 2048, 3072
 	 * and 4096, on the three models whose K divides none of them -- so the
 	 * quantiser emits the same bytes across the sweep and only the slicing
-	 * moves. 2048 agrees on all three. Above it:
+	 * moves. 2048 agrees on all three -- and it was never broken. A commit
+	 * once credited a CBUF fix for it; that fix was in a function only a
+	 * dump tool calls, job.c already had the rule, and 2048 had simply
+	 * never been compared against the token loop before. Above it:
 	 *
 	 *   slice 2816   WRONG   (Qwen2.5 at KMAX 3072, surf 88)
 	 *   slice 3072   right   (gemma-3-1b at KMAX 3072, surf 96)
