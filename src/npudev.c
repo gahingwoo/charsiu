@@ -3582,6 +3582,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * NUMBER HERE. It is whatever the vendor emits above 5120, which is a
 	 * third window state nothing on disk has ever shown -- so it has to be
 	 * searched for, not derived.
+	 *
+	 * ⚠⚠ AND THE STATED MECHANISM IS NOT PROVEN. The bound fits nine model
+	 * cells and 5120 is exactly the vendor's largest split sample, which is
+	 * why it reads as a surface ceiling -- but phase 15 submitted ONE
+	 * dispatch at K = 4096, N = 1536, m = 80, a surface of 10240, and it
+	 * was EXACT. So a wide surface is not wrong by itself. What is wrong is
+	 * a wide surface inside a MULTI-SLICE accumulation, and this guard
+	 * refuses on the number that fits rather than on a cause anybody has
+	 * established. Do not quote the ceiling as an explanation.
 	 */
 	{
 		unsigned kw = 0, i;
@@ -3593,8 +3602,23 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				kw = sk;
 		}
 		if ((size_t)(kw / 32) * m > 5120) {
-			whine(g, "the input surface is past the widest the "
-			      "vendor's own file ever splits", kw, m);
+			/*
+			 * ⚠ CHARSIU_NPU_KFIT IS THE LIKELY WAY TO GET HERE, and
+			 * the two are in direct conflict at the shipped width.
+			 * KFIT widens the last slice to kmax + K % kmax, which
+			 * at KMAX 2048 is 2816 on Qwen2.5 and gemma-3-1b and
+			 * 3584 on tinyllama -- 7040 and 8960 entries at a chunk
+			 * of 80, both past this. So turning KFIT on there does
+			 * not make the batch faster, it makes there be no batch:
+			 * this returns -1 and the caller falls back a row at a
+			 * time. It was measured +7.3% on gemma-3-1b back when
+			 * KMAX was 1024 and the widest it produced was 1792.
+			 */
+			whine(g, g->kfit
+			      ? "KFIT widened a slice past the input surface "
+				"ceiling, so this tensor is not batched at all"
+			      : "the input surface is past the widest the "
+				"vendor's own file ever splits", kw, m);
 			return -1;
 		}
 	}
