@@ -100,6 +100,14 @@ for d in $DIRS; do
 		case " $seen " in *" $b "*) continue ;; esac
 		seen="$seen $b"
 		case "$b" in *Q4_0*|*q4_0*) ;; *) continue ;; esac
+		# ⚠ A SUBSTRING FILTER, for callers isolating one axis. Phase 13
+		# sweeps the K slice width and can only do that on models whose
+		# K divides none of the candidate widths -- on any other model
+		# the weights change with the width and the comparison stops
+		# being about slicing.
+		if [ -n "${CHARSIU_TEXT_ONLY:-}" ]; then
+			case "$b" in *${CHARSIU_TEXT_ONLY}*) ;; *) continue ;; esac
+		fi
 
 		# shellcheck disable=SC2086
 		env $W4 "$RUN" "$M" -p "$PROMPT" -n "$NGEN" --ignore-eos \

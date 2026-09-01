@@ -30,6 +30,8 @@
 #  11  the prefill chunk         we chunk at 32, the vendor's ladder tops at 80
 #  12  the quality probe         phase 10's counting prompt cannot see a
 #                                coarser quantiser; this asks something that can
+#  13  where the wide slice      the batched path disagrees with the token loop
+#      stops being correct       above KMAX 1024; find the width it breaks at
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -41,7 +43,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -746,6 +748,69 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    printf '     KMAX widens is the recorded symptom of one scale over too long a\n'
    printf '     row; a ratio that holds while the words go wrong is a different\n'
    printf '     fault and this phase cannot name it.\n'
+   ;;
+
+13) say "13. the wide K slice: does the CBUF pair fix make it agree with m = 1"
+   # ⚠ THE CAUSE IS FOUND AND FIXED; this phase is now the check on that fix
+   # rather than the hunt for it. regcmd.c emitted the non split CBUF pair
+   # unconditionally, and the vendor's own batched dispatches switch to the
+   # split pair on K * M > 131072 -- 2048x64 and 4096x32 are its widest non
+   # split, both exactly 131072. Our shipped setting is 1024 x 80 = 81920,
+   # which is why every round for months was right, and 4096 x 80 = 327680,
+   # which is why phase 2 was not.
+   # ⚠⚠ WHAT THIS IS FOR. Phase 2 at KMAX 4096 had Qwen2.5 and gemma-3-1b
+   # answering differently from their own token loop, while SmolLM2-135M was
+   # fine -- and phases 10 and 12 had called all three identical at that width,
+   # because both of THEIR arms were batched. A batched path that is wrong at a
+   # wide slice is invisible to a batched-versus-batched comparison.
+   #
+   # The discriminator is the widest single dispatch, not the number of slices:
+   #
+   #   SmolLM2-135M   576 / 1536   at 4096 every tensor is ks = 1, widest 1536   ok
+   #   Qwen2.5-1.5B  1536 / 8960   at 4096 the ffn is ks = 3, widest 4096        wrong
+   #   gemma-3-1b    1152 / 6912   at 4096 the ffn is ks = 2, widest 4096        wrong
+   #
+   # so the bound is somewhere in (1536, 4096], and the vendor's own .rkllm
+   # dispatches K = 2048 and K = 4096 -- the hardware does this, our encoder
+   # does not.
+   #
+   # ⚠ ONLY THESE THREE MODELS, AND THAT IS THE WHOLE DESIGN. K must divide
+   # none of the candidate widths, or the WEIGHTS change with the width and the
+   # comparison stops being about slicing at all. 1536, 8960, 1152, 6912, 576
+   # and 1536 divide none of 1024, 2048, 3072, 4096, so across this sweep the
+   # quantiser emits the same bytes and only ks moves.
+   run 13
+   KW=${KMAX_WIDTHS:-1024 2048 3072 4096}
+   printf '  KMAX = W4_GROUP over %s, on the three models whose weights\n' "$KW"
+   printf '  do not move across it. Batched against the token loop.\n'
+   n13=0
+   for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
+	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
+	n13=$((n13 + 1))
+	printf '\n  %s\n' "$MK"
+	for K in $KW; do
+		r=$(CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
+		    CHARSIU_NPU_W4_GROUP="$K" \
+		    sh "$BIN/board_text_all.sh" 2>&1 \
+		    | grep -E "text identical|TEXT DIFFERS" | head -1)
+		case "$r" in
+		*identical*) printf '      KMAX %-5s agrees with the token loop\n' "$K" ;;
+		*DIFFERS*)   printf '      KMAX %-5s ⚠ DISAGREES -- the batched path is wrong here\n' "$K"
+			     bad "$MK breaks at a K slice of $K" ;;
+		*)           bad "$MK at KMAX $K: no verdict line at all"
+			     printf '        %s\n' "${r:-(no output)}" ;;
+		esac
+	done
+   done
+   wedged "phase 13" && break
+   if [ "$n13" = 0 ]; then
+	bad "none of the three models is under $MODELS -- nothing was swept"
+   else
+	ok "the first width that disagrees is the bound. Everything below it is"
+	printf '     a slice the batched path encodes correctly; the vendor reaches\n'
+	printf '     4096, so what is above the bound is ours to find, not the\n'
+	printf '     hardware refusing.\n'
+   fi
    ;;
 esac
 done
