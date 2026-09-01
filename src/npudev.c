@@ -3634,9 +3634,14 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * and charsiu_pool_rows batches 64 rows, so (3072 / 32) * 64 is
 		 * 6144 -- the first cell in the int4 bracket above -- and all
 		 * twelve of them plus the idefics3 projector were refused. The
-		 * scoreboard's encoder went 15.5 s to 31.0 s, the pool reported
+		 * scoreboard's encoder went 5.57 s to 31.0 s, the pool reported
 		 * "73 asked and 13 fell back", and 87.6% of the run was ffn
-		 * matmuls with only 1287 ms of it on the hardware.
+		 * matmuls with only 1287 ms of it on the hardware. Gated, the
+		 * same board reads 5.37 s, 0 fell back, ffn 962 ms.
+		 *
+		 * ⚠ 15.5 s IS THE WRONG BASELINE and I quoted it first: that is
+		 * board_modalities' vision number from a different round, not
+		 * this scoreboard's encoder.
 		 *
 		 * whisper opens want_w4 = 0 too and escaped only by being small:
 		 * its widest K is 4 * n_audio_state, which is 2048 at base and

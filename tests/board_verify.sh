@@ -51,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1249,8 +1249,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # with a wide K. SmolVLM-256M's ffn_down is K = 3072 and charsiu_pool_rows
    # batches 64 rows, so the width formula reads 6144 -- the first WRONG cell
    # in phase 17's int4 bracket -- and all twelve of them plus the idefics3
-   # projector were refused. The encoder went 15.5 s to 31.0 s and the pool
-   # said "73 asked and 13 fell back".
+   # projector were refused. The encoder went 5.57 s to 31.0 s and the pool
+   # said "73 asked and 13 fell back"; gated it reads 5.37 s and 0 fell back.
+   # (15.5 s was quoted first and is the wrong baseline -- that is
+   # board_modalities' number from another round, not this scoreboard's.)
    #
    # ⚠ SO THIS PHASE RUNS WITHOUT THE HATCH. Phases 16 and 17 lift the guard
    # because they exist to interrogate what is above it; this one exists to
@@ -1297,18 +1299,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	elif printf '%s' "$r" | grep -q "exact"; then
 		printf '      %s exact   [width %s]%s\n' "$lbl" "$wf" \
 		    "$([ "$wf" -gt 5120 ] && echo '  ⚠ the guard would have refused this')"
-	elif [ "$sl" -gt 1 ]; then
-		# ⚠ NOT A FAILURE AND NOT A PASS. npudev takes int8's scale over
-		# each K SLICE's own range and charsiu_act_q1 takes it over the
-		# whole row, so a multi-slice int8 batch is quantised FINER than
-		# its own row-by-row reference on purpose. Asking those two to
-		# agree to 0.1% is asking two arithmetics to be one, which is
-		# the mistake that cost this file two rounds already.
-		printf '      %s differs, and %s slices means it must:\n' "$lbl" "$sl"
-		printf '        the batch scales per slice, the row loop scales per row.\n'
-		printf '%s\n' "$r" | grep -E "rows wrong|magnitude|got/want" | sed 's/^/        /'
 	else
-		bad "$lbl: one slice and still not exact -- the quantisers now match, so this is the batching"
+		# ⚠⚠ THERE IS NO EXCUSE BRANCH HERE ANY MORE. This had one for
+		# multi-slice cells, on the reasoning that npudev scales per K
+		# slice while charsiu_act_q1 scales per row, so the two could
+		# not agree. K = 8192 at 4 slices then came back EXACT, which
+		# refutes it -- the reference is charsiu_npu_matvec, the NPU's
+		# own row loop, and it goes through the same slicing. A branch
+		# that turns a failure into prose is worse than no branch: it
+		# was written to explain a result it had not seen.
+		bad "$lbl: not exact -- the quantisers match now, so this is the batching"
 		printf '%s\n' "$r" | grep -E "quantiser check|batched|rows wrong|channels |got/want|magnitude" | sed 's/^/       /'
 	fi
 	# ⚠ INSIDE the sweep: a wedged block makes every later cell read as
@@ -1318,9 +1318,75 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    done
    wedged "phase 18" && break
    ok "int8 batches past the int4 ceiling, so the gate belongs on the axis"
-   printf '     ⚠ this does NOT say the height axis has no ceiling of its own.\n'
-   printf '        It says the int4 one is not it. Nothing here has walked a\n'
-   printf '        height-axis bound and no caller in the tree asks for one.\n'
+   printf '     ⚠ the height axis has a ceiling of its own -- phase 19 walks it.\n'
+   ;;
+
+19) say "19. the height axis has a ceiling too, and which quantity is it"
+   # ⚠⚠ PHASE 18 FOUND ONE AND THIS PHASE IS WHAT IT OWES. Four int8 cells ran
+   # and three were exact:
+   #
+   #   K=3072 m=64  1 slice   surf 96  x 64 =  6144   exact
+   #   K=3072 m=80  1 slice   surf 96  x 80 =  7680   exact
+   #   K=8192 m=64  4 slices  surf 64  x 64 =  4096   exact   (per dispatch)
+   #   K=4096 m=80  1 slice   surf 128 x 80 = 10240   WRONG, 80/80 rows,
+   #                                                  mean got/want 2.1037
+   #
+   # and the quantiser check printed 0 differing codes on that cell, so the
+   # thing phase 18 spent a round on is excluded by the tool itself.
+   #
+   # ⚠ AND job.c NEVER CHECKS. Its split rule is `wide && surf * rows > 4096`,
+   # and wide is 0 for int8, so an int8 dispatch never splits and nothing looks.
+   # The int4 side has a guard at 5120; the height axis has nothing.
+   #
+   # ⚠⚠ BUT DO NOT GUARD IT YET. Three quantities fit all four cells and they
+   # are not the same rule:
+   #
+   #   (a) surf alone, i.e. K/32     128 fails, 96 and 64 pass
+   #   (b) surf * rows               10240 fails, 7680 and below pass
+   #   (c) N * m, the OUTPUT         122880 fails, 98304 and below pass
+   #
+   # Putting a guard on the wrong one of those is exactly what shipped last
+   # round on the other axis. Each cell below says which candidate it kills.
+   #
+   # ⚠ m STOPS AT 80. npupool's own sweep has 4..80 identical and 96 and up "a
+   # different tower", so a cell above 80 would be measuring that instead.
+   run 19
+   have npu_slice_test || { skip 19 "npu_slice_test not installed (dev channel)"; break; }
+   printf '  int8, one slice unless said. surf = K/32. each cell kills a candidate.\n'
+   for C in ${H_CELLS:-4096/1536/32/a 3072/1536/80/c 4096/768/80/b 4096/1536/48/w 4096/1536/64/w 3584/1536/80/w}; do
+	HK=${C%%/*}; rest=${C#*/}; HN=${rest%%/*}; rest=${rest#*/}
+	HM=${rest%%/*}; HW=${rest##*/}
+	sf=$(( HK / 32 )); pr=$(( sf * HM )); ou=$(( HN * HM ))
+	case "$HW" in
+	a) why="if WRONG: surf alone (K), and neither product matters" ;;
+	b) why="if WRONG with (a) dead: the input surface, not the output" ;;
+	c) why="if WRONG: the OUTPUT N*m, not the input at all" ;;
+	*) why="walks the bracket" ;;
+	esac
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=0 \
+	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+	    CHARSIU_SLICE_SEED="${INT8_SEED:-12345}" \
+	    timeout 600 "$BIN/npu_slice_test" "$HK" "$HN" "$HM" "$HK" 2>&1)
+	lbl=$(printf 'K=%-5s N=%-5s m=%-3s surf %-4s x%-3s = %-6s out %-7s' \
+	    "$HK" "$HN" "$HM" "$sf" "$HM" "$pr" "$ou")
+	if printf '%s' "$r" | grep -q "REFUSED"; then
+		bad "$lbl refused -- nothing was measured"
+	elif printf '%s' "$r" | grep -q "exact"; then
+		printf '      %s exact\n' "$lbl"
+	else
+		printf '      %s ⚠ WRONG\n' "$lbl"
+		printf '        %s\n' "$why"
+		printf '%s\n' "$r" | grep -E "rows wrong|got/want|magnitude" | sed 's/^/        /'
+	fi
+	# a wedge here would make every later cell read exact on a dead block
+	wedged "phase 19" && break
+   done
+   wedged "phase 19" && break
+   ok "the bracket is walked; read the three candidates off the table above"
+   printf '     ⚠ EXPOSURE, unguarded either way: whisper sizes its pool at\n'
+   printf '        4 * n_audio_state, so medium is K=4096 (surf 128) and large\n'
+   printf '        is K=5120 (surf 160) -- both at or past the failing cell,\n'
+   printf '        and the board has only ever run tiny (K=1536, surf 48).\n'
    ;;
 esac
 done
