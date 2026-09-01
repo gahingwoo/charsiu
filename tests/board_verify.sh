@@ -36,6 +36,8 @@
 #                                shape at a time against an exact CPU reference
 #  15  one int4 matmul at a time  the direct instrument, on the real emitter:
 #                                is the bound K, or is it K*N?
+#  16  one tensor, SLICED        the missing rung: several K slices accumulated,
+#                                through npudev, against the CPU
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -47,7 +49,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1038,6 +1040,56 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '     K * N and 2 MiB is the number; if every N fails the bound is\n'
 	printf '     on K alone and the weight bytes were a coincidence of shapes.\n'
    fi
+   ;;
+
+16) say "16. one tensor, sliced: the rung between a dispatch and a model"
+   # ⚠⚠ WHY THIS EXISTS. Two rungs are measured and they disagree:
+   #
+   #   phase 15   ONE dispatch, int4, K=4096 N=1536 m=80    EXACT
+   #   phase 13   a whole model at KMAX 3072 or 4096        WRONG
+   #
+   # and everything between them was inferred. Three hypotheses were fitted to
+   # that inference and all three died: the CBUF pair (already in job.c and
+   # right), K * N at 2 MiB (killed by phase 15), and the core pair (Qwen2.5
+   # fails identically on one core).
+   #
+   # What is actually between the two rungs is: several K slices accumulated
+   # into one Y, staged through npudev, with the batched buffers shared across
+   # them. npu_slice_test is exactly that and nothing else -- one synthetic
+   # tensor, charsiu_npu_add, charsiu_npu_matmul, against npu_matvec on the
+   # same quantised weights, which is the comparison phase 2 makes at model
+   # scale.
+   #
+   # ⚠ The shapes below are Qwen2.5's ffn down projection, K = 8960 N = 1536,
+   # because that is the tensor phase 13 implicates and the only multi-slice
+   # one it has at KMAX 3072.
+   run 16
+   have npu_slice_test || { skip 16 "npu_slice_test not installed (dev channel)"; break; }
+   SK=${SLICE_K:-8960}
+   SN=${SLICE_N:-1536}
+   SM=${SLICE_M:-80}
+   printf '  K=%s N=%s m=%s, KMAX walking. m=1 is the control inside the tool.\n' \
+       "$SK" "$SN" "$SM"
+   for K in ${SLICE_KMAX:-1024 2048 3072 4096}; do
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
+	    CHARSIU_COEF_ELEMS=65536 \
+	    timeout 600 "$BIN/npu_slice_test" "$SK" "$SN" "$SM" "$K" 2>&1)
+	v=$(printf '%s' "$r" | grep -E "batched:|REFUSED|control" | tail -2)
+	if printf '%s' "$r" | grep -q "exact"; then
+		printf '      KMAX %-5s exact\n' "$K"
+	elif printf '%s' "$r" | grep -q "REFUSED"; then
+		printf '      KMAX %-5s refused by the surface guard (expected above 5120)\n' "$K"
+	else
+		bad "KMAX $K: the sliced batch disagrees with the CPU"
+		printf '%s\n' "$v" | sed 's/^/       /'
+	fi
+   done
+   wedged "phase 16" && break
+   ok "if a KMAX is wrong HERE it is the slicing, and this is the smallest"
+   printf '     thing that shows it -- one tensor, no model, no tokenizer. If\n'
+   printf '     every KMAX is exact here and phase 13 still fails, then it is\n'
+   printf '     not one tensor either: it is several sharing the buffers.\n'
    ;;
 esac
 done

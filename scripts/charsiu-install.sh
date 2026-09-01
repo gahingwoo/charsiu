@@ -884,7 +884,7 @@ RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 # six attention defaults chosen on a compute bound desktop are still the
 # defaults on a bandwidth bound board. Anything added to PROBE_SCRIPTS that
 # runs a binary has to add the binary here in the same edit.
-PROBE_BINS="bench_batch npu_gemm_test charsiu_matmul vattn_bench acc_index_check"
+PROBE_BINS="bench_batch npu_gemm_test npu_slice_test charsiu_matmul vattn_bench acc_index_check"
 # ⚠ EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
 # down says a probe that lives only in the source tree under ~/.cache is a
 # board round that does not happen -- and then only prefill_control.sh was
