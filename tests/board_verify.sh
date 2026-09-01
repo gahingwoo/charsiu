@@ -27,6 +27,9 @@
 #   9  where TTFT goes           the five-way split, and the pooled read back
 #  10  KMAX                      read is m*n*ks, so does a wider slice pay --
 #                                and what does the coarser quantiser cost
+#  11  the prefill chunk         we chunk at 32, the vendor's ladder tops at 80
+#  12  the quality probe         phase 10's counting prompt cannot see a
+#                                coarser quantiser; this asks something that can
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -38,10 +41,10 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
-slow) PHASES="6 7 8 9 10" ;;
+slow) PHASES="6 7 8 9 10 11" ;;
 esac
 
 BIN=${CHARSIU_BIN_DIR:-/opt/charsiu}
@@ -545,7 +548,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # restarts per tensor, so a single-slice tensor put everything on device 0.
    # The deal is least-loaded now and this has not been asked since.
    run 10
-   SW=${KMAX_SWEEP:-1024 2048}
+   # ⚠ 4096 IS IN THE DEFAULT BECAUSE THE VENDOR USES IT. Read off its own
+   # .rkllm, every one of its 3328 int4 dispatches is K = 2048 (81%) or
+   # K = 4096 (19%) and none is 1024, which is what these rounds have run.
+   SW=${KMAX_SWEEP:-1024 2048 4096}
    printf '  sweeping KMAX = W4_GROUP over: %s\n' "$SW"
    printf '  the first value is the baseline every later one is compared to\n'
    n10=0
@@ -610,6 +616,130 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '     and keeps the text is free; one that changes the text has to\n'
 	printf '     be judged on the answer, not on the milliseconds.\n'
    fi
+   ;;
+
+11) say "11. the prefill chunk: we use 32, the vendor's widest is 80"
+   # The vendor's int4 M ladder, read off its own .rkllm, is 1, 16, 24, 32, 40,
+   # 48, 64 and 80 -- and 80 is both the widest and the most common, 768 of
+   # 3328. charsiu chunks a prompt at 32. A wider chunk does not change the
+   # total read work, which is rows * n * ks, but it amortises everything
+   # charged per CALL: prep, the submits, and the fence's own ramp.
+   #
+   # ⚠ 96 IS IN THE SWEEP ON PURPOSE, ABOVE WHAT THE VENDOR EMITS. This tree
+   # has "the batch stops at m = 80" on record from the vision work, and a
+   # sweep that stops where the vendor stops cannot tell a hardware ceiling
+   # from a choice they made. If 96 comes back with different text, that is
+   # the ceiling and it is a correctness finding, not a slow arm.
+   run 11
+   CH=${CHUNK_SWEEP:-32 64 80 96}
+   printf '  sweeping CHARSIU_PREFILL_CHUNK over: %s\n' "$CH"
+   printf '  ⚠ the chunk is a MAXIMUM and is rounded down to an expressible\n'
+   printf '    width, so read the "chunks of" line, not the value asked for\n'
+   n11=0; nbad11=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n11=$((n11 + 1))
+	b=$(basename "$M" .gguf)
+	printf '\n  %s\n' "$b"
+	first=1
+	for C in $CH; do
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    CHARSIU_PREFILL_CHUNK="$C" \
+		    "$BIN/charsiu_run" "$M" -p "$P9" -n 8 --ignore-eos \
+		    >"$OUT/.c_out" 2>"$OUT/.c_err"
+		tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' "$OUT/.c_out" \
+		     | head -1 | grep -oE '[0-9.]+ ms')
+		# what it ACTUALLY batched at, not what was asked for
+		wd=$(grep -hoE 'chunks of [0-9]+[^)]*' "$OUT/.c_out" "$OUT/.c_err" \
+		     | head -1)
+		sed -i 's/^\[.*//' "$OUT/.c_out"
+		if [ -z "${tt:-}" ]; then
+			bad "$b at chunk $C: no prompt line, the run did not generate"
+			tail -4 "$OUT/.c_err" | sed 's/^/       /'
+			nbad11=$((nbad11 + 1))
+			continue
+		fi
+		if [ "$first" = 1 ]; then
+			cp "$OUT/.c_out" "$OUT/.c_base"; tx="baseline"; first=0
+		elif cmp -s "$OUT/.c_base" "$OUT/.c_out"; then
+			tx="text same"
+		else
+			# ⚠ UNLIKE PHASE 10, A DIFFERENCE HERE IS A FAILURE. The
+			# chunk width changes no arithmetic -- same weights, same
+			# scales, same order -- so the answer must not move. This
+			# is the m = 8 class of fault, which is what that phase
+			# and the width law exist for.
+			bad "$b at chunk $C: THE ANSWER MOVED. A chunk width changes"
+			printf '     no arithmetic, so this is a layout fault, not a trade.\n'
+			diff "$OUT/.c_base" "$OUT/.c_out" | head -4 | sed 's/^/       /'
+			tx="⚠ DIFFERS"
+			nbad11=$((nbad11 + 1))
+		fi
+		printf '      chunk %-4s TTFT %-11s %-12s %s\n' \
+		    "$C" "$tt" "$tx" "${wd:-}"
+	done
+   done
+   wedged "phase 11" && break
+   if [ "$n11" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   elif [ "$nbad11" = 0 ]; then
+	ok "every chunk width gave the same answer on $n11 model(s); the TTFT"
+	printf '     column is then a free choice.\n'
+   fi
+   ;;
+
+12) say "12. the quality probe: something a coarser quantiser can actually break"
+   # ⚠⚠ WHY THIS EXISTS. Phase 10 compares text across KMAX and reported "text
+   # same" on all eight models -- and that is not evidence, because its prompt
+   # is "1 2 3 ... 256" and the continuation is the model counting. Counting is
+   # the least quantisation-sensitive thing a language model does. Phi-3.5 goes
+   # from grouped-at-1024 to a per-row scale at KMAX 2048, which is exactly the
+   # degradation that was predicted, and it counted through it.
+   #
+   # So: short prompts whose continuation is a real language choice, and a
+   # symptom counter for the failure mode this tree has on record. Round 352's
+   # description of one absmax over a long row was output that stayed "English,
+   # on topic and REPETITIVE", so distinct words over total words is a direct
+   # probe for it.
+   #
+   # ⚠ THE RATIO IS A SYMPTOM DETECTOR, NOT AN ORACLE. It cannot tell you the
+   # answer is right; it can tell you the model started repeating itself, which
+   # is the shape the failure takes here. Read it next to the text, never
+   # instead of it.
+   run 12
+   SW12=${KMAX_SWEEP:-1024 2048 4096}
+   n12=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n12=$((n12 + 1))
+	printf '\n  %s\n' "$(basename "$M" .gguf)"
+	for QP in "The capital of France is" \
+		  "The opposite of hot is" \
+		  "Water is made of hydrogen and"; do
+		printf '      "%s"\n' "$QP"
+		for K in $SW12; do
+			env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+			    CHARSIU_NPU_KMAX="$K" CHARSIU_NPU_W4_GROUP="$K" \
+			    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+			    "$BIN/charsiu_run" "$M" -p "$QP" -n 24 --ignore-eos \
+			    >"$OUT/.q_out" 2>/dev/null
+			sed -i 's/^\[.*//' "$OUT/.q_out"
+			r=$(tr ' ' '\n' <"$OUT/.q_out" | sed '/^$/d' \
+			    | awk '{n++; if (!seen[$0]++) u++}
+				   END { if (n) printf "%d/%d", u, n; else printf "0/0" }')
+			printf '        KMAX %-5s distinct %-8s %s\n' "$K" "$r" \
+			    "$(tr '\n' ' ' <"$OUT/.q_out" | cut -c1-70)"
+		done
+	done
+   done
+   wedged "phase 12" && break
+   [ "$n12" -gt 0 ] || bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   ok "read the distinct ratio and the text together. A ratio that collapses as"
+   printf '     KMAX widens is the recorded symptom of one scale over too long a\n'
+   printf '     row; a ratio that holds while the words go wrong is a different\n'
+   printf '     fault and this phase cannot name it.\n'
    ;;
 esac
 done

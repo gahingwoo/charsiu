@@ -21,7 +21,11 @@ TMP=${TMPDIR:-/tmp}/charsiu-selftest.$$
 mkdir -p "$TMP/models" "$TMP/out"
 trap 'rm -rf "$TMP"' EXIT
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10}
+# ⚠ THE LIST COMES FROM THE SCRIPT, NOT FROM HERE. A hardcoded 1..10 in this
+# file goes stale the moment a phase is added, and it goes stale SILENTLY -- the
+# new phase is the one nobody checked. Read the case labels out of
+# board_verify.sh instead.
+PHASES=${*:-$(sed -n 's/^\([0-9][0-9]*\)) say .*/\1/p' "$HERE/board_verify.sh" | tr '\n' ' ')}
 fail=0
 for ph in $PHASES; do
 	out=$(CHARSIU_BIN_DIR=${CHARSIU_BIN_DIR:-$HERE/../build} \
