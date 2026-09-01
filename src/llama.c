@@ -3666,7 +3666,20 @@ static int batch_ok(const struct llama_model *m)
 	return 0;
 }
 
-int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
+/*
+ * ⚠ THE LAYERS, AND ONLY THE LAYERS. Everything from the embedding lookup to
+ * the last residual add, over n rows at pos0, with the KV cache written for
+ * every row. What it leaves behind is s->bx: n rows of the final residual
+ * stream, unnormed. Two callers finish it two ways -- llama_prefill_batch runs
+ * the output head on the LAST row, which is all a prompt needs, and
+ * llama_verify_batch runs it on EVERY row, which is what a speculative pass
+ * needs to score its drafts. Neither owns a copy of the layer loop, so the two
+ * cannot drift.
+ *
+ * s->pos is NOT advanced here; the callers do that, because the verify pass
+ * advances it by how many drafts were accepted rather than by n.
+ */
+static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0)
 {
 	/*
@@ -4252,6 +4265,14 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		}
 	}
 
+	return 0;
+}
+
+int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
+			const int32_t *toks, int n, int pos0)
+{
+	if (batch_layers(s, m, toks, n, pos0))
+		return -1;
 	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
@@ -4259,6 +4280,41 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 		for (uint32_t i = 0; i < m->n_vocab; i++)
 			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
 				       m->final_softcap;
+	s->pos = pos0 + n;
+	return 0;
+}
+
+/*
+ * ⚠⚠ THE SAME FORWARD, WITH THE HEAD ON EVERY ROW.
+ *
+ * A speculative pass feeds the last committed token as row 0 and k drafted
+ * tokens as rows 1..k. Whether draft i was right is decided by the logits of
+ * row i -- the model's own next token given everything up to and including
+ * draft i-1 -- so every row needs its logits, not the last one. The head is
+ * one more batched matmul over n rows, and on the hardware it is the same
+ * batched call a prompt makes; on a machine with no NPU matmul_rows runs it a
+ * row at a time, which is correct and only slower.
+ *
+ * On return s->pos is pos0 + n and the cache holds all n rows. The CALLER
+ * rolls s->pos back to pos0 + 1 + accepted: the rows past that are stale
+ * entries that the next pass overwrites, and nothing reads a position above
+ * s->pos, so rolling back is one assignment.
+ */
+int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
+		       const int32_t *toks, int n, int pos0, float *logits_all)
+{
+	if (batch_layers(s, m, toks, n, pos0))
+		return -1;
+	for (int r = 0; r < n; r++)
+		rmsnorm(s->bxb + (size_t)r * m->n_embd,
+			s->bx + (size_t)r * m->n_embd, m->out_norm,
+			m->n_embd, m->rms_eps);
+	matmul_rows(s, m->output, s->bxb, n, logits_all, m->n_embd,
+		    m->n_vocab);
+	if (m->final_softcap > 0.0f)
+		for (size_t i = 0; i < (size_t)n * m->n_vocab; i++)
+			logits_all[i] = tanhf(logits_all[i] / m->final_softcap)
+					* m->final_softcap;
 	s->pos = pos0 + n;
 	return 0;
 }
@@ -4773,4 +4829,246 @@ int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
 
 	free(p);
 	return out;
+}
+
+/*
+ * ⚠⚠ SPECULATIVE DECODING, AND WHY IT IS THE ONE ALGORITHM THAT CAN GO PAST
+ * THE VENDOR RATHER THAN TO IT.
+ *
+ * At m = 1 every token reads every weight, and that is the whole cost of a
+ * decode step on this hardware: Qwen3-0.6B is 298 MB of int4 and the board
+ * reads it at 16 GB/s across the two cores, which is the 52 ms the token
+ * takes. Rockchip reads the same bytes at 40 ms. Nothing inside a matmul
+ * changes the bytes, and the NPU has no int2 or int3, so the only way to more
+ * tokens a second is more tokens a READ -- which is what a batch does. The
+ * batched path reads the weights ONCE for m rows, and the board has it exact at
+ * m = 2, 4 and 6.
+ *
+ * So: guess k tokens by some cheap means, feed the last committed token and
+ * the k guesses as one batch of 1 + k rows, and read off every row's logits.
+ * Row i's argmax is what greedy decoding would have produced after guess i-1.
+ * Accept guesses while they match; the first row that disagrees supplies the
+ * token greedy would have produced there instead. Every committed token is
+ * therefore exactly the token the plain loop would have committed -- the
+ * drafts only decide how many of them one weight read yields. THE TEXT IS
+ * BIT-IDENTICAL TO GREEDY BY CONSTRUCTION, and tests/spec_identity.sh holds it
+ * to that with a control whose drafts are junk.
+ *
+ * The drafter here is prompt lookup: the last few tokens are searched for in
+ * everything the model has seen or said, and what followed them last time is
+ * proposed. It costs nothing, needs no second model, and is strong wherever the
+ * output repeats its input -- quoting, summarising, code, structured answers --
+ * and weak on open prose, where it mostly proposes nothing and the pass
+ * degrades to a plain forward. It is the drafter to start with because it is
+ * the one with no model to get wrong; the pass itself does not care where the
+ * drafts come from.
+ *
+ * ⚠ WHAT THIS DOES NOT DO. Sampling at a temperature is left to the plain
+ * loop: lossless speculative SAMPLING exists (accept with p_target(d), else
+ * draw from the residual) and is not written here, so with --temp the runner
+ * says so once and does not speculate. And a pass at m = 4 has never been
+ * PRICED on the board -- the argument that it costs about one decode step is
+ * an argument about bytes, and the fence and the read back both grow with m.
+ * The acceptance statistics this prints are a property of the model and the
+ * prompt and are measured on any machine; the pass cost is the one number
+ * that needs the hardware.
+ */
+
+static void spec_push(struct llama_spec *sp, int32_t tok)
+{
+	if (sp->n_hist < sp->cap_hist)
+		sp->hist[sp->n_hist++] = tok;
+}
+
+int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
+		    int n_ctx)
+{
+	memset(sp, 0, sizeof(*sp));
+	if (k < 1)
+		k = 1;
+	/*
+	 * ⚠ AT MOST 5, BECAUSE THE ROWS ARE 1 + k AND THE BOARD REFUSES 8 AND
+	 * 10. npudev's dense sweep has 2, 4 and 6 exact on both cores and 8
+	 * and 10 missing row 0 of the wide projections, so a pass is 2, 4 or 6
+	 * rows and nothing between 6 and 12 is asked for.
+	 */
+	if (k > 5)
+		k = 5;
+	sp->k = k;
+	sp->ngram = 3;
+	sp->n_vocab = m->n_vocab;
+	sp->cap_hist = n_ctx;
+	sp->hist = malloc((size_t)n_ctx * sizeof(*sp->hist));
+	/* k drafts, row 0, and one row of padding to keep the width even */
+	sp->logits_all = malloc((size_t)(k + 2) * m->n_vocab * sizeof(float));
+	sp->junk = getenv("CHARSIU_SPEC_JUNK") != NULL;
+	if (!sp->hist || !sp->logits_all) {
+		llama_spec_free(sp);
+		return -1;
+	}
+	return 0;
+}
+
+void llama_spec_free(struct llama_spec *sp)
+{
+	free(sp->hist);
+	free(sp->logits_all);
+	memset(sp, 0, sizeof(*sp));
+}
+
+void llama_spec_push(struct llama_spec *sp, int32_t tok)
+{
+	spec_push(sp, tok);
+}
+
+void llama_spec_reset(struct llama_spec *sp)
+{
+	sp->n_hist = 0;
+}
+
+/*
+ * Prompt lookup: the longest n-gram ending at the present that has occurred
+ * before, and up to k of what followed it. Newest occurrence first, because a
+ * repeated structure is more likely to continue the way it most recently did.
+ */
+static int spec_draft(const struct llama_spec *sp, int32_t *out, int k)
+{
+	int n = sp->n_hist;
+
+	/*
+	 * ⚠ THE CONTROL. Junk drafts must be rejected every time and the text
+	 * must not move; a run where they are accepted, or where the text
+	 * changes, is a verifier that is not verifying. Deterministic in the
+	 * history length so a run reproduces.
+	 */
+	if (sp->junk) {
+		for (int i = 0; i < k; i++)
+			out[i] = (int32_t)(((unsigned)n * 104729u + (unsigned)i
+					    * 7919u + 17u) % (unsigned)sp->n_vocab);
+		return k;
+	}
+	for (int ng = sp->ngram; ng >= 1; ng--) {
+		const int32_t *pat;
+
+		if (n < ng + 1)
+			continue;
+		pat = sp->hist + n - ng;
+		for (int i = n - ng - 1; i >= 0; i--) {
+			int avail, d;
+
+			if (memcmp(sp->hist + i, pat, (size_t)ng * sizeof(*pat)))
+				continue;
+			avail = n - (i + ng);
+			d = avail < k ? avail : k;
+			memcpy(out, sp->hist + i + ng, (size_t)d * sizeof(*out));
+			return d;
+		}
+	}
+	return 0;
+}
+
+int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
+		    const struct llama_model *m, int32_t tok, int32_t *out,
+		    int max_out)
+{
+	int32_t rows[8], drafts[8];
+	int d, n, a, nc, pos0 = s->pos;
+
+	spec_push(sp, tok);
+	d = sp->off ? 0 : spec_draft(sp, drafts, sp->k);
+	/* every row must fit the cache, or the pass would write past it */
+	if (d && pos0 + 1 + d + 1 > s->n_ctx)
+		d = 0;
+	if (d == 0) {
+		const float *lg = llama_forward(s, tok, s->pos);
+
+		if (!lg)
+			return -1;
+		out[0] = llama_argmax(lg, m->n_vocab);
+		sp->passes++;
+		sp->plain++;
+		return 1;
+	}
+	rows[0] = tok;
+	for (int i = 0; i < d; i++)
+		rows[1 + i] = drafts[i];
+	n = 1 + d;
+	/*
+	 * ⚠ AN ODD WIDTH HAS NO EXPRESSION ON THE SURFACE, so pad to even with
+	 * a row that is never read: it sits after the last draft, nothing
+	 * before it can see it, and the roll back below discards it.
+	 */
+	if (n & 1)
+		rows[n++] = drafts[d - 1];
+	if (llama_verify_batch(s, m, rows, n, pos0, sp->logits_all)) {
+		/*
+		 * ⚠ REFUSED, AND SAID ONCE. batch_layers refuses before it
+		 * touches the cache, so nothing needs undoing; the rest of the
+		 * run is the plain loop and the report line says so, because
+		 * a speculative run that quietly ran plain would read as
+		 * "speculation gained nothing" and that is not what happened.
+		 */
+		if (!sp->off)
+			fprintf(stderr, "charsiu: speculation is off -- the "
+				"batched forward refused this model (%s)\n",
+				llama_batch_why_not(m));
+		sp->off = 1;
+		s->pos = pos0;
+		return llama_spec_step(sp, s, m, tok, out, max_out);
+	}
+	a = 0;
+	for (int i = 0; i < d; i++) {
+		int32_t x = llama_argmax(sp->logits_all
+					 + (size_t)i * m->n_vocab, m->n_vocab);
+
+		if (x != drafts[i])
+			break;
+		a++;
+	}
+	/*
+	 * The committed tokens: the a drafts that matched, and then the
+	 * model's own token from row a -- the correction where a draft was
+	 * wrong, or the free extra token where all of them were right. Their
+	 * count is at most d + 1, which is at most 6, and max_out is 16.
+	 */
+	nc = 0;
+	for (int i = 0; i < a && nc < max_out; i++)
+		out[nc++] = drafts[i];
+	if (nc < max_out)
+		out[nc++] = llama_argmax(sp->logits_all + (size_t)a * m->n_vocab,
+					 m->n_vocab);
+	/*
+	 * Rows 1..a hold accepted tokens and their cache entries are right.
+	 * The correction is not in the cache yet: it is the next pass's row 0.
+	 */
+	s->pos = pos0 + 1 + a;
+	/*
+	 * ⚠ EVERY TOKEN ENTERS THE HISTORY EXACTLY ONCE. The caller feeds the
+	 * LAST committed token back as the next pass's `tok`, which pushes it
+	 * then; everything before it is pushed here.
+	 */
+	for (int i = 0; i + 1 < nc; i++)
+		spec_push(sp, out[i]);
+	sp->passes++;
+	sp->drafted += (unsigned long)d;
+	sp->accepted += (unsigned long)a;
+	sp->committed += (unsigned long)nc;
+	return nc;
+}
+
+void llama_spec_report(const struct llama_spec *sp, FILE *out)
+{
+	unsigned long spec_passes = sp->passes - sp->plain;
+
+	fprintf(out, "[spec k=%d: %lu passes, %lu plain, %lu speculative; "
+		"drafted %lu, accepted %lu (%.0f%%), committed %lu; "
+		"%.2f tok/pass%s%s]\n",
+		sp->k, sp->passes, sp->plain, spec_passes,
+		sp->drafted, sp->accepted,
+		sp->drafted ? 100.0 * sp->accepted / sp->drafted : 0.0,
+		sp->committed + sp->plain,
+		sp->passes ? (double)(sp->committed + sp->plain) / sp->passes
+			   : 0.0,
+		sp->off ? ", REFUSED by the batched forward" : "",
+		sp->junk ? ", JUNK drafts (control)" : "");
 }

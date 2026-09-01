@@ -401,6 +401,40 @@ from zero, but its **ARM path** uses `vcvtnq_s32_f32`, which is ties to even, an
 path is the one that runs. Matching `roundf` made the worst logit disagreement with
 llama.cpp twice as large and cost 9% of the tokens per second.
 
+## Speculative decoding: more tokens a weight read
+
+A decode step at one row reads every weight once, and on this board that is
+the whole of its cost: Qwen3-0.6B is 298 MB of int4 read at about 16 GB/s
+across the two cores, which is the 52 ms the token takes. Rockchip's runtime
+reads the same bytes in 40 ms. Nothing inside a matmul changes the bytes and
+the NPU has no int2 or int3, so the only way to more tokens a second is more
+tokens a read, which is what a batch is.
+
+`--spec K` guesses K tokens by prompt lookup, the longest recent n-gram that
+has occurred before and what followed it, and feeds the last committed token
+plus the guesses as one batch of 1 + K rows. Every row's logits are read back;
+row i's argmax is what greedy decoding would have produced after guess i-1.
+Guesses are accepted while they match and the first row that disagrees
+supplies the token greedy would have produced there instead. So every
+committed token is the token the plain loop would have committed, and the
+guesses only decide how many of them one weight read yields. The text is
+bit-identical to greedy by construction, and `tests/spec_identity.sh` holds it
+to that on three arms, one of which drafts junk and must be refused every
+time.
+
+On a machine with no NPU, on a prompt that asks for repetition, the pass
+yields 2.29 tokens on Qwen3-0.6B, 2.45 on gemma4-E2B and 1.70 on Phi-3.5.
+Those are properties of the model and the prompt; a repetition prompt is
+prompt lookup's best case and open prose will be lower. What the host cannot
+measure is what a pass at four rows costs against one decode step, and the
+speed-up is tokens a pass divided by that. The argument that it is about one
+step is an argument about bytes; the fence and the accumulator read back both
+grow with the rows. `board_verify.sh 20` measures it, and `--spec` stays off
+until it has.
+
+Sampling at a temperature runs the plain loop: lossless speculative sampling
+exists and is not written here.
+
 ## The NPU's number format, answered on the CPU
 
 Moving a projection onto the NPU means accepting the format the hardware imposes: signed

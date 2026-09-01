@@ -51,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1387,6 +1387,48 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    printf '        4 * n_audio_state, so medium is K=4096 (surf 128) and large\n'
    printf '        is K=5120 (surf 160) -- both at or past the failing cell,\n'
    printf '        and the board has only ever run tiny (K=1536, surf 48).\n'
+   ;;
+
+20) say "20. speculative decoding: the price of a pass, and the text"
+   # ⚠⚠ THE ONE NUMBER THE HOST CANNOT MEASURE. tests/spec_identity.sh has
+   # already shown, on a machine with no NPU, that --spec commits exactly the
+   # tokens greedy would have and that junk drafts are rejected every time; and
+   # it has measured how many tokens a pass yields, which is a property of the
+   # model and the prompt: Qwen3 2.29 a pass, gemma4 2.45, phi3 1.70, on a
+   # prompt that asks for repetition. What only the board can say is what a
+   # pass at m = 4 COSTS against a decode step. The argument that it is about
+   # one step is an argument about bytes -- the weights are read once either
+   # way -- and the fence and the accumulator read back both grow with m.
+   #
+   #   speed up = tokens a pass / (pass cost in decode steps)
+   #
+   # so at 2.29 tokens a pass the break-even cost is 2.29 steps, and anything
+   # under that is a win the vendor's decode does not have.
+   #
+   # ⚠ THE TEXT IS CHECKED HERE TOO, because on the board the pass is a real
+   # batched matmul at m = 4 and the host only ever ran that a row at a time.
+   run 20
+   have spec_identity.sh || { skip 20 "spec_identity.sh not installed (dev channel)"; break; }
+   sh "$BIN/spec_identity.sh" "$MODELS" 48 >"$OUT/verify-spec.txt" 2>&1
+   rc=$?
+   sed 's/^/  /' "$OUT/verify-spec.txt"
+   wedged "phase 20" && break
+   [ "$rc" = 0 ] && ok "every model's speculative text is its greedy text, and junk was refused" \
+                 || bad "spec_identity failed on $rc model(s)"
+   # the price: the same prompt and length, plain against --spec 3, one model
+   SM=""
+   for f in "$MODELS"/Qwen3-0.6B*.gguf "$MODELS"/*.gguf; do [ -r "$f" ] && SM=$f && break; done
+   if [ -n "$SM" ]; then
+	printf '  price on %s, %s tokens:\n' "$(basename "$SM")" "${SPEC_N:-96}"
+	for arm in "" "--spec 3" "--spec 5"; do
+		r=$("$BIN/charsiu_run" "$SM" -p "$P9" -n "${SPEC_N:-96}" $arm 2>/dev/null)
+		gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms, \([0-9.]*\) tok\/s.*/\3 tok\/s (\1 tok, \2 ms)/p')
+		sl=$(printf '%s' "$r" | grep '^\[spec ' | sed 's/^\[spec k=[0-9]*: //; s/\]$//')
+		printf '    %-9s %s%s\n' "${arm:-plain}" "$gen" "${sl:+   $sl}"
+	done
+	printf '  ⚠ tok/s over passes = the pass cost in decode steps; compare it to tok/pass.\n'
+   fi
+   wedged "phase 20" && break
    ;;
 esac
 done

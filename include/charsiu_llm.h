@@ -830,6 +830,48 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos);
 const float *llama_forward_embd(struct llama_state *s, const float *embd,
 				int pos);
 
+/*
+ * The batched forward with the output head on EVERY row, for a speculative
+ * pass: logits_all is n * n_vocab floats. Advances s->pos by n; the caller
+ * rolls it back to what it accepted. -1 if the model is refused, in which case
+ * nothing was touched.
+ */
+int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
+		       const int32_t *toks, int n, int pos0, float *logits_all);
+
+/*
+ * Speculative decoding: k drafted tokens verified in one batched pass. Greedy
+ * only, and bit-identical to the plain greedy loop by construction -- the
+ * drafts decide how many tokens one weight read yields, never which tokens.
+ * The long note over llama_spec_step in llama.c has the argument.
+ */
+struct llama_spec {
+	int k;                  /* drafts a pass, 1..5 (rows are 1 + k, even) */
+	int ngram;              /* longest n-gram the lookup tries first */
+	int off;                /* the batched forward refused: plain from here */
+	int junk;               /* CHARSIU_SPEC_JUNK: drafts are noise (control) */
+	uint32_t n_vocab;
+	int32_t *hist;          /* everything seen or said, for the lookup */
+	int n_hist, cap_hist;
+	float *logits_all;      /* (k + 2) rows of n_vocab */
+	unsigned long passes, plain, drafted, accepted, committed;
+};
+int  llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
+		     int n_ctx);
+void llama_spec_free(struct llama_spec *sp);
+void llama_spec_push(struct llama_spec *sp, int32_t tok);   /* the prompt */
+void llama_spec_reset(struct llama_spec *sp);
+/*
+ * One pass. `tok` is the last committed token, not yet in the cache. Fills
+ * out[] with the tokens greedy decoding would produce next and returns how
+ * many (at least 1), or -1 at the end of the context. The caller prints them,
+ * then calls again with the LAST of them.
+ */
+int  llama_spec_step(struct llama_spec *sp, struct llama_state *s,
+		     const struct llama_model *m, int32_t tok, int32_t *out,
+		     int max_out);
+void llama_spec_report(const struct llama_spec *sp, FILE *out);
+
 /* argmax, which is the only sampler an oracle is allowed. */
 /*
  * The clock of the first pinned CPU, in MHz, or 0 where sysfs has none. Read it
