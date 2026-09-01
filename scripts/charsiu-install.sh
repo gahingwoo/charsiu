@@ -890,7 +890,7 @@ PROBE_BINS="bench_batch npu_gemm_test npu_slice_test charsiu_matmul vattn_bench 
 # board round that does not happen -- and then only prefill_control.sh was
 # listed, so every board_*.sh written since has been exactly that: reachable
 # by a path nobody types.
-PROBE_SCRIPTS="spec_identity.sh prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
+PROBE_SCRIPTS="board_next.sh spec_identity.sh prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
 board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh \
 board_threads.sh board_w4_m8.sh vattn_sweep.sh vattn_edges.sh \
 board_text_all.sh board_refused_onedev.sh board_chunk_sweep.sh board_intermittent.sh \
