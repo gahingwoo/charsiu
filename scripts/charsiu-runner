@@ -2,7 +2,8 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# charsiu: run the model named in /etc/charsiu/config.ini.
+# charsiu: run the model named in config.ini -- $HOME/.charsiu's if there is
+# one, /etc/charsiu's otherwise.
 #
 # The runtime reads 109 CHARSIU_* environment variables. Six of them decide
 # whether a decode goes to the NPU at all, and getting one wrong does not fail

@@ -15,19 +15,33 @@ claim below depends on one.
 ## The whole model, by the numbers
 
 ```
-streams            21532, of which 8808 are convolutions and 12724 DPU only
+streams            13224, of which 8808 are convolutions and 4416 DPU only
 distinct shapes    1061
-weight bits        {16: 4940, 4: 3328, 8: 40}
-M (rows per op)    {1: 3752, 32: 1108, 64: 856, 96: 728, 128: 672}
+weight bits        {16.0: 4940, 4.0: 3328, 0.0: 500, 8.0: 40}
+M (pixels a dispatch) {32: 1628, 64: 1248, 80: 776, 96: 736, 128: 680}
 ```
+
+⚠ **Both of those lines used to say something else, and both changes were bugs in
+the reader rather than in the model.** The stream count was 21532 with 12724 DPU
+only, because target `0x0401` was missing from the table and an unknown target ENDS
+a run, cutting every op into three. And the M histogram used to be headed by
+`{1: 3752, ...}` because it read the ROW count, `0x102c`, instead of the pixel
+count, `0x1034`. Do not quote either old figure.
 
 Two things stand out before any detail.
 
-**M = 1 is on the NPU.** 3752 convolution dispatches are a single row and a single
-output pixel. On the RK3588 the open stack measured that shape at about 82 times
-slower than a batched one and gates it back to the CPU. The RK3576 vendor stack does
-not: it runs the model's projections there and gets roughly 13 tokens a second on
-Llama-3.2-1B.
+**The vendor batches, and it batches almost everything.** 2816 of its 3328 int4
+projection dispatches are above M = 1, which is 85%, at widths of 16, 24, 32, 40,
+48, 64 and 80. This document said the opposite for a long time, and the reason is
+worth keeping: an int4 projection is emitted as a ONE ROW image M PIXELS WIDE, so
+its row count is 1 whatever M is. A reader that takes the row count gets 1 every
+time and concludes there is no batch. The fp16 attention is emitted as an M row
+image instead, and all 4940 of those have rows == pixels, which is why the two
+readings agreed everywhere the mistake was invisible.
+
+**It never hands one dispatch a K of 1024.** Every int4 dispatch is K = 2048 (2688
+of them, 81%) or K = 4096 (640, 19%). Llama-3.2-1B is 2048 wide with an 8192 FFN, so
+K = 2048 is the whole hidden size in one dispatch and K = 4096 is half the FFN.
 
 **The runtime is mixed precision, per role.** Not one datatype for the model.
 
@@ -35,10 +49,14 @@ Llama-3.2-1B.
 
 | role | precision | shapes (ic, oc, M) | ops |
 |---|---|---|---|
-| projections | **int4** | 2048x1024, 2048x256, 2048x4096, 4096x1024, all M=1 | 3328 |
+| projections | **int4** | 2048x1024 (896), 2048x256 (896), 2048x4096 (896), 4096x1024 (640); M = 1 to 80 | 3328 |
 | attention | **fp16** | 2688..4064 x 64, M = 32 to 48 | 4940 |
-| LM head | **int8** | 2048 x 8160, M=1 | 40 |
-| no weights | none | oc=1, M=1..5 | 500 |
+| LM head | **int8** | 2048 x 8160, M = 1 and above | 40 |
+| no weights | none | oc=1 | 500 |
+
+The int4 M ladder in full, over all 3328: M = 1 (512), 16 (384), 24 (64), 32 (512),
+40 (320), 48 (384), 64 (384), 80 (768). The widest is 80 and it is also the most
+common. charsiu's own batched prefill chunks at 32.
 
 ### The projections are split across the two cores
 
@@ -66,7 +84,7 @@ run in int4. The precision split follows the operand, not the layer.
 
 ### The LM head is int8
 
-40 ops of 2048 x 8160 at M=1. Llama-3.2-1B's vocabulary is 128256, so the head is
+40 ops of 2048 x 8160, and 32 of the 40 batch. Llama-3.2-1B's vocabulary is 128256, so the head is
 split into pieces of 8160 output channels each, in int8 rather than the int4 the
 projections use.
 
@@ -99,10 +117,22 @@ unit, against 16 for int8 and 8 for fp16. That matches the RK3588 tile-layout ta
 exactly, which is a useful independent check that the IP-level layouts are shared and
 only the machine parameters differ.
 
-## The 12724 DPU-only streams are six programs
+## The 4416 DPU-only streams, and why "six programs" was an artifact
 
-Grouping them by their configuration registers rather than their shape, there are
-only **six** distinct kinds in the whole model:
+⚠⚠ **THE TABLE BELOW IS SUPERSEDED AND IS KEPT AS A RECORD OF THE BUG, NOT OF THE
+MODEL.** Its counts sum to 12724, which is the pre-fix DPU-only total: it was built
+when target `0x0401` was missing from the reader's table, so every op was cut into a
+CNA fragment, a lost middle and a DPU fragment. The "six kinds" were the fragments,
+carrying whichever registers happened to fall on each side of the cut, and grouping
+them looked like a taxonomy.
+
+Re-run against the same file with `0x0401` known, there are **4416** DPU-only
+streams and, grouped by `0x4010` and `0x4050`, exactly **one** kind -- both
+registers read 0 in all of them, and their lengths are 31, 33, 35, 94 and 96 words.
+Whatever these programs are, those two registers do not separate them, and no
+replacement taxonomy is offered here because none has been established.
+
+The superseded table:
 
 | 0x4010 | 0x4050 | entries | count | shape (ow, oh, oc) |
 |---|---|---:|---:|---|
@@ -132,7 +162,7 @@ channel count is the KV cache length. Those lengths are:
 
 That is the whole design in one line. The vendor cannot build a register program at
 run time, so it **ships one per 32 tokens of context**, up to 4096, per attention
-matmul. It is why a 1.3 GB file holds 21532 dispatch programs for a 1.2 GB model.
+matmul. It is why a 1.3 GB file holds 13224 dispatch programs for a 1.2 GB model.
 
 An open runtime does not have to do this. Building the register stream is what the
 Mesa driver already does per operation, so charsiu can emit the exact geometry for
@@ -151,7 +181,7 @@ answer.
 - **Nothing about speed.** The file says what is dispatched, not how long it takes or
   how much of the wall clock is NPU versus CPU. Only the board says that.
 - **Nothing about the CPU side.** The runtime may still do sampling, the KV cache,
-  RoPE, the norms, or anything else on the cores; 12724 DPU-only streams suggest a lot
+  RoPE, the norms, or anything else on the cores; 4416 DPU-only streams suggest a lot
   of elementwise work is on the NPU, but which ops those are is not decoded yet.
 - **Nothing about correctness at M = 1.** That the vendor dispatches it is not proof
   the hardware is exact there. It is proof the vendor believes it is, which is a

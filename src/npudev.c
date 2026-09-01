@@ -178,6 +178,14 @@ struct npu_entry {
  * is four to five times the vendor's on the same silicon. The NPU is idle for
  * 91% of a batched matmul and this was the biggest single reason why.
  *
+ * ⚠⚠ AND THIS FIX MADE BOTH OF THOSE NUMBERS STALE. The pool worked: measured
+ * on the board across eight models, `prep` is 0.1% to 0.5% of a batched matmul
+ * now, not 36%. The idle figure went with it -- the split reads about 44%
+ * fence, 26% read, 26% pack, 2% submit, 0.2% prep, so the hardware is BUSY for
+ * roughly 44% of the call and idle for 56%, not 91%. The paragraph above is
+ * kept because it is the record of what this fix was worth. Do not quote the
+ * 36% or the 91% as current; charsiu_pool_report_batch prints the live split.
+ *
  * What the size depends on is not WHICH tensor it is. It is the widest slice,
  * how many slots the busier device gets, and m -- and a transformer has a
  * handful of those, not one per tensor. Llama-3.2-1B's 113 matmul tensors, at
@@ -388,6 +396,16 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	/*
+	 * ⚠⚠ THE DENOMINATOR, AND IT HAS TO LIVE HERE. The obvious one is
+	 * charsiu_npu_pool::hw_ms, but that is only incremented by
+	 * charsiu_pool_rows, which VISION AND WHISPER call and LLAMA DOES
+	 * NOT -- llama calls charsiu_npu_matmul directly. Using it would
+	 * have divided the five shares by zero on exactly the workload the
+	 * split was added to explain. Timed at this entry instead, so every
+	 * caller is covered and none has to remember.
+	 */
+	double bwall_us;
 	double bprep_us;	/* buffers and the output zero, before any of it */
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
@@ -664,10 +682,40 @@ struct charsiu_npu {
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
 	int kfit;
+	/*
+	 * ⚠⚠ WHETHER KFIT COULD FIRE AT ALL, which is not the same question
+	 * as whether it helped. The `ks--` below needs a REMAINDER: a model
+	 * whose every K is a multiple of kmax has none, so KFIT leaves the
+	 * dispatch plan byte for byte identical and any measured difference
+	 * belongs to the measurement. A board round scored two such models as
+	 * losses and would have kept the switch off for it.
+	 */
+	unsigned kfit_hits, kfit_seen;
+	/*
+	 * ⚠⚠ THE BUFFERS WITHOUT THE SLICING -- the control that separates
+	 * what KFIT COSTS from what it BUYS. Turning KFIT on does two
+	 * independent things: it widens five buffers to 2 * kmax, and it
+	 * makes the last slice absorb the remainder. The first happens
+	 * UNCONDITIONALLY, on every model, including the ones where no
+	 * tensor can fire -- and those models measured a small consistent
+	 * LOSS across two board rounds while their dispatch plan was
+	 * provably identical in both arms. This flag does the widening and
+	 * not the slicing, so the two can be priced apart instead of
+	 * argued about.
+	 */
+	int kwide_only;
 	/* one message per REASON; the pointer identifies it, see whine() */
 	const char *whined[8];
 	unsigned n_whined;
 	int serialpack;
+	/*
+	 * ⚠⚠ POOLING THE READ BACK IS MEASURED SLOWER AND IS OFF. It is a
+	 * parallelisation over disjoint rows and nothing else -- the text is
+	 * identical on all eight models, so it is CORRECT -- and it lost on
+	 * every one of them, 5% to 18% of the whole prefill, with the read
+	 * itself exactly DOUBLING. See the note above read_rows.
+	 */
+	int poolread;
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
 	 * 0 is the hardware doing all of it, which is every round before 371.
@@ -1021,7 +1069,7 @@ static void whine(struct charsiu_npu *g, const char *what, unsigned k, unsigned 
  */
 static size_t kmax_wide(const struct charsiu_npu *g)
 {
-	return (size_t)g->kmax * (g->kfit ? 2 : 1);
+	return (size_t)g->kmax * ((g->kfit || g->kwide_only) ? 2 : 1);
 }
 
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
@@ -1262,6 +1310,8 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
+	g->poolread = getenv("CHARSIU_NPU_POOL_READ") != NULL;
+	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
 	 * assignment every number in this file before round 391 was measured
@@ -1623,6 +1673,14 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			"N=2048 is the smallest and trips on a 1 ms hiccup\n",
 			g->slow_n, g->submits, g->min_gbs, g->slow_worst,
 			g->slow_worst_k, g->slow_worst_n);
+	if (g->kfit)
+		fprintf(stderr,
+			"charsiu NPU: KFIT narrowed %u of %u staged tensors\n",
+			g->kfit_hits, g->kfit_seen);
+	if (g->kwide_only)
+		fprintf(stderr,
+			"charsiu NPU: KFIT narrowed 0 of 0 staged tensors "
+			"(wide buffers only, no slicing)\n");
 	if (!g->submits)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
@@ -2054,8 +2112,13 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	ns = (unsigned)((e_n_npu + g->nmax - 1) / g->nmax);
 	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
 	/* the last slice absorbs the remainder rather than being it */
-	if (g->kfit && ks > 1 && (t->k % g->kmax) && !tensor_grouped(g, t))
-		ks--;
+	if (g->kfit) {
+		g->kfit_seen++;
+		if (ks > 1 && (t->k % g->kmax) && !tensor_grouped(g, t)) {
+			ks--;
+			g->kfit_hits++;
+		}
+	}
 	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
 		return -1;
@@ -3011,6 +3074,19 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 		g->bpack_us = g->bsub_us = g->bfence_us = g->bread_us = 0.0;
 }
 
+/*
+ * Wall clock across every charsiu_npu_matmul call. This is the denominator the
+ * five shares are read against; see bwall_us for why the pool's hw_ms is not.
+ */
+double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset)
+{
+	double v = g->bwall_us / 1e3;
+
+	if (reset)
+		g->bwall_us = 0.0;
+	return v;
+}
+
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset)
 {
 	double v = g->bprep_us / 1e3;
@@ -3183,8 +3259,215 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	return ob;
 }
 
-int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
-		       unsigned m, float *Y)
+/*
+ * ⚠⚠ ONE ROW IS A UNIT OF WORK, AND THE READ BACK NEVER USED THAT. Reading the
+ * accumulators is 26% of a batched matmul measured across eight models on the
+ * board -- 11.0 s of Phi-3.5's 33.8 s -- and it ran on one core while the pool
+ * that llama_state_new starts sat idle. Before this, npudev.c contained exactly
+ * one charsiu_parallel_for, on the weight pack at staging, and none on either
+ * of the two hot batched loops.
+ *
+ * Rows are safe to split and slices are not: for a fixed slot every row writes
+ * Y + r * n + s->n0, which is disjoint, while two K slices of the SAME slot
+ * accumulate into the same elements and must stay ordered. So the slice loop
+ * stays serial and the rows inside it go wide.
+ *
+ * ⚠ firstw IS INVARIANT ACROSS THE ROWS and has to be, which is why it is
+ * passed in rather than recomputed here. g->bseen is only set after the whole
+ * row loop, so every row of a slot sees the same flag; reading it per row from
+ * threads would add a race on top of a correctness bug.
+ *
+ * ⚠ THE BODY BELOW IS THE ORIGINAL LOOP BODY VERBATIM, indentation included.
+ * It is macro heavy, and the #undef block at its end is why: re-indenting it
+ * broke the directives, and so did closing the function on the same line as
+ * the last one.
+ *
+ * ⚠⚠ AND THE POOL LOST. Measured on the board over eight models, the whole
+ * prefill got 5% to 18% SLOWER and the read share went from about 26% to about
+ * 46% -- the read itself exactly doubled, on every model. The text is identical
+ * in both arms, so the split is correct; it is the granularity that is wrong.
+ *
+ *     model            serial      pooled
+ *     Phi-3.5-mini     97973 ms   109269 ms   +11.5%
+ *     Qwen2.5-1.5B     44997 ms    53276 ms   +18.4%
+ *     Qwen3-0.6B       40233 ms    42273 ms    +5.1%
+ *     SmolLM2-1.7B     52831 ms    57827 ms    +9.5%
+ *     SmolLM2-135M     15138 ms    16497 ms    +9.0%
+ *     gemma-3-1b       26033 ms    30498 ms   +17.2%
+ *     gemma-4-E2B      72244 ms    85228 ms   +18.0%
+ *     tinyllama        41346 ms    47722 ms   +15.4%
+ *
+ * Two reasons, and both are about the size of the unit rather than the code:
+ *
+ *   - ONE DISPATCH PER SLICE. A dispatch is a broadcast, eight wakeups and two
+ *     rounds of mutex, and the work it fans out is m = 32 rows of one slice --
+ *     a few hundred microseconds. The pool costs more than that.
+ *   - AN EVEN SPLIT OVER UNEVEN CORES. RK3576 is four A72 and four A53,
+ *     sysconf gives 8, cpus_pin only acts if CHARSIU_CPUS is set, and the
+ *     barrier waits for the A53s.
+ *
+ * ⚠ Hoisting the dispatch out of the slice loop was the obvious next move and
+ * the arithmetic does not support it: it multiplies the work per dispatch by
+ * the slice count, about three, against an overhead that is already larger
+ * than the work. Whisper and the vision tower got 3.3x from this same pool
+ * because their ranges are whole tensors, not 32 rows.
+ *
+ * The read is m * n * ks, and ks is the number of K slices -- so the way to
+ * make it smaller is fewer, wider slices, not more cores. That is KMAX, which
+ * was measured 37% slower once and attributed to the index deal that has since
+ * been fixed, and has not been re-measured against the deal that replaced it.
+ */
+struct read_rows {
+	struct charsiu_npu *g;
+	const struct npu_entry *e;
+	const struct npu_slot *s;
+	const float *fo;
+	const int32_t *io;
+	float *Y;
+	unsigned m, sn, ki;
+	int grp, firstw;
+};
+
+static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct read_rows *c = ctx;
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	const float *fo = c->fo;
+	const int32_t *io = c->io;
+	float *Y = c->Y;
+	unsigned m = c->m, sn = c->sn, ki = c->ki;
+	int grp = c->grp, firstw = c->firstw;
+
+	(void)m; (void)ki; (void)grp; (void)io; (void)fo;
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
+					const uint32_t *mp = g->bmap
+							  + (size_t)r * g->bmap_n4;
+					float *yr = Y + (size_t)r * e->t->n
+						  + s->n0;
+					unsigned n4 = sn / 4, j;
+
+					/*
+					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
+					 * tail is whatever a slice's width
+					 * leaves over, and it recomputes its
+					 * own base rather than reading a table
+					 * entry that may not exist.
+					 */
+/*
+					 * ⚠ THE BRANCH IS OUTSIDE THE LOOP, and
+					 * it cannot be a multiply by zero: Y is
+					 * the caller's buffer and a bit pattern
+					 * in untouched memory can be a NaN,
+					 * which times zero is a NaN and not a
+					 * zero.
+					 *
+					 * ⚠⚠ AND A NEON FORM OF THIS WAS
+					 * WRITTEN, MEASURED AND TAKEN OUT.
+					 *
+					 * The four are one vector, so a run is
+					 * vld1q from one index, vmulq, vst1q,
+					 * and it was bit identical to this --
+					 * checked, including the rounding,
+					 * because the C here is a multiply then
+					 * an add and an fmla rounds once where
+					 * it rounds twice. On this toolchain
+					 * mul-then-add differs from the C in 0
+					 * of a million and fmla in 227529, so
+					 * the C is not contracted and the
+					 * vector form matched.
+					 *
+					 * The board moved by NOTHING: read was
+					 * 223, 320, 555 ms at m of 32, 48 and
+					 * 80 before it and 229, 337, 580 after.
+					 *
+					 * ⚠ AND THE ARITHMETIC SAYS WHY, which
+					 * is the part worth keeping. The gather
+					 * moves about 403 MB at m = 32 and 1007
+					 * at m = 80 -- Y once per K slice, read
+					 * and written -- in 229 and 580 ms,
+					 * which is 1.76 and 1.74 GB/s, the same
+					 * rate at both. A run is 16 BYTES and a
+					 * cache line is 64, and the runs are
+					 * scattered, so the DRAM sees four
+					 * times that: about 7 GB/s against this
+					 * board's 9.4 roof, 75% of it.
+					 *
+					 * It was never instruction bound.
+					 * Fewer instructions cannot help and
+					 * the only lever left is fewer BYTES:
+					 * walking the source sequentially and
+					 * scattering into Y would use whole
+					 * lines instead of a quarter of each.
+					 */
+#define GATHER4(OP, VAL)                                                     \
+					for (j = 0; j < n4; j++) {           \
+						float *yp = yr + j * 4;      \
+						VAL;                         \
+						yp[0] SC_##OP v0;            \
+						yp[1] SC_##OP v1;            \
+						yp[2] SC_##OP v2;            \
+						yp[3] SC_##OP v3;            \
+					}
+#define SC_ASSIGN  =
+#define SC_ADD     +=
+#define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
+	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
+		   v2 = fp[2]*cp[2], v3 = fp[3]*cp[3]
+#define W4   const float *fp = fo + mp[j];                                   \
+	     float v0 = fp[0], v1 = fp[1], v2 = fp[2], v3 = fp[3]
+#define I8   const int32_t *ip = io + mp[j];                                 \
+	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
+		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
+					if (g->w4 && grp) {
+						const float *sc = s->sc;
+
+						if (firstw) { GATHER4(ASSIGN, W4G) }
+						else        { GATHER4(ADD, W4G) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4] * sc[j];
+
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
+						}
+					} else if (g->w4) {
+						if (firstw) { GATHER4(ASSIGN, W4) }
+						else        { GATHER4(ADD, W4) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4];
+
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
+						}
+					} else {
+						float d1 = g->bd1[(size_t)ki * m + r];
+
+						if (firstw) { GATHER4(ASSIGN, I8) }
+						else        { GATHER4(ADD, I8) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = (float)io[mp[j / 4] + j % 4] * d1;
+
+							if (firstw) yr[j] = v;
+							else        yr[j] += v;
+						}
+					}
+#undef GATHER4
+#undef SC_ASSIGN
+#undef SC_ADD
+#undef W4G
+#undef W4
+#undef I8
+	}
+}
+
+/*
+ * ⚠ THE BODY IS A STATIC INNER SO THE WALL CLOCK CANNOT BE FORGOTTEN. This
+ * function has eleven return points and wrapping each of them is a bug waiting
+ * for the twelfth. See bwall_us.
+ */
+static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
+			    unsigned m, float *Y)
 {
 	struct npu_entry *e;
 	struct npu_outbuf *ob;
@@ -3632,125 +3915,17 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 				 * instead cost exactly one tensor: 3585 rows of
 				 * 3616.
 				 */
-				for (unsigned r = 0; r < m; r++) {
-					const uint32_t *mp = g->bmap
-							  + (size_t)r * g->bmap_n4;
-					float *yr = Y + (size_t)r * e->t->n
-						  + s->n0;
-					unsigned n4 = sn / 4, j;
+				{
 					unsigned ni = s->n0 / g->nmax;
-					int firstw = !g->bseen[ni];
+					struct read_rows rr = {
+						g, e, s, fo, io, Y, m, sn, ki,
+						grp, !g->bseen[ni]
+					};
 
-					/*
-					 * ⚠ FOUR AT A TIME OFF ONE INDEX. The
-					 * tail is whatever a slice's width
-					 * leaves over, and it recomputes its
-					 * own base rather than reading a table
-					 * entry that may not exist.
-					 */
-/*
-					 * ⚠ THE BRANCH IS OUTSIDE THE LOOP, and
-					 * it cannot be a multiply by zero: Y is
-					 * the caller's buffer and a bit pattern
-					 * in untouched memory can be a NaN,
-					 * which times zero is a NaN and not a
-					 * zero.
-					 *
-					 * ⚠⚠ AND A NEON FORM OF THIS WAS
-					 * WRITTEN, MEASURED AND TAKEN OUT.
-					 *
-					 * The four are one vector, so a run is
-					 * vld1q from one index, vmulq, vst1q,
-					 * and it was bit identical to this --
-					 * checked, including the rounding,
-					 * because the C here is a multiply then
-					 * an add and an fmla rounds once where
-					 * it rounds twice. On this toolchain
-					 * mul-then-add differs from the C in 0
-					 * of a million and fmla in 227529, so
-					 * the C is not contracted and the
-					 * vector form matched.
-					 *
-					 * The board moved by NOTHING: read was
-					 * 223, 320, 555 ms at m of 32, 48 and
-					 * 80 before it and 229, 337, 580 after.
-					 *
-					 * ⚠ AND THE ARITHMETIC SAYS WHY, which
-					 * is the part worth keeping. The gather
-					 * moves about 403 MB at m = 32 and 1007
-					 * at m = 80 -- Y once per K slice, read
-					 * and written -- in 229 and 580 ms,
-					 * which is 1.76 and 1.74 GB/s, the same
-					 * rate at both. A run is 16 BYTES and a
-					 * cache line is 64, and the runs are
-					 * scattered, so the DRAM sees four
-					 * times that: about 7 GB/s against this
-					 * board's 9.4 roof, 75% of it.
-					 *
-					 * It was never instruction bound.
-					 * Fewer instructions cannot help and
-					 * the only lever left is fewer BYTES:
-					 * walking the source sequentially and
-					 * scattering into Y would use whole
-					 * lines instead of a quarter of each.
-					 */
-#define GATHER4(OP, VAL)                                                     \
-					for (j = 0; j < n4; j++) {           \
-						float *yp = yr + j * 4;      \
-						VAL;                         \
-						yp[0] SC_##OP v0;            \
-						yp[1] SC_##OP v1;            \
-						yp[2] SC_##OP v2;            \
-						yp[3] SC_##OP v3;            \
-					}
-#define SC_ASSIGN  =
-#define SC_ADD     +=
-#define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
-	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
-		   v2 = fp[2]*cp[2], v3 = fp[3]*cp[3]
-#define W4   const float *fp = fo + mp[j];                                   \
-	     float v0 = fp[0], v1 = fp[1], v2 = fp[2], v3 = fp[3]
-#define I8   const int32_t *ip = io + mp[j];                                 \
-	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
-		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
-					if (g->w4 && grp) {
-						const float *sc = s->sc;
-
-						if (firstw) { GATHER4(ASSIGN, W4G) }
-						else        { GATHER4(ADD, W4G) }
-						for (j = n4 * 4; j < sn; j++) {
-							float v = fo[mp[j / 4] + j % 4] * sc[j];
-
-							if (firstw) yr[j] = v;
-							else        yr[j] += v;
-						}
-					} else if (g->w4) {
-						if (firstw) { GATHER4(ASSIGN, W4) }
-						else        { GATHER4(ADD, W4) }
-						for (j = n4 * 4; j < sn; j++) {
-							float v = fo[mp[j / 4] + j % 4];
-
-							if (firstw) yr[j] = v;
-							else        yr[j] += v;
-						}
-					} else {
-						float d1 = g->bd1[(size_t)ki * m + r];
-
-						if (firstw) { GATHER4(ASSIGN, I8) }
-						else        { GATHER4(ADD, I8) }
-						for (j = n4 * 4; j < sn; j++) {
-							float v = (float)io[mp[j / 4] + j % 4] * d1;
-
-							if (firstw) yr[j] = v;
-							else        yr[j] += v;
-						}
-					}
-#undef GATHER4
-#undef SC_ASSIGN
-#undef SC_ADD
-#undef W4G
-#undef W4
-#undef I8
+					if (g->poolread)
+						charsiu_parallel_for(read_rows, &rr, m);
+					else
+						read_rows(&rr, 0, m);
 				}
 				/* ⚠ AFTER the row loop: every row of this slot
 				 * shares the flag, and setting it inside would
@@ -3774,6 +3949,16 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			for (unsigned j = 0; j < (unsigned)e->t->n; j++)
 				Y[(size_t)r * e->t->n + j] *= e->t->scale[j];
 	return 0;
+}
+
+int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
+		       unsigned m, float *Y)
+{
+	double t0 = now_us();
+	int rc = npu_matmul_inner(g, id, X, m, Y);
+
+	g->bwall_us += now_us() - t0;
+	return rc;
 }
 
 /*

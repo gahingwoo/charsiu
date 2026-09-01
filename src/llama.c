@@ -2733,6 +2733,160 @@ static uint32_t state_widest(const struct llama_model *m)
 	return w;
 }
 
+/*
+ * ⚠⚠ A WIDER K SLICE IS FREE ON SOME MODELS AND BUYS QUALITY ON OTHERS, and
+ * which one a model is can be read off two integers.
+ *
+ * The read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
+ * directly less work -- the board measured KMAX 4096 taking Phi-3.5's read from
+ * 11776 ms to 3484. But npudev's own note closes the free version of it: ONE
+ * DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP, so KMAX and
+ * CHARSIU_NPU_W4_GROUP move together, and moving them changes how the weights
+ * were quantised.
+ *
+ * ⚠ EXCEPT WHERE THEY WERE NEVER GROUPED. npuquant falls back to one scale a
+ * row when K % group is non-zero. A model whose every K misses every candidate
+ * width is on that per-row path at all of them, so widening changes the
+ * SLICING and not one weight -- and the board says so: gemma-3-1b (1152, 6912)
+ * came back byte identical at 1024, 2048 and 4096 on three prompts, while
+ * Phi-3.5 (3072, 8192) and SmolLM2-1.7B (2048, 8192) degraded, the latter to
+ * "cold.  .  .  .  ." at 4096.
+ *
+ * ⚠ AND THE COUNTING PROMPT COULD NOT SEE ANY OF THAT. An earlier round swept
+ * KMAX with "1 2 3 ... 256" and reported text identical on all eight models,
+ * because continuing a count is the least quantisation sensitive thing a
+ * language model does. The degradation above was found only once the probe
+ * asked something else.
+ *
+ * So: widen only when NO tensor's grouping changes, which for a model that is
+ * ungrouped at the baseline means it is ungrouped everywhere. Anything else
+ * keeps 1024 and can still be overridden by hand.
+ */
+static void llama_auto_kmax(const struct llama_model *m)
+{
+	/*
+	 * ⚠ 2048 ONLY, AND 4096 IS DELIBERATELY NOT HERE. Phase 13 put the
+	 * batched path against the model's own token loop at 1024, 2048, 3072
+	 * and 4096, on the three models whose K divides none of them -- so the
+	 * quantiser emits the same bytes across the sweep and only the slicing
+	 * moves. 2048 agrees on all three. Above it:
+	 *
+	 *   slice 2816   WRONG   (Qwen2.5 at KMAX 3072, surf 88)
+	 *   slice 3072   right   (gemma-3-1b at KMAX 3072, surf 96)
+	 *   slice 4096   WRONG   (both, surf 128)
+	 *
+	 * which is not a size threshold -- 3072 is larger than 2816 and works.
+	 * Something else is wrong above 2048 and it has not been found, so the
+	 * candidate list stops at the width the board has actually verified.
+	 * CHARSIU_NPU_KMAX by hand still reaches anything.
+	 *
+	 * 2048 is also what the vendor uses for 81% of its own int4 dispatches.
+	 */
+	static const unsigned cand[] = { 2048 };
+	unsigned base = 1024, i, j;
+	uint64_t k[8];
+	char buf[16];
+	unsigned nk = 0;
+
+	if (getenv("CHARSIU_NPU_KMAX") || getenv("CHARSIU_NPU_W4_GROUP"))
+		return;                 /* asked for by hand, leave it alone */
+
+	/*
+	 * ⚠⚠ SET THE BASELINE FIRST, ALWAYS, BEFORE DECIDING ANYTHING. Falling
+	 * out of this function without setting them does NOT leave 1024: the
+	 * code defaults are CHARSIU_NPU_KMAX 4096 in npudev.c and, in
+	 * npuquant.c, a group of k -- one absmax over a whole row. No board
+	 * round has ever run that pair; every probe pinned 1024/1024, which is
+	 * exactly why nobody noticed the defaults had drifted away from it.
+	 *
+	 * Unpinning the probes and shipping this function together turned that
+	 * into eight models of nine answering wrongly, and the six that this
+	 * function DECLINED to widen were the six that got the untouched
+	 * defaults. A function that decides not to act still has to say so.
+	 */
+	setenv("CHARSIU_NPU_KMAX", "1024", 1);
+	setenv("CHARSIU_NPU_W4_GROUP", "1024", 1);
+
+	/*
+	 * ⚠ THE WIDENING IS ON, AND WHAT TURNED IT ON WAS ONE PHASE. Phase 13
+	 * compares the batched path against the model's own TOKEN LOOP at each
+	 * width -- phases 10 and 12 compare batched against batched and are
+	 * blind to a batched-path fault by construction, which is how a wide
+	 * slice was called "identical" on three models and shipped wrong.
+	 * CHARSIU_NPU_KMAX_AUTO=0 turns it off.
+	 *
+	 * The reasoning below is sound as far as the QUANTISER goes and the
+	 * board agreed with it: at 1024, 2048 and 4096 the three models whose
+	 * every K misses every width came back byte identical on three prompts.
+	 * But that comparison, and the KMAX sweep in phase 10, put a BATCHED
+	 * run against another BATCHED run. Phase 2 puts the batched path
+	 * against the model's own token loop, and there Qwen2.5 and gemma-3-1b
+	 * DISAGREE at 4096 -- both of them models this function had cleared,
+	 * and both of them models phase 12 had called identical.
+	 *
+	 * So the weights are fine and something in the batched path is not, at
+	 * a K slice wider than 1024. Until that is found, the widest safe slice
+	 * is the one the board has always run.
+	 */
+	{
+		const char *a = getenv("CHARSIU_NPU_KMAX_AUTO");
+
+		if (a && *a == '0')
+			return;
+	}
+
+	k[nk++] = m->n_embd;
+	if (m->n_ff)
+		k[nk++] = m->n_ff;
+	/*
+	 * ⚠⚠ EVERY LAYER'S OWN WIDTH, NOT THE MODEL'S. gemma4 gives each layer
+	 * its own feed_forward_length -- 6144 for its first fifteen and 12288
+	 * after -- and the model wide n_ff is only the fallback. Checking that
+	 * one number would clear a model whose per layer widths include a
+	 * grouped one, and this decision is only safe when it has seen every K
+	 * that will be staged.
+	 */
+	if (m->layers)
+		for (i = 0; i < m->n_layer; i++) {
+			uint64_t f = m->layers[i].n_ff ? m->layers[i].n_ff
+						       : m->n_ff;
+			int seen = 0;
+
+			for (j = 0; j < nk; j++)
+				if (k[j] == f)
+					seen = 1;
+			if (seen || !f)
+				continue;
+			if (nk == sizeof(k) / sizeof(k[0]))
+				return;   /* more widths than room: do not guess */
+			k[nk++] = f;
+		}
+
+	for (i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+		int safe = 1;
+
+		for (j = 0; j < nk; j++) {
+			/*
+			 * Grouped at the baseline, or grouped at the candidate:
+			 * either way the scale layout is not what it was.
+			 */
+			if (k[j] % base == 0 || k[j] % cand[i] == 0)
+				safe = 0;
+		}
+		if (!safe)
+			continue;
+		snprintf(buf, sizeof(buf), "%u", cand[i]);
+		setenv("CHARSIU_NPU_KMAX", buf, 1);
+		setenv("CHARSIU_NPU_W4_GROUP", buf, 1);
+		if (charsiu_diag())
+			fprintf(stderr, "charsiu: K slices at %u -- no tensor "
+				"of this model is grouped at any candidate "
+				"width, so the weights are unchanged\n",
+				cand[i]);
+		return;
+	}
+}
+
 struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 {
 	struct llama_state *s = calloc(1, sizeof(*s));
@@ -2815,6 +2969,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 
 		if (maxn > m->n_vocab)
 			maxn = m->n_vocab;
+		llama_auto_kmax(m);
 		s->pool.dev = charsiu_npu_open(widest, maxn, s->pool.cap);
 		if (!s->pool.dev) {
 			fprintf(stderr, "charsiu: no NPU; staying on the CPU\n");
@@ -2938,8 +3093,18 @@ void llama_state_free(struct llama_state *s)
 		}
 	}
 	llama_stages_report();
-	if (s->pool.dev)
+	if (s->pool.dev) {
 		charsiu_npu_report(s->pool.dev);
+		/*
+		 * ⚠ llama had NO batched breakdown at all. The five counters
+		 * behind this have existed since they were written with no
+		 * caller anywhere, and vision and whisper reach them only
+		 * through charsiu_pool_report, which nothing on this path
+		 * calls. It self-suppresses when no prompt took the batched
+		 * path, so a decode-only run prints nothing new.
+		 */
+		charsiu_pool_report_batch(&s->pool, stderr);
+	}
 	charsiu_npu_close(s->pool.dev);
 	if (s->pool.t) {
 		for (unsigned i = 0; i < s->pool.n; i++)

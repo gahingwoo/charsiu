@@ -131,10 +131,13 @@ echo "arms     $ARMS"
 # ARMS held three, which is the same class of lie as a computed width: the
 # thing on screen has to be the thing that happened.
 for A in $ARMS; do case $A in
-default) echo "  default  as shipped: two NPU cores" ;;
+default) echo "  default  as shipped: two NPU cores, submits serialised" ;;
 onedev)  echo "  onedev   CHARSIU_NPU_ONEDEV=1 -- ONE core; the control for the core pair" ;;
-serial)  echo "  serial   CHARSIU_NPU_BATCH_SERIAL=1 -- both cores, never at the same"
-         echo "           time: the candidate FIX, and it keeps decode's second core" ;;
+serial)  echo "  serial   CHARSIU_NPU_BATCH_PARALLEL=0 -- both cores, never at the same"
+         echo "           time. It is the SHIPPED behaviour, so this arm and default"
+         echo "           are the same run; parallel is the arm that returns wrong text" ;;
+parallel) echo "  parallel CHARSIU_NPU_BATCH_PARALLEL=1 -- the overlap put back: the"
+         echo "           fault this default exists to avoid, 13 of 16 wrong when priced" ;;
 zero)    echo "  zero     CHARSIU_NPU_BATCH_ZERO=1 -- a TIMING perturbation, not a"
          echo "           semantic control: the memset cannot change what the"
          echo "           hardware computes, so a failure only here is a race" ;;
@@ -222,7 +225,8 @@ for ARM in $ARMS; do
 	case $ARM in
 	default) EXTRA="" ;;
 	onedev)  EXTRA="CHARSIU_NPU_ONEDEV=1" ;;
-	serial)  EXTRA="CHARSIU_NPU_BATCH_SERIAL=1" ;;
+	serial)  EXTRA="CHARSIU_NPU_BATCH_PARALLEL=0" ;;
+	parallel) EXTRA="CHARSIU_NPU_BATCH_PARALLEL=1" ;;
 	zero)    EXTRA="CHARSIU_NPU_BATCH_ZERO=1" ;;
 	*) echo "unknown arm '$ARM'" >&2; continue ;;
 	esac
@@ -322,8 +326,9 @@ d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
 two=0
 [ -n "$d" ] && [ "$d" -gt 0 ] && two=$((two + d))
 [ -n "$z" ] && [ "$z" -gt 0 ] && two=$((two + z))
-# ⚠ THE SERIAL ARM IS THE CANDIDATE FIX, so it is reported on its own line
-# whatever the rest says -- it is the only arm here that could ship.
+# ⚠ THE SERIAL ARM IS WHAT SHIPS, so it is reported on its own line whatever
+# the rest says. It is also what `default` now runs, so the two agreeing is the
+# expected result and only `parallel` puts the overlap back.
 sr=${res_serial:-}
 if [ -n "$sr" ]; then
 	if [ "$sr" -eq 0 ]; then

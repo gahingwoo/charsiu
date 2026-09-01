@@ -306,6 +306,7 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
 /* the fifth segment: buffers and the output zero, before any packing */
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
+double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);
 /* how much of prep is the output buffer allocation, and how often */
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
 /* several independent projections of the same activation, one submit, one fence */
@@ -677,6 +678,13 @@ int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
 
 /* One line: how much of the work actually reached the hardware. */
 void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out);
+
+/*
+ * The five-way split of a batched matmul plus the share with no name.
+ * Called by charsiu_pool_report; separate so a caller can ask for the
+ * breakdown without the pool line.
+ */
+void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out);
 
 /* $XDG_CACHE_HOME/charsiu/<name>.wq, made if it is not there. NULL on failure. */
 const char *charsiu_cache_path(const char *model, char *buf, size_t max);

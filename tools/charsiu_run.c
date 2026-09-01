@@ -165,7 +165,7 @@ static void usage(void)
 "usage: charsiu_run MODEL.gguf [options]\n"
 "  -p TEXT       the prompt (default: a short one)\n"
 "  -f FILE       read the prompt from a file\n"
-"  --chat        wrap the prompt in the Llama 3 chat template\n"
+"  --chat        wrap the prompt in the chat template the file asks for\n"
 "  --sys TEXT    the system message, with --chat\n"
 "  -n N          how many tokens to generate (default 64)\n"
 "  -c N          context, in tokens (default: the model's training context)\n"
@@ -749,8 +749,22 @@ int main(int argc, char **argv)
 		 * refused the whole prompt goes through the token loop, rather
 		 * than half of it taking one path and half the other.
 		 */
+		/*
+		 * ⚠ 80, AND IT IS THE VENDOR'S NUMBER. Their int4 M ladder,
+		 * read off a .rkllm, is 1, 16, 24, 32, 40, 48, 64 and 80, and
+		 * 80 is both the widest and the most common -- 768 of 3328.
+		 * The board swept 32, 64, 80 and 96 over eight models: the text
+		 * is identical at every width, which it must be because a chunk
+		 * changes no arithmetic, and 80 was fastest on five of the
+		 * eight and never the worst.
+		 *
+		 * ⚠ 96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR
+		 * stops and not where the hardware does. It was in the sweep
+		 * for exactly that reason: a sweep that stops where they stop
+		 * cannot tell a ceiling from a choice.
+		 */
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
-		int chunk = ec ? atoi(ec) : 32;
+		int chunk = ec ? atoi(ec) : 80;
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };

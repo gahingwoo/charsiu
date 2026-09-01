@@ -36,9 +36,12 @@ token, and the head is 131.3 MB of int4 weights: 131.3 / 12.59 = 10.43 GB/s agai
 10.58 GB/s this board measures for weight bandwidth. The time a batched prompt does not
 spend is the time it takes to stream the head once per token.
 
-It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files. Decode is at the
-board's DRAM roof: 10.8 GB/s of weights, 1661 ms of a 1792 ms hardware path spent waiting
-on the fence, and one millisecond of a token unaccounted for.
+It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files. Decode is
+DISPATCH bound rather than bandwidth bound, which is the opposite of what this file said
+for a long time: a call costs `128.7 + 36.8*tasks + 110.0*MB` us on the busier of the two
+cores, 39% of the hardware path is the fixed part of that, and gate and up together run at
+13.65 GB/s against a 10.58 GB/s weight roof. Reading it as a bandwidth wall is what made
+fewer and larger K slices look like the obvious move; they measured 37% SLOWER.
 
 **And it sees.** A vision tower read out of llama.cpp's `mmproj` gguf, on the same
 primitives -- a patch embedding is a convolution whose stride equals its kernel, which
@@ -64,11 +67,6 @@ $ charsiu_whisper ggml-tiny.en.bin --transcribe --audio jfk.wav
 Every stage is diffed against numpy on the real weights: the spectrogram at 1.7e-05,
 the encoder at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the
 same argmax.
-
-⚠ On the board it takes **34.5 s for 11 s of audio**, and a picture takes **153 s**,
-because **none of the three new modalities touches the NPU yet** -- they call
-`gguf_matvec` directly and only the language model's projections are routed. Three
-independent graphs measure the same 0.6 G-mac/s, which is the scalar CPU path.
 
 **And it matches pictures to words.** CLIP's two towers land in one space:
 
@@ -272,10 +270,7 @@ question, and they are kept because the reasoning in them is still the reasoning
 What they say is left has since been done: models run, int4 computes end to end, and
 the numbers at the top of this file are measured rather than projected. The two items
 this paragraph used to name as open have closed since -- prefill batches above M = 1,
-and the stale width cap that kept an output head on the CPU is gone. What is still
-open is narrower and further down: w4a16 computes exactly one row whatever it is
-asked for, so an int4 prompt gains only the skipped output head, and phi3 does not
-batch at all because its K and V arrive fused.
+and the stale width cap that kept an output head on the CPU is gone.
 
 One thing on that list has not moved: the reference still requantises in float where
 the hardware uses an integer scale and shift. It agrees to the byte on everything
@@ -459,8 +454,12 @@ fetch.** Three things say so and each of them could have said otherwise:
   are both 1.05 MB and came out 111.56 and 111.24 us, 0.3% apart. K=2048 N=1024 and
   K=1024 N=2048 are both 2.10 MB, 208.06 and 211.21 us, 1.5% apart. That test was run
   to break the reading above and did not.
-- **a second core does not help.** Two jobs of eight tasks were about 5% *worse* than
-  one job of sixteen at every shape, which is what a bandwidth bound workload does.
+- **a second core did not help, and the reason was not bandwidth.** Two jobs of eight
+  tasks were about 5% *worse* than one job of sixteen at every shape. That was read as a
+  bandwidth bound workload and it was the deal: slices went to devices by index,
+  `(ki * ns + ni) & 1`, and ki and ni restart at zero for every tensor, so a
+  single slice tensor landed entirely on device 0 and the other core sat out. Dealing to
+  the less loaded core instead is worth 15% to 21% of the token hardware path.
 
 On top of the per task cost sits about 172 us per submit, which chaining removes. That
 is why a 0.5 MB projection gains 4.4x from batching and a 2 MB one only 1.9x.
@@ -871,7 +870,6 @@ open, and both are measured rather than untried
     it stops.
   charsiu_bench has an int4 path now, with the GB/s column counting the weight
     bytes a shape really moves, `k*n/2` for int4 against `k*n` for int8.
-  charsiu_bench has no int4 path, so "what does int4 buy" still cannot be asked.
 ```
 
 ### "Half the k" is not half the weights
@@ -1594,7 +1592,7 @@ where it used to charge all fifteen seconds of quantising to prefill and report 
 
 ### Why it was not routed before, which was not what it looked like
 
-The suspect was the coefficient buffer. `charsiu_coef_bytes` bounds the
+The suspect was the coefficient buffer. `charsiu_coef_bytes` used to bound the
 coefficient surface by `k*n`, which makes it four times the weight buffer and
 would put this head at 1210 MB against 151 MB of weights. That bound is a guess
 and its own comment has said so since it was written: the two walls it was sized
@@ -1628,9 +1626,10 @@ The staging bar hid the arithmetic too: its denominator is a prediction and its
 heartbeat fires every sixteenth tensor, so it drew `183/183` over a run that
 staged 182. It reconciles against the runtime's own count now.
 
-The coefficient bound is still unmeasured and still worth measuring.
-`npu_gemm_test K N --coef` walks it downward and stops at the first value that is
-not exact. ⚠ It walks DOWN because under-allocating does not return an error: the
+65536 elements is the default now, because it is what every board round has used;
+`CHARSIU_COEF_ELEMS=0` asks for `k*n`. The bound itself is still unmeasured and
+still worth measuring. `npu_gemm_test K N --coef` walks it downward and stops at
+the first value that is not exact. ⚠ It walks DOWN because under-allocating does not return an error: the
 RDMA reads past the buffer, the IOMMU faults, and the job times out with every
 register correct. The last exact value is the floor; everything below it is
 unexplored rather than known bad.
@@ -1657,7 +1656,9 @@ one of 26 layers, and 468 slices where 338 would do. Every llama dimension is a 
 of two and divides 1024 exactly, which is why this had never come up.
 `CHARSIU_NPU_KFIT=1` gives the last slice the remainder instead. Ungrouped tensors
 only: a grouped tensor carries one scale per (channel, K group) and a slice spanning
-two groups would apply the first group's scale to both. Off by default, unrun.
+two groups would apply the first group's scale to both. Off by default. The first
+run of it on the board overran three batched buffers; with that fixed the tokens
+are identical on eight models.
 
 ### More than one architecture, and two things that were quietly wrong
 
@@ -1665,13 +1666,15 @@ two groups would apply the first group's scale to both. Off by default, unrun.
 gate has to match it exactly: it exists to save a two gigabyte download and is wrong in
 both directions if it drifts.
 
-⚠ All seven decode. **Only the plain ones batch a prompt**, and the batched layer loop
-refuses the rest rather than computing something else -- gemma3's window and two rope
-bases, gemma4's per layer embeddings and shared KV, qwen3's q and k norms, phi3's fused
-K and V, and any bias, post norm or softcap. A refused model falls back to the token
-loop, which is correct everywhere and merely slower: phi3's prompt runs at 4.96 tok/s,
-what a generated token costs. Splitting a fused qkv into three views is the whole of
-what phi3 needs, and the control above says it is worth 12.4 ms a token.
+⚠ All seven decode and all seven batch a prompt. The last two off that list, gemma4
+and phi3, were refused for properties that turned out not to be the cause: the faults
+were an odd batch width, which has no expression on the accumulator surface, and the
+two NPU cores corrupting each other when their submits overlap. The chunker emits only
+even widths now and the submits are serialised.
+
+⚠ An empty refusal list means the next architecture will not be refused by this loop,
+it will be MISSED by it. `tests/board_text_all.sh` is the check that caught phi3, on
+its first run.
 
 ⚠ And a refusal has to be audible. It used to be a `return 0` the caller swallowed, so
 "the flag did nothing" and "this architecture was never batchable" looked identical from
@@ -1681,7 +1684,7 @@ line now saying which path its prompt took, and the reason when it fell back:
 
 ```
 charsiu: prompt batched, 64 tokens in chunks of 32
-charsiu: prompt a token at a time -- this model is not batched: fused or absent K and V projections
+charsiu: prompt a token at a time (CHARSIU_NO_BATCH_PREFILL)
 ```
 
 qwen3 is the llama graph with the three QKV biases dropped and a norm added on Q and K
@@ -1786,10 +1789,10 @@ written by whoever wrote the C, so a convention they SHARE passes. The patch gat
 order is the one to suspect first if a real model ever describes the wrong picture
 fluently.
 
-⚠ **phi3 and gemma3 do not batch a prompt**, and gemma3 is the family whose vision
-models people will reach for. The tower batches -- it is our own graph -- but the
-embeddings it produces enter the language model one at a time until the sliding window
-case is written.
+⚠ **A prompt with a picture in it takes the token loop.** The tower batches -- it is
+our own graph -- but the batched language model builds its rows from the embedding
+table by token id, and the picture's rows did not come from there. Sending them
+through it would batch the text and drop the picture.
 
 ### What a tokens-per-second number needs before it can be compared
 
@@ -1876,10 +1879,10 @@ The rest of what the file says is in [docs/vendor-dispatch.md](docs/vendor-dispa
 ## Prerequisite
 
 The RK3576 support in `rocket` is not upstream yet. It is on the list as
-[PATCH v9](https://lore.kernel.org/all/cover.1787568658.git.gahing@gahingwoo.com/),
+[PATCH v11](https://lore.kernel.org/all/20260831081956.84871-1-gahing@gahingwoo.com/),
 which has collected an Acked-by from Conor Dooley on both dt-bindings, a Reviewed-by
-from Abel Vesa on both pmdomain patches, and a Tested-by from Igor Paunovic on the two
-reset-race patches -- his testing on RK3588 reproduced, once in 102 induced resets, an
+from Abel Vesa on both pmdomain patches, and a Tested-by from Igor Paunovic on each of
+the three reset-race patches with a Reviewed-by on the refactor -- his testing on RK3588 reproduced, once in 102 induced resets, an
 inference that signalled success while its output buffer was never written, and only
 on the arm without them. The driver plus the Mesa work it comes from is
 [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu), which is where the

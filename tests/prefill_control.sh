@@ -4,15 +4,10 @@
 #
 # prefill_control.sh: what is int4's prefill rate actually made of?
 #
-# int4 REFUSES the batched matmul -- w4a16 computes one row and five rounds
-# established that no register makes it compute two -- so an int4 prompt still
-# goes through the projections a token at a time. It measured 19.24 tok/s
-# against a decode of 15.46 anyway, and the standing explanation is that a
-# prompt needs logits for its last token only, so llama_prefill_batch skips the
-# output head n - 1 times and that is the whole of the gap.
-#
-# That explanation has never been measured. It is written into PLAN.md and into
-# a commit message as though it had been. This is the control:
+# int4 batches the projections now, on the width axis, so a prompt gains twice
+# over: the matmul itself, and the output head, which a prompt needs for its
+# last token only and which llama_prefill_batch therefore skips n - 1 times.
+# This is the control that separates them from the board warming up:
 # CHARSIU_NO_BATCH_PREFILL=1 sends the prompt through the token loop, head and
 # all, with nothing else different.
 #

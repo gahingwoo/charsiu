@@ -23,7 +23,16 @@
 #   6  the deal                 least-loaded against CHARSIU_NPU_DEAL_INDEX=1
 #   7  the scoreboard           against Rockchip, REPEAT=3 because one reading
 #                               of this table has a 25% spread
-#   8  CHARSIU_NPU_KFIT         written, legal, default off, NEVER RUN
+#   8  CHARSIU_NPU_KFIT         three arms: off / wide buffers only / on
+#   9  where TTFT goes           the five-way split, and the pooled read back
+#  10  KMAX                      read is m*n*ks, so does a wider slice pay --
+#                                and what does the coarser quantiser cost
+#  11  the prefill chunk         we chunk at 32, the vendor's ladder tops at 80
+#  12  the quality probe         phase 10's counting prompt cannot see a
+#                                coarser quantiser; this asks something that can
+#  13  where the wide slice      the batched path disagrees with the token loop
+#      stops being correct       above KMAX 1024; find the width it breaks at
+#                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
 # numbers and are allowed to disappoint.
@@ -34,10 +43,10 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
-slow) PHASES="6 7 8" ;;
+slow) PHASES="6 7 8 9 10 11" ;;
 esac
 
 BIN=${CHARSIU_BIN_DIR:-/opt/charsiu}
@@ -46,6 +55,25 @@ MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 OUT=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUT"
 FAIL=0; SKIP=""; RAN=""
+
+# ⚠⚠ ONE PROMPT FOR THE WHOLE ROUND. `seq 1 32 | tr` leaves a TRAILING SPACE,
+# which tokenises differently, and phases 3, 7 and 8 each built their own copy
+# -- two with the space and one without. Inside a phase both arms saw the same
+# string so the comparisons held, but a tok/s from one phase was not comparable
+# to a tok/s from another, and a round has already been read as "gemma4 flipped"
+# when what changed was the prompt. Built once here, stripped once, printed
+# below so a log says what it measured.
+P=$(seq 1 32 | tr '\n' ' '); P=${P% }
+
+# ⚠⚠ AND THE LONG ONE TOO, FOR EXACTLY THE SAME REASON THE SHORT ONE IS
+# HERE. P9 was built inside phase 9's own case arm, so `board_verify.sh 10`
+# -- phase 10 alone, which is how a sweep gets run -- died on its first
+# model with "P9: parameter not set". The lesson from hoisting P was that a
+# prompt belongs to the ROUND and not to a phase, and P9 was written after
+# that and did not get it. set -u is what turned it into an error rather
+# than an empty prompt and a table of meaningless numbers.
+P9=$(i=1; while [ $i -le 256 ]; do printf '%d ' "$i"; i=$((i+1)); done)
+P9=${P9% }
 
 say() { printf '\n=========== %s ===========\n' "$*"; }
 bad() { printf '  ⚠⚠ %s\n' "$*"; FAIL=$((FAIL + 1)); }
@@ -76,6 +104,7 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+echo "  prompt    $(printf '%s' "$P" | wc -w) words, no trailing space"
 echo "  ⚠ phase 7 sets the performance governor itself, as their protocol does."
 
 for p in $PHASES; do
@@ -112,7 +141,6 @@ case $p in
    # to run. If it changes a single token, the identity is not an identity
    # here and four commits are wrong. It is the cheapest check in the round.
    run 3
-   P=$(seq 1 32 | tr '\n' ' '); P=${P% }
    W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
@@ -202,7 +230,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
-		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
+		    "$BIN/charsiu_run" "$M" -p "$P" \
 		    -n 32 --ignore-eos >"$OUT/.deal_$arm" \
 		    2>"$OUT/.deal_$arm.err"
 		printf '  %-28s %-6s %s\n' "$b" "$arm" \
@@ -241,60 +269,560 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ok "scoreboard in $OUT/verify-vendor.txt"
    ;;
 
-8) say "8. KFIT: the runt K slice, on the tensors it is free for"
-   # ⚠⚠ WHY IT IS FREE, WHICH IS NOT OBVIOUS. npuquant falls back to one
-   # scale a row when k % grp is non-zero, so a tensor whose K does not
-   # divide the slice is ALREADY ungrouped -- gemma-3-1b is 1152 and 6912,
-   # gemma-4-E2B is 1536 -- and a tensor whose K DOES divide has no remainder
-   # for KFIT to absorb. The two conditions are complementary, so KFIT costs
-   # no quantisation quality on any tensor it can help. Priced offline at
-   # gemma-3-1b -7.9% and gemma-4-E2B -3.5%.
+8) say "8. KFIT: what the wider buffers cost, and what the slicing buys"
+   # ⚠⚠ TURNING KFIT ON DOES TWO INDEPENDENT THINGS, and two board rounds
+   # priced them together and could not tell them apart.
    #
-   # ⚠ It has never been run on hardware. The text check is the point of this
-   # phase; the tok/s is the reason to look.
+   #   1. it widens five buffers to 2 * kmax -- UNCONDITIONALLY, on every
+   #      model, including ones where no tensor can fire. in_stride is one of
+   #      them, so every K slice sits twice as far from the next in the DMA
+   #      buffer, whether or not anything needed the room.
+   #   2. it makes the last slice absorb the remainder, the `ks--`, which is
+   #      the part that is supposed to pay.
+   #
+   # The three models that CANNOT fire -- their every K divides KMAX, so the
+   # dispatch plan is byte for byte identical in both arms -- came out at
+   # -0.5%, +0.0% and -0.9%, and SmolLM2-1.7B read -1.0% and -0.9% in two
+   # separate rounds. A reproducible loss on a model where the switch provably
+   # changes no dispatch is not noise, it is (1) with none of (2).
+   #
+   # So there is a third arm: CHARSIU_NPU_KFIT_WIDE widens the buffers and
+   # does NOT slice. Now every model is its own control rather than only the
+   # three that happen to divide evenly:
+   #
+   #   wide - off   what the widening COSTS
+   #   on   - wide  what the slicing BUYS, with the cost already paid
+   #   on   - off   the net, which is what a user would see
+   #
+   # ⚠ ONE READING IS NOT A MEASUREMENT: --repeat pays the model load once and
+   # generates REP times, and the spread is printed under every row.
    run 8
-   nk=0
-   for M in "$MODELS"/gemma-3-1b*Q4_0*.gguf "$MODELS"/gemma-4*Q4_0*.gguf; do
+   REP=${KFIT_REPEAT:-3}
+   nk=0; nchg=0; ndead=0
+   : >"$OUT/.kfit_rows"
+   printf '  %-30s %7s %7s %7s %9s  %s\n' model off wide on narrowed text
+   for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
 	nk=$((nk + 1))
-	b=$(basename "$M")
-	for arm in off on; do
-		case $arm in on) E=CHARSIU_NPU_KFIT=1 ;; *) E=CHARSIU_KFIT_DUMMY=1 ;; esac
+	b=$(basename "$M" .gguf)
+	rates_off=""; rates_wide=""; rates_on=""
+	for arm in off wide on; do
+		case $arm in
+		on)   E=CHARSIU_NPU_KFIT=1 ;;
+		wide) E=CHARSIU_NPU_KFIT_WIDE=1 ;;
+		*)    E=CHARSIU_KFIT_DUMMY=1 ;;
+		esac
 		# shellcheck disable=SC2086
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
-		    "$BIN/charsiu_run" "$M" -p "$(seq 1 32 | tr '\n' ' ')" \
-		    -n 32 --ignore-eos >"$OUT/.kfit_$arm" \
+		    "$BIN/charsiu_run" "$M" -p "$P" -n 32 --ignore-eos \
+		    --repeat "$REP" >"$OUT/.kfit_$arm" \
 		    2>"$OUT/.kfit_$arm.err"
-		# ⚠ READ THE RATE BEFORE THE STRIP BELOW REMOVES IT. The
-		# summary is a bracketed line on STDOUT, and the sed that
-		# prepares the text for comparison deletes exactly those --
-		# so a check written after it greps for a line it just ate
-		# and reports a healthy run as one that never generated.
-		r=$(grep -hoE 'gen [0-9]+ tok in [0-9]+ ms, [0-9.]+ tok/s' \
-		    "$OUT/.kfit_$arm" "$OUT/.kfit_$arm.err" | head -1)
-		eval "rate_$arm=\$r"
-		printf '  %-28s kfit=%-4s %s\n' "$b" "$arm" "$r"
+		# ⚠ READ THE RATES BEFORE THE STRIP BELOW EATS THEM, and isolate
+		# the GENERATION one. The summary is a single line carrying the
+		# prompt rate and the gen rate, the halves line below it carries
+		# two more, and the sed that prepares the text for comparison
+		# deletes every bracketed line -- so a check written after it
+		# greps for what it just removed, and a bare "tok/s" grep
+		# collects four rates a repeat and maxes to the first-half one.
+		rr=$(grep -hoE 'gen [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
+		    "$OUT/.kfit_$arm" "$OUT/.kfit_$arm.err" \
+		    | sed 's/.*, //; s/ tok.s//' | tr '\n' ' ')
+		case $arm in
+		off)  rates_off=$rr ;;
+		wide) rates_wide=$rr ;;
+		on)   rates_on=$rr ;;
+		esac
 	done
-	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_on"
-	# ⚠ A RUN THAT PRODUCED NO RATE DID NOT RUN, and that is a different
-	# failure from a text difference. Saying "KFIT changes the answer" about
-	# an arm that never generated a token is a wrong diagnosis of a real
-	# problem, which is worse than either alone.
-	if [ -z "${rate_on:-}" ]; then
-		bad "$b: the KFIT arm produced no generation at all"
-		printf '     its stderr, last lines:\n'
-		tail -6 "$OUT/.kfit_on.err" | sed 's/^/       /'
-	elif cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on"; then
-		printf '      text identical with and without KFIT\n'
-	else
-		bad "$b: KFIT CHANGES THE ANSWER -- it is a slicing change and must not"
-		diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'
+	hits=$(grep -hoE 'KFIT narrowed [0-9]+ of [0-9]+' "$OUT/.kfit_on.err" \
+	    | head -1 | awk '{print $3"/"$5}')
+	[ -n "$hits" ] || hits="?"
+	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_wide" "$OUT/.kfit_on"
+	# ⚠⚠ A SHORT ARM IS A DEAD ARM. An arm that crashed on repeat two of
+	# three leaves rates behind, which is not empty, so it reads as healthy
+	# -- and its text is then shorter than the others', so the comparison
+	# calls it "KFIT changes the answer". That is the wrong diagnosis of a
+	# real problem, which is the failure this phase was rewritten after.
+	dead=""
+	for arm in off wide on; do
+		eval "n=\$(printf '%s' \"\$rates_$arm\" | wc -w)"
+		[ "$n" -eq "$REP" ] || dead="$arm($n/$REP)"
+	done
+	if [ -n "$dead" ]; then
+		bad "$b: the $dead arm did not generate $REP times"
+		tail -6 "$OUT/.kfit_${dead%%(*}.err" | sed 's/^/       /'
+		ndead=$((ndead + 1))
+		continue
 	fi
+	bo=$(printf '%s' "$rates_off"  | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	bw=$(printf '%s' "$rates_wide" | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	bn=$(printf '%s' "$rates_on"   | awk '{m=0;for(i=1;i<=NF;i++)if($i>m)m=$i;printf "%.2f",m}')
+	if cmp -s "$OUT/.kfit_off" "$OUT/.kfit_on" &&
+	   cmp -s "$OUT/.kfit_off" "$OUT/.kfit_wide"; then
+		t=same
+	else
+		t="⚠ DIFFERS"
+		nchg=$((nchg + 1))
+	fi
+	printf '  %-30s %7s %7s %7s %9s  %s\n' "$b" "$bo" "$bw" "$bn" "$hits" "$t"
+	printf '      off : %s\n      wide: %s\n      on  : %s\n' \
+	    "$rates_off" "$rates_wide" "$rates_on"
+	awk -v a="$bo" -v w="$bw" -v n="$bn" 'BEGIN{
+	    printf "      buffers %+.1f%%   slicing %+.1f%%   net %+.1f%%\n",
+	           (w-a)/a*100, (n-w)/w*100, (n-a)/a*100 }'
+	[ "$t" = same ] || { diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'; }
+	printf '%s %s %s %s %s\n' "$b" "${hits%%/*}" "$bo" "$bw" "$bn" >>"$OUT/.kfit_rows"
    done
    wedged "phase 8" && break
-   [ "$nk" -gt 0 ] || bad "phase 8 found no gemma model under $MODELS"
+   if [ "$nk" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+	printf '     pass CHARSIU_MODELS=/path if they live somewhere else.\n'
+   elif [ "$nchg" -gt 0 ]; then
+	bad "$nchg of $nk model(s) answer differently. KFIT is a slicing"
+	printf '     change and the wide arm changes no slicing at all, so\n'
+	printf '     either one moving a token is a bug: keep it off.\n'
+   else
+	ok "text identical across all three arms on $((nk - ndead)) model(s)."
+	printf '     Speed is a separate question:\n\n'
+	awk '{ n=$1; h=$2+0; a=$3+0; w=$4+0; u=$5+0
+	       cost[++c] = (w-a)/a*100; cname[c]=n; csum += cost[c]
+	       if (h==0) { zc++; zg += (u-w)/w*100 }
+	       else { fc++; fname[fc]=n; fgain[fc]=(u-w)/w*100
+	              fnet[fc]=(u-a)/a*100; fh[fc]=h } }
+	     END {
+	       printf "     what the WIDER BUFFERS cost, on every model:\n"
+	       for (i=1;i<=c;i++) printf "       %-30s %+6.1f%%\n", cname[i], cost[i]
+	       printf "       mean %+.1f%% -- paid whether or not anything fires\n\n", csum/c
+	       if (zc) printf "     consistency: the %d model(s) that cannot fire gained\n       %+.1f%% mean from the slicing arm, and should have gained 0.\n       That is this round%s measurement error.\n\n", zc, zg/zc, "'"'"'s"
+	       printf "     what the SLICING buys, where it fires:\n"
+	       worst=999; best=-999
+	       for (i=1;i<=fc;i++) {
+	         if (fgain[i]<worst) worst=fgain[i]
+	         if (fgain[i]>best)  best=fgain[i]
+	         printf "       %-30s %+6.1f%%  (net %+.1f%%, %d tensors)\n", \
+	                fname[i], fgain[i], fnet[i], fh[i] }
+	       print ""
+	       if (fc == 0) { print "     ⚠ NOTHING FIRED. This round says nothing about the slicing."; exit }
+	       if (csum/c < -0.4)
+	         printf "     ⚠ THE WIDENING IS NOT FREE (%+.1f%% mean) and it is paid by\n     every model. Size the buffers by the widest slice actually\n     staged and the net becomes the slicing figure above.\n", csum/c
+	       else
+	         printf "     the widening is free, so net == slicing and the range is\n     %+.1f%% .. %+.1f%%.\n", worst, best
+	     }' "$OUT/.kfit_rows"
+	[ "$ndead" = 0 ] || printf '\n  – %s model(s) never generated; see above.\n' "$ndead"
+   fi
+   ;;
+
+9) say "9. where TTFT goes: the five shares of a batched matmul, and the sixth"
+   # ⚠⚠ WHY THIS PHASE AND NOT MORE DECODE WORK. The two gaps to the vendor
+   # are not the same size. On Qwen3-0.6B decode is 19.70 tok/s against 24.85,
+   # which is 1.26x; time to first token is 1588 ms against 469, which is
+   # 3.39x. The distance is in prefill, npudev's own note says the NPU is idle
+   # for 91% of a batched matmul, and nothing has ever printed which part of
+   # this side of the ioctl that idle time is.
+   #
+   # ⚠ THE COUNTERS EXISTED AND NOTHING CALLED THEM. charsiu_npu_batch_split
+   # and charsiu_npu_batch_prep have been in the tree with no caller anywhere;
+   # vision and whisper could only have reached them through
+   # charsiu_pool_report, and llama does not call that either. Same shape as
+   # the switch that was "written, legal, default off" and corrupted the heap
+   # the first time hardware ran it.
+   #
+   # ⚠⚠ AND THE HOST CANNOT CHECK THIS ONE EITHER. With no /dev/accel the pool
+   # has no device, the report suppresses itself and a desk run prints nothing
+   # -- which is indistinguishable from the instrument being broken. So the
+   # ABSENCE of the block is a FAILURE here, not a quiet skip.
+   run 9
+   # A long prompt, because a 32 word one spends more time loading than
+   # prefilling and the split would be reading noise. -n 4 keeps generation out
+   # of the way; TTFT is the number this phase is about.
+   printf '  prompt %s words, generation held to 4 tokens\n' \
+       "$(printf '%s' "$P9" | wc -w)"
+   # ⚠⚠ TWO ARMS, because the read back is now split across the pool and the
+   # HOST CANNOT PRICE IT. With no /dev/accel read_rows never runs at all, so a
+   # desk comparison of the two arms is two identical serial runs agreeing with
+   # each other -- which looks exactly like a verified parallelisation.
+   #
+   # Rows are disjoint in Y, so the two arms must produce the SAME TEXT. A
+   # difference is not a performance result, it is the parallelisation being
+   # wrong, and it is checked before the timing is read.
+   n9=0; nmiss=0; ntx=0
+   ARMS9=serial
+   [ "${READ_ARMS:-0}" = 0 ] || ARMS9="serial pool"
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n9=$((n9 + 1))
+	b=$(basename "$M" .gguf)
+	# ⚠ ONE ARM BY DEFAULT. The pooled read back is a settled negative -- it
+	# is correct and 5% to 18% slower on every model -- so a normal round
+	# should not pay double to re-measure it. READ_ARMS=1 asks for the
+	# comparison again, which is what to do after changing the granularity.
+	for arm in $ARMS9; do
+		case $arm in
+		pool)   E=CHARSIU_NPU_POOL_READ=1 ;;
+		*)      E=CHARSIU_READ_DUMMY=1 ;;
+		esac
+		# shellcheck disable=SC2086
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
+		    "$BIN/charsiu_run" "$M" -p "$P9" -n 4 --ignore-eos \
+		    >"$OUT/.ttft_$arm" 2>"$OUT/.ttft_$arm.err"
+		eval "t_$arm=\$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' \
+		    '$OUT/.ttft_$arm' | head -1 | grep -oE '[0-9.]+ ms')"
+	done
+	# ⚠⚠ READ THE ARM THAT ACTUALLY RAN. This copied .ttft_pool
+	# unconditionally, and with the pool arm opt-in that file is a STALE
+	# LEFTOVER from an earlier run -- so the split printed below would have
+	# been another model's, or another round's, with nothing to say so.
+	last=${ARMS9##* }
+	cp "$OUT/.ttft_$last" "$OUT/.ttft_out"
+	cp "$OUT/.ttft_$last.err" "$OUT/.ttft_err"
+	tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
+	    "$OUT/.ttft_out" "$OUT/.ttft_err" | head -1)
+	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
+	if [ "$ARMS9" = serial ]; then
+		:
+	elif sed -i 's/^\[.*//' "$OUT/.ttft_serial" "$OUT/.ttft_pool" &&
+	     cmp -s "$OUT/.ttft_serial" "$OUT/.ttft_pool"; then
+		printf '      read back: serial %s   pooled %s   (text same)\n' \
+		    "${t_serial:-?}" "${t_pool:-?}"
+	else
+		bad "$b: the pooled read back CHANGES THE TEXT"
+		printf '     rows are disjoint in Y, so this is the split being\n'
+		printf '     wrong, not a number to weigh against a speed-up.\n'
+		diff "$OUT/.ttft_serial" "$OUT/.ttft_pool" | head -4 | sed 's/^/       /'
+		ntx=$((ntx + 1))
+	fi
+	if grep -q "charsiu NPU batched:" "$OUT/.ttft_err"; then
+		# from the header until the first line that is not part of the
+		# block, so the tail line is included when it is there and
+		# nothing is printed twice when it is not
+		awk '/charsiu NPU batched:/ { f = 1 }
+		     f { if (/charsiu NPU batched:/ || /^    /) print; else exit }' \
+		    "$OUT/.ttft_err" | sed 's/^/      /'
+	else
+		# ⚠ NOT A SKIP. On the board this block is the whole phase, and
+		# its absence means either nothing took the batched path or the
+		# instrument did not fire -- and those look identical from here,
+		# which is exactly why it counts as a failure rather than a
+		# blank line someone reads past.
+		bad "$b: NO batched breakdown was printed"
+		printf '     either no prompt took the batched path, or the\n'
+		printf '     counters did not fire. Both need looking at.\n'
+		grep -iE "NOT on the NPU|refus|fell back" "$OUT/.ttft_err" \
+		    | head -3 | sed 's/^/       /'
+		nmiss=$((nmiss + 1))
+	fi
+   done
+   wedged "phase 9" && break
+   if [ "$n9" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   elif [ "$ntx" -gt 0 ]; then
+	printf '  %s model(s) changed text between the read arms; nothing above\n' "$ntx"
+	printf '  is a speed result until that is fixed.\n'
+   elif [ "$nmiss" = 0 ]; then
+	ok "every model printed its split. The row to act on is the last one:"
+	printf '     if `other` is larger than any named share, the next thing to\n'
+	printf '     do is NAME it, not optimise one of the five.\n'
+   fi
+   ;;
+
+10) say "10. KMAX: read is m * n * ks, so buy ks down and see what it costs"
+   # ⚠⚠ THIS PHASE COMPARES BATCHED AGAINST BATCHED, AND SO DOES PHASE 12.
+   # Both arms take the same path, so neither can see the batched path
+   # disagreeing with the model's own token loop -- and at KMAX 4096 it DOES,
+   # on Qwen2.5 and gemma-3-1b, which this phase and phase 12 both called
+   # identical. Only phase 2 asks that question. Read a "text same" here as
+   # "the quantiser did not move", never as "this width is correct".
+   # ⚠⚠ THIS IS A TRADE, NOT A FREE WIN, AND THE TREE ALREADY KNEW WHY. The
+   # read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
+   # directly less read work. But npudev's own note closes the obvious version
+   # of this: ONE DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP --
+   # a dispatch produces one number per output channel and nothing in the
+   # register map segments the K reduction. So KMAX and CHARSIU_NPU_W4_GROUP
+   # have to move together, and moving them COARSENS THE QUANTISER.
+   #
+   # ⚠ That is why this phase prints text. A wider group is measured at 0.1067
+   # relative error per channel against group 32's 0.0666, and round 352's
+   # symptom for one absmax over a long row was output that stayed "English, on
+   # topic and repetitive". A differing answer here is EXPECTED and is the
+   # PRICE; it is not a failure, and the phase does not call it one. What it
+   # must not do is show a speed-up without showing what was paid for it.
+   #
+   # ⚠ AND KMAX WAS MEASURED ONCE ALREADY, at 37% SLOWER, which is why the
+   # board settled on 1024. That round is not evidence any more: the reason was
+   # `d = (ki * ns + ni) & 1`, slices dealt to devices by an index that
+   # restarts per tensor, so a single-slice tensor put everything on device 0.
+   # The deal is least-loaded now and this has not been asked since.
+   run 10
+   # ⚠ 4096 IS IN THE DEFAULT BECAUSE THE VENDOR USES IT. Read off its own
+   # .rkllm, every one of its 3328 int4 dispatches is K = 2048 (81%) or
+   # K = 4096 (19%) and none is 1024, which is what these rounds have run.
+   SW=${KMAX_SWEEP:-1024 2048 4096}
+   printf '  sweeping KMAX = W4_GROUP over: %s\n' "$SW"
+   printf '  the first value is the baseline every later one is compared to\n'
+   n10=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n10=$((n10 + 1))
+	b=$(basename "$M" .gguf)
+	printf '\n  %s\n' "$b"
+	first=1
+	for K in $SW; do
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX="$K" CHARSIU_NPU_W4_GROUP="$K" \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    "$BIN/charsiu_run" "$M" -p "$P9" -n 16 --ignore-eos \
+		    >"$OUT/.k_out" 2>"$OUT/.k_err"
+		# ⚠ READ EVERYTHING OUT BEFORE THE STRIP, which eats the
+		# bracketed line the prompt clause lives on.
+		tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' "$OUT/.k_out" \
+		     | head -1 | grep -oE '[0-9.]+ ms')
+		rd=$(grep -hoE '^ *read +[0-9.]+ ms +[0-9.]+%' "$OUT/.k_err" \
+		     | head -1 | tr -s ' ')
+		fe=$(grep -hoE '^ *fence +[0-9.]+ ms +[0-9.]+%' "$OUT/.k_err" \
+		     | head -1 | tr -s ' ')
+		sed -i 's/^\[.*//' "$OUT/.k_out"
+		# ⚠⚠ A RUN THAT DID NOT RUN IS NOT A TEXT DIFFERENCE. Without
+		# this, a KMAX the hardware refuses leaves an empty .k_out,
+		# which compares unequal to the baseline and gets reported as
+		# "the quantiser changed the answer" -- a wrong diagnosis of a
+		# real problem, which this round has already made once.
+		if [ -z "${tt:-}" ]; then
+			bad "$b at KMAX $K: no prompt line, the run did not generate"
+			tail -4 "$OUT/.k_err" | sed 's/^/       /'
+			continue
+		fi
+		if [ "$first" = 1 ]; then
+			cp "$OUT/.k_out" "$OUT/.k_base"
+			tx="baseline"
+			first=0
+		elif cmp -s "$OUT/.k_base" "$OUT/.k_out"; then
+			tx="text same"
+		else
+			# ⚠ NOT A FAILURE. See the note above: a wider group is
+			# a coarser quantiser and a different answer is what
+			# was bought with the time.
+			tx="⚠ TEXT CHANGED -- this is the price"
+		fi
+		printf '      KMAX %-5s TTFT %-11s %s\n' "$K" "${tt:-?}" "$tx"
+		printf '                 %s\n' "${rd:-  read  (no split printed)}"
+		printf '                 %s\n' "${fe:-  fence (no split printed)}"
+	done
+	# the answer at the widest KMAX, so a coarser quantiser can be judged
+	# rather than inferred from the word "changed"
+	printf '      last answer: %s\n' \
+	    "$(tr '\n' ' ' <"$OUT/.k_out" | cut -c1-96)"
+   done
+   wedged "phase 10" && break
+   if [ "$n10" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   else
+	ok "$n10 model(s) swept. Read the three together: TTFT, the read row,"
+	printf '     and whether the answer changed. A KMAX that halves the read\n'
+	printf '     and keeps the text is free; one that changes the text has to\n'
+	printf '     be judged on the answer, not on the milliseconds.\n'
+   fi
+   ;;
+
+11) say "11. the prefill chunk: we use 32, the vendor's widest is 80"
+   # The vendor's int4 M ladder, read off its own .rkllm, is 1, 16, 24, 32, 40,
+   # 48, 64 and 80 -- and 80 is both the widest and the most common, 768 of
+   # 3328. charsiu chunks a prompt at 32. A wider chunk does not change the
+   # total read work, which is rows * n * ks, but it amortises everything
+   # charged per CALL: prep, the submits, and the fence's own ramp.
+   #
+   # ⚠ 96 IS IN THE SWEEP ON PURPOSE, ABOVE WHAT THE VENDOR EMITS. This tree
+   # has "the batch stops at m = 80" on record from the vision work, and a
+   # sweep that stops where the vendor stops cannot tell a hardware ceiling
+   # from a choice they made. If 96 comes back with different text, that is
+   # the ceiling and it is a correctness finding, not a slow arm.
+   run 11
+   CH=${CHUNK_SWEEP:-32 64 80 96}
+   printf '  sweeping CHARSIU_PREFILL_CHUNK over: %s\n' "$CH"
+   printf '  ⚠ the chunk is a MAXIMUM and is rounded down to an expressible\n'
+   printf '    width, so read the "chunks of" line, not the value asked for\n'
+   n11=0; nbad11=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n11=$((n11 + 1))
+	b=$(basename "$M" .gguf)
+	printf '\n  %s\n' "$b"
+	first=1
+	for C in $CH; do
+		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    CHARSIU_PREFILL_CHUNK="$C" \
+		    "$BIN/charsiu_run" "$M" -p "$P9" -n 8 --ignore-eos \
+		    >"$OUT/.c_out" 2>"$OUT/.c_err"
+		tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' "$OUT/.c_out" \
+		     | head -1 | grep -oE '[0-9.]+ ms')
+		# what it ACTUALLY batched at, not what was asked for
+		wd=$(grep -hoE 'chunks of [0-9]+[^)]*' "$OUT/.c_out" "$OUT/.c_err" \
+		     | head -1)
+		sed -i 's/^\[.*//' "$OUT/.c_out"
+		if [ -z "${tt:-}" ]; then
+			bad "$b at chunk $C: no prompt line, the run did not generate"
+			tail -4 "$OUT/.c_err" | sed 's/^/       /'
+			nbad11=$((nbad11 + 1))
+			continue
+		fi
+		if [ "$first" = 1 ]; then
+			cp "$OUT/.c_out" "$OUT/.c_base"; tx="baseline"; first=0
+		elif cmp -s "$OUT/.c_base" "$OUT/.c_out"; then
+			tx="text same"
+		else
+			# ⚠ UNLIKE PHASE 10, A DIFFERENCE HERE IS A FAILURE. The
+			# chunk width changes no arithmetic -- same weights, same
+			# scales, same order -- so the answer must not move. This
+			# is the m = 8 class of fault, which is what that phase
+			# and the width law exist for.
+			bad "$b at chunk $C: THE ANSWER MOVED. A chunk width changes"
+			printf '     no arithmetic, so this is a layout fault, not a trade.\n'
+			diff "$OUT/.c_base" "$OUT/.c_out" | head -4 | sed 's/^/       /'
+			tx="⚠ DIFFERS"
+			nbad11=$((nbad11 + 1))
+		fi
+		printf '      chunk %-4s TTFT %-11s %-12s %s\n' \
+		    "$C" "$tt" "$tx" "${wd:-}"
+	done
+   done
+   wedged "phase 11" && break
+   if [ "$n11" = 0 ]; then
+	bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   elif [ "$nbad11" = 0 ]; then
+	ok "every chunk width gave the same answer on $n11 model(s); the TTFT"
+	printf '     column is then a free choice.\n'
+   fi
+   ;;
+
+12) say "12. the quality probe: something a coarser quantiser can actually break"
+   # ⚠⚠ WHY THIS EXISTS. Phase 10 compares text across KMAX and reported "text
+   # same" on all eight models -- and that is not evidence, because its prompt
+   # is "1 2 3 ... 256" and the continuation is the model counting. Counting is
+   # the least quantisation-sensitive thing a language model does. Phi-3.5 goes
+   # from grouped-at-1024 to a per-row scale at KMAX 2048, which is exactly the
+   # degradation that was predicted, and it counted through it.
+   #
+   # So: short prompts whose continuation is a real language choice, and a
+   # symptom counter for the failure mode this tree has on record. Round 352's
+   # description of one absmax over a long row was output that stayed "English,
+   # on topic and REPETITIVE", so distinct words over total words is a direct
+   # probe for it.
+   #
+   # ⚠ THE RATIO IS A SYMPTOM DETECTOR, NOT AN ORACLE. It cannot tell you the
+   # answer is right; it can tell you the model started repeating itself, which
+   # is the shape the failure takes here. Read it next to the text, never
+   # instead of it.
+   run 12
+   SW12=${KMAX_SWEEP:-1024 2048 4096}
+   n12=0
+   for M in "$MODELS"/*Q4_0*.gguf; do
+	[ -r "$M" ] || continue
+	n12=$((n12 + 1))
+	printf '\n  %s\n' "$(basename "$M" .gguf)"
+	for QP in "The capital of France is" \
+		  "The opposite of hot is" \
+		  "Water is made of hydrogen and"; do
+		printf '      "%s"\n' "$QP"
+		for K in $SW12; do
+			env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+			    CHARSIU_NPU_KMAX="$K" CHARSIU_NPU_W4_GROUP="$K" \
+			    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+			    "$BIN/charsiu_run" "$M" -p "$QP" -n 24 --ignore-eos \
+			    >"$OUT/.q_out" 2>/dev/null
+			sed -i 's/^\[.*//' "$OUT/.q_out"
+			r=$(tr ' ' '\n' <"$OUT/.q_out" | sed '/^$/d' \
+			    | awk '{n++; if (!seen[$0]++) u++}
+				   END { if (n) printf "%d/%d", u, n; else printf "0/0" }')
+			printf '        KMAX %-5s distinct %-8s %s\n' "$K" "$r" \
+			    "$(tr '\n' ' ' <"$OUT/.q_out" | cut -c1-70)"
+		done
+	done
+   done
+   wedged "phase 12" && break
+   [ "$n12" -gt 0 ] || bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
+   ok "read the distinct ratio and the text together. A ratio that collapses as"
+   printf '     KMAX widens is the recorded symptom of one scale over too long a\n'
+   printf '     row; a ratio that holds while the words go wrong is a different\n'
+   printf '     fault and this phase cannot name it.\n'
+   ;;
+
+13) say "13. the wide K slice: does the CBUF pair fix make it agree with m = 1"
+   # ⚠ ONE CAUSE FOUND AND FIXED, ONE STILL OPEN, and this phase is what
+   # separated them. The CBUF fix bought 2048, which is now the shipped
+   # width for models that can take it. Above it the board says:
+   #
+   #     slice 2816   WRONG   Qwen2.5 at KMAX 3072, surf 88
+   #     slice 3072   right   gemma-3-1b at KMAX 3072, surf 96
+   #     slice 4096   WRONG   both, surf 128
+   #
+   # ⚠⚠ THAT IS NOT A SIZE THRESHOLD. 3072 is wider than 2816 and works, so
+   # whatever is wrong above 2048 is not "too big" and the next round should
+   # not be a bigger sweep of the same axis. K * M does not separate them
+   # either: 245760 works and 225280 does not.
+   #
+   # The old note, still true of the half that IS fixed: regcmd.c emitted the non split CBUF pair
+   # unconditionally, and the vendor's own batched dispatches switch to the
+   # split pair on K * M > 131072 -- 2048x64 and 4096x32 are its widest non
+   # split, both exactly 131072. Our shipped setting is 1024 x 80 = 81920,
+   # which is why every round for months was right, and 4096 x 80 = 327680,
+   # which is why phase 2 was not.
+   # ⚠⚠ WHAT THIS IS FOR. Phase 2 at KMAX 4096 had Qwen2.5 and gemma-3-1b
+   # answering differently from their own token loop, while SmolLM2-135M was
+   # fine -- and phases 10 and 12 had called all three identical at that width,
+   # because both of THEIR arms were batched. A batched path that is wrong at a
+   # wide slice is invisible to a batched-versus-batched comparison.
+   #
+   # The discriminator is the widest single dispatch, not the number of slices:
+   #
+   #   SmolLM2-135M   576 / 1536   at 4096 every tensor is ks = 1, widest 1536   ok
+   #   Qwen2.5-1.5B  1536 / 8960   at 4096 the ffn is ks = 3, widest 4096        wrong
+   #   gemma-3-1b    1152 / 6912   at 4096 the ffn is ks = 2, widest 4096        wrong
+   #
+   # so the bound is somewhere in (1536, 4096], and the vendor's own .rkllm
+   # dispatches K = 2048 and K = 4096 -- the hardware does this, our encoder
+   # does not.
+   #
+   # ⚠ ONLY THESE THREE MODELS, AND THAT IS THE WHOLE DESIGN. K must divide
+   # none of the candidate widths, or the WEIGHTS change with the width and the
+   # comparison stops being about slicing at all. 1536, 8960, 1152, 6912, 576
+   # and 1536 divide none of 1024, 2048, 3072, 4096, so across this sweep the
+   # quantiser emits the same bytes and only ks moves.
+   run 13
+   KW=${KMAX_WIDTHS:-1024 2048 3072 4096}
+   printf '  KMAX = W4_GROUP over %s, on the three models whose weights\n' "$KW"
+   printf '  do not move across it. Batched against the token loop.\n'
+   n13=0
+   for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
+	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
+	n13=$((n13 + 1))
+	printf '\n  %s\n' "$MK"
+	for K in $KW; do
+		r=$(CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
+		    CHARSIU_NPU_W4_GROUP="$K" \
+		    sh "$BIN/board_text_all.sh" 2>&1 \
+		    | grep -E "text identical|TEXT DIFFERS" | head -1)
+		case "$r" in
+		*identical*) printf '      KMAX %-5s agrees with the token loop\n' "$K" ;;
+		*DIFFERS*)   printf '      KMAX %-5s ⚠ DISAGREES -- the batched path is wrong here\n' "$K"
+			     bad "$MK breaks at a K slice of $K" ;;
+		*)           bad "$MK at KMAX $K: no verdict line at all"
+			     printf '        %s\n' "${r:-(no output)}" ;;
+		esac
+	done
+   done
+   wedged "phase 13" && break
+   if [ "$n13" = 0 ]; then
+	bad "none of the three models is under $MODELS -- nothing was swept"
+   else
+	ok "the first width that disagrees is the bound. Everything below it is"
+	printf '     a slice the batched path encodes correctly; the vendor reaches\n'
+	printf '     4096, so what is above the bound is ours to find, not the\n'
+	printf '     hardware refusing.\n'
+   fi
    ;;
 esac
 done

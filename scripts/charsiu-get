@@ -13,9 +13,9 @@
 #
 # ⚠ WHY THIS IS NOT "curl the file and be done".
 #
-# charsiu reads six ggml types (f32 f16 q4_0 q4_1 q8_0 q6_K) and builds ONE
-# graph shape (general.architecture == "llama"). Hugging Face is full of files
-# whose NAMES pass a substring test and whose CONTENTS do not:
+# charsiu reads six ggml types (f32 f16 q4_0 q4_1 q8_0 q6_K) and seven
+# architectures (llama qwen2 qwen3 gemma3 gemma4 phi3 smollm3). Hugging Face is
+# full of files whose NAMES pass a substring test and whose CONTENTS do not:
 #
 #   ...-Q4_0_4_4.gguf   measured: type 31 in 210 tensors. A Q4_0 REPACKED for
 #                       ARM dotprod: same block size, interleaved weights.
