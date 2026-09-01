@@ -20,7 +20,8 @@
 #   2     board_verify 21               how much of the 130 us call   spin on by default?
 #                                       floor is wake latency         touch cpuidle?
 #   3     swap rocket.ko, then 2 and 21 what "keep the domain         50 us is decode
-#                                       attached" takes off a call    parity; v12 or not
+#         then rocket-hardirq.ko, same   attached" takes off a call,   parity; which of
+#                                       and the hardirq on top of it  the two go to v12
 #   4     board_verify 20               what an m=4 pass costs        --spec on by default
 #                                       against a decode step         on Qwen3?
 #   5     board_verify 19               which quantity bounds the     an int8 guard, and
@@ -91,9 +92,23 @@ if step 3 "the call floor: keep the IOMMU domain attached (rocket.ko)"; then
 	fi
 	verify 2 3a || { note "step 3: TEXT CHANGED under the new module -- revert: sh $OUT/board-swap-rocket-ko.sh --revert"; exit 1; }
 	verify 21 3b || true
-	note "step 3: before  $(call_line "$OUT/next-step2.txt")"
-	note "step 3: after   $(call_line "$OUT/next-step3b.txt")"
+	note "step 3: before        $(call_line "$OUT/next-step2.txt")"
+	note "step 3: attach-once   $(call_line "$OUT/next-step3b.txt")"
+	# the second piece: the completion handled in the hardirq, on top of the first
+	for f in rocket-hardirq.ko rocket-hardirq.ko.sha256; do
+		curl -fsSL -o "$f" "$RAW/$f" || { note "step 3: could not fetch $f"; exit 1; }
+	done
+	sed 's#  .*/#  #' rocket-hardirq.ko.sha256 | sha256sum -c - || { note "step 3: rocket-hardirq.ko checksum mismatch"; exit 1; }
+	sh board-swap-rocket-ko.sh rocket-hardirq.ko 2>&1 | tee "$OUT/next-step3-swap2.txt"
+	if grep -q "reloaded" "$OUT/next-step3-swap2.txt"; then
+		verify 2 3c || { note "step 3: TEXT CHANGED under rocket-hardirq.ko -- revert"; exit 1; }
+		verify 21 3d || true
+		note "step 3: +hardirq      $(call_line "$OUT/next-step3d.txt")"
+	else
+		note "step 3: rocket-hardirq.ko did not reload; the attach-once module stays in"
+	fi
 	note "  (150 calls a token on Qwen3: every 10 us off 'a call' is 1.5 ms a token; 50 us is parity)"
+	note "  (the module left installed is the last one that reloaded; --revert restores the original)"
 fi
 
 if step 4 "speculative decoding: the price of a pass"; then
