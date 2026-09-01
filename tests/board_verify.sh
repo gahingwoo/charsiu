@@ -815,7 +815,23 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # stay wrong, the pair is innocent and it is the slice accumulation.
    run 13
    KW=${KMAX_WIDTHS:-1024 2048 3072 4096}
-   A13=${K_ARMS:-both onedev}
+   # ⚠⚠ THE CHUNK IS THE SECOND AXIS NOW, and it is the sharper question.
+   # onedev already answered its own: Qwen2.5 fails identically on one core and
+   # two, so the core pair is not necessary for the fault. What has never been
+   # run is a WIDE K SLICE AT A NARROW m.
+   #
+   # It matters because `split` -- the only thing in the emitter keyed on m at
+   # all -- fires on surf * m > 4096, and surf is K/32:
+   #
+   #     KMAX 2048 chunk 32 -> 2048   no split      chunk 80 -> 5120   split
+   #     KMAX 3072 chunk 32 -> 3072   no split      chunk 80 -> 7680   split
+   #     KMAX 4096 chunk 32 -> 4096   no split      chunk 80 -> 10240  split
+   #
+   # so at a chunk of 32 none of these widths splits. Phase 11 already has
+   # (1024, 32) and (1024, 80) both correct, and phase 13 has (3072, 80) wrong.
+   # (3072, 32) is the cell nobody has run, and it separates "the width is
+   # wrong" from "the width is wrong when m is wide too".
+   A13=${K_ARMS:-m80 m32}
    printf '  KMAX = W4_GROUP over %s, on the three models whose weights\n' "$KW"
    printf '  do not move across it. Batched against the token loop.\n'
    printf '  arms: %s   (onedev = CHARSIU_NPU_ONEDEV=1, the core pair removed)\n' "$A13"
@@ -827,6 +843,8 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	for ARM in $A13; do
 		case $ARM in
 		onedev) E13=CHARSIU_NPU_ONEDEV=1 ;;
+		m32)    E13=CHARSIU_PREFILL_CHUNK=32 ;;
+		m80)    E13=CHARSIU_PREFILL_CHUNK=80 ;;
 		*)      E13=CHARSIU_DEV_DUMMY=1 ;;
 		esac
 		for K in $KW; do
