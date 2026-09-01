@@ -25,7 +25,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
-     $(BUILD)/npu_gemm_test $(BUILD)/charsiu_matmul \
+     $(BUILD)/npu_gemm_test $(BUILD)/npu_slice_test $(BUILD)/charsiu_matmul \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
      $(BUILD)/vattn_bench \
@@ -170,6 +170,9 @@ $(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/npu_slice_test: tools/npu_slice_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)

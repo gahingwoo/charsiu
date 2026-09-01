@@ -3555,6 +3555,103 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 	}
 	e = &g->ent[id];
+	/*
+	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
+	 *
+	 * On the width axis the surface is (k_slice / 32) * m CBUF entries.
+	 * charsiu_emit_job splits the CBUF window above 4096 of them, a rule
+	 * read off the vendor's own file -- and its LARGEST split sample is
+	 * 5120, which is 2048 at m = 80. Above that nothing in that file says
+	 * what the stream should look like, and the board says our guess is
+	 * wrong. Nine cells, all of them:
+	 *
+	 *   surf 2560 3840 4096 5120   right    (1024x80, 1536x80, 4096x32, 2048x80)
+	 *   surf 7680 10240            WRONG    (3072x80, 4096x80)
+	 *   surf 1024 2048 3072        right    (1024x32, 2048x32, 3072x32)
+	 *
+	 * so the bound is in (5120, 7680] and 5120 is exactly where the
+	 * evidence stops. A wider surface than that is extrapolation, and this
+	 * refuses it rather than computing a wrong answer quietly.
+	 *
+	 * ⚠ IT IS NOT A SIZE LIMIT ON K, which is what three earlier readings
+	 * of this thought it was. K = 4096 is fine at m = 32 and wrong at
+	 * m = 80; a single dispatch at K = 4096, N = 1536, m = 80 is EXACT
+	 * (phase 15). Only the product moves it.
+	 *
+	 * ⚠ AND THE FIX, IF SOMEBODY WANTS THESE WIDTHS, IS NOT A BIGGER
+	 * NUMBER HERE. It is whatever the vendor emits above 5120, which is a
+	 * third window state nothing on disk has ever shown -- so it has to be
+	 * searched for, not derived.
+	 *
+	 * ⚠⚠ 5120 IS MEASURED, AND ITS CAUSE IS NOT KNOWN. Read it as a fence
+	 * post, never as an explanation.
+	 *
+	 * Walking the surface directly, one slice, K held at 4096 so that it is
+	 * 128 * m:
+	 *
+	 *     4096   exact        6144   WRONG
+	 *     5120   exact        7168   WRONG
+	 *                         8192   WRONG
+	 *
+	 * so the line is in (5120, 6144] and 5120 is the last value measured
+	 * good. It is also, independently, the largest surface in the vendor's
+	 * own file. Two lines of evidence landing on one number is why the
+	 * guard sits there.
+	 *
+	 * ⚠ FIVE EXPLANATIONS HAVE FITTED THIS AND DIED, in order: the CBUF
+	 * split pair (already in job.c and already right), K on its own
+	 * (K = 4096 is fine at m = 32), K * N at 2 MiB (killed by a single
+	 * dispatch at 3072 KiB), the core pair (identical on one core), and
+	 * window 1's base at 0x1c00 = 7168, which sat in the gap the data left
+	 * and was killed by 6144 failing. Each fitted everything known when it
+	 * was proposed. The bound has held and every story about it has not.
+	 *
+	 * ⚠ AND TIGHTENING IT BUYS NOTHING. At 6144, the far end of the
+	 * bracket, KMAX 3072 still needs a chunk of 53 and K at m = 80 still
+	 * stops at 2457 -- no width becomes reachable that is not reachable
+	 * now, and phase 11 measured a chunk of 96 tied with 80 anyway.
+	 */
+	{
+		unsigned kw = 0, i;
+
+		for (i = 0; i < e->count; i++) {
+			unsigned sk = (unsigned)g->slot[e->first + i].job.mm.k;
+
+			if (sk > kw)
+				kw = sk;
+		}
+		/*
+		 * ⚠⚠ AND A PROBE HAS TO BE ABLE TO ASK ABOUT WHAT THIS
+		 * REFUSES. w4_batch_why_not learned this already and says so
+		 * above itself: asking is how every line of its table was
+		 * measured and the only way any of it gets re-measured. This
+		 * guard shipped without the hatch and the very next round --
+		 * phase 16, one tensor sliced, the rung this fault has been
+		 * missing all week -- came back with its two interesting cells
+		 * REFUSED BY IT. Nothing but a probe should set this.
+		 */
+		if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+		    (size_t)(kw / 32) * m > 5120) {
+			/*
+			 * ⚠ CHARSIU_NPU_KFIT IS THE LIKELY WAY TO GET HERE, and
+			 * the two are in direct conflict at the shipped width.
+			 * KFIT widens the last slice to kmax + K % kmax, which
+			 * at KMAX 2048 is 2816 on Qwen2.5 and gemma-3-1b and
+			 * 3584 on tinyllama -- 7040 and 8960 entries at a chunk
+			 * of 80, both past this. So turning KFIT on there does
+			 * not make the batch faster, it makes there be no batch:
+			 * this returns -1 and the caller falls back a row at a
+			 * time. It was measured +7.3% on gemma-3-1b back when
+			 * KMAX was 1024 and the widest it produced was 1792.
+			 */
+			whine(g, g->kfit
+			      ? "KFIT widened a slice past the input surface "
+				"ceiling, so this tensor is not batched at all"
+			      : "the input surface is past the widest the "
+				"vendor's own file ever splits", kw, m);
+			return -1;
+		}
+	}
 	if (e->n_npu != (unsigned)e->t->n) {
 		/* a CPU share would have to be batched too, and is not */
 		whine(g, "batched cannot split rows with the CPU",

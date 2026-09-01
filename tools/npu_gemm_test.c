@@ -1097,10 +1097,54 @@ int main(int argc, char **argv)
 	 * least informative ones to stop at: m=4, 8 and 32 are where a
 	 * batched prefill would actually live.
 	 */
-	static const unsigned MS[] = { 1, 2, 4, 8, 32 };
+	static unsigned MS[] = { 1, 2, 4, 8, 32, 0, 0, 0 };
+	unsigned nms = 5;
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 256;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 64;
-	unsigned maxm = MS[sizeof(MS) / sizeof(*MS) - 1];
+	unsigned maxm;
+
+	/*
+	 * ⚠⚠ CHARSIU_GEMM_M EXISTS TO ASK ONE QUESTION: is the wide K slice
+	 * fault int4's, or the encoder's?
+	 *
+	 * The board has the batched int4 path disagreeing with the token loop
+	 * at a slice of 2816 and of 4096, and AGREEING at 3072 -- which is
+	 * wider than 2816, so it is not a size limit and the usual suspects
+	 * (K * M, a 16 bit field) do not separate them either. All of that was
+	 * inferred from whole-model text diffs, which is three layers away from
+	 * the dispatch that is wrong.
+	 *
+	 * This test is the direct instrument: ONE shape, int8, against an exact
+	 * CPU reference. If int8 at m = 80 shows the same 2816-wrong,
+	 * 3072-right pattern then the fault is in the geometry every dispatch
+	 * shares and int4 is a bystander. If int8 is clean at every width then
+	 * it is the int4 path, and that is a much smaller place to look.
+	 *
+	 * ⚠ m = 1 STAYS FIRST WHATEVER IS ASKED FOR, because it is the control:
+	 * an m = 80 failure means nothing if m = 1 is already wrong.
+	 */
+	{
+		const char *e = getenv("CHARSIU_GEMM_M");
+
+		if (e && *e) {
+			char buf[64];
+			char *tok;
+
+			snprintf(buf, sizeof(buf), "%s", e);
+			nms = 1;                /* MS[0] = 1, the control */
+			for (tok = strtok(buf, ", "); tok; tok = strtok(NULL, ", ")) {
+				unsigned v = (unsigned)atoi(tok);
+
+				if (v < 2 || nms >= sizeof(MS) / sizeof(*MS))
+					continue;
+				MS[nms++] = v;
+			}
+		}
+	}
+	maxm = MS[nms - 1];
+	for (unsigned i = 0; i < nms; i++)
+		if (MS[i] > maxm)
+			maxm = MS[i];
 	struct charsiu_device *dev;
 	uint8_t *A, *B;
 	int32_t *got, *want;
@@ -1213,7 +1257,6 @@ int main(int argc, char **argv)
 		static const struct { unsigned ape; char axis; } CFG[] = {
 			{ 4, 'h' }, { 8, 'h' }, { 4, 'w' }, { 8, 'w' },
 		};
-		unsigned nms = sizeof(MS) / sizeof(*MS);
 		unsigned best_p = 0, best_t = 0, bi = 0;
 
 		for (unsigned c = 0; c < sizeof(CFG) / sizeof(*CFG); c++) {
@@ -1389,7 +1432,6 @@ int main(int argc, char **argv)
 	 */
 	if (n > 16) {
 		unsigned p = 0, t = 0;
-		unsigned nms = sizeof(MS) / sizeof(*MS);
 
 		printf("\n  ===== the prediction: N=16, where the budget is"
 		       " enough =====\n");

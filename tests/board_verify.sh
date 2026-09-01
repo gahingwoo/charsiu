@@ -32,6 +32,14 @@
 #                                coarser quantiser; this asks something that can
 #  13  where the wide slice      the batched path disagrees with the token loop
 #      stops being correct       above KMAX 1024; find the width it breaks at
+#  14  int8 at the same widths   is the fault int4's, or every dispatch's? one
+#                                shape at a time against an exact CPU reference
+#  15  one int4 matmul at a time  the direct instrument, on the real emitter:
+#                                is the bound K, or is it K*N?
+#  16  one tensor, SLICED        the missing rung: several K slices accumulated,
+#                                through npudev, against the CPU
+#  17  where the CBUF window     0x1c00 is 7168 and reads like window 1's base.
+#      actually ends             walk the surface across it and find out
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -43,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -104,6 +112,12 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+# ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
+# new data when it was the previous version of this file: `charsiu update dev`
+# had not taken, the output was byte identical to the round before, and the only
+# thing that gave it away was one word in a header nobody was checking. A stale
+# probe is a wasted board trip and it looks exactly like a result.
+echo "  script    $(cksum "$0" 2>/dev/null | cut -d" " -f1), $(wc -l <"$0") lines"
 echo "  prompt    $(printf '%s' "$P" | wc -w) words, no trailing space"
 echo "  ⚠ phase 7 sets the performance governor itself, as their protocol does."
 
@@ -751,9 +765,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 13) say "13. the wide K slice: does the CBUF pair fix make it agree with m = 1"
-   # ⚠ ONE CAUSE FOUND AND FIXED, ONE STILL OPEN, and this phase is what
-   # separated them. The CBUF fix bought 2048, which is now the shipped
-   # width for models that can take it. Above it the board says:
+   # ⚠⚠ CORRECTION: NOTHING WAS FIXED TO GET 2048, IT WAS NEVER BROKEN. The
+   # commit that claimed credit put the split CBUF rule into regcmd.c, whose
+   # only caller in this tree is tools/emit_dump.c -- the runtime submits
+   # through charsiu_emit_job in job.c, which already had the rule and had it
+   # right: `split = wide && surf * rows > 4096`, exact on all 3328 of the
+   # vendor's int4 streams. 2048 had simply never been compared against the
+   # token loop before this phase existed.
+   #
+   # What this phase measures, then, is not a fix. It is the first honest
+   # reading of the axis, and it says:
    #
    #     slice 2816   WRONG   Qwen2.5 at KMAX 3072, surf 88
    #     slice 3072   right   gemma-3-1b at KMAX 3072, surf 96
@@ -791,27 +812,95 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # comparison stops being about slicing at all. 1536, 8960, 1152, 6912, 576
    # and 1536 divide none of 1024, 2048, 3072, 4096, so across this sweep the
    # quantiser emits the same bytes and only ks moves.
+   # ⚠⚠ AND A SECOND ARM, BECAUSE PHASE 15 EXONERATED THE DISPATCH. One int4
+   # matmul at K=4096 N=1536, m=80, through the same emitter, is EXACT -- and
+   # so is every other shape these models run. So the fault is not in the
+   # register stream for one dispatch; it is in something the model does and a
+   # single call does not, and the shortest list is: several K slices
+   # accumulated, two cores, and the buffers shared across both.
+   #
+   # CHARSIU_NPU_ONEDEV=1 removes one of those three outright. If 3072 and 4096
+   # come back correct on one core, the fault is in the pair -- which this tree
+   # has seen before, in the batched submits that corrupted each other. If they
+   # stay wrong, the pair is innocent and it is the slice accumulation.
    run 13
    KW=${KMAX_WIDTHS:-1024 2048 3072 4096}
+   # ⚠⚠ THE CHUNK IS THE SECOND AXIS NOW, and it is the sharper question.
+   # onedev already answered its own: Qwen2.5 fails identically on one core and
+   # two, so the core pair is not necessary for the fault. What has never been
+   # run is a WIDE K SLICE AT A NARROW m.
+   #
+   # It matters because `split` -- the only thing in the emitter keyed on m at
+   # all -- fires on surf * m > 4096, and surf is K/32:
+   #
+   #     KMAX 2048 chunk 32 -> 2048   no split      chunk 80 -> 5120   split
+   #     KMAX 3072 chunk 32 -> 3072   no split      chunk 80 -> 7680   split
+   #     KMAX 4096 chunk 32 -> 4096   no split      chunk 80 -> 10240  split
+   #
+   # so at a chunk of 32 none of these widths splits. Phase 11 already has
+   # (1024, 32) and (1024, 80) both correct, and phase 13 has (3072, 80) wrong.
+   # (3072, 32) is the cell nobody has run, and it separates "the width is
+   # wrong" from "the width is wrong when m is wide too".
+   A13=${K_ARMS:-m80 m32}
    printf '  KMAX = W4_GROUP over %s, on the three models whose weights\n' "$KW"
    printf '  do not move across it. Batched against the token loop.\n'
+   printf '  arms: %s\n' "$A13"
+   printf '        m80 = CHARSIU_PREFILL_CHUNK=80, m32 = 32, onedev = one core\n'
    n13=0
    for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
 	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
 	n13=$((n13 + 1))
+	# ⚠⚠ gemma-3-1b IS AN INTERMITTENT REPRODUCER AND ITS CELLS ARE NOISE.
+	# It read WRONG at KMAX 4096 on one round and RIGHT on the next with a
+	# byte-identical runtime -- every commit between the two touched only
+	# tests and comments. Its two arms also inverted against each other in
+	# the round before that. A hypothesis was fitted to those cells and was
+	# wrong, so REP13 runs each cell more than once and a cell that
+	# disagrees with itself is reported as unstable rather than as a bound.
+	# Qwen2.5-1.5B has been consistent in every round and is the reproducer.
 	printf '\n  %s\n' "$MK"
-	for K in $KW; do
-		r=$(CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
-		    CHARSIU_NPU_W4_GROUP="$K" \
-		    sh "$BIN/board_text_all.sh" 2>&1 \
-		    | grep -E "text identical|TEXT DIFFERS" | head -1)
-		case "$r" in
-		*identical*) printf '      KMAX %-5s agrees with the token loop\n' "$K" ;;
-		*DIFFERS*)   printf '      KMAX %-5s ⚠ DISAGREES -- the batched path is wrong here\n' "$K"
-			     bad "$MK breaks at a K slice of $K" ;;
-		*)           bad "$MK at KMAX $K: no verdict line at all"
-			     printf '        %s\n' "${r:-(no output)}" ;;
+	for ARM in $A13; do
+		case $ARM in
+		onedev) E13=CHARSIU_NPU_ONEDEV=1 ;;
+		m32)    E13=CHARSIU_PREFILL_CHUNK=32 ;;
+		m80)    E13=CHARSIU_PREFILL_CHUNK=80 ;;
+		*)      E13=CHARSIU_DEV_DUMMY=1 ;;
 		esac
+		for K in $KW; do
+			# shellcheck disable=SC2086
+			ok13=0; no13=0; err13=0
+			i13=0
+			while [ "$i13" -lt "${REP13:-2}" ]; do
+				i13=$((i13 + 1))
+				# shellcheck disable=SC2086
+				r=$(env CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
+				    CHARSIU_NPU_W4_GROUP="$K" $E13 \
+				    sh "$BIN/board_text_all.sh" 2>&1 \
+				    | grep -E "text identical|TEXT DIFFERS" | head -1)
+				case "$r" in
+				*identical*) ok13=$((ok13 + 1)) ;;
+				*DIFFERS*)   no13=$((no13 + 1)) ;;
+				*)           err13=$((err13 + 1)) ;;
+				esac
+			done
+			if [ "$err13" != 0 ]; then
+				bad "$MK at KMAX $K on $ARM: $err13 run(s) gave no verdict"
+			elif [ "$no13" = 0 ]; then
+				printf '      %-7s KMAX %-5s agrees, %s of %s\n' \
+				    "$ARM" "$K" "$ok13" "$i13"
+			elif [ "$ok13" = 0 ]; then
+				printf '      %-7s KMAX %-5s ⚠ DISAGREES, %s of %s\n' \
+				    "$ARM" "$K" "$no13" "$i13"
+				bad "$MK breaks at a K slice of $K on $ARM"
+			else
+				# ⚠ NOT A BOUND. A cell that disagrees with itself
+				# is the model being flaky, and fitting anything
+				# to it is how the last two hypotheses died.
+				printf '      %-7s KMAX %-5s ⚠⚠ UNSTABLE: %s right, %s wrong of %s\n' \
+				    "$ARM" "$K" "$ok13" "$no13" "$i13"
+				bad "$MK at KMAX $K on $ARM is not repeatable"
+			fi
+		done
 	done
    done
    wedged "phase 13" && break
@@ -823,6 +912,274 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '     4096, so what is above the bound is ours to find, not the\n'
 	printf '     hardware refusing.\n'
    fi
+   ;;
+
+14) say "14. the same widths in int8: is it int4's fault or every dispatch's"
+   # ⚠⚠ EVERYTHING KNOWN ABOUT THIS FAULT IS INFERRED FROM WHOLE-MODEL TEXT.
+   # Phase 13 says a model answers differently, and the slice widths were then
+   # worked out from its two dimensions. That is three layers away from the
+   # dispatch that is actually wrong, and it is why the shape of the fault
+   # still makes no sense: 2816 wrong, 3072 RIGHT, 4096 wrong.
+   #
+   # npu_gemm_test is the direct instrument -- ONE shape, submitted, against an
+   # exact CPU reference -- and it has never been pointed at this. It is int8,
+   # which is the point: the CBUF pair, the surface fields and the geometry are
+   # shared by every dispatch, so
+   #
+   #   int8 shows the same 2816/3072/4096 pattern  -> the fault is in the
+   #       geometry every dispatch shares and int4 is a bystander
+   #   int8 is exact at every width                -> it is the int4 path, and
+   #       that is a far smaller place to look
+   #
+   # Either answer halves the search, which is more than another sweep of
+   # whole-model text can do.
+   #
+   # ⚠ m=1 RUNS FIRST WHATEVER IS ASKED FOR, inside the tool. An m=80 failure
+   # means nothing if the control is already wrong, and the tool says so itself.
+   run 14
+   have npu_gemm_test || { skip 14 "npu_gemm_test not installed (dev channel)"; break; }
+   KG=${GEMM_WIDTHS:-2048 2816 3072 4096}
+   NG=${GEMM_N:-1536}
+   MG=${GEMM_M:-80}
+   printf '  K over %s at N=%s, m=1 then m=%s, int8 exact against the CPU\n' \
+       "$KG" "$NG" "$MG"
+   printf '  (N=%s is Qwen2.5 down projection, the tensor phase 13 implicates)\n' "$NG"
+   for K in $KG; do
+	r=$(CHARSIU_GEMM_M="$MG" timeout 600 "$BIN/npu_gemm_test" "$K" "$NG" 2>&1)
+	v=$(printf '%s' "$r" | grep -oE '[0-9]+ of [0-9]+ widths exact' | head -1)
+	c=$(printf '%s' "$r" | grep -c "m=1 disagrees")
+	if [ -z "$v" ]; then
+		bad "K=$K: no verdict line -- the tool did not finish"
+		printf '%s\n' "$r" | tail -4 | sed 's/^/       /'
+	elif [ "$c" != 0 ]; then
+		bad "K=$K: the m=1 CONTROL disagrees, so this width says nothing"
+	else
+		# ⚠ "3 of 3" is exact and "2 of 3" is the fault. Compare the two
+		# numbers rather than printing the line and leaving it to a
+		# reader -- a table nobody has to interpret is a table nobody
+		# misreads at one in the morning.
+		got=${v%% of *}
+		rest=${v#* of }
+		want=${rest%% *}
+		if [ "$got" = "$want" ]; then
+			printf '      K=%-5s %-22s exact\n' "$K" "$v"
+		else
+			bad "K=$K: $v -- this width is wrong in int8 too"
+			printf '%s\n' "$r" | grep -E "^  *[0-9]+ +[0-9]+" \
+			    | head -6 | sed 's/^/       /'
+		fi
+	fi
+   done
+   wedged "phase 14" && break
+   ok "a width that is not all-exact here is a fault every dispatch shares."
+   printf '     All of them exact, and the fault is somewhere only int4 goes.\n'
+   ;;
+
+15) say "15. one int4 matmul at a time: is the bound K, or is it K times N"
+   # ⚠⚠ THIS TOOL WAS HERE THE WHOLE TIME AND I INFERRED INSTEAD. charsiu_matmul
+   # submits ONE matmul through charsiu's own emitter -- charsiu_emit_job, the
+   # one npudev uses, on the width axis that int4 takes -- and checks it against
+   # the CPU. Everything known about the wide slice fault so far was worked out
+   # from whole-model text and two dimensions, which is how it kept looking
+   # like nonsense: 2816 wrong, 3072 right, 4096 wrong.
+   #
+   # It stops looking like nonsense when the dispatch's WEIGHT BYTES are
+   # computed instead of its K. Per slice, K * N / 2 for int4:
+   #
+   #   Qwen2.5 @2048  max 1536 KiB   right      gemma-3-1b @3072  max 1728 KiB  right
+   #   SmolLM2 @4096  max  432 KiB   right      Qwen2.5    @3072  max 2304 KiB  WRONG
+   #   Qwen2.5 @4096  max 3072 KiB   WRONG      gemma-3-1b @4096  max 2304 KiB  WRONG
+   #
+   # Six for six, with the boundary in (1728 KiB, 2304 KiB] -- 2 MiB sits in
+   # the gap. It is the only reading that explains gemma-3-1b working at 3072
+   # while Qwen2.5 does not: same K, different N.
+   #
+   # ⚠ AND IT IS PROBABLY OURS, NOT THE HARDWARE'S. The vendor emits 0x101c =
+   # 4194304 on its 2048x4096 int4 shape, which is 4 MiB of weight bytes in one
+   # dispatch, so the block does this.
+   #
+   # The second sweep is the one that can kill the hypothesis: hold K at 4096
+   # and walk N. If the bound is K, every N fails. If it is K * N, it turns
+   # over around N = 1024, where 4096 * 1024 / 2 is exactly 2 MiB.
+   run 15
+   have charsiu_matmul || { skip 15 "charsiu_matmul not installed (dev channel)"; break; }
+   MM=${MM_M:-80}
+   printf '  m=%s, int4 weights, charsiu_emit_job, against the CPU\n\n' "$MM"
+   printf '  A. N fixed at 1536, K walking -- phase 13 widths, directly\n'
+   for K in ${MM_K:-2048 2816 3072 4096}; do
+	wb=$((K * 1536 / 2 / 1024))
+	if CHARSIU_W4=1 timeout 300 "$BIN/charsiu_matmul" "$MM" "$K" 1536 \
+	   >"$OUT/.mm" 2>&1; then
+		printf '      K=%-5s N=1536  %5s KiB  exact\n' "$K" "$wb"
+	else
+		printf '      K=%-5s N=1536  %5s KiB  ⚠ WRONG\n' "$K" "$wb"
+		nb15=$((${nb15:-0} + 1))
+	fi
+   done
+   printf '\n  B. K fixed at 4096, N walking -- this is the discriminating one\n'
+   for N in ${MM_N:-384 512 768 1024 1536}; do
+	wb=$((4096 * N / 2 / 1024))
+	if CHARSIU_W4=1 timeout 300 "$BIN/charsiu_matmul" "$MM" 4096 "$N" \
+	   >"$OUT/.mm" 2>&1; then
+		printf '      K=4096 N=%-5s %5s KiB  exact\n' "$N" "$wb"
+	else
+		printf '      K=4096 N=%-5s %5s KiB  ⚠ WRONG\n' "$N" "$wb"
+		nb15=$((${nb15:-0} + 1))
+	fi
+   done
+   wedged "phase 15" && break
+   printf '\n'
+   if [ "${nb15:-0}" = 0 ]; then
+	# ⚠ NOT A PASS. The models are wrong at these widths, so a bench that
+	# says every shape is exact has failed to reproduce a fault that is
+	# certainly there -- and that is a finding about the bench.
+	bad "every shape here is exact, so this bench does NOT reproduce the"
+	printf '     fault the models show. Something the models do and this does\n'
+	printf '     not -- the K slice loop, the accumulation across slices, the\n'
+	printf '     deal across two cores -- is where it actually lives.\n'
+   else
+	ok "sweep B is the answer: if it turns over near N=1024 the bound is on"
+	printf '     K * N and 2 MiB is the number; if every N fails the bound is\n'
+	printf '     on K alone and the weight bytes were a coincidence of shapes.\n'
+   fi
+   ;;
+
+16) say "16. one tensor, sliced: the rung between a dispatch and a model"
+   # ⚠⚠ WHY THIS EXISTS. Two rungs are measured and they disagree:
+   #
+   #   phase 15   ONE dispatch, int4, K=4096 N=1536 m=80    EXACT
+   #   phase 13   a whole model at KMAX 3072 or 4096        WRONG
+   #
+   # and everything between them was inferred. Three hypotheses were fitted to
+   # that inference and all three died: the CBUF pair (already in job.c and
+   # right), K * N at 2 MiB (killed by phase 15), and the core pair (Qwen2.5
+   # fails identically on one core).
+   #
+   # What is actually between the two rungs is: several K slices accumulated
+   # into one Y, staged through npudev, with the batched buffers shared across
+   # them. npu_slice_test is exactly that and nothing else -- one synthetic
+   # tensor, charsiu_npu_add, charsiu_npu_matmul, against npu_matvec on the
+   # same quantised weights, which is the comparison phase 2 makes at model
+   # scale.
+   #
+   # ⚠ The shapes below are Qwen2.5's ffn down projection, K = 8960 N = 1536,
+   # because that is the tensor phase 13 implicates and the only multi-slice
+   # one it has at KMAX 3072.
+   run 16
+   have npu_slice_test || { skip 16 "npu_slice_test not installed (dev channel)"; break; }
+   SK=${SLICE_K:-8960}
+   SN=${SLICE_N:-1536}
+   SM=${SLICE_M:-80}
+   printf '  K=%s N=%s m=%s, KMAX walking. m=1 is the control inside the tool.\n' \
+       "$SK" "$SN" "$SM"
+   for K in ${SLICE_KMAX:-1024 2048 3072 4096}; do
+	# ⚠ CHARSIU_NPU_ANY_SURFACE=1 LIFTS THE GUARD THIS PHASE EXISTS TO
+	# INTERROGATE. Without it the first run of this phase came back with
+	# 3072 and 4096 "refused by the surface guard" -- my own tripwire
+	# blocking the only measurement that can explain it.
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
+	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
+	    timeout 600 "$BIN/npu_slice_test" "$SK" "$SN" "$SM" "$K" 2>&1)
+	# ⚠ the detail lines came back EMPTY last round because this grepped
+	# "batched:" with a colon and the tool prints "batched vs the same
+	# call". A phase that loses the diagnosis is a board round spent on one
+	# bit of information.
+	v=$(printf '%s' "$r" | grep -E "batched|rows wrong|channels |got/want|ks=" )
+	if printf '%s' "$r" | grep -q "exact"; then
+		printf '      KMAX %-5s exact\n' "$K"
+	elif printf '%s' "$r" | grep -q "REFUSED"; then
+		# ⚠ WITH THE HATCH SET THIS SHOULD NOT HAPPEN, so it is a
+		# failure and not a note: something else refused the batch and
+		# the cell was not measured either way.
+		bad "KMAX $K: the batch was refused even with the guard lifted"
+		printf '%s\n' "$r" | grep -iE "NOT on the NPU" | head -2 | sed 's/^/       /'
+	else
+		bad "KMAX $K: the sliced batch disagrees with the CPU"
+		printf '%s\n' "$v" | sed 's/^/       /'
+	fi
+   done
+
+   # ⚠⚠ THE FREE CONTROL: THE SAME SURFACE WITH ONE SLICE.
+   #
+   # phase 15 has a single dispatch at surface 10240 EXACT, but it submits a
+   # raw job -- it never touches npudev's staging, slots or batched buffers.
+   # phase 16 above goes through all of that AND accumulates several slices, so
+   # a failure there has two possible homes and the two rungs cannot separate
+   # them.
+   #
+   # K = KMAX = 3072 separates them for nothing: one slice, so no accumulation
+   # at all, at exactly the surface that fails above. Exact here means the
+   # accumulation is the fault; wrong here means it is npudev's own buffers and
+   # the slice count never mattered.
+   printf '\n  the same surface with ONE slice, through the same staging:\n'
+   for K in ${SLICE_ONE:-3072 4096}; do
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
+	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
+	    timeout 600 "$BIN/npu_slice_test" "$K" "$SN" "$SM" "$K" 2>&1)
+	if printf '%s' "$r" | grep -q "exact"; then
+		printf '      K=KMAX=%-5s one slice, surface %-6s exact\n' \
+		    "$K" "$(( (K / 32) * SM ))"
+	else
+		bad "K=KMAX=$K: ONE slice at surface $(( (K / 32) * SM )) is already wrong"
+		printf '     so it is not the accumulation -- npudev gets a single\n'
+		printf '     wide slice wrong through its own staging.\n'
+		printf '%s\n' "$r" | grep -E "rows wrong|channels |got/want" | sed 's/^/       /'
+	fi
+   done
+   wedged "phase 16" && break
+   ok "if a KMAX is wrong HERE it is the slicing, and this is the smallest"
+   printf '     thing that shows it -- one tensor, no model, no tokenizer. If\n'
+   printf '     every KMAX is exact here and phase 13 still fails, then it is\n'
+   printf '     not one tensor either: it is several sharing the buffers.\n'
+   ;;
+
+17) say "17. the CBUF window: 0x1c00 is 7168, and is that where it ends"
+   # ⚠⚠ THE MECHANISM, AND IT WAS WRITTEN DOWN HERE BEFORE ANY OF THIS.
+   # job.c on charsiu_cbuf_window: "0x1c00 is 7168 and appears in three of them
+   # as what reads like a base offset", and npudev sets cbuf_window = di, the
+   # device index. So the CBUF is two windows and window 1 starts at entry
+   # 7168 -- which means window 0 holds 7168 entries and a surface past that
+   # runs into the other core's.
+   #
+   # It accounts for every cell measured so far. Surfaces of 1024 through 5120
+   # are exact; 7680 and 10240 are garbage, all rows, all channels, ratios in
+   # the hundreds. And phase 15's raw job at surface 10240 was EXACT because
+   # charsiu_cbuf_window() returns 0 by default and one job has no second
+   # window to collide with -- npudev always has one.
+   #
+   # ⚠ BUT (5120, 7168] HAS NEVER BEEN RUN. The guard shipped at 5120, which is
+   # the vendor's largest observed surface, not the hardware's line. If the
+   # line is 7168 the guard is 40% too tight: it is the difference between
+   # KMAX 2048 at m = 80 and at m = 112.
+   #
+   # K is held at 4096 and m walks, because that makes the surface land on
+   # round numbers: (4096/32) * m = 128m.
+   run 17
+   have npu_slice_test || { skip 17 "npu_slice_test not installed (dev channel)"; break; }
+   printf '  K=N=4096/1536, one slice, m walking. surface = 128 * m.\n'
+   printf '  the guard is lifted; 7168 is the value under test.\n'
+   for M in ${SURF_M:-32 40 48 56 60 64}; do
+	surf=$((128 * M))
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_W4_GROUP=4096 CHARSIU_NPU_MAXN=262144 \
+	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
+	    timeout 600 "$BIN/npu_slice_test" 4096 1536 "$M" 4096 2>&1)
+	if printf '%s' "$r" | grep -q "exact"; then
+		printf '      m=%-4s surface %-6s exact%s\n' "$M" "$surf" \
+		    "$([ "$surf" -gt 7168 ] && echo '   ⚠ past 7168 and still right')"
+	elif printf '%s' "$r" | grep -q "REFUSED"; then
+		bad "m=$M: refused even with the guard lifted"
+	else
+		printf '      m=%-4s surface %-6s ⚠ WRONG%s\n' "$M" "$surf" \
+		    "$([ "$surf" -le 7168 ] && echo '   ⚠ at or below 7168 and already wrong')"
+	fi
+   done
+   wedged "phase 17" && break
+   ok "the last exact surface is the ceiling. If it is 7168 the mechanism is"
+   printf '     window 1 s base and the guard can move there; if it is 5120 the\n'
+   printf '     base is a coincidence and 5120 stands on the vendor evidence.\n'
    ;;
 esac
 done
