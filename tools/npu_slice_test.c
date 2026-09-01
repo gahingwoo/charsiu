@@ -53,6 +53,8 @@ int main(int argc, char **argv)
 	const char *kmaxe = argc > 4 ? argv[4] : getenv("CHARSIU_NPU_KMAX");
 	unsigned kmax = kmaxe ? (unsigned)atoi(kmaxe) : 1024;
 	unsigned seed = 12345, r, j, bad = 0;
+	const char *e4 = getenv("CHARSIU_NPU_W4V");
+	int w4v = e4 && *e4 && *e4 != '0';
 	struct gguf_tensor w = { 0 };
 	struct npu_tensor t = { 0 };
 	struct charsiu_npu *g;
@@ -63,10 +65,24 @@ int main(int argc, char **argv)
 	if (argc > 4)
 		setenv("CHARSIU_NPU_KMAX", argv[4], 1);
 
-	printf("K=%u N=%u m=%u KMAX=%u -> %u slice(s), widest %u,"
-	       " surface %u entries\n", k, n, m, kmax,
-	       (k + kmax - 1) / kmax, k < kmax ? k : kmax,
-	       ((k < kmax ? k : kmax) / 32) * m);
+	/*
+	 * ⚠ THE SURFACE IS NOT ONE FORMULA, and printing it as if it were is
+	 * how the guard in npudev.c came to reach a path it was never measured
+	 * on. charsiu_emit_job sets inw = m only on the WIDTH axis, so int4's
+	 * surface is (slice / 32) * m and int8's is (slice / 32) * 1 -- the m
+	 * rows go on the height there and cost the input nothing. Name the axis
+	 * and print the number that actually applies to it.
+	 */
+	{
+		int wideax = charsiu_m_axis_wide_for(w4v);
+		unsigned slice = k < kmax ? k : kmax;
+
+		printf("K=%u N=%u m=%u KMAX=%u -> %u slice(s), widest %u,"
+		       " %s axis, surface %u entries\n", k, n, m, kmax,
+		       (k + kmax - 1) / kmax, slice,
+		       wideax ? "width" : "height",
+		       (slice / 32) * (wideax ? m : 1));
+	}
 	if ((k + kmax - 1) / kmax < 2)
 		printf("  ⚠ ONE SLICE: this cannot show a fault that needs"
 		       " several. Raise K or lower KMAX.\n");

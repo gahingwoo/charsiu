@@ -51,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1149,10 +1149,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # charsiu_cbuf_window() returns 0 by default and one job has no second
    # window to collide with -- npudev always has one.
    #
-   # ⚠ BUT (5120, 7168] HAS NEVER BEEN RUN. The guard shipped at 5120, which is
-   # the vendor's largest observed surface, not the hardware's line. If the
-   # line is 7168 the guard is 40% too tight: it is the difference between
-   # KMAX 2048 at m = 80 and at m = 112.
+   # ⚠⚠ AND THIS PHASE ALREADY RAN AND KILLED THAT STORY. 6144 came back WRONG,
+   # which is below 7168, so window 1's base is not the line either -- it is
+   # the fifth explanation to fit everything known and then die. The bracket
+   # this phase actually left behind is (5120, 6144], the guard sits at the
+   # bottom of it, and tightening or loosening inside a 1024-wide bracket buys
+   # no width that is not already reachable. Everything below is kept as the
+   # instrument that walked it, NOT as an open question.
    #
    # K is held at 4096 and m walks, because that makes the surface land on
    # round numbers: (4096/32) * m = 128m.
@@ -1177,9 +1180,58 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	fi
    done
    wedged "phase 17" && break
-   ok "the last exact surface is the ceiling. If it is 7168 the mechanism is"
-   printf '     window 1 s base and the guard can move there; if it is 5120 the\n'
-   printf '     base is a coincidence and 5120 stands on the vendor evidence.\n'
+   ok "the last exact surface is the ceiling. It came back 5120, so window 1's"
+   printf '     base at 7168 is a coincidence and 5120 stands on the vendor evidence.\n'
+   ;;
+
+18) say "18. the surface guard has an axis, and int8 is not on it"
+   # ⚠⚠ THE SURFACE GUARD HAS AN AXIS, AND THE FIRST VERSION OF IT DID NOT.
+   #
+   # (slice / 32) * m is the WIDTH axis's input surface. charsiu_emit_job sets
+   # inw = m only when wide, so on the HEIGHT axis the input is one column of m
+   # rows and the surface is (slice / 32) * 1 -- three orders smaller and
+   # nowhere near any ceiling. job.c had already written down, in the note over
+   # the split window, that a rule read off int4 must not reach int8. The guard
+   # shipped without the gate and reached it anyway.
+   #
+   # It cost the vision tower, which is the one caller that opens want_w4 = 0
+   # with a wide K. SmolVLM-256M's ffn_down is K = 3072 and charsiu_pool_rows
+   # batches 64 rows, so the width formula reads 6144 -- the first WRONG cell
+   # in phase 17's int4 bracket -- and all twelve of them plus the idefics3
+   # projector were refused. The encoder went 15.5 s to 31.0 s and the pool
+   # said "73 asked and 13 fell back".
+   #
+   # ⚠ SO THIS PHASE RUNS WITHOUT THE HATCH. Phases 16 and 17 lift the guard
+   # because they exist to interrogate what is above it; this one exists to
+   # check that the guard is not standing where it was never measured, and
+   # lifting it would verify nothing.
+   run 18
+   have npu_slice_test || { skip 18 "npu_slice_test not installed (dev channel)"; break; }
+   printf '  int8, height axis, the guard NOT lifted. width formula in brackets.\n'
+   for C in ${INT8_CELLS:-3072/768/64 3072/768/80 8192/1536/64 4096/1536/80}; do
+	IK=${C%%/*}; rest=${C#*/}; IN=${rest%%/*}; IM=${rest##*/}
+	wf=$(( (IK / 32) * IM ))
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=0 \
+	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+	    timeout 600 "$BIN/npu_slice_test" "$IK" "$IN" "$IM" "$IK" 2>&1)
+	if printf '%s' "$r" | grep -q "REFUSED"; then
+		# the regression, exactly: refused on a formula for another axis
+		bad "K=$IK m=$IM: refused on the height axis (width formula reads $wf)"
+		printf '%s\n' "$r" | grep -iE "NOT on the NPU|surface" | head -2 | sed 's/^/       /'
+	elif printf '%s' "$r" | grep -q "exact"; then
+		printf '      K=%-5s N=%-5s m=%-4s exact   [width formula %s]%s\n' \
+		    "$IK" "$IN" "$IM" "$wf" \
+		    "$([ "$wf" -gt 5120 ] && echo '  ⚠ the guard would have refused this')"
+	else
+		bad "K=$IK m=$IM: the int8 batch disagrees with the CPU"
+		printf '%s\n' "$r" | grep -E "batched|rows wrong|channels |got/want" | sed 's/^/       /'
+	fi
+   done
+   wedged "phase 18" && break
+   ok "int8 batches past the int4 ceiling, so the gate belongs on the axis"
+   printf '     ⚠ this does NOT say the height axis has no ceiling of its own.\n'
+   printf '        It says the int4 one is not it. Nothing here has walked a\n'
+   printf '        height-axis bound and no caller in the tree asks for one.\n'
    ;;
 esac
 done

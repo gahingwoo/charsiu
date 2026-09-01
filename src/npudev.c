@@ -3621,6 +3621,30 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				kw = sk;
 		}
 		/*
+		 * ⚠⚠ AND IT ONLY MEANS ANYTHING ON THE WIDTH AXIS. (kw / 32) * m
+		 * IS THE WIDTH AXIS'S SURFACE AND NOBODY ELSE'S: charsiu_emit_job
+		 * sets inw = m only when wide, so on the height axis the input is
+		 * one column of m rows and the surface is 1 * m -- three orders
+		 * smaller and nowhere near any ceiling. job.c had already written
+		 * down that a rule read off int4 must not reach int8, and this
+		 * guard shipped without the gate and reached it anyway.
+		 *
+		 * ⚠ IT COST THE VISION TOWER, which is the one caller that opens
+		 * want_w4 = 0 with a wide K. SmolVLM-256M's ffn_down is K = 3072
+		 * and charsiu_pool_rows batches 64 rows, so (3072 / 32) * 64 is
+		 * 6144 -- the first cell in the int4 bracket above -- and all
+		 * twelve of them plus the idefics3 projector were refused. The
+		 * scoreboard's encoder went 15.5 s to 31.0 s, the pool reported
+		 * "73 asked and 13 fell back", and 87.6% of the run was ffn
+		 * matmuls with only 1287 ms of it on the hardware.
+		 *
+		 * whisper opens want_w4 = 0 too and escaped only by being small:
+		 * its widest K is 4 * n_audio_state, which is 2048 at base and
+		 * 4096 entries at 64 rows, just under.
+		 */
+		if (!charsiu_m_axis_wide_for(g->w4))
+			kw = 0;
+		/*
 		 * ⚠⚠ AND A PROBE HAS TO BE ABLE TO ASK ABOUT WHAT THIS
 		 * REFUSES. w4_batch_why_not learned this already and says so
 		 * above itself: asking is how every line of its table was
