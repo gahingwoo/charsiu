@@ -2733,6 +2733,98 @@ static uint32_t state_widest(const struct llama_model *m)
 	return w;
 }
 
+/*
+ * ⚠⚠ A WIDER K SLICE IS FREE ON SOME MODELS AND BUYS QUALITY ON OTHERS, and
+ * which one a model is can be read off two integers.
+ *
+ * The read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
+ * directly less work -- the board measured KMAX 4096 taking Phi-3.5's read from
+ * 11776 ms to 3484. But npudev's own note closes the free version of it: ONE
+ * DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP, so KMAX and
+ * CHARSIU_NPU_W4_GROUP move together, and moving them changes how the weights
+ * were quantised.
+ *
+ * ⚠ EXCEPT WHERE THEY WERE NEVER GROUPED. npuquant falls back to one scale a
+ * row when K % group is non-zero. A model whose every K misses every candidate
+ * width is on that per-row path at all of them, so widening changes the
+ * SLICING and not one weight -- and the board says so: gemma-3-1b (1152, 6912)
+ * came back byte identical at 1024, 2048 and 4096 on three prompts, while
+ * Phi-3.5 (3072, 8192) and SmolLM2-1.7B (2048, 8192) degraded, the latter to
+ * "cold.  .  .  .  ." at 4096.
+ *
+ * ⚠ AND THE COUNTING PROMPT COULD NOT SEE ANY OF THAT. An earlier round swept
+ * KMAX with "1 2 3 ... 256" and reported text identical on all eight models,
+ * because continuing a count is the least quantisation sensitive thing a
+ * language model does. The degradation above was found only once the probe
+ * asked something else.
+ *
+ * So: widen only when NO tensor's grouping changes, which for a model that is
+ * ungrouped at the baseline means it is ungrouped everywhere. Anything else
+ * keeps 1024 and can still be overridden by hand.
+ */
+static void llama_auto_kmax(const struct llama_model *m)
+{
+	static const unsigned cand[] = { 4096, 2048 };
+	unsigned base = 1024, i, j;
+	uint64_t k[8];
+	char buf[16];
+	unsigned nk = 0;
+
+	if (getenv("CHARSIU_NPU_KMAX") || getenv("CHARSIU_NPU_W4_GROUP"))
+		return;                 /* asked for by hand, leave it alone */
+
+	k[nk++] = m->n_embd;
+	if (m->n_ff)
+		k[nk++] = m->n_ff;
+	/*
+	 * ⚠⚠ EVERY LAYER'S OWN WIDTH, NOT THE MODEL'S. gemma4 gives each layer
+	 * its own feed_forward_length -- 6144 for its first fifteen and 12288
+	 * after -- and the model wide n_ff is only the fallback. Checking that
+	 * one number would clear a model whose per layer widths include a
+	 * grouped one, and this decision is only safe when it has seen every K
+	 * that will be staged.
+	 */
+	if (m->layers)
+		for (i = 0; i < m->n_layer; i++) {
+			uint64_t f = m->layers[i].n_ff ? m->layers[i].n_ff
+						       : m->n_ff;
+			int seen = 0;
+
+			for (j = 0; j < nk; j++)
+				if (k[j] == f)
+					seen = 1;
+			if (seen || !f)
+				continue;
+			if (nk == sizeof(k) / sizeof(k[0]))
+				return;   /* more widths than room: do not guess */
+			k[nk++] = f;
+		}
+
+	for (i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+		int safe = 1;
+
+		for (j = 0; j < nk; j++) {
+			/*
+			 * Grouped at the baseline, or grouped at the candidate:
+			 * either way the scale layout is not what it was.
+			 */
+			if (k[j] % base == 0 || k[j] % cand[i] == 0)
+				safe = 0;
+		}
+		if (!safe)
+			continue;
+		snprintf(buf, sizeof(buf), "%u", cand[i]);
+		setenv("CHARSIU_NPU_KMAX", buf, 1);
+		setenv("CHARSIU_NPU_W4_GROUP", buf, 1);
+		if (charsiu_diag())
+			fprintf(stderr, "charsiu: K slices at %u -- no tensor "
+				"of this model is grouped at any candidate "
+				"width, so the weights are unchanged\n",
+				cand[i]);
+		return;
+	}
+}
+
 struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 {
 	struct llama_state *s = calloc(1, sizeof(*s));
@@ -2815,6 +2907,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 
 		if (maxn > m->n_vocab)
 			maxn = m->n_vocab;
+		llama_auto_kmax(m);
 		s->pool.dev = charsiu_npu_open(widest, maxn, s->pool.cap);
 		if (!s->pool.dev) {
 			fprintf(stderr, "charsiu: no NPU; staying on the CPU\n");
