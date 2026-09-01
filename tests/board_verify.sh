@@ -753,9 +753,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 13) say "13. the wide K slice: does the CBUF pair fix make it agree with m = 1"
-   # ⚠ ONE CAUSE FOUND AND FIXED, ONE STILL OPEN, and this phase is what
-   # separated them. The CBUF fix bought 2048, which is now the shipped
-   # width for models that can take it. Above it the board says:
+   # ⚠⚠ CORRECTION: NOTHING WAS FIXED TO GET 2048, IT WAS NEVER BROKEN. The
+   # commit that claimed credit put the split CBUF rule into regcmd.c, whose
+   # only caller in this tree is tools/emit_dump.c -- the runtime submits
+   # through charsiu_emit_job in job.c, which already had the rule and had it
+   # right: `split = wide && surf * rows > 4096`, exact on all 3328 of the
+   # vendor's int4 streams. 2048 had simply never been compared against the
+   # token loop before this phase existed.
+   #
+   # What this phase measures, then, is not a fix. It is the first honest
+   # reading of the axis, and it says:
    #
    #     slice 2816   WRONG   Qwen2.5 at KMAX 3072, surf 88
    #     slice 3072   right   gemma-3-1b at KMAX 3072, surf 96

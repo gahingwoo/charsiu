@@ -256,39 +256,27 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);  /* stride 1 both axes */
 
 	/*
-	 * ⚠⚠ THE CBUF PAIR, AND IT IS NOT A CONSTANT. 0x0505 with 0x14000000
-	 * means "more than one row window", 0x0404 with 0x10000000 means one.
+	 * The CBUF pair. 0x0505 and 0x14000000 mean "more than one row window",
+	 * 0x0404 and 0x10000000 mean one. Established over 87 compiled .rknn
+	 * (86 of 87) and agreed with by the vendor's own LLM dispatches, whose
+	 * single row matmuls all carry the non split pair.
 	 *
-	 * This file emitted the non split pair unconditionally, under a comment
-	 * saying "a matmul emitted here is one window by construction: it is
-	 * not tiled yet". That was read off the vendor's SINGLE ROW matmuls,
-	 * and it is false as soon as m grows. Reading its BATCHED int4
-	 * dispatches out of a .rkllm instead:
+	 * A matmul emitted here is one window by construction: it is not tiled
+	 * yet. Tiling is what makes this false, and it is not written.
 	 *
-	 *   K = 2048  M <= 64   0x40000404 / 0x10000000     2048 * 64 = 131072
-	 *   K = 2048  M  = 80   0x40000505 / 0x14000000     2048 * 80 = 163840
-	 *   K = 4096  M <= 32   0x40000404 / 0x10000000     4096 * 32 = 131072
-	 *   K = 4096  M  = 40   0x40000505 / 0x14000000     4096 * 40 = 163840
+	 * ⚠⚠ AND THE RUNTIME DOES NOT COME THROUGH HERE. charsiu_emit_matmul
+	 * has exactly one caller in the tree, tools/emit_dump.c. npudev submits
+	 * through charsiu_emit_job in job.c, which HAS the split rule --
+	 * `split = wide && surf * rows > 4096`, derived from the same vendor
+	 * file and exact on all 3328 of its int4 streams.
 	 *
-	 * The switch is on K * M, and both K values put their widest non split
-	 * dispatch on exactly 131072. That is the convolution buffer: what does
-	 * not fit in it takes a second window.
-	 *
-	 * ⚠ THE BOUND IS BRACKETED, NOT PINNED. 131072 is the largest product
-	 * seen not split and 163840 the smallest seen split; nothing between
-	 * them appears in that file. 2^17 is the natural reading and it is what
-	 * this uses, but a shape landing in the gap is untested.
-	 *
-	 * ⚠ AND THIS IS THE BUG PHASE 2 FOUND. At KMAX 1024 with a chunk of 80
-	 * the product is 81920 and the non split pair is right, which is why
-	 * every board round for months was correct. At KMAX 4096 it is 327680
-	 * and the pair was still non split: Qwen2.5 and gemma-3-1b answered
-	 * differently from their own token loop, while SmolLM2-135M -- whose
-	 * widest dispatch at that setting is K = 1536, so 122880 -- did not.
-	 * One rule, all three models.
+	 * This note is here because I added the rule to this function instead,
+	 * called it the fix for a wide-K fault, and verified it with emit_dump
+	 * -- which is this same function, so the check could not have failed.
+	 * If you are about to change a register here, first check whether the
+	 * thing you are fixing runs through job.c.
 	 */
-	emit(&e, CNA, 0x1018,
-	     (size_t)mm->k * rows > 131072u ? 0x40000505u : 0x40000404u);
+	emit(&e, CNA, 0x1018, 0x40000404);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));   /* bytes per kernel */
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1024, n_pad - 1);
@@ -306,9 +294,7 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	emit(&e, CNA, 0x1030, ((uint32_t)(wbytes / n_pad) << 16) | 0);
 	emit(&e, CNA, 0x1034, rows - 1);        /* ow * oh - 1, one column */
 	emit(&e, CNA, 0x103c, surf << 16);
-	/* the other half of the same pair, see 0x1018 above */
-	emit(&e, CNA, 0x1040,
-	     (size_t)mm->k * rows > 131072u ? 0x14000000u : 0x10000000u);
+	emit(&e, CNA, 0x1040, 0x10000000);
 	/* (width << 16) | surf, and the width of a matmul is one column. Pinned
 	 * by shapes where the two halves differ: the vendor carries 0x00010002
 	 * at M = 128 with K = 64, so the high half is the width and not M. */
