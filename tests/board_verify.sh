@@ -92,9 +92,16 @@ ok()  { printf '  ✓ %s\n' "$*"; }
 # phase reads CLEAN. A round has already died printing a header and no rows.
 # Check dmesg between phases and stop at the first sign.
 DMESG0=$(dmesg 2>/dev/null | grep -c "NPU job timed out" || echo 0)
+# ⚠⚠ ONCE, AND THEN TRUE FOREVER. This is called from inside a sweep (to stop
+# it at the cell that wedged) and again after it (to skip the phase's ok line),
+# so it must report exactly once and keep saying yes afterwards. Without the
+# WEDGED latch the second call would count a second failure for the same event.
+WEDGED=0
 wedged() {
 	n=$(dmesg 2>/dev/null | grep -c "NPU job timed out" || echo 0)
+	[ "$WEDGED" = 1 ] && return 0
 	[ "$n" = "$DMESG0" ] && return 1
+	WEDGED=1
 	bad "THE NPU WEDGED during $1. Everything after this would fall back to"
 	printf '     the CPU and read as a pass. Reboot and start again; nothing\n'
 	printf '     measured after a timeout counts.\n'
@@ -266,6 +273,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	cmp -s "$OUT/.deal_least" "$OUT/.deal_index" \
 	    && printf '      text identical between the two deals\n' \
 	    || bad "$b: the two deals disagree about the ANSWER, not just the speed"
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 6" && break
    done
    wedged "phase 6" && break
    [ "$nd" -gt 0 ] || bad "phase 6 found no Qwen3 or gemma-3-1b under $MODELS"
@@ -387,6 +398,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	           (w-a)/a*100, (n-w)/w*100, (n-a)/a*100 }'
 	[ "$t" = same ] || { diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'; }
 	printf '%s %s %s %s %s\n' "$b" "${hits%%/*}" "$bo" "$bw" "$bn" >>"$OUT/.kfit_rows"
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 8" && break
    done
    wedged "phase 8" && break
    if [ "$nk" = 0 ]; then
@@ -528,6 +543,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    | head -3 | sed 's/^/       /'
 		nmiss=$((nmiss + 1))
 	fi
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 9" && break
    done
    wedged "phase 9" && break
    if [ "$n9" = 0 ]; then
@@ -628,6 +647,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# rather than inferred from the word "changed"
 	printf '      last answer: %s\n' \
 	    "$(tr '\n' ' ' <"$OUT/.k_out" | cut -c1-96)"
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 10" && break
    done
    wedged "phase 10" && break
    if [ "$n10" = 0 ]; then
@@ -702,6 +725,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		printf '      chunk %-4s TTFT %-11s %-12s %s\n' \
 		    "$C" "$tt" "$tx" "${wd:-}"
 	done
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 11" && break
    done
    wedged "phase 11" && break
    if [ "$n11" = 0 ]; then
@@ -755,6 +782,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			    "$(tr '\n' ' ' <"$OUT/.q_out" | cut -c1-70)"
 		done
 	done
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 12" && break
    done
    wedged "phase 12" && break
    [ "$n12" -gt 0 ] || bad "NO Q4_0 MODEL under $MODELS -- this phase measured nothing"
@@ -902,6 +933,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			fi
 		done
 	done
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 13" && break
    done
    wedged "phase 13" && break
    if [ "$n13" = 0 ]; then
@@ -969,6 +1004,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			    | head -6 | sed 's/^/       /'
 		fi
 	fi
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 14" && break
    done
    wedged "phase 14" && break
    ok "a width that is not all-exact here is a fault every dispatch shares."
@@ -1026,6 +1065,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		printf '      K=4096 N=%-5s %5s KiB  ⚠ WRONG\n' "$N" "$wb"
 		nb15=$((${nb15:-0} + 1))
 	fi
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 15" && break
    done
    wedged "phase 15" && break
    printf '\n'
@@ -1127,6 +1170,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		printf '     wide slice wrong through its own staging.\n'
 		printf '%s\n' "$r" | grep -E "rows wrong|channels |got/want" | sed 's/^/       /'
 	fi
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 16" && break
    done
    wedged "phase 16" && break
    ok "if a KMAX is wrong HERE it is the slicing, and this is the smallest"
@@ -1178,6 +1225,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		printf '      m=%-4s surface %-6s ⚠ WRONG%s\n' "$M" "$surf" \
 		    "$([ "$surf" -le 7168 ] && echo '   ⚠ at or below 7168 and already wrong')"
 	fi
+   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# read as garbage, and this loop printed two of them as
+   	# failures before the check below ever ran.
+   	wedged "phase 17" && break
    done
    wedged "phase 17" && break
    ok "the last exact surface is the ceiling. It came back 5120, so window 1's"
@@ -1205,27 +1256,65 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # because they exist to interrogate what is above it; this one exists to
    # check that the guard is not standing where it was never measured, and
    # lifting it would verify nothing.
+   # ⚠⚠ K = 8192 WEDGED THE BLOCK the first time this phase ran, and a wedge is
+   # not a result: the two cells after it were measured on a dead NPU and
+   # printed as failures. It runs LAST now, and the sweep stops at it. It is
+   # here at all because job.c's split-window note cites k = 8192 at m = 64 as
+   # the int8 batch that has been right since the 2.94x round -- a claim in the
+   # tree that nothing had ever run on its own.
+   #
+   # ⚠⚠ AND THE FIRST RUN'S OTHER TWO "FAILURES" WERE NOT THE BATCHING EITHER.
+   # charsiu_act_q1 multiplies by 1/d and npudev's batched packer divided by d.
+   # Those are not the same float, so one value in 3072 landed a code apart and
+   # moved all 768 outputs a hair -- 127 of them past a 0.1% RELATIVE threshold
+   # because they are near-zero channels. It read as "1 row of 64 wrong, mean
+   # got/want 1.0007", which is small enough to look like noise and stable
+   # enough to look like structure.
+   #
+   # It never needed a board. npu_slice_test now runs both quantisers on the
+   # desk before it opens anything and prints the row -- it says "1 code in 1
+   # of 64 rows, first such row is 3" at seed 12345, which is exactly the row
+   # the board reported. npudev multiplies now, so a SINGLE-SLICE int8 cell is
+   # expected EXACT and anything else is the batching.
    run 18
    have npu_slice_test || { skip 18 "npu_slice_test not installed (dev channel)"; break; }
    printf '  int8, height axis, the guard NOT lifted. width formula in brackets.\n'
-   for C in ${INT8_CELLS:-3072/768/64 3072/768/80 8192/1536/64 4096/1536/80}; do
-	IK=${C%%/*}; rest=${C#*/}; IN=${rest%%/*}; IM=${rest##*/}
+   printf '  the tool prints a quantiser check first; it needs no hardware.\n'
+   for C in ${INT8_CELLS:-3072/768/64/4096 3072/768/80/4096 4096/1536/80/4096 8192/1536/64/2048}; do
+	IK=${C%%/*}; rest=${C#*/}; IN=${rest%%/*}; rest=${rest#*/}
+	IM=${rest%%/*}; IX=${rest##*/}
 	wf=$(( (IK / 32) * IM ))
+	sl=$(( (IK + IX - 1) / IX ))
 	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=0 \
 	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-	    timeout 600 "$BIN/npu_slice_test" "$IK" "$IN" "$IM" "$IK" 2>&1)
+	    CHARSIU_SLICE_SEED="${INT8_SEED:-12345}" \
+	    timeout 600 "$BIN/npu_slice_test" "$IK" "$IN" "$IM" "$IX" 2>&1)
+	lbl=$(printf 'K=%-5s N=%-5s m=%-4s %s slice(s)' "$IK" "$IN" "$IM" "$sl")
 	if printf '%s' "$r" | grep -q "REFUSED"; then
 		# the regression, exactly: refused on a formula for another axis
-		bad "K=$IK m=$IM: refused on the height axis (width formula reads $wf)"
+		bad "$lbl: refused on the height axis (width formula reads $wf)"
 		printf '%s\n' "$r" | grep -iE "NOT on the NPU|surface" | head -2 | sed 's/^/       /'
 	elif printf '%s' "$r" | grep -q "exact"; then
-		printf '      K=%-5s N=%-5s m=%-4s exact   [width formula %s]%s\n' \
-		    "$IK" "$IN" "$IM" "$wf" \
+		printf '      %s exact   [width %s]%s\n' "$lbl" "$wf" \
 		    "$([ "$wf" -gt 5120 ] && echo '  ⚠ the guard would have refused this')"
+	elif [ "$sl" -gt 1 ]; then
+		# ⚠ NOT A FAILURE AND NOT A PASS. npudev takes int8's scale over
+		# each K SLICE's own range and charsiu_act_q1 takes it over the
+		# whole row, so a multi-slice int8 batch is quantised FINER than
+		# its own row-by-row reference on purpose. Asking those two to
+		# agree to 0.1% is asking two arithmetics to be one, which is
+		# the mistake that cost this file two rounds already.
+		printf '      %s differs, and %s slices means it must:\n' "$lbl" "$sl"
+		printf '        the batch scales per slice, the row loop scales per row.\n'
+		printf '%s\n' "$r" | grep -E "rows wrong|magnitude|got/want" | sed 's/^/        /'
 	else
-		bad "K=$IK m=$IM: the int8 batch disagrees with the CPU"
-		printf '%s\n' "$r" | grep -E "batched|rows wrong|channels |got/want" | sed 's/^/       /'
+		bad "$lbl: one slice and still not exact -- the quantisers now match, so this is the batching"
+		printf '%s\n' "$r" | grep -E "quantiser check|batched|rows wrong|channels |got/want|magnitude" | sed 's/^/       /'
 	fi
+	# ⚠ INSIDE the sweep: a wedged block makes every later cell read as
+	# garbage, and this loop printed two of them as failures before the
+	# check below ever ran.
+	wedged "phase 18" && break
    done
    wedged "phase 18" && break
    ok "int8 batches past the int4 ceiling, so the gate belongs on the axis"

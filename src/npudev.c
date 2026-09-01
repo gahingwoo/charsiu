@@ -3824,9 +3824,31 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				 * int8's scale is per row and taken over THIS K
 				 * slice's own range, so it is kept per K slice
 				 * for the read back.
+				 *
+				 * ⚠⚠ AND IT MULTIPLIES BY THE RECIPROCAL BECAUSE
+				 * charsiu_act_q1 DOES. x * (1/d) and x / d are
+				 * not the same float: the reciprocal rounds
+				 * once and the product rounds again, the divide
+				 * rounds once, and a value sitting halfway
+				 * between two codes comes out one code apart.
+				 * This path divided and the row loop multiplied,
+				 * so a batch and its own row-by-row reference
+				 * disagreed on a handful of near-zero channels
+				 * -- 127 of 49152 on the vision tower's own
+				 * shape, one row of 64, mean got/want 1.0007.
+				 * Small enough to look like noise and stable
+				 * enough to look like structure, which is how it
+				 * cost a board round to tell apart.
+				 *
+				 * ⚠ THIS ONLY MAKES THE TWO IDENTICAL ON A SINGLE
+				 * SLICE. q1's amax is over the whole row and this
+				 * one is over sk, so a multi-slice int8 tensor is
+				 * quantised FINER here on purpose and cannot
+				 * match the row loop to 0.1% -- and should not
+				 * be asked to.
 				 */
 				for (unsigned r = 0; r < m; r++) {
-					float mx = 0.0f, d1;
+					float mx = 0.0f, d1, id1;
 
 					for (unsigned kk = 0; kk < sk; kk++) {
 						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
@@ -3835,9 +3857,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 							mx = v;
 					}
 					d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+					id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
 					g->bd1[(size_t)ki * m + r] = d1;
 					for (unsigned kk = 0; kk < sk; kk++) {
-						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] / d1);
+						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
 
 						if (q > 127) q = 127;
 						if (q < -127) q = -127;

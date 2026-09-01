@@ -52,7 +52,16 @@ int main(int argc, char **argv)
 	unsigned m = argc > 3 ? (unsigned)atoi(argv[3]) : 80;
 	const char *kmaxe = argc > 4 ? argv[4] : getenv("CHARSIU_NPU_KMAX");
 	unsigned kmax = kmaxe ? (unsigned)atoi(kmaxe) : 1024;
-	unsigned seed = 12345, r, j, bad = 0;
+	/*
+	 * ⚠ THE SEED IS A KNOB BECAUSE THE ROW INDEX IS THE EVIDENCE. A single
+	 * wrong row at a fixed index is either structure or one row of random
+	 * data sitting on a quantisation boundary, and those two look identical
+	 * in one run. Move the data: structure keeps the row, a boundary does
+	 * not.
+	 */
+	const char *es = getenv("CHARSIU_SLICE_SEED");
+	unsigned seed = es ? (unsigned)strtoul(es, NULL, 0) : 12345;
+	unsigned r, j, bad = 0;
 	const char *e4 = getenv("CHARSIU_NPU_W4V");
 	int w4v = e4 && *e4 && *e4 != '0';
 	struct gguf_tensor w = { 0 };
@@ -142,6 +151,60 @@ int main(int argc, char **argv)
 			       : ", which it is NOT");
 			return 1;
 		}
+	}
+
+	/*
+	 * ⚠⚠ AND THE TWO QUANTISERS, SIDE BY SIDE, ON A DESK. charsiu_act_q1
+	 * multiplies by 1/d and the batched packer in npudev.c used to divide
+	 * by d. Those are not the same float -- the reciprocal rounds once and
+	 * the product rounds again -- so a value halfway between two codes came
+	 * out one code apart, and one code out of 3072 moves every one of the n
+	 * outputs by a hair. On the board that read as "1 row of 64 wrong, 127
+	 * of 49152 channels, mean got/want 1.0007": small enough to look like
+	 * noise, stable enough to look like structure, and it cost a round to
+	 * tell those apart.
+	 *
+	 * It never needed one. This loop reproduces the board's row index from
+	 * the same seed with no /dev/accel in the machine, and the seed sweep
+	 * that would have been a board round is five runs of this line.
+	 */
+	{
+		unsigned qdiff = 0, rows = 0, firstr = m;
+
+		for (r = 0; r < m; r++) {
+			float amax = 0.0f, d, id;
+			unsigned any = 0;
+
+			for (j = 0; j < k; j++) {
+				float a = fabsf(X[(size_t)r * k + j]);
+
+				if (a > amax) amax = a;
+			}
+			d = amax / 127.0f;
+			id = d != 0.0f ? 1.0f / d : 0.0f;
+			for (j = 0; j < k; j++) {
+				float x = X[(size_t)r * k + j];
+				int a = (int)lrintf(x * id);
+				int b = d != 0.0f ? (int)lrintf(x / d) : 0;
+
+				if (a > 127) a = 127;
+				if (a < -127) a = -127;
+				if (b > 127) b = 127;
+				if (b < -127) b = -127;
+				if (a != b) { any = 1; qdiff++; }
+			}
+			if (any) {
+				rows++;
+				if (r < firstr) firstr = r;
+			}
+		}
+		printf("  quantiser check (no hardware): x*(1/d) vs x/d differ on"
+		       " %u code(s) in %u of %u rows%s\n", qdiff, rows, m,
+		       rows ? "" : " -- none");
+		if (rows)
+			printf("    first such row is %u. If the batch below is"
+			       " wrong on exactly these rows,\n    that is this"
+			       " and not the batching.\n", firstr);
 	}
 
 	g = charsiu_npu_open(k, n, 1);
@@ -277,8 +340,11 @@ int main(int argc, char **argv)
 				if (r > rlast) rlast = r;
 			}
 		}
-		printf("    rows wrong     %u of %u, first %u last %u\n",
-		       rows_bad, m, r0, rlast);
+		printf("    rows wrong     %u of %u, first %u last %u%s\n",
+		       rows_bad, m, r0, rlast,
+		       rows_bad == 1 ? "   (ONE row: rerun with"
+				       " CHARSIU_SLICE_SEED to see if it moves)"
+				     : "");
 		printf("    channels       first %u last %u of %u\n",
 		       c0, clast, n);
 		if (rn)
@@ -286,6 +352,53 @@ int main(int argc, char **argv)
 			       rsum / rn, rn,
 			       fabs(rsum / rn - 1.0) < 0.5
 			       ? "" : "   (far from 1: not a rounding difference)");
+		/*
+		 * ⚠⚠ AND HOW BIG THE DISAGREEING VALUES ARE, because a 0.1%
+		 * RELATIVE threshold on a channel whose true value is a
+		 * thousandth of the row is not a correctness test -- it is a
+		 * test of whether two int8 activation codes rounded the same
+		 * way. Print the wrong cells' |want| against their own row's
+		 * largest, so the next reader does not have to assume.
+		 */
+		{
+			double frac_sum = 0.0, frac_max = 0.0;
+			unsigned fn = 0;
+
+			for (r = 0; r < m; r++) {
+				float rmax = 0.0f;
+
+				for (j = 0; j < n; j++) {
+					float a = fabsf(Yref[(size_t)r * n + j]);
+
+					if (a > rmax) rmax = a;
+				}
+				if (rmax <= 0.0f)
+					continue;
+				for (j = 0; j < n; j++) {
+					size_t i = (size_t)r * n + j;
+					float sc = fabsf(Yref[i]) + 1e-6f;
+					double f;
+
+					if (fabsf(Yb[i] - Yref[i]) / sc <= 1e-3f)
+						continue;
+					f = fabsf(Yref[i]) / rmax;
+					frac_sum += f;
+					if (f > frac_max) frac_max = f;
+					fn++;
+				}
+			}
+			if (fn)
+				printf("    magnitude      the wrong cells are"
+				       " %.4f of their row's largest on average,"
+				       " %.4f at most%s\n",
+				       frac_sum / fn, frac_max,
+				       frac_max < 0.05
+				       ? "\n                   -> all of them are"
+					 " near-zero channels, where a 0.1%%"
+					 " RELATIVE\n                      threshold"
+					 " measures rounding and not correctness"
+				       : "");
+		}
 		{
 			unsigned ks = (k + kmax - 1) / kmax;
 
