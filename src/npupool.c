@@ -205,12 +205,85 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
  * m alone or m against K is not known, which is the other reason not to sit at
  * the edge.
  */
+/*
+ * ⚠ 80 NOW, NOT 64, AND ON TWO MEASUREMENTS. The sweep above has 80 identical
+ * at K = 768 and 3072, and board_verify phase 18 has K = 3072 at 80 rows EXACT
+ * against the row loop on the height axis (surface 7680; the next cell up,
+ * 10240, is wrong and phase 19 walks the gap). When the tower took 82 s the
+ * dispatch count did not matter; at 5.4 s it does -- 1024 rows is 16 calls of
+ * 64 or 13 of 80, and every call carries its own pack, fence and read.
+ */
 static unsigned rows_max(void)
 {
 	const char *e = getenv("CHARSIU_NPU_ROWS_MAX");
-	int v = e ? atoi(e) : 64;
+	int v = e ? atoi(e) : 80;
 
-	return v > 0 ? (unsigned)v : 64;
+	return v > 0 ? (unsigned)v : 80;
+}
+
+static int pool_id(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
+		   unsigned *id)
+{
+	unsigned i;
+
+	if (!p->dev || !charsiu_pool_get(p, w))
+		return -1;
+	for (i = 0; i < p->n; i++)
+		if (p->key[i] == w) {
+			if (p->id[i] < 0)
+				return -1;
+			*id = (unsigned)p->id[i];
+			return 0;
+		}
+	return -1;
+}
+
+int charsiu_pool_rows3(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
+		       const struct gguf_tensor *w2, const float *X, unsigned m,
+		       float *Y0, float *Y1, float *Y2)
+{
+	unsigned id0, id1, id2, chunk = rows_max(), done = 0;
+	uint64_t k, n0, n1, n2;
+	double t0;
+
+	p->calls += 3;
+	if (pool_id(p, w0, &id0) || pool_id(p, w1, &id1) || pool_id(p, w2, &id2))
+		return -1;
+	if (w0->ne[0] != w1->ne[0] || w0->ne[0] != w2->ne[0])
+		return -1;             /* one input means one K */
+	k = w0->ne[0];
+	n0 = w0->n_dims ? w0->ne[w0->n_dims - 1] : 1;
+	n1 = w1->n_dims ? w1->ne[w1->n_dims - 1] : 1;
+	n2 = w2->n_dims ? w2->ne[w2->n_dims - 1] : 1;
+	t0 = now_ms();
+	while (done < m) {
+		unsigned c = m - done < chunk ? m - done : chunk;
+		const float *x = X + (size_t)done * k;
+
+		/*
+		 * ⚠ THE CHUNK IS THE UNIT OF REUSE. Three whole-tensor calls
+		 * in a row would pack every chunk three times, because the
+		 * input BO only ever holds the LAST chunk packed; q, k and v
+		 * on one chunk before the next is what makes two of the three
+		 * packs vanish.
+		 */
+		if (charsiu_npu_matmul(p->dev, (int)id0, x, c,
+				       Y0 + (size_t)done * n0) ||
+		    charsiu_npu_matmul_same(p->dev, (int)id1, x, c,
+					    Y1 + (size_t)done * n1) ||
+		    charsiu_npu_matmul_same(p->dev, (int)id2, x, c,
+					    Y2 + (size_t)done * n2)) {
+			p->fell_back += 3;
+			p->hw_ms += now_ms() - t0;
+			return -1;
+		}
+		done += c;
+	}
+	p->hw += 3;
+	p->rows_hw += 3 * m;
+	p->hw_ms += now_ms() - t0;
+	return 0;
 }
 
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
@@ -359,6 +432,20 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 		fprintf(out, "    (%u batch buffer allocations, %.1f ms, inside "
 			"prep -- a pool that quietly reallocates is the old "
 			"bug in new clothes)\n", nbuf, alloc);
+	{
+		unsigned long hits = 0, misses = 0;
+
+		charsiu_npu_reuse_stats(p->dev, &hits, &misses);
+		/*
+		 * ⚠ SAID EVEN WHEN ZERO. A reuse that silently never fired
+		 * would read as "pack did not move", which is a different
+		 * fact from "the declaration was never honoured".
+		 */
+		if (hits || misses)
+			fprintf(out, "    input reused %lu times, packed anyway "
+				"%lu times when declared the same\n",
+				hits, misses);
+	}
 }
 
 /*

@@ -301,6 +301,22 @@ int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
  */
 int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			unsigned m, float *Y);
+/*
+ * The same call, with the INPUT DECLARED UNCHANGED since the previous batched
+ * call: same X contents, same m. q, k and v multiply one RMSNorm output, and so
+ * do gate and up, and the pack of that input -- gather, quantise, permute, and
+ * the cache clean that makes it visible to the hardware, on both cores -- is
+ * 26% of a batched matmul. This skips it when X, m and K match what the input
+ * BO already holds and packs as usual when they do not. The caller vouches for
+ * the CONTENTS: a buffer rewritten between two calls at the same address is
+ * exactly the misuse this cannot see.
+ */
+int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
+			     unsigned m, float *Y);
+/* how often the declaration was honoured, and how often it had to pack anyway */
+void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
+			     unsigned long *misses);
+
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
@@ -706,6 +722,16 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
  */
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		      const float *X, unsigned m, float *Y);
+/*
+ * Three projections of ONE input, chunked together: q, k and v. Each chunk is
+ * packed once and the other two reuse it. Returns 0 with all three Y filled,
+ * or -1 having filled none of them, so the caller falls back for all three.
+ */
+int charsiu_pool_rows3(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
+		       const struct gguf_tensor *w2, const float *X, unsigned m,
+		       float *Y0, float *Y1, float *Y2);
+
 
 struct llama_state {
 	const struct llama_model *m;

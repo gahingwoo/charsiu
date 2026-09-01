@@ -352,6 +352,18 @@ struct charsiu_npu {
 	struct charsiu_bo bin[2], breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
+	/*
+	 * What the input BOs hold right now, so a caller that declares its
+	 * input unchanged (charsiu_npu_matmul_same) can skip the pack. The
+	 * key is the pointer, the width, K and the zero point; the CONTENTS
+	 * are the caller's word. Cleared whenever the BOs are rebuilt.
+	 */
+	const float *bin_x;
+	unsigned bin_m;
+	uint64_t bin_k;
+	uint8_t bin_zp;
+	int bin_valid, reuse_ask;
+	unsigned long reuse_hits, reuse_misses;
 	size_t bin_stride, bout_stride;
 	/* the output buffers, one per geometry rather than one per tensor:
 	 * see the comment on struct npu_outbuf */
@@ -2997,6 +3009,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
+	g->bin_valid = 0;          /* the BOs are about to be replaced */
 	if (m > g->bm)
 		g->bm = m;
 	if (nks > g->bnks)
@@ -3793,11 +3806,34 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * before either is waited on, which is what decode does. The fence was
 	 * 5072 ms of a 7448 ms report when this waited on every slice.
 	 */
+	/*
+	 * ⚠ REUSE IS DECIDED ONCE, FOR BOTH DEVICES. The key says whether the
+	 * input BOs already hold this X at this width for this K; the caller's
+	 * declaration says whether it is allowed to matter. Either alone packs.
+	 */
+	int reuse = g->reuse_ask && g->bin_valid && g->bin_x == X &&
+		    g->bin_m == m && g->bin_k == e->t->k &&
+		    g->bin_zp == g->slot[e->first].job.input_zero_point;
+
+	if (g->reuse_ask) {
+		if (reuse)
+			g->reuse_hits++;
+		else
+			g->reuse_misses++;
+	}
+	if (!reuse) {
+		g->bin_valid = 0;
+		g->bin_x = X;
+		g->bin_m = m;
+		g->bin_k = e->t->k;
+		g->bin_zp = g->slot[e->first].job.input_zero_point;
+	}
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0, nh = 0, done_ki = 0;
 		double tp = now_us();
 
-		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+		if (!reuse)
+			charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
 		g->handles[nh++] = g->bin[d].handle;
 
@@ -3816,7 +3852,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			unsigned sk = s->job.mm.k, ki = i / e->n_slices;
 			struct charsiu_matmul mm = s->job.mm;
 
-			if (s->di != d || ((done_ki >> ki) & 1u))
+			if (reuse || s->di != d || ((done_ki >> ki) & 1u))
 				continue;
 			done_ki |= 1u << ki;
 			mm.m = m;
@@ -3913,9 +3949,13 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			nt++;
 			g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
 		}
-		charsiu_bo_fini(g->dev[d], &g->bin[d]);
+		if (!reuse)
+			charsiu_bo_fini(g->dev[d], &g->bin[d]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
 		g->bpack_us += now_us() - tp;
+		/* every device's input is in place: the key may be honoured */
+		if (!reuse && d + 1 == g->ndev)
+			g->bin_valid = 1;
 		if (!nt)
 			continue;
 		tp = now_us();
@@ -4104,10 +4144,32 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
 	double t0 = now_us();
-	int rc = npu_matmul_inner(g, id, X, m, Y);
+	int rc;
 
+	g->reuse_ask = 0;
+	rc = npu_matmul_inner(g, id, X, m, Y);
 	g->bwall_us += now_us() - t0;
 	return rc;
+}
+
+int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
+			    unsigned m, float *Y)
+{
+	double t0 = now_us();
+	int rc;
+
+	g->reuse_ask = 1;
+	rc = npu_matmul_inner(g, id, X, m, Y);
+	g->reuse_ask = 0;
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
+			     unsigned long *misses)
+{
+	*hits = g ? g->reuse_hits : 0;
+	*misses = g ? g->reuse_misses : 0;
 }
 
 /*

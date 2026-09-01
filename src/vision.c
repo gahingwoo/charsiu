@@ -880,6 +880,41 @@ static void rows_mul(const struct gguf_tensor *w, const float *bias,
 	}
 }
 
+/*
+ * q, k and v of one input, as one pooled call that packs each chunk once.
+ * The bias for each is read into its own row, because row1() fills the one
+ * scratch it is handed and three projections need three.
+ */
+static void rows_mul3(const struct charsiu_vision_layer *L, const float *X, unsigned m,
+		      unsigned W, float *q, float *k, float *v, float *bias,
+		      struct charsiu_act *a)
+{
+	float *bk = malloc((size_t)W * sizeof(float));
+	float *bv = malloc((size_t)W * sizeof(float));
+	const float *bq_r = row1(L->q_b, bias, W);
+	const float *bk_r = bk ? row1(L->k_b, bk, W) : NULL;
+	const float *bv_r = bv ? row1(L->v_b, bv, W) : NULL;
+	unsigned r, i;
+
+	if (bk && bv && rows_pool && m > 1 &&
+	    !charsiu_pool_rows3(rows_pool, L->q_w, L->k_w, L->v_w, X, m,
+				q, k, v)) {
+		for (r = 0; r < m; r++)
+			for (i = 0; i < W; i++) {
+				if (bq_r) q[(size_t)r * W + i] += bq_r[i];
+				if (bk_r) k[(size_t)r * W + i] += bk_r[i];
+				if (bv_r) v[(size_t)r * W + i] += bv_r[i];
+			}
+		free(bk); free(bv);
+		return;
+	}
+	/* the old three calls, which fall back a row at a time themselves */
+	rows_mul(L->q_w, row1(L->q_b, bias, W), X, m, W, q, W, a);
+	rows_mul(L->k_w, row1(L->k_b, bias, W), X, m, W, k, W, a);
+	rows_mul(L->v_w, row1(L->v_b, bias, W), X, m, W, v, W, a);
+	free(bk); free(bv);
+}
+
 void charsiu_vision_normalise(const struct charsiu_vision *v, float *px)
 {
 	unsigned c, i, hw = v->image_size * v->image_size;
@@ -1464,9 +1499,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 			free(g); free(b);
 		}
 
-		VSTAGE(V_QKV, rows_mul(L->q_w, row1(L->q_b, bias, W), xb, nt, W, q, W, &a));
-		VSTAGE(V_QKV, rows_mul(L->k_w, row1(L->k_b, bias, W), xb, nt, W, k, W, &a));
-		VSTAGE(V_QKV, rows_mul(L->v_w, row1(L->v_b, bias, W), xb, nt, W, val, W, &a));
+		VSTAGE(V_QKV, rows_mul3(L, xb, nt, W, q, k, val, bias, &a));
 
 		/*
 		 * ⚠ FULL ATTENTION, EVERY PATCH AGAINST EVERY PATCH, and on a
