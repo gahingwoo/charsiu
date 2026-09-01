@@ -802,27 +802,47 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # comparison stops being about slicing at all. 1536, 8960, 1152, 6912, 576
    # and 1536 divide none of 1024, 2048, 3072, 4096, so across this sweep the
    # quantiser emits the same bytes and only ks moves.
+   # ⚠⚠ AND A SECOND ARM, BECAUSE PHASE 15 EXONERATED THE DISPATCH. One int4
+   # matmul at K=4096 N=1536, m=80, through the same emitter, is EXACT -- and
+   # so is every other shape these models run. So the fault is not in the
+   # register stream for one dispatch; it is in something the model does and a
+   # single call does not, and the shortest list is: several K slices
+   # accumulated, two cores, and the buffers shared across both.
+   #
+   # CHARSIU_NPU_ONEDEV=1 removes one of those three outright. If 3072 and 4096
+   # come back correct on one core, the fault is in the pair -- which this tree
+   # has seen before, in the batched submits that corrupted each other. If they
+   # stay wrong, the pair is innocent and it is the slice accumulation.
    run 13
    KW=${KMAX_WIDTHS:-1024 2048 3072 4096}
+   A13=${K_ARMS:-both onedev}
    printf '  KMAX = W4_GROUP over %s, on the three models whose weights\n' "$KW"
    printf '  do not move across it. Batched against the token loop.\n'
+   printf '  arms: %s   (onedev = CHARSIU_NPU_ONEDEV=1, the core pair removed)\n' "$A13"
    n13=0
    for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
 	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
 	n13=$((n13 + 1))
 	printf '\n  %s\n' "$MK"
-	for K in $KW; do
-		r=$(CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
-		    CHARSIU_NPU_W4_GROUP="$K" \
-		    sh "$BIN/board_text_all.sh" 2>&1 \
-		    | grep -E "text identical|TEXT DIFFERS" | head -1)
-		case "$r" in
-		*identical*) printf '      KMAX %-5s agrees with the token loop\n' "$K" ;;
-		*DIFFERS*)   printf '      KMAX %-5s ⚠ DISAGREES -- the batched path is wrong here\n' "$K"
-			     bad "$MK breaks at a K slice of $K" ;;
-		*)           bad "$MK at KMAX $K: no verdict line at all"
-			     printf '        %s\n' "${r:-(no output)}" ;;
+	for ARM in $A13; do
+		case $ARM in
+		onedev) E13=CHARSIU_NPU_ONEDEV=1 ;;
+		*)      E13=CHARSIU_DEV_DUMMY=1 ;;
 		esac
+		for K in $KW; do
+			# shellcheck disable=SC2086
+			r=$(env CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
+			    CHARSIU_NPU_W4_GROUP="$K" $E13 \
+			    sh "$BIN/board_text_all.sh" 2>&1 \
+			    | grep -E "text identical|TEXT DIFFERS" | head -1)
+			case "$r" in
+			*identical*) printf '      %-7s KMAX %-5s agrees with the token loop\n' "$ARM" "$K" ;;
+			*DIFFERS*)   printf '      %-7s KMAX %-5s ⚠ DISAGREES\n' "$ARM" "$K"
+				     bad "$MK breaks at a K slice of $K on $ARM" ;;
+			*)           bad "$MK at KMAX $K on $ARM: no verdict line at all"
+				     printf '        %s\n' "${r:-(no output)}" ;;
+			esac
+		done
 	done
    done
    wedged "phase 13" && break
