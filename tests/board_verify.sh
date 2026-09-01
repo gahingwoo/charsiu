@@ -846,6 +846,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
 	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
 	n13=$((n13 + 1))
+	# ⚠⚠ gemma-3-1b IS AN INTERMITTENT REPRODUCER AND ITS CELLS ARE NOISE.
+	# It read WRONG at KMAX 4096 on one round and RIGHT on the next with a
+	# byte-identical runtime -- every commit between the two touched only
+	# tests and comments. Its two arms also inverted against each other in
+	# the round before that. A hypothesis was fitted to those cells and was
+	# wrong, so REP13 runs each cell more than once and a cell that
+	# disagrees with itself is reported as unstable rather than as a bound.
+	# Qwen2.5-1.5B has been consistent in every round and is the reproducer.
 	printf '\n  %s\n' "$MK"
 	for ARM in $A13; do
 		case $ARM in
@@ -856,17 +864,38 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		esac
 		for K in $KW; do
 			# shellcheck disable=SC2086
-			r=$(env CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
-			    CHARSIU_NPU_W4_GROUP="$K" $E13 \
-			    sh "$BIN/board_text_all.sh" 2>&1 \
-			    | grep -E "text identical|TEXT DIFFERS" | head -1)
-			case "$r" in
-			*identical*) printf '      %-7s KMAX %-5s agrees with the token loop\n' "$ARM" "$K" ;;
-			*DIFFERS*)   printf '      %-7s KMAX %-5s ⚠ DISAGREES\n' "$ARM" "$K"
-				     bad "$MK breaks at a K slice of $K on $ARM" ;;
-			*)           bad "$MK at KMAX $K on $ARM: no verdict line at all"
-				     printf '        %s\n' "${r:-(no output)}" ;;
-			esac
+			ok13=0; no13=0; err13=0
+			i13=0
+			while [ "$i13" -lt "${REP13:-2}" ]; do
+				i13=$((i13 + 1))
+				# shellcheck disable=SC2086
+				r=$(env CHARSIU_TEXT_ONLY="$MK" CHARSIU_NPU_KMAX="$K" \
+				    CHARSIU_NPU_W4_GROUP="$K" $E13 \
+				    sh "$BIN/board_text_all.sh" 2>&1 \
+				    | grep -E "text identical|TEXT DIFFERS" | head -1)
+				case "$r" in
+				*identical*) ok13=$((ok13 + 1)) ;;
+				*DIFFERS*)   no13=$((no13 + 1)) ;;
+				*)           err13=$((err13 + 1)) ;;
+				esac
+			done
+			if [ "$err13" != 0 ]; then
+				bad "$MK at KMAX $K on $ARM: $err13 run(s) gave no verdict"
+			elif [ "$no13" = 0 ]; then
+				printf '      %-7s KMAX %-5s agrees, %s of %s\n' \
+				    "$ARM" "$K" "$ok13" "$i13"
+			elif [ "$ok13" = 0 ]; then
+				printf '      %-7s KMAX %-5s ⚠ DISAGREES, %s of %s\n' \
+				    "$ARM" "$K" "$no13" "$i13"
+				bad "$MK breaks at a K slice of $K on $ARM"
+			else
+				# ⚠ NOT A BOUND. A cell that disagrees with itself
+				# is the model being flaky, and fitting anything
+				# to it is how the last two hypotheses died.
+				printf '      %-7s KMAX %-5s ⚠⚠ UNSTABLE: %s right, %s wrong of %s\n' \
+				    "$ARM" "$K" "$ok13" "$no13" "$i13"
+				bad "$MK at KMAX $K on $ARM is not repeatable"
+			fi
 		done
 	done
    done

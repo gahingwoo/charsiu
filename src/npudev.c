@@ -3555,6 +3555,49 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 	}
 	e = &g->ent[id];
+	/*
+	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
+	 *
+	 * On the width axis the surface is (k_slice / 32) * m CBUF entries.
+	 * charsiu_emit_job splits the CBUF window above 4096 of them, a rule
+	 * read off the vendor's own file -- and its LARGEST split sample is
+	 * 5120, which is 2048 at m = 80. Above that nothing in that file says
+	 * what the stream should look like, and the board says our guess is
+	 * wrong. Nine cells, all of them:
+	 *
+	 *   surf 2560 3840 4096 5120   right    (1024x80, 1536x80, 4096x32, 2048x80)
+	 *   surf 7680 10240            WRONG    (3072x80, 4096x80)
+	 *   surf 1024 2048 3072        right    (1024x32, 2048x32, 3072x32)
+	 *
+	 * so the bound is in (5120, 7680] and 5120 is exactly where the
+	 * evidence stops. A wider surface than that is extrapolation, and this
+	 * refuses it rather than computing a wrong answer quietly.
+	 *
+	 * ⚠ IT IS NOT A SIZE LIMIT ON K, which is what three earlier readings
+	 * of this thought it was. K = 4096 is fine at m = 32 and wrong at
+	 * m = 80; a single dispatch at K = 4096, N = 1536, m = 80 is EXACT
+	 * (phase 15). Only the product moves it.
+	 *
+	 * ⚠ AND THE FIX, IF SOMEBODY WANTS THESE WIDTHS, IS NOT A BIGGER
+	 * NUMBER HERE. It is whatever the vendor emits above 5120, which is a
+	 * third window state nothing on disk has ever shown -- so it has to be
+	 * searched for, not derived.
+	 */
+	{
+		unsigned kw = 0, i;
+
+		for (i = 0; i < e->count; i++) {
+			unsigned sk = (unsigned)g->slot[e->first + i].job.mm.k;
+
+			if (sk > kw)
+				kw = sk;
+		}
+		if ((size_t)(kw / 32) * m > 5120) {
+			whine(g, "the input surface is past the widest the "
+			      "vendor's own file ever splits", kw, m);
+			return -1;
+		}
+	}
 	if (e->n_npu != (unsigned)e->t->n) {
 		/* a CPU share would have to be batched too, and is not */
 		whine(g, "batched cannot split rows with the CPU",
