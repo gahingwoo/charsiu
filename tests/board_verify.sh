@@ -527,6 +527,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 10) say "10. KMAX: read is m * n * ks, so buy ks down and see what it costs"
+   # ⚠⚠ THIS PHASE COMPARES BATCHED AGAINST BATCHED, AND SO DOES PHASE 12.
+   # Both arms take the same path, so neither can see the batched path
+   # disagreeing with the model's own token loop -- and at KMAX 4096 it DOES,
+   # on Qwen2.5 and gemma-3-1b, which this phase and phase 12 both called
+   # identical. Only phase 2 asks that question. Read a "text same" here as
+   # "the quantiser did not move", never as "this width is correct".
    # ⚠⚠ THIS IS A TRADE, NOT A FREE WIN, AND THE TREE ALREADY KNEW WHY. The
    # read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
    # directly less read work. But npudev's own note closes the obvious version

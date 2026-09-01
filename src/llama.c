@@ -2773,6 +2773,42 @@ static void llama_auto_kmax(const struct llama_model *m)
 	if (getenv("CHARSIU_NPU_KMAX") || getenv("CHARSIU_NPU_W4_GROUP"))
 		return;                 /* asked for by hand, leave it alone */
 
+	/*
+	 * ⚠⚠ SET THE BASELINE FIRST, ALWAYS, BEFORE DECIDING ANYTHING. Falling
+	 * out of this function without setting them does NOT leave 1024: the
+	 * code defaults are CHARSIU_NPU_KMAX 4096 in npudev.c and, in
+	 * npuquant.c, a group of k -- one absmax over a whole row. No board
+	 * round has ever run that pair; every probe pinned 1024/1024, which is
+	 * exactly why nobody noticed the defaults had drifted away from it.
+	 *
+	 * Unpinning the probes and shipping this function together turned that
+	 * into eight models of nine answering wrongly, and the six that this
+	 * function DECLINED to widen were the six that got the untouched
+	 * defaults. A function that decides not to act still has to say so.
+	 */
+	setenv("CHARSIU_NPU_KMAX", "1024", 1);
+	setenv("CHARSIU_NPU_W4_GROUP", "1024", 1);
+
+	/*
+	 * ⚠⚠ AND THE WIDENING ITSELF IS OFF UNTIL IT IS UNDERSTOOD.
+	 * CHARSIU_NPU_KMAX_AUTO=1 asks for it.
+	 *
+	 * The reasoning below is sound as far as the QUANTISER goes and the
+	 * board agreed with it: at 1024, 2048 and 4096 the three models whose
+	 * every K misses every width came back byte identical on three prompts.
+	 * But that comparison, and the KMAX sweep in phase 10, put a BATCHED
+	 * run against another BATCHED run. Phase 2 puts the batched path
+	 * against the model's own token loop, and there Qwen2.5 and gemma-3-1b
+	 * DISAGREE at 4096 -- both of them models this function had cleared,
+	 * and both of them models phase 12 had called identical.
+	 *
+	 * So the weights are fine and something in the batched path is not, at
+	 * a K slice wider than 1024. Until that is found, the widest safe slice
+	 * is the one the board has always run.
+	 */
+	if (!getenv("CHARSIU_NPU_KMAX_AUTO"))
+		return;
+
 	k[nk++] = m->n_embd;
 	if (m->n_ff)
 		k[nk++] = m->n_ff;
