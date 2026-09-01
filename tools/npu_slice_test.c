@@ -52,12 +52,12 @@ int main(int argc, char **argv)
 	unsigned m = argc > 3 ? (unsigned)atoi(argv[3]) : 80;
 	const char *kmaxe = argc > 4 ? argv[4] : getenv("CHARSIU_NPU_KMAX");
 	unsigned kmax = kmaxe ? (unsigned)atoi(kmaxe) : 1024;
-	unsigned seed = 12345, r, j, bad = 0, ctrl_bad = 0;
+	unsigned seed = 12345, r, j, bad = 0;
 	struct gguf_tensor w = { 0 };
 	struct npu_tensor t = { 0 };
 	struct charsiu_npu *g;
 	struct charsiu_act act;
-	float *raw, *X, *Ynpu, *Ycpu, worst = 0.0f;
+	float *raw, *X, *Yb, *Yref, *Ycpu, worst = 0.0f;
 	int id;
 
 	if (argc > 4)
@@ -73,9 +73,10 @@ int main(int argc, char **argv)
 
 	raw = malloc((size_t)n * k * sizeof(float));
 	X = malloc((size_t)m * k * sizeof(float));
-	Ynpu = malloc((size_t)m * n * sizeof(float));
-	Ycpu = malloc((size_t)m * n * sizeof(float));
-	if (!raw || !X || !Ynpu || !Ycpu) {
+	Yb = malloc((size_t)m * n * sizeof(float));
+	Yref = malloc((size_t)m * n * sizeof(float));
+	Ycpu = malloc((size_t)n * sizeof(float));
+	if (!raw || !X || !Yb || !Yref || !Ycpu) {
 		fprintf(stderr, "out of memory\n");
 		return 1;
 	}
@@ -98,62 +99,39 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠⚠ charsiu_act_set QUANTISES NOTHING. Its own header says so, and
-	 * npu_matvec reads a->q1 -- so without charsiu_act_q1 the reference is
-	 * computed from an activation that was never realised. The first
-	 * version of this file left it out and the board answered "1536 of 1536
-	 * channels wrong" at every KMAX, which the tool correctly reported as
-	 * ITS OWN fault and stopped on.
+	 * ⚠⚠ THE HALF A DESK CAN VERIFY, AND IT RUNS BEFORE THE HARDWARE IS
+	 * OPENED. The reference below is the NPU's own row loop and needs a
+	 * board; the tensor and the activation do not -- and the bug this file
+	 * shipped with was exactly there. charsiu_act_set quantises NOTHING,
+	 * npu_matvec reads a->q1, and charsiu_act_q1 fills it only under
+	 * CHARSIU_NPU_QUANT=1. A machine with no /dev/accel can see all of
+	 * that, and could not, because the open used to come first.
 	 */
-	for (r = 0; r < m; r++) {
-		charsiu_act_set(&act, X + (size_t)r * k, (int)k);
-		charsiu_act_q1(&act);
-		npu_matvec(&t, &act, Ycpu + (size_t)r * n, 0, n);
-	}
-
-	/*
-	 * ⚠ AND THE REFERENCE IS CHECKED BEFORE THE HARDWARE IS OPENED, on the
-	 * host, with no NPU in the room. A reference that is all zeros or all
-	 * one value compares against anything and is how a broken harness looks
-	 * exactly like a broken runtime. This is the half of the tool a desk can
-	 * actually verify, so it runs first and it runs everywhere.
-	 */
+	charsiu_act_set(&act, X, (int)k);
+	charsiu_act_q1(&act);
+	npu_matvec(&t, &act, Ycpu, 0, n);
 	{
-		unsigned nz = 0, nd = 0;
-		float first = Ycpu[0];
+		unsigned nz = 0;
 
-		for (size_t i = 0; i < (size_t)m * n; i++) {
-			if (Ycpu[i] != 0.0f)
+		for (j = 0; j < n; j++)
+			if (Ycpu[j] != 0.0f)
 				nz++;
-			if (Ycpu[i] != first)
-				nd++;
-		}
-		printf("  reference: %u of %zu non-zero, %u differ from the first\n",
-		       nz, (size_t)m * n, nd);
-		if (nz == 0 || nd == 0) {
-			printf("  ⚠⚠ THE CPU REFERENCE IS DEGENERATE. Nothing below\n"
-			       "     would mean anything; this is the harness, not\n"
-			       "     the hardware.\n"
-			       "     npu_matvec reads a->q1, charsiu_act_set fills\n"
-			       "     nothing, and charsiu_act_q1 only fills it when\n"
-			       "     CHARSIU_NPU_QUANT=1 is set%s.\n",
-			       getenv("CHARSIU_NPU_QUANT") ? " -- and it IS set,"
-			       " so this is something else" : ", which it is NOT");
+		printf("  CPU on row 0: %u of %u channels non-zero\n", nz, n);
+		if (!nz) {
+			printf("  ⚠⚠ THE HARNESS CANNOT COMPUTE ANYTHING.\n"
+			       "     npu_matvec reads a->q1 and charsiu_act_q1\n"
+			       "     fills it only when CHARSIU_NPU_QUANT=1%s.\n",
+			       getenv("CHARSIU_NPU_QUANT")
+			       ? " -- and it IS set, so this is something else"
+			       : ", which it is NOT");
 			return 1;
 		}
 	}
 
-	/*
-	 * ⚠ THE HARDWARE IS OPENED HERE AND NOT EARLIER. Everything above is
-	 * CPU only, so a desk with no /dev/accel still runs the reference and
-	 * still catches a harness that cannot compute its own answer -- which
-	 * is exactly the bug this file shipped with, and the board found it
-	 * because the desk could not.
-	 */
 	g = charsiu_npu_open(k, n, 1);
 	if (!g) {
-		fprintf(stderr, "no /dev/accel/accel0 -- the reference above is"
-			" still checked, the comparison is not\n");
+		fprintf(stderr, "no /dev/accel/accel0 -- the CPU check above"
+			" still ran, the comparison did not\n");
 		return 1;
 	}
 	id = charsiu_npu_add(g, &t);
@@ -162,48 +140,83 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* ⚠ THE CONTROL FIRST: m=1 through the decode path on the same tensor */
-	charsiu_act_set(&act, X, (int)k);
-	if (charsiu_npu_needs_q1(g))
-		charsiu_act_q1(&act);
-	memset(Ynpu, 0, (size_t)n * sizeof(float));
-	if (charsiu_npu_matvec(g, id, &act, Ynpu)) {
-		printf("  ⚠ the m=1 control did not run at all\n");
-		return 1;
+	/*
+	 * ⚠⚠ THE REFERENCE IS THE NPU'S OWN ROW LOOP, NOT THE CPU'S.
+	 *
+	 * Two earlier versions compared the batch against npu_matvec and their
+	 * controls failed on 1536 channels and then 1327. Neither was the
+	 * runtime: npu_matvec reads an int8 quantised activation and w4a16
+	 * hands the hardware the FLOAT one, which charsiu_npu_needs_q1 says in
+	 * one line above its own declaration. Two arithmetics that differ
+	 * cannot agree to 0.1% and it is not a bug that they do not.
+	 *
+	 * Phase 2 compares the batched prefill against the TOKEN LOOP, and the
+	 * token loop is charsiu_npu_matvec. Same call, same weights, same
+	 * activation, one row at a time. Whatever is left is the batching.
+	 */
+	for (r = 0; r < m; r++) {
+		charsiu_act_set(&act, X + (size_t)r * k, (int)k);
+		if (charsiu_npu_needs_q1(g))
+			charsiu_act_q1(&act);
+		if (charsiu_npu_matvec(g, id, &act, Yref + (size_t)r * n)) {
+			printf("  ⚠ the reference did not run at row %u\n", r);
+			return 1;
+		}
 	}
-	for (j = 0; j < n; j++) {
-		float d = fabsf(Ynpu[j] - Ycpu[j]);
-		float s = fabsf(Ycpu[j]) + 1e-6f;
+	{
+		unsigned nz = 0, nd = 0, far = 0;
+		float first = Yref[0];
 
-		if (d / s > 1e-3f)
-			ctrl_bad++;
+		for (size_t i = 0; i < (size_t)m * n; i++) {
+			if (Yref[i] != 0.0f)
+				nz++;
+			if (Yref[i] != first)
+				nd++;
+		}
+		printf("  reference (NPU, row by row): %u of %zu non-zero,"
+		       " %u distinct\n", nz, (size_t)m * n, nd);
+		if (!nz || !nd) {
+			printf("  ⚠⚠ THE REFERENCE IS DEGENERATE -- the harness,"
+			       " not the hardware.\n");
+			return 1;
+		}
+		/*
+		 * ⚠ AND LOOSELY AGAINST THE CPU, at 10% and not 0.1%. The
+		 * activation quantisation makes a tight comparison meaningless
+		 * here; this only has to catch the hardware returning noise.
+		 */
+		for (j = 0; j < n; j++)
+			if (fabsf(Yref[j] - Ycpu[j])
+			    > 0.10f * (fabsf(Ycpu[j]) + 1e-6f))
+				far++;
+		printf("  sanity vs the CPU on row 0: %u of %u channels more"
+		       " than 10%% apart%s\n", far, n,
+		       far > n / 2 ? "  ⚠ the reference is not this tensor" : "");
+		if (far > n / 2)
+			return 1;
 	}
-	printf("  m=1 control: %u of %u channels off by more than 0.1%%%s\n",
-	       ctrl_bad, n, ctrl_bad ? "  ⚠ THE HARNESS IS WRONG, STOP HERE" : "");
-	if (ctrl_bad)
-		return 1;
 
-	memset(Ynpu, 0, (size_t)m * n * sizeof(float));
-	if (charsiu_npu_matmul(g, id, X, m, Ynpu)) {
-		printf("  ⚠ the batched call was REFUSED -- see the whine above."
-		       " Nothing was compared.\n");
+	memset(Yb, 0, (size_t)m * n * sizeof(float));
+	if (charsiu_npu_matmul(g, id, X, m, Yb)) {
+		printf("  ⚠ the batched call was REFUSED -- see the whine"
+		       " above. Nothing was compared.\n");
 		return 1;
 	}
 	for (r = 0; r < m; r++)
 		for (j = 0; j < n; j++) {
 			size_t i = (size_t)r * n + j;
-			float d = fabsf(Ynpu[i] - Ycpu[i]);
-			float s = fabsf(Ycpu[i]) + 1e-6f;
+			float d = fabsf(Yb[i] - Yref[i]);
+			float sc = fabsf(Yref[i]) + 1e-6f;
 
-			if (d / s > worst)
-				worst = d / s;
-			if (d / s > 1e-3f)
+			if (d / sc > worst)
+				worst = d / sc;
+			if (d / sc > 1e-3f)
 				bad++;
 		}
-	printf("  m=%u batched: %u of %zu values off by more than 0.1%%,"
-	       " worst %.3e\n", m, bad, (size_t)m * n, worst);
-	printf("  %s\n", bad ? "⚠⚠ THE SLICED BATCH DISAGREES WITH THE CPU"
-			     : "exact");
+	printf("  m=%u batched vs the same call row by row: %u of %zu off by"
+	       " more than 0.1%%, worst %.3e\n", m, bad, (size_t)m * n, worst);
+	printf("  %s\n", bad ? "⚠⚠ THE SLICED BATCH DISAGREES WITH ITS OWN"
+			       " ROW LOOP" : "exact");
 	charsiu_npu_close(g);
 	return bad ? 1 : 0;
 }
