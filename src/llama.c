@@ -2784,6 +2784,26 @@ static void llama_auto_kmax(const struct llama_model *m)
 	 * CHARSIU_NPU_KMAX by hand still reaches anything.
 	 *
 	 * 2048 is also what the vendor uses for 81% of its own int4 dispatches.
+	 *
+	 * ⚠⚠ AND IT IS THE OPTIMUM, NOT A COMPROMISE, under the surface ceiling
+	 * npudev enforces: (slice / 32) * m <= 5120, so a wider slice buys
+	 * itself a narrower chunk. Scored on Qwen2.5-1.5B, where read work is
+	 * sum over tensors of ceil(K / KMAX) * n and does not depend on m:
+	 *
+	 *   KMAX    max m    read      calls at that m
+	 *   1024     160     100%      1.00x
+	 *   2048      80      51%      1.00x
+	 *   3072      53      46%      1.51x
+	 *   4096      40      46%      2.00x
+	 *
+	 * Nearly all of the read is bought going 1024 -> 2048, and it is the
+	 * last width that still allows a chunk of 80. Against the board's own
+	 * measurement -- 19109 ms of batched matmul, 4925 read, 8003 fence, of
+	 * which about 30% is the per call term -- 4096 at m = 40 saves 266 ms
+	 * of read and pays about 2400 ms of call overhead for it.
+	 *
+	 * So this axis is finished. More would need the surface ceiling lifted,
+	 * and that is the third CBUF window state nothing on disk has shown.
 	 */
 	static const unsigned cand[] = { 2048 };
 	unsigned base = 1024, i, j;
