@@ -1079,7 +1079,11 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
 	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
 	    timeout 600 "$BIN/npu_slice_test" "$SK" "$SN" "$SM" "$K" 2>&1)
-	v=$(printf '%s' "$r" | grep -E "batched:|REFUSED|control" | tail -2)
+	# ⚠ the detail lines came back EMPTY last round because this grepped
+	# "batched:" with a colon and the tool prints "batched vs the same
+	# call". A phase that loses the diagnosis is a board round spent on one
+	# bit of information.
+	v=$(printf '%s' "$r" | grep -E "batched|rows wrong|channels |got/want|ks=" )
 	if printf '%s' "$r" | grep -q "exact"; then
 		printf '      KMAX %-5s exact\n' "$K"
 	elif printf '%s' "$r" | grep -q "REFUSED"; then
@@ -1091,6 +1095,35 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	else
 		bad "KMAX $K: the sliced batch disagrees with the CPU"
 		printf '%s\n' "$v" | sed 's/^/       /'
+	fi
+   done
+
+   # ⚠⚠ THE FREE CONTROL: THE SAME SURFACE WITH ONE SLICE.
+   #
+   # phase 15 has a single dispatch at surface 10240 EXACT, but it submits a
+   # raw job -- it never touches npudev's staging, slots or batched buffers.
+   # phase 16 above goes through all of that AND accumulates several slices, so
+   # a failure there has two possible homes and the two rungs cannot separate
+   # them.
+   #
+   # K = KMAX = 3072 separates them for nothing: one slice, so no accumulation
+   # at all, at exactly the surface that fails above. Exact here means the
+   # accumulation is the fault; wrong here means it is npudev's own buffers and
+   # the slice count never mattered.
+   printf '\n  the same surface with ONE slice, through the same staging:\n'
+   for K in ${SLICE_ONE:-3072 4096}; do
+	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
+	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
+	    timeout 600 "$BIN/npu_slice_test" "$K" "$SN" "$SM" "$K" 2>&1)
+	if printf '%s' "$r" | grep -q "exact"; then
+		printf '      K=KMAX=%-5s one slice, surface %-6s exact\n' \
+		    "$K" "$(( (K / 32) * SM ))"
+	else
+		bad "K=KMAX=$K: ONE slice at surface $(( (K / 32) * SM )) is already wrong"
+		printf '     so it is not the accumulation -- npudev gets a single\n'
+		printf '     wide slice wrong through its own staging.\n'
+		printf '%s\n' "$r" | grep -E "rows wrong|channels |got/want" | sed 's/^/       /'
 	fi
    done
    wedged "phase 16" && break

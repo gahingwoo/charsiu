@@ -217,6 +217,67 @@ int main(int argc, char **argv)
 	       " more than 0.1%%, worst %.3e\n", m, bad, (size_t)m * n, worst);
 	printf("  %s\n", bad ? "⚠⚠ THE SLICED BATCH DISAGREES WITH ITS OWN"
 			       " ROW LOOP" : "exact");
+
+	/*
+	 * ⚠⚠ WHERE IT IS WRONG IS THE DIAGNOSIS; THAT IT IS WRONG IS NOT.
+	 *
+	 * This fault has been chased for a day on "a model answers differently"
+	 * and every hypothesis fitted to that died. The shape of the error
+	 * separates the remaining candidates on its own:
+	 *
+	 *   every row wrong, all channels   -> the whole accumulation
+	 *   some rows only                  -> the m axis, the read order
+	 *   a channel range only            -> an output buffer offset
+	 *   ratio near (ks-1)/ks            -> a slice's contribution missing
+	 *
+	 * so print all four rather than make the next round guess again.
+	 */
+	if (bad) {
+		unsigned rows_bad = 0, r0 = m, rlast = 0;
+		unsigned c0 = n, clast = 0;
+		double rsum = 0.0;
+		unsigned rn = 0;
+
+		for (r = 0; r < m; r++) {
+			unsigned any = 0;
+
+			for (j = 0; j < n; j++) {
+				size_t i = (size_t)r * n + j;
+				float sc = fabsf(Yref[i]) + 1e-6f;
+
+				if (fabsf(Yb[i] - Yref[i]) / sc <= 1e-3f)
+					continue;
+				any = 1;
+				if (j < c0) c0 = j;
+				if (j > clast) clast = j;
+				if (fabsf(Yref[i]) > 1e-4f) {
+					rsum += Yb[i] / Yref[i];
+					rn++;
+				}
+			}
+			if (any) {
+				rows_bad++;
+				if (r < r0) r0 = r;
+				if (r > rlast) rlast = r;
+			}
+		}
+		printf("    rows wrong     %u of %u, first %u last %u\n",
+		       rows_bad, m, r0, rlast);
+		printf("    channels       first %u last %u of %u\n",
+		       c0, clast, n);
+		if (rn)
+			printf("    mean got/want  %.4f over %u values%s\n",
+			       rsum / rn, rn,
+			       fabs(rsum / rn - 1.0) < 0.5
+			       ? "" : "   (far from 1: not a rounding difference)");
+		{
+			unsigned ks = (k + kmax - 1) / kmax;
+
+			printf("    for reference, (ks-1)/ks with ks=%u is %.4f"
+			       " -- a missing slice would land there\n",
+			       ks, (double)(ks - 1) / ks);
+		}
+	}
 	charsiu_npu_close(g);
 	return bad ? 1 : 0;
 }
