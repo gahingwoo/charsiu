@@ -44,7 +44,7 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
-mkdir -p "$OUT"
+[ "$PLAN" = 1 ] || mkdir -p "$OUT"
 SUM=$OUT/next-summary.txt
 say() { printf '\n=========== %s ===========\n' "$*"; }
 note() { printf '%s\n' "$*" | tee -a "$SUM"; }
