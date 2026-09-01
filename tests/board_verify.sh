@@ -34,6 +34,8 @@
 #      stops being correct       above KMAX 1024; find the width it breaks at
 #  14  int8 at the same widths   is the fault int4's, or every dispatch's? one
 #                                shape at a time against an exact CPU reference
+#  15  one int4 matmul at a time  the direct instrument, on the real emitter:
+#                                is the bound K, or is it K*N?
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -45,7 +47,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -893,6 +895,75 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    wedged "phase 14" && break
    ok "a width that is not all-exact here is a fault every dispatch shares."
    printf '     All of them exact, and the fault is somewhere only int4 goes.\n'
+   ;;
+
+15) say "15. one int4 matmul at a time: is the bound K, or is it K times N"
+   # ⚠⚠ THIS TOOL WAS HERE THE WHOLE TIME AND I INFERRED INSTEAD. charsiu_matmul
+   # submits ONE matmul through charsiu's own emitter -- charsiu_emit_job, the
+   # one npudev uses, on the width axis that int4 takes -- and checks it against
+   # the CPU. Everything known about the wide slice fault so far was worked out
+   # from whole-model text and two dimensions, which is how it kept looking
+   # like nonsense: 2816 wrong, 3072 right, 4096 wrong.
+   #
+   # It stops looking like nonsense when the dispatch's WEIGHT BYTES are
+   # computed instead of its K. Per slice, K * N / 2 for int4:
+   #
+   #   Qwen2.5 @2048  max 1536 KiB   right      gemma-3-1b @3072  max 1728 KiB  right
+   #   SmolLM2 @4096  max  432 KiB   right      Qwen2.5    @3072  max 2304 KiB  WRONG
+   #   Qwen2.5 @4096  max 3072 KiB   WRONG      gemma-3-1b @4096  max 2304 KiB  WRONG
+   #
+   # Six for six, with the boundary in (1728 KiB, 2304 KiB] -- 2 MiB sits in
+   # the gap. It is the only reading that explains gemma-3-1b working at 3072
+   # while Qwen2.5 does not: same K, different N.
+   #
+   # ⚠ AND IT IS PROBABLY OURS, NOT THE HARDWARE'S. The vendor emits 0x101c =
+   # 4194304 on its 2048x4096 int4 shape, which is 4 MiB of weight bytes in one
+   # dispatch, so the block does this.
+   #
+   # The second sweep is the one that can kill the hypothesis: hold K at 4096
+   # and walk N. If the bound is K, every N fails. If it is K * N, it turns
+   # over around N = 1024, where 4096 * 1024 / 2 is exactly 2 MiB.
+   run 15
+   have charsiu_matmul || { skip 15 "charsiu_matmul not installed (dev channel)"; break; }
+   MM=${MM_M:-80}
+   printf '  m=%s, int4 weights, charsiu_emit_job, against the CPU\n\n' "$MM"
+   printf '  A. N fixed at 1536, K walking -- phase 13 widths, directly\n'
+   for K in ${MM_K:-2048 2816 3072 4096}; do
+	wb=$((K * 1536 / 2 / 1024))
+	if CHARSIU_W4=1 timeout 300 "$BIN/charsiu_matmul" "$MM" "$K" 1536 \
+	   >"$OUT/.mm" 2>&1; then
+		printf '      K=%-5s N=1536  %5s KiB  exact\n' "$K" "$wb"
+	else
+		printf '      K=%-5s N=1536  %5s KiB  ⚠ WRONG\n' "$K" "$wb"
+		nb15=$((${nb15:-0} + 1))
+	fi
+   done
+   printf '\n  B. K fixed at 4096, N walking -- this is the discriminating one\n'
+   for N in ${MM_N:-384 512 768 1024 1536}; do
+	wb=$((4096 * N / 2 / 1024))
+	if CHARSIU_W4=1 timeout 300 "$BIN/charsiu_matmul" "$MM" 4096 "$N" \
+	   >"$OUT/.mm" 2>&1; then
+		printf '      K=4096 N=%-5s %5s KiB  exact\n' "$N" "$wb"
+	else
+		printf '      K=4096 N=%-5s %5s KiB  ⚠ WRONG\n' "$N" "$wb"
+		nb15=$((${nb15:-0} + 1))
+	fi
+   done
+   wedged "phase 15" && break
+   printf '\n'
+   if [ "${nb15:-0}" = 0 ]; then
+	# ⚠ NOT A PASS. The models are wrong at these widths, so a bench that
+	# says every shape is exact has failed to reproduce a fault that is
+	# certainly there -- and that is a finding about the bench.
+	bad "every shape here is exact, so this bench does NOT reproduce the"
+	printf '     fault the models show. Something the models do and this does\n'
+	printf '     not -- the K slice loop, the accumulation across slices, the\n'
+	printf '     deal across two cores -- is where it actually lives.\n'
+   else
+	ok "sweep B is the answer: if it turns over near N=1024 the bound is on"
+	printf '     K * N and 2 MiB is the number; if every N fails the bound is\n'
+	printf '     on K alone and the weight bytes were a coincidence of shapes.\n'
+   fi
    ;;
 esac
 done
