@@ -32,6 +32,8 @@
 #                                coarser quantiser; this asks something that can
 #  13  where the wide slice      the batched path disagrees with the token loop
 #      stops being correct       above KMAX 1024; find the width it breaks at
+#  14  int8 at the same widths   is the fault int4's, or every dispatch's? one
+#                                shape at a time against an exact CPU reference
 #                                the share that has no name
 #
 # Phases 1 to 5 are correctness and any failure stops the round. 6 and 7 are
@@ -43,7 +45,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -823,6 +825,67 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '     4096, so what is above the bound is ours to find, not the\n'
 	printf '     hardware refusing.\n'
    fi
+   ;;
+
+14) say "14. the same widths in int8: is it int4's fault or every dispatch's"
+   # ⚠⚠ EVERYTHING KNOWN ABOUT THIS FAULT IS INFERRED FROM WHOLE-MODEL TEXT.
+   # Phase 13 says a model answers differently, and the slice widths were then
+   # worked out from its two dimensions. That is three layers away from the
+   # dispatch that is actually wrong, and it is why the shape of the fault
+   # still makes no sense: 2816 wrong, 3072 RIGHT, 4096 wrong.
+   #
+   # npu_gemm_test is the direct instrument -- ONE shape, submitted, against an
+   # exact CPU reference -- and it has never been pointed at this. It is int8,
+   # which is the point: the CBUF pair, the surface fields and the geometry are
+   # shared by every dispatch, so
+   #
+   #   int8 shows the same 2816/3072/4096 pattern  -> the fault is in the
+   #       geometry every dispatch shares and int4 is a bystander
+   #   int8 is exact at every width                -> it is the int4 path, and
+   #       that is a far smaller place to look
+   #
+   # Either answer halves the search, which is more than another sweep of
+   # whole-model text can do.
+   #
+   # ⚠ m=1 RUNS FIRST WHATEVER IS ASKED FOR, inside the tool. An m=80 failure
+   # means nothing if the control is already wrong, and the tool says so itself.
+   run 14
+   have npu_gemm_test || { skip 14 "npu_gemm_test not installed (dev channel)"; break; }
+   KG=${GEMM_WIDTHS:-2048 2816 3072 4096}
+   NG=${GEMM_N:-1536}
+   MG=${GEMM_M:-80}
+   printf '  K over %s at N=%s, m=1 then m=%s, int8 exact against the CPU\n' \
+       "$KG" "$NG" "$MG"
+   printf '  (N=%s is Qwen2.5 down projection, the tensor phase 13 implicates)\n' "$NG"
+   for K in $KG; do
+	r=$(CHARSIU_GEMM_M="$MG" timeout 600 "$BIN/npu_gemm_test" "$K" "$NG" 2>&1)
+	v=$(printf '%s' "$r" | grep -oE '[0-9]+ of [0-9]+ widths exact' | head -1)
+	c=$(printf '%s' "$r" | grep -c "m=1 disagrees")
+	if [ -z "$v" ]; then
+		bad "K=$K: no verdict line -- the tool did not finish"
+		printf '%s\n' "$r" | tail -4 | sed 's/^/       /'
+	elif [ "$c" != 0 ]; then
+		bad "K=$K: the m=1 CONTROL disagrees, so this width says nothing"
+	else
+		# ⚠ "3 of 3" is exact and "2 of 3" is the fault. Compare the two
+		# numbers rather than printing the line and leaving it to a
+		# reader -- a table nobody has to interpret is a table nobody
+		# misreads at one in the morning.
+		got=${v%% of *}
+		rest=${v#* of }
+		want=${rest%% *}
+		if [ "$got" = "$want" ]; then
+			printf '      K=%-5s %-22s exact\n' "$K" "$v"
+		else
+			bad "K=$K: $v -- this width is wrong in int8 too"
+			printf '%s\n' "$r" | grep -E "^  *[0-9]+ +[0-9]+" \
+			    | head -6 | sed 's/^/       /'
+		fi
+	fi
+   done
+   wedged "phase 14" && break
+   ok "a width that is not all-exact here is a fault every dispatch shares."
+   printf '     All of them exact, and the fault is somewhere only int4 goes.\n'
    ;;
 esac
 done
