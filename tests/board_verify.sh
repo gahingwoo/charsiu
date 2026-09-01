@@ -1071,15 +1071,23 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    printf '  K=%s N=%s m=%s, KMAX walking. m=1 is the control inside the tool.\n' \
        "$SK" "$SN" "$SM"
    for K in ${SLICE_KMAX:-1024 2048 3072 4096}; do
+	# ⚠ CHARSIU_NPU_ANY_SURFACE=1 LIFTS THE GUARD THIS PHASE EXISTS TO
+	# INTERROGATE. Without it the first run of this phase came back with
+	# 3072 and 4096 "refused by the surface guard" -- my own tripwire
+	# blocking the only measurement that can explain it.
 	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
-	    CHARSIU_COEF_ELEMS=65536 \
+	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
 	    timeout 600 "$BIN/npu_slice_test" "$SK" "$SN" "$SM" "$K" 2>&1)
 	v=$(printf '%s' "$r" | grep -E "batched:|REFUSED|control" | tail -2)
 	if printf '%s' "$r" | grep -q "exact"; then
 		printf '      KMAX %-5s exact\n' "$K"
 	elif printf '%s' "$r" | grep -q "REFUSED"; then
-		printf '      KMAX %-5s refused by the surface guard (expected above 5120)\n' "$K"
+		# ⚠ WITH THE HATCH SET THIS SHOULD NOT HAPPEN, so it is a
+		# failure and not a note: something else refused the batch and
+		# the cell was not measured either way.
+		bad "KMAX $K: the batch was refused even with the guard lifted"
+		printf '%s\n' "$r" | grep -iE "NOT on the NPU" | head -2 | sed 's/^/       /'
 	else
 		bad "KMAX $K: the sliced batch disagrees with the CPU"
 		printf '%s\n' "$v" | sed 's/^/       /'

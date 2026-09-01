@@ -3601,7 +3601,18 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			if (sk > kw)
 				kw = sk;
 		}
-		if ((size_t)(kw / 32) * m > 5120) {
+		/*
+		 * ⚠⚠ AND A PROBE HAS TO BE ABLE TO ASK ABOUT WHAT THIS
+		 * REFUSES. w4_batch_why_not learned this already and says so
+		 * above itself: asking is how every line of its table was
+		 * measured and the only way any of it gets re-measured. This
+		 * guard shipped without the hatch and the very next round --
+		 * phase 16, one tensor sliced, the rung this fault has been
+		 * missing all week -- came back with its two interesting cells
+		 * REFUSED BY IT. Nothing but a probe should set this.
+		 */
+		if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+		    (size_t)(kw / 32) * m > 5120) {
 			/*
 			 * ⚠ CHARSIU_NPU_KFIT IS THE LIKELY WAY TO GET HERE, and
 			 * the two are in direct conflict at the shipped width.
