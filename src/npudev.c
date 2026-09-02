@@ -23,7 +23,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,6 +250,12 @@ struct charsiu_npu {
 	 */
 	struct charsiu_device *dev[2];
 	unsigned ndev;
+	/*
+	 * /dev/cpu_dma_latency, held open for as long as the device is. See
+	 * the note where it is opened: it is worth 24% of decode on this
+	 * board and it is not a kernel patch. -1 when not held.
+	 */
+	int qos_fd;
 	struct charsiu_bo in[2];      /* one per device: they cannot be shared */
 	unsigned in_stride, out_stride, max_slices, maxtask;
 	uint8_t *scratch;
@@ -352,6 +361,32 @@ struct charsiu_npu {
 	struct charsiu_bo bin[2], breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
+	/*
+	 * What EACH DEVICE'S input BO holds right now, so a caller that
+	 * declares its input unchanged (charsiu_npu_matmul_same) can skip the
+	 * pack. The key is the pointer, the width, K and the zero point; the
+	 * CONTENTS are the caller's word. Cleared whenever the BOs are rebuilt.
+	 *
+	 * ⚠⚠ PER DEVICE, BECAUSE THE FIRST VERSION WAS NOT AND THE BOARD SAID
+	 * SO IN ONE ROUND: 6 of 9 models' batched prompts stopped matching
+	 * their token loop. A tensor is packed only into the BOs of the
+	 * devices its slots were dealt to, and a small projection -- Qwen2.5's
+	 * k with two KV heads, gemma3's with one -- goes whole to ONE core.
+	 * So q packed core 0, k was dealt to core 1, and k "reused" a BO on
+	 * core 1 that held whatever the last tensor there had left. The three
+	 * models that stayed right were the three whose every projection is
+	 * wide enough to be split across both cores. One key for two buffers
+	 * described neither.
+	 */
+	struct {
+		const float *x;
+		unsigned m;
+		uint64_t k;
+		uint8_t zp;
+		int valid;
+	} bin_key[2];
+	int reuse_ask;
+	unsigned long reuse_hits, reuse_misses;
 	size_t bin_stride, bout_stride;
 	/* the output buffers, one per geometry rather than one per tensor:
 	 * see the comment on struct npu_outbuf */
@@ -1096,6 +1131,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 
 	if (!g)
 		return NULL;
+	g->qos_fd = -1;
 	g->dev[0] = charsiu_open("/dev/accel/accel0");
 	g->ndev = 1;
 	if (g->dev[0] && !getenv("CHARSIU_NPU_ONEDEV")) {
@@ -1361,6 +1397,55 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		if (charsiu_bo_alloc(g->dev[d],
 				     (size_t)g->in_stride * ks + 4096, &g->in[d]))
 			goto fail;
+
+	/*
+	 * ⚠⚠ HOLD THE CPUs OUT OF DEEP IDLE WHILE THE NPU IS OPEN.
+	 *
+	 * rk3576.dtsi gives CPU_SLEEP an exit latency of 250 us. A decode step
+	 * is about 150 calls, and each call is several wakeups -- the irq
+	 * thread, the scheduler thread, the waiter, the CPU thread pool's
+	 * workers -- on CPUs that had nothing to do for the 300 us the fence
+	 * took and went to sleep. Phase 21 on the board, same prompt, same
+	 * kernel, ondemand governor:
+	 *
+	 *   deep idle allowed         7.64 tok/s
+	 *   CPU_SLEEP disabled        9.46 tok/s     +24%
+	 *   spin on the fence only    8.06 tok/s     +5%   (the waiter's share)
+	 *
+	 * so most of it is paid by the kernel threads, not by the waiter, and
+	 * a spinning waiter cannot buy it back. What can, from userspace, is
+	 * the PM QoS interface: a process that writes a latency bound to
+	 * /dev/cpu_dma_latency and keeps the file open forbids every idle
+	 * state whose exit latency exceeds it, on every CPU, until it closes
+	 * the file. Audio and network stacks do exactly this. 100 us allows
+	 * WFI and forbids CPU_SLEEP; the fd goes away with the device, and
+	 * with the process if it dies.
+	 *
+	 * CHARSIU_NPU_IDLE=1 leaves the CPUs alone (the control), and
+	 * CHARSIU_NPU_DMA_LATENCY_US moves the bound. Needs root, which the
+	 * board has; without it this says so once and carries on.
+	 */
+	if (!getenv("CHARSIU_NPU_IDLE")) {
+		const char *e = getenv("CHARSIU_NPU_DMA_LATENCY_US");
+		int32_t us = e ? (int32_t)atoi(e) : 100;
+		int fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
+
+		if (fd >= 0 && write(fd, &us, sizeof(us)) == (ssize_t)sizeof(us)) {
+			g->qos_fd = fd;
+			fprintf(stderr, "charsiu NPU: holding the CPUs out of idle "
+				"states deeper than %d us while the NPU is open "
+				"(CHARSIU_NPU_IDLE=1 to allow them)\n", (int)us);
+		} else {
+			int err = errno;
+
+			if (fd >= 0)
+				close(fd);
+			fprintf(stderr, "charsiu NPU: could not hold "
+				"/dev/cpu_dma_latency (%s); deep idle stays "
+				"allowed, which costs about a quarter of decode\n",
+				strerror(err));
+		}
+	}
 	return g;
 
 fail:
@@ -1382,6 +1467,10 @@ void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
+	if (g->qos_fd >= 0) {
+		close(g->qos_fd);      /* the CPUs may sleep deeply again */
+		g->qos_fd = -1;
+	}
 	if (g->dev[0]) {
 		for (unsigned i = 0; i < g->n_slot; i++) {
 			unsigned d = g->slot[i].di;
@@ -1615,6 +1704,20 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				g->deal_index
 				? " -- CHARSIU_NPU_DEAL_INDEX is set, so this "
 				  "is the old per tensor deal" : "");
+		/*
+		 * ⚠ SAY WHEN THE FIT DECLINES. Phase 21's second arm printed
+		 * the stage table and no cost-model line, and the phase could
+		 * only report "no line": the fit had been refused silently.
+		 * The normal matrix goes singular when every call has the same
+		 * task count or the same weight size -- a run too short or too
+		 * uniform to separate the three terms -- and saying so is the
+		 * difference between a mystery and a shorter prompt.
+		 */
+		if (solve3(m, v, x))
+			fprintf(stderr, "charsiu NPU: the cost model did not fit "
+				"(the calls do not separate 'a task' from 'a "
+				"MB': %lu calls, tasks summed %.0f, MB summed "
+				"%.1f)\n", g->calls, g->f_t, g->f_m);
 		if (!solve3(m, v, x)) {
 			double fix = x[0] * (double)g->calls / 1e3;
 			double tsk = x[1] * (double)g->tasks_hi / 1e3;
@@ -2997,6 +3100,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
+	g->bin_key[0].valid = g->bin_key[1].valid = 0;   /* BOs replaced */
 	if (m > g->bm)
 		g->bm = m;
 	if (nks > g->bnks)
@@ -3621,6 +3725,51 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				kw = sk;
 		}
 		/*
+		 * ⚠⚠ AND IT ONLY MEANS ANYTHING ON THE WIDTH AXIS. (kw / 32) * m
+		 * IS THE WIDTH AXIS'S SURFACE AND NOBODY ELSE'S: charsiu_emit_job
+		 * sets inw = m only when wide, so on the height axis the input is
+		 * one column of m rows and the surface is 1 * m -- three orders
+		 * smaller and nowhere near any ceiling. job.c had already written
+		 * down that a rule read off int4 must not reach int8, and this
+		 * guard shipped without the gate and reached it anyway.
+		 *
+		 * ⚠ IT COST THE VISION TOWER, which is the one caller that opens
+		 * want_w4 = 0 with a wide K. SmolVLM-256M's ffn_down is K = 3072
+		 * and charsiu_pool_rows batches 64 rows, so (3072 / 32) * 64 is
+		 * 6144 -- the first cell in the int4 bracket above -- and all
+		 * twelve of them plus the idefics3 projector were refused. The
+		 * scoreboard's encoder went 5.57 s to 31.0 s, the pool reported
+		 * "73 asked and 13 fell back", and 87.6% of the run was ffn
+		 * matmuls with only 1287 ms of it on the hardware. Gated, the
+		 * same board reads 5.37 s, 0 fell back, ffn 962 ms.
+		 *
+		 * ⚠ 15.5 s IS THE WRONG BASELINE and I quoted it first: that is
+		 * board_modalities' vision number from a different round, not
+		 * this scoreboard's encoder.
+		 *
+		 * whisper opens want_w4 = 0 too and escaped only by being small:
+		 * its widest K is 4 * n_audio_state, which is 2048 at base and
+		 * 4096 entries at 64 rows, just under.
+		 */
+		/*
+		 * ⚠ AND THE HEIGHT AXIS HAS ITS OWN LINE. Phase 19 walked it on
+		 * int8: (K / 32) * rows of 4096, 6144, 7680 and 8192 exact,
+		 * 8960 and 10240 wrong on every row -- with K alone (128 at 32
+		 * rows) and the output (122880 floats) both exact, so it is the
+		 * input surface again, in (8192, 8960]. The same hatch lifts it
+		 * for the probe that walks it.
+		 */
+		if (!charsiu_m_axis_wide_for(g->w4)) {
+			if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+			    (size_t)(kw / 32) * m > 8192) {
+				whine(g, "the input surface on the height axis is "
+				      "past 8192, where the board says every row "
+				      "comes back wrong", kw, m);
+				return -1;
+			}
+			kw = 0;
+		}
+		/*
 		 * ⚠⚠ AND A PROBE HAS TO BE ABLE TO ASK ABOUT WHAT THIS
 		 * REFUSES. w4_batch_why_not learned this already and says so
 		 * above itself: asking is how every line of its table was
@@ -3764,11 +3913,32 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * before either is waited on, which is what decode does. The fence was
 	 * 5072 ms of a 7448 ms report when this waited on every slice.
 	 */
+	/*
+	 * ⚠ REUSE IS DECIDED PER DEVICE. Each device's key says whether ITS
+	 * input BO already holds this X at this width for this K; the caller's
+	 * declaration says whether that is allowed to matter. Either alone
+	 * packs that device. A device this tensor has no slot on is neither
+	 * packed nor read, and its key is left describing what is there.
+	 */
+	uint8_t zp = g->slot[e->first].job.input_zero_point;
+
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0, nh = 0, done_ki = 0;
 		double tp = now_us();
+		int reuse = g->reuse_ask && g->bin_key[d].valid &&
+			    g->bin_key[d].x == X && g->bin_key[d].m == m &&
+			    g->bin_key[d].k == e->t->k && g->bin_key[d].zp == zp;
 
-		charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+		if (g->reuse_ask) {
+			if (reuse)
+				g->reuse_hits++;
+			else
+				g->reuse_misses++;
+		}
+		if (!reuse)
+			g->bin_key[d].valid = 0;   /* until this device's pack lands */
+		if (!reuse)
+			charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
 		g->handles[nh++] = g->bin[d].handle;
 
@@ -3787,7 +3957,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			unsigned sk = s->job.mm.k, ki = i / e->n_slices;
 			struct charsiu_matmul mm = s->job.mm;
 
-			if (s->di != d || ((done_ki >> ki) & 1u))
+			if (reuse || s->di != d || ((done_ki >> ki) & 1u))
 				continue;
 			done_ki |= 1u << ki;
 			mm.m = m;
@@ -3800,9 +3970,31 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				 * int8's scale is per row and taken over THIS K
 				 * slice's own range, so it is kept per K slice
 				 * for the read back.
+				 *
+				 * ⚠⚠ AND IT MULTIPLIES BY THE RECIPROCAL BECAUSE
+				 * charsiu_act_q1 DOES. x * (1/d) and x / d are
+				 * not the same float: the reciprocal rounds
+				 * once and the product rounds again, the divide
+				 * rounds once, and a value sitting halfway
+				 * between two codes comes out one code apart.
+				 * This path divided and the row loop multiplied,
+				 * so a batch and its own row-by-row reference
+				 * disagreed on a handful of near-zero channels
+				 * -- 127 of 49152 on the vision tower's own
+				 * shape, one row of 64, mean got/want 1.0007.
+				 * Small enough to look like noise and stable
+				 * enough to look like structure, which is how it
+				 * cost a board round to tell apart.
+				 *
+				 * ⚠ THIS ONLY MAKES THE TWO IDENTICAL ON A SINGLE
+				 * SLICE. q1's amax is over the whole row and this
+				 * one is over sk, so a multi-slice int8 tensor is
+				 * quantised FINER here on purpose and cannot
+				 * match the row loop to 0.1% -- and should not
+				 * be asked to.
 				 */
 				for (unsigned r = 0; r < m; r++) {
-					float mx = 0.0f, d1;
+					float mx = 0.0f, d1, id1;
 
 					for (unsigned kk = 0; kk < sk; kk++) {
 						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
@@ -3811,9 +4003,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 							mx = v;
 					}
 					d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+					id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
 					g->bd1[(size_t)ki * m + r] = d1;
 					for (unsigned kk = 0; kk < sk; kk++) {
-						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] / d1);
+						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
 
 						if (q > 127) q = 127;
 						if (q < -127) q = -127;
@@ -3861,9 +4054,22 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			nt++;
 			g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
 		}
-		charsiu_bo_fini(g->dev[d], &g->bin[d]);
+		if (!reuse)
+			charsiu_bo_fini(g->dev[d], &g->bin[d]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
 		g->bpack_us += now_us() - tp;
+		/*
+		 * THIS device's BO now holds X -- but only if a slice was
+		 * actually packed into it. A tensor with no slot here wrote
+		 * nothing, and the key must not claim otherwise.
+		 */
+		if (!reuse && done_ki) {
+			g->bin_key[d].x = X;
+			g->bin_key[d].m = m;
+			g->bin_key[d].k = e->t->k;
+			g->bin_key[d].zp = zp;
+			g->bin_key[d].valid = 1;
+		}
 		if (!nt)
 			continue;
 		tp = now_us();
@@ -4052,10 +4258,66 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 		       unsigned m, float *Y)
 {
 	double t0 = now_us();
-	int rc = npu_matmul_inner(g, id, X, m, Y);
+	int rc;
 
+	g->reuse_ask = 0;
+	rc = npu_matmul_inner(g, id, X, m, Y);
 	g->bwall_us += now_us() - t0;
 	return rc;
+}
+
+/*
+ * ⚠⚠ OFF UNLESS ASKED, AND THE BOARD IS WHY. Input reuse shipped twice in one
+ * day and phase 2 stopped the round both times: first 6 of 9 models, with one
+ * key for two devices; then, with a key per device, still Phi-3.5 and
+ * gemma4-E2B -- the two whose projections are VIEWS of a fused tensor or come
+ * with per-layer embeddings. Whatever the second fault is, the host cannot
+ * see it (no NPU: the batched path falls back to the row loop) and two rounds
+ * of guessing is the budget this file allows before a change goes back to
+ * being a probe. CHARSIU_NPU_REUSE=1 turns it on; board_verify's reuse phase
+ * is the way to find out which model it breaks and how.
+ */
+static int reuse_enabled(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_REUSE");
+
+		v = e && *e && *e != '0';
+	}
+	return v;
+}
+
+int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
+			    unsigned m, float *Y)
+{
+	double t0 = now_us();
+	int rc;
+
+	g->reuse_ask = reuse_enabled();
+	rc = npu_matmul_inner(g, id, X, m, Y);
+	g->reuse_ask = 0;
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+int charsiu_npu_reuse_on(void)
+{
+	return reuse_enabled();
+}
+
+/* the widest K one dispatch carries: a tensor wider than this is sliced */
+unsigned charsiu_npu_kmax(const struct charsiu_npu *g)
+{
+	return g ? g->kmax : 4096;
+}
+
+void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
+			     unsigned long *misses)
+{
+	*hits = g ? g->reuse_hits : 0;
+	*misses = g ? g->reuse_misses : 0;
 }
 
 /*

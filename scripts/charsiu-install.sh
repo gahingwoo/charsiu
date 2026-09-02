@@ -480,8 +480,18 @@ Install a kernel built from the series by hand instead:
 		return 1
 	fi
 
-	ui_note "asking $REPO for the latest kernel..."
-	J=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+	# ⚠ A NAMED RELEASE, FOR A TEST KERNEL. CHARSIU_KERNEL_TAG=<tag> asks for
+	# that release instead of the latest one, which is how a pre-release --
+	# something `releases/latest` never returns -- gets installed on purpose
+	# and only on purpose. The board scripts use it to put a kernel with
+	# patches under test on the board; nobody else should see it.
+	if [ -n "${CHARSIU_KERNEL_TAG:-}" ]; then
+		ui_note "asking $REPO for the kernel tagged $CHARSIU_KERNEL_TAG..."
+		J=$(api "https://api.github.com/repos/$REPO/releases/tags/$CHARSIU_KERNEL_TAG" 2>/dev/null || true)
+	else
+		ui_note "asking $REPO for the latest kernel..."
+		J=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+	fi
 	if [ -z "$J" ]; then
 		ui_msg "Could not reach the GitHub API.
 
@@ -629,12 +639,31 @@ Armbian layout after all. Nothing was written."
 	# ⚠ REMOVE BEFORE COPYING. Writing through a symlink would overwrite
 	# whatever it points at, which on Armbian is the distro's own
 	# vmlinuz-<version> and is not ours to replace.
+	TAGREL=$(strings "$TMP/Image" 2>/dev/null | sed -n 's/^Linux version \([^ ]*\).*/\1/p' | head -1)
 	as_root rm -f "$BOOTDIR/Image"
 	as_root cp "$TMP/Image" "$BOOTDIR/Image"
 	as_root rm -f "$DTBDEST"
 	as_root cp "$TMP/$DTBNAME" "$DTBDEST"
 	if [ -n "$MODS" ]; then
-		as_root tar -C / -xzf "$TMP/$(basename "$MODS")"
+		# ⚠⚠ NEVER `tar -C /`. Armbian is merged-usr: /lib is a SYMLINK to
+		# usr/lib, and GNU tar, extracting a `lib/` directory member over
+		# it, deletes the symlink and makes a real directory. Every
+		# dynamically linked program then fails to exec -- the loader is
+		# reached as /lib/ld-linux-aarch64.so.1 -- init included, and the
+		# next boot panics in run-init. That is what happened on 2026-09-02
+		# with a modules tarball rooted at lib/. Extract aside, find the
+		# release directory wherever the tarball put it, and copy it
+		# THROUGH the existing /lib/modules path, whatever /lib is.
+		as_root rm -rf "$TMP/mods" && as_root mkdir -p "$TMP/mods"
+		as_root tar -C "$TMP/mods" -xzf "$TMP/$(basename "$MODS")"
+		MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/$TAGREL" 2>/dev/null | head -1)
+		[ -n "$MODDIR" ] || MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/*" 2>/dev/null | head -1)
+		if [ -z "$MODDIR" ]; then
+			ui_msg "The modules tarball has no modules/<release> directory in it. Image and dtb are installed; modules were not."
+		else
+			as_root mkdir -p /lib/modules
+			as_root cp -a "$MODDIR" "/lib/modules/$(basename "$MODDIR")"
+		fi
 		# ⚠ MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD, and neither
 		# layout was running it. The version is whatever the tarball says,
 		# not `uname -r`: the running kernel is still the old one.
@@ -703,7 +732,12 @@ Reboot, then run this again to finish the userspace."
 	return 0
 }
 
-if [ "$NPU_OK" = 1 ]; then
+if [ "$NPU_OK" = 1 ] && [ "$DOKERNEL" = only ] && [ -n "${CHARSIU_KERNEL_TAG:-}" ]; then
+	# a kernel that already works is being REPLACED on purpose, by tag
+	ui_ok "$ACCEL is here; CHARSIU_KERNEL_TAG=$CHARSIU_KERNEL_TAG asks for a specific kernel anyway"
+	install_kernel && exit 0
+	exit 1
+elif [ "$NPU_OK" = 1 ]; then
 	ui_ok "$ACCEL is here, so this kernel already drives the NPU"
 	[ "$DOKERNEL" = only ] && { ui_msg "Nothing to do: the NPU already works."; exit 0; }
 elif [ "$DOKERNEL" = no ]; then
@@ -890,7 +924,7 @@ PROBE_BINS="bench_batch npu_gemm_test npu_slice_test charsiu_matmul vattn_bench 
 # board round that does not happen -- and then only prefill_control.sh was
 # listed, so every board_*.sh written since has been exactly that: reachable
 # by a path nobody types.
-PROBE_SCRIPTS="prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
+PROBE_SCRIPTS="board_next.sh spec_identity.sh prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
 board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh \
 board_threads.sh board_w4_m8.sh vattn_sweep.sh vattn_edges.sh \
 board_text_all.sh board_refused_onedev.sh board_chunk_sweep.sh board_intermittent.sh \

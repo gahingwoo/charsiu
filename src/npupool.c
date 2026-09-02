@@ -205,18 +205,157 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
  * m alone or m against K is not known, which is the other reason not to sit at
  * the edge.
  */
+/*
+ * ⚠ 80 NOW, NOT 64, AND ON TWO MEASUREMENTS. The sweep above has 80 identical
+ * at K = 768 and 3072, and board_verify phase 18 has K = 3072 at 80 rows EXACT
+ * against the row loop on the height axis (surface 7680; the next cell up,
+ * 10240, is wrong and phase 19 walks the gap). When the tower took 82 s the
+ * dispatch count did not matter; at 5.4 s it does -- 1024 rows is 16 calls of
+ * 64 or 13 of 80, and every call carries its own pack, fence and read.
+ */
 static unsigned rows_max(void)
 {
 	const char *e = getenv("CHARSIU_NPU_ROWS_MAX");
-	int v = e ? atoi(e) : 64;
+	int v = e ? atoi(e) : 80;
 
-	return v > 0 ? (unsigned)v : 64;
+	return v > 0 ? (unsigned)v : 80;
+}
+
+/*
+ * ⚠⚠ THE HEIGHT AXIS HAS A CEILING OF ITS OWN, AND PHASE 19 WALKED IT:
+ *
+ *   surf x rows   4096  6144  7680  8192   exact
+ *                 8960 10240               WRONG, every row, every channel
+ *
+ * with surf alone (128 at m = 32) and the output size (122880 at K = 3072)
+ * both exact, so the quantity is the input surface (K / 32) * rows and the
+ * line is in (8192, 8960]. 80 rows is only safe up to K = 3276: SmolVLM's
+ * K = 3072 sits at 7680 and passed by 512; whisper medium's K = 4096 at 80
+ * rows is 10240 and would be wrong on every row. So the chunk is the
+ * smaller of rows_max and what 8192 entries allow at this K.
+ */
+static unsigned rows_fit(const struct charsiu_npu_pool *p, uint64_t k)
+{
+	unsigned cap = rows_max();
+	/*
+	 * ⚠ THE SLICE, NOT THE TENSOR. npudev slices a tensor wider than its
+	 * kmax into dispatches of at most kmax, and the surface ceiling is per
+	 * DISPATCH. The first version of this took the whole K: SmolVLM's
+	 * idefics3 projector is K = 12288, which is three slices of 4096 and
+	 * 8192 entries at 64 rows -- exactly at the line and exact on the board
+	 * all day -- and this computed 21 rows for it, chunked 64 into
+	 * 21 + 21 + 21 + 1, the batched path refused the row of one, and the
+	 * whole projector went to the CPU: 20 ms became 512 and the pool said
+	 * "1 fell back". A rule about a dispatch has to be applied to a dispatch.
+	 */
+	uint64_t slice = charsiu_npu_kmax(p->dev);
+	uint64_t ks = k < slice ? k : slice;
+	unsigned by_surface = ks >= 32 ? (unsigned)((8192u * 32u) / ks) : cap;
+
+	if (by_surface < 2)
+		by_surface = 2;
+	return by_surface < cap ? by_surface : cap;
+}
+
+/*
+ * The next chunk: never leave a tail of one row, which the batched path
+ * refuses and which would send the whole call to the CPU.
+ */
+static unsigned rows_next(unsigned rem, unsigned chunk)
+{
+	unsigned c = rem < chunk ? rem : chunk;
+
+	if (rem - c == 1 && c > 2)
+		c--;
+	return c;
+}
+
+static int pool_id(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
+		   unsigned *id)
+{
+	unsigned i;
+
+	if (!p->dev || !charsiu_pool_get(p, w))
+		return -1;
+	for (i = 0; i < p->n; i++)
+		if (p->key[i] == w) {
+			if (p->id[i] < 0)
+				return -1;
+			*id = (unsigned)p->id[i];
+			return 0;
+		}
+	return -1;
+}
+
+int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *const *ws, unsigned nw,
+		       const float *X, unsigned m, float *const *Ys)
+{
+	unsigned ids[8], chunk, done = 0, i;
+	uint64_t k, ns[8];
+	double t0;
+
+	if (nw < 1 || nw > 8)
+		return -1;
+	p->calls += nw;
+	for (i = 0; i < nw; i++)
+		if (pool_id(p, ws[i], &ids[i]))
+			return -1;
+	k = ws[0]->ne[0];
+	for (i = 0; i < nw; i++) {
+		if (ws[i]->ne[0] != k)
+			return -1;     /* one input means one K */
+		ns[i] = ws[i]->n_dims ? ws[i]->ne[ws[i]->n_dims - 1] : 1;
+	}
+	chunk = rows_fit(p, k);
+	t0 = now_ms();
+	while (done < m) {
+		unsigned c = rows_next(m - done, chunk);
+		const float *x = X + (size_t)done * k;
+
+		/*
+		 * ⚠ THE CHUNK IS THE UNIT OF REUSE. Whole-tensor calls in a
+		 * row would pack every chunk once per tensor, because the
+		 * input BO only ever holds the LAST chunk packed; all the
+		 * projections on one chunk before the next is what makes the
+		 * packs after the first vanish.
+		 */
+		for (i = 0; i < nw; i++) {
+			float *y = Ys[i] + (size_t)done * ns[i];
+			int rc = i == 0
+			       ? charsiu_npu_matmul(p->dev, (int)ids[0], x, c, y)
+			       : charsiu_npu_matmul_same(p->dev, (int)ids[i], x,
+							 c, y);
+
+			if (rc) {
+				p->fell_back += nw;
+				p->hw_ms += now_ms() - t0;
+				return -1;
+			}
+		}
+		done += c;
+	}
+	p->hw += nw;
+	p->rows_hw += nw * m;
+	p->hw_ms += now_ms() - t0;
+	return 0;
+}
+
+int charsiu_pool_rows3(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
+		       const struct gguf_tensor *w2, const float *X, unsigned m,
+		       float *Y0, float *Y1, float *Y2)
+{
+	const struct gguf_tensor *ws[3] = { w0, w1, w2 };
+	float *Ys[3] = { Y0, Y1, Y2 };
+
+	return charsiu_pool_rowsn(p, ws, 3, X, m, Ys);
 }
 
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		      const float *X, unsigned m, float *Y)
 {
-	unsigned i, id = 0, found = 0, chunk = rows_max(), done = 0;
+	unsigned i, id = 0, found = 0, chunk, done = 0;
 	uint64_t k, n;
 	double t0;
 
@@ -236,9 +375,10 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 
 	k = w->ne[0];
 	n = w->n_dims ? w->ne[w->n_dims - 1] : 1;
+	chunk = rows_fit(p, k);
 	t0 = now_ms();
 	while (done < m) {
-		unsigned c = m - done < chunk ? m - done : chunk;
+		unsigned c = rows_next(m - done, chunk);
 
 		if (charsiu_npu_matmul(p->dev, (int)id, X + (size_t)done * k, c,
 				       Y + (size_t)done * n)) {
@@ -359,6 +499,24 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 		fprintf(out, "    (%u batch buffer allocations, %.1f ms, inside "
 			"prep -- a pool that quietly reallocates is the old "
 			"bug in new clothes)\n", nbuf, alloc);
+	{
+		unsigned long hits = 0, misses = 0;
+
+		charsiu_npu_reuse_stats(p->dev, &hits, &misses);
+		/*
+		 * ⚠ SAID EVEN WHEN ZERO. A reuse that silently never fired
+		 * would read as "pack did not move", which is a different
+		 * fact from "the declaration was never honoured".
+		 */
+		if (hits || misses)
+			fprintf(out, "    input reused %lu times, packed anyway "
+				"%lu times when declared the same\n",
+				hits, misses);
+		else if (!charsiu_npu_reuse_on())
+			fprintf(out, "    input reuse OFF (CHARSIU_NPU_REUSE=1 "
+				"turns it on; phase 2 broke Phi-3.5 and "
+				"gemma4 with it)\n");
+	}
 }
 
 /*

@@ -301,6 +301,25 @@ int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
  */
 int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			unsigned m, float *Y);
+/*
+ * The same call, with the INPUT DECLARED UNCHANGED since the previous batched
+ * call: same X contents, same m. q, k and v multiply one RMSNorm output, and so
+ * do gate and up, and the pack of that input -- gather, quantise, permute, and
+ * the cache clean that makes it visible to the hardware, on both cores -- is
+ * 26% of a batched matmul. This skips it when X, m and K match what the input
+ * BO already holds and packs as usual when they do not. The caller vouches for
+ * the CONTENTS: a buffer rewritten between two calls at the same address is
+ * exactly the misuse this cannot see.
+ */
+int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
+			     unsigned m, float *Y);
+/* how often the declaration was honoured, and how often it had to pack anyway */
+void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
+			     unsigned long *misses);
+/* whether CHARSIU_NPU_REUSE=1 is set: matmul_same packs like matmul without it */
+int  charsiu_npu_reuse_on(void);
+unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
+
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
@@ -706,6 +725,20 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
  */
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		      const float *X, unsigned m, float *Y);
+/*
+ * Three projections of ONE input, chunked together: q, k and v. Each chunk is
+ * packed once and the other two reuse it. Returns 0 with all three Y filled,
+ * or -1 having filled none of them, so the caller falls back for all three.
+ */
+/* the general form: up to 8 projections of one input, packed once a chunk */
+int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *const *ws, unsigned nw,
+		       const float *X, unsigned m, float *const *Ys);
+int charsiu_pool_rows3(struct charsiu_npu_pool *p,
+		       const struct gguf_tensor *w0, const struct gguf_tensor *w1,
+		       const struct gguf_tensor *w2, const float *X, unsigned m,
+		       float *Y0, float *Y1, float *Y2);
+
 
 struct llama_state {
 	const struct llama_model *m;
@@ -829,6 +862,48 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos);
  */
 const float *llama_forward_embd(struct llama_state *s, const float *embd,
 				int pos);
+
+/*
+ * The batched forward with the output head on EVERY row, for a speculative
+ * pass: logits_all is n * n_vocab floats. Advances s->pos by n; the caller
+ * rolls it back to what it accepted. -1 if the model is refused, in which case
+ * nothing was touched.
+ */
+int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
+		       const int32_t *toks, int n, int pos0, float *logits_all);
+
+/*
+ * Speculative decoding: k drafted tokens verified in one batched pass. Greedy
+ * only, and bit-identical to the plain greedy loop by construction -- the
+ * drafts decide how many tokens one weight read yields, never which tokens.
+ * The long note over llama_spec_step in llama.c has the argument.
+ */
+struct llama_spec {
+	int k;                  /* drafts a pass, 1..5 (rows are 1 + k, even) */
+	int ngram;              /* longest n-gram the lookup tries first */
+	int off;                /* the batched forward refused: plain from here */
+	int junk;               /* CHARSIU_SPEC_JUNK: drafts are noise (control) */
+	uint32_t n_vocab;
+	int32_t *hist;          /* everything seen or said, for the lookup */
+	int n_hist, cap_hist;
+	float *logits_all;      /* (k + 2) rows of n_vocab */
+	unsigned long passes, plain, drafted, accepted, committed;
+};
+int  llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
+		     int n_ctx);
+void llama_spec_free(struct llama_spec *sp);
+void llama_spec_push(struct llama_spec *sp, int32_t tok);   /* the prompt */
+void llama_spec_reset(struct llama_spec *sp);
+/*
+ * One pass. `tok` is the last committed token, not yet in the cache. Fills
+ * out[] with the tokens greedy decoding would produce next and returns how
+ * many (at least 1), or -1 at the end of the context. The caller prints them,
+ * then calls again with the LAST of them.
+ */
+int  llama_spec_step(struct llama_spec *sp, struct llama_state *s,
+		     const struct llama_model *m, int32_t tok, int32_t *out,
+		     int max_out);
+void llama_spec_report(const struct llama_spec *sp, FILE *out);
 
 /* argmax, which is the only sampler an oracle is allowed. */
 /*

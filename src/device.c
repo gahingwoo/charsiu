@@ -228,6 +228,55 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 	timeout_ns += (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
 
 	req.handle = bo->handle;
+	/*
+	 * ⚠⚠ SPIN BEFORE SLEEPING, BECAUSE THE SLEEP IS WHAT COSTS.
+	 *
+	 * The kernel's wait is dma_resv_wait_timeout(): the task sleeps, the
+	 * NPU finishes, the hardirq wakes an irq thread, the thread signals
+	 * the fence, the fence wakes this task. On this SoC a CPU that went
+	 * idle for that wait may have entered CPU_SLEEP, whose exit latency
+	 * the device tree puts at 250 us -- and a decode step waits about 150
+	 * times. The driver's own cost model reads 130 us of floor per call.
+	 *
+	 * An absolute deadline that has already passed makes the same ioctl a
+	 * POLL: drm_timeout_abs_to_jiffies() turns it into a zero wait that
+	 * returns -EBUSY at once if the job is still running (round 148 found
+	 * this by passing a duration where an absolute time was wanted). So
+	 * for up to CHARSIU_NPU_SPIN_US the CPU asks instead of sleeping,
+	 * never leaves C0, and sees the completion one ioctl after it lands.
+	 * Past that it sleeps as before. The bytes and the arithmetic are
+	 * untouched; this is only where the waiter stands.
+	 *
+	 * Off unless asked, until phase 21 has priced it against the arm that
+	 * disables CPU_SLEEP outright.
+	 */
+	{
+		static long spin_us = -1;
+
+		if (spin_us < 0) {
+			const char *e = getenv("CHARSIU_NPU_SPIN_US");
+
+			spin_us = e ? atol(e) : 0;
+		}
+		if (spin_us > 0) {
+			int64_t t0 = (int64_t)now.tv_sec * 1000000000LL
+				   + now.tv_nsec;
+
+			req.timeout_ns = 1;    /* long past: a poll */
+			for (;;) {
+				struct timespec t;
+
+				if (!ioctl(dev->fd, DRM_IOCTL_ROCKET_PREP_BO, &req))
+					return 0;
+				if (errno != EBUSY && errno != EINTR)
+					return -errno;
+				clock_gettime(CLOCK_MONOTONIC, &t);
+				if ((int64_t)t.tv_sec * 1000000000LL + t.tv_nsec
+				    - t0 > spin_us * 1000LL)
+					break;
+			}
+		}
+	}
 	req.timeout_ns = timeout_ns;
 	/*
 	 * EINTR here is a signal, not a failure, and the deadline has to be

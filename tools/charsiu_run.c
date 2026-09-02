@@ -180,6 +180,7 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
+"  --spec K      speculate K tokens a pass (1..5; greedy only, text identical)\n"
 "  --repeat N     run the same prompt N times in ONE process, so a rate\n"
 "                 question does not pay for N model loads. The cache is\n"
 "                 reset between them and each is separated by a marker\n"
@@ -274,6 +275,15 @@ int main(int argc, char **argv)
 	 */
 	int add_bos = -1, show_special = 0;
 	int ignore_eos = 0;
+	/*
+	 * --spec K, or CHARSIU_SPEC=K: prompt-lookup drafts verified in one
+	 * batched pass. Off unless asked, because a pass at m = 4 has not been
+	 * priced on the board yet; the acceptance it reports is a property of
+	 * the model and is measured anywhere.
+	 */
+	int spec_k = getenv("CHARSIU_SPEC") ? atoi(getenv("CHARSIU_SPEC")) : 0;
+	struct llama_spec spec;
+	int spec_on = 0;
 	unsigned batch_probe = 0;
 	float temp = 0.0f, top_p = 0.9f;
 	uint64_t seed = 1234;
@@ -335,6 +345,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bos")) add_bos = 1;
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
+		else if (!strcmp(a, "--spec")) spec_k = atoi(NEXT());
 		/*
 		 * ⚠ AFTER STAGING AND INSTEAD OF GENERATING. The question is
 		 * what batching buys on this board's own weights, and a token
@@ -1008,6 +1019,29 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	/*
+	 * ⚠ SAY WHY IT IS OFF, EVERY WAY IT CAN BE. A run asked to speculate
+	 * that ran plain looks like speculation gaining nothing, and that is
+	 * a different fact.
+	 */
+	spec_on = 0;
+	if (spec_k > 0) {
+		const char *why = llama_batch_why_not(&m);
+
+		if (temp > 0.0f)
+			fprintf(stderr, "charsiu: --spec is greedy only and "
+				"--temp was given; not speculating\n");
+		else if (why)
+			fprintf(stderr, "charsiu: --spec off, the batched "
+				"forward refuses this model (%s)\n", why);
+		else if (llama_spec_init(&spec, &m, spec_k, st->n_ctx))
+			fprintf(stderr, "charsiu: --spec off, no memory\n");
+		else {
+			for (i = 0; i < n_ids; i++)
+				llama_spec_push(&spec, ids[i]);
+			spec_on = 1;
+		}
+	}
 	temp_start = board_temp_c();
 	t0 = now_ms();
 	int produced = 0;
@@ -1051,10 +1085,19 @@ int main(int argc, char **argv)
 	 */
 	char held[1024];
 
+	/*
+	 * The speculative pass commits several tokens at once; they wait here
+	 * and are printed one an iteration, so every line of the printing
+	 * state machine below sees exactly what it saw before.
+	 */
+	int32_t pend[16];
+	int npend = 0, ipend = 0;
+
 	for (i = 0; i < n_gen; i++) {
-		int32_t tok = temp > 0.0f
-			? llama_sample(logits, m.n_vocab, temp, top_p, &seed)
-			: llama_argmax(logits, m.n_vocab);
+		int32_t tok = ipend < npend ? pend[ipend++]
+			    : temp > 0.0f
+			    ? llama_sample(logits, m.n_vocab, temp, top_p, &seed)
+			    : llama_argmax(logits, m.n_vocab);
 		int len;
 		const char *s;
 
@@ -1155,6 +1198,15 @@ next:
 
 		if (st->pos >= st->n_ctx)
 			break;
+		if (spec_on) {
+			if (ipend < npend)
+				continue;      /* committed tokens still to print */
+			npend = llama_spec_step(&spec, st, &m, tok, pend, 16);
+			ipend = 0;
+			if (npend <= 0)
+				break;
+			continue;
+		}
 		logits = llama_forward(st, tok, st->pos);
 		if (!logits)
 			break;
@@ -1244,6 +1296,11 @@ next:
 					printf(", cpu %ld MHz under load", mhz);
 			}
 			printf("]\n");
+		}
+		if (spec_on) {
+			llama_spec_report(&spec, stdout);
+			llama_spec_free(&spec);
+			spec_on = 0;
 		}
 		if (!interactive && eog_at >= 0)
 			printf("[the model reached its own end at token %d; "

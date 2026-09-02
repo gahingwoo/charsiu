@@ -1139,6 +1139,37 @@ static const float *wrow1(const struct gguf_tensor *t, float *buf)
 }
 
 /*
+ * q, k and v of one input as one pooled call, packed once a chunk. The bias
+ * rows are added here because the pool does not know about them, and v's
+ * gets a row of its own because wrow1() fills the one scratch it is handed.
+ * Falls back to the three calls, which fall back a row at a time themselves.
+ */
+static void wrows_qkv(const struct whisper_block *B, const float *xb, unsigned T,
+		      unsigned W, float *q, float *k, float *v, float *b1,
+		      struct charsiu_act *a)
+{
+	const struct gguf_tensor *ws[3] = { B->q_w, B->k_w, B->v_w };
+	float *ys[3] = { q, k, v };
+	float *bv = malloc((size_t)W * sizeof(float));
+	const float *bq_r = wrow1(B->q_b, b1);
+	const float *bv_r = bv ? wrow1(B->v_b, bv) : NULL;
+	unsigned r, i;
+
+	if (bv && rows_pool && !charsiu_pool_rowsn(rows_pool, ws, 3, xb, T, ys)) {
+		for (r = 0; r < T; r++)
+			for (i = 0; i < W; i++) {
+				if (bq_r) q[(size_t)r * W + i] += bq_r[i];
+				if (bv_r) v[(size_t)r * W + i] += bv_r[i];
+			}
+	} else {
+		wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, a);
+		wrows(B->k_w, NULL, xb, T, W, k, W, a);
+		wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, a);
+	}
+	free(bv);
+}
+
+/*
  * conv1d, kernel 3, padding 1, stride `stride`.
  *
  * ⚠ THE WEIGHT IS [tap][in][out] WITH tap FASTEST, so tap `p`'s slice is not
@@ -1424,9 +1455,13 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 			wlayernorm(xb + (size_t)i * W, x + (size_t)i * W,
 				   wrow1(B->attn_ln_w, g1),
 				   wrow1(B->attn_ln_b, b1), W, 1e-5f));
-		WSTAGE(W_QKV, wrows(B->q_w, wrow1(B->q_b, b1), xb, T, W, q, W, &a));
-		WSTAGE(W_QKV, wrows(B->k_w, NULL, xb, T, W, k, W, &a));
-		WSTAGE(W_QKV, wrows(B->v_w, wrow1(B->v_b, b1), xb, T, W, v, W, &a));
+		/*
+		 * q, k and v of one input as one pooled call, packed once a
+		 * chunk; the bias rows are added here because the pool does
+		 * not know about them. Falls back to the three calls, which
+		 * fall back a row at a time themselves.
+		 */
+		WSTAGE(W_QKV, wrows_qkv(B, xb, T, W, q, k, v, b1, &a));
 
 		/*
 		 * ⚠ THIS IS 63% OF A TRANSCRIPTION and it is not a matmul
@@ -1565,9 +1600,24 @@ struct whisper_decoder *charsiu_whisper_decoder_new(const struct charsiu_whisper
 		if (!d->xk[l] || !d->xv[l] || !d->sk[l] || !d->sv[l])
 			goto fail;
 		/* ⚠ no bias on the key projection, here as everywhere */
-		wrows(B->xk_w, NULL, encoded, d->T, d->W, d->xk[l], d->W, &d->a);
-		wrows(B->xv_w, wrow1(B->xv_b, d->b1), encoded, d->T, d->W,
-		      d->xv[l], d->W, &d->a);
+		{
+			/* the cross keys and values read one encoding: one pack */
+			const struct gguf_tensor *ws[2] = { B->xk_w, B->xv_w };
+			float *ys[2] = { d->xk[l], d->xv[l] };
+			const float *bv_r = wrow1(B->xv_b, d->b1);
+
+			if (rows_pool &&
+			    !charsiu_pool_rowsn(rows_pool, ws, 2, encoded, d->T, ys)) {
+				if (bv_r)
+					for (unsigned r_ = 0; r_ < d->T; r_++)
+						for (unsigned i_ = 0; i_ < d->W; i_++)
+							d->xv[l][(size_t)r_ * d->W + i_] += bv_r[i_];
+			} else {
+				wrows(B->xk_w, NULL, encoded, d->T, d->W, d->xk[l], d->W, &d->a);
+				wrows(B->xv_w, wrow1(B->xv_b, d->b1), encoded, d->T, d->W,
+				      d->xv[l], d->W, &d->a);
+			}
+		}
 	}
 	d->ok = 1;
 	return d;
