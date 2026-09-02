@@ -119,6 +119,19 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+# ⚠⚠ SAY WHICH KERNEL. Every kernel this project ships is 7.2.0-rc5-next-20260730
+# by uname, so a round pasted from the board cannot be told apart by release
+# string, and the one that decided whether the core-pair overlap is a kernel
+# fault or a runtime fault was pasted without any. The Image hash can.
+_ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
+case "$_ksha" in
+c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
+5418f487) _kname="v11-control: v11 as sent + second core, no rocket patches" ;;
+2422dc11) _kname="attach-once-v11: v11 + attach-once + hardirq completion" ;;
+"")       _kname="no /boot/Image readable" ;;
+*)        _kname="not a release this script knows" ;;
+esac
+echo "  kernel    $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
 # ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
 # new data when it was the previous version of this file: `charsiu update dev`
 # had not taken, the output was byte identical to the round before, and the only
