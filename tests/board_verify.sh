@@ -1476,14 +1476,24 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# The first run of this phase started charsiu_run bare and priced the
 	# CPU: 4.60 tok/s on a model that decodes at 19.5 on the hardware, no
 	# cost-model line at all, and a verdict line that read as a pass.
-	r=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	# ⚠ THE WHOLE OUTPUT IS KEPT. The second run of this phase printed
+	# "no cost-model line" four times and nothing else, and the reason was
+	# invisible because only two grep results survived. A phase that
+	# loses the error is a board round spent on one bit.
+	af=$OUT/verify-21-$(printf '%s' "$arm" | tr ' ' '-').txt
+	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 	    CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN \
-	    "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 512 -t 4 2>&1)
-	gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p')
-	cm=$(printf '%s' "$r" | grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" | head -1)
-	printf '  %-20s %-12s %s\n' "$arm" "$gen" "${cm:-⚠ NO COST-MODEL LINE: this run did not take the NPU}"
-	[ -n "$cm" ] || bad "phase 21 arm '$arm' ran without the NPU"
+	    timeout 600 "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 512 -t 4 >"$af" 2>&1
+	rc=$?
+	gen=$(sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p' "$af")
+	cm=$(grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" "$af" | head -1)
+	printf '  %-20s %-12s %s\n' "$arm" "$gen" "${cm:-⚠ NO COST-MODEL LINE (exit $rc)}"
+	if [ -z "$cm" ]; then
+		bad "phase 21 arm '$arm': no cost-model line, exit $rc -- the last lines of $af:"
+		tail -8 "$af" | sed 's/^/       /'
+		break
+	fi
    done
    wedged "phase 21" && break
    ok "read 'a call' across the arms; the third must match the first"
