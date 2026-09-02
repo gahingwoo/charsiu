@@ -128,7 +128,11 @@ if step 3 "the call floor: the two rocket patches, as a whole kernel"; then
 fi
 
 if step 4 "the call floor under the new kernel"; then
-	note "step 4: running on $(uname -r), rocket $(dmesg | grep -c 'Rockchip NPU core') core lines"
+	# ⚠ uname -r IS THE SAME STRING FOR EVERY KERNEL IN THE BISECT, so say
+	# which Image this is by its hash: 370c4612 both patches, 7773c43b
+	# attach-only, e70a8b6a control (no patches), and the August release
+	# is whatever Image.previous hashes to.
+	note "step 4: running on $(uname -r), Image $(sha256sum /boot/Image 2>/dev/null | cut -c1-8), rocket $(dmesg | grep -c 'Rockchip NPU core') core lines"
 	verify 2 4a || { note "step 4: TEXT CHANGED under the new kernel -- revert: sh $OUT/board-kernel-revert.sh, reboot"; exit 1; }
 	verify 21 4b || true
 	note "step 4: before   $(call_line "$OUT/next-step2.txt")"
