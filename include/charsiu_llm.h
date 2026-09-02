@@ -318,6 +318,7 @@ void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses);
 /* whether CHARSIU_NPU_REUSE=1 is set: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
+unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
 
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,

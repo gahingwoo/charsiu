@@ -234,14 +234,40 @@ static unsigned rows_max(void)
  * rows is 10240 and would be wrong on every row. So the chunk is the
  * smaller of rows_max and what 8192 entries allow at this K.
  */
-static unsigned rows_fit(uint64_t k)
+static unsigned rows_fit(const struct charsiu_npu_pool *p, uint64_t k)
 {
 	unsigned cap = rows_max();
-	unsigned by_surface = k >= 32 ? (unsigned)((8192u * 32u) / k) : cap;
+	/*
+	 * ⚠ THE SLICE, NOT THE TENSOR. npudev slices a tensor wider than its
+	 * kmax into dispatches of at most kmax, and the surface ceiling is per
+	 * DISPATCH. The first version of this took the whole K: SmolVLM's
+	 * idefics3 projector is K = 12288, which is three slices of 4096 and
+	 * 8192 entries at 64 rows -- exactly at the line and exact on the board
+	 * all day -- and this computed 21 rows for it, chunked 64 into
+	 * 21 + 21 + 21 + 1, the batched path refused the row of one, and the
+	 * whole projector went to the CPU: 20 ms became 512 and the pool said
+	 * "1 fell back". A rule about a dispatch has to be applied to a dispatch.
+	 */
+	uint64_t slice = charsiu_npu_kmax(p->dev);
+	uint64_t ks = k < slice ? k : slice;
+	unsigned by_surface = ks >= 32 ? (unsigned)((8192u * 32u) / ks) : cap;
 
-	if (by_surface < 1)
-		by_surface = 1;
+	if (by_surface < 2)
+		by_surface = 2;
 	return by_surface < cap ? by_surface : cap;
+}
+
+/*
+ * The next chunk: never leave a tail of one row, which the batched path
+ * refuses and which would send the whole call to the CPU.
+ */
+static unsigned rows_next(unsigned rem, unsigned chunk)
+{
+	unsigned c = rem < chunk ? rem : chunk;
+
+	if (rem - c == 1 && c > 2)
+		c--;
+	return c;
 }
 
 static int pool_id(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
@@ -281,10 +307,10 @@ int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
 			return -1;     /* one input means one K */
 		ns[i] = ws[i]->n_dims ? ws[i]->ne[ws[i]->n_dims - 1] : 1;
 	}
-	chunk = rows_fit(k);
+	chunk = rows_fit(p, k);
 	t0 = now_ms();
 	while (done < m) {
-		unsigned c = m - done < chunk ? m - done : chunk;
+		unsigned c = rows_next(m - done, chunk);
 		const float *x = X + (size_t)done * k;
 
 		/*
@@ -349,10 +375,10 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 
 	k = w->ne[0];
 	n = w->n_dims ? w->ne[w->n_dims - 1] : 1;
-	chunk = rows_fit(k);
+	chunk = rows_fit(p, k);
 	t0 = now_ms();
 	while (done < m) {
-		unsigned c = m - done < chunk ? m - done : chunk;
+		unsigned c = rows_next(m - done, chunk);
 
 		if (charsiu_npu_matmul(p->dev, (int)id, X + (size_t)done * k, c,
 				       Y + (size_t)done * n)) {

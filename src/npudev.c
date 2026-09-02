@@ -4307,6 +4307,12 @@ int charsiu_npu_reuse_on(void)
 	return reuse_enabled();
 }
 
+/* the widest K one dispatch carries: a tensor wider than this is sliced */
+unsigned charsiu_npu_kmax(const struct charsiu_npu *g)
+{
+	return g ? g->kmax : 4096;
+}
+
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses)
 {
