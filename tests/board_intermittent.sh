@@ -55,6 +55,15 @@
 #   CHARSIU_INT_ARMS="default zero"    which arms to run
 #   CHARSIU_INT_CHUNK=32               prefill chunk
 #   CHARSIU_INT_NGEN=8                 tokens generated
+#   CHARSIU_INT_KMAX=1024              K slice; 1024 is the 08-30 reading's,
+#                                      2048 is what ships
+#
+# ⚠ THE 08-30 READING, for the record: phi3, chunk 24, KMAX 1024, sixteen
+# runs an arm -- parallel 13 of 16 WRONG, onedev 0, serial 0 -- on the
+# August kernel, where rocket attaches and detaches the IOMMU per job. On
+# 2026-09-02 the attach-once kernel ran phase 2 with the overlap on and all
+# nine models were right at widths 80+36. Whether that is the kernel or the
+# runtime is exactly this script at chunk 24 on each kernel in turn.
 set -u
 
 RUN=${CHARSIU_RUN_BIN:-}
@@ -119,8 +128,12 @@ WEDGED=0
 CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
 PROMPT="$(seq 1 32 | tr '\n' ' ')"
 PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
+# ⚠ THE K SLICE IS PINNED TO 1024, WHICH IS THE 2026-08-30 READING'S, not the
+# shipped 2048: this script exists to reproduce that reading's 13 of 16, and
+# a reproduction at a different width is a different experiment. To ask the
+# shipped width the same question, CHARSIU_INT_KMAX=2048.
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+CHARSIU_NPU_KMAX=${CHARSIU_INT_KMAX:-1024} CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"
