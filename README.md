@@ -115,6 +115,8 @@ sh install.sh --dev          the probes too, from the start
 charsiu update dev           switch an existing install, no reinstall needed
 charsiu update stable        go back
 charsiu update               whichever it was last told, remembered
+charsiu update --auto        no questions, no demo at the end (-y);
+                             `auto = yes` under [update] in config.ini keeps it
 ```
 
 `charsiu doctor` says which channel it is on, which matters when a log gets
