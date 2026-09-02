@@ -1472,13 +1472,21 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	case "$arm" in *OFF) v=1 ;; *) v=0 ;; esac
 	case "$arm" in spin*) SPIN=400 ;; *) SPIN=0 ;; esac
 	for c in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state1/disable; do echo $v >"$c"; done
-	r=$(CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 2>&1)
+	# ⚠ THE SCOREBOARD'S OWN ENVIRONMENT, verbatim from board_vendor.sh.
+	# The first run of this phase started charsiu_run bare and priced the
+	# CPU: 4.60 tok/s on a model that decodes at 19.5 on the hardware, no
+	# cost-model line at all, and a verdict line that read as a pass.
+	r=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+	    CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN \
+	    "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 512 -t 4 2>&1)
 	gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p')
 	cm=$(printf '%s' "$r" | grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" | head -1)
-	printf '  %-20s %-12s %s\n' "$arm" "$gen" "$cm"
+	printf '  %-20s %-12s %s\n' "$arm" "$gen" "${cm:-⚠ NO COST-MODEL LINE: this run did not take the NPU}"
+	[ -n "$cm" ] || bad "phase 21 arm '$arm' ran without the NPU"
    done
    wedged "phase 21" && break
-   ok "read `a call` across the arms; the third must match the first"
+   ok "read 'a call' across the arms; the third must match the first"
    printf '     ⚠ these arms are the wake latency ALONE. The attach/detach per job\n'
    printf '        is the patched kernel (rocket: keep the domain attached), next round.\n'
    ;;
