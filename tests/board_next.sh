@@ -19,17 +19,20 @@
 #                                       text, answer or transcript
 #   2     board_verify 21               how much of the 130 us call   spin on by default?
 #                                       floor is wake latency         touch cpuidle?
-#   3     swap rocket.ko, then 2 and 21 what "keep the domain         50 us is decode
-#         then rocket-hardirq.ko, same   attached" takes off a call,   parity; which of
-#                                       and the hardirq on top of it  the two go to v12
-#   4     board_verify 20               what an m=4 pass costs        --spec on by default
+#   3     install the test kernel       (the two rocket patches: the  -- then REBOOT and
+#         by tag, keep the old one      domain kept attached, and the    --from 4
+#                                       completion in the hardirq)
+#   4     board_verify 2 and 21 again   what the patches take off a   50 us is decode
+#                                       call, text held               parity; v12 or not
+#   5     board_verify 20               what an m=4 pass costs        --spec on by default
 #                                       against a decode step         on Qwen3?
-#   5     board_verify 19               which quantity bounds the     an int8 guard, and
+#   6     board_verify 19               which quantity bounds the     an int8 guard, and
 #                                       height axis                   whisper medium/large
 #
-# ⚠ STEP 3 CHANGES THE RUNNING KERNEL MODULE. The original is kept beside it
-# and `board-swap-rocket-ko.sh --revert` puts it back. The module is checked
-# against uname -r before anything is touched.
+# ⚠ STEP 3 REPLACES THE KERNEL. charsiu-install keeps the one it replaces as
+# /boot/Image.previous and board-kernel-revert.sh puts it back; this board has
+# no boot menu, so a kernel that does not boot needs a serial console or the
+# SD card.
 # ⚠ A WEDGED NPU NEEDS A REBOOT. board_verify says so when it happens; reboot
 # and come back with --from N.
 set -u
@@ -78,48 +81,49 @@ if step 2 "the call floor: wake latency alone"; then
 	note "step 2: $(grep -E 'cpu-sleep|spin ' "$OUT/next-step2.txt" | sed 's/^ *//' | tr '\n' ';')"
 fi
 
-if step 3 "the call floor: keep the IOMMU domain attached (rocket.ko)"; then
-	cd "$OUT" || exit 1
-	for f in rocket.ko rocket.ko.sha256 board-swap-rocket-ko.sh; do
-		curl -fsSL -o "$f" "$RAW/$f" || { note "step 3: could not fetch $f from $RAW"; exit 1; }
-	done
-	sed 's#  .*/#  #' rocket.ko.sha256 | sha256sum -c - || { note "step 3: rocket.ko checksum mismatch"; exit 1; }
-	pkill -f charsiu_serve 2>/dev/null || true
-	sh board-swap-rocket-ko.sh rocket.ko 2>&1 | tee "$OUT/next-step3-swap.txt"
-	if ! grep -q "reloaded" "$OUT/next-step3-swap.txt"; then
-		note "step 3: the module did not reload (see next-step3-swap.txt). If it says next boot, reboot and --from 3."
-		exit 1
+if step 3 "the call floor: the two rocket patches, as a whole kernel"; then
+	# ⚠⚠ rocket IS BUILT IN on this board (kernel/npu.fragment:
+	# CONFIG_DRM_ACCEL_ROCKET=y, because a module probes after the
+	# late_initcall that cuts vdd_npu_s0), so there is no module to swap.
+	# The two patches come as a whole Image, built with the board's own
+	# config and the same release string, published as a GitHub PRE-release
+	# that `releases/latest` never returns, and installed on purpose by tag.
+	# charsiu-install keeps the kernel it replaces as Image.previous;
+	# board-kernel-revert.sh puts it back.
+	#
+	# ⚠ THIS BOARD HAS NO BOOT MENU. If the new Image does not boot, the way
+	# back is a serial console or the SD card, not this script.
+	TAG=${KERNEL_TAG:-kernel-7.2.0-rc5-next-20260730-attach-once}
+	curl -fsSL -o "$OUT/board-kernel-revert.sh" "$RAW/board-kernel-revert.sh" || true
+	if CHARSIU_KERNEL_TAG=$TAG CTUI_ASSUME=yes \
+	   sh "$BIN/charsiu-install.sh" --kernel 2>&1 | tee "$OUT/next-step3-install.txt"; then
+		note "step 3: installed kernel $TAG; the previous one is /boot/Image.previous"
+		note "  REBOOT NOW, then: sh $BIN/board_next.sh --from 4"
+		note "  (to go back: sh $OUT/board-kernel-revert.sh, then reboot)"
+		exit 0
 	fi
-	verify 2 3a || { note "step 3: TEXT CHANGED under the new module -- revert: sh $OUT/board-swap-rocket-ko.sh --revert"; exit 1; }
-	verify 21 3b || true
-	note "step 3: before        $(call_line "$OUT/next-step2.txt")"
-	note "step 3: attach-once   $(call_line "$OUT/next-step3b.txt")"
-	# the second piece: the completion handled in the hardirq, on top of the first
-	for f in rocket-hardirq.ko rocket-hardirq.ko.sha256; do
-		curl -fsSL -o "$f" "$RAW/$f" || { note "step 3: could not fetch $f"; exit 1; }
-	done
-	sed 's#  .*/#  #' rocket-hardirq.ko.sha256 | sha256sum -c - || { note "step 3: rocket-hardirq.ko checksum mismatch"; exit 1; }
-	sh board-swap-rocket-ko.sh rocket-hardirq.ko 2>&1 | tee "$OUT/next-step3-swap2.txt"
-	if grep -q "reloaded" "$OUT/next-step3-swap2.txt"; then
-		verify 2 3c || { note "step 3: TEXT CHANGED under rocket-hardirq.ko -- revert"; exit 1; }
-		verify 21 3d || true
-		note "step 3: +hardirq      $(call_line "$OUT/next-step3d.txt")"
-	else
-		note "step 3: rocket-hardirq.ko did not reload; the attach-once module stays in"
-	fi
-	note "  (150 calls a token on Qwen3: every 10 us off 'a call' is 1.5 ms a token; 50 us is parity)"
-	note "  (the module left installed is the last one that reloaded; --revert restores the original)"
+	note "step 3: the kernel install did not complete (see next-step3-install.txt); nothing was changed"
+	exit 1
 fi
 
-if step 4 "speculative decoding: the price of a pass"; then
-	verify 20 4 || true
-	grep -E "^ *(plain|--spec)" "$OUT/next-step4.txt" | sed 's/^ */step 4: /' | tee -a "$SUM"
+if step 4 "the call floor under the new kernel"; then
+	note "step 4: running on $(uname -r), rocket $(dmesg | grep -c 'Rockchip NPU core') core lines"
+	verify 2 4a || { note "step 4: TEXT CHANGED under the new kernel -- revert: sh $OUT/board-kernel-revert.sh, reboot"; exit 1; }
+	verify 21 4b || true
+	note "step 4: before   $(call_line "$OUT/next-step2.txt")"
+	note "step 4: patched  $(call_line "$OUT/next-step4b.txt")"
+	note "  (150 calls a token on Qwen3: every 10 us off 'a call' is 1.5 ms a token; 50 us is parity)"
+fi
+
+if step 5 "speculative decoding: the price of a pass"; then
+	verify 20 5 || true
+	grep -E "^ *(plain|--spec)" "$OUT/next-step5.txt" | sed 's/^ */step 5: /' | tee -a "$SUM"
 	note "  (speed up = tok/pass over pass cost in decode steps; break-even on Qwen3 is 2.29)"
 fi
 
-if step 5 "the height axis: which quantity is the bound"; then
-	verify 19 5 || true
-	grep -E "exact|WRONG" "$OUT/next-step5.txt" | sed 's/^ */step 5: /' | tee -a "$SUM"
+if step 6 "the height axis: which quantity is the bound"; then
+	verify 19 6 || true
+	grep -E "exact|WRONG" "$OUT/next-step6.txt" | sed 's/^ */step 6: /' | tee -a "$SUM"
 fi
 
 [ "$PLAN" = 1 ] && exit 0

@@ -480,8 +480,18 @@ Install a kernel built from the series by hand instead:
 		return 1
 	fi
 
-	ui_note "asking $REPO for the latest kernel..."
-	J=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+	# ⚠ A NAMED RELEASE, FOR A TEST KERNEL. CHARSIU_KERNEL_TAG=<tag> asks for
+	# that release instead of the latest one, which is how a pre-release --
+	# something `releases/latest` never returns -- gets installed on purpose
+	# and only on purpose. The board scripts use it to put a kernel with
+	# patches under test on the board; nobody else should see it.
+	if [ -n "${CHARSIU_KERNEL_TAG:-}" ]; then
+		ui_note "asking $REPO for the kernel tagged $CHARSIU_KERNEL_TAG..."
+		J=$(api "https://api.github.com/repos/$REPO/releases/tags/$CHARSIU_KERNEL_TAG" 2>/dev/null || true)
+	else
+		ui_note "asking $REPO for the latest kernel..."
+		J=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+	fi
 	if [ -z "$J" ]; then
 		ui_msg "Could not reach the GitHub API.
 
@@ -703,7 +713,12 @@ Reboot, then run this again to finish the userspace."
 	return 0
 }
 
-if [ "$NPU_OK" = 1 ]; then
+if [ "$NPU_OK" = 1 ] && [ "$DOKERNEL" = only ] && [ -n "${CHARSIU_KERNEL_TAG:-}" ]; then
+	# a kernel that already works is being REPLACED on purpose, by tag
+	ui_ok "$ACCEL is here; CHARSIU_KERNEL_TAG=$CHARSIU_KERNEL_TAG asks for a specific kernel anyway"
+	install_kernel && exit 0
+	exit 1
+elif [ "$NPU_OK" = 1 ]; then
 	ui_ok "$ACCEL is here, so this kernel already drives the NPU"
 	[ "$DOKERNEL" = only ] && { ui_msg "Nothing to do: the NPU already works."; exit 0; }
 elif [ "$DOKERNEL" = no ]; then
