@@ -419,6 +419,13 @@ struct charsiu_npu {
 	unsigned bmap_m;
 	unsigned bmap_n4;	/* the table is one entry per FOUR channels */
 	/*
+	 * Whether rows 4h..4h+3 of every channel quad sit at index, +4, +8,
+	 * +12 in this table -- one 64-byte line -- which is what lets the read
+	 * back take four rows off one line (read_rows4). Checked on the table
+	 * itself whenever it is rebuilt, never assumed from the layout.
+	 */
+	int bmap4;
+	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
 	 * extra is linear in the rows, about 20 ms a row, and a speedup against
@@ -746,6 +753,7 @@ struct charsiu_npu {
 	 * itself exactly DOUBLING. See the note above read_rows.
 	 */
 	int poolread;
+	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
 	 * 0 is the hardware doing all of it, which is every round before 371.
@@ -1345,6 +1353,8 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
 	g->poolread = getenv("CHARSIU_NPU_POOL_READ") != NULL;
+	/* four rows off one line in the read back; =0 is the row-at-a-time control */
+	g->read4 = !getenv("CHARSIU_NPU_READ4") || atoi(getenv("CHARSIU_NPU_READ4")) != 0;
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -3461,12 +3471,95 @@ struct read_rows {
 	int grp, firstw;
 };
 
+/*
+ * ⚠ FOUR ROWS OFF ONE LINE, and why the last attempt at this loop was wrong
+ * about where the time went.
+ *
+ * The comment inside read_rows below reasons that a 16-byte run out of a
+ * 64-byte line costs the DRAM four times the surface. It does not: the other
+ * three quarters of that line are rows r+1, r+2 and r+3 of the SAME channel
+ * quad -- index, +4, +8, +12 in the w4a16 layout -- and the row-at-a-time
+ * loop comes back for them on the next three row passes, a working set of
+ * n/4 lines apart, which the L2 keeps. What it pays is one L2 round trip per
+ * row per line instead of one per line, four times the load instructions and
+ * four times the table reads.
+ *
+ * Measured on the host with tools/bench_gather, byte for byte the same Y:
+ * walking the surface in order and scattering into Y, the fix that comment
+ * proposes, is 4 to 10 times SLOWER (the scatter side gets the partial lines
+ * and the TLB); taking the four rows off each line once is 1.4 to 2.2 times
+ * faster at every shape from m = 32 by 1024 to m = 80 by 8192. The board is
+ * the one that prices it -- the board is where a NEON form of the row loop
+ * moved nothing -- and CHARSIU_NPU_READ4=0 is the row-at-a-time control.
+ *
+ * The premise is checked on the table when it is built (g->bmap4), the
+ * arithmetic per element is the row loop's exactly (multiply, then assign
+ * or add), and anything this cannot take -- int8, a width that is not a
+ * multiple of four, a pooled range that is not four aligned -- goes through
+ * the row loop unchanged.
+ */
+static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
+{
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	const float *fo = c->fo;
+	float *Y = c->Y;
+	unsigned sn = c->sn, n4 = sn / 4, j;
+	int firstw = c->firstw;
+	const float *sc = g->w4 && c->grp ? s->sc : NULL;
+
+	if (!g->read4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
+		return 0;
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *y0 = Y + (size_t)r * e->t->n + s->n0;
+		float *y1 = y0 + e->t->n, *y2 = y1 + e->t->n, *y3 = y2 + e->t->n;
+
+#define ROW4(OP, S0, S1, S2, S3)                                             \
+		for (j = 0; j < n4; j++) {                                   \
+			const float *fp = fo + mp[j];                        \
+			unsigned q = j * 4;                                  \
+			y0[q + 0] OP fp[0]  * S0; y0[q + 1] OP fp[1]  * S1;  \
+			y0[q + 2] OP fp[2]  * S2; y0[q + 3] OP fp[3]  * S3;  \
+			y1[q + 0] OP fp[4]  * S0; y1[q + 1] OP fp[5]  * S1;  \
+			y1[q + 2] OP fp[6]  * S2; y1[q + 3] OP fp[7]  * S3;  \
+			y2[q + 0] OP fp[8]  * S0; y2[q + 1] OP fp[9]  * S1;  \
+			y2[q + 2] OP fp[10] * S2; y2[q + 3] OP fp[11] * S3;  \
+			y3[q + 0] OP fp[12] * S0; y3[q + 1] OP fp[13] * S1;  \
+			y3[q + 2] OP fp[14] * S2; y3[q + 3] OP fp[15] * S3;  \
+		}
+		if (sc) {
+			if (firstw) { ROW4(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			else        { ROW4(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+		} else {
+			if (firstw) { ROW4(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			else        { ROW4(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
+		}
+#undef ROW4
+		/* the tail past the last whole quad, per row, as the row loop does */
+		for (j = n4 * 4; j < sn; j++) {
+			unsigned base = mp[j / 4] + j % 4;
+			float s0 = sc ? sc[j] : 1.0f;
+			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0,
+			      v2 = fo[base + 8] * s0, v3 = fo[base + 12] * s0;
+
+			if (firstw) { y0[j] = v0; y1[j] = v1; y2[j] = v2; y3[j] = v3; }
+			else        { y0[j] += v0; y1[j] += v1; y2[j] += v2; y3[j] += v3; }
+		}
+	}
+	return 1;
+}
+
 static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 {
 	struct read_rows *c = ctx;
 	struct charsiu_npu *g = c->g;
 	const struct npu_entry *e = c->e;
 	const struct npu_slot *s = c->s;
+
+	if (read_rows4(c, r0, nr))
+		return;
 	const float *fo = c->fo;
 	const int32_t *io = c->io;
 	float *Y = c->Y;
@@ -4212,6 +4305,16 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						  (uint32_t)charsiu_acc_index(r, j * 4, m,
 							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
+				/* read_rows4's premise, read off the table just built */
+				g->bmap4 = m % 4 == 0;
+				for (unsigned r = 0; g->bmap4 && r < m; r += 4)
+					for (unsigned j = 0; g->bmap4 && j < n4; j++)
+						for (unsigned lo = 1; lo < 4; lo++)
+							if (g->bmap[(size_t)(r + lo) * n4 + j] !=
+							    g->bmap[(size_t)r * n4 + j] + lo * 4) {
+								g->bmap4 = 0;
+								break;
+							}
 			}
 			/*
 			 * ⚠⚠ NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
