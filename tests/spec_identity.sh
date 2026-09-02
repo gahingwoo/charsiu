@@ -67,6 +67,9 @@ accepted() { sed -n 's/.*accepted \([0-9]*\).*/\1/p'; }
 bad=0; n=0; skipped=0
 for mdl in "$DIR"/*.gguf; do
 	[ -e "$mdl" ] || continue
+	# a vision projector is not a language model: the runner has nothing to
+	# decode, and the board read it as "the arm ran plain and said nothing"
+	case "$(basename "$mdl")" in mmproj-*) continue;; esac
 	n=$((n + 1))
 	name=$(basename "$mdl")
 	# ⚠ A MODEL THAT STOPS AT ONCE VERIFIES NOTHING. gemma-3-1b answers a
