@@ -639,12 +639,31 @@ Armbian layout after all. Nothing was written."
 	# ⚠ REMOVE BEFORE COPYING. Writing through a symlink would overwrite
 	# whatever it points at, which on Armbian is the distro's own
 	# vmlinuz-<version> and is not ours to replace.
+	TAGREL=$(strings "$TMP/Image" 2>/dev/null | sed -n 's/^Linux version \([^ ]*\).*/\1/p' | head -1)
 	as_root rm -f "$BOOTDIR/Image"
 	as_root cp "$TMP/Image" "$BOOTDIR/Image"
 	as_root rm -f "$DTBDEST"
 	as_root cp "$TMP/$DTBNAME" "$DTBDEST"
 	if [ -n "$MODS" ]; then
-		as_root tar -C / -xzf "$TMP/$(basename "$MODS")"
+		# ⚠⚠ NEVER `tar -C /`. Armbian is merged-usr: /lib is a SYMLINK to
+		# usr/lib, and GNU tar, extracting a `lib/` directory member over
+		# it, deletes the symlink and makes a real directory. Every
+		# dynamically linked program then fails to exec -- the loader is
+		# reached as /lib/ld-linux-aarch64.so.1 -- init included, and the
+		# next boot panics in run-init. That is what happened on 2026-09-02
+		# with a modules tarball rooted at lib/. Extract aside, find the
+		# release directory wherever the tarball put it, and copy it
+		# THROUGH the existing /lib/modules path, whatever /lib is.
+		as_root rm -rf "$TMP/mods" && as_root mkdir -p "$TMP/mods"
+		as_root tar -C "$TMP/mods" -xzf "$TMP/$(basename "$MODS")"
+		MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/$TAGREL" 2>/dev/null | head -1)
+		[ -n "$MODDIR" ] || MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/*" 2>/dev/null | head -1)
+		if [ -z "$MODDIR" ]; then
+			ui_msg "The modules tarball has no modules/<release> directory in it. Image and dtb are installed; modules were not."
+		else
+			as_root mkdir -p /lib/modules
+			as_root cp -a "$MODDIR" "/lib/modules/$(basename "$MODDIR")"
+		fi
 		# ⚠ MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD, and neither
 		# layout was running it. The version is whatever the tarball says,
 		# not `uname -r`: the running kernel is still the old one.
