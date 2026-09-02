@@ -1410,7 +1410,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # batched matmul at m = 4 and the host only ever ran that a row at a time.
    run 20
    have spec_identity.sh || { skip 20 "spec_identity.sh not installed (dev channel)"; break; }
-   sh "$BIN/spec_identity.sh" "$MODELS" 48 >"$OUT/verify-spec.txt" 2>&1
+   # ⚠⚠ WITH THE NPU ENVIRONMENT. The first board run of this phase called
+   # the script bare, which is the CPU: the identity it would have reported
+   # is the host's, run on a board. (It reported nothing, because the script
+   # also wrote its stderr file under a build/ the board does not have, and a
+   # redirection that cannot open its file stops the command.)
+   env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+       CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+       sh "$BIN/spec_identity.sh" "$MODELS" 48 >"$OUT/verify-spec.txt" 2>&1
    rc=$?
    sed 's/^/  /' "$OUT/verify-spec.txt"
    wedged "phase 20" && break
@@ -1426,17 +1433,53 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# on P9, whose continuation 257 258 259 has never occurred before, so
 	# the lookup drafted nothing useful and accepted 11%. The identity
 	# test's prompt asks for repetition, which is the case this drafter
-	# is for; open prose is phase 20's second row below.
+	# is for.
+	#
+	# ⚠ THE FIRST REAL READING, 2026-09-02, Qwen3 on the attach-once
+	# kernel: plain 28.94 tok/s, --spec 3 21.65, --spec 5 21.32. A pass at
+	# m = 4 cost 2.51 decode steps and yielded 1.90 tokens, so speculation
+	# LOST 25% -- the batched path serialises the two cores (the overlap
+	# corrupts, see batch_serial) and pays the fence and the read back
+	# per pass. The fourth arm below puts the overlap back for the price
+	# and checks the text, because that finding predates the attach-once
+	# kernel; if its text is identical the pass is about half the price
+	# and the sum changes sign. Every spec arm's text is checked against
+	# plain: on the board the pass is a real batched matmul at m = 4.
 	SPEC_P="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
-	for arm in "" "--spec 3" "--spec 5"; do
-		r=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-		    "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $arm 2>/dev/null)
+	SPEC_ENV="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
+	PT=""; PTOK=0; PMS=0
+	for arm in plain "--spec 3" "--spec 5" "--spec 3 +parallel"; do
+		opt=$arm; par=""
+		case "$arm" in
+		plain) opt="";;
+		*+parallel) opt="--spec 3"; par="CHARSIU_NPU_BATCH_PARALLEL=1";;
+		esac
+		r=$(env $SPEC_ENV $par "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $opt 2>/dev/null)
 		gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms, \([0-9.]*\) tok\/s.*/\3 tok\/s (\1 tok, \2 ms)/p')
+		tok=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms.*/\1/p')
+		ms=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms.*/\2/p')
 		sl=$(printf '%s' "$r" | grep '^\[spec ' | sed 's/^\[spec k=[0-9]*: //; s/\]$//')
-		printf '    %-9s %s%s\n' "${arm:-plain}" "$gen" "${sl:+   $sl}"
+		passes=$(printf '%s' "$sl" | sed -n 's/^\([0-9]*\) passes.*/\1/p')
+		t=$(printf '%s' "$r" | sed '/^\[load /,$d')
+		v=""; steps=""
+		if [ "$arm" = plain ]; then
+			PT=$t; PTOK=${tok:-0}; PMS=${ms:-0}
+		else
+			if [ "$t" = "$PT" ]; then v="text identical"; else v="⚠⚠ TEXT DIFFERS from plain"; fi
+			case "$arm" in
+			*+parallel) ;;
+			*) [ "$t" = "$PT" ] || bad "phase 20: $arm text differs from plain on $(basename "$SM")";;
+			esac
+			[ "${passes:-0}" -gt 0 ] && [ "$PTOK" -gt 0 ] && [ "$PMS" -gt 0 ] &&
+			    steps=$(awk -v ms="$ms" -v p="$passes" -v pms="$PMS" -v pt="$PTOK" \
+				'BEGIN { printf "a pass = %.2f decode steps", (ms / p) / (pms / pt) }')
+		fi
+		printf '    %-18s %s%s%s%s\n' "$arm" "${gen:-no gen line}" "${sl:+   $sl}" "${steps:+   $steps}" "${v:+   $v}"
+		wedged "phase 20" && break
 	done
-	printf '  ⚠ tok/s over passes = the pass cost in decode steps; compare it to tok/pass.\n'
+	printf '  ⚠ speculation wins only where tok/pass is above the steps a pass costs.\n'
+	printf '  ⚠ +parallel is a PROBE: its text differing is the known fault, and identical\n'
+	printf '    would mean the core pair overlap was the old kernel, and the pass is cheaper.\n'
    fi
    wedged "phase 20" && break
    ;;
