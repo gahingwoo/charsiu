@@ -1491,16 +1491,25 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	    timeout 600 "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 2048 -t 4 >"$af" 2>&1
 	rc=$?
 	gen=$(sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p' "$af")
+	# ⚠ THE NUMBER THAT ALWAYS PRINTS IS THE AVERAGE. "N calls, M tasks and X
+	# MB on the busier core, A us a call" is busy_us / calls, a direct
+	# measurement, and it is what the arms are compared on: same workload,
+	# same calls, so a change in A is the wake latency. The three-term fit
+	# ("us a call = c + t a task + b a MB") is a regression that a run can
+	# refuse when its calls do not separate the terms, and it refused the
+	# same workload it had fitted an hour earlier; it is printed when it
+	# exists and decides nothing.
+	avg=$(grep -o "on the busier core, [0-9]* us a call" "$af" | grep -o "[0-9]* us a call" | head -1)
 	cm=$(grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" "$af" | head -1)
-	printf '  %-20s %-12s %s\n' "$arm" "$gen" "${cm:-⚠ NO COST-MODEL LINE (exit $rc)}"
-	if [ -z "$cm" ]; then
-		bad "phase 21 arm '$arm': no cost-model line, exit $rc -- the last lines of $af:"
+	printf '  %-20s %-12s %-16s %s\n' "$arm" "$gen" "${avg:-⚠ NO NPU SUMMARY}" "${cm:-(fit declined)}"
+	if [ -z "$avg" ]; then
+		bad "phase 21 arm '$arm': no NPU summary line, exit $rc -- the last lines of $af:"
 		tail -8 "$af" | sed 's/^/       /'
 		break
 	fi
    done
    wedged "phase 21" && break
-   ok "read 'a call' across the arms; the third must match the first"
+   ok "compare the AVERAGE us a call across the arms; the third must match the first"
    printf '     ⚠ these arms are the wake latency ALONE. The attach/detach per job\n'
    printf '        is the patched kernel (rocket: keep the domain attached), next round.\n'
    ;;
