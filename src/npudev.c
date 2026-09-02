@@ -23,7 +23,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,6 +250,12 @@ struct charsiu_npu {
 	 */
 	struct charsiu_device *dev[2];
 	unsigned ndev;
+	/*
+	 * /dev/cpu_dma_latency, held open for as long as the device is. See
+	 * the note where it is opened: it is worth 24% of decode on this
+	 * board and it is not a kernel patch. -1 when not held.
+	 */
+	int qos_fd;
 	struct charsiu_bo in[2];      /* one per device: they cannot be shared */
 	unsigned in_stride, out_stride, max_slices, maxtask;
 	uint8_t *scratch;
@@ -1122,6 +1131,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 
 	if (!g)
 		return NULL;
+	g->qos_fd = -1;
 	g->dev[0] = charsiu_open("/dev/accel/accel0");
 	g->ndev = 1;
 	if (g->dev[0] && !getenv("CHARSIU_NPU_ONEDEV")) {
@@ -1387,6 +1397,55 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		if (charsiu_bo_alloc(g->dev[d],
 				     (size_t)g->in_stride * ks + 4096, &g->in[d]))
 			goto fail;
+
+	/*
+	 * ⚠⚠ HOLD THE CPUs OUT OF DEEP IDLE WHILE THE NPU IS OPEN.
+	 *
+	 * rk3576.dtsi gives CPU_SLEEP an exit latency of 250 us. A decode step
+	 * is about 150 calls, and each call is several wakeups -- the irq
+	 * thread, the scheduler thread, the waiter, the CPU thread pool's
+	 * workers -- on CPUs that had nothing to do for the 300 us the fence
+	 * took and went to sleep. Phase 21 on the board, same prompt, same
+	 * kernel, ondemand governor:
+	 *
+	 *   deep idle allowed         7.64 tok/s
+	 *   CPU_SLEEP disabled        9.46 tok/s     +24%
+	 *   spin on the fence only    8.06 tok/s     +5%   (the waiter's share)
+	 *
+	 * so most of it is paid by the kernel threads, not by the waiter, and
+	 * a spinning waiter cannot buy it back. What can, from userspace, is
+	 * the PM QoS interface: a process that writes a latency bound to
+	 * /dev/cpu_dma_latency and keeps the file open forbids every idle
+	 * state whose exit latency exceeds it, on every CPU, until it closes
+	 * the file. Audio and network stacks do exactly this. 100 us allows
+	 * WFI and forbids CPU_SLEEP; the fd goes away with the device, and
+	 * with the process if it dies.
+	 *
+	 * CHARSIU_NPU_IDLE=1 leaves the CPUs alone (the control), and
+	 * CHARSIU_NPU_DMA_LATENCY_US moves the bound. Needs root, which the
+	 * board has; without it this says so once and carries on.
+	 */
+	if (!getenv("CHARSIU_NPU_IDLE")) {
+		const char *e = getenv("CHARSIU_NPU_DMA_LATENCY_US");
+		int32_t us = e ? (int32_t)atoi(e) : 100;
+		int fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
+
+		if (fd >= 0 && write(fd, &us, sizeof(us)) == (ssize_t)sizeof(us)) {
+			g->qos_fd = fd;
+			fprintf(stderr, "charsiu NPU: holding the CPUs out of idle "
+				"states deeper than %d us while the NPU is open "
+				"(CHARSIU_NPU_IDLE=1 to allow them)\n", (int)us);
+		} else {
+			int err = errno;
+
+			if (fd >= 0)
+				close(fd);
+			fprintf(stderr, "charsiu NPU: could not hold "
+				"/dev/cpu_dma_latency (%s); deep idle stays "
+				"allowed, which costs about a quarter of decode\n",
+				strerror(err));
+		}
+	}
 	return g;
 
 fail:
@@ -1408,6 +1467,10 @@ void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
+	if (g->qos_fd >= 0) {
+		close(g->qos_fd);      /* the CPUs may sleep deeply again */
+		g->qos_fd = -1;
+	}
 	if (g->dev[0]) {
 		for (unsigned i = 0; i < g->n_slot; i++) {
 			unsigned d = g->slot[i].di;
