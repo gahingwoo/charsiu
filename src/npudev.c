@@ -32,6 +32,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "reusekey.h"
 #include "charsiu.h"
 #include "charsiu_llm.h"
 
@@ -378,13 +379,7 @@ struct charsiu_npu {
 	 * wide enough to be split across both cores. One key for two buffers
 	 * described neither.
 	 */
-	struct {
-		const float *x;
-		unsigned m;
-		uint64_t k;
-		uint8_t zp;
-		int valid;
-	} bin_key[2];
+	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
 	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
 	size_t bin_stride, bout_stride;
@@ -3100,7 +3095,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
-	g->bin_key[0].valid = g->bin_key[1].valid = 0;   /* BOs replaced */
+	reuse_keys_drop(g->bin_key, 2);   /* BOs replaced */
 	if (m > g->bm)
 		g->bm = m;
 	if (nks > g->bnks)
@@ -3922,12 +3917,25 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 */
 	uint8_t zp = g->slot[e->first].job.input_zero_point;
 
+	/*
+	 * ⚠⚠ A LEADER DROPS EVERY KEY FIRST, on the devices this tensor will
+	 * not pack as much as on the ones it will: the caller not declaring
+	 * its input unchanged means X is new everywhere. reusekey.h has the
+	 * round that found out (phase 22: q on core 0, gate on core 1, up
+	 * back on core 0 reading the attention input).
+	 */
+	if (!g->reuse_ask)
+		reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
+
 	for (unsigned d = 0; d < g->ndev; d++) {
-		unsigned nt = 0, nh = 0, done_ki = 0;
+		unsigned nt = 0, nh = 0, done_ki = 0, need = 0;
 		double tp = now_us();
-		int reuse = g->reuse_ask && g->bin_key[d].valid &&
-			    g->bin_key[d].x == X && g->bin_key[d].m == m &&
-			    g->bin_key[d].k == e->t->k && g->bin_key[d].zp == zp;
+
+		for (unsigned i = 0; i < e->count; i++)
+			if (g->slot[e->first + i].di == d)
+				need |= 1u << (i / e->n_slices);
+		int reuse = g->reuse_ask &&
+			    reuse_key_hit(&g->bin_key[d], X, m, e->t->k, zp, need);
 
 		if (g->reuse_ask) {
 			if (reuse)
@@ -4063,13 +4071,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * actually packed into it. A tensor with no slot here wrote
 		 * nothing, and the key must not claim otherwise.
 		 */
-		if (!reuse && done_ki) {
-			g->bin_key[d].x = X;
-			g->bin_key[d].m = m;
-			g->bin_key[d].k = e->t->k;
-			g->bin_key[d].zp = zp;
-			g->bin_key[d].valid = 1;
-		}
+		if (!reuse && done_ki)
+			reuse_key_set(&g->bin_key[d], X, m, e->t->k, zp, done_ki);
 		if (!nt)
 			continue;
 		tp = now_us();
@@ -4270,12 +4273,18 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
  * ⚠⚠ OFF UNLESS ASKED, AND THE BOARD IS WHY. Input reuse shipped twice in one
  * day and phase 2 stopped the round both times: first 6 of 9 models, with one
  * key for two devices; then, with a key per device, still Phi-3.5 and
- * gemma4-E2B -- the two whose projections are VIEWS of a fused tensor or come
- * with per-layer embeddings. Whatever the second fault is, the host cannot
- * see it (no NPU: the batched path falls back to the row loop) and two rounds
- * of guessing is the budget this file allows before a change goes back to
- * being a probe. CHARSIU_NPU_REUSE=1 turns it on; board_verify's reuse phase
- * is the way to find out which model it breaks and how.
+ * gemma4-E2B. The host cannot see either fault (no NPU: the batched path
+ * falls back to the row loop), and two rounds of guessing was the budget
+ * before this went back to being a probe.
+ *
+ * Phase 22 then bisected it by site: Phi-3.5 broke on k after q, gemma4 on
+ * up after gate, Qwen3 on nothing. The second fault was a key with no
+ * expiry -- a leader packing one core left the other core's key naming the
+ * same buffer with the old contents (reusekey.h). "Views of a fused tensor"
+ * and "per-layer embeddings", the two guesses above, were wrong. Fixed by
+ * the leader drop; STILL OFF until phase 22 reads identical on every site
+ * and phase 2 passes with CHARSIU_NPU_REUSE=1, which is what flips the
+ * default, not this comment.
  */
 static int reuse_enabled(void)
 {

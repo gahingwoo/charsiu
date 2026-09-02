@@ -184,11 +184,15 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key
 	./$(BUILD)/pack_int4
+	./$(BUILD)/reuse_key
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+$(BUILD)/reuse_key: tests/reuse_key.c src/reusekey.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
 	rm -rf $(BUILD)
