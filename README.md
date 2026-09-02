@@ -4,44 +4,26 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** **Every matmul in Llama-3.2-1B runs on the NPU at four bits, the sentence is
-identical to the one the exact arithmetic writes, and it is 2.3x the int8 baseline on the
-same board.** 113 tensors including the 128256 wide output head, on a ROCK 4D with a
-mainline kernel and the open `rocket` driver.
+**Status.** On a ROCK 4D, under the vendor's own measuring protocol, decode is at
+the vendor's speed:
 
 ```
-                                     tokens/second
-  charsiu, int4, 64 tokens                15.91      (14.70 when this was first written)
-  charsiu, int4, 384 tokens               11.98      (attention grows with the context)
-  charsiu, int8                            6.40
-  charsiu on the CPU, best                 5.53      (pure q4_0, four threads)
+                     decode tok/s            time to first token, ms
+                     charsiu   vendor        charsiu   vendor
+  Qwen3 0.6B          24.70    24.85          1399      469
+  TinyLLAMA 1.1B      20.44    19.71          2003      544
+  Phi3 3.8B            6.84     6.58          5838     1829
+  Gemma4 E2B           8.63     9.23          4160     1219
 ```
 
-A prompt is a different job from a generated token: its tokens are all known at once,
-so the same weight bytes can serve more than one of them. **Prefill used to cost more
-per token than decode and now costs a third of it.**
+Every projection, including the output head, runs on the NPU at four bits, and the
+text is identical to what the CPU decode loop writes. Prefill is the open front:
+about a third of the vendor's, because every projection still comes back to the CPU
+between layers. The numbers are read off `board_verify.sh 7`, the same prompt and
+protocol the vendor publishes, and the rest of this file says how they are known to
+be right.
 
-```
-                            a prompt, batched   a token at a time
-  charsiu, int8                    26.60               9.04       tokens/second
-  charsiu, int4                    18.59              15.10
-```
-
-Both columns are the same binary one environment variable apart, generating identical
-text, with two batched samples bracketing the control so a warming board cannot be
-mistaken for the flag. int4 gains less because **w4a16 computes exactly one row** and no
-register makes it compute two -- so an int4 prompt batches nothing and gains only the
-output head, which a prompt needs for its last token alone. That saving is 12.40 ms a
-token, and the head is 131.3 MB of int4 weights: 131.3 / 12.59 = 10.43 GB/s against the
-10.58 GB/s this board measures for weight bandwidth. The time a batched prompt does not
-spend is the time it takes to stream the head once per token.
-
-It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files. Decode is
-DISPATCH bound rather than bandwidth bound, which is the opposite of what this file said
-for a long time: a call costs `128.7 + 36.8*tasks + 110.0*MB` us on the busier of the two
-cores, 39% of the hardware path is the fixed part of that, and gate and up together run at
-13.65 GB/s against a 10.58 GB/s weight roof. Reading it as a bandwidth wall is what made
-fewer and larger K slices look like the obvious move; they measured 37% SLOWER.
+It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files.
 
 **And it sees.** A vision tower read out of llama.cpp's `mmproj` gguf, on the same
 primitives -- a patch embedding is a convolution whose stride equals its kernel, which
@@ -87,8 +69,9 @@ curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/ch
 It fetches the source, checks whether the running kernel can drive the NPU, and
 **offers a kernel if it cannot**, because RK3576 NPU support is not upstream yet,
 so no distribution kernel anywhere will bind this hardware. A kernel it installs
-becomes the default boot entry and **the one already on the card stays selectable**,
-five seconds into the boot, in case the new one misbehaves.
+becomes the default boot entry. On an extlinux board **the one already on the card
+stays selectable**, five seconds into the boot; on Armbian there is no menu, and the
+previous kernel is kept as `/boot/Image.previous` to copy back by hand.
 
 Then it builds charsiu, fetches a model that charsiu can actually run, and asks it
 something so you can see it work.
@@ -154,16 +137,8 @@ charsiu-doctor --paste      the block to put in a bug report
 direction, see [What a file's name does not tell you, twice](#what-a-files-name-does-not-tell-you-twice).
 `charsiu-get` gates every download by reading the file, and deletes what it cannot run.
 
-A 64 token generation is 62.3 ms a token, and 49.7 of that is the weight fetch itself at
-10.8 GB/s, which is what this hardware's own bandwidth bench measures. **The fence is
-the floor**: 620 MB of int4 weights have to cross the bus for every token, and no amount
-of software makes that cheaper. What is left on the CPU is about 12.6 ms, and the last
-eight rounds took it there from about 40. One millisecond of the token is neither the
-hardware nor the packing, which is as closed as this account gets.
-
-That acceptance test is the point of how this was built. The CPU decode loop came first
-and is the oracle; the NPU computes the same sum, so the two runs must agree exactly, and
-"the text looks fine" was never allowed to count.
+The CPU decode loop came first and is the oracle; the NPU computes the same sum, so the
+two runs must agree exactly, and "the text looks fine" was never allowed to count.
 
 Still on the CPU: the embedding lookup, RMSNorm, RoPE, the attention score, softmax and
 weighted sum, SwiGLU, the residuals and sampling. Every projection, including the output
@@ -186,95 +161,6 @@ $ charsiu_run Llama-3.2-1B-Instruct-Q4_0.gguf -p "The capital of France is" -n 2
 The capital of France is Paris. The capital of Germany is Berlin. The capital of
 Italy is Rome. The capital of Spain is Madrid.
 ```
-
-
-Measured on a ROCK 4D, 2026-08-15, every value identical to the reference rather than
-close to it:
-
-| probe | shape | result |
-|---|---|---|
-| dense | M=1 K=64 N=64 | 64 of 64 bytes exact |
-| negative MAC, output -66 to +63 | M=1 K=64 N=64 | 64 of 64 bytes exact |
-| bias ramp | M=1 K=64 N=64 | 64 of 64 bytes exact |
-| impulse | M=1 K=64 N=64 | 64 of 64 bytes exact |
-| dense, a projection's shape | M=1 K=512 N=1024 | 1023 of 1024 exact, but see the note |
-| dense, **many rows** | M=224 K=64 N=64 | 14313 of 14336, none off by more than 1 |
-| dense, a whole 56x56 surface | **M=3136 K=33 N=64** | 200344 of 200704, 51 off by more than 1 |
-
-⚠ **The last two rows are the int8 output path, not the accumulator one.** They were
-measured by `charsiu_matmul`, which requantises to int8 and reads the result as a
-surface. The runtime's decode path sets `acc_out` for the raw int32 accumulator and
-reads it flat, and on that path nothing above one row has ever been correct. Do not
-read these two rows as "m > 1 works"; they say it works in the path they measured.
-
-**The rows above M = 1 were wrong for 36 rounds and the hardware was not.** The
-output surface is `[n/atom][m][n%atom]`, the mirror of the input's, and at M = 1
-that expression collapses to exactly `n`. So a row major reading was right at one
-row and only there, and every correctness run this project had done was at one
-row. Nothing about the job changed when this was found: same register stream,
-same packing, same buffers, only which byte the checker reads.
-
-**Which of these rows is evidence, and which is not.** A matching channel is not a
-computed one: if the reference is flat, both sides can hold the same common value
-without a single multiply having been right. Computed with the tool's own
-cpu_reference() at M = 1, K = 64, N = 64:
-
-| probe | distinct reference values | range | reads as evidence |
-|---|---|---|---|
-| negative MAC | 64 | -66 to 63 | yes |
-| bias ramp | 64 | -48 to 53 | yes |
-| dense | 5 | -2 to 2 | no |
-| impulse | 5 | -2 to 2 | no, until the scale fix below |
-
-The K=512 row is the same problem again, 7 distinct values across 1024 channels.
-
-This file used to say the four 64 wide rows were all strong evidence because they
-had 64 distinct reference values. Two of them do. The other two put the whole
-reference inside four counts, which is under the tool's own TOO FLAT TO JUDGE A
-MATCH threshold, so those two 64 of 64 results were never readable.
-
-It matters which two. The two that hold are the ones that exercise the output
-stage, one walking the MAC through zero and one holding it at zero and walking
-the bias. The two that do not are the ones that exercise the WEIGHT LAYOUT. So
-the layout evidence is the weaker half, which is the opposite of what this file
-implied.
-
-The impulse now sets its own weight scale, the way the int4 probes learned to in
-rounds 170 and 176, and its reference spans 62 values across -115 to 115.
-CHARSIU_I8_IMPULSE_SMALLSCALE restores the old setting as a control. The dense
-probe has the same problem and has deliberately not been touched in the same
-change, so that whichever result moves can be attributed.
-
-The two things that had to be understood to get there are worth stating because both
-were wrong in this file before:
-
-- **both operands are signed bytes.** The weight is stored biased by `-0x80` and so is
-  the input; storing the input raw makes a byte of 168, meaning +40 against a zero
-  point of 128, arrive as -88.
-- **the output stage is** `out = clamp(max(requant, 0) + offset, -128, 127)`, an int8
-  with a floor under it. The floor is a real fused ReLU and it does not need to be
-  switched off: lifting the accumulator clears it, and the offset takes the same
-  amount back.
-
-  ⚠ **The lift is the output zero point, not 128.** 128 is right here only because
-  charsiu's own zero point is 0, which makes its offset `-128` already. Reading this
-  as a constant is what took the driver project a board round to undo: it lifted by
-  128 on a tensor whose zero point was 128, where the offset is 0 and nothing takes
-  the lift back, and the whole surface railed at the top. `out_zp` is the smallest
-  lift that clears the floor, and with it the offset is a constant `-128` and the
-  expression collapses to `clamp(requant + out_zp, 0, 255)`, which is what the
-  operation means.
-
-⚠ **The three paragraphs above are where this stood when the matmul was the whole
-question, and they are kept because the reasoning in them is still the reasoning.**
-What they say is left has since been done: models run, int4 computes end to end, and
-the numbers at the top of this file are measured rather than projected. The two items
-this paragraph used to name as open have closed since -- prefill batches above M = 1,
-and the stale width cap that kept an output head on the CPU is gone.
-
-One thing on that list has not moved: the reference still requantises in float where
-the hardware uses an integer scale and shift. It agrees to the byte on everything
-measured so far, which does not mean it will at every scale.
 
 The three tools that got it there are in the repository rather than in a shell history,
 because every step that worked was a diff against something known to compute:
@@ -326,51 +212,6 @@ deliberately **ARMv8.0 only**: no fp16 arithmetic, no SDOT. Writing them against
 development machine's feature bits would produce a kernel that runs here and not on the
 board it is a baseline for. `CHARSIU_NO_NEON` builds the portable versions, and
 `tests/neon_control.sh` requires the two to produce the same tokens.
-
-One thing that cost a day and is worth stating plainly: **a q4_0 file is not all q4_0.**
-llama.cpp quantises `token_embd` to q6_K even there, and Llama 3.2 ties the output head
-to it, so at a 128256 vocabulary that one tensor is a fifth of the weights and the
-biggest matmul in a decode step. It was also the one type whose vector path had been
-removed to silence a spurious compiler warning, and a q4_0 model ran at **half** a q8_0
-model's speed while reading half the bytes.
-
-| | before | vector q6_K over a dequantised buffer | dot folded into the unpacking |
-|---|---|---|---|
-| q4_0, 6 threads | 9.21 tok/s | 12.06 | **18.70** |
-
-The first guess had been register spilling in the q4_0 kernel. Rewriting it changed
-nothing, which refuted it, and the answer turned out to be in the file rather than in the
-code.
-
-### The activation is quantised, not the weights converted
-
-The first version converted every **weight** to a float in order to multiply it by a float
-activation. That is the expensive way round: a matvec has `N*K` weights and only `K`
-activations. So the activation is quantised to signed int8 once per matvec, in blocks of
-32 with a scale each, and the dot product becomes **integer**, with one float multiply per
-block at the end. Q, K and V all read one RMSNorm output and so do gate and up, so six of
-the nine quantisations in a layer are of a vector already done and are skipped.
-
-| host, q4_0, 4 threads | tok/s |
-|---|---|
-| exact f32 activation | 17.99 |
-| quantised | 31.50 |
-| plus the deduplication | **36.85** |
-
-**The order flipped**: q4_0 36.85 now beats q8_0 34.80, where q8_0 used to win. Thread
-scaling flattened as well (1 → 18.4, 2 → 30.2, 4 → 33.4, 6 → 30.8). Both are what a
-kernel that has stopped being ALU bound looks like. llama.cpp on the same host and file
-is 48.3 tok/s; charsiu was at 39% of it and is now at 76%.
-
-This matters beyond speed. **An int8 activation with a scale is exactly what the NPU
-consumes**, so the CPU fallback and an NPU job can be fed from the same buffer, and the
-CPU path is the reference the NPU path gets diffed against rather than a separate design.
-
-It is an approximation, so it has controls. `CHARSIU_NO_QACT` restores the exact path, and
-that path is proven untouched: the logits it prints are byte identical to the values
-recorded before the change. `tests/qact_control.py` measures what the approximation costs
-without needing any reference implementation, q4_0 moves a logit by at most 0.055 with 48
-greedy tokens unchanged, q8_0 by at most 0.103.
 
 ### What a file's name does not tell you, twice
 
@@ -435,1264 +276,28 @@ until it has.
 Sampling at a temperature runs the plain loop: lossless speculative sampling
 exists and is not written here.
 
-## The NPU's number format, answered on the CPU
-
-Moving a projection onto the NPU means accepting the format the hardware imposes: signed
-int8 weights with **one scale per output channel**, which is what the coefficient buffer
-applies, against an activation with **one scale for the whole vector**, because a
-`charsiu_job` carries a single `input_scale`. Both zero points are 128, so what the DPU
-computes is exactly
-
-```
-acc[n] = sum_k a_q[k] * w_q[n][k]
-y[n]   = acc[n] * a_scale * w_scale[n]
-```
-
-Whether that costs the model its output is not a question about register streams, and the
-CPU decode loop is already the oracle for it. So the whole model runs in it:
-`CHARSIU_NPU_QUANT=1` builds a second copy of every routed tensor in that format and
-multiplies with a widening integer dot.
-
-Llama-3.2-1B from a q8_0 file, **113 tensors routed**, every projection and the tied
-output head, with a per tensor RMS error against the original of **0.85% to 1.57%**. The
-text is coherent, and at this prompt it is the continuation llama.cpp itself produces:
-
-```
-$ CHARSIU_NPU_QUANT=1 charsiu_run Llama-3.2-1B-Instruct-Q8_0.gguf \
-      -p "The capital of France is" -n 32
-Paris. The Eiffel Tower is located in Paris. The Eiffel Tower is one of the most
-famous landmarks in the world. It was built for
-```
-
-So the format is not the problem, and what is left of that step is plumbing rather than
-accuracy. `npu_tensor_build()` in `src/npuquant.c` is also the converter's arithmetic
-already written: it produces `q`, the per channel scale, and the per channel weight sum
-the coefficient buffer wants, verified by the tokens it produces rather than by reading it.
-
-## What it costs, and what the cost is OF
-
-Measured on the same board, 2026-08-15. A submit carries jobs, a job carries tasks;
-tasks in one job are chained on a single core with no further ioctl. Sweeping seven
-shapes at 32 chained tasks and fitting all of them at once:
-
-```
-us per task = 26.3 + weight_MB * 84.3        i.e. 11.9 GB/s, plus 26 us per task
-```
-
-with every point inside 10% of that line and most inside 4%. **The cost is the weight
-fetch.** Three things say so and each of them could have said otherwise:
-
-- **M is nearly free.** The same 2.10 MB of weights costs 201.9 us at M = 1 and
-  217.6 us at M = 32, which is 1.08 times the time for 32 times the arithmetic.
-- **the same bytes in different shapes cost the same.** K=1024 N=1024 and K=2048 N=512
-  are both 1.05 MB and came out 111.56 and 111.24 us, 0.3% apart. K=2048 N=1024 and
-  K=1024 N=2048 are both 2.10 MB, 208.06 and 211.21 us, 1.5% apart. That test was run
-  to break the reading above and did not.
-- **a second core did not help, and the reason was not bandwidth.** Two jobs of eight
-  tasks were about 5% *worse* than one job of sixteen at every shape. That was read as a
-  bandwidth bound workload and it was the deal: slices went to devices by index,
-  `(ki * ns + ni) & 1`, and ki and ni restart at zero for every tensor, so a
-  single slice tensor landed entirely on device 0 and the other core sat out. Dealing to
-  the less loaded core instead is worth 15% to 21% of the token hardware path.
-
-On top of the per task cost sits about 172 us per submit, which chaining removes. That
-is why a 0.5 MB projection gains 4.4x from batching and a 2 MB one only 1.9x.
-
-### What that means for a token
-
-Llama-3.2-1B reads about 973 M projection weights per token, once each, so decode is
-DRAM bound and not MAC bound:
-
-| weights | bytes per token | time | tokens/s |
-|---|---|---|---|
-| int8 | 973 MB | 85 ms | **11.8** |
-| int4 | 487 MB | 44 ms | **22.7** |
-
-The vendor ships about 13 tokens a second on this board. **So int4 is not a
-nice-to-have, it is the only 2x available**, which is why it moves to the front of the
-queue despite its layout still being unconfirmed here.
-
-Prefill is a different machine entirely: at M = 32 the same weights are amortised over
-32 rows, 604 GOP/s and 6.9 us per row against 200 us per row at M = 1.
-
-### The honest denominator
-
-The same matmul on one CPU thread, a naive scalar loop, takes 5078 us against the
-NPU's 201 us. That ratio is **not** 25x in any useful sense: the loop has no NEON in
-it, and more importantly the CPU has to read the same 2.10 MB, so a tuned kernel would
-run into the same wall from the other side. What the measurement does settle is the
-RK3588 stacks' conclusion that a single row matmul belongs on the CPU. On RK3576 it
-does not.
-
-## Reading a weight layout off the hardware
-
-A weight layout used to be inferred here from whether an output came out right.
-It can be asked directly instead: put **one** live weight in the whole buffer, sweep
-it, and record which output channel lights. `tools/charsiu_int4.c --map` does that,
-and the point of it is that it was validated against int8, which is byte exact on
-this silicon:
-
-```
-int8   K=64 N=64, 4096 bytes    512 of 512 probes light exactly one channel,
-                                no dead region, n = byte / 32, k = byte % 32
-```
-
-which is exactly what `src/regcmd.c` packs. The instrument agrees with a case whose
-answer is already known, which is what makes its answer on int4 worth anything.
-
-`--kpair` goes further and is sparse on **both** sides: one live nibble, a one hot
-input, sweeping k. Every nibble pairs with exactly one k, so nothing is broadcast and
-the pairing can be read with no sum to unpick.
-
-### What int4's layout turned out to be
-
-```
-channel n is read from byte (n / 32) * 512 + (n % 32) * 8, eight bytes
-byte b nibble h is k = 2b + h
-an activation element is TWO bytes wide
-```
-
-Each part measured, then confirmed by a second and different probe. The element width
-was found the hard way: with an 8 bit input packing every nibble paired with
-`k = 2 * k_ours + 1`, and with a 16 bit one it pairs with `k` exactly.
-
-That last also retires a reading this project carried for eight rounds. The hardware
-appeared to fetch only a **quarter** of the weight buffer; it never did. It fetches
-half as many elements, each twice as wide.
-
-### The w4a16 stage, and what the output actually is
-
-The vendor never runs int4 against an int8 activation. It runs `w4a16`, and that path
-has its own DPU output stage **and** its own RDMA coefficient fetch, both of which live
-in vendor streams separate from the 3328 int4 convolution streams, which carry no DPU
-and no RDMA registers at all. Both are ported. The line worth writing down is:
-
-```
-0x40ac = 0    0x40b0 = 1    0x40b4 = 0        an IDENTITY requant
-```
-
-`w4a16` does not requantise. This file used to say "so the output is a float", and that
-was an addition rather than a measurement. An un-requantised output is the raw
-accumulator, and an accumulator is an integer. Read as halves the outputs came back in
-a period of four, with `0xffff` and `0x0000` filling every second slot; paired up
-little endian they are 32 bit integers of alternating sign:
-
-```
-[94 f1][ff ff] -> 0xfffff194 = -3692
-[a4 10][00 00] -> 0x000010a4 = +4260
-```
-
-### Reading the output layout the same way
-
-One live nibble in the entire weight buffer, one byte at a time, all 2048 of them, the
-activation held at a single constant so nothing in the output can track an activation
-index, and the output bytes dumped with nothing assumed about how wide an element is:
-
-```
-byte b feeds output slot b / 8       eight consecutive bytes per slot
-each slot is fed by 16 bytes         two runs of eight, 256 apart
-640 bytes light something            1408 light nothing, and the entire
-                                     second half of the buffer is dark
-no byte lights more than one slot
-```
-
-The control, an all zero weight buffer, lights nothing.
-
-⚠ Round 266 put the third line in doubt and it was wrong to. `--kpair` swept
-bytes 1024, 1536 and 1920, predicted words 32, 48 and 56 for them, and all three
-lit nothing. **The second half of the weight buffer really is dark.** What is
-confirmed instead is that the boundary sits at 1024 rather than at 512: bytes
-512, 640, 768 and 896 all light, at words 16, 24, 16 and 24.
-
-### What the output actually is, exactly
-
-`out = ((int16)fp16bits(w) * (int16)fp16bits(a)) >> 16`, **18 of 18 measured
-points exact**, both negative nibbles included. The hardware multiplies the two
-operands' fp16 **bit patterns as signed 16 bit integers** and shifts right 16.
-charsiu packs a genuine fp16 and the hardware never reads it as a float.
-
-Getting there needed a confound broken first. Doubling an input ADDS a constant
-to the output rather than scaling it: +284 for the activation three times over,
-+288 for the weight twice, exact each time. So the output is linear in log2 of
-its inputs, which is why changing a nibble from 7 to 3 scaled the result by
-0.930 instead of 3/7 and why no line ever fit two points of it.
-
-Two readings then fit everything measured, and they separate only on values
-that are not powers of two, by 20 to 24 counts. The predicted numbers for both
-went into the board script before the run:
-
-```
-   a      fp16 bits   integer reading   true logarithm   measured
-  1.5         15872              4402             4426       4402
-  3.0         16896              4686             4710       4686
-  5.0         17664              4899             4919       4899
-  6.0         17920              4970             4994       4970
-```
-
-Four for four on the integer reading, zero error.
-
-## What int4 buys, measured
-
-```
-                    int8 us/task   int4 us/task
-K=224 N=160            22.7           18.4        -19%
-K=128 N=160            16.0           14.9        - 7%
-K=224 N= 64            14.7           13.3        -10%
-K=2048 N=1024         201.5          cannot run this shape
-```
-
-⚠ **Not 2x, and the reason is that the envelope never reaches the regime where
-halving the bytes would pay.** At 0.04 MB of weights the achieved bandwidth is
-1.58 GB/s; at 2.10 MB it is 10.41. These shapes are latency bound, not bytes
-bound, so int4's halved weight traffic buys almost nothing.
-
-⚠ **The twelve-times figure that first followed from that was wrong, and the K
-ceiling was charsiu's own guard.** The layout works at every K tried up to 2048:
-288, 384, 512, 1024 and 2048 all give `wrote 40 of 64, exact 32` at N = 64, and
-K = 512 at N = 16 is 16 of 16. `exact` is `N/2` at all of them, independent of K, a working half-width job, not a failure. Benched at K = 512, N = 64: int8 24.6
-us against int4 16.7, **int4 by 32%**.
-
-So the arithmetic is per job. An int4 job at a declared `K` and `N` gives `K/2`
-real k a channel and `N/2` usable channels:
-
-```
-int4   NK/4 MACs for NK/8 weight bytes fetched   2 MACs a byte
-int8   NK   MACs for NK   bytes                  1 MAC  a byte
-```
-
-int4 really is twice the work per byte, which is what a 4-bit weight should buy.
-It pays in **jobs**: four times as many for the same work, each with a fixed
-cost.
-
-⚠ **Measured at the shape that matters, it does not survive that.** At
-`K = 2048, N = 256` a single job is **222.7 us for int4 against 224.2 us for
-int8**, half the weight bytes, the same time. int8 is genuinely bytes-bound
-there, 9.14 GB/s marginal; int4 moves 0.26 MB in the same 223 us, which is
-1.18 GB/s. The 2x per byte is real on paper and none of it reaches the clock.
-And chaining hangs: the second task of that shape times out and takes the block
-with it.
-
-The layout itself is fine that far out, `K = 2048` at `N` of 64, 128, 160 and
-256 all give `wrote = N/2 + 8` and `exact = N/2`, so 128 usable channels a job at
-`N = 256`. `N = 512` and above were recorded as failures and were **this packer's
-own group-count guard**, the same mistake as the K whitelist that had `K = 192`
-down as a layout fault for two rounds.
-
-## An int4 matmul that computes
-
-**Round 280: `int4 output: 64 of 64 words written, 64 EXACT`.** Every channel,
-against `cpu_reference`, on a dense buffer. The pieces:
-
-```
-charsiu_pack_weights writes the measured layout   address table + k parity
-CORE 0x3020 = 2*(n-8) - 1                          111 at n = 64
-weights zeroed outside each channel's fed half     CHARSIU_W4_HALFK
-```
-
-The controls behaved. `CHARSIU_INT4_ORDER=1` scored 0 of 64, so the intra group
-order is settled at `byte j holds k = 2j low and k = 2j+1 high`. The no-`HALFK`
-control scored 0 of 64 **with npu values identical to the passing arm**, which is
-the model confirming itself: the hardware computed the same thing and only the
-reference moved. int8 stayed 64 of 64 byte exact throughout.
-
-Both shift placements scored 64, and that is not a weak test. fp16 bits of an
-integer have a zero low byte and `abits` is `(a-0x80) << 8`, so every product is
-a multiple of 65536 and the shift loses nothing per element. **The two readings
-are identically equal for this packing** rather than undecided.
-
-### The base table is one expression at both K
-
-```
-K=64  0 128 512 640 1024 1152 1536 1600
-K=32  0 128 256 384  512  640  768  832
-
-base[g] = (g/2) * 8K + (g odd ? (g == 7 ? 64 : 128) : 0)
-```
-
-Sixteen points, one expression, and the last pair sitting 64 bytes in rather than
-128 appears in **both** tables independently, so it is read and not fitted. It is
-not a cap either: `3*512 + 128 + 56` is well inside 2048.
-
-Both hold on hardware with **no override at all**: `K = 64` and `K = 32` at
-`N = 64` are each 64 of 64 exact with `0x3020` emitted as `2*(n-8) - 1`.
-
-⚠ `N = 32` and `N = 16` came back 24 of 32 and 8 of 16, short by exactly one
-group of eight each. "The last pair" was written as `g == 7`, which is the last
-group only at `N = 64`; at 32 it is 3 and at 16 it is 1, and those are the sizes
-of the shortfalls. So the irregular term belongs to the highest group in use,
-`g == (n-1)/8`.
-
-**Confirmed.** Every `N` whose highest group is odd is now exact, with every
-group at 8 of 8:
-
-```
-N = 16  16/16      N = 32  32/32      N = 48  48/48      N = 64  64/64
-```
-
-32 and 16 were 24 and 8 before the fix, and 48 had never been run and was exact
-first time.
-
-### The write quantises to sixteen channels
-
-The `N` with an even highest group, 24, 40 and 56, failed, and **not on the
-packing**. Whole groups came back 0 of 8 at the top and the count of words
-*written* was short by the same amount:
-
-```
-n      16  24  32  40  48  56  64
-wrote  16  16  32  32  48  48  64      = floor(n/16) * 16, seven for seven
-```
-
-So `0x3020` asks for the next multiple of sixteen,
-`2*(ALIGN_UP(n,16) - 8) - 1`, and the extra channels are computed and thrown
-away. That fixed the write: 24, 40 and 56 now report every word written.
-
-### The pair stride was only ever measured at N = 64
-
-The same three `N` are **still wrong**, and with the write fixed that is now a
-placement fault: whole groups at 0 of 8 at the top, `g2` at `N = 24`, `g3` and
-`g4` at 40, `g4` to `g6` at 56.
-
-The base expression used a pair stride of `8*K`. The weight buffer is `k*n/2`
-bytes, so at `N = 64` it is `k*32`, and **at `N = 64` `8*K` and `wbytes/4` are the
-same number**. Both measured tables were swept at `N = 64`, so no data in this
-project can tell the two forms apart, and the `N` sweep is the first thing that
-could. It says the map scales with the buffer: at `N = 24` the second group of
-`g2` lands at byte 768, which is exactly the size of that buffer.
-
-`wbytes/4` was tried and is **refuted**, and not narrowly. It did not fix the
-three that were wrong and it broke the three that were right:
-
-```
-            8*K      wbytes/4
-N = 16    16/16          0/16
-N = 32    32/32          0/32
-N = 48    48/48          8/48
-N = 64    64/64         64/64     equal here by construction, so proves nothing
-N = 24    16/24          0/24
-N = 40    24/40          0/40
-N = 56    32/56          0/56
-```
-
-So `8*K` is right everywhere there is data and the failures at 24, 40 and 56 are
-something else. The reasoning that produced `wbytes/4` was tidy, the map must
-scale with the buffer, and at `N = 24` the second group of `g2` lands at 768
-which is exactly that buffer's size, and it did not survive one round.
-
-### The map away from N = 64, and what it turned out to be
-
-Sweeping `--map` at `N = 24` and `N = 40`, the first time the map was read
-anywhere but 64, disagreed with `8*K` at both:
-
-```
-N = 24  measured 0, 128, 192              8*K said 0, 128, 512
-N = 40  measured 0, 128, 512, 576, 704    8*K said ... 640, 1024
-```
-
-The **skeleton** is regular and K independent. Groups of eight channels sit in
-*blocks* of `8*K` bytes at *slots* of 64, with a channel's k+ half four slots on,
-and the `K = 32` table decomposes exactly like the `K = 64` one, only the block
-stride scales.
-
-**Which slots** looked irregular until `G = 9` was swept. As flat slot indices,
-block times 8 plus slot:
-
-```
-G=2  0 1              G=3  0 2 3
-G=4  0 2 8 9          G=5  0 2 8 9 11
-G=6  0 2 8 10 16 17   G=7  0 2 8 10 11 17 19
-G=8  0 2 8 10 16 18 24 25
-G=9  0 2 8 10 16 17 19 25 27
-
-EVEN G   pairs at slots 0 and 2 in every block but the last, which takes 0 and 1
-ODD G    one block of three at b3 = (G-1)/4, slots 0 and 2 before it and 1 and 3
-         after it, the three itself {0,2,3} when G mod 4 is 3, {0,1,3} when it is 1
-```
-
-This is the third closed form written for this layout. The first two died in the
-round after they were written, `wbytes/4`, which also broke three working
-geometries, and "the last block takes the odd slots", which put `g4` of `N = 56`
-at 1024 where `--map` found it at 704, and both were fitted to a single point.
-
-**This one predicted `G = 10` and `G = 11` before either was swept, and both
-landed.** `N = 80` and `N = 88` came back 80 of 80 and 88 of 88 against the CPU
-reference, and their `--map` grids reproduce all 21 predicted bases exactly:
-
-```
-N=80  0 128 512 640 1024 1152 1536 1664 2048 2112
-N=88  0 128 512 640 1024 1152 1216 1600 1728 2112 2240
-```
-
-### Where int4 stands
-
-```
-works, no override, byte exact against a CPU reference
-  K = 32, 64, 128, 160, 192 and 224. K must be a MULTIPLE OF 32, which is the
-    run count K/32 being whole: 144 and 176 give 8 of 64 where 160 and 192 give 64
-  every N that is a multiple of 8 that has been tried, 16 through 160
-  every channel, K/2 real k each
-  out = ((int16)fp16bits(w) * (int16)abits) >> 16
-
-open, and both are measured rather than untried
-  M > 1 is int4 only, int8 at M = 4 is 256 of 256 byte exact. Two faults, now
-    separated. The surface groups by SIXTEEN BYTES, read straight off a raw dump
-    at M = 2: row 0's channels 0-3 are at words 0-3 and 4-7 at words 8-11, so an
-    atom is 4 elements for w4a16 and 16 for int8, and at M = 1 every atom
-    collapses to n. That fix landed: at M = 2, N = 16 row 0 now has no mismatches
-    at all. What is left at M > 1 is SLOT 2: row 0 at N = 64 fails on channels
-    8-15, 24-31 and 40-47, which are g1, g3 and g5, and those are every slot 2
-    group in the packer's own placement, while slots 0 and 1 all pass. N = 16 has
-    no slot 2 group, which is why its row 0 is clean, and at N = 24, which has
-    a slot 2 AND a slot 3, both fail, so at M > 1 only slots 0 and 1 work.
-    ⚠ The weight layout has NO M term, that reading came from a probe that
-    drove every row at once and printed only the first lit word. Holding one row
-    live at a time: row 0 alone has byte 8j lighting channel j in BOTH rows, at
-    the same address M = 1 uses, and **row 1 alone lights nothing at all**. Row 1
-    IS computed, in the row-0-only baseline its words come back nonzero with its
-    own activation at the zero point, so both output rows are computed from
-    row 0's activation slot and row 1's bytes are never fetched.
-    Three registers wake row 1 up on the map, `0x1044`'s DATA_ENTRIES at
-    `surf*m`, `0x103c` at `surf*m << 16`, and `0x1078` back at its M = 1 value, and **as matmuls all three are 16 of 32, identical to changing nothing.**
-    `0x1094` breaks row 0 as well and `0x118c` is the baseline. Six registers,
-    none of them a row count.
-    The packing is not inert and no arrangement is right either. Sweeping the
-    granularity at which rows interleave over 1, 2, 4, 8, 16, 32 and 64 elements,
-    with the shipped value 8 and "rows outermost" 64 in the sweep as controls and
-    both reproducing, **only 8 gives 16 of 32 and every other value gives 0**.
-    ⚠ **M > 1 is closed with a negative**: six registers and nine packings, and
-    the hardware computes M rows while feeding every one from row 0's activation.
-    It does not block the project, decoding LLM tokens is M = 1, and int4 at
-    M = 1 is exact across eleven geometries. M > 1 is a chaining problem.
-  N not a multiple of 8: the hardware does not put the short group LAST. Its live
-    channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
-    so bytes 160-191 and 544-575 are dead and the packer writes logical channels
-    12-15 and 20-23 into them. Both match the mismatch lists exactly. Measured at
-    two N, no rule written.
-  ⚠ The LAYOUT scales in K and the CHANNEL COUNT does not. K = 128 is exact at
-    three N once the group count is right: a channel is fed by K/32 runs of eight
-    bytes spaced a constant 256, 1, 2 and 4 at K of 32, 64 and 128, where the
-    packer wrote two at an offset of 4*K, which equals 256 only when K is 64.
-    That was the same trap as `8*K` against `wbytes/4`.
-    At K = 256 thirty-two channels are correct whatever gets written: `0x3020`
-    swept over six values gives 40, 40, 56, 56, 40, 40 written with `exact` at
-    `wrote - 8` throughout, and `SIZE_E_2` moves what is written, 32/36/40, with
-    `exact` stuck at 32. Beside the K that work, in bytes of weight actually
-    fetched, which is `K/2` a channel:
-
-    ```
-    K =  64  N = 88 correct    88 x 32  = 2816
-    K = 128  N = 64 correct    64 x 64  = 4096
-    K = 256  N = 32 correct    32 x 128 = 4096
-    ```
-
-    Two land on 4096 exactly and the third is under it, which looked like a 4096
-    byte weight fetch budget. ⚠ **Refuted, usefully.** `K = 64` at `N = 160` is
-    5120 bytes and comes back 160 of 160, `K = 128` at `N = 96` is 6144 and comes
-    back 96 of 96, and both were predicted to cap. There is no byte budget: **K
-    up to 128 works at every N tried and K of 192 and 256 fail**, in two
-    different ways. `N = 160` is also `G = 20`, well past the `G = 11` the slot
-    form was read at, so that part generalises far.
-  ⚠ K = 192 was never a fault. Rounds 300 and 301 recorded it as "writes every
-    channel and computes none, the first non-power-of-two K"; it was the packer's
-    K whitelist, which did not contain 192, so it returned without writing a
-    byte, while `--map` lit anyway because it writes raw bytes. With the guard
-    widened to multiples of 32 it is 64 of 64.
-  ⚠ K = 256 is a count fault, and it is now exact: the channel count is `N/2`
-    and `SIZE_E_2`'s additive 8 writes garbage on top, so `wrote` is `N/2 + 8`
-    and `exact` is `N/2`. At `N = 16` those coincide with `N`, which is why
-    `N = 16` alone comes back 16 of 16 there. K = 224 is full, so 256 is where
-    it stops.
-  charsiu_bench has an int4 path now, with the GB/s column counting the weight
-    bytes a shape really moves, `k*n/2` for int4 against `k*n` for int8.
-```
-
-### "Half the k" is not half the weights
-
-Only half the k reach any channel, but that is a statement about the reduction
-depth and **not** about wasted weights. Every nibble the packer writes is
-fetched: a channel gets two eight byte groups, 32 nibbles, and it is fed exactly
-32 k, one per nibble. So a job declared at `K` computes a correct `K/2` deep
-reduction, and what is wasted is buffer *space*, 2048 bytes allocated to hold
-1024 bytes of live nibbles.
-
-That also puts the two working configurations on a comparable footing:
-
-```
-shipped arithmetic, 0x3020 = 111    64 channels x 32 k  = 2048 MACs a job
-                                    exact, and it runs today
-PROC_PRECISION = 0                  40 channels x 64 k  = 2560 MACs a job
-                                    but out = 127 * w unless the activation is
-                                    one byte wide, and that halves the k back
-```
-
-The second is the larger job if its arithmetic can be made to hold, which is
-what the `A8_STRIDE1` thread was chasing when it found `out = a * w` on one of
-the two paired k.
-
-### What is still open on int4
-
-**The weights are read.** With no live nibble anywhere the output comes back all zero,
-and the sign of the result follows the sign of the nibble: 7 gives +5112, and 15, which
-is -1 as a signed nibble, gives -4896.
-
-⚠ This section used to end here saying the magnitude did not follow, because changing
-the nibble from 7 to 3 scales the output by 0.930 where 3/7 was expected. That is
-answered by the section above and the text was left behind when the answer arrived.
-The output is linear in log2 of its inputs, so 0.930 is what the formula predicts and
-no line was ever going to fit two points of it. The coefficient buffer being unread on
-this path is consistent rather than a defect, since `w4a16` does not requantise.
-
-**What is genuinely left is the layout.** `k = 16` and above is no longer the
-open part; rounds 262 to 265 read it. What replaced it is narrower and sharper.
-
-Two geometries close on their own data, 40 of 40 points at `N = 16` and 48 of 48
-at `N = 64`, with `nib` 0 for the low nibble and 1 for the high:
-
-```
-N=16, B<128:  word = B/8
-              k    = 16*((B/8)&1) + 2*(B%8) + nib
-
-N=64:         G = B/128, b = B%128,  b >= 64 fetches nothing
-              word = b/8 + 8*(G&1) + 16*(G>>2)
-              k    = 16*((b/8)&1) + 32*((G>>1)&1) + nib
-```
-
-Written as bits, one address bit does two jobs and one does none:
-
-```
-k    bit 0   = the nibble        word bit 0    = B bit 3     <- the same bit
-k    bits1-3 = B bits 0,1,2      word bits 1,2 = B bits 4,5
-k    bit 4   = B bit 3           word bit 3    = B bit 7
-k    bit 5   = B bit 8           word bits 4+  = B bits 9+
-                                 B bit 6 must be 0 at N = 64
-```
-
-So exactly half the `(channel, k)` pairs have no nibble feeding them, at both
-`N`. `0x1020` says 32 weight bytes per channel and only 16 of them are ever
-reached. That is one folded address bit, not a shape, and it is the whole of
-what stands between here and an int4 projection.
-
-Round 265 also settled what an output element is, which every reading before it
-had guessed at: **four byte signed little endian, one per channel**. A live
-nibble of 7 gives `00001bbc`, which is `+7100` and lights two bytes; a nibble of
-15 gives `ffffe570`, which is `-6800` and lights four. The two arms agree on
-every word and every k across 48 points.
-
-### The whole weight map, read densely
-
-`--map` needs one submit per byte where `--kpair` needs sixty four to sweep k,
-and a nibble pairing with exactly one k is now measured at over a hundred
-points, which retires the summation objection `--map` was written under. That
-buys the whole buffer at a stride of 8 at three geometries in one boot:
-
-```
-N=64                         N=32                N=16
-   0: w0-7    512: w16-23       0: w0-7             0: w0-7
-  64: .       576: .           64: .               64: w8-15
- 128: w8-15   640: w24-31     128: w8-15          128: .
- 192: .       704: w32-39     192: w16-23         192: .
- 256: w0-7'   768: w16-23'    256: w0-7'          256: w0-7'
- 320: .       832: .          320: .              320: w8-15'
- 384: w8-15'  896: w24-31'    384: w8-15'         384: .
- 448: .       960: w32-39'    448: w16-23'        448: .
-             1024+: dark      512+: dark          (' is the same channel, k+32)
-```
-
-Every word that gets written gets lit: 16 of 16, 24 of 24, 40 of 40. Nothing
-writes a channel it does not compute.
-
-Two numbers come out of that map and they are **different problems**:
-
-```
-channels reached = 8 * (N/16 + 1)    16, 24, 32, 40 and 72 at N of 16, 32,
-                                     48, 64 and 128. 48 and 128 were derived
-                                     from the other three, not fitted to.
-k per channel    = 32                two eight byte groups, at B and B+256,
-                                     sixteen nibbles each, while K is 64
-```
-
-The second is not the first in disguise. Every channel that exists at all gets
-exactly half of its k, whatever `N` is. And `N/8` groups of eight would be every
-channel, so the count is halved and then incremented.
-
-### int8 is the oracle, and it computes everything it is asked for
-
-The same probe, the same `K`, the same `N`, one flag:
-
-```
-int8:  channel = 32*(B/2048) + (B/32) mod 32
-       k       = B mod 32 + 32*((B/1024) mod 2)
-       64 bytes a channel, 64 k, no dead byte anywhere, highest byte written N-1
-```
-
-The two paths are the **same shape with int4's runs half as long**. int8 reads
-32 bytes a channel a pass and takes two passes to cover 64 k. int4 reads 8 and
-takes two, so it covers 32. To cover 64 it would have to read 16.
-
-Diffing the two register streams at the same geometry leaves **fourteen**
-registers, of which three are the requant and settled and one is the precision
-itself:
-
-```
-CNA 0x100c  0 -> 0x20600120        DPU 0x4030  ..0710 -> ..0310
-CNA 0x101c  0x1000 -> 0x800        DPU 0x4038  0x00120080 -> 0x53
-CNA 0x1020  64 -> 32               DPU 0x4044  1 -> 2
-CNA 0x1028  surf 1 -> 2            DPU 0x4050  0x80011111 -> 0x00023333
-CNA 0x1030  128<<16 -> 32<<16      DPU 0x4010  0 -> 0xa0000002
-CNA 0x103c, 0x1044  surf 1 -> 2    DPU 0x40ac, 0x40b0, 0x40b4  requant
-```
-
-`--stream` dumps that list from the tool and `CHARSIU_OVERRIDE` sets any single
-register from the environment, so the ten that are left can be flipped to their
-int8 value one at a time without a rebuild.
-
-Nine of those ten arms came back clean and **not one moved either number**:
-
-```
-0x1020 0x1028 0x1030 0x103c 0x1044   five CNA size registers, excluded
-0x4030 0x4044                        excluded
-0x4038 0x4050                        both HANG when set to int8's value
-0x100c                               wrote stays 40, every byte goes dark
-```
-
-`0x1020` set to int8's 64 and `0x1030` to int8's 128 left the eight byte run
-exactly where it was, so bytes per kernel is not what bounds the fetch.
-
-**The last line is the structural result.** The write extent does not depend on
-the weights being read at all, so the two shortfalls are in different units:
-
-```
-k per channel is 32 and not 64      CNA. 0x100C CONV_CON1 is the only CNA
-                                    register that did anything.
-channels is 8*(N/16+1) not N/8      DPU, since no CNA arm touched it.
-```
-
-`CONV_CON1` reads `CONV_MODE 0, IN_PRECISION 2, PROC_PRECISION 2, RESERVED_1
-48, GROUP_LINE_OFF 1`, and a field called RESERVED holding 48 is the same shape
-round 260 found on `0x4050`, where four of five fields were load bearing and two
-of them were in the reserved range.
-
-### Two fields that move the two numbers
-
-Sweeping those two registers by field found one each:
-
-```
-CNA 0x100C  RESERVED_1     48 -> 0    one group a channel becomes TWO
-            PROC_PRECISION  2 -> 0    the same, from a different field
-DPU 0x4050  SIZE_E_2        3 -> 1    channels 40 -> 32
-```
-
-Sixteen weight bytes a channel a pass instead of eight is 32 nibbles, and with
-the pass at `B+256` that is 64 k, exactly the half that was missing. Both arms
-left the channel count at 40, so the split holds.
-
-That was a word pattern, not a k measurement, and `--kpair` separated the two
-arms in one entry. **They are not the same thing.**
-
-```
-RESERVED_1 = 0        byte 0 low k0, byte 0 HIGH ALSO k0 with a different
-                      value, byte 8 k8, k = byte mod 32
-                      the byte is read as ONE weight. This does not fix int4,
-                      it turns it off.
-
-PROC_PRECISION = 0    byte 0 low k0 high k1, byte 8 low k16 high k17,
-                      byte 16 -> w1 k0
-                      nibble packing intact, 32 k a pass. This one is real.
-```
-
-The derived prediction was byte 8 at k 16 and the second arm did exactly that,
-four of six points. The other two moved meaning: bytes 256 and 264 used to be
-the same channel at `k+32` and are now channel 8 at k 0 and 16, so where k 32
-through 63 lives is open again.
-
-**`PROC_PRECISION = 0` closes the k side completely.** The full sweep under it:
-
-```
-   0- 127: w0..w7      512- 639: w0..w7  k+32      1024-1151: w16..w23
- 128- 255: dark        640- 767: dark              1280-1407: w24..w31
- 256- 383: w8..w15     768- 895: w8..w15 k+32      1408-1535: w32..w39
- 384- 511: dark        896-1023: dark              1536-2047: the k+32 half
-```
-
-Four groups of eight bytes a channel: 32 bytes, 64 nibbles, **64 k**. `0x1020`
-says 32 bytes a kernel and 32 is now what gets fetched. The dark 768 bytes are
-exactly 24 channels times 32, so the buffer is the right size and 24 channels'
-worth is never read. What is left is only the channel count.
-
-The channel count scales with `M`: 40 words at `M = 1` and 80 at `M = 2`, so it
-is `M * (N/2 + 8)` and the halving is not about `M`.
-
-### The two arithmetic modes, measured
-
-`PROC_PRECISION` is the arithmetic mode and the two are different operations,
-not a working one and a broken one. Sweeping the live nibble under both:
-
-```
-nibble        1    2    3    4    5    7    15
-shipped      60   64   66   68   69   71   -68
-PP = 0      127  254  381  508  635  889  -127
-```
-
-The shipped column is the formula above, exact at all seven, once the activation
-is read as the **raw 16 bit slot** rather than as an fp16 of the value. `--map`
-packs an int8 into the high byte of a 2 byte slot, so `abits` is 256 for `a = 1`:
-
-```
-out = ((int16)fp16bits(w) * (int16)abits) >> 16
-w=1  15360*256>>16 = 60      w=5  17664*256>>16 = 69
-w=2  16384*256>>16 = 64      w=7  18176*256>>16 = 71
-w=3  16896*256>>16 = 66      w=15 (signed -1) -17408*256>>16 = -68
-w=4  17408*256>>16 = 68      and the high nibble, abits 512, is 2x each
-```
-
-`PP = 0` is `127 * w` with `w` a signed nibble, linear and exact at all seven.
-With a **one byte activation** it becomes the real thing. Sweeping the one hot
-amplitude against a nibble of 7:
-
-```
-amp     1    2     5    10   100
-out     7   14    35    70   700        out = a * w, exact at five of five
-```
-
-A plain integer multiply, no fp16 bit pattern and no logarithm, which is the
-operation an int4 matmul wants. The paired second k still returns `127 * w`
-whatever the amplitude, so it reads something that is not in the activation
-buffer, and that is a separate defect.
-
-### The channel count has a source, and it is 0x3020
-
-`CORE 0x3020` set to 127, claiming 128 channels at `N = 64`, gives 72 written.
-`0x402c` and `0x5014` carry the same `n-1` and are inert, `CONV_CON2` is inert,
-`SIZE_E_0` is inert or hangs, `CBUF_CON0` turns the fetch dark without moving the
-count:
-
-```
-channels = ceil((v+1)/2) + extra(SIZE_E_2)     v = 0x3020, extra 0, 0, 4, 8
-
-v =  31 -> 24    v =  79 -> 48    v = 111 -> 64
-v =  47 -> 32    v =  95 -> 56    v = 127 -> 72
-```
-
-Six for six, derived from two measured points rather than fitted to six. **So
-`0x3020 = 111` writes all 64 channels at `N = 64`**, and the channel shortfall
-is not a wall, it is a value.
-
-**Written and reachable.** The full sweep at `v = 111`: 256 groups, 128 live, 64
-distinct words lit, range 0 to 63, exactly the derived prediction. The channel
-shortfall is solved.
-
-So without any other change that configuration is, today:
-
-```
-64 channels, each fed by 16 weight bytes = 32 nibbles = 32 k
-the SHIPPED arithmetic, whose formula is known exactly and exact at seven points
-```
-
-Bytes per channel is `K/4`, measured at two `K`: 8 at `K = 32` and 16 at
-`K = 64`. So half the k is missing at **every** `K` and it is not a fixed cap.
-`K = 16` lights nothing at all.
-
-### The fetched half is a known half
-
-With `0x3020 = 111` at `N = 64, K = 64`, every channel gets 16 bytes in two runs,
-its own and one 256 bytes later, which `--kpair` reads as k 0..15 and k 32..47:
-
-```
-fetched  <=>  (k mod 32) < 16
-```
-
-A weight the hardware never reads is only wrong if it matters. **Zero the ones
-it does not read and the partial sum it computes is the full sum**, so a CPU
-reference and the hardware answer the same question. That is a real 32 deep int4
-matmul on all 64 channels with the arithmetic already known exact, at the cost of
-half the weight buffer, and it needs no packer change and no `CONV_CON1` change.
-`CHARSIU_W4_HALFK` does the zeroing.
-
-⚠ **Round 278 ran that comparison and it was void, for two reasons that are both
-instrument.** The matmul harness read the output as **bytes**, and the giveaway
-is in its own log: every group of four reads `X Y 255 255` or `X Y 0 0`, which is
-a little endian int32 pulled apart, `159 229 255 255` being `0xFFFFE59F`. And
-`cpu_reference()` returns a requantised int8 where w4a16 returns a raw
-accumulator, so the two were never in the same domain and the round could not
-have passed whatever the hardware did.
-
-That is the **fourth** place in this repo to read a four byte output as bytes,
-after `--kpair`, `--map` and the matmul. Every one was correct for int8, which is
-how each passed its int8 validation and kept the bug; 278's int8 arm was 64 of 64
-byte exact in the same log.
-
-⚠ **Where the shift goes has never been measured.** Every point behind the
-formula had one live nibble, and with a single term a shift per element and a
-shift on the sum are the same number. A dense buffer is the first thing that can
-tell them apart.
-
-### Why every int4 matmul arm returned the same numbers
-
-Channels 0 to 7 came back as -6753, -4633, -7670, -9732, -3554, -12306, -706 and
--8100 in every arm of two rounds: `HALFK` on and off, `0x3020 = 111` and not, and
-`N` of 64, 32 and 16. The output did not move by one count while `HALFK` zeroed
-2048 of 4096 weights.
-
-Not the hardware. `charsiu_pack_weights` **refuses to place k >= 16 for int4**,
-deliberately since round 173, and `HALFK` only ever touched k the packer never
-wrote, so both buffers were byte identical. The `N` invariance falls out of the
-same thing: the row it used, `(n/32)*512 + (n%32)*8`, has no `N` in it, and it
-came from `--map` before the byte width defect was fixed, so it was the stale map
-as well as an incomplete one.
-
-### The layout the packer writes now
-
-```
-ADDRESS   c 0..7  -> 0      c 16..23 -> 512    c 32..39 -> 1024   c 48..55 -> 1536
-          c 8..15 -> 128    c 24..31 -> 640    c 40..47 -> 1152   c 56..63 -> 1600
-          plus a second eight byte group 256 bytes later
-
-k         an EVEN channel is fed k 0..15 and 32..47
-          an ODD  channel is fed k 16..31 and 48..63
-```
-
-A table and not a formula on purpose: seven of the eight steps are 128 or 384 and
-the last is 64, so a closed form would be fitted to one point. The parity rule is
-read off byte 0 pairing with k 0 on channel 0, byte 8 with k 16 on channel 1 and
-byte 16 with k 0 on channel 2, and confirmed independently at `K = 32`.
-
-⚠ So the `HALFK` mask in rounds 278 and 279 was **backwards on half the
-channels**: both zeroed `(k mod 32) >= 16` everywhere, which is what an even
-channel is fed.
-
-⚠ And the address map was read at `0x3020 = 111`. charsiu emits `n - 1` there,
-which gives 40 channels, so this layout describes the hardware only when that
-register is overridden.
-
-Five rounds of sweeping and the answer was in a register excluded for being
-**identical on both paths**. The sweep list came from diffing int8's stream
-against int4's, and a register that is the same in both cannot cause the
-difference, but it can be the bound one path reaches and the other does not.
-
-⚠ **The two fixes do not combine, and the buffer explanation for it was wrong.**
-The prediction was that `v = 111` would not fight, since 64 channels times 32
-bytes is exactly the 2048 the buffer holds. It hung: 235 groups swept and 4
-alive. The other route to 64, `v = 127` with `SIZE_E_2 = 1`, drops to 32 under
-the k fix rather than hanging. Three points, no explanation:
-
-```
-v = 63,  extra 8, k fix  ->  40      unchanged from without the fix
-v = 127, extra 0, k fix  ->  32      halved from 64
-v = 71, 79, 87, 95, 103, 111  ->  all hang
-```
-
-`2^n - 1` looked like the rule on eight points and is **refuted**: 15 and 31 are
-`2^n - 1` and both hang. The predicate that fits all twelve is `(v+1) mod 64 ==
-0`. And under the k fix `v` stops driving the count entirely, since 63, 127 and
-255 all give 40 and only `SIZE_E_2` moves it, so the k fix pins the channels at
-32 plus `SIZE_E_2`'s term. **The two halves cannot be had together.**
-
-### The activation packing
-
-It was the packing, at least partly. charsiu packs the activation as a 2 byte
-fp16 whenever the weight is int4, int8 value in the high byte and the low byte
-zero. Switching to a 1 byte element with `CHARSIU_A8_STRIDE1` makes a nibble
-pair with **two** k, and the two do different things:
-
-```
-byte 0 low  ->  k0 = 700 = 100 * 7    the one hot amplitude times the nibble.
-                                      a * w, exactly.
-            ->  k1 = 889 = 127 * 7    the constant again.
-```
-
-So the mode can multiply by the activation. Whatever the 127 is, it is not "this
-mode ignores the activation", because one of the two k did not ignore it.
-
-⚠ It costs half the k back: 80 live groups where `PROC_PRECISION = 0` alone gave
-160, and byte 512 goes dark.
-
-`SIZE_E_2` swept across all eight values gives `0 -> 32, 1 -> 32, 2 -> 36,
-3 -> 40`, and 4 upward hang: an additive 0, 0, 4, 8 on top of `N/2`, so it is
-the `+1` in `8*(N/16 + 1)`. **No value gives 64.** **It is not the halving**: int8 runs `SIZE_E_2 = 1` and gets all
-64 channels where int4 runs the same value and gets 32. `RGP_CNTER`, `SIZE_E_1`
-and `OD_BYPASS` are inert, `RESERVED_0` hangs, `0x4038`'s `NOTCH_ADDR_0` hangs
-and `NOTCH_ADDR_1` is inert, and `0x4058` is inert in both its fields, which
-settles that the register naming the output channel count is not what bounds
-it.
-
-### The hardware writes fewer channels than the job declares
-
-Filling the output buffer with a sentinel rather than zero, and reading the
-whole of it, says how far the write actually reaches. It is not `N`:
-
-```
-N = 16   ->  16 words written        N = 64   ->  40 words written
-N = 32   ->  24 words written        which is N/2 + 8
-```
-
-Three geometries, and the fit is exact. At `N = 16` it happens to equal `N`,
-which is why every closed result in this file is at `N = 16`. At `N = 32` eight
-declared channels are never written and at `N = 64` it is twenty four. This is
-an output side fact and none of the weight address arithmetic above is needed to
-state it.
-
-### The defect this project put there, and its fix
-
-**A w4a16 job used to leave the NPU unable to start the next one.** The same int8 binary, the
-same register stream, the same shape and the same boot: byte exact when it runs first,
-`NPU job timed out` when it runs after w4a16 jobs, with the output still holding its
-0xa5 sentinel and an `rk_iommu` reset error beside it. Mesa's own models run fine
-afterwards, so the driver recovers and nothing is permanently broken.
-
-It was not the stream: int8's register stream is byte identical before and after the
-w4a16 port, at both shapes, checked offline. It took a one job repro to bisect, and two
-earlier attempts were killed by their own written controls first, once by a recovery
-step that was itself broken and once by a probe whose "zero jobs" row had five jobs
-behind it. Both are recorded in the board scripts rather than quietly fixed, because
-those controls are the only reason the wrong answers were not published.
-
-**It is the RDMA coefficient fetch group, and within it `0x5034` and `0x5044`
-each on their own.** One w4a16 job per mask, judged by a separate process running
-the int8 path that has been byte exact since round 164:
-
-```
-mask 0xf  all four     int8 TIMED OUT        mask 2  0x5034 only  int8 TIMED OUT
-mask 0    none         int8 byte exact       mask 4  0x5040 only  int8 byte exact
-mask 1    0x501c only  int8 byte exact       mask 8  0x5044 only  int8 TIMED OUT
-```
-
-That group is out of the default stream now. It buys nothing: the byte map with it
-off and the byte map with it forced on are identical line for line. It stays reachable
-one bit per register through `CHARSIU_W4_RDMA_MASK`, because fetching the coefficient
-surface will have to start there.
-
-## On the name
-
-Char siu is Cantonese barbecue pork, eaten across Guangdong, Hong Kong and Malaysia. A kiln is
-the oven it is roasted in. [kiln](https://github.com/gahingwoo/kiln) runs the
-**vendor** LLM stack on a mainline kernel and is that oven here: it is what makes a
-vendor `.rkllm` readable, what a live dispatch is captured with, and the number this
-project has to beat. charsiu is what comes out of it and what you actually eat, an
-open runtime with nothing closed left in the path.
-
-## The three repositories
-
-| repo | what it is |
-|---|---|
-| [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu) | the open RK3576 NPU driver and Mesa work: `rocket` upstream, and where every register name used here was established |
-| [kiln](https://github.com/gahingwoo/kiln) | the vendor RKLLM/RKNN stack on a mainline kernel. The measuring stick, and the capture harness |
-| **charsiu** | this one: an open LLM runtime on top of the open driver |
-
-## Why this exists, and why it is not a port
-
-Two open stacks already drive a Rockchip NPU for LLM work, both on the **RK3588**:
-[rocket-userspace](https://github.com/gregordinary/rocket-userspace) with
-[ggml-rocket](https://github.com/gregordinary/ggml-rocket) on the mainline `rocket`
-driver, and [iwagumi](https://github.com/fukumori/iwagumi) on the vendor `rknpu` ioctl.
-Their measurements are worth reading before starting anything here, and they are
-collected in [rockchip-npu-notes](https://github.com/gregordinary/rockchip-npu-notes).
-
-Their central finding is that **the NPU is a prefill engine and decode belongs on the
-CPU**: a single-row matmul is about 82 times slower on the NPU than the batched shape
-it was built for, a feature height below four computes wrong output at all, and
-quantisation does not speed prefill up because the pipeline sits at a dispatch and DMA
-floor rather than a MAC one.
-
-**On the RK3576 the vendor does the thing that finding says not to do.** Reading the
-register command streams out of a vendor `.rkllm` for Llama-3.2-1B, 3752 of its
-convolution dispatches are `M = 1`, one row and one output pixel, and they are the
-model's own projections. The vendor ships that and it generates about 13 tokens a
-second on this board.
-
-So the question this project starts from is not "how do we port the RK3588 result"
-but **"what does the RK3576 actually do, and can an open runtime match it"**. The
-RK3576 is not the same machine: 1 MiB of CBUF against the RK3588's 384 KiB, two cores
-rather than three, a 16 bit task number, and a different weight tile stride. A
-negative result measured on the other chip is a hypothesis here, not a conclusion.
-
-### Measured on hardware, 2026-08-14
-
-Through the open driver and Mesa's own delegate, on a ROCK 4D, single 1x1
-convolutions at an LLM projection's shape:
-
-| shape | M | result |
-|---|---|---|
-| 512 to 1024 | 1 | 1024 of 1024 channels exact, 146 distinct values against the CPU's 146 |
-| 512 to 1024 | 2 | 1024 of 1024, 357 of them computed |
-| 512 to 1024 | 3 | 1024 of 1024, 416 computed |
-| 512 to 1024 | 4 | 1024 of 1024, 465 computed |
-| 512 to 1024 | 8 | 1024 of 1024, 518 computed |
-| 512 to 512 | 1 | 512 of 512 |
-| 256 to 1024 | 1 | 1024 of 1024 |
-
-**Heights of one, two and three are exact.** The RK3588 constraint is not on this
-silicon, which is what the vendor dispatching M = 1, 2 and 3 in its own `.rkllm`
-already implied. A one row surface has nothing to vary within a channel, so the
-evidence at M = 1 is the per channel match count and the distinct count; M = 2 and
-up carry the computed confirmation.
-
-What this does **not** yet say is anything about speed, or about int4. Both are the
-next board round.
-
-### What charsiu's own M > 1 turned out to be
-
-**Solved, and there was never a hardware wall.** Two defects of ours, both invisible at
-the only width they had ever been exercised at:
-
-- `0x40b8` was the literal `3` where it must be `3 * rows`. It was fitted at M = 1,
-  which is the one width at which a value that follows the row count cannot show that
-  it does.
-- the accumulator's read order was unknown. It is `charsiu_acc_index()`: `P = m / 2`,
-  super groups of 32, rows pairing P at a time, four word runs alternating. Confirmed
-  at m = 8 and N = 2048, both widths it was not fitted on.
-
-int8 batches correctly from m = 2 to 32 and a batched prompt is 2.94x on the board.
-**w4a16 computes exactly one row with M on the HEIGHT axis**: fed the same activation
-twice, row 1 matches row 0 in 1 of 2048; the DPU and RDMA blocks are identical to a
-stream that does two rows; every CNA word that differs was put back one at a time.
-
-⚠ That was called silicon rather than a literal, and it is not. The vendor's own
-Llama-3.2-1B file carries 3328 int4 streams and 2816 of them are batched, at M up to
-80 -- one row high and M PIXELS WIDE, which is why anything reading the row count sees
-M = 1 and concludes there is nothing to copy. Their fp16 attention does use the height
-axis, all 4940 streams of it, which is what made the two look like one. charsiu's
-width axis form is now two registers from theirs at M = 32 and 64, fewer than at M = 1
-where this board is known to be right; `tests/board_w4_axis.sh` is the round that has
-not happened yet.
-
-The same file settles something about the int8 path too. Its 40 int8 streams are the
-LM head at M of 1, 32, 64, 96 and 128, and every one of them is **one row high** as
-well -- so the vendor puts M on the width for both weight formats and uses the height
-axis for nothing but attention. This tree's int8 batch, which is the one that works,
-runs on the height and stops being exact at 96. `tests/board_rows_sweep.sh` sweeps
-both axes now, height first as the control. If the width arm reaches 128 then the
-ceiling was the arrangement, on the path that already carries the 2.94x.
-
-**What follows is the record of the search**, kept because the reasoning in it is still
-the reasoning and because most of a fortnight was spent fitting models to the symptom.
-
-charsiu asks the hardware for one row. A batched prefill wants thirty two, where the
-same weight bytes serve thirty two rows instead of one, and at a projection's K this
-tree had never got a correct answer above M = 1.
-
-Four rounds went into fitting an address function to the output, because the values
-came back in the wrong places and that looks like a layout. Against a reference with
-121 distinct values in 128 the fit is unique -- one function, 80 of 80 cells, no misses
--- and then it predicts 132 words at M = 4 where the board writes 148. A model that
-fits one width perfectly and misses the next is a model of that width.
-
-Counting instead of fitting says what it actually is:
-
-```
-N=64 m=2   92 of 128       N=64 m=4  148 of 256      N=64 m=8  260 of 512
-N=32 m=2   52 of  64       N=16 m=2   32 of  32
-```
-
-`written = N + inc * (m - 1)`, with `inc = N/4 + 12` through all three widths. **The
-first row gets all N words. Every row after it gets N/4 + 12, and needs N.** They meet
-at sixteen, and at sixteen nothing is missing -- every value present, none of them
-where a contiguous read expects it.
-
-So it is not a stride. A stride puts values in the wrong place; this leaves them
-uncomputed, and "one row whole and the rest a fixed share" is a budget being divided.
-
-**The budget is not the CBUF, and the arithmetic settles that without a board.** An
-LLM matmul reaches the encoder one column wide, `input_height = m`,
-`input_channels = K`, so `entries_per_slice` is 16 at K = 1024. The RK3576 CBUF is 16
-banks of 512 entries and Mesa's own budget is five banks usable, ten total: at m = 8
-that is **128 entries against 2560**. Mesa's over-budget test needs m > 320, its split
-needs m > 640, and its row-window path needs a surface at least 112 wide. Mesa does
-not split these shapes either, so not splitting is not the difference.
-
-**It is not `surf` either, and the control said so.** The reading before that was
-that every shape ever correct above one row has `charsiu_entries_per_row() == 1`, so
-the axis is entries per row rather than m. The rule was written down before the run:
-K = 48 and K = 64 are surf 1 and have to be exact at m = 2 and m = 4, or the axis is
-not surf. They were not.
-
-```
-     K  surf   m   exact of      all values present
-    48     1   2       8 of 128       99 of 128
-    64     1   2       8 of 128       97 of 128
-   128     2   2       8 of 128       93 of 128
-   256     4   2       8 of 128       92 of 128
-  1024    16   2       8 of 128       95 of 128
-```
-
-Flat from surf 1 to surf 16, **8 words exact at m = 2 and 8 at m = 4 at every K**. The
-`N + (N/4 + 12)(m - 1)` budget above fitted one K and does not survive the rest.
-
-**What the record was comparing is two different output paths.** M = 224 and M = 3136,
-the rows in the table near the top of this file, were measured by `charsiu_matmul`,
-which takes the requantised **int8** output and reads it as `[n/atom][m][n%atom]` with
-a 16 byte atom. Every m > 1 failure was measured by `npu_gemm_test`, which sets
-`acc_out = 1` for the **raw int32 accumulator** and reads it flat. Those are not the
-same experiment, and the runtime's decode path uses the accumulator, so the layout
-that matters above one row has never been established.
-
-⚠ The obvious guess is that the accumulator mirrors the same surface with a four word
-atom. It predicts 8 exact at m = 2, which is what the board wrote, and 16 at m = 4,
-where the board wrote 8. Right at one width and wrong at the next is what the last
-four rounds kept producing, so it is recorded and not acted on.
-
-That was right, and it is what settled it: both probes at one shape in one session,
-`charsiu_matmul` against `npu_gemm_test --surf`, with `CHARSIU_OUT_ROWMAJOR=1` as the
-control that had to fail. The accumulator does not mirror the int8 surface with a four
-word atom. It is `charsiu_acc_index` above, and the reason every earlier fit died at
-the next width is that `0x40b8` was writing a row budget for one row whatever m was --
-so the counting was measuring a truncation, not a layout.
-
-⚠ The test that measured all of this printed the opposite of its own data first: "1 of
-5 widths exact at N=16, the budget reading does not hold", while its own increment line
-three screens up said `at N=16, m=2: wrote 32 of 32`. `check()` compares position by
-position and could not tell a wrong value from a wrong order. It says which now.
-
 ## What runs today
 
-```
-$ charsiu_run models/Llama-3.2-1B-Instruct-Q8_0.gguf -p "The capital of France is" \
-      -n 64 --ignore-eos -c 512 -t 4
- Paris. The Eiffel Tower is located in Paris. The Louvre Museum is also located in
- Paris. The famous painting "The Mona Lisa" is on display at the Louvre Museum. ...
+`charsiu` picks the environment itself: int4 weights, the K slice width chosen per
+model, both cores, and the CPUs held out of deep idle while the NPU is open (see
+below). `CHARSIU_STAGES=1` prints where a token goes, once per half of the run.
 
-[load 138 ms | gen 64 tok in 4008 ms, 15.97 tok/s | peak 2018 MB]
-[first 32 tok 16.84 tok/s, last 32 tok 15.18 tok/s, board 53 -> 51 C, cpu 2208 MHz under load]
-```
+Three things moved decode from 82% of the vendor to parity, each measured on the
+board with a control:
 
-with the hardware taking every projection:
-
-```
-CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=262144
-```
-
-`CHARSIU_STAGES=1` prints where a token goes, and prints it once per half of the run,
-because a table averaged over the whole of it cannot answer a question about how the
-run changed. On a ROCK 4D at 64 tokens:
-
-```
-  stage            first 31   last 33
-  q k v              9.02       9.21
-  o proj             5.42       5.62
-  gate + up         19.87      20.18
-  down              14.72      15.14
-  output head        8.53       8.41
-  attention          1.18       2.94
-  total             60.4       63.3
-```
-
-Five of those rows are the hardware; the fence inside them is 1661 ms of the 1792.
-
-Attention is 1.76 ms of the 2.9 ms between the halves, which is sixty percent of it and
-is what a cost linear in the context looks like. The rest is a fifth of a millisecond
-here and there across the projections -- the KV cache growing into the same DRAM the
-weights are streaming through. Nothing else moved, the board **cooled** 53 C to 51
-across the run, and the A72 held 2208 MHz throughout. So 60.4 ms is 16.6 tok/s and 63.3
-is 15.8, and a remembered 17.1 is a shorter window on the same curve.
-
-### gemma4 costs what a 4.6B model costs, and the head is two fifths of it
-
-Measured on this host, everything on the CPU, 24 tokens:
-
-```
-  Llama-3.2-1B    30.6 ms a token
-  gemma3-1b       30.8
-  gemma-4-E2B     63.8
-```
-
-Twice the time for about twice the weights, which is the model rather than the
-runtime. Per token gemma-4-E2B moves
-
-```
-  projections and the per layer gates  1048 MB   the hardware's
-  per_layer_model_proj, bf16              28     the CPU's, and now vectorised
-  output head, q8_0 and tied             428     the CPU's, because it is not routed
-```
-
-The per layer embedding does what its name says: the 2.35B parameter table is
-looked up one row at a time, so the 1048 MB really is the "2B active" and not
-the 4.6B stored. What is left is the head, and it is **two fifths of the token
-on a CPU that reads at 6.5 GB/s**. At the board's measured rates that is about
-167 ms a token, or 6 tok/s, against Llama-3.2-1B's measured 60.4.
-
-### The output head is routed now, and it was worth 49 ms a token
-
-```
-                    before      after
-  output head       49.81 ms    11.53 ms      44.2% of the token -> 15.6%
-  a token          112.7  ms    73.9  ms
-  generation         8.76 tok/s 13.07 tok/s
-  weights           6.16 GB/s   7.18 GB/s
-```
-
-Same prompt, same tokens, on a ROCK 4D. Staging is also out of the prompt figure
-now, so the same run reads `staging 15081 ms | prompt 6 tok in 829 ms, 7.24 tok/s`
-where it used to charge all fifteen seconds of quantising to prefill and report 0.92.
-
-### Why it was not routed before, which was not what it looked like
-
-The suspect was the coefficient buffer. `charsiu_coef_bytes` used to bound the
-coefficient surface by `k*n`, which makes it four times the weight buffer and
-would put this head at 1210 MB against 151 MB of weights. That bound is a guess
-and its own comment has said so since it was written: the two walls it was sized
-against were tens of KILObytes -- 4.7 KB allocated against 33 KB read, and 1280
-bytes against 20800 -- and nothing has ever measured the read growing with
-`k*n`.
-
-**It was not the coefficient buffer.** The shipped runner has passed
-`CHARSIU_COEF_ELEMS=65536` all along, which puts the same head at 10.5 MB. What
-refused it was `maxn`: the config default was 131072, chosen to clear Llama
-3.2's 128256 vocabulary, and gemma3's is 262144. Raising it is the whole fix, and
-the table above is the result. The runtime clamps the cap to
-the model's own vocabulary anyway, so a wider number costs nothing, and the one
-reason to keep a wide head off -- it used to share one output buffer with every
-other tensor, so all 113 matvecs a token paid for its size -- stopped being true
-when each tensor got its own.
-
-Two things kept that invisible for four board rounds:
-
-- the runtime **declined without saying so**. Every other refusal in npudev
-  whines once per reason; this gate only spoke under `CHARSIU_NPU_VERBOSE`. The
-  three silent paths -- the cap, the tensor slots, and the quantised copy
-  failing to allocate -- now each name the tensor, the reason and the setting.
-- the round that put `CHARSIU_NPU_MAXN=262144` on the command line **did not set
-  it**. `charsiu run` builds its environment from config.ini and hands it to
-  `env NAME=VALUE`, which goes in front of the inherited environment, so the
-  config's 131072 silently won. The config file is the default now and the
-  environment is the override; `charsiu --show` names anything it deferred to.
-
-The staging bar hid the arithmetic too: its denominator is a prediction and its
-heartbeat fires every sixteenth tensor, so it drew `183/183` over a run that
-staged 182. It reconciles against the runtime's own count now.
-
-65536 elements is the default now, because it is what every board round has used;
-`CHARSIU_COEF_ELEMS=0` asks for `k*n`. The bound itself is still unmeasured and
-still worth measuring. `npu_gemm_test K N --coef` walks it downward and stops at
-the first value that is not exact. ⚠ It walks DOWN because under-allocating does not return an error: the
-RDMA reads past the buffer, the IOMMU faults, and the job times out with every
-register correct. The last exact value is the floor; everything below it is
-unexplored rather than known bad.
-
-### gemma3-1b is slower here, and the reason is not the graph
-
-113 ms a token against llama's 60, on the same board. On a host where everything runs
-on the CPU the two are within ten percent of each other, so it is not the model.
-
-`output head 49.8 ms, 44% of the token`. Gemma-3-1B's vocabulary is 262144 against
-Llama-3.2-1B's 128256, and its head is **tied to `token_embd` at q8_0**, so it reads
-**321 MB every token**. It is not routed -- the gate is `n <= CHARSIU_NPU_MAXN` -- so
-that lands on a CPU whose sequential read is about 6.5 GB/s, and 321 MB at 6.5 GB/s is
-49 ms. The arithmetic closes; there is no bug in it.
-
-The rest is size, and part of it is a remainder. gemma3-1b's embedding is 1152 against
-llama's 2048, so its submits carry **1.92 MB against llama's 4.75** for roughly the
-same fixed cost per submit, and the hardware rate falls from 10.82 GB/s to 6.16.
-
-1152 also does not divide the 1024 K slice. `ceil(k / KMAX)` leaves the remainder in a
-slice of its own, so q, k, v, gate and up each split 1024 + 128 and the second slice
-carries a ninth of a slice of work for a whole task's cost -- five extra tasks in every
-one of 26 layers, and 468 slices where 338 would do. Every llama dimension is a power
-of two and divides 1024 exactly, which is why this had never come up.
-`CHARSIU_NPU_KFIT=1` gives the last slice the remainder instead. Ungrouped tensors
-only: a grouped tensor carries one scale per (channel, K group) and a slice spanning
-two groups would apply the first group's scale to both. Off by default. The first
-run of it on the board overran three batched buffers; with that fixed the tokens
-are identical on eight models.
+- **the CPUs are held out of deep idle while the NPU is open.** rk3576's CPU_SLEEP
+  costs 250 us to leave, a token is about 150 calls into the driver, and each call
+  wakes several threads that had gone to sleep for the 300 us the hardware took.
+  charsiu writes a 100 us bound to `/dev/cpu_dma_latency` and keeps it open: +24%
+  on its own, with the sysfs switch as the control. `CHARSIU_NPU_IDLE=1` leaves the
+  CPUs alone.
+- **the kernel keeps the IOMMU domain attached across jobs and handles the
+  completion in the hardirq**, two patches under review in the driver repository,
+  about +4% together.
+- **the batched paths have their ceilings written down.** An int4 batch is one row
+  M pixels wide and the hardware stops computing past 5120 input entries; an int8
+  batch is M rows high and stops past 8192. Both were walked on the board, both are
+  refused above the last exact cell, and the tower chunks its rows under the second.
 
 ### More than one architecture, and two things that were quietly wrong
 
@@ -1721,61 +326,7 @@ charsiu: prompt batched, 64 tokens in chunks of 32
 charsiu: prompt a token at a time (CHARSIU_NO_BATCH_PREFILL)
 ```
 
-qwen3 is the llama graph with the three QKV biases dropped and a norm added on Q and K
--- per head, over one head's head_dim, before rope. It is also the first architecture
-here whose head is not `n_embd / n_head`: Qwen3-0.6B is 16 heads of 128 against an
-embedding of 1024, so attention produces 2048 floats and hands them to `attn_output`,
-and the buffer that held both was sized by `n_embd` alone.
-
-gemma3 adds a sliding window over most of its attention, **two rope bases** -- the
-window layers rotate at 10000 and the full ones at the model's own 1000000, and the
-file carries no key for it -- a second norm on each branch before the residual add, the
-embedding times sqrt(n_embd), GELU, and a fourth chat format whose assistant is spelled
-`model` and which has no system role at all.
-
-gemma4 is the one that needed the most, and almost none of it is the attention.
-gemma-4-E2B is 4.6B parameters of which about two are active, and the mechanism
-that decides which is a **per layer embedding**: a second table that every layer
-gates itself against after its feed forward residual. Around that:
-`feed_forward_length` is an **array**, 6144 for its first fifteen layers and
-12288 after; a window layer's head is **256** where a full layer's is **512**;
-its last twenty layers have no `attn_k` at all and read an earlier layer's KV --
-and gemma4 keeps **two caches, one per kind of attention**, so E2B's first
-shared layer (15, a window layer) reads layer 13 and not layer 14, which is the
-last layer with a KV of its own and is a full one. Pointing it at 14 reads 256
-floats out of a slot written as 512, the residual norms stay between 0.75 and 2
-the whole way down, and the model answers in a different language every token.
-Its attention scale is 1.0 rather than 1/sqrt(head), it RMS normalises V with no
-gain at all, and one of its tensors is bf16.
-
-Two bugs found on the way, both of which produced **fluent English** rather than
-anything that looks like a fault:
-
-**The RoPE pairing.** There are two, and no gguf key says which one a file wants;
-llama.cpp carries it as a switch over the architecture enum. llama and smollm3 are the
-permuted, interleaved ones. qwen2, qwen3, phi3 and every gemma are not. charsiu had only
-the interleaved form and applied it to all of them. Asked for the capital of France,
-Qwen2.5-0.5B answered *"a country in the world. The capital of the world."* before and
-*"Paris. It is the largest city in France"* after; Phi-3.5-mini answered *"the most
-important city in the country"* and then *"Paris."* Llama is unchanged, which is the
-control.
-
-**The SentencePiece tokenizer.** charsiu segmented with a Viterbi over the piece scores,
-which is the unigram objective and is not what a gguf means -- llama.cpp does a greedy
-bigram merge. The two agree only when the scores really are log probabilities. Gemma
-stores what is effectively minus a rank: `▁The` scores -175 while `▁T` and `he` score
--64 and -5, so the additive objective prefers the two small pieces by more than a
-hundred and the prompt segments as `▁T | he | ▁c | ap | it | al`.
-
-A third, which is neither: **a tensor that is not found is simply not used.**
-Three of gemma4's per layer names are SHORTER than the model wide ones they
-belong to -- `per_layer_token_embd` and `per_layer_model_proj` are top level,
-but a layer's three are `blk.N.inp_gate`, `blk.N.proj` and `blk.N.post_norm`.
-Guessing `per_layer_*` found nothing three times, so the whole per layer path
-was skipped, and the model loaded, ran, answered and was missing the half of
-itself its name is about.
-
-`tests/arch_sanity.sh` catches both. It asks every gguf in a directory one factual
+`tests/arch_sanity.sh` asks every gguf in a directory one factual
 question and reports the ones that miss it -- no llama.cpp build, no f32 copy -- and it
 makes a second pass with `CHARSIU_STAGES=1`, because a crash that needs an environment
 variable is still a crash and one of them cost four board rounds.
@@ -1793,11 +344,7 @@ the m > 1 matmul, so the tower is where the batched path pays most. That also se
 the format: **int8**, because w4a16 computes one row whatever it is asked for and an
 int4 tower would dispatch those patches one at a time.
 
-Every tensor name here was a guess -- llama.cpp's clip naming as we read it -- so the
-loader was written to be **loud** before it was written to be right: it binds what it
-can and reports what it could not, by name, in the order it wanted them. Pointed at
-SmolVLM-256M's real mmproj it printed one missing name out of about two hundred, and
-the file then corrected two things:
+Every tensor name was a guess until a real file corrected two of them:
 
 - ⚠ **`ffn_up` and `ffn_down` are backwards in a vision tower.** `ffn_down.weight` is
   `(768, 3072)` -- the FIRST matmul -- and `ffn_up` is `(3072, 768)`, the opposite of
@@ -1850,24 +397,6 @@ from attention. A throttle is a gap wider than that alongside a temperature that
 climbed, which is why the temperature is printed next to the halves and not somewhere
 else.
 
-### The parts that are not the hardware
-
-Each of these was a board round with a control that could fail, and each is in
-`board-logs/` in the driver repository:
-
-| | before | after |
-|---|---|---|
-| weight packing into the NPU's layout | 8.5 ms a token | 2.8 |
-| summing the K slices | 8.6 | 3.5 |
-| the activation quantised for consumers that never read it | 8.1 | 0.01 |
-| attention, at 384 tokens | 37.9 | 16.2 |
-
-The last one is two changes. Four query heads share every key/value row in this
-model, and the loop was reading each row four times; and the cache was laid out
-`[layer][position][head]` while attention walks one head across every position.
-Neither changes a number (the tokens are byte identical either way) and both
-were measured against a control that put the old behaviour back.
-
 ## The instrument
 
 `tools/rkllm_regcmd.py` reads the NPU register command streams straight out of a
@@ -1905,10 +434,52 @@ The rest of what the file says is in [docs/vendor-dispatch.md](docs/vendor-dispa
 - **Out**: no vendor `librkllmrt` or `librknnrt` in the execution path, and no claim
   about any SoC this has not been run on.
 - **Honest about performance**: the target is the vendor's own number on the same
-  board and model, and it is met. **15.91 tok/s at int4 and 64 tokens against the
-  vendor's roughly 13**, on the same ROCK 4D and the same Llama-3.2-1B. Every number
-  in this file is measured; where one is projected it says so and gives the
-  arithmetic.
+  board and model. Decode meets it; prefill does not yet, and the table at the top
+  says by how much. Every number in this file is measured on the board.
+
+## On the name
+
+Char siu is Cantonese barbecue pork, eaten across Guangdong, Hong Kong and Malaysia. A kiln is
+the oven it is roasted in. [kiln](https://github.com/gahingwoo/kiln) runs the
+**vendor** LLM stack on a mainline kernel and is that oven here: it is what makes a
+vendor `.rkllm` readable, what a live dispatch is captured with, and the number this
+project has to beat. charsiu is what comes out of it and what you actually eat, an
+open runtime with nothing closed left in the path.
+
+## The three repositories
+
+| repo | what it is |
+|---|---|
+| [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu) | the open RK3576 NPU driver and Mesa work: `rocket` upstream, and where every register name used here was established |
+| [kiln](https://github.com/gahingwoo/kiln) | the vendor RKLLM/RKNN stack on a mainline kernel. The measuring stick, and the capture harness |
+| **charsiu** | this one: an open LLM runtime on top of the open driver |
+
+## Why this exists, and why it is not a port
+
+Two open stacks already drive a Rockchip NPU for LLM work, both on the **RK3588**:
+[rocket-userspace](https://github.com/gregordinary/rocket-userspace) with
+[ggml-rocket](https://github.com/gregordinary/ggml-rocket) on the mainline `rocket`
+driver, and [iwagumi](https://github.com/fukumori/iwagumi) on the vendor `rknpu` ioctl.
+Their measurements are worth reading before starting anything here, and they are
+collected in [rockchip-npu-notes](https://github.com/gregordinary/rockchip-npu-notes).
+
+Their central finding is that **the NPU is a prefill engine and decode belongs on the
+CPU**: a single-row matmul is about 82 times slower on the NPU than the batched shape
+it was built for, a feature height below four computes wrong output at all, and
+quantisation does not speed prefill up because the pipeline sits at a dispatch and DMA
+floor rather than a MAC one.
+
+**On the RK3576 the vendor does the thing that finding says not to do.** Reading the
+register command streams out of a vendor `.rkllm` for Llama-3.2-1B, 3752 of its
+convolution dispatches are `M = 1`, one row and one output pixel, and they are the
+model's own projections. The vendor ships that and it generates about 13 tokens a
+second on this board.
+
+So the question this project starts from is not "how do we port the RK3588 result"
+but **"what does the RK3576 actually do, and can an open runtime match it"**. The
+RK3576 is not the same machine: 1 MiB of CBUF against the RK3588's 384 KiB, two cores
+rather than three, a 16 bit task number, and a different weight tile stride. A
+negative result measured on the other chip is a hypothesis here, not a conclusion.
 
 ## Prerequisite
 
@@ -1929,3 +500,10 @@ the model file is not enough.
 
 GPL-2.0-or-later. `LICENSE` carries the GPL version 2 text; the "or later" is what
 lets this be combined with GPL-3 code if it ever links any.
+
+## The record
+
+How the int4 layout, the output surface, the accumulator read order and the batching
+were read off the hardware, round by round, is in [docs/lab-notebook.md](docs/lab-notebook.md).
+It is long because it is the evidence. What the vendor's own model file says about its
+dispatches is in [docs/vendor-dispatch.md](docs/vendor-dispatch.md).
