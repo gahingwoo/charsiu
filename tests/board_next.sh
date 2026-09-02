@@ -95,14 +95,35 @@ if step 3 "the call floor: the two rocket patches, as a whole kernel"; then
 	# back is a serial console or the SD card, not this script.
 	TAG=${KERNEL_TAG:-kernel-7.2.0-rc5-next-20260730-attach-once}
 	curl -fsSL -o "$OUT/board-kernel-revert.sh" "$RAW/board-kernel-revert.sh" || true
-	if CHARSIU_KERNEL_TAG=$TAG CTUI_ASSUME=yes \
-	   sh "$BIN/charsiu-install.sh" --kernel 2>&1 | tee "$OUT/next-step3-install.txt"; then
+	# ⚠ THE INSTALLER IS NOT IN $BIN. charsiu-update keeps the source tree
+	# it built from in one of these and runs scripts/charsiu-install.sh out
+	# of it; the first version of this step guessed $BIN/charsiu-install.sh,
+	# sh could not open it, and the `if` read tee's exit status and said
+	# "installed, reboot now" about a kernel that had not been touched.
+	INST=""
+	for d in "${XDG_CACHE_HOME:-$HOME/.cache}/charsiu/src" "$HOME/charsiu" /opt/charsiu/src "$BIN/src"; do
+		[ -f "$d/scripts/charsiu-install.sh" ] && { INST=$d/scripts/charsiu-install.sh; break; }
+	done
+	if [ -z "$INST" ]; then
+		curl -fsSL -o "$OUT/charsiu-install.sh" \
+		    "https://raw.githubusercontent.com/${CHARSIU_SRC_REPO_PATH:-gahingwoo/charsiu}/dev/scripts/charsiu-install.sh" \
+		    && INST=$OUT/charsiu-install.sh
+	fi
+	[ -n "$INST" ] || { note "step 3: no charsiu-install.sh anywhere and no network to fetch one"; exit 1; }
+	grep -q CHARSIU_KERNEL_TAG "$INST" || { note "step 3: $INST predates CHARSIU_KERNEL_TAG -- run 'charsiu update dev' first"; exit 1; }
+	CHARSIU_KERNEL_TAG=$TAG CTUI_ASSUME=yes sh "$INST" --kernel >"$OUT/next-step3-install.txt" 2>&1
+	rc=$?
+	cat "$OUT/next-step3-install.txt"
+	# ⚠ SUCCESS IS THE INSTALLER'S OWN WORD, not an exit status through a
+	# pipe. It prints "Kernel installed." only after Image, dtb and modules
+	# are in place and the previous kernel is kept.
+	if [ "$rc" = 0 ] && grep -q "Kernel installed" "$OUT/next-step3-install.txt"; then
 		note "step 3: installed kernel $TAG; the previous one is /boot/Image.previous"
 		note "  REBOOT NOW, then: sh $BIN/board_next.sh --from 4"
 		note "  (to go back: sh $OUT/board-kernel-revert.sh, then reboot)"
 		exit 0
 	fi
-	note "step 3: the kernel install did not complete (see next-step3-install.txt); nothing was changed"
+	note "step 3: the kernel install did NOT complete (exit $rc; see next-step3-install.txt). /boot was not changed. Do not reboot for this."
 	exit 1
 fi
 
