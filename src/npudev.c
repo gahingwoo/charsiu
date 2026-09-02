@@ -1641,6 +1641,20 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				g->deal_index
 				? " -- CHARSIU_NPU_DEAL_INDEX is set, so this "
 				  "is the old per tensor deal" : "");
+		/*
+		 * ⚠ SAY WHEN THE FIT DECLINES. Phase 21's second arm printed
+		 * the stage table and no cost-model line, and the phase could
+		 * only report "no line": the fit had been refused silently.
+		 * The normal matrix goes singular when every call has the same
+		 * task count or the same weight size -- a run too short or too
+		 * uniform to separate the three terms -- and saying so is the
+		 * difference between a mystery and a shorter prompt.
+		 */
+		if (solve3(m, v, x))
+			fprintf(stderr, "charsiu NPU: the cost model did not fit "
+				"(the calls do not separate 'a task' from 'a "
+				"MB': %lu calls, tasks summed %.0f, MB summed "
+				"%.1f)\n", g->calls, g->f_t, g->f_m);
 		if (!solve3(m, v, x)) {
 			double fix = x[0] * (double)g->calls / 1e3;
 			double tsk = x[1] * (double)g->tasks_hi / 1e3;
