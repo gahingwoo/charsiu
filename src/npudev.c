@@ -4173,17 +4173,45 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	return rc;
 }
 
+/*
+ * ⚠⚠ OFF UNLESS ASKED, AND THE BOARD IS WHY. Input reuse shipped twice in one
+ * day and phase 2 stopped the round both times: first 6 of 9 models, with one
+ * key for two devices; then, with a key per device, still Phi-3.5 and
+ * gemma4-E2B -- the two whose projections are VIEWS of a fused tensor or come
+ * with per-layer embeddings. Whatever the second fault is, the host cannot
+ * see it (no NPU: the batched path falls back to the row loop) and two rounds
+ * of guessing is the budget this file allows before a change goes back to
+ * being a probe. CHARSIU_NPU_REUSE=1 turns it on; board_verify's reuse phase
+ * is the way to find out which model it breaks and how.
+ */
+static int reuse_enabled(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_REUSE");
+
+		v = e && *e && *e != '0';
+	}
+	return v;
+}
+
 int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			    unsigned m, float *Y)
 {
 	double t0 = now_us();
 	int rc;
 
-	g->reuse_ask = 1;
+	g->reuse_ask = reuse_enabled();
 	rc = npu_matmul_inner(g, id, X, m, Y);
 	g->reuse_ask = 0;
 	g->bwall_us += now_us() - t0;
 	return rc;
+}
+
+int charsiu_npu_reuse_on(void)
+{
+	return reuse_enabled();
 }
 
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
