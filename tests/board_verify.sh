@@ -1476,6 +1476,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# The first run of this phase started charsiu_run bare and priced the
 	# CPU: 4.60 tok/s on a model that decodes at 19.5 on the hardware, no
 	# cost-model line at all, and a verdict line that read as a pass.
+	# ⚠ -c 2048, NOT THE SCOREBOARD'S 512: P9 is the numbers 1 to 256, which
+	# Qwen3's tokenizer makes well over 512 tokens, and the third run of
+	# this phase died on "the prompt is longer than the context" -- which
+	# only became visible once the output was kept.
 	# ⚠ THE WHOLE OUTPUT IS KEPT. The second run of this phase printed
 	# "no cost-model line" four times and nothing else, and the reason was
 	# invisible because only two grep results survived. A phase that
@@ -1484,7 +1488,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 	    CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN \
-	    timeout 600 "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 512 -t 4 >"$af" 2>&1
+	    timeout 600 "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 2048 -t 4 >"$af" 2>&1
 	rc=$?
 	gen=$(sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p' "$af")
 	cm=$(grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" "$af" | head -1)
