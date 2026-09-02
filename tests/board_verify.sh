@@ -1445,6 +1445,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# kernel; if its text is identical the pass is about half the price
 	# and the sum changes sign. Every spec arm's text is checked against
 	# plain: on the board the pass is a real batched matmul at m = 4.
+	#
+	# ⚠ SECOND READING, same night, harness fixed: 9 of 9 language models
+	# identical x3 on the NPU, and +parallel IDENTICAL on Qwen3 at m = 4
+	# with a pass = 2.11 steps (2.51 serialised). One model at one width;
+	# the shape that failed was phi3 at m = 24, 13 of 16 wrong, so what
+	# decides the default is CHARSIU_NPU_BATCH_PARALLEL=1 on phase 2, not
+	# this arm.
 	SPEC_P="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
 	SPEC_ENV="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	PT=""; PTOK=0; PMS=0
@@ -1583,13 +1590,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 22) say "22. input reuse: which site breaks which model"
-   # ⚠⚠ REUSE IS OFF BY DEFAULT BECAUSE OF THIS. Phase 2 stopped two rounds on
-   # it: 6 of 9 models with one key for two devices, then Phi-3.5 and gemma4
-   # with a key per device -- the two whose projections are views of a fused
-   # tensor or come with per-layer embeddings. The host cannot see either
-   # fault. This phase turns it on for those two models one SITE at a time
-   # (k after q, v after q, up after gate) and reads phase 2's own comparison
-   # off each, so the next fix is aimed at a site and not at a guess.
+   # ⚠⚠ REUSE WAS OFF FOR A DAY BECAUSE OF THIS. Phase 2 stopped two rounds
+   # on it: 6 of 9 models with one key for two devices, then Phi-3.5 and
+   # gemma4 with a key per device. The host cannot see either fault. This
+   # phase turns it on for those models one SITE at a time (k after q, v
+   # after q, up after gate) and reads phase 2's own comparison off each.
+   # Its first table (2026-09-02: Phi-3.5 k and up, gemma4 up, Qwen3 nothing)
+   # is what found the key with no expiry -- which site breaks is which core
+   # the follower is dealt to -- and its second read identical on all 15
+   # cells. Reuse is on by default since; this phase is the bisect if phase
+   # 2 ever stops on it again.
    run 22
    have board_text_all.sh || { skip 22 "board_text_all.sh not installed"; break; }
    for MO in ${REUSE_MODELS:-Phi-3.5 gemma-4 Qwen3}; do

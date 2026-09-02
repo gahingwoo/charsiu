@@ -3500,10 +3500,12 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  * one -- k and v after q, up after gate. The CPU fallback is the same loop.
  */
 /*
- * ⚠ WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. With
- * CHARSIU_NPU_REUSE=1 every site reuses unless CHARSIU_REUSE_SITES names a
- * subset: any of k, v, up, comma separated. Phase 2 broke Phi-3.5 and gemma4
- * with all three on; this is how the next round learns which one.
+ * ⚠ WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. Every
+ * site reuses unless CHARSIU_REUSE_SITES names a subset: any of k, v, up,
+ * comma separated. Phase 2 broke Phi-3.5 and gemma4 with all three on, and
+ * phase 22 walking the sites is what found the key with no expiry
+ * (reusekey.h): k and up broke, and only on the core the leader had not
+ * packed.
  */
 static int reuse_site(char which)
 {

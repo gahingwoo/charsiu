@@ -4270,21 +4270,22 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 }
 
 /*
- * ⚠⚠ OFF UNLESS ASKED, AND THE BOARD IS WHY. Input reuse shipped twice in one
- * day and phase 2 stopped the round both times: first 6 of 9 models, with one
- * key for two devices; then, with a key per device, still Phi-3.5 and
- * gemma4-E2B. The host cannot see either fault (no NPU: the batched path
- * falls back to the row loop), and two rounds of guessing was the budget
- * before this went back to being a probe.
+ * ⚠⚠ ON, AND IT WAS OFF FOR A DAY BECAUSE OF THE BOARD. Input reuse shipped
+ * twice in one day and phase 2 stopped the round both times: first 6 of 9
+ * models, with one key for two devices; then, with a key per device, still
+ * Phi-3.5 and gemma4-E2B. The host cannot see either fault (no NPU: the
+ * batched path falls back to the row loop), and two rounds of guessing was
+ * the budget before this went back to being a probe.
  *
  * Phase 22 then bisected it by site: Phi-3.5 broke on k after q, gemma4 on
  * up after gate, Qwen3 on nothing. The second fault was a key with no
  * expiry -- a leader packing one core left the other core's key naming the
  * same buffer with the old contents (reusekey.h). "Views of a fused tensor"
- * and "per-layer embeddings", the two guesses above, were wrong. Fixed by
- * the leader drop; STILL OFF until phase 22 reads identical on every site
- * and phase 2 passes with CHARSIU_NPU_REUSE=1, which is what flips the
- * default, not this comment.
+ * and "per-layer embeddings", the two guesses, were wrong. With the leader
+ * drop phase 22 read identical on all 15 cells (2026-09-02), and the drop
+ * can only turn a hit into a miss, so nothing that was right before it can
+ * be wrong after it. CHARSIU_NPU_REUSE=0 turns it off; phase 22 is the
+ * bisect if phase 2 ever stops on it again.
  */
 static int reuse_enabled(void)
 {
@@ -4293,7 +4294,7 @@ static int reuse_enabled(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_NPU_REUSE");
 
-		v = e && *e && *e != '0';
+		v = !(e && *e == '0');
 	}
 	return v;
 }

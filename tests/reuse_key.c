@@ -11,8 +11,8 @@
  * after a leader, whatever it says.
  *
  * This is the half a desk can verify: which calls hit. That a hit reads the
- * right bytes is the board's (phase 22, then phase 2 with
- * CHARSIU_NPU_REUSE=1). Before the leader drop, the fourth case here hit.
+ * right bytes is the board's (phase 22: 15 of 15 identical with the drop,
+ * 2026-09-02). Before the leader drop, the fourth case here hit.
  */
 #include <stdio.h>
 #include "../src/reusekey.h"

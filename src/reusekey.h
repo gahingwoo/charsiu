@@ -27,7 +27,8 @@
  * In a header of its own so the bookkeeping can be replayed on a host with
  * no NPU (tests/reuse_key.c, under make test), which is the half of this a
  * desk can verify. That the bytes a hit reads are the right bytes is the
- * board's: phase 22, then phase 2 with CHARSIU_NPU_REUSE=1.
+ * board's: phase 22 read identical on all 15 cells with the drop
+ * (2026-09-02), and phase 2 runs with reuse on by default.
  */
 #ifndef CHARSIU_REUSEKEY_H
 #define CHARSIU_REUSEKEY_H

@@ -316,7 +316,7 @@ int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses);
-/* whether CHARSIU_NPU_REUSE=1 is set: matmul_same packs like matmul without it */
+/* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
 
