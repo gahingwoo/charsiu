@@ -353,16 +353,30 @@ struct charsiu_npu {
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
 	/*
-	 * What the input BOs hold right now, so a caller that declares its
-	 * input unchanged (charsiu_npu_matmul_same) can skip the pack. The
-	 * key is the pointer, the width, K and the zero point; the CONTENTS
-	 * are the caller's word. Cleared whenever the BOs are rebuilt.
+	 * What EACH DEVICE'S input BO holds right now, so a caller that
+	 * declares its input unchanged (charsiu_npu_matmul_same) can skip the
+	 * pack. The key is the pointer, the width, K and the zero point; the
+	 * CONTENTS are the caller's word. Cleared whenever the BOs are rebuilt.
+	 *
+	 * ⚠⚠ PER DEVICE, BECAUSE THE FIRST VERSION WAS NOT AND THE BOARD SAID
+	 * SO IN ONE ROUND: 6 of 9 models' batched prompts stopped matching
+	 * their token loop. A tensor is packed only into the BOs of the
+	 * devices its slots were dealt to, and a small projection -- Qwen2.5's
+	 * k with two KV heads, gemma3's with one -- goes whole to ONE core.
+	 * So q packed core 0, k was dealt to core 1, and k "reused" a BO on
+	 * core 1 that held whatever the last tensor there had left. The three
+	 * models that stayed right were the three whose every projection is
+	 * wide enough to be split across both cores. One key for two buffers
+	 * described neither.
 	 */
-	const float *bin_x;
-	unsigned bin_m;
-	uint64_t bin_k;
-	uint8_t bin_zp;
-	int bin_valid, reuse_ask;
+	struct {
+		const float *x;
+		unsigned m;
+		uint64_t k;
+		uint8_t zp;
+		int valid;
+	} bin_key[2];
+	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
 	size_t bin_stride, bout_stride;
 	/* the output buffers, one per geometry rather than one per tensor:
@@ -3009,7 +3023,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
-	g->bin_valid = 0;          /* the BOs are about to be replaced */
+	g->bin_key[0].valid = g->bin_key[1].valid = 0;   /* BOs replaced */
 	if (m > g->bm)
 		g->bm = m;
 	if (nks > g->bnks)
@@ -3807,31 +3821,29 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * 5072 ms of a 7448 ms report when this waited on every slice.
 	 */
 	/*
-	 * ⚠ REUSE IS DECIDED ONCE, FOR BOTH DEVICES. The key says whether the
-	 * input BOs already hold this X at this width for this K; the caller's
-	 * declaration says whether it is allowed to matter. Either alone packs.
+	 * ⚠ REUSE IS DECIDED PER DEVICE. Each device's key says whether ITS
+	 * input BO already holds this X at this width for this K; the caller's
+	 * declaration says whether that is allowed to matter. Either alone
+	 * packs that device. A device this tensor has no slot on is neither
+	 * packed nor read, and its key is left describing what is there.
 	 */
-	int reuse = g->reuse_ask && g->bin_valid && g->bin_x == X &&
-		    g->bin_m == m && g->bin_k == e->t->k &&
-		    g->bin_zp == g->slot[e->first].job.input_zero_point;
+	uint8_t zp = g->slot[e->first].job.input_zero_point;
 
-	if (g->reuse_ask) {
-		if (reuse)
-			g->reuse_hits++;
-		else
-			g->reuse_misses++;
-	}
-	if (!reuse) {
-		g->bin_valid = 0;
-		g->bin_x = X;
-		g->bin_m = m;
-		g->bin_k = e->t->k;
-		g->bin_zp = g->slot[e->first].job.input_zero_point;
-	}
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0, nh = 0, done_ki = 0;
 		double tp = now_us();
+		int reuse = g->reuse_ask && g->bin_key[d].valid &&
+			    g->bin_key[d].x == X && g->bin_key[d].m == m &&
+			    g->bin_key[d].k == e->t->k && g->bin_key[d].zp == zp;
 
+		if (g->reuse_ask) {
+			if (reuse)
+				g->reuse_hits++;
+			else
+				g->reuse_misses++;
+		}
+		if (!reuse)
+			g->bin_key[d].valid = 0;   /* until this device's pack lands */
 		if (!reuse)
 			charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
 		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
@@ -3953,9 +3965,18 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			charsiu_bo_fini(g->dev[d], &g->bin[d]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
 		g->bpack_us += now_us() - tp;
-		/* every device's input is in place: the key may be honoured */
-		if (!reuse && d + 1 == g->ndev)
-			g->bin_valid = 1;
+		/*
+		 * THIS device's BO now holds X -- but only if a slice was
+		 * actually packed into it. A tensor with no slot here wrote
+		 * nothing, and the key must not claim otherwise.
+		 */
+		if (!reuse && done_ki) {
+			g->bin_key[d].x = X;
+			g->bin_key[d].m = m;
+			g->bin_key[d].k = e->t->k;
+			g->bin_key[d].zp = zp;
+			g->bin_key[d].valid = 1;
+		}
 		if (!nt)
 			continue;
 		tp = now_us();
