@@ -1468,9 +1468,21 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # the latency was the waiter's; if cpu-sleep-off wins by more, the irq
    # thread and the scheduler thread were paying it too, and only the kernel
    # can fix those.
-   for arm in "cpu-sleep on" "cpu-sleep OFF" "cpu-sleep on again" "spin 400 us"; do
+   # ⚠ AT THE PERFORMANCE GOVERNOR, like phase 7: under ondemand the arms
+   # carry the frequency ramp after every idle as well, and the "on" and
+   # "on again" arms came back 9% apart. Restored on the way out.
+   GOV0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo ondemand)
+   for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance >"$c" 2>/dev/null; done
+   # ⚠ THE FOUR ARMS, AFTER THE FIRST RUN OF THIS PHASE (ondemand, August kernel):
+   #   deep idle allowed   CHARSIU_NPU_IDLE=1, the control: 7.64 tok/s
+   #   cpu-sleep OFF       the sysfs switch, plus the control: 9.46, +24%
+   #   qos hold (default)  charsiu holds /dev/cpu_dma_latency at 100 us,
+   #                       which should match the sysfs arm from userspace
+   #   qos + spin 400 us   whether the waiter's own spin adds anything on top
+   for arm in "deep idle allowed" "cpu-sleep OFF" "qos hold (default)" "qos + spin 400"; do
 	case "$arm" in *OFF) v=1 ;; *) v=0 ;; esac
-	case "$arm" in spin*) SPIN=400 ;; *) SPIN=0 ;; esac
+	case "$arm" in *spin*) SPIN=400 ;; *) SPIN=0 ;; esac
+	case "$arm" in "deep idle"*|*OFF) IDLE=1 ;; *) IDLE="" ;; esac
 	for c in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state1/disable; do echo $v >"$c"; done
 	# ⚠ THE SCOREBOARD'S OWN ENVIRONMENT, verbatim from board_vendor.sh.
 	# The first run of this phase started charsiu_run bare and priced the
@@ -1487,7 +1499,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	af=$OUT/verify-21-$(printf '%s' "$arm" | tr ' ' '-').txt
 	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-	    CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN \
+	    CHARSIU_STAGES=1 CHARSIU_NPU_SPIN_US=$SPIN ${IDLE:+CHARSIU_NPU_IDLE=1} \
 	    timeout 600 "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 2048 -t 4 >"$af" 2>&1
 	rc=$?
 	gen=$(sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p' "$af")
@@ -1507,11 +1519,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		tail -8 "$af" | sed 's/^/       /'
 		break
 	fi
+	wedged "phase 21" && break
    done
+   for c in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state1/disable; do echo 0 >"$c"; done
+   for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo "$GOV0" >"$c" 2>/dev/null; done
    wedged "phase 21" && break
-   ok "compare the AVERAGE us a call across the arms; the third must match the first"
-   printf '     ⚠ these arms are the wake latency ALONE. The attach/detach per job\n'
-   printf '        is the patched kernel (rocket: keep the domain attached), next round.\n'
+   ok "the qos arm should match cpu-sleep OFF, and both beat deep idle by about a quarter"
+   printf '     ⚠ these arms are the wake latency ALONE; the qos hold is now the default.\n'
+   printf '        The attach/detach per job is the patched kernel, a separate round.\n'
    ;;
 
 22) say "22. input reuse: which site breaks which model"
