@@ -178,6 +178,9 @@ $(BUILD)/npu_slice_test: tools/npu_slice_test.c $(LLM) | $(BUILD)
 $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
+$(BUILD)/bench_gather: tools/bench_gather.c $(SRC) | $(BUILD)
+	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
+
 $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
