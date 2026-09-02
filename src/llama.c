@@ -3499,12 +3499,39 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  * The same call with the input declared unchanged since the previous batched
  * one -- k and v after q, up after gate. The CPU fallback is the same loop.
  */
+/*
+ * ⚠ WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. With
+ * CHARSIU_NPU_REUSE=1 every site reuses unless CHARSIU_REUSE_SITES names a
+ * subset: any of k, v, up, comma separated. Phase 2 broke Phi-3.5 and gemma4
+ * with all three on; this is how the next round learns which one.
+ */
+static int reuse_site(char which)
+{
+	static const char *sites = NULL;
+	static int asked = 0;
+
+	if (!asked) {
+		sites = getenv("CHARSIU_REUSE_SITES");
+		asked = 1;
+	}
+	if (!sites || !*sites)
+		return 1;
+	switch (which) {
+	case 'k': return strstr(sites, "k") != NULL && !strstr(sites, "kv-");
+	case 'v': return strstr(sites, "v") != NULL;
+	case 'u': return strstr(sites, "up") != NULL;
+	}
+	return 1;
+}
+
 static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 			    const float *X, int n, float *Y, uint32_t k,
-			    uint32_t nout)
+			    uint32_t nout, char site)
 {
 	int id = npu_id_for(s, w);
 
+	if (!reuse_site(site))
+		return matmul_rows(s, w, X, n, Y, k, nout);
 	if (id >= 0 && !charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y))
 		return 1;
 	for (int r = 0; r < n; r++)
@@ -3958,10 +3985,10 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			/* ⚠ nothing writes bxb between these three: the
 			 * declaration below is only true because of that */
 			matmul_rows_same(s, L->wk, s->bxb, n, s->bk, m->n_embd,
-					 m->n_head_kv * hd);
+					 m->n_head_kv * hd, 'k');
 			if (L->wv)
 				matmul_rows_same(s, L->wv, s->bxb, n, s->bv,
-						 m->n_embd, m->n_head_kv * hd);
+						 m->n_embd, m->n_head_kv * hd, 'v');
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
@@ -4157,7 +4184,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd,
 				    nff);
 			matmul_rows_same(s, L->up, s->bxb, n, s->bhb2,
-					 m->n_embd, nff);
+					 m->n_embd, nff, 'u');
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,

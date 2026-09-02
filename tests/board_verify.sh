@@ -51,7 +51,7 @@
 #   PHASES is a list like "1 2 3", or "fast" for 1 2 3, or "slow" for 6 7.
 set -u
 
-PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21}
+PHASES=${*:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22}
 case "$PHASES" in
 fast) PHASES="1 2 3" ;;
 slow) PHASES="6 7 8 9 10 11" ;;
@@ -1481,6 +1481,30 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ok "read `a call` across the arms; the third must match the first"
    printf '     ⚠ these arms are the wake latency ALONE. The attach/detach per job\n'
    printf '        is the patched kernel (rocket: keep the domain attached), next round.\n'
+   ;;
+
+22) say "22. input reuse: which site breaks which model"
+   # ⚠⚠ REUSE IS OFF BY DEFAULT BECAUSE OF THIS. Phase 2 stopped two rounds on
+   # it: 6 of 9 models with one key for two devices, then Phi-3.5 and gemma4
+   # with a key per device -- the two whose projections are views of a fused
+   # tensor or come with per-layer embeddings. The host cannot see either
+   # fault. This phase turns it on for those two models one SITE at a time
+   # (k after q, v after q, up after gate) and reads phase 2's own comparison
+   # off each, so the next fix is aimed at a site and not at a guess.
+   run 22
+   have board_text_all.sh || { skip 22 "board_text_all.sh not installed"; break; }
+   for MO in ${REUSE_MODELS:-Phi-3.5 gemma-4 Qwen3}; do
+	for SITES in ${REUSE_SITES:-k v up k,v k,v,up}; do
+		CHARSIU_NPU_REUSE=1 CHARSIU_REUSE_SITES=$SITES CHARSIU_TEXT_ONLY=$MO \
+		    sh "$BIN/board_text_all.sh" >"$OUT/verify-reuse-$MO-$SITES.txt" 2>&1
+		v=$(grep -E "text identical|TEXT DIFFERS" "$OUT/verify-reuse-$MO-$SITES.txt" | head -1 | sed 's/.*prompt batched //')
+		printf '      %-9s sites %-7s %s\n' "$MO" "$SITES" "${v:-no verdict line}"
+		wedged "phase 22" && break 2
+	done
+   done
+   wedged "phase 22" && break
+   ok "read the table: the first site that says DIFFERS on a model is the one to look at"
+   printf '     ⚠ Qwen3 is the control: it passed with all three on when the key was per device.\n'
    ;;
 esac
 done
