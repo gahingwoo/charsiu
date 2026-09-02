@@ -1363,9 +1363,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	c) why="if WRONG: the OUTPUT N*m, not the input at all" ;;
 	*) why="walks the bracket" ;;
 	esac
+	# the guard this phase put at 8192 is lifted here, as 16 and 17 lift theirs
 	r=$(CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=0 \
 	    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-	    CHARSIU_SLICE_SEED="${INT8_SEED:-12345}" \
+	    CHARSIU_SLICE_SEED="${INT8_SEED:-12345}" CHARSIU_NPU_ANY_SURFACE=1 \
 	    timeout 600 "$BIN/npu_slice_test" "$HK" "$HN" "$HM" "$HK" 2>&1)
 	lbl=$(printf 'K=%-5s N=%-5s m=%-3s surf %-4s x%-3s = %-6s out %-7s' \
 	    "$HK" "$HN" "$HM" "$sf" "$HM" "$pr" "$ou")
@@ -1382,7 +1383,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	wedged "phase 19" && break
    done
    wedged "phase 19" && break
-   ok "the bracket is walked; read the three candidates off the table above"
+   ok "the bracket is (8192, 8960] on surf x rows; npudev refuses above 8192 and the pool chunks under it"
    printf '     ⚠ EXPOSURE, unguarded either way: whisper sizes its pool at\n'
    printf '        4 * n_audio_state, so medium is K=4096 (surf 128) and large\n'
    printf '        is K=5120 (surf 160) -- both at or past the failing cell,\n'
@@ -1420,8 +1421,17 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    for f in "$MODELS"/Qwen3-0.6B*.gguf "$MODELS"/*.gguf; do [ -r "$f" ] && SM=$f && break; done
    if [ -n "$SM" ]; then
 	printf '  price on %s, %s tokens:\n' "$(basename "$SM")" "${SPEC_N:-96}"
+	# ⚠ THE NPU ENVIRONMENT, AND A PROMPT THE LOOKUP CAN WORK WITH. The
+	# first run priced the CPU (2.6 tok/s on a model that decodes at 22)
+	# on P9, whose continuation 257 258 259 has never occurred before, so
+	# the lookup drafted nothing useful and accepted 11%. The identity
+	# test's prompt asks for repetition, which is the case this drafter
+	# is for; open prose is phase 20's second row below.
+	SPEC_P="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
 	for arm in "" "--spec 3" "--spec 5"; do
-		r=$("$BIN/charsiu_run" "$SM" -p "$P9" -n "${SPEC_N:-96}" $arm 2>/dev/null)
+		r=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $arm 2>/dev/null)
 		gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms, \([0-9.]*\) tok\/s.*/\3 tok\/s (\1 tok, \2 ms)/p')
 		sl=$(printf '%s' "$r" | grep '^\[spec ' | sed 's/^\[spec k=[0-9]*: //; s/\]$//')
 		printf '    %-9s %s%s\n' "${arm:-plain}" "$gen" "${sl:+   $sl}"

@@ -3751,8 +3751,24 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * its widest K is 4 * n_audio_state, which is 2048 at base and
 		 * 4096 entries at 64 rows, just under.
 		 */
-		if (!charsiu_m_axis_wide_for(g->w4))
+		/*
+		 * ⚠ AND THE HEIGHT AXIS HAS ITS OWN LINE. Phase 19 walked it on
+		 * int8: (K / 32) * rows of 4096, 6144, 7680 and 8192 exact,
+		 * 8960 and 10240 wrong on every row -- with K alone (128 at 32
+		 * rows) and the output (122880 floats) both exact, so it is the
+		 * input surface again, in (8192, 8960]. The same hatch lifts it
+		 * for the probe that walks it.
+		 */
+		if (!charsiu_m_axis_wide_for(g->w4)) {
+			if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+			    (size_t)(kw / 32) * m > 8192) {
+				whine(g, "the input surface on the height axis is "
+				      "past 8192, where the board says every row "
+				      "comes back wrong", kw, m);
+				return -1;
+			}
 			kw = 0;
+		}
 		/*
 		 * ⚠⚠ AND A PROBE HAS TO BE ABLE TO ASK ABOUT WHAT THIS
 		 * REFUSES. w4_batch_why_not learned this already and says so

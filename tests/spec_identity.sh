@@ -38,10 +38,19 @@ set -u
 DIR="${1:?usage: spec_identity.sh MODEL_DIR [N_TOKENS]}"
 N="${2:-48}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUN="$ROOT/build/charsiu_run"
 PROMPT="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
-
-make -C "$ROOT" build/charsiu_run >/dev/null || exit 1
+# ⚠ ON THE BOARD THERE IS NO MAKEFILE AND NO build/: the binaries sit beside
+# this script in /opt/charsiu. The first board run of this died on
+# "No rule to make target build/charsiu_run" before measuring anything.
+RUN=${CHARSIU_RUN_BIN:-}
+for c in "$ROOT/build/charsiu_run" "$ROOT/charsiu_run" "$(dirname "$0")/charsiu_run"; do
+	[ -n "$RUN" ] && break
+	[ -x "$c" ] && RUN=$c
+done
+if [ -z "$RUN" ] && [ -f "$ROOT/Makefile" ]; then
+	make -C "$ROOT" build/charsiu_run >/dev/null && RUN="$ROOT/build/charsiu_run"
+fi
+[ -x "${RUN:-/nonexistent}" ] || { echo "no charsiu_run to test with"; exit 2; }
 
 # the generated text only: everything before the runner's own report
 text() { sed '/^\[load /,$d'; }

@@ -221,6 +221,29 @@ static unsigned rows_max(void)
 	return v > 0 ? (unsigned)v : 80;
 }
 
+/*
+ * ⚠⚠ THE HEIGHT AXIS HAS A CEILING OF ITS OWN, AND PHASE 19 WALKED IT:
+ *
+ *   surf x rows   4096  6144  7680  8192   exact
+ *                 8960 10240               WRONG, every row, every channel
+ *
+ * with surf alone (128 at m = 32) and the output size (122880 at K = 3072)
+ * both exact, so the quantity is the input surface (K / 32) * rows and the
+ * line is in (8192, 8960]. 80 rows is only safe up to K = 3276: SmolVLM's
+ * K = 3072 sits at 7680 and passed by 512; whisper medium's K = 4096 at 80
+ * rows is 10240 and would be wrong on every row. So the chunk is the
+ * smaller of rows_max and what 8192 entries allow at this K.
+ */
+static unsigned rows_fit(uint64_t k)
+{
+	unsigned cap = rows_max();
+	unsigned by_surface = k >= 32 ? (unsigned)((8192u * 32u) / k) : cap;
+
+	if (by_surface < 1)
+		by_surface = 1;
+	return by_surface < cap ? by_surface : cap;
+}
+
 static int pool_id(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		   unsigned *id)
 {
@@ -242,7 +265,7 @@ int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
 		       const struct gguf_tensor *const *ws, unsigned nw,
 		       const float *X, unsigned m, float *const *Ys)
 {
-	unsigned ids[8], chunk = rows_max(), done = 0, i;
+	unsigned ids[8], chunk, done = 0, i;
 	uint64_t k, ns[8];
 	double t0;
 
@@ -258,6 +281,7 @@ int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
 			return -1;     /* one input means one K */
 		ns[i] = ws[i]->n_dims ? ws[i]->ne[ws[i]->n_dims - 1] : 1;
 	}
+	chunk = rows_fit(k);
 	t0 = now_ms();
 	while (done < m) {
 		unsigned c = m - done < chunk ? m - done : chunk;
@@ -305,7 +329,7 @@ int charsiu_pool_rows3(struct charsiu_npu_pool *p,
 int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		      const float *X, unsigned m, float *Y)
 {
-	unsigned i, id = 0, found = 0, chunk = rows_max(), done = 0;
+	unsigned i, id = 0, found = 0, chunk, done = 0;
 	uint64_t k, n;
 	double t0;
 
@@ -325,6 +349,7 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 
 	k = w->ne[0];
 	n = w->n_dims ? w->ne[w->n_dims - 1] : 1;
+	chunk = rows_fit(k);
 	t0 = now_ms();
 	while (done < m) {
 		unsigned c = m - done < chunk ? m - done : chunk;

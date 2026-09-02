@@ -66,10 +66,10 @@ verify() {
 	return 0
 }
 call_line() {
-	# the average, which always prints, then the fit if the run managed one
-	a=$(grep -ho "on the busier core, [0-9]* us a call" "$1" "$OUT"/verify-21-*.txt 2>/dev/null | grep -o "[0-9]* us a call" | head -1)
-	f=$(grep -ho "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" "$1" "$OUT"/verify-21-*.txt 2>/dev/null | head -1)
-	printf '%s%s' "${a:-no NPU summary}" "${f:+   (fit: $f)}"
+	# phase 21's own table row for the default arm, from THIS step's file
+	# only -- the first version globbed every arm file and printed the same
+	# number for "before" and "patched".
+	grep -h "qos hold (default)" "$1" 2>/dev/null | head -1 | sed 's/^ *//' | tr -s ' '
 }
 
 [ "$PLAN" = 1 ] || [ "$FROM" -gt 1 ] || : >"$SUM"
