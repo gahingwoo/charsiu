@@ -1118,6 +1118,9 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
  * patches ONE AT A TIME. It would still be correct, and it would be slower than
  * the CPU it was moved off.
  */
+/* defined after charsiu_npu_close, where the hold is dropped too */
+static void qos_hold(struct charsiu_npu *g, int say);
+
 struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 					  unsigned max_tensors, int want_w4)
 {
@@ -1420,27 +1423,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * CHARSIU_NPU_DMA_LATENCY_US moves the bound. Needs root, which the
 	 * board has; without it this says so once and carries on.
 	 */
-	if (!getenv("CHARSIU_NPU_IDLE")) {
-		const char *e = getenv("CHARSIU_NPU_DMA_LATENCY_US");
-		int32_t us = e ? (int32_t)atoi(e) : 100;
-		int fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
-
-		if (fd >= 0 && write(fd, &us, sizeof(us)) == (ssize_t)sizeof(us)) {
-			g->qos_fd = fd;
-			fprintf(stderr, "charsiu NPU: holding the CPUs out of idle "
-				"states deeper than %d us while the NPU is open "
-				"(CHARSIU_NPU_IDLE=1 to allow them)\n", (int)us);
-		} else {
-			int err = errno;
-
-			if (fd >= 0)
-				close(fd);
-			fprintf(stderr, "charsiu NPU: could not hold "
-				"/dev/cpu_dma_latency (%s); deep idle stays "
-				"allowed, which costs about a quarter of decode\n",
-				strerror(err));
-		}
-	}
+	qos_hold(g, 1);
 	return g;
 
 fail:
@@ -1458,14 +1441,65 @@ int charsiu_npu_batches(const struct charsiu_npu *g)
 	return g && !g->w4;
 }
 
+/*
+ * Take the PM QoS hold described above charsiu_npu_open_mode's call, if it
+ * is not held already and the control has not been asked for. `say` prints
+ * the one line about it: the open says it, a server taking the hold back
+ * before every request does not.
+ */
+static void qos_hold(struct charsiu_npu *g, int say)
+{
+	const char *e;
+	int32_t us;
+	int fd;
+
+	if (g->qos_fd >= 0 || getenv("CHARSIU_NPU_IDLE"))
+		return;
+	e = getenv("CHARSIU_NPU_DMA_LATENCY_US");
+	us = e ? (int32_t)atoi(e) : 100;
+	fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
+	if (fd >= 0 && write(fd, &us, sizeof(us)) == (ssize_t)sizeof(us)) {
+		g->qos_fd = fd;
+		if (say)
+			fprintf(stderr, "charsiu NPU: holding the CPUs out of idle "
+				"states deeper than %d us while the NPU is open "
+				"(CHARSIU_NPU_IDLE=1 to allow them)\n", (int)us);
+	} else {
+		int err = errno;
+
+		if (fd >= 0)
+			close(fd);
+		if (say)
+			fprintf(stderr, "charsiu NPU: could not hold "
+				"/dev/cpu_dma_latency (%s); deep idle stays "
+				"allowed, which costs about a quarter of decode\n",
+				strerror(err));
+	}
+}
+
+/*
+ * A server holds the device for days and sits at accept() between requests;
+ * the hold is for a request, not for the process. See charsiu_llm.h.
+ */
+void charsiu_npu_idle(struct charsiu_npu *g, int idle)
+{
+	if (!g)
+		return;
+	if (idle) {
+		if (g->qos_fd >= 0) {
+			close(g->qos_fd);      /* the CPUs may sleep deeply again */
+			g->qos_fd = -1;
+		}
+	} else {
+		qos_hold(g, 0);
+	}
+}
+
 void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
-	if (g->qos_fd >= 0) {
-		close(g->qos_fd);      /* the CPUs may sleep deeply again */
-		g->qos_fd = -1;
-	}
+	charsiu_npu_idle(g, 1);
 	if (g->dev[0]) {
 		for (unsigned i = 0; i < g->n_slot; i++) {
 			unsigned d = g->slot[i].di;

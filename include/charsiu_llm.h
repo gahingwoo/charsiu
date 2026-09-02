@@ -289,6 +289,14 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors);
 void charsiu_npu_close(struct charsiu_npu *g);
+/*
+ * The PM QoS hold that keeps the CPUs out of deep idle while the NPU is open
+ * is taken at open and dropped at close, which is the shape of a one-shot
+ * run. A server holds the device for days: charsiu_npu_idle(g, 1) drops the
+ * hold between requests and charsiu_npu_idle(g, 0) takes it back before the
+ * next one. NULL and a device with no hold are no-ops.
+ */
+void charsiu_npu_idle(struct charsiu_npu *g, int idle);
 int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
 /* int4 takes the float activation; int8 needs q1 realised first */
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
