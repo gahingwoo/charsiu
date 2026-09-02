@@ -1478,7 +1478,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		plain) opt="";;
 		*+parallel) opt="--spec 3"; par="CHARSIU_NPU_BATCH_PARALLEL=1";;
 		esac
-		r=$(env $SPEC_ENV $par "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $opt 2>/dev/null)
+		r=$(env $SPEC_ENV $par "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $opt 2>"$OUT/.spec_err")
 		gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms, \([0-9.]*\) tok\/s.*/\3 tok\/s (\1 tok, \2 ms)/p')
 		tok=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms.*/\1/p')
 		ms=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms.*/\2/p')
@@ -1499,6 +1499,22 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 				'BEGIN { printf "a pass = %.2f decode steps", (ms / p) / (pms / pt) }')
 		fi
 		printf '    %-18s %s%s%s%s\n' "$arm" "${gen:-no gen line}" "${sl:+   $sl}" "${steps:+   $steps}" "${v:+   $v}"
+		# ⚠ WHERE A PASS GOES. 2.11 steps a pass with the cores overlapped
+		# is still 1.1 steps of something that is not a decode step, and
+		# nothing had ever printed what. The runtime's batched report has
+		# the five shares; this divides them by the passes. The prompt's
+		# own batched chunk is in there too, once.
+		if [ "$arm" = plain ]; then
+			hw=$(sed -n 's/^charsiu NPU: \([0-9]*\) ms in the hardware path.*/\1/p' "$OUT/.spec_err" | head -1)
+			[ -n "$hw" ] && [ "${tok:-0}" -gt 0 ] && \
+			    awk -v hw="$hw" -v t="$tok" 'BEGIN { printf "                       a decode step in the hardware path: %.1f ms\n", hw / t }'
+		elif grep -q "charsiu NPU batched:" "$OUT/.spec_err" && [ "${passes:-0}" -gt 0 ]; then
+			awk -v p="$passes" '
+			    /^charsiu NPU batched:/ { w = $4; inb = 1; next }
+			    inb && /^    (prep|pack|sub|fence|read|other) / { v[$1] = $2 }
+			    inb && /^    input reuse/ { inb = 0 }
+			    END { if (w > 0) printf "                       a pass in the batched entry: %.1f ms = prep %.1f + pack %.1f + sub %.1f + fence %.1f + read %.1f + other %.1f\n", w / p, v["prep"] / p, v["pack"] / p, v["sub"] / p, v["fence"] / p, v["read"] / p, v["other"] / p }' "$OUT/.spec_err"
+		fi
 		wedged "phase 20" && break
 	done
 	printf '  ⚠ speculation wins only where tok/pass is above the steps a pass costs.\n'
