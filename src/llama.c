@@ -3165,6 +3165,16 @@ static const char *stage_name[ST_N] = {
 
 static double stage_ms[ST_N];
 static unsigned stage_tok;
+/*
+ * ⚠ THE BATCHED PROMPT HAD NO STAGES. The fourteen above are the token
+ * loop's; batch_layers, which is where every prompt token goes, was never
+ * instrumented, so on a board where Qwen3's prompt takes 1298 ms and its
+ * batched matmul entry about 300 of them, nothing had ever said where the
+ * other thousand went. Kept apart from the token loop's numbers because a
+ * row of a batch and a decoded token do not cost the same thing.
+ */
+static double bstage_ms[ST_N];
+static unsigned bstage_rows, bstage_chunks;
 
 void llama_stages_reset(void)
 {
@@ -3178,7 +3188,25 @@ void llama_stages_report(void)
 	double tot = 0;
 	unsigned i;
 
-	if (stage_on <= 0 || !stage_tok)
+	if (stage_on <= 0 || (!stage_tok && !bstage_rows))
+		return;
+	if (bstage_rows) {
+		double bt = 0;
+
+		for (i = 0; i < ST_N; i++)
+			bt += bstage_ms[i];
+		printf("charsiu batched stages: %u rows in %u chunks, %.2f ms a row"
+		       " (%.0f ms)\n", bstage_rows, bstage_chunks,
+		       bt / bstage_rows, bt);
+		for (i = 0; i < ST_N; i++)
+			if (bstage_ms[i] > 0.0)
+				printf("  %-16s %8.2f ms a row     %5.1f%%\n",
+				       stage_name[i], bstage_ms[i] / bstage_rows,
+				       100.0 * bstage_ms[i] / bt);
+		printf("  (\"residual\" after o proj carries the ffn rmsnorm too, and"
+		       " \"rope + kv copy\" only the rope)\n");
+	}
+	if (!stage_tok)
 		return;
 	for (i = 0; i < ST_N; i++)
 		tot += stage_ms[i];
@@ -3906,12 +3934,31 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		}
 	}
 
+	/*
+	 * The stage clock for the batched path: the same fourteen names as
+	 * the token loop, accumulated per row of the chunk. CHARSIU_STAGES
+	 * turns it on; a prompt-only run reaches here before any token, so
+	 * it is read here too rather than only in llama_forward.
+	 */
+	if (stage_on < 0)
+		stage_on = getenv("CHARSIU_STAGES") != NULL;
+	double bt0 = stage_on > 0 ? now_ms() : 0.0, bt1;
+#define BSTAGE(i) do { if (stage_on > 0) { bt1 = now_ms();               \
+			bstage_ms[i] += bt1 - bt0; bt0 = bt1; } } while (0)
+	if (stage_on > 0) {
+		bstage_rows += (unsigned)n;
+		bstage_chunks++;
+	}
+
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
 		/* ⚠ THIS LAYER'S WIDTH; m->n_ff is only the fallback */
 		uint32_t nff = L->n_ff ? L->n_ff : m->n_ff;
 		int swa = L->swa;
+
+		if (l == 0)
+			BSTAGE(ST_EMBD);
 
 		/*
 		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
@@ -3932,6 +3979,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			rmsnorm(s->bxb + (size_t)r * m->n_embd,
 				s->bx + (size_t)r * m->n_embd, L->attn_norm,
 				m->n_embd, m->rms_eps);
+		BSTAGE(ST_NORM1);
 		/*
 		 * ⚠⚠ TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
 		 *
@@ -4034,6 +4082,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * actually differs, and where it does not a window
 			 * layer takes the full one, factors and all.
 			 */
+			BSTAGE(ST_QKV);   /* row 0: the three projections; rows after: nothing */
 			int swatab = swa && (m->swa_pattern || m->swa_arr) &&
 				     (m->rope_base_swa != m->rope_base ||
 				      m->head_dim_swa != m->head_dim);
@@ -4105,6 +4154,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			if (L->wk)
 				rope(s->k, m->n_head_kv, hd, s->bcs,
 				     m->rope_neox);
+			BSTAGE(ST_ROPE);
 			/* ⚠ the cache is strided by hdmax, written at hd, and
 			 * a shared KV layer has nothing of its own to store:
 			 * it reads what L->kv_from wrote. Writing here would
@@ -4162,10 +4212,12 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * o projection over every row */
 			memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
 			       (size_t)m->n_head * hd * sizeof(float));
+			BSTAGE(ST_ATTN);
 		}
 
 		matmul_rows(s, L->wo, s->bao, n, s->bxo, m->n_head * hd,
 			    m->n_embd);
+		BSTAGE(ST_WO);
 		for (int r = 0; r < n; r++) {
 			float *xr = s->bx + (size_t)r * m->n_embd;
 			float *o = s->bxo + (size_t)r * m->n_embd;
@@ -4180,6 +4232,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
 				m->n_embd, m->rms_eps);
 		}
+		BSTAGE(ST_RES1);   /* the residual add and the ffn rmsnorm */
 
 		/* gate and up read one norm as well: the same choice */
 		if (!prefill_grouped() || will_batch(s, L->gate)) {
@@ -4194,6 +4247,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					    L->up, s->bhb2 + (size_t)r * nff,
 					    NULL, NULL);
 		}
+		BSTAGE(ST_GATEUP);
 		for (int r = 0; r < n; r++) {
 			if (m->ffn_gelu)
 				gelu_mul(s->bhb + (size_t)r * nff,
@@ -4202,7 +4256,9 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				silu_mul(s->bhb + (size_t)r * nff,
 					 s->bhb2 + (size_t)r * nff, nff);
 		}
+		BSTAGE(ST_SILU);
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
+		BSTAGE(ST_DOWN);
 		for (int r = 0; r < n; r++) {
 			float *xr = s->bx + (size_t)r * m->n_embd;
 			float *o = s->bxo + (size_t)r * m->n_embd;
@@ -4213,6 +4269,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
 		}
+		BSTAGE(ST_RES2);
 
 		/*
 		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not

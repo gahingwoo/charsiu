@@ -509,9 +509,15 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		*)      E=CHARSIU_READ_DUMMY=1 ;;
 		esac
 		# shellcheck disable=SC2086
+		# ⚠ THE SHIPPED WIDTHS, AND THE STAGE CLOCK. This pinned KMAX and
+		# the group to 1024 after the default had moved to 2048, so the
+		# split it printed was of a configuration nobody runs; and it
+		# never asked for CHARSIU_STAGES, so the prompt's CPU side --
+		# attention, norms, rope, the activation -- was invisible next to
+		# the matmul entry it was priced against.
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
-		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    CHARSIU_STAGES=1 $E \
 		    "$BIN/charsiu_run" "$M" -p "$P9" -n 4 --ignore-eos \
 		    >"$OUT/.ttft_$arm" 2>"$OUT/.ttft_$arm.err"
 		eval "t_$arm=\$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' \
@@ -547,6 +553,17 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		awk '/charsiu NPU batched:/ { f = 1 }
 		     f { if (/charsiu NPU batched:/ || /^    /) print; else exit }' \
 		    "$OUT/.ttft_err" | sed 's/^/      /'
+		# ⚠ AND THE OTHER SIDE OF THE PROMPT: the batched path's own
+		# stage table, per row, from stdout. Matmul rows are the NPU
+		# calls above seen from the caller; the rest is the CPU, and on
+		# Qwen3 it was a thousand of 1298 ms with no name on it.
+		if grep -q "charsiu batched stages:" "$OUT/.ttft_out"; then
+			awk '/charsiu batched stages:/ { f = 1; n++ }
+			     f && n == 1 { if (/charsiu batched stages:/ || /^  /) print; else exit }' \
+			    "$OUT/.ttft_out" | sed 's/^/      /'
+		else
+			printf '      ⚠ no batched stage table: the runner predates it, or CHARSIU_STAGES did not take\n'
+		fi
 	else
 		# ⚠ NOT A SKIP. On the board this block is the whole phase, and
 		# its absence means either nothing took the batched path or the

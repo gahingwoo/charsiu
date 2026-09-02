@@ -165,6 +165,46 @@ def main():
         print("no stream at 0x%x" % want)
         return 1
 
+    if args and args[0] == "--dpu":
+        # ⚠ THE OPS THAT ARE NOT MATMULS, which is the question "what does
+        # the vendor keep on the NPU between the projections". Read on
+        # 2026-09-03 for Llama-3.2-1B: 4416 DPU only streams in two
+        # families and 500 weight-less convolutions, no LUT written by any
+        # of them, no PPU, no DDMA/SDMA anywhere in the file -- so the
+        # exp, the SiLU and the rsqrt are not the NPU's in this runtime
+        # either. See --dpu's output for the families.
+        fam = Counter()
+        ex = {}
+        w0 = Counter()
+        lutany = 0
+        for off, ws in runs:
+            regs = decode(ws)
+            geo = geometry(regs)
+            if geo is None:
+                r = lambda t, a: regs.get((t, a))
+                lut = any(t == 0x1001 and 0x4100 <= a <= 0x4194 and v
+                          for (t, a), v in regs.items())
+                lutany += lut
+                key = (r(0x1001, 0x4010), r(0x1001, 0x4060),
+                       r(0x2001, 0x5034), r(0x2001, 0x5044), lut)
+                fam[key] += 1
+                ex.setdefault(key, (off, len(ws)))
+            elif geo["weight_bits"] == 0:
+                w0[(geo["ic"], geo["oc"], geo["m"])] += 1
+        print("DPU only streams by family (DATA_FORMAT 4010, BN_CFG 4060, "
+              "ERDMA_CFG 5034, RDMA FEATURE 5044, any LUT write):")
+        for key, c in fam.most_common(8):
+            off, n = ex[key]
+            print("  x%-5d %3d words @0x%-9x  4010=%s 4060=%s 5034=%s 5044=%s lut=%s"
+                  % ((c, n, off) + tuple("-" if v is None else
+                     (str(v) if isinstance(v, bool) else "%x" % v) for v in key)))
+        print("  LUT registers written in %d of them" % lutany)
+        print("weight-less convolutions (ic, oc, M): a reduction over ic to one "
+              "channel")
+        for k, c in w0.most_common(6):
+            print("  ", k, "x%d" % c)
+        return 0
+
     if args and args[0] == "--find":
         key, _, val = args[1].partition("=")
         val = int(val, 0)
