@@ -132,6 +132,10 @@ c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
 *)        _kname="not a release this script knows" ;;
 esac
 echo "  kernel    $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
+# ⚠ AN IMAGE INSTALLED SINCE THIS BOOT IS NOT THE KERNEL RUNNING. /proc/1 is
+# as old as the boot; an Image newer than it has not been booted yet.
+[ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
+	echo "  ⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 # ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
 # new data when it was the previous version of this file: `charsiu update dev`
 # had not taken, the output was byte identical to the round before, and the only

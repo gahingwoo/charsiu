@@ -138,6 +138,20 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠⚠ SAY WHICH KERNEL, the same way board_verify does: every kernel this
+# project ships has the same uname, and this script's whole purpose now is to
+# tell two of them apart.
+_ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
+case "$_ksha" in
+c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
+5418f487) _kname="v11-control: v11 as sent + second core, no rocket patches" ;;
+2422dc11) _kname="attach-once-v11: v11 + attach-once + hardirq completion" ;;
+"")       _kname="no /boot/Image readable" ;;
+*)        _kname="not a release this script knows" ;;
+esac
+echo "kernel   $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
+[ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
+	echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 echo "config   chunk $CHUNK, gen $NGEN, $RUNS runs an arm"
 echo "arms     $ARMS"
 # ⚠ DESCRIBE ONLY THE ARMS THAT WILL RUN. The header listed all four while
