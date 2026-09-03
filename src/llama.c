@@ -3452,21 +3452,34 @@ static int attn_block_rows(void)
 		const char *e = getenv("CHARSIU_ATTN_BLOCK");
 
 		/*
-		 * ⚠ OFF, AND THE BOARD IS WHY. Eight rows a pass over the cache
-		 * was 44 ms a row on Qwen3 against 33 a row at a time (phase 9,
-		 * 2026-09-03), slower on four models of eight and equal on the
-		 * rest, with phase 2 nine of nine. The bytes argument that
-		 * motivated it was wrong here: a row of Qwen3 reads 3.7 MB of
-		 * cache in 33 ms, 113 MB/s against a 9 GB/s roof, so the row
-		 * loop was never streaming-bound; it is arithmetic and latency,
-		 * 52 million multiply-adds a row plus a scalar expf per score,
-		 * and reordering the loops does not change either. What can is
-		 * the thread pool, which the token loop's attention does not use
-		 * (round 368: the pool lost at one row a token), and this block
-		 * form is the unit the pool can take: CHARSIU_ATTN_BLOCK=8
-		 * CHARSIU_ATTN_BLOCK_POOL=1 is that arm.
+		 * ⚠ EIGHT ROWS A PASS, ON THE POOL, AND THE BOARD IS WHY, TWICE.
+		 *
+		 * The block alone was SLOWER: 44 ms a row on Qwen3 against 33 a
+		 * row at a time (phase 9, 2026-09-03), slower on four models
+		 * of eight. The bytes argument behind it was wrong: a row of
+		 * Qwen3 reads 3.7 MB of cache in 33 ms, 113 MB/s against a
+		 * 9 GB/s roof, so the row loop was never streaming-bound; it is
+		 * arithmetic -- 52 million multiply-adds a row across 28 layers
+		 * at about one a cycle -- and reordering the loops changes none
+		 * of it.
+		 *
+		 * The block on the pool, one head range a thread over the whole
+		 * chunk, is what the arithmetic wanted, and the same night:
+		 *
+		 *   attention, ms a row    row loop   block+pool
+		 *   Qwen3-0.6B                34.2        14.6    2.3x
+		 *   Phi-3.5                   64.5        23.0    2.8x
+		 *   gemma4-E2B                44.1        16.0    2.8x
+		 *   tinyllama                 31.8        12.8    2.5x
+		 *   SmolLM2-135M              12.5         5.1    2.4x
+		 *
+		 * every one of eight, the whole prompt 1.3 to 1.9x. The serial
+		 * arm's own split says scores 45%, values 50%, softmax the rest,
+		 * so the expf is not the next lever; the axpy's traffic through
+		 * L1 is. 0 is the row-at-a-time control; the pool is
+		 * CHARSIU_ATTN_BLOCK_POOL=0 to switch off on its own.
 		 */
-		v = e ? atoi(e) : 0;
+		v = e ? atoi(e) : 8;
 		if (v < 0)
 			v = 0;
 	}
@@ -3483,8 +3496,11 @@ static int attn_block_pool(void)
 {
 	static int v = -1;
 
-	if (v < 0)
-		v = getenv("CHARSIU_ATTN_BLOCK_POOL") != NULL;
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_BLOCK_POOL");
+
+		v = !(e && *e == '0');
+	}
 	return v;
 }
 
