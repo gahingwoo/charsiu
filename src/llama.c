@@ -249,9 +249,56 @@ struct pool {
 	 */
 	void (*fn)(void *ctx, uint64_t r0, uint64_t n);
 	void *ctx;
+	/*
+	 * ⚠ THE SPLIT WAS STATIC AND THE BOARD IS BIG.LITTLE. Every thread took
+	 * an equal contiguous share, so a dispatch ended when the slowest A53
+	 * finished its eighth while the A72s, three times as fast, sat at the
+	 * barrier. CHARSIU_POOL_DYNAMIC=1 hands out chunks from a cursor as
+	 * threads come free, so the fast cores take more. Off until the board
+	 * prices it: the static split is what every number to date was taken
+	 * with. `chunk` is 0 for the static split.
+	 */
+	uint64_t next, chunk;
 };
 
 static struct pool g_pool;
+
+static int pool_dynamic(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_POOL_DYNAMIC") != NULL;
+	return v;
+}
+
+/*
+ * Arm the split for a job of n items. Every entry that hands the pool work
+ * goes through this: the matvec entry did not, the cursor and chunk it
+ * found were the previous job's, and rows were skipped and repeated -- the
+ * host caught it as changed text on the first run.
+ */
+static void pool_arm(uint64_t n)
+{
+	g_pool.nrows = n;
+	g_pool.next = 0;
+	/* about four chunks a thread, never below one item */
+	g_pool.chunk = pool_dynamic()
+		     ? (n / (4u * (uint64_t)g_pool.n) > 0 ? n / (4u * (uint64_t)g_pool.n) : 1)
+		     : 0;
+	g_pool.done = 0;
+}
+
+/* one range of the current job, whichever kind it is */
+static void pool_do(uint64_t r0, uint64_t n)
+{
+	if (g_pool.fn)
+		g_pool.fn(g_pool.ctx, r0, n);
+	else if (g_pool.nt)
+		npu_matvec(g_pool.nt, g_pool.a, g_pool.y, r0, n);
+	else
+		gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
+}
 
 static void *worker(void *arg)
 {
@@ -271,18 +318,22 @@ static void *worker(void *arg)
 		mygen = g_pool.gen;
 		pthread_mutex_unlock(&g_pool.mu);
 
-		per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
-		r0 = per * (uint64_t)id;
-		n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
-		if (n > per)
-			n = per;
-		if (n) {
-			if (g_pool.fn)
-				g_pool.fn(g_pool.ctx, r0, n);
-			else if (g_pool.nt)
-				npu_matvec(g_pool.nt, g_pool.a, g_pool.y, r0, n);
-			else
-				gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
+		if (g_pool.chunk) {
+			while ((r0 = __atomic_fetch_add(&g_pool.next, g_pool.chunk,
+							__ATOMIC_RELAXED)) < g_pool.nrows) {
+				n = g_pool.nrows - r0;
+				if (n > g_pool.chunk)
+					n = g_pool.chunk;
+				pool_do(r0, n);
+			}
+		} else {
+			per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
+			r0 = per * (uint64_t)id;
+			n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
+			if (n > per)
+				n = per;
+			if (n)
+				pool_do(r0, n);
 		}
 
 		pthread_mutex_lock(&g_pool.mu);
@@ -476,8 +527,7 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
-	g_pool.nrows = n;
-	g_pool.done = 0;
+	pool_arm(n);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -1900,8 +1950,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
-	g_pool.nrows = w->ne[1];
-	g_pool.done = 0;
+	pool_arm(w->ne[1]);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
