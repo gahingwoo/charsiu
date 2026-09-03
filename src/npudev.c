@@ -1353,8 +1353,22 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
 	g->poolread = getenv("CHARSIU_NPU_POOL_READ") != NULL;
-	/* four rows off one line in the read back; =0 is the row-at-a-time control */
-	g->read4 = !getenv("CHARSIU_NPU_READ4") || atoi(getenv("CHARSIU_NPU_READ4")) != 0;
+	/*
+	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
+	 * SLOWER, on every one of eight models, same night (phase 9,
+	 * 2026-09-03: Qwen3 read 3234 ms with it against 1339 without, Phi-3.5
+	 * 27770 against 12408, gemma4 18030 against 7071; pack and fence did
+	 * not move, so the column isolates it). Four rows off one line means
+	 * one read stream and FOUR write streams whose rows sit n floats
+	 * apart -- 4 KB on Qwen3, 32 KB on the wide slices -- and the A72's
+	 * L1 is 32 KB two way with a store buffer that does not merge four
+	 * interleaved partial lines; the host's core does. The bytes argument
+	 * that carried vision's attention across did not carry this: it
+	 * changed which SIDE of the copy is scattered, and the board's side
+	 * cost more. CHARSIU_NPU_READ4=1 is the probe; tools/bench_gather is
+	 * the host number that was wrong about this board.
+	 */
+	g->read4 = getenv("CHARSIU_NPU_READ4") && atoi(getenv("CHARSIU_NPU_READ4")) != 0;
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -4072,9 +4086,23 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 		if (!reuse)
 			g->bin_key[d].valid = 0;   /* until this device's pack lands */
-		if (!reuse)
-			charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
-		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		/*
+		 * ⚠ NO PREP ON A BUFFER ONLY THE DEVICE READS, the way the row
+		 * path already does with `in` (CHARSIU_NPU_INPREP puts it
+		 * back). PREP_BO is a fence wait on WRITERS plus
+		 * dma_sync_sgtable_for_cpu over the whole object, and neither
+		 * does anything for a buffer the hardware never writes and the
+		 * CPU is about to overwrite; the FINI that cleans the CPU's
+		 * writes out to the device stays. Phase 20 priced the batched
+		 * call's "pack" at 22 ms a pass for FOUR rows -- 150 us a call,
+		 * which is not 16 KB of packing, it is the ioctls: two preps
+		 * and two finis a device a call.
+		 */
+		if (g->inprep) {
+			if (!reuse)
+				charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+			charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		}
 		g->handles[nh++] = g->bin[d].handle;
 
 		/*
