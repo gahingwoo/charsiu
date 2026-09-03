@@ -353,6 +353,20 @@ d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
 two=0
 [ -n "$d" ] && [ "$d" -gt 0 ] && two=$((two + d))
 [ -n "$z" ] && [ "$z" -gt 0 ] && two=$((two + z))
+# ⚠⚠ THE PARALLEL ARM COUNTS TOO. This verdict summed `default` and `zero`
+# only, so a round whose parallel arm was WRONG 15 OF 16 -- on the attach-once
+# kernel, 2026-09-03, the round that decided the overlap was not the old
+# kernel's -- ended with "IT DID NOT FIRE" printed under it. The arm that
+# puts the overlap back is the one this script exists to read.
+p=${res_parallel:-}
+if [ -n "$p" ]; then
+	if [ "$p" -gt 0 ]; then
+		echo "parallel (both cores, overlapped): WRONG $p of $RUNS"
+		two=$((two + p))
+	else
+		echo "parallel (both cores, overlapped): $RUNS of $RUNS CLEAN"
+	fi
+fi
 # ⚠ THE SERIAL ARM IS WHAT SHIPS, so it is reported on its own line whatever
 # the rest says. It is also what `default` now runs, so the two agreeing is the
 # expected result and only `parallel` puts the overlap back.
