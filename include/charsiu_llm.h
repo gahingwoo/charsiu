@@ -334,6 +334,10 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 /* the fifth segment: buffers and the output zero, before any packing */
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);
+/* the parts of "pack" that are not packing: the register streams emitted a
+ * slot, and the FINI ioctls a device */
+void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
+				  double *fini, int reset);
 /* how much of prep is the output buffer allocation, and how often */
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
 /* several independent projections of the same activation, one submit, one fence */

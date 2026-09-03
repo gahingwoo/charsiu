@@ -474,6 +474,15 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 		"the memset of Y\n", prep, 100.0 * prep / wall);
 	fprintf(out, "    pack  %8.1f ms  %5.1f%%  gather, quantise, pack into "
 		"the input BO\n", pack, 100.0 * pack / wall);
+	{
+		double emit = 0.0, fini = 0.0;
+
+		charsiu_npu_batch_pack_split(p->dev, &emit, &fini, 0);
+		if (emit + fini > 0.0)
+			fprintf(out, "          of which %8.1f ms emitting register "
+				"streams, %8.1f ms in FINI ioctls, %8.1f ms the packing\n",
+				emit, fini, pack - emit - fini);
+	}
 	fprintf(out, "    sub   %8.1f ms  %5.1f%%  the submit ioctls\n",
 		sub, 100.0 * sub / wall);
 	fprintf(out, "    fence %8.1f ms  %5.1f%%  waiting on the hardware\n",

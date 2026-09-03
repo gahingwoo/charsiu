@@ -434,6 +434,14 @@ struct charsiu_npu {
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
 	/*
+	 * ⚠ PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
+	 * 80: "pack" was 2.0 ms a row, 0.8 ms a call, and the fp16 packer moves
+	 * the 160 KB a call takes in about 7 us. Whatever the other 790 us are
+	 * -- the register streams emitted per slot, the two FINI ioctls a
+	 * device, the copies -- this splits them, so the next round can say.
+	 */
+	double bpack_emit_us, bpack_fini_us;
+	/*
 	 * ⚠⚠ THE DENOMINATOR, AND IT HAS TO LIVE HERE. The obvious one is
 	 * charsiu_npu_pool::hw_ms, but that is only incremented by
 	 * charsiu_pool_rows, which VISION AND WHISPER call and LLAMA DOES
@@ -3235,6 +3243,15 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
  * Wall clock across every charsiu_npu_matmul call. This is the denominator the
  * five shares are read against; see bwall_us for why the pool's hw_ms is not.
  */
+void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
+				  double *fini, int reset)
+{
+	*emit = g->bpack_emit_us / 1e3;
+	*fini = g->bpack_fini_us / 1e3;
+	if (reset)
+		g->bpack_emit_us = g->bpack_fini_us = 0.0;
+}
+
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset)
 {
 	double v = g->bwall_us / 1e3;
@@ -4186,6 +4203,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			}
 		}
 
+		double tpe = now_us();
+
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			unsigned ki = i / e->n_slices;
@@ -4217,9 +4236,12 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			nt++;
 			g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
 		}
+		g->bpack_emit_us += now_us() - tpe;
+		tpe = now_us();
 		if (!reuse)
 			charsiu_bo_fini(g->dev[d], &g->bin[d]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_fini_us += now_us() - tpe;
 		g->bpack_us += now_us() - tp;
 		/*
 		 * THIS device's BO now holds X -- but only if a slice was
