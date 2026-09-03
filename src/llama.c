@@ -3290,6 +3290,99 @@ static inline void attn_axpy(float *out, float a, const float *vt, uint32_t hd)
 }
 
 /*
+ * FOUR POSITIONS A PASS, THE SAME BITS. The serial block arm's split on the
+ * board (phase 9, 2026-09-03) put the values loop at half of attention and
+ * the scores at most of the rest: attn_axpy reads and writes `out` through L1
+ * once per position, and attn_dot's two accumulator chains wait on fma
+ * latency. These do four positions per pass -- one load and one store of
+ * `out` for four, four independent dot chains sharing the q loads -- and
+ * per element they perform exactly the operations of four single calls in
+ * the same order: each product rounded once, each add rounded once, the
+ * accumulators laid out as attn_dot lays them. So the token loop, which
+ * keeps the single-position kernels, still agrees bit for bit.
+ */
+static inline void attn_dot4(const float *qh, const float *k0, const float *k1,
+			     const float *k2, const float *k3, uint32_t hd,
+			     float *o)
+{
+	float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn()) {
+		float32x4_t p0 = vdupq_n_f32(0.0f), q0 = vdupq_n_f32(0.0f);
+		float32x4_t p1 = vdupq_n_f32(0.0f), q1 = vdupq_n_f32(0.0f);
+		float32x4_t p2 = vdupq_n_f32(0.0f), q2 = vdupq_n_f32(0.0f);
+		float32x4_t p3 = vdupq_n_f32(0.0f), q3 = vdupq_n_f32(0.0f);
+
+		for (; i + 8 <= hd; i += 8) {
+			float32x4_t qa = vld1q_f32(qh + i), qb = vld1q_f32(qh + i + 4);
+
+			p0 = vfmaq_f32(p0, qa, vld1q_f32(k0 + i));
+			q0 = vfmaq_f32(q0, qb, vld1q_f32(k0 + i + 4));
+			p1 = vfmaq_f32(p1, qa, vld1q_f32(k1 + i));
+			q1 = vfmaq_f32(q1, qb, vld1q_f32(k1 + i + 4));
+			p2 = vfmaq_f32(p2, qa, vld1q_f32(k2 + i));
+			q2 = vfmaq_f32(q2, qb, vld1q_f32(k2 + i + 4));
+			p3 = vfmaq_f32(p3, qa, vld1q_f32(k3 + i));
+			q3 = vfmaq_f32(q3, qb, vld1q_f32(k3 + i + 4));
+		}
+		a0 = vaddvq_f32(vaddq_f32(p0, q0));
+		a1 = vaddvq_f32(vaddq_f32(p1, q1));
+		a2 = vaddvq_f32(vaddq_f32(p2, q2));
+		a3 = vaddvq_f32(vaddq_f32(p3, q3));
+	}
+#endif
+	for (; i < hd; i++) {
+		a0 += qh[i] * k0[i];
+		a1 += qh[i] * k1[i];
+		a2 += qh[i] * k2[i];
+		a3 += qh[i] * k3[i];
+	}
+	o[0] = a0; o[1] = a1; o[2] = a2; o[3] = a3;
+}
+
+static inline void attn_axpy4(float *out, const float *a, const float *v0,
+			      const float *v1, const float *v2, const float *v3,
+			      uint32_t hd)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain()) {
+		float32x4_t a0 = vdupq_n_f32(a[0]), a1 = vdupq_n_f32(a[1]);
+		float32x4_t a2 = vdupq_n_f32(a[2]), a3 = vdupq_n_f32(a[3]);
+
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t o = vld1q_f32(out + i), p;
+
+			p = vmulq_f32(a0, vld1q_f32(v0 + i));
+			__asm__("" : "+w"(p));
+			o = vaddq_f32(o, p);
+			p = vmulq_f32(a1, vld1q_f32(v1 + i));
+			__asm__("" : "+w"(p));
+			o = vaddq_f32(o, p);
+			p = vmulq_f32(a2, vld1q_f32(v2 + i));
+			__asm__("" : "+w"(p));
+			o = vaddq_f32(o, p);
+			p = vmulq_f32(a3, vld1q_f32(v3 + i));
+			__asm__("" : "+w"(p));
+			vst1q_f32(out + i, vaddq_f32(o, p));
+		}
+	}
+#endif
+	for (; i < hd; i++) {
+		float o = out[i];
+
+		o += a[0] * v0[i];
+		o += a[1] * v1[i];
+		o += a[2] * v2[i];
+		o += a[3] * v3[i];
+		out[i] = o;
+	}
+}
+
+/*
  * ATTENTION, ONE RANGE OF HEADS AT A TIME.
  *
  * Each head reads the whole K and V cache but writes only its own hd floats of
@@ -3559,19 +3652,35 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 			int tmax = j->pos0 + re - 1;
 			double t0 = timed ? now_ms() : 0.0, t1;
 
-			for (int t = tlo_first; t <= tmax; t++) {
-				const float *kt = kbase + (size_t)t * kstride;
+			for (int t = tlo_first; t <= tmax; t += 4) {
+				const float *k0 = kbase + (size_t)t * kstride;
+				int quad = t + 3 <= tmax;
 
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
 					int tlo = j->swa && pos + 1 > j->n_swa
 						? pos + 1 - j->n_swa : 0;
+					const float *qh = j->q + (size_t)r * qstride + h * hd;
+					float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
-					if (t < tlo || t > pos)
+					if (quad && t >= tlo && t + 3 <= pos) {
+						float o[4];
+
+						attn_dot4(qh, k0, k0 + kstride,
+							  k0 + 2 * kstride, k0 + 3 * kstride,
+							  hd, o);
+						sr[t] = o[0] * j->scale;
+						sr[t + 1] = o[1] * j->scale;
+						sr[t + 2] = o[2] * j->scale;
+						sr[t + 3] = o[3] * j->scale;
 						continue;
-					sc[(size_t)(r - rb) * s->n_ctx + t] =
-						attn_dot(j->q + (size_t)r * qstride + h * hd,
-							 kt, hd) * j->scale;
+					}
+					for (int u = t; u < t + 4 && u <= tmax; u++) {
+						if (u < tlo || u > pos)
+							continue;
+						sr[u] = attn_dot(qh, kbase + (size_t)u * kstride,
+								 hd) * j->scale;
+					}
 				}
 			}
 			if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
@@ -3586,19 +3695,29 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 				       hd * sizeof(float));
 			}
 			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
-			for (int t = tlo_first; t <= tmax; t++) {
-				const float *vt = vbase + (size_t)t * kstride;
+			for (int t = tlo_first; t <= tmax; t += 4) {
+				const float *v0 = vbase + (size_t)t * kstride;
+				int quad = t + 3 <= tmax;
 
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
 					int tlo = j->swa && pos + 1 > j->n_swa
 						? pos + 1 - j->n_swa : 0;
+					float *out = j->out + (size_t)r * qstride + h * hd;
+					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
-					if (t < tlo || t > pos)
+					if (quad && t >= tlo && t + 3 <= pos) {
+						attn_axpy4(out, sr + t, v0, v0 + kstride,
+							   v0 + 2 * kstride, v0 + 3 * kstride,
+							   hd);
 						continue;
-					attn_axpy(j->out + (size_t)r * qstride + h * hd,
-						  sc[(size_t)(r - rb) * s->n_ctx + t],
-						  vt, hd);
+					}
+					for (int u = t; u < t + 4 && u <= tmax; u++) {
+						if (u < tlo || u > pos)
+							continue;
+						attn_axpy(out, sr[u],
+							  vbase + (size_t)u * kstride, hd);
+					}
 				}
 			}
 			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
