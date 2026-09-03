@@ -425,6 +425,7 @@ struct charsiu_npu {
 	 * itself whenever it is rebuilt, never assumed from the layout.
 	 */
 	int bmap4;
+	int bmap2;   /* rows 2h, 2h+1 at index, +4: the two-row premise */
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
@@ -1376,7 +1377,14 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * cost more. CHARSIU_NPU_READ4=1 is the probe; tools/bench_gather is
 	 * the host number that was wrong about this board.
 	 */
-	g->read4 = getenv("CHARSIU_NPU_READ4") && atoi(getenv("CHARSIU_NPU_READ4")) != 0;
+	g->read4 = getenv("CHARSIU_NPU_READ4") ? atoi(getenv("CHARSIU_NPU_READ4")) : 0;
+	if (g->read4 == 1)
+		g->read4 = 4;
+	/*
+	 * =2 is the half step the board has not priced: two rows off one line,
+	 * one read stream and TWO write streams, which the A72's store buffer
+	 * may take where it did not take four.
+	 */
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -3503,6 +3511,60 @@ struct read_rows {
 };
 
 /*
+ * TWO ROWS OFF ONE LINE: rows 2h and 2h+1 of a channel quad sit at index and
+ * index+4, 32 bytes of the same line. One read stream, two write streams.
+ * The four-row form below lost 2.3x on the board to its four write streams;
+ * whether two is on the right side of the A72's store buffer is a board
+ * question, and CHARSIU_NPU_READ4=2 asks it. Same arithmetic per element.
+ */
+static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
+{
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	const float *fo = c->fo;
+	float *Y = c->Y;
+	unsigned sn = c->sn, n4 = sn / 4, j;
+	int firstw = c->firstw;
+	const float *sc = g->w4 && c->grp ? s->sc : NULL;
+
+	if (g->read4 != 2 || !g->w4 || !g->bmap2 || r0 % 2 || nr % 2)
+		return 0;
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 2) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *y0 = Y + (size_t)r * e->t->n + s->n0;
+		float *y1 = y0 + e->t->n;
+
+#define ROW2(OP, S0, S1, S2, S3)                                             \
+		for (j = 0; j < n4; j++) {                                   \
+			const float *fp = fo + mp[j];                        \
+			unsigned q = j * 4;                                  \
+			y0[q + 0] OP fp[0] * S0; y0[q + 1] OP fp[1] * S1;    \
+			y0[q + 2] OP fp[2] * S2; y0[q + 3] OP fp[3] * S3;    \
+			y1[q + 0] OP fp[4] * S0; y1[q + 1] OP fp[5] * S1;    \
+			y1[q + 2] OP fp[6] * S2; y1[q + 3] OP fp[7] * S3;    \
+		}
+		if (sc) {
+			if (firstw) { ROW2(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			else        { ROW2(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+		} else {
+			if (firstw) { ROW2(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			else        { ROW2(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
+		}
+#undef ROW2
+		for (j = n4 * 4; j < sn; j++) {
+			unsigned base = mp[j / 4] + j % 4;
+			float s0 = sc ? sc[j] : 1.0f;
+			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0;
+
+			if (firstw) { y0[j] = v0; y1[j] = v1; }
+			else        { y0[j] += v0; y1[j] += v1; }
+		}
+	}
+	return 1;
+}
+
+/*
  * ⚠ FOUR ROWS OFF ONE LINE, and why the last attempt at this loop was wrong
  * about where the time went.
  *
@@ -3540,7 +3602,7 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	int firstw = c->firstw;
 	const float *sc = g->w4 && c->grp ? s->sc : NULL;
 
-	if (!g->read4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
+	if (g->read4 != 4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
 		return 0;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -3589,7 +3651,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 	const struct npu_entry *e = c->e;
 	const struct npu_slot *s = c->s;
 
-	if (read_rows4(c, r0, nr))
+	if (read_rows2(c, r0, nr) || read_rows4(c, r0, nr))
 		return;
 	const float *fo = c->fo;
 	const int32_t *io = c->io;
@@ -4355,6 +4417,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						  (uint32_t)charsiu_acc_index(r, j * 4, m,
 							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
+				/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
+				g->bmap2 = m % 2 == 0;
+				for (unsigned r = 0; g->bmap2 && r < m; r += 2)
+					for (unsigned j = 0; g->bmap2 && j < n4; j++)
+						if (g->bmap[(size_t)(r + 1) * n4 + j] !=
+						    g->bmap[(size_t)r * n4 + j] + 4) {
+							g->bmap2 = 0;
+							break;
+						}
 				/* read_rows4's premise, read off the table just built */
 				g->bmap4 = m % 4 == 0;
 				for (unsigned r = 0; g->bmap4 && r < m; r += 4)
