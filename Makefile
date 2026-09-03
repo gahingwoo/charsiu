@@ -178,17 +178,24 @@ $(BUILD)/npu_slice_test: tools/npu_slice_test.c $(LLM) | $(BUILD)
 $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
+$(BUILD)/bench_gather: tools/bench_gather.c $(SRC) | $(BUILD)
+	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
+
 $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key
 	./$(BUILD)/pack_int4
+	./$(BUILD)/reuse_key
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+$(BUILD)/reuse_key: tests/reuse_key.c src/reusekey.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
 	rm -rf $(BUILD)

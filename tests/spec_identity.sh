@@ -51,6 +51,12 @@ if [ -z "$RUN" ] && [ -f "$ROOT/Makefile" ]; then
 	make -C "$ROOT" build/charsiu_run >/dev/null && RUN="$ROOT/build/charsiu_run"
 fi
 [ -x "${RUN:-/nonexistent}" ] || { echo "no charsiu_run to test with"; exit 2; }
+# ⚠⚠ NOT UNDER $ROOT/build. On the board ROOT is /opt and there is no build/,
+# and a redirection that cannot open its file stops the whole command: phase
+# 20's first board run ran the spec arm of ten models ZERO times and reported
+# all ten as differing from plain.
+ERR=${TMPDIR:-/tmp}/charsiu-spec.$$.err
+trap 'rm -f "$ERR"' EXIT
 
 # the generated text only: everything before the runner's own report
 text() { sed '/^\[load /,$d'; }
@@ -61,6 +67,9 @@ accepted() { sed -n 's/.*accepted \([0-9]*\).*/\1/p'; }
 bad=0; n=0; skipped=0
 for mdl in "$DIR"/*.gguf; do
 	[ -e "$mdl" ] || continue
+	# a vision projector is not a language model: the runner has nothing to
+	# decode, and the board read it as "the arm ran plain and said nothing"
+	case "$(basename "$mdl")" in mmproj-*) continue;; esac
 	n=$((n + 1))
 	name=$(basename "$mdl")
 	# ⚠ A MODEL THAT STOPS AT ONCE VERIFIES NOTHING. gemma-3-1b answers a
@@ -72,16 +81,16 @@ for mdl in "$DIR"/*.gguf; do
 	# ⚠ DECIDED ON THE PASS COUNT, NOT ON THE TEXT: the runner echoes the
 	# prompt, so a word count of the output is never small.
 	EXTRA=""
-	spec=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 2>"$ROOT/build/spec.err")
+	spec=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 2>"$ERR")
 	np=$(printf '%s' "$spec" | specline | sed -n 's/.*: \([0-9]*\) passes.*/\1/p')
-	if [ "${np:-0}" -le 2 ] && ! grep -q "refuses this model\|speculation is off" "$ROOT/build/spec.err"; then
+	if [ "${np:-0}" -le 2 ] && ! grep -q "refuses this model\|speculation is off" "$ERR"; then
 		EXTRA="--ignore-eos"
-		spec=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 $EXTRA 2>"$ROOT/build/spec.err")
+		spec=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 $EXTRA 2>"$ERR")
 	fi
 	plain=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
-	if grep -q "refuses this model\|speculation is off" "$ROOT/build/spec.err"; then
+	if grep -q "refuses this model\|speculation is off" "$ERR"; then
 		printf '  – %-40s refused: %s\n' "$name" \
-		    "$(sed -n 's/.*(\(.*\)).*/\1/p' "$ROOT/build/spec.err" | head -1)"
+		    "$(sed -n 's/.*(\(.*\)).*/\1/p' "$ERR" | head -1)"
 		skipped=$((skipped + 1))
 		continue
 	fi

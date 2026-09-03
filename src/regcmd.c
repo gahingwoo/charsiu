@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "charsiu.h"
+#include "envq.h"
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
@@ -150,7 +151,7 @@ static void emit(struct emitter *e, unsigned target, unsigned reg, uint32_t val)
  */
 enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm)
 {
-	if (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_A8_STRIDE1"))
+	if (mm->wdtype == CHARSIU_INT4 && !envq("CHARSIU_A8_STRIDE1"))
 		return CHARSIU_FP16;    /* any 2 byte type: the atom is 8 */
 	return mm->adtype;
 }
@@ -186,7 +187,7 @@ enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm)
  */
 static unsigned entry_atomics(void)
 {
-	const char *e = getenv("CHARSIU_ENTRY_ATOMICS");
+	const char *e = envq("CHARSIU_ENTRY_ATOMICS");
 	int v = e ? atoi(e) : 4;
 
 	return (v == 8) ? 8u : 4u;
@@ -206,7 +207,7 @@ unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm)
 
 unsigned charsiu_k_eff(const struct charsiu_matmul *mm)
 {
-	if (getenv("CHARSIU_NO_KALIGN"))
+	if (envq("CHARSIU_NO_KALIGN"))
 		return mm->k;
 	return charsiu_k_padded(mm->k, charsiu_effective_adtype(mm));
 }
@@ -437,10 +438,10 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 	 *   2            [k/atom][atom][m], rows innermost, element interleaved
 	 */
 	{
-		unsigned lay = getenv("CHARSIU_A_LAYOUT")
-			? (unsigned)atoi(getenv("CHARSIU_A_LAYOUT")) : 0;
-		unsigned gran = getenv("CHARSIU_A_GRAN")
-			? (unsigned)atoi(getenv("CHARSIU_A_GRAN")) : atom;
+		unsigned lay = envq("CHARSIU_A_LAYOUT")
+			? (unsigned)atoi(envq("CHARSIU_A_LAYOUT")) : 0;
+		unsigned gran = envq("CHARSIU_A_GRAN")
+			? (unsigned)atoi(envq("CHARSIU_A_GRAN")) : atom;
 
 		if (!gran)
 			gran = atom;
@@ -566,7 +567,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 		static int plain = -1;
 
 		if (plain < 0)
-			plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
+			plain = envq("CHARSIU_NPU_PLAIN") != NULL;
 
 		if (!plain && lay != 2) {
 			unsigned m = mm->m, k = mm->k;
@@ -779,7 +780,7 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 	static int plain = -1;
 
 	if (plain < 0)
-		plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
+		plain = envq("CHARSIU_NPU_PLAIN") != NULL;
 	if (mm->m == 1 && !plain) {
 		size_t used = (size_t)mm->k * 2;
 
@@ -1090,7 +1091,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * CHARSIU_W4_BITPAT selects the old layout, and it is the same switch
 	 * that restores the old CORE registers, so the two cannot disagree.
 	 */
-	if (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_W4_BITPAT")) {
+	if (mm->wdtype == CHARSIU_INT4 && !envq("CHARSIU_W4_BITPAT")) {
 		/*
 		 * ⚠ THE BOUND AND THE DIVISIONS ARE HOISTED. The first version
 		 * called charsiu_weight_bytes() inside the inner loop, which is
@@ -1144,8 +1145,8 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	}
 
 	if (mm->wdtype == CHARSIU_INT4) {
-		unsigned order = getenv("CHARSIU_INT4_ORDER")
-			? (unsigned)atoi(getenv("CHARSIU_INT4_ORDER")) : 0;
+		unsigned order = envq("CHARSIU_INT4_ORDER")
+			? (unsigned)atoi(envq("CHARSIU_INT4_ORDER")) : 0;
 
 		/*
 		 * K is refused outside 64 and 32 because those are the only two

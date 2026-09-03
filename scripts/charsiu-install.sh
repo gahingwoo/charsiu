@@ -11,6 +11,8 @@
 #   sh charsiu-install.sh --prefix DIR stage instead of installing
 #   sh charsiu-install.sh --uninstall  remove what this installed
 #   sh charsiu-install.sh --dev        the probes too, and track dev
+#   sh charsiu-install.sh --yes        every question answers yes (-y)
+#   sh charsiu-install.sh --no-demo    do not offer the one-sentence run at the end
 #   CHARSIU_PLAIN=1 ...                no full-screen dialogs
 #
 # ⚠ TWO CHANNELS. stable is the runtime and is what a fresh install gets. dev
@@ -262,6 +264,7 @@ DRY=0
 DOKERNEL=ask
 DOMODEL=1
 DOBUILD=1
+DEMO=1
 UNINSTALL=0
 
 CHANNEL="${CHARSIU_CHANNEL:-stable}"
@@ -273,6 +276,16 @@ while [ $# -gt 0 ]; do
 	--no-kernel) DOKERNEL=no; shift ;;
 	--no-model)  DOMODEL=0; shift ;;
 	--no-build)  DOBUILD=0; shift ;;
+	# ⚠ --yes IS THE SAME SWITCH THE DRY RUN USES WITHOUT A TERMINAL, and it
+	# answers EVERY question yes, the kernel step included; charsiu update
+	# passes it together with --no-kernel, so there the only questions left
+	# are "install the compiler" and the demo, and it takes --no-demo too.
+	--yes|-y)    CTUI_ASSUME=yes; export CTUI_ASSUME; shift ;;
+	--no-demo)   DEMO=0; shift ;;
+	# `charsiu update --auto` spells it as --yes --no-demo; accepted here
+	# too, so an older charsiu-update that passes --auto straight through
+	# is not told "unknown option" by the tree it just fetched.
+	--auto)      CTUI_ASSUME=yes; export CTUI_ASSUME; DEMO=0; shift ;;
 	# stable installs the runtime; dev adds the probes. See INSTALL_BINS.
 	--channel)   CHANNEL="$2"; shift 2 ;;
 	--dev)       CHANNEL=dev; shift ;;
@@ -1062,7 +1075,9 @@ fi
 # ⚠ A REPORT IS NOT A DEMONSTRATION. Ending on a list of ticks leaves someone
 # who has waited through a build and a download with no evidence the thing
 # talks. One sentence is cheap and it is the whole point of installing it.
-if [ "$DRY" = 1 ]; then
+if [ "$DEMO" = 0 ]; then
+	: # an update on a board that has already talked does not need proving
+elif [ "$DRY" = 1 ]; then
 	would "charsiu -p 'The capital of France is' -n 32   (one sentence, to prove it works)"
 elif [ -n "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ] && [ "$NPU_OK" = 1 ]; then
 	if ui_yesno "Ask it something, to see it work?

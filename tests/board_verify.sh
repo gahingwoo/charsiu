@@ -119,6 +119,23 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+# ⚠⚠ SAY WHICH KERNEL. Every kernel this project ships is 7.2.0-rc5-next-20260730
+# by uname, so a round pasted from the board cannot be told apart by release
+# string, and the one that decided whether the core-pair overlap is a kernel
+# fault or a runtime fault was pasted without any. The Image hash can.
+_ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
+case "$_ksha" in
+c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
+5418f487) _kname="v11-control: v11 as sent + second core, no rocket patches" ;;
+2422dc11) _kname="attach-once-v11: v11 + attach-once + hardirq completion" ;;
+"")       _kname="no /boot/Image readable" ;;
+*)        _kname="not a release this script knows" ;;
+esac
+echo "  kernel    $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
+# ⚠ AN IMAGE INSTALLED SINCE THIS BOOT IS NOT THE KERNEL RUNNING. /proc/1 is
+# as old as the boot; an Image newer than it has not been booted yet.
+[ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
+	echo "  ⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 # ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
 # new data when it was the previous version of this file: `charsiu update dev`
 # had not taken, the output was byte identical to the round before, and the only
@@ -492,9 +509,15 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		*)      E=CHARSIU_READ_DUMMY=1 ;;
 		esac
 		# shellcheck disable=SC2086
+		# ⚠ THE SHIPPED WIDTHS, AND THE STAGE CLOCK. This pinned KMAX and
+		# the group to 1024 after the default had moved to 2048, so the
+		# split it printed was of a configuration nobody runs; and it
+		# never asked for CHARSIU_STAGES, so the prompt's CPU side --
+		# attention, norms, rope, the activation -- was invisible next to
+		# the matmul entry it was priced against.
 		env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-		    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
-		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 $E \
+		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		    CHARSIU_STAGES=1 $E \
 		    "$BIN/charsiu_run" "$M" -p "$P9" -n 4 --ignore-eos \
 		    >"$OUT/.ttft_$arm" 2>"$OUT/.ttft_$arm.err"
 		eval "t_$arm=\$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' \
@@ -530,6 +553,17 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		awk '/charsiu NPU batched:/ { f = 1 }
 		     f { if (/charsiu NPU batched:/ || /^    /) print; else exit }' \
 		    "$OUT/.ttft_err" | sed 's/^/      /'
+		# ⚠ AND THE OTHER SIDE OF THE PROMPT: the batched path's own
+		# stage table, per row, from stdout. Matmul rows are the NPU
+		# calls above seen from the caller; the rest is the CPU, and on
+		# Qwen3 it was a thousand of 1298 ms with no name on it.
+		if grep -q "charsiu batched stages:" "$OUT/.ttft_out"; then
+			awk '/charsiu batched stages:/ { f = 1; n++ }
+			     f && n == 1 { if (/charsiu batched stages:/ || /^  /) print; else exit }' \
+			    "$OUT/.ttft_out" | sed 's/^/      /'
+		else
+			printf '      ⚠ no batched stage table: the runner predates it, or CHARSIU_STAGES did not take\n'
+		fi
 	else
 		# ⚠ NOT A SKIP. On the board this block is the whole phase, and
 		# its absence means either nothing took the batched path or the
@@ -1410,7 +1444,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # batched matmul at m = 4 and the host only ever ran that a row at a time.
    run 20
    have spec_identity.sh || { skip 20 "spec_identity.sh not installed (dev channel)"; break; }
-   sh "$BIN/spec_identity.sh" "$MODELS" 48 >"$OUT/verify-spec.txt" 2>&1
+   # ⚠⚠ WITH THE NPU ENVIRONMENT. The first board run of this phase called
+   # the script bare, which is the CPU: the identity it would have reported
+   # is the host's, run on a board. (It reported nothing, because the script
+   # also wrote its stderr file under a build/ the board does not have, and a
+   # redirection that cannot open its file stops the command.)
+   env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+       CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+       sh "$BIN/spec_identity.sh" "$MODELS" 48 >"$OUT/verify-spec.txt" 2>&1
    rc=$?
    sed 's/^/  /' "$OUT/verify-spec.txt"
    wedged "phase 20" && break
@@ -1426,17 +1467,76 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# on P9, whose continuation 257 258 259 has never occurred before, so
 	# the lookup drafted nothing useful and accepted 11%. The identity
 	# test's prompt asks for repetition, which is the case this drafter
-	# is for; open prose is phase 20's second row below.
+	# is for.
+	#
+	# ⚠ THE FIRST REAL READING, 2026-09-02, Qwen3 on the attach-once
+	# kernel: plain 28.94 tok/s, --spec 3 21.65, --spec 5 21.32. A pass at
+	# m = 4 cost 2.51 decode steps and yielded 1.90 tokens, so speculation
+	# LOST 25% -- the batched path serialises the two cores (the overlap
+	# corrupts, see batch_serial) and pays the fence and the read back
+	# per pass. The fourth arm below puts the overlap back for the price
+	# and checks the text, because that finding predates the attach-once
+	# kernel; if its text is identical the pass is about half the price
+	# and the sum changes sign. Every spec arm's text is checked against
+	# plain: on the board the pass is a real batched matmul at m = 4.
+	#
+	# ⚠ SECOND READING, same night, harness fixed: 9 of 9 language models
+	# identical x3 on the NPU, and +parallel IDENTICAL on Qwen3 at m = 4
+	# with a pass = 2.11 steps (2.51 serialised). One model at one width;
+	# the shape that failed was phi3 at m = 24, 13 of 16 wrong, so what
+	# decides the default is CHARSIU_NPU_BATCH_PARALLEL=1 on phase 2, not
+	# this arm.
 	SPEC_P="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
-	for arm in "" "--spec 3" "--spec 5"; do
-		r=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-		    "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $arm 2>/dev/null)
+	SPEC_ENV="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
+	PT=""; PTOK=0; PMS=0
+	for arm in plain "--spec 3" "--spec 5" "--spec 3 +parallel"; do
+		opt=$arm; par=""
+		case "$arm" in
+		plain) opt="";;
+		*+parallel) opt="--spec 3"; par="CHARSIU_NPU_BATCH_PARALLEL=1";;
+		esac
+		r=$(env $SPEC_ENV $par "$BIN/charsiu_run" "$SM" -p "$SPEC_P" -n "${SPEC_N:-96}" --ignore-eos $opt 2>"$OUT/.spec_err")
 		gen=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms, \([0-9.]*\) tok\/s.*/\3 tok\/s (\1 tok, \2 ms)/p')
+		tok=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms.*/\1/p')
+		ms=$(printf '%s' "$r" | sed -n 's/.*| gen \([0-9]*\) tok in \([0-9]*\) ms.*/\2/p')
 		sl=$(printf '%s' "$r" | grep '^\[spec ' | sed 's/^\[spec k=[0-9]*: //; s/\]$//')
-		printf '    %-9s %s%s\n' "${arm:-plain}" "$gen" "${sl:+   $sl}"
+		passes=$(printf '%s' "$sl" | sed -n 's/^\([0-9]*\) passes.*/\1/p')
+		t=$(printf '%s' "$r" | sed '/^\[load /,$d')
+		v=""; steps=""
+		if [ "$arm" = plain ]; then
+			PT=$t; PTOK=${tok:-0}; PMS=${ms:-0}
+		else
+			if [ "$t" = "$PT" ]; then v="text identical"; else v="⚠⚠ TEXT DIFFERS from plain"; fi
+			case "$arm" in
+			*+parallel) ;;
+			*) [ "$t" = "$PT" ] || bad "phase 20: $arm text differs from plain on $(basename "$SM")";;
+			esac
+			[ "${passes:-0}" -gt 0 ] && [ "$PTOK" -gt 0 ] && [ "$PMS" -gt 0 ] &&
+			    steps=$(awk -v ms="$ms" -v p="$passes" -v pms="$PMS" -v pt="$PTOK" \
+				'BEGIN { printf "a pass = %.2f decode steps", (ms / p) / (pms / pt) }')
+		fi
+		printf '    %-18s %s%s%s%s\n' "$arm" "${gen:-no gen line}" "${sl:+   $sl}" "${steps:+   $steps}" "${v:+   $v}"
+		# ⚠ WHERE A PASS GOES. 2.11 steps a pass with the cores overlapped
+		# is still 1.1 steps of something that is not a decode step, and
+		# nothing had ever printed what. The runtime's batched report has
+		# the five shares; this divides them by the passes. The prompt's
+		# own batched chunk is in there too, once.
+		if [ "$arm" = plain ]; then
+			hw=$(sed -n 's/^charsiu NPU: \([0-9]*\) ms in the hardware path.*/\1/p' "$OUT/.spec_err" | head -1)
+			[ -n "$hw" ] && [ "${tok:-0}" -gt 0 ] && \
+			    awk -v hw="$hw" -v t="$tok" 'BEGIN { printf "                       a decode step in the hardware path: %.1f ms\n", hw / t }'
+		elif grep -q "charsiu NPU batched:" "$OUT/.spec_err" && [ "${passes:-0}" -gt 0 ]; then
+			awk -v p="$passes" '
+			    /^charsiu NPU batched:/ { w = $4; inb = 1; next }
+			    inb && /^    (prep|pack|sub|fence|read|other) / { v[$1] = $2 }
+			    inb && /^    input reuse/ { inb = 0 }
+			    END { if (w > 0) printf "                       a pass in the batched entry: %.1f ms = prep %.1f + pack %.1f + sub %.1f + fence %.1f + read %.1f + other %.1f\n", w / p, v["prep"] / p, v["pack"] / p, v["sub"] / p, v["fence"] / p, v["read"] / p, v["other"] / p }' "$OUT/.spec_err"
+		fi
+		wedged "phase 20" && break
 	done
-	printf '  ⚠ tok/s over passes = the pass cost in decode steps; compare it to tok/pass.\n'
+	printf '  ⚠ speculation wins only where tok/pass is above the steps a pass costs.\n'
+	printf '  ⚠ +parallel is a PROBE: its text differing is the known fault, and identical\n'
+	printf '    would mean the core pair overlap was the old kernel, and the pass is cheaper.\n'
    fi
    wedged "phase 20" && break
    ;;
@@ -1540,13 +1640,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 22) say "22. input reuse: which site breaks which model"
-   # ⚠⚠ REUSE IS OFF BY DEFAULT BECAUSE OF THIS. Phase 2 stopped two rounds on
-   # it: 6 of 9 models with one key for two devices, then Phi-3.5 and gemma4
-   # with a key per device -- the two whose projections are views of a fused
-   # tensor or come with per-layer embeddings. The host cannot see either
-   # fault. This phase turns it on for those two models one SITE at a time
-   # (k after q, v after q, up after gate) and reads phase 2's own comparison
-   # off each, so the next fix is aimed at a site and not at a guess.
+   # ⚠⚠ REUSE WAS OFF FOR A DAY BECAUSE OF THIS. Phase 2 stopped two rounds
+   # on it: 6 of 9 models with one key for two devices, then Phi-3.5 and
+   # gemma4 with a key per device. The host cannot see either fault. This
+   # phase turns it on for those models one SITE at a time (k after q, v
+   # after q, up after gate) and reads phase 2's own comparison off each.
+   # Its first table (2026-09-02: Phi-3.5 k and up, gemma4 up, Qwen3 nothing)
+   # is what found the key with no expiry -- which site breaks is which core
+   # the follower is dealt to -- and its second read identical on all 15
+   # cells. Reuse is on by default since; this phase is the bisect if phase
+   # 2 ever stops on it again.
    run 22
    have board_text_all.sh || { skip 22 "board_text_all.sh not installed"; break; }
    for MO in ${REUSE_MODELS:-Phi-3.5 gemma-4 Qwen3}; do

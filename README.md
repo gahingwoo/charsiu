@@ -10,18 +10,18 @@ the vendor's speed:
 ```
                      decode tok/s            time to first token, ms
                      charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          24.70    24.85          1399      469
-  TinyLLAMA 1.1B      20.44    19.71          2003      544
-  Phi3 3.8B            6.84     6.58          5838     1829
-  Gemma4 E2B           8.63     9.23          4160     1219
+  Qwen3 0.6B          24.28    24.85          1037      469
+  TinyLLAMA 1.1B      20.34    19.71          1565      544
+  Phi3 3.8B            6.82     6.58          5073     1829
+  Gemma4 E2B           8.68     9.23          3604     1219
 ```
 
 Every projection, including the output head, runs on the NPU at four bits, and the
 text is identical to what the CPU decode loop writes. Prefill is the open front:
-about a third of the vendor's, because every projection still comes back to the CPU
-between layers. The numbers are read off `board_verify.sh 7`, the same prompt and
-protocol the vendor publishes, and the rest of this file says how they are known to
-be right.
+between a third and a half of the vendor's, because every projection still comes
+back to the CPU between layers. The numbers are read off `board_verify.sh 7`, the
+same prompt and protocol the vendor publishes, and the rest of this file says how
+they are known to be right.
 
 It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files.
 
@@ -115,6 +115,8 @@ sh install.sh --dev          the probes too, from the start
 charsiu update dev           switch an existing install, no reinstall needed
 charsiu update stable        go back
 charsiu update               whichever it was last told, remembered
+charsiu update --auto        no questions, no demo at the end (-y);
+                             `auto = yes` under [update] in config.ini keeps it
 ```
 
 `charsiu doctor` says which channel it is on, which matters when a log gets
@@ -298,6 +300,22 @@ board with a control:
   M pixels wide and the hardware stops computing past 5120 input entries; an int8
   batch is M rows high and stops past 8192. Both were walked on the board, both are
   refused above the last exact cell, and the tower chunks its rows under the second.
+
+And three moved the prompt, on a 915 token prompt at chunk 80, measured the same way:
+
+- **attention runs eight rows a pass over the cache, a head range a thread, four
+  positions a pass.** It was 45 to 72 percent of a long prompt, one row at a time on
+  one core; it is 3.5 to 3.8 times faster on every model of eight, and each row still
+  scores the same positions in the same order with the same kernels the token loop
+  uses, so the text does not move. `CHARSIU_ATTN_BLOCK=0` is the row loop.
+- **the packed input is reused across q, k and v and across gate and up**, on the
+  core that packed it; the key expires at every leader, which is what phase 22 of
+  `board_verify.sh` found the first version did not do.
+- **a batched call does half the ioctls it did**, and asks the environment once
+  rather than fifteen times per register stream: a four row speculative pass went
+  from 2.5 decode steps to 2.1.
+- **the thread pool hands out chunks from a cursor**, so the four A72s take more
+  than the four A53s instead of waiting for them.
 
 ### More than one architecture, and two things that were quietly wrong
 

@@ -289,6 +289,14 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 				     unsigned max_tensors);
 void charsiu_npu_close(struct charsiu_npu *g);
+/*
+ * The PM QoS hold that keeps the CPUs out of deep idle while the NPU is open
+ * is taken at open and dropped at close, which is the shape of a one-shot
+ * run. A server holds the device for days: charsiu_npu_idle(g, 1) drops the
+ * hold between requests and charsiu_npu_idle(g, 0) takes it back before the
+ * next one. NULL and a device with no hold are no-ops.
+ */
+void charsiu_npu_idle(struct charsiu_npu *g, int idle);
 int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
 /* int4 takes the float activation; int8 needs q1 realised first */
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
@@ -316,7 +324,7 @@ int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses);
-/* whether CHARSIU_NPU_REUSE=1 is set: matmul_same packs like matmul without it */
+/* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
 
@@ -793,6 +801,10 @@ struct llama_state {
 	float *q;              /* n_head * head_dim */
 	float *k, *v;          /* n_head_kv * head_dim */
 	float *att;            /* n_head * n_ctx */
+	/* the batched prompt's attention scores, CHARSIU_ATTN_BLOCK rows at a
+	 * time: [rows][n_head][n_ctx], built on first use */
+	float *batt;
+	unsigned batt_rows;
 	float *logits;         /* n_vocab */
 	/* gemma4's per layer embeddings: [n_layer][n_embd_pl], and scratch */
 	float *pl, *plb, *plc;

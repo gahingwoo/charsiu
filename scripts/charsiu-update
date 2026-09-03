@@ -35,10 +35,26 @@ command -v ini_get >/dev/null 2>&1 \
 # Installing dev on somebody's board without them asking is how a tool stops
 # being trusted. The channel is remembered, so `charsiu update` after
 # `charsiu update dev` stays on dev, and `charsiu update stable` goes back.
+#
+# ⚠ --auto (or -y): NO QUESTIONS. An update on a board that has already run a
+# model asks exactly one thing on a good day, "ask it something, to see it
+# work?", and somebody updating ten times an afternoon has to answer it ten
+# times. With --auto the demo is skipped and whatever else the installer would
+# ask -- a missing compiler, on a board that has lost one -- answers yes. The
+# kernel and the model are still not touched: --no-kernel and --no-model are
+# not questions, they are what this command is. `auto = yes` under [update]
+# in config.ini makes it the default.
 CHANNEL=""
-case "${1:-}" in
-dev|stable) CHANNEL=$1; shift ;;
-esac
+AUTO=""
+_n=$#
+while [ "$_n" -gt 0 ]; do
+	_a=$1; shift; _n=$((_n - 1))
+	case "$_a" in
+	dev|stable) CHANNEL=$_a ;;
+	--auto|-y)  AUTO=1 ;;
+	*)          set -- "$@" "$_a" ;;
+	esac
+done
 
 SRC=""
 for d in ${CHARSIU_SRC:+"$CHARSIU_SRC"} \
@@ -72,9 +88,16 @@ stable) REF=stable ;;
 	exit 1 ;;
 esac
 
+if [ -z "$AUTO" ]; then
+	case "$(ini_get update auto 2>/dev/null || echo "")" in
+	yes|1|true) AUTO=1 ;;
+	esac
+fi
+
 was=$(cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || echo "")
 echo "  source  $SRC${was:+  ($was)}"
 echo "  channel $CHANNEL  ($REF)"
+[ -n "$AUTO" ] && echo "  auto    no questions, no demo"
 
 # ⚠ `git pull` INTO A TREE SOMEBODY EDITED would either fail or merge. This is
 # a working copy of ours, not theirs, so --ff-only: if it will not fast forward
@@ -113,5 +136,6 @@ fi
 
 # ⚠ HAND OVER RATHER THAN REBUILD HERE. The installer is the one place that
 # knows how to build, where the binaries go, and how to ask for root once.
+[ -n "$AUTO" ] && set -- --yes --no-demo "$@"
 exec sh "$SRC/scripts/charsiu-install.sh" --no-kernel --no-model \
 	--channel "$CHANNEL" "$@"

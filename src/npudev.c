@@ -32,6 +32,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "reusekey.h"
 #include "charsiu.h"
 #include "charsiu_llm.h"
 
@@ -378,13 +379,7 @@ struct charsiu_npu {
 	 * wide enough to be split across both cores. One key for two buffers
 	 * described neither.
 	 */
-	struct {
-		const float *x;
-		unsigned m;
-		uint64_t k;
-		uint8_t zp;
-		int valid;
-	} bin_key[2];
+	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
 	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
 	size_t bin_stride, bout_stride;
@@ -423,6 +418,13 @@ struct charsiu_npu {
 	uint32_t *bmap;
 	unsigned bmap_m;
 	unsigned bmap_n4;	/* the table is one entry per FOUR channels */
+	/*
+	 * Whether rows 4h..4h+3 of every channel quad sit at index, +4, +8,
+	 * +12 in this table -- one 64-byte line -- which is what lets the read
+	 * back take four rows off one line (read_rows4). Checked on the table
+	 * itself whenever it is rebuilt, never assumed from the layout.
+	 */
+	int bmap4;
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
@@ -751,6 +753,7 @@ struct charsiu_npu {
 	 * itself exactly DOUBLING. See the note above read_rows.
 	 */
 	int poolread;
+	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
 	 * 0 is the hardware doing all of it, which is every round before 371.
@@ -1123,6 +1126,9 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
  * patches ONE AT A TIME. It would still be correct, and it would be slower than
  * the CPU it was moved off.
  */
+/* defined after charsiu_npu_close, where the hold is dropped too */
+static void qos_hold(struct charsiu_npu *g, int say);
+
 struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 					  unsigned max_tensors, int want_w4)
 {
@@ -1347,6 +1353,22 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
 	g->poolread = getenv("CHARSIU_NPU_POOL_READ") != NULL;
+	/*
+	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
+	 * SLOWER, on every one of eight models, same night (phase 9,
+	 * 2026-09-03: Qwen3 read 3234 ms with it against 1339 without, Phi-3.5
+	 * 27770 against 12408, gemma4 18030 against 7071; pack and fence did
+	 * not move, so the column isolates it). Four rows off one line means
+	 * one read stream and FOUR write streams whose rows sit n floats
+	 * apart -- 4 KB on Qwen3, 32 KB on the wide slices -- and the A72's
+	 * L1 is 32 KB two way with a store buffer that does not merge four
+	 * interleaved partial lines; the host's core does. The bytes argument
+	 * that carried vision's attention across did not carry this: it
+	 * changed which SIDE of the copy is scattered, and the board's side
+	 * cost more. CHARSIU_NPU_READ4=1 is the probe; tools/bench_gather is
+	 * the host number that was wrong about this board.
+	 */
+	g->read4 = getenv("CHARSIU_NPU_READ4") && atoi(getenv("CHARSIU_NPU_READ4")) != 0;
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -1425,27 +1447,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * CHARSIU_NPU_DMA_LATENCY_US moves the bound. Needs root, which the
 	 * board has; without it this says so once and carries on.
 	 */
-	if (!getenv("CHARSIU_NPU_IDLE")) {
-		const char *e = getenv("CHARSIU_NPU_DMA_LATENCY_US");
-		int32_t us = e ? (int32_t)atoi(e) : 100;
-		int fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
-
-		if (fd >= 0 && write(fd, &us, sizeof(us)) == (ssize_t)sizeof(us)) {
-			g->qos_fd = fd;
-			fprintf(stderr, "charsiu NPU: holding the CPUs out of idle "
-				"states deeper than %d us while the NPU is open "
-				"(CHARSIU_NPU_IDLE=1 to allow them)\n", (int)us);
-		} else {
-			int err = errno;
-
-			if (fd >= 0)
-				close(fd);
-			fprintf(stderr, "charsiu NPU: could not hold "
-				"/dev/cpu_dma_latency (%s); deep idle stays "
-				"allowed, which costs about a quarter of decode\n",
-				strerror(err));
-		}
-	}
+	qos_hold(g, 1);
 	return g;
 
 fail:
@@ -1463,14 +1465,65 @@ int charsiu_npu_batches(const struct charsiu_npu *g)
 	return g && !g->w4;
 }
 
+/*
+ * Take the PM QoS hold described above charsiu_npu_open_mode's call, if it
+ * is not held already and the control has not been asked for. `say` prints
+ * the one line about it: the open says it, a server taking the hold back
+ * before every request does not.
+ */
+static void qos_hold(struct charsiu_npu *g, int say)
+{
+	const char *e;
+	int32_t us;
+	int fd;
+
+	if (g->qos_fd >= 0 || getenv("CHARSIU_NPU_IDLE"))
+		return;
+	e = getenv("CHARSIU_NPU_DMA_LATENCY_US");
+	us = e ? (int32_t)atoi(e) : 100;
+	fd = open("/dev/cpu_dma_latency", O_RDWR | O_CLOEXEC);
+	if (fd >= 0 && write(fd, &us, sizeof(us)) == (ssize_t)sizeof(us)) {
+		g->qos_fd = fd;
+		if (say)
+			fprintf(stderr, "charsiu NPU: holding the CPUs out of idle "
+				"states deeper than %d us while the NPU is open "
+				"(CHARSIU_NPU_IDLE=1 to allow them)\n", (int)us);
+	} else {
+		int err = errno;
+
+		if (fd >= 0)
+			close(fd);
+		if (say)
+			fprintf(stderr, "charsiu NPU: could not hold "
+				"/dev/cpu_dma_latency (%s); deep idle stays "
+				"allowed, which costs about a quarter of decode\n",
+				strerror(err));
+	}
+}
+
+/*
+ * A server holds the device for days and sits at accept() between requests;
+ * the hold is for a request, not for the process. See charsiu_llm.h.
+ */
+void charsiu_npu_idle(struct charsiu_npu *g, int idle)
+{
+	if (!g)
+		return;
+	if (idle) {
+		if (g->qos_fd >= 0) {
+			close(g->qos_fd);      /* the CPUs may sleep deeply again */
+			g->qos_fd = -1;
+		}
+	} else {
+		qos_hold(g, 0);
+	}
+}
+
 void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
-	if (g->qos_fd >= 0) {
-		close(g->qos_fd);      /* the CPUs may sleep deeply again */
-		g->qos_fd = -1;
-	}
+	charsiu_npu_idle(g, 1);
 	if (g->dev[0]) {
 		for (unsigned i = 0; i < g->n_slot; i++) {
 			unsigned d = g->slot[i].di;
@@ -3100,7 +3153,7 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
-	g->bin_key[0].valid = g->bin_key[1].valid = 0;   /* BOs replaced */
+	reuse_keys_drop(g->bin_key, 2);   /* BOs replaced */
 	if (m > g->bm)
 		g->bm = m;
 	if (nks > g->bnks)
@@ -3432,12 +3485,95 @@ struct read_rows {
 	int grp, firstw;
 };
 
+/*
+ * ⚠ FOUR ROWS OFF ONE LINE, and why the last attempt at this loop was wrong
+ * about where the time went.
+ *
+ * The comment inside read_rows below reasons that a 16-byte run out of a
+ * 64-byte line costs the DRAM four times the surface. It does not: the other
+ * three quarters of that line are rows r+1, r+2 and r+3 of the SAME channel
+ * quad -- index, +4, +8, +12 in the w4a16 layout -- and the row-at-a-time
+ * loop comes back for them on the next three row passes, a working set of
+ * n/4 lines apart, which the L2 keeps. What it pays is one L2 round trip per
+ * row per line instead of one per line, four times the load instructions and
+ * four times the table reads.
+ *
+ * Measured on the host with tools/bench_gather, byte for byte the same Y:
+ * walking the surface in order and scattering into Y, the fix that comment
+ * proposes, is 4 to 10 times SLOWER (the scatter side gets the partial lines
+ * and the TLB); taking the four rows off each line once is 1.4 to 2.2 times
+ * faster at every shape from m = 32 by 1024 to m = 80 by 8192. The board is
+ * the one that prices it -- the board is where a NEON form of the row loop
+ * moved nothing -- and CHARSIU_NPU_READ4=0 is the row-at-a-time control.
+ *
+ * The premise is checked on the table when it is built (g->bmap4), the
+ * arithmetic per element is the row loop's exactly (multiply, then assign
+ * or add), and anything this cannot take -- int8, a width that is not a
+ * multiple of four, a pooled range that is not four aligned -- goes through
+ * the row loop unchanged.
+ */
+static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
+{
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	const float *fo = c->fo;
+	float *Y = c->Y;
+	unsigned sn = c->sn, n4 = sn / 4, j;
+	int firstw = c->firstw;
+	const float *sc = g->w4 && c->grp ? s->sc : NULL;
+
+	if (!g->read4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
+		return 0;
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *y0 = Y + (size_t)r * e->t->n + s->n0;
+		float *y1 = y0 + e->t->n, *y2 = y1 + e->t->n, *y3 = y2 + e->t->n;
+
+#define ROW4(OP, S0, S1, S2, S3)                                             \
+		for (j = 0; j < n4; j++) {                                   \
+			const float *fp = fo + mp[j];                        \
+			unsigned q = j * 4;                                  \
+			y0[q + 0] OP fp[0]  * S0; y0[q + 1] OP fp[1]  * S1;  \
+			y0[q + 2] OP fp[2]  * S2; y0[q + 3] OP fp[3]  * S3;  \
+			y1[q + 0] OP fp[4]  * S0; y1[q + 1] OP fp[5]  * S1;  \
+			y1[q + 2] OP fp[6]  * S2; y1[q + 3] OP fp[7]  * S3;  \
+			y2[q + 0] OP fp[8]  * S0; y2[q + 1] OP fp[9]  * S1;  \
+			y2[q + 2] OP fp[10] * S2; y2[q + 3] OP fp[11] * S3;  \
+			y3[q + 0] OP fp[12] * S0; y3[q + 1] OP fp[13] * S1;  \
+			y3[q + 2] OP fp[14] * S2; y3[q + 3] OP fp[15] * S3;  \
+		}
+		if (sc) {
+			if (firstw) { ROW4(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			else        { ROW4(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+		} else {
+			if (firstw) { ROW4(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			else        { ROW4(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
+		}
+#undef ROW4
+		/* the tail past the last whole quad, per row, as the row loop does */
+		for (j = n4 * 4; j < sn; j++) {
+			unsigned base = mp[j / 4] + j % 4;
+			float s0 = sc ? sc[j] : 1.0f;
+			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0,
+			      v2 = fo[base + 8] * s0, v3 = fo[base + 12] * s0;
+
+			if (firstw) { y0[j] = v0; y1[j] = v1; y2[j] = v2; y3[j] = v3; }
+			else        { y0[j] += v0; y1[j] += v1; y2[j] += v2; y3[j] += v3; }
+		}
+	}
+	return 1;
+}
+
 static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 {
 	struct read_rows *c = ctx;
 	struct charsiu_npu *g = c->g;
 	const struct npu_entry *e = c->e;
 	const struct npu_slot *s = c->s;
+
+	if (read_rows4(c, r0, nr))
+		return;
 	const float *fo = c->fo;
 	const int32_t *io = c->io;
 	float *Y = c->Y;
@@ -3922,12 +4058,25 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 */
 	uint8_t zp = g->slot[e->first].job.input_zero_point;
 
+	/*
+	 * ⚠⚠ A LEADER DROPS EVERY KEY FIRST, on the devices this tensor will
+	 * not pack as much as on the ones it will: the caller not declaring
+	 * its input unchanged means X is new everywhere. reusekey.h has the
+	 * round that found out (phase 22: q on core 0, gate on core 1, up
+	 * back on core 0 reading the attention input).
+	 */
+	if (!g->reuse_ask)
+		reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
+
 	for (unsigned d = 0; d < g->ndev; d++) {
-		unsigned nt = 0, nh = 0, done_ki = 0;
+		unsigned nt = 0, nh = 0, done_ki = 0, need = 0;
 		double tp = now_us();
-		int reuse = g->reuse_ask && g->bin_key[d].valid &&
-			    g->bin_key[d].x == X && g->bin_key[d].m == m &&
-			    g->bin_key[d].k == e->t->k && g->bin_key[d].zp == zp;
+
+		for (unsigned i = 0; i < e->count; i++)
+			if (g->slot[e->first + i].di == d)
+				need |= 1u << (i / e->n_slices);
+		int reuse = g->reuse_ask &&
+			    reuse_key_hit(&g->bin_key[d], X, m, e->t->k, zp, need);
 
 		if (g->reuse_ask) {
 			if (reuse)
@@ -3937,9 +4086,23 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 		if (!reuse)
 			g->bin_key[d].valid = 0;   /* until this device's pack lands */
-		if (!reuse)
-			charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
-		charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		/*
+		 * ⚠ NO PREP ON A BUFFER ONLY THE DEVICE READS, the way the row
+		 * path already does with `in` (CHARSIU_NPU_INPREP puts it
+		 * back). PREP_BO is a fence wait on WRITERS plus
+		 * dma_sync_sgtable_for_cpu over the whole object, and neither
+		 * does anything for a buffer the hardware never writes and the
+		 * CPU is about to overwrite; the FINI that cleans the CPU's
+		 * writes out to the device stays. Phase 20 priced the batched
+		 * call's "pack" at 22 ms a pass for FOUR rows -- 150 us a call,
+		 * which is not 16 KB of packing, it is the ioctls: two preps
+		 * and two finis a device a call.
+		 */
+		if (g->inprep) {
+			if (!reuse)
+				charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+			charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		}
 		g->handles[nh++] = g->bin[d].handle;
 
 		/*
@@ -4063,13 +4226,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * actually packed into it. A tensor with no slot here wrote
 		 * nothing, and the key must not claim otherwise.
 		 */
-		if (!reuse && done_ki) {
-			g->bin_key[d].x = X;
-			g->bin_key[d].m = m;
-			g->bin_key[d].k = e->t->k;
-			g->bin_key[d].zp = zp;
-			g->bin_key[d].valid = 1;
-		}
+		if (!reuse && done_ki)
+			reuse_key_set(&g->bin_key[d], X, m, e->t->k, zp, done_ki);
 		if (!nt)
 			continue;
 		tp = now_us();
@@ -4175,6 +4333,16 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						  (uint32_t)charsiu_acc_index(r, j * 4, m,
 							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
+				/* read_rows4's premise, read off the table just built */
+				g->bmap4 = m % 4 == 0;
+				for (unsigned r = 0; g->bmap4 && r < m; r += 4)
+					for (unsigned j = 0; g->bmap4 && j < n4; j++)
+						for (unsigned lo = 1; lo < 4; lo++)
+							if (g->bmap[(size_t)(r + lo) * n4 + j] !=
+							    g->bmap[(size_t)r * n4 + j] + lo * 4) {
+								g->bmap4 = 0;
+								break;
+							}
 			}
 			/*
 			 * ⚠⚠ NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
@@ -4267,15 +4435,22 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 }
 
 /*
- * ⚠⚠ OFF UNLESS ASKED, AND THE BOARD IS WHY. Input reuse shipped twice in one
- * day and phase 2 stopped the round both times: first 6 of 9 models, with one
- * key for two devices; then, with a key per device, still Phi-3.5 and
- * gemma4-E2B -- the two whose projections are VIEWS of a fused tensor or come
- * with per-layer embeddings. Whatever the second fault is, the host cannot
- * see it (no NPU: the batched path falls back to the row loop) and two rounds
- * of guessing is the budget this file allows before a change goes back to
- * being a probe. CHARSIU_NPU_REUSE=1 turns it on; board_verify's reuse phase
- * is the way to find out which model it breaks and how.
+ * ⚠⚠ ON, AND IT WAS OFF FOR A DAY BECAUSE OF THE BOARD. Input reuse shipped
+ * twice in one day and phase 2 stopped the round both times: first 6 of 9
+ * models, with one key for two devices; then, with a key per device, still
+ * Phi-3.5 and gemma4-E2B. The host cannot see either fault (no NPU: the
+ * batched path falls back to the row loop), and two rounds of guessing was
+ * the budget before this went back to being a probe.
+ *
+ * Phase 22 then bisected it by site: Phi-3.5 broke on k after q, gemma4 on
+ * up after gate, Qwen3 on nothing. The second fault was a key with no
+ * expiry -- a leader packing one core left the other core's key naming the
+ * same buffer with the old contents (reusekey.h). "Views of a fused tensor"
+ * and "per-layer embeddings", the two guesses, were wrong. With the leader
+ * drop phase 22 read identical on all 15 cells (2026-09-02), and the drop
+ * can only turn a hit into a miss, so nothing that was right before it can
+ * be wrong after it. CHARSIU_NPU_REUSE=0 turns it off; phase 22 is the
+ * bisect if phase 2 ever stops on it again.
  */
 static int reuse_enabled(void)
 {
@@ -4284,7 +4459,7 @@ static int reuse_enabled(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_NPU_REUSE");
 
-		v = e && *e && *e != '0';
+		v = !(e && *e == '0');
 	}
 	return v;
 }

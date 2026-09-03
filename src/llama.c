@@ -249,9 +249,66 @@ struct pool {
 	 */
 	void (*fn)(void *ctx, uint64_t r0, uint64_t n);
 	void *ctx;
+	/*
+	 * ⚠ THE SPLIT WAS STATIC AND THE BOARD IS BIG.LITTLE. Every thread took
+	 * an equal contiguous share, so a dispatch ended when the slowest A53
+	 * finished its eighth while the A72s, three times as fast, sat at the
+	 * barrier. CHARSIU_POOL_DYNAMIC=1 hands out chunks from a cursor as
+	 * threads come free, so the fast cores take more. Off until the board
+	 * prices it: the static split is what every number to date was taken
+	 * with. `chunk` is 0 for the static split.
+	 */
+	uint64_t next, chunk;
 };
 
 static struct pool g_pool;
+
+static int pool_dynamic(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_POOL_DYNAMIC");
+
+		/*
+		 * ON. Phase 9, 2026-09-04, attention ms a row against the
+		 * static split: Qwen3 9.9 to 6.7, Phi-3.5 17.0 to 13.5,
+		 * tinyllama 8.4 to 6.3, Qwen2.5 8.6 to 5.9, SmolLM2-1.7B 10.2
+		 * to 7.6; gemma3 and gemma4 unmoved. The prompt 6 of 8 faster,
+		 * Qwen3 56.7 to 68.7 tok/s. =0 is the static split.
+		 */
+		v = !(e && *e == '0');
+	}
+	return v;
+}
+
+/*
+ * Arm the split for a job of n items. Every entry that hands the pool work
+ * goes through this: the matvec entry did not, the cursor and chunk it
+ * found were the previous job's, and rows were skipped and repeated -- the
+ * host caught it as changed text on the first run.
+ */
+static void pool_arm(uint64_t n)
+{
+	g_pool.nrows = n;
+	g_pool.next = 0;
+	/* about four chunks a thread, never below one item */
+	g_pool.chunk = pool_dynamic()
+		     ? (n / (4u * (uint64_t)g_pool.n) > 0 ? n / (4u * (uint64_t)g_pool.n) : 1)
+		     : 0;
+	g_pool.done = 0;
+}
+
+/* one range of the current job, whichever kind it is */
+static void pool_do(uint64_t r0, uint64_t n)
+{
+	if (g_pool.fn)
+		g_pool.fn(g_pool.ctx, r0, n);
+	else if (g_pool.nt)
+		npu_matvec(g_pool.nt, g_pool.a, g_pool.y, r0, n);
+	else
+		gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
+}
 
 static void *worker(void *arg)
 {
@@ -271,18 +328,22 @@ static void *worker(void *arg)
 		mygen = g_pool.gen;
 		pthread_mutex_unlock(&g_pool.mu);
 
-		per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
-		r0 = per * (uint64_t)id;
-		n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
-		if (n > per)
-			n = per;
-		if (n) {
-			if (g_pool.fn)
-				g_pool.fn(g_pool.ctx, r0, n);
-			else if (g_pool.nt)
-				npu_matvec(g_pool.nt, g_pool.a, g_pool.y, r0, n);
-			else
-				gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
+		if (g_pool.chunk) {
+			while ((r0 = __atomic_fetch_add(&g_pool.next, g_pool.chunk,
+							__ATOMIC_RELAXED)) < g_pool.nrows) {
+				n = g_pool.nrows - r0;
+				if (n > g_pool.chunk)
+					n = g_pool.chunk;
+				pool_do(r0, n);
+			}
+		} else {
+			per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
+			r0 = per * (uint64_t)id;
+			n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
+			if (n > per)
+				n = per;
+			if (n)
+				pool_do(r0, n);
 		}
 
 		pthread_mutex_lock(&g_pool.mu);
@@ -476,8 +537,7 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
-	g_pool.nrows = n;
-	g_pool.done = 0;
+	pool_arm(n);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -1900,8 +1960,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
-	g_pool.nrows = w->ne[1];
-	g_pool.done = 0;
+	pool_arm(w->ne[1]);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -3047,7 +3106,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bfreq);
 	free(s->bpl); free(s->bplg);
 
-	free(s->att); free(s->logits);
+	free(s->att); free(s->batt); free(s->logits);
 	charsiu_act_free(&s->act);
 	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
 		npu_report(s->pool.t, s->pool.n);
@@ -3165,6 +3224,29 @@ static const char *stage_name[ST_N] = {
 
 static double stage_ms[ST_N];
 static unsigned stage_tok;
+/*
+ * ⚠ THE BATCHED PROMPT HAD NO STAGES. The fourteen above are the token
+ * loop's; batch_layers, which is where every prompt token goes, was never
+ * instrumented, so on a board where Qwen3's prompt takes 1298 ms and its
+ * batched matmul entry about 300 of them, nothing had ever said where the
+ * other thousand went. Kept apart from the token loop's numbers because a
+ * row of a batch and a decoded token do not cost the same thing.
+ */
+static double bstage_ms[ST_N];
+static unsigned bstage_rows, bstage_chunks;
+/* the serial block arm's attention, in three parts: scores, softmax, values */
+static double battn_ms[3];
+/*
+ * ⚠ THE MATMUL STAGES WERE TWICE THE NPU ENTRY. Phase 9 on the board,
+ * 2026-09-04, Qwen3: the seven projection rows of the batched stage table
+ * summed to 12.3 ms a row while the NPU's own batched entry reported 5.8, and
+ * the 6.4 between them had no name -- a third of the prompt. A projection the
+ * hardware refuses falls back to matvec a row at a time in silence, which is
+ * the shape of that number; this says how many rows did, and how much of the
+ * matmul stages was inside the entry, in its wrapper, or on the CPU.
+ */
+static double bmm_entry_ms, bmm_wrap_ms, bmm_fell_ms;
+static unsigned long bmm_fell_rows, bmm_calls;
 
 void llama_stages_reset(void)
 {
@@ -3178,7 +3260,36 @@ void llama_stages_report(void)
 	double tot = 0;
 	unsigned i;
 
-	if (stage_on <= 0 || !stage_tok)
+	if (stage_on <= 0 || (!stage_tok && !bstage_rows))
+		return;
+	if (bstage_rows) {
+		double bt = 0;
+
+		for (i = 0; i < ST_N; i++)
+			bt += bstage_ms[i];
+		printf("charsiu batched stages: %u rows in %u chunks, %.2f ms a row"
+		       " (%.0f ms)\n", bstage_rows, bstage_chunks,
+		       bt / bstage_rows, bt);
+		for (i = 0; i < ST_N; i++)
+			if (bstage_ms[i] > 0.0)
+				printf("  %-16s %8.2f ms a row     %5.1f%%\n",
+				       stage_name[i], bstage_ms[i] / bstage_rows,
+				       100.0 * bstage_ms[i] / bt);
+		printf("  (\"residual\" after o proj carries the ffn rmsnorm too, and"
+		       " \"rope + kv copy\" only the rope)\n");
+		if (bmm_calls)
+			printf("  %-16s %lu calls: %.2f ms a row inside the NPU entry, "
+			       "%.2f in its wrapper, %.2f on the CPU (%lu rows fell back)\n",
+			       "matmul rows:", bmm_calls, bmm_entry_ms / bstage_rows,
+			       bmm_wrap_ms / bstage_rows, bmm_fell_ms / bstage_rows,
+			       bmm_fell_rows);
+		if (battn_ms[0] + battn_ms[1] + battn_ms[2] > 0.0)
+			printf("  %-16s scores %.2f  softmax %.2f  values %.2f ms a row"
+			       "  (the serial block arm's split)\n", "attention:",
+			       battn_ms[0] / bstage_rows, battn_ms[1] / bstage_rows,
+			       battn_ms[2] / bstage_rows);
+	}
+	if (!stage_tok)
 		return;
 	for (i = 0; i < ST_N; i++)
 		tot += stage_ms[i];
@@ -3192,6 +3303,160 @@ void llama_stages_report(void)
 }
 
 /* ---- the forward pass ---------------------------------------------------- */
+
+/*
+ * THE TWO INNER KERNELS OF ATTENTION, in one place, because two loops use
+ * them: the token loop's attn_heads below, a row at a time, and the batched
+ * prompt's attn_block, several rows a pass over the cache. Whatever they
+ * compute they compute bit for bit the same in both, which is what lets the
+ * batched prompt be checked against the token loop by text alone.
+ */
+static inline float attn_dot(const float *qh, const float *kt, uint32_t hd)
+{
+	float a = 0.0f;
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * ⚠ OPT OUT ONLY. A dot product is a reduction and four lanes add it
+	 * up in a different ORDER; that is a last bit, and a last bit moved a
+	 * token on the host. It did not on the board in round 370, and it is
+	 * the default since 372. CHARSIU_EXACT_ATTN goes back.
+	 */
+	if (fast_attn()) {
+		float32x4_t a0 = vdupq_n_f32(0.0f);
+		float32x4_t a1 = vdupq_n_f32(0.0f);
+
+		for (; i + 8 <= hd; i += 8) {
+			a0 = vfmaq_f32(a0, vld1q_f32(qh + i), vld1q_f32(kt + i));
+			a1 = vfmaq_f32(a1, vld1q_f32(qh + i + 4),
+				       vld1q_f32(kt + i + 4));
+		}
+		a = vaddvq_f32(vaddq_f32(a0, a1));
+	}
+#endif
+	for (; i < hd; i++)
+		a += qh[i] * kt[i];
+	return a;
+}
+
+static inline void attn_axpy(float *out, float a, const float *vt, uint32_t hd)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * Each i lands in its own accumulator, so there is no reduction and
+	 * no order to change. The barrier keeps the multiply and the add
+	 * separately rounded, which is what the scalar line below compiles to.
+	 */
+	if (!cpu_plain()) {
+		float32x4_t av = vdupq_n_f32(a);
+
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t p = vmulq_f32(av, vld1q_f32(vt + i));
+
+			__asm__("" : "+w"(p));
+			vst1q_f32(out + i, vaddq_f32(vld1q_f32(out + i), p));
+		}
+	}
+#endif
+	for (; i < hd; i++)
+		out[i] += a * vt[i];
+}
+
+/*
+ * FOUR POSITIONS A PASS, THE SAME BITS. The serial block arm's split on the
+ * board (phase 9, 2026-09-03) put the values loop at half of attention and
+ * the scores at most of the rest: attn_axpy reads and writes `out` through L1
+ * once per position, and attn_dot's two accumulator chains wait on fma
+ * latency. These do four positions per pass -- one load and one store of
+ * `out` for four, four independent dot chains sharing the q loads -- and
+ * per element they perform exactly the operations of four single calls in
+ * the same order: each product rounded once, each add rounded once, the
+ * accumulators laid out as attn_dot lays them. So the token loop, which
+ * keeps the single-position kernels, still agrees bit for bit.
+ */
+static inline void attn_dot4(const float *qh, const float *k0, const float *k1,
+			     const float *k2, const float *k3, uint32_t hd,
+			     float *o)
+{
+	float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn()) {
+		float32x4_t p0 = vdupq_n_f32(0.0f), q0 = vdupq_n_f32(0.0f);
+		float32x4_t p1 = vdupq_n_f32(0.0f), q1 = vdupq_n_f32(0.0f);
+		float32x4_t p2 = vdupq_n_f32(0.0f), q2 = vdupq_n_f32(0.0f);
+		float32x4_t p3 = vdupq_n_f32(0.0f), q3 = vdupq_n_f32(0.0f);
+
+		for (; i + 8 <= hd; i += 8) {
+			float32x4_t qa = vld1q_f32(qh + i), qb = vld1q_f32(qh + i + 4);
+
+			p0 = vfmaq_f32(p0, qa, vld1q_f32(k0 + i));
+			q0 = vfmaq_f32(q0, qb, vld1q_f32(k0 + i + 4));
+			p1 = vfmaq_f32(p1, qa, vld1q_f32(k1 + i));
+			q1 = vfmaq_f32(q1, qb, vld1q_f32(k1 + i + 4));
+			p2 = vfmaq_f32(p2, qa, vld1q_f32(k2 + i));
+			q2 = vfmaq_f32(q2, qb, vld1q_f32(k2 + i + 4));
+			p3 = vfmaq_f32(p3, qa, vld1q_f32(k3 + i));
+			q3 = vfmaq_f32(q3, qb, vld1q_f32(k3 + i + 4));
+		}
+		a0 = vaddvq_f32(vaddq_f32(p0, q0));
+		a1 = vaddvq_f32(vaddq_f32(p1, q1));
+		a2 = vaddvq_f32(vaddq_f32(p2, q2));
+		a3 = vaddvq_f32(vaddq_f32(p3, q3));
+	}
+#endif
+	for (; i < hd; i++) {
+		a0 += qh[i] * k0[i];
+		a1 += qh[i] * k1[i];
+		a2 += qh[i] * k2[i];
+		a3 += qh[i] * k3[i];
+	}
+	o[0] = a0; o[1] = a1; o[2] = a2; o[3] = a3;
+}
+
+static inline void attn_axpy4(float *out, const float *a, const float *v0,
+			      const float *v1, const float *v2, const float *v3,
+			      uint32_t hd)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain()) {
+		float32x4_t a0 = vdupq_n_f32(a[0]), a1 = vdupq_n_f32(a[1]);
+		float32x4_t a2 = vdupq_n_f32(a[2]), a3 = vdupq_n_f32(a[3]);
+
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t o = vld1q_f32(out + i), p;
+
+			p = vmulq_f32(a0, vld1q_f32(v0 + i));
+			__asm__("" : "+w"(p));
+			o = vaddq_f32(o, p);
+			p = vmulq_f32(a1, vld1q_f32(v1 + i));
+			__asm__("" : "+w"(p));
+			o = vaddq_f32(o, p);
+			p = vmulq_f32(a2, vld1q_f32(v2 + i));
+			__asm__("" : "+w"(p));
+			o = vaddq_f32(o, p);
+			p = vmulq_f32(a3, vld1q_f32(v3 + i));
+			__asm__("" : "+w"(p));
+			vst1q_f32(out + i, vaddq_f32(o, p));
+		}
+	}
+#endif
+	for (; i < hd; i++) {
+		float o = out[i];
+
+		o += a[0] * v0[i];
+		o += a[1] * v1[i];
+		o += a[2] * v2[i];
+		o += a[3] * v3[i];
+		out[i] = o;
+	}
+}
 
 /*
  * ATTENTION, ONE RANGE OF HEADS AT A TIME.
@@ -3298,37 +3563,9 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 
 			for (q = 0; q < n; q++) {
 				const float *qh = s->q + (g0 + q) * hd;
-				float a = 0.0f;
-				uint32_t i = 0;
 
-#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-				/*
-				 * ⚠ OPT OUT ONLY. A dot product is a reduction
-				 * and four lanes add it up in a different
-				 * ORDER; that is a last bit, and a last bit
-				 * moved a token on the host. It did not on the
-				 * board in round 370, and it is the default
-				 * since 372. CHARSIU_EXACT_ATTN goes back.
-				 */
-				if (fast_attn()) {
-					float32x4_t a0 = vdupq_n_f32(0.0f);
-					float32x4_t a1 = vdupq_n_f32(0.0f);
-
-					for (; i + 8 <= hd; i += 8) {
-						a0 = vfmaq_f32(a0,
-							vld1q_f32(qh + i),
-							vld1q_f32(kt + i));
-						a1 = vfmaq_f32(a1,
-							vld1q_f32(qh + i + 4),
-							vld1q_f32(kt + i + 4));
-					}
-					a = vaddvq_f32(vaddq_f32(a0, a1));
-				}
-#endif
-				for (; i < hd; i++)
-					a += qh[i] * kt[i];
 				s->att[(size_t)(g0 + q) * s->n_ctx + t] =
-					a * j->scale;
+					attn_dot(qh, kt, hd) * j->scale;
 			}
 		}
 
@@ -3348,37 +3585,247 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			const float *vt = vbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
-				float *out = s->xb + (g0 + q) * hd;
-				float a = s->att[(size_t)(g0 + q) * s->n_ctx + t];
-				uint32_t i = 0;
-
-#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-				/*
-				 * Each i lands in its own accumulator, so there
-				 * is no reduction and no order to change. The
-				 * barrier keeps the multiply and the add
-				 * separately rounded, which is what the scalar
-				 * line below compiles to.
-				 */
-				if (!cpu_plain()) {
-					float32x4_t av = vdupq_n_f32(a);
-
-					for (; i + 4 <= hd; i += 4) {
-						float32x4_t p = vmulq_f32(av,
-							vld1q_f32(vt + i));
-
-						__asm__("" : "+w"(p));
-						vst1q_f32(out + i,
-							vaddq_f32(vld1q_f32(out + i),
-								  p));
-					}
-				}
-#endif
-				for (; i < hd; i++)
-					out[i] += a * vt[i];
+				attn_axpy(s->xb + (g0 + q) * hd,
+					  s->att[(size_t)(g0 + q) * s->n_ctx + t],
+					  vt, hd);
 			}
 		}
 	}
+}
+
+/*
+ * ⚠⚠ THE BATCHED PROMPT'S ATTENTION, SEVERAL ROWS A PASS OVER THE CACHE.
+ *
+ * Phase 9 on the board, 2026-09-03, a 915 token prompt: attention was 72% of
+ * Qwen3's prefill, 61% of tinyllama's, 43% of Phi-3.5's -- 33 ms a row on
+ * Qwen3 against 3 for its q, k and v together. batch_layers called attn_heads
+ * once per row, so a row streamed the whole K and V cache before it and the
+ * next row streamed it again: n passes over a cache that grows with n, which
+ * is the quadratic term with the worst constant it can have.
+ *
+ * This walks the cache once per CHARSIU_ATTN_BLOCK rows (8). For each row it
+ * scores exactly the positions the row loop scored, in the same order, with
+ * the same attn_dot; softmaxes the same window; and accumulates V in the same
+ * ascending t with the same attn_axpy. Only the loop nest moved. The vision
+ * tower's attention took the same step and moved 3.71x on the host and 10.32x
+ * on the board, for the same reason: bytes.
+ *
+ * CHARSIU_ATTN_BLOCK=0 is the row-at-a-time control, and phase 2 -- the
+ * batched prompt against its own token loop, nine models -- is the check.
+ */
+static int attn_block_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_BLOCK");
+
+		/*
+		 * ⚠ EIGHT ROWS A PASS, ON THE POOL, AND THE BOARD IS WHY, TWICE.
+		 *
+		 * The block alone was SLOWER: 44 ms a row on Qwen3 against 33 a
+		 * row at a time (phase 9, 2026-09-03), slower on four models
+		 * of eight. The bytes argument behind it was wrong: a row of
+		 * Qwen3 reads 3.7 MB of cache in 33 ms, 113 MB/s against a
+		 * 9 GB/s roof, so the row loop was never streaming-bound; it is
+		 * arithmetic -- 52 million multiply-adds a row across 28 layers
+		 * at about one a cycle -- and reordering the loops changes none
+		 * of it.
+		 *
+		 * The block on the pool, one head range a thread over the whole
+		 * chunk, is what the arithmetic wanted, and the same night:
+		 *
+		 *   attention, ms a row    row loop   block+pool
+		 *   Qwen3-0.6B                34.2        14.6    2.3x
+		 *   Phi-3.5                   64.5        23.0    2.8x
+		 *   gemma4-E2B                44.1        16.0    2.8x
+		 *   tinyllama                 31.8        12.8    2.5x
+		 *   SmolLM2-135M              12.5         5.1    2.4x
+		 *
+		 * every one of eight, the whole prompt 1.3 to 1.9x. The serial
+		 * arm's own split says scores 45%, values 50%, softmax the rest,
+		 * so the expf is not the next lever; the axpy's traffic through
+		 * L1 is. 0 is the row-at-a-time control; the pool is
+		 * CHARSIU_ATTN_BLOCK_POOL=0 to switch off on its own.
+		 */
+		v = e ? atoi(e) : 8;
+		if (v < 0)
+			v = 0;
+	}
+	return v;
+}
+
+/*
+ * ⚠ ITS OWN NAME. CHARSIU_ATTN_POOL already exists and gates the TOKEN
+ * loop's attention, the one round 368 measured at 22.70 ms a token pooled
+ * against 7.75 serial; an arm that set it to test this would have slowed
+ * decode in the same run and read the two together.
+ */
+static int attn_block_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_BLOCK_POOL");
+
+		v = !(e && *e == '0');
+	}
+	return v;
+}
+
+struct attn_block_job {
+	struct llama_state *s;
+	uint32_t l;          /* the cache's layer (kv_from resolved) */
+	int pos0, n;         /* row r sits at position pos0 + r */
+	int swa, n_swa;      /* a window layer sees the last n_swa positions */
+	uint32_t hd, hdmax, kvdim, gqa, nkv, n_head;
+	float scale;
+	const float *q;      /* [n][n_head * hd], roped */
+	float *out;          /* [n][n_head * hd] */
+	int R;               /* rows a pass over the cache */
+};
+
+/*
+ * One range of heads over every row of the chunk, in row blocks of R. Heads
+ * are independent -- each reads the cache and writes its own hd floats of
+ * every row -- so this is the unit the pool splits, and a head's arithmetic
+ * per (row, position) is attn_heads' exactly: attn_dot, softmax over the
+ * same window, attn_axpy in ascending t.
+ */
+static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
+{
+	struct attn_block_job *j = ctx;
+	struct llama_state *s = j->s;
+	uint32_t hd = j->hd, hdmax = j->hdmax, gqa = j->gqa, nkv = j->nkv;
+	int R = j->R, n = j->n;
+	size_t qstride = (size_t)j->n_head * hd;
+	int timed = stage_on > 0 && !attn_block_pool();
+
+	for (uint32_t h = (uint32_t)h0; h < (uint32_t)(h0 + nh_); h++) {
+		uint32_t kvh = h / gqa;
+		const float *kbase, *vbase;
+		size_t kstride;
+		float *sc = s->batt + (size_t)h * R * s->n_ctx;
+
+		if (kv_posmajor()) {
+			size_t b = (size_t)j->l * s->n_ctx * j->kvdim
+				 + (size_t)kvh * hd;
+
+			kbase = s->kcache + b;
+			vbase = s->vcache + b;
+			kstride = j->kvdim;
+		} else {
+			size_t b = (size_t)(j->l * nkv + kvh) * s->n_ctx * hdmax;
+
+			kbase = s->kcache + b;
+			vbase = s->vcache + b;
+			kstride = hdmax;
+		}
+		for (int rb = 0; rb < n; rb += R) {
+			int re = rb + R < n ? rb + R : n;
+			int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
+				      ? j->pos0 + rb + 1 - j->n_swa : 0;
+			int tmax = j->pos0 + re - 1;
+			double t0 = timed ? now_ms() : 0.0, t1;
+
+			for (int t = tlo_first; t <= tmax; t += 4) {
+				const float *k0 = kbase + (size_t)t * kstride;
+				int quad = t + 3 <= tmax;
+
+				for (int r = rb; r < re; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+					const float *qh = j->q + (size_t)r * qstride + h * hd;
+					float *sr = sc + (size_t)(r - rb) * s->n_ctx;
+
+					if (quad && t >= tlo && t + 3 <= pos) {
+						float o[4];
+
+						attn_dot4(qh, k0, k0 + kstride,
+							  k0 + 2 * kstride, k0 + 3 * kstride,
+							  hd, o);
+						sr[t] = o[0] * j->scale;
+						sr[t + 1] = o[1] * j->scale;
+						sr[t + 2] = o[2] * j->scale;
+						sr[t + 3] = o[3] * j->scale;
+						continue;
+					}
+					for (int u = t; u < t + 4 && u <= tmax; u++) {
+						if (u < tlo || u > pos)
+							continue;
+						sr[u] = attn_dot(qh, kbase + (size_t)u * kstride,
+								 hd) * j->scale;
+					}
+				}
+			}
+			if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
+			for (int r = rb; r < re; r++) {
+				int pos = j->pos0 + r;
+				int tlo = j->swa && pos + 1 > j->n_swa
+					? pos + 1 - j->n_swa : 0;
+
+				softmax(sc + (size_t)(r - rb) * s->n_ctx + tlo,
+					pos + 1 - tlo);
+				memset(j->out + (size_t)r * qstride + h * hd, 0,
+				       hd * sizeof(float));
+			}
+			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
+			for (int t = tlo_first; t <= tmax; t += 4) {
+				const float *v0 = vbase + (size_t)t * kstride;
+				int quad = t + 3 <= tmax;
+
+				for (int r = rb; r < re; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+					float *out = j->out + (size_t)r * qstride + h * hd;
+					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
+
+					if (quad && t >= tlo && t + 3 <= pos) {
+						attn_axpy4(out, sr + t, v0, v0 + kstride,
+							   v0 + 2 * kstride, v0 + 3 * kstride,
+							   hd);
+						continue;
+					}
+					for (int u = t; u < t + 4 && u <= tmax; u++) {
+						if (u < tlo || u > pos)
+							continue;
+						attn_axpy(out, sr[u],
+							  vbase + (size_t)u * kstride, hd);
+					}
+				}
+			}
+			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
+		}
+	}
+}
+
+static int attn_block(struct attn_block_job *j)
+{
+	struct llama_state *s = j->s;
+	int R = attn_block_rows(), n = j->n;
+
+	if (R <= 0 || n <= 0)
+		return 0;
+	if (R > n)
+		R = n;
+	j->R = R;
+	/* scores: [n_head][R][n_ctx], each head's block its own */
+	if (!s->batt || s->batt_rows < (unsigned)R) {
+		free(s->batt);
+		s->batt = malloc((size_t)j->n_head * R * s->n_ctx * sizeof(float));
+		if (!s->batt) {
+			s->batt_rows = 0;
+			return -1;
+		}
+		s->batt_rows = (unsigned)R;
+	}
+	if (attn_block_pool())
+		charsiu_parallel_for(attn_block_heads, j, j->n_head);
+	else
+		attn_block_heads(j, 0, j->n_head);
+	return 0;
 }
 
 /*
@@ -3457,9 +3904,23 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
 {
 	int id = npu_id_for(s, w);
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
 
-	if (id >= 0 && !charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y))
-		return 1;
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
 	/*
 	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
 	 * above can only ever be checked on the board.
@@ -3492,6 +3953,8 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 	 */
 	for (int r = 0; r < n; r++)
 		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
 	return 0;
 }
 
@@ -3500,10 +3963,12 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
  * one -- k and v after q, up after gate. The CPU fallback is the same loop.
  */
 /*
- * ⚠ WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. With
- * CHARSIU_NPU_REUSE=1 every site reuses unless CHARSIU_REUSE_SITES names a
- * subset: any of k, v, up, comma separated. Phase 2 broke Phi-3.5 and gemma4
- * with all three on; this is how the next round learns which one.
+ * ⚠ WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. Every
+ * site reuses unless CHARSIU_REUSE_SITES names a subset: any of k, v, up,
+ * comma separated. Phase 2 broke Phi-3.5 and gemma4 with all three on, and
+ * phase 22 walking the sites is what found the key with no expiry
+ * (reusekey.h): k and up broke, and only on the core the leader had not
+ * packed.
  */
 static int reuse_site(char which)
 {
@@ -3532,10 +3997,27 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 
 	if (!reuse_site(site))
 		return matmul_rows(s, w, X, n, Y, k, nout);
-	if (id >= 0 && !charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y))
-		return 1;
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
 	for (int r = 0; r < n; r++)
 		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
 	return 0;
 }
 
@@ -3904,12 +4386,31 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		}
 	}
 
+	/*
+	 * The stage clock for the batched path: the same fourteen names as
+	 * the token loop, accumulated per row of the chunk. CHARSIU_STAGES
+	 * turns it on; a prompt-only run reaches here before any token, so
+	 * it is read here too rather than only in llama_forward.
+	 */
+	if (stage_on < 0)
+		stage_on = getenv("CHARSIU_STAGES") != NULL;
+	double bt0 = stage_on > 0 ? now_ms() : 0.0, bt1;
+#define BSTAGE(i) do { if (stage_on > 0) { bt1 = now_ms();               \
+			bstage_ms[i] += bt1 - bt0; bt0 = bt1; } } while (0)
+	if (stage_on > 0) {
+		bstage_rows += (unsigned)n;
+		bstage_chunks++;
+	}
+
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
 		/* ⚠ THIS LAYER'S WIDTH; m->n_ff is only the fallback */
 		uint32_t nff = L->n_ff ? L->n_ff : m->n_ff;
 		int swa = L->swa;
+
+		if (l == 0)
+			BSTAGE(ST_EMBD);
 
 		/*
 		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
@@ -3930,6 +4431,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			rmsnorm(s->bxb + (size_t)r * m->n_embd,
 				s->bx + (size_t)r * m->n_embd, L->attn_norm,
 				m->n_embd, m->rms_eps);
+		BSTAGE(ST_NORM1);
 		/*
 		 * ⚠⚠ TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
 		 *
@@ -4032,6 +4534,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * actually differs, and where it does not a window
 			 * layer takes the full one, factors and all.
 			 */
+			BSTAGE(ST_QKV);   /* row 0: the three projections; rows after: nothing */
 			int swatab = swa && (m->swa_pattern || m->swa_arr) &&
 				     (m->rope_base_swa != m->rope_base ||
 				      m->head_dim_swa != m->head_dim);
@@ -4103,6 +4606,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			if (L->wk)
 				rope(s->k, m->n_head_kv, hd, s->bcs,
 				     m->rope_neox);
+			BSTAGE(ST_ROPE);
 			/* ⚠ the cache is strided by hdmax, written at hd, and
 			 * a shared KV layer has nothing of its own to store:
 			 * it reads what L->kv_from wrote. Writing here would
@@ -4119,7 +4623,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					memcpy(s->vcache + off, s->v + kh * hd,
 					       hd * sizeof(float));
 				}
-			{
+			if (attn_block_rows() > 0) {
+				/*
+				 * The roped q goes back to its row; the
+				 * attention runs after this loop, R rows a pass
+				 * over the cache (attn_block). The cache rows
+				 * this row will read are all written by then.
+				 */
+				memcpy(s->bq + (size_t)r * m->n_head * hd, s->q,
+				       (size_t)m->n_head * hd * sizeof(float));
+			} else {
 				/*
 				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
 				 * READ, and the batched loop passed 0 for every
@@ -4155,15 +4668,30 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						       scale };
 
 				attn_heads(&aj, 0, m->n_head);
+				/* the attention's own output, kept for one
+				 * batched o projection over every row */
+				memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
+				       (size_t)m->n_head * hd * sizeof(float));
+				BSTAGE(ST_ATTN);
 			}
-			/* the attention's own output, kept for one batched
-			 * o projection over every row */
-			memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
-			       (size_t)m->n_head * hd * sizeof(float));
+		}
+		if (attn_block_rows() > 0) {
+			struct attn_block_job bj = {
+				s, L->kv_from >= 0 ? (uint32_t)L->kv_from : l,
+				pos0, n, swa, (int)m->n_swa,
+				hd, hdmax, m->n_head_kv * hdmax, gqa,
+				m->n_head_kv, m->n_head, scale,
+				s->bq, s->bao, 0
+			};
+
+			if (attn_block(&bj))
+				return -1;
+			BSTAGE(ST_ATTN);
 		}
 
 		matmul_rows(s, L->wo, s->bao, n, s->bxo, m->n_head * hd,
 			    m->n_embd);
+		BSTAGE(ST_WO);
 		for (int r = 0; r < n; r++) {
 			float *xr = s->bx + (size_t)r * m->n_embd;
 			float *o = s->bxo + (size_t)r * m->n_embd;
@@ -4178,6 +4706,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
 				m->n_embd, m->rms_eps);
 		}
+		BSTAGE(ST_RES1);   /* the residual add and the ffn rmsnorm */
 
 		/* gate and up read one norm as well: the same choice */
 		if (!prefill_grouped() || will_batch(s, L->gate)) {
@@ -4192,6 +4721,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					    L->up, s->bhb2 + (size_t)r * nff,
 					    NULL, NULL);
 		}
+		BSTAGE(ST_GATEUP);
 		for (int r = 0; r < n; r++) {
 			if (m->ffn_gelu)
 				gelu_mul(s->bhb + (size_t)r * nff,
@@ -4200,7 +4730,9 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				silu_mul(s->bhb + (size_t)r * nff,
 					 s->bhb2 + (size_t)r * nff, nff);
 		}
+		BSTAGE(ST_SILU);
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
+		BSTAGE(ST_DOWN);
 		for (int r = 0; r < n; r++) {
 			float *xr = s->bx + (size_t)r * m->n_embd;
 			float *o = s->bxo + (size_t)r * m->n_embd;
@@ -4211,6 +4743,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			for (uint32_t i = 0; i < m->n_embd; i++)
 				xr[i] += o[i];
 		}
+		BSTAGE(ST_RES2);
 
 		/*
 		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not

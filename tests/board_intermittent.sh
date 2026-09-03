@@ -55,6 +55,15 @@
 #   CHARSIU_INT_ARMS="default zero"    which arms to run
 #   CHARSIU_INT_CHUNK=32               prefill chunk
 #   CHARSIU_INT_NGEN=8                 tokens generated
+#   CHARSIU_INT_KMAX=1024              K slice; 1024 is the 08-30 reading's,
+#                                      2048 is what ships
+#
+# ⚠ THE 08-30 READING, for the record: phi3, chunk 24, KMAX 1024, sixteen
+# runs an arm -- parallel 13 of 16 WRONG, onedev 0, serial 0 -- on the
+# August kernel, where rocket attaches and detaches the IOMMU per job. On
+# 2026-09-02 the attach-once kernel ran phase 2 with the overlap on and all
+# nine models were right at widths 80+36. Whether that is the kernel or the
+# runtime is exactly this script at chunk 24 on each kernel in turn.
 set -u
 
 RUN=${CHARSIU_RUN_BIN:-}
@@ -119,12 +128,30 @@ WEDGED=0
 CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
 PROMPT="$(seq 1 32 | tr '\n' ' ')"
 PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
+# ⚠ THE K SLICE IS PINNED TO 1024, WHICH IS THE 2026-08-30 READING'S, not the
+# shipped 2048: this script exists to reproduce that reading's 13 of 16, and
+# a reproduction at a different width is a different experiment. To ask the
+# shipped width the same question, CHARSIU_INT_KMAX=2048.
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+CHARSIU_NPU_KMAX=${CHARSIU_INT_KMAX:-1024} CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠⚠ SAY WHICH KERNEL, the same way board_verify does: every kernel this
+# project ships has the same uname, and this script's whole purpose now is to
+# tell two of them apart.
+_ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
+case "$_ksha" in
+c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
+5418f487) _kname="v11-control: v11 as sent + second core, no rocket patches" ;;
+2422dc11) _kname="attach-once-v11: v11 + attach-once + hardirq completion" ;;
+"")       _kname="no /boot/Image readable" ;;
+*)        _kname="not a release this script knows" ;;
+esac
+echo "kernel   $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
+[ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
+	echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 echo "config   chunk $CHUNK, gen $NGEN, $RUNS runs an arm"
 echo "arms     $ARMS"
 # ⚠ DESCRIBE ONLY THE ARMS THAT WILL RUN. The header listed all four while
@@ -326,6 +353,20 @@ d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
 two=0
 [ -n "$d" ] && [ "$d" -gt 0 ] && two=$((two + d))
 [ -n "$z" ] && [ "$z" -gt 0 ] && two=$((two + z))
+# ⚠⚠ THE PARALLEL ARM COUNTS TOO. This verdict summed `default` and `zero`
+# only, so a round whose parallel arm was WRONG 15 OF 16 -- on the attach-once
+# kernel, 2026-09-03, the round that decided the overlap was not the old
+# kernel's -- ended with "IT DID NOT FIRE" printed under it. The arm that
+# puts the overlap back is the one this script exists to read.
+p=${res_parallel:-}
+if [ -n "$p" ]; then
+	if [ "$p" -gt 0 ]; then
+		echo "parallel (both cores, overlapped): WRONG $p of $RUNS"
+		two=$((two + p))
+	else
+		echo "parallel (both cores, overlapped): $RUNS of $RUNS CLEAN"
+	fi
+fi
 # ⚠ THE SERIAL ARM IS WHAT SHIPS, so it is reported on its own line whatever
 # the rest says. It is also what `default` now runs, so the two agreeing is the
 # expected result and only `parallel` puts the overlap back.

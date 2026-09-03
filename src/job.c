@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "charsiu.h"
+#include "envq.h"
 
 #define CNA   0x0201u
 #define CORE  0x0801u
@@ -81,19 +82,19 @@ struct emitter {
  */
 int charsiu_cbuf_window(void)
 {
-	const char *e = getenv("CHARSIU_CBUF_WINDOW");
+	const char *e = envq("CHARSIU_CBUF_WINDOW");
 
 	return e ? atoi(e) : 0;
 }
 
 int charsiu_w4_paired(const struct charsiu_matmul *mm)
 {
-	return mm->wdtype == CHARSIU_INT4 && getenv("CHARSIU_W4_PAIRED") != NULL;
+	return mm->wdtype == CHARSIU_INT4 && envq("CHARSIU_W4_PAIRED") != NULL;
 }
 
 static int override_for(unsigned reg, uint32_t *out)
 {
-	const char *p = getenv("CHARSIU_OVERRIDE");
+	const char *p = envq("CHARSIU_OVERRIDE");
 	int found = 0;
 
 	while (p && *p) {
@@ -201,7 +202,7 @@ static struct requant requant_of(const struct charsiu_job *job)
 	 * used all along.
 	 */
 	{
-		const char *o = getenv("CHARSIU_OUT_OFF");
+		const char *o = envq("CHARSIU_OUT_OFF");
 
 		r.offset = o ? (int32_t)strtol(o, NULL, 0)
 			     : (int32_t)job->output_zero_point - 0x80;
@@ -368,7 +369,7 @@ static unsigned acc_a_coeff(int *swap)
 	static unsigned A = 4;
 
 	if (!done) {
-		const char *e = getenv("CHARSIU_ACC_A");
+		const char *e = envq("CHARSIU_ACC_A");
 
 		done = 1;
 		if (e && !strcmp(e, "swap"))
@@ -558,7 +559,7 @@ size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 	 * CHARSIU_COEF_ELEMS=0 asks for when a round wants to find the edge on
 	 * purpose.
 	 */
-	const char *e = getenv("CHARSIU_COEF_ELEMS");
+	const char *e = envq("CHARSIU_COEF_ELEMS");
 	size_t want = e ? strtoul(e, NULL, 0) : 65536;
 	size_t elems = want ? want : (size_t)mm->k * mm->n;
 
@@ -573,8 +574,8 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 	const struct charsiu_matmul *mm = &job->mm;
 	/* ⚠ once, not once an output channel. The same shape of mistake cost
 	 * round 354 two minutes a run in the quantiser. */
-	const int16_t coef_c = (int16_t)(getenv("CHARSIU_COEF_C")
-					 ? atoi(getenv("CHARSIU_COEF_C")) : 16);
+	const int16_t coef_c = (int16_t)(envq("CHARSIU_COEF_C")
+					 ? atoi(envq("CHARSIU_COEF_C")) : 16);
 	size_t tb = table_bytes(mm), sb = scale_table_bytes(mm);
 	uint16_t *scales;
 	unsigned oc;
@@ -634,7 +635,7 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 			     job->output_scale;
 
 		*a = bias[oc] - (job->input_zero_point - 0x80) * weight_sums[oc]
-		   + (getenv("CHARSIU_NO_LIFT")
+		   + (envq("CHARSIU_NO_LIFT")
 		      ? 0 : (int32_t)(128.0f / mult + 0.5f));
 		/*
 		 * B carries the weight zero point correction, in the same
@@ -714,7 +715,7 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
  */
 static const char *vendor_stream_path(void)
 {
-	return getenv("CHARSIU_VENDOR_STREAM");
+	return envq("CHARSIU_VENDOR_STREAM");
 }
 
 static size_t vendor_stream_load(uint64_t *out, size_t max)
@@ -806,7 +807,7 @@ static void patch_addr(const struct charsiu_job *job, uint64_t *e)
  */
 static size_t merge_vendor_values(uint64_t *out, size_t n, size_t max)
 {
-	const char *path = getenv("CHARSIU_VENDOR_MERGE");
+	const char *path = envq("CHARSIU_VENDOR_MERGE");
 	uint64_t v[512];
 	size_t got, i, j, at, added = 0, overwrote = 0;
 	FILE *f;
@@ -838,14 +839,14 @@ static size_t merge_vendor_values(uint64_t *out, size_t n, size_t max)
 	 * five at 0x2810, "3" CORE 0x3xxx, "4" DPU 0x4xxx. Default is all.
 	 */
 	{
-		const char *only = getenv("CHARSIU_MERGE_UNITS");
+		const char *only = envq("CHARSIU_MERGE_UNITS");
 
 		if (only)
 			printf("MERGE: units %s only\n", only);
 	}
 	for (i = 0; i < got; i++) {
 		unsigned reg = (unsigned)(v[i] & 0xffff);
-		const char *only = getenv("CHARSIU_MERGE_UNITS");
+		const char *only = envq("CHARSIU_MERGE_UNITS");
 		char unit = (char)('0' + ((reg >> 12) & 0xf));
 		int found = 0;
 
@@ -894,7 +895,7 @@ static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
 	 * field -- so a verbatim replay has nothing that turns the units on, and
 	 * round 343 timed out on all four arms with zero live words.
 	 */
-	if (getenv("CHARSIU_VENDOR_TRAILER") && got + 3 <= max) {
+	if (envq("CHARSIU_VENDOR_TRAILER") && got + 3 <= max) {
 		out[got++] = ((uint64_t)CNA  << 48) | ((uint64_t)0x1du << 16) | 0x1008;
 		out[got++] = ((uint64_t)CORE << 48) | ((uint64_t)0x1du << 16) | 0x3008;
 		out[got++] = ((uint64_t)DPU  << 48) | ((uint64_t)0x1du << 16) | 0x4008;
@@ -920,7 +921,7 @@ static size_t emit_vendor_stream(const struct charsiu_job *job, uint64_t *out,
  */
 static int charsiu_m_axis(void)
 {
-	const char *e = getenv("CHARSIU_M_AXIS");
+	const char *e = envq("CHARSIU_M_AXIS");
 
 	if (e && (*e == 'h' || *e == 'H'))
 		return 0;
@@ -1161,8 +1162,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	emit(&e, CNA, 0x1090, inw * 4);
 	emit(&e, CNA, 0x1094, inw * rows);      /* inw * full_inh */
-	emit(&e, CNA, 0x1098, getenv("CHARSIU_CNA_1098")
-	     ? (uint32_t)strtoul(getenv("CHARSIU_CNA_1098"), NULL, 0)
+	emit(&e, CNA, 0x1098, envq("CHARSIU_CNA_1098")
+	     ? (uint32_t)strtoul(envq("CHARSIU_CNA_1098"), NULL, 0)
 	     : ((inw * rows + 3) & ~3u));
 	emit(&e, CNA, 0x109c, 0x00000000);
 	emit(&e, CNA, 0x1100, 0x00000000);
@@ -1267,7 +1268,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 
 	{
 		int w4v = mm->wdtype == CHARSIU_INT4 &&
-			  !getenv("CHARSIU_W4_BITPAT");
+			  !envq("CHARSIU_W4_BITPAT");
 
 		/*
 		 * ⚠⚠ AND THE w4v FORM OF 0x301c WAS CHOSEN WHERE IT CANNOT
@@ -1291,7 +1292,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		 * stream uses. The default does not move until a board round
 		 * says which.
 		 */
-		const char *e31 = getenv("CHARSIU_W4_301C");
+		const char *e31 = envq("CHARSIU_W4_301C");
 		int high = e31 && !strcmp(e31, "high");
 
 		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
@@ -1346,7 +1347,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * is where int4 used to collapse.
 	 */
 	emit(&e, CORE, 0x3020,
-	     (mm->wdtype == CHARSIU_INT4 && !getenv("CHARSIU_W4_BITPAT"))
+	     (mm->wdtype == CHARSIU_INT4 && !envq("CHARSIU_W4_BITPAT"))
 		     ? mm->n - 1
 		     : (charsiu_w4_paired(mm)
 			? (uint32_t)(2 * mm->n - 1)
@@ -1397,7 +1398,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * 0x100c is NOT in either group: it is the int4 weight format and
 	 * without it the run is not w4a16 at all.
 	 */
-	w4_dpu = w4a16 && !getenv("CHARSIU_W4_NO_DPU");
+	w4_dpu = w4a16 && !envq("CHARSIU_W4_NO_DPU");
 
 	/*
 	 * CHARSIU_WIDE8 forces parts of the w4a16 OUTPUT STAGE onto an int8
@@ -1421,7 +1422,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * that worked on 0x4050 in round 260.
 	 */
 	{
-		const char *e8 = getenv("CHARSIU_WIDE8");
+		const char *e8 = envq("CHARSIU_WIDE8");
 
 		wide8 = e8 ? (unsigned)strtoul(e8, NULL, 0) : 0;
 		if (job->acc_out)
@@ -1468,8 +1469,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * still wedges.
 	 */
 	rdma_mask = 0;
-	if (w4a16 && getenv("CHARSIU_W4_RDMA_MASK"))
-		rdma_mask = (unsigned)strtoul(getenv("CHARSIU_W4_RDMA_MASK"),
+	if (w4a16 && envq("CHARSIU_W4_RDMA_MASK"))
+		rdma_mask = (unsigned)strtoul(envq("CHARSIU_W4_RDMA_MASK"),
 					      NULL, 0);
 
 	emit(&e, DPU, 0x400c, 0x40000004);
@@ -1497,16 +1498,16 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	emit(&e, DPU, 0x4030,
 	     ((uint32_t)(charsiu_w4_paired(mm) ? 2 * mm->n - 1 : mm->n - 1) << 16) |
-	     (uint32_t)(getenv("CHARSIU_DPU_4030")
-			? strtoul(getenv("CHARSIU_DPU_4030"), NULL, 0)
+	     (uint32_t)(envq("CHARSIU_DPU_4030")
+			? strtoul(envq("CHARSIU_DPU_4030"), NULL, 0)
 			: (WIDE(1) ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, wide ? (((uint32_t)(rows - 1) << 16) | (ow - 1))
 				   : ((lines << 16) | 0));
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
 	 * here, but those are elementwise ops rather than convolutions, so it
 	 * is a candidate to sweep and not a value to copy. */
-	emit(&e, DPU, 0x4038, (uint32_t)(getenv("CHARSIU_DPU_4038")
-					 ? strtoul(getenv("CHARSIU_DPU_4038"), NULL, 0)
+	emit(&e, DPU, 0x4038, (uint32_t)(envq("CHARSIU_DPU_4038")
+					 ? strtoul(envq("CHARSIU_DPU_4038"), NULL, 0)
 					 : (WIDE(2) ? 0x00000053u : 0x00120080u)));
 	emit(&e, DPU, 0x403c, 0x00000000);
 	emit(&e, DPU, 0x4044, WIDE(3) ? 0x00000002u : 0x00000001u);
@@ -1535,8 +1536,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * if it changes nothing the identification above is wrong.
 	 */
 	emit(&e, DPU, 0x4060, 0x00000903);
-	emit(&e, DPU, 0x406c, (uint32_t)(getenv("CHARSIU_DPU_406C")
-					 ? strtoul(getenv("CHARSIU_DPU_406C"), NULL, 0)
+	emit(&e, DPU, 0x406c, (uint32_t)(envq("CHARSIU_DPU_406C")
+					 ? strtoul(envq("CHARSIU_DPU_406C"), NULL, 0)
 					 : 0x80000000u));
 	/*
 	 * CHARSIU_DPU_4070, the other half of the liveness test. Round 159's
@@ -1550,8 +1551,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * BELOW the whole range, or a minimum ABOVE it, flattens a surface that
 	 * is otherwise correct, so a stage that is connected cannot hide.
 	 */
-	emit(&e, DPU, 0x4070, (uint32_t)(getenv("CHARSIU_DPU_4070")
-					 ? strtoul(getenv("CHARSIU_DPU_4070"), NULL, 0)
+	emit(&e, DPU, 0x4070, (uint32_t)(envq("CHARSIU_DPU_4070")
+					 ? strtoul(envq("CHARSIU_DPU_4070"), NULL, 0)
 					 : 0x7fffffffu));
 	emit(&e, DPU, 0x4074, 0x80000000);
 	emit(&e, DPU, 0x4078, 0x7fffffff);
@@ -1671,7 +1672,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 */
 	/* ow * (2 * full_oh - win_orows); on the width axis full_oh is 1 */
 	{
-		const char *e8b = getenv("CHARSIU_DPU_40B8");
+		const char *e8b = envq("CHARSIU_DPU_40B8");
 		unsigned batch = wide ? ow : rows;
 		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
 			   ? 3u * batch : (uint32_t)(ow * (2 * rows - rows));

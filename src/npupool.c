@@ -513,9 +513,11 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 				"%lu times when declared the same\n",
 				hits, misses);
 		else if (!charsiu_npu_reuse_on())
-			fprintf(out, "    input reuse OFF (CHARSIU_NPU_REUSE=1 "
-				"turns it on; phase 2 broke Phi-3.5 and "
-				"gemma4 with it)\n");
+			fprintf(out, "    input reuse OFF (CHARSIU_NPU_REUSE=0 "
+				"is set)\n");
+		else
+			fprintf(out, "    input reuse never asked for: no "
+				"batched call declared its input unchanged\n");
 	}
 }
 

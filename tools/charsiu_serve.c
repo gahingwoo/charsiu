@@ -363,6 +363,7 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 		CACHED_N = 0;
 	}
 	if (!ST) { fputs("HTTP/1.1 500 Internal Server Error\r\n\r\n", f); return; }
+	charsiu_npu_idle(ST->pool.dev, 0);   /* the hold is back before the first token */
 
 	int n_ids = tokenizer_encode(M.tk, prompt, 1, ids, (int)(sizeof(ids)/sizeof(ids[0])));
 	if (n_ids < 1 || n_ids + 8 >= ST->n_ctx) {
@@ -616,6 +617,15 @@ int main(int argc, char **argv)
 		llama_state_free(ST);
 		ST = llama_state_new(&M, N_CTX);
 	}
+	/*
+	 * ⚠ THE QoS HOLD IS FOR A REQUEST, NOT FOR THE PROCESS. Opening the
+	 * NPU forbids the CPUs their deep idle states -- a quarter of decode
+	 * on this board -- and a one-shot run closes the device minutes
+	 * later. A server sits at accept() for hours between requests, and
+	 * an idle board that cannot idle is a heater. Dropped here and around
+	 * every request below; the hold is back before the first token.
+	 */
+	if (ST) charsiu_npu_idle(ST->pool.dev, 1);
 
 	int s = socket(AF_INET, SOCK_STREAM, 0);
 	int one = 1;
@@ -641,6 +651,8 @@ int main(int argc, char **argv)
 
 		if (c < 0) { if (errno == EINTR) continue; break; }
 		serve_one(c);
+		/* the request is answered: let the CPUs sleep until the next */
+		if (ST) charsiu_npu_idle(ST->pool.dev, 1);
 	}
 	return 0;
 }

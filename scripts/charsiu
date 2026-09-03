@@ -81,6 +81,8 @@ charsiu $VERSION, an open LLM runtime for the RK3576 NPU
   $SELF update [dev|stable]   fetch the latest charsiu and reinstall it
                               dev adds the hardware probes and tracks the
                               branch the work happens on
+  $SELF update --auto         the same with no questions and no demo (-y);
+                              auto = yes under [update] in config.ini keeps it
   $SELF setup                 the guided screen, on purpose
 
   Two things here are not conversations, so they are their own commands:
