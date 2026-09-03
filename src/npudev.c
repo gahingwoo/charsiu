@@ -1381,9 +1381,11 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	if (g->read4 == 1)
 		g->read4 = 4;
 	/*
-	 * =2 is the half step the board has not priced: two rows off one line,
-	 * one read stream and TWO write streams, which the A72's store buffer
-	 * may take where it did not take four.
+	 * =2 was the half step: two rows off one line, one read stream and TWO
+	 * write streams. The board priced it 2026-09-04, phase 9: read slower
+	 * on all eight models, +15% to +40% (Qwen3 1219 to 1558 ms, gemma4
+	 * 6747 to 8382). One write stream is what this core wants; the row
+	 * loop stays.
 	 */
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
@@ -3323,6 +3325,47 @@ static int batch_serial(void)
 	return z;
 }
 
+/*
+ * ⚠ THE FAULT HAS A WIDTH, and the map so far (phi3, 16 runs a cell,
+ * attach-once kernel, 2026-09-03/04, CHARSIU_NPU_BATCH_PARALLEL=1):
+ *
+ *   full chunks of 24            3 to 15 of 16 WRONG
+ *   full chunks of 28, 32, 42, 48, 56, 58, 64, 72, 74, 80   0 of 16 each
+ *   tails of 2, 4, 6, 12, 14, 16, 22, 28, 30                0 of 16 each
+ *   m = 8 and m = 10, the dense sweep of 08-30              wrong
+ *
+ * so the kernel was never the fix (the map is on the attach-once kernel),
+ * "m mod 16 in {8, 10}" was a guess the 42/56/58/72/74 row killed, and what
+ * is left is: the overlap fails on SMALL full chunks and has not failed on
+ * one of 28 or more. CHARSIU_NPU_PARALLEL_MIN_M=N overlaps the two cores
+ * for a call of m >= N rows and serialises below it; 0, the default, never
+ * overlaps. 28 is the smallest clean full width measured, so 28 is the
+ * value to try once the boundary below it is mapped, and phase 2 with the
+ * chunker's 80 + tail is the check. Speculative passes at m = 4 or 6 stay
+ * serial under any N above 6, which is the safe side of the map.
+ */
+static unsigned parallel_min_m(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_PARALLEL_MIN_M");
+
+		v = e ? atoi(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/* serialise the two cores for a call of m rows? */
+static int batch_serial_for(unsigned m)
+{
+	if (!batch_serial())
+		return 0;               /* CHARSIU_NPU_BATCH_PARALLEL=1: never */
+	return !(parallel_min_m() && m >= parallel_min_m());
+}
+
 static int batch_zero(void)
 {
 	static int z = -1;
@@ -4358,7 +4401,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * card, in the same minute. CHARSIU_NPU_BATCH_PARALLEL=1 puts
 		 * the overlap back, and returns wrong text when it does.
 		 */
-		if (batch_serial() && g->ndev > 1) {
+		if (batch_serial_for(m) && g->ndev > 1) {
 			double tf = now_us();
 
 			charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
