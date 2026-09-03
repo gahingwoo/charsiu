@@ -197,6 +197,12 @@ ui_progress() {
 # question. Plain mode does nothing, because there the text already went to the
 # screen in the order it was produced.
 ui_pane() {
+	# ⚠ THIS WAS THE ONE DIALOG --yes DID NOT COVER. Every question honoured
+	# CTUI_ASSUME and this report did not, so `charsiu update --auto` ran
+	# unattended right up to the doctor's pane and then waited for an Enter
+	# nobody was there to press. The text already went to stderr through
+	# tee; a pane is only ever a second showing of it.
+	if [ -n "$CTUI_ASSUME" ]; then return 0; fi
 	if [ "$CTUI" = whiptail ] && [ -s "$1" ]; then
 		# ⚠ NOT --scrolltext. It moves focus off the button, so Enter stops
 		# dismissing the dialog and the install hangs on its last screen with

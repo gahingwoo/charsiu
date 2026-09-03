@@ -282,6 +282,10 @@ while [ $# -gt 0 ]; do
 	# are "install the compiler" and the demo, and it takes --no-demo too.
 	--yes|-y)    CTUI_ASSUME=yes; export CTUI_ASSUME; shift ;;
 	--no-demo)   DEMO=0; shift ;;
+	# `charsiu update --auto` spells it as --yes --no-demo; accepted here
+	# too, so an older charsiu-update that passes --auto straight through
+	# is not told "unknown option" by the tree it just fetched.
+	--auto)      CTUI_ASSUME=yes; export CTUI_ASSUME; DEMO=0; shift ;;
 	# stable installs the runtime; dev adds the probes. See INSTALL_BINS.
 	--channel)   CHANNEL="$2"; shift 2 ;;
 	--dev)       CHANNEL=dev; shift ;;
