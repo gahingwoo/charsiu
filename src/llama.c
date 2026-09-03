@@ -3047,7 +3047,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bfreq);
 	free(s->bpl); free(s->bplg);
 
-	free(s->att); free(s->logits);
+	free(s->att); free(s->batt); free(s->logits);
 	charsiu_act_free(&s->act);
 	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
 		npu_report(s->pool.t, s->pool.n);
@@ -3222,6 +3222,67 @@ void llama_stages_report(void)
 /* ---- the forward pass ---------------------------------------------------- */
 
 /*
+ * THE TWO INNER KERNELS OF ATTENTION, in one place, because two loops use
+ * them: the token loop's attn_heads below, a row at a time, and the batched
+ * prompt's attn_block, several rows a pass over the cache. Whatever they
+ * compute they compute bit for bit the same in both, which is what lets the
+ * batched prompt be checked against the token loop by text alone.
+ */
+static inline float attn_dot(const float *qh, const float *kt, uint32_t hd)
+{
+	float a = 0.0f;
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * ⚠ OPT OUT ONLY. A dot product is a reduction and four lanes add it
+	 * up in a different ORDER; that is a last bit, and a last bit moved a
+	 * token on the host. It did not on the board in round 370, and it is
+	 * the default since 372. CHARSIU_EXACT_ATTN goes back.
+	 */
+	if (fast_attn()) {
+		float32x4_t a0 = vdupq_n_f32(0.0f);
+		float32x4_t a1 = vdupq_n_f32(0.0f);
+
+		for (; i + 8 <= hd; i += 8) {
+			a0 = vfmaq_f32(a0, vld1q_f32(qh + i), vld1q_f32(kt + i));
+			a1 = vfmaq_f32(a1, vld1q_f32(qh + i + 4),
+				       vld1q_f32(kt + i + 4));
+		}
+		a = vaddvq_f32(vaddq_f32(a0, a1));
+	}
+#endif
+	for (; i < hd; i++)
+		a += qh[i] * kt[i];
+	return a;
+}
+
+static inline void attn_axpy(float *out, float a, const float *vt, uint32_t hd)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * Each i lands in its own accumulator, so there is no reduction and
+	 * no order to change. The barrier keeps the multiply and the add
+	 * separately rounded, which is what the scalar line below compiles to.
+	 */
+	if (!cpu_plain()) {
+		float32x4_t av = vdupq_n_f32(a);
+
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t p = vmulq_f32(av, vld1q_f32(vt + i));
+
+			__asm__("" : "+w"(p));
+			vst1q_f32(out + i, vaddq_f32(vld1q_f32(out + i), p));
+		}
+	}
+#endif
+	for (; i < hd; i++)
+		out[i] += a * vt[i];
+}
+
+/*
  * ATTENTION, ONE RANGE OF HEADS AT A TIME.
  *
  * Each head reads the whole K and V cache but writes only its own hd floats of
@@ -3326,37 +3387,9 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 
 			for (q = 0; q < n; q++) {
 				const float *qh = s->q + (g0 + q) * hd;
-				float a = 0.0f;
-				uint32_t i = 0;
 
-#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-				/*
-				 * ⚠ OPT OUT ONLY. A dot product is a reduction
-				 * and four lanes add it up in a different
-				 * ORDER; that is a last bit, and a last bit
-				 * moved a token on the host. It did not on the
-				 * board in round 370, and it is the default
-				 * since 372. CHARSIU_EXACT_ATTN goes back.
-				 */
-				if (fast_attn()) {
-					float32x4_t a0 = vdupq_n_f32(0.0f);
-					float32x4_t a1 = vdupq_n_f32(0.0f);
-
-					for (; i + 8 <= hd; i += 8) {
-						a0 = vfmaq_f32(a0,
-							vld1q_f32(qh + i),
-							vld1q_f32(kt + i));
-						a1 = vfmaq_f32(a1,
-							vld1q_f32(qh + i + 4),
-							vld1q_f32(kt + i + 4));
-					}
-					a = vaddvq_f32(vaddq_f32(a0, a1));
-				}
-#endif
-				for (; i < hd; i++)
-					a += qh[i] * kt[i];
 				s->att[(size_t)(g0 + q) * s->n_ctx + t] =
-					a * j->scale;
+					attn_dot(qh, kt, hd) * j->scale;
 			}
 		}
 
@@ -3376,37 +3409,161 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			const float *vt = vbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
-				float *out = s->xb + (g0 + q) * hd;
-				float a = s->att[(size_t)(g0 + q) * s->n_ctx + t];
-				uint32_t i = 0;
-
-#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
-				/*
-				 * Each i lands in its own accumulator, so there
-				 * is no reduction and no order to change. The
-				 * barrier keeps the multiply and the add
-				 * separately rounded, which is what the scalar
-				 * line below compiles to.
-				 */
-				if (!cpu_plain()) {
-					float32x4_t av = vdupq_n_f32(a);
-
-					for (; i + 4 <= hd; i += 4) {
-						float32x4_t p = vmulq_f32(av,
-							vld1q_f32(vt + i));
-
-						__asm__("" : "+w"(p));
-						vst1q_f32(out + i,
-							vaddq_f32(vld1q_f32(out + i),
-								  p));
-					}
-				}
-#endif
-				for (; i < hd; i++)
-					out[i] += a * vt[i];
+				attn_axpy(s->xb + (g0 + q) * hd,
+					  s->att[(size_t)(g0 + q) * s->n_ctx + t],
+					  vt, hd);
 			}
 		}
 	}
+}
+
+/*
+ * ⚠⚠ THE BATCHED PROMPT'S ATTENTION, SEVERAL ROWS A PASS OVER THE CACHE.
+ *
+ * Phase 9 on the board, 2026-09-03, a 915 token prompt: attention was 72% of
+ * Qwen3's prefill, 61% of tinyllama's, 43% of Phi-3.5's -- 33 ms a row on
+ * Qwen3 against 3 for its q, k and v together. batch_layers called attn_heads
+ * once per row, so a row streamed the whole K and V cache before it and the
+ * next row streamed it again: n passes over a cache that grows with n, which
+ * is the quadratic term with the worst constant it can have.
+ *
+ * This walks the cache once per CHARSIU_ATTN_BLOCK rows (8). For each row it
+ * scores exactly the positions the row loop scored, in the same order, with
+ * the same attn_dot; softmaxes the same window; and accumulates V in the same
+ * ascending t with the same attn_axpy. Only the loop nest moved. The vision
+ * tower's attention took the same step and moved 3.71x on the host and 10.32x
+ * on the board, for the same reason: bytes.
+ *
+ * CHARSIU_ATTN_BLOCK=0 is the row-at-a-time control, and phase 2 -- the
+ * batched prompt against its own token loop, nine models -- is the check.
+ */
+static int attn_block_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_BLOCK");
+
+		v = e ? atoi(e) : 8;
+		if (v < 0)
+			v = 0;
+	}
+	return v;
+}
+
+struct attn_block_job {
+	struct llama_state *s;
+	uint32_t l;          /* the cache's layer (kv_from resolved) */
+	int pos0, n;         /* row r sits at position pos0 + r */
+	int swa, n_swa;      /* a window layer sees the last n_swa positions */
+	uint32_t hd, hdmax, kvdim, gqa, nkv, n_head;
+	float scale;
+	const float *q;      /* [n][n_head * hd], roped */
+	float *out;          /* [n][n_head * hd] */
+};
+
+static int attn_block(struct attn_block_job *j)
+{
+	struct llama_state *s = j->s;
+	uint32_t hd = j->hd, hdmax = j->hdmax, gqa = j->gqa, nkv = j->nkv;
+	uint32_t nh = j->n_head;
+	int R = attn_block_rows(), n = j->n;
+	size_t qstride = (size_t)nh * hd;
+
+	if (R <= 0 || n <= 0)
+		return 0;
+	if (R > n)
+		R = n;
+	if (!s->batt || s->batt_rows < (unsigned)R) {
+		free(s->batt);
+		s->batt = malloc((size_t)R * nh * s->n_ctx * sizeof(float));
+		if (!s->batt) {
+			s->batt_rows = 0;
+			return -1;
+		}
+		s->batt_rows = (unsigned)R;
+	}
+	/* the group is one kv head's queries, or one head under the control */
+	uint32_t grp = attn_perhead() ? 1 : gqa;
+
+	for (uint32_t kvh = 0; kvh < nkv; kvh++) {
+		const float *kbase, *vbase;
+		size_t kstride;
+
+		if (kv_posmajor()) {
+			size_t b = (size_t)j->l * s->n_ctx * j->kvdim
+				 + (size_t)kvh * hd;
+
+			kbase = s->kcache + b;
+			vbase = s->vcache + b;
+			kstride = j->kvdim;
+		} else {
+			size_t b = (size_t)(j->l * nkv + kvh) * s->n_ctx * hdmax;
+
+			kbase = s->kcache + b;
+			vbase = s->vcache + b;
+			kstride = hdmax;
+		}
+		for (uint32_t g0 = kvh * gqa; g0 < (kvh + 1) * gqa; g0 += grp) {
+			uint32_t g1 = g0 + grp;
+
+			for (int rb = 0; rb < n; rb += R) {
+				int re = rb + R < n ? rb + R : n;
+				/* the window's oldest position, per row */
+				int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
+					      ? j->pos0 + rb + 1 - j->n_swa : 0;
+				int tmax = j->pos0 + re - 1;
+
+				for (int t = tlo_first; t <= tmax; t++) {
+					const float *kt = kbase + (size_t)t * kstride;
+
+					for (int r = rb; r < re; r++) {
+						int pos = j->pos0 + r;
+						int tlo = j->swa && pos + 1 > j->n_swa
+							? pos + 1 - j->n_swa : 0;
+
+						if (t < tlo || t > pos)
+							continue;
+						for (uint32_t h = g0; h < g1; h++) {
+							const float *qh = j->q + (size_t)r * qstride + h * hd;
+
+							s->batt[((size_t)(r - rb) * nh + h) * s->n_ctx + t] =
+								attn_dot(qh, kt, hd) * j->scale;
+						}
+					}
+				}
+				for (int r = rb; r < re; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+
+					for (uint32_t h = g0; h < g1; h++) {
+						softmax(s->batt + ((size_t)(r - rb) * nh + h)
+							* s->n_ctx + tlo, pos + 1 - tlo);
+						memset(j->out + (size_t)r * qstride + h * hd, 0,
+						       hd * sizeof(float));
+					}
+				}
+				for (int t = tlo_first; t <= tmax; t++) {
+					const float *vt = vbase + (size_t)t * kstride;
+
+					for (int r = rb; r < re; r++) {
+						int pos = j->pos0 + r;
+						int tlo = j->swa && pos + 1 > j->n_swa
+							? pos + 1 - j->n_swa : 0;
+
+						if (t < tlo || t > pos)
+							continue;
+						for (uint32_t h = g0; h < g1; h++)
+							attn_axpy(j->out + (size_t)r * qstride + h * hd,
+								  s->batt[((size_t)(r - rb) * nh + h) * s->n_ctx + t],
+								  vt, hd);
+					}
+				}
+			}
+		}
+	}
+	return 0;
 }
 
 /*
@@ -4171,7 +4328,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					memcpy(s->vcache + off, s->v + kh * hd,
 					       hd * sizeof(float));
 				}
-			{
+			if (attn_block_rows() > 0) {
+				/*
+				 * The roped q goes back to its row; the
+				 * attention runs after this loop, R rows a pass
+				 * over the cache (attn_block). The cache rows
+				 * this row will read are all written by then.
+				 */
+				memcpy(s->bq + (size_t)r * m->n_head * hd, s->q,
+				       (size_t)m->n_head * hd * sizeof(float));
+			} else {
 				/*
 				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
 				 * READ, and the batched loop passed 0 for every
@@ -4207,11 +4373,24 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						       scale };
 
 				attn_heads(&aj, 0, m->n_head);
+				/* the attention's own output, kept for one
+				 * batched o projection over every row */
+				memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
+				       (size_t)m->n_head * hd * sizeof(float));
+				BSTAGE(ST_ATTN);
 			}
-			/* the attention's own output, kept for one batched
-			 * o projection over every row */
-			memcpy(s->bao + (size_t)r * m->n_head * hd, s->xb,
-			       (size_t)m->n_head * hd * sizeof(float));
+		}
+		if (attn_block_rows() > 0) {
+			struct attn_block_job bj = {
+				s, L->kv_from >= 0 ? (uint32_t)L->kv_from : l,
+				pos0, n, swa, (int)m->n_swa,
+				hd, hdmax, m->n_head_kv * hdmax, gqa,
+				m->n_head_kv, m->n_head, scale,
+				s->bq, s->bao
+			};
+
+			if (attn_block(&bj))
+				return -1;
 			BSTAGE(ST_ATTN);
 		}
 

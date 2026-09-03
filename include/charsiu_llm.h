@@ -801,6 +801,10 @@ struct llama_state {
 	float *q;              /* n_head * head_dim */
 	float *k, *v;          /* n_head_kv * head_dim */
 	float *att;            /* n_head * n_ctx */
+	/* the batched prompt's attention scores, CHARSIU_ATTN_BLOCK rows at a
+	 * time: [rows][n_head][n_ctx], built on first use */
+	float *batt;
+	unsigned batt_rows;
 	float *logits;         /* n_vocab */
 	/* gemma4's per layer embeddings: [n_layer][n_embd_pl], and scratch */
 	float *pl, *plb, *plc;
