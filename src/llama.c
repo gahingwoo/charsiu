@@ -3464,7 +3464,7 @@ static int attn_block_rows(void)
 		 * the thread pool, which the token loop's attention does not use
 		 * (round 368: the pool lost at one row a token), and this block
 		 * form is the unit the pool can take: CHARSIU_ATTN_BLOCK=8
-		 * CHARSIU_ATTN_POOL=1 is that arm.
+		 * CHARSIU_ATTN_BLOCK_POOL=1 is that arm.
 		 */
 		v = e ? atoi(e) : 0;
 		if (v < 0)
@@ -3473,12 +3473,18 @@ static int attn_block_rows(void)
 	return v;
 }
 
+/*
+ * ⚠ ITS OWN NAME. CHARSIU_ATTN_POOL already exists and gates the TOKEN
+ * loop's attention, the one round 368 measured at 22.70 ms a token pooled
+ * against 7.75 serial; an arm that set it to test this would have slowed
+ * decode in the same run and read the two together.
+ */
 static int attn_block_pool(void)
 {
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_ATTN_POOL") != NULL;
+		v = getenv("CHARSIU_ATTN_BLOCK_POOL") != NULL;
 	return v;
 }
 
