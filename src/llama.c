@@ -267,8 +267,18 @@ static int pool_dynamic(void)
 {
 	static int v = -1;
 
-	if (v < 0)
-		v = getenv("CHARSIU_POOL_DYNAMIC") != NULL;
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_POOL_DYNAMIC");
+
+		/*
+		 * ON. Phase 9, 2026-09-04, attention ms a row against the
+		 * static split: Qwen3 9.9 to 6.7, Phi-3.5 17.0 to 13.5,
+		 * tinyllama 8.4 to 6.3, Qwen2.5 8.6 to 5.9, SmolLM2-1.7B 10.2
+		 * to 7.6; gemma3 and gemma4 unmoved. The prompt 6 of 8 faster,
+		 * Qwen3 56.7 to 68.7 tok/s. =0 is the static split.
+		 */
+		v = !(e && *e == '0');
+	}
 	return v;
 }
 
@@ -3226,6 +3236,17 @@ static double bstage_ms[ST_N];
 static unsigned bstage_rows, bstage_chunks;
 /* the serial block arm's attention, in three parts: scores, softmax, values */
 static double battn_ms[3];
+/*
+ * ⚠ THE MATMUL STAGES WERE TWICE THE NPU ENTRY. Phase 9 on the board,
+ * 2026-09-04, Qwen3: the seven projection rows of the batched stage table
+ * summed to 12.3 ms a row while the NPU's own batched entry reported 5.8, and
+ * the 6.4 between them had no name -- a third of the prompt. A projection the
+ * hardware refuses falls back to matvec a row at a time in silence, which is
+ * the shape of that number; this says how many rows did, and how much of the
+ * matmul stages was inside the entry, in its wrapper, or on the CPU.
+ */
+static double bmm_entry_ms, bmm_wrap_ms, bmm_fell_ms;
+static unsigned long bmm_fell_rows, bmm_calls;
 
 void llama_stages_reset(void)
 {
@@ -3256,6 +3277,12 @@ void llama_stages_report(void)
 				       100.0 * bstage_ms[i] / bt);
 		printf("  (\"residual\" after o proj carries the ffn rmsnorm too, and"
 		       " \"rope + kv copy\" only the rope)\n");
+		if (bmm_calls)
+			printf("  %-16s %lu calls: %.2f ms a row inside the NPU entry, "
+			       "%.2f in its wrapper, %.2f on the CPU (%lu rows fell back)\n",
+			       "matmul rows:", bmm_calls, bmm_entry_ms / bstage_rows,
+			       bmm_wrap_ms / bstage_rows, bmm_fell_ms / bstage_rows,
+			       bmm_fell_rows);
 		if (battn_ms[0] + battn_ms[1] + battn_ms[2] > 0.0)
 			printf("  %-16s scores %.2f  softmax %.2f  values %.2f ms a row"
 			       "  (the serial block arm's split)\n", "attention:",
@@ -3877,9 +3904,23 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
 {
 	int id = npu_id_for(s, w);
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
 
-	if (id >= 0 && !charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y))
-		return 1;
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
 	/*
 	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
 	 * above can only ever be checked on the board.
@@ -3912,6 +3953,8 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 	 */
 	for (int r = 0; r < n; r++)
 		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
 	return 0;
 }
 
@@ -3954,10 +3997,27 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 
 	if (!reuse_site(site))
 		return matmul_rows(s, w, X, n, Y, k, nout);
-	if (id >= 0 && !charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y))
-		return 1;
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
 	for (int r = 0; r < n; r++)
 		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
 	return 0;
 }
 
