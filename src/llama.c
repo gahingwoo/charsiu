@@ -3175,6 +3175,8 @@ static unsigned stage_tok;
  */
 static double bstage_ms[ST_N];
 static unsigned bstage_rows, bstage_chunks;
+/* the serial block arm's attention, in three parts: scores, softmax, values */
+static double battn_ms[3];
 
 void llama_stages_reset(void)
 {
@@ -3205,6 +3207,11 @@ void llama_stages_report(void)
 				       100.0 * bstage_ms[i] / bt);
 		printf("  (\"residual\" after o proj carries the ffn rmsnorm too, and"
 		       " \"rope + kv copy\" only the rope)\n");
+		if (battn_ms[0] + battn_ms[1] + battn_ms[2] > 0.0)
+			printf("  %-16s scores %.2f  softmax %.2f  values %.2f ms a row"
+			       "  (the serial block arm's split)\n", "attention:",
+			       battn_ms[0] / bstage_rows, battn_ms[1] / bstage_rows,
+			       battn_ms[2] / bstage_rows);
 	}
 	if (!stage_tok)
 		return;
@@ -3444,10 +3451,34 @@ static int attn_block_rows(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_BLOCK");
 
-		v = e ? atoi(e) : 8;
+		/*
+		 * ⚠ OFF, AND THE BOARD IS WHY. Eight rows a pass over the cache
+		 * was 44 ms a row on Qwen3 against 33 a row at a time (phase 9,
+		 * 2026-09-03), slower on four models of eight and equal on the
+		 * rest, with phase 2 nine of nine. The bytes argument that
+		 * motivated it was wrong here: a row of Qwen3 reads 3.7 MB of
+		 * cache in 33 ms, 113 MB/s against a 9 GB/s roof, so the row
+		 * loop was never streaming-bound; it is arithmetic and latency,
+		 * 52 million multiply-adds a row plus a scalar expf per score,
+		 * and reordering the loops does not change either. What can is
+		 * the thread pool, which the token loop's attention does not use
+		 * (round 368: the pool lost at one row a token), and this block
+		 * form is the unit the pool can take: CHARSIU_ATTN_BLOCK=8
+		 * CHARSIU_ATTN_POOL=1 is that arm.
+		 */
+		v = e ? atoi(e) : 0;
 		if (v < 0)
 			v = 0;
 	}
+	return v;
+}
+
+static int attn_block_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_ATTN_POOL") != NULL;
 	return v;
 }
 
@@ -3460,35 +3491,30 @@ struct attn_block_job {
 	float scale;
 	const float *q;      /* [n][n_head * hd], roped */
 	float *out;          /* [n][n_head * hd] */
+	int R;               /* rows a pass over the cache */
 };
 
-static int attn_block(struct attn_block_job *j)
+/*
+ * One range of heads over every row of the chunk, in row blocks of R. Heads
+ * are independent -- each reads the cache and writes its own hd floats of
+ * every row -- so this is the unit the pool splits, and a head's arithmetic
+ * per (row, position) is attn_heads' exactly: attn_dot, softmax over the
+ * same window, attn_axpy in ascending t.
+ */
+static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 {
+	struct attn_block_job *j = ctx;
 	struct llama_state *s = j->s;
 	uint32_t hd = j->hd, hdmax = j->hdmax, gqa = j->gqa, nkv = j->nkv;
-	uint32_t nh = j->n_head;
-	int R = attn_block_rows(), n = j->n;
-	size_t qstride = (size_t)nh * hd;
+	int R = j->R, n = j->n;
+	size_t qstride = (size_t)j->n_head * hd;
+	int timed = stage_on > 0 && !attn_block_pool();
 
-	if (R <= 0 || n <= 0)
-		return 0;
-	if (R > n)
-		R = n;
-	if (!s->batt || s->batt_rows < (unsigned)R) {
-		free(s->batt);
-		s->batt = malloc((size_t)R * nh * s->n_ctx * sizeof(float));
-		if (!s->batt) {
-			s->batt_rows = 0;
-			return -1;
-		}
-		s->batt_rows = (unsigned)R;
-	}
-	/* the group is one kv head's queries, or one head under the control */
-	uint32_t grp = attn_perhead() ? 1 : gqa;
-
-	for (uint32_t kvh = 0; kvh < nkv; kvh++) {
+	for (uint32_t h = (uint32_t)h0; h < (uint32_t)(h0 + nh_); h++) {
+		uint32_t kvh = h / gqa;
 		const float *kbase, *vbase;
 		size_t kstride;
+		float *sc = s->batt + (size_t)h * R * s->n_ctx;
 
 		if (kv_posmajor()) {
 			size_t b = (size_t)j->l * s->n_ctx * j->kvdim
@@ -3504,65 +3530,84 @@ static int attn_block(struct attn_block_job *j)
 			vbase = s->vcache + b;
 			kstride = hdmax;
 		}
-		for (uint32_t g0 = kvh * gqa; g0 < (kvh + 1) * gqa; g0 += grp) {
-			uint32_t g1 = g0 + grp;
+		for (int rb = 0; rb < n; rb += R) {
+			int re = rb + R < n ? rb + R : n;
+			int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
+				      ? j->pos0 + rb + 1 - j->n_swa : 0;
+			int tmax = j->pos0 + re - 1;
+			double t0 = timed ? now_ms() : 0.0, t1;
 
-			for (int rb = 0; rb < n; rb += R) {
-				int re = rb + R < n ? rb + R : n;
-				/* the window's oldest position, per row */
-				int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
-					      ? j->pos0 + rb + 1 - j->n_swa : 0;
-				int tmax = j->pos0 + re - 1;
+			for (int t = tlo_first; t <= tmax; t++) {
+				const float *kt = kbase + (size_t)t * kstride;
 
-				for (int t = tlo_first; t <= tmax; t++) {
-					const float *kt = kbase + (size_t)t * kstride;
-
-					for (int r = rb; r < re; r++) {
-						int pos = j->pos0 + r;
-						int tlo = j->swa && pos + 1 > j->n_swa
-							? pos + 1 - j->n_swa : 0;
-
-						if (t < tlo || t > pos)
-							continue;
-						for (uint32_t h = g0; h < g1; h++) {
-							const float *qh = j->q + (size_t)r * qstride + h * hd;
-
-							s->batt[((size_t)(r - rb) * nh + h) * s->n_ctx + t] =
-								attn_dot(qh, kt, hd) * j->scale;
-						}
-					}
-				}
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
 					int tlo = j->swa && pos + 1 > j->n_swa
 						? pos + 1 - j->n_swa : 0;
 
-					for (uint32_t h = g0; h < g1; h++) {
-						softmax(s->batt + ((size_t)(r - rb) * nh + h)
-							* s->n_ctx + tlo, pos + 1 - tlo);
-						memset(j->out + (size_t)r * qstride + h * hd, 0,
-						       hd * sizeof(float));
-					}
-				}
-				for (int t = tlo_first; t <= tmax; t++) {
-					const float *vt = vbase + (size_t)t * kstride;
-
-					for (int r = rb; r < re; r++) {
-						int pos = j->pos0 + r;
-						int tlo = j->swa && pos + 1 > j->n_swa
-							? pos + 1 - j->n_swa : 0;
-
-						if (t < tlo || t > pos)
-							continue;
-						for (uint32_t h = g0; h < g1; h++)
-							attn_axpy(j->out + (size_t)r * qstride + h * hd,
-								  s->batt[((size_t)(r - rb) * nh + h) * s->n_ctx + t],
-								  vt, hd);
-					}
+					if (t < tlo || t > pos)
+						continue;
+					sc[(size_t)(r - rb) * s->n_ctx + t] =
+						attn_dot(j->q + (size_t)r * qstride + h * hd,
+							 kt, hd) * j->scale;
 				}
 			}
+			if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
+			for (int r = rb; r < re; r++) {
+				int pos = j->pos0 + r;
+				int tlo = j->swa && pos + 1 > j->n_swa
+					? pos + 1 - j->n_swa : 0;
+
+				softmax(sc + (size_t)(r - rb) * s->n_ctx + tlo,
+					pos + 1 - tlo);
+				memset(j->out + (size_t)r * qstride + h * hd, 0,
+				       hd * sizeof(float));
+			}
+			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
+			for (int t = tlo_first; t <= tmax; t++) {
+				const float *vt = vbase + (size_t)t * kstride;
+
+				for (int r = rb; r < re; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+
+					if (t < tlo || t > pos)
+						continue;
+					attn_axpy(j->out + (size_t)r * qstride + h * hd,
+						  sc[(size_t)(r - rb) * s->n_ctx + t],
+						  vt, hd);
+				}
+			}
+			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
 		}
 	}
+}
+
+static int attn_block(struct attn_block_job *j)
+{
+	struct llama_state *s = j->s;
+	int R = attn_block_rows(), n = j->n;
+
+	if (R <= 0 || n <= 0)
+		return 0;
+	if (R > n)
+		R = n;
+	j->R = R;
+	/* scores: [n_head][R][n_ctx], each head's block its own */
+	if (!s->batt || s->batt_rows < (unsigned)R) {
+		free(s->batt);
+		s->batt = malloc((size_t)j->n_head * R * s->n_ctx * sizeof(float));
+		if (!s->batt) {
+			s->batt_rows = 0;
+			return -1;
+		}
+		s->batt_rows = (unsigned)R;
+	}
+	if (attn_block_pool())
+		charsiu_parallel_for(attn_block_heads, j, j->n_head);
+	else
+		attn_block_heads(j, 0, j->n_head);
 	return 0;
 }
 
@@ -4386,7 +4431,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				pos0, n, swa, (int)m->n_swa,
 				hd, hdmax, m->n_head_kv * hdmax, gqa,
 				m->n_head_kv, m->n_head, scale,
-				s->bq, s->bao
+				s->bq, s->bao, 0
 			};
 
 			if (attn_block(&bj))
