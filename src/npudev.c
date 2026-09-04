@@ -3329,20 +3329,34 @@ static int batch_serial(void)
  * ⚠ THE FAULT HAS A WIDTH, and the map so far (phi3, 16 runs a cell,
  * attach-once kernel, 2026-09-03/04, CHARSIU_NPU_BATCH_PARALLEL=1):
  *
- *   full chunks of 24            3 to 15 of 16 WRONG
- *   full chunks of 28, 32, 42, 48, 56, 58, 64, 72, 74, 80   0 of 16 each
+ *   full chunks of 24            3 to 15 of 16 WRONG (13 of 16 at KMAX 1024)
+ *   full chunks of 22            1 of 16
+ *   a TAIL of 24 (62 + 24)       1 of 16
+ *   full chunks of 12, 14, 16, 18, 20, 26                    0 of 16 each
+ *   full chunks of 28, 32, 42, 48, 56, 58, 62, 64, 72, 74, 80   0 of 16 each
  *   tails of 2, 4, 6, 12, 14, 16, 22, 28, 30                0 of 16 each
  *   m = 8 and m = 10, the dense sweep of 08-30              wrong
+ *   24 at KMAX 4096 (one K slice for K = 3072)              0 of 16
  *
  * so the kernel was never the fix (the map is on the attach-once kernel),
- * "m mod 16 in {8, 10}" was a guess the 42/56/58/72/74 row killed, and what
- * is left is: the overlap fails on SMALL full chunks and has not failed on
- * one of 28 or more. CHARSIU_NPU_PARALLEL_MIN_M=N overlaps the two cores
- * for a call of m >= N rows and serialises below it; 0, the default, never
- * overlaps. 28 is the smallest clean full width measured, so 28 is the
- * value to try once the boundary below it is mapped, and phase 2 with the
- * chunker's 80 + tail is the check. Speculative passes at m = 4 or 6 stay
- * serial under any N above 6, which is the safe side of the map.
+ * "m mod 16 in {8, 10}" was a guess the 42/56/58/72/74 row killed, "small
+ * full chunks" was the next guess and 12..20 and 26 killed that. There is
+ * no width law: bad {8, 10, 22, 24}, clean either side of them, and the
+ * fault gets WORSE with more K slices (KMAX 1024) and goes away with fewer
+ * (KMAX 4096), which is the one lead the map left. CHARSIU_NPU_PARALLEL_MIN_M=N
+ * overlaps the two cores for a call of m >= N rows and serialises below
+ * it; 0, the default, never overlaps.
+ *
+ * ⚠ 28 IS PRICED AND NOT SHIPPED. With N = 28 phase 2 was 9 of 9 identical
+ * and phase 7 read TTFT 833/1218/3948/2905 ms against the serial default's
+ * 1037/1565/5073/3604 (Qwen3/TinyLLAMA/Phi3/Gemma4): a fifth off the prompt.
+ * What holds it back is the evidence, not the number: every width of 28 or
+ * more is clean at 16 runs, on ONE model, and 16 clean runs bound a fault
+ * rate at about one in six -- width 22 fails one in sixteen. A default that
+ * returns wrong text one prompt in fifty is not a default. The element
+ * probe (board_overlap_slots.sh) is what turns this into a mechanism, and a
+ * mechanism is what makes 28 (or any N) safe rather than unobserved.
+ * Speculative passes at m = 4 or 6 stay serial under any N above 6.
  */
 static unsigned parallel_min_m(void)
 {
@@ -4622,6 +4636,36 @@ int charsiu_npu_reuse_on(void)
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g)
 {
 	return g ? g->kmax : 4096;
+}
+
+/*
+ * Slot i of tensor id, as the deal left it: the device it ran on, its K slice
+ * index, and the output channels [n0, n1) it wrote. Slots are n fastest, so
+ * the first n_slices of them are K slice 0. -1 past the last slot.
+ *
+ * ⚠ THIS IS WHAT TURNS A WRONG ROW INTO A CORE. The overlap fault (both
+ * cores in flight, width 24, phi3) was mapped for four days by TEXT -- right
+ * or wrong, 16 runs a width -- which can say a width is bad and nothing about
+ * where. A miss in the batch probe knows its channels; with this it knows
+ * which slot covered them and which core that slot was dealt to.
+ */
+int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
+			  unsigned *di, unsigned *ki, unsigned *n0, unsigned *n1)
+{
+	const struct npu_entry *e;
+	const struct npu_slot *s;
+
+	if (!g || id < 0 || (unsigned)id >= g->n_ent)
+		return -1;
+	e = &g->ent[id];
+	if (i >= e->count)
+		return -1;
+	s = &g->slot[e->first + i];
+	*di = s->di;
+	*ki = i / e->n_slices;
+	*n0 = s->n0;
+	*n1 = s->n0 + s->job.mm.n;
+	return 0;
 }
 
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,

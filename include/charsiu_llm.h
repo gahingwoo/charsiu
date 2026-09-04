@@ -327,6 +327,10 @@ void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 /* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
+/* slot i of tensor id after a call: its device, K slice, and channels [n0, n1);
+ * -1 past the last slot. The batch probe names the core behind a wrong row with it. */
+int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
+			  unsigned *di, unsigned *ki, unsigned *n0, unsigned *n1);
 
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,

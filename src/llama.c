@@ -1326,6 +1326,67 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       t->name, (unsigned)t->k,
 					       (unsigned)t->n, r, mr, rworst);
 					nbad++;
+					/*
+					 * ⚠⚠ WHICH CHANNELS, AND WHOSE SLOT.
+					 *
+					 * A wrong row is a sum over K slices of
+					 * the n slices that cover it, and the deal
+					 * puts those slots on either core. The
+					 * overlap fault was mapped by text for
+					 * four days -- bad at 8, 10, 22, 24, clean
+					 * at 12..20, 26 and 28..80 -- and text
+					 * cannot say which core wrote the wrong
+					 * numbers. The span says which n slice;
+					 * the deal says which core it ran on and
+					 * where its K slices ran. One n slice on
+					 * one core is a different fault from a
+					 * whole row across both.
+					 */
+					{
+						unsigned c, w0 = 0, w1 = 0, nw = 0;
+						unsigned i2, di, ki, n0, n1;
+
+						for (c = 0; c < (unsigned)t->n; c++) {
+							size_t o = (size_t)r * t->n + c;
+							double d = fabs((double)Y[o] - (double)Yref[o]);
+							double sc = fabs((double)Yref[o]);
+
+							if ((sc > 1e-3 ? d / sc : d) > 1e-3) {
+								if (!nw)
+									w0 = c;
+								w1 = c;
+								nw++;
+							}
+						}
+						printf("           wrong channels %u..%u,"
+						       " %u of %u\n", w0, w1, nw,
+						       (unsigned)t->n);
+						for (i2 = 0; !charsiu_npu_slot_deal(s->pool.dev,
+							s->pool.id[i], i2, &di, &ki, &n0, &n1); i2++) {
+							unsigned inw = 0, i3, d3, k3, a3, b3;
+
+							if (ki)
+								break;	/* n fastest: K slice 0 came first */
+							for (c = n0; c < n1 && c < (unsigned)t->n; c++) {
+								size_t o = (size_t)r * t->n + c;
+								double d = fabs((double)Y[o] - (double)Yref[o]);
+								double sc = fabs((double)Yref[o]);
+
+								if ((sc > 1e-3 ? d / sc : d) > 1e-3)
+									inw++;
+							}
+							if (!inw)
+								continue;
+							printf("           n slice %u [%u,%u) on core %u:"
+							       " %u wrong; its K slices on cores",
+							       i2, n0, n1, di, inw);
+							for (i3 = 0; !charsiu_npu_slot_deal(s->pool.dev,
+								s->pool.id[i], i3, &d3, &k3, &a3, &b3); i3++)
+								if (a3 == n0)
+									printf(" %u", d3);
+							printf("\n");
+						}
+					}
 				}
 				/*
 				 * ⚠⚠ ABSENT OR MISPLACED, ASKED OF THE ROW
