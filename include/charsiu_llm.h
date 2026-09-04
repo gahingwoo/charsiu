@@ -328,6 +328,9 @@ void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 int  charsiu_npu_reuse_on(void);
 /* whether batched calls overlap the two cores, and why (the rail and clock against the vendor's OPP) */
 const char *charsiu_npu_overlap_note(void);
+/* the same decision from the rail and clock readings alone, for tests: 1 = may overlap.
+ * CHARSIU_NPU_RAIL_UV / CHARSIU_NPU_CLK_HZ replace the readings. */
+int charsiu_npu_overlap_ok(char *why, size_t n);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
 /* slot i of tensor id after a call: its device, K slice, and channels [n0, n1);
  * -1 past the last slot. The batch probe names the core behind a wrong row with it. */
