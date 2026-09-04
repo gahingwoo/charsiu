@@ -742,6 +742,28 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 			    uint8_t *dst, size_t dst_size)
 {
+	charsiu_pack_input_f16_stride(mm, src, mm->k, dst, dst_size);
+}
+
+/*
+ * ⚠⚠ THE SOURCE ROW STRIDE, WHICH IS WHERE A THIRD OF PREFILL'S PACKING WENT.
+ *
+ * A tensor is cut into K slices and each slice packs columns [k0, k0 + sk) of
+ * every row. With no stride the caller has to gather those columns into a
+ * contiguous scratch first, so an element is read from X, written to the
+ * scratch, read back and written as a half: fourteen bytes moved to pack six.
+ * The board was doing 730 MB of that per prompt on Qwen2.5-1.5B and packing
+ * measured 2628 ms of an 8941 ms matmul entry.
+ *
+ * With the stride the loop reads X where it lies. The access pattern is
+ * unchanged -- groups outermost, m strided reads a group, for the cold
+ * destination reason above -- only the stride differs, so nothing about the
+ * measurements in that comment moves.
+ */
+void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
+				   const float *src, size_t src_stride,
+				   uint8_t *dst, size_t dst_size)
+{
 	unsigned atom = charsiu_feature_atom(CHARSIU_FP16);
 	unsigned i, kk;
 
@@ -879,7 +901,7 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 			uint8_t *d = dst + (size_t)g * m * atom * 2;
 
 			for (i = 0; i < m; i++, d += 16) {
-				const float *r = s + (size_t)i * mm->k;
+				const float *r = s + (size_t)i * src_stride;
 
 				vst1q_u16((uint16_t *)d,
 					  vcombine_u16(charsiu_vhalf(vld1q_f32(r)),
@@ -889,7 +911,7 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 		for (i = 0; i < m; i++)
 			for (kk = 0; kk < tail; kk++) {
 				uint16_t h = charsiu_float_to_half(
-					src[(size_t)i * mm->k + ng * atom + kk]);
+					src[(size_t)i * src_stride + ng * atom + kk]);
 				uint8_t *p = dst + base + (size_t)i * 16
 					   + (size_t)kk * 2;
 
@@ -905,7 +927,7 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 		for (kk = 0; kk < mm->k; kk++) {
 			size_t off = ((size_t)(kk / atom) * mm->m * atom
 				      + (size_t)i * atom + kk % atom) * 2;
-			uint16_t h = charsiu_float_to_half(src[i * mm->k + kk]);
+			uint16_t h = charsiu_float_to_half(src[(size_t)i * src_stride + kk]);
 
 			dst[off] = (uint8_t)(h & 0xff);
 			dst[off + 1] = (uint8_t)(h >> 8);

@@ -180,6 +180,11 @@ float charsiu_half_to_float(uint16_t h);
  * a float carries its own sign, so pass the dequantised values. */
 void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 			    uint8_t *dst, size_t dst_size);
+/* the same, reading rows of `src` that are src_stride floats apart: a K slice
+ * can be packed out of the caller's own matrix without a gather into scratch */
+void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
+				   const float *src, size_t src_stride,
+				   uint8_t *dst, size_t dst_size);
 
 unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
 /*

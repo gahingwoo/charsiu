@@ -3448,6 +3448,20 @@ static int batch_serial_for(unsigned m)
 	return !(parallel_min_m() && m >= parallel_min_m());
 }
 
+/* CHARSIU_NPU_PACK_GATHER=1: gather every K slice into scratch before packing,
+ * which is what this did before the stride, and the control for measuring it */
+static int pack_gather(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_PACK_GATHER");
+
+		v = e && *e != '0';
+	}
+	return v;
+}
+
 static int batch_zero(void)
 {
 	static int z = -1;
@@ -4331,10 +4345,52 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				continue;
 			done_ki |= 1u << ki;
 			mm.m = m;
-			for (unsigned r = 0; r < m; r++)
-				memcpy(g->bscr + (size_t)r * sk,
-				       X + (size_t)r * e->t->k + s->k0,
-				       sk * sizeof(*g->bscr));
+			/*
+			 * ⚠⚠ PACK OUT OF X ONLY WHEN THE SLICE IS THE WHOLE
+			 * ROW, AND THE BOARD IS WHY.
+			 *
+			 * A K slice is columns [k0, k0 + sk) of every row, and
+			 * this used to copy them into g->bscr so the packer
+			 * could read contiguous rows: fourteen bytes moved per
+			 * element packed. Handing the packer X and a row
+			 * stride removes that round trip, and on a tensor whose
+			 * K fits one slice it is free money -- Qwen2.5-1.5B,
+			 * whose K is 1536 against a 2048 slice, went from 2628
+			 * to 2215 ms of packing.
+			 *
+			 * On a tensor that is CUT it is a loss, and a large
+			 * one. Phi-3.5's K is 3072, so a 2048 slice and a 1024
+			 * slice, and the packer walks groups outermost with m
+			 * strided reads a group. Reading X the stride is the
+			 * whole row, so every line fetched carries columns the
+			 * slice does not want and the working set is the whole
+			 * activation; reading bscr the stride is the slice, the
+			 * lines are all wanted, and the buffer was written
+			 * sequentially a moment earlier. Measured on the board:
+			 * packing 4384 ms with the gather, 6583 without it, and
+			 * the whole matmul entry 21312 against 23724.
+			 *
+			 * So the gather stays wherever the tensor is sliced,
+			 * and int8 keeps it always: it takes a per row maximum
+			 * over the slice and quantises into g->bq, which is a
+			 * pass over the slice either way.
+			 */
+			/*
+			 * ⚠ THE ARM, BECAUSE THE FIRST TWO ROUNDS OF THIS WERE
+			 * NOISE. Three board runs of phase 9 disagreed by more
+			 * than the change: Phi-3.5 packed 4384, 6583 and 3158
+			 * ms on paths that should have been the same twice,
+			 * and Qwen2.5 2628, 2215 and 3497. Phase 9 runs under
+			 * the ondemand governor and packing is CPU work, so a
+			 * build against a build measures the governor.
+			 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
+			 * binary can run both arms in one session.
+			 */
+			if (!g->w4 || sk != e->t->k || pack_gather())
+				for (unsigned r = 0; r < m; r++)
+					memcpy(g->bscr + (size_t)r * sk,
+					       X + (size_t)r * e->t->k + s->k0,
+					       sk * sizeof(*g->bscr));
 			if (!g->w4) {
 				/*
 				 * int8's scale is per row and taken over THIS K
@@ -4386,10 +4442,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				charsiu_pack_input(&mm, g->bq,
 						   (uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						   g->bin_stride, s->job.input_zero_point);
+			} else if (sk == e->t->k && !pack_gather()) {
+				/* the slice is the whole row, so k0 is 0 */
+				charsiu_pack_input_f16_stride(&mm, X, e->t->k,
+						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						g->bin_stride);
 			} else {
 				charsiu_pack_input_f16(&mm, g->bscr,
-						       (uint8_t *)g->bin[d].map + ki * g->bin_stride,
-						       g->bin_stride);
+						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						g->bin_stride);
 			}
 		}
 
