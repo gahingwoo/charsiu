@@ -108,7 +108,7 @@ pass() {
 	# the width line: m, tensors, worst, rows ok of total, ...
 	grep "^ *$W  " "$out" | sed "s/^/  $arm $n: /"
 	grep -c "^ *MISS " "$out" | sed "s/^/       MISS lines: /"
-	grep -A2 "^ *MISS " "$out" | grep -v '^--$' | sed 's/^/    /'
+	awk '/^ *MISS /{p=1; print; next} /^ *(wrong channels|n slice|\()/{if (p) print; next} {p=0}' "$out" | sed 's/^/    /'
 	return 0
 }
 
@@ -128,11 +128,15 @@ echo "tally over the parallel passes (MISS lines, capped at 40 a pass):"
 cat "$OUTDIR"/overlap-"$W"-parallel-*.txt 2>/dev/null | awk '
 /^ *MISS /       { miss++; for (i = 1; i <= NF; i++) if ($i == "row") rows[$(i+1)]++ }
 /^ *n slice /    { for (i = 1; i <= NF; i++) { if ($i == "slice") ns[$(i+1)]++; if ($i == "core") core[$(i+1)":"]++ } }
+/STALE READ/      { stale++ }
+/HARDWARE WROTE/  { hw++ }
+/NEITHER, the fresh/ { neither++ }
 END {
 	printf "  misses %d\n", miss
 	printf "  by row:"; for (r in rows) printf " row %s x%d", r, rows[r]; printf "\n"
 	printf "  by n slice:"; for (n in ns) printf " slice %s x%d", n, ns[n]; printf "\n"
 	printf "  by core the slice ran on:"; for (c in core) printf " core %s x%d", c, core[c]; printf "\n"
+	printf "  the wrong word re-read after a cache invalidate: right (STALE READ) x%d, same wrong (HARDWARE WROTE IT) x%d, a third value x%d\n", stale, hw, neither
 }'
 echo
 echo "what to read:"
@@ -143,5 +147,11 @@ echo "     Under each MISS: the wrong channel span, the n slice covering it"
 echo "     and its core, and the cores of that slice's K slices."
 echo "  3. one core, one n slice, one row index every time is a slot story;"
 echo "     whole rows across both cores is a surface or a fence story."
+echo "  4. THE LAST TALLY LINE IS THE VERDICT. Under each wrong element the"
+echo "     probe prints every K slice's word as the gather saw it and again"
+echo "     after invalidating the CPU's cache of the buffer. Fresh sum RIGHT:"
+echo "     the CPU read a stale line, a fence or cache story on our side."
+echo "     Fresh sum the SAME wrong number: the hardware wrote it, and no"
+echo "     amount of software reads it right."
 echo "  full logs: $OUTDIR/overlap-$W-{serial,parallel}-*.txt"
 echo "======================================================================"

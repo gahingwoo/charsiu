@@ -331,6 +331,13 @@ unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
  * -1 past the last slot. The batch probe names the core behind a wrong row with it. */
 int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
 			  unsigned *di, unsigned *ki, unsigned *n0, unsigned *n1);
+/* the word slot i wrote for (r, c) in the last batched call: raw bits, what the
+ * gather added for it, and the per channel scale applied after the sum. fresh = 1
+ * invalidates the CPU's cache of the buffer first. -1 when (r, c) is not in slot i
+ * or the last call was another tensor. */
+int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
+			  unsigned c, int fresh, uint32_t *raw, float *contrib,
+			  float *final);
 
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,

@@ -19,6 +19,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1205,6 +1206,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		unsigned seen = 0;		/* staged tensors reached, capped */
 		unsigned nbad = 0;		/* misses named, capped */
 		int whered = 0;			/* the where-did-it-go scan, once a width */
+		unsigned ndeep = 0;		/* slot-word dives, capped a width */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
@@ -1386,6 +1388,73 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 									printf(" %u", d3);
 							printf("\n");
 						}
+						/*
+						 * ⚠⚠ WHICH SIDE OF THE BUS. For the
+						 * first wrong channels: every slot's
+						 * word for (r, c) as the gather saw
+						 * it, then the same word after the
+						 * CPU's cache of the buffer is
+						 * invalidated. The fresh sum coming
+						 * back RIGHT says the CPU read a
+						 * stale line (a fence or a cache
+						 * story, fixable here); the fresh
+						 * sum being the SAME wrong number
+						 * says the hardware wrote it (a
+						 * shared-silicon story, not fixable
+						 * here). Twelve a width: each fresh
+						 * read is an ioctl.
+						 */
+						for (c = 0, nw = 0; c < (unsigned)t->n && nw < 4 && ndeep < 12; c++) {
+							size_t o = (size_t)r * t->n + c;
+							double d = fabs((double)Y[o] - (double)Yref[o]);
+							double sc = fabs((double)Yref[o]);
+							double want = Yref[o], got = Y[o];
+							double stale = 0.0, freshs = 0.0, fs = 1.0;
+							uint32_t raw;
+							float cb, fl;
+							int nsl = 0;
+
+							if ((sc > 1e-3 ? d / sc : d) <= 1e-3)
+								continue;
+							nw++;
+							ndeep++;
+							printf("           (%u,%u) want %.4e got %.4e |", r, c, want, got);
+							for (i2 = 0; charsiu_npu_slot_deal(s->pool.dev,
+								s->pool.id[i], i2, &di, &ki, &n0, &n1) == 0; i2++) {
+								if (charsiu_npu_slot_word(s->pool.dev, s->pool.id[i],
+									i2, r, c, 0, &raw, &cb, &fl))
+									continue;
+								printf(" k%u/core%u %.4e [%08x]", ki, di, (double)cb, raw);
+								stale += cb;
+								fs = fl;
+								nsl++;
+							}
+							printf(" | fresh");
+							for (i2 = 0; charsiu_npu_slot_deal(s->pool.dev,
+								s->pool.id[i], i2, &di, &ki, &n0, &n1) == 0; i2++) {
+								if (charsiu_npu_slot_word(s->pool.dev, s->pool.id[i],
+									i2, r, c, 1, &raw, &cb, &fl))
+									continue;
+								printf(" k%u %.4e [%08x]", ki, (double)cb, raw);
+								freshs += cb;
+							}
+							if (!nsl) {
+								printf(" | no slot word (another tensor was called since)\n");
+								continue;
+							}
+							freshs *= fs;
+							stale *= fs;
+							{
+								double lim = fabs(want) > 1e-3 ? fabs(want) * 1e-3 : 1e-3;
+								double limg = fabs(got) > 1e-3 ? fabs(got) * 1e-3 : 1e-3;
+
+								printf(" -> %.4e (stale sum %.4e): %s\n", freshs, stale,
+								       fabs(freshs - want) <= lim ? "STALE READ, the fresh word is right"
+								       : fabs(freshs - got) <= limg ? "HARDWARE WROTE IT, the fresh word is the same wrong one"
+								       : "NEITHER, the fresh word is a third value");
+							}
+						}
+						fflush(stdout);
 					}
 				}
 				/*

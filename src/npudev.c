@@ -387,6 +387,9 @@ struct charsiu_npu {
 	 * see the comment on struct npu_outbuf */
 	struct npu_outbuf *obuf;
 	unsigned n_obuf, obuf_cap;
+	/* the last batched call's buffer and tensor, for charsiu_npu_slot_word */
+	struct npu_outbuf *last_ob;
+	int last_id;
 	float *bscr;               /* m rows of one slice's K, gathered */
 	uint8_t *bq;               /* and quantised, for the int8 path */
 	/*
@@ -4122,6 +4125,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		ob = batch_outbuf(g, wide, most, m);
 		if (!ob)
 			return -1;
+		g->last_ob = ob;
+		g->last_id = id;
 	}
 
 	/*
@@ -4665,6 +4670,67 @@ int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
 	*ki = i / e->n_slices;
 	*n0 = s->n0;
 	*n1 = s->n0 + s->job.mm.n;
+	return 0;
+}
+
+/*
+ * The word slot i of tensor id wrote for (r, c) in the LAST batched call, and
+ * what the gather added for it: raw is the bit pattern (a float on the int4
+ * path, an int32 on int8), contrib is that word scaled the way read_rows
+ * scales it, and final is the per channel scale applied after the sum (1.0
+ * when the group scale already did it). Sum contrib over the slots covering
+ * c, times final, and that is Y[r][c] as the gather computed it.
+ *
+ * ⚠ fresh = 1 INVALIDATES THE CPU'S CACHE OF THE BUFFER FIRST -- a PREP on a
+ * job that has already finished is just the dma_sync -- so a word that changes
+ * between a stale read and a fresh one was a line the CPU held, not a number
+ * the hardware wrote. That is the one question the overlap fault has left:
+ * (row 16, channel 3) is wrong one time in fifty at width 24 with both cores
+ * in flight, and text, rows and even the slot cannot say which side of the
+ * bus the wrong word came from. -1 when the last call was not this tensor,
+ * or (r, c) is not in slot i.
+ */
+int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
+			  unsigned c, int fresh, uint32_t *raw, float *contrib,
+			  float *final)
+{
+	const struct npu_entry *e;
+	const struct npu_slot *s;
+	const uint8_t *base;
+	unsigned nt = 0, d, cc, idx, ki;
+
+	if (!g || id < 0 || (unsigned)id >= g->n_ent || !g->last_ob ||
+	    g->last_id != id || !g->bmap)
+		return -1;
+	e = &g->ent[id];
+	if (i >= e->count || r >= g->bmap_m)
+		return -1;
+	s = &g->slot[e->first + i];
+	if (c < s->n0 || c >= s->n0 + s->job.mm.n)
+		return -1;
+	d = s->di;
+	ki = i / e->n_slices;
+	/* the region index is this slot's rank among the device's slots */
+	for (unsigned j = 0; j < i; j++)
+		if (g->slot[e->first + j].di == d)
+			nt++;
+	if (fresh)
+		charsiu_bo_prep(g->dev[d], &g->last_ob->bo[d], 2000000000);
+	base = (const uint8_t *)g->last_ob->bo[d].map + (size_t)nt * g->bout_stride;
+	cc = c - s->n0;
+	idx = g->bmap[(size_t)r * g->bmap_n4 + cc / 4] + cc % 4;
+	*raw = ((const uint32_t *)base)[idx];
+	if (g->w4) {
+		float v = ((const float *)base)[idx];
+		int grp = tensor_grouped(g, e->t);
+
+		*contrib = grp ? v * s->sc[cc] : v;
+		*final = grp ? 1.0f : e->t->scale[c];
+	} else {
+		*contrib = (float)((const int32_t *)base)[idx]
+			 * g->bd1[(size_t)ki * g->bmap_m + r];
+		*final = e->t->scale[c];
+	}
 	return 0;
 }
 
