@@ -1789,6 +1789,18 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		 * uniform to separate the three terms -- and saying so is the
 		 * difference between a mystery and a shorter prompt.
 		 */
+		/*
+		 * ⚠ OUTSIDE THE COST MODEL'S BRANCH. This sat inside
+		 * `if (!solve3(...))`, so the line that says whether the two
+		 * cores ran together vanished on any run short or uniform
+		 * enough that the three-term fit went singular -- which is
+		 * every quick check somebody would make while asking exactly
+		 * that question. The board printed it for a real prompt and
+		 * printed nothing for `-p hi -n 4`.
+		 */
+		if (g->ndev > 1 && g->bwall_us > 0.0)
+			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
+				charsiu_npu_overlap_note());
 		if (solve3(m, v, x))
 			fprintf(stderr, "charsiu NPU: the cost model did not fit "
 				"(the calls do not separate 'a task' from 'a "
@@ -1808,9 +1820,6 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				x[0], x[1], x[2], g->busy_us / 1e3, fix, tsk,
 				byt, byt > 0.0 ? g->weight_mb / byt : 0.0,
 				g->ndev, g->ndev == 1 ? "" : "s");
-			if (g->ndev > 1 && g->bwall_us > 0.0)
-				fprintf(stderr, "charsiu NPU: batched calls, %s\n",
-					charsiu_npu_overlap_note());
 			/*
 			 * ⚠ THE RESIDUAL, NOT THE SUM. fix + tsk + byt is the
 			 * hardware path to the last decimal by construction --
