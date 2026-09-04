@@ -29,6 +29,9 @@
 #   CHARSIU_OVL_KMAX=2048    the shipped K slice; 1024 is worse, 4096 is clean
 #   CHARSIU_OVL_PASSES=4     parallel passes
 #   CHARSIU_OVL_MAXT=        cap staged tensors a pass (CHARSIU_PROBE_MAXT)
+#   CHARSIU_OVL_EXTRA=       more env for every arm, e.g. CHARSIU_CBUF_SWAP=1
+#                            (device 0 takes CBUF window 1 and device 1 window 0:
+#                            does the wrong word follow the window or the fd?)
 #
 # `charsiu update dev` installs this at /opt/charsiu/board_overlap_slots.sh.
 #
@@ -70,7 +73,7 @@ mkdir -p "$OUTDIR"
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=$KMAX CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
-CHARSIU_PROBE_WIDTHS=$W ${CHARSIU_OVL_MAXT:+CHARSIU_PROBE_MAXT=$CHARSIU_OVL_MAXT}"
+CHARSIU_PROBE_WIDTHS=$W ${CHARSIU_OVL_MAXT:+CHARSIU_PROBE_MAXT=$CHARSIU_OVL_MAXT} ${CHARSIU_OVL_EXTRA:-}"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
@@ -85,7 +88,7 @@ esac
 echo "kernel   $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
 [ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
 	echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
-echo "config   width $W, KMAX $KMAX, serial once then parallel x$PASSES"
+echo "config   width $W, KMAX $KMAX, serial once then parallel x$PASSES${CHARSIU_OVL_EXTRA:+, extra: $CHARSIU_OVL_EXTRA}"
 echo
 
 # one pass: the arm's env, the pass label; prints the width line and the misses
@@ -128,6 +131,16 @@ echo "tally over the parallel passes (MISS lines, capped at 40 a pass):"
 cat "$OUTDIR"/overlap-"$W"-parallel-*.txt 2>/dev/null | awk '
 /^ *MISS /       { miss++; for (i = 1; i <= NF; i++) if ($i == "row") rows[$(i+1)]++ }
 /^ *n slice /    { for (i = 1; i <= NF; i++) { if ($i == "slice") ns[$(i+1)]++; if ($i == "core") core[$(i+1)":"]++ } }
+/^ *\([0-9]+,[0-9]+\) want / {
+	# the K slice whose word is off: the one furthest from the others, by device
+	big = 0; bigd = ""
+	for (i = 1; i <= NF; i++) if ($i ~ /^k[0-9]+\/core[0-9]+$/) {
+		v = $(i+1) + 0; if (v < 0) v = -v
+		if (v > big) { big = v; bigd = $i; sub(/^k[0-9]+\//, "", bigd) }
+		if ($(i+2) == "|") break
+	}
+	if (bigd != "") baddev[bigd]++
+}
 /STALE READ/      { stale++ }
 /HARDWARE WROTE/  { hw++ }
 /NEITHER, the fresh/ { neither++ }
@@ -135,7 +148,8 @@ END {
 	printf "  misses %d\n", miss
 	printf "  by row:"; for (r in rows) printf " row %s x%d", r, rows[r]; printf "\n"
 	printf "  by n slice:"; for (n in ns) printf " slice %s x%d", n, ns[n]; printf "\n"
-	printf "  by core the slice ran on:"; for (c in core) printf " core %s x%d", c, core[c]; printf "\n"
+	printf "  by core the n slice ran on:"; for (c in core) printf " core %s x%d", c, core[c]; printf "\n"
+	printf "  THE DEVICE HOLDING THE WRONG K SLICE WORD:"; for (c in baddev) printf " %s x%d", c, baddev[c]; printf "\n"
 	printf "  the wrong word re-read after a cache invalidate: right (STALE READ) x%d, same wrong (HARDWARE WROTE IT) x%d, a third value x%d\n", stale, hw, neither
 }'
 echo

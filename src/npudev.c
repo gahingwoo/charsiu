@@ -2072,7 +2072,18 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	s->di = di;
 	/* the two cores share the CBUF, so the two devices take different
 	 * windows -- see charsiu_job.cbuf_window */
-	s->job.cbuf_window = di;
+	/*
+	 * ⚠ CHARSIU_CBUF_SWAP=1 GIVES DEVICE 0 WINDOW 1 AND DEVICE 1 WINDOW 0.
+	 * The overlap fault's wrong word (row 16, channel 3, both cores in
+	 * flight, 2026-09-04) sat in DEVICE 1's K slice in 48 of 48 element
+	 * reads and never in device 0's. Device 1 is two things at once: the
+	 * second fd, whose job rocket puts on whichever core is free, and
+	 * CBUF window 1 (data at 0x1c00, weights at 0x2c00, the vendor's
+	 * values off one capture). Swapping the windows keeps the fd and moves
+	 * the window: if the wrong word moves to device 0, it is the window's;
+	 * if it stays on device 1, it is the core's or the ordering's.
+	 */
+	s->job.cbuf_window = getenv("CHARSIU_CBUF_SWAP") ? di ^ 1u : di;
 	s->job.mm.m = 1;
 	s->job.mm.k = k;
 	s->job.mm.n = n;
