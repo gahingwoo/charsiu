@@ -545,15 +545,22 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
 	if [ "$ARMS9" = serial ]; then
 		:
-	elif sed -i 's/^\[.*//' "$OUT/.ttft_serial" "$OUT/.ttft_pool" &&
-	     cmp -s "$OUT/.ttft_serial" "$OUT/.ttft_pool"; then
+	# ⚠⚠ THE TEXT, NOT THE REPORT. This compared the whole of stdout, and
+	# the stage table is printed there too, so the two arms differed on
+	# their own timings: the first round this check ever ran called eight
+	# models of nine corrupted and every differing line it printed was a
+	# duration. The generated text comes first and the report follows it,
+	# so cut both files at the first report line.
+	elif { awk '/^(charsiu |\[)/{exit} {print}' "$OUT/.ttft_serial" >"$OUT/.ttft_serial.txt"
+	       awk '/^(charsiu |\[)/{exit} {print}' "$OUT/.ttft_pool"   >"$OUT/.ttft_pool.txt"; } &&
+	     cmp -s "$OUT/.ttft_serial.txt" "$OUT/.ttft_pool.txt"; then
 		printf '      read back: serial %s   pooled %s   (text same)\n' \
 		    "${t_serial:-?}" "${t_pool:-?}"
 	else
 		bad "$b: the pooled read back CHANGES THE TEXT"
 		printf '     rows are disjoint in Y, so this is the split being\n'
 		printf '     wrong, not a number to weigh against a speed-up.\n'
-		diff "$OUT/.ttft_serial" "$OUT/.ttft_pool" | head -4 | sed 's/^/       /'
+		diff "$OUT/.ttft_serial.txt" "$OUT/.ttft_pool.txt" | head -4 | sed 's/^/       /'
 		ntx=$((ntx + 1))
 	fi
 	if grep -q "charsiu NPU batched:" "$OUT/.ttft_err"; then
