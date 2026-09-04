@@ -87,6 +87,36 @@ int charsiu_cbuf_window(void)
 	return e ? atoi(e) : 0;
 }
 
+/*
+ * WINDOW 1'S START BANK, in banks of 0x400 CBUF entries; 7 is the vendor's
+ * 0x1c00 and every window 1 value above is a function of it. Read off the
+ * 2026-09-04 census of the vendor's Llama-3.2-1B .rkllm, where every op is
+ * present twice and the two copies differ in EXACTLY six registers:
+ *
+ *   register   window 0     window 1     as a function of the start bank S
+ *   0x1018     40000404     4000040b     low byte 4 + S
+ *   0x1038     00000007     0000010e     end bank (7, then 14) | 0x100 for S > 0
+ *   0x103c     xxxx0000     xxxx1c00     low half S * 0x400
+ *   0x1040     10000000     2c001c00     (S*0x400 + 0x1000) << 16 | S*0x400
+ *   0x2818     00000000     1c000000     S*0x400 << 16
+ *   0x2820     00000000     00000038     S * 8
+ *
+ * so the CBUF is two mirror-image windows of 7 banks (0x1000 of data and
+ * 0xc00 of weights each; the split form takes 0x1400 and 0x800) in 14 banks,
+ * 0x3800 entries. CHARSIU_CBUF_W1_BANK=N moves window 1 to start at bank N:
+ * 8 leaves a gap between the windows (a smaller weight ring), 6 makes them
+ * overlap by a bank (a control that should fail worse). The wrong word of
+ * the overlap fault sits in window 1's core; this asks whether it sits at
+ * window 1's ADDRESS.
+ */
+static unsigned w1_bank(void)
+{
+	const char *e = envq("CHARSIU_CBUF_W1_BANK");
+	int v = e ? atoi(e) : 7;
+
+	return v < 1 || v > 13 ? 7u : (unsigned)v;
+}
+
 int charsiu_w4_paired(const struct charsiu_matmul *mm)
 {
 	return mm->wdtype == CHARSIU_INT4 && envq("CHARSIU_W4_PAIRED") != NULL;
@@ -1027,8 +1057,12 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * carry 0x0e in each. */
 	emit(&e, CNA, 0x1004, 0x0000000e);
 	emit(&e, CORE, 0x3004, 0x0000000e);
-	emit(&e, CNA, 0x1038,
-	     job->cbuf_window == 1 ? 0x0000010eu : 0x00000007u);
+	{
+		unsigned S = w1_bank(), E = S + 7 > 14 ? 14 : S + 7;
+
+		emit(&e, CNA, 0x1038,
+		     job->cbuf_window == 1 ? (0x100u | E) : 0x00000007u);
+	}
 	emit(&e, DPU, 0x4004, 0x0000000e);
 	emit(&e, RDMA, 0x5004, 0x0000000e);
 	/*
@@ -1082,7 +1116,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * ever run: at M = 1 an ic of 131072 would be needed to reach it.
 	 */
 	emit(&e, CNA, 0x1018,
-	     (job->cbuf_window == 1 ? 0x4000040bu : 0x40000404u) +
+	     (job->cbuf_window == 1 ? 0x40000404u + w1_bank() : 0x40000404u) +
 	     (split ? 0x0101u : 0u));
 	emit(&e, CNA, 0x101c, (uint32_t)wbytes);
 	emit(&e, CNA, 0x1020, (uint32_t)(wbytes / n_pad));
@@ -1106,13 +1140,16 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * stream diff had left. Matched rather than reasoned about: the value is
 	 * the same both times, so the position is the only thing it can be
 	 * carrying. */
-	emit(&e, CNA, 0x1038,
-	     job->cbuf_window == 1 ? 0x0000010eu : 0x00000007u);
-	emit(&e, CNA, 0x103c,
-	     (surf << 16) | (job->cbuf_window == 1 ? 0x1c00u : 0u));
-	emit(&e, CNA, 0x1040,
-	     (job->cbuf_window == 1 ? 0x2c001c00u : 0x10000000u) +
-	     (split ? 0x04000000u : 0u));
+	{
+		unsigned S = w1_bank(), E = S + 7 > 14 ? 14 : S + 7;
+		unsigned D = job->cbuf_window == 1 ? S * 0x400u : 0u;
+
+		emit(&e, CNA, 0x1038,
+		     job->cbuf_window == 1 ? (0x100u | E) : 0x00000007u);
+		emit(&e, CNA, 0x103c, (surf << 16) | D);
+		emit(&e, CNA, 0x1040,
+		     (((D + 0x1000u) << 16) | D) + (split ? 0x04000000u : 0u));
+	}
 	emit(&e, CNA, 0x1044, (inw << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);
 	emit(&e, CNA, 0x104c, 0x00010001);
@@ -1262,8 +1299,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 
 		for (r2 = 0x2810; r2 <= 0x2820; r2 += 4)
 			emit(&e, U28, r2,
-			     w1 && r2 == 0x2818 ? 0x1c000000u :
-			     w1 && r2 == 0x2820 ? 0x00000038u : 0x00000000u);
+			     w1 && r2 == 0x2818 ? (w1_bank() * 0x400u) << 16 :
+			     w1 && r2 == 0x2820 ? w1_bank() * 8u : 0x00000000u);
 	}
 
 	{

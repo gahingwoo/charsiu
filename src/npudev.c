@@ -3386,6 +3386,26 @@ static unsigned parallel_min_m(void)
 	return (unsigned)v;
 }
 
+/*
+ * CHARSIU_NPU_SUBMIT_FIRST=1 submits device 1 before device 0 in a batched
+ * call. rocket puts a job on the least loaded core, so the device submitted
+ * first lands on core 0 and the second on core 1 whenever both are idle; the
+ * probe that found the wrong word always in DEVICE 1's slice cannot tell the
+ * fd from the physical core without this. With CHARSIU_CBUF_SWAP it separates
+ * fd, core and CBUF window in three runs.
+ */
+static int submit_first(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_SUBMIT_FIRST");
+
+		v = e ? atoi(e) == 1 : 0;
+	}
+	return v;
+}
+
 /* serialise the two cores for a call of m rows? */
 static int batch_serial_for(unsigned m)
 {
@@ -4220,7 +4240,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	if (!g->reuse_ask)
 		reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
 
-	for (unsigned d = 0; d < g->ndev; d++) {
+	for (unsigned dd = 0; dd < g->ndev; dd++) {
+		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
 		unsigned nt = 0, nh = 0, done_ki = 0, need = 0;
 		double tp = now_us();
 

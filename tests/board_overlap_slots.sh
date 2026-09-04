@@ -29,9 +29,12 @@
 #   CHARSIU_OVL_KMAX=2048    the shipped K slice; 1024 is worse, 4096 is clean
 #   CHARSIU_OVL_PASSES=4     parallel passes
 #   CHARSIU_OVL_MAXT=        cap staged tensors a pass (CHARSIU_PROBE_MAXT)
-#   CHARSIU_OVL_EXTRA=       more env for every arm, e.g. CHARSIU_CBUF_SWAP=1
-#                            (device 0 takes CBUF window 1 and device 1 window 0:
-#                            does the wrong word follow the window or the fd?)
+#   CHARSIU_OVL_EXTRA=       more env for every arm; the three that separate
+#                            fd, physical core and CBUF window:
+#         CHARSIU_CBUF_SWAP=1           device 0 takes window 1, device 1 window 0
+#         CHARSIU_NPU_SUBMIT_FIRST=1    device 1 is submitted first (lands on core 0)
+#         CHARSIU_CBUF_W1_BANK=8        window 1 starts at bank 8 (0x2000) not 7;
+#                                       6 overlaps window 0 and should fail worse
 #
 # `charsiu update dev` installs this at /opt/charsiu/board_overlap_slots.sh.
 #
