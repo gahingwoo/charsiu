@@ -4331,11 +4331,22 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				continue;
 			done_ki |= 1u << ki;
 			mm.m = m;
-			for (unsigned r = 0; r < m; r++)
-				memcpy(g->bscr + (size_t)r * sk,
-				       X + (size_t)r * e->t->k + s->k0,
-				       sk * sizeof(*g->bscr));
+			/*
+			 * ⚠ THE GATHER IS int8's, NOT THE PACKER'S. A K slice
+			 * is columns [k0, k0 + sk) of every row, and this used
+			 * to copy them into g->bscr for both formats so the
+			 * packer could read contiguous rows: fourteen bytes
+			 * moved per element packed. int4 now packs out of X
+			 * with a row stride and never touches bscr. int8 still
+			 * needs it, because it takes a per row maximum over
+			 * the slice and quantises into g->bq, which is a pass
+			 * over the slice either way.
+			 */
 			if (!g->w4) {
+				for (unsigned r = 0; r < m; r++)
+					memcpy(g->bscr + (size_t)r * sk,
+					       X + (size_t)r * e->t->k + s->k0,
+					       sk * sizeof(*g->bscr));
 				/*
 				 * int8's scale is per row and taken over THIS K
 				 * slice's own range, so it is kept per K slice
@@ -4387,9 +4398,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						   (uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						   g->bin_stride, s->job.input_zero_point);
 			} else {
-				charsiu_pack_input_f16(&mm, g->bscr,
-						       (uint8_t *)g->bin[d].map + ki * g->bin_stride,
-						       g->bin_stride);
+				charsiu_pack_input_f16_stride(&mm,
+						X + s->k0, e->t->k,
+						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						g->bin_stride);
 			}
 		}
 

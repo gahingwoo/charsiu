@@ -187,12 +187,17 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
+	./$(BUILD)/pack_stride
+	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+$(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the guard is its own unit for exactly this reason: the table is testable on a
