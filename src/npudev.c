@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
@@ -33,6 +34,7 @@
 #include <math.h>
 
 #include "reusekey.h"
+#include "overlap.h"
 #include "charsiu.h"
 #include "charsiu_llm.h"
 
@@ -387,6 +389,9 @@ struct charsiu_npu {
 	 * see the comment on struct npu_outbuf */
 	struct npu_outbuf *obuf;
 	unsigned n_obuf, obuf_cap;
+	/* the last batched call's buffer and tensor, for charsiu_npu_slot_word */
+	struct npu_outbuf *last_ob;
+	int last_id;
 	float *bscr;               /* m rows of one slice's K, gathered */
 	uint8_t *bq;               /* and quantised, for the int8 path */
 	/*
@@ -425,6 +430,7 @@ struct charsiu_npu {
 	 * itself whenever it is rebuilt, never assumed from the layout.
 	 */
 	int bmap4;
+	int bmap2;   /* rows 2h, 2h+1 at index, +4: the two-row premise */
 	/*
 	 * ⚠ WHAT THE BATCHED TIME IS MADE OF. It costs 135 ms at m = 2, which
 	 * is 9.14 GB/s and the DRAM roof, and 754 at m = 32, which is 1.64. The
@@ -433,6 +439,14 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	/*
+	 * ⚠ PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
+	 * 80: "pack" was 2.0 ms a row, 0.8 ms a call, and the fp16 packer moves
+	 * the 160 KB a call takes in about 7 us. Whatever the other 790 us are
+	 * -- the register streams emitted per slot, the two FINI ioctls a
+	 * device, the copies -- this splits them, so the next round can say.
+	 */
+	double bpack_emit_us, bpack_fini_us;
 	/*
 	 * ⚠⚠ THE DENOMINATOR, AND IT HAS TO LIVE HERE. The obvious one is
 	 * charsiu_npu_pool::hw_ms, but that is only incremented by
@@ -1368,7 +1382,16 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * cost more. CHARSIU_NPU_READ4=1 is the probe; tools/bench_gather is
 	 * the host number that was wrong about this board.
 	 */
-	g->read4 = getenv("CHARSIU_NPU_READ4") && atoi(getenv("CHARSIU_NPU_READ4")) != 0;
+	g->read4 = getenv("CHARSIU_NPU_READ4") ? atoi(getenv("CHARSIU_NPU_READ4")) : 0;
+	if (g->read4 == 1)
+		g->read4 = 4;
+	/*
+	 * =2 was the half step: two rows off one line, one read stream and TWO
+	 * write streams. The board priced it 2026-09-04, phase 9: read slower
+	 * on all eight models, +15% to +40% (Qwen3 1219 to 1558 ms, gemma4
+	 * 6747 to 8382). One write stream is what this core wants; the row
+	 * loop stays.
+	 */
 	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
@@ -1766,6 +1789,18 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		 * uniform to separate the three terms -- and saying so is the
 		 * difference between a mystery and a shorter prompt.
 		 */
+		/*
+		 * ⚠ OUTSIDE THE COST MODEL'S BRANCH. This sat inside
+		 * `if (!solve3(...))`, so the line that says whether the two
+		 * cores ran together vanished on any run short or uniform
+		 * enough that the three-term fit went singular -- which is
+		 * every quick check somebody would make while asking exactly
+		 * that question. The board printed it for a real prompt and
+		 * printed nothing for `-p hi -n 4`.
+		 */
+		if (g->ndev > 1 && g->bwall_us > 0.0)
+			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
+				charsiu_npu_overlap_note());
 		if (solve3(m, v, x))
 			fprintf(stderr, "charsiu NPU: the cost model did not fit "
 				"(the calls do not separate 'a task' from 'a "
@@ -2051,7 +2086,18 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	s->di = di;
 	/* the two cores share the CBUF, so the two devices take different
 	 * windows -- see charsiu_job.cbuf_window */
-	s->job.cbuf_window = di;
+	/*
+	 * ⚠ CHARSIU_CBUF_SWAP=1 GIVES DEVICE 0 WINDOW 1 AND DEVICE 1 WINDOW 0.
+	 * The overlap fault's wrong word (row 16, channel 3, both cores in
+	 * flight, 2026-09-04) sat in DEVICE 1's K slice in 48 of 48 element
+	 * reads and never in device 0's. Device 1 is two things at once: the
+	 * second fd, whose job rocket puts on whichever core is free, and
+	 * CBUF window 1 (data at 0x1c00, weights at 0x2c00, the vendor's
+	 * values off one capture). Swapping the windows keeps the fd and moves
+	 * the window: if the wrong word moves to device 0, it is the window's;
+	 * if it stays on device 1, it is the core's or the ordering's.
+	 */
+	s->job.cbuf_window = getenv("CHARSIU_CBUF_SWAP") ? di ^ 1u : di;
 	s->job.mm.m = 1;
 	s->job.mm.k = k;
 	s->job.mm.n = n;
@@ -3235,6 +3281,15 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
  * Wall clock across every charsiu_npu_matmul call. This is the denominator the
  * five shares are read against; see bwall_us for why the pool's hw_ms is not.
  */
+void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
+				  double *fini, int reset)
+{
+	*emit = g->bpack_emit_us / 1e3;
+	*fini = g->bpack_fini_us / 1e3;
+	if (reset)
+		g->bpack_emit_us = g->bpack_fini_us = 0.0;
+}
+
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset)
 {
 	double v = g->bwall_us / 1e3;
@@ -3267,8 +3322,9 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 }
 
 /*
- * ⚠⚠ ON BY DEFAULT SINCE 2026-08-30, BECAUSE THE PARALLEL DEFAULT WAS WRONG
- * 13 RUNS IN 16.
+ * ⚠ HISTORY: serialised by default from 2026-08-30 to 2026-09-04, because the
+ * overlapped default was wrong 13 runs in 16 -- and the reason turned out to
+ * be the board's NPU voltage, see overlap_safe() below, which now decides.
  *
  * phi3 at width 24, sixteen repeats an arm, on a freshly booted board with no
  * NPU timeout anywhere in the round:
@@ -3286,6 +3342,7 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
  * and to reproduce the fault, NOT as a configuration to run: it is the arm
  * that returns wrong text.
  */
+
 static int batch_serial(void)
 {
 	static int z = -1;
@@ -3293,9 +3350,102 @@ static int batch_serial(void)
 	if (z < 0) {
 		const char *e = getenv("CHARSIU_NPU_BATCH_PARALLEL");
 
-		z = !(e && *e != '0');
+		if (e && *e)
+			z = *e == '0';
+		else
+			z = !overlap_safe(overlap_why, sizeof(overlap_why));
 	}
 	return z;
+}
+
+/* what batch_serial decided and why, for the report */
+const char *charsiu_npu_overlap_note(void)
+{
+	static char note[160];
+	const char *e = getenv("CHARSIU_NPU_BATCH_PARALLEL");
+
+	if (e && *e)
+		snprintf(note, sizeof(note), "the two cores %s by CHARSIU_NPU_BATCH_PARALLEL=%s",
+			 batch_serial() ? "serialised" : "overlapped", e);
+	else
+		snprintf(note, sizeof(note), "the two cores %s: %s", batch_serial() ?
+			 "serialised" : "overlapped", overlap_why);
+	return note;
+}
+
+/*
+ * ⚠ THE FAULT HAS A WIDTH, and the map so far (phi3, 16 runs a cell,
+ * attach-once kernel, 2026-09-03/04, CHARSIU_NPU_BATCH_PARALLEL=1):
+ *
+ *   full chunks of 24            3 to 15 of 16 WRONG (13 of 16 at KMAX 1024)
+ *   full chunks of 22            1 of 16
+ *   a TAIL of 24 (62 + 24)       1 of 16
+ *   full chunks of 12, 14, 16, 18, 20, 26                    0 of 16 each
+ *   full chunks of 28, 32, 42, 48, 56, 58, 62, 64, 72, 74, 80   0 of 16 each
+ *   tails of 2, 4, 6, 12, 14, 16, 22, 28, 30                0 of 16 each
+ *   m = 8 and m = 10, the dense sweep of 08-30              wrong
+ *   24 at KMAX 4096 (one K slice for K = 3072)              0 of 16
+ *
+ * so the kernel was never the fix (the map is on the attach-once kernel),
+ * "m mod 16 in {8, 10}" was a guess the 42/56/58/72/74 row killed, "small
+ * full chunks" was the next guess and 12..20 and 26 killed that. There is
+ * no width law: bad {8, 10, 22, 24}, clean either side of them, and the
+ * fault gets WORSE with more K slices (KMAX 1024) and goes away with fewer
+ * (KMAX 4096), which is the one lead the map left. CHARSIU_NPU_PARALLEL_MIN_M=N
+ * overlaps the two cores for a call of m >= N rows and serialises below
+ * it; 0, the default, never overlaps.
+ *
+ * ⚠ 28 IS PRICED AND NOT SHIPPED. With N = 28 phase 2 was 9 of 9 identical
+ * and phase 7 read TTFT 833/1218/3948/2905 ms against the serial default's
+ * 1037/1565/5073/3604 (Qwen3/TinyLLAMA/Phi3/Gemma4): a fifth off the prompt.
+ * What holds it back is the evidence, not the number: every width of 28 or
+ * more is clean at 16 runs, on ONE model, and 16 clean runs bound a fault
+ * rate at about one in six -- width 22 fails one in sixteen. A default that
+ * returns wrong text one prompt in fifty is not a default. The element
+ * probe (board_overlap_slots.sh) is what turns this into a mechanism, and a
+ * mechanism is what makes 28 (or any N) safe rather than unobserved.
+ * Speculative passes at m = 4 or 6 stay serial under any N above 6.
+ */
+static unsigned parallel_min_m(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_PARALLEL_MIN_M");
+
+		v = e ? atoi(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/*
+ * CHARSIU_NPU_SUBMIT_FIRST=1 submits device 1 before device 0 in a batched
+ * call. rocket puts a job on the least loaded core, so the device submitted
+ * first lands on core 0 and the second on core 1 whenever both are idle; the
+ * probe that found the wrong word always in DEVICE 1's slice cannot tell the
+ * fd from the physical core without this. With CHARSIU_CBUF_SWAP it separates
+ * fd, core and CBUF window in three runs.
+ */
+static int submit_first(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_SUBMIT_FIRST");
+
+		v = e ? atoi(e) == 1 : 0;
+	}
+	return v;
+}
+
+/* serialise the two cores for a call of m rows? */
+static int batch_serial_for(unsigned m)
+{
+	if (!batch_serial())
+		return 0;               /* CHARSIU_NPU_BATCH_PARALLEL=1: never */
+	return !(parallel_min_m() && m >= parallel_min_m());
 }
 
 static int batch_zero(void)
@@ -3486,6 +3636,60 @@ struct read_rows {
 };
 
 /*
+ * TWO ROWS OFF ONE LINE: rows 2h and 2h+1 of a channel quad sit at index and
+ * index+4, 32 bytes of the same line. One read stream, two write streams.
+ * The four-row form below lost 2.3x on the board to its four write streams;
+ * whether two is on the right side of the A72's store buffer is a board
+ * question, and CHARSIU_NPU_READ4=2 asks it. Same arithmetic per element.
+ */
+static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
+{
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	const float *fo = c->fo;
+	float *Y = c->Y;
+	unsigned sn = c->sn, n4 = sn / 4, j;
+	int firstw = c->firstw;
+	const float *sc = g->w4 && c->grp ? s->sc : NULL;
+
+	if (g->read4 != 2 || !g->w4 || !g->bmap2 || r0 % 2 || nr % 2)
+		return 0;
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 2) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *y0 = Y + (size_t)r * e->t->n + s->n0;
+		float *y1 = y0 + e->t->n;
+
+#define ROW2(OP, S0, S1, S2, S3)                                             \
+		for (j = 0; j < n4; j++) {                                   \
+			const float *fp = fo + mp[j];                        \
+			unsigned q = j * 4;                                  \
+			y0[q + 0] OP fp[0] * S0; y0[q + 1] OP fp[1] * S1;    \
+			y0[q + 2] OP fp[2] * S2; y0[q + 3] OP fp[3] * S3;    \
+			y1[q + 0] OP fp[4] * S0; y1[q + 1] OP fp[5] * S1;    \
+			y1[q + 2] OP fp[6] * S2; y1[q + 3] OP fp[7] * S3;    \
+		}
+		if (sc) {
+			if (firstw) { ROW2(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			else        { ROW2(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+		} else {
+			if (firstw) { ROW2(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			else        { ROW2(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
+		}
+#undef ROW2
+		for (j = n4 * 4; j < sn; j++) {
+			unsigned base = mp[j / 4] + j % 4;
+			float s0 = sc ? sc[j] : 1.0f;
+			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0;
+
+			if (firstw) { y0[j] = v0; y1[j] = v1; }
+			else        { y0[j] += v0; y1[j] += v1; }
+		}
+	}
+	return 1;
+}
+
+/*
  * ⚠ FOUR ROWS OFF ONE LINE, and why the last attempt at this loop was wrong
  * about where the time went.
  *
@@ -3523,7 +3727,7 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	int firstw = c->firstw;
 	const float *sc = g->w4 && c->grp ? s->sc : NULL;
 
-	if (!g->read4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
+	if (g->read4 != 4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
 		return 0;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -3572,7 +3776,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 	const struct npu_entry *e = c->e;
 	const struct npu_slot *s = c->s;
 
-	if (read_rows4(c, r0, nr))
+	if (read_rows2(c, r0, nr) || read_rows4(c, r0, nr))
 		return;
 	const float *fo = c->fo;
 	const int32_t *io = c->io;
@@ -3986,6 +4190,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		ob = batch_outbuf(g, wide, most, m);
 		if (!ob)
 			return -1;
+		g->last_ob = ob;
+		g->last_id = id;
 	}
 
 	/*
@@ -4068,7 +4274,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	if (!g->reuse_ask)
 		reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
 
-	for (unsigned d = 0; d < g->ndev; d++) {
+	for (unsigned dd = 0; dd < g->ndev; dd++) {
+		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
 		unsigned nt = 0, nh = 0, done_ki = 0, need = 0;
 		double tp = now_us();
 
@@ -4186,6 +4393,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			}
 		}
 
+		double tpe = now_us();
+
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			unsigned ki = i / e->n_slices;
@@ -4217,9 +4426,12 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			nt++;
 			g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
 		}
+		g->bpack_emit_us += now_us() - tpe;
+		tpe = now_us();
 		if (!reuse)
 			charsiu_bo_fini(g->dev[d], &g->bin[d]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_fini_us += now_us() - tpe;
 		g->bpack_us += now_us() - tp;
 		/*
 		 * THIS device's BO now holds X -- but only if a slice was
@@ -4274,7 +4486,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * card, in the same minute. CHARSIU_NPU_BATCH_PARALLEL=1 puts
 		 * the overlap back, and returns wrong text when it does.
 		 */
-		if (batch_serial() && g->ndev > 1) {
+		if (batch_serial_for(m) && g->ndev > 1) {
 			double tf = now_us();
 
 			charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
@@ -4333,6 +4545,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						  (uint32_t)charsiu_acc_index(r, j * 4, m,
 							g->w4 && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
+				/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
+				g->bmap2 = m % 2 == 0;
+				for (unsigned r = 0; g->bmap2 && r < m; r += 2)
+					for (unsigned j = 0; g->bmap2 && j < n4; j++)
+						if (g->bmap[(size_t)(r + 1) * n4 + j] !=
+						    g->bmap[(size_t)r * n4 + j] + 4) {
+							g->bmap2 = 0;
+							break;
+						}
 				/* read_rows4's premise, read off the table just built */
 				g->bmap4 = m % 4 == 0;
 				for (unsigned r = 0; g->bmap4 && r < m; r += 4)
@@ -4486,6 +4707,97 @@ int charsiu_npu_reuse_on(void)
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g)
 {
 	return g ? g->kmax : 4096;
+}
+
+/*
+ * Slot i of tensor id, as the deal left it: the device it ran on, its K slice
+ * index, and the output channels [n0, n1) it wrote. Slots are n fastest, so
+ * the first n_slices of them are K slice 0. -1 past the last slot.
+ *
+ * ⚠ THIS IS WHAT TURNS A WRONG ROW INTO A CORE. The overlap fault (both
+ * cores in flight, width 24, phi3) was mapped for four days by TEXT -- right
+ * or wrong, 16 runs a width -- which can say a width is bad and nothing about
+ * where. A miss in the batch probe knows its channels; with this it knows
+ * which slot covered them and which core that slot was dealt to.
+ */
+int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
+			  unsigned *di, unsigned *ki, unsigned *n0, unsigned *n1)
+{
+	const struct npu_entry *e;
+	const struct npu_slot *s;
+
+	if (!g || id < 0 || (unsigned)id >= g->n_ent)
+		return -1;
+	e = &g->ent[id];
+	if (i >= e->count)
+		return -1;
+	s = &g->slot[e->first + i];
+	*di = s->di;
+	*ki = i / e->n_slices;
+	*n0 = s->n0;
+	*n1 = s->n0 + s->job.mm.n;
+	return 0;
+}
+
+/*
+ * The word slot i of tensor id wrote for (r, c) in the LAST batched call, and
+ * what the gather added for it: raw is the bit pattern (a float on the int4
+ * path, an int32 on int8), contrib is that word scaled the way read_rows
+ * scales it, and final is the per channel scale applied after the sum (1.0
+ * when the group scale already did it). Sum contrib over the slots covering
+ * c, times final, and that is Y[r][c] as the gather computed it.
+ *
+ * ⚠ fresh = 1 INVALIDATES THE CPU'S CACHE OF THE BUFFER FIRST -- a PREP on a
+ * job that has already finished is just the dma_sync -- so a word that changes
+ * between a stale read and a fresh one was a line the CPU held, not a number
+ * the hardware wrote. That is the one question the overlap fault has left:
+ * (row 16, channel 3) is wrong one time in fifty at width 24 with both cores
+ * in flight, and text, rows and even the slot cannot say which side of the
+ * bus the wrong word came from. -1 when the last call was not this tensor,
+ * or (r, c) is not in slot i.
+ */
+int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
+			  unsigned c, int fresh, uint32_t *raw, float *contrib,
+			  float *final)
+{
+	const struct npu_entry *e;
+	const struct npu_slot *s;
+	const uint8_t *base;
+	unsigned nt = 0, d, cc, idx, ki;
+
+	if (!g || id < 0 || (unsigned)id >= g->n_ent || !g->last_ob ||
+	    g->last_id != id || !g->bmap)
+		return -1;
+	e = &g->ent[id];
+	if (i >= e->count || r >= g->bmap_m)
+		return -1;
+	s = &g->slot[e->first + i];
+	if (c < s->n0 || c >= s->n0 + s->job.mm.n)
+		return -1;
+	d = s->di;
+	ki = i / e->n_slices;
+	/* the region index is this slot's rank among the device's slots */
+	for (unsigned j = 0; j < i; j++)
+		if (g->slot[e->first + j].di == d)
+			nt++;
+	if (fresh)
+		charsiu_bo_prep(g->dev[d], &g->last_ob->bo[d], 2000000000);
+	base = (const uint8_t *)g->last_ob->bo[d].map + (size_t)nt * g->bout_stride;
+	cc = c - s->n0;
+	idx = g->bmap[(size_t)r * g->bmap_n4 + cc / 4] + cc % 4;
+	*raw = ((const uint32_t *)base)[idx];
+	if (g->w4) {
+		float v = ((const float *)base)[idx];
+		int grp = tensor_grouped(g, e->t);
+
+		*contrib = grp ? v * s->sc[cc] : v;
+		*final = grp ? 1.0f : e->t->scale[c];
+	} else {
+		*contrib = (float)((const int32_t *)base)[idx]
+			 * g->bd1[(size_t)ki * g->bmap_m + r];
+		*final = e->t->scale[c];
+	}
+	return 0;
 }
 
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,

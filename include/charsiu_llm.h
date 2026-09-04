@@ -326,7 +326,23 @@ void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses);
 /* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
+/* whether batched calls overlap the two cores, and why (the rail and clock against the vendor's OPP) */
+const char *charsiu_npu_overlap_note(void);
+/* the same decision from the rail and clock readings alone, for tests: 1 = may overlap.
+ * CHARSIU_NPU_RAIL_UV / CHARSIU_NPU_CLK_HZ replace the readings. */
+int charsiu_npu_overlap_ok(char *why, size_t n);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
+/* slot i of tensor id after a call: its device, K slice, and channels [n0, n1);
+ * -1 past the last slot. The batch probe names the core behind a wrong row with it. */
+int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
+			  unsigned *di, unsigned *ki, unsigned *n0, unsigned *n1);
+/* the word slot i wrote for (r, c) in the last batched call: raw bits, what the
+ * gather added for it, and the per channel scale applied after the sum. fresh = 1
+ * invalidates the CPU's cache of the buffer first. -1 when (r, c) is not in slot i
+ * or the last call was another tensor. */
+int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
+			  unsigned c, int fresh, uint32_t *raw, float *contrib,
+			  float *final);
 
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
@@ -334,6 +350,10 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 /* the fifth segment: buffers and the output zero, before any packing */
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);
+/* the parts of "pack" that are not packing: the register streams emitted a
+ * slot, and the FINI ioctls a device */
+void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
+				  double *fini, int reset);
 /* how much of prep is the output buffer allocation, and how often */
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
 /* several independent projections of the same activation, one submit, one fence */

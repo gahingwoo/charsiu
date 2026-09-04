@@ -23,6 +23,26 @@ back to the CPU between layers. The numbers are read off `board_verify.sh 7`, th
 same prompt and protocol the vendor publishes, and the rest of this file says how
 they are known to be right.
 
+**The NPU rail.** Those prompt times run the two NPU cores one at a time. Run
+together they corrupt one word in a few thousand rows -- and the reason is not the
+runtime: mainline clocks the NPU at 786 MHz with the rail at whatever U-Boot left,
+750 mV, and the vendor's own table asks 800 mV of 800 MHz. Give the rail 800 mV,
+one line of device tree, and the two cores overlap on every batched call:
+
+```
+                     decode tok/s            time to first token, ms
+                     charsiu   vendor        charsiu   vendor
+  Qwen3 0.6B          24.51    24.85           866      469
+  TinyLLAMA 1.1B      20.36    19.71          1184      544
+  Phi3 3.8B            6.76     6.58          3877     1829
+  Gemma4 E2B           8.65     9.23          2925     1219
+```
+
+with the text identical on all nine models. charsiu reads the rail and the clock
+from sysfs, overlaps only inside the vendor's envelope, and says which it chose and
+why in its NPU report; a board that leaves the rail alone keeps the safe numbers
+above the table. `tests/overlap_guard.c` walks that decision on a desk.
+
 It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files.
 
 **And it sees.** A vision tower read out of llama.cpp's `mmproj` gguf, on the same

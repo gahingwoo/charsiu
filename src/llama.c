@@ -19,6 +19,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -1205,6 +1206,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		unsigned seen = 0;		/* staged tensors reached, capped */
 		unsigned nbad = 0;		/* misses named, capped */
 		int whered = 0;			/* the where-did-it-go scan, once a width */
+		unsigned ndeep = 0;		/* slot-word dives, capped a width */
 		double t_one = 0.0, t_bat = 0.0, worst = 0.0, mb = 0.0;
 
 		if (mr > mmax)
@@ -1326,6 +1328,134 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       t->name, (unsigned)t->k,
 					       (unsigned)t->n, r, mr, rworst);
 					nbad++;
+					/*
+					 * ⚠⚠ WHICH CHANNELS, AND WHOSE SLOT.
+					 *
+					 * A wrong row is a sum over K slices of
+					 * the n slices that cover it, and the deal
+					 * puts those slots on either core. The
+					 * overlap fault was mapped by text for
+					 * four days -- bad at 8, 10, 22, 24, clean
+					 * at 12..20, 26 and 28..80 -- and text
+					 * cannot say which core wrote the wrong
+					 * numbers. The span says which n slice;
+					 * the deal says which core it ran on and
+					 * where its K slices ran. One n slice on
+					 * one core is a different fault from a
+					 * whole row across both.
+					 */
+					{
+						unsigned c, w0 = 0, w1 = 0, nw = 0;
+						unsigned i2, di, ki, n0, n1;
+
+						for (c = 0; c < (unsigned)t->n; c++) {
+							size_t o = (size_t)r * t->n + c;
+							double d = fabs((double)Y[o] - (double)Yref[o]);
+							double sc = fabs((double)Yref[o]);
+
+							if ((sc > 1e-3 ? d / sc : d) > 1e-3) {
+								if (!nw)
+									w0 = c;
+								w1 = c;
+								nw++;
+							}
+						}
+						printf("           wrong channels %u..%u,"
+						       " %u of %u\n", w0, w1, nw,
+						       (unsigned)t->n);
+						for (i2 = 0; !charsiu_npu_slot_deal(s->pool.dev,
+							s->pool.id[i], i2, &di, &ki, &n0, &n1); i2++) {
+							unsigned inw = 0, i3, d3, k3, a3, b3;
+
+							if (ki)
+								break;	/* n fastest: K slice 0 came first */
+							for (c = n0; c < n1 && c < (unsigned)t->n; c++) {
+								size_t o = (size_t)r * t->n + c;
+								double d = fabs((double)Y[o] - (double)Yref[o]);
+								double sc = fabs((double)Yref[o]);
+
+								if ((sc > 1e-3 ? d / sc : d) > 1e-3)
+									inw++;
+							}
+							if (!inw)
+								continue;
+							printf("           n slice %u [%u,%u) on core %u:"
+							       " %u wrong; its K slices on cores",
+							       i2, n0, n1, di, inw);
+							for (i3 = 0; !charsiu_npu_slot_deal(s->pool.dev,
+								s->pool.id[i], i3, &d3, &k3, &a3, &b3); i3++)
+								if (a3 == n0)
+									printf(" %u", d3);
+							printf("\n");
+						}
+						/*
+						 * ⚠⚠ WHICH SIDE OF THE BUS. For the
+						 * first wrong channels: every slot's
+						 * word for (r, c) as the gather saw
+						 * it, then the same word after the
+						 * CPU's cache of the buffer is
+						 * invalidated. The fresh sum coming
+						 * back RIGHT says the CPU read a
+						 * stale line (a fence or a cache
+						 * story, fixable here); the fresh
+						 * sum being the SAME wrong number
+						 * says the hardware wrote it (a
+						 * shared-silicon story, not fixable
+						 * here). Twelve a width: each fresh
+						 * read is an ioctl.
+						 */
+						for (c = 0, nw = 0; c < (unsigned)t->n && nw < 4 && ndeep < 12; c++) {
+							size_t o = (size_t)r * t->n + c;
+							double d = fabs((double)Y[o] - (double)Yref[o]);
+							double sc = fabs((double)Yref[o]);
+							double want = Yref[o], got = Y[o];
+							double stale = 0.0, freshs = 0.0, fs = 1.0;
+							uint32_t raw;
+							float cb, fl;
+							int nsl = 0;
+
+							if ((sc > 1e-3 ? d / sc : d) <= 1e-3)
+								continue;
+							nw++;
+							ndeep++;
+							printf("           (%u,%u) want %.4e got %.4e |", r, c, want, got);
+							for (i2 = 0; charsiu_npu_slot_deal(s->pool.dev,
+								s->pool.id[i], i2, &di, &ki, &n0, &n1) == 0; i2++) {
+								if (charsiu_npu_slot_word(s->pool.dev, s->pool.id[i],
+									i2, r, c, 0, &raw, &cb, &fl))
+									continue;
+								printf(" k%u/core%u %.4e [%08x]", ki, di, (double)cb, raw);
+								stale += cb;
+								fs = fl;
+								nsl++;
+							}
+							printf(" | fresh");
+							for (i2 = 0; charsiu_npu_slot_deal(s->pool.dev,
+								s->pool.id[i], i2, &di, &ki, &n0, &n1) == 0; i2++) {
+								if (charsiu_npu_slot_word(s->pool.dev, s->pool.id[i],
+									i2, r, c, 1, &raw, &cb, &fl))
+									continue;
+								printf(" k%u %.4e [%08x]", ki, (double)cb, raw);
+								freshs += cb;
+							}
+							if (!nsl) {
+								printf(" | no slot word (another tensor was called since)\n");
+								continue;
+							}
+							freshs *= fs;
+							stale *= fs;
+							{
+								double lim = fabs(want) > 1e-3 ? fabs(want) * 1e-3 : 1e-3;
+								double limg = fabs(got) > 1e-3 ? fabs(got) * 1e-3 : 1e-3;
+
+								printf(" -> %.4e (stale sum %.4e): %s\n", freshs, stale,
+								       fabs(freshs - want) <= lim ? "STALE READ, the fresh word is right"
+								       : fabs(freshs - got) <= limg ? "HARDWARE WROTE IT, the fresh word is the same wrong one"
+								       : "NEITHER, the fresh word is a third value");
+							}
+						}
+						fflush(stdout);
+					}
 				}
 				/*
 				 * ⚠⚠ ABSENT OR MISPLACED, ASKED OF THE ROW
@@ -3232,7 +3362,7 @@ static unsigned stage_tok;
  * other thousand went. Kept apart from the token loop's numbers because a
  * row of a batch and a decoded token do not cost the same thing.
  */
-static double bstage_ms[ST_N];
+static double bstage_ms[ST_N], bstage_staged_ms;
 static unsigned bstage_rows, bstage_chunks;
 /* the serial block arm's attention, in three parts: scores, softmax, values */
 static double battn_ms[3];
@@ -3268,8 +3398,8 @@ void llama_stages_report(void)
 		for (i = 0; i < ST_N; i++)
 			bt += bstage_ms[i];
 		printf("charsiu batched stages: %u rows in %u chunks, %.2f ms a row"
-		       " (%.0f ms)\n", bstage_rows, bstage_chunks,
-		       bt / bstage_rows, bt);
+		       " (%.0f ms; %.0f ms of staging excluded)\n", bstage_rows,
+		       bstage_chunks, bt / bstage_rows, bt, bstage_staged_ms);
 		for (i = 0; i < ST_N; i++)
 			if (bstage_ms[i] > 0.0)
 				printf("  %-16s %8.2f ms a row     %5.1f%%\n",
@@ -3279,7 +3409,7 @@ void llama_stages_report(void)
 		       " \"rope + kv copy\" only the rope)\n");
 		if (bmm_calls)
 			printf("  %-16s %lu calls: %.2f ms a row inside the NPU entry, "
-			       "%.2f in its wrapper, %.2f on the CPU (%lu rows fell back)\n",
+			       "%.2f in its wrapper (staging included), %.2f on the CPU (%lu rows fell back)\n",
 			       "matmul rows:", bmm_calls, bmm_entry_ms / bstage_rows,
 			       bmm_wrap_ms / bstage_rows, bmm_fell_ms / bstage_rows,
 			       bmm_fell_rows);
@@ -3903,8 +4033,8 @@ static int prefill_grouped(void)
 static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
 {
-	int id = npu_id_for(s, w);
 	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+	int id = npu_id_for(s, w);   /* stages the tensor on first use */
 
 	bmm_calls++;
 	if (id >= 0) {
@@ -3998,6 +4128,8 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 	if (!reuse_site(site))
 		return matmul_rows(s, w, X, n, Y, k, nout);
 	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+	/* id was taken above, before t0: the staging on first use is not in this
+	 * wrapper's column, and the stage clock subtracts it on its own */
 
 	bmm_calls++;
 	if (id >= 0) {
@@ -4394,9 +4526,21 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	 */
 	if (stage_on < 0)
 		stage_on = getenv("CHARSIU_STAGES") != NULL;
+	/*
+	 * ⚠⚠ STAGING IS NOT A STAGE. The first chunk's projections upload every
+	 * tensor to the hardware on first use, inside npu_id_for, and the first
+	 * cut of this clock charged that to whichever projection touched the
+	 * tensor: on the board Qwen3's four matmul rows summed to 12.5 ms a row
+	 * against 6.25 inside the NPU entry, the table summed to 18.8 s on a
+	 * 13.5 s prompt, and a "6.4 ms a row with no name" got a memory entry
+	 * of its own. The runner's prompt time subtracts the staging clock;
+	 * this does the same, per mark, so the rows sum to the prompt.
+	 */
 	double bt0 = stage_on > 0 ? now_ms() : 0.0, bt1;
-#define BSTAGE(i) do { if (stage_on > 0) { bt1 = now_ms();               \
-			bstage_ms[i] += bt1 - bt0; bt0 = bt1; } } while (0)
+	double bs0 = stage_on > 0 ? llama_stage_ms() : 0.0, bs1;
+#define BSTAGE(i) do { if (stage_on > 0) { bt1 = now_ms(); bs1 = llama_stage_ms(); \
+			bstage_ms[i] += (bt1 - bt0) - (bs1 - bs0);            \
+			bstage_staged_ms += bs1 - bs0; bt0 = bt1; bs0 = bs1; } } while (0)
 	if (stage_on > 0) {
 		bstage_rows += (unsigned)n;
 		bstage_chunks++;
