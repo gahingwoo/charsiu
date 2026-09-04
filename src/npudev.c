@@ -3448,6 +3448,20 @@ static int batch_serial_for(unsigned m)
 	return !(parallel_min_m() && m >= parallel_min_m());
 }
 
+/* CHARSIU_NPU_PACK_GATHER=1: gather every K slice into scratch before packing,
+ * which is what this did before the stride, and the control for measuring it */
+static int pack_gather(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_PACK_GATHER");
+
+		v = e && *e != '0';
+	}
+	return v;
+}
+
 static int batch_zero(void)
 {
 	static int z = -1;
@@ -4361,7 +4375,18 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * over the slice and quantises into g->bq, which is a
 			 * pass over the slice either way.
 			 */
-			if (!g->w4 || sk != e->t->k)
+			/*
+			 * ⚠ THE ARM, BECAUSE THE FIRST TWO ROUNDS OF THIS WERE
+			 * NOISE. Three board runs of phase 9 disagreed by more
+			 * than the change: Phi-3.5 packed 4384, 6583 and 3158
+			 * ms on paths that should have been the same twice,
+			 * and Qwen2.5 2628, 2215 and 3497. Phase 9 runs under
+			 * the ondemand governor and packing is CPU work, so a
+			 * build against a build measures the governor.
+			 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
+			 * binary can run both arms in one session.
+			 */
+			if (!g->w4 || sk != e->t->k || pack_gather())
 				for (unsigned r = 0; r < m; r++)
 					memcpy(g->bscr + (size_t)r * sk,
 					       X + (size_t)r * e->t->k + s->k0,
@@ -4417,7 +4442,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				charsiu_pack_input(&mm, g->bq,
 						   (uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						   g->bin_stride, s->job.input_zero_point);
-			} else if (sk == e->t->k) {
+			} else if (sk == e->t->k && !pack_gather()) {
 				/* the slice is the whole row, so k0 is 0 */
 				charsiu_pack_input_f16_stride(&mm, X, e->t->k,
 						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
