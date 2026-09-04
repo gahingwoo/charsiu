@@ -766,7 +766,9 @@ struct charsiu_npu {
 	 * every one of them, 5% to 18% of the whole prefill, with the read
 	 * itself exactly DOUBLING. See the note above read_rows.
 	 */
-	int poolread;
+	int poolread;              /* 0 never, 1 always, 2 when m * n >= poolread_min */
+	unsigned poolread_min;
+	unsigned long bread_pooled, bread_serial;   /* slots read each way */
 	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
@@ -1366,7 +1368,27 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
-	g->poolread = getenv("CHARSIU_NPU_POOL_READ") != NULL;
+	/*
+	 * 🏁 2026-09-05: THE POOLED READ IS ON, ABOVE A SIZE. The note below
+	 * priced it when the read was 241 ms and the barrier 190 of that; at
+	 * today's shapes the read is the largest share of a batched matmul
+	 * (27 to 51%) and the work a dispatch is tens of times the barrier.
+	 * Phase 9 with both arms, governor pinned, 916 tokens, text identical
+	 * on all nine models: Phi-3.5 35618 -> 33620 ms, SmolLM2-1.7B 19066 ->
+	 * 17370, gemma-3 14951 -> 13487, gemma-4 31360 -> 28919, tinyllama
+	 * 13045 -> 12212, SmolLM2-135M 5894 -> 5391 -- and Qwen2.5 16441 ->
+	 * 17219, Qwen3 12145 -> 13216. The two that lost have the narrowest
+	 * tensors, which is the old note still being right for small work.
+	 * So: pool a slot's rows when m * n reaches CHARSIU_NPU_POOL_READ_MIN
+	 * elements (default 262144, one megabyte of floats), never below.
+	 * CHARSIU_NPU_POOL_READ=1 pools always, =0 never; both are arms.
+	 */
+	{
+		const char *e = getenv("CHARSIU_NPU_POOL_READ");
+
+		g->poolread = !e || !*e ? 2 : *e == '0' ? 0 : 1;   /* 2 = by size */
+		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 262144);
+	}
 	/*
 	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
@@ -1801,6 +1823,13 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		if (g->ndev > 1 && g->bwall_us > 0.0)
 			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
 				charsiu_npu_overlap_note());
+		if (g->bread_pooled + g->bread_serial)
+			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
+				" and %lu one thread (%s)\n",
+				g->bread_pooled, g->bread_serial,
+				g->poolread == 1 ? "CHARSIU_NPU_POOL_READ=1, always" :
+				g->poolread == 0 ? "CHARSIU_NPU_POOL_READ=0, never" :
+				"pooled from CHARSIU_NPU_POOL_READ_MIN elements of output");
 		if (solve3(m, v, x))
 			fprintf(stderr, "charsiu NPU: the cost model did not fit "
 				"(the calls do not separate 'a task' from 'a "
@@ -4675,10 +4704,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						grp, !g->bseen[ni]
 					};
 
-					if (g->poolread)
+					if (g->poolread == 1 ||
+					    (g->poolread == 2 &&
+					     (size_t)m * sn >= g->poolread_min)) {
 						charsiu_parallel_for(read_rows, &rr, m);
-					else
+						g->bread_pooled++;
+					} else {
 						read_rows(&rr, 0, m);
+						g->bread_serial++;
+					}
 				}
 				/* ⚠ AFTER the row loop: every row of this slot
 				 * shares the flag, and setting it inside would

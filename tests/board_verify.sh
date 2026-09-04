@@ -516,6 +516,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	for arm in $ARMS9; do
 		case $arm in
 		pool)   E=CHARSIU_NPU_POOL_READ=1 ;;
+		serial) E=CHARSIU_NPU_POOL_READ=0 ;;   # explicit: unset is the size gate now
 		*)      E=CHARSIU_READ_DUMMY=1 ;;
 		esac
 		# shellcheck disable=SC2086
