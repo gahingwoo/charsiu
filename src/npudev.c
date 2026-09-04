@@ -1806,6 +1806,9 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				x[0], x[1], x[2], g->busy_us / 1e3, fix, tsk,
 				byt, byt > 0.0 ? g->weight_mb / byt : 0.0,
 				g->ndev, g->ndev == 1 ? "" : "s");
+			if (g->ndev > 1 && g->bwall_us > 0.0)
+				fprintf(stderr, "charsiu NPU: batched calls, %s\n",
+					charsiu_npu_overlap_note());
 			/*
 			 * ⚠ THE RESIDUAL, NOT THE SUM. fix + tsk + byt is the
 			 * hardware path to the last decimal by construction --
@@ -3308,8 +3311,9 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 }
 
 /*
- * ⚠⚠ ON BY DEFAULT SINCE 2026-08-30, BECAUSE THE PARALLEL DEFAULT WAS WRONG
- * 13 RUNS IN 16.
+ * ⚠ HISTORY: serialised by default from 2026-08-30 to 2026-09-04, because the
+ * overlapped default was wrong 13 runs in 16 -- and the reason turned out to
+ * be the board's NPU voltage, see overlap_safe() below, which now decides.
  *
  * phi3 at width 24, sixteen repeats an arm, on a freshly booted board with no
  * NPU timeout anywhere in the round:
@@ -3327,6 +3331,101 @@ double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
  * and to reproduce the fault, NOT as a configuration to run: it is the arm
  * that returns wrong text.
  */
+/*
+ * 🏁 2026-09-04: THE OVERLAP FAULT WAS THE NPU'S VOLTAGE MARGIN, NOT THE
+ * OVERLAP. At width 24 with both cores in flight, core 1 wrote one word of
+ * a row wrong -- the right value plus 1024, or a few bits around bit 10 of
+ * the accumulator -- one row in a few thousand, on the same board, same
+ * kernel, same binary. Mainline runs the NPU clock (clk_rknn_dsu0, which is
+ * compute AND the shared CBUF) at 786.43 MHz off the audio PLL with no OPP,
+ * and the NPU rail at whatever U-Boot left, 750 mV. The vendor's own OPP
+ * table asks 800 mV of its 800 MHz step at the worst leakage bin, and 725
+ * only at 600 MHz. Four DTBs, same probe, KMAX 1024, 4 passes of 5400 rows:
+ *
+ *   786 MHz, 750 mV (mainline as shipped)   11 to 25 wrong words a pass
+ *   594 MHz, 750 mV                          0, 0, 0, 0   (10% slower)
+ *   786 MHz, 800 mV                          0, 0, 0, 0   (full speed)
+ *   786 MHz, 850 mV                          0, 0, 0, 0
+ *
+ * So the two cores may overlap when the rail and the clock sit inside the
+ * vendor's envelope, and must not otherwise. This reads both from sysfs
+ * (the rail from /sys/class/regulator, the clock from debugfs when it is
+ * mounted; unknown clock is taken as 800 MHz, the mainline default, and an
+ * unknown rail as unsafe) and decides. CHARSIU_NPU_BATCH_PARALLEL=1 forces
+ * the overlap and =0 forbids it, whatever the board says.
+ */
+static long sysfs_long(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	long v = -1;
+
+	if (!f)
+		return -1;
+	if (fscanf(f, "%ld", &v) != 1)
+		v = -1;
+	fclose(f);
+	return v;
+}
+
+static long npu_rail_uv(void)
+{
+	char path[256], name[64];
+	long uv = -1;
+
+	for (unsigned i = 0; i < 64 && uv < 0; i++) {
+		FILE *f;
+
+		snprintf(path, sizeof(path), "/sys/class/regulator/regulator.%u/name", i);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (fscanf(f, "%63s", name) == 1 && !strcmp(name, "vdd_npu_s0")) {
+			snprintf(path, sizeof(path),
+				 "/sys/class/regulator/regulator.%u/microvolts", i);
+			uv = sysfs_long(path);
+		}
+		fclose(f);
+	}
+	return uv;
+}
+
+static long npu_clk_hz(void)
+{
+	long hz = sysfs_long("/sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate");
+
+	return hz > 0 ? hz : 800000000;   /* debugfs not mounted: mainline's default */
+}
+
+/* the vendor's worst-bin voltage for each NPU OPP step (rk3576 npu_opp_table, L0) */
+static int overlap_safe(char *why, size_t n)
+{
+	static const struct { long hz; long uv; } opp[] = {
+		{ 600000000, 725000 }, { 700000000, 775000 },
+		{ 800000000, 800000 }, { 900000000, 850000 },
+	};
+	long uv = npu_rail_uv(), hz = npu_clk_hz();
+	long need = -1;
+
+	for (unsigned i = 0; i < sizeof(opp) / sizeof(opp[0]); i++)
+		if (hz <= opp[i].hz) {
+			need = opp[i].uv;
+			break;
+		}
+	if (uv < 0) {
+		snprintf(why, n, "the NPU rail is not readable, %ld MHz", hz / 1000000);
+		return 0;
+	}
+	if (need < 0) {
+		snprintf(why, n, "%ld MHz is above the vendor's table", hz / 1000000);
+		return 0;
+	}
+	snprintf(why, n, "%ld MHz at %ld mV, the vendor asks %ld", hz / 1000000,
+		 uv / 1000, need / 1000);
+	return uv >= need;
+}
+
+static char overlap_why[96];
+
 static int batch_serial(void)
 {
 	static int z = -1;
@@ -3334,9 +3433,27 @@ static int batch_serial(void)
 	if (z < 0) {
 		const char *e = getenv("CHARSIU_NPU_BATCH_PARALLEL");
 
-		z = !(e && *e != '0');
+		if (e && *e)
+			z = *e == '0';
+		else
+			z = !overlap_safe(overlap_why, sizeof(overlap_why));
 	}
 	return z;
+}
+
+/* what batch_serial decided and why, for the report */
+const char *charsiu_npu_overlap_note(void)
+{
+	static char note[160];
+	const char *e = getenv("CHARSIU_NPU_BATCH_PARALLEL");
+
+	if (e && *e)
+		snprintf(note, sizeof(note), "the two cores %s by CHARSIU_NPU_BATCH_PARALLEL=%s",
+			 batch_serial() ? "serialised" : "overlapped", e);
+	else
+		snprintf(note, sizeof(note), "the two cores %s: %s", batch_serial() ?
+			 "serialised" : "overlapped", overlap_why);
+	return note;
 }
 
 /*

@@ -23,6 +23,16 @@ back to the CPU between layers. The numbers are read off `board_verify.sh 7`, th
 same prompt and protocol the vendor publishes, and the rest of this file says how
 they are known to be right.
 
+**The NPU rail.** Those prompt times run the two NPU cores one at a time. Run
+together they corrupt one word in a few thousand rows -- and the reason is not the
+runtime: mainline clocks the NPU at 786 MHz with the rail at whatever U-Boot left,
+750 mV, and the vendor's own OPP table asks 800 mV of 800 MHz. With the rail at
+800 mV (a one-line DTB change on the ROCK 4D) the cores overlap on every batched
+call with the text identical on nine models, and time to first token becomes
+845 / 1183 / 3963 / 2891 ms for the four models above. charsiu reads the rail and
+the clock from sysfs and overlaps only inside the vendor's envelope, and says which
+it chose in its NPU report.
+
 It reads **llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3** gguf files.
 
 **And it sees.** A vision tower read out of llama.cpp's `mmproj` gguf, on the same
