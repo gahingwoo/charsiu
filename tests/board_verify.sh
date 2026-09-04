@@ -143,7 +143,7 @@ echo "  kernel    $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREE
 # probe is a wasted board trip and it looks exactly like a result.
 echo "  script    $(cksum "$0" 2>/dev/null | cut -d" " -f1), $(wc -l <"$0") lines"
 echo "  prompt    $(printf '%s' "$P" | wc -w) words, no trailing space"
-echo "  ⚠ phase 7 sets the performance governor itself, as their protocol does."
+echo "  ⚠ phases 7 and 9 set the performance governor themselves and put it back."
 
 for p in $PHASES; do
 case $p in
@@ -479,6 +479,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # -- which is indistinguishable from the instrument being broken. So the
    # ABSENCE of the block is a FAILURE here, not a quiet skip.
    run 9
+   # ⚠⚠ AND THE GOVERNOR, OR THIS PHASE MEASURES THE GOVERNOR. Every share it
+   # prints except the fence is CPU work, and under ondemand they do not
+   # reproduce: three runs on 2026-09-04 read Phi-3.5's packing at 4384, 6583
+   # and 3158 ms, two of them on identical code, and a change worth 5% was
+   # invisible underneath that. Pinned and put back at the end of the phase,
+   # the way phase 7 does it for their protocol.
+   GOV9=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo ondemand)
+   for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance >"$c" 2>/dev/null; done
+   printf '  governor  %s for this phase (was %s)\n' \
+       "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)" "$GOV9"
    # A long prompt, because a 32 word one spends more time loading than
    # prefilling and the split would be reading noise. -n 4 keeps generation out
    # of the way; TTFT is the number this phase is about.
@@ -593,6 +603,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	printf '     if `other` is larger than any named share, the next thing to\n'
 	printf '     do is NAME it, not optimise one of the five.\n'
    fi
+   for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo "$GOV9" >"$c" 2>/dev/null; done
    ;;
 
 10) say "10. KMAX: read is m * n * ks, so buy ks down and see what it costs"
