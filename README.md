@@ -24,7 +24,7 @@ same prompt and protocol the vendor publishes, and the rest of this file says ho
 they are known to be right.
 
 **The NPU rail.** The times above run the two NPU cores one at a time, because
-run together they corrupt one word in a few thousand rows. The runtime is not
+run together they get about one row in a thousand wrong. The runtime is not
 what does it. Mainline clocks the NPU at 786 MHz and leaves the rail at whatever
 U-Boot set, 750 mV, where the vendor's own table asks 800 mV of that speed. Give
 the rail 800 mV, one line of device tree, and both cores run on every batched
