@@ -465,6 +465,9 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
 /* the fifth segment: buffers and the output zero, before any packing */
+/* inside the pack: the gather out of X, and the packer call itself */
+void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
+				    double *packcall, int reset);
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);
 /* the parts of "pack" that are not packing: the register streams emitted a

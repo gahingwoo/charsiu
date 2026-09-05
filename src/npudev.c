@@ -449,6 +449,12 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	/* ⚠ inside bpack_us: the gather that copies a K slice's columns out of
+	 * X, and the packer call that lays them out for the hardware. They are
+	 * different repairs -- one is a memcpy loop over rows, the other is a
+	 * vectorised walk -- so a single "pack" number cannot choose between
+	 * them, which is the same mistake the entry split just fixed. */
+	double bgather_us, bpackcall_us;
 	/*
 	 * ⚠ PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
 	 * 80: "pack" was 2.0 ms a row, 0.8 ms a call, and the fp16 packer moves
@@ -3386,6 +3392,15 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
  * geometry. It still counts, because a pool that quietly reallocates is the
  * same bug wearing a different name.
  */
+void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
+				    double *packcall, int reset)
+{
+	*gather = g->bgather_us / 1e3;
+	*packcall = g->bpackcall_us / 1e3;
+	if (reset)
+		g->bgather_us = g->bpackcall_us = 0.0;
+}
+
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset)
 {
@@ -4540,11 +4555,16 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
 			 * binary can run both arms in one session.
 			 */
-			if (!g->w4 || sk != e->t->k || pack_gather())
+			if (!g->w4 || sk != e->t->k || pack_gather()) {
+				double tg = now_us();
+
 				for (unsigned r = 0; r < m; r++)
 					memcpy(g->bscr + (size_t)r * sk,
 					       X + (size_t)r * e->t->k + s->k0,
 					       sk * sizeof(*g->bscr));
+				g->bgather_us += now_us() - tg;
+			}
+			double tpc = now_us();
 			if (!g->w4) {
 				/*
 				 * int8's scale is per row and taken over THIS K
@@ -4606,6 +4626,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						g->bin_stride);
 			}
+			g->bpackcall_us += now_us() - tpc;
 		}
 
 		double tpe = now_us();

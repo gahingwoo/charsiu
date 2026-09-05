@@ -3544,6 +3544,8 @@ void llama_stages_report(void)
 
 			charsiu_npu_batch_split(bmm_dev, &pk, &sb, &fn,
 						&rd, 1);
+			double ga, pc;
+
 			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
 			       "  read %.2f  unaccounted %.2f ms a row\n",
 			       "of the entry:", pk / bstage_rows,
@@ -3551,6 +3553,11 @@ void llama_stages_report(void)
 			       rd / bstage_rows,
 			       (bmm_entry_ms - pk - sb - fn - rd)
 			       / bstage_rows);
+			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 1);
+			printf("  %-16s gather %.2f  packer %.2f  the rest"
+			       " %.2f ms a row\n", "of the pack:",
+			       ga / bstage_rows, pc / bstage_rows,
+			       (pk - ga - pc) / bstage_rows);
 		}
 	}
 	if (!stage_tok)
