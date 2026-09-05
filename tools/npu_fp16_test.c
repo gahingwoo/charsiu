@@ -346,6 +346,7 @@ int main(int argc, char **argv)
 	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
+	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -359,6 +360,58 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doout) {
+		/*
+		 * ⚠⚠ MEASURE THE OUTPUT ORDER, DO NOT GUESS IT.
+		 *
+		 * fp16 is exact at m=1 and wrong above it. A flat read and
+		 * charsiu_acc_index are both wrong (14.12 and 16.25 at m=2), so
+		 * the accumulator's layout above one row is not either of the
+		 * two orders already in this tree. Guessing a third is how the
+		 * evening has gone; this reads it the way the weight layout was
+		 * read.
+		 *
+		 * Two runs, no candidate assumed:
+		 *   pass 1  A[r][*] = 2^r / K, weights all 1  -> every slot's
+		 *           value is 2^r and names its ROW
+		 *   pass 2  A all 1/K, B[c][*] = 2^c          -> names its
+		 *           CHANNEL
+		 * Together they give (row, channel) for every slot.
+		 */
+		unsigned R = m < 8 ? m : 8, C = n < 8 ? n : 8;
+		uint32_t *p1 = calloc((size_t)m * n, 4);
+		uint32_t *p2 = calloc((size_t)m * n, 4);
+
+		if (!p1 || !p2) goto done;
+		setenv("CHARSIU_READ_FLAT", "1", 1);   /* raw, unreordered */
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned i = 0; i < k; i++)
+				A[(size_t)r * k + i] = r < R
+					? (float)(1u << r) / (float)k : 0.0f;
+		for (unsigned i = 0; i < n * k; i++) B[i] = 1.0f;
+		if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, p1)) goto done;
+		for (unsigned i = 0; i < m * k; i++) A[i] = 1.0f / (float)k;
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] = c < C
+					? (float)(1u << c) : 0.0f;
+		if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, p2)) goto done;
+		printf("raw accumulator slots, first %u rows x %u channels\n", R, C);
+		printf("  slot   value(row)  value(chan)   -> (r, c)\n");
+		for (unsigned i = 0; i < m * n; i++) {
+			float a = asf(p1[i]), b = asf(p2[i]);
+			long ra = (a > 0 && a == (float)(long)a) ? (long)a : -1;
+			long cb = (b > 0 && b == (float)(long)b) ? (long)b : -1;
+
+			if (ra <= 0 || cb <= 0) continue;
+			if ((ra & (ra - 1)) || (cb & (cb - 1))) continue;
+			printf("  %-6u %-11ld %-13ld -> (%d, %d)\n", i, ra, cb,
+			       __builtin_ctzl(ra), __builtin_ctzl(cb));
+		}
+		free(p1); free(p2);
+		rc = 0;
+		goto done;
+	}
 	if (doapi) {
 		/*
 		 * ⚠ THE UNIT THE RUNTIME WILL ACTUALLY CALL, end to end.
