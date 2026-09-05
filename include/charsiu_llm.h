@@ -323,7 +323,7 @@ int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
-			     unsigned long *misses);
+			     unsigned long *misses, unsigned long why[4]);
 /* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
 /* whether batched calls overlap the two cores, and why (the rail and clock against the vendor's OPP) */

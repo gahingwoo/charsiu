@@ -509,18 +509,28 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 			"prep -- a pool that quietly reallocates is the old "
 			"bug in new clothes)\n", nbuf, alloc);
 	{
-		unsigned long hits = 0, misses = 0;
+		unsigned long hits = 0, misses = 0, why[4] = { 0, 0, 0, 0 };
+		static const char *whyname[4] = {
+			"dropped by a leader", "a different input",
+			"a different shape", "the K slices are on the other device",
+		};
 
-		charsiu_npu_reuse_stats(p->dev, &hits, &misses);
+		charsiu_npu_reuse_stats(p->dev, &hits, &misses, why);
 		/*
 		 * ⚠ SAID EVEN WHEN ZERO. A reuse that silently never fired
 		 * would read as "pack did not move", which is a different
 		 * fact from "the declaration was never honoured".
 		 */
-		if (hits || misses)
+		if (hits || misses) {
 			fprintf(out, "    input reused %lu times, packed anyway "
 				"%lu times when declared the same\n",
 				hits, misses);
+			if (misses)
+				for (unsigned i = 0; i < 4; i++)
+					if (why[i])
+						fprintf(out, "        %6lu  %s\n",
+							why[i], whyname[i]);
+		}
 		else if (!charsiu_npu_reuse_on())
 			fprintf(out, "    input reuse OFF (CHARSIU_NPU_REUSE=0 "
 				"is set)\n");

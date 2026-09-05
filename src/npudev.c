@@ -384,6 +384,15 @@ struct charsiu_npu {
 	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
 	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
+	/*
+	 * ⚠ WHY A MISS MISSED. Phase 9 on 2026-09-05 reported Phi-3.5 as
+	 * "reused 0 times, packed anyway 2304 times when declared the same"
+	 * while every other model reused, and that one number has four
+	 * different fixes behind it. The four are counted apart so the next
+	 * round does not have to guess which: dropped, a different X, a
+	 * different shape, or this device not holding the K slices asked for.
+	 */
+	unsigned long reuse_why[4];   /* dropped, other X, other shape, slices */
 	size_t bin_stride, bout_stride;
 	/* the output buffers, one per geometry rather than one per tensor:
 	 * see the comment on struct npu_outbuf */
@@ -4348,10 +4357,22 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			    reuse_key_hit(&g->bin_key[d], X, m, e->t->k, zp, need);
 
 		if (g->reuse_ask) {
-			if (reuse)
+			const struct reuse_key *bk = &g->bin_key[d];
+
+			if (reuse) {
 				g->reuse_hits++;
-			else
+			} else {
 				g->reuse_misses++;
+				if (!bk->valid)
+					g->reuse_why[0]++;
+				else if (bk->x != X)
+					g->reuse_why[1]++;
+				else if (bk->m != m || bk->k != e->t->k ||
+					 bk->zp != zp)
+					g->reuse_why[2]++;
+				else
+					g->reuse_why[3]++;
+			}
 		}
 		if (!reuse)
 			g->bin_key[d].valid = 0;   /* until this device's pack lands */
@@ -4919,10 +4940,12 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 }
 
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
-			     unsigned long *misses)
+			     unsigned long *misses, unsigned long why[4])
 {
 	*hits = g ? g->reuse_hits : 0;
 	*misses = g ? g->reuse_misses : 0;
+	for (unsigned i = 0; i < 4; i++)
+		why[i] = g ? g->reuse_why[i] : 0;
 }
 
 /*
