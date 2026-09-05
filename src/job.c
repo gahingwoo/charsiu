@@ -1388,7 +1388,22 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		const char *e31 = envq("CHARSIU_W4_301C");
 		int high = e31 && !strcmp(e31, "high");
 
-		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
+		/*
+		 * ⚠⚠ AND FP16 TAKES THE 0x200 FORM TOO. The board's own words:
+		 * with 0x10000001 here, a single fp16 weight of 1.0 against
+		 * A[0] = 1.0 came back 3600, and 3600 is 0x3c * 0x3c -- the
+		 * HIGH BYTES of the two fp16 patterns multiplied as int8. A[8]
+		 * = 9.0 gave 4320, which is 0x48 * 0x3c. So the output stage
+		 * was fp16 by then and the MULTIPLY was still int8.
+		 *
+		 * 0x10000200 is what the vendor carries in all 4940 of its fp16
+		 * streams and in its int4 ones alike. 0x301c stays on w4v: its
+		 * fp16 form is the high half, which is what the non-w4v branch
+		 * already emits, and the vendor agrees there.
+		 */
+		emit(&e, CORE, 0x3018,
+		     (w4v || mm->wdtype == CHARSIU_FP16) ? 0x10000200u
+							 : 0x10000001u);
 		emit(&e, CORE, 0x301c,
 		     wide ? ((uint32_t)(rows - 1) << 16) | (ow - 1)
 			  : ((w4v && !high) ? lines : ((uint32_t)lines << 16)));
