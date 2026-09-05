@@ -1784,3 +1784,64 @@ arithmetic the hardware does. What is left is 5.3 ms a row inside the NPU
 matmul entry -- 64% of the row now -- and the stage table has never said
 whether that is the hardware or the pack in front of it. It says so from this
 commit on.
+
+## Where a batched prompt's time actually is
+
+The stage table learned to split the NPU matmul entry, and then to split the
+pack inside it. On the board, Llama-3.2-1B and Qwen3-0.6B, governor pinned:
+
+```
+   llama  entry 4.86  pack 1.20 (gather 0.33  packer 0.61)  fence 1.32  read 2.23
+   qwen3  entry 4.50  pack 1.62 (gather 0.20  packer 1.11)  fence 1.18  read 0.98
+```
+
+The two models do not have the same bottleneck. That is the whole argument for
+splitting a number rather than naming it: "the matmuls are 60%" would have sent
+both of them at the same repair.
+
+### What the morning moved
+
+Three changes, each measured on its own alternating arms, then all three
+together against all three off in one binary:
+
+```
+             all off      all on
+   llama      4948 ms      4144 ms     16.2%
+   SmolLM2    5590         4461        20.2%
+   Qwen3     12625        12381         1.9%
+```
+
+Qwen3 gains almost nothing from the set, and taking each one away in turn says
+each is still positive on it -- row pool 4.3%, softmax 2.6%, read threshold
+14.3%. They do not add, because all three run on one thread pool and warm it
+for each other. The set is the best configuration for all three models; the
+decomposition is not additive and should not be quoted as if it were.
+
+### And the packer, which is at the memory roof already
+
+Splitting the pack said the packer call is its largest piece, so it went on the
+pool too, by GROUPS of 8 k rather than by rows -- the function had already
+measured why: the destination is a cold write-back mapping, PREP_BO invalidates
+it immediately before, and rows outermost falls to 6.87 GB/s against 24.57.
+
+```
+   packer serial vs pooled     llama 2.9%    SmolLM2 6.4%    Qwen3 0.3%
+   llama's packer              0.61 -> 0.40 ms a row
+```
+
+1.5x from four cores, not 4x, and the reason is in that same note: one thread
+already reaches 24 GB/s on this, which is most of what the memory gives. Qwen3
+issues 2352 packs a prompt against Llama's 784, and the extra barriers eat the
+difference exactly.
+
+### The one that was not a speedup at all
+
+The norm and residual stages went on the pool with the silu, and rmsnorm keeps
+its gain row in a plain function static. Qwen3 stopped being reproducible: ten
+runs of one seed, eight of one sentence and two of another, where the commit
+before gave ten of ten. The first reading was "that model is nondeterministic
+anyway" -- true of the build with the bug and false of every build before it.
+
+What settled it was running one binary ten times and then the previous commit
+ten times. **A difference between two arms cannot be told from a difference
+between two runs without running one arm twice.**
