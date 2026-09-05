@@ -152,6 +152,38 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst);
 
+/*
+ * fp16 WEIGHTS, which is the precision the vendor runs attention in.
+ *
+ * ⚠⚠ THE LAYOUT IS THE ONE THING THE VENDOR'S FILE CANNOT SETTLE. Its size
+ * registers are exact and dense -- 0x101c = ic*oc*2, 0x1020 = ic*2, both the
+ * true byte count over all 8308 dispatches that write them -- but a grouping
+ * does not change a total, so the byte ORDER inside a kernel is invisible from
+ * outside. docs/vendor-dispatch.md has the whole read.
+ *
+ * So this takes the layout as an argument instead of picking one, and the
+ * board decides. `src` is B[n][k] row major, float; `dst` holds
+ * charsiu_weight_bytes(mm) bytes.
+ *
+ *   CHARSIU_W16_DENSE   kernel n is ic contiguous halves at n*k
+ *   CHARSIU_W16_ATOM    the activation packer's shape, [k/8][n][8]
+ *   CHARSIU_W16_GROUP   int8's ngroup/kgroup tiling with 2 byte elements
+ */
+enum charsiu_w16_layout {
+	CHARSIU_W16_DENSE,
+	CHARSIU_W16_ATOM,
+	CHARSIU_W16_GROUP,
+	CHARSIU_W16_NLAYOUT,
+};
+
+void charsiu_pack_weights_f16(const struct charsiu_matmul *mm,
+			      const float *src, uint8_t *dst, size_t dst_size,
+			      enum charsiu_w16_layout layout);
+
+/* where element (n, k) lands under `layout`, in BYTES; SIZE_MAX if outside */
+size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
+			  unsigned k, enum charsiu_w16_layout layout);
+
 unsigned charsiu_k_eff(const struct charsiu_matmul *mm);
 int charsiu_w4_paired(const struct charsiu_matmul *mm);
 int charsiu_cbuf_window(void);

@@ -1030,6 +1030,74 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 	}
 }
 
+/*
+ * ⚠⚠ THREE CANDIDATES, NOT ONE, AND THE BOARD PICKS. The vendor's size
+ * registers pin the buffer to ic*oc*2 bytes with ic*2 per output channel, and
+ * that is exact over all 4940 of its fp16 streams -- but a tiling does not
+ * change a total, so nothing in a static file can say what order the bytes go
+ * in. Guessing one and calling it the layout is how a wrong answer ships
+ * quietly; this enumerates the three that the rest of the tree already knows
+ * about and lets a probe on the hardware say which.
+ *
+ * DENSE is what the size registers read like if they are taken literally.
+ * ATOM is the shape charsiu_pack_input already uses for 2 byte activations,
+ * [k/8][rows][8], with the output channel in place of the row -- the strongest
+ * prior, because 8 is the 2 byte feature atom on both sides. GROUP is the
+ * int8 weight tiling with 2 byte elements, which is what charsiu_weight_kgroup
+ * currently returns for fp16 by inheritance rather than by measurement.
+ */
+size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
+			  unsigned k, enum charsiu_w16_layout layout)
+{
+	unsigned n_pad = ALIGN_UP(mm->n, 2);
+	unsigned ke = charsiu_k_eff(mm);
+	size_t off;
+
+	if (n >= n_pad || k >= mm->k)
+		return (size_t)-1;
+	switch (layout) {
+	case CHARSIU_W16_DENSE:
+		off = (size_t)n * ke + k;
+		break;
+	case CHARSIU_W16_ATOM:
+		off = (size_t)(k / 8) * n_pad * 8 + (size_t)n * 8 + k % 8;
+		break;
+	case CHARSIU_W16_GROUP: {
+		unsigned ng = charsiu_weight_ngroup(mm->wdtype);
+		unsigned kg = charsiu_weight_kgroup(mm->wdtype);
+		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
+		unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
+
+		off = (size_t)ngi * ng * ke + (size_t)kgi * kg * ngsz
+		    + (size_t)(n % ng) * kgsz + (k % kg);
+		break;
+	}
+	default:
+		return (size_t)-1;
+	}
+	return off * 2;
+}
+
+void charsiu_pack_weights_f16(const struct charsiu_matmul *mm,
+			      const float *src, uint8_t *dst, size_t dst_size,
+			      enum charsiu_w16_layout layout)
+{
+	unsigned n, k;
+
+	memset(dst, 0, dst_size);
+	for (n = 0; n < mm->n; n++)
+		for (k = 0; k < mm->k; k++) {
+			size_t off = charsiu_w16_offset(mm, n, k, layout);
+			uint16_t h;
+
+			if (off == (size_t)-1 || off + 1 >= dst_size)
+				continue;
+			h = charsiu_float_to_half(src[(size_t)n * mm->k + k]);
+			dst[off] = (uint8_t)(h & 0xff);
+			dst[off + 1] = (uint8_t)(h >> 8);
+		}
+}
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst)
 {

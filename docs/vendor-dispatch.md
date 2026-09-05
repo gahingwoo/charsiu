@@ -225,15 +225,26 @@ values differ. Six are constant within fp16 and differ from int4:
 |---|---|---|
 | `CNA 0x100c` | `0x20200120` | `0x20600120` x1920, `0x00600120` x1408 |
 | `CNA 0x1094` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
-| `CNA 0x1110` | `0` | `0` x3200, `0x00200000` x128 |
 | `CNA 0x118c` | `0` | `0x004f004f` x768, `0` x512, `0x001f001f` x512 |
 | `DPU 0x401c` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
 | `DPU 0x4020` | `0` | `0x4f` x768, `0` x512, `0x1f` x512 |
 
-`0x1094` pairs with `DPU 0x401c` and `0x118c` with `DPU 0x4020` -- they carry
-the same values -- so the four are the weight **group** count and its minus
-one, and fp16 collapses them to one group and none, because a 16 bit weight
-carries its own exponent and wants no per group scale.
+⚠ A sixth, `CNA 0x1110`, looked like a differing constant and is **not one**:
+`job.c` emits `job->weight_addr` there, and an address in a static file is an
+unpatched placeholder. It is listed here only so the next reader does not count
+it again.
+
+These four are the **surface geometry** registers, not anything about weights.
+`job.c` emits them as `inw * rows`, `ow * rows`, `((inw - 1) << 16) | (inh - 1)`
+and `ow - 1`. Holding them at 1, 0, 1, 0 therefore says the fp16 regime
+describes its window as **1 x 1**, with the count carried elsewhere -- which is
+consistent with the round 380 note's observation that the vendor writes M
+exactly into `0x1098`.
+
+⚠ An earlier reading of this called the four "the weight group count and its
+minus one, collapsed because a 16 bit weight carries its own exponent". That is
+WRONG and the emitter says so: they are the window, not the weights. The story
+was invented to fit four numbers before anyone looked at what writes them.
 
 ⚠ This is what round 380 hit from the other side: it copied fp16's `0x1094`,
 `0x1098` and `0x118c` onto an int4 op, the board said no, and the op the values

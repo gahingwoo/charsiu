@@ -1098,7 +1098,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * cost anything.
 	 */
 	emit(&e, CNA, 0x100c,
-	     (mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x00000000u) |
+	     (mm->wdtype == CHARSIU_INT4 ? 0x00600120u :
+	      mm->wdtype == CHARSIU_FP16 ? 0x00200120u : 0x00000000u) |
 	     (charsiu_effective_adtype(mm) == CHARSIU_FP16 ? 0x20000000u : 0u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
@@ -1193,12 +1194,19 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * closes the question rather than leaving it open. Counted across the
 	 * whole file, 0x1094 and 0x118c are CONSTANTS PER REGIME: fp16 holds
 	 * them at 1 and 0 in all 4940, int4 carries 0x60 or 0x80 and 0x4f004f
-	 * or 0x1f001f. They pair with DPU 0x401c and 0x4020, which hold the
-	 * same values -- so the four are the weight GROUP count and its minus
-	 * one, and fp16 collapses them to "one group" because a 16 bit weight
-	 * carries its own exponent and needs no per group scale. Round 380 took
-	 * fp16's values and put them on an int4 op: the same mistake 0x100c
-	 * above describes, copying a constant across regimes.
+	 * or 0x1f001f, and DPU 0x401c and 0x4020 move with them.
+	 *
+	 * ⚠ AND THOSE FOUR ARE THE WINDOW, NOT THE WEIGHTS. The lines below
+	 * emit them as inw * rows, ow * rows, ((inw - 1) << 16) | (inh - 1) and
+	 * ow - 1, so fp16 holding them at 1, 1, 0, 0 says that regime describes
+	 * its window as 1 x 1 and carries the count elsewhere -- 0x1098, which
+	 * is the register this note already says the vendor writes M into. An
+	 * earlier reading of mine called them a weight GROUP count collapsing
+	 * because fp16 carries its own exponent; that was a story fitted to four
+	 * numbers without looking at what writes them, and this emitter refutes
+	 * it. Round 380 took fp16's window values and put them on an int4 op:
+	 * the same mistake 0x100c above describes, a constant carried across
+	 * regimes.
 	 *
 	 * ⚠ AND THE VALUES BELOW ARE NOT A GUESS. They are Mesa's generic
 	 * RK3576 encoder, rkt_regcmd.c, with inw = 1 and full_inh = M:
@@ -1219,7 +1227,16 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * rounds and regcmd.c does not.
 	 */
 	emit(&e, CNA, 0x1090, inw * 4);
-	emit(&e, CNA, 0x1094, inw * rows);      /* inw * full_inh */
+	/*
+	 * ⚠ FP16 DESCRIBES ITS WINDOW AS 1 x 1, and these four registers are
+	 * where it says so. Over all 4940 of the vendor's fp16 streams,
+	 * 0x1094 and DPU 0x401c are 1 and 0x118c and DPU 0x4020 are 0, without
+	 * exception, while its int4 streams carry the geometry these lines
+	 * compute. Nothing sets wdtype to FP16 yet, so every stream that runs
+	 * today is bit identical to before these branches existed.
+	 */
+	emit(&e, CNA, 0x1094,
+	     mm->wdtype == CHARSIU_FP16 ? 1u : inw * rows);  /* inw * full_inh */
 	emit(&e, CNA, 0x1098, envq("CHARSIU_CNA_1098")
 	     ? (uint32_t)strtoul(envq("CHARSIU_CNA_1098"), NULL, 0)
 	     : ((inw * rows + 3) & ~3u));
@@ -1239,8 +1256,10 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * it made no difference. That round ran on the HEIGHT axis, where M
 	 * moves nothing at all, so it did not test this and does not excuse it.
 	 */
-	emit(&e, CNA, 0x118c, wide ? (((inw - 1) << 16) | (inw - 1))
-				   : (((inw - 1) << 16) | (rows - 1)));
+	emit(&e, CNA, 0x118c,
+	     mm->wdtype == CHARSIU_FP16 ? 0u
+	     : wide ? (((inw - 1) << 16) | (inw - 1))
+		    : (((inw - 1) << 16) | (rows - 1)));
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
@@ -1535,8 +1554,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4010, WIDE(0) ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
-	emit(&e, DPU, 0x401c, ow * rows);       /* ow * full_oh */
-	emit(&e, DPU, 0x4020, ow - 1);
+	emit(&e, DPU, 0x401c,
+	     mm->wdtype == CHARSIU_FP16 ? 1u : ow * rows);   /* ow * full_oh */
+	emit(&e, DPU, 0x4020, mm->wdtype == CHARSIU_FP16 ? 0u : ow - 1);
 	emit(&e, DPU, 0x4024, wide ? rows - 1 : lines);
 	emit(&e, DPU, 0x4028, 0x00000000);
 	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
