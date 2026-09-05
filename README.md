@@ -475,9 +475,11 @@ device buffer for a caller that is about to reduce over it anyway.
 It is **correct**: `CHARSIU_ATTN_NPU_CHECK` runs both arms on the same rows and
 they land 0.25 to 0.5% apart over 112 layers with nothing falling back, which
 is fp16 inputs against an fp32 CPU arm and not a cache written in the wrong
-order. And on a 513 token prompt it is **slower** -- 6710 ms against the CPU
-arm's 4889 -- because the CPU's attention grows with the cache depth and a
-short prompt's cache is shallow. It is off by default, and with the flag unset
+order. And it is **slower**: 6710 ms against the CPU arm's 4889 on a 513 token
+prompt, and 52558 against 35686 on a 2074 token one. The gap widens with the
+cache rather than closing, because the scores matmul's n is the number of
+positions and the values matmul's k is the context -- the hardware's work grows
+with the cache exactly as the CPU's does, and it starts from behind. It is off by default, and with the flag unset
 four models produce text identical to the build from before any of this.
 
 `docs/lab-notebook.md` has what had to be found, including the six
