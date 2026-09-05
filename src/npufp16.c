@@ -192,8 +192,6 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 		const uint32_t *o = f->ob.map;
 		unsigned untouched = 0;
 
-		int w4wide = charsiu_m_axis_wide_for(0);
-
 		for (unsigned i = 0; i < m * n; i++)
 			untouched += o[i] == 0xdeadbeefu;
 		if (untouched == m * n) {
@@ -201,15 +199,8 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 			f->refused++;
 			return -1;              /* the job wrote nothing */
 		}
-		/*
-		 * ⚠ THE ACCUMULATOR IS NOT FLAT ABOVE m=1. charsiu_acc_index is
-		 * that order; m=1 is flat, which is why a flat read looked
-		 * exact there and wrong everywhere else.
-		 */
-		for (unsigned r = 0; r < m; r++)
-			for (unsigned c = 0; c < n; c++)
-				((uint32_t *)Y)[(size_t)r * n + c] =
-					o[charsiu_acc_index(r, c, m, w4wide)];
+		/* flat, and measured: --outmap reads m by n row major */
+		memcpy(Y, o, (size_t)m * n * 4);
 	}
 	charsiu_bo_fini(f->dev, &f->ob);
 	f->calls++;

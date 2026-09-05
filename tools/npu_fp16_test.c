@@ -262,28 +262,14 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	tp = now_ms();
 	charsiu_bo_prep(dev, &ob, 1000000000);   /* this is the fence wait */
 	/*
-	 * ⚠⚠ THE ACCUMULATOR IS NOT FLAT ABOVE m=1, AND THAT IS WHY EVERY m>1
-	 * RESULT LOOKED WRONG. charsiu_acc_index exists for exactly this and
-	 * its own comment says "m = 1 is flat" -- which is why m=1 came back
-	 * EXACT and every larger m did not. A flat memcpy reads the right
-	 * numbers in the wrong order and that is indistinguishable, from here,
-	 * from the hardware computing the wrong numbers.
-	 *
-	 * CHARSIU_READ_FLAT=1 puts the old read back, because the difference
-	 * between "wrong order" and "wrong values" is worth being able to ask
-	 * again.
+	 * ⚠ FLAT, AND MEASURED. --outmap put B[c] = 2^c through the hardware
+	 * and read 2^0..2^7 at slots 0..7 and again at 64..71 -- m by n, row
+	 * major, exactly. An earlier version of this indexed through
+	 * charsiu_acc_index on the strength of its comment about m>1, which
+	 * made m=2 WORSE (14.12 to 16.25). The output order was never the
+	 * fault; reverted rather than left in as a second variable.
 	 */
-	if (getenv("CHARSIU_READ_FLAT")) {
-		memcpy(out, ob.map, (size_t)m * n * 4);
-	} else {
-		const uint32_t *acc = ob.map;
-		int w4wide = charsiu_m_axis_wide_for(0);
-
-		for (unsigned r = 0; r < m; r++)
-			for (unsigned c = 0; c < n; c++)
-				out[(size_t)r * n + c] =
-					acc[charsiu_acc_index(r, c, m, w4wide)];
-	}
+	memcpy(out, ob.map, (size_t)m * n * 4);
 	charsiu_bo_fini(dev, &ob);
 	t_split.rd += now_ms() - tp;
 	rc = 0;
