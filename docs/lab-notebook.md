@@ -1889,3 +1889,63 @@ The loop used the first slice's for all of them. Llama came back
 257, 258, 259. Neither faulted, because a wrong operand does not fault.
 
 A proof about one half of an expression is not a proof about the expression.
+
+## A day of instruments, and four numbers that were correct about the wrong thing
+
+The prompt got 17 to 21% faster on 2026-09-06 and the gap to the vendor went
+from 1.85-2.40x to 1.53-1.88x. Every one of the changes came out of splitting a
+number that had been reported whole, and every one of the day's mistakes came
+out of reading a number whose label did not describe it.
+
+### The measurements that worked
+
+The stage table learned to split the NPU matmul entry into pack, submit, fence
+and read, and then the pack into its gather and its packer call. That is what
+found the pooled read's threshold -- the largest single change of the day -- and
+it is also what showed that **Llama and Qwen3 do not share a bottleneck**:
+llama's read is 2.23 ms a row against qwen3's packer at 1.11. "The matmuls are
+60%" would have sent both at the same repair.
+
+### The four that were correct about the wrong thing
+
+**1. "-2438 ms of them is neither hardware nor packing."** Printed on every run
+for a whole morning. `busy_us` is incremented in three call paths and `call_us`
+in two, so a batched prompt put all its hardware time in the numerator and none
+in the denominator. Nobody read the minus sign -- including the person who then
+quoted the "2.36 GB/s of weights" beside it as a fact about the silicon and
+went looking for a hardware problem.
+
+**2. "GB/s of weights."** The window it divides by runs from the first submit to
+the last fini, and on a batched call the READ BACK is most of it. Same binary:
+2.05 GB/s on a prompt, 9.73 on a decode-heavy run. The number moves because the
+readback's share moves, not because the hardware does.
+
+**3. Two reports, four counters, one reset.** The stage report passed
+`reset = 1` and npudev's report, which prints after it, divided by the
+leftovers: "57 ms submitting and waiting" on a run whose fence alone was 189.
+The one that prints first is not the counter's owner.
+
+**4. "Bit exact by construction."** The fused read's derivation was about the
+ORDER OF THE ADDITIONS and never checked the OPERANDS. Every K slice carries
+its own scale, `t->scale[(n0+j)*ng + k0/kgroup]`, and the loop used the first
+slice's for all of them. Llama printed "000alivherherher"; Qwen3 counted 251,
+254, 256 for 257, 258, 259. **Neither faulted.** A proof about half an
+expression is not a proof about the expression.
+
+### And two about experiments rather than instruments
+
+**A data race that read as a property of the model.** rmsnorm keeps its gain row
+in a plain function static, which was safe until the norm stages went on the
+pool. Qwen3 stopped being reproducible and the first reading was "that model is
+nondeterministic anyway" -- true of the build with the bug and false of every
+build before it. What settled it was running one binary ten times and then the
+previous commit ten times: 8/2 against 10/0. **A difference between two arms
+cannot be told from a difference between two runs without running one arm
+twice.**
+
+**Two variables in one arm.** The chunk width experiment set
+`CHARSIU_NPU_KMAX=1024` and `CHARSIU_PREFILL_CHUNK=160` together and the result
+was read as a KMAX effect. Separated, KMAX alone changes nothing at all -- the
+chunk default is a hardcoded 80 and the surface ceiling can only lower it. The
+whole effect was the chunk. **Print the baseline before comparing anything to
+it.**
