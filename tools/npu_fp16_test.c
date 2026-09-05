@@ -630,16 +630,16 @@ int main(int argc, char **argv)
 		unsigned G = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
 		unsigned reps = argc > 5 ? (unsigned)atoi(argv[5]) : 8;
 		struct charsiu_fp16 *fp = charsiu_fp16_open();
-		struct charsiu_fp16_op op[32];
-		float *Xs[32] = { 0 }, *Ya[32] = { 0 }, *Yb[32] = { 0 };
-		float *Yc[32] = { 0 }, *Bs[32] = { 0 };
-		uint8_t *Ws[32] = { 0 };
+		struct charsiu_fp16_op op[64];
+		float *Xs[64] = { 0 }, *Ya[64] = { 0 }, *Yb[64] = { 0 };
+		float *Yc[64] = { 0 }, *Bs[64] = { 0 };
+		uint8_t *Ws[64] = { 0 };
 		struct charsiu_fp16_times t0t, t1t;
 		double wa = 0, wb = 0, cross = 0, tl = 0, tg = 0;
 		unsigned long c0, r0, s0, c1, r1, s1;
 		int failed = 0;
 
-		if (G > 32) G = 32;
+		if (G > 64) G = 64;
 		if (!fp) { printf("  could not open\n"); goto done; }
 		for (unsigned i = 0; i < G; i++) {
 			unsigned ni = n + 32 * i;
@@ -704,6 +704,58 @@ int main(int argc, char **argv)
 		       wb, wb == 0.0 ? "   <== EXACT" : "");
 		printf("  cells where the two arms differ: %.0f%s\n",
 		       cross, cross == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+		/*
+		 * ⚠ AND THE SAME OPS THROUGH WIDER ARRAYS. Attention's q rows
+		 * sit inside a [rows][n_head * hd] block and its output goes
+		 * back into one, so the group reads and writes with a row
+		 * stride rather than tightly. A stride that is applied to the
+		 * wrong axis does not fault -- it reads a neighbouring head's
+		 * numbers -- so it is checked against the tight arm rather
+		 * than against a tolerance.
+		 */
+		{
+			double sd = 0;
+			unsigned xs = k + 7, ys = 0;
+
+			for (unsigned i = 0; i < G; i++) {
+				unsigned ni = n + 32 * i;
+				float *xp = calloc((size_t)m * xs, sizeof(float));
+				float *yp;
+
+				ys = ni + 5;
+				yp = calloc((size_t)m * ys, sizeof(float));
+				if (!xp || !yp) { free(xp); free(yp); sd = -1; break; }
+				for (unsigned r = 0; r < m; r++)
+					memcpy(xp + (size_t)r * xs,
+					       Xs[i] + (size_t)r * k,
+					       k * sizeof(float));
+				op[i].X = xp; op[i].xstride = xs;
+				op[i].Y = yp; op[i].ystride = ys;
+			}
+			if (sd == 0 && charsiu_fp16_matmul_group(fp, op, G)) {
+				printf("  the strided group refused\n");
+				failed = 1;
+			}
+			for (unsigned i = 0; i < G && sd >= 0; i++) {
+				unsigned ni = n + 32 * i;
+
+				for (unsigned r = 0; r < m; r++)
+					for (unsigned c = 0; c < ni; c++)
+						if (op[i].Y[(size_t)r * op[i].ystride + c]
+						    != Ya[i][(size_t)r * ni + c])
+							sd += 1;
+			}
+			printf("  cells the strided arm differs in: %.0f%s\n",
+			       sd, sd == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+			if (sd != 0)
+				failed = 1;
+			for (unsigned i = 0; i < G; i++) {
+				free((void *)op[i].X);
+				free(op[i].Y);
+				op[i].X = Xs[i]; op[i].xstride = 0;
+				op[i].Y = Yb[i]; op[i].ystride = 0;
+			}
+		}
 		if (failed || cross != 0) {
 			printf("  not timing an arm that is not correct\n");
 			charsiu_fp16_close(fp);
@@ -848,18 +900,18 @@ int main(int argc, char **argv)
 		unsigned G = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
 		unsigned reps = argc > 5 ? (unsigned)atoi(argv[5]) : 8;
 		struct charsiu_fp16 *fp = charsiu_fp16_open();
-		struct charsiu_fp16_op op[32];
-		struct charsiu_fp16_w *W16[32] = { 0 };
-		float *Xs[32] = { 0 }, *Ya[32] = { 0 }, *Yb[32] = { 0 };
-		float *Yc[32] = { 0 }, *Bs[32] = { 0 };
-		uint8_t *Ws[32] = { 0 };
+		struct charsiu_fp16_op op[64];
+		struct charsiu_fp16_w *W16[64] = { 0 };
+		float *Xs[64] = { 0 }, *Ya[64] = { 0 }, *Yb[64] = { 0 };
+		float *Yc[64] = { 0 }, *Bs[64] = { 0 };
+		uint8_t *Ws[64] = { 0 };
 		struct charsiu_fp16_times t0t, t1t;
 		unsigned nbig = n * 2, ng = charsiu_weight_ngroup(CHARSIU_FP16);
 		double wa = 0, wb = 0, cross = 0, tc = 0, to = 0, tb = 0;
 		unsigned long s0, s1, c0, c1, r0, r1;
 		int failed = 0;
 
-		if (G > 32) G = 32;
+		if (G > 64) G = 64;
 		if (n % ng) {
 			printf("  n must be a multiple of %u for this arm\n", ng);
 			goto done;

@@ -1046,6 +1046,61 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
  * int8 weight tiling with 2 byte elements, which is what charsiu_weight_kgroup
  * currently returns for fp16 by inheritance rather than by measurement.
  */
+void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
+			    const float *k)
+{
+	struct charsiu_matmul mm = { 1, hd, nk, CHARSIU_FP16, CHARSIU_FP16 };
+	unsigned kg = charsiu_weight_kgroup(CHARSIU_FP16);
+	uint16_t *d = dst;
+	unsigned d0;
+
+	for (d0 = 0; d0 < hd; d0 += kg) {
+		size_t off = charsiu_w16_offset(&mm, pos, d0,
+						CHARSIU_W16_GROUP);
+		unsigned run = hd - d0 < kg ? hd - d0 : kg;
+		unsigned i;
+
+		if (off == (size_t)-1)
+			return;
+		for (i = 0; i < run; i++)
+			d[off / 2 + i] = charsiu_f2h(k[d0 + i]);
+	}
+}
+
+void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
+			    const float *v)
+{
+	struct charsiu_matmul mm = { 1, kv, hd, CHARSIU_FP16, CHARSIU_FP16 };
+	unsigned ng = charsiu_weight_ngroup(CHARSIU_FP16);
+	uint16_t *d = dst;
+	unsigned n0;
+
+	for (n0 = 0; n0 < hd; n0 += ng) {
+		size_t o0 = charsiu_w16_offset(&mm, n0, pos,
+					       CHARSIU_W16_GROUP);
+		unsigned run = hd - n0 < ng ? hd - n0 : ng;
+		size_t stride = 0;
+		unsigned i;
+
+		if (o0 == (size_t)-1)
+			return;
+		/* ⚠ the step between two output channels of one group, taken
+		 * from the offset function rather than restated: it is kgsz,
+		 * which depends on the padded k, and a second copy of that
+		 * arithmetic here is a second layout */
+		if (run > 1) {
+			size_t o1 = charsiu_w16_offset(&mm, n0 + 1, pos,
+						       CHARSIU_W16_GROUP);
+
+			if (o1 == (size_t)-1)
+				return;
+			stride = (o1 - o0) / 2;
+		}
+		for (i = 0; i < run; i++)
+			d[o0 / 2 + i * stride] = charsiu_f2h(v[n0 + i]);
+	}
+}
+
 size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
 			  unsigned k, enum charsiu_w16_layout layout)
 {

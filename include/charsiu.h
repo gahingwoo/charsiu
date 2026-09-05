@@ -267,6 +267,29 @@ static inline uint16_t charsiu_f2h(float f)
 	return (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
 }
 
+/*
+ * ONE POSITION OF A KV CACHE, straight into the buffer the hardware reads.
+ *
+ * These are the only two writes attention needs, and they exist here rather
+ * than in the runtime so the layout law lives in one file. Both take the run
+ * bases from charsiu_w16_offset itself and only assume that a run is
+ * contiguous (K) or evenly strided (V); tests/pack_f16w.c checks both against
+ * the per element definition on every shape.
+ *
+ *   krow: the scores matmul reads a (k = head_dim, n = positions) weight, so a
+ *         position is an OUTPUT CHANNEL and its head_dim values are a row.
+ *   vcol: the values matmul reads a (k = positions, n = head_dim) weight, so a
+ *         position is one element of every output channel: a column.
+ *
+ * dst is the whole buffer. Appending along positions is safe for krow while
+ * every group of 16 is full; vcol's k cannot grow, so its buffer is allocated
+ * at the context length and the matmul always runs there.
+ */
+void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
+			    const float *k);
+void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
+			    const float *v);
+
 /* Pack A[M][K] as real fp16, which is what int4 weights consume. No zero point:
  * a float carries its own sign, so pass the dequantised values. */
 void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,

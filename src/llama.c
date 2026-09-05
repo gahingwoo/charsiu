@@ -27,6 +27,7 @@
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
+#include "fp16plan.h"
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
@@ -56,6 +57,20 @@ static int cpu_plain(void)
  * is what it was before round 374. A layout change moves no values, so there
  * is nothing else that could tell the two apart and the round needs a control.
  */
+static void attn_npu_free(struct attn_npu *a);
+struct attn_block_job;
+static int attn_block_cpu(struct attn_block_job *j);
+
+/* both arms on the same rows, so the difference between them is a number */
+static int attn_npu_check(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_ATTN_NPU_CHECK") != NULL;
+	return v;
+}
+
 static int kv_posmajor(void)
 {
 	static int v = -1;
@@ -3236,6 +3251,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->bfreq);
 	free(s->bpl); free(s->bplg);
 
+	attn_npu_free(s->anpu);
 	free(s->att); free(s->batt); free(s->logits);
 	charsiu_act_free(&s->act);
 	if (s->pool.t && s->pool.n && getenv("CHARSIU_NPU_REPORT"))
@@ -3957,16 +3973,376 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 	}
 }
 
-static int attn_block(struct attn_block_job *j)
+/*
+ * ⚠⚠ ATTENTION ON THE NPU, IN FP16, WHICH IS HOW THE VENDOR RUNS IT.
+ *
+ * 56% of what the vendor's own model file asks this hardware to do is fp16,
+ * and 2908 of those dispatches carry oc = head_dim. charsiu has run attention
+ * on the CPU, where it is 30 to 52% of a prompt.
+ *
+ * The shape of it, and why each half is a group:
+ *
+ *   scores  X = the chunk's q rows for head h, m by head_dim
+ *           W = that head's K cache, a (k = head_dim, n = positions) weight
+ *           Y = m by positions
+ *   softmax on the CPU, in place, over [tlo, pos] with everything else zeroed
+ *   values  X = those probabilities, m by positions
+ *           W = that head's V cache, a (k = positions, n = head_dim) weight
+ *           Y = m by head_dim, straight back into the attention output
+ *
+ * Every head is independent of every other, so each half is ONE submit and one
+ * fence: 2 waits a layer where a loop would pay 2H. That is the whole reason
+ * the group exists; the board measured 8 to 19x for it.
+ *
+ * ⚠ THE TWO CACHES ARE SHAPED DIFFERENTLY AND ONLY ONE MAY GROW.
+ *
+ * A GROUP offset does not depend on n while every group of 16 output channels
+ * is full, and always depends on k. For the K cache a POSITION is an output
+ * channel, so it can be appended to and run at whatever multiple of 16 it has
+ * reached. For the V cache a position is part of the reduction, so its k
+ * cannot move: it is allocated at the context length and the matmul always
+ * runs there, with the probabilities past the last token left zero. That costs
+ * a fetch of the whole V surface every call and buys never repacking.
+ *
+ * ⚠ WHY THE PROBABILITIES SIT IN A SCRATCH WHOSE ROWS ARE THE CONTEXT LENGTH
+ * APART. They are the values matmul's activation, and that matmul runs at
+ * k = the context length, so a row must BE that long. It is zeroed once at
+ * allocation and only ever rewritten inside [0, npad), so the tail past the
+ * last token is zero for the life of the run without anyone clearing it.
+ *
+ * Sliding window layers need nothing special: the scores are computed for
+ * every column either way, and the softmax below already masks to
+ * [tlo, pos] and zeroes the rest, so a masked column multiplies V by zero.
+ */
+struct attn_npu {
+	struct charsiu_fp16 *f;
+	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
+	unsigned n_layer, nkv, hd, nk, kv, mmax;
+	unsigned char *dirty;               /* a layer with unflushed appends */
+	float *sc;                          /* [H][m][kv] probabilities */
+	size_t sc_cells;
+	unsigned long layers, fallbacks;
+	int off;                            /* tried and refused */
+};
+
+static int attn_npu_want(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_ATTN_NPU") != NULL;
+	return v;
+}
+
+static void attn_npu_free(struct attn_npu *a)
+{
+	unsigned i;
+
+	if (!a)
+		return;
+	if (a->f) {
+		for (i = 0; i < a->n_layer * a->nkv; i++) {
+			if (a->kb)
+				charsiu_fp16_w_free(a->f, a->kb[i]);
+			if (a->vb)
+				charsiu_fp16_w_free(a->f, a->vb[i]);
+		}
+		charsiu_fp16_close(a->f);
+	}
+	free(a->kb);
+	free(a->vb);
+	free(a->dirty);
+	free(a->sc);
+	free(a);
+}
+
+/*
+ * ⚠ ONE ATTEMPT, THEN NEVER AGAIN. Opening the device and allocating a few
+ * hundred buffer objects is not something to retry a token at a time, so a
+ * refusal is recorded in the handle and every later call reads it.
+ */
+static struct attn_npu *attn_npu_get(struct llama_state *s)
+{
+	const struct llama_model *m = s->m;
+	struct attn_npu *a;
+	unsigned hd, i, nbuf;
+	size_t mb;
+
+	if (s->anpu)
+		return s->anpu->off ? NULL : s->anpu;
+	if (!attn_npu_want() || !m)
+		return NULL;
+	a = calloc(1, sizeof(*a));
+	if (!a)
+		return NULL;
+	s->anpu = a;
+	a->off = 1;                       /* until everything below works */
+	/* the cache's stride, which is what the float cache is written at:
+	 * a window layer with a smaller head_dim refuses in attn_npu_layer
+	 * rather than being squeezed in beside it */
+	hd = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
+	a->hd = hd;
+	a->nkv = m->n_head_kv;
+	a->n_layer = m->n_layer;
+	a->nk = ((unsigned)s->n_ctx + 15u) & ~15u;
+	a->kv = ((unsigned)s->n_ctx + 31u) & ~31u;
+	/*
+	 * ⚠ THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
+	 * (k/32)*m up to 5120 -- measured, and the vendor's own file never
+	 * exceeds it -- and the values matmul's k is the context length, so a
+	 * 2048 context allows 80 rows a pass and a 4096 one allows 40.
+	 */
+	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
+	if (hd < 32 || a->nk < 32 || a->kv < 32 || !a->nkv || !a->mmax)
+		return NULL;
+	mb = (size_t)a->n_layer * a->nkv * ((size_t)hd * a->nk
+					    + (size_t)a->kv * hd) * 2;
+	{
+		const char *e = getenv("CHARSIU_ATTN_NPU_MB");
+		size_t cap = (size_t)(e ? atoi(e) : 2048) * 1024 * 1024;
+
+		if (mb > cap) {
+			fprintf(stderr, "charsiu: the fp16 KV mirror wants "
+				"%zu MB and the cap is %zu; set "
+				"CHARSIU_ATTN_NPU_MB or a smaller context\n",
+				mb / (1024 * 1024), cap / (1024 * 1024));
+			return NULL;
+		}
+	}
+	a->f = charsiu_fp16_open();
+	if (!a->f)
+		return NULL;
+	nbuf = a->n_layer * a->nkv;
+	a->kb = calloc(nbuf, sizeof(*a->kb));
+	a->vb = calloc(nbuf, sizeof(*a->vb));
+	a->dirty = calloc(a->n_layer, 1);
+	if (!a->kb || !a->vb || !a->dirty)
+		return NULL;
+	for (i = 0; i < nbuf; i++) {
+		a->kb[i] = charsiu_fp16_w_alloc(a->f, hd, a->nk);
+		a->vb[i] = charsiu_fp16_w_alloc(a->f, a->kv, hd);
+		if (!a->kb[i] || !a->vb[i]) {
+			fprintf(stderr, "charsiu: the fp16 KV mirror ran out "
+				"at buffer %u of %u\n", i, nbuf);
+			return NULL;
+		}
+	}
+	a->off = 0;
+	charsiu_note("attention: the fp16 mirror is open", a->n_layer, a->nkv);
+	return a;
+}
+
+/*
+ * One position of one head, into both caches, where llama.c already writes the
+ * float ones. The layouts are charsiu_fp16_pack_krow and _vcol; the runtime
+ * does not restate them.
+ */
+static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
+			    uint32_t hd, int pos, const float *k,
+			    const float *v)
+{
+	struct attn_npu *a = attn_npu_get(s);
+	unsigned i;
+
+	if (!a || pos < 0 || (unsigned)pos >= a->nk || (unsigned)pos >= a->kv)
+		return;
+	if (l >= a->n_layer || kh >= a->nkv || hd != a->hd)
+		return;
+	i = l * a->nkv + kh;
+	charsiu_fp16_pack_krow(charsiu_fp16_w_map(a->kb[i]), a->hd, a->nk,
+			       (unsigned)pos, k);
+	charsiu_fp16_pack_vcol(charsiu_fp16_w_map(a->vb[i]), a->kv, a->hd,
+			       (unsigned)pos, v);
+	a->dirty[l] = 1;
+}
+
+/*
+ * A whole layer of attention for a chunk of rows, or -1 to say the CPU should
+ * do it. Returning -1 is always safe; the float cache is written either way.
+ */
+static int attn_npu_layer(struct attn_block_job *j)
 {
 	struct llama_state *s = j->s;
+	struct attn_npu *a = attn_npu_get(s);
+	struct charsiu_fp16_op op[FP16_GROUP_MAX];
+	unsigned H = j->n_head, hd = j->hd, i, h, rb;
+	unsigned T, npad;
+
+	if (!a || j->n <= 0 || H > FP16_GROUP_MAX)
+		return -1;
+	if (hd != a->hd || j->l >= a->n_layer || j->nkv != a->nkv)
+		return -1;
+	T = (unsigned)(j->pos0 + j->n);
+	npad = (T + 15u) & ~15u;
+	if (T == 0 || npad > a->nk)
+		return -1;
+
+	/*
+	 * ⚠ THE CACHES GO TO THE DEVICE ONCE A LAYER, NOT ONCE A TOKEN. fini
+	 * is dma_sync_sgtable_for_device over the WHOLE buffer object -- the
+	 * board measured 6.5 GB/s -- so one per append would be the entire
+	 * cache per token. No prep: the hardware only ever reads these, so the
+	 * CPU's copy is never stale and there is nothing to invalidate.
+	 */
+	if (a->dirty[j->l]) {
+		for (i = 0; i < a->nkv; i++) {
+			charsiu_fp16_w_end(a->f, a->kb[j->l * a->nkv + i]);
+			charsiu_fp16_w_end(a->f, a->vb[j->l * a->nkv + i]);
+		}
+		a->dirty[j->l] = 0;
+	}
+
+	for (rb = 0; rb < (unsigned)j->n; rb += a->mmax) {
+		unsigned m = (unsigned)j->n - rb < a->mmax
+			   ? (unsigned)j->n - rb : a->mmax;
+		/*
+		 * ⚠⚠ THE SCRATCH IS INDEXED BY mmax AND NOT BY m, AND THE
+		 * DIFFERENCE IS A WRONG ANSWER.
+		 *
+		 * The zeros past the last token are what makes the values
+		 * matmul legal: it runs at k = the context length whatever the
+		 * prompt has reached, and the tail must contribute nothing.
+		 * They come from the calloc and survive because nothing ever
+		 * writes there. Index a head's block by the CURRENT m and a
+		 * chunk with fewer rows than the last one moves every row
+		 * boundary, so a row's tail lands on the previous chunk's
+		 * probabilities instead of on zero -- and every token after it
+		 * attends to positions that are not in its prompt. Fixed
+		 * strides, always mmax.
+		 */
+		size_t need = (size_t)H * a->mmax * a->kv;
+		size_t qstride = (size_t)H * hd;
+
+		if (a->sc_cells < need) {
+			free(a->sc);
+			a->sc = calloc(need, sizeof(*a->sc));
+			a->sc_cells = a->sc ? need : 0;
+			if (!a->sc)
+				return -1;
+		}
+		for (h = 0; h < H; h++) {
+			memset(&op[h], 0, sizeof(op[h]));
+			op[h].X = j->q + (size_t)rb * qstride + (size_t)h * hd;
+			op[h].xstride = (unsigned)qstride;
+			op[h].Wbuf = a->kb[j->l * a->nkv + h / j->gqa];
+			op[h].Y = a->sc + (size_t)h * a->mmax * a->kv;
+			op[h].ystride = a->kv;
+			op[h].m = m;
+			op[h].k = hd;
+			op[h].n = npad;
+		}
+		if (charsiu_fp16_matmul_group(a->f, op, H)) {
+			a->fallbacks++;
+			return -1;
+		}
+		for (h = 0; h < H; h++)
+			for (unsigned r = 0; r < m; r++) {
+				float *sr = a->sc
+					  + ((size_t)h * a->mmax + r) * a->kv;
+				int pos = j->pos0 + (int)rb + (int)r;
+				int tlo = j->swa && pos + 1 > j->n_swa
+					? pos + 1 - j->n_swa : 0;
+				int t;
+
+				/* ⚠ the scale the CPU arm applies inside
+				 * attn_dot, applied here on the way past */
+				for (t = 0; t < tlo; t++)
+					sr[t] = 0.0f;
+				for (t = tlo; t <= pos; t++)
+					sr[t] *= j->scale;
+				softmax(sr + tlo, pos + 1 - tlo);
+				for (t = pos + 1; t < (int)npad; t++)
+					sr[t] = 0.0f;
+			}
+		for (h = 0; h < H; h++) {
+			memset(&op[h], 0, sizeof(op[h]));
+			op[h].X = a->sc + (size_t)h * a->mmax * a->kv;
+			op[h].xstride = a->kv;
+			op[h].Wbuf = a->vb[j->l * a->nkv + h / j->gqa];
+			op[h].Y = j->out + (size_t)rb * qstride
+				+ (size_t)h * hd;
+			op[h].ystride = (unsigned)qstride;
+			op[h].m = m;
+			op[h].k = a->kv;
+			op[h].n = hd;
+		}
+		if (charsiu_fp16_matmul_group(a->f, op, H)) {
+			a->fallbacks++;
+			return -1;
+		}
+	}
+	a->layers++;
+	return 0;
+}
+
+static int attn_block(struct attn_block_job *j)
+{
 	int R = attn_block_rows(), n = j->n;
 
 	if (R <= 0 || n <= 0)
 		return 0;
 	if (R > n)
 		R = n;
+	/* ⚠ BEFORE either arm runs: the CPU one sizes its scores buffer from
+	 * j->R, and the check arm calls it directly */
 	j->R = R;
+	/*
+	 * ⚠⚠ THIS IS NOT A BIT EXACT SUBSTITUTION AND MUST NOT BE CHECKED AS
+	 * ONE. Every matmul the group runs was proved identical to the same
+	 * matmul alone, but the CPU arm carries the whole of attention in
+	 * fp32 and this carries the inputs in fp16, so the two agree to fp16
+	 * and not further. Tokens may differ where a logit is close.
+	 *
+	 * CHARSIU_ATTN_NPU_CHECK runs BOTH arms on the same rows and reports
+	 * how far apart they land, keeping the CPU's answer so the text stays
+	 * the reference text. That is the instrument for "is this attention
+	 * or is it noise"; comparing the sentences alone cannot tell a
+	 * rounding difference from a cache written in the wrong order.
+	 */
+	if (attn_npu_check()) {
+		size_t cells = (size_t)n * j->n_head * j->hd;
+		float *mine = malloc(cells * sizeof(float));
+
+		if (mine && !attn_npu_layer(j)) {
+			double worst = 0, ref = 0;
+			size_t i;
+
+			memcpy(mine, j->out, cells * sizeof(float));
+			memset(j->out, 0, cells * sizeof(float));
+			if (attn_block_cpu(j)) {
+				free(mine);
+				return -1;
+			}
+			for (i = 0; i < cells; i++) {
+				double d = fabs((double)mine[i]
+						- (double)j->out[i]);
+
+				if (d > worst)
+					worst = d;
+				if (fabs((double)j->out[i]) > ref)
+					ref = fabs((double)j->out[i]);
+			}
+			fprintf(stderr, "charsiu: fp16 attention layer %u, "
+				"%d rows: worst %.4g against a largest of "
+				"%.4g (%.2g relative)\n", j->l, n, worst, ref,
+				ref > 0 ? worst / ref : 0.0);
+			free(mine);
+			return 0;
+		}
+		free(mine);
+	} else if (!attn_npu_layer(j)) {
+		/* falling back is always safe: the float cache is written
+		 * either way and the CPU arm reads only it */
+		return 0;
+	}
+	return attn_block_cpu(j);
+}
+
+static int attn_block_cpu(struct attn_block_job *j)
+{
+	struct llama_state *s = j->s;
+	int R = j->R;
+
 	/* scores: [n_head][R][n_ctx], each head's block its own */
 	if (!s->batt || s->batt_rows < (unsigned)R) {
 		free(s->batt);
@@ -4792,6 +5168,13 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					       hd * sizeof(float));
 					memcpy(s->vcache + off, s->v + kh * hd,
 					       hd * sizeof(float));
+					/* ⚠ the fp16 mirror is written HERE and
+					 * not from the float cache: the same
+					 * source, the same instant, so the two
+					 * cannot drift by a rope or a norm */
+					attn_npu_append(s, l, kh, hd, pos,
+							s->k + kh * hd,
+							s->v + kh * hd);
 				}
 			if (attn_block_rows() > 0) {
 				/*
@@ -5346,6 +5729,12 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				       hd * sizeof(float));
 				memcpy(s->vcache + off, s->v + kh * hd,
 				       hd * sizeof(float));
+				/* the decode path writes the mirror too, or a
+				 * prompt continued after a generation would
+				 * read a cache with a hole in it */
+				attn_npu_append(s, l, kh, hd, pos,
+						s->k + kh * hd,
+						s->v + kh * hd);
 			}
 		}
 		STAGE(ST_ROPE);
