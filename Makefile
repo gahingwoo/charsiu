@@ -30,7 +30,8 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
      $(BUILD)/vattn_bench \
-     $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check
+     $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
+     $(BUILD)/fp16_plan
 
 $(BUILD):
 	@mkdir -p $(BUILD)

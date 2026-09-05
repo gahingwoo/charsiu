@@ -764,6 +764,39 @@ int main(int argc, char **argv)
 		       "   %.2fx\n", tg / (reps * G), tg / reps,
 		       tg > 0 ? tl / tg : 0.0);
 		printf("    %lu matmuls over %lu submits\n", c1 - c0, s1 - s0);
+		/*
+		 * ⚠ AND THE SAME GROUP BACK TO BACK, which is what a layer
+		 * loop does. The alternating arms above are the fair
+		 * comparison, but every single call in between rebuilds the
+		 * coefficients this unit caches -- so the arm that is fair to
+		 * the loop is unfair to the group, and the steady state needs
+		 * its own line.
+		 */
+		{
+			struct charsiu_fp16_times a, b;
+			double ts = now_ms();
+
+			charsiu_fp16_get_times(fp, &a);
+			for (unsigned r2 = 0; r2 < reps; r2++)
+				if (charsiu_fp16_matmul_group(fp, op, G))
+					failed = 1;
+			ts = now_ms() - ts;
+			charsiu_fp16_get_times(fp, &b);
+			printf("    grouped back to back  %.3f ms a matmul"
+			       "  (%.1f ms a round)   %.2fx\n",
+			       ts / (reps * G), ts / reps,
+			       ts > 0 ? tl / ts : 0.0);
+			printf("      wcopy %.3f  pack %.3f  coefs %.3f"
+			       "  emit %.3f  submit %.3f  fence %.3f"
+			       "  read %.3f ms\n",
+			       (b.wcopy - a.wcopy) / reps,
+			       (b.pack - a.pack) / reps,
+			       (b.coefs - a.coefs) / reps,
+			       (b.emit - a.emit) / reps,
+			       (b.submit - a.submit) / reps,
+			       (b.fence - a.fence) / reps,
+			       (b.read - a.read) / reps);
+		}
 		printf("    of a grouped round: wcopy %.3f  pack %.3f"
 		       "  coefs %.3f  emit %.3f  submit %.3f  fence %.3f"
 		       "  read %.3f ms\n",

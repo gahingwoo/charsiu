@@ -57,6 +57,26 @@ static void check(struct charsiu_fp16_op *ops, unsigned n)
 		fail++;
 		return;
 	}
+	/* the distinct (n, coefficient size) pairs, counted the slow way: the
+	 * plan claims to build exactly this many and no more */
+	{
+		unsigned want = 0;
+
+		for (i = 0; i < n; i++) {
+			unsigned seen = 0;
+
+			for (j = 0; j < i; j++)
+				if (ops[i].n == ops[j].n &&
+				    p.csz[i] == p.csz[j])
+					seen = 1;
+			want += !seen;
+		}
+		if (p.ncoef != want) {
+			printf("  %u coefficient regions for %u distinct "
+			       "shapes\n", p.ncoef, want);
+			fail++;
+		}
+	}
 	for (i = 0; i < n; i++) {
 		struct charsiu_matmul mm = { ops[i].m, ops[i].k, ops[i].n,
 					     CHARSIU_FP16, CHARSIU_FP16 };
@@ -75,15 +95,36 @@ static void check(struct charsiu_fp16_op *ops, unsigned n)
 			bad("a region runs past its buffer", i, i);
 		if (ops[i].n > p.nmax)
 			bad("nmax does not cover an op", i, i);
+		if (p.ncoef == 0 || p.ncoef > n)
+			bad("the coefficient regions were not counted", i, i);
 		for (j = 0; j < i; j++) {
+			int same = ops[i].n == ops[j].n &&
+				   p.csz[i] == p.csz[j];
+
 			if (overlap(p.woff[i], p.wsz[i], p.woff[j], p.wsz[j]))
 				bad("weights overlap", i, j);
 			if (overlap(p.ioff[i], p.isz[i], p.ioff[j], p.isz[j]))
 				bad("inputs overlap", i, j);
 			if (overlap(p.ooff[i], p.osz[i], p.ooff[j], p.osz[j]))
 				bad("outputs overlap", i, j);
-			if (overlap(p.coff[i], p.csz[i], p.coff[j], p.csz[j]))
+			/*
+			 * ⚠ COEFFICIENTS ARE THE ONE THING TWO OPS MAY SHARE,
+			 * and only when sharing is exact. Two ops with the same
+			 * n and the same size have byte identical coefficients
+			 * and point at one region; anything else must be
+			 * disjoint. A region that PARTLY overlaps another is
+			 * the failure this catches, and it is the one that
+			 * would return a plausible wrong number.
+			 */
+			if (same && p.coff[i] != p.coff[j])
+				bad("equal n did not share a coefficient "
+				    "region", i, j);
+			if (!same && overlap(p.coff[i], p.csz[i],
+					     p.coff[j], p.csz[j]))
 				bad("coefficients overlap", i, j);
+			if (p.coff[i] != p.coff[j] &&
+			    overlap(p.coff[i], p.csz[i], p.coff[j], p.csz[j]))
+				bad("coefficient regions partly overlap", i, j);
 		}
 	}
 }

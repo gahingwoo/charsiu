@@ -38,7 +38,13 @@ struct charsiu_fp16_plan {
 	size_t woff[FP16_GROUP_MAX], wsz[FP16_GROUP_MAX];
 	size_t ioff[FP16_GROUP_MAX], isz[FP16_GROUP_MAX];
 	size_t ooff[FP16_GROUP_MAX], osz[FP16_GROUP_MAX];
+	/* ⚠ coff MAY BE SHARED: two ops with the same n and the same
+	 * coefficient size have byte identical coefficients here, and the
+	 * board says building them twice is not free. See below. */
 	size_t coff[FP16_GROUP_MAX], csz[FP16_GROUP_MAX];
+	unsigned ncoef;                       /* distinct coefficient regions */
+	unsigned coefn[FP16_GROUP_MAX];       /* the n of each, in order made */
+	size_t coefoff[FP16_GROUP_MAX], coefsz[FP16_GROUP_MAX];
 	size_t wtot, itot, otot, ctot;
 	unsigned nops, nmax;
 };
@@ -64,6 +70,7 @@ static inline int charsiu_fp16_make_plan(const struct charsiu_fp16_op *ops,
 	if (!ops || !p || !nops || nops > FP16_GROUP_MAX)
 		return -1;
 	p->wtot = p->itot = p->otot = p->ctot = 0;
+	p->ncoef = 0;
 	p->nops = nops;
 	p->nmax = 0;
 	for (i = 0; i < nops; i++) {
@@ -80,7 +87,41 @@ static inline int charsiu_fp16_make_plan(const struct charsiu_fp16_op *ops,
 		p->woff[i] = p->wtot; p->wtot += charsiu_fp16_up4k(p->wsz[i]);
 		p->ioff[i] = p->itot; p->itot += charsiu_fp16_up4k(p->isz[i]);
 		p->ooff[i] = p->otot; p->otot += charsiu_fp16_up4k(p->osz[i]);
-		p->coff[i] = p->ctot; p->ctot += charsiu_fp16_up4k(p->csz[i]);
+		/*
+		 * ⚠⚠ ONE COEFFICIENT REGION PER DISTINCT n, NOT PER OP.
+		 *
+		 * This unit builds coefficients from a zero bias, zero weight
+		 * sums and unit scales, so their content depends on n and on
+		 * nothing else in the op -- and charsiu_build_coefs begins by
+		 * zeroing the whole buffer, which at the default 65536 element
+		 * bound is 262 kB. The first board round of the group measured
+		 * that at 0.48 to 1.29 ms of a round, up to 23% of it, for
+		 * sixteen byte identical copies. A layer of attention is H ops
+		 * of ONE shape, so this is H regions becoming 1.
+		 *
+		 * Keyed on the size as well as n because CHARSIU_COEF_ELEMS=0
+		 * asks for a k*n bound, and then two ops with the same n and
+		 * different k do not have the same buffer.
+		 */
+		{
+			unsigned c, found = 0;
+
+			for (c = 0; c < p->ncoef; c++)
+				if (p->coefn[c] == o->n &&
+				    p->coefsz[c] == p->csz[i]) {
+					p->coff[i] = p->coefoff[c];
+					found = 1;
+					break;
+				}
+			if (!found) {
+				p->coefn[p->ncoef] = o->n;
+				p->coefsz[p->ncoef] = p->csz[i];
+				p->coefoff[p->ncoef] = p->ctot;
+				p->coff[i] = p->ctot;
+				p->ctot += charsiu_fp16_up4k(p->csz[i]);
+				p->ncoef++;
+			}
+		}
 		if (o->n > p->nmax)
 			p->nmax = o->n;
 	}

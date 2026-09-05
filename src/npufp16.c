@@ -46,6 +46,11 @@ struct charsiu_fp16 {
 	size_t wsz, insz, obsz, coefsz, regsz;
 	unsigned long calls, refused, submits;
 	struct charsiu_fp16_times t;
+	/* what is currently sitting in the coefficient buffer, so a group
+	 * that asks for the same shapes twice does not build it twice */
+	unsigned gen, coef_gen, ncoef;
+	unsigned coefn[FP16_GROUP_MAX];
+	size_t coefoff[FP16_GROUP_MAX], coefsz_[FP16_GROUP_MAX];
 };
 
 static double now_ms(void)
@@ -95,6 +100,10 @@ static int want(struct charsiu_fp16 *f, size_t wsz, size_t insz, size_t obsz,
 	memset(&f->reg, 0, sizeof(f->reg));
 	f->wsz = wsz; f->insz = insz; f->obsz = obsz; f->coefsz = coefsz;
 	f->regsz = regsz;
+	/* the buffers moved, so whatever the coefficient cache remembers about
+	 * their contents is about a buffer that no longer exists */
+	f->gen++;
+	f->ncoef = 0;
 	if (charsiu_bo_alloc(f->dev, wsz, &f->wt) ||
 	    charsiu_bo_alloc(f->dev, insz, &f->in) ||
 	    charsiu_bo_alloc(f->dev, obsz, &f->ob) ||
@@ -213,6 +222,14 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 		charsiu_build_coefs(&job, zero, zero, f->coef.map);
 		charsiu_bo_fini(f->dev, &f->coef);
 		free(zero);
+		/* ⚠ AND THE GROUP'S CACHE NO LONGER DESCRIBES THIS BUFFER.
+		 * This writes its own coefficients at offset 0, which is where
+		 * a group's first region sits. Without this line a group that
+		 * ran before a single call and again after it would find its
+		 * bookkeeping intact, skip the rebuild, and multiply by
+		 * whatever the single call left there -- a wrong number with
+		 * nothing anywhere reporting an error. */
+		f->ncoef = 0;
 	}
 
 	job.input_addr = (uint32_t)f->in.dma_address;
@@ -352,11 +369,6 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	charsiu_bo_fini(f->dev, &f->in);
 	f->t.pack += now_ms() - t0;
 
-	t0 = now_ms();
-	zero = calloc(pl.nmax, sizeof(*zero));
-	if (!zero)
-		return -1;
-	charsiu_bo_prep(f->dev, &f->coef, 1000000000);
 	for (i = 0; i < nops; i++) {
 		memset(&job[i], 0, sizeof(job[i]));
 		job[i].cbuf_window = (unsigned)charsiu_cbuf_window();
@@ -373,11 +385,62 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		job[i].output_addr = (uint32_t)f->ob.dma_address + pl.ooff[i];
 		job[i].weight_addr = (uint32_t)f->wt.dma_address + pl.woff[i];
 		job[i].coef_addr = (uint32_t)f->coef.dma_address + pl.coff[i];
-		charsiu_build_coefs(&job[i], zero, zero,
-				    (uint8_t *)f->coef.map + pl.coff[i]);
 	}
-	charsiu_bo_fini(f->dev, &f->coef);
-	free(zero);
+
+	/*
+	 * ⚠⚠ THE COEFFICIENTS ARE THE SAME BYTES EVERY TIME, AND BUILDING
+	 * THEM WAS UP TO 23% OF A GROUP.
+	 *
+	 * charsiu_build_coefs starts by zeroing the whole buffer, which at the
+	 * default 65536 element bound is 262 kB, and this unit always feeds it
+	 * a zero bias, zero weight sums and unit scales -- so the result
+	 * depends on n and nothing else. The first board round measured 0.48
+	 * to 1.29 ms a round making up to sixteen identical copies of it.
+	 *
+	 * The plan already gives one region per distinct n. This builds each
+	 * region once, and then not at all: a second call with the same shapes
+	 * finds the same regions at the same offsets in a buffer that has not
+	 * moved, and the bytes it would write are the bytes already there. A
+	 * layer of attention calls this with one shape, twice a layer, every
+	 * layer, so the steady state is zero.
+	 */
+	t0 = now_ms();
+	{
+		int stale = f->coef_gen != f->gen || f->ncoef != pl.ncoef;
+		unsigned char built[FP16_GROUP_MAX] = { 0 };
+
+		for (unsigned c = 0; !stale && c < pl.ncoef; c++)
+			stale = f->coefn[c] != pl.coefn[c] ||
+				f->coefoff[c] != pl.coefoff[c] ||
+				f->coefsz_[c] != pl.coefsz[c];
+		if (stale) {
+			zero = calloc(pl.nmax, sizeof(*zero));
+			if (!zero)
+				return -1;
+			charsiu_bo_prep(f->dev, &f->coef, 1000000000);
+			for (i = 0; i < nops; i++) {
+				unsigned c;
+
+				for (c = 0; c < pl.ncoef; c++)
+					if (pl.coefoff[c] == pl.coff[i])
+						break;
+				if (c == pl.ncoef || built[c])
+					continue;
+				built[c] = 1;
+				charsiu_build_coefs(&job[i], zero, zero,
+					(uint8_t *)f->coef.map + pl.coff[i]);
+			}
+			charsiu_bo_fini(f->dev, &f->coef);
+			free(zero);
+			for (unsigned c = 0; c < pl.ncoef; c++) {
+				f->coefn[c] = pl.coefn[c];
+				f->coefoff[c] = pl.coefoff[c];
+				f->coefsz_[c] = pl.coefsz[c];
+			}
+			f->ncoef = pl.ncoef;
+			f->coef_gen = f->gen;
+		}
+	}
 	f->t.coefs += now_ms() - t0;
 
 	t0 = now_ms();
