@@ -2149,18 +2149,89 @@ static void rmsnorm(float *out, const float *x, const struct gguf_tensor *g,
 	}
 }
 
+static int fast_softmax(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_EXACT_SOFTMAX") == NULL && !cpu_plain();
+	return v;
+}
+
+/*
+ * ⚠⚠ THE LAST SCALAR expf LOOP IN THE ATTENTION, with charsiu_vexpq sitting
+ * in the header this file already includes.
+ *
+ * The serial split of a batched prompt on the board: scores 3.26, softmax
+ * 1.89, values 3.82 ms a row. A fifth of the attention, in three scalar passes
+ * with an expf AND a divide an element, between two passes that have been NEON
+ * since round 370.
+ *
+ * Three things here round differently from the scalar loop, and each is the
+ * trade the attention already made once: the maximum comes out of a lane wise
+ * reduction, the sum is accumulated in four partial lanes rather than one
+ * running total, and the normalisation multiplies by a single reciprocal
+ * instead of dividing n times. CHARSIU_EXACT_SOFTMAX is the arm that says
+ * whether any of that moved a token.
+ *
+ * ⚠ Short rows stay scalar. The first positions of a prompt softmax over one
+ * or two elements, and a vector prologue for those is slower than the loop it
+ * replaces.
+ */
 static void softmax(float *x, int n)
 {
-	float mx = x[0], sum = 0.0f;
+	float mx, sum = 0.0f;
+	int i = 0;
 
-	for (int i = 1; i < n; i++)
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_softmax() && n >= 8) {
+		float32x4_t mv = vdupq_n_f32(x[0]);
+		float32x4_t s0 = vdupq_n_f32(0.0f);
+		float32x4_t s1 = vdupq_n_f32(0.0f);
+		float32x4_t mxv, iv;
+		float inv;
+
+		for (; i + 4 <= n; i += 4)
+			mv = vmaxq_f32(mv, vld1q_f32(x + i));
+		mx = vmaxvq_f32(mv);
+		for (; i < n; i++)
+			if (x[i] > mx)
+				mx = x[i];
+		mxv = vdupq_n_f32(mx);
+		for (i = 0; i + 8 <= n; i += 8) {
+			float32x4_t a = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i),
+							        mxv));
+			float32x4_t b = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i + 4),
+							        mxv));
+
+			vst1q_f32(x + i, a);
+			vst1q_f32(x + i + 4, b);
+			s0 = vaddq_f32(s0, a);
+			s1 = vaddq_f32(s1, b);
+		}
+		sum = vaddvq_f32(vaddq_f32(s0, s1));
+		for (; i < n; i++) {
+			x[i] = expf(x[i] - mx);
+			sum += x[i];
+		}
+		inv = 1.0f / sum;
+		iv = vdupq_n_f32(inv);
+		for (i = 0; i + 4 <= n; i += 4)
+			vst1q_f32(x + i, vmulq_f32(vld1q_f32(x + i), iv));
+		for (; i < n; i++)
+			x[i] *= inv;
+		return;
+	}
+#endif
+	mx = x[0];
+	for (i = 1; i < n; i++)
 		if (x[i] > mx)
 			mx = x[i];
-	for (int i = 0; i < n; i++) {
+	for (i = 0; i < n; i++) {
 		x[i] = expf(x[i] - mx);
 		sum += x[i];
 	}
-	for (int i = 0; i < n; i++)
+	for (i = 0; i < n; i++)
 		x[i] /= sum;
 }
 
