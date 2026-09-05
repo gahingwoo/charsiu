@@ -327,3 +327,31 @@ run; the set of products is not. Channel 0 fires at `k = 0, 1` every time.
 one for an hour: the first slot sweep and an earlier `--map` run disagreed at
 the same shape, which read as "one of these instruments is lying". Both were
 telling the truth about different draws.
+
+### The sparse probe was invalid, and the answer survived it
+
+`--slots` leaves the weight buffer 99.99% zero, and this silicon has weight
+sparsity, so a fetch that skips zero blocks would produce exactly the drift it
+showed. `--bits` (every weight 1.0, `A[k] = 2^k`, so each channel's output is a
+bitmask of which k reached it) returned **0xffff on every channel** in three
+consecutive runs at K=16 N=8 and again at K=64 N=64 and K=256 N=64: coverage is
+complete, and the drift was the probe.
+
+`--bits` cannot answer the layout on its own -- with every weight 1.0 the sum
+is identical under any permutation -- so `--holes` asks it on a dense buffer:
+every weight 1.0 except one, and the channel that returns missing a bit names
+both halves of the hole.
+
+Across four runs and the two instruments, which have nothing in common:
+
+```
+holes2 (dense)   12/12 satisfy slot = 16n + k
+slotsA (sparse)  12/12
+slotsB (sparse)  12/12
+first  (sparse)  12/12
+TOTAL 48 points, 0 exceptions
+```
+
+Still open, and NOT a layout question: only 12 of 128 single-weight
+perturbations register at all, on the dense buffer too, and the set moves
+between runs. Every observation that carries layout information agrees.

@@ -191,8 +191,28 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  *   run 3   n=0 k=0,1   n=1 k=4,5    n=2 k=10,11 n=4 k=6,7    n=6 k=0,1  n=7 k=8,9
  *
  * The mapping is stable and correct in all three; the set of products is not.
- * Channel 0 fires at k=0,1 in every run. That drift is the next thing, and it
- * is NOT a reason to go back and try another layout.
+ * Channel 0 fires at k=0,1 in every run.
+ *
+ * ⚠⚠ AND THE SPARSE PROBE WAS NOT VALID, WHICH DID NOT CHANGE THE ANSWER.
+ * --slots leaves the buffer 99.99% zero, and this silicon has weight sparsity,
+ * so a fetch that skips zero blocks would behave exactly like that drift.
+ * --bits then set every weight to 1.0 with A[k] = 2^k: EVERY channel came back
+ * 0xffff, all sixteen terms, three runs running and again at K=64 N=64 and
+ * K=256 N=64. Coverage is COMPLETE and the sparse buffer was the artefact.
+ *
+ * --bits cannot answer the layout either -- with every weight 1.0 the sum is
+ * the same under any permutation -- so --holes asks it on a DENSE buffer:
+ * every weight 1.0 except one, and the channel that comes back missing a bit
+ * names both halves of the hole. Over four runs and two instruments that have
+ * nothing in common,
+ *
+ *     48 firing points, 0 exceptions to slot = n * k_eff + k
+ *
+ * so the layout is settled by an instrument the sparsity objection does not
+ * reach. What is NOT settled is why only 12 of 128 single-weight
+ * perturbations register at all, on the dense buffer too, with the set moving
+ * between runs. That is its own question and it is not a layout question:
+ * every observation that carries layout information agrees.
  */
 enum charsiu_w16_layout {
 	CHARSIU_W16_DENSE,
