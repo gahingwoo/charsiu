@@ -42,8 +42,11 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-if [ ! -e /dev/accel/accel0 ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
-	echo "NO /dev/accel/accel0 -- without the NPU the batched matmul never" >&2
+# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# minor, so the NPU can sit at accel1 or accel2 and a test that looks only
+# for accel0 refuses on a board that has one.
+if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
+	echo "NO /dev/accel/accel* -- without the NPU the batched matmul never" >&2
 	echo "runs, every chunk agrees, and the sweep reads as a pass. Run it" >&2
 	echo "on the board.  CHARSIU_ALLOW_NO_NPU=1 overrides." >&2
 	exit 1

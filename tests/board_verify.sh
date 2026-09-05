@@ -168,6 +168,16 @@ case $p in
    if wedged "phase 2"; then break; fi
    if [ $rc = 0 ] && grep -q "0 differing" "$OUT/verify-text.txt"; then
 	ok "every model's batched prompt matches its token loop"
+   elif ! grep -q "^model " "$OUT/verify-text.txt"; then
+	# ⚠⚠ COULD NOT RUN IS NOT THE SAME AS FAILED, and this branch used to
+	# say the second when it meant the first. board_text_all.sh refusing --
+	# no NPU node, no models, no binary -- also exits non-zero, and the
+	# round then reported nine models disagreeing when nothing had been
+	# compared at all. It cost an afternoon of hunting a correctness bug
+	# that was not there.
+	bad "phase 2 could not run: board_text_all.sh compared nothing"
+	sed -n '1,12p' "$OUT/verify-text.txt" | sed 's/^/     /'
+	break
    else
 	bad "a model's batched prompt does NOT match its token loop"
 	printf '     this stops the round: nothing below is worth reading.\n'
