@@ -4281,6 +4281,54 @@ static int attn_npu_layer(struct attn_block_job *j)
 	return 0;
 }
 
+/*
+ * ⚠⚠ THE ELEMENTWISE STAGES WERE THE LAST SINGLE THREADED THING IN A BATCHED
+ * PROMPT, AND ONE OF THEM IS 11% OF IT.
+ *
+ * The stage table for a 512 row prompt on Llama-3.2-1B: the matmuls 57%, the
+ * attention 27%, and `silu * up` 1.07 ms a row at 11.4% -- third largest, and
+ * a bare `for (r)` loop with charsiu_parallel_for sitting beside it. The
+ * attention has used the pool for 3.5x since the block work; this stage never
+ * did. Rows do not touch each other here: row r reads and writes its own nff
+ * floats of two buffers and nothing else.
+ *
+ * CHARSIU_ROW_POOL=0 is the control arm, because a pool call is a barrier and
+ * a stage can be too small to pay for one.
+ */
+struct silu_rows_job {
+	struct llama_state *s;
+	int gelu;
+	uint32_t nff;
+};
+
+static void silu_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct silu_rows_job *j = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++) {
+		float *a = j->s->bhb + r * j->nff;
+		const float *b = j->s->bhb2 + r * j->nff;
+
+		if (j->gelu)
+			gelu_mul(a, b, j->nff);
+		else
+			silu_mul(a, b, j->nff);
+	}
+}
+
+static int row_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROW_POOL");
+
+		v = !(e && *e == '0');
+	}
+	return v;
+}
+
 static int attn_block(struct attn_block_job *j)
 {
 	int R = attn_block_rows(), n = j->n;
@@ -5281,13 +5329,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					    NULL, NULL);
 		}
 		BSTAGE(ST_GATEUP);
-		for (int r = 0; r < n; r++) {
-			if (m->ffn_gelu)
-				gelu_mul(s->bhb + (size_t)r * nff,
-					 s->bhb2 + (size_t)r * nff, nff);
+		{
+			struct silu_rows_job sj = { s, m->ffn_gelu, nff };
+
+			if (row_pool() && n > 1)
+				charsiu_parallel_for(silu_rows, &sj,
+						     (uint64_t)n);
 			else
-				silu_mul(s->bhb + (size_t)r * nff,
-					 s->bhb2 + (size_t)r * nff, nff);
+				silu_rows(&sj, 0, (uint64_t)n);
 		}
 		BSTAGE(ST_SILU);
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
