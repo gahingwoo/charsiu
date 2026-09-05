@@ -2136,8 +2136,24 @@ static void rmsnorm(float *out, const float *x, const struct gguf_tensor *g,
 	 * far. Read it through gguf_row_f32 anyway rather than assuming.
 	 */
 	{
-		static float *buf;
-		static uint32_t bufn;
+		/*
+		 * ⚠⚠ _Thread_local, AND IT COST A WRONG ANSWER TO FIND OUT.
+		 *
+		 * This scratch was a plain function static, which is safe for
+		 * exactly as long as nothing calls rmsnorm from two threads.
+		 * The attention pool never did. The batched prompt's norm and
+		 * residual stages went on the same pool on 2026-09-06 and did,
+		 * and Qwen3 stopped being reproducible: ten runs of the same
+		 * seed gave eight of one sentence and two of another, where
+		 * the commit before gave ten of ten. Every thread was writing
+		 * the gain row into one buffer and reading its neighbour's --
+		 * and realloc can free it under them as well.
+		 *
+		 * It surfaced as "that model is nondeterministic anyway",
+		 * which is the reading that would have shipped it.
+		 */
+		static _Thread_local float *buf;
+		static _Thread_local uint32_t bufn;
 
 		if (bufn < n) {
 			buf = realloc(buf, n * sizeof(float));
