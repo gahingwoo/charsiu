@@ -186,3 +186,89 @@ answer.
 - **Nothing about correctness at M = 1.** That the vendor dispatches it is not proof
   the hardware is exact there. It is proof the vendor believes it is, which is a
   different and much cheaper thing to check on a board.
+
+## The 4940 fp16 streams are attention, and here is what they write
+
+Read 2026-09-05. The fp16 half of the file was counted long before this and
+called "its fp16 attention" on the strength of the shape of the thing; this
+section is what identifies it and what it takes to emit one.
+
+### It is attention
+
+2908 of the 4940 fp16 dispatches carry `oc = 64`, which is this model's
+`head_dim`. Their `ic` walks in steps of 32 -- the 2 byte feature atom -- and M
+is chosen so the input surface lands just under 4096 every single time:
+
+```
+ic 2688 M 48 surf 4032    ic 2848 M 46 surf 4094
+ic 2720 M 48 surf 4080    ic 2880 M 45 surf 4050
+ic 2752 M 47 surf 4042    ic 2912 M 45 surf 4095
+ic 2784 M 47 surf 4089    ic 4032 M 32 surf 4032
+```
+
+So `ic` is not a dimension of the model at all: it is a **context length**
+rounded up to the atom, which is why `ic = 1312` (41 * 32) matches nothing in
+the config. The remaining `oc` values -- 32, 96, 128, 160, 192, 224, 256, each
+sixteen times, which is the layer count -- are the `q.K^T` half, where `oc` is
+the growing context instead.
+
+Both halves of attention are on the NPU. **4940 of 8808 convolutions, 56% of
+everything the runtime submits, is attention** -- against 3328 int4 projections.
+
+### What an fp16 stream writes that an int4 one does not
+
+Every register written by an fp16 stream is also written by an int4 stream and
+the reverse, over all 8268 of them. The **register set is identical**; only
+values differ. Six are constant within fp16 and differ from int4:
+
+| register | fp16 | int4 |
+|---|---|---|
+| `CNA 0x100c` | `0x20200120` | `0x20600120` x1920, `0x00600120` x1408 |
+| `CNA 0x1094` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
+| `CNA 0x1110` | `0` | `0` x3200, `0x00200000` x128 |
+| `CNA 0x118c` | `0` | `0x004f004f` x768, `0` x512, `0x001f001f` x512 |
+| `DPU 0x401c` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
+| `DPU 0x4020` | `0` | `0x4f` x768, `0` x512, `0x1f` x512 |
+
+`0x1094` pairs with `DPU 0x401c` and `0x118c` with `DPU 0x4020` -- they carry
+the same values -- so the four are the weight **group** count and its minus
+one, and fp16 collapses them to one group and none, because a 16 bit weight
+carries its own exponent and wants no per group scale.
+
+⚠ This is what round 380 hit from the other side: it copied fp16's `0x1094`,
+`0x1098` and `0x118c` onto an int4 op, the board said no, and the op the values
+came from could not be named at the time. It can now, and the round's
+conclusion stands.
+
+### The weight buffer is dense
+
+Closed forms, exact over all 4940:
+
+```
+CNA 0x101c = ic * oc * 2      total weight bytes
+CNA 0x1020 = ic * 2           bytes per output channel
+CNA 0x1090 = ic / 8           the 2 byte feature atom is 8
+CNA 0x107c = ic - 1
+CNA 0x1024 = CORE 0x3020 = DPU 0x402c = oc - 1
+```
+
+`0x101c` and `0x1020` are the **true byte count** in every regime, checked
+across all 8308 dispatches that write them: 2.000 x `ic*oc` for fp16, 1.000 for
+int8, 0.500 for int4. No unit-of-two anywhere.
+
+So an fp16 weight buffer is exactly `oc` kernels of `ic` fp16 values, with no
+padding and no tiling overhead -- which is what `charsiu_weight_bytes()`
+already returns for `CHARSIU_FP16`.
+
+### What is still unknown
+
+The byte **order inside a kernel**. `charsiu_weight_kgroup()` returns 32 for
+anything that is not int4, which is int8's number inherited by fp16 as a guess,
+and `charsiu_weight_ngroup()` is in the same position. Nothing in a static
+model file can settle it: the fp16 "weights" here are the runtime KV cache, and
+address registers in a static file read 0.
+
+⚠ And there is no shortcut on a desk. The 30 vendor `.rknn` in the driver
+repository contain no fp16-weight convolution, and rknn-toolkit2 is not
+installed on this host, so one cannot be compiled here either. The tile has to
+be walked on the board with sparse maps, the way int4's was.

@@ -1179,6 +1179,27 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * identified -- ic=1312 matches no dimension of the model -- so three
 	 * registers were changed on the strength of an op nobody had named.
 	 *
+	 * 🏁 THEY HAVE A NAME NOW, 2026-09-05: THEY ARE ATTENTION. 2908 of the
+	 * 4940 fp16 dispatches carry oc = 64, which is Llama-3.2-1B's head_dim,
+	 * and their ic walks in steps of 32 with M chosen so the input surface
+	 * lands just under 4096 every time (ic 2688 M 48, ic 2848 M 46, ic 4032
+	 * M 32). ic = 1312 matches no dimension of the model because it is not
+	 * one: it is a CONTEXT LENGTH rounded up to the feature atom, 41 * 32.
+	 * The other oc values -- 32, 96, 128, 160, 192, 224, 256, each sixteen
+	 * times, which is the layer count -- are the q.K^T half, where oc is the
+	 * growing context.
+	 *
+	 * That makes the round's conclusion firmer rather than weaker, and it
+	 * closes the question rather than leaving it open. Counted across the
+	 * whole file, 0x1094 and 0x118c are CONSTANTS PER REGIME: fp16 holds
+	 * them at 1 and 0 in all 4940, int4 carries 0x60 or 0x80 and 0x4f004f
+	 * or 0x1f001f. They pair with DPU 0x401c and 0x4020, which hold the
+	 * same values -- so the four are the weight GROUP count and its minus
+	 * one, and fp16 collapses them to "one group" because a 16 bit weight
+	 * carries its own exponent and needs no per group scale. Round 380 took
+	 * fp16's values and put them on an int4 op: the same mistake 0x100c
+	 * above describes, copying a constant across regimes.
+	 *
 	 * ⚠ AND THE VALUES BELOW ARE NOT A GUESS. They are Mesa's generic
 	 * RK3576 encoder, rkt_regcmd.c, with inw = 1 and full_inh = M:
 	 *
