@@ -108,8 +108,16 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 		goto out;
 	}
 
+	/*
+	 * ⚠⚠ A SENTINEL, NOT ZEROS. --holes reported the entire output zero for
+	 * 116 of 128 single weight holes, and "the hardware computed zero" and
+	 * "the job never wrote" are the same four bytes when the buffer starts
+	 * at zero. This project has read the second as the first three times in
+	 * a week. 0xdeadbeef survives only if nothing was written.
+	 */
 	charsiu_bo_prep(dev, &ob, 1000000000);
-	memset(ob.map, 0, (size_t)m * n * 4);
+	for (unsigned i = 0; i < m * n; i++)
+		((uint32_t *)ob.map)[i] = 0xdeadbeefu;
 	charsiu_bo_fini(dev, &ob);
 	{
 		uint32_t ins[2] = { in.handle, wt.handle };
@@ -231,14 +239,37 @@ int main(int argc, char **argv)
 			raw[sl * 2] = raw[sl * 2 + 1] = 0;
 			if (run_raw(dev, m, k, n, A, raw, wsz, got))
 				break;
+			{
+				unsigned untouched = 0;
+
+				for (unsigned c = 0; c < n; c++)
+					untouched += got[c] == 0xdeadbeefu;
+				if (untouched == n) {
+					printf("  %-10u -> THE JOB WROTE NOTHING\n",
+					       sl);
+					continue;
+				}
+				if (untouched) {
+					printf("  %-10u -> %u of %u channels"
+					       " not written\n", sl, untouched, n);
+					said = 1;
+				}
+			}
 			for (unsigned c = 0; c < n; c++) {
 				float v = asf(got[c]);
-				unsigned long b = (v >= 0 && v < 1e9 &&
-						   v == (float)(unsigned long)v)
-						  ? (unsigned long)v : ~0ul;
+				unsigned long b = (got[c] == 0xdeadbeefu) ? ~0ul
+					: (v >= 0 && v < 1e9 &&
+					   v == (float)(unsigned long)v)
+					  ? (unsigned long)v : ~1ul;
 
 				if (b == full || b == ~0ul)
 					continue;
+				if (b == ~1ul) {
+					printf("  %-10u -> %u : %g, not an"
+					       " integer\n", sl, c, (double)v);
+					said = 1;
+					continue;
+				}
 				printf("  %-10u -> %u : 0x%lx", sl, c, full ^ b);
 				if (__builtin_popcountl(full ^ b) == 1)
 					printf(" so k=%d\n",
