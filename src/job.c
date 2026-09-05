@@ -1347,7 +1347,21 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * four. Two cores given the SAME CBUF configuration is the shape of
 	 * that.
 	 */
-	if (mm->wdtype == CHARSIU_INT4) {
+	/*
+	 * ⚠⚠ AND FP16 NEEDS IT TOO, which is the only thing left in the stream.
+	 * The vendor writes all five of these in its fp16 dispatches exactly as
+	 * it does in its int4 ones; this emitted them for int4 alone, so an
+	 * fp16 job left the block unset. After DPU 0x40b8's closed form went in,
+	 * a diff of our fp16 stream against the vendor's at ic=64 oc=1024 M=32
+	 * -- with acc_out matched, so the arms line up -- differed in these five
+	 * registers and nothing else.
+	 *
+	 * It is worth trying because fp16 is EXACT at m = 1 and wrong at every
+	 * m above it (K=256 N=64: m=1 exact, m=2 14.12, m=4 17.62, m=8 14,
+	 * m=32 14, m=80 16.25), and this block is the CBUF configuration, which
+	 * is what m changes the demands on.
+	 */
+	if (mm->wdtype == CHARSIU_INT4 || mm->wdtype == CHARSIU_FP16) {
 		unsigned r2;
 		(void)0;
 
