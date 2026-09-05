@@ -1853,8 +1853,32 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			g->busy_us / (double)g->submits, g->ndev,
 			g->submit_us / 1e3, g->fence_us / 1e3,
 			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3,
-			g->cpu_us / 1e3, g->call_us / 1e3,
-			(g->call_us - g->busy_us - g->pack_us) / 1e3);
+			g->cpu_us / 1e3, (g->call_us + g->bwall_us) / 1e3,
+			(g->call_us + g->bwall_us - g->busy_us
+			 - g->pack_us - g->bpack_us) / 1e3);
+	/*
+	 * ⚠⚠ AND IT SAYS SO WHEN THE ACCOUNTING DOES NOT CLOSE.
+	 *
+	 * This block printed "-2438 ms of them is neither hardware nor
+	 * packing" for a whole morning and nobody read the minus sign,
+	 * including the person who then quoted the 2.36 GB/s beside it as a
+	 * fact about the silicon. The cause: busy_us is incremented in THREE
+	 * places -- matvec, matvec_group and npu_matmul_inner -- and call_us
+	 * in only the first two. A batched prompt put every millisecond of its
+	 * hardware into the numerator and none into the denominator.
+	 *
+	 * The end to end figure above is call_us + bwall_us now, which is the
+	 * wall clock of BOTH entries, and the packing subtracted is both
+	 * packs. A remainder that is still negative means some other counter
+	 * covers a different set of calls, and that is worth a line of its own
+	 * rather than a number nobody checks the sign of.
+	 */
+	if (g->call_us + g->bwall_us - g->busy_us - g->pack_us
+	    - g->bpack_us < 0.0)
+		fprintf(stderr, "charsiu NPU: ⚠ that remainder is NEGATIVE, so"
+			" the hardware path and the wall clock are counting"
+			" different calls -- the rate above is not a fact"
+			" about the hardware\n");
 	/*
 	 * ⚠⚠ WHERE THE TIME GOES, SPLIT THREE WAYS INSTEAD OF DIVIDED BY A
 	 * SUBMIT COUNT THAT DOUBLE COUNTS THE CORES.
