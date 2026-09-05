@@ -1723,3 +1723,64 @@ right unit; attention on this hardware is not the right customer for it.
 
 Off by default, and with the flag unset four models produce text identical to
 the build from before any of this existed.
+
+## The morning after: the CPU stages nobody had looked at
+
+The fp16 attention round ended by closing a door, so the next one began by
+pricing the room. The batched stage table on the board, Llama-3.2-1B, a 512
+row prompt, governor pinned:
+
+```
+   matmuls (q k v, o, gate + up, down)   5.33 ms a row   56.7%
+   attention                             2.55 ms a row   27.1%
+   silu * up                             1.07 ms a row   11.4%
+   everything else                       0.44 ms a row    4.7%
+```
+
+Two things fell out of it immediately. Attention is 27% and not the 50% the
+README quotes -- that number is Qwen3's, which has 28 layers against this
+model's 16. And `silu * up`, third largest, was a bare `for (r)` loop with
+`charsiu_parallel_for` sitting beside it: the attention has used that pool for
+3.5x since the block work and this stage never had.
+
+Pooling it, and then the three smaller elementwise stages with it:
+
+```
+   CHARSIU_ROW_POOL=0   4919, 5002, 4932, 4859, 4890 ms
+   pooled               4584, 4537, 4507, 4354, 4554 ms      8.6% faster
+```
+
+`silu * up` went 1.07 to 0.24 ms a row, 4.5x -- better than the 3.5x the
+attention gets from the same pool.
+
+### The softmax, and the trade that was already the default
+
+What was left in the attention was the softmax: three scalar passes with an
+`expf` AND a divide an element, between two passes that have been NEON since
+round 370, with `charsiu_vexpq` in the header the file already includes.
+
+Vectorised, it is 3.8% of the whole prompt on the board, and every one of five
+runs beat every one of the five controls:
+
+```
+   CHARSIU_EXACT_SOFTMAX=1   4516, 4443, 4485, 4426, 4570 ms
+   vectorised                4328, 4280, 4309, 4366, 4299 ms
+```
+
+⚠ It moves tokens. On the development host, on a prose prompt, two of four
+models take a different branch. The two implementations were measured against
+each other over 2000 rows at ten widths first -- worst relative difference
+1.9e-06, which is fp32 rounding and not a defect -- and then the question that
+decides it was asked: **does the tree already ship this trade?** It does. The
+silu that has been the default for months uses the same `charsiu_vexpq`, and
+switching it off with `CHARSIU_EXACT_SILU` moves three of the same four models.
+
+On the board, both arms print the same sentence.
+
+### Where the prompt stands
+
+9.39 to 8.21 ms a row, 12.8% off a prompt, in two changes that touch no
+arithmetic the hardware does. What is left is 5.3 ms a row inside the NPU
+matmul entry -- 64% of the row now -- and the stage table has never said
+whether that is the hardware or the pack in front of it. It says so from this
+commit on.
