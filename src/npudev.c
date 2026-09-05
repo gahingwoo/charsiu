@@ -459,6 +459,8 @@ struct charsiu_npu {
 	int packpool;
 	unsigned packpool_min;
 	unsigned long bpack_pooled, bpack_serial;
+	int readfuse;
+	unsigned long bfused_groups, bfused_slices;
 	/*
 	 * ⚠ PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
 	 * 80: "pack" was 2.0 ms a row, 0.8 ms a call, and the fp16 packer moves
@@ -1492,6 +1494,11 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
 		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 64);
 	}
+	/* one pass over Y for every K slice a device holds. OFF until the
+	 * board prices it: it trades sequential Y round trips for several
+	 * scattered source streams at once. */
+	g->readfuse = getenv("CHARSIU_NPU_READ_FUSE") != NULL &&
+		      *getenv("CHARSIU_NPU_READ_FUSE") != '0';
 	/*
 	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
@@ -3959,6 +3966,128 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
  * whole buffer entry, including uneven splits, a source stride wider than k,
  * and a k that is not a multiple of the atom.
  */
+/*
+ * ⚠⚠ ONE PASS OVER Y FOR ALL THE K SLICES A DEVICE HOLDS.
+ *
+ * The read is the largest piece of a batched matmul on this model -- 2.27 ms
+ * of a 7.75 ms row -- and the note in read_rows already worked out why and
+ * what would fix it: "the gather moves about 403 MB at m = 32 and 1007 at
+ * m = 80 -- Y once per K slice, read and written ... it was never instruction
+ * bound ... the only lever left is fewer BYTES."
+ *
+ * A K slice is a partial sum. Every slice of one output range accumulates into
+ * the same columns of Y, so with s slices Y is read and written s times. This
+ * sums them in one pass and touches Y once. On Llama-3.2-1B the counters say
+ * 2240 slot reads over 1568 (device, range) pairs, so 672 round trips of
+ * m * sn * 4 bytes each way go away.
+ *
+ * ⚠ BIT EXACT, AND THAT IS THE WHOLE DESIGN. The unfused path computes
+ * y = c0, then y += c1, then y += c2, each rounding to float. This computes
+ * v = c0; v += c1; v += c2 in a float accumulator and stores once -- the same
+ * additions in the same order with the same rounding. A double accumulator
+ * would be more accurate and would NOT be this, so it is not used.
+ *
+ * ⚠ OFF UNTIL THE BOARD SAYS. Fusing trades s sequential Y round trips for s
+ * scattered source streams live at once, and this loop is already bandwidth
+ * bound with a 4x line amplification from 16 byte runs. Which side wins is a
+ * measurement. CHARSIU_NPU_READ_FUSE=1 turns it on.
+ */
+struct read_fused {
+	struct charsiu_npu *g;
+	const struct npu_entry *e;
+	const struct npu_slot *s0;      /* the first slice: n0, sn, the shape */
+	const float *fo[8];
+	unsigned ki[8], ns;
+	float *Y;
+	unsigned m, sn;
+	int grp, firstw;
+};
+
+static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct read_fused *c = ctx;
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	unsigned sn = c->sn, n4 = sn / 4, j, t;
+	int firstw = c->firstw;
+
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *yr = c->Y + (size_t)r * e->t->n + c->s0->n0;
+
+		for (j = 0; j < n4; j++) {
+			float v0, v1, v2, v3;
+
+			if (g->w4 && c->grp) {
+				const float *fp = c->fo[0] + mp[j];
+				const float *cp = c->s0->sc + j * 4;
+
+				v0 = fp[0] * cp[0]; v1 = fp[1] * cp[1];
+				v2 = fp[2] * cp[2]; v3 = fp[3] * cp[3];
+				for (t = 1; t < c->ns; t++) {
+					fp = c->fo[t] + mp[j];
+					v0 += fp[0] * cp[0]; v1 += fp[1] * cp[1];
+					v2 += fp[2] * cp[2]; v3 += fp[3] * cp[3];
+				}
+			} else if (g->w4) {
+				const float *fp = c->fo[0] + mp[j];
+
+				v0 = fp[0]; v1 = fp[1]; v2 = fp[2]; v3 = fp[3];
+				for (t = 1; t < c->ns; t++) {
+					fp = c->fo[t] + mp[j];
+					v0 += fp[0]; v1 += fp[1];
+					v2 += fp[2]; v3 += fp[3];
+				}
+			} else {
+				const int32_t *ip = (const int32_t *)c->fo[0]
+						  + mp[j];
+				float d1 = g->bd1[(size_t)c->ki[0] * c->m + r];
+
+				v0 = (float)ip[0] * d1; v1 = (float)ip[1] * d1;
+				v2 = (float)ip[2] * d1; v3 = (float)ip[3] * d1;
+				for (t = 1; t < c->ns; t++) {
+					ip = (const int32_t *)c->fo[t] + mp[j];
+					d1 = g->bd1[(size_t)c->ki[t] * c->m + r];
+					v0 += (float)ip[0] * d1;
+					v1 += (float)ip[1] * d1;
+					v2 += (float)ip[2] * d1;
+					v3 += (float)ip[3] * d1;
+				}
+			}
+			if (firstw) {
+				yr[j * 4 + 0] = v0; yr[j * 4 + 1] = v1;
+				yr[j * 4 + 2] = v2; yr[j * 4 + 3] = v3;
+			} else {
+				yr[j * 4 + 0] += v0; yr[j * 4 + 1] += v1;
+				yr[j * 4 + 2] += v2; yr[j * 4 + 3] += v3;
+			}
+		}
+		/* the tail a slice's width leaves over, the same way */
+		for (j = n4 * 4; j < sn; j++) {
+			float v = 0.0f;
+
+			for (t = 0; t < c->ns; t++) {
+				float u;
+
+				if (g->w4 && c->grp)
+					u = c->fo[t][mp[j / 4] + j % 4]
+					  * c->s0->sc[j];
+				else if (g->w4)
+					u = c->fo[t][mp[j / 4] + j % 4];
+				else
+					u = (float)((const int32_t *)c->fo[t])
+						[mp[j / 4] + j % 4]
+					  * g->bd1[(size_t)c->ki[t] * c->m + r];
+				v = t ? v + u : u;
+			}
+			if (firstw)
+				yr[j] = v;
+			else
+				yr[j] += v;
+		}
+	}
+}
+
 struct pack_groups_job {
 	const struct charsiu_matmul *mm;
 	const float *src;
@@ -4895,10 +5024,93 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * tensor, which means the caller's loop rather than
 			 * this one.
 			 */
+			/*
+			 * ⚠ THE FUSED PASS FIRST, and it walks the slots in
+			 * exactly the order the loop below would: n range
+			 * outermost, K slice ascending inside it, which is
+			 * what makes the sum bit identical. Anything it does
+			 * not take -- READ4 on, more than 8 slices on one
+			 * device, a range with a single slice to fuse -- falls
+			 * through to the per slot loop untouched.
+			 */
+			unsigned fused_ni = 0;
+
+			if (g->readfuse && !g->read4 && g->bmap) {
+				unsigned ni;
+
+				for (ni = 0; ni < e->n_slices; ni++) {
+					struct read_fused c;
+					unsigned i, cnt = 0, ntc = 0;
+
+					c.g = g; c.e = e; c.Y = Y; c.m = m;
+					c.s0 = NULL;
+					for (i = 0; i < e->count; i++) {
+						const struct npu_slot *s =
+							&g->slot[e->first + i];
+
+						if (s->di != d)
+							continue;
+						if (i % e->n_slices != ni) {
+							ntc++;
+							continue;
+						}
+						/*
+						 * ⚠ MORE THAN THE ARRAY HOLDS
+						 * MEANS DO NOT FUSE AT ALL. An
+						 * earlier cut kept the first
+						 * eight and let the per slot
+						 * loop skip the whole range,
+						 * which DROPS every slice past
+						 * the eighth -- a wrong answer
+						 * with nothing reporting one.
+						 */
+						if (cnt >= 8) {
+							cnt = 0;
+							break;
+						}
+						c.fo[cnt] = (const float *)
+							((uint8_t *)ob->bo[d].map
+							 + (size_t)ntc
+							 * g->bout_stride);
+						c.ki[cnt] = i / e->n_slices;
+						if (!cnt) c.s0 = s;
+						cnt++;
+						ntc++;
+					}
+					if (cnt < 2 || !c.s0)
+						continue;   /* nothing to fuse */
+					c.ns = cnt;
+					c.sn = c.s0->job.mm.n;
+					c.grp = tensor_grouped(g, e->t);
+					c.firstw = !g->bseen[c.s0->n0 / g->nmax];
+					g->bread_passes += cnt;
+					if (!((g->bseen_dev >> (d * 16))
+					      & (1u << (c.s0->n0 / g->nmax))))
+						g->bread_ranges++;
+					g->bseen_dev |= (uint64_t)1
+						<< (d * 16 + c.s0->n0 / g->nmax);
+					if (g->poolread == 1 ||
+					    (g->poolread == 2 &&
+					     (size_t)m * c.sn >= g->poolread_min))
+						charsiu_parallel_for(read_fused_rows,
+								     &c, m);
+					else
+						read_fused_rows(&c, 0, m);
+					g->bseen[c.s0->n0 / g->nmax] = 1;
+					g->bfused_groups++;
+					g->bfused_slices += cnt;
+					fused_ni |= 1u << ni;
+				}
+			}
 			nt = 0;
 			for (unsigned i = 0; i < e->count; i++) {
 				const struct npu_slot *s = &g->slot[e->first + i];
 				unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+
+				if (s->di == d && ((fused_ni >> (i % e->n_slices)) & 1u)) {
+					nt++;
+					continue;   /* the fused pass took it */
+				}
 				const float *fo;
 				const int32_t *io;
 				int grp = tensor_grouped(g, e->t);
