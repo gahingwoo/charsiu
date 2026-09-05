@@ -283,3 +283,47 @@ address registers in a static file read 0.
 repository contain no fp16-weight convolution, and rknn-toolkit2 is not
 installed on this host, so one cannot be compiled here either. The tile has to
 be walked on the board with sparse maps, the way int4's was.
+
+## And the answer to the one thing the file could not say
+
+The section above ends "the tile has to be walked on the board with sparse
+maps". It was, on 2026-09-05, and the answer is that there is no tile:
+
+**`slot = n * k_eff + k`, which is plain dense, output channel major.**
+
+`npu_fp16_test --slots` writes 1.0 into one slot of the weight buffer at a time
+and reads back which output channel it lands in and which `A[k]` it multiplied,
+with `A` a ramp. That is the hardware's own mapping read directly, with no
+candidate layout in the way -- which matters, because `--map`, the obvious
+instrument, places the weight at the (n, k) that a CHOSEN layout picks and so
+can only ever light up where we were already right.
+
+Three independent sweeps at K=16 N=8, eighteen firing slots between them, and
+every one satisfies that formula exactly.
+
+### Getting there took three register findings, each named by the board
+
+  1. every output `0x80808080`, the int8 zero point in all four bytes: the
+     OUTPUT STAGE was int8. `WIDE(bit)` is `w4_dpu || wide8` and `w4_dpu` was
+     `w4a16` alone. An fp16 job wants the same stage for the same reason w4a16
+     does, and every register it switches lands on the vendor's own fp16 value.
+  2. a weight of 1.0 against `A[0] = 1.0` returning **3600**, and `A[8] = 9.0`
+     returning **4320**: 3600 is `0x3c * 0x3c` and 4320 is `0x48 * 0x3c`, the
+     HIGH BYTES of the two fp16 patterns multiplied as int8. The output stage
+     had moved and the MULTIPLY had not -- `CORE 0x3018` takes the
+     `0x10000200` form for fp16, which is what the vendor writes in all 4940.
+  3. four more read straight off the file and exact over all 4940:
+     `CNA 0x1030 = (ic*2) << 16`, `CNA 0x1090 = ic/8`,
+     `DPU 0x4028 = oc/4 - 1`, `DPU 0x4030 = ((oc-1) << 16) | 0x310`.
+
+### What is still wrong
+
+Coverage, not layout. Only about 12 of the 128 products are accumulated -- six
+channels of eight, two consecutive `k` each -- and which ones changes from run
+to run with nothing else changed. The mapping is stable and correct in every
+run; the set of products is not. Channel 0 fires at `k = 0, 1` every time.
+
+⚠ That drift is not a reason to go back and try another layout. It looked like
+one for an hour: the first slot sweep and an earlier `--map` run disagreed at
+the same shape, which read as "one of these instruments is lying". Both were
+telling the truth about different draws.

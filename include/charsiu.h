@@ -168,6 +168,31 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  *   CHARSIU_W16_DENSE   kernel n is ic contiguous halves at n*k
  *   CHARSIU_W16_ATOM    the activation packer's shape, [k/8][n][8]
  *   CHARSIU_W16_GROUP   int8's ngroup/kgroup tiling with 2 byte elements
+ *
+ * 🏁 AND THE BOARD SAID DENSE, 2026-09-05. npu_fp16_test --slots writes 1.0
+ * into one SLOT of the buffer at a time and reads back which channel it lands
+ * in and which A[k] it multiplied, so it reads the hardware's own mapping with
+ * no candidate in the way. Three independent sweeps at K=16 N=8, eighteen
+ * firing slots between them, and every one of them satisfies
+ *
+ *     slot = n * k_eff + k
+ *
+ * exactly, which is CHARSIU_W16_DENSE. --map, which packs through this
+ * function, agrees: every cell that fires comes back in the right channel with
+ * the right A[k].
+ *
+ * ⚠⚠ WHAT IS STILL WRONG IS COVERAGE, NOT LAYOUT, and the two look alike from
+ * a distance. Only about 12 of the 128 products are accumulated at all, six
+ * channels of eight with two consecutive k each, and WHICH ones changes from
+ * run to run with nothing changed but the run:
+ *
+ *   run 1   n=0 k=0,1   n=1 k=10,11  n=3 k=6,7   n=4 k=14,15  n=6 k=4,5  n=7 k=8,9
+ *   run 2   n=0 k=0,1   n=1 k=8,9    n=3 k=0,1   n=4 k=12,13  n=6 k=4,5  n=7 k=14,15
+ *   run 3   n=0 k=0,1   n=1 k=4,5    n=2 k=10,11 n=4 k=6,7    n=6 k=0,1  n=7 k=8,9
+ *
+ * The mapping is stable and correct in all three; the set of products is not.
+ * Channel 0 fires at k=0,1 in every run. That drift is the next thing, and it
+ * is NOT a reason to go back and try another layout.
  */
 enum charsiu_w16_layout {
 	CHARSIU_W16_DENSE,
