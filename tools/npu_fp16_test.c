@@ -56,6 +56,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "charsiu.h"
 
@@ -272,6 +273,14 @@ static void reference(unsigned m, unsigned k, unsigned n,
 		}
 }
 
+static double now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 static float asf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
 int main(int argc, char **argv)
@@ -311,6 +320,7 @@ int main(int argc, char **argv)
 		 */
 		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 128;
 		unsigned wrote = 0, first_fail = 0;
+		double t0;
 
 		for (unsigned i = 0; i < m * k; i++)
 			A[i] = 1.0f;
@@ -318,6 +328,7 @@ int main(int argc, char **argv)
 			B[i] = 1.0f;
 		printf("%s, the same job %u times\n",
 		       getenv("CHARSIU_TEST_INT8") ? "int8" : "fp16", reps);
+		t0 = now_ms();
 		for (unsigned r = 0; r < reps; r++) {
 			unsigned untouched = 0;
 
@@ -337,6 +348,19 @@ int main(int argc, char **argv)
 		printf("\n  %u of %u wrote (# wrote, . nothing); first"
 		       " silent submit was number %u\n", wrote, reps,
 		       first_fail);
+		/*
+		 * ⚠ AND WHAT IT COSTS, because the whole reason for an fp16
+		 * matmul here is attention, and attention is only worth moving
+		 * if the hardware beats the 6 to 13 ms a row the CPU takes.
+		 * Timed over the submits that actually wrote; a wedged shape
+		 * would otherwise report the timeout as throughput.
+		 */
+		if (wrote) {
+			double el = now_ms() - t0;
+
+			printf("  %.3f ms a matmul over %u that wrote"
+			       " (%.1f ms wall)\n", el / wrote, wrote, el);
+		}
 		rc = 0;
 		goto done;
 	}
