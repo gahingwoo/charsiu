@@ -347,6 +347,7 @@ int main(int argc, char **argv)
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
+	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -360,6 +361,60 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doin) {
+		/*
+		 * ⚠⚠ THE FAULT IS IN THE ACTIVATION LAYOUT, AND --outmap FOUND
+		 * IT BY DUMPING RATHER THAN GUESSING.
+		 *
+		 * The output is flat and right: with B[c] = 2^c the raw
+		 * accumulator reads 2^0..2^7 at slots 0..7 and AGAIN at 64..71,
+		 * which is row 0 then row 1, m by n row major. So the read
+		 * order was never the problem and charsiu_acc_index was a wrong
+		 * turn.
+		 *
+		 * But with A[r] = 2^r / K and every weight 1, all 128 slots
+		 * read 1.5 -- the MEAN of the two rows. Each output row is
+		 * summing over k with half its terms taken from the other row's
+		 * data. charsiu_pack_input_f16 interleaves rows inside a k atom
+		 * ([k/8][m][8]); an fp16 weight job evidently wants something
+		 * else.
+		 *
+		 * These patterns say which. Each prints what row 0 and row 1
+		 * came back with, and the answer is in the ratios:
+		 *   1  only row 0 carries data      -> row1 nonzero means bleed
+		 *   2  only the first half of k     -> tells whether the split
+		 *                                      is by k position
+		 *   3  a single k, in row 0 only    -> the finest probe
+		 */
+		struct { const char *name; int mode; } pat[] = {
+			{ "row 0 only, all k", 0 },
+			{ "row 0 only, first half of k", 1 },
+			{ "row 0 only, k=0", 2 },
+			{ "row 0 only, last half of k", 3 },
+		};
+
+		for (unsigned i = 0; i < n * k; i++) B[i] = 1.0f;
+		printf("m=%u k=%u n=%u; weights all 1; each row should sum only"
+		       " its OWN k\n", m, k, n);
+		for (unsigned pi = 0; pi < 4; pi++) {
+			memset(A, 0, (size_t)m * k * sizeof(*A));
+			for (unsigned i = 0; i < k; i++) {
+				int on = pat[pi].mode == 0 ? 1
+				       : pat[pi].mode == 1 ? (i < k / 2)
+				       : pat[pi].mode == 2 ? (i == 0)
+				       : (i >= k / 2);
+				if (on) A[i] = 1.0f;
+			}
+			setenv("CHARSIU_READ_FLAT", "1", 1);
+			if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, got))
+				break;
+			printf("  %-30s row0 ch0 %-10g row1 ch0 %-10g\n",
+			       pat[pi].name, (double)asf(got[0]),
+			       m > 1 ? (double)asf(got[n]) : 0.0);
+		}
+		rc = 0;
+		goto done;
+	}
 	if (doout) {
 		/*
 		 * ⚠⚠ MEASURE THE OUTPUT ORDER, DO NOT GUESS IT.
