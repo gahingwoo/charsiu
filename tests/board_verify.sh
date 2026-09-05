@@ -513,7 +513,17 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # difference is not a performance result, it is the parallelisation being
    # wrong, and it is checked before the timing is read.
    n9=0; nmiss=0; ntx=0
-   ARMS9=serial
+   # ⚠⚠ THE ONE ARM IS THE SHIPPED ONE. This was `serial`, which sets
+   # CHARSIU_NPU_POOL_READ=0 and switches the size gate OFF -- so every
+   # number this phase has printed since the gate shipped is of a
+   # configuration nobody runs. It matters: on 2026-09-05 it put the read at
+   # 57.9% of Phi-3.5's matmul entry and 58.7% of SmolLM2-1.7B's, and both of
+   # those models are above the gate, so the shipped read is 17 to 20% smaller
+   # than what was printed. This phase's own note two paragraphs down
+   # complains about exactly this ("the split it printed was of a
+   # configuration nobody runs") about KMAX, and then did it again with the
+   # read. `ship` sets nothing and lets the gate decide.
+   ARMS9=ship
    [ "${READ_ARMS:-0}" = 0 ] || ARMS9="serial pool"
    for M in "$MODELS"/*Q4_0*.gguf; do
 	[ -r "$M" ] || continue
@@ -527,6 +537,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		case $arm in
 		pool)   E=CHARSIU_NPU_POOL_READ=1 ;;
 		serial) E=CHARSIU_NPU_POOL_READ=0 ;;   # explicit: unset is the size gate now
+		ship)   E= ;;                          # unset: the size gate decides
 		*)      E=CHARSIU_READ_DUMMY=1 ;;
 		esac
 		# shellcheck disable=SC2086
@@ -554,7 +565,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
 	    "$OUT/.ttft_out" "$OUT/.ttft_err" | head -1)
 	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
-	if [ "$ARMS9" = serial ]; then
+	if [ "$ARMS9" = serial ] || [ "$ARMS9" = ship ]; then
 		:
 	# ⚠⚠ THE TEXT, NOT THE REPORT. This compared the whole of stdout, and
 	# the stage table is printed there too, so the two arms differed on
