@@ -64,6 +64,10 @@ while [ "$i" -le "$N" ]; do
 		# ⚠ THE SECOND 'ms' IS THE BATCHED ONE. The first is the row at a
 		# time reference, which no arm here can move: reading it as the
 		# result made two arms look identical when one was 18% faster.
+		# ⚠ NO LINE IS AN ANSWER TOO. awk over an empty line prints nothing,
+		# `set --` then leaves $1 unset, and under set -u the script dies
+		# mid table: that is what happened when the NPU had moved to
+		# another accel node and every probe came back empty.
 		set -- $(printf '%s' "$line" | awk '{
 			b=""; p=""; r=""; f=""; n=0;
 			for (i=1;i<=NF;i++) {
@@ -73,6 +77,7 @@ while [ "$i" -le "$N" ]; do
 				if ($i=="fence") f=$(i+1);
 			}
 			print (b==""?"?":b), (p==""?"?":p), (r==""?"?":r), (f==""?"?":f) }')
+		[ "$#" -ge 4 ] || set -- "?" "?" "?" "?" 
 		rows=$(printf '%s' "$line" | sed -n 's/.*\([0-9]* of [0-9]*\).*/\1/p')
 		printf '%-6s %-5s %-12s %-6s %-6s %-7s %s\n' "$arm" "$i" "$1" "$2" "$3" "$4" "${rows:-?}"
 	done

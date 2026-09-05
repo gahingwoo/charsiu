@@ -115,7 +115,7 @@ int main(int argc, char **argv)
 			ref[i * n + j] = (int32_t)acc;
 		}
 
-	dev = charsiu_open("/dev/accel/accel0");
+	dev = charsiu_open(NULL);
 	if (!dev) {
 		printf("open failed\n");
 		return 1;

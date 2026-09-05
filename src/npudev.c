@@ -1154,10 +1154,10 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	if (!g)
 		return NULL;
 	g->qos_fd = -1;
-	g->dev[0] = charsiu_open("/dev/accel/accel0");
+	g->dev[0] = charsiu_open(NULL);
 	g->ndev = 1;
 	if (g->dev[0] && !getenv("CHARSIU_NPU_ONEDEV")) {
-		g->dev[1] = charsiu_open("/dev/accel/accel0");
+		g->dev[1] = charsiu_open(NULL);
 		if (g->dev[1])
 			g->ndev = 2;
 		else
