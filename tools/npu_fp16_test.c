@@ -171,6 +171,7 @@ int main(int argc, char **argv)
 	int domap = argc > 3 && !strcmp(argv[3], "--map");
 	int doslots = argc > 3 && !strcmp(argv[3], "--slots");
 	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
+	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -184,6 +185,75 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doholes) {
+		/*
+		 * ⚠⚠ THE ONE HOT PROBE WAS NOT VALID AND --bits IS WHY.
+		 *
+		 * --slots puts ONE non zero half in the weight buffer and
+		 * leaves the other 99.99% zero. Its firing set moved from run
+		 * to run and covered 12 slots of 128, which read as a coverage
+		 * defect. --bits then showed every channel summing all sixteen
+		 * k, three runs running, at three shapes: coverage is COMPLETE.
+		 * So the sparse buffer was the problem, not the hardware -- a
+		 * weight fetch that skips zero blocks would behave exactly like
+		 * that, and this silicon is documented to have sparsity.
+		 *
+		 * --bits cannot answer the layout on its own either: with every
+		 * weight 1.0 the sum is the same under ANY permutation.
+		 *
+		 * So: every weight 1.0 except ONE HOLE, and A[k] = 2^k. The
+		 * buffer stays dense, and the channel that comes back missing a
+		 * bit names both halves of the hole -- the channel is n and the
+		 * missing bit is k. One run per slot, and the answer does not
+		 * depend on any candidate layout.
+		 */
+		unsigned kk = k > 16 ? 16 : k;
+		unsigned full = (1u << kk) - 1u;
+		struct charsiu_matmul mm = { m, k, n, CHARSIU_FP16, CHARSIU_FP16 };
+		size_t wsz = charsiu_weight_bytes(&mm);
+		unsigned slots = (unsigned)(wsz / 2);
+		uint8_t *raw = calloc(wsz, 1);
+		uint16_t one = charsiu_float_to_half(1.0f);
+
+		if (!raw) goto done;
+		for (unsigned i = 0; i < k; i++)
+			A[i] = i < kk ? (float)(1u << i) : 0.0f;
+		printf("every weight 1.0 except one hole; A[k] = 2^k; full = 0x%x\n",
+		       full);
+		printf("  hole slot  -> channel : missing bit (= k)\n");
+		for (unsigned sl = 0; sl < slots; sl++) {
+			int said = 0;
+
+			for (size_t i = 0; i < wsz; i += 2) {
+				raw[i] = (uint8_t)(one & 0xff);
+				raw[i + 1] = (uint8_t)(one >> 8);
+			}
+			raw[sl * 2] = raw[sl * 2 + 1] = 0;
+			if (run_raw(dev, m, k, n, A, raw, wsz, got))
+				break;
+			for (unsigned c = 0; c < n; c++) {
+				float v = asf(got[c]);
+				unsigned long b = (v >= 0 && v < 1e9 &&
+						   v == (float)(unsigned long)v)
+						  ? (unsigned long)v : ~0ul;
+
+				if (b == full || b == ~0ul)
+					continue;
+				printf("  %-10u -> %u : 0x%lx", sl, c, full ^ b);
+				if (__builtin_popcountl(full ^ b) == 1)
+					printf(" so k=%d\n",
+					       __builtin_ctzl(full ^ b));
+				else
+					printf("   (not one bit)\n");
+				said = 1;
+			}
+			if (!said)
+				printf("  %-10u -> no channel changed\n", sl);
+		}
+		free(raw);
+		rc = 0;
+		goto done;
+	}
 	if (dobits) {
 		/*
 		 * ⚠⚠ ONE RUN FOR THE WHOLE COVERAGE MAP.
