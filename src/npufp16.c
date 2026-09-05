@@ -51,6 +51,10 @@ struct charsiu_fp16 {
 	unsigned gen, coef_gen, ncoef;
 	unsigned coefn[FP16_GROUP_MAX];
 	size_t coefoff[FP16_GROUP_MAX], coefsz_[FP16_GROUP_MAX];
+	/* the last group's layout, and whether its output buffer is still
+	 * held open for a caller reading the answers where they lie */
+	struct charsiu_fp16_plan last;
+	int held;
 };
 
 static double now_ms(void)
@@ -208,6 +212,7 @@ void charsiu_fp16_close(struct charsiu_fp16 *f)
 {
 	if (!f)
 		return;
+	charsiu_fp16_release(f);
 	charsiu_bo_free(f->dev, &f->reg);  charsiu_bo_free(f->dev, &f->coef);
 	charsiu_bo_free(f->dev, &f->ob);   charsiu_bo_free(f->dev, &f->in);
 	charsiu_bo_free(f->dev, &f->wt);
@@ -235,6 +240,10 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 			f->refused++;
 		return -1;
 	}
+	/* ⚠ BEFORE want(), which may free the buffer a borrowed answer is
+	 * still sitting in: releasing it afterwards would be a fini on a
+	 * handle that no longer exists */
+	charsiu_fp16_release(f);
 	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = m; job.mm.k = k; job.mm.n = n;
 	job.mm.wdtype = CHARSIU_FP16;
@@ -392,7 +401,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	struct charsiu_job job[FP16_GROUP_MAX];
 	struct charsiu_task task[FP16_GROUP_MAX];
 	struct charsiu_fp16_plan pl;
-	unsigned i, bad = 0;
+	unsigned i, bad = 0, borrowed = 0;
 	struct charsiu_joblist jl;
 	uint32_t ins[3 + FP16_GROUP_MAX], outs[1];
 	unsigned nin;
@@ -401,6 +410,9 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 
 	if (!f)
 		return -1;
+	/* a previous group's answers are still being read out of the buffer
+	 * this is about to overwrite */
+	charsiu_fp16_release(f);
 	/* the shapes, and where each op sits in the four shared buffers.
 	 * tests/fp16_plan.c walks this on a desk; nothing below recomputes it */
 	if (charsiu_fp16_make_plan(ops, nops, &pl)) {
@@ -468,18 +480,31 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	t0 = now_ms();
 	charsiu_bo_prep(f->dev, &f->in, 1000000000);
 	for (i = 0; i < nops; i++) {
-		uint8_t *d = (uint8_t *)f->in.map + pl.ioff[i];
+		/*
+		 * ⚠ THE BOUND, THE STORE AND THE ZEROING WERE ALL PER ELEMENT,
+		 * and this loop runs 262 thousand times at 32 ops.
+		 *
+		 * It was a call into another translation unit, a comparison
+		 * against the region size, and two byte stores an element, on
+		 * top of zeroing the whole region first. The board put it at
+		 * 1.69 ms a round. The bound is loop arithmetic, the store is
+		 * one aligned 16 bit write -- the region starts on a page --
+		 * the conversion is charsiu_f2h inline -- a native 16 bit
+		 * store, and this SoC is little endian, which is the same
+		 * bytes the two byte stores wrote -- and only the TAIL past
+		 * the activation needs zeroing, because that is the only part
+		 * the hardware reads that this does not write.
+		 */
+		uint16_t *d = (uint16_t *)((uint8_t *)f->in.map + pl.ioff[i]);
 		size_t nel = (size_t)ops[i].m * ops[i].k;
+		size_t cap = pl.isz[i] / 2;
+		const float *X = ops[i].X;
 
-		memset(d, 0, charsiu_fp16_up4k(pl.isz[i]));
-		for (size_t e = 0; e < nel; e++) {
-			uint16_t h = charsiu_float_to_half(ops[i].X[e]);
-
-			if ((e + 1) * 2 > pl.isz[i])
-				break;
-			d[e * 2] = (uint8_t)(h & 0xff);
-			d[e * 2 + 1] = (uint8_t)(h >> 8);
-		}
+		if (nel > cap)
+			nel = cap;
+		for (size_t e = 0; e < nel; e++)
+			d[e] = charsiu_f2h(X[e]);
+		memset(d + nel, 0, charsiu_fp16_up4k(pl.isz[i]) - nel * 2);
 	}
 	charsiu_bo_fini(f->dev, &f->in);
 	f->t.pack += now_ms() - t0;
@@ -664,9 +689,26 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			bad++;
 			continue;              /* this op wrote nothing */
 		}
-		memcpy(ops[i].Y, o, (size_t)cells * 4);
+		/*
+		 * ⚠ A NULL Y MEANS LEAVE IT WHERE IT IS. The board put the
+		 * copy out at 1.17 ms a round on the 80 row scores shape, and
+		 * a caller that is about to run a softmax over these numbers
+		 * reads them once either way -- the copy is a write and a
+		 * second read on top. charsiu_fp16_out hands back the address
+		 * and charsiu_fp16_release closes the buffer.
+		 */
+		if (ops[i].Y)
+			memcpy(ops[i].Y, o, (size_t)cells * 4);
+		else
+			borrowed = 1;
 	}
-	charsiu_bo_fini(f->dev, &f->ob);
+	f->last = pl;
+	if (borrowed) {
+		f->held = 1;
+	} else {
+		charsiu_bo_fini(f->dev, &f->ob);
+		f->held = 0;
+	}
 	f->t.read += now_ms() - t0;
 	if (bad) {
 		f->refused += bad;
@@ -674,6 +716,26 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	}
 	f->calls += nops;
 	return 0;
+}
+
+/*
+ * The answer of op i, where the hardware left it: m by n floats, row major,
+ * valid until the next call or charsiu_fp16_release. NULL if op i was given a
+ * Y of its own, or if the last call did not run.
+ */
+const float *charsiu_fp16_out(const struct charsiu_fp16 *f, unsigned i)
+{
+	if (!f || !f->held || i >= f->last.nops)
+		return NULL;
+	return (const float *)((const uint8_t *)f->ob.map + f->last.ooff[i]);
+}
+
+void charsiu_fp16_release(struct charsiu_fp16 *f)
+{
+	if (f && f->held) {
+		charsiu_bo_fini(f->dev, &f->ob);
+		f->held = 0;
+	}
 }
 
 void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,

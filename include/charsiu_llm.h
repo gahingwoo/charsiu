@@ -400,9 +400,18 @@ struct charsiu_fp16_op {
 	const float *X;
 	const void *W;                 /* NULL when Wbuf carries the weight */
 	struct charsiu_fp16_w *Wbuf;   /* NULL when W does */
-	float *Y;
+	float *Y;                      /* NULL to read it where it lies */
 	unsigned m, k, n;
 };
+
+/*
+ * The answer of op i where the hardware left it, m by n floats row major, when
+ * that op was given a NULL Y. Valid until the next call or the release. A
+ * caller that is about to reduce over these numbers -- a softmax, say -- reads
+ * them once either way, and the copy is a write and a second read on top.
+ */
+const float *charsiu_fp16_out(const struct charsiu_fp16 *f, unsigned i);
+void charsiu_fp16_release(struct charsiu_fp16 *f);
 
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			      const struct charsiu_fp16_op *ops, unsigned nops);

@@ -239,6 +239,34 @@ enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm);
 uint16_t charsiu_float_to_half(float f);
 float charsiu_half_to_float(uint16_t h);
 
+/*
+ * THE SAME CONVERSION, INLINE, for the loops that do millions of them.
+ *
+ * Packing a group's activations is 262 thousand conversions at 32 ops and the
+ * board measured 1.69 ms of it -- a call into another translation unit per
+ * element, and the call is a good part of the cost. This is the definition and
+ * charsiu_float_to_half is a one line wrapper around it, so the two cannot
+ * drift into two conversions: it truncates the mantissa and flushes subnormals
+ * to zero, which is what every fp16 buffer this project has ever checked
+ * against the hardware was built with.
+ */
+static inline uint16_t charsiu_f2h(float f)
+{
+	union { float f; uint32_t u; } v;
+	uint32_t sign, man;
+	int32_t exp;
+
+	v.f = f;
+	sign = (v.u >> 16) & 0x8000;
+	exp = (int32_t)((v.u >> 23) & 0xff) - 127 + 15;
+	man = v.u & 0x7fffff;
+	if (exp <= 0)
+		return (uint16_t)sign;
+	if (exp >= 0x1f)
+		return (uint16_t)(sign | 0x7c00);
+	return (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
+}
+
 /* Pack A[M][K] as real fp16, which is what int4 weights consume. No zero point:
  * a float carries its own sign, so pass the dequantised values. */
 void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,

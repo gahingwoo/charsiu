@@ -273,18 +273,11 @@ float charsiu_half_to_float(uint16_t h)
 	return v.f;
 }
 
+/* the definition is charsiu_f2h in charsiu.h; this is the same bytes for
+ * callers that want a symbol rather than an inline */
 uint16_t charsiu_float_to_half(float f)
 {
-	union { float f; uint32_t u; } v = { .f = f };
-	uint32_t sign = (v.u >> 16) & 0x8000;
-	int32_t exp = (int32_t)((v.u >> 23) & 0xff) - 127 + 15;
-	uint32_t man = v.u & 0x7fffff;
-
-	if (exp <= 0)
-		return (uint16_t)sign;
-	if (exp >= 0x1f)
-		return (uint16_t)(sign | 0x7c00);
-	return (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
+	return charsiu_f2h(f);
 }
 
 static size_t table_bytes(const struct charsiu_matmul *mm)

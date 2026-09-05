@@ -854,7 +854,7 @@ int main(int argc, char **argv)
 		uint8_t *Ws[32] = { 0 };
 		struct charsiu_fp16_times t0t, t1t;
 		unsigned nbig = n * 2, ng = charsiu_weight_ngroup(CHARSIU_FP16);
-		double wa = 0, wb = 0, cross = 0, tc = 0, to = 0;
+		double wa = 0, wb = 0, cross = 0, tc = 0, to = 0, tb = 0;
 		unsigned long s0, s1, c0, c1, r0, r1;
 		int failed = 0;
 
@@ -949,6 +949,38 @@ int main(int argc, char **argv)
 		       cross == 0 ? "   <== IDENTICAL, and the appending law"
 				    " holds on the hardware"
 				  : "  <== ⚠ the law or the buffer");
+		/*
+		 * ⚠ AND THE SAME ANSWERS WITHOUT THE COPY OUT. A NULL Y leaves
+		 * the result in the device buffer; charsiu_fp16_out points at
+		 * it. If borrowing were reading the wrong region it would show
+		 * here as another op's answer, which is why this compares
+		 * against the arm above rather than against a tolerance.
+		 */
+		{
+			double bd = 0;
+
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = NULL;
+			if (charsiu_fp16_matmul_group(fp, op, G)) {
+				printf("  the borrowing group refused\n");
+				failed = 1;
+			}
+			for (unsigned i = 0; i < G; i++) {
+				const float *o = charsiu_fp16_out(fp, i);
+
+				if (!o) { bd += 1; continue; }
+				for (size_t e = 0; e < (size_t)m * n; e++)
+					if (o[e] != Ya[i][e])
+						bd += 1;
+			}
+			charsiu_fp16_release(fp);
+			printf("  cells the borrowed answers differ in: %.0f%s\n",
+			       bd, bd == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+			if (bd)
+				failed = 1;
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = Yb[i];
+		}
 		if (failed || cross != 0) {
 			printf("  not timing an arm that is not correct\n");
 			charsiu_fp16_close(fp);
@@ -972,6 +1004,16 @@ int main(int argc, char **argv)
 			}
 			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
 			to += now_ms() - a;
+			a = now_ms();
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = NULL;
+			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
+			for (unsigned i = 0; i < G; i++)
+				(void)charsiu_fp16_out(fp, i);
+			charsiu_fp16_release(fp);
+			tb += now_ms() - a;
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = Yb[i];
 		}
 		charsiu_fp16_get_times(fp, &t1t);
 		charsiu_fp16_stats(fp, &c1, &r1);
@@ -983,6 +1025,9 @@ int main(int argc, char **argv)
 		printf("    weights owned    %.3f ms a matmul  (%.1f ms a round)"
 		       "   %.2fx\n", to / (reps * G), to / reps,
 		       to > 0 ? tc / to : 0.0);
+		printf("    owned, not copied out  %.3f ms a matmul"
+		       "  (%.1f ms a round)   %.2fx\n",
+		       tb / (reps * G), tb / reps, tb > 0 ? tc / tb : 0.0);
 		printf("    %lu matmuls over %lu submits, %lu refused\n",
 		       c1 - c0, s1 - s0, r1 - r0);
 		printf("    both arms together: wcopy %.3f  pack %.3f"
