@@ -4040,6 +4040,9 @@ static void attn_npu_free(struct attn_npu *a)
 
 	if (!a)
 		return;
+	if (a->layers || a->fallbacks)
+		fprintf(stderr, "charsiu: fp16 attention ran %lu layers and "
+			"fell back on %lu\n", a->layers, a->fallbacks);
 	if (a->f) {
 		for (i = 0; i < a->n_layer * a->nkv; i++) {
 			if (a->kb)
@@ -4174,7 +4177,10 @@ static int attn_npu_layer(struct attn_block_job *j)
 		return -1;
 	T = (unsigned)(j->pos0 + j->n);
 	npad = (T + 15u) & ~15u;
-	if (T == 0 || npad > a->nk)
+	/* ⚠ a matmul under the two byte feature atom on either axis is one
+	 * that wedged both cores, so the unit refuses it and so does this: a
+	 * prompt shorter than 32 positions runs on the CPU and always will */
+	if (T == 0 || npad < 32 || npad > a->nk)
 		return -1;
 
 	/*
