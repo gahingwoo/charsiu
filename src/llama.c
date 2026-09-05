@@ -3777,6 +3777,32 @@ static int attn_block_rows(void)
 		 * so the expf is not the next lever; the axpy's traffic through
 		 * L1 is. 0 is the row-at-a-time control; the pool is
 		 * CHARSIU_ATTN_BLOCK_POOL=0 to switch off on its own.
+		 *
+		 * ⚠ AND 8 WAS SWEPT, 2026-09-05, board_attn_block.sh -- because
+		 * "the axpy's traffic through L1" above predicts a wider block
+		 * keeps winning, and it does not. ms a row, two passes each,
+		 * alternating, governor pinned, text identical at every block:
+		 *
+		 *   block             4       8      16      32
+		 *   Qwen3-0.6B     7.81    6.62    6.64    6.62
+		 *                  7.88    7.21    7.29    6.84
+		 *   SmolLM2-135M   2.93    2.92    3.07    3.07
+		 *                  2.93    2.96    2.79    3.09
+		 *   gemma-3-1b     6.86    6.51    6.28    6.11
+		 *                  6.84    6.50    6.28    6.10
+		 *
+		 * 4 is worse everywhere, so 8 is already past the knee. Only
+		 * gemma-3-1b keeps falling, and its repeats agree to 0.01 ms, so
+		 * the 6.2% from 8 to 32 is real -- but attention is 41.9% of its
+		 * prompt, which makes it 2.6% of one model, against nothing on
+		 * the other two. Not worth moving the default.
+		 *
+		 * What that says is that the cost here is the arithmetic and not
+		 * the order the cache is read in, which is what the paragraph
+		 * above suspected and this measures. Attention gets materially
+		 * cheaper by leaving the CPU, not by being reordered on it: the
+		 * vendor runs both halves of it on the NPU in fp16, 4940 of the
+		 * 8808 dispatches in its own model file.
 		 */
 		v = e ? atoi(e) : 8;
 		if (v < 0)

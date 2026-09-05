@@ -34,6 +34,7 @@
 #include <math.h>
 
 #include "reusekey.h"
+#include "kslice.h"
 #include "overlap.h"
 #include "charsiu.h"
 #include "charsiu_llm.h"
@@ -384,6 +385,15 @@ struct charsiu_npu {
 	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
 	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
+	/*
+	 * ⚠ WHY A MISS MISSED. Phase 9 on 2026-09-05 reported Phi-3.5 as
+	 * "reused 0 times, packed anyway 2304 times when declared the same"
+	 * while every other model reused, and that one number has four
+	 * different fixes behind it. The four are counted apart so the next
+	 * round does not have to guess which: dropped, a different X, a
+	 * different shape, or this device not holding the K slices asked for.
+	 */
+	unsigned long reuse_why[4];   /* dropped, other X, other shape, slices */
 	size_t bin_stride, bout_stride;
 	/* the output buffers, one per geometry rather than one per tensor:
 	 * see the comment on struct npu_outbuf */
@@ -733,6 +743,7 @@ struct charsiu_npu {
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
 	int kfit;
+	int even_ks;      /* K slices of equal width, see slice_k() */
 	/*
 	 * ⚠⚠ WHETHER KFIT COULD FIRE AT ALL, which is not the same question
 	 * as whether it helped. The `ks--` below needs a REMAINDER: a model
@@ -769,6 +780,18 @@ struct charsiu_npu {
 	int poolread;              /* 0 never, 1 always, 2 when m * n >= poolread_min */
 	unsigned poolread_min;
 	unsigned long bread_pooled, bread_serial;   /* slots read each way */
+	/*
+	 * ⚠ HOW MANY TIMES Y IS WALKED, AND HOW FEW IT COULD BE. Every slot's
+	 * read is one pass over its own range of the caller's Y: the first
+	 * assigns and the K slices after it add. Fusing the slices a device
+	 * holds for one output range would make that one pass instead of
+	 * several, and whether that is worth writing depends entirely on how
+	 * the deal spread the slices -- one slice per device per range and
+	 * there is nothing to fuse. So count the passes and count the ranges
+	 * before touching the loop.
+	 */
+	unsigned long bread_passes, bread_ranges;
+	uint64_t bseen_dev;        /* (device, output range) pairs seen this call */
 	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
@@ -1369,6 +1392,35 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
 	/*
+	 * ⚠ EQUAL K SLICES, AND WHAT MADE IT WORTH ASKING. slice_k() gives
+	 * every slice KMAX and lets the last one take the remainder, so
+	 * Phi-3.5's K = 3072 at KMAX 2048 is 2048 + 1024 and Qwen2.5's
+	 * K = 8960 is 2048 x4 + 768. Two things follow from the unequal
+	 * widths, and phase 9 on 2026-09-05 measured the second:
+	 *
+	 *   - the two cores get unequal work on every K sliced tensor, and
+	 *     the fence waits for the wide one;
+	 *   - deal_pick balances by accumulated load, so a wide slice and a
+	 *     narrow one leave the loads uneven and the NEXT tensor gets the
+	 *     opposite assignment. The map flips per tensor, so a follower's
+	 *     slice is always on the device that does not hold it. Phi-3.5
+	 *     reused its packed input 0 times out of 2304 asks and gemma4 0
+	 *     of 528, and every one of those misses was counted as "the K
+	 *     slices are on the other device".
+	 *
+	 * Equal slices cost deal_pick the same load twice, so the assignment
+	 * is stable by construction and the two cores get equal work -- one
+	 * change for both, without touching the dealer or the reuse key.
+	 *
+	 * ⚠ OFF, AND THE BOARD IS WHY. Phase 2 is clean on nine models with it
+	 * on, so it is correct; it is just not worth anything. gemma4's 528
+	 * misses went to 0 and its prompt moved 30110 -> 29884 ms, which is
+	 * inside the spread, and Phi-3.5 did not move at all because at the
+	 * KMAX llama.c picks for it (1024) its slices were already even.
+	 * kslice.h has the whole result.
+	 */
+	g->even_ks = getenv("CHARSIU_NPU_EVEN_KS") != NULL;
+	/*
 	 * 🏁 2026-09-05: THE POOLED READ IS ON, ABOVE A SIZE. The note below
 	 * priced it when the read was 241 ms and the barrier 190 of that; at
 	 * today's shapes the read is the largest share of a batched matmul
@@ -1823,6 +1875,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		if (g->ndev > 1 && g->bwall_us > 0.0)
 			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
 				charsiu_npu_overlap_note());
+		if (g->bread_passes)
+			fprintf(stderr, "charsiu NPU: the read walked Y %lu times"
+				" over %lu (device, output range) pairs, so fusing"
+				" the K slices a device holds would save %lu of"
+				" them\n", g->bread_passes, g->bread_ranges,
+				g->bread_passes - g->bread_ranges);
 		if (g->bread_pooled + g->bread_serial)
 			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
 				" and %lu one thread (%s)\n",
@@ -2033,13 +2091,16 @@ static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
  * to agree exactly or a slice writes past the end of a buffer sized for fewer,
  * so the widths are computed here rather than written out twice.
  */
+static unsigned slice_k0(const struct charsiu_npu *g, uint64_t k, unsigned ks,
+			 unsigned ki)
+{
+	return charsiu_slice_k0(k, ks, ki, g->kmax, g->even_ks, g->kfit);
+}
+
 static unsigned slice_k(const struct charsiu_npu *g, uint64_t k, unsigned ks,
 			unsigned ki)
 {
-	/* ⚠ THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is more than
-	 * KMAX, and clamping it here would drop the tail of the tensor without
-	 * a word. */
-	return ki + 1 == ks ? (unsigned)(k - (uint64_t)ki * g->kmax) : g->kmax;
+	return charsiu_slice_kw(k, ks, ki, g->kmax, g->even_ks, g->kfit);
 }
 
 static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni)
@@ -2454,7 +2515,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	unsigned sid[2] = { 0, 0 };
 
 	for (unsigned ki = 0; ki < ks; ki++) {
-		unsigned k0 = ki * g->kmax;
+		unsigned k0 = slice_k0(g, t->k, ks, ki);
 		unsigned k = slice_k(g, t->k, ks, ki);
 
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
@@ -4070,6 +4131,27 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * third window state nothing on disk has ever shown -- so it has to be
 	 * searched for, not derived.
 	 *
+	 * 🏁 AND THERE IS NOTHING TO SEARCH FOR, at least not in this file.
+	 * The census above quoted 5120 as "its LARGEST SPLIT SAMPLE", which is
+	 * a sample and reads like one. The whole file, all 8808 convolutions
+	 * of Llama-3.2-1B-rk3576-w4a16 (tools/rkllm_regcmd.py, 2026-09-05):
+	 *
+	 *   max input surface   5120
+	 *   above 5120          0 dispatches
+	 *
+	 * and it holds that ceiling by LOWERING M AS K RISES, which is the
+	 * same trade this guard forces on us and not a workaround for it:
+	 *
+	 *   K 2048  ->  m 80   surface 5120
+	 *   K 4096  ->  m 40   surface 5120
+	 *   K 3968  ->  m 33   surface 4092
+	 *   K 3744  ->  m 35   surface 4095
+	 *
+	 * So 5120 is not a conservative reading of the vendor, it IS the
+	 * vendor, and KMAX 2048 at a chunk of 80 is its widest configuration
+	 * exactly. Whatever is above the line, the closed stack does not go
+	 * there either.
+	 *
 	 * ⚠⚠ 5120 IS MEASURED, AND ITS CAUSE IS NOT KNOWN. Read it as a fence
 	 * post, never as an explanation.
 	 *
@@ -4258,6 +4340,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * the read loop walks devices outermost, so ki = 1 can be read first.
 	 * "ki == 0 assigns" would have clobbered it.
 	 */
+	g->bseen_dev = 0;
 	if (g->bseen_n < e->n_slices) {
 		unsigned char *t2 = realloc(g->bseen, e->n_slices);
 
@@ -4329,10 +4412,22 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			    reuse_key_hit(&g->bin_key[d], X, m, e->t->k, zp, need);
 
 		if (g->reuse_ask) {
-			if (reuse)
+			const struct reuse_key *bk = &g->bin_key[d];
+
+			if (reuse) {
 				g->reuse_hits++;
-			else
+			} else {
 				g->reuse_misses++;
+				if (!bk->valid)
+					g->reuse_why[0]++;
+				else if (bk->x != X)
+					g->reuse_why[1]++;
+				else if (bk->m != m || bk->k != e->t->k ||
+					 bk->zp != zp)
+					g->reuse_why[2]++;
+				else
+					g->reuse_why[3]++;
+			}
 		}
 		if (!reuse)
 			g->bin_key[d].valid = 0;   /* until this device's pack lands */
@@ -4704,6 +4799,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						grp, !g->bseen[ni]
 					};
 
+					g->bread_passes++;
+					if (!((g->bseen_dev >> (d * 16)) & (1u << ni)))
+						g->bread_ranges++;
+					g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
 					     (size_t)m * sn >= g->poolread_min)) {
@@ -4896,10 +4995,12 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 }
 
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
-			     unsigned long *misses)
+			     unsigned long *misses, unsigned long why[4])
 {
 	*hits = g ? g->reuse_hits : 0;
 	*misses = g ? g->reuse_misses : 0;
+	for (unsigned i = 0; i < 4; i++)
+		why[i] = g ? g->reuse_why[i] : 0;
 }
 
 /*

@@ -186,3 +186,201 @@ answer.
 - **Nothing about correctness at M = 1.** That the vendor dispatches it is not proof
   the hardware is exact there. It is proof the vendor believes it is, which is a
   different and much cheaper thing to check on a board.
+
+## The 4940 fp16 streams are attention, and here is what they write
+
+Read 2026-09-05. The fp16 half of the file was counted long before this and
+called "its fp16 attention" on the strength of the shape of the thing; this
+section is what identifies it and what it takes to emit one.
+
+### It is attention
+
+2908 of the 4940 fp16 dispatches carry `oc = 64`, which is this model's
+`head_dim`. Their `ic` walks in steps of 32 -- the 2 byte feature atom -- and M
+is chosen so the input surface lands just under 4096 every single time:
+
+```
+ic 2688 M 48 surf 4032    ic 2848 M 46 surf 4094
+ic 2720 M 48 surf 4080    ic 2880 M 45 surf 4050
+ic 2752 M 47 surf 4042    ic 2912 M 45 surf 4095
+ic 2784 M 47 surf 4089    ic 4032 M 32 surf 4032
+```
+
+So `ic` is not a dimension of the model at all: it is a **context length**
+rounded up to the atom, which is why `ic = 1312` (41 * 32) matches nothing in
+the config. The remaining `oc` values -- 32, 96, 128, 160, 192, 224, 256, each
+sixteen times, which is the layer count -- are the `q.K^T` half, where `oc` is
+the growing context instead.
+
+Both halves of attention are on the NPU. **4940 of 8808 convolutions, 56% of
+everything the runtime submits, is attention** -- against 3328 int4 projections.
+
+### What an fp16 stream writes that an int4 one does not
+
+Every register written by an fp16 stream is also written by an int4 stream and
+the reverse, over all 8268 of them. The **register set is identical**; only
+values differ. Six are constant within fp16 and differ from int4:
+
+| register | fp16 | int4 |
+|---|---|---|
+| `CNA 0x100c` | `0x20200120` | `0x20600120` x1920, `0x00600120` x1408 |
+| `CNA 0x1094` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
+| `CNA 0x118c` | `0` | `0x004f004f` x768, `0` x512, `0x001f001f` x512 |
+| `DPU 0x401c` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
+| `DPU 0x4020` | `0` | `0x4f` x768, `0` x512, `0x1f` x512 |
+
+⚠ A sixth, `CNA 0x1110`, looked like a differing constant and is **not one**:
+`job.c` emits `job->weight_addr` there, and an address in a static file is an
+unpatched placeholder. It is listed here only so the next reader does not count
+it again.
+
+These four are the **surface geometry** registers, not anything about weights.
+`job.c` emits them as `inw * rows`, `ow * rows`, `((inw - 1) << 16) | (inh - 1)`
+and `ow - 1`. Holding them at 1, 0, 1, 0 therefore says the fp16 regime
+describes its window as **1 x 1**, with the count carried elsewhere -- which is
+consistent with the round 380 note's observation that the vendor writes M
+exactly into `0x1098`.
+
+⚠ An earlier reading of this called the four "the weight group count and its
+minus one, collapsed because a 16 bit weight carries its own exponent". That is
+WRONG and the emitter says so: they are the window, not the weights. The story
+was invented to fit four numbers before anyone looked at what writes them.
+
+⚠ This is what round 380 hit from the other side: it copied fp16's `0x1094`,
+`0x1098` and `0x118c` onto an int4 op, the board said no, and the op the values
+came from could not be named at the time. It can now, and the round's
+conclusion stands.
+
+### The weight buffer is dense
+
+Closed forms, exact over all 4940:
+
+```
+CNA 0x101c = ic * oc * 2      total weight bytes
+CNA 0x1020 = ic * 2           bytes per output channel
+CNA 0x1090 = ic / 8           the 2 byte feature atom is 8
+CNA 0x107c = ic - 1
+CNA 0x1024 = CORE 0x3020 = DPU 0x402c = oc - 1
+```
+
+`0x101c` and `0x1020` are the **true byte count** in every regime, checked
+across all 8308 dispatches that write them: 2.000 x `ic*oc` for fp16, 1.000 for
+int8, 0.500 for int4. No unit-of-two anywhere.
+
+So an fp16 weight buffer is exactly `oc` kernels of `ic` fp16 values, with no
+padding and no tiling overhead -- which is what `charsiu_weight_bytes()`
+already returns for `CHARSIU_FP16`.
+
+### What is still unknown
+
+The byte **order inside a kernel**. `charsiu_weight_kgroup()` returns 32 for
+anything that is not int4, which is int8's number inherited by fp16 as a guess,
+and `charsiu_weight_ngroup()` is in the same position. Nothing in a static
+model file can settle it: the fp16 "weights" here are the runtime KV cache, and
+address registers in a static file read 0.
+
+⚠ And there is no shortcut on a desk. The 30 vendor `.rknn` in the driver
+repository contain no fp16-weight convolution, and rknn-toolkit2 is not
+installed on this host, so one cannot be compiled here either. The tile has to
+be walked on the board with sparse maps, the way int4's was.
+
+## And the answer to the one thing the file could not say
+
+The section above ends "the tile has to be walked on the board with sparse
+maps". It was, on 2026-09-05, and the answer is that there is no tile:
+
+**`slot = n * k_eff + k`, which is plain dense, output channel major.**
+
+`npu_fp16_test --slots` writes 1.0 into one slot of the weight buffer at a time
+and reads back which output channel it lands in and which `A[k]` it multiplied,
+with `A` a ramp. That is the hardware's own mapping read directly, with no
+candidate layout in the way -- which matters, because `--map`, the obvious
+instrument, places the weight at the (n, k) that a CHOSEN layout picks and so
+can only ever light up where we were already right.
+
+Three independent sweeps at K=16 N=8, eighteen firing slots between them, and
+every one satisfies that formula exactly.
+
+### Getting there took three register findings, each named by the board
+
+  1. every output `0x80808080`, the int8 zero point in all four bytes: the
+     OUTPUT STAGE was int8. `WIDE(bit)` is `w4_dpu || wide8` and `w4_dpu` was
+     `w4a16` alone. An fp16 job wants the same stage for the same reason w4a16
+     does, and every register it switches lands on the vendor's own fp16 value.
+  2. a weight of 1.0 against `A[0] = 1.0` returning **3600**, and `A[8] = 9.0`
+     returning **4320**: 3600 is `0x3c * 0x3c` and 4320 is `0x48 * 0x3c`, the
+     HIGH BYTES of the two fp16 patterns multiplied as int8. The output stage
+     had moved and the MULTIPLY had not -- `CORE 0x3018` takes the
+     `0x10000200` form for fp16, which is what the vendor writes in all 4940.
+  3. four more read straight off the file and exact over all 4940:
+     `CNA 0x1030 = (ic*2) << 16`, `CNA 0x1090 = ic/8`,
+     `DPU 0x4028 = oc/4 - 1`, `DPU 0x4030 = ((oc-1) << 16) | 0x310`.
+
+### What is still wrong
+
+Coverage, not layout. Only about 12 of the 128 products are accumulated -- six
+channels of eight, two consecutive `k` each -- and which ones changes from run
+to run with nothing else changed. The mapping is stable and correct in every
+run; the set of products is not. Channel 0 fires at `k = 0, 1` every time.
+
+⚠ That drift is not a reason to go back and try another layout. It looked like
+one for an hour: the first slot sweep and an earlier `--map` run disagreed at
+the same shape, which read as "one of these instruments is lying". Both were
+telling the truth about different draws.
+
+### The sparse probe was invalid, and the answer survived it
+
+`--slots` leaves the weight buffer 99.99% zero, and this silicon has weight
+sparsity, so a fetch that skips zero blocks would produce exactly the drift it
+showed. `--bits` (every weight 1.0, `A[k] = 2^k`, so each channel's output is a
+bitmask of which k reached it) returned **0xffff on every channel** in three
+consecutive runs at K=16 N=8 and again at K=64 N=64 and K=256 N=64: coverage is
+complete, and the drift was the probe.
+
+`--bits` cannot answer the layout on its own -- with every weight 1.0 the sum
+is identical under any permutation -- so `--holes` asks it on a dense buffer:
+every weight 1.0 except one, and the channel that returns missing a bit names
+both halves of the hole.
+
+Across four runs and the two instruments, which have nothing in common:
+
+```
+holes2 (dense)   12/12 satisfy slot = 16n + k
+slotsA (sparse)  12/12
+slotsB (sparse)  12/12
+first  (sparse)  12/12
+TOTAL 48 points, 0 exceptions
+```
+
+Still open, and NOT a layout question: only 12 of 128 single-weight
+perturbations register at all, on the dense buffer too, and the set moves
+between runs. Every observation that carries layout information agrees.
+
+
+## Correction: the layout is GROUP, not dense
+
+Everything above about `slot = n * k_eff + k` was measured at K=16 N=8, and at
+that shape the dense and grouped layouts are **identical in all 128 cells**:
+ngroup 16 exceeds N=8 and kgroup 32 exceeds K=16, so the grouping degenerates
+to `16n + k`, which is what dense gives too. Sixty-two points across five runs
+and two independent instruments all agreed, and every one of them was blind to
+the question by construction.
+
+Re-taken at K=64 N=64, where the two differ, with `--holes` (every weight 1.0
+except one, `A[k] = 2^k`, so the channel that returns missing a bit names both
+halves of the hole). 1024 points, all 64 channels, k = 0..15:
+
+```
+CHARSIU_W16_GROUP     0 exceptions of 1024
+CHARSIU_W16_DENSE   960 exceptions of 1024
+```
+
+The base slot of channel n is `1024 * (n / 16) + 32 * (n % 16)` and k runs
+contiguously from it. That is ngroup 16, kgroup 32, two byte elements, which is
+what `charsiu_weight_ngroup()` and `charsiu_weight_kgroup()` already returned
+for fp16 by inheriting int8's numbers. **The inherited guess was correct and
+the measurement that contradicted it was taken where it could not see.**
+
+⚠ K=16 N=8 was chosen because it was small. It also wedges the NPU after two
+jobs. One bad choice of shape produced the wrong answer and the noise that hid
+it, and cost six wrong explanations of the noise.

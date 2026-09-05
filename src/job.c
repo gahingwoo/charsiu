@@ -1098,7 +1098,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * cost anything.
 	 */
 	emit(&e, CNA, 0x100c,
-	     (mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x00000000u) |
+	     (mm->wdtype == CHARSIU_INT4 ? 0x00600120u :
+	      mm->wdtype == CHARSIU_FP16 ? 0x00200120u : 0x00000000u) |
 	     (charsiu_effective_adtype(mm) == CHARSIU_FP16 ? 0x20000000u : 0u));
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
@@ -1131,8 +1132,17 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * same shape carries twice the kernel size: 0x80 against our 0x40 at
 	 * K=64. Both are right for their own precision.
 	 */
+	/*
+	 * ⚠ AND THE DOUBLING MUST NOT REACH FP16, whose bytes are already two.
+	 * The vendor writes (ic * 2) << 16 here in all 4940 of its fp16 streams,
+	 * exactly, and wbytes / n_pad IS ic * 2 for fp16 -- so doubling it again
+	 * asks for ic * 4. The comment above is about int8, where the kernel
+	 * really is carried at twice its byte size.
+	 */
 	emit(&e, CNA, 0x1030,
-	     ((uint32_t)(wbytes / n_pad * (mm->wdtype == CHARSIU_INT4 ? 1u : 2u))
+	     ((uint32_t)(wbytes / n_pad
+			 * (mm->wdtype == CHARSIU_INT4 ||
+			    mm->wdtype == CHARSIU_FP16 ? 1u : 2u))
 	      << 16) | (ow - 1));
 	emit(&e, CNA, 0x1034, ow * rows - 1);
 	/* Mesa writes 0x1038 a SECOND time here, after the geometry and before
@@ -1179,6 +1189,34 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * identified -- ic=1312 matches no dimension of the model -- so three
 	 * registers were changed on the strength of an op nobody had named.
 	 *
+	 * 🏁 THEY HAVE A NAME NOW, 2026-09-05: THEY ARE ATTENTION. 2908 of the
+	 * 4940 fp16 dispatches carry oc = 64, which is Llama-3.2-1B's head_dim,
+	 * and their ic walks in steps of 32 with M chosen so the input surface
+	 * lands just under 4096 every time (ic 2688 M 48, ic 2848 M 46, ic 4032
+	 * M 32). ic = 1312 matches no dimension of the model because it is not
+	 * one: it is a CONTEXT LENGTH rounded up to the feature atom, 41 * 32.
+	 * The other oc values -- 32, 96, 128, 160, 192, 224, 256, each sixteen
+	 * times, which is the layer count -- are the q.K^T half, where oc is the
+	 * growing context.
+	 *
+	 * That makes the round's conclusion firmer rather than weaker, and it
+	 * closes the question rather than leaving it open. Counted across the
+	 * whole file, 0x1094 and 0x118c are CONSTANTS PER REGIME: fp16 holds
+	 * them at 1 and 0 in all 4940, int4 carries 0x60 or 0x80 and 0x4f004f
+	 * or 0x1f001f, and DPU 0x401c and 0x4020 move with them.
+	 *
+	 * ⚠ AND THOSE FOUR ARE THE WINDOW, NOT THE WEIGHTS. The lines below
+	 * emit them as inw * rows, ow * rows, ((inw - 1) << 16) | (inh - 1) and
+	 * ow - 1, so fp16 holding them at 1, 1, 0, 0 says that regime describes
+	 * its window as 1 x 1 and carries the count elsewhere -- 0x1098, which
+	 * is the register this note already says the vendor writes M into. An
+	 * earlier reading of mine called them a weight GROUP count collapsing
+	 * because fp16 carries its own exponent; that was a story fitted to four
+	 * numbers without looking at what writes them, and this emitter refutes
+	 * it. Round 380 took fp16's window values and put them on an int4 op:
+	 * the same mistake 0x100c above describes, a constant carried across
+	 * regimes.
+	 *
 	 * ⚠ AND THE VALUES BELOW ARE NOT A GUESS. They are Mesa's generic
 	 * RK3576 encoder, rkt_regcmd.c, with inw = 1 and full_inh = M:
 	 *
@@ -1197,8 +1235,45 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * CHARSIU_CNA_1098 still reaches the one register whose value Mesa
 	 * rounds and regcmd.c does not.
 	 */
-	emit(&e, CNA, 0x1090, inw * 4);
-	emit(&e, CNA, 0x1094, inw * rows);      /* inw * full_inh */
+	/*
+	 * ⚠ FP16 COUNTS THE CONTRACTION AXIS HERE, NOT THE WINDOW. Exact over
+	 * all 4940 vendor fp16 streams: 0x1090 = ic / 8, the 2 byte feature
+	 * atom. inw * 4 is the int8/int4 form and gives 4 for a 1 wide window,
+	 * which is what this emitted for an fp16 job before.
+	 */
+	emit(&e, CNA, 0x1090,
+	     mm->wdtype == CHARSIU_FP16 ? mm->k / 8 : inw * 4);
+	/*
+	 * ⚠ FP16 DESCRIBES ITS WINDOW AS 1 x 1, and these four registers are
+	 * where it says so. Over all 4940 of the vendor's fp16 streams,
+	 * 0x1094 and DPU 0x401c are 1 and 0x118c and DPU 0x4020 are 0, without
+	 * exception, while its int4 streams carry the geometry these lines
+	 * compute. Nothing sets wdtype to FP16 yet, so every stream that runs
+	 * today is bit identical to before these branches existed.
+	 */
+	/*
+	 * ⚠⚠ THE FOUR fp16 WINDOW REGISTERS AND WHAT THEY COST. These carry
+	 * the vendor's constants -- 1, 0, 1, 0 -- and every one of them is a
+	 * quantity WITH rows IN IT: inw * rows, the window corners, ow * rows,
+	 * ow - 1. Telling the block the window is 1 x 1 and then handing it m
+	 * rows leaves it nowhere to put them, and the board says exactly that:
+	 * output row r comes back holding k in [r*K/m, (r+1)*K/m), so it splits
+	 * the CONTRACTION axis across the output rows instead of running m rows
+	 * over the whole of K (npu_fp16_test --inmap, m=2 and m=4, exact).
+	 *
+	 * CHARSIU_FP16_WINDOW=geom puts the computed geometry back so the two
+	 * can be compared on the board. The vendor's own fp16 dispatches run
+	 * M up to 128 with these constants, so the constants cannot be the
+	 * whole story -- but they are the only thing in the stream that carries
+	 * the row count, and a knob is how that gets settled rather than
+	 * argued.
+	 */
+	{
+		const char *fw = envq("CHARSIU_FP16_WINDOW");
+		int f16win = mm->wdtype == CHARSIU_FP16 &&
+			     !(fw && !strcmp(fw, "geom"));
+
+		emit(&e, CNA, 0x1094, f16win ? 1u : inw * rows);
 	emit(&e, CNA, 0x1098, envq("CHARSIU_CNA_1098")
 	     ? (uint32_t)strtoul(envq("CHARSIU_CNA_1098"), NULL, 0)
 	     : ((inw * rows + 3) & ~3u));
@@ -1218,8 +1293,11 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * it made no difference. That round ran on the HEIGHT axis, where M
 	 * moves nothing at all, so it did not test this and does not excuse it.
 	 */
-	emit(&e, CNA, 0x118c, wide ? (((inw - 1) << 16) | (inw - 1))
-				   : (((inw - 1) << 16) | (rows - 1)));
+	emit(&e, CNA, 0x118c,
+	     f16win ? 0u
+	     : wide ? (((inw - 1) << 16) | (inw - 1))
+		    : (((inw - 1) << 16) | (rows - 1)));
+	}
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
@@ -1291,7 +1369,21 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * four. Two cores given the SAME CBUF configuration is the shape of
 	 * that.
 	 */
-	if (mm->wdtype == CHARSIU_INT4) {
+	/*
+	 * ⚠⚠ AND FP16 NEEDS IT TOO, which is the only thing left in the stream.
+	 * The vendor writes all five of these in its fp16 dispatches exactly as
+	 * it does in its int4 ones; this emitted them for int4 alone, so an
+	 * fp16 job left the block unset. After DPU 0x40b8's closed form went in,
+	 * a diff of our fp16 stream against the vendor's at ic=64 oc=1024 M=32
+	 * -- with acc_out matched, so the arms line up -- differed in these five
+	 * registers and nothing else.
+	 *
+	 * It is worth trying because fp16 is EXACT at m = 1 and wrong at every
+	 * m above it (K=256 N=64: m=1 exact, m=2 14.12, m=4 17.62, m=8 14,
+	 * m=32 14, m=80 16.25), and this block is the CBUF configuration, which
+	 * is what m changes the demands on.
+	 */
+	if (mm->wdtype == CHARSIU_INT4 || mm->wdtype == CHARSIU_FP16) {
 		unsigned r2;
 		(void)0;
 
@@ -1332,7 +1424,22 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		const char *e31 = envq("CHARSIU_W4_301C");
 		int high = e31 && !strcmp(e31, "high");
 
-		emit(&e, CORE, 0x3018, w4v ? 0x10000200u : 0x10000001u);
+		/*
+		 * ⚠⚠ AND FP16 TAKES THE 0x200 FORM TOO. The board's own words:
+		 * with 0x10000001 here, a single fp16 weight of 1.0 against
+		 * A[0] = 1.0 came back 3600, and 3600 is 0x3c * 0x3c -- the
+		 * HIGH BYTES of the two fp16 patterns multiplied as int8. A[8]
+		 * = 9.0 gave 4320, which is 0x48 * 0x3c. So the output stage
+		 * was fp16 by then and the MULTIPLY was still int8.
+		 *
+		 * 0x10000200 is what the vendor carries in all 4940 of its fp16
+		 * streams and in its int4 ones alike. 0x301c stays on w4v: its
+		 * fp16 form is the high half, which is what the non-w4v branch
+		 * already emits, and the vendor agrees there.
+		 */
+		emit(&e, CORE, 0x3018,
+		     (w4v || mm->wdtype == CHARSIU_FP16) ? 0x10000200u
+							 : 0x10000001u);
 		emit(&e, CORE, 0x301c,
 		     wide ? ((uint32_t)(rows - 1) << 16) | (ow - 1)
 			  : ((w4v && !high) ? lines : ((uint32_t)lines << 16)));
@@ -1435,7 +1542,31 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * 0x100c is NOT in either group: it is the int4 weight format and
 	 * without it the run is not w4a16 at all.
 	 */
-	w4_dpu = w4a16 && !envq("CHARSIU_W4_NO_DPU");
+	/*
+	 * ⚠⚠ AND AN FP16 WEIGHT JOB WANTS THE SAME OUTPUT STAGE, because both
+	 * produce a 16 bit result and the int8 stage produces a byte. The board
+	 * said so first: an fp16 job with this false came back 0x80808080 in
+	 * every written word, which is the int8 zero point in all four bytes --
+	 * the DPU had been asked for an int8 output and gave one.
+	 *
+	 * It is not a guess. Every register the WIDE branches switch lands on
+	 * the value the vendor's own fp16 streams carry, all four of them:
+	 *
+	 *   0x4010  0xa0000002    (PROC_PRECISION 2, which is fp16)
+	 *   0x4044  2
+	 *   0x4050  0x00023333
+	 *   0x40ac / 0x40b0 / 0x40b4   0 / 1 / 0, which is no requant at all
+	 *
+	 * ⚠ AND THE FILTER THAT NEARLY HID IT. I diffed our fp16 stream against
+	 * the vendor's and dropped every register where the vendor's int4 value
+	 * equals its fp16 one, reasoning that those cannot be fp16 specific
+	 * since our int4 path differs there too and works. 0x4010 is exactly
+	 * such a register, and it was the one that mattered: our int4 path is
+	 * w4a16, which takes this branch, so it never differed. A filter over
+	 * what the VENDOR does cannot answer a question about what WE do.
+	 */
+	w4_dpu = (w4a16 || mm->wdtype == CHARSIU_FP16) &&
+		 !envq("CHARSIU_W4_NO_DPU");
 
 	/*
 	 * CHARSIU_WIDE8 forces parts of the w4a16 OUTPUT STAGE onto an int8
@@ -1514,10 +1645,19 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4010, WIDE(0) ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
-	emit(&e, DPU, 0x401c, ow * rows);       /* ow * full_oh */
-	emit(&e, DPU, 0x4020, ow - 1);
+	{
+		/* the other half of the fp16 window group; see 0x1094 */
+		const char *fw2 = envq("CHARSIU_FP16_WINDOW");
+		int f16w2 = mm->wdtype == CHARSIU_FP16 &&
+			    !(fw2 && !strcmp(fw2, "geom"));
+
+		emit(&e, DPU, 0x401c, f16w2 ? 1u : ow * rows);
+		emit(&e, DPU, 0x4020, f16w2 ? 0u : ow - 1);
+	}
 	emit(&e, DPU, 0x4024, wide ? rows - 1 : lines);
-	emit(&e, DPU, 0x4028, 0x00000000);
+	/* fp16: oc / 4 - 1, exact over all 4940 vendor fp16 streams */
+	emit(&e, DPU, 0x4028,
+	     mm->wdtype == CHARSIU_FP16 ? mm->n / 4 - 1 : 0x00000000u);
 	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
 					     and it changed nothing */
 	/*
@@ -1537,6 +1677,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     ((uint32_t)(charsiu_w4_paired(mm) ? 2 * mm->n - 1 : mm->n - 1) << 16) |
 	     (uint32_t)(envq("CHARSIU_DPU_4030")
 			? strtoul(envq("CHARSIU_DPU_4030"), NULL, 0)
+			/* fp16 reaches 0x310 through w4_dpu, like w4a16 */
 			: (WIDE(1) ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, wide ? (((uint32_t)(rows - 1) << 16) | (ow - 1))
 				   : ((lines << 16) | 0));
@@ -1714,6 +1855,31 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
 			   ? 3u * batch : (uint32_t)(ow * (2 * rows - rows));
 
+		/*
+		 * ⚠⚠ FP16 HAS A CLOSED FORM AND IT IS THE LAST REGISTER THAT
+		 * DIFFERED. With acc_out set -- which is what the fp16 probe
+		 * submits -- our stream matched the vendor's on every register
+		 * but this one, at BOTH attention shapes:
+		 *
+		 *   ic 512  oc 64   M 32   ours 0x60   vendor 0xfffffe13
+		 *   ic 64   oc 1024 M 32   ours 0x60   vendor 0xffffe103
+		 *
+		 * and (oc / 4 + 3) - (M * oc) / 4 reproduces the vendor's value
+		 * on ALL 4940 of its fp16 streams, exactly. It is fp16's: the
+		 * same form matches only 512 of its 3328 int4 streams, so the
+		 * int4 and acc_out arms above keep the values this board
+		 * measured for them.
+		 *
+		 * ⚠ AND THE DIFF THAT FOUND IT HAD BEEN COMPARING THE WRONG ARM
+		 * ALL EVENING. emit_job leaves acc_out OFF unless
+		 * CHARSIU_ACC_OUT is set, while npu_fp16_test sets it, so every
+		 * stream comparison before this one was of a stream nobody
+		 * submitted. Six registers of difference became one when the
+		 * dump was told to match the submit.
+		 */
+		if (mm->wdtype == CHARSIU_FP16)
+			v = (uint32_t)((int32_t)(mm->n / 4 + 3)
+				       - (int32_t)((mm->m * mm->n) / 4));
 		if (e8b)
 			v = (uint32_t)strtoul(e8b, NULL, 0);
 		emit(&e, DPU, 0x40b8, v);

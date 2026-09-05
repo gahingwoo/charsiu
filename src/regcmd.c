@@ -245,14 +245,39 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	emit(&e, CORE, 0x3004, 0x0000000e);
 
 	/*
-	 * NOT DECODED. The vendor carries 0x00600120 on its int4 projections
-	 * and 0x20200120 on its fp16 attention, so it is at least partly a
-	 * precision field, and the low half is the same in both. Copied rather
-	 * than derived, and marked as such: emitting 0 here is known wrong, and
-	 * a constant we cannot explain is the next thing to explain.
+	 * THE PRECISION REGISTER, and this was two constants copied out of the
+	 * vendor's int4 and fp16 streams with "emitting 0 here is known wrong"
+	 * written beside them. Both halves of that are refuted by the vendor's
+	 * own file, counted over every convolution in
+	 * Llama-3.2-1B-rk3576-w4a16 (2026-09-05):
+	 *
+	 *   int8 weights                       0x00000000    40
+	 *   int4 weights                       0x00600120  1408
+	 *   int4 weights, 16 bit activations   0x20600120  1920
+	 *   fp16 weights, 16 bit activations   0x20200120  4940
+	 *
+	 * So zero is what int8 carries, in all 40 of them, and job.c has had
+	 * that decoded for a while -- this emitter kept sending an int8 dump
+	 * the FP16 constant, which makes an int8 stream diff against the vendor
+	 * show a difference that is this line's and not the stream's. It also
+	 * sent plain 0x00600120 for int4 at 16 bit activations, which is
+	 * charsiu's own w4a16 shape and 1920 of the vendor's dispatches.
+	 *
+	 * ⚠ CHECKED AGAINST THE FILE, NOT AGAINST emit_dump. The note further
+	 * down this function is about exactly that mistake: emit_dump IS this
+	 * function, so it cannot fail a check on it. The four rows above are
+	 * read out of the .rkllm with tools/rkllm_regcmd.py, and the four cases
+	 * below reproduce all four.
 	 */
-	emit(&e, CNA, 0x100c,
-	     mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x20200120u);
+	{
+		uint32_t prec = mm->wdtype == CHARSIU_INT4 ? 0x00600120u
+			      : mm->wdtype == CHARSIU_FP16 ? 0x00200120u
+			      : 0x00000000u;
+
+		if (charsiu_effective_adtype(mm) == CHARSIU_FP16)
+			prec |= 0x20000000u;
+		emit(&e, CNA, 0x100c, prec);
+	}
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);  /* stride 1 both axes */
 
@@ -1003,6 +1028,74 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 			dst[off] = (uint8_t)(src[(size_t)n * mm->k + k] - 0x80);
 		}
 	}
+}
+
+/*
+ * ⚠⚠ THREE CANDIDATES, NOT ONE, AND THE BOARD PICKS. The vendor's size
+ * registers pin the buffer to ic*oc*2 bytes with ic*2 per output channel, and
+ * that is exact over all 4940 of its fp16 streams -- but a tiling does not
+ * change a total, so nothing in a static file can say what order the bytes go
+ * in. Guessing one and calling it the layout is how a wrong answer ships
+ * quietly; this enumerates the three that the rest of the tree already knows
+ * about and lets a probe on the hardware say which.
+ *
+ * DENSE is what the size registers read like if they are taken literally.
+ * ATOM is the shape charsiu_pack_input already uses for 2 byte activations,
+ * [k/8][rows][8], with the output channel in place of the row -- the strongest
+ * prior, because 8 is the 2 byte feature atom on both sides. GROUP is the
+ * int8 weight tiling with 2 byte elements, which is what charsiu_weight_kgroup
+ * currently returns for fp16 by inheritance rather than by measurement.
+ */
+size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
+			  unsigned k, enum charsiu_w16_layout layout)
+{
+	unsigned n_pad = ALIGN_UP(mm->n, 2);
+	unsigned ke = charsiu_k_eff(mm);
+	size_t off;
+
+	if (n >= n_pad || k >= mm->k)
+		return (size_t)-1;
+	switch (layout) {
+	case CHARSIU_W16_DENSE:
+		off = (size_t)n * ke + k;
+		break;
+	case CHARSIU_W16_ATOM:
+		off = (size_t)(k / 8) * n_pad * 8 + (size_t)n * 8 + k % 8;
+		break;
+	case CHARSIU_W16_GROUP: {
+		unsigned ng = charsiu_weight_ngroup(mm->wdtype);
+		unsigned kg = charsiu_weight_kgroup(mm->wdtype);
+		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
+		unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
+
+		off = (size_t)ngi * ng * ke + (size_t)kgi * kg * ngsz
+		    + (size_t)(n % ng) * kgsz + (k % kg);
+		break;
+	}
+	default:
+		return (size_t)-1;
+	}
+	return off * 2;
+}
+
+void charsiu_pack_weights_f16(const struct charsiu_matmul *mm,
+			      const float *src, uint8_t *dst, size_t dst_size,
+			      enum charsiu_w16_layout layout)
+{
+	unsigned n, k;
+
+	memset(dst, 0, dst_size);
+	for (n = 0; n < mm->n; n++)
+		for (k = 0; k < mm->k; k++) {
+			size_t off = charsiu_w16_offset(mm, n, k, layout);
+			uint16_t h;
+
+			if (off == (size_t)-1 || off + 1 >= dst_size)
+				continue;
+			h = charsiu_float_to_half(src[(size_t)n * mm->k + k]);
+			dst[off] = (uint8_t)(h & 0xff);
+			dst[off + 1] = (uint8_t)(h >> 8);
+		}
 }
 
 void charsiu_pack_weights(const struct charsiu_matmul *mm,

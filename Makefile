@@ -21,11 +21,12 @@ CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
 
 SRC    := src/regcmd.c src/device.c src/job.c
 LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
-          src/npudev.c src/npupool.c src/device.c src/job.c src/regcmd.c
+          src/npudev.c src/npupool.c src/npufp16.c src/device.c src/job.c src/regcmd.c
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
-     $(BUILD)/npu_gemm_test $(BUILD)/npu_slice_test $(BUILD)/charsiu_matmul \
+     $(BUILD)/npu_gemm_test $(BUILD)/npu_slice_test $(BUILD)/npu_fp16_test \
+     $(BUILD)/charsiu_matmul \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
      $(BUILD)/vattn_bench \
@@ -175,6 +176,9 @@ $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
 $(BUILD)/npu_slice_test: tools/npu_slice_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
+$(BUILD)/npu_fp16_test: tools/npu_fp16_test.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
 $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
@@ -187,17 +191,22 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
 	./$(BUILD)/pack_stride
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
+	./$(BUILD)/even_ks
+	./$(BUILD)/pack_f16w
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+$(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the guard is its own unit for exactly this reason: the table is testable on a
@@ -206,6 +215,9 @@ $(BUILD)/overlap_guard: tests/overlap_guard.c src/overlap.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
 $(BUILD)/reuse_key: tests/reuse_key.c src/reusekey.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD)/even_ks: tests/even_ks.c src/kslice.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:

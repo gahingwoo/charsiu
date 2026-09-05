@@ -323,7 +323,7 @@ int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
-			     unsigned long *misses);
+			     unsigned long *misses, unsigned long why[4]);
 /* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
 /* whether batched calls overlap the two cores, and why (the rail and clock against the vendor's OPP) */
@@ -331,6 +331,25 @@ const char *charsiu_npu_overlap_note(void);
 /* the same decision from the rail and clock readings alone, for tests: 1 = may overlap.
  * CHARSIU_NPU_RAIL_UV / CHARSIU_NPU_CLK_HZ replace the readings. */
 int charsiu_npu_overlap_ok(char *why, size_t n);
+
+/*
+ * fp16 matmul with a CALLER OWNED weight, which is what attention needs: its
+ * second operand is the KV cache, a different buffer per layer and per head
+ * that grows by a row a token. src/npufp16.c says why it is not in npudev.
+ *
+ * charsiu_fp16_woffset() is the layout the hardware wants (measured, see
+ * include/charsiu.h), so the cache can be written straight into it as tokens
+ * are appended and no pack is ever paid.
+ */
+struct charsiu_fp16;
+struct charsiu_fp16 *charsiu_fp16_open(void);
+void charsiu_fp16_close(struct charsiu_fp16 *f);
+size_t charsiu_fp16_wbytes(unsigned k, unsigned n);
+size_t charsiu_fp16_woffset(unsigned k, unsigned n, unsigned ni, unsigned ki);
+int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
+			unsigned k, unsigned n, const void *W, float *Y);
+void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
+			unsigned long *refused);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
 /* slot i of tensor id after a call: its device, K slice, and channels [n0, n1);
  * -1 past the last slot. The batch probe names the core behind a wrong row with it. */
