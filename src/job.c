@@ -1251,8 +1251,29 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * compute. Nothing sets wdtype to FP16 yet, so every stream that runs
 	 * today is bit identical to before these branches existed.
 	 */
-	emit(&e, CNA, 0x1094,
-	     mm->wdtype == CHARSIU_FP16 ? 1u : inw * rows);  /* inw * full_inh */
+	/*
+	 * ⚠⚠ THE FOUR fp16 WINDOW REGISTERS AND WHAT THEY COST. These carry
+	 * the vendor's constants -- 1, 0, 1, 0 -- and every one of them is a
+	 * quantity WITH rows IN IT: inw * rows, the window corners, ow * rows,
+	 * ow - 1. Telling the block the window is 1 x 1 and then handing it m
+	 * rows leaves it nowhere to put them, and the board says exactly that:
+	 * output row r comes back holding k in [r*K/m, (r+1)*K/m), so it splits
+	 * the CONTRACTION axis across the output rows instead of running m rows
+	 * over the whole of K (npu_fp16_test --inmap, m=2 and m=4, exact).
+	 *
+	 * CHARSIU_FP16_WINDOW=geom puts the computed geometry back so the two
+	 * can be compared on the board. The vendor's own fp16 dispatches run
+	 * M up to 128 with these constants, so the constants cannot be the
+	 * whole story -- but they are the only thing in the stream that carries
+	 * the row count, and a knob is how that gets settled rather than
+	 * argued.
+	 */
+	{
+		const char *fw = envq("CHARSIU_FP16_WINDOW");
+		int f16win = mm->wdtype == CHARSIU_FP16 &&
+			     !(fw && !strcmp(fw, "geom"));
+
+		emit(&e, CNA, 0x1094, f16win ? 1u : inw * rows);
 	emit(&e, CNA, 0x1098, envq("CHARSIU_CNA_1098")
 	     ? (uint32_t)strtoul(envq("CHARSIU_CNA_1098"), NULL, 0)
 	     : ((inw * rows + 3) & ~3u));
@@ -1273,9 +1294,10 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * moves nothing at all, so it did not test this and does not excuse it.
 	 */
 	emit(&e, CNA, 0x118c,
-	     mm->wdtype == CHARSIU_FP16 ? 0u
+	     f16win ? 0u
 	     : wide ? (((inw - 1) << 16) | (inw - 1))
 		    : (((inw - 1) << 16) | (rows - 1)));
+	}
 
 	/*
 	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
@@ -1623,9 +1645,15 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4010, WIDE(0) ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
-	emit(&e, DPU, 0x401c,
-	     mm->wdtype == CHARSIU_FP16 ? 1u : ow * rows);   /* ow * full_oh */
-	emit(&e, DPU, 0x4020, mm->wdtype == CHARSIU_FP16 ? 0u : ow - 1);
+	{
+		/* the other half of the fp16 window group; see 0x1094 */
+		const char *fw2 = envq("CHARSIU_FP16_WINDOW");
+		int f16w2 = mm->wdtype == CHARSIU_FP16 &&
+			    !(fw2 && !strcmp(fw2, "geom"));
+
+		emit(&e, DPU, 0x401c, f16w2 ? 1u : ow * rows);
+		emit(&e, DPU, 0x4020, f16w2 ? 0u : ow - 1);
+	}
 	emit(&e, DPU, 0x4024, wide ? rows - 1 : lines);
 	/* fp16: oc / 4 - 1, exact over all 4940 vendor fp16 streams */
 	emit(&e, DPU, 0x4028,
