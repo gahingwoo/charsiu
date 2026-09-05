@@ -380,6 +380,15 @@ void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
  *   charsiu_fp16_w_end(w);              -- before the hardware reads
  *   op.Wbuf = w;  op.W = NULL;
  *
+ * What that means for attention, so the next reader does not rederive it:
+ * the scores matmul's n is the number of POSITIONS, so it runs at the cache's
+ * width rounded up to 16 and the columns past the last token read zero weights
+ * -- harmless, because a softmax over [tlo, pos] never looks at them. The
+ * values matmul's k is the number of positions, so its buffer is allocated at
+ * the context length and run there every time, with the probabilities past the
+ * last token left zero. One wastes a little of the output, the other a little
+ * of the reduction, and neither needs a repack.
+ *
  * ⚠ THE LAYOUT IS ONLY STABLE WHERE EVERY GROUP IS FULL. charsiu_fp16_woffset
  * is (n/16)*16*ke + (k/32)*32*ngsz + (n%16)*kgsz + k%32, and ngsz is 16 for
  * every group except a partial last one, ke is the padded k. So an offset does

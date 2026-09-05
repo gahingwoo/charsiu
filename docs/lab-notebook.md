@@ -1532,3 +1532,94 @@ where each new one was looked for. "Where the last answer was" is not "where
 this answer is", and the thing that finally found it was the same slot sweep
 that had already settled the weight layout, pointed at the side nobody had
 measured.
+
+## Attention, grouped: the fence is the job
+
+The first pricing of the fp16 matmul was per dispatch, and the vendor's file
+said that could not be the whole story. At M=64 it issues **24** int4
+projection dispatches a layer against charsiu's 7, and is still 2.2 to 3.0x
+ahead on time to first token. Dispatch count is not what it is winning on.
+
+Splitting one call three ways said what is: fence and sync 0.345 to 0.454 ms,
+the copy out 4 to 63 us, the cache maintenance 2 to 44 us. **98% of a job is
+waiting for it.** `npudev.c` has had that written down since round 321 -- "the
+fence at 94% of the hardware path" -- and answers it with
+`charsiu_npu_matvec_group`, which puts q, k and v in one submit. `npufp16.c`
+was one matmul, one submit, one fence.
+
+So the unit takes a group. Tasks inside one job are chained by the program
+counter on a single core, so N matmuls are one submit and one wait, and the two
+cores are never in flight together -- which matters here, because they corrupt
+single words when they are and the fix for that is a voltage, not this.
+
+A layer of attention is exactly that shape: H independent scores matmuls, a
+softmax on the CPU, H independent values matmuls. Two waits a layer where a
+loop pays 2H.
+
+### What the board said, four rounds
+
+Every arm below was checked bit for bit against the same ops run one at a time
+before any of it was timed, at MIXED shapes -- uniform ones cannot catch an
+offset that is wrong by a whole region, because a wrong region is still a legal
+one. All identical, nothing refused, dmesg clean throughout.
+
+```
+  ops   shape                one at a time   grouped
+  16    k=64   n=1024 m=8    1.735 ms        0.211 ms     8.2x
+  32    k=64   n=1024 m=8    3.214 ms        0.211 ms    15.2x
+  16    k=1024 n=64   m=8    2.687 ms        0.300 ms     9.0x
+  32    k=1024 n=64   m=8    7.232 ms        0.375 ms    19.3x
+```
+
+Each round then reported where the time had gone, and the answer moved three
+times.
+
+**The coefficients were 23% of a round.** This unit builds them from a zero
+bias, zero weight sums and unit scales, so their content depends on n and
+nothing else -- and `charsiu_build_coefs` begins by zeroing the whole buffer,
+262 kB at the default element bound. Sixteen ops of one shape were sixteen
+identical copies of that. Now the plan gives one region per distinct n, the
+group builds each once, and a second group with the same shapes in a buffer
+that has not moved builds none: `coefs 0.000`.
+
+**The weight memcpy was 55%.** A KV cache is appended to a row a token and
+never changes, so copying it into a device buffer is pure waste.
+`charsiu_fp16_w` is a buffer the caller writes rows into and the hardware reads
+where they lie. 1.29 to 1.36x at eight rows.
+
+**Then the pack, and the copy out.** With the fence amortised and the copies
+gone, the largest line was converting the activation to halves: a call into
+another translation unit per element, a bounds test per element, two byte
+stores per element, and a memset of the whole region first. And an op that is
+about to have a softmax run over it does not need its answer copied anywhere: a
+NULL `Y` leaves it in the device buffer.
+
+### The appending law, and the half of the test that could fail
+
+All of that rests on one claim: a GROUP offset is
+
+    (n/16)*16*ke + (k/32)*32*ngsz + (n%16)*kgsz + (k%32)
+
+and only `ngsz` carries n, and only for a partial last group -- so while every
+group of 16 output channels is full, **an offset does not depend on n at all**,
+and a cache can be appended to and read at whatever width it has reached.
+
+That was a derivation, and this project has published derivations the board
+then refused. So `tests/pack_f16w.c` checks it on every shape, and also checks
+that a partial group really does move -- otherwise the law would be passing
+because it cannot fail. The second half is what found the exact precondition:
+`ngsz` reaches the offset only through `(k/32)*32*ngsz`, so with a single k
+group it cancels and nothing moves at all. Above one k group, which is where a
+cache lives, the difference is real. Then the board was asked the same question
+end to end: buffers allocated at 2n, written through `charsiu_fp16_woffset` at
+that width, run at n. Identical.
+
+### Two things this did not settle
+
+`CHARSIU_FP16_JOBS=split` sends N jobs instead of N chained tasks, so the
+scheduler may use both cores. It was faster in one round and slower in the
+next, at different group sizes, and both were correct. Nothing here decides it.
+
+And nothing in the model calls any of this yet. The next step is the KV cache
+written in `charsiu_fp16_woffset` layout as tokens are appended, and
+`attn_block` calling the group.
