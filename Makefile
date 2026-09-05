@@ -30,7 +30,8 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
      $(BUILD)/vattn_bench \
-     $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check
+     $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
+     $(BUILD)/fp16_plan
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -191,7 +192,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -199,6 +200,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
+	./$(BUILD)/fp16_plan
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -208,6 +210,11 @@ $(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
 
 $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the group's four buffers are addressed by arithmetic, and arithmetic that
+# overlaps two regions returns another op's answer rather than an error
+$(BUILD)/fp16_plan: tests/fp16_plan.c src/fp16plan.h src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/fp16_plan.c src/regcmd.c src/job.c -lm
 
 # the guard is its own unit for exactly this reason: the table is testable on a
 # desk without linking the hardware path behind it

@@ -445,14 +445,36 @@ those carry `oc = 64`, this model's head_dim. charsiu runs attention on the
 CPU, where it is 30 to 52% of a prompt.
 
 The fp16 matmul now works on this hardware and is bit exact against a CPU
-reference at every width tried. Priced on that, attention would cost 3.68 ms a
-row against the CPU's 6.67 at a batch of 178, about 1.31x on a Qwen3 prompt.
-Our TTFT is 2.2 to 3.0x behind the vendor's, so this closes roughly a third of
-that gap and is not the end of it.
+reference at every width tried.
 
-Nothing calls it yet. `src/npufp16.c` is a unit of its own and the int4 path
-cannot see it; `docs/lab-notebook.md` has what had to be found, including the
-six register-level fixes that were tried against a fault that was in a buffer.
+The first pricing of it was per dispatch, and per dispatch it is 98% waiting:
+0.35 to 0.45 ms in the fence against 6 to 107 us for everything else. So the
+unit takes a GROUP -- a layer of attention is H independent scores matmuls, a
+softmax, and H independent values matmuls, and each half is one submit and one
+wait. On the board, against the same ops one at a time and bit for bit
+identical to them:
+
+```
+  ops   shape                   one at a time   grouped
+  16    k=64  n=1024 m=8        1.735 ms        0.211 ms    8.2x
+  32    k=64  n=1024 m=8        3.214 ms        0.211 ms   15.2x
+  16    k=1024 n=64  m=8        2.687 ms        0.300 ms    9.0x
+  32    k=1024 n=64  m=8        7.232 ms        0.375 ms   19.3x
+```
+
+Each round then said what was left, and three things went in turn. The
+coefficients are the same bytes for every op of one shape, so they are built
+once and then never (`coefs 0.000`). A KV cache is appended to a row a token
+and never changes, so `charsiu_fp16_w` is a device buffer the caller writes
+rows into at `charsiu_fp16_woffset` and the hardware reads where it lies -- the
+board confirms the offsets do not move as the cache grows, which is what makes
+that legal. And an op that hands over a NULL `Y` leaves its answer in the
+device buffer for a caller that is about to reduce over it anyway.
+
+Nothing in the model calls it yet. `src/npufp16.c` is a unit of its own and the
+int4 path cannot see it; `docs/lab-notebook.md` has what had to be found,
+including the six register-level fixes that were tried against a fault that was
+in a buffer.
 
 ## The instrument
 

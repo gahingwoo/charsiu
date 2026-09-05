@@ -70,7 +70,16 @@
  * of a fixed cost, not of a matmul. The pack alone walks k*n elements through
  * charsiu_w16_offset one at a time.
  */
-static struct { double pack, cf, emit, run, rd; } t_split;
+static struct { double pack, cf, emit, run, rd, rd_prev; } t_split;
+/*
+ * ⚠ fence+read IS THREE THINGS AND THE 0.4 ms HAS TO BE ATTRIBUTED TO ONE.
+ * The vendor issues 24 int4 dispatches a layer where we issue 7 and is still
+ * 2.2 to 3.0x ahead on TTFT, so the gap is per-dispatch cost, not count. This
+ * tree records a 130 us per-call floor; a raw fp16 job measures 0.4 ms. These
+ * split the difference between waiting for the hardware, syncing the output
+ * buffer for the CPU, and copying it out.
+ */
+static struct { double fence, copy, fini; } t_read;
 
 static double now_ms(void)
 {
@@ -280,7 +289,9 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	}
 	t_split.run += now_ms() - tp;
 	tp = now_ms();
-	charsiu_bo_prep(dev, &ob, 1000000000);   /* this is the fence wait */
+	charsiu_bo_prep(dev, &ob, 1000000000);   /* fence wait + dma_sync */
+	t_read.fence += now_ms() - tp;
+	tp = now_ms();
 	/*
 	 * ⚠ FLAT, AND MEASURED. --outmap put B[c] = 2^c through the hardware
 	 * and read 2^0..2^7 at slots 0..7 and again at 64..71 -- m by n, row
@@ -290,8 +301,13 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	 * fault; reverted rather than left in as a second variable.
 	 */
 	memcpy(out, ob.map, (size_t)m * n * 4);
+	t_read.copy += now_ms() - tp;
+	tp = now_ms();
 	charsiu_bo_fini(dev, &ob);
-	t_split.rd += now_ms() - tp;
+	t_read.fini += now_ms() - tp;
+	t_split.rd += t_read.fence + t_read.copy + t_read.fini
+		    - (t_split.rd_prev);
+	t_split.rd_prev = t_read.fence + t_read.copy + t_read.fini;
 	rc = 0;
 out:
 	return rc;
@@ -351,6 +367,8 @@ int main(int argc, char **argv)
 	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
 	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
+	int dogrp = argc > 3 && !strcmp(argv[3], "--group");
+	int doown = argc > 3 && !strcmp(argv[3], "--own");
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
@@ -589,6 +607,448 @@ int main(int argc, char **argv)
 		rc = 0;
 		goto done;
 	}
+	if (dogrp) {
+		/*
+		 * ⚠⚠ THE GROUP AGAINST THE SAME OPS ONE AT A TIME, both bit
+		 * for bit and on the clock.
+		 *
+		 * The whole claim of charsiu_fp16_matmul_group is that N
+		 * matmuls in one submit compute exactly what N submits compute
+		 * and wait once instead of N times. Two arms, and the first
+		 * one has to pass before the second is worth reading.
+		 *
+		 * ⚠ THE CORRECTNESS ARM USES DIFFERENT SHAPES PER OP ON
+		 * PURPOSE. With every op the same size, an offset that is
+		 * wrong by a whole sub buffer still lands on a legal one, and
+		 * every op's answer would be some other op's answer -- which
+		 * is only visible because the contents differ too. Mixed
+		 * shapes also make the padding arithmetic answer for itself.
+		 * The timing arm then uses ONE shape, because that is what a
+		 * layer of attention actually looks like.
+		 */
+		unsigned G = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
+		unsigned reps = argc > 5 ? (unsigned)atoi(argv[5]) : 8;
+		struct charsiu_fp16 *fp = charsiu_fp16_open();
+		struct charsiu_fp16_op op[32];
+		float *Xs[32] = { 0 }, *Ya[32] = { 0 }, *Yb[32] = { 0 };
+		float *Yc[32] = { 0 }, *Bs[32] = { 0 };
+		uint8_t *Ws[32] = { 0 };
+		struct charsiu_fp16_times t0t, t1t;
+		double wa = 0, wb = 0, cross = 0, tl = 0, tg = 0;
+		unsigned long c0, r0, s0, c1, r1, s1;
+		int failed = 0;
+
+		if (G > 32) G = 32;
+		if (!fp) { printf("  could not open\n"); goto done; }
+		for (unsigned i = 0; i < G; i++) {
+			unsigned ni = n + 32 * i;
+			size_t wb2 = charsiu_fp16_wbytes(k, ni);
+
+			Xs[i] = calloc((size_t)m * k, sizeof(float));
+			Bs[i] = calloc((size_t)ni * k, sizeof(float));
+			Ws[i] = calloc(wb2, 1);
+			Ya[i] = calloc((size_t)m * ni, sizeof(float));
+			Yb[i] = calloc((size_t)m * ni, sizeof(float));
+			Yc[i] = calloc((size_t)m * ni, sizeof(float));
+			if (!Xs[i] || !Bs[i] || !Ws[i] || !Ya[i] || !Yb[i] ||
+			    !Yc[i]) { printf("  out of memory\n"); goto done; }
+			for (size_t e = 0; e < (size_t)m * k; e++)
+				Xs[i][e] = (float)((int)((e + 7 * i) % 13) - 6)
+					 * 0.25f;
+			for (size_t e = 0; e < (size_t)ni * k; e++)
+				Bs[i][e] = (float)((int)((e + 5 * i) % 7) - 3)
+					 * 0.5f;
+			for (unsigned c2 = 0; c2 < ni; c2++)
+				for (unsigned kk2 = 0; kk2 < k; kk2++) {
+					size_t off = charsiu_fp16_woffset(k, ni,
+									  c2, kk2);
+					uint16_t h = charsiu_float_to_half(
+						Bs[i][(size_t)c2 * k + kk2]);
+
+					if (off + 1 >= wb2) continue;
+					Ws[i][off] = (uint8_t)(h & 0xff);
+					Ws[i][off + 1] = (uint8_t)(h >> 8);
+				}
+			reference(m, k, ni, Xs[i], Bs[i], Yc[i]);
+			op[i].X = Xs[i]; op[i].W = Ws[i]; op[i].Y = Yb[i];
+			op[i].m = m; op[i].k = k; op[i].n = ni;
+		}
+		printf("%u ops, n from %u to %u, k=%u m=%u\n",
+		       G, n, n + 32 * (G - 1), k, m);
+		for (unsigned i = 0; i < G; i++)
+			if (charsiu_fp16_matmul(fp, Xs[i], m, k, n + 32 * i,
+						Ws[i], Ya[i])) {
+				printf("  op %u refused one at a time\n", i);
+				failed = 1;
+			}
+		if (charsiu_fp16_matmul_group(fp, op, G)) {
+			printf("  the group refused or an op wrote nothing\n");
+			failed = 1;
+		}
+		for (unsigned i = 0; i < G; i++) {
+			unsigned ni = n + 32 * i;
+
+			for (size_t e = 0; e < (size_t)m * ni; e++) {
+				double da = fabs(Ya[i][e] - Yc[i][e]);
+				double db = fabs(Yb[i][e] - Yc[i][e]);
+
+				if (da > wa) wa = da;
+				if (db > wb) wb = db;
+				if (Ya[i][e] != Yb[i][e]) cross += 1;
+			}
+		}
+		printf("  one at a time vs CPU: worst %.4g%s\n",
+		       wa, wa == 0.0 ? "   <== EXACT" : "");
+		printf("  the group    vs CPU: worst %.4g%s\n",
+		       wb, wb == 0.0 ? "   <== EXACT" : "");
+		printf("  cells where the two arms differ: %.0f%s\n",
+		       cross, cross == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+		if (failed || cross != 0) {
+			printf("  not timing an arm that is not correct\n");
+			charsiu_fp16_close(fp);
+			rc = 1;
+			goto done;
+		}
+		/*
+		 * One shape now, alternating arms, because that is a layer of
+		 * attention and because a governor that ramps mid run would
+		 * otherwise be read as the grouping.
+		 */
+		for (unsigned i = 0; i < G; i++) {
+			size_t wb2 = charsiu_fp16_wbytes(k, n);
+
+			op[i].n = n;
+			memset(Yb[i], 0, (size_t)m * n * sizeof(float));
+			/* ⚠ REPACK. Ws[i] holds the n + 32i layout from the
+			 * arm above, and a buffer packed for one n is not the
+			 * buffer for another. Timing it would still time a
+			 * matmul, but it would be a matmul of nothing anyone
+			 * can check, which is how a timing arm outlives the
+			 * correctness it was supposed to inherit. */
+			memset(Ws[i], 0, wb2);
+			for (unsigned c2 = 0; c2 < n; c2++)
+				for (unsigned kk2 = 0; kk2 < k; kk2++) {
+					size_t off = charsiu_fp16_woffset(k, n,
+									  c2, kk2);
+					uint16_t h = charsiu_float_to_half(
+						Bs[i][(size_t)c2 * k + kk2]);
+
+					if (off + 1 >= wb2) continue;
+					Ws[i][off] = (uint8_t)(h & 0xff);
+					Ws[i][off + 1] = (uint8_t)(h >> 8);
+				}
+		}
+		charsiu_fp16_stats(fp, &c0, &r0);
+		s0 = charsiu_fp16_submits(fp);
+		charsiu_fp16_get_times(fp, &t0t);
+		for (unsigned r2 = 0; r2 < reps; r2++) {
+			double a = now_ms();
+
+			for (unsigned i = 0; i < G; i++)
+				if (charsiu_fp16_matmul(fp, Xs[i], m, k, n,
+							Ws[i], Ya[i]))
+					failed = 1;
+			tl += now_ms() - a;
+			a = now_ms();
+			if (charsiu_fp16_matmul_group(fp, op, G))
+				failed = 1;
+			tg += now_ms() - a;
+		}
+		charsiu_fp16_stats(fp, &c1, &r1);
+		s1 = charsiu_fp16_submits(fp);
+		charsiu_fp16_get_times(fp, &t1t);
+		printf("  %u rounds of %u matmuls at k=%u n=%u m=%u%s\n",
+		       reps, G, k, n, m, failed ? "  (an arm refused)" : "");
+		printf("    one at a time  %.3f ms a matmul  (%.1f ms a round)\n",
+		       tl / (reps * G), tl / reps);
+		printf("    grouped        %.3f ms a matmul  (%.1f ms a round)"
+		       "   %.2fx\n", tg / (reps * G), tg / reps,
+		       tg > 0 ? tl / tg : 0.0);
+		printf("    %lu matmuls over %lu submits\n", c1 - c0, s1 - s0);
+		/*
+		 * ⚠ AND THE SAME GROUP BACK TO BACK, which is what a layer
+		 * loop does. The alternating arms above are the fair
+		 * comparison, but every single call in between rebuilds the
+		 * coefficients this unit caches -- so the arm that is fair to
+		 * the loop is unfair to the group, and the steady state needs
+		 * its own line.
+		 */
+		{
+			struct charsiu_fp16_times a, b;
+			double ts = now_ms();
+
+			charsiu_fp16_get_times(fp, &a);
+			for (unsigned r2 = 0; r2 < reps; r2++)
+				if (charsiu_fp16_matmul_group(fp, op, G))
+					failed = 1;
+			ts = now_ms() - ts;
+			charsiu_fp16_get_times(fp, &b);
+			printf("    grouped back to back  %.3f ms a matmul"
+			       "  (%.1f ms a round)   %.2fx\n",
+			       ts / (reps * G), ts / reps,
+			       ts > 0 ? tl / ts : 0.0);
+			printf("      wcopy %.3f  pack %.3f  coefs %.3f"
+			       "  emit %.3f  submit %.3f  fence %.3f"
+			       "  read %.3f ms\n",
+			       (b.wcopy - a.wcopy) / reps,
+			       (b.pack - a.pack) / reps,
+			       (b.coefs - a.coefs) / reps,
+			       (b.emit - a.emit) / reps,
+			       (b.submit - a.submit) / reps,
+			       (b.fence - a.fence) / reps,
+			       (b.read - a.read) / reps);
+		}
+		printf("    of a grouped round: wcopy %.3f  pack %.3f"
+		       "  coefs %.3f  emit %.3f  submit %.3f  fence %.3f"
+		       "  read %.3f ms\n",
+		       (t1t.wcopy - t0t.wcopy) / reps,
+		       (t1t.pack - t0t.pack) / reps,
+		       (t1t.coefs - t0t.coefs) / reps,
+		       (t1t.emit - t0t.emit) / reps,
+		       (t1t.submit - t0t.submit) / reps,
+		       (t1t.fence - t0t.fence) / reps,
+		       (t1t.read - t0t.read) / reps);
+		charsiu_fp16_close(fp);
+		for (unsigned i = 0; i < G; i++) {
+			free(Xs[i]); free(Bs[i]); free(Ws[i]);
+			free(Ya[i]); free(Yb[i]); free(Yc[i]);
+		}
+		rc = 0;
+		goto done;
+	}
+	if (doown) {
+		/*
+		 * ⚠⚠ THE WEIGHT WHERE IT LIES, AND THE APPENDING LAW ON THE
+		 * HARDWARE.
+		 *
+		 * Round two put the weight memcpy at up to 55% of a grouped
+		 * round -- 6.6 ms of 12.0 at 32 ops -- and a KV cache has no
+		 * business being copied at all: it is appended to a row at a
+		 * time and never changes. charsiu_fp16_w is one device buffer
+		 * the caller writes into at charsiu_fp16_woffset.
+		 *
+		 * Two things are under test and they fail differently:
+		 *
+		 *   1. the buffer. Same weights, same ops, handed over as a
+		 *      handle instead of bytes: the answers must be identical
+		 *      to the copying group, and the wcopy line must go to
+		 *      zero.
+		 *   2. THE APPENDING LAW. Each buffer is allocated at a width
+		 *      of 2n, written through woffset AT THAT WIDTH -- which
+		 *      is what a cache does, since it does not know how many
+		 *      tokens are coming -- and then run at n. tests/pack_f16w
+		 *      says the offsets do not move while every group of 16 is
+		 *      full. This is the board being asked the same question.
+		 *
+		 * If 1 passes and 2 fails, the derivation is wrong and every
+		 * answer will be a permutation of the right one rather than
+		 * noise.
+		 */
+		unsigned G = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
+		unsigned reps = argc > 5 ? (unsigned)atoi(argv[5]) : 8;
+		struct charsiu_fp16 *fp = charsiu_fp16_open();
+		struct charsiu_fp16_op op[32];
+		struct charsiu_fp16_w *W16[32] = { 0 };
+		float *Xs[32] = { 0 }, *Ya[32] = { 0 }, *Yb[32] = { 0 };
+		float *Yc[32] = { 0 }, *Bs[32] = { 0 };
+		uint8_t *Ws[32] = { 0 };
+		struct charsiu_fp16_times t0t, t1t;
+		unsigned nbig = n * 2, ng = charsiu_weight_ngroup(CHARSIU_FP16);
+		double wa = 0, wb = 0, cross = 0, tc = 0, to = 0, tb = 0;
+		unsigned long s0, s1, c0, c1, r0, r1;
+		int failed = 0;
+
+		if (G > 32) G = 32;
+		if (n % ng) {
+			printf("  n must be a multiple of %u for this arm\n", ng);
+			goto done;
+		}
+		if (!fp) { printf("  could not open\n"); goto done; }
+		for (unsigned i = 0; i < G; i++) {
+			size_t wb2 = charsiu_fp16_wbytes(k, n);
+
+			Xs[i] = calloc((size_t)m * k, sizeof(float));
+			Bs[i] = calloc((size_t)n * k, sizeof(float));
+			Ws[i] = calloc(wb2, 1);
+			Ya[i] = calloc((size_t)m * n, sizeof(float));
+			Yb[i] = calloc((size_t)m * n, sizeof(float));
+			Yc[i] = calloc((size_t)m * n, sizeof(float));
+			if (!Xs[i] || !Bs[i] || !Ws[i] || !Ya[i] || !Yb[i] ||
+			    !Yc[i]) { printf("  out of memory\n"); goto done; }
+			for (size_t e = 0; e < (size_t)m * k; e++)
+				Xs[i][e] = (float)((int)((e + 7 * i) % 13) - 6)
+					 * 0.25f;
+			for (size_t e = 0; e < (size_t)n * k; e++)
+				Bs[i][e] = (float)((int)((e + 5 * i) % 7) - 3)
+					 * 0.5f;
+			/* the copying arm's weight, packed at the run width */
+			for (unsigned c2 = 0; c2 < n; c2++)
+				for (unsigned kk2 = 0; kk2 < k; kk2++) {
+					size_t off = charsiu_fp16_woffset(k, n,
+									  c2, kk2);
+					uint16_t h = charsiu_float_to_half(
+						Bs[i][(size_t)c2 * k + kk2]);
+
+					if (off + 1 >= wb2) continue;
+					Ws[i][off] = (uint8_t)(h & 0xff);
+					Ws[i][off + 1] = (uint8_t)(h >> 8);
+				}
+			reference(m, k, n, Xs[i], Bs[i], Yc[i]);
+			/* and the owned buffer, written AT THE BIG WIDTH */
+			W16[i] = charsiu_fp16_w_alloc(fp, k, nbig);
+			if (!W16[i]) { printf("  no weight buffer\n"); goto done; }
+			charsiu_fp16_w_begin(fp, W16[i]);
+			{
+				uint8_t *d = charsiu_fp16_w_map(W16[i]);
+				size_t cap = charsiu_fp16_w_bytes(W16[i]);
+
+				for (unsigned c2 = 0; c2 < n; c2++)
+					for (unsigned kk2 = 0; kk2 < k; kk2++) {
+						size_t off = charsiu_fp16_woffset(
+							k, nbig, c2, kk2);
+						uint16_t h = charsiu_float_to_half(
+							Bs[i][(size_t)c2 * k + kk2]);
+
+						if (off + 1 >= cap) continue;
+						d[off] = (uint8_t)(h & 0xff);
+						d[off + 1] = (uint8_t)(h >> 8);
+					}
+			}
+			charsiu_fp16_w_end(fp, W16[i]);
+			op[i].X = Xs[i]; op[i].Y = Yb[i]; op[i].Wbuf = NULL;
+			op[i].W = Ws[i];
+			op[i].m = m; op[i].k = k; op[i].n = n;
+		}
+		printf("%u ops, k=%u n=%u m=%u, buffers allocated at n=%u\n",
+		       G, k, n, m, nbig);
+		if (charsiu_fp16_matmul_group(fp, op, G))
+			{ printf("  the copying group refused\n"); failed = 1; }
+		for (unsigned i = 0; i < G; i++)
+			memcpy(Ya[i], Yb[i], (size_t)m * n * sizeof(float));
+		for (unsigned i = 0; i < G; i++) {
+			op[i].W = NULL;
+			op[i].Wbuf = W16[i];
+			memset(Yb[i], 0, (size_t)m * n * sizeof(float));
+		}
+		if (charsiu_fp16_matmul_group(fp, op, G))
+			{ printf("  the owned group refused\n"); failed = 1; }
+		for (unsigned i = 0; i < G; i++)
+			for (size_t e = 0; e < (size_t)m * n; e++) {
+				double da = fabs(Ya[i][e] - Yc[i][e]);
+				double db = fabs(Yb[i][e] - Yc[i][e]);
+
+				if (da > wa) wa = da;
+				if (db > wb) wb = db;
+				if (Ya[i][e] != Yb[i][e]) cross += 1;
+			}
+		printf("  copied weights   vs CPU: worst %.4g%s\n",
+		       wa, wa == 0.0 ? "   <== EXACT" : "");
+		printf("  owned  weights   vs CPU: worst %.4g%s\n",
+		       wb, wb == 0.0 ? "   <== EXACT" : "");
+		printf("  cells where the two arms differ: %.0f%s\n", cross,
+		       cross == 0 ? "   <== IDENTICAL, and the appending law"
+				    " holds on the hardware"
+				  : "  <== ⚠ the law or the buffer");
+		/*
+		 * ⚠ AND THE SAME ANSWERS WITHOUT THE COPY OUT. A NULL Y leaves
+		 * the result in the device buffer; charsiu_fp16_out points at
+		 * it. If borrowing were reading the wrong region it would show
+		 * here as another op's answer, which is why this compares
+		 * against the arm above rather than against a tolerance.
+		 */
+		{
+			double bd = 0;
+
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = NULL;
+			if (charsiu_fp16_matmul_group(fp, op, G)) {
+				printf("  the borrowing group refused\n");
+				failed = 1;
+			}
+			for (unsigned i = 0; i < G; i++) {
+				const float *o = charsiu_fp16_out(fp, i);
+
+				if (!o) { bd += 1; continue; }
+				for (size_t e = 0; e < (size_t)m * n; e++)
+					if (o[e] != Ya[i][e])
+						bd += 1;
+			}
+			charsiu_fp16_release(fp);
+			printf("  cells the borrowed answers differ in: %.0f%s\n",
+			       bd, bd == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+			if (bd)
+				failed = 1;
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = Yb[i];
+		}
+		if (failed || cross != 0) {
+			printf("  not timing an arm that is not correct\n");
+			charsiu_fp16_close(fp);
+			rc = 1;
+			goto done;
+		}
+		charsiu_fp16_get_times(fp, &t0t);
+		charsiu_fp16_stats(fp, &c0, &r0);
+		s0 = charsiu_fp16_submits(fp);
+		for (unsigned r2 = 0; r2 < reps; r2++) {
+			double a = now_ms();
+
+			for (unsigned i = 0; i < G; i++) {
+				op[i].W = Ws[i]; op[i].Wbuf = NULL;
+			}
+			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
+			tc += now_ms() - a;
+			a = now_ms();
+			for (unsigned i = 0; i < G; i++) {
+				op[i].W = NULL; op[i].Wbuf = W16[i];
+			}
+			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
+			to += now_ms() - a;
+			a = now_ms();
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = NULL;
+			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
+			for (unsigned i = 0; i < G; i++)
+				(void)charsiu_fp16_out(fp, i);
+			charsiu_fp16_release(fp);
+			tb += now_ms() - a;
+			for (unsigned i = 0; i < G; i++)
+				op[i].Y = Yb[i];
+		}
+		charsiu_fp16_get_times(fp, &t1t);
+		charsiu_fp16_stats(fp, &c1, &r1);
+		s1 = charsiu_fp16_submits(fp);
+		printf("  %u rounds of %u matmuls%s\n", reps, G,
+		       failed ? "  (an arm refused)" : "");
+		printf("    weights copied   %.3f ms a matmul  (%.1f ms a round)\n",
+		       tc / (reps * G), tc / reps);
+		printf("    weights owned    %.3f ms a matmul  (%.1f ms a round)"
+		       "   %.2fx\n", to / (reps * G), to / reps,
+		       to > 0 ? tc / to : 0.0);
+		printf("    owned, not copied out  %.3f ms a matmul"
+		       "  (%.1f ms a round)   %.2fx\n",
+		       tb / (reps * G), tb / reps, tb > 0 ? tc / tb : 0.0);
+		printf("    %lu matmuls over %lu submits, %lu refused\n",
+		       c1 - c0, s1 - s0, r1 - r0);
+		printf("    both arms together: wcopy %.3f  pack %.3f"
+		       "  coefs %.3f  emit %.3f  submit %.3f  fence %.3f"
+		       "  read %.3f ms a round\n",
+		       (t1t.wcopy - t0t.wcopy) / reps,
+		       (t1t.pack - t0t.pack) / reps,
+		       (t1t.coefs - t0t.coefs) / reps,
+		       (t1t.emit - t0t.emit) / reps,
+		       (t1t.submit - t0t.submit) / reps,
+		       (t1t.fence - t0t.fence) / reps,
+		       (t1t.read - t0t.read) / reps);
+		for (unsigned i = 0; i < G; i++) {
+			charsiu_fp16_w_free(fp, W16[i]);
+			free(Xs[i]); free(Bs[i]); free(Ws[i]);
+			free(Ya[i]); free(Yb[i]); free(Yc[i]);
+		}
+		charsiu_fp16_close(fp);
+		rc = 0;
+		goto done;
+	}
 	if (doloop) {
 		/*
 		 * ⚠⚠ THE SAME JOB, N TIMES, COUNTING HOW MANY WRITE.
@@ -648,6 +1108,10 @@ int main(int argc, char **argv)
 			       t_split.pack / reps, t_split.cf / reps,
 			       t_split.emit / reps, t_split.run / reps,
 			       t_split.rd / reps);
+			printf("      of the read: fence+sync %.3f  copy %.3f"
+			       "  fini %.3f  ms each\n",
+			       t_read.fence / reps, t_read.copy / reps,
+			       t_read.fini / reps);
 		}
 		rc = 0;
 		goto done;
