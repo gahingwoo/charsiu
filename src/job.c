@@ -1813,6 +1813,31 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		uint32_t v = (job->acc_out || charsiu_w4_paired(&job->mm))
 			   ? 3u * batch : (uint32_t)(ow * (2 * rows - rows));
 
+		/*
+		 * ⚠⚠ FP16 HAS A CLOSED FORM AND IT IS THE LAST REGISTER THAT
+		 * DIFFERED. With acc_out set -- which is what the fp16 probe
+		 * submits -- our stream matched the vendor's on every register
+		 * but this one, at BOTH attention shapes:
+		 *
+		 *   ic 512  oc 64   M 32   ours 0x60   vendor 0xfffffe13
+		 *   ic 64   oc 1024 M 32   ours 0x60   vendor 0xffffe103
+		 *
+		 * and (oc / 4 + 3) - (M * oc) / 4 reproduces the vendor's value
+		 * on ALL 4940 of its fp16 streams, exactly. It is fp16's: the
+		 * same form matches only 512 of its 3328 int4 streams, so the
+		 * int4 and acc_out arms above keep the values this board
+		 * measured for them.
+		 *
+		 * ⚠ AND THE DIFF THAT FOUND IT HAD BEEN COMPARING THE WRONG ARM
+		 * ALL EVENING. emit_job leaves acc_out OFF unless
+		 * CHARSIU_ACC_OUT is set, while npu_fp16_test sets it, so every
+		 * stream comparison before this one was of a stream nobody
+		 * submitted. Six registers of difference became one when the
+		 * dump was told to match the submit.
+		 */
+		if (mm->wdtype == CHARSIU_FP16)
+			v = (uint32_t)((int32_t)(mm->n / 4 + 3)
+				       - (int32_t)((mm->m * mm->n) / 4));
 		if (e8b)
 			v = (uint32_t)strtoul(e8b, NULL, 0);
 		emit(&e, DPU, 0x40b8, v);
