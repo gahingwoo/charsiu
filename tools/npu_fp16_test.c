@@ -369,6 +369,7 @@ int main(int argc, char **argv)
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
 	int dogrp = argc > 3 && !strcmp(argv[3], "--group");
 	int doown = argc > 3 && !strcmp(argv[3], "--own");
+	int dosync = argc > 3 && !strcmp(argv[3], "--sync");
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
@@ -1044,6 +1045,71 @@ int main(int argc, char **argv)
 			charsiu_fp16_w_free(fp, W16[i]);
 			free(Xs[i]); free(Bs[i]); free(Ws[i]);
 			free(Ya[i]); free(Yb[i]); free(Yc[i]);
+		}
+		charsiu_fp16_close(fp);
+		rc = 0;
+		goto done;
+	}
+	if (dosync) {
+		/*
+		 * ⚠⚠ WHAT IT COSTS TO HAND A BUFFER BACK TO THE HARDWARE, and
+		 * why the answer decides how a KV cache is laid out.
+		 *
+		 * rocket_ioctl_fini_bo is dma_sync_sgtable_for_device over the
+		 * WHOLE buffer object, and rocket does not map its shmem write
+		 * combining, so that is real cache maintenance over every page
+		 * -- not over the bytes that changed. The uapi has no offset
+		 * or length.
+		 *
+		 * A KV cache is appended to and then read by the hardware, so
+		 * every chunk of a prompt pays one of these per buffer. If the
+		 * cost is per byte, then one buffer per layer and head is
+		 * 114 MB of cache maintenance a chunk on a 0.6B model, and the
+		 * cache has to be cut into position blocks so that only the
+		 * newest block is ever dirty -- which the group makes cheap,
+		 * since a block is just another op. If it is per call, none of
+		 * that is needed.
+		 *
+		 * So: buffers from 64 kB to 8 MB, prep and fini timed
+		 * separately, and the rate printed. Nothing here touches the
+		 * hardware queue; this is the ioctl alone.
+		 */
+		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 64;
+		struct charsiu_fp16 *fp = charsiu_fp16_open();
+		static const unsigned kb[] = { 64, 256, 1024, 4096, 8192 };
+
+		if (!fp) { printf("  could not open\n"); goto done; }
+		printf("prep and fini alone, %u repeats\n", reps);
+		printf("  buffer     prep ms    fini ms   both MB/s\n");
+		for (unsigned i = 0; i < sizeof(kb) / sizeof(*kb); i++) {
+			/* k and n chosen so the weight surface is about kb */
+			unsigned kk = 64;
+			unsigned nn = (unsigned)(((size_t)kb[i] * 1024)
+						 / (kk * 2));
+			struct charsiu_fp16_w *w;
+			double tp = 0, tf = 0, t0;
+			size_t bytes;
+
+			nn = (nn / 16) * 16;
+			if (nn < 32) nn = 32;
+			w = charsiu_fp16_w_alloc(fp, kk, nn);
+			if (!w) { printf("  %5u kB   no buffer\n", kb[i]); continue; }
+			bytes = charsiu_fp16_w_bytes(w);
+			/* warm: the first touch of a fresh mapping faults pages */
+			memset(charsiu_fp16_w_map(w), 0, bytes);
+			for (unsigned r = 0; r < reps; r++) {
+				t0 = now_ms();
+				charsiu_fp16_w_begin(fp, w);
+				tp += now_ms() - t0;
+				t0 = now_ms();
+				charsiu_fp16_w_end(fp, w);
+				tf += now_ms() - t0;
+			}
+			printf("  %5u kB   %7.4f   %7.4f   %8.1f\n",
+			       (unsigned)(bytes / 1024), tp / reps, tf / reps,
+			       (tp + tf) > 0 ? (double)bytes * reps
+			       / ((tp + tf) / 1000.0) / 1e6 : 0.0);
+			charsiu_fp16_w_free(fp, w);
 		}
 		charsiu_fp16_close(fp);
 		rc = 0;
