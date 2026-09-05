@@ -769,6 +769,18 @@ struct charsiu_npu {
 	int poolread;              /* 0 never, 1 always, 2 when m * n >= poolread_min */
 	unsigned poolread_min;
 	unsigned long bread_pooled, bread_serial;   /* slots read each way */
+	/*
+	 * ⚠ HOW MANY TIMES Y IS WALKED, AND HOW FEW IT COULD BE. Every slot's
+	 * read is one pass over its own range of the caller's Y: the first
+	 * assigns and the K slices after it add. Fusing the slices a device
+	 * holds for one output range would make that one pass instead of
+	 * several, and whether that is worth writing depends entirely on how
+	 * the deal spread the slices -- one slice per device per range and
+	 * there is nothing to fuse. So count the passes and count the ranges
+	 * before touching the loop.
+	 */
+	unsigned long bread_passes, bread_ranges;
+	uint64_t bseen_dev;        /* (device, output range) pairs seen this call */
 	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
@@ -1823,6 +1835,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		if (g->ndev > 1 && g->bwall_us > 0.0)
 			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
 				charsiu_npu_overlap_note());
+		if (g->bread_passes)
+			fprintf(stderr, "charsiu NPU: the read walked Y %lu times"
+				" over %lu (device, output range) pairs, so fusing"
+				" the K slices a device holds would save %lu of"
+				" them\n", g->bread_passes, g->bread_ranges,
+				g->bread_passes - g->bread_ranges);
 		if (g->bread_pooled + g->bread_serial)
 			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
 				" and %lu one thread (%s)\n",
@@ -4258,6 +4276,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * the read loop walks devices outermost, so ki = 1 can be read first.
 	 * "ki == 0 assigns" would have clobbered it.
 	 */
+	g->bseen_dev = 0;
 	if (g->bseen_n < e->n_slices) {
 		unsigned char *t2 = realloc(g->bseen, e->n_slices);
 
@@ -4704,6 +4723,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						grp, !g->bseen[ni]
 					};
 
+					g->bread_passes++;
+					if (!((g->bseen_dev >> (d * 16)) & (1u << ni)))
+						g->bread_ranges++;
+					g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
 					     (size_t)m * sn >= g->poolread_min)) {
