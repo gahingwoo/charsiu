@@ -437,6 +437,23 @@ from attention. A throttle is a gap wider than that alongside a temperature that
 climbed, which is why the temperature is printed next to the halves and not somewhere
 else.
 
+### fp16, which is how the vendor runs attention
+
+The vendor's own model file submits 4940 fp16 dispatches against 3328 int4
+ones: 56% of what it asks the NPU to do is attention, in fp16, and 2908 of
+those carry `oc = 64`, this model's head_dim. charsiu runs attention on the
+CPU, where it is 30 to 52% of a prompt.
+
+The fp16 matmul now works on this hardware and is bit exact against a CPU
+reference at every width tried. Priced on that, attention would cost 3.68 ms a
+row against the CPU's 6.67 at a batch of 178, about 1.31x on a Qwen3 prompt.
+Our TTFT is 2.2 to 3.0x behind the vendor's, so this closes roughly a third of
+that gap and is not the end of it.
+
+Nothing calls it yet. `src/npufp16.c` is a unit of its own and the int4 path
+cannot see it; `docs/lab-notebook.md` has what had to be found, including the
+six register-level fixes that were tried against a fault that was in a buffer.
+
 ## The instrument
 
 `tools/rkllm_regcmd.py` reads the NPU register command streams straight out of a

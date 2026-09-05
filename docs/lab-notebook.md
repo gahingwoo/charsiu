@@ -1475,3 +1475,60 @@ model, and the loop was reading each row four times; and the cache was laid out
 `[layer][position][head]` while attention walks one head across every position.
 Neither changes a number (the tokens are byte identical either way) and both
 were measured against a control that put the old behaviour back.
+
+## fp16 on the NPU, and what it is worth
+
+2026-09-05. The vendor runs attention on the NPU in fp16: 4940 of the 8808
+convolutions in its own `Llama-3.2-1B-rk3576-w4a16.rkllm`, 56% of everything it
+submits, against 3328 int4 projections. 2908 of those carry `oc = 64`, which is
+that model's head_dim, and their `ic` walks in steps of 32 with M chosen so the
+input surface lands just under 4096 every time. We run all of it on the CPU,
+where the batched stage table puts it at 30 to 52% of a prompt.
+
+So: can this hardware do an fp16 matmul at all, and is it worth moving?
+
+Both answers are yes and no in a specific way. The matmul works and is bit
+exact against a CPU fp16 reference at every width tried, on two independent
+paths. Priced on that verified computation, with the governor pinned and arms
+alternating, attention would cost 3.68 ms a row against the CPU's 6.67 at a
+batch of 178 -- 1.81x on attention, about 1.31x on a Qwen3 prompt. That is a
+step and not a finish: the vendor's TTFT is 2.2 to 3.0x ahead of ours, and this
+closes perhaps a third of it.
+
+### What had to be found
+
+Three things came off the vendor's file and were exact over all 4940 of its
+fp16 streams: `CNA 0x1030 = (ic*2) << 16`, `CNA 0x1090 = ic/8`,
+`DPU 0x4028 = oc/4 - 1`, `DPU 0x4030 = ((oc-1) << 16) | 0x310`, and
+`DPU 0x40b8 = (oc/4 + 3) - (M*oc)/4`. Two came off the board, each named by a
+number it returned:
+
+  - every output word `0x80808080`, the int8 zero point in all four bytes: the
+    DPU had been asked for an int8 output. An fp16 job takes the w4a16 output
+    stage, and every register that switches with it lands on the vendor's own
+    fp16 value.
+  - a weight of 1.0 against `A[0] = 1.0` returning **3600**, and `A[8] = 9.0`
+    returning **4320**. 3600 is `0x3c * 0x3c` and 4320 is `0x48 * 0x3c`: the
+    high bytes of the two fp16 patterns, multiplied as int8. The output stage
+    had moved and the multiply had not. `CORE 0x3018` takes its `0x200` form.
+
+And three layouts, none of them guessed. The weight buffer is `ngroup` 16 by
+`kgroup` 32 with two byte elements, measured by holing a dense buffer one
+element at a time: 1024 points, no exceptions. The output is flat, `m` by `n`
+row major, measured by putting `2^c` through it. The activation is plain row
+major, `[m][k]`, measured by writing one value into each packed input slot and
+reading which row answered.
+
+### The part worth reading twice
+
+fp16 was exact at `m = 1` and wrong at every width above it, and six
+register-level fixes were tried against that symptom without moving the error
+by a digit. The fault was in buffer content: `charsiu_pack_input_f16` writes
+`[k/8][m][8]`, and this path wants `[m][k]`. At `m = 1` the interleave is the
+identity, which is why one width worked and no other did.
+
+The register stream is where the previous four answers had been, so that is
+where each new one was looked for. "Where the last answer was" is not "where
+this answer is", and the thing that finally found it was the same slot sweep
+that had already settled the weight layout, pointed at the side nobody had
+measured.
