@@ -20,6 +20,32 @@
  *              anywhere else. What actually lights up IS the permutation, and
  *              it is printed whether or not it matches a candidate.
  *
+ * ⚠⚠⚠ USE A REAL SHAPE. K=16 N=8 AND K=64 N=8 WEDGE THE NPU.
+ *
+ * Measured 2026-09-05, --loop 32, the same job every time:
+ *
+ *     K=16  N=8     2 of 32 wrote
+ *     K=64  N=8    24 of 512 wrote (the --holes sweep)
+ *     K=64  N=64   32 of 32 wrote, dmesg clean
+ *     K=256 N=64   32 of 32 wrote, dmesg clean
+ *
+ * and on the small shapes dmesg carries "rocket: NPU job timed out" for BOTH
+ * cores followed by "rk_iommu: Error during raw reset. MMU_DTE_ADDR is not
+ * functioning", which is the reset defect this project already has on record.
+ * Two jobs get through -- one a core -- and then nothing until the timeout,
+ * which is what "two writes then eighteen silent, repeating" was all along.
+ *
+ * The board is fine: npu_gemm_test at 256x64 runs six times over with zero
+ * timeouts, and a model decodes normally.
+ *
+ * ⚠ THIS COST SIX WRONG EXPLANATIONS. A coverage defect, a zero-skipping
+ * weight fetch, a single zero killing the job, an fp16 register wedging the
+ * core, the buffer churn, a read that beat the fence -- every one of them a
+ * story about the thing under test, while the parameter that was actually
+ * responsible was the one I never moved. Two things would have found it in one
+ * round: reading dmesg, and varying the shape. npu_gemm_test has always used
+ * 256x64 and has never shown this, which was sitting there the whole time.
+ *
  * ⚠ THE ACCUMULATOR IS PRINTED BOTH WAYS. acc_out gives the raw accumulator
  * and nothing here has established whether an fp16 job accumulates in int32 or
  * in fp32. Reading it as one and not saying so is how a probe reports "wrong"
