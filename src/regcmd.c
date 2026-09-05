@@ -245,14 +245,39 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	emit(&e, CORE, 0x3004, 0x0000000e);
 
 	/*
-	 * NOT DECODED. The vendor carries 0x00600120 on its int4 projections
-	 * and 0x20200120 on its fp16 attention, so it is at least partly a
-	 * precision field, and the low half is the same in both. Copied rather
-	 * than derived, and marked as such: emitting 0 here is known wrong, and
-	 * a constant we cannot explain is the next thing to explain.
+	 * THE PRECISION REGISTER, and this was two constants copied out of the
+	 * vendor's int4 and fp16 streams with "emitting 0 here is known wrong"
+	 * written beside them. Both halves of that are refuted by the vendor's
+	 * own file, counted over every convolution in
+	 * Llama-3.2-1B-rk3576-w4a16 (2026-09-05):
+	 *
+	 *   int8 weights                       0x00000000    40
+	 *   int4 weights                       0x00600120  1408
+	 *   int4 weights, 16 bit activations   0x20600120  1920
+	 *   fp16 weights, 16 bit activations   0x20200120  4940
+	 *
+	 * So zero is what int8 carries, in all 40 of them, and job.c has had
+	 * that decoded for a while -- this emitter kept sending an int8 dump
+	 * the FP16 constant, which makes an int8 stream diff against the vendor
+	 * show a difference that is this line's and not the stream's. It also
+	 * sent plain 0x00600120 for int4 at 16 bit activations, which is
+	 * charsiu's own w4a16 shape and 1920 of the vendor's dispatches.
+	 *
+	 * ⚠ CHECKED AGAINST THE FILE, NOT AGAINST emit_dump. The note further
+	 * down this function is about exactly that mistake: emit_dump IS this
+	 * function, so it cannot fail a check on it. The four rows above are
+	 * read out of the .rkllm with tools/rkllm_regcmd.py, and the four cases
+	 * below reproduce all four.
 	 */
-	emit(&e, CNA, 0x100c,
-	     mm->wdtype == CHARSIU_INT4 ? 0x00600120u : 0x20200120u);
+	{
+		uint32_t prec = mm->wdtype == CHARSIU_INT4 ? 0x00600120u
+			      : mm->wdtype == CHARSIU_FP16 ? 0x00200120u
+			      : 0x00000000u;
+
+		if (charsiu_effective_adtype(mm) == CHARSIU_FP16)
+			prec |= 0x20000000u;
+		emit(&e, CNA, 0x100c, prec);
+	}
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);  /* stride 1 both axes */
 
