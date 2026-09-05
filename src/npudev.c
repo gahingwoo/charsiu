@@ -34,6 +34,7 @@
 #include <math.h>
 
 #include "reusekey.h"
+#include "kslice.h"
 #include "overlap.h"
 #include "charsiu.h"
 #include "charsiu_llm.h"
@@ -742,6 +743,7 @@ struct charsiu_npu {
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
 	int kfit;
+	int even_ks;      /* K slices of equal width, see slice_k() */
 	/*
 	 * ⚠⚠ WHETHER KFIT COULD FIRE AT ALL, which is not the same question
 	 * as whether it helped. The `ks--` below needs a REMAINDER: a model
@@ -1389,6 +1391,33 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
+	/*
+	 * ⚠ EQUAL K SLICES, AND WHAT MADE IT WORTH ASKING. slice_k() gives
+	 * every slice KMAX and lets the last one take the remainder, so
+	 * Phi-3.5's K = 3072 at KMAX 2048 is 2048 + 1024 and Qwen2.5's
+	 * K = 8960 is 2048 x4 + 768. Two things follow from the unequal
+	 * widths, and phase 9 on 2026-09-05 measured the second:
+	 *
+	 *   - the two cores get unequal work on every K sliced tensor, and
+	 *     the fence waits for the wide one;
+	 *   - deal_pick balances by accumulated load, so a wide slice and a
+	 *     narrow one leave the loads uneven and the NEXT tensor gets the
+	 *     opposite assignment. The map flips per tensor, so a follower's
+	 *     slice is always on the device that does not hold it. Phi-3.5
+	 *     reused its packed input 0 times out of 2304 asks and gemma4 0
+	 *     of 528, and every one of those misses was counted as "the K
+	 *     slices are on the other device". No other model has a K above
+	 *     KMAX and no other model loses a single reuse to this.
+	 *
+	 * Equal slices cost deal_pick the same load twice, so the assignment
+	 * is stable by construction and the two cores get equal work -- one
+	 * change for both, without touching the dealer or the reuse key.
+	 *
+	 * ⚠ OFF UNTIL THE BOARD SAYS. It changes the shapes submitted, so it
+	 * is a correctness question as well as a speed one, and this project
+	 * has shipped a faster wrong answer twice.
+	 */
+	g->even_ks = getenv("CHARSIU_NPU_EVEN_KS") != NULL;
 	/*
 	 * 🏁 2026-09-05: THE POOLED READ IS ON, ABOVE A SIZE. The note below
 	 * priced it when the read was 241 ms and the barrier 190 of that; at
@@ -2060,13 +2089,16 @@ static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
  * to agree exactly or a slice writes past the end of a buffer sized for fewer,
  * so the widths are computed here rather than written out twice.
  */
+static unsigned slice_k0(const struct charsiu_npu *g, uint64_t k, unsigned ks,
+			 unsigned ki)
+{
+	return charsiu_slice_k0(k, ks, ki, g->kmax, g->even_ks, g->kfit);
+}
+
 static unsigned slice_k(const struct charsiu_npu *g, uint64_t k, unsigned ks,
 			unsigned ki)
 {
-	/* ⚠ THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is more than
-	 * KMAX, and clamping it here would drop the tail of the tensor without
-	 * a word. */
-	return ki + 1 == ks ? (unsigned)(k - (uint64_t)ki * g->kmax) : g->kmax;
+	return charsiu_slice_kw(k, ks, ki, g->kmax, g->even_ks, g->kfit);
 }
 
 static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni)
@@ -2481,7 +2513,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	unsigned sid[2] = { 0, 0 };
 
 	for (unsigned ki = 0; ki < ks; ki++) {
-		unsigned k0 = ki * g->kmax;
+		unsigned k0 = slice_k0(g, t->k, ks, ki);
 		unsigned k = slice_k(g, t->k, ks, ki);
 
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
