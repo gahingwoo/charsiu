@@ -62,6 +62,23 @@
 
 #include "charsiu.h"
 
+/*
+ * ⚠ WHERE THE 2 ms GOES, because without this the loop times the PROBE and
+ * calls it the hardware. K=512 N=64, K=1024 N=64 and K=64 N=512 all came back
+ * 2.09 to 2.28 ms, which is nearly independent of both dimensions -- the shape
+ * of a fixed cost, not of a matmul. The pack alone walks k*n elements through
+ * charsiu_w16_offset one at a time.
+ */
+static struct { double pack, coef, emit, run, read; } t_split;
+
+static double now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 static const char *lname[CHARSIU_W16_NLAYOUT] = { "dense", "atom", "group" };
 
 /*
@@ -130,6 +147,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 {
 	struct charsiu_job job = { 0 };
 	size_t nreg, insz, wsz;
+	double tp;
 	int rc = -1;
 
 	job.cbuf_window = (unsigned)charsiu_cbuf_window();
@@ -163,6 +181,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 #define coef (pool.coef)
 #define reg  (pool.reg)
 
+	tp = now_ms();
 	charsiu_bo_prep(dev, &wt, 1000000000);
 	if (i8) {
 		memset(wt.map, 0x80, wsz);   /* every weight the zero point */
@@ -188,6 +207,8 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 		charsiu_pack_input_f16(&job.mm, A, in.map, insz);
 	}
 	charsiu_bo_fini(dev, &in);
+	t_split.pack += now_ms() - tp;
+	tp = now_ms();
 
 	{
 		int32_t *zero = calloc(n, sizeof(int32_t));
@@ -199,6 +220,8 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 		free(zero);
 	}
 
+	t_split.coef += now_ms() - tp;
+	tp = now_ms();
 	job.input_addr = (uint32_t)in.dma_address;
 	job.output_addr = (uint32_t)ob.dma_address;
 	job.weight_addr = (uint32_t)wt.dma_address;
@@ -219,6 +242,8 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	 * at zero. This project has read the second as the first three times in
 	 * a week. 0xdeadbeef survives only if nothing was written.
 	 */
+	t_split.emit += now_ms() - tp;
+	tp = now_ms();
 	charsiu_bo_prep(dev, &ob, 1000000000);
 	for (unsigned i = 0; i < m * n; i++)
 		((uint32_t *)ob.map)[i] = 0xdeadbeefu;
@@ -232,9 +257,12 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 			goto out;
 		}
 	}
-	charsiu_bo_prep(dev, &ob, 1000000000);
+	t_split.run += now_ms() - tp;
+	tp = now_ms();
+	charsiu_bo_prep(dev, &ob, 1000000000);   /* this is the fence wait */
 	memcpy(out, ob.map, (size_t)m * n * 4);
 	charsiu_bo_fini(dev, &ob);
+	t_split.read += now_ms() - tp;
 	rc = 0;
 out:
 	return rc;
@@ -273,14 +301,6 @@ static void reference(unsigned m, unsigned k, unsigned n,
 				     * charsiu_half_to_float(charsiu_float_to_half(B[(size_t)c * k + i]));
 			out[(size_t)r * n + c] = acc;
 		}
-}
-
-static double now_ms(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
 static float asf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
@@ -362,6 +382,11 @@ int main(int argc, char **argv)
 
 			printf("  %.3f ms a matmul over %u that wrote"
 			       " (%.1f ms wall)\n", el / wrote, wrote, el);
+			printf("    pack %.3f  coefs %.3f  emit %.3f"
+			       "  submit %.3f  fence+read %.3f  ms each\n",
+			       t_split.pack / reps, t_split.coef / reps,
+			       t_split.emit / reps, t_split.run / reps,
+			       t_split.read / reps);
 		}
 		rc = 0;
 		goto done;
