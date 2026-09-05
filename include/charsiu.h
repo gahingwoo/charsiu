@@ -169,50 +169,36 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  *   CHARSIU_W16_ATOM    the activation packer's shape, [k/8][n][8]
  *   CHARSIU_W16_GROUP   int8's ngroup/kgroup tiling with 2 byte elements
  *
- * 🏁 AND THE BOARD SAID DENSE, 2026-09-05. npu_fp16_test --slots writes 1.0
- * into one SLOT of the buffer at a time and reads back which channel it lands
- * in and which A[k] it multiplied, so it reads the hardware's own mapping with
- * no candidate in the way. Three independent sweeps at K=16 N=8, eighteen
- * firing slots between them, and every one of them satisfies
+ * 🏁 THE BOARD SAID **GROUP**, 2026-09-05: ngroup 16, kgroup 32, two byte
+ * elements, which is exactly what charsiu_weight_ngroup() and
+ * charsiu_weight_kgroup() already return for fp16 by inheriting int8's
+ * numbers. The inherited guess was right.
  *
- *     slot = n * k_eff + k
+ * npu_fp16_test --holes at K=64 N=64: every weight 1.0 except one, A[k] = 2^k,
+ * so the channel that comes back missing a bit names both halves of the hole.
+ * 1024 points, every channel, k = 0..15:
  *
- * exactly, which is CHARSIU_W16_DENSE. --map, which packs through this
- * function, agrees: every cell that fires comes back in the right channel with
- * the right A[k].
+ *     CHARSIU_W16_GROUP     0 exceptions of 1024
+ *     CHARSIU_W16_DENSE   960 exceptions of 1024
  *
- * ⚠⚠ WHAT IS STILL WRONG IS COVERAGE, NOT LAYOUT, and the two look alike from
- * a distance. Only about 12 of the 128 products are accumulated at all, six
- * channels of eight with two consecutive k each, and WHICH ones changes from
- * run to run with nothing changed but the run:
+ * The base slot of channel n is 1024 * (n / 16) + 32 * (n % 16), and k runs
+ * contiguously from it.
  *
- *   run 1   n=0 k=0,1   n=1 k=10,11  n=3 k=6,7   n=4 k=14,15  n=6 k=4,5  n=7 k=8,9
- *   run 2   n=0 k=0,1   n=1 k=8,9    n=3 k=0,1   n=4 k=12,13  n=6 k=4,5  n=7 k=14,15
- *   run 3   n=0 k=0,1   n=1 k=4,5    n=2 k=10,11 n=4 k=6,7    n=6 k=0,1  n=7 k=8,9
+ * ⚠⚠⚠ AND I PUBLISHED "DENSE, MEASURED THREE TIMES" BEFORE THIS. Every earlier
+ * reading was taken at K=16 N=8, and AT THAT SHAPE THE TWO LAYOUTS ARE
+ * IDENTICAL IN ALL 128 CELLS: ngroup 16 exceeds N=8 and kgroup 32 exceeds
+ * K=16, so the grouping degenerates to 16n + k, which is also what dense
+ * gives. Sixty-two points, five runs, two instruments with nothing in common,
+ * all agreeing -- and all of them blind to the question by construction.
  *
- * The mapping is stable and correct in all three; the set of products is not.
- * Channel 0 fires at k=0,1 in every run.
+ * That shape was chosen because it was small. It also wedges the NPU after two
+ * jobs (see the note at the top of npu_fp16_test.c), which is what made the
+ * probes look unreliable for an evening. One bad choice of shape produced a
+ * wrong answer AND the noise that hid it.
  *
- * ⚠⚠ AND THE SPARSE PROBE WAS NOT VALID, WHICH DID NOT CHANGE THE ANSWER.
- * --slots leaves the buffer 99.99% zero, and this silicon has weight sparsity,
- * so a fetch that skips zero blocks would behave exactly like that drift.
- * --bits then set every weight to 1.0 with A[k] = 2^k: EVERY channel came back
- * 0xffff, all sixteen terms, three runs running and again at K=64 N=64 and
- * K=256 N=64. Coverage is COMPLETE and the sparse buffer was the artefact.
- *
- * --bits cannot answer the layout either -- with every weight 1.0 the sum is
- * the same under any permutation -- so --holes asks it on a DENSE buffer:
- * every weight 1.0 except one, and the channel that comes back missing a bit
- * names both halves of the hole. Over four runs and two instruments that have
- * nothing in common,
- *
- *     48 firing points, 0 exceptions to slot = n * k_eff + k
- *
- * so the layout is settled by an instrument the sparsity objection does not
- * reach. What is NOT settled is why only 12 of 128 single-weight
- * perturbations register at all, on the dense buffer too, with the set moving
- * between runs. That is its own question and it is not a layout question:
- * every observation that carries layout information agrees.
+ * ⚠ A LAYOUT PROBE MUST RUN WHERE THE CANDIDATES DIFFER. Check that first, on
+ * a desk, before spending a board round: tests/pack_f16w.c can compare two
+ * layouts for any shape without hardware.
  */
 enum charsiu_w16_layout {
 	CHARSIU_W16_DENSE,

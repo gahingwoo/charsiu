@@ -355,3 +355,32 @@ TOTAL 48 points, 0 exceptions
 Still open, and NOT a layout question: only 12 of 128 single-weight
 perturbations register at all, on the dense buffer too, and the set moves
 between runs. Every observation that carries layout information agrees.
+
+
+## Correction: the layout is GROUP, not dense
+
+Everything above about `slot = n * k_eff + k` was measured at K=16 N=8, and at
+that shape the dense and grouped layouts are **identical in all 128 cells**:
+ngroup 16 exceeds N=8 and kgroup 32 exceeds K=16, so the grouping degenerates
+to `16n + k`, which is what dense gives too. Sixty-two points across five runs
+and two independent instruments all agreed, and every one of them was blind to
+the question by construction.
+
+Re-taken at K=64 N=64, where the two differ, with `--holes` (every weight 1.0
+except one, `A[k] = 2^k`, so the channel that returns missing a bit names both
+halves of the hole). 1024 points, all 64 channels, k = 0..15:
+
+```
+CHARSIU_W16_GROUP     0 exceptions of 1024
+CHARSIU_W16_DENSE   960 exceptions of 1024
+```
+
+The base slot of channel n is `1024 * (n / 16) + 32 * (n % 16)` and k runs
+contiguously from it. That is ngroup 16, kgroup 32, two byte elements, which is
+what `charsiu_weight_ngroup()` and `charsiu_weight_kgroup()` already returned
+for fp16 by inheriting int8's numbers. **The inherited guess was correct and
+the measurement that contradicted it was taken where it could not see.**
+
+⚠ K=16 N=8 was chosen because it was small. It also wedges the NPU after two
+jobs. One bad choice of shape produced the wrong answer and the noise that hid
+it, and cost six wrong explanations of the noise.
