@@ -4,9 +4,9 @@
  * How one tensor's contraction axis is cut into slices, as arithmetic alone.
  *
  * ⚠⚠ THE OLD RULE AND WHY IT COST SOMETHING. Every slice took KMAX and the
- * last one took the remainder, so Phi-3.5's K = 3072 at KMAX 2048 is
- * 2048 + 1024 and Qwen2.5's K = 8960 is 2048 x4 + 768. Two costs, and phase 9
- * on 2026-09-05 measured the second:
+ * last one took the remainder, so at KMAX 2048 a K of 3072 is 2048 + 1024 and
+ * Qwen2.5's 8960 is 2048 x4 + 768. Two costs, and phase 9 on 2026-09-05
+ * measured the second:
  *
  *   - the two cores get unequal work on every K sliced tensor, and the fence
  *     waits for the wide one;
@@ -15,12 +15,32 @@
  *     assignment. The map flips per tensor, so a follower's slice always
  *     lands on the device that does not hold it. Phi-3.5 reused its packed
  *     input 0 times out of 2304 asks and gemma4 0 of 528, and every one of
- *     those misses was counted "the K slices are on the other device". They
- *     are the only two models here whose K is above KMAX.
+ *     those misses was counted "the K slices are on the other device".
  *
  * Equal slices cost deal_pick the same load twice, so the assignment is
  * stable by construction and the cores get equal work: one change for both,
  * without touching the dealer or the reuse key.
+ *
+ * ⚠⚠ MEASURED, AND IT IS WORTH ALMOST NOTHING. Board, 2026-09-05, phase 2
+ * clean on nine models and phase 9 with it on:
+ *
+ *   gemma4      528 misses -> 0,   prompt 30110 -> 29884 ms   (-0.8%)
+ *   Phi-3.5    2304 misses -> 2304, unchanged
+ *
+ * -0.8% is inside the run to run spread, so eliminating a model's reuse
+ * misses entirely bought nothing measurable. That is the answer to "is the
+ * reuse worth chasing", and it is no. OFF by default, kept because the
+ * arithmetic is right and the next person should not re-derive it.
+ *
+ * ⚠ AND WHY PHI-3.5 DID NOT MOVE, WHICH IS NOT WHAT THE FIRST COMMIT SAID.
+ * llama.c picks KMAX itself: 1024 unless NO n_ff of the model is a multiple
+ * of a candidate. Phi-3.5's n_ff is 8192, a multiple of both, so it runs at
+ * KMAX 1024 -- where its K of 3072 is already 1024 x3 and its 8192 is
+ * 1024 x8. Both were already even and this changes nothing for it. Its
+ * misses are the case equal widths CANNOT fix: three slices across two
+ * devices is two and one, so the accumulated load still alternates and the
+ * map still flips. An even slice COUNT is a different fix from an even slice
+ * WIDTH, and nothing here does the first.
  *
  * In a header of its own so the tiling can be checked on a desk with no NPU
  * (tests/even_ks.c, under make test) -- that the slices tile K exactly, that

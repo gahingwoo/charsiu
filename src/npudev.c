@@ -1406,16 +1406,18 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 *     slice is always on the device that does not hold it. Phi-3.5
 	 *     reused its packed input 0 times out of 2304 asks and gemma4 0
 	 *     of 528, and every one of those misses was counted as "the K
-	 *     slices are on the other device". No other model has a K above
-	 *     KMAX and no other model loses a single reuse to this.
+	 *     slices are on the other device".
 	 *
 	 * Equal slices cost deal_pick the same load twice, so the assignment
 	 * is stable by construction and the two cores get equal work -- one
 	 * change for both, without touching the dealer or the reuse key.
 	 *
-	 * ⚠ OFF UNTIL THE BOARD SAYS. It changes the shapes submitted, so it
-	 * is a correctness question as well as a speed one, and this project
-	 * has shipped a faster wrong answer twice.
+	 * ⚠ OFF, AND THE BOARD IS WHY. Phase 2 is clean on nine models with it
+	 * on, so it is correct; it is just not worth anything. gemma4's 528
+	 * misses went to 0 and its prompt moved 30110 -> 29884 ms, which is
+	 * inside the spread, and Phi-3.5 did not move at all because at the
+	 * KMAX llama.c picks for it (1024) its slices were already even.
+	 * kslice.h has the whole result.
 	 */
 	g->even_ks = getenv("CHARSIU_NPU_EVEN_KS") != NULL;
 	/*
