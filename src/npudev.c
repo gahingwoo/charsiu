@@ -1432,14 +1432,44 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * 17219, Qwen3 12145 -> 13216. The two that lost have the narrowest
 	 * tensors, which is the old note still being right for small work.
 	 * So: pool a slot's rows when m * n reaches CHARSIU_NPU_POOL_READ_MIN
-	 * elements (default 262144, one megabyte of floats), never below.
-	 * CHARSIU_NPU_POOL_READ=1 pools always, =0 never; both are arms.
+	 * elements, never below. CHARSIU_NPU_POOL_READ=1 pools always, =0
+	 * never; both are arms.
+	 *
+	 * ⚠⚠ 2026-09-06: 262144 -> 32768, AND THE MODEL THAT LOST YESTERDAY
+	 * GAINS THE MOST TODAY.
+	 *
+	 * The stage table learned to split the NPU entry and said the READ is
+	 * 2.70 ms of a 5.26 ms row -- a third of the whole prompt, more than
+	 * the attention. At a chunk of 80 rows only gate and up cleared
+	 * 262144, so five of seven matmuls read back on one thread. Three
+	 * models on the board, alternating, prompt time:
+	 *
+	 *   threshold          262144      32768        all
+	 *   Llama-3.2-1B        4339 ms     4146        4113
+	 *   Qwen3-0.6B         13717       12319       12381
+	 *   SmolLM2-135M        4750        4418        4403
+	 *
+	 * Yesterday Qwen3 went 12145 -> 13216 with pool-all and that is why
+	 * the threshold was high. Today it is the biggest winner. The thing
+	 * that changed in between is that the batched path now runs four
+	 * elementwise stages and the attention on the same pool, so its
+	 * threads are warm when a read asks for them -- a HYPOTHESIS for the
+	 * flip, not a measurement of it, and the reason it is written down is
+	 * that it means yesterday's negatives may need re-running rather than
+	 * trusting.
+	 *
+	 * ⚠ DECODE WAS MEASURED SEPARATELY, because at m = 1 this lets the
+	 * output head through where 262144 did not, and decode is the half
+	 * that is already at parity: Llama 22.59, 22.48, 22.41, 22.49 tok/s
+	 * across both arms and Qwen3 982, 988 against 987 ms -- unchanged.
+	 * SmolLM2 generated nothing on that prompt, so decode is two models
+	 * and not three.
 	 */
 	{
 		const char *e = getenv("CHARSIU_NPU_POOL_READ");
 
 		g->poolread = !e || !*e ? 2 : *e == '0' ? 0 : 1;   /* 2 = by size */
-		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 262144);
+		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 32768);
 	}
 	/*
 	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
