@@ -1614,6 +1614,27 @@ cache lives, the difference is real. Then the board was asked the same question
 end to end: buffers allocated at 2n, written through `charsiu_fp16_woffset` at
 that width, run at n. Identical.
 
+### Where it ended, per matmul
+
+Owned weight, borrowed answer, back to back, against the same matmul alone on
+the first round:
+
+```
+  shape                    alone      grouped
+  k=64   n=1024 m=8  G=16  0.989 ms   0.073 ms
+  k=1024 n=64   m=8  G=16  1.245 ms   0.121 ms
+  k=64   n=1024 m=80 G=16  2.251 ms   0.470 ms
+  k=1024 n=64   m=80 G=16  1.922 ms   0.277 ms
+```
+
+⚠ **That is not a speedup over the CPU and must not be read as one.** These
+shapes hold a cache 1024 positions deep, and the 6.62 ms a row the CPU spends
+on attention was measured on a 256 token prompt, where the cache averages a
+fraction of that. The two numbers are not comparable and nothing in the model
+calls the group yet. This project has already published one attention speedup
+that was void; the honest statement is the cost of a matmul, and the comparison
+belongs to the integration that makes it.
+
 ### Two things this did not settle
 
 `CHARSIU_FP16_JOBS=split` sends N jobs instead of N chained tasks, so the
