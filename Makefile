@@ -192,7 +192,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan $(BUILD)/pack_groups
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -201,6 +201,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
 	./$(BUILD)/fp16_plan
+	./$(BUILD)/pack_groups
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
@@ -209,6 +210,11 @@ $(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the packer split by groups against the whole buffer it replaces: a byte
+# wrong here is a slightly wrong sentence and not a fault
+$(BUILD)/pack_groups: tests/pack_groups.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the group's four buffers are addressed by arithmetic, and arithmetic that

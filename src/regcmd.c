@@ -785,6 +785,85 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
  * destination reason above -- only the stride differs, so nothing about the
  * measurements in that comment moves.
  */
+/*
+ * GROUPS [g0, g0 + ng) OF THE BATCHED ACTIVATION, AND NOTHING ELSE.
+ *
+ * The batched packer walks groups outermost -- a group of 8 k is 16 contiguous
+ * destination bytes per row, so a group owns m * 16 bytes and no other group
+ * touches them. That is what lets the pool have it, the same way
+ * charsiu_pack_weights_rows lets staging split.
+ *
+ * ⚠ Splitting by GROUPS and not by rows on purpose. The note on the whole
+ * buffer entry has the measurement: rows outermost falls to 6.87 GB/s against
+ * groups outermost at 24.57 on a cold destination, which is the only kind this
+ * ever meets, because PREP_BO invalidates the input buffer object immediately
+ * before the loop runs. A row split would hand every thread the slow order.
+ *
+ * ⚠ THE CALLER OWNS THE EDGES: charsiu_pack_input_f16_edges does the tail
+ * memset and the k % atom remainder, once, before any range runs. The values
+ * are the values -- this is the same loop body, so a split changes no byte.
+ */
+unsigned charsiu_pack_input_f16_ngroups(const struct charsiu_matmul *mm)
+{
+	static int plain = -1;
+
+	if (plain < 0)
+		plain = envq("CHARSIU_NPU_PLAIN") != NULL;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (mm->m > 1 && !plain && charsiu_feature_atom(CHARSIU_FP16) == 8)
+		return mm->k / 8;
+#else
+	(void)mm;
+#endif
+	return 0;
+}
+
+void charsiu_pack_input_f16_edges(const struct charsiu_matmul *mm,
+				  const float *src, size_t src_stride,
+				  uint8_t *dst, size_t dst_size)
+{
+	unsigned atom = 8, ng = mm->k / atom, tail = mm->k % atom;
+	size_t base = (size_t)ng * mm->m * atom * 2;
+	unsigned i, kk;
+
+	if (dst_size > base)
+		memset(dst + base, 0, dst_size - base);
+	for (i = 0; i < mm->m; i++)
+		for (kk = 0; kk < tail; kk++) {
+			uint16_t h = charsiu_f2h(
+				src[(size_t)i * src_stride + ng * atom + kk]);
+			uint8_t *p = dst + base + (size_t)i * 16
+				   + (size_t)kk * 2;
+
+			p[0] = (uint8_t)(h & 0xff);
+			p[1] = (uint8_t)(h >> 8);
+		}
+}
+
+void charsiu_pack_input_f16_groups(const struct charsiu_matmul *mm,
+				   const float *src, size_t src_stride,
+				   uint8_t *dst, unsigned g0, unsigned ng)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	unsigned atom = 8, m = mm->m, g, i;
+
+	for (g = g0; g < g0 + ng; g++) {
+		const float *s = src + (size_t)g * atom;
+		uint8_t *d = dst + (size_t)g * m * atom * 2;
+
+		for (i = 0; i < m; i++, d += 16) {
+			const float *r = s + (size_t)i * src_stride;
+
+			vst1q_u16((uint16_t *)d,
+				  vcombine_u16(charsiu_vhalf(vld1q_f32(r)),
+					       charsiu_vhalf(vld1q_f32(r + 4))));
+		}
+	}
+#else
+	(void)mm; (void)src; (void)src_stride; (void)dst; (void)g0; (void)ng;
+#endif
+}
+
 void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 				   const float *src, size_t src_stride,
 				   uint8_t *dst, size_t dst_size)

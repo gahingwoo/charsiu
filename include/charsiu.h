@@ -296,6 +296,20 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 			    uint8_t *dst, size_t dst_size);
 /* the same, reading rows of `src` that are src_stride floats apart: a K slice
  * can be packed out of the caller's own matrix without a gather into scratch */
+/*
+ * The batched activation packer, split by GROUPS of 8 k so a pool can have it.
+ * ngroups returns 0 when the shape does not take the vector path, and the
+ * caller then uses the whole buffer entry below. edges does the tail memset
+ * and the k % 8 remainder, once, before any range runs.
+ */
+unsigned charsiu_pack_input_f16_ngroups(const struct charsiu_matmul *mm);
+void charsiu_pack_input_f16_edges(const struct charsiu_matmul *mm,
+				  const float *src, size_t src_stride,
+				  uint8_t *dst, size_t dst_size);
+void charsiu_pack_input_f16_groups(const struct charsiu_matmul *mm,
+				   const float *src, size_t src_stride,
+				   uint8_t *dst, unsigned g0, unsigned ng);
+
 void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 				   const float *src, size_t src_stride,
 				   uint8_t *dst, size_t dst_size);

@@ -455,6 +455,10 @@ struct charsiu_npu {
 	 * vectorised walk -- so a single "pack" number cannot choose between
 	 * them, which is the same mistake the entry split just fixed. */
 	double bgather_us, bpackcall_us;
+	/* the packer on the pool: 2 = by size, 1 = always, 0 = never */
+	int packpool;
+	unsigned packpool_min;
+	unsigned long bpack_pooled, bpack_serial;
 	/*
 	 * ⚠ PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
 	 * 80: "pack" was 2.0 ms a row, 0.8 ms a call, and the fp16 packer moves
@@ -1478,6 +1482,17 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 32768);
 	}
 	/*
+	 * The packer on the pool, by group count. 2 = by size, 1 = always,
+	 * 0 = never; both extremes are arms, and the size is in GROUPS of 8 k
+	 * because that is what the split is over.
+	 */
+	{
+		const char *e = getenv("CHARSIU_NPU_PACK_POOL");
+
+		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
+		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 64);
+	}
+	/*
 	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
 	 * 2026-09-03: Qwen3 read 3234 ms with it against 1339 without, Phi-3.5
@@ -1917,6 +1932,13 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				" the K slices a device holds would save %lu of"
 				" them\n", g->bread_passes, g->bread_ranges,
 				g->bread_passes - g->bread_ranges);
+		if (g->bpack_pooled + g->bpack_serial)
+			fprintf(stderr, "charsiu NPU: packed %lu activations on"
+				" the pool and %lu one thread (%s)\n",
+				g->bpack_pooled, g->bpack_serial,
+				g->packpool == 1 ? "CHARSIU_NPU_PACK_POOL=1, always" :
+				g->packpool == 0 ? "CHARSIU_NPU_PACK_POOL=0, never" :
+				"pooled from CHARSIU_NPU_PACK_POOL_MIN groups");
 		if (g->bread_pooled + g->bread_serial)
 			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
 				" and %lu one thread (%s)\n",
@@ -3918,6 +3940,60 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	return 1;
 }
 
+/*
+ * ⚠⚠ THE PACKER ON THE POOL, SPLIT BY GROUPS.
+ *
+ * The entry split put 1.20 ms a row in the pack on Llama-3.2-1B and 1.62 on
+ * Qwen3-0.6B, and splitting THAT said the packer call is 0.61 and 1.11 of it
+ * -- the largest piece, and on Qwen3 the largest piece of the whole entry.
+ * The packer has been NEON since the width work; it has never been on more
+ * than one core.
+ *
+ * ⚠ BY GROUPS AND NOT BY ROWS. The packer walks groups of 8 k outermost
+ * because the destination is a cold write back mapping -- PREP_BO invalidates
+ * it immediately before -- and rows outermost measured 6.87 GB/s against
+ * 24.57 on a cold buffer. A row split would hand every thread the slow order.
+ * A group owns m * 16 contiguous bytes and no other group touches them.
+ *
+ * tests/pack_groups.c walks 707 shapes and splits, byte for byte against the
+ * whole buffer entry, including uneven splits, a source stride wider than k,
+ * and a k that is not a multiple of the atom.
+ */
+struct pack_groups_job {
+	const struct charsiu_matmul *mm;
+	const float *src;
+	size_t stride;
+	uint8_t *dst;
+};
+
+static void pack_groups_worker(void *ctx, uint64_t g0, uint64_t ng)
+{
+	struct pack_groups_job *j = ctx;
+
+	charsiu_pack_input_f16_groups(j->mm, j->src, j->stride, j->dst,
+				      (unsigned)g0, (unsigned)ng);
+}
+
+static void pack_f16_pooled(struct charsiu_npu *g,
+			    const struct charsiu_matmul *mm,
+			    const float *src, size_t stride,
+			    uint8_t *dst, size_t dst_size)
+{
+	unsigned ng = charsiu_pack_input_f16_ngroups(mm);
+
+	if (ng && (g->packpool == 1 ||
+		   (g->packpool == 2 && ng >= g->packpool_min))) {
+		struct pack_groups_job pj = { mm, src, stride, dst };
+
+		charsiu_pack_input_f16_edges(mm, src, stride, dst, dst_size);
+		charsiu_parallel_for(pack_groups_worker, &pj, ng);
+		g->bpack_pooled++;
+		return;
+	}
+	charsiu_pack_input_f16_stride(mm, src, stride, dst, dst_size);
+	g->bpack_serial++;
+}
+
 static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 {
 	struct read_rows *c = ctx;
@@ -4618,11 +4694,11 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						   g->bin_stride, s->job.input_zero_point);
 			} else if (sk == e->t->k && !pack_gather()) {
 				/* the slice is the whole row, so k0 is 0 */
-				charsiu_pack_input_f16_stride(&mm, X, e->t->k,
+				pack_f16_pooled(g, &mm, X, e->t->k,
 						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						g->bin_stride);
 			} else {
-				charsiu_pack_input_f16(&mm, g->bscr,
+				pack_f16_pooled(g, &mm, g->bscr, mm.k,
 						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						g->bin_stride);
 			}
