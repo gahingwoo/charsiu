@@ -191,28 +191,55 @@ int main(int argc, char **argv)
 		goto done;
 	}
 
+	/*
+	 * ⚠⚠ (i % 13) - 6 ON AN UNSIGNED i IS 4 BILLION, NOT -6, and the first
+	 * run of this probe was entirely that. The data came out ~1e9, fp16
+	 * turned it into inf, inf + -inf made the reference NaN, and the
+	 * hardware wrote 0x7f7f7f7f. Cast before subtracting.
+	 */
 	for (unsigned i = 0; i < m * k; i++)
-		A[i] = (float)((i % 13) - 6) * 0.25f;
+		A[i] = (float)((int)(i % 13) - 6) * 0.25f;
 	for (unsigned i = 0; i < n * k; i++)
-		B[i] = (float)((i % 7) - 3) * 0.5f;
+		B[i] = (float)((int)(i % 7) - 3) * 0.5f;
 	reference(m, k, n, A, B, ref);
+	for (unsigned i = 0; i < m * n; i++)
+		if (!isfinite(ref[i])) {
+			printf("  the CPU reference is not finite at %u"
+			       " -- the INPUTS are wrong, not the hardware."
+			       " Refusing to compare.\n", i);
+			goto done;
+		}
 
 	for (int L = 0; L < CHARSIU_W16_NLAYOUT; L++) {
 		double worst = 0;
-		int any = 0;
+		int any = 0, bad = 0;
 
 		if (run(dev, m, k, n, A, B, (enum charsiu_w16_layout)L, got)) {
 			printf("  %-6s could not run\n", lname[L]);
 			continue;
 		}
+		/*
+		 * ⚠⚠ A NaN MUST NOT SCORE ZERO. `d > worst` is false when d is
+		 * NaN, so the first version of this loop reported a worst error
+		 * of 0 -- a perfect match -- for a run whose reference was
+		 * entirely NaN, on all three layouts at once. A probe that
+		 * cannot measure has to say so, not agree with you.
+		 */
 		for (unsigned i = 0; i < m * n; i++) {
 			double d = fabs(asf(got[i]) - ref[i]);
 
 			if (got[i]) any = 1;
+			if (!isfinite(d)) { bad = 1; continue; }
 			if (d > worst) worst = d;
 		}
-		printf("  %-6s worst |fp32 read - reference| %.4g%s\n",
-		       lname[L], worst, any ? "" : "   (every output zero)");
+		if (bad)
+			printf("  %-6s the hardware returned something that is "
+			       "not a finite float -- NOT a match\n", lname[L]);
+		else
+			printf("  %-6s worst |fp32 read - reference| %.4g%s%s\n",
+			       lname[L], worst,
+			       any ? "" : "   (every output zero)",
+			       worst == 0.0 && any ? "   <== EXACT" : "");
 		printf("         first four: raw %08x %08x %08x %08x\n",
 		       got[0], m * n > 1 ? got[1] : 0, m * n > 2 ? got[2] : 0,
 		       m * n > 3 ? got[3] : 0);

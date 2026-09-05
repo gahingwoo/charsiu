@@ -1132,8 +1132,17 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * same shape carries twice the kernel size: 0x80 against our 0x40 at
 	 * K=64. Both are right for their own precision.
 	 */
+	/*
+	 * ⚠ AND THE DOUBLING MUST NOT REACH FP16, whose bytes are already two.
+	 * The vendor writes (ic * 2) << 16 here in all 4940 of its fp16 streams,
+	 * exactly, and wbytes / n_pad IS ic * 2 for fp16 -- so doubling it again
+	 * asks for ic * 4. The comment above is about int8, where the kernel
+	 * really is carried at twice its byte size.
+	 */
 	emit(&e, CNA, 0x1030,
-	     ((uint32_t)(wbytes / n_pad * (mm->wdtype == CHARSIU_INT4 ? 1u : 2u))
+	     ((uint32_t)(wbytes / n_pad
+			 * (mm->wdtype == CHARSIU_INT4 ||
+			    mm->wdtype == CHARSIU_FP16 ? 1u : 2u))
 	      << 16) | (ow - 1));
 	emit(&e, CNA, 0x1034, ow * rows - 1);
 	/* Mesa writes 0x1038 a SECOND time here, after the geometry and before
@@ -1226,7 +1235,14 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * CHARSIU_CNA_1098 still reaches the one register whose value Mesa
 	 * rounds and regcmd.c does not.
 	 */
-	emit(&e, CNA, 0x1090, inw * 4);
+	/*
+	 * ⚠ FP16 COUNTS THE CONTRACTION AXIS HERE, NOT THE WINDOW. Exact over
+	 * all 4940 vendor fp16 streams: 0x1090 = ic / 8, the 2 byte feature
+	 * atom. inw * 4 is the int8/int4 form and gives 4 for a 1 wide window,
+	 * which is what this emitted for an fp16 job before.
+	 */
+	emit(&e, CNA, 0x1090,
+	     mm->wdtype == CHARSIU_FP16 ? mm->k / 8 : inw * 4);
 	/*
 	 * ⚠ FP16 DESCRIBES ITS WINDOW AS 1 x 1, and these four registers are
 	 * where it says so. Over all 4940 of the vendor's fp16 streams,
@@ -1558,7 +1574,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     mm->wdtype == CHARSIU_FP16 ? 1u : ow * rows);   /* ow * full_oh */
 	emit(&e, DPU, 0x4020, mm->wdtype == CHARSIU_FP16 ? 0u : ow - 1);
 	emit(&e, DPU, 0x4024, wide ? rows - 1 : lines);
-	emit(&e, DPU, 0x4028, 0x00000000);
+	/* fp16: oc / 4 - 1, exact over all 4940 vendor fp16 streams */
+	emit(&e, DPU, 0x4028,
+	     mm->wdtype == CHARSIU_FP16 ? mm->n / 4 - 1 : 0x00000000u);
 	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
 					     and it changed nothing */
 	/*
@@ -1578,7 +1596,9 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     ((uint32_t)(charsiu_w4_paired(mm) ? 2 * mm->n - 1 : mm->n - 1) << 16) |
 	     (uint32_t)(envq("CHARSIU_DPU_4030")
 			? strtoul(envq("CHARSIU_DPU_4030"), NULL, 0)
-			: (WIDE(1) ? 0x0310u : 0x0710u)));
+			/* fp16 is 0x310 in all 4940 vendor streams */
+			: (mm->wdtype == CHARSIU_FP16 || WIDE(1)
+			   ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, wide ? (((uint32_t)(rows - 1) << 16) | (ow - 1))
 				   : ((lines << 16) | 0));
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53

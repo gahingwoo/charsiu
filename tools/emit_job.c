@@ -23,6 +23,10 @@ int main(int argc, char **argv)
 	job.mm.wdtype = CHARSIU_INT8;
 	job.mm.adtype = CHARSIU_INT8;
 	if (argc > 4 && !strcmp(argv[4], "int4")) job.mm.wdtype = CHARSIU_INT4;
+	/* fp16 WEIGHTS, which is what the vendor's attention runs in. Without
+	 * this argv[4] = "fp16" silently left the weights int8 and a stream
+	 * diff against a vendor fp16 op compared the wrong thing. */
+	if (argc > 4 && !strcmp(argv[4], "fp16")) job.mm.wdtype = CHARSIU_FP16;
 	if (argc > 5 && !strcmp(argv[5], "fp16")) job.mm.adtype = CHARSIU_FP16;
 	job.input_scale = 0.02f; job.weight_scale = 0.01f; job.output_scale = 0.25f;
 	job.input_zero_point = 128; job.weight_zero_point = 128;
