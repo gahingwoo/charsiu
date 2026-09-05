@@ -63,6 +63,8 @@ yes|1|true|on)
 	env_default CHARSIU_COEF_ELEMS "$COEF" ;;
 esac
 [ -n "$CPUS" ] && env_default CHARSIU_CPUS "$CPUS"
+POOLCPUS=$(ini_get run pool_cpus)
+[ -n "$POOLCPUS" ] && env_default CHARSIU_POOL_CPUS "$POOLCPUS"
 
 # ⚠ Tell whoever started it where to point a browser. "listening on 0.0.0.0" is
 # not an address anybody can type.

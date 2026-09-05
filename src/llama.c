@@ -514,18 +514,31 @@ static int cpus_parse(const char *spec, cpu_set_t *setp)
  * elementwise stages, the attention, the packer and the read all went on the
  * pool on 2026-09-06, and a prompt now spends most of its CPU time there.
  *
- * Opening the whole machine to it is 3.9% off a Llama prompt and 1.8% off a
+ * Opening the whole machine to it is 4.3% off a Llama prompt and 2.2% off a
  * SmolLM2 one, with Qwen3 flat and the text identical on all three. But DECODE
- * is still one thread's work, and with 0-7 Qwen3 decoded 1503, 2208, 1503 ms
- * -- one run in three 47% slower, which is that thread landing on an A53. A
- * scheduling lottery is worse than a small steady loss, because it cannot be
- * planned around.
+ * is still one thread's work, and it does not survive the same change.
+ *
+ * All three arms, one binary, alternating, governor pinned:
+ *
+ *   prompt      4-7        0-7      4-7 + pool 0-7
+ *   Llama      4273 ms    4085          4090
+ *   SmolLM2    4300       4247          4204
+ *   Qwen3     12022      12198         12029
+ *
+ *   decode      4-7        0-7      4-7 + pool 0-7
+ *   Llama      2147 ms    2526          2145
+ *   Qwen3      1508       1509          1507
+ *
+ * Llama's 2526 is two runs of three at 2703 and 2730 -- 26% slower -- and
+ * Qwen3 had shown the same thing at 2208 against 1503 in an earlier round.
+ * That is the calling thread landing on an A53, and a scheduling lottery is
+ * worse than a small steady loss because it cannot be planned around.
  *
  * So they are separated: CHARSIU_CPUS is the calling thread, which is what
- * decode runs on, and CHARSIU_POOL_CPUS is the workers. Set the first to the
- * fast cores and the second to all of them and both halves get what they
- * measured best on. Neither has a default; a wrong guess baked in is a
- * regression nobody could see, which is the reason the first one is opt in.
+ * decode runs on, and CHARSIU_POOL_CPUS is the workers. The last column has
+ * the prompt gain and decode within a millisecond of the fast cores alone.
+ * Neither has a default; a wrong guess baked in is a regression nobody could
+ * see, which is the reason the first one is opt in already.
  */
 static void cpus_pin(void)
 {
