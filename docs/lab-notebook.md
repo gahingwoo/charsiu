@@ -1644,3 +1644,60 @@ next, at different group sizes, and both were correct. Nothing here decides it.
 And nothing in the model calls any of this yet. The next step is the KV cache
 written in `charsiu_fp16_woffset` layout as tokens are appended, and
 `attn_block` calling the group.
+
+## The integration, and the number it actually produces
+
+The group went into the model behind `CHARSIU_ATTN_NPU`: a layer is H scores
+matmuls in one submit, a softmax on the CPU, H values matmuls in a second.
+
+**It is correct.** On a Radxa ROCK 4D, Llama-3.2-1B, a 513 token prompt, with
+`CHARSIU_ATTN_NPU_CHECK` running both arms on the same rows: 112 layers on the
+hardware, none fell back, and the two arms land 0.25 to 0.5% apart --
+
+```
+  layer  9, 32 rows: worst 0.003501 against a largest of 0.8552 (0.0041 relative)
+  layer 13, 32 rows: worst 0.009572 against a largest of 2.161  (0.0044 relative)
+  layer 15, 32 rows: worst 0.0196   against a largest of 4.702  (0.0042 relative)
+```
+
+which is what fp16 inputs against an fp32 CPU arm should give. A cache written
+in the wrong order or a stride applied to the wrong axis would be order 1, not
+0.004. Comparing the sentences could not have told those apart, which is why
+the check exists.
+
+**And it is slower.** Same prompt, alternating, spread under 2%:
+
+```
+  attention on the CPU   4889, 4889, 4970 ms
+  attention on the NPU   6710, 6306 ms          1.36x SLOWER
+```
+
+### The explanation I had was wrong
+
+The values matmul runs at k = the context length whatever the prompt has
+reached, because its k cannot grow. That looked like the term: at a 1024
+context and an average cache depth of 256 it is four times the reduction
+anyone needs. So the context was cut to 576, which is 1.78x less values work
+for the same prompt.
+
+It moved 6%. **6710 to 6306.** The reduction width is not what this is
+spending, and the fix I was about to build for it would have bought almost
+nothing.
+
+What is left is the per matmul cost, and it is exactly what the probe already
+measured: about 0.3 to 0.5 ms at 80 rows, times 32 heads, times two halves,
+times 16 layers, times seven chunks. The hardware is not slow at this. There
+is simply more of it than the CPU needs to do, because the CPU'''s attention
+grows with the cache depth and at 513 tokens the cache is shallow.
+
+`CHARSIU_FP16_JOBS=split`, which lets the scheduler use both cores, made it
+6394 against 6306. Not that either.
+
+### What that leaves
+
+The one shape where the arithmetic says this should win is a DEEP cache: the
+CPU'''s cost is linear in it and the dispatch cost is not. That is the next
+measurement and it is the one that decides whether the path stays.
+
+Off by default, and with the flag unset four models produce text identical to
+the build from before any of this existed.
