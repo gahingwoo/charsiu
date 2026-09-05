@@ -51,6 +51,8 @@
  * in fp32. Reading it as one and not saying so is how a probe reports "wrong"
  * when what it means is "I do not know how to read this".
  */
+/* clock_gettime: the Makefile builds at -std=c11, which hides it */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
