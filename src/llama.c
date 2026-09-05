@@ -3463,6 +3463,10 @@ static double battn_ms[3];
  * matmul stages was inside the entry, in its wrapper, or on the CPU.
  */
 static double bmm_entry_ms, bmm_wrap_ms, bmm_fell_ms;
+/* the device those entries went to, so the report can ask it for its own
+ * split; llama_stages_report takes no state and this is the only thing it
+ * needs that is not already a file static */
+static struct charsiu_npu *bmm_dev;
 static unsigned long bmm_fell_rows, bmm_calls;
 
 void llama_stages_reset(void)
@@ -3505,6 +3509,33 @@ void llama_stages_report(void)
 			       "  (the serial block arm's split)\n", "attention:",
 			       battn_ms[0] / bstage_rows, battn_ms[1] / bstage_rows,
 			       battn_ms[2] / bstage_rows);
+		/*
+		 * ⚠⚠ AND WHAT THE 60% INSIDE THE NPU ENTRY IS MADE OF, because
+		 * "the matmuls" is not an answer anybody can act on.
+		 *
+		 * The entry packs the activation, submits, waits, and reads
+		 * back; npudev has counted all four since the width work, and
+		 * nothing outside bench_batch has ever printed them. A prompt
+		 * that spends 5.3 ms a row here is either waiting for the
+		 * hardware -- in which case the lever is the hardware -- or
+		 * packing on the CPU, which is a different repair entirely.
+		 * The remainder is printed beside them for the same reason the
+		 * probe prints one: a breakdown that does not say what it
+		 * failed to account for invites optimising the wrong third.
+		 */
+		if (bmm_calls && bmm_dev) {
+			double pk, sb, fn, rd;
+
+			charsiu_npu_batch_split(bmm_dev, &pk, &sb, &fn,
+						&rd, 1);
+			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
+			       "  read %.2f  unaccounted %.2f ms a row\n",
+			       "of the entry:", pk / bstage_rows,
+			       sb / bstage_rows, fn / bstage_rows,
+			       rd / bstage_rows,
+			       (bmm_entry_ms - pk - sb - fn - rd)
+			       / bstage_rows);
+		}
 	}
 	if (!stage_tok)
 		return;
@@ -4633,6 +4664,7 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
 
 				bmm_entry_ms += dw;
+				bmm_dev = s->pool.dev;
 				bmm_wrap_ms += now_ms() - t0 - dw;
 			}
 			return 1;
@@ -4728,6 +4760,7 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
 
 				bmm_entry_ms += dw;
+				bmm_dev = s->pool.dev;
 				bmm_wrap_ms += now_ms() - t0 - dw;
 			}
 			return 1;
