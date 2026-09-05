@@ -4097,6 +4097,27 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * third window state nothing on disk has ever shown -- so it has to be
 	 * searched for, not derived.
 	 *
+	 * 🏁 AND THERE IS NOTHING TO SEARCH FOR, at least not in this file.
+	 * The census above quoted 5120 as "its LARGEST SPLIT SAMPLE", which is
+	 * a sample and reads like one. The whole file, all 8808 convolutions
+	 * of Llama-3.2-1B-rk3576-w4a16 (tools/rkllm_regcmd.py, 2026-09-05):
+	 *
+	 *   max input surface   5120
+	 *   above 5120          0 dispatches
+	 *
+	 * and it holds that ceiling by LOWERING M AS K RISES, which is the
+	 * same trade this guard forces on us and not a workaround for it:
+	 *
+	 *   K 2048  ->  m 80   surface 5120
+	 *   K 4096  ->  m 40   surface 5120
+	 *   K 3968  ->  m 33   surface 4092
+	 *   K 3744  ->  m 35   surface 4095
+	 *
+	 * So 5120 is not a conservative reading of the vendor, it IS the
+	 * vendor, and KMAX 2048 at a chunk of 80 is its widest configuration
+	 * exactly. Whatever is above the line, the closed stack does not go
+	 * there either.
+	 *
 	 * ⚠⚠ 5120 IS MEASURED, AND ITS CAUSE IS NOT KNOWN. Read it as a fence
 	 * post, never as an explanation.
 	 *
