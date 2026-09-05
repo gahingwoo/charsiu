@@ -3606,8 +3606,15 @@ void llama_stages_report(void)
 		if (bmm_calls && bmm_dev) {
 			double pk, sb, fn, rd;
 
+			/* ⚠ reset = 0. npudev prints its own report AFTER
+			 * this one and reads the same four counters; resetting
+			 * here left it dividing by what was left over, and its
+			 * "57 ms submitting and waiting" against a fence of
+			 * 189 was the first sign. Two reports sharing a counter
+			 * have to agree on who clears it, and the one that
+			 * prints first is not automatically the owner. */
 			charsiu_npu_batch_split(bmm_dev, &pk, &sb, &fn,
-						&rd, 1);
+						&rd, 0);
 			double ga, pc;
 
 			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
@@ -3617,7 +3624,7 @@ void llama_stages_report(void)
 			       rd / bstage_rows,
 			       (bmm_entry_ms - pk - sb - fn - rd)
 			       / bstage_rows);
-			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 1);
+			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 0);
 			printf("  %-16s gather %.2f  packer %.2f  the rest"
 			       " %.2f ms a row\n", "of the pack:",
 			       ga / bstage_rows, pc / bstage_rows,
