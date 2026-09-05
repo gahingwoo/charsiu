@@ -69,7 +69,7 @@
  * of a fixed cost, not of a matmul. The pack alone walks k*n elements through
  * charsiu_w16_offset one at a time.
  */
-static struct { double pack, coef, emit, run, read; } t_split;
+static struct { double pack, cf, emit, run, rd; } t_split;
 
 static double now_ms(void)
 {
@@ -220,7 +220,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 		free(zero);
 	}
 
-	t_split.coef += now_ms() - tp;
+	t_split.cf += now_ms() - tp;
 	tp = now_ms();
 	job.input_addr = (uint32_t)in.dma_address;
 	job.output_addr = (uint32_t)ob.dma_address;
@@ -262,7 +262,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	charsiu_bo_prep(dev, &ob, 1000000000);   /* this is the fence wait */
 	memcpy(out, ob.map, (size_t)m * n * 4);
 	charsiu_bo_fini(dev, &ob);
-	t_split.read += now_ms() - tp;
+	t_split.rd += now_ms() - tp;
 	rc = 0;
 out:
 	return rc;
@@ -384,9 +384,9 @@ int main(int argc, char **argv)
 			       " (%.1f ms wall)\n", el / wrote, wrote, el);
 			printf("    pack %.3f  coefs %.3f  emit %.3f"
 			       "  submit %.3f  fence+read %.3f  ms each\n",
-			       t_split.pack / reps, t_split.coef / reps,
+			       t_split.pack / reps, t_split.cf / reps,
 			       t_split.emit / reps, t_split.run / reps,
-			       t_split.read / reps);
+			       t_split.rd / reps);
 		}
 		rc = 0;
 		goto done;
