@@ -1939,6 +1939,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				" the K slices a device holds would save %lu of"
 				" them\n", g->bread_passes, g->bread_ranges,
 				g->bread_passes - g->bread_ranges);
+		if (g->bfused_groups)
+			fprintf(stderr, "charsiu NPU: the fused read took %lu"
+				" ranges carrying %lu slices, so Y was touched"
+				" %lu times fewer\n", g->bfused_groups,
+				g->bfused_slices,
+				g->bfused_slices - g->bfused_groups);
 		if (g->bpack_pooled + g->bpack_serial)
 			fprintf(stderr, "charsiu NPU: packed %lu activations on"
 				" the pool and %lu one thread (%s)\n",
