@@ -80,6 +80,10 @@ static double now_ms(void)
 	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
+/* the packed INPUT supplied verbatim, for the activation slot sweep */
+static const uint8_t *raw_in;
+static size_t raw_in_len;
+
 static const char *lname[CHARSIU_W16_NLAYOUT] = { "dense", "atom", "group" };
 
 /*
@@ -195,7 +199,10 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	charsiu_bo_fini(dev, &wt);
 
 	charsiu_bo_prep(dev, &in, 1000000000);
-	if (i8) {
+	if (raw_in) {
+		memset(in.map, 0, insz);
+		memcpy(in.map, raw_in, raw_in_len < insz ? raw_in_len : insz);
+	} else if (i8) {
 		uint8_t *a8 = malloc((size_t)m * k);
 
 		if (!a8) goto out;
@@ -334,6 +341,7 @@ int main(int argc, char **argv)
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
+	int doinsl = argc > 3 && !strcmp(argv[3], "--inslots");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -347,6 +355,62 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doinsl) {
+		/*
+		 * ⚠⚠ THE ACTIVATION LAYOUT, MEASURED THE WAY THE WEIGHT LAYOUT
+		 * WAS. Everything else is now excluded by measurement: the
+		 * output is flat, the weights are GROUP, the stream matches the
+		 * vendor at M=32, the four window constants are required
+		 * (putting the geometry back is 17 orders of magnitude worse),
+		 * and the U28 block changes nothing. What is left is how
+		 * charsiu_pack_input_f16 arranges m rows, and nobody has asked
+		 * the hardware.
+		 *
+		 * Weights B[c][k] = 2^(k mod 16). One 1.0 into packed input
+		 * slot s, everything else zero. The row that answers names r;
+		 * the value it answers with names k mod 16. No candidate
+		 * layout is involved.
+		 */
+		unsigned slots = (unsigned)(((size_t)charsiu_entries_per_row(
+			&(struct charsiu_matmul){ m, k, n, CHARSIU_FP16,
+						  CHARSIU_FP16 }) * 64 * m) / 2);
+		uint8_t *ib = calloc((size_t)slots * 2 + 4096, 1);
+		uint16_t one = charsiu_float_to_half(1.0f);
+
+		if (!ib) goto done;
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] = (float)(1u << (i % 16));
+		if (slots > 512) slots = 512;
+		printf("one 1.0 per packed INPUT slot, %u slots, m=%u k=%u n=%u\n",
+		       slots, m, k, n);
+		printf("  slot   -> row : value (= 2^(k mod 16))\n");
+		raw_in_len = (size_t)slots * 2 + 4096;
+		for (unsigned sl = 0; sl < slots; sl++) {
+			memset(ib, 0, raw_in_len);
+			ib[sl * 2] = (uint8_t)(one & 0xff);
+			ib[sl * 2 + 1] = (uint8_t)(one >> 8);
+			raw_in = ib;
+			if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, got)) {
+				raw_in = NULL;
+				break;
+			}
+			raw_in = NULL;
+			for (unsigned r = 0; r < m; r++) {
+				float v = asf(got[(size_t)r * n]);
+
+				if (v == 0.0f) continue;
+				printf("  %-6u -> %u : %g%s\n", sl, r,
+				       (double)v,
+				       (v == (float)(long)v &&
+					((long)v & ((long)v - 1)) == 0)
+				       ? "" : "   (not a power of two)");
+			}
+		}
+		free(ib);
+		rc = 0;
+		goto done;
+	}
 	if (doin) {
 		/*
 		 * ⚠⚠ THE FAULT IS IN THE ACTIVATION LAYOUT, AND --outmap FOUND
