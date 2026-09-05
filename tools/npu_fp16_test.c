@@ -222,8 +222,24 @@ int main(int argc, char **argv)
 		unsigned slots = (unsigned)(wsz / 2);
 		uint8_t *raw = calloc(wsz, 1);
 		uint16_t one = charsiu_float_to_half(1.0f);
+		/*
+		 * ⚠⚠ THE HOLE DOES NOT HAVE TO BE ZERO, AND THAT IS THE
+		 * EXPERIMENT. With a hole of 0.0, 116 of 128 slots made the job
+		 * write NOTHING -- the sentinel survived in every channel -- and
+		 * only 12 gave a clean answer. A weight fetch that skips zero
+		 * blocks explains that; a fetch that does not, does not. So the
+		 * hole value is an argument. Anything other than 1.0 still names
+		 * k, because the channel's sum moves by (hole - 1) * 2^k, and a
+		 * non zero hole never makes the buffer look sparse.
+		 *
+		 * 3.0 is the default: the sum moves UP by 2 * 2^k, which cannot
+		 * be confused with a bit that failed to arrive.
+		 */
+		float hv = argc > 4 ? (float)atof(argv[4]) : 3.0f;
+		uint16_t hb = charsiu_float_to_half(hv);
 
 		if (!raw) goto done;
+		printf("hole value %g\n", (double)hv);
 		for (unsigned i = 0; i < k; i++)
 			A[i] = i < kk ? (float)(1u << i) : 0.0f;
 		printf("every weight 1.0 except one hole; A[k] = 2^k; full = 0x%x\n",
@@ -236,7 +252,8 @@ int main(int argc, char **argv)
 				raw[i] = (uint8_t)(one & 0xff);
 				raw[i + 1] = (uint8_t)(one >> 8);
 			}
-			raw[sl * 2] = raw[sl * 2 + 1] = 0;
+			raw[sl * 2] = (uint8_t)(hb & 0xff);
+			raw[sl * 2 + 1] = (uint8_t)(hb >> 8);
 			if (run_raw(dev, m, k, n, A, raw, wsz, got))
 				break;
 			{
@@ -262,6 +279,8 @@ int main(int argc, char **argv)
 					   v == (float)(unsigned long)v)
 					  ? (unsigned long)v : ~1ul;
 
+				long d;
+
 				if (b == full || b == ~0ul)
 					continue;
 				if (b == ~1ul) {
@@ -270,7 +289,24 @@ int main(int argc, char **argv)
 					said = 1;
 					continue;
 				}
-				printf("  %-10u -> %u : 0x%lx", sl, c, full ^ b);
+				/*
+				 * the sum moved by (hole - 1) * 2^k, so the
+				 * delta over (hole - 1) is the bit itself
+				 */
+				d = (long)b - (long)full;
+				if (hv != 1.0f && d % (long)(hv - 1.0f) == 0) {
+					long bit = d / (long)(hv - 1.0f);
+
+					if (bit > 0 && (bit & (bit - 1)) == 0) {
+						printf("  %-10u -> %u : +%ld"
+						       " so k=%d\n", sl, c, d,
+						       __builtin_ctzl(bit));
+						said = 1;
+						continue;
+					}
+				}
+				printf("  %-10u -> %u : 0x%lx delta %ld",
+				       sl, c, b, d);
 				if (__builtin_popcountl(full ^ b) == 1)
 					printf(" so k=%d\n",
 					       __builtin_ctzl(full ^ b));
