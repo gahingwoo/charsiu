@@ -35,13 +35,71 @@
 
 static const char *lname[CHARSIU_W16_NLAYOUT] = { "dense", "atom", "group" };
 
+/*
+ * ⚠⚠ THE BUFFERS ARE ALLOCATED ONCE, AND THE BOARD IS WHY.
+ *
+ * This allocated five buffer objects, submitted, and freed them, every call.
+ * Run the SAME job 128 times that way and only about twelve of them write
+ * anything: the pattern is two writes, then eighteen to twenty-two silent,
+ * repeating, and it is IDENTICAL for an int8 job (CHARSIU_TEST_INT8), so it is
+ * the churn and not the precision.
+ *
+ * That cost four wrong explanations before the control existed -- a coverage
+ * defect, a zero-skipping weight fetch, a single zero killing the job, and an
+ * fp16 register wedging the core. Every one of them was a story about a
+ * variable that was never moving.
+ *
+ * The buffers now live across calls, sized for the largest shape asked for.
+ */
+static struct {
+	struct charsiu_device *dev;
+	struct charsiu_bo wt, in, ob, coef, reg;
+	size_t wsz, insz, obsz, coefsz;
+} pool;
+
+static void pool_free(void)
+{
+	if (!pool.dev)
+		return;
+	charsiu_bo_free(pool.dev, &pool.reg);  charsiu_bo_free(pool.dev, &pool.coef);
+	charsiu_bo_free(pool.dev, &pool.ob);   charsiu_bo_free(pool.dev, &pool.in);
+	charsiu_bo_free(pool.dev, &pool.wt);
+	memset(&pool, 0, sizeof(pool));
+}
+
+static int pool_want(struct charsiu_device *dev, size_t wsz, size_t insz,
+		     size_t obsz, size_t coefsz)
+{
+	if (pool.dev == dev && pool.wsz >= wsz && pool.insz >= insz &&
+	    pool.obsz >= obsz && pool.coefsz >= coefsz)
+		return 0;
+	pool_free();
+	pool.dev = dev;
+	pool.wsz = wsz; pool.insz = insz; pool.obsz = obsz; pool.coefsz = coefsz;
+	if (charsiu_bo_alloc(dev, wsz, &pool.wt) ||
+	    charsiu_bo_alloc(dev, insz, &pool.in) ||
+	    charsiu_bo_alloc(dev, obsz, &pool.ob) ||
+	    charsiu_bo_alloc(dev, coefsz, &pool.coef) ||
+	    charsiu_bo_alloc(dev, 4096, &pool.reg)) {
+		fprintf(stderr, "  a buffer would not allocate\n");
+		pool_free();
+		return -1;
+	}
+	if (!pool.wt.map || !pool.in.map || !pool.ob.map || !pool.coef.map ||
+	    !pool.reg.map) {
+		fprintf(stderr, "  a buffer allocated but did not map\n");
+		pool_free();
+		return -1;
+	}
+	return 0;
+}
+
 static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 		    unsigned n, const float *A, const float *B,
 		    enum charsiu_w16_layout L, const uint8_t *W, size_t wlen,
 		    uint32_t *out)
 {
 	struct charsiu_job job = { 0 };
-	struct charsiu_bo wt = { 0 }, in = { 0 }, ob = { 0 }, coef = { 0 }, reg = { 0 };
 	size_t nreg, insz, wsz;
 	int rc = -1;
 
@@ -67,18 +125,14 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 
 	wsz = charsiu_weight_bytes(&job.mm);
 	insz = (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096;
-	if (charsiu_bo_alloc(dev, wsz + 4096, &wt) ||
-	    charsiu_bo_alloc(dev, insz, &in) ||
-	    charsiu_bo_alloc(dev, (size_t)m * n * 4 + 4096, &ob) ||
-	    charsiu_bo_alloc(dev, charsiu_coef_bytes(&job.mm) + 4096, &coef) ||
-	    charsiu_bo_alloc(dev, 4096, &reg)) {
-		fprintf(stderr, "  a buffer would not allocate\n");
-		goto out;
-	}
-	if (!wt.map || !in.map || !ob.map || !coef.map || !reg.map) {
-		fprintf(stderr, "  a buffer allocated but did not map\n");
-		goto out;
-	}
+	if (pool_want(dev, wsz + 4096, insz, (size_t)m * n * 4 + 4096,
+		      charsiu_coef_bytes(&job.mm) + 4096))
+		return -1;
+#define wt   (pool.wt)
+#define in   (pool.in)
+#define ob   (pool.ob)
+#define coef (pool.coef)
+#define reg  (pool.reg)
 
 	charsiu_bo_prep(dev, &wt, 1000000000);
 	if (i8) {
@@ -154,10 +208,12 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	charsiu_bo_fini(dev, &ob);
 	rc = 0;
 out:
-	charsiu_bo_free(dev, &reg); charsiu_bo_free(dev, &coef);
-	charsiu_bo_free(dev, &ob); charsiu_bo_free(dev, &in);
-	charsiu_bo_free(dev, &wt);
 	return rc;
+#undef wt
+#undef in
+#undef ob
+#undef coef
+#undef reg
 }
 
 static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
@@ -572,6 +628,7 @@ int main(int argc, char **argv)
 	}
 	rc = 0;
 done:
+	pool_free();
 	charsiu_close(dev);
 	free(A); free(B); free(ref); free(got);
 	return rc;
