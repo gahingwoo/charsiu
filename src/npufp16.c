@@ -502,12 +502,25 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		uint16_t *d = (uint16_t *)((uint8_t *)f->in.map + pl.ioff[i]);
 		size_t nel = (size_t)ops[i].m * ops[i].k;
 		size_t cap = pl.isz[i] / 2;
+		size_t xs = ops[i].xstride ? ops[i].xstride : ops[i].k;
 		const float *X = ops[i].X;
 
 		if (nel > cap)
 			nel = cap;
-		for (size_t e = 0; e < nel; e++)
-			d[e] = charsiu_f2h(X[e]);
+		if (xs == ops[i].k) {
+			for (size_t e = 0; e < nel; e++)
+				d[e] = charsiu_f2h(X[e]);
+		} else {
+			size_t e = 0;
+
+			for (unsigned r = 0; r < ops[i].m && e < nel; r++) {
+				const float *xr = X + (size_t)r * xs;
+
+				for (unsigned c = 0; c < ops[i].k && e < nel;
+				     c++, e++)
+					d[e] = charsiu_f2h(xr[c]);
+			}
+		}
 		memset(d + nel, 0, charsiu_fp16_up4k(pl.isz[i]) - nel * 2);
 	}
 	charsiu_bo_fini(f->dev, &f->in);
@@ -701,10 +714,17 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		 * second read on top. charsiu_fp16_out hands back the address
 		 * and charsiu_fp16_release closes the buffer.
 		 */
-		if (ops[i].Y)
+		if (ops[i].Y && (!ops[i].ystride ||
+				 ops[i].ystride == ops[i].n)) {
 			memcpy(ops[i].Y, o, (size_t)cells * 4);
-		else
+		} else if (ops[i].Y) {
+			for (unsigned r = 0; r < ops[i].m; r++)
+				memcpy(ops[i].Y + (size_t)r * ops[i].ystride,
+				       (const float *)o + (size_t)r * ops[i].n,
+				       (size_t)ops[i].n * 4);
+		} else {
 			borrowed = 1;
+		}
 	}
 	f->last = pl;
 	if (borrowed) {

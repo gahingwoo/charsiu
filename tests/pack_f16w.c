@@ -128,6 +128,71 @@ static void moves_in_n(unsigned k, unsigned n, unsigned nbig)
 	}
 }
 
+/*
+ * ⚠⚠ THE TWO CACHE WRITERS AGAINST THE DEFINITION.
+ *
+ * charsiu_fp16_pack_krow and _vcol take a run base from charsiu_w16_offset and
+ * then walk it -- contiguously for a K row, at one stride for a V column --
+ * because calling the offset function per element would be head_dim calls a
+ * token a head a layer. That walk is an ASSUMPTION about the layout, and an
+ * assumption that is wrong here does not fault: it writes a token's key into
+ * another token's slot and the model answers with a plausible wrong sentence.
+ *
+ * So every element written by each writer is compared against the same element
+ * placed through charsiu_fp16_woffset one at a time, on every shape.
+ */
+static void writers(unsigned hd, unsigned nk)
+{
+	struct charsiu_matmul k = { 1, hd, nk, CHARSIU_FP16, CHARSIU_FP16 };
+	struct charsiu_matmul v = { 1, nk, hd, CHARSIU_FP16, CHARSIU_FP16 };
+	size_t kb = charsiu_weight_bytes(&k), vb = charsiu_weight_bytes(&v);
+	uint16_t *fast = calloc(kb > vb ? kb : vb, 1);
+	uint16_t *slow = calloc(kb > vb ? kb : vb, 1);
+	float *row = calloc(hd, sizeof(float));
+	unsigned pos, i;
+
+	if (!fast || !slow || !row) { printf("  out of memory\n"); fail++; goto out; }
+	for (i = 0; i < hd; i++)
+		row[i] = (float)((int)(i % 23) - 11) * 0.5f + 1.0f;
+
+	for (pos = 0; pos < nk; pos += (nk > 64 ? 17 : 1)) {
+		memset(fast, 0, kb);
+		memset(slow, 0, kb);
+		charsiu_fp16_pack_krow(fast, hd, nk, pos, row);
+		for (i = 0; i < hd; i++) {
+			size_t o = charsiu_w16_offset(&k, pos, i,
+						      CHARSIU_W16_GROUP);
+
+			if (o != (size_t)-1)
+				slow[o / 2] = charsiu_float_to_half(row[i]);
+		}
+		if (memcmp(fast, slow, kb)) {
+			printf("  krow hd=%u nk=%u pos=%u differs\n",
+			       hd, nk, pos);
+			fail++;
+			goto out;
+		}
+		memset(fast, 0, vb);
+		memset(slow, 0, vb);
+		charsiu_fp16_pack_vcol(fast, nk, hd, pos, row);
+		for (i = 0; i < hd; i++) {
+			size_t o = charsiu_w16_offset(&v, i, pos,
+						      CHARSIU_W16_GROUP);
+
+			if (o != (size_t)-1)
+				slow[o / 2] = charsiu_float_to_half(row[i]);
+		}
+		if (memcmp(fast, slow, vb)) {
+			printf("  vcol kv=%u hd=%u pos=%u differs\n",
+			       nk, hd, pos);
+			fail++;
+			goto out;
+		}
+	}
+out:
+	free(fast); free(slow); free(row);
+}
+
 int main(void)
 {
 	/* head_dim as N is the vendor's own attention shape; the rest are the
@@ -154,6 +219,16 @@ int main(void)
 		moves_in_n(ks[i], 24, 1024); cases++;
 		moves_in_n(ks[i], 40, 512);  cases++;
 		moves_in_n(ks[i], 100, 256); cases++;
+	}
+	{
+		static const unsigned hds[] = { 32, 64, 96, 128, 256 };
+		static const unsigned nks[] = { 32, 64, 128, 512, 2048 };
+		unsigned a, b2;
+
+		for (a = 0; a < sizeof(hds) / sizeof(*hds); a++)
+			for (b2 = 0; b2 < sizeof(nks) / sizeof(*nks); b2++,
+			     cases++)
+				writers(hds[a], nks[b2]);
 	}
 	printf("  fp16 weight layouts: %d of %u cases wrong\n", fail, cases);
 	return fail ? 1 : 0;

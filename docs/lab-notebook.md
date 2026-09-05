@@ -1644,3 +1644,248 @@ next, at different group sizes, and both were correct. Nothing here decides it.
 And nothing in the model calls any of this yet. The next step is the KV cache
 written in `charsiu_fp16_woffset` layout as tokens are appended, and
 `attn_block` calling the group.
+
+## The integration, and the number it actually produces
+
+The group went into the model behind `CHARSIU_ATTN_NPU`: a layer is H scores
+matmuls in one submit, a softmax on the CPU, H values matmuls in a second.
+
+**It is correct.** On a Radxa ROCK 4D, Llama-3.2-1B, a 513 token prompt, with
+`CHARSIU_ATTN_NPU_CHECK` running both arms on the same rows: 112 layers on the
+hardware, none fell back, and the two arms land 0.25 to 0.5% apart --
+
+```
+  layer  9, 32 rows: worst 0.003501 against a largest of 0.8552 (0.0041 relative)
+  layer 13, 32 rows: worst 0.009572 against a largest of 2.161  (0.0044 relative)
+  layer 15, 32 rows: worst 0.0196   against a largest of 4.702  (0.0042 relative)
+```
+
+which is what fp16 inputs against an fp32 CPU arm should give. A cache written
+in the wrong order or a stride applied to the wrong axis would be order 1, not
+0.004. Comparing the sentences could not have told those apart, which is why
+the check exists.
+
+**And it is slower.** Same prompt, alternating, spread under 2%:
+
+```
+  attention on the CPU   4889, 4889, 4970 ms
+  attention on the NPU   6710, 6306 ms          1.36x SLOWER
+```
+
+### The explanation I had was wrong
+
+The values matmul runs at k = the context length whatever the prompt has
+reached, because its k cannot grow. That looked like the term: at a 1024
+context and an average cache depth of 256 it is four times the reduction
+anyone needs. So the context was cut to 576, which is 1.78x less values work
+for the same prompt.
+
+It moved 6%. **6710 to 6306.** The reduction width is not what this is
+spending, and the fix I was about to build for it would have bought almost
+nothing.
+
+What is left is the per matmul cost, and it is exactly what the probe already
+measured: about 0.3 to 0.5 ms at 80 rows, times 32 heads, times two halves,
+times 16 layers, times seven chunks. The hardware is not slow at this. There
+is simply more of it than the CPU needs to do, because the CPU'''s attention
+grows with the cache depth and at 513 tokens the cache is shallow.
+
+`CHARSIU_FP16_JOBS=split`, which lets the scheduler use both cores, made it
+6394 against 6306. Not that either.
+
+### And the deep cache does not save it either
+
+The one shape left was a deep cache: the CPU's attention is linear in depth and
+a dispatch cost is not, so a long prompt should have been where this turns. It
+is not.
+
+```
+   prompt   cache      CPU               NPU
+   513 tok  ctx 1024   4889, 4919 ms     6710, 6736 ms    1.36x slower
+  2074 tok  ctx 2560  35686, 35925 ms   52558, 53029 ms   1.47x slower
+```
+
+Both depths repeated, and the spread is under 1% in every arm.
+
+**The gap WIDENS with depth.** Which is obvious once the number exists and was
+not before it: the per matmul cost is not fixed either. The scores matmul's n
+is the number of positions and the values matmul's k is the context, so the
+hardware's work grows with the cache exactly as the CPU's does, and it starts
+from behind. There is no shape in this range where the fp16 attention path is
+the faster one.
+
+So for text on this model the path is finished, and it is worth being plain
+about that rather than leaving it looking like an unfinished lever. What
+remains true and useful: the group underneath is 8 to 19x over one matmul at a
+time, every op it runs is bit exact, the caches are written where the hardware
+reads them, and the whole thing is correct to fp16 in the model. It is the
+right unit; attention on this hardware is not the right customer for it.
+
+Off by default, and with the flag unset four models produce text identical to
+the build from before any of this existed.
+
+## The morning after: the CPU stages nobody had looked at
+
+The fp16 attention round ended by closing a door, so the next one began by
+pricing the room. The batched stage table on the board, Llama-3.2-1B, a 512
+row prompt, governor pinned:
+
+```
+   matmuls (q k v, o, gate + up, down)   5.33 ms a row   56.7%
+   attention                             2.55 ms a row   27.1%
+   silu * up                             1.07 ms a row   11.4%
+   everything else                       0.44 ms a row    4.7%
+```
+
+Two things fell out of it immediately. Attention is 27% and not the 50% the
+README quotes -- that number is Qwen3's, which has 28 layers against this
+model's 16. And `silu * up`, third largest, was a bare `for (r)` loop with
+`charsiu_parallel_for` sitting beside it: the attention has used that pool for
+3.5x since the block work and this stage never had.
+
+Pooling it, and then the three smaller elementwise stages with it:
+
+```
+   CHARSIU_ROW_POOL=0   4919, 5002, 4932, 4859, 4890 ms
+   pooled               4584, 4537, 4507, 4354, 4554 ms      8.6% faster
+```
+
+`silu * up` went 1.07 to 0.24 ms a row, 4.5x -- better than the 3.5x the
+attention gets from the same pool.
+
+### The softmax, and the trade that was already the default
+
+What was left in the attention was the softmax: three scalar passes with an
+`expf` AND a divide an element, between two passes that have been NEON since
+round 370, with `charsiu_vexpq` in the header the file already includes.
+
+Vectorised, it is 3.8% of the whole prompt on the board, and every one of five
+runs beat every one of the five controls:
+
+```
+   CHARSIU_EXACT_SOFTMAX=1   4516, 4443, 4485, 4426, 4570 ms
+   vectorised                4328, 4280, 4309, 4366, 4299 ms
+```
+
+⚠ It moves tokens. On the development host, on a prose prompt, two of four
+models take a different branch. The two implementations were measured against
+each other over 2000 rows at ten widths first -- worst relative difference
+1.9e-06, which is fp32 rounding and not a defect -- and then the question that
+decides it was asked: **does the tree already ship this trade?** It does. The
+silu that has been the default for months uses the same `charsiu_vexpq`, and
+switching it off with `CHARSIU_EXACT_SILU` moves three of the same four models.
+
+On the board, both arms print the same sentence.
+
+### Where the prompt stands
+
+9.39 to 8.21 ms a row, 12.8% off a prompt, in two changes that touch no
+arithmetic the hardware does. What is left is 5.3 ms a row inside the NPU
+matmul entry -- 64% of the row now -- and the stage table has never said
+whether that is the hardware or the pack in front of it. It says so from this
+commit on.
+
+## Where a batched prompt's time actually is
+
+The stage table learned to split the NPU matmul entry, and then to split the
+pack inside it. On the board, Llama-3.2-1B and Qwen3-0.6B, governor pinned:
+
+```
+   llama  entry 4.86  pack 1.20 (gather 0.33  packer 0.61)  fence 1.32  read 2.23
+   qwen3  entry 4.50  pack 1.62 (gather 0.20  packer 1.11)  fence 1.18  read 0.98
+```
+
+The two models do not have the same bottleneck. That is the whole argument for
+splitting a number rather than naming it: "the matmuls are 60%" would have sent
+both of them at the same repair.
+
+### What the morning moved
+
+Three changes, each measured on its own alternating arms, then all three
+together against all three off in one binary:
+
+```
+             all off      all on
+   llama      4948 ms      4144 ms     16.2%
+   SmolLM2    5590         4461        20.2%
+   Qwen3     12625        12381         1.9%
+```
+
+Qwen3 gains almost nothing from the set, and taking each one away in turn says
+each is still positive on it -- row pool 4.3%, softmax 2.6%, read threshold
+14.3%. They do not add, because all three run on one thread pool and warm it
+for each other. The set is the best configuration for all three models; the
+decomposition is not additive and should not be quoted as if it were.
+
+### And the packer, which is at the memory roof already
+
+Splitting the pack said the packer call is its largest piece, so it went on the
+pool too, by GROUPS of 8 k rather than by rows -- the function had already
+measured why: the destination is a cold write-back mapping, PREP_BO invalidates
+it immediately before, and rows outermost falls to 6.87 GB/s against 24.57.
+
+```
+   packer serial vs pooled     llama 2.9%    SmolLM2 6.4%    Qwen3 0.3%
+   llama's packer              0.61 -> 0.40 ms a row
+```
+
+1.5x from four cores, not 4x, and the reason is in that same note: one thread
+already reaches 24 GB/s on this, which is most of what the memory gives. Qwen3
+issues 2352 packs a prompt against Llama's 784, and the extra barriers eat the
+difference exactly.
+
+### The one that was not a speedup at all
+
+The norm and residual stages went on the pool with the silu, and rmsnorm keeps
+its gain row in a plain function static. Qwen3 stopped being reproducible: ten
+runs of one seed, eight of one sentence and two of another, where the commit
+before gave ten of ten. The first reading was "that model is nondeterministic
+anyway" -- true of the build with the bug and false of every build before it.
+
+What settled it was running one binary ten times and then the previous commit
+ten times. **A difference between two arms cannot be told from a difference
+between two runs without running one arm twice.**
+
+## Two ways to make the read cheaper, and the board refused both
+
+The read is the largest piece of a batched matmul, and `read_rows`' own note
+had already reasoned out the physics: it is bandwidth bound, a run is 16 bytes
+against a 64 byte line so the DRAM sees four times the useful traffic, "it was
+never instruction bound ... the only lever left is fewer BYTES." It named two
+ways to get them down.
+
+**Whole lines, four rows at a time** was tried before: 2.3x slower on eight
+models, because four rows off one line means four write streams whose rows sit
+n floats apart and the A72's store buffer does not merge them.
+
+**One pass over Y for all the K slices a device holds** is the other, and it is
+what a partial sum invites: with s slices Y is read and written s times. The
+counters said 2240 slot reads over 1568 ranges on Llama, so 672 round trips
+were available.
+
+```
+   Llama-3.2-1B   plain 4070, 4062, 4082 ms   fused 4195, 4121, 4179   2.3% SLOWER
+   Qwen3-0.6B     plain 12200, 12313, 12195   fused 12376, 12218, 12175   flat
+```
+
+It trades s sequential Y round trips for s scattered source streams live at
+once, and the scattered side costs more. Both levers are now measured. The read
+is at its floor for this accumulator layout.
+
+### The part that is worth more than the result
+
+The commit that added the fused read said **"bit exact by construction"**. It
+was not. The derivation was about the ORDER OF THE ADDITIONS -- `y = c0;
+y += c1` against `v = c0; v += c1` -- and it never checked that the OPERANDS
+were the same. They are not: a slot's scale is
+
+```
+   s->sc[j] = t->scale[(n0 + j) * ng + k0 / kgroup]
+```
+
+so it depends on the slice's own `k0` and every K slice has a different one.
+The loop used the first slice's for all of them. Llama came back
+"000alivherherher" and Qwen3 counted 251, 254, 256 where it should have counted
+257, 258, 259. Neither faulted, because a wrong operand does not fault.
+
+A proof about one half of an expression is not a proof about the expression.

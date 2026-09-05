@@ -411,6 +411,18 @@ struct charsiu_fp16_op {
 	struct charsiu_fp16_w *Wbuf;   /* NULL when W does */
 	float *Y;                      /* NULL to read it where it lies */
 	unsigned m, k, n;
+	/*
+	 * ⚠ ROW STRIDES, because attention's rows live inside wider arrays and
+	 * a gather is a copy of exactly the data the pack is about to read
+	 * anyway. 0 means tight: k for X, n for Y.
+	 *
+	 *   q for head h is  q + r*(n_head*hd) + h*hd,  so xstride = n_head*hd
+	 *   the values result goes to out + r*(n_head*hd) + h*hd, ystride the
+	 *   same, and the probabilities are read back out of a scratch whose
+	 *   rows are the context length apart because that is the k the values
+	 *   matmul must run at.
+	 */
+	unsigned xstride, ystride;
 };
 
 /*
@@ -453,6 +465,9 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset);
 /* the fifth segment: buffers and the output zero, before any packing */
+/* inside the pack: the gather out of X, and the packer call itself */
+void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
+				    double *packcall, int reset);
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);
 /* the parts of "pack" that are not packing: the register streams emitted a
@@ -930,6 +945,13 @@ struct llama_state {
 	 * time: [rows][n_head][n_ctx], built on first use */
 	float *batt;
 	unsigned batt_rows;
+	/*
+	 * The fp16 KV cache the NPU reads, when CHARSIU_ATTN_NPU is set: a
+	 * mirror of kcache and vcache in the two weight layouts the scores and
+	 * values matmuls want, written where llama.c already writes the float
+	 * cache. Opaque here; src/llama.c owns it.
+	 */
+	struct attn_npu *anpu;
 	float *logits;         /* n_vocab */
 	/* gemma4's per layer embeddings: [n_layer][n_embd_pl], and scratch */
 	float *pl, *plb, *plc;

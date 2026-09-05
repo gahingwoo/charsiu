@@ -33,11 +33,19 @@ call:
 ```
                      decode tok/s            time to first token, ms
                      charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          24.51    24.85           866      469
-  TinyLLAMA 1.1B      20.36    19.71          1184      544
-  Phi3 3.8B            6.76     6.58          3877     1829
-  Gemma4 E2B           8.65     9.23          2925     1219
+  Qwen3 0.6B          24.88    24.85           717      469
+  TinyLLAMA 1.1B      20.67    19.71           960      544
+  Phi3 3.8B            6.88     6.58          3127     1829
+  Gemma4 E2B           8.71     9.23          2295     1219
 ```
+
+Time to first token came down 17 to 21% on 2026-09-06, which took the gap from
+1.85-2.40x to 1.53-1.88x. None of it was new hardware work: the batched
+prompt's elementwise stages, its softmax and its activation packer went on the
+thread pool, the pooled read's size threshold came down from 262144 elements to
+32768, and the calling thread and the pool workers were given separate core
+sets -- decode runs on the caller and wants an A72, the prompt runs on the pool
+and wants all eight. `docs/lab-notebook.md` has the arms for each.
 
 The text stays identical on all nine models. charsiu reads the rail and the clock
 out of sysfs and overlaps the cores only inside the vendor's envelope, and its NPU
@@ -471,10 +479,20 @@ board confirms the offsets do not move as the cache grows, which is what makes
 that legal. And an op that hands over a NULL `Y` leaves its answer in the
 device buffer for a caller that is about to reduce over it anyway.
 
-Nothing in the model calls it yet. `src/npufp16.c` is a unit of its own and the
-int4 path cannot see it; `docs/lab-notebook.md` has what had to be found,
-including the six register-level fixes that were tried against a fault that was
-in a buffer.
+`CHARSIU_ATTN_NPU` puts it in the model, and the honest result is two things.
+It is **correct**: `CHARSIU_ATTN_NPU_CHECK` runs both arms on the same rows and
+they land 0.25 to 0.5% apart over 112 layers with nothing falling back, which
+is fp16 inputs against an fp32 CPU arm and not a cache written in the wrong
+order. And it is **slower**: 6710 ms against the CPU arm's 4889 on a 513 token
+prompt, and 52558 against 35686 on a 2074 token one. The gap widens with the
+cache rather than closing, because the scores matmul's n is the number of
+positions and the values matmul's k is the context -- the hardware's work grows
+with the cache exactly as the CPU's does, and it starts from behind. It is off by default, and with the flag unset
+four models produce text identical to the build from before any of this.
+
+`docs/lab-notebook.md` has what had to be found, including the six
+register-level fixes tried against a fault that was in a buffer, and the
+explanation for the slowdown that the board refuted.
 
 ## The instrument
 

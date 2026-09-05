@@ -449,6 +449,18 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	/* ⚠ inside bpack_us: the gather that copies a K slice's columns out of
+	 * X, and the packer call that lays them out for the hardware. They are
+	 * different repairs -- one is a memcpy loop over rows, the other is a
+	 * vectorised walk -- so a single "pack" number cannot choose between
+	 * them, which is the same mistake the entry split just fixed. */
+	double bgather_us, bpackcall_us;
+	/* the packer on the pool: 2 = by size, 1 = always, 0 = never */
+	int packpool;
+	unsigned packpool_min;
+	unsigned long bpack_pooled, bpack_serial;
+	int readfuse;
+	unsigned long bfused_groups, bfused_slices;
 	/*
 	 * ⚠ PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
 	 * 80: "pack" was 2.0 ms a row, 0.8 ms a call, and the fp16 packer moves
@@ -1432,15 +1444,61 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * 17219, Qwen3 12145 -> 13216. The two that lost have the narrowest
 	 * tensors, which is the old note still being right for small work.
 	 * So: pool a slot's rows when m * n reaches CHARSIU_NPU_POOL_READ_MIN
-	 * elements (default 262144, one megabyte of floats), never below.
-	 * CHARSIU_NPU_POOL_READ=1 pools always, =0 never; both are arms.
+	 * elements, never below. CHARSIU_NPU_POOL_READ=1 pools always, =0
+	 * never; both are arms.
+	 *
+	 * ⚠⚠ 2026-09-06: 262144 -> 32768, AND THE MODEL THAT LOST YESTERDAY
+	 * GAINS THE MOST TODAY.
+	 *
+	 * The stage table learned to split the NPU entry and said the READ is
+	 * 2.70 ms of a 5.26 ms row -- a third of the whole prompt, more than
+	 * the attention. At a chunk of 80 rows only gate and up cleared
+	 * 262144, so five of seven matmuls read back on one thread. Three
+	 * models on the board, alternating, prompt time:
+	 *
+	 *   threshold          262144      32768        all
+	 *   Llama-3.2-1B        4339 ms     4146        4113
+	 *   Qwen3-0.6B         13717       12319       12381
+	 *   SmolLM2-135M        4750        4418        4403
+	 *
+	 * Yesterday Qwen3 went 12145 -> 13216 with pool-all and that is why
+	 * the threshold was high. Today it is the biggest winner. The thing
+	 * that changed in between is that the batched path now runs four
+	 * elementwise stages and the attention on the same pool, so its
+	 * threads are warm when a read asks for them -- a HYPOTHESIS for the
+	 * flip, not a measurement of it, and the reason it is written down is
+	 * that it means yesterday's negatives may need re-running rather than
+	 * trusting.
+	 *
+	 * ⚠ DECODE WAS MEASURED SEPARATELY, because at m = 1 this lets the
+	 * output head through where 262144 did not, and decode is the half
+	 * that is already at parity: Llama 22.59, 22.48, 22.41, 22.49 tok/s
+	 * across both arms and Qwen3 982, 988 against 987 ms -- unchanged.
+	 * SmolLM2 generated nothing on that prompt, so decode is two models
+	 * and not three.
 	 */
 	{
 		const char *e = getenv("CHARSIU_NPU_POOL_READ");
 
 		g->poolread = !e || !*e ? 2 : *e == '0' ? 0 : 1;   /* 2 = by size */
-		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 262144);
+		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 32768);
 	}
+	/*
+	 * The packer on the pool, by group count. 2 = by size, 1 = always,
+	 * 0 = never; both extremes are arms, and the size is in GROUPS of 8 k
+	 * because that is what the split is over.
+	 */
+	{
+		const char *e = getenv("CHARSIU_NPU_PACK_POOL");
+
+		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
+		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 64);
+	}
+	/* one pass over Y for every K slice a device holds. OFF until the
+	 * board prices it: it trades sequential Y round trips for several
+	 * scattered source streams at once. */
+	g->readfuse = getenv("CHARSIU_NPU_READ_FUSE") != NULL &&
+		      *getenv("CHARSIU_NPU_READ_FUSE") != '0';
 	/*
 	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
@@ -1795,8 +1853,32 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			g->busy_us / (double)g->submits, g->ndev,
 			g->submit_us / 1e3, g->fence_us / 1e3,
 			g->copy_us / 1e3, g->fini_us / 1e3, g->pack_us / 1e3,
-			g->cpu_us / 1e3, g->call_us / 1e3,
-			(g->call_us - g->busy_us - g->pack_us) / 1e3);
+			g->cpu_us / 1e3, (g->call_us + g->bwall_us) / 1e3,
+			(g->call_us + g->bwall_us - g->busy_us
+			 - g->pack_us - g->bpack_us) / 1e3);
+	/*
+	 * ⚠⚠ AND IT SAYS SO WHEN THE ACCOUNTING DOES NOT CLOSE.
+	 *
+	 * This block printed "-2438 ms of them is neither hardware nor
+	 * packing" for a whole morning and nobody read the minus sign,
+	 * including the person who then quoted the 2.36 GB/s beside it as a
+	 * fact about the silicon. The cause: busy_us is incremented in THREE
+	 * places -- matvec, matvec_group and npu_matmul_inner -- and call_us
+	 * in only the first two. A batched prompt put every millisecond of its
+	 * hardware into the numerator and none into the denominator.
+	 *
+	 * The end to end figure above is call_us + bwall_us now, which is the
+	 * wall clock of BOTH entries, and the packing subtracted is both
+	 * packs. A remainder that is still negative means some other counter
+	 * covers a different set of calls, and that is worth a line of its own
+	 * rather than a number nobody checks the sign of.
+	 */
+	if (g->call_us + g->bwall_us - g->busy_us - g->pack_us
+	    - g->bpack_us < 0.0)
+		fprintf(stderr, "charsiu NPU: ⚠ that remainder is NEGATIVE, so"
+			" the hardware path and the wall clock are counting"
+			" different calls -- the rate above is not a fact"
+			" about the hardware\n");
 	/*
 	 * ⚠⚠ WHERE THE TIME GOES, SPLIT THREE WAYS INSTEAD OF DIVIDED BY A
 	 * SUBMIT COUNT THAT DOUBLE COUNTS THE CORES.
@@ -1881,6 +1963,19 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				" the K slices a device holds would save %lu of"
 				" them\n", g->bread_passes, g->bread_ranges,
 				g->bread_passes - g->bread_ranges);
+		if (g->bfused_groups)
+			fprintf(stderr, "charsiu NPU: the fused read took %lu"
+				" ranges carrying %lu slices, so Y was touched"
+				" %lu times fewer\n", g->bfused_groups,
+				g->bfused_slices,
+				g->bfused_slices - g->bfused_groups);
+		if (g->bpack_pooled + g->bpack_serial)
+			fprintf(stderr, "charsiu NPU: packed %lu activations on"
+				" the pool and %lu one thread (%s)\n",
+				g->bpack_pooled, g->bpack_serial,
+				g->packpool == 1 ? "CHARSIU_NPU_PACK_POOL=1, always" :
+				g->packpool == 0 ? "CHARSIU_NPU_PACK_POOL=0, never" :
+				"pooled from CHARSIU_NPU_PACK_POOL_MIN groups");
 		if (g->bread_pooled + g->bread_serial)
 			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
 				" and %lu one thread (%s)\n",
@@ -3356,6 +3451,15 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
  * geometry. It still counts, because a pool that quietly reallocates is the
  * same bug wearing a different name.
  */
+void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
+				    double *packcall, int reset)
+{
+	*gather = g->bgather_us / 1e3;
+	*packcall = g->bpackcall_us / 1e3;
+	if (reset)
+		g->bgather_us = g->bpackcall_us = 0.0;
+}
+
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset)
 {
@@ -3871,6 +3975,217 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 		}
 	}
 	return 1;
+}
+
+/*
+ * ⚠⚠ THE PACKER ON THE POOL, SPLIT BY GROUPS.
+ *
+ * The entry split put 1.20 ms a row in the pack on Llama-3.2-1B and 1.62 on
+ * Qwen3-0.6B, and splitting THAT said the packer call is 0.61 and 1.11 of it
+ * -- the largest piece, and on Qwen3 the largest piece of the whole entry.
+ * The packer has been NEON since the width work; it has never been on more
+ * than one core.
+ *
+ * ⚠ BY GROUPS AND NOT BY ROWS. The packer walks groups of 8 k outermost
+ * because the destination is a cold write back mapping -- PREP_BO invalidates
+ * it immediately before -- and rows outermost measured 6.87 GB/s against
+ * 24.57 on a cold buffer. A row split would hand every thread the slow order.
+ * A group owns m * 16 contiguous bytes and no other group touches them.
+ *
+ * tests/pack_groups.c walks 707 shapes and splits, byte for byte against the
+ * whole buffer entry, including uneven splits, a source stride wider than k,
+ * and a k that is not a multiple of the atom.
+ */
+/*
+ * ⚠⚠ ONE PASS OVER Y FOR ALL THE K SLICES A DEVICE HOLDS.
+ *
+ * The read is the largest piece of a batched matmul on this model -- 2.27 ms
+ * of a 7.75 ms row -- and the note in read_rows already worked out why and
+ * what would fix it: "the gather moves about 403 MB at m = 32 and 1007 at
+ * m = 80 -- Y once per K slice, read and written ... it was never instruction
+ * bound ... the only lever left is fewer BYTES."
+ *
+ * A K slice is a partial sum. Every slice of one output range accumulates into
+ * the same columns of Y, so with s slices Y is read and written s times. This
+ * sums them in one pass and touches Y once. On Llama-3.2-1B the counters say
+ * 2240 slot reads over 1568 (device, range) pairs, so 672 round trips of
+ * m * sn * 4 bytes each way go away.
+ *
+ * ⚠ BIT EXACT, AND THAT IS THE WHOLE DESIGN. The unfused path computes
+ * y = c0, then y += c1, then y += c2, each rounding to float. This computes
+ * v = c0; v += c1; v += c2 in a float accumulator and stores once -- the same
+ * additions in the same order with the same rounding. A double accumulator
+ * would be more accurate and would NOT be this, so it is not used.
+ *
+ * 🏁 OFF, AND THE BOARD SAID SO. Fusing trades s sequential Y round trips for
+ * s scattered source streams live at once, and this loop is already bandwidth
+ * bound with a 4x line amplification from 16 byte runs. The scattered side
+ * costs more. Three pairs a model, alternating, governor pinned:
+ *
+ *     Llama-3.2-1B   plain 4070, 4062, 4082 ms   fused 4195, 4121, 4179
+ *     Qwen3-0.6B     plain 12200, 12313, 12195   fused 12376, 12218, 12175
+ *
+ * 2.3% SLOWER on the first and flat on the second, and the entry split agrees:
+ * read 2.24 -> 2.41 ms a row. It stays behind CHARSIU_NPU_READ_FUSE because
+ * the code is correct and the next person to have this idea should be able to
+ * run it rather than write it again.
+ *
+ * ⚠ WITH READ4 -- whole lines, four rows at a time, measured 2.3x slower on
+ * eight models -- that is BOTH of the levers read_rows' own note proposed for
+ * getting the byte count down, and both are now measured. The read is at its
+ * floor for this accumulator layout.
+ *
+ * ⚠⚠ AND THE FIRST CUT OF THIS WAS WRONG IN A WAY THE DERIVATION COULD NOT
+ * SEE. Its commit said "bit exact by construction" about the ORDER OF THE
+ * ADDITIONS and never checked the OPERANDS: a slot's scale is
+ * t->scale[(n0 + j) * ng + k0 / kgroup], so every K slice has its own, and the
+ * loop used the first slice's for all of them. Llama printed
+ * "000alivherherher" and Qwen3 counted 251, 254, 256 for 257, 258, 259.
+ * Neither faulted.
+ */
+struct read_fused {
+	struct charsiu_npu *g;
+	const struct npu_entry *e;
+	const struct npu_slot *s0;      /* the first slice: n0, sn, the shape */
+	const float *fo[8];
+	/*
+	 * ⚠⚠ ONE SCALE VECTOR PER SLICE, AND THE BOARD IS WHY THIS IS HERE.
+	 *
+	 * The first cut used the first slice's s->sc for all of them and its
+	 * commit message said "bit exact by construction". It was not: the
+	 * derivation was about the ORDER OF THE ADDITIONS and never checked
+	 * the OPERANDS. A slot's scale is built as
+	 *     s->sc[j] = t->scale[(n0 + j) * ng + k0 / kgroup]
+	 * so it depends on the slice's own k0, and every K slice has a
+	 * different one. Llama came back "000alivherherher" and Qwen3 counted
+	 * 251, 254, 256 where it should have counted 257, 258, 259.
+	 */
+	const float *sc[8];
+	unsigned ki[8], ns;
+	float *Y;
+	unsigned m, sn;
+	int grp, firstw;
+};
+
+static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct read_fused *c = ctx;
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	unsigned sn = c->sn, n4 = sn / 4, j, t;
+	int firstw = c->firstw;
+
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *yr = c->Y + (size_t)r * e->t->n + c->s0->n0;
+
+		for (j = 0; j < n4; j++) {
+			float v0, v1, v2, v3;
+
+			if (g->w4 && c->grp) {
+				const float *fp = c->fo[0] + mp[j];
+				const float *cp = c->sc[0] + j * 4;
+
+				v0 = fp[0] * cp[0]; v1 = fp[1] * cp[1];
+				v2 = fp[2] * cp[2]; v3 = fp[3] * cp[3];
+				for (t = 1; t < c->ns; t++) {
+					fp = c->fo[t] + mp[j];
+					cp = c->sc[t] + j * 4;
+					v0 += fp[0] * cp[0]; v1 += fp[1] * cp[1];
+					v2 += fp[2] * cp[2]; v3 += fp[3] * cp[3];
+				}
+			} else if (g->w4) {
+				const float *fp = c->fo[0] + mp[j];
+
+				v0 = fp[0]; v1 = fp[1]; v2 = fp[2]; v3 = fp[3];
+				for (t = 1; t < c->ns; t++) {
+					fp = c->fo[t] + mp[j];
+					v0 += fp[0]; v1 += fp[1];
+					v2 += fp[2]; v3 += fp[3];
+				}
+			} else {
+				const int32_t *ip = (const int32_t *)c->fo[0]
+						  + mp[j];
+				float d1 = g->bd1[(size_t)c->ki[0] * c->m + r];
+
+				v0 = (float)ip[0] * d1; v1 = (float)ip[1] * d1;
+				v2 = (float)ip[2] * d1; v3 = (float)ip[3] * d1;
+				for (t = 1; t < c->ns; t++) {
+					ip = (const int32_t *)c->fo[t] + mp[j];
+					d1 = g->bd1[(size_t)c->ki[t] * c->m + r];
+					v0 += (float)ip[0] * d1;
+					v1 += (float)ip[1] * d1;
+					v2 += (float)ip[2] * d1;
+					v3 += (float)ip[3] * d1;
+				}
+			}
+			if (firstw) {
+				yr[j * 4 + 0] = v0; yr[j * 4 + 1] = v1;
+				yr[j * 4 + 2] = v2; yr[j * 4 + 3] = v3;
+			} else {
+				yr[j * 4 + 0] += v0; yr[j * 4 + 1] += v1;
+				yr[j * 4 + 2] += v2; yr[j * 4 + 3] += v3;
+			}
+		}
+		/* the tail a slice's width leaves over, the same way */
+		for (j = n4 * 4; j < sn; j++) {
+			float v = 0.0f;
+
+			for (t = 0; t < c->ns; t++) {
+				float u;
+
+				if (g->w4 && c->grp)
+					u = c->fo[t][mp[j / 4] + j % 4]
+					  * c->sc[t][j];
+				else if (g->w4)
+					u = c->fo[t][mp[j / 4] + j % 4];
+				else
+					u = (float)((const int32_t *)c->fo[t])
+						[mp[j / 4] + j % 4]
+					  * g->bd1[(size_t)c->ki[t] * c->m + r];
+				v = t ? v + u : u;
+			}
+			if (firstw)
+				yr[j] = v;
+			else
+				yr[j] += v;
+		}
+	}
+}
+
+struct pack_groups_job {
+	const struct charsiu_matmul *mm;
+	const float *src;
+	size_t stride;
+	uint8_t *dst;
+};
+
+static void pack_groups_worker(void *ctx, uint64_t g0, uint64_t ng)
+{
+	struct pack_groups_job *j = ctx;
+
+	charsiu_pack_input_f16_groups(j->mm, j->src, j->stride, j->dst,
+				      (unsigned)g0, (unsigned)ng);
+}
+
+static void pack_f16_pooled(struct charsiu_npu *g,
+			    const struct charsiu_matmul *mm,
+			    const float *src, size_t stride,
+			    uint8_t *dst, size_t dst_size)
+{
+	unsigned ng = charsiu_pack_input_f16_ngroups(mm);
+
+	if (ng && (g->packpool == 1 ||
+		   (g->packpool == 2 && ng >= g->packpool_min))) {
+		struct pack_groups_job pj = { mm, src, stride, dst };
+
+		charsiu_pack_input_f16_edges(mm, src, stride, dst, dst_size);
+		charsiu_parallel_for(pack_groups_worker, &pj, ng);
+		g->bpack_pooled++;
+		return;
+	}
+	charsiu_pack_input_f16_stride(mm, src, stride, dst, dst_size);
+	g->bpack_serial++;
 }
 
 static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
@@ -4510,11 +4825,16 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
 			 * binary can run both arms in one session.
 			 */
-			if (!g->w4 || sk != e->t->k || pack_gather())
+			if (!g->w4 || sk != e->t->k || pack_gather()) {
+				double tg = now_us();
+
 				for (unsigned r = 0; r < m; r++)
 					memcpy(g->bscr + (size_t)r * sk,
 					       X + (size_t)r * e->t->k + s->k0,
 					       sk * sizeof(*g->bscr));
+				g->bgather_us += now_us() - tg;
+			}
+			double tpc = now_us();
 			if (!g->w4) {
 				/*
 				 * int8's scale is per row and taken over THIS K
@@ -4568,14 +4888,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						   g->bin_stride, s->job.input_zero_point);
 			} else if (sk == e->t->k && !pack_gather()) {
 				/* the slice is the whole row, so k0 is 0 */
-				charsiu_pack_input_f16_stride(&mm, X, e->t->k,
+				pack_f16_pooled(g, &mm, X, e->t->k,
 						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						g->bin_stride);
 			} else {
-				charsiu_pack_input_f16(&mm, g->bscr,
+				pack_f16_pooled(g, &mm, g->bscr, mm.k,
 						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
 						g->bin_stride);
 			}
+			g->bpackcall_us += now_us() - tpc;
 		}
 
 		double tpe = now_us();
@@ -4768,10 +5089,94 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * tensor, which means the caller's loop rather than
 			 * this one.
 			 */
+			/*
+			 * ⚠ THE FUSED PASS FIRST, and it walks the slots in
+			 * exactly the order the loop below would: n range
+			 * outermost, K slice ascending inside it, which is
+			 * what makes the sum bit identical. Anything it does
+			 * not take -- READ4 on, more than 8 slices on one
+			 * device, a range with a single slice to fuse -- falls
+			 * through to the per slot loop untouched.
+			 */
+			unsigned fused_ni = 0;
+
+			if (g->readfuse && !g->read4 && g->bmap) {
+				unsigned ni;
+
+				for (ni = 0; ni < e->n_slices; ni++) {
+					struct read_fused c;
+					unsigned i, cnt = 0, ntc = 0;
+
+					c.g = g; c.e = e; c.Y = Y; c.m = m;
+					c.s0 = NULL;
+					for (i = 0; i < e->count; i++) {
+						const struct npu_slot *s =
+							&g->slot[e->first + i];
+
+						if (s->di != d)
+							continue;
+						if (i % e->n_slices != ni) {
+							ntc++;
+							continue;
+						}
+						/*
+						 * ⚠ MORE THAN THE ARRAY HOLDS
+						 * MEANS DO NOT FUSE AT ALL. An
+						 * earlier cut kept the first
+						 * eight and let the per slot
+						 * loop skip the whole range,
+						 * which DROPS every slice past
+						 * the eighth -- a wrong answer
+						 * with nothing reporting one.
+						 */
+						if (cnt >= 8) {
+							cnt = 0;
+							break;
+						}
+						c.fo[cnt] = (const float *)
+							((uint8_t *)ob->bo[d].map
+							 + (size_t)ntc
+							 * g->bout_stride);
+						c.sc[cnt] = s->sc;
+						c.ki[cnt] = i / e->n_slices;
+						if (!cnt) c.s0 = s;
+						cnt++;
+						ntc++;
+					}
+					if (cnt < 2 || !c.s0)
+						continue;   /* nothing to fuse */
+					c.ns = cnt;
+					c.sn = c.s0->job.mm.n;
+					c.grp = tensor_grouped(g, e->t);
+					c.firstw = !g->bseen[c.s0->n0 / g->nmax];
+					g->bread_passes += cnt;
+					if (!((g->bseen_dev >> (d * 16))
+					      & (1u << (c.s0->n0 / g->nmax))))
+						g->bread_ranges++;
+					g->bseen_dev |= (uint64_t)1
+						<< (d * 16 + c.s0->n0 / g->nmax);
+					if (g->poolread == 1 ||
+					    (g->poolread == 2 &&
+					     (size_t)m * c.sn >= g->poolread_min))
+						charsiu_parallel_for(read_fused_rows,
+								     &c, m);
+					else
+						read_fused_rows(&c, 0, m);
+					g->bseen[c.s0->n0 / g->nmax] = 1;
+					g->bfused_groups++;
+					g->bfused_slices += cnt;
+					fused_ni |= 1u << ni;
+				}
+			}
 			nt = 0;
 			for (unsigned i = 0; i < e->count; i++) {
 				const struct npu_slot *s = &g->slot[e->first + i];
 				unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+
+				if (s->di == d && ((fused_ni >> (i % e->n_slices)) & 1u)) {
+					nt++;
+					continue;   /* the fused pass took it */
+				}
 				const float *fo;
 				const int32_t *io;
 				int grp = tensor_grouped(g, e->t);

@@ -32,7 +32,13 @@
  * i's stream begins at i * FP16_REG_STRIDE. charsiu_emit_job returns 0 rather
  * than overrunning, and the group treats that as a refusal. */
 #define FP16_REG_STRIDE 4096
-#define FP16_GROUP_MAX  32
+/*
+ * A layer of attention is H scores matmuls and H values matmuls, and H is 32
+ * on Phi-3.5 and 16 on Qwen3, so a cap of 32 would split a layer that has no
+ * reason to be split. The arrays this sizes are on the stack of one call and
+ * in one heap object; 64 costs about 16 kB of stack and 8 kB in the handle.
+ */
+#define FP16_GROUP_MAX  64
 
 struct charsiu_fp16_plan {
 	size_t woff[FP16_GROUP_MAX], wsz[FP16_GROUP_MAX];

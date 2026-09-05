@@ -181,6 +181,13 @@ yes|1|true|on)
 	env_default CHARSIU_COEF_ELEMS "$COEF" ;;
 esac
 [ -n "$CPUS" ] && env_default CHARSIU_CPUS "$CPUS"
+# ⚠ THE POOL WANTS DIFFERENT CORES FROM THE CALLING THREAD, and the board
+# measured both halves: a prompt is 4.3% faster with the pool on all eight,
+# and decode is 26% SLOWER two runs in three if the CALLING thread can land on
+# an A53. cpus keeps the caller on the fast cores, pool_cpus opens the machine
+# to the workers. Neither has a default.
+POOLCPUS=$(ini_get run pool_cpus)
+[ -n "$POOLCPUS" ] && env_default CHARSIU_POOL_CPUS "$POOLCPUS"
 
 # ⚠ ONE SWITCH, NOT A SET OF ENVIRONMENT VARIABLES NOBODY WILL REMEMBER. The
 # stage timings existed only as CHARSIU_STAGES, which meant they were reachable
