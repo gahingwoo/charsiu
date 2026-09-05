@@ -81,7 +81,8 @@ static void check(struct charsiu_fp16_op *ops, unsigned n)
 		struct charsiu_matmul mm = { ops[i].m, ops[i].k, ops[i].n,
 					     CHARSIU_FP16, CHARSIU_FP16 };
 
-		if (p.wsz[i] < charsiu_weight_bytes(&mm) ||
+		if ((ops[i].Wbuf ? p.wsz[i] != 0
+				 : p.wsz[i] < charsiu_weight_bytes(&mm)) ||
 		    p.isz[i] < (size_t)ops[i].m * ops[i].k * 2 ||
 		    p.osz[i] < (size_t)ops[i].m * ops[i].n * 4 ||
 		    p.csz[i] < charsiu_coef_bytes(&mm))
@@ -101,7 +102,8 @@ static void check(struct charsiu_fp16_op *ops, unsigned n)
 			int same = ops[i].n == ops[j].n &&
 				   p.csz[i] == p.csz[j];
 
-			if (overlap(p.woff[i], p.wsz[i], p.woff[j], p.wsz[j]))
+			if (p.wsz[i] && p.wsz[j] &&
+			    overlap(p.woff[i], p.wsz[i], p.woff[j], p.wsz[j]))
 				bad("weights overlap", i, j);
 			if (overlap(p.ioff[i], p.isz[i], p.ioff[j], p.isz[j]))
 				bad("inputs overlap", i, j);
@@ -161,6 +163,7 @@ int main(void)
 						ops[i].n = ns[c];
 						ops[i].X = (const float *)1;
 						ops[i].W = (const void *)1;
+						ops[i].Wbuf = NULL;
 						ops[i].Y = (float *)1;
 					}
 					check(ops, n);
@@ -175,6 +178,7 @@ int main(void)
 			ops[i].n = ns[i % (sizeof(ns) / sizeof(*ns))];
 			ops[i].X = (const float *)1;
 			ops[i].W = (const void *)1;
+			ops[i].Wbuf = NULL;
 			ops[i].Y = (float *)1;
 		}
 		check(ops, n);
@@ -189,10 +193,33 @@ int main(void)
 			ops[i].n = 32 + i * 32;
 			ops[i].X = (const float *)1;
 			ops[i].W = (const void *)1;
+			ops[i].Wbuf = NULL;
 			ops[i].Y = (float *)1;
 		}
 		check(ops, n);
 	}
+
+	/*
+	 * ⚠ AND WITH SOME WEIGHTS ALREADY ON THE DEVICE. An op whose Wbuf is
+	 * set contributes nothing to the shared weight buffer, so the ops
+	 * either side of it must still not overlap -- which is the arithmetic
+	 * that breaks if a zero sized region is given a page anyway.
+	 */
+	for (n = 2; n <= FP16_GROUP_MAX; n++) {
+		for (i = 0; i < n; i++) {
+			ops[i].m = 8;
+			ops[i].k = ks[i % (sizeof(ks) / sizeof(*ks))];
+			ops[i].n = ns[i % (sizeof(ns) / sizeof(*ns))];
+			ops[i].X = (const float *)1;
+			ops[i].W = (i % 3) ? (const void *)1 : NULL;
+			ops[i].Wbuf = (i % 3) ? NULL
+					      : (struct charsiu_fp16_w *)1;
+			ops[i].Y = (float *)1;
+		}
+		check(ops, n);
+	}
+	for (i = 0; i < FP16_GROUP_MAX; i++)
+		ops[i].Wbuf = NULL;
 
 	/* and what must be refused */
 	for (i = 0; i < 4; i++) {

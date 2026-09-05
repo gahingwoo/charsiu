@@ -368,6 +368,7 @@ int main(int argc, char **argv)
 	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
 	int dogrp = argc > 3 && !strcmp(argv[3], "--group");
+	int doown = argc > 3 && !strcmp(argv[3], "--own");
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
@@ -812,6 +813,194 @@ int main(int argc, char **argv)
 			free(Xs[i]); free(Bs[i]); free(Ws[i]);
 			free(Ya[i]); free(Yb[i]); free(Yc[i]);
 		}
+		rc = 0;
+		goto done;
+	}
+	if (doown) {
+		/*
+		 * ⚠⚠ THE WEIGHT WHERE IT LIES, AND THE APPENDING LAW ON THE
+		 * HARDWARE.
+		 *
+		 * Round two put the weight memcpy at up to 55% of a grouped
+		 * round -- 6.6 ms of 12.0 at 32 ops -- and a KV cache has no
+		 * business being copied at all: it is appended to a row at a
+		 * time and never changes. charsiu_fp16_w is one device buffer
+		 * the caller writes into at charsiu_fp16_woffset.
+		 *
+		 * Two things are under test and they fail differently:
+		 *
+		 *   1. the buffer. Same weights, same ops, handed over as a
+		 *      handle instead of bytes: the answers must be identical
+		 *      to the copying group, and the wcopy line must go to
+		 *      zero.
+		 *   2. THE APPENDING LAW. Each buffer is allocated at a width
+		 *      of 2n, written through woffset AT THAT WIDTH -- which
+		 *      is what a cache does, since it does not know how many
+		 *      tokens are coming -- and then run at n. tests/pack_f16w
+		 *      says the offsets do not move while every group of 16 is
+		 *      full. This is the board being asked the same question.
+		 *
+		 * If 1 passes and 2 fails, the derivation is wrong and every
+		 * answer will be a permutation of the right one rather than
+		 * noise.
+		 */
+		unsigned G = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
+		unsigned reps = argc > 5 ? (unsigned)atoi(argv[5]) : 8;
+		struct charsiu_fp16 *fp = charsiu_fp16_open();
+		struct charsiu_fp16_op op[32];
+		struct charsiu_fp16_w *W16[32] = { 0 };
+		float *Xs[32] = { 0 }, *Ya[32] = { 0 }, *Yb[32] = { 0 };
+		float *Yc[32] = { 0 }, *Bs[32] = { 0 };
+		uint8_t *Ws[32] = { 0 };
+		struct charsiu_fp16_times t0t, t1t;
+		unsigned nbig = n * 2, ng = charsiu_weight_ngroup(CHARSIU_FP16);
+		double wa = 0, wb = 0, cross = 0, tc = 0, to = 0;
+		unsigned long s0, s1, c0, c1, r0, r1;
+		int failed = 0;
+
+		if (G > 32) G = 32;
+		if (n % ng) {
+			printf("  n must be a multiple of %u for this arm\n", ng);
+			goto done;
+		}
+		if (!fp) { printf("  could not open\n"); goto done; }
+		for (unsigned i = 0; i < G; i++) {
+			size_t wb2 = charsiu_fp16_wbytes(k, n);
+
+			Xs[i] = calloc((size_t)m * k, sizeof(float));
+			Bs[i] = calloc((size_t)n * k, sizeof(float));
+			Ws[i] = calloc(wb2, 1);
+			Ya[i] = calloc((size_t)m * n, sizeof(float));
+			Yb[i] = calloc((size_t)m * n, sizeof(float));
+			Yc[i] = calloc((size_t)m * n, sizeof(float));
+			if (!Xs[i] || !Bs[i] || !Ws[i] || !Ya[i] || !Yb[i] ||
+			    !Yc[i]) { printf("  out of memory\n"); goto done; }
+			for (size_t e = 0; e < (size_t)m * k; e++)
+				Xs[i][e] = (float)((int)((e + 7 * i) % 13) - 6)
+					 * 0.25f;
+			for (size_t e = 0; e < (size_t)n * k; e++)
+				Bs[i][e] = (float)((int)((e + 5 * i) % 7) - 3)
+					 * 0.5f;
+			/* the copying arm's weight, packed at the run width */
+			for (unsigned c2 = 0; c2 < n; c2++)
+				for (unsigned kk2 = 0; kk2 < k; kk2++) {
+					size_t off = charsiu_fp16_woffset(k, n,
+									  c2, kk2);
+					uint16_t h = charsiu_float_to_half(
+						Bs[i][(size_t)c2 * k + kk2]);
+
+					if (off + 1 >= wb2) continue;
+					Ws[i][off] = (uint8_t)(h & 0xff);
+					Ws[i][off + 1] = (uint8_t)(h >> 8);
+				}
+			reference(m, k, n, Xs[i], Bs[i], Yc[i]);
+			/* and the owned buffer, written AT THE BIG WIDTH */
+			W16[i] = charsiu_fp16_w_alloc(fp, k, nbig);
+			if (!W16[i]) { printf("  no weight buffer\n"); goto done; }
+			charsiu_fp16_w_begin(fp, W16[i]);
+			{
+				uint8_t *d = charsiu_fp16_w_map(W16[i]);
+				size_t cap = charsiu_fp16_w_bytes(W16[i]);
+
+				for (unsigned c2 = 0; c2 < n; c2++)
+					for (unsigned kk2 = 0; kk2 < k; kk2++) {
+						size_t off = charsiu_fp16_woffset(
+							k, nbig, c2, kk2);
+						uint16_t h = charsiu_float_to_half(
+							Bs[i][(size_t)c2 * k + kk2]);
+
+						if (off + 1 >= cap) continue;
+						d[off] = (uint8_t)(h & 0xff);
+						d[off + 1] = (uint8_t)(h >> 8);
+					}
+			}
+			charsiu_fp16_w_end(fp, W16[i]);
+			op[i].X = Xs[i]; op[i].Y = Yb[i]; op[i].Wbuf = NULL;
+			op[i].W = Ws[i];
+			op[i].m = m; op[i].k = k; op[i].n = n;
+		}
+		printf("%u ops, k=%u n=%u m=%u, buffers allocated at n=%u\n",
+		       G, k, n, m, nbig);
+		if (charsiu_fp16_matmul_group(fp, op, G))
+			{ printf("  the copying group refused\n"); failed = 1; }
+		for (unsigned i = 0; i < G; i++)
+			memcpy(Ya[i], Yb[i], (size_t)m * n * sizeof(float));
+		for (unsigned i = 0; i < G; i++) {
+			op[i].W = NULL;
+			op[i].Wbuf = W16[i];
+			memset(Yb[i], 0, (size_t)m * n * sizeof(float));
+		}
+		if (charsiu_fp16_matmul_group(fp, op, G))
+			{ printf("  the owned group refused\n"); failed = 1; }
+		for (unsigned i = 0; i < G; i++)
+			for (size_t e = 0; e < (size_t)m * n; e++) {
+				double da = fabs(Ya[i][e] - Yc[i][e]);
+				double db = fabs(Yb[i][e] - Yc[i][e]);
+
+				if (da > wa) wa = da;
+				if (db > wb) wb = db;
+				if (Ya[i][e] != Yb[i][e]) cross += 1;
+			}
+		printf("  copied weights   vs CPU: worst %.4g%s\n",
+		       wa, wa == 0.0 ? "   <== EXACT" : "");
+		printf("  owned  weights   vs CPU: worst %.4g%s\n",
+		       wb, wb == 0.0 ? "   <== EXACT" : "");
+		printf("  cells where the two arms differ: %.0f%s\n", cross,
+		       cross == 0 ? "   <== IDENTICAL, and the appending law"
+				    " holds on the hardware"
+				  : "  <== ⚠ the law or the buffer");
+		if (failed || cross != 0) {
+			printf("  not timing an arm that is not correct\n");
+			charsiu_fp16_close(fp);
+			rc = 1;
+			goto done;
+		}
+		charsiu_fp16_get_times(fp, &t0t);
+		charsiu_fp16_stats(fp, &c0, &r0);
+		s0 = charsiu_fp16_submits(fp);
+		for (unsigned r2 = 0; r2 < reps; r2++) {
+			double a = now_ms();
+
+			for (unsigned i = 0; i < G; i++) {
+				op[i].W = Ws[i]; op[i].Wbuf = NULL;
+			}
+			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
+			tc += now_ms() - a;
+			a = now_ms();
+			for (unsigned i = 0; i < G; i++) {
+				op[i].W = NULL; op[i].Wbuf = W16[i];
+			}
+			if (charsiu_fp16_matmul_group(fp, op, G)) failed = 1;
+			to += now_ms() - a;
+		}
+		charsiu_fp16_get_times(fp, &t1t);
+		charsiu_fp16_stats(fp, &c1, &r1);
+		s1 = charsiu_fp16_submits(fp);
+		printf("  %u rounds of %u matmuls%s\n", reps, G,
+		       failed ? "  (an arm refused)" : "");
+		printf("    weights copied   %.3f ms a matmul  (%.1f ms a round)\n",
+		       tc / (reps * G), tc / reps);
+		printf("    weights owned    %.3f ms a matmul  (%.1f ms a round)"
+		       "   %.2fx\n", to / (reps * G), to / reps,
+		       to > 0 ? tc / to : 0.0);
+		printf("    %lu matmuls over %lu submits, %lu refused\n",
+		       c1 - c0, s1 - s0, r1 - r0);
+		printf("    both arms together: wcopy %.3f  pack %.3f"
+		       "  coefs %.3f  emit %.3f  submit %.3f  fence %.3f"
+		       "  read %.3f ms a round\n",
+		       (t1t.wcopy - t0t.wcopy) / reps,
+		       (t1t.pack - t0t.pack) / reps,
+		       (t1t.coefs - t0t.coefs) / reps,
+		       (t1t.emit - t0t.emit) / reps,
+		       (t1t.submit - t0t.submit) / reps,
+		       (t1t.fence - t0t.fence) / reps,
+		       (t1t.read - t0t.read) / reps);
+		for (unsigned i = 0; i < G; i++) {
+			charsiu_fp16_w_free(fp, W16[i]);
+			free(Xs[i]); free(Bs[i]); free(Ws[i]);
+			free(Ya[i]); free(Yb[i]); free(Yc[i]);
+		}
+		charsiu_fp16_close(fp);
 		rc = 0;
 		goto done;
 	}

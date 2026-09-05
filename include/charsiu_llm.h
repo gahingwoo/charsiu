@@ -364,9 +364,42 @@ void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
  * between ops. At most 32 ops, and it refuses the whole group if any op is
  * shaped in a way the single call would refuse.
  */
+/*
+ * A WEIGHT BUFFER THE HARDWARE READS WHERE IT LIES.
+ *
+ * The group copies every op's W into a device buffer, and the first board
+ * round put that at 0.39 to 2.21 ms of a round -- the largest cost left once
+ * the fence was amortised. A KV cache does not need copying. It is appended to
+ * a row at a time and charsiu_fp16_woffset says exactly where a row goes, so a
+ * caller can allocate one of these per layer and head, write each token's row
+ * into it once, and hand the group a handle instead of 128 kB of memcpy.
+ *
+ *   w = charsiu_fp16_w_alloc(f, k, n);
+ *   charsiu_fp16_w_begin(w);            -- before the CPU writes
+ *   ... write halves at charsiu_fp16_woffset(k, n, ni, ki) into w's map ...
+ *   charsiu_fp16_w_end(w);              -- before the hardware reads
+ *   op.Wbuf = w;  op.W = NULL;
+ *
+ * ⚠ THE LAYOUT IS ONLY STABLE WHERE EVERY GROUP IS FULL. charsiu_fp16_woffset
+ * is (n/16)*16*ke + (k/32)*32*ngsz + (n%16)*kgsz + k%32, and ngsz is 16 for
+ * every group except a partial last one, ke is the padded k. So an offset does
+ * not depend on n at all when n is a multiple of 16 -- append along n freely --
+ * and it DOES depend on k through ke, so a buffer that will grow along k must
+ * be allocated at its final k and run at that k with the unused part zero.
+ */
+struct charsiu_fp16_w;
+struct charsiu_fp16_w *charsiu_fp16_w_alloc(struct charsiu_fp16 *f,
+					    unsigned k, unsigned n);
+void charsiu_fp16_w_free(struct charsiu_fp16 *f, struct charsiu_fp16_w *w);
+void *charsiu_fp16_w_map(struct charsiu_fp16_w *w);
+size_t charsiu_fp16_w_bytes(const struct charsiu_fp16_w *w);
+void charsiu_fp16_w_begin(struct charsiu_fp16 *f, struct charsiu_fp16_w *w);
+void charsiu_fp16_w_end(struct charsiu_fp16 *f, struct charsiu_fp16_w *w);
+
 struct charsiu_fp16_op {
 	const float *X;
-	const void *W;
+	const void *W;                 /* NULL when Wbuf carries the weight */
+	struct charsiu_fp16_w *Wbuf;   /* NULL when W does */
 	float *Y;
 	unsigned m, k, n;
 };

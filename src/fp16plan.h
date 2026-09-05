@@ -80,11 +80,17 @@ static inline int charsiu_fp16_make_plan(const struct charsiu_fp16_op *ops,
 
 		if (!o->m || o->k < 32 || o->n < 32)
 			return -1;
-		p->wsz[i] = charsiu_weight_bytes(&mm);
+		/* ⚠ an op whose weight is already on the device takes no room
+		 * in the shared buffer, and must take none: giving a zero
+		 * sized region a page would make the plan disagree with what
+		 * the group copies, and the ops either side of it would still
+		 * have to not overlap */
+		p->wsz[i] = o->Wbuf ? 0 : charsiu_weight_bytes(&mm);
 		p->isz[i] = (size_t)charsiu_entries_per_row(&mm) * 64 * o->m;
 		p->osz[i] = (size_t)o->m * o->n * 4;
 		p->csz[i] = charsiu_coef_bytes(&mm);
-		p->woff[i] = p->wtot; p->wtot += charsiu_fp16_up4k(p->wsz[i]);
+		p->woff[i] = p->wtot;
+		p->wtot += p->wsz[i] ? charsiu_fp16_up4k(p->wsz[i]) : 0;
 		p->ioff[i] = p->itot; p->itot += charsiu_fp16_up4k(p->isz[i]);
 		p->ooff[i] = p->otot; p->otot += charsiu_fp16_up4k(p->osz[i]);
 		/*

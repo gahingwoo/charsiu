@@ -114,6 +114,82 @@ static int want(struct charsiu_fp16 *f, size_t wsz, size_t insz, size_t obsz,
 		f->reg.map) ? 0 : -1;
 }
 
+/*
+ * A WEIGHT THE CALLER OWNS, WHICH IS THE POINT OF THE WHOLE FILE.
+ *
+ * The group's memcpy of the caller's weights was 0.39 to 2.21 ms of a round
+ * on the first board round -- the largest cost left once the fence was
+ * amortised, and pure waste for a KV cache, which is appended to a row at a
+ * time and never changes afterwards. This is one device buffer the caller
+ * writes rows into at charsiu_fp16_woffset and the hardware reads where it
+ * lies.
+ *
+ * ⚠ IT IS ZEROED ON THE WAY OUT AND THAT IS NOT TIDINESS. A group runs with
+ * whatever n it is given, and the hardware reads the whole weight surface for
+ * that n -- including the channels of a cache that has no token in them yet.
+ * Zero there contributes zero to a score, which the softmax mask then throws
+ * away; uninitialised memory contributes a NaN that spreads through the row.
+ */
+struct charsiu_fp16_w {
+	struct charsiu_bo bo;
+	size_t bytes;
+	unsigned k, n;
+};
+
+struct charsiu_fp16_w *charsiu_fp16_w_alloc(struct charsiu_fp16 *f,
+					    unsigned k, unsigned n)
+{
+	struct charsiu_matmul mm = { 1, k, n, CHARSIU_FP16, CHARSIU_FP16 };
+	struct charsiu_fp16_w *w;
+
+	if (!f || k < 32 || n < 32)
+		return NULL;
+	w = calloc(1, sizeof(*w));
+	if (!w)
+		return NULL;
+	w->bytes = charsiu_weight_bytes(&mm);
+	w->k = k;
+	w->n = n;
+	if (charsiu_bo_alloc(f->dev, w->bytes + 4096, &w->bo) || !w->bo.map) {
+		free(w);
+		return NULL;
+	}
+	charsiu_bo_prep(f->dev, &w->bo, 1000000000);
+	memset(w->bo.map, 0, w->bytes + 4096);
+	charsiu_bo_fini(f->dev, &w->bo);
+	return w;
+}
+
+void charsiu_fp16_w_free(struct charsiu_fp16 *f, struct charsiu_fp16_w *w)
+{
+	if (!f || !w)
+		return;
+	charsiu_bo_free(f->dev, &w->bo);
+	free(w);
+}
+
+void *charsiu_fp16_w_map(struct charsiu_fp16_w *w)
+{
+	return w ? w->bo.map : NULL;
+}
+
+size_t charsiu_fp16_w_bytes(const struct charsiu_fp16_w *w)
+{
+	return w ? w->bytes : 0;
+}
+
+void charsiu_fp16_w_begin(struct charsiu_fp16 *f, struct charsiu_fp16_w *w)
+{
+	if (f && w)
+		charsiu_bo_prep(f->dev, &w->bo, 1000000000);
+}
+
+void charsiu_fp16_w_end(struct charsiu_fp16 *f, struct charsiu_fp16_w *w)
+{
+	if (f && w)
+		charsiu_bo_fini(f->dev, &w->bo);
+}
+
 struct charsiu_fp16 *charsiu_fp16_open(void)
 {
 	struct charsiu_fp16 *f = calloc(1, sizeof(*f));
@@ -318,7 +394,8 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	struct charsiu_fp16_plan pl;
 	unsigned i, bad = 0;
 	struct charsiu_joblist jl;
-	uint32_t ins[3], outs[1];
+	uint32_t ins[3 + FP16_GROUP_MAX], outs[1];
+	unsigned nin;
 	int32_t *zero;
 	double t0;
 
@@ -330,11 +407,38 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		f->refused++;
 		return -1;
 	}
-	for (i = 0; i < nops; i++)
-		if (!ops[i].X || !ops[i].W || !ops[i].Y) {
+	for (i = 0; i < nops; i++) {
+		const struct charsiu_fp16_op *o = &ops[i];
+
+		if (!o->X || !o->Y || (!o->W && !o->Wbuf)) {
 			f->refused++;
 			return -1;
 		}
+		/*
+		 * ⚠ WHAT A CALLER OWNED WEIGHT MAY BE RUN AT, and it is not
+		 * "anything smaller".
+		 *
+		 * charsiu_fp16_woffset is
+		 *     (n/16)*16*ke + (k/32)*32*ngsz + (n%16)*kgsz + k%32
+		 * where ke is the PADDED k and ngsz is 16 for every group but
+		 * a partial last one. So an offset does not depend on n while
+		 * every group is full, which is what lets a cache be appended
+		 * to along n and read at whatever n it has reached -- and it
+		 * DOES depend on k through ke, always. A buffer written at one
+		 * k and run at another is not a smaller matmul of the same
+		 * weights, it is a different permutation of them, and it comes
+		 * back as a plausible wrong number.
+		 */
+		if (o->Wbuf) {
+			unsigned ng = charsiu_weight_ngroup(CHARSIU_FP16);
+
+			if (o->Wbuf->k != o->k || o->n > o->Wbuf->n ||
+			    (o->n != o->Wbuf->n && (o->n % ng))) {
+				f->refused++;
+				return -1;
+			}
+		}
+	}
 	if (want(f, pl.wtot + 4096, pl.itot + 4096, pl.otot + 4096,
 		 pl.ctot + 4096, (size_t)nops * FP16_REG_STRIDE + 4096))
 		return -1;
@@ -343,10 +447,21 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	 * maintenance per op would put back a per dispatch cost of exactly
 	 * the kind this function exists to remove. */
 	t0 = now_ms();
-	charsiu_bo_prep(f->dev, &f->wt, 1000000000);
-	for (i = 0; i < nops; i++)
-		memcpy((uint8_t *)f->wt.map + pl.woff[i], ops[i].W, pl.wsz[i]);
-	charsiu_bo_fini(f->dev, &f->wt);
+	{
+		unsigned copies = 0;
+
+		for (i = 0; i < nops; i++)
+			copies += pl.wsz[i] != 0;
+		if (copies) {
+			charsiu_bo_prep(f->dev, &f->wt, 1000000000);
+			for (i = 0; i < nops; i++)
+				if (pl.wsz[i])
+					memcpy((uint8_t *)f->wt.map
+					       + pl.woff[i], ops[i].W,
+					       pl.wsz[i]);
+			charsiu_bo_fini(f->dev, &f->wt);
+		}
+	}
 	f->t.wcopy += now_ms() - t0;
 
 	/* row major, [m][k], which is what --inslots measured slot by slot */
@@ -383,7 +498,9 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		job[i].acc_out = 1;
 		job[i].input_addr = (uint32_t)f->in.dma_address + pl.ioff[i];
 		job[i].output_addr = (uint32_t)f->ob.dma_address + pl.ooff[i];
-		job[i].weight_addr = (uint32_t)f->wt.dma_address + pl.woff[i];
+		job[i].weight_addr = ops[i].Wbuf
+			? (uint32_t)ops[i].Wbuf->bo.dma_address
+			: (uint32_t)f->wt.dma_address + pl.woff[i];
 		job[i].coef_addr = (uint32_t)f->coef.dma_address + pl.coff[i];
 	}
 
@@ -477,6 +594,19 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	ins[0] = f->in.handle;
 	ins[1] = f->wt.handle;
 	ins[2] = f->coef.handle;
+	nin = 3;
+	/* every caller owned weight is its own buffer object, and a job names
+	 * the buffers it reads. Twice is not an error but it is not useful. */
+	for (i = 0; i < nops; i++)
+		if (ops[i].Wbuf) {
+			unsigned j, seen = 0;
+
+			for (j = 0; j < nin; j++)
+				if (ins[j] == ops[i].Wbuf->bo.handle)
+					seen = 1;
+			if (!seen)
+				ins[nin++] = ops[i].Wbuf->bo.handle;
+		}
 	outs[0] = f->ob.handle;
 	/*
 	 * ⚠ THE PROBE HATCH, because "the group is wrong" has two causes and
@@ -499,7 +629,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			split[i].tasks = &task[i];
 			split[i].task_count = 1;
 			split[i].in_handles = ins;
-			split[i].in_count = 3;
+			split[i].in_count = nin;
 			split[i].out_handles = outs;
 			split[i].out_count = 1;
 		}
@@ -509,7 +639,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		jl.tasks = task;
 		jl.task_count = nops;
 		jl.in_handles = ins;
-		jl.in_count = 3;
+		jl.in_count = nin;
 		jl.out_handles = outs;
 		jl.out_count = 1;
 		if (charsiu_submit_jobs(f->dev, &jl, 1))
