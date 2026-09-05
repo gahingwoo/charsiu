@@ -3993,10 +3993,31 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
  * additions in the same order with the same rounding. A double accumulator
  * would be more accurate and would NOT be this, so it is not used.
  *
- * ⚠ OFF UNTIL THE BOARD SAYS. Fusing trades s sequential Y round trips for s
- * scattered source streams live at once, and this loop is already bandwidth
- * bound with a 4x line amplification from 16 byte runs. Which side wins is a
- * measurement. CHARSIU_NPU_READ_FUSE=1 turns it on.
+ * 🏁 OFF, AND THE BOARD SAID SO. Fusing trades s sequential Y round trips for
+ * s scattered source streams live at once, and this loop is already bandwidth
+ * bound with a 4x line amplification from 16 byte runs. The scattered side
+ * costs more. Three pairs a model, alternating, governor pinned:
+ *
+ *     Llama-3.2-1B   plain 4070, 4062, 4082 ms   fused 4195, 4121, 4179
+ *     Qwen3-0.6B     plain 12200, 12313, 12195   fused 12376, 12218, 12175
+ *
+ * 2.3% SLOWER on the first and flat on the second, and the entry split agrees:
+ * read 2.24 -> 2.41 ms a row. It stays behind CHARSIU_NPU_READ_FUSE because
+ * the code is correct and the next person to have this idea should be able to
+ * run it rather than write it again.
+ *
+ * ⚠ WITH READ4 -- whole lines, four rows at a time, measured 2.3x slower on
+ * eight models -- that is BOTH of the levers read_rows' own note proposed for
+ * getting the byte count down, and both are now measured. The read is at its
+ * floor for this accumulator layout.
+ *
+ * ⚠⚠ AND THE FIRST CUT OF THIS WAS WRONG IN A WAY THE DERIVATION COULD NOT
+ * SEE. Its commit said "bit exact by construction" about the ORDER OF THE
+ * ADDITIONS and never checked the OPERANDS: a slot's scale is
+ * t->scale[(n0 + j) * ng + k0 / kgroup], so every K slice has its own, and the
+ * loop used the first slice's for all of them. Llama printed
+ * "000alivherherher" and Qwen3 counted 251, 254, 256 for 257, 258, 259.
+ * Neither faulted.
  */
 struct read_fused {
 	struct charsiu_npu *g;

@@ -1845,3 +1845,47 @@ anyway" -- true of the build with the bug and false of every build before it.
 What settled it was running one binary ten times and then the previous commit
 ten times. **A difference between two arms cannot be told from a difference
 between two runs without running one arm twice.**
+
+## Two ways to make the read cheaper, and the board refused both
+
+The read is the largest piece of a batched matmul, and `read_rows`' own note
+had already reasoned out the physics: it is bandwidth bound, a run is 16 bytes
+against a 64 byte line so the DRAM sees four times the useful traffic, "it was
+never instruction bound ... the only lever left is fewer BYTES." It named two
+ways to get them down.
+
+**Whole lines, four rows at a time** was tried before: 2.3x slower on eight
+models, because four rows off one line means four write streams whose rows sit
+n floats apart and the A72's store buffer does not merge them.
+
+**One pass over Y for all the K slices a device holds** is the other, and it is
+what a partial sum invites: with s slices Y is read and written s times. The
+counters said 2240 slot reads over 1568 ranges on Llama, so 672 round trips
+were available.
+
+```
+   Llama-3.2-1B   plain 4070, 4062, 4082 ms   fused 4195, 4121, 4179   2.3% SLOWER
+   Qwen3-0.6B     plain 12200, 12313, 12195   fused 12376, 12218, 12175   flat
+```
+
+It trades s sequential Y round trips for s scattered source streams live at
+once, and the scattered side costs more. Both levers are now measured. The read
+is at its floor for this accumulator layout.
+
+### The part that is worth more than the result
+
+The commit that added the fused read said **"bit exact by construction"**. It
+was not. The derivation was about the ORDER OF THE ADDITIONS -- `y = c0;
+y += c1` against `v = c0; v += c1` -- and it never checked that the OPERANDS
+were the same. They are not: a slot's scale is
+
+```
+   s->sc[j] = t->scale[(n0 + j) * ng + k0 / kgroup]
+```
+
+so it depends on the slice's own `k0` and every K slice has a different one.
+The loop used the first slice's for all of them. Llama came back
+"000alivherherher" and Qwen3 counted 251, 254, 256 where it should have counted
+257, 258, 259. Neither faulted, because a wrong operand does not fault.
+
+A proof about one half of an expression is not a proof about the expression.
