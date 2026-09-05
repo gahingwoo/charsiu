@@ -47,10 +47,18 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 
 	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = m; job.mm.k = k; job.mm.n = n;
-	job.mm.wdtype = CHARSIU_FP16;
-	job.mm.adtype = CHARSIU_FP16;
-	job.input_zero_point = 0;      /* a float carries its own sign */
-	job.weight_zero_point = 0;
+	/*
+	 * ⚠ THE CONTROL ARM. CHARSIU_TEST_INT8 runs this identical loop as an
+	 * int8 job, which is the only way to say whether "an fp16 job writes
+	 * nothing 89% of the time" is about fp16 or about submitting 128 jobs
+	 * in one process with five BOs allocated and freed each time.
+	 */
+	int i8 = getenv("CHARSIU_TEST_INT8") != NULL;
+
+	job.mm.wdtype = i8 ? CHARSIU_INT8 : CHARSIU_FP16;
+	job.mm.adtype = i8 ? CHARSIU_INT8 : CHARSIU_FP16;
+	job.input_zero_point = i8 ? 128 : 0;   /* a float carries its own sign */
+	job.weight_zero_point = i8 ? 128 : 0;
 	job.output_zero_point = 0;
 	job.input_scale = 1.0f;
 	job.weight_scale = 1.0f;
@@ -73,7 +81,9 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	}
 
 	charsiu_bo_prep(dev, &wt, 1000000000);
-	if (W) {                        /* the slot sweep supplies its own */
+	if (i8) {
+		memset(wt.map, 0x80, wsz);   /* every weight the zero point */
+	} else if (W) {                 /* the slot sweep supplies its own */
 		memset(wt.map, 0, wsz);
 		memcpy(wt.map, W, wlen < wsz ? wlen : wsz);
 	} else {
@@ -82,7 +92,18 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	charsiu_bo_fini(dev, &wt);
 
 	charsiu_bo_prep(dev, &in, 1000000000);
-	charsiu_pack_input_f16(&job.mm, A, in.map, insz);
+	if (i8) {
+		uint8_t *a8 = malloc((size_t)m * k);
+
+		if (!a8) goto out;
+		for (size_t z = 0; z < (size_t)m * k; z++)
+			a8[z] = 128;
+		charsiu_pack_input(&job.mm, a8, in.map, insz,
+				   job.input_zero_point);
+		free(a8);
+	} else {
+		charsiu_pack_input_f16(&job.mm, A, in.map, insz);
+	}
 	charsiu_bo_fini(dev, &in);
 
 	{
@@ -180,6 +201,7 @@ int main(int argc, char **argv)
 	int doslots = argc > 3 && !strcmp(argv[3], "--slots");
 	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
 	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
+	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -193,6 +215,49 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doloop) {
+		/*
+		 * ⚠⚠ THE SAME JOB, N TIMES, COUNTING HOW MANY WRITE.
+		 *
+		 * --holes with a hole of 1.0 is no hole at all, and 116 of its
+		 * 128 submits still wrote nothing. So the weight contents were
+		 * never the variable and every "which slots fire" reading in
+		 * this file was sampling a submit that succeeds about a tenth
+		 * of the time. This measures that rate on its own, and
+		 * CHARSIU_TEST_INT8 runs the identical loop as an int8 job so
+		 * the rate can be attributed to fp16 or to the loop.
+		 */
+		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 128;
+		unsigned wrote = 0, first_fail = 0;
+
+		for (unsigned i = 0; i < m * k; i++)
+			A[i] = 1.0f;
+		for (unsigned i = 0; i < n * k; i++)
+			B[i] = 1.0f;
+		printf("%s, the same job %u times\n",
+		       getenv("CHARSIU_TEST_INT8") ? "int8" : "fp16", reps);
+		for (unsigned r = 0; r < reps; r++) {
+			unsigned untouched = 0;
+
+			if (run(dev, m, k, n, A, B, CHARSIU_W16_DENSE, got))
+				break;
+			for (unsigned c = 0; c < n; c++)
+				untouched += got[c] == 0xdeadbeefu;
+			if (untouched == n) {
+				if (!first_fail)
+					first_fail = r + 1;
+			} else {
+				wrote++;
+			}
+			if (r < 40)
+				printf("%c", untouched == n ? '.' : '#');
+		}
+		printf("\n  %u of %u wrote (# wrote, . nothing); first"
+		       " silent submit was number %u\n", wrote, reps,
+		       first_fail);
+		rc = 0;
+		goto done;
+	}
 	if (doholes) {
 		/*
 		 * ⚠⚠ THE ONE HOT PROBE WAS NOT VALID AND --bits IS WHY.
