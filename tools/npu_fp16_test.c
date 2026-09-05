@@ -35,9 +35,10 @@
 
 static const char *lname[CHARSIU_W16_NLAYOUT] = { "dense", "atom", "group" };
 
-static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
-	       const float *A, const float *B, enum charsiu_w16_layout L,
-	       uint32_t *out)
+static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
+		    unsigned n, const float *A, const float *B,
+		    enum charsiu_w16_layout L, const uint8_t *W, size_t wlen,
+		    uint32_t *out)
 {
 	struct charsiu_job job = { 0 };
 	struct charsiu_bo wt = { 0 }, in = { 0 }, ob = { 0 }, coef = { 0 }, reg = { 0 };
@@ -72,7 +73,12 @@ static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
 	}
 
 	charsiu_bo_prep(dev, &wt, 1000000000);
-	charsiu_pack_weights_f16(&job.mm, B, wt.map, wsz, L);
+	if (W) {                        /* the slot sweep supplies its own */
+		memset(wt.map, 0, wsz);
+		memcpy(wt.map, W, wlen < wsz ? wlen : wsz);
+	} else {
+		charsiu_pack_weights_f16(&job.mm, B, wt.map, wsz, L);
+	}
 	charsiu_bo_fini(dev, &wt);
 
 	charsiu_bo_prep(dev, &in, 1000000000);
@@ -125,6 +131,21 @@ out:
 	return rc;
 }
 
+static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
+	       const float *A, const float *B, enum charsiu_w16_layout L,
+	       uint32_t *out)
+{
+	return run_core(dev, m, k, n, A, B, L, NULL, 0, out);
+}
+
+/* the weight buffer supplied verbatim, for the slot sweep */
+static int run_raw(struct charsiu_device *dev, unsigned m, unsigned k,
+		   unsigned n, const float *A, const uint8_t *W, size_t wlen,
+		   uint32_t *out)
+{
+	return run_core(dev, m, k, n, A, NULL, CHARSIU_W16_DENSE, W, wlen, out);
+}
+
 /* the same arithmetic on the CPU, rounded through fp16 the way the pack is */
 static void reference(unsigned m, unsigned k, unsigned n,
 		      const float *A, const float *B, float *out)
@@ -148,6 +169,7 @@ int main(int argc, char **argv)
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 8;
 	unsigned m = 1;
 	int domap = argc > 3 && !strcmp(argv[3], "--map");
+	int doslots = argc > 3 && !strcmp(argv[3], "--slots");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -161,6 +183,60 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doslots) {
+		/*
+		 * ⚠⚠ SWEEP THE BYTE OFFSET, NOT THE LOGICAL INDEX.
+		 *
+		 * --map places a weight at the (n, k) THIS layout chooses, so a
+		 * cell only lights up where our layout already agrees with the
+		 * hardware's. It cannot see what the hardware read the other
+		 * cells as, which is the whole permutation. Four rounds of that
+		 * gave twelve firing cells and no rule.
+		 *
+		 * This writes 1.0 into slot s of the buffer directly, so the
+		 * channel it comes back in is the hardware's n and the value is
+		 * A[k] for the hardware's k. That is H inverse, read off, with
+		 * no candidate layout in the way.
+		 */
+		unsigned slots = (unsigned)(charsiu_weight_bytes(&(struct charsiu_matmul){
+			m, k, n, CHARSIU_FP16, CHARSIU_FP16 }) / 2);
+		struct charsiu_matmul mm = { m, k, n, CHARSIU_FP16, CHARSIU_FP16 };
+		size_t wsz = charsiu_weight_bytes(&mm);
+		uint8_t *raw = calloc(wsz, 1);
+
+		for (unsigned i = 0; i < k; i++)
+			A[i] = (float)(i + 1);
+		if (!raw) goto done;
+		printf("one 1.0 per SLOT, %u slots of %zu bytes; A[k] = k+1\n",
+		       slots, wsz);
+		printf("  slot  byte   -> channel : A[k], so k\n");
+		for (unsigned sl = 0; sl < slots; sl++) {
+			uint16_t h = charsiu_float_to_half(1.0f);
+			int lit = 0;
+
+			memset(raw, 0, wsz);
+			raw[sl * 2] = (uint8_t)(h & 0xff);
+			raw[sl * 2 + 1] = (uint8_t)(h >> 8);
+			if (run_raw(dev, m, k, n, A, raw, wsz, got))
+				break;
+			for (unsigned c = 0; c < n; c++)
+				if (got[c]) {
+					float v = asf(got[c]);
+
+					printf("  %-5u %-6u -> %u : %g%s\n", sl,
+					       sl * 2, c, (double)v,
+					       (v >= 1 && v <= (float)k &&
+						v == (float)(int)v)
+					       ? "" : "   (not a ramp value)");
+					lit = 1;
+				}
+			if (!lit)
+				printf("  %-5u %-6u -> nothing\n", sl, sl * 2);
+		}
+		free(raw);
+		rc = 0;
+		goto done;
+	}
 	if (domap) {
 		/*
 		 * ⚠ ONE NON ZERO WEIGHT AT A TIME. A is a ramp with no repeats,
