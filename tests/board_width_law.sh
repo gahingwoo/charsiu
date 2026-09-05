@@ -114,8 +114,11 @@ done
 # of the failure this tree keeps shipping: a run that exits clean having
 # measured nothing. It is caught below by looking for the table itself, and
 # this guard is here so the common case says so before spending the time.
-if [ ! -e /dev/accel/accel0 ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
-	echo "NO /dev/accel/accel0 -- every width would fall back to the CPU," >&2
+# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# minor, so the NPU can sit at accel1 or accel2 and a test that looks only
+# for accel0 refuses on a board that has one.
+if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
+	echo "NO /dev/accel/accel* -- every width would fall back to the CPU," >&2
 	echo "every arm would agree, odd widths would come back exact, and a" >&2
 	echo "prediction scored against that says nothing about the silicon." >&2
 	echo "Run it on the board.  CHARSIU_ALLOW_NO_NPU=1 overrides." >&2

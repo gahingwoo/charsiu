@@ -113,13 +113,39 @@ void charsiu_note_install(void)
 	signal(SIGFPE, note_crash);
 }
 
+/*
+ * ⚠ THE NODE IS NOT ALWAYS accel0. An accel device is numbered in the order
+ * the class hands minors out, so unbinding rocket and binding it again gives
+ * accel1, then accel2: after two unbind and rebind rounds on a ROCK 4D the
+ * NPU was at accel2 and everything here opened accel0, found nothing, and
+ * reported no hardware -- which reads exactly like a driver that failed to
+ * probe. So with no path given, the accel nodes are tried in order and the
+ * first that opens wins. CHARSIU_ACCEL names one outright.
+ */
+static int open_any_accel(void)
+{
+	const char *e = getenv("CHARSIU_ACCEL");
+	char path[64];
+	int fd;
+
+	if (e && *e)
+		return open(e, O_RDWR | O_CLOEXEC);
+	for (unsigned i = 0; i < 16; i++) {
+		snprintf(path, sizeof(path), "/dev/accel/accel%u", i);
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd >= 0)
+			return fd;
+	}
+	return -1;
+}
+
 struct charsiu_device *charsiu_open(const char *path)
 {
 	charsiu_note_install();
 	struct charsiu_device *dev;
 	int fd;
 
-	fd = open(path ? path : "/dev/accel/accel0", O_RDWR | O_CLOEXEC);
+	fd = path ? open(path, O_RDWR | O_CLOEXEC) : open_any_accel();
 	if (fd < 0)
 		return NULL;
 
