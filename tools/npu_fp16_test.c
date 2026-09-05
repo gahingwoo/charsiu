@@ -70,7 +70,16 @@
  * of a fixed cost, not of a matmul. The pack alone walks k*n elements through
  * charsiu_w16_offset one at a time.
  */
-static struct { double pack, cf, emit, run, rd; } t_split;
+static struct { double pack, cf, emit, run, rd, rd_prev; } t_split;
+/*
+ * ⚠ fence+read IS THREE THINGS AND THE 0.4 ms HAS TO BE ATTRIBUTED TO ONE.
+ * The vendor issues 24 int4 dispatches a layer where we issue 7 and is still
+ * 2.2 to 3.0x ahead on TTFT, so the gap is per-dispatch cost, not count. This
+ * tree records a 130 us per-call floor; a raw fp16 job measures 0.4 ms. These
+ * split the difference between waiting for the hardware, syncing the output
+ * buffer for the CPU, and copying it out.
+ */
+static struct { double fence, copy, fini; } t_read;
 
 static double now_ms(void)
 {
@@ -280,7 +289,9 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	}
 	t_split.run += now_ms() - tp;
 	tp = now_ms();
-	charsiu_bo_prep(dev, &ob, 1000000000);   /* this is the fence wait */
+	charsiu_bo_prep(dev, &ob, 1000000000);   /* fence wait + dma_sync */
+	t_read.fence += now_ms() - tp;
+	tp = now_ms();
 	/*
 	 * ⚠ FLAT, AND MEASURED. --outmap put B[c] = 2^c through the hardware
 	 * and read 2^0..2^7 at slots 0..7 and again at 64..71 -- m by n, row
@@ -290,8 +301,13 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	 * fault; reverted rather than left in as a second variable.
 	 */
 	memcpy(out, ob.map, (size_t)m * n * 4);
+	t_read.copy += now_ms() - tp;
+	tp = now_ms();
 	charsiu_bo_fini(dev, &ob);
-	t_split.rd += now_ms() - tp;
+	t_read.fini += now_ms() - tp;
+	t_split.rd += t_read.fence + t_read.copy + t_read.fini
+		    - (t_split.rd_prev);
+	t_split.rd_prev = t_read.fence + t_read.copy + t_read.fini;
 	rc = 0;
 out:
 	return rc;
@@ -648,6 +664,10 @@ int main(int argc, char **argv)
 			       t_split.pack / reps, t_split.cf / reps,
 			       t_split.emit / reps, t_split.run / reps,
 			       t_split.rd / reps);
+			printf("      of the read: fence+sync %.3f  copy %.3f"
+			       "  fini %.3f  ms each\n",
+			       t_read.fence / reps, t_read.copy / reps,
+			       t_read.fini / reps);
 		}
 		rc = 0;
 		goto done;
