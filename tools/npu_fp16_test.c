@@ -396,18 +396,24 @@ int main(int argc, char **argv)
 				B[(size_t)c * k + i] = c < C
 					? (float)(1u << c) : 0.0f;
 		if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, p2)) goto done;
-		printf("raw accumulator slots, first %u rows x %u channels\n", R, C);
-		printf("  slot   value(row)  value(chan)   -> (r, c)\n");
-		for (unsigned i = 0; i < m * n; i++) {
-			float a = asf(p1[i]), b = asf(p2[i]);
-			long ra = (a > 0 && a == (float)(long)a) ? (long)a : -1;
-			long cb = (b > 0 && b == (float)(long)b) ? (long)b : -1;
-
-			if (ra <= 0 || cb <= 0) continue;
-			if ((ra & (ra - 1)) || (cb & (cb - 1))) continue;
-			printf("  %-6u %-11ld %-13ld -> (%d, %d)\n", i, ra, cb,
-			       __builtin_ctzl(ra), __builtin_ctzl(cb));
-		}
+		/*
+		 * ⚠⚠ DUMP, DO NOT FILTER. The first version of this printed
+		 * only slots whose two values were positive powers of two, and
+		 * came back with NOTHING at m=2, 4 and 8 -- which says the
+		 * values are not what I assumed and says nothing about what
+		 * they are. --map made the same mistake earlier tonight: an
+		 * instrument that shows only what it expected cannot correct
+		 * you.
+		 */
+		printf("raw accumulator, %u rows x %u channels, both passes\n",
+		       m, n);
+		printf("  expect pass1 = 2^row (rows < %u), pass2 = 2^chan"
+		       " (chans < %u)\n", R, C);
+		printf("  slot   raw1      pass1        raw2      pass2\n");
+		for (unsigned i = 0; i < m * n && i < 160; i++)
+			printf("  %-6u %08x  %-12g %08x  %g\n", i,
+			       p1[i], (double)asf(p1[i]),
+			       p2[i], (double)asf(p2[i]));
 		free(p1); free(p2);
 		rc = 0;
 		goto done;
