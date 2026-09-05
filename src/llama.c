@@ -475,14 +475,12 @@ static void cpu_clock_report(const cpu_set_t *set)
 			first, gov[0] ? gov : "(unknown)", khz / 1000);
 }
 
-static void cpus_pin(void)
+/* "4-7", "0,2,4", "0-7" into a mask. Returns how many bits it set. */
+static int cpus_parse(const char *spec, cpu_set_t *setp)
 {
-	const char *spec = getenv("CHARSIU_CPUS");
 	cpu_set_t set;
 	const char *p;
 
-	if (!spec || !*spec)
-		return;
 	CPU_ZERO(&set);
 	for (p = spec; *p; ) {
 		char *end;
@@ -502,9 +500,43 @@ static void cpus_pin(void)
 		while (*p == ',' || *p == ' ')
 			p++;
 	}
+	*setp = set;
+	return CPU_COUNT(&set);
+}
+
+/*
+ * ⚠⚠ THE MAIN THREAD AND THE POOL WANT DIFFERENT CORES, AND THE BOARD SAID SO
+ * TWICE IN ONE MORNING.
+ *
+ * The note below this one pinned everything to the four A72s because in NPU
+ * mode "the pool is nearly idle and the CPU's whole 13 ms a token is one
+ * thread's work". That was true when it was written and is no longer: the
+ * elementwise stages, the attention, the packer and the read all went on the
+ * pool on 2026-09-06, and a prompt now spends most of its CPU time there.
+ *
+ * Opening the whole machine to it is 3.9% off a Llama prompt and 1.8% off a
+ * SmolLM2 one, with Qwen3 flat and the text identical on all three. But DECODE
+ * is still one thread's work, and with 0-7 Qwen3 decoded 1503, 2208, 1503 ms
+ * -- one run in three 47% slower, which is that thread landing on an A53. A
+ * scheduling lottery is worse than a small steady loss, because it cannot be
+ * planned around.
+ *
+ * So they are separated: CHARSIU_CPUS is the calling thread, which is what
+ * decode runs on, and CHARSIU_POOL_CPUS is the workers. Set the first to the
+ * fast cores and the second to all of them and both halves get what they
+ * measured best on. Neither has a default; a wrong guess baked in is a
+ * regression nobody could see, which is the reason the first one is opt in.
+ */
+static void cpus_pin(void)
+{
+	const char *spec = getenv("CHARSIU_CPUS");
+	cpu_set_t set;
+
+	if (!spec || !*spec)
+		return;
 	/* ⚠ the FAILURE still speaks. A pin that did not apply changes the
 	 * numbers and is not a running commentary. */
-	if (CPU_COUNT(&set) && sched_setaffinity(0, sizeof(set), &set))
+	if (cpus_parse(spec, &set) && sched_setaffinity(0, sizeof(set), &set))
 		fprintf(stderr, "charsiu: CHARSIU_CPUS=%s did not apply\n", spec);
 	else if (charsiu_diag())
 		fprintf(stderr, "charsiu: pinned to CPUs %s, %d of them\n",
@@ -536,6 +568,25 @@ static void pool_start(int nthreads)
 	g_pool.th = calloc((size_t)nthreads, sizeof(*g_pool.th));
 	for (long i = 0; i < nthreads; i++)
 		pthread_create(&g_pool.th[i], NULL, worker, (void *)i);
+	{
+		const char *pspec = getenv("CHARSIU_POOL_CPUS");
+		cpu_set_t pset;
+		int n = 0, bad = 0;
+
+		if (pspec && *pspec && (n = cpus_parse(pspec, &pset)) > 0) {
+			for (long i = 0; i < nthreads; i++)
+				bad |= pthread_setaffinity_np(g_pool.th[i],
+							      sizeof(pset),
+							      &pset) != 0;
+			if (bad)
+				fprintf(stderr, "charsiu: CHARSIU_POOL_CPUS=%s"
+					" did not apply\n", pspec);
+			else if (charsiu_diag())
+				fprintf(stderr, "charsiu: the pool's %d threads"
+					" on CPUs %s, %d of them\n", nthreads,
+					pspec, n);
+		}
+	}
 }
 
 /*
