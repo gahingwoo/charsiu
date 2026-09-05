@@ -170,6 +170,7 @@ int main(int argc, char **argv)
 	unsigned m = 1;
 	int domap = argc > 3 && !strcmp(argv[3], "--map");
 	int doslots = argc > 3 && !strcmp(argv[3], "--slots");
+	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -183,6 +184,46 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (dobits) {
+		/*
+		 * ⚠⚠ ONE RUN FOR THE WHOLE COVERAGE MAP.
+		 *
+		 * --slots needs a run per slot and each run draws a different
+		 * subset, so 128 runs give 128 unrelated samples rather than one
+		 * picture. Weights all 1.0 and A[k] = 2^k makes each channel's
+		 * output a BITMASK of exactly which k reached it, and every
+		 * channel is read from the same run. fp16 holds 2^k exactly to
+		 * k = 15 (32768 < 65504) and the fp32 sum of distinct powers of
+		 * two is exact, so the number that comes back is the answer and
+		 * not a rounding of it.
+		 */
+		unsigned kk = k > 16 ? 16 : k;
+
+		for (unsigned i = 0; i < k; i++)
+			A[i] = i < kk ? (float)(1u << i) : 0.0f;
+		for (unsigned i = 0; i < n * k; i++)
+			B[i] = 1.0f;
+		printf("weights all 1.0, A[k] = 2^k for k < %u; each channel's"
+		       " output names the k it summed\n", kk);
+		printf("  want every channel = 0x%x (%u terms)\n",
+		       (1u << kk) - 1u, kk);
+		for (int L = 0; L < CHARSIU_W16_NLAYOUT; L++) {
+			if (run(dev, m, k, n, A, B, (enum charsiu_w16_layout)L, got))
+				continue;
+			printf("  %-6s", lname[L]);
+			for (unsigned c = 0; c < n; c++) {
+				float v = asf(got[c]);
+				unsigned long b = (v >= 0 && v < 1e9 &&
+						   v == (float)(unsigned long)v)
+						  ? (unsigned long)v : 0;
+
+				printf("  ch%u=%s%lx", c, b ? "0x" : "?", b);
+			}
+			printf("\n");
+		}
+		rc = 0;
+		goto done;
+	}
 	if (doslots) {
 		/*
 		 * ⚠⚠ SWEEP THE BYTE OFFSET, NOT THE LOGICAL INDEX.
