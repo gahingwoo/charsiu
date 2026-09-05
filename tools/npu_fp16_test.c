@@ -309,7 +309,14 @@ int main(int argc, char **argv)
 {
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 8;
-	unsigned m = 1;
+	/*
+	 * ⚠ m WAS HARDCODED TO 1 AND THAT IS THE WHOLE QUESTION. The vendor
+	 * batches rows -- M up to 48 in its own attention dispatches -- so a
+	 * dispatch serves a chunk, not a row, and the per-row share of a
+	 * 419 us job is what decides whether attention can leave the CPU.
+	 * Measuring only at m = 1 prices the worst case and calls it the case.
+	 */
+	unsigned m = getenv("CHARSIU_TEST_M") ? (unsigned)atoi(getenv("CHARSIU_TEST_M")) : 1;
 	int domap = argc > 3 && !strcmp(argv[3], "--map");
 	int doslots = argc > 3 && !strcmp(argv[3], "--slots");
 	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
