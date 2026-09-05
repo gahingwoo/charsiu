@@ -422,7 +422,11 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	for (i = 0; i < nops; i++) {
 		const struct charsiu_fp16_op *o = &ops[i];
 
-		if (!o->X || !o->Y || (!o->W && !o->Wbuf)) {
+		/* ⚠ a NULL Y is not a missing argument, it is the borrow: the
+		 * answer stays in the device buffer and charsiu_fp16_out
+		 * points at it. Refusing it here made the whole feature
+		 * unreachable and the probe's own arm is what said so. */
+		if (!o->X || (!o->W && !o->Wbuf)) {
 			f->refused++;
 			return -1;
 		}
