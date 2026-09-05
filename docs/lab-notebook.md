@@ -1700,10 +1700,12 @@ a dispatch cost is not, so a long prompt should have been where this turns. It
 is not.
 
 ```
-   prompt   cache      CPU        NPU
-   513 tok  ctx 1024   4889 ms    6710 ms    1.36x slower
-  2074 tok  ctx 2560  35686 ms   52558 ms    1.47x slower
+   prompt   cache      CPU               NPU
+   513 tok  ctx 1024   4889, 4919 ms     6710, 6736 ms    1.36x slower
+  2074 tok  ctx 2560  35686, 35925 ms   52558, 53029 ms   1.47x slower
 ```
+
+Both depths repeated, and the spread is under 1% in every arm.
 
 **The gap WIDENS with depth.** Which is obvious once the number exists and was
 not before it: the per matmul cost is not fixed either. The scores matmul's n
