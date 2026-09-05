@@ -3997,6 +3997,19 @@ struct read_fused {
 	const struct npu_entry *e;
 	const struct npu_slot *s0;      /* the first slice: n0, sn, the shape */
 	const float *fo[8];
+	/*
+	 * ⚠⚠ ONE SCALE VECTOR PER SLICE, AND THE BOARD IS WHY THIS IS HERE.
+	 *
+	 * The first cut used the first slice's s->sc for all of them and its
+	 * commit message said "bit exact by construction". It was not: the
+	 * derivation was about the ORDER OF THE ADDITIONS and never checked
+	 * the OPERANDS. A slot's scale is built as
+	 *     s->sc[j] = t->scale[(n0 + j) * ng + k0 / kgroup]
+	 * so it depends on the slice's own k0, and every K slice has a
+	 * different one. Llama came back "000alivherherher" and Qwen3 counted
+	 * 251, 254, 256 where it should have counted 257, 258, 259.
+	 */
+	const float *sc[8];
 	unsigned ki[8], ns;
 	float *Y;
 	unsigned m, sn;
@@ -4020,12 +4033,13 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 
 			if (g->w4 && c->grp) {
 				const float *fp = c->fo[0] + mp[j];
-				const float *cp = c->s0->sc + j * 4;
+				const float *cp = c->sc[0] + j * 4;
 
 				v0 = fp[0] * cp[0]; v1 = fp[1] * cp[1];
 				v2 = fp[2] * cp[2]; v3 = fp[3] * cp[3];
 				for (t = 1; t < c->ns; t++) {
 					fp = c->fo[t] + mp[j];
+					cp = c->sc[t] + j * 4;
 					v0 += fp[0] * cp[0]; v1 += fp[1] * cp[1];
 					v2 += fp[2] * cp[2]; v3 += fp[3] * cp[3];
 				}
@@ -4071,7 +4085,7 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 
 				if (g->w4 && c->grp)
 					u = c->fo[t][mp[j / 4] + j % 4]
-					  * c->s0->sc[j];
+					  * c->sc[t][j];
 				else if (g->w4)
 					u = c->fo[t][mp[j / 4] + j % 4];
 				else
@@ -5072,6 +5086,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 							((uint8_t *)ob->bo[d].map
 							 + (size_t)ntc
 							 * g->bout_stride);
+						c.sc[cnt] = s->sc;
 						c.ki[cnt] = i / e->n_slices;
 						if (!cnt) c.s0 = s;
 						cnt++;
