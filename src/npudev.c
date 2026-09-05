@@ -1873,6 +1873,32 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	 * covers a different set of calls, and that is worth a line of its own
 	 * rather than a number nobody checks the sign of.
 	 */
+	/*
+	 * ⚠⚠ AND "GB/s OF WEIGHTS" ABOVE IS NOT A RATE THE SILICON ACHIEVES.
+	 *
+	 * busy_us is the window from the first submit to the last fini, and on
+	 * a batched call the READ BACK is most of it -- 1.0 to 2.2 ms a row of
+	 * CPU gather against about 1.2 of fence. Dividing the weight bytes by
+	 * that window gave 2.05 GB/s on a prompt and 9.73 on a decode heavy
+	 * run of the same binary, and the first of those sent somebody looking
+	 * for a hardware problem that is not there. It is the readback's share
+	 * changing, not the silicon's rate.
+	 *
+	 * So the rate against the time actually spent submitting and waiting
+	 * is printed underneath, from both entries' own counters. That one is
+	 * about the hardware.
+	 */
+	{
+		double hw = g->submit_us + g->fence_us + g->bsub_us
+			  + g->bfence_us;
+
+		if (hw > 0.0 && g->weight_mb > 0.0)
+			fprintf(stderr, "charsiu NPU: of that, %.0f ms was"
+				" submitting and waiting, and the weights move"
+				" at %.2f GB/s against THAT -- the rest of the"
+				" window is the read back\n", hw / 1e3,
+				g->weight_mb / hw * 1e3);
+	}
 	if (g->call_us + g->bwall_us - g->busy_us - g->pack_us
 	    - g->bpack_us < 0.0)
 		fprintf(stderr, "charsiu NPU: ⚠ that remainder is NEGATIVE, so"
