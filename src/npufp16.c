@@ -144,8 +144,41 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 	memcpy(f->wt.map, W, wsz);
 	charsiu_bo_fini(f->dev, &f->wt);
 
+	/*
+	 * ⚠⚠ ROW MAJOR, NOT charsiu_pack_input_f16's INTERLEAVE, AND THE BOARD
+	 * SAID SO SLOT BY SLOT.
+	 *
+	 * charsiu_pack_input_f16 writes [k/8][m][8]: row r's k values are
+	 * spread through the buffer at a stride of m*8. npu_fp16_test
+	 * --inslots put one 1.0 into each packed input slot in turn and read
+	 * which output row answered and with which k. At m=2, K=256:
+	 *
+	 *     slots   0..255   -> row 0, k = slot
+	 *     slots 256..511   -> row 1
+	 *
+	 * so this path wants row r's k CONTIGUOUS at r*k. Feeding it the
+	 * interleaved layout is why every output row came back holding
+	 * k in [r*K/m, (r+1)*K/m) -- it reads contiguous runs and gets a
+	 * mixture -- and why m=1 was exact: at m=1 the interleave is the
+	 * identity.
+	 *
+	 * Six register-level fixes were tried against that symptom and none
+	 * moved it, because the fault was never in the stream.
+	 */
 	charsiu_bo_prep(f->dev, &f->in, 1000000000);
-	charsiu_pack_input_f16(&job.mm, X, f->in.map, insz);
+	{
+		uint8_t *d = f->in.map;
+
+		memset(d, 0, insz);
+		for (size_t i = 0; i < (size_t)m * k; i++) {
+			uint16_t h = charsiu_float_to_half(X[i]);
+
+			if ((i + 1) * 2 > insz)
+				break;
+			d[i * 2] = (uint8_t)(h & 0xff);
+			d[i * 2 + 1] = (uint8_t)(h >> 8);
+		}
+	}
 	charsiu_bo_fini(f->dev, &f->in);
 
 	{

@@ -211,8 +211,21 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 		charsiu_pack_input(&job.mm, a8, in.map, insz,
 				   job.input_zero_point);
 		free(a8);
-	} else {
+	} else if (getenv("CHARSIU_IN_INTERLEAVE")) {
 		charsiu_pack_input_f16(&job.mm, A, in.map, insz);
+	} else {
+		/* row major: --inslots measured row r's k contiguous at r*k */
+		uint8_t *d = in.map;
+
+		memset(d, 0, insz);
+		for (size_t i = 0; i < (size_t)m * k; i++) {
+			uint16_t h = charsiu_float_to_half(A[i]);
+
+			if ((i + 1) * 2 > insz)
+				break;
+			d[i * 2] = (uint8_t)(h & 0xff);
+			d[i * 2 + 1] = (uint8_t)(h >> 8);
+		}
 	}
 	charsiu_bo_fini(dev, &in);
 	t_split.pack += now_ms() - tp;
