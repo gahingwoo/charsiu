@@ -1693,11 +1693,31 @@ grows with the cache depth and at 513 tokens the cache is shallow.
 `CHARSIU_FP16_JOBS=split`, which lets the scheduler use both cores, made it
 6394 against 6306. Not that either.
 
-### What that leaves
+### And the deep cache does not save it either
 
-The one shape where the arithmetic says this should win is a DEEP cache: the
-CPU'''s cost is linear in it and the dispatch cost is not. That is the next
-measurement and it is the one that decides whether the path stays.
+The one shape left was a deep cache: the CPU's attention is linear in depth and
+a dispatch cost is not, so a long prompt should have been where this turns. It
+is not.
+
+```
+   prompt   cache      CPU        NPU
+   513 tok  ctx 1024   4889 ms    6710 ms    1.36x slower
+  2074 tok  ctx 2560  35686 ms   52558 ms    1.47x slower
+```
+
+**The gap WIDENS with depth.** Which is obvious once the number exists and was
+not before it: the per matmul cost is not fixed either. The scores matmul's n
+is the number of positions and the values matmul's k is the context, so the
+hardware's work grows with the cache exactly as the CPU's does, and it starts
+from behind. There is no shape in this range where the fp16 attention path is
+the faster one.
+
+So for text on this model the path is finished, and it is worth being plain
+about that rather than leaving it looking like an unfinished lever. What
+remains true and useful: the group underneath is 8 to 19x over one matmul at a
+time, every op it runs is bit exact, the caches are written where the hardware
+reads them, and the whole thing is correct to fp16 in the model. It is the
+right unit; attention on this hardware is not the right customer for it.
 
 Off by default, and with the flag unset four models produce text identical to
 the build from before any of this existed.
