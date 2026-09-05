@@ -61,6 +61,7 @@
 #include <time.h>
 
 #include "charsiu.h"
+#include "charsiu_llm.h"
 
 /*
  * ⚠ WHERE THE 2 ms GOES, because without this the loop times the PROBE and
@@ -322,6 +323,7 @@ int main(int argc, char **argv)
 	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
 	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
+	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -335,6 +337,59 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (doapi) {
+		/*
+		 * ⚠ THE UNIT THE RUNTIME WILL ACTUALLY CALL, end to end.
+		 * Everything above drives job.c directly; this goes through
+		 * src/npufp16.c, packs the weight with charsiu_fp16_woffset --
+		 * the entry point that exists so a KV cache can be written in
+		 * place -- and compares against the same CPU reference. If the
+		 * probe is exact and this is not, the fault is in the unit and
+		 * not in the hardware.
+		 */
+		struct charsiu_fp16 *fp = charsiu_fp16_open();
+		size_t wb = charsiu_fp16_wbytes(k, n);
+		uint8_t *W = calloc(wb, 1);
+		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 1;
+		double worst = 0, t0;
+		unsigned long c, r;
+
+		if (!fp || !W) { printf("  could not open\n"); goto done; }
+		for (unsigned i = 0; i < m * k; i++)
+			A[i] = (float)((int)(i % 13) - 6) * 0.25f;
+		for (unsigned i = 0; i < n * k; i++)
+			B[i] = (float)((int)(i % 7) - 3) * 0.5f;
+		reference(m, k, n, A, B, ref);
+		for (unsigned nn = 0; nn < n; nn++)
+			for (unsigned kk2 = 0; kk2 < k; kk2++) {
+				size_t off = charsiu_fp16_woffset(k, n, nn, kk2);
+				uint16_t h = charsiu_float_to_half(B[(size_t)nn * k + kk2]);
+
+				if (off + 1 >= wb) continue;
+				W[off] = (uint8_t)(h & 0xff);
+				W[off + 1] = (uint8_t)(h >> 8);
+			}
+		t0 = now_ms();
+		for (unsigned i = 0; i < reps; i++)
+			if (charsiu_fp16_matmul(fp, A, m, k, n, W,
+						(float *)got)) {
+				printf("  the unit refused or wrote nothing\n");
+				break;
+			}
+		for (unsigned i = 0; i < m * n; i++) {
+			double d = fabs(((float *)got)[i] - ref[i]);
+
+			if (d > worst) worst = d;
+		}
+		charsiu_fp16_stats(fp, &c, &r);
+		printf("  charsiu_fp16_matmul: worst |result - reference| %.4g%s\n",
+		       worst, worst == 0.0 ? "   <== EXACT" : "");
+		printf("  %lu calls, %lu refused, %.3f ms a call\n",
+		       c, r, c ? (now_ms() - t0) / c : 0.0);
+		free(W); charsiu_fp16_close(fp);
+		rc = 0;
+		goto done;
+	}
 	if (doloop) {
 		/*
 		 * ⚠⚠ THE SAME JOB, N TIMES, COUNTING HOW MANY WRITE.
