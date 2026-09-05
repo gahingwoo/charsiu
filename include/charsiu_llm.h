@@ -350,6 +350,41 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 			unsigned k, unsigned n, const void *W, float *Y);
 void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
 			unsigned long *refused);
+
+/*
+ * SEVERAL MATMULS IN ONE SUBMIT, because a single one is 98% fence.
+ *
+ * A layer's attention is H independent scores matmuls, then a CPU softmax,
+ * then H independent values matmuls. One at a time that is 2H waits on the
+ * hardware; as two groups it is 2. The arithmetic is identical either way and
+ * npu_fp16_test --group requires the results to be identical too.
+ *
+ * X is m by k row major, W holds charsiu_fp16_wbytes(k, n) bytes in the
+ * charsiu_fp16_woffset layout, Y is m by n row major. Shapes may differ
+ * between ops. At most 32 ops, and it refuses the whole group if any op is
+ * shaped in a way the single call would refuse.
+ */
+struct charsiu_fp16_op {
+	const float *X;
+	const void *W;
+	float *Y;
+	unsigned m, k, n;
+};
+
+int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
+			      const struct charsiu_fp16_op *ops, unsigned nops);
+
+/* waits on the hardware so far: calls / submits is the grouping factor */
+unsigned long charsiu_fp16_submits(const struct charsiu_fp16 *f);
+
+/* milliseconds spent in each stage of the groups run so far. wcopy is the
+ * memcpy of the caller's weights into the device buffer, which is the whole
+ * of what writing a KV cache through charsiu_fp16_woffset would remove. */
+struct charsiu_fp16_times {
+	double wcopy, pack, coefs, emit, submit, fence, read;
+};
+void charsiu_fp16_get_times(const struct charsiu_fp16 *f,
+			    struct charsiu_fp16_times *t);
 unsigned charsiu_npu_kmax(const struct charsiu_npu *g);
 /* slot i of tensor id after a call: its device, K slice, and channels [n0, n1);
  * -1 past the last slot. The batch probe names the core behind a wrong row with it. */

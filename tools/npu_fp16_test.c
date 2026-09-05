@@ -367,6 +367,7 @@ int main(int argc, char **argv)
 	int dobits = argc > 3 && !strcmp(argv[3], "--bits");
 	int doholes = argc > 3 && !strcmp(argv[3], "--holes");
 	int doloop = argc > 3 && !strcmp(argv[3], "--loop");
+	int dogrp = argc > 3 && !strcmp(argv[3], "--group");
 	int doapi = argc > 3 && !strcmp(argv[3], "--api");
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
@@ -602,6 +603,182 @@ int main(int argc, char **argv)
 		printf("  %lu calls, %lu refused, %.3f ms a call\n",
 		       c, r, c ? (now_ms() - t0) / c : 0.0);
 		free(W); charsiu_fp16_close(fp);
+		rc = 0;
+		goto done;
+	}
+	if (dogrp) {
+		/*
+		 * ⚠⚠ THE GROUP AGAINST THE SAME OPS ONE AT A TIME, both bit
+		 * for bit and on the clock.
+		 *
+		 * The whole claim of charsiu_fp16_matmul_group is that N
+		 * matmuls in one submit compute exactly what N submits compute
+		 * and wait once instead of N times. Two arms, and the first
+		 * one has to pass before the second is worth reading.
+		 *
+		 * ⚠ THE CORRECTNESS ARM USES DIFFERENT SHAPES PER OP ON
+		 * PURPOSE. With every op the same size, an offset that is
+		 * wrong by a whole sub buffer still lands on a legal one, and
+		 * every op's answer would be some other op's answer -- which
+		 * is only visible because the contents differ too. Mixed
+		 * shapes also make the padding arithmetic answer for itself.
+		 * The timing arm then uses ONE shape, because that is what a
+		 * layer of attention actually looks like.
+		 */
+		unsigned G = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
+		unsigned reps = argc > 5 ? (unsigned)atoi(argv[5]) : 8;
+		struct charsiu_fp16 *fp = charsiu_fp16_open();
+		struct charsiu_fp16_op op[32];
+		float *Xs[32] = { 0 }, *Ya[32] = { 0 }, *Yb[32] = { 0 };
+		float *Yc[32] = { 0 }, *Bs[32] = { 0 };
+		uint8_t *Ws[32] = { 0 };
+		struct charsiu_fp16_times t0t, t1t;
+		double wa = 0, wb = 0, cross = 0, tl = 0, tg = 0;
+		unsigned long c0, r0, s0, c1, r1, s1;
+		int failed = 0;
+
+		if (G > 32) G = 32;
+		if (!fp) { printf("  could not open\n"); goto done; }
+		for (unsigned i = 0; i < G; i++) {
+			unsigned ni = n + 32 * i;
+			size_t wb2 = charsiu_fp16_wbytes(k, ni);
+
+			Xs[i] = calloc((size_t)m * k, sizeof(float));
+			Bs[i] = calloc((size_t)ni * k, sizeof(float));
+			Ws[i] = calloc(wb2, 1);
+			Ya[i] = calloc((size_t)m * ni, sizeof(float));
+			Yb[i] = calloc((size_t)m * ni, sizeof(float));
+			Yc[i] = calloc((size_t)m * ni, sizeof(float));
+			if (!Xs[i] || !Bs[i] || !Ws[i] || !Ya[i] || !Yb[i] ||
+			    !Yc[i]) { printf("  out of memory\n"); goto done; }
+			for (size_t e = 0; e < (size_t)m * k; e++)
+				Xs[i][e] = (float)((int)((e + 7 * i) % 13) - 6)
+					 * 0.25f;
+			for (size_t e = 0; e < (size_t)ni * k; e++)
+				Bs[i][e] = (float)((int)((e + 5 * i) % 7) - 3)
+					 * 0.5f;
+			for (unsigned c2 = 0; c2 < ni; c2++)
+				for (unsigned kk2 = 0; kk2 < k; kk2++) {
+					size_t off = charsiu_fp16_woffset(k, ni,
+									  c2, kk2);
+					uint16_t h = charsiu_float_to_half(
+						Bs[i][(size_t)c2 * k + kk2]);
+
+					if (off + 1 >= wb2) continue;
+					Ws[i][off] = (uint8_t)(h & 0xff);
+					Ws[i][off + 1] = (uint8_t)(h >> 8);
+				}
+			reference(m, k, ni, Xs[i], Bs[i], Yc[i]);
+			op[i].X = Xs[i]; op[i].W = Ws[i]; op[i].Y = Yb[i];
+			op[i].m = m; op[i].k = k; op[i].n = ni;
+		}
+		printf("%u ops, n from %u to %u, k=%u m=%u\n",
+		       G, n, n + 32 * (G - 1), k, m);
+		for (unsigned i = 0; i < G; i++)
+			if (charsiu_fp16_matmul(fp, Xs[i], m, k, n + 32 * i,
+						Ws[i], Ya[i])) {
+				printf("  op %u refused one at a time\n", i);
+				failed = 1;
+			}
+		if (charsiu_fp16_matmul_group(fp, op, G)) {
+			printf("  the group refused or an op wrote nothing\n");
+			failed = 1;
+		}
+		for (unsigned i = 0; i < G; i++) {
+			unsigned ni = n + 32 * i;
+
+			for (size_t e = 0; e < (size_t)m * ni; e++) {
+				double da = fabs(Ya[i][e] - Yc[i][e]);
+				double db = fabs(Yb[i][e] - Yc[i][e]);
+
+				if (da > wa) wa = da;
+				if (db > wb) wb = db;
+				if (Ya[i][e] != Yb[i][e]) cross += 1;
+			}
+		}
+		printf("  one at a time vs CPU: worst %.4g%s\n",
+		       wa, wa == 0.0 ? "   <== EXACT" : "");
+		printf("  the group    vs CPU: worst %.4g%s\n",
+		       wb, wb == 0.0 ? "   <== EXACT" : "");
+		printf("  cells where the two arms differ: %.0f%s\n",
+		       cross, cross == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+		if (failed || cross != 0) {
+			printf("  not timing an arm that is not correct\n");
+			charsiu_fp16_close(fp);
+			rc = 1;
+			goto done;
+		}
+		/*
+		 * One shape now, alternating arms, because that is a layer of
+		 * attention and because a governor that ramps mid run would
+		 * otherwise be read as the grouping.
+		 */
+		for (unsigned i = 0; i < G; i++) {
+			size_t wb2 = charsiu_fp16_wbytes(k, n);
+
+			op[i].n = n;
+			memset(Yb[i], 0, (size_t)m * n * sizeof(float));
+			/* ⚠ REPACK. Ws[i] holds the n + 32i layout from the
+			 * arm above, and a buffer packed for one n is not the
+			 * buffer for another. Timing it would still time a
+			 * matmul, but it would be a matmul of nothing anyone
+			 * can check, which is how a timing arm outlives the
+			 * correctness it was supposed to inherit. */
+			memset(Ws[i], 0, wb2);
+			for (unsigned c2 = 0; c2 < n; c2++)
+				for (unsigned kk2 = 0; kk2 < k; kk2++) {
+					size_t off = charsiu_fp16_woffset(k, n,
+									  c2, kk2);
+					uint16_t h = charsiu_float_to_half(
+						Bs[i][(size_t)c2 * k + kk2]);
+
+					if (off + 1 >= wb2) continue;
+					Ws[i][off] = (uint8_t)(h & 0xff);
+					Ws[i][off + 1] = (uint8_t)(h >> 8);
+				}
+		}
+		charsiu_fp16_stats(fp, &c0, &r0);
+		s0 = charsiu_fp16_submits(fp);
+		charsiu_fp16_get_times(fp, &t0t);
+		for (unsigned r2 = 0; r2 < reps; r2++) {
+			double a = now_ms();
+
+			for (unsigned i = 0; i < G; i++)
+				if (charsiu_fp16_matmul(fp, Xs[i], m, k, n,
+							Ws[i], Ya[i]))
+					failed = 1;
+			tl += now_ms() - a;
+			a = now_ms();
+			if (charsiu_fp16_matmul_group(fp, op, G))
+				failed = 1;
+			tg += now_ms() - a;
+		}
+		charsiu_fp16_stats(fp, &c1, &r1);
+		s1 = charsiu_fp16_submits(fp);
+		charsiu_fp16_get_times(fp, &t1t);
+		printf("  %u rounds of %u matmuls at k=%u n=%u m=%u%s\n",
+		       reps, G, k, n, m, failed ? "  (an arm refused)" : "");
+		printf("    one at a time  %.3f ms a matmul  (%.1f ms a round)\n",
+		       tl / (reps * G), tl / reps);
+		printf("    grouped        %.3f ms a matmul  (%.1f ms a round)"
+		       "   %.2fx\n", tg / (reps * G), tg / reps,
+		       tg > 0 ? tl / tg : 0.0);
+		printf("    %lu matmuls over %lu submits\n", c1 - c0, s1 - s0);
+		printf("    of a grouped round: wcopy %.3f  pack %.3f"
+		       "  coefs %.3f  emit %.3f  submit %.3f  fence %.3f"
+		       "  read %.3f ms\n",
+		       (t1t.wcopy - t0t.wcopy) / reps,
+		       (t1t.pack - t0t.pack) / reps,
+		       (t1t.coefs - t0t.coefs) / reps,
+		       (t1t.emit - t0t.emit) / reps,
+		       (t1t.submit - t0t.submit) / reps,
+		       (t1t.fence - t0t.fence) / reps,
+		       (t1t.read - t0t.read) / reps);
+		charsiu_fp16_close(fp);
+		for (unsigned i = 0; i < G; i++) {
+			free(Xs[i]); free(Bs[i]); free(Ws[i]);
+			free(Ya[i]); free(Yb[i]); free(Yc[i]);
+		}
 		rc = 0;
 		goto done;
 	}

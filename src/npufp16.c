@@ -28,20 +28,34 @@
  * four times the job. If a caller packs per dispatch there is nothing here
  * worth having; charsiu_fp16_woffset() exists so it does not have to.
  */
+/* clock_gettime: the Makefile builds at -std=c11, which hides it */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
+#include "fp16plan.h"
 
 struct charsiu_fp16 {
 	struct charsiu_device *dev;
 	struct charsiu_bo wt, in, ob, coef, reg;
-	size_t wsz, insz, obsz, coefsz;
-	unsigned long calls, refused;
+	size_t wsz, insz, obsz, coefsz, regsz;
+	unsigned long calls, refused, submits;
+	struct charsiu_fp16_times t;
 };
+
+static double now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
 
 /* the weight buffer a (k, n) fp16 matmul needs, in bytes */
 size_t charsiu_fp16_wbytes(unsigned k, unsigned n)
@@ -60,11 +74,19 @@ size_t charsiu_fp16_woffset(unsigned k, unsigned n, unsigned ni, unsigned ki)
 }
 
 static int want(struct charsiu_fp16 *f, size_t wsz, size_t insz, size_t obsz,
-		size_t coefsz)
+		size_t coefsz, size_t regsz)
 {
 	if (f->wsz >= wsz && f->insz >= insz && f->obsz >= obsz &&
-	    f->coefsz >= coefsz)
+	    f->coefsz >= coefsz && f->regsz >= regsz)
 		return 0;
+	/* grow, never shrink. A single call and a group share these buffers,
+	 * and alternating between them must not free and reallocate five
+	 * buffer objects every time. */
+	if (wsz < f->wsz) wsz = f->wsz;
+	if (insz < f->insz) insz = f->insz;
+	if (obsz < f->obsz) obsz = f->obsz;
+	if (coefsz < f->coefsz) coefsz = f->coefsz;
+	if (regsz < f->regsz) regsz = f->regsz;
 	charsiu_bo_free(f->dev, &f->reg);  charsiu_bo_free(f->dev, &f->coef);
 	charsiu_bo_free(f->dev, &f->ob);   charsiu_bo_free(f->dev, &f->in);
 	charsiu_bo_free(f->dev, &f->wt);
@@ -72,11 +94,12 @@ static int want(struct charsiu_fp16 *f, size_t wsz, size_t insz, size_t obsz,
 	memset(&f->ob, 0, sizeof(f->ob));   memset(&f->coef, 0, sizeof(f->coef));
 	memset(&f->reg, 0, sizeof(f->reg));
 	f->wsz = wsz; f->insz = insz; f->obsz = obsz; f->coefsz = coefsz;
+	f->regsz = regsz;
 	if (charsiu_bo_alloc(f->dev, wsz, &f->wt) ||
 	    charsiu_bo_alloc(f->dev, insz, &f->in) ||
 	    charsiu_bo_alloc(f->dev, obsz, &f->ob) ||
 	    charsiu_bo_alloc(f->dev, coefsz, &f->coef) ||
-	    charsiu_bo_alloc(f->dev, 4096, &f->reg))
+	    charsiu_bo_alloc(f->dev, regsz, &f->reg))
 		return -1;
 	return (f->wt.map && f->in.map && f->ob.map && f->coef.map &&
 		f->reg.map) ? 0 : -1;
@@ -137,7 +160,7 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 	wsz = charsiu_weight_bytes(&job.mm);
 	insz = (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096;
 	if (want(f, wsz + 4096, insz, (size_t)m * n * 4 + 4096,
-		 charsiu_coef_bytes(&job.mm) + 4096))
+		 charsiu_coef_bytes(&job.mm) + 4096, FP16_REG_STRIDE))
 		return -1;
 
 	charsiu_bo_prep(f->dev, &f->wt, 1000000000);
@@ -219,6 +242,7 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 		if (charsiu_submit(f->dev, &f->reg, (unsigned)nreg, ins, 2,
 				   outs, 1))
 			return -1;
+		f->submits++;
 	}
 	charsiu_bo_prep(f->dev, &f->ob, 1000000000);   /* the fence wait */
 	{
@@ -240,9 +264,252 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 	return 0;
 }
 
+
+/*
+ * ⚠⚠ SEVERAL MATMULS, ONE SUBMIT AND ONE FENCE, BECAUSE THE FENCE IS THE JOB.
+ *
+ * npu_fp16_test --loop split a single call three ways on 2026-09-05 and put
+ * 98% of it in the wait: fence+sync 0.345 to 0.454 ms against 6 to 107 us for
+ * the copy and the cache maintenance together. charsiu_npu_matvec_group has
+ * said the same since round 321 -- "the fence at 94% of the hardware path" --
+ * and answers it the same way. Tasks inside one job are chained by the program
+ * counter on one core, so N matmuls cost one submit and one wait rather than
+ * N of each.
+ *
+ * A layer's attention is exactly this shape. Every head's scores matmul reads
+ * a different K cache and writes its own output and none of them reads
+ * another's result, so the whole layer is one submit; softmax runs on the CPU;
+ * the values matmuls are a second. Per layer that is 2 fences where a loop
+ * over charsiu_fp16_matmul pays 2H.
+ *
+ * ⚠ THE GROUPING CHANGES NO ARITHMETIC, so the results must be IDENTICAL to
+ * the same ops run one at a time. npu_fp16_test --group checks that bit for
+ * bit, at MIXED SHAPES, before it reports a single millisecond: uniform shapes
+ * cannot catch an offset that is wrong by a whole sub buffer.
+ *
+ * ⚠ AND THE WEIGHT COPY IS STILL HERE. Every op's W is memcpy'd into the
+ * device buffer, which for a K=1024 N=64 cache is 128 kB an op. That is what
+ * charsiu_fp16_woffset exists to remove -- a caller that appends its KV cache
+ * straight into the buffer pays none of it -- and the times below name it
+ * separately so the next round can see what is left after it goes.
+ */
+int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
+			      const struct charsiu_fp16_op *ops, unsigned nops)
+{
+	struct charsiu_job job[FP16_GROUP_MAX];
+	struct charsiu_task task[FP16_GROUP_MAX];
+	struct charsiu_fp16_plan pl;
+	unsigned i, bad = 0;
+	struct charsiu_joblist jl;
+	uint32_t ins[3], outs[1];
+	int32_t *zero;
+	double t0;
+
+	if (!f)
+		return -1;
+	/* the shapes, and where each op sits in the four shared buffers.
+	 * tests/fp16_plan.c walks this on a desk; nothing below recomputes it */
+	if (charsiu_fp16_make_plan(ops, nops, &pl)) {
+		f->refused++;
+		return -1;
+	}
+	for (i = 0; i < nops; i++)
+		if (!ops[i].X || !ops[i].W || !ops[i].Y) {
+			f->refused++;
+			return -1;
+		}
+	if (want(f, pl.wtot + 4096, pl.itot + 4096, pl.otot + 4096,
+		 pl.ctot + 4096, (size_t)nops * FP16_REG_STRIDE + 4096))
+		return -1;
+
+	/* ONE prep and ONE fini a buffer for the whole group. Cache
+	 * maintenance per op would put back a per dispatch cost of exactly
+	 * the kind this function exists to remove. */
+	t0 = now_ms();
+	charsiu_bo_prep(f->dev, &f->wt, 1000000000);
+	for (i = 0; i < nops; i++)
+		memcpy((uint8_t *)f->wt.map + pl.woff[i], ops[i].W, pl.wsz[i]);
+	charsiu_bo_fini(f->dev, &f->wt);
+	f->t.wcopy += now_ms() - t0;
+
+	/* row major, [m][k], which is what --inslots measured slot by slot */
+	t0 = now_ms();
+	charsiu_bo_prep(f->dev, &f->in, 1000000000);
+	for (i = 0; i < nops; i++) {
+		uint8_t *d = (uint8_t *)f->in.map + pl.ioff[i];
+		size_t nel = (size_t)ops[i].m * ops[i].k;
+
+		memset(d, 0, charsiu_fp16_up4k(pl.isz[i]));
+		for (size_t e = 0; e < nel; e++) {
+			uint16_t h = charsiu_float_to_half(ops[i].X[e]);
+
+			if ((e + 1) * 2 > pl.isz[i])
+				break;
+			d[e * 2] = (uint8_t)(h & 0xff);
+			d[e * 2 + 1] = (uint8_t)(h >> 8);
+		}
+	}
+	charsiu_bo_fini(f->dev, &f->in);
+	f->t.pack += now_ms() - t0;
+
+	t0 = now_ms();
+	zero = calloc(pl.nmax, sizeof(*zero));
+	if (!zero)
+		return -1;
+	charsiu_bo_prep(f->dev, &f->coef, 1000000000);
+	for (i = 0; i < nops; i++) {
+		memset(&job[i], 0, sizeof(job[i]));
+		job[i].cbuf_window = (unsigned)charsiu_cbuf_window();
+		job[i].mm.m = ops[i].m;
+		job[i].mm.k = ops[i].k;
+		job[i].mm.n = ops[i].n;
+		job[i].mm.wdtype = CHARSIU_FP16;
+		job[i].mm.adtype = CHARSIU_FP16;
+		job[i].input_scale = 1.0f;
+		job[i].weight_scale = 1.0f;
+		job[i].output_scale = 1.0f;
+		job[i].acc_out = 1;
+		job[i].input_addr = (uint32_t)f->in.dma_address + pl.ioff[i];
+		job[i].output_addr = (uint32_t)f->ob.dma_address + pl.ooff[i];
+		job[i].weight_addr = (uint32_t)f->wt.dma_address + pl.woff[i];
+		job[i].coef_addr = (uint32_t)f->coef.dma_address + pl.coff[i];
+		charsiu_build_coefs(&job[i], zero, zero,
+				    (uint8_t *)f->coef.map + pl.coff[i]);
+	}
+	charsiu_bo_fini(f->dev, &f->coef);
+	free(zero);
+	f->t.coefs += now_ms() - t0;
+
+	t0 = now_ms();
+	charsiu_bo_prep(f->dev, &f->reg, 1000000000);
+	for (i = 0; i < nops; i++) {
+		size_t nreg = charsiu_emit_job(&job[i],
+			(uint64_t *)((uint8_t *)f->reg.map
+				     + (size_t)i * FP16_REG_STRIDE),
+			FP16_REG_STRIDE / 8);
+
+		if (!nreg) {
+			charsiu_bo_fini(f->dev, &f->reg);
+			return -1;
+		}
+		task[i].regcmd = (uint32_t)f->reg.dma_address
+			       + (uint32_t)(i * FP16_REG_STRIDE);
+		task[i].regcmd_count = (uint32_t)nreg;
+	}
+	charsiu_bo_fini(f->dev, &f->reg);
+	f->t.emit += now_ms() - t0;
+
+	/* the sentinel, per op: a job that never wrote and a job that computed
+	 * zero are the same four bytes otherwise */
+	charsiu_bo_prep(f->dev, &f->ob, 1000000000);
+	for (i = 0; i < nops; i++) {
+		uint32_t *o = (uint32_t *)((uint8_t *)f->ob.map + pl.ooff[i]);
+
+		for (unsigned e = 0; e < ops[i].m * ops[i].n; e++)
+			o[e] = 0xdeadbeefu;
+	}
+	charsiu_bo_fini(f->dev, &f->ob);
+
+	t0 = now_ms();
+	ins[0] = f->in.handle;
+	ins[1] = f->wt.handle;
+	ins[2] = f->coef.handle;
+	outs[0] = f->ob.handle;
+	/*
+	 * ⚠ THE PROBE HATCH, because "the group is wrong" has two causes and
+	 * they are not the same repair.
+	 *
+	 * The default is ONE job of N tasks: the program counter walks them on
+	 * a single core, which is what npudev has always done and what keeps
+	 * the two cores from being in flight together -- they corrupt single
+	 * words when they are, and the rail is why. CHARSIU_FP16_JOBS=split
+	 * sends N jobs of one task in the same submit instead, so the
+	 * scheduler may place them on both cores. If the split arm is correct
+	 * and the chained arm is not, the fault is task chaining and not this
+	 * function's addressing.
+	 */
+	if (getenv("CHARSIU_FP16_JOBS") &&
+	    !strcmp(getenv("CHARSIU_FP16_JOBS"), "split")) {
+		struct charsiu_joblist split[FP16_GROUP_MAX];
+
+		for (i = 0; i < nops; i++) {
+			split[i].tasks = &task[i];
+			split[i].task_count = 1;
+			split[i].in_handles = ins;
+			split[i].in_count = 3;
+			split[i].out_handles = outs;
+			split[i].out_count = 1;
+		}
+		if (charsiu_submit_jobs(f->dev, split, nops))
+			return -1;
+	} else {
+		jl.tasks = task;
+		jl.task_count = nops;
+		jl.in_handles = ins;
+		jl.in_count = 3;
+		jl.out_handles = outs;
+		jl.out_count = 1;
+		if (charsiu_submit_jobs(f->dev, &jl, 1))
+			return -1;
+	}
+	f->submits++;
+	f->t.submit += now_ms() - t0;
+
+	t0 = now_ms();
+	charsiu_bo_prep(f->dev, &f->ob, 1000000000);   /* the one fence wait */
+	f->t.fence += now_ms() - t0;
+
+	t0 = now_ms();
+	for (i = 0; i < nops; i++) {
+		const uint32_t *o = (const uint32_t *)
+			((const uint8_t *)f->ob.map + pl.ooff[i]);
+		unsigned untouched = 0, cells = ops[i].m * ops[i].n;
+
+		for (unsigned e = 0; e < cells; e++)
+			untouched += o[e] == 0xdeadbeefu;
+		if (untouched == cells) {
+			bad++;
+			continue;              /* this op wrote nothing */
+		}
+		memcpy(ops[i].Y, o, (size_t)cells * 4);
+	}
+	charsiu_bo_fini(f->dev, &f->ob);
+	f->t.read += now_ms() - t0;
+	if (bad) {
+		f->refused += bad;
+		return -1;
+	}
+	f->calls += nops;
+	return 0;
+}
+
 void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
 			unsigned long *refused)
 {
 	*calls = f ? f->calls : 0;
 	*refused = f ? f->refused : 0;
+}
+
+/*
+ * How many times the hardware was waited on. calls / submits is the whole
+ * point of the group: 1 for a loop over charsiu_fp16_matmul, the group size
+ * for charsiu_fp16_matmul_group, and it is the number the fence is paid per.
+ */
+unsigned long charsiu_fp16_submits(const struct charsiu_fp16 *f)
+{
+	return f ? f->submits : 0;
+}
+
+/* ⚠ the group fills these and the single call does not: the split for one
+ * call is npu_fp16_test --loop, which measures the same stages around
+ * job.c directly and does not need the unit to carry a clock. */
+void charsiu_fp16_get_times(const struct charsiu_fp16 *f,
+			    struct charsiu_fp16_times *t)
+{
+	if (!t)
+		return;
+	if (!f)
+		memset(t, 0, sizeof(*t));
+	else
+		*t = f->t;
 }
