@@ -1491,7 +1491,31 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * 0x100c is NOT in either group: it is the int4 weight format and
 	 * without it the run is not w4a16 at all.
 	 */
-	w4_dpu = w4a16 && !envq("CHARSIU_W4_NO_DPU");
+	/*
+	 * ⚠⚠ AND AN FP16 WEIGHT JOB WANTS THE SAME OUTPUT STAGE, because both
+	 * produce a 16 bit result and the int8 stage produces a byte. The board
+	 * said so first: an fp16 job with this false came back 0x80808080 in
+	 * every written word, which is the int8 zero point in all four bytes --
+	 * the DPU had been asked for an int8 output and gave one.
+	 *
+	 * It is not a guess. Every register the WIDE branches switch lands on
+	 * the value the vendor's own fp16 streams carry, all four of them:
+	 *
+	 *   0x4010  0xa0000002    (PROC_PRECISION 2, which is fp16)
+	 *   0x4044  2
+	 *   0x4050  0x00023333
+	 *   0x40ac / 0x40b0 / 0x40b4   0 / 1 / 0, which is no requant at all
+	 *
+	 * ⚠ AND THE FILTER THAT NEARLY HID IT. I diffed our fp16 stream against
+	 * the vendor's and dropped every register where the vendor's int4 value
+	 * equals its fp16 one, reasoning that those cannot be fp16 specific
+	 * since our int4 path differs there too and works. 0x4010 is exactly
+	 * such a register, and it was the one that mattered: our int4 path is
+	 * w4a16, which takes this branch, so it never differed. A filter over
+	 * what the VENDOR does cannot answer a question about what WE do.
+	 */
+	w4_dpu = (w4a16 || mm->wdtype == CHARSIU_FP16) &&
+		 !envq("CHARSIU_W4_NO_DPU");
 
 	/*
 	 * CHARSIU_WIDE8 forces parts of the w4a16 OUTPUT STAGE onto an int8
@@ -1596,9 +1620,8 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	     ((uint32_t)(charsiu_w4_paired(mm) ? 2 * mm->n - 1 : mm->n - 1) << 16) |
 	     (uint32_t)(envq("CHARSIU_DPU_4030")
 			? strtoul(envq("CHARSIU_DPU_4030"), NULL, 0)
-			/* fp16 is 0x310 in all 4940 vendor streams */
-			: (mm->wdtype == CHARSIU_FP16 || WIDE(1)
-			   ? 0x0310u : 0x0710u)));
+			/* fp16 reaches 0x310 through w4_dpu, like w4a16 */
+			: (WIDE(1) ? 0x0310u : 0x0710u)));
 	emit(&e, DPU, 0x4034, wide ? (((uint32_t)(rows - 1) << 16) | (ow - 1))
 				   : ((lines << 16) | 0));
 	/* Mesa's regular conv value. The vendor's DPU only streams carry 0x53
