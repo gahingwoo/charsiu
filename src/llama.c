@@ -4317,6 +4317,68 @@ static void silu_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+/*
+ * The rest of the elementwise stages, on the same pool and behind the same
+ * gate. Measured after silu went first: attn rmsnorm 0.10, the residual after
+ * the o projection 0.16 (it carries the ffn rmsnorm too), the residual after
+ * down 0.04 -- 0.30 ms a row of an 8.58 ms row, and every one of them a row
+ * loop over independent rows.
+ */
+struct norm_rows_job {
+	struct llama_state *s;
+	const struct llama_model *m;
+	const struct llama_layer *L;
+};
+
+static void norm1_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct norm_rows_job *j = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++)
+		rmsnorm(j->s->bxb + r * j->m->n_embd,
+			j->s->bx + r * j->m->n_embd, j->L->attn_norm,
+			j->m->n_embd, j->m->rms_eps);
+}
+
+static void res1_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct norm_rows_job *j = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++) {
+		float *xr = j->s->bx + r * j->m->n_embd;
+		float *o = j->s->bxo + r * j->m->n_embd;
+		uint32_t i;
+
+		if (j->L->attn_post_norm)
+			rmsnorm(o, o, j->L->attn_post_norm, j->m->n_embd,
+				j->m->rms_eps);
+		for (i = 0; i < j->m->n_embd; i++)
+			xr[i] += o[i];
+		rmsnorm(j->s->bxb + r * j->m->n_embd, xr, j->L->ffn_norm,
+			j->m->n_embd, j->m->rms_eps);
+	}
+}
+
+static void res2_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct norm_rows_job *j = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++) {
+		float *xr = j->s->bx + r * j->m->n_embd;
+		float *o = j->s->bxo + r * j->m->n_embd;
+		uint32_t i;
+
+		if (j->L->ffn_post_norm)
+			rmsnorm(o, o, j->L->ffn_post_norm, j->m->n_embd,
+				j->m->rms_eps);
+		for (i = 0; i < j->m->n_embd; i++)
+			xr[i] += o[i];
+	}
+}
+
 static int row_pool(void)
 {
 	static int v = -1;
@@ -5027,10 +5089,15 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 * cache rows before it. So the loop below is the same as it
 		 * was with the projections lifted out of it.
 		 */
-		for (int r = 0; r < n; r++)
-			rmsnorm(s->bxb + (size_t)r * m->n_embd,
-				s->bx + (size_t)r * m->n_embd, L->attn_norm,
-				m->n_embd, m->rms_eps);
+		{
+			struct norm_rows_job nj = { s, m, L };
+
+			if (row_pool() && n > 1)
+				charsiu_parallel_for(norm1_rows, &nj,
+						     (uint64_t)n);
+			else
+				norm1_rows(&nj, 0, (uint64_t)n);
+		}
 		BSTAGE(ST_NORM1);
 		/*
 		 * ⚠⚠ TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
@@ -5299,19 +5366,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		matmul_rows(s, L->wo, s->bao, n, s->bxo, m->n_head * hd,
 			    m->n_embd);
 		BSTAGE(ST_WO);
-		for (int r = 0; r < n; r++) {
-			float *xr = s->bx + (size_t)r * m->n_embd;
-			float *o = s->bxo + (size_t)r * m->n_embd;
+		/* ⚠ the post norm is on the branch, BEFORE the residual add:
+		 * after it would normalise the residual stream too */
+		{
+			struct norm_rows_job nj = { s, m, L };
 
-			/* ⚠ on the branch, before the residual add: after it
-			 * would normalise the residual stream too. */
-			if (L->attn_post_norm)
-				rmsnorm(o, o, L->attn_post_norm, m->n_embd,
-					m->rms_eps);
-			for (uint32_t i = 0; i < m->n_embd; i++)
-				xr[i] += o[i];
-			rmsnorm(s->bxb + (size_t)r * m->n_embd, xr, L->ffn_norm,
-				m->n_embd, m->rms_eps);
+			if (row_pool() && n > 1)
+				charsiu_parallel_for(res1_rows, &nj,
+						     (uint64_t)n);
+			else
+				res1_rows(&nj, 0, (uint64_t)n);
 		}
 		BSTAGE(ST_RES1);   /* the residual add and the ffn rmsnorm */
 
@@ -5341,15 +5405,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		BSTAGE(ST_SILU);
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
 		BSTAGE(ST_DOWN);
-		for (int r = 0; r < n; r++) {
-			float *xr = s->bx + (size_t)r * m->n_embd;
-			float *o = s->bxo + (size_t)r * m->n_embd;
+		{
+			struct norm_rows_job nj = { s, m, L };
 
-			if (L->ffn_post_norm)
-				rmsnorm(o, o, L->ffn_post_norm, m->n_embd,
-					m->rms_eps);
-			for (uint32_t i = 0; i < m->n_embd; i++)
-				xr[i] += o[i];
+			if (row_pool() && n > 1)
+				charsiu_parallel_for(res2_rows, &nj,
+						     (uint64_t)n);
+			else
+				res2_rows(&nj, 0, (uint64_t)n);
 		}
 		BSTAGE(ST_RES2);
 
