@@ -492,6 +492,10 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 /* inside the pack: the gather out of X, and the packer call itself */
 void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
 				    double *packcall, int reset);
+/* two independent tensors sharing an input, both submitted before either is
+ * read; -1 if it refuses, and the caller then makes two ordinary calls */
+int charsiu_npu_matmul_pair(struct charsiu_npu *g, int ia, int ib,
+			    const float *X, unsigned m, float *Ya, float *Yb);
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_scale(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);

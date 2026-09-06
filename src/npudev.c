@@ -401,6 +401,21 @@ struct charsiu_npu {
 	 * flushed whole. One binary, two arms, one session.
 	 */
 	int bin_one;               /* CHARSIU_NPU_BIN_ONEBO=1 */
+	/*
+	 * ⚠⚠ WHICH HALF OF THE REGISTER BUFFER THIS CALL MAY WRITE.
+	 *
+	 * The hardware reads a task's register stream WHILE THE JOB RUNS, so
+	 * a second tensor submitted before the first is read cannot emit over
+	 * the top of it. breg is allocated for twice the slots and a paired
+	 * call puts the second side at bnslots; everything else leaves this 0
+	 * and uses the buffer exactly as before.
+	 *
+	 * This is the one piece of per call state a pair could not simply
+	 * reset between sides, because the collision is with the DEVICE and
+	 * not with the CPU.
+	 */
+	unsigned breg_slot0;
+	unsigned long bpairs;      /* calls that went through the pair path */
 	struct charsiu_bo breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
@@ -3627,7 +3642,9 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	 * reads past the end of the data it was given, and each slice is now
 	 * its own object with its own end. */
 	ins = g->bin_one ? g->bin_stride * nks + 4096 : g->bin_stride + 4096;
-	regs = (size_t)nslots * 4096;
+	/* ⚠ TWICE: a paired call has two tensors' streams live at once, and
+	 * the second must not land on the first while its job still runs. */
+	regs = (size_t)nslots * 2 * 4096;
 
 	/*
 	 * ⚠⚠ TEAR DOWN EVERY DEVICE BEFORE BUILDING ANY, because bin_nks is
@@ -5082,8 +5099,16 @@ static int npu_collect_side(struct charsiu_npu *g, struct npu_entry *e,
 	return 0;
 }
 
-static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
-			    unsigned m, float *Y)
+/*
+ * ⚠ `defer` STOPS AFTER THE SUBMIT and hands back the three things the collect
+ * half needs. It is the whole of the pair path's intrusion into this function:
+ * one branch at the end, nothing else moved, and defer = 0 is the call every
+ * existing caller makes.
+ */
+static int npu_matmul_inner2(struct charsiu_npu *g, int id, const float *X,
+			     unsigned m, float *Y, int defer,
+			     struct npu_entry **eo, struct npu_outbuf **obo,
+			     double *t0o)
 {
 	struct npu_entry *e;
 	struct npu_outbuf *ob;
@@ -5700,7 +5725,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			job.output_addr = (uint32_t)ob->bo[d].dma_address
 					+ (uint32_t)(nt * g->bout_stride);
 			nreg = charsiu_emit_job(&job,
-					(uint64_t *)((uint8_t *)g->breg[d].map + (size_t)nt * 4096),
+					(uint64_t *)((uint8_t *)g->breg[d].map
+						     + (size_t)(g->breg_slot0 + nt) * 4096),
 					4096 / 8);
 			if (!nreg) {
 				whine(g, "the batched register stream came back empty",
@@ -5713,7 +5739,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				return -1;
 			}
 			g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
-					    + (uint32_t)(nt * 4096);
+					    + (uint32_t)((g->breg_slot0 + nt)
+							 * 4096);
 			g->tasks[nt].regcmd_count = (unsigned)nreg;
 			g->handles[nh++] = s->wt.handle;
 			g->handles[nh++] = s->coef.handle;
@@ -5798,7 +5825,110 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 	}
 
+	if (defer) {
+		*eo = e;
+		*obo = ob;
+		*t0o = t0;
+		return 0;
+	}
 	return npu_collect_side(g, e, ob, Y, m, t0);
+}
+
+static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
+			    unsigned m, float *Y)
+{
+	return npu_matmul_inner2(g, id, X, m, Y, 0, NULL, NULL, NULL);
+}
+
+/*
+ * TWO INDEPENDENT TENSORS, BOTH SUBMITTED BEFORE EITHER IS READ.
+ *
+ * A layer's only independence is `{q, k, v}` and `{gate, up}`: they share an
+ * input, so the second's pack is already free through matmul_same, and neither
+ * needs the other's answer. Everything else is a chain -- o needs attention,
+ * gate needs o -- so there is nothing else to pair.
+ *
+ * What it buys is the READ, which translates one for one into time to first
+ * token: CHARSIU_NPU_POOL_READ=0 moved llama's read 164.6 -> 328.7 ms and its
+ * prompt 603 -> 765. Reading gate while up is still on the hardware hides
+ * min(read of the first, fence of the second), which on the per layer shares is
+ * about 3.3 ms a layer of a 453 ms entry -- call it 8%, and it is the last
+ * lever left that does not touch the quantiser.
+ *
+ * ⚠⚠ IT REFUSES ANYTHING IT CANNOT PROVE SAFE, and the reasons are not
+ * cosmetic:
+ *
+ *   - the two must have the SAME geometry. g->bout_stride is set by whichever
+ *     prologue ran last, and the first side's collect runs after the second
+ *     side's prologue. Equal n, k and slice counts make that a non-question;
+ *     gate and up satisfy it by construction and a mismatched pair falls back;
+ *   - the pool must hand out two DIFFERENT output buffers. batch_outbuf skips
+ *     one that is still in flight, so it will, unless the allocation fails --
+ *     and then the second submit returns -1 and the first is still collected;
+ *   - the register streams go in different halves of breg (breg_slot0),
+ *     because the hardware reads a task's stream while the job runs.
+ *
+ * ⚠ g->bseen is cleared before each collect. It is per call first-write state,
+ * and the second submit's prologue has already overwritten it.
+ */
+static int reuse_enabled(void);
+
+int charsiu_npu_matmul_pair(struct charsiu_npu *g, int ia, int ib,
+			    const float *X, unsigned m, float *Ya, float *Yb)
+{
+	struct npu_entry *ea = NULL, *eb = NULL;
+	struct npu_outbuf *oba = NULL, *obb = NULL;
+	double t0a = 0.0, t0b = 0.0, tw = now_us();
+	const struct npu_tensor *ta, *tb;
+	int rc;
+
+	if (g->dead || ia < 0 || ib < 0 || ia == ib || g->ndev < 1 ||
+	    (unsigned)ia >= g->n_ent || (unsigned)ib >= g->n_ent || m < 2)
+		return -1;
+	ta = g->ent[ia].t;
+	tb = g->ent[ib].t;
+	if (ta->n != tb->n || ta->k != tb->k ||
+	    g->ent[ia].k_slices != g->ent[ib].k_slices ||
+	    g->ent[ia].n_slices != g->ent[ib].n_slices)
+		return -1;
+
+	g->reuse_ask = 0;
+	g->breg_slot0 = 0;
+	if (npu_matmul_inner2(g, ia, X, m, Ya, 1, &ea, &oba, &t0a)) {
+		g->bwall_us += now_us() - tw;
+		return -1;
+	}
+	/* ⚠ the second side declares the same input, so its pack is the reuse
+	 * the single path already takes -- pairing must not cost an extra one.
+	 *
+	 * ⚠⚠ reuse_enabled(), NOT 1. A hard 1 would reuse straight through
+	 * CHARSIU_NPU_REUSE=0, which is the switch that exists because input
+	 * reuse shipped wrong twice in one day and phase 2 caught it both
+	 * times. A knob a new path ignores is not a knob. */
+	g->reuse_ask = reuse_enabled();
+	g->breg_slot0 = g->bnslots;
+	rc = npu_matmul_inner2(g, ib, X, m, Yb, 1, &eb, &obb, &t0b);
+	g->breg_slot0 = 0;
+	if (rc || oba == obb) {
+		/* ⚠ THE FIRST IS STILL IN FLIGHT AND MUST BE COLLECTED, or its
+		 * output buffer stays marked busy for the life of the run and
+		 * every later call of that geometry allocates another one. */
+		memset(g->bseen, 0, ea->n_slices);
+		g->bseen_dev = 0;
+		npu_collect_side(g, ea, oba, Ya, m, t0a);
+		g->bwall_us += now_us() - tw;
+		return -1;
+	}
+	memset(g->bseen, 0, ea->n_slices);
+	g->bseen_dev = 0;
+	rc = npu_collect_side(g, ea, oba, Ya, m, t0a);
+	memset(g->bseen, 0, eb->n_slices);
+	g->bseen_dev = 0;
+	if (npu_collect_side(g, eb, obb, Yb, m, t0b))
+		rc = -1;
+	g->bpairs++;
+	g->bwall_us += now_us() - tw;
+	return rc;
 }
 
 int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
