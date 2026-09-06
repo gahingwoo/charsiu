@@ -3606,8 +3606,15 @@ void llama_stages_report(void)
 		if (bmm_calls && bmm_dev) {
 			double pk, sb, fn, rd;
 
+			/* ⚠ reset = 0. npudev prints its own report AFTER
+			 * this one and reads the same four counters; resetting
+			 * here left it dividing by what was left over, and its
+			 * "57 ms submitting and waiting" against a fence of
+			 * 189 was the first sign. Two reports sharing a counter
+			 * have to agree on who clears it, and the one that
+			 * prints first is not automatically the owner. */
 			charsiu_npu_batch_split(bmm_dev, &pk, &sb, &fn,
-						&rd, 1);
+						&rd, 0);
 			double ga, pc;
 
 			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
@@ -3617,7 +3624,7 @@ void llama_stages_report(void)
 			       rd / bstage_rows,
 			       (bmm_entry_ms - pk - sb - fn - rd)
 			       / bstage_rows);
-			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 1);
+			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 0);
 			printf("  %-16s gather %.2f  packer %.2f  the rest"
 			       " %.2f ms a row\n", "of the pack:",
 			       ga / bstage_rows, pc / bstage_rows,
@@ -5707,6 +5714,51 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	}
 
 	return 0;
+}
+
+/*
+ * ⚠⚠ THE WIDEST CHUNK THAT DOES NOT SEND THE WHOLE PROMPT TO THE CPU.
+ *
+ * npudev refuses a dispatch whose input surface (k_slice / 32) * m exceeds
+ * 5120 -- measured, and the vendor's own file never exceeds it either. A
+ * refused projection is not an error: every row of it falls back to the token
+ * loop, silently, and the prompt gets slower by a lot. SmolLM2-135M at a chunk
+ * of 160, board, 916 tokens:
+ *
+ *   chunk  80   4.67 ms a row   0 rows fell back
+ *   chunk 106   4.63            0
+ *   chunk 160   7.11        27480 fell back, `down` 0.31 -> 2.65 ms a row
+ *
+ * Its n_ff is 1536 and auto_kmax widens it to 2048, so its widest K SLICE is
+ * 1536 and the ceiling puts the chunk at 163840 / 1536 = 106. Qwen3-0.6B is
+ * not widened -- 1024 is a multiple of 1024 -- so its widest slice is 1024,
+ * its cap is 160, and it runs 160 with zero fallbacks and 7% faster than 80.
+ *
+ * So the cap is per model and it is 163840 / min(widest K, KMAX). This is a
+ * CLAMP and not a default: 80 stays what a caller gets, and CHARSIU_PREFILL_
+ * CHUNK is now safe to raise on any model because it cannot cross the cliff.
+ */
+int llama_prefill_chunk_cap(const struct llama_model *m)
+{
+	const char *e = getenv("CHARSIU_NPU_KMAX");
+	uint64_t kmax = e ? strtoull(e, NULL, 0) : 1024;
+	uint64_t widest = m->n_embd, cap;
+	uint32_t l;
+
+	if (m->n_ff > widest)
+		widest = m->n_ff;
+	if (m->layers)
+		for (l = 0; l < m->n_layer; l++)
+			if (m->layers[l].n_ff > widest)
+				widest = m->layers[l].n_ff;
+	if (kmax && widest > kmax)
+		widest = kmax;
+	if (!widest)
+		return 80;
+	cap = 163840u / widest;
+	/* ⚠ a floor of 2, because a chunk of one is the token loop wearing
+	 * the batched path's name, and the caller has its own minimum */
+	return cap < 2 ? 2 : (int)cap;
 }
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,

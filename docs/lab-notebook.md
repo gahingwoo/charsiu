@@ -1889,3 +1889,124 @@ The loop used the first slice's for all of them. Llama came back
 257, 258, 259. Neither faulted, because a wrong operand does not fault.
 
 A proof about one half of an expression is not a proof about the expression.
+
+## A day of instruments, and four numbers that were correct about the wrong thing
+
+The prompt got 17 to 21% faster on 2026-09-06 and the gap to the vendor went
+from 1.85-2.40x to 1.53-1.88x. Every one of the changes came out of splitting a
+number that had been reported whole, and every one of the day's mistakes came
+out of reading a number whose label did not describe it.
+
+### The measurements that worked
+
+The stage table learned to split the NPU matmul entry into pack, submit, fence
+and read, and then the pack into its gather and its packer call. That is what
+found the pooled read's threshold -- the largest single change of the day -- and
+it is also what showed that **Llama and Qwen3 do not share a bottleneck**:
+llama's read is 2.23 ms a row against qwen3's packer at 1.11. "The matmuls are
+60%" would have sent both at the same repair.
+
+### The four that were correct about the wrong thing
+
+**1. "-2438 ms of them is neither hardware nor packing."** Printed on every run
+for a whole morning. `busy_us` is incremented in three call paths and `call_us`
+in two, so a batched prompt put all its hardware time in the numerator and none
+in the denominator. Nobody read the minus sign -- including the person who then
+quoted the "2.36 GB/s of weights" beside it as a fact about the silicon and
+went looking for a hardware problem.
+
+**2. "GB/s of weights."** The window it divides by runs from the first submit to
+the last fini, and on a batched call the READ BACK is most of it. Same binary:
+2.05 GB/s on a prompt, 9.73 on a decode-heavy run. The number moves because the
+readback's share moves, not because the hardware does.
+
+**3. Two reports, four counters, one reset.** The stage report passed
+`reset = 1` and npudev's report, which prints after it, divided by the
+leftovers: "57 ms submitting and waiting" on a run whose fence alone was 189.
+The one that prints first is not the counter's owner.
+
+**4. "Bit exact by construction."** The fused read's derivation was about the
+ORDER OF THE ADDITIONS and never checked the OPERANDS. Every K slice carries
+its own scale, `t->scale[(n0+j)*ng + k0/kgroup]`, and the loop used the first
+slice's for all of them. Llama printed "000alivherherher"; Qwen3 counted 251,
+254, 256 for 257, 258, 259. **Neither faulted.** A proof about half an
+expression is not a proof about the expression.
+
+### And two about experiments rather than instruments
+
+**A data race that read as a property of the model.** rmsnorm keeps its gain row
+in a plain function static, which was safe until the norm stages went on the
+pool. Qwen3 stopped being reproducible and the first reading was "that model is
+nondeterministic anyway" -- true of the build with the bug and false of every
+build before it. What settled it was running one binary ten times and then the
+previous commit ten times: 8/2 against 10/0. **A difference between two arms
+cannot be told from a difference between two runs without running one arm
+twice.**
+
+**Two variables in one arm.** The chunk width experiment set
+`CHARSIU_NPU_KMAX=1024` and `CHARSIU_PREFILL_CHUNK=160` together and the result
+was read as a KMAX effect. Separated, KMAX alone changes nothing at all -- the
+chunk default is a hardcoded 80 and the surface ceiling can only lower it. The
+whole effect was the chunk. **Print the baseline before comparing anything to
+it.**
+
+## The chunk width: a suspicion three months old, and the cliff under it
+
+The default chunk is 80 and the note beside it already said where that came
+from: *"96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR stops and not
+where the hardware does. It was in the sweep for exactly that reason: a sweep
+that stops where they stop cannot tell a ceiling from a choice."* And then
+`board_chunk_sweep.sh` walked 32 31 30 29 24 16 4 2 -- every one of them BELOW
+the default. The suspicion was written down and the sweep never went up.
+
+Going up finds two things.
+
+**Qwen3-0.6B is 8% faster at 160**, at every prompt length measured, with zero
+rows falling back. **Llama-3.2-1B is 5% slower.** And at 224 both fall off a
+cliff -- Qwen3's 404 token prompt goes 3272 to 13507 ms -- because the batched
+path refuses and every token takes the token loop.
+
+### The derived default that shipped for twenty minutes
+
+The mechanism looked clean: npudev refuses a dispatch whose input surface
+`(k_slice / 32) * m` exceeds 5120, so the widest chunk that forces no extra
+slicing is `163840 / k`. Qwen3's n_embd is 1024 and gives 160; Llama's 2048
+gives 80. Both matched.
+
+SmolLM2-135M came back **77% slower**.
+
+The stage table said what, in one line: `2.89 ms a row on the CPU (27480 rows
+fell back)`, and `down` going 0.31 to 2.65 ms a row. Not a slowdown -- a
+REFUSAL. And the reason is that **`down` reads n_ff, not n_embd**: SmolLM2's
+n_ff is 1536, `auto_kmax` widens it to 2048 so the slice stays 1536, and
+`(1536/32) * 160 = 7680`. The formula was right and it was applied to the wrong
+K.
+
+The right one is `163840 / min(widest K, effective KMAX)`, and effective KMAX is
+itself per model because `auto_kmax` only widens where no tensor is grouped:
+
+```
+   Qwen3      1024 is a multiple of 1024, so KMAX stays 1024
+              widest slice 1024   cap 160   measured 160: 0 fallbacks, fastest
+   SmolLM2    576 and 1536 are not, so KMAX widens to 2048
+              widest slice 1536   cap 106   measured 106: 0 fallbacks, fastest
+   Llama      2048 is a multiple, KMAX 1024, widest slice 1024, cap 160
+              but 160 is 5% SLOWER -- legal is not the same as good
+```
+
+### What shipped is the clamp, not the default
+
+80 is still what a caller gets. `CHARSIU_PREFILL_CHUNK` is clamped to the cap,
+so the knob is now safe to raise on any model:
+
+```
+                 ask 160        ask 400        default 80
+   Qwen3      160  11216 ms   160  11094         12149     -8%
+   SmolLM2   ->106  4154     ->106  4217          4283     -3%   (was 6550)
+   Llama      160   4301      160   4282          4105     +5%
+```
+
+SmolLM2's 77% regression becomes a 3% gain, and asking for 400 lands safely
+everywhere. Llama still wants 80, which is why the cap is a ceiling and not a
+recommendation: **legal is not the same as good, and this file now has both
+numbers for all three.**

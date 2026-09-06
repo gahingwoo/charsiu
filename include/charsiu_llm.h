@@ -993,6 +993,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
  * if it will not take this model -- in which case the caller loops
  * llama_forward, which is correct for every architecture and merely slower.
  */
+/*
+ * The widest chunk this model can take before npudev's input surface ceiling
+ * refuses a projection and every row of it falls back to the token loop --
+ * 163840 / min(widest K, KMAX). A clamp, not a default.
+ */
+int llama_prefill_chunk_cap(const struct llama_model *m);
+
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);
 

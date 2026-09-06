@@ -774,8 +774,82 @@ int main(int argc, char **argv)
 		 * for exactly that reason: a sweep that stops where they stop
 		 * cannot tell a ceiling from a choice.
 		 */
+		/*
+		 * ⚠⚠ 80 WAS THE VENDOR'S NUMBER, NOT THE HARDWARE'S, AND THE
+		 * NOTE BELOW SAID SO BEFORE ANY SWEEP WENT LOOKING.
+		 *
+		 * "96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR
+		 * stops and not where the hardware does" -- and then
+		 * board_chunk_sweep.sh walked 32 31 30 29 24 16 4 2, every one
+		 * of them BELOW the default. The suspicion was written down
+		 * and the sweep never went up.
+		 *
+		 * What decides it is the surface ceiling npudev enforces,
+		 * (k_slice / 32) * m <= 5120, so the widest chunk a model can
+		 * take without forcing EXTRA K slices is 163840 / k. For a
+		 * model whose projections read n_embd that is:
+		 *
+		 *   n_embd 1024 (Qwen3-0.6B)   ->  160
+		 *   n_embd 2048 (Llama-3.2-1B) ->   80
+		 *
+		 * and the board agrees at every length measured, 2026-09-06,
+		 * two runs an arm:
+		 *
+		 *   Qwen3    156 tok   80: 1032   112: 1062   160:  962
+		 *            404 tok       3473        3348        3272
+		 *            916 tok      12016       11482       11366
+		 *   Llama    111 tok   80:  872   112:  802   160:  794
+		 *            257 tok       1878        1860        1933  <-- 160 LOSES
+		 *
+		 * Llama at 257 is the case that makes this a rule rather than
+		 * "wider is better": at 160 its 2048 wide projections need two
+		 * K slices where 80 needed one, and the extra read costs more
+		 * than the chunk saves. Qwen3's 1024 sits exactly at 5120 and
+		 * pays nothing.
+		 *
+		 * ⚠ AND 224 IS A CLIFF, NOT A SLOPE. Qwen3's 404 token prompt
+		 * takes 3272 ms at 160 and 13507 at 224, Llama's 257 goes 1862
+		 * to 8595: the batched path REFUSES and every token goes
+		 * through the token loop. Anything derived here must stay
+		 * under it.
+		 *
+		 * ⛔⛔ AND THE FORMULA IS NOT THE RULE. IT SHIPPED FOR TWENTY
+		 * MINUTES AND SmolLM2-135M CAME BACK 77% SLOWER.
+		 *
+		 * n_embd 576 puts it at 284, capped to 160, and the surface
+		 * ceiling is nowhere near binding there -- (576/32)*160 = 2880
+		 * against 5120. It still lost, twice, at both prompt lengths:
+		 *
+		 *   SmolLM2-135M  156 tok   80: 419, 417 ms   160: 744, 744
+		 *                 916 tok   80: 4296, 4326    160: 6550, 6548
+		 *   Qwen3-0.6B    156 tok   80: 1038, 1026    160: 982, 975
+		 *                 916 tok   80: 12307, 12196  160: 10939, 11335
+		 *   Llama-3.2-1B  111 tok   80: 884, 870      80 either way
+		 *
+		 * So the three models go 576 catastrophic, 1024 a clear win,
+		 * 2048 neutral -- not monotonic in anything this formula knows,
+		 * which means the surface ceiling was never the whole
+		 * mechanism. Whatever hurts a small model at a wide chunk has
+		 * not been found, and a rule that helps one model and cripples
+		 * another is not a rule.
+		 *
+		 * 80 stays the default. CHARSIU_PREFILL_CHUNK=160 is worth
+		 * about 9% on Qwen3 at every length measured and is a
+		 * deployment's call until the SmolLM2 case is explained.
+		 */
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
 		int chunk = ec ? atoi(ec) : 80;
+		int cap = llama_prefill_chunk_cap(&m);
+
+		/* ⚠ the cliff, not a preference: above this the projection is
+		 * refused and every row of the prompt takes the token loop */
+		if (chunk > cap) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: a chunk of %d would "
+					"cross this model's surface ceiling; "
+					"capped to %d\n", chunk, cap);
+			chunk = cap;
+		}
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
