@@ -80,10 +80,24 @@ int main(int argc, char **argv)
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 1024;
 	unsigned m = argc > 2 ? (unsigned)atoi(argv[2]) : 80;
 	unsigned reps = argc > 3 ? (unsigned)atoi(argv[3]) : 20;
+	/*
+	 * ⚠⚠ COLD: a RING of weight buffers, so a repeat never re-reads the one
+	 * before it. The warm sweep loops a single buffer, which is what
+	 * bench_batch's header warns leaves a tensor in cache -- and the two
+	 * readings of that sweep's slope (a cache, or a per channel floor) are
+	 * told apart by exactly this. A floor survives a cold ring; a cache does
+	 * not.
+	 *
+	 * The ring is sized to overflow anything that could hold one buffer, and
+	 * every entry is packed before the timing starts, so the loop still
+	 * times only submit and fence.
+	 */
+	unsigned ring = argc > 4 ? (unsigned)atoi(argv[4]) : 1;
 	unsigned nmax = NS[NN - 1], i, r;
 	struct charsiu_device *dev;
 	struct charsiu_bo wt = { 0 }, in = { 0 }, ob = { 0 }, coef = { 0 },
 			  reg = { 0 };
+	struct charsiu_bo *wr = NULL, *rr = NULL;   /* the cold ring */
 	uint8_t *A = NULL, *B = NULL;
 	int32_t *zero = NULL;
 	double sub[NN], fen[NN];
@@ -93,7 +107,8 @@ int main(int argc, char **argv)
 	dev = charsiu_open(NULL);
 	if (!dev) { fprintf(stderr, "no accel device\n"); return 1; }
 	printf("one dispatch, k=%u m=%u, %u repeats a point, buffers allocated"
-	       " once at n=%u\n", k, m, reps, nmax);
+	       " once at n=%u%s\n", k, m, reps, nmax,
+	       ring > 1 ? ", COLD ring" : ", warm (one weight buffer)");
 
 	/* sized for the widest point, so nothing here moves during the sweep */
 	{
@@ -111,6 +126,29 @@ int main(int argc, char **argv)
 			fprintf(stderr, "a buffer would not allocate\n");
 			goto out;
 		}
+	}
+	if (ring > 1) {
+		wr = calloc(ring, sizeof(*wr));
+		rr = calloc(ring, sizeof(*rr));
+		if (!wr || !rr) { fprintf(stderr, "out of memory\n"); goto out; }
+		for (i = 0; i < ring; i++) {
+			struct charsiu_job big = { 0 };
+
+			big.mm.m = m; big.mm.k = k; big.mm.n = nmax;
+			big.mm.wdtype = CHARSIU_INT8;
+			big.mm.adtype = CHARSIU_INT8;
+			if (charsiu_bo_alloc(dev,
+					     charsiu_weight_bytes(&big.mm) + 4096,
+					     &wr[i]) ||
+			    charsiu_bo_alloc(dev, 4096, &rr[i])) {
+				fprintf(stderr, "the cold ring would not "
+					"allocate at %u of %u\n", i, ring);
+				goto out;
+			}
+		}
+		printf("cold ring: %u weight buffers of %zu KB, %zu MB in all\n",
+		       ring, (size_t)k * nmax / 1024,
+		       (size_t)ring * k * nmax / (1024 * 1024));
 	}
 	A = malloc((size_t)m * k);
 	B = malloc((size_t)k * nmax);
@@ -134,6 +172,17 @@ int main(int argc, char **argv)
 		job.input_scale = job.weight_scale = job.output_scale = 1.0f;
 		job.acc_out = 1;
 
+		if (ring > 1) {
+			/* every entry packed BEFORE the clock starts, so the
+			 * loop still times only the submit and the fence */
+			for (r = 0; r < ring; r++) {
+				charsiu_bo_prep(dev, &wr[r], 1000000000);
+				memset(wr[r].map, 0,
+				       charsiu_weight_bytes(&job.mm));
+				charsiu_pack_weights(&job.mm, B, wr[r].map);
+				charsiu_bo_fini(dev, &wr[r]);
+			}
+		}
 		charsiu_bo_prep(dev, &wt, 1000000000);
 		memset(wt.map, 0, charsiu_weight_bytes(&job.mm));
 		charsiu_pack_weights(&job.mm, B, wt.map);
@@ -153,14 +202,38 @@ int main(int argc, char **argv)
 		nreg = charsiu_emit_job(&job, reg.map, 4096 / 8);
 		charsiu_bo_fini(dev, &reg);
 		if (!nreg) { printf("  %6u  the stream came back empty\n", NS[i]); continue; }
+		/*
+		 * ⚠ A STREAM PER RING ENTRY, because the weight address is IN
+		 * the stream. One stream reused would submit the same buffer
+		 * every time however many were allocated, and the ring would be
+		 * decoration -- the failure would look exactly like "the cache
+		 * does not matter", which is one of the two answers this is
+		 * meant to tell apart.
+		 */
+		for (r = 0; ring > 1 && r < ring; r++) {
+			struct charsiu_job jr = job;
+			size_t nr;
+
+			jr.weight_addr = (uint32_t)wr[r].dma_address;
+			charsiu_bo_prep(dev, &rr[r], 1000000000);
+			nr = charsiu_emit_job(&jr, rr[r].map, 4096 / 8);
+			charsiu_bo_fini(dev, &rr[r]);
+			if (!nr) {
+				printf("  %6u  ring stream %u empty\n", NS[i], r);
+				break;
+			}
+		}
 
 		sub[i] = fen[i] = 0.0;
 		for (r = 0; r < reps; r++) {
-			uint32_t ins[2] = { in.handle, wt.handle };
+			unsigned q = ring > 1 ? r % ring : 0;
+			struct charsiu_bo *w = ring > 1 ? &wr[q] : &wt;
+			struct charsiu_bo *rg = ring > 1 ? &rr[q] : &reg;
+			uint32_t ins[2] = { in.handle, w->handle };
 			uint32_t outs[1] = { ob.handle };
 			double t0 = us(), t1;
 
-			if (charsiu_submit(dev, &reg, (unsigned)nreg, ins, 2,
+			if (charsiu_submit(dev, rg, (unsigned)nreg, ins, 2,
 					   outs, 1)) {
 				printf("  %6u  the submit failed\n", NS[i]);
 				break;
@@ -185,6 +258,9 @@ int main(int argc, char **argv)
 	rc = 0;
 out:
 	free(A); free(B); free(zero);
+	if (wr) for (i = 0; i < ring; i++) charsiu_bo_free(dev, &wr[i]);
+	if (rr) for (i = 0; i < ring; i++) charsiu_bo_free(dev, &rr[i]);
+	free(wr); free(rr);
 	charsiu_bo_free(dev, &reg); charsiu_bo_free(dev, &coef);
 	charsiu_bo_free(dev, &ob); charsiu_bo_free(dev, &in);
 	charsiu_bo_free(dev, &wt);

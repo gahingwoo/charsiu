@@ -2699,3 +2699,91 @@ the way `bench_batch` does, and it is not written.
 **Read the neighbouring file's comments before building the instrument.** Both
 halves of today's fence answer were already in this tree, and the tool built to
 find them reproduced the specific error the file next to it exists to warn about.
+
+## The fix was repeats
+
+Two changes to the fp16 mirror -- decode no longer fills it, and the unit no
+longer opens a second file descriptor on an accel device the process already
+has -- went in unpriced, because two rounds of `board_vendor.sh` disagreed with
+each other and with themselves. The conclusion drawn at the time was that the
+harness could not carry the comparison and a decode-only one had to be built.
+
+That was one step too far. **`board_vendor.sh` already reports the best of its
+runs**, and the bimodality is not symmetric: the low mode is contamination and
+the high mode is the clean reading. Best-of-TWO simply misses the high mode
+often enough to produce nonsense. Best-of-six does not.
+
+```
+   CHARSIU_BENCH_REPEAT=6, arms alternating, every arm repeated
+
+                  Qwen3 decode      TinyLLAMA decode
+     base a/b      24.76 / 24.73     20.68 / 20.63
+     mirror a/b    24.79 / 24.77     20.68 / 20.66
+```
+
+**Identical, inside 0.2%, on both models, with both arms repeated.** Before the
+two changes the same configuration cost 12 to 14% of decode. Together they take
+it to nothing, and the fp16 attention mirror is now free to hold while it is not
+being used.
+
+What is left is TTFT -- 685/673 to 939/940 on Qwen3, 912/910 to 1108/1110 on
+TinyLLAMA -- and that is the mirror being BUILT for a 110 token prompt, which is
+far too short to pay it back. That is the envelope this file already measured,
+not a defect.
+
+The lesson is smaller than the one I reached for. A harness that already reports
+a best does not need replacing when its distribution is bimodal; it needs enough
+samples to find the mode that means something. **Count the samples before
+building the instrument.**
+
+## Cold weights, and a two term model killed by its own prediction
+
+The warm sweep's slope did not scale with k, and that had two readings: the
+weights were being served warm because the sweep loops one buffer, or there was
+a per output channel floor. `npu_fence_scan` grew a cold ring -- eight weight
+buffers, each with its OWN emitted register stream, because the weight address
+lives inside the stream and one stream reused would have submitted the same
+buffer however many were allocated.
+
+```
+       k      slope warm    slope cold     cold/warm at n = 8192
+     512        0.139         0.127               1.00
+    1024        0.158         0.154               1.02
+    2048        0.213         0.212               0.99
+```
+
+**The weights were never being cached.** 32 to 128 MB of ring behaves exactly
+like one reused buffer at the wide points that set the slope, so the warm number
+was the right number and the worry was mine, not the tool's.
+
+That leaves a real floor, and three cold slopes at m = 80 fit
+`b = 0.0987 + 5.51e-5 * k` us an output channel to within a thousandth. The two
+terms read beautifully: `m * 4` bytes of accumulator at 3.2 GB/s, and `k` bytes
+of weight at 18.1 GB/s. The write and the read.
+
+Three points and two free parameters is not a result. So: the model predicts
+that the k term is INDEPENDENT of m, and that is not something the fit can
+arrange.
+
+```
+   slope, cold ring          m=8      m=16     m=32     m=80
+     k = 512                0.0466   0.0461   0.0716   0.1300
+     k = 2048               0.1702   0.1719   0.1836   0.2073
+
+   the k term, which must not move:
+                            12.4     12.2     13.7     19.9  GB/s
+```
+
+**It moves, by 60%.** The two terms are not separable, and the model is wrong as
+stated -- the fifth rule today to be tested where it could fail and to fail
+there.
+
+What survives is better than what died:
+
+- **m = 8 and m = 16 cost the same per output channel**, within 1% at both k.
+  The row count is nearly free below about 16, which is round 165's "M is nearly
+  free" arrived at from the other end.
+- **A wider m makes the weight fetch itself more efficient**, 12.4 GB/s at m = 8
+  to 19.9 at m = 80. Batching does not only amortise a fetch over more rows, it
+  makes the fetch go faster, and that is a quantified argument for the whole
+  batched prefill rather than an assumed one.
