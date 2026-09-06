@@ -3424,7 +3424,7 @@ void llama_state_free(struct llama_state *s)
 	 * for the server.
 	 */
 	free(s->bx); free(s->bxb); free(s->bxo);
-	free(s->bhb); free(s->bhb2); free(s->bcs);
+	free(s->bhb); free(s->bhb2); free(s->bcs); free(s->bcstab); free(s->bcstab_have);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
 	free(s->bfreq);
 	free(s->bpl); free(s->bplg);
@@ -5035,6 +5035,18 @@ static void res2_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+static int rope_tab_cache(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROPE_TAB");
+
+		v = !(e && *e == '0');
+	}
+	return v;
+}
+
 static int row_pool(void)
 {
 	static int v = -1;
@@ -5552,13 +5564,34 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		return -1;
 	if (s->bx_n < (unsigned)n) {
 		free(s->bx); free(s->bxb); free(s->bhb);
-		free(s->bhb2); free(s->bxo); free(s->bcs);
+		free(s->bhb2); free(s->bxo); free(s->bcs); free(s->bcstab); free(s->bcstab_have);
 		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bhb = malloc((size_t)n * nffmax * sizeof(float));
 		s->bhb2 = malloc((size_t)n * nffmax * sizeof(float));
 		s->bcs = malloc((size_t)hdmax * sizeof(float));
+		/*
+		 * ⚠⚠ THE ROPE TABLE ONLY DEPENDS ON THE POSITION, AND IT WAS
+		 * BEING REBUILT ONCE PER ROW PER LAYER.
+		 *
+		 * rope_table is head_dim/2 iterations of powf, cosf and sinf.
+		 * The loop below is `for layer { for row { ... } }`, and the
+		 * table's arguments are the position and the rope base -- so a
+		 * 110 token prompt on a 28 layer model built 3080 of them where
+		 * 110 would do, and every one of the other 2970 recomputed the
+		 * same transcendentals to the same bits.
+		 *
+		 * Two variants, not one: a window layer rotates at its own base
+		 * and its own head, so `swatab` picks a second table. Both are
+		 * cached, lazily, and `have` is cleared once a chunk.
+		 *
+		 * n * hdmax * 2 floats is 327 kB at the widest chunk this
+		 * runtime emits, against the 448 kB of activation it already
+		 * carries a row.
+		 */
+		s->bcstab = malloc((size_t)n * hdmax * 2 * sizeof(float));
+		s->bcstab_have = malloc((size_t)n * 2);
 		/*
 		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
 		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
@@ -5601,13 +5634,19 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		}
 
 		if (!s->bx || !s->bxb || !s->bxo || !s->bhb || !s->bhb2 ||
-		    !s->bcs || !s->bq || !s->bk || !s->bv || !s->bao ||
+		    !s->bcs || !s->bcstab || !s->bcstab_have ||
+		    !s->bq || !s->bk || !s->bv || !s->bao ||
 		    (m->n_embd_pl && (!s->bpl || !s->bplg))) {
 			s->bx_n = 0;
 			return -1;
 		}
 		s->bx_n = n;
 	}
+	/* ⚠ ONCE A CHUNK, not once an allocation: the buffers survive between
+	 * chunks and the positions do not. A stale `have` would hand layer 0 of
+	 * the next chunk the previous chunk's rotation, which is a wrong answer
+	 * that no allocation path would ever reach. */
+	memset(s->bcstab_have, 0, (size_t)n * 2);
 
 	/*
 	 * ⚠⚠ THE ROPE FREQUENCY FACTORS, WHICH THIS LOOP HAS NEVER READ. The
@@ -5864,10 +5903,27 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				     (m->rope_base_swa != m->rope_base ||
 				      m->head_dim_swa != m->head_dim);
 
-			rope_table(s->bcs,
-				   swatab ? m->head_dim_swa : hdmax, pos,
-				   swatab ? m->rope_base_swa : m->rope_base,
-				   swatab ? NULL : freqf);
+			/* ⚠ BUILT ONCE PER (POSITION, VARIANT) AND REUSED BY
+			 * EVERY LAYER. See the allocation. */
+			unsigned tv = swatab ? 1u : 0u;
+			float *cs = s->bcstab
+				  + ((size_t)tv * (size_t)n + (size_t)r)
+				    * hdmax;
+
+			/* ⚠ THE CONTROL, in the same binary: CHARSIU_ROPE_TAB=0
+			 * rebuilds the table every row of every layer, the way
+			 * it was, so the two arms can be interleaved in one
+			 * session and on the host. */
+			if (!rope_tab_cache() ||
+			    !s->bcstab_have[(size_t)tv * (size_t)n + r]) {
+				rope_table(cs,
+					   swatab ? m->head_dim_swa : hdmax,
+					   pos,
+					   swatab ? m->rope_base_swa
+						  : m->rope_base,
+					   swatab ? NULL : freqf);
+				s->bcstab_have[(size_t)tv * (size_t)n + r] = 1;
+			}
 			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
 			       (size_t)m->n_head * hd * sizeof(float));
 			/* ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, so
@@ -5927,9 +5983,9 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			if (m->v_norm && L->wk)
 				qk_norm(s->v, m->n_head_kv, hd, NULL,
 					m->rms_eps);
-			rope(s->q, m->n_head, hd, s->bcs, m->rope_neox);
+			rope(s->q, m->n_head, hd, cs, m->rope_neox);
 			if (L->wk)
-				rope(s->k, m->n_head_kv, hd, s->bcs,
+				rope(s->k, m->n_head_kv, hd, cs,
 				     m->rope_neox);
 			BSTAGE(ST_ROPE);
 			/* ⚠ the cache is strided by hdmax, written at hd, and

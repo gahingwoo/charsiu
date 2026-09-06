@@ -937,6 +937,10 @@ struct llama_state {
 	 * the three above.
 	 */
 	float *bx, *bxb, *bhb, *bhb2, *bxo, *bcs;
+	/* the rope table cached per (position, window variant) for the whole
+	 * chunk, because it does not depend on the layer; see its allocation */
+	float *bcstab;
+	unsigned char *bcstab_have;
 	/*
 	 * The batched q k v and the attention's output.
 	 * ⚠ bq AND bao ARE n_head * head_dim WIDE, NOT n_embd. Qwen3 0.6B is
