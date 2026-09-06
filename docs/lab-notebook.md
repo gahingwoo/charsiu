@@ -2959,7 +2959,20 @@ buffers** on the w4 path. Sharing them is safe by construction and saves no
 time; it is a memory fix and belongs with the fp16 mirror's 2 GB cap rather than
 with the prefill.
 
-**So the register stream is closed.** Ours matches theirs at their own batched
-shape, modulo an output stride that satisfies the same law and a coefficient DMA
-worth a third of a percent. The remaining gap is not in how a dispatch is
-programmed.
+### ⛔⛔ And the conclusion above is worthless
+
+"The register stream is closed" was drawn from **one** shape, and it is a shape
+**this runtime never emits**. KMAX is pinned at 1024, so every dispatch charsiu
+makes has k = 1024; the diff was our k = 2048 against their k = 2048.
+
+Counted, their shapes are ic 2048 or 4096 and oc 1024, 256, 4096, 1 or 64.
+Llama's tensors are k 2048 and 8192, n 2048, 512 and 8192. **Their oc is exactly
+half our n and their ic exactly half our k** -- int4 packs two weights to a
+byte, which is the obvious unit difference and has not been confirmed. Neither
+side emits a shape the other emits.
+
+So nothing was compared, and the same mistake is on the record three times now:
+the wall was chased as a CBUF property for months and was a field layout; the
+0x4050 rule was fitted where two expressions are indistinguishable. **A
+comparison between one shape of theirs and one shape we do not run cannot close
+anything.**
