@@ -4402,15 +4402,33 @@ struct attn_npu {
  *   hd  64  Llama-3.2-1B attention 2.16 -> 3.72, a LOSS
  *   hd  64  SmolLM2-135M attention 2.59 -> 3.13, a LOSS
  *
- * A wider head is a wider matmul and this hardware wants width; the crossover
- * is between 64 and 128 and `auto` puts it at 128.
+ * A wider head is a wider matmul and this hardware wants width.
  *
- * ⚠ IT IS STILL OFF BY DEFAULT BECAUSE IT IS NOT BIT EXACT. Every other thing
- * turned on in this tree today -- the pair read, the eight wide values, the one
- * chunk prompt -- was shipped on a hash that did not move. This one computes
- * attention in fp16 where the CPU computes it in fp32, so the text CAN differ,
- * and that is a call about the answer rather than about the clock. `auto` makes
- * the rule available without making it the default.
+ * ⚠⚠ AND THAT IS ONLY HALF A RULE, WHICH `auto` SHIPPED AS THOUGH IT WERE THE
+ * WHOLE ONE. Every number above is a 916 or 918 token prompt. On the vendor's
+ * protocol -- a 110 token prompt and 64 generated tokens -- the same gate turns
+ * the same models ON and LOSES:
+ *
+ *   Qwen3   TTFT 707 -> 954,  decode 24.63 -> 20.84
+ *   Gemma4  TTFT 2408 -> 2527, decode 8.70 -> 7.57
+ *   TinyLLAMA and Phi-3.5, which the gate leaves off, do not move at all
+ *
+ * Two costs the long prompt hid. The mirror has to be BUILT -- every position
+ * of every layer packed into the fp16 surfaces -- and on 110 positions that
+ * outweighs what the attention saves. And the DECODE path appends to the mirror
+ * too (see the call in llama_forward: a prompt continued after a generation
+ * would otherwise read a cache with a hole in it), so a generation pays to fill
+ * a mirror it never reads.
+ *
+ * So the envelope is a WIDE HEAD AND A LONG PROMPT, and where the second one
+ * starts is not known: 110 loses and 916 wins and nothing has been run in
+ * between. `auto` is withdrawn until it is, because a threshold placed between
+ * two points eight times apart is the chunk formula again.
+ *
+ * ⚠ AND IT IS OFF BY DEFAULT FOR A SEPARATE REASON: it is not bit exact.
+ * Everything else turned on in this tree today shipped on a hash that did not
+ * move. This computes attention in fp16 where the CPU computes it in fp32, so
+ * the text can differ, and that is a call about the answer, not the clock.
  */
 static int attn_npu_want_for(unsigned head_dim)
 {
@@ -4421,14 +4439,18 @@ static int attn_npu_want_for(unsigned head_dim)
 
 		if (!e || !*e)
 			v = 0;
-		else if (!strcmp(e, "auto"))
-			v = -1;                 /* decided per model, below */
-		else
+		else if (!strcmp(e, "auto")) {
+			fprintf(stderr, "charsiu: CHARSIU_ATTN_NPU=auto is "
+				"withdrawn -- head_dim >= 128 is only half the "
+				"rule and the other half (how long a prompt) "
+				"has not been measured; attention stays on the "
+				"CPU\n");
+			v = 0;
+		} else
 			v = atoi(e) != 0;
 	}
-	if (v >= 0)
-		return v;
-	return head_dim >= 128;
+	(void)head_dim;
+	return v;
 }
 
 
