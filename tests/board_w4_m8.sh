@@ -47,6 +47,17 @@
 # CHARSIU_NPU_W4_M8 is set -- a control that cannot reach the thing it is
 # controlling for is not a control, which this tree has already paid for once.
 #
+# 🏁 AND ON 2026-09-06 IT DID NOT FAIL, WHICH IS THE ANSWER. Re-run unchanged
+# with the NPU rail reading 800000 uV instead of the 750 mV U-Boot leaves, all
+# three arms came back 904 of 904 with ZERO MISS lines, against this script's
+# own 871 of 904 and 33 misses on 08-29. m = 8 was the voltage margin
+# overlap.h found on 09-04, seen at a different width -- not a second fault.
+#
+# So the sentence above now has a condition on it: the baseline must fail on a
+# board OUTSIDE the vendor's OPP envelope, and must not fail inside it. This
+# prints the rail first so a run can be read either way, and npudev.c gates the
+# refusal on charsiu_npu_overlap_ok() rather than on the width.
+#
 # ⚠ AND READ THE where-did-it-go LINE, not just the row count. The probe now
 # scans the row that missed and says whether its wanted values are SOMEWHERE in
 # the batch or absent from it. Absent means the block never wrote them and no
@@ -100,6 +111,16 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_W4_M8=1"
 echo "model    $MODEL"
 echo "binary   $RUN"
 echo "probe    --batch-probe $MMAX   (widths 2, 4, 8; 8 is the question)"
+# ⚠⚠ THE RAIL, BEFORE ANYTHING ELSE. This whole probe's 08-29 map was drawn at
+# 750 mV and read as a property of the width. A round that does not say which
+# voltage it ran at cannot be compared with either reading.
+for _r in /sys/class/regulator/regulator.*; do
+	_n=$(cat "$_r/name" 2>/dev/null) || continue
+	case $_n in
+	*npu*|*NPU*) echo "rail     $_n $(cat "$_r/microvolts" 2>/dev/null) uV" \
+			  "(the vendor asks 800000 at 800 MHz)" ;;
+	esac
+done
 echo
 
 for ARM in baseline onedev nmax4096; do

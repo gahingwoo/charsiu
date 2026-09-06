@@ -3193,3 +3193,39 @@ the n = 8192 tensors, 33 of 904, one core clean and two cores dirty -- was
 measured on 2026-08-29, six days before the voltage was found, so every arm of
 it ran at 750 mV. That is the same signature the voltage produced. m69 re-runs
 it at the rail the board now holds.
+
+### 🏁 m69/m70: m = 8 was the rail too, and the refusal now names the envelope
+
+`board_w4_m8.sh`, re-run unchanged, with `vdd_npu_s0` reading 800000 uV:
+
+```
+  arm         m=2          m=4          m=8          worst      MISS lines
+  baseline    226 of 226   452 of 452   904 of 904   5.10e-05   0
+  onedev      226 of 226   452 of 452   904 of 904   0.00e+00   0
+  nmax4096    226 of 226   452 of 452   904 of 904   5.10e-05   0
+```
+
+against the same script's **871 of 904 and 33 MISS lines** on 2026-08-29, when
+the rail was the 750 mV U-Boot leaves. The baseline is the arm the script says
+must fail, and it is exact.
+
+So the second fault was never a second fault. "Two cores stepping on ROW 0 of a
+wide output at m = 8 and m = 10" and "the width-24 text fault" are one thing:
+786 MHz outside the vendor's OPP envelope, which `src/overlap.h` found on 09-04
+with four DTBs. Both maps were drawn at 750 mV; both dissolve at 800.
+
+onedev being 0.00e+00 while the two-core arms sit at 5.10e-05 is not a
+residue of the fault -- it is one float summation order against two, which the
+probe's own bar (1e-3) is set for. And onedev is *slower*: 516 ms against 368
+at m = 8, which is the two cores doing their half each.
+
+**What shipped from it:** the m = 8 / m = 10 refusal in `npudev.c` is now gated
+on `charsiu_npu_overlap_ok()` -- the same reading of the same envelope that
+already decides whether the two cores may overlap -- instead of on the width.
+Inside the envelope the widths run; outside it they still refuse.
+
+⚠ Deliberately conservative, and here is the gap: nobody has measured m = 8 at
+750 mV with the cores *serialised*. onedev was clean there, but onedev halves
+the hardware and the draw, so it cannot separate "needs two cores" from "needs
+the current". Off-envelope this keeps refusing, which costs a fallback nobody
+will notice -- no prompt length measured yet makes the chunker emit 8 or 10.

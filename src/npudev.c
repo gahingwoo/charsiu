@@ -3478,8 +3478,44 @@ static const char *w4_batch_why_not(unsigned m)
 	 * a switch that exists -- but the chunker never emits 8 or 10 anyway,
 	 * so this refusal is the net under a width that should never arrive.
 	 */
-	if ((m == 8 || m == 10) && !getenv("CHARSIU_NPU_W4_M8"))
-		return "int4 at m=8 and m=10 misses row 0 of the n=8192 tensors";
+	/*
+	 * 🏁 2026-09-06: AND IT WAS THE RAIL, THE SAME RAIL AS WIDTH 24.
+	 *
+	 * The whole map above was measured on 2026-08-29, six days before
+	 * overlap.h found that 786 MHz at the 750 mV U-Boot leaves gives 11 to
+	 * 25 wrong words a pass and 800 mV gives none. Every arm of it ran at
+	 * 750 mV, and its signature -- a few wrong words in thousands of rows,
+	 * one core clean, two cores dirty -- is that fault's signature.
+	 *
+	 * board_w4_m8.sh, re-run unchanged with the rail reading 800000 uV:
+	 *
+	 *   arm         m=2          m=4          m=8            MISS lines
+	 *   baseline    226 of 226   452 of 452   904 of 904     0
+	 *   onedev      226 of 226   452 of 452   904 of 904     0
+	 *   nmax4096    226 of 226   452 of 452   904 of 904     0
+	 *
+	 * against the same script's 871 of 904 and 33 MISS at 750 mV. The
+	 * baseline is the arm that had to fail and it is exact, so m = 8 is not
+	 * a second fault: it is the voltage margin seen at a different width.
+	 *
+	 * ⚠ SO THE GATE IS THE ENVELOPE, NOT THE WIDTH. Refusing 8 and 10 on a
+	 * board inside the vendor's OPP envelope refuses a width the hardware
+	 * computes correctly; allowing them outside it returns the 33 misses.
+	 * charsiu_npu_overlap_ok() already reads exactly that envelope and
+	 * already decides whether the two cores may run together, which is the
+	 * condition the fault needs -- so the two questions get one answer.
+	 *
+	 * ⚠ What is NOT established, and why this stays conservative: nobody
+	 * has measured m = 8 at 750 mV with the cores SERIALISED. onedev was
+	 * clean there, but onedev is one core and half the draw, so it does not
+	 * separate "needs two cores" from "needs the current". Off-envelope
+	 * this refuses, which costs a fallback nobody will notice -- the
+	 * chunker does not emit 8 or 10 for any prompt length yet measured.
+	 */
+	if ((m == 8 || m == 10) && !getenv("CHARSIU_NPU_W4_M8") &&
+	    !charsiu_npu_overlap_ok(NULL, 0))
+		return "int4 at m=8 and m=10 misses row 0 of the n=8192 "
+		       "tensors when the NPU rail is below the vendor's OPP";
 	return NULL;
 }
 
