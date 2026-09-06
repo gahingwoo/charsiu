@@ -813,24 +813,32 @@ int main(int argc, char **argv)
 		 * through the token loop. Anything derived here must stay
 		 * under it.
 		 *
-		 * RAISE ONLY. Phi-3.5's n_embd is 3072, which the formula puts
-		 * at 53, and narrowing a model that has always run at 80 is a
-		 * change nothing has measured. This takes the wider of the two
-		 * and caps at 160.
+		 * ⛔⛔ AND THE FORMULA IS NOT THE RULE. IT SHIPPED FOR TWENTY
+		 * MINUTES AND SmolLM2-135M CAME BACK 77% SLOWER.
+		 *
+		 * n_embd 576 puts it at 284, capped to 160, and the surface
+		 * ceiling is nowhere near binding there -- (576/32)*160 = 2880
+		 * against 5120. It still lost, twice, at both prompt lengths:
+		 *
+		 *   SmolLM2-135M  156 tok   80: 419, 417 ms   160: 744, 744
+		 *                 916 tok   80: 4296, 4326    160: 6550, 6548
+		 *   Qwen3-0.6B    156 tok   80: 1038, 1026    160: 982, 975
+		 *                 916 tok   80: 12307, 12196  160: 10939, 11335
+		 *   Llama-3.2-1B  111 tok   80: 884, 870      80 either way
+		 *
+		 * So the three models go 576 catastrophic, 1024 a clear win,
+		 * 2048 neutral -- not monotonic in anything this formula knows,
+		 * which means the surface ceiling was never the whole
+		 * mechanism. Whatever hurts a small model at a wide chunk has
+		 * not been found, and a rule that helps one model and cripples
+		 * another is not a rule.
+		 *
+		 * 80 stays the default. CHARSIU_PREFILL_CHUNK=160 is worth
+		 * about 9% on Qwen3 at every length measured and is a
+		 * deployment's call until the SmolLM2 case is explained.
 		 */
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
-		int chunk;
-
-		if (ec) {
-			chunk = atoi(ec);
-		} else {
-			unsigned kd = m.n_embd ? m.n_embd : 2048;
-			int wide = (int)(163840u / kd);
-
-			chunk = wide > 80 ? wide : 80;
-			if (chunk > 160)
-				chunk = 160;
-		}
+		int chunk = ec ? atoi(ec) : 80;
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
