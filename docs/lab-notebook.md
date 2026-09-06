@@ -3585,3 +3585,68 @@ So for PREFILL, which is MAC-bound, int8 weights are the faster arm and int4 is
 the DRAM-bound choice that belongs to decode. The tree already has both paths
 and a heuristic between them; what it has not had until now is the per-dispatch
 model saying how much the trade is worth.
+
+### ⛔ And int8 weights lose the whole prompt by 25 to 30%
+
+The per-dispatch 1.9x does not survive contact with a run. Interleaved, six
+repeats, one session, each arm against its OWN token loop (the two quantise
+differently, so their text should differ and a cross-arm hash would read a
+correct run as a regression):
+
+```
+            prompt ms          decode 16 tok      staging     peak
+  llama w4  601..608  (604)    756..760   (758)   7.2 s      1544 MB
+  llama w8  740..769  (752)   1381..1390 (1385)   9.6 s      2130 MB
+  qwen3 w4  710..725  (718)    607..610   (608)   3.7 s      1129 MB
+  qwen3 w8  903..958  (936)    923..942   (930)   4.7 s      1420 MB
+```
+
+**+25% and +30% on the prompt, 1.5x to 1.8x on decode, +40% staging, +30%
+memory.** The int4 default is right and this measures why rather than assuming
+it: an int8-weight run also quantises the ACTIVATION per row on the CPU inside
+the pack loop -- a max pass and a quantise pass over every slice -- where w4a16
+packs fp16 straight through with NEON. The dispatch is faster and the entry
+around it is not.
+
+⚠ The w8 batched hash differs from the w8 token loop, and that is expected
+rather than a bug: npudev's own note says a multi-slice int8 tensor is
+quantised FINER in the batch than in the row loop, on purpose, and cannot match
+it to 0.1%. Worth writing down because a round that compared the two arms'
+hashes instead of each arm against its own reference would have called this a
+correctness failure.
+
+### Where that leaves the prefill gap
+
+Everything cheap is now measured and most of it is closed:
+
+```
+  w4a8 instead of w4a16          no change at all (within 1%)
+  int8 weights                   25-30% WORSE end to end
+  capping the output width       8% on gemma-3-1b, nothing on two others
+  KMAX 2048 by hand              a quantiser change on any model whose K
+                                   divides both widths; llama.c already
+                                   refuses it there
+  input reuse misses             diagnosed, fixed, worth nothing
+  one input BO per K slice       SHIPPED, 1.1-2.9%
+  the pack's FINI ioctls         halved by the above
+  hiding pack behind the NPU     no next tensor to pack: the chain is serial
+```
+
+What is left, with its price:
+
+1. **Submit a group before reading it** -- `{q,k,v}` and `{gate,up}` are the
+   only independence inside a layer. Worth about 8%: the hideable reads are
+   bounded by the group's own NPU time, which on qwen3 is 19 ms in the first
+   group and 18 in the second against a 444 ms entry. Blocked by k and v
+   sharing an output geometry and gate and up sharing another; a ping-pong pair
+   costs about 5 MB a device.
+2. **The read, which is 21-37% of the entry and has never been split** the way
+   the pack now is. Its volume is `m·n·S·4` read plus `m·n·4` written -- on
+   llama 304 MB in 164.6 ms, **1.85 GB/s**, against the 7.13 GB/s one thread of
+   this board managed on a plain read. Three to four times off memory speed,
+   and the index gather is the suspect that the pack's FINI was.
+3. **Fewer K slices** would cut the read AND the fence's intercepts
+   proportionally, and it is blocked by the quantiser group, not by the
+   hardware. That is a quantiser question -- go where the vendor is, one scale
+   a row, and pay for it with a calibrated quantiser instead of RTN -- and
+   npudev.c has the offline price already.
