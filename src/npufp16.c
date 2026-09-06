@@ -204,11 +204,20 @@ void charsiu_fp16_w_end(struct charsiu_fp16 *f, struct charsiu_fp16_w *w)
  * per FILE, so the second handle is a second client of the same hardware even
  * when it submits nothing.
  *
- * Decode paid for it: with the mirror on, 24.69/24.70 -> 21.70 tok/s on Qwen3,
- * 20.66/20.61 -> 17.83 on TinyLLAMA and 8.65/8.63 -> 7.60 on Gemma4, against a
- * base arm that repeats either side of it -- and this was AFTER the decode path
- * stopped writing the mirror, so it is not the packing. Decode never touches
- * this unit at all; the only thing it shares with it is the device.
+ * ⚠ THE BOARD HAS NOT CONFIRMED THAT THIS IS WHAT DECODE WAS PAYING FOR, and
+ * the claim is worth less than the change. One round did show decode falling
+ * 24.69/24.70 to 21.70 on Qwen3, 20.66/20.61 to 17.83 on TinyLLAMA and
+ * 8.65/8.63 to 7.60 on Gemma4 with the mirror on, after the decode path had
+ * already stopped writing it -- so the packing was not it, and the device was
+ * the only thing left that decode shares with this unit. But the round that
+ * tried to price the fix could not: its two base arms read 18.48..20.58 and
+ * 18.35..20.91 while its mirror arm read 24.74..24.75, which would make the
+ * mirror FASTER, and that is not credible. The decode column of
+ * board_vendor.sh is bimodal at two repeats.
+ *
+ * So this stands on its own terms -- a process should not open one accel device
+ * twice -- and not on a measurement. Settling it needs many more repeats, or a
+ * decode harness that does not run a prompt first.
  *
  * charsiu_fp16_open_on() borrows a device the caller already has and does not
  * close it. charsiu_fp16_open() keeps its old meaning for the standalone
