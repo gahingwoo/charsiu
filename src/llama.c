@@ -4391,14 +4391,47 @@ struct attn_npu {
 	int off;                            /* tried and refused */
 };
 
-static int attn_npu_want(void)
+/*
+ * ⚠⚠ OFF, auto, OR ON -- AND OFF IS THE DEFAULT FOR A REASON THAT IS NOT SPEED.
+ *
+ * fp16 attention on the NPU is now a large win on a wide head and a loss on a
+ * narrow one, and the board has four points, monotone in head_dim:
+ *
+ *   hd 256  gemma-3-1b   attention 6.29 -> 1.50, the whole prefill -37%
+ *   hd 128  Qwen3-0.6B   attention 8.13 -> 5.51, the whole prefill -14%
+ *   hd  64  Llama-3.2-1B attention 2.16 -> 3.72, a LOSS
+ *   hd  64  SmolLM2-135M attention 2.59 -> 3.13, a LOSS
+ *
+ * A wider head is a wider matmul and this hardware wants width; the crossover
+ * is between 64 and 128 and `auto` puts it at 128.
+ *
+ * ⚠ IT IS STILL OFF BY DEFAULT BECAUSE IT IS NOT BIT EXACT. Every other thing
+ * turned on in this tree today -- the pair read, the eight wide values, the one
+ * chunk prompt -- was shipped on a hash that did not move. This one computes
+ * attention in fp16 where the CPU computes it in fp32, so the text CAN differ,
+ * and that is a call about the answer rather than about the clock. `auto` makes
+ * the rule available without making it the default.
+ */
+static int attn_npu_want_for(unsigned head_dim)
 {
-	static int v = -1;
+	static int v = -2;
 
-	if (v < 0)
-		v = getenv("CHARSIU_ATTN_NPU") != NULL;
-	return v;
+	if (v == -2) {
+		const char *e = getenv("CHARSIU_ATTN_NPU");
+
+		if (!e || !*e)
+			v = 0;
+		else if (!strcmp(e, "auto"))
+			v = -1;                 /* decided per model, below */
+		else
+			v = atoi(e) != 0;
+	}
+	if (v >= 0)
+		return v;
+	return head_dim >= 128;
 }
+
+
 
 static void attn_npu_free(struct attn_npu *a)
 {
@@ -4439,7 +4472,12 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 
 	if (s->anpu)
 		return s->anpu->off ? NULL : s->anpu;
-	if (!attn_npu_want() || !m)
+	/* ⚠ the model FIRST, because `auto` is a decision about its head_dim
+	 * and there is nothing to decide without it */
+	if (!m)
+		return NULL;
+	if (!attn_npu_want_for(m->head_dim ? m->head_dim
+					   : m->n_embd / m->n_head))
 		return NULL;
 	a = calloc(1, sizeof(*a));
 	if (!a)
