@@ -3887,7 +3887,11 @@ static int attn_axpy8_on(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_AXPY8");
 
-		v = e ? atoi(e) != 0 : 0;
+		/* ⚠ ON. Llama's attention 2.34 -> 2.16 and Qwen3's 8.13 ->
+		 * 7.60, with both models' text md5 unchanged on the board and
+		 * tests/axpy8 finding no shape out of 520 that differs in a
+		 * bit. CHARSIU_ATTN_AXPY8=0 is the control. */
+		v = e ? atoi(e) != 0 : 1;
 	}
 	return v;
 }

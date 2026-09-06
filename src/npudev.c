@@ -1538,7 +1538,19 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * cost more. CHARSIU_NPU_READ4=1 is the probe; tools/bench_gather is
 	 * the host number that was wrong about this board.
 	 */
-	g->read4 = getenv("CHARSIU_NPU_READ4") ? atoi(getenv("CHARSIU_NPU_READ4")) : 0;
+	/*
+	 * ⚠ 2 IS THE DEFAULT NOW: the PAIR form, two rows off one line.
+	 *
+	 * read_rows4 takes four and lost 2.3x to its four write streams, and
+	 * the two-row form went in beside it and was never run -- its own
+	 * comment said the question had not been asked. It has now: read 2.23
+	 * -> 2.06 ms a row on Llama and 0.96 -> 0.92 on Qwen3 with the text md5
+	 * unchanged, TTFT about 2.5% on the two models whose baseline repeats,
+	 * and every architecture board_text_all.sh carries identical.
+	 *
+	 * 0 is the row-at-a-time control, 1 selects the four-row form.
+	 */
+	g->read4 = getenv("CHARSIU_NPU_READ4") ? atoi(getenv("CHARSIU_NPU_READ4")) : 2;
 	if (g->read4 == 1)
 		g->read4 = 4;
 	/*
