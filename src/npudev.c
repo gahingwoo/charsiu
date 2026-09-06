@@ -3411,6 +3411,17 @@ static const char *w4_batch_why_not(unsigned m)
 	 *                          that asks for twice that. If m=8 comes back
 	 *                          exact the fault is the width.
 	 *
+	 * 🏁 BOTH ARMS HAVE RUN, 2026-08-29, and they agree. onedev is 904 of
+	 * 904 at worst 0.00e+00. NMAX=4096 STILL MISSES -- blk.0.ffn_up onward,
+	 * the same k=2048 n=8192 row 0 -- so the width is not it and the pair
+	 * is. The nmax arm's result sat in ~/charsiu-board/w4-m8-nmax4096.txt
+	 * unread for a week while this comment described it as an open question.
+	 *
+	 * ⚠ The MISS line prints the TENSOR's n, 8192 either way, so it cannot
+	 * show the knob engaged. What does: the miss SET moved (blk.0.ffn_gate
+	 * and blk.5.ffn_up miss in the baseline and not under it) and the
+	 * present-value count went 8192 of 8192 to 8189 of 8192.
+	 *
 	 * Both need this refusal lifted to say anything, and that is what
 	 * CHARSIU_NPU_W4_M8=1 is for: its own name rather than a second meaning
 	 * for CHARSIU_NPU_W4_BATCH, so a round that sets the batch switch for
@@ -3734,6 +3745,24 @@ const char *charsiu_npu_overlap_note(void)
  * returns wrong text one prompt in fifty is not a default. The element
  * probe (board_overlap_slots.sh) is what turns this into a mechanism, and a
  * mechanism is what makes 28 (or any N) safe rather than unobserved.
+ *
+ * 🏁 AND THE ELEMENT PROBE HAS RUN. 2026-09-04 21:37, phi3, width 24, KMAX
+ * 2048, 225 tensors a pass:
+ *
+ *   serial 1      5400 of 5400   worst 1.61e-04   0 MISS   4.24x   fence 409 ms
+ *   parallel 1-4  5400 of 5400   worst 1.61e-04   0 MISS   5.7x    fence 164 ms
+ *
+ * Four overlapped passes, 21600 rows, not one wrong number -- at the width
+ * whose TEXT is wrong 3 to 15 times in 16. The overlap engaged: the fence is
+ * exactly what overlapping the cores cuts and it collapsed 409 to 164 ms while
+ * the pass got a third faster, which is a behavioural signature rather than a
+ * flag that was set.
+ *
+ * So "two cores stepping on row 0 of a wide output" is earned for m = 8 and
+ * m = 10, where this same probe catches 33 misses, and is NOT earned for 22
+ * and 24. --batch-probe never runs a norm, a rope table or a cache offset, so
+ * a fault outside the matmul is invisible to it by construction -- which is
+ * now the shape of what is left to find, and where the next round looks.
  * Speculative passes at m = 4 or 6 stay serial under any N above 6.
  */
 static unsigned parallel_min_m(void)
