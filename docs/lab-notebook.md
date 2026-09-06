@@ -3294,3 +3294,55 @@ disappointment: the default chunker emits one wide chunk at these prompt
 lengths and never asks for 8 or 10, so nothing shipped today is on this path.
 What the day bought is that three "open" faults are closed and two gates now
 name the real condition. The gap itself is still the NPU entry.
+
+## 2026-09-06 evening: where the prompt actually goes at the scoreboard's length
+
+`CHARSIU_STAGES=1 CHARSIU_FENCE_SPLIT=1`, prompts of 80 to 112 tokens -- the
+lengths `board_vendor.sh` itself uses -- so this is the profile of the number
+in the gap and not of the 916-token runs everything was tuned on.
+
+```
+  model   entry    prep   pack    sub    fence   read    other
+  qwen3   444 ms   2.9%   25.5%   1.7%   27.5%   28.4%   14.1%
+  tinyl   685 ms   2.0%   18.6%   1.2%   37.6%   35.1%    5.6%
+  llama   485 ms   2.6%   17.1%   1.2%   39.8%   34.3%    4.9%
+  gemma3  664 ms   1.9%   31.0%   1.6%   28.4%   20.6%   16.6%
+```
+
+**The hardware is busy for 28% to 40% of the matmul entry.** `read` and `pack`
+are 45% to 55% between them and both are CPU work with the NPU idle. And of
+the fence itself, the invalidate is 0.22 to 0.42 ms a row against a wait of
+0.89 to 2.14 -- so "fence" really is mostly the hardware, not cache
+maintenance.
+
+### 🔑 The widest output is the slowest, inside one run of one model
+
+The per-width fence buckets. Nothing changes between rows but n: same model,
+same pass, same clock, same prompt.
+
+```
+  llama    n=512   0.40 TMAC/s    tinyl   n=256   0.39    gemma3  n=256   0.16
+           n=2048  0.58                   n=2048  0.58            n=1024  0.34
+           n=8192  0.33                   n=5632  0.34            n=1152  1.09
+                                                                  n=6912  0.32
+```
+
+A narrow n being slow is the per-dispatch floor and is expected. **The widest
+being slow is not**, and it is not arithmetic intensity: a dispatch does 2m
+MACs per weight byte at every n, so equal intensity should give equal TMAC/s.
+Turning the buckets into bandwidth on llama: the n=2048 bucket moves 201 MB of
+weights in 56.0 ms of summed fence and the n=8192 bucket 269 MB in 130.6 ms --
+3.6 against 2.1 GB/s. **The wide bucket fetches weights at about half the rate
+of the middle one.**
+
+That is the biggest single line in the fence on three of four models: 130.6 of
+llama's 193 ms, 166.6 of tinyl's 257, 143.2 of gemma3's 188.
+
+And the vendor's own Llama-3.2-1B `.rkllm` never dispatches more than **4096**
+output channels -- ours is the only shape that asks for twice that. m75 caps
+it (`CHARSIU_NPU_NMAX`) and reads the bucket back.
+
+⚠ `CHARSIU_NPU_NMAX` has been run exactly once, as a correctness control for
+m = 8, where it changed nothing. **Its speed has never been measured.** It can
+also lose: splitting n doubles the dispatches for those tensors and re-reads
+the same activation twice.
