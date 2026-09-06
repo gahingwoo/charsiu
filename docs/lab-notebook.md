@@ -2402,3 +2402,47 @@ threshold placed between two points eight times apart is the chunk formula
 again**, which this file recorded going wrong this morning, so `auto` is
 withdrawn rather than guessed at. The knob stays and the note above it now says
 where it pays.
+
+## Where fp16 attention starts paying, and a rule that has to be tested where it hurts
+
+`auto` was withdrawn because 110 tokens lost and 916 won and nothing had been
+run in between. This is in between.
+
+```
+   prompt tok      39     135     279     532     916
+   Qwen3   CPU    335     915    2168    4896   11347   ms
+   hd 128  NPU    647    1441    2780    5496   10476
+           ratio 1.93    1.57    1.28    1.12    0.92   <- crosses in here
+
+   prompt tok      41     137     281     534     918
+   gemma-3 CPU    541    1112    2445    5648   11400   ms
+   hd 256  NPU    472    1170    2242    4090    7261
+           ratio 0.87    1.05    0.92    0.72    0.64
+```
+
+Qwen3 is monotone and crosses between 532 and 916. gemma-3 wins nearly
+everywhere and by 36% at the top; its 137 point is the one that goes the wrong
+way, and it is also where the absolute times are smallest.
+
+### One quantity separates eleven of twelve arms
+
+Across every fp16 attention arm measured -- four models, five lengths --
+`head_dim * prompt_tokens` puts every loss at or below 68096 and every win at or
+above 71936:
+
+```
+   qwen3   128 *  532 =  68096   loss      <- the largest loss
+   gemma3  256 *  281 =  71936   WIN       <- the smallest win
+   qwen3   128 *  916 = 117248   WIN
+   llama    64 *  512 =  32768   loss
+   smol     64 *  916 =  58624   loss
+```
+
+The exception is gemma-3 at 41 tokens, product 10496, which won -- and is the
+smallest and noisiest measurement on the list.
+
+**That is a fitted threshold, and this file has recorded two of those going wrong
+today.** So it does not ship on the fit. The two candidate rules disagree
+somewhere specific, and that is what to run: **head_dim alone says Llama, at 64,
+never wins at any length. The product says Llama wins past about 1100 tokens.**
+One of those is about to be false.
