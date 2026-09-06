@@ -3814,3 +3814,46 @@ scoreboard is consistent with them rather than evidence on its own.
 
 Qwen3's decode is now exactly the vendor's to three figures, and three of four
 models are at or above it.
+
+### NMAX on the two models the scoreboard loses on, and a prediction that failed
+
+Phi3 and Gemma4 -- 1.64x and 1.86x, the two the scoreboard actually loses on --
+had never been in the NMAX sweep. Both batch their prefill, checked first: the
+binary says "prompt batched, 112 tokens in chunks of 112", so the gap is not a
+fallback. And on gemma4 the **read is the bigger line than the fence**, 539.6 ms
+against 419.1 of a 1400 ms entry; phi3's is 874.5 of 2170.
+
+```
+  gemma4   default 1986 1968 1991    4096 1974 1978 1972    2048 1971 1983 1958
+           -- inside 1%, nothing
+  phi3     default 2730 2692 2748    4096 2666 2653 2661    2048 2797 2799 2788
+           -- 4096 is -2.3% on 3 of 3, and 2048 is +2.6%, so there is an optimum
+```
+
+Phi-3.5's attention is one fused `attn_qkv` of n = 9216 against nmax 8192, so
+its n slices are **8192 + 1024** -- an eight to one split handed to two cores
+that are then waited on together, and `q k v` is its largest stage at 8.09 ms a
+row. That gives a mechanism and a number: the best nmax should be **4608**,
+which halves 9216 exactly.
+
+```
+  8192  (8:1)     2706 2675 2670   mean 2684
+  4608  (1:1)     2670 2635 2662   mean 2656   -1.0%   <- the prediction
+  4096  (4:1)     2649 2632 2646   mean 2642   -1.6%
+  3072  (1:1:1)   2650 2686 2687   mean 2674   -0.4%
+```
+
+**Wrong.** A perfectly balanced two-slice split loses to an unbalanced
+three-slice one, and the other balanced point (3072) is the worst of the three.
+So the n-slice balance is not the cost, and NMAX remains what it has been all
+week: worth 8% on gemma-3-1b, 1.5 to 2.3% on phi3, nothing on llama, tinyllama
+or gemma4, **with no mechanism after five models and four rounds**.
+
+That is the shape of fitting, and it is where this stops. No default ships from
+it.
+
+⚠ One weakness worth recording about every hash in these two rounds: the prompt
+is "1 2 3 ... 40" and the models continue the count, so **gemma3 and gemma4 hash
+to the same twelve characters**. The check still does its job -- batched against
+that model's own token loop -- but it cannot see a quantisation change, which is
+exactly what llama.c's own note says about counting prompts.
