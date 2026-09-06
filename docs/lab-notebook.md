@@ -3496,3 +3496,48 @@ gate's read overlaps up's run. That is 5 of a layer's 7 tensors.
 geometry, gate and up share the 8192 one, so the second submit of a group
 would overwrite the first's accumulators. `ob->busy` guards it today. A
 ping-pong pair on the two shared geometries is about 5 MB a device.
+
+### 🏁 One input buffer object per K slice: 18 of 18 paired runs
+
+`rocket_ioctl_fini_bo` is `dma_sync_sgtable_for_device` over the whole object
+and the uapi has no range -- both `drm_rocket_prep_bo` and `drm_rocket_fini_bo`
+carry a bare handle and a `reserved` field. The batched path kept every K slice
+in one buffer sized for the widest tensor in the model, so a call packed ONE
+slice and flushed all of them. Llama's buffer is sized for `ffn_down`'s eight,
+and its other six tensors each flushed eight slices' worth.
+
+The pool report names it, and nobody had printed that line before today:
+
+```
+  model    pack     of which:  emit   FINI ioctls   the packing
+  qwen3    112.1 ms            2.6     28.3          81.2
+  llama     77.6               2.3     17.3          58.0
+  gemma3   193.9               4.4     71.4         118.1
+```
+
+Split per slice -- `done_ki` already tracks what was written, and the slot walk
+gives what will be read, which is what the handle list needs since a reusing
+call packs nothing and still reads:
+
+```
+  FINI ioctls   qwen3 28.3 -> 13.4    llama 17.3 -> 8.1    gemma3 71.4 -> 27.4
+```
+
+⚠ And the first read of that could not be trusted: the entry TOTAL moved the
+wrong way by a few percent, but the two arms were two sessions and the board
+was 3% slower in the second. So `CHARSIU_NPU_BIN_ONEBO=1` restores the old
+single buffer, and both arms come out of one binary, interleaved, six repeats:
+
+```
+  prompt ms      split (6 runs)             onebo (6 runs)          delta
+  gemma3   884 882 879 874 870 891     909 907 902 901 909 906     -26 ms  -2.9%
+  llama    601 603 600 605 602 604     604 609 611 613 609 609     -6.7    -1.1%
+  qwen3    727 721 715 722 720 721     730 725 734 729 738 731     -10.2   -1.4%
+```
+
+**18 of 18 paired runs favour the split and the two arms' ranges do not overlap
+on any model.** Every run in both arms hashes to its own token loop.
+
+Small, and worth having for a reason beyond the milliseconds: flushing bytes
+the call did not write is not a tuning choice. The remaining FINI is now
+roughly what the writes justify.
