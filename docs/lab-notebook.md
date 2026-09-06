@@ -1949,3 +1949,64 @@ was read as a KMAX effect. Separated, KMAX alone changes nothing at all -- the
 chunk default is a hardcoded 80 and the surface ceiling can only lower it. The
 whole effect was the chunk. **Print the baseline before comparing anything to
 it.**
+
+## The chunk width: a suspicion three months old, and the cliff under it
+
+The default chunk is 80 and the note beside it already said where that came
+from: *"96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR stops and not
+where the hardware does. It was in the sweep for exactly that reason: a sweep
+that stops where they stop cannot tell a ceiling from a choice."* And then
+`board_chunk_sweep.sh` walked 32 31 30 29 24 16 4 2 -- every one of them BELOW
+the default. The suspicion was written down and the sweep never went up.
+
+Going up finds two things.
+
+**Qwen3-0.6B is 8% faster at 160**, at every prompt length measured, with zero
+rows falling back. **Llama-3.2-1B is 5% slower.** And at 224 both fall off a
+cliff -- Qwen3's 404 token prompt goes 3272 to 13507 ms -- because the batched
+path refuses and every token takes the token loop.
+
+### The derived default that shipped for twenty minutes
+
+The mechanism looked clean: npudev refuses a dispatch whose input surface
+`(k_slice / 32) * m` exceeds 5120, so the widest chunk that forces no extra
+slicing is `163840 / k`. Qwen3's n_embd is 1024 and gives 160; Llama's 2048
+gives 80. Both matched.
+
+SmolLM2-135M came back **77% slower**.
+
+The stage table said what, in one line: `2.89 ms a row on the CPU (27480 rows
+fell back)`, and `down` going 0.31 to 2.65 ms a row. Not a slowdown -- a
+REFUSAL. And the reason is that **`down` reads n_ff, not n_embd**: SmolLM2's
+n_ff is 1536, `auto_kmax` widens it to 2048 so the slice stays 1536, and
+`(1536/32) * 160 = 7680`. The formula was right and it was applied to the wrong
+K.
+
+The right one is `163840 / min(widest K, effective KMAX)`, and effective KMAX is
+itself per model because `auto_kmax` only widens where no tensor is grouped:
+
+```
+   Qwen3      1024 is a multiple of 1024, so KMAX stays 1024
+              widest slice 1024   cap 160   measured 160: 0 fallbacks, fastest
+   SmolLM2    576 and 1536 are not, so KMAX widens to 2048
+              widest slice 1536   cap 106   measured 106: 0 fallbacks, fastest
+   Llama      2048 is a multiple, KMAX 1024, widest slice 1024, cap 160
+              but 160 is 5% SLOWER -- legal is not the same as good
+```
+
+### What shipped is the clamp, not the default
+
+80 is still what a caller gets. `CHARSIU_PREFILL_CHUNK` is clamped to the cap,
+so the knob is now safe to raise on any model:
+
+```
+                 ask 160        ask 400        default 80
+   Qwen3      160  11216 ms   160  11094         12149     -8%
+   SmolLM2   ->106  4154     ->106  4217          4283     -3%   (was 6550)
+   Llama      160   4301      160   4282          4105     +5%
+```
+
+SmolLM2's 77% regression becomes a 3% gain, and asking for 400 lands safely
+everywhere. Llama still wants 80, which is why the cap is a ceiling and not a
+recommendation: **legal is not the same as good, and this file now has both
+numbers for all three.**
