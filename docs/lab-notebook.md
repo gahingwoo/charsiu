@@ -3905,3 +3905,52 @@ in one session, and is **negative**. The 8% estimate was wrong in sign, which
 is the fourth estimate in this area to be wrong -- the read fusion, the NMAX
 mechanism, the n-slice balance, and now this. Estimating in this part of the
 system does not work; only the board does.
+
+### 🏁 The rope table was rebuilt once per row PER LAYER
+
+A whole day went into the matmul entry, which is 57 to 74% of the prompt. The
+other 26 to 43% had not been looked at once.
+
+`rope_table` is `head_dim/2` iterations of `powf`, `cosf` and `sinf`. The
+batched prefill is `for layer { for row { ... } }` with the table built inside,
+and its arguments are the position and the rope base -- **not the layer**. So a
+110 token prompt on a 28 layer model built 3080 tables where 110 would do, and
+2970 of them recomputed the same transcendentals to the same bits.
+
+Cached per (position, window variant) for the chunk. Two variants, because a
+window layer rotates at its own base and its own head. Cleared once a chunk and
+not once an allocation -- the buffers outlive a chunk and the positions do not,
+and a stale flag would hand the next chunk the previous one's rotation.
+
+⚠ **The host is a real oracle for this one and it went first.** Without a card
+only the NPU matmul falls back; the rope path itself runs. Four models
+including both window-layer ones, a **prose** prompt so the hashes differ
+between models at all, three arms -- token loop, cached, and
+`CHARSIU_ROPE_TAB=0` uncached -- all identical.
+
+Then the board, interleaved, three pairs a model:
+
+```
+  prompt ms       cached (3)              rebuilt (3)            delta
+  qwen3       698 691 687  (692)      712 707 719  (713)       -21 ms  -2.9%  3/3
+  gemma3      854 852 835  (847)      870 855 866  (864)       -17     -2.0%  3/3
+  tinyl       858 861 862  (860)      860 876 868  (868)        -8      -0.9%  3/3
+  llama       605 604 610  (606)      604 609 607  (607)        -1      noise
+```
+
+and the stage line says it is the thing itself:
+
+```
+  rope + kv copy   qwen3  0.59 -> 0.52 ms a row      gemma3  0.36 -> 0.22
+```
+
+llama is nearly flat and that is the mechanism, not a null result: head_dim 64
+over 16 layers is 512 table iterations a row against qwen3's 64 over 28 = 1792,
+and its prompt is 81 tokens rather than 111.
+
+**And there is more in this half.** The loop that survives is still, per row per
+layer: three memcpys of q, k and v into per-row scratch, `add_bias`, `qk_norm`,
+`rope`, and the cache write -- all scalar and all single threaded, because the
+scratch is shared and pooling it would need the batched buffers operated on in
+place. On qwen3 that stage is still 0.52 ms a row after this, 8.7% of the
+prompt, and `attention` is another 16.9%.
