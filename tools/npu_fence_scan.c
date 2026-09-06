@@ -43,11 +43,14 @@
  *      k = 1024   0.152                1.48x
  *      k = 2048   0.208                1.02x
  *
- * -- so only the widest k here is paying a cold weight fetch, and the narrow
- * ones are being served from somewhere closer. The INTERCEPT is not affected by
- * that (a fixed cost per submit is paid warm or cold, and round 165 put it at
- * 180 to 195 us at M = 1 against the 118 to 305 this measures across m), but
- * the SLOPE understates a first, cold dispatch.
+ * -- and that has TWO readings. Either the narrow k points are served warm,
+ * which this loop would cause, or there is a per output channel FLOOR near
+ * 0.14 us that dominates until the weight bytes catch up around k = 1400. The
+ * second fits better in one place: at k = 1024 the slope 0.152 is HIGHER than
+ * the 0.102 that 10 GB/s predicts, and being warm cannot make a dispatch slower
+ * than its own bandwidth bound. The INTERCEPT is not in question either way --
+ * a fixed cost per submit is paid warm or cold, and round 165 put it at 180 to
+ * 195 us at M = 1 against the 118 to 305 this measures across m.
  *
  * Walking a model's layers the way bench_batch does is the fix, and it is not
  * done here.

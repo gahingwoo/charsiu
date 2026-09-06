@@ -2677,12 +2677,21 @@ channel the slope must double when k doubles. It does not:
       k = 2048   0.208                 1.02x
 ```
 
-Only the widest k is paying a cold weight fetch. `npu_fence_scan` loops ONE
-shape twenty times -- and `bench_batch`'s header, two files away, says exactly
-what that does: *"the first version looped on one tensor 200 times, which left it
-in cache and measured arithmetic rather than memory"*. The intercept survives it,
-because a fixed cost per submit is paid warm or cold. The slope does not: it is a
-warm number, and a first dispatch of a cold tensor costs more.
+⚠ **That admits two readings and I asserted one.** Either the narrow k points
+are being served warm -- `npu_fence_scan` loops ONE shape twenty times, and
+`bench_batch`'s header two files away says what that does: *"the first version
+looped on one tensor 200 times, which left it in cache and measured arithmetic
+rather than memory"* -- OR there is a per output channel FLOOR of about 0.14 us
+that dominates until the weight bytes catch up with it, which happens around
+k = 1400. The second fits too, and it fits better in one respect: at k = 1024 the
+warm slope 0.152 is HIGHER than the 0.102 that 10 GB/s predicts, and caching
+cannot make something slower than its own bandwidth bound.
+
+The discriminating form is the same one either way: walk a model's layers so the
+weights are cold, as `bench_batch` does. A floor survives that; caching does not.
+
+The intercept is not in question -- a fixed cost per submit is paid warm or
+cold.
 
 The header of `npu_fence_scan` now says so. The fix is to walk a model's layers
 the way `bench_batch` does, and it is not written.
