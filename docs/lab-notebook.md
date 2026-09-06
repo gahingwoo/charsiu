@@ -2787,3 +2787,89 @@ What survives is better than what died:
   to 19.9 at m = 80. Batching does not only amortise a fetch over more rows, it
   makes the fetch go faster, and that is a quantified argument for the whole
   batched prefill rather than an assumed one.
+
+## Reading the vendor's own file, and finding we are already past it in one place
+
+Two things came out of `rkllm_regcmd.py` on their Llama-3.2-1B w4a16 that the
+afternoon's profiling could not have found.
+
+**Their input surface is pinned at exactly the ceiling.** Every batched shape in
+the file reads `surf = 5120`:
+
+```
+   ic       oc       surf     M      count
+   4096     1024     5120     40     320
+   2048     1024     5120     80     256
+   2048      256     5120     80     256
+   2048     4096     5120     80     256
+```
+
+`(ic / 32) * M` is 5120 in all of them. The bound this tree found by bisection
+and recorded as "measured, cause unknown" is a number the vendor's compiler
+targets deliberately.
+
+**And they dispatch ic = 2048 unsliced at M = 80, where we cut the same tensor
+in two.** Our KMAX is pinned at 1024, and the note that pins it does not say 2048
+is bad -- phase 2 caught two models disagreeing with their own token loop at
+4096, and 1024 was kept as "the widest the board has always run". So the obvious
+move was to take the vendor's slice.
+
+It loses, and the reason is a coupling this file had not written down:
+
+```
+   Qwen3, 156 tokens
+     KMAX 1024   1 chunk of 156    196 calls   6.10 ms a row
+     KMAX 2048   2 chunks 80+76    392 calls   6.56 ms a row
+```
+
+**The chunk cap is `163840 / KMAX`**, so raising the slice width lowers the
+widest legal chunk in exact proportion. The slices per tensor halve and the
+chunks double, the call count does not fall -- here it doubled -- and the ragged
+tail comes back. Both knobs sit on one constraint, `(k / 32) * m <= 5120`, and
+the vendor's (2048, 80) and ours (1024, 156) are two points on the same line.
+
+Theirs is forced: a runtime that always chunks at 80 has to widen K to fill the
+surface. Ours is not, and at the prompt length their own benchmark uses, one
+chunk of 156 at KMAX 1024 beats their arrangement. The text is identical to the
+token loop at both.
+
+That is worth knowing in both directions. It closes "should we copy their slice"
+with a measurement instead of an assumption, and it says the 5120 ceiling is the
+real object -- the thing to attack is the surface bound itself, not either of
+the two knobs that trade against each other underneath it.
+
+### And the read is proportional to the K slices
+
+TinyLLAMA at the same 158 tokens, with the same text out of both:
+
+```
+                        calls   ms a row   pack   fence   read
+   KMAX 1024, 1 chunk    154      7.77     1.11    2.02   2.43
+   KMAX 2048, 2 chunks   308      7.92     1.33    3.14   1.20
+```
+
+The totals are a wash. The COMPOSITION is not: **the read halves.** That is the
+mechanism for the largest item at the vendor's prompt length, and it was not
+written down -- `read_rows` walks Y once per K SLICE, because each slice
+contributes a partial sum that has to be accumulated, so the read cost is
+proportional to the slice count and not to the output alone.
+
+So the constraint has two sides and they pull opposite ways:
+
+```
+   read   falls with FEWER K slices  -> wants a WIDE slice
+   fence  rises with MORE chunks     -> wants a WIDE chunk
+   and (k / 32) * m <= 5120 makes slices * chunk a constant
+```
+
+Llama says the same thing at 110 tokens, 7.45 against 7.47 with the fence going
+2.11 to 3.16. Three models, three washes, and in each one the read and the fence
+swap places.
+
+**That is why this has been stuck.** Every knob touched so far slides along the
+5120 line, and the two costs cancel. The thing worth attacking is the line: 5120
+times 32 is 163840 bytes, which is the shape of a hardware input buffer, and the
+vendor's compiler targets it exactly -- so it is probably not ours to move. What
+IS ours is the read's dependence on the slice count, which is a software choice
+about where partial sums are accumulated, and `read_fused` was one attempt at it
+that lost 2.3% on Llama at a profile measured before any of today's work.
