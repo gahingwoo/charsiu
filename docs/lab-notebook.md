@@ -2280,3 +2280,39 @@ still go a0, a1, a2 in order; what disappears is a store and a reload of a
 float32 in between, and a float32 that goes to memory and comes back is the same
 float32. `tests/axpy8` checks one eight wide call against two four wide ones
 over 520 shapes and finds no case differing in a single bit.
+
+## Two hashes that agreed for the wrong reason
+
+The onechunk knob had passed `board_text_all.sh` on all nine architectures, so
+the next step was to make it the default. Two rounds nearly did it on evidence
+that was not evidence.
+
+**The first**: eight of those nine prompts are 86 to 88 tokens, which is above
+the chunk of 80 and below the ceiling, so the knob engaged. The ninth --
+Llama-3.2-1B -- runs a 64 token prompt. `n_ids > chunk` is false at 64, the knob
+did nothing, and its "text identical" said only that the code without the knob
+still works.
+
+So a round went out with a 100 number prompt, three arms, and the token loop as
+the reference. All three hashes matched. They matched because `seq 1 100`
+tokenises to about 200, which is over Llama's 160 ceiling, so `n_ids <= cap` was
+false and the knob did nothing again. **The round printed the widths beside the
+hash and the widths said `2x80+1x40`** -- which is what a chunk of 80 does, and
+not what one chunk looks like.
+
+**The second**: two of that round's three models produced
+`d41d8cd98f00b204e9800998ecf8427e` in every arm. That is the md5 of the empty
+string. `/opt/charsiu/models` holds three models and the rest live in
+`~/.charsiu/models`, so those runs found no file, printed nothing, and hashed
+nothing -- identically, in all three arms.
+
+A missing model reads as "text identical" unless something checks that the model
+ran. A knob that does not engage reads as "text identical" unless something
+checks that it engaged. Both are the same failure as the instruments corrected
+the day before: **a true statement about something other than what the label
+says**, and in both cases the thing that caught it was a second line printed
+beside the first.
+
+The prompt that actually engages it is 45 numbers, 91 tokens, and the widths it
+currently runs are `1x80+1x6+1x4` -- a chunk of six and a chunk of four, each
+paying a fence, a pack and a read on every tensor of every layer.
