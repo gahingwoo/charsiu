@@ -2467,7 +2467,12 @@ alternative rather than where it agrees. Eleven points of agreement cost nothing
 to collect and bought nothing; one point of disagreement settled it in a single
 round.
 
-head_dim survives: 64 does not win at any length tried, 39 to 1101. What it
+And 1701 tokens says the same thing again -- product 108864, further above the
+threshold than any win in the fitted set, and the NPU arm is 22% behind (21409
+against 26164, attention 7.34 against 9.82). The rule is dead twice over.
+
+head_dim survives: 64 does not win at any length tried, 39 to 1701 on Llama and
+916 on SmolLM2. What it
 still does not have is the length condition, which is real -- Qwen3 at 128 loses
 below about 700 tokens and wins at 916 -- and which is therefore per head width
 rather than a single number. Two thresholds fitted on two models is not a rule
