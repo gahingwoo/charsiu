@@ -2837,3 +2837,39 @@ That is worth knowing in both directions. It closes "should we copy their slice"
 with a measurement instead of an assumption, and it says the 5120 ceiling is the
 real object -- the thing to attack is the surface bound itself, not either of
 the two knobs that trade against each other underneath it.
+
+### And the read is proportional to the K slices
+
+TinyLLAMA at the same 158 tokens, with the same text out of both:
+
+```
+                        calls   ms a row   pack   fence   read
+   KMAX 1024, 1 chunk    154      7.77     1.11    2.02   2.43
+   KMAX 2048, 2 chunks   308      7.92     1.33    3.14   1.20
+```
+
+The totals are a wash. The COMPOSITION is not: **the read halves.** That is the
+mechanism for the largest item at the vendor's prompt length, and it was not
+written down -- `read_rows` walks Y once per K SLICE, because each slice
+contributes a partial sum that has to be accumulated, so the read cost is
+proportional to the slice count and not to the output alone.
+
+So the constraint has two sides and they pull opposite ways:
+
+```
+   read   falls with FEWER K slices  -> wants a WIDE slice
+   fence  rises with MORE chunks     -> wants a WIDE chunk
+   and (k / 32) * m <= 5120 makes slices * chunk a constant
+```
+
+Llama says the same thing at 110 tokens, 7.45 against 7.47 with the fence going
+2.11 to 3.16. Three models, three washes, and in each one the read and the fence
+swap places.
+
+**That is why this has been stuck.** Every knob touched so far slides along the
+5120 line, and the two costs cancel. The thing worth attacking is the line: 5120
+times 32 is 163840 bytes, which is the shape of a hardware input buffer, and the
+vendor's compiler targets it exactly -- so it is probably not ours to move. What
+IS ours is the read's dependence on the slice count, which is a software choice
+about where partial sums are accumulated, and `read_fused` was one attempt at it
+that lost 2.3% on Llama at a profile measured before any of today's work.
