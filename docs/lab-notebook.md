@@ -2919,3 +2919,47 @@ That is not yet a defect. The w4a16 read applies its group scales on the CPU --
 for on this path is a question, not an answer, and `charsiu_build_coefs` writes
 bias and weight sums that the int8 requant genuinely needs. The probe is to
 leave it unprogrammed on w4a16 and read the text.
+
+### The RDMA block, counted and then priced out
+
+`--dump` on one stream said the vendor writes no RDMA. Counted over the whole
+file that generalises: **none of the 8808 convolution streams carries a single
+RDMA register** -- not the 3328 int4, not the 4940 fp16, not the 40 int8, not
+the 500 weightless. They program the coefficient DMA in their DPU-only streams
+and never in a matmul.
+
+⚠ The note above the emit says the opposite -- *"the vendor keeps that
+configuration in its own stream as well, 21 RDMA registers"* -- and the count
+says otherwise for this file. That note may be about the int8 capture rather
+than the .rkllm; it is left standing with this beside it rather than edited on a
+guess.
+
+We write 22 there, and `0x5020` is the coefficient address. On the w4a16 path
+the buffer is provably all zeros -- bias and weight sums are both `calloc`ed and
+only the int8 branch fills them, because int4 has no input zero point to correct
+-- so the natural next move was to stop programming it.
+
+**It is not worth the risk.** The DMA is not the 270 KB allocation, it is the
+span `0x5024 - 0x5020`, which the emitter sets to the table plus the scale
+table:
+
+```
+   0x5020 = 0x7000, 0x5024 = 0x9800   ->  10240 bytes
+   10 KB at 10 GB/s = 1.0 us of a ~300 us dispatch = 0.34%
+```
+
+Against that, the note two screens up records what happens when this unit is
+half programmed: *"the job timed out: the unit that fetches the per channel
+records was half configured, so the DPU waited for data that never arrived."*
+A third of a percent is not worth a wedged NPU on an unattended round.
+
+What IS left over is memory, not time: one coefficient buffer is allocated PER
+SLOT, and Llama makes 320 of them at 270 KB, so **84 MB of identical zero
+buffers** on the w4 path. Sharing them is safe by construction and saves no
+time; it is a memory fix and belongs with the fp16 mirror's 2 GB cap rather than
+with the prefill.
+
+**So the register stream is closed.** Ours matches theirs at their own batched
+shape, modulo an output stride that satisfies the same law and a coefficient DMA
+worth a third of a percent. The remaining gap is not in how a dispatch is
+programmed.
