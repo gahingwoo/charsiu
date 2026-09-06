@@ -3857,3 +3857,51 @@ is "1 2 3 ... 40" and the models continue the count, so **gemma3 and gemma4 hash
 to the same twelve characters**. The check still does its job -- batched against
 that model's own token loop -- but it cannot see a quantisation change, which is
 exactly what llama.c's own note says about counting prompts.
+
+### ⛔ The pair submit is a 12 to 28% LOSS, built and reverted
+
+The last non-quality lever: submit `gate` and `up` before reading either, so
+gate's read runs while up is still on the hardware. It was priced at about 8%
+off the per-layer shares, and the read is known to translate one for one into
+TTFT (`POOL_READ=0` moved llama's read 164.6 -> 328.7 ms and its prompt 603 ->
+765).
+
+Built in three steps so a failure could not be ambiguous. The middle one --
+`npu_collect_side` extracted byte for byte, and `batch_outbuf` learning to skip
+a buffer still in flight -- was verified on the board as a **no-op first**: four
+models, two prompt lengths, eight hashes equal to their token loops and every
+time on baseline. Then the pair itself, behind `CHARSIU_NPU_PAIR`.
+
+It works, and it is slower on every model:
+
+```
+  prompt ms      pair (3 runs)          control (3 runs)       delta
+  llama      695 700 695              604 610 604             +15%
+  qwen3      801 799 806              712 719 717             +12%
+  tinyl      985 990 988              867 866 868             +14%
+  gemma3    1116 1139 1121            860 854 904             +28%
+```
+
+Every hash is still exactly its token loop, so this is a speed result and not a
+correctness one. The split says where it went, on qwen3:
+
+```
+              pair    control
+  prep        46.6      12.4    <- 3.8x, "buffers, output alloc, memset of Y"
+  pack       124.9     100.1
+  fence      141.9     132.1    <- the thing it was supposed to CUT
+  read       150.2     126.4
+  entry      503       403
+```
+
+**Every line got worse and the fence went up.** A second output buffer per
+geometry doubles the working set of the hottest shape, so both the pack and the
+read meet colder memory, and the pool pays to allocate and manage it. Whatever
+overlap the hardware gave back did not cover that.
+
+Reverted, both commits. What is worth keeping is the number: the last lever
+that does not touch the quantiser was built, measured against its own control
+in one session, and is **negative**. The 8% estimate was wrong in sign, which
+is the fourth estimate in this area to be wrong -- the read fusion, the NMAX
+mechanism, the n-slice balance, and now this. Estimating in this part of the
+system does not work; only the board does.

@@ -5294,78 +5294,6 @@ static int reuse_site(char which)
 	return 1;
 }
 
-/*
- * BOTH OF AN INDEPENDENT PAIR, SUBMITTED BEFORE EITHER IS READ.
- *
- * gate and up take the same input and neither needs the other's answer, so the
- * hardware can hold both while the CPU reads the first. Everything else in a
- * layer is a chain. CHARSIU_NPU_PAIR=0 turns it off in the same binary, which
- * is how the two arms get measured in one session.
- *
- * ⚠ IT FALLS BACK RATHER THAN FAILING. charsiu_npu_matmul_pair refuses any
- * shape it cannot prove safe -- a geometry mismatch, or the pool declining a
- * second output buffer -- and returns -1 having collected whatever it did
- * submit. The two ordinary calls below then run, which is exactly what shipped
- * before this function existed.
- */
-static int pair_on(void)
-{
-	static int v = -1;
-
-	if (v < 0) {
-		const char *e = getenv("CHARSIU_NPU_PAIR");
-
-		v = !e || *e != '0';
-	}
-	return v;
-}
-
-static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
-		       const float *X, int n, float *Y, uint32_t k,
-		       uint32_t nout);
-static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
-			    const float *X, int n, float *Y, uint32_t k,
-			    uint32_t nout, char site);
-
-static void matmul_rows_pair(struct llama_state *s,
-			     const struct gguf_tensor *wa,
-			     const struct gguf_tensor *wb,
-			     const float *X, int n, float *Ya, float *Yb,
-			     uint32_t k, uint32_t nout, char site)
-{
-	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
-	int ia, ib;
-
-	if (!pair_on() || n < 2) {
-		matmul_rows(s, wa, X, n, Ya, k, nout);
-		matmul_rows_same(s, wb, X, n, Yb, k, nout, site);
-		return;
-	}
-	ia = npu_id_for(s, wa);      /* stages on first use, before the clock */
-	ib = npu_id_for(s, wb);
-	if (ia >= 0 && ib >= 0) {
-		bmm_calls += 2;
-		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
-		if (!charsiu_npu_matmul_pair(s->pool.dev, ia, ib, X,
-					     (unsigned)n, Ya, Yb)) {
-			if (stage_on > 0) {
-				double dw = charsiu_npu_batch_wall(s->pool.dev,
-								   0) - w0;
-
-				bmm_entry_ms += dw;
-				bmm_dev = s->pool.dev;
-				bmm_wrap_ms += now_ms() - t0 - dw;
-			}
-			return;
-		}
-		/* ⚠ the pair refused or half ran; both are re-done the ordinary
-		 * way, and the pair's own accounting above is not taken */
-		bmm_calls -= 2;
-	}
-	matmul_rows(s, wa, X, n, Ya, k, nout);
-	matmul_rows_same(s, wb, X, n, Yb, k, nout, site);
-}
-
 static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 			    const float *X, int n, float *Y, uint32_t k,
 			    uint32_t nout, char site)
@@ -6111,8 +6039,10 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 
 		/* gate and up read one norm as well: the same choice */
 		if (!prefill_grouped() || will_batch(s, L->gate)) {
-			matmul_rows_pair(s, L->gate, L->up, s->bxb, n,
-					 s->bhb, s->bhb2, m->n_embd, nff, 'u');
+			matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd,
+				    nff);
+			matmul_rows_same(s, L->up, s->bxb, n, s->bhb2,
+					 m->n_embd, nff, 'u');
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
