@@ -2919,3 +2919,60 @@ That is not yet a defect. The w4a16 read applies its group scales on the CPU --
 for on this path is a question, not an answer, and `charsiu_build_coefs` writes
 bias and weight sums that the int8 requant genuinely needs. The probe is to
 leave it unprogrammed on w4a16 and read the text.
+
+### The RDMA block, counted and then priced out
+
+`--dump` on one stream said the vendor writes no RDMA. Counted over the whole
+file that generalises: **none of the 8808 convolution streams carries a single
+RDMA register** -- not the 3328 int4, not the 4940 fp16, not the 40 int8, not
+the 500 weightless. They program the coefficient DMA in their DPU-only streams
+and never in a matmul.
+
+⚠ The note above the emit says the opposite -- *"the vendor keeps that
+configuration in its own stream as well, 21 RDMA registers"* -- and the count
+says otherwise for this file. That note may be about the int8 capture rather
+than the .rkllm; it is left standing with this beside it rather than edited on a
+guess.
+
+We write 22 there, and `0x5020` is the coefficient address. On the w4a16 path
+the buffer is provably all zeros -- bias and weight sums are both `calloc`ed and
+only the int8 branch fills them, because int4 has no input zero point to correct
+-- so the natural next move was to stop programming it.
+
+**It is not worth the risk.** The DMA is not the 270 KB allocation, it is the
+span `0x5024 - 0x5020`, which the emitter sets to the table plus the scale
+table:
+
+```
+   0x5020 = 0x7000, 0x5024 = 0x9800   ->  10240 bytes
+   10 KB at 10 GB/s = 1.0 us of a ~300 us dispatch = 0.34%
+```
+
+Against that, the note two screens up records what happens when this unit is
+half programmed: *"the job timed out: the unit that fetches the per channel
+records was half configured, so the DPU waited for data that never arrived."*
+A third of a percent is not worth a wedged NPU on an unattended round.
+
+What IS left over is memory, not time: one coefficient buffer is allocated PER
+SLOT, and Llama makes 320 of them at 270 KB, so **84 MB of identical zero
+buffers** on the w4 path. Sharing them is safe by construction and saves no
+time; it is a memory fix and belongs with the fp16 mirror's 2 GB cap rather than
+with the prefill.
+
+### ⛔⛔ And the conclusion above is worthless
+
+"The register stream is closed" was drawn from **one** shape, and it is a shape
+**this runtime never emits**. KMAX is pinned at 1024, so every dispatch charsiu
+makes has k = 1024; the diff was our k = 2048 against their k = 2048.
+
+Counted, their shapes are ic 2048 or 4096 and oc 1024, 256, 4096, 1 or 64.
+Llama's tensors are k 2048 and 8192, n 2048, 512 and 8192. **Their oc is exactly
+half our n and their ic exactly half our k** -- int4 packs two weights to a
+byte, which is the obvious unit difference and has not been confirmed. Neither
+side emits a shape the other emits.
+
+So nothing was compared, and the same mistake is on the record three times now:
+the wall was chased as a CBUF property for months and was a field layout; the
+0x4050 rule was fitted where two expressions are indistinguishable. **A
+comparison between one shape of theirs and one shape we do not run cannot close
+anything.**
