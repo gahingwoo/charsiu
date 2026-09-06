@@ -3046,3 +3046,35 @@ tensor by tensor and never runs a norm, a rope table or a cache offset. A fault
 outside the matmul is invisible to it by construction. Round m65 asks the text
 question directly, with the KMAX 1024 cell as the positive control, because a
 round where nothing reproduces says the fault is gone rather than located.
+
+### m65: the overlap is clean at width 24, and the control never ran
+
+Phi-3.5, 87 token prompt, 16 runs an arm, on the board's current dev build.
+
+```
+  KMAX 2048, chunk 24   widths 3x24+1x14   parallel 0/16 wrong   serial 0/16
+  KMAX 1024, chunk 24   widths 1x86        parallel 0/16 wrong   serial 0/16
+                                           onedev   0/16 wrong
+```
+
+The KMAX 2048 cell is a real width-24 test and the overlap is clean sixteen
+times, where the 08-30 map has this configuration wrong 3 to 15 times in 16.
+Together with the slots probe's 21600 exact rows that is two independent reads
+saying the same thing.
+
+**⚠ The KMAX 1024 cell -- the one that exists to reproduce 13 of 16 -- did not
+run width 24 at all.** Its widths line says `1x86`: the chunk cap at KMAX 1024
+is 163840/1024 = 160, the prompt is 87 tokens, and `CHARSIU_PREFILL_ONECHUNK`
+(default ON since this week) replaced the requested chunk of 24 with one chunk
+of 86. A cell that was supposed to fail tested a width that has never failed.
+
+That is the fourth time this month a knob has been set and not engaged, and the
+only reason it was caught is that the script prints the binary's own `widths`
+line beside the rate. **A number is worth what the line next to it says was
+run.** m66 repeats the control with `CHARSIU_PREFILL_ONECHUNK=0`.
+
+So the standing claim after m65 is narrow and deliberately so: at KMAX 2048,
+chunk 24, phi3, on this kernel and this build, sixteen overlapped runs are
+right. Nothing here has yet reproduced the fault, so nothing here has yet
+proved it gone -- an experiment where the positive control does not fire
+cannot tell "fixed" from "not looking".
