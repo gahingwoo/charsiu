@@ -3143,3 +3143,53 @@ m68 reads the two things that cannot stay quiet if the arms really differ: the
 line the runtime prints about what it decided, and the fence, which is the
 stage overlapping the cores cuts -- 409 ms to 164 ms when the element probe
 engaged it.
+
+### ⛔ Correction: the overlap is already the default, and the fault was already solved
+
+m68 asked the runtime what it had decided, and all four models, all three arms,
+printed the same line:
+
+```
+  charsiu NPU: batched calls, the two cores overlapped: 786 MHz at 800 mV,
+                                                        the vendor asks 800
+```
+
+**The two cores have been overlapping by default on this board.** The "serial"
+arm of m67 and m68 was not serial: `batch_serial()` defaults to
+`!overlap_safe()`, the rail reads 800 mV, `overlap_safe()` approves, and
+`CHARSIU_NPU_PARALLEL_MIN_M` is never even consulted. m67's two arms were the
+same run twice, exactly as the caveat written beside it feared.
+
+And the mechanism was found on 2026-09-04 and is written at the top of
+`src/overlap.h`: **the overlap fault was the NPU's voltage margin.** 786 MHz at
+the 750 mV U-Boot leaves, against the 800 mV the vendor's OPP asks of its 800
+MHz step. Four DTBs, same probe, 4 passes of 5400 rows:
+
+```
+  786 MHz, 750 mV (mainline as shipped)   11 to 25 wrong words a pass
+  594 MHz, 750 mV                          0, 0, 0, 0   (10% slower)
+  786 MHz, 800 mV                          0, 0, 0, 0   (full speed)
+  786 MHz, 850 mV                          0, 0, 0, 0
+```
+
+So m66's "the fault does not reproduce" reproduces nothing because the rail it
+needed is gone, and its closing line -- *"which change fixed it is not
+established"* -- is answered in the tree it was written next to. The three
+rounds today are still worth their UART time, but for a smaller claim than they
+were run for: they are an end-to-end check of the 09-04 guard at the width the
+old map called worst, on four models the guard was never exercised on, and it
+holds -- 16 of 16 at width 24, 16 of 16 at width 22, 48 hashes equal to their
+token loops.
+
+**The one thing that follows and is new: the TTFT numbers already quoted are
+overlapped numbers.** 673 / 910 / 3004 / 2408 ms against the vendor's 469 / 544
+/ 1829 / 1219 were measured with both cores in flight, so the fifth off the
+prompt that `PARALLEL_MIN_M=28` was priced at is **already taken** and is not
+sitting in the gap waiting to be collected.
+
+⚠ And it leaves one question that is genuinely open, because its evidence
+predates the rail. `board_w4_m8.sh`'s map -- m = 8 and m = 10 missing ROW 0 of
+the n = 8192 tensors, 33 of 904, one core clean and two cores dirty -- was
+measured on 2026-08-29, six days before the voltage was found, so every arm of
+it ran at 750 mV. That is the same signature the voltage produced. m69 re-runs
+it at the rail the board now holds.
