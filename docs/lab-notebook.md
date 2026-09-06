@@ -3706,3 +3706,40 @@ tensors BELOW the grouped number** (attn_q 0.1409) and does nothing for
 ffn_down, which is the one with the most slices to save.
 
 That is a model-quality decision and belongs to the user, not to a round.
+
+### ⛔ The read fusion is worth nothing, and an existing knob said so for free
+
+The plan was to deal both K slices of a tensor to ONE device so
+`read_fused_rows` walks Y once instead of twice -- on the traffic count that is
+a quarter of the read, since Y goes from a write plus a read-modify-write to a
+single write on every two-slice tensor. It needs a pair-submit refactor of the
+hottest path to arrange.
+
+`CHARSIU_NPU_ONEDEV=1` already arranges it, for every tensor, for free:
+
+```
+                       ranges   read ms/row   read total   fence
+  two cores, split      224      2.07 / 2.09   166.0/167.2  195 ms
+  onedev,   fused       112      2.06 / 2.06   164.6/164.6  327 ms
+```
+
+**The (device, output range) pairs halve, exactly as the refactor would arrange
+them, and the read does not move by more than the noise.** So either the fusion
+does not fire or -- far more likely -- the read is not bound by the Y traffic
+at all.
+
+The arithmetic agrees once it is done properly: the accumulator side is
+`S·m·n·4` and is **unchanged by any dealing**, because S is a property of k and
+KMAX and not of which device holds a slice. Y is `m·n·4` and is written
+sequentially. On `ffn_gate` that is 5.24 MB of scattered accumulator against
+2.62 MB of streaming Y, and the scattered side is what costs.
+
+So the read has exactly one lever and it is S. That is now established from two
+directions -- more threads do not move it (2.0x is the ceiling), and neither
+does removing a third of its traffic.
+
+What survives of the pair submit is its **overlap only**: reading `gate` while
+`up` still runs, and `q` and `k` while `v` runs. Priced off the per-layer MAC
+and read shares that is about 3.3 ms a layer, 52 ms of a 453 ms entry, **8.6%
+of the prompt** -- worth having, and worth knowing it is 8.6% and not the 15%
+it looked like an hour ago.
