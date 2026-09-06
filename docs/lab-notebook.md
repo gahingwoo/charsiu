@@ -2010,3 +2010,471 @@ SmolLM2's 77% regression becomes a 3% gain, and asking for 400 lands safely
 everywhere. Llama still wants 80, which is why the cap is a ceiling and not a
 recommendation: **legal is not the same as good, and this file now has both
 numbers for all three.**
+
+## The fence was never only a wait
+
+The fence was the last large item in a batched row that nobody had looked
+inside. On Llama-3.2-1B it is 1.36 of 7.75 ms a row, and every reading of it in
+this file -- *"the hardware is BUSY"*, *"a fence removed is worth more than a
+submit removed"* -- had taken it for time spent waiting for the NPU.
+
+`rocket_ioctl_prep_bo` is two things:
+
+```c
+ret = dma_resv_wait_timeout(gem_obj->resv, DMA_RESV_USAGE_WRITE, true, timeout);
+...
+dma_sync_sgtable_for_cpu(dev->dev, shmem_obj->sgt, DMA_BIDIRECTIONAL);
+```
+
+A wait, and then a cache invalidate over the WHOLE buffer. One ioctl, one
+number, two things -- the same shape as the three instruments corrected the day
+before: true about something other than its label.
+
+### Asking for the second one twice
+
+A second `prep` on a buffer whose fence has already signalled waits for nothing.
+`dma_resv_wait_timeout` returns at once and what is left is the invalidate, over
+the same bytes, through the same ioctl. `CHARSIU_FENCE_SPLIT=1` does that and
+charges it separately.
+
+The probe cannot be trusted on its own say-so, so the round ran the plain binary
+twice first and read the split arm against that spread:
+
+```
+   llama, 512 rows       fence   invalidate   the wait
+     plain 1              1.36        -           -
+     plain 2              1.35        -           -
+     split                1.39      0.30        1.09    1.99 GiB, 14.03 GB/s
+```
+
+1.36, 1.35, 1.39: the probe moves the number it measures by less than 3%, which
+is what makes the 0.30 worth reading. Qwen3 and SmolLM2 came back at the same
+ratio -- 0.24 of 1.15, 0.19 of 0.52 -- so **about a fifth of every fence on this
+board is cache maintenance, not the hardware.**
+
+The bytes are printed beside the microseconds on purpose. A rate whose
+denominator holds something other than the transfer it names is exactly how
+"2.36 GB/s of weights" got quoted here as a fact about the silicon.
+
+### And the other four fifths are not the weight fetch
+
+The obvious next story was that the wait is the weight fetch: the NPU reads
+every weight once per chunk, so a prompt in 7 chunks reads them seven times, and
+1.09 ms a row over 512 rows is 558 ms, which is about 4.2 GB at this board's
+measured roof. It fits.
+
+It is wrong, and one arm says so. Doubling the chunk halves the number of passes
+over the weights:
+
+```
+   llama, 512 rows      chunks   fence/row   read/row   prompt
+     chunk  80             7        1.37       2.20     4093 ms
+     chunk  80             7        1.35       2.27     4107 ms
+     chunk 160             4        1.42       2.68     4262 ms
+```
+
+Half the weight traffic, and the fence per row did not move -- it rose. **The
+fence scales with rows, not with weight passes**, so whatever the NPU is doing
+in those 356 us it is not waiting on DRAM for weights, and the "hardware is the
+floor" reading that has stood since the int4 work does not extend from decode to
+prefill.
+
+What DID move is the read, up 22% on the wider chunk, on a model whose widest
+tensor is 8192 -- while Qwen3, whose widest is 3072, held flat at 0.93. That is
+a working set, not a bandwidth, and it is the first mechanism this file has for
+why the best chunk is per model.
+
+## The chunk curve, and a knob that had been sitting in the source
+
+The chunk had been read twice before: once by a sweep that only went DOWN from
+80, and once by a sweep that went up and found 160 good for Qwen3 and bad for
+Llama. Neither had a stage table beside it, so neither could say what moved.
+
+With one:
+
+```
+                     16      32      48      80      80     120     160
+   llama ms a row   9.50    8.48    8.16    7.79    7.78   7.67    8.12
+   qwen3 ms a row  15.86   14.89   13.90   13.19   13.30  12.65   12.25
+   smol  ms a row                           4.66    4.60          4.54 (->106)
+```
+
+Llama has a minimum at 120 and turns up after it. Qwen3 is still falling at its
+own ceiling. SmolLM2 is still falling at its own ceiling, which is 106.
+
+And the entry says which column does it. Between 80 and 160, on Llama, `read`
+goes 2.20 to 2.68 while everything else holds; on Qwen3 it goes 0.96 to 0.93.
+**Llama's widest tensor is 8192 and Qwen3's is 3072**, and the read walks the
+output buffer of one slot, which is `widest * m * 4` bytes. That is the first
+mechanism this file has had for why the chunk is per model -- the earlier note
+said "whatever hurts a small model at a wide chunk has not been found", and the
+answer is that it is not the small model that is hurt, it is the WIDE one.
+
+`min(cap, 120)` is faster than 80 on all three. It is not shipped as a default
+yet, because 120 is Llama's minimum and Llama is the only one of the three whose
+curve has a minimum below its ceiling -- a rule fitted at the single point that
+exercises it is the mistake this file has already made once.
+
+### read_rows2: measured, at last
+
+Underneath `read_rows` sits `read_rows2`, with a comment ending *"whether two is
+on the right side of the A72's store buffer is a board question, and
+CHARSIU_NPU_READ4=2 asks it."* Nothing in this repository had ever asked it.
+`read_rows4` -- four rows off one line, four write streams -- lost 2.3x, and the
+two-row form went in beside it and was never run.
+
+```
+                 ms a row    read     text
+   llama plain     7.81      2.23     6c2e11a4...
+   llama plain     7.78      2.23     6c2e11a4...
+   llama read2     7.69      2.06     6c2e11a4...   identical
+   qwen3 plain     13.35     0.96     955de80d...
+   qwen3 read2     13.21     0.92     955de80d...   identical
+```
+
+Both plain arms agree on the read to the hundredth, so 2.23 to 2.06 is 7.6% and
+not weather. Llama gains more than Qwen3, which is the same width story again:
+2.23 ms a row of gather has more to save than 0.96.
+
+### And it was applying by accident
+
+`pool_arm` gives each worker `n / (4 * threads)` rows. At m = 80 with eight
+threads that is 2, and the pair form needs an even range, so it applied. At m =
+120 it is 3 and the pair form would have returned 0 on every range and fallen
+back to the scalar path -- silently, because falling back is what it is supposed
+to do when it cannot help.
+
+So the 7.6% was measured at the one width where an unrelated division happened
+to come out even. `charsiu_parallel_for_grain` rounds the chunk up to a multiple
+of the grain and the read asks for 2 when the pair form is on. Nothing that did
+not ask for a grain changes.
+
+## The whole table, and the stage nobody had been looking at
+
+Three rounds read the five columns inside the NPU entry and none printed what
+sits outside them. With `prep` added as the fifth segment the entry closes to
+0.01 ms a row on Llama, and the rest of the table can finally be read:
+
+```
+   Llama-3.2-1B, 512 rows, chunk 80, 7.73 ms a row
+     token embedding   0.00    0.0%
+     attn rmsnorm      0.05    0.6%
+     q k v             0.70    9.1%
+     rope + kv copy    0.15    1.9%
+     attention         2.34   30.2%     <-- CPU
+     o proj            0.40    5.2%
+     residual          0.07    0.9%
+     gate + up         2.29   29.6%
+     silu * up         0.25    3.2%
+     down              1.45   18.7%
+     residual          0.04    0.6%
+   of the entry: pack 1.11  submit 0.08  fence 1.33  read 2.21  prep 0.03
+                 unaccounted 0.01
+```
+
+**Attention is the largest single stage in a prefilled row, larger than any
+matmul**, and all of it is on the CPU. On Qwen3 at a 916 token prompt it is
+**8.36 of 13.15 ms a row, 63.6%** -- attention is linear in the context and
+Qwen3's prompt is longer, so the same code reads as a third of one model and
+two thirds of another.
+
+It is not bandwidth bound. The block already walks the KV cache once per 8 query
+rows, which puts Qwen3 at about 1.6 GB/s against this board's 9.4 roof, and the
+scores kernel is eight NEON accumulators over four keys at a time. What it IS
+running at is about a fifth of the CPU's fp32 peak, and **the block was swept on
+Qwen3, SmolLM2 and gemma-3 and never on Llama** -- gemma-3 was still falling at
+32 when 8 was chosen as the smallest inside the spread of the best.
+
+### The vendor protocol's prompt fits in one chunk, and did not get one
+
+Their benchmark is a 128 token prompt; ours tokenises to 110 to 116. The surface
+ceiling on these models is 160. It ran as 80 and then 30.
+
+```
+                base TTFT   onechunk    gap was -> now
+   Qwen3           721         643      1.53x -> 1.37x
+   TinyLLAMA       980         918      1.80x -> 1.69x
+   Phi3           3160        3028      1.73x -> 1.66x
+   Gemma4         2399        2133      1.97x -> 1.75x
+```
+
+**Decode is unchanged in both arms**, which is the control: a chunking change
+cannot touch it, and if it had moved, the arm would have been measuring the
+board rather than the change.
+
+That control is not decoration. The `read2` arm of the same round showed Qwen3's
+TTFT at 1008 against 721 AND its decode at 20.71 against 24.74 -- and `read4` is
+read only by the batched gather, so it cannot reach decode at all. The next
+arm's decode came back to 24.74. Arms run in BLOCKS track the state of the
+board; the alternating round is the one to believe.
+
+## A door that was closed on an allocation
+
+fp16 attention on the NPU is implemented, was measured slower at every cache
+depth, and was shut. Attention has since turned out to be the largest stage in a
+prefilled row, so the verdict was worth re-reading -- and the note above the
+implementation contains its own refutation:
+
+> For the V cache a position is part of the reduction, so its k cannot move: it
+> is allocated at the context length and the matmul always runs there, with the
+> probabilities past the last token left zero. **That costs a fetch of the whole
+> V surface every call** and buys never repacking.
+
+Every round that closed the door ran `-c 2048`. A 916 token prompt then pays
+2.2x, a 110 token one 18x. And the cost is doubled by a second route: the input
+surface ceiling is `(k / 32) * m <= 5120`, so a wider k also buys fewer rows a
+pass -- 80 at a 2048 context, 160 at 1024.
+
+So: the same two arms, at a context barely above the prompt.
+
+```
+                    CPU attn    NPU attn
+   llama -c 2048      2.34        6.50
+   llama -c 640       2.28        4.16
+   qwen3 -c 2048      8.46        7.61
+   qwen3 -c 1024      8.39        5.97
+```
+
+**The CPU arm does not move** -- 2.34 to 2.28, 8.46 to 8.39 -- which is the
+control that makes the rest readable: its loop runs to `pos`, not to `n_ctx`, so
+if it HAD moved the round would have been measuring something else. The NPU arm
+moves 36% on Llama and 22% on Qwen3 for no reason but the size of a buffer.
+
+And on Qwen3 the NPU path **already wins at -c 2048**, and wins by 29% at 1024,
+where its V surface is only 1.12x oversized and there is little left to take.
+Attention is 63% of a prefilled Qwen3 row, so that is 18% of the whole prompt.
+
+The split is by head_dim: Qwen3's is 128 and the NPU wins, Llama's is 64 and the
+NPU loses at every context tried. That is the shape you would expect -- a wider
+head is a wider matmul -- and it means this is a per model choice rather than a
+default.
+
+### What the fix has to preserve
+
+`kv` now climbs a doubling ladder instead of sitting at the context length, so a
+run repacks at most log2 of the context many times. Three things had to survive
+it:
+
+- **the layout.** It would be easy to write the new V surface out by hand in the
+  growth path and easy to get it wrong. Instead the repack walks the FLOAT V
+  cache -- the source of truth, which both paths write -- and hands each
+  position to the same `charsiu_fp16_pack_vcol` the append path uses. There is
+  still exactly one copy of that layout in the file.
+- **the zeros.** The values matmul is legal only because the probabilities past
+  the last token are zero. Those live in a scratch whose rows are `kv` apart, so
+  a changed `kv` reinterprets every byte of it. It is re-zeroed on every rung --
+  a memset, not a reallocation, because `mmax * kv` is `5120 * 32` on every rung
+  and the size does not change.
+- **the refusal.** `attn_npu_layer` now refuses a T its surface does not cover.
+  Falling back to the CPU is always safe, because the float cache is written
+  either way; a stale surface is a wrong answer.
+
+### And the values kernel was four positions wide
+
+`attn_axpy4` is deliberately not an FMA -- `vmulq`, a barrier, `vaddq` -- so it
+rounds twice, as the scalar reference does. That stays. What was free was the
+WIDTH: per four output floats the loop does four multiplies, four adds, four V
+loads and one load and store of the output, so it is the output traffic that
+bounds it, and eight positions a call halves that per multiply. The additions
+still go a0, a1, a2 in order; what disappears is a store and a reload of a
+float32 in between, and a float32 that goes to memory and comes back is the same
+float32. `tests/axpy8` checks one eight wide call against two four wide ones
+over 520 shapes and finds no case differing in a single bit.
+
+## Two hashes that agreed for the wrong reason
+
+The onechunk knob had passed `board_text_all.sh` on all nine architectures, so
+the next step was to make it the default. Two rounds nearly did it on evidence
+that was not evidence.
+
+**The first**: eight of those nine prompts are 86 to 88 tokens, which is above
+the chunk of 80 and below the ceiling, so the knob engaged. The ninth --
+Llama-3.2-1B -- runs a 64 token prompt. `n_ids > chunk` is false at 64, the knob
+did nothing, and its "text identical" said only that the code without the knob
+still works.
+
+So a round went out with a 100 number prompt, three arms, and the token loop as
+the reference. All three hashes matched. They matched because `seq 1 100`
+tokenises to about 200, which is over Llama's 160 ceiling, so `n_ids <= cap` was
+false and the knob did nothing again. **The round printed the widths beside the
+hash and the widths said `2x80+1x40`** -- which is what a chunk of 80 does, and
+not what one chunk looks like.
+
+**The second**: two of that round's three models produced
+`d41d8cd98f00b204e9800998ecf8427e` in every arm. That is the md5 of the empty
+string. `/opt/charsiu/models` holds three models and the rest live in
+`~/.charsiu/models`, so those runs found no file, printed nothing, and hashed
+nothing -- identically, in all three arms.
+
+A missing model reads as "text identical" unless something checks that the model
+ran. A knob that does not engage reads as "text identical" unless something
+checks that it engaged. Both are the same failure as the instruments corrected
+the day before: **a true statement about something other than what the label
+says**, and in both cases the thing that caught it was a second line printed
+beside the first.
+
+The prompt that actually engages it is 45 numbers, 91 tokens, and the widths it
+currently runs are `1x80+1x6+1x4` -- a chunk of six and a chunk of four, each
+paying a fence, a pack and a read on every tensor of every layer.
+
+### And the rule has four points
+
+With the paths fixed -- `/opt/charsiu/models` holds three models and the rest
+live in `~/.charsiu/models`, which is what produced the empty hashes -- the two
+missing head widths ran:
+
+```
+                              CPU attn   NPU attn   whole prefill
+   hd 256  gemma-3-1b           6.29       1.50      12.43 -> 7.85   -37%
+   hd 128  Qwen3-0.6B           8.13       5.51      13.15 -> 11.34  -14%
+   hd  64  Llama-3.2-1B         2.16       3.72      a loss
+   hd  64  SmolLM2-135M         2.59       3.13      a loss
+```
+
+gemma-3's CPU arm repeats to 0.9% either side of the NPU one, so the 76% is not
+weather. Monotone in head_dim, with a mechanism that does not need fitting: a
+wider head is a wider matmul and this hardware wants width. `CHARSIU_ATTN_NPU=
+auto` puts the crossover at 128.
+
+**It is still off by default, and not because of the clock.** Everything else
+turned on today -- the pair read, the eight wide values, the one chunk prompt --
+shipped on a text hash that did not move. This one computes attention in fp16
+where the CPU computes it in fp32, so the answer can differ. That is a decision
+about the output, not about the speed, and it is not this file's to make.
+
+## What this table can and cannot say
+
+`board_vendor.sh` has warned since it was written that one reading of its TTFT
+column has a large spread. Today put numbers on that. The same build, the same
+governor, minutes apart:
+
+```
+   Qwen3 TTFT     721   924   729   707..784
+   Gemma4 TTFT   2133  2182  2185  2325  2408  2707  ...and 3221 inside one arm
+   Phi3 TTFT     3155  3149  3004..3167
+   TinyLLAMA      965   987   915..1033
+```
+
+Phi-3.5 repeats to 0.2% and TinyLLAMA to 2%. **Qwen3 swings 27% and Gemma4
+swings 51%.** So a change worth 5% can be attributed on two of these four models
+and cannot be attributed on the other two at any repeat count this harness runs.
+
+That is not a reason to drop them from the table -- they are the vendor's rows
+and the comparison is the point -- but it is a reason to stop reading their
+column as a measurement of anything charsiu did. Every attribution in this file
+today comes from either the stage table, which compares inside one run, or from
+Phi-3.5 and TinyLLAMA.
+
+And the decode column has its own shape: nearly every arm shows one low outlier
+(Phi-3.5 reads 4.66 and 6.84 in the same three runs), which is why the script
+reports the best and prints the range beside it.
+
+## Half a rule, shipped as a whole one
+
+`CHARSIU_ATTN_NPU=auto` went in on four points that were monotone in head_dim
+and had a mechanism that needed no fitting. It was measured on the vendor's own
+protocol the same hour and it lost:
+
+```
+                   shipping   auto    head_dim   the gate
+   Qwen3              707      954      128       ON    decode 24.63 -> 20.84
+   TinyLLAMA          915      919       64       off   unchanged
+   Phi3              3004     3019       96       off   unchanged
+   Gemma4            2408     2527     >=128      ON    decode  8.70 ->  7.57
+```
+
+The gate is not the error -- it fires on exactly the two models it was meant to
+and the two it skips do not move at all, which is as clean a control as this
+harness gives. The error is that **every number the rule was built on came from
+a 916 token prompt**, and the vendor's protocol is 110 tokens and 64 generated.
+
+**The decode column is what says so.** A prefill change cannot touch decode, so
+decode falling 15% is not the attention being slower -- it is something else
+being paid per token. It is: the decode path appends to the fp16 mirror
+deliberately, because a prompt continued after a generation would otherwise read
+a cache with a hole in it. A generation pays to fill a mirror it never reads.
+And the other hidden cost is the mirror's construction itself, which on 110
+positions outweighs what fp16 attention saves.
+
+So the envelope is a wide head AND a long prompt. Where the second one starts is
+not known: 110 loses, 916 wins, and nothing has been run in between. **A
+threshold placed between two points eight times apart is the chunk formula
+again**, which this file recorded going wrong this morning, so `auto` is
+withdrawn rather than guessed at. The knob stays and the note above it now says
+where it pays.
+
+## Where fp16 attention starts paying, and a rule that has to be tested where it hurts
+
+`auto` was withdrawn because 110 tokens lost and 916 won and nothing had been
+run in between. This is in between.
+
+```
+   prompt tok      39     135     279     532     916
+   Qwen3   CPU    335     915    2168    4896   11347   ms
+   hd 128  NPU    647    1441    2780    5496   10476
+           ratio 1.93    1.57    1.28    1.12    0.92   <- crosses in here
+
+   prompt tok      41     137     281     534     918
+   gemma-3 CPU    541    1112    2445    5648   11400   ms
+   hd 256  NPU    472    1170    2242    4090    7261
+           ratio 0.87    1.05    0.92    0.72    0.64
+```
+
+Qwen3 is monotone and crosses between 532 and 916. gemma-3 wins nearly
+everywhere and by 36% at the top; its 137 point is the one that goes the wrong
+way, and it is also where the absolute times are smallest.
+
+### One quantity separates eleven of twelve arms
+
+Across every fp16 attention arm measured -- four models, five lengths --
+`head_dim * prompt_tokens` puts every loss at or below 68096 and every win at or
+above 71936:
+
+```
+   qwen3   128 *  532 =  68096   loss      <- the largest loss
+   gemma3  256 *  281 =  71936   WIN       <- the smallest win
+   qwen3   128 *  916 = 117248   WIN
+   llama    64 *  512 =  32768   loss
+   smol     64 *  916 =  58624   loss
+```
+
+The exception is gemma-3 at 41 tokens, product 10496, which won -- and is the
+smallest and noisiest measurement on the list.
+
+**That is a fitted threshold, and this file has recorded two of those going wrong
+today.** So it does not ship on the fit. The two candidate rules disagree
+somewhere specific, and that is what to run: **head_dim alone says Llama, at 64,
+never wins at any length. The product says Llama wins past about 1100 tokens.**
+One of those is about to be false.
+
+### And the product rule is dead
+
+Llama, head_dim 64, at 1101 tokens. `64 * 1101 = 70464`, which is above the
+threshold the fit produced, so the product rule predicted a win:
+
+```
+   llama, 1101 tok    CPU 10852 ms    NPU 13782 ms     27% WORSE
+                      CPU 10978 ms    (the control, 1.2% apart)
+                      attention 4.67           6.79
+```
+
+Not marginal, and not weather: the two CPU arms are 1.2% apart and the NPU one
+is 27% outside them. **A quantity that separated eleven of twelve arms was wrong
+the first time it was asked a question it had not already been fitted to.**
+
+That is the whole reason to test a fitted rule where it CONTRADICTS the
+alternative rather than where it agrees. Eleven points of agreement cost nothing
+to collect and bought nothing; one point of disagreement settled it in a single
+round.
+
+And 1701 tokens says the same thing again -- product 108864, further above the
+threshold than any win in the fitted set, and the NPU arm is 22% behind (21409
+against 26164, attention 7.34 against 9.82). The rule is dead twice over.
+
+head_dim survives: 64 does not win at any length tried, 39 to 1701 on Llama and
+916 on SmolLM2. What it
+still does not have is the length condition, which is real -- Qwen3 at 128 loses
+below about 700 tokens and wins at 916 -- and which is therefore per head width
+rather than a single number. Two thresholds fitted on two models is not a rule
+either, so the knob stays a knob and this table is what a deployment reads
+instead.

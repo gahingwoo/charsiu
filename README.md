@@ -33,19 +33,27 @@ call:
 ```
                      decode tok/s            time to first token, ms
                      charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          24.88    24.85           717      469
-  TinyLLAMA 1.1B      20.67    19.71           960      544
-  Phi3 3.8B            6.88     6.58          3127     1829
-  Gemma4 E2B           8.71     9.23          2295     1219
+  Qwen3 0.6B          24.63    24.85           707      469
+  TinyLLAMA 1.1B      20.62    19.71           915      544
+  Phi3 3.8B            6.84     6.58          3004     1829
+  Gemma4 E2B           8.70     9.23          2408     1219
 ```
 
-Time to first token came down 17 to 21% on 2026-09-06, which took the gap from
-1.85-2.40x to 1.53-1.88x. None of it was new hardware work: the batched
-prompt's elementwise stages, its softmax and its activation packer went on the
-thread pool, the pooled read's size threshold came down from 262144 elements to
-32768, and the calling thread and the pool workers were given separate core
-sets -- decode runs on the caller and wants an A72, the prompt runs on the pool
-and wants all eight. `docs/lab-notebook.md` has the arms for each.
+Time to first token came down through 2026-09-06, from a gap of 1.85-2.40x to
+1.51-1.68x on the three rows that hold still. None of it was new hardware work:
+the batched prompt's elementwise stages, its softmax and its activation packer
+went on the thread pool, the pooled read's threshold came down from 262144
+elements to 32768, the calling thread and the pool workers were given separate
+core sets, the accumulator read back takes two rows off one cache line, the
+attention values kernel does eight positions a call, and a prompt that already
+fits under the hardware's ceiling stops being cut into a chunk and a remainder.
+Every one of those is bit exact: the text hash does not move.
+
+⚠ **Gemma4's column is not quotable at this repeat count.** The same build,
+minutes apart, has read 2133, 2182, 2185, 2325, 2408 and 2707 ms, and 3221
+inside a single three-run arm. Phi-3.5 repeats to 0.2% and TinyLLAMA to 2%, so
+those two are where a change of a few percent can be attributed at all.
+`docs/lab-notebook.md` has the arms for each.
 
 The text stays identical on all nine models. charsiu reads the rail and the clock
 out of sysfs and overlaps the cores only inside the vendor's envelope, and its NPU

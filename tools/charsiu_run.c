@@ -123,6 +123,20 @@ static int prefill_width(int rem, int cap)
  * more, so they are counted by width and printed, and the line cannot be read
  * as one number.
  */
+/* CHARSIU_PREFILL_ONECHUNK=0 turns off running a prompt that already fits
+ * under the ceiling as a single chunk. See the note at the use. */
+static int onechunk_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_PREFILL_ONECHUNK");
+
+		v = e ? atoi(e) != 0 : 1;
+	}
+	return v;
+}
+
 struct prefill_widths {
 	int w[6];
 	int n[6];
@@ -849,6 +863,51 @@ int main(int argc, char **argv)
 					"cross this model's surface ceiling; "
 					"capped to %d\n", chunk, cap);
 			chunk = cap;
+		}
+		/*
+		 * ⚠ ONE CHUNK WHEN THE WHOLE PROMPT FITS IN ONE, and this is
+		 * NOT the derived default that shipped for twenty minutes.
+		 *
+		 * That one asked "how wide may a chunk be" and answered it from
+		 * a formula, and SmolLM2 came back 77% slower. This asks a
+		 * different question: given that 128 tokens are legal in a
+		 * single chunk on this model, is there any reason to run them
+		 * as 80 and then 48? A boundary costs a fence, a pack and a
+		 * read on every tensor of every layer, and the last chunk pays
+		 * all of it for 48 rows.
+		 *
+		 * It cannot cross the ceiling -- it is clamped to the same cap
+		 * -- and it never NARROWS a chunk, so no configuration that
+		 * works today can be made slower by a smaller width. The
+		 * vendor's own protocol is a 128 token prompt, which is exactly
+		 * the case it changes.
+		 *
+		 * ⚠ ON. TTFT fell on all four vendor-protocol models -- 5.1%
+		 * and 5.7% on Phi-3.5 and TinyLLAMA, the two whose baseline
+		 * repeats, and further on the two whose baseline swings 16 to
+		 * 27% between identical runs -- with the DECODE column
+		 * unchanged in both arms, which is the control: a chunking
+		 * change cannot touch decode, and if it had moved, the arm
+		 * would have been measuring the board.
+		 *
+		 * ⚠⚠ AND IT IS VERIFIED WHERE IT ENGAGES, WHICH TOOK THREE
+		 * TRIES. board_text_all.sh cleared eight architectures at 86 to
+		 * 88 tokens; the ninth runs a 64 token prompt, below the chunk,
+		 * so the knob did nothing and its matching hash said nothing. A
+		 * round with a 100 number prompt then matched on all three arms
+		 * because that tokenises to about 200, over the 160 ceiling --
+		 * and the widths line printed beside the hash said `2x80+1x40`.
+		 * At 91 tokens Llama runs `1x90`, TinyLLAMA and gemma-4 run
+		 * `1x128`, and all three hash identically to the token loop.
+		 *
+		 * CHARSIU_PREFILL_ONECHUNK=0 is the control.
+		 */
+		if (onechunk_on() && n_ids > chunk && n_ids <= cap) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: the whole prompt (%d) "
+					"fits under this model's ceiling (%d), "
+					"so it goes in one chunk\n", n_ids, cap);
+			chunk = n_ids;
 		}
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */

@@ -304,7 +304,21 @@ static int pool_dynamic(void)
  * found were the previous job's, and rows were skipped and repeated -- the
  * host caught it as changed text on the first run.
  */
-static void pool_arm(uint64_t n)
+/*
+ * ⚠⚠ THE GRAIN IS NOT COSMETIC, AND read_rows2 FOUND THAT OUT BY LUCK.
+ *
+ * A callback that consumes rows in pairs -- two rows off one cache line -- can
+ * only do it when the range it is handed starts even and is even long. The
+ * dynamic chunk is n / (4 * threads), which at m = 80 with eight threads is 2
+ * and at m = 120 is 3. So the pair form applied at the default width, was
+ * measured there at 7.6% off the read, and would have gone silently inert at
+ * any width whose chunk came out odd. That is a measurement that depends on an
+ * unrelated division, which is not a measurement.
+ *
+ * `grain` rounds the chunk UP to a multiple of it. Callers that do not care
+ * pass 1 and get exactly what they got before.
+ */
+static void pool_arm(uint64_t n, unsigned grain)
 {
 	g_pool.nrows = n;
 	g_pool.next = 0;
@@ -312,6 +326,8 @@ static void pool_arm(uint64_t n)
 	g_pool.chunk = pool_dynamic()
 		     ? (n / (4u * (uint64_t)g_pool.n) > 0 ? n / (4u * (uint64_t)g_pool.n) : 1)
 		     : 0;
+	if (g_pool.chunk && grain > 1)
+		g_pool.chunk = ((g_pool.chunk + grain - 1) / grain) * grain;
 	g_pool.done = 0;
 }
 
@@ -608,7 +624,7 @@ static void pool_start(int nthreads)
  * itself.
  */
 static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
-		     uint64_t n)
+		     uint64_t n, unsigned grain)
 {
 	if (g_pool.n <= 1) {
 		fn(ctx, 0, n);
@@ -617,7 +633,7 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
-	pool_arm(n);
+	pool_arm(n, grain);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -629,7 +645,18 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 			  void *ctx, uint64_t n)
 {
-	pool_run(fn, ctx, n);
+	pool_run(fn, ctx, n, 1);
+}
+
+/*
+ * The same thing for a callback that works in blocks of `grain` rows. Every
+ * range it is handed then starts on a multiple of the grain and is a multiple
+ * of it long, except the last, which is whatever the total leaves over.
+ */
+void charsiu_parallel_for_grain(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
+				void *ctx, uint64_t n, unsigned grain)
+{
+	pool_run(fn, ctx, n, grain ? grain : 1);
 }
 
 /*
@@ -2169,7 +2196,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
-	pool_arm(w->ne[1]);
+	pool_arm(w->ne[1], 1);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -3616,19 +3643,57 @@ void llama_stages_report(void)
 			charsiu_npu_batch_split(bmm_dev, &pk, &sb, &fn,
 						&rd, 0);
 			double ga, pc;
+			/*
+			 * ⚠ THE FIFTH SEGMENT, which bench_batch has printed
+			 * since it was written and this table never did. Qwen3
+			 * left 0.36 ms a row unaccounted here against Llama's
+			 * 0.04, and the difference is layer count: `prep` is
+			 * per call -- batch_bufs, the output buffer, the byte
+			 * of Y per n slice -- and 28 layers make more calls a
+			 * row than 16. A residue with a known name should not
+			 * be printed as a residue.
+			 */
+			double pr = charsiu_npu_batch_prep(bmm_dev, 0);
 
 			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
-			       "  read %.2f  unaccounted %.2f ms a row\n",
+			       "  read %.2f  prep %.2f  unaccounted %.2f "
+			       "ms a row\n",
 			       "of the entry:", pk / bstage_rows,
 			       sb / bstage_rows, fn / bstage_rows,
-			       rd / bstage_rows,
-			       (bmm_entry_ms - pk - sb - fn - rd)
+			       rd / bstage_rows, pr / bstage_rows,
+			       (bmm_entry_ms - pk - sb - fn - rd - pr)
 			       / bstage_rows);
 			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 0);
 			printf("  %-16s gather %.2f  packer %.2f  the rest"
 			       " %.2f ms a row\n", "of the pack:",
 			       ga / bstage_rows, pc / bstage_rows,
 			       (pk - ga - pc) / bstage_rows);
+			/*
+			 * ⚠ AND OF THE FENCE, when the probe was asked for.
+			 * prep_bo waits and then invalidates the whole output
+			 * buffer, so this row says how much of "fence" was the
+			 * hardware and how much was cache maintenance the read
+			 * back is usually blamed for. Silent when off: a zero
+			 * here would read as "the invalidate is free", which is
+			 * not what an unasked probe knows.
+			 */
+			{
+				double iv, gib;
+				unsigned nc;
+
+				charsiu_npu_batch_fence_split(bmm_dev, &iv,
+							      &gib, &nc, 0);
+				if (nc)
+					printf("  %-16s invalidate %.2f  the "
+					       "wait %.2f ms a row  (%.2f GiB "
+					       "over %u preps, %.2f GB/s)\n",
+					       "of the fence:",
+					       iv / bstage_rows,
+					       (fn - iv) / bstage_rows, gib, nc,
+					       iv > 0.0 ? gib * 1073741824.0
+							  / (iv * 1e6)
+						        : 0.0);
+			}
 		}
 	}
 	if (!stage_tok)
@@ -3758,6 +3823,77 @@ static inline void attn_dot4(const float *qh, const float *k0, const float *k1,
 		a3 += qh[i] * k3[i];
 	}
 	o[0] = a0; o[1] = a1; o[2] = a2; o[3] = a3;
+}
+
+/*
+ * ⚠⚠ EIGHT POSITIONS, AND IT IS BIT EXACT WITH THE FOUR WIDE FORM.
+ *
+ * The values half is 47% of attention on Llama and attention is 30% of a
+ * prefilled row, and this loop is not FMA bound: per four output floats it does
+ * four multiplies, four adds, four V loads and ONE LOAD AND STORE OF THE
+ * OUTPUT. Widening the group halves that output traffic per multiply.
+ *
+ * ⚠ AND IT CHANGES NO ARITHMETIC. The additions still happen in the order a0,
+ * a1, a2 ... -- what goes away is a store and a reload of a float32 between the
+ * fourth and the fifth, and a float32 that goes to memory and comes back is the
+ * same float32. The multiplies keep the barrier that stops the compiler
+ * contracting them into an fmla, for the same reason attn_axpy4 has it: an fmla
+ * rounds once where this rounds twice, and the board has measured that
+ * difference at 227529 elements in a million.
+ *
+ * CHARSIU_ATTN_AXPY8=0 is the control.
+ */
+static inline void attn_axpy8(float *out, const float *a, const float *v,
+			      size_t kstride, uint32_t hd)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain()) {
+		const float *v0 = v, *v1 = v + kstride, *v2 = v + 2 * kstride;
+		const float *v3 = v + 3 * kstride, *v4 = v + 4 * kstride;
+		const float *v5 = v + 5 * kstride, *v6 = v + 6 * kstride;
+		const float *v7 = v + 7 * kstride;
+		float32x4_t a0 = vdupq_n_f32(a[0]), a1 = vdupq_n_f32(a[1]);
+		float32x4_t a2 = vdupq_n_f32(a[2]), a3 = vdupq_n_f32(a[3]);
+		float32x4_t a4 = vdupq_n_f32(a[4]), a5 = vdupq_n_f32(a[5]);
+		float32x4_t a6 = vdupq_n_f32(a[6]), a7 = vdupq_n_f32(a[7]);
+
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t o = vld1q_f32(out + i), p;
+
+#define AX(A, V)                                        			p = vmulq_f32(A, vld1q_f32((V) + i)); 			__asm__("" : "+w"(p));                			o = vaddq_f32(o, p)
+			AX(a0, v0); AX(a1, v1); AX(a2, v2); AX(a3, v3);
+			AX(a4, v4); AX(a5, v5); AX(a6, v6); AX(a7, v7);
+#undef AX
+			vst1q_f32(out + i, o);
+		}
+	}
+#endif
+	for (; i < hd; i++) {
+		float o = out[i];
+		unsigned q;
+
+		for (q = 0; q < 8; q++)
+			o += a[q] * v[(size_t)q * kstride + i];
+		out[i] = o;
+	}
+}
+
+static int attn_axpy8_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_AXPY8");
+
+		/* ⚠ ON. Llama's attention 2.34 -> 2.16 and Qwen3's 8.13 ->
+		 * 7.60, with both models' text md5 unchanged on the board and
+		 * tests/axpy8 finding no shape out of 520 that differs in a
+		 * bit. CHARSIU_ATTN_AXPY8=0 is the control. */
+		v = e ? atoi(e) != 0 : 1;
+	}
+	return v;
 }
 
 static inline void attn_axpy4(float *out, const float *a, const float *v0,
@@ -4139,9 +4275,12 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 				       hd * sizeof(float));
 			}
 			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
-			for (int t = tlo_first; t <= tmax; t += 4) {
+			{
+			int step = attn_axpy8_on() ? 8 : 4;
+
+			for (int t = tlo_first; t <= tmax; t += step) {
 				const float *v0 = vbase + (size_t)t * kstride;
-				int quad = t + 3 <= tmax;
+				int wide = t + step - 1 <= tmax;
 
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
@@ -4150,19 +4289,34 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 					float *out = j->out + (size_t)r * qstride + h * hd;
 					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
-					if (quad && t >= tlo && t + 3 <= pos) {
-						attn_axpy4(out, sr + t, v0, v0 + kstride,
-							   v0 + 2 * kstride, v0 + 3 * kstride,
-							   hd);
+					/*
+					 * ⚠ THE PARTIAL WINDOW GOES ONE
+					 * POSITION AT A TIME AND THAT IS NOT A
+					 * DIFFERENT ANSWER: every form here
+					 * adds a0, a1, a2 ... in that order,
+					 * and the only thing the wide forms
+					 * remove is a store and a reload of a
+					 * float32 in between.
+					 */
+					if (wide && t >= tlo && t + step - 1 <= pos) {
+						if (step == 8)
+							attn_axpy8(out, sr + t, v0,
+								   kstride, hd);
+						else
+							attn_axpy4(out, sr + t, v0,
+								   v0 + kstride,
+								   v0 + 2 * kstride,
+								   v0 + 3 * kstride, hd);
 						continue;
 					}
-					for (int u = t; u < t + 4 && u <= tmax; u++) {
+					for (int u = t; u < t + step && u <= tmax; u++) {
 						if (u < tlo || u > pos)
 							continue;
 						attn_axpy(out, sr[u],
 							  vbase + (size_t)u * kstride, hd);
 					}
 				}
+			}
 			}
 			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
 		}
@@ -4214,6 +4368,22 @@ struct attn_npu {
 	struct charsiu_fp16 *f;
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
 	unsigned n_layer, nkv, hd, nk, kv, mmax;
+	/*
+	 * ⚠⚠ kv IS THE V SURFACE'S REDUCTION EXTENT AND IT USED TO BE THE
+	 * CONTEXT LENGTH FOR THE LIFE OF THE RUN.
+	 *
+	 * The values matmul runs at k = kv whatever the prompt has reached, so
+	 * a 2048 context with 916 live positions fetched 2.2x the surface it
+	 * needed on EVERY call -- and, because the input surface ceiling is
+	 * (k/32)*m <= 5120, it also halved the rows a pass. The board measured
+	 * both: Qwen3's fp16 attention is 7.61 ms a row at -c 2048 and 5.97 at
+	 * -c 1024, against a CPU arm that does not move (8.46, 8.39).
+	 *
+	 * So kv now GROWS, on a doubling ladder, up to kvmax. Every growth
+	 * repacks the live positions, which is why the ladder doubles: at most
+	 * log2 of the context many repacks in a whole run.
+	 */
+	unsigned kvmax;
 	unsigned char *dirty;               /* a layer with unflushed appends */
 	float *sc;                          /* [H][m][kv] probabilities */
 	size_t sc_cells;
@@ -4221,14 +4391,69 @@ struct attn_npu {
 	int off;                            /* tried and refused */
 };
 
-static int attn_npu_want(void)
+/*
+ * ⚠⚠ OFF, auto, OR ON -- AND OFF IS THE DEFAULT FOR A REASON THAT IS NOT SPEED.
+ *
+ * fp16 attention on the NPU is now a large win on a wide head and a loss on a
+ * narrow one, and the board has four points, monotone in head_dim:
+ *
+ *   hd 256  gemma-3-1b   attention 6.29 -> 1.50, the whole prefill -37%
+ *   hd 128  Qwen3-0.6B   attention 8.13 -> 5.51, the whole prefill -14%
+ *   hd  64  Llama-3.2-1B attention 2.16 -> 3.72, a LOSS
+ *   hd  64  SmolLM2-135M attention 2.59 -> 3.13, a LOSS
+ *
+ * A wider head is a wider matmul and this hardware wants width.
+ *
+ * ⚠⚠ AND THAT IS ONLY HALF A RULE, WHICH `auto` SHIPPED AS THOUGH IT WERE THE
+ * WHOLE ONE. Every number above is a 916 or 918 token prompt. On the vendor's
+ * protocol -- a 110 token prompt and 64 generated tokens -- the same gate turns
+ * the same models ON and LOSES:
+ *
+ *   Qwen3   TTFT 707 -> 954,  decode 24.63 -> 20.84
+ *   Gemma4  TTFT 2408 -> 2527, decode 8.70 -> 7.57
+ *   TinyLLAMA and Phi-3.5, which the gate leaves off, do not move at all
+ *
+ * Two costs the long prompt hid. The mirror has to be BUILT -- every position
+ * of every layer packed into the fp16 surfaces -- and on 110 positions that
+ * outweighs what the attention saves. And the DECODE path appends to the mirror
+ * too (see the call in llama_forward: a prompt continued after a generation
+ * would otherwise read a cache with a hole in it), so a generation pays to fill
+ * a mirror it never reads.
+ *
+ * So the envelope is a WIDE HEAD AND A LONG PROMPT, and where the second one
+ * starts is not known: 110 loses and 916 wins and nothing has been run in
+ * between. `auto` is withdrawn until it is, because a threshold placed between
+ * two points eight times apart is the chunk formula again.
+ *
+ * ⚠ AND IT IS OFF BY DEFAULT FOR A SEPARATE REASON: it is not bit exact.
+ * Everything else turned on in this tree today shipped on a hash that did not
+ * move. This computes attention in fp16 where the CPU computes it in fp32, so
+ * the text can differ, and that is a call about the answer, not the clock.
+ */
+static int attn_npu_want_for(unsigned head_dim)
 {
-	static int v = -1;
+	static int v = -2;
 
-	if (v < 0)
-		v = getenv("CHARSIU_ATTN_NPU") != NULL;
+	if (v == -2) {
+		const char *e = getenv("CHARSIU_ATTN_NPU");
+
+		if (!e || !*e)
+			v = 0;
+		else if (!strcmp(e, "auto")) {
+			fprintf(stderr, "charsiu: CHARSIU_ATTN_NPU=auto is "
+				"withdrawn -- head_dim >= 128 is only half the "
+				"rule and the other half (how long a prompt) "
+				"has not been measured; attention stays on the "
+				"CPU\n");
+			v = 0;
+		} else
+			v = atoi(e) != 0;
+	}
+	(void)head_dim;
 	return v;
 }
+
+
 
 static void attn_npu_free(struct attn_npu *a)
 {
@@ -4269,7 +4494,12 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 
 	if (s->anpu)
 		return s->anpu->off ? NULL : s->anpu;
-	if (!attn_npu_want() || !m)
+	/* ⚠ the model FIRST, because `auto` is a decision about its head_dim
+	 * and there is nothing to decide without it */
+	if (!m)
+		return NULL;
+	if (!attn_npu_want_for(m->head_dim ? m->head_dim
+					   : m->n_embd / m->n_head))
 		return NULL;
 	a = calloc(1, sizeof(*a));
 	if (!a)
@@ -4284,7 +4514,9 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->nkv = m->n_head_kv;
 	a->n_layer = m->n_layer;
 	a->nk = ((unsigned)s->n_ctx + 15u) & ~15u;
-	a->kv = ((unsigned)s->n_ctx + 31u) & ~31u;
+	a->kvmax = ((unsigned)s->n_ctx + 31u) & ~31u;
+	/* the smallest rung the unit will take; attn_npu_fit climbs from here */
+	a->kv = a->kvmax < 32u ? a->kvmax : 32u;
 	/*
 	 * ⚠ THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
 	 * (k/32)*m up to 5120 -- measured, and the vendor's own file never
@@ -4294,8 +4526,11 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
 	if (hd < 32 || a->nk < 32 || a->kv < 32 || !a->nkv || !a->mmax)
 		return NULL;
+	/* ⚠ the CEILING is what the memory cap has to be judged against: kv
+	 * starts at one rung but a long enough run climbs to kvmax, and a cap
+	 * that only checked the first rung would refuse later, mid answer */
 	mb = (size_t)a->n_layer * a->nkv * ((size_t)hd * a->nk
-					    + (size_t)a->kv * hd) * 2;
+					    + (size_t)a->kvmax * hd) * 2;
 	{
 		const char *e = getenv("CHARSIU_ATTN_NPU_MB");
 		size_t cap = (size_t)(e ? atoi(e) : 2048) * 1024 * 1024;
@@ -4332,6 +4567,100 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 }
 
 /*
+ * One position of the float V cache, addressed the way attn_block_heads and
+ * attn_heads address it. `a->hd` IS the cache's stride hdmax -- attn_npu_get
+ * builds it from the same expression llama_forward does and refuses any layer
+ * whose head differs -- so this needs no new field to stay in step with them.
+ */
+static const float *attn_vcache_at(struct llama_state *s, unsigned l,
+				   unsigned kh, unsigned hd, unsigned pos)
+{
+	if (kv_posmajor()) {
+		size_t kvdim = (size_t)s->anpu->nkv * hd;
+
+		return s->vcache + (size_t)l * s->n_ctx * kvdim
+		     + (size_t)kh * hd + (size_t)pos * kvdim;
+	}
+	return s->vcache
+	     + ((size_t)l * s->anpu->nkv + kh) * s->n_ctx * hd
+	     + (size_t)pos * hd;
+}
+
+/*
+ * ⚠⚠ GROW THE V SURFACE TO COVER `want` POSITIONS, REPACKING WHAT IS LIVE.
+ *
+ * A GROUP offset depends on the reduction extent, so every element of the V
+ * surface moves when kv changes and there is no incremental form of this. What
+ * makes it affordable is the LADDER: kv doubles, so a run reaches the context
+ * length in at most log2 of it many repacks, and each one costs a pass over the
+ * positions that already exist.
+ *
+ * ⚠ THE REPACK CALLS THE SAME PACKER THE APPEND DOES. It would be easy to
+ * write the new layout out by hand here and easy to get it wrong; instead this
+ * walks the float V cache -- which is the source of truth and is written on
+ * every path -- and hands each position to charsiu_fp16_pack_vcol exactly as
+ * attn_npu_append does. There is one layout in this file and this is not a
+ * second copy of it.
+ *
+ * ⚠ AND THE PROBABILITY SCRATCH IS RE-ZEROED. Its rows are kv apart, so a
+ * changed kv reinterprets every byte in it; the zeros past the last token are
+ * what makes the values matmul legal (see the note in attn_npu_layer), and a
+ * stale row boundary would put the previous rung's numbers where those zeros
+ * have to be. Its SIZE does not change -- mmax * kv is 5120 * 32 whatever rung
+ * this is on -- so this is a memset and not a reallocation.
+ *
+ * Returns 0 if kv now covers `want`, -1 if it cannot.
+ */
+static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
+			unsigned want)
+{
+	unsigned kv = a->kv, i, l, kh, p;
+
+	if (want <= a->kv)
+		return 0;
+	if (want > a->kvmax)
+		return -1;
+	while (kv < want)
+		kv *= 2;
+	if (kv > a->kvmax)
+		kv = a->kvmax;
+
+	for (i = 0; i < a->n_layer * a->nkv; i++) {
+		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->f, kv, a->hd);
+
+		if (!w) {
+			fprintf(stderr, "charsiu: the fp16 V surface would not "
+				"grow to %u positions\n", kv);
+			return -1;
+		}
+		charsiu_fp16_w_free(a->f, a->vb[i]);
+		a->vb[i] = w;
+	}
+	a->kv = kv;
+	a->mmax = 5120u / (kv / 32u);
+	if (!a->mmax)
+		return -1;
+	if (a->sc)
+		memset(a->sc, 0, a->sc_cells * sizeof(*a->sc));
+
+	/* every position that already exists, through the packer the append
+	 * path uses, out of the float cache that both paths write */
+	for (l = 0; l < a->n_layer; l++) {
+		for (kh = 0; kh < a->nkv; kh++) {
+			uint16_t *map = charsiu_fp16_w_map(
+					a->vb[l * a->nkv + kh]);
+
+			for (p = 0; p + 1 < want; p++)
+				charsiu_fp16_pack_vcol(map, a->kv, a->hd, p,
+					attn_vcache_at(s, l, kh, a->hd, p));
+		}
+		a->dirty[l] = 1;
+	}
+	charsiu_note("attention: the V surface grew", kv, a->mmax);
+	return 0;
+}
+
+/*
  * One position of one head, into both caches, where llama.c already writes the
  * float ones. The layouts are charsiu_fp16_pack_krow and _vcol; the runtime
  * does not restate them.
@@ -4343,9 +4672,14 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 	struct attn_npu *a = attn_npu_get(s);
 	unsigned i;
 
-	if (!a || pos < 0 || (unsigned)pos >= a->nk || (unsigned)pos >= a->kv)
+	if (!a || pos < 0 || (unsigned)pos >= a->nk)
 		return;
 	if (l >= a->n_layer || kh >= a->nkv || hd != a->hd)
+		return;
+	/* ⚠ the ladder is climbed HERE, where the first position that does not
+	 * fit arrives, and the repack covers [0, pos) -- which is every
+	 * position already in the float cache, this one not being in it yet */
+	if ((unsigned)pos >= a->kv && attn_npu_fit(s, a, (unsigned)pos + 1))
 		return;
 	i = l * a->nkv + kh;
 	charsiu_fp16_pack_krow(charsiu_fp16_w_map(a->kb[i]), a->hd, a->nk,
@@ -4377,6 +4711,15 @@ static int attn_npu_layer(struct attn_block_job *j)
 	 * that wedged both cores, so the unit refuses it and so does this: a
 	 * prompt shorter than 32 positions runs on the CPU and always will */
 	if (T == 0 || npad < 32 || npad > a->nk)
+		return -1;
+	/*
+	 * ⚠ AND THE V SURFACE HAS TO COVER T. The appends climb the ladder as
+	 * positions arrive, so it normally does; if a growth ever failed, the
+	 * appends returned without writing and this surface is stale. Falling
+	 * back to the CPU is always safe -- the float cache is written either
+	 * way -- and a stale surface is a wrong answer.
+	 */
+	if (T > a->kv)
 		return -1;
 
 	/*
@@ -6129,7 +6472,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			if (attn_pool()) {
 				charsiu_note("attention over the pool",
 					     cur_layer, (unsigned long)g_pool.n);
-				pool_run(attn_heads, &aj, m->n_head);
+				pool_run(attn_heads, &aj, m->n_head, 1);
 			} else {
 				attn_heads(&aj, 0, m->n_head);
 			}
