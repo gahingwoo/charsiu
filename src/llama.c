@@ -3825,6 +3825,73 @@ static inline void attn_dot4(const float *qh, const float *k0, const float *k1,
 	o[0] = a0; o[1] = a1; o[2] = a2; o[3] = a3;
 }
 
+/*
+ * ⚠⚠ EIGHT POSITIONS, AND IT IS BIT EXACT WITH THE FOUR WIDE FORM.
+ *
+ * The values half is 47% of attention on Llama and attention is 30% of a
+ * prefilled row, and this loop is not FMA bound: per four output floats it does
+ * four multiplies, four adds, four V loads and ONE LOAD AND STORE OF THE
+ * OUTPUT. Widening the group halves that output traffic per multiply.
+ *
+ * ⚠ AND IT CHANGES NO ARITHMETIC. The additions still happen in the order a0,
+ * a1, a2 ... -- what goes away is a store and a reload of a float32 between the
+ * fourth and the fifth, and a float32 that goes to memory and comes back is the
+ * same float32. The multiplies keep the barrier that stops the compiler
+ * contracting them into an fmla, for the same reason attn_axpy4 has it: an fmla
+ * rounds once where this rounds twice, and the board has measured that
+ * difference at 227529 elements in a million.
+ *
+ * CHARSIU_ATTN_AXPY8=0 is the control.
+ */
+static inline void attn_axpy8(float *out, const float *a, const float *v,
+			      size_t kstride, uint32_t hd)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain()) {
+		const float *v0 = v, *v1 = v + kstride, *v2 = v + 2 * kstride;
+		const float *v3 = v + 3 * kstride, *v4 = v + 4 * kstride;
+		const float *v5 = v + 5 * kstride, *v6 = v + 6 * kstride;
+		const float *v7 = v + 7 * kstride;
+		float32x4_t a0 = vdupq_n_f32(a[0]), a1 = vdupq_n_f32(a[1]);
+		float32x4_t a2 = vdupq_n_f32(a[2]), a3 = vdupq_n_f32(a[3]);
+		float32x4_t a4 = vdupq_n_f32(a[4]), a5 = vdupq_n_f32(a[5]);
+		float32x4_t a6 = vdupq_n_f32(a[6]), a7 = vdupq_n_f32(a[7]);
+
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t o = vld1q_f32(out + i), p;
+
+#define AX(A, V)                                        			p = vmulq_f32(A, vld1q_f32((V) + i)); 			__asm__("" : "+w"(p));                			o = vaddq_f32(o, p)
+			AX(a0, v0); AX(a1, v1); AX(a2, v2); AX(a3, v3);
+			AX(a4, v4); AX(a5, v5); AX(a6, v6); AX(a7, v7);
+#undef AX
+			vst1q_f32(out + i, o);
+		}
+	}
+#endif
+	for (; i < hd; i++) {
+		float o = out[i];
+		unsigned q;
+
+		for (q = 0; q < 8; q++)
+			o += a[q] * v[(size_t)q * kstride + i];
+		out[i] = o;
+	}
+}
+
+static int attn_axpy8_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_AXPY8");
+
+		v = e ? atoi(e) != 0 : 0;
+	}
+	return v;
+}
+
 static inline void attn_axpy4(float *out, const float *a, const float *v0,
 			      const float *v1, const float *v2, const float *v3,
 			      uint32_t hd)
@@ -4204,9 +4271,12 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 				       hd * sizeof(float));
 			}
 			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
-			for (int t = tlo_first; t <= tmax; t += 4) {
+			{
+			int step = attn_axpy8_on() ? 8 : 4;
+
+			for (int t = tlo_first; t <= tmax; t += step) {
 				const float *v0 = vbase + (size_t)t * kstride;
-				int quad = t + 3 <= tmax;
+				int wide = t + step - 1 <= tmax;
 
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
@@ -4215,19 +4285,34 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 					float *out = j->out + (size_t)r * qstride + h * hd;
 					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
-					if (quad && t >= tlo && t + 3 <= pos) {
-						attn_axpy4(out, sr + t, v0, v0 + kstride,
-							   v0 + 2 * kstride, v0 + 3 * kstride,
-							   hd);
+					/*
+					 * ⚠ THE PARTIAL WINDOW GOES ONE
+					 * POSITION AT A TIME AND THAT IS NOT A
+					 * DIFFERENT ANSWER: every form here
+					 * adds a0, a1, a2 ... in that order,
+					 * and the only thing the wide forms
+					 * remove is a store and a reload of a
+					 * float32 in between.
+					 */
+					if (wide && t >= tlo && t + step - 1 <= pos) {
+						if (step == 8)
+							attn_axpy8(out, sr + t, v0,
+								   kstride, hd);
+						else
+							attn_axpy4(out, sr + t, v0,
+								   v0 + kstride,
+								   v0 + 2 * kstride,
+								   v0 + 3 * kstride, hd);
 						continue;
 					}
-					for (int u = t; u < t + 4 && u <= tmax; u++) {
+					for (int u = t; u < t + step && u <= tmax; u++) {
 						if (u < tlo || u > pos)
 							continue;
 						attn_axpy(out, sr[u],
 							  vbase + (size_t)u * kstride, hd);
 					}
 				}
+			}
 			}
 			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
 		}
