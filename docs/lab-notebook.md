@@ -2976,3 +2976,73 @@ the wall was chased as a CBUF property for months and was a field layout; the
 0x4050 rule was fitted where two expressions are indistinguishable. **A
 comparison between one shape of theirs and one shape we do not run cannot close
 anything.**
+
+## 2026-09-06: two board results that were sitting on the card unread
+
+Both of these ran days ago, wrote their files, and were never quoted in a
+status line, a source comment or a memory. Reading them first was cheaper than
+any round, and one of them moves the target.
+
+### `CHARSIU_NPU_NMAX=4096` ran on 2026-08-29 and does not fix m = 8
+
+`board_w4_m8.sh` has three arms and all three are on the card
+(`~/charsiu-board/w4-m8-{baseline,onedev,nmax4096}.txt`, all 22:21 on 08-29).
+Only the onedev arm was ever written down.
+
+```
+  baseline   MISS blk.0.ffn_gate .. blk.13.ffn_up, k=2048 n=8192 row 0 of 8
+             row 0: 8192 of the first 8192 wanted values are somewhere in the
+             batch, 0 slots came back exactly zero
+  onedev     904 of 904, worst 0.00e+00
+  nmax4096   STILL MISSES.  blk.0.ffn_up onward, same k=2048 n=8192 row 0
+             row 0: 8189 of the first 8192 wanted values are somewhere in the
+             batch, 0 slots exactly zero
+```
+
+So the arm npudev.c still describes as open -- *"if m = 8 comes back exact the
+fault is the WIDTH"* -- has run and come back dirty. The width is not it, which
+is the same verdict the onedev arm reached from the other side, now with an
+independent second arm behind it.
+
+⚠ One caveat kept honestly: the MISS line prints the TENSOR's n, which is 8192
+either way, so the line itself cannot show that the knob engaged. What does show
+it is the miss set changing -- `blk.0.ffn_gate` and `blk.5.ffn_up` miss in the
+baseline and not under nmax4096 -- and the present-value count moving from
+8192 of 8192 to 8189. A knob that changed nothing would have reproduced the
+baseline exactly.
+
+### 🏁 The overlap at width 24 produced 21600 exact rows
+
+`board_overlap_slots.sh` -- the probe npudev.c calls *"what turns this into a
+mechanism"* -- ran on 2026-09-04 at 21:37, on phi3, width 24, KMAX 2048, 225
+tensors a pass:
+
+```
+  arm            rows            worst rel   MISS   speedup   fence
+  serial 1       5400 of 5400    1.61e-04    0      4.24x     409 ms
+  parallel 1     5400 of 5400    1.61e-04    0      5.69x     164 ms
+  parallel 2     5400 of 5400    1.61e-04    0      5.65x     165 ms
+  parallel 3     5400 of 5400    1.61e-04    0      5.82x     167 ms
+  parallel 4     5400 of 5400    1.61e-04    0      -         -
+```
+
+**Zero misses in four overlapped passes at the width whose TEXT is wrong 3 to
+15 times in 16.** And the overlap demonstrably engaged: the fence is what
+overlapping two cores is supposed to cut, and it collapses 409 -> 164 ms while
+the pass gets a third faster. That is a behavioural signature, not a flag being
+set -- which matters, because a knob that quietly does nothing has cost this
+tree a round before.
+
+The consequence is that the width-24 fault is **not in the batched matmul**,
+or is no longer there at all. npudev.c currently describes the whole residual
+as "two cores stepping on row 0 of a wide output"; that sentence is earned for
+m = 8 and m = 10, where the same probe DOES catch 33 misses, and it is not
+earned for 22 and 24, where this probe looks straight at the numbers and finds
+none.
+
+⛔ What this does NOT say: that the text is now right. The probe runs
+`--batch-probe`, which exercises the batched matmul against the m = 1 path
+tensor by tensor and never runs a norm, a rope table or a cache offset. A fault
+outside the matmul is invisible to it by construction. Round m65 asks the text
+question directly, with the KMAX 1024 cell as the positive control, because a
+round where nothing reproduces says the fault is gone rather than located.
