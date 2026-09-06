@@ -2547,3 +2547,61 @@ control. The discriminating form is a timing harness that varies n at fixed k
 and m on one dispatch, which `npu_gemm_test` is not (it checks correctness and
 does not time) and `charsiu_matmul` is not (one shape, once). That is the next
 tool, and it is a small one.
+
+## What one dispatch costs, asked without the model in the way
+
+The fence bucketed inside a forward pass said the time went with the output
+width, but its buckets mixed tensors with different K slice counts and charged a
+device a whole fence even where the deal gave it no slot. `npu_fence_scan` asks
+it with nothing else moving: one dispatch, one device, k and m fixed, n swept,
+and the buffers allocated ONCE at the widest point so the sweep cannot measure
+an allocation -- a mistake this tree has already made, at 652 ms in one round.
+
+```
+   k=1024 m=80      n    fence us   us per n
+                   256      334.8     1.308
+                   512      343.3     0.671
+                  1024      454.4     0.444
+                  2048      595.1     0.291
+                  4096      911.6     0.223
+                  8192     1543.2     0.188
+```
+
+The last column falls, so it is not paid by output channel alone. Every sweep
+fits `a + b * n` to a few percent:
+
+```
+      k      m     a (us)    b (us a channel)
+   1024     80      299          0.152
+   1024     16      118          0.091
+    512     80      192          0.141
+   2048     80      305          0.208
+```
+
+⚠ **I read the first table off a `tail` while the next sweep was printing and
+quoted the m = 16 row as m = 80**, which made the fixed cost 118 us instead of
+299. The controls are the only reason that got caught: an m that changes nothing
+would have been the strange result, not the ordinary one.
+
+And they say something the single sweep could not: **the fixed cost is not a
+per call constant.** It is 118 us at m = 16 and 299 at m = 80, so part of what
+looks fixed in n scales with the rows. Only part -- 5x the rows for 2.5x the
+cost.
+
+### What it is worth, which is the point of measuring it
+
+The batched path already submits ONE job per (tensor, device) with the K slices
+chained as tasks inside it, so the fixed cost is paid per tensor and not per
+slice. A device walks 7 tensors * 16 layers * 7 chunks = 784 jobs in Llama's 512
+token prompt, and 784 * 299 us is 234 ms against a measured fence of 701: **the
+per dispatch fixed cost is about a third of the fence, and 6.3% of the prompt.**
+
+There is one structural way to spend less of it: q, k and v read the SAME input,
+so the three could be one job instead of three. That is two jobs saved of every
+seven, 67 ms, **1.8% of the prompt.** Real, and small.
+
+So the fence is close to its floor for this dispatch structure, and that is the
+useful part of the answer: **after today the largest remaining item in a
+prefilled row is attention** -- 2.34 ms against read's 2.04 and the fence's 1.37
+-- and the thing that addresses attention is the fp16 path, which is measured,
+reopened, and waiting on a decision about fp16 rather than on more measurement.
