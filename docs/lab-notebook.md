@@ -3346,3 +3346,54 @@ it (`CHARSIU_NPU_NMAX`) and reads the bucket back.
 m = 8, where it changed nothing. **Its speed has never been measured.** It can
 also lose: splitting n doubles the dispatches for those tensors and re-reads
 the same activation twice.
+
+### m75/m76/m77: capping the output width, and two hypotheses it killed
+
+`CHARSIU_NPU_NMAX` had been run exactly once, as a correctness control for
+m = 8 where it changed nothing. Its speed had never been measured. Swept at
+each model's OWN default K slice, prompts of 81 and 113 tokens:
+
+```
+  nmax     gemma-3-1b            llama-3.2-1b          tinyllama-1.1b
+           prompt  wide bucket   prompt  wide bucket   prompt  wide bucket
+  default   912 ms  6912 0.29     616 ms  8192 0.33     884 ms  5632 0.33
+  6144      884     6144 0.40     634     6144 0.32     872     5632 0.33
+  4096      838     4096 0.53     630     4096 0.34     903     4096 0.32
+  3072      872     3072 0.44     637     3072 0.34     882     3072 0.32
+  2048      857     2048 0.54     627     (merged) 0.43 881     (merged)
+  1024      949     1024 0.57     683     1024 0.42     957     (merged)
+```
+
+**gemma-3-1b takes 8% off its prompt at nmax 4096 and the other two take
+nothing at any width.** gemma3's text was verified identical to its token loop
+at 8192, 4096 and 2048 in m75, and not one weight changes -- the model is
+ungrouped at every candidate K, so this is purely a dispatch shape.
+
+Two readings die here, and both were mine:
+
+- **not the weight bytes a dispatch.** llama at n = 4096 with a 1024 slice is
+  2.10 MB and runs 0.34; gemma3 at n = 4096 with a 1152 slice is 2.36 MB and
+  runs 0.53. More bytes, nearly double the rate.
+- **not n.** Same n, same prompt, same clock, two models, 0.34 against 0.53.
+
+⚠⚠ **And m76's llama result is not shippable, for a reason that is not
+performance.** `KMAX 2048 + NMAX 4096` took llama from 643 to 576 ms -- but
+`llama.c`'s auto-widener already refuses KMAX 2048 on llama, because k = 2048
+is divisible by both candidate widths so widening coarsens the quantiser from
+group 1024 to group 2048. gemma-3-1b (1152, 6912) is ungrouped at both and IS
+already at 2048; llama is not, and setting it by hand buys speed with weights.
+llama.c's own note says the counting prompt cannot see that: an earlier sweep
+called eight models identical on "1 2 3 ..." while two were degrading.
+
+So: a per-model 8%, a knob that is measured rather than guessed for the first
+time, and no rule -- **nothing ships from this until something explains why
+two dispatches of the same width and nearly the same weight bytes differ by
+1.6x.** The next suspect is the INPUT surface: at KMAX 1024 and m = 80 we fill
+`(1024/32) * 80 = 2560` of the 5120 the block allows, and every int4 dispatch
+in the vendor's file sits at exactly 5120. ⚠ Already dented, not dead: llama at
+KMAX 2048 (surf 5120) ran its wide bucket at 0.24, slower, not faster.
+
+⚠ A note on m77's hashes: `CHARSIU_STAGES=1` was in the shared environment, so
+the md5 covers a stage table full of timings and differs run to run. Those
+hashes say nothing. The text check that counts is m75's, which hashed a run
+with no stage output.
