@@ -3784,3 +3784,33 @@ The scalar loop was 110 and 62.5 ms; vectorised and pooled it is 39.0 and 21.5
 -- **2.8x** -- and the unnamed row collapses to under 1% on every model. The
 prompt moves less than the line does, which is honest and worth saying: some of
 the old cost was overlapping a stall elsewhere.
+
+### The scoreboard after the day, best of six
+
+Same kernel (`2ffc0913`), governor performance, `CHARSIU_BENCH_REPEAT=6`:
+
+```
+                 TTFT ours   theirs    gap      decode ours   theirs   ours/theirs
+  Qwen3 0.6B       653        469     1.39x      24.85        24.85      100.0%
+  TinyLLAMA 1.1B   890        544     1.64x      20.70        19.71      105.0%
+  Phi3 3.8B       2994       1829     1.64x       6.88         6.58      104.6%
+  Gemma4 E2B      2272       1219     1.86x       8.72         9.23       94.5%
+```
+
+Against yesterday evening's six-run reading, also on this kernel:
+
+```
+  Qwen3      687 -> 653   1.47 -> 1.39
+  TinyLLAMA  900 -> 890   1.65 -> 1.64
+  Phi3      3057 -> 2994  1.67 -> 1.64
+  Gemma4    2352 -> 2272  1.93 -> 1.86
+```
+
+⚠ **Those two readings are different sessions and the board drifts about 3%**,
+which is the size of most of that column. The numbers to trust are the paired
+in-session ones the two changes were measured with -- per-slice input buffers
+1.1 to 2.9%, the tail scale 1.4 to 3.0% on the models that run it -- and the
+scoreboard is consistent with them rather than evidence on its own.
+
+Qwen3's decode is now exactly the vendor's to three figures, and three of four
+models are at or above it.
