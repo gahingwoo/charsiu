@@ -850,6 +850,36 @@ int main(int argc, char **argv)
 					"capped to %d\n", chunk, cap);
 			chunk = cap;
 		}
+		/*
+		 * ⚠ ONE CHUNK WHEN THE WHOLE PROMPT FITS IN ONE, and this is
+		 * NOT the derived default that shipped for twenty minutes.
+		 *
+		 * That one asked "how wide may a chunk be" and answered it from
+		 * a formula, and SmolLM2 came back 77% slower. This asks a
+		 * different question: given that 128 tokens are legal in a
+		 * single chunk on this model, is there any reason to run them
+		 * as 80 and then 48? A boundary costs a fence, a pack and a
+		 * read on every tensor of every layer, and the last chunk pays
+		 * all of it for 48 rows.
+		 *
+		 * It cannot cross the ceiling -- it is clamped to the same cap
+		 * -- and it never NARROWS a chunk, so no configuration that
+		 * works today can be made slower by a smaller width. The
+		 * vendor's own protocol is a 128 token prompt, which is exactly
+		 * the case it changes.
+		 *
+		 * ⚠ OFF UNTIL A BOARD SAYS OTHERWISE. The last rule about chunk
+		 * widths was right about the mechanism and wrong about the
+		 * model, so this one is a knob until four models have run it.
+		 */
+		if (getenv("CHARSIU_PREFILL_ONECHUNK") && n_ids > chunk
+		    && n_ids <= cap) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: the whole prompt (%d) "
+					"fits under this model's ceiling (%d), "
+					"so it goes in one chunk\n", n_ids, cap);
+			chunk = n_ids;
+		}
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
