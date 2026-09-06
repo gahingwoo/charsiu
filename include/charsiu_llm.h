@@ -471,6 +471,10 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 			  float *final);
 
 /* what the batched calls spent, in ms: packing, submitting, the fence, reading */
+unsigned charsiu_npu_batch_fence_widths(struct charsiu_npu *g, unsigned *wide,
+					double *ms, double *gmac,
+					unsigned *calls, unsigned max,
+					int reset);
 void charsiu_npu_batch_fence_split(struct charsiu_npu *g, double *inval,
 				   double *gib, unsigned *calls, int reset);
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,

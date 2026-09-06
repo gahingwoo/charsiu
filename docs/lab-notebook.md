@@ -2503,3 +2503,47 @@ all, and length decides whether it does.** 256 pays from about 280 tokens, 128
 from somewhere between 532 and 916, and 64 has not paid at 3292. That is a table
 a deployment can read. It is not yet a gate the runtime can apply, and writing
 one from these points would be the third fitted rule in a day.
+
+## The fence is paid by output channel, not by arithmetic
+
+Three things the fence is not: the weight fetch (doubling the chunk halves the
+weight passes and it does not move), the two cores being serialised (worth 2.7x,
+and the default already takes it), and CPU idle exit (the PM QoS hold forbids
+it). What was left was a suspicion from three models -- each one's MACs a row
+over its fence gives 0.72 TMAC/s on Llama at 8192 wide, 0.37 on Qwen3 at 3072,
+0.20 on SmolLM2 at 1536 -- which looks like a fixed per dispatch cost.
+
+Three models that differ in layer count, K and KV heads is not a measurement of
+that, and a rule fitted across four models died earlier the same day. So the
+fence was bucketed by width and asked inside ONE pass of ONE model:
+
+```
+                  ms/call   GMAC/call   slots/call    ms per unit of n
+   llama  n  512    0.090      0.038        0.9          1.76e-4
+   llama  n 2048    0.271      0.307        1.8          1.32e-4
+   llama  n 8192    1.070      0.614        0.9          1.31e-4
+   qwen3  n 1024    0.135      0.070        0.8          1.32e-4
+   qwen3  n 2048    0.294      0.080        0.5          1.44e-4
+   qwen3  n 3072    0.423      0.120        0.5          1.38e-4
+```
+
+**The rate column is contaminated and is not quoted.** Slots a call runs from
+0.5 to 1.8, because a device is charged a whole fence even on the calls where
+the deal gave it no slot of that tensor, and because a tensor with eight K
+slices puts four on a device where one with two puts one. MACs a call therefore
+varies for reasons that have nothing to do with the width.
+
+`ms/call` does not have that problem -- it is a clock reading either way -- and
+divided by n it is **1.31 to 1.44e-4 across both models and five of the six
+widths**. The sixth is the smallest dispatch there is, and it is high, which is
+what a fixed cost looks like when the work is too small to hide it.
+
+So: **the fence is proportional to the output channels of a dispatch, about
+0.135 us each at m = 80, and not to its arithmetic.** That is why the apparent
+TMAC/s moved between models -- MACs scale with k as well and the time does not.
+
+⚠ It is still a fit over buckets whose composition this instrument does not
+control. The discriminating form is a timing harness that varies n at fixed k
+and m on one dispatch, which `npu_gemm_test` is not (it checks correctness and
+does not time) and `charsiu_matmul` is not (one shape, once). That is the next
+tool, and it is a small one.
