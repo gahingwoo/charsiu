@@ -2873,3 +2873,49 @@ vendor's compiler targets it exactly -- so it is probably not ours to move. What
 IS ours is the read's dependence on the slice count, which is a software choice
 about where partial sums are accumulated, and `read_fused` was one attempt at it
 that lost 2.3% on Llama at a profile measured before any of today's work.
+
+## Our register stream against theirs, at the shape they actually run
+
+`--find m=80` picks their canonical batched projection -- ic 2048, oc 1024,
+M 80, surf 5120, int4 -- and `emit_job` builds ours for the same shape. The
+comparison has to use `emit_job` and not `emit_dump`: `emit_dump` calls
+`charsiu_emit_matmul`, whose only caller is `emit_dump`, and this file has
+already recorded one fix verified by the thing it changed.
+
+```
+                ours   theirs
+     CNA          46     45
+     CORE          6      5
+     DPU          69     68
+     U28           5      5
+     RDMA         22      0
+```
+
+**The DPU block differs in three registers and they are one difference.** Ours
+writes `401c = M`, `4028 = 0`, `40b8 = 3M`; theirs writes 96, 16, 304 at M = 80.
+Counted over every int4 stream in the file -- 512 at M = 1, 384 at 16, 512 at
+32, 320 at 40, 384 at 48, 384 at 64, 768 at 80 -- two relations hold without
+exception:
+
+```
+     4028 = 401c - M
+     40b8 = 4 * 401c - M
+```
+
+and our values satisfy both at `401c = M`. So they are not doing something we
+are not; they allocate output surfaces at pooled widths -- 32, 64, 96, 128 --
+and declare the unused tail, and we allocate exactly M. **The stream is the
+same law at a different stride, which closes "is the gap in how we program a
+dispatch" with a count rather than an opinion.**
+
+### Except for one block we write and they do not
+
+Their int4 projection programs **no RDMA registers at all**. Ours writes 22, and
+`0x5020` in them is the coefficient address. So we build and fetch a coefficient
+buffer per dispatch on a path where the vendor fetches none.
+
+That is not yet a defect. The w4a16 read applies its group scales on the CPU --
+`fp[0] * cp[0]` in the gather -- so what the coefficient buffer is still needed
+for on this path is a question, not an answer, and `charsiu_build_coefs` writes
+bias and weight sums that the int8 requant genuinely needs. The probe is to
+leave it unprogrammed on w4a16 and read the text.
