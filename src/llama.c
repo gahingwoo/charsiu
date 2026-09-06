@@ -3643,13 +3643,25 @@ void llama_stages_report(void)
 			charsiu_npu_batch_split(bmm_dev, &pk, &sb, &fn,
 						&rd, 0);
 			double ga, pc;
+			/*
+			 * ⚠ THE FIFTH SEGMENT, which bench_batch has printed
+			 * since it was written and this table never did. Qwen3
+			 * left 0.36 ms a row unaccounted here against Llama's
+			 * 0.04, and the difference is layer count: `prep` is
+			 * per call -- batch_bufs, the output buffer, the byte
+			 * of Y per n slice -- and 28 layers make more calls a
+			 * row than 16. A residue with a known name should not
+			 * be printed as a residue.
+			 */
+			double pr = charsiu_npu_batch_prep(bmm_dev, 0);
 
 			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
-			       "  read %.2f  unaccounted %.2f ms a row\n",
+			       "  read %.2f  prep %.2f  unaccounted %.2f "
+			       "ms a row\n",
 			       "of the entry:", pk / bstage_rows,
 			       sb / bstage_rows, fn / bstage_rows,
-			       rd / bstage_rows,
-			       (bmm_entry_ms - pk - sb - fn - rd)
+			       rd / bstage_rows, pr / bstage_rows,
+			       (bmm_entry_ms - pk - sb - fn - rd - pr)
 			       / bstage_rows);
 			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 0);
 			printf("  %-16s gather %.2f  packer %.2f  the rest"
