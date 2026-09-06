@@ -3743,3 +3743,44 @@ What survives of the pair submit is its **overlap only**: reading `gate` while
 and read shares that is about 3.3 ms a layer, 52 ms of a 453 ms entry, **8.6%
 of the prompt** -- worth having, and worth knowing it is 8.6% and not the 15%
 it looked like an hour ago.
+
+### 🏁 The tail per channel scale: 14-17% of the entry, and it had no name
+
+An UNGROUPED tensor takes its per channel scale once at the end, as a full
+`m × n` pass over Y. That pass sat after the device loop, **outside every
+counter, single threaded and scalar**, and landed in the report's `other` row.
+Which is why `other` read 2.2 ms on Llama and 62.5 on Qwen3 and 110.0 on
+gemma-3-1b: llama is grouped everywhere and never runs it.
+
+"Ungrouped" is wider than it sounds. `tensor_grouped` wants `kgroup < k`, so a
+tensor whose K **is** one group -- Qwen3's 1024-wide projections at group 1024
+-- is on this path too, as is every tensor of a model npuquant put on one scale
+a row because its K divides no candidate width.
+
+Counted, vectorised four at a time, and put on the pool by the same size rule
+the read uses. `CHARSIU_NPU_TAIL_PLAIN=1` is the old loop, so both arms come
+out of one binary, interleaved, in one session:
+
+```
+  prompt ms       fast (4 runs)            plain (4 runs)          delta
+  gemma3     860 847 852 859   (854.5)   875 883 879 885 (880.5)   -26 ms  -3.0%  4/4
+  qwen3      714 723 708 703   (712)     719 716 727 726 (722)     -10     -1.4%  3/4
+  llama      603 605 602 602   (603)     606 600 604 605 (603.8)    -0.8    noise  <- the control
+```
+
+**llama is the null control and it correctly shows nothing**, because it never
+runs the loop. Every run in both arms hashes exactly to its own token loop --
+the arms multiply the same elements by the same scales in the same order, so
+equal is the only acceptable answer, not close.
+
+And the row now exists, which is the durable part:
+
+```
+  gemma3   scale 39.0 ms  6.8%     other 2.7 ms  0.5%    (other was 110.0, 16.6%)
+  qwen3    scale 21.5 ms  5.4%     other 2.4 ms  0.6%    (other was  62.5, 14.1%)
+```
+
+The scalar loop was 110 and 62.5 ms; vectorised and pooled it is 39.0 and 21.5
+-- **2.8x** -- and the unnamed row collapses to under 1% on every model. The
+prompt moves less than the line does, which is honest and worth saying: some of
+the old cost was overlapping a stall elsewhere.
