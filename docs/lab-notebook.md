@@ -2148,3 +2148,62 @@ So the 7.6% was measured at the one width where an unrelated division happened
 to come out even. `charsiu_parallel_for_grain` rounds the chunk up to a multiple
 of the grain and the read asks for 2 when the pair form is on. Nothing that did
 not ask for a grain changes.
+
+## The whole table, and the stage nobody had been looking at
+
+Three rounds read the five columns inside the NPU entry and none printed what
+sits outside them. With `prep` added as the fifth segment the entry closes to
+0.01 ms a row on Llama, and the rest of the table can finally be read:
+
+```
+   Llama-3.2-1B, 512 rows, chunk 80, 7.73 ms a row
+     token embedding   0.00    0.0%
+     attn rmsnorm      0.05    0.6%
+     q k v             0.70    9.1%
+     rope + kv copy    0.15    1.9%
+     attention         2.34   30.2%     <-- CPU
+     o proj            0.40    5.2%
+     residual          0.07    0.9%
+     gate + up         2.29   29.6%
+     silu * up         0.25    3.2%
+     down              1.45   18.7%
+     residual          0.04    0.6%
+   of the entry: pack 1.11  submit 0.08  fence 1.33  read 2.21  prep 0.03
+                 unaccounted 0.01
+```
+
+**Attention is the largest single stage in a prefilled row, larger than any
+matmul**, and all of it is on the CPU. On Qwen3 at a 916 token prompt it is
+**8.36 of 13.15 ms a row, 63.6%** -- attention is linear in the context and
+Qwen3's prompt is longer, so the same code reads as a third of one model and
+two thirds of another.
+
+It is not bandwidth bound. The block already walks the KV cache once per 8 query
+rows, which puts Qwen3 at about 1.6 GB/s against this board's 9.4 roof, and the
+scores kernel is eight NEON accumulators over four keys at a time. What it IS
+running at is about a fifth of the CPU's fp32 peak, and **the block was swept on
+Qwen3, SmolLM2 and gemma-3 and never on Llama** -- gemma-3 was still falling at
+32 when 8 was chosen as the smallest inside the spread of the best.
+
+### The vendor protocol's prompt fits in one chunk, and did not get one
+
+Their benchmark is a 128 token prompt; ours tokenises to 110 to 116. The surface
+ceiling on these models is 160. It ran as 80 and then 30.
+
+```
+                base TTFT   onechunk    gap was -> now
+   Qwen3           721         643      1.53x -> 1.37x
+   TinyLLAMA       980         918      1.80x -> 1.69x
+   Phi3           3160        3028      1.73x -> 1.66x
+   Gemma4         2399        2133      1.97x -> 1.75x
+```
+
+**Decode is unchanged in both arms**, which is the control: a chunking change
+cannot touch it, and if it had moved, the arm would have been measuring the
+board rather than the change.
+
+That control is not decoration. The `read2` arm of the same round showed Qwen3's
+TTFT at 1008 against 721 AND its decode at 20.71 against 24.74 -- and `read4` is
+read only by the batched gather, so it cannot reach decode at all. The next
+arm's decode came back to 24.74. Arms run in BLOCKS track the state of the
+board; the alternating round is the one to believe.
