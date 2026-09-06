@@ -2478,3 +2478,28 @@ below about 700 tokens and wins at 916 -- and which is therefore per head width
 rather than a single number. Two thresholds fitted on two models is not a rule
 either, so the knob stays a knob and this table is what a deployment reads
 instead.
+
+### Eight lengths on a 64-wide head, and none of them win
+
+The product rule got three more chances and took none of them:
+
+```
+   Llama    hd 64   1101 tok   product  70464   CPU 10852 / 10978   NPU 13782   +27%
+   Llama    hd 64   1701 tok   product 108864   CPU 21409 / 21416   NPU 26164   +22%
+   SmolLM2  hd 64   2092 tok   product 133888   CPU 16328 / 16841   NPU 18156   +11%
+   SmolLM2  hd 64   3292 tok   product 210688   CPU 37259           NPU 39657   +6.4%
+```
+
+Every one of those products is above the 71936 that the fit called the smallest
+win, and the largest is three times it. The CPU controls sit 0.03% to 3% apart,
+so none of this is drift.
+
+What the last column does show is a narrowing: 27, 22, 11, 6.4. A 64 wide head
+may cross somewhere, but not inside a prompt anybody sends, and "eventually" is
+not a rule either.
+
+So the shape that survives is: **head width decides whether the NPU can win at
+all, and length decides whether it does.** 256 pays from about 280 tokens, 128
+from somewhere between 532 and 916, and 64 has not paid at 3292. That is a table
+a deployment can read. It is not yet a gate the runtime can apply, and writing
+one from these points would be the third fitted rule in a day.
