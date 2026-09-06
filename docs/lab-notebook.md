@@ -2446,3 +2446,30 @@ today.** So it does not ship on the fit. The two candidate rules disagree
 somewhere specific, and that is what to run: **head_dim alone says Llama, at 64,
 never wins at any length. The product says Llama wins past about 1100 tokens.**
 One of those is about to be false.
+
+### And the product rule is dead
+
+Llama, head_dim 64, at 1101 tokens. `64 * 1101 = 70464`, which is above the
+threshold the fit produced, so the product rule predicted a win:
+
+```
+   llama, 1101 tok    CPU 10852 ms    NPU 13782 ms     27% WORSE
+                      CPU 10978 ms    (the control, 1.2% apart)
+                      attention 4.67           6.79
+```
+
+Not marginal, and not weather: the two CPU arms are 1.2% apart and the NPU one
+is 27% outside them. **A quantity that separated eleven of twelve arms was wrong
+the first time it was asked a question it had not already been fitted to.**
+
+That is the whole reason to test a fitted rule where it CONTRADICTS the
+alternative rather than where it agrees. Eleven points of agreement cost nothing
+to collect and bought nothing; one point of disagreement settled it in a single
+round.
+
+head_dim survives: 64 does not win at any length tried, 39 to 1101. What it
+still does not have is the length condition, which is real -- Qwen3 at 128 loses
+below about 700 tokens and wins at 916 -- and which is therefore per head width
+rather than a single number. Two thresholds fitted on two models is not a rule
+either, so the knob stays a knob and this table is what a deployment reads
+instead.
