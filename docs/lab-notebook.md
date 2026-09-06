@@ -3466,3 +3466,33 @@ share one -- so submitting ahead would have the second tensor's dispatch
 overwrite the first's accumulators before the CPU has read them. `ob->busy`
 guards exactly that today. A ping-pong pair on the wide geometry costs about
 5 MB a device.
+
+### And two thirds of the pipeline idea does not exist to be built
+
+Two things checked before writing any of it, both by reading:
+
+**The pack is not reuse misses.** `charsiu_npu_matmul_same` already skips the
+pack for the second and third tensor of a group, so a layer packs four times
+(qkv, o, gate+up, down) and not seven. The known miss -- *"Phi-3.5 reused its
+packed input 0 times out of 2304 asks"* -- is diagnosed, fixed and priced:
+`CHARSIU_NPU_EVEN_KS` takes gemma4's 528 misses to zero and its prompt from
+30110 to 29884 ms, inside the spread, and Phi-3.5 does not move at all because
+at its own KMAX the slices were already even. That door is shut.
+
+**The read already overlaps the second core.** The loop is submit both, then
+`for d: fence(d); read(d)` -- so device 0's read runs while device 1 is still
+computing, and the fence counter is what is LEFT after that.
+
+**And the transformer has no next tensor to pack ahead.** o needs attention,
+gate needs o, down needs silu; the chain is serial by construction. The only
+independence inside a layer is `{q, k, v}` (one input) and `{gate, up}` (one
+input), and those already share their pack.
+
+So the pipeline is not "hide 322 ms of CPU". It is exactly this: **submit a
+whole group before reading any of it**, so q's read overlaps k's run and
+gate's read overlaps up's run. That is 5 of a layer's 7 tensors.
+
+⚠ And what blocks even that is the output-buffer pool: k and v share the 512
+geometry, gate and up share the 8192 one, so the second submit of a group
+would overwrite the first's accumulators. `ob->busy` guards it today. A
+ping-pong pair on the two shared geometries is about 5 MB a device.
