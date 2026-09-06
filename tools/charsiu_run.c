@@ -123,6 +123,20 @@ static int prefill_width(int rem, int cap)
  * more, so they are counted by width and printed, and the line cannot be read
  * as one number.
  */
+/* CHARSIU_PREFILL_ONECHUNK=0 turns off running a prompt that already fits
+ * under the ceiling as a single chunk. See the note at the use. */
+static int onechunk_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_PREFILL_ONECHUNK");
+
+		v = e ? atoi(e) != 0 : 1;
+	}
+	return v;
+}
+
 struct prefill_widths {
 	int w[6];
 	int n[6];
@@ -868,12 +882,27 @@ int main(int argc, char **argv)
 		 * vendor's own protocol is a 128 token prompt, which is exactly
 		 * the case it changes.
 		 *
-		 * ⚠ OFF UNTIL A BOARD SAYS OTHERWISE. The last rule about chunk
-		 * widths was right about the mechanism and wrong about the
-		 * model, so this one is a knob until four models have run it.
+		 * ⚠ ON. TTFT fell on all four vendor-protocol models -- 5.1%
+		 * and 5.7% on Phi-3.5 and TinyLLAMA, the two whose baseline
+		 * repeats, and further on the two whose baseline swings 16 to
+		 * 27% between identical runs -- with the DECODE column
+		 * unchanged in both arms, which is the control: a chunking
+		 * change cannot touch decode, and if it had moved, the arm
+		 * would have been measuring the board.
+		 *
+		 * ⚠⚠ AND IT IS VERIFIED WHERE IT ENGAGES, WHICH TOOK THREE
+		 * TRIES. board_text_all.sh cleared eight architectures at 86 to
+		 * 88 tokens; the ninth runs a 64 token prompt, below the chunk,
+		 * so the knob did nothing and its matching hash said nothing. A
+		 * round with a 100 number prompt then matched on all three arms
+		 * because that tokenises to about 200, over the 160 ceiling --
+		 * and the widths line printed beside the hash said `2x80+1x40`.
+		 * At 91 tokens Llama runs `1x90`, TinyLLAMA and gemma-4 run
+		 * `1x128`, and all three hash identically to the token loop.
+		 *
+		 * CHARSIU_PREFILL_ONECHUNK=0 is the control.
 		 */
-		if (getenv("CHARSIU_PREFILL_ONECHUNK") && n_ids > chunk
-		    && n_ids <= cap) {
+		if (onechunk_on() && n_ids > chunk && n_ids <= cap) {
 			if (charsiu_diag())
 				fprintf(stderr, "charsiu: the whole prompt (%d) "
 					"fits under this model's ceiling (%d), "
