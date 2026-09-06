@@ -774,8 +774,63 @@ int main(int argc, char **argv)
 		 * for exactly that reason: a sweep that stops where they stop
 		 * cannot tell a ceiling from a choice.
 		 */
+		/*
+		 * ⚠⚠ 80 WAS THE VENDOR'S NUMBER, NOT THE HARDWARE'S, AND THE
+		 * NOTE BELOW SAID SO BEFORE ANY SWEEP WENT LOOKING.
+		 *
+		 * "96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR
+		 * stops and not where the hardware does" -- and then
+		 * board_chunk_sweep.sh walked 32 31 30 29 24 16 4 2, every one
+		 * of them BELOW the default. The suspicion was written down
+		 * and the sweep never went up.
+		 *
+		 * What decides it is the surface ceiling npudev enforces,
+		 * (k_slice / 32) * m <= 5120, so the widest chunk a model can
+		 * take without forcing EXTRA K slices is 163840 / k. For a
+		 * model whose projections read n_embd that is:
+		 *
+		 *   n_embd 1024 (Qwen3-0.6B)   ->  160
+		 *   n_embd 2048 (Llama-3.2-1B) ->   80
+		 *
+		 * and the board agrees at every length measured, 2026-09-06,
+		 * two runs an arm:
+		 *
+		 *   Qwen3    156 tok   80: 1032   112: 1062   160:  962
+		 *            404 tok       3473        3348        3272
+		 *            916 tok      12016       11482       11366
+		 *   Llama    111 tok   80:  872   112:  802   160:  794
+		 *            257 tok       1878        1860        1933  <-- 160 LOSES
+		 *
+		 * Llama at 257 is the case that makes this a rule rather than
+		 * "wider is better": at 160 its 2048 wide projections need two
+		 * K slices where 80 needed one, and the extra read costs more
+		 * than the chunk saves. Qwen3's 1024 sits exactly at 5120 and
+		 * pays nothing.
+		 *
+		 * ⚠ AND 224 IS A CLIFF, NOT A SLOPE. Qwen3's 404 token prompt
+		 * takes 3272 ms at 160 and 13507 at 224, Llama's 257 goes 1862
+		 * to 8595: the batched path REFUSES and every token goes
+		 * through the token loop. Anything derived here must stay
+		 * under it.
+		 *
+		 * RAISE ONLY. Phi-3.5's n_embd is 3072, which the formula puts
+		 * at 53, and narrowing a model that has always run at 80 is a
+		 * change nothing has measured. This takes the wider of the two
+		 * and caps at 160.
+		 */
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
-		int chunk = ec ? atoi(ec) : 80;
+		int chunk;
+
+		if (ec) {
+			chunk = atoi(ec);
+		} else {
+			unsigned kd = m.n_embd ? m.n_embd : 2048;
+			int wide = (int)(163840u / kd);
+
+			chunk = wide > 80 ? wide : 80;
+			if (chunk > 160)
+				chunk = 160;
+		}
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
