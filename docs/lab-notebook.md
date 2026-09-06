@@ -3078,3 +3078,41 @@ chunk 24, phi3, on this kernel and this build, sixteen overlapped runs are
 right. Nothing here has yet reproduced the fault, so nothing here has yet
 proved it gone -- an experiment where the positive control does not fire
 cannot tell "fixed" from "not looking".
+
+### 🏁 m66: the overlap fault does not reproduce, control included
+
+The same script, the same model, `CHARSIU_PREFILL_ONECHUNK=0` so the requested
+chunk survives to the chunker:
+
+```
+  KMAX 1024, chunk 24   widths 3x24+1x14   parallel 0/16 wrong   serial 0/16
+  KMAX 2048, chunk 22   widths 3x22+1x20   parallel 0/16 wrong   serial 0/16
+```
+
+The first line is the 2026-08-30 reading's own cell -- phi3, chunk 24, KMAX
+1024, both cores overlapped -- which was **13 of 16 WRONG** when it was priced.
+It is now 16 of 16 right, and this time the widths line proves the width ran.
+Width 22, which failed 1 in 16, is clean 16 of 16 too.
+
+Three independent reads now say the same thing: 21600 exact rows in the element
+probe, 16 clean at width 24, 16 clean at width 22.
+
+**What that supports:** the 13-in-16 fault is gone. A rate that large gives
+sixteen consecutive clean runs about once in 10^11 tries, so this is not luck.
+**What it does not support:** that nothing is left. Sixteen clean runs bound a
+rate at roughly one in six, so a fault firing one prompt in fifty would sail
+through all of this untouched. That is the whole reason the 28 default was held
+back before, and the answer to it is more runs on more models, not a louder
+adjective.
+
+**Which change fixed it is not established and this round cannot say.** The
+running kernel is `2ffc0913` -- attach-once-v11 plus the igorfix patches, #9,
+built 09-05 -- against the August kernel that attached and detached the IOMMU
+per job, and the runtime has moved a long way in the same window. Telling the
+two apart needs the other kernel booted, which is a flash, which is the user's.
+
+⚠ And the warning both board scripts print here -- *"/boot/Image is NEWER THAN
+THIS BOOT"* -- is a false alarm. The Image's mtime is 1788580697 and the boot
+was at `now - uptime` = 1788636058, so the Image is 15 hours OLDER than the
+boot and the kernel running is the one on disk. The test is
+`[ /boot/Image -nt /proc/1 ]` and /proc/1's mtime is not the boot instant.
