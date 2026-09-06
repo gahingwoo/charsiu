@@ -4364,6 +4364,22 @@ struct attn_npu {
 	struct charsiu_fp16 *f;
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
 	unsigned n_layer, nkv, hd, nk, kv, mmax;
+	/*
+	 * ⚠⚠ kv IS THE V SURFACE'S REDUCTION EXTENT AND IT USED TO BE THE
+	 * CONTEXT LENGTH FOR THE LIFE OF THE RUN.
+	 *
+	 * The values matmul runs at k = kv whatever the prompt has reached, so
+	 * a 2048 context with 916 live positions fetched 2.2x the surface it
+	 * needed on EVERY call -- and, because the input surface ceiling is
+	 * (k/32)*m <= 5120, it also halved the rows a pass. The board measured
+	 * both: Qwen3's fp16 attention is 7.61 ms a row at -c 2048 and 5.97 at
+	 * -c 1024, against a CPU arm that does not move (8.46, 8.39).
+	 *
+	 * So kv now GROWS, on a doubling ladder, up to kvmax. Every growth
+	 * repacks the live positions, which is why the ladder doubles: at most
+	 * log2 of the context many repacks in a whole run.
+	 */
+	unsigned kvmax;
 	unsigned char *dirty;               /* a layer with unflushed appends */
 	float *sc;                          /* [H][m][kv] probabilities */
 	size_t sc_cells;
@@ -4434,7 +4450,9 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->nkv = m->n_head_kv;
 	a->n_layer = m->n_layer;
 	a->nk = ((unsigned)s->n_ctx + 15u) & ~15u;
-	a->kv = ((unsigned)s->n_ctx + 31u) & ~31u;
+	a->kvmax = ((unsigned)s->n_ctx + 31u) & ~31u;
+	/* the smallest rung the unit will take; attn_npu_fit climbs from here */
+	a->kv = a->kvmax < 32u ? a->kvmax : 32u;
 	/*
 	 * ⚠ THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
 	 * (k/32)*m up to 5120 -- measured, and the vendor's own file never
@@ -4444,8 +4462,11 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
 	if (hd < 32 || a->nk < 32 || a->kv < 32 || !a->nkv || !a->mmax)
 		return NULL;
+	/* ⚠ the CEILING is what the memory cap has to be judged against: kv
+	 * starts at one rung but a long enough run climbs to kvmax, and a cap
+	 * that only checked the first rung would refuse later, mid answer */
 	mb = (size_t)a->n_layer * a->nkv * ((size_t)hd * a->nk
-					    + (size_t)a->kv * hd) * 2;
+					    + (size_t)a->kvmax * hd) * 2;
 	{
 		const char *e = getenv("CHARSIU_ATTN_NPU_MB");
 		size_t cap = (size_t)(e ? atoi(e) : 2048) * 1024 * 1024;
@@ -4482,6 +4503,100 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 }
 
 /*
+ * One position of the float V cache, addressed the way attn_block_heads and
+ * attn_heads address it. `a->hd` IS the cache's stride hdmax -- attn_npu_get
+ * builds it from the same expression llama_forward does and refuses any layer
+ * whose head differs -- so this needs no new field to stay in step with them.
+ */
+static const float *attn_vcache_at(struct llama_state *s, unsigned l,
+				   unsigned kh, unsigned hd, unsigned pos)
+{
+	if (kv_posmajor()) {
+		size_t kvdim = (size_t)s->anpu->nkv * hd;
+
+		return s->vcache + (size_t)l * s->n_ctx * kvdim
+		     + (size_t)kh * hd + (size_t)pos * kvdim;
+	}
+	return s->vcache
+	     + ((size_t)l * s->anpu->nkv + kh) * s->n_ctx * hd
+	     + (size_t)pos * hd;
+}
+
+/*
+ * ⚠⚠ GROW THE V SURFACE TO COVER `want` POSITIONS, REPACKING WHAT IS LIVE.
+ *
+ * A GROUP offset depends on the reduction extent, so every element of the V
+ * surface moves when kv changes and there is no incremental form of this. What
+ * makes it affordable is the LADDER: kv doubles, so a run reaches the context
+ * length in at most log2 of it many repacks, and each one costs a pass over the
+ * positions that already exist.
+ *
+ * ⚠ THE REPACK CALLS THE SAME PACKER THE APPEND DOES. It would be easy to
+ * write the new layout out by hand here and easy to get it wrong; instead this
+ * walks the float V cache -- which is the source of truth and is written on
+ * every path -- and hands each position to charsiu_fp16_pack_vcol exactly as
+ * attn_npu_append does. There is one layout in this file and this is not a
+ * second copy of it.
+ *
+ * ⚠ AND THE PROBABILITY SCRATCH IS RE-ZEROED. Its rows are kv apart, so a
+ * changed kv reinterprets every byte in it; the zeros past the last token are
+ * what makes the values matmul legal (see the note in attn_npu_layer), and a
+ * stale row boundary would put the previous rung's numbers where those zeros
+ * have to be. Its SIZE does not change -- mmax * kv is 5120 * 32 whatever rung
+ * this is on -- so this is a memset and not a reallocation.
+ *
+ * Returns 0 if kv now covers `want`, -1 if it cannot.
+ */
+static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
+			unsigned want)
+{
+	unsigned kv = a->kv, i, l, kh, p;
+
+	if (want <= a->kv)
+		return 0;
+	if (want > a->kvmax)
+		return -1;
+	while (kv < want)
+		kv *= 2;
+	if (kv > a->kvmax)
+		kv = a->kvmax;
+
+	for (i = 0; i < a->n_layer * a->nkv; i++) {
+		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->f, kv, a->hd);
+
+		if (!w) {
+			fprintf(stderr, "charsiu: the fp16 V surface would not "
+				"grow to %u positions\n", kv);
+			return -1;
+		}
+		charsiu_fp16_w_free(a->f, a->vb[i]);
+		a->vb[i] = w;
+	}
+	a->kv = kv;
+	a->mmax = 5120u / (kv / 32u);
+	if (!a->mmax)
+		return -1;
+	if (a->sc)
+		memset(a->sc, 0, a->sc_cells * sizeof(*a->sc));
+
+	/* every position that already exists, through the packer the append
+	 * path uses, out of the float cache that both paths write */
+	for (l = 0; l < a->n_layer; l++) {
+		for (kh = 0; kh < a->nkv; kh++) {
+			uint16_t *map = charsiu_fp16_w_map(
+					a->vb[l * a->nkv + kh]);
+
+			for (p = 0; p + 1 < want; p++)
+				charsiu_fp16_pack_vcol(map, a->kv, a->hd, p,
+					attn_vcache_at(s, l, kh, a->hd, p));
+		}
+		a->dirty[l] = 1;
+	}
+	charsiu_note("attention: the V surface grew", kv, a->mmax);
+	return 0;
+}
+
+/*
  * One position of one head, into both caches, where llama.c already writes the
  * float ones. The layouts are charsiu_fp16_pack_krow and _vcol; the runtime
  * does not restate them.
@@ -4493,9 +4608,14 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 	struct attn_npu *a = attn_npu_get(s);
 	unsigned i;
 
-	if (!a || pos < 0 || (unsigned)pos >= a->nk || (unsigned)pos >= a->kv)
+	if (!a || pos < 0 || (unsigned)pos >= a->nk)
 		return;
 	if (l >= a->n_layer || kh >= a->nkv || hd != a->hd)
+		return;
+	/* ⚠ the ladder is climbed HERE, where the first position that does not
+	 * fit arrives, and the repack covers [0, pos) -- which is every
+	 * position already in the float cache, this one not being in it yet */
+	if ((unsigned)pos >= a->kv && attn_npu_fit(s, a, (unsigned)pos + 1))
 		return;
 	i = l * a->nkv + kh;
 	charsiu_fp16_pack_krow(charsiu_fp16_w_map(a->kb[i]), a->hd, a->nk,
@@ -4527,6 +4647,15 @@ static int attn_npu_layer(struct attn_block_job *j)
 	 * that wedged both cores, so the unit refuses it and so does this: a
 	 * prompt shorter than 32 positions runs on the CPU and always will */
 	if (T == 0 || npad < 32 || npad > a->nk)
+		return -1;
+	/*
+	 * ⚠ AND THE V SURFACE HAS TO COVER T. The appends climb the ladder as
+	 * positions arrive, so it normally does; if a growth ever failed, the
+	 * appends returned without writing and this surface is stale. Falling
+	 * back to the CPU is always safe -- the float cache is written either
+	 * way -- and a stale surface is a wrong answer.
+	 */
+	if (T > a->kv)
 		return -1;
 
 	/*
