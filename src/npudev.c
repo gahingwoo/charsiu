@@ -1678,6 +1678,12 @@ fail:
  * strategies has to choose before it acts: trying the batch and falling back
  * has already done the work of one of them.
  */
+/* the pool's own device, so nothing else has to open the accel node twice */
+struct charsiu_device *charsiu_npu_device(struct charsiu_npu *g)
+{
+	return g && g->ndev ? g->dev[0] : NULL;
+}
+
 int charsiu_npu_batches(const struct charsiu_npu *g)
 {
 	return g && !g->w4;

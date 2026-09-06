@@ -42,6 +42,7 @@
 
 struct charsiu_fp16 {
 	struct charsiu_device *dev;
+	int borrowed;               /* the device belongs to the caller */
 	struct charsiu_bo wt, in, ob, coef, reg;
 	size_t wsz, insz, obsz, coefsz, regsz;
 	unsigned long calls, refused, submits;
@@ -194,6 +195,48 @@ void charsiu_fp16_w_end(struct charsiu_fp16 *f, struct charsiu_fp16_w *w)
 		charsiu_bo_fini(f->dev, &w->bo);
 }
 
+/*
+ * ⚠⚠ A SECOND OPEN OF THE SAME DEVICE IS NOT FREE, AND THE BOARD SAID SO.
+ *
+ * This used to call charsiu_open() unconditionally, so a runtime that turned
+ * the fp16 attention mirror on held TWO file descriptors on one accel device.
+ * rocket keeps its scheduler entities and, since attach-once, its IOMMU domain
+ * per FILE, so the second handle is a second client of the same hardware even
+ * when it submits nothing.
+ *
+ * ⚠ THE BOARD HAS NOT CONFIRMED THAT THIS IS WHAT DECODE WAS PAYING FOR, and
+ * the claim is worth less than the change. One round did show decode falling
+ * 24.69/24.70 to 21.70 on Qwen3, 20.66/20.61 to 17.83 on TinyLLAMA and
+ * 8.65/8.63 to 7.60 on Gemma4 with the mirror on, after the decode path had
+ * already stopped writing it -- so the packing was not it, and the device was
+ * the only thing left that decode shares with this unit. But the round that
+ * tried to price the fix could not: its two base arms read 18.48..20.58 and
+ * 18.35..20.91 while its mirror arm read 24.74..24.75, which would make the
+ * mirror FASTER, and that is not credible. The decode column of
+ * board_vendor.sh is bimodal at two repeats.
+ *
+ * So this stands on its own terms -- a process should not open one accel device
+ * twice -- and not on a measurement. Settling it needs many more repeats, or a
+ * decode harness that does not run a prompt first.
+ *
+ * charsiu_fp16_open_on() borrows a device the caller already has and does not
+ * close it. charsiu_fp16_open() keeps its old meaning for the standalone
+ * probes, which have no other handle to lend.
+ */
+struct charsiu_fp16 *charsiu_fp16_open_on(struct charsiu_device *dev)
+{
+	struct charsiu_fp16 *f;
+
+	if (!dev)
+		return NULL;
+	f = calloc(1, sizeof(*f));
+	if (!f)
+		return NULL;
+	f->dev = dev;
+	f->borrowed = 1;
+	return f;
+}
+
 struct charsiu_fp16 *charsiu_fp16_open(void)
 {
 	struct charsiu_fp16 *f = calloc(1, sizeof(*f));
@@ -216,7 +259,8 @@ void charsiu_fp16_close(struct charsiu_fp16 *f)
 	charsiu_bo_free(f->dev, &f->reg);  charsiu_bo_free(f->dev, &f->coef);
 	charsiu_bo_free(f->dev, &f->ob);   charsiu_bo_free(f->dev, &f->in);
 	charsiu_bo_free(f->dev, &f->wt);
-	charsiu_close(f->dev);
+	if (!f->borrowed)
+		charsiu_close(f->dev);
 	free(f);
 }
 

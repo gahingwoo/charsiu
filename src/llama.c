@@ -4415,6 +4415,22 @@ struct attn_npu {
 	 */
 	unsigned kvmax;
 	unsigned char *dirty;               /* a layer with unflushed appends */
+	/*
+	 * ⚠⚠ HOW MANY POSITIONS EACH LAYER'S MIRROR ACTUALLY HOLDS.
+	 *
+	 * The decode path used to append here as well, deliberately, so that a
+	 * prompt continued after a generation would not read a cache with a
+	 * hole in it. The board priced that: with the mirror on, decode fell
+	 * 24.63 to 20.84 tok/s on Qwen3 and 8.70 to 7.57 on Gemma4 -- a
+	 * generation paying to fill a surface it never reads, because
+	 * attn_npu_layer runs only on the batched path.
+	 *
+	 * So decode does not append any more, and this is what makes that safe:
+	 * the layer notices its mirror is behind and packs the missing
+	 * positions out of the float cache, which is written on every path. The
+	 * hole is filled where it is needed rather than everywhere it might be.
+	 */
+	unsigned *packed;                   /* [n_layer], positions mirrored */
 	float *sc;                          /* [H][m][kv] probabilities */
 	size_t sc_cells;
 	unsigned long layers, fallbacks;
@@ -4506,6 +4522,7 @@ static void attn_npu_free(struct attn_npu *a)
 	free(a->kb);
 	free(a->vb);
 	free(a->dirty);
+	free(a->packed);
 	free(a->sc);
 	free(a);
 }
@@ -4573,14 +4590,19 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			return NULL;
 		}
 	}
-	a->f = charsiu_fp16_open();
+	/* ⚠ BORROW THE POOL'S DEVICE. Opening a second one costs decode 12 to
+	 * 14% for a handle it never submits through; see charsiu_fp16_open_on */
+	a->f = charsiu_fp16_open_on(charsiu_npu_device(s->pool.dev));
+	if (!a->f)
+		a->f = charsiu_fp16_open();   /* no pool: the probes' path */
 	if (!a->f)
 		return NULL;
 	nbuf = a->n_layer * a->nkv;
 	a->kb = calloc(nbuf, sizeof(*a->kb));
 	a->vb = calloc(nbuf, sizeof(*a->vb));
 	a->dirty = calloc(a->n_layer, 1);
-	if (!a->kb || !a->vb || !a->dirty)
+	a->packed = calloc(a->n_layer, sizeof(*a->packed));
+	if (!a->kb || !a->vb || !a->dirty || !a->packed)
 		return NULL;
 	for (i = 0; i < nbuf; i++) {
 		a->kb[i] = charsiu_fp16_w_alloc(a->f, hd, a->nk);
@@ -4612,6 +4634,21 @@ static const float *attn_vcache_at(struct llama_state *s, unsigned l,
 		     + (size_t)kh * hd + (size_t)pos * kvdim;
 	}
 	return s->vcache
+	     + ((size_t)l * s->anpu->nkv + kh) * s->n_ctx * hd
+	     + (size_t)pos * hd;
+}
+
+/* the same position of the float K cache; the two caches share a layout */
+static const float *attn_kcache_at(struct llama_state *s, unsigned l,
+				   unsigned kh, unsigned hd, unsigned pos)
+{
+	if (kv_posmajor()) {
+		size_t kvdim = (size_t)s->anpu->nkv * hd;
+
+		return s->kcache + (size_t)l * s->n_ctx * kvdim
+		     + (size_t)kh * hd + (size_t)pos * kvdim;
+	}
+	return s->kcache
 	     + ((size_t)l * s->anpu->nkv + kh) * s->n_ctx * hd
 	     + (size_t)pos * hd;
 }
@@ -4717,6 +4754,51 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 	charsiu_fp16_pack_vcol(charsiu_fp16_w_map(a->vb[i]), a->kv, a->hd,
 			       (unsigned)pos, v);
 	a->dirty[l] = 1;
+	/* ⚠ ON THE LAST KV HEAD, because a position is only mirrored once
+	 * every head of it is, and the catch-up below trusts this number */
+	if (kh + 1 == a->nkv && a->packed[l] < (unsigned)pos + 1)
+		a->packed[l] = (unsigned)pos + 1;
+}
+
+/*
+ * ⚠⚠ FILL WHAT DECODE NO LONGER APPENDS, WHERE IT IS NEEDED.
+ *
+ * Every position of this layer below `need` has to be in the mirror before the
+ * layer runs, and the ones a generation produced are not: decode stopped
+ * appending because it was paying to fill a surface only the batched path
+ * reads. They are all in the FLOAT caches, which every path writes, so they are
+ * packed here through the same two packers the append path uses -- there is one
+ * copy of those layouts in this file and this is not a second.
+ *
+ * The cost lands on the first batched layer after a generation, once, instead
+ * of on every token of it.
+ */
+static void attn_npu_catchup(struct llama_state *s, struct attn_npu *a,
+			     unsigned l, unsigned need)
+{
+	unsigned kh, p;
+
+	if (a->packed[l] >= need)
+		return;
+	if (need > a->nk || need > a->kv)
+		return;                 /* the caller refuses on the same test */
+	for (kh = 0; kh < a->nkv; kh++) {
+		unsigned i = l * a->nkv + kh;
+		uint16_t *km = charsiu_fp16_w_map(a->kb[i]);
+		uint16_t *vm = charsiu_fp16_w_map(a->vb[i]);
+
+		for (p = a->packed[l]; p < need; p++) {
+			charsiu_fp16_pack_krow(km, a->hd, a->nk, p,
+					       attn_kcache_at(s, l, kh,
+							      a->hd, p));
+			charsiu_fp16_pack_vcol(vm, a->kv, a->hd, p,
+					       attn_vcache_at(s, l, kh,
+							      a->hd, p));
+		}
+	}
+	charsiu_note("attention: the mirror caught up", l, need - a->packed[l]);
+	a->packed[l] = need;
+	a->dirty[l] = 1;
 }
 
 /*
@@ -4751,6 +4833,11 @@ static int attn_npu_layer(struct attn_block_job *j)
 	 */
 	if (T > a->kv)
 		return -1;
+	/* ⚠ before anything reads the mirror: a generation between two prompts
+	 * left positions in the float cache and not in here */
+	attn_npu_catchup(s, a, j->l, T);
+	if (a->packed[j->l] < T)
+		return -1;              /* could not fill it: the CPU is safe */
 
 	/*
 	 * ⚠ THE CACHES GO TO THE DEVICE ONCE A LAYER, NOT ONCE A TOKEN. fini
@@ -6463,12 +6550,18 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				       hd * sizeof(float));
 				memcpy(s->vcache + off, s->v + kh * hd,
 				       hd * sizeof(float));
-				/* the decode path writes the mirror too, or a
-				 * prompt continued after a generation would
-				 * read a cache with a hole in it */
-				attn_npu_append(s, l, kh, hd, pos,
-						s->k + kh * hd,
-						s->v + kh * hd);
+				/*
+				 * ⚠ THE DECODE PATH NO LONGER WRITES THE
+				 * MIRROR. It used to, so that a prompt
+				 * continued after a generation would not read a
+				 * cache with a hole in it -- and the board
+				 * priced that at 24.63 to 20.84 tok/s on Qwen3
+				 * and 8.70 to 7.57 on Gemma4, a generation
+				 * filling a surface only the batched path
+				 * reads. attn_npu_catchup fills the hole on the
+				 * next batched layer instead, out of the float
+				 * cache this loop has just written.
+				 */
 			}
 		}
 		STAGE(ST_ROPE);

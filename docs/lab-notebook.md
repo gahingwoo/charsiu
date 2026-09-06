@@ -2605,3 +2605,47 @@ useful part of the answer: **after today the largest remaining item in a
 prefilled row is attention** -- 2.34 ms against read's 2.04 and the fence's 1.37
 -- and the thing that addresses attention is the fp16 path, which is measured,
 reopened, and waiting on a decision about fp16 rather than on more measurement.
+
+## A column that cannot carry a conclusion
+
+Two changes went in for the fp16 attention mirror: decode stopped filling a
+surface only the batched path reads, and the fp16 unit stopped opening a second
+file descriptor on an accel device the process already had open. Both are right
+on their own terms. Neither could be priced, and the way that became clear is
+worth keeping.
+
+The round ran base, mirror, base, mirror, so every arm had a repeat:
+
+```
+   m57                Qwen3 decode        TinyLLAMA decode
+     base            18.48 .. 20.58       13.34 .. 20.57
+     mirror          24.74 .. 24.75       13.26 .. 13.33
+     base again      18.35 .. 20.91       13.23 .. 20.58
+     mirror again    24.72 .. 24.72       20.58 .. 20.62
+```
+
+Read Qwen3 alone and the mirror is 20% FASTER, twice, tightly. That is not
+credible, and it is not what happened. **TinyLLAMA with the mirror on reads
+13.33 in one arm and 20.62 in the other** -- the same binary, the same flags,
+the same minute apart. The column is bimodal WITHIN a configuration, so Qwen3
+landing high twice and low twice is two coin flips agreeing, not a measurement.
+
+Across rounds it is worse. Between the round before the fix and this one, the
+mirror arm went 21.70 to 24.7 and the base arm went 24.69 to 20.6 -- **both
+moved, in opposite directions**, and the fix cannot touch the base path at all.
+Something on the board moves the baseline between rounds fifteen minutes apart.
+
+And I read it wrong once on the way: I compared this round's mirror arm against
+the PREVIOUS round's mirror arm and called the 14% difference the fix. That is a
+cross round comparison, which this file spent the afternoon establishing is
+worthless here, written down at 15:00 and broken at 17:17.
+
+**So decode is not to be priced with board_vendor.sh.** It runs a prompt before
+it generates, and whatever the prefill leaves behind -- the NPU's own operating
+point is the first suspect -- follows into the window being timed. What that
+needs is a decode-only harness with many repeats and the arms alternating inside
+one process, and it does not exist yet.
+
+The prefill side of the same work needs none of that, because the stage table
+compares inside one run: Qwen3 at 916 tokens goes 12.41 to 11.21 ms a row with
+attention 7.69 to 5.52, and it repeats.

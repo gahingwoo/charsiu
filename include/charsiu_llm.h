@@ -351,7 +351,16 @@ int charsiu_npu_overlap_ok(char *why, size_t n);
  * are appended and no pack is ever paid.
  */
 struct charsiu_fp16;
+struct charsiu_device;
 struct charsiu_fp16 *charsiu_fp16_open(void);
+/*
+ * The same unit on a device the caller already holds, which it does not close.
+ * A second open of one accel device is a second scheduler entity and a second
+ * IOMMU domain, and the board measured decode losing 12 to 14% to one that
+ * never submitted anything. Anything with a device of its own should lend it.
+ */
+struct charsiu_fp16 *charsiu_fp16_open_on(struct charsiu_device *dev);
+struct charsiu_device *charsiu_npu_device(struct charsiu_npu *g);
 void charsiu_fp16_close(struct charsiu_fp16 *f);
 size_t charsiu_fp16_wbytes(unsigned k, unsigned n);
 size_t charsiu_fp16_woffset(unsigned k, unsigned n, unsigned ni, unsigned ki);
