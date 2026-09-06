@@ -93,6 +93,17 @@ int main(int argc, char **argv)
 	 * times only submit and fence.
 	 */
 	unsigned ring = argc > 4 ? (unsigned)atoi(argv[4]) : 1;
+	/*
+	 * ⚠ THE DTYPE, BECAUSE int8 IS NOT WHAT THE PREFILL RUNS. Every sweep
+	 * before this one dispatched int8, and the cost model fitted to it was
+	 * then carried to a w4a16 prefill by halving the weight bytes on paper.
+	 * The halving is an inference; this makes it a measurement. argv[5]:
+	 * 8 (default, every earlier sweep) or 4 for int4 weights with fp16
+	 * activations, which is the pair llama.c actually submits.
+	 */
+	int w4 = argc > 5 && atoi(argv[5]) == 4;
+	int wdt = w4 ? CHARSIU_INT4 : CHARSIU_INT8;
+	int adt = w4 ? CHARSIU_FP16 : CHARSIU_INT8;
 	unsigned nmax = NS[NN - 1], i, r;
 	struct charsiu_device *dev;
 	struct charsiu_bo wt = { 0 }, in = { 0 }, ob = { 0 }, coef = { 0 },
@@ -106,8 +117,9 @@ int main(int argc, char **argv)
 
 	dev = charsiu_open(NULL);
 	if (!dev) { fprintf(stderr, "no accel device\n"); return 1; }
-	printf("one dispatch, k=%u m=%u, %u repeats a point, buffers allocated"
-	       " once at n=%u%s\n", k, m, reps, nmax,
+	printf("one dispatch, k=%u m=%u %s, %u repeats a point, buffers"
+	       " allocated once at n=%u%s\n", k, m,
+	       w4 ? "w4a16" : "int8", reps, nmax,
 	       ring > 1 ? ", COLD ring" : ", warm (one weight buffer)");
 
 	/* sized for the widest point, so nothing here moves during the sweep */
@@ -115,8 +127,8 @@ int main(int argc, char **argv)
 		struct charsiu_job big = { 0 };
 
 		big.mm.m = m; big.mm.k = k; big.mm.n = nmax;
-		big.mm.wdtype = CHARSIU_INT8;
-		big.mm.adtype = CHARSIU_INT8;
+		big.mm.wdtype = wdt;
+		big.mm.adtype = adt;
 		insz = (size_t)charsiu_entries_per_row(&big.mm) * 64 * m + 4096;
 		if (charsiu_bo_alloc(dev, charsiu_weight_bytes(&big.mm) + 4096, &wt) ||
 		    charsiu_bo_alloc(dev, insz, &in) ||
@@ -135,8 +147,8 @@ int main(int argc, char **argv)
 			struct charsiu_job big = { 0 };
 
 			big.mm.m = m; big.mm.k = k; big.mm.n = nmax;
-			big.mm.wdtype = CHARSIU_INT8;
-			big.mm.adtype = CHARSIU_INT8;
+			big.mm.wdtype = wdt;
+			big.mm.adtype = adt;
 			if (charsiu_bo_alloc(dev,
 					     charsiu_weight_bytes(&big.mm) + 4096,
 					     &wr[i]) ||
@@ -165,8 +177,8 @@ int main(int argc, char **argv)
 
 		job.cbuf_window = (unsigned)charsiu_cbuf_window();
 		job.mm.m = m; job.mm.k = k; job.mm.n = NS[i];
-		job.mm.wdtype = CHARSIU_INT8;
-		job.mm.adtype = CHARSIU_INT8;
+		job.mm.wdtype = wdt;
+		job.mm.adtype = adt;
 		job.input_zero_point = 128;
 		job.weight_zero_point = 128;
 		job.input_scale = job.weight_scale = job.output_scale = 1.0f;
