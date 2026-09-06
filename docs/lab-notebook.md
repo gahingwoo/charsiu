@@ -3541,3 +3541,47 @@ on any model.** Every run in both arms hashes to its own token loop.
 Small, and worth having for a reason beyond the milliseconds: flushing bytes
 the call did not write is not a tuning choice. The remaining FINI is now
 roughly what the writes justify.
+
+### ⛔ w4a8 costs exactly what w4a16 costs — and int8 WEIGHTS are 1.9x faster
+
+The vendor's Llama-3.2-1B `.rkllm` runs two activation precisions per weight
+and picks by batch width: of 3328 int4 dispatches, 1408 clear CNA 0x100c bit 29
+(8 bit activations) and they are exactly `M ∈ {1, 32, 64}`, while
+`M ∈ {16, 24, 40, 48, 80}` set it. charsiu sets it on every int4 dispatch,
+because `charsiu_effective_adtype` returns FP16 for int4 unconditionally, and
+round 178's "int4 consumes 16 bit activations whatever the stream asks" was
+measured with bit 29 set in every stream it asked with.
+
+`npu_fence_scan` grew a w4a8 mode, and the mode demonstrably engaged -- the two
+streams differ on the host, and not only in the flag:
+
+```
+  0x100c   20600120 -> 00600120     bit 29 cleared
+  0x103c   0a000000 -> 05000000     the SURFACE halves, as "surf follows the
+  0x1028   0a0003ff -> 050003ff     activation precision" predicts
+```
+
+Cold ring, µs per output channel at the wide end, m = 80:
+
+```
+           k = 1024        k = 2048
+  int8       0.1548          0.2144
+  w4a16      0.2099          0.4089
+  w4a8       0.2121          0.4120     <- within 1% of w4a16 at both k
+```
+
+**Clearing bit 29 changes nothing about the cost.** The activation precision is
+not the 6x between our 0.495 TMAC/s and the part's int8 rating. What it does buy
+is a half-size input surface, which doubles the `(k/32)·m ≤ 5120` ceiling -- not
+cashable today, since the chunk cap it widens is not what binds and the K slice
+it would widen is held by the quantiser group.
+
+🔑 **The other half of that table is not a negative.** At k = 2048 an int8-weight
+dispatch is `0.2144` against int4's `0.4089` -- **1.9x faster while reading
+TWICE the weight bytes**, which is the MAC-rate model saying the fence is not
+weight-bandwidth bound at this shape. At k = 1024 it is 1.35x.
+
+So for PREFILL, which is MAC-bound, int8 weights are the faster arm and int4 is
+the DRAM-bound choice that belongs to decode. The tree already has both paths
+and a heuristic between them; what it has not had until now is the per-dispatch
+model saying how much the trade is worth.
