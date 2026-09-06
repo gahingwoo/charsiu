@@ -5316,7 +5316,14 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
 					     (size_t)m * sn >= g->poolread_min)) {
-						charsiu_parallel_for(read_rows, &rr, m);
+						/* ⚠ THE PAIR FORM NEEDS EVEN
+						 * RANGES, and before the grain
+						 * it got them only where the
+						 * chunk arithmetic happened to
+						 * land even. See pool_arm. */
+						charsiu_parallel_for_grain(
+							read_rows, &rr, m,
+							g->read4 == 2 ? 2 : 1);
 						g->bread_pooled++;
 					} else {
 						read_rows(&rr, 0, m);

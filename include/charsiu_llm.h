@@ -238,6 +238,15 @@ struct npu_tensor {
  */
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 			  void *ctx, uint64_t n);
+/*
+ * The same, for a callback that consumes rows in blocks: every range starts on
+ * a multiple of `grain` and is a multiple of it long, bar the final remainder.
+ * Without this the block form of a callback applies or not depending on how
+ * n / (4 * threads) happens to divide, which is not something a measurement
+ * should rest on.
+ */
+void charsiu_parallel_for_grain(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
+				void *ctx, uint64_t n, unsigned grain);
 
 /*
  * Start the worker pool. llama_state_new does this; a graph that is not the

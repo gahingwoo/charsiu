@@ -304,7 +304,21 @@ static int pool_dynamic(void)
  * found were the previous job's, and rows were skipped and repeated -- the
  * host caught it as changed text on the first run.
  */
-static void pool_arm(uint64_t n)
+/*
+ * ⚠⚠ THE GRAIN IS NOT COSMETIC, AND read_rows2 FOUND THAT OUT BY LUCK.
+ *
+ * A callback that consumes rows in pairs -- two rows off one cache line -- can
+ * only do it when the range it is handed starts even and is even long. The
+ * dynamic chunk is n / (4 * threads), which at m = 80 with eight threads is 2
+ * and at m = 120 is 3. So the pair form applied at the default width, was
+ * measured there at 7.6% off the read, and would have gone silently inert at
+ * any width whose chunk came out odd. That is a measurement that depends on an
+ * unrelated division, which is not a measurement.
+ *
+ * `grain` rounds the chunk UP to a multiple of it. Callers that do not care
+ * pass 1 and get exactly what they got before.
+ */
+static void pool_arm(uint64_t n, unsigned grain)
 {
 	g_pool.nrows = n;
 	g_pool.next = 0;
@@ -312,6 +326,8 @@ static void pool_arm(uint64_t n)
 	g_pool.chunk = pool_dynamic()
 		     ? (n / (4u * (uint64_t)g_pool.n) > 0 ? n / (4u * (uint64_t)g_pool.n) : 1)
 		     : 0;
+	if (g_pool.chunk && grain > 1)
+		g_pool.chunk = ((g_pool.chunk + grain - 1) / grain) * grain;
 	g_pool.done = 0;
 }
 
@@ -608,7 +624,7 @@ static void pool_start(int nthreads)
  * itself.
  */
 static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
-		     uint64_t n)
+		     uint64_t n, unsigned grain)
 {
 	if (g_pool.n <= 1) {
 		fn(ctx, 0, n);
@@ -617,7 +633,7 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
-	pool_arm(n);
+	pool_arm(n, grain);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -629,7 +645,18 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 			  void *ctx, uint64_t n)
 {
-	pool_run(fn, ctx, n);
+	pool_run(fn, ctx, n, 1);
+}
+
+/*
+ * The same thing for a callback that works in blocks of `grain` rows. Every
+ * range it is handed then starts on a multiple of the grain and is a multiple
+ * of it long, except the last, which is whatever the total leaves over.
+ */
+void charsiu_parallel_for_grain(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
+				void *ctx, uint64_t n, unsigned grain)
+{
+	pool_run(fn, ctx, n, grain ? grain : 1);
 }
 
 /*
@@ -2169,7 +2196,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
-	pool_arm(w->ne[1]);
+	pool_arm(w->ne[1], 1);
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
@@ -6155,7 +6182,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			if (attn_pool()) {
 				charsiu_note("attention over the pool",
 					     cur_layer, (unsigned long)g_pool.n);
-				pool_run(attn_heads, &aj, m->n_head);
+				pool_run(attn_heads, &aj, m->n_head, 1);
 			} else {
 				attn_heads(&aj, 0, m->n_head);
 			}
