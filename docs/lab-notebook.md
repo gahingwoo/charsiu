@@ -2207,3 +2207,76 @@ TTFT at 1008 against 721 AND its decode at 20.71 against 24.74 -- and `read4` is
 read only by the batched gather, so it cannot reach decode at all. The next
 arm's decode came back to 24.74. Arms run in BLOCKS track the state of the
 board; the alternating round is the one to believe.
+
+## A door that was closed on an allocation
+
+fp16 attention on the NPU is implemented, was measured slower at every cache
+depth, and was shut. Attention has since turned out to be the largest stage in a
+prefilled row, so the verdict was worth re-reading -- and the note above the
+implementation contains its own refutation:
+
+> For the V cache a position is part of the reduction, so its k cannot move: it
+> is allocated at the context length and the matmul always runs there, with the
+> probabilities past the last token left zero. **That costs a fetch of the whole
+> V surface every call** and buys never repacking.
+
+Every round that closed the door ran `-c 2048`. A 916 token prompt then pays
+2.2x, a 110 token one 18x. And the cost is doubled by a second route: the input
+surface ceiling is `(k / 32) * m <= 5120`, so a wider k also buys fewer rows a
+pass -- 80 at a 2048 context, 160 at 1024.
+
+So: the same two arms, at a context barely above the prompt.
+
+```
+                    CPU attn    NPU attn
+   llama -c 2048      2.34        6.50
+   llama -c 640       2.28        4.16
+   qwen3 -c 2048      8.46        7.61
+   qwen3 -c 1024      8.39        5.97
+```
+
+**The CPU arm does not move** -- 2.34 to 2.28, 8.46 to 8.39 -- which is the
+control that makes the rest readable: its loop runs to `pos`, not to `n_ctx`, so
+if it HAD moved the round would have been measuring something else. The NPU arm
+moves 36% on Llama and 22% on Qwen3 for no reason but the size of a buffer.
+
+And on Qwen3 the NPU path **already wins at -c 2048**, and wins by 29% at 1024,
+where its V surface is only 1.12x oversized and there is little left to take.
+Attention is 63% of a prefilled Qwen3 row, so that is 18% of the whole prompt.
+
+The split is by head_dim: Qwen3's is 128 and the NPU wins, Llama's is 64 and the
+NPU loses at every context tried. That is the shape you would expect -- a wider
+head is a wider matmul -- and it means this is a per model choice rather than a
+default.
+
+### What the fix has to preserve
+
+`kv` now climbs a doubling ladder instead of sitting at the context length, so a
+run repacks at most log2 of the context many times. Three things had to survive
+it:
+
+- **the layout.** It would be easy to write the new V surface out by hand in the
+  growth path and easy to get it wrong. Instead the repack walks the FLOAT V
+  cache -- the source of truth, which both paths write -- and hands each
+  position to the same `charsiu_fp16_pack_vcol` the append path uses. There is
+  still exactly one copy of that layout in the file.
+- **the zeros.** The values matmul is legal only because the probabilities past
+  the last token are zero. Those live in a scratch whose rows are `kv` apart, so
+  a changed `kv` reinterprets every byte of it. It is re-zeroed on every rung --
+  a memset, not a reallocation, because `mmax * kv` is `5120 * 32` on every rung
+  and the size does not change.
+- **the refusal.** `attn_npu_layer` now refuses a T its surface does not cover.
+  Falling back to the CPU is always safe, because the float cache is written
+  either way; a stale surface is a wrong answer.
+
+### And the values kernel was four positions wide
+
+`attn_axpy4` is deliberately not an FMA -- `vmulq`, a barrier, `vaddq` -- so it
+rounds twice, as the scalar reference does. That stays. What was free was the
+WIDTH: per four output floats the loop does four multiplies, four adds, four V
+loads and one load and store of the output, so it is the output traffic that
+bounds it, and eight positions a call halves that per multiply. The additions
+still go a0, a1, a2 in order; what disappears is a store and a reload of a
+float32 in between, and a float32 that goes to memory and comes back is the same
+float32. `tests/axpy8` checks one eight wide call against two four wide ones
+over 520 shapes and finds no case differing in a single bit.
