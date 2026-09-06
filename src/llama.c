@@ -4590,7 +4590,11 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			return NULL;
 		}
 	}
-	a->f = charsiu_fp16_open();
+	/* ⚠ BORROW THE POOL'S DEVICE. Opening a second one costs decode 12 to
+	 * 14% for a handle it never submits through; see charsiu_fp16_open_on */
+	a->f = charsiu_fp16_open_on(charsiu_npu_device(s->pool.dev));
+	if (!a->f)
+		a->f = charsiu_fp16_open();   /* no pool: the probes' path */
 	if (!a->f)
 		return NULL;
 	nbuf = a->n_layer * a->nkv;
