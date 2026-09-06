@@ -2010,3 +2010,76 @@ SmolLM2's 77% regression becomes a 3% gain, and asking for 400 lands safely
 everywhere. Llama still wants 80, which is why the cap is a ceiling and not a
 recommendation: **legal is not the same as good, and this file now has both
 numbers for all three.**
+
+## The fence was never only a wait
+
+The fence was the last large item in a batched row that nobody had looked
+inside. On Llama-3.2-1B it is 1.36 of 7.75 ms a row, and every reading of it in
+this file -- *"the hardware is BUSY"*, *"a fence removed is worth more than a
+submit removed"* -- had taken it for time spent waiting for the NPU.
+
+`rocket_ioctl_prep_bo` is two things:
+
+```c
+ret = dma_resv_wait_timeout(gem_obj->resv, DMA_RESV_USAGE_WRITE, true, timeout);
+...
+dma_sync_sgtable_for_cpu(dev->dev, shmem_obj->sgt, DMA_BIDIRECTIONAL);
+```
+
+A wait, and then a cache invalidate over the WHOLE buffer. One ioctl, one
+number, two things -- the same shape as the three instruments corrected the day
+before: true about something other than its label.
+
+### Asking for the second one twice
+
+A second `prep` on a buffer whose fence has already signalled waits for nothing.
+`dma_resv_wait_timeout` returns at once and what is left is the invalidate, over
+the same bytes, through the same ioctl. `CHARSIU_FENCE_SPLIT=1` does that and
+charges it separately.
+
+The probe cannot be trusted on its own say-so, so the round ran the plain binary
+twice first and read the split arm against that spread:
+
+```
+   llama, 512 rows       fence   invalidate   the wait
+     plain 1              1.36        -           -
+     plain 2              1.35        -           -
+     split                1.39      0.30        1.09    1.99 GiB, 14.03 GB/s
+```
+
+1.36, 1.35, 1.39: the probe moves the number it measures by less than 3%, which
+is what makes the 0.30 worth reading. Qwen3 and SmolLM2 came back at the same
+ratio -- 0.24 of 1.15, 0.19 of 0.52 -- so **about a fifth of every fence on this
+board is cache maintenance, not the hardware.**
+
+The bytes are printed beside the microseconds on purpose. A rate whose
+denominator holds something other than the transfer it names is exactly how
+"2.36 GB/s of weights" got quoted here as a fact about the silicon.
+
+### And the other four fifths are not the weight fetch
+
+The obvious next story was that the wait is the weight fetch: the NPU reads
+every weight once per chunk, so a prompt in 7 chunks reads them seven times, and
+1.09 ms a row over 512 rows is 558 ms, which is about 4.2 GB at this board's
+measured roof. It fits.
+
+It is wrong, and one arm says so. Doubling the chunk halves the number of passes
+over the weights:
+
+```
+   llama, 512 rows      chunks   fence/row   read/row   prompt
+     chunk  80             7        1.37       2.20     4093 ms
+     chunk  80             7        1.35       2.27     4107 ms
+     chunk 160             4        1.42       2.68     4262 ms
+```
+
+Half the weight traffic, and the fence per row did not move -- it rose. **The
+fence scales with rows, not with weight passes**, so whatever the NPU is doing
+in those 356 us it is not waiting on DRAM for weights, and the "hardware is the
+floor" reading that has stood since the int4 work does not extend from decode to
+prefill.
+
+What DID move is the read, up 22% on the wider chunk, on a model whose widest
+tensor is 8192 -- while Qwen3, whose widest is 3072, held flat at 0.93. That is
+a working set, not a bandwidth, and it is the first mechanism this file has for
+why the best chunk is per model.
