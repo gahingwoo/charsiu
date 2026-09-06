@@ -3650,3 +3650,59 @@ What is left, with its price:
    hardware. That is a quantiser question -- go where the vendor is, one scale
    a row, and pay for it with a calibrated quantiser instead of RTN -- and
    npudev.c has the offline price already.
+
+### The read is at a memory ceiling, and it is not the little cores
+
+`read` is 36-38% of llama's matmul entry, 166 ms, and had never been split. It
+turns out not to need splitting so much as bounding.
+
+**It is fully pooled already**: "read back 320 slots on the pool and 0 one
+thread". And the pool buys exactly **2.0x**, no more:
+
+```
+  CHARSIU_NPU_POOL_READ=0   one thread    read 328.7 ms   prompt 765 ms
+  default / =1              the pool      read 164.6 ms   prompt 603 ms
+```
+
+Two explanations, both killed:
+
+**Not the memory walk.** Simulating `charsiu_acc_index`'s traversal on the host,
+every 64-byte line of the accumulator is fetched **exactly once** -- 1.00x the
+ideal at n = 512, 2048 and 8192, even with only 256 KB of cache. There is no
+line amplification to remove.
+
+**Not the little cores.** This board is 4x A53 (MIDR d03, CPUs 0-3) and 4x A72
+(d08, CPUs 4-7) -- read off the board rather than assumed -- and
+`charsiu_parallel_for` splits a range into equal chunks, so four A53s dragging
+three A72s to a barrier was the obvious story. It is wrong:
+
+```
+  0-7, 8 threads   read 166.7 / 167.9 / 165.7 ms      prompt 603 / 606 / 603
+  4-7, 4 threads   read 169.9 / 177.7                 prompt 613
+  0-3, 4 threads   read 504.6                         prompt 1059   <- the control
+```
+
+Four big cores are no faster than eight mixed, and the A53-only control is 3x
+worse, which is what makes the first line mean something. **The read saturates
+at about 2.6 GB/s of traffic and more threads do not move it.**
+
+### 🔑 So both remaining levers are the same quantity: S
+
+The read's volume is `m·n·S·4` bytes in and `m·n·4` out, where **S is the number
+of K slices**. It cannot be threaded faster and it has no layout to fix, so the
+only way down is fewer slices. And the fence's other term -- 270 µs a dispatch
+-- is also proportional to S.
+
+`S = ceil(k / KMAX)`, and KMAX is pinned to the quantisation group because one
+dispatch cannot span two groups. For llama at KMAX 1024 that is S = 2 for six
+tensors of seven and S = 8 for `ffn_down`.
+
+**S = 1 would take the read from 166 to about 83 ms, the entry from 453 to ~370
+and the prompt from 603 to ~520 -- 14%.** It is not a dispatch change; it is a
+quantiser change, and npudev.c already carries its offline price: one scale a
+row against group 1024 costs attn_q 0.1427 -> 0.1518 and ffn_down 0.1402 ->
+0.1707 relative Frobenius, while **the per-k AWQ factor takes the K = 2048
+tensors BELOW the grouped number** (attn_q 0.1409) and does nothing for
+ffn_down, which is the one with the most slices to save.
+
+That is a model-quality decision and belongs to the user, not to a round.
