@@ -89,8 +89,19 @@ c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
 *)        _kname="not a release this script knows" ;;
 esac
 echo "kernel   $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
-[ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
-	echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+# ⚠ AGAINST now - uptime, NOT /proc/1. The old test was
+# `[ /boot/Image -nt /proc/1 ]` and it fires on a board where the Image is
+# fifteen hours OLDER than the boot: /proc/1's mtime is not the boot instant,
+# it moves. This compares the Image's mtime against the clock minus uptime,
+# which is the boot instant and nothing else. A warning that cries wolf is
+# worse than none -- it is the one that will be ignored when the Image really
+# is newer.
+if [ -f /boot/Image ]; then
+	_imt=$(date -r /boot/Image +%s 2>/dev/null || echo 0)
+	_boot=$(awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0)
+	[ "$_imt" -gt 0 ] && [ "$_boot" -gt 0 ] && [ "$_imt" -gt "$_boot" ] && \
+		echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+fi
 echo "config   width $W, KMAX $KMAX, serial once then parallel x$PASSES${CHARSIU_OVL_EXTRA:+, extra: $CHARSIU_OVL_EXTRA}"
 echo
 
