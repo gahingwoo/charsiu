@@ -101,9 +101,41 @@ int main(int argc, char **argv)
 	 * 8 (default, every earlier sweep) or 4 for int4 weights with fp16
 	 * activations, which is the pair llama.c actually submits.
 	 */
-	int w4 = argc > 5 && atoi(argv[5]) == 4;
+	/*
+	 * ⚠⚠ AND 48 IS w4a8, WHICH THE VENDOR RUNS AND THIS TREE NEVER HAS.
+	 *
+	 * CNA 0x100c bit 29 selects 16 bit activations (charsiu_int4.c's own
+	 * header, from diffing the vendor's int4 against its int8), and
+	 * charsiu sets it for EVERY int4 dispatch because
+	 * charsiu_effective_adtype returns FP16 for int4 unconditionally.
+	 * Round 178 measured that an int4 dispatch consumes its activation as
+	 * 16 bits "whatever the stream asks for" -- but every stream it asked
+	 * with had bit 29 set, so what it established is that bit 29 works,
+	 * not that clearing it does nothing.
+	 *
+	 * The vendor's Llama-3.2-1B .rkllm settles that it is a real mode:
+	 * of 3328 int4 dispatches, 1408 carry 0x00600120 with bit 29 CLEAR,
+	 * and they are exactly the M in {1, 32, 64} while {16, 24, 40, 48, 80}
+	 * carry 0x20600120. Two activation precisions per weight, chosen by
+	 * batch width.
+	 *
+	 * ⚠ THE CALLER MUST ALSO SET CHARSIU_A8_STRIDE1, because
+	 * charsiu_effective_adtype is what every buffer size, the surface and
+	 * the packing derive from -- without it the stream would say 8 bit and
+	 * the buffers would still be built for 16, which is two descriptions of
+	 * different memory and the classic way to measure nothing.
+	 */
+	int dt = argc > 5 ? atoi(argv[5]) : 8;
+	int w4 = dt == 4 || dt == 48;
 	int wdt = w4 ? CHARSIU_INT4 : CHARSIU_INT8;
-	int adt = w4 ? CHARSIU_FP16 : CHARSIU_INT8;
+	int adt = dt == 4 ? CHARSIU_FP16 : CHARSIU_INT8;
+
+	if (dt == 48 && !getenv("CHARSIU_A8_STRIDE1")) {
+		fprintf(stderr, "npu_fence_scan: w4a8 needs "
+			"CHARSIU_A8_STRIDE1=1 set, or the stream says 8 bit "
+			"and every buffer is still built for 16\n");
+		return 1;
+	}
 	unsigned nmax = NS[NN - 1], i, r;
 	struct charsiu_device *dev;
 	struct charsiu_bo wt = { 0 }, in = { 0 }, ob = { 0 }, coef = { 0 },
@@ -119,7 +151,7 @@ int main(int argc, char **argv)
 	if (!dev) { fprintf(stderr, "no accel device\n"); return 1; }
 	printf("one dispatch, k=%u m=%u %s, %u repeats a point, buffers"
 	       " allocated once at n=%u%s\n", k, m,
-	       w4 ? "w4a16" : "int8", reps, nmax,
+	       dt == 48 ? "w4a8" : w4 ? "w4a16" : "int8", reps, nmax,
 	       ring > 1 ? ", COLD ring" : ", warm (one weight buffer)");
 
 	/* sized for the widest point, so nothing here moves during the sweep */

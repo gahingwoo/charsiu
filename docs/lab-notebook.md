@@ -3541,3 +3541,168 @@ on any model.** Every run in both arms hashes to its own token loop.
 Small, and worth having for a reason beyond the milliseconds: flushing bytes
 the call did not write is not a tuning choice. The remaining FINI is now
 roughly what the writes justify.
+
+### ⛔ w4a8 costs exactly what w4a16 costs — and int8 WEIGHTS are 1.9x faster
+
+The vendor's Llama-3.2-1B `.rkllm` runs two activation precisions per weight
+and picks by batch width: of 3328 int4 dispatches, 1408 clear CNA 0x100c bit 29
+(8 bit activations) and they are exactly `M ∈ {1, 32, 64}`, while
+`M ∈ {16, 24, 40, 48, 80}` set it. charsiu sets it on every int4 dispatch,
+because `charsiu_effective_adtype` returns FP16 for int4 unconditionally, and
+round 178's "int4 consumes 16 bit activations whatever the stream asks" was
+measured with bit 29 set in every stream it asked with.
+
+`npu_fence_scan` grew a w4a8 mode, and the mode demonstrably engaged -- the two
+streams differ on the host, and not only in the flag:
+
+```
+  0x100c   20600120 -> 00600120     bit 29 cleared
+  0x103c   0a000000 -> 05000000     the SURFACE halves, as "surf follows the
+  0x1028   0a0003ff -> 050003ff     activation precision" predicts
+```
+
+Cold ring, µs per output channel at the wide end, m = 80:
+
+```
+           k = 1024        k = 2048
+  int8       0.1548          0.2144
+  w4a16      0.2099          0.4089
+  w4a8       0.2121          0.4120     <- within 1% of w4a16 at both k
+```
+
+**Clearing bit 29 changes nothing about the cost.** The activation precision is
+not the 6x between our 0.495 TMAC/s and the part's int8 rating. What it does buy
+is a half-size input surface, which doubles the `(k/32)·m ≤ 5120` ceiling -- not
+cashable today, since the chunk cap it widens is not what binds and the K slice
+it would widen is held by the quantiser group.
+
+🔑 **The other half of that table is not a negative.** At k = 2048 an int8-weight
+dispatch is `0.2144` against int4's `0.4089` -- **1.9x faster while reading
+TWICE the weight bytes**, which is the MAC-rate model saying the fence is not
+weight-bandwidth bound at this shape. At k = 1024 it is 1.35x.
+
+So for PREFILL, which is MAC-bound, int8 weights are the faster arm and int4 is
+the DRAM-bound choice that belongs to decode. The tree already has both paths
+and a heuristic between them; what it has not had until now is the per-dispatch
+model saying how much the trade is worth.
+
+### ⛔ And int8 weights lose the whole prompt by 25 to 30%
+
+The per-dispatch 1.9x does not survive contact with a run. Interleaved, six
+repeats, one session, each arm against its OWN token loop (the two quantise
+differently, so their text should differ and a cross-arm hash would read a
+correct run as a regression):
+
+```
+            prompt ms          decode 16 tok      staging     peak
+  llama w4  601..608  (604)    756..760   (758)   7.2 s      1544 MB
+  llama w8  740..769  (752)   1381..1390 (1385)   9.6 s      2130 MB
+  qwen3 w4  710..725  (718)    607..610   (608)   3.7 s      1129 MB
+  qwen3 w8  903..958  (936)    923..942   (930)   4.7 s      1420 MB
+```
+
+**+25% and +30% on the prompt, 1.5x to 1.8x on decode, +40% staging, +30%
+memory.** The int4 default is right and this measures why rather than assuming
+it: an int8-weight run also quantises the ACTIVATION per row on the CPU inside
+the pack loop -- a max pass and a quantise pass over every slice -- where w4a16
+packs fp16 straight through with NEON. The dispatch is faster and the entry
+around it is not.
+
+⚠ The w8 batched hash differs from the w8 token loop, and that is expected
+rather than a bug: npudev's own note says a multi-slice int8 tensor is
+quantised FINER in the batch than in the row loop, on purpose, and cannot match
+it to 0.1%. Worth writing down because a round that compared the two arms'
+hashes instead of each arm against its own reference would have called this a
+correctness failure.
+
+### Where that leaves the prefill gap
+
+Everything cheap is now measured and most of it is closed:
+
+```
+  w4a8 instead of w4a16          no change at all (within 1%)
+  int8 weights                   25-30% WORSE end to end
+  capping the output width       8% on gemma-3-1b, nothing on two others
+  KMAX 2048 by hand              a quantiser change on any model whose K
+                                   divides both widths; llama.c already
+                                   refuses it there
+  input reuse misses             diagnosed, fixed, worth nothing
+  one input BO per K slice       SHIPPED, 1.1-2.9%
+  the pack's FINI ioctls         halved by the above
+  hiding pack behind the NPU     no next tensor to pack: the chain is serial
+```
+
+What is left, with its price:
+
+1. **Submit a group before reading it** -- `{q,k,v}` and `{gate,up}` are the
+   only independence inside a layer. Worth about 8%: the hideable reads are
+   bounded by the group's own NPU time, which on qwen3 is 19 ms in the first
+   group and 18 in the second against a 444 ms entry. Blocked by k and v
+   sharing an output geometry and gate and up sharing another; a ping-pong pair
+   costs about 5 MB a device.
+2. **The read, which is 21-37% of the entry and has never been split** the way
+   the pack now is. Its volume is `m·n·S·4` read plus `m·n·4` written -- on
+   llama 304 MB in 164.6 ms, **1.85 GB/s**, against the 7.13 GB/s one thread of
+   this board managed on a plain read. Three to four times off memory speed,
+   and the index gather is the suspect that the pack's FINI was.
+3. **Fewer K slices** would cut the read AND the fence's intercepts
+   proportionally, and it is blocked by the quantiser group, not by the
+   hardware. That is a quantiser question -- go where the vendor is, one scale
+   a row, and pay for it with a calibrated quantiser instead of RTN -- and
+   npudev.c has the offline price already.
+
+### The read is at a memory ceiling, and it is not the little cores
+
+`read` is 36-38% of llama's matmul entry, 166 ms, and had never been split. It
+turns out not to need splitting so much as bounding.
+
+**It is fully pooled already**: "read back 320 slots on the pool and 0 one
+thread". And the pool buys exactly **2.0x**, no more:
+
+```
+  CHARSIU_NPU_POOL_READ=0   one thread    read 328.7 ms   prompt 765 ms
+  default / =1              the pool      read 164.6 ms   prompt 603 ms
+```
+
+Two explanations, both killed:
+
+**Not the memory walk.** Simulating `charsiu_acc_index`'s traversal on the host,
+every 64-byte line of the accumulator is fetched **exactly once** -- 1.00x the
+ideal at n = 512, 2048 and 8192, even with only 256 KB of cache. There is no
+line amplification to remove.
+
+**Not the little cores.** This board is 4x A53 (MIDR d03, CPUs 0-3) and 4x A72
+(d08, CPUs 4-7) -- read off the board rather than assumed -- and
+`charsiu_parallel_for` splits a range into equal chunks, so four A53s dragging
+three A72s to a barrier was the obvious story. It is wrong:
+
+```
+  0-7, 8 threads   read 166.7 / 167.9 / 165.7 ms      prompt 603 / 606 / 603
+  4-7, 4 threads   read 169.9 / 177.7                 prompt 613
+  0-3, 4 threads   read 504.6                         prompt 1059   <- the control
+```
+
+Four big cores are no faster than eight mixed, and the A53-only control is 3x
+worse, which is what makes the first line mean something. **The read saturates
+at about 2.6 GB/s of traffic and more threads do not move it.**
+
+### 🔑 So both remaining levers are the same quantity: S
+
+The read's volume is `m·n·S·4` bytes in and `m·n·4` out, where **S is the number
+of K slices**. It cannot be threaded faster and it has no layout to fix, so the
+only way down is fewer slices. And the fence's other term -- 270 µs a dispatch
+-- is also proportional to S.
+
+`S = ceil(k / KMAX)`, and KMAX is pinned to the quantisation group because one
+dispatch cannot span two groups. For llama at KMAX 1024 that is S = 2 for six
+tensors of seven and S = 8 for `ffn_down`.
+
+**S = 1 would take the read from 166 to about 83 ms, the entry from 453 to ~370
+and the prompt from 603 to ~520 -- 14%.** It is not a dispatch change; it is a
+quantiser change, and npudev.c already carries its offline price: one scale a
+row against group 1024 costs attn_q 0.1427 -> 0.1518 and ffn_down 0.1402 ->
+0.1707 relative Frobenius, while **the per-k AWQ factor takes the K = 2048
+tensors BELOW the grouped number** (attn_q 0.1409) and does nothing for
+ffn_down, which is the one with the most slices to save.
+
+That is a model-quality decision and belongs to the user, not to a round.
