@@ -2083,3 +2083,68 @@ What DID move is the read, up 22% on the wider chunk, on a model whose widest
 tensor is 8192 -- while Qwen3, whose widest is 3072, held flat at 0.93. That is
 a working set, not a bandwidth, and it is the first mechanism this file has for
 why the best chunk is per model.
+
+## The chunk curve, and a knob that had been sitting in the source
+
+The chunk had been read twice before: once by a sweep that only went DOWN from
+80, and once by a sweep that went up and found 160 good for Qwen3 and bad for
+Llama. Neither had a stage table beside it, so neither could say what moved.
+
+With one:
+
+```
+                     16      32      48      80      80     120     160
+   llama ms a row   9.50    8.48    8.16    7.79    7.78   7.67    8.12
+   qwen3 ms a row  15.86   14.89   13.90   13.19   13.30  12.65   12.25
+   smol  ms a row                           4.66    4.60          4.54 (->106)
+```
+
+Llama has a minimum at 120 and turns up after it. Qwen3 is still falling at its
+own ceiling. SmolLM2 is still falling at its own ceiling, which is 106.
+
+And the entry says which column does it. Between 80 and 160, on Llama, `read`
+goes 2.20 to 2.68 while everything else holds; on Qwen3 it goes 0.96 to 0.93.
+**Llama's widest tensor is 8192 and Qwen3's is 3072**, and the read walks the
+output buffer of one slot, which is `widest * m * 4` bytes. That is the first
+mechanism this file has had for why the chunk is per model -- the earlier note
+said "whatever hurts a small model at a wide chunk has not been found", and the
+answer is that it is not the small model that is hurt, it is the WIDE one.
+
+`min(cap, 120)` is faster than 80 on all three. It is not shipped as a default
+yet, because 120 is Llama's minimum and Llama is the only one of the three whose
+curve has a minimum below its ceiling -- a rule fitted at the single point that
+exercises it is the mistake this file has already made once.
+
+### read_rows2: measured, at last
+
+Underneath `read_rows` sits `read_rows2`, with a comment ending *"whether two is
+on the right side of the A72's store buffer is a board question, and
+CHARSIU_NPU_READ4=2 asks it."* Nothing in this repository had ever asked it.
+`read_rows4` -- four rows off one line, four write streams -- lost 2.3x, and the
+two-row form went in beside it and was never run.
+
+```
+                 ms a row    read     text
+   llama plain     7.81      2.23     6c2e11a4...
+   llama plain     7.78      2.23     6c2e11a4...
+   llama read2     7.69      2.06     6c2e11a4...   identical
+   qwen3 plain     13.35     0.96     955de80d...
+   qwen3 read2     13.21     0.92     955de80d...   identical
+```
+
+Both plain arms agree on the read to the hundredth, so 2.23 to 2.06 is 7.6% and
+not weather. Llama gains more than Qwen3, which is the same width story again:
+2.23 ms a row of gather has more to save than 0.96.
+
+### And it was applying by accident
+
+`pool_arm` gives each worker `n / (4 * threads)` rows. At m = 80 with eight
+threads that is 2, and the pair form needs an even range, so it applied. At m =
+120 it is 3 and the pair form would have returned 0 on every range and fallen
+back to the scalar path -- silently, because falling back is what it is supposed
+to do when it cannot help.
+
+So the 7.6% was measured at the one width where an unrelated division happened
+to come out even. `charsiu_parallel_for_grain` rounds the chunk up to a multiple
+of the grain and the read asks for 2 when the pair form is on. Nothing that did
+not ask for a grain changes.
