@@ -452,7 +452,7 @@ void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out)
  */
 void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 {
-	double pack, sub, fence, read, prep, named, other, wall;
+	double pack, sub, fence, read, prep, named, other, wall, scale;
 	unsigned nbuf = 0;
 	double alloc;
 
@@ -461,9 +461,10 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 	/* reset = 0: reading this must not disturb a run that is still going */
 	charsiu_npu_batch_split(p->dev, &pack, &sub, &fence, &read, 0);
 	prep = charsiu_npu_batch_prep(p->dev, 0);
+	scale = charsiu_npu_batch_scale(p->dev, 0);
 	alloc = charsiu_npu_batch_alloc(p->dev, &nbuf, 0);
 	wall = charsiu_npu_batch_wall(p->dev, 0);
-	named = pack + sub + fence + read + prep;
+	named = pack + sub + fence + read + prep + scale;
 	if (named <= 0.0 || wall <= 0.0)
 		return;              /* nothing took the batched path */
 	other = wall - named;
@@ -489,6 +490,14 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 		fence, 100.0 * fence / wall);
 	fprintf(out, "    read  %8.1f ms  %5.1f%%  reading the accumulators "
 		"back\n", read, 100.0 * read / wall);
+	/*
+	 * ⚠ SAID EVEN WHEN ZERO, because zero is a fact about the model: a
+	 * tensor is on this path only when it is UNGROUPED, so a grouped model
+	 * prints 0.0 here and an ungrouped one prints the largest line after
+	 * the fence and the read. It was 14 to 17% of the entry with no name.
+	 */
+	fprintf(out, "    scale %8.1f ms  %5.1f%%  the tail per channel scale, "
+		"ungrouped tensors only\n", scale, 100.0 * scale / wall);
 	fprintf(out, "    ----\n");
 	fprintf(out, "    other %8.1f ms  %5.1f%%  %s\n", other,
 		100.0 * other / wall,
