@@ -839,6 +839,17 @@ int main(int argc, char **argv)
 		 */
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
 		int chunk = ec ? atoi(ec) : 80;
+		int cap = llama_prefill_chunk_cap(&m);
+
+		/* ⚠ the cliff, not a preference: above this the projection is
+		 * refused and every row of the prompt takes the token loop */
+		if (chunk > cap) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: a chunk of %d would "
+					"cross this model's surface ceiling; "
+					"capped to %d\n", chunk, cap);
+			chunk = cap;
+		}
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
