@@ -493,6 +493,7 @@ void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
 				    double *packcall, int reset);
 double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset);
+double charsiu_npu_batch_scale(struct charsiu_npu *g, int reset);
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset);
 /* the parts of "pack" that are not packing: the register streams emitted a
  * slot, and the FINI ioctls a device */

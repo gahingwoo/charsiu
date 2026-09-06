@@ -3706,3 +3706,81 @@ tensors BELOW the grouped number** (attn_q 0.1409) and does nothing for
 ffn_down, which is the one with the most slices to save.
 
 That is a model-quality decision and belongs to the user, not to a round.
+
+### ⛔ The read fusion is worth nothing, and an existing knob said so for free
+
+The plan was to deal both K slices of a tensor to ONE device so
+`read_fused_rows` walks Y once instead of twice -- on the traffic count that is
+a quarter of the read, since Y goes from a write plus a read-modify-write to a
+single write on every two-slice tensor. It needs a pair-submit refactor of the
+hottest path to arrange.
+
+`CHARSIU_NPU_ONEDEV=1` already arranges it, for every tensor, for free:
+
+```
+                       ranges   read ms/row   read total   fence
+  two cores, split      224      2.07 / 2.09   166.0/167.2  195 ms
+  onedev,   fused       112      2.06 / 2.06   164.6/164.6  327 ms
+```
+
+**The (device, output range) pairs halve, exactly as the refactor would arrange
+them, and the read does not move by more than the noise.** So either the fusion
+does not fire or -- far more likely -- the read is not bound by the Y traffic
+at all.
+
+The arithmetic agrees once it is done properly: the accumulator side is
+`S·m·n·4` and is **unchanged by any dealing**, because S is a property of k and
+KMAX and not of which device holds a slice. Y is `m·n·4` and is written
+sequentially. On `ffn_gate` that is 5.24 MB of scattered accumulator against
+2.62 MB of streaming Y, and the scattered side is what costs.
+
+So the read has exactly one lever and it is S. That is now established from two
+directions -- more threads do not move it (2.0x is the ceiling), and neither
+does removing a third of its traffic.
+
+What survives of the pair submit is its **overlap only**: reading `gate` while
+`up` still runs, and `q` and `k` while `v` runs. Priced off the per-layer MAC
+and read shares that is about 3.3 ms a layer, 52 ms of a 453 ms entry, **8.6%
+of the prompt** -- worth having, and worth knowing it is 8.6% and not the 15%
+it looked like an hour ago.
+
+### 🏁 The tail per channel scale: 14-17% of the entry, and it had no name
+
+An UNGROUPED tensor takes its per channel scale once at the end, as a full
+`m × n` pass over Y. That pass sat after the device loop, **outside every
+counter, single threaded and scalar**, and landed in the report's `other` row.
+Which is why `other` read 2.2 ms on Llama and 62.5 on Qwen3 and 110.0 on
+gemma-3-1b: llama is grouped everywhere and never runs it.
+
+"Ungrouped" is wider than it sounds. `tensor_grouped` wants `kgroup < k`, so a
+tensor whose K **is** one group -- Qwen3's 1024-wide projections at group 1024
+-- is on this path too, as is every tensor of a model npuquant put on one scale
+a row because its K divides no candidate width.
+
+Counted, vectorised four at a time, and put on the pool by the same size rule
+the read uses. `CHARSIU_NPU_TAIL_PLAIN=1` is the old loop, so both arms come
+out of one binary, interleaved, in one session:
+
+```
+  prompt ms       fast (4 runs)            plain (4 runs)          delta
+  gemma3     860 847 852 859   (854.5)   875 883 879 885 (880.5)   -26 ms  -3.0%  4/4
+  qwen3      714 723 708 703   (712)     719 716 727 726 (722)     -10     -1.4%  3/4
+  llama      603 605 602 602   (603)     606 600 604 605 (603.8)    -0.8    noise  <- the control
+```
+
+**llama is the null control and it correctly shows nothing**, because it never
+runs the loop. Every run in both arms hashes exactly to its own token loop --
+the arms multiply the same elements by the same scales in the same order, so
+equal is the only acceptable answer, not close.
+
+And the row now exists, which is the durable part:
+
+```
+  gemma3   scale 39.0 ms  6.8%     other 2.7 ms  0.5%    (other was 110.0, 16.6%)
+  qwen3    scale 21.5 ms  5.4%     other 2.4 ms  0.6%    (other was  62.5, 14.1%)
+```
+
+The scalar loop was 110 and 62.5 ms; vectorised and pooled it is 39.0 and 21.5
+-- **2.8x** -- and the unnamed row collapses to under 1% on every model. The
+prompt moves less than the line does, which is honest and worth saying: some of
+the old cost was overlapping a stall elsewhere.

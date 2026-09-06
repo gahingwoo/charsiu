@@ -570,6 +570,25 @@ struct charsiu_npu {
 	 */
 	double bwall_us;
 	double bprep_us;	/* buffers and the output zero, before any of it */
+	/*
+	 * ⚠⚠ THE TAIL SCALE, WHICH WAS 14 TO 17% OF THE ENTRY AND HAD NO
+	 * NAME.
+	 *
+	 * An UNGROUPED tensor gets its per channel scale once, at the end,
+	 * as a full m by n pass over Y. That pass sat after the device loop
+	 * outside every counter, single threaded and scalar, so it landed in
+	 * the report's `other` row -- 2.2 ms on Llama, which is grouped
+	 * everywhere and never runs it, against 62.5 ms on Qwen3 and 110.0
+	 * on gemma-3-1b, which run it on nearly every tensor.
+	 *
+	 * `ungrouped` is wider than it sounds: tensor_grouped wants
+	 * kgroup < k, so a tensor whose K IS one group -- Qwen3's 1024 wide
+	 * projections at group 1024 -- is on this path too, as is every
+	 * tensor of a model npuquant put on one scale a row because its K
+	 * divides no candidate width.
+	 */
+	double bscale_us;       /* the per channel scale an ungrouped tensor
+				 * takes at the end, over the whole of Y */
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
 	double balloc_us;	/* the output BO allocation, inside prep */
@@ -3783,6 +3802,16 @@ double charsiu_npu_batch_prep(struct charsiu_npu *g, int reset)
 	return v;
 }
 
+/* the tail per channel scale an ungrouped tensor pays; see bscale_us */
+double charsiu_npu_batch_scale(struct charsiu_npu *g, int reset)
+{
+	double v = g->bscale_us / 1e3;
+
+	if (reset)
+		g->bscale_us = 0.0;
+	return v;
+}
+
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 {
 	double v = g->balloc_us / 1e3;
@@ -4710,6 +4739,41 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
  * function has eleven return points and wrapping each of them is a bug waiting
  * for the twelfth. See bwall_us.
  */
+static int tail_plain(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_NPU_TAIL_PLAIN") != NULL;
+	return v;
+}
+
+/* Y[r][j] *= scale[j], the tail an ungrouped tensor pays. See bscale_us. */
+struct tail_scale_job {
+	float *Y;
+	const float *scale;
+	unsigned n;
+};
+
+static void tail_scale_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct tail_scale_job *t = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++) {
+		float *y = t->Y + r * t->n;
+		unsigned j = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+		for (; j + 4 <= t->n; j += 4)
+			vst1q_f32(y + j, vmulq_f32(vld1q_f32(y + j),
+						   vld1q_f32(t->scale + j)));
+#endif
+		for (; j < t->n; j++)
+			y[j] *= t->scale[j];
+	}
+}
+
 static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			    unsigned m, float *Y)
 {
@@ -5676,10 +5740,37 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	/* an ungrouped tensor is scaled once, per channel, at the end; int8
 	 * always is, because its d1 went in above */
-	if (!g->w4 || !tensor_grouped(g, e->t))
-		for (unsigned r = 0; r < m; r++)
-			for (unsigned j = 0; j < (unsigned)e->t->n; j++)
-				Y[(size_t)r * e->t->n + j] *= e->t->scale[j];
+	if (!g->w4 || !tensor_grouped(g, e->t)) {
+		struct tail_scale_job tj = { Y, e->t->scale,
+					     (unsigned)e->t->n };
+		double ts = now_us();
+
+		/*
+		 * ⚠ THE ROWS ARE INDEPENDENT, so the pool needs no grain and
+		 * the order cannot change: element (r, j) is multiplied by
+		 * scale[j] and by nothing else. The vector form below is the
+		 * same IEEE single multiply four at a time -- there is no add
+		 * for a compiler to fuse into an fma, which is the one way a
+		 * rewrite like this has changed a value in this tree before.
+		 */
+		/* ⚠ THE CONTROL, in the same binary: CHARSIU_NPU_TAIL_PLAIN=1
+		 * is the loop exactly as it was, one thread and scalar, so the
+		 * two arms can be interleaved in one session. The board drifts
+		 * 3% between sessions and that is the size of what this
+		 * measures. */
+		if (tail_plain())
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < (unsigned)e->t->n; j++)
+					Y[(size_t)r * e->t->n + j] *=
+						e->t->scale[j];
+		else if (g->poolread == 1 ||
+			 (g->poolread == 2 &&
+			  (size_t)m * e->t->n >= g->poolread_min))
+			charsiu_parallel_for(tail_scale_rows, &tj, m);
+		else
+			tail_scale_rows(&tj, 0, m);
+		g->bscale_us += now_us() - ts;
+	}
 	return 0;
 }
 
