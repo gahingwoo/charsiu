@@ -3229,3 +3229,34 @@ Inside the envelope the widths run; outside it they still refuse.
 the hardware and the draw, so it cannot separate "needs two cores" from "needs
 the current". Off-envelope this keeps refusing, which costs a fallback nobody
 will notice -- no prompt length measured yet makes the chunker emit 8 or 10.
+
+### m72: 8, 10, 22 and 24 all exact at 800 mV, through the shipped gate
+
+Llama-3.2-1B, 113 staged tensors, two passes a width, `CHARSIU_NPU_W4_M8`
+deliberately **not** set -- so 8 and 10 had to get past npudev's new gate to
+reach the hardware at all, and getting a row count back at all is the gate
+working:
+
+```
+   width   pass 0            pass 1            worst
+    8       904 of 904        904 of 904       5.10e-05
+   10      1130 of 1130      1130 of 1130      5.10e-05   <- never measured
+   22      2486 of 2486      2486 of 2486      5.10e-05      at 800 mV before
+   24      2712 of 2712      2712 of 2712      5.10e-05
+```
+
+m = 10 is the one that had to be asked separately: `board_w4_m8.sh` caps at 8,
+and the chunker splits **both** 8 and 10, so lifting its split on one width's
+evidence would have been the layout-proof mistake again.
+
+So `prefill_width()`'s `8 -> 4+4` and `10 -> 6+4` now happen only when
+`charsiu_npu_overlap_ok()` says the rail is below the envelope. **The split
+stays there for a good reason rather than a cautious one:** off-envelope
+npudev refuses 8 and 10, a refused chunk runs a row at a time, and two batched
+calls of 4 are much faster than that. The same reading of the same envelope
+now picks between two correct paths instead of guarding a broken one.
+
+⚠ m71 is why this round existed: asked for `CHARSIU_PREFILL_CHUNK=8` the board
+answered `widths 20x4`. The chunker had already split it, so the gate under
+test was never reached and the round proved nothing about it. The widths line
+said so on its own output.
