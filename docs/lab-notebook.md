@@ -2649,3 +2649,44 @@ one process, and it does not exist yet.
 The prefill side of the same work needs none of that, because the stage table
 compares inside one run: Qwen3 at 916 tokens goes 12.41 to 11.21 ms a row with
 attention 7.69 to 5.52, and it repeats.
+
+## The tree already knew, and the new tool repeats the mistake its neighbour warns about
+
+`charsiu_bench.c` has carried this in its header since round 165:
+
+> Sweeping tasks per job from 1 to 128 at three shapes, the marginal cost of one
+> more task is ... M is nearly free. The same weights at M = 32 cost 1.08 times
+> what they cost at M = 1 while doing 32 times the arithmetic, so the cost is not
+> MAC and not the row count. **It tracks the WEIGHT BYTES, at something close to
+> 10 GB/s** ... There is also a **fixed cost of 180 to 195 us per submit that
+> chaining removes**.
+
+Which is most of what today's fence work concluded, written down months ago. The
+afternoon spent establishing that the fence is not the arithmetic re-derived a
+result this repository already held, and the only genuinely new part is that the
+"fixed" cost is not fixed in m: 118 us at m = 16 against 299 at m = 80, where
+round 165 measured 180 to 195 at M = 1.
+
+**And checking the new tool against the old result finds a fault in the new
+one.** If the marginal cost tracks weight bytes, then at k bytes per output
+channel the slope must double when k doubles. It does not:
+
+```
+      k = 512    0.141 us a channel    2.75x what 10 GB/s would cost
+      k = 1024   0.152                 1.48x
+      k = 2048   0.208                 1.02x
+```
+
+Only the widest k is paying a cold weight fetch. `npu_fence_scan` loops ONE
+shape twenty times -- and `bench_batch`'s header, two files away, says exactly
+what that does: *"the first version looped on one tensor 200 times, which left it
+in cache and measured arithmetic rather than memory"*. The intercept survives it,
+because a fixed cost per submit is paid warm or cold. The slope does not: it is a
+warm number, and a first dispatch of a cold tensor costs more.
+
+The header of `npu_fence_scan` now says so. The fix is to walk a model's layers
+the way `bench_batch` does, and it is not written.
+
+**Read the neighbouring file's comments before building the instrument.** Both
+halves of today's fence answer were already in this tree, and the tool built to
+find them reproduced the specific error the file next to it exists to warn about.

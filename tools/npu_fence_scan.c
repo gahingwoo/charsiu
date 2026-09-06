@@ -30,6 +30,28 @@
  * a constant lands in the intercept, and the slope is then the part that is
  * really about the width. Both are printed.
  *
+ * ⚠⚠ AND IT REPEATS ONE SHAPE, WHICH THIS TREE HAS WARNED ABOUT IN WRITING.
+ *
+ * bench_batch's own header says: "the first version looped on one tensor 200
+ * times, which left it in cache and measured arithmetic rather than memory".
+ * This loops one shape `reps` times. So its slope is a WARM number, and the
+ * board says so: round 165 measured the marginal cost of a task tracking the
+ * WEIGHT BYTES at close to 10 GB/s, which at k bytes an output channel would
+ * make the slope double every time k doubles. It does not --
+ *
+ *      k = 512    0.141 us a channel   2.75x what 10 GB/s would cost
+ *      k = 1024   0.152                1.48x
+ *      k = 2048   0.208                1.02x
+ *
+ * -- so only the widest k here is paying a cold weight fetch, and the narrow
+ * ones are being served from somewhere closer. The INTERCEPT is not affected by
+ * that (a fixed cost per submit is paid warm or cold, and round 165 put it at
+ * 180 to 195 us at M = 1 against the 118 to 305 this measures across m), but
+ * the SLOPE understates a first, cold dispatch.
+ *
+ * Walking a model's layers the way bench_batch does is the fix, and it is not
+ * done here.
+ *
  *   npu_fence_scan [k] [m] [reps]
  */
 #define _POSIX_C_SOURCE 200809L
