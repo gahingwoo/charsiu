@@ -2368,3 +2368,37 @@ Phi-3.5 and TinyLLAMA.
 And the decode column has its own shape: nearly every arm shows one low outlier
 (Phi-3.5 reads 4.66 and 6.84 in the same three runs), which is why the script
 reports the best and prints the range beside it.
+
+## Half a rule, shipped as a whole one
+
+`CHARSIU_ATTN_NPU=auto` went in on four points that were monotone in head_dim
+and had a mechanism that needed no fitting. It was measured on the vendor's own
+protocol the same hour and it lost:
+
+```
+                   shipping   auto    head_dim   the gate
+   Qwen3              707      954      128       ON    decode 24.63 -> 20.84
+   TinyLLAMA          915      919       64       off   unchanged
+   Phi3              3004     3019       96       off   unchanged
+   Gemma4            2408     2527     >=128      ON    decode  8.70 ->  7.57
+```
+
+The gate is not the error -- it fires on exactly the two models it was meant to
+and the two it skips do not move at all, which is as clean a control as this
+harness gives. The error is that **every number the rule was built on came from
+a 916 token prompt**, and the vendor's protocol is 110 tokens and 64 generated.
+
+**The decode column is what says so.** A prefill change cannot touch decode, so
+decode falling 15% is not the attention being slower -- it is something else
+being paid per token. It is: the decode path appends to the fp16 mirror
+deliberately, because a prompt continued after a generation would otherwise read
+a cache with a hole in it. A generation pays to fill a mirror it never reads.
+And the other hidden cost is the mirror's construction itself, which on 110
+positions outweighs what fp16 attention saves.
+
+So the envelope is a wide head AND a long prompt. Where the second one starts is
+not known: 110 loses, 916 wins, and nothing has been run in between. **A
+threshold placed between two points eight times apart is the chunk formula
+again**, which this file recorded going wrong this morning, so `auto` is
+withdrawn rather than guessed at. The knob stays and the note above it now says
+where it pays.
