@@ -57,15 +57,18 @@ static double now_ms(void)
  * and a tail of 1, which is below the batching minimum and went to the token
  * loop, and its text has always been right.
  *
- * ⚠ EIGHT IS A DIFFERENT FAULT AND IS EXCLUDED SEPARATELY. m = 8 is even and
- * its read order is a bijection, and the board still misses 33 rows of 904 at
- * it -- unless CHARSIU_NPU_ONEDEV puts both K slices on one core, which makes
- * it exact. That is the core pair, not the layout, and npudev.c refuses it
- * with its own reason string for exactly that reason.
+ * ⚠ EIGHT WAS READ AS A DIFFERENT FAULT AND IT IS THE SAME ONE. m = 8 is even
+ * and its read order is a bijection, and the board missed 33 rows of 904 at
+ * it -- unless CHARSIU_NPU_ONEDEV put both K slices on one core. That looked
+ * like the core pair. It was the NPU rail: every one of those runs was at 750
+ * mV, and at the 800 mV the vendor's OPP asks the same script returns 904 of
+ * 904 (2026-09-06, and 1130 of 1130 at m = 10). Both halves of the law below
+ * now ask charsiu_npu_overlap_ok() instead of asking the width.
  *
  * ⚠⚠ AND THIS IS THE SPEED HALF, NOT THE SAFETY HALF. The safety half is
- * w4_batch_why_not() in src/npudev.c, which refuses an odd width and m = 8 and
- * sends that chunk to a correct row at a time path. This is what stops the
+ * w4_batch_why_not() in src/npudev.c, which refuses an odd width -- and 8 and
+ * 10 only below the OPP envelope -- and sends that chunk to a correct row at a
+ * time path. This is what stops the
  * runtime ever asking for one. The two encode the same law and CANNOT SEE EACH
  * OTHER -- there is no header they can share without exporting a predicate
  * that only these two callers want -- so they must be kept in step by hand. If
@@ -107,10 +110,30 @@ static int prefill_width(int rem, int cap)
 	 * on the layout proof, and m = 10 is the standing evidence that the
 	 * layout proof alone is not enough.
 	 */
-	if (w == 8)
-		w = 4;
-	else if (w == 10)
-		w = 6;
+	/*
+	 * 🏁 2026-09-06: AND THE SPLIT IS NOW CONDITIONAL, because the fault it
+	 * avoids is the NPU RAIL and not the width.
+	 *
+	 * Both maps quoted above were drawn at 750 mV, which overlap.h has
+	 * since shown gives 11 to 25 wrong words a pass at 786 MHz where 800 mV
+	 * gives none. Re-measured on the board with vdd_npu_s0 at 800000 uV,
+	 * llama's 113 staged tensors, two passes a width, no override set so
+	 * the widths had to pass npudev's gate to run at all:
+	 *
+	 *    8    904 of 904     904 of 904
+	 *   10   1130 of 1130   1130 of 1130      <- never measured at 800 mV
+	 *   22   2486 of 2486   2486 of 2486         before this
+	 *   24   2712 of 2712   2712 of 2712
+	 *
+	 * ⚠ THE SPLIT STAYS FOR AN OFF-ENVELOPE BOARD, and not out of caution:
+	 * there it is the FASTER of the two correct paths. npudev.c refuses 8
+	 * and 10 below the envelope, and a refused chunk runs a row at a time,
+	 * which is far worse than two batched calls of 4. So the same reading
+	 * of the same envelope picks between two working answers rather than
+	 * guarding a broken one.
+	 */
+	if ((w == 8 || w == 10) && !charsiu_npu_overlap_ok(NULL, 0))
+		w = w == 8 ? 4 : 6;
 	return w >= 2 ? w : 0;
 }
 

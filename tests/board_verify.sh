@@ -134,8 +134,19 @@ esac
 echo "  kernel    $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
 # ⚠ AN IMAGE INSTALLED SINCE THIS BOOT IS NOT THE KERNEL RUNNING. /proc/1 is
 # as old as the boot; an Image newer than it has not been booted yet.
-[ -f /boot/Image ] && [ /boot/Image -nt /proc/1 ] && \
-	echo "  ⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+# ⚠ AGAINST now - uptime, NOT /proc/1. The old test was
+# `[ /boot/Image -nt /proc/1 ]` and it fires on a board where the Image is
+# fifteen hours OLDER than the boot: /proc/1's mtime is not the boot instant,
+# it moves. This compares the Image's mtime against the clock minus uptime,
+# which is the boot instant and nothing else. A warning that cries wolf is
+# worse than none -- it is the one that will be ignored when the Image really
+# is newer.
+if [ -f /boot/Image ]; then
+	_imt=$(date -r /boot/Image +%s 2>/dev/null || echo 0)
+	_boot=$(awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0)
+	[ "$_imt" -gt 0 ] && [ "$_boot" -gt 0 ] && [ "$_imt" -gt "$_boot" ] && \
+		echo "  ⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+fi
 # ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
 # new data when it was the previous version of this file: `charsiu update dev`
 # had not taken, the output was byte identical to the round before, and the only

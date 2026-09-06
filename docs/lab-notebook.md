@@ -2976,3 +2976,321 @@ the wall was chased as a CBUF property for months and was a field layout; the
 0x4050 rule was fitted where two expressions are indistinguishable. **A
 comparison between one shape of theirs and one shape we do not run cannot close
 anything.**
+
+## 2026-09-06: two board results that were sitting on the card unread
+
+Both of these ran days ago, wrote their files, and were never quoted in a
+status line, a source comment or a memory. Reading them first was cheaper than
+any round, and one of them moves the target.
+
+### `CHARSIU_NPU_NMAX=4096` ran on 2026-08-29 and does not fix m = 8
+
+`board_w4_m8.sh` has three arms and all three are on the card
+(`~/charsiu-board/w4-m8-{baseline,onedev,nmax4096}.txt`, all 22:21 on 08-29).
+Only the onedev arm was ever written down.
+
+```
+  baseline   MISS blk.0.ffn_gate .. blk.13.ffn_up, k=2048 n=8192 row 0 of 8
+             row 0: 8192 of the first 8192 wanted values are somewhere in the
+             batch, 0 slots came back exactly zero
+  onedev     904 of 904, worst 0.00e+00
+  nmax4096   STILL MISSES.  blk.0.ffn_up onward, same k=2048 n=8192 row 0
+             row 0: 8189 of the first 8192 wanted values are somewhere in the
+             batch, 0 slots exactly zero
+```
+
+So the arm npudev.c still describes as open -- *"if m = 8 comes back exact the
+fault is the WIDTH"* -- has run and come back dirty. The width is not it, which
+is the same verdict the onedev arm reached from the other side, now with an
+independent second arm behind it.
+
+⚠ One caveat kept honestly: the MISS line prints the TENSOR's n, which is 8192
+either way, so the line itself cannot show that the knob engaged. What does show
+it is the miss set changing -- `blk.0.ffn_gate` and `blk.5.ffn_up` miss in the
+baseline and not under nmax4096 -- and the present-value count moving from
+8192 of 8192 to 8189. A knob that changed nothing would have reproduced the
+baseline exactly.
+
+### 🏁 The overlap at width 24 produced 21600 exact rows
+
+`board_overlap_slots.sh` -- the probe npudev.c calls *"what turns this into a
+mechanism"* -- ran on 2026-09-04 at 21:37, on phi3, width 24, KMAX 2048, 225
+tensors a pass:
+
+```
+  arm            rows            worst rel   MISS   speedup   fence
+  serial 1       5400 of 5400    1.61e-04    0      4.24x     409 ms
+  parallel 1     5400 of 5400    1.61e-04    0      5.69x     164 ms
+  parallel 2     5400 of 5400    1.61e-04    0      5.65x     165 ms
+  parallel 3     5400 of 5400    1.61e-04    0      5.82x     167 ms
+  parallel 4     5400 of 5400    1.61e-04    0      -         -
+```
+
+**Zero misses in four overlapped passes at the width whose TEXT is wrong 3 to
+15 times in 16.** And the overlap demonstrably engaged: the fence is what
+overlapping two cores is supposed to cut, and it collapses 409 -> 164 ms while
+the pass gets a third faster. That is a behavioural signature, not a flag being
+set -- which matters, because a knob that quietly does nothing has cost this
+tree a round before.
+
+The consequence is that the width-24 fault is **not in the batched matmul**,
+or is no longer there at all. npudev.c currently describes the whole residual
+as "two cores stepping on row 0 of a wide output"; that sentence is earned for
+m = 8 and m = 10, where the same probe DOES catch 33 misses, and it is not
+earned for 22 and 24, where this probe looks straight at the numbers and finds
+none.
+
+⛔ What this does NOT say: that the text is now right. The probe runs
+`--batch-probe`, which exercises the batched matmul against the m = 1 path
+tensor by tensor and never runs a norm, a rope table or a cache offset. A fault
+outside the matmul is invisible to it by construction. Round m65 asks the text
+question directly, with the KMAX 1024 cell as the positive control, because a
+round where nothing reproduces says the fault is gone rather than located.
+
+### m65: the overlap is clean at width 24, and the control never ran
+
+Phi-3.5, 87 token prompt, 16 runs an arm, on the board's current dev build.
+
+```
+  KMAX 2048, chunk 24   widths 3x24+1x14   parallel 0/16 wrong   serial 0/16
+  KMAX 1024, chunk 24   widths 1x86        parallel 0/16 wrong   serial 0/16
+                                           onedev   0/16 wrong
+```
+
+The KMAX 2048 cell is a real width-24 test and the overlap is clean sixteen
+times, where the 08-30 map has this configuration wrong 3 to 15 times in 16.
+Together with the slots probe's 21600 exact rows that is two independent reads
+saying the same thing.
+
+**⚠ The KMAX 1024 cell -- the one that exists to reproduce 13 of 16 -- did not
+run width 24 at all.** Its widths line says `1x86`: the chunk cap at KMAX 1024
+is 163840/1024 = 160, the prompt is 87 tokens, and `CHARSIU_PREFILL_ONECHUNK`
+(default ON since this week) replaced the requested chunk of 24 with one chunk
+of 86. A cell that was supposed to fail tested a width that has never failed.
+
+That is the fourth time this month a knob has been set and not engaged, and the
+only reason it was caught is that the script prints the binary's own `widths`
+line beside the rate. **A number is worth what the line next to it says was
+run.** m66 repeats the control with `CHARSIU_PREFILL_ONECHUNK=0`.
+
+So the standing claim after m65 is narrow and deliberately so: at KMAX 2048,
+chunk 24, phi3, on this kernel and this build, sixteen overlapped runs are
+right. Nothing here has yet reproduced the fault, so nothing here has yet
+proved it gone -- an experiment where the positive control does not fire
+cannot tell "fixed" from "not looking".
+
+### 🏁 m66: the overlap fault does not reproduce, control included
+
+The same script, the same model, `CHARSIU_PREFILL_ONECHUNK=0` so the requested
+chunk survives to the chunker:
+
+```
+  KMAX 1024, chunk 24   widths 3x24+1x14   parallel 0/16 wrong   serial 0/16
+  KMAX 2048, chunk 22   widths 3x22+1x20   parallel 0/16 wrong   serial 0/16
+```
+
+The first line is the 2026-08-30 reading's own cell -- phi3, chunk 24, KMAX
+1024, both cores overlapped -- which was **13 of 16 WRONG** when it was priced.
+It is now 16 of 16 right, and this time the widths line proves the width ran.
+Width 22, which failed 1 in 16, is clean 16 of 16 too.
+
+Three independent reads now say the same thing: 21600 exact rows in the element
+probe, 16 clean at width 24, 16 clean at width 22.
+
+**What that supports:** the 13-in-16 fault is gone. A rate that large gives
+sixteen consecutive clean runs about once in 10^11 tries, so this is not luck.
+**What it does not support:** that nothing is left. Sixteen clean runs bound a
+rate at roughly one in six, so a fault firing one prompt in fifty would sail
+through all of this untouched. That is the whole reason the 28 default was held
+back before, and the answer to it is more runs on more models, not a louder
+adjective.
+
+**Which change fixed it is not established and this round cannot say.** The
+running kernel is `2ffc0913` -- attach-once-v11 plus the igorfix patches, #9,
+built 09-05 -- against the August kernel that attached and detached the IOMMU
+per job, and the runtime has moved a long way in the same window. Telling the
+two apart needs the other kernel booted, which is a flash, which is the user's.
+
+⚠ And the warning both board scripts print here -- *"/boot/Image is NEWER THAN
+THIS BOOT"* -- is a false alarm. The Image's mtime is 1788580697 and the boot
+was at `now - uptime` = 1788636058, so the Image is 15 hours OLDER than the
+boot and the kernel running is the one on disk. The test is
+`[ /boot/Image -nt /proc/1 ]` and /proc/1's mtime is not the boot instant.
+
+### m67: 48 identical hashes across four models, and none of them proves the overlap ran
+
+Four models, two prompt lengths, the token loop as the reference and three runs
+each of the serial default and `CHARSIU_NPU_PARALLEL_MIN_M=28`:
+
+```
+  short  qwen3  1x156        tinyl 1x158       llama 1x110       gemma3 1x80+1x78
+  long   qwen3  5x80+1x12    tinyl 5x80+1x14   llama 3x80+1x20   gemma3 5x80+1x14
+```
+
+Every one of the 48 batched runs hashes exactly to its own token loop, and the
+widths line beside each says which chunks it batched -- including tails of 12,
+14 and 20, and the 80s the chunker really emits.
+
+**⚠ And that is not yet evidence the overlap engaged.** `PARALLEL_MIN_M` is
+consulted only after `batch_serial()` has already said "serialise", and
+`batch_serial()` defaults to `!overlap_safe()` -- so on a rail `overlap_safe()`
+approves, the two arms would be the same run twice and all 48 hashes would
+match for a reason that has nothing to do with the question. Identical output
+across arms is exactly what a knob that never engaged produces, which this
+month has already cost four rounds.
+
+m68 reads the two things that cannot stay quiet if the arms really differ: the
+line the runtime prints about what it decided, and the fence, which is the
+stage overlapping the cores cuts -- 409 ms to 164 ms when the element probe
+engaged it.
+
+### ⛔ Correction: the overlap is already the default, and the fault was already solved
+
+m68 asked the runtime what it had decided, and all four models, all three arms,
+printed the same line:
+
+```
+  charsiu NPU: batched calls, the two cores overlapped: 786 MHz at 800 mV,
+                                                        the vendor asks 800
+```
+
+**The two cores have been overlapping by default on this board.** The "serial"
+arm of m67 and m68 was not serial: `batch_serial()` defaults to
+`!overlap_safe()`, the rail reads 800 mV, `overlap_safe()` approves, and
+`CHARSIU_NPU_PARALLEL_MIN_M` is never even consulted. m67's two arms were the
+same run twice, exactly as the caveat written beside it feared.
+
+And the mechanism was found on 2026-09-04 and is written at the top of
+`src/overlap.h`: **the overlap fault was the NPU's voltage margin.** 786 MHz at
+the 750 mV U-Boot leaves, against the 800 mV the vendor's OPP asks of its 800
+MHz step. Four DTBs, same probe, 4 passes of 5400 rows:
+
+```
+  786 MHz, 750 mV (mainline as shipped)   11 to 25 wrong words a pass
+  594 MHz, 750 mV                          0, 0, 0, 0   (10% slower)
+  786 MHz, 800 mV                          0, 0, 0, 0   (full speed)
+  786 MHz, 850 mV                          0, 0, 0, 0
+```
+
+So m66's "the fault does not reproduce" reproduces nothing because the rail it
+needed is gone, and its closing line -- *"which change fixed it is not
+established"* -- is answered in the tree it was written next to. The three
+rounds today are still worth their UART time, but for a smaller claim than they
+were run for: they are an end-to-end check of the 09-04 guard at the width the
+old map called worst, on four models the guard was never exercised on, and it
+holds -- 16 of 16 at width 24, 16 of 16 at width 22, 48 hashes equal to their
+token loops.
+
+**The one thing that follows and is new: the TTFT numbers already quoted are
+overlapped numbers.** 673 / 910 / 3004 / 2408 ms against the vendor's 469 / 544
+/ 1829 / 1219 were measured with both cores in flight, so the fifth off the
+prompt that `PARALLEL_MIN_M=28` was priced at is **already taken** and is not
+sitting in the gap waiting to be collected.
+
+⚠ And it leaves one question that is genuinely open, because its evidence
+predates the rail. `board_w4_m8.sh`'s map -- m = 8 and m = 10 missing ROW 0 of
+the n = 8192 tensors, 33 of 904, one core clean and two cores dirty -- was
+measured on 2026-08-29, six days before the voltage was found, so every arm of
+it ran at 750 mV. That is the same signature the voltage produced. m69 re-runs
+it at the rail the board now holds.
+
+### 🏁 m69/m70: m = 8 was the rail too, and the refusal now names the envelope
+
+`board_w4_m8.sh`, re-run unchanged, with `vdd_npu_s0` reading 800000 uV:
+
+```
+  arm         m=2          m=4          m=8          worst      MISS lines
+  baseline    226 of 226   452 of 452   904 of 904   5.10e-05   0
+  onedev      226 of 226   452 of 452   904 of 904   0.00e+00   0
+  nmax4096    226 of 226   452 of 452   904 of 904   5.10e-05   0
+```
+
+against the same script's **871 of 904 and 33 MISS lines** on 2026-08-29, when
+the rail was the 750 mV U-Boot leaves. The baseline is the arm the script says
+must fail, and it is exact.
+
+So the second fault was never a second fault. "Two cores stepping on ROW 0 of a
+wide output at m = 8 and m = 10" and "the width-24 text fault" are one thing:
+786 MHz outside the vendor's OPP envelope, which `src/overlap.h` found on 09-04
+with four DTBs. Both maps were drawn at 750 mV; both dissolve at 800.
+
+onedev being 0.00e+00 while the two-core arms sit at 5.10e-05 is not a
+residue of the fault -- it is one float summation order against two, which the
+probe's own bar (1e-3) is set for. And onedev is *slower*: 516 ms against 368
+at m = 8, which is the two cores doing their half each.
+
+**What shipped from it:** the m = 8 / m = 10 refusal in `npudev.c` is now gated
+on `charsiu_npu_overlap_ok()` -- the same reading of the same envelope that
+already decides whether the two cores may overlap -- instead of on the width.
+Inside the envelope the widths run; outside it they still refuse.
+
+⚠ Deliberately conservative, and here is the gap: nobody has measured m = 8 at
+750 mV with the cores *serialised*. onedev was clean there, but onedev halves
+the hardware and the draw, so it cannot separate "needs two cores" from "needs
+the current". Off-envelope this keeps refusing, which costs a fallback nobody
+will notice -- no prompt length measured yet makes the chunker emit 8 or 10.
+
+### m72: 8, 10, 22 and 24 all exact at 800 mV, through the shipped gate
+
+Llama-3.2-1B, 113 staged tensors, two passes a width, `CHARSIU_NPU_W4_M8`
+deliberately **not** set -- so 8 and 10 had to get past npudev's new gate to
+reach the hardware at all, and getting a row count back at all is the gate
+working:
+
+```
+   width   pass 0            pass 1            worst
+    8       904 of 904        904 of 904       5.10e-05
+   10      1130 of 1130      1130 of 1130      5.10e-05   <- never measured
+   22      2486 of 2486      2486 of 2486      5.10e-05      at 800 mV before
+   24      2712 of 2712      2712 of 2712      5.10e-05
+```
+
+m = 10 is the one that had to be asked separately: `board_w4_m8.sh` caps at 8,
+and the chunker splits **both** 8 and 10, so lifting its split on one width's
+evidence would have been the layout-proof mistake again.
+
+So `prefill_width()`'s `8 -> 4+4` and `10 -> 6+4` now happen only when
+`charsiu_npu_overlap_ok()` says the rail is below the envelope. **The split
+stays there for a good reason rather than a cautious one:** off-envelope
+npudev refuses 8 and 10, a refused chunk runs a row at a time, and two batched
+calls of 4 are much faster than that. The same reading of the same envelope
+now picks between two correct paths instead of guarding a broken one.
+
+⚠ m71 is why this round existed: asked for `CHARSIU_PREFILL_CHUNK=8` the board
+answered `widths 20x4`. The chunker had already split it, so the gate under
+test was never reached and the round proved nothing about it. The widths line
+said so on its own output.
+
+### m73: the gate on the card, and the price with six runs
+
+`charsiu update dev`, then a chunk of 8 and a chunk of 10 asked for explicitly
+on four models, each against its own token loop:
+
+```
+  model    token loop     chunk 8            chunk 10          default
+  llama    c728d6bc2799   10x8      same     8x10     same     1x80      same
+  qwen3    4f050ade006f   13x8+1x6  same     11x10    same     1x110     same
+  tinyl    c7a8689f0a9d   14x8      same     11x10+1x2 same    1x112     same
+  gemma3   efd3dfb40845   14x8      same     11x10+1x2 same    1x80+1x32 same
+```
+
+Where m71 got `20x4` for the same request, the chunker now emits the width it
+was asked for, and every hash equals its token loop. That is the change working
+end to end: the chunker stopped splitting and npudev let the width through.
+
+And the standing price, `board_vendor.sh` at `CHARSIU_BENCH_REPEAT=6`,
+governor performance:
+
+```
+                 TTFT ours   theirs   gap      decode ours   theirs
+  Qwen3 0.6B      687        469      1.47x     24.75         24.85
+  TinyLLAMA 1.1B  900        544      1.65x     20.64         19.71
+  Phi3 3.8B      3057       1829      1.67x      6.87          6.58
+  Gemma4 E2B     2352       1219      1.93x      8.67          9.23
+```
+
+Unchanged by the day's work, and that is the expected result rather than a
+disappointment: the default chunker emits one wide chunk at these prompt
+lengths and never asks for 8 or 10, so nothing shipped today is on this path.
+What the day bought is that three "open" faults are closed and two gates now
+name the real condition. The gap itself is still the NPU entry.
