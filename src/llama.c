@@ -3629,6 +3629,32 @@ void llama_stages_report(void)
 			       " %.2f ms a row\n", "of the pack:",
 			       ga / bstage_rows, pc / bstage_rows,
 			       (pk - ga - pc) / bstage_rows);
+			/*
+			 * ⚠ AND OF THE FENCE, when the probe was asked for.
+			 * prep_bo waits and then invalidates the whole output
+			 * buffer, so this row says how much of "fence" was the
+			 * hardware and how much was cache maintenance the read
+			 * back is usually blamed for. Silent when off: a zero
+			 * here would read as "the invalidate is free", which is
+			 * not what an unasked probe knows.
+			 */
+			{
+				double iv, gib;
+				unsigned nc;
+
+				charsiu_npu_batch_fence_split(bmm_dev, &iv,
+							      &gib, &nc, 0);
+				if (nc)
+					printf("  %-16s invalidate %.2f  the "
+					       "wait %.2f ms a row  (%.2f GiB "
+					       "over %u preps, %.2f GB/s)\n",
+					       "of the fence:",
+					       iv / bstage_rows,
+					       (fn - iv) / bstage_rows, gib, nc,
+					       iv > 0.0 ? gib * 1073741824.0
+							  / (iv * 1e6)
+						        : 0.0);
+			}
 		}
 	}
 	if (!stage_tok)

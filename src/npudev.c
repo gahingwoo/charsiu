@@ -449,6 +449,30 @@ struct charsiu_npu {
 	 * or this file preparing more, because both sides pay the CPU part.
 	 */
 	double bpack_us, bsub_us, bfence_us, bread_us;
+	/*
+	 * ⚠⚠ INSIDE bfence_us: THE HALF THAT IS NOT WAITING.
+	 *
+	 * rocket_ioctl_prep_bo is dma_resv_wait_timeout FOLLOWED BY
+	 * dma_sync_sgtable_for_cpu over the WHOLE buffer, so "fence" has always
+	 * been a wait and an invalidate added together, and every reading of it
+	 * so far -- "the hardware is busy", "a fence removed is worth more than
+	 * a submit removed" -- assumed it was all wait. That is the same shape
+	 * as the three instruments this file corrected yesterday: a number true
+	 * about something other than its label.
+	 *
+	 * A SECOND prep on a buffer whose fence has already signalled waits for
+	 * nothing and invalidates everything, so it prices the invalidate on its
+	 * own, with the same ioctl and the same bytes. CHARSIU_FENCE_SPLIT=1
+	 * turns that second call on; it is a probe, not a path, because it
+	 * really does invalidate the lines the read back is about to want.
+	 *
+	 * The bytes are counted beside the microseconds ON PURPOSE. A GB/s whose
+	 * denominator holds something other than the transfer it names is how
+	 * "2.36 GB/s of weights" got quoted as a fact about the silicon.
+	 */
+	double bfinval_us;
+	uint64_t bfinval_bytes;
+	unsigned bfinval_n;
 	/* ⚠ inside bpack_us: the gather that copies a K slice's columns out of
 	 * X, and the packer call that lays them out for the hardware. They are
 	 * different repairs -- one is a memcpy loop over rows, the other is a
@@ -3486,6 +3510,24 @@ void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
 		g->bgather_us = g->bpackcall_us = 0.0;
 }
 
+/*
+ * The invalidate half of the fence, and the bytes it covered. Zero unless
+ * CHARSIU_FENCE_SPLIT asked for it, and the caller has to say so rather than
+ * printing a zero as though the invalidate were free.
+ */
+void charsiu_npu_batch_fence_split(struct charsiu_npu *g, double *inval,
+				   double *gib, unsigned *calls, int reset)
+{
+	*inval = g->bfinval_us / 1e3;
+	*gib = (double)g->bfinval_bytes / (1024.0 * 1024.0 * 1024.0);
+	*calls = g->bfinval_n;
+	if (reset) {
+		g->bfinval_us = 0.0;
+		g->bfinval_bytes = 0;
+		g->bfinval_n = 0;
+	}
+}
+
 void charsiu_npu_batch_split(struct charsiu_npu *g, double *pack, double *sub,
 			     double *fence, double *read, int reset)
 {
@@ -3798,6 +3840,47 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	g->balloc_us += now_us() - ta;
 	g->balloc_n++;
 	return ob;
+}
+
+/*
+ * THE FENCE, AND THE PRICE OF THE INVALIDATE THAT RIDES ON IT.
+ *
+ * Every caller wants the same two things -- wait for the job, then own the
+ * bytes -- and the driver gives them one ioctl that does both, so the only way
+ * to tell them apart is to ask for the second one twice. The first call here is
+ * the real fence and its time is charged where it always was. The second, under
+ * the probe, has nothing left to wait for: dma_resv_wait_timeout returns at
+ * once on a signalled fence, and what is left is dma_sync_sgtable_for_cpu over
+ * the whole buffer plus one ioctl. That is the invalidate, priced by itself.
+ *
+ * ⚠ THE PROBE PERTURBS THE READ, NOT THE FENCE. Invalidating a second time
+ * leaves the lines cold that the gather is about to touch, so `read` gets
+ * slower while the probe is on. The number this helper exists to produce -- the
+ * first prep's own microseconds -- is untouched by it, which is the reason the
+ * second call goes after the first rather than the measurement going anywhere
+ * near it.
+ */
+static void fence_bo(struct charsiu_npu *g, unsigned d, struct charsiu_bo *bo)
+{
+	static int split = -1;
+	double t0;
+
+	t0 = now_us();
+	charsiu_bo_prep(g->dev[d], bo, 2000000000);
+	g->bfence_us += now_us() - t0;
+
+	if (split < 0) {
+		const char *e = getenv("CHARSIU_FENCE_SPLIT");
+
+		split = e ? atoi(e) : 0;
+	}
+	if (!split)
+		return;
+	t0 = now_us();
+	charsiu_bo_prep(g->dev[d], bo, 2000000000);
+	g->bfinval_us += now_us() - t0;
+	g->bfinval_bytes += bo->size;
+	g->bfinval_n++;
 }
 
 /*
@@ -5019,22 +5102,18 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * the overlap back, and returns wrong text when it does.
 		 */
 		if (batch_serial_for(m) && g->ndev > 1) {
-			double tf = now_us();
-
-			charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+			fence_bo(g, d, &ob->bo[d]);
 			ob->busy &= ~(1u << d);
-			g->bfence_us += now_us() - tf;
 		}
 	}
 
 	/* ⚠ both submitted, then both waited on: that is the point */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		double tf = now_us();
+		double tf;
 		unsigned nt;
 
-		charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+		fence_bo(g, d, &ob->bo[d]);
 		ob->busy &= ~(1u << d);
-		g->bfence_us += now_us() - tf;
 		tf = now_us();
 		{
 			/* ⚠ THE KEY IS m ALONE and that is still right: the
