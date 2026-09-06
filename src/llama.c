@@ -3663,6 +3663,36 @@ void llama_stages_report(void)
 			       rd / bstage_rows, pr / bstage_rows,
 			       (bmm_entry_ms - pk - sb - fn - rd - pr)
 			       / bstage_rows);
+			/*
+			 * ⚠⚠ THE FENCE BY WIDTH, INSIDE ONE RUN OF ONE MODEL.
+			 *
+			 * Dividing each model's MACs a row by its fence gives
+			 * 0.72 TMAC/s on Llama (widest 8192), 0.37 on Qwen3
+			 * (3072) and 0.20 on SmolLM2 (1536) -- which looks like
+			 * a fixed per dispatch cost. Three models that differ
+			 * in layer count, K and KV heads is not a measurement
+			 * of that, and a rule fitted across models died today.
+			 * Here the only thing that changes between rows is the
+			 * width: Llama's k and v are 512, its q and o 2048, its
+			 * gate, up and down 8192, same pass, same clock.
+			 */
+			{
+				unsigned wd[8], wc[8], nw, wi;
+				double wms[8], wg[8];
+
+				nw = charsiu_npu_batch_fence_widths(bmm_dev, wd,
+					wms, wg, wc, 8, 0);
+				for (wi = 0; wi < nw; wi++)
+					printf("  %-16s n %5u  fence %7.1f ms"
+					       " over %5u calls  %8.1f GMAC"
+					       "  %5.2f TMAC/s\n",
+					       wi ? "" : "of the fence:",
+					       wd[wi], wms[wi], wc[wi], wg[wi],
+					       wms[wi] > 0.0
+					         ? wg[wi] / 1000.0
+					           / (wms[wi] / 1000.0)
+					         : 0.0);
+			}
 			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 0);
 			printf("  %-16s gather %.2f  packer %.2f  the rest"
 			       " %.2f ms a row\n", "of the pack:",

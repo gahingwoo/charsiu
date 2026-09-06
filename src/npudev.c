@@ -473,6 +473,33 @@ struct charsiu_npu {
 	double bfinval_us;
 	uint64_t bfinval_bytes;
 	unsigned bfinval_n;
+	/*
+	 * ⚠⚠ THE FENCE BY TENSOR WIDTH, WHICH IS THE ONE QUESTION LEFT.
+	 *
+	 * The fence is not the weight fetch -- doubling the chunk halves the
+	 * weight passes and it does not move -- and it is not the two cores
+	 * being serialised, which is worth 2.7x and is already taken. What is
+	 * left is that the rate looks different on different MODELS: dividing
+	 * each one's MACs a row by its fence gives 0.72 TMAC/s on Llama, whose
+	 * widest tensor is 8192, 0.37 on Qwen3 at 3072 and 0.20 on SmolLM2 at
+	 * 1536. That is what a FIXED PER DISPATCH COST looks like from outside:
+	 * a wider tensor does more arithmetic for the same overhead.
+	 *
+	 * ⚠ AND THREE MODELS THAT DIFFER IN EVERYTHING IS NOT A MEASUREMENT.
+	 * They have different layer counts, different K, different numbers of
+	 * KV heads. Today already killed one rule that fitted eleven points
+	 * across four models and lost on the first arm chosen to contradict it.
+	 *
+	 * So this asks the same question INSIDE ONE RUN of ONE model, where the
+	 * only thing that changes between buckets is the width: Llama's k and v
+	 * are 512 wide, its q and o are 2048, its gate, up and down are 8192,
+	 * and they all run in the same forward pass on the same silicon at the
+	 * same clock. If the rate is flat across those the per dispatch story is
+	 * wrong; if it climbs with width it is right, and the fence finally has
+	 * a cause.
+	 */
+	struct { unsigned n; double us; uint64_t mac; unsigned calls; } bw[8];
+	unsigned n_bw;
 	/* ⚠ inside bpack_us: the gather that copies a K slice's columns out of
 	 * X, and the packer call that lays them out for the hardware. They are
 	 * different repairs -- one is a memcpy loop over rows, the other is a
@@ -3527,6 +3554,29 @@ void charsiu_npu_batch_gather_split(struct charsiu_npu *g, double *gather,
  * CHARSIU_FENCE_SPLIT asked for it, and the caller has to say so rather than
  * printing a zero as though the invalidate were free.
  */
+/*
+ * The fence bucketed by the tensor's width: how long, how many calls, and how
+ * much arithmetic each width's dispatches actually did. Returns how many
+ * buckets were filled. The caller divides; this only counts.
+ */
+unsigned charsiu_npu_batch_fence_widths(struct charsiu_npu *g, unsigned *wide,
+					double *ms, double *gmac,
+					unsigned *calls, unsigned max,
+					int reset)
+{
+	unsigned i, n = g->n_bw < max ? g->n_bw : max;
+
+	for (i = 0; i < n; i++) {
+		wide[i] = g->bw[i].n;
+		ms[i] = g->bw[i].us / 1e3;
+		gmac[i] = (double)g->bw[i].mac / 1e9;
+		calls[i] = g->bw[i].calls;
+	}
+	if (reset)
+		g->n_bw = 0;
+	return n;
+}
+
 void charsiu_npu_batch_fence_split(struct charsiu_npu *g, double *inval,
 				   double *gib, unsigned *calls, int reset)
 {
@@ -3872,14 +3922,54 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
  * second call goes after the first rather than the measurement going anywhere
  * near it.
  */
-static void fence_bo(struct charsiu_npu *g, unsigned d, struct charsiu_bo *bo)
+/* the arithmetic this device's slots do for one call: sum over its slots of
+ * m * k_slice * n_slice, which is what the fence for that device covers */
+static uint64_t mac_for_dev(struct charsiu_npu *g, const struct npu_entry *e,
+			    unsigned d, unsigned m)
+{
+	uint64_t mac = 0;
+	unsigned i;
+
+	for (i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+
+		if (s->di == d)
+			mac += (uint64_t)m * s->job.mm.k * s->job.mm.n;
+	}
+	return mac;
+}
+
+static void fence_width(struct charsiu_npu *g, unsigned wide, double us,
+			uint64_t mac)
+{
+	unsigned i;
+
+	for (i = 0; i < g->n_bw; i++)
+		if (g->bw[i].n == wide)
+			break;
+	if (i == g->n_bw) {
+		if (g->n_bw == sizeof(g->bw) / sizeof(g->bw[0]))
+			return;         /* more widths than room: do not guess */
+		g->bw[i].n = wide;
+		g->bw[i].us = 0.0;
+		g->bw[i].mac = 0;
+		g->bw[i].calls = 0;
+		g->n_bw++;
+	}
+	g->bw[i].us += us;
+	g->bw[i].mac += mac;
+	g->bw[i].calls++;
+}
+
+static double fence_bo(struct charsiu_npu *g, unsigned d, struct charsiu_bo *bo)
 {
 	static int split = -1;
-	double t0;
+	double t0, waited;
 
 	t0 = now_us();
 	charsiu_bo_prep(g->dev[d], bo, 2000000000);
-	g->bfence_us += now_us() - t0;
+	waited = now_us() - t0;
+	g->bfence_us += waited;
 
 	if (split < 0) {
 		const char *e = getenv("CHARSIU_FENCE_SPLIT");
@@ -3887,12 +3977,13 @@ static void fence_bo(struct charsiu_npu *g, unsigned d, struct charsiu_bo *bo)
 		split = e ? atoi(e) : 0;
 	}
 	if (!split)
-		return;
+		return waited;
 	t0 = now_us();
 	charsiu_bo_prep(g->dev[d], bo, 2000000000);
 	g->bfinval_us += now_us() - t0;
 	g->bfinval_bytes += bo->size;
 	g->bfinval_n++;
+	return waited;
 }
 
 /*
@@ -5114,7 +5205,13 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * the overlap back, and returns wrong text when it does.
 		 */
 		if (batch_serial_for(m) && g->ndev > 1) {
-			fence_bo(g, d, &ob->bo[d]);
+			double w = fence_bo(g, d, &ob->bo[d]);
+
+			/* bout_stride is wide * m * 4, and `wide` itself is
+			 * scoped to the block that set it */
+			fence_width(g, (unsigned)(g->bout_stride
+						  / ((size_t)m * 4)),
+				    w, mac_for_dev(g, e, d, m));
 			ob->busy &= ~(1u << d);
 		}
 	}
@@ -5124,7 +5221,17 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		double tf;
 		unsigned nt;
 
-		fence_bo(g, d, &ob->bo[d]);
+		{
+			double w = fence_bo(g, d, &ob->bo[d]);
+
+			/* ⚠ the WHOLE fence of this device is charged to this
+			 * tensor's width; when the two devices are waited
+			 * together the second one's wait is mostly already
+			 * over, which is why the calls are counted too */
+			fence_width(g, (unsigned)(g->bout_stride
+						  / ((size_t)m * 4)),
+				    w, mac_for_dev(g, e, d, m));
+		}
 		ob->busy &= ~(1u << d);
 		tf = now_us();
 		{
