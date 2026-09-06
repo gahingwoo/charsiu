@@ -2699,3 +2699,39 @@ the way `bench_batch` does, and it is not written.
 **Read the neighbouring file's comments before building the instrument.** Both
 halves of today's fence answer were already in this tree, and the tool built to
 find them reproduced the specific error the file next to it exists to warn about.
+
+## The fix was repeats
+
+Two changes to the fp16 mirror -- decode no longer fills it, and the unit no
+longer opens a second file descriptor on an accel device the process already
+has -- went in unpriced, because two rounds of `board_vendor.sh` disagreed with
+each other and with themselves. The conclusion drawn at the time was that the
+harness could not carry the comparison and a decode-only one had to be built.
+
+That was one step too far. **`board_vendor.sh` already reports the best of its
+runs**, and the bimodality is not symmetric: the low mode is contamination and
+the high mode is the clean reading. Best-of-TWO simply misses the high mode
+often enough to produce nonsense. Best-of-six does not.
+
+```
+   CHARSIU_BENCH_REPEAT=6, arms alternating, every arm repeated
+
+                  Qwen3 decode      TinyLLAMA decode
+     base a/b      24.76 / 24.73     20.68 / 20.63
+     mirror a/b    24.79 / 24.77     20.68 / 20.66
+```
+
+**Identical, inside 0.2%, on both models, with both arms repeated.** Before the
+two changes the same configuration cost 12 to 14% of decode. Together they take
+it to nothing, and the fp16 attention mirror is now free to hold while it is not
+being used.
+
+What is left is TTFT -- 685/673 to 939/940 on Qwen3, 912/910 to 1108/1110 on
+TinyLLAMA -- and that is the mirror being BUILT for a 110 token prompt, which is
+far too short to pay it back. That is the envelope this file already measured,
+not a defect.
+
+The lesson is smaller than the one I reached for. A harness that already reports
+a best does not need replacing when its distribution is bimodal; it needs enough
+samples to find the mode that means something. **Count the samples before
+building the instrument.**
