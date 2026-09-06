@@ -2341,3 +2341,30 @@ turned on today -- the pair read, the eight wide values, the one chunk prompt --
 shipped on a text hash that did not move. This one computes attention in fp16
 where the CPU computes it in fp32, so the answer can differ. That is a decision
 about the output, not about the speed, and it is not this file's to make.
+
+## What this table can and cannot say
+
+`board_vendor.sh` has warned since it was written that one reading of its TTFT
+column has a large spread. Today put numbers on that. The same build, the same
+governor, minutes apart:
+
+```
+   Qwen3 TTFT     721   924   729   707..784
+   Gemma4 TTFT   2133  2182  2185  2325  2408  2707  ...and 3221 inside one arm
+   Phi3 TTFT     3155  3149  3004..3167
+   TinyLLAMA      965   987   915..1033
+```
+
+Phi-3.5 repeats to 0.2% and TinyLLAMA to 2%. **Qwen3 swings 27% and Gemma4
+swings 51%.** So a change worth 5% can be attributed on two of these four models
+and cannot be attributed on the other two at any repeat count this harness runs.
+
+That is not a reason to drop them from the table -- they are the vendor's rows
+and the comparison is the point -- but it is a reason to stop reading their
+column as a measurement of anything charsiu did. Every attribution in this file
+today comes from either the stage table, which compares inside one run, or from
+Phi-3.5 and TinyLLAMA.
+
+And the decode column has its own shape: nearly every arm shows one low outlier
+(Phi-3.5 reads 4.66 and 6.84 in the same three runs), which is why the script
+reports the best and prints the range beside it.
