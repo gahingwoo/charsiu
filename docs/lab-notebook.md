@@ -3397,3 +3397,147 @@ KMAX 2048 (surf 5120) ran its wide bucket at 0.24, slower, not faster.
 the md5 covers a stage table full of timings and differs run to run. Those
 hashes say nothing. The text check that counts is m75's, which hashed a run
 with no stage output.
+
+## 2026-09-07: what a dispatch actually costs, in the dtype the prefill runs
+
+`npu_fence_scan`, one dispatch, one device, k and m fixed and only n moving,
+buffers allocated once at the widest point, **cold ring of 64** so no repeat
+re-reads the buffer before it. Slopes fitted at the wide end (n 4096 → 8192),
+microseconds per output channel:
+
+```
+             k=512    k=1024   k=2048        m=20     m=40     m=80  (k=1024)
+  int8      0.1347   0.1556   0.2085        --       --      0.1556
+  w4a16     0.1056   0.2063   0.4103       0.0825   0.1247   0.2063
+```
+
+⚠ The cold ring matters and it was checked: against the warm loop the slope
+moves under 4%, so the k term is a real fetch and not a cache. And **argv[5]
+is new** -- every sweep before today dispatched int8, and the model fitted to
+it was carried to a w4a16 prefill by halving the weight bytes on paper.
+
+### The two dtypes are bound by different things
+
+**int8** has a large k-INDEPENDENT floor: 0.111 µs a channel at m = 80, which
+is 1.39 ns an output element, about one element per clock at 786 MHz. It is
+**output-stage bound**.
+
+**w4a16 is not.** Its slope doubles cleanly with k (×2.0 per doubling, twice)
+and its k-free part is 0.004 µs -- zero within the fit. Separating m and k:
+
+```
+  w4a16:  µs per output channel  =  k × (4.01e-5  +  2.02e-6 × m)
+```
+
+Both halves are physical:
+
+- `4.01e-5 µs per channel·k` is **k/2 bytes at 12.5 GB/s** -- the weight fetch,
+  and it lands on the ~10 GB/s this tree has measured three other ways.
+- `2.02e-6 µs per channel·k·m` is **2.02 ps per MAC = 0.495 TMAC/s**, and
+  `n·k·m` is exactly the MAC count. **w4a16 is MAC-throughput bound at half a
+  TMAC/s**, which is a sixth of the part's 3 TMAC/s int8 rating.
+
+And it predicts the live buckets it was not fitted to: qwen3's whole prompt at
+110 tokens does ~66 GMAC in 122 ms of fence, which is 0.54 TMAC/s.
+
+### 🔑 Which means the prefill gap is not throughput
+
+The vendor's Qwen3-0.6B TTFT is 469 ms for 110 tokens. The same 66 GMAC at
+their wall clock is **0.14 TMAC/s** -- our hardware time is already three to
+four times better than theirs. Ours is 122 ms of fence inside a 444 ms entry
+inside a 705 ms prompt.
+
+```
+  qwen3, 110 tokens     pack 113   fence 122   read 126   prep 13   sub 8   other 63
+```
+
+**72% of the matmul entry is CPU work with the NPU idle**, and that is the
+whole distance to the vendor. Not the width, not the K slice, not the
+quantiser group, not the two cores -- all four of which the last two days
+spent rounds on.
+
+⇒ The lever is a **pipeline**: pack chunk N+1 and read chunk N−1 while the
+hardware runs N. The ceiling is `max(CPU, NPU)` instead of `CPU + NPU`, which
+on qwen3 is 315 ms against 444 -- prompt 705 → ~576, gap 1.47x → 1.23x.
+
+⚠ What blocks it, and it is structural rather than hard: `struct npu_outbuf`
+is one buffer per GEOMETRY, not per tensor -- k and v share one, gate and up
+share one -- so submitting ahead would have the second tensor's dispatch
+overwrite the first's accumulators before the CPU has read them. `ob->busy`
+guards exactly that today. A ping-pong pair on the wide geometry costs about
+5 MB a device.
+
+### And two thirds of the pipeline idea does not exist to be built
+
+Two things checked before writing any of it, both by reading:
+
+**The pack is not reuse misses.** `charsiu_npu_matmul_same` already skips the
+pack for the second and third tensor of a group, so a layer packs four times
+(qkv, o, gate+up, down) and not seven. The known miss -- *"Phi-3.5 reused its
+packed input 0 times out of 2304 asks"* -- is diagnosed, fixed and priced:
+`CHARSIU_NPU_EVEN_KS` takes gemma4's 528 misses to zero and its prompt from
+30110 to 29884 ms, inside the spread, and Phi-3.5 does not move at all because
+at its own KMAX the slices were already even. That door is shut.
+
+**The read already overlaps the second core.** The loop is submit both, then
+`for d: fence(d); read(d)` -- so device 0's read runs while device 1 is still
+computing, and the fence counter is what is LEFT after that.
+
+**And the transformer has no next tensor to pack ahead.** o needs attention,
+gate needs o, down needs silu; the chain is serial by construction. The only
+independence inside a layer is `{q, k, v}` (one input) and `{gate, up}` (one
+input), and those already share their pack.
+
+So the pipeline is not "hide 322 ms of CPU". It is exactly this: **submit a
+whole group before reading any of it**, so q's read overlaps k's run and
+gate's read overlaps up's run. That is 5 of a layer's 7 tensors.
+
+⚠ And what blocks even that is the output-buffer pool: k and v share the 512
+geometry, gate and up share the 8192 one, so the second submit of a group
+would overwrite the first's accumulators. `ob->busy` guards it today. A
+ping-pong pair on the two shared geometries is about 5 MB a device.
+
+### 🏁 One input buffer object per K slice: 18 of 18 paired runs
+
+`rocket_ioctl_fini_bo` is `dma_sync_sgtable_for_device` over the whole object
+and the uapi has no range -- both `drm_rocket_prep_bo` and `drm_rocket_fini_bo`
+carry a bare handle and a `reserved` field. The batched path kept every K slice
+in one buffer sized for the widest tensor in the model, so a call packed ONE
+slice and flushed all of them. Llama's buffer is sized for `ffn_down`'s eight,
+and its other six tensors each flushed eight slices' worth.
+
+The pool report names it, and nobody had printed that line before today:
+
+```
+  model    pack     of which:  emit   FINI ioctls   the packing
+  qwen3    112.1 ms            2.6     28.3          81.2
+  llama     77.6               2.3     17.3          58.0
+  gemma3   193.9               4.4     71.4         118.1
+```
+
+Split per slice -- `done_ki` already tracks what was written, and the slot walk
+gives what will be read, which is what the handle list needs since a reusing
+call packs nothing and still reads:
+
+```
+  FINI ioctls   qwen3 28.3 -> 13.4    llama 17.3 -> 8.1    gemma3 71.4 -> 27.4
+```
+
+⚠ And the first read of that could not be trusted: the entry TOTAL moved the
+wrong way by a few percent, but the two arms were two sessions and the board
+was 3% slower in the second. So `CHARSIU_NPU_BIN_ONEBO=1` restores the old
+single buffer, and both arms come out of one binary, interleaved, six repeats:
+
+```
+  prompt ms      split (6 runs)             onebo (6 runs)          delta
+  gemma3   884 882 879 874 870 891     909 907 902 901 909 906     -26 ms  -2.9%
+  llama    601 603 600 605 602 604     604 609 611 613 609 609     -6.7    -1.1%
+  qwen3    727 721 715 722 720 721     730 725 734 729 738 731     -10.2   -1.4%
+```
+
+**18 of 18 paired runs favour the split and the two arms' ranges do not overlap
+on any model.** Every run in both arms hashes to its own token loop.
+
+Small, and worth having for a reason beyond the milliseconds: flushing bytes
+the call did not write is not a tuning choice. The remaining FINI is now
+roughly what the writes justify.

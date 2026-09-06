@@ -362,7 +362,46 @@ struct charsiu_npu {
 	 * output all do, so the batched path brings its own rather than
 	 * disturbing the ones decode has been reading for hundreds of rounds.
 	 */
-	struct charsiu_bo bin[2], breg[2];
+	/*
+	 * ⚠⚠ ONE BUFFER OBJECT PER K SLICE, AND THE REASON IS AN IOCTL.
+	 *
+	 * This was one BO per device holding every K slice at bin_stride
+	 * apart, and a call packed ONE slice into it and then called
+	 * charsiu_bo_fini on the whole thing. rocket's FINI_BO is
+	 * dma_sync_sgtable_for_device over the entire object -- there is no
+	 * range in the uapi, both prep and fini take a bare handle -- so the
+	 * flush was sized by the WIDEST tensor the model has and paid by every
+	 * tensor whatever its own K.
+	 *
+	 * The board named it once the pool report was actually read
+	 * (2026-09-07): of a "pack" line of 112.1 ms on Qwen3, 77.6 on Llama
+	 * and 193.9 on gemma-3-1b, the FINI ioctls are 28.3, 17.3 and 71.4 --
+	 * a fifth to a third of it, and on gemma3 that is 12% of the whole
+	 * matmul entry. Llama's buffer is sized for ffn_down's EIGHT slices
+	 * and every one of its other six tensors flushed all eight.
+	 *
+	 * Split, a slice's flush is its own bytes. The slices a device holds
+	 * are already tracked -- `done_ki` for what was packed, and the slot
+	 * walk for what will be read -- so nothing new has to be computed.
+	 */
+	struct charsiu_bo *bin[2];
+	unsigned bin_nks;          /* how many the array holds, 0 if unbuilt */
+	/*
+	 * ⚠⚠ THE CONTROL, AND IT EXISTS BECAUSE THE FIRST MEASUREMENT OF THIS
+	 * COULD NOT BE READ. The split's FINI saving is unambiguous -- 71.4 to
+	 * 27.4 ms on gemma-3-1b -- but the matmul entry moved 607 to 620 ms in
+	 * the same pair of runs, and those were two different sessions with the
+	 * board 3% slower in the second (staging 4650 against 4592 ms on the
+	 * same model). A change measured across sessions is a change measured
+	 * against the thermal state, which has already cost this tree a round
+	 * this week.
+	 *
+	 * CHARSIU_NPU_BIN_ONEBO=1 restores exactly what was here before: one
+	 * buffer object a device holding every K slice at bin_stride apart,
+	 * flushed whole. One binary, two arms, one session.
+	 */
+	int bin_one;               /* CHARSIU_NPU_BIN_ONEBO=1 */
+	struct charsiu_bo breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
 	/*
@@ -1386,6 +1425,8 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * walks. CHARSIU_NPU_INPREP puts them back.
 	 */
 	g->inprep = getenv("CHARSIU_NPU_INPREP") != NULL;
+	/* the control for the per-slice input buffers; see the field */
+	g->bin_one = getenv("CHARSIU_NPU_BIN_ONEBO") != NULL;
 	/*
 	 * ONE SWITCH FOR THE THREE THINGS ROUND 369 CHANGED that have no
 	 * behaviour of their own to show: the vectorised half conversion, the
@@ -1626,7 +1667,11 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->asum = calloc(ks ? ks : 1, sizeof(*g->asum));
 	/* a GROUP can carry several tensors' slices, so four times over */
 	g->tasks = calloc(4 * g->max_slices, sizeof(*g->tasks));
-	g->handles = calloc(1 + 8 * g->max_slices, sizeof(*g->handles));
+	/* ⚠ ONE PER K SLICE at the front, not one: the batched call lists
+	 * every input slice this device reads. max_slices bounds the K
+	 * slices too, so the old 1 + 8n would have been short by n - 1. */
+	g->handles = calloc(g->max_slices + 8 * g->max_slices + 8,
+			    sizeof(*g->handles));
 	if (!g->ent || !g->slot || !g->scratch || !g->acc || !g->accf ||
 	    !g->fscr || !g->afscr || !g->wpack || !g->asum || !g->tasks || !g->handles)
 		goto fail;
@@ -1770,7 +1815,10 @@ void charsiu_npu_close(struct charsiu_npu *g)
 			charsiu_bo_free(g->dev[d], &g->in[d]);
 			/* the batched path's, which a decode never allocates.
 			 * Its output is in the geometry pool freed just above. */
-			charsiu_bo_free(g->dev[d], &g->bin[d]);
+			for (unsigned ki = 0; ki < g->bin_nks; ki++)
+				charsiu_bo_free(g->dev[d], &g->bin[d][ki]);
+			free(g->bin[d]);
+			g->bin[d] = NULL;
 			charsiu_bo_free(g->dev[d], &g->breg[d]);
 			charsiu_close(g->dev[d]);
 		}
@@ -3519,10 +3567,29 @@ static const char *w4_batch_why_not(unsigned m)
 	return NULL;
 }
 
+/* which object a K slice lives in, and where inside it: the split path gives
+ * every slice its own object at offset 0, the control puts them all in one. */
+static unsigned bin_idx(const struct charsiu_npu *g, unsigned ki)
+{
+	return g->bin_one ? 0u : ki;
+}
+
+static size_t bin_off(const struct charsiu_npu *g, unsigned ki)
+{
+	return g->bin_one ? (size_t)ki * g->bin_stride : 0;
+}
+
+/* is this slice's object one the call must list or flush? In the control every
+ * slice shares object 0, so object 0 is always both. */
+static int bin_used(const struct charsiu_npu *g, unsigned ki, unsigned mask)
+{
+	return g->bin_one || ki >= 32 || ((mask >> ki) & 1u);
+}
+
 static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 		      unsigned nslots)
 {
-	size_t ins, outs, regs;
+	size_t ins, regs;
 
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
@@ -3537,18 +3604,49 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 
 	/* the f16 packer writes k * 2 bytes a row; int8 writes one */
 	g->bin_stride = kmax_wide(g) * m * (g->w4 ? 2 : 1);
-	ins = g->bin_stride * nks + 4096;
+	/* ⚠ THE PAD IS PER SLICE NOW, not once for the whole array: the CBUF
+	 * reads past the end of the data it was given, and each slice is now
+	 * its own object with its own end. */
+	ins = g->bin_one ? g->bin_stride * nks + 4096 : g->bin_stride + 4096;
 	regs = (size_t)nslots * 4096;
-	outs = 0;
 
+	/*
+	 * ⚠⚠ TEAR DOWN EVERY DEVICE BEFORE BUILDING ANY, because bin_nks is
+	 * ONE number describing BOTH arrays. Freeing and re-allocating device
+	 * by device leaves a window where device 0's array is nks long and
+	 * device 1's is still the old length, and the free path -- which walks
+	 * every device with the single count -- runs off the end of one of
+	 * them. calloc zeroes the entries and charsiu_bo_free guards on
+	 * !bo->map, so publishing the count before the buffers exist is safe
+	 * and a half-built array unwinds correctly.
+	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		charsiu_bo_free(g->dev[d], &g->bin[d]);
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			charsiu_bo_free(g->dev[d], &g->bin[d][ki]);
+		free(g->bin[d]);
+		g->bin[d] = NULL;
 		charsiu_bo_free(g->dev[d], &g->breg[d]);
-		if (charsiu_bo_alloc(g->dev[d], ins, &g->bin[d]) ||
-		    charsiu_bo_alloc(g->dev[d], regs, &g->breg[d])) {
+	}
+	g->bin_nks = 0;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		g->bin[d] = calloc(g->bin_one ? 1 : nks, sizeof(*g->bin[d]));
+		if (!g->bin[d]) {
+			whine(g, "the batch input buffers would not allocate",
+			      g->kmax, g->nmax * m);
+			g->bm = 0;
+			return -1;
+		}
+	}
+	g->bin_nks = g->bin_one ? 1u : nks;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		int bad = 0;
+
+		for (unsigned ki = 0; ki < g->bin_nks && !bad; ki++)
+			bad = charsiu_bo_alloc(g->dev[d], ins, &g->bin[d][ki]);
+		if (bad || charsiu_bo_alloc(g->dev[d], regs, &g->breg[d])) {
 			fprintf(stderr, "charsiu: the batch buffers wanted "
 				"%.1f MB and would not allocate\n",
-				(double)(ins + outs + regs) / 1e6);
+				(double)(ins * g->bin_nks + regs) / 1e6);
 			whine(g, "the batch buffers would not allocate",
 			      g->kmax, g->nmax * m);
 			g->bm = 0;
@@ -5000,7 +5098,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
-		unsigned nt = 0, nh = 0, done_ki = 0, need = 0;
+		unsigned nt = 0, nh = 0, done_ki = 0, use_ki = 0, need = 0;
 		double tp = now_us();
 
 		for (unsigned i = 0; i < e->count; i++)
@@ -5041,12 +5139,41 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * which is not 16 KB of packing, it is the ioctls: two preps
 		 * and two finis a device a call.
 		 */
+		/*
+		 * ⚠⚠ AND BEYOND 32 SLICES THE BITMAP STOPS BEING A BITMAP.
+		 *
+		 * done_ki and use_ki are u32 and `1u << ki` is undefined past
+		 * 31. That was harmless while one buffer held every slice and
+		 * the flush covered all of them whatever the mask said; with a
+		 * buffer per slice a lost bit is a MISSING FLUSH, which is
+		 * wrong data rather than slow data. So a slice at or past 32 is
+		 * treated as always present -- it flushes and it is listed --
+		 * which costs nothing on any model this runtime has run
+		 * (Phi-3.5's eight is the widest) and cannot be wrong.
+		 */
+		/*
+		 * ⚠ WHICH SLICES THIS DEVICE TOUCHES, computed from the slots
+		 * rather than from done_ki, because a REUSING call packs
+		 * nothing and still READS them. done_ki is what was written and
+		 * decides the flush; use_ki is what the hardware will read and
+		 * decides the handle list.
+		 */
+		for (unsigned i = 0; i < e->count; i++)
+			if (g->slot[e->first + i].di == d &&
+			    i / e->n_slices < 32)
+				use_ki |= 1u << (i / e->n_slices);
 		if (g->inprep) {
 			if (!reuse)
-				charsiu_bo_prep(g->dev[d], &g->bin[d], 1000000000);
+				for (unsigned ki = 0; ki < g->bin_nks; ki++)
+					if (bin_used(g, ki, use_ki))
+						charsiu_bo_prep(g->dev[d],
+							&g->bin[d][ki],
+							1000000000);
 			charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
 		}
-		g->handles[nh++] = g->bin[d].handle;
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, use_ki))
+				g->handles[nh++] = g->bin[d][ki].handle;
 
 		/*
 		 * ⚠⚠ ONCE PER K SLICE, NOT ONCE PER SLOT.
@@ -5167,16 +5294,19 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 					}
 				}
 				charsiu_pack_input(&mm, g->bq,
-						   (uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						   (uint8_t *)g->bin[d][bin_idx(g, ki)].map
+						   + bin_off(g, ki),
 						   g->bin_stride, s->job.input_zero_point);
 			} else if (sk == e->t->k && !pack_gather()) {
 				/* the slice is the whole row, so k0 is 0 */
 				pack_f16_pooled(g, &mm, X, e->t->k,
-						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						(uint8_t *)g->bin[d][bin_idx(g, ki)].map
+						+ bin_off(g, ki),
 						g->bin_stride);
 			} else {
 				pack_f16_pooled(g, &mm, g->bscr, mm.k,
-						(uint8_t *)g->bin[d].map + ki * g->bin_stride,
+						(uint8_t *)g->bin[d][bin_idx(g, ki)].map
+						+ bin_off(g, ki),
 						g->bin_stride);
 			}
 			g->bpackcall_us += now_us() - tpc;
@@ -5193,8 +5323,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			if (s->di != d)
 				continue;
 			job.mm.m = m;
-			job.input_addr = (uint32_t)g->bin[d].dma_address
-				       + (uint32_t)(ki * g->bin_stride);
+			job.input_addr = (uint32_t)g->bin[d][bin_idx(g, ki)].dma_address
+				       + (uint32_t)bin_off(g, ki);
 			job.output_addr = (uint32_t)ob->bo[d].dma_address
 					+ (uint32_t)(nt * g->bout_stride);
 			nreg = charsiu_emit_job(&job,
@@ -5203,7 +5333,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			if (!nreg) {
 				whine(g, "the batched register stream came back empty",
 				      (unsigned)job.mm.k, (unsigned)job.mm.n);
-				charsiu_bo_fini(g->dev[d], &g->bin[d]);
+				for (unsigned kj = 0; kj < g->bin_nks; kj++)
+					if (bin_used(g, kj, done_ki))
+						charsiu_bo_fini(g->dev[d],
+							&g->bin[d][kj]);
 				charsiu_bo_fini(g->dev[d], &g->breg[d]);
 				return -1;
 			}
@@ -5217,8 +5350,14 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 		g->bpack_emit_us += now_us() - tpe;
 		tpe = now_us();
+		/* ⚠ ONLY WHAT WAS WRITTEN. done_ki is the bitmap of K slices
+		 * this call packed into this device; a slice nobody touched
+		 * holds bytes the hardware already read and needs no flush. */
 		if (!reuse)
-			charsiu_bo_fini(g->dev[d], &g->bin[d]);
+			for (unsigned ki = 0; ki < g->bin_nks; ki++)
+				if (bin_used(g, ki, done_ki))
+					charsiu_bo_fini(g->dev[d],
+							&g->bin[d][ki]);
 		charsiu_bo_fini(g->dev[d], &g->breg[d]);
 		g->bpack_fini_us += now_us() - tpe;
 		g->bpack_us += now_us() - tp;
