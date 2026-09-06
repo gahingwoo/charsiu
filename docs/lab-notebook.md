@@ -3116,3 +3116,30 @@ THIS BOOT"* -- is a false alarm. The Image's mtime is 1788580697 and the boot
 was at `now - uptime` = 1788636058, so the Image is 15 hours OLDER than the
 boot and the kernel running is the one on disk. The test is
 `[ /boot/Image -nt /proc/1 ]` and /proc/1's mtime is not the boot instant.
+
+### m67: 48 identical hashes across four models, and none of them proves the overlap ran
+
+Four models, two prompt lengths, the token loop as the reference and three runs
+each of the serial default and `CHARSIU_NPU_PARALLEL_MIN_M=28`:
+
+```
+  short  qwen3  1x156        tinyl 1x158       llama 1x110       gemma3 1x80+1x78
+  long   qwen3  5x80+1x12    tinyl 5x80+1x14   llama 3x80+1x20   gemma3 5x80+1x14
+```
+
+Every one of the 48 batched runs hashes exactly to its own token loop, and the
+widths line beside each says which chunks it batched -- including tails of 12,
+14 and 20, and the 80s the chunker really emits.
+
+**⚠ And that is not yet evidence the overlap engaged.** `PARALLEL_MIN_M` is
+consulted only after `batch_serial()` has already said "serialise", and
+`batch_serial()` defaults to `!overlap_safe()` -- so on a rail `overlap_safe()`
+approves, the two arms would be the same run twice and all 48 hashes would
+match for a reason that has nothing to do with the question. Identical output
+across arms is exactly what a knob that never engaged produces, which this
+month has already cost four rounds.
+
+m68 reads the two things that cannot stay quiet if the arms really differ: the
+line the runtime prints about what it decided, and the fence, which is the
+stage overlapping the cores cuts -- 409 ms to 164 ms when the element probe
+engaged it.
