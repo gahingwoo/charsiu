@@ -3260,3 +3260,37 @@ now picks between two correct paths instead of guarding a broken one.
 answered `widths 20x4`. The chunker had already split it, so the gate under
 test was never reached and the round proved nothing about it. The widths line
 said so on its own output.
+
+### m73: the gate on the card, and the price with six runs
+
+`charsiu update dev`, then a chunk of 8 and a chunk of 10 asked for explicitly
+on four models, each against its own token loop:
+
+```
+  model    token loop     chunk 8            chunk 10          default
+  llama    c728d6bc2799   10x8      same     8x10     same     1x80      same
+  qwen3    4f050ade006f   13x8+1x6  same     11x10    same     1x110     same
+  tinyl    c7a8689f0a9d   14x8      same     11x10+1x2 same    1x112     same
+  gemma3   efd3dfb40845   14x8      same     11x10+1x2 same    1x80+1x32 same
+```
+
+Where m71 got `20x4` for the same request, the chunker now emits the width it
+was asked for, and every hash equals its token loop. That is the change working
+end to end: the chunker stopped splitting and npudev let the width through.
+
+And the standing price, `board_vendor.sh` at `CHARSIU_BENCH_REPEAT=6`,
+governor performance:
+
+```
+                 TTFT ours   theirs   gap      decode ours   theirs
+  Qwen3 0.6B      687        469      1.47x     24.75         24.85
+  TinyLLAMA 1.1B  900        544      1.65x     20.64         19.71
+  Phi3 3.8B      3057       1829      1.67x      6.87          6.58
+  Gemma4 E2B     2352       1219      1.93x      8.67          9.23
+```
+
+Unchanged by the day's work, and that is the expected result rather than a
+disappointment: the default chunker emits one wide chunk at these prompt
+lengths and never asks for 8 or 10, so nothing shipped today is on this path.
+What the day bought is that three "open" faults are closed and two gates now
+name the real condition. The gap itself is still the NPU entry.
