@@ -2316,3 +2316,28 @@ beside the first.
 The prompt that actually engages it is 45 numbers, 91 tokens, and the widths it
 currently runs are `1x80+1x6+1x4` -- a chunk of six and a chunk of four, each
 paying a fence, a pack and a read on every tensor of every layer.
+
+### And the rule has four points
+
+With the paths fixed -- `/opt/charsiu/models` holds three models and the rest
+live in `~/.charsiu/models`, which is what produced the empty hashes -- the two
+missing head widths ran:
+
+```
+                              CPU attn   NPU attn   whole prefill
+   hd 256  gemma-3-1b           6.29       1.50      12.43 -> 7.85   -37%
+   hd 128  Qwen3-0.6B           8.13       5.51      13.15 -> 11.34  -14%
+   hd  64  Llama-3.2-1B         2.16       3.72      a loss
+   hd  64  SmolLM2-135M         2.59       3.13      a loss
+```
+
+gemma-3's CPU arm repeats to 0.9% either side of the NPU one, so the 76% is not
+weather. Monotone in head_dim, with a mechanism that does not need fitting: a
+wider head is a wider matmul and this hardware wants width. `CHARSIU_ATTN_NPU=
+auto` puts the crossover at 128.
+
+**It is still off by default, and not because of the clock.** Everything else
+turned on today -- the pair read, the eight wide values, the one chunk prompt --
+shipped on a text hash that did not move. This one computes attention in fp16
+where the CPU computes it in fp32, so the answer can differ. That is a decision
+about the output, not about the speed, and it is not this file's to make.
