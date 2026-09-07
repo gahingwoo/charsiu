@@ -4121,3 +4121,62 @@ Everything shipped today came from two moves, used five times:
 2. **Look at the half nobody has looked at.** Two days went into the matmul
    entry, which is 57 to 74% of the prompt. All three rope changes came out of
    the other half, in the last few hours, after "there must be a way out."
+
+### 🏁 The decode attention pool, and gemma4 is still not there
+
+I reported "three of four at or above the vendor's decode" and led with the
+model that wins. Gemma4's decode was **8.71 against 9.23, 94.4%, behind** -- the
+number was in the table and the framing walked past it. That is the wall's
+mistake: a story fitted to the cases that agree, with the exception left
+unchased.
+
+Chasing it: gemma4 does **9.98 tok/s at an 8 token context and beats the
+vendor**, and 8.78 at the scoreboard's 111. The deficit is attention growing
+with the context, not weights.
+
+```
+  attention ms a token      ctx 8     ctx 113    ctx 694
+  gemma4                     1.48      13.37      62.19
+  gemma3                     0.57       3.50      15.81
+  qwen3                      1.39       8.66        --
+```
+
+Decode attention was deliberately serial, and round 368's comment is why -- and
+it wrote its own follow-up: *"the path stays, because attention grows with the
+context and 38 positions is not where this question gets settled."*
+
+Settled at 113, five models, text identical in every pair:
+
+```
+                pinned                   unpinned
+  gemma4     8.78 -> 9.12  +3.9%      8.79 -> 9.11  +3.6%
+  qwen3     25.75 -> 27.17 +5.5%     25.70 -> 27.18 +5.8%
+  tinyllama 20.90 -> 22.80 +9.1%
+  llama     20.98 -> 21.57 +2.8%
+  gemma3    21.26 -> 21.04 -1.0%     14.24 -> 18.53 +30%
+```
+
+⚠ **Round 368's 15 ms unpinned penalty is gone** -- unpinned is now the best
+case of all, from the QoS hold and affinity work that landed since. At eight
+positions it still loses, -0.5 to -2.5%, exactly as that round said. So the
+rule is the context and not the model: pool from `CHARSIU_ATTN_POOL_MIN`
+positions, 64 by default.
+
+Scoreboard, best of six:
+
+```
+             decode ours   before   theirs   ours/theirs
+  Qwen3       26.43        24.90    24.85     106.4%   (was 100.2%)
+  TinyLLAMA   22.89        20.76    19.71     116.1%   (was 105.3%)
+  Phi3         7.01         6.89     6.58     106.5%   (was 104.7%)
+  Gemma4       9.00         8.71     9.23      97.5%   (was  94.4%)
+```
+
+**Gemma4 is still behind, by 2.5%.** Most of the gap closed and none of it is
+closed by adjective. What is left, from its own token at 100 ms: `gate + up`
+35.06 ms and `down` 19.73 -- 55% of the token in two weight reads, at the
+9.74 GB/s the hardware path reports against the 11.9 this board has been
+measured reading at. That is where the last 2.5% is, and it is a bandwidth
+question, not an attention one.
+
+TTFT moved with it: 609 / 866 / 2934 / 2183, so 1.30 / 1.59 / 1.60 / 1.79.

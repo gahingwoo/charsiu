@@ -89,6 +89,62 @@ static int attn_perhead(void)
 	return v;
 }
 
+/*
+ * ⚠⚠ POOL THE DECODE ATTENTION ONCE THE CONTEXT PAYS FOR THE FAN OUT, WHICH IS
+ * ROUND 368'S OWN FOLLOW-UP.
+ *
+ * That round measured the heads on the pool at 22.70 ms a token against 7.75
+ * serial unpinned, and 7.42 against 7.75 pinned, at THIRTY EIGHT positions --
+ * and said in as many words: "the path stays, because attention grows with the
+ * context and 38 positions is not where this question gets settled."
+ *
+ * Settled at 113, which is the length the vendor's own scoreboard uses. Decode
+ * tok/s, serial -> pooled, five models, text identical in every pair:
+ *
+ *              pinned to the A72s        unpinned
+ *   gemma4      8.78 -> 9.12  +3.9%      8.79 -> 9.11  +3.6%
+ *   qwen3      25.75 -> 27.17 +5.5%     25.70 -> 27.18 +5.8%
+ *   tinyllama  20.90 -> 22.80 +9.1%
+ *   llama      20.98 -> 21.57 +2.8%
+ *   gemma3     21.26 -> 21.04 -1.0%     14.24 -> 18.53 +30%
+ *
+ * ⚠ AND THE 15 ms UNPINNED PENALTY IS GONE. Round 368's worst case was the
+ * scheduler moving the process; unpinned now it is the best case of all, which
+ * is the QoS hold and the affinity work that landed since. A default fitted
+ * under conditions that changed is the thing this tree keeps finding.
+ *
+ * At EIGHT positions it still loses -- gemma3 -1.5%, qwen3 -2.5%, llama -0.5%
+ * -- exactly as round 368 said, because the fan out is a fixed cost and there
+ * is almost nothing to divide. So the rule is the context and not the model:
+ * pool from CHARSIU_ATTN_POOL_MIN positions, 64 by default, which sits between
+ * the 8 that loses and the 113 that wins.
+ *
+ * CHARSIU_ATTN_POOL=1 forces it on at any length and =0 off, which is what the
+ * rounds above used.
+ */
+static unsigned attn_pool_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_POOL_MIN");
+
+		v = e ? atoi(e) : 64;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+static int attn_pool_for(int pos)
+{
+	const char *e = getenv("CHARSIU_ATTN_POOL");
+
+	if (e && *e)
+		return *e != '0';
+	return pos >= 0 && (unsigned)pos >= attn_pool_min();
+}
+
 static int attn_pool(void)
 {
 	static int v = -1;
@@ -6809,7 +6865,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			 * context and 38 positions is not where this question
 			 * gets settled. CHARSIU_ATTN_POOL turns it on.
 			 */
-			if (attn_pool()) {
+			if (attn_pool_for(pos)) {
 				charsiu_note("attention over the pool",
 					     cur_layer, (unsigned long)g_pool.n);
 				pool_run(attn_heads, &aj, m->n_head, 1);
