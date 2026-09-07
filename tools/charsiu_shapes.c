@@ -45,10 +45,50 @@ static uint64_t slices(uint64_t k, unsigned kmax)
 	return kmax ? (k + kmax - 1) / kmax : 1;
 }
 
+/*
+ * ⚠⚠ THE COST OF A CALL IS NOT LINEAR IN ITS BYTES, AND A TOTAL HIDES THAT.
+ *
+ * The first version of this fitted a token as calls*a + tasks*b + MB*c with
+ * MB the model's whole weight, and its hold-out error was +4.4% on qwen3,
+ * +10.6% on gemma4 and +23.5% on Phi-3.5 -- monotone in size, which no
+ * coefficient fixes because it is the FORM that is wrong. npu_job_cost's own
+ * sweep says why (round 155, one job one task, us against MB):
+ *
+ *     0.0328 -> 40.13     1.0486 -> 144.00     8.3886 -> 785.00
+ *     0.2621 -> 44.44     4.1943 -> 406.81
+ *
+ * The line through the large end predicts 38 and 129 for the first two, so a
+ * megabyte in a SMALL call costs more than a megabyte in a large one. Phi-3.5
+ * has the fattest tensors of the five, so an average rate overcharges it most
+ * -- exactly the shape of the error.
+ *
+ * So a call is priced from its own bytes, by interpolating the measured
+ * points, and the model's total is never formed. That is not a better fit; it
+ * is the same measurement asked per call instead of once.
+ */
+static double call_us(double mb)
+{
+	/* npu_job_cost, round 155, m = 1, one task, int8 weights */
+	static const double x[] = { 0.0328, 0.2621, 1.0486, 4.1943, 8.3886 };
+	static const double y[] = { 40.13,  44.44,  144.00, 406.81, 785.00 };
+	const int n = (int)(sizeof(x) / sizeof(*x));
+	int i;
+
+	if (mb <= x[0])                       /* below the smallest measured */
+		return y[0] * (mb / x[0] < 1.0 ? 1.0 : 1.0);
+	for (i = 1; i < n; i++)
+		if (mb <= x[i])
+			return y[i - 1] + (y[i] - y[i - 1])
+			       * (mb - x[i - 1]) / (x[i] - x[i - 1]);
+	/* above the largest measured, extend at the large end's slope */
+	return y[n - 1] + (mb - x[n - 1])
+	       * (y[n - 1] - y[n - 2]) / (x[n - 1] - x[n - 2]);
+}
+
 int main(int argc, char **argv)
 {
 	/* provisional: npu_job_cost's a and b, npudev's c. See the note above. */
-	double A = 16.85, B = 4.81, C = 110.0;
+	double A = 37.2, B = 4.81, C = 89.1;
 	unsigned kmax = 1024, nmax = 8192;
 	int i, first = 1;
 
@@ -61,14 +101,14 @@ int main(int argc, char **argv)
 			sscanf(argv[++i], "%lf,%lf,%lf", &A, &B, &C);
 	}
 	printf("KMAX %u  NMAX %u   cost = %.2f us a call + %.2f a task + "
-	       "%.1f a MB  (PROVISIONAL)\n\n", kmax, nmax, A, B, C);
+	       "%.1f a MB  (npu_job_cost, round 155)\n\n", kmax, nmax, A, B, C);
 	printf("%-30s %6s %6s %7s %7s %8s %8s %7s %9s\n",
 	       "model", "layer", "n_embd", "n_ff", "calls", "tasks", "MB",
 	       "t/MB", "ms a token");
 	for (i = 1; i < argc; i++) {
 		struct llama_model m;
 		uint64_t calls = 0, tasks = 0;
-		double bytes = 0.0, ms;
+		double bytes = 0.0, ms, us = 0.0;
 		unsigned l;
 
 		if (argv[i][0] == '-') { i++; continue; }
@@ -86,20 +126,27 @@ int main(int argc, char **argv)
 				    ? m.layers[l].n_ff : m.n_ff;
 			uint64_t gu = e * ff, dn = ff * e;
 
-			/* four grouped calls a layer: qkv, o, gate+up, down */
+			/* four grouped calls a layer: qkv, o, gate+up, down.
+			 * Each is priced from ITS OWN bytes -- see call_us. */
 			calls += 4;
 			tasks += 3 * slices(e, kmax)      /* q, k, v */
 			       + slices(e, kmax)          /* o reads n_head*hd */
 			       + 2 * slices(e, kmax)      /* gate, up */
 			       + slices(ff, kmax);        /* down */
 			bytes += (double)(q + 2 * kv + o + 2 * gu + dn) * 0.5;
+			us += call_us((double)(q + 2 * kv) * 0.5 / 1e6)
+			    + call_us((double)o * 0.5 / 1e6)
+			    + call_us((double)(2 * gu) * 0.5 / 1e6)
+			    + call_us((double)dn * 0.5 / 1e6);
 		}
 		calls += 1;                                   /* the head */
 		tasks += slices(m.n_embd, kmax)
 		       * ((m.n_vocab + nmax - 1) / nmax);
 		bytes += (double)m.n_vocab * m.n_embd * 0.5;
+		us += call_us((double)m.n_vocab * m.n_embd * 0.5 / 1e6);
 		bytes /= 1e6;
-		ms = (calls * A + tasks * B + bytes * C) / 1e3;
+		ms = (us + tasks * B) / 1e3;
+		(void)A; (void)C;
 
 		if (first) first = 0;
 		printf("%-30s %6u %6u %7u %7llu %8llu %8.1f %7.2f %9.2f\n",
