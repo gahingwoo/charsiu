@@ -6061,3 +6061,54 @@ this morning's pack fix: int8's row went 6.41 -> 4.59 ms while int4's stayed at
 the prompt. The qpack change landed at ~09:2x. That stale column is what the
 README's three-row table quotes, and what "int8 is a quality option, not a
 speed one" was written from. Round 155 re-runs it.
+
+### 🏁 The .rkllm, mapped to the byte, and the scale array found
+
+Binary search on the nibble-half statistic puts three of the four regions
+exactly, and the arithmetic closes to within a tenth of a percent:
+
+```
+                      offset          size      expected      error
+  metadata          0            7.3 MB       header + tokenizer
+  fp16 embedding    7.3 MB     501.0 MB       128256 x 2048 x 2
+  fp16 SCALES     514.6 MB      11.2 MB       ?
+  int4 layers     525.8 MB     463.8 MB       973 M x 0.5 = 464.0   -0.04%
+  int8 head       989.6 MB     250.7 MB       263 M x 1   = 250.5   +0.10%
+```
+
+**The int4 region is the weights and nothing else** -- 463.800 against 464.000
+predicted -- so the scales are not interleaved with them, which the 0.26%
+nibble symmetry already implied and this confirms by size.
+
+**The scales are their own region and it is findable by what a scale IS.**
+Embeddings are symmetric about zero; a scale is positive. Sweeping the fraction
+of positive fp16 values walks from 49.9% to 99.4% at 514.6 MB, and the region
+from there to the int4 boundary is 11.203 MB -- 5,873,759 halves, 90 to 99%
+positive, magnitudes from 1e-7 to 1e-3, and about 300 distinct values in any
+64 KB.
+
+⚠ **Mostly powers of two.** `frexp` mantissas over 2000 samples: 0.5 in 80% of
+them, 0.75 in 12%, 1.0 in 5%. A scale quantised to a shift, not a free fp16.
+
+⚠⚠ **And it is not a flat array of one scale a group.** The tail has an
+obvious period of four:
+
+```
+  0.000488758   2.10156   3.75509e-06   1.78814e-07
+  0.000488758   2.10938   4.94719e-06   0
+  0.000488758   2.11719   ...
+```
+
+First slot constant, second drifting slowly, third and fourth small. Dividing
+the count by the weights gives group 165.7 or 210.4 depending on whether the
+head is included -- **neither is an integer**, which is the arithmetic saying
+the layout is a record and not an array.
+
+**So: the file is fully readable and the scales are located. What is left is a
+record format, not a search.** Whether the vendor's four-bit quantiser is
+better than charsiu's can be answered by decoding ONE tensor -- no tokenizer,
+no forward pass, no board -- and that is now a bounded piece of work rather
+than an open question.
+
+⚠ Everything above is structure and arithmetic. No vendor weight has been
+dequantised yet, and until one is, nothing here says anything about quality.
