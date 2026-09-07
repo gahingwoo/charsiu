@@ -5257,3 +5257,41 @@ slicing moves.
 group" coupling does not bind -- which looks like int8 being free to take a
 wider KMAX and halve its task count. It is not free: the constraint that stops
 2048 is the batched path itself, and it has nothing to do with grouping.
+
+### Why int8 is the answer here, as an argument rather than an observation
+
+The four-bit group is bought in READ, because the K slice IS the group: cut the
+group by a factor and every tensor is dispatched that many more times, and each
+dispatch reads its own accumulator back. Put the measured quality against that
+cost, on qwen3, 600 tokens:
+
+```
+                              bytes a weight   read     ppl
+  int4, group 1024 (ships)         0.502        1x     49.89
+  int4, group 256                  0.508        4x     38.97
+  int4, group 128                  0.516        8x     36.33
+  q4_0, group 32 (llama.cpp)       0.5625      32x     26.64
+  int8, one scale a row            1.000        1x     27.07
+```
+
+⚠ **The int8 row is 1x and that is the whole point.** Its group is the row, so
+`tensor_grouped()` is false and KMAX is not tied to it at all -- eight bits
+steps outside the coupling rather than paying it.
+
+And the read budget says the other rows are not reachable. The batched prefill
+reads at **5.2 GB/s against the 11.9 the board's eight threads can do** -- 2.3x
+of headroom. Group 256 wants 4x, group 128 wants 8x, and q4_0's group of 32
+wants 32x. **Only the 1x column is affordable, and int8 is the only row in it
+with a usable number.**
+
+So the format story closes: two extra bits buy llama.cpp's own q4_0 quality
+(27.07 against 26.64) at ONE times the read, where buying the same quality with
+a finer four-bit group would cost thirty-two. The price is the weight bytes --
+twice as many, and decode is memory bound, which is why int4 stays the default
+for chat and int8 is the prompt-heavy arm PLAN.md already recommends.
+
+⚠ What this does NOT say: that a finer group is impossible. It says it is
+read-bound on THIS board with THIS accumulator. The note over `tensor_grouped`
+in npudev.c has the register-level argument for why one dispatch cannot carry
+more than one group, and that is the thing to reopen if the surface ceiling
+ever lifts.
