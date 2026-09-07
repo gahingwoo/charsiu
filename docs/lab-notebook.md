@@ -5973,3 +5973,57 @@ And the rest of the row was already int8's: fence 0.90 against 1.24, read 0.94
 against 1.30. Eight-bit weights dispatch fewer, wider slices for the same
 tensor because their group does not pin KMAX, and both of those numbers follow
 from it before KMAX is even swept.
+
+### 🏁 Round 154: KMAX 4096 does not disagree, it collapses
+
+The batched path scored at each width, int8, qwen3, 400 tokens:
+
+```
+  KMAX 1024, token loop        43.9086
+  KMAX 1024, --batch           44.7567     +1.9%
+  KMAX 2048, --batch           43.6578     -0.6%   better than the loop
+  KMAX 4096, --batch    4,932,524,413,828  ⛔
+```
+
+`llama_auto_kmax` stops its candidate list at 2048 because "Qwen2.5 and
+gemma-3-1b DISAGREE at 4096" -- a text hash, a bit, no magnitude. **It is
+eleven orders of magnitude.** The candidate list was right and now the reason
+has a shape.
+
+And 2048 is CLEAN on int8 -- marginally better than the token loop, which is
+what a wider slice should be: fewer accumulator round trips, the same
+quantiser, because int8's group does not widen with KMAX.
+
+⚠ But the width is not the lever it looked like. Its whole value is a 25%
+smaller read, and the chunk cap halves with it, so it only wins where the
+prompt still fits one chunk:
+
+```
+  prompt   KMAX 1024 chunks   KMAX 2048 chunks   winner
+      64          1                  1           2048, read -25%
+      80          1                  1           2048
+     110          1                  2           1024
+     400          3                  5           1024
+```
+
+At 91 tokens round 153 measured exactly that: 4.59 ms a row at 1024 in one
+chunk, 5.21 at 2048 in two. **The ceiling on this whole line is about 3%, and
+only for prompts under 80.**
+
+### ⚠⚠ But normalising round 153 found something the scoreboard is wrong about
+
+```
+  m153  int8 KMAX 1024   413 ms / 91 tok  =  4.54 ms a token
+  vendor qwen3           469 ms / 110 tok =  4.26            6.5% behind
+  scoreboard int4        594 ms / 110 tok =  5.40            27% behind
+```
+
+**int8 takes TTFT from 27% behind the vendor to about 6.5%,** and the reason is
+this morning's pack fix: int8's row went 6.41 -> 4.59 ms while int4's stayed at
+5.36, so the format that was slower on both axes is now faster on one.
+
+⛔ **And the scoreboard's int8 column predates that commit.** Round 143 ran
+`CHARSIU_BENCH_W4V=0` at 08:41 and reported Qwen3 TTFT 751 ms -- int8 slower on
+the prompt. The qpack change landed at ~09:2x. That stale column is what the
+README's three-row table quotes, and what "int8 is a quality option, not a
+speed one" was written from. Round 155 re-runs it.
