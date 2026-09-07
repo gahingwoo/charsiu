@@ -4995,3 +4995,136 @@ charsiu. The first external measurement said +87%, the cause was a group 32x
 coarser than q4_0's, the fix for that was a method the tree had already
 implemented and never got to work, and it was three bugs deep -- each of which
 looked exactly like a null result.
+
+## 2026-09-08 — w8a8 was never broken
+
+Last night's quality line ended with a refusal: *"⛔ w8a8 IS BROKEN AND UNFIXED,
+ppl 272369 (qwen3) / 218168 (gemma4), and PLAN.md still calls it the faster arm
+for prefill."* That was the right thing to write down and the wrong thing to
+conclude.
+
+### The desk decided it, in two commands
+
+The first question a broken path deserves is *which half*. `charsiu_ppl` on the
+host runs the CPU reference against the same staged, requantised weights, so it
+prices the quantiser with the device taken out of the loop. qwen3, 200 tokens:
+
+```
+  CHARSIU_NPU_W4V=1   int4   ppl 91.6559
+  CHARSIU_NPU_W4V=0   int8   ppl 44.8050
+```
+
+int8 is not noise on the host. It is twice as good as int4, which is what eight
+bits ought to be. So the fault is not in the weights — it is between them and
+the hardware.
+
+### And then the tree said what it was, twice, in comments it had already written
+
+`tensor_grouped()` in npudev.c decides whether a K slice may carry one group's
+scale. It wants four things, and the first is `g->w4`. The quantiser did not
+know that: `npu_tensor_build` sets `t->kgroup = grp` for eight bits exactly as
+for four, writes `scale[row * ngrp + group]`, and the int8 consumer reads
+`scale[row]`. Every row takes some other row's scale.
+
+There is already a guard for this. It was added when a partial last group did
+the same thing to Qwen2.5-1.5B, whose k of 1536 and 8960 do not divide the 1024
+slice — it "decoded fluent nonsense on the board while the same file was correct
+on the CPU". The guard reads:
+
+```c
+if (t->kgroup && t->kgroup < t->k && (t->k % t->kgroup)) {
+        whine(g, "a partial weight group would be read as one scale a row", ...);
+```
+
+⚠⚠ **It tests one of tensor_grouped's four clauses.** An int8 tensor at k 2048
+with a group of 1024 has no remainder, so it walks straight past a guard written
+against its exact failure. Every board round exports
+`CHARSIU_NPU_W4_GROUP=1024` whatever the format, which is why the accidental
+w8a8 arm hit it and no deliberate one ever had.
+
+### The fix, and what it costs
+
+```c
+  npuquant.c   if (bits != 4) grp = k;      /* one scale a row, which is what
+                                               the int8 consumer applies */
+  npudev.c     if (t->kgroup && t->kgroup < t->k && !tensor_grouped(g, t))
+                       refuse;              /* ask the predicate, not a clause */
+```
+
+Host, paired, one knob apart:
+
+```
+                     before     after
+  int8 group 1024   44.8050   43.6595     the row number, digit for digit
+  int4 group 1024   91.6559   91.6559     untouched, digit for digit
+```
+
+**At eight bits the coarser group is not a cost — it is a small gain.** A row's
+spread fits in eight bits on its own, so the finer scales only add their own
+rounding. Four bits is the opposite, 91.66 grouped against 114.22 a row, which
+is the whole reason the group exists.
+
+### On the board (round 139)
+
+The corpus lives in /tmp and `usb_reset` reboots the card, so all four ppl arms
+read a missing file and returned nothing — four blank lines, which is what four
+equal arms also look like. The arms that need no corpus did run:
+
+```
+  the widened guard fired on 0 tensors, int4 and int8 alike
+  w8a8 text: "storm had been coming for a long time, but the lighthouse is now
+              only 100 miles from the coast."
+  int8 decode 19.45 tok/s against int4's 31.53, same 13 token prompt
+```
+
+ppl 272369 does not write that sentence. Round 140 rebuilds the corpus first and
+refuses to run the arms if it is not there.
+
+### Where the four-bit error actually lives
+
+`CHARSIU_NPU_W4_ONLY` narrows int4 to tensors whose name contains a substring.
+Host, qwen3, 200 tokens, group 1024:
+
+```
+  everything int8                       43.66
+  attention int4, the rest int8         54.76
+  ffn int4, the rest int8               62.49
+  everything int4                       91.66
+```
+
+⚠ This is an attribution, not a saving: `npu_q_packed()` is off whenever
+W4_ONLY is set, so the four-bit tensors still occupy a byte a code. The file
+says so itself — "a diagnostic for WHERE the error lives".
+
+Two things it says. Attention at four bits costs less than the feed forward at
+four bits, 11.10 against 18.83 — and the feed forward is the larger of the two,
+so per byte they are close to the same. And **the two costs compound rather than
+add**: 11.10 + 18.83 = 29.93, while both together cost 48.00. There is no cheap
+win from splitting the format by tensor class; the error is spread about evenly
+over the bytes, and it gets worse than proportionally when they are all four
+bits at once.
+
+### What this does to the format decision
+
+PLAN.md's rule — int8 when the prompt is more than 3.1x the generated text —
+was priced entirely in tok/s. The quality column, now that one exists, points
+the same way and harder:
+
+```
+  int4, one scale a row                       114.22
+  int4, group 1024                             91.66
+  int4, group 1024 + AWQ 0.5 clamp 2           72.36
+  int8, group 1024                             44.81
+  int8, one scale a row                        43.66
+```
+
+Eight bits with no group and no AWQ beats four bits with both. So int8 is not
+the format you accept for prefill speed and pay for in quality; it is better on
+both counts for prompt-heavy work, and only decode speed argues against it.
+
+⚠ AWQ and the finer group do stack, 73.88 and 91.66 separately against 72.36
+together — but barely, and both are still a long way behind eight bits.
+
+⚠ Still unmeasured: quality through the BATCHED prefill path. Every number here
+is `charsiu_ppl`, one position at a time on purpose. The recommendation is about
+prefill and the arm that ships it has not been scored.

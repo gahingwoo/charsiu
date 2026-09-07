@@ -1739,6 +1739,62 @@ the work. For a prompt of P tokens and G generated,
 wins it outright; int8 is for prompt-heavy work -- summarising a document,
 retrieval -- where the prompt is several times the answer.
 
+⚠⚠ **AND THAT RULE WAS PRICED ENTIRELY IN MILLISECONDS.** Four tok/s numbers
+decide which format a user gets, and not one of them says anything about what
+the answer is worth. The instrument that could have -- `tools/charsiu_ppl` --
+did not exist until 2026-09-07, and the first thing it did was refuse the whole
+paragraph above:
+
+```
+  qwen3, 600 tokens, on the board
+  the gguf's own q4_0 through llama.cpp        26.64
+  charsiu int4, group 1024, as it ships        49.89   +87%
+  charsiu w8a8                              272369     noise
+```
+
+⛔ For a night this was written down here as "the int8 path emits noise, and
+this file recommends it". **That was wrong, and it was wrong in a way worth
+keeping the record of, because the measurement was real and the conclusion
+drawn from it was not.**
+
+w8a8 is not broken. It was being handed scales in a layout it does not read.
+`tensor_grouped()` in npudev.c requires four things before a K slice may carry
+a group's scale, and one of them is `g->w4`; the quantiser wrote
+`scale[row * ngrp + group]` for eight bits exactly as for four, and the int8
+consumer read `scale[row]`. Every row took some other row's scale. The guard
+that exists for precisely this failure tested one of the four clauses -- the
+partial last group -- and an int8 tensor at k 2048 with a group of 1024 has no
+remainder, so it sailed past. Every board round exports
+`CHARSIU_NPU_W4_GROUP=1024` whatever the format, which is why the accidental
+arm reached it and no deliberate one ever had.
+
+**Read the other way round, the same instrument makes the int8 case stronger
+than this section ever did.** Host, qwen3, 200 tokens, the CPU reference, one
+knob apart:
+
+```
+  int4, one scale a row                       114.22
+  int4, group 1024                             91.66
+  int4, group 1024 + AWQ 0.5 clamp 2           72.36
+  int8, group 1024                             44.81
+  int8, one scale a row                        43.66
+```
+
+Eight bits, with no group and no AWQ, is better than four bits with both. And
+the coarser group is not a cost there at all -- 43.66 beats 44.81 -- because a
+row's spread fits in eight bits on its own and the finer scales only add their
+own rounding, which is the exact opposite of what the group is for at four.
+
+So the trade in this section is not speed against nothing. It is
+**prompt-heavy work AND better answers, against decode speed**, and the second
+term was invisible while the only numbers here were tok/s.
+
+⚠ What is still unmeasured: quality through the BATCHED prefill path. Every
+number above is `charsiu_ppl`, which runs one position at a time on purpose --
+the batched path is a different arithmetic and this priced the weights. The
+format recommendation in this section is about prefill, so the arm that
+actually ships it has not been scored.
+
 ⚠ The batched prefill helps int4 too, and not because the matmul batches: it
 refuses there. It is that a prompt needs logits for its last token only, so the
 head is skipped n - 1 times whatever the format.
