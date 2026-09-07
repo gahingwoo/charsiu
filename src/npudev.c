@@ -2589,8 +2589,8 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	if (g->t_first == 0.0)
 		g->t_first = t_add;
 	/*
-	 * ⚠⚠ AWQ IS NOT WIRED TO THIS PATH, AND IT FAILS LOUD NOW RATHER THAN
-	 * QUIETLY WRONG.
+	 * ⚠⚠ AWQ: THE FACTOR RIDES ON THE ACTIVATION, and only the
+	 * single-tensor matvec applies it. Paths that cannot, refuse.
 	 *
 	 * npuquant folds the AWQ factor into the WEIGHTS and leaves t->kscale
 	 * for the caller to apply to the ACTIVATION -- its own note says "on
@@ -2613,18 +2613,6 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * nothing shipped wrong; but "written, legal, default off" describes
 	 * three things and only the last was ever certain.
 	 */
-	if (t->kscale) {
-		static int said;
-
-		if (!said++)
-			fprintf(stderr, "charsiu NPU: CHARSIU_NPU_AWQ folds a "
-				"factor into the weights that this path never "
-				"applies to the activation -- the answers would"
-				" be WRONG, not approximate. Staying on the CPU"
-				" for %s and anything else carrying one.\n",
-				t->name);
-		return -1;
-	}
 	/*
 	 * ⚠ t->name IS A FIXED ARRAY INSIDE npu_tensor, not a stack buffer, so
 	 * it is still readable from a signal handler after this frame is gone.
@@ -3014,6 +3002,23 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 
 		if (g->w4) {
 			const float *src = a->f + s->k0;
+			const float *ks = e->t->kscale;
+
+			/*
+			 * ⚠⚠ THE AWQ FACTOR, UNDONE ON THE INPUT -- the one
+			 * multiply npuquant's note asks for and nothing did.
+			 *
+			 * It scaled this tensor's weights by kscale[k] before
+			 * rounding them, so the product only survives if the
+			 * activation carries the inverse. The stored factor IS
+			 * that inverse, so this is a multiply: one pass over k,
+			 * into the scratch midrise already allocated.
+			 */
+			if (ks) {
+				for (i = 0; i < s->job.mm.k; i++)
+					g->fscr[i] = src[i] * ks[s->k0 + i];
+				src = g->fscr;
+			}
 
 			/*
 			 * STRAIGHT FROM THE ACTIVATION, NO COPY. The packer
@@ -5991,6 +5996,25 @@ void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			     const struct charsiu_act *a, float **ys)
 {
+	/*
+	 * ⚠⚠ A GROUP SHARES ONE PACKED INPUT, AND AN AWQ FACTOR IS PER TENSOR.
+	 *
+	 * That is the whole point of this entry: q, k and v read the same
+	 * activation, so it is packed once. npuquant's factor is a property of
+	 * the WEIGHTS it was folded into, so two tensors with different factors
+	 * need two different inputs and the sharing is gone.
+	 *
+	 * Refusing here is not a fallback to the CPU: matvec_pair's caller
+	 * drops to charsiu_npu_matvec per tensor, which applies the factor.
+	 * The cost is the sharing, not the hardware.
+	 */
+	for (unsigned gi = 0; gi < n; gi++) {
+		const struct npu_entry *ge = &g->ent[ids[gi]];
+
+		if (ge->t->kscale)
+			return -1;
+	}
+
 	struct npu_entry *e0;
 	struct charsiu_joblist jl;
 	uint32_t outh[8];
