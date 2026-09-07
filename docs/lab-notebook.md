@@ -5224,3 +5224,36 @@ answers as well -- not a trade.
 ⚠ The decode figures are from round 139's 13-token text arms and are not
 scoreboard numbers. The scoreboard runs 110-token prompts and int8 has never
 been through it.
+
+### The `--batch` number is also the instrument for the K-slice fault
+
+`llama_auto_kmax` stops its candidate list at 2048 and says why:
+
+```
+  slice 2816   WRONG   (Qwen2.5 at KMAX 3072, surf 88)
+  slice 3072   right   (gemma-3-1b at KMAX 3072, surf 96)
+  slice 4096   WRONG   (both, surf 128)
+```
+
+"Something else is wrong above 2048 and it has not been found." Every probe
+that has ever asked this question asked it as **text identical or not** -- a
+bit. A bit cannot say whether a slice is slightly wrong or catastrophically
+wrong, cannot rank two widths that both fail, and cannot see a width that is
+wrong by less than one token choice.
+
+`charsiu_ppl --batch` is the continuous version of the same question, on the
+same path, and it costs one run a width. That is the next probe: sweep
+`CHARSIU_NPU_KMAX` over 1024 / 2048 / 3072 / 4096 with `--batch` and read the
+SHAPE of the error, against the token loop at the same width as the control.
+
+⚠ And note what the widening note already establishes and this does not
+change: the fault is in the batched path, not the quantiser -- at 1024, 2048
+and 4096 the three models whose every K misses every width came back byte
+identical, so the weights are the same bytes across the sweep and only the
+slicing moves.
+
+⚠⚠ It also closes an idea worth not having twice. int8 now sets `grp = k`, so
+`tensor_grouped()` is false for it and the "the K slice IS the quantisation
+group" coupling does not bind -- which looks like int8 being free to take a
+wider KMAX and halve its task count. It is not free: the constraint that stops
+2048 is the batched path itself, and it has nothing to do with grouping.
