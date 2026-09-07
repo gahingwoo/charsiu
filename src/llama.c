@@ -6640,21 +6640,60 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
  * CLAMP and not a default: 80 stays what a caller gets, and CHARSIU_PREFILL_
  * CHUNK is now safe to raise on any model because it cannot cross the cliff.
  */
+/*
+ * ⚠⚠ THE WIDEST SLICE A K BECOMES, AND UNDER KFIT THAT IS WIDER THAN KMAX.
+ *
+ * charsiu_slice_kw gives the last slice whatever is left, and its own comment
+ * says clamping it would drop the tail of the tensor without a word. So KFIT
+ * makes the widest slice `k - (ks-1)*kmax`, not `kmax`, and the ceiling below
+ * is a function of the slice and not of KMAX.
+ *
+ * Round 421 is what this is for. gemma-3-1b's `down` has K = 6912 at KMAX
+ * 2048, which KFIT takes from four slices to three -- and the last of those
+ * is 6912 - 2*2048 = 2816 wide. npudev.c already records `slice 2816 WRONG,
+ * surf 88` from a different model entirely. At 93 prompt rows the surface is
+ * 88 * 93 = 8184 against a ceiling of 5120, so EVERY projection was refused
+ * and every row of the prompt took the token loop -- silently:
+ *
+ *   gemma3   slices 292 -> 266   submits 5020 -> 9128   prompt 719 -> 1398 ms
+ *
+ * Fewer slices, 82% more submits, and the prompt nearly doubled. The text
+ * stayed correct, which is exactly why nothing said anything.
+ */
+static uint64_t widest_k_slice(uint64_t k, uint64_t kmax, int kfit)
+{
+	uint64_t ks;
+
+	if (!kmax || !k)
+		return k;
+	ks = (k + kmax - 1) / kmax;
+	if (kfit && ks > 1 && (k % kmax))
+		ks--;
+	if (ks <= 1)
+		return k;
+	/* the tail slice is the wide one; the others are kmax */
+	k -= (ks - 1) * kmax;
+	return k > kmax ? k : kmax;
+}
+
 int llama_prefill_chunk_cap(const struct llama_model *m)
 {
 	const char *e = getenv("CHARSIU_NPU_KMAX");
 	uint64_t kmax = e ? strtoull(e, NULL, 0) : 1024;
-	uint64_t widest = m->n_embd, cap;
+	int kfit = charsiu_env_flag("CHARSIU_NPU_KFIT", 0);
+	uint64_t widest, w, cap;
 	uint32_t l;
 
-	if (m->n_ff > widest)
-		widest = m->n_ff;
+	widest = widest_k_slice(m->n_embd, kmax, kfit);
+	w = widest_k_slice(m->n_ff, kmax, kfit);
+	if (w > widest)
+		widest = w;
 	if (m->layers)
-		for (l = 0; l < m->n_layer; l++)
-			if (m->layers[l].n_ff > widest)
-				widest = m->layers[l].n_ff;
-	if (kmax && widest > kmax)
-		widest = kmax;
+		for (l = 0; l < m->n_layer; l++) {
+			w = widest_k_slice(m->layers[l].n_ff, kmax, kfit);
+			if (w > widest)
+				widest = w;
+		}
 	if (!widest)
 		return 80;
 	cap = 163840u / widest;
