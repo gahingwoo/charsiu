@@ -117,6 +117,22 @@ int main(int argc, char **argv)
 		 */
 		const char *why = llama_batch_why_not(&m);
 		int cap = llama_prefill_chunk_cap(&m);
+		/*
+		 * ⚠⚠ THE SAME RULE charsiu_run USES, OR THIS MEASURES A WIDTH
+		 * NOBODY SHIPS. The runner's default chunk is 80 and
+		 * CHARSIU_PREFILL_CHUNK overrides it, capped by the surface
+		 * ceiling. This took `cap` -- 160 on qwen3 -- for its first
+		 * board round, so the first number ever produced for "the
+		 * quality of the batched path" was the quality of a path the
+		 * product does not take. Reading the cap is what a probe does
+		 * when it forgets the product has a default of its own.
+		 *
+		 * Honouring the variable also gives the width its own axis, so
+		 * a chunk sweep is one env apart from this arm rather than a
+		 * rebuild.
+		 */
+		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
+		int chunk = ec && *ec ? atoi(ec) : 80;
 		float *lga;
 		int a;
 
@@ -127,11 +143,13 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		if (cap < 2) cap = 2;
-		lga = malloc((size_t)cap * m.n_vocab * sizeof(*lga));
+		if (chunk > cap) chunk = cap;
+		if (chunk < 2) chunk = 2;
+		lga = malloc((size_t)chunk * m.n_vocab * sizeof(*lga));
 		if (!lga) { fprintf(stderr, "oom on %d x %u logits\n",
-				    cap, m.n_vocab); return 1; }
-		for (a = 0; a + 1 < n; a += cap) {
-			int w = n - a < cap ? n - a : cap;
+				    chunk, m.n_vocab); return 1; }
+		for (a = 0; a + 1 < n; a += chunk) {
+			int w = n - a < chunk ? n - a : chunk;
 			int r;
 
 			if (llama_verify_batch(st, &m, ids + a, w, a, lga)) {
@@ -157,8 +175,8 @@ int main(int argc, char **argv)
 		free(lga);
 		fprintf(stderr, "\r%*s\r", 40, "");
 		printf("ppl %.4f  over %d scored positions of %d tokens"
-		       "  (%s, --batch in chunks of %d)\n",
-		       exp(nll / scored), scored, n, path, cap);
+		       "  (%s, --batch in chunks of %d, ceiling %d)\n",
+		       exp(nll / scored), scored, n, path, chunk, cap);
 		llama_state_free(st);
 		tokenizer_free(tk);
 		llama_free(&m);
