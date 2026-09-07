@@ -392,7 +392,7 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 	/* ⚠ nothing else starts it outside the language model */
 	charsiu_threads_start(0);
 
-	if (getenv("CHARSIU_NPU") && !w->n_missing) {
+	if (charsiu_env_flag("CHARSIU_NPU", 0) && !w->n_missing) {
 		unsigned A = (unsigned)w->n_audio_state;
 		unsigned nt = (unsigned)(w->n_audio_layer + w->n_text_layer);
 

@@ -17,7 +17,9 @@ the vendor's speed:
 ```
 
 Every projection, including the output head, runs on the NPU at four bits, and the
-text is identical to what the CPU decode loop writes. Prefill is the open front:
+text is identical to what the CPU decode loop writes -- which is an internal
+check and, as of 2026-09-07, a measured **understatement of what it does not
+cover**: see *What "identical" does not mean* below. Prefill is the open front:
 between a third and a half of the vendor's, because every projection still comes
 back to the CPU between layers. The numbers are read off `board_verify.sh 7`, the
 same prompt and protocol the vendor publishes, and the rest of this file says how
@@ -33,11 +35,19 @@ call:
 ```
                      decode tok/s            time to first token, ms
                      charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          24.63    24.85           707      469
-  TinyLLAMA 1.1B      20.62    19.71           915      544
-  Phi3 3.8B            6.84     6.58          3004     1829
-  Gemma4 E2B           8.70     9.23          2408     1219
+  Qwen3 0.6B          26.59    24.85           610      469
+  TinyLLAMA 1.1B      22.85    19.71           866      544
+  Phi3 3.8B            7.02     6.58          2937     1829
+  Gemma4 E2B           9.26     9.23          2192     1219
 ```
+
+**All four decode faster than the vendor**, best of six under their own
+protocol. Prefill is still the open front, and the reason is measured rather
+than guessed: on gemma4's 93 row prompt the fence -- the hardware's own MAC
+time -- is 372 ms of 1589, and the read back and the activation pack are 434
+and 239. Those two are CPU work at 5.2 and 4.7 GB/s against the 11.9 eight
+threads reach here, so they are at rate and not idling. The remaining lever is
+the number of bytes read back, which is set by the quantisation group.
 
 Time to first token came down through 2026-09-06, from a gap of 1.85-2.40x to
 1.51-1.68x on the three rows that hold still. None of it was new hardware work:
@@ -243,6 +253,57 @@ and neither side is wrong: llama.cpp quantises the **activation** to q8_0 before
 product, and charsiu keeps it in f32. Taking the quantisation off both sides collapsed
 the disagreement by a factor of thirty, which is what makes that an explanation rather
 than a story.
+
+### What "identical" does not mean
+
+Every correctness check above compares charsiu to **charsiu**: the NPU against
+its own CPU decode loop, eight models byte for byte, nine architectures under
+`board_text_all.sh`. Those catch a dispatch bug. They cannot catch a quantiser
+that is simply worse, because both sides of the comparison use the same one.
+
+The forward-pass cross-check against llama.cpp is real, but it is run on an
+**f32** model -- it says the arithmetic is right, not that the four-bit weights
+are good.
+
+`tools/charsiu_ppl` asks the other question. Perplexity, greedy, one position
+at a time, on the board -- it has to be on the board, because the host has no
+NPU and every matvec falls back to the gguf weights, which measures llama.cpp
+instead. qwen3, 600 tokens of prose:
+
+```
+  llama.cpp's own q4_0, fp32 activations      26.64
+  charsiu int4 w4a16, as it shipped           49.89      +87%
+  charsiu int4 w4a16, with AWQ                40.80      +53%
+```
+
+**The cause is not exotic.** q4_0 carries one fp16 scale per **32** weights;
+charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which `llama_auto_kmax` sets to
+1024. Thirty-two times coarser. The group cannot simply be narrowed, because
+the K slice **is** the group and the read back is `m·n·ceil(K/KMAX)·4` -- so a
+finer group is paid for in prefill. Narrowing it does work, and the ladder is
+the evidence that the group is the cause:
+
+```
+  group 1024   49.89        group 256   38.97        group 128   36.33
+```
+
+So the route is the vendor's: a coarse group and a calibrated quantiser. Their
+own `.rkllm` carries **one scale and one zero point per row** -- the whole of K,
+8192 wide on `ffn_down` -- and gets quality out of it by what it does to the
+weights before rounding them, not by storing more scales.
+
+`CHARSIU_NPU_AWQ` is that, and it took three fixes to work at all: the factor
+was never applied to the activation, then it collapsed in the quantiser on
+every path, then the exponent turned out to be positive where AWQ needs
+`-alpha` -- it was shrinking the columns that meet large activations, which are
+exactly the ones the method exists to protect. It is off by default: it needs a
+calibration pass, and a tensor carrying a factor cannot share a packed input,
+so grouped q/k/v drop to single calls and decode gets slower.
+
+⚠ Perplexity on one passage is a weak instrument and these are first numbers,
+not a characterisation. What is not in doubt is the direction and the size:
+this was never measured before 2026-09-07, and "identical to the CPU loop" was
+carrying more weight in this file than it can hold.
 
 ### The CPU baseline is meant to be honest
 
@@ -503,6 +564,22 @@ register-level fixes tried against a fault that was in a buffer, and the
 explanation for the slowdown that the board refuted.
 
 ## The instrument
+
+`tools/charsiu_ppl` is the quality one: perplexity over the token loop, one
+position at a time, greedy, no timing in the number. It is deterministic to the
+last digit across boots, which makes it the one measurement here that survives
+a session boundary -- everything else on this board drifts about 3% and may
+only be compared within one run. A quality regression can be caught weeks after
+it lands.
+
+```
+$ charsiu_ppl models/Qwen3-0.6B-Q4_0.gguf corpus.txt -c 1024 -n 600
+  ppl 26.6416  over 599 scored positions of 600 tokens
+```
+
+It must run on the board. On a desktop there is no NPU, `npu_get` returns NULL,
+every matvec falls back to the gguf weights, and the number describes
+llama.cpp's q4_0 rather than anything charsiu did.
 
 `tools/rkllm_regcmd.py` reads the NPU register command streams straight out of a
 `.rkllm`, on a desktop, with no board and no vendor runtime running. The vendor's

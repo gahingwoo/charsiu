@@ -31,7 +31,9 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_whisper \
      $(BUILD)/vattn_bench \
      $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
-     $(BUILD)/fp16_plan
+     $(BUILD)/fp16_plan \
+     $(BUILD)/charsiu_ppl \
+     $(BUILD)/charsiu_membw
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -85,6 +87,9 @@ $(BUILD)/charsiu_whisper: tools/charsiu_whisper.c src/whisper.c $(LLM) | $(BUILD
 # the CPU decode loop: the oracle every NPU version is diffed against
 $(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
+
+$(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread

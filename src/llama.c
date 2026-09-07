@@ -3453,7 +3453,22 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 		return NULL;
 	}
 
-	if (getenv("CHARSIU_NPU")) {
+	/*
+	 * ⚠⚠ charsiu_env_flag, BECAUSE `CHARSIU_NPU=0` USED TO OPEN THE NPU.
+	 *
+	 * This was `if (getenv("CHARSIU_NPU"))` -- an existence test, so the
+	 * one spelling anybody would reach for to turn the device OFF turned it
+	 * ON. Round 428 wanted a CPU control arm, wrote CHARSIU_NPU=0, and got
+	 * the NPU with W4V unset, which is w8a8: ppl 272369 against int4's
+	 * 75.17. Two arms of that round were bit-for-bit identical and that is
+	 * what gave it away.
+	 *
+	 * Tonight's charsiu_env_flag sweep converted the twenty `!= NULL`
+	 * switches and missed this shape entirely -- there are 51 of them in
+	 * the tree and this is the one that matters, because it is the switch
+	 * every board round sets.
+	 */
+	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
 		const char *e = getenv("CHARSIU_NPU_MAXN");
 		unsigned maxn = e ? (unsigned)atoi(e) : 8192;
 		unsigned widest = state_widest(m);
@@ -3795,6 +3810,49 @@ void llama_stages_report(void)
 			       " %.2f ms a row\n", "of the pack:",
 			       ga / bstage_rows, pc / bstage_rows,
 			       (pk - ga - pc) / bstage_rows);
+			/*
+			 * ⚠⚠ AND WHAT `packer` IS MADE OF, which has never been
+			 * printed on this path.
+			 *
+			 * npudev.c has split it since 2026-09-04 and says why:
+			 * "the fp16 packer moves the 160 KB a call takes in
+			 * about 7 us. Whatever the other 790 us are -- the
+			 * register streams emitted per slot, the two FINI
+			 * ioctls a device, the copies -- this splits them, so
+			 * the next round can say."
+			 *
+			 * The next round did not say, because
+			 * charsiu_npu_batch_pack_split is reached only through
+			 * charsiu_pool_report, which vision and whisper call
+			 * and llama does not. So on gemma4 `packer` reads 1.35
+			 * ms a row, 1.04 ms a CALL, against a conversion that
+			 * costs 7 us -- and the other 99% has had a counter
+			 * waiting for a reader for three days.
+			 */
+			{
+				double em = 0.0, fi = 0.0;
+
+				charsiu_npu_batch_pack_split(bmm_dev, &em,
+							     &fi, 0);
+				/*
+				 * ⚠ THESE SPLIT `the rest`, NOT `packer`.
+				 * npudev's tpe starts AFTER bpackcall_us is
+				 * banked, so emit and fini do not overlap the
+				 * packer call at all -- and the board agrees to
+				 * the hundredth: emit 0.07 + fini 0.31 = 0.38,
+				 * which is `the rest` exactly. Printing
+				 * `pc - em - fi` as "the packer itself" was a
+				 * subtraction across disjoint intervals, and it
+				 * was wrong for the ten minutes it existed.
+				 */
+				if (em > 0.0 || fi > 0.0)
+					fprintf(stderr, "  %-16s emit %.2f  fini"
+						" %.2f ms a row  (these two are"
+						" `the rest` above)\n",
+						"of that rest:",
+						em / bstage_rows,
+						fi / bstage_rows);
+			}
 			/*
 			 * ⚠ AND OF THE FENCE, when the probe was asked for.
 			 * prep_bo waits and then invalidates the whole output

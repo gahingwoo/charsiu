@@ -4605,3 +4605,393 @@ nothing here should be read as one. It is what the change looks like, put
 beside what it costs, so that a person can decide. `llama_auto_kmax` declines
 this widening on gemma4 by design and says why; overriding it is
 `CHARSIU_NPU_KMAX=2048 CHARSIU_NPU_W4_GROUP=2048`.
+
+## 2026-09-07 late: two arithmetic errors of my own, both in the flattering direction
+
+### `packer` is per SLICE, not per call
+
+The pack split, gemma4, 92 rows: `gather 0.98  packer 1.22  the rest 0.39`,
+and `the rest` divides into `emit 0.07 + fini 0.31` -- which sums to 0.38
+against the 0.39 printed above it, so the counters agree to the hundredth.
+
+I first divided `packer` by the 140 matmul CALLS and got 0.80 ms a call
+against npudev's note that the fp16 conversion costs about 7 us, and wrote
+that up as a 121x anomaly. **The loop is per K SLICE.** 937 of them, so it is
+0.12 ms a slice moving about 530 MB of fp32 in and fp16 out:
+
+```
+  packer   112 ms / 937 slices = 0.12 ms   ~530 MB   4.7 GB/s
+```
+
+⚠ I also shipped, for about ten minutes, a report line printing
+`packer - emit - fini` as "the packer itself". `tpe` starts AFTER
+`bpackcall_us` is banked, so those are disjoint intervals and the subtraction
+was meaningless. The board is what caught it: emit + fini came to exactly
+`the rest`, not to a share of `packer`.
+
+### And the read is 5.2 GB/s, not the 1.93 I quoted all evening
+
+I counted only the int32 accumulator. **Y is read and written once per K
+slice** -- that is what "Y once per K slice" in the read_rows note means, and
+I had read that line. Per output-slice element it is 4 bytes of accumulator
+plus a read-modify-write of Y on every slice after the first:
+
+```
+  read   434 ms / 209 M slice-elements = 10.8 bytes each   5.2 GB/s
+```
+
+So `36 cycles an element is too many for index-load-add-scale` was wrong too:
+36 cycles moving 10.8 bytes is bandwidth, not compute.
+
+### What that changes
+
+```
+  stage    rate      of the board's 11.9 GB/s sequential
+  read     5.2       44%
+  packer   4.7       39%
+  fence    --        the MAC, and 3-4x the vendor's own wall clock
+```
+
+**Nothing on the CPU side of gemma4's prefill is running at a fraction of
+what this board can do.** 40 to 45% is what a permutation walk and a
+gather-plus-convert get here, and that is why every attempt to speed them up
+failed: read fusion, read_rows4, read_rows2, the NEON form, the pair submit.
+They were all trying to make something faster that was already at rate.
+
+⇒ The remaining lever is not the rate, it is the BYTES, and the byte count is
+`m * n * ceil(K / KMAX)`. Which is the quantiser group, and it is the user's
+call. That conclusion has not changed, but it now rests on every stage being
+measured at rate rather than on a list of failed attempts.
+
+## 2026-09-07 late: six weeks of comparing charsiu against itself
+
+`charsiu_ppl` exists now, and the first thing it did was ask a question this
+project has never asked: **are the answers as good as the file's own q4_0?**
+
+Every correctness check here has been an INTERNAL one -- "tokens identical to
+the token loop", "text unchanged", eight models byte for byte, `board_text_all`
+across nine architectures. They all compare charsiu to charsiu. None of them
+compares it to llama.cpp.
+
+```
+                              ppl, same 200 tokens, same tool
+  host   gguf q4_0 + fp32     Qwen3  43.85     gemma4  54.43
+  board  charsiu int4 w4a16   Qwen3  75.17     gemma4  82.26
+                                    +71%              +51%
+```
+
+### ⛔⛔ And the int8 path is not slower. It is broken.
+
+```
+  qwen3   w8a8  272369.9386        gemma4  w8a8  218167.8116
+```
+
+PLAN.md and this notebook both carry *"for PREFILL, which is MAC-bound, int8
+weights are the faster arm and int4 is the DRAM-bound choice that belongs to
+decode"*, and the round that produced it measured **milliseconds**. It was
+turned down for being 25 to 30% slower on the whole prompt -- which is the only
+reason nobody shipped a configuration that emits noise.
+
+⚠ "int8 weights" is a misleading name for the arm. The ACTIVATION is quantised
+to int8 as well; the int4 path keeps fp16 activations. What collapses is the
+activation, not the weight.
+
+### ⚠⚠ How it was found: `CHARSIU_NPU=0` opened the NPU
+
+The round wanted a CPU control. `if (getenv("CHARSIU_NPU"))` is an existence
+test, so the one spelling anybody would reach for to disable the device
+enabled it, with W4V unset -- which is w8a8.
+
+**Two arms came back bit-for-bit identical, 272369.9386 twice, and that is the
+only reason it was caught.** The arm labelled "CPU, gguf weights" was the arm
+labelled "NPU int8 weights".
+
+Tonight's `charsiu_env_flag` sweep converted the twenty `!= NULL` switches and
+missed this shape entirely. There are 51 implicit existence tests in the tree;
+the three on `CHARSIU_NPU` itself are fixed, because that is the switch every
+board round and every installer sets.
+
+### 🔑 And ppl is the one quantity here that survives a session boundary
+
+Rounds 427 and 428 ran the four int4 arms on different boots, with other models
+and a reinstall in between, and every figure repeated **to the last digit**:
+75.1684, 106.6864, 82.2555, 76.2290. It is a greedy forward with no sampling
+and no timing in it. Where "never A/B across sessions" is the rule here, this
+is the exception -- and that is worth having, because a quality regression can
+now be caught weeks after it lands.
+
+### The two int4 groups disagree between models, and not in the flattering way
+
+```
+              group 1024   one scale a row
+  qwen3          75.17        106.69      +42%   much worse
+  gemma4         82.26         76.23       -7%   better
+```
+
+⚠ qwen3's two coarse arms are identical because neither of its K values is a
+multiple of 2048, so `group 2048` already IS one scale a row for it -- the
+tensor_grouped test needs `k % kgroup == 0`. That is a check on the harness,
+not a result.
+
+Offline Frobenius error said grouped is better on every tensor. Perplexity
+says the opposite on gemma4. npudev.c's own caption -- "weight error is not
+the objective" -- is now measured rather than asserted.
+
+## 2026-09-07 late: the quality instrument, and three arms that were inert
+
+`charsiu_ppl` on the board, 200 tokens, model md5 identical to the host's:
+
+```
+                                   qwen3     gemma4
+  board CPU  gguf q4_0 + fp32       43.49     55.22    <- host 43.85 / 54.43
+  board NPU  charsiu int4 w4a16     75.17     82.26       +72.8%  +49.0%
+  board CPU  charsiu int4 + int8 a 113.23     79.38
+  board NPU  w8a8                 272370    218168    <- noise
+```
+
+The chain checks out: the board's CPU arm lands within 1.5% of the host's, on
+a file whose md5 matches, so the whole +73% / +49% belongs to the NPU path.
+
+**The cause is not exotic.** q4_0 carries one fp16 scale per 32 weights;
+charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which auto_kmax sets to 1024.
+Thirty-two times coarser -- and the group cannot simply be narrowed, because
+the K slice IS the group and the read back is `m*n*ceil(K/KMAX)*4`.
+
+### ⚠⚠ Three arms in a row measured nothing, and each control caught it
+
+1. **`CHARSIU_NPU=0` opened the NPU.** `if (getenv(...))` is an existence test.
+   Two arms came back bit-for-bit identical, 272369.9386 twice, and that is the
+   only reason it surfaced. Fixed in llama/vision/whisper; 51 implicit tests
+   remain elsewhere.
+2. **The calibration wrote zero tensors.** `npu_calib_note` is called from one
+   place -- `npu_matvec`, the CPU reference -- so a calibration run with the NPU
+   on records nothing. Through `CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` it wrote 197
+   tensors and 2.3 MB.
+3. **AWQ was never on.** `CHARSIU_AWQ_STATS` names the statistics file;
+   `CHARSIU_NPU_AWQ` is the exponent and defaults to 0, which gates the whole
+   block. Two rounds set only the first and returned 75.1684 to the digit.
+
+Every one of the three was caught by a control arm returning EXACTLY the same
+number as its baseline. An arm that reproduces its control to seven figures is
+not a null result, it is an inert arm.
+
+### And the separation probe changed two variables, so it separated nothing
+
+`CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` was meant to isolate the quantiser by
+running charsiu's own int4 weights through the CPU reference. It does -- but
+`npu_matvec` takes `a->q1`, an int8 activation, where the NPU path keeps fp16.
+So the arm is w4a8 against w4a16 and moves the activation as well as the
+hardware. qwen3 got worse (113 against 75) and gemma4 got better (79 against
+82), which is two variables and one number.
+
+Isolating the weight quantiser needs a charsiu-weights + fp32-activation path,
+and there is not one.
+
+## 2026-09-07 late: measuring the denominator I had been quoting all evening
+
+Every "at rate, no lever left" conclusion tonight divided by 11.9 GB/s, which
+came from a memory note and had never been measured on this card.
+`charsiu_membw` had a build rule since it was written and was in neither `all:`
+nor PROBE_BINS, so it had never run here.
+
+```
+  1 thread    8.62 GB/s
+  2           8.04
+  4           7.53      <- more threads, less bandwidth
+  8          11.91      <- this is the 11.9
+```
+
+**Non-monotonic.** 11.9 is the EIGHT-thread figure, and the read back is
+pooled across eight, so the denominator was right -- but I did not know it was
+an eight-thread number, and I did not know 1 to 4 threads sit lower. The
+board is four A53 and four A72 and the probe does not pin, so one thread
+probably lands on an A72 and four straddle both kinds.
+
+The tool's own header puts the bus peak near 21.9 GB/s (LPDDR5 2736 MHz, two
+16-bit channels), so 11.91 is 54% of theoretical, which is ordinary.
+
+### What it changes
+
+Nothing in the conclusion, and two things around it:
+
+- `read` at 5.2 GB/s is 44% of what eight threads can reach sequentially, and
+  it is a PERMUTATION walk. 44% of sequential for a permutation is high, not
+  low. `pack` at 4.7 is 39%. Both stand.
+- **any pool of four threads or fewer is capped at 7.5 to 8.6**, below what
+  eight get. That is an argument for `CHARSIU_POOL_CPUS=0-7` that nobody had
+  measured, and it explains the "2.0x ceiling" on threading the read: the
+  controller does not scale with threads, it steps.
+
+⚠ And the NPU reads weights at 16.98 GB/s -- ABOVE anything the CPU can reach
+here. The two do not share a path in the way the CPU-side numbers assume, which
+is why the fence can sit at the MAC rate while read and pack are held at 11.9.
+
+## 2026-09-07 late: AWQ was two bugs deep, and the second one is the interesting one
+
+### Bug one: the factor was never applied to the activation
+
+npuquant folds the AWQ factor into the weights (`row[i] /= t->kscale[i]` in
+quant_rows) and leaves `t->kscale` for the caller to undo on the input. Its
+note: *"on the board this is one multiply a k before the pack"*. Nothing did
+it -- `kscale` appeared twelve times in npuquant.c and zero times in npudev.c.
+
+```
+  CHARSIU_NPU_AWQ off                     75.17
+  CHARSIU_NPU_AWQ=0.5, column means      10755.75
+  CHARSIU_NPU_AWQ=0.5, real |x| stats  65233808
+```
+
+The better the statistic, the worse the output: the signature of a factor
+nothing undoes, since a truer mean |x_k| gives a more extreme one.
+
+`charsiu_npu_matvec` applies it now. `charsiu_npu_matvec_group` refuses a
+tensor that carries one -- the whole point of that entry is that q, k and v
+share one packed input, and a per-tensor factor means per-tensor inputs.
+
+### Bug two: with the multiply in, it still collapsed -- and the CPU said it was not mine
+
+```
+  board, NPU, factor now applied   AWQ 0.5   2155726
+                                   AWQ 0.25     1103.80
+```
+
+⚠ The CPU reference path applies the factor too (`a->f[i] * t->kscale[i]`) and
+touches none of tonight's code. On the host:
+
+```
+  CPU reference, AWQ off        114.22
+  CPU reference, AWQ 0.5   7252312.56
+```
+
+**So it was broken in the quantiser, on every path, since it was written.**
+That is what made it debuggable: the host runs the same collapse in seconds.
+
+The factor is clamped to `[0.125, 8]` -- sixty-four fold. It DIVIDES the
+weights, so a k with f = 0.125 has its column multiplied by eight before
+rounding, and one such column sets vmax for the whole row: the int4 step for
+every other weight in that row goes eight times coarser. That is the shape of
+a collapse, not of a trade. Published AWQ keeps the factor near 1; the point is
+to protect a few salient channels, not to rescale the tensor.
+
+```
+  CPU reference, qwen3, 200 tokens, AWQ 0.5
+    off                    114.22
+    clamp [0.95, 1.05]     111.08     <- AWQ starts working
+    clamp [0.125, 8]  7252312.56      <- what it shipped as
+```
+
+`CHARSIU_NPU_AWQ_CLAMP` sets the bound, default 2.0.
+
+⚠ Both alpha and the clamp move the same quantity -- how far the factor may
+stray from 1 -- which is why alpha 0.25 was a thousand and alpha 0.5 was two
+million on the same clamp. The clamp is the direct control and the exponent
+should not be doing that job.
+
+## 2026-09-07 late: AWQ was three bugs deep, and each was found by the layer under it
+
+### 1. The factor was never applied to the activation
+
+npuquant folds it into the weights (`row[i] /= t->kscale[i]`) and leaves
+`t->kscale` for the caller to undo on the input -- *"on the board this is one
+multiply a k before the pack"*. `kscale` appeared twelve times in npuquant.c
+and zero times in npudev.c.
+
+```
+  off                              75.17
+  AWQ 0.5, column means         10755.75
+  AWQ 0.5, real |x| stats     65233808
+```
+
+The better the statistic, the worse the output: a factor nothing undoes, and a
+truer mean |x_k| makes it more extreme. `charsiu_npu_matvec` applies it now;
+`charsiu_npu_matvec_group` refuses a tensor carrying one, because that entry
+exists to share ONE packed input across q, k and v.
+
+### 2. With the multiply in, it still collapsed -- and the CPU said it was not mine
+
+```
+  board, factor now applied     AWQ 0.5  2155726     AWQ 0.25  1103.80
+  host, CPU reference           AWQ off   114.22     AWQ 0.5   7252312.56
+```
+
+The CPU reference applies the factor itself and touches none of the npudev
+work. Both collapsed, so the bug was in the quantiser and had been since it
+was written -- which also made it debuggable in seconds on the host instead of
+minutes over a UART.
+
+### 3. The exponent was positive, and that is the whole method
+
+`quant_rows` DIVIDES the weights by the factor, so W' = W/f. AWQ asks for
+W' = W·s with s = (mean|x|)^alpha -- the columns that meet large activations
+get MORE of the int4 grid. With a positive exponent this file shrank exactly
+those columns. f = 1/s, so the exponent is **-alpha**.
+
+```
+  host, CPU reference, qwen3, 200 tokens
+    off                            114.22
+    AWQ 0.5  clamp 1.25             78.64
+    AWQ 0.5  clamp 2.0              73.88     -35.3%
+    AWQ 0.5  clamp 4.0              76.88
+    AWQ 0.5  clamp 8.0              91.67
+    AWQ 0.5  clamp 2.0, old sign   851.09     <- the control
+```
+
+**A U with a minimum, where before it was monotone worse.** That shape is the
+result: a factor is supposed to have a best size. Before the flip every step
+away from 1 pushed the wrong way, which is why narrowing the clamp to
+[0.95, 1.05] had looked like a fix -- it was only reducing the error to nearly
+nothing (111.08 against 114.22).
+
+⚠ **I shipped a wrong default on the way.** After seeing the single point at
+clamp 1.05 I set the default to 2.0; the sweep then showed 2.0 giving 851.09
+under the old sign, seven times worse than off. It is right under the new sign
+by luck, not by measurement, and the commit says so.
+
+Against the gguf's own q4_0 on the same tokens (43.85), this takes charsiu's
+int4 from +160% to +68% -- about 57% of the gap, from a factor applied
+backwards.
+
+⚠ Still w4a8 on the CPU reference. The board runs w4a16 and the multiply lives
+in `charsiu_npu_matvec`; round 438 is the first time the fix meets hardware.
+
+### 🏁 And it holds on the hardware
+
+Round 438, board, qwen3, 600 tokens, the NPU's own w4a16 path:
+
+```
+  q4_0 baseline (a scale per 32 weights)   26.64
+  charsiu int4, group 1024, AWQ off        49.89   +87.3%
+  charsiu int4, group 1024, AWQ 0.5 c2     40.80   +53.2%   -18.2%
+  charsiu int4, group 1024, AWQ 0.5 c4     43.74
+  charsiu int4, AWQ 0.5 c2, OLD SIGN      441.34   the control
+```
+
+**39% of the quality gap, without one extra K slice.** The U survives (clamp 2
+beats clamp 4) and the old-sign control stays broken, so the gain is the sign
+fix and not something else that moved.
+
+The board's -18.2% is smaller than the host's -35.3% and the two are not
+comparable: the host measures w4a8 through the CPU reference on 200 tokens,
+the board measures w4a16 through the NPU on 600. What transfers is the shape.
+
+⚠ AWQ still needs a calibration pass, and that pass only records through
+`CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` -- `npu_calib_note` is called from
+`npu_matvec` and nowhere else. And it makes decode slower, because a tensor
+carrying a factor cannot share a packed input, so grouped q/k/v drop to single
+calls. Neither is a reason not to have it; both are reasons it is not a
+default.
+
+### What the evening's quality line adds up to
+
+```
+                                   qwen3 600 tokens
+  gguf q4_0 + fp32 (the baseline)        26.64
+  charsiu int4, as it shipped this morning 49.89
+  charsiu int4 + AWQ, tonight             40.80
+```
+
+Six weeks of "tokens identical" never compared charsiu to anything but
+charsiu. The first external measurement said +87%, the cause was a group 32x
+coarser than q4_0's, the fix for that was a method the tree had already
+implemented and never got to work, and it was three bugs deep -- each of which
+looked exactly like a null result.
