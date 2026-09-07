@@ -4953,3 +4953,45 @@ backwards.
 
 ⚠ Still w4a8 on the CPU reference. The board runs w4a16 and the multiply lives
 in `charsiu_npu_matvec`; round 438 is the first time the fix meets hardware.
+
+### 🏁 And it holds on the hardware
+
+Round 438, board, qwen3, 600 tokens, the NPU's own w4a16 path:
+
+```
+  q4_0 baseline (a scale per 32 weights)   26.64
+  charsiu int4, group 1024, AWQ off        49.89   +87.3%
+  charsiu int4, group 1024, AWQ 0.5 c2     40.80   +53.2%   -18.2%
+  charsiu int4, group 1024, AWQ 0.5 c4     43.74
+  charsiu int4, AWQ 0.5 c2, OLD SIGN      441.34   the control
+```
+
+**39% of the quality gap, without one extra K slice.** The U survives (clamp 2
+beats clamp 4) and the old-sign control stays broken, so the gain is the sign
+fix and not something else that moved.
+
+The board's -18.2% is smaller than the host's -35.3% and the two are not
+comparable: the host measures w4a8 through the CPU reference on 200 tokens,
+the board measures w4a16 through the NPU on 600. What transfers is the shape.
+
+⚠ AWQ still needs a calibration pass, and that pass only records through
+`CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` -- `npu_calib_note` is called from
+`npu_matvec` and nowhere else. And it makes decode slower, because a tensor
+carrying a factor cannot share a packed input, so grouped q/k/v drop to single
+calls. Neither is a reason not to have it; both are reasons it is not a
+default.
+
+### What the evening's quality line adds up to
+
+```
+                                   qwen3 600 tokens
+  gguf q4_0 + fp32 (the baseline)        26.64
+  charsiu int4, as it shipped this morning 49.89
+  charsiu int4 + AWQ, tonight             40.80
+```
+
+Six weeks of "tokens identical" never compared charsiu to anything but
+charsiu. The first external measurement said +87%, the cause was a group 32x
+coarser than q4_0's, the fix for that was a method the tree had already
+implemented and never got to work, and it was three bugs deep -- each of which
+looked exactly like a null result.
