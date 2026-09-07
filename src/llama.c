@@ -3796,6 +3796,38 @@ void llama_stages_report(void)
 			       ga / bstage_rows, pc / bstage_rows,
 			       (pk - ga - pc) / bstage_rows);
 			/*
+			 * ⚠⚠ AND WHAT `packer` IS MADE OF, which has never been
+			 * printed on this path.
+			 *
+			 * npudev.c has split it since 2026-09-04 and says why:
+			 * "the fp16 packer moves the 160 KB a call takes in
+			 * about 7 us. Whatever the other 790 us are -- the
+			 * register streams emitted per slot, the two FINI
+			 * ioctls a device, the copies -- this splits them, so
+			 * the next round can say."
+			 *
+			 * The next round did not say, because
+			 * charsiu_npu_batch_pack_split is reached only through
+			 * charsiu_pool_report, which vision and whisper call
+			 * and llama does not. So on gemma4 `packer` reads 1.35
+			 * ms a row, 1.04 ms a CALL, against a conversion that
+			 * costs 7 us -- and the other 99% has had a counter
+			 * waiting for a reader for three days.
+			 */
+			{
+				double em = 0.0, fi = 0.0;
+
+				charsiu_npu_batch_pack_split(bmm_dev, &em,
+							     &fi, 0);
+				if (em > 0.0 || fi > 0.0)
+					fprintf(stderr, "  %-16s emit %.2f  fini"
+						" %.2f  the packer itself %.2f"
+						" ms a row\n", "of the packer:",
+						em / bstage_rows,
+						fi / bstage_rows,
+						(pc - em - fi) / bstage_rows);
+			}
+			/*
 			 * ⚠ AND OF THE FENCE, when the probe was asked for.
 			 * prep_bo waits and then invalidates the whole output
 			 * buffer, so this row says how much of "fence" was the
