@@ -5595,12 +5595,46 @@ a `=0` control arm should be re-run before it is leaned on. The scripts are
 gone; the status files are not, so a specific claim can still be checked by
 hand if someone needs it.
 
+### ⛔ The audit was incomplete, and the five it missed are worse
+
+That sentence was written as "charsiu_env_flag is now the only way a boolean
+switch is read in src/". It was wrong within the hour. The first sweep grepped
+`if (getenv("X"))`, and five switches use a different spelling:
+
+```c
+  v = getenv("CHARSIU_EXACT_ATTN")    == NULL && !cpu_plain();
+  v = getenv("CHARSIU_EXACT_SILU")    == NULL && !cpu_plain();
+  v = getenv("CHARSIU_EXACT_GELU")    == NULL && !cpu_plain();
+  v = getenv("CHARSIU_EXACT_SOFTMAX") == NULL && !cpu_plain();
+  g->nofini = getenv("CHARSIU_NPU_FINI") == NULL;
+```
+
+Unset gives the fast path; **any value, "0" included, gives the exact one**.
+So `CHARSIU_EXACT_SILU=0`, written to mean "not exact", selects exact -- the
+mirror image of `CHARSIU_NPU=0` opening the NPU, and these four control
+NUMERICAL PRECISION. Measured on the host after the fix: `=1` gives 32.44
+tok/s and `=0` gives 37.99, so the wrong branch is a **17%** difference
+silently attached to the arm that asked for the other one.
+
+🔑 **Nothing was contaminated, and the reason is luck.** Every use of these in
+the surviving rounds and in tests/ is `=1` -- nine of `CHARSIU_EXACT_SOFTMAX=1`
+in board_verify.sh, one of `CHARSIU_EXACT_GELU=1`, none of `=0` anywhere. `=1`
+selected exact before the fix and selects exact after it, so every arm that
+ever ran got what it asked for. The bug was live for the whole window and
+nobody happened to spell it the broken way.
+
+⚠⚠ **Two incomplete audits in one day is the actual lesson.** The first missed
+these because it grepped a spelling rather than a semantics; this one found
+them by asking "what reads a variable and never looks at its value", which is
+the property, not the syntax. A census that greps for a shape will keep missing
+whatever is written differently.
+
 ### What stops it happening again
 
-`charsiu_env_flag` is now the only way a boolean switch is read in src/. The
-remaining `getenv()` calls there take a value (`atoi`, `atol`, `atof`), a name
-(a file, a substring, a CPU list) or a `strcmp` -- checked one by one, not by
-pattern. ⚠ tools/ still has thirty-odd, and they are probes: a probe that
+`charsiu_env_flag` is the only way a boolean switch is read in src/, and that
+claim is now checked by property rather than by pattern. The remaining
+`getenv()` calls there take a value (`atoi`, `atol`, `atof`), a name (a file, a
+substring, a CPU list) or a `strcmp` -- checked one by one. ⚠ tools/ still has thirty-odd, and they are probes: a probe that
 inverts its own arm is exactly the failure this section is about.
 
 ### The vendor's quality cell: reconnaissance, and it is not encrypted

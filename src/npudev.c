@@ -1430,7 +1430,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * to the one device control, and the run went 9.86 to 10.26 tok/s. So it
 	 * is the default now, and CHARSIU_NPU_FINI puts the clean back.
 	 */
-	g->nofini = getenv("CHARSIU_NPU_FINI") == NULL;
+	g->nofini = !charsiu_env_flag("CHARSIU_NPU_FINI", 0);
 	/*
 	 * AND THE SAME ARGUMENT ON THE OTHER SIDE, which round 367 did NOT run.
 	 *

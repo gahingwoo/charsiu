@@ -183,7 +183,7 @@ static int fast_attn(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_ATTN") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_ATTN", 0) && !cpu_plain();
 	return v;
 }
 
@@ -197,7 +197,7 @@ static int fast_silu(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_SILU") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_SILU", 0) && !cpu_plain();
 	return v;
 }
 
@@ -223,7 +223,7 @@ static int fast_gelu(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_GELU") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_GELU", 0) && !cpu_plain();
 	return v;
 }
 #endif
@@ -2316,7 +2316,7 @@ static int fast_softmax(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_SOFTMAX") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_SOFTMAX", 0) && !cpu_plain();
 	return v;
 }
 
