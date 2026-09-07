@@ -66,6 +66,39 @@ static uint64_t slices(uint64_t k, unsigned kmax)
  * points, and the model's total is never formed. That is not a better fit; it
  * is the same measurement asked per call instead of once.
  */
+/*
+ * ⚠⚠ A CALL IS TWO JOBS, AND THE PROBE MEASURED ONE.
+ *
+ * npu_job_cost times a single job on a single fd. charsiu issues one per core
+ * and waits on both, so a call moves its bytes through two devices. Pricing it
+ * as one job overestimates, and by more the fatter the tensor -- which is
+ * exactly the hold-out's shape: +8.4% on qwen3, +19.8% on gemma-3-1b, +34.5%
+ * on Phi-3.5, all high, monotone in size.
+ *
+ * The two cores are not worth two, and that is measured rather than assumed:
+ * round 150 ran the same decode on one core and on two, 39.6 against 30.8 ms a
+ * token, so the pair is worth **1.286x**. Dividing each call's bytes by that
+ * takes the hold-out from a 34.5% systematic overestimate to +6.0 / -3.9 /
+ * -11.1% -- no longer one-sided, and no longer growing with the model.
+ *
+ * ⚠ CHARSIU_SHAPES_CORES overrides it, because 1.286 is one board's number at
+ * one governor and it will move. It is not a fitted parameter: sweeping it
+ * (1.0, 1.15, 1.286, 1.4, 1.6, 2.0) has its minimum AT the measured value,
+ * which is the only reason to trust it as a mechanism rather than a knob.
+ *
+ * ⚠ What is still missing and is not this: the predictor counts MATMULS only,
+ * and round 147 measured those at 87.8% of a qwen3 token and 90.6% of a
+ * tinyllama one. Attention, the norms and the elementwise joins are 9 to 12%
+ * that this number does not contain.
+ */
+static double core_pair(void)
+{
+	const char *e = getenv("CHARSIU_SHAPES_CORES");
+	double v = e && *e ? atof(e) : 1.286;
+
+	return v > 0.0 ? v : 1.286;
+}
+
 static double call_us(double mb)
 {
 	/* npu_job_cost, round 155, m = 1, one task, int8 weights */
@@ -134,16 +167,16 @@ int main(int argc, char **argv)
 			       + 2 * slices(e, kmax)      /* gate, up */
 			       + slices(ff, kmax);        /* down */
 			bytes += (double)(q + 2 * kv + o + 2 * gu + dn) * 0.5;
-			us += call_us((double)(q + 2 * kv) * 0.5 / 1e6)
-			    + call_us((double)o * 0.5 / 1e6)
-			    + call_us((double)(2 * gu) * 0.5 / 1e6)
-			    + call_us((double)dn * 0.5 / 1e6);
+			us += call_us((double)(q + 2 * kv) * 0.5 / 1e6 / core_pair())
+			    + call_us((double)o * 0.5 / 1e6 / core_pair())
+			    + call_us((double)(2 * gu) * 0.5 / 1e6 / core_pair())
+			    + call_us((double)dn * 0.5 / 1e6 / core_pair());
 		}
 		calls += 1;                                   /* the head */
 		tasks += slices(m.n_embd, kmax)
 		       * ((m.n_vocab + nmax - 1) / nmax);
 		bytes += (double)m.n_vocab * m.n_embd * 0.5;
-		us += call_us((double)m.n_vocab * m.n_embd * 0.5 / 1e6);
+		us += call_us((double)m.n_vocab * m.n_embd * 0.5 / 1e6 / core_pair());
 		bytes /= 1e6;
 		ms = (us + tasks * B) / 1e3;
 		(void)A; (void)C;
