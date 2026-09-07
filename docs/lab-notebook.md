@@ -4431,3 +4431,60 @@ so directly, in a line I had already grepped for.
 The chunk table in `charsiu_run.c` -- SmolLM2 catastrophic at 160, Qwen3 9%
 better, Llama neutral -- has no gemma4 in it and still does. But it is a
 question about prompts LONGER than 160 tokens, not about the scoreboard.
+
+## 2026-09-07 late: KFIT is a per-model property, and one arm was measuring a bug
+
+Round 421, four models, three paired reps, 93 token prompt, text identical on
+every arm of every model:
+
+```
+  model    slices        prompt            decode           verdict
+  gemma4   937 -> 693    1597 -> 1470 ms   9.69 -> 9.82     -8.0% TTFT, +1.4%
+  gemma3   292 -> 266     719 -> 1398      21.43 -> 20.97   +94%, a catastrophe
+  tinyl    404 -> 382     745 ->  754      22.82 -> 22.43   slightly worse
+  phi3     844 -> 844    2629 -> 2629      7.21 -> 7.21     zero control, held
+```
+
+**phi3 is the control that could have refuted this and did not.** Every one of
+its K values is a multiple of its KMAX, so KFIT has no remainder to absorb and
+removes no slice -- and nothing about it moved. It was written down in advance
+that if phi3 moved, gemma4's win would need another explanation.
+
+### gemma3's arm was not measuring KFIT
+
+`submits 5020 -> 9128`. Fewer slices, 82% MORE submits. That is not a slicing
+result, it is a fallback.
+
+KFIT takes gemma3's `down` (K = 6912, KMAX 2048) from four slices to three,
+and `charsiu_slice_kw` gives the last one whatever is left: **2816 wide**, a
+width npudev.c already records as `WRONG, surf 88` from an unrelated model.
+The surface ceiling is `(slice / 32) * m <= 5120`, so at 93 rows it is
+88 * 93 = 8184 -- every projection refused, every row of the prompt back on
+the token loop, in silence, with the text still correct.
+
+`llama_prefill_chunk_cap` could not see it: it took `min(widest K, KMAX)`, and
+KFIT is the one thing that makes a slice **wider** than KMAX. Fixed, and the
+caps move:
+
+```
+  model     KFIT   widest slice   cap
+  gemma4      0        1024       160
+  gemma4      1        1536       106
+  gemma3      0        2048        80
+  gemma3      1        2816        58
+  qwen3     0/1        1024       160   (no K of it has a remainder)
+```
+
+⚠⚠ **And gemma4 cleared its new 106 cap by thirteen rows, by luck.** The round
+used a 93 token prompt; the scoreboard's is 111. 93 passing says nothing about
+111, and with KFIT on and the cap unfixed, the scoreboard prompt would have
+walked into the same silent fallback gemma3 did. Round 422 uses a prompt over
+110 so the clamp actually engages.
+
+### What is still open
+
+KFIT wins on one model of four. gemma4 is the model that needs it -- worst
+TTFT ratio of the four -- but one win, one catastrophe caused by a bug now
+fixed, one small loss and one no-op is not a default. Round 422 re-runs the
+three that move, with the cap fix installed and a prompt that splits, and that
+decides whether this is a default or stays an explicit switch.
