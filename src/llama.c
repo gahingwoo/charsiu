@@ -5128,12 +5128,28 @@ static void softcap_logits(float *y, size_t n, float c)
  * 10.4 ns an element in both, which is the same rate on two models and so is a
  * property of the loop rather than of either.
  *
- * ⚠ THE THRESHOLD IS THE POINT, NOT A GUARD. A pool call is a barrier, and
- * gemma4's per-layer embedding calls the same join on 256 elements 35 times a
- * token -- pooling THAT would pay eight wake-ups for 256 multiplies. Below the
- * threshold this is the plain call it always was.
+ * ⚠⚠ AND THE HOST SAYS THE SPLIT LOSES, SO IT IS OFF BY DEFAULT. gemma-3-1b,
+ * 26 layers of 6912, six cores:
  *
- * CHARSIU_ACT_POOL=0 is the control, =1 forces it at every width.
+ *   CHARSIU_ACT_POOL=0    silu * up   0.18 ms a token
+ *   CHARSIU_ACT_POOL=1    silu * up   1.91 ms a token     10x WORSE
+ *
+ * 26 barriers a token against 7 us of work a layer. The barrier is about 66 us
+ * there, and llama.c's own note on the batched version of this stage says
+ * exactly that: a pool call is a barrier and a stage can be too small to pay
+ * for one. I committed this default-on from an analogy to the rope and tail
+ * scale wins and had not measured it; this is what the analogy was worth.
+ *
+ * The board is not the host and might disagree -- its serial loop is 10.4 ns
+ * an element against the host's 1.0, so the same barrier has ten times as much
+ * work to hide behind. If B is 66 us there too, the break-even for an eight
+ * way split is n * 10.4ns * 7/8 > B, so about 7250 elements: gemma4's twenty
+ * 12288 wide layers would pay and its fifteen 6144 wide ones would not. That
+ * is a measurement, not a default.
+ *
+ * CHARSIU_ACT_POOL=1 forces the split, =0 refuses it, and
+ * CHARSIU_ACT_POOL_MIN sets the width it turns on at when neither is given.
+ * Until a board round moves it, that width is off.
  */
 struct act_mul_job {
 	float *hb;
@@ -5151,23 +5167,24 @@ static void act_mul_rows(void *ctx, uint64_t i0, uint64_t ni)
 		silu_mul(j->hb + i0, j->hb2 + i0, (uint32_t)ni);
 }
 
-static unsigned act_pool_min(void)
+static int act_pool_min(void)
 {
-	static int v = -1;
+	static int v = -2;
 
-	if (v < 0) {
+	if (v == -2) {
 		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
 
-		v = e && *e ? atoi(e) : 4096;
+		v = e && *e ? atoi(e) : -1;   /* off: the host measured a loss */
 	}
-	return (unsigned)v;
+	return v;
 }
 
 static void act_mul(float *hb, const float *hb2, uint32_t n, int gelu)
 {
 	struct act_mul_job j = { hb, hb2, gelu };
 	const char *e = getenv("CHARSIU_ACT_POOL");
-	int pool = e && *e ? *e != '0' : n >= act_pool_min();
+	int m = act_pool_min();
+	int pool = e && *e ? *e != '0' : (m >= 0 && (int)n >= m);
 
 	/*
 	 * ⚠ The NEON paths above step four at a time and fall through to a
