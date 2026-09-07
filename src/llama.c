@@ -5084,6 +5084,18 @@ static void res2_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+static int rope_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROPE_POOL");
+
+		v = !(e && *e == '0');
+	}
+	return v;
+}
+
 static int rope_tab_cache(void)
 {
 	static int v = -1;
@@ -6116,7 +6128,12 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			}
 			rj = (struct rope_rows_job){ s, m, L, hd, hdmax, pos0,
 						     swa, n, freqf, qg, kg };
-			if (row_pool() && n > 1)
+			/* ⚠ ITS OWN KNOB, NOT row_pool(). CHARSIU_ROW_POOL=0
+			 * turns off every row stage at once -- silu, the
+			 * residuals, the norms -- so an arm using it measures
+			 * all of them and calls the answer the rope's. This
+			 * one moves only the rope. */
+			if (rope_pool() && row_pool() && n > 1)
 				charsiu_parallel_for(rope_rows, &rj,
 						     (uint64_t)n);
 			else
