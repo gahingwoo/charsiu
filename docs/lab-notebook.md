@@ -4080,3 +4080,44 @@ arithmetic -- 6105 query-key pairs, 16 heads, 128 wide, dot and axpy -- gives
 about 1.4 GFLOP a prompt in 110 ms, **12.7 GFLOP/s across four A72s and four
 A53s**, which is close to what this board can do. There is no factor sitting in
 attention at this length.
+
+### The scoreboard at the end of the day
+
+Same kernel `2ffc0913`, governor performance, `CHARSIU_BENCH_REPEAT=6`:
+
+```
+                 TTFT ours   theirs    gap      decode ours   theirs
+  Qwen3 0.6B       602        469     1.28x      24.90        24.85
+  TinyLLAMA 1.1B   870        544     1.60x      20.76        19.71
+  Phi3 3.8B       2963       1829     1.62x       6.89         6.58
+  Gemma4 E2B      2225       1219     1.83x       8.71         9.23
+```
+
+Across the three readings of this kernel:
+
+```
+             yesterday    this morning    now
+  Qwen3      687  1.47x   653  1.39x     602  1.28x
+  TinyLLAMA  900  1.65    890  1.64      870  1.60
+  Phi3      3057  1.67   2994  1.64     2963  1.62
+  Gemma4    2352  1.93   2272  1.86     2225  1.83
+```
+
+⚠ Those are three different sessions and the board drifts about 3%. What makes
+the column trustworthy is that it agrees with the paired in-session numbers the
+five changes were each measured with. On qwen3 those were -1.4% (per-slice
+input buffers), -1.4% (the tail scale), -2.9% (the rope table), -1.5% (rope in
+place) and -4.9% (the rope stage pooled), which compound to **-11.6%** against a
+measured 687 -> 602, or **-12.4%**.
+
+**Qwen3's decode is now above the vendor's** and three of four models are at or
+above it.
+
+Everything shipped today came from two moves, used five times:
+
+1. **Name the unnamed row before optimising a named one.** The pack's FINI
+   ioctls and the tail per-channel scale were both found by printing an
+   instrument that already existed and had never been read.
+2. **Look at the half nobody has looked at.** Two days went into the matmul
+   entry, which is 57 to 74% of the prompt. All three rope changes came out of
+   the other half, in the last few hours, after "there must be a way out."
