@@ -4757,6 +4757,12 @@ the objective" -- is now measured rather than asserted.
   board NPU  w8a8                 272370    218168    <- noise
 ```
 
+⚠⚠ **THE w8a8 ROW IS A BUG, NOT A PROPERTY -- see "w8a8 was never broken", the
+next day.** Both figures are one tensor's scales read in the wrong layout. On
+qwen3 the fixed arm measures 27.07, better than every other row in this table
+including the gguf's own q4_0 on the same tokens. **gemma4's 218168 has NOT
+been re-measured** and the qwen3 result says it should be.
+
 The chain checks out: the board's CPU arm lands within 1.5% of the host's, on
 a file whose md5 matches, so the whole +73% / +49% belongs to the NPU path.
 
