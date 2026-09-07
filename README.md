@@ -4,33 +4,8 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** On a ROCK 4D, under the vendor's own measuring protocol, decode is at
-the vendor's speed:
-
-```
-                     decode tok/s            time to first token, ms
-                     charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          24.28    24.85          1037      469
-  TinyLLAMA 1.1B      20.34    19.71          1565      544
-  Phi3 3.8B            6.82     6.58          5073     1829
-  Gemma4 E2B           8.68     9.23          3604     1219
-```
-
-Every projection, including the output head, runs on the NPU at four bits, and the
-text is identical to what the CPU decode loop writes -- which is an internal
-check and, as of 2026-09-07, a measured **understatement of what it does not
-cover**: see *What "identical" does not mean* below. Prefill is the open front:
-between a third and a half of the vendor's, because every projection still comes
-back to the CPU between layers. The numbers are read off `board_verify.sh 7`, the
-same prompt and protocol the vendor publishes, and the rest of this file says how
-they are known to be right.
-
-**The NPU rail.** The times above run the two NPU cores one at a time, because
-run together they get about one row in a thousand wrong. The runtime is not
-what does it. Mainline clocks the NPU at 786 MHz and leaves the rail at whatever
-U-Boot set, 750 mV, where the vendor's own table asks 800 mV of that speed. Give
-the rail 800 mV, one line of device tree, and both cores run on every batched
-call:
+**Status.** On a ROCK 4D, under the vendor's own measuring protocol, **all four
+models decode faster than the vendor**:
 
 ```
                      decode tok/s            time to first token, ms
@@ -41,16 +16,30 @@ call:
   Gemma4 E2B           9.26     9.23          2192     1219
 ```
 
-**All four decode faster than the vendor**, best of six under their own
-protocol. Prefill is still the open front, and the reason is measured rather
-than guessed: on gemma4's 93 row prompt the fence -- the hardware's own MAC
-time -- is 372 ms of 1589, and the read back and the activation pack are 434
-and 239. Those two are CPU work at 5.2 and 4.7 GB/s against the 11.9 eight
-threads reach here, so they are at rate and not idling. The remaining lever is
-the number of bytes read back, which is set by the quantisation group.
+Best of six, `board_verify.sh 7`, the same prompt and protocol the vendor
+publishes. Every projection, including the output head, runs on the NPU at four
+bits, and the text is identical to what the CPU decode loop writes -- which is
+an internal check and covers less than it sounds like: see *What "identical"
+does not mean* below.
 
-Time to first token came down through 2026-09-06, from a gap of 1.85-2.40x to
-1.51-1.68x on the three rows that hold still. None of it was new hardware work:
+**Prefill is the open front**, and the reason is measured rather than guessed.
+On gemma4's 93 row prompt the fence -- the hardware's own MAC time -- is 372 ms
+of 1589, while the read back and the activation pack are 434 and 239. Those two
+are CPU work running at 5.2 and 4.7 GB/s against the 11.9 that eight threads
+reach on this board, so they are at rate rather than idling. What is left to
+win is the number of bytes read back, and that is set by the quantisation
+group.
+
+**One line of device tree matters.** Mainline clocks the NPU at 786 MHz and
+leaves the rail wherever U-Boot put it, 750 mV, where the vendor's own table
+asks 800 mV of that speed. At 750 the two cores get about one row in a thousand
+wrong when they run together, so the runtime has to use them one at a time and
+decode falls to 24.28 / 20.34 / 6.82 / 8.68. Give the rail 800 mV and both
+cores run on every batched call, which is the table above.
+
+Time to first token came down through 2026-09-06 and again on the 7th, from a
+gap of 1.85-2.40x to **1.30-1.61x** on the three rows that hold still. None
+of it was new hardware work:
 the batched prompt's elementwise stages, its softmax and its activation packer
 went on the thread pool, the pooled read's threshold came down from 262144
 elements to 32768, the calling thread and the pool workers were given separate
@@ -59,9 +48,11 @@ attention values kernel does eight positions a call, and a prompt that already
 fits under the hardware's ceiling stops being cut into a chunk and a remainder.
 Every one of those is bit exact: the text hash does not move.
 
-⚠ **Gemma4's column is not quotable at this repeat count.** The same build,
-minutes apart, has read 2133, 2182, 2185, 2325, 2408 and 2707 ms, and 3221
-inside a single three-run arm. Phi-3.5 repeats to 0.2% and TinyLLAMA to 2%, so
+⚠ **Gemma4's TTFT column is not quotable at a low repeat count.** The same
+build, minutes apart, has read 2133, 2182, 2185, 2325, 2408 and 2707 ms, and
+3221 inside a single three-run arm. The 2192 in the table above is a best of
+six; anything read off fewer runs than that is a coin toss. Phi-3.5 repeats
+to 0.2% and TinyLLAMA to 2%, so
 those two are where a change of a few percent can be attributed at all.
 `docs/lab-notebook.md` has the arms for each.
 
@@ -384,7 +375,8 @@ model, both cores, and the CPUs held out of deep idle while the NPU is open (see
 below). `CHARSIU_STAGES=1` prints where a token goes, once per half of the run.
 
 Three things moved decode from 82% of the vendor to parity, each measured on the
-board with a control:
+board with a control (it has since gone past the vendor on all four models --
+see the table at the top -- but these are what closed the original gap):
 
 - **the CPUs are held out of deep idle while the NPU is open.** rk3576's CPU_SLEEP
   costs 250 us to leave, a token is about 150 calls into the driver, and each call
