@@ -32,7 +32,8 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/vattn_bench \
      $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
      $(BUILD)/fp16_plan \
-     $(BUILD)/charsiu_ppl
+     $(BUILD)/charsiu_ppl \
+     $(BUILD)/charsiu_membw
 
 $(BUILD):
 	@mkdir -p $(BUILD)
