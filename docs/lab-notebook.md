@@ -5658,3 +5658,44 @@ dequantise and a gguf write. That is days. But the question underneath it --
 can be answered by decoding **one tensor**: dequantise a single gate
 projection, compare its error against the same gguf tensor, and put that beside
 charsiu's own. No tokenizer, no forward pass, no board.
+
+### 🏁 Round 150: the floor is the hardware, and the counters are why that is knowable
+
+```
+                        two cores   one core
+  ms a token               30.8       39.6
+  hardware path (ms)       1710       2310
+  weights                 11.50      8.52 GB/s
+  a submit's wall clock    114 us     306 us
+    of it, the fence       1352       2002 ms
+    of it, submitting       138         93 ms
+```
+
+And the spin counters, added this morning for exactly this reading:
+
+```
+  charsiu spin: 13899 polls, 13827 won without blocking (99%, mean 114 us),
+                72 fell back (mean 312 us of polling before they did)
+```
+
+⚠⚠ **NINETY-NINE PERCENT OF THE POLLS WIN, AND THE MEAN IS 114 us.** The
+blocking wait is essentially never reached once the poll is on, so the wakeup
+that round 149's 2.7% was attributed to is not a large hidden cost -- it is
+about 2%, and what is left of the 114 us is the hardware computing. One core
+with the poll on is 2268 ms against 2310 blocking: 1.8%.
+
+**So the per-call floor is not ours.** Round 148 showed the CPU side is 7.3% of
+a decode. Round 149 and this one show the wakeup inside the fence is ~2%. What
+remains is a job's start on the device and the output invalidate, and only the
+second of those is in software.
+
+🔑 **Without the counters this round reads the opposite way.** A 1.8%
+improvement from a 300 us poll is exactly what "the poll never fired" looks
+like, and the next move from that reading -- raise the spin, chase the wakeup --
+would have been wrong. `99%, mean 114 us` closes it in one line. That is what
+the instrument was for.
+
+⚠ What is still not separated: the invalidate. The winning poll's own ioctl
+does the wait AND the invalidate, so the 114 us mean contains both. A second
+PREP on an already-finished BO would be the invalidate alone -- one probe,
+still unwritten.
