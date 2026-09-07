@@ -4736,3 +4736,53 @@ not a result.
 Offline Frobenius error said grouped is better on every tensor. Perplexity
 says the opposite on gemma4. npudev.c's own caption -- "weight error is not
 the objective" -- is now measured rather than asserted.
+
+## 2026-09-07 late: the quality instrument, and three arms that were inert
+
+`charsiu_ppl` on the board, 200 tokens, model md5 identical to the host's:
+
+```
+                                   qwen3     gemma4
+  board CPU  gguf q4_0 + fp32       43.49     55.22    <- host 43.85 / 54.43
+  board NPU  charsiu int4 w4a16     75.17     82.26       +72.8%  +49.0%
+  board CPU  charsiu int4 + int8 a 113.23     79.38
+  board NPU  w8a8                 272370    218168    <- noise
+```
+
+The chain checks out: the board's CPU arm lands within 1.5% of the host's, on
+a file whose md5 matches, so the whole +73% / +49% belongs to the NPU path.
+
+**The cause is not exotic.** q4_0 carries one fp16 scale per 32 weights;
+charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which auto_kmax sets to 1024.
+Thirty-two times coarser -- and the group cannot simply be narrowed, because
+the K slice IS the group and the read back is `m*n*ceil(K/KMAX)*4`.
+
+### ⚠⚠ Three arms in a row measured nothing, and each control caught it
+
+1. **`CHARSIU_NPU=0` opened the NPU.** `if (getenv(...))` is an existence test.
+   Two arms came back bit-for-bit identical, 272369.9386 twice, and that is the
+   only reason it surfaced. Fixed in llama/vision/whisper; 51 implicit tests
+   remain elsewhere.
+2. **The calibration wrote zero tensors.** `npu_calib_note` is called from one
+   place -- `npu_matvec`, the CPU reference -- so a calibration run with the NPU
+   on records nothing. Through `CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` it wrote 197
+   tensors and 2.3 MB.
+3. **AWQ was never on.** `CHARSIU_AWQ_STATS` names the statistics file;
+   `CHARSIU_NPU_AWQ` is the exponent and defaults to 0, which gates the whole
+   block. Two rounds set only the first and returned 75.1684 to the digit.
+
+Every one of the three was caught by a control arm returning EXACTLY the same
+number as its baseline. An arm that reproduces its control to seven figures is
+not a null result, it is an inert arm.
+
+### And the separation probe changed two variables, so it separated nothing
+
+`CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` was meant to isolate the quantiser by
+running charsiu's own int4 weights through the CPU reference. It does -- but
+`npu_matvec` takes `a->q1`, an int8 activation, where the NPU path keeps fp16.
+So the arm is w4a8 against w4a16 and moves the activation as well as the
+hardware. qwen3 got worse (113 against 75) and gemma4 got better (79 against
+82), which is two variables and one number.
+
+Isolating the weight quantiser needs a charsiu-weights + fp32-activation path,
+and there is not one.
