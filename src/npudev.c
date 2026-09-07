@@ -1343,7 +1343,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * slow-job threshold by the chain length. Setting it changes what
 	 * gets WARNED about, never what gets submitted.
 	 */
-	g->nochain = getenv("CHARSIU_NPU_NOCHAIN") != NULL;
+	g->nochain = charsiu_env_flag("CHARSIU_NPU_NOCHAIN", 0);
 	/*
 	 * 0 is unlimited. A cap exists because the output head is 126 chained
 	 * tasks and 253 buffer handles in one submit, and it reached only
@@ -1443,9 +1443,9 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * It is 65 entries a token times two devices: 130 ioctls and 130 cache
 	 * walks. CHARSIU_NPU_INPREP puts them back.
 	 */
-	g->inprep = getenv("CHARSIU_NPU_INPREP") != NULL;
+	g->inprep = charsiu_env_flag("CHARSIU_NPU_INPREP", 0);
 	/* the control for the per-slice input buffers; see the field */
-	g->bin_one = getenv("CHARSIU_NPU_BIN_ONEBO") != NULL;
+	g->bin_one = charsiu_env_flag("CHARSIU_NPU_BIN_ONEBO", 0);
 	/*
 	 * ONE SWITCH FOR THE THREE THINGS ROUND 369 CHANGED that have no
 	 * behaviour of their own to show: the vectorised half conversion, the
@@ -1456,7 +1456,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * right. It is so a round that comes out SLOWER can say which of them
 	 * did it, which is the lesson round 368's attention arm taught.
 	 */
-	g->plain = getenv("CHARSIU_NPU_PLAIN") != NULL;
+	g->plain = charsiu_env_flag("CHARSIU_NPU_PLAIN", 0);
 	/*
 	 * ⚠ THE LEGACY BIT PATTERN LAYOUT CANNOT BE SPLIT. It accumulates with
 	 * |=, so two channels can share a byte and two threads would race for
@@ -1464,7 +1464,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * which would silently produce the CURRENT one instead, so the check
 	 * belongs here rather than in a comment.
 	 */
-	g->serialpack = g->plain || getenv("CHARSIU_W4_BITPAT") != NULL;
+	g->serialpack = g->plain || charsiu_env_flag("CHARSIU_W4_BITPAT", 0);
 	{
 		const char *e = getenv("CHARSIU_NPU_CPU_FRAC");
 
@@ -1474,7 +1474,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		if (g->cpu_frac > 0.9)
 			g->cpu_frac = 0.9;
 	}
-	g->midrise = g->w4 && getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
+	g->midrise = g->w4 && charsiu_env_flag("CHARSIU_NPU_W4_MIDRISE", 0);
 	/*
 	 * ⚠ THE RUNT K SLICE, AND WHAT IT COSTS. ceil(k / KMAX) leaves the
 	 * remainder in a slice of its own, and a slice costs about a task --
@@ -1513,7 +1513,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * 49347 us a token, -7.9%, and gemma4 76583 -> 73870, -3.5%. Llama,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
-	g->kfit = getenv("CHARSIU_NPU_KFIT") != NULL;
+	g->kfit = charsiu_env_flag("CHARSIU_NPU_KFIT", 0);
 	/*
 	 * ⚠ EQUAL K SLICES, AND WHAT MADE IT WORTH ASKING. slice_k() gives
 	 * every slice KMAX and lets the last one take the remainder, so
@@ -1542,7 +1542,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * KMAX llama.c picks for it (1024) its slices were already even.
 	 * kslice.h has the whole result.
 	 */
-	g->even_ks = getenv("CHARSIU_NPU_EVEN_KS") != NULL;
+	g->even_ks = charsiu_env_flag("CHARSIU_NPU_EVEN_KS", 0);
 	/*
 	 * 🏁 2026-09-05: THE POOLED READ IS ON, ABOVE A SIZE. The note below
 	 * priced it when the read was 241 ms and the barrier 190 of that; at
@@ -1608,8 +1608,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	/* one pass over Y for every K slice a device holds. OFF until the
 	 * board prices it: it trades sequential Y round trips for several
 	 * scattered source streams at once. */
-	g->readfuse = getenv("CHARSIU_NPU_READ_FUSE") != NULL &&
-		      *getenv("CHARSIU_NPU_READ_FUSE") != '0';
+	g->readfuse = charsiu_env_flag("CHARSIU_NPU_READ_FUSE", 0);
 	/*
 	 * ⚠⚠ OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
@@ -1647,7 +1646,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * 6747 to 8382). One write stream is what this core wants; the row
 	 * loop stays.
 	 */
-	g->kwide_only = !g->kfit && getenv("CHARSIU_NPU_KFIT_WIDE") != NULL;
+	g->kwide_only = !g->kfit && charsiu_env_flag("CHARSIU_NPU_KFIT_WIDE", 0);
 	/*
 	 * ⚠ THE CONTROL FOR THE DEAL. `di = (ki * ns + ni) & 1` was the
 	 * assignment every number in this file before round 391 was measured
@@ -1656,7 +1655,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Llama-3.2-1B, whose dimensions are all powers of two, which is the
 	 * cheapest way for a board round to check the switch itself works.
 	 */
-	g->deal_index = getenv("CHARSIU_NPU_DEAL_INDEX") != NULL;
+	g->deal_index = charsiu_env_flag("CHARSIU_NPU_DEAL_INDEX", 0);
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	g->max_slices = ns * ks;
@@ -4744,7 +4743,7 @@ static int tail_plain(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_NPU_TAIL_PLAIN") != NULL;
+		v = charsiu_env_flag("CHARSIU_NPU_TAIL_PLAIN", 0);
 	return v;
 }
 

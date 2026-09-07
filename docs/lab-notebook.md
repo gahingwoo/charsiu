@@ -4180,3 +4180,254 @@ measured reading at. That is where the last 2.5% is, and it is a bandwidth
 question, not an attention one.
 
 TTFT moved with it: 609 / 866 / 2934 / 2183, so 1.30 / 1.59 / 1.60 / 1.79.
+
+## 2026-09-07 evening: the bandwidth question, answered by refusing it
+
+The handoff above says gemma4's last 2.5% is bandwidth -- "gate + up 35.06 ms
+and down 19.73, 55% of the token in two weight reads, at the 9.74 GB/s the
+hardware path reports against the 11.9 this board has been measured reading
+at. Ask why the weight fetch runs at 82%."
+
+Every part of that is wrong, and the tree said so before the round started.
+
+**npudev.c already refuses the number it quotes.** The 9.74 GB/s is
+`weight_mb / busy_us`, and the comment beside it: *"The 550 MB a token over
+58.4 ms that reads as '9.4 GB/s, the bandwidth roof' is an average over stages
+that run from 6.67 GB/s (q k v) to 15.60 (the head): a roof does not have a
+2.3x spread across shapes, a fixed cost does."*
+
+**gemma4's own stage table says the same, from its gguf shapes:**
+
+```
+  stage                        MB a token     ms    GB/s
+  q k v                              81.0    8.15    9.9
+  o proj                             74.3    6.05   12.2
+  gate + up                         583.9   34.77   16.8    the BIGGEST is the FASTEST
+  down                              292.0   19.51   15.0
+  residual (per-layer embedding)     15.5    6.37    2.4
+```
+
+`gate + up` is above every rate this board has ever been quoted at. There is
+no 82% to recover there.
+
+### What the board's own three-term fit says, once the grep stops eating it
+
+`charsiu_npu_report` has fitted `us a call = A + B a task + C a MB` on every
+run since it was written -- `llama_state_free` calls it ungated -- and every
+round's grep has discarded it, m105's included. Rounds 410 and 411 truncated
+it mid-word before 412 finally kept it:
+
+```
+  gemma4   us a call = 43 + 7.7 a task + 116.7 a MB   of 4277 ms: 435 per call,
+                                                      185 per task, 3288 weights
+                                                      at 16.98 GB/s across 2 cores
+  gemma3   us a call = 51 + 3.2 a task + 114.3 a MB   of 1881 ms: 257 per call,
+                                                       26 per task, 1496 weights
+                                                      at 16.38 GB/s across 2 cores
+```
+
+**The two models stream at the same rate.** Dispatch is 10% of gemma4's
+hardware path and 14% of gemma3's. Neither is bandwidth-starved and neither is
+dispatch-bound. gemma4 is simply a bigger model a token: 211 calls where
+gemma3 makes 105, and 1140 MB of weights where gemma3 reads 545.
+
+### Slices are cheap, and that killed my own hypothesis
+
+Predicting the slice count from the gguf shapes and checking it against the
+board: gemma4 933 predicted / 937 measured, gemma3 292 / 292 exact. The reason
+they differ is `llama_auto_kmax`, which leaves gemma4 at KMAX 1024 and gives
+gemma3 2048 -- gemma4's `down` has K = 6144 and 12288, exact multiples of
+1024, and the rule declines the WHOLE MODEL when ANY K would regroup.
+
+So: cut the slices, cut the cost. Round 411 cut them 937 -> 486, a 37% drop in
+tasks, and bought **1.2% of the token**. Round 412's `CHARSIU_NPU_KFIT` cut
+them to 693 -- 691 predicted, so the model is right -- and bought 1.1%.
+
+```
+              slices   tasks   hardware   a token   core balance
+  default        937   24080     4277 ms   101.3     1.03x
+  KMAX 2048      486   15280     4141       99.7     1.13x
+  KFIT           693   19216     4142      100.2     1.07x
+```
+
+⚠ And fewer slices makes the balance WORSE, visibly: `q k v` went 8.23 -> 9.05
+ms when its tensors fell to one slice and one core sat out the call. That is
+the hazard npudev.c already documents, arriving on cue.
+
+So PLAN.md section 2b's open speed half is answered: **KFIT is worth about 1%**,
+and it is not where gemma4's deficit is.
+
+### The one stage that misses the line, and it is not on the NPU
+
+Fitting gemma4's largest call against its smallest gives `79 us a call + 54.8
+us a MB`. Every stage of both models lands on it within 27 us:
+
+```
+  stage                calls   MB a call   measured   on the line   excess
+  q k v                   35       2.314        233           206      +27 us
+  o proj                  35       2.123        173           195      -22
+  gate + up               35      16.683        993           993       -0
+  down                    35       8.343        557           536      +21
+  residual = pl pair      70       0.221         91            91        0
+  gemma3 head              1     169.900       9380          9390      -10
+  gemma4 head              1     226.500      17710         12496   +5214
+```
+
+**5.21 ms above the line on one call, 5.2% of a 100.9 ms token**, against a
+2.5% deficit -- and gemma3's head, same 262144 vocabulary, same int4, sits
+dead on it.
+
+The difference is one line of metadata. gemma4 declares
+`final_logit_softcapping` and gemma3 does not, so llama.c ran **262144 scalar
+`tanhf` calls a token on one core**, inside `output head`, where nothing
+charged them separately. The NPU side is excluded twice over: giving that head
+a single K slice moved it 17.71 -> 17.18 (KMAX 2048) and 17.09 (KFIT), a tenth
+of the gap each.
+
+`softcap_logits()` pools it. The squash stays exact -- the same `tanhf` in the
+same order, only a different core -- and `CHARSIU_SOFTCAP_POOL=0` is the
+control.
+
+### ⚠⚠ Two traps this round walked into, both of which have bitten before
+
+**Hashing `charsiu_run`'s stdout hashes its own timings, in TWO forms, and
+the second one cost three board rounds.** The `[load ... | prompt ... tok/s]`
+summary goes to stdout -- that one `grep -v '^\['` removes. But with
+`CHARSIU_STAGES=1` **the whole stage table goes to stdout as well**, once per
+report, interleaved with the generated text, milliseconds and all. Neither
+`2>/dev/null` nor the bracket strip can reach it.
+
+So round 413's two arms hashed differently, and I went and built three rounds
+to find out why:
+
+```
+  414  gemma4, STAGES off, 4 runs (2 pooled, 2 serial)   ALL FOUR IDENTICAL
+  415  gemma4, STAGES on,  4 runs (2 pooled, 2 serial)   all four differ
+  416  gemma3, STAGES on,  3 runs                        differs 3 ways
+       gemma4, STAGES on, CHARSIU_ATTN_POOL=0            differs 3 ways
+       gemma4, STAGES on, CHARSIU_THREADS=1              differs 3 ways
+```
+
+⚠ **The single-threaded arm was the tell and I ran it last.** A run on one
+thread that still "differs" is not computing anything differently. Extracting
+the generated text alone on the host: four runs, two with the timer on, **one
+distinct text**. There is no nondeterminism -- not in the model, not from the
+stage timer, not from the change.
+
+The same mistake also produced a claim earlier in this round: I wrote that KMAX
+2048 changed gemma4's answer, on hashes that contained stage tables. Nothing
+was shown either way. **Hash with the stage timer OFF, and strip `^\[`. If a
+round needs both timings and a text check, run the model twice.**
+
+**`d41d8cd98f00` turned up again**, from a model path that does not exist on
+the host, and three runs "agreed" about nothing.
+
+⚠ Round 412 arm 2 raised `CHARSIU_NPU_NMAX` to 16384 and **wedged both cores**:
+job timeouts and `rk_iommu ... MMU_DTE_ADDR is not functioning`. It recovered
+by the next arm. 8192 is a limit, not a default.
+
+## 2026-09-07 late: the scoreboard, and decode is done
+
+`board_vendor.sh`, best of six, kernel `2ffc0913`, rail 800 mV, governor
+performance. The second pass is the same script with `CHARSIU_SOFTCAP_POOL=0`,
+so the control ran on the same boot as the arm:
+
+```
+              decode ours   theirs   ours/theirs     this morning
+  Qwen3        26.59        24.85     107.0%         106.4%
+  TinyLLAMA    22.85        19.71     115.9%         116.1%
+  Phi3          7.02         6.58     106.7%         106.5%
+  Gemma4        9.26         9.23     100.3%          97.5%
+  Gemma4 ctrl   8.99         9.23      97.4%    <- softcap serial, same boot
+```
+
+**All four models are at or above the vendor's decode.** Four things agree at
+once, which is more than the arm alone would give:
+
+- the arm beats the vendor and the control does not;
+- **the control reproduces this morning's 9.00** to within 0.01, so the
+  baseline is the baseline and not a drift;
+- the three models that declare no softcapping did not move -- 107.0 / 115.9 /
+  106.7 against 106.4 / 116.1 / 106.5, all inside the 3% band;
+- **TTFT is 2192 in both arms**, which is what a change that runs once a
+  prefill and 262144 times a decode has to look like.
+
+TTFT: 610 / 866 / 2937 / 2192, so 1.30 / 1.59 / 1.61 / 1.79 against theirs.
+
+### ⚠ And one change I got wrong on the way
+
+I committed `act_mul` -- the same elementwise join, split across the pool --
+default ON, reasoning by analogy from the rope and tail scale wins of the
+morning, without measuring it. The host, gemma-3-1b, 26 layers of 6912:
+
+```
+  CHARSIU_ACT_POOL=0    silu * up   0.18 ms a token
+  CHARSIU_ACT_POOL=1    silu * up   1.91 ms a token     10x WORSE
+```
+
+26 barriers a token against 7 us of work a layer. `llama.c`'s own note on the
+batched version of that same stage says it in as many words: a pool call is a
+barrier and a stage can be too small to pay for one. **An analogy is not a
+measurement**, and the default is off until a board round says otherwise --
+the board's serial loop is 10.4 ns an element against the host's 1.0, so the
+break-even for an eight way split lands near 7250 elements, which would split
+gemma4's twenty 12288 wide layers from its fifteen 6144 wide ones.
+
+## 2026-09-07 late: KFIT was priced on the wrong half
+
+Round 412 measured `CHARSIU_NPU_KFIT` at decode, got 1%, and I wrote it off.
+That is the right answer to the wrong question. The read back is
+`m * n * ceil(K / KMAX)`, so at m = 1 there is almost nothing to read and the
+slice count moves almost nothing. **At a prompt it is the biggest stream in
+the run.**
+
+gemma4 is the only one of the four scoreboard models on KMAX 1024 --
+`llama_auto_kmax` declines the whole model when ANY of its K values would
+regroup, and its `down` has K = 6144 and 12288. So it reads back twice what
+its shape needs, on every row of every prompt:
+
+```
+  KMAX 1024, what gemma4 runs         read back  998 MB a 111 row prompt
+  KMAX 1024 + KFIT                               652        -35%
+  KMAX 2048, what the others get                 511        -49%
+  the weights themselves, read once             1273
+```
+
+Round 420, three paired reps, 93 token prompt, text identical over four runs:
+
+```
+                slices  submits  read a row   entry a row   fence a row
+  KFIT off        937     2450   4.75 ms      12.50         4.17
+  KFIT on         693     2054   3.10  -35%   11.29  -9.7%  4.82  +16%
+```
+
+**The read fell by exactly what the arithmetic said it would.** 998 -> 652 MB
+is -35%, and 4.75 -> 3.10 ms a row is -35%.
+
+⚠ And the fence went UP 16%, which is the same core-balance cost the decode
+round saw: fewer slices means a coarser deal between the two cores. It is
+paid back three times over here, but it is the reason this is 9.7% and not 35%.
+
+### The control could not have been arranged better
+
+qwen3 ran beside it and **KFIT removes not one slice from it**: 299 -> 299.
+Every one of its K values is a multiple of its KMAX, so there is no remainder
+for the last slice to absorb. Its entry does not move either -- 3.89 -> 4.05
+ms a row, inside the noise of the arm.
+
+So the gain tracks the slice count, on a model where the slice count moves,
+and vanishes on a model where it does not.
+
+### ⛔ And a premise I had to throw away first
+
+I had worked out that gemma4's 111 token prompt splits into two chunks of 80
+and 31, so the weights are read twice, about 102 ms. **It does not.**
+`CHARSIU_PREFILL_ONECHUNK` has been on since August and runs the whole prompt
+as one chunk whenever it fits under the model's cap; gemma4's cap is 160
+(`163840 / min(12288, KMAX 1024)`), so 111 rows are one chunk. The widths line
+in round 420 reads `1x92` for a 93 token prompt, which is the tree telling me
+so directly, in a line I had already grepped for.
+
+The chunk table in `charsiu_run.c` -- SmolLM2 catastrophic at 160, Qwen3 9%
+better, Llama neutral -- has no gemma4 in it and still does. But it is a
+question about prompts LONGER than 160 tokens, not about the scoreboard.

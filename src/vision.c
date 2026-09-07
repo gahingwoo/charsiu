@@ -707,7 +707,7 @@ static int gelu_exact(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_GELU") != NULL;
+		v = charsiu_env_flag("CHARSIU_EXACT_GELU", 0);
 	return v;
 }
 
@@ -1443,7 +1443,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	 * embed and the gather ran outside every row in the table.
 	 */
 	if (vstage_on < 0)
-		vstage_on = getenv("CHARSIU_STAGES") != NULL;
+		vstage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 
 	VSTAGE(V_PATCH, for (p = 0; p < np; p++) {
 		unsigned gy = p / v->grid, gx = p % v->grid;

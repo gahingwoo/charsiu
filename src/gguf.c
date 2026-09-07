@@ -23,6 +23,33 @@
 
 /* ---- half ---------------------------------------------------------------- */
 
+/*
+ * ⚠⚠ AN ENV FLAG THAT `=0` ACTUALLY TURNS OFF.
+ *
+ * Twenty-odd switches in this tree read `getenv("X") != NULL`, so `X=0` turns
+ * them ON -- the opposite of what anyone types it for. npudev.c already caught
+ * this once on CHARSIU_NPU_W4V, where a board round meant to measure the int8
+ * batched path ran int4 and only its own report gave it away. The note there
+ * was never applied to the other nineteen.
+ *
+ * It cost a round again on 2026-09-07: CHARSIU_NPU_KFIT=0 against
+ * CHARSIU_NPU_KFIT=1 ran KFIT in BOTH arms -- 693 slices either way, where the
+ * off arm should read 937 -- and the two arms were the same arm. That round
+ * was written that way on purpose, to obey the rule that a control must name
+ * its knob rather than lean on a default. Naming the knob is right; the knob
+ * has to parse the name.
+ *
+ * Unset returns `dflt`. "" and "0" are off. Anything else is on.
+ */
+int charsiu_env_flag(const char *name, int dflt)
+{
+	const char *e = getenv(name);
+
+	if (!e || !*e)
+		return e ? 0 : dflt;
+	return *e != '0';
+}
+
 static inline float half_to_float(uint16_t h)
 {
 	uint32_t s = (uint32_t)(h >> 15) << 31;
@@ -886,7 +913,7 @@ static int sm_exact = -1;
 static int softmax_exact(void)
 {
 	if (sm_exact < 0)
-		sm_exact = getenv("CHARSIU_EXACT_SOFTMAX") != NULL;
+		sm_exact = charsiu_env_flag("CHARSIU_EXACT_SOFTMAX", 0);
 	return sm_exact;
 }
 
@@ -969,7 +996,7 @@ void charsiu_attn_plain_set(int on)
 static int pv_is_plain(void)
 {
 	if (attn_plain < 0)
-		attn_plain = getenv("CHARSIU_PLAIN_ATTN") != NULL;
+		attn_plain = charsiu_env_flag("CHARSIU_PLAIN_ATTN", 0);
 	return attn_plain;
 }
 
@@ -1379,7 +1406,7 @@ void charsiu_act_set(struct charsiu_act *a, const float *x, int n)
 		npu = e && *e != '0';
 	}
 	if (eager < 0)
-		eager = getenv("CHARSIU_ACT_EAGER") != NULL;
+		eager = charsiu_env_flag("CHARSIU_ACT_EAGER", 0);
 
 	a->f = x;
 	a->n = n;

@@ -43,7 +43,7 @@ static int cpu_reference(const struct charsiu_job *job, const uint8_t *a,
 {
 	const struct charsiu_matmul *mm = &job->mm;
 	float mult = job->input_scale * job->weight_scale / job->output_scale;
-	int unsigned_out = getenv("CHARSIU_UINT8_OUT") != NULL;
+	int unsigned_out = getenv("CHARSIU_UINT8_OUT") != NULL;   /* no gguf.c on this target */
 	unsigned m, n, k;
 
 	for (m = 0; m < mm->m; m++) {

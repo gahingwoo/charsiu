@@ -70,7 +70,7 @@ int main(int argc, char **argv)
 	 * job.acc_out turns on the whole w4a16 output stage plus 0x40b8 = 3,
 	 * which round 312 measured at 1024 of 1024 elements exact.
 	 */
-	job.acc_out = getenv("CHARSIU_ACC") != NULL;
+	job.acc_out = charsiu_env_flag("CHARSIU_ACC", 0);
 
 	printf("wide8 probe  M=%u K=%u N=%u int8   acc_out=%d  CHARSIU_WIDE8=%s"
 	       "  coef %zu bytes\n",

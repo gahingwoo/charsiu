@@ -665,7 +665,7 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 					      (float)i / (float)nfft));
 
 	if (wstage_on < 0)
-		wstage_on = getenv("CHARSIU_STAGES") != NULL;
+		wstage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	t_mel = wnow();
 	/*
 	 * ⚠ 3000 FRAMES, EACH ONE INDEPENDENT, AND IT WAS SERIAL. On the board
@@ -925,7 +925,7 @@ static int gelu_exact(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_GELU") != NULL;
+		v = charsiu_env_flag("CHARSIU_EXACT_GELU", 0);
 	return v;
 }
 

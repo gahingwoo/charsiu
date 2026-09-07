@@ -48,7 +48,7 @@ static int cpu_plain(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_CPU_PLAIN") != NULL;
+		v = charsiu_env_flag("CHARSIU_CPU_PLAIN", 0);
 	return v;
 }
 
@@ -67,7 +67,7 @@ static int attn_npu_check(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_ATTN_NPU_CHECK") != NULL;
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_CHECK", 0);
 	return v;
 }
 
@@ -76,7 +76,7 @@ static int kv_posmajor(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_KV_POSMAJOR") != NULL;
+		v = charsiu_env_flag("CHARSIU_KV_POSMAJOR", 0);
 	return v;
 }
 
@@ -85,7 +85,7 @@ static int attn_perhead(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_ATTN_PERHEAD") != NULL;
+		v = charsiu_env_flag("CHARSIU_ATTN_PERHEAD", 0);
 	return v;
 }
 
@@ -143,15 +143,6 @@ static int attn_pool_for(int pos)
 	if (e && *e)
 		return *e != '0';
 	return pos >= 0 && (unsigned)pos >= attn_pool_min();
-}
-
-static int attn_pool(void)
-{
-	static int v = -1;
-
-	if (v < 0)
-		v = getenv("CHARSIU_ATTN_POOL") != NULL && !cpu_plain();
-	return v;
 }
 
 /*
@@ -759,7 +750,7 @@ static int dbg_layers(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_DBG_LAYERS") != NULL;
+		v = charsiu_env_flag("CHARSIU_DBG_LAYERS", 0);
 	return v;
 }
 
@@ -2145,7 +2136,7 @@ static int group_off(void)
 	static int m = -1;
 
 	if (m < 0)
-		m = getenv("CHARSIU_NPU_NOGROUP") != NULL;
+		m = charsiu_env_flag("CHARSIU_NPU_NOGROUP", 0);
 	return m;
 }
 
@@ -5056,6 +5047,162 @@ static int attn_npu_layer(struct attn_block_job *j)
  * CHARSIU_ROW_POOL=0 is the control arm, because a pool call is a barrier and
  * a stage can be too small to pay for one.
  */
+/*
+ * ⚠⚠ 262144 tanhf CALLS A TOKEN, SINGLE THREADED, INSIDE `output head`.
+ *
+ * gemma4 declares final_logit_softcapping and gemma3 does not, and that one
+ * line of metadata is the whole of why their heads price differently. Every
+ * stage of both models lands on one line fitted from gemma4's largest call and
+ * its smallest -- us a call = 79 + 54.8 a MB, 18.2 GB/s -- within 27 us:
+ *
+ *   gemma3 head   169.9 MB   predicted  9390 us   measured  9380
+ *   gemma4 head   226.5 MB   predicted 12496 us   measured 17710   +5214
+ *
+ * 5.21 ms above the line on ONE call, 5.2% of a 100.9 ms token, and the NPU
+ * cannot be the reason: round 411 moved gemma4's head to a single K slice and
+ * it gave back 0.53 ms of the 5.21. The rest is this loop, which is not on the
+ * NPU at all and was never charged to anything but the head it sits under.
+ *
+ * The squash is exact here, not approximated -- tanhf, the same call, in the
+ * same order -- because the answer must not move. All this changes is which
+ * core evaluates it.
+ *
+ * CHARSIU_SOFTCAP_POOL=0 is the control arm, and the threshold is real: the
+ * pool call is a barrier and a 32000 wide vocabulary may not pay for one.
+ */
+struct softcap_job {
+	float *y;
+	float c;
+};
+
+static void softcap_rows(void *ctx, uint64_t i0, uint64_t ni)
+{
+	const struct softcap_job *j = ctx;
+	float *y = j->y;
+	uint64_t i;
+
+	for (i = i0; i < i0 + ni; i++)
+		y[i] = tanhf(y[i] / j->c) * j->c;
+}
+
+static void softcap_logits(float *y, size_t n, float c)
+{
+	struct softcap_job j = { y, c };
+	const char *e = getenv("CHARSIU_SOFTCAP_POOL");
+	unsigned min = 8192;
+
+	if (c <= 0.0f)
+		return;
+	if (e && *e)
+		min = *e == '0' ? (unsigned)-1 : 0;
+	if (charsiu_threads() > 1 && n > min)
+		charsiu_parallel_for(softcap_rows, &j, (uint64_t)n);
+	else
+		softcap_rows(&j, 0, (uint64_t)n);
+}
+
+/*
+ * ⚠⚠ `silu * up` IS 3.50 ms A TOKEN ON gemma4 AND IT NEVER SAW THE POOL.
+ *
+ * The join is elementwise -- element i reads hb[i] and hb2[i] and writes
+ * hb[i], and touches nothing else -- so it is the same shape as the tail
+ * per-channel scale and the rope table, both of which turned out to be whole
+ * percent of a token once anything looked at them.
+ *
+ * It is already vectorised: silu_mul and gelu_mul both have NEON paths on by
+ * default. What it is not is SPLIT. Decode calls it once a layer on the whole
+ * n_ff, 35 times a token on gemma4, on one core while seven sit idle:
+ *
+ *   gemma4   337920 elements a token (15 layers of 6144, 20 of 12288)   3.50 ms
+ *   gemma3   179712 elements a token (26 of 6912)                       1.87 ms
+ *
+ * 10.4 ns an element in both, which is the same rate on two models and so is a
+ * property of the loop rather than of either.
+ *
+ * ⚠⚠ THE HOST AND THE BOARD DISAGREE, AND THE BOARD IS THE ONE THAT SHIPS.
+ *
+ *                          silu * up a token       decode
+ *   host, gemma-3-1b     0.18 -> 1.91   10x WORSE     --
+ *   board, gemma-3-1b    1.90 -> 1.48   -22%      22.51 -> 22.66  +0.7%
+ *   board, gemma-4-E2B   3.57 -> 2.28   -36%       9.97 -> 10.07  +1.0%
+ *
+ * Three paired reps each, text identical. The direction was PREDICTED before
+ * the board round from the one number the two platforms do not share: the
+ * serial loop is 10.4 ns an element on the board against 1.0 on the host, so
+ * the same barrier has ten times the work to hide behind.
+ *
+ * ⚠ I still had it default-ON first, from an analogy to the rope and tail
+ * scale wins, with nothing measured either way. The host then said 10x worse.
+ * The analogy was worth nothing in both directions -- it was right about the
+ * board by luck and wrong about the host -- and llama.c's own note on the
+ * batched version of this stage already said which way to think: a pool call
+ * is a barrier and a stage can be too small to pay for one.
+ *
+ * ⚠⚠ WHERE THE THRESHOLD COMES FROM, and it is not a guess now. Both models
+ * back out the SAME barrier from their own two arms -- P = W/T + L*B with
+ * T = 8 gives 47.8 us on gemma3's 26 layers and 52.4 on gemma4's 35 -- so
+ *
+ *   n * 10.5 ns * (1 - 1/8) > 48 us   ->   n > 5224 elements
+ *
+ * 6144 is the DEFAULT because it is the narrowest width actually measured on
+ * the board, not because it is the break-even. Nothing narrower has run:
+ * Qwen3's n_ff is 3072 and TinyLLAMA's 5632, and both sit below it untested,
+ * which is where they stay until a round says otherwise.
+ *
+ * ⚠ gemma4's per-layer embedding calls gelu_mul on 256 elements directly, 35
+ * times a token, and does NOT come through here. Routing it would pay eight
+ * wake-ups for 256 multiplies.
+ *
+ * CHARSIU_ACT_POOL=1 forces the split, =0 refuses it, CHARSIU_ACT_POOL_MIN
+ * moves the width.
+ */
+struct act_mul_job {
+	float *hb;
+	const float *hb2;
+	int gelu;
+};
+
+static void act_mul_rows(void *ctx, uint64_t i0, uint64_t ni)
+{
+	const struct act_mul_job *j = ctx;
+
+	if (j->gelu)
+		gelu_mul(j->hb + i0, j->hb2 + i0, (uint32_t)ni);
+	else
+		silu_mul(j->hb + i0, j->hb2 + i0, (uint32_t)ni);
+}
+
+static int act_pool_min(void)
+{
+	static int v = -2;
+
+	if (v == -2) {
+		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
+
+		v = e && *e ? atoi(e) : 6144; /* the narrowest width measured */
+	}
+	return v;
+}
+
+static void act_mul(float *hb, const float *hb2, uint32_t n, int gelu)
+{
+	struct act_mul_job j = { hb, hb2, gelu };
+	const char *e = getenv("CHARSIU_ACT_POOL");
+	int m = act_pool_min();
+	int pool = e && *e ? *e != '0' : (m >= 0 && (int)n >= m);
+
+	/*
+	 * ⚠ The NEON paths above step four at a time and fall through to a
+	 * scalar tail, so a range that is not a multiple of four is still
+	 * exact -- but every range starting on a multiple of four keeps the
+	 * whole split on the vector path. Hence the grain.
+	 */
+	if (pool && charsiu_threads() > 1)
+		charsiu_parallel_for_grain(act_mul_rows, &j, (uint64_t)n, 4);
+	else
+		act_mul_rows(&j, 0, (uint64_t)n);
+}
+
 struct silu_rows_job {
 	struct llama_state *s;
 	int gelu;
@@ -5482,7 +5629,7 @@ static int prefill_grouped(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_PREFILL_GROUPED") != NULL;
+		v = charsiu_env_flag("CHARSIU_PREFILL_GROUPED", 0);
 	return v;
 }
 
@@ -6024,7 +6171,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	 * it is read here too rather than only in llama_forward.
 	 */
 	if (stage_on < 0)
-		stage_on = getenv("CHARSIU_STAGES") != NULL;
+		stage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	/*
 	 * ⚠⚠ STAGING IS NOT A STAGE. The first chunk's projections upload every
 	 * tensor to the hardware on first use, inside npu_id_for, and the first
@@ -6345,7 +6492,6 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			else
 				res2_rows(&nj, 0, (uint64_t)n);
 		}
-		BSTAGE(ST_RES2);
 
 		/*
 		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not
@@ -6398,6 +6544,29 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					xr[i] += o[i];
 			}
 		}
+		/*
+		 * ⚠⚠ THE MARK IS HERE, AFTER THE PER LAYER EMBEDDING, AND IT
+		 * USED TO BE BEFORE IT -- which charged gemma4's two pl
+		 * projections to whatever ran next, and what runs next is the
+		 * NEXT LAYER'S attn rmsnorm. The table said so for weeks:
+		 *
+		 *   attn rmsnorm a row     gemma4    qwen3    work ratio
+		 *   board                   1.17     0.07       1.9x
+		 *   host                    7.74     0.05       1.9x
+		 *
+		 * 155x on the host for 1.9x the elements. A rmsnorm at 21.8 ns
+		 * an element against qwen3's 2.4 was never the reading; the
+		 * row was two batched matmuls wearing the norm's name.
+		 *
+		 * The decode path has always marked it here -- STAGE(ST_RES2)
+		 * sits after the same block -- so the two paths disagreed
+		 * about which stage pays for gemma4's whole architecture.
+		 *
+		 * ⚠ This moves no arithmetic. It is the instrument, and the
+		 * instrument was pointing at the wrong stage: an afternoon of
+		 * this round went into asking why gemma4's rmsnorm is slow.
+		 */
+		BSTAGE(ST_RES2);
 		/*
 		 * ⚠ ONE SCALAR THE WHOLE LAYER OUTPUT IS MULTIPLIED BY, and
 		 * this loop never had it. It is not in llama_batch_why_not
@@ -6502,10 +6671,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
-	if (m->final_softcap > 0.0f)
-		for (uint32_t i = 0; i < m->n_vocab; i++)
-			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
-				       m->final_softcap;
+	softcap_logits(s->logits, m->n_vocab, m->final_softcap);
 	s->pos = pos0 + n;
 	return 0;
 }
@@ -6537,10 +6703,8 @@ int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 			m->n_embd, m->rms_eps);
 	matmul_rows(s, m->output, s->bxb, n, logits_all, m->n_embd,
 		    m->n_vocab);
-	if (m->final_softcap > 0.0f)
-		for (size_t i = 0; i < (size_t)n * m->n_vocab; i++)
-			logits_all[i] = tanhf(logits_all[i] / m->final_softcap)
-					* m->final_softcap;
+	softcap_logits(logits_all, (size_t)n * m->n_vocab,
+		       m->final_softcap);
 	s->pos = pos0 + n;
 	return 0;
 }
@@ -6574,7 +6738,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		return NULL;
 
 	if (stage_on < 0)
-		stage_on = getenv("CHARSIU_STAGES") != NULL;
+		stage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	/*
 	 * ⚠ THE STAGE IS ALSO THE BREADCRUMB. A crash anywhere in the forward
 	 * pass used to arrive as "Segmentation fault" with nothing else, and
@@ -6896,10 +7060,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_NORM2);
 		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
 		STAGE(ST_GATEUP);
-		if (m->ffn_gelu)
-			gelu_mul(s->hb, s->hb2, L->n_ff);
-		else
-			silu_mul(s->hb, s->hb2, L->n_ff);
+		act_mul(s->hb, s->hb2, L->n_ff, m->ffn_gelu);
 		STAGE(ST_SILU);
 		matvec(s, L->down, s->hb, s->xb2);
 		STAGE(ST_DOWN);
@@ -6971,10 +7132,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	 * measured leave even that off, so this is here for the ones that
 	 * declare it rather than as something every gemma needs.
 	 */
-	if (m->final_softcap > 0.0f)
-		for (uint32_t i = 0; i < m->n_vocab; i++)
-			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
-				       m->final_softcap;
+	softcap_logits(s->logits, m->n_vocab, m->final_softcap);
 	STAGE(ST_HEAD);
 	if (stage_on)
 		stage_tok++;
@@ -7139,7 +7297,7 @@ int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 	sp->hist = malloc((size_t)n_ctx * sizeof(*sp->hist));
 	/* k drafts, row 0, and one row of padding to keep the width even */
 	sp->logits_all = malloc((size_t)(k + 2) * m->n_vocab * sizeof(float));
-	sp->junk = getenv("CHARSIU_SPEC_JUNK") != NULL;
+	sp->junk = charsiu_env_flag("CHARSIU_SPEC_JUNK", 0);
 	if (!sp->hist || !sp->logits_all) {
 		llama_spec_free(sp);
 		return -1;

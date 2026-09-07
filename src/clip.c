@@ -609,7 +609,7 @@ static int gelu_exact(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_GELU") != NULL;
+		v = charsiu_env_flag("CHARSIU_EXACT_GELU", 0);
 	return v;
 }
 

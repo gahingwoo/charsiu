@@ -277,7 +277,7 @@ int main(int argc, char **argv)
 	job.output_zero_point = 0;
 	job.acc_out = 1;
 
-	reread = getenv("CHARSIU_REREAD") != NULL;
+	reread = charsiu_env_flag("CHARSIU_REREAD", 0);
 	c.dev = charsiu_open(NULL);
 	if (!c.dev) { printf("open FAILED\n"); return 1; }
 	if (charsiu_bo_alloc(c.dev, 8192, &c.regcmd) ||

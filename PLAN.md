@@ -1875,6 +1875,22 @@ identical on eight models. The speed half is still open.
 correctness bar, since acc_out sums int32 across K slices and any split of the same K
 has to give the same accumulator; slices and GB/s in the NPU report are the win.
 
+🏁 **THE SPEED HALF RAN 2026-09-07 AND IT IS WORTH ABOUT 1%.** On gemma4 -- the
+model `llama_auto_kmax` declines to widen, because its `down` has K = 6144 and
+12288, exact multiples of the 1024 baseline -- KFIT takes 937 slices to 693
+(691 predicted from the gguf shapes, so the model is right) and the token from
+101.3 to 100.2 ms. The same round cut slices harder still with KMAX 2048, 937
+to 486, and bought 1.2%.
+
+**Slices are cheap, and that is the finding.** The board's own three-term fit
+over 10177 calls: `us a call = 43 + 7.7 a task + 116.7 a MB`, so of a 4277 ms
+hardware path 435 ms is per call, 185 ms is per task and 3288 ms is the weights
+at 16.98 GB/s across two cores. There is no task-count wall to knock down.
+
+⚠ And fewer slices makes the core balance WORSE, exactly as the note above
+`g->deal_load` predicts: `q k v` went 8.23 -> 9.05 ms a token when its tensors
+fell to one slice and one core sat out the call. Balance 1.03x -> 1.13x.
+
 ## 3. Upstreaming
 
 - The driver is [PATCH v11](https://lore.kernel.org/all/20260831081956.84871-1-gahing@gahingwoo.com/),
