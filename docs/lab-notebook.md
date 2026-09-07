@@ -5128,3 +5128,85 @@ together — but barely, and both are still a long way behind eight bits.
 ⚠ Still unmeasured: quality through the BATCHED prefill path. Every number here
 is `charsiu_ppl`, one position at a time on purpose. The recommendation is about
 prefill and the arm that ships it has not been scored.
+
+### 🏁 Round 141: w8a8 lands 1.6% off llama.cpp's own q4_0
+
+Round 140 answered the question on a corpus I had rebuilt wrong -- lifting the
+two appends and dropping the `cp /tmp/ppl.txt /tmp/long.txt` between them, so
+long.txt was one passage twice, 571 tokens instead of 600. Internally paired
+and therefore sound:
+
+```
+                NPU      CPU reference
+  int4      11.8818        12.3193
+  int8       7.8720         7.7962
+```
+
+Both formats within about 1% of their own CPU reference, and int4's device arm
+is the BETTER of its pair because the board runs w4a16 where the CPU reference
+runs w4a8. That is the localisation closed from the other end: the device is
+faithful to the weights it is given, for both formats.
+
+Round 141 on the right corpus. ⚠ **Arm Z is a fingerprint, not a baseline** --
+the gguf's own q4_0 through charsiu's CPU loop touches nothing this week
+changed and is deterministic, so it says whether the corpus is last night's:
+
+```
+  Z  q4_0 gguf, the fingerprint      26.6416     recorded 26.6413
+  A  int4 NPU                        49.8930     recorded 49.8930
+  B  int8 NPU                        27.0668     was 272369
+  C  int4 NPU + AWQ clamp 2          40.8296     recorded 40.8006
+  E  int8 NPU + AWQ clamp 2        2162.7320     never asked before
+```
+
+**27.07 against 26.64.** The quality gap that opened last night at +87% closes
+to 1.6% by fixing a scale layout, with no calibration, no finer group and
+nothing new on the hardware.
+
+⚠ Arm C is 0.07% off its record and that is the calibration, not a drift: this
+round's calib pass ran with `CHARSIU_NPU_W4V` unset, so the activations were
+recorded through an int8 model where round 138 recorded them through an int4
+one. Small, and in the direction that says so.
+
+### ⛔ And arm E is the same bug one layer down
+
+int8 with AWQ is 2162.73 where int8 alone is 27.07. On the host it is 44.76
+against 43.66 -- 2.5% worse, not eighty times. The difference is where the
+factor's cancelling multiply lives.
+
+`W' = W/f` happens in the quantiser for any width. `x' = x*f` happens in
+`charsiu_npu_matvec`, which scales the activation before packing it -- and that
+is the w4a16 path, where the activation is still a float when it gets there.
+The int8 path packs `a->q1`, one absmax quantisation of the whole vector, and
+has nowhere to put a per column factor. So at eight bits on the board the
+divide happens and the multiply does not.
+
+⚠⚠ **That is AWQ bug #1 again, in the branch nobody had run.** The first one
+was "the factor was never applied to the activation -- kscale appears twelve
+times in npuquant.c and zero times in npudev.c". This is the same sentence with
+"on the int8 path" appended, and it was reachable the whole time.
+
+Declined rather than fixed, because fixing it buys nothing: the host applies
+the multiply correctly at eight bits and AWQ still makes int8 worse there.
+Eight bits does not have the dynamic-range problem the method exists to solve.
+`npu_tensor_build` now zeroes alpha for `bits != 4` and says so once, naming
+the width. Paired on the host: int8 with AWQ 44.7554 -> 43.6595, which is the
+AWQ-off number digit for digit, and int4 with AWQ 72.3630 -> 72.3630.
+
+### Where this leaves the format choice
+
+```
+                     ppl      bytes a weight     decode, 13 tok prompt
+  int4 w4a16       49.89          0.5            31.53 tok/s
+  int8 w8a8        27.07          1.0            19.45 tok/s
+  q4_0 reference   26.64          0.5625         (not on the NPU)
+```
+
+int4 stays the default: decode is memory bound, int8 moves twice the bytes,
+and chat is a short prompt and a long answer. But PLAN.md's rule already sends
+prompt-heavy work to int8 on speed grounds, and for that work it is now better
+answers as well -- not a trade.
+
+⚠ The decode figures are from round 139's 13-token text arms and are not
+scoreboard numbers. The scoreboard runs 110-token prompts and int8 has never
+been through it.
