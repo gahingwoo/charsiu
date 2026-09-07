@@ -5110,6 +5110,77 @@ static void softcap_logits(float *y, size_t n, float c)
 		softcap_rows(&j, 0, (uint64_t)n);
 }
 
+/*
+ * ⚠⚠ `silu * up` IS 3.50 ms A TOKEN ON gemma4 AND IT NEVER SAW THE POOL.
+ *
+ * The join is elementwise -- element i reads hb[i] and hb2[i] and writes
+ * hb[i], and touches nothing else -- so it is the same shape as the tail
+ * per-channel scale and the rope table, both of which turned out to be whole
+ * percent of a token once anything looked at them.
+ *
+ * It is already vectorised: silu_mul and gelu_mul both have NEON paths on by
+ * default. What it is not is SPLIT. Decode calls it once a layer on the whole
+ * n_ff, 35 times a token on gemma4, on one core while seven sit idle:
+ *
+ *   gemma4   337920 elements a token (15 layers of 6144, 20 of 12288)   3.50 ms
+ *   gemma3   179712 elements a token (26 of 6912)                       1.87 ms
+ *
+ * 10.4 ns an element in both, which is the same rate on two models and so is a
+ * property of the loop rather than of either.
+ *
+ * ⚠ THE THRESHOLD IS THE POINT, NOT A GUARD. A pool call is a barrier, and
+ * gemma4's per-layer embedding calls the same join on 256 elements 35 times a
+ * token -- pooling THAT would pay eight wake-ups for 256 multiplies. Below the
+ * threshold this is the plain call it always was.
+ *
+ * CHARSIU_ACT_POOL=0 is the control, =1 forces it at every width.
+ */
+struct act_mul_job {
+	float *hb;
+	const float *hb2;
+	int gelu;
+};
+
+static void act_mul_rows(void *ctx, uint64_t i0, uint64_t ni)
+{
+	const struct act_mul_job *j = ctx;
+
+	if (j->gelu)
+		gelu_mul(j->hb + i0, j->hb2 + i0, (uint32_t)ni);
+	else
+		silu_mul(j->hb + i0, j->hb2 + i0, (uint32_t)ni);
+}
+
+static unsigned act_pool_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
+
+		v = e && *e ? atoi(e) : 4096;
+	}
+	return (unsigned)v;
+}
+
+static void act_mul(float *hb, const float *hb2, uint32_t n, int gelu)
+{
+	struct act_mul_job j = { hb, hb2, gelu };
+	const char *e = getenv("CHARSIU_ACT_POOL");
+	int pool = e && *e ? *e != '0' : n >= act_pool_min();
+
+	/*
+	 * ⚠ The NEON paths above step four at a time and fall through to a
+	 * scalar tail, so a range that is not a multiple of four is still
+	 * exact -- but every range starting on a multiple of four keeps the
+	 * whole split on the vector path. Hence the grain.
+	 */
+	if (pool && charsiu_threads() > 1)
+		charsiu_parallel_for_grain(act_mul_rows, &j, (uint64_t)n, 4);
+	else
+		act_mul_rows(&j, 0, (uint64_t)n);
+}
+
 struct silu_rows_job {
 	struct llama_state *s;
 	int gelu;
@@ -6945,10 +7016,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_NORM2);
 		matvec_pair(s, s->xb, L->gate, s->hb, L->up, s->hb2, NULL, NULL);
 		STAGE(ST_GATEUP);
-		if (m->ffn_gelu)
-			gelu_mul(s->hb, s->hb2, L->n_ff);
-		else
-			silu_mul(s->hb, s->hb2, L->n_ff);
+		act_mul(s->hb, s->hb2, L->n_ff, m->ffn_gelu);
 		STAGE(ST_SILU);
 		matvec(s, L->down, s->hb, s->xb2);
 		STAGE(ST_DOWN);
