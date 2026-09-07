@@ -26,7 +26,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
      $(BUILD)/npu_gemm_test $(BUILD)/npu_slice_test $(BUILD)/npu_fp16_test \
-     $(BUILD)/npu_qpack_test $(BUILD)/npu_prep_cost \
+     $(BUILD)/npu_qpack_test $(BUILD)/npu_prep_cost $(BUILD)/npu_job_cost \
      $(BUILD)/charsiu_matmul $(BUILD)/npu_fence_scan \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
@@ -187,6 +187,9 @@ $(BUILD)/npu_qpack_test: tools/npu_qpack_test.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(BUILD)/npu_prep_cost: tools/npu_prep_cost.c src/device.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+$(BUILD)/npu_job_cost: tools/npu_job_cost.c src/device.c src/job.c src/regcmd.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/npu_fence_scan: tools/npu_fence_scan.c $(LLM) | $(BUILD)
