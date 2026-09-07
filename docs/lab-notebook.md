@@ -4372,3 +4372,62 @@ measurement**, and the default is off until a board round says otherwise --
 the board's serial loop is 10.4 ns an element against the host's 1.0, so the
 break-even for an eight way split lands near 7250 elements, which would split
 gemma4's twenty 12288 wide layers from its fifteen 6144 wide ones.
+
+## 2026-09-07 late: KFIT was priced on the wrong half
+
+Round 412 measured `CHARSIU_NPU_KFIT` at decode, got 1%, and I wrote it off.
+That is the right answer to the wrong question. The read back is
+`m * n * ceil(K / KMAX)`, so at m = 1 there is almost nothing to read and the
+slice count moves almost nothing. **At a prompt it is the biggest stream in
+the run.**
+
+gemma4 is the only one of the four scoreboard models on KMAX 1024 --
+`llama_auto_kmax` declines the whole model when ANY of its K values would
+regroup, and its `down` has K = 6144 and 12288. So it reads back twice what
+its shape needs, on every row of every prompt:
+
+```
+  KMAX 1024, what gemma4 runs         read back  998 MB a 111 row prompt
+  KMAX 1024 + KFIT                               652        -35%
+  KMAX 2048, what the others get                 511        -49%
+  the weights themselves, read once             1273
+```
+
+Round 420, three paired reps, 93 token prompt, text identical over four runs:
+
+```
+                slices  submits  read a row   entry a row   fence a row
+  KFIT off        937     2450   4.75 ms      12.50         4.17
+  KFIT on         693     2054   3.10  -35%   11.29  -9.7%  4.82  +16%
+```
+
+**The read fell by exactly what the arithmetic said it would.** 998 -> 652 MB
+is -35%, and 4.75 -> 3.10 ms a row is -35%.
+
+⚠ And the fence went UP 16%, which is the same core-balance cost the decode
+round saw: fewer slices means a coarser deal between the two cores. It is
+paid back three times over here, but it is the reason this is 9.7% and not 35%.
+
+### The control could not have been arranged better
+
+qwen3 ran beside it and **KFIT removes not one slice from it**: 299 -> 299.
+Every one of its K values is a multiple of its KMAX, so there is no remainder
+for the last slice to absorb. Its entry does not move either -- 3.89 -> 4.05
+ms a row, inside the noise of the arm.
+
+So the gain tracks the slice count, on a model where the slice count moves,
+and vanishes on a model where it does not.
+
+### ⛔ And a premise I had to throw away first
+
+I had worked out that gemma4's 111 token prompt splits into two chunks of 80
+and 31, so the weights are read twice, about 102 ms. **It does not.**
+`CHARSIU_PREFILL_ONECHUNK` has been on since August and runs the whole prompt
+as one chunk whenever it fits under the model's cap; gemma4's cap is 160
+(`163840 / min(12288, KMAX 1024)`), so 111 rows are one chunk. The widths line
+in round 420 reads `1x92` for a 93 token prompt, which is the tree telling me
+so directly, in a line I had already grepped for.
+
+The chunk table in `charsiu_run.c` -- SmolLM2 catastrophic at 160, Qwen3 9%
+better, Llama neutral -- has no gemma4 in it and still does. But it is a
+question about prompts LONGER than 160 tokens, not about the scoreboard.
