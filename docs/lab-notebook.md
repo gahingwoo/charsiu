@@ -4046,3 +4046,37 @@ The stage line agrees: gemma3's `rope + kv copy` is 0.19 ms a row serial and
 All of it out of the 26 to 43% of the prompt that is not the matmul entry --
 the half two days of work had never touched, and which was reached only because
 "there must be a way out" turned out to be right.
+
+### ⛔ The attention block width does nothing at this length, and the rule said stop
+
+Attention is the last unmeasured piece of the non-matmul half: 16.9% of qwen3's
+prompt at the scoreboard's own length. It is already blocked, pooled over heads
+and vectorised -- `attn_dot4` takes four key rows at once and the R query rows
+of a block share them -- so the only untried thing was its one number.
+`CHARSIU_ATTN_BLOCK` is 4, chosen at 916 tokens where the cache does not fit in
+L2 and the trade is different.
+
+The round was written with its own stopping rule: R trades cache reuse against
+the scores buffer, `n_head * R * n_ctx` floats, which on Qwen3 at R = 32 is
+4 MB against this board's 1 MB of L2 -- **so the curve had to turn somewhere,
+and if it did not, the sweep was fitting and would stop.**
+
+```
+  prompt ms      R=2    R=4    R=8    R=16   R=32
+  qwen3          656    656    650    656    651
+                 666    702    658    652    652
+  gemma3         824    817    836    821    816
+                 827    831    828    836    829
+  tinyl          834    844    838    851    847
+                 837    836    840    841    852
+```
+
+Flat, on all three, across a sixteenfold range. **It did not turn**, so R is not
+what binds here and no default moves.
+
+Which is itself the answer about attention: at 110 tokens the whole KV cache of
+a layer is 0.9 MB and stays in L2, so reuse is not the constraint. Counting the
+arithmetic -- 6105 query-key pairs, 16 heads, 128 wide, dot and axpy -- gives
+about 1.4 GFLOP a prompt in 110 ms, **12.7 GFLOP/s across four A72s and four
+A53s**, which is close to what this board can do. There is no factor sitting in
+attention at this length.
