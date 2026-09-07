@@ -145,15 +145,6 @@ static int attn_pool_for(int pos)
 	return pos >= 0 && (unsigned)pos >= attn_pool_min();
 }
 
-static int attn_pool(void)
-{
-	static int v = -1;
-
-	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_ATTN_POOL", 0) && !cpu_plain();
-	return v;
-}
-
 /*
  * ⚠ OPT IN, AND IT MOVES TOKENS.
  *
