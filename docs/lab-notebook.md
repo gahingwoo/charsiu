@@ -4825,3 +4825,64 @@ Nothing in the conclusion, and two things around it:
 ⚠ And the NPU reads weights at 16.98 GB/s -- ABOVE anything the CPU can reach
 here. The two do not share a path in the way the CPU-side numbers assume, which
 is why the fence can sit at the MAC rate while read and pack are held at 11.9.
+
+## 2026-09-07 late: AWQ was two bugs deep, and the second one is the interesting one
+
+### Bug one: the factor was never applied to the activation
+
+npuquant folds the AWQ factor into the weights (`row[i] /= t->kscale[i]` in
+quant_rows) and leaves `t->kscale` for the caller to undo on the input. Its
+note: *"on the board this is one multiply a k before the pack"*. Nothing did
+it -- `kscale` appeared twelve times in npuquant.c and zero times in npudev.c.
+
+```
+  CHARSIU_NPU_AWQ off                     75.17
+  CHARSIU_NPU_AWQ=0.5, column means      10755.75
+  CHARSIU_NPU_AWQ=0.5, real |x| stats  65233808
+```
+
+The better the statistic, the worse the output: the signature of a factor
+nothing undoes, since a truer mean |x_k| gives a more extreme one.
+
+`charsiu_npu_matvec` applies it now. `charsiu_npu_matvec_group` refuses a
+tensor that carries one -- the whole point of that entry is that q, k and v
+share one packed input, and a per-tensor factor means per-tensor inputs.
+
+### Bug two: with the multiply in, it still collapsed -- and the CPU said it was not mine
+
+```
+  board, NPU, factor now applied   AWQ 0.5   2155726
+                                   AWQ 0.25     1103.80
+```
+
+⚠ The CPU reference path applies the factor too (`a->f[i] * t->kscale[i]`) and
+touches none of tonight's code. On the host:
+
+```
+  CPU reference, AWQ off        114.22
+  CPU reference, AWQ 0.5   7252312.56
+```
+
+**So it was broken in the quantiser, on every path, since it was written.**
+That is what made it debuggable: the host runs the same collapse in seconds.
+
+The factor is clamped to `[0.125, 8]` -- sixty-four fold. It DIVIDES the
+weights, so a k with f = 0.125 has its column multiplied by eight before
+rounding, and one such column sets vmax for the whole row: the int4 step for
+every other weight in that row goes eight times coarser. That is the shape of
+a collapse, not of a trade. Published AWQ keeps the factor near 1; the point is
+to protect a few salient channels, not to rescale the tensor.
+
+```
+  CPU reference, qwen3, 200 tokens, AWQ 0.5
+    off                    114.22
+    clamp [0.95, 1.05]     111.08     <- AWQ starts working
+    clamp [0.125, 8]  7252312.56      <- what it shipped as
+```
+
+`CHARSIU_NPU_AWQ_CLAMP` sets the bound, default 2.0.
+
+⚠ Both alpha and the clamp move the same quantity -- how far the factor may
+stray from 1 -- which is why alpha 0.25 was a thousand and alpha 0.5 was two
+million on the same clamp. The clamp is the direct control and the exponent
+should not be doing that job.

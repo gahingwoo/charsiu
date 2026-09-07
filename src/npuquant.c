@@ -869,12 +869,38 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			}
 		}
 		gm = exp(gm / (double)k);            /* keep the mean factor at 1 */
+		{
+		/*
+		 * ⚠⚠ THE CLAMP IS 64x WIDE AND THAT IS THE SUSPECT.
+		 *
+		 * The factor divides the weights: a k with f = 0.125 has its
+		 * column multiplied by EIGHT before rounding. One such column
+		 * sets vmax for the whole row, so the int4 step for every other
+		 * weight in it goes eight times coarser -- which is the shape
+		 * of a collapse, not of a trade.
+		 *
+		 * Measured with the clamp as it was, qwen3, 200 tokens, on the
+		 * CPU reference where no hardware is involved:
+		 *
+		 *   AWQ off                         114.22
+		 *   AWQ 0.5, clamp [0.125, 8]  7252312.56
+		 *
+		 * Published AWQ keeps the factor near 1 -- the point is to
+		 * protect a few salient channels, not to rescale the tensor.
+		 * CHARSIU_NPU_AWQ_CLAMP sets the bound, default 2.0, so the
+		 * factor lives in [0.5, 2].
+		 */
+		const char *cl = getenv("CHARSIU_NPU_AWQ_CLAMP");
+		double hi = cl && *cl ? atof(cl) : 2.0;
+		double lo = hi > 0.0 ? 1.0 / hi : 0.5;
+
 		for (uint64_t i = 0; i < k; i++) {
 			double f = col[i] / gm;
 
-			if (f < 0.125) f = 0.125;
-			if (f > 8.0) f = 8.0;
+			if (f < lo) f = lo;
+			if (f > hi) f = hi;
 			t->kscale[i] = (float)f;
+		}
 		}
 		free(col);
 	}
