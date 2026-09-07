@@ -6112,3 +6112,45 @@ than an open question.
 
 ⚠ Everything above is structure and arithmetic. No vendor weight has been
 dequantised yet, and until one is, nothing here says anything about quality.
+
+### ⚠ Round 158: the predictor's held-out extremes, and it fails at both ends
+
+Ten ggufs predicted from the desk, every coefficient from `npu_job_cost`, no
+model in the fit. Seven now have a measurement on one protocol:
+
+```
+  model            t/MB     pred    meas    error   implied matmul share
+  SmolLM2-135M     3.66     9.36    14.6   -35.9%          64%
+  qwen3            0.91    27.13    30.9   -12.2%          88%
+  tinyllama        0.78    41.44    41.3    +0.3%         100%
+  gemma-3-1b       1.12    41.11    42.8    -3.9%          96%
+  Qwen2.5-1.5B     0.81    61.36    63.0    -2.6%          97%
+  SmolLM2-1.7B     0.58    65.54    63.3    +3.5%         104%
+  Phi-3.5          0.45   138.36   130.5    +6.0%         106%
+```
+
+Two of the three new models land inside 4%, on shapes nobody calibrated
+anything against. **tinyllama is +0.3% and took part in nothing.**
+
+⚠⚠ **But three rows imply a matmul share above 100%,** which is the model
+claiming more of a token than the token has. That is not a fit error. Phi-3.5's
+gate+up is **19.6 MB in one call** and the MB sweep stopped at 8.39, so those
+rows are extrapolated 2.3x past the data.
+
+And the other end fails the other way: SmolLM2-135M's calls are 0.13 to 0.69 MB
+and it is missed by 36% LOW, with an implied matmul share of 64% -- i.e. the
+elementwise work this predictor does not model is a third of that token where
+it is a ninth of qwen3's.
+
+⛔ **I tried to fix the small end by adding a term and made it worse.** A
+residual proportional to `layers * n_embd` is physically the right shape for
+elementwise work, and fitting it took RMS from 14.7% to **16.4%** -- because
+the residuals it was fitted to are +303, +132, -3, +56, +38, -46, -80 ns per
+unit, sign-changing, which is two errors of opposite sign being averaged into
+one parameter.
+
+🔑 **So: widen the measurement, do not add a parameter.** The sweep now runs
+0.002 to 67 MB, covering every call any of the ten models makes. The
+elementwise term can be fitted after the matmul term stops being extrapolated,
+or it may turn out not to be needed. Fitting it first was fitting the second
+parameter on top of a wrong first one.
