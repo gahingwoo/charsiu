@@ -5798,7 +5798,38 @@ tensor wider than 2048, and qwen3's 151936-wide head would take 75 slices
 instead of 19. The right change is `out_stride` per entry -- `min(nmax, t->n)`
 -- which buys the same cache and re-slices nothing. Priced, not yet written.
 
-🔑 **This is where the decode line stops being worth pushing.** Three rounds
-took a "22% of a token is overhead" reading down to 6%, and the honest summary
-is that charsiu's decode is within about 6% of what this hardware's dispatch
-allows, at 105 to 116% of the vendor.
+🔑 Three rounds took a "22% of a token is overhead" reading down to 6%.
+
+⛔ **AND THEN I WROTE THAT THE LINE WAS FINISHED, ON A NUMBER I HAD
+SUBTRACTED.** The 46 us is what was left after removing three measured terms
+from 71. Nothing measured it. The paragraph above it on this same page had just
+retracted a residual for exactly that reason, and one screen later I used
+another one to close a line of work.
+
+**A residual attributed to hardware is the shape of the wall.** Every
+explanation of that one was a property of the CBUF sequencer -- for months,
+with data behind each -- until it turned out to be `PC_TASK_CON`'s field layout
+in a header copied from RK3588. What made it a wall was not the difficulty. It
+was that "the hardware does this" was never itself a measurement.
+
+So the 46 us gets measured. `tools/npu_job_cost` submits a matmul small enough
+that the arithmetic is nothing and times four ways of getting two jobs onto the
+device:
+
+```
+  A  one job, one ioctl                  the floor itself
+  B  TWO jobs in ONE ioctl, one fd       never run
+  C  two jobs, two ioctls, one fd        an ioctl's own share
+  D  two jobs, two ioctls, two fds       what charsiu does today
+```
+
+⚠⚠ **And arm B exists because of something in charsiu's own submit loop.**
+`charsiu_npu_matvec_group` runs `for (d = 0; d < g->ndev; d++)
+charsiu_submit_jobs(g->dev[d], &jl, 1)` -- one ioctl per core, in sequence, so
+the second core starts a whole syscall after the first. `charsiu_submit_jobs`
+has taken a job LIST since it was written, and device.c says why that matters
+in a comment nobody acted on: *"Jobs are what the scheduler can hand to
+different cores."*
+
+Round 152. If B beats D, the second core has been starting late for the life of
+this runtime, and 46 us was never the device's.
