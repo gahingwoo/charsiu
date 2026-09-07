@@ -5128,28 +5128,42 @@ static void softcap_logits(float *y, size_t n, float c)
  * 10.4 ns an element in both, which is the same rate on two models and so is a
  * property of the loop rather than of either.
  *
- * ⚠⚠ AND THE HOST SAYS THE SPLIT LOSES, SO IT IS OFF BY DEFAULT. gemma-3-1b,
- * 26 layers of 6912, six cores:
+ * ⚠⚠ THE HOST AND THE BOARD DISAGREE, AND THE BOARD IS THE ONE THAT SHIPS.
  *
- *   CHARSIU_ACT_POOL=0    silu * up   0.18 ms a token
- *   CHARSIU_ACT_POOL=1    silu * up   1.91 ms a token     10x WORSE
+ *                          silu * up a token       decode
+ *   host, gemma-3-1b     0.18 -> 1.91   10x WORSE     --
+ *   board, gemma-3-1b    1.90 -> 1.48   -22%      22.51 -> 22.66  +0.7%
+ *   board, gemma-4-E2B   3.57 -> 2.28   -36%       9.97 -> 10.07  +1.0%
  *
- * 26 barriers a token against 7 us of work a layer. The barrier is about 66 us
- * there, and llama.c's own note on the batched version of this stage says
- * exactly that: a pool call is a barrier and a stage can be too small to pay
- * for one. I committed this default-on from an analogy to the rope and tail
- * scale wins and had not measured it; this is what the analogy was worth.
+ * Three paired reps each, text identical. The direction was PREDICTED before
+ * the board round from the one number the two platforms do not share: the
+ * serial loop is 10.4 ns an element on the board against 1.0 on the host, so
+ * the same barrier has ten times the work to hide behind.
  *
- * The board is not the host and might disagree -- its serial loop is 10.4 ns
- * an element against the host's 1.0, so the same barrier has ten times as much
- * work to hide behind. If B is 66 us there too, the break-even for an eight
- * way split is n * 10.4ns * 7/8 > B, so about 7250 elements: gemma4's twenty
- * 12288 wide layers would pay and its fifteen 6144 wide ones would not. That
- * is a measurement, not a default.
+ * ⚠ I still had it default-ON first, from an analogy to the rope and tail
+ * scale wins, with nothing measured either way. The host then said 10x worse.
+ * The analogy was worth nothing in both directions -- it was right about the
+ * board by luck and wrong about the host -- and llama.c's own note on the
+ * batched version of this stage already said which way to think: a pool call
+ * is a barrier and a stage can be too small to pay for one.
  *
- * CHARSIU_ACT_POOL=1 forces the split, =0 refuses it, and
- * CHARSIU_ACT_POOL_MIN sets the width it turns on at when neither is given.
- * Until a board round moves it, that width is off.
+ * ⚠⚠ WHERE THE THRESHOLD COMES FROM, and it is not a guess now. Both models
+ * back out the SAME barrier from their own two arms -- P = W/T + L*B with
+ * T = 8 gives 47.8 us on gemma3's 26 layers and 52.4 on gemma4's 35 -- so
+ *
+ *   n * 10.5 ns * (1 - 1/8) > 48 us   ->   n > 5224 elements
+ *
+ * 6144 is the DEFAULT because it is the narrowest width actually measured on
+ * the board, not because it is the break-even. Nothing narrower has run:
+ * Qwen3's n_ff is 3072 and TinyLLAMA's 5632, and both sit below it untested,
+ * which is where they stay until a round says otherwise.
+ *
+ * ⚠ gemma4's per-layer embedding calls gelu_mul on 256 elements directly, 35
+ * times a token, and does NOT come through here. Routing it would pay eight
+ * wake-ups for 256 multiplies.
+ *
+ * CHARSIU_ACT_POOL=1 forces the split, =0 refuses it, CHARSIU_ACT_POOL_MIN
+ * moves the width.
  */
 struct act_mul_job {
 	float *hb;
@@ -5174,7 +5188,7 @@ static int act_pool_min(void)
 	if (v == -2) {
 		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
 
-		v = e && *e ? atoi(e) : -1;   /* off: the host measured a loss */
+		v = e && *e ? atoi(e) : 6144; /* the narrowest width measured */
 	}
 	return v;
 }
