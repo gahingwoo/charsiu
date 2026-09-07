@@ -1261,7 +1261,7 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		 * at all, since spreading an eight bit activation's range is
 		 * what destroyed it here.
 		 */
-		if (getenv("CHARSIU_NPU_A16")) {
+		if (charsiu_env_flag("CHARSIU_NPU_A16", 0)) {
 			for (uint64_t g = 0; g < ngrp; g++) {
 				uint64_t lo = g * grp;
 				uint64_t len = lo + grp < t->k ? grp : t->k - lo;

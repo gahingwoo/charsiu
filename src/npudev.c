@@ -3461,7 +3461,7 @@ static const char *w4_batch_why_not(unsigned m)
 	 * for the same reason this one has its own name -- a round that sets a
 	 * switch for one reason must not quietly get a second meaning with it.
 	 */
-	if (getenv("CHARSIU_NPU_W4_ANYM"))
+	if (charsiu_env_flag("CHARSIU_NPU_W4_ANYM", 0))
 		return NULL;
 	/*
 	 * ⚠⚠ TWO REFUSALS, TWO REASONS, AND THEY ARE NOT THE SAME FAULT. The

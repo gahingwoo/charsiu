@@ -1077,7 +1077,7 @@ int main(int argc, char **argv)
 					"a time", done, n_ids);
 				prefill_say_widths(&pw);
 				fprintf(stderr, "%s\n", forced);
-			} else if (getenv("CHARSIU_NO_BATCH_PREFILL")) {
+			} else if (charsiu_env_flag("CHARSIU_NO_BATCH_PREFILL", 0)) {
 				fprintf(stderr, "charsiu: prompt a token at a "
 					"time (CHARSIU_NO_BATCH_PREFILL)\n");
 			} else if (n_ids < 2) {

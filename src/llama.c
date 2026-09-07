@@ -1007,7 +1007,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 * and spent itself on the one term row 0 cannot see. Both rows are
 	 * counted and both are printed.
 	 */
-	if (getenv("CHARSIU_BATCH_SWEEP")) {
+	if (charsiu_env_flag("CHARSIU_BATCH_SWEEP", 0)) {
 		static const char *READS[] = { "acc", "flat", "2", "4", "8",
 					       "16", "32" };
 		static const char *AXES[] = { "h", "w" };
@@ -5997,7 +5997,7 @@ static int batch_ok(const struct llama_model *m)
 	 * so on stderr every run: this is a probe switch, and a number measured
 	 * under it is a number about a model that is still refused.
 	 */
-	if (getenv("CHARSIU_BATCH_FORCE")) {
+	if (charsiu_env_flag("CHARSIU_BATCH_FORCE", 0)) {
 		static int said;
 
 		if (!said++)

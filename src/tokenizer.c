@@ -1157,7 +1157,7 @@ static int encode_span_spm(const struct tokenizer *tk, const char *s, size_t n,
 	}
 #undef TRY_BIGRAM
 
-	if (getenv("CHARSIU_SPM_DEBUG")) {
+	if (charsiu_env_flag("CHARSIU_SPM_DEBUG", 0)) {
 		fprintf(stderr, "spm: nsym=%d bn=%zu chain:", nsym, bn);
 		for (int k = 0; k != -1; k = sym[k].next)
 			fprintf(stderr, " [%d]'%.*s'(%zu)", k,
