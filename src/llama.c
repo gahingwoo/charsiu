@@ -3453,7 +3453,22 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 		return NULL;
 	}
 
-	if (getenv("CHARSIU_NPU")) {
+	/*
+	 * ⚠⚠ charsiu_env_flag, BECAUSE `CHARSIU_NPU=0` USED TO OPEN THE NPU.
+	 *
+	 * This was `if (getenv("CHARSIU_NPU"))` -- an existence test, so the
+	 * one spelling anybody would reach for to turn the device OFF turned it
+	 * ON. Round 428 wanted a CPU control arm, wrote CHARSIU_NPU=0, and got
+	 * the NPU with W4V unset, which is w8a8: ppl 272369 against int4's
+	 * 75.17. Two arms of that round were bit-for-bit identical and that is
+	 * what gave it away.
+	 *
+	 * Tonight's charsiu_env_flag sweep converted the twenty `!= NULL`
+	 * switches and missed this shape entirely -- there are 51 of them in
+	 * the tree and this is the one that matters, because it is the switch
+	 * every board round sets.
+	 */
+	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
 		const char *e = getenv("CHARSIU_NPU_MAXN");
 		unsigned maxn = e ? (unsigned)atoi(e) : 8192;
 		unsigned widest = state_widest(m);

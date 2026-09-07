@@ -338,7 +338,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 	/* ⚠ nothing else starts it outside the language model */
 	charsiu_threads_start(0);
 
-	if (getenv("CHARSIU_NPU")) {
+	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
 		unsigned wide = v->n_embd > v->n_ff ? v->n_embd : v->n_ff;
 		unsigned rows = v->n_ff > v->proj_dim ? v->n_ff : v->proj_dim;
 
