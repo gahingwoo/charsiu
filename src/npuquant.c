@@ -738,6 +738,32 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 */
 	if (k % grp)
 		grp = k;
+	/*
+	 * ⚠⚠ AND THE SAME DISAGREEMENT AGAIN, ON THE OTHER SIDE OF bits.
+	 *
+	 * tensor_grouped() also requires g->w4. So an INT8 tensor whose k
+	 * divides the group exactly walks past the remainder collapse above,
+	 * gets its scales written as scale[row * ngrp + group], and is then
+	 * read by a consumer that takes scale[row] -- the identical fault the
+	 * comment above describes, in the one case that comment's condition
+	 * cannot see.
+	 *
+	 * It is not hypothetical. Every board round exports
+	 * CHARSIU_NPU_W4_GROUP=1024 whatever the format, so the accidental
+	 * w8a8 arm of round 428 measured ppl 272369 against int4's 75.17 and
+	 * was written down as "the int8 path emits noise". The int8 path is
+	 * fine; it was being handed scales in a layout it does not read.
+	 *
+	 * One scale a row is what the int8 consumer applies, so it is what
+	 * gets written -- and at eight bits it costs nothing. Host, qwen3,
+	 * 200 tokens, CPU reference: group 1024 44.81, one scale a row 43.66.
+	 * The row is not worse, it is very slightly BETTER, because eight bits
+	 * spans a row's spread on its own and the finer scales only add their
+	 * own rounding. Four bits is the opposite -- 91.66 grouped against
+	 * 114.22 a row -- which is why the group exists at all.
+	 */
+	if (bits != 4)
+		grp = k;
 	ngrp = (k + grp - 1) / grp;
 
 	/*

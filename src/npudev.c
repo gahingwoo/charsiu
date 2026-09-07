@@ -2648,8 +2648,23 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * ever does again, the tensor falls back to the CPU and says why,
 	 * instead of returning numbers nobody can tell are wrong.
 	 */
-	if (t->kgroup && t->kgroup < t->k && (t->k % t->kgroup)) {
-		whine(g, "a partial weight group would be read as one scale a row",
+	/*
+	 * ⚠⚠ AND THE TEST IS tensor_grouped ITSELF, NOT ONE OF ITS CLAUSES.
+	 *
+	 * This asked only about a partial group, which is one of the four
+	 * things tensor_grouped() wants. It also wants g->w4 and it wants the
+	 * group to BE the K slice, and each of those is a way for the two
+	 * sides to disagree with no remainder in sight. The int8 one cost a
+	 * board round: k 2048, group 1024, no remainder, w4 off -- so the
+	 * guard passed, tensor_grouped said no, and the consumer read a
+	 * [row][2] array as one scale a row. ppl 272369.
+	 *
+	 * Ask the consumer's own predicate. If the quantiser grouped the
+	 * tensor and the consumer will not honour that grouping, the tensor
+	 * goes to the CPU and says so, whatever the reason turns out to be.
+	 */
+	if (t->kgroup && t->kgroup < t->k && !tensor_grouped(g, t)) {
+		whine(g, "a weight group the consumer cannot honour would be read as one scale a row",
 		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
