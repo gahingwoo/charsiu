@@ -323,13 +323,30 @@ not a characterisation. What is not in doubt is the direction and the size:
 this was never measured before 2026-09-07, and "identical to the CPU loop" was
 carrying more weight in this file than it can hold.
 
-**What it changes.** int4 is still the default and still the right one for chat,
-which is a short prompt and a long answer: int8 moves twice the bytes a token
-and decode is memory bound. But the choice was priced entirely in tok/s until
-now, and the quality column runs the other way and hard -- 27.07 against 49.89.
-For prompt-heavy work, where `PLAN.md` already recommends int8 above a prompt
-3.1x the generated text, that is now better answers AND a faster prompt rather
-than a trade.
+**What it changes, and it is less than it first looked.** The scoreboard, both
+formats, best of 6 at the same prompt lengths, same session:
+
+```
+                 decode tok/s              TTFT ms
+              int4    int8   int8/int4   int4   int8   int8
+  Qwen3      26.30   17.16     65.2%      594    751   +26.4%
+  TinyLLAMA  22.89   12.88     56.3%      869    971   +11.7%
+  Phi3        7.06    3.85     54.5%     2818   3091    +9.7%
+  Gemma4      9.42    5.55     58.9%     2190   2512   +14.7%
+```
+
+⚠⚠ **int8 IS SLOWER ON THE PROMPT TOO, on all four.** This section said the
+opposite for a few hours this morning, on the strength of `PLAN.md`'s "int8 is
+the faster prefill arm". That measurement is real and it is **stale**: it was
+taken when int8 batched and int4 did not, and the 3.3x batched w4a16 prefill
+landed since. int4 caught up and went past. So the crossover rule `PLAN.md`
+still carries -- int8 above a prompt 3.1x the generated text -- has lost the
+term it was built on.
+
+**int8 is a quality option, not a speed one.** It costs about a third of decode
+and about 15% of TTFT, and it buys 49.89 -> 27.07 in perplexity, which is
+llama.cpp's own q4_0 to within 1.6%. int4 stays the default. Ask for int8 when
+the answer matters more than the rate:
 
 ```
 $ CHARSIU_NPU_W4V=0 charsiu run Qwen3-0.6B "summarise this document ..."
@@ -338,6 +355,9 @@ $ CHARSIU_NPU_W4V=0 charsiu run Qwen3-0.6B "summarise this document ..."
 The runner sets `CHARSIU_NPU_W4V=1` as a default, and `env_default` skips any
 variable the caller already set, so this wins and the run reports it under
 `# from the environment, not the config:`.
+
+⚠ Phi-3.5 at eight bits runs, and its peak goes 4299 -> 6025 MB. It fits on
+this board; on a smaller one it would not.
 
 ### The CPU baseline is meant to be honest
 

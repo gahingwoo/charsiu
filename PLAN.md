@@ -1735,9 +1735,37 @@ the work. For a prompt of P tokens and G generated,
   int8 wins  when  P * (1/19.24 - 1/26.60) > G * (1/9.16 - 1/15.46)
              i.e.  P > 3.1 * G
 
+⛔ **THIS RULE IS RETIRED, AND ITS FIRST TERM IS THE REASON.** The prefill pair
+above was measured when int8 batched and int4 DID NOT -- the same section says
+so two paragraphs down, "int8 for the prompt, which batches ... turns n grouped
+submits into 3n the moment the batch is refused, which on int4 is always". The
+batched w4a16 prefill landed on 2026-08-27 at 3.3x, and int4 did not just catch
+up. The scoreboard, 2026-09-08, both formats, best of 6, same session, same
+prompts:
+
+```
+                 decode tok/s                     TTFT ms
+              int4    int8   int8/int4     int4   int8    int8
+  Qwen3      26.30   17.16     65.2%        594    751   +26.4%
+  TinyLLAMA  22.89   12.88     56.3%        869    971   +11.7%
+  Phi3        7.06    3.85     54.5%       2818   3091    +9.7%
+  Gemma4      9.42    5.55     58.9%       2190   2512   +14.7%
+```
+
+**int8 is slower on the prompt on all four**, by 10 to 26%. There is no
+crossover to compute: it is behind on both axes now, so no P and G make it win
+on time. What it wins is quality -- ppl 49.89 -> 27.07, llama.cpp's own q4_0 to
+within 1.6% -- and that is the only reason to reach for it.
+
+⚠ The four numbers in the block above are not wrong and are not deleted. They
+were taken on Llama-3.2-1B before the batched prefill existed, and they are
+what a stale measurement looks like from the inside: correct, reproducible,
+and load-bearing for a rule whose world had moved.
+
 **So int4 stays the default.** Chat is a short prompt and a long answer and int4
-wins it outright; int8 is for prompt-heavy work -- summarising a document,
-retrieval -- where the prompt is several times the answer.
+wins it outright. ⛔ The rest of this paragraph used to send prompt-heavy work
+to int8 on speed grounds and that is retired above: int8 is for work where the
+ANSWER matters more than the rate, whatever the shape of the prompt.
 
 ⚠⚠ **AND THAT RULE WAS PRICED ENTIRELY IN MILLISECONDS.** Four tok/s numbers
 decide which format a user gets, and not one of them says anything about what
@@ -1785,9 +1813,11 @@ the coarser group is not a cost there at all -- 43.66 beats 44.81 -- because a
 row's spread fits in eight bits on its own and the finer scales only add their
 own rounding, which is the exact opposite of what the group is for at four.
 
-So the trade in this section is not speed against nothing. It is
-**prompt-heavy work AND better answers, against decode speed**, and the second
-term was invisible while the only numbers here were tok/s.
+So the trade in this section is not speed against nothing. ⛔ I then wrote that
+it was "prompt-heavy work AND better answers, against decode speed" -- and the
+scoreboard the same morning said int8 is slower on the prompt too, on all four
+models. It is **better answers against BOTH speeds**, and the first half of my
+correction inherited the very assumption the rest of it was retiring.
 
 ⚠ What is still unmeasured: quality through the BATCHED prefill path. Every
 number above is `charsiu_ppl`, which runs one position at a time on purpose --

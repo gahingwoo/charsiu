@@ -5295,3 +5295,42 @@ read-bound on THIS board with THIS accumulator. The note over `tensor_grouped`
 in npudev.c has the register-level argument for why one dispatch cannot carry
 more than one group, and that is the thing to reopen if the surface ceiling
 ever lifts.
+
+### ⛔ Round 143: int8 is slower on the PROMPT too, and my own correction was wrong
+
+The scoreboard, both formats, best of 6, one session, same prompts:
+
+```
+                 decode tok/s                     TTFT ms
+              int4    int8   int8/int4     int4   int8    int8
+  Qwen3      26.30   17.16     65.2%        594    751   +26.4%
+  TinyLLAMA  22.89   12.88     56.3%        869    971   +11.7%
+  Phi3        7.06    3.85     54.5%       2818   3091    +9.7%
+  Gemma4      9.42    5.55     58.9%       2190   2512   +14.7%
+```
+
+The int4 arm is the carried control and it holds: 26.30 / 22.89 / 7.06 / 9.42
+against last night's 26.59 / 22.85 / 7.02 / 9.26, all four still above the
+vendor, all within the board's ~3% drift.
+
+**int8 is behind on both axes.** So `PLAN.md`'s crossover -- int8 above a
+prompt 3.1x the generated text -- has no crossover left to compute. Its prefill
+pair (19.24 int4, 26.60 int8) was measured when int8 batched and int4 did not,
+which the same section says two paragraphs down; the 3.3x batched w4a16 prefill
+landed on 08-27 and int4 went past.
+
+⚠⚠ **AND I WROTE THE WRONG THING TWICE THIS MORNING, THE SECOND TIME WHILE
+CORRECTING THE FIRST.** The README got "better answers AND a faster prompt
+rather than a trade", and PLAN.md got "prompt-heavy work AND better answers,
+against decode speed" -- both of them repeating `PLAN.md`'s prefill claim as an
+input while the whole point of the edit was that its quality claims had never
+been checked. **I audited one column of that section and inherited the other.**
+A stale measurement is load-bearing until something weighs it, and being in the
+middle of fixing a document is not the same as having weighed it.
+
+What survives is the part that was measured today: int8 buys 49.89 -> 27.07,
+llama.cpp's own q4_0 to within 1.6%, for about a third of decode and about 15%
+of TTFT. A quality option, not a speed one.
+
+⚠ Phi-3.5 at eight bits fits: peak 4299 -> 6025 MB. On a smaller board it
+would not.
