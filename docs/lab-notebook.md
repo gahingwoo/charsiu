@@ -5755,3 +5755,50 @@ error is spread roughly with the bytes, and no single tensor class carries it.
 ⚠ So the interesting difference, if there is one, is the layers -- and those
 are int4 on both sides. Which leaves the group size, and the file does not say
 what it is.
+
+### 🏁 Round 151: the 71 us floor, fully attributed, and decode's remaining room
+
+`npu_prep_cost` times prep and fini on a buffer that was never submitted, so
+there is no fence in the number:
+
+```
+     bytes   prep us   fini us    GB/s
+      4096      1.16      1.00     3.5
+      8192      1.46      1.33     5.6
+     32768      3.26      3.12    10.1
+     65536      5.60      5.46    11.7
+    262144     19.72     19.55    13.3
+   1048576     76.47     76.06    13.7
+   4194304    302.04    301.39    13.9
+```
+
+**A syscall with no work costs 0.87 us and the cache walk runs at 13.9 GB/s.**
+Both halves of a call's maintenance follow: two output preps at charsiu's 32 KB
+out_stride are 6.5 us, two input finis at ~8 KB are 2.7, so **9.2 us**.
+
+With round 149's spin sweep and round 150's counters, the 71 us fixed term is
+now accounted for end to end:
+
+```
+  the device starting a job    ~46 us   65%    not ours
+  the blocking wakeup           ~11 us   15%    CHARSIU_NPU_SPIN_US removes it
+  cache maintenance             9.2 us   13%    out_stride is 32 KB for a 4 KB result
+  ioctl syscalls                 ~5 us    7%
+```
+
+⚠⚠ **So decode's remaining room is about 6% of a token, not the 22% the first
+fit implied.** 26% of a token is the per-call floor, and 65% of that floor is
+the device starting a job -- which no amount of userspace work removes.
+
+The two pieces that are ours were both confirmed the same round.
+`CHARSIU_NPU_NMAX=2048` drops out_stride from 32 KB to 8 and moves the hardware
+path 1709 -> 1663 ms, **2.7%**, which is the right size for 2 x (3.26 - 1.46)
+us a call. ⚠ NMAX is the wrong lever for it though: it also re-slices every
+tensor wider than 2048, and qwen3's 151936-wide head would take 75 slices
+instead of 19. The right change is `out_stride` per entry -- `min(nmax, t->n)`
+-- which buys the same cache and re-slices nothing. Priced, not yet written.
+
+🔑 **This is where the decode line stops being worth pushing.** Three rounds
+took a "22% of a token is overhead" reading down to 6%, and the honest summary
+is that charsiu's decode is within about 6% of what this hardware's dispatch
+allows, at 105 to 116% of the vendor.
