@@ -4488,3 +4488,47 @@ TTFT ratio of the four -- but one win, one catastrophe caused by a bug now
 fixed, one small loss and one no-op is not a default. Round 422 re-runs the
 three that move, with the cap fix installed and a prompt that splits, and that
 decides whether this is a default or stays an explicit switch.
+
+## 2026-09-07 late: KFIT does not ship, and the reason is the chunk and not the slice
+
+Round 422, the cap fix installed, a 109 token prompt so the clamp engages --
+which is the scoreboard's regime and not the 93 that flattered round 421:
+
+```
+  model    widths off -> KFIT       prompt off -> KFIT   decode
+  gemma4   1x108   -> 1x80+1x28     1836 -> 1815 ms      9.56 -> 9.68
+  tinyl    1x116   -> 1x80+1x36      822 ->  897         (EOS, no decode)
+  gemma3   1x80+1x28 already two chunks off
+```
+
+**-8.0% became -1.1%.** KFIT takes gemma4's widest slice from 1024 to 1536, so
+its cap falls 160 -> 106, and a 108 row prompt no longer fits in one chunk. The
+second chunk reads all 1273 MB of weights again, which is most of what the 35%
+smaller read back had just saved.
+
+TinyLLAMA is the same mechanism with none of the compensation: it ran `1x116`
+in one chunk, KFIT put its cap at 106, and it lost 9.1%.
+
+**So it is the chunk COUNT that decides, not the slice count.** The read back
+is the biggest single stream in a prefill and KFIT genuinely cuts it by 35% --
+and a single extra pass over the weights outweighs that. KFIT stays an
+explicit switch.
+
+⚠ Round 421 said -8.0% on a 93 token prompt and I wrote "93 passing says
+nothing about 111" into the round that followed. It did not.
+
+### ⚠ And auto_kmax has a cost nobody had priced
+
+`llama_auto_kmax` widens gemma-3-1b to KMAX 2048 because that halves its
+slices, 532 -> 292. It also doubles its widest slice, 1024 -> 2048, which
+halves its chunk cap, 160 -> 80 -- and at 109 rows that is the difference
+between one chunk and two.
+
+```
+  gemma3   KMAX 1024   532 slices   cap 160   one chunk
+  gemma3   KMAX 2048   292 slices   cap  80   two chunks   <- what it runs
+```
+
+The function optimises the read back and does not know the chunk exists. Which
+of the two is faster has never been measured, on any model. It is the same
+trade KFIT just lost, run in the opposite direction.
