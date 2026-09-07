@@ -1032,6 +1032,9 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
  */
 int llama_prefill_chunk_cap(const struct llama_model *m);
 
+/* `=0` and `=` are OFF, unset is `dflt`; see the note in gguf.c */
+int charsiu_env_flag(const char *name, int dflt);
+
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);
 

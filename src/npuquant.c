@@ -218,7 +218,7 @@ static int midrise_grid(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_NPU_W4_MIDRISE") != NULL;
+		v = charsiu_env_flag("CHARSIU_NPU_W4_MIDRISE", 0);
 	return v;
 }
 
@@ -710,9 +710,9 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * hardware or layout problem for two rounds. It was 1.24 billion
 	 * getenv calls.
 	 */
-	const int w4sym = getenv("CHARSIU_NPU_W4_SYM") != NULL;
-	const int w4clip = getenv("CHARSIU_NPU_W4_CLIP") != NULL;
-	const int rms = getenv("CHARSIU_NPU_RMS") != NULL;
+	const int w4sym = charsiu_env_flag("CHARSIU_NPU_W4_SYM", 0);
+	const int w4clip = charsiu_env_flag("CHARSIU_NPU_W4_CLIP", 0);
+	const int rms = charsiu_env_flag("CHARSIU_NPU_RMS", 0);
 	const int midrise = midrise_grid();
 	uint64_t ngrp;
 	float qmax = bits == 4 ? 7.0f : 127.0f;

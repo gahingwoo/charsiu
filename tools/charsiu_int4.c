@@ -1150,7 +1150,7 @@ int main(int argc, char **argv)
 		static const unsigned perm[16] = {
 			9, 2, 14, 5, 11, 0, 7, 13, 3, 15, 6, 8, 1, 12, 4, 10
 		};
-		int permute = getenv("CHARSIU_INT4_PERM") != NULL;
+		int permute = charsiu_env_flag("CHARSIU_INT4_PERM", 0);
 		float *af = malloc((size_t)m * k * sizeof(*af));
 		unsigned c, j, seen16[65536] = { 0 }, distinct = 0;
 		uint8_t *o;

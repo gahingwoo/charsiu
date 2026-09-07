@@ -172,7 +172,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	 * nothing 89% of the time" is about fp16 or about submitting 128 jobs
 	 * in one process with five BOs allocated and freed each time.
 	 */
-	int i8 = getenv("CHARSIU_TEST_INT8") != NULL;
+	int i8 = charsiu_env_flag("CHARSIU_TEST_INT8", 0);
 
 	job.mm.wdtype = i8 ? CHARSIU_INT8 : CHARSIU_FP16;
 	job.mm.adtype = i8 ? CHARSIU_INT8 : CHARSIU_FP16;

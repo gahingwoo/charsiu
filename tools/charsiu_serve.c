@@ -397,7 +397,7 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 	static int noreuse = -1;
 
 	if (noreuse < 0)
-		noreuse = getenv("CHARSIU_NO_KV_REUSE") != NULL;
+		noreuse = charsiu_env_flag("CHARSIU_NO_KV_REUSE", 0);
 	while (!noreuse && keep < CACHED_N && keep < n_ids - 1 &&
 	       CACHED[keep] == ids[keep])
 		keep++;

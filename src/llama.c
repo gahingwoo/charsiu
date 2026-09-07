@@ -48,7 +48,7 @@ static int cpu_plain(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_CPU_PLAIN") != NULL;
+		v = charsiu_env_flag("CHARSIU_CPU_PLAIN", 0);
 	return v;
 }
 
@@ -67,7 +67,7 @@ static int attn_npu_check(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_ATTN_NPU_CHECK") != NULL;
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_CHECK", 0);
 	return v;
 }
 
@@ -76,7 +76,7 @@ static int kv_posmajor(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_KV_POSMAJOR") != NULL;
+		v = charsiu_env_flag("CHARSIU_KV_POSMAJOR", 0);
 	return v;
 }
 
@@ -85,7 +85,7 @@ static int attn_perhead(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_ATTN_PERHEAD") != NULL;
+		v = charsiu_env_flag("CHARSIU_ATTN_PERHEAD", 0);
 	return v;
 }
 
@@ -150,7 +150,7 @@ static int attn_pool(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_ATTN_POOL") != NULL && !cpu_plain();
+		v = charsiu_env_flag("CHARSIU_ATTN_POOL", 0) && !cpu_plain();
 	return v;
 }
 
@@ -759,7 +759,7 @@ static int dbg_layers(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_DBG_LAYERS") != NULL;
+		v = charsiu_env_flag("CHARSIU_DBG_LAYERS", 0);
 	return v;
 }
 
@@ -2145,7 +2145,7 @@ static int group_off(void)
 	static int m = -1;
 
 	if (m < 0)
-		m = getenv("CHARSIU_NPU_NOGROUP") != NULL;
+		m = charsiu_env_flag("CHARSIU_NPU_NOGROUP", 0);
 	return m;
 }
 
@@ -5638,7 +5638,7 @@ static int prefill_grouped(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_PREFILL_GROUPED") != NULL;
+		v = charsiu_env_flag("CHARSIU_PREFILL_GROUPED", 0);
 	return v;
 }
 
@@ -6180,7 +6180,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	 * it is read here too rather than only in llama_forward.
 	 */
 	if (stage_on < 0)
-		stage_on = getenv("CHARSIU_STAGES") != NULL;
+		stage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	/*
 	 * ⚠⚠ STAGING IS NOT A STAGE. The first chunk's projections upload every
 	 * tensor to the hardware on first use, inside npu_id_for, and the first
@@ -6747,7 +6747,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		return NULL;
 
 	if (stage_on < 0)
-		stage_on = getenv("CHARSIU_STAGES") != NULL;
+		stage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	/*
 	 * ⚠ THE STAGE IS ALSO THE BREADCRUMB. A crash anywhere in the forward
 	 * pass used to arrive as "Segmentation fault" with nothing else, and
@@ -7306,7 +7306,7 @@ int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 	sp->hist = malloc((size_t)n_ctx * sizeof(*sp->hist));
 	/* k drafts, row 0, and one row of padding to keep the width even */
 	sp->logits_all = malloc((size_t)(k + 2) * m->n_vocab * sizeof(float));
-	sp->junk = getenv("CHARSIU_SPEC_JUNK") != NULL;
+	sp->junk = charsiu_env_flag("CHARSIU_SPEC_JUNK", 0);
 	if (!sp->hist || !sp->logits_all) {
 		llama_spec_free(sp);
 		return -1;
