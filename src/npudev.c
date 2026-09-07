@@ -4634,6 +4634,121 @@ static void pack_groups_worker(void *ctx, uint64_t g0, uint64_t ng)
 				      (unsigned)g0, (unsigned)ng);
 }
 
+/*
+ * ⚠⚠ int8's BATCHED ACTIVATION QUANTISER, AND WHY IT GOT ITS OWN FUNCTION.
+ *
+ * Round 146 read the prefill table with `scale` named for the first time and
+ * the answer was somewhere else entirely: qwen3, 90 rows, ms a row --
+ *
+ *   int4   pack 0.86  submit 0.08  fence 1.29  read 1.30  scale 0.19
+ *   int8   pack 2.66  submit 0.09  fence 0.93  read 0.97  scale 0.25
+ *
+ * int8's fence and read are BOTH SMALLER -- its hardware path really is
+ * faster, which is what PLAN.md has claimed since March -- and pack alone,
+ * 3.1x wider, eats the whole advantage and 1.08 ms a row more. The tail scale
+ * everybody suspected is 0.06 of it.
+ *
+ * The cause is not subtle once the two are side by side: int4 packs through
+ * pack_f16_pooled, which is pooled across groups, and int8 ran two scalar
+ * passes over the slice, one thread, no NEON. Both passes are trivially
+ * vectorisable and the rows are independent -- each has its own d1 -- so this
+ * is the same shape as tail_scale_rows one screen down.
+ *
+ * ⚠ BIT IDENTICAL, and the reason is worth stating rather than assuming.
+ * vcvtnq_s32_f32 is round-to-nearest-even, which is lrintf's behaviour under
+ * the default rounding mode, and the MULTIPLY by id1 is kept exactly where it
+ * was: the note above this block records a board round lost to `x * (1/d)`
+ * and `x / d` disagreeing on near-zero channels, and this must not reopen it.
+ * The max is a max -- reassociating it cannot change the answer.
+ *
+ * CHARSIU_NPU_QPACK_PLAIN=1 is the loop exactly as it was, so one binary runs
+ * both arms in one session. The board drifts 3% between sessions.
+ */
+struct qpack_job {
+	const float *src;
+	uint8_t *dst;
+	float *d1out;
+	unsigned sk;
+};
+
+static int qpack_plain(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_QPACK_PLAIN", 0);
+	return v;
+}
+
+static void qpack_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct qpack_job *j = ctx;
+	unsigned sk = j->sk;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const float *row = j->src + (size_t)r * sk;
+		uint8_t *out = j->dst + (size_t)r * sk;
+		float mx = 0.0f, d1, id1;
+		unsigned kk = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+		{
+			float32x4_t m4 = vdupq_n_f32(0.0f);
+
+			for (; kk + 4 <= sk; kk += 4)
+				m4 = vmaxq_f32(m4, vabsq_f32(vld1q_f32(row + kk)));
+			mx = vmaxvq_f32(m4);
+		}
+#endif
+		for (; kk < sk; kk++) {
+			float v = fabsf(row[kk]);
+
+			if (v > mx)
+				mx = v;
+		}
+		d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+		id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
+		j->d1out[r] = d1;
+
+		kk = 0;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+		{
+			const float32x4_t s4 = vdupq_n_f32(id1);
+			const int32x4_t hi = vdupq_n_s32(127);
+			const int32x4_t lo = vdupq_n_s32(-127);
+
+			for (; kk + 16 <= sk; kk += 16) {
+				int32x4_t a = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk), s4));
+				int32x4_t b = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk + 4), s4));
+				int32x4_t c = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk + 8), s4));
+				int32x4_t e = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk + 12), s4));
+				int16x8_t p, q;
+
+				a = vmaxq_s32(vminq_s32(a, hi), lo);
+				b = vmaxq_s32(vminq_s32(b, hi), lo);
+				c = vmaxq_s32(vminq_s32(c, hi), lo);
+				e = vmaxq_s32(vminq_s32(e, hi), lo);
+				p = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
+				q = vcombine_s16(vmovn_s32(c), vmovn_s32(e));
+				/* +128 is an XOR of the sign bit on the byte */
+				vst1q_u8(out + kk,
+					 veorq_u8(vreinterpretq_u8_s8(
+							  vcombine_s8(vmovn_s16(p),
+								      vmovn_s16(q))),
+						  vdupq_n_u8(0x80)));
+			}
+		}
+#endif
+		for (; kk < sk; kk++) {
+			int q = (int)lrintf(row[kk] * id1);
+
+			if (q > 127) q = 127;
+			if (q < -127) q = -127;
+			out[kk] = (uint8_t)(q + 128);
+		}
+	}
+}
+
 static void pack_f16_pooled(struct charsiu_npu *g,
 			    const struct charsiu_matmul *mm,
 			    const float *src, size_t stride,
@@ -5393,25 +5508,42 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				 * match the row loop to 0.1% -- and should not
 				 * be asked to.
 				 */
-				for (unsigned r = 0; r < m; r++) {
-					float mx = 0.0f, d1, id1;
+				if (qpack_plain()) {
+					for (unsigned r = 0; r < m; r++) {
+						float mx = 0.0f, d1, id1;
 
-					for (unsigned kk = 0; kk < sk; kk++) {
-						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
+						for (unsigned kk = 0; kk < sk; kk++) {
+							float v = fabsf(g->bscr[(size_t)r * sk + kk]);
 
-						if (v > mx)
-							mx = v;
+							if (v > mx)
+								mx = v;
+						}
+						d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+						id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
+						g->bd1[(size_t)ki * m + r] = d1;
+						for (unsigned kk = 0; kk < sk; kk++) {
+							int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
+
+							if (q > 127) q = 127;
+							if (q < -127) q = -127;
+							g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
+						}
 					}
-					d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
-					id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
-					g->bd1[(size_t)ki * m + r] = d1;
-					for (unsigned kk = 0; kk < sk; kk++) {
-						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
+				} else {
+					struct qpack_job qj = {
+						g->bscr, g->bq,
+						g->bd1 + (size_t)ki * m, sk
+					};
 
-						if (q > 127) q = 127;
-						if (q < -127) q = -127;
-						g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
-					}
+					/* the rows are independent -- each has
+					 * its own d1 -- so the pool needs no
+					 * grain and the order cannot change */
+					if (g->packpool == 1 ||
+					    (g->packpool == 2 && m > 1))
+						charsiu_parallel_for(qpack_rows,
+								     &qj, m);
+					else
+						qpack_rows(&qj, 0, m);
 				}
 				charsiu_pack_input(&mm, g->bq,
 						   (uint8_t *)g->bin[d][bin_idx(g, ki)].map
