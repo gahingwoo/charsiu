@@ -5833,3 +5833,59 @@ different cores."*
 
 Round 152. If B beats D, the second core has been starting late for the life of
 this runtime, and 46 us was never the device's.
+
+### ⚠⚠ And the tree already had a three-term model that my fit erased
+
+npudev.c, from a round that fitted TinyLLAMA's five decode stages against the
+geometry this file cuts:
+
+```
+     q k v     1.311 MB  3 tasks   measured  392.7   fit  383.5
+     o         1.049     1         measured  276.4   fit  280.9
+     gate+up   5.767     2         measured  845.0   fit  836.9
+     down      3.146     3         measured  573.6   fit  585.4
+     head     16.777     4         measured 2100.0   fit 2122.1
+
+   us a call = 128.7 + 36.8 * tasks + 110.0 * MB   (busier core)
+```
+
+Inside 2.4% at all five, and it agrees with a 2026-08-15 sweep of synthetic
+matmuls at 32 chained tasks that never saw this model: 26.3 us a task, 172 a
+submit, 84.3 a megabyte. Same three terms, same order, different shapes,
+different day.
+
+**My fit today has no task term.** Two points, then five, then `a = 71 us +
+63.4 us a MB` -- and it predicted the output head to 3% from the small tensors,
+which is why I trusted it. But task count and megabytes are collinear across
+those five classes, so a two-term fit puts the task cost inside the MB slope
+and reports a floor that is only the part left over. That is how 46 us appeared
+and then got a name.
+
+If a task really costs tens of microseconds, decode's budget is a different
+shape. qwen3 presents **271 tasks a token** across 113 calls:
+
+```
+  task marginal   36.8 us  ->  9.97 ms  =  32% of a 30.7 ms token
+                  26.3 us  ->  7.13 ms  =  23%
+                  10.0 us  ->  2.71 ms  =   9%
+```
+
+🔑 **AND THE TASK COUNT HAS A LEVER THAT int4 DOES NOT HAVE.** Tasks are K
+slices, and `ceil(K / KMAX)` is the count. int4 cannot raise KMAX -- the K
+slice IS the quantisation group, and `tensor_grouped()` requires
+`kgroup == kmax`. **int8's group is the whole row, so it is free of that
+coupling entirely**:
+
+```
+  KMAX 1024   down takes 3 slices   271 tasks a token
+  KMAX 2048                 2       243        -28
+  KMAX 4096                 1       215        -56
+```
+
+⚠ This may be why int8's fence was already smaller in round 146 (0.93 against
+int4's 1.29 ms a row) while its pack was worse -- fewer tasks for the same
+bytes. Nobody has swept KMAX on int8, because until this morning int8 was
+believed to emit noise.
+
+Round 152's task sweep -- 1 to 16 chained in one job, on a matmul with no
+arithmetic in it -- prices the term directly instead of fitting it.
