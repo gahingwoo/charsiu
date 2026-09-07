@@ -1597,7 +1597,17 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e = getenv("CHARSIU_NPU_POOL_READ");
 
 		g->poolread = !e || !*e ? 2 : *e == '0' ? 0 : 1;   /* 2 = by size */
-		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 32768);
+		/*
+		 * ⚠ 32768 WAS THE ANSWER AT EIGHT THREADS, NOT THE RULE.
+		 * charsiu_pool_min derives it from the barrier, the rate and
+		 * the threads actually running; 573.44 elements a microsecond
+		 * is what 32768 implies at eight and a 50 us barrier, so this
+		 * is bit-identical there and tracks the pool elsewhere. The
+		 * long note is in gguf.c.
+		 */
+		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN",
+					(unsigned)charsiu_pool_min(573.44,
+							charsiu_threads()));
 	}
 	/*
 	 * The packer on the pool, by group count. 2 = by size, 1 = always,
@@ -1608,7 +1618,11 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e = getenv("CHARSIU_NPU_PACK_POOL");
 
 		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
-		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 64);
+		/* 64 groups at eight threads implies 1.12 groups a
+		 * microsecond; derived so it tracks the pool. See gguf.c. */
+		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN",
+					(unsigned)charsiu_pool_min(1.12,
+							charsiu_threads()));
 	}
 	/* one pass over Y for every K slice a device holds. OFF until the
 	 * board prices it: it trades sequential Y round trips for several
