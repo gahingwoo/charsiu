@@ -788,6 +788,35 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
 
+	/*
+	 * ⚠⚠ AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
+	 *
+	 * The factor only cancels because the weights are divided by it and the
+	 * activation is multiplied by it. charsiu_npu_matvec does that multiply
+	 * on the w4a16 path, where the activation is a float it can scale
+	 * before packing. The int8 path packs a->q1, one absmax quantisation of
+	 * the whole vector, and there is nowhere in it for a per column factor
+	 * -- so the divide happens, the multiply does not, and the factor does
+	 * not cancel. Board, qwen3, 600 tokens: int8 27.07, int8 with AWQ
+	 * 2162.73. Wrong numbers, not an error.
+	 *
+	 * Refusing loses nothing measurable. AWQ exists to protect a small
+	 * dynamic range and eight bits does not have that problem: on the host
+	 * CPU reference, which DOES apply the multiply at eight bits, AWQ makes
+	 * int8 slightly worse -- 43.66 off against 44.76 on. So the method is
+	 * declined for anything but four bits and says so once.
+	 */
+	if (alpha != 0.0 && bits != 4) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CHARSIU_NPU_AWQ is a four bit "
+				"method and these weights are %u bit -- "
+				"ignoring it. It measured worse at eight bits "
+				"even where it is applied correctly.\n", bits);
+		alpha = 0.0;
+	}
+
 	memset(t, 0, sizeof(*t));
 	snprintf(t->name, sizeof(t->name), "%s", w->name);
 	t->n = n;
