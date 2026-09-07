@@ -5889,3 +5889,62 @@ believed to emit noise.
 
 Round 152's task sweep -- 1 to 16 chained in one job, on a matmul with no
 arithmetic in it -- prices the term directly instead of fitting it.
+
+### 🏁 Round 152: the 46 us measured, and both of my levers are dead
+
+```
+  one job, tasks chained inside it
+     tasks   us a job    us a task
+         1      21.66        21.66
+         2      25.93        12.96
+         4      35.83         8.96
+         8      55.33         6.92
+        16     216.16        13.51
+
+  two jobs, four ways
+    A  one job, one ioctl                72.59 us
+    B  two jobs, ONE ioctl, one fd      131.12 us     ~ 2 x A
+    C  two jobs, two ioctls, one fd     131.93 us     ~ B
+    D  two jobs, two ioctls, two fds     57.84 us     <- what charsiu does
+```
+
+**B and C are both about twice A, and D is the fastest of the four.** Two jobs
+submitted through one fd RUN SERIALLY, whether they arrive in one ioctl or two.
+Two fds run in parallel. So the `for (d) submit(dev[d])` loop that looked like
+a missed opportunity is the only arrangement of the four that uses both cores,
+and the comment about the scheduler handing jobs to different cores does not
+mean it will do so within one fd.
+
+⛔ **The fd merge is dead, and it is dead by measurement rather than by
+argument.** So is the reasoning that led to it: charsiu's second core is not
+starting a syscall late, because the alternative starts it on the same core.
+
+**And the task term is not 36.8 us.** Fitting 1 to 8 tasks:
+
+```
+  a job costs 16.85 us + 4.81 us a task
+```
+
+Eight times smaller than the three-term model in npudev.c, which got 36.8 from
+five decode stages on TinyLLAMA. Both cannot be right about the same hardware.
+What the stage fit actually has is five points where tasks and megabytes move
+together, so its task coefficient is carrying weight-fetch time that this probe
+-- where the matmul is 64x32 and the arithmetic is nothing -- does not have.
+
+⚠⚠ So my own correction was half wrong too. I said the two-term fit erased a
+task term worth up to 32% of a token. At 4.81 us it is **271 x 4.81 = 1.30 ms,
+4.2%**, and int8's freedom to raise KMAX is worth about a percent, not ten.
+
+🔑 **What the residual actually was.** D -- two jobs on two fds, submitted and
+waited on, which is exactly what one decode call does -- is 57.84 us against
+the 71 us fixed term fitted from the stage table. The 13 us of difference is
+the pack, the fini and the slice sum. **The floor is the dispatch, it is about
+58 us of it, and it is now a measurement rather than a subtraction.** The
+answer did not change. What changed is that it is now evidence.
+
+⚠ **And the probe found something nobody was looking for.** Sixteen tasks in
+one job costs 216 us where the line through 1 to 8 predicts 94 -- 130% over,
+after four points that sit on it to within a microsecond. Something has a
+ceiling between 8 and 16 chained tasks. charsiu's largest decode chain is 4
+(the head at NMAX 8192), so nothing hits it today, and the batched prefill
+chains more. Unexplained, reproducible, and written down.
