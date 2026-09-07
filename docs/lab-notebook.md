@@ -4662,3 +4662,77 @@ They were all trying to make something faster that was already at rate.
 `m * n * ceil(K / KMAX)`. Which is the quantiser group, and it is the user's
 call. That conclusion has not changed, but it now rests on every stage being
 measured at rate rather than on a list of failed attempts.
+
+## 2026-09-07 late: six weeks of comparing charsiu against itself
+
+`charsiu_ppl` exists now, and the first thing it did was ask a question this
+project has never asked: **are the answers as good as the file's own q4_0?**
+
+Every correctness check here has been an INTERNAL one -- "tokens identical to
+the token loop", "text unchanged", eight models byte for byte, `board_text_all`
+across nine architectures. They all compare charsiu to charsiu. None of them
+compares it to llama.cpp.
+
+```
+                              ppl, same 200 tokens, same tool
+  host   gguf q4_0 + fp32     Qwen3  43.85     gemma4  54.43
+  board  charsiu int4 w4a16   Qwen3  75.17     gemma4  82.26
+                                    +71%              +51%
+```
+
+### ⛔⛔ And the int8 path is not slower. It is broken.
+
+```
+  qwen3   w8a8  272369.9386        gemma4  w8a8  218167.8116
+```
+
+PLAN.md and this notebook both carry *"for PREFILL, which is MAC-bound, int8
+weights are the faster arm and int4 is the DRAM-bound choice that belongs to
+decode"*, and the round that produced it measured **milliseconds**. It was
+turned down for being 25 to 30% slower on the whole prompt -- which is the only
+reason nobody shipped a configuration that emits noise.
+
+⚠ "int8 weights" is a misleading name for the arm. The ACTIVATION is quantised
+to int8 as well; the int4 path keeps fp16 activations. What collapses is the
+activation, not the weight.
+
+### ⚠⚠ How it was found: `CHARSIU_NPU=0` opened the NPU
+
+The round wanted a CPU control. `if (getenv("CHARSIU_NPU"))` is an existence
+test, so the one spelling anybody would reach for to disable the device
+enabled it, with W4V unset -- which is w8a8.
+
+**Two arms came back bit-for-bit identical, 272369.9386 twice, and that is the
+only reason it was caught.** The arm labelled "CPU, gguf weights" was the arm
+labelled "NPU int8 weights".
+
+Tonight's `charsiu_env_flag` sweep converted the twenty `!= NULL` switches and
+missed this shape entirely. There are 51 implicit existence tests in the tree;
+the three on `CHARSIU_NPU` itself are fixed, because that is the switch every
+board round and every installer sets.
+
+### 🔑 And ppl is the one quantity here that survives a session boundary
+
+Rounds 427 and 428 ran the four int4 arms on different boots, with other models
+and a reinstall in between, and every figure repeated **to the last digit**:
+75.1684, 106.6864, 82.2555, 76.2290. It is a greedy forward with no sampling
+and no timing in it. Where "never A/B across sessions" is the rule here, this
+is the exception -- and that is worth having, because a quality regression can
+now be caught weeks after it lands.
+
+### The two int4 groups disagree between models, and not in the flattering way
+
+```
+              group 1024   one scale a row
+  qwen3          75.17        106.69      +42%   much worse
+  gemma4         82.26         76.23       -7%   better
+```
+
+⚠ qwen3's two coarse arms are identical because neither of its K values is a
+multiple of 2048, so `group 2048` already IS one scale a row for it -- the
+tensor_grouped test needs `k % kgroup == 0`. That is a check on the harness,
+not a result.
+
+Offline Frobenius error said grouped is better on every tensor. Perplexity
+says the opposite on gemma4. npudev.c's own caption -- "weight error is not
+the objective" -- is now measured rather than asserted.
