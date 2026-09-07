@@ -5525,3 +5525,80 @@ arm that disables CPU_SLEEP outright."* Phase 21 priced the QoS hold and never
 came back. Polling with `timeout_ns = 1` before falling back to the blocking
 wait removes the wakeup and leaves the invalidate and the hardware, so the
 sweep attributes the fence rather than arguing about it. Round 149.
+
+## 2026-09-08 — the `=0` audit, because two catches are not two bugs
+
+`CHARSIU_NPU=0` opened the NPU and `CHARSIU_NPU_ONEDEV=0` closed the second
+core. Both were found by accident, one night apart, and both were written up
+as incidents. They are not incidents. They are one **shape**, and the only
+honest question is how much of this notebook was measured through it.
+
+**This is instrument contamination, not a code bug.** It does not crash, does
+not warn, and produces a result that reads exactly like a real one. It belongs
+with the four rounds of npu_slice_test and the withdrawn map that stood for
+thirteen days: the probe was wrong and nothing said so.
+
+### The window
+
+```
+  CHARSIU_NPU, CHARSIU_NPU_VERBOSE, CHARSIU_NPU_A16   introduced 08-22
+  CHARSIU_NPU_ONEDEV                                             08-23
+  CHARSIU_SPM_DEBUG                                              08-26
+  CHARSIU_NO_BATCH_PREFILL, CHARSIU_BATCH_SWEEP                  08-27
+  CHARSIU_NO_WCACHE                                              08-28
+  CHARSIU_NPU_W4_ANYM, CHARSIU_BATCH_FORCE                       08-30
+```
+
+Forty-six switches read as existence tests until 2026-09-07 20:02 (34 of them),
+2026-09-08 08:06 (8) and 09:43 (ONEDEV). The exposure runs from 08-22, so
+**seventeen days**.
+
+### What was actually run through it
+
+Every `XXX=0` in the surviving round scripts, checked against the commit that
+gave that switch a value rule:
+
+```
+  switch                    used =0 in      switch became a value rule   verdict
+  CHARSIU_ATTN_POOL         m116 09-07 19:22    09-07 20:02   ⛔ CONTAMINATED
+  CHARSIU_NPU_KFIT          m121 20:16, m122 20:29  09-07 20:02   ok, after
+  CHARSIU_NPU_NOGROUP       m148 09-08 09:32    09-07 20:02       ok, after
+  CHARSIU_NPU_ONEDEV        m150 09-08 09:46    09-08 09:43       ok, by 3 min
+  CHARSIU_NPU_POOL_READ     m7 09-06, m87 09-07  09-05 11:11      ok, after
+  CHARSIU_ROW_POOL          m2 m3 m13 m14 m15 m100  value from birth 09-06 07:28
+  CHARSIU_NPU_PACK_POOL     m16 09-06           value from birth   ok
+  CHARSIU_NPU_PAIR          m96 09-07 10:57     value from birth   ok
+  CHARSIU_ROPE_INPLACE      m99 09-07 17:06     value from birth   ok
+```
+
+### ⛔ Round 116 is downgraded to UNVERIFIED
+
+m116 ran four arms looking for a text nondeterminism. Its third,
+`gemma4 + no attn pool`, set `CHARSIU_ATTN_POOL=0` **forty minutes before that
+switch stopped being an existence test**. It did not turn the pool off. It
+turned it on, which is where it already was.
+
+So that arm is the same arm as the one above it, and "the pool is not the
+cause" was never tested by that round. **The conclusion happens to have
+survived** -- the nondeterminism turned out to be `CHARSIU_STAGES` writing
+milliseconds onto stdout, which the next round found -- but it survived for a
+reason m116 did not supply. A right answer reached through a dead knob is not
+evidence, and if the pool HAD been the cause this round would have said it was
+not.
+
+### ⚠⚠ And two weeks cannot be audited at all
+
+The oldest round script that still exists is 09-04 22:36. The switches go back
+to 08-22. **Every round between 08-22 and 09-04 is outside this audit** -- not
+cleared, not condemned, unexaminable. Anything from that window that rests on
+a `=0` control arm should be re-run before it is leaned on. The scripts are
+gone; the status files are not, so a specific claim can still be checked by
+hand if someone needs it.
+
+### What stops it happening again
+
+`charsiu_env_flag` is now the only way a boolean switch is read in src/. The
+remaining `getenv()` calls there take a value (`atoi`, `atol`, `atof`), a name
+(a file, a substring, a CPU list) or a `strcmp` -- checked one by one, not by
+pattern. ⚠ tools/ still has thirty-odd, and they are probes: a probe that
+inverts its own arm is exactly the failure this section is about.
