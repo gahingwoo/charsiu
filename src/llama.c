@@ -3991,6 +3991,16 @@ struct attn_job {
 	 * layer 4 read where layer 0 wrote.
 	 */
 	uint32_t hd, hdmax, kvdim, gqa, nkv;
+	/*
+	 * ⚠ THE QUERY, EXPLICIT. attn_heads read s->q, which made the caller's
+	 * job to have put this row's roped q there -- a per row scratch buffer
+	 * the batched loop only filled by copying a row of s->bq into it and
+	 * copying it back afterwards. With the rope done in place that copy is
+	 * gone, and the query has to arrive as what it is: a pointer.
+	 *
+	 * Decode passes s->q and is unchanged.
+	 */
+	const float *q;
 	float scale;
 };
 
@@ -4070,7 +4080,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 			const float *kt = kbase + (size_t)t * kstride;
 
 			for (q = 0; q < n; q++) {
-				const float *qh = s->q + (g0 + q) * hd;
+				const float *qh = j->q + (g0 + q) * hd;
 
 				s->att[(size_t)(g0 + q) * s->n_ctx + t] =
 					attn_dot(qh, kt, hd) * j->scale;
@@ -5035,6 +5045,18 @@ static void res2_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+static int rope_inplace(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROPE_INPLACE");
+
+		v = !(e && *e == '0');
+	}
+	return v;
+}
+
 static int rope_tab_cache(void)
 {
 	static int v = -1;
@@ -5924,22 +5946,50 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					   swatab ? NULL : freqf);
 				s->bcstab_have[(size_t)tv * (size_t)n + r] = 1;
 			}
-			memcpy(s->q, s->bq + (size_t)r * m->n_head * hd,
-			       (size_t)m->n_head * hd * sizeof(float));
-			/* ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, so
-			 * every line below that touches k or v is asked the
-			 * same question. The token loop leaves s->k and s->v
-			 * from the previous layer and never reads them; this
-			 * leaves them untouched for the same reason. */
-			if (L->wk) {
-				memcpy(s->k, s->bk + (size_t)r * m->n_head_kv
-				       * hd,
-				       (size_t)m->n_head_kv * hd *
-				       sizeof(float));
-				memcpy(s->v, s->bv + (size_t)r * m->n_head_kv
-				       * hd,
-				       (size_t)m->n_head_kv * hd *
-				       sizeof(float));
+			/*
+			 * ⚠⚠ IN PLACE, NOT THROUGH THE PER ROW SCRATCH.
+			 *
+			 * This copied q, k and v out of the batched buffers
+			 * into s->q, s->k and s->v, transformed them there,
+			 * and copied q back -- purely so the token loop's own
+			 * helpers could be reused unchanged. The batched
+			 * buffers already hold one contiguous row each, so
+			 * every one of those copies was moving data to where
+			 * it already was.
+			 *
+			 * On Qwen3 that is 8 kB of q in, 8 kB back, and 4 kB
+			 * each of k and v, per row PER LAYER: 672 kB a row over
+			 * 28 layers, 74 MB across a 110 token prompt.
+			 *
+			 * ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, and the
+			 * property that mattered survives: the token loop
+			 * leaves s->k and s->v from the previous layer and
+			 * never reads them, and these pointers likewise address
+			 * whatever the last projecting layer wrote. A shared KV
+			 * layer reads L->kv_from's cache either way.
+			 */
+			float *qr = s->bq + (size_t)r * m->n_head * hd;
+			float *kr = s->bk + (size_t)r * m->n_head_kv * hd;
+			float *vr = s->bv + (size_t)r * m->n_head_kv * hd;
+
+			/* ⚠ THE CONTROL, in the same binary:
+			 * CHARSIU_ROPE_INPLACE=0 puts the round trip through
+			 * the per row scratch back, so the two arms can be
+			 * interleaved in one session. Cross-session is worth
+			 * nothing here -- the board drifts 3% and this is
+			 * smaller than that on three of four models. */
+			if (!rope_inplace()) {
+				memcpy(s->q, qr,
+				       (size_t)m->n_head * hd * sizeof(float));
+				qr = s->q;
+				if (L->wk) {
+					memcpy(s->k, kr, (size_t)m->n_head_kv
+					       * hd * sizeof(float));
+					memcpy(s->v, vr, (size_t)m->n_head_kv
+					       * hd * sizeof(float));
+					kr = s->k;
+					vr = s->v;
+				}
 			}
 			/*
 			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
@@ -5951,24 +6001,24 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * vector is not biasing a rotated one.
 			 */
 			if (L->bq) {
-				add_bias(s->q, L->bq, m->n_head * hd);
+				add_bias(qr, L->bq, m->n_head * hd);
 				/* ⚠ NO K MEANS NO K BIAS. The token loop adds
 				 * all three unguarded and would dereference
 				 * NULL here; no file in the zoo has both a
 				 * shared KV and attention biases, so neither
 				 * loop has ever reached it. */
 				if (L->wk) {
-					add_bias(s->k, L->bk,
+					add_bias(kr, L->bk,
 						 m->n_head_kv * hd);
-					add_bias(s->v, L->bv,
+					add_bias(vr, L->bv,
 						 m->n_head_kv * hd);
 				}
 			}
 			if (L->q_norm) {
-				qk_norm(s->q, m->n_head, hd, L->q_norm,
+				qk_norm(qr, m->n_head, hd, L->q_norm,
 					m->rms_eps);
 				if (L->wk)
-					qk_norm(s->k, m->n_head_kv, hd,
+					qk_norm(kr, m->n_head_kv, hd,
 						L->k_norm, m->rms_eps);
 			}
 			/*
@@ -5981,11 +6031,11 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * same position the token loop puts it.
 			 */
 			if (m->v_norm && L->wk)
-				qk_norm(s->v, m->n_head_kv, hd, NULL,
+				qk_norm(vr, m->n_head_kv, hd, NULL,
 					m->rms_eps);
-			rope(s->q, m->n_head, hd, cs, m->rope_neox);
+			rope(qr, m->n_head, hd, cs, m->rope_neox);
 			if (L->wk)
-				rope(s->k, m->n_head_kv, hd, cs,
+				rope(kr, m->n_head_kv, hd, cs,
 				     m->rope_neox);
 			BSTAGE(ST_ROPE);
 			/* ⚠ the cache is strided by hdmax, written at hd, and
@@ -5999,17 +6049,17 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						      + kh)
 						      * s->n_ctx + pos) * hdmax;
 
-					memcpy(s->kcache + off, s->k + kh * hd,
+					memcpy(s->kcache + off, kr + kh * hd,
 					       hd * sizeof(float));
-					memcpy(s->vcache + off, s->v + kh * hd,
+					memcpy(s->vcache + off, vr + kh * hd,
 					       hd * sizeof(float));
 					/* ⚠ the fp16 mirror is written HERE and
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
 					 * cannot drift by a rope or a norm */
 					attn_npu_append(s, l, kh, hd, pos,
-							s->k + kh * hd,
-							s->v + kh * hd);
+							kr + kh * hd,
+							vr + kh * hd);
 				}
 			if (attn_block_rows() > 0) {
 				/*
@@ -6018,8 +6068,13 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				 * over the cache (attn_block). The cache rows
 				 * this row will read are all written by then.
 				 */
-				memcpy(s->bq + (size_t)r * m->n_head * hd, s->q,
-				       (size_t)m->n_head * hd * sizeof(float));
+				/* ⚠ NOTHING TO COPY BACK when the rope wrote the
+				 * row where it already lives; the control has
+				 * to, because it worked in the scratch. */
+				if (!rope_inplace())
+					memcpy(s->bq + (size_t)r * m->n_head
+					       * hd, s->q, (size_t)m->n_head
+					       * hd * sizeof(float));
 			} else {
 				/*
 				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
@@ -6053,7 +6108,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						       hdmax,
 						       m->n_head_kv * hdmax,
 						       gqa, m->n_head_kv,
-						       scale };
+						       qr, scale };
 
 				attn_heads(&aj, 0, m->n_head);
 				/* the attention's own output, kept for one
@@ -6627,7 +6682,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 					       L->kv_from >= 0
 					       ? (uint32_t)L->kv_from : l,
 					       pos, tlo, hd, hdmax, kvdim,
-					       gqa, m->n_head_kv, scale };
+					       gqa, m->n_head_kv, s->q, scale };
 
 			charsiu_note("attention: entering", cur_layer,
 				     (unsigned long)m->n_head);
