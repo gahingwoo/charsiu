@@ -5163,7 +5163,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * for the probe that walks it.
 		 */
 		if (!charsiu_m_axis_wide_for(g->w4)) {
-			if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+			if (!charsiu_env_flag("CHARSIU_NPU_ANY_SURFACE", 0) &&
 			    (size_t)(kw / 32) * m > 8192) {
 				whine(g, "the input surface on the height axis is "
 				      "past 8192, where the board says every row "
@@ -5182,7 +5182,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * missing all week -- came back with its two interesting cells
 		 * REFUSED BY IT. Nothing but a probe should set this.
 		 */
-		if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+		if (!charsiu_env_flag("CHARSIU_NPU_ANY_SURFACE", 0) &&
 		    (size_t)(kw / 32) * m > 5120) {
 			/*
 			 * ⚠ CHARSIU_NPU_KFIT IS THE LIKELY WAY TO GET HERE, and
