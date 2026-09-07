@@ -4886,3 +4886,70 @@ to protect a few salient channels, not to rescale the tensor.
 stray from 1 -- which is why alpha 0.25 was a thousand and alpha 0.5 was two
 million on the same clamp. The clamp is the direct control and the exponent
 should not be doing that job.
+
+## 2026-09-07 late: AWQ was three bugs deep, and each was found by the layer under it
+
+### 1. The factor was never applied to the activation
+
+npuquant folds it into the weights (`row[i] /= t->kscale[i]`) and leaves
+`t->kscale` for the caller to undo on the input -- *"on the board this is one
+multiply a k before the pack"*. `kscale` appeared twelve times in npuquant.c
+and zero times in npudev.c.
+
+```
+  off                              75.17
+  AWQ 0.5, column means         10755.75
+  AWQ 0.5, real |x| stats     65233808
+```
+
+The better the statistic, the worse the output: a factor nothing undoes, and a
+truer mean |x_k| makes it more extreme. `charsiu_npu_matvec` applies it now;
+`charsiu_npu_matvec_group` refuses a tensor carrying one, because that entry
+exists to share ONE packed input across q, k and v.
+
+### 2. With the multiply in, it still collapsed -- and the CPU said it was not mine
+
+```
+  board, factor now applied     AWQ 0.5  2155726     AWQ 0.25  1103.80
+  host, CPU reference           AWQ off   114.22     AWQ 0.5   7252312.56
+```
+
+The CPU reference applies the factor itself and touches none of the npudev
+work. Both collapsed, so the bug was in the quantiser and had been since it
+was written -- which also made it debuggable in seconds on the host instead of
+minutes over a UART.
+
+### 3. The exponent was positive, and that is the whole method
+
+`quant_rows` DIVIDES the weights by the factor, so W' = W/f. AWQ asks for
+W' = W·s with s = (mean|x|)^alpha -- the columns that meet large activations
+get MORE of the int4 grid. With a positive exponent this file shrank exactly
+those columns. f = 1/s, so the exponent is **-alpha**.
+
+```
+  host, CPU reference, qwen3, 200 tokens
+    off                            114.22
+    AWQ 0.5  clamp 1.25             78.64
+    AWQ 0.5  clamp 2.0              73.88     -35.3%
+    AWQ 0.5  clamp 4.0              76.88
+    AWQ 0.5  clamp 8.0              91.67
+    AWQ 0.5  clamp 2.0, old sign   851.09     <- the control
+```
+
+**A U with a minimum, where before it was monotone worse.** That shape is the
+result: a factor is supposed to have a best size. Before the flip every step
+away from 1 pushed the wrong way, which is why narrowing the clamp to
+[0.95, 1.05] had looked like a fix -- it was only reducing the error to nearly
+nothing (111.08 against 114.22).
+
+⚠ **I shipped a wrong default on the way.** After seeing the single point at
+clamp 1.05 I set the default to 2.0; the sweep then showed 2.0 giving 851.09
+under the old sign, seven times worse than off. It is right under the new sign
+by luck, not by measurement, and the commit says so.
+
+Against the gguf's own q4_0 on the same tokens (43.85), this takes charsiu's
+int4 from +160% to +68% -- about 57% of the gap, from a factor applied
+backwards.
+
+⚠ Still w4a8 on the CPU reference. The board runs w4a16 and the multiply lives
+in `charsiu_npu_matvec`; round 438 is the first time the fix meets hardware.
