@@ -2258,6 +2258,38 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 
 /* ---- the small pieces ---------------------------------------------------- */
 
+/*
+ * ⚠⚠ THE GAIN IS ONE ROW AND A BATCHED PROMPT READ IT ONCE A ROW A LAYER.
+ *
+ * rmsnorm() below fetches its gain through gguf_row_f32 on every call, and for
+ * the f32 gains every model here ships that is a memcpy straight out of the
+ * mmapped file. A 110 row prompt on Qwen3 is 110 * 28 = 3080 copies of the
+ * same 28 rows, 4 kB each.
+ *
+ * Warm that is a millisecond and invisible. Cold it is 3080 page faults, and
+ * round 424 caught it on the board with nothing but a drop_caches between two
+ * runs of ONE model on ONE binary:
+ *
+ *   qwen3, caches dropped   staging 7442 ms   attn rmsnorm 1.11 ms a row
+ *   qwen3, run again        staging 3736      attn rmsnorm 0.07     16x
+ *
+ * That is the first prompt after a boot or a model switch -- which is the one
+ * a person actually waits for. The rope table and qk_norm's gain were the same
+ * shape and were fixed the same way: hoist it out of the row loop.
+ */
+static void rmsnorm_g(float *out, const float *x, const float *gain,
+		      uint32_t n, float eps)
+{
+	float ss = 0.0f, scale;
+	uint32_t i;
+
+	for (i = 0; i < n; i++)
+		ss += x[i] * x[i];
+	scale = 1.0f / sqrtf(ss / (float)n + eps);
+	for (i = 0; i < n; i++)
+		out[i] = x[i] * scale * gain[i];
+}
+
 static void rmsnorm(float *out, const float *x, const struct gguf_tensor *g,
 		    uint32_t n, float eps)
 {
@@ -3510,7 +3542,7 @@ void llama_state_free(struct llama_state *s)
 	 * for the server.
 	 */
 	free(s->bx); free(s->bxb); free(s->bxo);
-	free(s->bhb); free(s->bhb2); free(s->bcs); free(s->bcstab); free(s->bcstab_have); free(s->qkgain); free(s->qkgain2);
+	free(s->bhb); free(s->bhb2); free(s->bcs); free(s->bcstab); free(s->bcstab_have); free(s->qkgain); free(s->qkgain2); free(s->ngain);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
 	free(s->bfreq);
 	free(s->bpl); free(s->bplg);
@@ -5236,6 +5268,9 @@ struct norm_rows_job {
 	struct llama_state *s;
 	const struct llama_model *m;
 	const struct llama_layer *L;
+	/* read ONCE A LAYER by the caller; NULL where the layer has no such
+	 * norm, which is exactly the test the row loops already made */
+	const float *g_attn, *g_attn_post, *g_ffn, *g_ffn_post;
 };
 
 static void norm1_rows(void *ctx, uint64_t r0, uint64_t nr)
@@ -5244,9 +5279,9 @@ static void norm1_rows(void *ctx, uint64_t r0, uint64_t nr)
 	uint64_t r;
 
 	for (r = r0; r < r0 + nr; r++)
-		rmsnorm(j->s->bxb + r * j->m->n_embd,
-			j->s->bx + r * j->m->n_embd, j->L->attn_norm,
-			j->m->n_embd, j->m->rms_eps);
+		rmsnorm_g(j->s->bxb + r * j->m->n_embd,
+			  j->s->bx + r * j->m->n_embd, j->g_attn,
+			  j->m->n_embd, j->m->rms_eps);
 }
 
 static void res1_rows(void *ctx, uint64_t r0, uint64_t nr)
@@ -5259,13 +5294,13 @@ static void res1_rows(void *ctx, uint64_t r0, uint64_t nr)
 		float *o = j->s->bxo + r * j->m->n_embd;
 		uint32_t i;
 
-		if (j->L->attn_post_norm)
-			rmsnorm(o, o, j->L->attn_post_norm, j->m->n_embd,
-				j->m->rms_eps);
+		if (j->g_attn_post)
+			rmsnorm_g(o, o, j->g_attn_post, j->m->n_embd,
+				  j->m->rms_eps);
 		for (i = 0; i < j->m->n_embd; i++)
 			xr[i] += o[i];
-		rmsnorm(j->s->bxb + r * j->m->n_embd, xr, j->L->ffn_norm,
-			j->m->n_embd, j->m->rms_eps);
+		rmsnorm_g(j->s->bxb + r * j->m->n_embd, xr, j->g_ffn,
+			  j->m->n_embd, j->m->rms_eps);
 	}
 }
 
@@ -5279,9 +5314,9 @@ static void res2_rows(void *ctx, uint64_t r0, uint64_t nr)
 		float *o = j->s->bxo + r * j->m->n_embd;
 		uint32_t i;
 
-		if (j->L->ffn_post_norm)
-			rmsnorm(o, o, j->L->ffn_post_norm, j->m->n_embd,
-				j->m->rms_eps);
+		if (j->g_ffn_post)
+			rmsnorm_g(o, o, j->g_ffn_post, j->m->n_embd,
+				  j->m->rms_eps);
 		for (i = 0; i < j->m->n_embd; i++)
 			xr[i] += o[i];
 	}
@@ -5992,7 +6027,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		return -1;
 	if (s->bx_n < (unsigned)n) {
 		free(s->bx); free(s->bxb); free(s->bhb);
-		free(s->bhb2); free(s->bxo); free(s->bcs); free(s->bcstab); free(s->bcstab_have); free(s->qkgain); free(s->qkgain2);
+		free(s->bhb2); free(s->bxo); free(s->bcs); free(s->bcstab); free(s->bcstab_have); free(s->qkgain); free(s->qkgain2); free(s->ngain); s->ngain = NULL;
 		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
@@ -6023,6 +6058,8 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		free(s->qkgain); free(s->qkgain2);
 		s->qkgain = malloc((size_t)hdmax * sizeof(float));
 		s->qkgain2 = malloc((size_t)hdmax * sizeof(float));
+		free(s->ngain);
+		s->ngain = malloc((size_t)m->n_embd * 4 * sizeof(float));
 		/*
 		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
 		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
@@ -6198,9 +6235,31 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		/* ⚠ THIS LAYER'S WIDTH; m->n_ff is only the fallback */
 		uint32_t nff = L->n_ff ? L->n_ff : m->n_ff;
 		int swa = L->swa;
+		const float *gn[4];
 
 		if (l == 0)
 			BSTAGE(ST_EMBD);
+
+		/*
+		 * ⚠ ONCE A LAYER, NOT ONCE A ROW. Four gguf_row_f32 calls here
+		 * replace 4 * n of them below; see rmsnorm_g. NULL stays NULL,
+		 * so the row loops keep the same test they always made.
+		 */
+		{
+			const struct gguf_tensor *gt[4] = {
+				L->attn_norm, L->attn_post_norm,
+				L->ffn_norm, L->ffn_post_norm
+			};
+			unsigned gi;
+
+			for (gi = 0; gi < 4; gi++) {
+				gn[gi] = NULL;
+				if (!gt[gi] || !s->ngain)
+					continue;
+				gn[gi] = s->ngain + (size_t)gi * m->n_embd;
+				gguf_row_f32(gt[gi], 0, (float *)gn[gi]);
+			}
+		}
 
 		/*
 		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
@@ -6218,7 +6277,8 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 * was with the projections lifted out of it.
 		 */
 		{
-			struct norm_rows_job nj = { s, m, L };
+			struct norm_rows_job nj = { s, m, L, gn[0], gn[1],
+						    gn[2], gn[3] };
 
 			if (row_pool() && n > 1)
 				charsiu_parallel_for(norm1_rows, &nj,
@@ -6447,7 +6507,8 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		/* ⚠ the post norm is on the branch, BEFORE the residual add:
 		 * after it would normalise the residual stream too */
 		{
-			struct norm_rows_job nj = { s, m, L };
+			struct norm_rows_job nj = { s, m, L, gn[0], gn[1],
+						    gn[2], gn[3] };
 
 			if (row_pool() && n > 1)
 				charsiu_parallel_for(res1_rows, &nj,
@@ -6484,7 +6545,8 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
 		BSTAGE(ST_DOWN);
 		{
-			struct norm_rows_job nj = { s, m, L };
+			struct norm_rows_job nj = { s, m, L, gn[0], gn[1],
+						    gn[2], gn[3] };
 
 			if (row_pool() && n > 1)
 				charsiu_parallel_for(res2_rows, &nj,
