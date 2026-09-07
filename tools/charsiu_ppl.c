@@ -31,6 +31,19 @@
  * positions the token loop scores, in exactly the same order. The two numbers
  * are therefore comparable, and any gap between them belongs to the batched
  * path and to nothing else.
+ *
+ * Boundaries checked rather than reasoned about, host, qwen3, chunk cap 160 --
+ * n at cap-1, cap, cap+1, cap+2, two chunks, and a corpus that runs out mid
+ * chunk. Both modes score the same count and the same ppl at every one:
+ *
+ *   n = 159  158 positions  45.0441      n = 162  161 positions  44.3203
+ *   n = 160  159 positions  45.3804      n = 320  235 positions  45.0442
+ *   n = 161  160 positions  44.9461      n = 321  235 positions  45.0442
+ *
+ * And the refusal fires: CHARSIU_KV_POSMAJOR=1 makes llama_batch_why_not
+ * return "a position major KV cache", and --batch then exits 1 with that
+ * phrase instead of falling back and printing the token loop's number under
+ * this label. The same run without --batch is unaffected.
  */
 #include <math.h>
 #include <stdio.h>
