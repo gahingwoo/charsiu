@@ -943,9 +943,6 @@ struct llama_state {
 	/* the q and k norm gains, dequantised once a layer for the pooled
 	 * rope stage; qk_norm's own static cannot be shared by two rows */
 	float *qkgain, *qkgain2;
-	/* the four rmsnorm gains of ONE layer, read once a layer
-	 * instead of once a row: see rmsnorm_g in llama.c */
-	float *ngain;
 	unsigned char *bcstab_have;
 	/*
 	 * The batched q k v and the attention's output.
