@@ -1963,6 +1963,8 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	 */
 	fprintf(stderr, "charsiu NPU: weights are %s, %u devices\n",
 		g->w4 ? "int4" : "int8", g->ndev);
+	/* silent unless CHARSIU_NPU_SPIN_US asked for the poll */
+	charsiu_spin_report();
 	fprintf(stderr,
 		"charsiu NPU: %u tensors, %lu slices, %lu submits, %.2f MB per "
 		"submit%s\n",

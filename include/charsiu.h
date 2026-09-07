@@ -467,6 +467,16 @@ struct charsiu_joblist {
 	unsigned out_count;
 };
 
+/*
+ * Whether CHARSIU_NPU_SPIN_US ever won its poll. A flat sweep of that knob
+ * reads two ways -- the wakeup is free, or every poll timed out -- and these
+ * separate them. charsiu_spin_report() prints one line and says nothing when
+ * the knob is off.
+ */
+extern unsigned long charsiu_spin_tries, charsiu_spin_won, charsiu_spin_lost;
+extern unsigned long charsiu_spin_won_us, charsiu_spin_lost_us;
+void charsiu_spin_report(void);
+
 int charsiu_submit_jobs(struct charsiu_device *dev,
 			const struct charsiu_joblist *jobs, unsigned job_count);
 
