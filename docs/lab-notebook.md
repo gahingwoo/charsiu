@@ -5644,12 +5644,19 @@ row* -- for this model that is 505088 rows, about 2 MB, and it does not fit.
 A scale and zero point every 64 weights costs 77 MB and lands at 695 against
 713 measured; every 32 costs 154 and lands at 772.
 
-So the file size says the vendor quantises in **groups of tens of weights, not
-one group a row** -- which would be sixteen to thirty times finer than
-charsiu's group of 1024 and is the obvious candidate for why its answers might
-be better. ⚠ This is an inference from a byte count and nothing else. It
-contradicts a written finding, so one of the two is wrong and neither should be
-quoted until the tensor boundaries are actually walked.
+So the file size looked like it said the vendor quantises in groups of tens of
+weights rather than one group a row.
+
+⛔ **AND THAT WAS OVERREADING A RESIDUAL, WITHIN THE HOUR IT WAS WRITTEN.** The
+95 MB came from subtracting a 618 MB estimate from a 713 MB profile band whose
+edges are good to about 3%, which is +/-20 MB on its own. Walking the regions
+properly (below) closes the file to 1215 of 1240 MB, leaving **25 MB** for
+every scale in the model -- and 25 MB cannot tell a group of 32 from one scale
+a row, because one scale a row is 2 MB and 2 MB fits inside the error bar.
+
+The honest statement is that **the scale format is unknown and this file's size
+does not constrain it.** The written finding it appeared to contradict is
+neither confirmed nor refuted.
 
 **What it would take, and a cheaper intermediate.** Filling the cell properly
 needs the tensor boundaries, the scale format, the weight layout, then a
@@ -5699,3 +5706,52 @@ the instrument was for.
 does the wait AND the invalidate, so the 114 us mean contains both. A second
 PREP on an already-finished BO would be the invalidate alone -- one probe,
 still unwritten.
+
+### The .rkllm's three regions, settled by a test that discriminates
+
+The entropy profile could not tell packed int4 from int8 -- both put bytes near
+zero. One statistic does: **in packed int4 the low and high nibble hold two
+independent weights, so their histograms are the SAME; in int8 the low nibble
+is mantissa noise and the high nibble carries sign and magnitude.** Total
+variation between the two halves, over a megabyte:
+
+```
+   520 -- 990 MB     0.26%   identical halves      -> packed int4
+   990 -- 1240 MB   52.19%   low flat, high a bell -> int8
+     0 -- 520 MB    55.39%   fp16 exponent pattern -> fp16
+```
+
+The low nibble at 1100 MB is 6.2 to 6.3% across all sixteen values -- flat to
+a tenth of a point -- and the high nibble is 21.7 / 15.4 / 8.1 / 3.4 / ...
+symmetric about the sign. That is int8, not a coincidence.
+
+```
+    0 -- 520 MB    fp16   token embedding    128256 x 2048 x 2  =  501 MB
+  520 -- 990 MB    int4   16 layers          973 M x 0.5        =  464 MB
+  990 -- 1240 MB   int8   output head        263 M x 1          =  250 MB
+                                                        total     1215 of 1240
+```
+
+🏁 **The vendor keeps its output head at eight bits.** charsiu quantises it to
+four along with everything else.
+
+### And charsiu can already do that, so it was measured rather than assumed
+
+`CHARSIU_NPU_W4_ONLY=blk` gives four bits to every tensor whose name contains
+`blk` -- the layers -- and leaves `output.weight` at eight, which is the
+vendor's shape. Host, qwen3, 200 tokens:
+
+```
+  everything int4                    91.66
+  layers int4, head int8 (vendor)    86.83     -5.3%
+  everything int8                    43.66
+```
+
+**Only 5.3%.** The head is 26% of qwen3's weight bytes and 5% of the damage, so
+the vendor's eight-bit head is not where a quality difference would come from
+if it has one. It is consistent with this morning's W4_ONLY sweep: the four-bit
+error is spread roughly with the bytes, and no single tensor class carries it.
+
+⚠ So the interesting difference, if there is one, is the layers -- and those
+are int4 on both sides. Which leaves the group size, and the file does not say
+what it is.
