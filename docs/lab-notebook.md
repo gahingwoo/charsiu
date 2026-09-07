@@ -5602,3 +5602,59 @@ remaining `getenv()` calls there take a value (`atoi`, `atol`, `atof`), a name
 (a file, a substring, a CPU list) or a `strcmp` -- checked one by one, not by
 pattern. ⚠ tools/ still has thirty-odd, and they are probes: a probe that
 inverts its own arm is exactly the failure this section is about.
+
+### The vendor's quality cell: reconnaissance, and it is not encrypted
+
+The README's three-row table has one empty cell -- the vendor's perplexity --
+and it is the cell the other two rows are read against. `rkllm_regcmd.py` says
+why it cannot be filled from the register streams: *"Address registers in a
+static file are unpatched placeholders and read 0"*, so the programs are
+readable and the data they point at is not located by them.
+
+The weights are still in the file. Twenty minutes on
+`Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm`, 1240 MB:
+
+**It is not encrypted.** Entropy runs 5.2 to 6.4 bits a byte, never near 8, and
+the nibble histogram over a megabyte at the midpoint is the signature:
+
+```
+   0:17.8  1:14.3  2:9.6  3:5.2  4:2.4  5:0.9  6:0.3  7:0.1
+   8: 0.1  9: 0.3 10:0.8 11:2.3 12:5.0 13:9.2 14:14.0 15:17.5
+```
+
+A bell centred on zero in four-bit two's complement, symmetric to within 0.3
+points across the sign (0 against 15, 1 against 14). Gaussian weights, rounded
+to four bits, +/-7 the rarest. Encrypted bytes are flat.
+
+**And the file has two halves.** A 200-step profile of entropy and nibble
+symmetry:
+
+```
+   0 -- 520 MB    not bimodal, entropy ~6.0
+ 520 -- 1240 MB   int4 signature throughout, 713 MB of it
+```
+
+Against the model: 128256 x 2048 token embeddings at fp16 are **525 MB**, which
+is the first half; 1236 M weights at four bits are **618 MB**, which is most of
+the second.
+
+⚠⚠ **AND THE 95 MB LEFT OVER CONTRADICTS SOMETHING THIS TREE BELIEVES.** The
+memory of the vendor's format says it carries *one scale and one zero point per
+row* -- for this model that is 505088 rows, about 2 MB, and it does not fit.
+A scale and zero point every 64 weights costs 77 MB and lands at 695 against
+713 measured; every 32 costs 154 and lands at 772.
+
+So the file size says the vendor quantises in **groups of tens of weights, not
+one group a row** -- which would be sixteen to thirty times finer than
+charsiu's group of 1024 and is the obvious candidate for why its answers might
+be better. ⚠ This is an inference from a byte count and nothing else. It
+contradicts a written finding, so one of the two is wrong and neither should be
+quoted until the tensor boundaries are actually walked.
+
+**What it would take, and a cheaper intermediate.** Filling the cell properly
+needs the tensor boundaries, the scale format, the weight layout, then a
+dequantise and a gguf write. That is days. But the question underneath it --
+*is the vendor's four-bit quantisation better than ours, and by how much* --
+can be answered by decoding **one tensor**: dequantise a single gate
+projection, compare its error against the same gguf tensor, and put that beside
+charsiu's own. No tokenizer, no forward pass, no board.
