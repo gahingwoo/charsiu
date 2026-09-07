@@ -4605,3 +4605,60 @@ nothing here should be read as one. It is what the change looks like, put
 beside what it costs, so that a person can decide. `llama_auto_kmax` declines
 this widening on gemma4 by design and says why; overriding it is
 `CHARSIU_NPU_KMAX=2048 CHARSIU_NPU_W4_GROUP=2048`.
+
+## 2026-09-07 late: two arithmetic errors of my own, both in the flattering direction
+
+### `packer` is per SLICE, not per call
+
+The pack split, gemma4, 92 rows: `gather 0.98  packer 1.22  the rest 0.39`,
+and `the rest` divides into `emit 0.07 + fini 0.31` -- which sums to 0.38
+against the 0.39 printed above it, so the counters agree to the hundredth.
+
+I first divided `packer` by the 140 matmul CALLS and got 0.80 ms a call
+against npudev's note that the fp16 conversion costs about 7 us, and wrote
+that up as a 121x anomaly. **The loop is per K SLICE.** 937 of them, so it is
+0.12 ms a slice moving about 530 MB of fp32 in and fp16 out:
+
+```
+  packer   112 ms / 937 slices = 0.12 ms   ~530 MB   4.7 GB/s
+```
+
+⚠ I also shipped, for about ten minutes, a report line printing
+`packer - emit - fini` as "the packer itself". `tpe` starts AFTER
+`bpackcall_us` is banked, so those are disjoint intervals and the subtraction
+was meaningless. The board is what caught it: emit + fini came to exactly
+`the rest`, not to a share of `packer`.
+
+### And the read is 5.2 GB/s, not the 1.93 I quoted all evening
+
+I counted only the int32 accumulator. **Y is read and written once per K
+slice** -- that is what "Y once per K slice" in the read_rows note means, and
+I had read that line. Per output-slice element it is 4 bytes of accumulator
+plus a read-modify-write of Y on every slice after the first:
+
+```
+  read   434 ms / 209 M slice-elements = 10.8 bytes each   5.2 GB/s
+```
+
+So `36 cycles an element is too many for index-load-add-scale` was wrong too:
+36 cycles moving 10.8 bytes is bandwidth, not compute.
+
+### What that changes
+
+```
+  stage    rate      of the board's 11.9 GB/s sequential
+  read     5.2       44%
+  packer   4.7       39%
+  fence    --        the MAC, and 3-4x the vendor's own wall clock
+```
+
+**Nothing on the CPU side of gemma4's prefill is running at a fraction of
+what this board can do.** 40 to 45% is what a permutation walk and a
+gather-plus-convert get here, and that is why every attempt to speed them up
+failed: read fusion, read_rows4, read_rows2, the NEON form, the pair submit.
+They were all trying to make something faster that was already at rate.
+
+⇒ The remaining lever is not the rate, it is the BYTES, and the byte count is
+`m * n * ceil(K / KMAX)`. Which is the quantiser group, and it is the user's
+call. That conclusion has not changed, but it now rests on every stage being
+measured at rate rather than on a list of failed attempts.
