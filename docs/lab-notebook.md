@@ -4696,6 +4696,14 @@ reason nobody shipped a configuration that emits noise.
 to int8 as well; the int4 path keeps fp16 activations. What collapses is the
 activation, not the weight.
 
+⚠⚠ **AND THAT LAST SENTENCE IS WRONG -- SEE "w8a8 was never broken", the next
+day.** Nothing collapsed. The weights were quantised into 1024-wide groups and
+read as one scale a row, because `tensor_grouped()` requires `g->w4` and the
+quantiser did not know it. With the layouts agreeing, this arm measures 27.07
+against llama.cpp's own q4_0 at 26.64 -- the BEST quality number in the tree.
+The guess in this paragraph was made without asking the CPU reference, which
+answers it in one command.
+
 ### ⚠⚠ How it was found: `CHARSIU_NPU=0` opened the NPU
 
 The round wanted a CPU control. `if (getenv("CHARSIU_NPU"))` is an existence
