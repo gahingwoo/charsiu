@@ -3995,3 +3995,54 @@ the direction and the sign were right and the size was not.
 Together with the rope table: **qwen3 713 -> 685 ms (-3.9%), gemma3 864 -> 841
 (-2.7%), tinyllama 868 -> 845 (-2.6%)**, all from the half of the prompt that
 two days of work had not touched.
+
+### 🏁 The rope stage on the pool, and the race the host caught first
+
+With q, k and v roped in place, the rows stopped sharing anything and the stage
+could go on the pool. Bias, QK norm and rope for every row now run through
+`charsiu_parallel_for`; the KV cache write stays serial beside
+`attn_npu_append`, which mutates `a->dirty` and `a->packed` and can reallocate
+the mirror.
+
+⚠⚠ **The first attempt was wrong and the host said so before the board saw
+it.** `qk_norm` keeps the dequantised gain in a `static` -- the buffer, its
+length, and which tensor it holds -- and writes all three on the way through,
+including the length check the no-gain case takes before it returns. Pooled,
+three models of four came back with different text, and the fourth was Phi-3.5,
+**which has no q_norm and never enters the function**. That is as clean a
+fingerprint as a race gets. `qk_norm_gain` now takes the gain as a read-only
+pointer, dequantised once a layer off the pool; decode keeps `qk_norm` and its
+static untouched.
+
+⚠ **And the first board round measured the wrong thing.** `CHARSIU_ROW_POOL=0`
+turns off *every* row stage -- silu, the residuals, the norms -- so the arm read
+qwen3 648 against 753 ms, which is mostly stages that were already pooled before
+this change existed. `CHARSIU_ROPE_POOL=0` moves only the rope:
+
+```
+  prompt ms       pooled (3)              rope serial (3)        delta
+  qwen3       658 657 651  (655)      687 691 690  (689)       -34 ms  -4.9%  3/3
+  gemma3      826 835 822  (828)      830 840 846  (839)       -11     -1.3%  3/3
+  tinyl       847 836 850  (844)      839 844 857  (847)        -3      noise
+  llama       596 597 597  (597)      603 598 596  (599)        -2      noise
+```
+
+qwen3 gains most and that is the mechanism: 16 heads of 128 with a QK norm on
+both q and k is the most per-row arithmetic of the four. llama and tinyllama
+have no `q_norm` at all, so the pooled stage has almost nothing in it.
+
+The stage line agrees: gemma3's `rope + kv copy` is 0.19 ms a row serial and
+**0.07 pooled**.
+
+### The three rope changes together
+
+```
+  qwen3     713 -> 655 ms   -8.1%
+  gemma3    864 -> 828      -4.2%
+  tinyl     868 -> 844      -2.8%
+  llama     607 -> 597      -1.6%
+```
+
+All of it out of the 26 to 43% of the prompt that is not the matmul entry --
+the half two days of work had never touched, and which was reached only because
+"there must be a way out" turned out to be right.
