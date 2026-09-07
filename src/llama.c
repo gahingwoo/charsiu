@@ -3669,6 +3669,17 @@ void llama_stages_reset(void)
 	stage_tok = 0;
 }
 
+/*
+ * ⚠⚠ STDERR, AND IT USED TO BE STDOUT. Three rounds tonight compared md5 sums
+ * of `charsiu_run ... 2>/dev/null` and got four different hashes from one
+ * binary, because this table -- milliseconds and all -- was printed on the
+ * same stream as the generated text, interleaved with it. Neither redirecting
+ * stderr nor stripping the `[load ...]` line could reach it.
+ *
+ * charsiu_npu_report has always used stderr. This is a diagnostic too, the
+ * board scripts capture it with 2>&1 either way, and on stderr a text hash
+ * cannot accidentally include a clock.
+ */
 void llama_stages_report(void)
 {
 	double tot = 0;
@@ -3681,24 +3692,24 @@ void llama_stages_report(void)
 
 		for (i = 0; i < ST_N; i++)
 			bt += bstage_ms[i];
-		printf("charsiu batched stages: %u rows in %u chunks, %.2f ms a row"
+		fprintf(stderr, "charsiu batched stages: %u rows in %u chunks, %.2f ms a row"
 		       " (%.0f ms; %.0f ms of staging excluded)\n", bstage_rows,
 		       bstage_chunks, bt / bstage_rows, bt, bstage_staged_ms);
 		for (i = 0; i < ST_N; i++)
 			if (bstage_ms[i] > 0.0)
-				printf("  %-16s %8.2f ms a row     %5.1f%%\n",
+				fprintf(stderr, "  %-16s %8.2f ms a row     %5.1f%%\n",
 				       stage_name[i], bstage_ms[i] / bstage_rows,
 				       100.0 * bstage_ms[i] / bt);
-		printf("  (\"residual\" after o proj carries the ffn rmsnorm too, and"
+		fprintf(stderr, "  (\"residual\" after o proj carries the ffn rmsnorm too, and"
 		       " \"rope + kv copy\" only the rope)\n");
 		if (bmm_calls)
-			printf("  %-16s %lu calls: %.2f ms a row inside the NPU entry, "
+			fprintf(stderr, "  %-16s %lu calls: %.2f ms a row inside the NPU entry, "
 			       "%.2f in its wrapper (staging included), %.2f on the CPU (%lu rows fell back)\n",
 			       "matmul rows:", bmm_calls, bmm_entry_ms / bstage_rows,
 			       bmm_wrap_ms / bstage_rows, bmm_fell_ms / bstage_rows,
 			       bmm_fell_rows);
 		if (battn_ms[0] + battn_ms[1] + battn_ms[2] > 0.0)
-			printf("  %-16s scores %.2f  softmax %.2f  values %.2f ms a row"
+			fprintf(stderr, "  %-16s scores %.2f  softmax %.2f  values %.2f ms a row"
 			       "  (the serial block arm's split)\n", "attention:",
 			       battn_ms[0] / bstage_rows, battn_ms[1] / bstage_rows,
 			       battn_ms[2] / bstage_rows);
@@ -3741,7 +3752,7 @@ void llama_stages_report(void)
 			 */
 			double pr = charsiu_npu_batch_prep(bmm_dev, 0);
 
-			printf("  %-16s pack %.2f  submit %.2f  fence %.2f"
+			fprintf(stderr, "  %-16s pack %.2f  submit %.2f  fence %.2f"
 			       "  read %.2f  prep %.2f  unaccounted %.2f "
 			       "ms a row\n",
 			       "of the entry:", pk / bstage_rows,
@@ -3769,7 +3780,7 @@ void llama_stages_report(void)
 				nw = charsiu_npu_batch_fence_widths(bmm_dev, wd,
 					wms, wg, wc, 8, 0);
 				for (wi = 0; wi < nw; wi++)
-					printf("  %-16s n %5u  fence %7.1f ms"
+					fprintf(stderr, "  %-16s n %5u  fence %7.1f ms"
 					       " over %5u calls  %8.1f GMAC"
 					       "  %5.2f TMAC/s\n",
 					       wi ? "" : "of the fence:",
@@ -3780,7 +3791,7 @@ void llama_stages_report(void)
 					         : 0.0);
 			}
 			charsiu_npu_batch_gather_split(bmm_dev, &ga, &pc, 0);
-			printf("  %-16s gather %.2f  packer %.2f  the rest"
+			fprintf(stderr, "  %-16s gather %.2f  packer %.2f  the rest"
 			       " %.2f ms a row\n", "of the pack:",
 			       ga / bstage_rows, pc / bstage_rows,
 			       (pk - ga - pc) / bstage_rows);
@@ -3800,7 +3811,7 @@ void llama_stages_report(void)
 				charsiu_npu_batch_fence_split(bmm_dev, &iv,
 							      &gib, &nc, 0);
 				if (nc)
-					printf("  %-16s invalidate %.2f  the "
+					fprintf(stderr, "  %-16s invalidate %.2f  the "
 					       "wait %.2f ms a row  (%.2f GiB "
 					       "over %u preps, %.2f GB/s)\n",
 					       "of the fence:",
@@ -3816,12 +3827,12 @@ void llama_stages_report(void)
 		return;
 	for (i = 0; i < ST_N; i++)
 		tot += stage_ms[i];
-	printf("charsiu stages: %u tokens, %.1f ms a token\n",
+	fprintf(stderr, "charsiu stages: %u tokens, %.1f ms a token\n",
 	       stage_tok, tot / stage_tok);
 	for (i = 0; i < ST_N; i++)
-		printf("  %-16s %8.2f ms a token   %5.1f%%\n", stage_name[i],
+		fprintf(stderr, "  %-16s %8.2f ms a token   %5.1f%%\n", stage_name[i],
 		       stage_ms[i] / stage_tok, 100.0 * stage_ms[i] / tot);
-	printf("  %-16s %8.2f ms a token          (inside the rows above)\n",
+	fprintf(stderr, "  %-16s %8.2f ms a token          (inside the rows above)\n",
 	       "quantising x", act_ms / stage_tok);
 }
 
@@ -6640,21 +6651,60 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
  * CLAMP and not a default: 80 stays what a caller gets, and CHARSIU_PREFILL_
  * CHUNK is now safe to raise on any model because it cannot cross the cliff.
  */
+/*
+ * ⚠⚠ THE WIDEST SLICE A K BECOMES, AND UNDER KFIT THAT IS WIDER THAN KMAX.
+ *
+ * charsiu_slice_kw gives the last slice whatever is left, and its own comment
+ * says clamping it would drop the tail of the tensor without a word. So KFIT
+ * makes the widest slice `k - (ks-1)*kmax`, not `kmax`, and the ceiling below
+ * is a function of the slice and not of KMAX.
+ *
+ * Round 421 is what this is for. gemma-3-1b's `down` has K = 6912 at KMAX
+ * 2048, which KFIT takes from four slices to three -- and the last of those
+ * is 6912 - 2*2048 = 2816 wide. npudev.c already records `slice 2816 WRONG,
+ * surf 88` from a different model entirely. At 93 prompt rows the surface is
+ * 88 * 93 = 8184 against a ceiling of 5120, so EVERY projection was refused
+ * and every row of the prompt took the token loop -- silently:
+ *
+ *   gemma3   slices 292 -> 266   submits 5020 -> 9128   prompt 719 -> 1398 ms
+ *
+ * Fewer slices, 82% more submits, and the prompt nearly doubled. The text
+ * stayed correct, which is exactly why nothing said anything.
+ */
+static uint64_t widest_k_slice(uint64_t k, uint64_t kmax, int kfit)
+{
+	uint64_t ks;
+
+	if (!kmax || !k)
+		return k;
+	ks = (k + kmax - 1) / kmax;
+	if (kfit && ks > 1 && (k % kmax))
+		ks--;
+	if (ks <= 1)
+		return k;
+	/* the tail slice is the wide one; the others are kmax */
+	k -= (ks - 1) * kmax;
+	return k > kmax ? k : kmax;
+}
+
 int llama_prefill_chunk_cap(const struct llama_model *m)
 {
 	const char *e = getenv("CHARSIU_NPU_KMAX");
 	uint64_t kmax = e ? strtoull(e, NULL, 0) : 1024;
-	uint64_t widest = m->n_embd, cap;
+	int kfit = charsiu_env_flag("CHARSIU_NPU_KFIT", 0);
+	uint64_t widest, w, cap;
 	uint32_t l;
 
-	if (m->n_ff > widest)
-		widest = m->n_ff;
+	widest = widest_k_slice(m->n_embd, kmax, kfit);
+	w = widest_k_slice(m->n_ff, kmax, kfit);
+	if (w > widest)
+		widest = w;
 	if (m->layers)
-		for (l = 0; l < m->n_layer; l++)
-			if (m->layers[l].n_ff > widest)
-				widest = m->layers[l].n_ff;
-	if (kmax && widest > kmax)
-		widest = kmax;
+		for (l = 0; l < m->n_layer; l++) {
+			w = widest_k_slice(m->layers[l].n_ff, kmax, kfit);
+			if (w > widest)
+				widest = w;
+		}
 	if (!widest)
 		return 80;
 	cap = 163840u / widest;

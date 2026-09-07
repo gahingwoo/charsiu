@@ -1338,16 +1338,22 @@ int main(int argc, char **argv)
 			 * pipe, because stdout is block buffered there and
 			 * stderr is not -- both labels came out before both
 			 * tables, which is worse than no label at all.
+			 *
+			 * ⚠ THE TABLES ARE ON STDERR NOW and the labels follow
+			 * them, for that same reason: one stream, one
+			 * buffering. The `[load ...]` summary stays on stdout
+			 * -- board_vendor.sh redirects stderr to a file and
+			 * greps stdout for `^[load`, and it is one character
+			 * to filter, which the stage tables were not.
 			 */
 			if (!quiet && getenv("CHARSIU_STAGES")) {
-				printf("\n--- the first %d tokens ---\n",
-				       produced);
+				fprintf(stderr, "\n--- the first %d tokens"
+					" ---\n", produced);
 				llama_stages_report();
 				llama_stages_reset();
-				printf("--- and the last %d, whose table is"
-				       " at the end ---\n",
-				       n_gen - produced);
-				fflush(stdout);
+				fprintf(stderr, "--- and the last %d, whose"
+					" table is at the end ---\n",
+					n_gen - produced);
 			}
 		}
 next:

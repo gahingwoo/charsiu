@@ -604,13 +604,15 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		     f { if (/charsiu NPU batched:/ || /^    /) print; else exit }' \
 		    "$OUT/.ttft_err" | sed 's/^/      /'
 		# ⚠ AND THE OTHER SIDE OF THE PROMPT: the batched path's own
-		# stage table, per row, from stdout. Matmul rows are the NPU
+		# stage table, per row. It moved from stdout to stderr on
+		# 2026-09-07, because on stdout it landed inside every md5 of
+		# the generated text and cost three rounds. Matmul rows are the NPU
 		# calls above seen from the caller; the rest is the CPU, and on
 		# Qwen3 it was a thousand of 1298 ms with no name on it.
-		if grep -q "charsiu batched stages:" "$OUT/.ttft_out"; then
+		if grep -q "charsiu batched stages:" "$OUT/.ttft_err"; then
 			awk '/charsiu batched stages:/ { f = 1; n++ }
 			     f && n == 1 { if (/charsiu batched stages:/ || /^  /) print; else exit }' \
-			    "$OUT/.ttft_out" | sed 's/^/      /'
+			    "$OUT/.ttft_err" | sed 's/^/      /'
 		else
 			printf '      ⚠ no batched stage table: the runner predates it, or CHARSIU_STAGES did not take\n'
 		fi

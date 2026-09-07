@@ -4431,3 +4431,177 @@ so directly, in a line I had already grepped for.
 The chunk table in `charsiu_run.c` -- SmolLM2 catastrophic at 160, Qwen3 9%
 better, Llama neutral -- has no gemma4 in it and still does. But it is a
 question about prompts LONGER than 160 tokens, not about the scoreboard.
+
+## 2026-09-07 late: KFIT is a per-model property, and one arm was measuring a bug
+
+Round 421, four models, three paired reps, 93 token prompt, text identical on
+every arm of every model:
+
+```
+  model    slices        prompt            decode           verdict
+  gemma4   937 -> 693    1597 -> 1470 ms   9.69 -> 9.82     -8.0% TTFT, +1.4%
+  gemma3   292 -> 266     719 -> 1398      21.43 -> 20.97   +94%, a catastrophe
+  tinyl    404 -> 382     745 ->  754      22.82 -> 22.43   slightly worse
+  phi3     844 -> 844    2629 -> 2629      7.21 -> 7.21     zero control, held
+```
+
+**phi3 is the control that could have refuted this and did not.** Every one of
+its K values is a multiple of its KMAX, so KFIT has no remainder to absorb and
+removes no slice -- and nothing about it moved. It was written down in advance
+that if phi3 moved, gemma4's win would need another explanation.
+
+### gemma3's arm was not measuring KFIT
+
+`submits 5020 -> 9128`. Fewer slices, 82% MORE submits. That is not a slicing
+result, it is a fallback.
+
+KFIT takes gemma3's `down` (K = 6912, KMAX 2048) from four slices to three,
+and `charsiu_slice_kw` gives the last one whatever is left: **2816 wide**, a
+width npudev.c already records as `WRONG, surf 88` from an unrelated model.
+The surface ceiling is `(slice / 32) * m <= 5120`, so at 93 rows it is
+88 * 93 = 8184 -- every projection refused, every row of the prompt back on
+the token loop, in silence, with the text still correct.
+
+`llama_prefill_chunk_cap` could not see it: it took `min(widest K, KMAX)`, and
+KFIT is the one thing that makes a slice **wider** than KMAX. Fixed, and the
+caps move:
+
+```
+  model     KFIT   widest slice   cap
+  gemma4      0        1024       160
+  gemma4      1        1536       106
+  gemma3      0        2048        80
+  gemma3      1        2816        58
+  qwen3     0/1        1024       160   (no K of it has a remainder)
+```
+
+⚠⚠ **And gemma4 cleared its new 106 cap by thirteen rows, by luck.** The round
+used a 93 token prompt; the scoreboard's is 111. 93 passing says nothing about
+111, and with KFIT on and the cap unfixed, the scoreboard prompt would have
+walked into the same silent fallback gemma3 did. Round 422 uses a prompt over
+110 so the clamp actually engages.
+
+### What is still open
+
+KFIT wins on one model of four. gemma4 is the model that needs it -- worst
+TTFT ratio of the four -- but one win, one catastrophe caused by a bug now
+fixed, one small loss and one no-op is not a default. Round 422 re-runs the
+three that move, with the cap fix installed and a prompt that splits, and that
+decides whether this is a default or stays an explicit switch.
+
+## 2026-09-07 late: KFIT does not ship, and the reason is the chunk and not the slice
+
+Round 422, the cap fix installed, a 109 token prompt so the clamp engages --
+which is the scoreboard's regime and not the 93 that flattered round 421:
+
+```
+  model    widths off -> KFIT       prompt off -> KFIT   decode
+  gemma4   1x108   -> 1x80+1x28     1836 -> 1815 ms      9.56 -> 9.68
+  tinyl    1x116   -> 1x80+1x36      822 ->  897         (EOS, no decode)
+  gemma3   1x80+1x28 already two chunks off
+```
+
+**-8.0% became -1.1%.** KFIT takes gemma4's widest slice from 1024 to 1536, so
+its cap falls 160 -> 106, and a 108 row prompt no longer fits in one chunk. The
+second chunk reads all 1273 MB of weights again, which is most of what the 35%
+smaller read back had just saved.
+
+TinyLLAMA is the same mechanism with none of the compensation: it ran `1x116`
+in one chunk, KFIT put its cap at 106, and it lost 9.1%.
+
+**So it is the chunk COUNT that decides, not the slice count.** The read back
+is the biggest single stream in a prefill and KFIT genuinely cuts it by 35% --
+and a single extra pass over the weights outweighs that. KFIT stays an
+explicit switch.
+
+⚠ Round 421 said -8.0% on a 93 token prompt and I wrote "93 passing says
+nothing about 111" into the round that followed. It did not.
+
+### ⚠ And auto_kmax has a cost nobody had priced
+
+`llama_auto_kmax` widens gemma-3-1b to KMAX 2048 because that halves its
+slices, 532 -> 292. It also doubles its widest slice, 1024 -> 2048, which
+halves its chunk cap, 160 -> 80 -- and at 109 rows that is the difference
+between one chunk and two.
+
+```
+  gemma3   KMAX 1024   532 slices   cap 160   one chunk
+  gemma3   KMAX 2048   292 slices   cap  80   two chunks   <- what it runs
+```
+
+The function optimises the read back and does not know the chunk exists. Which
+of the two is faster has never been measured, on any model. It is the same
+trade KFIT just lost, run in the opposite direction.
+
+## 2026-09-07 late: the quantiser decision, priced — and it is the user's
+
+Where gemma4's prefill actually goes, 93 rows, warm, measured:
+
+```
+  prompt total                    1589 ms
+  fence -- which IS the MAC time   372 ms   0.465 TMAC/s
+  read back                        433      836 MB at 1.93 GB/s
+  pack                             239
+```
+
+The vendor does the same prompt in about 1021 ms. If their MAC runs at our
+rate, that is 372 ms of arithmetic and **649 ms for everything else** -- and
+our read plus pack alone is 672. We are not slower at the maths. We move more
+bytes around it.
+
+**Every lever on the read is closed except one.** read fusion lost 2.3x on
+this board on all eight models (one read stream, four write streams, and an
+A72 store buffer that will not merge interleaved partial lines); read_rows4
+and read_rows2 both lost; the NEON form was bit-identical and moved nothing;
+KFIT trades the read for a chunk and loses; the fence is already the MAC.
+
+What is left is the quantisation group, because the read back is
+`m * n * ceil(K / KMAX) * 4` and the vendor's own .rkllm dispatches K =
+2048/4096 and never 1024. Round 425, gemma4, three reps an arm, 76 token
+prompt -- short enough that every arm still runs ONE chunk, so this is the
+lever without the chunk cost:
+
+```
+  group   slices   prompt        decode
+   1024      937   1263 ms       9.78 tok/s
+   2048      486   1082  -14.3%  9.96  +1.8%
+   4096      256   1222   -3.2%  9.65  -1.3%   <- capped to 40, two chunks
+```
+
+**2048 is the optimum and 4096 is worse**, exactly as the chunk arithmetic
+predicted: a wider group widens the slice, which lowers the chunk cap, which
+splits the prompt and reads every weight again.
+
+⚠ At the scoreboard's 111 tokens group 2048's cap of 80 splits the prompt, so
+the -14.3% becomes about -9.6%. 76 rows flatter it.
+
+### It changes the weights, and here is what that looks like
+
+Same prompt, temperature 0, 60 tokens:
+
+```
+  1024  ...a man of unyielding resilience and quiet fortitude. He was a man who
+        faced relentless adversity with a stoic acceptance of his harsh
+        circumstances, yet he possessed an inner strength that allowed him to
+        endure even the most brutal conditions.
+
+  2048  ...a man of profound resilience. He was a man who didn't succumb to
+        despair when faced with overwhelming adversity. He was a man who found
+        a way to persevere through seemingly insurmountable odds. He was a man
+        who possessed an unwavering determination to keep going
+
+  4096  ...a man of profound resilience and quiet fortitude. He was a man who
+        faced adversity not with despair, but with a quiet, unwavering resolve.
+        He was a man who understood that life is not always easy, and that even
+        in the face of overwhelming
+```
+
+All three are usable. 2048 repeats its sentence frame four times where 1024
+varies it, and 4096 reads closer to 1024 than 2048 does -- so the quality is
+not monotonic in the group width, which is itself worth knowing.
+
+⚠⚠ **One prompt, one sample, greedy. That is not a quality measurement** and
+nothing here should be read as one. It is what the change looks like, put
+beside what it costs, so that a person can decide. `llama_auto_kmax` declines
+this widening on gemma4 by design and says why; overriding it is
+`CHARSIU_NPU_KMAX=2048 CHARSIU_NPU_W4_GROUP=2048`.
