@@ -41,6 +41,70 @@
  *
  * Unset returns `dflt`. "" and "0" are off. Anything else is on.
  */
+/*
+ * ⚠⚠ WHERE A POOLING THRESHOLD COMES FROM, INSTEAD OF WHAT IT WAS TUNED TO.
+ *
+ * Four constants in this tree decide the same thing in four different units:
+ *
+ *   CHARSIU_ACT_POOL_MIN       6144   elements of an activation join
+ *   CHARSIU_ATTN_POOL_MIN        64   positions of a cache
+ *   CHARSIU_NPU_POOL_READ_MIN 32768   elements of an accumulator read
+ *   CHARSIU_NPU_PACK_POOL_MIN    64   groups of a packed input
+ *
+ * Each was measured on the board, on one or two models, and each is a number
+ * with no derivation -- which is the failure mode this project already paid
+ * for once. `d = (ki*ns+ni)&1` was neutral on Llama-3.2, whose every dimension
+ * is a power of two, and cost 13 to 21% on Qwen3, gemma3 and Phi-3.5. A
+ * constant tuned where it cannot be seen is not a constant, it is a bug with a
+ * default.
+ *
+ * The decision itself has a closed form. For W units of work at R units a
+ * microsecond on one thread, over T threads with a barrier of `bar`:
+ *
+ *     serial    W / R
+ *     pooled    W / (R * T) + bar
+ *     pool iff  W * (1 - 1/T) / R > bar
+ *     i.e.      W > bar * R / (1 - 1/T)
+ *
+ * So the only thing a caller has to know about its own loop is R -- a physical
+ * rate in units a microsecond, a property of the arithmetic and not of any
+ * model -- and the threshold follows from that, the thread count and the
+ * barrier. Change the governor, the core count or the CPU set and every
+ * threshold moves with it, which is exactly what four tuned numbers cannot do.
+ *
+ * ⚠ THE BARRIER IS THE ONE MEASURED INPUT and it is measured, not guessed:
+ * 47.8 and 52.4 us backed out of two models on the board, 2026-09-08.
+ * CHARSIU_POOL_BARRIER_US overrides it for a sweep.
+ */
+double charsiu_pool_barrier_us(void)
+{
+	static double v = -1.0;
+
+	if (v < 0.0) {
+		const char *e = getenv("CHARSIU_POOL_BARRIER_US");
+
+		v = e && *e ? atof(e) : 50.0;
+		if (v < 0.0)
+			v = 0.0;
+	}
+	return v;
+}
+
+/*
+ * ⚠ THE THREAD COUNT IS A PARAMETER, NOT A LOOKUP. charsiu_threads() lives in
+ * llama.c and gguf.c is linked on its own by charsiu_check, so reaching for it
+ * here breaks a tool that has no business knowing about a thread pool. Passing
+ * it also lets a caller ask the question for a pool it is NOT currently on --
+ * the batched paths do exactly that.
+ */
+uint64_t charsiu_pool_min(double units_per_us, int threads)
+{
+	if (threads < 2 || units_per_us <= 0.0)
+		return (uint64_t)-1;          /* never pool */
+	return (uint64_t)(charsiu_pool_barrier_us() * units_per_us
+			  / (1.0 - 1.0 / threads));
+}
+
 int charsiu_env_flag(const char *name, int dflt)
 {
 	const char *e = getenv(name);

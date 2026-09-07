@@ -175,6 +175,54 @@ int main(int argc, char **argv)
 		printf("  %8u %12.2f %14.2f\n", nt, us, us / nt);
 	}
 
+	/* --- the MB axis: is the bandwidth term a constant at all --- */
+	/*
+	 * ⚠⚠ THE COEFFICIENT THE SHAPE PREDICTOR NEEDS AND CANNOT ASSUME.
+	 *
+	 * charsiu_shapes fits a token as calls*a + tasks*b + MB*c. Calibrated
+	 * on qwen3 alone it predicts gemma4 +12.6% and Phi-3.5 +25.1%, both
+	 * HIGH and monotone in size -- which is what a single average `c` does
+	 * when the real one rises with the tensor. Round 147 saw exactly that
+	 * inside one run: 8.29 GB/s on o_proj, 15.56 on the output head.
+	 *
+	 * So sweep the bytes with the task count HELD AT ONE. If the us a MB
+	 * falls as MB grows, `c` is not a constant and no per-model constant
+	 * will fix a predictor built on one.
+	 */
+	printf("\n  one job, one task, the weight bytes swept\n");
+	printf("  %6s %6s %9s %10s %10s\n", "k", "n", "MB", "us", "us a MB");
+	{
+		static const unsigned ks[] = { 64, 256, 1024, 1024, 2048, 2048 };
+		static const unsigned ns[] = { 32, 128, 256, 1024, 2048, 4096 };
+		unsigned c;
+
+		for (c = 0; c < sizeof(ks) / sizeof(*ks); c++) {
+			struct unit u;
+			double us, mb;
+
+			if (unit_make(d0, &u, 1, ks[c], ns[c])) {
+				printf("  %6u %6u  (would not build)\n",
+				       ks[c], ns[c]);
+				continue;
+			}
+			mb = (double)ks[c] * ns[c] / 1e6;   /* int8 weights */
+			fill(&jl[0], &u, 1);
+			charsiu_submit_jobs(d0, jl, 1);
+			charsiu_bo_prep(d0, &u.ob, 1000000000);
+			t0 = now_us();
+			for (r = 0; r < reps; r++) {
+				fill(&jl[0], &u, 1);
+				if (charsiu_submit_jobs(d0, jl, 1))
+					break;
+				charsiu_bo_prep(d0, &u.ob, 1000000000);
+			}
+			us = (now_us() - t0) / reps;
+			printf("  %6u %6u %9.4f %10.2f %10.1f\n",
+			       ks[c], ns[c], mb, us, mb > 0 ? us / mb : 0.0);
+			unit_free(d0, &u);
+		}
+	}
+
 	/* --- the four ways to get two jobs onto the hardware --- */
 	printf("\n  two jobs, four ways\n");
 	{

@@ -129,7 +129,9 @@ static unsigned attn_pool_min(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_POOL_MIN");
 
-		v = e ? atoi(e) : 64;
+		/* 64 positions at eight threads implies 1.12 positions a
+		 * microsecond; derived so it tracks the pool. See gguf.c. */
+		v = e ? atoi(e) : (int)charsiu_pool_min(1.12, charsiu_threads());
 		if (v < 0)
 			v = 0;
 	}
@@ -5270,7 +5272,17 @@ static int act_pool_min(void)
 	if (v == -2) {
 		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
 
-		v = e && *e ? atoi(e) : 6144; /* the narrowest width measured */
+		/*
+		 * ⚠ 6144 WAS THE ANSWER, NOT THE RULE. It came off two models'
+		 * measured barrier on 2026-09-08 and it is only right at the
+		 * thread count it was measured at. charsiu_pool_min derives it
+		 * from the barrier, the rate and the threads actually running:
+		 * 107.52 elements a microsecond is what 6144 implies at eight
+		 * threads and a 50 us barrier, so this is bit-identical there
+		 * and follows the pool everywhere else. See gguf.c.
+		 */
+		v = e && *e ? atoi(e)
+			    : (int)charsiu_pool_min(107.52, charsiu_threads());
 	}
 	return v;
 }
