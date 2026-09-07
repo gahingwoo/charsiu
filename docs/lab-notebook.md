@@ -3954,3 +3954,44 @@ layer: three memcpys of q, k and v into per-row scratch, `add_bias`, `qk_norm`,
 scratch is shared and pooling it would need the batched buffers operated on in
 place. On qwen3 that stage is still 0.52 ms a row after this, 8.7% of the
 prompt, and `attention` is another 16.9%.
+
+### 🏁 Rope in place: the scratch round trip was moving data to where it was
+
+The loop copied q, k and v out of the batched buffers into `s->q`, `s->k` and
+`s->v`, transformed them there, and copied q back -- purely so the token loop's
+own helpers could be reused unchanged. The batched buffers already hold one
+contiguous row each. On Qwen3 that is 8 kB of q in, 8 kB back and 4 kB each of
+k and v, **per row per layer**: 672 kB a row over 28 layers, **74 MB across a
+110 token prompt**.
+
+`attn_heads` read `s->q`, which made it the caller's job to have put the roped
+row there. It now takes the query as a pointer, which is what it always was;
+decode passes `s->q` and is unchanged.
+
+Host first, and it covers more combinations than the board round could: four
+models including both window-layer ones, a prose prompt, and every crossing of
+the two attention paths with the new control -- token loop, in place, scratch,
+and scratch with the per-row attention -- all identical.
+
+Board, interleaved, three pairs a model:
+
+```
+  prompt ms       in place (3)            scratch (3)            delta
+  qwen3       683 684 687  (685)      695 692 697  (695)       -10 ms  -1.5%  3/3
+  gemma3      842 834 846  (841)      845 851 856  (851)       -10     -1.2%  3/3
+  tinyl       851 838 846  (845)      859 852 853  (855)       -10     -1.2%  3/3
+  llama       595 597 602  (598)      600 602 599  (600)        -2      noise
+```
+
+and `rope + kv copy` moves with it: gemma3 0.22 -> 0.19 ms a row, qwen3 0.52 ->
+0.51 (its q is 16 heads of 128 against gemma3's 4 of 256, so the copy it sheds
+is a smaller share of a bigger stage).
+
+**Smaller than the 5.3% the traffic count suggested** -- 74 MB at the board's
+2.6 GB/s should have been 28 ms and it is 10 -- which says those copies were
+partly hitting cache. Worth writing down as another estimate that came in high;
+the direction and the sign were right and the size was not.
+
+Together with the rope table: **qwen3 713 -> 685 ms (-3.9%), gemma3 864 -> 841
+(-2.7%), tinyllama 868 -> 845 (-2.6%)**, all from the half of the prompt that
+two days of work had not touched.
