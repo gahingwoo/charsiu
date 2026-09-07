@@ -192,8 +192,20 @@ int main(int argc, char **argv)
 	printf("\n  one job, one task, the weight bytes swept\n");
 	printf("  %6s %6s %9s %10s %10s\n", "k", "n", "MB", "us", "us a MB");
 	{
-		static const unsigned ks[] = { 64, 256, 1024, 1024, 2048, 2048 };
-		static const unsigned ns[] = { 32, 128, 256, 1024, 2048, 4096 };
+		/*
+		 * ⚠ THE RANGE HAS TO COVER WHAT A MODEL ACTUALLY ASKS FOR.
+		 * The first sweep stopped at 8.39 MB and charsiu_shapes then
+		 * had to extrapolate Phi-3.5's gate+up, which is 19.6 MB in one
+		 * call -- 2.3x outside the data. Its predictions came back
+		 * claiming 106% of the token was matmul, which is not a fit
+		 * error, it is a question asked outside where it was answered.
+		 * The small end matters for the other reason: SmolLM2-135M's
+		 * calls are 0.13 to 0.69 MB and its prediction missed by 36%.
+		 */
+		static const unsigned ks[] = { 64, 256, 512, 1024, 1024, 1024,
+					       2048, 2048, 4096, 4096, 4096 };
+		static const unsigned ns[] = { 32, 128, 256,  256,  512, 1024,
+					       2048, 4096, 4096, 8192, 16384 };
 		unsigned c;
 
 		for (c = 0; c < sizeof(ks) / sizeof(*ks); c++) {
