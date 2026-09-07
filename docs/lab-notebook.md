@@ -4290,13 +4290,34 @@ control.
 
 ### ⚠⚠ Two traps this round walked into, both of which have bitten before
 
-**Hashing `charsiu_run`'s stdout hashes its own timings.** The `[load ... |
-prompt ... tok/s ...]` summary goes to stdout, so two identical texts never
-agree and two different ones cannot be told apart. Three host runs of one arm
-gave three hashes and looked like nondeterminism; the generated text was
-byte-identical every time and only the milliseconds moved. This is also why
-round 411's arms A and B "differed" -- nothing was shown either way. Strip
-`^\[` before hashing.
+**Hashing `charsiu_run`'s stdout hashes its own timings, in TWO forms, and
+the second one cost three board rounds.** The `[load ... | prompt ... tok/s]`
+summary goes to stdout -- that one `grep -v '^\['` removes. But with
+`CHARSIU_STAGES=1` **the whole stage table goes to stdout as well**, once per
+report, interleaved with the generated text, milliseconds and all. Neither
+`2>/dev/null` nor the bracket strip can reach it.
+
+So round 413's two arms hashed differently, and I went and built three rounds
+to find out why:
+
+```
+  414  gemma4, STAGES off, 4 runs (2 pooled, 2 serial)   ALL FOUR IDENTICAL
+  415  gemma4, STAGES on,  4 runs (2 pooled, 2 serial)   all four differ
+  416  gemma3, STAGES on,  3 runs                        differs 3 ways
+       gemma4, STAGES on, CHARSIU_ATTN_POOL=0            differs 3 ways
+       gemma4, STAGES on, CHARSIU_THREADS=1              differs 3 ways
+```
+
+⚠ **The single-threaded arm was the tell and I ran it last.** A run on one
+thread that still "differs" is not computing anything differently. Extracting
+the generated text alone on the host: four runs, two with the timer on, **one
+distinct text**. There is no nondeterminism -- not in the model, not from the
+stage timer, not from the change.
+
+The same mistake also produced a claim earlier in this round: I wrote that KMAX
+2048 changed gemma4's answer, on hashes that contained stage tables. Nothing
+was shown either way. **Hash with the stage timer OFF, and strip `^\[`. If a
+round needs both timings and a text check, run the model twice.**
 
 **`d41d8cd98f00` turned up again**, from a model path that does not exist on
 the host, and three runs "agreed" about nothing.
