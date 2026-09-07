@@ -4046,3 +4046,78 @@ The stage line agrees: gemma3's `rope + kv copy` is 0.19 ms a row serial and
 All of it out of the 26 to 43% of the prompt that is not the matmul entry --
 the half two days of work had never touched, and which was reached only because
 "there must be a way out" turned out to be right.
+
+### ⛔ The attention block width does nothing at this length, and the rule said stop
+
+Attention is the last unmeasured piece of the non-matmul half: 16.9% of qwen3's
+prompt at the scoreboard's own length. It is already blocked, pooled over heads
+and vectorised -- `attn_dot4` takes four key rows at once and the R query rows
+of a block share them -- so the only untried thing was its one number.
+`CHARSIU_ATTN_BLOCK` is 4, chosen at 916 tokens where the cache does not fit in
+L2 and the trade is different.
+
+The round was written with its own stopping rule: R trades cache reuse against
+the scores buffer, `n_head * R * n_ctx` floats, which on Qwen3 at R = 32 is
+4 MB against this board's 1 MB of L2 -- **so the curve had to turn somewhere,
+and if it did not, the sweep was fitting and would stop.**
+
+```
+  prompt ms      R=2    R=4    R=8    R=16   R=32
+  qwen3          656    656    650    656    651
+                 666    702    658    652    652
+  gemma3         824    817    836    821    816
+                 827    831    828    836    829
+  tinyl          834    844    838    851    847
+                 837    836    840    841    852
+```
+
+Flat, on all three, across a sixteenfold range. **It did not turn**, so R is not
+what binds here and no default moves.
+
+Which is itself the answer about attention: at 110 tokens the whole KV cache of
+a layer is 0.9 MB and stays in L2, so reuse is not the constraint. Counting the
+arithmetic -- 6105 query-key pairs, 16 heads, 128 wide, dot and axpy -- gives
+about 1.4 GFLOP a prompt in 110 ms, **12.7 GFLOP/s across four A72s and four
+A53s**, which is close to what this board can do. There is no factor sitting in
+attention at this length.
+
+### The scoreboard at the end of the day
+
+Same kernel `2ffc0913`, governor performance, `CHARSIU_BENCH_REPEAT=6`:
+
+```
+                 TTFT ours   theirs    gap      decode ours   theirs
+  Qwen3 0.6B       602        469     1.28x      24.90        24.85
+  TinyLLAMA 1.1B   870        544     1.60x      20.76        19.71
+  Phi3 3.8B       2963       1829     1.62x       6.89         6.58
+  Gemma4 E2B      2225       1219     1.83x       8.71         9.23
+```
+
+Across the three readings of this kernel:
+
+```
+             yesterday    this morning    now
+  Qwen3      687  1.47x   653  1.39x     602  1.28x
+  TinyLLAMA  900  1.65    890  1.64      870  1.60
+  Phi3      3057  1.67   2994  1.64     2963  1.62
+  Gemma4    2352  1.93   2272  1.86     2225  1.83
+```
+
+⚠ Those are three different sessions and the board drifts about 3%. What makes
+the column trustworthy is that it agrees with the paired in-session numbers the
+five changes were each measured with. On qwen3 those were -1.4% (per-slice
+input buffers), -1.4% (the tail scale), -2.9% (the rope table), -1.5% (rope in
+place) and -4.9% (the rope stage pooled), which compound to **-11.6%** against a
+measured 687 -> 602, or **-12.4%**.
+
+**Qwen3's decode is now above the vendor's** and three of four models are at or
+above it.
+
+Everything shipped today came from two moves, used five times:
+
+1. **Name the unnamed row before optimising a named one.** The pack's FINI
+   ioctls and the tail per-channel scale were both found by printing an
+   instrument that already existed and had never been read.
+2. **Look at the half nobody has looked at.** Two days went into the matmul
+   entry, which is 57 to 74% of the prompt. All three rope changes came out of
+   the other half, in the last few hours, after "there must be a way out."
