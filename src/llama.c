@@ -5056,6 +5056,60 @@ static int attn_npu_layer(struct attn_block_job *j)
  * CHARSIU_ROW_POOL=0 is the control arm, because a pool call is a barrier and
  * a stage can be too small to pay for one.
  */
+/*
+ * ⚠⚠ 262144 tanhf CALLS A TOKEN, SINGLE THREADED, INSIDE `output head`.
+ *
+ * gemma4 declares final_logit_softcapping and gemma3 does not, and that one
+ * line of metadata is the whole of why their heads price differently. Every
+ * stage of both models lands on one line fitted from gemma4's largest call and
+ * its smallest -- us a call = 79 + 54.8 a MB, 18.2 GB/s -- within 27 us:
+ *
+ *   gemma3 head   169.9 MB   predicted  9390 us   measured  9380
+ *   gemma4 head   226.5 MB   predicted 12496 us   measured 17710   +5214
+ *
+ * 5.21 ms above the line on ONE call, 5.2% of a 100.9 ms token, and the NPU
+ * cannot be the reason: round 411 moved gemma4's head to a single K slice and
+ * it gave back 0.53 ms of the 5.21. The rest is this loop, which is not on the
+ * NPU at all and was never charged to anything but the head it sits under.
+ *
+ * The squash is exact here, not approximated -- tanhf, the same call, in the
+ * same order -- because the answer must not move. All this changes is which
+ * core evaluates it.
+ *
+ * CHARSIU_SOFTCAP_POOL=0 is the control arm, and the threshold is real: the
+ * pool call is a barrier and a 32000 wide vocabulary may not pay for one.
+ */
+struct softcap_job {
+	float *y;
+	float c;
+};
+
+static void softcap_rows(void *ctx, uint64_t i0, uint64_t ni)
+{
+	const struct softcap_job *j = ctx;
+	float *y = j->y;
+	uint64_t i;
+
+	for (i = i0; i < i0 + ni; i++)
+		y[i] = tanhf(y[i] / j->c) * j->c;
+}
+
+static void softcap_logits(float *y, size_t n, float c)
+{
+	struct softcap_job j = { y, c };
+	const char *e = getenv("CHARSIU_SOFTCAP_POOL");
+	unsigned min = 8192;
+
+	if (c <= 0.0f)
+		return;
+	if (e && *e)
+		min = *e == '0' ? (unsigned)-1 : 0;
+	if (charsiu_threads() > 1 && n > min)
+		charsiu_parallel_for(softcap_rows, &j, (uint64_t)n);
+	else
+		softcap_rows(&j, 0, (uint64_t)n);
+}
+
 struct silu_rows_job {
 	struct llama_state *s;
 	int gelu;
@@ -6502,10 +6556,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
-	if (m->final_softcap > 0.0f)
-		for (uint32_t i = 0; i < m->n_vocab; i++)
-			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
-				       m->final_softcap;
+	softcap_logits(s->logits, m->n_vocab, m->final_softcap);
 	s->pos = pos0 + n;
 	return 0;
 }
@@ -6537,10 +6588,8 @@ int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 			m->n_embd, m->rms_eps);
 	matmul_rows(s, m->output, s->bxb, n, logits_all, m->n_embd,
 		    m->n_vocab);
-	if (m->final_softcap > 0.0f)
-		for (size_t i = 0; i < (size_t)n * m->n_vocab; i++)
-			logits_all[i] = tanhf(logits_all[i] / m->final_softcap)
-					* m->final_softcap;
+	softcap_logits(logits_all, (size_t)n * m->n_vocab,
+		       m->final_softcap);
 	s->pos = pos0 + n;
 	return 0;
 }
@@ -6971,10 +7020,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	 * measured leave even that off, so this is here for the ones that
 	 * declare it rather than as something every gemma needs.
 	 */
-	if (m->final_softcap > 0.0f)
-		for (uint32_t i = 0; i < m->n_vocab; i++)
-			s->logits[i] = tanhf(s->logits[i] / m->final_softcap) *
-				       m->final_softcap;
+	softcap_logits(s->logits, m->n_vocab, m->final_softcap);
 	STAGE(ST_HEAD);
 	if (stage_on)
 		stage_tok++;
