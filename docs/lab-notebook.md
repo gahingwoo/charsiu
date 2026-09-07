@@ -4532,3 +4532,76 @@ between one chunk and two.
 The function optimises the read back and does not know the chunk exists. Which
 of the two is faster has never been measured, on any model. It is the same
 trade KFIT just lost, run in the opposite direction.
+
+## 2026-09-07 late: the quantiser decision, priced — and it is the user's
+
+Where gemma4's prefill actually goes, 93 rows, warm, measured:
+
+```
+  prompt total                    1589 ms
+  fence -- which IS the MAC time   372 ms   0.465 TMAC/s
+  read back                        433      836 MB at 1.93 GB/s
+  pack                             239
+```
+
+The vendor does the same prompt in about 1021 ms. If their MAC runs at our
+rate, that is 372 ms of arithmetic and **649 ms for everything else** -- and
+our read plus pack alone is 672. We are not slower at the maths. We move more
+bytes around it.
+
+**Every lever on the read is closed except one.** read fusion lost 2.3x on
+this board on all eight models (one read stream, four write streams, and an
+A72 store buffer that will not merge interleaved partial lines); read_rows4
+and read_rows2 both lost; the NEON form was bit-identical and moved nothing;
+KFIT trades the read for a chunk and loses; the fence is already the MAC.
+
+What is left is the quantisation group, because the read back is
+`m * n * ceil(K / KMAX) * 4` and the vendor's own .rkllm dispatches K =
+2048/4096 and never 1024. Round 425, gemma4, three reps an arm, 76 token
+prompt -- short enough that every arm still runs ONE chunk, so this is the
+lever without the chunk cost:
+
+```
+  group   slices   prompt        decode
+   1024      937   1263 ms       9.78 tok/s
+   2048      486   1082  -14.3%  9.96  +1.8%
+   4096      256   1222   -3.2%  9.65  -1.3%   <- capped to 40, two chunks
+```
+
+**2048 is the optimum and 4096 is worse**, exactly as the chunk arithmetic
+predicted: a wider group widens the slice, which lowers the chunk cap, which
+splits the prompt and reads every weight again.
+
+⚠ At the scoreboard's 111 tokens group 2048's cap of 80 splits the prompt, so
+the -14.3% becomes about -9.6%. 76 rows flatter it.
+
+### It changes the weights, and here is what that looks like
+
+Same prompt, temperature 0, 60 tokens:
+
+```
+  1024  ...a man of unyielding resilience and quiet fortitude. He was a man who
+        faced relentless adversity with a stoic acceptance of his harsh
+        circumstances, yet he possessed an inner strength that allowed him to
+        endure even the most brutal conditions.
+
+  2048  ...a man of profound resilience. He was a man who didn't succumb to
+        despair when faced with overwhelming adversity. He was a man who found
+        a way to persevere through seemingly insurmountable odds. He was a man
+        who possessed an unwavering determination to keep going
+
+  4096  ...a man of profound resilience and quiet fortitude. He was a man who
+        faced adversity not with despair, but with a quiet, unwavering resolve.
+        He was a man who understood that life is not always easy, and that even
+        in the face of overwhelming
+```
+
+All three are usable. 2048 repeats its sentence frame four times where 1024
+varies it, and 4096 reads closer to 1024 than 2048 does -- so the quality is
+not monotonic in the group width, which is itself worth knowing.
+
+⚠⚠ **One prompt, one sample, greedy. That is not a quality measurement** and
+nothing here should be read as one. It is what the change looks like, put
+beside what it costs, so that a person can decide. `llama_auto_kmax` declines
+this widening on gemma4 by design and says why; overriding it is
+`CHARSIU_NPU_KMAX=2048 CHARSIU_NPU_W4_GROUP=2048`.
