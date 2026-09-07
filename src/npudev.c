@@ -1300,7 +1300,12 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->qos_fd = -1;
 	g->dev[0] = charsiu_open(NULL);
 	g->ndev = 1;
-	if (g->dev[0] && !getenv("CHARSIU_NPU_ONEDEV")) {
+	/* ⚠ charsiu_env_flag, NOT `!getenv`. As an existence test
+	 * CHARSIU_NPU_ONEDEV=0 -- the spelling anybody reaching for two cores
+	 * would write -- turned the second core OFF, and round 150 wants this
+	 * variable as the named knob of a paired arm. Same shape as
+	 * CHARSIU_NPU=0 opening the NPU. */
+	if (g->dev[0] && !charsiu_env_flag("CHARSIU_NPU_ONEDEV", 0)) {
 		g->dev[1] = charsiu_open(NULL);
 		if (g->dev[1])
 			g->ndev = 2;
