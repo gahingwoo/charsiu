@@ -3819,13 +3819,24 @@ void llama_stages_report(void)
 
 				charsiu_npu_batch_pack_split(bmm_dev, &em,
 							     &fi, 0);
+				/*
+				 * ⚠ THESE SPLIT `the rest`, NOT `packer`.
+				 * npudev's tpe starts AFTER bpackcall_us is
+				 * banked, so emit and fini do not overlap the
+				 * packer call at all -- and the board agrees to
+				 * the hundredth: emit 0.07 + fini 0.31 = 0.38,
+				 * which is `the rest` exactly. Printing
+				 * `pc - em - fi` as "the packer itself" was a
+				 * subtraction across disjoint intervals, and it
+				 * was wrong for the ten minutes it existed.
+				 */
 				if (em > 0.0 || fi > 0.0)
 					fprintf(stderr, "  %-16s emit %.2f  fini"
-						" %.2f  the packer itself %.2f"
-						" ms a row\n", "of the packer:",
+						" %.2f ms a row  (these two are"
+						" `the rest` above)\n",
+						"of that rest:",
 						em / bstage_rows,
-						fi / bstage_rows,
-						(pc - em - fi) / bstage_rows);
+						fi / bstage_rows);
 			}
 			/*
 			 * ⚠ AND OF THE FENCE, when the probe was asked for.
