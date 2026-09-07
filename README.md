@@ -12,8 +12,8 @@ column of two, and the other one is why this table has three rows:
   qwen3 0.6B, one board, one session
 
                         decode tok/s     TTFT ms      perplexity, 600 tokens
-  charsiu int4 (default)     26.30          594        49.89     +87%
-  charsiu int8               17.16          751        27.07     +1.6%
+  charsiu int4 (default)     26.31          602        49.89     +87%
+  charsiu int8               17.23          543        27.07     +1.6%
   the vendor's runtime       24.85          469          ?         ?
 ```
 
@@ -24,16 +24,24 @@ Nobody has scored the vendor's `.rkllm` for quality, so the row that the speed
 claim is made against is the one row with no quality number at all, and until
 it exists neither of the other two rows can be read as "better".
 
-What the three rows do say, and it is not nothing: **int4 is fast and its
-answers are 87% worse than a plain q4_0 gguf; int8 gets to 1.6% of that gguf
-and gives up a third of decode; the vendor sits between them on speed.** Where
-it sits on quality decides whether charsiu's fast row is a fair trade or a bad
-one, and that measurement does not exist.
+**Neither of charsiu's rows wins outright and they lose in different places.**
+int4 decodes 5.9% faster than the vendor and starts 28% slower. int8 starts
+15.8% slower instead of 28%, gives up a third of decode, and its answers are
+within 1.6% of a plain q4_0 gguf where int4's are 87% worse. int4 is the
+default because chat is a short prompt and a long answer; `CHARSIU_NPU_W4V=0`
+selects int8 for the other shape of work.
 
-`tools/rkllm_regcmd.py` reads a `.rkllm` without a board or a vendor runtime.
-If the weights and their quantisation parameters can be lifted out of the same
-file and fed to `charsiu_ppl`, the cell fills with no RKLLM install and no
-logits. That is the open question, not a plan.
+⚠ int8's TTFT column was WORSE than int4's until 2026-09-08. Its batched
+activation quantiser ran two scalar passes on one thread where int4's packer
+was pooled and vectorised; fixing that took int8's prefill from 6.41 to 4.59 ms
+a row and turned the sign. A number in this table is one commit old at best.
+
+`tools/rkllm_regcmd.py` reads a `.rkllm` without a board or a vendor runtime,
+and the file is not encrypted: the weights are packed int4 for the layers,
+int8 for the output head, fp16 for the token embeddings, told apart by whether
+a byte's two nibbles carry the same distribution. If they can be dequantised
+and scored with `charsiu_ppl`, the cell fills with no RKLLM install. That is
+the open question, not a plan.
 
 **The perplexity column is the only number here that survives a reboot.**
 `tools/charsiu_ppl` is deterministic to the last digit across boots; everything
@@ -357,24 +365,24 @@ formats, best of 6 at the same prompt lengths, same session:
 ```
                  decode tok/s              TTFT ms
               int4    int8   int8/int4   int4   int8   int8
-  Qwen3      26.30   17.16     65.2%      594    751   +26.4%
-  TinyLLAMA  22.89   12.88     56.3%      869    971   +11.7%
-  Phi3        7.06    3.85     54.5%     2818   3091    +9.7%
-  Gemma4      9.42    5.55     58.9%     2190   2512   +14.7%
+  Qwen3      26.31   17.23     65.5%      602    543    -9.8%
+  TinyLLAMA  22.83   12.87     56.4%      867    821    -5.3%
+  Phi3        7.07    3.85     54.5%     2764   2636    -4.6%
+  Gemma4      9.33    5.52     59.2%     2187   2076    -5.1%
 ```
 
-⚠⚠ **int8 IS SLOWER ON THE PROMPT TOO, on all four.** This section said the
-opposite for a few hours this morning, on the strength of `PLAN.md`'s "int8 is
-the faster prefill arm". That measurement is real and it is **stale**: it was
-taken when int8 batched and int4 did not, and the 3.3x batched w4a16 prefill
-landed since. int4 caught up and went past. So the crossover rule `PLAN.md`
-still carries -- int8 above a prompt 3.1x the generated text -- has lost the
-term it was built on.
+⚠⚠ **This table read the other way for forty minutes this morning.** int8's
+TTFT column was +9.7 to +26.4% until its batched activation quantiser was
+vectorised and pooled -- two scalar passes on one thread, where int4's packer
+was already both. That took int8's prefill from 6.41 to 4.59 ms a row and
+turned the sign on every model. The earlier numbers were correctly measured on
+a binary one commit old.
 
-**int8 is a quality option, not a speed one.** It costs about a third of decode
-and about 15% of TTFT, and it buys 49.89 -> 27.07 in perplexity, which is
-llama.cpp's own q4_0 to within 1.6%. int4 stays the default. Ask for int8 when
-the answer matters more than the rate:
+**int8 costs decode and buys both the prompt and the answer.** About a third of
+decode, against a TTFT 4.6 to 9.8% BELOW int4's on all four models and a
+perplexity of 27.07 against 49.89 -- llama.cpp's own q4_0 to within 1.6%. int4
+stays the default because chat is a short prompt and a long answer. Ask for
+int8 when the prompt is long or the answer matters:
 
 ```
 $ CHARSIU_NPU_W4V=0 charsiu run Qwen3-0.6B "summarise this document ..."

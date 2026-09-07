@@ -1753,9 +1753,31 @@ prompts:
 ```
 
 **int8 is slower on the prompt on all four**, by 10 to 26%. There is no
-crossover to compute: it is behind on both axes now, so no P and G make it win
-on time. What it wins is quality -- ppl 49.89 -> 27.07, llama.cpp's own q4_0 to
-within 1.6% -- and that is the only reason to reach for it.
+crossover to compute: it is behind on both axes now.
+
+⛔ **THAT HELD FOR FORTY MINUTES.** The table above was measured at 08:41 and
+int8's batched activation quantiser was vectorised and pooled at 09:2x -- two
+scalar passes on one thread, where int4's packer was already both. Its prefill
+went 6.41 -> 4.59 ms a row against int4's 5.36, and the scoreboard re-run says
+the sign is the other way on every model:
+
+```
+                int4 TTFT   int8 TTFT   int8
+  Qwen3             602         543    -9.8%
+  TinyLLAMA         867         821    -5.3%
+  Phi3             2764        2636    -4.6%
+  Gemma4           2187        2076    -5.1%
+```
+
+**So there IS a crossover again, and int8 is on the right side of it for a
+prompt.** Against the vendor's 469 ms on Qwen3, int4 is 28.4% behind and int8
+15.8% -- half the gap, from a packing loop. The rule is not restored, because
+the 19.24/26.60 pair it was built on is still from a world without batched int4
+prefill; what is restored is the SHAPE of the trade. int8 costs about a third
+of decode and buys a faster prompt and a 45% lower perplexity.
+
+⚠ Two stale readings in one file in one day, both mine, both written from a
+measurement that a later commit invalidated. The numbers were right when taken.
 
 ⚠ The four numbers in the block above are not wrong and are not deleted. They
 were taken on Llama-3.2-1B before the batched prefill existed, and they are
