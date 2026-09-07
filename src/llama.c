@@ -1951,13 +1951,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		 * the time is not the hardware at all.
 		 */
 		{
-			double pk, sb, fn, rd, pr, al;
+			double pk, sb, fn, rd, pr, al, sc;
 			unsigned an = 0;
 			char tcol[24];
 
 			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			pr = charsiu_npu_batch_prep(s->pool.dev, 1);
 			al = charsiu_npu_batch_alloc(s->pool.dev, &an, 1);
+			/* ⚠ RESET IT TOO, or this per width row keeps a whole
+			 * run's tail scale while its other four segments are
+			 * cleared each iteration -- two counters in one line
+			 * disagreeing about what they cover, which is the
+			 * exact shape of the bug the note above records. */
+			sc = charsiu_npu_batch_scale(s->pool.dev, 1);
 			/*
 			 * ⚠ AND WHAT IS STILL MISSING. The five segments are
 			 * printed with the remainder beside them, because the
@@ -1978,13 +1984,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
 			       "   prep %4.0f (alloc %4.0f x%u)  pack %4.0f"
 			       "  submit %3.0f  fence %5.0f  read %4.0f"
-			       "  rest %4.0f\n",
+			       "  scale %4.0f  rest %4.0f\n",
 			       mr, tcol, worst, rows_ok, rows_tot, t_one,
 			       t_bat, t_bat > 0 ? t_one / t_bat : 0.0,
 			       t_bat * 1e3 / (tested * (double)mr),
 			       t_bat > 0 ? mb / t_bat : 0.0,
-			       pr, al, an, pk, sb, fn, rd,
-			       t_bat - (pr + pk + sb + fn + rd));
+			       pr, al, an, pk, sb, fn, rd, sc,
+			       t_bat - (pr + pk + sb + fn + rd + sc));
 		}
 		rc = 0;
 	}
@@ -3766,14 +3772,30 @@ void llama_stages_report(void)
 			 * be printed as a residue.
 			 */
 			double pr = charsiu_npu_batch_prep(bmm_dev, 0);
+			/*
+			 * ⚠ THE SIXTH SEGMENT, AND int8 IS WHY IT NEEDED ONE.
+			 *
+			 * charsiu_npu_batch_scale has existed as long as the
+			 * pool's own report, which has printed it all along;
+			 * this table never asked for it, so the per channel
+			 * tail multiply sat in `unaccounted`. That cost
+			 * nothing while every board round ran int4, because
+			 * grouped int4 SKIPS that branch -- its scale rides in
+			 * with the slice -- and it is the one segment the two
+			 * formats do not share. Round 143 put int8's TTFT 10
+			 * to 26% behind int4's and this is the first place to
+			 * look. Same lesson as `prep` one field to the left.
+			 */
+			double sc = charsiu_npu_batch_scale(bmm_dev, 0);
 
 			fprintf(stderr, "  %-16s pack %.2f  submit %.2f  fence %.2f"
-			       "  read %.2f  prep %.2f  unaccounted %.2f "
-			       "ms a row\n",
+			       "  read %.2f  scale %.2f  prep %.2f"
+			       "  unaccounted %.2f ms a row\n",
 			       "of the entry:", pk / bstage_rows,
 			       sb / bstage_rows, fn / bstage_rows,
-			       rd / bstage_rows, pr / bstage_rows,
-			       (bmm_entry_ms - pk - sb - fn - rd - pr)
+			       rd / bstage_rows, sc / bstage_rows,
+			       pr / bstage_rows,
+			       (bmm_entry_ms - pk - sb - fn - rd - sc - pr)
 			       / bstage_rows);
 			/*
 			 * ⚠⚠ THE FENCE BY WIDTH, INSIDE ONE RUN OF ONE MODEL.
