@@ -814,6 +814,8 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	}
 
 	if (alpha != 0.0) {
+		const char *sg = getenv("CHARSIU_NPU_AWQ_SIGN");
+		double awq_sign = sg && *sg == '+' ? 1.0 : -1.0;
 		double *col = calloc(k, sizeof(*col));
 		double gm = 0.0;
 		const char *sf = getenv("CHARSIU_AWQ_STATS");
@@ -864,7 +866,23 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 
 				if (v < 1e-3 * mean)
 					v = 1e-3 * mean;
-				col[i] = pow(v, alpha);
+				/*
+				 * ⚠⚠ NEGATIVE, AND THAT IS THE WHOLE METHOD.
+				 *
+				 * quant_rows DIVIDES the weights by this factor
+				 * and the activation is MULTIPLIED by it, so
+				 * W' = W/f and x' = x*f. AWQ asks for the other
+				 * one: W' = W*s with s = (mean|x|)^alpha, which
+				 * PROTECTS the columns that meet large
+				 * activations by giving them more of the int4
+				 * grid. With a positive exponent this file
+				 * shrinks exactly those columns instead.
+				 *
+				 * f = 1/s, so the exponent is -alpha.
+				 * CHARSIU_NPU_AWQ_SIGN=+ restores the old sense
+				 * as the control.
+				 */
+				col[i] = pow(v, awq_sign * alpha);
 				gm += log(col[i]);
 			}
 		}
