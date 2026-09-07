@@ -4180,3 +4180,127 @@ measured reading at. That is where the last 2.5% is, and it is a bandwidth
 question, not an attention one.
 
 TTFT moved with it: 609 / 866 / 2934 / 2183, so 1.30 / 1.59 / 1.60 / 1.79.
+
+## 2026-09-07 evening: the bandwidth question, answered by refusing it
+
+The handoff above says gemma4's last 2.5% is bandwidth -- "gate + up 35.06 ms
+and down 19.73, 55% of the token in two weight reads, at the 9.74 GB/s the
+hardware path reports against the 11.9 this board has been measured reading
+at. Ask why the weight fetch runs at 82%."
+
+Every part of that is wrong, and the tree said so before the round started.
+
+**npudev.c already refuses the number it quotes.** The 9.74 GB/s is
+`weight_mb / busy_us`, and the comment beside it: *"The 550 MB a token over
+58.4 ms that reads as '9.4 GB/s, the bandwidth roof' is an average over stages
+that run from 6.67 GB/s (q k v) to 15.60 (the head): a roof does not have a
+2.3x spread across shapes, a fixed cost does."*
+
+**gemma4's own stage table says the same, from its gguf shapes:**
+
+```
+  stage                        MB a token     ms    GB/s
+  q k v                              81.0    8.15    9.9
+  o proj                             74.3    6.05   12.2
+  gate + up                         583.9   34.77   16.8    the BIGGEST is the FASTEST
+  down                              292.0   19.51   15.0
+  residual (per-layer embedding)     15.5    6.37    2.4
+```
+
+`gate + up` is above every rate this board has ever been quoted at. There is
+no 82% to recover there.
+
+### What the board's own three-term fit says, once the grep stops eating it
+
+`charsiu_npu_report` has fitted `us a call = A + B a task + C a MB` on every
+run since it was written -- `llama_state_free` calls it ungated -- and every
+round's grep has discarded it, m105's included. Rounds 410 and 411 truncated
+it mid-word before 412 finally kept it:
+
+```
+  gemma4   us a call = 43 + 7.7 a task + 116.7 a MB   of 4277 ms: 435 per call,
+                                                      185 per task, 3288 weights
+                                                      at 16.98 GB/s across 2 cores
+  gemma3   us a call = 51 + 3.2 a task + 114.3 a MB   of 1881 ms: 257 per call,
+                                                       26 per task, 1496 weights
+                                                      at 16.38 GB/s across 2 cores
+```
+
+**The two models stream at the same rate.** Dispatch is 10% of gemma4's
+hardware path and 14% of gemma3's. Neither is bandwidth-starved and neither is
+dispatch-bound. gemma4 is simply a bigger model a token: 211 calls where
+gemma3 makes 105, and 1140 MB of weights where gemma3 reads 545.
+
+### Slices are cheap, and that killed my own hypothesis
+
+Predicting the slice count from the gguf shapes and checking it against the
+board: gemma4 933 predicted / 937 measured, gemma3 292 / 292 exact. The reason
+they differ is `llama_auto_kmax`, which leaves gemma4 at KMAX 1024 and gives
+gemma3 2048 -- gemma4's `down` has K = 6144 and 12288, exact multiples of
+1024, and the rule declines the WHOLE MODEL when ANY K would regroup.
+
+So: cut the slices, cut the cost. Round 411 cut them 937 -> 486, a 37% drop in
+tasks, and bought **1.2% of the token**. Round 412's `CHARSIU_NPU_KFIT` cut
+them to 693 -- 691 predicted, so the model is right -- and bought 1.1%.
+
+```
+              slices   tasks   hardware   a token   core balance
+  default        937   24080     4277 ms   101.3     1.03x
+  KMAX 2048      486   15280     4141       99.7     1.13x
+  KFIT           693   19216     4142      100.2     1.07x
+```
+
+⚠ And fewer slices makes the balance WORSE, visibly: `q k v` went 8.23 -> 9.05
+ms when its tensors fell to one slice and one core sat out the call. That is
+the hazard npudev.c already documents, arriving on cue.
+
+So PLAN.md section 2b's open speed half is answered: **KFIT is worth about 1%**,
+and it is not where gemma4's deficit is.
+
+### The one stage that misses the line, and it is not on the NPU
+
+Fitting gemma4's largest call against its smallest gives `79 us a call + 54.8
+us a MB`. Every stage of both models lands on it within 27 us:
+
+```
+  stage                calls   MB a call   measured   on the line   excess
+  q k v                   35       2.314        233           206      +27 us
+  o proj                  35       2.123        173           195      -22
+  gate + up               35      16.683        993           993       -0
+  down                    35       8.343        557           536      +21
+  residual = pl pair      70       0.221         91            91        0
+  gemma3 head              1     169.900       9380          9390      -10
+  gemma4 head              1     226.500      17710         12496   +5214
+```
+
+**5.21 ms above the line on one call, 5.2% of a 100.9 ms token**, against a
+2.5% deficit -- and gemma3's head, same 262144 vocabulary, same int4, sits
+dead on it.
+
+The difference is one line of metadata. gemma4 declares
+`final_logit_softcapping` and gemma3 does not, so llama.c ran **262144 scalar
+`tanhf` calls a token on one core**, inside `output head`, where nothing
+charged them separately. The NPU side is excluded twice over: giving that head
+a single K slice moved it 17.71 -> 17.18 (KMAX 2048) and 17.09 (KFIT), a tenth
+of the gap each.
+
+`softcap_logits()` pools it. The squash stays exact -- the same `tanhf` in the
+same order, only a different core -- and `CHARSIU_SOFTCAP_POOL=0` is the
+control.
+
+### ⚠⚠ Two traps this round walked into, both of which have bitten before
+
+**Hashing `charsiu_run`'s stdout hashes its own timings.** The `[load ... |
+prompt ... tok/s ...]` summary goes to stdout, so two identical texts never
+agree and two different ones cannot be told apart. Three host runs of one arm
+gave three hashes and looked like nondeterminism; the generated text was
+byte-identical every time and only the milliseconds moved. This is also why
+round 411's arms A and B "differed" -- nothing was shown either way. Strip
+`^\[` before hashing.
+
+**`d41d8cd98f00` turned up again**, from a model path that does not exist on
+the host, and three runs "agreed" about nothing.
+
+⚠ Round 412 arm 2 raised `CHARSIU_NPU_NMAX` to 16384 and **wedged both cores**:
+job timeouts and `rk_iommu ... MMU_DTE_ADDR is not functioning`. It recovered
+by the next arm. 8192 is a limit, not a default.
