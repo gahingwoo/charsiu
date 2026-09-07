@@ -4,23 +4,51 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** On a ROCK 4D, under the vendor's own measuring protocol, **all four
-models decode faster than the vendor**:
+**Status.** On a ROCK 4D, under the vendor's own measuring protocol, charsiu's
+default format decodes faster than the vendor on all four models. That is one
+column of two, and the other one is why this table has three rows:
 
 ```
-                     decode tok/s            time to first token, ms
-                     charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          26.59    24.85           610      469
-  TinyLLAMA 1.1B      22.85    19.71           866      544
-  Phi3 3.8B            7.02     6.58          2937     1829
-  Gemma4 E2B           9.26     9.23          2192     1219
+  qwen3 0.6B, one board, one session
+
+                        decode tok/s     TTFT ms      perplexity, 600 tokens
+  charsiu int4 (default)     26.30          594        49.89     +87%
+  charsiu int8               17.16          751        27.07     +1.6%
+  the vendor's runtime       24.85          469          ?         ?
 ```
 
-Best of six, `board_verify.sh 7`, the same prompt and protocol the vendor
-publishes. Every projection, including the output head, runs on the NPU at four
-bits, and the text is identical to what the CPU decode loop writes -- which is
-an internal check and covers less than it sounds like: see *What "identical"
-does not mean* below.
+⚠⚠ **THE EMPTY CELL IS THE POINT.** The speed column is measured against the
+vendor's runtime; the quality column is measured against llama.cpp's own q4_0
+on the same tokens (26.64) -- **a different program, on a different build.**
+Nobody has scored the vendor's `.rkllm` for quality, so the row that the speed
+claim is made against is the one row with no quality number at all, and until
+it exists neither of the other two rows can be read as "better".
+
+What the three rows do say, and it is not nothing: **int4 is fast and its
+answers are 87% worse than a plain q4_0 gguf; int8 gets to 1.6% of that gguf
+and gives up a third of decode; the vendor sits between them on speed.** Where
+it sits on quality decides whether charsiu's fast row is a fair trade or a bad
+one, and that measurement does not exist.
+
+`tools/rkllm_regcmd.py` reads a `.rkllm` without a board or a vendor runtime.
+If the weights and their quantisation parameters can be lifted out of the same
+file and fed to `charsiu_ppl`, the cell fills with no RKLLM install and no
+logits. That is the open question, not a plan.
+
+**The perplexity column is the only number here that survives a reboot.**
+`tools/charsiu_ppl` is deterministic to the last digit across boots; everything
+else on this board drifts about 3% between sessions and may only be compared
+inside one run. That is not a detail about a tool -- board time is the binding
+constraint on this project, and it means every speed claim needs its baseline
+re-run beside it while a quality regression can be caught weeks after it lands.
+The `board_verify.sh` tables carry their own control arm for exactly that
+reason. See *The instrument*.
+
+The four-model speed table, best of six under `board_verify.sh 7`, is further
+down under *What runs today*. Every projection including the output head runs
+on the NPU, and the generated text is identical to what the CPU decode loop
+writes -- an internal check that covers less than it sounds like: see *What
+"identical" does not mean*.
 
 **Prefill is the open front**, and the reason is measured rather than guessed.
 On gemma4's 93 row prompt the fence -- the hardware's own MAC time -- is 372 ms
@@ -437,9 +465,26 @@ exists and is not written here.
 model, both cores, and the CPUs held out of deep idle while the NPU is open (see
 below). `CHARSIU_STAGES=1` prints where a token goes, once per half of the run.
 
+The four-model speed table, best of six under `board_verify.sh 7`, on the
+vendor's own prompt and protocol:
+
+```
+                     decode tok/s            time to first token, ms
+                     charsiu   vendor        charsiu   vendor
+  Qwen3 0.6B          26.30    24.85           594      469
+  TinyLLAMA 1.1B      22.89    19.71           869      544
+  Phi3 3.8B            7.06     6.58          2818     1829
+  Gemma4 E2B           9.42     9.23          2190     1219
+```
+
+⚠ **Gemma4 is +2.1% and has read +0.3% on a different session.** This board
+drifts about 3% between boots, so that row is "level with the vendor", not
+"past it", and the three above it are the ones with a margin worth the name.
+⚠ And this is the int4 column: see the three-row table at the top for what
+these tok/s cost in perplexity.
+
 Three things moved decode from 82% of the vendor to parity, each measured on the
-board with a control (it has since gone past the vendor on all four models --
-see the table at the top -- but these are what closed the original gap):
+board with a control:
 
 - **the CPUs are held out of deep idle while the NPU is open.** rk3576's CPU_SLEEP
   costs 250 us to leave, a token is about 150 calls into the driver, and each call
