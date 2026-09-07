@@ -5334,3 +5334,50 @@ of TTFT. A quality option, not a speed one.
 
 ⚠ Phi-3.5 at eight bits fits: peak 4299 -> 6025 MB. On a smaller board it
 would not.
+
+### 🏁 Round 144: int8 generalises, on three models
+
+```
+                q4_0      int4      int8     int4 vs q4_0   int8 vs q4_0
+  qwen3        26.64     49.89     27.07        +87.3%          +1.6%
+  gemma4       38.41     53.47     39.83        +39.2%          +3.7%
+  tinyllama    18.89     22.78     19.12        +20.6%          +1.2%
+```
+
+The q4_0 arm runs first on each model as a corpus fingerprint. gemma4's w8a8,
+written down on 09-07 as 218168, is 39.83.
+
+⚠ **int4's damage is very model dependent and int8's closeness is not.** qwen3
+loses 87% at four bits and tinyllama 21%, a factor of four between them; both
+land within 4% of the reference at eight. So "int4 costs about 50%" was never
+a property of the format, and a single-model reading of it would have been
+wrong in either direction.
+
+### 🏁 Round 145: the batched path, scored for the first time in six weeks
+
+```
+                    token loop     --batch      difference
+  int4               49.8930      49.8877       -0.011%
+  int8               27.0668      27.8654       +2.95%
+```
+
+**The batched prefill costs int4 nothing.** That is worth stating plainly: the
+path that carries every prompt this runtime serves has been unmeasured since it
+shipped, and for the default format it is free.
+
+**It costs int8 2.95%,** which is the first sign that eight bits is not just
+"int4 with more bits" as far as the batched path is concerned. The one segment
+the formats do not share is the per channel tail multiply -- grouped int4 skips
+it because its scale rides in with the K slice, int8 always takes it.
+
+⚠⚠ **AND THAT NUMBER IS FOR A WIDTH THE PRODUCT DOES NOT USE.** `--batch` read
+`llama_prefill_chunk_cap()`, which is the surface CEILING -- 160 on qwen3 --
+while `charsiu_run`'s default chunk is 80. So the first number ever produced
+for "the quality of the batched path" was the quality of a path nobody runs.
+A probe that reads the cap has forgotten the product has a default of its own.
+Fixed: `--batch` takes `CHARSIU_PREFILL_CHUNK` or 80, the same rule, and prints
+both the chunk and the ceiling so a pasted line cannot be read as the other.
+
+Round 146 sweeps m over 8 / 40 / 80 / 160 to say whether 2.95% is a property of
+the width or of the code path, and reads the prefill table with `scale` named
+for the first time.
