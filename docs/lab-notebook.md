@@ -4325,3 +4325,50 @@ the host, and three runs "agreed" about nothing.
 ⚠ Round 412 arm 2 raised `CHARSIU_NPU_NMAX` to 16384 and **wedged both cores**:
 job timeouts and `rk_iommu ... MMU_DTE_ADDR is not functioning`. It recovered
 by the next arm. 8192 is a limit, not a default.
+
+## 2026-09-07 late: the scoreboard, and decode is done
+
+`board_vendor.sh`, best of six, kernel `2ffc0913`, rail 800 mV, governor
+performance. The second pass is the same script with `CHARSIU_SOFTCAP_POOL=0`,
+so the control ran on the same boot as the arm:
+
+```
+              decode ours   theirs   ours/theirs     this morning
+  Qwen3        26.59        24.85     107.0%         106.4%
+  TinyLLAMA    22.85        19.71     115.9%         116.1%
+  Phi3          7.02         6.58     106.7%         106.5%
+  Gemma4        9.26         9.23     100.3%          97.5%
+  Gemma4 ctrl   8.99         9.23      97.4%    <- softcap serial, same boot
+```
+
+**All four models are at or above the vendor's decode.** Four things agree at
+once, which is more than the arm alone would give:
+
+- the arm beats the vendor and the control does not;
+- **the control reproduces this morning's 9.00** to within 0.01, so the
+  baseline is the baseline and not a drift;
+- the three models that declare no softcapping did not move -- 107.0 / 115.9 /
+  106.7 against 106.4 / 116.1 / 106.5, all inside the 3% band;
+- **TTFT is 2192 in both arms**, which is what a change that runs once a
+  prefill and 262144 times a decode has to look like.
+
+TTFT: 610 / 866 / 2937 / 2192, so 1.30 / 1.59 / 1.61 / 1.79 against theirs.
+
+### ⚠ And one change I got wrong on the way
+
+I committed `act_mul` -- the same elementwise join, split across the pool --
+default ON, reasoning by analogy from the rope and tail scale wins of the
+morning, without measuring it. The host, gemma-3-1b, 26 layers of 6912:
+
+```
+  CHARSIU_ACT_POOL=0    silu * up   0.18 ms a token
+  CHARSIU_ACT_POOL=1    silu * up   1.91 ms a token     10x WORSE
+```
+
+26 barriers a token against 7 us of work a layer. `llama.c`'s own note on the
+batched version of that same stage says it in as many words: a pool call is a
+barrier and a stage can be too small to pay for one. **An analogy is not a
+measurement**, and the default is off until a board round says otherwise --
+the board's serial loop is 10.4 ns an element against the host's 1.0, so the
+break-even for an eight way split lands near 7250 elements, which would split
+gemma4's twenty 12288 wide layers from its fifteen 6144 wide ones.
