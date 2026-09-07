@@ -264,13 +264,32 @@ instead. qwen3, 600 tokens of prose:
 ```
   llama.cpp's own q4_0, fp32 activations      26.64
   charsiu int4 w4a16, as it shipped           49.89      +87%
-  charsiu int4 w4a16, with AWQ                40.80      +53%
+  charsiu int4 w4a16, with AWQ                40.83      +53%
+  charsiu int8 w8a8                           27.07     +1.6%
 ```
 
-**The cause is not exotic.** q4_0 carries one fp16 scale per **32** weights;
-charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which `llama_auto_kmax` sets to
-1024. Thirty-two times coarser. The group cannot simply be narrowed, because
-the K slice **is** the group and the read back is `m·n·ceil(K/KMAX)·4` -- so a
+**The int8 row is a bug fix, not a new idea.** It read 272369 the night before
+-- noise -- and the reason was not the int8 path at all. `tensor_grouped()` in
+npudev.c decides whether a K slice may carry one group's scale and requires
+four things of a tensor, one of them being that the weights are four bits. The
+quantiser did not know that: it wrote `scale[row * ngrp + group]` for eight
+bits exactly as for four, and the int8 consumer read `scale[row]`, so every row
+took some other row's scale. There is a guard against precisely this, added
+after a partial last group did it to Qwen2.5-1.5B, and it tested one of the
+four conditions -- the one an int8 tensor at k 2048 and group 1024 satisfies.
+The quantiser now writes one scale a row for anything that is not four bits,
+and the guard asks `tensor_grouped()` itself rather than one of its clauses.
+
+At eight bits the coarser group costs nothing: on the host CPU reference, group
+1024 measures 44.81 and one scale a row 43.66, and the row is the better of the
+two because eight bits spans a row's spread on its own while finer scales only
+add their own rounding. Four bits is the opposite -- 91.66 against 114.22 --
+which is the whole reason the group exists.
+
+**Why the int4 row is +87%, and it is not exotic.** q4_0 carries one fp16
+scale per **32** weights; charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which
+`llama_auto_kmax` sets to 1024. Thirty-two times coarser. The group cannot
+simply be narrowed, because the K slice **is** the group and the read back is `m·n·ceil(K/KMAX)·4` -- so a
 finer group is paid for in prefill. Narrowing it does work, and the ladder is
 the evidence that the group is the cause:
 
@@ -291,10 +310,26 @@ exactly the ones the method exists to protect. It is off by default: it needs a
 calibration pass, and a tensor carrying a factor cannot share a packed input,
 so grouped q/k/v drop to single calls and decode gets slower.
 
+⚠ **And AWQ is a four-bit method.** At eight bits the factor's divide happens
+in the quantiser and its cancelling multiply has nowhere to live, because the
+int8 path packs one absmax quantisation of the whole activation vector: board,
+int8 with AWQ, 2162.73. It is declined above four bits now and says so. Even
+where it IS applied correctly -- the host CPU reference -- it makes int8 worse,
+43.66 off against 44.76 on, because it protects a dynamic range eight bits does
+not lack.
+
 ⚠ Perplexity on one passage is a weak instrument and these are first numbers,
 not a characterisation. What is not in doubt is the direction and the size:
 this was never measured before 2026-09-07, and "identical to the CPU loop" was
 carrying more weight in this file than it can hold.
+
+**What it changes.** int4 is still the default and still the right one for chat,
+which is a short prompt and a long answer: int8 moves twice the bytes a token
+and decode is memory bound. But the choice was priced entirely in tok/s until
+now, and the quality column runs the other way and hard -- 27.07 against 49.89.
+For prompt-heavy work, where `PLAN.md` already recommends int8 above a prompt
+3.1x the generated text, that is now better answers AND a faster prompt rather
+than a trade. `CHARSIU_NPU_W4V=0` selects it.
 
 ### The CPU baseline is meant to be honest
 
