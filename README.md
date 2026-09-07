@@ -329,7 +329,15 @@ and decode is memory bound. But the choice was priced entirely in tok/s until
 now, and the quality column runs the other way and hard -- 27.07 against 49.89.
 For prompt-heavy work, where `PLAN.md` already recommends int8 above a prompt
 3.1x the generated text, that is now better answers AND a faster prompt rather
-than a trade. `CHARSIU_NPU_W4V=0` selects it.
+than a trade.
+
+```
+$ CHARSIU_NPU_W4V=0 charsiu run Qwen3-0.6B "summarise this document ..."
+```
+
+The runner sets `CHARSIU_NPU_W4V=1` as a default, and `env_default` skips any
+variable the caller already set, so this wins and the run reports it under
+`# from the environment, not the config:`.
 
 ### The CPU baseline is meant to be honest
 
