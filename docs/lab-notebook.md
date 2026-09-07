@@ -5473,3 +5473,55 @@ August note quotes -- attach-once and the halved ioctls did land.
 prediction instead: `CHARSIU_NPU_NOGROUP=1` stops q/k/v and gate/up sharing a
 submit, taking the count from 113 to 197, which at 60 us is +5.0 ms a token.
 If the table moves by much less, the floor is smaller than the fit says.
+
+### 🏁 Round 148: the prediction held, and it killed the theory behind it
+
+`CHARSIU_NPU_NOGROUP=1` takes the call count from 113 to 197. The fit said
++5.0 ms a token. The board said **+10.6** (30.8 -> 41.4), which is 126 us a
+call, twice the 60 us two points had implied and close to the 130 us the August
+note quotes.
+
+```
+                 group ON   group OFF
+  ms a token        30.8       41.4
+  q k v             6.07      11.26
+  gate + up         7.30      11.78
+```
+
+⚠ Not all of that is dispatch: without grouping, q/k/v pack the same activation
+three times instead of once. The arm confirms a floor exists and is large; it
+does not measure it cleanly.
+
+⚠⚠ **AND THE NPU'S OWN SPLIT SAYS THE FLOOR IS NOT WHERE I WAS LOOKING.**
+
+```
+                        group ON   group OFF
+  hardware path (ms)       1699       2267
+    of it, the fence       1343       1939
+    of it, submitting       133        152
+    of it, summing          140         92
+  end to end               1832       2514
+  neither hardware nor pack   7         70
+  weights                11.58 GB/s  8.68 GB/s
+  a submit's wall clock    114 us     135 us
+```
+
+**End to end is 1832 against 1699 in the hardware path: 7.3% of a decode
+happens outside it, and 7 ms of that is neither hardware nor packing.** Every
+ioctl, malloc and cache clean on the CPU side, all of it together, is noise. I
+had spent an hour reading submit paths and counting syscalls, and the answer
+was that the CPU side is already finished.
+
+The floor is INSIDE the fence -- 1343 of 1699 ms -- and the report's own
+parenthesis says what else lives there: *"waiting for the fence (the invalidate
+is in there)"*. So that one number is the hardware computing, plus the wakeup
+from a blocking ioctl, plus the output BO invalidate. 11.58 GB/s inside the
+hardware path against a 15.7 GB/s marginal rate puts about 26% of it in a fixed
+per-submit cost, and two of those three components are not the hardware.
+
+🔑 **`CHARSIU_NPU_SPIN_US` splits it, and it has existed unpriced the whole
+time.** device.c: *"Off unless asked, until phase 21 has priced it against the
+arm that disables CPU_SLEEP outright."* Phase 21 priced the QoS hold and never
+came back. Polling with `timeout_ns = 1` before falling back to the blocking
+wait removes the wakeup and leaves the invalidate and the hardware, so the
+sweep attributes the fence rather than arguing about it. Round 149.
