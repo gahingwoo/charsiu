@@ -6501,7 +6501,6 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			else
 				res2_rows(&nj, 0, (uint64_t)n);
 		}
-		BSTAGE(ST_RES2);
 
 		/*
 		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not
@@ -6554,6 +6553,29 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					xr[i] += o[i];
 			}
 		}
+		/*
+		 * ⚠⚠ THE MARK IS HERE, AFTER THE PER LAYER EMBEDDING, AND IT
+		 * USED TO BE BEFORE IT -- which charged gemma4's two pl
+		 * projections to whatever ran next, and what runs next is the
+		 * NEXT LAYER'S attn rmsnorm. The table said so for weeks:
+		 *
+		 *   attn rmsnorm a row     gemma4    qwen3    work ratio
+		 *   board                   1.17     0.07       1.9x
+		 *   host                    7.74     0.05       1.9x
+		 *
+		 * 155x on the host for 1.9x the elements. A rmsnorm at 21.8 ns
+		 * an element against qwen3's 2.4 was never the reading; the
+		 * row was two batched matmuls wearing the norm's name.
+		 *
+		 * The decode path has always marked it here -- STAGE(ST_RES2)
+		 * sits after the same block -- so the two paths disagreed
+		 * about which stage pays for gemma4's whole architecture.
+		 *
+		 * ⚠ This moves no arithmetic. It is the instrument, and the
+		 * instrument was pointing at the wrong stage: an afternoon of
+		 * this round went into asking why gemma4's rmsnorm is slow.
+		 */
+		BSTAGE(ST_RES2);
 		/*
 		 * ⚠ ONE SCALAR THE WHOLE LAYER OUTPUT IS MULTIPLIED BY, and
 		 * this loop never had it. It is not in llama_batch_why_not
