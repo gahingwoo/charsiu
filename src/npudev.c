@@ -2589,6 +2589,43 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	if (g->t_first == 0.0)
 		g->t_first = t_add;
 	/*
+	 * ⚠⚠ AWQ IS NOT WIRED TO THIS PATH, AND IT FAILS LOUD NOW RATHER THAN
+	 * QUIETLY WRONG.
+	 *
+	 * npuquant folds the AWQ factor into the WEIGHTS and leaves t->kscale
+	 * for the caller to apply to the ACTIVATION -- its own note says "on
+	 * the board this is one multiply a k before the pack". That multiply
+	 * does not exist here: `kscale` appears twelve times in npuquant.c and
+	 * zero times in this file. So the weights are scaled and the input is
+	 * not, and the answer is not approximate, it is wrong.
+	 *
+	 * Round 433, qwen3, 200 tokens of perplexity on the card:
+	 *
+	 *   CHARSIU_NPU_AWQ off                     75.17
+	 *   CHARSIU_NPU_AWQ=0.5, column means      10755.75
+	 *   CHARSIU_NPU_AWQ=0.5, real |x| stats  65233808
+	 *
+	 * The better the statistic, the worse the output -- which is the
+	 * signature of an unapplied factor, since a truer |x| gives a more
+	 * extreme factor and nothing undoes it.
+	 *
+	 * It has been reachable and default-off since it was written, so
+	 * nothing shipped wrong; but "written, legal, default off" describes
+	 * three things and only the last was ever certain.
+	 */
+	if (t->kscale) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu NPU: CHARSIU_NPU_AWQ folds a "
+				"factor into the weights that this path never "
+				"applies to the activation -- the answers would"
+				" be WRONG, not approximate. Staying on the CPU"
+				" for %s and anything else carrying one.\n",
+				t->name);
+		return -1;
+	}
+	/*
 	 * ⚠ t->name IS A FIXED ARRAY INSIDE npu_tensor, not a stack buffer, so
 	 * it is still readable from a signal handler after this frame is gone.
 	 */
