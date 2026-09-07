@@ -940,6 +940,9 @@ struct llama_state {
 	/* the rope table cached per (position, window variant) for the whole
 	 * chunk, because it does not depend on the layer; see its allocation */
 	float *bcstab;
+	/* the q and k norm gains, dequantised once a layer for the pooled
+	 * rope stage; qk_norm's own static cannot be shared by two rows */
+	float *qkgain, *qkgain2;
 	unsigned char *bcstab_have;
 	/*
 	 * The batched q k v and the attention's output.

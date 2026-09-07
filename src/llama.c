@@ -2459,6 +2459,45 @@ static void qk_norm(float *v, uint32_t nheads, uint32_t hd,
 	}
 }
 
+/*
+ * ⚠⚠ THE SAME NORM WITH THE GAIN ALREADY IN HAND, BECAUSE qk_norm CANNOT BE
+ * CALLED FROM TWO THREADS.
+ *
+ * qk_norm keeps the dequantised gain in a `static` -- the buffer, its length,
+ * and which tensor it holds -- so a layer's two calls re-read one row instead
+ * of two. All three are written on the way through, INCLUDING the length check
+ * the no-gain case takes before it returns, so two rows normalising at once
+ * race on every one of them.
+ *
+ * The host caught it the first time the rope stage went on the pool: three
+ * models of four came back with different text and the fourth was Phi-3.5,
+ * which has no q_norm and never enters the function. That is as clean a
+ * fingerprint as a race gets, and it cost nothing, because the host runs this
+ * path with no card.
+ *
+ * So the pooled path dequantises each gain ONCE a layer, before the rows, and
+ * passes a read only pointer. NULL still means a bare RMS with no weight,
+ * which is what gemma4 does to V. Decode keeps qk_norm and its static.
+ */
+static void qk_norm_gain(float *v, uint32_t nheads, uint32_t hd,
+			 const float *gain, float eps)
+{
+	for (uint32_t h = 0; h < nheads; h++) {
+		float *p = v + (size_t)h * hd;
+		float ss = 0.0f, sc;
+
+		for (uint32_t i = 0; i < hd; i++)
+			ss += p[i] * p[i];
+		sc = 1.0f / sqrtf(ss / (float)hd + eps);
+		if (gain)
+			for (uint32_t i = 0; i < hd; i++)
+				p[i] = p[i] * sc * gain[i];
+		else
+			for (uint32_t i = 0; i < hd; i++)
+				p[i] *= sc;
+	}
+}
+
 static void rope(float *v, uint32_t nheads, uint32_t hd, const float *cs,
 		 int neox)
 {
@@ -3424,7 +3463,7 @@ void llama_state_free(struct llama_state *s)
 	 * for the server.
 	 */
 	free(s->bx); free(s->bxb); free(s->bxo);
-	free(s->bhb); free(s->bhb2); free(s->bcs); free(s->bcstab); free(s->bcstab_have);
+	free(s->bhb); free(s->bhb2); free(s->bcs); free(s->bcstab); free(s->bcstab_have); free(s->qkgain); free(s->qkgain2);
 	free(s->bq); free(s->bk); free(s->bv); free(s->bao);
 	free(s->bfreq);
 	free(s->bpl); free(s->bplg);
@@ -5045,12 +5084,12 @@ static void res2_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
-static int rope_inplace(void)
+static int rope_pool(void)
 {
 	static int v = -1;
 
 	if (v < 0) {
-		const char *e = getenv("CHARSIU_ROPE_INPLACE");
+		const char *e = getenv("CHARSIU_ROPE_POOL");
 
 		v = !(e && *e == '0');
 	}
@@ -5079,6 +5118,170 @@ static int row_pool(void)
 		v = !(e && *e == '0');
 	}
 	return v;
+}
+
+/*
+ * THE ROPE STAGE FOR EVERY ROW, ON THE POOL.
+ *
+ * ⚠ IT IS ONLY PARALLEL BECAUSE THE ROPE STOPPED GOING THROUGH A SHARED
+ * SCRATCH. While q, k and v were copied into s->q, s->k and s->v, every row
+ * wrote the same three buffers and this could not be split at all. In place
+ * they are one contiguous row each of s->bq, s->bk and s->bv, so a row touches
+ * nothing another row touches.
+ *
+ * ⚠ THE TABLE FLAGS ARE SAFE FOR THE SAME REASON: bcstab_have is indexed by
+ * (variant, row) and a thread owns whole rows.
+ *
+ * ⚠⚠ WHAT IS NOT IN HERE. The KV cache write is per row and would
+ * parallelise, but attn_npu_append beside it will not: it mutates a->dirty and
+ * a->packed, and attn_npu_fit can REALLOCATE the mirror mid-loop. Both stay in
+ * the serial loop rather than splitting a pair that has to see one instant.
+ */
+struct rope_rows_job {
+	struct llama_state *s;
+	const struct llama_model *m;
+	const struct llama_layer *L;
+	uint32_t hd, hdmax;
+	int pos0, swa, n;
+	const float *freqf;
+	/* dequantised once a layer by the caller; NULL where there is none */
+	const float *qgain, *kgain;
+};
+
+static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct rope_rows_job *j = ctx;
+	struct llama_state *s = j->s;
+	const struct llama_model *m = j->m;
+	const struct llama_layer *L = j->L;
+	uint32_t hd = j->hd, hdmax = j->hdmax;
+	const float *freqf = j->freqf;
+	int swa = j->swa, n = j->n;
+	uint64_t rr;
+
+	(void)hdmax; (void)swa;
+	for (rr = r0; rr < r0 + nr; rr++) {
+		int r = (int)rr;
+		int pos = j->pos0 + r;
+
+
+		/*
+		 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
+		 * HEAD. gemma3's window layers turn at 10000 and its
+		 * full ones at the model's own 1000000, and the file
+		 * carries no key saying so.
+		 *
+		 * ⚠⚠ AND WITH NO FREQUENCY FACTORS. llama.cpp gives
+		 * rope_freqs to the FULL layers only; this handed them
+		 * to both, which scales a frequency table a window
+		 * layer was never built for. It could not show on
+		 * gemma3, which carries no such tensor, and gemma4 is
+		 * the first model to arrive here with both a window and
+		 * a shorter window head.
+		 *
+		 * The condition is the token loop's, word for word:
+		 * a second table exists only where the base or the head
+		 * actually differs, and where it does not a window
+		 * layer takes the full one, factors and all.
+		 */
+		int swatab = swa && (m->swa_pattern || m->swa_arr) &&
+			     (m->rope_base_swa != m->rope_base ||
+			      m->head_dim_swa != m->head_dim);
+
+		/* ⚠ BUILT ONCE PER (POSITION, VARIANT) AND REUSED BY
+		 * EVERY LAYER. See the allocation. */
+		unsigned tv = swatab ? 1u : 0u;
+		float *cs = s->bcstab
+			  + ((size_t)tv * (size_t)n + (size_t)r)
+			    * hdmax;
+
+		/* ⚠ THE CONTROL, in the same binary: CHARSIU_ROPE_TAB=0
+		 * rebuilds the table every row of every layer, the way
+		 * it was, so the two arms can be interleaved in one
+		 * session and on the host. */
+		if (!rope_tab_cache() ||
+		    !s->bcstab_have[(size_t)tv * (size_t)n + r]) {
+			rope_table(cs,
+				   swatab ? m->head_dim_swa : hdmax,
+				   pos,
+				   swatab ? m->rope_base_swa
+					  : m->rope_base,
+				   swatab ? NULL : freqf);
+			s->bcstab_have[(size_t)tv * (size_t)n + r] = 1;
+		}
+		/*
+		 * ⚠⚠ IN PLACE, NOT THROUGH THE PER ROW SCRATCH.
+		 *
+		 * This copied q, k and v out of the batched buffers
+		 * into s->q, s->k and s->v, transformed them there,
+		 * and copied q back -- purely so the token loop's own
+		 * helpers could be reused unchanged. The batched
+		 * buffers already hold one contiguous row each, so
+		 * every one of those copies was moving data to where
+		 * it already was.
+		 *
+		 * On Qwen3 that is 8 kB of q in, 8 kB back, and 4 kB
+		 * each of k and v, per row PER LAYER: 672 kB a row over
+		 * 28 layers, 74 MB across a 110 token prompt.
+		 *
+		 * ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, and the
+		 * property that mattered survives: the token loop
+		 * leaves s->k and s->v from the previous layer and
+		 * never reads them, and these pointers likewise address
+		 * whatever the last projecting layer wrote. A shared KV
+		 * layer reads L->kv_from's cache either way.
+		 */
+		float *qr = s->bq + (size_t)r * m->n_head * hd;
+		float *kr = s->bk + (size_t)r * m->n_head_kv * hd;
+		float *vr = s->bv + (size_t)r * m->n_head_kv * hd;
+
+		/*
+		 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
+		 * here that is not interchangeable, and it is copied
+		 * from the token loop rather than reasoned about
+		 * again. Rope mixes element 2i with 2i+1, so norming
+		 * after it divides a rotated pair by a sum of squares
+		 * the rotation already changed; and rotating a biased
+		 * vector is not biasing a rotated one.
+		 */
+		if (L->bq) {
+			add_bias(qr, L->bq, m->n_head * hd);
+			/* ⚠ NO K MEANS NO K BIAS. The token loop adds
+			 * all three unguarded and would dereference
+			 * NULL here; no file in the zoo has both a
+			 * shared KV and attention biases, so neither
+			 * loop has ever reached it. */
+			if (L->wk) {
+				add_bias(kr, L->bk,
+					 m->n_head_kv * hd);
+				add_bias(vr, L->bv,
+					 m->n_head_kv * hd);
+			}
+		}
+		if (L->q_norm) {
+			qk_norm_gain(qr, m->n_head, hd, j->qgain,
+				m->rms_eps);
+			if (L->wk)
+				qk_norm_gain(kr, m->n_head_kv, hd,
+					j->kgain, m->rms_eps);
+		}
+		/*
+		 * ⚠ THE VALUE NORM IS THE SAME CALL, and refusing a
+		 * model for it was right only while this line did not
+		 * exist. gemma4 norms V with no gain -- llama.cpp
+		 * writes it as a bare rms_norm, so there is no weight
+		 * to find and the only place it exists is the graph --
+		 * and it is qk_norm with a NULL gain, per row, in the
+		 * same position the token loop puts it.
+		 */
+		if (m->v_norm && L->wk)
+			qk_norm_gain(vr, m->n_head_kv, hd, NULL,
+				m->rms_eps);
+		rope(qr, m->n_head, hd, cs, m->rope_neox);
+		if (L->wk)
+			rope(kr, m->n_head_kv, hd, cs,
+			     m->rope_neox);
+	}
 }
 
 static int attn_block(struct attn_block_job *j)
@@ -5586,7 +5789,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		return -1;
 	if (s->bx_n < (unsigned)n) {
 		free(s->bx); free(s->bxb); free(s->bhb);
-		free(s->bhb2); free(s->bxo); free(s->bcs); free(s->bcstab); free(s->bcstab_have);
+		free(s->bhb2); free(s->bxo); free(s->bcs); free(s->bcstab); free(s->bcstab_have); free(s->qkgain); free(s->qkgain2);
 		s->bx = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxb = malloc((size_t)n * m->n_embd * sizeof(float));
 		s->bxo = malloc((size_t)n * m->n_embd * sizeof(float));
@@ -5614,6 +5817,9 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 */
 		s->bcstab = malloc((size_t)n * hdmax * 2 * sizeof(float));
 		s->bcstab_have = malloc((size_t)n * 2);
+		free(s->qkgain); free(s->qkgain2);
+		s->qkgain = malloc((size_t)hdmax * sizeof(float));
+		s->qkgain2 = malloc((size_t)hdmax * sizeof(float));
 		/*
 		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
 		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
@@ -5898,146 +6104,51 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			memcpy(s->bv, s->bk,
 			       (size_t)n * m->n_head_kv * hd * sizeof(float));
 
+		/*
+		 * ⚠ ONE POOLED PASS, THEN A SERIAL ONE. The stage markers move
+		 * out of the row loop with the work: BSTAGE accumulates a
+		 * difference of timestamps, so calling it once a layer rather
+		 * than once a row changes the granularity, not the totals.
+		 */
+		BSTAGE(ST_QKV);   /* the three projections, before any row */
+		{
+			/* ⚠ ONCE A LAYER AND OFF THE POOL: gguf_row_f32 is what
+			 * qk_norm's static was caching, and it is exactly the
+			 * thing two rows must not do at once. */
+			const float *qg = NULL, *kg = NULL;
+			struct rope_rows_job rj;
+
+			if (L->q_norm && s->qkgain) {
+				gguf_row_f32(L->q_norm, 0, s->qkgain);
+				qg = s->qkgain;
+				if (L->k_norm && s->qkgain2) {
+					gguf_row_f32(L->k_norm, 0, s->qkgain2);
+					kg = s->qkgain2;
+				}
+			}
+			rj = (struct rope_rows_job){ s, m, L, hd, hdmax, pos0,
+						     swa, n, freqf, qg, kg };
+			/* ⚠ ITS OWN KNOB, NOT row_pool(). CHARSIU_ROW_POOL=0
+			 * turns off every row stage at once -- silu, the
+			 * residuals, the norms -- so an arm using it measures
+			 * all of them and calls the answer the rope's. This
+			 * one moves only the rope. */
+			if (rope_pool() && row_pool() && n > 1)
+				charsiu_parallel_for(rope_rows, &rj,
+						     (uint64_t)n);
+			else
+				rope_rows(&rj, 0, (uint64_t)n);
+		}
+		BSTAGE(ST_ROPE);
 		for (int r = 0; r < n; r++) {
 			int pos = pos0 + r;
-
-			/*
-			 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
-			 * HEAD. gemma3's window layers turn at 10000 and its
-			 * full ones at the model's own 1000000, and the file
-			 * carries no key saying so.
-			 *
-			 * ⚠⚠ AND WITH NO FREQUENCY FACTORS. llama.cpp gives
-			 * rope_freqs to the FULL layers only; this handed them
-			 * to both, which scales a frequency table a window
-			 * layer was never built for. It could not show on
-			 * gemma3, which carries no such tensor, and gemma4 is
-			 * the first model to arrive here with both a window and
-			 * a shorter window head.
-			 *
-			 * The condition is the token loop's, word for word:
-			 * a second table exists only where the base or the head
-			 * actually differs, and where it does not a window
-			 * layer takes the full one, factors and all.
-			 */
-			BSTAGE(ST_QKV);   /* row 0: the three projections; rows after: nothing */
-			int swatab = swa && (m->swa_pattern || m->swa_arr) &&
-				     (m->rope_base_swa != m->rope_base ||
-				      m->head_dim_swa != m->head_dim);
-
-			/* ⚠ BUILT ONCE PER (POSITION, VARIANT) AND REUSED BY
-			 * EVERY LAYER. See the allocation. */
-			unsigned tv = swatab ? 1u : 0u;
-			float *cs = s->bcstab
-				  + ((size_t)tv * (size_t)n + (size_t)r)
-				    * hdmax;
-
-			/* ⚠ THE CONTROL, in the same binary: CHARSIU_ROPE_TAB=0
-			 * rebuilds the table every row of every layer, the way
-			 * it was, so the two arms can be interleaved in one
-			 * session and on the host. */
-			if (!rope_tab_cache() ||
-			    !s->bcstab_have[(size_t)tv * (size_t)n + r]) {
-				rope_table(cs,
-					   swatab ? m->head_dim_swa : hdmax,
-					   pos,
-					   swatab ? m->rope_base_swa
-						  : m->rope_base,
-					   swatab ? NULL : freqf);
-				s->bcstab_have[(size_t)tv * (size_t)n + r] = 1;
-			}
-			/*
-			 * ⚠⚠ IN PLACE, NOT THROUGH THE PER ROW SCRATCH.
-			 *
-			 * This copied q, k and v out of the batched buffers
-			 * into s->q, s->k and s->v, transformed them there,
-			 * and copied q back -- purely so the token loop's own
-			 * helpers could be reused unchanged. The batched
-			 * buffers already hold one contiguous row each, so
-			 * every one of those copies was moving data to where
-			 * it already was.
-			 *
-			 * On Qwen3 that is 8 kB of q in, 8 kB back, and 4 kB
-			 * each of k and v, per row PER LAYER: 672 kB a row over
-			 * 28 layers, 74 MB across a 110 token prompt.
-			 *
-			 * ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, and the
-			 * property that mattered survives: the token loop
-			 * leaves s->k and s->v from the previous layer and
-			 * never reads them, and these pointers likewise address
-			 * whatever the last projecting layer wrote. A shared KV
-			 * layer reads L->kv_from's cache either way.
-			 */
+			/* the row's three vectors, where the pooled pass left
+			 * them; see rope_rows */
 			float *qr = s->bq + (size_t)r * m->n_head * hd;
 			float *kr = s->bk + (size_t)r * m->n_head_kv * hd;
 			float *vr = s->bv + (size_t)r * m->n_head_kv * hd;
 
-			/* ⚠ THE CONTROL, in the same binary:
-			 * CHARSIU_ROPE_INPLACE=0 puts the round trip through
-			 * the per row scratch back, so the two arms can be
-			 * interleaved in one session. Cross-session is worth
-			 * nothing here -- the board drifts 3% and this is
-			 * smaller than that on three of four models. */
-			if (!rope_inplace()) {
-				memcpy(s->q, qr,
-				       (size_t)m->n_head * hd * sizeof(float));
-				qr = s->q;
-				if (L->wk) {
-					memcpy(s->k, kr, (size_t)m->n_head_kv
-					       * hd * sizeof(float));
-					memcpy(s->v, vr, (size_t)m->n_head_kv
-					       * hd * sizeof(float));
-					kr = s->k;
-					vr = s->v;
-				}
-			}
-			/*
-			 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
-			 * here that is not interchangeable, and it is copied
-			 * from the token loop rather than reasoned about
-			 * again. Rope mixes element 2i with 2i+1, so norming
-			 * after it divides a rotated pair by a sum of squares
-			 * the rotation already changed; and rotating a biased
-			 * vector is not biasing a rotated one.
-			 */
-			if (L->bq) {
-				add_bias(qr, L->bq, m->n_head * hd);
-				/* ⚠ NO K MEANS NO K BIAS. The token loop adds
-				 * all three unguarded and would dereference
-				 * NULL here; no file in the zoo has both a
-				 * shared KV and attention biases, so neither
-				 * loop has ever reached it. */
-				if (L->wk) {
-					add_bias(kr, L->bk,
-						 m->n_head_kv * hd);
-					add_bias(vr, L->bv,
-						 m->n_head_kv * hd);
-				}
-			}
-			if (L->q_norm) {
-				qk_norm(qr, m->n_head, hd, L->q_norm,
-					m->rms_eps);
-				if (L->wk)
-					qk_norm(kr, m->n_head_kv, hd,
-						L->k_norm, m->rms_eps);
-			}
-			/*
-			 * ⚠ THE VALUE NORM IS THE SAME CALL, and refusing a
-			 * model for it was right only while this line did not
-			 * exist. gemma4 norms V with no gain -- llama.cpp
-			 * writes it as a bare rms_norm, so there is no weight
-			 * to find and the only place it exists is the graph --
-			 * and it is qk_norm with a NULL gain, per row, in the
-			 * same position the token loop puts it.
-			 */
-			if (m->v_norm && L->wk)
-				qk_norm(vr, m->n_head_kv, hd, NULL,
-					m->rms_eps);
-			rope(qr, m->n_head, hd, cs, m->rope_neox);
-			if (L->wk)
-				rope(kr, m->n_head_kv, hd, cs,
-				     m->rope_neox);
-			BSTAGE(ST_ROPE);
+			(void)qr; (void)kr; (void)vr;
 			/* ⚠ the cache is strided by hdmax, written at hd, and
 			 * a shared KV layer has nothing of its own to store:
 			 * it reads what L->kv_from wrote. Writing here would
@@ -6068,13 +6179,8 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				 * over the cache (attn_block). The cache rows
 				 * this row will read are all written by then.
 				 */
-				/* ⚠ NOTHING TO COPY BACK when the rope wrote the
-				 * row where it already lives; the control has
-				 * to, because it worked in the scratch. */
-				if (!rope_inplace())
-					memcpy(s->bq + (size_t)r * m->n_head
-					       * hd, s->q, (size_t)m->n_head
-					       * hd * sizeof(float));
+				/* ⚠ NOTHING TO COPY BACK: the rope wrote the
+				 * row where it already lives. */
 			} else {
 				/*
 				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
