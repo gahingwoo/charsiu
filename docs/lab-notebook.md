@@ -5948,3 +5948,28 @@ after four points that sit on it to within a microsecond. Something has a
 ceiling between 8 and 16 chained tasks. charsiu's largest decode chain is 4
 (the head at NMAX 8192), so nothing hits it today, and the batched prefill
 chains more. Unexplained, reproducible, and written down.
+
+### 🏁 The qpack fix, measured: int8's prefill now beats int4's outright
+
+Round 153's first two arms, qwen3, 90 rows, ms a row:
+
+```
+              pack  submit  fence  read  scale  prep   total
+  int4 1024   0.95   0.08   1.24   1.30   0.20  0.11    5.36
+  int8 1024   0.88   0.09   0.90   0.94   0.25  0.10    4.59
+```
+
+**int8 is 14.4% faster a row than int4, at the same K slice.** This morning
+the same comparison was 6.41 against 5.33 the other way, and the whole
+difference was pack: 2.66 then, **0.88 now**. Vectorising and pooling int8's
+activation quantiser took its own prefill down 28% and turned the sign of the
+comparison.
+
+⚠ I had not measured that change on the board -- it went in on a host
+bit-identity proof and a prediction. The prediction was that pack would fall
+towards int4's 0.86. It landed at 0.88.
+
+And the rest of the row was already int8's: fence 0.90 against 1.24, read 0.94
+against 1.30. Eight-bit weights dispatch fewer, wider slices for the same
+tensor because their group does not pin KMAX, and both of those numbers follow
+from it before KMAX is even swept.
