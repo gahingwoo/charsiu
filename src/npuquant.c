@@ -225,8 +225,16 @@ static int midrise_grid(void)
 #define WCACHE_MAGIC  0x43535743u        /* "CSWC" */
 #define WCACHE_FORMAT 1u
 /* ⚠ BUMP THIS whenever the quantiser's arithmetic changes, or an old cache
- * will quietly feed the new code the old numbers. */
-#define WCACHE_QUANT  2u
+ * will quietly feed the new code the old numbers.
+ *
+ * 2 -> 3 on 2026-09-08: int8 now writes one scale a row where it used to write
+ * CHARSIU_NPU_W4_GROUP of them. `group` is in the key, but wcache_setup runs
+ * once on the FIRST tensor and int8's group is now that tensor's k -- so on a
+ * model whose first staged tensor is 1024 wide, which qwen3's n_embd is, the
+ * new key and an old int8 key are the same number and the old file would have
+ * been accepted. That is exactly the layout disagreement this week was spent
+ * closing, coming back through the cache. */
+#define WCACHE_QUANT  3u
 
 struct wcache_head {
 	uint32_t magic, format, quant, bits;
