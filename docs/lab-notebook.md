@@ -4786,3 +4786,42 @@ hardware. qwen3 got worse (113 against 75) and gemma4 got better (79 against
 
 Isolating the weight quantiser needs a charsiu-weights + fp32-activation path,
 and there is not one.
+
+## 2026-09-07 late: measuring the denominator I had been quoting all evening
+
+Every "at rate, no lever left" conclusion tonight divided by 11.9 GB/s, which
+came from a memory note and had never been measured on this card.
+`charsiu_membw` had a build rule since it was written and was in neither `all:`
+nor PROBE_BINS, so it had never run here.
+
+```
+  1 thread    8.62 GB/s
+  2           8.04
+  4           7.53      <- more threads, less bandwidth
+  8          11.91      <- this is the 11.9
+```
+
+**Non-monotonic.** 11.9 is the EIGHT-thread figure, and the read back is
+pooled across eight, so the denominator was right -- but I did not know it was
+an eight-thread number, and I did not know 1 to 4 threads sit lower. The
+board is four A53 and four A72 and the probe does not pin, so one thread
+probably lands on an A72 and four straddle both kinds.
+
+The tool's own header puts the bus peak near 21.9 GB/s (LPDDR5 2736 MHz, two
+16-bit channels), so 11.91 is 54% of theoretical, which is ordinary.
+
+### What it changes
+
+Nothing in the conclusion, and two things around it:
+
+- `read` at 5.2 GB/s is 44% of what eight threads can reach sequentially, and
+  it is a PERMUTATION walk. 44% of sequential for a permutation is high, not
+  low. `pack` at 4.7 is 39%. Both stand.
+- **any pool of four threads or fewer is capped at 7.5 to 8.6**, below what
+  eight get. That is an argument for `CHARSIU_POOL_CPUS=0-7` that nobody had
+  measured, and it explains the "2.0x ceiling" on threading the read: the
+  controller does not scale with threads, it steps.
+
+⚠ And the NPU reads weights at 16.98 GB/s -- ABOVE anything the CPU can reach
+here. The two do not share a path in the way the CPU-side numbers assume, which
+is why the fence can sit at the MAC rate while read and pack are held at 11.9.
