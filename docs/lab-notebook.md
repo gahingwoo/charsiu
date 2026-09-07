@@ -5381,3 +5381,95 @@ both the chunk and the ceiling so a pasted line cannot be read as the other.
 Round 146 sweeps m over 8 / 40 / 80 / 160 to say whether 2.95% is a property of
 the width or of the code path, and reads the prefill table with `scale` named
 for the first time.
+
+### 🏁 Round 146: int8's prefill loss is the PACK, and it is not the scale
+
+Part 1 -- the batched path's 2.95% on int8 does not move with the width:
+
+```
+  int8, token loop                 27.0668
+  int8, --batch m=8                27.8654
+  int8, --batch m=40               27.8654
+  int8, --batch m=80  (shipped)    27.8654
+  int8, --batch m=160              27.8654
+  int4, --batch m=80               49.8877
+```
+
+Identical to four decimals across a twenty-fold range of m. So it is a fixed
+property of the code path and not of the batch, which rules out anything that
+scales with the number of rows -- a shared scale, an accumulator that grows, a
+pooling grain.
+
+Part 2 -- the prefill table with `scale` named for the first time, qwen3,
+90 rows, ms a row:
+
+```
+          pack   submit  fence   read   scale  prep  unacc
+  int4    0.86    0.08   1.29   1.30    0.19   0.12   0.03    5.33 total
+  int8    2.66    0.09   0.93   0.97    0.25   0.10   0.03    6.41
+```
+
+⚠⚠ **int8's fence and read are BOTH SMALLER.** Its hardware path is genuinely
+faster, which is what PLAN.md claimed all along and what round 143's TTFT made
+look false. **pack alone is 3.1x wider and eats the advantage and 1.08 ms a row
+more.** The tail scale everybody suspected -- this author loudest -- is 0.06 of
+the gap, and naming it is how that was settled in one round instead of three.
+
+The cause, once they are side by side: int4 packs through `pack_f16_pooled`,
+pooled across groups; int8 ran two scalar passes over the slice, one thread, no
+NEON. Both vectorise; the rows are independent because each carries its own d1.
+
+Fixed, with `CHARSIU_NPU_QPACK_PLAIN=1` as the same-binary control, and proved
+identical by `tools/npu_qpack_test` rather than by generated text: 56000 rows
+over fourteen widths, on data chosen to break it -- codes exactly halfway
+between two integers, values past the clamp, an all-zero row, near-denormals,
+every remainder mod 16 and mod 4. **0 byte mismatches, 0 d1 mismatches.**
+
+🔑 **And it ran on the desk, because this host is aarch64.** Every
+`__ARM_NEON` block here compiles AND executes. A vector rewrite does not need
+a board round to be proved identical, and I had assumed the opposite.
+
+### 🏁 Round 147: decode is 88 to 91% matmul, and the rest is a per call floor
+
+qwen3, 30.7 ms a token; tinyllama, 41.3.
+
+```
+  qwen3          ms     %        tinyllama        ms     %
+  gate + up     7.29  23.8       gate + up     15.89  38.5
+  q k v         6.06  19.8       down           9.96  24.1
+  down          5.05  16.5       q k v          5.66  13.7
+  output head   5.00  16.3       o proj         3.95   9.6
+  o proj        3.54  11.5       output head    1.93   4.7
+  -- matmul    26.94  87.8       -- matmul     37.39  90.6
+  attention     2.35   7.7       attention      1.99   4.8
+  silu * up     0.72   2.4       silu * up      1.04   2.5
+```
+
+**Everything that is not a matmul is 12% and 9%.** The elementwise work is
+done; whatever is left in decode is in the matmuls.
+
+And the matmuls have a fingerprint. Effective bandwidth by class, qwen3:
+
+```
+  o proj        1.05 MB a call    8.29 GB/s
+  down          1.57              8.72
+  q k v         2.10              9.69
+  gate + up     3.15             12.08
+  output head  77.79             15.56    <- one call, nothing to amortise
+```
+
+Monotone in the bytes ONE call moves, which is what a fixed per-call cost looks
+like and very little else does. Fitting `t = a + b*MB` through the smallest and
+largest gives **b = 15.7 GB/s marginal** and **a = 60 us a call**. At 113 calls
+a token that is 6.8 ms of 30.7 -- **22%** -- and removing it entirely would be
+32.6 -> 44.0 tok/s.
+
+⚠ Two corrections this kills. The marginal bandwidth is 15.7 GB/s, ABOVE the
+11.9 the CPU threads reach, so using the CPU membw ladder as the roof for NPU
+weight reads was wrong. And the floor is 60 us a call now, not the 130 us the
+August note quotes -- attach-once and the halved ioctls did land.
+
+⚠⚠ A line through two points is not a law. Round 148 turns it into a
+prediction instead: `CHARSIU_NPU_NOGROUP=1` stops q/k/v and gate/up sharing a
+submit, taking the count from 113 to 197, which at 60 us is +5.0 ms a token.
+If the table moves by much less, the floor is smaller than the fit says.
