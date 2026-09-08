@@ -863,6 +863,7 @@ struct charsiu_npu {
 	double slow_worst;
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
+	int poolread_set, packpool_set;
 	int kfit;
 	int even_ks;      /* K slices of equal width, see slice_k() */
 	/*
@@ -1200,22 +1201,39 @@ static void cpu_rows(const struct npu_entry *e, const float *af, float *y)
  * ⚠ THE THRESHOLD IS RESOLVED ON FIRST USE, NOT AT OPEN.
  *
  * charsiu_pool_min needs the thread count and the pool does not exist when the
- * device is opened. A zero in the field means "not resolved yet"; the first
- * caller that needs it asks then, when charsiu_threads() is real.
+ * device is opened -- charsiu_run never calls charsiu_threads_start, so
+ * charsiu_threads() returns 1 there and charsiu_pool_min says "never pool".
+ * That shipped once and made prefill's read 4.3x slower.
+ *
+ * ⚠⚠ AND A SEPARATE FLAG, NOT A ZERO SENTINEL. The first version of this fix
+ * read the env with a default of 0 and treated a zero field as "not resolved
+ * yet" -- so CHARSIU_NPU_POOL_READ_MIN=0, which means "threshold zero, always
+ * pool", got silently replaced by the derived value. That is the same disease
+ * as the thirteen switches fixed this morning: `=0` not meaning what it says.
  */
 static size_t poolread_min(struct charsiu_npu *g)
 {
-	if (!g->poolread_min)
-		g->poolread_min = (unsigned)charsiu_pool_min(573.44,
-							charsiu_threads());
+	if (!g->poolread_set) {
+		const char *e = getenv("CHARSIU_NPU_POOL_READ_MIN");
+
+		g->poolread_min = e && *e
+			? (unsigned)strtoul(e, NULL, 0)
+			: (unsigned)charsiu_pool_min(573.44, charsiu_threads());
+		g->poolread_set = 1;
+	}
 	return g->poolread_min;
 }
 
 static unsigned packpool_min(struct charsiu_npu *g)
 {
-	if (!g->packpool_min)
-		g->packpool_min = (unsigned)charsiu_pool_min(1.12,
-							charsiu_threads());
+	if (!g->packpool_set) {
+		const char *e = getenv("CHARSIU_NPU_PACK_POOL_MIN");
+
+		g->packpool_min = e && *e
+			? (unsigned)strtoul(e, NULL, 0)
+			: (unsigned)charsiu_pool_min(1.12, charsiu_threads());
+		g->packpool_set = 1;
+	}
 	return g->packpool_min;
 }
 
@@ -1636,7 +1654,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		 * both passed. Same class as every other "the host runs the
 		 * order and not the arithmetic" miss in this tree.
 		 */
-		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 0);
+		/* resolved on first use; see poolread_min() above */
 	}
 	/*
 	 * The packer on the pool, by group count. 2 = by size, 1 = always,
@@ -1647,8 +1665,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e = getenv("CHARSIU_NPU_PACK_POOL");
 
 		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
-		/* 0 = derive at first use; see the note above poolread_min */
-		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 0);
+		/* resolved on first use; see packpool_min() above */
 	}
 	/* one pass over Y for every K slice a device holds. OFF until the
 	 * board prices it: it trades sequential Y round trips for several
