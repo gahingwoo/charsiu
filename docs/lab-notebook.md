@@ -6241,3 +6241,70 @@ target, carrying-water work, not worth chasing". On the fixed binary
 0.67 ms a row gap to the vendor.** The matmul share had been inflated by my own
 regression, which pushed everything else down. I gave a "not worth chasing"
 verdict on numbers from a binary I had broken four hours earlier.
+
+### 🔑 Round 166: acc_out bypasses the output convert, it does not select it
+
+One matmul with a known product -- A and B all ones at zero point 128, so every
+element is (1-128)^2 = 16129 and k = 1024 should give 16516096:
+
+```
+   raw 0004fc00    as int32 16516096    as fp32 2.3e-38    fp16 6.1e-05
+```
+
+**int32, exactly right.** And the same job's registers are the vendor's float
+stage, because `job.c` sets `if (job->acc_out) wide8 = 0x3f` -- 0x4010
+a0000002 (PROC_PRECISION 2, fp16), 0x4044 = 2, identity requant.
+
+So the note that says *"w4a16 does not requantise at all, the output is a
+float"* is about the DPU's PROCESSING precision. `acc_out` takes the raw
+accumulator before the convert. A narrower read is not a cast, it needs the
+requant and the convert to actually run.
+
+### What a narrower output would be worth, and where it is legal
+
+TTFT is 15.8% behind the vendor on int8: 74 ms over 110 tokens, **0.67 ms a
+row**. Prefill reads 0.94 ms a row at four bytes an element. Two bytes is 0.47.
+
+**And the legality is a static property of the weights.** With int8's group
+being the whole row, the DPU's per-channel requant can apply exactly the scale
+the CPU applies now, and the largest value it can emit is `127 * sum|w|`,
+because every `|a_q| <= 127`:
+
+```
+  Qwen3-0.6B     worst tensor   18,334      fp16 max 65,504    ✓
+  Phi-3.5-mini   ffn_down      139,399                         ⛔ 2.1x over
+```
+
+⚠ `job.c` already named that tensor -- *"the output magnitude of ffn_down
+varies by up to 2971x between tokens"* -- without the arithmetic. The bound is
+computable at staging from the weights alone, so this is a per-tensor decision
+and not a global switch, which is the shape this project wants: a rule over
+`(m, k, n)` rather than a constant.
+
+⚠⚠ The bound is worst case: it assumes every `|a_q|` is 127 and all the signs
+agree. Real activations run about a third of that, so Phi-3.5 would probably
+not overflow -- but an overflow is an inf that destroys the token, so only the
+worst case can gate it.
+
+### And prefill's attention is the other half, with room in it
+
+Round 165 on the fixed binary: attention is **0.97 ms a row, 18.2%** of a
+prefill row, and 0.97 alone is larger than the whole 0.67 gap. Its rate:
+
+```
+  33.2 MMAC over 87 ms   =  0.38 GMAC/s
+  66.4 MB of KV over 87  =  0.76 GB/s      against 11.9 the threads reach
+```
+
+**Neither bandwidth nor arithmetic bound.** And the pool splits it over HEADS,
+so the thread count only divides evenly when the head count does:
+
+```
+  qwen3 16 -> 100%    tinyllama 32 -> 100%
+  gemma-3-1b 4 -> 50%       SmolLM2-135M 9 -> 56%
+```
+
+⚠ Splitting over (head, row block) instead needs the per-head scratch
+(`s->batt + h * R * n_ctx`) reindexed, and prefill's best axis is the row block
+(12 of them at n=90, R=8) while decode's is the head (one row block). Worth
+doing, not a safe last-hour change.
