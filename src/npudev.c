@@ -1196,6 +1196,29 @@ static void cpu_rows(const struct npu_entry *e, const float *af, float *y)
 	}
 }
 
+/*
+ * ⚠ THE THRESHOLD IS RESOLVED ON FIRST USE, NOT AT OPEN.
+ *
+ * charsiu_pool_min needs the thread count and the pool does not exist when the
+ * device is opened. A zero in the field means "not resolved yet"; the first
+ * caller that needs it asks then, when charsiu_threads() is real.
+ */
+static size_t poolread_min(struct charsiu_npu *g)
+{
+	if (!g->poolread_min)
+		g->poolread_min = (unsigned)charsiu_pool_min(573.44,
+							charsiu_threads());
+	return g->poolread_min;
+}
+
+static unsigned packpool_min(struct charsiu_npu *g)
+{
+	if (!g->packpool_min)
+		g->packpool_min = (unsigned)charsiu_pool_min(1.12,
+							charsiu_threads());
+	return g->packpool_min;
+}
+
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
 	return g->w4 && t->kgroup && t->kgroup < t->k &&
@@ -1598,16 +1621,22 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 
 		g->poolread = !e || !*e ? 2 : *e == '0' ? 0 : 1;   /* 2 = by size */
 		/*
-		 * ⚠ 32768 WAS THE ANSWER AT EIGHT THREADS, NOT THE RULE.
-		 * charsiu_pool_min derives it from the barrier, the rate and
-		 * the threads actually running; 573.44 elements a microsecond
-		 * is what 32768 implies at eight and a 50 us barrier, so this
-		 * is bit-identical there and tracks the pool elsewhere. The
-		 * long note is in gguf.c.
+		 * ⚠⚠ ZERO MEANS "ASK LATER", AND IT HAS TO.
+		 *
+		 * charsiu_pool_min needs the thread count, and at open time
+		 * there is not one: charsiu_run never calls
+		 * charsiu_threads_start, so g_pool.n is 0 and
+		 * charsiu_threads() returns 1 here. Computing the threshold
+		 * now got `never pool` -- the read back stopped pooling and
+		 * prefill's read went 0.94 -> 4.09 ms a row, a 1.8x slower
+		 * prompt, committed and pushed.
+		 *
+		 * ⚠ The host suites cannot see it. With no NPU the read back
+		 * path is never taken at all, so arch_sanity and hostcheck
+		 * both passed. Same class as every other "the host runs the
+		 * order and not the arithmetic" miss in this tree.
 		 */
-		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN",
-					(unsigned)charsiu_pool_min(573.44,
-							charsiu_threads()));
+		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 0);
 	}
 	/*
 	 * The packer on the pool, by group count. 2 = by size, 1 = always,
@@ -1618,11 +1647,8 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e = getenv("CHARSIU_NPU_PACK_POOL");
 
 		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
-		/* 64 groups at eight threads implies 1.12 groups a
-		 * microsecond; derived so it tracks the pool. See gguf.c. */
-		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN",
-					(unsigned)charsiu_pool_min(1.12,
-							charsiu_threads()));
+		/* 0 = derive at first use; see the note above poolread_min */
+		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 0);
 	}
 	/* one pass over Y for every K slice a device holds. OFF until the
 	 * board prices it: it trades sequential Y round trips for several
@@ -4778,7 +4804,7 @@ static void pack_f16_pooled(struct charsiu_npu *g,
 	unsigned ng = charsiu_pack_input_f16_ngroups(mm);
 
 	if (ng && (g->packpool == 1 ||
-		   (g->packpool == 2 && ng >= g->packpool_min))) {
+		   (g->packpool == 2 && ng >= packpool_min(g)))) {
 		struct pack_groups_job pj = { mm, src, stride, dst };
 
 		charsiu_pack_input_f16_edges(mm, src, stride, dst, dst_size);
@@ -5974,7 +6000,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						e->t->scale[j];
 		else if (g->poolread == 1 ||
 			 (g->poolread == 2 &&
-			  (size_t)m * e->t->n >= g->poolread_min))
+			  (size_t)m * e->t->n >= poolread_min(g)))
 			charsiu_parallel_for(tail_scale_rows, &tj, m);
 		else
 			tail_scale_rows(&tj, 0, m);
