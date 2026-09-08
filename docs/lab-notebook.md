@@ -6396,3 +6396,33 @@ tree now has the instrument for it.
 ⚠ Four of ten arms timed out. Round 169 checks the board is alive; round 167's
 four arms had zero timeouts, so wedging is a property of the bits asked for and
 not of asking.
+
+### 🏁 Round 170: attention over (head, row block), and the control moved too
+
+```
+                        HR=0                HR=1          attention
+  gemma-3-1b   attn 0.74  row 11.63    0.40  row 7.14        -46%
+  SmolLM2-135M attn 0.28  row  2.50    0.26  row 2.43         -7%
+  qwen3        attn 0.99  row  5.32    0.90  row 5.33         -9%
+```
+
+Text identical across the knob on all three -- one hash printed per model, so
+both arms agreed.
+
+**gemma-3-1b's -46% is what "half of eight threads idle" predicts**, and it has
+4 heads. But the informative row is **qwen3, the control**: its 16 heads
+already divided by 8, and it still gained 9%. So the finer unit helps beyond
+the divisibility -- a row block finishes sooner than a whole head, so the tail
+of the pool is shorter.
+
+⚠⚠ **AND gemma-3-1b's WHOLE ROW is not readable.** 11.63 -> 7.14 looks like a
+38% win, and in the same pair `staging` went 8943 -> 4236 ms. Staging has
+nothing to do with how attention is pooled. That arm was the first thing the
+round ran.
+
+**A first point being cold is the third time today.** Round 162 called two
+cells "a shape property" and they did not reproduce; round 155 and 161's small
+end disagreed by 2x and best-of-five removed it; and here it inflates a whole
+row by 60%. Round 171 runs HR=1 first, HR=0 second, with a warm-up pass before
+either: if the attention numbers hold with the order reversed they are the
+split, and if they follow the order they were the cache.
