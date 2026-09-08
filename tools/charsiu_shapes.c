@@ -172,11 +172,35 @@ int main(int argc, char **argv)
 			    + call_us((double)(2 * gu) * 0.5 / 1e6 / core_pair())
 			    + call_us((double)dn * 0.5 / 1e6 / core_pair());
 		}
-		calls += 1;                                   /* the head */
-		tasks += slices(m.n_embd, kmax)
-		       * ((m.n_vocab + nmax - 1) / nmax);
-		bytes += (double)m.n_vocab * m.n_embd * 0.5;
-		us += call_us((double)m.n_vocab * m.n_embd * 0.5 / 1e6 / core_pair());
+		/*
+		 * ⚠⚠ THE HEAD IS NOT ONE 156 MB CALL, IT IS ceil(n_vocab/NMAX)
+		 * SLICES OF AT MOST NMAX.
+		 *
+		 * Pricing it whole asked call_us for 38 MB on Phi-3.5 and 157
+		 * on gemma4, both far outside the sweep, so the answer was a
+		 * straight-line extrapolation at 89 us a megabyte -- while
+		 * round 147 measured the head itself at 15.56 GB/s, which is
+		 * 64. Three models then came back implying a matmul share above
+		 * 100% of their own token, which is the arithmetic refusing the
+		 * extrapolation rather than a fit being poor.
+		 *
+		 * A slice is at most NMAX wide by construction, so every piece
+		 * lands inside the measured range and nothing is extrapolated.
+		 */
+		{
+			unsigned nsl = (m.n_vocab + nmax - 1) / nmax;
+			unsigned left = m.n_vocab, w;
+
+			calls += 1;                           /* the head */
+			tasks += slices(m.n_embd, kmax) * nsl;
+			bytes += (double)m.n_vocab * m.n_embd * 0.5;
+			while (left) {
+				w = left > nmax ? nmax : left;
+				us += call_us((double)w * m.n_embd * 0.5
+					      / 1e6 / core_pair());
+				left -= w;
+			}
+		}
 		bytes /= 1e6;
 		ms = (us + tasks * B) / 1e3;
 		(void)A; (void)C;

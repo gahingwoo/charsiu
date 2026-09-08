@@ -203,15 +203,37 @@ int main(int argc, char **argv)
 		 * calls are 0.13 to 0.69 MB and its prediction missed by 36%.
 		 */
 		static const unsigned ks[] = { 64, 256, 512, 1024, 1024, 1024,
-					       2048, 2048, 4096, 4096, 4096 };
+					       2048, 2048, 4096, 4096 };
 		static const unsigned ns[] = { 32, 128, 256,  256,  512, 1024,
-					       2048, 4096, 4096, 8192, 16384 };
+					       2048, 4096, 4096, 8192 };
 		unsigned c;
 
 		for (c = 0; c < sizeof(ks) / sizeof(*ks); c++) {
 			struct unit u;
 			double us, mb;
 
+			/*
+			 * ⚠⚠ REFUSE WHAT THE DEVICE WILL NOT TAKE, HERE, NOT BY
+			 * SUBMITTING IT.
+			 *
+			 * The sweep was widened to 67 MB with 4096 x 16384 on
+			 * the end. n = 16384 is past the 8192 the device is
+			 * opened for; the job was submitted anyway, timed out,
+			 * and took the IOMMU with it -- "Error during raw
+			 * reset, MMU_DTE_ADDR is not functioning", the state
+			 * this project has a memory note about, and the board
+			 * was dead for five hours.
+			 *
+			 * A probe that walks an axis has to know where the axis
+			 * ends. Both bounds are already written down elsewhere
+			 * in this tree and neither was checked here.
+			 */
+			if (ns[c] > 8192 || (size_t)(ks[c] / 32) * 1 > 5120) {
+				printf("  %6u %6u  (past the device's limits:"
+				       " n <= 8192, (k/32)*m <= 5120)\n",
+				       ks[c], ns[c]);
+				continue;
+			}
 			if (unit_make(d0, &u, 1, ks[c], ns[c])) {
 				printf("  %6u %6u  (would not build)\n",
 				       ks[c], ns[c]);
