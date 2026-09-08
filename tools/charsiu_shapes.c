@@ -101,9 +101,22 @@ static double core_pair(void)
 
 static double call_us(double mb)
 {
-	/* npu_job_cost, round 155, m = 1, one task, int8 weights */
-	static const double x[] = { 0.0328, 0.2621, 1.0486, 4.1943, 8.3886 };
-	static const double y[] = { 40.13,  44.44,  144.00, 406.81, 785.00 };
+	/*
+	 * npu_job_cost, round 162: five passes a point, best of five, with the
+	 * spread printed. Two points are dropped because they disagreed with
+	 * themselves -- 0.2621 MB by 90.9% and 1.0486 by 36.9% -- while every
+	 * neighbour on both sides repeated to 3% or better. A row that cannot
+	 * reproduce is not a datum to interpolate through.
+	 *
+	 * ⚠ Rounds 155 and 161 read the small end as 40 to 73 us where this
+	 * reads 22 to 34. Taking the best of five removed an interference, not
+	 * a cost: the large end, which was always stable, did not move (8.3886
+	 * MB read 785.00, 769.01 and now 774.30).
+	 */
+	static const double x[] = { 0.0020, 0.0328, 0.1311, 0.5243,
+				    4.1943, 8.3886, 16.7772, 33.5544 };
+	static const double y[] = { 21.80,  24.86,  33.58,  101.23,
+				    359.51, 774.30, 1444.60, 2812.43 };
 	const int n = (int)(sizeof(x) / sizeof(*x));
 	int i;
 

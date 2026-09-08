@@ -241,8 +241,8 @@ int main(int argc, char **argv)
 	 * be attributed to the model at all.
 	 */
 	printf("\n  one job, one task, the weight bytes swept\n");
-	printf("  %6s %6s %9s %10s %10s %9s\n",
-	       "k", "n", "MB", "us", "us a MB", "spread");
+	printf("  %6s %6s %9s %10s %10s %10s %9s\n",
+	       "k", "n", "MB", "us mean", "us best", "us a MB", "spread");
 	{
 		/*
 		 * ⚠ THE RANGE HAS TO COVER WHAT A MODEL ACTUALLY ASKS FOR.
@@ -296,7 +296,7 @@ int main(int argc, char **argv)
 			charsiu_submit_jobs(d0, jl, 1);
 			charsiu_bo_prep(d0, &u.ob, 1000000000);
 			{
-				double best = 1e18, worst = 0.0;
+				double best = 1e18, worst = 0.0, sum = 0.0;
 				unsigned pass;
 
 				/* five passes, so the row carries its own
@@ -318,10 +318,30 @@ int main(int argc, char **argv)
 					us = (now_us() - t0) / reps - gap;
 					if (us < best) best = us;
 					if (us > worst) worst = us;
+					sum += us;
 				}
-				us = best;
-				printf("  %6u %6u %9.4f %10.2f %10.1f %8.1f%%\n",
-				       ks[c], ns[c], mb, us,
+				/*
+				 * ⚠⚠ THE MEAN, NOT THE BEST, AND THAT WAS A
+				 * REAL MISTAKE.
+				 *
+				 * Round 162 reported best-of-five and the
+				 * predictor recalibrated on it went from 6.9%
+				 * RMS to 12.0%, every model LOW. Taking the
+				 * best removes an interference that a decode
+				 * does not get to remove: it runs in the same
+				 * process, on the same cores, against the same
+				 * other work. The best case is not the case
+				 * being predicted.
+				 *
+				 * Both are printed now. best says what the
+				 * hardware can do, mean says what a token
+				 * costs, and the spread says whether asking
+				 * the question twice was worth anything.
+				 */
+				us = sum / 5.0;
+				printf("  %6u %6u %9.4f %10.2f %10.2f %10.1f"
+				       " %8.1f%%\n",
+				       ks[c], ns[c], mb, us, best,
 				       mb > 0 ? us / mb : 0.0,
 				       100.0 * (worst - best) / best);
 			}
