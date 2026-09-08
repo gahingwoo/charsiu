@@ -6426,3 +6426,41 @@ end disagreed by 2x and best-of-five removed it; and here it inflates a whole
 row by 60%. Round 171 runs HR=1 first, HR=0 second, with a warm-up pass before
 either: if the attention numbers hold with the order reversed they are the
 split, and if they follow the order they were the cache.
+
+### 🏁 Round 171: reversed and warmed, and it splits the result in two
+
+```
+                  m170 (HR=0 first)     m171 (HR=1 first, warmed)
+                  HR=0    HR=1          HR=1    HR=0
+  gemma-3-1b      0.74    0.40          0.40    0.67
+  SmolLM2-135M    0.28    0.26          0.26    0.27
+  qwen3           0.99    0.90          0.88    0.96
+```
+
+**The attention numbers follow the knob, not the order.** gemma-3-1b reads 0.40
+under HR=1 in both rounds and 0.74/0.67 under HR=0; qwen3 reads 0.88/0.90
+against 0.96/0.99. The split is real, reproducible, and the text is identical
+across it on three architectures and two orders.
+
+⛔ **And the whole-row win was the cache.** gemma-3-1b's row read 11.63 -> 7.14
+in round 170 with `staging` 8943 -> 4236 in the same pair; warmed and reversed
+it reads **7.50 -> 7.27**, with staging 4289 -> 4277. A 38% win was a 3% win
+and a cold first arm.
+
+So the honest table:
+
+```
+                attention          whole row
+  gemma-3-1b    0.67 -> 0.40  -40%    7.50 -> 7.27   -3.1%
+  SmolLM2-135M  0.27 -> 0.26   -4%    2.42 -> 2.38   -1.7%
+  qwen3         0.96 -> 0.88   -8%    5.40 -> 5.45   +0.9%
+```
+
+**Attention falls 4 to 40% and the row falls 0 to 3%,** because attention is 5
+to 18% of a row. On qwen3 that is 0.08 ms a row against a 0.67 gap to the
+vendor -- 12% of the distance, real and small.
+
+🔑 The reason to keep it is not the 3%. It is that the win is largest exactly
+where the head count divides worst, so it removes a model-shaped cliff rather
+than adding a speedup: gemma-3-1b was paying 67% more for attention than its
+arithmetic needed, and nothing in the code said so.
