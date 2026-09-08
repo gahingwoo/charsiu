@@ -58,6 +58,37 @@ static double now_us(void)
 }
 
 /* the smallest matmul that still assembles: the arithmetic must not matter */
+/*
+ * ⚠⚠ THE PROBE'S LOOP IS NOT THE SHAPE OF A DECODE, AND THE SMALL END KNOWS.
+ *
+ * Rounds 155 and 161 disagreed by a factor of two below 1 MB and round 161 was
+ * non monotone inside itself. But decode -- which issues exactly these small
+ * calls, a hundred and twenty a token -- repeats to 1.3% across three rounds
+ * on three different hours. **The hardware is not the unstable thing.**
+ *
+ * The difference is the gap. This loop submits the next job the instant the
+ * previous prep returns, so nothing separates one dispatch from the next and
+ * a small job can overlap the tail of the one before. A decode cannot do that:
+ * between two calls the CPU has to rmsnorm, rope, run attention or a residual,
+ * which is tens of microseconds of real work on the same cores.
+ *
+ * CHARSIU_JOB_GAP_US inserts that. It is a spin, not a sleep -- a sleep would
+ * park the thread and measure the wakeup this project already priced at 11 us.
+ * Sweeping it says whether the small end settles once the dispatches stop
+ * touching, and if it does, the number to feed a predictor is the one at a
+ * realistic gap rather than the one at zero.
+ */
+static void spin_us(double us)
+{
+	double t0;
+
+	if (us <= 0.0)
+		return;
+	t0 = now_us();
+	while (now_us() - t0 < us)
+		;
+}
+
 static int unit_make(struct charsiu_device *dev, struct unit *u,
 		     unsigned m, unsigned k, unsigned n)
 {
@@ -271,6 +302,9 @@ int main(int argc, char **argv)
 				/* five passes, so the row carries its own
 				 * spread and a noisy point cannot be read as
 				 * a measurement */
+				const char *eg = getenv("CHARSIU_JOB_GAP_US");
+				double gap = eg && *eg ? atof(eg) : 0.0;
+
 				for (pass = 0; pass < 5; pass++) {
 					t0 = now_us();
 					for (r = 0; r < reps; r++) {
@@ -279,8 +313,9 @@ int main(int argc, char **argv)
 							break;
 						charsiu_bo_prep(d0, &u.ob,
 								1000000000);
+						spin_us(gap);
 					}
-					us = (now_us() - t0) / reps;
+					us = (now_us() - t0) / reps - gap;
 					if (us < best) best = us;
 					if (us > worst) worst = us;
 				}
