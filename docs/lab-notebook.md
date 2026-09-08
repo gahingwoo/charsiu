@@ -6200,3 +6200,44 @@ slice puts every piece inside the measured range:
 
 ⚠ A small correction, because the head is one call against a hundred and
 twenty. It was still an extrapolation being reported as a measurement.
+
+### ⛔ A regression I shipped, and it hid inside a judgement I then made
+
+Round 164 read prefill at 8.29 ms a row where round 153 read 4.59 on the same
+90 rows in one chunk. The difference was `read`: 0.94 -> **4.09**.
+
+Cause: this afternoon's "four tuned constants become one rule" derived
+`CHARSIU_NPU_POOL_READ_MIN` from `charsiu_pool_min(rate, charsiu_threads())`
+**at charsiu_npu_open() time**, and there is no thread pool there --
+`charsiu_run` never calls `charsiu_threads_start`, so `g_pool.n` is 0 and
+`charsiu_threads()` returns 1. Below two threads that function returns "never
+pool". The accumulator read back stopped pooling, the prompt got 1.8x slower,
+and it was committed and pushed.
+
+⚠⚠ **arch_sanity 6/6 and hostcheck 4/4 both passed.** With no NPU the read back
+path is never taken at all. The only reason it surfaced is that round 164
+printed a stage table next to one from round 153.
+
+Fixed by resolving on first use. ⚠ And the fix converted two of four call
+sites, because the other two wrap the condition across a line and a
+single-line pattern walked past them -- the same shape as this morning's audit
+missing five `getenv(...) == NULL` switches. Twice in one day a mechanical
+replace declared itself done on a subset, and both times counting the call
+sites caught it, not reading the diff.
+
+**And the judgement it poisoned.** From round 164 I read attention at 11.5% of
+a prefill row and concluded TTFT was "spread over a dozen items, no single
+target, carrying-water work, not worth chasing". On the fixed binary
+(round 165):
+
+```
+  q k v         1.22   23.0%        attention     0.97   18.2%
+  gate + up     1.38   26.0%        rmsnorm+rope+silu+residual  0.50  9.2%
+  down          0.76   14.3%
+  o proj        0.49    9.2%        matmul total          72.5%
+```
+
+**attention is 18.2%, and 0.97 ms a row on its own is larger than the entire
+0.67 ms a row gap to the vendor.** The matmul share had been inflated by my own
+regression, which pushed everything else down. I gave a "not worth chasing"
+verdict on numbers from a binary I had broken four hours earlier.
