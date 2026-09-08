@@ -189,8 +189,29 @@ int main(int argc, char **argv)
 	 * falls as MB grows, `c` is not a constant and no per-model constant
 	 * will fix a predictor built on one.
 	 */
+	/*
+	 * ⚠⚠ THE SMALL END IS NOISE AND TWO ROUNDS PROVED IT, so it is
+	 * repeated more and reported with a spread rather than as a point.
+	 *
+	 * Rounds 155 and 161 on the same shapes: 0.0020 MB read 60.10 then
+	 * 37.96 us, 0.0328 read 40.13 then 73.31, 0.2621 read 44.44 then
+	 * 88.93. A factor of two, in both directions. Round 161 was also non
+	 * monotone inside itself -- 0.5243 MB at 77.81 us against 0.2621 at
+	 * 88.93, twice the bytes and less time.
+	 *
+	 * The large end is not like that at all: 4.1943 read 406.81 then
+	 * 399.14, and 8.3886 read 785.00 then 769.01, agreeing to 2%.
+	 *
+	 * That matters because it decides what a prediction MEANS. Every call
+	 * SmolLM2-135M makes is 0.13 to 0.69 MB -- entirely inside the noisy
+	 * band -- and the shape predictor missed it by 36%. Phi-3.5's calls are
+	 * 11 to 20 MB, inside the stable band, and it is missed by 6%. Until
+	 * the small end is repeatable, the first of those two numbers cannot
+	 * be attributed to the model at all.
+	 */
 	printf("\n  one job, one task, the weight bytes swept\n");
-	printf("  %6s %6s %9s %10s %10s\n", "k", "n", "MB", "us", "us a MB");
+	printf("  %6s %6s %9s %10s %10s %9s\n",
+	       "k", "n", "MB", "us", "us a MB", "spread");
 	{
 		/*
 		 * ⚠ THE RANGE HAS TO COVER WHAT A MODEL ACTUALLY ASKS FOR.
@@ -243,16 +264,32 @@ int main(int argc, char **argv)
 			fill(&jl[0], &u, 1);
 			charsiu_submit_jobs(d0, jl, 1);
 			charsiu_bo_prep(d0, &u.ob, 1000000000);
-			t0 = now_us();
-			for (r = 0; r < reps; r++) {
-				fill(&jl[0], &u, 1);
-				if (charsiu_submit_jobs(d0, jl, 1))
-					break;
-				charsiu_bo_prep(d0, &u.ob, 1000000000);
+			{
+				double best = 1e18, worst = 0.0;
+				unsigned pass;
+
+				/* five passes, so the row carries its own
+				 * spread and a noisy point cannot be read as
+				 * a measurement */
+				for (pass = 0; pass < 5; pass++) {
+					t0 = now_us();
+					for (r = 0; r < reps; r++) {
+						fill(&jl[0], &u, 1);
+						if (charsiu_submit_jobs(d0, jl, 1))
+							break;
+						charsiu_bo_prep(d0, &u.ob,
+								1000000000);
+					}
+					us = (now_us() - t0) / reps;
+					if (us < best) best = us;
+					if (us > worst) worst = us;
+				}
+				us = best;
+				printf("  %6u %6u %9.4f %10.2f %10.1f %8.1f%%\n",
+				       ks[c], ns[c], mb, us,
+				       mb > 0 ? us / mb : 0.0,
+				       100.0 * (worst - best) / best);
 			}
-			us = (now_us() - t0) / reps;
-			printf("  %6u %6u %9.4f %10.2f %10.1f\n",
-			       ks[c], ns[c], mb, us, mb > 0 ? us / mb : 0.0);
 			unit_free(d0, &u);
 		}
 	}
