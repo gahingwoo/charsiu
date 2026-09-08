@@ -467,6 +467,46 @@ until it has.
 Sampling at a temperature runs the plain loop: lossless speculative sampling
 exists and is not written here.
 
+## Performance generality, which is a different claim from correctness
+
+Nine architectures produce identical text to the CPU reference. Four have a
+tok/s number, and those four are the four the vendor publishes a benchmark for.
+Those are two claims and only one of them had been made.
+
+`tools/charsiu_shapes` reads a gguf **on a desktop, with no NPU and no board**
+and predicts a decode token from its shapes. Every coefficient comes from
+`tools/npu_job_cost`, a synthetic matmul with no model in it:
+
+```
+  model            t/MB    predicted   measured    error
+  SmolLM2-135M     3.66        13.53       14.6    -7.3%
+  Qwen3-0.6B       0.91        27.84       30.9    -9.9%
+  tinyllama-1.1B   0.78        40.36       41.3    -2.3%
+  gemma-3-1b       1.12        41.56       42.8    -2.9%
+  Qwen2.5-1.5B     0.81        60.45       63.0    -4.1%
+  SmolLM2-1.7B     0.58        63.37       63.3    +0.1%
+  Phi-3.5-mini     0.45       133.02      130.5    +1.9%
+                                            RMS     5.1%
+```
+
+**Twenty-eight times the parameters and eight times the shape signature, inside
+10%.** `t/MB` is tasks a megabyte: SmolLM2-135M pays dispatch where Phi-3.5
+pays bandwidth, and a threshold tuned on one is wrong on the other by
+construction -- which is not a hypothesis. `d = (ki*ns+ni)&1` was neutral on
+Llama-3.2, whose every dimension is a power of two, and cost 13 to 21% on
+Qwen3, gemma3 and Phi-3.5, and it survived because the model measured most
+often was the one that could not see it.
+
+⚠ **Every error is negative except two.** The predictor models matmuls only,
+and round 147 measured those at 88% of a qwen3 token; the missing few percent
+is attention, the norms and the elementwise joins. It is not corrected by a
+constant, because a constant fitted to close it would be fitting the thing the
+tool exists to avoid.
+
+⚠ Predictions, not measurements, and they are for THIS board at eight threads
+with the performance governor. Re-run `npu_job_cost` after any change to the
+dispatch path and the numbers move with it.
+
 ## What runs today
 
 `charsiu` picks the environment itself: int4 weights, the K slice width chosen per
