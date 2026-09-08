@@ -5890,7 +5890,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						<< (d * 16 + c.s0->n0 / g->nmax);
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
-					     (size_t)m * c.sn >= g->poolread_min))
+					     (size_t)m * c.sn >= poolread_min(g)))
 						charsiu_parallel_for(read_fused_rows,
 								     &c, m);
 					else
@@ -5943,7 +5943,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 					g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
-					     (size_t)m * sn >= g->poolread_min)) {
+					     (size_t)m * sn >= poolread_min(g))) {
 						/* ⚠ THE PAIR FORM NEEDS EVEN
 						 * RANGES, and before the grain
 						 * it got them only where the
