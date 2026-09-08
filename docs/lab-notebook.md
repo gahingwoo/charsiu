@@ -6464,3 +6464,41 @@ vendor -- 12% of the distance, real and small.
 where the head count divides worst, so it removes a model-shaped cliff rather
 than adding a speedup: gemma-3-1b was paying 67% more for attention than its
 arithmetic needed, and nothing in the code said so.
+
+### 🏁 The pre-merge regression, and the one signal it raised
+
+```
+  1. ppl, three carried controls, four decimals
+       q4_0  26.6416  want 26.6416   int4 49.8930 want 49.8930
+       int8  27.0668  want 27.0668
+  2. prefill, int8 KMAX 1024
+       4.48 ms a row, read 0.93      (the regression read 8.29 and 4.09)
+  3. scoreboard int4        earlier   regression   vendor
+       Qwen3                 26.31      26.55       24.85
+       TinyLLAMA             22.83      22.89       19.71
+       Phi3                   7.07       7.04        6.58
+       Gemma4                 9.33       8.93        9.23   <- -4.3%
+```
+
+**Seventeen commits touched the product path today and not one moved the
+answer.** Three ppl arms reproducing to four decimals is the strongest check
+this board offers, because it is the only measurement here that survives a
+session boundary.
+
+⚠ Gemma4's 4.3% sat outside the board's ~3% drift, and gemma4 was the only
+model the attention change had never been measured on -- rounds 170 and 171
+took gemma-3-1b, SmolLM2-135M and qwen3. So round 173 alternated the knob four
+times on it, warmed:
+
+```
+  HR=1  10.05    HR=0  10.05    HR=1  10.04    HR=0  10.03   text identical
+```
+
+**Neutral, and the 4.3% is drift.** Which is the answer that could only be had
+by asking -- gemma4's decode spread over six runs is 7.08 to 8.93, so a
+best-of-six can move 4% without anything changing.
+
+⚠⚠ And the merge check found what the test suites did not, twice: the
+zero-sentinel in `poolread_min` (=0 meaning "always pool" was being replaced by
+the derived value) was caught by reading today's diffs before proposing this,
+not by any run.
