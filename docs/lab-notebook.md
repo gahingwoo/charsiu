@@ -6339,3 +6339,60 @@ at four bytes an element; two would be 0.47 and the entire gap to the vendor is
 0.67. One byte would be 0.24 -- and is exactly what `job.c` refused, because
 ffn_down's output range does not fit in one. So fp16 is the target and int8 is
 not, which makes this a search for a bit rather than for a bundle.
+
+### 🏁 Round 168: the width sweep job.c asked for, and it has only two values
+
+```
+  WIDE8=0x01  bit0  0x4010          ⛔ NPU timed out
+  WIDE8=0x02  bit1  0x4030 low         80808080    one byte
+  WIDE8=0x04  bit2  0x4038             7F7F7F7F    one byte, saturated
+  WIDE8=0x08  bit3  0x4044             80808080    one byte
+  WIDE8=0x10  bit4  0x4050          ⛔ NPU timed out
+  WIDE8=0x20  bit5  identity requant   00000000    zero
+  WIDE8=0x3e  0x3f minus bit0       ⛔ NPU timed out
+  WIDE8=0x37  0x3f minus bit3          16516096 ✓  four bytes
+  WIDE8=0x1f  0x3f minus bit5          16516096 ✓  four bytes
+  WIDE8=0x0f  low four               ⛔ NPU timed out
+```
+
+**bit0 and bit4 have to be together** -- either alone wedges, which reproduces
+round 311 -- and **bit3 and bit5 are not needed at all**: 0x37 and 0x1f both
+give the exact four-byte accumulator.
+
+⚠⚠ **And the width has exactly two values, 1 and 4. There is no 2.** I had
+picked `0x4044` as the width register on the strength of "int8 writes 1, w4a16
+writes 2", and 0x37 removes it and stays four bytes wide. Whatever selects fp16
+output is not in this bundle.
+
+### But one byte is worth more than fp16 would have been
+
+```
+  prefill read, qwen3        0.94 ms a row at four bytes
+  at two bytes               0.47      saves 0.47
+  at ONE byte                0.23      saves 0.70     the gap is 0.67
+```
+
+`job.c` refused a byte for a real reason -- *"the coefficient buffer's scale is
+fixed at build time, and the output magnitude of ffn_down varies by up to
+2971x between tokens"*. But that variation is **per token**, and the term that
+varies is known before the dispatch: the output is
+`sum(w_q a_q) * w_scale * a_scale`, `w_scale` is per output channel (which is
+what a DPU coefficient IS, and what int8's whole-row group already is), and
+`a_scale` is the activation's own `d1`, computed at pack time.
+
+So the coefficient buffer would be rewritten per call with the current
+`a_scale` folded in. The trade:
+
+```
+  write  1024 x 2 bytes  =   2 KB a call
+  save   read 360 KB -> 90 KB = 270 KB a call
+```
+
+**135 to 1.** ⚠ And it costs precision: an int8 output is quantised. But the
+result feeds the next layer, which quantises its activations to int8 anyway, so
+the loss may be nothing at all -- which is a `charsiu_ppl` question and this
+tree now has the instrument for it.
+
+⚠ Four of ten arms timed out. Round 169 checks the board is alive; round 167's
+four arms had zero timeouts, so wedging is a property of the bits asked for and
+not of asking.
