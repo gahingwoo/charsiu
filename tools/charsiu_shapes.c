@@ -102,21 +102,34 @@ static double core_pair(void)
 static double call_us(double mb)
 {
 	/*
-	 * npu_job_cost, round 162: five passes a point, best of five, with the
-	 * spread printed. Two points are dropped because they disagreed with
-	 * themselves -- 0.2621 MB by 90.9% and 1.0486 by 36.9% -- while every
-	 * neighbour on both sides repeated to 3% or better. A row that cannot
-	 * reproduce is not a datum to interpolate through.
+	 * npu_job_cost, round 163, **with CHARSIU_JOB_GAP_US=40**, mean of five.
 	 *
-	 * ⚠ Rounds 155 and 161 read the small end as 40 to 73 us where this
-	 * reads 22 to 34. Taking the best of five removed an interference, not
-	 * a cost: the large end, which was always stable, did not move (8.3886
-	 * MB read 785.00, 769.01 and now 774.30).
+	 * ⚠⚠ THE GAP IS THE WHOLE POINT. The probe's loop submits the next job
+	 * the instant the previous prep returns, and consecutive dispatches
+	 * then overlap. A decode cannot: between two calls it has to rmsnorm,
+	 * rope, run attention or a residual, which is tens of microseconds of
+	 * real work on the same cores. Measured both ways on the same round:
+	 *
+	 *      MB      gap 0     gap 40
+	 *   0.1311     33.15      79.13     2.4x
+	 *   0.5243     64.80     107.96     1.7x
+	 *   1.0486    150.98     153.64     1.0x
+	 *  33.5544   2825.77    2829.00     1.0x
+	 *
+	 * Small calls are 2.4x more expensive when nothing pipelines them and
+	 * large ones do not care. Every model's small calls are exactly where
+	 * this predictor was low, so it was calibrated against an overlap the
+	 * product never gets.
+	 *
+	 * ⚠ And round 162's "two shapes disagree with themselves by 90.9% and
+	 * 36.9%" did not reproduce -- both read 3.3% and 1.5% here. I gave a
+	 * random pair of cells a shape explanation. The instability is the
+	 * first points measured in a pass, whatever they are.
 	 */
-	static const double x[] = { 0.0020, 0.0328, 0.1311, 0.5243,
-				    4.1943, 8.3886, 16.7772, 33.5544 };
-	static const double y[] = { 21.80,  24.86,  33.58,  101.23,
-				    359.51, 774.30, 1444.60, 2812.43 };
+	static const double x[] = { 0.0020, 0.0328, 0.1311, 0.2621, 0.5243,
+				    1.0486, 4.1943, 8.3886, 16.7772, 33.5544 };
+	static const double y[] = { 66.13,  68.42,  79.13,  80.31,  107.96,
+				    153.64, 371.38, 776.53, 1473.48, 2829.00 };
 	const int n = (int)(sizeof(x) / sizeof(*x));
 	int i;
 
