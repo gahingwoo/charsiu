@@ -224,6 +224,8 @@ struct npu_tensor {
 	uint64_t n, k;
 	double rms_rel;    /* what the quantisation cost this tensor */
 	float out_scale;   /* CHARSIU_NPU_OUT8>=2: calibrated, then frozen */
+	float out_ascale;  /* mode 4: the a_scale that calibration saw, so the
+			    * frozen part can be rescaled by the current one */
 	double out_clip;   /* how much of the output the frozen scale clipped */
 	uint64_t out_calls;
 	float amax_lo, amax_hi;   /* the spread of |y| across calls: the outliers */
@@ -276,7 +278,14 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
  *   mode 2  a scale calibrated on the first call and then frozen, which is what
  *           a coefficient buffer actually holds. Records what it clips.
  */
-void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode);
+/*
+ * mode 4 takes the activation's own scale. See the long note in npuquant.c:
+ * a frozen coefficient cannot look at the vector it quantises, but it does not
+ * have to -- the output is proportional to a_scale, which is known at pack
+ * time, so the per-channel part freezes and the per-token magnitude rides in.
+ */
+void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode,
+			 float a_scale);
 
 /* ---- and the same thing on the hardware ---------------------------------- */
 

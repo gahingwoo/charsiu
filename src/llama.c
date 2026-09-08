@@ -2217,7 +2217,8 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			act_q1_timed(a);
 		if (id >= 0 && !charsiu_npu_matvec(s->pool.dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
-					    npu_out8_mode());
+					    npu_out8_mode(),
+					    a->q1_valid ? a->d1 : 0.0f);
 			return;
 		}
 	}
@@ -2238,7 +2239,8 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		if (nt) {
 			npu_matvec(nt, a, y, 0, nt->n);
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
-					    npu_out8_mode());
+					    npu_out8_mode(),
+					    a->q1_valid ? a->d1 : 0.0f);
 		} else {
 			gguf_matvec(w, a, y, 0, w->ne[1]);
 		}
@@ -2261,7 +2263,8 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	/* after the fan in, because the scale is a property of the whole vector */
 	if (nt)
 		npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
-				    npu_out8_mode());
+				    npu_out8_mode(),
+				    a->q1_valid ? a->d1 : 0.0f);
 }
 
 /* ---- the small pieces ---------------------------------------------------- */

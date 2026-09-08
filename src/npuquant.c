@@ -1375,7 +1375,8 @@ int npu_out8_mode(void)
 	return m;
 }
 
-void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
+void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode,
+			 float a_scale)
 {
 	float amax = 0.0f, d, id;
 	uint64_t clipped = 0;
@@ -1409,6 +1410,8 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
 		 */
 		uint64_t cal = mode >= 3 ? npu_cal_calls() : 1;
 
+		if (t->out_calls < cal && a_scale > 0.0f)
+			t->out_ascale = a_scale;
 		if (t->out_calls < cal) {
 			float want = amax / 127.0f;
 
@@ -1416,6 +1419,27 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
 				t->out_scale = want;
 		}
 		d = t->out_scale;
+		/*
+		 * ⚠⚠ MODE 4: THE FROZEN PART IS PER CHANNEL, THE MOVING PART
+		 * IS THE ACTIVATION'S OWN SCALE.
+		 *
+		 * The note above says a coefficient buffer cannot look at the
+		 * vector it is about to quantise, and that is true. It does not
+		 * need to. The output of a projection is
+		 *
+		 *     sum(w_q * a_q) * w_scale * a_scale
+		 *
+		 * so its magnitude is PROPORTIONAL to a_scale, which is the
+		 * activation's own absmax over 127 and is computed at pack
+		 * time, before the dispatch. Freeze the rest and let a_scale
+		 * carry the per-token movement -- which is exactly the 2971x
+		 * that job.c refused a byte for.
+		 *
+		 * The calibration therefore records amax / a_scale rather than
+		 * amax, and this multiplies it back.
+		 */
+		if (mode >= 4 && t->out_ascale > 0.0f && a_scale > 0.0f)
+			d = t->out_scale * (a_scale / t->out_ascale);
 	} else {
 		d = amax / 127.0f;
 	}
