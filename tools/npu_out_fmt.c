@@ -26,6 +26,15 @@
 #include <string.h>
 #include "charsiu.h"
 
+static int charsiu_env_flag_local(const char *n, int dflt)
+{
+	const char *e = getenv(n);
+
+	if (!e || !*e)
+		return e ? 0 : dflt;
+	return *e != '0';
+}
+
 int main(int argc, char **argv)
 {
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
@@ -47,7 +56,24 @@ int main(int argc, char **argv)
 	job.input_zero_point = 128;
 	job.weight_zero_point = 128;
 	job.input_scale = job.weight_scale = job.output_scale = 1.0f;
-	job.acc_out = 1;
+	/*
+	 * ⚠ ACC_OUT IS THE WHOLE QUESTION NOW. With it set, job.c forces
+	 * CHARSIU_WIDE8 = 0x3f -- the vendor's float output stage -- and the
+	 * hardware still writes a raw int32 accumulator, exactly right: k=1024
+	 * of (1-128)*(1-128) reads back 16516096 = 1024 * 127^2. So acc_out
+	 * BYPASSES the output conversion rather than selecting it, and the
+	 * float in that comment is the DPU's processing precision.
+	 *
+	 * CHARSIU_ACC_OUT=0 turns it off and leaves WIDE8 to its own default,
+	 * so the requant and the convert run. If the answer then comes back as
+	 * fp16 and still correct, the read back halves and TTFT's 0.67 ms a row
+	 * gap has a 0.47 ms answer.
+	 *
+	 * ⚠ The coefficient buffer is zeroed here, so a requant that actually
+	 * multiplies will produce zero, not a wrong number. That is a clean
+	 * negative: it says the stage ran.
+	 */
+	job.acc_out = charsiu_env_flag_local("CHARSIU_ACC_OUT", 1);
 
 	insz = (size_t)charsiu_entries_per_row(&job.mm) * 64 + 4096;
 	if (charsiu_bo_alloc(dev, charsiu_weight_bytes(&job.mm) + 4096, &wt) ||
@@ -87,7 +113,9 @@ int main(int argc, char **argv)
 	}
 	charsiu_bo_prep(dev, &ob, 2000000000);
 
-	printf("A = 1^%u, B = 1, so every output should be %u\n\n", k, k);
+	printf("A = 1^%u, B = 1, zero point 128, so each product is 127^2 and\n"
+	       "the accumulator should be %u * 16129 = %u   (acc_out=%d)\n\n",
+	       k, k, k * 16129, job.acc_out);
 	printf("  %4s %12s %14s %10s %10s   %s\n", "i", "as int32",
 	       "as fp32", "fp16 lo", "fp16 hi", "raw");
 	for (i = 0; i < (n < 8 ? n : 8); i++) {
@@ -102,9 +130,8 @@ int main(int argc, char **argv)
 		       (double)charsiu_half_to_float(h1),
 		       p[0], p[1], p[2], p[3]);
 	}
-	printf("\n⚠ Whichever column reads %u is the format the hardware writes.\n"
-	       "  If it is int32, four bytes an element is what the read costs\n"
-	       "  and a narrower one needs the requant, not just a cast.\n", k);
+	printf("\n⚠ Whichever column reads %u is the format the hardware writes.\n",
+	       k * 16129);
 	charsiu_close(dev);
 	return 0;
 }
