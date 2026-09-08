@@ -4696,6 +4696,14 @@ reason nobody shipped a configuration that emits noise.
 to int8 as well; the int4 path keeps fp16 activations. What collapses is the
 activation, not the weight.
 
+⚠⚠ **AND THAT LAST SENTENCE IS WRONG -- SEE "w8a8 was never broken", the next
+day.** Nothing collapsed. The weights were quantised into 1024-wide groups and
+read as one scale a row, because `tensor_grouped()` requires `g->w4` and the
+quantiser did not know it. With the layouts agreeing, this arm measures 27.07
+against llama.cpp's own q4_0 at 26.64 -- the BEST quality number in the tree.
+The guess in this paragraph was made without asking the CPU reference, which
+answers it in one command.
+
 ### ⚠⚠ How it was found: `CHARSIU_NPU=0` opened the NPU
 
 The round wanted a CPU control. `if (getenv("CHARSIU_NPU"))` is an existence
@@ -4748,6 +4756,12 @@ the objective" -- is now measured rather than asserted.
   board CPU  charsiu int4 + int8 a 113.23     79.38
   board NPU  w8a8                 272370    218168    <- noise
 ```
+
+⚠⚠ **THE w8a8 ROW IS A BUG, NOT A PROPERTY -- see "w8a8 was never broken", the
+next day.** Both figures are one tensor's scales read in the wrong layout. On
+qwen3 the fixed arm measures 27.07, better than every other row in this table
+including the gguf's own q4_0 on the same tokens. **gemma4's 218168 has NOT
+been re-measured** and the qwen3 result says it should be.
 
 The chain checks out: the board's CPU arm lands within 1.5% of the host's, on
 a file whose md5 matches, so the whole +73% / +49% belongs to the NPU path.
@@ -4995,3 +5009,1496 @@ charsiu. The first external measurement said +87%, the cause was a group 32x
 coarser than q4_0's, the fix for that was a method the tree had already
 implemented and never got to work, and it was three bugs deep -- each of which
 looked exactly like a null result.
+
+## 2026-09-08 — w8a8 was never broken
+
+Last night's quality line ended with a refusal: *"⛔ w8a8 IS BROKEN AND UNFIXED,
+ppl 272369 (qwen3) / 218168 (gemma4), and PLAN.md still calls it the faster arm
+for prefill."* That was the right thing to write down and the wrong thing to
+conclude.
+
+### The desk decided it, in two commands
+
+The first question a broken path deserves is *which half*. `charsiu_ppl` on the
+host runs the CPU reference against the same staged, requantised weights, so it
+prices the quantiser with the device taken out of the loop. qwen3, 200 tokens:
+
+```
+  CHARSIU_NPU_W4V=1   int4   ppl 91.6559
+  CHARSIU_NPU_W4V=0   int8   ppl 44.8050
+```
+
+int8 is not noise on the host. It is twice as good as int4, which is what eight
+bits ought to be. So the fault is not in the weights — it is between them and
+the hardware.
+
+### And then the tree said what it was, twice, in comments it had already written
+
+`tensor_grouped()` in npudev.c decides whether a K slice may carry one group's
+scale. It wants four things, and the first is `g->w4`. The quantiser did not
+know that: `npu_tensor_build` sets `t->kgroup = grp` for eight bits exactly as
+for four, writes `scale[row * ngrp + group]`, and the int8 consumer reads
+`scale[row]`. Every row takes some other row's scale.
+
+There is already a guard for this. It was added when a partial last group did
+the same thing to Qwen2.5-1.5B, whose k of 1536 and 8960 do not divide the 1024
+slice — it "decoded fluent nonsense on the board while the same file was correct
+on the CPU". The guard reads:
+
+```c
+if (t->kgroup && t->kgroup < t->k && (t->k % t->kgroup)) {
+        whine(g, "a partial weight group would be read as one scale a row", ...);
+```
+
+⚠⚠ **It tests one of tensor_grouped's four clauses.** An int8 tensor at k 2048
+with a group of 1024 has no remainder, so it walks straight past a guard written
+against its exact failure. Every board round exports
+`CHARSIU_NPU_W4_GROUP=1024` whatever the format, which is why the accidental
+w8a8 arm hit it and no deliberate one ever had.
+
+### The fix, and what it costs
+
+```c
+  npuquant.c   if (bits != 4) grp = k;      /* one scale a row, which is what
+                                               the int8 consumer applies */
+  npudev.c     if (t->kgroup && t->kgroup < t->k && !tensor_grouped(g, t))
+                       refuse;              /* ask the predicate, not a clause */
+```
+
+Host, paired, one knob apart:
+
+```
+                     before     after
+  int8 group 1024   44.8050   43.6595     the row number, digit for digit
+  int4 group 1024   91.6559   91.6559     untouched, digit for digit
+```
+
+**At eight bits the coarser group is not a cost — it is a small gain.** A row's
+spread fits in eight bits on its own, so the finer scales only add their own
+rounding. Four bits is the opposite, 91.66 grouped against 114.22 a row, which
+is the whole reason the group exists.
+
+### On the board (round 139)
+
+The corpus lives in /tmp and `usb_reset` reboots the card, so all four ppl arms
+read a missing file and returned nothing — four blank lines, which is what four
+equal arms also look like. The arms that need no corpus did run:
+
+```
+  the widened guard fired on 0 tensors, int4 and int8 alike
+  w8a8 text: "storm had been coming for a long time, but the lighthouse is now
+              only 100 miles from the coast."
+  int8 decode 19.45 tok/s against int4's 31.53, same 13 token prompt
+```
+
+ppl 272369 does not write that sentence. Round 140 rebuilds the corpus first and
+refuses to run the arms if it is not there.
+
+### Where the four-bit error actually lives
+
+`CHARSIU_NPU_W4_ONLY` narrows int4 to tensors whose name contains a substring.
+Host, qwen3, 200 tokens, group 1024:
+
+```
+  everything int8                       43.66
+  attention int4, the rest int8         54.76
+  ffn int4, the rest int8               62.49
+  everything int4                       91.66
+```
+
+⚠ This is an attribution, not a saving: `npu_q_packed()` is off whenever
+W4_ONLY is set, so the four-bit tensors still occupy a byte a code. The file
+says so itself — "a diagnostic for WHERE the error lives".
+
+Two things it says. Attention at four bits costs less than the feed forward at
+four bits, 11.10 against 18.83 — and the feed forward is the larger of the two,
+so per byte they are close to the same. And **the two costs compound rather than
+add**: 11.10 + 18.83 = 29.93, while both together cost 48.00. There is no cheap
+win from splitting the format by tensor class; the error is spread about evenly
+over the bytes, and it gets worse than proportionally when they are all four
+bits at once.
+
+### What this does to the format decision
+
+PLAN.md's rule — int8 when the prompt is more than 3.1x the generated text —
+was priced entirely in tok/s. The quality column, now that one exists, points
+the same way and harder:
+
+```
+  int4, one scale a row                       114.22
+  int4, group 1024                             91.66
+  int4, group 1024 + AWQ 0.5 clamp 2           72.36
+  int8, group 1024                             44.81
+  int8, one scale a row                        43.66
+```
+
+Eight bits with no group and no AWQ beats four bits with both. So int8 is not
+the format you accept for prefill speed and pay for in quality; it is better on
+both counts for prompt-heavy work, and only decode speed argues against it.
+
+⚠ AWQ and the finer group do stack, 73.88 and 91.66 separately against 72.36
+together — but barely, and both are still a long way behind eight bits.
+
+⚠ Still unmeasured: quality through the BATCHED prefill path. Every number here
+is `charsiu_ppl`, one position at a time on purpose. The recommendation is about
+prefill and the arm that ships it has not been scored.
+
+### 🏁 Round 141: w8a8 lands 1.6% off llama.cpp's own q4_0
+
+Round 140 answered the question on a corpus I had rebuilt wrong -- lifting the
+two appends and dropping the `cp /tmp/ppl.txt /tmp/long.txt` between them, so
+long.txt was one passage twice, 571 tokens instead of 600. Internally paired
+and therefore sound:
+
+```
+                NPU      CPU reference
+  int4      11.8818        12.3193
+  int8       7.8720         7.7962
+```
+
+Both formats within about 1% of their own CPU reference, and int4's device arm
+is the BETTER of its pair because the board runs w4a16 where the CPU reference
+runs w4a8. That is the localisation closed from the other end: the device is
+faithful to the weights it is given, for both formats.
+
+Round 141 on the right corpus. ⚠ **Arm Z is a fingerprint, not a baseline** --
+the gguf's own q4_0 through charsiu's CPU loop touches nothing this week
+changed and is deterministic, so it says whether the corpus is last night's:
+
+```
+  Z  q4_0 gguf, the fingerprint      26.6416     recorded 26.6413
+  A  int4 NPU                        49.8930     recorded 49.8930
+  B  int8 NPU                        27.0668     was 272369
+  C  int4 NPU + AWQ clamp 2          40.8296     recorded 40.8006
+  E  int8 NPU + AWQ clamp 2        2162.7320     never asked before
+```
+
+**27.07 against 26.64.** The quality gap that opened last night at +87% closes
+to 1.6% by fixing a scale layout, with no calibration, no finer group and
+nothing new on the hardware.
+
+⚠ Arm C is 0.07% off its record and that is the calibration, not a drift: this
+round's calib pass ran with `CHARSIU_NPU_W4V` unset, so the activations were
+recorded through an int8 model where round 138 recorded them through an int4
+one. Small, and in the direction that says so.
+
+### ⛔ And arm E is the same bug one layer down
+
+int8 with AWQ is 2162.73 where int8 alone is 27.07. On the host it is 44.76
+against 43.66 -- 2.5% worse, not eighty times. The difference is where the
+factor's cancelling multiply lives.
+
+`W' = W/f` happens in the quantiser for any width. `x' = x*f` happens in
+`charsiu_npu_matvec`, which scales the activation before packing it -- and that
+is the w4a16 path, where the activation is still a float when it gets there.
+The int8 path packs `a->q1`, one absmax quantisation of the whole vector, and
+has nowhere to put a per column factor. So at eight bits on the board the
+divide happens and the multiply does not.
+
+⚠⚠ **That is AWQ bug #1 again, in the branch nobody had run.** The first one
+was "the factor was never applied to the activation -- kscale appears twelve
+times in npuquant.c and zero times in npudev.c". This is the same sentence with
+"on the int8 path" appended, and it was reachable the whole time.
+
+Declined rather than fixed, because fixing it buys nothing: the host applies
+the multiply correctly at eight bits and AWQ still makes int8 worse there.
+Eight bits does not have the dynamic-range problem the method exists to solve.
+`npu_tensor_build` now zeroes alpha for `bits != 4` and says so once, naming
+the width. Paired on the host: int8 with AWQ 44.7554 -> 43.6595, which is the
+AWQ-off number digit for digit, and int4 with AWQ 72.3630 -> 72.3630.
+
+### Where this leaves the format choice
+
+```
+                     ppl      bytes a weight     decode, 13 tok prompt
+  int4 w4a16       49.89          0.5            31.53 tok/s
+  int8 w8a8        27.07          1.0            19.45 tok/s
+  q4_0 reference   26.64          0.5625         (not on the NPU)
+```
+
+int4 stays the default: decode is memory bound, int8 moves twice the bytes,
+and chat is a short prompt and a long answer. But PLAN.md's rule already sends
+prompt-heavy work to int8 on speed grounds, and for that work it is now better
+answers as well -- not a trade.
+
+⚠ The decode figures are from round 139's 13-token text arms and are not
+scoreboard numbers. The scoreboard runs 110-token prompts and int8 has never
+been through it.
+
+### The `--batch` number is also the instrument for the K-slice fault
+
+`llama_auto_kmax` stops its candidate list at 2048 and says why:
+
+```
+  slice 2816   WRONG   (Qwen2.5 at KMAX 3072, surf 88)
+  slice 3072   right   (gemma-3-1b at KMAX 3072, surf 96)
+  slice 4096   WRONG   (both, surf 128)
+```
+
+"Something else is wrong above 2048 and it has not been found." Every probe
+that has ever asked this question asked it as **text identical or not** -- a
+bit. A bit cannot say whether a slice is slightly wrong or catastrophically
+wrong, cannot rank two widths that both fail, and cannot see a width that is
+wrong by less than one token choice.
+
+`charsiu_ppl --batch` is the continuous version of the same question, on the
+same path, and it costs one run a width. That is the next probe: sweep
+`CHARSIU_NPU_KMAX` over 1024 / 2048 / 3072 / 4096 with `--batch` and read the
+SHAPE of the error, against the token loop at the same width as the control.
+
+⚠ And note what the widening note already establishes and this does not
+change: the fault is in the batched path, not the quantiser -- at 1024, 2048
+and 4096 the three models whose every K misses every width came back byte
+identical, so the weights are the same bytes across the sweep and only the
+slicing moves.
+
+⚠⚠ It also closes an idea worth not having twice. int8 now sets `grp = k`, so
+`tensor_grouped()` is false for it and the "the K slice IS the quantisation
+group" coupling does not bind -- which looks like int8 being free to take a
+wider KMAX and halve its task count. It is not free: the constraint that stops
+2048 is the batched path itself, and it has nothing to do with grouping.
+
+### Why int8 is the answer here, as an argument rather than an observation
+
+The four-bit group is bought in READ, because the K slice IS the group: cut the
+group by a factor and every tensor is dispatched that many more times, and each
+dispatch reads its own accumulator back. Put the measured quality against that
+cost, on qwen3, 600 tokens:
+
+```
+                              bytes a weight   read     ppl
+  int4, group 1024 (ships)         0.502        1x     49.89
+  int4, group 256                  0.508        4x     38.97
+  int4, group 128                  0.516        8x     36.33
+  q4_0, group 32 (llama.cpp)       0.5625      32x     26.64
+  int8, one scale a row            1.000        1x     27.07
+```
+
+⚠ **The int8 row is 1x and that is the whole point.** Its group is the row, so
+`tensor_grouped()` is false and KMAX is not tied to it at all -- eight bits
+steps outside the coupling rather than paying it.
+
+And the read budget says the other rows are not reachable. The batched prefill
+reads at **5.2 GB/s against the 11.9 the board's eight threads can do** -- 2.3x
+of headroom. Group 256 wants 4x, group 128 wants 8x, and q4_0's group of 32
+wants 32x. **Only the 1x column is affordable, and int8 is the only row in it
+with a usable number.**
+
+So the format story closes: two extra bits buy llama.cpp's own q4_0 quality
+(27.07 against 26.64) at ONE times the read, where buying the same quality with
+a finer four-bit group would cost thirty-two. The price is the weight bytes --
+twice as many, and decode is memory bound, which is why int4 stays the default
+for chat and int8 is the prompt-heavy arm PLAN.md already recommends.
+
+⚠ What this does NOT say: that a finer group is impossible. It says it is
+read-bound on THIS board with THIS accumulator. The note over `tensor_grouped`
+in npudev.c has the register-level argument for why one dispatch cannot carry
+more than one group, and that is the thing to reopen if the surface ceiling
+ever lifts.
+
+### ⛔ Round 143: int8 is slower on the PROMPT too, and my own correction was wrong
+
+The scoreboard, both formats, best of 6, one session, same prompts:
+
+```
+                 decode tok/s                     TTFT ms
+              int4    int8   int8/int4     int4   int8    int8
+  Qwen3      26.30   17.16     65.2%        594    751   +26.4%
+  TinyLLAMA  22.89   12.88     56.3%        869    971   +11.7%
+  Phi3        7.06    3.85     54.5%       2818   3091    +9.7%
+  Gemma4      9.42    5.55     58.9%       2190   2512   +14.7%
+```
+
+The int4 arm is the carried control and it holds: 26.30 / 22.89 / 7.06 / 9.42
+against last night's 26.59 / 22.85 / 7.02 / 9.26, all four still above the
+vendor, all within the board's ~3% drift.
+
+**int8 is behind on both axes.** So `PLAN.md`'s crossover -- int8 above a
+prompt 3.1x the generated text -- has no crossover left to compute. Its prefill
+pair (19.24 int4, 26.60 int8) was measured when int8 batched and int4 did not,
+which the same section says two paragraphs down; the 3.3x batched w4a16 prefill
+landed on 08-27 and int4 went past.
+
+⚠⚠ **AND I WROTE THE WRONG THING TWICE THIS MORNING, THE SECOND TIME WHILE
+CORRECTING THE FIRST.** The README got "better answers AND a faster prompt
+rather than a trade", and PLAN.md got "prompt-heavy work AND better answers,
+against decode speed" -- both of them repeating `PLAN.md`'s prefill claim as an
+input while the whole point of the edit was that its quality claims had never
+been checked. **I audited one column of that section and inherited the other.**
+A stale measurement is load-bearing until something weighs it, and being in the
+middle of fixing a document is not the same as having weighed it.
+
+What survives is the part that was measured today: int8 buys 49.89 -> 27.07,
+llama.cpp's own q4_0 to within 1.6%, for about a third of decode and about 15%
+of TTFT. A quality option, not a speed one.
+
+⚠ Phi-3.5 at eight bits fits: peak 4299 -> 6025 MB. On a smaller board it
+would not.
+
+### 🏁 Round 144: int8 generalises, on three models
+
+```
+                q4_0      int4      int8     int4 vs q4_0   int8 vs q4_0
+  qwen3        26.64     49.89     27.07        +87.3%          +1.6%
+  gemma4       38.41     53.47     39.83        +39.2%          +3.7%
+  tinyllama    18.89     22.78     19.12        +20.6%          +1.2%
+```
+
+The q4_0 arm runs first on each model as a corpus fingerprint. gemma4's w8a8,
+written down on 09-07 as 218168, is 39.83.
+
+⚠ **int4's damage is very model dependent and int8's closeness is not.** qwen3
+loses 87% at four bits and tinyllama 21%, a factor of four between them; both
+land within 4% of the reference at eight. So "int4 costs about 50%" was never
+a property of the format, and a single-model reading of it would have been
+wrong in either direction.
+
+### 🏁 Round 145: the batched path, scored for the first time in six weeks
+
+```
+                    token loop     --batch      difference
+  int4               49.8930      49.8877       -0.011%
+  int8               27.0668      27.8654       +2.95%
+```
+
+**The batched prefill costs int4 nothing.** That is worth stating plainly: the
+path that carries every prompt this runtime serves has been unmeasured since it
+shipped, and for the default format it is free.
+
+**It costs int8 2.95%,** which is the first sign that eight bits is not just
+"int4 with more bits" as far as the batched path is concerned. The one segment
+the formats do not share is the per channel tail multiply -- grouped int4 skips
+it because its scale rides in with the K slice, int8 always takes it.
+
+⚠⚠ **AND THAT NUMBER IS FOR A WIDTH THE PRODUCT DOES NOT USE.** `--batch` read
+`llama_prefill_chunk_cap()`, which is the surface CEILING -- 160 on qwen3 --
+while `charsiu_run`'s default chunk is 80. So the first number ever produced
+for "the quality of the batched path" was the quality of a path nobody runs.
+A probe that reads the cap has forgotten the product has a default of its own.
+Fixed: `--batch` takes `CHARSIU_PREFILL_CHUNK` or 80, the same rule, and prints
+both the chunk and the ceiling so a pasted line cannot be read as the other.
+
+Round 146 sweeps m over 8 / 40 / 80 / 160 to say whether 2.95% is a property of
+the width or of the code path, and reads the prefill table with `scale` named
+for the first time.
+
+### 🏁 Round 146: int8's prefill loss is the PACK, and it is not the scale
+
+Part 1 -- the batched path's 2.95% on int8 does not move with the width:
+
+```
+  int8, token loop                 27.0668
+  int8, --batch m=8                27.8654
+  int8, --batch m=40               27.8654
+  int8, --batch m=80  (shipped)    27.8654
+  int8, --batch m=160              27.8654
+  int4, --batch m=80               49.8877
+```
+
+Identical to four decimals across a twenty-fold range of m. So it is a fixed
+property of the code path and not of the batch, which rules out anything that
+scales with the number of rows -- a shared scale, an accumulator that grows, a
+pooling grain.
+
+Part 2 -- the prefill table with `scale` named for the first time, qwen3,
+90 rows, ms a row:
+
+```
+          pack   submit  fence   read   scale  prep  unacc
+  int4    0.86    0.08   1.29   1.30    0.19   0.12   0.03    5.33 total
+  int8    2.66    0.09   0.93   0.97    0.25   0.10   0.03    6.41
+```
+
+⚠⚠ **int8's fence and read are BOTH SMALLER.** Its hardware path is genuinely
+faster, which is what PLAN.md claimed all along and what round 143's TTFT made
+look false. **pack alone is 3.1x wider and eats the advantage and 1.08 ms a row
+more.** The tail scale everybody suspected -- this author loudest -- is 0.06 of
+the gap, and naming it is how that was settled in one round instead of three.
+
+The cause, once they are side by side: int4 packs through `pack_f16_pooled`,
+pooled across groups; int8 ran two scalar passes over the slice, one thread, no
+NEON. Both vectorise; the rows are independent because each carries its own d1.
+
+Fixed, with `CHARSIU_NPU_QPACK_PLAIN=1` as the same-binary control, and proved
+identical by `tools/npu_qpack_test` rather than by generated text: 56000 rows
+over fourteen widths, on data chosen to break it -- codes exactly halfway
+between two integers, values past the clamp, an all-zero row, near-denormals,
+every remainder mod 16 and mod 4. **0 byte mismatches, 0 d1 mismatches.**
+
+🔑 **And it ran on the desk, because this host is aarch64.** Every
+`__ARM_NEON` block here compiles AND executes. A vector rewrite does not need
+a board round to be proved identical, and I had assumed the opposite.
+
+### 🏁 Round 147: decode is 88 to 91% matmul, and the rest is a per call floor
+
+qwen3, 30.7 ms a token; tinyllama, 41.3.
+
+```
+  qwen3          ms     %        tinyllama        ms     %
+  gate + up     7.29  23.8       gate + up     15.89  38.5
+  q k v         6.06  19.8       down           9.96  24.1
+  down          5.05  16.5       q k v          5.66  13.7
+  output head   5.00  16.3       o proj         3.95   9.6
+  o proj        3.54  11.5       output head    1.93   4.7
+  -- matmul    26.94  87.8       -- matmul     37.39  90.6
+  attention     2.35   7.7       attention      1.99   4.8
+  silu * up     0.72   2.4       silu * up      1.04   2.5
+```
+
+**Everything that is not a matmul is 12% and 9%.** The elementwise work is
+done; whatever is left in decode is in the matmuls.
+
+And the matmuls have a fingerprint. Effective bandwidth by class, qwen3:
+
+```
+  o proj        1.05 MB a call    8.29 GB/s
+  down          1.57              8.72
+  q k v         2.10              9.69
+  gate + up     3.15             12.08
+  output head  77.79             15.56    <- one call, nothing to amortise
+```
+
+Monotone in the bytes ONE call moves, which is what a fixed per-call cost looks
+like and very little else does. Fitting `t = a + b*MB` through the smallest and
+largest gives **b = 15.7 GB/s marginal** and **a = 60 us a call**. At 113 calls
+a token that is 6.8 ms of 30.7 -- **22%** -- and removing it entirely would be
+32.6 -> 44.0 tok/s.
+
+⚠ Two corrections this kills. The marginal bandwidth is 15.7 GB/s, ABOVE the
+11.9 the CPU threads reach, so using the CPU membw ladder as the roof for NPU
+weight reads was wrong. And the floor is 60 us a call now, not the 130 us the
+August note quotes -- attach-once and the halved ioctls did land.
+
+⚠⚠ A line through two points is not a law. Round 148 turns it into a
+prediction instead: `CHARSIU_NPU_NOGROUP=1` stops q/k/v and gate/up sharing a
+submit, taking the count from 113 to 197, which at 60 us is +5.0 ms a token.
+If the table moves by much less, the floor is smaller than the fit says.
+
+### 🏁 Round 148: the prediction held, and it killed the theory behind it
+
+`CHARSIU_NPU_NOGROUP=1` takes the call count from 113 to 197. The fit said
++5.0 ms a token. The board said **+10.6** (30.8 -> 41.4), which is 126 us a
+call, twice the 60 us two points had implied and close to the 130 us the August
+note quotes.
+
+```
+                 group ON   group OFF
+  ms a token        30.8       41.4
+  q k v             6.07      11.26
+  gate + up         7.30      11.78
+```
+
+⚠ Not all of that is dispatch: without grouping, q/k/v pack the same activation
+three times instead of once. The arm confirms a floor exists and is large; it
+does not measure it cleanly.
+
+⚠⚠ **AND THE NPU'S OWN SPLIT SAYS THE FLOOR IS NOT WHERE I WAS LOOKING.**
+
+```
+                        group ON   group OFF
+  hardware path (ms)       1699       2267
+    of it, the fence       1343       1939
+    of it, submitting       133        152
+    of it, summing          140         92
+  end to end               1832       2514
+  neither hardware nor pack   7         70
+  weights                11.58 GB/s  8.68 GB/s
+  a submit's wall clock    114 us     135 us
+```
+
+**End to end is 1832 against 1699 in the hardware path: 7.3% of a decode
+happens outside it, and 7 ms of that is neither hardware nor packing.** Every
+ioctl, malloc and cache clean on the CPU side, all of it together, is noise. I
+had spent an hour reading submit paths and counting syscalls, and the answer
+was that the CPU side is already finished.
+
+The floor is INSIDE the fence -- 1343 of 1699 ms -- and the report's own
+parenthesis says what else lives there: *"waiting for the fence (the invalidate
+is in there)"*. So that one number is the hardware computing, plus the wakeup
+from a blocking ioctl, plus the output BO invalidate. 11.58 GB/s inside the
+hardware path against a 15.7 GB/s marginal rate puts about 26% of it in a fixed
+per-submit cost, and two of those three components are not the hardware.
+
+🔑 **`CHARSIU_NPU_SPIN_US` splits it, and it has existed unpriced the whole
+time.** device.c: *"Off unless asked, until phase 21 has priced it against the
+arm that disables CPU_SLEEP outright."* Phase 21 priced the QoS hold and never
+came back. Polling with `timeout_ns = 1` before falling back to the blocking
+wait removes the wakeup and leaves the invalidate and the hardware, so the
+sweep attributes the fence rather than arguing about it. Round 149.
+
+## 2026-09-08 — the `=0` audit, because two catches are not two bugs
+
+`CHARSIU_NPU=0` opened the NPU and `CHARSIU_NPU_ONEDEV=0` closed the second
+core. Both were found by accident, one night apart, and both were written up
+as incidents. They are not incidents. They are one **shape**, and the only
+honest question is how much of this notebook was measured through it.
+
+**This is instrument contamination, not a code bug.** It does not crash, does
+not warn, and produces a result that reads exactly like a real one. It belongs
+with the four rounds of npu_slice_test and the withdrawn map that stood for
+thirteen days: the probe was wrong and nothing said so.
+
+### The window
+
+```
+  CHARSIU_NPU, CHARSIU_NPU_VERBOSE, CHARSIU_NPU_A16   introduced 08-22
+  CHARSIU_NPU_ONEDEV                                             08-23
+  CHARSIU_SPM_DEBUG                                              08-26
+  CHARSIU_NO_BATCH_PREFILL, CHARSIU_BATCH_SWEEP                  08-27
+  CHARSIU_NO_WCACHE                                              08-28
+  CHARSIU_NPU_W4_ANYM, CHARSIU_BATCH_FORCE                       08-30
+```
+
+Forty-six switches read as existence tests until 2026-09-07 20:02 (34 of them),
+2026-09-08 08:06 (8) and 09:43 (ONEDEV). The exposure runs from 08-22, so
+**seventeen days**.
+
+### What was actually run through it
+
+Every `XXX=0` in the surviving round scripts, checked against the commit that
+gave that switch a value rule:
+
+```
+  switch                    used =0 in      switch became a value rule   verdict
+  CHARSIU_ATTN_POOL         m116 09-07 19:22    09-07 20:02   ⛔ CONTAMINATED
+  CHARSIU_NPU_KFIT          m121 20:16, m122 20:29  09-07 20:02   ok, after
+  CHARSIU_NPU_NOGROUP       m148 09-08 09:32    09-07 20:02       ok, after
+  CHARSIU_NPU_ONEDEV        m150 09-08 09:46    09-08 09:43       ok, by 3 min
+  CHARSIU_NPU_POOL_READ     m7 09-06, m87 09-07  09-05 11:11      ok, after
+  CHARSIU_ROW_POOL          m2 m3 m13 m14 m15 m100  value from birth 09-06 07:28
+  CHARSIU_NPU_PACK_POOL     m16 09-06           value from birth   ok
+  CHARSIU_NPU_PAIR          m96 09-07 10:57     value from birth   ok
+  CHARSIU_ROPE_INPLACE      m99 09-07 17:06     value from birth   ok
+```
+
+### ⛔ Round 116 is downgraded to UNVERIFIED
+
+m116 ran four arms looking for a text nondeterminism. Its third,
+`gemma4 + no attn pool`, set `CHARSIU_ATTN_POOL=0` **forty minutes before that
+switch stopped being an existence test**. It did not turn the pool off. It
+turned it on, which is where it already was.
+
+So that arm is the same arm as the one above it, and "the pool is not the
+cause" was never tested by that round. **The conclusion happens to have
+survived** -- the nondeterminism turned out to be `CHARSIU_STAGES` writing
+milliseconds onto stdout, which the next round found -- but it survived for a
+reason m116 did not supply. A right answer reached through a dead knob is not
+evidence, and if the pool HAD been the cause this round would have said it was
+not.
+
+### ⚠⚠ And two weeks cannot be audited at all
+
+The oldest round script that still exists is 09-04 22:36. The switches go back
+to 08-22. **Every round between 08-22 and 09-04 is outside this audit** -- not
+cleared, not condemned, unexaminable. Anything from that window that rests on
+a `=0` control arm should be re-run before it is leaned on. The scripts are
+gone; the status files are not, so a specific claim can still be checked by
+hand if someone needs it.
+
+### ⛔ The audit was incomplete, and the five it missed are worse
+
+That sentence was written as "charsiu_env_flag is now the only way a boolean
+switch is read in src/". It was wrong within the hour. The first sweep grepped
+`if (getenv("X"))`, and five switches use a different spelling:
+
+```c
+  v = getenv("CHARSIU_EXACT_ATTN")    == NULL && !cpu_plain();
+  v = getenv("CHARSIU_EXACT_SILU")    == NULL && !cpu_plain();
+  v = getenv("CHARSIU_EXACT_GELU")    == NULL && !cpu_plain();
+  v = getenv("CHARSIU_EXACT_SOFTMAX") == NULL && !cpu_plain();
+  g->nofini = getenv("CHARSIU_NPU_FINI") == NULL;
+```
+
+Unset gives the fast path; **any value, "0" included, gives the exact one**.
+So `CHARSIU_EXACT_SILU=0`, written to mean "not exact", selects exact -- the
+mirror image of `CHARSIU_NPU=0` opening the NPU, and these four control
+NUMERICAL PRECISION. Measured on the host after the fix: `=1` gives 32.44
+tok/s and `=0` gives 37.99, so the wrong branch is a **17%** difference
+silently attached to the arm that asked for the other one.
+
+🔑 **Nothing was contaminated, and the reason is luck.** Every use of these in
+the surviving rounds and in tests/ is `=1` -- nine of `CHARSIU_EXACT_SOFTMAX=1`
+in board_verify.sh, one of `CHARSIU_EXACT_GELU=1`, none of `=0` anywhere. `=1`
+selected exact before the fix and selects exact after it, so every arm that
+ever ran got what it asked for. The bug was live for the whole window and
+nobody happened to spell it the broken way.
+
+⚠⚠ **Two incomplete audits in one day is the actual lesson.** The first missed
+these because it grepped a spelling rather than a semantics; this one found
+them by asking "what reads a variable and never looks at its value", which is
+the property, not the syntax. A census that greps for a shape will keep missing
+whatever is written differently.
+
+### What stops it happening again
+
+`charsiu_env_flag` is the only way a boolean switch is read in src/, and that
+claim is now checked by property rather than by pattern. The remaining
+`getenv()` calls there take a value (`atoi`, `atol`, `atof`), a name (a file, a
+substring, a CPU list) or a `strcmp` -- checked one by one. ⚠ tools/ still has thirty-odd, and they are probes: a probe that
+inverts its own arm is exactly the failure this section is about.
+
+### The vendor's quality cell: reconnaissance, and it is not encrypted
+
+The README's three-row table has one empty cell -- the vendor's perplexity --
+and it is the cell the other two rows are read against. `rkllm_regcmd.py` says
+why it cannot be filled from the register streams: *"Address registers in a
+static file are unpatched placeholders and read 0"*, so the programs are
+readable and the data they point at is not located by them.
+
+The weights are still in the file. Twenty minutes on
+`Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm`, 1240 MB:
+
+**It is not encrypted.** Entropy runs 5.2 to 6.4 bits a byte, never near 8, and
+the nibble histogram over a megabyte at the midpoint is the signature:
+
+```
+   0:17.8  1:14.3  2:9.6  3:5.2  4:2.4  5:0.9  6:0.3  7:0.1
+   8: 0.1  9: 0.3 10:0.8 11:2.3 12:5.0 13:9.2 14:14.0 15:17.5
+```
+
+A bell centred on zero in four-bit two's complement, symmetric to within 0.3
+points across the sign (0 against 15, 1 against 14). Gaussian weights, rounded
+to four bits, +/-7 the rarest. Encrypted bytes are flat.
+
+**And the file has two halves.** A 200-step profile of entropy and nibble
+symmetry:
+
+```
+   0 -- 520 MB    not bimodal, entropy ~6.0
+ 520 -- 1240 MB   int4 signature throughout, 713 MB of it
+```
+
+Against the model: 128256 x 2048 token embeddings at fp16 are **525 MB**, which
+is the first half; 1236 M weights at four bits are **618 MB**, which is most of
+the second.
+
+⚠⚠ **AND THE 95 MB LEFT OVER CONTRADICTS SOMETHING THIS TREE BELIEVES.** The
+memory of the vendor's format says it carries *one scale and one zero point per
+row* -- for this model that is 505088 rows, about 2 MB, and it does not fit.
+A scale and zero point every 64 weights costs 77 MB and lands at 695 against
+713 measured; every 32 costs 154 and lands at 772.
+
+So the file size looked like it said the vendor quantises in groups of tens of
+weights rather than one group a row.
+
+⛔ **AND THAT WAS OVERREADING A RESIDUAL, WITHIN THE HOUR IT WAS WRITTEN.** The
+95 MB came from subtracting a 618 MB estimate from a 713 MB profile band whose
+edges are good to about 3%, which is +/-20 MB on its own. Walking the regions
+properly (below) closes the file to 1215 of 1240 MB, leaving **25 MB** for
+every scale in the model -- and 25 MB cannot tell a group of 32 from one scale
+a row, because one scale a row is 2 MB and 2 MB fits inside the error bar.
+
+The honest statement is that **the scale format is unknown and this file's size
+does not constrain it.** The written finding it appeared to contradict is
+neither confirmed nor refuted.
+
+**What it would take, and a cheaper intermediate.** Filling the cell properly
+needs the tensor boundaries, the scale format, the weight layout, then a
+dequantise and a gguf write. That is days. But the question underneath it --
+*is the vendor's four-bit quantisation better than ours, and by how much* --
+can be answered by decoding **one tensor**: dequantise a single gate
+projection, compare its error against the same gguf tensor, and put that beside
+charsiu's own. No tokenizer, no forward pass, no board.
+
+### 🏁 Round 150: the floor is the hardware, and the counters are why that is knowable
+
+```
+                        two cores   one core
+  ms a token               30.8       39.6
+  hardware path (ms)       1710       2310
+  weights                 11.50      8.52 GB/s
+  a submit's wall clock    114 us     306 us
+    of it, the fence       1352       2002 ms
+    of it, submitting       138         93 ms
+```
+
+And the spin counters, added this morning for exactly this reading:
+
+```
+  charsiu spin: 13899 polls, 13827 won without blocking (99%, mean 114 us),
+                72 fell back (mean 312 us of polling before they did)
+```
+
+⚠⚠ **NINETY-NINE PERCENT OF THE POLLS WIN, AND THE MEAN IS 114 us.** The
+blocking wait is essentially never reached once the poll is on, so the wakeup
+that round 149's 2.7% was attributed to is not a large hidden cost -- it is
+about 2%, and what is left of the 114 us is the hardware computing. One core
+with the poll on is 2268 ms against 2310 blocking: 1.8%.
+
+**So the per-call floor is not ours.** Round 148 showed the CPU side is 7.3% of
+a decode. Round 149 and this one show the wakeup inside the fence is ~2%. What
+remains is a job's start on the device and the output invalidate, and only the
+second of those is in software.
+
+🔑 **Without the counters this round reads the opposite way.** A 1.8%
+improvement from a 300 us poll is exactly what "the poll never fired" looks
+like, and the next move from that reading -- raise the spin, chase the wakeup --
+would have been wrong. `99%, mean 114 us` closes it in one line. That is what
+the instrument was for.
+
+⚠ What is still not separated: the invalidate. The winning poll's own ioctl
+does the wait AND the invalidate, so the 114 us mean contains both. A second
+PREP on an already-finished BO would be the invalidate alone -- one probe,
+still unwritten.
+
+### The .rkllm's three regions, settled by a test that discriminates
+
+The entropy profile could not tell packed int4 from int8 -- both put bytes near
+zero. One statistic does: **in packed int4 the low and high nibble hold two
+independent weights, so their histograms are the SAME; in int8 the low nibble
+is mantissa noise and the high nibble carries sign and magnitude.** Total
+variation between the two halves, over a megabyte:
+
+```
+   520 -- 990 MB     0.26%   identical halves      -> packed int4
+   990 -- 1240 MB   52.19%   low flat, high a bell -> int8
+     0 -- 520 MB    55.39%   fp16 exponent pattern -> fp16
+```
+
+The low nibble at 1100 MB is 6.2 to 6.3% across all sixteen values -- flat to
+a tenth of a point -- and the high nibble is 21.7 / 15.4 / 8.1 / 3.4 / ...
+symmetric about the sign. That is int8, not a coincidence.
+
+```
+    0 -- 520 MB    fp16   token embedding    128256 x 2048 x 2  =  501 MB
+  520 -- 990 MB    int4   16 layers          973 M x 0.5        =  464 MB
+  990 -- 1240 MB   int8   output head        263 M x 1          =  250 MB
+                                                        total     1215 of 1240
+```
+
+🏁 **The vendor keeps its output head at eight bits.** charsiu quantises it to
+four along with everything else.
+
+### And charsiu can already do that, so it was measured rather than assumed
+
+`CHARSIU_NPU_W4_ONLY=blk` gives four bits to every tensor whose name contains
+`blk` -- the layers -- and leaves `output.weight` at eight, which is the
+vendor's shape. Host, qwen3, 200 tokens:
+
+```
+  everything int4                    91.66
+  layers int4, head int8 (vendor)    86.83     -5.3%
+  everything int8                    43.66
+```
+
+**Only 5.3%.** The head is 26% of qwen3's weight bytes and 5% of the damage, so
+the vendor's eight-bit head is not where a quality difference would come from
+if it has one. It is consistent with this morning's W4_ONLY sweep: the four-bit
+error is spread roughly with the bytes, and no single tensor class carries it.
+
+⚠ So the interesting difference, if there is one, is the layers -- and those
+are int4 on both sides. Which leaves the group size, and the file does not say
+what it is.
+
+### 🏁 Round 151: the 71 us floor, fully attributed, and decode's remaining room
+
+`npu_prep_cost` times prep and fini on a buffer that was never submitted, so
+there is no fence in the number:
+
+```
+     bytes   prep us   fini us    GB/s
+      4096      1.16      1.00     3.5
+      8192      1.46      1.33     5.6
+     32768      3.26      3.12    10.1
+     65536      5.60      5.46    11.7
+    262144     19.72     19.55    13.3
+   1048576     76.47     76.06    13.7
+   4194304    302.04    301.39    13.9
+```
+
+**A syscall with no work costs 0.87 us and the cache walk runs at 13.9 GB/s.**
+Both halves of a call's maintenance follow: two output preps at charsiu's 32 KB
+out_stride are 6.5 us, two input finis at ~8 KB are 2.7, so **9.2 us**.
+
+With round 149's spin sweep and round 150's counters, the 71 us fixed term is
+now accounted for end to end:
+
+```
+  the device starting a job    ~46 us   65%    not ours
+  the blocking wakeup           ~11 us   15%    CHARSIU_NPU_SPIN_US removes it
+  cache maintenance             9.2 us   13%    out_stride is 32 KB for a 4 KB result
+  ioctl syscalls                 ~5 us    7%
+```
+
+⚠⚠ **So decode's remaining room is about 6% of a token, not the 22% the first
+fit implied.** 26% of a token is the per-call floor, and 65% of that floor is
+the device starting a job -- which no amount of userspace work removes.
+
+The two pieces that are ours were both confirmed the same round.
+`CHARSIU_NPU_NMAX=2048` drops out_stride from 32 KB to 8 and moves the hardware
+path 1709 -> 1663 ms, **2.7%**, which is the right size for 2 x (3.26 - 1.46)
+us a call. ⚠ NMAX is the wrong lever for it though: it also re-slices every
+tensor wider than 2048, and qwen3's 151936-wide head would take 75 slices
+instead of 19. The right change is `out_stride` per entry -- `min(nmax, t->n)`
+-- which buys the same cache and re-slices nothing. Priced, not yet written.
+
+🔑 Three rounds took a "22% of a token is overhead" reading down to 6%.
+
+⛔ **AND THEN I WROTE THAT THE LINE WAS FINISHED, ON A NUMBER I HAD
+SUBTRACTED.** The 46 us is what was left after removing three measured terms
+from 71. Nothing measured it. The paragraph above it on this same page had just
+retracted a residual for exactly that reason, and one screen later I used
+another one to close a line of work.
+
+**A residual attributed to hardware is the shape of the wall.** Every
+explanation of that one was a property of the CBUF sequencer -- for months,
+with data behind each -- until it turned out to be `PC_TASK_CON`'s field layout
+in a header copied from RK3588. What made it a wall was not the difficulty. It
+was that "the hardware does this" was never itself a measurement.
+
+So the 46 us gets measured. `tools/npu_job_cost` submits a matmul small enough
+that the arithmetic is nothing and times four ways of getting two jobs onto the
+device:
+
+```
+  A  one job, one ioctl                  the floor itself
+  B  TWO jobs in ONE ioctl, one fd       never run
+  C  two jobs, two ioctls, one fd        an ioctl's own share
+  D  two jobs, two ioctls, two fds       what charsiu does today
+```
+
+⚠⚠ **And arm B exists because of something in charsiu's own submit loop.**
+`charsiu_npu_matvec_group` runs `for (d = 0; d < g->ndev; d++)
+charsiu_submit_jobs(g->dev[d], &jl, 1)` -- one ioctl per core, in sequence, so
+the second core starts a whole syscall after the first. `charsiu_submit_jobs`
+has taken a job LIST since it was written, and device.c says why that matters
+in a comment nobody acted on: *"Jobs are what the scheduler can hand to
+different cores."*
+
+Round 152. If B beats D, the second core has been starting late for the life of
+this runtime, and 46 us was never the device's.
+
+### ⚠⚠ And the tree already had a three-term model that my fit erased
+
+npudev.c, from a round that fitted TinyLLAMA's five decode stages against the
+geometry this file cuts:
+
+```
+     q k v     1.311 MB  3 tasks   measured  392.7   fit  383.5
+     o         1.049     1         measured  276.4   fit  280.9
+     gate+up   5.767     2         measured  845.0   fit  836.9
+     down      3.146     3         measured  573.6   fit  585.4
+     head     16.777     4         measured 2100.0   fit 2122.1
+
+   us a call = 128.7 + 36.8 * tasks + 110.0 * MB   (busier core)
+```
+
+Inside 2.4% at all five, and it agrees with a 2026-08-15 sweep of synthetic
+matmuls at 32 chained tasks that never saw this model: 26.3 us a task, 172 a
+submit, 84.3 a megabyte. Same three terms, same order, different shapes,
+different day.
+
+**My fit today has no task term.** Two points, then five, then `a = 71 us +
+63.4 us a MB` -- and it predicted the output head to 3% from the small tensors,
+which is why I trusted it. But task count and megabytes are collinear across
+those five classes, so a two-term fit puts the task cost inside the MB slope
+and reports a floor that is only the part left over. That is how 46 us appeared
+and then got a name.
+
+If a task really costs tens of microseconds, decode's budget is a different
+shape. qwen3 presents **271 tasks a token** across 113 calls:
+
+```
+  task marginal   36.8 us  ->  9.97 ms  =  32% of a 30.7 ms token
+                  26.3 us  ->  7.13 ms  =  23%
+                  10.0 us  ->  2.71 ms  =   9%
+```
+
+🔑 **AND THE TASK COUNT HAS A LEVER THAT int4 DOES NOT HAVE.** Tasks are K
+slices, and `ceil(K / KMAX)` is the count. int4 cannot raise KMAX -- the K
+slice IS the quantisation group, and `tensor_grouped()` requires
+`kgroup == kmax`. **int8's group is the whole row, so it is free of that
+coupling entirely**:
+
+```
+  KMAX 1024   down takes 3 slices   271 tasks a token
+  KMAX 2048                 2       243        -28
+  KMAX 4096                 1       215        -56
+```
+
+⚠ This may be why int8's fence was already smaller in round 146 (0.93 against
+int4's 1.29 ms a row) while its pack was worse -- fewer tasks for the same
+bytes. Nobody has swept KMAX on int8, because until this morning int8 was
+believed to emit noise.
+
+Round 152's task sweep -- 1 to 16 chained in one job, on a matmul with no
+arithmetic in it -- prices the term directly instead of fitting it.
+
+### 🏁 Round 152: the 46 us measured, and both of my levers are dead
+
+```
+  one job, tasks chained inside it
+     tasks   us a job    us a task
+         1      21.66        21.66
+         2      25.93        12.96
+         4      35.83         8.96
+         8      55.33         6.92
+        16     216.16        13.51
+
+  two jobs, four ways
+    A  one job, one ioctl                72.59 us
+    B  two jobs, ONE ioctl, one fd      131.12 us     ~ 2 x A
+    C  two jobs, two ioctls, one fd     131.93 us     ~ B
+    D  two jobs, two ioctls, two fds     57.84 us     <- what charsiu does
+```
+
+**B and C are both about twice A, and D is the fastest of the four.** Two jobs
+submitted through one fd RUN SERIALLY, whether they arrive in one ioctl or two.
+Two fds run in parallel. So the `for (d) submit(dev[d])` loop that looked like
+a missed opportunity is the only arrangement of the four that uses both cores,
+and the comment about the scheduler handing jobs to different cores does not
+mean it will do so within one fd.
+
+⛔ **The fd merge is dead, and it is dead by measurement rather than by
+argument.** So is the reasoning that led to it: charsiu's second core is not
+starting a syscall late, because the alternative starts it on the same core.
+
+**And the task term is not 36.8 us.** Fitting 1 to 8 tasks:
+
+```
+  a job costs 16.85 us + 4.81 us a task
+```
+
+Eight times smaller than the three-term model in npudev.c, which got 36.8 from
+five decode stages on TinyLLAMA. Both cannot be right about the same hardware.
+What the stage fit actually has is five points where tasks and megabytes move
+together, so its task coefficient is carrying weight-fetch time that this probe
+-- where the matmul is 64x32 and the arithmetic is nothing -- does not have.
+
+⚠⚠ So my own correction was half wrong too. I said the two-term fit erased a
+task term worth up to 32% of a token. At 4.81 us it is **271 x 4.81 = 1.30 ms,
+4.2%**, and int8's freedom to raise KMAX is worth about a percent, not ten.
+
+🔑 **What the residual actually was.** D -- two jobs on two fds, submitted and
+waited on, which is exactly what one decode call does -- is 57.84 us against
+the 71 us fixed term fitted from the stage table. The 13 us of difference is
+the pack, the fini and the slice sum. **The floor is the dispatch, it is about
+58 us of it, and it is now a measurement rather than a subtraction.** The
+answer did not change. What changed is that it is now evidence.
+
+⚠ **And the probe found something nobody was looking for.** Sixteen tasks in
+one job costs 216 us where the line through 1 to 8 predicts 94 -- 130% over,
+after four points that sit on it to within a microsecond. Something has a
+ceiling between 8 and 16 chained tasks. charsiu's largest decode chain is 4
+(the head at NMAX 8192), so nothing hits it today, and the batched prefill
+chains more. Unexplained, reproducible, and written down.
+
+### 🏁 The qpack fix, measured: int8's prefill now beats int4's outright
+
+Round 153's first two arms, qwen3, 90 rows, ms a row:
+
+```
+              pack  submit  fence  read  scale  prep   total
+  int4 1024   0.95   0.08   1.24   1.30   0.20  0.11    5.36
+  int8 1024   0.88   0.09   0.90   0.94   0.25  0.10    4.59
+```
+
+**int8 is 14.4% faster a row than int4, at the same K slice.** This morning
+the same comparison was 6.41 against 5.33 the other way, and the whole
+difference was pack: 2.66 then, **0.88 now**. Vectorising and pooling int8's
+activation quantiser took its own prefill down 28% and turned the sign of the
+comparison.
+
+⚠ I had not measured that change on the board -- it went in on a host
+bit-identity proof and a prediction. The prediction was that pack would fall
+towards int4's 0.86. It landed at 0.88.
+
+And the rest of the row was already int8's: fence 0.90 against 1.24, read 0.94
+against 1.30. Eight-bit weights dispatch fewer, wider slices for the same
+tensor because their group does not pin KMAX, and both of those numbers follow
+from it before KMAX is even swept.
+
+### 🏁 Round 154: KMAX 4096 does not disagree, it collapses
+
+The batched path scored at each width, int8, qwen3, 400 tokens:
+
+```
+  KMAX 1024, token loop        43.9086
+  KMAX 1024, --batch           44.7567     +1.9%
+  KMAX 2048, --batch           43.6578     -0.6%   better than the loop
+  KMAX 4096, --batch    4,932,524,413,828  ⛔
+```
+
+`llama_auto_kmax` stops its candidate list at 2048 because "Qwen2.5 and
+gemma-3-1b DISAGREE at 4096" -- a text hash, a bit, no magnitude. **It is
+eleven orders of magnitude.** The candidate list was right and now the reason
+has a shape.
+
+And 2048 is CLEAN on int8 -- marginally better than the token loop, which is
+what a wider slice should be: fewer accumulator round trips, the same
+quantiser, because int8's group does not widen with KMAX.
+
+⚠ But the width is not the lever it looked like. Its whole value is a 25%
+smaller read, and the chunk cap halves with it, so it only wins where the
+prompt still fits one chunk:
+
+```
+  prompt   KMAX 1024 chunks   KMAX 2048 chunks   winner
+      64          1                  1           2048, read -25%
+      80          1                  1           2048
+     110          1                  2           1024
+     400          3                  5           1024
+```
+
+At 91 tokens round 153 measured exactly that: 4.59 ms a row at 1024 in one
+chunk, 5.21 at 2048 in two. **The ceiling on this whole line is about 3%, and
+only for prompts under 80.**
+
+### ⚠⚠ But normalising round 153 found something the scoreboard is wrong about
+
+```
+  m153  int8 KMAX 1024   413 ms / 91 tok  =  4.54 ms a token
+  vendor qwen3           469 ms / 110 tok =  4.26            6.5% behind
+  scoreboard int4        594 ms / 110 tok =  5.40            27% behind
+```
+
+**int8 takes TTFT from 27% behind the vendor to about 6.5%,** and the reason is
+this morning's pack fix: int8's row went 6.41 -> 4.59 ms while int4's stayed at
+5.36, so the format that was slower on both axes is now faster on one.
+
+⛔ **And the scoreboard's int8 column predates that commit.** Round 143 ran
+`CHARSIU_BENCH_W4V=0` at 08:41 and reported Qwen3 TTFT 751 ms -- int8 slower on
+the prompt. The qpack change landed at ~09:2x. That stale column is what the
+README's three-row table quotes, and what "int8 is a quality option, not a
+speed one" was written from. Round 155 re-runs it.
+
+### 🏁 The .rkllm, mapped to the byte, and the scale array found
+
+Binary search on the nibble-half statistic puts three of the four regions
+exactly, and the arithmetic closes to within a tenth of a percent:
+
+```
+                      offset          size      expected      error
+  metadata          0            7.3 MB       header + tokenizer
+  fp16 embedding    7.3 MB     501.0 MB       128256 x 2048 x 2
+  fp16 SCALES     514.6 MB      11.2 MB       ?
+  int4 layers     525.8 MB     463.8 MB       973 M x 0.5 = 464.0   -0.04%
+  int8 head       989.6 MB     250.7 MB       263 M x 1   = 250.5   +0.10%
+```
+
+**The int4 region is the weights and nothing else** -- 463.800 against 464.000
+predicted -- so the scales are not interleaved with them, which the 0.26%
+nibble symmetry already implied and this confirms by size.
+
+**The scales are their own region and it is findable by what a scale IS.**
+Embeddings are symmetric about zero; a scale is positive. Sweeping the fraction
+of positive fp16 values walks from 49.9% to 99.4% at 514.6 MB, and the region
+from there to the int4 boundary is 11.203 MB -- 5,873,759 halves, 90 to 99%
+positive, magnitudes from 1e-7 to 1e-3, and about 300 distinct values in any
+64 KB.
+
+⚠ **Mostly powers of two.** `frexp` mantissas over 2000 samples: 0.5 in 80% of
+them, 0.75 in 12%, 1.0 in 5%. A scale quantised to a shift, not a free fp16.
+
+⚠⚠ **And it is not a flat array of one scale a group.** The tail has an
+obvious period of four:
+
+```
+  0.000488758   2.10156   3.75509e-06   1.78814e-07
+  0.000488758   2.10938   4.94719e-06   0
+  0.000488758   2.11719   ...
+```
+
+First slot constant, second drifting slowly, third and fourth small. Dividing
+the count by the weights gives group 165.7 or 210.4 depending on whether the
+head is included -- **neither is an integer**, which is the arithmetic saying
+the layout is a record and not an array.
+
+**So: the file is fully readable and the scales are located. What is left is a
+record format, not a search.** Whether the vendor's four-bit quantiser is
+better than charsiu's can be answered by decoding ONE tensor -- no tokenizer,
+no forward pass, no board -- and that is now a bounded piece of work rather
+than an open question.
+
+⚠ Everything above is structure and arithmetic. No vendor weight has been
+dequantised yet, and until one is, nothing here says anything about quality.
+
+### ⚠ Round 158: the predictor's held-out extremes, and it fails at both ends
+
+Ten ggufs predicted from the desk, every coefficient from `npu_job_cost`, no
+model in the fit. Seven now have a measurement on one protocol:
+
+```
+  model            t/MB     pred    meas    error   implied matmul share
+  SmolLM2-135M     3.66     9.36    14.6   -35.9%          64%
+  qwen3            0.91    27.13    30.9   -12.2%          88%
+  tinyllama        0.78    41.44    41.3    +0.3%         100%
+  gemma-3-1b       1.12    41.11    42.8    -3.9%          96%
+  Qwen2.5-1.5B     0.81    61.36    63.0    -2.6%          97%
+  SmolLM2-1.7B     0.58    65.54    63.3    +3.5%         104%
+  Phi-3.5          0.45   138.36   130.5    +6.0%         106%
+```
+
+Two of the three new models land inside 4%, on shapes nobody calibrated
+anything against. **tinyllama is +0.3% and took part in nothing.**
+
+⚠⚠ **But three rows imply a matmul share above 100%,** which is the model
+claiming more of a token than the token has. That is not a fit error. Phi-3.5's
+gate+up is **19.6 MB in one call** and the MB sweep stopped at 8.39, so those
+rows are extrapolated 2.3x past the data.
+
+And the other end fails the other way: SmolLM2-135M's calls are 0.13 to 0.69 MB
+and it is missed by 36% LOW, with an implied matmul share of 64% -- i.e. the
+elementwise work this predictor does not model is a third of that token where
+it is a ninth of qwen3's.
+
+⛔ **I tried to fix the small end by adding a term and made it worse.** A
+residual proportional to `layers * n_embd` is physically the right shape for
+elementwise work, and fitting it took RMS from 14.7% to **16.4%** -- because
+the residuals it was fitted to are +303, +132, -3, +56, +38, -46, -80 ns per
+unit, sign-changing, which is two errors of opposite sign being averaged into
+one parameter.
+
+🔑 **So: widen the measurement, do not add a parameter.** The sweep now runs
+0.002 to 67 MB, covering every call any of the ten models makes. The
+elementwise term can be fitted after the matmul term stops being extrapolated,
+or it may turn out not to be needed. Fitting it first was fitting the second
+parameter on top of a wrong first one.
+
+### ⛔ Round 159 killed the board, and the probe had no business asking
+
+Widening npu_job_cost's sweep to 67 MB put `4096 x 16384` on the end. **n =
+16384 is past the 8192 the device is opened for.** The job was submitted
+anyway:
+
+```
+  rocket 27708000.npu: NPU job timed out
+  rk_iommu 2770a000.iommu: Error during raw reset. MMU_DTE_ADDR is not functioning
+```
+
+which is the dead state this project already has a note about, and the clock
+between that round and the next says the board sat in it for **five hours**.
+
+Both bounds are written down elsewhere in this tree -- npudev refuses
+`(k/32)*m > 5120` and the device is opened for a max n -- and the probe checked
+neither. **A probe that walks an axis has to know where the axis ends,** and I
+widened one by editing an array.
+
+🔑 **usb_reset brought it back.** A power cycle does what the driver's own
+reset path cannot, and round 160 confirmed it: `accel0` present, 197 tensors
+staged, 10.74 GB/s, English out. That is worth knowing the next time this
+happens -- the five hours were nobody watching, not an unrecoverable board.
+
+### And the head was being extrapolated, which was a smaller version of the same
+
+`charsiu_shapes` priced the output head as one call of its whole weight -- 38
+MB on Phi-3.5, 157 on gemma4 -- and `call_us` answered by extending a straight
+line at 89 us a megabyte, where round 147 measured the head itself at 15.56
+GB/s, which is 64. Three models came back implying a matmul share above 100% of
+their own token: the arithmetic refusing an extrapolation, not a poor fit.
+
+The head is `ceil(n_vocab / NMAX)` slices of at most NMAX, so pricing it by
+slice puts every piece inside the measured range:
+
+```
+                 whole    by slice    measured     was        now
+  Qwen3-0.6B     27.13      27.77        30.9    -12.2%    -10.1%
+  gemma-3-1b     41.11      42.11        42.8     -3.9%     -1.6%
+  Phi-3.5       138.36     138.45       130.5     +6.0%     +6.1%
+                                          RMS      8.2%      6.9%
+```
+
+⚠ A small correction, because the head is one call against a hundred and
+twenty. It was still an extrapolation being reported as a measurement.
+
+### ⛔ A regression I shipped, and it hid inside a judgement I then made
+
+Round 164 read prefill at 8.29 ms a row where round 153 read 4.59 on the same
+90 rows in one chunk. The difference was `read`: 0.94 -> **4.09**.
+
+Cause: this afternoon's "four tuned constants become one rule" derived
+`CHARSIU_NPU_POOL_READ_MIN` from `charsiu_pool_min(rate, charsiu_threads())`
+**at charsiu_npu_open() time**, and there is no thread pool there --
+`charsiu_run` never calls `charsiu_threads_start`, so `g_pool.n` is 0 and
+`charsiu_threads()` returns 1. Below two threads that function returns "never
+pool". The accumulator read back stopped pooling, the prompt got 1.8x slower,
+and it was committed and pushed.
+
+⚠⚠ **arch_sanity 6/6 and hostcheck 4/4 both passed.** With no NPU the read back
+path is never taken at all. The only reason it surfaced is that round 164
+printed a stage table next to one from round 153.
+
+Fixed by resolving on first use. ⚠ And the fix converted two of four call
+sites, because the other two wrap the condition across a line and a
+single-line pattern walked past them -- the same shape as this morning's audit
+missing five `getenv(...) == NULL` switches. Twice in one day a mechanical
+replace declared itself done on a subset, and both times counting the call
+sites caught it, not reading the diff.
+
+**And the judgement it poisoned.** From round 164 I read attention at 11.5% of
+a prefill row and concluded TTFT was "spread over a dozen items, no single
+target, carrying-water work, not worth chasing". On the fixed binary
+(round 165):
+
+```
+  q k v         1.22   23.0%        attention     0.97   18.2%
+  gate + up     1.38   26.0%        rmsnorm+rope+silu+residual  0.50  9.2%
+  down          0.76   14.3%
+  o proj        0.49    9.2%        matmul total          72.5%
+```
+
+**attention is 18.2%, and 0.97 ms a row on its own is larger than the entire
+0.67 ms a row gap to the vendor.** The matmul share had been inflated by my own
+regression, which pushed everything else down. I gave a "not worth chasing"
+verdict on numbers from a binary I had broken four hours earlier.
+
+### 🔑 Round 166: acc_out bypasses the output convert, it does not select it
+
+One matmul with a known product -- A and B all ones at zero point 128, so every
+element is (1-128)^2 = 16129 and k = 1024 should give 16516096:
+
+```
+   raw 0004fc00    as int32 16516096    as fp32 2.3e-38    fp16 6.1e-05
+```
+
+**int32, exactly right.** And the same job's registers are the vendor's float
+stage, because `job.c` sets `if (job->acc_out) wide8 = 0x3f` -- 0x4010
+a0000002 (PROC_PRECISION 2, fp16), 0x4044 = 2, identity requant.
+
+So the note that says *"w4a16 does not requantise at all, the output is a
+float"* is about the DPU's PROCESSING precision. `acc_out` takes the raw
+accumulator before the convert. A narrower read is not a cast, it needs the
+requant and the convert to actually run.
+
+### What a narrower output would be worth, and where it is legal
+
+TTFT is 15.8% behind the vendor on int8: 74 ms over 110 tokens, **0.67 ms a
+row**. Prefill reads 0.94 ms a row at four bytes an element. Two bytes is 0.47.
+
+**And the legality is a static property of the weights.** With int8's group
+being the whole row, the DPU's per-channel requant can apply exactly the scale
+the CPU applies now, and the largest value it can emit is `127 * sum|w|`,
+because every `|a_q| <= 127`:
+
+```
+  Qwen3-0.6B     worst tensor   18,334      fp16 max 65,504    ✓
+  Phi-3.5-mini   ffn_down      139,399                         ⛔ 2.1x over
+```
+
+⚠ `job.c` already named that tensor -- *"the output magnitude of ffn_down
+varies by up to 2971x between tokens"* -- without the arithmetic. The bound is
+computable at staging from the weights alone, so this is a per-tensor decision
+and not a global switch, which is the shape this project wants: a rule over
+`(m, k, n)` rather than a constant.
+
+⚠⚠ The bound is worst case: it assumes every `|a_q|` is 127 and all the signs
+agree. Real activations run about a third of that, so Phi-3.5 would probably
+not overflow -- but an overflow is an inf that destroys the token, so only the
+worst case can gate it.
+
+### And prefill's attention is the other half, with room in it
+
+Round 165 on the fixed binary: attention is **0.97 ms a row, 18.2%** of a
+prefill row, and 0.97 alone is larger than the whole 0.67 gap. Its rate:
+
+```
+  33.2 MMAC over 87 ms   =  0.38 GMAC/s
+  66.4 MB of KV over 87  =  0.76 GB/s      against 11.9 the threads reach
+```
+
+**Neither bandwidth nor arithmetic bound.** And the pool splits it over HEADS,
+so the thread count only divides evenly when the head count does:
+
+```
+  qwen3 16 -> 100%    tinyllama 32 -> 100%
+  gemma-3-1b 4 -> 50%       SmolLM2-135M 9 -> 56%
+```
+
+⚠ Splitting over (head, row block) instead needs the per-head scratch
+(`s->batt + h * R * n_ctx`) reindexed, and prefill's best axis is the row block
+(12 of them at n=90, R=8) while decode's is the head (one row block). Worth
+doing, not a safe last-hour change.
+
+### 🏁 Round 167: the output width is controllable, and both ends were reached
+
+acc_out off, the same known matmul, WIDE8 swept coarsely:
+
+```
+  acc_out=1                 16516096   raw 0004fc00    four bytes, exact
+  acc_out=0  WIDE8=0x3f     16516096   raw 0004fc00    identical
+  acc_out=0  WIDE8=0                   raw 80808080    ONE byte, repeated
+  acc_out=0  WIDE8=0                   raw 80808080    (repeat, same)
+```
+
+**0x3f writes four bytes and 0 writes one.** The values under WIDE8=0 are
+garbage -- the coefficient buffer is zeroed, so a requant that multiplies
+produces nothing -- but the WIDTH moved, and nothing timed out in any arm.
+
+That is the sweep `job.c` has been asking for since it was written: *"the bits
+exist separately because 'the whole bundle changed something' does not say
+which register the width lives in, and a single field sweep is the method that
+worked on 0x4050 in round 260."* Nobody had run it.
+
+```
+  bit 0  0x4010   bit 1  0x4030 low   bit 2  0x4038
+  bit 3  0x4044   bit 4  0x4050       bit 5  0x40ac/b0/b4 identity
+```
+
+**What is worth finding is two bytes.** Prefill reads 0.94 ms of a 4.59 ms row
+at four bytes an element; two would be 0.47 and the entire gap to the vendor is
+0.67. One byte would be 0.24 -- and is exactly what `job.c` refused, because
+ffn_down's output range does not fit in one. So fp16 is the target and int8 is
+not, which makes this a search for a bit rather than for a bundle.
+
+### 🏁 Round 168: the width sweep job.c asked for, and it has only two values
+
+```
+  WIDE8=0x01  bit0  0x4010          ⛔ NPU timed out
+  WIDE8=0x02  bit1  0x4030 low         80808080    one byte
+  WIDE8=0x04  bit2  0x4038             7F7F7F7F    one byte, saturated
+  WIDE8=0x08  bit3  0x4044             80808080    one byte
+  WIDE8=0x10  bit4  0x4050          ⛔ NPU timed out
+  WIDE8=0x20  bit5  identity requant   00000000    zero
+  WIDE8=0x3e  0x3f minus bit0       ⛔ NPU timed out
+  WIDE8=0x37  0x3f minus bit3          16516096 ✓  four bytes
+  WIDE8=0x1f  0x3f minus bit5          16516096 ✓  four bytes
+  WIDE8=0x0f  low four               ⛔ NPU timed out
+```
+
+**bit0 and bit4 have to be together** -- either alone wedges, which reproduces
+round 311 -- and **bit3 and bit5 are not needed at all**: 0x37 and 0x1f both
+give the exact four-byte accumulator.
+
+⚠⚠ **And the width has exactly two values, 1 and 4. There is no 2.** I had
+picked `0x4044` as the width register on the strength of "int8 writes 1, w4a16
+writes 2", and 0x37 removes it and stays four bytes wide. Whatever selects fp16
+output is not in this bundle.
+
+### But one byte is worth more than fp16 would have been
+
+```
+  prefill read, qwen3        0.94 ms a row at four bytes
+  at two bytes               0.47      saves 0.47
+  at ONE byte                0.23      saves 0.70     the gap is 0.67
+```
+
+`job.c` refused a byte for a real reason -- *"the coefficient buffer's scale is
+fixed at build time, and the output magnitude of ffn_down varies by up to
+2971x between tokens"*. But that variation is **per token**, and the term that
+varies is known before the dispatch: the output is
+`sum(w_q a_q) * w_scale * a_scale`, `w_scale` is per output channel (which is
+what a DPU coefficient IS, and what int8's whole-row group already is), and
+`a_scale` is the activation's own `d1`, computed at pack time.
+
+So the coefficient buffer would be rewritten per call with the current
+`a_scale` folded in. The trade:
+
+```
+  write  1024 x 2 bytes  =   2 KB a call
+  save   read 360 KB -> 90 KB = 270 KB a call
+```
+
+**135 to 1.** ⚠ And it costs precision: an int8 output is quantised. But the
+result feeds the next layer, which quantises its activations to int8 anyway, so
+the loss may be nothing at all -- which is a `charsiu_ppl` question and this
+tree now has the instrument for it.
+
+⚠ Four of ten arms timed out. Round 169 checks the board is alive; round 167's
+four arms had zero timeouts, so wedging is a property of the bits asked for and
+not of asking.
+
+### 🏁 Round 170: attention over (head, row block), and the control moved too
+
+```
+                        HR=0                HR=1          attention
+  gemma-3-1b   attn 0.74  row 11.63    0.40  row 7.14        -46%
+  SmolLM2-135M attn 0.28  row  2.50    0.26  row 2.43         -7%
+  qwen3        attn 0.99  row  5.32    0.90  row 5.33         -9%
+```
+
+Text identical across the knob on all three -- one hash printed per model, so
+both arms agreed.
+
+**gemma-3-1b's -46% is what "half of eight threads idle" predicts**, and it has
+4 heads. But the informative row is **qwen3, the control**: its 16 heads
+already divided by 8, and it still gained 9%. So the finer unit helps beyond
+the divisibility -- a row block finishes sooner than a whole head, so the tail
+of the pool is shorter.
+
+⚠⚠ **AND gemma-3-1b's WHOLE ROW is not readable.** 11.63 -> 7.14 looks like a
+38% win, and in the same pair `staging` went 8943 -> 4236 ms. Staging has
+nothing to do with how attention is pooled. That arm was the first thing the
+round ran.
+
+**A first point being cold is the third time today.** Round 162 called two
+cells "a shape property" and they did not reproduce; round 155 and 161's small
+end disagreed by 2x and best-of-five removed it; and here it inflates a whole
+row by 60%. Round 171 runs HR=1 first, HR=0 second, with a warm-up pass before
+either: if the attention numbers hold with the order reversed they are the
+split, and if they follow the order they were the cache.
+
+### 🏁 Round 171: reversed and warmed, and it splits the result in two
+
+```
+                  m170 (HR=0 first)     m171 (HR=1 first, warmed)
+                  HR=0    HR=1          HR=1    HR=0
+  gemma-3-1b      0.74    0.40          0.40    0.67
+  SmolLM2-135M    0.28    0.26          0.26    0.27
+  qwen3           0.99    0.90          0.88    0.96
+```
+
+**The attention numbers follow the knob, not the order.** gemma-3-1b reads 0.40
+under HR=1 in both rounds and 0.74/0.67 under HR=0; qwen3 reads 0.88/0.90
+against 0.96/0.99. The split is real, reproducible, and the text is identical
+across it on three architectures and two orders.
+
+⛔ **And the whole-row win was the cache.** gemma-3-1b's row read 11.63 -> 7.14
+in round 170 with `staging` 8943 -> 4236 in the same pair; warmed and reversed
+it reads **7.50 -> 7.27**, with staging 4289 -> 4277. A 38% win was a 3% win
+and a cold first arm.
+
+So the honest table:
+
+```
+                attention          whole row
+  gemma-3-1b    0.67 -> 0.40  -40%    7.50 -> 7.27   -3.1%
+  SmolLM2-135M  0.27 -> 0.26   -4%    2.42 -> 2.38   -1.7%
+  qwen3         0.96 -> 0.88   -8%    5.40 -> 5.45   +0.9%
+```
+
+**Attention falls 4 to 40% and the row falls 0 to 3%,** because attention is 5
+to 18% of a row. On qwen3 that is 0.08 ms a row against a 0.67 gap to the
+vendor -- 12% of the distance, real and small.
+
+🔑 The reason to keep it is not the 3%. It is that the win is largest exactly
+where the head count divides worst, so it removes a model-shaped cliff rather
+than adding a speedup: gemma-3-1b was paying 67% more for attention than its
+arithmetic needed, and nothing in the code said so.
+
+### 🏁 The pre-merge regression, and the one signal it raised
+
+```
+  1. ppl, three carried controls, four decimals
+       q4_0  26.6416  want 26.6416   int4 49.8930 want 49.8930
+       int8  27.0668  want 27.0668
+  2. prefill, int8 KMAX 1024
+       4.48 ms a row, read 0.93      (the regression read 8.29 and 4.09)
+  3. scoreboard int4        earlier   regression   vendor
+       Qwen3                 26.31      26.55       24.85
+       TinyLLAMA             22.83      22.89       19.71
+       Phi3                   7.07       7.04        6.58
+       Gemma4                 9.33       8.93        9.23   <- -4.3%
+```
+
+**Seventeen commits touched the product path today and not one moved the
+answer.** Three ppl arms reproducing to four decimals is the strongest check
+this board offers, because it is the only measurement here that survives a
+session boundary.
+
+⚠ Gemma4's 4.3% sat outside the board's ~3% drift, and gemma4 was the only
+model the attention change had never been measured on -- rounds 170 and 171
+took gemma-3-1b, SmolLM2-135M and qwen3. So round 173 alternated the knob four
+times on it, warmed:
+
+```
+  HR=1  10.05    HR=0  10.05    HR=1  10.04    HR=0  10.03   text identical
+```
+
+**Neutral, and the 4.3% is drift.** Which is the answer that could only be had
+by asking -- gemma4's decode spread over six runs is 7.08 to 8.93, so a
+best-of-six can move 4% without anything changing.
+
+⚠⚠ And the merge check found what the test suites did not, twice: the
+zero-sentinel in `poolread_min` (=0 meaning "always pool" was being replaced by
+the derived value) was caught by reading today's diffs before proposing this,
+not by any run.

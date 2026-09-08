@@ -225,8 +225,16 @@ static int midrise_grid(void)
 #define WCACHE_MAGIC  0x43535743u        /* "CSWC" */
 #define WCACHE_FORMAT 1u
 /* ⚠ BUMP THIS whenever the quantiser's arithmetic changes, or an old cache
- * will quietly feed the new code the old numbers. */
-#define WCACHE_QUANT  2u
+ * will quietly feed the new code the old numbers.
+ *
+ * 2 -> 3 on 2026-09-08: int8 now writes one scale a row where it used to write
+ * CHARSIU_NPU_W4_GROUP of them. `group` is in the key, but wcache_setup runs
+ * once on the FIRST tensor and int8's group is now that tensor's k -- so on a
+ * model whose first staged tensor is 1024 wide, which qwen3's n_embd is, the
+ * new key and an old int8 key are the same number and the old file would have
+ * been accepted. That is exactly the layout disagreement this week was spent
+ * closing, coming back through the cache. */
+#define WCACHE_QUANT  3u
 
 struct wcache_head {
 	uint32_t magic, format, quant, bits;
@@ -738,6 +746,32 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 */
 	if (k % grp)
 		grp = k;
+	/*
+	 * ⚠⚠ AND THE SAME DISAGREEMENT AGAIN, ON THE OTHER SIDE OF bits.
+	 *
+	 * tensor_grouped() also requires g->w4. So an INT8 tensor whose k
+	 * divides the group exactly walks past the remainder collapse above,
+	 * gets its scales written as scale[row * ngrp + group], and is then
+	 * read by a consumer that takes scale[row] -- the identical fault the
+	 * comment above describes, in the one case that comment's condition
+	 * cannot see.
+	 *
+	 * It is not hypothetical. Every board round exports
+	 * CHARSIU_NPU_W4_GROUP=1024 whatever the format, so the accidental
+	 * w8a8 arm of round 428 measured ppl 272369 against int4's 75.17 and
+	 * was written down as "the int8 path emits noise". The int8 path is
+	 * fine; it was being handed scales in a layout it does not read.
+	 *
+	 * One scale a row is what the int8 consumer applies, so it is what
+	 * gets written -- and at eight bits it costs nothing. Host, qwen3,
+	 * 200 tokens, CPU reference: group 1024 44.81, one scale a row 43.66.
+	 * The row is not worse, it is very slightly BETTER, because eight bits
+	 * spans a row's spread on its own and the finer scales only add their
+	 * own rounding. Four bits is the opposite -- 91.66 grouped against
+	 * 114.22 a row -- which is why the group exists at all.
+	 */
+	if (bits != 4)
+		grp = k;
 	ngrp = (k + grp - 1) / grp;
 
 	/*
@@ -761,6 +795,35 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
+
+	/*
+	 * ⚠⚠ AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
+	 *
+	 * The factor only cancels because the weights are divided by it and the
+	 * activation is multiplied by it. charsiu_npu_matvec does that multiply
+	 * on the w4a16 path, where the activation is a float it can scale
+	 * before packing. The int8 path packs a->q1, one absmax quantisation of
+	 * the whole vector, and there is nowhere in it for a per column factor
+	 * -- so the divide happens, the multiply does not, and the factor does
+	 * not cancel. Board, qwen3, 600 tokens: int8 27.07, int8 with AWQ
+	 * 2162.73. Wrong numbers, not an error.
+	 *
+	 * Refusing loses nothing measurable. AWQ exists to protect a small
+	 * dynamic range and eight bits does not have that problem: on the host
+	 * CPU reference, which DOES apply the multiply at eight bits, AWQ makes
+	 * int8 slightly worse -- 43.66 off against 44.76 on. So the method is
+	 * declined for anything but four bits and says so once.
+	 */
+	if (alpha != 0.0 && bits != 4) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CHARSIU_NPU_AWQ is a four bit "
+				"method and these weights are %u bit -- "
+				"ignoring it. It measured worse at eight bits "
+				"even where it is applied correctly.\n", bits);
+		alpha = 0.0;
+	}
 
 	memset(t, 0, sizeof(*t));
 	snprintf(t->name, sizeof(t->name), "%s", w->name);
@@ -1235,7 +1298,7 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		 * at all, since spreading an eight bit activation's range is
 		 * what destroyed it here.
 		 */
-		if (getenv("CHARSIU_NPU_A16")) {
+		if (charsiu_env_flag("CHARSIU_NPU_A16", 0)) {
 			for (uint64_t g = 0; g < ngrp; g++) {
 				uint64_t lo = g * grp;
 				uint64_t len = lo + grp < t->k ? grp : t->k - lo;
@@ -1312,7 +1375,8 @@ int npu_out8_mode(void)
 	return m;
 }
 
-void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
+void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode,
+			 float a_scale)
 {
 	float amax = 0.0f, d, id;
 	uint64_t clipped = 0;
@@ -1346,6 +1410,8 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
 		 */
 		uint64_t cal = mode >= 3 ? npu_cal_calls() : 1;
 
+		if (t->out_calls < cal && a_scale > 0.0f)
+			t->out_ascale = a_scale;
 		if (t->out_calls < cal) {
 			float want = amax / 127.0f;
 
@@ -1353,6 +1419,27 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode)
 				t->out_scale = want;
 		}
 		d = t->out_scale;
+		/*
+		 * ⚠⚠ MODE 4: THE FROZEN PART IS PER CHANNEL, THE MOVING PART
+		 * IS THE ACTIVATION'S OWN SCALE.
+		 *
+		 * The note above says a coefficient buffer cannot look at the
+		 * vector it is about to quantise, and that is true. It does not
+		 * need to. The output of a projection is
+		 *
+		 *     sum(w_q * a_q) * w_scale * a_scale
+		 *
+		 * so its magnitude is PROPORTIONAL to a_scale, which is the
+		 * activation's own absmax over 127 and is computed at pack
+		 * time, before the dispatch. Freeze the rest and let a_scale
+		 * carry the per-token movement -- which is exactly the 2971x
+		 * that job.c refused a byte for.
+		 *
+		 * The calibration therefore records amax / a_scale rather than
+		 * amax, and this multiplies it back.
+		 */
+		if (mode >= 4 && t->out_ascale > 0.0f && a_scale > 0.0f)
+			d = t->out_scale * (a_scale / t->out_ascale);
 	} else {
 		d = amax / 127.0f;
 	}

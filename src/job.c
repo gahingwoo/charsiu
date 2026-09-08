@@ -109,6 +109,56 @@ int charsiu_cbuf_window(void)
  * the overlap fault sits in window 1's core; this asks whether it sits at
  * window 1's ADDRESS.
  */
+/*
+ * ⚠⚠ THE THIRD CBUF WINDOW STATE, WHICH THIS TREE ASKED SOMEBODY TO SEARCH FOR.
+ *
+ * npudev.c, on the input surface ceiling: "the fix, if somebody wants these
+ * widths, is not a bigger number here. It is whatever the vendor emits above
+ * 5120, which is a third window state nothing on disk has ever shown -- so it
+ * has to be searched for, not derived." Nobody searched.
+ *
+ * Here is the reason it is searchable at all. The CBUF is 14 banks, 0x3800
+ * entries, and this file cuts it into two mirror windows of 7:
+ *
+ *   plain   data 0x1000 (4096) + weights 0xc00 (3072)  = 0x1c00
+ *   split   data 0x1400 (5120) + weights 0x800 (2048)  = 0x1c00
+ *
+ * **5120 is not a property of the silicon's arithmetic. It is the data half of
+ * a SEVEN BANK window in the split form**, and seven is half of fourteen
+ * because charsiu gives each core its own window (npudev sets cbuf_window =
+ * di). The end bank for window 0 was the constant 7 in two places.
+ *
+ * So: if one window may span all fourteen banks, its data half is 0x2800 and
+ * the ceiling is 10240 -- which is exactly the cell the board got WRONG when
+ * it was asked for 4096 x 80 with a seven bank window. That is a prediction,
+ * not a plan, and these two knobs are how it gets asked:
+ *
+ *   CHARSIU_CBUF_W0_END    0x1038's window 0 value, default 7
+ *   CHARSIU_CBUF_W0_DATA   0x1040's data bound, default 0x1000
+ *
+ * ⚠ A window that spans everything leaves the other core nowhere to put its
+ * own, so this can only ever be a one-device configuration. That is a real
+ * cost -- round 150 put one core 28% behind two on decode -- and it is why
+ * this is a probe and not a default. It is worth the search anyway, because
+ * prefill re-reads every weight for every extra chunk, and a chunk cap that
+ * doubles removes a whole pass over the model.
+ */
+static unsigned w0_end(void)
+{
+	const char *e = envq("CHARSIU_CBUF_W0_END");
+	unsigned v = e ? (unsigned)strtoul(e, NULL, 0) : 7;
+
+	return v && v <= 14 ? v : 7;
+}
+
+static unsigned w0_data(void)
+{
+	const char *e = envq("CHARSIU_CBUF_W0_DATA");
+	unsigned v = e ? (unsigned)strtoul(e, NULL, 0) : 0x1000u;
+
+	return v && v <= 0x3000u ? v : 0x1000u;
+}
+
 static unsigned w1_bank(void)
 {
 	const char *e = envq("CHARSIU_CBUF_W1_BANK");
@@ -1054,7 +1104,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		unsigned S = w1_bank(), E = S + 7 > 14 ? 14 : S + 7;
 
 		emit(&e, CNA, 0x1038,
-		     job->cbuf_window == 1 ? (0x100u | E) : 0x00000007u);
+		     job->cbuf_window == 1 ? (0x100u | E) : w0_end());
 	}
 	emit(&e, DPU, 0x4004, 0x0000000e);
 	emit(&e, RDMA, 0x5004, 0x0000000e);
@@ -1147,11 +1197,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		unsigned S = w1_bank(), E = S + 7 > 14 ? 14 : S + 7;
 		unsigned D = job->cbuf_window == 1 ? S * 0x400u : 0u;
 
+		unsigned DB = job->cbuf_window == 1 ? 0x1000u : w0_data();
+
 		emit(&e, CNA, 0x1038,
-		     job->cbuf_window == 1 ? (0x100u | E) : 0x00000007u);
+		     job->cbuf_window == 1 ? (0x100u | E) : w0_end());
 		emit(&e, CNA, 0x103c, (surf << 16) | D);
 		emit(&e, CNA, 0x1040,
-		     (((D + 0x1000u) << 16) | D) + (split ? 0x04000000u : 0u));
+		     (((D + DB) << 16) | D) + (split ? 0x04000000u : 0u));
 	}
 	emit(&e, CNA, 0x1044, (inw << 16) | surf);
 	emit(&e, CNA, 0x1048, 0x0000000b);

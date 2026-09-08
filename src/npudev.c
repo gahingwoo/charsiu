@@ -863,6 +863,7 @@ struct charsiu_npu {
 	double slow_worst;
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
+	int poolread_set, packpool_set;
 	int kfit;
 	int even_ks;      /* K slices of equal width, see slice_k() */
 	/*
@@ -1196,6 +1197,46 @@ static void cpu_rows(const struct npu_entry *e, const float *af, float *y)
 	}
 }
 
+/*
+ * ⚠ THE THRESHOLD IS RESOLVED ON FIRST USE, NOT AT OPEN.
+ *
+ * charsiu_pool_min needs the thread count and the pool does not exist when the
+ * device is opened -- charsiu_run never calls charsiu_threads_start, so
+ * charsiu_threads() returns 1 there and charsiu_pool_min says "never pool".
+ * That shipped once and made prefill's read 4.3x slower.
+ *
+ * ⚠⚠ AND A SEPARATE FLAG, NOT A ZERO SENTINEL. The first version of this fix
+ * read the env with a default of 0 and treated a zero field as "not resolved
+ * yet" -- so CHARSIU_NPU_POOL_READ_MIN=0, which means "threshold zero, always
+ * pool", got silently replaced by the derived value. That is the same disease
+ * as the thirteen switches fixed this morning: `=0` not meaning what it says.
+ */
+static size_t poolread_min(struct charsiu_npu *g)
+{
+	if (!g->poolread_set) {
+		const char *e = getenv("CHARSIU_NPU_POOL_READ_MIN");
+
+		g->poolread_min = e && *e
+			? (unsigned)strtoul(e, NULL, 0)
+			: (unsigned)charsiu_pool_min(573.44, charsiu_threads());
+		g->poolread_set = 1;
+	}
+	return g->poolread_min;
+}
+
+static unsigned packpool_min(struct charsiu_npu *g)
+{
+	if (!g->packpool_set) {
+		const char *e = getenv("CHARSIU_NPU_PACK_POOL_MIN");
+
+		g->packpool_min = e && *e
+			? (unsigned)strtoul(e, NULL, 0)
+			: (unsigned)charsiu_pool_min(1.12, charsiu_threads());
+		g->packpool_set = 1;
+	}
+	return g->packpool_min;
+}
+
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
 	return g->w4 && t->kgroup && t->kgroup < t->k &&
@@ -1300,7 +1341,12 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->qos_fd = -1;
 	g->dev[0] = charsiu_open(NULL);
 	g->ndev = 1;
-	if (g->dev[0] && !getenv("CHARSIU_NPU_ONEDEV")) {
+	/* ⚠ charsiu_env_flag, NOT `!getenv`. As an existence test
+	 * CHARSIU_NPU_ONEDEV=0 -- the spelling anybody reaching for two cores
+	 * would write -- turned the second core OFF, and round 150 wants this
+	 * variable as the named knob of a paired arm. Same shape as
+	 * CHARSIU_NPU=0 opening the NPU. */
+	if (g->dev[0] && !charsiu_env_flag("CHARSIU_NPU_ONEDEV", 0)) {
 		g->dev[1] = charsiu_open(NULL);
 		if (g->dev[1])
 			g->ndev = 2;
@@ -1425,7 +1471,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * to the one device control, and the run went 9.86 to 10.26 tok/s. So it
 	 * is the default now, and CHARSIU_NPU_FINI puts the clean back.
 	 */
-	g->nofini = getenv("CHARSIU_NPU_FINI") == NULL;
+	g->nofini = !charsiu_env_flag("CHARSIU_NPU_FINI", 0);
 	/*
 	 * AND THE SAME ARGUMENT ON THE OTHER SIDE, which round 367 did NOT run.
 	 *
@@ -1592,7 +1638,23 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e = getenv("CHARSIU_NPU_POOL_READ");
 
 		g->poolread = !e || !*e ? 2 : *e == '0' ? 0 : 1;   /* 2 = by size */
-		g->poolread_min = env_u("CHARSIU_NPU_POOL_READ_MIN", 32768);
+		/*
+		 * ⚠⚠ ZERO MEANS "ASK LATER", AND IT HAS TO.
+		 *
+		 * charsiu_pool_min needs the thread count, and at open time
+		 * there is not one: charsiu_run never calls
+		 * charsiu_threads_start, so g_pool.n is 0 and
+		 * charsiu_threads() returns 1 here. Computing the threshold
+		 * now got `never pool` -- the read back stopped pooling and
+		 * prefill's read went 0.94 -> 4.09 ms a row, a 1.8x slower
+		 * prompt, committed and pushed.
+		 *
+		 * ⚠ The host suites cannot see it. With no NPU the read back
+		 * path is never taken at all, so arch_sanity and hostcheck
+		 * both passed. Same class as every other "the host runs the
+		 * order and not the arithmetic" miss in this tree.
+		 */
+		/* resolved on first use; see poolread_min() above */
 	}
 	/*
 	 * The packer on the pool, by group count. 2 = by size, 1 = always,
@@ -1603,7 +1665,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e = getenv("CHARSIU_NPU_PACK_POOL");
 
 		g->packpool = !e || !*e ? 2 : *e == '0' ? 0 : 1;
-		g->packpool_min = env_u("CHARSIU_NPU_PACK_POOL_MIN", 64);
+		/* resolved on first use; see packpool_min() above */
 	}
 	/* one pass over Y for every K slice a device holds. OFF until the
 	 * board prices it: it trades sequential Y round trips for several
@@ -1963,6 +2025,8 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	 */
 	fprintf(stderr, "charsiu NPU: weights are %s, %u devices\n",
 		g->w4 ? "int4" : "int8", g->ndev);
+	/* silent unless CHARSIU_NPU_SPIN_US asked for the poll */
+	charsiu_spin_report();
 	fprintf(stderr,
 		"charsiu NPU: %u tensors, %lu slices, %lu submits, %.2f MB per "
 		"submit%s\n",
@@ -2648,8 +2712,23 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * ever does again, the tensor falls back to the CPU and says why,
 	 * instead of returning numbers nobody can tell are wrong.
 	 */
-	if (t->kgroup && t->kgroup < t->k && (t->k % t->kgroup)) {
-		whine(g, "a partial weight group would be read as one scale a row",
+	/*
+	 * ⚠⚠ AND THE TEST IS tensor_grouped ITSELF, NOT ONE OF ITS CLAUSES.
+	 *
+	 * This asked only about a partial group, which is one of the four
+	 * things tensor_grouped() wants. It also wants g->w4 and it wants the
+	 * group to BE the K slice, and each of those is a way for the two
+	 * sides to disagree with no remainder in sight. The int8 one cost a
+	 * board round: k 2048, group 1024, no remainder, w4 off -- so the
+	 * guard passed, tensor_grouped said no, and the consumer read a
+	 * [row][2] array as one scale a row. ppl 272369.
+	 *
+	 * Ask the consumer's own predicate. If the quantiser grouped the
+	 * tensor and the consumer will not honour that grouping, the tensor
+	 * goes to the CPU and says so, whatever the reason turns out to be.
+	 */
+	if (t->kgroup && t->kgroup < t->k && !tensor_grouped(g, t)) {
+		whine(g, "a weight group the consumer cannot honour would be read as one scale a row",
 		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
@@ -3446,7 +3525,7 @@ static const char *w4_batch_why_not(unsigned m)
 	 * for the same reason this one has its own name -- a round that sets a
 	 * switch for one reason must not quietly get a second meaning with it.
 	 */
-	if (getenv("CHARSIU_NPU_W4_ANYM"))
+	if (charsiu_env_flag("CHARSIU_NPU_W4_ANYM", 0))
 		return NULL;
 	/*
 	 * ⚠⚠ TWO REFUSALS, TWO REASONS, AND THEY ARE NOT THE SAME FAULT. The
@@ -4619,6 +4698,121 @@ static void pack_groups_worker(void *ctx, uint64_t g0, uint64_t ng)
 				      (unsigned)g0, (unsigned)ng);
 }
 
+/*
+ * ⚠⚠ int8's BATCHED ACTIVATION QUANTISER, AND WHY IT GOT ITS OWN FUNCTION.
+ *
+ * Round 146 read the prefill table with `scale` named for the first time and
+ * the answer was somewhere else entirely: qwen3, 90 rows, ms a row --
+ *
+ *   int4   pack 0.86  submit 0.08  fence 1.29  read 1.30  scale 0.19
+ *   int8   pack 2.66  submit 0.09  fence 0.93  read 0.97  scale 0.25
+ *
+ * int8's fence and read are BOTH SMALLER -- its hardware path really is
+ * faster, which is what PLAN.md has claimed since March -- and pack alone,
+ * 3.1x wider, eats the whole advantage and 1.08 ms a row more. The tail scale
+ * everybody suspected is 0.06 of it.
+ *
+ * The cause is not subtle once the two are side by side: int4 packs through
+ * pack_f16_pooled, which is pooled across groups, and int8 ran two scalar
+ * passes over the slice, one thread, no NEON. Both passes are trivially
+ * vectorisable and the rows are independent -- each has its own d1 -- so this
+ * is the same shape as tail_scale_rows one screen down.
+ *
+ * ⚠ BIT IDENTICAL, and the reason is worth stating rather than assuming.
+ * vcvtnq_s32_f32 is round-to-nearest-even, which is lrintf's behaviour under
+ * the default rounding mode, and the MULTIPLY by id1 is kept exactly where it
+ * was: the note above this block records a board round lost to `x * (1/d)`
+ * and `x / d` disagreeing on near-zero channels, and this must not reopen it.
+ * The max is a max -- reassociating it cannot change the answer.
+ *
+ * CHARSIU_NPU_QPACK_PLAIN=1 is the loop exactly as it was, so one binary runs
+ * both arms in one session. The board drifts 3% between sessions.
+ */
+struct qpack_job {
+	const float *src;
+	uint8_t *dst;
+	float *d1out;
+	unsigned sk;
+};
+
+static int qpack_plain(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_QPACK_PLAIN", 0);
+	return v;
+}
+
+static void qpack_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct qpack_job *j = ctx;
+	unsigned sk = j->sk;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const float *row = j->src + (size_t)r * sk;
+		uint8_t *out = j->dst + (size_t)r * sk;
+		float mx = 0.0f, d1, id1;
+		unsigned kk = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+		{
+			float32x4_t m4 = vdupq_n_f32(0.0f);
+
+			for (; kk + 4 <= sk; kk += 4)
+				m4 = vmaxq_f32(m4, vabsq_f32(vld1q_f32(row + kk)));
+			mx = vmaxvq_f32(m4);
+		}
+#endif
+		for (; kk < sk; kk++) {
+			float v = fabsf(row[kk]);
+
+			if (v > mx)
+				mx = v;
+		}
+		d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+		id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
+		j->d1out[r] = d1;
+
+		kk = 0;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+		{
+			const float32x4_t s4 = vdupq_n_f32(id1);
+			const int32x4_t hi = vdupq_n_s32(127);
+			const int32x4_t lo = vdupq_n_s32(-127);
+
+			for (; kk + 16 <= sk; kk += 16) {
+				int32x4_t a = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk), s4));
+				int32x4_t b = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk + 4), s4));
+				int32x4_t c = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk + 8), s4));
+				int32x4_t e = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(row + kk + 12), s4));
+				int16x8_t p, q;
+
+				a = vmaxq_s32(vminq_s32(a, hi), lo);
+				b = vmaxq_s32(vminq_s32(b, hi), lo);
+				c = vmaxq_s32(vminq_s32(c, hi), lo);
+				e = vmaxq_s32(vminq_s32(e, hi), lo);
+				p = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
+				q = vcombine_s16(vmovn_s32(c), vmovn_s32(e));
+				/* +128 is an XOR of the sign bit on the byte */
+				vst1q_u8(out + kk,
+					 veorq_u8(vreinterpretq_u8_s8(
+							  vcombine_s8(vmovn_s16(p),
+								      vmovn_s16(q))),
+						  vdupq_n_u8(0x80)));
+			}
+		}
+#endif
+		for (; kk < sk; kk++) {
+			int q = (int)lrintf(row[kk] * id1);
+
+			if (q > 127) q = 127;
+			if (q < -127) q = -127;
+			out[kk] = (uint8_t)(q + 128);
+		}
+	}
+}
+
 static void pack_f16_pooled(struct charsiu_npu *g,
 			    const struct charsiu_matmul *mm,
 			    const float *src, size_t stride,
@@ -4627,7 +4821,7 @@ static void pack_f16_pooled(struct charsiu_npu *g,
 	unsigned ng = charsiu_pack_input_f16_ngroups(mm);
 
 	if (ng && (g->packpool == 1 ||
-		   (g->packpool == 2 && ng >= g->packpool_min))) {
+		   (g->packpool == 2 && ng >= packpool_min(g)))) {
 		struct pack_groups_job pj = { mm, src, stride, dst };
 
 		charsiu_pack_input_f16_edges(mm, src, stride, dst, dst_size);
@@ -5026,7 +5220,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * for the probe that walks it.
 		 */
 		if (!charsiu_m_axis_wide_for(g->w4)) {
-			if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+			if (!charsiu_env_flag("CHARSIU_NPU_ANY_SURFACE", 0) &&
 			    (size_t)(kw / 32) * m > 8192) {
 				whine(g, "the input surface on the height axis is "
 				      "past 8192, where the board says every row "
@@ -5045,7 +5239,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * missing all week -- came back with its two interesting cells
 		 * REFUSED BY IT. Nothing but a probe should set this.
 		 */
-		if (!getenv("CHARSIU_NPU_ANY_SURFACE") &&
+		if (!charsiu_env_flag("CHARSIU_NPU_ANY_SURFACE", 0) &&
 		    (size_t)(kw / 32) * m > 5120) {
 			/*
 			 * ⚠ CHARSIU_NPU_KFIT IS THE LIKELY WAY TO GET HERE, and
@@ -5378,25 +5572,42 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				 * match the row loop to 0.1% -- and should not
 				 * be asked to.
 				 */
-				for (unsigned r = 0; r < m; r++) {
-					float mx = 0.0f, d1, id1;
+				if (qpack_plain()) {
+					for (unsigned r = 0; r < m; r++) {
+						float mx = 0.0f, d1, id1;
 
-					for (unsigned kk = 0; kk < sk; kk++) {
-						float v = fabsf(g->bscr[(size_t)r * sk + kk]);
+						for (unsigned kk = 0; kk < sk; kk++) {
+							float v = fabsf(g->bscr[(size_t)r * sk + kk]);
 
-						if (v > mx)
-							mx = v;
+							if (v > mx)
+								mx = v;
+						}
+						d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+						id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
+						g->bd1[(size_t)ki * m + r] = d1;
+						for (unsigned kk = 0; kk < sk; kk++) {
+							int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
+
+							if (q > 127) q = 127;
+							if (q < -127) q = -127;
+							g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
+						}
 					}
-					d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
-					id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
-					g->bd1[(size_t)ki * m + r] = d1;
-					for (unsigned kk = 0; kk < sk; kk++) {
-						int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
+				} else {
+					struct qpack_job qj = {
+						g->bscr, g->bq,
+						g->bd1 + (size_t)ki * m, sk
+					};
 
-						if (q > 127) q = 127;
-						if (q < -127) q = -127;
-						g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
-					}
+					/* the rows are independent -- each has
+					 * its own d1 -- so the pool needs no
+					 * grain and the order cannot change */
+					if (g->packpool == 1 ||
+					    (g->packpool == 2 && m > 1))
+						charsiu_parallel_for(qpack_rows,
+								     &qj, m);
+					else
+						qpack_rows(&qj, 0, m);
 				}
 				charsiu_pack_input(&mm, g->bq,
 						   (uint8_t *)g->bin[d][bin_idx(g, ki)].map
@@ -5696,7 +5907,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						<< (d * 16 + c.s0->n0 / g->nmax);
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
-					     (size_t)m * c.sn >= g->poolread_min))
+					     (size_t)m * c.sn >= poolread_min(g)))
 						charsiu_parallel_for(read_fused_rows,
 								     &c, m);
 					else
@@ -5749,7 +5960,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 					g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
 					if (g->poolread == 1 ||
 					    (g->poolread == 2 &&
-					     (size_t)m * sn >= g->poolread_min)) {
+					     (size_t)m * sn >= poolread_min(g))) {
 						/* ⚠ THE PAIR FORM NEEDS EVEN
 						 * RANGES, and before the grain
 						 * it got them only where the
@@ -5806,7 +6017,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						e->t->scale[j];
 		else if (g->poolread == 1 ||
 			 (g->poolread == 2 &&
-			  (size_t)m * e->t->n >= g->poolread_min))
+			  (size_t)m * e->t->n >= poolread_min(g)))
 			charsiu_parallel_for(tail_scale_rows, &tj, m);
 		else
 			tail_scale_rows(&tj, 0, m);

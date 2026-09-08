@@ -224,6 +224,8 @@ struct npu_tensor {
 	uint64_t n, k;
 	double rms_rel;    /* what the quantisation cost this tensor */
 	float out_scale;   /* CHARSIU_NPU_OUT8>=2: calibrated, then frozen */
+	float out_ascale;  /* mode 4: the a_scale that calibration saw, so the
+			    * frozen part can be rescaled by the current one */
 	double out_clip;   /* how much of the output the frozen scale clipped */
 	uint64_t out_calls;
 	float amax_lo, amax_hi;   /* the spread of |y| across calls: the outliers */
@@ -276,7 +278,14 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
  *   mode 2  a scale calibrated on the first call and then frozen, which is what
  *           a coefficient buffer actually holds. Records what it clips.
  */
-void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode);
+/*
+ * mode 4 takes the activation's own scale. See the long note in npuquant.c:
+ * a frozen coefficient cannot look at the vector it quantises, but it does not
+ * have to -- the output is proportional to a_scale, which is known at pack
+ * time, so the per-channel part freezes and the per-token magnitude rides in.
+ */
+void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode,
+			 float a_scale);
 
 /* ---- and the same thing on the hardware ---------------------------------- */
 
@@ -977,6 +986,7 @@ struct llama_state {
 	 * time: [rows][n_head][n_ctx], built on first use */
 	float *batt;
 	unsigned batt_rows;
+	size_t batt_units;   /* (head, row block) units the scratch holds */
 	/*
 	 * The fp16 KV cache the NPU reads, when CHARSIU_ATTN_NPU is set: a
 	 * mirror of kcache and vcache in the two weight layouts the scores and
@@ -1033,6 +1043,16 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 int llama_prefill_chunk_cap(const struct llama_model *m);
 
 /* `=0` and `=` are OFF, unset is `dflt`; see the note in gguf.c */
+/*
+ * The pooling threshold, derived rather than tuned. `units_per_us` is the
+ * caller's own single-thread rate in whatever unit it counts work in; the
+ * threshold is barrier * rate / (1 - 1/threads). Returns -1 (never pool) below
+ * two threads. See the long note in gguf.c for why four tuned constants were
+ * one rule.
+ */
+uint64_t charsiu_pool_min(double units_per_us, int threads);
+double charsiu_pool_barrier_us(void);
+
 int charsiu_env_flag(const char *name, int dflt);
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,

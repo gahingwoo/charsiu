@@ -156,11 +156,11 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 					w->name,
 					(unsigned long long)w->ne[1], pool_maxn());
 		}
-		if (getenv("CHARSIU_NPU_VERBOSE"))
+		if (charsiu_env_flag("CHARSIU_NPU_VERBOSE", 0))
 			fprintf(stderr, "  -> %s\n",
 				p->id[p->n] >= 0 ? "on the NPU" : "on the CPU");
 	}
-	if (getenv("CHARSIU_NPU_VERBOSE"))
+	if (charsiu_env_flag("CHARSIU_NPU_VERBOSE", 0))
 		fprintf(stderr, "npu-quant  %-28s  %llu x %llu  rms %.4f%%\n",
 			w->name, (unsigned long long)w->ne[1],
 			(unsigned long long)w->ne[0], p->t[p->n].rms_rel * 100.0);
@@ -562,7 +562,7 @@ const char *charsiu_cache_path(const char *model, char *buf, size_t max)
 	const char *base;
 	char dir[400];
 
-	if (getenv("CHARSIU_NO_WCACHE"))
+	if (charsiu_env_flag("CHARSIU_NO_WCACHE", 0))
 		return NULL;
 	if (xdg && *xdg)
 		snprintf(dir, sizeof(dir), "%s/charsiu", xdg);

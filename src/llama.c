@@ -129,7 +129,9 @@ static unsigned attn_pool_min(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_POOL_MIN");
 
-		v = e ? atoi(e) : 64;
+		/* 64 positions at eight threads implies 1.12 positions a
+		 * microsecond; derived so it tracks the pool. See gguf.c. */
+		v = e ? atoi(e) : (int)charsiu_pool_min(1.12, charsiu_threads());
 		if (v < 0)
 			v = 0;
 	}
@@ -181,7 +183,7 @@ static int fast_attn(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_ATTN") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_ATTN", 0) && !cpu_plain();
 	return v;
 }
 
@@ -195,7 +197,7 @@ static int fast_silu(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_SILU") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_SILU", 0) && !cpu_plain();
 	return v;
 }
 
@@ -221,7 +223,7 @@ static int fast_gelu(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_GELU") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_GELU", 0) && !cpu_plain();
 	return v;
 }
 #endif
@@ -1007,7 +1009,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 * and spent itself on the one term row 0 cannot see. Both rows are
 	 * counted and both are printed.
 	 */
-	if (getenv("CHARSIU_BATCH_SWEEP")) {
+	if (charsiu_env_flag("CHARSIU_BATCH_SWEEP", 0)) {
 		static const char *READS[] = { "acc", "flat", "2", "4", "8",
 					       "16", "32" };
 		static const char *AXES[] = { "h", "w" };
@@ -1951,13 +1953,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		 * the time is not the hardware at all.
 		 */
 		{
-			double pk, sb, fn, rd, pr, al;
+			double pk, sb, fn, rd, pr, al, sc;
 			unsigned an = 0;
 			char tcol[24];
 
 			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			pr = charsiu_npu_batch_prep(s->pool.dev, 1);
 			al = charsiu_npu_batch_alloc(s->pool.dev, &an, 1);
+			/* ⚠ RESET IT TOO, or this per width row keeps a whole
+			 * run's tail scale while its other four segments are
+			 * cleared each iteration -- two counters in one line
+			 * disagreeing about what they cover, which is the
+			 * exact shape of the bug the note above records. */
+			sc = charsiu_npu_batch_scale(s->pool.dev, 1);
 			/*
 			 * ⚠ AND WHAT IS STILL MISSING. The five segments are
 			 * printed with the remainder beside them, because the
@@ -1978,13 +1986,13 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			       " %7.0f ms  %5.2fx  %7.1f  %6.2f"
 			       "   prep %4.0f (alloc %4.0f x%u)  pack %4.0f"
 			       "  submit %3.0f  fence %5.0f  read %4.0f"
-			       "  rest %4.0f\n",
+			       "  scale %4.0f  rest %4.0f\n",
 			       mr, tcol, worst, rows_ok, rows_tot, t_one,
 			       t_bat, t_bat > 0 ? t_one / t_bat : 0.0,
 			       t_bat * 1e3 / (tested * (double)mr),
 			       t_bat > 0 ? mb / t_bat : 0.0,
-			       pr, al, an, pk, sb, fn, rd,
-			       t_bat - (pr + pk + sb + fn + rd));
+			       pr, al, an, pk, sb, fn, rd, sc,
+			       t_bat - (pr + pk + sb + fn + rd + sc));
 		}
 		rc = 0;
 	}
@@ -2209,7 +2217,8 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 			act_q1_timed(a);
 		if (id >= 0 && !charsiu_npu_matvec(s->pool.dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
-					    npu_out8_mode());
+					    npu_out8_mode(),
+					    a->q1_valid ? a->d1 : 0.0f);
 			return;
 		}
 	}
@@ -2230,7 +2239,8 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		if (nt) {
 			npu_matvec(nt, a, y, 0, nt->n);
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
-					    npu_out8_mode());
+					    npu_out8_mode(),
+					    a->q1_valid ? a->d1 : 0.0f);
 		} else {
 			gguf_matvec(w, a, y, 0, w->ne[1]);
 		}
@@ -2253,7 +2263,8 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	/* after the fan in, because the scale is a property of the whole vector */
 	if (nt)
 		npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
-				    npu_out8_mode());
+				    npu_out8_mode(),
+				    a->q1_valid ? a->d1 : 0.0f);
 }
 
 /* ---- the small pieces ---------------------------------------------------- */
@@ -2308,7 +2319,7 @@ static int fast_softmax(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = getenv("CHARSIU_EXACT_SOFTMAX") == NULL && !cpu_plain();
+		v = !charsiu_env_flag("CHARSIU_EXACT_SOFTMAX", 0) && !cpu_plain();
 	return v;
 }
 
@@ -3766,14 +3777,30 @@ void llama_stages_report(void)
 			 * be printed as a residue.
 			 */
 			double pr = charsiu_npu_batch_prep(bmm_dev, 0);
+			/*
+			 * ⚠ THE SIXTH SEGMENT, AND int8 IS WHY IT NEEDED ONE.
+			 *
+			 * charsiu_npu_batch_scale has existed as long as the
+			 * pool's own report, which has printed it all along;
+			 * this table never asked for it, so the per channel
+			 * tail multiply sat in `unaccounted`. That cost
+			 * nothing while every board round ran int4, because
+			 * grouped int4 SKIPS that branch -- its scale rides in
+			 * with the slice -- and it is the one segment the two
+			 * formats do not share. Round 143 put int8's TTFT 10
+			 * to 26% behind int4's and this is the first place to
+			 * look. Same lesson as `prep` one field to the left.
+			 */
+			double sc = charsiu_npu_batch_scale(bmm_dev, 0);
 
 			fprintf(stderr, "  %-16s pack %.2f  submit %.2f  fence %.2f"
-			       "  read %.2f  prep %.2f  unaccounted %.2f "
-			       "ms a row\n",
+			       "  read %.2f  scale %.2f  prep %.2f"
+			       "  unaccounted %.2f ms a row\n",
 			       "of the entry:", pk / bstage_rows,
 			       sb / bstage_rows, fn / bstage_rows,
-			       rd / bstage_rows, pr / bstage_rows,
-			       (bmm_entry_ms - pk - sb - fn - rd - pr)
+			       rd / bstage_rows, sc / bstage_rows,
+			       pr / bstage_rows,
+			       (bmm_entry_ms - pk - sb - fn - rd - sc - pr)
 			       / bstage_rows);
 			/*
 			 * ⚠⚠ THE FENCE BY WIDTH, INSIDE ONE RUN OF ONE MODEL.
@@ -4391,7 +4418,40 @@ struct attn_block_job {
  * per (row, position) is attn_heads' exactly: attn_dot, softmax over the
  * same window, attn_axpy in ascending t.
  */
-static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
+/*
+ * ⚠⚠ THE UNIT IS (HEAD, ROW BLOCK), NOT THE HEAD, AND THE HEAD COUNT IS WHY.
+ *
+ * This pooled over heads, so the threads only divide evenly when the head
+ * count does. Over the models on the card that is not a detail:
+ *
+ *   qwen3 16 heads -> 100%     tinyllama 32 -> 100%
+ *   gemma-3-1b 4   ->  50%     SmolLM2-135M 9 ->  56%
+ *
+ * Half of eight threads idle on gemma-3-1b, and prefill's attention is 18.2%
+ * of a row -- 0.97 ms against a 0.67 ms gap to the vendor. It is also neither
+ * bandwidth nor arithmetic bound where it runs: 0.76 GB/s of KV and 0.38
+ * GMAC/s, against 11.9 GB/s the threads reach.
+ *
+ * Row blocks are independent for the same reason heads are -- each reads the
+ * cache and writes its own rows -- so the unit is their product, which is
+ * n_head * ceil(n/R) and is 192 on qwen3 at a 90 row chunk. That divides.
+ *
+ * ⚠ THE SCRATCH HAD TO FOLLOW. `sc` was indexed by head, which is only safe
+ * while one worker owns a whole head; it is indexed by the flat (h, rb) unit
+ * now, so the buffer grows by ceil(n/R). CHARSIU_ATTN_HR=0 is the old
+ * head-only split, in the same binary, because a change that reorders work
+ * across threads has to be able to prove it did not reorder arithmetic.
+ */
+static int attn_hr(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_HR", 1);
+	return v;
+}
+
+static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 {
 	struct attn_block_job *j = ctx;
 	struct llama_state *s = j->s;
@@ -4399,12 +4459,16 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 	int R = j->R, n = j->n;
 	size_t qstride = (size_t)j->n_head * hd;
 	int timed = stage_on > 0 && !attn_block_pool();
+	int nblk = attn_hr() ? (n + R - 1) / R : 1;
+	uint64_t u;
 
-	for (uint32_t h = (uint32_t)h0; h < (uint32_t)(h0 + nh_); h++) {
+	for (u = u0; u < u0 + nu; u++) {
+		uint32_t h = (uint32_t)(attn_hr() ? u / (unsigned)nblk : u);
+		int only = attn_hr() ? (int)(u % (unsigned)nblk) : -1;
 		uint32_t kvh = h / gqa;
 		const float *kbase, *vbase;
 		size_t kstride;
-		float *sc = s->batt + (size_t)h * R * s->n_ctx;
+		float *sc = s->batt + (size_t)u * R * s->n_ctx;
 
 		if (kv_posmajor()) {
 			size_t b = (size_t)j->l * s->n_ctx * j->kvdim
@@ -4420,7 +4484,12 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 			vbase = s->vcache + b;
 			kstride = hdmax;
 		}
-		for (int rb = 0; rb < n; rb += R) {
+		/* one block when the unit names it, the whole range when the
+		 * split is head-only */
+		int rb0 = only >= 0 ? only * R : 0;
+		int rbN = only >= 0 ? (rb0 + R < n ? rb0 + R : n) : n;
+
+		for (int rb = rb0; rb < rbN; rb += R) {
 			int re = rb + R < n ? rb + R : n;
 			int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
 				      ? j->pos0 + rb + 1 - j->n_swa : 0;
@@ -5248,7 +5317,17 @@ static int act_pool_min(void)
 	if (v == -2) {
 		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
 
-		v = e && *e ? atoi(e) : 6144; /* the narrowest width measured */
+		/*
+		 * ⚠ 6144 WAS THE ANSWER, NOT THE RULE. It came off two models'
+		 * measured barrier on 2026-09-08 and it is only right at the
+		 * thread count it was measured at. charsiu_pool_min derives it
+		 * from the barrier, the rate and the threads actually running:
+		 * 107.52 elements a microsecond is what 6144 implies at eight
+		 * threads and a 50 us barrier, so this is bit-identical there
+		 * and follows the pool everywhere else. See gguf.c.
+		 */
+		v = e && *e ? atoi(e)
+			    : (int)charsiu_pool_min(107.52, charsiu_threads());
 	}
 	return v;
 }
@@ -5625,19 +5704,31 @@ static int attn_block_cpu(struct attn_block_job *j)
 	int R = j->R;
 
 	/* scores: [n_head][R][n_ctx], each head's block its own */
-	if (!s->batt || s->batt_rows < (unsigned)R) {
-		free(s->batt);
-		s->batt = malloc((size_t)j->n_head * R * s->n_ctx * sizeof(float));
-		if (!s->batt) {
-			s->batt_rows = 0;
-			return -1;
+	{
+		/* ⚠ THE SCRATCH IS PER UNIT NOW, and the unit is (head, row
+		 * block), so it grows by ceil(n/R). A head-indexed buffer was
+		 * only safe while one worker owned a whole head. */
+		unsigned nblk = attn_hr() ? (unsigned)((j->n + R - 1) / R) : 1;
+		size_t want = (size_t)j->n_head * nblk * R * s->n_ctx;
+
+		if (!s->batt || s->batt_rows < (unsigned)R
+		    || s->batt_units < (size_t)j->n_head * nblk) {
+			free(s->batt);
+			s->batt = malloc(want * sizeof(float));
+			if (!s->batt) {
+				s->batt_rows = 0;
+				s->batt_units = 0;
+				return -1;
+			}
+			s->batt_rows = (unsigned)R;
+			s->batt_units = (size_t)j->n_head * nblk;
 		}
-		s->batt_rows = (unsigned)R;
+		if (attn_block_pool())
+			charsiu_parallel_for(attn_block_heads, j,
+					     (uint64_t)j->n_head * nblk);
+		else
+			attn_block_heads(j, 0, (uint64_t)j->n_head * nblk);
 	}
-	if (attn_block_pool())
-		charsiu_parallel_for(attn_block_heads, j, j->n_head);
-	else
-		attn_block_heads(j, 0, j->n_head);
 	return 0;
 }
 
@@ -5997,7 +6088,7 @@ static int batch_ok(const struct llama_model *m)
 	 * so on stderr every run: this is a probe switch, and a number measured
 	 * under it is a number about a model that is still refused.
 	 */
-	if (getenv("CHARSIU_BATCH_FORCE")) {
+	if (charsiu_env_flag("CHARSIU_BATCH_FORCE", 0)) {
 		static int said;
 
 		if (!said++)

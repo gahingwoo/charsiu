@@ -285,21 +285,33 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 			spin_us = e ? atol(e) : 0;
 		}
 		if (spin_us > 0) {
+			charsiu_spin_tries++;
 			int64_t t0 = (int64_t)now.tv_sec * 1000000000LL
 				   + now.tv_nsec;
 
 			req.timeout_ns = 1;    /* long past: a poll */
 			for (;;) {
 				struct timespec t;
+				int64_t el;
 
-				if (!ioctl(dev->fd, DRM_IOCTL_ROCKET_PREP_BO, &req))
+				if (!ioctl(dev->fd, DRM_IOCTL_ROCKET_PREP_BO, &req)) {
+					clock_gettime(CLOCK_MONOTONIC, &t);
+					charsiu_spin_won++;
+					charsiu_spin_won_us +=
+						((int64_t)t.tv_sec * 1000000000LL
+						 + t.tv_nsec - t0) / 1000;
 					return 0;
+				}
 				if (errno != EBUSY && errno != EINTR)
 					return -errno;
 				clock_gettime(CLOCK_MONOTONIC, &t);
-				if ((int64_t)t.tv_sec * 1000000000LL + t.tv_nsec
-				    - t0 > spin_us * 1000LL)
+				el = (int64_t)t.tv_sec * 1000000000LL
+				   + t.tv_nsec - t0;
+				if (el > spin_us * 1000LL) {
+					charsiu_spin_lost++;
+					charsiu_spin_lost_us += el / 1000;
 					break;
+				}
 			}
 		}
 	}
@@ -314,6 +326,37 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 			return -errno;
 	}
 	return 0;
+}
+
+/*
+ * ⚠⚠ WHETHER THE SPIN EVER WON, BECAUSE OTHERWISE A NULL RESULT HAS TWO
+ * READINGS AND THIS TREE HAS PAID FOR THAT FOUR TIMES IN ONE NIGHT.
+ *
+ * CHARSIU_NPU_SPIN_US polls before falling back to the blocking wait. If a
+ * sweep of it comes back flat, that is either "the wakeup costs nothing" or
+ * "every poll timed out and every arm took the blocking path anyway" -- and
+ * those call for opposite next moves. The counters separate them: tries is
+ * how often the poll was entered, won is how often it returned without ever
+ * blocking, and the two microsecond totals say how long each outcome took, so
+ * a spin that wins at 300 us but is set to 75 shows up as lost with a mean
+ * near 75 rather than as nothing.
+ */
+unsigned long charsiu_spin_tries, charsiu_spin_won, charsiu_spin_lost;
+unsigned long charsiu_spin_won_us, charsiu_spin_lost_us;
+
+void charsiu_spin_report(void)
+{
+	if (!charsiu_spin_tries)
+		return;
+	fprintf(stderr,
+		"charsiu spin: %lu polls, %lu won without blocking (%.0f%%, "
+		"mean %.0f us), %lu fell back (mean %.0f us of polling before "
+		"they did)\n",
+		charsiu_spin_tries, charsiu_spin_won,
+		100.0 * charsiu_spin_won / charsiu_spin_tries,
+		charsiu_spin_won ? (double)charsiu_spin_won_us / charsiu_spin_won : 0.0,
+		charsiu_spin_lost,
+		charsiu_spin_lost ? (double)charsiu_spin_lost_us / charsiu_spin_lost : 0.0);
 }
 
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)

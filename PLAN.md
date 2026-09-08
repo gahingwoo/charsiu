@@ -1735,9 +1735,117 @@ the work. For a prompt of P tokens and G generated,
   int8 wins  when  P * (1/19.24 - 1/26.60) > G * (1/9.16 - 1/15.46)
              i.e.  P > 3.1 * G
 
+⛔ **THIS RULE IS RETIRED, AND ITS FIRST TERM IS THE REASON.** The prefill pair
+above was measured when int8 batched and int4 DID NOT -- the same section says
+so two paragraphs down, "int8 for the prompt, which batches ... turns n grouped
+submits into 3n the moment the batch is refused, which on int4 is always". The
+batched w4a16 prefill landed on 2026-08-27 at 3.3x, and int4 did not just catch
+up. The scoreboard, 2026-09-08, both formats, best of 6, same session, same
+prompts:
+
+```
+                 decode tok/s                     TTFT ms
+              int4    int8   int8/int4     int4   int8    int8
+  Qwen3      26.30   17.16     65.2%        594    751   +26.4%
+  TinyLLAMA  22.89   12.88     56.3%        869    971   +11.7%
+  Phi3        7.06    3.85     54.5%       2818   3091    +9.7%
+  Gemma4      9.42    5.55     58.9%       2190   2512   +14.7%
+```
+
+**int8 is slower on the prompt on all four**, by 10 to 26%. There is no
+crossover to compute: it is behind on both axes now.
+
+⛔ **THAT HELD FOR FORTY MINUTES.** The table above was measured at 08:41 and
+int8's batched activation quantiser was vectorised and pooled at 09:2x -- two
+scalar passes on one thread, where int4's packer was already both. Its prefill
+went 6.41 -> 4.59 ms a row against int4's 5.36, and the scoreboard re-run says
+the sign is the other way on every model:
+
+```
+                int4 TTFT   int8 TTFT   int8
+  Qwen3             602         543    -9.8%
+  TinyLLAMA         867         821    -5.3%
+  Phi3             2764        2636    -4.6%
+  Gemma4           2187        2076    -5.1%
+```
+
+**So there IS a crossover again, and int8 is on the right side of it for a
+prompt.** Against the vendor's 469 ms on Qwen3, int4 is 28.4% behind and int8
+15.8% -- half the gap, from a packing loop. The rule is not restored, because
+the 19.24/26.60 pair it was built on is still from a world without batched int4
+prefill; what is restored is the SHAPE of the trade. int8 costs about a third
+of decode and buys a faster prompt and a 45% lower perplexity.
+
+⚠ Two stale readings in one file in one day, both mine, both written from a
+measurement that a later commit invalidated. The numbers were right when taken.
+
+⚠ The four numbers in the block above are not wrong and are not deleted. They
+were taken on Llama-3.2-1B before the batched prefill existed, and they are
+what a stale measurement looks like from the inside: correct, reproducible,
+and load-bearing for a rule whose world had moved.
+
 **So int4 stays the default.** Chat is a short prompt and a long answer and int4
-wins it outright; int8 is for prompt-heavy work -- summarising a document,
-retrieval -- where the prompt is several times the answer.
+wins it outright. ⛔ The rest of this paragraph used to send prompt-heavy work
+to int8 on speed grounds and that is retired above: int8 is for work where the
+ANSWER matters more than the rate, whatever the shape of the prompt.
+
+⚠⚠ **AND THAT RULE WAS PRICED ENTIRELY IN MILLISECONDS.** Four tok/s numbers
+decide which format a user gets, and not one of them says anything about what
+the answer is worth. The instrument that could have -- `tools/charsiu_ppl` --
+did not exist until 2026-09-07, and the first thing it did was refuse the whole
+paragraph above:
+
+```
+  qwen3, 600 tokens, on the board
+  the gguf's own q4_0 through llama.cpp        26.64
+  charsiu int4, group 1024, as it ships        49.89   +87%
+  charsiu w8a8                              272369     noise
+```
+
+⛔ For a night this was written down here as "the int8 path emits noise, and
+this file recommends it". **That was wrong, and it was wrong in a way worth
+keeping the record of, because the measurement was real and the conclusion
+drawn from it was not.**
+
+w8a8 is not broken. It was being handed scales in a layout it does not read.
+`tensor_grouped()` in npudev.c requires four things before a K slice may carry
+a group's scale, and one of them is `g->w4`; the quantiser wrote
+`scale[row * ngrp + group]` for eight bits exactly as for four, and the int8
+consumer read `scale[row]`. Every row took some other row's scale. The guard
+that exists for precisely this failure tested one of the four clauses -- the
+partial last group -- and an int8 tensor at k 2048 with a group of 1024 has no
+remainder, so it sailed past. Every board round exports
+`CHARSIU_NPU_W4_GROUP=1024` whatever the format, which is why the accidental
+arm reached it and no deliberate one ever had.
+
+**Read the other way round, the same instrument makes the int8 case stronger
+than this section ever did.** Host, qwen3, 200 tokens, the CPU reference, one
+knob apart:
+
+```
+  int4, one scale a row                       114.22
+  int4, group 1024                             91.66
+  int4, group 1024 + AWQ 0.5 clamp 2           72.36
+  int8, group 1024                             44.81
+  int8, one scale a row                        43.66
+```
+
+Eight bits, with no group and no AWQ, is better than four bits with both. And
+the coarser group is not a cost there at all -- 43.66 beats 44.81 -- because a
+row's spread fits in eight bits on its own and the finer scales only add their
+own rounding, which is the exact opposite of what the group is for at four.
+
+So the trade in this section is not speed against nothing. ⛔ I then wrote that
+it was "prompt-heavy work AND better answers, against decode speed" -- and the
+scoreboard the same morning said int8 is slower on the prompt too, on all four
+models. It is **better answers against BOTH speeds**, and the first half of my
+correction inherited the very assumption the rest of it was retiring.
+
+⚠ What is still unmeasured: quality through the BATCHED prefill path. Every
+number above is `charsiu_ppl`, which runs one position at a time on purpose --
+the batched path is a different arithmetic and this priced the weights. The
+format recommendation in this section is about prefill, so the arm that
+actually ships it has not been scored.
 
 ⚠ The batched prefill helps int4 too, and not because the matmul batches: it
 refuses there. It is that a prompt needs logits for its last token only, so the

@@ -20,10 +20,19 @@
 # ⚠ AND w4a16 IS THEIR int4, WHICH IS OURS. w4a16_g128 is a finer group size
 # and w8a8 is int8; the rows compared here are w4a16 against CHARSIU_NPU_W4V=1.
 #
+# CHARSIU_BENCH_W4V=0 scores our w8a8 instead, which is a different question and
+# not the one the vendor column answers -- their w4a16 row stays where it is, so
+# the ratio printed is int8 against their int4. It is here because the format
+# choice used to be priced in tok/s alone and the quality column disagrees:
+# qwen3, 600 tokens, int4 49.89 against int8 27.07 with llama.cpp's q4_0 at
+# 26.64. Whoever reads that wants to know what the speed costs at a real prompt
+# length, and this is where that number comes from.
+#
 #   sh tests/board_vendor.sh
 set -eu
 
 REPEAT=${CHARSIU_BENCH_REPEAT:-1}
+W4V=${CHARSIU_BENCH_W4V:-1}
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$DIR"
 # ⚠⚠ PRICING THE CORRECTNESS FIX, AND THIS ARM RETURNS WRONG TEXT.
@@ -100,6 +109,9 @@ else
 	echo "  CHARSIU_BENCH_PERF=1 sets it, and this line changes when you do."
 fi
 echo "  governor: $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+# ⚠ SAY WHICH FORMAT WAS SCORED. A table that does not is a table whose rows
+# cannot be compared to any other table.
+[ "$W4V" = 1 ] || echo "  ⚠ OUR column is w8a8 (CHARSIU_BENCH_W4V=0); theirs is still their w4a16."
 echo
 
 printf '%-16s %10s %10s   %10s %10s   %8s %8s\n' \
@@ -167,7 +179,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		# ships, and scored it LOWER than what does. A probe that
 		# sweeps an axis pins it; a probe that scores the product must
 		# not.
-		OUT=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		OUT=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V="$W4V" \
 		      CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 		      $PRICE_ENV \
 		      "$RUN" "$M" -p "$PROMPT" -n 64 --ignore-eos -c 512 -t 4 \

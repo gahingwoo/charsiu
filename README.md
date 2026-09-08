@@ -4,23 +4,59 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** On a ROCK 4D, under the vendor's own measuring protocol, **all four
-models decode faster than the vendor**:
+**Status.** On a ROCK 4D, under the vendor's own measuring protocol, charsiu's
+default format decodes faster than the vendor on all four models. That is one
+column of two, and the other one is why this table has three rows:
 
 ```
-                     decode tok/s            time to first token, ms
-                     charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          26.59    24.85           610      469
-  TinyLLAMA 1.1B      22.85    19.71           866      544
-  Phi3 3.8B            7.02     6.58          2937     1829
-  Gemma4 E2B           9.26     9.23          2192     1219
+  qwen3 0.6B, one board, one session
+
+                        decode tok/s     TTFT ms      perplexity, 600 tokens
+  charsiu int4 (default)     26.31          602        49.89     +87%
+  charsiu int8               17.23          543        27.07     +1.6%
+  the vendor's runtime       24.85          469          ?         ?
 ```
 
-Best of six, `board_verify.sh 7`, the same prompt and protocol the vendor
-publishes. Every projection, including the output head, runs on the NPU at four
-bits, and the text is identical to what the CPU decode loop writes -- which is
-an internal check and covers less than it sounds like: see *What "identical"
-does not mean* below.
+⚠⚠ **THE EMPTY CELL IS THE POINT.** The speed column is measured against the
+vendor's runtime; the quality column is measured against llama.cpp's own q4_0
+on the same tokens (26.64) -- **a different program, on a different build.**
+Nobody has scored the vendor's `.rkllm` for quality, so the row that the speed
+claim is made against is the one row with no quality number at all, and until
+it exists neither of the other two rows can be read as "better".
+
+**Neither of charsiu's rows wins outright and they lose in different places.**
+int4 decodes 5.9% faster than the vendor and starts 28% slower. int8 starts
+15.8% slower instead of 28%, gives up a third of decode, and its answers are
+within 1.6% of a plain q4_0 gguf where int4's are 87% worse. int4 is the
+default because chat is a short prompt and a long answer; `CHARSIU_NPU_W4V=0`
+selects int8 for the other shape of work.
+
+⚠ int8's TTFT column was WORSE than int4's until 2026-09-08. Its batched
+activation quantiser ran two scalar passes on one thread where int4's packer
+was pooled and vectorised; fixing that took int8's prefill from 6.41 to 4.59 ms
+a row and turned the sign. A number in this table is one commit old at best.
+
+`tools/rkllm_regcmd.py` reads a `.rkllm` without a board or a vendor runtime,
+and the file is not encrypted: the weights are packed int4 for the layers,
+int8 for the output head, fp16 for the token embeddings, told apart by whether
+a byte's two nibbles carry the same distribution. If they can be dequantised
+and scored with `charsiu_ppl`, the cell fills with no RKLLM install. That is
+the open question, not a plan.
+
+**The perplexity column is the only number here that survives a reboot.**
+`tools/charsiu_ppl` is deterministic to the last digit across boots; everything
+else on this board drifts about 3% between sessions and may only be compared
+inside one run. That is not a detail about a tool -- board time is the binding
+constraint on this project, and it means every speed claim needs its baseline
+re-run beside it while a quality regression can be caught weeks after it lands.
+The `board_verify.sh` tables carry their own control arm for exactly that
+reason. See *The instrument*.
+
+The four-model speed table, best of six under `board_verify.sh 7`, is further
+down under *What runs today*. Every projection including the output head runs
+on the NPU, and the generated text is identical to what the CPU decode loop
+writes -- an internal check that covers less than it sounds like: see *What
+"identical" does not mean*.
 
 **Prefill is the open front**, and the reason is measured rather than guessed.
 On gemma4's 93 row prompt the fence -- the hardware's own MAC time -- is 372 ms
@@ -264,13 +300,32 @@ instead. qwen3, 600 tokens of prose:
 ```
   llama.cpp's own q4_0, fp32 activations      26.64
   charsiu int4 w4a16, as it shipped           49.89      +87%
-  charsiu int4 w4a16, with AWQ                40.80      +53%
+  charsiu int4 w4a16, with AWQ                40.83      +53%
+  charsiu int8 w8a8                           27.07     +1.6%
 ```
 
-**The cause is not exotic.** q4_0 carries one fp16 scale per **32** weights;
-charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which `llama_auto_kmax` sets to
-1024. Thirty-two times coarser. The group cannot simply be narrowed, because
-the K slice **is** the group and the read back is `m·n·ceil(K/KMAX)·4` -- so a
+**The int8 row is a bug fix, not a new idea.** It read 272369 the night before
+-- noise -- and the reason was not the int8 path at all. `tensor_grouped()` in
+npudev.c decides whether a K slice may carry one group's scale and requires
+four things of a tensor, one of them being that the weights are four bits. The
+quantiser did not know that: it wrote `scale[row * ngrp + group]` for eight
+bits exactly as for four, and the int8 consumer read `scale[row]`, so every row
+took some other row's scale. There is a guard against precisely this, added
+after a partial last group did it to Qwen2.5-1.5B, and it tested one of the
+four conditions -- the one an int8 tensor at k 2048 and group 1024 satisfies.
+The quantiser now writes one scale a row for anything that is not four bits,
+and the guard asks `tensor_grouped()` itself rather than one of its clauses.
+
+At eight bits the coarser group costs nothing: on the host CPU reference, group
+1024 measures 44.81 and one scale a row 43.66, and the row is the better of the
+two because eight bits spans a row's spread on its own while finer scales only
+add their own rounding. Four bits is the opposite -- 91.66 against 114.22 --
+which is the whole reason the group exists.
+
+**Why the int4 row is +87%, and it is not exotic.** q4_0 carries one fp16
+scale per **32** weights; charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which
+`llama_auto_kmax` sets to 1024. Thirty-two times coarser. The group cannot
+simply be narrowed, because the K slice **is** the group and the read back is `m·n·ceil(K/KMAX)·4` -- so a
 finer group is paid for in prefill. Narrowing it does work, and the ladder is
 the evidence that the group is the cause:
 
@@ -291,10 +346,54 @@ exactly the ones the method exists to protect. It is off by default: it needs a
 calibration pass, and a tensor carrying a factor cannot share a packed input,
 so grouped q/k/v drop to single calls and decode gets slower.
 
+⚠ **And AWQ is a four-bit method.** At eight bits the factor's divide happens
+in the quantiser and its cancelling multiply has nowhere to live, because the
+int8 path packs one absmax quantisation of the whole activation vector: board,
+int8 with AWQ, 2162.73. It is declined above four bits now and says so. Even
+where it IS applied correctly -- the host CPU reference -- it makes int8 worse,
+43.66 off against 44.76 on, because it protects a dynamic range eight bits does
+not lack.
+
 ⚠ Perplexity on one passage is a weak instrument and these are first numbers,
 not a characterisation. What is not in doubt is the direction and the size:
 this was never measured before 2026-09-07, and "identical to the CPU loop" was
 carrying more weight in this file than it can hold.
+
+**What it changes, and it is less than it first looked.** The scoreboard, both
+formats, best of 6 at the same prompt lengths, same session:
+
+```
+                 decode tok/s              TTFT ms
+              int4    int8   int8/int4   int4   int8   int8
+  Qwen3      26.31   17.23     65.5%      602    543    -9.8%
+  TinyLLAMA  22.83   12.87     56.4%      867    821    -5.3%
+  Phi3        7.07    3.85     54.5%     2764   2636    -4.6%
+  Gemma4      9.33    5.52     59.2%     2187   2076    -5.1%
+```
+
+⚠⚠ **This table read the other way for forty minutes this morning.** int8's
+TTFT column was +9.7 to +26.4% until its batched activation quantiser was
+vectorised and pooled -- two scalar passes on one thread, where int4's packer
+was already both. That took int8's prefill from 6.41 to 4.59 ms a row and
+turned the sign on every model. The earlier numbers were correctly measured on
+a binary one commit old.
+
+**int8 costs decode and buys both the prompt and the answer.** About a third of
+decode, against a TTFT 4.6 to 9.8% BELOW int4's on all four models and a
+perplexity of 27.07 against 49.89 -- llama.cpp's own q4_0 to within 1.6%. int4
+stays the default because chat is a short prompt and a long answer. Ask for
+int8 when the prompt is long or the answer matters:
+
+```
+$ CHARSIU_NPU_W4V=0 charsiu run Qwen3-0.6B "summarise this document ..."
+```
+
+The runner sets `CHARSIU_NPU_W4V=1` as a default, and `env_default` skips any
+variable the caller already set, so this wins and the run reports it under
+`# from the environment, not the config:`.
+
+⚠ Phi-3.5 at eight bits runs, and its peak goes 4299 -> 6025 MB. It fits on
+this board; on a smaller one it would not.
 
 ### The CPU baseline is meant to be honest
 
@@ -368,15 +467,72 @@ until it has.
 Sampling at a temperature runs the plain loop: lossless speculative sampling
 exists and is not written here.
 
+## Performance generality, which is a different claim from correctness
+
+Nine architectures produce identical text to the CPU reference. Four have a
+tok/s number, and those four are the four the vendor publishes a benchmark for.
+Those are two claims and only one of them had been made.
+
+`tools/charsiu_shapes` reads a gguf **on a desktop, with no NPU and no board**
+and predicts a decode token from its shapes. Every coefficient comes from
+`tools/npu_job_cost`, a synthetic matmul with no model in it:
+
+```
+  model            t/MB    predicted   measured    error
+  SmolLM2-135M     3.66        13.53       14.6    -7.3%
+  Qwen3-0.6B       0.91        27.84       30.9    -9.9%
+  tinyllama-1.1B   0.78        40.36       41.3    -2.3%
+  gemma-3-1b       1.12        41.56       42.8    -2.9%
+  Qwen2.5-1.5B     0.81        60.45       63.0    -4.1%
+  SmolLM2-1.7B     0.58        63.37       63.3    +0.1%
+  Phi-3.5-mini     0.45       133.02      130.5    +1.9%
+                                            RMS     5.1%
+```
+
+**Twenty-eight times the parameters and eight times the shape signature, inside
+10%.** `t/MB` is tasks a megabyte: SmolLM2-135M pays dispatch where Phi-3.5
+pays bandwidth, and a threshold tuned on one is wrong on the other by
+construction -- which is not a hypothesis. `d = (ki*ns+ni)&1` was neutral on
+Llama-3.2, whose every dimension is a power of two, and cost 13 to 21% on
+Qwen3, gemma3 and Phi-3.5, and it survived because the model measured most
+often was the one that could not see it.
+
+⚠ **Every error is negative except two.** The predictor models matmuls only,
+and round 147 measured those at 88% of a qwen3 token; the missing few percent
+is attention, the norms and the elementwise joins. It is not corrected by a
+constant, because a constant fitted to close it would be fitting the thing the
+tool exists to avoid.
+
+⚠ Predictions, not measurements, and they are for THIS board at eight threads
+with the performance governor. Re-run `npu_job_cost` after any change to the
+dispatch path and the numbers move with it.
+
 ## What runs today
 
 `charsiu` picks the environment itself: int4 weights, the K slice width chosen per
 model, both cores, and the CPUs held out of deep idle while the NPU is open (see
 below). `CHARSIU_STAGES=1` prints where a token goes, once per half of the run.
 
+The four-model speed table, best of six under `board_verify.sh 7`, on the
+vendor's own prompt and protocol:
+
+```
+                     decode tok/s            time to first token, ms
+                     charsiu   vendor        charsiu   vendor
+  Qwen3 0.6B          26.30    24.85           594      469
+  TinyLLAMA 1.1B      22.89    19.71           869      544
+  Phi3 3.8B            7.06     6.58          2818     1829
+  Gemma4 E2B           9.42     9.23          2190     1219
+```
+
+⚠ **Gemma4 is +2.1% and has read +0.3% on a different session.** This board
+drifts about 3% between boots, so that row is "level with the vendor", not
+"past it", and the three above it are the ones with a margin worth the name.
+⚠ And this is the int4 column: see the three-row table at the top for what
+these tok/s cost in perplexity.
+
 Three things moved decode from 82% of the vendor to parity, each measured on the
-board with a control (it has since gone past the vendor on all four models --
-see the table at the top -- but these are what closed the original gap):
+board with a control:
 
 - **the CPUs are held out of deep idle while the NPU is open.** rk3576's CPU_SLEEP
   costs 250 us to leave, a token is about 150 calls into the driver, and each call
