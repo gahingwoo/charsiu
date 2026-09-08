@@ -4418,7 +4418,40 @@ struct attn_block_job {
  * per (row, position) is attn_heads' exactly: attn_dot, softmax over the
  * same window, attn_axpy in ascending t.
  */
-static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
+/*
+ * ⚠⚠ THE UNIT IS (HEAD, ROW BLOCK), NOT THE HEAD, AND THE HEAD COUNT IS WHY.
+ *
+ * This pooled over heads, so the threads only divide evenly when the head
+ * count does. Over the models on the card that is not a detail:
+ *
+ *   qwen3 16 heads -> 100%     tinyllama 32 -> 100%
+ *   gemma-3-1b 4   ->  50%     SmolLM2-135M 9 ->  56%
+ *
+ * Half of eight threads idle on gemma-3-1b, and prefill's attention is 18.2%
+ * of a row -- 0.97 ms against a 0.67 ms gap to the vendor. It is also neither
+ * bandwidth nor arithmetic bound where it runs: 0.76 GB/s of KV and 0.38
+ * GMAC/s, against 11.9 GB/s the threads reach.
+ *
+ * Row blocks are independent for the same reason heads are -- each reads the
+ * cache and writes its own rows -- so the unit is their product, which is
+ * n_head * ceil(n/R) and is 192 on qwen3 at a 90 row chunk. That divides.
+ *
+ * ⚠ THE SCRATCH HAD TO FOLLOW. `sc` was indexed by head, which is only safe
+ * while one worker owns a whole head; it is indexed by the flat (h, rb) unit
+ * now, so the buffer grows by ceil(n/R). CHARSIU_ATTN_HR=0 is the old
+ * head-only split, in the same binary, because a change that reorders work
+ * across threads has to be able to prove it did not reorder arithmetic.
+ */
+static int attn_hr(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_HR", 1);
+	return v;
+}
+
+static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 {
 	struct attn_block_job *j = ctx;
 	struct llama_state *s = j->s;
@@ -4426,12 +4459,16 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 	int R = j->R, n = j->n;
 	size_t qstride = (size_t)j->n_head * hd;
 	int timed = stage_on > 0 && !attn_block_pool();
+	int nblk = attn_hr() ? (n + R - 1) / R : 1;
+	uint64_t u;
 
-	for (uint32_t h = (uint32_t)h0; h < (uint32_t)(h0 + nh_); h++) {
+	for (u = u0; u < u0 + nu; u++) {
+		uint32_t h = (uint32_t)(attn_hr() ? u / (unsigned)nblk : u);
+		int only = attn_hr() ? (int)(u % (unsigned)nblk) : -1;
 		uint32_t kvh = h / gqa;
 		const float *kbase, *vbase;
 		size_t kstride;
-		float *sc = s->batt + (size_t)h * R * s->n_ctx;
+		float *sc = s->batt + (size_t)u * R * s->n_ctx;
 
 		if (kv_posmajor()) {
 			size_t b = (size_t)j->l * s->n_ctx * j->kvdim
@@ -4447,7 +4484,12 @@ static void attn_block_heads(void *ctx, uint64_t h0, uint64_t nh_)
 			vbase = s->vcache + b;
 			kstride = hdmax;
 		}
-		for (int rb = 0; rb < n; rb += R) {
+		/* one block when the unit names it, the whole range when the
+		 * split is head-only */
+		int rb0 = only >= 0 ? only * R : 0;
+		int rbN = only >= 0 ? (rb0 + R < n ? rb0 + R : n) : n;
+
+		for (int rb = rb0; rb < rbN; rb += R) {
 			int re = rb + R < n ? rb + R : n;
 			int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
 				      ? j->pos0 + rb + 1 - j->n_swa : 0;
@@ -5662,19 +5704,31 @@ static int attn_block_cpu(struct attn_block_job *j)
 	int R = j->R;
 
 	/* scores: [n_head][R][n_ctx], each head's block its own */
-	if (!s->batt || s->batt_rows < (unsigned)R) {
-		free(s->batt);
-		s->batt = malloc((size_t)j->n_head * R * s->n_ctx * sizeof(float));
-		if (!s->batt) {
-			s->batt_rows = 0;
-			return -1;
+	{
+		/* ⚠ THE SCRATCH IS PER UNIT NOW, and the unit is (head, row
+		 * block), so it grows by ceil(n/R). A head-indexed buffer was
+		 * only safe while one worker owned a whole head. */
+		unsigned nblk = attn_hr() ? (unsigned)((j->n + R - 1) / R) : 1;
+		size_t want = (size_t)j->n_head * nblk * R * s->n_ctx;
+
+		if (!s->batt || s->batt_rows < (unsigned)R
+		    || s->batt_units < (size_t)j->n_head * nblk) {
+			free(s->batt);
+			s->batt = malloc(want * sizeof(float));
+			if (!s->batt) {
+				s->batt_rows = 0;
+				s->batt_units = 0;
+				return -1;
+			}
+			s->batt_rows = (unsigned)R;
+			s->batt_units = (size_t)j->n_head * nblk;
 		}
-		s->batt_rows = (unsigned)R;
+		if (attn_block_pool())
+			charsiu_parallel_for(attn_block_heads, j,
+					     (uint64_t)j->n_head * nblk);
+		else
+			attn_block_heads(j, 0, (uint64_t)j->n_head * nblk);
 	}
-	if (attn_block_pool())
-		charsiu_parallel_for(attn_block_heads, j, j->n_head);
-	else
-		attn_block_heads(j, 0, j->n_head);
 	return 0;
 }
 

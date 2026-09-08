@@ -986,6 +986,7 @@ struct llama_state {
 	 * time: [rows][n_head][n_ctx], built on first use */
 	float *batt;
 	unsigned batt_rows;
+	size_t batt_units;   /* (head, row block) units the scratch holds */
 	/*
 	 * The fp16 KV cache the NPU reads, when CHARSIU_ATTN_NPU is set: a
 	 * mirror of kcache and vcache in the two weight layouts the scores and
