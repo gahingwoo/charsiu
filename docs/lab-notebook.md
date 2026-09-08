@@ -6308,3 +6308,34 @@ so the thread count only divides evenly when the head count does:
 (`s->batt + h * R * n_ctx`) reindexed, and prefill's best axis is the row block
 (12 of them at n=90, R=8) while decode's is the head (one row block). Worth
 doing, not a safe last-hour change.
+
+### 🏁 Round 167: the output width is controllable, and both ends were reached
+
+acc_out off, the same known matmul, WIDE8 swept coarsely:
+
+```
+  acc_out=1                 16516096   raw 0004fc00    four bytes, exact
+  acc_out=0  WIDE8=0x3f     16516096   raw 0004fc00    identical
+  acc_out=0  WIDE8=0                   raw 80808080    ONE byte, repeated
+  acc_out=0  WIDE8=0                   raw 80808080    (repeat, same)
+```
+
+**0x3f writes four bytes and 0 writes one.** The values under WIDE8=0 are
+garbage -- the coefficient buffer is zeroed, so a requant that multiplies
+produces nothing -- but the WIDTH moved, and nothing timed out in any arm.
+
+That is the sweep `job.c` has been asking for since it was written: *"the bits
+exist separately because 'the whole bundle changed something' does not say
+which register the width lives in, and a single field sweep is the method that
+worked on 0x4050 in round 260."* Nobody had run it.
+
+```
+  bit 0  0x4010   bit 1  0x4030 low   bit 2  0x4038
+  bit 3  0x4044   bit 4  0x4050       bit 5  0x40ac/b0/b4 identity
+```
+
+**What is worth finding is two bytes.** Prefill reads 0.94 ms of a 4.59 ms row
+at four bytes an element; two would be 0.47 and the entire gap to the vendor is
+0.67. One byte would be 0.24 -- and is exactly what `job.c` refused, because
+ffn_down's output range does not fit in one. So fp16 is the target and int8 is
+not, which makes this a search for a bit rather than for a bundle.
