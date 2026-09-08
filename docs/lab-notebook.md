@@ -6154,3 +6154,49 @@ one parameter.
 elementwise term can be fitted after the matmul term stops being extrapolated,
 or it may turn out not to be needed. Fitting it first was fitting the second
 parameter on top of a wrong first one.
+
+### ⛔ Round 159 killed the board, and the probe had no business asking
+
+Widening npu_job_cost's sweep to 67 MB put `4096 x 16384` on the end. **n =
+16384 is past the 8192 the device is opened for.** The job was submitted
+anyway:
+
+```
+  rocket 27708000.npu: NPU job timed out
+  rk_iommu 2770a000.iommu: Error during raw reset. MMU_DTE_ADDR is not functioning
+```
+
+which is the dead state this project already has a note about, and the clock
+between that round and the next says the board sat in it for **five hours**.
+
+Both bounds are written down elsewhere in this tree -- npudev refuses
+`(k/32)*m > 5120` and the device is opened for a max n -- and the probe checked
+neither. **A probe that walks an axis has to know where the axis ends,** and I
+widened one by editing an array.
+
+🔑 **usb_reset brought it back.** A power cycle does what the driver's own
+reset path cannot, and round 160 confirmed it: `accel0` present, 197 tensors
+staged, 10.74 GB/s, English out. That is worth knowing the next time this
+happens -- the five hours were nobody watching, not an unrecoverable board.
+
+### And the head was being extrapolated, which was a smaller version of the same
+
+`charsiu_shapes` priced the output head as one call of its whole weight -- 38
+MB on Phi-3.5, 157 on gemma4 -- and `call_us` answered by extending a straight
+line at 89 us a megabyte, where round 147 measured the head itself at 15.56
+GB/s, which is 64. Three models came back implying a matmul share above 100% of
+their own token: the arithmetic refusing an extrapolation, not a poor fit.
+
+The head is `ceil(n_vocab / NMAX)` slices of at most NMAX, so pricing it by
+slice puts every piece inside the measured range:
+
+```
+                 whole    by slice    measured     was        now
+  Qwen3-0.6B     27.13      27.77        30.9    -12.2%    -10.1%
+  gemma-3-1b     41.11      42.11        42.8     -3.9%     -1.6%
+  Phi-3.5       138.36     138.45       130.5     +6.0%     +6.1%
+                                          RMS      8.2%      6.9%
+```
+
+⚠ A small correction, because the head is one call against a hundred and
+twenty. It was still an extrapolation being reported as a measurement.
