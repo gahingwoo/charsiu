@@ -1037,6 +1037,21 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			if (f > hi) f = hi;
 			t->kscale[i] = (float)f;
 		}
+		/*
+		 * A hash of the factor, so charsiu_npu_matvec_group can ask
+		 * "is this the same factor?" in one comparison. q, k and v
+		 * read one activation and so are handed byte-identical
+		 * statistics, which makes their factors byte-identical too --
+		 * checked on this model's own calibration file, all sixteen
+		 * layers, and the same for gate against up.
+		 */
+		t->kshash = 1469598103934665603ull;
+		for (uint64_t i = 0; i < k; i++) {
+			uint32_t b;
+
+			memcpy(&b, &t->kscale[i], sizeof(b));
+			t->kshash = (t->kshash ^ b) * 1099511628211ull;
+		}
 		}
 		free(col);
 	}

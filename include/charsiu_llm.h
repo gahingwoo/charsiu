@@ -215,6 +215,9 @@ struct npu_tensor {
 	float *scale;      /* n * ngroup, per output channel per k group */
 	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	float *kscale;     /* k, a factor shared by every channel; NULL when off */
+	uint64_t kshash;   /* a hash of kscale, so a group can compare factors
+			    * in one integer instead of memcmp-ing 32 KB a
+			    * tensor a call; 0 when kscale is NULL */
 	double *astat;     /* k, the running sum of |x| over a calibration run */
 	uint64_t acalls;
 	double *acov;      /* k*k, upper triangle, one named tensor only */

@@ -7372,3 +7372,45 @@ it, 58.76. It is the layer whose row gauge is most extreme -- `ffn_up` at rho
 22.3 against `ffn_down` at 0.298 -- and the gauge cancels at inference only if
 both halves are reconstructed exactly. It is left out and said so, rather than
 averaged in.
+
+### 🔑 What charsiu can take from them: the factor a group can share
+
+charsiu's AWQ is off by default and the reason is speed, not quality:
+`charsiu_npu_matvec_group` refuses any tensor carrying a factor, so q, k and v
+drop from one submit to three. The comment there states the reason exactly --
+"two tensors with DIFFERENT factors need two different inputs" -- and the
+vendor's file is what points out that the premise does not hold here.
+
+**The factors in a group are the same factor.** The factor is built from
+`mean |x_k|` over a calibration run; q, k and v read one activation, so their
+recorded statistics are byte-identical -- checked on this model's own
+calibration file, all sixteen layers, `q == k` and `q == v` exactly, and
+`gate == up` as well. So the group can pack once and apply one factor once.
+
+That is charsiu's version of what the vendor gets for nothing by folding `1/c`
+into the RMSNorm ahead of the projection instead of scaling the activation at
+all.
+
+⚠ **Shape is not the test.** `attn_output` has the same `k` as `attn_q` and a
+completely different input. The comparison is on the factor's values, through a
+hash computed once at staging, because memcmp of 32 KB a tensor a call is
+16 MB a token.
+
+⚠ **Two things reading the diff caught, both real.** The first version let a
+group through when entry 0 carried a factor and entry 1 did not -- entry 1's
+weights were never scaled, so the shared input would have been multiplied by a
+factor that belongs to somebody else. And the check dereferenced `ids[0]`
+before the `!n` and bounds tests that were already there, which the loop it
+replaced could not do because a loop body does not run at `n == 0`.
+
+⛔ **`CHARSIU_NPU_AWQ_SHARE` is DEFAULT OFF and untested on hardware.** The
+group path exists only on the board and the host cannot exercise it. What the
+host says is that the knob is in the binary, that AWQ's perplexity is identical
+with it on and off (35.2041 both ways, so nothing leaked into the CPU path),
+and that arch_sanity is 8/8.
+
+**The round it needs**: `CHARSIU_NPU_AWQ=0.2` with `AWQ_SHARE` 0 and 1, on the
+board, same prompt. The tokens must be identical -- the arithmetic is unchanged
+either way -- and the stage table should show the group path taken instead of
+three single calls. If they are, AWQ stops costing decode and can be considered
+for default-on, which is worth 16% of perplexity on Llama and 35% on qwen3.
