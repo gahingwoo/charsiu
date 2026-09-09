@@ -380,11 +380,25 @@ head, same norms, no quantiser running at inference:
 ```
 
 **The vendor's four-bit weights cost 11.1% of perplexity where charsiu's cost
-6.8%**, and the ordering is the same one the weight error gives. ⚠ 43 of 112
-matrices: the other 69 carry a calibration this cannot undo well enough to
-score (see the notebook -- attempting it produced a perplexity of 1701 and a
-matched-noise control at the same weight error produced 32, which is how the
-attempt was caught).
+6.8%**, and the ordering is the same one the weight error gives.
+
+The calibration turned out not to need undoing at all: they fold `1/c` into the
+preceding RMSNorm rather than dividing the activation at runtime, so **their
+norms with their weights cancel it by construction**. That widens the same
+comparison from 43 matrices to 91 -- layers 3 to 15, every tensor type:
+
+```
+  the reference weights, untouched       19.8844
+  llama.cpp q4_0, group 32               20.2695    +1.94%
+  charsiu int4, group 1024               23.8090   +19.74%
+  the vendor's own stored int4 codes     26.6062   +33.81%
+```
+
+⚠ Layers 0 to 2 are left out because they carry a second, extreme gauge -- a
+per-output-row factor on `ffn_up` (rho 22.3) undone by `ffn_down`'s columns
+(rho 0.298) -- which this reconstruction does not recover accurately. With them
+in, the file reads 58.76, and that number is a measure of the reconstruction,
+not of their quantiser.
 
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
 is worth more than that. Pricing the zero point on its own, over all 112

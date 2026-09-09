@@ -7303,3 +7303,44 @@ above 40%:
 `down` at 0.298 -- so the residual is the gauge not being reconstructed
 exactly, not the quantiser. **The 11.14% figure stands on the 43 matrices that
 carry no gauge; the full-model number is not a measurement of their quality.**
+
+### 🏁 The comparison widened to 91 matrices, and the ordering holds
+
+Folding removed the need to recover `c`, so the same three-way comparison runs
+over layers 3 to 15 -- 91 of the 112 matrices, every tensor type, with the
+vendor's own norms in the vendor arm and the reference's in the other two,
+because that is what each side's model actually is:
+
+```
+  the reference weights, untouched       19.8844
+  llama.cpp q4_0, group 32               20.2695    +1.94%
+  charsiu int4, group 1024               23.8090   +19.74%
+  the vendor's own stored int4 codes     26.6062   +33.81%
+```
+
+**The vendor's excess is 1.71x charsiu's**, against 1.65x on the 43-matrix
+subset -- two disjoint measurements of the same ratio.
+
+⚠ Layers 0 to 2 are excluded and the exclusion is attributed, not assumed:
+the full sixteen-layer file reads **58.76** and dropping those three takes it
+to **26.61**, so they carry the excess. They are also where the row gauge is
+extreme -- `blk.1.ffn_up` at rho 22.3 against `blk.1.ffn_down` at 0.298.
+
+🔑 **And the layout is not what fails there.** Within a row, `V/W` should be
+`c_j * r_i`, so any two rows' column profiles are proportional if the layout is
+right -- and a gauge is exactly what that divides out. The median pairwise
+correlation of those profiles:
+
+```
+  blk.3.attn_q   rho  1.000    0.011   <- untransformed: V/W is 1 plus noise
+  blk.6.ffn_gate rho  0.975    0.030
+  blk.0.attn_q   rho  3.507    0.710
+  blk.1.ffn_gate rho  4.300    0.654
+  blk.1.ffn_up   rho 22.317    0.614
+```
+
+The transformed tensors share a column profile at 0.61 to 0.71 where the
+untransformed ones sit at 0.01 to 0.03, which is the layout being right and
+`c` being real. What is not accurate enough is my ESTIMATE of the row gauge:
+dividing both gauges out by least squares takes `blk.1.ffn_up` from 450% to
+1645%, which is a fit to a quantity the noise dominates.
