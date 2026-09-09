@@ -7414,3 +7414,35 @@ board, same prompt. The tokens must be identical -- the arithmetic is unchanged
 either way -- and the stage table should show the group path taken instead of
 three single calls. If they are, AWQ stops costing decode and can be considered
 for default-on, which is worth 16% of perplexity on Llama and 35% on qwen3.
+
+### ⛔ AWQ's factor was never applied on the batched path, and nothing refused
+
+Chasing whether AWQ could be default-on turned up a wrong-answer path that has
+been reachable since batching shipped.
+
+`npuquant` scales the weights by `kscale[k]` and leaves the inverse for the
+caller to put on the activation. `kscale` appears **twice** in `npudev.c`:
+`charsiu_npu_matvec` applies it, and -- since today -- a group whose members
+share one factor. `npu_matmul_inner`, which is the batched path and takes the
+w4 route by default, does not, and there was no refusal anywhere else:
+`kscale` does not appear in `llama.c` at all.
+
+So with `CHARSIU_NPU_AWQ` set, **decode was right and prefill was not**: scaled
+weights multiplied by an unscaled input, which `charsiu_npu_add`'s own note
+already prices at ppl 75.17 off against 65233808 on.
+
+⚠ **And no measurement in this tree would have caught it.** `charsiu_ppl`
+scores one token at a time unless `--batch` is passed, so every AWQ perplexity
+ever recorded here went through the single matvec. The board's 40.83 is a
+decode number and is not affected; a `charsiu_run` prompt is.
+
+🔑 The note at `charsiu_npu_add` says "paths that cannot, refuse" and prices
+the failure in the same paragraph. **The sentence was true about the intent and
+false about the code** -- the refusal it describes had never been written. That
+is the same shape as the guard that tested one of `tensor_grouped`'s four
+clauses: a comment describing a check that does not exist reads exactly like
+one describing a check that does.
+
+The refusal is now written. It costs the batch and keeps the answer. Applying
+the factor on that path is the better fix and needs the board, because the path
+does not exist on the host.

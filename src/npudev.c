@@ -5104,6 +5104,34 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			return -1;
 		}
 	}
+	/*
+	 * ⚠⚠ AWQ'S FACTOR IS NOT APPLIED ON THIS PATH, AND NOTHING SAID SO.
+	 *
+	 * npuquant scales the weights by kscale[k] and leaves the inverse for
+	 * the caller to put on the ACTIVATION. Two places do it: the single
+	 * matvec, and -- since today -- a group whose members share one factor.
+	 * This one does not. `kscale` appeared exactly twice in this file and
+	 * neither occurrence was here, so a batched prefill with
+	 * CHARSIU_NPU_AWQ set multiplied scaled weights by an unscaled input.
+	 *
+	 * charsiu_npu_add's own note says "paths that cannot, refuse" and
+	 * prices the failure -- ppl 75.17 off against 65233808 on. This is the
+	 * refusal that sentence describes, and it had never been written.
+	 *
+	 * Nothing shipped wrong, because AWQ is off by default. With it on,
+	 * decode was right and prefill was not, and no measurement in this
+	 * tree would have caught it: charsiu_ppl scores one token at a time
+	 * unless --batch is passed.
+	 *
+	 * Refusing costs the batch and keeps the answer. Applying the factor
+	 * here is the better fix and needs the board, because this path does
+	 * not exist on the host.
+	 */
+	if (g->ent[id].t->kscale) {
+		whine(g, "AWQ's factor has no place to go on the batched path",
+		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
+		return -1;
+	}
 	e = &g->ent[id];
 	/*
 	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
