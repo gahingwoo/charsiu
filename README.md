@@ -394,11 +394,25 @@ comparison from 43 matrices to 91 -- layers 3 to 15, every tensor type:
   the vendor's own stored int4 codes     26.6062   +33.81%
 ```
 
-⚠ Layers 0 to 2 are left out because they carry a second, extreme gauge -- a
+and the same comparison on three nested subsets, each with charsiu's quantiser
+run over exactly the same matrices, gives the same answer:
+
+```
+  matrices   charsiu    vendor    ratio
+     43       +6.76%   +11.14%     1.65
+     91      +19.74%   +33.81%     1.71
+    105      +34.10%   +61.57%     1.81
+```
+
+**The vendor's four-bit weights cost about 1.7x what charsiu's cost**, measured
+three times over disjoint additions of tensors.
+
+⚠ Layer 1 is excluded from all three. It carries an extreme second gauge -- a
 per-output-row factor on `ffn_up` (rho 22.3) undone by `ffn_down`'s columns
-(rho 0.298) -- which this reconstruction does not recover accurately. With them
-in, the file reads 58.76, and that number is a measure of the reconstruction,
-not of their quantiser.
+(rho 0.298) -- and with it in, the file reads 58.76 against 32.13 without. That
+step is the reconstruction, not their quantiser: layers 0 and 2 cost charsiu
+23.81 -> 26.67 as well, so the layers really are more sensitive, and only layer
+1 moves the vendor arm on its own.
 
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
 is worth more than that. Pricing the zero point on its own, over all 112

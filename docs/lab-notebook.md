@@ -7344,3 +7344,31 @@ untransformed ones sit at 0.01 to 0.03, which is the layout being right and
 `c` being real. What is not accurate enough is my ESTIMATE of the row gauge:
 dividing both gauges out by least squares takes `blk.1.ffn_up` from 450% to
 1645%, which is a fit to a quantity the noise dominates.
+
+### 🏁 The ratio, measured three times on nested subsets
+
+Adding layers back one group at a time, with charsiu's quantiser run over
+exactly the same matrices each time so the comparison never drifts:
+
+```
+  matrices                       ref    charsiu    vendor    ratio
+  43   (rho = 1 only)         19.8844   21.2288   22.1006    1.65
+  91   (layers 3..15)         19.8844   23.8090   26.6062    1.71
+  105  (all but layer 1)      19.8844   26.6654   32.1275    1.81
+  112  (everything)           19.8844      --     58.7642     --
+```
+
+**The vendor's excess is about 1.7x charsiu's**, three times, on three
+different sets of tensors.
+
+🔑 **And the charsiu column is what says the early layers are not my mistake.**
+Going from 91 matrices to 105 adds layers 0 and 2, and it costs charsiu
+23.81 -> 26.67 as well as costing the vendor 26.61 -> 32.13. Both arms pay, so
+those layers are genuinely more sensitive to four-bit weights; the difference
+between the arms stays a ratio.
+
+⛔ **Layer 1 alone is the 58.76.** Everything except layer 1 reads 32.13; with
+it, 58.76. It is the layer whose row gauge is most extreme -- `ffn_up` at rho
+22.3 against `ffn_down` at 0.298 -- and the gauge cancels at inference only if
+both halves are reconstructed exactly. It is left out and said so, rather than
+averaged in.
