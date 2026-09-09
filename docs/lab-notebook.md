@@ -6697,3 +6697,62 @@ and gets more for them. Two rows of the same table:
 `CHARSIU_NPU_W4_CLIP` minimises this number and made KL worse. What it settles
 is the *cost side* -- 1.4% for double the scale bytes is not a trade worth
 making blind -- not the quality side.
+
+### 🏁 The formula survives six alternatives, and two calibrations do not
+
+`scale = (max - min) / 15` was read off six tensors where it holds to four
+digits. The question that leaves open is whether it is the *form* of the
+vendor's rule or just a coincidence there, and the way to ask is to offer the
+rule some competition. Relative spread of `scale / f(row)` over 42 tensors,
+seven candidate `f`:
+
+```
+                 range/15  absmax/8    rms   mean|w|   p99.9    p99    p95
+  blk.6.attn_q      2.05%     4.54%  10.96%   11.52%   7.08%  10.16%  11.31%
+  blk.3.attn_q      0.03%     5.50%  13.79%   14.51%   8.81%  12.60%  14.23%
+  blk.0.ffn_gate    4.08%     5.46%  18.34%   21.96%   8.33%  15.05%  21.25%
+
+  wins: range/15 39, absmax/8 3, everything else 0
+```
+
+The three losses are `ffn_down` rows where `range/15` and `absmax/8` read 68%
+and 65% and neither is a description of anything. **So the scale is
+`(max - min) / 15` of something, and the something is a transformed weight.**
+
+`rho = 15 * scale / (max - min)` is the size of that transform, and it has
+structure worth having:
+
+```
+  layer      attn_q    attn_k    attn_v   attn_out  ffn_gate   ffn_up  ffn_down
+    0         3.507     3.451     2.856     0.990     1.679     2.121     0.830
+    1         1.549     1.580     1.493     1.043     4.300    22.317     0.298
+    2         2.949     3.069     3.141     0.906     1.386     1.684     0.833
+    3         1.000     1.000     1.132     0.889     1.561     1.888     0.847
+   10         1.000     1.000     0.950     1.114     0.954     1.051     0.926
+   15         1.000     1.000     1.158     0.864     0.912     1.436     0.802
+```
+
+**The two columns that sit below 1 everywhere are attn_output and ffn_down --
+exactly the two whose input is not a normed activation.** Everything the vendor
+widens is fed by a norm, and it widens layers 0 to 2 hardest, up to 22.3x on
+`blk.1.ffn_up`. Layers 3 to 15 sit within a few percent of 1. That is the shape
+of an activation-aware method spending its budget where the outliers are, and
+it is a map of where charsiu's own AWQ would be worth turning on.
+
+⛔ **Two readings of what the transform IS, both refuted the same afternoon.**
+
+*A few outlier input channels scaled up.* If `w' = w * c` with a few large
+`c_j`, the row range would be carried by those columns. On `blk.1.ffn_up`, the
+most extreme tensor in the table, `corr(row range, |w[:,j]|)` tops out at
+**0.23** and nothing passes 0.5 -- while the untransformed `blk.3.attn_q` has a
+median of 0.36 from the trivial correlation alone. No column carries it.
+
+*The RMSNorm folded into the columns.* Structurally the best candidate: the
+tensors with `rho > 1` are precisely the ones with a norm in front. Folding it
+makes the spread **worse in every case** -- `blk.3.attn_q` goes from
+`1.000 / 0.0%` to `2.233 / 20.2%` -- and folding `1 + norm` instead gives
+`0.706 / 7.8%`. A hypothesis that turns an exact identity into a 20% scatter is
+answered.
+
+🔑 What the negatives cost: one run each. What they buy is that the next
+candidate is not proposed against the same evidence.

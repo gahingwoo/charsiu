@@ -38,6 +38,7 @@ Usage:
     rkllm_scales.py verify   <model.rkllm> <ref.gguf>   test the derived map
     rkllm_scales.py compare  <model.rkllm> <ref.gguf>   vendor vs charsiu vs q4_0
     rkllm_scales.py zero     x <ref.gguf>               price the zero point
+    rkllm_scales.py rho      <model.rkllm> <ref.gguf>   where their calibration is
 """
 import os
 import sys
@@ -217,6 +218,45 @@ def cmd_compare(rk, ref):
     return 0
 
 
+def cmd_rho(rk, ref):
+    """rho = 15 * scale / (max - min), per tensor. 1 means untransformed.
+
+    The formula is settled -- scale is (max-min)/15 of SOMETHING, and against
+    absmax/8, RMS, mean|w| and the 95/99/99.9 percentiles it wins 39 of 42
+    tensors, the three losses being ffn_down rows where every candidate is
+    above 65%. What is not settled is what the vendor did to the weights first,
+    and rho is the size of it.
+
+    Two candidates are already dead:
+      - a few outlier input channels scaled up: on blk.1.ffn_up, the most
+        extreme tensor at rho 22.3, corr(row range, |w[:,j]|) tops out at 0.23
+        and NOTHING passes 0.5, while the untransformed blk.3.attn_q sits at a
+        median 0.36 by itself. No column carries it.
+      - the RMSNorm folded into the columns: folding makes the spread WORSE
+        everywhere, and turns rho = 1.000 / 0.0% into 2.233 / 20.2%.
+    """
+    sig = region(rk)
+    r = GGUFReader(ref)
+    G = {t.name: t for t in r.tensors}
+    res = {}
+    for name, (slot, rows) in derived_map().items():
+        w = dequant_q8(G[name])
+        rho = 15.0 * sig[slot:slot + rows] / (w.max(axis=1) - w.min(axis=1))
+        res[name] = (rho.mean(), rho.std() / rho.mean() * 100)
+    suf = [s for s, _ in ORDER]
+    print("rho = 15 * scale / (max - min).  rho == 1 / 0.0% means the vendor")
+    print("quantised THESE weights; anything else is its calibration.\n")
+    print(f"{'layer':>5} " + " ".join(f"{s[:8]:>13}" for s in suf))
+    for L in range(LAYERS):
+        print(f"  {L:>3} " + " ".join(
+            f"{res[f'blk.{L}.{s}.weight'][0]:7.3f}/{res[f'blk.{L}.{s}.weight'][1]:4.1f}%"
+            for s in suf))
+    print("\nThe two columns with no norm in front of them -- attn_output and")
+    print("ffn_down -- are the two that sit BELOW 1. Everything the vendor")
+    print("widens is fed by a norm, and it widens layers 0 to 2 the most.")
+    return 0
+
+
 def cmd_zero(rk, ref):
     """What an asymmetric zero point is worth to charsiu, at every group size.
 
@@ -270,7 +310,7 @@ def main():
         return 1
     cmd, rk, ref = sys.argv[1], sys.argv[2], sys.argv[3]
     fn = {"map": cmd_map, "verify": cmd_verify, "compare": cmd_compare,
-          "zero": cmd_zero}.get(cmd)
+          "zero": cmd_zero, "rho": cmd_rho}.get(cmd)
     if fn is None:
         print(__doc__)
         return 1
