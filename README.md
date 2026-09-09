@@ -374,6 +374,13 @@ weight error, not a perplexity -- `CHARSIU_NPU_W4_CLIP` minimises exactly this
 number and made KL worse. It narrows the empty cell in the table at the top; it
 does not fill it.
 
+`CHARSIU_NPU_AWQ_LAYERS` restricts it to a range of blocks, because their own
+calibration is nearly all in the first three layers and so is most of ours: on
+Qwen3-0.6B's host CPU reference, `0-2` takes ppl 113.23 to **85.50** where every
+layer takes it to 73.77 -- **70% of the win on 11% of the layers**, with the
+other twenty-five keeping their grouped q/k/v calls. ⛔ Not a free lunch
+though: `3-27` on its own is still worth 19.3%.
+
 `CHARSIU_NPU_AWQ` is that, and it took three fixes to work at all: the factor
 was never applied to the activation, then it collapsed in the quantiser on
 every path, then the exponent turned out to be positive where AWQ needs

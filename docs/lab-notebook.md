@@ -6756,3 +6756,47 @@ answered.
 
 🔑 What the negatives cost: one run each. What they buy is that the next
 candidate is not proposed against the same evidence.
+
+### ⚠ AWQ by layer: 70% of the win from 3 layers of 28, and the other 25 are not free
+
+The vendor's `rho` puts its widening in layers 0 to 2 and leaves 3 to 15 within
+a few percent of 1, so the obvious transfer is to stop paying for AWQ where the
+vendor does not. `CHARSIU_NPU_AWQ_LAYERS` restricts the factor to a range of
+blocks. Qwen3-0.6B, host CPU reference, 200 tokens, one binary and one corpus,
+every arm naming the knob:
+
+```
+  AWQ off                          113.2310
+  CHARSIU_NPU_AWQ_LAYERS=0-27       73.7671   -34.9%   (identity arm)
+  (unset, every layer)              73.7671   -34.9%   <- must be, and is
+  CHARSIU_NPU_AWQ_LAYERS=0-5        84.1331   -25.7%
+  CHARSIU_NPU_AWQ_LAYERS=0-2        85.4975   -24.5%
+  CHARSIU_NPU_AWQ_LAYERS=0-1        95.2883   -15.8%
+  CHARSIU_NPU_AWQ_LAYERS=3-27       91.4078   -19.3%
+```
+
+**Layers 0 to 2 carry 70% of the whole win on 11% of the layers.** Per layer
+that is 8.2 points against 0.77 for the rest, so the vendor's profile does
+transfer. AWQ's cost is structural -- a tensor carrying a factor cannot share a
+packed input, so grouped q/k/v drop to single calls -- and restricting it to
+three blocks leaves the other twenty-five grouped.
+
+⛔ **But the strong form is refuted: `3-27` is still worth 19.3%.** A third of
+the benefit is spread thinly over the layers the vendor leaves alone, so
+"switch it off above layer 2" is a trade, not a free lunch. And `0-5` beats
+`0-2` by only 1.4 points, so layers 3 to 5 are nearly worthless and the rest of
+the value is diffuse across 6 to 27.
+
+⚠ **And this corrects my own reading of `rho` from an hour earlier.** `rho = 1`
+means the row's RANGE is unchanged, not that the weights are: a transform that
+preserves each row's max and min is invisible to it. Only the six tensors at
+`1.000 +- 0.0003` are provably untransformed. For the rest of layers 3 to 15,
+at 0.95 to 1.15 with 2 to 10% spread, "untransformed" was more than the
+statistic says -- and this ppl sweep is what says so, because charsiu's own
+calibration still finds 19.3% to take there.
+
+🔑 The identity arm is why the rest is readable: `0-27` had to equal the
+unrestricted run to the last digit and does, so the parse is not quietly
+excluding a layer. The controls before it are the same shape -- AWQ off and
+AWQ everywhere reproduce the recorded 114.2234 / 73.8760 to within 0.9% and
+0.15%, the residual being a corpus that differs slightly from that session's.

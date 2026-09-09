@@ -797,6 +797,39 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
 
 	/*
+	 * CHARSIU_NPU_AWQ_LAYERS restricts the factor to a range of blocks,
+	 * "0-2" or "4". The vendor spends its own calibration almost entirely
+	 * on the first three: rho = 15 * scale / (max - min), read out of the
+	 * scale arrays in its .rkllm, runs 1.5 to 22.3 on layers 0 to 2 of
+	 * Llama-3.2-1B and sits within a few percent of 1 on 3 to 15
+	 * (tools/rkllm_scales.py rho). AWQ costs decode -- a tensor carrying a
+	 * factor cannot share a packed input, so grouped q/k/v drop to single
+	 * calls -- so WHERE it can be switched off is worth a knob.
+	 *
+	 * ⚠ UNSET OR EMPTY MEANS EVERY LAYER, which is what AWQ did before
+	 * this existed. A range this cannot parse must not quietly turn the
+	 * method off: the arm that says "AWQ on" would then be the arm with
+	 * AWQ off, and this tree has already run four of those.
+	 *
+	 * A tensor with no "blk.<n>." in its name is not a layer and is never
+	 * restricted by this.
+	 */
+	if (alpha != 0.0) {
+		const char *lr = getenv("CHARSIU_NPU_AWQ_LAYERS");
+		const char *b = strstr(w->name, "blk.");
+
+		if (lr && *lr && b) {
+			char *end;
+			long lo = strtol(lr, &end, 10);
+			long hi = *end == '-' ? strtol(end + 1, NULL, 10) : lo;
+			long ln = strtol(b + 4, NULL, 10);
+
+			if (end != lr && (ln < lo || ln > hi))
+				alpha = 0.0;
+		}
+	}
+
+	/*
 	 * ⚠⚠ AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
 	 *
 	 * The factor only cancels because the weights are divided by it and the
