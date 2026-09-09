@@ -7040,3 +7040,50 @@ as the grid that ranked the wrong cell.
 support is narrower and more useful: the exponent has to be swept per model,
 and 0.5 -- the value every experiment in this tree used -- is on the wrong side
 of the minimum on both models tested, badly so on one.
+
+### 🏁 The calibration, identified — and it says the same thing the ppl sweep did
+
+With the layout solved, the vendor's transformed weights are readable, so the
+factor comes out by division: `c_j = median_i(w'_ij / w_ij)` over the larger
+half of each column. The residual after dividing it back out is 15.9 to 25.9%,
+which is int4 quantisation and not much else, so the per-column form is most of
+the transform.
+
+**And `c` is activation-aware.** Against `mean|x_k|` recorded by charsiu's own
+calibration pass on a 562-byte passage -- a completely different calibration
+set from theirs:
+
+```
+  corr(log c, log mean|x|)   blk.0.attn_q +0.846   blk.1.ffn_up +0.822
+                             blk.0.ffn_up +0.792   blk.2.attn_v +0.775
+                             blk.3.attn_q -0.071   <- the untransformed one
+```
+
+That is AWQ's direction: the columns meeting large activations are scaled UP,
+so they get more of the int4 grid.
+
+**The exponent is per tensor, and it is small.** Fitting
+`log(c/gm) = alpha * log(x/gm)`:
+
+```
+  rho    1.000  0.975  1.018  1.549  1.684  2.121  2.949  3.507  22.317
+  alpha -0.001  0.038  0.032  0.057  0.093  0.120  0.142  0.175   0.401
+  r     -0.071  0.662  0.442  0.810  0.611  0.792  0.817  0.846   0.822
+```
+
+Three tensors -- `blk.3/10/15.attn_q` -- come out at alpha 0.000 and r ~ 0,
+which is the same three the `(max-min)/scale = 15` identity picked out. The
+factor's range is bounded: `c/gm` runs 0.41 to 2.22 across every tensor
+measured, which is charsiu's own `CHARSIU_NPU_AWQ_CLAMP` default of [0.5, 2.0]
+almost exactly.
+
+🔑 **This corroborates today's ppl sweep from a completely different direction.**
+charsiu has used `CHARSIU_NPU_AWQ=0.5` since the factor was written. The vendor
+never exceeds **0.401**, is usually **0.03 to 0.15**, and switches the method
+off entirely on some tensors. The sweep found 0.5 past the minimum on both
+models and actively harmful on Llama; the vendor's own file says they never go
+near it.
+
+⚠ The exponents here are fitted against MY calibration corpus, not theirs, so
+the numbers are the vendor's transform expressed in my activation statistics.
+The ordering and the magnitude survive that; a third decimal would not.
