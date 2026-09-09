@@ -7087,3 +7087,36 @@ near it.
 ⚠ The exponents here are fitted against MY calibration corpus, not theirs, so
 the numbers are the vendor's transform expressed in my activation statistics.
 The ordering and the magnitude survive that; a third decimal would not.
+
+### ⛔ A per-tensor alpha search does not reproduce the vendor's choices
+
+The vendor picks alpha per tensor, which is what published AWQ does -- a grid
+search minimising the output error on calibration data. charsiu records
+`mean|x_k|` and nothing else, so the cheapest version of that objective is
+diagonal: `sum_j mean|x_j|^2 * sum_i (w_ij - what_ij)^2`. Before writing that
+into npuquant.c, the question is whether it picks what they picked.
+
+It does not:
+
+```
+  corr(vendor alpha, activation-weighted search)  -0.0197
+  corr(vendor alpha, unweighted search)           -0.0556
+```
+
+Eighteen tensors, no relationship at either. So the objective charsiu can
+afford is not the one they used, and implementing the search would have been
+building on an unvalidated premise.
+
+🔑 **Two things the run does support, and they are the useful half.** The
+unweighted search picks alpha 0.00 on thirteen of eighteen tensors -- weight
+error alone always prefers no smoothing, which is `CHARSIU_NPU_AWQ_CLIP`'s
+lesson arriving from a third direction. The activation-weighted one picks 0.05
+to 0.35, which is the vendor's own range (0.00 to 0.40) even though the
+per-tensor choices disagree. **So the objective has to be activation-weighted
+and the magnitude is 0.1 to 0.3** -- which is what the ppl sweep said, and what
+the vendor's file says, and now what an offline search says.
+
+⚠ Why it probably fails per tensor: `mean|x_k|` is a diagonal statistic taken
+from a 562-byte passage, and AWQ's real objective is the output error of the
+whole matmul under the activation covariance. The magnitude survives that
+approximation; the ranking does not.
