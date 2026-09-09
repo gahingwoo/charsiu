@@ -6502,3 +6502,959 @@ best-of-six can move 4% without anything changing.
 zero-sentinel in `poolread_min` (=0 meaning "always pool" was being replaced by
 the derived value) was caught by reading today's diffs before proposing this,
 not by any run.
+
+### ⛔ The 11.2 MB "fp16 SCALES" region was the REGISTER COMMAND STREAM
+
+Yesterday's entry put a scale array at 514.6 MB and described it as fp16, 90 to
+99% positive, "mostly powers of two", with "an obvious period of four". Every
+one of those observations is real and every one of them is an artefact of
+reading `u64` register writes as `fp16`:
+
+```
+  1c 40 01 00  00 00 01 10      reg 0x401c <- 0x00000001   target 0x1001 DPU
+  20 40 03 00  00 00 01 10      reg 0x4020 <- 0x00000003
+  24 40 3f 00  00 00 01 10      reg 0x4024 <- 0x0000003f       <- WIDE8
+  28 40 c0 15  00 00 01 10      reg 0x4028 <- 0x000015c0
+```
+
+The period of four is `u64` seen as four halves. The 96% positive is the two
+high halves being small. The "powers of two" mantissas are register numbers.
+**And the decoder was already in this tree** -- `tools/rkllm_regcmd.py` has had
+`[63:48] target [47:16] value [15:0] register` written at the top of it since
+the day it was written, and the region matches that layout at 95 to 98% over
+its whole 11.7 MB.
+
+🔑 **The tell I had and did not use: the group size came out non-integral.**
+Yesterday's own note says "dividing the count by the weights gives 165.7 or
+210.4 -- neither is an integer" and reads that as "the layout is a record".
+A non-integral count is also what "these are not scales" looks like, and the
+second reading costs nothing to test.
+
+### 🏁 The float region, and the vendor's int4 quantiser written down
+
+Sweeping two statistics over 505 to 527 MB -- the fraction of `f32` that is
+positive and smaller than 10, and the fraction of `u64` whose target field is
+one of the seven `rkllm_regcmd` knows -- separates the file cleanly:
+
+```
+        0 ..  7.47 MB    header + tokenizer
+     7.47 .. 508.47 MB   fp16 token embeddings, 128256 x 2048   (501.0 MB)
+   508.47 .. 512.10 MB   fp32 SCALES AND ZERO POINTS            (  3.6 MB)
+   512.10 .. 512.60 MB   fp32, all integral, signed
+   512.60 .. 514.15 MB   a table, 60 to 79% zero bytes
+   514.15 .. 525.90 MB   REGISTER COMMAND STREAMS               ( 11.7 MB)
+   525.90 .. 989.6  MB   packed int4 weights
+   989.6  .. 1240.4 MB   int8 output head
+```
+
+The embedding boundary is not fitted: 128256 x 2048 x 2 is 525336576 bytes and
+it ends exactly where the first scale begins, `0x1FC77DA0`.
+
+**The record is per tensor: `rows` fp32 scales, then `rows` fp32 zero points**,
+and each layer closes with two 2048-slot fp32 arrays (its two norms). So a
+layer is `2 * 23552 + 4096 = 51200` slots and the whole thing is a stride, not
+a search:
+
+```
+  blk.0.attn_q      122728        blk.1.attn_q      173928     +51200
+  blk.0.attn_k      126824        blk.2.attn_q      225128     +51200
+  blk.0.attn_v      127848        blk.3.attn_q      276328     +51200
+  blk.0.attn_output 128872        ...
+  blk.0.ffn_gate    132968
+  blk.0.ffn_up      149352
+  blk.0.ffn_down    165736
+  (two norms)       169832
+```
+
+Found by correlating each tensor's per-row `max|w|`, taken from the same model
+in q8_0, against the region -- 112 tensors, best offsets tiling it with no gap
+and no overlap, in model order. The zero points are exactly integral, range -5
+to +3, mean -0.50, and about half of them are zero.
+
+**The quantiser is `w = s * (q - z)` with `q` in `[-8, +7]`.** Both halves of
+that come from the data: `max/s + z` is 7.19 +- 0.34 and `min/s + z` is
+-8.20 +- 0.33, while the other sign convention, `w = s * (q + z)`, has four
+times the spread. And on six tensors the scale is the formula exactly:
+
+```
+  blk.3.attn_q    (max-min)/scale = 14.9999 +- 0.0038
+  blk.3.attn_k                      14.9998 +- 0.0030
+  blk.10.attn_q                     14.9999 +- 0.0040
+  blk.10.attn_k                     14.9999 +- 0.0032
+  blk.15.attn_q                     15.0000 +- 0.0035
+  blk.15.attn_k                     15.0000 +- 0.0035
+```
+
+Four digits, and the +-0.004 is q8_0's own rounding of `max` and `min`. So
+`scale = (max - min) / 15`, sixteen levels, asymmetric, **one scale and one
+integer zero point per output row**.
+
+### ⛔ And the first error table was scored against weights the vendor never saw
+
+The other 106 tensors do NOT satisfy that relation -- they come back at 3.5,
+7.1, 9.6, 18.2 with several percent of scatter. A per-tensor factor with
+per-row spread is what quantising **transformed** weights looks like, so the
+vendor has a calibration step in front of its quantiser and the reference in
+this tree is not what it quantised.
+
+I had already printed a 112-tensor table reading "vendor 23.667% against
+charsiu 13.788%" before checking that. It contained `blk.1.ffn_up 99.520%` --
+a reconstruction with no correlation to its input, which no shipped quantiser
+produces -- and that one cell is the whole table's retraction. **The number was
+the vendor's scales applied to weights they were not computed from.**
+
+⚠ The same run had a second thing wrong that the result did not show: the
+`vendor` and `vendor-sym` columns agreed to three decimals, and the reason is
+that `round(w/s + z) - z` is `round(w/s)` for integer `z`. The zero point is
+mathematically inert in that expression except where it moves the clip window.
+Two arms that cannot differ are not two arms.
+
+### 🏁 The six tensors that CAN be scored, and what they say
+
+Restricted to the six where the vendor's scale provably comes from these exact
+weights, all four quantisers on one set of weights:
+
+```
+                                      weight error
+  vendor    one (s, z) a row, asym        15.843%
+  charsiu   group 1024, symmetric         14.935%     <- what ships
+  charsiu   one scale a row, symmetric    16.209%
+  q4_0      group 32, symmetric            8.980%
+```
+
+**At equal granularity the vendor is 2.3% better than charsiu, and charsiu as
+it ships is 5.7% better than the vendor.** Their whole advantage at that
+granularity is the zero point, which is a thing charsiu can have.
+
+⚠ Six tensors of 112, weight error and not perplexity, and this tree already
+owns the counter-example to reading weight error as quality: `CHARSIU_NPU_W4_CLIP`
+minimises exactly this number and made KL worse, 0.0989 to 0.2084. It narrows
+the empty cell. It does not fill it.
+
+### ⚠ The int4 weights are not stored in the reference's order
+
+A sign correlation of `blk.0.ffn_gate` row 0 against every byte and nibble
+alignment of the 480 MB int4 region tops out at `|r| = 0.133`, which is the
+noise floor for a 2048-long pattern. Row major is dead; the weights are in some
+NPU-native order, which is what charsiu's own packer also has to produce.
+
+### ⛔ A scratch file called bisect.py power-cycled the board four times
+
+`scratchpad/bisect.py` is an old round script, and it shadows the stdlib
+`bisect` module. Anything run from that directory that reaches `random` or
+`tempfile` -- `from gguf import GGUFReader` does, through `gguf_writer` --
+executes it, and line 11 of it is `uart.usb_reset()`.
+
+So `import numpy; from gguf import ...` reset the board. The failure surfaced
+as `FATAL: no shell` printed by a script that contains no such string, and I
+spent four tool calls looking for a hook before reading the traceback, which
+had named the file the whole time.
+
+🔑 **Never name a scratch script after a stdlib module**, and `python3 -P`
+keeps the script's own directory off `sys.path` when the directory is not
+trusted. The scratchpad now has none: `sys.stdlib_module_names` is the check.
+
+### ⛔ The zero point, priced over all 112 tensors, and it is not worth taking
+
+The six-tensor table says the vendor's asymmetry is worth something, so the
+next question is what it would be worth to charsiu. Symmetric against
+asymmetric at every group size, same weights, no vendor data needed
+(`tools/rkllm_scales.py zero`, and the row arm's scale bytes are counted per
+tensor because its group is the tensor's own k -- 2048 on most of these and
+8192 on ffn_down):
+
+```
+                 weight error   bytes a weight
+  sym   row         15.297%         0.5015
+  asym  row         15.182%         0.5031        -0.8%
+  sym  1024         13.788%         0.5039
+  asym 1024         13.592%         0.5078        -1.4%
+  sym   512         12.800%         0.5078
+  asym  512         12.538%         0.5156        -2.0%
+  sym   128         10.848%         0.5312
+  asym  128         10.423%         0.5625        -3.9%
+  sym    32          8.826%         0.6250
+  asym   32          8.211%         0.7500        -7.0%
+```
+
+**At charsiu's shipped group of 1024 an asymmetric zero point buys 1.4%,** and
+it costs a second fp32 array -- double the scale memory -- plus a
+`zero * sum(a)` correction a group a row in the accumulate. The value grows as
+the group narrows and is 7% at 32, which is the group charsiu cannot have,
+because the group **is** the K slice and the read back is `m*n*ceil(K/KMAX)*4`.
+
+🔑 **So the vendor's asymmetry is a consequence of its granularity, not an
+advantage over ours.** They have one scale a row, so the zero point is the only
+cheap thing left to add; charsiu already spends those bytes on 2x the scales
+and gets more for them. Two rows of the same table:
+
+```
+  vendor    asym, one a row     15.18% of the way to their number
+  charsiu    sym, group 1024    13.79%
+```
+
+⚠ Weight error. The same caveat as everywhere above: this tree's own
+`CHARSIU_NPU_W4_CLIP` minimises this number and made KL worse. What it settles
+is the *cost side* -- 1.4% for double the scale bytes is not a trade worth
+making blind -- not the quality side.
+
+### 🏁 The formula survives six alternatives, and two calibrations do not
+
+`scale = (max - min) / 15` was read off six tensors where it holds to four
+digits. The question that leaves open is whether it is the *form* of the
+vendor's rule or just a coincidence there, and the way to ask is to offer the
+rule some competition. Relative spread of `scale / f(row)` over 42 tensors,
+seven candidate `f`:
+
+```
+                 range/15  absmax/8    rms   mean|w|   p99.9    p99    p95
+  blk.6.attn_q      2.05%     4.54%  10.96%   11.52%   7.08%  10.16%  11.31%
+  blk.3.attn_q      0.03%     5.50%  13.79%   14.51%   8.81%  12.60%  14.23%
+  blk.0.ffn_gate    4.08%     5.46%  18.34%   21.96%   8.33%  15.05%  21.25%
+
+  wins: range/15 39, absmax/8 3, everything else 0
+```
+
+The three losses are `ffn_down` rows where `range/15` and `absmax/8` read 68%
+and 65% and neither is a description of anything. **So the scale is
+`(max - min) / 15` of something, and the something is a transformed weight.**
+
+`rho = 15 * scale / (max - min)` is the size of that transform, and it has
+structure worth having:
+
+```
+  layer      attn_q    attn_k    attn_v   attn_out  ffn_gate   ffn_up  ffn_down
+    0         3.507     3.451     2.856     0.990     1.679     2.121     0.830
+    1         1.549     1.580     1.493     1.043     4.300    22.317     0.298
+    2         2.949     3.069     3.141     0.906     1.386     1.684     0.833
+    3         1.000     1.000     1.132     0.889     1.561     1.888     0.847
+   10         1.000     1.000     0.950     1.114     0.954     1.051     0.926
+   15         1.000     1.000     1.158     0.864     0.912     1.436     0.802
+```
+
+**The two columns that sit below 1 everywhere are attn_output and ffn_down --
+exactly the two whose input is not a normed activation.** Everything the vendor
+widens is fed by a norm, and it widens layers 0 to 2 hardest, up to 22.3x on
+`blk.1.ffn_up`. Layers 3 to 15 sit within a few percent of 1. That is the shape
+of an activation-aware method spending its budget where the outliers are, and
+it is a map of where charsiu's own AWQ would be worth turning on.
+
+⛔ **Two readings of what the transform IS, both refuted the same afternoon.**
+
+*A few outlier input channels scaled up.* If `w' = w * c` with a few large
+`c_j`, the row range would be carried by those columns. On `blk.1.ffn_up`, the
+most extreme tensor in the table, `corr(row range, |w[:,j]|)` tops out at
+**0.23** and nothing passes 0.5 -- while the untransformed `blk.3.attn_q` has a
+median of 0.36 from the trivial correlation alone. No column carries it.
+
+*The RMSNorm folded into the columns.* Structurally the best candidate: the
+tensors with `rho > 1` are precisely the ones with a norm in front. Folding it
+makes the spread **worse in every case** -- `blk.3.attn_q` goes from
+`1.000 / 0.0%` to `2.233 / 20.2%` -- and folding `1 + norm` instead gives
+`0.706 / 7.8%`. A hypothesis that turns an exact identity into a 20% scatter is
+answered.
+
+🔑 What the negatives cost: one run each. What they buy is that the next
+candidate is not proposed against the same evidence.
+
+### ⚠ AWQ by layer: 70% of the win from 3 layers of 28, and the other 25 are not free
+
+The vendor's `rho` puts its widening in layers 0 to 2 and leaves 3 to 15 within
+a few percent of 1, so the obvious transfer is to stop paying for AWQ where the
+vendor does not. `CHARSIU_NPU_AWQ_LAYERS` restricts the factor to a range of
+blocks. Qwen3-0.6B, host CPU reference, 200 tokens, one binary and one corpus,
+every arm naming the knob:
+
+```
+  AWQ off                          113.2310
+  CHARSIU_NPU_AWQ_LAYERS=0-27       73.7671   -34.9%   (identity arm)
+  (unset, every layer)              73.7671   -34.9%   <- must be, and is
+  CHARSIU_NPU_AWQ_LAYERS=0-5        84.1331   -25.7%
+  CHARSIU_NPU_AWQ_LAYERS=0-2        85.4975   -24.5%
+  CHARSIU_NPU_AWQ_LAYERS=0-1        95.2883   -15.8%
+  CHARSIU_NPU_AWQ_LAYERS=3-27       91.4078   -19.3%
+```
+
+**Layers 0 to 2 carry 70% of the whole win on 11% of the layers.** Per layer
+that is 8.2 points against 0.77 for the rest, so the vendor's profile does
+transfer. AWQ's cost is structural -- a tensor carrying a factor cannot share a
+packed input, so grouped q/k/v drop to single calls -- and restricting it to
+three blocks leaves the other twenty-five grouped.
+
+⛔ **But the strong form is refuted: `3-27` is still worth 19.3%.** A third of
+the benefit is spread thinly over the layers the vendor leaves alone, so
+"switch it off above layer 2" is a trade, not a free lunch. And `0-5` beats
+`0-2` by only 1.4 points, so layers 3 to 5 are nearly worthless and the rest of
+the value is diffuse across 6 to 27.
+
+⚠ **And this corrects my own reading of `rho` from an hour earlier.** `rho = 1`
+means the row's RANGE is unchanged, not that the weights are: a transform that
+preserves each row's max and min is invisible to it. Only the six tensors at
+`1.000 +- 0.0003` are provably untransformed. For the rest of layers 3 to 15,
+at 0.95 to 1.15 with 2 to 10% spread, "untransformed" was more than the
+statistic says -- and this ppl sweep is what says so, because charsiu's own
+calibration still finds 19.3% to take there.
+
+🔑 The identity arm is why the rest is readable: `0-27` had to equal the
+unrestricted run to the last digit and does, so the parse is not quietly
+excluding a layer. The controls before it are the same shape -- AWQ off and
+AWQ everywhere reproduce the recorded 114.2234 / 73.8760 to within 0.9% and
+0.15%, the residual being a corpus that differs slightly from that session's.
+
+### 🏁 The int4 payload, and the whole 1240 MB file closes with zero bytes left
+
+The last valid register command word ends at `0x20DDA980`, and `0x20DDA9C4` is
+the only offset near it for which the arithmetic is exact:
+
+```
+  0x20DDA9C4  +  112 matrices        486539264 B   = 464.0 MB
+              +  128256 x 2048 head  262668288 B   = 250.5 MB
+              =  1300605380                        = the file, to the byte
+```
+
+A layer is `2048*2048 + 512*2048*2 + 2048*2048 + 8192*2048*2 + 2048*8192`
+halved = **30408704 bytes**, sixteen of them is 486539264, and the region ends
+exactly where the head begins. Nothing is fitted here.
+
+**Confirmed without knowing the order, which is the point.** A tensor's int4
+CODE HISTOGRAM survives any permutation of its codes, and for the six tensors
+where `rho == 1` the histogram is predictable from the reference and the
+vendor's own `(s, z)`. `blk.3.attn_q`'s prediction against every 2 MB window of
+the 464 MB region:
+
+```
+  tv 0.00025   block 1392   0x264DA9C4   = layer 3, offset 0   <- what the map predicts
+  tv 0.00108   block 1395   ... 196608 into layer 3
+  tv 0.00123   block 4721   ... layer 10
+  median 0.01501, 1st percentile 0.00327
+```
+
+The best of 7393 windows is the predicted one, 13x better than the 1st
+percentile. So the weight region holds the same 112 tensors in the same order
+as the scale region, and the quantiser identity `w = s * (q - z)` is now
+confirmed against the actual stored codes rather than against a scale alone.
+
+### 🔑 The codes fill the grid the same way at rho 22.3 as at rho 1.000
+
+`rho = 22.3` on `blk.1.ffn_up` was the one number in the rho table that looked
+like a mistake: a scale 22x wider than the row's range would crush every code
+into 0 and +-1. It does not:
+
+```
+  tensor              code sd   |code| >= 4     rho
+  blk.3.attn_q          2.210      11.80%     1.000
+  blk.10.attn_q         2.221      12.20%     1.000
+  blk.1.ffn_up          2.153      10.91%    22.317
+  blk.1.ffn_gate        2.143      10.64%     4.300
+  blk.15.ffn_down       1.830       6.25%     0.802
+```
+
+**The vendor's scale fits whatever it quantised.** `rho` is the size of a real
+transform of the weights, not a badly chosen scale, and the doubt that the map
+might simply be wrong for the 106 is answered by the file itself.
+
+### ⛔ The order inside a tensor is still not known, and it had a fair run
+
+With the byte range confirmed, the haystack is 2 MB rather than 464, so a
+candidate order can be scored at a KNOWN offset with a single dot product and
+no search at all. Row major, column major, and four orderings across eight
+output tiles and six input tiles: **142 candidates on signs, 194 on code
+values, every one at the noise floor.** Best code correlation 0.023 against a
+floor of 0.002.
+
+charsiu hands the device row-major nibbles and the device computes correctly,
+so this is not the matmul weight layout -- it is the CONVOLUTION one, which is
+what the vendor's own register streams dispatch, and it is not a simple tiling
+of (output, input).
+
+⚠ And a bug the output caught rather than the number: `rkllm_layout.py` printed
+every hit at `start + i // 2` while the streaming rewrite had already seeded
+its cursor at `start * 2`, so the addresses landed outside the range that was
+searched. The correlations were right the whole time. A wrong address next to a
+right correlation survives a glance at the top line.
+
+### 🏁 AWQ's exponent was never swept, and 0.5 is on the wrong side of the minimum
+
+Every AWQ experiment in this tree pinned `CHARSIU_NPU_AWQ` at 0.5 -- the usual
+square root balance -- and moved the clamp. Sweeping the exponent instead, with
+the clamp at its default 2.0, qwen3 on the host CPU reference at 500 tokens:
+
+```
+  alpha   0.25    0.30    0.35    0.40    0.45    0.50
+  ppl    68.86   65.84   65.12   68.02   75.52   76.36     (AWQ off: 113.56)
+```
+
+A clean single minimum at **0.35**, and **65.12 against 76.36 is 14.7%**. The
+same ordering holds on the other corpus at 200 tokens -- 68.07 against 73.77 --
+so it is not one length or one passage.
+
+⚠ **And the first version of this measurement ranked the wrong cell.** The
+opening sweep was a 6 x 3 grid of alpha against clamp at 200 tokens, and its
+winner was `0.35 / 1.5` at 66.99. At 500 tokens that cell reads **75.44** and
+`0.35 / 2.0` -- third in the grid -- reads 65.12. The grid was not smooth
+either: `0.50 / 1.5` at 78.28 sat worse than `0.20 / 3.0` at 71.98, which is
+the shape of a statistic that cannot rank what it is being asked to rank.
+
+🔑 **199 scored positions cannot separate cells a few points apart, and the
+tell was in the surface, not in the numbers.** Holding the clamp at its default
+and sweeping one variable gave a curve with one minimum and no crossings, and
+that curve reproduces across both lengths. The cell that survived is the one
+that was never the winner of the noisy grid.
+
+⚠ The board's 40.83 in the README was measured at 0.5 and has not been re-run.
+If the host's 14.7% transfers it lands near 35, which would be inside 31% of
+llama.cpp's own q4_0 rather than 53% -- but that is a prediction, not a result.
+
+### 🏁 The weight layout, 89% of the way, and the 11% that is not phase
+
+Guessing layouts was dead -- 336 candidates at the noise floor. Deriving one
+works much better, and the derivation has three steps, each of which is a
+measurement rather than a hypothesis.
+
+**1. The block is 16 output channels.** A row's codes average about its own
+zero point, so the spread of window means over a tensor says how many rows a
+window mixes. The excess over the sampling noise is flat at 0.179 from 1024
+codes up to 32768 and then falls as `1/sqrt(m)`:
+
+```
+  window     2048    8192   16384   32768   65536  131072
+  excess    0.1778  0.1783  0.1784  0.1786  0.1221  0.0844
+```
+
+The knee is exactly 32768 codes = 16 KB, and `sd(z)/sqrt(16)` is 0.195 against
+the 0.179 observed. Three tensors agree.
+
+**And which 16 is settled without any within-block knowledge**: block means
+survive any permutation inside the block, so the 128 observed block means can
+be regressed on the predicted ones. Contiguous 16-row groups give **r =
+1.0000**; a strided grouping gives −0.05 and a shuffled control −0.16.
+
+**2. The cycle is 512 codes.** Autocorrelation of window means, computed inside
+blocks so the boundary cannot manufacture a period: at a 64-code window the
+peaks are at lags 8, 16, 24, 32 (r 0.77); at 32 codes, lags 16 and 32 (0.72);
+at 16 codes, lag 32 (0.60). All three say 512.
+
+**3. Which row each of the 512 positions holds, fitted over all 128 blocks at
+once.** Every one of the 16 rows comes out used exactly 32 times, the margin
+between the best and second-best assignment has a median of 15.5 and a minimum
+of 9.07, and the residual is 0.2545 against a sampling noise of 0.2762. There
+is nothing ambiguous in it.
+
+⛔ **And the layout built from all that is 89% right, not right.** Rebuilt and
+scored against the file it reads 88.46% exact, which is what I first called the
+ceiling -- 12% of predicted codes sit within 0.06 of a rounding boundary, so
+88% looked like agreement. **It is not the ceiling, and the test that says so
+is stratifying by confidence:**
+
+```
+  |frac from a boundary|   0.00-0.05  0.05-0.15  0.15-0.25  0.25-0.35  0.45-0.50
+  exact match               89.33%     89.27%     89.25%     89.29%     81.08%
+```
+
+A correct mapping has to approach 100% at the confident end. It is **flat at
+89.3%**, so about one position in nine is mapped wrong for reasons that have
+nothing to do with my rounding -- and the disagreements are spread to +-3 and
+beyond, where a rounding flip can only ever be +-1.
+
+Scanning all 512 cycle phases against all 16 row rotations -- 1024
+combinations -- tops out at **89.28%**. So it is not the phase and it is not
+the row order.
+
+⛔ **The 53% "vendor effective weight error" this produced is retracted before
+it was used.** It is dominated by the 11% of mis-mapped positions, not by the
+vendor: on `blk.3.attn_q`, `s(P - z)` against the reference is 14.18% while
+`s(Q - z)` through this mapping is 50.37%, and the gap is the mapping.
+
+🔑 What is banked: the block is 16 output channels and contiguous, the cycle is
+512 codes, the row of each position is known. What is not: the k index inside a
+row's run.
+
+### 🏁 The weight layout, solved — and the k index came out the same way the row did
+
+The 11% that phase and rotation could not fix was the k index, and guessing it
+was never going to work. Solving it does, and by the same move that gave the
+row: **at each slot the 128 blocks hand you 128 observed codes, and the row is
+already known, so matching that vector against the 2048 candidate columns is a
+fit with 128 samples and one answer.**
+
+```
+  best score        48/48       (a right k)
+  runner-up         16/48       (chance, with this code distribution)
+  margin >= 10      32712 of 32768 slots
+  distinct k        2048 of 2048, each chosen 14..18 times -- a bijection
+```
+
+**Held out properly**: solved on blocks 0..47, scored on rows 768..2047 which
+took no part in the fit --
+
+```
+  all codes                     98.79%
+  codes away from a boundary    99.72%
+  Q - P disagreements           -2: 851   -1: 13329   +1: 13506   +2: 1067
+```
+
+which is the rounding-boundary signature and nothing else. My own earlier
+"solved" claim read 88.46% and was flat at 89.3% across every confidence bin;
+this one climbs to 99.72% at the confident end, which is what a correct mapping
+has to do.
+
+⚠ **And the map has to be solved on a tensor the vendor did NOT transform.**
+Caching it by shape and letting the first tensor of that shape fill the cache
+put `blk.0.attn_q` (rho 3.507) in charge of the 2048x2048 map, and the table
+came back at 279%. A mapping fitted to predictions that are wrong fits nothing.
+The anchors are `blk.3.attn_q`, `blk.3.attn_k`, `blk.6.ffn_gate`.
+
+⛔ `ffn_down` (k = 8192) is not this layout: 16.5%, the noise floor.
+
+### 🏁 So the vendor's own codes, scored
+
+Over the 41 tensors whose `rho` is within 5% of 1 -- the ones where the
+reference IS what the vendor quantised:
+
+```
+  vendor's own stored codes    17.577%
+  charsiu group 1024           13.946%     <- what ships
+  llama.cpp q4_0, group 32      8.856%
+```
+
+and `blk.3.attn_q` alone reads **15.859%** here against the **15.843%** that
+came out of applying the vendor's `(scale, zero)` to charsiu's own rounding.
+Two independent routes, one number.
+
+### ⚠ AWQ's exponent: the minimum is per model, and 0.5 is past it on both
+
+Yesterday's sweep was one model. Llama-3.2-1B, its own calibration file
+(113 tensors), same corpus and length:
+
+```
+  off     0.20    0.25    0.30    0.35    0.40    0.50    0.65
+ 52.34   43.86   46.98   52.55   50.58   52.95   68.26   92.42
+```
+
+Llama's minimum is **0.20**, not qwen3's 0.35, and at **0.5 AWQ is worse than
+not running it at all** -- 68.26 against 52.34. The curve is not clean in the
+middle either (0.30 sits worse than 0.35), which is the same resolution limit
+as the grid that ranked the wrong cell.
+
+🔑 **So "use 0.35" was one model's answer and is withdrawn.** What both models
+support is narrower and more useful: the exponent has to be swept per model,
+and 0.5 -- the value every experiment in this tree used -- is on the wrong side
+of the minimum on both models tested, badly so on one.
+
+### 🏁 The calibration, identified — and it says the same thing the ppl sweep did
+
+With the layout solved, the vendor's transformed weights are readable, so the
+factor comes out by division: `c_j = median_i(w'_ij / w_ij)` over the larger
+half of each column. The residual after dividing it back out is 15.9 to 25.9%,
+which is int4 quantisation and not much else, so the per-column form is most of
+the transform.
+
+**And `c` is activation-aware.** Against `mean|x_k|` recorded by charsiu's own
+calibration pass on a 562-byte passage -- a completely different calibration
+set from theirs:
+
+```
+  corr(log c, log mean|x|)   blk.0.attn_q +0.846   blk.1.ffn_up +0.822
+                             blk.0.ffn_up +0.792   blk.2.attn_v +0.775
+                             blk.3.attn_q -0.071   <- the untransformed one
+```
+
+That is AWQ's direction: the columns meeting large activations are scaled UP,
+so they get more of the int4 grid.
+
+**The exponent is per tensor, and it is small.** Fitting
+`log(c/gm) = alpha * log(x/gm)`:
+
+```
+  rho    1.000  0.975  1.018  1.549  1.684  2.121  2.949  3.507  22.317
+  alpha -0.001  0.038  0.032  0.057  0.093  0.120  0.142  0.175   0.401
+  r     -0.071  0.662  0.442  0.810  0.611  0.792  0.817  0.846   0.822
+```
+
+Three tensors -- `blk.3/10/15.attn_q` -- come out at alpha 0.000 and r ~ 0,
+which is the same three the `(max-min)/scale = 15` identity picked out. The
+factor's range is bounded: `c/gm` runs 0.41 to 2.22 across every tensor
+measured, which is charsiu's own `CHARSIU_NPU_AWQ_CLAMP` default of [0.5, 2.0]
+almost exactly.
+
+🔑 **This corroborates today's ppl sweep from a completely different direction.**
+charsiu has used `CHARSIU_NPU_AWQ=0.5` since the factor was written. The vendor
+never exceeds **0.401**, is usually **0.03 to 0.15**, and switches the method
+off entirely on some tensors. The sweep found 0.5 past the minimum on both
+models and actively harmful on Llama; the vendor's own file says they never go
+near it.
+
+⚠ The exponents here are fitted against MY calibration corpus, not theirs, so
+the numbers are the vendor's transform expressed in my activation statistics.
+The ordering and the magnitude survive that; a third decimal would not.
+
+### ⛔ A per-tensor alpha search does not reproduce the vendor's choices
+
+The vendor picks alpha per tensor, which is what published AWQ does -- a grid
+search minimising the output error on calibration data. charsiu records
+`mean|x_k|` and nothing else, so the cheapest version of that objective is
+diagonal: `sum_j mean|x_j|^2 * sum_i (w_ij - what_ij)^2`. Before writing that
+into npuquant.c, the question is whether it picks what they picked.
+
+It does not:
+
+```
+  corr(vendor alpha, activation-weighted search)  -0.0197
+  corr(vendor alpha, unweighted search)           -0.0556
+```
+
+Eighteen tensors, no relationship at either. So the objective charsiu can
+afford is not the one they used, and implementing the search would have been
+building on an unvalidated premise.
+
+🔑 **Two things the run does support, and they are the useful half.** The
+unweighted search picks alpha 0.00 on thirteen of eighteen tensors -- weight
+error alone always prefers no smoothing, which is `CHARSIU_NPU_AWQ_CLIP`'s
+lesson arriving from a third direction. The activation-weighted one picks 0.05
+to 0.35, which is the vendor's own range (0.00 to 0.40) even though the
+per-tensor choices disagree. **So the objective has to be activation-weighted
+and the magnitude is 0.1 to 0.3** -- which is what the ppl sweep said, and what
+the vendor's file says, and now what an offline search says.
+
+⚠ Why it probably fails per tensor: `mean|x_k|` is a diagonal statistic taken
+from a 562-byte passage, and AWQ's real objective is the output error of the
+whole matmul under the activation covariance. The magnitude survives that
+approximation; the ranking does not.
+
+### ⚠ ffn_down: the block is 32 KB and k is the outer loop, the rest is unresolved
+
+`ffn_down` is 2048 x 8192 and scores 16.5% -- the noise floor -- under the
+k = 2048 layout, so it is a different one. The same window-mean probe puts its
+knee at **65536 codes = 32 KB**, and the excess there is 0.1852 against
+`sd(z)/sqrt(16)` = 0.1780 and `sd(z)/sqrt(8)` = 0.2518. So a block holds
+**16 rows and 4096 of the 8192 k**, not 8 rows and all of them.
+
+**k is the outer loop.** Regressing the 256 block means on candidate groupings:
+
+```
+  rows 16*(b%128).., k-half b//128    r = +0.52     <- k outer
+  rows 16*(b//2).., k-half b%2        r = -0.02     <- k inner
+  rows 8b..8b+7, whole k              r = +0.02
+  shuffled control                    r = +0.08
+```
+
+and every way of splitting k -- contiguous halves, even/odd k, even/odd 32-,
+512-, 1024-, 2048-chunks -- gives the same +0.52, because a row group's mean
+does not depend on which of its k are in the block. The statistic can see the
+row grouping and is blind to the k split.
+
+⚠ **+0.52 is not +1.0000, and I am not calling this solved.** Assigning each
+block to its nearest (row group, k half) slot puts 50 of 256 on the identity
+and uses only 177 distinct slots, with a mean error of 0.00039 against a slot
+spread of 0.186 -- so where it lands it lands hard, and where two groups have
+close means it cannot choose. The k = 2048 case had `r = 1.0000` and no
+ambiguity at all; this needs the code-level fit, not the mean-level one.
+
+What is banked for `ffn_down`: block 32 KB, 16 rows x 4096 k, k outer. What is
+not: the block order and everything inside the block.
+
+### 🏁 ffn_down solved too, and the whole file is readable
+
+The mean-level fit could not choose between block orders for `ffn_down`, so the
+code-level one did. Assuming its block is the same 16-row shape with k split in
+two, each of the 256 blocks was searched over the 128 row groups and 2 k halves
+by matching its codes:
+
+```
+  best match   median 93.43%      runner-up  median 18.07%
+  all 256 blocks over 80%,  256 distinct slots used -- a bijection
+```
+
+⚠ **And the order is neither of the two I would have written down.** It is not
+`(row group, k half)` and not `(k half, row group)`: it is **64 row groups at a
+time**, each superblock doing k-half 0 for all 64 and then k-half 1 for all 64.
+
+```
+  block   0..63    ->  groups  0..63, k half 0
+  block  64..127   ->  groups  0..63, k half 1
+  block 128..191   ->  groups 64..127, k half 0
+```
+
+**The first twelve blocks agree with all three orders**, which is exactly why I
+called it the identity from a twelve-row print and got 54.29% where the right
+one gives **98.99% on confident codes**. Look at where the candidates diverge,
+not at where they agree.
+
+### 🏁 So the vendor's own codes, over every tensor type
+
+```
+                                    weight error
+  vendor's own int4 codes              17.711%
+  charsiu group 1024, symmetric        13.981%   <- ships
+  llama.cpp q4_0, group 32              8.864%
+```
+
+43 tensors -- the ones whose scale still satisfies `(max - min)/15`, so the
+reference is what they quantised. Adding `ffn_down` moved the vendor's figure
+from 17.577% to 17.711%, which is the kind of agreement that says the new
+layout is the same quantiser and not a new fit.
+
+### 🏁 The empty cell, filled -- and the first attempt at it was wrong
+
+With the layout solved the vendor's weights can be written into a gguf and
+run, so the comparison stops being a weight norm and becomes a perplexity.
+Three f16 files differing only in the 43 matrices whose scale still satisfies
+`(max - min)/15` -- same tokenizer, embeddings, head and norms in all of them,
+and no quantiser running at inference:
+
+```
+  A  the reference weights, untouched       19.8844
+  D  llama.cpp q4_0, group 32               20.0010    +0.59%
+  C  charsiu int4, group 1024               21.2288    +6.76%
+  B  the vendor's own stored int4 codes     22.1006   +11.14%
+```
+
+**The vendor's four-bit weights cost 11.1% where charsiu's cost 6.8%**, and
+that is the same ordering the weight error gave -- 17.58% against 13.98%
+against 8.86%. Two independent metrics, one answer.
+
+⛔ **The first version of this read 1701 and was my own mistake.** Replacing
+all 112 matrices with `s(q - z) / c`, where `c` is the calibration recovered
+by division, gives a perplexity of **1700.98**. The median per-tensor weight
+error of what went into that file was 18.3%, and charsiu's own int4 at 13.9%
+scores 41 -- so the number was not credible and the question was whether 18.3%
+is simply that expensive.
+
+🔑 **The control answered it in one run.** A fourth file, the reference plus
+Gaussian noise scaled to the SAME per-tensor relative error, scores **32.10**.
+So the magnitude is worth 32 and the structure is worth 1701: the recovered
+`c` is wrong in a way a Frobenius norm barely charges for and a forward pass
+charges enormously -- a column scaled by the wrong factor is a systematically
+wrong channel, not a small perturbation.
+
+That is this tree's own recurring lesson arriving again from a new direction:
+**weight error and functional error are different things**, which is why
+`CHARSIU_NPU_AWQ_CLIP` minimises the first and made the second worse.
+
+⚠ So the cell is filled for 43 of 112 matrices. The other 69 need the vendor's
+actual calibration, not one recovered by dividing by a reference.
+
+### 🏁 The calibration is not stored as a vector -- it is folded into the norm
+
+Their runtime has to know `c` to divide the activation by it, so `c` must be in
+the file. It is not: correlating a recovered 2048-vector against every f32
+alignment of the header and the whole float/table/register region tops out at
+**|r| = 0.20** where a hit would be 0.9 and the noise floor is 0.022.
+
+**Because AWQ does not divide at runtime -- it folds `1/c` into the preceding
+RMSNorm**, and that is exactly what the file shows:
+
+```
+                corr(vendor norm, ref)   corr(vendor norm, ref / c)
+  blk.1 ffn            0.7777                    0.9945
+  blk.9 attn           0.8406                    0.9914
+  blk.2 attn           0.8916                    0.9922
+  blk.3 attn           1.0000                    0.9905   <- c = 1 here
+```
+
+with the ratio `vendor_norm * c / ref_norm` at 0.9995 to 1.0000 throughout. And
+the other half of the same fact: **q, k and v of one layer share `c`**, which
+they must if it lives in `attn_norm` -- `corr(c_q, c_k)` is +0.996, +0.993,
++0.994, +0.990 across four layers.
+
+🔑 **So nothing has to be recovered.** Taking their norms with their weights
+makes `c` cancel by construction. Using the reference norms with their weights
+is what scored 1701.
+
+### 🏁 And a second gauge: a row factor on v and up, undone by o and down
+
+`gate` and `up` share `ffn_norm`, so they share `c` -- but their `rho` are 4.30
+and 22.32 in layer 1. The difference is a per-OUTPUT-ROW factor, and a row
+factor is absorbed by the per-row scale, so it is invisible in the codes and
+visible only in `s`. It has to be undone downstream, and only `up` can carry
+one: `gate` goes through SiLU, which a scalar cannot pass.
+
+```
+  corr(log(up/gate), -log(down))   +0.9933      up * down   median 1.009
+  corr(log(v/q),     -log(o))      +0.8387    (v/q) * o     median 1.024, 6%
+  corr(log q,         log k)       +0.9978    <- no extra gauge on q, k
+```
+
+**So the whole pipeline is described**: one activation-aware factor per input
+channel folded into the norm ahead of it, plus a row gauge on `v` and `up`
+cancelled by the columns of `attn_output` and `ffn_down`.
+
+### ⚠ The full-model rebuild is 58.76, and five tensors own it
+
+Their norms with their weights, all 112 matrices and 32 norms:
+
+```
+  reference                      19.8844
+  vendor, their norms too        58.7642
+```
+
+which is a long way from the 1701 the reference norms gave, and still a long
+way from the 22.10 the 43 clean matrices gave on their own. The effective
+weight error with the folding applied has a median of 21.5% and five tensors
+above 40%:
+
+```
+  blk.1.ffn_up      450.67%      blk.15.ffn_up    72.53%
+  blk.1.ffn_down     85.44%      blk.14.attn_v    44.07%
+  blk.15.ffn_down    43.96%
+```
+
+`blk.1` is where the row gauge is most extreme -- `up` at rho 22.3 against
+`down` at 0.298 -- so the residual is the gauge not being reconstructed
+exactly, not the quantiser. **The 11.14% figure stands on the 43 matrices that
+carry no gauge; the full-model number is not a measurement of their quality.**
+
+### 🏁 The comparison widened to 91 matrices, and the ordering holds
+
+Folding removed the need to recover `c`, so the same three-way comparison runs
+over layers 3 to 15 -- 91 of the 112 matrices, every tensor type, with the
+vendor's own norms in the vendor arm and the reference's in the other two,
+because that is what each side's model actually is:
+
+```
+  the reference weights, untouched       19.8844
+  llama.cpp q4_0, group 32               20.2695    +1.94%
+  charsiu int4, group 1024               23.8090   +19.74%
+  the vendor's own stored int4 codes     26.6062   +33.81%
+```
+
+**The vendor's excess is 1.71x charsiu's**, against 1.65x on the 43-matrix
+subset -- two disjoint measurements of the same ratio.
+
+⚠ Layers 0 to 2 are excluded and the exclusion is attributed, not assumed:
+the full sixteen-layer file reads **58.76** and dropping those three takes it
+to **26.61**, so they carry the excess. They are also where the row gauge is
+extreme -- `blk.1.ffn_up` at rho 22.3 against `blk.1.ffn_down` at 0.298.
+
+🔑 **And the layout is not what fails there.** Within a row, `V/W` should be
+`c_j * r_i`, so any two rows' column profiles are proportional if the layout is
+right -- and a gauge is exactly what that divides out. The median pairwise
+correlation of those profiles:
+
+```
+  blk.3.attn_q   rho  1.000    0.011   <- untransformed: V/W is 1 plus noise
+  blk.6.ffn_gate rho  0.975    0.030
+  blk.0.attn_q   rho  3.507    0.710
+  blk.1.ffn_gate rho  4.300    0.654
+  blk.1.ffn_up   rho 22.317    0.614
+```
+
+The transformed tensors share a column profile at 0.61 to 0.71 where the
+untransformed ones sit at 0.01 to 0.03, which is the layout being right and
+`c` being real. What is not accurate enough is my ESTIMATE of the row gauge:
+dividing both gauges out by least squares takes `blk.1.ffn_up` from 450% to
+1645%, which is a fit to a quantity the noise dominates.
+
+### 🏁 The ratio, measured three times on nested subsets
+
+Adding layers back one group at a time, with charsiu's quantiser run over
+exactly the same matrices each time so the comparison never drifts:
+
+```
+  matrices                       ref    charsiu    vendor    ratio
+  43   (rho = 1 only)         19.8844   21.2288   22.1006    1.65
+  91   (layers 3..15)         19.8844   23.8090   26.6062    1.71
+  105  (all but layer 1)      19.8844   26.6654   32.1275    1.81
+  112  (everything)           19.8844      --     58.7642     --
+```
+
+**The vendor's excess is about 1.7x charsiu's**, three times, on three
+different sets of tensors.
+
+🔑 **And the charsiu column is what says the early layers are not my mistake.**
+Going from 91 matrices to 105 adds layers 0 and 2, and it costs charsiu
+23.81 -> 26.67 as well as costing the vendor 26.61 -> 32.13. Both arms pay, so
+those layers are genuinely more sensitive to four-bit weights; the difference
+between the arms stays a ratio.
+
+⛔ **Layer 1 alone is the 58.76.** Everything except layer 1 reads 32.13; with
+it, 58.76. It is the layer whose row gauge is most extreme -- `ffn_up` at rho
+22.3 against `ffn_down` at 0.298 -- and the gauge cancels at inference only if
+both halves are reconstructed exactly. It is left out and said so, rather than
+averaged in.
+
+### 🔑 What charsiu can take from them: the factor a group can share
+
+charsiu's AWQ is off by default and the reason is speed, not quality:
+`charsiu_npu_matvec_group` refuses any tensor carrying a factor, so q, k and v
+drop from one submit to three. The comment there states the reason exactly --
+"two tensors with DIFFERENT factors need two different inputs" -- and the
+vendor's file is what points out that the premise does not hold here.
+
+**The factors in a group are the same factor.** The factor is built from
+`mean |x_k|` over a calibration run; q, k and v read one activation, so their
+recorded statistics are byte-identical -- checked on this model's own
+calibration file, all sixteen layers, `q == k` and `q == v` exactly, and
+`gate == up` as well. So the group can pack once and apply one factor once.
+
+That is charsiu's version of what the vendor gets for nothing by folding `1/c`
+into the RMSNorm ahead of the projection instead of scaling the activation at
+all.
+
+⚠ **Shape is not the test.** `attn_output` has the same `k` as `attn_q` and a
+completely different input. The comparison is on the factor's values, through a
+hash computed once at staging, because memcmp of 32 KB a tensor a call is
+16 MB a token.
+
+**And the premise is not one model's.** `matvec_pair` is called with
+`(wq, wk, wv)` and with `(gate, up)` -- read off llama.c, not assumed -- and
+those are exactly the sets whose statistics have to match:
+
+```
+  Llama-3.2-1B   16 layers:  q == k == v in 16/16,  gate == up in 16/16
+  Qwen3-0.6B     28 layers:  q == k == v in 28/28,  gate == up in 28/28
+```
+
+Two architectures, 44 layers, byte-identical every time. It has to be: they
+read one activation and the statistic is a sum over that activation.
+
+⚠ **Two things reading the diff caught, both real.** The first version let a
+group through when entry 0 carried a factor and entry 1 did not -- entry 1's
+weights were never scaled, so the shared input would have been multiplied by a
+factor that belongs to somebody else. And the check dereferenced `ids[0]`
+before the `!n` and bounds tests that were already there, which the loop it
+replaced could not do because a loop body does not run at `n == 0`.
+
+⛔ **`CHARSIU_NPU_AWQ_SHARE` is DEFAULT OFF and untested on hardware.** The
+group path exists only on the board and the host cannot exercise it. What the
+host says is that the knob is in the binary, that AWQ's perplexity is identical
+with it on and off (35.2041 both ways, so nothing leaked into the CPU path),
+and that arch_sanity is 8/8.
+
+**The round it needs**: `CHARSIU_NPU_AWQ=0.2` with `AWQ_SHARE` 0 and 1, on the
+board, same prompt. The tokens must be identical -- the arithmetic is unchanged
+either way -- and the stage table should show the group path taken instead of
+three single calls. If they are, AWQ stops costing decode and can be considered
+for default-on, which is worth 16% of perplexity on Llama and 35% on qwen3.
+
+### ⛔ AWQ's factor was never applied on the batched path, and nothing refused
+
+Chasing whether AWQ could be default-on turned up a wrong-answer path that has
+been reachable since batching shipped.
+
+`npuquant` scales the weights by `kscale[k]` and leaves the inverse for the
+caller to put on the activation. `kscale` appears **twice** in `npudev.c`:
+`charsiu_npu_matvec` applies it, and -- since today -- a group whose members
+share one factor. `npu_matmul_inner`, which is the batched path and takes the
+w4 route by default, does not, and there was no refusal anywhere else:
+`kscale` does not appear in `llama.c` at all.
+
+So with `CHARSIU_NPU_AWQ` set, **decode was right and prefill was not**: scaled
+weights multiplied by an unscaled input, which `charsiu_npu_add`'s own note
+already prices at ppl 75.17 off against 65233808 on.
+
+⚠ **And no measurement in this tree would have caught it.** `charsiu_ppl`
+scores one token at a time unless `--batch` is passed, so every AWQ perplexity
+ever recorded here went through the single matvec. The board's 40.83 is a
+decode number and is not affected; a `charsiu_run` prompt is.
+
+🔑 The note at `charsiu_npu_add` says "paths that cannot, refuse" and prices
+the failure in the same paragraph. **The sentence was true about the intent and
+false about the code** -- the refusal it describes had never been written. That
+is the same shape as the guard that tested one of `tensor_grouped`'s four
+clauses: a comment describing a check that does not exist reads exactly like
+one describing a check that does.
+
+The refusal is now written. It costs the batch and keeps the answer. Applying
+the factor on that path is the better fix and needs the board, because the path
+does not exist on the host.

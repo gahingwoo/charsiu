@@ -333,10 +333,136 @@ the evidence that the group is the cause:
   group 1024   49.89        group 256   38.97        group 128   36.33
 ```
 
-So the route is the vendor's: a coarse group and a calibrated quantiser. Their
-own `.rkllm` carries **one scale and one zero point per row** -- the whole of K,
-8192 wide on `ffn_down` -- and gets quality out of it by what it does to the
-weights before rounding them, not by storing more scales.
+So the route is the vendor's: a coarse group and a calibrated quantiser. That
+sentence used to be a belief and is now read out of their file. Correlating
+each tensor's per-row `max|w|`, taken from the same model in q8_0, against the
+`.rkllm`'s float region finds all 112 scale arrays tiling it with no gap and no
+overlap, in model order, and the record is `rows` fp32 scales followed by
+`rows` fp32 zero points. On six tensors the scale is the formula to four
+digits:
+
+```
+  blk.3.attn_q   (max - min) / scale = 14.9999 +- 0.0038
+  blk.15.attn_k                        15.0000 +- 0.0035
+```
+
+so it is `w = scale * (q - zero)`, `q` in `[-8, +7]`, **one scale and one
+integer zero point per output row** -- the whole of K, 8192 wide on `ffn_down`.
+`tools/rkllm_scales.py` does this; it needs no board and no vendor runtime.
+
+**And the vendor loses to what charsiu already ships.** The int4 payload is
+mapped too -- `0x20DDA9C4`, 16 output channels a block, a 512-code cycle, the
+row and the k of every slot fitted from the file itself (`tools/rkllm_codes.py`,
+99.72% on a held-out third of the tensor) -- so this is their ACTUAL stored
+codes, not a re-derivation:
+
+```
+                                              weight error
+  vendor's own int4 codes                          17.71%
+  charsiu   group 1024, symmetric                  13.98%   <- ships
+  llama.cpp q4_0, group 32, symmetric               8.86%
+```
+
+over the 43 tensors whose scale still satisfies `(max - min)/15`, so the
+reference is what they quantised. Reading it the other way -- their
+`(scale, zero)` applied to charsiu's own rounding -- gives 15.84% against
+15.86% from their codes on the same tensor. Two routes, one number.
+
+**And in perplexity, which is the column that was empty.** Three f16 ggufs
+that differ only in those 43 matrices -- same tokenizer, same embeddings, same
+head, same norms, no quantiser running at inference:
+
+```
+  the reference weights, untouched       19.8844
+  llama.cpp q4_0, group 32               20.0010    +0.59%
+  charsiu int4, group 1024               21.2288    +6.76%
+  the vendor's own stored int4 codes     22.1006   +11.14%
+```
+
+**The vendor's four-bit weights cost 11.1% of perplexity where charsiu's cost
+6.8%**, and the ordering is the same one the weight error gives.
+
+The calibration turned out not to need undoing at all: they fold `1/c` into the
+preceding RMSNorm rather than dividing the activation at runtime, so **their
+norms with their weights cancel it by construction**. That widens the same
+comparison from 43 matrices to 91 -- layers 3 to 15, every tensor type:
+
+```
+  the reference weights, untouched       19.8844
+  llama.cpp q4_0, group 32               20.2695    +1.94%
+  charsiu int4, group 1024               23.8090   +19.74%
+  the vendor's own stored int4 codes     26.6062   +33.81%
+```
+
+and the same comparison on three nested subsets, each with charsiu's quantiser
+run over exactly the same matrices, gives the same answer:
+
+```
+  matrices   charsiu    vendor    ratio
+     43       +6.76%   +11.14%     1.65
+     91      +19.74%   +33.81%     1.71
+    105      +34.10%   +61.57%     1.81
+```
+
+**The vendor's four-bit weights cost about 1.7x what charsiu's cost**, measured
+three times over disjoint additions of tensors.
+
+⚠ Layer 1 is excluded from all three. It carries an extreme second gauge -- a
+per-output-row factor on `ffn_up` (rho 22.3) undone by `ffn_down`'s columns
+(rho 0.298) -- and with it in, the file reads 58.76 against 32.13 without. That
+step is the reconstruction, not their quantiser: layers 0 and 2 cost charsiu
+23.81 -> 26.67 as well, so the layers really are more sensitive, and only layer
+1 moves the vendor arm on its own.
+
+At the same granularity the zero point is worth 2.3%, and charsiu's finer group
+is worth more than that. Pricing the zero point on its own, over all 112
+tensors and with no vendor data in it, says the same thing from the other side:
+symmetric against asymmetric is 13.788% against 13.591% at group 1024 -- **1.4%
+for double the scale bytes** -- and only reaches 7% at group 32, which is the
+group charsiu cannot have because the group *is* the K slice. Their asymmetry
+is a consequence of their granularity, not an advantage over ours. ⚠ Six tensors of 112: the other 106 miss
+`(max - min)/scale = 15` by a per-tensor factor with per-row spread, which is
+what quantising **transformed** weights looks like, so the vendor's calibration
+is real, is in front of its quantiser, and is not yet identified. And this is a
+weight error, not a perplexity -- `CHARSIU_NPU_W4_CLIP` minimises exactly this
+number and made KL worse. It narrows the empty cell in the table at the top; it
+does not fill it.
+
+`CHARSIU_NPU_AWQ_LAYERS` restricts it to a range of blocks, because their own
+calibration is nearly all in the first three layers and so is most of ours: on
+Qwen3-0.6B's host CPU reference, `0-2` takes ppl 113.23 to **85.50** where every
+layer takes it to 73.77 -- **70% of the win on 11% of the layers**, with the
+other twenty-five keeping their grouped q/k/v calls. ⛔ Not a free lunch
+though: `3-27` on its own is still worth 19.3%.
+
+⚠ **And its exponent had never been swept.** Every experiment before today
+pinned `CHARSIU_NPU_AWQ` at 0.5 -- the usual square-root balance -- and moved
+the clamp instead. Held at the default clamp of 2.0 it is a clean single
+minimum, and 0.5 is past it:
+
+```
+  alpha   0.25    0.30    0.35    0.40    0.45    0.50
+  ppl    68.86   65.84   65.12   68.02   75.52   76.36
+```
+
+qwen3, host CPU reference, 500 tokens. **65.12 against 76.36 is 14.7%**, and
+the ordering holds on the shorter corpus at 200 tokens too (68.07 against
+73.77).
+
+⚠ **The minimum itself is per model, but 0.5 is past it on both.** The same
+sweep on Llama-3.2-1B, its own calibration, same corpus and length:
+
+```
+  off     0.20    0.25    0.30    0.35    0.40    0.50    0.65
+ 52.34   43.86   46.98   52.55   50.58   52.95   68.26   92.42
+```
+
+Llama's minimum is at **0.20**, and at 0.5 -- the value this tree has always
+used -- AWQ is **worse than not running it at all**, 68.26 against 52.34. So
+the transferable finding is not a number to adopt; it is that the exponent has
+to be swept per model and that 0.5 is the wrong end of the range on both
+models tested. ⚠ The board number in the table above, 40.83, was measured at
+0.5 and has not been re-run.
 
 `CHARSIU_NPU_AWQ` is that, and it took three fixes to work at all: the factor
 was never applied to the activation, then it collapsed in the quantiser on

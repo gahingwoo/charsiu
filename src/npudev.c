@@ -287,6 +287,8 @@ struct charsiu_npu {
 	 * by every output channel, which is why it is nearly free here.
 	 */
 	int midrise;
+	int awqshare;      /* a group may share one packed input when every
+			    * tensor in it carries the SAME AWQ factor */
 	double *asum;      /* per K slice, the sum of the activation */
 	float *fscr;
 	float *accf;
@@ -1521,6 +1523,11 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 			g->cpu_frac = 0.9;
 	}
 	g->midrise = g->w4 && charsiu_env_flag("CHARSIU_NPU_W4_MIDRISE", 0);
+	/*
+	 * Read once. getenv walks the environment with a strcmp an entry, and
+	 * a group runs 65 times a token.
+	 */
+	g->awqshare = charsiu_env_flag("CHARSIU_NPU_AWQ_SHARE", 0);
 	/*
 	 * ⚠ THE RUNT K SLICE, AND WHAT IT COSTS. ceil(k / KMAX) leaves the
 	 * remainder in a slice of its own, and a slice costs about a task --
@@ -5097,6 +5104,34 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			return -1;
 		}
 	}
+	/*
+	 * ⚠⚠ AWQ'S FACTOR IS NOT APPLIED ON THIS PATH, AND NOTHING SAID SO.
+	 *
+	 * npuquant scales the weights by kscale[k] and leaves the inverse for
+	 * the caller to put on the ACTIVATION. Two places do it: the single
+	 * matvec, and -- since today -- a group whose members share one factor.
+	 * This one does not. `kscale` appeared exactly twice in this file and
+	 * neither occurrence was here, so a batched prefill with
+	 * CHARSIU_NPU_AWQ set multiplied scaled weights by an unscaled input.
+	 *
+	 * charsiu_npu_add's own note says "paths that cannot, refuse" and
+	 * prices the failure -- ppl 75.17 off against 65233808 on. This is the
+	 * refusal that sentence describes, and it had never been written.
+	 *
+	 * Nothing shipped wrong, because AWQ is off by default. With it on,
+	 * decode was right and prefill was not, and no measurement in this
+	 * tree would have caught it: charsiu_ppl scores one token at a time
+	 * unless --batch is passed.
+	 *
+	 * Refusing costs the batch and keeps the answer. Applying the factor
+	 * here is the better fix and needs the board, because this path does
+	 * not exist on the host.
+	 */
+	if (g->ent[id].t->kscale) {
+		whine(g, "AWQ's factor has no place to go on the batched path",
+		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
+		return -1;
+	}
 	e = &g->ent[id];
 	/*
 	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
@@ -6218,13 +6253,26 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	 * Refusing here is not a fallback to the CPU: matvec_pair's caller
 	 * drops to charsiu_npu_matvec per tensor, which applies the factor.
 	 * The cost is the sharing, not the hardware.
+	 *
+	 * 🔑 BUT THE FACTORS IN A GROUP ARE THE SAME FACTOR. The sentence above
+	 * says two tensors with DIFFERENT factors cannot share, and q, k and v
+	 * do not have different ones: the factor is built from mean |x_k| over
+	 * a calibration run, they read one activation, and their recorded
+	 * statistics are byte-identical -- checked on this model's own
+	 * calibration file, all sixteen layers, and gate against up as well.
+	 * So the group can pack once and apply the shared factor once, which is
+	 * what the vendor gets for free by folding it into the RMSNorm ahead of
+	 * the projection instead of scaling the activation at all.
+	 *
+	 * ⚠ SHAPE IS NOT THE TEST. attn_output has the same k as attn_q and a
+	 * completely different input, so the comparison is on the factor's
+	 * VALUES -- via a hash computed once at staging, because memcmp of
+	 * 32 KB a tensor a call is 16 MB a token.
+	 *
+	 * ⚠ DEFAULT OFF. This path exists only on the board and the host
+	 * cannot exercise it, so it is written, legal and switched off until a
+	 * round says the tokens are identical.
 	 */
-	for (unsigned gi = 0; gi < n; gi++) {
-		const struct npu_entry *ge = &g->ent[ids[gi]];
-
-		if (ge->t->kscale)
-			return -1;
-	}
 
 	struct npu_entry *e0;
 	struct charsiu_joblist jl;
@@ -6237,6 +6285,26 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (i = 0; i < n; i++)
 		if (ids[i] < 0 || (unsigned)ids[i] >= g->n_ent)
 			return -1;
+
+	const struct npu_tensor *gt0 = g->ent[ids[0]].t;
+	const float *gks = gt0->kscale;
+
+	/*
+	 * ⚠ ALL OR NONE. The first version let a group through when entry 0
+	 * carried a factor and entry 1 did not: entry 1's weights were never
+	 * scaled, so multiplying the shared input by entry 0's factor would
+	 * have corrupted it. A mixed group has to be refused from either side.
+	 */
+	for (unsigned gi = 1; gi < n; gi++) {
+		const struct npu_tensor *ti = g->ent[ids[gi]].t;
+
+		if ((ti->kscale != NULL) != (gks != NULL))
+			return -1;
+		if (gks && ti->kshash != gt0->kshash)
+			return -1;
+	}
+	if (gks && !g->awqshare)
+		return -1;
 	charsiu_note("a group: checking the entries", (unsigned long)n,
 		     (unsigned long)a->n);
 	e0 = &g->ent[ids[0]];
@@ -6278,11 +6346,13 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			 * default and measured worse when it was on, so it no
 			 * longer costs a double add per element either.
 			 */
-			if (g->midrise || g->plain) {
+			if (g->midrise || g->plain || gks) {
 				double as = 0.0;
 
 				for (i = 0; i < s->job.mm.k; i++) {
-					g->fscr[i] = src[i];
+					g->fscr[i] = gks
+						? src[i] * gks[s->k0 + i]
+						: src[i];
 					as += (double)g->fscr[i];
 				}
 				g->asum[ki] = as;

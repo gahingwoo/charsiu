@@ -790,11 +790,66 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * SmoothQuant trick, and here it costs one multiply a k on a vector of
 	 * 2048 and nothing on the hardware.
 	 *
-	 * CHARSIU_NPU_AWQ is the exponent, 0 for off and 0.5 for the usual
-	 * square root balance.
+	 * CHARSIU_NPU_AWQ is the exponent, 0 for off. 0.5 is the usual square
+	 * root balance and is what this tree used from the day the factor was
+	 * written; it is NOT the best value here.
+	 *
+	 * ⚠ THE EXPONENT WAS NEVER SWEPT. Every earlier experiment pinned it
+	 * at 0.5 and moved the clamp instead. Swept with the clamp held at its
+	 * default 2.0 -- qwen3, host CPU reference, 500 tokens -- it is a clean
+	 * single minimum and 0.5 is on the wrong side of it:
+	 *
+	 *   alpha  0.25   0.30   0.35   0.40   0.45   0.50
+	 *   ppl   68.86  65.84  65.12  68.02  75.52  76.36
+	 *
+	 * 65.12 against 76.36 is 14.7%, and the same ordering holds on the
+	 * shorter corpus at 200 tokens (68.07 against 73.77).
+	 *
+	 * ⚠ THE MINIMUM IS PER MODEL. Llama-3.2-1B, its own calibration, same
+	 * corpus and length: off 52.34, then
+	 *
+	 *   alpha  0.20   0.25   0.30   0.35   0.40   0.50   0.65
+	 *   ppl   43.86  46.98  52.55  50.58  52.95  68.26  92.42
+	 *
+	 * so its minimum is 0.20 and at 0.5 AWQ is WORSE THAN OFF. Sweep it
+	 * per model; what both models agree on is only that 0.5 is past the
+	 * minimum.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
+
+	/*
+	 * CHARSIU_NPU_AWQ_LAYERS restricts the factor to a range of blocks,
+	 * "0-2" or "4". The vendor spends its own calibration almost entirely
+	 * on the first three: rho = 15 * scale / (max - min), read out of the
+	 * scale arrays in its .rkllm, runs 1.5 to 22.3 on layers 0 to 2 of
+	 * Llama-3.2-1B and sits within a few percent of 1 on 3 to 15
+	 * (tools/rkllm_scales.py rho). AWQ costs decode -- a tensor carrying a
+	 * factor cannot share a packed input, so grouped q/k/v drop to single
+	 * calls -- so WHERE it can be switched off is worth a knob.
+	 *
+	 * ⚠ UNSET OR EMPTY MEANS EVERY LAYER, which is what AWQ did before
+	 * this existed. A range this cannot parse must not quietly turn the
+	 * method off: the arm that says "AWQ on" would then be the arm with
+	 * AWQ off, and this tree has already run four of those.
+	 *
+	 * A tensor with no "blk.<n>." in its name is not a layer and is never
+	 * restricted by this.
+	 */
+	if (alpha != 0.0) {
+		const char *lr = getenv("CHARSIU_NPU_AWQ_LAYERS");
+		const char *b = strstr(w->name, "blk.");
+
+		if (lr && *lr && b) {
+			char *end;
+			long lo = strtol(lr, &end, 10);
+			long hi = *end == '-' ? strtol(end + 1, NULL, 10) : lo;
+			long ln = strtol(b + 4, NULL, 10);
+
+			if (end != lr && (ln < lo || ln > hi))
+				alpha = 0.0;
+		}
+	}
 
 	/*
 	 * ⚠⚠ AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
@@ -981,6 +1036,21 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			if (f < lo) f = lo;
 			if (f > hi) f = hi;
 			t->kscale[i] = (float)f;
+		}
+		/*
+		 * A hash of the factor, so charsiu_npu_matvec_group can ask
+		 * "is this the same factor?" in one comparison. q, k and v
+		 * read one activation and so are handed byte-identical
+		 * statistics, which makes their factors byte-identical too --
+		 * checked on this model's own calibration file, all sixteen
+		 * layers, and the same for gate against up.
+		 */
+		t->kshash = 1469598103934665603ull;
+		for (uint64_t i = 0; i < k; i++) {
+			uint32_t b;
+
+			memcpy(&b, &t->kscale[i], sizeof(b));
+			t->kshash = (t->kshash ^ b) * 1099511628211ull;
 		}
 		}
 		free(col);
