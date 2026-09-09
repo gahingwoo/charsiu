@@ -7396,6 +7396,18 @@ completely different input. The comparison is on the factor's values, through a
 hash computed once at staging, because memcmp of 32 KB a tensor a call is
 16 MB a token.
 
+**And the premise is not one model's.** `matvec_pair` is called with
+`(wq, wk, wv)` and with `(gate, up)` -- read off llama.c, not assumed -- and
+those are exactly the sets whose statistics have to match:
+
+```
+  Llama-3.2-1B   16 layers:  q == k == v in 16/16,  gate == up in 16/16
+  Qwen3-0.6B     28 layers:  q == k == v in 28/28,  gate == up in 28/28
+```
+
+Two architectures, 44 layers, byte-identical every time. It has to be: they
+read one activation and the statistic is a sum over that activation.
+
 ⚠ **Two things reading the diff caught, both real.** The first version let a
 group through when entry 0 carried a factor and entry 1 did not -- entry 1's
 weights were never scaled, so the shared input would have been multiplied by a
