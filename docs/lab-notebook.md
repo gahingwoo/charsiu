@@ -7120,3 +7120,35 @@ the vendor's file says, and now what an offline search says.
 from a 562-byte passage, and AWQ's real objective is the output error of the
 whole matmul under the activation covariance. The magnitude survives that
 approximation; the ranking does not.
+
+### ⚠ ffn_down: the block is 32 KB and k is the outer loop, the rest is unresolved
+
+`ffn_down` is 2048 x 8192 and scores 16.5% -- the noise floor -- under the
+k = 2048 layout, so it is a different one. The same window-mean probe puts its
+knee at **65536 codes = 32 KB**, and the excess there is 0.1852 against
+`sd(z)/sqrt(16)` = 0.1780 and `sd(z)/sqrt(8)` = 0.2518. So a block holds
+**16 rows and 4096 of the 8192 k**, not 8 rows and all of them.
+
+**k is the outer loop.** Regressing the 256 block means on candidate groupings:
+
+```
+  rows 16*(b%128).., k-half b//128    r = +0.52     <- k outer
+  rows 16*(b//2).., k-half b%2        r = -0.02     <- k inner
+  rows 8b..8b+7, whole k              r = +0.02
+  shuffled control                    r = +0.08
+```
+
+and every way of splitting k -- contiguous halves, even/odd k, even/odd 32-,
+512-, 1024-, 2048-chunks -- gives the same +0.52, because a row group's mean
+does not depend on which of its k are in the block. The statistic can see the
+row grouping and is blind to the k split.
+
+⚠ **+0.52 is not +1.0000, and I am not calling this solved.** Assigning each
+block to its nearest (row group, k half) slot puts 50 of 256 on the identity
+and uses only 177 distinct slots, with a mean error of 0.00039 against a slot
+spread of 0.186 -- so where it lands it lands hard, and where two groups have
+close means it cannot choose. The k = 2048 case had `r = 1.0000` and no
+ambiguity at all; this needs the code-level fit, not the mean-level one.
+
+What is banked for `ffn_down`: block 32 KB, 16 rows x 4096 k, k outer. What is
+not: the block order and everything inside the block.
