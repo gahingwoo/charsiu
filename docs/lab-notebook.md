@@ -6904,3 +6904,67 @@ that was never the winner of the noisy grid.
 ⚠ The board's 40.83 in the README was measured at 0.5 and has not been re-run.
 If the host's 14.7% transfers it lands near 35, which would be inside 31% of
 llama.cpp's own q4_0 rather than 53% -- but that is a prediction, not a result.
+
+### 🏁 The weight layout, 89% of the way, and the 11% that is not phase
+
+Guessing layouts was dead -- 336 candidates at the noise floor. Deriving one
+works much better, and the derivation has three steps, each of which is a
+measurement rather than a hypothesis.
+
+**1. The block is 16 output channels.** A row's codes average about its own
+zero point, so the spread of window means over a tensor says how many rows a
+window mixes. The excess over the sampling noise is flat at 0.179 from 1024
+codes up to 32768 and then falls as `1/sqrt(m)`:
+
+```
+  window     2048    8192   16384   32768   65536  131072
+  excess    0.1778  0.1783  0.1784  0.1786  0.1221  0.0844
+```
+
+The knee is exactly 32768 codes = 16 KB, and `sd(z)/sqrt(16)` is 0.195 against
+the 0.179 observed. Three tensors agree.
+
+**And which 16 is settled without any within-block knowledge**: block means
+survive any permutation inside the block, so the 128 observed block means can
+be regressed on the predicted ones. Contiguous 16-row groups give **r =
+1.0000**; a strided grouping gives −0.05 and a shuffled control −0.16.
+
+**2. The cycle is 512 codes.** Autocorrelation of window means, computed inside
+blocks so the boundary cannot manufacture a period: at a 64-code window the
+peaks are at lags 8, 16, 24, 32 (r 0.77); at 32 codes, lags 16 and 32 (0.72);
+at 16 codes, lag 32 (0.60). All three say 512.
+
+**3. Which row each of the 512 positions holds, fitted over all 128 blocks at
+once.** Every one of the 16 rows comes out used exactly 32 times, the margin
+between the best and second-best assignment has a median of 15.5 and a minimum
+of 9.07, and the residual is 0.2545 against a sampling noise of 0.2762. There
+is nothing ambiguous in it.
+
+⛔ **And the layout built from all that is 89% right, not right.** Rebuilt and
+scored against the file it reads 88.46% exact, which is what I first called the
+ceiling -- 12% of predicted codes sit within 0.06 of a rounding boundary, so
+88% looked like agreement. **It is not the ceiling, and the test that says so
+is stratifying by confidence:**
+
+```
+  |frac from a boundary|   0.00-0.05  0.05-0.15  0.15-0.25  0.25-0.35  0.45-0.50
+  exact match               89.33%     89.27%     89.25%     89.29%     81.08%
+```
+
+A correct mapping has to approach 100% at the confident end. It is **flat at
+89.3%**, so about one position in nine is mapped wrong for reasons that have
+nothing to do with my rounding -- and the disagreements are spread to +-3 and
+beyond, where a rounding flip can only ever be +-1.
+
+Scanning all 512 cycle phases against all 16 row rotations -- 1024
+combinations -- tops out at **89.28%**. So it is not the phase and it is not
+the row order.
+
+⛔ **The 53% "vendor effective weight error" this produced is retracted before
+it was used.** It is dominated by the 11% of mis-mapped positions, not by the
+vendor: on `blk.3.attn_q`, `s(P - z)` against the reference is 14.18% while
+`s(Q - z)` through this mapping is 50.37%, and the gap is the mapping.
+
+🔑 What is banked: the block is 16 output channels and contiguous, the cycle is
+512 codes, the row of each position is known. What is not: the k index inside a
+row's run.
