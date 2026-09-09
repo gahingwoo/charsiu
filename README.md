@@ -361,7 +361,12 @@ integer zero point per output row** -- the whole of K, 8192 wide on `ffn_down`.
 ```
 
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
-is worth more than that. ⚠ Six tensors of 112: the other 106 miss
+is worth more than that. Pricing the zero point on its own, over all 112
+tensors and with no vendor data in it, says the same thing from the other side:
+symmetric against asymmetric is 13.788% against 13.591% at group 1024 -- **1.4%
+for double the scale bytes** -- and only reaches 7% at group 32, which is the
+group charsiu cannot have because the group *is* the K slice. Their asymmetry
+is a consequence of their granularity, not an advantage over ours. ⚠ Six tensors of 112: the other 106 miss
 `(max - min)/scale = 15` by a per-tensor factor with per-row spread, which is
 what quantising **transformed** weights looks like, so the vendor's calibration
 is real, is in front of its quantiser, and is not yet identified. And this is a

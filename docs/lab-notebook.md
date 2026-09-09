@@ -6653,3 +6653,47 @@ had named the file the whole time.
 🔑 **Never name a scratch script after a stdlib module**, and `python3 -P`
 keeps the script's own directory off `sys.path` when the directory is not
 trusted. The scratchpad now has none: `sys.stdlib_module_names` is the check.
+
+### ⛔ The zero point, priced over all 112 tensors, and it is not worth taking
+
+The six-tensor table says the vendor's asymmetry is worth something, so the
+next question is what it would be worth to charsiu. Symmetric against
+asymmetric at every group size, same weights, no vendor data needed
+(`tools/rkllm_scales.py zero`, and the row arm's scale bytes are counted per
+tensor because its group is the tensor's own k -- 2048 on most of these and
+8192 on ffn_down):
+
+```
+                 weight error   bytes a weight
+  sym   row         15.297%         0.5015
+  asym  row         15.182%         0.5031        -0.8%
+  sym  1024         13.788%         0.5039
+  asym 1024         13.592%         0.5078        -1.4%
+  sym   512         12.800%         0.5078
+  asym  512         12.538%         0.5156        -2.0%
+  sym   128         10.848%         0.5312
+  asym  128         10.423%         0.5625        -3.9%
+  sym    32          8.826%         0.6250
+  asym   32          8.211%         0.7500        -7.0%
+```
+
+**At charsiu's shipped group of 1024 an asymmetric zero point buys 1.4%,** and
+it costs a second fp32 array -- double the scale memory -- plus a
+`zero * sum(a)` correction a group a row in the accumulate. The value grows as
+the group narrows and is 7% at 32, which is the group charsiu cannot have,
+because the group **is** the K slice and the read back is `m*n*ceil(K/KMAX)*4`.
+
+🔑 **So the vendor's asymmetry is a consequence of its granularity, not an
+advantage over ours.** They have one scale a row, so the zero point is the only
+cheap thing left to add; charsiu already spends those bytes on 2x the scales
+and gets more for them. Two rows of the same table:
+
+```
+  vendor    asym, one a row     15.18% of the way to their number
+  charsiu    sym, group 1024    13.79%
+```
+
+⚠ Weight error. The same caveat as everywhere above: this tree's own
+`CHARSIU_NPU_W4_CLIP` minimises this number and made KL worse. What it settles
+is the *cost side* -- 1.4% for double the scale bytes is not a trade worth
+making blind -- not the quality side.

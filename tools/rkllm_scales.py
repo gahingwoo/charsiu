@@ -37,6 +37,7 @@ Usage:
     rkllm_scales.py map      <model.rkllm> <ref.gguf>   find every scale array
     rkllm_scales.py verify   <model.rkllm> <ref.gguf>   test the derived map
     rkllm_scales.py compare  <model.rkllm> <ref.gguf>   vendor vs charsiu vs q4_0
+    rkllm_scales.py zero     x <ref.gguf>               price the zero point
 """
 import os
 import sys
@@ -216,12 +217,60 @@ def cmd_compare(rk, ref):
     return 0
 
 
+def cmd_zero(rk, ref):
+    """What an asymmetric zero point is worth to charsiu, at every group size.
+
+    No vendor data in it, so `rk` is ignored.  The answer is 1.4% at the group
+    charsiu ships and 7% at the group it cannot have -- the group IS the K
+    slice -- so the vendor's asymmetry follows from its granularity rather than
+    beating ours.
+
+    Pass --fast to score every fourth tensor, which reproduces the full run to
+    about a hundredth of a point and takes a quarter of the time.
+    """
+    step = 4 if "--fast" in sys.argv else 1
+    r = GGUFReader(ref)
+    # ⚠ The row arm's group is the tensor's own k, which is 2048 on most of
+    # these and 8192 on ffn_down, so its scale bytes are counted per tensor
+    # rather than assumed.  Quoting one group size for it would be a fiction.
+    groups = [("row", None), ("1024", 1024), ("512", 512),
+              ("128", 128), ("32", 32)]
+    arms = [(f"{k:4s} {lab:>4}", f, g)
+            for lab, g in groups for k, f in (("sym", sym), ("asym", asym))]
+    tot = {a: [0.0, 0.0] for a, _, _ in arms}
+    sbytes = {a: 0.0 for a, _, _ in arms}
+    nw_all = 0.0
+    n = 0
+    for i, t in enumerate(matrices(r)):
+        if i % step:
+            continue
+        w = dequant_q8(t).astype(np.float32)
+        nw = float(np.linalg.norm(w)) ** 2
+        rows, k = w.shape
+        n += 1
+        nw_all += rows * k
+        for a, f, g in arms:
+            gg = k if g is None else min(g, k)
+            tot[a][0] += float(np.linalg.norm(w - f(w, gg))) ** 2
+            tot[a][1] += nw
+            per = 8.0 if a.startswith("asym") else 4.0
+            sbytes[a] += per * rows * ((k + gg - 1) // gg)
+    print(f"{n} int4 matrices of {ref.rsplit('/', 1)[-1]}"
+          f"{'  (--fast: every 4th)' if step > 1 else ''}")
+    print(f"  {'arm':11s} {'error':>9}  {'bytes a weight':>15}")
+    for a, _, _ in arms:
+        print(f"  {a:11s} {np.sqrt(tot[a][0] / tot[a][1]) * 100:8.3f}%"
+              f"  {0.5 + sbytes[a] / nw_all:15.4f}")
+    return 0
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
         return 1
     cmd, rk, ref = sys.argv[1], sys.argv[2], sys.argv[3]
-    fn = {"map": cmd_map, "verify": cmd_verify, "compare": cmd_compare}.get(cmd)
+    fn = {"map": cmd_map, "verify": cmd_verify, "compare": cmd_compare,
+          "zero": cmd_zero}.get(cmd)
     if fn is None:
         print(__doc__)
         return 1
