@@ -7152,3 +7152,44 @@ ambiguity at all; this needs the code-level fit, not the mean-level one.
 
 What is banked for `ffn_down`: block 32 KB, 16 rows x 4096 k, k outer. What is
 not: the block order and everything inside the block.
+
+### 🏁 ffn_down solved too, and the whole file is readable
+
+The mean-level fit could not choose between block orders for `ffn_down`, so the
+code-level one did. Assuming its block is the same 16-row shape with k split in
+two, each of the 256 blocks was searched over the 128 row groups and 2 k halves
+by matching its codes:
+
+```
+  best match   median 93.43%      runner-up  median 18.07%
+  all 256 blocks over 80%,  256 distinct slots used -- a bijection
+```
+
+⚠ **And the order is neither of the two I would have written down.** It is not
+`(row group, k half)` and not `(k half, row group)`: it is **64 row groups at a
+time**, each superblock doing k-half 0 for all 64 and then k-half 1 for all 64.
+
+```
+  block   0..63    ->  groups  0..63, k half 0
+  block  64..127   ->  groups  0..63, k half 1
+  block 128..191   ->  groups 64..127, k half 0
+```
+
+**The first twelve blocks agree with all three orders**, which is exactly why I
+called it the identity from a twelve-row print and got 54.29% where the right
+one gives **98.99% on confident codes**. Look at where the candidates diverge,
+not at where they agree.
+
+### 🏁 So the vendor's own codes, over every tensor type
+
+```
+                                    weight error
+  vendor's own int4 codes              17.711%
+  charsiu group 1024, symmetric        13.981%   <- ships
+  llama.cpp q4_0, group 32              8.864%
+```
+
+43 tensors -- the ones whose scale still satisfies `(max - min)/15`, so the
+reference is what they quantised. Adding `ffn_down` moved the vendor's figure
+from 17.577% to 17.711%, which is the kind of agreement that says the new
+layout is the same quantiser and not a new fit.

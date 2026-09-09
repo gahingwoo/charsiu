@@ -350,15 +350,23 @@ so it is `w = scale * (q - zero)`, `q` in `[-8, +7]`, **one scale and one
 integer zero point per output row** -- the whole of K, 8192 wide on `ffn_down`.
 `tools/rkllm_scales.py` does this; it needs no board and no vendor runtime.
 
-**And on those six the vendor loses to what charsiu already ships:**
+**And the vendor loses to what charsiu already ships.** The int4 payload is
+mapped too -- `0x20DDA9C4`, 16 output channels a block, a 512-code cycle, the
+row and the k of every slot fitted from the file itself (`tools/rkllm_codes.py`,
+99.72% on a held-out third of the tensor) -- so this is their ACTUAL stored
+codes, not a re-derivation:
 
 ```
                                               weight error
-  vendor    one (scale, zero) a row, asym         15.84%
-  charsiu   group 1024, symmetric                 14.94%   <- ships
-  charsiu   one scale a row, symmetric            16.21%
-  llama.cpp q4_0, group 32, symmetric              8.98%
+  vendor's own int4 codes                          17.71%
+  charsiu   group 1024, symmetric                  13.98%   <- ships
+  llama.cpp q4_0, group 32, symmetric               8.86%
 ```
+
+over the 43 tensors whose scale still satisfies `(max - min)/15`, so the
+reference is what they quantised. Reading it the other way -- their
+`(scale, zero)` applied to charsiu's own rounding -- gives 15.84% against
+15.86% from their codes on the same tensor. Two routes, one number.
 
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
 is worth more than that. Pricing the zero point on its own, over all 112

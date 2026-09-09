@@ -26,7 +26,13 @@ and letting the first tensor of that shape fill the cache put blk.0.attn_q
 (rho 3.507) in charge of the 2048x2048 map and the whole table came back at
 279%: a mapping fitted to predictions that are wrong fits nothing.
 
-⛔ ffn_down (k = 8192) is NOT this layout -- it scores 16.5%, the noise floor.
+ffn_down (k = 8192) IS this layout with k split: its block is 32 KB rather than
+16 KB and holds 16 rows x 4096 k, with k as the OUTER loop -- blocks 0..127 are
+row groups 0..127 over k 0..4095, blocks 128..255 the same groups over
+k 4096..8191, and inside a block the 4096 k are two 2048-k blocks in a row.
+Searching each block over the 128 row groups x 2 halves picks the identity with
+a median 93.43% against a runner-up of 18.07%, all 256 blocks over 80%, and
+exactly 256 distinct slots used.
 
 RESULT, over the 41 tensors whose rho is within 5% of 1, so the reference IS
 what the vendor quantised:
@@ -142,12 +148,18 @@ def main():
         C = codes(off, rows * kd // 2).reshape(rows // 16, -1)
         maps[shape] = solve(P, C, min(48, rows // 16))
         print(f"  map for {shape} solved on {anch}")
+    #
+    # ffn_down: same block, k split in two and k on the OUTSIDE.  Built from
+    # the 2048-k map rather than solved again, and the block search that says
+    # so picks the identity at a median 93.43% against a runner-up of 18.07%.
+    #
+    rho2, kk2 = maps[(2048, 2048)]
+    maps[(2048, 8192)] = (rho2, np.concatenate([kk2, kk2 + 2048]))
     T = {x: [0.0, 0.0] for x in ("vendor", "chr1024", "q40")}
     print(f"{'tensor':24s} {'vendor':>9} {'chr1024':>9} {'q4_0/32':>9}  note")
     for L in range(16):
         for nm, n, k in S:
-            if k != 2048:
-                continue                    # ffn_down's layout is not this one
+            pass
             name = f"blk.{L}.{nm}.weight"
             off, rows, kd = WOFF[name]
             slot, _ = SLOT[name]
@@ -157,10 +169,28 @@ def main():
             P = np.clip(np.rint(W / s[:, None] + z[:, None]), -8, 7).astype(np.int8)
             C = codes(off, rows * kd // 2).reshape(rows // 16, -1)
             rho, kk = maps[(rows, kd)]
-            slots = C.shape[1]
-            rowidx = rho[np.arange(slots) % 512]
-            R = (np.arange(rows // 16)[:, None] * 16 + rowidx[None, :]).reshape(-1)
-            K = np.broadcast_to(kk[None, :], (rows // 16, slots)).reshape(-1)
+            if kd == 8192:
+                #
+                # 256 blocks of 16 rows x 4096 k.  The order is not
+                # (row group, k half) and not (k half, row group): it is 64
+                # row groups at a time, each superblock doing k-half 0 for all
+                # 64 and then k-half 1 for all 64.  Assuming the simpler order
+                # read 54.29% where this reads 98.99% on confident codes, and
+                # the tell was that the FIRST twelve blocks agree with both.
+                #
+                C = codes(off, rows * kd // 2).reshape(-1, 65536)
+                nb = C.shape[0]
+                rowidx = rho[np.arange(65536) % 512]
+                b = np.arange(nb)
+                gid = 64 * (b // 128) + (b % 128) % 64
+                hid = (b % 128) // 64
+                R = (gid[:, None] * 16 + rowidx[None, :]).reshape(-1)
+                K = (kk[None, :] + 4096 * hid[:, None]).reshape(-1)
+            else:
+                slots = C.shape[1]
+                rowidx = rho[np.arange(slots) % 512]
+                R = (np.arange(rows // 16)[:, None] * 16 + rowidx[None, :]).reshape(-1)
+                K = np.broadcast_to(kk[None, :], (rows // 16, slots)).reshape(-1)
             Q = np.zeros((rows, kd))
             Q[R, K] = C.reshape(-1)
             V = (Q - z[:, None]) * s[:, None]
