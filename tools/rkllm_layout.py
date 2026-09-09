@@ -155,7 +155,15 @@ def main():
     hits = xcorr_max(rk, pat, start, end)
     print("\n  correlation   nibble        byte offset   note")
     for c, i in hits:
-        print(f"  {c:+9.4f}   {i:>10d}   {start + i // 2:#012x}   "
+        #
+        # ⚠ i IS ALREADY ABSOLUTE. The whole-file version counted nibbles from
+        # `start` and printed `start + i // 2`; the streaming one seeds its
+        # cursor at `start * 2`, so adding it again put every hit outside the
+        # range that was searched. The correlations were right and the
+        # addresses were not, which is the kind of wrong that survives a
+        # glance at the top line.
+        #
+        print(f"  {c:+9.4f}   {i:>10d}   {i // 2:#012x}   "
               f"{'HIGH nibble first' if i % 2 else 'low nibble first'}")
     print("\n  |r| ~ 0.9  the tensor is here and stored in this order")
     print("  |r| < 0.1  it is not stored this way anywhere in the file")

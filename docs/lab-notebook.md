@@ -6800,3 +6800,75 @@ unrestricted run to the last digit and does, so the parse is not quietly
 excluding a layer. The controls before it are the same shape -- AWQ off and
 AWQ everywhere reproduce the recorded 114.2234 / 73.8760 to within 0.9% and
 0.15%, the residual being a corpus that differs slightly from that session's.
+
+### 🏁 The int4 payload, and the whole 1240 MB file closes with zero bytes left
+
+The last valid register command word ends at `0x20DDA980`, and `0x20DDA9C4` is
+the only offset near it for which the arithmetic is exact:
+
+```
+  0x20DDA9C4  +  112 matrices        486539264 B   = 464.0 MB
+              +  128256 x 2048 head  262668288 B   = 250.5 MB
+              =  1300605380                        = the file, to the byte
+```
+
+A layer is `2048*2048 + 512*2048*2 + 2048*2048 + 8192*2048*2 + 2048*8192`
+halved = **30408704 bytes**, sixteen of them is 486539264, and the region ends
+exactly where the head begins. Nothing is fitted here.
+
+**Confirmed without knowing the order, which is the point.** A tensor's int4
+CODE HISTOGRAM survives any permutation of its codes, and for the six tensors
+where `rho == 1` the histogram is predictable from the reference and the
+vendor's own `(s, z)`. `blk.3.attn_q`'s prediction against every 2 MB window of
+the 464 MB region:
+
+```
+  tv 0.00025   block 1392   0x264DA9C4   = layer 3, offset 0   <- what the map predicts
+  tv 0.00108   block 1395   ... 196608 into layer 3
+  tv 0.00123   block 4721   ... layer 10
+  median 0.01501, 1st percentile 0.00327
+```
+
+The best of 7393 windows is the predicted one, 13x better than the 1st
+percentile. So the weight region holds the same 112 tensors in the same order
+as the scale region, and the quantiser identity `w = s * (q - z)` is now
+confirmed against the actual stored codes rather than against a scale alone.
+
+### 🔑 The codes fill the grid the same way at rho 22.3 as at rho 1.000
+
+`rho = 22.3` on `blk.1.ffn_up` was the one number in the rho table that looked
+like a mistake: a scale 22x wider than the row's range would crush every code
+into 0 and +-1. It does not:
+
+```
+  tensor              code sd   |code| >= 4     rho
+  blk.3.attn_q          2.210      11.80%     1.000
+  blk.10.attn_q         2.221      12.20%     1.000
+  blk.1.ffn_up          2.153      10.91%    22.317
+  blk.1.ffn_gate        2.143      10.64%     4.300
+  blk.15.ffn_down       1.830       6.25%     0.802
+```
+
+**The vendor's scale fits whatever it quantised.** `rho` is the size of a real
+transform of the weights, not a badly chosen scale, and the doubt that the map
+might simply be wrong for the 106 is answered by the file itself.
+
+### ⛔ The order inside a tensor is still not known, and it had a fair run
+
+With the byte range confirmed, the haystack is 2 MB rather than 464, so a
+candidate order can be scored at a KNOWN offset with a single dot product and
+no search at all. Row major, column major, and four orderings across eight
+output tiles and six input tiles: **142 candidates on signs, 194 on code
+values, every one at the noise floor.** Best code correlation 0.023 against a
+floor of 0.002.
+
+charsiu hands the device row-major nibbles and the device computes correctly,
+so this is not the matmul weight layout -- it is the CONVOLUTION one, which is
+what the vendor's own register streams dispatch, and it is not a simple tiling
+of (output, input).
+
+⚠ And a bug the output caught rather than the number: `rkllm_layout.py` printed
+every hit at `start + i // 2` while the streaming rewrite had already seeded
+its cursor at `start * 2`, so the addresses landed outside the range that was
+searched. The correlations were right the whole time. A wrong address next to a
+right correlation survives a glance at the top line.

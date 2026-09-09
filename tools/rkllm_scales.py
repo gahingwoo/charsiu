@@ -39,6 +39,7 @@ Usage:
     rkllm_scales.py compare  <model.rkllm> <ref.gguf>   vendor vs charsiu vs q4_0
     rkllm_scales.py zero     x <ref.gguf>               price the zero point
     rkllm_scales.py rho      <model.rkllm> <ref.gguf>   where their calibration is
+    rkllm_scales.py weights  <model.rkllm> <ref.gguf>   locate + read the int4 codes
 """
 import os
 import sys
@@ -257,6 +258,81 @@ def cmd_rho(rk, ref):
     return 0
 
 
+# The int4 payload. Its start is not fitted: the last valid regcmd word ends at
+# 0x20DDA980, and 0x20DDA9C4 is the only nearby offset for which
+#   start + 112 matrices + 128256 x 2048 head  ==  the file size, exactly.
+INT4 = 0x20DDA9C4
+LAYER_BYTES = sum(n * k // 2 for _, n, k in
+                  [("attn_q", 2048, 2048), ("attn_k", 512, 2048),
+                   ("attn_v", 512, 2048), ("attn_output", 2048, 2048),
+                   ("ffn_gate", 8192, 2048), ("ffn_up", 8192, 2048),
+                   ("ffn_down", 2048, 8192)])
+
+
+def weight_map():
+    """Byte range of every matrix, same tensor order as the scales."""
+    m, at = {}, INT4
+    for L in range(LAYERS):
+        for suf, rows in ORDER:
+            k = 8192 if suf == "ffn_down" else 2048
+            m[f"blk.{L}.{suf}.weight"] = (at, rows * k // 2)
+            at += rows * k // 2
+    return m, at
+
+
+def cmd_weights(rk, ref):
+    """Confirm the weight map without knowing the order, then read the codes.
+
+    A tensor's CODE HISTOGRAM does not depend on how the codes are arranged, so
+    it locates a tensor through any permutation. For the six where rho == 1 the
+    histogram is predictable from the reference and the vendor's own (s, z),
+    and blk.3.attn_q's prediction matches the file at the offset this map
+    predicts with a total variation of 0.00025 -- the best of 7393 windows over
+    the whole 464 MB, 13x better than the 1st percentile.
+
+    ⛔ The ORDER inside a tensor is still unknown. Row major, column major and
+    4 orderings x 8 output tiles x 6 input tiles were scored at the confirmed
+    offset, on signs (142 candidates) and again on code values (194), and every
+    one sat at the noise floor -- best |r| 0.023 against a floor of 0.002.
+    charsiu hands the device row-major nibbles and it works, so this is the
+    CONVOLUTION weight layout, which is what the vendor dispatches.
+    """
+    mm = np.memmap(rk, dtype=np.uint8, mode="r")
+    wm, end = weight_map()
+    print(f"int4 payload {INT4:#x} .. {end:#x}, then the int8 head to EOF")
+    print(f"  head is {mm.size - end} B, and 128256 x 2048 is {128256 * 2048} "
+          f"-- {'EXACT' if mm.size - end == 128256 * 2048 else 'MISMATCH'}\n")
+    sig = region(rk)
+    r = GGUFReader(ref)
+    G = {t.name: t for t in r.tensors}
+    print(f"{'tensor':22s} {'byte':>12} {'code sd':>8} {'|c|>=4':>8} {'rho':>7}")
+    for name in ("blk.0.attn_q.weight", "blk.1.ffn_gate.weight",
+                 "blk.1.ffn_up.weight", "blk.1.ffn_down.weight",
+                 "blk.3.attn_q.weight", "blk.10.attn_q.weight",
+                 "blk.15.ffn_down.weight"):
+        off, nb = wm[name]
+        h = np.zeros(16, dtype=np.int64)
+        for o in range(off, off + nb, 1 << 22):
+            b = np.asarray(mm[o:min(o + (1 << 22), off + nb)])
+            h += np.bincount(b & 0xF, minlength=16)
+            h += np.bincount(b >> 4, minlength=16)
+        c = np.arange(16)
+        c = np.where(c > 7, c - 16, c)
+        o_ = np.argsort(c)
+        cc, hh = c[o_], h[o_] / h.sum()
+        sd = np.sqrt((hh * (cc - (hh * cc).sum()) ** 2).sum())
+        slot, rows = derived_map()[name]
+        w = dequant_q8(G[name])
+        rho = (15.0 * sig[slot:slot + rows]
+               / (w.max(axis=1) - w.min(axis=1))).mean()
+        print(f"{name:22s} {off:>12x} {sd:8.3f} "
+              f"{hh[np.abs(cc) >= 4].sum() * 100:7.2f}% {rho:7.3f}")
+    print("\n🔑 The codes fill the grid the SAME WAY at rho 22.3 as at rho 1.000,")
+    print("   so the vendor's scale fits whatever it quantised: rho is the size")
+    print("   of a real transform of the weights, not a badly chosen scale.")
+    return 0
+
+
 def cmd_zero(rk, ref):
     """What an asymmetric zero point is worth to charsiu, at every group size.
 
@@ -310,7 +386,8 @@ def main():
         return 1
     cmd, rk, ref = sys.argv[1], sys.argv[2], sys.argv[3]
     fn = {"map": cmd_map, "verify": cmd_verify, "compare": cmd_compare,
-          "zero": cmd_zero, "rho": cmd_rho}.get(cmd)
+          "zero": cmd_zero, "rho": cmd_rho,
+          "weights": cmd_weights}.get(cmd)
     if fn is None:
         print(__doc__)
         return 1
