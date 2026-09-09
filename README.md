@@ -368,6 +368,24 @@ reference is what they quantised. Reading it the other way -- their
 `(scale, zero)` applied to charsiu's own rounding -- gives 15.84% against
 15.86% from their codes on the same tensor. Two routes, one number.
 
+**And in perplexity, which is the column that was empty.** Three f16 ggufs
+that differ only in those 43 matrices -- same tokenizer, same embeddings, same
+head, same norms, no quantiser running at inference:
+
+```
+  the reference weights, untouched       19.8844
+  llama.cpp q4_0, group 32               20.0010    +0.59%
+  charsiu int4, group 1024               21.2288    +6.76%
+  the vendor's own stored int4 codes     22.1006   +11.14%
+```
+
+**The vendor's four-bit weights cost 11.1% of perplexity where charsiu's cost
+6.8%**, and the ordering is the same one the weight error gives. ⚠ 43 of 112
+matrices: the other 69 carry a calibration this cannot undo well enough to
+score (see the notebook -- attempting it produced a perplexity of 1701 and a
+matched-noise control at the same weight error produced 32, which is how the
+attempt was caught).
+
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
 is worth more than that. Pricing the zero point on its own, over all 112
 tensors and with no vendor data in it, says the same thing from the other side:

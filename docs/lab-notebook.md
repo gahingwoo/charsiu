@@ -7193,3 +7193,43 @@ not at where they agree.
 reference is what they quantised. Adding `ffn_down` moved the vendor's figure
 from 17.577% to 17.711%, which is the kind of agreement that says the new
 layout is the same quantiser and not a new fit.
+
+### 🏁 The empty cell, filled -- and the first attempt at it was wrong
+
+With the layout solved the vendor's weights can be written into a gguf and
+run, so the comparison stops being a weight norm and becomes a perplexity.
+Three f16 files differing only in the 43 matrices whose scale still satisfies
+`(max - min)/15` -- same tokenizer, embeddings, head and norms in all of them,
+and no quantiser running at inference:
+
+```
+  A  the reference weights, untouched       19.8844
+  D  llama.cpp q4_0, group 32               20.0010    +0.59%
+  C  charsiu int4, group 1024               21.2288    +6.76%
+  B  the vendor's own stored int4 codes     22.1006   +11.14%
+```
+
+**The vendor's four-bit weights cost 11.1% where charsiu's cost 6.8%**, and
+that is the same ordering the weight error gave -- 17.58% against 13.98%
+against 8.86%. Two independent metrics, one answer.
+
+⛔ **The first version of this read 1701 and was my own mistake.** Replacing
+all 112 matrices with `s(q - z) / c`, where `c` is the calibration recovered
+by division, gives a perplexity of **1700.98**. The median per-tensor weight
+error of what went into that file was 18.3%, and charsiu's own int4 at 13.9%
+scores 41 -- so the number was not credible and the question was whether 18.3%
+is simply that expensive.
+
+🔑 **The control answered it in one run.** A fourth file, the reference plus
+Gaussian noise scaled to the SAME per-tensor relative error, scores **32.10**.
+So the magnitude is worth 32 and the structure is worth 1701: the recovered
+`c` is wrong in a way a Frobenius norm barely charges for and a forward pass
+charges enormously -- a column scaled by the wrong factor is a systematically
+wrong channel, not a small perturbation.
+
+That is this tree's own recurring lesson arriving again from a new direction:
+**weight error and functional error are different things**, which is why
+`CHARSIU_NPU_AWQ_CLIP` minimises the first and made the second worse.
+
+⚠ So the cell is filled for 43 of 112 matrices. The other 69 need the vendor's
+actual calibration, not one recovered by dividing by a reference.
