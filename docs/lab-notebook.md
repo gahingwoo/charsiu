@@ -7233,3 +7233,73 @@ That is this tree's own recurring lesson arriving again from a new direction:
 
 ⚠ So the cell is filled for 43 of 112 matrices. The other 69 need the vendor's
 actual calibration, not one recovered by dividing by a reference.
+
+### 🏁 The calibration is not stored as a vector -- it is folded into the norm
+
+Their runtime has to know `c` to divide the activation by it, so `c` must be in
+the file. It is not: correlating a recovered 2048-vector against every f32
+alignment of the header and the whole float/table/register region tops out at
+**|r| = 0.20** where a hit would be 0.9 and the noise floor is 0.022.
+
+**Because AWQ does not divide at runtime -- it folds `1/c` into the preceding
+RMSNorm**, and that is exactly what the file shows:
+
+```
+                corr(vendor norm, ref)   corr(vendor norm, ref / c)
+  blk.1 ffn            0.7777                    0.9945
+  blk.9 attn           0.8406                    0.9914
+  blk.2 attn           0.8916                    0.9922
+  blk.3 attn           1.0000                    0.9905   <- c = 1 here
+```
+
+with the ratio `vendor_norm * c / ref_norm` at 0.9995 to 1.0000 throughout. And
+the other half of the same fact: **q, k and v of one layer share `c`**, which
+they must if it lives in `attn_norm` -- `corr(c_q, c_k)` is +0.996, +0.993,
++0.994, +0.990 across four layers.
+
+🔑 **So nothing has to be recovered.** Taking their norms with their weights
+makes `c` cancel by construction. Using the reference norms with their weights
+is what scored 1701.
+
+### 🏁 And a second gauge: a row factor on v and up, undone by o and down
+
+`gate` and `up` share `ffn_norm`, so they share `c` -- but their `rho` are 4.30
+and 22.32 in layer 1. The difference is a per-OUTPUT-ROW factor, and a row
+factor is absorbed by the per-row scale, so it is invisible in the codes and
+visible only in `s`. It has to be undone downstream, and only `up` can carry
+one: `gate` goes through SiLU, which a scalar cannot pass.
+
+```
+  corr(log(up/gate), -log(down))   +0.9933      up * down   median 1.009
+  corr(log(v/q),     -log(o))      +0.8387    (v/q) * o     median 1.024, 6%
+  corr(log q,         log k)       +0.9978    <- no extra gauge on q, k
+```
+
+**So the whole pipeline is described**: one activation-aware factor per input
+channel folded into the norm ahead of it, plus a row gauge on `v` and `up`
+cancelled by the columns of `attn_output` and `ffn_down`.
+
+### ⚠ The full-model rebuild is 58.76, and five tensors own it
+
+Their norms with their weights, all 112 matrices and 32 norms:
+
+```
+  reference                      19.8844
+  vendor, their norms too        58.7642
+```
+
+which is a long way from the 1701 the reference norms gave, and still a long
+way from the 22.10 the 43 clean matrices gave on their own. The effective
+weight error with the folding applied has a median of 21.5% and five tensors
+above 40%:
+
+```
+  blk.1.ffn_up      450.67%      blk.15.ffn_up    72.53%
+  blk.1.ffn_down     85.44%      blk.14.attn_v    44.07%
+  blk.15.ffn_down    43.96%
+```
+
+`blk.1` is where the row gauge is most extreme -- `up` at rho 22.3 against
+`down` at 0.298 -- so the residual is the gauge not being reconstructed
+exactly, not the quantiser. **The 11.14% figure stands on the 43 matrices that
+carry no gauge; the full-model number is not a measurement of their quality.**
