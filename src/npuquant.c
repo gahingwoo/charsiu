@@ -803,7 +803,17 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 *   ppl   68.86  65.84  65.12  68.02  75.52  76.36
 	 *
 	 * 65.12 against 76.36 is 14.7%, and the same ordering holds on the
-	 * shorter corpus at 200 tokens (68.07 against 73.77). Use 0.35.
+	 * shorter corpus at 200 tokens (68.07 against 73.77).
+	 *
+	 * ⚠ THE MINIMUM IS PER MODEL. Llama-3.2-1B, its own calibration, same
+	 * corpus and length: off 52.34, then
+	 *
+	 *   alpha  0.20   0.25   0.30   0.35   0.40   0.50   0.65
+	 *   ppl   43.86  46.98  52.55  50.58  52.95  68.26  92.42
+	 *
+	 * so its minimum is 0.20 and at 0.5 AWQ is WORSE THAN OFF. Sweep it
+	 * per model; what both models agree on is only that 0.5 is past the
+	 * minimum.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;

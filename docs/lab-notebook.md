@@ -6968,3 +6968,75 @@ vendor: on `blk.3.attn_q`, `s(P - z)` against the reference is 14.18% while
 🔑 What is banked: the block is 16 output channels and contiguous, the cycle is
 512 codes, the row of each position is known. What is not: the k index inside a
 row's run.
+
+### 🏁 The weight layout, solved — and the k index came out the same way the row did
+
+The 11% that phase and rotation could not fix was the k index, and guessing it
+was never going to work. Solving it does, and by the same move that gave the
+row: **at each slot the 128 blocks hand you 128 observed codes, and the row is
+already known, so matching that vector against the 2048 candidate columns is a
+fit with 128 samples and one answer.**
+
+```
+  best score        48/48       (a right k)
+  runner-up         16/48       (chance, with this code distribution)
+  margin >= 10      32712 of 32768 slots
+  distinct k        2048 of 2048, each chosen 14..18 times -- a bijection
+```
+
+**Held out properly**: solved on blocks 0..47, scored on rows 768..2047 which
+took no part in the fit --
+
+```
+  all codes                     98.79%
+  codes away from a boundary    99.72%
+  Q - P disagreements           -2: 851   -1: 13329   +1: 13506   +2: 1067
+```
+
+which is the rounding-boundary signature and nothing else. My own earlier
+"solved" claim read 88.46% and was flat at 89.3% across every confidence bin;
+this one climbs to 99.72% at the confident end, which is what a correct mapping
+has to do.
+
+⚠ **And the map has to be solved on a tensor the vendor did NOT transform.**
+Caching it by shape and letting the first tensor of that shape fill the cache
+put `blk.0.attn_q` (rho 3.507) in charge of the 2048x2048 map, and the table
+came back at 279%. A mapping fitted to predictions that are wrong fits nothing.
+The anchors are `blk.3.attn_q`, `blk.3.attn_k`, `blk.6.ffn_gate`.
+
+⛔ `ffn_down` (k = 8192) is not this layout: 16.5%, the noise floor.
+
+### 🏁 So the vendor's own codes, scored
+
+Over the 41 tensors whose `rho` is within 5% of 1 -- the ones where the
+reference IS what the vendor quantised:
+
+```
+  vendor's own stored codes    17.577%
+  charsiu group 1024           13.946%     <- what ships
+  llama.cpp q4_0, group 32      8.856%
+```
+
+and `blk.3.attn_q` alone reads **15.859%** here against the **15.843%** that
+came out of applying the vendor's `(scale, zero)` to charsiu's own rounding.
+Two independent routes, one number.
+
+### ⚠ AWQ's exponent: the minimum is per model, and 0.5 is past it on both
+
+Yesterday's sweep was one model. Llama-3.2-1B, its own calibration file
+(113 tensors), same corpus and length:
+
+```
+  off     0.20    0.25    0.30    0.35    0.40    0.50    0.65
+ 52.34   43.86   46.98   52.55   50.58   52.95   68.26   92.42
+```
+
+Llama's minimum is **0.20**, not qwen3's 0.35, and at **0.5 AWQ is worse than
+not running it at all** -- 68.26 against 52.34. The curve is not clean in the
+middle either (0.30 sits worse than 0.35), which is the same resolution limit
+as the grid that ranked the wrong cell.
+
+🔑 **So "use 0.35" was one model's answer and is withdrawn.** What both models
+support is narrower and more useful: the exponent has to be swept per model,
+and 0.5 -- the value every experiment in this tree used -- is on the wrong side
+of the minimum on both models tested, badly so on one.

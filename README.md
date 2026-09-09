@@ -393,8 +393,22 @@ minimum, and 0.5 is past it:
 
 qwen3, host CPU reference, 500 tokens. **65.12 against 76.36 is 14.7%**, and
 the ordering holds on the shorter corpus at 200 tokens too (68.07 against
-73.77). Use **0.35**. ⚠ The board number in the table above, 40.83, was
-measured at 0.5 and has not been re-run.
+73.77).
+
+⚠ **The minimum itself is per model, but 0.5 is past it on both.** The same
+sweep on Llama-3.2-1B, its own calibration, same corpus and length:
+
+```
+  off     0.20    0.25    0.30    0.35    0.40    0.50    0.65
+ 52.34   43.86   46.98   52.55   50.58   52.95   68.26   92.42
+```
+
+Llama's minimum is at **0.20**, and at 0.5 -- the value this tree has always
+used -- AWQ is **worse than not running it at all**, 68.26 against 52.34. So
+the transferable finding is not a number to adopt; it is that the exponent has
+to be swept per model and that 0.5 is the wrong end of the range on both
+models tested. ⚠ The board number in the table above, 40.83, was measured at
+0.5 and has not been re-run.
 
 `CHARSIU_NPU_AWQ` is that, and it took three fixes to work at all: the factor
 was never applied to the activation, then it collapsed in the quantiser on
