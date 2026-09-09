@@ -333,10 +333,41 @@ the evidence that the group is the cause:
   group 1024   49.89        group 256   38.97        group 128   36.33
 ```
 
-So the route is the vendor's: a coarse group and a calibrated quantiser. Their
-own `.rkllm` carries **one scale and one zero point per row** -- the whole of K,
-8192 wide on `ffn_down` -- and gets quality out of it by what it does to the
-weights before rounding them, not by storing more scales.
+So the route is the vendor's: a coarse group and a calibrated quantiser. That
+sentence used to be a belief and is now read out of their file. Correlating
+each tensor's per-row `max|w|`, taken from the same model in q8_0, against the
+`.rkllm`'s float region finds all 112 scale arrays tiling it with no gap and no
+overlap, in model order, and the record is `rows` fp32 scales followed by
+`rows` fp32 zero points. On six tensors the scale is the formula to four
+digits:
+
+```
+  blk.3.attn_q   (max - min) / scale = 14.9999 +- 0.0038
+  blk.15.attn_k                        15.0000 +- 0.0035
+```
+
+so it is `w = scale * (q - zero)`, `q` in `[-8, +7]`, **one scale and one
+integer zero point per output row** -- the whole of K, 8192 wide on `ffn_down`.
+`tools/rkllm_scales.py` does this; it needs no board and no vendor runtime.
+
+**And on those six the vendor loses to what charsiu already ships:**
+
+```
+                                              weight error
+  vendor    one (scale, zero) a row, asym         15.84%
+  charsiu   group 1024, symmetric                 14.94%   <- ships
+  charsiu   one scale a row, symmetric            16.21%
+  llama.cpp q4_0, group 32, symmetric              8.98%
+```
+
+At the same granularity the zero point is worth 2.3%, and charsiu's finer group
+is worth more than that. ⚠ Six tensors of 112: the other 106 miss
+`(max - min)/scale = 15` by a per-tensor factor with per-row spread, which is
+what quantising **transformed** weights looks like, so the vendor's calibration
+is real, is in front of its quantiser, and is not yet identified. And this is a
+weight error, not a perplexity -- `CHARSIU_NPU_W4_CLIP` minimises exactly this
+number and made KL worse. It narrows the empty cell in the table at the top; it
+does not fill it.
 
 `CHARSIU_NPU_AWQ` is that, and it took three fixes to work at all: the factor
 was never applied to the activation, then it collapsed in the quantiser on

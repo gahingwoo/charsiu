@@ -6502,3 +6502,154 @@ best-of-six can move 4% without anything changing.
 zero-sentinel in `poolread_min` (=0 meaning "always pool" was being replaced by
 the derived value) was caught by reading today's diffs before proposing this,
 not by any run.
+
+### ⛔ The 11.2 MB "fp16 SCALES" region was the REGISTER COMMAND STREAM
+
+Yesterday's entry put a scale array at 514.6 MB and described it as fp16, 90 to
+99% positive, "mostly powers of two", with "an obvious period of four". Every
+one of those observations is real and every one of them is an artefact of
+reading `u64` register writes as `fp16`:
+
+```
+  1c 40 01 00  00 00 01 10      reg 0x401c <- 0x00000001   target 0x1001 DPU
+  20 40 03 00  00 00 01 10      reg 0x4020 <- 0x00000003
+  24 40 3f 00  00 00 01 10      reg 0x4024 <- 0x0000003f       <- WIDE8
+  28 40 c0 15  00 00 01 10      reg 0x4028 <- 0x000015c0
+```
+
+The period of four is `u64` seen as four halves. The 96% positive is the two
+high halves being small. The "powers of two" mantissas are register numbers.
+**And the decoder was already in this tree** -- `tools/rkllm_regcmd.py` has had
+`[63:48] target [47:16] value [15:0] register` written at the top of it since
+the day it was written, and the region matches that layout at 95 to 98% over
+its whole 11.7 MB.
+
+🔑 **The tell I had and did not use: the group size came out non-integral.**
+Yesterday's own note says "dividing the count by the weights gives 165.7 or
+210.4 -- neither is an integer" and reads that as "the layout is a record".
+A non-integral count is also what "these are not scales" looks like, and the
+second reading costs nothing to test.
+
+### 🏁 The float region, and the vendor's int4 quantiser written down
+
+Sweeping two statistics over 505 to 527 MB -- the fraction of `f32` that is
+positive and smaller than 10, and the fraction of `u64` whose target field is
+one of the seven `rkllm_regcmd` knows -- separates the file cleanly:
+
+```
+        0 ..  7.47 MB    header + tokenizer
+     7.47 .. 508.47 MB   fp16 token embeddings, 128256 x 2048   (501.0 MB)
+   508.47 .. 512.10 MB   fp32 SCALES AND ZERO POINTS            (  3.6 MB)
+   512.10 .. 512.60 MB   fp32, all integral, signed
+   512.60 .. 514.15 MB   a table, 60 to 79% zero bytes
+   514.15 .. 525.90 MB   REGISTER COMMAND STREAMS               ( 11.7 MB)
+   525.90 .. 989.6  MB   packed int4 weights
+   989.6  .. 1240.4 MB   int8 output head
+```
+
+The embedding boundary is not fitted: 128256 x 2048 x 2 is 525336576 bytes and
+it ends exactly where the first scale begins, `0x1FC77DA0`.
+
+**The record is per tensor: `rows` fp32 scales, then `rows` fp32 zero points**,
+and each layer closes with two 2048-slot fp32 arrays (its two norms). So a
+layer is `2 * 23552 + 4096 = 51200` slots and the whole thing is a stride, not
+a search:
+
+```
+  blk.0.attn_q      122728        blk.1.attn_q      173928     +51200
+  blk.0.attn_k      126824        blk.2.attn_q      225128     +51200
+  blk.0.attn_v      127848        blk.3.attn_q      276328     +51200
+  blk.0.attn_output 128872        ...
+  blk.0.ffn_gate    132968
+  blk.0.ffn_up      149352
+  blk.0.ffn_down    165736
+  (two norms)       169832
+```
+
+Found by correlating each tensor's per-row `max|w|`, taken from the same model
+in q8_0, against the region -- 112 tensors, best offsets tiling it with no gap
+and no overlap, in model order. The zero points are exactly integral, range -5
+to +3, mean -0.50, and about half of them are zero.
+
+**The quantiser is `w = s * (q - z)` with `q` in `[-8, +7]`.** Both halves of
+that come from the data: `max/s + z` is 7.19 +- 0.34 and `min/s + z` is
+-8.20 +- 0.33, while the other sign convention, `w = s * (q + z)`, has four
+times the spread. And on six tensors the scale is the formula exactly:
+
+```
+  blk.3.attn_q    (max-min)/scale = 14.9999 +- 0.0038
+  blk.3.attn_k                      14.9998 +- 0.0030
+  blk.10.attn_q                     14.9999 +- 0.0040
+  blk.10.attn_k                     14.9999 +- 0.0032
+  blk.15.attn_q                     15.0000 +- 0.0035
+  blk.15.attn_k                     15.0000 +- 0.0035
+```
+
+Four digits, and the +-0.004 is q8_0's own rounding of `max` and `min`. So
+`scale = (max - min) / 15`, sixteen levels, asymmetric, **one scale and one
+integer zero point per output row**.
+
+### ⛔ And the first error table was scored against weights the vendor never saw
+
+The other 106 tensors do NOT satisfy that relation -- they come back at 3.5,
+7.1, 9.6, 18.2 with several percent of scatter. A per-tensor factor with
+per-row spread is what quantising **transformed** weights looks like, so the
+vendor has a calibration step in front of its quantiser and the reference in
+this tree is not what it quantised.
+
+I had already printed a 112-tensor table reading "vendor 23.667% against
+charsiu 13.788%" before checking that. It contained `blk.1.ffn_up 99.520%` --
+a reconstruction with no correlation to its input, which no shipped quantiser
+produces -- and that one cell is the whole table's retraction. **The number was
+the vendor's scales applied to weights they were not computed from.**
+
+⚠ The same run had a second thing wrong that the result did not show: the
+`vendor` and `vendor-sym` columns agreed to three decimals, and the reason is
+that `round(w/s + z) - z` is `round(w/s)` for integer `z`. The zero point is
+mathematically inert in that expression except where it moves the clip window.
+Two arms that cannot differ are not two arms.
+
+### 🏁 The six tensors that CAN be scored, and what they say
+
+Restricted to the six where the vendor's scale provably comes from these exact
+weights, all four quantisers on one set of weights:
+
+```
+                                      weight error
+  vendor    one (s, z) a row, asym        15.843%
+  charsiu   group 1024, symmetric         14.935%     <- what ships
+  charsiu   one scale a row, symmetric    16.209%
+  q4_0      group 32, symmetric            8.980%
+```
+
+**At equal granularity the vendor is 2.3% better than charsiu, and charsiu as
+it ships is 5.7% better than the vendor.** Their whole advantage at that
+granularity is the zero point, which is a thing charsiu can have.
+
+⚠ Six tensors of 112, weight error and not perplexity, and this tree already
+owns the counter-example to reading weight error as quality: `CHARSIU_NPU_W4_CLIP`
+minimises exactly this number and made KL worse, 0.0989 to 0.2084. It narrows
+the empty cell. It does not fill it.
+
+### ⚠ The int4 weights are not stored in the reference's order
+
+A sign correlation of `blk.0.ffn_gate` row 0 against every byte and nibble
+alignment of the 480 MB int4 region tops out at `|r| = 0.133`, which is the
+noise floor for a 2048-long pattern. Row major is dead; the weights are in some
+NPU-native order, which is what charsiu's own packer also has to produce.
+
+### ⛔ A scratch file called bisect.py power-cycled the board four times
+
+`scratchpad/bisect.py` is an old round script, and it shadows the stdlib
+`bisect` module. Anything run from that directory that reaches `random` or
+`tempfile` -- `from gguf import GGUFReader` does, through `gguf_writer` --
+executes it, and line 11 of it is `uart.usb_reset()`.
+
+So `import numpy; from gguf import ...` reset the board. The failure surfaced
+as `FATAL: no shell` printed by a script that contains no such string, and I
+spent four tool calls looking for a hook before reading the traceback, which
+had named the file the whole time.
+
+🔑 **Never name a scratch script after a stdlib module**, and `python3 -P`
+keeps the script's own directory off `sys.path` when the directory is not
+trusted. The scratchpad now has none: `sys.stdlib_module_names` is the check.
