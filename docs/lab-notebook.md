@@ -6872,3 +6872,35 @@ every hit at `start + i // 2` while the streaming rewrite had already seeded
 its cursor at `start * 2`, so the addresses landed outside the range that was
 searched. The correlations were right the whole time. A wrong address next to a
 right correlation survives a glance at the top line.
+
+### 🏁 AWQ's exponent was never swept, and 0.5 is on the wrong side of the minimum
+
+Every AWQ experiment in this tree pinned `CHARSIU_NPU_AWQ` at 0.5 -- the usual
+square root balance -- and moved the clamp. Sweeping the exponent instead, with
+the clamp at its default 2.0, qwen3 on the host CPU reference at 500 tokens:
+
+```
+  alpha   0.25    0.30    0.35    0.40    0.45    0.50
+  ppl    68.86   65.84   65.12   68.02   75.52   76.36     (AWQ off: 113.56)
+```
+
+A clean single minimum at **0.35**, and **65.12 against 76.36 is 14.7%**. The
+same ordering holds on the other corpus at 200 tokens -- 68.07 against 73.77 --
+so it is not one length or one passage.
+
+⚠ **And the first version of this measurement ranked the wrong cell.** The
+opening sweep was a 6 x 3 grid of alpha against clamp at 200 tokens, and its
+winner was `0.35 / 1.5` at 66.99. At 500 tokens that cell reads **75.44** and
+`0.35 / 2.0` -- third in the grid -- reads 65.12. The grid was not smooth
+either: `0.50 / 1.5` at 78.28 sat worse than `0.20 / 3.0` at 71.98, which is
+the shape of a statistic that cannot rank what it is being asked to rank.
+
+🔑 **199 scored positions cannot separate cells a few points apart, and the
+tell was in the surface, not in the numbers.** Holding the clamp at its default
+and sweeping one variable gave a curve with one minimum and no crossings, and
+that curve reproduces across both lengths. The cell that survived is the one
+that was never the winner of the noisy grid.
+
+⚠ The board's 40.83 in the README was measured at 0.5 and has not been re-run.
+If the host's 14.7% transfers it lands near 35, which would be inside 31% of
+llama.cpp's own q4_0 rather than 53% -- but that is a prediction, not a result.

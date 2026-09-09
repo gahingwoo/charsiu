@@ -790,8 +790,20 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * SmoothQuant trick, and here it costs one multiply a k on a vector of
 	 * 2048 and nothing on the hardware.
 	 *
-	 * CHARSIU_NPU_AWQ is the exponent, 0 for off and 0.5 for the usual
-	 * square root balance.
+	 * CHARSIU_NPU_AWQ is the exponent, 0 for off. 0.5 is the usual square
+	 * root balance and is what this tree used from the day the factor was
+	 * written; it is NOT the best value here.
+	 *
+	 * ⚠ THE EXPONENT WAS NEVER SWEPT. Every earlier experiment pinned it
+	 * at 0.5 and moved the clamp instead. Swept with the clamp held at its
+	 * default 2.0 -- qwen3, host CPU reference, 500 tokens -- it is a clean
+	 * single minimum and 0.5 is on the wrong side of it:
+	 *
+	 *   alpha  0.25   0.30   0.35   0.40   0.45   0.50
+	 *   ppl   68.86  65.84  65.12  68.02  75.52  76.36
+	 *
+	 * 65.12 against 76.36 is 14.7%, and the same ordering holds on the
+	 * shorter corpus at 200 tokens (68.07 against 73.77). Use 0.35.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;

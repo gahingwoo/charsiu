@@ -381,6 +381,21 @@ layer takes it to 73.77 -- **70% of the win on 11% of the layers**, with the
 other twenty-five keeping their grouped q/k/v calls. ⛔ Not a free lunch
 though: `3-27` on its own is still worth 19.3%.
 
+⚠ **And its exponent had never been swept.** Every experiment before today
+pinned `CHARSIU_NPU_AWQ` at 0.5 -- the usual square-root balance -- and moved
+the clamp instead. Held at the default clamp of 2.0 it is a clean single
+minimum, and 0.5 is past it:
+
+```
+  alpha   0.25    0.30    0.35    0.40    0.45    0.50
+  ppl    68.86   65.84   65.12   68.02   75.52   76.36
+```
+
+qwen3, host CPU reference, 500 tokens. **65.12 against 76.36 is 14.7%**, and
+the ordering holds on the shorter corpus at 200 tokens too (68.07 against
+73.77). Use **0.35**. ⚠ The board number in the table above, 40.83, was
+measured at 0.5 and has not been re-run.
+
 `CHARSIU_NPU_AWQ` is that, and it took three fixes to work at all: the factor
 was never applied to the activation, then it collapsed in the quantiser on
 every path, then the exponent turned out to be positive where AWQ needs
