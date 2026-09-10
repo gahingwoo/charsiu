@@ -8754,3 +8754,44 @@ experiment twice, at two different settings of everything else. It stays
 because it is the only way to ask the question at all, and because
 `attn_k=0`-style exclusions remain a legitimate thing to want -- but nobody
 should reach for it expecting the table's rows to add up.
+
+### 🏁🏁 The clamp default moves 2.0 → 6.0, and that is a third of the method
+
+The factor has two bounds and the clamp only acts while it is the tighter. At
+2.0 it binds from alpha 0.10 upward — across the whole useful range. 6.0 is
+inert wherever the exponent is usable (`1000^0.25 = 5.62`) and still bounds
+above it. Llama-3.2-1B, host CPU reference, AWQ off = 41.5289:
+
+```
+  alpha    hi=2.0    hi=6.0    hi=64     1000^alpha
+  0.20    35.2041   28.0368   28.0368     4.0   inert, identical to unclamped
+  0.25    38.3471   28.3271   28.3271     5.6   inert, identical to unclamped
+  0.35    42.3752   30.7736   29.9920    11.2
+  0.50    50.7341   41.4979   37.6820    31.6
+  0.65    72.1690   94.5806   79.7978    89.1
+```
+
+`host_awq` now reads **41.5289 / 41.5289 / 28.0368** where it read
+41.5289 / 41.5289 / 35.2041. The guard asserts relationships, not values, so it
+passes either way — which is why it was safe to move.
+
+⚠ **Everything AWQ-on recorded in this file before today was measured at 2.0**,
+and `CHARSIU_NPU_AWQ_CLAMP=2.0` reproduces it exactly — verified at 35.2041 to
+the last digit. The entries above are dated and state their settings, so they
+stay as written; what matters is that they remain recoverable, not that they
+match today's default.
+
+⚠ Nothing shipped moves: AWQ is off by default and the three carried controls
+are bit-identical.
+
+⚠ **I declined to move this default four times today** on reproducibility
+grounds. Two things changed: the measurement grew from the 5–7% I first thought
+to a third of the method, and the reproducibility argument turned out weaker
+than I was treating it — the guard is relational and every recorded number
+carries its settings. **A reason for not acting has to be re-checked when the
+measurement behind it changes**, or it becomes a habit wearing the clothes of a
+principle.
+
+⚠ The one row 2.0 wins is 0.65, where every arm is unusable. And the clamp is
+non-monotone there — hi=6.0 is worse than hi=2.0 AND worse than not clamping.
+Noted, not explained, off the map.
