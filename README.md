@@ -486,6 +486,23 @@ exactly the ones the method exists to protect. It is off by default: it needs a
 calibration pass, and a tensor carrying a factor cannot share a packed input,
 so grouped q/k/v drop to single calls and decode gets slower.
 
+⚠⚠ **It needs statistics and it will not invent them.** The factor is built
+from `mean |x_k|` over a calibration run, in two passes:
+
+```
+  CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_CALIB=model.gguf.awq \
+      charsiu_ppl model.gguf calibration.txt -n 150      # record
+  CHARSIU_NPU_AWQ=0.2 charsiu_run model.gguf ...          # use
+```
+
+The second line finds `model.gguf.awq` beside the model on its own;
+`CHARSIU_AWQ_STATS` overrides it. **Calibrate on different text from what you
+measure.** With no statistics at all `CHARSIU_NPU_AWQ` now declines and says
+so, because the fallback it used to take -- the column means of the weights --
+measured 41.53 off, 35.20 with statistics, and **58.35 with none**: 40% worse
+than leaving AWQ alone. `CHARSIU_NPU_AWQ_WEIGHTMEANS=1` keeps that variant
+reachable as the control it is.
+
 ⚠ **And AWQ is a four-bit method.** At eight bits the factor's divide happens
 in the quantiser and its cancelling multiply has nowhere to live, because the
 int8 path packs one absmax quantisation of the whole activation vector: board,

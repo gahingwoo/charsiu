@@ -7555,3 +7555,38 @@ names a file, because the environment still wins.
 ⚠ The fallback is also slow -- it reads every row of every tensor to average
 them -- which is why an arm measuring it takes several times as long as the
 arms that read a file.
+
+### 🏁 charsiu's own per-layer sensitivity, measured rather than inherited
+
+`CHARSIU_NPU_AWQ_LAYERS=0-2` came from the vendor's profile. charsiu's own is
+measurable directly: quantise exactly one layer's seven matrices to int4 group
+1024, leave every other weight at f16, and read the perplexity.
+
+```
+  reference f16                    19.8844
+  layer  0   21.4894  +8.07%       layer  8   19.9492  +0.33%
+  layer  1   21.4953  +8.10%       layer  9   20.1233  +1.20%
+  layer  2   20.4344  +2.77%       layer 10   20.0988  +1.08%
+  layer  3   20.6071  +3.63%       layer 11   20.2716  +1.95%
+  layer  4   20.2050  +1.61%       layer 12   20.2277  +1.73%
+  layer  5   20.6524  +3.86%       layer 13   19.8260  -0.29%
+  layer  6   19.9086  +0.12%       layer 14   19.8219  -0.30%
+  layer  7   20.0027  +0.59%       layer 15   20.3808  +2.50%
+```
+
+**Layers 0 and 1 carry 16.2 of the roughly 37 points on offer -- 44% of the
+damage from 12% of the layers** -- and 0 to 2 carry 51%. The vendor spends its
+calibration in the same place, which is now two independent reasons rather than
+one inherited one.
+
+🔑 **And the excesses are close to additive.** Layers 3 to 15 measured one at a
+time sum to 18.01%; measured together they are 19.74%. That is worth knowing
+before anyone reasons about a subset again.
+
+⚠ Layers 13 and 14 come out 0.3% BELOW the reference. That is not
+quantisation improving the model, it is the resolution of this statistic, and
+it is the scale at which any single-layer number here should be read.
+
+⚠ And sensitivity to four-bit weights is not the same question as where AWQ
+helps: AWQ helps where quantisation hurts AND the activations have outliers.
+This is a proxy for the second, measured on the first.
