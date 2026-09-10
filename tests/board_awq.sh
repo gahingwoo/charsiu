@@ -228,5 +228,26 @@ echo "⚠⚠ THE SURFACE MUST BE MONOTONE ON EACH SIDE OF ITS MINIMUM, AND ON TH
    extend the grid before naming it."
 
 echo
+echo "== arm 5: the factor's clamp, which costs 5-7% at the exponent you should use"
+# ⚠ THE HOST ALREADY ANSWERED THE QUALITY HALF and this arm is here for the
+# board's own quantiser, not to re-derive it. qwen3 71.7770 -> 67.9646 at
+# alpha 0.25 and Llama 32.5094 -> 30.1937 at 0.15, each at its own best
+# setting. The onset is dated: at alpha 0.10 hi = 2, 4 and 8 give 80.1066 to
+# the last digit, so nothing reaches the bound there.
+# ⚠ NOT BETTER EVERYWHERE. At 0.65 the narrow clamp wins on both models by 20%
+# and 8.8%, and between 0.25 and 0.5 the two models disagree. So this sweeps
+# rather than asserts.
+for c in 2.0 4.0; do
+	# shellcheck disable=SC2086
+	P=$(env $W4 CHARSIU_NPU_AWQ="$ALPHA" CHARSIU_AWQ_STATS="$STATS" 		CHARSIU_NPU_AWQ_CLAMP=$c 		"$PPL" "$M" "$E" -n 300 2>/dev/null | tail -1 |
+		grep -o 'ppl [0-9.]*' | awk '{print $2}')
+	printf '   clamp hi=%-5s alpha %s   ppl %s
+' "$c" "$ALPHA" "${P:-?}"
+done
+echo "⚠ The DEFAULT stays 2.0: every AWQ number on record was measured there,
+   and moving it silently would make all of them unreproducible. If the board
+   agrees with the host, that is a decision to take deliberately."
+
+echo
 echo "board_awq: $fail identity checks failed"
 exit "$fail"
