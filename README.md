@@ -407,12 +407,26 @@ run over exactly the same matrices, gives the same answer:
 **The vendor's four-bit weights cost about 1.7x what charsiu's cost**, measured
 three times over disjoint additions of tensors.
 
-⚠ Layer 1 is excluded from all three. It carries an extreme second gauge -- a
-per-output-row factor on `ffn_up` (rho 22.3) undone by `ffn_down`'s columns
-(rho 0.298) -- and with it in, the file reads 58.76 against 32.13 without. That
-step is the reconstruction, not their quantiser: layers 0 and 2 cost charsiu
-23.81 -> 26.67 as well, so the layers really are more sensitive, and only layer
-1 moves the vendor arm on its own.
+⚠ Layer 1 is excluded from all three, and it is excluded because it is an
+outlier rather than because it is unreadable. With it in, the file reads 58.76
+against 32.13 without. Swapping in that one layer on its own:
+
+```
+                        reference   charsiu   vendor
+  layer 1 alone           19.8844   21.4953   29.0294
+  layer 6 alone           19.8844   19.9086   20.1796
+  layer 1, its FFN only   19.8844      --     28.5822
+  layer 1, attention only 19.8844      --     19.9806
+```
+
+**It is their weights, not my reading of them.** The reconstruction is checked
+there and passes: with the calibration taken exactly from the folded norm,
+`V / (W * c)` is one number per row with 6.5% of spread -- the int4 floor --
+and `ffn_down`'s column factor times `ffn_up`'s row factor is 1.0131. What the
+bisect shows is that layer 1's damage is entirely in its FFN, which is exactly
+where the extreme gauge lives: `ffn_up` at rho 22.3 undone by `ffn_down` at
+0.298. **The gauge is not free -- it costs quality in the tensor that undoes
+it**, and charsiu pays +8.1% on that same layer where the vendor pays +46.0%.
 
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
 is worth more than that. Pricing the zero point on its own, over all 112
@@ -457,7 +471,49 @@ sweep on Llama-3.2-1B, its own calibration, same corpus and length:
  52.34   43.86   46.98   52.55   50.58   52.95   68.26   92.42
 ```
 
-Llama's minimum is at **0.20**, and at 0.5 -- the value this tree has always
+⚠⚠ **And 0.20 was that grid's FLOOR, not a minimum.** Swept downward on
+`tests/corpus` at 300 tokens, the same host CPU reference:
+
+```
+  alpha   off      0.05     0.10     0.15     0.20     0.35     0.50
+  ppl    41.5289  38.4906  33.7566  32.5094  35.2041  42.3752  50.7341
+```
+
+Unimodal, and **the good region extends below 0.20**: 0.10 and 0.15 both beat
+it by 4 to 8%. A best cell sitting on the boundary of a grid has a neighbour on
+one side only, and that is the whole tell.
+
+⚠⚠ **And the surface is NOT SMOOTH, which is the thing that matters here.** The
+same sweep on Qwen3-0.6B is not monotone, and the bump is real:
+
+```
+  alpha              off      0.10     0.15     0.20     0.25     0.35     0.50
+  long.txt  300 tok 110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
+  long.txt  500 tok    -      81.0273  89.9499  75.1107  70.8360  77.7245  80.7067
+  long2.txt 300 tok 153.8779 140.4129 148.4278 128.0319 117.6984 132.0993 118.6291
+```
+
+0.15 is **worse than 0.10 on an independent passage as well as on a longer run
+of the first one**, so it is a property of the transform and not of the sample.
+`charsiu_ppl` has no randomness in it; these weights really are worse at that
+exponent than at the one below it.
+
+⚠ And the same three rows separate what is real from what is not: 0.15 beats
+0.10 the wrong way in all three (+7.5%, +11.0%, +5.7%) and 0.25 is the minimum
+in all three, while **0.50 against 0.35 flips sign** (-0.4%, +3.8%, -10.2%) and
+is simply not resolved. Real structure and unrankable cells, in one row.
+
+🔑 **So a coarse grid cannot be interpolated and the optimum has to be searched
+rather than fitted.** A seven-point sweep can step straight over a spike, which
+is exactly what makes "the minimum is at X" a claim that needs a fine sweep
+around X and not just a longer one. Llama's grid was monotone, which is the
+absence of the tell rather than evidence of smoothness.
+
+**What is established: the good region for Llama runs 0.10 to 0.20** — all of
+which beat 0.20's neighbour above — and 0.5 is bad on both models. The exact
+point inside it is not resolved for either.
+
+At 0.5 -- the value this tree has always
 used -- AWQ is **worse than not running it at all**, 68.26 against 52.34. So
 the transferable finding is not a number to adopt; it is that the exponent has
 to be swept per model and that 0.5 is the wrong end of the range on both
@@ -472,6 +528,61 @@ exactly the ones the method exists to protect. It is off by default: it needs a
 calibration pass, and a tensor carrying a factor cannot share a packed input,
 so grouped q/k/v drop to single calls and decode gets slower.
 
+⚠⚠ **It needs statistics and it will not invent them.** The factor is built
+from `mean |x_k|` over a calibration run, in two passes:
+
+```
+  CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_CALIB=model.gguf.awq \
+      charsiu_ppl model.gguf calibration.txt -n 150      # record
+  CHARSIU_NPU_AWQ=0.2 charsiu_run model.gguf ...          # use
+```
+
+The second line finds `model.gguf.awq` beside the model on its own;
+`CHARSIU_AWQ_STATS` overrides it. **Calibrate on different text from what you
+measure.** With no statistics at all `CHARSIU_NPU_AWQ` now declines and says
+so, because the fallback it used to take -- the column means of the weights --
+measured 41.53 off, 35.20 with statistics, and **58.35 with none**: 40% worse
+than leaving AWQ alone. `CHARSIU_NPU_AWQ_WEIGHTMEANS=1` keeps that variant
+reachable as the control it is.
+
+⚠ **And the batched path applies it now rather than refusing.** For a day it
+refused: the factor rides on the activation, two places put it there, and the
+batched prefill was not one of them, so with AWQ on decode was right and
+prefill was not — and nothing in this tree could see it, because `charsiu_ppl`
+scores one token at a time unless `--batch` is passed. Refusing kept the answer
+and cost the batch on every tensor in the range. It goes on at the gather now,
+and the input reuse key had to learn about it: what a device's input buffer
+holds is `X` times **one tensor's** factor, q, k and v share one normed buffer,
+and every field that key had said "this is the same input". `CHARSIU_NPU_AWQ_BATCH=0`
+puts the refusal back.
+
+⚠⚠ **And the factor's CLAMP is costing 7% of AWQ at the exponent you should
+use.** `CHARSIU_NPU_AWQ_CLAMP` defaults to 2.0, so the factor lives in
+[0.5, 2]. Its onset is measurable: at alpha 0.10 the width makes no difference
+at all -- 80.1066 to the last digit at hi = 2, 4 and 8 -- and from 0.15 it
+does. At each model's own best setting:
+
+```
+  qwen3   71.7770 -> 67.9646   -5.3%   (both at alpha 0.25)
+  Llama   32.5094 -> 30.1937   -7.1%   (both at alpha 0.15)
+```
+
+**`CHARSIU_NPU_AWQ_CLAMP=4.0` is the better setting in the useful range**
+(0.10 to 0.25), on two models and two passages. ⚠ It is NOT better everywhere:
+at 0.65 the narrow clamp wins on both models, by 20% and 8.8%, so the clamp is
+protecting something real where the exponent is too large. Between 0.25 and
+0.5 the two models disagree.
+
+⚠ The default stays at 2.0 because every number on record was measured there,
+and moving it silently would make them all unreproducible.
+
+⚠ **The activation width is not where four bits hurt.** The int4 path tells the
+hardware sixteen-bit activations and then packs an eight-bit value into the
+high byte of the slot, so every quality number here is really w4a8.
+`CHARSIU_NPU_A16=1` fills the slot: Llama-3.2-1B, host CPU reference, **41.53
+against 40.70**. Two percent. Next to what AWQ or an eight-bit layer buys, the
+activation is not the problem at four bits.
+
 ⚠ **And AWQ is a four-bit method.** At eight bits the factor's divide happens
 in the quantiser and its cancelling multiply has nowhere to live, because the
 int8 path packs one absmax quantisation of the whole activation vector: board,
@@ -484,6 +595,33 @@ not lack.
 not a characterisation. What is not in doubt is the direction and the size:
 this was never measured before 2026-09-07, and "identical to the CPU loop" was
 carrying more weight in this file than it can hold.
+
+### Eight bits, on the two layers that need them
+
+The damage is not spread evenly over the layers. `CHARSIU_NPU_INT8_LAYERS=0-1`
+keeps the first two blocks at eight bits and leaves the rest at four:
+
+```
+                        int4 g1024   INT8_LAYERS=0-1   all int8   of the gap
+  Llama-3.2-1B            41.5289        26.0672       17.9772      65.6%
+  Qwen3-0.6B             110.0549        85.0878       45.1214      38.4%
+```
+
+The absolute fractions differ because the models have sixteen layers and
+twenty-eight, so the same two are 12.5% of one and 7.1% of the other. **The
+rate does not**: 65.6/12.5 is 5.2 and 38.4/7.1 is 5.4. The first two layers
+return about five times their share of the bytes on both. How far to go is
+model-dependent — Llama's next two return 0.68 and Qwen3's return 2.3 — so
+`0-1` is a defensible default on both and `0-3` is a judgement call.
+
+⛔ **It is host-side today.** `charsiu_npu_add` refuses an eight-bit tensor on
+a device opened for four, so those tensors take the CPU: slow, and right. The
+easy way round it is a trap and is written down so nobody takes it — an int8
+DEVICE reading int4 codes already works and ships, so a mixed model could just
+be opened as int8, and that gives **int8's bytes on the wire with a worse
+answer than all-int8**. The knob's whole value is int8's quality at int4's
+bandwidth. `tools/npu_mixed_test.c` asks the question the real fix rests on:
+does one open device alternate the two programs correctly?
 
 **What it changes, and it is less than it first looked.** The scoreboard, both
 formats, best of 6 at the same prompt lengths, same session:

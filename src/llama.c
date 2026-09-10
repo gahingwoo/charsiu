@@ -2631,6 +2631,35 @@ int llama_load(struct llama_model *m, const char *path)
 	if (gguf_open(&m->gguf, path) < 0)
 		return -1;
 
+	/*
+	 * ⚠ AWQ NEEDS A FILE AND NOTHING POINTED AT ONE.
+	 *
+	 * The factor is built from mean |x_k| recorded by a calibration pass
+	 * and read back through CHARSIU_AWQ_STATS. With that unset, npuquant
+	 * does not decline -- it falls back to the column means of the
+	 * WEIGHTS, which is the variant this project measured and rejected,
+	 * and it does so silently. So a model that carries its own calibration
+	 * beside it should not need the caller to say so.
+	 *
+	 * <model>.gguf.awq, next to the gguf. The environment still wins: this
+	 * only fills in when nobody has chosen.
+	 */
+	if (!getenv("CHARSIU_AWQ_STATS")) {
+		char sib[1024];
+		int len = snprintf(sib, sizeof(sib), "%s.awq", path);
+
+		if (len > 0 && (size_t)len < sizeof(sib)) {
+			FILE *f = fopen(sib, "rb");
+
+			if (f) {
+				fclose(f);
+				setenv("CHARSIU_AWQ_STATS", sib, 1);
+				fprintf(stderr, "charsiu: AWQ statistics found "
+					"beside the model, %s\n", sib);
+			}
+		}
+	}
+
 	gguf_get_str(&m->gguf, "general.architecture", arch, sizeof(arch));
 	/*
 	 * ⚠ qwen2 RUNS ON THE LLAMA GRAPH. Read out of the files rather than

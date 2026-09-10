@@ -26,6 +26,7 @@ LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_check $(BUILD)/charsiu_serve $(BUILD)/bench_batch \
      $(BUILD)/npu_gemm_test $(BUILD)/npu_slice_test $(BUILD)/npu_fp16_test \
+     $(BUILD)/npu_mixed_test $(BUILD)/out16_bound \
      $(BUILD)/npu_qpack_test $(BUILD)/npu_prep_cost $(BUILD)/npu_job_cost $(BUILD)/charsiu_shapes $(BUILD)/npu_out_fmt \
      $(BUILD)/charsiu_matmul $(BUILD)/npu_fence_scan \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
@@ -207,6 +208,12 @@ $(BUILD)/npu_slice_test: tools/npu_slice_test.c $(LLM) | $(BUILD)
 $(BUILD)/npu_fp16_test: tools/npu_fp16_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
+$(BUILD)/npu_mixed_test: tools/npu_mixed_test.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/out16_bound: tools/out16_bound.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
 $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
@@ -230,6 +237,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
+	./tests/corpus_fixed.sh
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm

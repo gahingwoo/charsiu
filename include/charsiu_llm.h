@@ -212,6 +212,10 @@ struct npu_tensor {
 	 * read-modify-write one shared byte.
 	 */
 	int8_t *q;
+	int packed;        /* two codes a byte -- a property of THIS tensor's
+			    * width, not of the process. It used to be
+			    * npu_q_packed(), one global bool, which is why
+			    * mixing widths meant nothing packed at all. */
 	float *scale;      /* n * ngroup, per output channel per k group */
 	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	float *kscale;     /* k, a factor shared by every channel; NULL when off */
@@ -344,7 +348,7 @@ int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
-			     unsigned long *misses, unsigned long why[4]);
+			     unsigned long *misses, unsigned long why[5]);
 /* input reuse is on unless CHARSIU_NPU_REUSE=0: matmul_same packs like matmul without it */
 int  charsiu_npu_reuse_on(void);
 /* whether batched calls overlap the two cores, and why (the rail and clock against the vendor's OPP) */

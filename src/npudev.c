@@ -45,10 +45,19 @@
  * The quantiser holds an int4 weight in HALF a byte -- 298.0 MB of q on
  * Qwen3-0.6B rather than 596.0, and 1861.2 rather than 3722.4 on Phi-3.5-mini
  * -- laid out row major, ((k + 1) / 2) bytes a row, low nibble first. The long
- * note over npu_q_packed in src/npuquant.c has the layout and, more
- * importantly, why "is it packed" is ONE process wide bool rather than anything
- * per tensor: this file only holds t->name, and two files disagreeing by a
- * nibble about the same buffer is a wrong answer that reads as a right one.
+ * note over npu_q_packed in src/npuquant.c has the layout.
+ *
+ * ⚠ IT IS t->packed NOW, NOT A PROCESS WIDE BOOL, and this paragraph used to
+ * say the opposite and give the reason: two files disagreeing by a nibble
+ * about the same buffer is a wrong answer that reads as a right one, and
+ * this file only had t->name to decide with. The answer to that was not to
+ * keep one global bool, it was to put the width on the TENSOR both files
+ * already share -- so they cannot disagree, and a model with eight bits on
+ * two layers stops paying a byte a code on the other fourteen.
+ *
+ * npu_q_packed() still exists and is still process wide. It answers a
+ * different question -- what the quantiser is about to produce -- and
+ * anything reading an EXISTING buffer wants npu_q_stride_t and t->packed.
  *
  * Declared here rather than in charsiu_llm.h because the width q is held at is
  * the quantiser's business and nothing outside these two files reads it.
@@ -63,6 +72,7 @@
  */
 int npu_q_packed(void);
 size_t npu_q_stride(uint64_t k);
+size_t npu_q_stride_t(const struct npu_tensor *t);
 
 /* one int4 code out of a packed row of t->q, by column */
 static inline int q_code(const int8_t *row, uint64_t i)
@@ -434,7 +444,8 @@ struct charsiu_npu {
 	 * round does not have to guess which: dropped, a different X, a
 	 * different shape, or this device not holding the K slices asked for.
 	 */
-	unsigned long reuse_why[4];   /* dropped, other X, other shape, slices */
+	unsigned long reuse_why[5];   /* dropped, other X, other shape, slices,
+				       * other AWQ factor */
 	size_t bin_stride, bout_stride;
 	/* the output buffers, one per geometry rather than one per tensor:
 	 * see the comment on struct npu_outbuf */
@@ -890,8 +901,18 @@ struct charsiu_npu {
 	 * argued about.
 	 */
 	int kwide_only;
-	/* one message per REASON; the pointer identifies it, see whine() */
-	const char *whined[8];
+	/*
+	 * one message per REASON; the pointer identifies it, see whine()
+	 *
+	 * ⚠ IT HAS TO BE BIGGER THAN THE NUMBER OF REASONS. whine() records a
+	 * message only if there is room, and a message it could not record is
+	 * one it can never recognise again -- so past the end of this table
+	 * the dedupe stops and the reason prints on EVERY call, which on a
+	 * prefill is a line per tensor per row. There were 8 slots against 28
+	 * call sites, so the last twenty were only quiet by never being the
+	 * first eight to fire. 32 covers every site with room to add.
+	 */
+	const char *whined[32];
 	unsigned n_whined;
 	int serialpack;
 	/*
@@ -2317,8 +2338,8 @@ static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 	 * byte, and the two are free to differ -- which they do whenever a
 	 * caller forces int8 on the device while the quantiser is at four bits.
 	 */
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(w->t->k);
+	const int pk = w->t->packed;
+	const size_t stride = npu_q_stride_t(w->t);
 
 	for (uint64_t r = r0; r < r0 + nr; r++) {
 		const int8_t *src = w->t->q + (size_t)(w->n0 + r) * stride;
@@ -2358,8 +2379,8 @@ static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 static void slice_wsum(const struct npu_tensor *t, unsigned n0, unsigned n,
 		       unsigned k0, unsigned k, int32_t *wsum)
 {
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(t->k);
+	const int pk = t->packed;
+	const size_t stride = npu_q_stride_t(t);
 
 	for (unsigned r = 0; r < n; r++) {
 		const int8_t *src = t->q + (size_t)(n0 + r) * stride;
@@ -2387,8 +2408,8 @@ static void slice_wsum(const struct npu_tensor *t, unsigned n0, unsigned n,
  */
 static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
 {
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(t->k);
+	const int pk = t->packed;
+	const size_t stride = npu_q_stride_t(t);
 	size_t per = ((size_t)t->k + 1) / 2;
 	unsigned nc = (unsigned)t->n - n0;
 
@@ -2704,6 +2725,25 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	if (t->n > g->max_n) {
 		whine(g, "wider than the device was opened for", (unsigned)t->k,
 		      (unsigned)t->n);
+		return -1;
+	}
+	/*
+	 * ⚠⚠ EIGHT BIT WEIGHTS ON A FOUR BIT DEVICE, WHICH IS NEW.
+	 *
+	 * The note over slice_wsum has the other direction and says it is
+	 * handled: an int8 DEVICE reading int4 codes out of a packed q, which
+	 * every batching caller creates. CHARSIU_NPU_INT8_LAYERS creates the
+	 * direction nobody has: a tensor whose q is one byte a code staged onto
+	 * a device opened for four, where the register program and the
+	 * activation pack are both g->w4's.
+	 *
+	 * Nothing here can be reached from a host without an NPU, so this is
+	 * refused rather than guessed at. Refusing puts those tensors on the
+	 * CPU -- slow, and right. Dispatching a mixed model is a board round.
+	 */
+	if (g->w4 && !t->packed) {
+		whine(g, "eight bit weights on a device opened for four",
+		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
 	/*
@@ -5105,30 +5145,40 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 	}
 	/*
-	 * ⚠⚠ AWQ'S FACTOR IS NOT APPLIED ON THIS PATH, AND NOTHING SAID SO.
+	 * ⚠⚠ AWQ'S FACTOR WAS NOT APPLIED ON THIS PATH, AND NOTHING SAID SO.
 	 *
 	 * npuquant scales the weights by kscale[k] and leaves the inverse for
-	 * the caller to put on the ACTIVATION. Two places do it: the single
-	 * matvec, and -- since today -- a group whose members share one factor.
-	 * This one does not. `kscale` appeared exactly twice in this file and
-	 * neither occurrence was here, so a batched prefill with
-	 * CHARSIU_NPU_AWQ set multiplied scaled weights by an unscaled input.
+	 * the caller to put on the ACTIVATION. Two places did it: the single
+	 * matvec, and a group whose members share one factor. This one did
+	 * not. `kscale` appeared exactly twice in this file and neither
+	 * occurrence was here, so a batched prefill with CHARSIU_NPU_AWQ set
+	 * multiplied scaled weights by an unscaled input.
 	 *
 	 * charsiu_npu_add's own note says "paths that cannot, refuse" and
-	 * prices the failure -- ppl 75.17 off against 65233808 on. This is the
-	 * refusal that sentence describes, and it had never been written.
+	 * prices the failure -- ppl 75.17 off against 65233808 on. That
+	 * refusal had never been written; it was written, and it cost the
+	 * batch on every AWQ tensor.
 	 *
-	 * Nothing shipped wrong, because AWQ is off by default. With it on,
-	 * decode was right and prefill was not, and no measurement in this
-	 * tree would have caught it: charsiu_ppl scores one token at a time
-	 * unless --batch is passed.
+	 * ⚠ IT NOW APPLIES THE FACTOR INSTEAD, at the gather, which is the
+	 * fix the refusal's own note asked for. Three things had to move:
 	 *
-	 * Refusing costs the batch and keeps the answer. Applying the factor
-	 * here is the better fix and needs the board, because this path does
-	 * not exist on the host.
+	 *   - the gather is no longer optional when kscale is set, because
+	 *     the packer reads X directly on the shipped w4 shape and there
+	 *     is nowhere to put a scaled copy but bscr;
+	 *   - the branch below that packs straight from X takes !ks, since
+	 *     the condition it mirrors is no longer its complement;
+	 *   - the reuse key carries kshash, because the bytes in a device's
+	 *     BO are X times ONE TENSOR'S factor and every other field of
+	 *     that key said hit. reusekey.h has the whole of that.
+	 *
+	 * ⚠ CHARSIU_NPU_AWQ_BATCH=0 PUTS THE REFUSAL BACK, so one binary runs
+	 * both arms. With AWQ off there is no kscale and neither arm does
+	 * anything; the point of the switch is that the board can price the
+	 * batch against a known-correct row-at-a-time fallback without a
+	 * rebuild, and go back to it if prefill and decode disagree.
 	 */
-	if (g->ent[id].t->kscale) {
-		whine(g, "AWQ's factor has no place to go on the batched path",
+	if (g->ent[id].t->kscale && !charsiu_env_flag("CHARSIU_NPU_AWQ_BATCH", 1)) {
+		whine(g, "AWQ's factor is applied a row at a time by request",
 		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
 		return -1;
 	}
@@ -5419,6 +5469,14 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * packed nor read, and its key is left describing what is there.
 	 */
 	uint8_t zp = g->slot[e->first].job.input_zero_point;
+	/*
+	 * AWQ's per-k factor, or NULL. It is a property of the TENSOR, so it
+	 * is read once here and not per device or per slice; kshash is what
+	 * the reuse key compares, and npuquant leaves it 0 when kscale is
+	 * NULL, so the key needs no branch of its own.
+	 */
+	const float *ks = e->t->kscale;
+	uint64_t ksh = e->t->kshash;
 
 	/*
 	 * ⚠⚠ A LEADER DROPS EVERY KEY FIRST, on the devices this tensor will
@@ -5439,7 +5497,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			if (g->slot[e->first + i].di == d)
 				need |= 1u << (i / e->n_slices);
 		int reuse = g->reuse_ask &&
-			    reuse_key_hit(&g->bin_key[d], X, m, e->t->k, zp, need);
+			    reuse_key_hit(&g->bin_key[d], X, m, e->t->k, zp,
+					  need, ksh);
 
 		if (g->reuse_ask) {
 			const struct reuse_key *bk = &g->bin_key[d];
@@ -5455,6 +5514,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				else if (bk->m != m || bk->k != e->t->k ||
 					 bk->zp != zp)
 					g->reuse_why[2]++;
+				else if (bk->ksh != ksh)
+					g->reuse_why[4]++;
 				else
 					g->reuse_why[3]++;
 			}
@@ -5569,13 +5630,30 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
 			 * binary can run both arms in one session.
 			 */
-			if (!g->w4 || sk != e->t->k || pack_gather()) {
+			/*
+			 * ⚠ AND ALWAYS WHEN AWQ IS ON, because the scaled
+			 * activation has to live somewhere and X is the
+			 * caller's. This is the gather's other job: it is the
+			 * only buffer on this path that the pack may write
+			 * through, so the factor goes on as the columns are
+			 * copied rather than in a pass of its own.
+			 */
+			if (!g->w4 || sk != e->t->k || pack_gather() || ks) {
 				double tg = now_us();
 
-				for (unsigned r = 0; r < m; r++)
-					memcpy(g->bscr + (size_t)r * sk,
-					       X + (size_t)r * e->t->k + s->k0,
-					       sk * sizeof(*g->bscr));
+				for (unsigned r = 0; r < m; r++) {
+					const float *xr = X + (size_t)r * e->t->k
+							+ s->k0;
+					float *dr = g->bscr + (size_t)r * sk;
+
+					if (!ks) {
+						memcpy(dr, xr,
+						       sk * sizeof(*dr));
+						continue;
+					}
+					for (unsigned kk = 0; kk < sk; kk++)
+						dr[kk] = xr[kk] * ks[s->k0 + kk];
+				}
 				g->bgather_us += now_us() - tg;
 			}
 			double tpc = now_us();
@@ -5648,8 +5726,13 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						   (uint8_t *)g->bin[d][bin_idx(g, ki)].map
 						   + bin_off(g, ki),
 						   g->bin_stride, s->job.input_zero_point);
-			} else if (sk == e->t->k && !pack_gather()) {
-				/* the slice is the whole row, so k0 is 0 */
+			} else if (sk == e->t->k && !pack_gather() && !ks) {
+				/* the slice is the whole row, so k0 is 0.
+				 * ⚠ !ks BECAUSE THIS IS NO LONGER THE
+				 * COMPLEMENT OF THE GATHER ABOVE: with AWQ on
+				 * the gather ran and wrote the scaled copy,
+				 * and this branch would pack the caller's
+				 * unscaled X straight past it. */
 				pack_f16_pooled(g, &mm, X, e->t->k,
 						(uint8_t *)g->bin[d][bin_idx(g, ki)].map
 						+ bin_off(g, ki),
@@ -5718,7 +5801,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * nothing, and the key must not claim otherwise.
 		 */
 		if (!reuse && done_ki)
-			reuse_key_set(&g->bin_key[d], X, m, e->t->k, zp, done_ki);
+			reuse_key_set(&g->bin_key[d], X, m, e->t->k, zp,
+				      done_ki, ksh);
 		if (!nt)
 			continue;
 		tp = now_us();
@@ -6219,11 +6303,11 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 }
 
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
-			     unsigned long *misses, unsigned long why[4])
+			     unsigned long *misses, unsigned long why[5])
 {
 	*hits = g ? g->reuse_hits : 0;
 	*misses = g ? g->reuse_misses : 0;
-	for (unsigned i = 0; i < 4; i++)
+	for (unsigned i = 0; i < 5; i++)
 		why[i] = g ? g->reuse_why[i] : 0;
 }
 
@@ -6298,13 +6382,36 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (unsigned gi = 1; gi < n; gi++) {
 		const struct npu_tensor *ti = g->ent[ids[gi]].t;
 
-		if ((ti->kscale != NULL) != (gks != NULL))
+		if ((ti->kscale != NULL) != (gks != NULL)) {
+			whine(g, "a group where only some tensors carry an AWQ "
+				 "factor cannot share one packed input",
+			      (unsigned)gt0->k, (unsigned)gt0->n);
 			return -1;
-		if (gks && ti->kshash != gt0->kshash)
+		}
+		if (gks && ti->kshash != gt0->kshash) {
+			whine(g, "a group whose AWQ factors differ cannot "
+				 "share one packed input",
+			      (unsigned)gt0->k, (unsigned)gt0->n);
 			return -1;
+		}
 	}
-	if (gks && !g->awqshare)
+	/*
+	 * ⚠⚠ AND IT SAYS SO. This refusal was SILENT, and a board arm that
+	 * measures CHARSIU_NPU_AWQ_SHARE=0 against =1 has no way to tell "the
+	 * knob did nothing because sharing was refused for another reason"
+	 * from "the knob did nothing because it changes nothing" -- the tokens
+	 * are identical either way and that is the whole result being claimed.
+	 *
+	 * tests/board_awq.sh reads these lines as the positive tell that the
+	 * arm ran at all. A silent refusal is exactly what made AWQ's two
+	 * wrong-answer paths invisible for as long as they were there.
+	 */
+	if (gks && !g->awqshare) {
+		whine(g, "a tensor with an AWQ factor does not share a packed "
+			 "input unless CHARSIU_NPU_AWQ_SHARE=1",
+		      (unsigned)gt0->k, (unsigned)gt0->n);
 		return -1;
+	}
 	charsiu_note("a group: checking the entries", (unsigned long)n,
 		     (unsigned long)a->n);
 	e0 = &g->ent[ids[0]];

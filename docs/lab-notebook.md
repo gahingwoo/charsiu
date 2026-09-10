@@ -7458,3 +7458,1095 @@ one describing a check that does.
 The refusal is now written. It costs the batch and keeps the answer. Applying
 the factor on that path is the better fix and needs the board, because the path
 does not exist on the host.
+
+### 🏁 Layer 1 is theirs, and the gauge is what costs it
+
+The full-model 58.76 was attributed to "the reconstruction, not their
+quantiser". **That was wrong and the check that says so is the one that should
+have been run first**: take the calibration exactly, from the folded norm,
+rather than fitting it.
+
+```
+  V / (W * c), one number a row, spread within a row
+    blk.1.ffn_up     r = 5.4668     6.5%      blk.3.attn_q   r = 1.0024   6.8%
+    blk.1.ffn_gate   r = 1.0093     6.5%      blk.6.ffn_up   r = 1.0571   6.0%
+```
+
+Uniform at 6 to 8% everywhere including layer 1 -- that is the int4 floor and
+nothing else. And the two halves of the gauge multiply out:
+
+```
+  layer      r median   d median   d * r     spread
+      0        1.2884     0.7829   1.0054      3.6%
+      1        5.4668     0.1842   1.0131      4.5%
+     15        1.6480     0.6078   1.0057      4.1%
+```
+
+So the reconstruction is right, `c` is right, and the gauge cancels. Swapping
+one layer at a time then says where the cost is:
+
+```
+                        reference   charsiu   vendor
+  layer 1 alone           19.8844   21.4953   29.0294    +8.1%  vs  +46.0%
+  layer 6 alone           19.8844   19.9086   20.1796    +0.1%  vs   +1.5%
+  layer 1, FFN only       19.8844      --     28.5822          +43.7%
+  layer 1, attention only 19.8844      --     19.9806           +0.5%
+```
+
+**Layer 1's damage is entirely in its FFN**, which is where the extreme gauge
+is. `ffn_up` carries r = 5.47 and `ffn_down` undoes it at 0.184, and the row
+gauge only spreads 2.5x across `ffn_up`'s rows -- so it is not a wild spread,
+it is that `ffn_down` must now cover the gauge's variation on top of its own
+column variation with one int4 scale a row.
+
+🔑 **The gauge is not free. It costs quality in the tensor that undoes it**, and
+it is the vendor's own design choice. charsiu pays +8.1% on that layer where
+they pay +46.0%.
+
+⚠ And the earlier sentence was the residual-as-measurement mistake in another
+costume: "58.76 minus 32.13 is layer 1, and layer 1 is where my reconstruction
+is least sure, so it must be mine." Both halves were true and the conclusion
+was not.
+
+### ⚠ AWQ with no statistics does not decline -- it runs the refuted variant
+
+`CHARSIU_NPU_AWQ=0.5` is what the README documents, and on its own it does not
+do what the README describes. `npuquant` reads the activation statistics from
+`CHARSIU_AWQ_STATS`, and when that is unset -- or when the tensor is not in the
+file -- it falls through to **the column means of the weights**, silently.
+
+That is the variant this tree already measured and rejected. Its own note says
+why: "the weights worth protecting are the ones multiplying LARGE ACTIVATIONS,
+so the factor is built from mean |x_k| over a calibration run. Measuring the
+wrong signal and concluding the method does not work is the mistake, not the
+method." The fallback is precisely the wrong signal, reached by default.
+
+⛔ **And warning was not enough, because the fallback is worse than off.**
+Llama-3.2-1B, host CPU reference, 300 tokens:
+
+```
+  AWQ off                        41.5289
+  AWQ 0.20 with statistics       35.2041    -15.2%
+  AWQ 0.20 with NO statistics    58.3542    +40.5%
+```
+
+A user following the README -- `CHARSIU_NPU_AWQ=0.5`, nothing else -- got a
+model **40% worse than leaving it alone**. Declining costs them nothing they
+had; the fallback cost them that. So it declines now, and
+`CHARSIU_NPU_AWQ_WEIGHTMEANS=1` keeps the refuted variant reachable as the
+control it is.
+
+🔑 Verified exactly: with no statistics the run prints DECLINING and returns
+**41.5289**, bit-identical to the AWQ-off arm, and with statistics it is still
+35.2041.
+
+Three changes, all verified on the host:
+
+**It says so now.** The first tensor that finds no statistics prints what it is
+falling back to and how to fix it. Verified: the line appears with nothing set,
+and does not appear once a file is found.
+
+**And a model can carry its own.** `llama_load` looks for `<model>.gguf.awq`
+beside the gguf and points `CHARSIU_AWQ_STATS` at it when nobody else has.
+Verified in three arms: the warning with nothing set; "statistics found beside
+the model" with the sibling present; and no such line when the environment
+names a file, because the environment still wins.
+
+⚠ The fallback is also slow -- it reads every row of every tensor to average
+them -- which is why an arm measuring it takes several times as long as the
+arms that read a file.
+
+### 🏁 charsiu's own per-layer sensitivity, measured rather than inherited
+
+`CHARSIU_NPU_AWQ_LAYERS=0-2` came from the vendor's profile. charsiu's own is
+measurable directly: quantise exactly one layer's seven matrices to int4 group
+1024, leave every other weight at f16, and read the perplexity.
+
+```
+  reference f16                    19.8844
+  layer  0   21.4894  +8.07%       layer  8   19.9492  +0.33%
+  layer  1   21.4953  +8.10%       layer  9   20.1233  +1.20%
+  layer  2   20.4344  +2.77%       layer 10   20.0988  +1.08%
+  layer  3   20.6071  +3.63%       layer 11   20.2716  +1.95%
+  layer  4   20.2050  +1.61%       layer 12   20.2277  +1.73%
+  layer  5   20.6524  +3.86%       layer 13   19.8260  -0.29%
+  layer  6   19.9086  +0.12%       layer 14   19.8219  -0.30%
+  layer  7   20.0027  +0.59%       layer 15   20.3808  +2.50%
+```
+
+**Layers 0 and 1 carry 16.2 of the roughly 37 points on offer -- 44% of the
+damage from 12% of the layers** -- and 0 to 2 carry 51%. The vendor spends its
+calibration in the same place, which is now two independent reasons rather than
+one inherited one.
+
+🔑 **And the excesses are close to additive.** Layers 3 to 15 measured one at a
+time sum to 18.01%; measured together they are 19.74%. That is worth knowing
+before anyone reasons about a subset again.
+
+⚠ Layers 13 and 14 come out 0.3% BELOW the reference. That is not
+quantisation improving the model, it is the resolution of this statistic, and
+it is the scale at which any single-layer number here should be read.
+
+⚠ And sensitivity to four-bit weights is not the same question as where AWQ
+helps: AWQ helps where quantisation hurts AND the activations have outliers.
+This is a proxy for the second, measured on the first.
+
+### 🏁 A finer group on two layers buys 69% of a finer group everywhere
+
+Layers 0 and 1 carry 44% of the four-bit damage, so the obvious question is
+what a finer group costs and buys THERE rather than everywhere. Priced offline,
+all 112 matrices quantised, only the group varying by layer:
+
+```
+                        weight error       ppl        of the prize
+  all 1024 (ships)         13.7877%     32.9790            --
+  L0-1 at 128              13.4455%     28.8072           69%
+  L0-2 at 128              13.2933%     29.1832           69%
+  all 128 (the ceiling)    10.8471%     26.9442          100%
+  (reference f16)               --      19.8844
+```
+
+**Two layers of sixteen capture 69% of what group 128 everywhere would buy.**
+
+🔑 **And the two metrics disagree about why.** Going to 128 on layers 0 and 1
+moves the weight error by 2.5% relative -- 13.7877 to 13.4455 -- and the
+perplexity by **12.6%**. The weight error is an average over bytes and the
+early layers are 12.5% of them; the function does not average that way. Same
+lesson as the reconstruction that scored 1701 at 18% weight error, arriving
+from the other side.
+
+⚠ **The L0-1 against L0-2 inversion is resolution, not a result.** Perplexity
+says 28.81 then 29.18, which would mean a strictly finer group made the model
+worse. The weight error is monotone by construction -- 13.4455 then 13.2933 --
+so the 1.3% is what this statistic can resolve at 499 scored positions, and it
+is the same scale as layers 13 and 14 reading below the reference.
+
+⛔ **And the runtime cannot do this today.** `g->kmax` is a device field set
+once at `charsiu_npu_open`, and `tensor_grouped()` requires
+`t->kgroup == g->kmax`, so one K slice is one scale. A per-layer group means a
+per-entry kmax, which is the slice arithmetic, the CBUF budget and the input
+surface ceiling -- a dispatch change, on a path that does not exist on the
+host. The prize is now priced; the machinery is not written.
+
+### ⚠ "The error is spread with the bytes" was true by tensor class and is false by layer
+
+Round 150-something measured the vendor's shape -- layers int4, head int8 --
+at 5.3%, and concluded "the four-bit error is spread roughly with the bytes,
+and no single tensor class carries it." That still holds across classes.
+
+Across LAYERS it does not: layers 0 and 1 are 12.5% of the bytes and 44% of the
+damage, a 3.5x concentration. The earlier sentence was about the axis it was
+measured on, and reads like a statement about all axes.
+
+### 🏁 Eight bits on two layers beats a finer four-bit group everywhere
+
+The finer group was one route to the early layers. Eight bits is the other, and
+it is the better one. All 112 matrices quantised, only the early layers'
+treatment varying, same corpus and length:
+
+```
+                              ppl      excess    of the gap to lossless
+  reference f16            19.8844      +0.0%
+  all int8                 19.9007      +0.1%          100%
+  L0-3 at int8             23.1661     +16.5%           75%
+  L0-1 at int8             24.2834     +22.1%           67%
+  all int4 group 128       26.9442     +35.5%           46%
+  L0-1 at int4 group 128   28.8072     +44.9%           32%
+  all int4 group 1024      32.9790     +65.9%            0%    <- ships
+```
+
+**Eight bits on two layers of sixteen beats group 128 on all of them**, 24.28
+against 26.94, and it is 67% of the whole distance to lossless.
+
+🔑 **And the marginal return falls off a cliff after two layers.** Layers 0 and
+1 are +12.5% of the weight bytes and buy 66.5% of the gap -- 5.3 points of
+quality a point of bytes. Layers 2 and 3 are the next +12.5% and buy 8.5 more
+-- 0.68 a point. **Eight times worse**, which is the same concentration the
+per-layer sweep found, priced.
+
+⛔ **And the runtime can express the mix but not afford it.** `npu_q_packed()`
+is a process-wide constant: packed only when four bits are on AND
+`CHARSIU_NPU_W4_ONLY` is unset. So mixing widths today means nothing packs, and
+every four-bit code takes a byte:
+
+```
+  all int4, packed                       0.5000 B a weight
+  mixed through W4_ONLY, unpacked        1.0000       -- the same as all int8
+  mixed with per-tensor packing          0.5625       +12.5%, which is the point
+```
+
+The note above `npu_q_packed` says why it is global -- "under W4_ONLY the two
+files could disagree about the width of the same buffer, and a reader that is
+one nibble out of step with the writer does not fail, it answers in fluent
+sentences." The fix is the same shape as the one that ended that argument for
+grouping: **put it on the tensor, so both files read one per-tensor bool
+instead of one global one.** 28 call sites, 18 in npuquant and 10 in npudev,
+and the quantiser half is exercised by the host CPU reference.
+
+⚠ Not written. The prize is priced and the blocker is named; the change is not
+a comment away.
+
+### 🏁 The width moved onto the tensor, and eight bits on two layers is now a knob
+
+`npu_q_packed()` was a process-wide bool -- packed only when four bits are on
+AND `CHARSIU_NPU_W4_ONLY` is unset -- which is why a mixed model cost a byte a
+code on every tensor. It is now `t->packed`, set from the tensor's own bits, so
+the four-bit tensors keep their nibbles while the eight-bit ones do not.
+
+**Pure refactor, checked by the only test that can prove it: nothing moved.**
+
+```
+  int8, no W4V        17.9772  ->  17.9772
+  int4, group 1024    41.5289  ->  41.5289
+```
+
+Bit-identical both ways, and `arch_sanity` 8/8, and `host_awq` still
+41.5289 / 41.5289 / 35.2041 after the range parser was shared between two
+knobs instead of copied.
+
+**And then the knob it was for.** `CHARSIU_NPU_INT8_LAYERS=0-1` keeps those
+blocks at eight bits:
+
+```
+  all int4 group 1024            41.5289
+  INT8_LAYERS=0-1                26.0672     65.6% of the gap
+  all int8                       17.9772
+```
+
+**65.6%** against the **66.5%** the offline gguf sweep predicted on a different
+source and length. The runtime reproduces the prediction.
+
+⚠ **Two hazards, both refused rather than guessed at.**
+
+The weight cache holds one `bits` for the whole file and `wcache_read` validates
+a record's name, n, k and ngrp but not its width. That is safe while every
+tensor is the same width and stops being safe exactly when this knob is used,
+so a mixed model turns the cache off and says so.
+
+And the dispatch: the note over `slice_wsum` has one direction of the
+weight/device width mismatch and says it is handled -- an int8 DEVICE reading
+int4 codes, which every batching caller creates. This knob makes the direction
+nobody has, eight-bit weights on a device opened for four, where the register
+program and the activation pack are both `g->w4`'s. **It is refused in
+`charsiu_npu_add`**, so those tensors fall back to the CPU: slow, and right.
+Dispatching a mixed model is a board round.
+
+### 🏁 And the knob checked on a second architecture
+
+Llama-3.2-1B has sixteen layers and Qwen3-0.6B has twenty-eight, so the same
+two layers are 12.5% of one model's bytes and 7.1% of the other's. Both, host
+CPU reference, same corpus and length:
+
+```
+                        int4 g1024   INT8_LAYERS=0-1   int8      of the gap
+  Llama-3.2-1B            41.5289        26.0672      17.9772      65.6%
+  Qwen3-0.6B             110.0549        85.0878      45.1214      38.4%
+```
+
+The absolute fractions differ because the layer counts do. **The rate does
+not**: 65.6/12.5 is 5.2 and 38.4/7.1 is 5.4. The first two layers return about
+five times their share of the bytes on both.
+
+⚠ **How far to go IS model-dependent.** Llama's next two layers return 0.68 --
+an eightfold collapse -- and Qwen3's return 2.3:
+
+```
+  Qwen3   0-1   85.0878   38.4% of the gap,  7.1% of the bytes   5.4x
+          0-3   74.5665   54.7%             14.3%                3.8x  (2.3x marginal)
+```
+
+So `INT8_LAYERS=0-1` is a defensible default on both and `0-3` is a judgement
+call that one model rewards and the other does not. Which is the honest shape:
+the concentration is general, its length is not.
+
+## 2026-09-10 — the batched path, the corpus, and the one question INT8_LAYERS rests on
+
+### ⚠⚠ The refusal written yesterday was the right first move and the wrong resting place
+
+`npu_matmul_inner` refused any tensor carrying an AWQ factor, because npuquant
+scales the weights by `kscale[k]` and leaves the inverse for the caller to put
+on the activation, and this path never did. That kept the answer and cost the
+batch on every tensor in the AWQ range, which with AWQ on is most of them.
+
+It applies the factor now, at the gather. Three things had to move with it and
+**only two of them are bookkeeping**:
+
+- the gather stops being optional when `kscale` is set. On the shipped w4 shape
+  the packer reads `X` directly and there is nowhere to put a scaled copy.
+- the branch that packs straight from `X` takes `!ks`. It used to be the exact
+  complement of the gather's condition and is not any more, so with AWQ on it
+  would have packed the caller's unscaled `X` straight past the scaled copy the
+  gather had just written. **A condition that was a complement and stopped
+  being one is invisible in a diff of either half.**
+- **the reuse key carries the factor's hash**, and this is the part that is not
+  bookkeeping at all.
+
+### ⚠⚠ What a device's input BO holds is X times ONE TENSOR'S factor
+
+`reuse_key_hit` compared the pointer, the width, K, the zero point and which K
+slices landed. q, k and v share one normed buffer and, with AWQ on, have three
+different factors. Same pointer, same width, same K, same zero point, same
+slices: **every field that key had said hit**, and a hit would have multiplied
+k's weights by q's scaled input.
+
+It is the same fault the grouped decode path refuses by comparing `kshash`, one
+call site over, and it did not exist until this commit — the refusal was
+holding it shut. That is what makes it worth writing down: **removing a refusal
+opens every path the refusal was standing in front of**, and the second one was
+not in the note that priced the first.
+
+`tests/reuse_key.c` gains five cases, and they are load-bearing rather than
+decorative: with `k->ksh == ksh` taken back out of the predicate, three of them
+hit.
+
+```
+  reuse key: a factored tensor after an unfactored one: expected miss, got hit
+  reuse key: another tensor's factor, everything else equal: expected miss, got hit
+  reuse key: back to no factor at all: expected miss, got hit
+  reuse key: 3 of 18 cases wrong
+```
+
+`CHARSIU_NPU_AWQ_BATCH=0` puts the refusal back so the board can price the
+batch against a known-correct fallback without a rebuild, and a fifth
+reuse-miss reason is reported — "a different AWQ factor on the same input" —
+because the whole class this belongs to was invisible for as long as it was
+there.
+
+**Default path unchanged, and measured rather than asserted.** With AWQ off
+there is no `kscale` and every `kshash` is 0:
+
+```
+  int4, group 1024        41.5289  ->  41.5289
+  INT8_LAYERS=0-1         26.0672  ->  26.0672
+  int8                    17.9772  ->  17.9772
+  host_awq                41.5289 / 41.5289 / 35.2041, unchanged
+```
+
+### ⚠⚠ The one number this tree can compare across sessions was living in /tmp
+
+`charsiu_ppl` is deterministic, which is the only reason a perplexity measured
+last week can be put beside one measured today — the board drifts about 3%
+between boots and takes every timing with it. That property is worth exactly as
+much as the text it is measured on, and the text was in a session scratch
+directory.
+
+A reboot would have taken it. **41.5289 would still have been written down in
+this file and in the README's quality table, and nothing here would have been
+able to produce it again.** Every number above and every number in the AWQ and
+INT8_LAYERS sections was measured on those bytes.
+
+They are `tests/corpus/` now, with the hashes checked in `make test` rather than
+trusted, because an edit to a corpus does not fail anything — it silently
+re-bases every perplexity ever recorded here against a text that is no longer
+the one they were measured on. `host_awq.sh` defaults to them.
+
+### 🏁 The activation is not where four bits hurt
+
+The note in `npu_matvec` has said for some time that the shipped int4 path is
+really w4a8: it tells the hardware sixteen-bit activations and then packs an
+eight-bit value into the high byte of the slot. `CHARSIU_NPU_A16=1` fills the
+slot properly. Llama-3.2-1B, host CPU reference, same corpus and length:
+
+```
+  w4a8    41.5289
+  w4a16   40.7016      2.0%
+```
+
+**Two percent.** A plausible story — "the shipped path is secretly a8 and we are
+leaving quality on the table" — priced and closed. Next to 41.53 → 35.20 from
+AWQ or 41.53 → 26.07 from eight bits on two layers, the activation width is
+not where the damage is at four bits. It also means a mixed dispatch that
+shared one activation pack between widths would pay 2% for it, which is not a
+reason to refuse.
+
+### ⚠⚠ And the cheap way to dispatch a mixed model is DOMINATED
+
+`CHARSIU_NPU_INT8_LAYERS` does nothing on the board: `charsiu_npu_add` refuses
+an eight-bit tensor on a device opened for four and it takes the CPU.
+
+The other direction of that mismatch already works and already ships. An int8
+DEVICE reading int4 codes is what every vision tower does — `pack_rows` has
+tested `t->packed` and `g->w4` separately since it was written, because a tower
+forces `want_w4 = 0` while the quantiser still reads `CHARSIU_NPU_W4V`. So a
+mixed model could be opened as int8 today, with no new hardware path at all.
+
+**And it would be strictly worse than not bothering.**
+
+```
+  all int8                    ppl 17.98,  int8 weight bytes
+  INT8_LAYERS=0-1 as int8     ppl 26.07,  int8 weight bytes
+```
+
+Same bytes on the wire, worse answer. The knob's entire value is int8's quality
+at **int4's bandwidth**, and opening the device as int8 throws away the half
+that makes it worth doing. Anyone who reaches for the easy version should be
+stopped by this paragraph.
+
+So the only version worth building is the int4 device running int8 tensors, and
+that is the forty-site refactor: the register program, the activation pack, the
+buffer stride, the readback, and — as of today — the reuse key, which would
+need the activation dtype in it for exactly the reason the AWQ factor is in it.
+
+### 🏁 So ask the question the refactor rests on, first
+
+`tools/npu_mixed_test.c`. Two jobs of the same shape, one w8a8 and one w4a16,
+built from the SAME codes so the two references are the same arithmetic. It
+runs each alone as a control, then alternates them on **one open device**
+`--loop` times. **A device that latches a mode between jobs passes both
+controls and fails the alternation**, and that is the failure the refactor
+cannot survive.
+
+`--dry` needs no hardware and answers half of it at the desk:
+
+```
+  int8 program  143 words, 4.2 MB of weights
+  int4 program  148 words, 2.1 MB of weights
+  102 words differ over the shorter stream
+```
+
+Two distinct programs, and the 2× bandwidth the knob exists to keep, visible at
+the emitter. The silicon question is the rest of the tool.
+
+⚠ Its default shape is K=256 N=64 and it refuses anything under K=128 N=32,
+because `npu_fp16_test`'s own note has the table where K=16 N=8 and K=64 N=8
+wedge the NPU and cost six wrong explanations.
+
+### The AWQ board round is one command
+
+`tests/board_awq.sh` — four arms, three of them identity questions.
+
+⚠ **Two of them compare charsiu to charsiu, and here that is the right
+question**, which is not usually true. It is the wrong question when both arms
+are the same graph, because a shared bug is invisible to it. These are not
+that: the control arm in each is the path that has always applied the factor
+and has evidence behind it, and the arm under test is a new place to apply the
+same factor.
+
+⚠ **And each identity arm checks that the path it is about actually ran.** An
+arm that refuses for some other reason is arm A twice over and matches for no
+reason; the tells are the refusal line appearing in A's diagnostics and not in
+B's, and a non-zero batched matmul entry in B's report.
+
+`CHARSIU_AWQ_BASE` runs the whole thing against the host CPU reference, which
+is a complete answer to the two quality arms and correctly reports the two
+hardware arms as vacuous. A script that has never been run is not a board
+round, it is a plan for one.
+
+### 🏁 The narrow output read: which tensors, and what share of the read
+
+⛔⛔ **RETRACTED — see "the narrow read was measured dead on 09-08" at the end
+of this file.** This section and the next treat a road that rounds 167-168 had
+already closed. Read them as documentation for `tools/out16_bound.c` and not
+as a plan.
+
+The read is four bytes an output element, every K slice, every row of a
+prefill, because `job.acc_out` takes the raw int32 accumulator before the
+convert. Round 165 priced it at **0.94 ms a prefill row**; two bytes would be
+0.47. The int8 TTFT gap to the vendor is **0.67 ms a row**. The whole gap is
+inside one read width.
+
+The gate is a static property of the weights and `tools/out16_bound.c` is it.
+At int8 the group is the whole row, so the per-channel requant applies exactly
+the scale the CPU applies now and the hardware emits the value in units of the
+activation scale; every `|a_q| <= 127`, so a channel is bounded by
+`127 * sum_k |w[c][k]|`.
+
+```
+  Llama-3.2-1B     100.0%   worst 0.80x   ffn_up
+  Qwen3-0.6B       100.0%   worst 0.37x   ffn_up
+  gemma-3-1b       100.0%   worst 0.54x   ffn_down
+  gemma-4-E2B      100.0%   worst 0.56x   ffn_down
+  Phi-3.5-mini      92.6%   ffn_down 20 of 32 OVER, worst 2.13x
+```
+
+**Worth the board round, and it must be per-tensor.** A global switch breaks
+Phi-3.5, whose `blk.0.ffn_down` is 2.13x over -- and that is the tensor `job.c`
+already named for varying 2971x between tokens, without ever doing the
+arithmetic. Even there 92.6% of the read is narrow.
+
+⚠ The bound is worst case: every `|a_q|` at 127 with every sign agreeing. Real
+activations run about a third of that, so Phi-3.5 would probably not overflow
+-- and an overflow is an inf that destroys the token, so "probably" cannot gate
+it.
+
+⚠ **Two bugs on the way, both the same shape, and both are why the tool prints
+a coverage percentage rather than a verdict.** It routed by SPELLING first -- a
+list of eight suffixes -- and read Phi-3.5 as having no attention weights at
+all, because Phi fuses them into `attn_qkv.weight`. Then, routing by property,
+it excluded `token_embd` unconditionally and dropped the single widest tensor
+in every tied-head model: Llama-3.2-1B's head is 128256 channels against 8192
+for the next biggest, so the denominator was missing most of itself. It follows
+llama.c's own tie rule now, and matches `token_embd.weight` EXACTLY, because
+gemma4's `per_layer_token_embd` contains that string and is a lookup.
+
+**A tool whose whole output is a percentage is a tool where the census rule is
+the result.** Both of those printed a clean, plausible table.
+
+### ⚠⚠ The second gate on a narrow read, and it applies to only one of the two widths
+
+⛔ **Also retracted, except for the fp16-vs-int8 partial-sum distinction, which
+survives.** See the retraction at the end of this file.
+
+The first version of this entry said a narrow read cannot carry a partial sum.
+That is right for one width and wrong for the other, and the difference decides
+which of the two is worth chasing.
+
+What makes a K split free today is `acc_out`: the hardware writes the raw int32
+accumulator and the CPU adds the slices, so a tensor wider than KMAX costs
+nothing at all. A requantised output is a different object, and what it costs
+depends on whether its precision is **relative or absolute**.
+
+```
+  fp16   relative, about 2^-11 of whatever the partial sum is. Four partials
+         each carrying that, summed, still carry about that. Only the 65504
+         bound gates it.
+  int8   absolute, against a scale fixed before the dispatch. A quarter of K
+         sums to about half the total, so a scale chosen for the total spends
+         two of the eight bits on range the partial never uses, and the four
+         roundings add. A four-way split is nearer six bits than eight.
+```
+
+And one byte is the one worth chasing — 0.70 ms a row against 0.47, on a gap of
+0.67 — so the split gate is the one that matters. At KMAX 2048:
+
+```
+                   under 65504    one K slice
+  Llama-3.2-1B        100.0%         78.3%
+  Qwen3-0.6B          100.0%         89.1%
+  Phi-3.5-mini         87.8%          0.0%
+```
+
+⚠⚠ **Phi-3.5 is zero, and that is a KMAX choice rather than a property of the
+model.** Its K is 3072 and every tensor is cut in two at 2048. At KMAX 4096 the
+same file reads **82.8%**. So the model with the worst TTFT in the table — 2764
+ms — gets nothing from a one-byte read at the shipped slice width and most of
+it at a wider one.
+
+⚠ And a wider KMAX is not free: the input surface ceiling is `(k/32) * m <=
+5120`, so K 2048 allows m 80 and K 4096 allows m 40. That is the vendor's own
+trade, from its own file, and it is now on both sides of a decision rather than
+just recorded.
+
+`tools/out16_bound.c --kmax N` prints both shares.
+
+### ⛔⛔ RETRACTION: the narrow read was measured dead on 09-08 and I reopened it
+
+The two sections above — "the narrow output read: which tensors, and what share
+of the read" and "the K split gates an int8 read and not an fp16 one" — treat
+the narrow read as a live lead worth a board round. **It is not, and the reason
+is three entries up this same file.**
+
+Round 168's own conclusion, written two days before I wrote those: the width
+register bundle has **exactly two values, 1 and 4 — there is no 2**, so an fp16
+output is not reachable in it at all. And the one-byte width that IS reachable
+was measured:
+
+```
+  one byte, ppl                125.30   against 43.66 four bytes
+  mode 4, coefficient rewritten per call with a_scale folded in
+                               ran, and did not help
+```
+
+because ffn_down's 2971x swing is the **SHAPE** of `sum(w_q a_q)` and not its
+magnitude, so following the activation scale does not track it. Wide KMAX was
+measured too: read −25%, chunk cap halved, ~3% only at prompt ≤ 80, and
+`--batch` at KMAX 4096 gives **ppl 4.9e12**. And the clean int8 decomposition
+says there is no single 0.67 to take at all — `pack 0.87 · submit 0.08 ·
+fence 0.86 · read 0.93 · scale 0.25` plus attention 0.88, with the fence being
+hardware MAC.
+
+**So `tools/out16_bound.c` is a bound on a width nobody can select, and the
+"⚠⚠ Phi-3.5 is zero, at --kmax 4096 it reads 82.8%" paragraph recommends
+buying a thing that was already priced as a loss.** The tool stays because the
+bound is cheap and correct and would matter the day an fp16 width register
+turns up somewhere else; the two sections above should be read as its
+documentation and not as a plan.
+
+⚠ **What survives the retraction** is one distinction that was not written down
+before: fp16 partial sums are fine and int8 partial sums are not, because
+fp16's precision is relative and int8's is absolute against a scale fixed
+before the dispatch. If an fp16 width is ever found, the K split does not gate
+it. That is worth keeping; the rest of the two sections is not.
+
+⚠⚠ **And the process failure is the point.** The closure was in this file and
+in the project's own memory under "three roads measured dead today, do not
+reopen". I read the notebook's ROUND ENTRIES, found round 165's price on the
+read, and started from there — without reading forward three entries to round
+168, which is where the same thread ends. **An entry that opens a lead and an
+entry that closes it look identical from a grep for the lead's own words.** The
+fix is to search for the close, not the open: grep the thing's name and read the
+LAST hit first.
+
+### ⚠⚠ A minimum at the edge of a grid is not a minimum, it is an edge
+
+The README says Llama-3.2-1B's AWQ exponent has its minimum at 0.20. **0.20 was
+the smallest value that sweep tested.** Swept downward on the tree corpus at
+300 tokens, host CPU reference, `tests/corpus/{calib,long}.txt`:
+
+```
+  alpha   off      0.05     0.10     0.15     0.20     0.35     0.50
+  ppl    41.5289  38.4906  33.7566  32.5094  35.2041  42.3752  50.7341
+```
+
+Unimodal, and the minimum is at **0.15** — 32.51 against 41.53 off, **21.7%**,
+where 0.20 gives 15.2%. 0.10 also beats 0.20. So the earlier grid did not find
+a minimum at its floor; **it found its floor.**
+
+⚠ This is a different corpus and length from the README's sweep, so the two
+numbers are not in conflict as measurements — 43.86 at 0.20 there and 35.20 at
+0.20 here are answers to different questions. What IS in conflict is the
+sentence "Llama's minimum is at 0.20", which was read off a grid that could not
+have found anything smaller.
+
+🔑 The check costs one arm: **when the best cell is on the boundary, extend the
+grid before naming it.** The related trap already in this file is a grid too
+noisy to rank its own cells, whose tell is non-monotonicity. This one is
+perfectly monotone and perfectly wrong, and its tell is only that the winner
+has a neighbour on one side.
+
+⚠ 0.10 reproduced to the last digit (33.7566) across two separate runs with
+independently recorded calibration files, which is also a check on the
+calibration pass being deterministic.
+
+### AWQ on the first three blocks, on Llama this time
+
+At alpha 0.20, same corpus and length:
+
+```
+  off                41.5289
+  AWQ_LAYERS=0-2     37.3771     65.6% of the win, on 3 of 16 layers (18.8%)
+  AWQ everywhere     35.2041
+```
+
+Against qwen3's **70.3% on 3 of 28 (10.7%)**. Both models concentrate, and the
+rate differs by about two: 3.5x its share of the layers on Llama against 6.6x
+on qwen3. **The concentration is general and its size is not**, which is the
+same shape `INT8_LAYERS` turned out to have.
+
+⚠ A LAYERS number quoted without its exponent is not comparable to anything,
+and the whole surface moves with alpha. `tests/board_awq.sh` prints the alpha
+in the arm's own heading now.
+
+### ⚠⚠ The second model put the tell back: 0.15 is a region, not a minimum
+
+Llama's and qwen3's AWQ optima had been measured on **different corpora** —
+0.20 and 0.35 — so nobody had separated "per model" from "per corpus". Both on
+`tests/corpus/long.txt` at 300 tokens, host CPU reference, each with its own
+calibration recorded from `tests/corpus/calib.txt`:
+
+```
+  alpha        off      0.05     0.10     0.15     0.20     0.25     0.35     0.50
+  Llama-1B   41.5289  38.4906  33.7566  32.5094  35.2041     -     42.3752  50.7341
+  Qwen3-0.6B 110.0549    -     80.1066  86.1183  77.7821  71.7770 77.8404  77.5428
+```
+
+**Qwen3's row is not monotone.** 0.15 sits *above* both its neighbours by eight
+to ten percent, and 0.50 sits *below* 0.35. `charsiu_ppl` is deterministic, so
+this is not measurement noise — it is **299 scored positions of one passage
+being unable to rank cells eight to ten percent apart.**
+
+⚠⚠ **And that retracts the sharp form of this morning's claim.** Llama's
+0.15-against-0.20 gap is eight percent, which is inside the band qwen3 has just
+demonstrated to be unrankable at this length. The surface being monotone on
+Llama is the tell's *absence*, which is weaker than its presence is damning.
+
+**What survives, and it is the part that mattered:**
+
+- the good region for Llama extends **below 0.20**, which was the old grid's
+  floor: 0.10 and 0.15 both beat it, by 4 and 8%. "The minimum is at 0.20" was
+  read off a grid that could not have found anything smaller, and that is still
+  wrong.
+- 0.5 is still clearly bad on Llama — 50.73 against 41.53 with AWQ off.
+- AWQ is worth 20 to 35% on both models somewhere in 0.10 to 0.25.
+- ⚠ The vendor's own per-tensor exponents run 0.03 to 0.15 typical and never
+  exceed 0.401, which lands in the same region from a completely different
+  direction and is not subject to this corpus's sampling at all.
+
+🔑 **The instrument's resolution is a property of the corpus and the length,
+and it is now measured: ~10% at 299 positions on this passage.** Any two cells
+closer than that need a longer run or another corpus before they can be
+ordered. That is a number this tree did not have, and it applies to every ppl
+comparison in this file, not only to AWQ.
+
+### 🏁 The AWQ activation was rebuilt once per ROW, and the note above it said "per call"
+
+`npu_matvec`'s `kscale` block carries **"⚠ PER CALL, NOT static"** together with
+the race that motivated it — and it was allocating k bytes, taking a maximum
+over k, quantising k values and freeing, **inside the row loop**. The scaled
+activation depends on `a` and `t->kscale` and on nothing else; `r` does not
+appear in it. Every row rebuilt what the previous row had just built, and on a
+128256-wide output head that is 128256 identical reconstructions of one buffer.
+
+Hoisted, it is exactly the "per call" the note asked for — `npu_matvec` takes a
+row range per pool worker, so once per range rather than once per row.
+
+**Same arithmetic in the same order, so the only test that can prove it is that
+nothing moves.** Warmed, alternating, one binary each, Qwen3-0.6B at 0.10:
+
+```
+  new  13.28 s      old   92.91 s
+  new  17.43 s      old  101.44 s
+```
+
+**6.3x**, and every intermediate checkpoint identical — 386.0400 / 142.4919 /
+99.7580 / 86.0915 / 82.3756 / 75.5518 / 82.9369 / 74.7559 / 77.4978, final
+80.1066, which is the sweep's own value.
+
+⚠ Host-side only: the board applies the factor at the pack, once. But it is why
+every AWQ arm of every ppl sweep here has taken several times longer than the
+arm with AWQ off — and those sweeps are how the exponent gets chosen, so the
+instrument's cost was shaping how much of the surface anybody was willing to
+measure. **The grid that stopped at 0.20 was a grid somebody had to wait for.**
+
+### ⛔⛔ RETRACTION: the non-monotone surface was NOT the instrument, and I said it was
+
+An hour after writing "the instrument's resolution is ~10% at 299 scored
+positions", the test that separates the two explanations says the opposite.
+
+**The claim.** Qwen3's AWQ exponent sweep came back non-monotone — 0.15 above
+both its neighbours — and `charsiu_ppl` is deterministic, so I concluded the
+passage's own sampling could not order cells eight to ten percent apart, and
+put a resolution floor on every close comparison in this tree.
+
+**The test.** Two arms, and the first one is weaker than it looks:
+
+```
+  qwen3            off      0.10     0.15     0.20     0.25     0.35     0.50
+  long.txt 300  110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
+  long.txt 500     -      81.0273  89.9499  75.1107  70.8360  77.7245  80.7067
+  long2.txt 300 153.8779 140.4129 148.4278 128.0319 117.6984 132.0993 118.6291
+```
+
+🔑 **And it separates the cells that are real from the cells that are not**,
+which is the part worth keeping:
+
+```
+  0.15 worse than 0.10    +7.5%   +11.0%   +5.7%    3 of 3   REAL
+  0.25 is the minimum       ✓        ✓        ✓      3 of 3   REAL
+  0.50 against 0.35       -0.4%    +3.8%   -10.2%   flips     NOT RESOLVED
+```
+
+So the surface has real structure AND the grid has cells it cannot order, in
+the same row. Reading either one off the shape alone would have been wrong.
+
+⚠ `-n 500` on `long.txt` is **not an independent sample** — it is the same 299
+positions plus 200 more, so agreement is partly guaranteed. `long2.txt` is the
+real test, and it is why that file now exists.
+
+**On an independent passage, 0.15 is still worse than 0.10.** The weights at
+that exponent really are worse than the ones below it. The surface is genuinely
+non-smooth, and the resolution claim is withdrawn.
+
+🔑 **What replaces it, and it is more useful.** A coarse grid over alpha cannot
+be interpolated: a seven-point sweep steps straight over a spike. So "the
+minimum is at X" needs a FINE sweep around X, not merely a longer run — and
+Llama's monotone row is the absence of the tell, not evidence of smoothness.
+
+⚠ ⛔ A mechanism was offered here and then withdrawn — see "the argmax flip
+mechanism does not survive one minute of arithmetic" below. The curve is
+continuous; the band is an ordinary local maximum of it.
+
+⚠⚠ **And the process failure is worth more than the finding.** The tree already
+had a rule: *a non-monotone surface is a grid that cannot rank its own cells.*
+That rule was written for a case where it was true — a 200-token grid whose
+winner moved when the length changed. I matched the pattern and stopped. **The
+rule names a SYMPTOM with two causes, and the second one is that the function
+really is bumpy.** The arm that separates them costs one run on another
+passage; I wrote the conclusion first and ran the arm afterwards.
+
+**Still standing from all of this:** Llama's good region runs 0.10 to 0.20 and
+0.20 was the old grid's floor; 0.5 is bad on both models; AWQ is worth 20 to
+35%; and the vendor's own per-tensor exponents (0.03 to 0.15 typical, 0.401
+max) land in the same region from a direction no corpus here can affect.
+
+### 🏁 And at 0.01 resolution it is a BAND, not a spike
+
+The coarse grid showed 0.15 sitting above 0.10 and 0.20. Swept at 0.01,
+qwen3, `long.txt`, 300 tokens:
+
+```
+  0.10  80.1066  │  0.12  89.2108   0.13  83.1503   0.14  84.6774
+                 │  0.15  86.1183   0.16  88.7239   0.17  84.9452
+                 │  0.18  86.5491  │  0.20  77.7821
+```
+
+**Every point from 0.12 to 0.18 lies in 83.2 to 89.2, and both edges — 0.10 and
+0.20 — lie near 78 to 80.** So it is a band of exponents where the transform is
+worse, with better values on either side, and not one bad cell that a finer
+grid would have smoothed over.
+
+⚠⚠ **On one passage. The independent one narrows it, and this paragraph was
+written before that arm came back.** The band that reproduces is **0.12 to
+0.15**; 0.17 and 0.18 are above 0.10 on `long.txt` and BELOW it on `long2.txt`,
+so the band's right edge is not established. See the table below.
+
+⚠ 0.15 came back **86.1183**, the same to the last digit as in the coarse
+sweep, which is the determinism check on the fine one.
+
+**And the independent passage says the same about the band and the opposite
+about its interior**, which is the cleanest possible version of the point.
+`long2.txt`, 300 tokens, the same cells:
+
+```
+  0.10  140.4129  │  0.12 146.8927   0.13 145.1806   0.14 143.1422
+                  │  0.15 148.4278   0.17 138.4367   0.18 139.2796 │ 0.20 128.0319
+```
+
+**0.12 through 0.15 are above 0.10 on both passages — that is the band, and it
+is 0.12 to 0.15.** ⚠ 0.17 and 0.18 are above 0.10 on `long.txt` and BELOW it
+here, so the right edge is not established and the first version of this entry
+had the band a third too wide.
+
+And the ORDER inside the band does not reproduce either: `long.txt` runs
+89.21 / 83.15 / 84.68 / 86.12 across 0.12–0.15 while `long2.txt` runs
+146.89 / 145.18 / 143.14 / 148.43 — opposite trends, same band.
+
+```
+  0.12-0.15 worse than 0.10     4 of 4 cells, 2 of 2 passages   REAL
+  0.17-0.18 worse than 0.10     disagrees between passages      NOT RESOLVED
+  0.20 better than 0.10         both passages                   REAL
+  0.25 is the minimum           both passages, both lengths     REAL
+```
+
+🔑 So one row of a sweep contains **both** a real feature and cells that cannot
+be ordered, and reading either off the shape alone would have been wrong.
+**Decide "real or not" per COMPARISON on an independent sample, never per grid
+off its shape.**
+
+▶ **Which points at the next thing to build — but not for the reason I first
+wrote.**
+
+⛔ **The "argmax flip" mechanism does not survive one minute of arithmetic, and
+I published it before spending that minute.** The claim was that charsiu
+quantises per OUTPUT ROW while AWQ scales input COLUMNS, so the column
+attaining a row's `max|w|` flips at particular exponents and that row's scale
+JUMPS. It does not: `scale_j = max_k |w_kj · c_k(α)| / 7` is a maximum of
+finitely many functions each continuous in α, and **a max of continuous
+functions is continuous.** An argmax flip is a kink, not a jump. The only true
+discontinuities are the roundings `round(w/scale)`, and with hundreds of
+millions of weights each step moves one code — a staircase far too fine to
+produce an eight percent feature.
+
+🔑 **So the band is an ordinary local maximum of a continuous curve**, and the
+mechanism is the trade the method is made of: AWQ protects salient channels
+(helps) and spreads the row's dynamic range (hurts), both smooth in α, and a
+sum of two competing smooth effects can perfectly well have more than one local
+extremum. Nothing exotic is required and nothing discrete is involved.
+
+**And per-tensor alpha survives the correction with a better argument than it
+had.** Every tensor has its own trade point, so a single global α is a
+compromise across all of them, and the global curve is a sum of per-tensor
+curves whose optima sit in different places — which is exactly how a global
+value lands in a region that is bad for many tensors at once. 🔑 **The vendor
+chooses α per tensor: 0.00 to 0.40, typically 0.03 to 0.15.**
+
+⚠ The known negative result is about a different question: fitting THEIR
+exponents from our statistics gave corr −0.02. Optimising OUR own per tensor
+has not been tried, and it needs a ppl objective rather than a weight-error one
+— [[feedback-weight-error-is-not-functional-error]] — which the 6.3x on AWQ
+arms has just made affordable.
+
+### 🏁🏁 The optima differ by tensor kind, and one kind carries a 21% win on its own
+
+`CHARSIU_NPU_AWQ_ONLY=<substring>` restricts the factor to tensors whose name
+contains it — the axis `AWQ_LAYERS` does not cover. Its own controls first,
+because this tree has run four arms that said "AWQ on" while being the arm with
+AWQ off:
+
+```
+  AWQ off                      110.0549
+  0.25, ONLY unset              71.7770
+  0.25, ONLY=""                 71.7770   identical: empty is EVERY tensor
+  0.25, ONLY=zzz               110.0549   exactly off: no match is no AWQ
+```
+
+Then each kind alone, qwen3, `tests/corpus/long.txt`, 300 tokens:
+
+```
+  kind          0.05     0.10     0.15     0.25     0.40      best     (off 110.05)
+  attn_q      106.67   101.64   108.87   101.41    96.58      0.40
+  attn_k      114.37   111.76   118.61   113.33   112.04      none
+  attn_v      116.25    93.59    93.03    86.39    88.05      0.25
+  attn_output  92.24    95.62    98.19    92.46    95.91      0.05
+  ffn_gate     95.67    97.42    96.96    93.56    97.90      0.25
+  ffn_up      107.27    97.59    96.34   101.52   105.77      0.15
+  ffn_down    102.95    86.56   103.77   102.68   105.47      0.10
+```
+
+**Five different optima across seven kinds — 0.05, 0.10, 0.15, 0.25, 0.40 — and
+one kind that AWQ never helps anywhere.** A single global exponent cannot serve
+that, which is the whole case for a per-tensor one and is what the vendor does
+(0.00 to 0.40, typically 0.03 to 0.15).
+
+🔑 **`ffn_down` alone at 0.10 is 86.56 against 110.05, a 21% win from one kind
+— and it is SHARPLY PEAKED**: 0.05 gives 102.95 and 0.15 gives 103.77. A sweep
+at 0.05 spacing finds it; a sweep at 0.10 spacing steps over it. That is the
+concrete version of "a coarse grid over a non-smooth parameter cannot be
+interpolated", and it is worth 21% on one kind.
+
+⚠ **`attn_k`: the honest reading is "never better than off", not "hurts".** Its
+best cell is 111.76 against 110.05 — 1.6%, which is not separable at this
+resolution. 118.61 at 0.15 is 7.8% worse and probably real. The distinction
+matters because "AWQ hurts attn_k" is the sort of sentence that becomes a rule.
+
+⚠ **And a per-kind optimum measured in isolation is not the optimum in
+combination.** Every row here is that kind alone against AWQ-off everywhere
+else. The composite has to be built and measured, not assembled from the best
+cell of each row — which needs a knob that takes a per-kind alpha map, and that
+does not exist yet.
+
+▶ **Four of seven kinds have their WORST cell at exactly 0.15**, which is where
+the global curve's band is. Several independent kinds peaking at one exponent
+points at a common cause rather than seven coincidences; the candidate under
+test is the factor's clamp beginning to bind at a similar alpha across tensors
+that share activation statistics. If widening the clamp moves the band, that is
+the mechanism.
+
+### 🏁🏁 The factor's CLAMP is costing 7 to 20% of AWQ, at the exponents anyone should use
+
+Four of seven kinds have their worst cell at 0.15, which is where the global
+band is, and several independent kinds peaking at one exponent points at a
+common cause. The candidate was the factor's clamp — `CHARSIU_NPU_AWQ_CLAMP`,
+default 2.0, so the factor lives in [0.5, 2].
+
+**Its onset is now dated exactly.** qwen3, `long.txt`, 300 tokens:
+
+```
+  clamp      0.10      0.15      0.20      0.25
+  hi=2.0   80.1066   86.1183   77.7821   71.7770
+  hi=4.0   80.1066   84.2043   77.2277   67.9646
+  hi=8.0   80.1066   84.2043   77.2277   68.5076
+```
+
+🔑 **At alpha 0.10 the width makes NO difference at all — 80.1066 to the last
+digit across hi = 2, 4 and 8 — so nothing reaches the bound there.** From 0.15
+on it does, and hi=4 equals hi=8, so nothing reaches 4 either. The clamp starts
+binding between 0.10 and 0.15.
+
+⚠ **But the band survives it.** At hi=4 the 0.15 peak is still there, 5.1%
+instead of 7.5%. **The clamp is a contributing cause and not the cause**, which
+is the second hypothesis about this band to be narrowed by its own test today.
+
+**And the clamp is expensive.** Two models, two passages:
+
+```
+  qwen3 long.txt  @0.25    71.7770 -> 67.9646    -5.3%
+  qwen3 long2.txt @0.25   117.6984 -> 115.9869   -1.5%
+  Llama long.txt  @0.15     32.5094 ->  30.1937   -7.1%
+  Llama long.txt  @0.25     38.3471 ->  30.7909  -19.7%
+```
+
+⚠⚠ **It also flattens the alpha curve**, which is the part that reframes a
+week of sweeping. At hi=2 Llama's 0.15 and 0.25 differ by 18%; at hi=4 they are
+30.19 and 30.79, two percent apart. A good deal of "the exponent must be swept
+per model" was the shape of a bound, not of the method.
+
+**⚠ And the clamp is NOT merely a mistake — it earns its keep above 0.5.**
+Llama, `long.txt`, against AWQ off at 41.5289:
+
+```
+  clamp      0.35      0.50      0.65
+  hi=2.0   42.3752   50.7341   72.1690
+  hi=4.0   34.3462   45.5974   86.6635
+```
+
+```
+  0.10-0.35   hi=4 better by 1.5 to 19.7%, two models, two passages
+  0.50        hi=4 better than hi=2, and BOTH still worse than off
+  0.65        hi=2 better by 20% -- the narrow clamp is protecting
+```
+
+🔑 **One sign in the README flips and one does not.** "AWQ at 0.35 is worse than
+not running it at all" is a statement about the clamp: 42.38 against 41.53 at
+hi=2, but 34.35 against 41.53 at hi=4 — clearly better. **"0.5 is worse than
+off" survives**, 45.60 against 41.53, so that claim is about the exponent.
+
+So the shipped default is costing 7 to 20% of AWQ's benefit exactly where AWQ
+should be used, and the protection it buys only matters where AWQ is a bad idea
+whatever the clamp is.
+
+### And the second model says the crossover is NOT in the same place
+
+```
+  qwen3          0.35      0.50      0.65      (off 110.0549)
+  hi=2.0       77.8404   77.5428   83.9348
+  hi=4.0       80.6523   73.7438   91.3330
+```
+
+At 0.35 the wider clamp is **worse** on qwen3 — 80.65 against 77.84 — where on
+Llama it was much better. So above 0.25 the comparison is not resolved and the
+crossover is per model. What holds on both models and both passages:
+
+```
+  0.10-0.25   hi=4 better everywhere measured        the useful range
+  0.35-0.50   inconsistent: Llama prefers wide, qwen3 prefers narrow at 0.35
+  0.65        hi=2 better on both, +20% and +8.8%    the clamp protecting
+```
+
+**And at each model's own best setting, which is what a user would actually
+run:**
+
+```
+  qwen3   71.7770 -> 67.9646   -5.3%   (both at 0.25)
+  Llama   32.5094 -> 30.1937   -7.1%   (both at 0.15)
+```
+
+⛔ **The default stays at 2.0, and that is a decision rather than caution.**
+Every AWQ number on record here was measured at 2.0. Moving the default
+silently would make all of them unreproducible — which is the same failure as
+leaving the corpus in /tmp, wearing different clothes. It goes in the README as
+a measured recommendation and onto the board list as a decision with its
+numbers attached.
+
+⚠ And note where it leaves the exponent story: **the per-model difference is
+real and is NOT the clamp's doing.** qwen3 at 0.50 is still far better than off
+(77.54 against 110.05) while Llama at 0.50 is worse than off (50.73 against
+41.53). The two models genuinely tolerate different amounts of exponent. What
+the clamp was responsible for is the SHAPE within the useful range, not the
+difference between the models.
+
+### ⛔ The per-kind composite LOSES to one well-chosen global exponent
+
+`CHARSIU_NPU_AWQ_MAP` gives an exponent per tensor kind, so the per-kind table
+can be assembled and scored instead of admired. Its five controls first — a
+map matching nothing, a map setting every kind to the global value
+(bit-identical, which is what proves the parser reaches all seven), a
+malformed entry (skipped, not parsed as 0), and `ffn_down=0` (took effect, and
+costs 10% on its own). Then the composite of each row's best:
+
+```
+  attn_q=0.40, attn_k=0, attn_v=0.25, attn_output=0.05,
+  ffn_gate=0.25, ffn_up=0.15, ffn_down=0.10
+```
+
+```
+  long.txt    global 0.25 clamp 2.0   71.7770    composite   70.3012   -2.1%
+              global 0.25 clamp 4.0   67.9646    composite   73.5539   +8.2%
+  long2.txt   global 0.25 clamp 2.0  117.6984    composite  118.8202   +1.0%
+              global 0.25 clamp 4.0  115.9869    composite  117.7463   +1.5%
+```
+
+**Three of four cells worse, and the one win does not reproduce on the second
+passage.** The per-kind optima are real and **they do not compose.**
+
+🔑 This is the caveat from two hours ago, measured instead of warned about:
+*"a per-kind optimum measured in isolation is not the optimum in combination"*,
+because every row of that table was that kind alone against AWQ-off everywhere
+else. Writing the caveat down was not the same as testing it, and testing it
+cost eight arms and about twenty minutes.
+
+⚠ And the failure is worse at clamp 4.0 (+8.2%) than at 2.0, which fits: the
+per-kind values were each chosen at clamp 2.0, so they do not transfer to a
+different bound. A composite is a tuple tuned against one setting of everything
+else.
+
+**What it kills and what it leaves.** It kills the cheap version of a
+per-tensor exponent — greedily assembling isolated optima. A JOINT search might
+still do better, but it is expensive, unproven, and has just lost its
+motivating evidence. ⚠ And the vendor choosing alpha per tensor is not evidence
+that it wins: **their quantiser is 1.7x worse than charsiu's overall** on the
+three nested subsets, so what they do per tensor is not a target to copy.
+
+▶ The better-supported lead is the plain one: **the clamp**, a single global
+setting worth 5 to 7% at each model's own best exponent, on two models and two
+passages.

@@ -121,6 +121,31 @@ static int w4_env(void)
 	return (a && *a && *a != '0') || (b && *b && *b != '0');
 }
 
+/*
+ * "0-2", or "4": is this tensor's block inside that range?
+ *
+ * ⚠ UNSET OR EMPTY MEANS NO, NOT YES. Two knobs read this and both would be
+ * dangerous if an unparseable range quietly meant "everything": one of them
+ * decides a tensor's WIDTH.
+ *
+ * A tensor with no "blk.<n>." in its name is not a layer and is never in range.
+ */
+static int layer_in_range(const char *spec, const char *name)
+{
+	const char *b = name ? strstr(name, "blk.") : NULL;
+	char *end;
+	long lo, hi, ln;
+
+	if (!spec || !*spec || !b)
+		return 0;
+	lo = strtol(spec, &end, 10);
+	if (end == spec)
+		return 0;
+	hi = *end == '-' ? strtol(end + 1, NULL, 10) : lo;
+	ln = strtol(b + 4, NULL, 10);
+	return ln >= lo && ln <= hi;
+}
+
 int npu_q_packed(void)
 {
 	static int v = -1;
@@ -134,6 +159,23 @@ int npu_q_packed(void)
 size_t npu_q_stride(uint64_t k)
 {
 	return npu_q_packed() ? (size_t)((k + 1) / 2) : (size_t)k;
+}
+
+/*
+ * THE SAME QUESTION, ASKED OF ONE TENSOR.
+ *
+ * npu_q_packed is a process-wide answer and that is what made a mixed model
+ * unaffordable: CHARSIU_NPU_W4_ONLY turned packing off for EVERY tensor, so a
+ * model with eight bits on two layers paid a byte a code on the other fourteen
+ * as well -- 1.0 bytes a weight, which is what all int8 costs anyway.
+ *
+ * The width belongs to the tensor. Both files read t->packed and neither can
+ * be a nibble out of step with the other, which is the hazard the note above
+ * npu_q_packed describes.
+ */
+size_t npu_q_stride_t(const struct npu_tensor *t)
+{
+	return t->packed ? (size_t)((t->k + 1) / 2) : (size_t)t->k;
 }
 
 /*
@@ -288,6 +330,18 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 	wc.checked = 1;
 	if (!path || !*path)
 		return;
+	/*
+	 * ⚠ THE CACHE HEADER HOLDS ONE `bits` FOR THE WHOLE FILE, and
+	 * wcache_read validates a record's name, n, k and ngrp but not its
+	 * width. That is safe while every tensor has the same width and is not
+	 * safe the moment they do not, so a mixed model does not use the cache
+	 * at all rather than use it carefully.
+	 */
+	if (getenv("CHARSIU_NPU_INT8_LAYERS") || getenv("CHARSIU_NPU_W4_ONLY")) {
+		fprintf(stderr, "charsiu: the weight cache is off -- this model "
+			"mixes widths and the cache header describes one\n");
+		return;
+	}
 
 	memset(&want, 0, sizeof(want));
 	want.magic = WCACHE_MAGIC;
@@ -330,9 +384,9 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 }
 
 /* one record's payload size: q goes to the file exactly as it is held */
-static size_t wcache_qbytes(uint64_t n, uint64_t k)
+static size_t wcache_qbytes(const struct npu_tensor *t)
 {
-	return (size_t)n * npu_q_stride(k);
+	return (size_t)t->n * npu_q_stride_t(t);
 }
 
 static int wcache_read(struct npu_tensor *t, const char *name)
@@ -362,7 +416,7 @@ static int wcache_read(struct npu_tensor *t, const char *name)
 		wc.f = NULL;
 		return 0;
 	}
-	qb = wcache_qbytes(n, k);
+	qb = wcache_qbytes(t);
 	if (fread(t->q, 1, qb, wc.f) != qb ||
 	    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
 		    != (size_t)(n * ngrp))
@@ -378,7 +432,7 @@ static void wcache_write(const struct npu_tensor *t, const char *name)
 	char nm[80];
 	uint64_t n = t->n, k = t->k;
 	uint64_t ngrp = t->kgroup ? (k + t->kgroup - 1) / t->kgroup : 1;
-	size_t qb = wcache_qbytes(n, k);
+	size_t qb = wcache_qbytes(t);
 
 	if (!wc.f || !wc.writing)
 		return;
@@ -655,8 +709,8 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
  */
 static int w4file_codes(FILE *f, struct npu_tensor *t, uint64_t n, uint64_t k)
 {
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(k);
+	const int pk = t->packed;
+	const size_t stride = npu_q_stride_t(t);
 	int8_t *scratch = malloc((size_t)k);
 	uint64_t r, i;
 
@@ -679,6 +733,23 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	uint64_t n = w->ne[1], k = w->ne[0];
 	float *row;
 	double se = 0.0, sw = 0.0;
+
+	/*
+	 * ⚠ THE AWQ PAIR, SET HERE RATHER THAN ASSUMED OF THE CALLER. Both
+	 * callers today hand this a zeroed tensor -- npupool calloc's its
+	 * array and npu_slice_test writes `= { 0 }` -- and the factor is only
+	 * ever allocated further down, so nothing is leaked by this.
+	 *
+	 * It matters because the two fields are read as a PAIR by three
+	 * places now: the group gate, the batched pack, and the input reuse
+	 * key. A garbage kshash beside a NULL kscale would not crash; it
+	 * would make one device's cached input look like another tensor's
+	 * for the rest of the run, and that is a wrong answer in fluent
+	 * sentences. A field whose zero value means "no factor" should not
+	 * depend on the caller having remembered.
+	 */
+	t->kscale = NULL;
+	t->kshash = 0;
 
 	/*
 	 * ⚠ THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
@@ -706,6 +777,21 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * the quantiser at eight bits. */
 	unsigned bits = w4_env()
 		&& (!w4only || strstr(w->name, w4only)) ? 4 : 8;
+
+	/*
+	 * CHARSIU_NPU_INT8_LAYERS keeps a range of blocks at EIGHT bits while
+	 * the rest stay at four. Layers 0 and 1 are 12.5% of the weight bytes
+	 * and carry 44% of the four-bit damage, and eight bits on just those
+	 * two beats a group of 128 on all sixteen -- ppl 24.28 against 26.94,
+	 * two thirds of the whole distance to lossless, for +12.5% of bytes.
+	 *
+	 * This only became affordable when the width moved onto the tensor:
+	 * CHARSIU_NPU_W4_ONLY expresses the same mix but unpacks EVERY tensor,
+	 * so it costs a byte a code throughout, which is what all int8 costs.
+	 */
+	if (bits == 4 && layer_in_range(getenv("CHARSIU_NPU_INT8_LAYERS"),
+					w->name))
+		bits = 8;
 	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
 		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
 	/*
@@ -814,6 +900,15 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * so its minimum is 0.20 and at 0.5 AWQ is WORSE THAN OFF. Sweep it
 	 * per model; what both models agree on is only that 0.5 is past the
 	 * minimum.
+	 *
+	 * ⚠⚠ "ITS MINIMUM IS 0.20" WAS THE FLOOR OF THAT GRID. Swept downward
+	 * on tests/corpus at 300 tokens, Llama reads off 41.5289, 0.10
+	 * 33.7566, 0.15 32.5094, 0.20 35.2041 -- and qwen3's row at the same
+	 * length is NOT monotone, with a band from 0.12 to 0.15 that is worse
+	 * than either side and reproduces on a second, independent passage.
+	 * So the curve has more than one local extremum, a coarse grid cannot
+	 * be interpolated, and the good region is what is established rather
+	 * than a point inside it. docs/lab-notebook.md has the tables.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
@@ -836,18 +931,101 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * A tensor with no "blk.<n>." in its name is not a layer and is never
 	 * restricted by this.
 	 */
-	if (alpha != 0.0) {
+	{
 		const char *lr = getenv("CHARSIU_NPU_AWQ_LAYERS");
-		const char *b = strstr(w->name, "blk.");
 
-		if (lr && *lr && b) {
-			char *end;
-			long lo = strtol(lr, &end, 10);
-			long hi = *end == '-' ? strtol(end + 1, NULL, 10) : lo;
-			long ln = strtol(b + 4, NULL, 10);
+		if (alpha != 0.0 && lr && *lr && strstr(w->name, "blk.") &&
+		    !layer_in_range(lr, w->name))
+			alpha = 0.0;
+	}
+	/*
+	 * CHARSIU_NPU_AWQ_ONLY restricts the factor to tensors whose name
+	 * CONTAINS a substring -- "ffn_down", "attn", "ffn" -- which is the
+	 * other axis the LAYERS knob does not cover.
+	 *
+	 * ⚠⚠ IT IS A PROBE FOR ONE QUESTION AND THE QUESTION IS WORTH SAYING.
+	 * The exponent's ppl curve has a BAND where it is worse than on either
+	 * side (qwen3, 0.12 to 0.15, reproduced on two independent passages),
+	 * and the band is an ordinary local maximum of a continuous curve: AWQ
+	 * protects salient channels and spreads the row's dynamic range, and
+	 * the sum of two competing smooth effects can have more than one local
+	 * extremum. If every TENSOR has its own trade point, then one global
+	 * alpha is a compromise and the global curve is a sum of per-tensor
+	 * curves whose optima sit in different places -- which is exactly how
+	 * a global value lands in a region bad for many tensors at once.
+	 *
+	 * 🔑 The vendor chooses alpha PER TENSOR: 0.00 to 0.40, typically 0.03
+	 * to 0.15, read out of its own .rkllm. This knob is how a desk asks
+	 * whether the optima really do differ by tensor kind before anybody
+	 * writes a per-tensor search.
+	 *
+	 * ⚠ UNSET OR EMPTY MEANS EVERY TENSOR, the same rule the LAYERS knob
+	 * has and for the same reason: a filter this cannot satisfy must not
+	 * quietly turn the method off, or the arm that says "AWQ on" is the
+	 * arm with AWQ off.
+	 */
+	{
+		const char *on = getenv("CHARSIU_NPU_AWQ_ONLY");
 
-			if (end != lr && (ln < lo || ln > hi))
-				alpha = 0.0;
+		if (alpha != 0.0 && on && *on && !strstr(w->name, on))
+			alpha = 0.0;
+	}
+	/*
+	 * CHARSIU_NPU_AWQ_MAP gives the exponent PER TENSOR KIND:
+	 *
+	 *   "ffn_down=0.10,attn_v=0.25,attn_q=0.40,attn_k=0"
+	 *
+	 * substring=alpha, comma separated, FIRST MATCH WINS, and a tensor no
+	 * entry matches keeps whatever CHARSIU_NPU_AWQ said. An entry of 0
+	 * turns the method off for that kind, which is a setting one kind
+	 * actually wants.
+	 *
+	 * ⚠⚠ IT EXISTS BECAUSE THE PER-KIND TABLE CANNOT BE ASSEMBLED FROM ITS
+	 * OWN ROWS. Sweeping CHARSIU_NPU_AWQ_ONLY one kind at a time measures
+	 * each kind AGAINST AWQ-OFF EVERYWHERE ELSE, and the best cell of each
+	 * row is not the best combination -- the tensors compose. The table
+	 * says the optima differ (qwen3: 0.05 for attn_output, 0.10 for
+	 * ffn_down, 0.15 for ffn_up, 0.25 for attn_v and ffn_gate, 0.40 for
+	 * attn_q, and attn_k never wins at all); this is what turns that into
+	 * something that can be run and scored.
+	 *
+	 * 🔑 And it is the shape the vendor ships: alpha per tensor, 0.00 to
+	 * 0.40, typically 0.03 to 0.15, read out of its own .rkllm.
+	 *
+	 * ⚠ FIRST MATCH WINS, so order the entries most specific first.
+	 * "attn_q" before "attn" -- otherwise "attn" swallows all four.
+	 *
+	 * ⚠ A MALFORMED ENTRY MUST NOT QUIETLY MEAN OFF. atof of nonsense
+	 * returns 0.0, which would silently disable AWQ for that kind and make
+	 * "AWQ on" the arm with AWQ off -- this tree has run four of those. An
+	 * entry with no '=' is skipped rather than parsed.
+	 */
+	{
+		const char *m = getenv("CHARSIU_NPU_AWQ_MAP");
+
+		while (m && *m) {
+			const char *eq = strchr(m, '=');
+			const char *end = strchr(m, ',');
+			size_t klen;
+
+			if (!end)
+				end = m + strlen(m);
+			if (!eq || eq > end) {         /* no '=' in this entry */
+				m = *end ? end + 1 : end;
+				continue;
+			}
+			klen = (size_t)(eq - m);
+			if (klen && klen < 64) {
+				char key[64];
+
+				memcpy(key, m, klen);
+				key[klen] = '\0';
+				if (strstr(w->name, key)) {
+					alpha = atof(eq + 1);
+					break;         /* first match wins */
+				}
+			}
+			m = *end ? end + 1 : end;
 		}
 	}
 
@@ -885,7 +1063,9 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	t->n = n;
 	t->k = k;
 	t->kgroup = grp;
-	t->q = malloc((size_t)n * npu_q_stride(k));
+	/* the width is this tensor's, decided by its own bits */
+	t->packed = (bits == 4);
+	t->q = malloc((size_t)n * npu_q_stride_t(t));
 	t->scale = malloc((size_t)n * ngrp * sizeof(float));
 	t->wsum = malloc((size_t)n * sizeof(int32_t));
 	row = malloc((size_t)k * sizeof(float));
@@ -910,7 +1090,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		fprintf(stderr, "charsiu: %s stays on the CPU -- its %llu x %llu "
 			"quantised copy needs %.0f MB and would not allocate\n",
 			w->name, (unsigned long long)n, (unsigned long long)k,
-			(double)((size_t)n * npu_q_stride(k)) / 1e6);
+			(double)((size_t)n * npu_q_stride_t(t)) / 1e6);
 		free(row);
 		npu_tensor_free(t);
 		return -1;
@@ -956,12 +1136,71 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			if (f)
 				fclose(f);
 		}
-		if (!got)
-			for (uint64_t r = 0; r < n; r++) {
-				gguf_row_f32(w, r, row);
-				for (uint64_t i = 0; i < k; i++)
-					col[i] += fabs((double)row[i]);
+		if (!got) {
+			/*
+			 * ⚠⚠ AND THIS FALLBACK IS THE REFUTED VARIANT, SAID OUT
+			 * LOUD. The column means of |w| are what the first
+			 * version of AWQ used here, and the note further down
+			 * records why they are wrong: the weights worth
+			 * protecting are the ones multiplying LARGE
+			 * ACTIVATIONS, which the weights cannot know. Reaching
+			 * this quietly is how "AWQ does not work" gets
+			 * concluded from measuring something else.
+			 */
+			static int said;
+
+			/*
+			 * ⚠⚠ AND IT IS WORSE THAN NOT RUNNING AWQ AT ALL, so
+			 * warning was not enough. Llama-3.2-1B, host CPU
+			 * reference, 300 tokens:
+			 *
+			 *   AWQ off                        41.53
+			 *   AWQ 0.20 with statistics       35.20   -15.2%
+			 *   AWQ 0.20 with NO statistics    58.35   +40.5%
+			 *
+			 * Declining costs the caller nothing they had -- it
+			 * lands them on the 41.53 they would have had anyway --
+			 * and the fallback costs them 40%. So it declines, and
+			 * CHARSIU_NPU_AWQ_WEIGHTMEANS=1 keeps the refuted
+			 * variant reachable for anyone who wants it as a
+			 * control, which is the only thing it is good for.
+			 */
+			if (!charsiu_env_flag("CHARSIU_NPU_AWQ_WEIGHTMEANS", 0)) {
+				if (!said) {
+					said = 1;
+					fprintf(stderr,
+						"charsiu: AWQ is on but no "
+						"activation statistics were "
+						"found (first: %s) -- DECLINING "
+						"it. The fallback measured 40%% "
+						"WORSE than leaving AWQ off. "
+						"Record them with "
+						"CHARSIU_CALIB=<file>, then "
+						"point CHARSIU_AWQ_STATS at it "
+						"or leave it beside the gguf as "
+						"<model>.gguf.awq.\n", w->name);
+				}
+				free(col);
+				alpha = 0.0;
+			} else {
+				if (!said) {
+					said = 1;
+					fprintf(stderr,
+						"charsiu: AWQ from the column "
+						"means of the WEIGHTS, which "
+						"measured 40%% worse than off. "
+						"This is a control, not a "
+						"setting.\n");
+				}
+				for (uint64_t r = 0; r < n; r++) {
+					gguf_row_f32(w, r, row);
+					for (uint64_t i = 0; i < k; i++)
+						col[i] += fabs((double)row[i]);
+				}
 			}
+		}
+		if (alpha == 0.0)
+			goto no_awq;
 		t->kscale = malloc((size_t)k * sizeof(float));
 		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
 		/*
@@ -1055,11 +1294,12 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		}
 		free(col);
 	}
+no_awq:
 
 	{
 		struct qrows c = { t, w, k, ngrp, grp, bits, qmax,
 				   w4sym, w4clip, rms, midrise,
-				   npu_q_stride(k), npu_q_packed(), 0.0, 0.0 };
+				   npu_q_stride_t(t), t->packed, 0.0, 0.0 };
 
 		/* the diagnostic is the only thing that crosses rows */
 		if (rms)
@@ -1102,8 +1342,8 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		if (f)
 			fclose(f);
 		if (got) {
-			const int pk = npu_q_packed();
-			const size_t stride = npu_q_stride(k);
+			const int pk = t->packed;
+			const size_t stride = npu_q_stride_t(t);
 
 			t->kgroup = k;               /* one scale a row */
 			for (uint64_t r = 0; r < n; r++) {
@@ -1299,11 +1539,61 @@ void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
 void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		float *y, uint64_t row0, uint64_t nrows)
 {
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(t->k);
+	const int pk = t->packed;
+	const size_t stride = npu_q_stride_t(t);
+
+	/*
+	 * The k factor rides on the ACTIVATION, so a tensor that has one needs
+	 * its own quantisation of the same input vector. On the board this is
+	 * one multiply a k before the pack; here it is done straight so the
+	 * measurement is honest.
+	 *
+	 * ⚠ PER CALL, NOT static. npu_matvec runs on the worker threads, and a
+	 * static scratch buffer here was a race and a double free: three of
+	 * the five exponents in the first sweep produced no output at all.
+	 *
+	 * ⚠⚠ AND IT WAS PER ROW, WHICH THE PARAGRAPH ABOVE ALREADY SAID IT
+	 * SHOULD NOT BE. The scaled activation depends on `a` and on
+	 * `t->kscale` and on nothing else -- `r` does not appear in it -- so
+	 * every row of a tensor was mallocing k bytes, taking a maximum over
+	 * k, quantising k values and freeing, to arrive at the same buffer the
+	 * previous row had just built. On the output head that is 128256
+	 * identical reconstructions of one vector, and it is why an AWQ arm of
+	 * a ppl sweep runs several times longer than the arm with AWQ off.
+	 *
+	 * Hoisted, it is exactly the "per call" the note asked for. Same
+	 * arithmetic in the same order, so the answer must not move by a
+	 * digit -- which is the only test that can prove it.
+	 */
+	const int8_t *aq = a->q1;
+	int8_t *free_after = NULL;
+	float ad = a->d1;
 
 	if (getenv("CHARSIU_CALIB") && row0 == 0)
 		npu_calib_note((struct npu_tensor *)t, a);
+	if (t->kscale) {
+		int8_t *tmp = malloc((size_t)t->k);
+		float amax = 0.0f;
+
+		if (!tmp)
+			return;
+		for (uint64_t i = 0; i < t->k; i++) {
+			float v = a->f[i] * t->kscale[i];
+
+			if (fabsf(v) > amax) amax = fabsf(v);
+		}
+		ad = amax / 127.0f;
+		for (uint64_t i = 0; i < t->k; i++) {
+			int v = (int)lrintf(a->f[i] * t->kscale[i]
+					    / (ad != 0.0f ? ad : 1.0f));
+
+			if (v > 127) v = 127;
+			if (v < -127) v = -127;
+			tmp[i] = (int8_t)v;
+		}
+		aq = tmp;
+		free_after = tmp;
+	}
 	for (uint64_t r = 0; r < nrows; r++) {
 		uint64_t n = row0 + r;
 		const int8_t *qr = t->q + n * stride;
@@ -1311,45 +1601,6 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		uint64_t grp = t->kgroup ? t->kgroup : t->k;
 		uint64_t ngrp = (t->k + grp - 1) / grp;
 		double acc = 0.0;
-		const int8_t *aq = a->q1;
-		int8_t *free_after = NULL;
-		float ad = a->d1;
-
-		/*
-		 * The k factor rides on the ACTIVATION, so a tensor that has one
-		 * needs its own quantisation of the same input vector. On the
-		 * board this is one multiply a k before the pack; here it is
-		 * done straight so the measurement is honest.
-		 */
-		if (t->kscale) {
-			/*
-			 * ⚠ PER CALL, NOT static. npu_matvec runs on the worker
-			 * threads, and a static scratch buffer here was a race
-			 * and a double free: three of the five exponents in the
-			 * first sweep produced no output at all.
-			 */
-			int8_t *tmp = malloc((size_t)t->k);
-			float amax = 0.0f;
-
-			if (!tmp)
-				return;
-			for (uint64_t i = 0; i < t->k; i++) {
-				float v = a->f[i] * t->kscale[i];
-
-				if (fabsf(v) > amax) amax = fabsf(v);
-			}
-			ad = amax / 127.0f;
-			for (uint64_t i = 0; i < t->k; i++) {
-				int v = (int)lrintf(a->f[i] * t->kscale[i]
-						    / (ad != 0.0f ? ad : 1.0f));
-
-				if (v > 127) v = 127;
-				if (v < -127) v = -127;
-				tmp[i] = (int8_t)v;
-			}
-			aq = tmp;
-			free_after = tmp;
-		}
 
 		/*
 		 * ⚠ WHAT PRECISION IS THE ACTIVATION, REALLY.
@@ -1386,7 +1637,6 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 				acc += part * t->scale[n * ngrp + g];
 			}
 			y[n] = (float)acc;
-			free(free_after);
 			continue;
 		}
 		for (uint64_t g = 0; g < ngrp; g++) {
@@ -1415,8 +1665,11 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 			acc += part * t->scale[n * ngrp + g];
 		}
 		y[n] = (float)(acc * ad);
-		free(free_after);
 	}
+	/* ⚠ ONCE, AFTER THE LOOP. It used to be freed at the bottom of every
+	 * iteration, which was consistent with allocating at the top of every
+	 * iteration and is a double free the moment either one moves. */
+	free(free_after);
 }
 
 static uint64_t npu_cal_calls(void)

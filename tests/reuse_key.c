@@ -37,18 +37,26 @@ static void leader(struct reuse_key *ks, const float *x, unsigned devs,
 	reuse_keys_drop(ks, 2);
 	for (unsigned d = 0; d < 2; d++)
 		if (devs & (1u << d))
-			reuse_key_set(&ks[d], x, 4, 3072, 0x80, kslices);
+			reuse_key_set(&ks[d], x, 4, 3072, 0x80, kslices, 0);
 }
 
-/* one follower call on device d: hit, or pack and set */
+/* one follower call on device d: hit, or pack and set. ksh is the hash of
+ * the AWQ factor this tensor's weights were scaled by, 0 when AWQ is off */
+static int follower_awq(struct reuse_key *ks, const float *x, unsigned d,
+			unsigned need, uint64_t ksh)
+{
+	int hit = reuse_key_hit(&ks[d], x, 4, 3072, 0x80, need, ksh);
+
+	if (!hit)
+		reuse_key_set(&ks[d], x, 4, 3072, 0x80, need, ksh);
+	return hit;
+}
+
+/* a tensor with no AWQ factor: npuquant leaves kshash 0 */
 static int follower(struct reuse_key *ks, const float *x, unsigned d,
 		    unsigned need)
 {
-	int hit = reuse_key_hit(&ks[d], x, 4, 3072, 0x80, need);
-
-	if (!hit)
-		reuse_key_set(&ks[d], x, 4, 3072, 0x80, need);
-	return hit;
+	return follower_awq(ks, x, d, need, 0);
 }
 
 int main(void)
@@ -83,10 +91,28 @@ int main(void)
 
 	/* the width, K and zero point are part of the key */
 	leader(ks, bufA, 3u, 3u);
-	expect(reuse_key_hit(&ks[0], bufA, 6, 3072, 0x80, 3u), 0, "wider");
-	expect(reuse_key_hit(&ks[0], bufA, 4, 2048, 0x80, 3u), 0, "narrower K");
-	expect(reuse_key_hit(&ks[0], bufA, 4, 3072, 0x7f, 3u), 0, "another zero point");
-	expect(reuse_key_hit(&ks[0], bufA, 4, 3072, 0x80, 3u), 1, "the same");
+	expect(reuse_key_hit(&ks[0], bufA, 6, 3072, 0x80, 3u, 0), 0, "wider");
+	expect(reuse_key_hit(&ks[0], bufA, 4, 2048, 0x80, 3u, 0), 0, "narrower K");
+	expect(reuse_key_hit(&ks[0], bufA, 4, 3072, 0x7f, 3u, 0), 0, "another zero point");
+	expect(reuse_key_hit(&ks[0], bufA, 4, 3072, 0x80, 3u, 0), 1, "the same");
+
+	/*
+	 * ⚠⚠ THE AWQ SHAPE, and every field above says hit.
+	 *
+	 * With CHARSIU_NPU_AWQ on, what a device's BO holds is X times THAT
+	 * TENSOR'S per-k factor. q, k and v share one normed buffer and have
+	 * three different factors: same pointer, same width, same K, same
+	 * zero point, same slices. Without the hash in the key, k would read
+	 * q's scaled input and multiply it by k's weights, and the arithmetic
+	 * would be wrong by a per-channel vector -- which is exactly the kind
+	 * of wrong that still produces fluent text.
+	 */
+	leader(ks, bufA, 3u, 3u);   /* AWQ off: every hash is 0 */
+	expect(follower_awq(ks, bufA, 0, 3u, 0x51ce), 0, "a factored tensor after an unfactored one");
+	expect(follower_awq(ks, bufA, 0, 3u, 0x51ce), 1, "the same factor again");
+	expect(follower_awq(ks, bufA, 0, 3u, 0xbeef), 0, "another tensor's factor, everything else equal");
+	expect(follower_awq(ks, bufA, 0, 3u, 0), 0, "back to no factor at all");
+	expect(follower_awq(ks, bufA, 0, 3u, 0), 1, "and no factor again");
 
 	printf("  reuse key: %d of %d cases wrong\n", bad, n);
 	return bad != 0;
