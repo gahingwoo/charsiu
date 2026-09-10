@@ -8728,3 +8728,29 @@ table — including the one I built `CHARSIU_NPU_AWQ_MAP` to exploit.
 scored against a clamped baseline with clamped per-kind values. Whether a
 composite beats a good global exponent is now an open question again, not a
 closed one.
+
+### 🏁 The composite still loses, measured properly this time — and by more
+
+The earlier composite verdict was scored with a clamped baseline AND clamped
+per-kind values, so it had to be re-asked. Both sides clamp-free, qwen3:
+
+```
+  long.txt    best global 0.25   68.5076    composite   74.6805   +9.0%
+  long2.txt   best global 0.25  114.5617    composite  133.5909  +16.6%
+```
+
+**Two of two, and the margins are larger than when both sides were clamped**
+(−2.1% / +1.0% / +8.2% / +1.5% before). So the negative result survives the
+correction and is stronger for it.
+
+🔑 **AWQ's effect is not separable across tensors.** Each kind's isolated
+optimum is measured with every other kind at AWQ-off; switching them all on at
+those exponents over-corrects. A per-tensor exponent, if it is worth anything,
+needs a JOINT objective — greedy assembly is not merely suboptimal here, it is
+worse than not bothering.
+
+⚠ Which also means `CHARSIU_NPU_AWQ_MAP` has now failed its motivating
+experiment twice, at two different settings of everything else. It stays
+because it is the only way to ask the question at all, and because
+`attn_k=0`-style exclusions remain a legitimate thing to want -- but nobody
+should reach for it expecting the table's rows to add up.
