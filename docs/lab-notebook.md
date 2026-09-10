@@ -7931,3 +7931,48 @@ B's, and a non-zero batched matmul entry in B's report.
 is a complete answer to the two quality arms and correctly reports the two
 hardware arms as vacuous. A script that has never been run is not a board
 round, it is a plan for one.
+
+### 🏁 The narrow output read: which tensors, and what share of the read
+
+The read is four bytes an output element, every K slice, every row of a
+prefill, because `job.acc_out` takes the raw int32 accumulator before the
+convert. Round 165 priced it at **0.94 ms a prefill row**; two bytes would be
+0.47. The int8 TTFT gap to the vendor is **0.67 ms a row**. The whole gap is
+inside one read width.
+
+The gate is a static property of the weights and `tools/out16_bound.c` is it.
+At int8 the group is the whole row, so the per-channel requant applies exactly
+the scale the CPU applies now and the hardware emits the value in units of the
+activation scale; every `|a_q| <= 127`, so a channel is bounded by
+`127 * sum_k |w[c][k]|`.
+
+```
+  Llama-3.2-1B     100.0%   worst 0.80x   ffn_up
+  Qwen3-0.6B       100.0%   worst 0.37x   ffn_up
+  gemma-3-1b       100.0%   worst 0.54x   ffn_down
+  gemma-4-E2B      100.0%   worst 0.56x   ffn_down
+  Phi-3.5-mini      92.6%   ffn_down 20 of 32 OVER, worst 2.13x
+```
+
+**Worth the board round, and it must be per-tensor.** A global switch breaks
+Phi-3.5, whose `blk.0.ffn_down` is 2.13x over -- and that is the tensor `job.c`
+already named for varying 2971x between tokens, without ever doing the
+arithmetic. Even there 92.6% of the read is narrow.
+
+⚠ The bound is worst case: every `|a_q|` at 127 with every sign agreeing. Real
+activations run about a third of that, so Phi-3.5 would probably not overflow
+-- and an overflow is an inf that destroys the token, so "probably" cannot gate
+it.
+
+⚠ **Two bugs on the way, both the same shape, and both are why the tool prints
+a coverage percentage rather than a verdict.** It routed by SPELLING first -- a
+list of eight suffixes -- and read Phi-3.5 as having no attention weights at
+all, because Phi fuses them into `attn_qkv.weight`. Then, routing by property,
+it excluded `token_embd` unconditionally and dropped the single widest tensor
+in every tied-head model: Llama-3.2-1B's head is 128256 channels against 8192
+for the next biggest, so the denominator was missing most of itself. It follows
+llama.c's own tie rule now, and matches `token_embd.weight` EXACTLY, because
+gemma4's `per_layer_token_embd` contains that string and is a lookup.
+
+**A tool whose whole output is a percentage is a tool where the census rule is
+the result.** Both of those printed a clean, plausible table.
