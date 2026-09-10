@@ -8167,3 +8167,33 @@ and it is now measured: ~10% at 299 positions on this passage.** Any two cells
 closer than that need a longer run or another corpus before they can be
 ordered. That is a number this tree did not have, and it applies to every ppl
 comparison in this file, not only to AWQ.
+
+### 🏁 The AWQ activation was rebuilt once per ROW, and the note above it said "per call"
+
+`npu_matvec`'s `kscale` block carries **"⚠ PER CALL, NOT static"** together with
+the race that motivated it — and it was allocating k bytes, taking a maximum
+over k, quantising k values and freeing, **inside the row loop**. The scaled
+activation depends on `a` and `t->kscale` and on nothing else; `r` does not
+appear in it. Every row rebuilt what the previous row had just built, and on a
+128256-wide output head that is 128256 identical reconstructions of one buffer.
+
+Hoisted, it is exactly the "per call" the note asked for — `npu_matvec` takes a
+row range per pool worker, so once per range rather than once per row.
+
+**Same arithmetic in the same order, so the only test that can prove it is that
+nothing moves.** Warmed, alternating, one binary each, Qwen3-0.6B at 0.10:
+
+```
+  new  13.28 s      old   92.91 s
+  new  17.43 s      old  101.44 s
+```
+
+**6.3x**, and every intermediate checkpoint identical — 386.0400 / 142.4919 /
+99.7580 / 86.0915 / 82.3756 / 75.5518 / 82.9369 / 74.7559 / 77.4978, final
+80.1066, which is the sweep's own value.
+
+⚠ Host-side only: the board applies the factor at the pack, once. But it is why
+every AWQ arm of every ppl sweep here has taken several times longer than the
+arm with AWQ off — and those sweeps are how the exponent gets chosen, so the
+instrument's cost was shaping how much of the surface anybody was willing to
+measure. **The grid that stopped at 0.20 was a grid somebody had to wait for.**
