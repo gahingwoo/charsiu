@@ -8345,3 +8345,59 @@ exponents from our statistics gave corr −0.02. Optimising OUR own per tensor
 has not been tried, and it needs a ppl objective rather than a weight-error one
 — [[feedback-weight-error-is-not-functional-error]] — which the 6.3x on AWQ
 arms has just made affordable.
+
+### 🏁🏁 The optima differ by tensor kind, and one kind carries a 21% win on its own
+
+`CHARSIU_NPU_AWQ_ONLY=<substring>` restricts the factor to tensors whose name
+contains it — the axis `AWQ_LAYERS` does not cover. Its own controls first,
+because this tree has run four arms that said "AWQ on" while being the arm with
+AWQ off:
+
+```
+  AWQ off                      110.0549
+  0.25, ONLY unset              71.7770
+  0.25, ONLY=""                 71.7770   identical: empty is EVERY tensor
+  0.25, ONLY=zzz               110.0549   exactly off: no match is no AWQ
+```
+
+Then each kind alone, qwen3, `tests/corpus/long.txt`, 300 tokens:
+
+```
+  kind          0.05     0.10     0.15     0.25     0.40      best     (off 110.05)
+  attn_q      106.67   101.64   108.87   101.41    96.58      0.40
+  attn_k      114.37   111.76   118.61   113.33   112.04      none
+  attn_v      116.25    93.59    93.03    86.39    88.05      0.25
+  attn_output  92.24    95.62    98.19    92.46    95.91      0.05
+  ffn_gate     95.67    97.42    96.96    93.56    97.90      0.25
+  ffn_up      107.27    97.59    96.34   101.52   105.77      0.15
+  ffn_down    102.95    86.56   103.77   102.68   105.47      0.10
+```
+
+**Five different optima across seven kinds — 0.05, 0.10, 0.15, 0.25, 0.40 — and
+one kind that AWQ never helps anywhere.** A single global exponent cannot serve
+that, which is the whole case for a per-tensor one and is what the vendor does
+(0.00 to 0.40, typically 0.03 to 0.15).
+
+🔑 **`ffn_down` alone at 0.10 is 86.56 against 110.05, a 21% win from one kind
+— and it is SHARPLY PEAKED**: 0.05 gives 102.95 and 0.15 gives 103.77. A sweep
+at 0.05 spacing finds it; a sweep at 0.10 spacing steps over it. That is the
+concrete version of "a coarse grid over a non-smooth parameter cannot be
+interpolated", and it is worth 21% on one kind.
+
+⚠ **`attn_k`: the honest reading is "never better than off", not "hurts".** Its
+best cell is 111.76 against 110.05 — 1.6%, which is not separable at this
+resolution. 118.61 at 0.15 is 7.8% worse and probably real. The distinction
+matters because "AWQ hurts attn_k" is the sort of sentence that becomes a rule.
+
+⚠ **And a per-kind optimum measured in isolation is not the optimum in
+combination.** Every row here is that kind alone against AWQ-off everywhere
+else. The composite has to be built and measured, not assembled from the best
+cell of each row — which needs a knob that takes a per-kind alpha map, and that
+does not exist yet.
+
+▶ **Four of seven kinds have their WORST cell at exactly 0.15**, which is where
+the global curve's band is. Several independent kinds peaking at one exponent
+points at a common cause rather than seven coincidences; the candidate under
+test is the factor's clamp beginning to bind at a similar alpha across tensors
+that share activation statistics. If widening the clamp moves the band, that is
+the mechanism.
