@@ -900,6 +900,15 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * so its minimum is 0.20 and at 0.5 AWQ is WORSE THAN OFF. Sweep it
 	 * per model; what both models agree on is only that 0.5 is past the
 	 * minimum.
+	 *
+	 * ⚠⚠ "ITS MINIMUM IS 0.20" WAS THE FLOOR OF THAT GRID. Swept downward
+	 * on tests/corpus at 300 tokens, Llama reads off 41.5289, 0.10
+	 * 33.7566, 0.15 32.5094, 0.20 35.2041 -- and qwen3's row at the same
+	 * length is NOT monotone, with a band from 0.12 to 0.15 that is worse
+	 * than either side and reproduces on a second, independent passage.
+	 * So the curve has more than one local extremum, a coarse grid cannot
+	 * be interpolated, and the good region is what is established rather
+	 * than a point inside it. docs/lab-notebook.md has the tables.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
@@ -927,6 +936,38 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 
 		if (alpha != 0.0 && lr && *lr && strstr(w->name, "blk.") &&
 		    !layer_in_range(lr, w->name))
+			alpha = 0.0;
+	}
+	/*
+	 * CHARSIU_NPU_AWQ_ONLY restricts the factor to tensors whose name
+	 * CONTAINS a substring -- "ffn_down", "attn", "ffn" -- which is the
+	 * other axis the LAYERS knob does not cover.
+	 *
+	 * ⚠⚠ IT IS A PROBE FOR ONE QUESTION AND THE QUESTION IS WORTH SAYING.
+	 * The exponent's ppl curve has a BAND where it is worse than on either
+	 * side (qwen3, 0.12 to 0.15, reproduced on two independent passages),
+	 * and the band is an ordinary local maximum of a continuous curve: AWQ
+	 * protects salient channels and spreads the row's dynamic range, and
+	 * the sum of two competing smooth effects can have more than one local
+	 * extremum. If every TENSOR has its own trade point, then one global
+	 * alpha is a compromise and the global curve is a sum of per-tensor
+	 * curves whose optima sit in different places -- which is exactly how
+	 * a global value lands in a region bad for many tensors at once.
+	 *
+	 * 🔑 The vendor chooses alpha PER TENSOR: 0.00 to 0.40, typically 0.03
+	 * to 0.15, read out of its own .rkllm. This knob is how a desk asks
+	 * whether the optima really do differ by tensor kind before anybody
+	 * writes a per-tensor search.
+	 *
+	 * ⚠ UNSET OR EMPTY MEANS EVERY TENSOR, the same rule the LAYERS knob
+	 * has and for the same reason: a filter this cannot satisfy must not
+	 * quietly turn the method off, or the arm that says "AWQ on" is the
+	 * arm with AWQ off.
+	 */
+	{
+		const char *on = getenv("CHARSIU_NPU_AWQ_ONLY");
+
+		if (alpha != 0.0 && on && *on && !strstr(w->name, on))
 			alpha = 0.0;
 	}
 
