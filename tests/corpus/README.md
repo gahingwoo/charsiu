@@ -20,6 +20,7 @@ old ones incomparable; a new question gets a new file next to these.
   4237c8fc3163a359fc21bde60c7b1d8b  long.txt    2264 B
   7fd405ffb641d25ddbed66f3c6414fbe  calib.txt    562 B
   96bd8dd96214fcc776d55bbacb643dc8  ppl.txt     1003 B
+  9c1f92b423e3ab3d3f9279a8d70a4ae6  long2.txt   2983 B
 ```
 
 `ppl.txt` is a prefix of `long.txt` -- the first fourteen lines -- and is kept
@@ -39,6 +40,23 @@ question.
 
 `ppl.txt` is the short arm, for smoke tests where 300 tokens is more wall
 clock than the question deserves.
+
+⚠⚠ **`long2.txt` is the SECOND OPINION, and it exists because one passage was
+not enough.** On 2026-09-10 a sweep of AWQ's exponent on Qwen3-0.6B came back
+NOT MONOTONE at 300 tokens of `long.txt` -- 0.15 above both its neighbours by
+eight to ten percent -- while `charsiu_ppl` is deterministic, so that is the
+corpus's own sampling and not the measurement. **It puts a floor of roughly ten
+percent on what a single passage at that length can order.** Anything closer
+than that has to be checked against a different passage or a longer run before
+it is believed, and until this file there was no different passage: `ppl.txt`
+is a prefix of `long.txt` and `calib.txt` is the calibration text.
+
+It is a different subject on purpose -- a mill leat, hand papermaking, bell
+founding, winter bees -- and, like the others, ordinary English at a steady
+register with no code, no lists and no proper nouns a 1B model would have
+memorised. **It does not replace `long.txt`**: every number on record was
+measured on that one, and a second opinion is a second number, not a new
+baseline.
 
 ## The recipe the recorded numbers use
 

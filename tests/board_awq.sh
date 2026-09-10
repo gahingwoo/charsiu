@@ -85,11 +85,14 @@ trap 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -n "$
 # it is a plan for one, and this tree has lost a round to a dead loop before.
 #
 W4=${CHARSIU_AWQ_BASE:-"CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"}
-# ⚠ 0.15 IS MEASURED, NOT CONVENTIONAL. On tests/corpus at 300 tokens,
-# Llama-3.2-1B: off 41.5289, 0.10 33.7566, 0.15 32.5094, 0.20 35.2041. It is
-# also inside the vendor's own per-tensor range (0.03-0.15 typical, 0.401
-# max), which is a second line of evidence for the same place. Arm 4 sweeps it
-# anyway, because the optimum is per model.
+# ⚠ 0.15 IS IN THE MEASURED GOOD REGION, NOT A RESOLVED OPTIMUM. On
+# tests/corpus at 300 tokens, Llama-3.2-1B reads off 41.5289, 0.10 33.7566,
+# 0.15 32.5094, 0.20 35.2041 -- but qwen3's row at the same length is NOT
+# monotone, which measures the instrument at about 10% resolution and puts
+# Llama's 8% gap inside it. What IS supported: 0.10 and 0.15 both beat 0.20,
+# 0.5 is bad, and the vendor's own per-tensor exponents (0.03-0.15 typical,
+# 0.401 max) land in the same region from a direction this corpus cannot
+# affect. Arm 4 sweeps it anyway, and see its own warning about ranking.
 ALPHA=${CHARSIU_AWQ_ALPHA:-0.15}
 NTOK=${CHARSIU_AWQ_NTOK:-32}
 # long enough that the prompt is BATCHED, which is the whole subject of arm 1
@@ -216,9 +219,13 @@ for a in 0.00 0.05 0.10 0.15 0.20 0.35 0.50; do
 	printf '   alpha %s   ppl %s\n' "$a" "${P:-?}"
 done
 echo
-echo "⚠ THE SURFACE MUST BE MONOTONE ON EACH SIDE OF ITS MINIMUM. A grid that
-   is not is a grid that cannot rank its own cells: re-run the two best at
-   -n 500 before believing either."
+echo "⚠⚠ THE SURFACE MUST BE MONOTONE ON EACH SIDE OF ITS MINIMUM, AND ON THE
+   HOST AT 300 TOKENS QWEN3'S IS NOT. That measures the instrument rather
+   than the knob: ~10% resolution at 299 scored positions of one passage.
+   Two cells closer than that cannot be ordered -- re-run the best pair at
+   -n 500, or on another corpus, before believing either.
+⚠ And a winner on the boundary of the grid is not a winner, it is an edge:
+   extend the grid before naming it."
 
 echo
 echo "board_awq: $fail identity checks failed"

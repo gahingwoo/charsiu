@@ -29,5 +29,6 @@ check() {
 check long.txt  4237c8fc3163a359fc21bde60c7b1d8b
 check calib.txt 7fd405ffb641d25ddbed66f3c6414fbe
 check ppl.txt   96bd8dd96214fcc776d55bbacb643dc8
-echo "  corpus: $bad of 3 files changed"
+check long2.txt 9c1f92b423e3ab3d3f9279a8d70a4ae6
+echo "  corpus: $bad of 4 files changed"
 exit $bad

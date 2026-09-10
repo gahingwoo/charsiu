@@ -989,7 +989,7 @@ dev)	for f in $PROBE_SCRIPTS; do
 	# They resolve it as $D/corpus where $D is the script's own directory,
 	# so on the board it has to be $BIN/corpus.
 	#
-	for f in long.txt calib.txt ppl.txt; do
+	for f in long.txt calib.txt ppl.txt long2.txt; do
 		[ "$DRY" = 1 ] || [ -r "$SRC/tests/corpus/$f" ] || continue
 		as_root mkdir -p "$BIN/corpus"
 		as_root cp "$SRC/tests/corpus/$f" "$BIN/corpus/$f"
