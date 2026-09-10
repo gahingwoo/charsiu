@@ -901,8 +901,18 @@ struct charsiu_npu {
 	 * argued about.
 	 */
 	int kwide_only;
-	/* one message per REASON; the pointer identifies it, see whine() */
-	const char *whined[8];
+	/*
+	 * one message per REASON; the pointer identifies it, see whine()
+	 *
+	 * ⚠ IT HAS TO BE BIGGER THAN THE NUMBER OF REASONS. whine() records a
+	 * message only if there is room, and a message it could not record is
+	 * one it can never recognise again -- so past the end of this table
+	 * the dedupe stops and the reason prints on EVERY call, which on a
+	 * prefill is a line per tensor per row. There were 8 slots against 28
+	 * call sites, so the last twenty were only quiet by never being the
+	 * first eight to fire. 32 covers every site with room to add.
+	 */
+	const char *whined[32];
 	unsigned n_whined;
 	int serialpack;
 	/*
