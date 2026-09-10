@@ -9077,3 +9077,66 @@ without setting the group, and I was one passage away from calling that a bug
 in a command everyone copies. Sixth time today the second passage changed the
 answer; the first five all went the other way, which is exactly why the sixth
 has to be run rather than assumed.
+
+### 🏁🏁🏁 THE BOARD ROUND: six arms, zero identity checks failed
+
+`board_awq.sh` on the ROCK 4D, Llama-3.2-1B, `/opt/charsiu/corpus/long.txt`
+(md5 verified identical to the desk's), 561 s, relogins 0.
+
+**Board against host, at the corrected settings:**
+
+```
+                        board       host      delta
+  int4                 33.4149    33.8071     1.2%
+  + AWQ alpha 0.20     23.7935    23.7173     0.3%
+  + INT8_LAYERS=3-4    22.0356    22.0818     0.2%
+```
+
+🔑 **They agree to within 1.2%.** The host reference is a faithful instrument
+for the board's quantiser — once the group is set, which is the whole of what
+was wrong with it before today.
+
+### 🏁 And the TTFT answer was in arm 1, not in anything I chased tonight
+
+```
+  arm 1   prompt   refuse 2643 ms   batch 515 ms    5.1x
+```
+
+That is this morning's fix, priced. With AWQ on, the batched path used to
+REFUSE — falling back to a row at a time — so turning AWQ on cost **five times
+the prefill**. It does not any more.
+
+⚠ I spent the evening pricing read volume and K slices for 12% of a prefill
+row, and the 5x was sitting in a fix made twelve hours earlier that nobody had
+measured. **The cheapest TTFT work available was to measure what had already
+been repaired.**
+
+### 🏁 The clamp default change: the hardware agrees, independently
+
+```
+  arm 5   clamp 2.0  26.9265     6.0  23.7935     64.0  23.7935
+```
+
+6.0 and 64.0 are **identical to the last digit**, which is the proof that 6.0
+does not bind at alpha 0.20 — exactly as `1000^0.2 = 3.98` predicts. And 2.0
+costs 13.2% where the host measured 14.4%. Two independent measurements of the
+same claim, on different hardware, agreeing.
+
+**arm 4** is smooth and unimodal on the board with its minimum at 0.20, which
+is the host's answer. **arm 2**: AWQ_SHARE gives identical tokens and +2.9%
+decode (13.92 -> 14.33 tok/s), so the group can share one packed input.
+
+### ⚠ Two disagreements, both about 2%, both inside the resolution band
+
+```
+  arm 3   AWQ_LAYERS=0-2    board 23.2380 BETTER   host 24.5122 WORSE
+  arm 6   INT8_LAYERS=1-1   board 22.4623 worse than 0-1's 22.1619
+                            host  22.3404 better than 0-1's 22.5511
+```
+
+**So "1-1 gets the same for half the bytes" does NOT hold on the board.** It
+was two host passages agreeing; the hardware says otherwise. `3-4` being best
+holds on both — board 22.0356, host 22.0818.
+
+⚠ Both disagreements are ~2%, which is inside the ~10% one passage resolves.
+Neither is a contradiction; both are cells that were never separable.
