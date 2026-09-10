@@ -7934,6 +7934,11 @@ round, it is a plan for one.
 
 ### 🏁 The narrow output read: which tensors, and what share of the read
 
+⛔⛔ **RETRACTED — see "the narrow read was measured dead on 09-08" at the end
+of this file.** This section and the next treat a road that rounds 167-168 had
+already closed. Read them as documentation for `tools/out16_bound.c` and not
+as a plan.
+
 The read is four bytes an output element, every K slice, every row of a
 prefill, because `job.acc_out` takes the raw int32 accumulator before the
 convert. Round 165 priced it at **0.94 ms a prefill row**; two bytes would be
@@ -7978,6 +7983,9 @@ gemma4's `per_layer_token_embd` contains that string and is a lookup.
 the result.** Both of those printed a clean, plausible table.
 
 ### ⚠⚠ The second gate on a narrow read, and it applies to only one of the two widths
+
+⛔ **Also retracted, except for the fp16-vs-int8 partial-sum distinction, which
+survives.** See the retraction at the end of this file.
 
 The first version of this entry said a narrow read cannot carry a partial sum.
 That is right for one width and wrong for the other, and the difference decides
