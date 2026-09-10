@@ -34,7 +34,16 @@ if [ -f "$M.awq" ]; then
 	exit 1
 fi
 
-export CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1
+#
+# ⚠⚠ W4_GROUP=1024 BECAUSE THE HOST REFERENCE DOES NOT GET IT FOR FREE.
+# llama_auto_kmax() pins the group to 1024 and is called only when the NPU is
+# on, so `CHARSIU_NPU=0` takes npuquant's code default of one absmax a row --
+# a quantiser the board never runs. The assertions here are relational and
+# hold either way, but the NUMBERS this prints are read by people, and they
+# should be the board's.
+#
+export CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+       CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024
 ppl() { "$B"/charsiu_ppl "$M" "$E" -n 300 2>/dev/null | tail -1 |
         grep -o 'ppl [0-9.]*' | awk '{print $2}'; }
 

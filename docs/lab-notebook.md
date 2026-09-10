@@ -8936,3 +8936,32 @@ degenerates to one scale a row. For that model there is nothing between
 +24.5% for the same Llama step. The gain side is computed and exact; the price
 side is not even well determined. Anything built on this trade would be built
 on the shakier half.
+
+### 🏁🏁🏁 23.7173 — the same quantiser, measured where it actually lives
+
+`host_awq.sh` now sets the group the board runs, and says why. Llama-3.2-1B,
+`tests/corpus/long.txt`, 300 tokens:
+
+```
+  AWQ off             33.8071      (was reported as 41.5289 -- that is UNGROUPED)
+  AWQ on, no stats    33.8071      declines, equal to off ✓
+  AWQ on, with stats  23.7173      -29.9%
+```
+
+**23.7173 is charsiu's best four-bit result on this model**, at the board's own
+group 1024 with the corrected AWQ — alpha 0.20, clamp 6.0.
+
+🔑 **This morning the best number in this tree was 35.2041, labelled "group
+1024", and it was neither.** It was ungrouped, through a clamp that was
+binding. Same quantiser, same machine, same passage: **35.2041 → 23.7173, a
+32.6% improvement, and not one line of quality logic changed.** All of it was
+putting the measurement back in the configuration it was supposed to be in.
+
+⚠ Which is the whole lesson of the day in one number. Three faults — a default
+that outlived its reason, two knobs that had to agree and did not, a function
+reachable only when the NPU is on — none of them a bug, all of them producing
+plausible numbers, and between them they were hiding a third of the method.
+
+⚠ The board has not run this. What the board has run is 40.83 at alpha 0.5 and
+clamp 2.0, which is now known to be the wrong end of both knobs.
+`tests/board_awq.sh` is five arms and one command.

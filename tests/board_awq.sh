@@ -77,6 +77,15 @@ trap 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -n "$
 
 #
 # ⚠ CHARSIU_AWQ_BASE EXISTS SO THIS SCRIPT CAN BE RUN BEFORE THE BOARD IS.
+#
+# ⚠⚠ AND A DESK OVERRIDE MUST CARRY W4_GROUP=1024 ITSELF. llama_auto_kmax()
+# pins KMAX and the group to 1024 and is called only when the NPU is on, so a
+# base with CHARSIU_NPU=0 measures one absmax a row -- not what the board runs.
+# The full desk base is:
+#
+#   CHARSIU_AWQ_BASE="CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+#                     CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024"
+#
 # Setting it to "CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1" runs
 # every arm against the host CPU reference on the SAME quantised weights:
 # arms 3 and 4 are quality questions and that is a complete answer to them,
