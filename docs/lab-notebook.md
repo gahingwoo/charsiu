@@ -8834,3 +8834,62 @@ over 112 tensors with a perplexity objective is not a desk experiment.
   do not bother with per-kind         three ways, all worse
   worth                               32-38% against AWQ off
 ```
+
+### ⛔⛔⛔ THE HOST CPU REFERENCE HAS NEVER MEASURED THE BOARD'S QUANTISER
+
+`llama_auto_kmax()` pins `CHARSIU_NPU_KMAX` and `CHARSIU_NPU_W4_GROUP` to 1024
+— and it is called from inside `if (charsiu_env_flag("CHARSIU_NPU", 0))`. The
+host reference runs `CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1`, so **it never reaches
+that function** and takes the code defaults instead: `grp = k` in npuquant.c,
+one absmax over a whole row.
+
+**So every quality number ever measured on the host reference in this tree is
+UNGROUPED, while the board runs group 1024.** Llama-3.2-1B, int4:
+
+```
+  no CHARSIU_NPU_W4_GROUP    41.5289    <- what the host reference measures
+  CHARSIU_NPU_W4_GROUP=1024  33.8071    <- what the board actually runs
+```
+
+⚠ The function's own comment names the hazard exactly — *"the code defaults
+are CHARSIU_NPU_KMAX 4096 in npudev.c and, in npuquant.c, a group of k -- one
+absmax over a whole row. No board round has ever run that pair"* — and it is
+right. What it does not say is that the HOST reference runs that pair every
+time, which is where the tree's entire quality record comes from.
+
+### 🏁 The headline survives: AWQ still helps at the board's own group setting
+
+alpha 0.20 (Llama) and 0.25 (qwen3), clamp at the new default 6.0:
+
+```
+                    ungrouped   ungrouped   group1024   group1024
+                       off       + AWQ         off       + AWQ
+  Llama  long        41.5289     28.0368     33.8071     25.3664   -25.0%
+         long2       88.5643     61.6044     77.3405     44.0703   -43.0%
+  qwen3  long       110.0549     68.5076     95.5754     64.0527   -33.0%
+         long2      153.8779    114.5617    164.8471    106.1014   -35.6%
+```
+
+🔑 **`group1024 + AWQ` is the best cell in all four rows.** Grouping and AWQ
+both attack a row's dynamic range and they were the obvious candidates to
+substitute for each other; they do not. They compose, and AWQ is worth 25 to
+43% on top of the grouping the board already has.
+
+⚠ **qwen3's long2 says grouping alone makes it WORSE** — 164.85 against 153.88
+ungrouped — while on long it helps (95.58 against 110.05). Grouping's own value
+is passage-dependent for that model. AWQ's is not.
+
+### ⛔ And a baseline I mis-copied, which understated AWQ
+
+The alpha re-sweep's header said *"off: Llama 41.5289 / 69.9949 (long2)"*.
+**69.9949 is not an AWQ-off number** — it is alpha 0.15 at clamp 2.0, copied
+out of the wrong row of the clamp sweep. Llama's true long2 AWQ-off is
+**88.5643**.
+
+The error understated AWQ throughout: I recorded long2 as `69.9949 -> 61.6044`,
+−12.0%, where it is `88.5643 -> 61.6044`, **−30.5%**. And I wrote that "on
+long2 only 0.15 to 0.35 beat off" — against the true baseline **every alpha in
+the sweep beats off**, 85.80 to 83.86 against 88.56.
+
+⚠ A number carried from one table's header into another's is not a
+measurement, and this one had a row label attached that I did not re-read.
