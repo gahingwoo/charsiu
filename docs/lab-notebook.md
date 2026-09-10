@@ -8965,3 +8965,42 @@ plausible numbers, and between them they were hiding a third of the method.
 ⚠ The board has not run this. What the board has run is 40.83 at alpha 0.5 and
 clamp 2.0, which is now known to be the wrong end of both knobs.
 `tests/board_awq.sh` is five arms and one command.
+
+### ⛔ INT8_LAYERS is worth half what its own entry claims, once AWQ is on
+
+Its record — *"Llama 41.53 → 26.07, 65.6% of the gap for 12.5% of the bytes,
+about five times their share"* — was measured UNGROUPED and with AWQ off.
+Neither is what the board runs. At group 1024, alpha 0.20, clamp 6.0:
+
+```
+                      long.txt    long2.txt
+  int4                 33.8071      77.3405
+  int4 + AWQ           25.3664      44.0703
+  INT8_LAYERS=0-1      23.6300      45.5554
+  INT8_LAYERS + AWQ    23.4235      41.8643
+```
+
+🔑 **AWQ and INT8_LAYERS are near-substitutes, not additions.** Both attack the
+same thing — the first two layers carry 44% of the four-bit damage — and adding
+INT8_LAYERS on top of AWQ buys **0.9% on long and 8.1% on long2, for 12.5% more
+weight bytes.** AWQ costs no bytes at all.
+
+Against all-int8 at 17.9772, the gap framing its entry uses:
+
+```
+  recorded (ungrouped, no AWQ)   65.6% of the gap for 12.5% of bytes   5.2x
+  board's group, with AWQ        26.3%                                 2.1x
+```
+
+⚠ **And the two passages disagree about which of the two is better alone**:
+long says INT8_LAYERS by 6.9%, long2 says AWQ by 3.3% — and AWQ is free. So
+"which one" is not resolved; "they do not add up" is.
+
+⚠ int8 at 17.9772 is unaffected by any of this: npuquant collapses an
+eight-bit tensor to one scale a row deliberately, because tensor_grouped()
+also requires `g->w4` and a board round once read a grouped int8 scale array
+as one-per-row and recorded ppl 272369 as "the int8 path emits noise".
+
+▶ The shipped default keeps INT8_LAYERS off, so nothing ships wrong. What
+changes is the recommendation: **turn AWQ on first — it is free — and then ask
+whether 12.5% more bytes is worth 1 to 8%.**
