@@ -9048,3 +9048,32 @@ passages:**
 ▶ So the recommendation is: **AWQ first (free), then `1-1` if bytes matter or
 `3-4` if quality does.** `0-1` was the right answer to a question measured in a
 configuration the board does not run.
+
+### ⛔ Does the calibration have to be recorded under the quantiser it will be used with? NOT RESOLVED
+
+The six-arm dry run's baseline read 23.7173 where the same cell measured
+earlier read 25.3664 — same alpha, same group, same passage. The only
+difference was the statistics file: `board_awq.sh` records its own under
+group 1024, and the earlier one was recorded ungrouped. Since the statistics
+are `mean |x_k|` and the activations depend on the quantised weights, a
+different quantiser genuinely produces a different factor, and 6.5% looked
+like a rule: **calibrate under the configuration you will run.**
+
+The second passage says the opposite:
+
+```
+                     long.txt              long2.txt
+  stats ungrouped     25.3664               44.0703
+  stats at g1024      23.7173               46.3016
+                     g1024 better 6.5%    ungrouped better 4.8%
+```
+
+**Opposite signs, so it is not resolved.** Recording the calibration under a
+different quantiser does produce a materially different factor — worth 5 to 6%
+either way — but which is better is not determined by these two passages.
+
+⚠ **The README's recipe stays as it is.** It teaches recording the statistics
+without setting the group, and I was one passage away from calling that a bug
+in a command everyone copies. Sixth time today the second passage changed the
+answer; the first five all went the other way, which is exactly why the sixth
+has to be run rather than assumed.
