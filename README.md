@@ -567,11 +567,29 @@ does. At each model's own best setting:
   Llama   32.5094 -> 30.1937   -7.1%   (both at alpha 0.15)
 ```
 
-**`CHARSIU_NPU_AWQ_CLAMP=4.0` is the better setting in the useful range**
-(0.10 to 0.25), on two models and two passages. ⚠ It is NOT better everywhere:
-at 0.65 the narrow clamp wins on both models, by 20% and 8.8%, so the clamp is
-protecting something real where the exponent is too large. Between 0.25 and
-0.5 the two models disagree.
+**The right setting is stated as a bound, not a number: the clamp should be at
+least `(1/floor)^alpha`, so that it never binds.** The factor has a SECOND
+bound that had no knob until today -- the statistic is floored at `1e-3 * mean`
+before the exponent, capping the factor at `(1/floor)^alpha` = 2.82 at alpha
+0.15 and 5.62 at 0.25 -- and that floor is what the divide-by-nearly-zero
+protection actually is. Swept over a thousandfold range with
+`CHARSIU_NPU_AWQ_FLOOR`, the floor moves perplexity by under 2.2%, so it is not
+a lever and 1e-3 stays.
+
+With the floor held out of the way the question is simply whether the clamp
+binds, and there the answer is unanimous:
+
+```
+  Llama  long    32.5094 -> 30.1937   -7.1%
+  Llama  long2   69.9949 -> 67.3171   -3.8%
+  qwen3  long    71.7770 -> 68.5076   -4.5%
+  qwen3  long2  117.6984 -> 114.5617  -2.7%
+```
+
+⚠ **It is not "remove the clamp".** At alpha 0.65 the floor allows factors up
+to 1000^0.65 = 89 and the narrow clamp is what saves the model -- Llama 72.17
+at hi=2 against 86.66 at hi=4. The clamp earns its keep exactly where the
+exponent is too large to be used at all.
 
 ⚠ The default stays at 2.0 because every number on record was measured there,
 and moving it silently would make them all unreproducible.
