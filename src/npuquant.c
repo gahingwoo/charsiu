@@ -735,6 +735,23 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	double se = 0.0, sw = 0.0;
 
 	/*
+	 * ⚠ THE AWQ PAIR, SET HERE RATHER THAN ASSUMED OF THE CALLER. Both
+	 * callers today hand this a zeroed tensor -- npupool calloc's its
+	 * array and npu_slice_test writes `= { 0 }` -- and the factor is only
+	 * ever allocated further down, so nothing is leaked by this.
+	 *
+	 * It matters because the two fields are read as a PAIR by three
+	 * places now: the group gate, the batched pack, and the input reuse
+	 * key. A garbage kshash beside a NULL kscale would not crash; it
+	 * would make one device's cached input look like another tensor's
+	 * for the rest of the run, and that is a wrong answer in fluent
+	 * sentences. A field whose zero value means "no factor" should not
+	 * depend on the caller having remembered.
+	 */
+	t->kscale = NULL;
+	t->kshash = 0;
+
+	/*
 	 * ⚠ THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
 	 * IN. The hardware's coefficient buffer carries ONE multiplier per
 	 * output channel, so charsiu's NPU weights are quantised per channel --

@@ -8020,3 +8020,51 @@ trade, from its own file, and it is now on both sides of a decision rather than
 just recorded.
 
 `tools/out16_bound.c --kmax N` prints both shares.
+
+### ⛔⛔ RETRACTION: the narrow read was measured dead on 09-08 and I reopened it
+
+The two sections above — "the narrow output read: which tensors, and what share
+of the read" and "the K split gates an int8 read and not an fp16 one" — treat
+the narrow read as a live lead worth a board round. **It is not, and the reason
+is three entries up this same file.**
+
+Round 168's own conclusion, written two days before I wrote those: the width
+register bundle has **exactly two values, 1 and 4 — there is no 2**, so an fp16
+output is not reachable in it at all. And the one-byte width that IS reachable
+was measured:
+
+```
+  one byte, ppl                125.30   against 43.66 four bytes
+  mode 4, coefficient rewritten per call with a_scale folded in
+                               ran, and did not help
+```
+
+because ffn_down's 2971x swing is the **SHAPE** of `sum(w_q a_q)` and not its
+magnitude, so following the activation scale does not track it. Wide KMAX was
+measured too: read −25%, chunk cap halved, ~3% only at prompt ≤ 80, and
+`--batch` at KMAX 4096 gives **ppl 4.9e12**. And the clean int8 decomposition
+says there is no single 0.67 to take at all — `pack 0.87 · submit 0.08 ·
+fence 0.86 · read 0.93 · scale 0.25` plus attention 0.88, with the fence being
+hardware MAC.
+
+**So `tools/out16_bound.c` is a bound on a width nobody can select, and the
+"⚠⚠ Phi-3.5 is zero, at --kmax 4096 it reads 82.8%" paragraph recommends
+buying a thing that was already priced as a loss.** The tool stays because the
+bound is cheap and correct and would matter the day an fp16 width register
+turns up somewhere else; the two sections above should be read as its
+documentation and not as a plan.
+
+⚠ **What survives the retraction** is one distinction that was not written down
+before: fp16 partial sums are fine and int8 partial sums are not, because
+fp16's precision is relative and int8's is absolute against a scale fixed
+before the dispatch. If an fp16 width is ever found, the K split does not gate
+it. That is worth keeping; the rest of the two sections is not.
+
+⚠⚠ **And the process failure is the point.** The closure was in this file and
+in the project's own memory under "three roads measured dead today, do not
+reopen". I read the notebook's ROUND ENTRIES, found round 165's price on the
+read, and started from there — without reading forward three entries to round
+168, which is where the same thread ends. **An entry that opens a lead and an
+entry that closes it look identical from a grep for the lead's own words.** The
+fix is to search for the close, not the open: grep the thing's name and read the
+LAST hit first.

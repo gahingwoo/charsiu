@@ -4,6 +4,24 @@
  * WHICH TENSORS COULD HAVE THEIR OUTPUT READ BACK AS fp16, AND WHAT SHARE OF
  * THE READ THAT IS.
  *
+ * ⛔⛔ AND THE ROAD THIS SERVES IS CLOSED. Read this paragraph before acting on
+ * anything below it.
+ *
+ * Rounds 167-168 swept the output width on the board and it has EXACTLY TWO
+ * VALUES, 1 and 4. There is no 2, so an fp16 output cannot be selected in that
+ * register bundle at all. The one-byte width that CAN be selected was measured
+ * at ppl 125.30 against 43.66, and the fix for it -- rewriting the coefficient
+ * buffer per call with the activation scale folded in -- was written, run, and
+ * did not help, because ffn_down's 2971x swing is the SHAPE of sum(w_q a_q)
+ * and not its magnitude. Wide KMAX was measured and loses (--batch at 4096
+ * gives ppl 4.9e12).
+ *
+ * This tool was written on 2026-09-10 by somebody who had read round 165's
+ * price on the read and not round 168's answer. It computes a correct and
+ * cheap static bound; it would matter the day an fp16 width register turns up
+ * somewhere outside that bundle. It is not a plan, and the KMAX suggestion in
+ * its output notes buys something already priced as a loss.
+ *
  * charsiu reads the raw int32 accumulator (job.acc_out) on every dispatch:
  * four bytes an output element, every K slice, every row of a prefill. Round
  * 165 priced it -- prefill reads 0.94 ms a row at four bytes an element, and
