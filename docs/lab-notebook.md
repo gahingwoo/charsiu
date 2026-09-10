@@ -7458,3 +7458,52 @@ one describing a check that does.
 The refusal is now written. It costs the batch and keeps the answer. Applying
 the factor on that path is the better fix and needs the board, because the path
 does not exist on the host.
+
+### 🏁 Layer 1 is theirs, and the gauge is what costs it
+
+The full-model 58.76 was attributed to "the reconstruction, not their
+quantiser". **That was wrong and the check that says so is the one that should
+have been run first**: take the calibration exactly, from the folded norm,
+rather than fitting it.
+
+```
+  V / (W * c), one number a row, spread within a row
+    blk.1.ffn_up     r = 5.4668     6.5%      blk.3.attn_q   r = 1.0024   6.8%
+    blk.1.ffn_gate   r = 1.0093     6.5%      blk.6.ffn_up   r = 1.0571   6.0%
+```
+
+Uniform at 6 to 8% everywhere including layer 1 -- that is the int4 floor and
+nothing else. And the two halves of the gauge multiply out:
+
+```
+  layer      r median   d median   d * r     spread
+      0        1.2884     0.7829   1.0054      3.6%
+      1        5.4668     0.1842   1.0131      4.5%
+     15        1.6480     0.6078   1.0057      4.1%
+```
+
+So the reconstruction is right, `c` is right, and the gauge cancels. Swapping
+one layer at a time then says where the cost is:
+
+```
+                        reference   charsiu   vendor
+  layer 1 alone           19.8844   21.4953   29.0294    +8.1%  vs  +46.0%
+  layer 6 alone           19.8844   19.9086   20.1796    +0.1%  vs   +1.5%
+  layer 1, FFN only       19.8844      --     28.5822          +43.7%
+  layer 1, attention only 19.8844      --     19.9806           +0.5%
+```
+
+**Layer 1's damage is entirely in its FFN**, which is where the extreme gauge
+is. `ffn_up` carries r = 5.47 and `ffn_down` undoes it at 0.184, and the row
+gauge only spreads 2.5x across `ffn_up`'s rows -- so it is not a wild spread,
+it is that `ffn_down` must now cover the gauge's variation on top of its own
+column variation with one int4 scale a row.
+
+🔑 **The gauge is not free. It costs quality in the tensor that undoes it**, and
+it is the vendor's own design choice. charsiu pays +8.1% on that layer where
+they pay +46.0%.
+
+⚠ And the earlier sentence was the residual-as-measurement mistake in another
+costume: "58.76 minus 32.13 is layer 1, and layer 1 is where my reconstruction
+is least sure, so it must be mine." Both halves were true and the conclusion
+was not.

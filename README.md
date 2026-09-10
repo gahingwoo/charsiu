@@ -407,12 +407,26 @@ run over exactly the same matrices, gives the same answer:
 **The vendor's four-bit weights cost about 1.7x what charsiu's cost**, measured
 three times over disjoint additions of tensors.
 
-⚠ Layer 1 is excluded from all three. It carries an extreme second gauge -- a
-per-output-row factor on `ffn_up` (rho 22.3) undone by `ffn_down`'s columns
-(rho 0.298) -- and with it in, the file reads 58.76 against 32.13 without. That
-step is the reconstruction, not their quantiser: layers 0 and 2 cost charsiu
-23.81 -> 26.67 as well, so the layers really are more sensitive, and only layer
-1 moves the vendor arm on its own.
+⚠ Layer 1 is excluded from all three, and it is excluded because it is an
+outlier rather than because it is unreadable. With it in, the file reads 58.76
+against 32.13 without. Swapping in that one layer on its own:
+
+```
+                        reference   charsiu   vendor
+  layer 1 alone           19.8844   21.4953   29.0294
+  layer 6 alone           19.8844   19.9086   20.1796
+  layer 1, its FFN only   19.8844      --     28.5822
+  layer 1, attention only 19.8844      --     19.9806
+```
+
+**It is their weights, not my reading of them.** The reconstruction is checked
+there and passes: with the calibration taken exactly from the folded norm,
+`V / (W * c)` is one number per row with 6.5% of spread -- the int4 floor --
+and `ffn_down`'s column factor times `ffn_up`'s row factor is 1.0131. What the
+bisect shows is that layer 1's damage is entirely in its FFN, which is exactly
+where the extreme gauge lives: `ffn_up` at rho 22.3 undone by `ffn_down` at
+0.298. **The gauge is not free -- it costs quality in the tensor that undoes
+it**, and charsiu pays +8.1% on that same layer where the vendor pays +46.0%.
 
 At the same granularity the zero point is worth 2.3%, and charsiu's finer group
 is worth more than that. Pricing the zero point on its own, over all 112
