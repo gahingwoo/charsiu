@@ -8550,3 +8550,72 @@ three nested subsets, so what they do per tensor is not a target to copy.
 ▶ The better-supported lead is the plain one: **the clamp**, a single global
 setting worth 5 to 7% at each model's own best exponent, on two models and two
 passages.
+
+### 🏁🏁 The AWQ factor has TWO bounds, and the one that has been swept is the wrong one
+
+`CHARSIU_NPU_AWQ_CLAMP` has been swept repeatedly. The other bound had no knob
+at all: the statistic is floored at `1e-3 * mean` before the exponent, which
+caps the factor at **(1/floor)^alpha** whatever the data does — 1000^alpha at
+the shipped value, so 2.82 at alpha 0.15 and 5.62 at 0.25.
+
+🔑 **Measurable two independent ways, and they agree.** Widen the clamp and the
+perplexity stops moving once `hi` passes that cap, because the clamp is no
+longer the tighter of the two — Llama at alpha 0.15 gives 30.1937 identically
+at hi = 3.0, 3.5, 4.0 and 6.0. Computed straight off the statistics file, the
+largest factor in that model is **2.806** against a theoretical 2.818.
+
+⚠ **And it is the FLOOR that binds, not the data.** Llama and Qwen3 have the
+same maximum factor at the same alpha — 2.806 against 2.784 at 0.15, 5.581
+against 5.508 at 0.25 — because both are pinned by the hardcoded constant
+rather than by their own activations. So *"the clamp behaves differently on the
+two models"* was never true: they were being measured at different alphas.
+
+⚠⚠ **The floor is not the clamp wearing a different number.** FLOOR=1e-2 caps
+the factor at 100^0.15 = 1.99, near enough the same ceiling as CLAMP=2.0, and
+gives **30.7720 where the clamp gives 32.5094**. The clamp is applied AFTER the
+geometric mean, so it truncates the tails; the floor is applied BEFORE, so it
+moves the mean and renormalises every factor.
+
+**And the floor is not a lever.** Swept with the clamp held inert at 64:
+
+```
+  floor=          1e-2     3e-3     1e-3     3e-4     1e-4     1e-5
+  Llama  long   30.7720  30.4933  30.1937  30.2091  30.3988  30.3834
+         long2  66.9247  66.5240  67.3171  67.8814  67.4706  68.0377
+  qwen3  long   69.1073  69.8998  68.5076  68.4958  68.8661  68.7824
+         long2 117.1189 115.7779 114.5617 115.4848 115.6818 114.5572
+```
+
+**≤2.2% spread over a thousandfold range**, the passages disagree on the best
+cell, and the shipped 1e-3 is at or beside the best in three rows of four. It
+stays.
+
+### 🔑 So the whole effect is the clamp, and stated properly it is 4 of 4
+
+With the floor held out of the way, the question is not "which hi" but **does
+the clamp bind at all**. Clamp 2.0 against a clamp wide enough to be inert:
+
+```
+  Llama  long    32.5094 -> 30.1937   -7.1%
+  Llama  long2   69.9949 -> 67.3171   -3.8%
+  qwen3  long    71.7770 -> 68.5076   -4.5%
+  qwen3  long2  117.6984 -> 114.5617  -2.7%
+```
+
+⚠ **Four of four, and I called qwen3 "not resolved" an hour ago** — that was
+reading the bumpy middle of its curve (2.5, 3.0, 3.5 disagree between
+passages). The endpoints do not disagree. **A comparison is resolved or not as
+a COMPARISON; "the curve is noisy" is not a property the whole row shares.**
+
+**The recommendation, in terms of the bound rather than a number:** the clamp
+should be at least `(1/floor)^alpha` so that it never binds, and the floor —
+which is what the divide-by-nearly-zero note is actually about — does the
+protecting on its own. At alpha 0.15 that is 2.82, at 0.25 it is 5.62.
+
+⚠ **It is not "remove the clamp".** At alpha 0.65 the floor allows factors up
+to 1000^0.65 = 89, and there the narrow clamp is what saves the model: Llama
+72.17 at hi=2 against 86.66 at hi=4. The clamp earns its keep exactly where the
+exponent is too large to use.
+
+⛔ The default stays 2.0 regardless: every AWQ number on record was measured
+there, and moving it silently would make them unreproducible.
