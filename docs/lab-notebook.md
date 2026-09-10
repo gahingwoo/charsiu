@@ -7507,3 +7507,32 @@ they pay +46.0%.
 costume: "58.76 minus 32.13 is layer 1, and layer 1 is where my reconstruction
 is least sure, so it must be mine." Both halves were true and the conclusion
 was not.
+
+### ⚠ AWQ with no statistics does not decline -- it runs the refuted variant
+
+`CHARSIU_NPU_AWQ=0.5` is what the README documents, and on its own it does not
+do what the README describes. `npuquant` reads the activation statistics from
+`CHARSIU_AWQ_STATS`, and when that is unset -- or when the tensor is not in the
+file -- it falls through to **the column means of the weights**, silently.
+
+That is the variant this tree already measured and rejected. Its own note says
+why: "the weights worth protecting are the ones multiplying LARGE ACTIVATIONS,
+so the factor is built from mean |x_k| over a calibration run. Measuring the
+wrong signal and concluding the method does not work is the mistake, not the
+method." The fallback is precisely the wrong signal, reached by default.
+
+Two changes, both verified on the host:
+
+**It says so now.** The first tensor that finds no statistics prints what it is
+falling back to and how to fix it. Verified: the line appears with nothing set,
+and does not appear once a file is found.
+
+**And a model can carry its own.** `llama_load` looks for `<model>.gguf.awq`
+beside the gguf and points `CHARSIU_AWQ_STATS` at it when nobody else has.
+Verified in three arms: the warning with nothing set; "statistics found beside
+the model" with the sibling present; and no such line when the environment
+names a file, because the environment still wins.
+
+⚠ The fallback is also slow -- it reads every row of every tensor to average
+them -- which is why an arm measuring it takes several times as long as the
+arms that read a file.

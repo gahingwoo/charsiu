@@ -956,12 +956,37 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			if (f)
 				fclose(f);
 		}
-		if (!got)
+		if (!got) {
+			/*
+			 * ⚠⚠ AND THIS FALLBACK IS THE REFUTED VARIANT, SAID OUT
+			 * LOUD. The column means of |w| are what the first
+			 * version of AWQ used here, and the note further down
+			 * records why they are wrong: the weights worth
+			 * protecting are the ones multiplying LARGE
+			 * ACTIVATIONS, which the weights cannot know. Reaching
+			 * this quietly is how "AWQ does not work" gets
+			 * concluded from measuring something else.
+			 */
+			static int said;
+
+			if (!said) {
+				said = 1;
+				fprintf(stderr,
+					"charsiu: AWQ is on but no activation "
+					"statistics were found for %s -- falling "
+					"back to the column means of the WEIGHTS, "
+					"which this project measured and rejected. "
+					"Record them with CHARSIU_CALIB=<file>, "
+					"then point CHARSIU_AWQ_STATS at it or "
+					"leave it beside the gguf as "
+					"<model>.gguf.awq.\n", w->name);
+			}
 			for (uint64_t r = 0; r < n; r++) {
 				gguf_row_f32(w, r, row);
 				for (uint64_t i = 0; i < k; i++)
 					col[i] += fabs((double)row[i]);
 			}
+		}
 		t->kscale = malloc((size_t)k * sizeof(float));
 		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
 		/*
