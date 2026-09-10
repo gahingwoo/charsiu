@@ -7730,3 +7730,31 @@ nobody has, eight-bit weights on a device opened for four, where the register
 program and the activation pack are both `g->w4`'s. **It is refused in
 `charsiu_npu_add`**, so those tensors fall back to the CPU: slow, and right.
 Dispatching a mixed model is a board round.
+
+### 🏁 And the knob checked on a second architecture
+
+Llama-3.2-1B has sixteen layers and Qwen3-0.6B has twenty-eight, so the same
+two layers are 12.5% of one model's bytes and 7.1% of the other's. Both, host
+CPU reference, same corpus and length:
+
+```
+                        int4 g1024   INT8_LAYERS=0-1   int8      of the gap
+  Llama-3.2-1B            41.5289        26.0672      17.9772      65.6%
+  Qwen3-0.6B             110.0549        85.0878      45.1214      38.4%
+```
+
+The absolute fractions differ because the layer counts do. **The rate does
+not**: 65.6/12.5 is 5.2 and 38.4/7.1 is 5.4. The first two layers return about
+five times their share of the bytes on both.
+
+⚠ **How far to go IS model-dependent.** Llama's next two layers return 0.68 --
+an eightfold collapse -- and Qwen3's return 2.3:
+
+```
+  Qwen3   0-1   85.0878   38.4% of the gap,  7.1% of the bytes   5.4x
+          0-3   74.5665   54.7%             14.3%                3.8x  (2.3x marginal)
+```
+
+So `INT8_LAYERS=0-1` is a defensible default on both and `0-3` is a judgement
+call that one model rewards and the other does not. Which is the honest shape:
+the concentration is general, its length is not.
