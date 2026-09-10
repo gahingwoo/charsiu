@@ -8619,3 +8619,60 @@ exponent is too large to use.
 
 ⛔ The default stays 2.0 regardless: every AWQ number on record was measured
 there, and moving it silently would make them unreproducible.
+
+### ⛔⛔⛔ EVERY alpha SWEEP TODAY WAS MEASURED THROUGH A BINDING CLAMP
+
+The clamp binds whenever `hi < (1/floor)^alpha`, which at the shipped 1e-3
+floor and hi = 2.0 means **from alpha 0.10 upward**. Every exponent sweep in
+this file above that point was measuring the bound and the exponent together.
+Re-run with the clamp held inert at 64:
+
+```
+  Llama   long   38.4906  33.7566  30.1937  28.0368  28.3271  29.9920  37.6820
+          long2  85.7996  72.9087  67.3171  61.6044  61.8348  66.6056  83.8567
+  qwen3   long   79.7636  80.1066  84.2043  77.2277  68.5076  81.6596  98.7685
+          long2 149.2676 140.4129 156.1032 127.3319 114.5617 134.8510 158.9409
+         alpha=   0.05     0.10     0.15     0.20     0.25     0.35     0.50
+```
+
+🏁🏁 **AWQ is worth far more than this tree has ever recorded**, and the
+optimum is 0.20 to 0.25 on both models and both passages:
+
+```
+  Llama    41.5289 -> 28.0368  @0.20   -32.5%   (was -21.7% at clamp 2.0)
+           69.9949 -> 61.6044  @0.20   -12.0%
+  qwen3   110.0549 -> 68.5076  @0.25   -37.7%
+          153.8779 -> 114.5617 @0.25   -25.6%
+```
+
+### ⛔ "0.5 is worse than not running AWQ at all" is a clamp artefact
+
+I wrote three hours ago that this claim **survived** the clamp change. It does
+not. At hi=2.0 Llama's 0.50 reads 50.7341 against 41.5289 off; with the clamp
+inert it reads **37.6820, better than off.**
+
+⚠⚠ **And the way I got it wrong is the part worth keeping.** I tested "is this
+the clamp's doing?" by re-running at hi=4.0 — but `1000^0.5 = 31.6`, so hi=4.0
+was still binding, and binding hard. **I checked a claim caused by a bound
+against a measurement that still contained the bound**, got a smaller version
+of the same number, and read that as the claim surviving.
+
+🔑 To test whether X causes a result, X has to be *absent*, not *reduced*. And
+"absent" for a bound is computable — `hi >= (1/floor)^alpha` — rather than
+something to eyeball.
+
+### ⚠ And two more of today's conclusions need re-reading
+
+**The 0.12–0.15 band is model-specific, not general.** With the clamp inert
+Llama's curve is smooth and unimodal — no band at all — while qwen3's bump at
+0.15 survives on both passages (84.20 and 156.10, worse than either
+neighbour). I wrote it up as a property of the method; it is a property of
+qwen3.
+
+**The per-kind table was measured at clamp 2.0**, over exactly the alpha range
+where the clamp bites hardest, so its five-different-optima reading is
+suspect and is being re-measured on the same grid with the clamp inert.
+
+⚠ What does NOT change: the floor sweep (measured with the clamp already
+inert), the clamp-binds-or-not result (four of four), and the two silent
+wrong-answer paths, which have nothing to do with any of this.
