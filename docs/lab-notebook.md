@@ -8795,3 +8795,42 @@ principle.
 ⚠ The one row 2.0 wins is 0.65, where every arm is unusable. And the clamp is
 non-monotone there — hi=6.0 is worse than hi=2.0 AND worse than not clamping.
 Noted, not explained, off the map.
+
+### ⛔⛔ Per-kind exponents: closed. The isolated table does not predict even the SIGN
+
+`attn_k` was the one kind worth a single-kind change: it shares its statistics
+bit-identically with attn_q and attn_v (28 of 28 layers, so all three get the
+same kscale — the difference has to be weights or downstream), and it was the
+only kind whose two passages disagreed in sign. Both directions, against the
+best global exponent at the new default clamp:
+
+```
+  long.txt    baseline 68.5076   attn_k=0  69.9781   attn_k=0.40  72.7172
+  long2.txt   baseline 114.5617  attn_k=0 118.1245   attn_k=0.40 120.7641
+```
+
+**Excluding it hurts, on both passages — although measured ALONE it never
+won. Giving it its own isolated optimum hurts more.**
+
+🔑 So the per-kind table does not predict the sign of a single-kind change, let
+alone its size. That is stronger than "the optima do not compose": the 35 arms
+that produced that table say nothing actionable about the model as a whole.
+
+**`CHARSIU_NPU_AWQ_MAP` has now failed three times** — the full composite at
+clamp 2.0, the full composite re-measured with the clamp inert (worse: +9.0%
+and +16.6%), and a single-kind change in either direction. The knob stays
+because it is the only way to ask, and the asking is what closed the question.
+
+⚠ It also explains, in hindsight, why per-tensor exponents fitted against the
+vendor's own choices correlated at −0.02. A per-tensor optimum measured any way
+other than JOINTLY is not measuring the thing that matters, and joint search
+over 112 tensors with a perplexity objective is not a desk experiment.
+
+### 🏁 So the AWQ answer, complete
+
+```
+  use a good GLOBAL exponent          0.20 to 0.25 on both models tested
+  make sure the clamp does not bind   default is 6.0 now; rule is (1/floor)^alpha
+  do not bother with per-kind         three ways, all worse
+  worth                               32-38% against AWQ off
+```
