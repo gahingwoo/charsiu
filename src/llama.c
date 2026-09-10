@@ -3554,7 +3554,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 			/*
 			 * ⚠ SAY HOW MANY ARE COMING. Staging is about twenty
 			 * seconds of silence and the heartbeat below only
-				 * counts up, so a caller drawing a progress bar
+			 * counts up, so a caller drawing a progress bar
 			 * has no denominator. Seven projections a layer --
 			 * q k v o gate up down -- plus the output head, which
 			 * is 113 for the 16 layer model every board round uses

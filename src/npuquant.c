@@ -881,9 +881,9 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * written; it is NOT the best value here.
 	 *
 	 * ⚠ THE EXPONENT WAS NEVER SWEPT. Every earlier experiment pinned it
-	 * at 0.5 and moved the clamp instead. Swept with the clamp held at its
-	 * default 2.0 -- qwen3, host CPU reference, 500 tokens -- it is a clean
-	 * single minimum and 0.5 is on the wrong side of it:
+	 * at 0.5 and moved the clamp instead. Swept with the clamp held at the
+	 * default OF THE DAY, 2.0 -- qwen3, host CPU reference, 500 tokens --
+	 * it is a clean single minimum and 0.5 is on the wrong side of it:
 	 *
 	 *   alpha  0.25   0.30   0.35   0.40   0.45   0.50
 	 *   ppl   68.86  65.84  65.12  68.02  75.52  76.36
@@ -900,6 +900,19 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * so its minimum is 0.20 and at 0.5 AWQ is WORSE THAN OFF. Sweep it
 	 * per model; what both models agree on is only that 0.5 is past the
 	 * minimum.
+	 *
+	 * ⛔ "WORSE THAN OFF AT 0.5" IS AN ARTEFACT OF THE CLAMP, and so is
+	 * every number in the two grids above: the clamp binds from alpha 0.10
+	 * upward at the 2.0 they were measured through, so they are the
+	 * exponent and the bound together. With it truly inert -- hi >= 31.6,
+	 * which is 1000^0.5 -- Llama's 0.50 reads 37.6820 against 41.5289 off:
+	 * BETTER than off, not worse. (At the shipped 6.0 it reads 41.4979,
+	 * level with off, because 6.0 still binds at that exponent -- which is
+	 * the whole trap: a bound cannot be tested while it is present.) The
+	 * default
+	 * moved to 6.0 on 2026-09-10 for exactly this; see the clamp's own
+	 * comment below. What survives unchanged is that 0.5 is past the
+	 * minimum, which is 0.20 to 0.25 on both models.
 	 *
 	 * ⚠⚠ "ITS MINIMUM IS 0.20" WAS THE FLOOR OF THAT GRID. Swept downward
 	 * on tests/corpus at 300 tokens, Llama reads off 41.5289, 0.10
@@ -922,6 +935,13 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * (tools/rkllm_scales.py rho). AWQ costs decode -- a tensor carrying a
 	 * factor cannot share a packed input, so grouped q/k/v drop to single
 	 * calls -- so WHERE it can be switched off is worth a knob.
+	 *
+	 * ⚠ THAT DECODE COST IS NOW OPTIONAL. q, k and v of one layer read the
+	 * same normed input and therefore carry the SAME factor, so the group
+	 * can share after all; CHARSIU_NPU_AWQ_SHARE=1 lets it, guarded by the
+	 * factor's hash so a group whose factors differ still refuses aloud.
+	 * On the board it gives identical tokens and 13.92 -> 14.33 tok/s. It
+	 * is off by default because the guard is younger than the path.
 	 *
 	 * ⚠ UNSET OR EMPTY MEANS EVERY LAYER, which is what AWQ did before
 	 * this existed. A range this cannot parse must not quietly turn the
@@ -1299,8 +1319,8 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 *
 		 * Published AWQ keeps the factor near 1 -- the point is to
 		 * protect a few salient channels, not to rescale the tensor.
-		 * CHARSIU_NPU_AWQ_CLAMP sets the bound, default 2.0, so the
-		 * factor lives in [0.5, 2].
+		 * CHARSIU_NPU_AWQ_CLAMP sets the bound, 2.0 when this was
+		 * written, so the factor lived in [0.5, 2].
 		 */
 		/*
 		 * ⚠⚠ THE DEFAULT MOVED 2.0 -> 6.0 ON 2026-09-10, AND EVERY AWQ

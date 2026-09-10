@@ -9140,3 +9140,47 @@ holds on both — board 22.0356, host 22.0818.
 
 ⚠ Both disagreements are ~2%, which is inside the ~10% one passage resolves.
 Neither is a contradiction; both are cells that were never separable.
+
+### ⛔⛔ A PERPLEXITY BELONGS TO A FILE, AND THE TREE'S NUMBERS ARE THE Q4_0 ONE
+
+Found while checking a sentence I had just written into README.md, which is the
+only reason it was found: the README now told a reader to reproduce the board's
+quantiser with `CHARSIU_NPU_W4_GROUP=1024`, and running my own instruction gave
+**30.2425** where the record says 33.8071. Same corpus md5, same binary — the
+pre-change `ppl_old` gives 30.2425 too — and no group width produces 33.8071
+(2048 gives 36.6621, 512 gives 26.6816). So it was not the configuration.
+
+It was the file. Three ggufs of the same Llama-3.2-1B, 300 tokens of
+`tests/corpus/long.txt`, current binary:
+
+```
+                        one scale a row    group 1024
+  Q8_0                      34.6888         28.7072
+  Q4_0                      41.5289         33.8071   <- the whole record
+  Q4_0 "pure"               41.8712         30.2425
+```
+
+**Q4_0 reproduces the record to the last digit**, so every Llama number in this
+tree is that file and always was. I had reached for `models-unshipped/`, which
+holds only the "pure" variant, and a `find -maxdepth 6` missed
+`rootfs-overlay/opt/charsiu/models/` where the real two live.
+
+⚠ **The 20% spread is the thing to keep.** charsiu re-quantises whatever it
+loads, so the source format is inside every quality number it prints. Q8_0 is
+the honest source — nearly lossless going in, so the arm scores charsiu's
+quantiser and nothing else. Handing it a file that is ALREADY four-bit scores
+the second quantisation of an already-quantised tensor.
+
+⚠ And `scripts/charsiu-get` annotates its **Q8_0** line "THE ONE EVERY BOARD
+ROUND USES", while the board's AWQ round read 33.4149 — the Q4_0 figure. The
+annotation and the practice disagree and one of them has to move.
+
+🔑 Two rules earned here, and the first is the one that keeps costing:
+
+- **when a number will not reproduce, the configuration is only the first
+  suspect — the INPUT is the second, and it is the one nobody varies.** I
+  swept group widths for a while, which was the disciplined-looking move and
+  the wrong axis entirely.
+- **`find -maxdepth N` answering "nothing there" is not "nothing there".** I
+  concluded from a truncated search that the host had one Llama gguf, and built
+  a whole explanation on top of that. The unbounded search took 90 seconds.
