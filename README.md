@@ -483,20 +483,35 @@ Unimodal, and **the good region extends below 0.20**: 0.10 and 0.15 both beat
 it by 4 to 8%. A best cell sitting on the boundary of a grid has a neighbour on
 one side only, and that is the whole tell.
 
-⚠⚠ **But 0.15 is not a resolved minimum, and the second model is why.** The
-same sweep on Qwen3-0.6B, same corpus and length, is NOT monotone:
+⚠⚠ **And the surface is NOT SMOOTH, which is the thing that matters here.** The
+same sweep on Qwen3-0.6B is not monotone, and the bump is real:
 
 ```
-  alpha   off      0.10     0.15     0.20     0.25     0.35     0.50
-  ppl   110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
+  alpha              off      0.10     0.15     0.20     0.25     0.35     0.50
+  long.txt  300 tok 110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
+  long.txt  500 tok    -      81.0273  89.9499  75.1107  70.8360  77.7245  80.7067
+  long2.txt 300 tok 153.8779 140.4129 148.4278 128.0319 117.6984 132.0993 118.6291
 ```
 
-0.15 sits **above both its neighbours** and 0.50 sits below 0.35. `charsiu_ppl`
-is deterministic, so that is not measurement noise -- it is 299 scored
-positions of one passage being unable to rank cells eight to ten percent apart.
-And Llama's 0.15-against-0.20 gap is eight percent, which is inside the band
-this model just showed to be unrankable at that length. **The good region is
-established; the point inside it is not.**
+0.15 is **worse than 0.10 on an independent passage as well as on a longer run
+of the first one**, so it is a property of the transform and not of the sample.
+`charsiu_ppl` has no randomness in it; these weights really are worse at that
+exponent than at the one below it.
+
+⚠ And the same three rows separate what is real from what is not: 0.15 beats
+0.10 the wrong way in all three (+7.5%, +11.0%, +5.7%) and 0.25 is the minimum
+in all three, while **0.50 against 0.35 flips sign** (-0.4%, +3.8%, -10.2%) and
+is simply not resolved. Real structure and unrankable cells, in one row.
+
+🔑 **So a coarse grid cannot be interpolated and the optimum has to be searched
+rather than fitted.** A seven-point sweep can step straight over a spike, which
+is exactly what makes "the minimum is at X" a claim that needs a fine sweep
+around X and not just a longer one. Llama's grid was monotone, which is the
+absence of the tell rather than evidence of smoothness.
+
+**What is established: the good region for Llama runs 0.10 to 0.20** — all of
+which beat 0.20's neighbour above — and 0.5 is bad on both models. The exact
+point inside it is not resolved for either.
 
 At 0.5 -- the value this tree has always
 used -- AWQ is **worse than not running it at all**, 68.26 against 52.34. So

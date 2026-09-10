@@ -8197,3 +8197,67 @@ every AWQ arm of every ppl sweep here has taken several times longer than the
 arm with AWQ off — and those sweeps are how the exponent gets chosen, so the
 instrument's cost was shaping how much of the surface anybody was willing to
 measure. **The grid that stopped at 0.20 was a grid somebody had to wait for.**
+
+### ⛔⛔ RETRACTION: the non-monotone surface was NOT the instrument, and I said it was
+
+An hour after writing "the instrument's resolution is ~10% at 299 scored
+positions", the test that separates the two explanations says the opposite.
+
+**The claim.** Qwen3's AWQ exponent sweep came back non-monotone — 0.15 above
+both its neighbours — and `charsiu_ppl` is deterministic, so I concluded the
+passage's own sampling could not order cells eight to ten percent apart, and
+put a resolution floor on every close comparison in this tree.
+
+**The test.** Two arms, and the first one is weaker than it looks:
+
+```
+  qwen3            off      0.10     0.15     0.20     0.25     0.35     0.50
+  long.txt 300  110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
+  long.txt 500     -      81.0273  89.9499  75.1107  70.8360  77.7245  80.7067
+  long2.txt 300 153.8779 140.4129 148.4278 128.0319 117.6984 132.0993 118.6291
+```
+
+🔑 **And it separates the cells that are real from the cells that are not**,
+which is the part worth keeping:
+
+```
+  0.15 worse than 0.10    +7.5%   +11.0%   +5.7%    3 of 3   REAL
+  0.25 is the minimum       ✓        ✓        ✓      3 of 3   REAL
+  0.50 against 0.35       -0.4%    +3.8%   -10.2%   flips     NOT RESOLVED
+```
+
+So the surface has real structure AND the grid has cells it cannot order, in
+the same row. Reading either one off the shape alone would have been wrong.
+
+⚠ `-n 500` on `long.txt` is **not an independent sample** — it is the same 299
+positions plus 200 more, so agreement is partly guaranteed. `long2.txt` is the
+real test, and it is why that file now exists.
+
+**On an independent passage, 0.15 is still worse than 0.10.** The weights at
+that exponent really are worse than the ones below it. The surface is genuinely
+non-smooth, and the resolution claim is withdrawn.
+
+🔑 **What replaces it, and it is more useful.** A coarse grid over alpha cannot
+be interpolated: a seven-point sweep steps straight over a spike. So "the
+minimum is at X" needs a FINE sweep around X, not merely a longer run — and
+Llama's monotone row is the absence of the tell, not evidence of smoothness.
+
+⚠ A mechanism, offered as a hypothesis and not measured: charsiu quantises per
+OUTPUT ROW and AWQ scales input COLUMNS, so which column attains a row's
+`max|w|` changes discretely as alpha moves and that row's scale jumps. Those
+jumps need not average out, because a perplexity is dominated by a few
+sensitive rows. The clamp at [0.5, 2.0] adds kinks of its own but probably
+binds on very few channels at 0.15.
+
+⚠⚠ **And the process failure is worth more than the finding.** The tree already
+had a rule: *a non-monotone surface is a grid that cannot rank its own cells.*
+That rule was written for a case where it was true — a 200-token grid whose
+winner moved when the length changed. I matched the pattern and stopped. **The
+rule names a SYMPTOM with two causes, and the second one is that the function
+really is bumpy.** The arm that separates them costs one run on another
+passage; I wrote the conclusion first and ran the arm afterwards.
+
+**Still standing from all of this:** Llama's good region runs 0.10 to 0.20 and
+0.20 was the old grid's floor; 0.5 is bad on both models; AWQ is worth 20 to
+35%; and the vendor's own per-tensor exponents (0.03 to 0.15 typical, 0.401
+max) land in the same region from a direction no corpus here can affect.
