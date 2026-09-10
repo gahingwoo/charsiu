@@ -8278,13 +8278,43 @@ qwen3, `long.txt`, 300 tokens:
 worse, with better values on either side, and not one bad cell that a finer
 grid would have smoothed over.
 
+⚠⚠ **On one passage. The independent one narrows it, and this paragraph was
+written before that arm came back.** The band that reproduces is **0.12 to
+0.15**; 0.17 and 0.18 are above 0.10 on `long.txt` and BELOW it on `long2.txt`,
+so the band's right edge is not established. See the table below.
+
 ⚠ 0.15 came back **86.1183**, the same to the last digit as in the coarse
 sweep, which is the determinism check on the fine one.
 
-⚠ The wobble *inside* the band — 83.2 to 89.2 with no trend — is the part that
-is probably the sampling. The band's existence is not: it reproduces on the
-independent passage. **Two different claims about the same row, and the test
-tells them apart.**
+**And the independent passage says the same about the band and the opposite
+about its interior**, which is the cleanest possible version of the point.
+`long2.txt`, 300 tokens, the same cells:
+
+```
+  0.10  140.4129  │  0.12 146.8927   0.13 145.1806   0.14 143.1422
+                  │  0.15 148.4278   0.17 138.4367   0.18 139.2796 │ 0.20 128.0319
+```
+
+**0.12 through 0.15 are above 0.10 on both passages — that is the band, and it
+is 0.12 to 0.15.** ⚠ 0.17 and 0.18 are above 0.10 on `long.txt` and BELOW it
+here, so the right edge is not established and the first version of this entry
+had the band a third too wide.
+
+And the ORDER inside the band does not reproduce either: `long.txt` runs
+89.21 / 83.15 / 84.68 / 86.12 across 0.12–0.15 while `long2.txt` runs
+146.89 / 145.18 / 143.14 / 148.43 — opposite trends, same band.
+
+```
+  0.12-0.15 worse than 0.10     4 of 4 cells, 2 of 2 passages   REAL
+  0.17-0.18 worse than 0.10     disagrees between passages      NOT RESOLVED
+  0.20 better than 0.10         both passages                   REAL
+  0.25 is the minimum           both passages, both lengths     REAL
+```
+
+🔑 So one row of a sweep contains **both** a real feature and cells that cannot
+be ordered, and reading either off the shape alone would have been wrong.
+**Decide "real or not" per COMPARISON on an independent sample, never per grid
+off its shape.**
 
 ▶ **Which points at the next thing to build.** A hypothesis worth the round:
 charsiu quantises per OUTPUT ROW while AWQ scales input COLUMNS, so which
