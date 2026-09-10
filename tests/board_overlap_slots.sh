@@ -74,7 +74,14 @@ mkdir -p "$OUTDIR"
 
 # the int4 environment board_intermittent.sh runs, at the K slice asked for
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=$KMAX CHARSIU_NPU_W4_GROUP=1024 \
+# ⚠⚠ THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
+# wants t->kgroup == g->kmax -- the hardware sums a whole K slice into one
+# accumulator, so a slice carries exactly one group's scale -- and
+# charsiu_npu_add REFUSES a tensor whose grouping the consumer cannot
+# honour. A hardcoded 1024 beside a KMAX that is anything else sends every
+# tensor with k > 1024 to the CPU, which on Llama is all of attention and
+# ffn_down. It whines; no harness read it.
+CHARSIU_NPU_KMAX=$KMAX CHARSIU_NPU_W4_GROUP=$KMAX \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 CHARSIU_PROBE_WIDTHS=$W ${CHARSIU_OVL_MAXT:+CHARSIU_PROBE_MAXT=$CHARSIU_OVL_MAXT} ${CHARSIU_OVL_EXTRA:-}"
 

@@ -3508,6 +3508,37 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	 * the tree and this is the one that matters, because it is the switch
 	 * every board round sets.
 	 */
+	/*
+	 * ⚠⚠ THE HOST REFERENCE MEASURES AN UNGROUPED QUANTISER UNLESS TOLD
+	 * OTHERWISE, AND FOR A LONG TIME NOBODY SAID SO.
+	 *
+	 * llama_auto_kmax() pins KMAX and W4_GROUP to 1024, and it is called
+	 * inside the branch below -- so `CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1`,
+	 * which is how every quality number in this tree was measured, never
+	 * reaches it and takes npuquant's code default of `grp = k`: one absmax
+	 * over a whole row. Llama-3.2-1B int4 reads 41.5289 that way and
+	 * 33.8071 at the group the board actually runs.
+	 *
+	 * auto_kmax's own comment warns that no board round has ever run the
+	 * code defaults. It is right, and it misses that the HOST reference
+	 * runs them every time.
+	 *
+	 * So the reference says which quantiser it is measuring. Once, on
+	 * stderr, only in the mode where the question arises.
+	 */
+	if (!charsiu_env_flag("CHARSIU_NPU", 0) &&
+	    charsiu_env_flag("CHARSIU_NPU_QUANT", 0) &&
+	    !getenv("CHARSIU_NPU_W4_GROUP")) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: CPU reference with the "
+				"quantiser, and CHARSIU_NPU_W4_GROUP is unset "
+				"-- this measures ONE SCALE A ROW, not the "
+				"group the NPU path pins to 1024. Set "
+				"CHARSIU_NPU_W4_GROUP=1024 to measure what the "
+				"board runs.\n");
+	}
 	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
 		const char *e = getenv("CHARSIU_NPU_MAXN");
 		unsigned maxn = e ? (unsigned)atoi(e) : 8192;

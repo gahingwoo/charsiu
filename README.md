@@ -673,6 +673,34 @@ return about five times their share of the bytes on both. How far to go is
 model-dependent — Llama's next two return 0.68 and Qwen3's return 2.3 — so
 `0-1` is a defensible default on both and `0-3` is a judgement call.
 
+⚠⚠ **Those numbers were measured UNGROUPED and with AWQ off, and neither is
+what the board runs.** At group 1024 with AWQ at alpha 0.20:
+
+```
+                      long.txt    long2.txt
+  int4 + AWQ           25.3664      44.0703
+  INT8_LAYERS + AWQ    23.4235      41.8643      +12.5% bytes for 0.9% / 8.1%
+```
+
+AWQ and INT8_LAYERS are near-substitutes -- both attack the first two layers'
+share of the damage -- so against all-int8 at 17.9772 the knob returns **2.1x
+its share of the bytes, not the 5.2x above.** AWQ costs no bytes at all, so
+**turn AWQ on first**, then ask whether 12.5% more weight is worth 1 to 8%.
+
+⚠⚠ **And `0-1` is then the wrong range.** With AWQ on, blk.0 ranks NINTH of
+sixteen for how much four-bit damage it carries -- AWQ already treats what the
+first layers suffer from, and what is left peaks at blk.1 and blk.3. Both
+replacements hold on both passages:
+
+```
+              long.txt        long2.txt      bytes
+  0-1        23.4235 -7.7%   41.8643 -5.0%   12.5%
+  1-1        23.5415 -7.2%   41.8468 -5.0%   6.25%   same, HALF the bytes
+  3-4        23.1453 -8.8%   40.5593 -8.0%   12.5%   more, same bytes
+```
+
+**Use `1-1` if bytes matter or `3-4` if quality does.**
+
 ⛔ **It is host-side today.** `charsiu_npu_add` refuses an eight-bit tensor on
 a device opened for four, so those tensors take the CPU: slow, and right. The
 easy way round it is a trap and is written down so nobody takes it — an int8

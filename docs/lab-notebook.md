@@ -8795,3 +8795,285 @@ principle.
 ⚠ The one row 2.0 wins is 0.65, where every arm is unusable. And the clamp is
 non-monotone there — hi=6.0 is worse than hi=2.0 AND worse than not clamping.
 Noted, not explained, off the map.
+
+### ⛔⛔ Per-kind exponents: closed. The isolated table does not predict even the SIGN
+
+`attn_k` was the one kind worth a single-kind change: it shares its statistics
+bit-identically with attn_q and attn_v (28 of 28 layers, so all three get the
+same kscale — the difference has to be weights or downstream), and it was the
+only kind whose two passages disagreed in sign. Both directions, against the
+best global exponent at the new default clamp:
+
+```
+  long.txt    baseline 68.5076   attn_k=0  69.9781   attn_k=0.40  72.7172
+  long2.txt   baseline 114.5617  attn_k=0 118.1245   attn_k=0.40 120.7641
+```
+
+**Excluding it hurts, on both passages — although measured ALONE it never
+won. Giving it its own isolated optimum hurts more.**
+
+🔑 So the per-kind table does not predict the sign of a single-kind change, let
+alone its size. That is stronger than "the optima do not compose": the 35 arms
+that produced that table say nothing actionable about the model as a whole.
+
+**`CHARSIU_NPU_AWQ_MAP` has now failed three times** — the full composite at
+clamp 2.0, the full composite re-measured with the clamp inert (worse: +9.0%
+and +16.6%), and a single-kind change in either direction. The knob stays
+because it is the only way to ask, and the asking is what closed the question.
+
+⚠ It also explains, in hindsight, why per-tensor exponents fitted against the
+vendor's own choices correlated at −0.02. A per-tensor optimum measured any way
+other than JOINTLY is not measuring the thing that matters, and joint search
+over 112 tensors with a perplexity objective is not a desk experiment.
+
+### 🏁 So the AWQ answer, complete
+
+```
+  use a good GLOBAL exponent          0.20 to 0.25 on both models tested
+  make sure the clamp does not bind   default is 6.0 now; rule is (1/floor)^alpha
+  do not bother with per-kind         three ways, all worse
+  worth                               32-38% against AWQ off
+```
+
+### ⛔⛔⛔ THE HOST CPU REFERENCE HAS NEVER MEASURED THE BOARD'S QUANTISER
+
+`llama_auto_kmax()` pins `CHARSIU_NPU_KMAX` and `CHARSIU_NPU_W4_GROUP` to 1024
+— and it is called from inside `if (charsiu_env_flag("CHARSIU_NPU", 0))`. The
+host reference runs `CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1`, so **it never reaches
+that function** and takes the code defaults instead: `grp = k` in npuquant.c,
+one absmax over a whole row.
+
+**So every quality number ever measured on the host reference in this tree is
+UNGROUPED, while the board runs group 1024.** Llama-3.2-1B, int4:
+
+```
+  no CHARSIU_NPU_W4_GROUP    41.5289    <- what the host reference measures
+  CHARSIU_NPU_W4_GROUP=1024  33.8071    <- what the board actually runs
+```
+
+⚠ The function's own comment names the hazard exactly — *"the code defaults
+are CHARSIU_NPU_KMAX 4096 in npudev.c and, in npuquant.c, a group of k -- one
+absmax over a whole row. No board round has ever run that pair"* — and it is
+right. What it does not say is that the HOST reference runs that pair every
+time, which is where the tree's entire quality record comes from.
+
+### 🏁 The headline survives: AWQ still helps at the board's own group setting
+
+alpha 0.20 (Llama) and 0.25 (qwen3), clamp at the new default 6.0:
+
+```
+                    ungrouped   ungrouped   group1024   group1024
+                       off       + AWQ         off       + AWQ
+  Llama  long        41.5289     28.0368     33.8071     25.3664   -25.0%
+         long2       88.5643     61.6044     77.3405     44.0703   -43.0%
+  qwen3  long       110.0549     68.5076     95.5754     64.0527   -33.0%
+         long2      153.8779    114.5617    164.8471    106.1014   -35.6%
+```
+
+🔑 **`group1024 + AWQ` is the best cell in all four rows.** Grouping and AWQ
+both attack a row's dynamic range and they were the obvious candidates to
+substitute for each other; they do not. They compose, and AWQ is worth 25 to
+43% on top of the grouping the board already has.
+
+⚠ **qwen3's long2 says grouping alone makes it WORSE** — 164.85 against 153.88
+ungrouped — while on long it helps (95.58 against 110.05). Grouping's own value
+is passage-dependent for that model. AWQ's is not.
+
+### ⛔ And a baseline I mis-copied, which understated AWQ
+
+The alpha re-sweep's header said *"off: Llama 41.5289 / 69.9949 (long2)"*.
+**69.9949 is not an AWQ-off number** — it is alpha 0.15 at clamp 2.0, copied
+out of the wrong row of the clamp sweep. Llama's true long2 AWQ-off is
+**88.5643**.
+
+The error understated AWQ throughout: I recorded long2 as `69.9949 -> 61.6044`,
+−12.0%, where it is `88.5643 -> 61.6044`, **−30.5%**. And I wrote that "on
+long2 only 0.15 to 0.35 beat off" — against the true baseline **every alpha in
+the sweep beats off**, 85.80 to 83.86 against 88.56.
+
+⚠ A number carried from one table's header into another's is not a
+measurement, and this one had a row label attached that I did not re-read.
+
+### 🏁 The KMAX/group trade, priced at last — and it is unfavourable
+
+Item 3 of "what is left" has said *"fewer K slices would cut the read AND the
+fence's intercepts proportionally, and it is blocked by the quantiser group"*
+since 09-08. `tensor_grouped()` wants `kgroup == kmax`, so the two move
+together. Both sides now have numbers.
+
+**The gain, computed from shapes alone** — `read ∝ Σ slices × n`, and the fence
+carries a per-slice intercept:
+
+```
+                   KMAX=1024      2048        4096
+  Llama-3.2-1B    320 / 1.0M   160 / 0.5M   128 / 0.4M    -50%   -60%
+  Qwen3-0.6B      281 / 0.6M   225 / 0.5M   197 / 0.5M    -20%   -30%
+```
+
+**The price, measured with AWQ on at each model's own exponent:**
+
+```
+                  group=1024      2048        4096
+  Llama  long       25.3664     27.2848     28.3082     +7.6%   +11.6%
+         long2      44.0703     54.8905     56.6209    +24.5%   +28.5%
+  qwen3  long       64.0527     68.5076     68.5076     +7.0%    +7.0%
+         long2     106.1014    114.5617    114.5617     +8.0%    +8.0%
+```
+
+Llama 1024 → 4096 buys 60% off the read, which is 0.93 ms of a 4.59 ms row, so
+about **0.56 ms a row — 12%** — plus whatever the fence's per-slice intercept
+is worth. It costs **10.5% to 39.7%** of perplexity.
+
+⛔ **So the road stays closed, but priced rather than asserted: the grouping is
+worth more than the slices.**
+
+⚠ qwen3's 2048 and 4096 columns are IDENTICAL, and equal to its ungrouped
+value, because most of its tensors are k = 1024 — a group wider than k
+degenerates to one scale a row. For that model there is nothing between
+"group 1024" and "ungrouped" at all.
+
+⚠⚠ **And the two passages disagree threefold on the price** — +7.6% against
++24.5% for the same Llama step. The gain side is computed and exact; the price
+side is not even well determined. Anything built on this trade would be built
+on the shakier half.
+
+### 🏁🏁🏁 23.7173 — the same quantiser, measured where it actually lives
+
+`host_awq.sh` now sets the group the board runs, and says why. Llama-3.2-1B,
+`tests/corpus/long.txt`, 300 tokens:
+
+```
+  AWQ off             33.8071      (was reported as 41.5289 -- that is UNGROUPED)
+  AWQ on, no stats    33.8071      declines, equal to off ✓
+  AWQ on, with stats  23.7173      -29.9%
+```
+
+**23.7173 is charsiu's best four-bit result on this model**, at the board's own
+group 1024 with the corrected AWQ — alpha 0.20, clamp 6.0.
+
+🔑 **This morning the best number in this tree was 35.2041, labelled "group
+1024", and it was neither.** It was ungrouped, through a clamp that was
+binding. Same quantiser, same machine, same passage: **35.2041 → 23.7173, a
+32.6% improvement, and not one line of quality logic changed.** All of it was
+putting the measurement back in the configuration it was supposed to be in.
+
+⚠ Which is the whole lesson of the day in one number. Three faults — a default
+that outlived its reason, two knobs that had to agree and did not, a function
+reachable only when the NPU is on — none of them a bug, all of them producing
+plausible numbers, and between them they were hiding a third of the method.
+
+⚠ The board has not run this. What the board has run is 40.83 at alpha 0.5 and
+clamp 2.0, which is now known to be the wrong end of both knobs.
+`tests/board_awq.sh` is five arms and one command.
+
+### ⛔ INT8_LAYERS is worth half what its own entry claims, once AWQ is on
+
+Its record — *"Llama 41.53 → 26.07, 65.6% of the gap for 12.5% of the bytes,
+about five times their share"* — was measured UNGROUPED and with AWQ off.
+Neither is what the board runs. At group 1024, alpha 0.20, clamp 6.0:
+
+```
+                      long.txt    long2.txt
+  int4                 33.8071      77.3405
+  int4 + AWQ           25.3664      44.0703
+  INT8_LAYERS=0-1      23.6300      45.5554
+  INT8_LAYERS + AWQ    23.4235      41.8643
+```
+
+🔑 **AWQ and INT8_LAYERS are near-substitutes, not additions.** Both attack the
+same thing — the first two layers carry 44% of the four-bit damage — and adding
+INT8_LAYERS on top of AWQ buys **0.9% on long and 8.1% on long2, for 12.5% more
+weight bytes.** AWQ costs no bytes at all.
+
+Against all-int8 at 17.9772, the gap framing its entry uses:
+
+```
+  recorded (ungrouped, no AWQ)   65.6% of the gap for 12.5% of bytes   5.2x
+  board's group, with AWQ        26.3%                                 2.1x
+```
+
+⚠ **And the two passages disagree about which of the two is better alone**:
+long says INT8_LAYERS by 6.9%, long2 says AWQ by 3.3% — and AWQ is free. So
+"which one" is not resolved; "they do not add up" is.
+
+⚠ int8 at 17.9772 is unaffected by any of this: npuquant collapses an
+eight-bit tensor to one scale a row deliberately, because tensor_grouped()
+also requires `g->w4` and a board round once read a grouped int8 scale array
+as one-per-row and recorded ppl 272369 as "the int8 path emits noise".
+
+▶ The shipped default keeps INT8_LAYERS off, so nothing ships wrong. What
+changes is the recommendation: **turn AWQ on first — it is free — and then ask
+whether 12.5% more bytes is worth 1 to 8%.**
+
+### ⛔ And `INT8_LAYERS=0-1` is the wrong range once AWQ is on — dominated on both sides
+
+The range was chosen from a per-layer table showing L0/L1 carrying 44% of the
+four-bit damage. Re-measured at the board's group with AWQ on, each layer alone
+at eight bits against a 25.3664 baseline:
+
+```
+  blk.1  -1.8249   blk.3  -1.5681   blk.4  -1.0805   blk.10 -0.7679
+  blk.15 -0.6333   blk.5  -0.5768   blk.12 -0.5166   blk.2  -0.5052
+  blk.0  -0.4581  <- ninth of sixteen
+  ...    blk.7 +0.1846   blk.9 +0.2902  <- eight bits made these WORSE
+```
+
+**blk.0 ranks ninth.** L0+L1 is 27.4% of the total, not 44%. That is what AWQ
+being on does: it already treats what the first layers suffer from, so what is
+left peaks at blk.1 and blk.3 instead.
+
+⚠ Two layers coming out POSITIVE — more precision making the answer worse — is
+the tell that these individual differences are at the edge of what one passage
+resolves. So the ranking is not the result; the direct comparison is, and only
+where both passages agree:
+
+```
+                long.txt            long2.txt         bytes
+  baseline     25.3664             44.0703
+  0-1          23.4235  -7.7%      41.8643  -5.0%     12.5%
+  1-1          23.5415  -7.2%      41.8468  -5.0%     6.25%   half the bytes
+  3-4          23.1453  -8.8%      40.5593  -8.0%     12.5%   same bytes
+  1-2          23.1331  -8.8%      42.7466  -3.0%     12.5%   passages disagree
+```
+
+🔑 **`0-1` is dominated on both sides, and both replacements hold on both
+passages:**
+
+- **`1-1` gets the same thing for HALF the bytes** — long says 0-1 by 0.5%,
+  long2 says 1-1 by 0.04%. That is "indistinguishable", which is the claim.
+- **`3-4` gets more for the SAME bytes** — 1.2% and 3.1%, same sign both ways.
+
+⚠ `1-2` wins on long and loses to 0-1 on long2. Not resolved, not adopted.
+
+▶ So the recommendation is: **AWQ first (free), then `1-1` if bytes matter or
+`3-4` if quality does.** `0-1` was the right answer to a question measured in a
+configuration the board does not run.
+
+### ⛔ Does the calibration have to be recorded under the quantiser it will be used with? NOT RESOLVED
+
+The six-arm dry run's baseline read 23.7173 where the same cell measured
+earlier read 25.3664 — same alpha, same group, same passage. The only
+difference was the statistics file: `board_awq.sh` records its own under
+group 1024, and the earlier one was recorded ungrouped. Since the statistics
+are `mean |x_k|` and the activations depend on the quantised weights, a
+different quantiser genuinely produces a different factor, and 6.5% looked
+like a rule: **calibrate under the configuration you will run.**
+
+The second passage says the opposite:
+
+```
+                     long.txt              long2.txt
+  stats ungrouped     25.3664               44.0703
+  stats at g1024      23.7173               46.3016
+                     g1024 better 6.5%    ungrouped better 4.8%
+```
+
+**Opposite signs, so it is not resolved.** Recording the calibration under a
+different quantiser does produce a materially different factor — worth 5 to 6%
+either way — but which is better is not determined by these two passages.
+
+⚠ **The README's recipe stays as it is.** It teaches recording the statistics
+without setting the group, and I was one passage away from calling that a bug
+in a command everyone copies. Sixth time today the second passage changed the
+answer; the first five all went the other way, which is exactly why the sixth
+has to be run rather than assumed.
