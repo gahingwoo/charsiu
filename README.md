@@ -463,8 +463,36 @@ qwen3, host CPU reference, 500 tokens. **65.12 against 76.36 is 14.7%**, and
 the ordering holds on the shorter corpus at 200 tokens too (68.07 against
 73.77).
 
-⚠ **The minimum itself is per model, but 0.5 is past it on both.** The same
-sweep on Llama-3.2-1B, its own calibration, same corpus and length:
+⚠⚠ **EVERY SWEEP IN THIS SECTION WAS MEASURED THROUGH A BINDING CLAMP, and
+that changes the answers.** The factor's clamp binds whenever
+`hi < (1/floor)^alpha`, which at the shipped defaults is from alpha 0.10
+upward -- so the numbers below are the exponent and the bound together. With
+`CHARSIU_NPU_AWQ_CLAMP=64` so the clamp is inert:
+
+```
+  Llama   long   38.4906  33.7566  30.1937  28.0368  28.3271  29.9920  37.6820
+          long2  85.7996  72.9087  67.3171  61.6044  61.8348  66.6056  83.8567
+  qwen3   long   79.7636  80.1066  84.2043  77.2277  68.5076  81.6596  98.7685
+          long2 149.2676 140.4129 156.1032 127.3319 114.5617 134.8510 158.9409
+         alpha=   0.05     0.10     0.15     0.20     0.25     0.35     0.50
+```
+
+**The optimum is 0.20 to 0.25 on both models and both passages, and AWQ is
+worth much more than the clamped numbers show:**
+
+```
+  Llama    41.5289 -> 28.0368  @0.20   -32.5%
+  qwen3   110.0549 -> 68.5076  @0.25   -37.7%
+```
+
+⚠ **"0.5 is worse than not running AWQ at all" is an artefact of the clamp.**
+At hi=2.0 Llama's 0.50 reads 50.73 against 41.53 off; with the clamp inert it
+reads 37.68, which is better than off. The paragraphs below are kept because
+they are what the shipped defaults actually produce.
+
+⚠ **The minimum itself is per model, but 0.5 is past it on both** (at the
+shipped clamp). The same sweep on Llama-3.2-1B, its own calibration, same
+corpus and length:
 
 ```
   off     0.20    0.25    0.30    0.35    0.40    0.50    0.65
