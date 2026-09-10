@@ -1302,8 +1302,44 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * CHARSIU_NPU_AWQ_CLAMP sets the bound, default 2.0, so the
 		 * factor lives in [0.5, 2].
 		 */
+		/*
+		 * ⚠⚠ THE DEFAULT MOVED 2.0 -> 6.0 ON 2026-09-10, AND EVERY AWQ
+		 * NUMBER RECORDED BEFORE THAT DATE WAS MEASURED AT 2.0.
+		 * `CHARSIU_NPU_AWQ_CLAMP=2.0` reproduces all of them exactly.
+		 *
+		 * 2.0 was not a safety choice, it was a bound an order of
+		 * magnitude tighter than the safety it was justified by. The
+		 * factor already has a second bound -- the statistic is floored
+		 * at awq_floor * mean, capping it at (1/floor)^alpha -- and the
+		 * clamp only acts while it is the tighter of the two. At 2.0
+		 * that is from alpha 0.10 UPWARD, so it was binding across the
+		 * whole useful range and taking a third of the method with it.
+		 *
+		 * 6.0 is inert wherever the exponent is usable and still bounds
+		 * above it, because 1000^0.25 = 5.62. Llama-3.2-1B, host CPU
+		 * reference, tests/corpus/long.txt, AWQ off = 41.5289:
+		 *
+		 *   alpha    hi=2.0    hi=6.0    hi=64     1000^alpha
+		 *   0.20    35.2041   28.0368   28.0368     4.0   inert
+		 *   0.25    38.3471   28.3271   28.3271     5.6   inert
+		 *   0.35    42.3752   30.7736   29.9920    11.2
+		 *   0.50    50.7341   41.4979   37.6820    31.6
+		 *   0.65    72.1690   94.5806   79.7978    89.1
+		 *
+		 * At the recommended exponent that is 35.20 -> 28.04, and
+		 * against AWQ off the method goes from -15% to -32%.
+		 *
+		 * ⚠ The one row 2.0 wins is 0.65, where every arm is unusable
+		 * -- off is 41.5289 and the best of the three is 72.17. A
+		 * default should not be chosen on the behaviour of a setting
+		 * nobody should reach.
+		 *
+		 * ⚠ AND THE CLAMP IS NON-MONOTONE UP THERE: at 0.65, hi=6.0 is
+		 * worse than hi=2.0 AND worse than not clamping. Noted, not
+		 * explained, and off the map.
+		 */
 		const char *cl = getenv("CHARSIU_NPU_AWQ_CLAMP");
-		double hi = cl && *cl ? atof(cl) : 2.0;
+		double hi = cl && *cl ? atof(cl) : 6.0;
 		double lo = hi > 0.0 ? 1.0 / hi : 0.5;
 
 		for (uint64_t i = 0; i < k; i++) {
