@@ -8463,5 +8463,44 @@ off" survives**, 45.60 against 41.53, so that claim is about the exponent.
 
 So the shipped default is costing 7 to 20% of AWQ's benefit exactly where AWQ
 should be used, and the protection it buys only matters where AWQ is a bad idea
-whatever the clamp is. ▶ A default change wants the same crossover on the
-second model first; it is running.
+whatever the clamp is.
+
+### And the second model says the crossover is NOT in the same place
+
+```
+  qwen3          0.35      0.50      0.65      (off 110.0549)
+  hi=2.0       77.8404   77.5428   83.9348
+  hi=4.0       80.6523   73.7438   91.3330
+```
+
+At 0.35 the wider clamp is **worse** on qwen3 — 80.65 against 77.84 — where on
+Llama it was much better. So above 0.25 the comparison is not resolved and the
+crossover is per model. What holds on both models and both passages:
+
+```
+  0.10-0.25   hi=4 better everywhere measured        the useful range
+  0.35-0.50   inconsistent: Llama prefers wide, qwen3 prefers narrow at 0.35
+  0.65        hi=2 better on both, +20% and +8.8%    the clamp protecting
+```
+
+**And at each model's own best setting, which is what a user would actually
+run:**
+
+```
+  qwen3   71.7770 -> 67.9646   -5.3%   (both at 0.25)
+  Llama   32.5094 -> 30.1937   -7.1%   (both at 0.15)
+```
+
+⛔ **The default stays at 2.0, and that is a decision rather than caution.**
+Every AWQ number on record here was measured at 2.0. Moving the default
+silently would make all of them unreproducible — which is the same failure as
+leaving the corpus in /tmp, wearing different clothes. It goes in the README as
+a measured recommendation and onto the board list as a decision with its
+numbers attached.
+
+⚠ And note where it leaves the exponent story: **the per-model difference is
+real and is NOT the clamp's doing.** qwen3 at 0.50 is still far better than off
+(77.54 against 110.05) while Llama at 0.50 is worse than off (50.73 against
+41.53). The two models genuinely tolerate different amounts of exponent. What
+the clamp was responsible for is the SHAPE within the useful range, not the
+difference between the models.

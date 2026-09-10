@@ -556,6 +556,26 @@ holds is `X` times **one tensor's** factor, q, k and v share one normed buffer,
 and every field that key had said "this is the same input". `CHARSIU_NPU_AWQ_BATCH=0`
 puts the refusal back.
 
+⚠⚠ **And the factor's CLAMP is costing 7% of AWQ at the exponent you should
+use.** `CHARSIU_NPU_AWQ_CLAMP` defaults to 2.0, so the factor lives in
+[0.5, 2]. Its onset is measurable: at alpha 0.10 the width makes no difference
+at all -- 80.1066 to the last digit at hi = 2, 4 and 8 -- and from 0.15 it
+does. At each model's own best setting:
+
+```
+  qwen3   71.7770 -> 67.9646   -5.3%   (both at alpha 0.25)
+  Llama   32.5094 -> 30.1937   -7.1%   (both at alpha 0.15)
+```
+
+**`CHARSIU_NPU_AWQ_CLAMP=4.0` is the better setting in the useful range**
+(0.10 to 0.25), on two models and two passages. ⚠ It is NOT better everywhere:
+at 0.65 the narrow clamp wins on both models, by 20% and 8.8%, so the clamp is
+protecting something real where the exponent is too large. Between 0.25 and
+0.5 the two models disagree.
+
+⚠ The default stays at 2.0 because every number on record was measured there,
+and moving it silently would make them all unreproducible.
+
 ⚠ **The activation width is not where four bits hurt.** The int4 path tells the
 hardware sixteen-bit activations and then packs an eight-bit value into the
 high byte of the slot, so every quality number here is really w4a8.
