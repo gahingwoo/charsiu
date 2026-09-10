@@ -94,15 +94,19 @@ trap 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -n "$
 # it is a plan for one, and this tree has lost a round to a dead loop before.
 #
 W4=${CHARSIU_AWQ_BASE:-"CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"}
-# ⚠ 0.15 IS IN THE MEASURED GOOD REGION, NOT A RESOLVED OPTIMUM. On
-# tests/corpus at 300 tokens, Llama-3.2-1B reads off 41.5289, 0.10 33.7566,
-# 0.15 32.5094, 0.20 35.2041 -- but qwen3's row at the same length is NOT
-# monotone, which measures the instrument at about 10% resolution and puts
-# Llama's 8% gap inside it. What IS supported: 0.10 and 0.15 both beat 0.20,
-# 0.5 is bad, and the vendor's own per-tensor exponents (0.03-0.15 typical,
-# 0.401 max) land in the same region from a direction this corpus cannot
-# affect. Arm 4 sweeps it anyway, and see its own warning about ranking.
-ALPHA=${CHARSIU_AWQ_ALPHA:-0.15}
+# ⚠⚠ 0.20 IS THE CORRECTED OPTIMUM, AND EVERY EARLIER NUMBER IN THIS SCRIPT
+# WAS MEASURED THROUGH A BINDING CLAMP. The clamp acts while it is tighter
+# than the floor's (1/floor)^alpha, which at the old default of 2.0 meant from
+# alpha 0.10 upward -- so the exponent and the bound were being swept together.
+# With the clamp inert the optimum is 0.20 to 0.25 on both models and both
+# passages, and AWQ is worth 32-38% rather than 15-22%.
+#
+# Llama-3.2-1B, host, at the board's own group 1024:
+#   int4 33.8071 -> +AWQ 25.3664 -> +INT8_LAYERS=3-4 23.1453 ; all int8 17.9772
+#
+# ⚠ qwen3 prefers 0.25. Arm 4 sweeps it; this is only the default the other
+# arms run at.
+ALPHA=${CHARSIU_AWQ_ALPHA:-0.20}
 NTOK=${CHARSIU_AWQ_NTOK:-32}
 # long enough that the prompt is BATCHED, which is the whole subject of arm 1
 PROMPT=${CHARSIU_AWQ_PROMPT:-"The keeper of the lighthouse wrote down the barometer and the wind every morning for eleven years, and what he remembered afterwards was not the storms but the particular quality of the light in the hour before one arrived. Explain, in plain words, why a written record outlasts a memory:"}
@@ -254,17 +258,41 @@ echo "== arm 5: does the factor's clamp BIND, which is worth a third of the meth
 # ⚠ NOT "remove the clamp". At alpha 0.65 the floor allows factors to 89 and
 # the narrow clamp is what saves the model -- it earns its keep exactly where
 # the exponent is too large to be used at all.
-for c in 2.0 64.0; do
+for c in 2.0 6.0 64.0; do
 	# shellcheck disable=SC2086
 	P=$(env $W4 CHARSIU_NPU_AWQ="$ALPHA" CHARSIU_AWQ_STATS="$STATS" 		CHARSIU_NPU_AWQ_CLAMP=$c 		"$PPL" "$M" "$E" -n 300 2>/dev/null | tail -1 |
 		grep -o 'ppl [0-9.]*' | awk '{print $2}')
 	printf '   clamp hi=%-5s alpha %s   ppl %s%s
 ' "$c" "$ALPHA" "${P:-?}" \
-	       "$([ "$c" = 64.0 ] && echo '   (inert: the floor is the only bound)')"
+	       "$([ "$c" = 64.0 ] && echo '   (inert: the floor is the only bound)')$([ "$c" = 6.0 ] && echo '   (the shipped default since 09-10)')"
 done
-echo "⚠ The DEFAULT stays 2.0: every AWQ number on record was measured there,
-   and moving it silently would make all of them unreproducible. If the board
-   agrees with the host, that is a decision to take deliberately."
+echo "⚠ The default IS 6.0 as of 09-10, chosen because it is inert wherever the
+   exponent is usable (1000^0.25 = 5.62) and still bounds above it. hi=2.0
+   reproduces every AWQ number recorded before that date. If the board
+   disagrees with the host here, the default is what to revisit."
+
+echo
+echo "== arm 6: INT8_LAYERS -- is 0-1 still the range, with AWQ on?"
+# ⚠⚠ 0-1 WAS CHOSEN FROM A TABLE MEASURED UNGROUPED AND WITH AWQ OFF, and at
+# the board's own group with AWQ on, blk.0 ranks NINTH of sixteen for the
+# damage it carries -- AWQ already treats what the first layers suffer from.
+# Host, Llama, both passages, against a 25.3664 / 44.0703 baseline:
+#
+#   0-1   23.4235 / 41.8643   12.5% of the weight bytes
+#   1-1   23.5415 / 41.8468   6.25%  -- the same, for HALF the bytes
+#   3-4   23.1453 / 40.5593   12.5%  -- more, for the same bytes
+#
+# So 0-1 is dominated on both sides. This arm asks the board's own quantiser
+# the same question.
+for R in "" 0-1 1-1 3-4; do
+	# shellcheck disable=SC2086
+	P=$(env $W4 CHARSIU_NPU_AWQ="$ALPHA" CHARSIU_AWQ_STATS="$STATS" \
+		${R:+CHARSIU_NPU_INT8_LAYERS=$R} \
+		"$PPL" "$M" "$E" -n 300 2>/dev/null | tail -1 |
+		grep -o 'ppl [0-9.]*' | awk '{print $2}')
+	printf '   INT8_LAYERS=%-6s ppl %s%s\n' "${R:-off}" "${P:-?}" \
+	       "$([ "$R" = 1-1 ] && echo '   (half the bytes of 0-1)')"
+done
 
 echo
 echo "board_awq: $fail identity checks failed"
