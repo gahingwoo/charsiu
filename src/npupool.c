@@ -518,10 +518,11 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 			"prep -- a pool that quietly reallocates is the old "
 			"bug in new clothes)\n", nbuf, alloc);
 	{
-		unsigned long hits = 0, misses = 0, why[4] = { 0, 0, 0, 0 };
-		static const char *whyname[4] = {
+		unsigned long hits = 0, misses = 0, why[5] = { 0, 0, 0, 0, 0 };
+		static const char *whyname[5] = {
 			"dropped by a leader", "a different input",
 			"a different shape", "the K slices are on the other device",
+			"a different AWQ factor on the same input",
 		};
 
 		charsiu_npu_reuse_stats(p->dev, &hits, &misses, why);
@@ -535,7 +536,7 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 				"%lu times when declared the same\n",
 				hits, misses);
 			if (misses)
-				for (unsigned i = 0; i < 4; i++)
+				for (unsigned i = 0; i < 5; i++)
 					if (why[i])
 						fprintf(out, "        %6lu  %s\n",
 							why[i], whyname[i]);
