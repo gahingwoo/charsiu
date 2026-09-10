@@ -85,7 +85,12 @@ trap 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -n "$
 # it is a plan for one, and this tree has lost a round to a dead loop before.
 #
 W4=${CHARSIU_AWQ_BASE:-"CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"}
-ALPHA=${CHARSIU_AWQ_ALPHA:-0.20}
+# ⚠ 0.15 IS MEASURED, NOT CONVENTIONAL. On tests/corpus at 300 tokens,
+# Llama-3.2-1B: off 41.5289, 0.10 33.7566, 0.15 32.5094, 0.20 35.2041. It is
+# also inside the vendor's own per-tensor range (0.03-0.15 typical, 0.401
+# max), which is a second line of evidence for the same place. Arm 4 sweeps it
+# anyway, because the optimum is per model.
+ALPHA=${CHARSIU_AWQ_ALPHA:-0.15}
 NTOK=${CHARSIU_AWQ_NTOK:-32}
 # long enough that the prompt is BATCHED, which is the whole subject of arm 1
 PROMPT=${CHARSIU_AWQ_PROMPT:-"The keeper of the lighthouse wrote down the barometer and the wind every morning for eleven years, and what he remembered afterwards was not the storms but the particular quality of the light in the hour before one arrived. Explain, in plain words, why a written record outlasts a memory:"}
@@ -185,8 +190,8 @@ echo
 # ⚠ AT WHATEVER CHARSIU_AWQ_ALPHA IS, WHICH ARM 4 IS WHAT CHOOSES. The two
 # arms are in this order because arm 3 only needs the comparison to be
 # internally consistent, but a LAYERS number quoted without its alpha is not
-# comparable to anything -- Llama's optimum moved from 0.20 to 0.10 on the
-# tree corpus, and the whole surface moves with it.
+# comparable to anything -- Llama's optimum measures 0.15 on the tree corpus,
+# not the 0.20 the README used to name, and the whole surface moves with it.
 echo "== arm 3: AWQ on the first three blocks only, at alpha $ALPHA"
 for L in "" "0-2"; do
 	# shellcheck disable=SC2086
@@ -199,7 +204,7 @@ done
 
 echo
 echo "== arm 4: the exponent, on this board's own quantiser"
-for a in 0.00 0.10 0.20 0.35 0.50; do
+for a in 0.00 0.05 0.10 0.15 0.20 0.35 0.50; do
 	# shellcheck disable=SC2086
 	# ⚠ alpha 0.00 IS "AWQ OFF", not "AWQ at zero". The knob's absence is
 	# the control arm; setting it to 0 still walks the factor code with a
