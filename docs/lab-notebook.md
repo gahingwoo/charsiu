@@ -7521,7 +7521,26 @@ so the factor is built from mean |x_k| over a calibration run. Measuring the
 wrong signal and concluding the method does not work is the mistake, not the
 method." The fallback is precisely the wrong signal, reached by default.
 
-Two changes, both verified on the host:
+⛔ **And warning was not enough, because the fallback is worse than off.**
+Llama-3.2-1B, host CPU reference, 300 tokens:
+
+```
+  AWQ off                        41.5289
+  AWQ 0.20 with statistics       35.2041    -15.2%
+  AWQ 0.20 with NO statistics    58.3542    +40.5%
+```
+
+A user following the README -- `CHARSIU_NPU_AWQ=0.5`, nothing else -- got a
+model **40% worse than leaving it alone**. Declining costs them nothing they
+had; the fallback cost them that. So it declines now, and
+`CHARSIU_NPU_AWQ_WEIGHTMEANS=1` keeps the refuted variant reachable as the
+control it is.
+
+🔑 Verified exactly: with no statistics the run prints DECLINING and returns
+**41.5289**, bit-identical to the AWQ-off arm, and with statistics it is still
+35.2041.
+
+Three changes, all verified on the host:
 
 **It says so now.** The first tensor that finds no statistics prints what it is
 falling back to and how to fix it. Verified: the line appears with nothing set,

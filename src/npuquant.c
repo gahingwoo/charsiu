@@ -969,24 +969,58 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			 */
 			static int said;
 
-			if (!said) {
-				said = 1;
-				fprintf(stderr,
-					"charsiu: AWQ is on but no activation "
-					"statistics were found for %s -- falling "
-					"back to the column means of the WEIGHTS, "
-					"which this project measured and rejected. "
-					"Record them with CHARSIU_CALIB=<file>, "
-					"then point CHARSIU_AWQ_STATS at it or "
-					"leave it beside the gguf as "
-					"<model>.gguf.awq.\n", w->name);
-			}
-			for (uint64_t r = 0; r < n; r++) {
-				gguf_row_f32(w, r, row);
-				for (uint64_t i = 0; i < k; i++)
-					col[i] += fabs((double)row[i]);
+			/*
+			 * ⚠⚠ AND IT IS WORSE THAN NOT RUNNING AWQ AT ALL, so
+			 * warning was not enough. Llama-3.2-1B, host CPU
+			 * reference, 300 tokens:
+			 *
+			 *   AWQ off                        41.53
+			 *   AWQ 0.20 with statistics       35.20   -15.2%
+			 *   AWQ 0.20 with NO statistics    58.35   +40.5%
+			 *
+			 * Declining costs the caller nothing they had -- it
+			 * lands them on the 41.53 they would have had anyway --
+			 * and the fallback costs them 40%. So it declines, and
+			 * CHARSIU_NPU_AWQ_WEIGHTMEANS=1 keeps the refuted
+			 * variant reachable for anyone who wants it as a
+			 * control, which is the only thing it is good for.
+			 */
+			if (!charsiu_env_flag("CHARSIU_NPU_AWQ_WEIGHTMEANS", 0)) {
+				if (!said) {
+					said = 1;
+					fprintf(stderr,
+						"charsiu: AWQ is on but no "
+						"activation statistics were "
+						"found (first: %s) -- DECLINING "
+						"it. The fallback measured 40%% "
+						"WORSE than leaving AWQ off. "
+						"Record them with "
+						"CHARSIU_CALIB=<file>, then "
+						"point CHARSIU_AWQ_STATS at it "
+						"or leave it beside the gguf as "
+						"<model>.gguf.awq.\n", w->name);
+				}
+				free(col);
+				alpha = 0.0;
+			} else {
+				if (!said) {
+					said = 1;
+					fprintf(stderr,
+						"charsiu: AWQ from the column "
+						"means of the WEIGHTS, which "
+						"measured 40%% worse than off. "
+						"This is a control, not a "
+						"setting.\n");
+				}
+				for (uint64_t r = 0; r < n; r++) {
+					gguf_row_f32(w, r, row);
+					for (uint64_t i = 0; i < k; i++)
+						col[i] += fabs((double)row[i]);
+				}
 			}
 		}
+		if (alpha == 0.0)
+			goto no_awq;
 		t->kscale = malloc((size_t)k * sizeof(float));
 		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
 		/*
@@ -1080,6 +1114,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		}
 		free(col);
 	}
+no_awq:
 
 	{
 		struct qrows c = { t, w, k, ngrp, grp, bits, qmax,
