@@ -1214,15 +1214,52 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 */
 		{
 			double mean = 0.0;
+			const char *fl = getenv("CHARSIU_NPU_AWQ_FLOOR");
+			double awq_floor = fl && *fl ? atof(fl) : 1e-3;
 
+			/* ⚠ A FLOOR OF 0 OR LESS IS NOT "no floor", IT IS A
+			 * DIVIDE BY NEARLY ZERO -- the fault this exists to
+			 * prevent. An unusable value keeps the default rather
+			 * than silently disabling the guard. */
+			if (!(awq_floor > 0.0) || awq_floor >= 1.0)
+				awq_floor = 1e-3;
 			for (uint64_t i = 0; i < k; i++)
 				mean += col[i];
 			mean /= (double)n * (double)k;
+			/*
+			 * ⚠⚠ THE FLOOR IS THE OTHER BOUND ON THE FACTOR, AND IT
+			 * IS THE ONE NOBODY HAS EVER SWEPT.
+			 *
+			 * Flooring the statistic at `floor * mean` bounds the
+			 * factor at (1/floor)^alpha, whatever the data does --
+			 * so at the shipped 1e-3 the factor can never exceed
+			 * 1000^alpha: 2.82 at alpha 0.15, 5.62 at 0.25.
+			 *
+			 * 🔑 That is measurable two ways and they agree. Widen
+			 * CHARSIU_NPU_AWQ_CLAMP and the perplexity STOPS MOVING
+			 * once hi passes the bound, because the clamp is no
+			 * longer the tighter of the two: Llama at alpha 0.15
+			 * saturates at hi = 3.0, and 1000^0.15 is 2.82. Computed
+			 * straight off the statistics file, the largest factor
+			 * in that model is 2.806.
+			 *
+			 * ⚠ AND IT IS THE FLOOR THAT BINDS, NOT THE DATA. Llama
+			 * and Qwen3 have the SAME maximum factor at the same
+			 * alpha -- 2.806 against 2.784 at 0.15, 5.581 against
+			 * 5.508 at 0.25 -- because both are pinned here rather
+			 * than by their own activations. So "the clamp behaves
+			 * differently on the two models" was never true; they
+			 * were being measured at different alphas.
+			 *
+			 * ⚠ The clamp only does anything while hi < (1/floor)^
+			 * alpha. Above that it is inert and the floor is the
+			 * whole bound.
+			 */
 			for (uint64_t i = 0; i < k; i++) {
 				double v = col[i] / (double)n;
 
-				if (v < 1e-3 * mean)
-					v = 1e-3 * mean;
+				if (v < awq_floor * mean)
+					v = awq_floor * mean;
 				/*
 				 * ⚠⚠ NEGATIVE, AND THAT IS THE WHOLE METHOD.
 				 *
