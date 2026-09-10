@@ -7685,3 +7685,48 @@ and the quantiser half is exercised by the host CPU reference.
 
 ⚠ Not written. The prize is priced and the blocker is named; the change is not
 a comment away.
+
+### 🏁 The width moved onto the tensor, and eight bits on two layers is now a knob
+
+`npu_q_packed()` was a process-wide bool -- packed only when four bits are on
+AND `CHARSIU_NPU_W4_ONLY` is unset -- which is why a mixed model cost a byte a
+code on every tensor. It is now `t->packed`, set from the tensor's own bits, so
+the four-bit tensors keep their nibbles while the eight-bit ones do not.
+
+**Pure refactor, checked by the only test that can prove it: nothing moved.**
+
+```
+  int8, no W4V        17.9772  ->  17.9772
+  int4, group 1024    41.5289  ->  41.5289
+```
+
+Bit-identical both ways, and `arch_sanity` 8/8, and `host_awq` still
+41.5289 / 41.5289 / 35.2041 after the range parser was shared between two
+knobs instead of copied.
+
+**And then the knob it was for.** `CHARSIU_NPU_INT8_LAYERS=0-1` keeps those
+blocks at eight bits:
+
+```
+  all int4 group 1024            41.5289
+  INT8_LAYERS=0-1                26.0672     65.6% of the gap
+  all int8                       17.9772
+```
+
+**65.6%** against the **66.5%** the offline gguf sweep predicted on a different
+source and length. The runtime reproduces the prediction.
+
+⚠ **Two hazards, both refused rather than guessed at.**
+
+The weight cache holds one `bits` for the whole file and `wcache_read` validates
+a record's name, n, k and ngrp but not its width. That is safe while every
+tensor is the same width and stops being safe exactly when this knob is used,
+so a mixed model turns the cache off and says so.
+
+And the dispatch: the note over `slice_wsum` has one direction of the
+weight/device width mismatch and says it is handled -- an int8 DEVICE reading
+int4 codes, which every batching caller creates. This knob makes the direction
+nobody has, eight-bit weights on a device opened for four, where the register
+program and the activation pack are both `g->w4`'s. **It is refused in
+`charsiu_npu_add`**, so those tensors fall back to the CPU: slow, and right.
+Dispatching a mixed model is a board round.

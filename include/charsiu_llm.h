@@ -212,6 +212,10 @@ struct npu_tensor {
 	 * read-modify-write one shared byte.
 	 */
 	int8_t *q;
+	int packed;        /* two codes a byte -- a property of THIS tensor's
+			    * width, not of the process. It used to be
+			    * npu_q_packed(), one global bool, which is why
+			    * mixing widths meant nothing packed at all. */
 	float *scale;      /* n * ngroup, per output channel per k group */
 	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	float *kscale;     /* k, a factor shared by every channel; NULL when off */

@@ -63,6 +63,7 @@
  */
 int npu_q_packed(void);
 size_t npu_q_stride(uint64_t k);
+size_t npu_q_stride_t(const struct npu_tensor *t);
 
 /* one int4 code out of a packed row of t->q, by column */
 static inline int q_code(const int8_t *row, uint64_t i)
@@ -2317,8 +2318,8 @@ static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 	 * byte, and the two are free to differ -- which they do whenever a
 	 * caller forces int8 on the device while the quantiser is at four bits.
 	 */
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(w->t->k);
+	const int pk = w->t->packed;
+	const size_t stride = npu_q_stride_t(w->t);
 
 	for (uint64_t r = r0; r < r0 + nr; r++) {
 		const int8_t *src = w->t->q + (size_t)(w->n0 + r) * stride;
@@ -2358,8 +2359,8 @@ static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 static void slice_wsum(const struct npu_tensor *t, unsigned n0, unsigned n,
 		       unsigned k0, unsigned k, int32_t *wsum)
 {
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(t->k);
+	const int pk = t->packed;
+	const size_t stride = npu_q_stride_t(t);
 
 	for (unsigned r = 0; r < n; r++) {
 		const int8_t *src = t->q + (size_t)(n0 + r) * stride;
@@ -2387,8 +2388,8 @@ static void slice_wsum(const struct npu_tensor *t, unsigned n0, unsigned n,
  */
 static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
 {
-	const int pk = npu_q_packed();
-	const size_t stride = npu_q_stride(t->k);
+	const int pk = t->packed;
+	const size_t stride = npu_q_stride_t(t);
 	size_t per = ((size_t)t->k + 1) / 2;
 	unsigned nc = (unsigned)t->n - n0;
 
@@ -2704,6 +2705,25 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	if (t->n > g->max_n) {
 		whine(g, "wider than the device was opened for", (unsigned)t->k,
 		      (unsigned)t->n);
+		return -1;
+	}
+	/*
+	 * ⚠⚠ EIGHT BIT WEIGHTS ON A FOUR BIT DEVICE, WHICH IS NEW.
+	 *
+	 * The note over slice_wsum has the other direction and says it is
+	 * handled: an int8 DEVICE reading int4 codes out of a packed q, which
+	 * every batching caller creates. CHARSIU_NPU_INT8_LAYERS creates the
+	 * direction nobody has: a tensor whose q is one byte a code staged onto
+	 * a device opened for four, where the register program and the
+	 * activation pack are both g->w4's.
+	 *
+	 * Nothing here can be reached from a host without an NPU, so this is
+	 * refused rather than guessed at. Refusing puts those tensors on the
+	 * CPU -- slow, and right. Dispatching a mixed model is a board round.
+	 */
+	if (g->w4 && !t->packed) {
+		whine(g, "eight bit weights on a device opened for four",
+		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
 	/*
