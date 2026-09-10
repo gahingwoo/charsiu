@@ -8893,3 +8893,46 @@ the sweep beats off**, 85.80 to 83.86 against 88.56.
 
 ⚠ A number carried from one table's header into another's is not a
 measurement, and this one had a row label attached that I did not re-read.
+
+### 🏁 The KMAX/group trade, priced at last — and it is unfavourable
+
+Item 3 of "what is left" has said *"fewer K slices would cut the read AND the
+fence's intercepts proportionally, and it is blocked by the quantiser group"*
+since 09-08. `tensor_grouped()` wants `kgroup == kmax`, so the two move
+together. Both sides now have numbers.
+
+**The gain, computed from shapes alone** — `read ∝ Σ slices × n`, and the fence
+carries a per-slice intercept:
+
+```
+                   KMAX=1024      2048        4096
+  Llama-3.2-1B    320 / 1.0M   160 / 0.5M   128 / 0.4M    -50%   -60%
+  Qwen3-0.6B      281 / 0.6M   225 / 0.5M   197 / 0.5M    -20%   -30%
+```
+
+**The price, measured with AWQ on at each model's own exponent:**
+
+```
+                  group=1024      2048        4096
+  Llama  long       25.3664     27.2848     28.3082     +7.6%   +11.6%
+         long2      44.0703     54.8905     56.6209    +24.5%   +28.5%
+  qwen3  long       64.0527     68.5076     68.5076     +7.0%    +7.0%
+         long2     106.1014    114.5617    114.5617     +8.0%    +8.0%
+```
+
+Llama 1024 → 4096 buys 60% off the read, which is 0.93 ms of a 4.59 ms row, so
+about **0.56 ms a row — 12%** — plus whatever the fence's per-slice intercept
+is worth. It costs **10.5% to 39.7%** of perplexity.
+
+⛔ **So the road stays closed, but priced rather than asserted: the grouping is
+worth more than the slices.**
+
+⚠ qwen3's 2048 and 4096 columns are IDENTICAL, and equal to its ungrouped
+value, because most of its tensors are k = 1024 — a group wider than k
+degenerates to one scale a row. For that model there is nothing between
+"group 1024" and "ungrouped" at all.
+
+⚠⚠ **And the two passages disagree threefold on the price** — +7.6% against
++24.5% for the same Llama step. The gain side is computed and exact; the price
+side is not even well determined. Anything built on this trade would be built
+on the shakier half.
