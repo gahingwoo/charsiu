@@ -1443,8 +1443,58 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 	const int pk = t->packed;
 	const size_t stride = npu_q_stride_t(t);
 
+	/*
+	 * The k factor rides on the ACTIVATION, so a tensor that has one needs
+	 * its own quantisation of the same input vector. On the board this is
+	 * one multiply a k before the pack; here it is done straight so the
+	 * measurement is honest.
+	 *
+	 * ⚠ PER CALL, NOT static. npu_matvec runs on the worker threads, and a
+	 * static scratch buffer here was a race and a double free: three of
+	 * the five exponents in the first sweep produced no output at all.
+	 *
+	 * ⚠⚠ AND IT WAS PER ROW, WHICH THE PARAGRAPH ABOVE ALREADY SAID IT
+	 * SHOULD NOT BE. The scaled activation depends on `a` and on
+	 * `t->kscale` and on nothing else -- `r` does not appear in it -- so
+	 * every row of a tensor was mallocing k bytes, taking a maximum over
+	 * k, quantising k values and freeing, to arrive at the same buffer the
+	 * previous row had just built. On the output head that is 128256
+	 * identical reconstructions of one vector, and it is why an AWQ arm of
+	 * a ppl sweep runs several times longer than the arm with AWQ off.
+	 *
+	 * Hoisted, it is exactly the "per call" the note asked for. Same
+	 * arithmetic in the same order, so the answer must not move by a
+	 * digit -- which is the only test that can prove it.
+	 */
+	const int8_t *aq = a->q1;
+	int8_t *free_after = NULL;
+	float ad = a->d1;
+
 	if (getenv("CHARSIU_CALIB") && row0 == 0)
 		npu_calib_note((struct npu_tensor *)t, a);
+	if (t->kscale) {
+		int8_t *tmp = malloc((size_t)t->k);
+		float amax = 0.0f;
+
+		if (!tmp)
+			return;
+		for (uint64_t i = 0; i < t->k; i++) {
+			float v = a->f[i] * t->kscale[i];
+
+			if (fabsf(v) > amax) amax = fabsf(v);
+		}
+		ad = amax / 127.0f;
+		for (uint64_t i = 0; i < t->k; i++) {
+			int v = (int)lrintf(a->f[i] * t->kscale[i]
+					    / (ad != 0.0f ? ad : 1.0f));
+
+			if (v > 127) v = 127;
+			if (v < -127) v = -127;
+			tmp[i] = (int8_t)v;
+		}
+		aq = tmp;
+		free_after = tmp;
+	}
 	for (uint64_t r = 0; r < nrows; r++) {
 		uint64_t n = row0 + r;
 		const int8_t *qr = t->q + n * stride;
@@ -1452,45 +1502,6 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		uint64_t grp = t->kgroup ? t->kgroup : t->k;
 		uint64_t ngrp = (t->k + grp - 1) / grp;
 		double acc = 0.0;
-		const int8_t *aq = a->q1;
-		int8_t *free_after = NULL;
-		float ad = a->d1;
-
-		/*
-		 * The k factor rides on the ACTIVATION, so a tensor that has one
-		 * needs its own quantisation of the same input vector. On the
-		 * board this is one multiply a k before the pack; here it is
-		 * done straight so the measurement is honest.
-		 */
-		if (t->kscale) {
-			/*
-			 * ⚠ PER CALL, NOT static. npu_matvec runs on the worker
-			 * threads, and a static scratch buffer here was a race
-			 * and a double free: three of the five exponents in the
-			 * first sweep produced no output at all.
-			 */
-			int8_t *tmp = malloc((size_t)t->k);
-			float amax = 0.0f;
-
-			if (!tmp)
-				return;
-			for (uint64_t i = 0; i < t->k; i++) {
-				float v = a->f[i] * t->kscale[i];
-
-				if (fabsf(v) > amax) amax = fabsf(v);
-			}
-			ad = amax / 127.0f;
-			for (uint64_t i = 0; i < t->k; i++) {
-				int v = (int)lrintf(a->f[i] * t->kscale[i]
-						    / (ad != 0.0f ? ad : 1.0f));
-
-				if (v > 127) v = 127;
-				if (v < -127) v = -127;
-				tmp[i] = (int8_t)v;
-			}
-			aq = tmp;
-			free_after = tmp;
-		}
 
 		/*
 		 * ⚠ WHAT PRECISION IS THE ACTIVATION, REALLY.
@@ -1527,7 +1538,6 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 				acc += part * t->scale[n * ngrp + g];
 			}
 			y[n] = (float)acc;
-			free(free_after);
 			continue;
 		}
 		for (uint64_t g = 0; g < ngrp; g++) {
@@ -1556,8 +1566,11 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 			acc += part * t->scale[n * ngrp + g];
 		}
 		y[n] = (float)(acc * ad);
-		free(free_after);
 	}
+	/* ⚠ ONCE, AFTER THE LOOP. It used to be freed at the bottom of every
+	 * iteration, which was consistent with allocating at the top of every
+	 * iteration and is a double free the moment either one moves. */
+	free(free_after);
 }
 
 static uint64_t npu_cal_calls(void)
