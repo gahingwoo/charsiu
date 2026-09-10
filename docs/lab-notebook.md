@@ -7976,3 +7976,47 @@ gemma4's `per_layer_token_embd` contains that string and is a lookup.
 
 **A tool whose whole output is a percentage is a tool where the census rule is
 the result.** Both of those printed a clean, plausible table.
+
+### ⚠⚠ The second gate on a narrow read, and it applies to only one of the two widths
+
+The first version of this entry said a narrow read cannot carry a partial sum.
+That is right for one width and wrong for the other, and the difference decides
+which of the two is worth chasing.
+
+What makes a K split free today is `acc_out`: the hardware writes the raw int32
+accumulator and the CPU adds the slices, so a tensor wider than KMAX costs
+nothing at all. A requantised output is a different object, and what it costs
+depends on whether its precision is **relative or absolute**.
+
+```
+  fp16   relative, about 2^-11 of whatever the partial sum is. Four partials
+         each carrying that, summed, still carry about that. Only the 65504
+         bound gates it.
+  int8   absolute, against a scale fixed before the dispatch. A quarter of K
+         sums to about half the total, so a scale chosen for the total spends
+         two of the eight bits on range the partial never uses, and the four
+         roundings add. A four-way split is nearer six bits than eight.
+```
+
+And one byte is the one worth chasing — 0.70 ms a row against 0.47, on a gap of
+0.67 — so the split gate is the one that matters. At KMAX 2048:
+
+```
+                   under 65504    one K slice
+  Llama-3.2-1B        100.0%         78.3%
+  Qwen3-0.6B          100.0%         89.1%
+  Phi-3.5-mini         87.8%          0.0%
+```
+
+⚠⚠ **Phi-3.5 is zero, and that is a KMAX choice rather than a property of the
+model.** Its K is 3072 and every tensor is cut in two at 2048. At KMAX 4096 the
+same file reads **82.8%**. So the model with the worst TTFT in the table — 2764
+ms — gets nothing from a one-byte read at the shipped slice width and most of
+it at a wider one.
+
+⚠ And a wider KMAX is not free: the input surface ceiling is `(k/32) * m <=
+5120`, so K 2048 allows m 80 and K 4096 allows m 40. That is the vendor's own
+trade, from its own file, and it is now on both sides of a decision rather than
+just recorded.
+
+`tools/out16_bound.c --kmax N` prints both shares.

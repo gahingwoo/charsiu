@@ -31,6 +31,28 @@
  * is per channel, so the hardware cannot apply a per-group scale and the raw
  * accumulator is the only correct read. Nothing here applies to w4a16.
  *
+ * ⚠⚠ AND THE K SPLIT IS A SECOND GATE, BUT ONLY FOR ONE OF THE TWO WIDTHS.
+ * This is worth getting right because the obvious version of it is wrong.
+ *
+ * What makes a K split free today is `acc_out`: the hardware writes the raw
+ * int32 accumulator and the CPU adds the slices, so a tensor wider than KMAX
+ * costs nothing at all. A requantised output is a different object, and what
+ * it costs depends on whether its precision is RELATIVE or ABSOLUTE.
+ *
+ *   fp16   relative, about 2^-11 of whatever the partial sum is. Four
+ *          partials each carrying that, summed, still carry about that. The
+ *          split is fine and only the 65504 bound gates it.
+ *   int8   absolute, against a scale that has to be fixed before the
+ *          dispatch. A partial sum of a quarter of K is smaller than the
+ *          total by roughly the square root of four, so a scale chosen for
+ *          the total spends two of the eight bits on range the partial never
+ *          uses -- and the four roundings add. A four-way split is nearer six
+ *          bits than eight.
+ *
+ * So the second percentage below gates the INT8 read and not the fp16 one,
+ * and it is the interesting number because one byte saves 0.70 ms a row where
+ * two saves 0.47 and the gap is 0.67.
+ *
  * ⚠ THE WEIGHTS ARE THE GGUF'S, NOT charsiu'S QUANTISATION OF THEM. The
  * hardware would emit sum a_q * w_q * w_scale and this sums |w| off the file.
  * They differ by the quantiser's error on a sum of thousands of magnitudes,
@@ -38,7 +60,7 @@
  * tensor ever lands within a few percent of the line, that is the reason not
  * to trust this tool about it.
  *
- *   out16_bound MODEL.gguf [MODEL.gguf ...]
+ *   out16_bound MODEL.gguf [MODEL.gguf ...] [--kmax N]
  *
  * The last column is the one that decides whether the feature is worth a board
  * round: what share of the output elements a prefill reads are on tensors that
@@ -110,9 +132,10 @@ struct kind {
 	char name[48];
 	double worst;        /* the largest 127*sum|w| over every channel */
 	char worst_in[80];
-	uint64_t nchan;      /* output elements a prefill row reads */
+	uint64_t nchan;      /* output elements a prefill row reads, per slice */
 	uint64_t nchan_ok;   /* of them, on tensors under the line */
-	unsigned ntensor, nover;
+	uint64_t nchan_1ks;  /* of them, on tensors with ONE K slice */
+	unsigned ntensor, nover, nsplit;
 };
 
 static struct kind *find(struct kind *k, unsigned *n, const char *name)
@@ -124,12 +147,12 @@ static struct kind *find(struct kind *k, unsigned *n, const char *name)
 	return &k[(*n)++];
 }
 
-static int one(const char *path)
+static int one(const char *path, unsigned kmax)
 {
 	struct gguf g;
 	struct kind kinds[16];
 	unsigned nk = 0;
-	uint64_t tot = 0, ok = 0;
+	uint64_t tot = 0, ok = 0, one_ks = 0;
 	float *row = NULL;
 	uint64_t rowmax = 0;
 	int tied;
@@ -177,13 +200,30 @@ static int one(const char *path)
 		kindof(t->name, kn, sizeof(kn));
 		k = find(kinds, &nk, kn);
 		k->ntensor++;
-		k->nchan += t->ne[1];
-		tot += t->ne[1];
-		if (worst <= FP16_MAX) {
-			k->nchan_ok += t->ne[1];
-			ok += t->ne[1];
-		} else {
-			k->nover++;
+		/*
+		 * ⚠ PER K SLICE, because that is what is READ. Every slice
+		 * writes the tensor's full n outputs and the CPU sums them,
+		 * so a tensor cut four ways is read four times over -- which
+		 * is exactly why ffn_down dominates the read and exactly why
+		 * it is the one a narrow output cannot have.
+		 */
+		{
+			uint64_t ks = (t->ne[0] + kmax - 1) / kmax;
+
+			k->nchan += t->ne[1] * ks;
+			tot += t->ne[1] * ks;
+			if (ks == 1) {
+				k->nchan_1ks += t->ne[1];
+				one_ks += t->ne[1];
+			} else {
+				k->nsplit++;
+			}
+			if (worst <= FP16_MAX) {
+				k->nchan_ok += t->ne[1] * ks;
+				ok += t->ne[1] * ks;
+			} else {
+				k->nover++;
+			}
 		}
 		if (worst > k->worst) {
 			k->worst = worst;
@@ -196,34 +236,51 @@ static int one(const char *path)
 		puts("  no routed tensors -- is this a language model?");
 		return 0;
 	}
-	printf("  %-14s %7s %7s  %12s  %6s  %s\n",
-	       "kind", "tensors", "over", "worst 127S|w|", "of max", "worst in");
+	printf("  %-14s %7s %5s %6s  %12s  %6s  %s\n",
+	       "kind", "tensors", "over", "split", "worst 127S|w|", "of max",
+	       "worst in");
 	for (unsigned i = 0; i < nk; i++) {
 		struct kind *k = &kinds[i];
 
-		printf("  %-14s %7u %7u  %12.0f  %5.2fx  %s\n",
-		       k->name, k->ntensor, k->nover, k->worst,
+		printf("  %-14s %7u %5u %6u  %12.0f  %5.2fx  %s\n",
+		       k->name, k->ntensor, k->nover, k->nsplit, k->worst,
 		       k->worst / FP16_MAX, k->nover ? k->worst_in : "-");
 	}
 	printf("  ----\n");
-	printf("  %.1f%% of the output elements a prefill row reads are on "
-	       "tensors under fp16's 65504\n", 100.0 * (double)ok / (double)tot);
+	printf("  of the output elements a prefill row reads, at KMAX %u:\n", kmax);
+	printf("    %5.1f%%  are on tensors under fp16's 65504\n",
+	       100.0 * (double)ok / (double)tot);
+	printf("    %5.1f%%  are on tensors with ONE K slice -- the share an "
+	       "int8 read could\n            take at full precision; fp16 is "
+	       "relative and does not need this\n",
+	       100.0 * (double)one_ks / (double)tot);
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
-	int bad = 0;
+	int bad = 0, nfile = 0;
+	unsigned kmax = 2048;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: out16_bound MODEL.gguf [...]\n");
+		fprintf(stderr, "usage: out16_bound MODEL.gguf [...] [--kmax N]\n");
 		return 2;
 	}
+	for (int i = 1; i < argc; i++)
+		if (!strcmp(argv[i], "--kmax") && i + 1 < argc)
+			kmax = (unsigned)strtoul(argv[++i], NULL, 10);
 	puts("The worst case a channel can emit, against fp16's 65504.");
 	puts("⚠ WORST CASE: every |a_q| = 127 and every sign agreeing. Real "
 	     "activations run about a third of that -- but an overflow is an "
 	     "inf, so only the worst case can gate it.");
-	for (int i = 1; i < argc; i++)
-		bad |= one(argv[i]);
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--kmax")) { i++; continue; }
+		bad |= one(argv[i], kmax);
+		nfile++;
+	}
+	if (!nfile) {
+		fprintf(stderr, "no model given\n");
+		return 2;
+	}
 	return bad;
 }
