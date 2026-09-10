@@ -619,6 +619,21 @@ to 1000^0.65 = 89 and the narrow clamp is what saves the model -- Llama 72.17
 at hi=2 against 86.66 at hi=4. The clamp earns its keep exactly where the
 exponent is too large to be used at all.
 
+🏁🏁 **CONFIRMED ON THE BOARD, 2026-09-10.** ROCK 4D, Llama-3.2-1B, the same
+corpus bytes as the desk:
+
+```
+                       board       host
+  int4                33.4149    33.8071
+  + AWQ alpha 0.20    23.7935    23.7173     board and host agree to 0.3%
+  + INT8_LAYERS=3-4   22.0356    22.0818
+  clamp 2.0 instead    26.9265    27.7029     the old default costs 13.2%
+```
+
+and the batched path applying AWQ's factor instead of refusing is worth
+**5.1x on prefill** -- 2643 ms against 515 ms -- because the refusal fell back
+to a row at a time. AWQ_SHARE gives identical tokens and +2.9% decode.
+
 🏁 **The default moved 2.0 -> 6.0 on 2026-09-10**, because 2.0 binds from alpha
 0.10 upward and was taking a third of the method with it. 6.0 is inert wherever
 the exponent is usable and still bounds above it:
