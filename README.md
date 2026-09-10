@@ -479,10 +479,24 @@ sweep on Llama-3.2-1B, its own calibration, same corpus and length:
   ppl    41.5289  38.4906  33.7566  32.5094  35.2041  42.3752  50.7341
 ```
 
-Unimodal, minimum at **0.15**: 21.7% against off, where 0.20 gives 15.2%. A
-best cell sitting on the boundary of a grid has a neighbour on one side only,
-and that is the whole tell -- the surface above is perfectly monotone and the
-conclusion drawn from it was still wrong.
+Unimodal, and **the good region extends below 0.20**: 0.10 and 0.15 both beat
+it by 4 to 8%. A best cell sitting on the boundary of a grid has a neighbour on
+one side only, and that is the whole tell.
+
+⚠⚠ **But 0.15 is not a resolved minimum, and the second model is why.** The
+same sweep on Qwen3-0.6B, same corpus and length, is NOT monotone:
+
+```
+  alpha   off      0.10     0.15     0.20     0.25     0.35     0.50
+  ppl   110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
+```
+
+0.15 sits **above both its neighbours** and 0.50 sits below 0.35. `charsiu_ppl`
+is deterministic, so that is not measurement noise -- it is 299 scored
+positions of one passage being unable to rank cells eight to ten percent apart.
+And Llama's 0.15-against-0.20 gap is eight percent, which is inside the band
+this model just showed to be unrankable at that length. **The good region is
+established; the point inside it is not.**
 
 At 0.5 -- the value this tree has always
 used -- AWQ is **worse than not running it at all**, 68.26 against 52.34. So

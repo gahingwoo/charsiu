@@ -8126,3 +8126,44 @@ same shape `INT8_LAYERS` turned out to have.
 ⚠ A LAYERS number quoted without its exponent is not comparable to anything,
 and the whole surface moves with alpha. `tests/board_awq.sh` prints the alpha
 in the arm's own heading now.
+
+### ⚠⚠ The second model put the tell back: 0.15 is a region, not a minimum
+
+Llama's and qwen3's AWQ optima had been measured on **different corpora** —
+0.20 and 0.35 — so nobody had separated "per model" from "per corpus". Both on
+`tests/corpus/long.txt` at 300 tokens, host CPU reference, each with its own
+calibration recorded from `tests/corpus/calib.txt`:
+
+```
+  alpha        off      0.05     0.10     0.15     0.20     0.25     0.35     0.50
+  Llama-1B   41.5289  38.4906  33.7566  32.5094  35.2041     -     42.3752  50.7341
+  Qwen3-0.6B 110.0549    -     80.1066  86.1183  77.7821  71.7770 77.8404  77.5428
+```
+
+**Qwen3's row is not monotone.** 0.15 sits *above* both its neighbours by eight
+to ten percent, and 0.50 sits *below* 0.35. `charsiu_ppl` is deterministic, so
+this is not measurement noise — it is **299 scored positions of one passage
+being unable to rank cells eight to ten percent apart.**
+
+⚠⚠ **And that retracts the sharp form of this morning's claim.** Llama's
+0.15-against-0.20 gap is eight percent, which is inside the band qwen3 has just
+demonstrated to be unrankable at this length. The surface being monotone on
+Llama is the tell's *absence*, which is weaker than its presence is damning.
+
+**What survives, and it is the part that mattered:**
+
+- the good region for Llama extends **below 0.20**, which was the old grid's
+  floor: 0.10 and 0.15 both beat it, by 4 and 8%. "The minimum is at 0.20" was
+  read off a grid that could not have found anything smaller, and that is still
+  wrong.
+- 0.5 is still clearly bad on Llama — 50.73 against 41.53 with AWQ off.
+- AWQ is worth 20 to 35% on both models somewhere in 0.10 to 0.25.
+- ⚠ The vendor's own per-tensor exponents run 0.03 to 0.15 typical and never
+  exceed 0.401, which lands in the same region from a completely different
+  direction and is not subject to this corpus's sampling at all.
+
+🔑 **The instrument's resolution is a property of the corpus and the length,
+and it is now measured: ~10% at 299 positions on this passage.** Any two cells
+closer than that need a longer run or another corpus before they can be
+ordered. That is a number this tree did not have, and it applies to every ppl
+comparison in this file, not only to AWQ.
