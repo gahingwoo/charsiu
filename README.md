@@ -687,6 +687,20 @@ share of the damage -- so against all-int8 at 17.9772 the knob returns **2.1x
 its share of the bytes, not the 5.2x above.** AWQ costs no bytes at all, so
 **turn AWQ on first**, then ask whether 12.5% more weight is worth 1 to 8%.
 
+⚠⚠ **And `0-1` is then the wrong range.** With AWQ on, blk.0 ranks NINTH of
+sixteen for how much four-bit damage it carries -- AWQ already treats what the
+first layers suffer from, and what is left peaks at blk.1 and blk.3. Both
+replacements hold on both passages:
+
+```
+              long.txt        long2.txt      bytes
+  0-1        23.4235 -7.7%   41.8643 -5.0%   12.5%
+  1-1        23.5415 -7.2%   41.8468 -5.0%   6.25%   same, HALF the bytes
+  3-4        23.1453 -8.8%   40.5593 -8.0%   12.5%   more, same bytes
+```
+
+**Use `1-1` if bytes matter or `3-4` if quality does.**
+
 ⛔ **It is host-side today.** `charsiu_npu_add` refuses an eight-bit tensor on
 a device opened for four, so those tensors take the CPU: slow, and right. The
 easy way round it is a trap and is written down so nobody takes it — an int8
