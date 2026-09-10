@@ -15,7 +15,12 @@
 set -e
 D=$(dirname "$0")
 M=${1:?model} C=${2:-$D/corpus/calib.txt} E=${3:-$D/corpus/long.txt}
+# ⚠ ON THE BOARD THERE IS NO build/. The binaries sit beside this script in
+# /opt/charsiu, which is what `charsiu update dev` installs -- spec_identity.sh
+# lost a whole board run to exactly this and says so at its own resolver.
 B=$D/../build
+[ -x "$B/charsiu_ppl" ] || B=$D
+[ -x "$B/charsiu_ppl" ] || { echo "no charsiu_ppl beside $0 or in ../build"; exit 2; }
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 

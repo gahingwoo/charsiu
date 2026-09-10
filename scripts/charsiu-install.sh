@@ -931,7 +931,7 @@ RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 # six attention defaults chosen on a compute bound desktop are still the
 # defaults on a bandwidth bound board. Anything added to PROBE_SCRIPTS that
 # runs a binary has to add the binary here in the same edit.
-PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt"
+PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt npu_mixed_test out16_bound"
 # ⚠ EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
 # down says a probe that lives only in the source tree under ~/.cache is a
 # board round that does not happen -- and then only prefill_control.sh was
@@ -942,7 +942,8 @@ board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh \
 board_threads.sh board_w4_m8.sh vattn_sweep.sh vattn_edges.sh \
 board_text_all.sh board_refused_onedev.sh board_chunk_sweep.sh board_intermittent.sh \
 board_ab.sh board_width_law.sh board_verify.sh verify_selftest.sh whisper_transcribe.sh \
-board_overlap_slots.sh board_attn_block.sh"
+board_overlap_slots.sh board_attn_block.sh board_awq.sh host_awq.sh \
+corpus_fixed.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
@@ -974,6 +975,24 @@ dev)	for f in $PROBE_SCRIPTS; do
 		[ "$DRY" = 1 ] || [ -r "$SRC/tests/$f" ] || continue
 		as_root cp "$SRC/tests/$f" "$BIN/$f"
 		as_root chmod 0755 "$BIN/$f"
+	done
+	#
+	# ⚠⚠ AND THE TEXT THEY SCORE ON, which is not a script and is not a
+	# binary and would have been the thing nobody copied.
+	#
+	# board_awq.sh and host_awq.sh both default to tests/corpus, and every
+	# perplexity written down in this tree was measured on those exact
+	# bytes -- that is the whole reason a number from last week can be put
+	# beside one from today. A board round that rebuilds its own corpus is
+	# a board round whose numbers cannot be compared with the desk's.
+	#
+	# They resolve it as $D/corpus where $D is the script's own directory,
+	# so on the board it has to be $BIN/corpus.
+	#
+	for f in long.txt calib.txt ppl.txt; do
+		[ "$DRY" = 1 ] || [ -r "$SRC/tests/corpus/$f" ] || continue
+		as_root mkdir -p "$BIN/corpus"
+		as_root cp "$SRC/tests/corpus/$f" "$BIN/corpus/$f"
 	done ;;
 esac
 # ⚠ BOTH LIBRARIES, OR EVERY COMMAND EXITS ON THE FIRST LINE. charsiu-lib.sh

@@ -155,7 +155,12 @@ printf '   decode %s tok/s (no share)   %s tok/s (shared)\n' \
 	"$(tps < "$T/s0.err")" "$(tps < "$T/s1.err")"
 
 echo
-echo "== arm 3: AWQ on the first three blocks only"
+# ⚠ AT WHATEVER CHARSIU_AWQ_ALPHA IS, WHICH ARM 4 IS WHAT CHOOSES. The two
+# arms are in this order because arm 3 only needs the comparison to be
+# internally consistent, but a LAYERS number quoted without its alpha is not
+# comparable to anything -- Llama's optimum moved from 0.20 to 0.10 on the
+# tree corpus, and the whole surface moves with it.
+echo "== arm 3: AWQ on the first three blocks only, at alpha $ALPHA"
 for L in "" "0-2"; do
 	# shellcheck disable=SC2086
 	P=$(env $W4 CHARSIU_NPU_AWQ="$ALPHA" CHARSIU_AWQ_STATS="$STATS" \
