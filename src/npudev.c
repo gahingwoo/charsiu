@@ -45,10 +45,19 @@
  * The quantiser holds an int4 weight in HALF a byte -- 298.0 MB of q on
  * Qwen3-0.6B rather than 596.0, and 1861.2 rather than 3722.4 on Phi-3.5-mini
  * -- laid out row major, ((k + 1) / 2) bytes a row, low nibble first. The long
- * note over npu_q_packed in src/npuquant.c has the layout and, more
- * importantly, why "is it packed" is ONE process wide bool rather than anything
- * per tensor: this file only holds t->name, and two files disagreeing by a
- * nibble about the same buffer is a wrong answer that reads as a right one.
+ * note over npu_q_packed in src/npuquant.c has the layout.
+ *
+ * ⚠ IT IS t->packed NOW, NOT A PROCESS WIDE BOOL, and this paragraph used to
+ * say the opposite and give the reason: two files disagreeing by a nibble
+ * about the same buffer is a wrong answer that reads as a right one, and
+ * this file only had t->name to decide with. The answer to that was not to
+ * keep one global bool, it was to put the width on the TENSOR both files
+ * already share -- so they cannot disagree, and a model with eight bits on
+ * two layers stops paying a byte a code on the other fourteen.
+ *
+ * npu_q_packed() still exists and is still process wide. It answers a
+ * different question -- what the quantiser is about to produce -- and
+ * anything reading an EXISTING buffer wants npu_q_stride_t and t->packed.
  *
  * Declared here rather than in charsiu_llm.h because the width q is held at is
  * the quantiser's business and nothing outside these two files reads it.
