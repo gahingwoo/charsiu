@@ -619,8 +619,21 @@ to 1000^0.65 = 89 and the narrow clamp is what saves the model -- Llama 72.17
 at hi=2 against 86.66 at hi=4. The clamp earns its keep exactly where the
 exponent is too large to be used at all.
 
-⚠ The default stays at 2.0 because every number on record was measured there,
-and moving it silently would make them all unreproducible.
+🏁 **The default moved 2.0 -> 6.0 on 2026-09-10**, because 2.0 binds from alpha
+0.10 upward and was taking a third of the method with it. 6.0 is inert wherever
+the exponent is usable and still bounds above it:
+
+```
+  alpha    hi=2.0    hi=6.0    hi=64      (AWQ off 41.5289)
+  0.20    35.2041   28.0368   28.0368     inert, identical to unclamped
+  0.25    38.3471   28.3271   28.3271     inert, identical to unclamped
+  0.50    50.7341   41.4979   37.6820
+  0.65    72.1690   94.5806   79.7978     2.0 wins only here, where all are unusable
+```
+
+⚠ **Every AWQ number recorded before that date was measured at 2.0**, and
+`CHARSIU_NPU_AWQ_CLAMP=2.0` reproduces them exactly. Nothing shipped changes:
+AWQ is off by default and the carried controls are bit-identical.
 
 ⚠ **The activation width is not where four bits hurt.** The int4 path tells the
 hardware sixteen-bit activations and then packs an eight-bit value into the
