@@ -7637,3 +7637,51 @@ and no single tensor class carries it." That still holds across classes.
 Across LAYERS it does not: layers 0 and 1 are 12.5% of the bytes and 44% of the
 damage, a 3.5x concentration. The earlier sentence was about the axis it was
 measured on, and reads like a statement about all axes.
+
+### 🏁 Eight bits on two layers beats a finer four-bit group everywhere
+
+The finer group was one route to the early layers. Eight bits is the other, and
+it is the better one. All 112 matrices quantised, only the early layers'
+treatment varying, same corpus and length:
+
+```
+                              ppl      excess    of the gap to lossless
+  reference f16            19.8844      +0.0%
+  all int8                 19.9007      +0.1%          100%
+  L0-3 at int8             23.1661     +16.5%           75%
+  L0-1 at int8             24.2834     +22.1%           67%
+  all int4 group 128       26.9442     +35.5%           46%
+  L0-1 at int4 group 128   28.8072     +44.9%           32%
+  all int4 group 1024      32.9790     +65.9%            0%    <- ships
+```
+
+**Eight bits on two layers of sixteen beats group 128 on all of them**, 24.28
+against 26.94, and it is 67% of the whole distance to lossless.
+
+🔑 **And the marginal return falls off a cliff after two layers.** Layers 0 and
+1 are +12.5% of the weight bytes and buy 66.5% of the gap -- 5.3 points of
+quality a point of bytes. Layers 2 and 3 are the next +12.5% and buy 8.5 more
+-- 0.68 a point. **Eight times worse**, which is the same concentration the
+per-layer sweep found, priced.
+
+⛔ **And the runtime can express the mix but not afford it.** `npu_q_packed()`
+is a process-wide constant: packed only when four bits are on AND
+`CHARSIU_NPU_W4_ONLY` is unset. So mixing widths today means nothing packs, and
+every four-bit code takes a byte:
+
+```
+  all int4, packed                       0.5000 B a weight
+  mixed through W4_ONLY, unpacked        1.0000       -- the same as all int8
+  mixed with per-tensor packing          0.5625       +12.5%, which is the point
+```
+
+The note above `npu_q_packed` says why it is global -- "under W4_ONLY the two
+files could disagree about the width of the same buffer, and a reader that is
+one nibble out of step with the writer does not fail, it answers in fluent
+sentences." The fix is the same shape as the one that ended that argument for
+grouping: **put it on the tensor, so both files read one per-tensor bool
+instead of one global one.** 28 call sites, 18 in npuquant and 10 in npudev,
+and the quantiser half is exercised by the host CPU reference.
+
+⚠ Not written. The prize is priced and the blocker is named; the change is not
+a comment away.
