@@ -8676,3 +8676,55 @@ suspect and is being re-measured on the same grid with the clamp inert.
 ⚠ What does NOT change: the floor sweep (measured with the clamp already
 inert), the clamp-binds-or-not result (four of four), and the two silent
 wrong-answer paths, which have nothing to do with any of this.
+
+### ⛔ The per-kind table re-measured: five of seven optima move, and attn_k reverses
+
+Same grid, same passage, the only change being `CHARSIU_NPU_AWQ_CLAMP=64` so
+the clamp cannot bind. qwen3, `long.txt`, off = 110.0549:
+
+```
+  kind          0.05     0.10     0.15     0.25     0.40    best  (was)
+  attn_q      106.67   101.64   108.87   102.85   108.70   0.10  (0.40)
+  attn_k      114.37   111.76   118.61   123.81    95.70   0.40  (never won)
+  attn_v      116.25    93.59    93.03    93.83    85.34   0.40  (0.25)
+  attn_output  92.24    95.62    98.19    89.30    98.84   0.25  (0.05)
+  ffn_gate     95.67    97.42    96.96    97.90    92.61   0.40  (0.25)
+  ffn_up      107.27    97.59    96.34   100.88   114.48   0.15  (0.15)  unchanged
+  ffn_down    102.95    86.56    97.77    89.45    89.85   0.10  (0.10)  unchanged
+```
+
+⚠ The 0.05 and 0.10 columns are **identical to the clamped table**, which is
+the built-in control: `1000^0.10 = 2.0`, so at those exponents the clamp was
+already at the boundary and not binding. Everything from 0.15 rightward moves.
+
+**And the movement is confirmed on the independent passage — 5 of 5.** Each
+kind's new best against the best it replaced, `long2`, off = 153.8779:
+
+```
+  attn_q       0.40 152.4950  ->  0.10 147.7498   -3.1%
+  attn_k       0.10 157.9865  ->  0.40 157.5473   -0.3%
+  attn_v       0.25 139.9828  ->  0.40 132.4395   -5.4%
+  attn_output  0.05 160.0934  ->  0.25 145.7871   -8.9%
+  ffn_gate     0.25 146.6641  ->  0.40 145.7892   -0.6%
+```
+
+⚠⚠ **attn_k: "AWQ never helps it anywhere" is withdrawn, and the replacement
+is NOT "it gains 13%".** On `long.txt` at 0.40 it reads 95.70 against 110.05
+off — 13% better. On `long2.txt` it reads 157.55 against 153.88 off — 2.4%
+**worse**. The two passages disagree in sign, so whether AWQ helps attn_k at
+all is unresolved; what is settled is that the old answer was the clamp, which
+at alpha 0.40 was holding a factor bounded at 15.8 down to 2.0.
+
+⚠ I wrote "gains 13%" off one passage before the second came back. That is the
+same overstatement three times today, and the second passage caught it three
+times.
+
+🔑 **What survives: the optima differ by kind.** Four distinct values across
+seven kinds (0.10, 0.15, 0.25, 0.40) instead of five, and a completely
+different assignment. What does not survive is any specific reading of the old
+table — including the one I built `CHARSIU_NPU_AWQ_MAP` to exploit.
+
+⚠ And the composite result stands unexamined at the new settings: the map was
+scored against a clamped baseline with clamped per-kind values. Whether a
+composite beats a good global exponent is now an open question again, not a
+closed one.
