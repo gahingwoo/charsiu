@@ -8261,3 +8261,42 @@ passage; I wrote the conclusion first and ran the arm afterwards.
 0.20 was the old grid's floor; 0.5 is bad on both models; AWQ is worth 20 to
 35%; and the vendor's own per-tensor exponents (0.03 to 0.15 typical, 0.401
 max) land in the same region from a direction no corpus here can affect.
+
+### 🏁 And at 0.01 resolution it is a BAND, not a spike
+
+The coarse grid showed 0.15 sitting above 0.10 and 0.20. Swept at 0.01,
+qwen3, `long.txt`, 300 tokens:
+
+```
+  0.10  80.1066  │  0.12  89.2108   0.13  83.1503   0.14  84.6774
+                 │  0.15  86.1183   0.16  88.7239   0.17  84.9452
+                 │  0.18  86.5491  │  0.20  77.7821
+```
+
+**Every point from 0.12 to 0.18 lies in 83.2 to 89.2, and both edges — 0.10 and
+0.20 — lie near 78 to 80.** So it is a band of exponents where the transform is
+worse, with better values on either side, and not one bad cell that a finer
+grid would have smoothed over.
+
+⚠ 0.15 came back **86.1183**, the same to the last digit as in the coarse
+sweep, which is the determinism check on the fine one.
+
+⚠ The wobble *inside* the band — 83.2 to 89.2 with no trend — is the part that
+is probably the sampling. The band's existence is not: it reproduces on the
+independent passage. **Two different claims about the same row, and the test
+tells them apart.**
+
+▶ **Which points at the next thing to build.** A hypothesis worth the round:
+charsiu quantises per OUTPUT ROW while AWQ scales input COLUMNS, so which
+column attains a row's `max|w|` flips at particular exponents and that row's
+scale jumps — and every tensor has its jumps in a different place, so ONE
+global alpha is always standing on somebody's discontinuity. 🔑 **The vendor
+chooses alpha per tensor: 0.00 to 0.40, typically 0.03 to 0.15.** If the
+hypothesis holds, a per-tensor exponent both removes the band and does better
+than the best global value.
+
+⚠ The known negative result is about a different question: fitting THEIR
+exponents from our statistics gave corr −0.02. Optimising OUR own per tensor
+has not been tried, and it needs a ppl objective rather than a weight-error one
+— [[feedback-weight-error-is-not-functional-error]] — which the 6.3x on AWQ
+arms has just made affordable.
