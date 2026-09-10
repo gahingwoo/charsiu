@@ -136,7 +136,17 @@ PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 # a reproduction at a different width is a different experiment. To ask the
 # shipped width the same question, CHARSIU_INT_KMAX=2048.
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_KMAX=${CHARSIU_INT_KMAX:-1024} CHARSIU_NPU_W4_GROUP=1024 \
+# ⚠⚠ THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
+# wants t->kgroup == g->kmax -- the hardware sums a whole K slice into one
+# accumulator, so a slice carries exactly one group's scale -- and
+# charsiu_npu_add REFUSES a tensor whose grouping the consumer cannot
+# honour. A hardcoded 1024 beside a KMAX that is anything else sends every
+# tensor with k > 1024 to the CPU, which on Llama is all of attention and
+# ffn_down. It whines; no harness read it.
+# ⚠ AND THIS SCRIPT DOCUMENTS CHARSIU_INT_KMAX=2048 AS A VARIANT TO RUN,
+# which with a hardcoded group of 1024 was exactly that fault.
+CHARSIU_NPU_KMAX=${CHARSIU_INT_KMAX:-1024} \
+CHARSIU_NPU_W4_GROUP=${CHARSIU_INT_KMAX:-1024} \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"

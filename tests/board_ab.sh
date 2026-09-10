@@ -41,7 +41,25 @@ for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
 done
 trap '[ -n "$OLD" ] && for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo "$OLD" > "$g" 2>/dev/null; done' EXIT
 
-W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_KMAX=2048 \
+#
+# ⚠⚠ KMAX AND W4_GROUP MUST BE EQUAL, AND THIS SCRIPT HAD THEM AT 2048 AND
+# 1024, WHICH SENDS EVERY WIDE TENSOR TO THE CPU.
+#
+# tensor_grouped() wants `t->kgroup == g->kmax` -- the hardware sums a whole K
+# slice into one accumulator, so a slice can carry exactly one group's scale --
+# and charsiu_npu_add REFUSES a tensor whose grouping the consumer cannot
+# honour rather than reading a [row][ngrp] array as one scale a row. With
+# KMAX 2048 and W4_GROUP 1024 that refusal fires on every tensor with k > 1024:
+# on Llama-3.2-1B that is the whole of attention (k = 2048) and ffn_down
+# (k = 8192), so an A/B harness measuring "the batched matmul" was measuring
+# the CPU fallback for most of the model.
+#
+# It is not silent -- the guard whines -- but this script never read stderr,
+# which is the same failure tests/board_awq.sh was given positive tells for.
+# The check below is that tell. The other fourteen configs in this tree use
+# 1024/1024; this now matches them.
+#
+W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_KMAX=1024 \
 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 CHARSIU_PROBE_WIDTHS=$W CHARSIU_PROBE_MAXT=${CHARSIU_AB_MAXT:-40}"
 
@@ -60,6 +78,23 @@ while [ "$i" -le "$N" ]; do
 		esac
 		# shellcheck disable=SC2086
 		out=$(env $W4 $E "$RUN" "$M" --batch-probe "$W" 2>&1)
+		#
+		# ⚠⚠ THE TELL THAT THIS HARNESS DID NOT HAVE. If the grouping
+		# the quantiser chose is one the consumer cannot honour, every
+		# affected tensor falls to the CPU and the "batched matmul"
+		# being timed is the fallback. It whined all along; nothing
+		# read it. KMAX 2048 against W4_GROUP 1024 did exactly this to
+		# the whole of Llama's attention and ffn_down.
+		#
+		if printf '%s' "$out" | grep -q "the consumer cannot honour"; then
+			echo
+			echo "⚠⚠ ABORT: tensors fell to the CPU -- the grouping is one"
+			echo "   the consumer cannot honour, so this would time the CPU"
+			echo "   fallback and call it the batched matmul."
+			printf '%s' "$out" | grep "the consumer cannot honour" | head -1
+			echo "   CHARSIU_NPU_W4_GROUP must EQUAL CHARSIU_NPU_KMAX."
+			exit 3
+		fi
 		line=$(printf '%s' "$out" | grep -E "^ *$W  " | tail -1)
 		# ⚠ THE SECOND 'ms' IS THE BATCHED ONE. The first is the row at a
 		# time reference, which no arm here can move: reading it as the
