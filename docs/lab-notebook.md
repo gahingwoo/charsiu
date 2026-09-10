@@ -8242,12 +8242,9 @@ be interpolated: a seven-point sweep steps straight over a spike. So "the
 minimum is at X" needs a FINE sweep around X, not merely a longer run — and
 Llama's monotone row is the absence of the tell, not evidence of smoothness.
 
-⚠ A mechanism, offered as a hypothesis and not measured: charsiu quantises per
-OUTPUT ROW and AWQ scales input COLUMNS, so which column attains a row's
-`max|w|` changes discretely as alpha moves and that row's scale jumps. Those
-jumps need not average out, because a perplexity is dominated by a few
-sensitive rows. The clamp at [0.5, 2.0] adds kinks of its own but probably
-binds on very few channels at 0.15.
+⚠ ⛔ A mechanism was offered here and then withdrawn — see "the argmax flip
+mechanism does not survive one minute of arithmetic" below. The curve is
+continuous; the band is an ordinary local maximum of it.
 
 ⚠⚠ **And the process failure is worth more than the finding.** The tree already
 had a rule: *a non-monotone surface is a grid that cannot rank its own cells.*
@@ -8316,14 +8313,32 @@ be ordered, and reading either off the shape alone would have been wrong.
 **Decide "real or not" per COMPARISON on an independent sample, never per grid
 off its shape.**
 
-▶ **Which points at the next thing to build.** A hypothesis worth the round:
-charsiu quantises per OUTPUT ROW while AWQ scales input COLUMNS, so which
-column attains a row's `max|w|` flips at particular exponents and that row's
-scale jumps — and every tensor has its jumps in a different place, so ONE
-global alpha is always standing on somebody's discontinuity. 🔑 **The vendor
-chooses alpha per tensor: 0.00 to 0.40, typically 0.03 to 0.15.** If the
-hypothesis holds, a per-tensor exponent both removes the band and does better
-than the best global value.
+▶ **Which points at the next thing to build — but not for the reason I first
+wrote.**
+
+⛔ **The "argmax flip" mechanism does not survive one minute of arithmetic, and
+I published it before spending that minute.** The claim was that charsiu
+quantises per OUTPUT ROW while AWQ scales input COLUMNS, so the column
+attaining a row's `max|w|` flips at particular exponents and that row's scale
+JUMPS. It does not: `scale_j = max_k |w_kj · c_k(α)| / 7` is a maximum of
+finitely many functions each continuous in α, and **a max of continuous
+functions is continuous.** An argmax flip is a kink, not a jump. The only true
+discontinuities are the roundings `round(w/scale)`, and with hundreds of
+millions of weights each step moves one code — a staircase far too fine to
+produce an eight percent feature.
+
+🔑 **So the band is an ordinary local maximum of a continuous curve**, and the
+mechanism is the trade the method is made of: AWQ protects salient channels
+(helps) and spreads the row's dynamic range (hurts), both smooth in α, and a
+sum of two competing smooth effects can perfectly well have more than one local
+extremum. Nothing exotic is required and nothing discrete is involved.
+
+**And per-tensor alpha survives the correction with a better argument than it
+had.** Every tensor has its own trade point, so a single global α is a
+compromise across all of them, and the global curve is a sum of per-tensor
+curves whose optima sit in different places — which is exactly how a global
+value lands in a region that is bad for many tensors at once. 🔑 **The vendor
+chooses α per tensor: 0.00 to 0.40, typically 0.03 to 0.15.**
 
 ⚠ The known negative result is about a different question: fitting THEIR
 exponents from our statistics gave corr −0.02. Optimising OUR own per tensor
