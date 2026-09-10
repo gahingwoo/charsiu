@@ -970,6 +970,64 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		if (alpha != 0.0 && on && *on && !strstr(w->name, on))
 			alpha = 0.0;
 	}
+	/*
+	 * CHARSIU_NPU_AWQ_MAP gives the exponent PER TENSOR KIND:
+	 *
+	 *   "ffn_down=0.10,attn_v=0.25,attn_q=0.40,attn_k=0"
+	 *
+	 * substring=alpha, comma separated, FIRST MATCH WINS, and a tensor no
+	 * entry matches keeps whatever CHARSIU_NPU_AWQ said. An entry of 0
+	 * turns the method off for that kind, which is a setting one kind
+	 * actually wants.
+	 *
+	 * ⚠⚠ IT EXISTS BECAUSE THE PER-KIND TABLE CANNOT BE ASSEMBLED FROM ITS
+	 * OWN ROWS. Sweeping CHARSIU_NPU_AWQ_ONLY one kind at a time measures
+	 * each kind AGAINST AWQ-OFF EVERYWHERE ELSE, and the best cell of each
+	 * row is not the best combination -- the tensors compose. The table
+	 * says the optima differ (qwen3: 0.05 for attn_output, 0.10 for
+	 * ffn_down, 0.15 for ffn_up, 0.25 for attn_v and ffn_gate, 0.40 for
+	 * attn_q, and attn_k never wins at all); this is what turns that into
+	 * something that can be run and scored.
+	 *
+	 * 🔑 And it is the shape the vendor ships: alpha per tensor, 0.00 to
+	 * 0.40, typically 0.03 to 0.15, read out of its own .rkllm.
+	 *
+	 * ⚠ FIRST MATCH WINS, so order the entries most specific first.
+	 * "attn_q" before "attn" -- otherwise "attn" swallows all four.
+	 *
+	 * ⚠ A MALFORMED ENTRY MUST NOT QUIETLY MEAN OFF. atof of nonsense
+	 * returns 0.0, which would silently disable AWQ for that kind and make
+	 * "AWQ on" the arm with AWQ off -- this tree has run four of those. An
+	 * entry with no '=' is skipped rather than parsed.
+	 */
+	{
+		const char *m = getenv("CHARSIU_NPU_AWQ_MAP");
+
+		while (m && *m) {
+			const char *eq = strchr(m, '=');
+			const char *end = strchr(m, ',');
+			size_t klen;
+
+			if (!end)
+				end = m + strlen(m);
+			if (!eq || eq > end) {         /* no '=' in this entry */
+				m = *end ? end + 1 : end;
+				continue;
+			}
+			klen = (size_t)(eq - m);
+			if (klen && klen < 64) {
+				char key[64];
+
+				memcpy(key, m, klen);
+				key[klen] = '\0';
+				if (strstr(w->name, key)) {
+					alpha = atof(eq + 1);
+					break;         /* first match wins */
+				}
+			}
+			m = *end ? end + 1 : end;
+		}
+	}
 
 	/*
 	 * ⚠⚠ AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
