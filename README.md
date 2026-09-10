@@ -503,6 +503,24 @@ measured 41.53 off, 35.20 with statistics, and **58.35 with none**: 40% worse
 than leaving AWQ alone. `CHARSIU_NPU_AWQ_WEIGHTMEANS=1` keeps that variant
 reachable as the control it is.
 
+⚠ **And the batched path applies it now rather than refusing.** For a day it
+refused: the factor rides on the activation, two places put it there, and the
+batched prefill was not one of them, so with AWQ on decode was right and
+prefill was not — and nothing in this tree could see it, because `charsiu_ppl`
+scores one token at a time unless `--batch` is passed. Refusing kept the answer
+and cost the batch on every tensor in the range. It goes on at the gather now,
+and the input reuse key had to learn about it: what a device's input buffer
+holds is `X` times **one tensor's** factor, q, k and v share one normed buffer,
+and every field that key had said "this is the same input". `CHARSIU_NPU_AWQ_BATCH=0`
+puts the refusal back.
+
+⚠ **The activation width is not where four bits hurt.** The int4 path tells the
+hardware sixteen-bit activations and then packs an eight-bit value into the
+high byte of the slot, so every quality number here is really w4a8.
+`CHARSIU_NPU_A16=1` fills the slot: Llama-3.2-1B, host CPU reference, **41.53
+against 40.70**. Two percent. Next to what AWQ or an eight-bit layer buys, the
+activation is not the problem at four bits.
+
 ⚠ **And AWQ is a four-bit method.** At eight bits the factor's divide happens
 in the quantiser and its cancelling multiply has nowhere to live, because the
 int8 path packs one absmax quantisation of the whole activation vector: board,
@@ -515,6 +533,33 @@ not lack.
 not a characterisation. What is not in doubt is the direction and the size:
 this was never measured before 2026-09-07, and "identical to the CPU loop" was
 carrying more weight in this file than it can hold.
+
+### Eight bits, on the two layers that need them
+
+The damage is not spread evenly over the layers. `CHARSIU_NPU_INT8_LAYERS=0-1`
+keeps the first two blocks at eight bits and leaves the rest at four:
+
+```
+                        int4 g1024   INT8_LAYERS=0-1   all int8   of the gap
+  Llama-3.2-1B            41.5289        26.0672       17.9772      65.6%
+  Qwen3-0.6B             110.0549        85.0878       45.1214      38.4%
+```
+
+The absolute fractions differ because the models have sixteen layers and
+twenty-eight, so the same two are 12.5% of one and 7.1% of the other. **The
+rate does not**: 65.6/12.5 is 5.2 and 38.4/7.1 is 5.4. The first two layers
+return about five times their share of the bytes on both. How far to go is
+model-dependent — Llama's next two return 0.68 and Qwen3's return 2.3 — so
+`0-1` is a defensible default on both and `0-3` is a judgement call.
+
+⛔ **It is host-side today.** `charsiu_npu_add` refuses an eight-bit tensor on
+a device opened for four, so those tensors take the CPU: slow, and right. The
+easy way round it is a trap and is written down so nobody takes it — an int8
+DEVICE reading int4 codes already works and ships, so a mixed model could just
+be opened as int8, and that gives **int8's bytes on the wire with a worse
+answer than all-int8**. The knob's whole value is int8's quality at int4's
+bandwidth. `tools/npu_mixed_test.c` asks the question the real fix rests on:
+does one open device alternate the two programs correctly?
 
 **What it changes, and it is less than it first looked.** The scoreboard, both
 formats, best of 6 at the same prompt lengths, same session:

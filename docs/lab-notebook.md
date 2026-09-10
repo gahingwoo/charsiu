@@ -7758,3 +7758,176 @@ an eightfold collapse -- and Qwen3's return 2.3:
 So `INT8_LAYERS=0-1` is a defensible default on both and `0-3` is a judgement
 call that one model rewards and the other does not. Which is the honest shape:
 the concentration is general, its length is not.
+
+## 2026-09-10 — the batched path, the corpus, and the one question INT8_LAYERS rests on
+
+### ⚠⚠ The refusal written yesterday was the right first move and the wrong resting place
+
+`npu_matmul_inner` refused any tensor carrying an AWQ factor, because npuquant
+scales the weights by `kscale[k]` and leaves the inverse for the caller to put
+on the activation, and this path never did. That kept the answer and cost the
+batch on every tensor in the AWQ range, which with AWQ on is most of them.
+
+It applies the factor now, at the gather. Three things had to move with it and
+**only two of them are bookkeeping**:
+
+- the gather stops being optional when `kscale` is set. On the shipped w4 shape
+  the packer reads `X` directly and there is nowhere to put a scaled copy.
+- the branch that packs straight from `X` takes `!ks`. It used to be the exact
+  complement of the gather's condition and is not any more, so with AWQ on it
+  would have packed the caller's unscaled `X` straight past the scaled copy the
+  gather had just written. **A condition that was a complement and stopped
+  being one is invisible in a diff of either half.**
+- **the reuse key carries the factor's hash**, and this is the part that is not
+  bookkeeping at all.
+
+### ⚠⚠ What a device's input BO holds is X times ONE TENSOR'S factor
+
+`reuse_key_hit` compared the pointer, the width, K, the zero point and which K
+slices landed. q, k and v share one normed buffer and, with AWQ on, have three
+different factors. Same pointer, same width, same K, same zero point, same
+slices: **every field that key had said hit**, and a hit would have multiplied
+k's weights by q's scaled input.
+
+It is the same fault the grouped decode path refuses by comparing `kshash`, one
+call site over, and it did not exist until this commit — the refusal was
+holding it shut. That is what makes it worth writing down: **removing a refusal
+opens every path the refusal was standing in front of**, and the second one was
+not in the note that priced the first.
+
+`tests/reuse_key.c` gains five cases, and they are load-bearing rather than
+decorative: with `k->ksh == ksh` taken back out of the predicate, three of them
+hit.
+
+```
+  reuse key: a factored tensor after an unfactored one: expected miss, got hit
+  reuse key: another tensor's factor, everything else equal: expected miss, got hit
+  reuse key: back to no factor at all: expected miss, got hit
+  reuse key: 3 of 18 cases wrong
+```
+
+`CHARSIU_NPU_AWQ_BATCH=0` puts the refusal back so the board can price the
+batch against a known-correct fallback without a rebuild, and a fifth
+reuse-miss reason is reported — "a different AWQ factor on the same input" —
+because the whole class this belongs to was invisible for as long as it was
+there.
+
+**Default path unchanged, and measured rather than asserted.** With AWQ off
+there is no `kscale` and every `kshash` is 0:
+
+```
+  int4, group 1024        41.5289  ->  41.5289
+  INT8_LAYERS=0-1         26.0672  ->  26.0672
+  int8                    17.9772  ->  17.9772
+  host_awq                41.5289 / 41.5289 / 35.2041, unchanged
+```
+
+### ⚠⚠ The one number this tree can compare across sessions was living in /tmp
+
+`charsiu_ppl` is deterministic, which is the only reason a perplexity measured
+last week can be put beside one measured today — the board drifts about 3%
+between boots and takes every timing with it. That property is worth exactly as
+much as the text it is measured on, and the text was in a session scratch
+directory.
+
+A reboot would have taken it. **41.5289 would still have been written down in
+this file and in the README's quality table, and nothing here would have been
+able to produce it again.** Every number above and every number in the AWQ and
+INT8_LAYERS sections was measured on those bytes.
+
+They are `tests/corpus/` now, with the hashes checked in `make test` rather than
+trusted, because an edit to a corpus does not fail anything — it silently
+re-bases every perplexity ever recorded here against a text that is no longer
+the one they were measured on. `host_awq.sh` defaults to them.
+
+### 🏁 The activation is not where four bits hurt
+
+The note in `npu_matvec` has said for some time that the shipped int4 path is
+really w4a8: it tells the hardware sixteen-bit activations and then packs an
+eight-bit value into the high byte of the slot. `CHARSIU_NPU_A16=1` fills the
+slot properly. Llama-3.2-1B, host CPU reference, same corpus and length:
+
+```
+  w4a8    41.5289
+  w4a16   40.7016      2.0%
+```
+
+**Two percent.** A plausible story — "the shipped path is secretly a8 and we are
+leaving quality on the table" — priced and closed. Next to 41.53 → 35.20 from
+AWQ or 41.53 → 26.07 from eight bits on two layers, the activation width is
+not where the damage is at four bits. It also means a mixed dispatch that
+shared one activation pack between widths would pay 2% for it, which is not a
+reason to refuse.
+
+### ⚠⚠ And the cheap way to dispatch a mixed model is DOMINATED
+
+`CHARSIU_NPU_INT8_LAYERS` does nothing on the board: `charsiu_npu_add` refuses
+an eight-bit tensor on a device opened for four and it takes the CPU.
+
+The other direction of that mismatch already works and already ships. An int8
+DEVICE reading int4 codes is what every vision tower does — `pack_rows` has
+tested `t->packed` and `g->w4` separately since it was written, because a tower
+forces `want_w4 = 0` while the quantiser still reads `CHARSIU_NPU_W4V`. So a
+mixed model could be opened as int8 today, with no new hardware path at all.
+
+**And it would be strictly worse than not bothering.**
+
+```
+  all int8                    ppl 17.98,  int8 weight bytes
+  INT8_LAYERS=0-1 as int8     ppl 26.07,  int8 weight bytes
+```
+
+Same bytes on the wire, worse answer. The knob's entire value is int8's quality
+at **int4's bandwidth**, and opening the device as int8 throws away the half
+that makes it worth doing. Anyone who reaches for the easy version should be
+stopped by this paragraph.
+
+So the only version worth building is the int4 device running int8 tensors, and
+that is the forty-site refactor: the register program, the activation pack, the
+buffer stride, the readback, and — as of today — the reuse key, which would
+need the activation dtype in it for exactly the reason the AWQ factor is in it.
+
+### 🏁 So ask the question the refactor rests on, first
+
+`tools/npu_mixed_test.c`. Two jobs of the same shape, one w8a8 and one w4a16,
+built from the SAME codes so the two references are the same arithmetic. It
+runs each alone as a control, then alternates them on **one open device**
+`--loop` times. **A device that latches a mode between jobs passes both
+controls and fails the alternation**, and that is the failure the refactor
+cannot survive.
+
+`--dry` needs no hardware and answers half of it at the desk:
+
+```
+  int8 program  143 words, 4.2 MB of weights
+  int4 program  148 words, 2.1 MB of weights
+  102 words differ over the shorter stream
+```
+
+Two distinct programs, and the 2× bandwidth the knob exists to keep, visible at
+the emitter. The silicon question is the rest of the tool.
+
+⚠ Its default shape is K=256 N=64 and it refuses anything under K=128 N=32,
+because `npu_fp16_test`'s own note has the table where K=16 N=8 and K=64 N=8
+wedge the NPU and cost six wrong explanations.
+
+### The AWQ board round is one command
+
+`tests/board_awq.sh` — four arms, three of them identity questions.
+
+⚠ **Two of them compare charsiu to charsiu, and here that is the right
+question**, which is not usually true. It is the wrong question when both arms
+are the same graph, because a shared bug is invisible to it. These are not
+that: the control arm in each is the path that has always applied the factor
+and has evidence behind it, and the arm under test is a new place to apply the
+same factor.
+
+⚠ **And each identity arm checks that the path it is about actually ran.** An
+arm that refuses for some other reason is arm A twice over and matches for no
+reason; the tells are the refusal line appearing in A's diagnostics and not in
+B's, and a non-zero batched matmul entry in B's report.
+
+`CHARSIU_AWQ_BASE` runs the whole thing against the host CPU reference, which
+is a complete answer to the two quality arms and correctly reports the two
+hardware arms as vacuous. A script that has never been run is not a board
+round, it is a plan for one.
