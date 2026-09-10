@@ -9004,3 +9004,47 @@ as one-per-row and recorded ppl 272369 as "the int8 path emits noise".
 ▶ The shipped default keeps INT8_LAYERS off, so nothing ships wrong. What
 changes is the recommendation: **turn AWQ on first — it is free — and then ask
 whether 12.5% more bytes is worth 1 to 8%.**
+
+### ⛔ And `INT8_LAYERS=0-1` is the wrong range once AWQ is on — dominated on both sides
+
+The range was chosen from a per-layer table showing L0/L1 carrying 44% of the
+four-bit damage. Re-measured at the board's group with AWQ on, each layer alone
+at eight bits against a 25.3664 baseline:
+
+```
+  blk.1  -1.8249   blk.3  -1.5681   blk.4  -1.0805   blk.10 -0.7679
+  blk.15 -0.6333   blk.5  -0.5768   blk.12 -0.5166   blk.2  -0.5052
+  blk.0  -0.4581  <- ninth of sixteen
+  ...    blk.7 +0.1846   blk.9 +0.2902  <- eight bits made these WORSE
+```
+
+**blk.0 ranks ninth.** L0+L1 is 27.4% of the total, not 44%. That is what AWQ
+being on does: it already treats what the first layers suffer from, so what is
+left peaks at blk.1 and blk.3 instead.
+
+⚠ Two layers coming out POSITIVE — more precision making the answer worse — is
+the tell that these individual differences are at the edge of what one passage
+resolves. So the ranking is not the result; the direct comparison is, and only
+where both passages agree:
+
+```
+                long.txt            long2.txt         bytes
+  baseline     25.3664             44.0703
+  0-1          23.4235  -7.7%      41.8643  -5.0%     12.5%
+  1-1          23.5415  -7.2%      41.8468  -5.0%     6.25%   half the bytes
+  3-4          23.1453  -8.8%      40.5593  -8.0%     12.5%   same bytes
+  1-2          23.1331  -8.8%      42.7466  -3.0%     12.5%   passages disagree
+```
+
+🔑 **`0-1` is dominated on both sides, and both replacements hold on both
+passages:**
+
+- **`1-1` gets the same thing for HALF the bytes** — long says 0-1 by 0.5%,
+  long2 says 1-1 by 0.04%. That is "indistinguishable", which is the claim.
+- **`3-4` gets more for the SAME bytes** — 1.2% and 3.1%, same sign both ways.
+
+⚠ `1-2` wins on long and loses to 0-1 on long2. Not resolved, not adopted.
+
+▶ So the recommendation is: **AWQ first (free), then `1-1` if bytes matter or
+`3-4` if quality does.** `0-1` was the right answer to a question measured in a
+configuration the board does not run.
