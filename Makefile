@@ -230,6 +230,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
+	./tests/corpus_fixed.sh
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm

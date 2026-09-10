@@ -6,10 +6,16 @@
 # the weights and said nothing, and that fallback measures 40% WORSE than not
 # using AWQ at all. Nothing in the tree exercised it.
 #
-#   usage: tests/host_awq.sh MODEL.gguf CALIB.txt EVAL.txt
+#   usage: tests/host_awq.sh MODEL.gguf [CALIB.txt [EVAL.txt]]
+#
+# ⚠ THE TEXTS DEFAULT TO tests/corpus, WHICH IS THE POINT. Every perplexity
+# recorded in this tree was measured on those bytes, so an arm run against
+# anything else is a number that cannot be put beside them. Pass your own only
+# when the question is about the corpus.
 set -e
-M=${1:?model} C=${2:?calibration text} E=${3:?evaluation text}
-B=$(dirname "$0")/../build
+D=$(dirname "$0")
+M=${1:?model} C=${2:-$D/corpus/calib.txt} E=${3:-$D/corpus/long.txt}
+B=$D/../build
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
