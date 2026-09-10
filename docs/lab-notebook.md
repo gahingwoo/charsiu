@@ -8401,3 +8401,67 @@ points at a common cause rather than seven coincidences; the candidate under
 test is the factor's clamp beginning to bind at a similar alpha across tensors
 that share activation statistics. If widening the clamp moves the band, that is
 the mechanism.
+
+### 🏁🏁 The factor's CLAMP is costing 7 to 20% of AWQ, at the exponents anyone should use
+
+Four of seven kinds have their worst cell at 0.15, which is where the global
+band is, and several independent kinds peaking at one exponent points at a
+common cause. The candidate was the factor's clamp — `CHARSIU_NPU_AWQ_CLAMP`,
+default 2.0, so the factor lives in [0.5, 2].
+
+**Its onset is now dated exactly.** qwen3, `long.txt`, 300 tokens:
+
+```
+  clamp      0.10      0.15      0.20      0.25
+  hi=2.0   80.1066   86.1183   77.7821   71.7770
+  hi=4.0   80.1066   84.2043   77.2277   67.9646
+  hi=8.0   80.1066   84.2043   77.2277   68.5076
+```
+
+🔑 **At alpha 0.10 the width makes NO difference at all — 80.1066 to the last
+digit across hi = 2, 4 and 8 — so nothing reaches the bound there.** From 0.15
+on it does, and hi=4 equals hi=8, so nothing reaches 4 either. The clamp starts
+binding between 0.10 and 0.15.
+
+⚠ **But the band survives it.** At hi=4 the 0.15 peak is still there, 5.1%
+instead of 7.5%. **The clamp is a contributing cause and not the cause**, which
+is the second hypothesis about this band to be narrowed by its own test today.
+
+**And the clamp is expensive.** Two models, two passages:
+
+```
+  qwen3 long.txt  @0.25    71.7770 -> 67.9646    -5.3%
+  qwen3 long2.txt @0.25   117.6984 -> 115.9869   -1.5%
+  Llama long.txt  @0.15     32.5094 ->  30.1937   -7.1%
+  Llama long.txt  @0.25     38.3471 ->  30.7909  -19.7%
+```
+
+⚠⚠ **It also flattens the alpha curve**, which is the part that reframes a
+week of sweeping. At hi=2 Llama's 0.15 and 0.25 differ by 18%; at hi=4 they are
+30.19 and 30.79, two percent apart. A good deal of "the exponent must be swept
+per model" was the shape of a bound, not of the method.
+
+**⚠ And the clamp is NOT merely a mistake — it earns its keep above 0.5.**
+Llama, `long.txt`, against AWQ off at 41.5289:
+
+```
+  clamp      0.35      0.50      0.65
+  hi=2.0   42.3752   50.7341   72.1690
+  hi=4.0   34.3462   45.5974   86.6635
+```
+
+```
+  0.10-0.35   hi=4 better by 1.5 to 19.7%, two models, two passages
+  0.50        hi=4 better than hi=2, and BOTH still worse than off
+  0.65        hi=2 better by 20% -- the narrow clamp is protecting
+```
+
+🔑 **One sign in the README flips and one does not.** "AWQ at 0.35 is worse than
+not running it at all" is a statement about the clamp: 42.38 against 41.53 at
+hi=2, but 34.35 against 41.53 at hi=4 — clearly better. **"0.5 is worse than
+off" survives**, 45.60 against 41.53, so that claim is about the exponent.
+
+So the shipped default is costing 7 to 20% of AWQ's benefit exactly where AWQ
+should be used, and the protection it buys only matters where AWQ is a bad idea
+whatever the clamp is. ▶ A default change wants the same crossover on the
+second model first; it is running.
