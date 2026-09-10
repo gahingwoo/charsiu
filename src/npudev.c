@@ -6372,13 +6372,36 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (unsigned gi = 1; gi < n; gi++) {
 		const struct npu_tensor *ti = g->ent[ids[gi]].t;
 
-		if ((ti->kscale != NULL) != (gks != NULL))
+		if ((ti->kscale != NULL) != (gks != NULL)) {
+			whine(g, "a group where only some tensors carry an AWQ "
+				 "factor cannot share one packed input",
+			      (unsigned)gt0->k, (unsigned)gt0->n);
 			return -1;
-		if (gks && ti->kshash != gt0->kshash)
+		}
+		if (gks && ti->kshash != gt0->kshash) {
+			whine(g, "a group whose AWQ factors differ cannot "
+				 "share one packed input",
+			      (unsigned)gt0->k, (unsigned)gt0->n);
 			return -1;
+		}
 	}
-	if (gks && !g->awqshare)
+	/*
+	 * ⚠⚠ AND IT SAYS SO. This refusal was SILENT, and a board arm that
+	 * measures CHARSIU_NPU_AWQ_SHARE=0 against =1 has no way to tell "the
+	 * knob did nothing because sharing was refused for another reason"
+	 * from "the knob did nothing because it changes nothing" -- the tokens
+	 * are identical either way and that is the whole result being claimed.
+	 *
+	 * tests/board_awq.sh reads these lines as the positive tell that the
+	 * arm ran at all. A silent refusal is exactly what made AWQ's two
+	 * wrong-answer paths invisible for as long as they were there.
+	 */
+	if (gks && !g->awqshare) {
+		whine(g, "a tensor with an AWQ factor does not share a packed "
+			 "input unless CHARSIU_NPU_AWQ_SHARE=1",
+		      (unsigned)gt0->k, (unsigned)gt0->n);
 		return -1;
+	}
 	charsiu_note("a group: checking the entries", (unsigned long)n,
 		     (unsigned long)a->n);
 	e0 = &g->ent[ids[0]];

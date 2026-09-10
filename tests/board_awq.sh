@@ -37,8 +37,8 @@
 #   batch   the batched matmul entry is non-zero in the stage report AND the
 #           "applied a row at a time by request" refusal appears in arm A's
 #           diagnostics and NOT in arm B's
-#   share   the refusal about a factored tensor not sharing appears in arm A
-#           and not in arm B
+#   share   "does not share a packed input unless CHARSIU_NPU_AWQ_SHARE=1"
+#           appears in arm A's diagnostics and not in arm B's
 #
 #   usage: tests/board_awq.sh MODEL.gguf [CALIB.txt]
 #
@@ -165,6 +165,19 @@ arm "CHARSIU_NPU_AWQ_SHARE=0" s0
 arm "CHARSIU_NPU_AWQ_SHARE=1" s1
 A=$(text < "$T/s0.out"); B=$(text < "$T/s1.out")
 say_same "$A" "$B"
+# ⚠ THE TELL, because identical tokens is what BOTH "the knob works" and "the
+# knob never ran" look like. npudev whines this only where a factored tensor
+# meets the group path with sharing off.
+SH="does not share a packed input unless"
+if ! grep -q "$SH" "$T/s0.err"; then
+	echo "   ⚠⚠ arm A never refused to share -- this identity proved nothing"
+	fail=$((fail + 1))
+fi
+if grep -q "$SH" "$T/s1.err"; then
+	echo "   ⚠⚠ arm B refused to share too -- the knob did not take effect"
+	fail=$((fail + 1))
+fi
+grep -h "cannot share one packed input" "$T/s1.err" | sed 's/^/   /'
 printf '   decode %s tok/s (no share)   %s tok/s (shared)\n' \
 	"$(gen_tps < "$T/s0.out")" "$(gen_tps < "$T/s1.out")"
 

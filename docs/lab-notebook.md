@@ -8076,3 +8076,53 @@ read, and started from there — without reading forward three entries to round
 entry that closes it look identical from a grep for the lead's own words.** The
 fix is to search for the close, not the open: grep the thing's name and read the
 LAST hit first.
+
+### ⚠⚠ A minimum at the edge of a grid is not a minimum, it is an edge
+
+The README says Llama-3.2-1B's AWQ exponent has its minimum at 0.20. **0.20 was
+the smallest value that sweep tested.** Swept downward on the tree corpus at
+300 tokens, host CPU reference, `tests/corpus/{calib,long}.txt`:
+
+```
+  alpha   off      0.05     0.10     0.15     0.20     0.35     0.50
+  ppl    41.5289  38.4906  33.7566  32.5094  35.2041  42.3752  50.7341
+```
+
+Unimodal, and the minimum is at **0.15** — 32.51 against 41.53 off, **21.7%**,
+where 0.20 gives 15.2%. 0.10 also beats 0.20. So the earlier grid did not find
+a minimum at its floor; **it found its floor.**
+
+⚠ This is a different corpus and length from the README's sweep, so the two
+numbers are not in conflict as measurements — 43.86 at 0.20 there and 35.20 at
+0.20 here are answers to different questions. What IS in conflict is the
+sentence "Llama's minimum is at 0.20", which was read off a grid that could not
+have found anything smaller.
+
+🔑 The check costs one arm: **when the best cell is on the boundary, extend the
+grid before naming it.** The related trap already in this file is a grid too
+noisy to rank its own cells, whose tell is non-monotonicity. This one is
+perfectly monotone and perfectly wrong, and its tell is only that the winner
+has a neighbour on one side.
+
+⚠ 0.10 reproduced to the last digit (33.7566) across two separate runs with
+independently recorded calibration files, which is also a check on the
+calibration pass being deterministic.
+
+### AWQ on the first three blocks, on Llama this time
+
+At alpha 0.20, same corpus and length:
+
+```
+  off                41.5289
+  AWQ_LAYERS=0-2     37.3771     65.6% of the win, on 3 of 16 layers (18.8%)
+  AWQ everywhere     35.2041
+```
+
+Against qwen3's **70.3% on 3 of 28 (10.7%)**. Both models concentrate, and the
+rate differs by about two: 3.5x its share of the layers on Llama against 6.6x
+on qwen3. **The concentration is general and its size is not**, which is the
+same shape `INT8_LAYERS` turned out to have.
+
+⚠ A LAYERS number quoted without its exponent is not comparable to anything,
+and the whole surface moves with alpha. `tests/board_awq.sh` prints the alpha
+in the arm's own heading now.

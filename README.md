@@ -471,7 +471,20 @@ sweep on Llama-3.2-1B, its own calibration, same corpus and length:
  52.34   43.86   46.98   52.55   50.58   52.95   68.26   92.42
 ```
 
-Llama's minimum is at **0.20**, and at 0.5 -- the value this tree has always
+⚠⚠ **And 0.20 was that grid's FLOOR, not a minimum.** Swept downward on
+`tests/corpus` at 300 tokens, the same host CPU reference:
+
+```
+  alpha   off      0.05     0.10     0.15     0.20     0.35     0.50
+  ppl    41.5289  38.4906  33.7566  32.5094  35.2041  42.3752  50.7341
+```
+
+Unimodal, minimum at **0.15**: 21.7% against off, where 0.20 gives 15.2%. A
+best cell sitting on the boundary of a grid has a neighbour on one side only,
+and that is the whole tell -- the surface above is perfectly monotone and the
+conclusion drawn from it was still wrong.
+
+At 0.5 -- the value this tree has always
 used -- AWQ is **worse than not running it at all**, 68.26 against 52.34. So
 the transferable finding is not a number to adopt; it is that the exponent has
 to be swept per model and that 0.5 is the wrong end of the range on both
