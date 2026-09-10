@@ -8504,3 +8504,49 @@ real and is NOT the clamp's doing.** qwen3 at 0.50 is still far better than off
 41.53). The two models genuinely tolerate different amounts of exponent. What
 the clamp was responsible for is the SHAPE within the useful range, not the
 difference between the models.
+
+### ⛔ The per-kind composite LOSES to one well-chosen global exponent
+
+`CHARSIU_NPU_AWQ_MAP` gives an exponent per tensor kind, so the per-kind table
+can be assembled and scored instead of admired. Its five controls first — a
+map matching nothing, a map setting every kind to the global value
+(bit-identical, which is what proves the parser reaches all seven), a
+malformed entry (skipped, not parsed as 0), and `ffn_down=0` (took effect, and
+costs 10% on its own). Then the composite of each row's best:
+
+```
+  attn_q=0.40, attn_k=0, attn_v=0.25, attn_output=0.05,
+  ffn_gate=0.25, ffn_up=0.15, ffn_down=0.10
+```
+
+```
+  long.txt    global 0.25 clamp 2.0   71.7770    composite   70.3012   -2.1%
+              global 0.25 clamp 4.0   67.9646    composite   73.5539   +8.2%
+  long2.txt   global 0.25 clamp 2.0  117.6984    composite  118.8202   +1.0%
+              global 0.25 clamp 4.0  115.9869    composite  117.7463   +1.5%
+```
+
+**Three of four cells worse, and the one win does not reproduce on the second
+passage.** The per-kind optima are real and **they do not compose.**
+
+🔑 This is the caveat from two hours ago, measured instead of warned about:
+*"a per-kind optimum measured in isolation is not the optimum in combination"*,
+because every row of that table was that kind alone against AWQ-off everywhere
+else. Writing the caveat down was not the same as testing it, and testing it
+cost eight arms and about twenty minutes.
+
+⚠ And the failure is worse at clamp 4.0 (+8.2%) than at 2.0, which fits: the
+per-kind values were each chosen at clamp 2.0, so they do not transfer to a
+different bound. A composite is a tuple tuned against one setting of everything
+else.
+
+**What it kills and what it leaves.** It kills the cheap version of a
+per-tensor exponent — greedily assembling isolated optima. A JOINT search might
+still do better, but it is expensive, unproven, and has just lost its
+motivating evidence. ⚠ And the vendor choosing alpha per tensor is not evidence
+that it wins: **their quantiser is 1.7x worse than charsiu's overall** on the
+three nested subsets, so what they do per tensor is not a target to copy.
+
+▶ The better-supported lead is the plain one: **the clamp**, a single global
+setting worth 5 to 7% at each model's own best exponent, on two models and two
+passages.
