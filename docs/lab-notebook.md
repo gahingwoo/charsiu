@@ -7590,3 +7590,50 @@ it is the scale at which any single-layer number here should be read.
 ⚠ And sensitivity to four-bit weights is not the same question as where AWQ
 helps: AWQ helps where quantisation hurts AND the activations have outliers.
 This is a proxy for the second, measured on the first.
+
+### 🏁 A finer group on two layers buys 69% of a finer group everywhere
+
+Layers 0 and 1 carry 44% of the four-bit damage, so the obvious question is
+what a finer group costs and buys THERE rather than everywhere. Priced offline,
+all 112 matrices quantised, only the group varying by layer:
+
+```
+                        weight error       ppl        of the prize
+  all 1024 (ships)         13.7877%     32.9790            --
+  L0-1 at 128              13.4455%     28.8072           69%
+  L0-2 at 128              13.2933%     29.1832           69%
+  all 128 (the ceiling)    10.8471%     26.9442          100%
+  (reference f16)               --      19.8844
+```
+
+**Two layers of sixteen capture 69% of what group 128 everywhere would buy.**
+
+🔑 **And the two metrics disagree about why.** Going to 128 on layers 0 and 1
+moves the weight error by 2.5% relative -- 13.7877 to 13.4455 -- and the
+perplexity by **12.6%**. The weight error is an average over bytes and the
+early layers are 12.5% of them; the function does not average that way. Same
+lesson as the reconstruction that scored 1701 at 18% weight error, arriving
+from the other side.
+
+⚠ **The L0-1 against L0-2 inversion is resolution, not a result.** Perplexity
+says 28.81 then 29.18, which would mean a strictly finer group made the model
+worse. The weight error is monotone by construction -- 13.4455 then 13.2933 --
+so the 1.3% is what this statistic can resolve at 499 scored positions, and it
+is the same scale as layers 13 and 14 reading below the reference.
+
+⛔ **And the runtime cannot do this today.** `g->kmax` is a device field set
+once at `charsiu_npu_open`, and `tensor_grouped()` requires
+`t->kgroup == g->kmax`, so one K slice is one scale. A per-layer group means a
+per-entry kmax, which is the slice arithmetic, the CBUF budget and the input
+surface ceiling -- a dispatch change, on a path that does not exist on the
+host. The prize is now priced; the machinery is not written.
+
+### ⚠ "The error is spread with the bytes" was true by tensor class and is false by layer
+
+Round 150-something measured the vendor's shape -- layers int4, head int8 --
+at 5.3%, and concluded "the four-bit error is spread roughly with the bytes,
+and no single tensor class carries it." That still holds across classes.
+
+Across LAYERS it does not: layers 0 and 1 are 12.5% of the bytes and 44% of the
+damage, a 3.5x concentration. The earlier sentence was about the axis it was
+measured on, and reads like a statement about all axes.
