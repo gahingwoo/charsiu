@@ -463,8 +463,36 @@ qwen3, host CPU reference, 500 tokens. **65.12 against 76.36 is 14.7%**, and
 the ordering holds on the shorter corpus at 200 tokens too (68.07 against
 73.77).
 
-⚠ **The minimum itself is per model, but 0.5 is past it on both.** The same
-sweep on Llama-3.2-1B, its own calibration, same corpus and length:
+⚠⚠ **EVERY SWEEP IN THIS SECTION WAS MEASURED THROUGH A BINDING CLAMP, and
+that changes the answers.** The factor's clamp binds whenever
+`hi < (1/floor)^alpha`, which at the shipped defaults is from alpha 0.10
+upward -- so the numbers below are the exponent and the bound together. With
+`CHARSIU_NPU_AWQ_CLAMP=64` so the clamp is inert:
+
+```
+  Llama   long   38.4906  33.7566  30.1937  28.0368  28.3271  29.9920  37.6820
+          long2  85.7996  72.9087  67.3171  61.6044  61.8348  66.6056  83.8567
+  qwen3   long   79.7636  80.1066  84.2043  77.2277  68.5076  81.6596  98.7685
+          long2 149.2676 140.4129 156.1032 127.3319 114.5617 134.8510 158.9409
+         alpha=   0.05     0.10     0.15     0.20     0.25     0.35     0.50
+```
+
+**The optimum is 0.20 to 0.25 on both models and both passages, and AWQ is
+worth much more than the clamped numbers show:**
+
+```
+  Llama    41.5289 -> 28.0368  @0.20   -32.5%
+  qwen3   110.0549 -> 68.5076  @0.25   -37.7%
+```
+
+⚠ **"0.5 is worse than not running AWQ at all" is an artefact of the clamp.**
+At hi=2.0 Llama's 0.50 reads 50.73 against 41.53 off; with the clamp inert it
+reads 37.68, which is better than off. The paragraphs below are kept because
+they are what the shipped defaults actually produce.
+
+⚠ **The minimum itself is per model, but 0.5 is past it on both** (at the
+shipped clamp). The same sweep on Llama-3.2-1B, its own calibration, same
+corpus and length:
 
 ```
   off     0.20    0.25    0.30    0.35    0.40    0.50    0.65
@@ -567,14 +595,45 @@ does. At each model's own best setting:
   Llama   32.5094 -> 30.1937   -7.1%   (both at alpha 0.15)
 ```
 
-**`CHARSIU_NPU_AWQ_CLAMP=4.0` is the better setting in the useful range**
-(0.10 to 0.25), on two models and two passages. ⚠ It is NOT better everywhere:
-at 0.65 the narrow clamp wins on both models, by 20% and 8.8%, so the clamp is
-protecting something real where the exponent is too large. Between 0.25 and
-0.5 the two models disagree.
+**The right setting is stated as a bound, not a number: the clamp should be at
+least `(1/floor)^alpha`, so that it never binds.** The factor has a SECOND
+bound that had no knob until today -- the statistic is floored at `1e-3 * mean`
+before the exponent, capping the factor at `(1/floor)^alpha` = 2.82 at alpha
+0.15 and 5.62 at 0.25 -- and that floor is what the divide-by-nearly-zero
+protection actually is. Swept over a thousandfold range with
+`CHARSIU_NPU_AWQ_FLOOR`, the floor moves perplexity by under 2.2%, so it is not
+a lever and 1e-3 stays.
 
-⚠ The default stays at 2.0 because every number on record was measured there,
-and moving it silently would make them all unreproducible.
+With the floor held out of the way the question is simply whether the clamp
+binds, and there the answer is unanimous:
+
+```
+  Llama  long    32.5094 -> 30.1937   -7.1%
+  Llama  long2   69.9949 -> 67.3171   -3.8%
+  qwen3  long    71.7770 -> 68.5076   -4.5%
+  qwen3  long2  117.6984 -> 114.5617  -2.7%
+```
+
+⚠ **It is not "remove the clamp".** At alpha 0.65 the floor allows factors up
+to 1000^0.65 = 89 and the narrow clamp is what saves the model -- Llama 72.17
+at hi=2 against 86.66 at hi=4. The clamp earns its keep exactly where the
+exponent is too large to be used at all.
+
+🏁 **The default moved 2.0 -> 6.0 on 2026-09-10**, because 2.0 binds from alpha
+0.10 upward and was taking a third of the method with it. 6.0 is inert wherever
+the exponent is usable and still bounds above it:
+
+```
+  alpha    hi=2.0    hi=6.0    hi=64      (AWQ off 41.5289)
+  0.20    35.2041   28.0368   28.0368     inert, identical to unclamped
+  0.25    38.3471   28.3271   28.3271     inert, identical to unclamped
+  0.50    50.7341   41.4979   37.6820
+  0.65    72.1690   94.5806   79.7978     2.0 wins only here, where all are unusable
+```
+
+⚠ **Every AWQ number recorded before that date was measured at 2.0**, and
+`CHARSIU_NPU_AWQ_CLAMP=2.0` reproduces them exactly. Nothing shipped changes:
+AWQ is off by default and the carried controls are bit-identical.
 
 ⚠ **The activation width is not where four bits hurt.** The int4 path tells the
 hardware sixteen-bit activations and then packs an eight-bit value into the

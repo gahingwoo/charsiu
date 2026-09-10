@@ -1403,6 +1403,23 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * 67 MB coefficient buffer, NOT the width. K = 8192 is the one that
 	 * collapses, to 0.65 GB/s, and it collapses rather than hanging.
 	 */
+	/*
+	 * ⚠ NMAX CAN ONLY ACT WHILE IT IS BELOW CHARSIU_NPU_MAXN, and both
+	 * default to 8192.
+	 *
+	 * MAXN is the pool's staging gate -- `w->ne[1] <= pool_maxn()` in
+	 * npupool.c, above which the tensor never reaches this file at all --
+	 * and NMAX slices the n of a tensor that did. So a slice needs
+	 * NMAX < n <= MAXN, and at the library defaults that set is EMPTY:
+	 * raising NMAX does nothing except enlarge `scratch` and `wpack`,
+	 * which are sized by it.
+	 *
+	 * It is not inert in practice, because the board config raises MAXN to
+	 * 262144 -- that is what lets NMAX 8192 cut a 128256 wide head into
+	 * sixteen. But the two knobs bound the same quantity and the tighter
+	 * one wins silently, which is the shape that hid a third of AWQ behind
+	 * its clamp until 2026-09-10.
+	 */
 	g->nmax = env_u("CHARSIU_NPU_NMAX", 8192);
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 4096);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);

@@ -228,21 +228,30 @@ echo "⚠⚠ THE SURFACE MUST BE MONOTONE ON EACH SIDE OF ITS MINIMUM, AND ON TH
    extend the grid before naming it."
 
 echo
-echo "== arm 5: the factor's clamp, which costs 5-7% at the exponent you should use"
-# ⚠ THE HOST ALREADY ANSWERED THE QUALITY HALF and this arm is here for the
-# board's own quantiser, not to re-derive it. qwen3 71.7770 -> 67.9646 at
-# alpha 0.25 and Llama 32.5094 -> 30.1937 at 0.15, each at its own best
-# setting. The onset is dated: at alpha 0.10 hi = 2, 4 and 8 give 80.1066 to
-# the last digit, so nothing reaches the bound there.
-# ⚠ NOT BETTER EVERYWHERE. At 0.65 the narrow clamp wins on both models by 20%
-# and 8.8%, and between 0.25 and 0.5 the two models disagree. So this sweeps
-# rather than asserts.
-for c in 2.0 4.0; do
+echo "== arm 5: does the factor's clamp BIND, which is worth a third of the method"
+# ⚠⚠ THE ARM IS "DOES IT BIND", NOT "WHICH hi". The factor has a SECOND bound:
+# the statistic is floored at 1e-3 * mean, which caps the factor at
+# (1/floor)^alpha whatever the data does. The clamp only acts while it is the
+# tighter of the two -- and at the shipped defaults that means it binds from
+# alpha 0.10 UPWARD, always. A sweep of hi below the cap measures the bound and
+# the exponent together, which is what every alpha sweep in this tree did
+# before 2026-09-10.
+#
+# 64 is inert for any alpha up to 0.6, since 1000^0.6 = 63.1.
+#
+# ⚠ On the host, releasing it is worth a third of the whole method:
+# Llama 41.5289 off -> 32.5094 at clamp 2.0 -> 28.0368 clamp-free (alpha 0.20).
+#
+# ⚠ NOT "remove the clamp". At alpha 0.65 the floor allows factors to 89 and
+# the narrow clamp is what saves the model -- it earns its keep exactly where
+# the exponent is too large to be used at all.
+for c in 2.0 64.0; do
 	# shellcheck disable=SC2086
 	P=$(env $W4 CHARSIU_NPU_AWQ="$ALPHA" CHARSIU_AWQ_STATS="$STATS" 		CHARSIU_NPU_AWQ_CLAMP=$c 		"$PPL" "$M" "$E" -n 300 2>/dev/null | tail -1 |
 		grep -o 'ppl [0-9.]*' | awk '{print $2}')
-	printf '   clamp hi=%-5s alpha %s   ppl %s
-' "$c" "$ALPHA" "${P:-?}"
+	printf '   clamp hi=%-5s alpha %s   ppl %s%s
+' "$c" "$ALPHA" "${P:-?}" \
+	       "$([ "$c" = 64.0 ] && echo '   (inert: the floor is the only bound)')"
 done
 echo "⚠ The DEFAULT stays 2.0: every AWQ number on record was measured there,
    and moving it silently would make all of them unreproducible. If the board
