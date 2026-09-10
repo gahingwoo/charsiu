@@ -97,10 +97,24 @@ env $W4 CHARSIU_NPU=0 CHARSIU_CALIB="$STATS" \
 [ -s "$STATS" ] || { echo "FAIL: the calibration pass wrote nothing"; exit 1; }
 echo "   $(wc -c < "$STATS") bytes"
 
-# the generated text only: everything before the runner's own report
-text() { sed '/^\[load /,$d'; }
-tps()  { grep -o '[0-9.]* tok/s' | head -1 | awk '{print $1}'; }
-ttft() { grep -o 'TTFT [0-9.]*' | head -1 | awk '{print $2}'; }
+#
+# ⚠⚠ THE SUMMARY IS ON STDOUT AND IT DOES NOT SAY "TTFT". charsiu_run prints
+#
+#   [load N ms | staging N ms | prompt N tok in N ms, N tok/s
+#                             | gen N tok in N ms, N tok/s | peak N MB]
+#
+# on STDOUT, next to the generated text; the refusals and the stage report go
+# to stderr. The first version of this read timings out of the .err file and
+# grepped for "TTFT", so every timing it printed was blank -- which the host
+# dry run showed, and which on the board would have been a round that measured
+# nothing and said so in a column of empty fields.
+#
+# And `head -1` on "tok/s" takes the PROMPT rate, not the decode one. They are
+# different quantities wearing the same unit.
+#
+text()      { sed '/^\[load /,$d'; }
+prompt_ms() { grep -o 'prompt [0-9]* tok in [0-9.]* ms' | head -1 | awk '{print $5}'; }
+gen_tps()   { grep -o 'gen [0-9]* tok in [0-9.]* ms, [0-9.]* tok/s' | head -1 | awk '{print $7}'; }
 
 # run one arm: $1 extra env, writes $T/$2.out and $T/$2.err
 arm() {
@@ -141,8 +155,8 @@ if ! grep -q "charsiu NPU batched" "$T/b1.err"; then
 	echo "   ⚠ no batched matmul entry in arm B's report -- nothing was batched"
 	fail=$((fail + 1))
 fi
-printf '   TTFT   refuse %s ms   batch %s ms\n' \
-	"$(ttft < "$T/b0.err")" "$(ttft < "$T/b1.err")"
+printf '   prompt   refuse %s ms   batch %s ms\n' \
+	"$(prompt_ms < "$T/b0.out")" "$(prompt_ms < "$T/b1.out")"
 grep -h "a different AWQ factor" "$T/b1.err" | sed 's/^/   reuse: /'
 
 echo
@@ -152,7 +166,7 @@ arm "CHARSIU_NPU_AWQ_SHARE=1" s1
 A=$(text < "$T/s0.out"); B=$(text < "$T/s1.out")
 say_same "$A" "$B"
 printf '   decode %s tok/s (no share)   %s tok/s (shared)\n' \
-	"$(tps < "$T/s0.err")" "$(tps < "$T/s1.err")"
+	"$(gen_tps < "$T/s0.out")" "$(gen_tps < "$T/s1.out")"
 
 echo
 # ⚠ AT WHATEVER CHARSIU_AWQ_ALPHA IS, WHICH ARM 4 IS WHAT CHOOSES. The two
