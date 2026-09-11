@@ -735,10 +735,17 @@ The damage is not spread evenly over the layers. `CHARSIU_NPU_INT8_LAYERS=0-1`
 keeps the first two blocks at eight bits and leaves the rest at four:
 
 ```
-                        int4 g1024   INT8_LAYERS=0-1   all int8   of the gap
+                       int4, a row   INT8_LAYERS=0-1   all int8   of the gap
   Llama-3.2-1B            41.5289        26.0672       17.9772      65.6%
   Qwen3-0.6B             110.0549        85.0878       45.1214      38.4%
 ```
+
+⛔ **THAT HEADER SAID `int4 g1024` UNTIL 2026-09-11 AND THE COLUMN IS NOT
+GROUPED.** 41.5289 is one absmax a row; the same file at group 1024 is 33.8071.
+The warning two paragraphs down had said "measured UNGROUPED" since the table
+was written, so the table contradicted its own caption for as long as it
+existed -- and a header is what gets copied out into a paper, not the
+paragraph under it.
 
 The absolute fractions differ because the models have sixteen layers and
 twenty-eight, so the same two are 12.5% of one and 7.1% of the other. **The
