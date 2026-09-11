@@ -9496,3 +9496,58 @@ runtime where to run.**
 at maximum frequency, with no N and no spread. A 5.6% margin over a point
 estimate of unknown method is not a result, it is a comparison. What IS a
 result is 20.92 -> 26.25 on the same binary and the same board.
+
+### 🏁🏁🏁 THE SCOREBOARD ON THE PINNING BINARY — AND THE CLAIM WAS TRUE ALL ALONG
+
+One boot, performance governor, median of seven with every reading printed,
+the binary from a58086c. Quality table bit-identical to the previous round
+(34.2425 / 23.6746 / 18.3604), which is the free regression check that pinning
+changes scheduling and not arithmetic.
+
+```
+             old median  old best   NEW median  spread    gain   vs vendor
+  Qwen3         20.76     26.06       26.26     1.9%    +26.5%     +5.7%
+  TinyLLAMA     19.41     22.83       22.79     1.2%    +17.4%    +15.6%
+  Phi3           5.96      7.04        7.03     0.1%    +18.0%     +6.8%
+  Gemma4         7.28      9.33        9.25     1.7%    +27.1%     +0.2%
+```
+
+**All four are ahead on the MEDIAN now**, with spreads of 0.1 to 1.9%. Phi3
+reads 7.03, 7.04, 7.03, 7.03, 7.04, 7.04, 7.03 — a tenth of a percent.
+
+🔑🔑 **AND THE NEW MEDIANS ARE THE OLD BEST-OF-SEVEN, TO WITHIN 1%:**
+
+```
+  Qwen3     26.06 -> 26.26   +0.8%
+  TinyLLAMA 22.83 -> 22.79   -0.2%
+  Phi3       7.04 ->  7.03   -0.1%
+  Gemma4     9.33 ->  9.25   -0.9%
+```
+
+So the published claim's NUMBERS were right and its METHOD was not. The high
+mode was the machine's real capability all along; best-of-N was reporting a
+number the runtime could reach but would not deliver. **The finding is not
+"the claim was inflated" — it is "the claim was unreproducible", and the fix
+was to make the runtime do reliably what it had been doing by luck.**
+
+Against the published +5.8% (Qwen3) and +16.1% (TinyLLAMA), the medians now
+give +5.7% and +15.6%. The paper's headline survives, from a statistic that
+can be defended.
+
+⚠ **TTFT did not move, and should not have.** Qwen3 607 -> 613, Phi3 2923 ->
+2987, gemma4 2269 -> 2222 — a couple of percent either way. A prompt's work is
+on the pool, which still has the whole machine; decode is the one thread that
+was losing the lottery. That is the 09-06 table's shape exactly.
+
+🏁 **And gemma4's TTFT sweep closes R4 for good.** Twenty readings on the
+pinning binary: median 1978, spread **4.4%**, and `spread_shape.py` now refuses
+to call a shape at that width. The chain end to end:
+
+```
+  46%    seven readings, whatever governor the board had     <- what R4 asked about
+   9.9%  twenty readings, performance governor
+   4.4%  twenty readings, performance governor, pinned
+```
+
+Two clusters at the second step, none at the third. **gemma4's TTFT was the
+same lottery**, and the row is now quotable as a median without qualification.
