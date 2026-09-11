@@ -9784,3 +9784,50 @@ exactly what the existing refusal tests: `if (g->w4 && !t->packed)`.
 int8 needs, and `adtype` differs (w4 wants fp16 activations, w8 wants int8), so
 a group that mixes widths cannot share one packed activation. The tree has
 already priced that second one at about 2%.
+
+### 🏁 THE SERIAL ARM, SAME BOOT: serialising costs NOTHING on decode
+
+The round of record ran with the two cores overlapped, because at 800 mV
+`overlap_safe()` approves and `batch_serial()` defaults to `!overlap_safe()`.
+What that is worth had only ever been quoted from 2026-09-04, a different
+governor and before the pin. This is the same boot as the round of record:
+boot id `929e85e2` at both ends, uptime 6920 s then 21794 s, same binary, same
+governor, same rail, same model file, and `CHARSIU_NPU_BATCH_PARALLEL=0` the
+only thing changed.
+
+```
+  Qwen3      ttft 799 686 671 677 688 676 679   decode 26.24 25.94 26.44 26.17 26.02 26.11 26.07
+  TinyLLAMA  ttft 1332 1167 1146 1159 1128 1140 1157   decode 22.57 22.78 22.82 22.84 22.87 22.75 22.83
+  Phi3       ttft 3976 3843 3896 3953 3953 3877 3842   decode 7.02 7.05 7.05 7.06 7.04 7.04 7.03
+  Gemma4     ttft 3225 2668 2687 2663 2668 2700 2706   decode 9.18 9.31 9.04 9.20 9.24 9.19 9.25
+```
+
+```
+             decode              TTFT
+           overlap  serial     overlap serial
+  Qwen3      26.26   26.11       613    679   +10.8%
+  TinyLLAMA  22.79   22.82       890   1157   +30.0%
+  Phi3        7.03    7.04      2987   3896   +30.4%
+  Gemma4      9.25    9.20      2222   2687   +20.9%
+```
+
+🔑 **Decode does not move: -0.6%, +0.1%, +0.1%, -0.5%.** Two of the four go UP.
+That is inside the run-to-run spread, so serialising is free on decode.
+
+And it is what the mechanism says once the mechanism is stated: overlap puts
+two cores in flight at the same time, a decode step is one row with nothing to
+overlap, and the entire gain is on the batched prompt. TTFT pays 11 to 30%.
+
+⛔ **So the four serial numbers this project has been quoting are not measuring
+serialisation.** 24.28 / 20.34 / 6.82 / 8.68, from 09-04, are ALL BELOW the
+serial decode here (26.11 / 22.82 / 7.04 / 9.20). They predate the affinity
+pin, so what they measure is the cost of not pinning, which is +25.5% and is
+measured directly elsewhere. Replacing them is right; dating them is not.
+
+🔑 **And the claim they supported gets stronger, not weaker.** "A reader on
+stock mainline gets neither these speeds nor these answers" is half wrong: the
+decode margin over the vendor survives serialisation intact, and only TTFT
+depends on the overlap.
+
+⚠ The first TTFT reading of every model is the high one (799, 1332, 3976,
+3225). Seven readings and a median absorb it; a single reading would not.

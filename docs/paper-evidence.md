@@ -329,9 +329,37 @@ has both.
 
 Every speed number in section 1 ran with the two cores overlapped. The board
 reads 800 mV, `overlap_safe()` approves, and `batch_serial()` defaults to
-`!overlap_safe()`, so the cores overlap by default. The TTFT and decode figures
-are overlapped figures, and a reader on a 750 mV device tree gets neither these
-speeds nor these answers.
+`!overlap_safe()`, so the cores overlap by default.
+
+What that costs was measured in the same boot as the round of record, with
+`CHARSIU_NPU_BATCH_PARALLEL=0` the only thing changed. Same binary, same
+governor, same rail, same model file, boot id `929e85e2` at both ends:
+
+```
+             decode              TTFT ms
+           overlapped serial     overlapped serial
+  Qwen3       26.26   26.11        613     679    +10.8%
+  TinyLLAMA   22.79   22.82        890    1157    +30.0%
+  Phi3         7.03    7.04       2987    3896    +30.4%
+  Gemma4       9.25    9.20       2222    2687    +20.9%
+```
+
+**Serialising costs nothing on decode and 11 to 30% on TTFT.** All four decode
+figures move by less than 0.6%, which is inside the run-to-run spread, and two
+of the four move upward. That is what the mechanism predicts once stated:
+overlap puts two cores in flight at once, a decode step has one row and nothing
+to overlap, and the whole gain is on the batched prompt.
+
+So a reader on a 750 mV device tree, where `overlap_safe()` refuses, gets the
+decode numbers in section 1 unchanged and a TTFT 11 to 30% worse. The decode
+margin over the vendor does not depend on the overlap.
+
+⚠ The four serial figures this project quoted before today (24.28, 20.34, 6.82,
+8.68 tok/s) are all BELOW the serial decode measured here, and they are from
+2026-09-04 at a different governor and before the calling thread was pinned.
+They measure the cost of not pinning, which section 1b measures directly at
++25.5%, rather than the cost of serialising, which is zero. Replace them rather
+than dating them.
 
 One boot on 2026-09-11 could not fire the fault at all: 68 runs at the old
 map's worst cell (phi3, chunk 24, KMAX 2048) across `default`, `onedev`,
