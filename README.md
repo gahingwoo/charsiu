@@ -1259,10 +1259,19 @@ Their measurements are worth reading before starting anything here, and they are
 collected in [rockchip-npu-notes](https://github.com/gregordinary/rockchip-npu-notes).
 
 Their central finding is that **the NPU is a prefill engine and decode belongs on the
-CPU**: a single-row matmul is about 82 times slower on the NPU than the batched shape
-it was built for, a feature height below four computes wrong output at all, and
-quantisation does not speed prefill up because the pipeline sits at a dispatch and DMA
-floor rather than a MAC one.
+CPU** -- `ggml-rocket`'s own words are *"Decode (M=1 GEMV) is forced to the CPU, ~82x
+slower on the NPU"*. A feature height below four computes wrong output at all
+(`rockchip-npu-notes`: *"a height below 4 mis-computes on the hardware at every dtype.
+That is the `M==1` single-vector or GEMV case"*), and quantisation does not speed
+prefill up because the pipeline sits at a dispatch and DMA floor rather than a MAC one.
+
+⚠ **They qualify that last one and this file used to drop the qualifier.**
+`ggml-rocket` says quantisation buys RAM rather than prefill speed *"at this operating
+point"*, and `rockchip-npu-notes` adds that it is *"bottleneck-conditional rather than
+a permanent silicon law"*. Checked against both repositories on 2026-09-11: the three
+findings are theirs and are stated as above, and the 82x and the decode
+recommendation are in **ggml-rocket** rather than in the notes collection this
+paragraph used to point at for them.
 
 **On the RK3576 the vendor does the thing that finding says not to do.** Reading the
 register command streams out of a vendor `.rkllm` for Llama-3.2-1B, 3752 of its
