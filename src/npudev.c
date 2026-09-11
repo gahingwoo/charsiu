@@ -1260,9 +1260,35 @@ static unsigned packpool_min(struct charsiu_npu *g)
 	return g->packpool_min;
 }
 
+/*
+ * IS THIS TENSOR FOUR BITS ON THE WIRE?
+ *
+ * ⚠⚠ NOT THE SAME QUESTION AS g->w4, WHICH IS WHAT THE DEVICE WAS OPENED FOR.
+ * A device holds one register program per slice, so the width can be a
+ * property of the tensor rather than of the device, and CHARSIU_NPU_INT8_LAYERS
+ * wants exactly that: eight bits for the first blocks and four for the rest,
+ * on one open device, for int8's answer at int4's bandwidth.
+ *
+ * This step threads the tensor to every site that asks, and still returns the
+ * device's answer, so it is bit identical. Changing WHAT it answers is the
+ * next step and is this one function.
+ *
+ * ⚠ The two directions are not symmetric and only one of them is new. An int8
+ * DEVICE carrying int4 codes already works and every vision tower does it --
+ * pack_rows UNPACKS them, one byte a code, so those weights go on the wire at
+ * int8's width. That is int4's answer at int8's bandwidth, which is the
+ * inverse of what the knob is for, and it is why opening a mixed model as int8
+ * is not the cheap way round this.
+ */
+static int w4_for(const struct charsiu_npu *g, const struct npu_tensor *t)
+{
+	(void)t;
+	return g->w4;
+}
+
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
-	return g->w4 && t->kgroup && t->kgroup < t->k &&
+	return w4_for(g, t) && t->kgroup && t->kgroup < t->k &&
 	       (t->k % t->kgroup) == 0 && t->kgroup == (uint64_t)g->kmax;
 }
 
@@ -2366,8 +2392,9 @@ static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 			uint64_t i = (uint64_t)w->k0 + c;
 			int v = pk ? q_code(src, i) : src[i];
 
-			dst[c] = g->w4 ? (uint8_t)((unsigned)v & 0xfu)
-				       : (uint8_t)(v + 128);
+			dst[c] = w4_for(g, w->t)
+					? (uint8_t)((unsigned)v & 0xfu)
+					: (uint8_t)(v + 128);
 		}
 	}
 	charsiu_pack_weights_rows(w->mm, g->scratch, g->wpack,
@@ -2556,8 +2583,8 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	s->job.mm.m = 1;
 	s->job.mm.k = k;
 	s->job.mm.n = n;
-	s->job.mm.wdtype = g->w4 ? CHARSIU_INT4 : CHARSIU_INT8;
-	s->job.mm.adtype = g->w4 ? CHARSIU_FP16 : CHARSIU_INT8;
+	s->job.mm.wdtype = w4_for(g, t) ? CHARSIU_INT4 : CHARSIU_INT8;
+	s->job.mm.adtype = w4_for(g, t) ? CHARSIU_FP16 : CHARSIU_INT8;
 	s->job.input_zero_point = 128;
 	s->job.weight_zero_point = 128;
 	s->job.output_zero_point = 0;
@@ -2657,7 +2684,7 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	/* the weight sums this slice's K range accounts for, not the tensor's.
 	 * int4 has no input zero point, so there is nothing for them to
 	 * correct and they stay at zero. */
-	if (!g->w4)
+	if (!w4_for(g, t))
 		slice_wsum(t, n0, n, k0, k, wsum);
 
 	/*
@@ -2814,7 +2841,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * go straight into y and the conversion at the end is skipped, which is
 	 * grouped int4 with the vector paths on.
 	 */
-	if (g->cpu_frac > 0.0 && g->w4 && !g->plain && tensor_grouped(g, t) &&
+	if (g->cpu_frac > 0.0 && w4_for(g, t) && !g->plain && tensor_grouped(g, t) &&
 	    t->n >= 64) {
 		unsigned keep = (unsigned)((double)t->n * (1.0 - g->cpu_frac));
 
@@ -2981,7 +3008,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 
 		e->nt_dev[d]++;
 		e->mb_dev[d] += (double)sl->job.mm.k * (double)sl->job.mm.n
-			      / (g->w4 ? 2.0 : 1.0) / 1e6;
+			      / (w4_for(g, t) ? 2.0 : 1.0) / 1e6;
 	}
 	/*
 	 * THE CPU'S ROWS, PACKED TWO WEIGHTS TO A BYTE.
@@ -3018,7 +3045,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * outside and what the shape sweep said.
 	 */
 	e->weight_mb = (double)e_n_npu * (double)t->k
-		     / (g->w4 ? 2.0 : 1.0) / 1e6;
+		     / (w4_for(g, t) ? 2.0 : 1.0) / 1e6;
 	/*
 	 * A HEARTBEAT WHILE THE WEIGHTS ARE STAGED. Round 352's int4 arm printed
 	 * nothing for minutes and there was no way to tell a slow load from a
@@ -4453,9 +4480,9 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned sn = c->sn, n4 = sn / 4, j;
 	int firstw = c->firstw;
-	const float *sc = g->w4 && c->grp ? s->sc : NULL;
+	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
-	if (g->read4 != 2 || !g->w4 || !g->bmap2 || r0 % 2 || nr % 2)
+	if (g->read4 != 2 || !w4_for(g, e->t) || !g->bmap2 || r0 % 2 || nr % 2)
 		return 0;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 2) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -4527,9 +4554,9 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned sn = c->sn, n4 = sn / 4, j;
 	int firstw = c->firstw;
-	const float *sc = g->w4 && c->grp ? s->sc : NULL;
+	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
-	if (g->read4 != 4 || !g->w4 || !g->bmap4 || r0 % 4 || nr % 4)
+	if (g->read4 != 4 || !w4_for(g, e->t) || !g->bmap4 || r0 % 4 || nr % 4)
 		return 0;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -4676,7 +4703,7 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 		for (j = 0; j < n4; j++) {
 			float v0, v1, v2, v3;
 
-			if (g->w4 && c->grp) {
+			if (w4_for(g, e->t) && c->grp) {
 				const float *fp = c->fo[0] + mp[j];
 				const float *cp = c->sc[0] + j * 4;
 
@@ -4688,7 +4715,7 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 					v0 += fp[0] * cp[0]; v1 += fp[1] * cp[1];
 					v2 += fp[2] * cp[2]; v3 += fp[3] * cp[3];
 				}
-			} else if (g->w4) {
+			} else if (w4_for(g, e->t)) {
 				const float *fp = c->fo[0] + mp[j];
 
 				v0 = fp[0]; v1 = fp[1]; v2 = fp[2]; v3 = fp[3];
@@ -4728,10 +4755,10 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 			for (t = 0; t < c->ns; t++) {
 				float u;
 
-				if (g->w4 && c->grp)
+				if (w4_for(g, e->t) && c->grp)
 					u = c->fo[t][mp[j / 4] + j % 4]
 					  * c->sc[t][j];
-				else if (g->w4)
+				else if (w4_for(g, e->t))
 					u = c->fo[t][mp[j / 4] + j % 4];
 				else
 					u = (float)((const int32_t *)c->fo[t])
@@ -4992,7 +5019,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 #define I8   const int32_t *ip = io + mp[j];                                 \
 	     float v0 = (float)ip[0]*d1, v1 = (float)ip[1]*d1,               \
 		   v2 = (float)ip[2]*d1, v3 = (float)ip[3]*d1
-					if (g->w4 && grp) {
+					if (w4_for(g, e->t) && grp) {
 						const float *sc = s->sc;
 
 						if (firstw) { GATHER4(ASSIGN, W4G) }
@@ -5003,7 +5030,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 							if (firstw) yr[j] = v;
 							else        yr[j] += v;
 						}
-					} else if (g->w4) {
+					} else if (w4_for(g, e->t)) {
 						if (firstw) { GATHER4(ASSIGN, W4) }
 						else        { GATHER4(ADD, W4) }
 						for (j = n4 * 4; j < sn; j++) {
