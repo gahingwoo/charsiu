@@ -9664,3 +9664,55 @@ there is no breakdown of the vendor's side at all.
 ⚠ The `in its wrapper` figure — 24.21 ms a row on Qwen3 against 3.90 inside
 the entry — **includes staging**, 4135 ms of it, which is once per process and
 outside both the prompt total and TTFT. It is not prompt time.
+
+### ⛔⛔ THREE BOARD ROUNDS ON A QUESTION `src/overlap.h` ANSWERS ON LINE 11
+
+Asked to refresh the overlap evidence. What the rounds produced, in the order
+it matters:
+
+**1. Both overlap harnesses had been dead for a day.** `board_intermittent.sh`
+and `board_overlap_slots.sh` each carried a comment block between `W4="... \`
+and the rest of the string, so the `#` was DATA: `env` tried to execute a
+program called `#`, every arm died in under a second, `2>/dev/null` swallowed
+it. Introduced 2026-09-10 by `68b1a75`, *"two board harnesses were timing the
+CPU fallback and calling it the NPU"* — the commit that made them correct is
+the one that stopped them running. Found only because
+`board_intermittent.sh`'s own empty-reference guard refused to compare against
+a control that had produced nothing. `verify_selftest.sh` now checks every
+harness for a comment following a continuation of a command, verified against
+a deliberately broken file and against `board_awq.sh`'s commented example.
+
+**2. The fault did not fire, 68 runs at the map's own cell** — phi3, chunk 24,
+KMAX 2048 — across `default`, `onedev`, `serial`, `parallel`, `zero`, with the
+affinity pin on and off.
+
+**3. The pin does not mask it.** 14 of 14 clean with `CHARSIU_AFFINITY=0` and
+14 of 14 with the pin, identical. That was worth asking: overlap is a race, I
+shipped a default today that changes thread placement, and a race that stops
+firing because the timing moved is MASKED rather than fixed.
+
+⛔ **And none of that was the question.** `src/overlap.h`, line 11:
+
+> 🏁 2026-09-04: THE OVERLAP FAULT WAS THE NPU'S VOLTAGE MARGIN, NOT THE
+> OVERLAP.
+
+with the four-DTB sweep in this notebook beside it — 786 MHz at 750 mV gives
+11 to 25 wrong words a pass, at 800 mV 0, 0, 0, 0. **This board reads 800 mV.**
+The 68 clean runs re-confirm a settled result, and `serial` against `parallel`
+was probably one configuration twice, because `batch_serial()` defaults to
+`!overlap_safe()` and at 800 mV `overlap_safe()` approves — which this notebook
+already says, in the words *"m67's two arms were the same run twice"*.
+
+🔑 **The evidence for the claim is the 09-04 voltage sweep, not tonight.** Four
+device trees under a controlled sweep beats 68 runs of a probe that did not
+fire, and a paper should cite the former.
+
+⚠ What tonight IS good for, and it is not nothing: an end-to-end check that the
+09-04 guard still holds on the current binary **including today's affinity
+default**, at the width the old map called worst.
+
+🔑 **Second time in two days.** On 09-10 I re-opened the narrow-output-read
+road that 09-08 had measured dead. A closed question does not look closed from
+outside — it looks like an open one nobody has touched lately, and the instinct
+to go and measure is the same instinct that is usually right. What separates
+them is five minutes of reading, and reading does not feel like working.
