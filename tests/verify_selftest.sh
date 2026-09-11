@@ -71,6 +71,42 @@ for f in board_text_all.sh board_vendor.sh; do
 	fi
 done
 
+#
+# ⚠⚠⚠ A COMMENT DIRECTLY AFTER A LINE CONTINUATION IS ALWAYS A BUG, and on
+# 2026-09-10 it killed both of the harnesses that map the overlap fault. A
+# nine-line note sat between `W4="... \` and the rest of the string, so the
+# `#` was DATA: W4 expanded to the environment followed by prose, `env` tried
+# to run a program called `#`, every arm died in under a second, and
+# 2>/dev/null swallowed the reason. It went unnoticed for a day because
+# nothing ran those scripts.
+#
+# Inside quotes the comment becomes part of the value; outside them the
+# shell joins the lines and the `#` comments out the rest of the command.
+# There is no case where it is what the author meant.
+#
+for f in "$HERE"/*.sh; do
+	[ -r "$f" ] || continue
+	#
+	# ⚠ THE CONTINUED LINE MUST NOT ITSELF BE A COMMENT. board_awq.sh
+	# documents a command a reader would type, wrapped over two commented
+	# lines, and the first version of this check called that a fault. A
+	# comment continuing a comment is prose; only a comment continuing a
+	# COMMAND is data.
+	#
+	bad=$(awk '
+		{ isc = ($0 ~ /^[[:space:]]*#/) }
+		cont && isc { print NR }
+		{ if ($0 ~ /\\$/) { if (!cont && !isc) cont = 1 }
+		  else cont = 0 }' "$f" | tr '\n' ' ')
+	if [ -n "$bad" ]; then
+		printf '  !! %s has a comment after a line continuation at line(s) %s\n' \
+			"$(basename "$f")" "$bad"
+		printf '     that comment is DATA, not a comment. Lift it above.\n'
+		fail=$((fail + 1))
+	fi
+done
+[ "$fail" -gt 0 ] || printf '  ok no harness hides a comment inside a continuation\n'
+
 if [ "$fail" -gt 0 ]; then
 	printf '\n%s phase(s) cannot be run on their own.\n' "$fail"
 	exit 1
