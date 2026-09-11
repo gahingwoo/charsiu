@@ -236,7 +236,8 @@ def main():
                 g *= e * np.linalg.norm(ref) / max(np.linalg.norm(g), 1e-30)
                 d = (ref + g).astype(np.float16)
                 n += 1
-            elif which in ("chr43", "q4043") and name in WOFF:
+            elif which in ("chr43", "q4043", "chr43row",
+                           "chr43g") and name in WOFF:
                 #
                 # The SAME 43 tensors, quantised by us instead. Everything
                 # else in the file is the reference, so the perplexity
@@ -250,7 +251,41 @@ def main():
                 rho_t = float((15.0 * sv
                                / (Wr.max(axis=1) - Wr.min(axis=1))).mean())
                 if abs(rho_t - 1.0) <= 0.05:
-                    g = 1024 if which == "chr43" else 32
+                    #
+                    # ⚠⚠ THE GROUPS ARE NOT THE SAME SIZE AND THE PAPER DOES
+                    # NOT SAY SO. The vendor keeps ONE fp32 scale and one
+                    # integer zero point per OUTPUT ROW -- confirmed from the
+                    # slot offsets, 4096 floats between two 2048-row tensors --
+                    # so its group is the whole of K. charsiu at 1024 has two
+                    # groups on a 2048-wide row and eight on an 8192-wide one.
+                    #
+                    # So the 2.00 / 2.23 / 2.35 ladder is not one difference,
+                    # it is at least two: a different algorithm AND a finer
+                    # group, and the finer group flatters us. `chr43row` makes
+                    # the group the whole row, which is the vendor's own, so
+                    # the ratio can be read with that difference removed.
+                    #
+                    # ⚠ A third difference runs the OTHER way and is not
+                    # removed by this: the vendor is asymmetric with an integer
+                    # zero point and charsiu here is symmetric absmax. The zero
+                    # point is worth about 1.4% at group 1024 by this tree's
+                    # own measurement, so it is the small one.
+                    #
+                    #
+                    # ⚠ AND THE THREE ARMS ARE ONE QUANTISER AT THREE GROUPS.
+                    # llama.cpp's q4_0 is `d = max / -8` with max the signed
+                    # value at max|x| (ggml-quants.c:132); charsiu's is
+                    # `d = vmax / -8.0f` (npuquant.c:606); this is
+                    # `dd = vm / -8.0`. Identical. So "charsiu against q4_0"
+                    # compares GROUP SIZES, not algorithms, and only the
+                    # vendor's arm is a different quantiser.
+                    #
+                    if which == "chr43row":
+                        g = Wr.shape[1]
+                    elif which == "chr43g":
+                        g = int(os.environ.get("CHARSIU_CHR_GROUP", "1024"))
+                    else:
+                        g = 1024 if which == "chr43" else 32
                     g = min(g, Wr.shape[1])
                     ww = Wr.reshape(Wr.shape[0], -1, g)
                     i = np.abs(ww).argmax(axis=2)
