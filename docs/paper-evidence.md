@@ -161,6 +161,23 @@ runs, `Llama-3.2-1B-Instruct-Q4_0.gguf` md5 `48ff0243…`, 773025920 bytes,
   int8                    18.3604
 ```
 
+**On a second architecture**, Qwen3-0.6B (md5 `45f23a28…`), same group, same
+corpus, `tests/host_awq.sh`:
+
+```
+  AWQ off                 95.5754
+  AWQ on, no statistics   95.5754     must equal off -- it declines, and does
+  AWQ on, alpha 0.20      72.5107     -24.1%
+```
+
+**So AWQ is worth 24 to 31% across two architectures at the configuration the
+board runs.** ⚠ Qwen3's own optimum is 0.25 rather than 0.20, so its 24.1% is
+the conservative reading of its own row.
+
+⚠ The middle arm is the tell, not decoration: with no calibration statistics
+`CHARSIU_NPU_AWQ` declines and says so, and an AWQ arm that silently equals its
+control is what a missing calibration looks like. It cost a board round today.
+
 🔑 **Board and desk are bit-identical on all three**, and the calibration pass
 writes the same 2647768 bytes — across two compilers, two glibcs, two kernels
 and two thread counts. Perplexity survives all of that.

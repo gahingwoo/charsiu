@@ -9611,3 +9611,21 @@ prompt against its own token loop:
 🔑 **Every row reads `prompt batched`, not `prompt a token`.** A refusal would
 have reported "text identical" meaning only that the token loop agrees with
 itself — the null result wearing the same words as the real one. None refused.
+
+### 🏁 AWQ ON A SECOND ARCHITECTURE, AT THE BOARD'S GROUP
+
+`tests/host_awq.sh models/Qwen3-0.6B-Q4_0.gguf` (md5 `45f23a28…`), group 1024,
+`tests/corpus/long.txt` at 300 tokens:
+
+```
+  AWQ off                 95.5754
+  AWQ on, no statistics   95.5754     declines, exactly as it must
+  AWQ on, alpha 0.20      72.5107     -24.1%
+```
+
+Against Llama-3.2-1B's 34.2425 -> 23.6746, **-30.9%**. So the method is worth
+**24 to 31% on two architectures** at the configuration the board actually
+runs, rather than 32-38% on one at the ungrouped configuration nobody runs.
+
+⚠ Qwen3's own optimum is 0.25, not the 0.20 used here, so 24.1% is the
+conservative reading of its row.
