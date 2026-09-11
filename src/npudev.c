@@ -496,7 +496,6 @@ struct charsiu_npu {
 	 * the failure the refactor would otherwise ship.
 	 */
 	unsigned bmap_w4;
-	int mixw;		/* CHARSIU_NPU_MIXED_WIDTH: per-tensor width */
 	/*
 	 * Whether rows 4h..4h+3 of every channel quad sit at index, +4, +8,
 	 * +12 in this table -- one 64-byte line -- which is what lets the read
@@ -1294,23 +1293,8 @@ static unsigned packpool_min(struct charsiu_npu *g)
  */
 static int w4_for(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
-	/*
-	 * ⚠ t->packed IS THE WIDTH, and it is the same test the refusal in
-	 * charsiu_npu_add has always made: a packed q holds two codes a byte
-	 * and is four bits, an unpacked one is eight. The quantiser already
-	 * decides this per tensor for CHARSIU_NPU_INT8_LAYERS; until now the
-	 * device overruled it.
-	 *
-	 * ⛔ DEFAULT OFF. npu_mixed_test cleared the hardware question at
-	 * K=256 and N=64, eight alternations, 0 of 18 dispatches wrong. That
-	 * says one open device runs both programs; it does not say this runs
-	 * correctly across the shapes and the thousands of dispatches a real
-	 * model makes. It ships behind a switch until a board round says
-	 * otherwise.
-	 */
-	if (!g->mixw)
-		return g->w4;
-	return t->packed ? 1 : 0;
+	(void)t;
+	return g->w4;
 }
 
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
@@ -1547,12 +1531,6 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 		const char *e4 = getenv("CHARSIU_NPU_W4V");
 
 		g->w4 = e4 && *e4 && *e4 != '0';
-	}
-	{
-		g->mixw = charsiu_env_flag("CHARSIU_NPU_MIXED_WIDTH", 0);
-		if (g->mixw && charsiu_diag())
-			fprintf(stderr, "charsiu: mixed weight widths on, the "
-				"tensor decides and not the device\n");
 	}
 	/*
 	 * SKIP THE FLUSH ON A BUFFER THE CPU ONLY READ.
@@ -2818,9 +2796,38 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * refused rather than guessed at. Refusing puts those tensors on the
 	 * CPU -- slow, and right. Dispatching a mixed model is a board round.
 	 */
-	if (g->w4 && !t->packed && !g->mixw) {
-		whine(g, "eight bit weights on a device opened for four "
-			 "(CHARSIU_NPU_MIXED_WIDTH=1 lets the tensor decide)",
+	/*
+	 * ⛔⛔ AND IT WAS TRIED, ON HARDWARE, AND IT COMPUTES WRONGLY.
+	 *
+	 * 2026-09-11: fae4f88 made w4_for() answer t->packed behind
+	 * CHARSIU_NPU_MIXED_WIDTH and lifted this refusal. The switch worked --
+	 * the refusal stopped, the diag line fired, the tensors staged -- and
+	 * the answer was garbage. board_text_all.sh, every model's BATCHED
+	 * prompt against its own TOKEN LOOP, both arms carrying mixed width:
+	 *
+	 *   without mixing   9 models compared, 0 differing
+	 *   with mixing      9 models compared, 9 differing
+	 *
+	 *   <s> 1 2 3 ... 31 32!!!!!!!!
+	 *   <|begin_of_text|>1 2 3 ... 31 32oooooooo
+	 *
+	 * The prompt echoes correctly and then it emits filler, on all nine.
+	 * So the threading in d8cbb73 is right and something the width also
+	 * selects is not: the scales, the zero-point correction, the
+	 * accumulator index, or the activation the group shares. It is reverted
+	 * rather than left switched off, because a path known to be wrong is
+	 * worse in the tree than one that refuses.
+	 *
+	 * ⚠ THREE TEXT COMPARISONS BEFORE THAT ONE COULD NOT RULE ON IT, and
+	 * all three failed the same way: they put a float path against an
+	 * integer one. NPU-mixed against the CPU reference differs even with
+	 * nothing mixed. int8-on-CPU against int8-on-hardware is the same
+	 * confound wearing another hat. Only NPU against NPU decides, which is
+	 * why board_text_all.sh compares the batched prompt to the token loop
+	 * and not to anything on the host.
+	 */
+	if (g->w4 && !t->packed) {
+		whine(g, "eight bit weights on a device opened for four",
 		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
@@ -6466,22 +6473,6 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		if ((ti->kscale != NULL) != (gks != NULL)) {
 			whine(g, "a group where only some tensors carry an AWQ "
 				 "factor cannot share one packed input",
-			      (unsigned)gt0->k, (unsigned)gt0->n);
-			return -1;
-		}
-		/*
-		 * ⚠⚠ AND THE SAME ARGUMENT APPLIES TO THE WIDTH. A group
-		 * packs the activation once, and w4 wants it fp16 where w8
-		 * wants it int8, so two tensors of different widths cannot
-		 * read one packed input. This can only fire with
-		 * CHARSIU_NPU_MIXED_WIDTH on, and it has to fire ALOUD: the
-		 * tokens are identical either way when the group silently
-		 * drops to single calls, which is exactly what made AWQ's two
-		 * wrong-answer paths invisible for as long as they were there.
-		 */
-		if (w4_for(g, ti) != w4_for(g, gt0)) {
-			whine(g, "a group whose tensors are different widths "
-				 "cannot share one packed input",
 			      (unsigned)gt0->k, (unsigned)gt0->n);
 			return -1;
 		}
