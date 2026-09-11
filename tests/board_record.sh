@@ -81,12 +81,27 @@ env_block() {
 		*npu*|*NPU*) echo "   rail      $_n $(cat "$_r/microvolts" 2>/dev/null) uV" ;;
 		esac
 	done
+	#
+	# ⚠⚠ LIST EVERY devfreq, NOT THE ONES WHOSE PATH SAYS "npu". The first
+	# version matched the path against *npu* and printed NOTHING on this
+	# board -- the devfreq nodes are named after their platform device, so
+	# the NPU's is something like fdab0000.npu or is not a devfreq at all.
+	# A clock with two operating points is exactly the shape of the thing
+	# being hunted (decode reads 5.96 five times and 7.04 twice), and the
+	# round of record could not see it.
+	#
 	for _d in /sys/class/devfreq/*; do
 		[ -e "$_d/cur_freq" ] || continue
-		case $_d in
-		*npu*|*NPU*) echo "   npu clk   $(cat "$_d/cur_freq" 2>/dev/null) Hz" \
-		                  "(governor $(cat "$_d/governor" 2>/dev/null))" ;;
-		esac
+		echo "   devfreq   $(basename "$_d")  $(cat "$_d/cur_freq" 2>/dev/null) Hz" \
+		     "(governor $(cat "$_d/governor" 2>/dev/null), available $(cat "$_d/available_frequencies" 2>/dev/null))"
+	done
+	# and the CPU clusters' actual frequency, which the governor name does
+	# not give: `performance` still leaves a cluster at whatever its own
+	# table's top is, and the two clusters differ.
+	for _c in 0 4; do
+		_f=/sys/devices/system/cpu/cpu$_c/cpufreq/scaling_cur_freq
+		[ -e "$_f" ] && echo "   cpu$_c freq $(cat "$_f" 2>/dev/null) kHz" \
+		     "(max $(cat /sys/devices/system/cpu/cpu$_c/cpufreq/cpuinfo_max_freq 2>/dev/null))"
 	done
 	for _t in /sys/class/thermal/thermal_zone*; do
 		[ -e "$_t/temp" ] || continue
