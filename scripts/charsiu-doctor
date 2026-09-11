@@ -111,6 +111,37 @@ for r in /sys/class/regulator/regulator.*; do
 	info "vdd_npu_s0 is $st at rest (disabled here is correct: the rail follows the power domain)"
 done
 
+#
+# WHERE THE THREADS RUN, because on a big.LITTLE part it is worth 27.7% and
+# until 2026-09-11 nothing here mentioned it at all.
+#
+# Measured on a ROCK 4D, Qwen3-0.6B, ten passes: unpinned decode is BIMODAL
+# across a 28% spread -- 20.5 or 26.4 depending on where the scheduler put four
+# threads -- and pinned to the four A72s it is 26.4 with a 1.6% spread. charsiu
+# pins its calling thread to the fastest cluster itself now; this says whether
+# that will happen on THIS machine, because a default that silently does
+# nothing is the thing this tree keeps being caught by.
+#
+CL=$(for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+	[ -r "$c" ] && cat "$c"; done | sort -u | wc -l)
+if [ "${CL:-0}" -eq 0 ]; then
+	info "no cpufreq here, so charsiu will not pin anything (it needs cpuinfo_max_freq to tell the clusters apart)"
+elif [ "$CL" -eq 1 ]; then
+	info "one CPU cluster: nothing to pin to, and charsiu leaves the scheduler alone"
+else
+	FAST=$(for c in /sys/devices/system/cpu/cpu[0-9]*; do
+		f=$(cat "$c/cpufreq/cpuinfo_max_freq" 2>/dev/null || echo 0)
+		echo "$f ${c##*cpu}"; done | sort -rn |
+		awk 'NR==1{t=$1} $1==t{printf "%s%s", (n++?",":""), $2}')
+	TOP=$(for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+		[ -r "$c" ] && cat "$c"; done | sort -rn | head -1)
+	ok "$CL CPU clusters; charsiu pins its calling thread to the fastest, CPUs $FAST at $((TOP / 1000)) MHz"
+	info "CHARSIU_AFFINITY=0 leaves it to the scheduler, which on this part costs a bimodal decode"
+	G=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+	[ "$G" = performance ] ||
+		info "the governor is ${G:-unknown}, not performance -- every timing here will be noisier than it needs to be"
+fi
+
 hdr "the configuration"
 if [ -f "$CONF" ]; then
 	ok "config at $CONF"
