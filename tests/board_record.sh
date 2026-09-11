@@ -118,8 +118,34 @@ echo
 #
 echo "== 2. quality, CPU reference, group 1024 (what the board runs)"
 if [ -f "$QMODEL" ]; then
+	#
+	# ⚠⚠ AWQ NEEDS ITS STATISTICS AND DECLINES WITHOUT THEM. The first
+	# version of this set CHARSIU_NPU_AWQ=0.20 and nothing else, and the
+	# board printed `int4 34.2425` and `int4+AWQ 34.2425` -- the same
+	# number to the last digit, because with no calibration charsiu
+	# refuses the method and says so on a stderr this was discarding.
+	# An arm equal to its control to the last digit never ran.
+	#
+	# ⚠ AND THE CALIBRATION TEXT IS NOT THE EVALUATION TEXT. Calibrating
+	# on the passage being scored measures how well the statistics fit
+	# that passage, which is not the question.
+	#
+	CAL=$D/corpus/calib.txt
+	[ -f "$CAL" ] || CAL=/opt/charsiu/corpus/calib.txt
+	STATS=$(mktemp)
+	env CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+	    CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+	    CHARSIU_CALIB="$STATS" \
+	    "$BIN/charsiu_ppl" "$QMODEL" "$CAL" -n 150 >/dev/null 2>&1 || true
+	if [ -s "$STATS" ]; then
+		echo "   calibration      $(wc -c < "$STATS") bytes from $(basename "$CAL")"
+	else
+		echo "   ⚠⚠ THE CALIBRATION PASS WROTE NOTHING -- the AWQ arm below"
+		echo "      cannot run and will equal the int4 arm. Do not read it."
+	fi
+	INT4=; AWQ=
 	for arm in "int4:CHARSIU_NPU_W4V=1" \
-	           "int4+AWQ 0.20:CHARSIU_NPU_W4V=1 CHARSIU_NPU_AWQ=0.20" \
+	           "int4+AWQ 0.20:CHARSIU_NPU_W4V=1 CHARSIU_NPU_AWQ=0.20 CHARSIU_AWQ_STATS=$STATS" \
 	           "int8:CHARSIU_NPU_W4V=0"; do
 		lbl=${arm%%:*}; ev=${arm#*:}
 		# shellcheck disable=SC2086
@@ -128,7 +154,20 @@ if [ -f "$QMODEL" ]; then
 		        "$BIN/charsiu_ppl" "$QMODEL" "$CORPUS" -n 300 2>/dev/null |
 		    tail -1 | grep -o 'ppl [0-9.]*' | tail -1 | awk '{print $2}')
 		printf '   %-16s %s\n' "$lbl" "${P:-FAILED}"
+		case $lbl in
+		int4) INT4=$P ;;
+		int4+*) AWQ=$P ;;
+		esac
 	done
+	rm -f "$STATS"
+	# ⚠⚠ THE TELL. Identical tokens is what BOTH "the knob works" and "the
+	# knob never ran" look like, and so is an identical perplexity.
+	if [ -n "$INT4" ] && [ "$INT4" = "$AWQ" ]; then
+		echo "   ⚠⚠ THE AWQ ARM EQUALS THE int4 ARM TO THE LAST DIGIT."
+		echo "      It did not run. AWQ declines without statistics, and a"
+		echo "      null arm is not a null result. This table's AWQ row is"
+		echo "      VOID for this round."
+	fi
 else
 	echo "   ⚠ $QMODEL is not here -- quality table SKIPPED"
 fi
@@ -159,6 +198,7 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 	done
 else
 	echo "   ⚠ no gemma4 in $MODELS or no charsiu_run -- sweep SKIPPED"
+	echo "     (charsiu pull gemma4-e2b-q4 puts it there; it is 2.7 GB)"
 fi
 echo
 
