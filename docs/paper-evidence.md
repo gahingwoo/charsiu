@@ -83,6 +83,25 @@ could do but would not do reliably. **The paper should say the margin is
 +5.7%/+15.6% from a median, and that this required pinning; it should not
 quote a best-of-N.**
 
+### 1c. The pinning default is safe across every architecture
+
+`a58086c` changes a default that touches every workload on every model, and
+what had been checked was one model's decode text. `board_text_all.sh` compares
+each model's BATCHED prompt against its own token loop, on the hardware:
+
+```
+  Phi-3.5-mini   Qwen2.5-1.5B   Qwen3-0.6B   SmolLM2-1.7B   SmolLM2-135M
+  gemma-3-1b     gemma-4-E2B    tinyllama-1.1b   Llama-3.2-1B
+
+  9 models compared, 0 differing -- every one "prompt batched, text identical"
+```
+
+🔑 **Every row says `prompt batched`, not `prompt a token`.** A model that
+refuses to batch would report "text identical" meaning only that the token loop
+agrees with itself; none did. This is the check that caught gemma4 emitting
+"31 32 1 2 3" on the card in 2026-08-30 after six architectures had passed on a
+desktop.
+
 ---
 
 ## 2. Quality against the vendor's own int4 — the empty cell, filled

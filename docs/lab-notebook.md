@@ -9594,3 +9594,20 @@ than all-int8 (26.07 against 17.98).
 fundamentally possible", not "is it reliable across the thousands of
 dispatches and dozens of shapes a real model makes". It de-risks the refactor;
 it does not stand in for verifying it.
+
+### 🏁 THE PINNING DEFAULT IS SAFE ACROSS ALL NINE MODELS
+
+`a58086c` changes a default that touches every workload on every architecture,
+and all that had been checked was Qwen3's decode text against
+`CHARSIU_AFFINITY=0`. `board_text_all.sh` on the board, each model's BATCHED
+prompt against its own token loop:
+
+```
+  9 models compared, 0 differing
+  Phi-3.5-mini, Qwen2.5-1.5B, Qwen3-0.6B, SmolLM2-1.7B, SmolLM2-135M,
+  gemma-3-1b, gemma-4-E2B, tinyllama-1.1b, Llama-3.2-1B
+```
+
+🔑 **Every row reads `prompt batched`, not `prompt a token`.** A refusal would
+have reported "text identical" meaning only that the token loop agrees with
+itself — the null result wearing the same words as the real one. None refused.
