@@ -9831,3 +9831,61 @@ depends on the overlap.
 
 ⚠ The first TTFT reading of every model is the high one (799, 1332, 3976,
 3225). Seven readings and a median absorb it; a single reading would not.
+
+### ⛔⛔ MIXED WIDTH DISPATCHES AND COMPUTES GARBAGE. REVERTED.
+
+`fae4f88` made `w4_for()` answer `t->packed` behind `CHARSIU_NPU_MIXED_WIDTH`
+and lifted the refusal. Every positive tell fired: the refusal stopped (1 with
+the switch off, 0 with it on), the diag line printed, the tensors staged. And
+the answer is garbage:
+
+```
+  without mixing   9 models compared, 0 differing
+  with mixing      9 models compared, 9 differing
+
+  <s> 1 2 3 ... 31 32!!!!!!!!
+  <|begin_of_text|>1 2 3 ... 31 32oooooooo
+```
+
+The prompt echoes correctly and then it emits filler, on all nine models. Nine
+of nine is systematic, not an edge. Reverted in `09c5b75`, refusal restored
+with the evidence in its comment.
+
+⚠ **Reverted rather than left switched off.** Default-off AND known-wrong is
+worse in a tree than a refusal, because the switch is an invitation.
+
+🏁 The threading (`d8cbb73`) stays. It is bit identical, the desk still reads
+34.2425, and it is what makes the next attempt one function instead of
+forty-eight edits. `npu_mixed_test` also stands: one open device alternates
+w8a8 and w4a16 correctly at K=256 N=64. The hardware can do this. What does not
+work is this way of asking.
+
+### 🔑🔑 AND THREE COMPARISONS COULD NOT RULE ON IT, ALL BROKEN THE SAME WAY
+
+Before the one that decided, I ran three text checks and every one of them put
+a FLOAT path against an INTEGER one:
+
+```
+  NPU mixed  vs  CPU reference      the control says these differ with
+                                    NOTHING mixed, so the arm proved nothing
+  int8-on-CPU vs int8-on-hardware   the same confound in another hat: the
+                                    switch moves those layers between float
+                                    and integer, so of course the text moves
+```
+
+Only NPU against NPU can decide, and **this tree already owned that comparison
+and says why on its own first page**: `board_text_all.sh` compares each model's
+batched prompt against its own TOKEN LOOP, both on the hardware, because the
+desk "could not have caught it" — with no NPU `matmul_rows` falls back to a
+matvec a row and the batched MATMUL never runs.
+
+⚠ I quoted that script earlier the same day, as the nine-architecture
+regression for the affinity default. Then I wrote a new comparison and reached
+for the reference it exists to avoid.
+
+**Second occurrence in one day of the same shape.** The other was three board
+rounds on the overlap fault whose answer is line 11 of `src/overlap.h`. Knowing
+the rule and owning the tool did not help, because neither got consulted at the
+moment a new check was being written. The question that would have caught both
+is "how does this tree already compare this?", asked before writing the
+comparison rather than after reading its result.
