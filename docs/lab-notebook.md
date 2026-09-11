@@ -9551,3 +9551,46 @@ to call a shape at that width. The chain end to end:
 
 Two clusters at the second step, none at the third. **gemma4's TTFT was the
 same lottery**, and the row is now quotable as a median without qualification.
+
+### 🏁 THE VENDOR LADDER, COMPLETE ON THE PINNED PROTOCOL
+
+`tests/vendor_quality.sh` over all three nested sets, `tests/corpus/long.txt`
+at `-n 300`, every arm from the Q8_0 source, no quantiser at inference:
+
+```
+  matrices                   ref     vendor   charsiu    q4_0    vendor  charsiu  ratio
+  43  (rho = 1)          17.8719   20.2531   19.0597  17.9111  +13.32%   +6.65%  2.00x
+  91  (layers 3..15)     17.8719   25.1141   21.1186  18.0910  +40.52%  +18.17%  2.23x
+  105 (all but layer 1)  17.8719   29.9056   22.9824       --  +67.33%  +28.60%  2.35x
+```
+
+**The vendor's four-bit excess is 2.0 to 2.4x charsiu's**, rising with the
+number of matrices, on three nested subsets.
+
+⚠ The unrecorded protocol gave 1.65 / 1.71 / 1.81 for the same three sets. Same
+shape, same monotone rise, consistently lower — which is what a different
+corpus and length do, and is why neither ladder is quotable without its
+protocol. **This one has one.**
+
+### 🏁 npu_mixed_test: ONE OPEN DEVICE RUNS BOTH PROGRAMS
+
+The longest-standing open item on the board, answered:
+
+```
+  one device, K=256 N=64, 8 alternations
+  controls, each program on its own      int8 0/64 wrong, int4 0/64 wrong
+  alternating on the same open device    16 arms, every one 0 of 64 wrong
+  0 of 18 dispatches wrong
+```
+
+So `CHARSIU_NPU_INT8_LAYERS` can reach the hardware, and the per-tensor width
+refactor in npudev.c is justified rather than speculative. The knob is worth
+having — on the host reference it takes Llama-3.2-1B from 41.53 to 26.07 for
+12.5% of the bytes — and the cheap way round it is already known to be
+dominated: opening a mixed model as int8 gives int8's bytes with a WORSE answer
+than all-int8 (26.07 against 17.98).
+
+⚠ **SCOPE.** K=256, N=64, eight alternations. This answers "is it
+fundamentally possible", not "is it reliable across the thousands of
+dispatches and dozens of shapes a real model makes". It de-risks the refactor;
+it does not stand in for verifying it.
