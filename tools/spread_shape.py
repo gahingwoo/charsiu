@@ -27,12 +27,30 @@ twenty readings cannot support one:
 
 THE RULE, fixed here:
 
-  two clusters   gap ratio >= 3 AND the gap sits between the 25th and 75th
-                 percentile of the readings AND |rho_index| < 0.5
-                 (a middle gap that is not just drift)
+  too tight      total spread < 5% of the median -- the shape question is
+                 not asked at all (see below)
+  two clusters   gap ratio >= 3 AND at least 2 readings on EACH side of the
+                 gap AND |rho_index| < 0.5
   drift          |rho_index| >= 0.5 or |rho_temp| >= 0.5
-  one tail       anything else -- and then the row is NOT quotable, which is
-                 a result and gets written down as one
+  no structure   anything else
+
+⚠⚠ AND QUOTABILITY IS A SEPARATE QUESTION FROM SHAPE. The first version said
+"no structure -> the row is NOT quotable", which is written for a 46% spread
+and is exactly backwards for a 1.6% one: a tight unimodal arm is the most
+quotable thing there is. Shape and spread are reported separately now, and the
+quotable line keys off the SPREAD.
+
+⚠⚠ AND A GAP RATIO IS SCALE-FREE, so on a very tight sample the readings'
+own last digit manufactures structure: the big-cluster arm spans 1.6% and its
+"largest gap" is 0.1 tok/s, which the ratio test happily called two clusters.
+Below a 5% spread the shape question is not asked -- at that width two
+clusters cannot be told from rounding, and saying so is the honest answer.
+
+⚠ The middle-gap test was also too strict. It required the split to sit
+between the quartiles, so 7 low and 2 high -- a gap ratio of 49 -- came back
+"at an END" because both quartiles were inside the low cluster. Two clusters
+of very different sizes are still two clusters; what a single outlier must not
+do is get called one, hence 2 readings a side.
 
 Usage:
     python3 -P tools/spread_shape.py FILE   # lines of "value [temp]"
@@ -105,7 +123,10 @@ def main():
     ratio = gmax / medgap if medgap > 0 else float("inf")
     split = (sv[gi] + sv[gi + 1]) / 2.0
     q25, q75 = pct(sv, 0.25), pct(sv, 0.75)
-    middle = q25 <= split <= q75
+    # ⚠ 2 A SIDE, NOT "between the quartiles": a lopsided split is still a
+    # split, and gi is the index of the gap in the sorted list, so the sides
+    # are gi+1 below and n-gi-1 above.
+    middle = (gi + 1) >= 2 and (n - gi - 1) >= 2
 
     rho_i = spearman(vals, list(range(n)))
     #
@@ -130,8 +151,10 @@ def main():
     print("  spread       %.1f%% of the median" % ((sv[-1] - sv[0]) / pct(sv, 0.5) * 100))
     print("  largest gap  %.1f at %.1f   (median gap %.1f)  ratio %.2f" %
           (gmax, split, medgap, ratio))
-    print("  gap sits     %s  (q25 %.1f, q75 %.1f)" %
-          ("IN THE MIDDLE" if middle else "at an END", q25, q75))
+    print("  gap splits   %d below / %d above  %s  (q25 %.1f, q75 %.1f)" %
+          (gi + 1, n - gi - 1,
+           "-- a real split" if middle else "-- ONE OUTLIER, not a split",
+           q25, q75))
     print("  rho index    %+.3f" % rho_i)
     print("  rho temp     %s" % ("%+.3f" % rho_t if rho_t is not None else "no temperatures"))
     print("  split gives  %d low / %d high, %d runs (independent would give %.1f)" %
@@ -147,9 +170,17 @@ def main():
         print("     readable from sorted data.")
         print()
 
-    drift = (not presorted) and (
+    spread = (sv[-1] - sv[0]) / pct(sv, 0.5) * 100
+    #
+    # ⚠⚠ THE WIDTH GATE. A ratio has no units, so a sample spanning 1.6% has
+    # a "largest gap" made of its own last digit. Do not ask the shape
+    # question of something too tight to hold an answer.
+    #
+    tight = spread < 5.0
+    drift = (not presorted) and (not tight) and (
         abs(rho_i) >= 0.5 or (rho_t is not None and abs(rho_t) >= 0.5))
-    two = ratio >= 3 and middle and (presorted or abs(rho_i) < 0.5)
+    two = (not tight) and ratio >= 3 and middle and (
+        presorted or abs(rho_i) < 0.5)
     if two:
         print("  VERDICT: TWO CLUSTERS. Something is switching, and that is a")
         print("  finding rather than a caveat. Next: what differs between the")
@@ -158,10 +189,29 @@ def main():
         print("  VERDICT: DRIFT. The readings track their own order or the")
         print("  temperature, so this is the round being run wrong, not a")
         print("  property of the model. Warm up first and alternate the arms.")
+    elif tight:
+        print("  VERDICT: TOO TIGHT TO HAVE A SHAPE -- %.1f%% spread. Two"
+              % spread)
+        print("  clusters cannot be told from rounding at this width, so the")
+        print("  question is not asked. This is the good case.")
     else:
-        print("  VERDICT: ONE TAIL, no structure. The row is NOT quotable and")
-        print("  the paper says so. A median with this range beside it is the")
-        print("  most that can honestly be reported.")
+        print("  VERDICT: NO STRUCTURE -- one population, not two, no trend.")
+    #
+    # ⚠⚠ SHAPE IS NOT QUOTABILITY. A tight unimodal arm is the most quotable
+    # thing there is; a 46% spread is not, whatever its shape.
+    #
+    print()
+    if spread < 5:
+        print("  QUOTABLE: yes -- %.1f%% spread. Quote the median." % spread)
+    elif spread < 15:
+        print("  QUOTABLE: with its range -- %.1f%% spread. Median AND range,"
+              % spread)
+        print("  never the median alone." % ())
+    else:
+        print("  QUOTABLE: NO -- %.1f%% spread. Report that it is unstable and"
+              % spread)
+        print("  what the modes are; a single figure from this is an artefact")
+        print("  of whichever statistic was chosen.")
     return 0
 
 

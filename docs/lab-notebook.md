@@ -9368,3 +9368,75 @@ against +5.8% and +16.1% on record, and +4.9% / +15.8% from the best of seven.
 **Three different ways of taking one number out of a bimodal sample all land on
 the high mode and all reproduce the published claim.** The median of seven puts
 both behind. Nothing about the code changed between them.
+
+### 🏁🏁🏁 THE SWITCH IS CORE PLACEMENT, AND THE FAST MODE IS REACHABLE ON PURPOSE
+
+Asked properly this time: `board_vendor.sh`'s invocation verbatim -- the
+protocol prompt, `-n 64 --ignore-eos -c 512 -t 4`, MAXN and COEF_ELEMS -- with
+affinity the only thing that moves. Four arms alternating, ten passes, the
+first discarded. Qwen3-0.6B, one boot, performance governor.
+
+The board's own topology: cpu0-3 are 0x410fd034 at 2016 MHz, cpu4-7 are
+0x411fd080 at 2208 MHz.
+
+```
+  default     20.92 20.59 20.53 26.35 20.95 20.41 25.91 20.67 26.37   TWO CLUSTERS  28.5%
+  all eight   20.65 20.11 20.94 20.55 26.31 20.42 20.39 20.54 26.40   TWO CLUSTERS  30.6%
+  big four    26.20 26.53 26.55 26.60 26.18 26.40 26.52 26.33 26.49   1.6%
+  little4     18.35 18.22 18.16 18.26 18.33 18.27 18.29 18.33 18.34   1.0%
+```
+
+**The control passed first: `default` reproduced the bimodality**, so the other
+arms can be read. And then three facts arrive together:
+
+1. **The high mode of `default` IS the big-four level.** 25.91 to 26.37 against
+   26.18 to 26.60. Not close -- the same population.
+2. **Pinning to the big four removes the bimodality entirely**, at the FAST
+   value, with a 1.6% spread.
+3. **`taskset -c 0-7` behaves exactly like no taskset at all.** So it is not
+   about which cores are permitted, it is about where the scheduler puts four
+   threads when it has eight cores and no instruction.
+
+🔑 **So the fast mode was never luck -- it is the case where all four threads
+happened to land on the four A72s, and it can be asked for.** The median of the
+default arm is 20.67; pinned it is 26.40. **+27.7%, and the number stops
+moving.**
+
+🔑 **And this is what rescues the vendor comparison, honestly.** Against their
+published 24.85, the pinned arm is **+6.2% with a 1.6% spread** -- a claim that
+survives being measured again, rather than one that depends on choosing the
+best of seven. The earlier +4.9% from best-of-N was the same underlying fact
+seen through a statistic that could not be defended; the fix is not a better
+statistic, it is telling the runtime where to run.
+
+⚠ little4 at 18.3 against big4 at 26.4 is 1.44x, not the 1.72x the previous
+probe reported -- because that probe had changed the prompt, `-n`, and two
+environment variables away from the scoreboard's shape. This is why an arm
+meant to explain an observation has to begin at that observation's
+configuration.
+
+▶ NEXT, and it is a code change rather than a measurement: charsiu should
+detect the fastest cluster and pin its workers there when they fit.
+
+### ⚠ The instrument needed two fixes before it could report this
+
+`tools/spread_shape.py` got the answer backwards twice, and both were my rule
+rather than the data.
+
+**"No structure" is not "not quotable".** The first rule ended `one tail ->
+the row is NOT quotable`, which was written for gemma4's 46% spread and is
+exactly inverted for a 1.6% one: a tight unimodal arm is the most quotable
+thing there is. Shape and spread are separate questions and are reported
+separately now.
+
+**A gap ratio is scale-free.** Relaxing the split test made `big4` -- 1.6%
+wide, largest gap 0.1 tok/s -- come back as TWO CLUSTERS, because the ratio
+test cheerfully found structure in the readings' own last digit. Below a 5%
+spread the shape question is not asked at all now: at that width two clusters
+cannot be distinguished from rounding, and saying so is the answer.
+
+**And the middle-gap test was too strict in the other direction**: seven low
+and two high, gap ratio 49, was called "at an END" because both quartiles sat
+inside the low cluster. Two clusters of very different sizes are still two
+clusters; what must not pass is a single outlier, so the rule is now two
+readings a side.
