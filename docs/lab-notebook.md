@@ -9629,3 +9629,38 @@ runs, rather than 32-38% on one at the ungrouped configuration nobody runs.
 
 ⚠ Qwen3's own optimum is 0.25, not the 0.20 used here, so 24.1% is the
 conservative reading of its row.
+
+### 🏁🏁 WHERE THE PROMPT'S TIME GOES: THE READ-BACK COSTS AS MUCH AS THE MATHS
+
+`tests/board_prefill_stages.sh`, one boot, `-n 1`, board_vendor's protocol
+prompt so the rows are the rows TTFT is measured over:
+
+```
+              ms/row   in the NPU entry     pack   fence    read   read/fence  read/total
+  Qwen3         5.66    3.90   (69%)        0.85    1.28    1.39     1.09x        25%
+  TinyLLAMA     7.79    6.12   (79%)        0.89    2.22    2.79     1.26x        36%
+  Phi3         25.10   20.45   (81%)        2.72    8.72    8.63     0.99x        34%
+  Gemma4       17.38   12.79   (74%)        2.17    4.59    5.16     1.12x        30%
+```
+
+1. ⛔ **Zero rows fell back on any model.** The silent fallback — a projection
+   the hardware refuses becoming a matvec a row at a time, which phase 9 found
+   eating a third of a prompt — is not happening here.
+2. ⛔ **Submit is 0.06 to 0.12 ms a row, 1 to 2%.** Per-call dispatch is not
+   the prefill story. That is twice today it has failed as an explanation: it
+   also ran backwards against the four models' gaps.
+3. 🔑 **read is 0.99 to 1.26x fence, and 25 to 36% of the prompt.** Reading
+   the results back costs what computing them costs.
+
+👉 The read volume is `m·n·ceil(K/KMAX)·4`, so it is the quantisation group
+that sets it — **prefill speed and answer quality are the same knob**, and the
+README's "what is left to win is the number of bytes read back" now has the
+measurement under it rather than an inference.
+
+⚠ It attributes OUR prompt, not the gap. `read/fence` does not track the gap
+across the four (Phi3 has the lowest ratio and nearly the largest gap), and
+there is no breakdown of the vendor's side at all.
+
+⚠ The `in its wrapper` figure — 24.21 ms a row on Qwen3 against 3.90 inside
+the entry — **includes staging**, 4135 ms of it, which is once per process and
+outside both the prompt total and TTFT. It is not prompt time.

@@ -110,11 +110,47 @@ remainder is NEGATIVE, so the hardware path and the wall clock are counting
 different calls -- the rate above is not a fact about the hardware"*. Do not
 quote them.
 
-👉 **So the paper should state the TTFT gap and say it is unattributed.** What
-is measured is that the prompt batches on all four (§1c) and that the saving
-from batching is the output head to 1.4% (§4). What is NOT measured is where
-the remaining 1.3-1.8x goes. A prefill-only instrumentation round would be the
-next piece of work, and it does not exist yet.
+### 1b-3. Where the prompt's time actually goes — measured
+
+`tests/board_prefill_stages.sh`, `-n 1` so the table is the prompt's, the
+protocol prompt so the rows are the rows the TTFT column is measured over:
+
+```
+              ms/row   in the NPU entry     pack   fence    read   read/fence  read/total
+  Qwen3         5.66    3.90   (69%)        0.85    1.28    1.39     1.09x        25%
+  TinyLLAMA     7.79    6.12   (79%)        0.89    2.22    2.79     1.26x        36%
+  Phi3         25.10   20.45   (81%)        2.72    8.72    8.63     0.99x        34%
+  Gemma4       17.38   12.79   (74%)        2.17    4.59    5.16     1.12x        30%
+```
+
+**Three results, and the first two close roads:**
+
+1. **Zero rows fell back to the CPU on any model.** The silent-fallback
+   explanation — a projection the hardware refuses becoming a matvec a row at
+   a time — is dead. The batched path is entirely on the hardware.
+2. **Submitting costs 0.06 to 0.12 ms a row, 1 to 2% of the prompt.** Per-call
+   dispatch is not the prefill story, which is the second independent way that
+   explanation has failed today.
+3. 🔑 **Reading the results back costs as much as computing them.** `read` is
+   0.99 to 1.26 times `fence` — the hardware's own MAC time — and is 25 to 36%
+   of the whole prompt on every model.
+
+👉 **The read-back is the largest single lever in prefill, and it is set by the
+quantisation group**: the read volume is `m·n·ceil(K/KMAX)·4`, so a finer group
+is paid for here. **Prefill speed and answer quality are traded through one
+parameter**, which is the tension a paper can state precisely.
+
+⚠ **This attributes charsiu's prompt time. It does not by itself explain the
+SIZE of the gap against the vendor**, because there is no equivalent breakdown
+of theirs — and `read/fence` does not track the gap across the four models
+(Phi3 has the lowest ratio and nearly the largest gap). What can be said is
+what charsiu spends the prompt on, and that the vendor dispatches at M=1 where
+charsiu batches, so the two are not paying the same costs in the same places.
+
+⚠ The `in its wrapper` figure the probe also prints (24.21 ms a row on Qwen3
+against 3.90 inside the entry) **includes staging** — 4135 ms of it on Qwen3 —
+which is a once-per-process cost and is excluded from the prompt total and
+from TTFT. Do not read it as prompt time.
 
 ### 1c. The pinning default is safe across every architecture
 
@@ -333,9 +369,10 @@ ends — and refuses to be read as one round if the boot id moved.
 - **The 112-matrix vendor rebuild (58.76).** It measures the reconstruction.
 - **Cross-machine quality comparisons made before 2026-09-11.** They compared
   two different files.
-- **Any attribution of the TTFT gap.** §1b-2: the per-call explanation runs
-  backwards against the data, and the counters that might attribute it cover
-  the whole process rather than the prompt.
+- **The SIZE of the TTFT gap against the vendor.** §1b-3 attributes charsiu's
+  own prompt time (69-81% inside the NPU entry, of which the read-back is
+  25-36% of the whole and matches the fence). There is no equivalent
+  breakdown of theirs, and read/fence does not track the gap across models.
 - **`CHARSIU_NPU_INT8_LAYERS` on hardware.** `npu_mixed_test` shows one open
   device alternates w8a8 and w4a16 correctly (0 of 18 dispatches wrong over
   eight alternations both ways) at K=256 N=64, which says the per-tensor width
