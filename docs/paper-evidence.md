@@ -354,7 +354,7 @@ So a reader on a 750 mV device tree, where `overlap_safe()` refuses, gets the
 decode numbers in section 1 unchanged and a TTFT 11 to 30% worse. The decode
 margin over the vendor does not depend on the overlap.
 
-⚠ The four serial figures this project quoted before today (24.28, 20.34, 6.82,
+The four serial figures this project quoted before today (24.28, 20.34, 6.82,
 8.68 tok/s) are all BELOW the serial decode measured here, and they are from
 2026-09-04 at a different governor and before the calling thread was pinned.
 They measure the cost of not pinning, which section 1b measures directly at
