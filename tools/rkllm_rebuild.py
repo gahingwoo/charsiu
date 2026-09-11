@@ -208,7 +208,23 @@ def main():
     nn = [0]
     for t in r.tensors:
         name = t.name
-        if int(t.tensor_type) == 8:
+        #
+        # ⚠⚠ 8 IS Q8_0'S TYPE ID AND THIS USED TO BE THE WHOLE TEST. Handed an
+        # f16 reference every tensor fell through to a plain copy and the run
+        # reported "0 matrices replaced" -- a complete, plausible, empty
+        # result. The reference became an environment variable so that the
+        # comparison could be rebuilt from the ORIGINAL weights, which is
+        # exactly the file this gate refused.
+        #
+        # 1 is F16, 0 is F32. What the gate means is "a 2-D weight tensor
+        # this script might replace", so it says that instead.
+        #
+        # ⚠ THE RANK IS PART OF IT. Widening the type alone let the 1-D norms
+        # through, which are F32 in an f16 file and were never Q8_0, and the
+        # shape assertion below indexes shp[1]. The norms have their own
+        # branches further down and must reach them.
+        #
+        if int(t.tensor_type) in (0, 1, 8) and len(t.shape) >= 2:
             if which == "rho1" and name in WOFF:
                 #
                 # ONLY the tensors whose scale still satisfies (max-min)/15, and

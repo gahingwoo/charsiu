@@ -9947,3 +9947,56 @@ tree's own rule is that one passage of 300 tokens cannot order anything closer
 than about 10%.** `charsiu_ppl` is deterministic, so the numbers reproduce; what
 does not reproduce is the ORDER. The only figure here that survived a second
 passage is the main ratio, which is the one that was already being reported.
+
+### 🏁 THE bf16 CONTROL: the precondition holds, and the interval is wider than it looked
+
+The vendor quantised the ORIGINAL weights. charsiu's arm quantised whatever
+`RC.REF` pointed at, which was Q8_0, so the two sides started from different
+things and "asked to quantise the same thing" was not defensible. `REF` is
+`CHARSIU_RKLLM_REF` now, and the same 43 matrices were rebuilt from
+`Llama-3.2-1B-Instruct-f16.gguf` (md5 `3ba43423d342673e26016ffe85268937`).
+
+```
+                        charsiu     vendor      ratio
+  from Q8_0   long        +6.65%    +13.32%     2.00x
+              long2       +4.39%     +9.50%     2.16x
+  from f16    long        +7.45%    +13.81%     1.85x
+              long2       +3.92%    +10.26%     2.62x
+```
+
+**The asymmetry is real and it does not point one way.** From f16 charsiu is
+worse on `long` and better on `long2`; the vendor is slightly worse on both.
+There is no systematic flattering, which is what the caveat feared.
+
+🔑 **Report the f16 row, and report an interval.** 1.85x to 2.62x across two
+passages, because that is the arm whose precondition actually holds: both sides
+quantising the same original weights. The Q8_0 interval is narrower, 2.00 to
+2.16, and narrower for no good reason -- part of what makes it narrow is the
+two sides starting from different places and the difference happening to
+cancel.
+
+### ⚠⚠ AND THE REFERENCE SWAP FOUND TWO GATES THAT SAID "Q8_0" WITHOUT SAYING IT
+
+```
+  deq()                    reshape(-1, 34) -- q8_0's block, 2-byte scale + 32 int8
+  if tensor_type == 8      8 is q8_0's type id
+```
+
+`deq` raised on an f16 tensor, which is the GOOD failure: loud, immediate,
+unmistakable.
+
+⛔ **The type gate is the other kind.** Handed an f16 file every tensor fell
+past it to a plain copy, and the run printed **"chr43: 0 matrices and 0 norms
+replaced"** and wrote a complete file. A charsiu arm identical to the
+reference, scored, would have read as charsiu losing nothing at all. The only
+thing between that and a published number was reading the count.
+
+⚠ And widening the gate to `(0, 1, 8)` immediately let the 1-D norms through --
+F32 in an f16 file, never q8_0 -- into a shape assertion that indexes `shp[1]`.
+The rank is part of the gate now. **Fixing one fault uncovering the next is the
+third time today.**
+
+🔑 The lesson that generalises: a constant like `34` or `8` is a format
+assumption with no name, and it only becomes visible when the format changes.
+`deq`'s crashed; the gate's returned an empty result that looked like a
+measurement.
