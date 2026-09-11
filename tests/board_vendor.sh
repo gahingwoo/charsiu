@@ -60,8 +60,17 @@ if [ -n "${CHARSIU_VENDOR_PRICE_SERIAL:-}" ]; then
 	echo
 fi
 
+#
+# ⚠⚠ RESOLVE PER FILE, NOT PER DIRECTORY. This picked $HOME/.charsiu/models
+# whenever that directory merely EXISTED, and on a board where `charsiu pull`
+# had put gemma4 there while the installer had put the other three in
+# /opt/charsiu/models, the table came back saying "charsiu pull" for models
+# that were on the card. The loop below already walks a list; the list just
+# has to contain both.
+#
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
-[ -d "$MODELS" ] || MODELS=/opt/charsiu/models
+ALTMODELS=/opt/charsiu/models
+[ -d "$MODELS" ] || MODELS=$ALTMODELS
 
 # ⚠ CHARSIU_RUN_BIN, so the shell around the table can be exercised without a
 # board. The repeat loop below went in untested because a missing model takes a
@@ -146,7 +155,7 @@ printf '%-16s %10s %10s   %10s %10s   %8s %8s\n' \
 
 rows | while IFS='|' read -r name file vt vttft vmb label; do
 	M=""
-	for d in "$MODELS" "$DIR"; do
+	for d in "$MODELS" "$ALTMODELS" "$DIR"; do
 		[ -f "$d/$file" ] && { M="$d/$file"; break; }
 	done
 	if [ -z "$M" ]; then

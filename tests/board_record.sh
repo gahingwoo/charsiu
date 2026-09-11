@@ -42,8 +42,27 @@ mkdir -p "$(dirname "$OUT")"
 # row. A quality number without its file is a 20% error with nothing on the
 # page to show it.
 #
-MODELS=${CHARSIU_RECORD_MODELS:-/opt/charsiu/models}
-QMODEL=${CHARSIU_RECORD_QMODEL:-$MODELS/Llama-3.2-1B-Instruct-Q4_0.gguf}
+#
+# ⚠⚠ MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
+# `charsiu pull` puts them in $HOME/.charsiu/models; the installer puts them in
+# /opt/charsiu/models. On this board gemma4 is in the first and the other three
+# are in the second, so a script that resolves a DIRECTORY and then looks
+# inside it reports "no gemma4" while gemma4 is sitting on the card -- which
+# cost two rounds on 2026-09-11, once as a skipped sweep and once as a missing
+# row in the speed table.
+#
+# Resolve per FILE, over every directory.
+#
+MODELDIRS=${CHARSIU_RECORD_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models"}
+find_model() {
+	for _d in $MODELDIRS; do
+		for _f in "$_d"/$1; do
+			[ -f "$_f" ] && { echo "$_f"; return 0; }
+		done
+	done
+	return 1
+}
+QMODEL=${CHARSIU_RECORD_QMODEL:-$(find_model 'Llama-3.2-1B-Instruct-Q4_0.gguf' || true)}
 
 env_block() {
 	echo "== environment, $1"
@@ -81,7 +100,7 @@ echo "================================================================"
 echo " charsiu round of record   $(date -Is)"
 echo "================================================================"
 echo " charsiu   $(cd "$D/.." 2>/dev/null && git log --oneline -1 2>/dev/null || echo 'not a git tree here')"
-echo " quality model file:  $QMODEL"
+echo " quality model file:  ${QMODEL:-NOT FOUND}"
 echo " corpus:              $CORPUS  ($(md5sum "$CORPUS" 2>/dev/null | cut -c1-32))"
 echo " speed REPEAT:        $REPEAT      gemma4 sweep N: $NSWEEP"
 [ "$REPEAT" -ge 7 ] || echo " ⚠⚠ REPEAT WAS CUT -- this is a dry run, not a round of record"
@@ -169,7 +188,8 @@ if [ -f "$QMODEL" ]; then
 		echo "      VOID for this round."
 	fi
 else
-	echo "   ⚠ $QMODEL is not here -- quality table SKIPPED"
+	echo "   ⚠ no Llama-3.2-1B-Instruct-Q4_0.gguf under [$MODELDIRS]"
+	echo "     -- quality table SKIPPED"
 fi
 echo
 
@@ -182,7 +202,7 @@ echo
 #    so thermal drift can be told from whatever else.
 #
 echo "== 3. gemma4 TTFT, $NSWEEP readings, timestamped with temperature"
-GM=$(ls "$MODELS"/gemma-4*Q4_0.gguf 2>/dev/null | head -1 || true)
+GM=$(find_model 'gemma-4*Q4_0.gguf' || true)
 if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 	i=0
 	while [ $i -lt "$NSWEEP" ]; do
@@ -197,8 +217,8 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 			"$i" "$(date +%H:%M:%S)" "${MS:-FAIL}" "$T"
 	done
 else
-	echo "   ⚠ no gemma4 in $MODELS or no charsiu_run -- sweep SKIPPED"
-	echo "     (charsiu pull gemma4-e2b-q4 puts it there; it is 2.7 GB)"
+	echo "   ⚠ no gemma4 under [$MODELDIRS] or no charsiu_run -- sweep SKIPPED"
+	echo "     (charsiu pull gemma4-e2b-q4 puts it in ~/.charsiu/models)"
 fi
 echo
 
