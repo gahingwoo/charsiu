@@ -486,6 +486,17 @@ struct charsiu_npu {
 	unsigned bmap_m;
 	unsigned bmap_n4;	/* the table is one entry per FOUR channels */
 	/*
+	 * ⚠⚠ THE WIDTH IS PART OF THE KEY. charsiu_acc_index takes the width,
+	 * so this table is only valid for the width it was built at. While
+	 * every tensor on a device shared one width that could not go wrong;
+	 * once the width is a property of the TENSOR, a cache keyed on m alone
+	 * hands an int8 tensor the map built for an int4 one, and a wrong
+	 * accumulator index is read back without complaint and comes out as
+	 * text. Added with the threading rather than after it, because this is
+	 * the failure the refactor would otherwise ship.
+	 */
+	unsigned bmap_w4;
+	/*
 	 * Whether rows 4h..4h+3 of every channel quad sit at index, +4, +8,
 	 * +12 in this table -- one 64-byte line -- which is what lets the read
 	 * back take four rows off one line (read_rows4). Checked on the table
@@ -2503,9 +2514,9 @@ static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni
 }
 
 /* the weight megabytes a slice costs the device it lands on, at its own width */
-static double slice_mb(const struct charsiu_npu *g, unsigned k, unsigned n)
+static double slice_mb(int w4, unsigned k, unsigned n)
 {
-	return (double)k * (double)n / (g->w4 ? 2.0 : 1.0) / 1e6;
+	return (double)k * (double)n / (w4 ? 2.0 : 1.0) / 1e6;
 }
 
 /*
@@ -2535,7 +2546,7 @@ static double slice_mb(const struct charsiu_npu *g, unsigned k, unsigned n)
 #define DEAL_US_MB    110.0
 
 static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
-			  unsigned ki, unsigned ni, unsigned ns,
+			  int w4, unsigned ki, unsigned ni, unsigned ns,
 			  unsigned k, unsigned n)
 {
 	unsigned d;
@@ -2545,7 +2556,7 @@ static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
 	if (g->deal_index)
 		return (ki * ns + ni) & 1;
 	d = load[0] <= load[1] ? 0 : 1;
-	load[d] += DEAL_US_TASK + DEAL_US_MB * slice_mb(g, k, n);
+	load[d] += DEAL_US_TASK + DEAL_US_MB * slice_mb(w4, k, n);
 	return d;
 }
 
@@ -2905,7 +2916,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 			unsigned kw = slice_k(g, t->k, ks, ki);
 
 			for (unsigned ni = 0; ni < ns; ni++)
-				nslot[deal_pick(g, probe, ki, ni, ns, kw,
+				nslot[deal_pick(g, probe, w4_for(g, t), ki, ni, ns, kw,
 						slice_n(g, e_n_npu, ni))]++;
 		}
 	}
@@ -2972,7 +2983,8 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
 			unsigned n0 = ni * g->nmax;
 			unsigned n = slice_n(g, e_n_npu, ni);
-			unsigned d = deal_pick(g, g->deal_load, ki, ni, ns,
+			unsigned d = deal_pick(g, g->deal_load, w4_for(g, t),
+					       ki, ni, ns,
 					       k, n);
 
 			if (add_slice(g, d, t, n0, n, k0, k, ki, sid[d]++,
@@ -3170,7 +3182,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
-		if (g->w4) {
+		if (w4_for(g, e->t)) {
 			const float *src = a->f + s->k0;
 			const float *ks = e->t->kscale;
 
@@ -3341,9 +3353,9 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		 * y[i] = accf[i] and nothing else: a staging buffer read and
 		 * written for no reason.
 		 */
-		af = (g->w4 && grp && !g->plain) ? y : g->accf;
+		af = (w4_for(g, e->t) && grp && !g->plain) ? y : g->accf;
 		/* ⚠ the hardware's rows only: the CPU's are already written */
-		if (g->w4)
+		if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
@@ -3353,7 +3365,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 					      s->out_slot * g->out_stride;
 
 			/* int4 writes float32, int8 the raw int32 accumulator */
-			if (g->w4) {
+			if (w4_for(g, e->t)) {
 				const float *fo = (const float *)base;
 
 				if (grp) {
@@ -3468,7 +3480,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		int grp = tensor_grouped(g, e->t);
 		double hs = 0.0;
 
-		if (g->w4 && grp && !g->plain) {
+		if (w4_for(g, e->t) && grp && !g->plain) {
 			g->call_us += now_us() - tcall;
 			charsiu_note("something outside the NPU code", 0, 0);
 	return 0;              /* it was summed into y */
@@ -3477,7 +3489,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			for (unsigned ki = 0; ki < e->k_slices; ki++)
 				hs += 0.5 * g->asum[ki];
 		for (i = 0; i < (unsigned)e->t->n; i++)
-			y[i] = g->w4
+			y[i] = w4_for(g, e->t)
 			     ? (grp ? g->accf[i]
 				    : (float)(((double)g->accf[i] + hs)
 					      * e->t->scale[i]))
@@ -5179,7 +5191,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * on this board -- so it is an experiment with a switch, not a default.
 	 * llama_batch_probe checks every row before it times anything.
 	 */
-	if (g->w4) {
+	if (w4_for(g, e->t)) {
 		const char *why = w4_batch_why_not(m);
 
 		if (why) {
@@ -5348,7 +5360,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * input surface again, in (8192, 8960]. The same hatch lifts it
 		 * for the probe that walks it.
 		 */
-		if (!charsiu_m_axis_wide_for(g->w4)) {
+		if (!charsiu_m_axis_wide_for(w4_for(g, e->t))) {
 			if (!charsiu_env_flag("CHARSIU_NPU_ANY_SURFACE", 0) &&
 			    (size_t)(kw / 32) * m > 8192) {
 				whine(g, "the input surface on the height axis is "
@@ -5682,7 +5694,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * through, so the factor goes on as the columns are
 			 * copied rather than in a pass of its own.
 			 */
-			if (!g->w4 || sk != e->t->k || pack_gather() || ks) {
+			if (!w4_for(g, e->t) || sk != e->t->k || pack_gather() || ks) {
 				double tg = now_us();
 
 				for (unsigned r = 0; r < m; r++) {
@@ -5701,7 +5713,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				g->bgather_us += now_us() - tg;
 			}
 			double tpc = now_us();
-			if (!g->w4) {
+			if (!w4_for(g, e->t)) {
 				/*
 				 * int8's scale is per row and taken over THIS K
 				 * slice's own range, so it is kept per K slice
@@ -5946,7 +5958,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			 * dominant cost of a batched projection now that the
 			 * hardware part is right.
 			 */
-			if (g->bmap_m != m) {
+			if (g->bmap_m != m ||
+			    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
 				unsigned n4 = (g->nmax + 3) / 4;
 				uint32_t *t2 = realloc(g->bmap,
 					(size_t)m * n4 * sizeof(*t2));
@@ -5962,8 +5975,9 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 					for (unsigned j = 0; j < n4; j++)
 						g->bmap[(size_t)r * n4 + j] =
 						  (uint32_t)charsiu_acc_index(r, j * 4, m,
-							g->w4 && charsiu_m_axis_wide_for(1));
+							w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
 				g->bmap_m = m;
+				g->bmap_w4 = (unsigned)w4_for(g, e->t);
 				/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
 				g->bmap2 = m % 2 == 0;
 				for (unsigned r = 0; g->bmap2 && r < m; r += 2)
@@ -6155,7 +6169,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	/* an ungrouped tensor is scaled once, per channel, at the end; int8
 	 * always is, because its d1 went in above */
-	if (!g->w4 || !tensor_grouped(g, e->t)) {
+	if (!w4_for(g, e->t) || !tensor_grouped(g, e->t)) {
 		struct tail_scale_job tj = { Y, e->t->scale,
 					     (unsigned)e->t->n };
 		double ts = now_us();
@@ -6332,7 +6346,7 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 	cc = c - s->n0;
 	idx = g->bmap[(size_t)r * g->bmap_n4 + cc / 4] + cc % 4;
 	*raw = ((const uint32_t *)base)[idx];
-	if (g->w4) {
+	if (w4_for(g, e->t)) {
 		float v = ((const float *)base)[idx];
 		int grp = tensor_grouped(g, e->t);
 
@@ -6485,7 +6499,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
 
-		if (g->w4) {
+		if (w4_for(g, e0->t)) {
 			const float *src = a->f + s->k0;
 
 			/*
@@ -6642,7 +6656,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		const int32_t *out;
 
 		int grp = tensor_grouped(g, e->t);
-		float *af = (g->w4 && grp && !g->plain) ? ys[i] : g->accf;
+		float *af = (w4_for(g, e->t) && grp && !g->plain) ? ys[i] : g->accf;
 
 		/*
 		 * ONE OF THESE, NOT BOTH. int4 sums into accf and int8 into
@@ -6658,7 +6672,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		/* ⚠ the hardware's rows only: the CPU's are already written */
 		charsiu_note("a group: clearing the accumulator",
 			     (unsigned long)e->t->n, (unsigned long)e->n_npu);
-		if (g->w4)
+		if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
@@ -6714,7 +6728,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				return -1;
 			}
 
-			if (g->w4) {
+			if (w4_for(g, e->t)) {
 				const float *fo = (const float *)base;
 
 				if (grp) {
@@ -6775,7 +6789,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			 * having no control.
 			 */
 			for (unsigned q = 0; q < (unsigned)e->t->n; q++)
-				ys[i][q] = g->w4
+				ys[i][q] = w4_for(g, e->t)
 					 ? (grp ? g->accf[q]
 					        : (float)(((double)g->accf[q]
 						   + hsu) * e->t->scale[q]))
