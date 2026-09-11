@@ -65,6 +65,42 @@ RK = "/home/parallels/Documents/kiln/model/Llama-3.2-1B-Instruct-rk3576-w4a16.rk
 REF = os.environ.get(
         "CHARSIU_RKLLM_REF",
         "/home/parallels/Desktop/charsiu/models/Llama-3.2-1B-Instruct-Q8_0.gguf")
+
+
+def ref_tag(path=None):
+    """Eight hex of the reference's md5 -- the ORIGIN, as part of a filename.
+
+    ⛔ A REBUILT ARM IS CACHED UNDER ITS ARM NAME, AND THE ARM NAME DOES NOT
+    SAY WHAT IT WAS BUILT FROM. `Llama-3.2-1B-ref-F16.gguf` from the Q8_0
+    source and the same name from the f16 source are the same path, so the
+    second round silently scores the first round's file and every percentage
+    in the ladder shifts. That is exactly what was sitting in models/ on
+    2026-09-11: two arms two days older than the control that would replace.
+
+    The md5 is the only identity this tree accepts for a model file, so it is
+    the key. It takes about six seconds over 2.5 GB, cached in a sidecar
+    keyed on (size, mtime_ns) because the rebuild and the harness both ask.
+    """
+    import hashlib
+    path = path or REF
+    st = os.stat(path)
+    stamp = f"{st.st_size} {st.st_mtime_ns}"
+    side = path + ".md5"
+    try:
+        c = open(side).read().split()
+        if len(c) == 3 and f"{c[1]} {c[2]}" == stamp:
+            return c[0][:8]
+    except OSError:
+        pass
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    try:
+        open(side, "w").write(f"{h.hexdigest()} {stamp}\n")
+    except OSError:
+        pass
+    return h.hexdigest()[:8]
 LO = int(508.0 * 2**20)
 INT4 = 0x20DDA9C4
 mm = np.memmap(RK, dtype=np.uint8, mode="r")

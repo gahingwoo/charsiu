@@ -62,6 +62,9 @@ directory from sys.path.
 
 Environment:
     CHARSIU_REBUILD_OUT    where to write        (default charsiu/models)
+    CHARSIU_RKLLM_REF      the reference to quantise and to carry everything
+                           BUT the swapped matrices; its md5 goes in the
+                           output filename, see outpath()
     CHARSIU_GGUF_PY        gguf-py checkout      (default llama.cpp-ref/gguf-py)
 """
 import sys, os
@@ -78,6 +81,32 @@ sys.path.insert(0, _HERE)
 import rkllm_codes as RC                                          # noqa: E402
 
 OUT = os.environ.get("CHARSIU_REBUILD_OUT", os.path.join(_ROOT, "models"))
+
+
+def outpath(which):
+    """⛔ THE ORIGIN IS IN THE FILENAME BECAUSE IT IS PART OF THE ANSWER.
+
+    An arm rebuilt from Q8_0 and the same arm rebuilt from the f16 original
+    are different files that answer differently, and the arm name alone does
+    not distinguish them. Anything that skips a rebuild when the path already
+    exists -- tests/vendor_quality.sh does -- then scores the older origin
+    under the newer origin's heading. See rkllm_codes.ref_tag.
+    """
+    return f"{OUT}/Llama-3.2-1B-{which}-{RC.ref_tag()}-F16.gguf"
+
+
+def _partpath(which):
+    """⛔ A HALF-WRITTEN FILE MUST NOT WEAR THE FINISHED NAME.
+
+    tests/vendor_quality.sh skips the rebuild when the path exists, and
+    `exists` is not `complete`: a build killed mid-write on 2026-09-11 left
+    1046478848 bytes of a 2.48 GB arm under the final name, and the next round
+    accepted it and tried to score it. It failed loudly that time. A truncated
+    gguf that still loads would have been scored instead.
+
+    So the writer writes here and os.replace()s into place only after close.
+    """
+    return outpath(which) + ".part"
 S, f32, deq, codes, solve = RC.S, RC.f32, RC.deq, RC.codes, RC.solve
 
 
@@ -185,7 +214,7 @@ def main():
     RAW = which == "rho1"      # rho1: only the untransformed 43, no c at all
     rng = np.random.default_rng(1)
     arch = r.fields["general.architecture"].parts[-1].tobytes().decode()
-    w = GGUFWriter(f"{OUT}/Llama-3.2-1B-{which}-F16.gguf", arch)
+    w = GGUFWriter(_partpath(which), arch)
     for key, fld in r.fields.items():
         if key == "GGUF.version" or key.startswith("GGUF."):
             continue
@@ -532,7 +561,8 @@ def main():
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    p = f"{OUT}/Llama-3.2-1B-{which}-F16.gguf"
+    os.replace(_partpath(which), outpath(which))
+    p = outpath(which)
     print(f"  wrote {p}  {os.path.getsize(p)/2**20:.0f} MB")
     return 0
 
