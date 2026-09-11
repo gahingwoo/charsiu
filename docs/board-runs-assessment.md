@@ -1,234 +1,277 @@
-# 对《Board runs that would make the evidence hold》的核对 + 板子轮次结果
+# Review of "Board runs that would make the evidence hold", with the results
 
-2026-09-11。桌面核对 + 当天四轮板子（ROCK 4D，performance governor）。
-charsiu `dev bae7694`，全部已推。
+2026-09-11. A desk review of the checklist, plus the board rounds it asked for,
+on one ROCK 4D at the `performance` governor. charsiu `dev 4057a39`, all
+pushed.
 
 ---
 
-# ⛔→🏁 R1：领先是统计量造出来的 —— **然后被真的修好了**
+# R1: the margin was made by a statistic, and then it was really fixed
 
-## 第一步：那个领先不存在
+## Step one: the margin did not exist
 
-板子上第一次**打印每一次读数**而不是只报最好的那次：
+The first board round that printed every reading instead of only the best:
 
 ```
-  model         decode 读数（时间顺序）                          best    median   厂商
+  model         decode readings (time order)                    best    median   theirs
   Qwen3      20.76 24.25 20.61 20.27 26.06 20.81 20.54          26.06   20.76   24.85
   TinyLLAMA  19.11 19.41 22.83 21.94 19.24 19.15 20.08          22.83   19.41   19.71
   Phi3        7.04  5.96  5.98  5.96  5.96  5.96  7.04           7.04    5.96    6.58
   Gemma4      7.25  7.34  7.28  9.33  7.28  7.32  7.28           9.33    7.28    9.23
 ```
 
-四个模型**全是 5 低 / 2 高**。Phi3 最干净 —— `5.96` 五次、`7.04` 两次，
-**精确重复的两个值**，中位间隔 0.0。
+All four models split 5 low and 2 high. Phi3 is the cleanest: `5.96` five times
+and `7.04` twice, the same two values exactly, with a median gap of 0.0.
 
 ```
-  best of 7    Qwen3 +4.9%    TinyLLAMA +15.8%
-  单次读数     Qwen3 +6.0%    TinyLLAMA +15.1%
-  论文在案     Qwen3 +5.8%    TinyLLAMA +16.1%
+  best of 7       Qwen3 +4.9%    TinyLLAMA +15.8%
+  single reading  Qwen3 +6.0%    TinyLLAMA +15.1%
+  on record       Qwen3 +5.8%    TinyLLAMA +16.1%
   ------------------------------------------------
-  median of 7  Qwen3 −16.5%   TinyLLAMA  −1.5%
+  median of 7     Qwen3 -16.5%   TinyLLAMA  -1.5%
 ```
 
-**三种「从双峰样本里取一个数」的方式全落在高模式，全复现论文的数字。**
+Three different ways of taking one number out of a bimodal sample all land on
+the high mode, and all reproduce the published figures.
 
-## 第二步：切换的是**核放置**
+## Step two: what switches is core placement
 
-`board_bimodal.sh`，逐字照搬 `board_vendor.sh` 的调用（`-n 64 -t 4` +
-`MAXN`/`COEF_ELEMS` + 协议 prompt），只动 affinity，四臂交替，丢弃冷的第一遍。
-⚠ 第一版探针改了 prompt、`-n` 和两个 env —— **一次动三样**，测出来的档位对不上。
-**要解释一个观察，就得从那个观察的配置出发。**
+`board_bimodal.sh` runs `board_vendor.sh`'s invocation verbatim (`-n 64 -t 4`
+plus `MAXN` and `COEF_ELEMS` and the protocol prompt), moves affinity only,
+alternates four arms, and discards the cold first pass.
 
-```
-  default     20.92 20.59 20.53 26.35 20.95 20.41 25.91 20.67 26.37   两簇  28.5%
-  all eight   20.65 20.11 20.94 20.55 26.31 20.42 20.39 20.54 26.40   两簇  30.6%
-  big four    26.20 26.53 26.55 26.60 26.18 26.40 26.52 26.33 26.49        1.6%
-  little4     18.35 18.22 18.16 18.26 18.33 18.27 18.29 18.33 18.34        1.0%
-```
-
-控制臂先过了（`default` 复现了双峰），然后三件事一起到：
-
-1. **`default` 的高模式就是 big4 的水平** —— 同一个总体，不是接近
-2. **钉到大核直接消灭双峰，停在快的那个值**
-3. **`taskset -c 0-7` 和完全不 taskset 一模一样** —— 不是「允许哪些核」的问题，
-   是**调度器在有八个核、没有指示时把四个线程放到哪**
-
-## 第三步：改代码，板子上验过
-
-`a58086c`：**默认把调用线程钉到最快的簇**。簇从 `cpuinfo_max_freq` 读出来，
-**与继承掩码取交集**，同构机器或没有 cpufreq 就什么都不做。
+The first version of that probe changed the prompt, the `-n`, and two
+environment variables, three things at once, and the levels it reported did not
+match the observation. An arm meant to explain an observation has to start from
+that observation's configuration.
 
 ```
-                    修复前                            修复后
-  default    20.92 20.59 20.53 26.35 … 26.37   |  26.07 26.39 25.89 26.46 25.86 26.32 26.25
-  all eight  20.65 20.11 20.94 20.55 … 26.40   |  26.62 25.62 26.36 26.24 26.10 26.49 26.35
-  big four   26.20 26.53 26.55 26.60 … 26.49   |  26.16 26.06 26.48 26.67 26.49 26.43 26.51
-  little4    18.35 18.22 18.16 18.26 … 18.34   |  18.26 18.32 18.31 18.18 18.30 18.32 18.26
-
-  default 中位数   20.92 → 26.25    +25.5%
-  跨度             28.5% →  2.3%
-  对厂商 24.85    −15.8% → +5.6%
+  default     20.92 20.59 20.53 26.35 20.95 20.41 25.91 20.67 26.37   two clusters  28.5%
+  all eight   20.65 20.11 20.94 20.55 26.31 20.42 20.39 20.54 26.40   two clusters  30.6%
+  big four    26.20 26.53 26.55 26.60 26.18 26.40 26.52 26.33 26.49                  1.6%
+  little4     18.35 18.22 18.16 18.26 18.33 18.27 18.29 18.33 18.34                  1.0%
 ```
 
-三个检查都过：tell 响了（`this thread on the fastest cluster, 4 CPUs`）、
-**文本一致**、臂的形状符合预先写死的预期。
+The control passed first, in that `default` reproduced the bimodality, and then
+three facts arrived together. The high mode of `default` is the big-four level,
+the same population rather than a near one. Pinning to the big four removes the
+bimodality at the fast value. And `taskset -c 0-7` behaves exactly like no
+taskset, so the question is not which cores are permitted but where the
+scheduler puts four threads given eight and no instruction.
 
-🔑 **`little4` 纹丝不动停在 18.3，那是交集在起作用。** `taskset -c 0-3`
-把进程限在慢簇，charsiu 在**继承掩码之内**找最快的簇，发现四个一样快，
-**拒绝动作**。已经回答过这个问题的操作员不会被运行时推翻。
+## Step three: the code change, verified on the board
 
-## 第四步：四个模型用新二进制重测 —— **而且论文的数字是对的**
-
-一次开机，median of 7，每次读数都打印。质量表逐位复现上一轮
-（34.2425 / 23.6746 / 18.3604）—— 免费的回归检查：pin 只改调度不改算术。
-
-```
-             旧median  旧best   新median   跨度     提升    对厂商
-  Qwen3        20.76   26.06     26.26    1.9%   +26.5%   +5.7%
-  TinyLLAMA    19.41   22.83     22.79    1.2%   +17.4%  +15.6%
-  Phi3          5.96    7.04      7.03    0.1%   +18.0%   +6.8%
-  Gemma4        7.28    9.33      9.25    1.7%   +27.1%   +0.2%
-```
-
-**四个全部在中位数上领先**，跨度 0.1–1.9%。
-Phi3 七个读数是 `7.03 7.04 7.03 7.03 7.04 7.04 7.03` —— 千分之一。
-
-### 🔑🔑 新的中位数**就是**旧的 best-of-7，差不到 1%
+`a58086c` pins the calling thread to the fastest cluster by default. The cluster
+is read from `cpuinfo_max_freq`, intersected with the inherited mask, and a
+homogeneous machine or a kernel without cpufreq gets nothing done to it.
 
 ```
-  Qwen3     26.06 → 26.26   +0.8%
-  TinyLLAMA 22.83 → 22.79   −0.2%
-  Phi3       7.04 →  7.03   −0.1%
-  Gemma4     9.33 →  9.25   −0.9%
+                    before                            after
+  default    20.92 20.59 20.53 26.35 ... 26.37  |  26.07 26.39 25.89 26.46 25.86 26.32 26.25
+  all eight  20.65 20.11 20.94 20.55 ... 26.40  |  26.62 25.62 26.36 26.24 26.10 26.49 26.35
+  big four   26.20 26.53 26.55 26.60 ... 26.49  |  26.16 26.06 26.48 26.67 26.49 26.43 26.51
+  little4    18.35 18.22 18.16 18.26 ... 18.34  |  18.26 18.32 18.31 18.18 18.30 18.32 18.26
+
+  default median   20.92 -> 26.25    +25.5%
+  spread           28.5% ->   2.3%
+  against 24.85   -15.8% -> +5.6%
 ```
 
-**所以论文那些数字是对的，错的是取到它们的方法。**
-高模式一直是这台机器的真实能力；best-of-N 报的是一个运行时够得着、
-但不会可靠交付的数。
+Three checks passed: the tell fired (`this thread on the fastest cluster, 4
+CPUs`), the text was identical, and the arms took the shape the prediction had
+been written down for.
 
-👉 **结论不是「那个声称被夸大了」，而是「那个声称不可复现」** ——
-修法是让运行时把它一直靠运气做到的事，变成每次都做到。
+`little4` does not move from 18.3, and that is the intersection working.
+`taskset -c 0-3` confines the process to the slow cluster, charsiu looks for the
+fastest cluster within the inherited mask, finds four equal CPUs, and declines.
+An operator who has already answered this question is not overruled by the
+runtime.
 
-对照论文在案的 **+5.8% / +16.1%**，现在中位数给出 **+5.7% / +15.6%**。
-**头条活下来了，而且来自一个站得住的统计量。**
+## Step four: all four models re-measured, and the published figures were right
 
-⚠ **TTFT 没动，而且本来就不该动。** Qwen3 607→613、Phi3 2923→2987、
-gemma4 2269→2222 —— 两个百分点上下。prompt 的活在 pool 上，
-而 pool 仍占着整台机器；**decode 才是那个在抽奖里输掉的单线程**。
-这正是 09-06 那张表的形状。
+One boot, median of seven, every reading printed. The quality table reproduces
+the previous round bit for bit (34.2425 / 23.6746 / 18.3604), which is a free
+regression check that pinning changes scheduling and not arithmetic.
 
-⚠ **但厂商那列仍然是引用** —— benchmark.md，满频，没有 N 没有离散度。
-**对一个方法不明的点估计领先不是结果，是比较。**
-真正是结果的是：**同一个二进制、同一块板子，四个模型 +17% 到 +27%。**
+```
+             old median  old best   new median  spread   gain    vs vendor
+  Qwen3         20.76      26.06      26.26      1.9%   +26.5%     +5.7%
+  TinyLLAMA     19.41      22.83      22.79      1.2%   +17.4%    +15.6%
+  Phi3           5.96       7.04       7.03      0.1%   +18.0%     +6.8%
+  Gemma4         7.28       9.33       9.25      1.7%   +27.1%     +0.2%
+```
 
-## 这一条本可以早四天拿到
+All four are ahead on the median, with spreads of 0.1 to 1.9%. Phi3's seven
+readings are `7.03 7.04 7.03 7.03 7.04 7.04 7.03`, a tenth of a percent.
 
-`llama.c` 里 2026-09-06 的注释已经写着
-「*that is the calling thread landing on an A53, and a scheduling lottery is
-worse than a small steady loss*」，而且那张表已经量出最优列。
-**然后两个旋钮都没设默认值**，理由是「baked-in 的猜测是没人看得见的回退」。
+### The new medians are the old best-of-seven, to within 1%
 
-🔑 **那个理由在没人量过「不选」的代价时是对的。** 和 AWQ 的 clamp 同一个形状：
-**不行动的理由，在它背后的测量变了之后要重新检查。**
+```
+  Qwen3     26.06 -> 26.26   +0.8%
+  TinyLLAMA 22.83 -> 22.79   -0.2%
+  Phi3       7.04 ->  7.03   -0.1%
+  Gemma4     9.33 ->  9.25   -0.9%
+```
+
+So the published numbers were right and the method for getting them was not.
+The high mode was the machine's real capability all along, and best-of-N was
+reporting something the runtime could reach but would not deliver reliably.
+
+The finding is therefore not that the claim was inflated. It is that the claim
+was unreproducible, and the fix was to make the runtime do reliably what it had
+been doing by luck.
+
+Against the +5.8% and +16.1% on record, the medians now give +5.7% and +15.6%.
+The headline survives, from a statistic that can be defended.
+
+TTFT did not move, and should not have. Qwen3 went 607 to 613, Phi3 2923 to
+2987, gemma4 2269 to 2222, a couple of percent either way. A prompt's work is
+on the pool, which still has the whole machine; decode is the one thread that
+was losing the lottery. That is the shape of the 09-06 table exactly.
+
+The vendor column is still a citation: benchmark.md, maximum frequency, no N
+and no spread. A margin over a point estimate of unknown method is a
+comparison, not a result. What is a result is the same binary on the same
+board, four models, +17% to +27%.
+
+## This was available four days earlier
+
+A comment in `llama.c` dated 2026-09-06 already said, in those words, *"that is
+the calling thread landing on an A53, and a scheduling lottery is worse than a
+small steady loss"*, and the table beside it had already measured the best
+column. Then neither knob was given a default, on the grounds that "a wrong
+guess baked in is a regression nobody could see".
+
+That reason was correct while nobody had measured what not choosing costs. It
+is the same shape as the AWQ clamp: a reason not to act has to be rechecked
+when the measurement behind it changes.
 
 ---
 
-# 🏁 R4：先有答案，然后被同一个修复关掉
+# R4: answered, then closed by the same fix
 
-20 个读数，performance，时间顺序。判定：**间隔比 15.0 且落在中间**、
-无漂移、12 低 / 8 高、**10 个游程对独立抛硬币的 10.6** —— 簇归属每次重新决定。
+Twenty readings at `performance`, in time order. The verdict: a gap ratio of
+15.0 with the gap in the middle, no drift, 12 low and 8 high, and 10 runs
+against the 10.6 that independent coin flips would give, so cluster membership
+is decided afresh each run.
 
-**两簇，1890 和 2010，差 6.3%，总跨度 9.9%。**
+Two clusters, 1890 and 2010, 6.3% apart, with a total spread of 9.9%.
 
-## 🏁 然后它被同一个修复关掉了
+## Then the same fix closed it
 
-钉核之后二十次：中位数 1978，**跨度 4.4%**，判定工具在这个宽度上拒绝谈形状。
+Twenty readings after pinning: median 1978, spread 4.4%, and the decision tool
+refuses to call a shape at that width.
 
 ```
-  46%    七个读数,板子当时的 governor        ← R4 当初问的
-   9.9%  二十个,performance
-   4.4%  二十个,performance + 钉核
+  46%    seven readings, whatever governor the board had    what R4 asked about
+   9.9%  twenty readings, performance
+   4.4%  twenty readings, performance, pinned
 ```
 
-第二步是两簇，第三步没有。**gemma4 的 TTFT 是同一个抽奖。**
-那一行现在可以**无保留地**引用中位数。
+Two clusters at the second step and none at the third. gemma4's TTFT was the
+same lottery, and the row can now be quoted as a median without qualification.
 
-⚠ 引出 R4 的那七个读数跨度是 46%，因为它们在板子当时的 governor 下取的 ——
-**那个问题问的是一个没人会引用的配置。**
+The seven readings that motivated R4 spanned 46% because they were taken at
+whatever governor the board had, so the question was being asked of a
+configuration nobody would quote from.
 
 ---
 
-# ⚠⚠ R8 升级：两台机器不是同一个文件
+# R8 is worse than the checklist assumed: the two machines had different files
 
 ```
               md5                                bytes
-  桌面   c82c0340d974c3eca5b528236cf9f621       773025824
-  板子   48ff0243978606fdba19d899b77802fc       773025920
+  desk   c82c0340d974c3eca5b528236cf9f621       773025824
+  board  48ff0243978606fdba19d899b77802fc       773025920
 ```
 
-线程数已排除（桌面 8/4/1 逐位相同）。工具链也不同但**文件差异已经足够**。
+Thread count was already ruled out, since the desk gives bit-identical results
+at 8, 4 and 1 threads. The toolchains differ too, but the file difference is
+enough on its own.
 
-👉 **这改写了在案的说法。** AWQ 那轮的「板子与主机差 0.3%」「板子确认了桌面」
-是**两个不同文件**碰巧接近。跨机器的质量数字**从来没可比过**。
+`bartowski/Llama-3.2-1B-Instruct-GGUF` has been re-uploaded. Downloading what
+Hugging Face serves today gives the board's md5 exactly, and with the same file
+the two machines agree to the last digit on all three arms.
 
-`board_record.sh` 现在每轮戳模型 md5、大小、二进制 md5 和线程数。
+That rewrites something on record. "Board and host agree to 0.3%" in the AWQ
+round, and "the board confirms the desk", were two different files landing near
+each other. Cross-machine quality numbers were never comparable, and nobody had
+checked a fingerprint.
+
+`board_record.sh` now stamps the model's md5 and size, the binary's md5, and
+the thread count on every round.
 
 ---
 
-# 🏁 质量表：AWQ 板上确认，−30.9%
+# The quality table: AWQ confirmed on the board at -30.9%
 
 ```
    calibration      2647768 bytes from calib.txt
    int4             34.2425
-   int4+AWQ 0.20    23.6746        −30.9%
+   int4+AWQ 0.20    23.6746        -30.9%
    int8             18.3604
 ```
 
-⚠ 两边是不同文件，所以能说的是「**收益幅度**差一个百分点」，不是「数字一致」。
+Since the two sides were on different files when this was first compared, what
+can be said is that the size of the gain agrees within a percentage point, not
+that the numbers match.
 
 ---
 
-# 这一天修掉的五个 harness 缺陷
+# Five harness defects found in one day
 
-**全都不是板子的问题，全是 harness 报告了一个它没验证过的状态。**
+None of them were the board. All five were a harness reporting a state it had
+never verified.
 
-| | 症状 | 真因 |
+| defect | symptom | cause |
 |---|---|---|
-| AWQ 空臂 | 和对照一样到最后一位 | 没标定 → 被拒绝，而 stderr 被丢了 |
-| gemma4「不在板子上」 | 扫描整条跳过 | **在板子上**，在另一个模型目录 |
-| 假静默 | — | `\| tail` 让整轮零输出，300 秒静默误触发 USB 复位 |
-| 静默死亡 | 第 3 节只打标题，**boot 检查从没跑** | 没有 `thermal_zone` → glob 字面 → `set -e` |
-| 判定工具读反 | `big4` 1.6% 跨度被判「不能引用」 | 我把「没有结构」写成了「不能引用」；间隔比无量纲，在最后一位里造假结构 |
+| null AWQ arm | equal to its control to the last digit | no calibration, so AWQ declined, and the stderr saying so was discarded |
+| "gemma4 is not on the board" | the whole sweep skipped | it was on the board, in the other models directory |
+| false silence | none | `\| tail` gave zero output for a whole round, and 300 s of silence tripped a USB reset |
+| silent death | section 3 printed its header only, and the boot check never ran | no `thermal_zone` on this board, so the glob stayed literal and `set -e` ended the script |
+| the decision tool read backwards | `big4` at 1.6% spread was called "not quotable" | I had written "no structure" as "not quotable", and a scale-free gap ratio found structure in the last digit |
 
-🔑 `set -e` 那条只在 gemma4 **被找到之后**才暴露 ——
-**修好一个错误掀开了它下面的另一个。**
-🔑 空臂那条最贵：**不是 smoke 跑了 296 秒，这个数会以「AWQ 在板子上没用」进论文。**
+The `set -e` defect only became reachable once gemma4 was found: while the
+sweep was skipping, that line never ran. Fixing one fault uncovered the one
+beneath it.
+
+The null arm was the most expensive. Without the 296 s smoke run, that number
+would have reached a paper as "AWQ does nothing on the board".
 
 ---
 
-# 清单 8 条的最终状态
+# Final state of the checklist's eight items
 
-| | 状态 |
+| item | state |
 |---|---|
-| **R1** | 🏁 **查清、修好、四模型复测完**。领先曾是 best-of-N 在双峰上挑的；根因是核放置；`a58086c` 默认钉快簇 → 四模型 **+17%~+27%**，跨度 0.1–1.9%，**全部在中位数上领先厂商**，而新中位数 = 旧 best-of-7（差<1%） |
-| **R2** | 🏁 **完成**，全程桌面。协议钉死后厂商/charsiu = **2.00 倍** |
-| **R3** | 🏁 **做到了**。一次开机，boot id 两端一致 |
-| **R4** | 🏁 **关掉了**。曾是两簇（6.3%），钉核后跨度 4.4% 且无形状可言 —— 同一个抽奖 |
-| **R5** | ⛔ **不是 run，是读错了**。`12.59 × 64/65 = 12.40`。gate 可拆 |
-| **R6** | 🏁 **定了**。9.9 退休，11.7 注明是 cache walk |
-| **R7** | ✅ 只有一块 RK3576。写成 limitation |
-| **R8** | ⚠⚠ **比清单想的严重**。是**文件**，而两台机器的文件不同 |
+| R1 | Diagnosed, fixed, and re-measured on four models. The margin was best-of-N picking the fast mode of a bimodal decode; the cause is core placement; `a58086c` pins the fast cluster by default, giving +17% to +27% across four models at spreads of 0.1 to 1.9%, all four ahead of the vendor on the median, with the new medians equal to the old best-of-seven to within 1% |
+| R2 | Done, entirely on the desk. On the pinned protocol the vendor's excess is 2.00, 2.23 and 2.35 times charsiu's across three nested subsets |
+| R3 | Done. One boot, boot id taken at both ends and unchanged |
+| R4 | Closed. It was two clusters 6.3% apart; after pinning the spread is 4.4% with no shape callable. The same lottery |
+| R5 | Not a run, a misreading. `12.59 * 64/65 = 12.40`, so the gate can come out |
+| R6 | Settled. 9.9 GB/s retired, 11.7 GB/s annotated as a cache walk |
+| R7 | One RK3576 only. State it as a limitation |
+| R8 | Worse than the checklist assumed. It is the file, and the two machines had different ones |
 
 ---
 
-# ▶ 下一步
+# Next
 
-1. **两台机器换成同一个文件**，重测跨机器一致性 —— 现在那个「一致」是假的
-2. **`npu_mixed_test` 还没上板**（决定 `INT8_LAYERS` 的混合派发要不要写）
-3. checker 那个 ban：现在可以**基于测量**解除了 —— 但规则该记录
-   「当时测到了什么」而不是「结论是什么」
-4. ⚠ **论文里所有速度数字都要标注是 median of 7 + 钉核**，
-   并且注明厂商列是**引用**（满频，无 N，无离散度）
+The `npudev.c` per-tensor width refactor. `npu_mixed_test` on the board answers
+the question that blocked it: one open device alternates w8a8 and w4a16
+correctly, 0 of 18 dispatches wrong over eight alternations in both directions.
+That was at K=256 and N=64, so it justifies the refactor rather than
+demonstrating the knob.
 
-⚠ 上板：一个脚本一个 UART opener；`charsiu update` 要
-`CTUI_ASSUME=yes ... </dev/null`；**必须 `update dev`**。
+The checker's ban on "beats the vendor" can now be lifted against a
+measurement. The rule should record what was measured and when, not the verdict
+it produced.
+
+Every speed figure in a paper needs to say it is a median of seven with the
+calling thread pinned, and the vendor column needs to say it is a citation at
+maximum frequency with no N and no spread.
+
+Two notes for whoever runs the next round: one script per UART opener, and
+`charsiu update` is interactive so it needs `CTUI_ASSUME=yes ... </dev/null`.
+The `stable` channel installs neither the probes nor the corpora, so a board
+round needs `update dev`.

@@ -1,41 +1,41 @@
 # Evidence pack, 2026-09-11
 
 Every number a paper could quote from this project, with the protocol that
-produced it and the sentence that has to travel beside it. Assembled after five
-board rounds in one session on one ROCK 4D.
+produced it and the sentence that has to travel beside it. Assembled over a day
+of board rounds on one ROCK 4D.
 
-Tree state: `dev 150e592`. Board: Armbian, kernel `7.2.0-rc5-next-20260730+`,
+Tree state: `dev 4057a39`. Board: Armbian, kernel `7.2.0-rc5-next-20260730+`,
 GCC 15.2.0, glibc 2.43. Desk: aarch64 VM, GCC 13.3.0, glibc 2.39.
 
 ---
 
-## 0. The three things that must be said beside the numbers
+## 0. Three things that must be said beside the numbers
 
-**(a) The vendor column is a CITATION, not an arm.** It is copied from
+**The vendor column is a citation, not an arm.** It is copied from
 `airockchip/rknn-llm/main/benchmark.md`, fetched 2026-08-28, and their header
 says the figures were "collected based on the maximum CPU and NPU frequencies
-of each platform". Nothing in this project runs their runtime. It has no N, no
-spread and no method beyond that sentence. **A margin over it cannot be
-"inside the noise" in either direction, because it has none.** Every comparison
-below is our median of seven with its range against their published point.
+of each platform". Nothing in this project runs their runtime. The column has
+no N, no spread, and no method beyond that one sentence, so a margin over it
+cannot be inside anyone's noise in either direction. Every comparison below is
+our median of seven with its range, against their published point.
 
-**(b) A perplexity needs a model, a corpus AND a file.** charsiu re-quantises
+**A perplexity needs a model, a corpus, and a file.** charsiu re-quantises
 whatever it loads, so the source format is inside every quality number. The
-same Llama-3.2-1B reads 41.37 or 34.24 or 28.71 depending on which file and
+same Llama-3.2-1B reads 41.37, or 34.24, or 28.71, depending on which file and
 which group. Every figure here names its md5.
 
-**(c) One board.** Everything hardware is a single ROCK 4D. That separates
-voltage from clock and it does not separate this board from the part, so a
-leakage bin cannot be ruled out. The ArmSoM CM5 is RK3588S and cannot test
-this rail at all.
+**One board.** Everything measured on hardware is a single ROCK 4D. That
+separates voltage from clock, and it does not separate this board from the
+part, so a leakage bin cannot be ruled out. The ArmSoM CM5 is RK3588S and
+cannot test this rail at all.
 
 ---
 
 ## 1. Speed against the vendor
 
 One boot, `performance` governor, `board_record.sh` REPEAT=7, median of seven
-with every reading kept. Binary pins its calling thread to the fast cluster
-(a58086c). Their protocol: 128-token prompt, 64 new tokens.
+with every reading kept. The binary pins its calling thread to the fast cluster
+(a58086c). Their protocol is a 128-token prompt and 64 new tokens.
 
 ```
               decode t/s                      TTFT ms
@@ -46,20 +46,20 @@ with every reading kept. Binary pins its calling thread to the fast cluster
   Gemma4 E2B       9.25      1.7%     9.23          2222     2193..2245    1219.25
 ```
 
-**Decode: ahead on all four** — +5.7%, +15.6%, +6.8%, +0.2%.
-**TTFT: behind on all four** — 1.31x, 1.64x, 1.63x, 1.82x theirs.
+Decode is ahead on all four: +5.7%, +15.6%, +6.8%, +0.2%.
+TTFT is behind on all four: 1.31x, 1.64x, 1.63x, 1.82x theirs.
 
-⚠ **The prompt is where this runtime is still losing**, and it is the half the
-vendor spends 3328 M=1 dispatches on. Saying only the decode half would be
+The prompt is where this runtime is still losing, and it is the half the vendor
+spends 3328 M=1 dispatches on. Reporting only the decode column would be
 choosing a column.
 
-⚠ TTFT and their TTFT are not the same quantity: theirs is time to the first
-token, ours is the prompt's forward passes, so the first token's own step is in
-theirs and not in ours — one token's worth in our favour.
+Their TTFT and ours are not the same quantity. Theirs is time to the first
+token; ours is the prompt's forward passes, so the first token's own step is in
+theirs and not in ours, which is one token's worth in our favour.
 
-### 1b. And the decode margin is younger than the round
+### 1b. The decode margin is younger than the round
 
-Before `a58086c` the decode was **bimodal** and the table reported best-of-N:
+Before `a58086c` the decode was bimodal and the table reported best-of-N:
 
 ```
   Qwen3      20.76 24.25 20.61 20.27 26.06 20.81 20.54     best 26.06, median 20.76
@@ -68,22 +68,23 @@ Before `a58086c` the decode was **bimodal** and the table reported best-of-N:
   Gemma4      7.25  7.34  7.28  9.33  7.28  7.32  7.28     best  9.33, median  7.28
 ```
 
-Four threads (`-t 4`) on a 4xA72 + 4xA53 part: when they all landed on the A72s
-it was fast. `taskset -c 0-7` behaved exactly like no taskset, so it was never
-about which cores were permitted but about where the scheduler put them.
+Four threads (`-t 4`) on a part with four A72s and four A53s: when all four
+landed on the A72s it was fast. `taskset -c 0-7` behaved exactly like no
+taskset, so it was never about which cores were permitted, only about where the
+scheduler put them.
 
 ```
   default median  20.92 -> 26.25   +25.5%       spread 28.5% -> 2.3%
 ```
 
-🔑 **The new medians are the old best-of-seven to within 1%**, so the claim on
-record was the right number reached the wrong way: the high mode was the
+The new medians are the old best-of-seven to within 1%. The claim on record was
+therefore the right number reached the wrong way: the high mode was the
 machine's real capability, and best-of-N was reporting something the runtime
-could do but would not do reliably. **The paper should say the margin is
-+5.7%/+15.6% from a median, and that this required pinning; it should not
-quote a best-of-N.**
+could do but would not do reliably. A paper should give the margin as
++5.7%/+15.6% from a median, say that it required pinning, and not quote a
+best-of-N.
 
-### 1b-2. The TTFT gap is NOT attributed, and the obvious explanation does not fit
+### 1b-2. The TTFT gap is not attributed, and the obvious explanation does not fit
 
 The runtime's own report from the same round:
 
@@ -95,25 +96,25 @@ The runtime's own report from the same round:
   Gemma4      2222 1219.25  1.82x    25790     2.92          13%
 ```
 
-⛔ **Per-call overhead does not explain the gap.** The model with the MOST
-dispatch overhead has the SMALLEST gap (Qwen3, 23% and 1.31x) and the one with
-the least has nearly the largest (Phi3, 4% and 1.63x). The correlation runs
-backwards.
+Per-call overhead does not explain the gap. The model with the most dispatch
+overhead has the smallest gap (Qwen3, 23% and 1.31x) and the one with the least
+has nearly the largest (Phi3, 4% and 1.63x). The correlation runs backwards.
 
-⚠⚠ **And those counters cannot be used for TTFT anyway** — they cover the whole
-process, and with 64 generated tokens a run the calls are mostly DECODE's. Any
-attribution of prompt time from them is a category error, including the one
-above; it is written down to close the road, not to travel it.
+Those counters could not attribute TTFT even if they had pointed the right way.
+They cover the whole process, and at 64 generated tokens a run the calls are
+mostly decode's. Any attribution of prompt time from them is a category error,
+including the paragraph above, which is written down to close the road rather
+than to travel it.
 
-⚠ The report's own GB/s figures are self-flagged in all four models: *"that
+The report's own GB/s figures are self-flagged in all four models: *"that
 remainder is NEGATIVE, so the hardware path and the wall clock are counting
-different calls -- the rate above is not a fact about the hardware"*. Do not
+different calls, the rate above is not a fact about the hardware"*. Do not
 quote them.
 
-### 1b-3. Where the prompt's time actually goes — measured
+### 1b-3. Where the prompt's time actually goes
 
-`tests/board_prefill_stages.sh`, `-n 1` so the table is the prompt's, the
-protocol prompt so the rows are the rows the TTFT column is measured over:
+`tests/board_prefill_stages.sh` with `-n 1`, so the table is the prompt's, and
+the protocol prompt, so the rows are the rows the TTFT column is measured over:
 
 ```
               ms/row   in the NPU entry     pack   fence    read   read/fence  read/total
@@ -123,64 +124,67 @@ protocol prompt so the rows are the rows the TTFT column is measured over:
   Gemma4       17.38   12.79   (74%)        2.17    4.59    5.16     1.12x        30%
 ```
 
-**Three results, and the first two close roads:**
+Three results, and the first two close roads.
 
-1. **Zero rows fell back to the CPU on any model.** The silent-fallback
-   explanation — a projection the hardware refuses becoming a matvec a row at
-   a time — is dead. The batched path is entirely on the hardware.
-2. **Submitting costs 0.06 to 0.12 ms a row, 1 to 2% of the prompt.** Per-call
-   dispatch is not the prefill story, which is the second independent way that
-   explanation has failed today.
-3. 🔑 **Reading the results back costs as much as computing them.** `read` is
-   0.99 to 1.26 times `fence` — the hardware's own MAC time — and is 25 to 36%
-   of the whole prompt on every model.
+Zero rows fell back to the CPU on any model, so the silent-fallback
+explanation, a projection the hardware refuses becoming a matvec a row at a
+time, is dead. The batched path is entirely on the hardware.
 
-👉 **The read-back is the largest single lever in prefill, and it is set by the
-quantisation group**: the read volume is `m·n·ceil(K/KMAX)·4`, so a finer group
-is paid for here. **Prefill speed and answer quality are traded through one
-parameter**, which is the tension a paper can state precisely.
+Submitting costs 0.06 to 0.12 ms a row, 1 to 2% of the prompt. Per-call
+dispatch is not the prefill story, which is the second independent way that
+explanation has failed.
 
-⚠ **This attributes charsiu's prompt time. It does not by itself explain the
-SIZE of the gap against the vendor**, because there is no equivalent breakdown
-of theirs — and `read/fence` does not track the gap across the four models
-(Phi3 has the lowest ratio and nearly the largest gap). What can be said is
-what charsiu spends the prompt on, and that the vendor dispatches at M=1 where
+Reading the results back costs as much as computing them. `read` is 0.99 to
+1.26 times `fence`, the hardware's own MAC time, and is 25 to 36% of the whole
+prompt on every model.
+
+The read-back is therefore the largest single lever in prefill, and it is set
+by the quantisation group: the read volume is `m * n * ceil(K/KMAX) * 4`, so a
+finer group is paid for here. Prefill speed and answer quality are traded
+through one parameter, which is a tension a paper can state precisely.
+
+This attributes charsiu's prompt time. It does not by itself explain the size
+of the gap against the vendor, because there is no equivalent breakdown of
+theirs, and `read/fence` does not track the gap across the four models (Phi3
+has the lowest ratio and nearly the largest gap). What can be said is what
+charsiu spends the prompt on, and that the vendor dispatches at M=1 where
 charsiu batches, so the two are not paying the same costs in the same places.
 
-⚠ The `in its wrapper` figure the probe also prints (24.21 ms a row on Qwen3
-against 3.90 inside the entry) **includes staging** — 4135 ms of it on Qwen3 —
-which is a once-per-process cost and is excluded from the prompt total and
-from TTFT. Do not read it as prompt time.
+The probe also prints an `in its wrapper` figure, 24.21 ms a row on Qwen3
+against 3.90 inside the entry. That one includes staging, 4135 ms of it on
+Qwen3, which is a once-per-process cost and is excluded from both the prompt
+total and TTFT. It is not prompt time.
 
 ### 1c. The pinning default is safe across every architecture
 
 `a58086c` changes a default that touches every workload on every model, and
 what had been checked was one model's decode text. `board_text_all.sh` compares
-each model's BATCHED prompt against its own token loop, on the hardware:
+each model's batched prompt against its own token loop, on the hardware:
 
 ```
   Phi-3.5-mini   Qwen2.5-1.5B   Qwen3-0.6B   SmolLM2-1.7B   SmolLM2-135M
   gemma-3-1b     gemma-4-E2B    tinyllama-1.1b   Llama-3.2-1B
 
-  9 models compared, 0 differing -- every one "prompt batched, text identical"
+  9 models compared, 0 differing, every one "prompt batched, text identical"
 ```
 
-🔑 **Every row says `prompt batched`, not `prompt a token`.** A model that
-refuses to batch would report "text identical" meaning only that the token loop
-agrees with itself; none did. This is the check that caught gemma4 emitting
-"31 32 1 2 3" on the card in 2026-08-30 after six architectures had passed on a
-desktop.
+Every row says `prompt batched`, not `prompt a token`. A model that refuses to
+batch would report "text identical" meaning only that the token loop agrees
+with itself; none did. This is the check that caught gemma4 emitting
+"31 32 1 2 3" on the card in 2026-08-30, after six architectures had passed on
+a desktop.
 
 ---
 
-## 2. Quality against the vendor's own int4 — the empty cell, filled
+## 2. Quality against the vendor's own int4
 
 The comparison nothing in the literature has: the vendor's stored weights,
-scored. No board and no vendor install — `tools/rkllm_rebuild.py` reads the
-`.rkllm`, and `tests/vendor_quality.sh` scores it.
+scored. It needs no board and no vendor install. `tools/rkllm_rebuild.py` reads
+the `.rkllm` and `tests/vendor_quality.sh` scores it.
 
-All arms are f16 files differing only in the swapped matrices, from the **Q8_0**
-source, `tests/corpus/long.txt` at `-n 300`, no quantiser at inference:
+All arms are f16 files differing only in the swapped matrices, from the Q8_0
+source, on `tests/corpus/long.txt` at `-n 300`, with no quantiser running at
+inference:
 
 ```
   matrices                   ref     vendor   charsiu    q4_0    vendor  charsiu  ratio
@@ -189,40 +193,45 @@ source, `tests/corpus/long.txt` at `-n 300`, no quantiser at inference:
   105 (all but layer 1)  17.8719   29.9056   22.9824       --  +67.33%  +28.60%  2.35x
 ```
 
-**The vendor's four-bit excess is 2.0 to 2.4x charsiu's**, on three nested
+The vendor's four-bit excess is 2.0 to 2.4 times charsiu's, on three nested
 subsets, monotone.
 
 ### What makes it evidence rather than a reconstruction of mine
 
-- the weight layout is **solved and held out**: fitted on blocks 0..47, scored
-  on rows 768..2047, 99.72% of codes away from a rounding boundary, residuals
-  ±1 which is the boundary signature
-- the calibration is **not recovered, it cancels**: the vendor folds 1/c into
-  the RMSNorm ahead of each projection, `corr(vendor_norm, ref/c)` = 0.9905 to
-  0.9945 against 0.78 to 0.89 for `corr(vendor_norm, ref)`
-- **the noise control**: unstructured error at the same per-tensor magnitude
-  costs +60.00% where their actual quantisation costs +13.32%. The vendor row
-  sits four and a half times further from noise than from the reference
-- an earlier version scored **1700.98** by recovering c through division; the
-  same magnitude as Gaussian noise scored 32.10. That is how the fault was
-  found, and it is why the noise arm is in the harness rather than beside it
+The weight layout is solved and held out: fitted on blocks 0 to 47, scored on
+rows 768 to 2047, 99.72% of codes away from a rounding boundary, with residuals
+of plus or minus 1, which is the boundary signature.
 
-⚠ **Layer 1 is excluded and the reason is named.** All 112 matrices read 58.76
+The calibration is not recovered, it cancels. The vendor folds 1/c into the
+RMSNorm ahead of each projection, so `corr(vendor_norm, ref/c)` runs 0.9905 to
+0.9945 against 0.78 to 0.89 for `corr(vendor_norm, ref)`.
+
+The noise control decides whether any of it means anything. Unstructured error
+at the same per-tensor magnitude costs +60.00% where their actual quantisation
+costs +13.32%, so the vendor row sits four and a half times further from noise
+than from the reference.
+
+An earlier version scored 1700.98 by recovering c through division, while the
+same magnitude as Gaussian noise scored 32.10. That is how the fault was found,
+and it is why the noise arm is inside the harness rather than beside it.
+
+Layer 1 is excluded and the reason is named. All 112 matrices read 58.76
 against 32.13 for the same set minus layer 1; `blk.1` carries the most extreme
 row gauge in the model and `blk.1.ffn_down` is not reconstructed at all. That
-number measures the reconstruction, not their quality, and is not quoted.
+number measures the reconstruction rather than their quality, and is not
+quoted.
 
-⚠ **The unrecorded protocol gave 1.65 / 1.71 / 1.81 for the same three sets.**
-Same shape, consistently lower. Neither ladder is quotable without its corpus
-and length; this one has them.
+The unrecorded protocol gave 1.65 / 1.71 / 1.81 for the same three sets: same
+shape, consistently lower. Neither ladder is quotable without its corpus and
+length, and this one has them.
 
 ---
 
 ## 3. Quality of charsiu's own quantiser
 
 CPU reference (`CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1`) at the group the board
-runs, `Llama-3.2-1B-Instruct-Q4_0.gguf` md5 `48ff0243…`, 773025920 bytes,
-`tests/corpus/long.txt` `-n 300`:
+runs, on `Llama-3.2-1B-Instruct-Q4_0.gguf` md5 `48ff0243`, 773025920 bytes,
+`tests/corpus/long.txt` at `-n 300`:
 
 ```
   int4, group 1024        34.2425
@@ -230,29 +239,30 @@ runs, `Llama-3.2-1B-Instruct-Q4_0.gguf` md5 `48ff0243…`, 773025920 bytes,
   int8                    18.3604
 ```
 
-**On a second architecture**, Qwen3-0.6B (md5 `45f23a28…`), same group, same
-corpus, `tests/host_awq.sh`:
+On a second architecture, Qwen3-0.6B (md5 `45f23a28`), same group, same corpus,
+through `tests/host_awq.sh`:
 
 ```
   AWQ off                 95.5754
-  AWQ on, no statistics   95.5754     must equal off -- it declines, and does
+  AWQ on, no statistics   95.5754     must equal off: it declines, and does
   AWQ on, alpha 0.20      72.5107     -24.1%
 ```
 
-**So AWQ is worth 24 to 31% across two architectures at the configuration the
-board runs.** ⚠ Qwen3's own optimum is 0.25 rather than 0.20, so its 24.1% is
-the conservative reading of its own row.
+So AWQ is worth 24 to 31% across two architectures at the configuration the
+board runs. Qwen3's own optimum is 0.25 rather than 0.20, so its 24.1% is the
+conservative reading of its own row.
 
-⚠ The middle arm is the tell, not decoration: with no calibration statistics
+The middle arm is a tell rather than decoration. With no calibration statistics
 `CHARSIU_NPU_AWQ` declines and says so, and an AWQ arm that silently equals its
-control is what a missing calibration looks like. It cost a board round today.
+control is what a missing calibration looks like. It cost a board round.
 
-🔑 **Board and desk are bit-identical on all three**, and the calibration pass
-writes the same 2647768 bytes — across two compilers, two glibcs, two kernels
+Board and desk are bit-identical on all three arms, and the calibration pass
+writes the same 2647768 bytes, across two compilers, two glibcs, two kernels
 and two thread counts. Perplexity survives all of that.
 
-⚠ **It does not survive a different file.** `bartowski/Llama-3.2-1B-Instruct-GGUF`
-has been re-uploaded; this project's image carries the older copy:
+It does not survive a different file.
+`bartowski/Llama-3.2-1B-Instruct-GGUF` has been re-uploaded, and this project's
+image carries the older copy:
 
 ```
                                      md5        bytes      a row   g1024
@@ -260,19 +270,19 @@ has been re-uploaded; this project's image carries the older copy:
   what Hugging Face serves now   48ff0243   773025920   41.3739  34.2425
 ```
 
-**Every quality figure recorded in this tree before 2026-09-11 is the first
-row.** A reader reproducing today gets the second. Both are named by md5 in
-`tests/corpus/README.md`; the file of record going forward is the one a reader
-will actually get.
+Every quality figure recorded in this tree before 2026-09-11 is the first row.
+A reader reproducing today gets the second. Both are named by md5 in
+`tests/corpus/README.md`, and the file of record going forward is the one a
+reader will actually get.
 
-⚠ And "board and host agree to 0.3%" in the earlier AWQ round was two
-different files landing near each other. It is not evidence of anything.
+"Board and host agree to 0.3%" in the earlier AWQ round was two different files
+landing near each other. It is not evidence of anything.
 
 ---
 
 ## 4. The output head, and why 12.40 and 12.59 are not a disagreement
 
-`tests/prefill_control.sh`, batched -> control -> batched on one binary:
+`tests/prefill_control.sh` runs batched, control, batched on one binary:
 
 ```
   control   65 tok / 4304 ms   66.22 ms a token   15.10 tok/s
@@ -288,23 +298,23 @@ the head's own cost, 12.59 ms:
                   12.40  ms   measured
 ```
 
-and independently, Llama-3.2-1B's head is 128256 x 2048 = 131.3 MB at int4:
+Independently, Llama-3.2-1B's head is 128256 x 2048, which at int4 is 131.3 MB:
 
 ```
   131.3 MB / 12.59 ms = 10.43 GB/s   against the 10.58 GB/s the NPU summary reports
 ```
 
-**1.4% apart, from a shape and a rate that never saw the stopwatch.** This is
-the strongest triangulation in the project and it is one measurement plus two
-independent predictions, not two estimates of one thing.
+That is 1.4% apart, from a shape and a rate that never saw the stopwatch. It is
+the strongest triangulation in the project, and it is one measurement plus two
+independent predictions rather than two estimates of one thing.
 
 ---
 
 ## 4b. The two cores, the overlap fault, and what the speed numbers ran under
 
-**The fault is real and it is attributed: it is the NPU's voltage margin, not
-the overlap.** `src/overlap.h` states it and the notebook carries the sweep —
-four device trees, same probe, four passes of 5400 rows each:
+The fault is real and it is attributed: it is the NPU's voltage margin, not the
+overlap. `src/overlap.h` states it and the notebook carries the sweep, four
+device trees, same probe, four passes of 5400 rows each:
 
 ```
   786 MHz, 750 mV (mainline as U-Boot leaves it)   11 to 25 wrong words a pass
@@ -313,44 +323,43 @@ four device trees, same probe, four passes of 5400 rows each:
   786 MHz, 850 mV                                   0, 0, 0, 0
 ```
 
-**Cite that sweep.** It is a controlled voltage series across four DTBs. It is
+Cite that sweep. It is a controlled voltage series across four DTBs, which is
 not the same kind of evidence as a probe that failed to fire, and this project
 has both.
 
-⚠⚠ **AND EVERY SPEED NUMBER IN §1 RAN WITH THE TWO CORES OVERLAPPED.** The
-board reads 800 mV, `overlap_safe()` approves, `batch_serial()` defaults to
-`!overlap_safe()`, so the cores overlap by default. The TTFT and decode
-figures are overlapped figures. A reader on a 750 mV device tree gets neither
-these speeds nor these answers.
+Every speed number in section 1 ran with the two cores overlapped. The board
+reads 800 mV, `overlap_safe()` approves, and `batch_serial()` defaults to
+`!overlap_safe()`, so the cores overlap by default. The TTFT and decode figures
+are overlapped figures, and a reader on a 750 mV device tree gets neither these
+speeds nor these answers.
 
-⚠ **One boot on 2026-09-11 could not fire the fault at all** — 68 runs at the
-old map's worst cell (phi3, chunk 24, KMAX 2048) across `default`, `onedev`,
+One boot on 2026-09-11 could not fire the fault at all: 68 runs at the old
+map's worst cell (phi3, chunk 24, KMAX 2048) across `default`, `onedev`,
 `serial`, `parallel` and `zero`, with the affinity pin on and off. That is
 consistent with the sweep, since the board is at 800 mV, and it is worth
-exactly one sentence: **it confirms the guard end to end on the shipped binary,
-and it establishes nothing on its own.** A probe that does not fire and a fault
-that no longer happens are the same picture.
+exactly one sentence. It confirms the guard end to end on the shipped binary
+and establishes nothing on its own, because a probe that does not fire and a
+fault that no longer happens are the same picture.
 
-🔑 What it did establish, because the arms were run for it: **the affinity
-default shipped today does not mask the race.** 14 of 14 clean with
-`CHARSIU_AFFINITY=0` and 14 of 14 with the pin. A race that stops firing
-because the timing moved would be masked rather than fixed, and it is worth
-checking whenever a scheduling default changes.
+What those arms did establish is that the affinity default does not mask the
+race: 14 of 14 clean with `CHARSIU_AFFINITY=0` and 14 of 14 with the pin. A
+race that stops firing because the timing moved would be masked rather than
+fixed, and that is worth checking whenever a scheduling default changes.
 
 ---
 
-## 5. Bandwidth figures — which are quotable
+## 5. Bandwidth figures, and which are quotable
 
 ```
   5.2 GB/s   the read back        measured directly    quotable
   4.7 GB/s   the activation pack  measured directly    quotable
   11.9 GB/s  what 8 threads reach measured directly    quotable
-  10.58 GB/s weight rate, NPU summary                  quotable (see §4)
-  --------------------------------------------------------------------
+  10.58 GB/s weight rate, NPU summary                  quotable (see section 4)
+  --------------------------------------------------------------------------
   11.7 GB/s  npu_prep_cost cache walk at 65536 bytes   real, but it is BUFFER
                                                        MAINTENANCE, not weights
-  9.9 GB/s   ⛔ NOT A BANDWIDTH. gemma4's q/k/v stage from gguf shapes; the
-             entry it comes from exists to argue such a figure is not a roof --
+  9.9 GB/s   NOT A BANDWIDTH. gemma4's q/k/v stage from gguf shapes. The entry
+             it comes from exists to argue that such a figure is not a roof:
              gate+up reaches 16.8 in the same table, the biggest stage being
              the fastest. Quoting it cites a number derived to refute it.
 ```
@@ -359,22 +368,24 @@ checking whenever a scheduling default changes.
 
 ## 6. Variability, and what one passage can order
 
-- **A single reading cannot see a change worth less than ~25%.** TinyLLAMA has
-  read 12.64 and 17.39 tok/s on the same build minutes apart.
-- **One passage of 300 tokens resolves about 10% of perplexity.** A sweep of
-  AWQ's exponent on Qwen3 came back non-monotone at that length on the
-  evaluation corpus while `charsiu_ppl` is deterministic — so that is the
-  corpus's own sampling. `tests/corpus/long2.txt` is the second opinion.
-- **gemma4's TTFT**: 46% spread at whatever governor the board had, 9.9% at
-  `performance`, **4.4%** pinned. Two clusters at the middle step, none at the
-  last. It was the same scheduling lottery.
+A single reading cannot see a change worth less than about 25%. TinyLLAMA has
+read 12.64 and 17.39 tok/s on the same build minutes apart.
+
+One passage of 300 tokens resolves about 10% of perplexity. A sweep of AWQ's
+exponent on Qwen3 came back non-monotone at that length on the evaluation
+corpus while `charsiu_ppl` is deterministic, so that is the corpus's own
+sampling. `tests/corpus/long2.txt` is the second opinion.
+
+gemma4's TTFT spread was 46% at whatever governor the board had, 9.9% at
+`performance`, and 4.4% pinned. Two clusters at the middle step, none at the
+last. It was the same scheduling lottery.
 
 ---
 
 ## 7. Reproduction
 
 ```sh
-git clone <charsiu> && cd charsiu && git checkout 150e592 && make
+git clone <charsiu> && cd charsiu && git checkout 4057a39 && make
 # the model of record
 curl -L -o models/Llama-3.2-1B-Instruct-Q4_0.gguf \
   https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
@@ -393,29 +404,35 @@ sh tests/vendor_quality.sh 43
 sh tests/board_record.sh
 ```
 
-`tests/corpus_fixed.sh` locks the corpora by md5 and runs in `make test`;
+`tests/corpus_fixed.sh` locks the corpora by md5 and runs inside `make test`.
 `board_record.sh` stamps the model's md5, the binary's md5, the thread count,
 the governor, the NPU rail, both CPU clusters' clock, and the boot id at both
-ends — and refuses to be read as one round if the boot id moved.
+ends, and refuses to be read as one round if the boot id moved.
 
 ---
 
-## 8. What is NOT supported
+## 8. What is not supported
 
-- **Any claim about the vendor's runtime speed measured here.** It has never
-  been run in this project. §1's right column is a citation.
-- **That the overlap fault is gone.** §4b: it is rail-conditioned, this board
-  is at 800 mV, and a probe that did not fire says nothing on its own.
-- **Anything about a second RK3576.** One board.
-- **The 112-matrix vendor rebuild (58.76).** It measures the reconstruction.
-- **Cross-machine quality comparisons made before 2026-09-11.** They compared
-  two different files.
-- **The SIZE of the TTFT gap against the vendor.** §1b-3 attributes charsiu's
-  own prompt time (69-81% inside the NPU entry, of which the read-back is
-  25-36% of the whole and matches the fence). There is no equivalent
-  breakdown of theirs, and read/fence does not track the gap across models.
-- **`CHARSIU_NPU_INT8_LAYERS` on hardware.** `npu_mixed_test` shows one open
-  device alternates w8a8 and w4a16 correctly (0 of 18 dispatches wrong over
-  eight alternations both ways) at K=256 N=64, which says the per-tensor width
-  refactor is justified. It does not say the knob works at the scale a real
-  model dispatches at, because the refactor is not written.
+Any claim about the vendor's runtime speed measured here. It has never been run
+in this project, and section 1's right column is a citation.
+
+That the overlap fault is gone. Section 4b: it is rail-conditioned, this board
+is at 800 mV, and a probe that did not fire says nothing on its own.
+
+Anything about a second RK3576. One board.
+
+The 112-matrix vendor rebuild, 58.76. It measures the reconstruction.
+
+Cross-machine quality comparisons made before 2026-09-11. They compared two
+different files.
+
+The size of the TTFT gap against the vendor. Section 1b-3 attributes charsiu's
+own prompt time, 69 to 81% inside the NPU entry, of which the read-back is 25
+to 36% of the whole and matches the fence. There is no equivalent breakdown of
+theirs, and read/fence does not track the gap across models.
+
+`CHARSIU_NPU_INT8_LAYERS` on hardware. `npu_mixed_test` shows that one open
+device alternates w8a8 and w4a16 correctly, 0 of 18 dispatches wrong over eight
+alternations in both directions, at K=256 and N=64. That says the per-tensor
+width refactor is justified. It does not say the knob works at the scale a real
+model dispatches at, because the refactor is not written.
