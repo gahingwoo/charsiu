@@ -9304,3 +9304,67 @@ left the glob literal, `[ -e ]` false, the substitution exiting non-zero, and
 🔑 **It only appeared once gemma4 was FOUND.** While the sweep was skipping,
 that line never ran. Fixing the model resolution uncovered it -- which is the
 ordinary shape of this: a guard that skips hides the code behind it.
+
+### 🏁 THE SWITCH IS CORE PLACEMENT — 1.72x between the clusters
+
+`tests/board_bimodal.sh`, Qwen3-0.6B, eight passes, arms ALTERNATING, first
+pass discarded, `CHARSIU_THREADS=4` in every arm so affinity is the only knob.
+The board reports its own topology: fast four are cpu 4..7, slow four cpu 0..3.
+
+```
+  any four    19.26 17.33 15.54 19.22 18.64 19.57 18.51    15.54..19.57   26%
+  big four    19.66 19.54 19.41 19.90 20.02 19.68 19.88    19.41..20.02    3%
+  little4     11.45 11.47 11.44 11.40 11.42 11.42 11.42    11.40..11.47   0.6%
+```
+
+**Both pinned arms are unimodal and tight; the unpinned one is the mess.** The
+cluster is worth **1.72x** on decode, and when nothing pins the threads the
+placement differs run to run and the rate goes with it.
+
+⛔ **AND THIS DOES NOT DEMONSTRATE THE BIMODALITY IT WAS WRITTEN FOR.** The
+5-low/2-high pattern was observed at the DEFAULT thread count, eight; this
+experiment pinned four to isolate affinity, so it changed two things at once.
+The levels do not match either: the clusters here are 19.7 and 11.4, a ratio of
+1.72, while the observed modes were 20.5 and 26.1, a ratio of 1.26 — and 26.1
+is ABOVE the big four's 19.7, so the little cores are contributing there.
+
+So: placement is a large real effect and a plausible mechanism. It is not yet
+the explanation. The arm that would settle it runs the DEFAULT eight threads
+against `taskset -c 0-7` and against eight oversubscribed onto the big four.
+
+### 🏁 R4 ANSWERED: gemma4's TTFT is TWO CLUSTERS, and only 6% apart
+
+Twenty readings, one boot, performance governor, in time order:
+
+```
+  1904 1921 1888 1858 2000 1898 1879 2046 1903 2024
+  2004 1862 1901 2019 1910 1876 1893 2028 1996 2012
+```
+
+`tools/spread_shape.py`: gap ratio **15.0 with the gap IN THE MIDDLE**, rho
+against index +0.247 so no drift, split 12 low / 8 high at 1958.5, and **10
+runs against the 10.6 independent flips would give** — so membership is decided
+afresh each run rather than drifting.
+
+**Two clusters, 1890 and 2010, 6.3% apart, total spread 9.9%.**
+
+⚠ **The seven readings that motivated R4 spanned 2133 to 3221, which is 46%.**
+This round spans 9.9% on twenty. The difference is the governor: those were
+taken with whatever the board was doing, these at `performance`. So the
+question "two clusters or a tail" was being asked of a configuration nobody
+would quote from anyway. It is two clusters — but the row IS quotable now, as
+a median with a 10% range beside it.
+
+### ⚠ And a third independent sighting of the published margin
+
+The single-reading table in the same session, `REPEAT=1`:
+
+```
+  Qwen3      26.33 against 24.85   +6.0%
+  TinyLLAMA  22.68 against 19.71   +15.1%
+```
+
+against +5.8% and +16.1% on record, and +4.9% / +15.8% from the best of seven.
+**Three different ways of taking one number out of a bimodal sample all land on
+the high mode and all reproduce the published claim.** The median of seven puts
+both behind. Nothing about the code changed between them.
