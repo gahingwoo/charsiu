@@ -49,8 +49,22 @@ find_model() {
 }
 M=${1:-$(find_model 'Qwen3-0.6B-Q4_0.gguf' || true)}
 [ -n "$M" ] && [ -f "$M" ] || { echo "no model"; exit 2; }
-PASSES=${2:-8}
-P="The keeper of the lighthouse wrote down the barometer and the wind every morning for eleven years. Explain in plain words why a written record outlasts a memory:"
+PASSES=${2:-10}
+#
+# ⚠⚠ THE INVOCATION IS board_vendor.sh's, VERBATIM, AND THAT IS THE POINT.
+# The first version of this probe used its own prompt, -n 48, and neither of
+# the two environment variables the scoreboard sets -- so it changed three
+# things away from the configuration where the bimodality was SEEN, and then
+# reported levels that did not match it (19.7/11.4 against the observed
+# 20.5/26.1). An arm that is supposed to explain an observation has to start
+# from that observation's configuration and move ONE thing.
+#
+# Taken from tests/board_vendor.sh: the 128-token protocol prompt, -n 64,
+# --ignore-eos, -c 512, -t 4, MAXN and COEF_ELEMS. -t 4 beats CHARSIU_THREADS
+# because llama.c's pool_start only consults the environment when the flag is
+# absent, so the scoreboard has always run FOUR threads.
+#
+P="The history of computing begins long before the first electronic machine. Merchants kept accounts on clay, astronomers ruled tables by hand, and the abacus moved beads along a wire for two thousand years before anyone thought to make the beads move themselves. What changed was not arithmetic but who did it: a machine that could be told the order of operations once and would then repeat them without tiring, without a wage, and without the small drift of attention that makes a long column of figures a gamble. Explain, in plain words, why that shift mattered more than the speed:"
 
 #
 # ⚠ READ THE TOPOLOGY, DO NOT ASSUME IT. "cpu0-3 is the little cluster" is true
@@ -84,32 +98,36 @@ echo
 #
 run_one() {   # $1 = label, $2 = taskset prefix or empty
 	# shellcheck disable=SC2086
-	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_THREADS=4 \
-		$2 "$BIN/charsiu_run" "$M" -p "$P" -n 48 --ignore-eos -c 512 \
+	env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
+		$2 "$BIN/charsiu_run" "$M" -p "$P" -n 64 --ignore-eos -c 512 -t 4 \
 		2>/dev/null | grep -o 'gen [0-9]* tok in [0-9]* ms, [0-9.]* tok/s' |
 		head -1 | awk '{print $7}'
 }
 
 echo "== $(basename "$M"), $PASSES passes, arms ALTERNATING, pass 1 discarded"
-echo "   every arm runs CHARSIU_THREADS=4 so affinity is the only difference"
+echo "   board_vendor.sh's own invocation; -t 4, so four threads in every arm"
+echo "   ⚠ the DEFAULT arm is the scoreboard exactly: no taskset at all"
 echo
-ALL=; BG=; LT=
+DEF=; ALL8=; BG=; LT=
 i=0
 while [ $i -lt "$PASSES" ]; do
 	i=$((i + 1))
-	a=$(run_one all "")
+	d=$(run_one def "")
+	e=$(run_one all8 "taskset -c 0-7")
 	b=$(run_one big "taskset -c $BIG")
 	c=$(run_one lit "taskset -c $LIT")
-	printf '   pass %d   any4 %-7s big4 %-7s little4 %-7s%s\n' \
-		"$i" "${a:-FAIL}" "${b:-FAIL}" "${c:-FAIL}" \
-		"$([ $i = 1 ] && echo '   <- cold, discarded')"
+	printf '   pass %2d   default %-7s all8 %-7s big4 %-7s little4 %-7s%s\n' \
+		"$i" "${d:-FAIL}" "${e:-FAIL}" "${b:-FAIL}" "${c:-FAIL}" \
+		"$([ $i = 1 ] && echo '  <- cold, discarded')"
 	if [ $i -gt 1 ]; then
-		ALL="$ALL $a"; BG="$BG $b"; LT="$LT $c"
+		DEF="$DEF $d"; ALL8="$ALL8 $e"; BG="$BG $b"; LT="$LT $c"
 	fi
 done
 
 echo
-echo "   any four   $ALL"
+echo "   default    $DEF"
+echo "   all eight  $ALL8"
 echo "   big four   $BG"
 echo "   little4    $LT"
 echo
@@ -119,6 +137,18 @@ echo
 # each UNIMODAL and sit at the two levels, it is the scheduler, and the fix is
 # a policy rather than a finding. Say which before reading the numbers.
 #
-echo "⚠ read it as: pinned arms UNIMODAL and at the two levels  -> it is affinity"
-echo "              all three still bimodal                     -> it is not, look elsewhere"
-echo "              pinned arms unimodal but at the SAME level   -> it is neither cluster"
+#
+# ⚠⚠ THE FIRST THING TO CHECK IS THAT THE DEFAULT ARM REPRODUCED THE THING.
+# If `default` comes back unimodal, this round did not observe the effect at
+# all and NOTHING below it can be read -- not as a confirmation and not as a
+# refutation. A probe that cannot see the phenomenon cannot rule on its cause.
+#
+echo "⚠ FIRST: is the DEFAULT arm bimodal? If not, this round saw nothing and"
+echo "  none of the other arms mean anything either way."
+echo
+echo "  then: pinned arms unimodal, default bimodal   -> placement IS the switch"
+echo "        every arm bimodal, including all8       -> not placement; the two"
+echo "                                                   cores, the NPU clock or"
+echo "                                                   the governor's own steps"
+echo "        all8 unimodal but default bimodal       -> the scheduler's choice,"
+echo "                                                   not the cores themselves"
