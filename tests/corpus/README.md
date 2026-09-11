@@ -95,6 +95,39 @@ CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 
 The runtime says which of the two it is taking, once, on stderr.
 
+## ⛔⛔ THE RECORDED NUMBERS ARE ON A FILE HUGGING FACE NO LONGER SERVES
+
+2026-09-11. The board and the desk disagreed by 1.3% on the same nominal model.
+It was neither the toolchain nor the thread count: **it was the file.**
+`bartowski/Llama-3.2-1B-Instruct-GGUF` has been re-uploaded at some point, and
+the copy baked into this project's rootfs-overlay is the older one.
+
+```
+                                              md5           bytes      a row   g1024
+  rootfs-overlay, the whole record on it   c82c0340...   773025824   41.5289  33.8071
+  what Hugging Face serves today           48ff0243...   773025920   41.3739  34.2425
+```
+
+🔑 **With the SAME file the two machines agree to the last digit.** Desk against
+board, three arms, and the calibration pass writing the same 2647768 bytes:
+
+```
+              desk      board
+  int4      34.2425   34.2425
+  AWQ 0.20  23.6746   23.6746
+  int8      18.3604   18.3604
+```
+
+The desk is an aarch64 VM on GCC 13.3 and glibc 2.39; the board is a ROCK 4D
+on GCC 15.2 and glibc 2.43, a different kernel and a different thread count.
+**Perplexity survives all of that. It does not survive a different file**, and
+the file is the one thing nobody writes down.
+
+⚠ So a reader reproducing the README's 33.8071 today will get **34.2425** and
+have no way to see why. Every recorded figure stands, on the file named beside
+it; the file of record going forward is the one Hugging Face serves, because
+that is what a reader will get and what the board already runs.
+
 ## ⚠⚠ A perplexity needs THREE names, and the third is the one nobody writes
 
 **A model, a corpus, and a FILE.** charsiu re-quantises whatever it loads, so
@@ -102,11 +135,15 @@ the source format survives into the answer. Three ggufs of the same
 Llama-3.2-1B, these same 300 tokens, the same binary:
 
 ```
-                       one scale a row    group 1024
-  Q8_0                     34.6888         28.7072
-  Q4_0                     41.5289         33.8071    <- the record
-  Q4_0 "pure"              41.8712         30.2425
+                                   one scale a row    group 1024
+  Q8_0                                 34.6888         28.7072
+  Q4_0  c82c0340 (rootfs-overlay)      41.5289         33.8071   <- the record
+  Q4_0  48ff0243 (Hugging Face today)  41.3739         34.2425   <- what a reader gets
+  Q4_0 "pure"                          41.8712         30.2425
 ```
+
+⚠ **The two Q4_0 rows are the same URL at different times.** A file name and a
+quantisation are not an identity; only the md5 is.
 
 **Every Llama figure on record is the Q4_0 file**, and it reproduces to the
 last digit. A number from one file put beside a number from another is a 20%
