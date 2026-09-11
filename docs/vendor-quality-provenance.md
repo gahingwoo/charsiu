@@ -15,6 +15,11 @@ its inputs. Collected 2026-09-11.
                    md5  0cb5367ee9a555b8fad00db326ba1604
                    1321082528 bytes
 
+  the control      Llama-3.2-1B-Instruct-f16.gguf    (bartowski)
+                   md5  3ba43423d342673e26016ffe85268937
+                   2479595360 bytes
+                   CHARSIU_RKLLM_REF points the rebuild at this instead
+
   corpus           tests/corpus/long.txt
                    md5  4237c8fc3163a359fc21bde60c7b1d8b
                    scored at -n 300
@@ -87,6 +92,34 @@ of 300 tokens cannot order anything closer than about 10%.
 asymmetric with an integer zero point, charsiu here is symmetric absmax. This
 tree measures the zero point at about 1.4% at group 1024, so it is the small
 one, and it favours the vendor.
+
+## The quantisation origin, measured
+
+The vendor quantised the ORIGINAL weights. The charsiu arm quantised whatever
+`RC.REF` pointed at, which was the Q8_0 file, so the two sides started from
+different things and "asked to quantise the same thing" was not defensible.
+
+`CHARSIU_RKLLM_REF` overrides the reference. The same 43 matrices, rebuilt from
+the f16 original:
+
+```
+                        charsiu     vendor      ratio
+  from Q8_0   long        +6.65%    +13.32%     2.00x
+              long2       +4.39%     +9.50%     2.16x
+  from f16    long        +7.45%    +13.81%     1.85x
+              long2       +3.92%    +10.26%     2.62x
+```
+
+The asymmetry is real and points no particular way. Report the f16 row as an
+interval, 1.85x to 2.62x: it is the arm whose precondition holds, and the Q8_0
+interval is narrower for no good reason.
+
+⚠ Two gates had to be fixed to run this and only one failed loudly. `deq()`
+reshapes by 34, which is q8_0's block, and raised on an f16 tensor. The outer
+gate tested `tensor_type == 8`, which is q8_0's type id, and handed an f16 file
+it let every tensor fall past to a plain copy, printed "0 matrices and 0 norms
+replaced", and wrote a complete file. A charsiu arm identical to its reference
+would have scored as charsiu losing nothing.
 
 ## The checker rule, specified
 

@@ -196,6 +196,39 @@ inference:
 The vendor's four-bit excess is 2.0 to 2.4 times charsiu's, on three nested
 subsets, monotone.
 
+That ladder is on one passage, and the two sides quantised different things.
+Two controls have since been run on the 43-matrix subset and both move the
+headline, so read the next paragraphs before quoting a number from it.
+
+**The quantisation origin.** The vendor quantised the ORIGINAL weights; the
+charsiu arm quantised Q8_0, because that is what the reference pointed at. With
+both sides rebuilt from `Llama-3.2-1B-Instruct-f16.gguf` (md5
+`3ba43423d342673e26016ffe85268937`):
+
+```
+                        charsiu     vendor      ratio
+  from Q8_0   long        +6.65%    +13.32%     2.00x
+              long2       +4.39%     +9.50%     2.16x
+  from f16    long        +7.45%    +13.81%     1.85x
+              long2       +3.92%    +10.26%     2.62x
+```
+
+The asymmetry is real and points no particular way: from f16 charsiu is worse
+on one passage and better on the other. Report the f16 row, and report an
+interval, 1.85x to 2.62x, because that is the arm whose precondition holds.
+The Q8_0 interval is narrower for no good reason.
+
+**The group size.** The vendor keeps one fp32 scale and one integer zero point
+per OUTPUT ROW, so its group is the whole of K against charsiu's 1024. Matching
+the group is the obvious remedy and it is worse than the caveat: 2.00 and 2.16
+at group 1024 on the two passages, against 3.76 and 1.97 matched, which swings
+by a factor of two and cannot be quoted. State the difference; do not try to
+remove it.
+
+A third asymmetry runs the other way and no arm removes it: the vendor is
+asymmetric with an integer zero point and charsiu is symmetric absmax, worth
+about 1.4% at group 1024 by this tree's own measurement.
+
 ### What makes it evidence rather than a reconstruction of mine
 
 The weight layout is solved and held out: fitted on blocks 0 to 47, scored on
@@ -450,6 +483,11 @@ is at 800 mV, and a probe that did not fire says nothing on its own.
 Anything about a second RK3576. One board.
 
 The 112-matrix vendor rebuild, 58.76. It measures the reconstruction.
+
+A single figure for the vendor-to-charsiu ratio. Section 2: it is 1.85x to
+2.62x across two passages once both sides quantise the same original weights,
+and the 91- and 105-matrix rungs have not been re-run under that control. The
+ladder's shape holds; a point estimate taken from it does not.
 
 Cross-machine quality comparisons made before 2026-09-11. They compared two
 different files.
