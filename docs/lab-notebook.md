@@ -9889,3 +9889,61 @@ the rule and owning the tool did not help, because neither got consulted at the
 moment a new check was being written. The question that would have caught both
 is "how does this tree already compare this?", asked before writing the
 comparison rather than after reading its result.
+
+### ⛔⛔ THE GROUP SWEEP: three readings taken from one passage, all three wrong
+
+The vendor keeps ONE fp32 scale and one integer zero point per OUTPUT ROW --
+read off the slot offsets, 4096 floats between two 2048-row tensors and 16384
+between two 8192-row ones -- so its group is the whole of K while charsiu's is
+1024. The comparison was never one difference, and the obvious worry is that
+the finer group flatters us.
+
+`chr43g` takes the group from `CHARSIU_CHR_GROUP`. 43 matrices, `-n 300`:
+
+```
+  group     long.txt            long2.txt
+  ref       17.8719             32.9174
+   32       17.9111  +0.22%
+  128       18.2978  +2.38%
+  256       18.3356  +2.59%
+  512       18.0920  +1.23%     33.4423  +1.59%
+ 1024       19.0597  +6.65%     34.3625  +4.39%
+ 2048       18.5473  +3.78%     34.5030  +4.82%
+  row       18.5053  +3.54%
+  vendor    20.2531 +13.32%     36.0449  +9.50%
+```
+
+🔑 **`chr43g` at 32 reads 17.9111, which is the q4043 arm to the last digit.**
+The parameterised path reproduces the arm it generalises, which is the check
+that it is the same quantiser.
+
+⛔ **And three things I said from `long.txt` alone are all wrong.**
+
+**"The finer group flatters charsiu."** It does not. On `long.txt` group 1024
+is WORSE than the whole row, +6.65% against +3.54%.
+
+**"1024 is a bad point in the quantiser."** `long.txt` has a clear spike there,
+2.7% above both neighbours, and the mechanism was ready: `d = vmax / -8` with
+`vmax` the SIGNED value at max|w| (npuquant.c 606, and identically llama.cpp's
+q4_0 at ggml-quants.c 132), so a negative `vmax` maps to +8 and clips to 7.
+**`long2.txt` is monotone: 512 < 1024 < 2048, no spike.** The dip is that
+passage, not the quantiser.
+
+**"Matching the group makes the section harder."** It reverses:
+
+```
+                      long.txt   long2.txt
+  charsiu group 1024     2.00x      2.16x
+  charsiu whole row      3.76x      1.97x
+```
+
+🔑 **So the configuration already in the paper is the stable one.** Group 1024
+gives 2.00 and 2.16 on two independent passages; the matched-group variant
+swings from 3.76 to 1.97 and is not quotable. The caveat is still worth stating
+-- the groups differ -- but the remedy for it is worse than the caveat.
+
+⚠⚠ **Every one of the three was read from differences of 1 to 7%, and this
+tree's own rule is that one passage of 300 tokens cannot order anything closer
+than about 10%.** `charsiu_ppl` is deterministic, so the numbers reproduce; what
+does not reproduce is the ORDER. The only figure here that survived a second
+passage is the main ratio, which is the one that was already being reported.
