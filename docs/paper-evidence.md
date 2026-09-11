@@ -300,6 +300,45 @@ independent predictions, not two estimates of one thing.
 
 ---
 
+## 4b. The two cores, the overlap fault, and what the speed numbers ran under
+
+**The fault is real and it is attributed: it is the NPU's voltage margin, not
+the overlap.** `src/overlap.h` states it and the notebook carries the sweep —
+four device trees, same probe, four passes of 5400 rows each:
+
+```
+  786 MHz, 750 mV (mainline as U-Boot leaves it)   11 to 25 wrong words a pass
+  594 MHz, 750 mV                                   0, 0, 0, 0   (10% slower)
+  786 MHz, 800 mV                                   0, 0, 0, 0   (full speed)
+  786 MHz, 850 mV                                   0, 0, 0, 0
+```
+
+**Cite that sweep.** It is a controlled voltage series across four DTBs. It is
+not the same kind of evidence as a probe that failed to fire, and this project
+has both.
+
+⚠⚠ **AND EVERY SPEED NUMBER IN §1 RAN WITH THE TWO CORES OVERLAPPED.** The
+board reads 800 mV, `overlap_safe()` approves, `batch_serial()` defaults to
+`!overlap_safe()`, so the cores overlap by default. The TTFT and decode
+figures are overlapped figures. A reader on a 750 mV device tree gets neither
+these speeds nor these answers.
+
+⚠ **One boot on 2026-09-11 could not fire the fault at all** — 68 runs at the
+old map's worst cell (phi3, chunk 24, KMAX 2048) across `default`, `onedev`,
+`serial`, `parallel` and `zero`, with the affinity pin on and off. That is
+consistent with the sweep, since the board is at 800 mV, and it is worth
+exactly one sentence: **it confirms the guard end to end on the shipped binary,
+and it establishes nothing on its own.** A probe that does not fire and a fault
+that no longer happens are the same picture.
+
+🔑 What it did establish, because the arms were run for it: **the affinity
+default shipped today does not mask the race.** 14 of 14 clean with
+`CHARSIU_AFFINITY=0` and 14 of 14 with the pin. A race that stops firing
+because the timing moved would be masked rather than fixed, and it is worth
+checking whenever a scheduling default changes.
+
+---
+
 ## 5. Bandwidth figures — which are quotable
 
 ```
@@ -365,6 +404,8 @@ ends — and refuses to be read as one round if the boot id moved.
 
 - **Any claim about the vendor's runtime speed measured here.** It has never
   been run in this project. §1's right column is a citation.
+- **That the overlap fault is gone.** §4b: it is rail-conditioned, this board
+  is at 800 mV, and a probe that did not fire says nothing on its own.
 - **Anything about a second RK3576.** One board.
 - **The 112-matrix vendor rebuild (58.76).** It measures the reconstruction.
 - **Cross-machine quality comparisons made before 2026-09-11.** They compared
