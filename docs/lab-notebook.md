@@ -9716,3 +9716,71 @@ road that 09-08 had measured dead. A closed question does not look closed from
 outside — it looks like an open one nobody has touched lately, and the instinct
 to go and measure is the same instinct that is usually right. What separates
 them is five minutes of reading, and reading does not feel like working.
+
+### 🏁 SCOPING THE PER-TENSOR WIDTH REFACTOR: the buffers already fit
+
+`npu_mixed_test` cleared the hardware question, so the remaining one is what it
+costs to write. Three findings, and the order matters because the first kills a
+cheaper idea I had.
+
+**1. There is no narrow path. An int8 device cannot carry int4 bytes.**
+The obvious shortcut is to open a mixed model as int8, since "an int8 DEVICE
+reading int4 codes" already works and every vision tower does it. It does not
+help, and `pack_rows` says why:
+
+```c
+  v = pk ? q_code(src, i) : src[i];          /* unpack the source */
+  dst[c] = g->w4 ? (v & 0xfu) : (v + 128);   /* one byte a code if int8 */
+```
+
+The codes are UNPACKED at staging when the device is int8. So a mixed model
+opened as int8 puts int4 layers on the wire at int8 bytes, which is int4's
+answer at int8's bandwidth -- the exact inverse of what `INT8_LAYERS` is for,
+and what `npu_mixed_test`'s header already said when it called that route
+dominated. Refuted by reading, before any code was written.
+
+**2. The tensor is in scope nearly everywhere `g->w4` is read.** 48 real uses,
+and the ones that matter sit where a tensor or an entry already is:
+
+```
+  charsiu_npu_open_mode, report, needs_q1     ~6   DEVICE level, unchanged
+  pack_rows, tensor_grouped, add_slice, ...   ~8   `t` is a parameter
+  read_rows{,2,4}, read_fused_rows            ~10  `c->e->t` is one hop
+  npu_matmul_inner, matvec_group              ~10  entries are in hand
+  bin_stride and the MB arithmetic             ~4  sizing, see below
+```
+
+`struct npu_entry` carries `const struct npu_tensor *t` as its second field, so
+the refactor threads no new state. Only `charsiu_npu_slot_word` has a slot and
+no entry.
+
+🔑 **3. AND THE BUFFERS ALREADY HAVE ROOM.** This was the risk worth checking
+first, because it is the one that could have made the refactor impossible
+rather than tedious. `charsiu_npu_open_mode` sizes the shared buffers from a
+shape that is explicitly int8:
+
+```c
+  struct charsiu_matmul widest = { 1, kwide, g->nmax, CHARSIU_INT8, CHARSIU_INT8 };
+  g->scratch = malloc(nmax * kmax_wide(g) + max_k);   /* one byte an element */
+  g->wpack   = malloc(nmax * kmax_wide(g) + 4096);
+  if (g->w4) g->in_stride *= 2;                        /* fp16 is two bytes */
+```
+
+So an int4 device's scratch and wpack are already the int8 size, and its
+`in_stride` is already TWICE what an int8 tensor needs, because an fp16
+activation is wider than an int8 one. Every shared buffer on a four-bit device
+has room for an eight-bit tensor.
+
+And the per-slice weight buffer follows the job rather than the device:
+`memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm))`, where
+`s->job.mm.wdtype` is the thing being made per-tensor. It resizes itself.
+
+▶ So the refactor is mechanical threading plus one function that decides the
+width, and the first candidate for that function is `t->packed`, which is
+exactly what the existing refusal tests: `if (g->w4 && !t->packed)`.
+
+⚠ Two things it still has to get right, neither of which the sizing covers:
+`slice_wsum`'s `if (!g->w4)` gate computes the zero-point correction that only
+int8 needs, and `adtype` differs (w4 wants fp16 activations, w8 wants int8), so
+a group that mixes widths cannot share one packed activation. The tree has
+already priced that second one at about 2%.
