@@ -100,7 +100,18 @@ echo "================================================================"
 echo " charsiu round of record   $(date -Is)"
 echo "================================================================"
 echo " charsiu   $(cd "$D/.." 2>/dev/null && git log --oneline -1 2>/dev/null || echo 'not a git tree here')"
+#
+# ⚠⚠ THE FINGERPRINT, NOT THE FILENAME. Two machines can hold different bytes
+# under one name, and charsiu re-quantises whatever it loads, so the source
+# file is inside every perplexity it prints. The desk and this board disagree
+# by about 1.3% on the same nominal model, and an md5 on each side is what
+# decides whether that is the FILE or the BINARY -- thread count is already
+# ruled out, since 8, 4 and 1 threads give 33.8071 on the desk bit for bit.
+#
 echo " quality model file:  ${QMODEL:-NOT FOUND}"
+[ -n "$QMODEL" ] && echo " quality model md5:   $(md5sum "$QMODEL" 2>/dev/null | cut -c1-32)  ($(stat -Lc%s "$QMODEL" 2>/dev/null) bytes)"
+echo " charsiu_ppl binary:  $BIN/charsiu_ppl  md5 $(md5sum "$BIN/charsiu_ppl" 2>/dev/null | cut -c1-32)"
+echo " threads:             ${CHARSIU_THREADS:-all $(nproc 2>/dev/null) cores}"
 echo " corpus:              $CORPUS  ($(md5sum "$CORPUS" 2>/dev/null | cut -c1-32))"
 echo " speed REPEAT:        $REPEAT      gemma4 sweep N: $NSWEEP"
 [ "$REPEAT" -ge 7 ] || echo " ⚠⚠ REPEAT WAS CUT -- this is a dry run, not a round of record"
