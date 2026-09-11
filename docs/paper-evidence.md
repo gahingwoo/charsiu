@@ -83,6 +83,39 @@ could do but would not do reliably. **The paper should say the margin is
 +5.7%/+15.6% from a median, and that this required pinning; it should not
 quote a best-of-N.**
 
+### 1b-2. The TTFT gap is NOT attributed, and the obvious explanation does not fit
+
+The runtime's own report from the same round:
+
+```
+              TTFT  theirs  ratio   submits  MB/submit  "dispatch rather than bytes"
+  Qwen3        613  468.61  1.31x    14718     1.32          23%
+  TinyLLAMA    890  543.68  1.64x    11702     2.87          14%
+  Phi3        2987 1829.12  1.63x    16962     7.13           4%
+  Gemma4      2222 1219.25  1.82x    25790     2.92          13%
+```
+
+⛔ **Per-call overhead does not explain the gap.** The model with the MOST
+dispatch overhead has the SMALLEST gap (Qwen3, 23% and 1.31x) and the one with
+the least has nearly the largest (Phi3, 4% and 1.63x). The correlation runs
+backwards.
+
+⚠⚠ **And those counters cannot be used for TTFT anyway** — they cover the whole
+process, and with 64 generated tokens a run the calls are mostly DECODE's. Any
+attribution of prompt time from them is a category error, including the one
+above; it is written down to close the road, not to travel it.
+
+⚠ The report's own GB/s figures are self-flagged in all four models: *"that
+remainder is NEGATIVE, so the hardware path and the wall clock are counting
+different calls -- the rate above is not a fact about the hardware"*. Do not
+quote them.
+
+👉 **So the paper should state the TTFT gap and say it is unattributed.** What
+is measured is that the prompt batches on all four (§1c) and that the saving
+from batching is the output head to 1.4% (§4). What is NOT measured is where
+the remaining 1.3-1.8x goes. A prefill-only instrumentation round would be the
+next piece of work, and it does not exist yet.
+
 ### 1c. The pinning default is safe across every architecture
 
 `a58086c` changes a default that touches every workload on every model, and
@@ -300,6 +333,9 @@ ends — and refuses to be read as one round if the boot id moved.
 - **The 112-matrix vendor rebuild (58.76).** It measures the reconstruction.
 - **Cross-machine quality comparisons made before 2026-09-11.** They compared
   two different files.
+- **Any attribution of the TTFT gap.** §1b-2: the per-call explanation runs
+  backwards against the data, and the counters that might attribute it cover
+  the whole process rather than the prompt.
 - **`CHARSIU_NPU_INT8_LAYERS` on hardware.** `npu_mixed_test` shows one open
   device alternates w8a8 and w4a16 correctly (0 of 18 dispatches wrong over
   eight alternations both ways) at K=256 N=64, which says the per-tensor width
