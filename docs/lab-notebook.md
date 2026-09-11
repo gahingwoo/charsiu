@@ -9440,3 +9440,59 @@ and two high, gap ratio 49, was called "at an END" because both quartiles sat
 inside the low cluster. Two clusters of very different sizes are still two
 clusters; what must not pass is a single outlier, so the rule is now two
 readings a side.
+
+### 🏁🏁🏁 THE AFFINITY DEFAULT, VERIFIED ON HARDWARE — AND IT IS THE HONEST +5.6%
+
+`a58086c` pins the calling thread to the fastest cluster. The desk cannot test
+it: no cpufreq there, so the detection returns 0 and the code does nothing at
+all — 33.8071 before and after, and with `CHARSIU_AFFINITY=0` and
+`CHARSIU_CPUS=off`. "Written, legal, default on" was three things and only the
+last was certain until the board ran it.
+
+Three checks, expectation written before the round:
+
+```
+  the tell    charsiu: this thread on the fastest cluster, 4 CPUs
+  the text    TEXT IDENTICAL, pinned against CHARSIU_AFFINITY=0
+```
+
+and then the same four arms, same invocation, same board, one binary apart:
+
+```
+                   BEFORE (a58086c^)                       AFTER
+  default    20.92 20.59 20.53 26.35 ... 26.37   |  26.07 26.39 25.89 26.46 25.86 26.32 26.25
+  all eight  20.65 20.11 20.94 20.55 ... 26.40   |  26.62 25.62 26.36 26.24 26.10 26.49 26.35
+  big four   26.20 26.53 26.55 26.60 ... 26.49   |  26.16 26.06 26.48 26.67 26.49 26.43 26.51
+  little4    18.35 18.22 18.16 18.26 ... 18.34   |  18.26 18.32 18.31 18.18 18.30 18.32 18.26
+
+  default    BIMODAL, 28.5% spread               |  2.3% spread, one population
+  all eight  BIMODAL, 30.6%                      |  3.8%
+```
+
+```
+  default median   20.92 -> 26.25    +25.5%
+  against 24.85   -15.8% -> +5.6%
+  spread           28.5% ->   2.3%
+```
+
+**The default arm is now the big-four arm**, which is what the prediction said
+it would be, and the lottery is gone.
+
+🔑 **`little4` is unchanged at 18.3, and that is the intersection working.**
+`taskset -c 0-3` restricts the process to the slow cluster; charsiu looks for
+the fastest cluster WITHIN the inherited mask, finds all four equal, and
+declines to act. An operator who has answered this question is not overruled.
+`all eight` is fixed for the same reason in the other direction: the fast
+cluster inside 0-7 is 4-7.
+
+🔑 **And this is what the vendor comparison should have been all along.** +5.6%
+against their published 24.85, with a 2.3% spread, from a configuration that
+reproduces — instead of +4.9% from the best of seven readings spanning 28%.
+The margin barely moved; what changed is that it is now a measurement rather
+than a selection. **The fix was never a better statistic, it was telling the
+runtime where to run.**
+
+⚠ Still true and still has to be said beside it: their column is a citation,
+at maximum frequency, with no N and no spread. A 5.6% margin over a point
+estimate of unknown method is not a result, it is a comparison. What IS a
+result is 20.92 -> 26.25 on the same binary and the same board.
