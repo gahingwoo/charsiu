@@ -66,6 +66,24 @@ reach on this board, so they are at rate rather than idling. What is left to
 win is the number of bytes read back, and that is set by the quantisation
 group.
 
+⚠ **THREE DIFFERENT RATES GET CALLED "THE BANDWIDTH" IN THIS PROJECT AND ONLY
+SOME OF THEM ARE ONE.** The three above are a memcpy rate measured directly,
+and they are comparable to each other. Two others are quoted elsewhere and
+should not be:
+
+- **11.7 GB/s** is `npu_prep_cost`'s cache walk at 65536 bytes (round 151). It
+  is real, and it is the rate of buffer MAINTENANCE, not of weights.
+- ⛔ **9.9 GB/s is not a bandwidth at all.** It is gemma4's q/k/v stage,
+  81.0 MB a token over 8.15 ms, computed from gguf shapes -- and the entry it
+  comes from exists to argue that such a number is NOT a roof: in the same
+  table `gate + up` reaches **16.8**, the biggest stage being the fastest. A
+  roof does not have a 2.3x spread across shapes; a fixed cost does. Quoting
+  9.9 as a bandwidth cites a figure the tree derived in order to refute it.
+
+The one number that behaves like a roof is the weight rate the NPU summary
+reports, **10.58 GB/s**, and the head's own cost agrees with it to 1.4% from
+its shape alone (PLAN.md, section 2).
+
 **One line of device tree matters.** Mainline clocks the NPU at 786 MHz and
 leaves the rail wherever U-Boot put it, 750 mV, where the vendor's own table
 asks 800 mV of that speed. At 750 the two cores get about one row in a thousand

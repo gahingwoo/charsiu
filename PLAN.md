@@ -1896,15 +1896,28 @@ board that warms over a minute cannot be mistaken for the flag:
   saved                        12.40 ms a token
 ```
 
-⚠ AND THE SAVING IS THE OUTPUT HEAD, TO WITHIN 1.4%, BY AN ARITHMETIC THAT
-NEVER SAW THESE TIMINGS. The head runs once instead of 65 times, so the saving
-per token is H * 64/65 and H is 12.59 ms. Llama-3.2-1B's head is 128256 x 2048,
-which at int4 is 131.3 MB of weights, and
+🔑 AND THE SAVING IS THE OUTPUT HEAD, BY AN ARITHMETIC THAT NEVER SAW THESE
+TIMINGS. The head runs once instead of 65 times, so the saving per token is
+`H * 64/65` where H is the head's own cost, 12.59 ms:
+
+  12.59 * 64/65 = 12.396 ms   predicted
+                  12.40  ms   measured, above
+
+⚠⚠ **12.40 AND 12.59 ARE NOT TWO ESTIMATES OF ONE QUANTITY** and reading them
+as a disagreement to be settled by another board round is a mistake this file
+has invited at least once. 12.59 is what the head costs ONCE; 12.40 is what a
+token saves, and the ratio between them is 64/65 exactly. Nothing is
+unresolved here.
+
+The 1.4% is a different check, and it is the one that makes this evidence
+rather than bookkeeping. Llama-3.2-1B's head is 128256 x 2048, which at int4 is
+131.3 MB of weights, and
 
   131.3 MB / 12.59 ms = 10.43 GB/s
 
 against the 10.58 GB/s this model's own NPU summary reports for weight
-bandwidth. The time the batched prompt does not spend is exactly the time it
+bandwidth -- **1.4% apart, from a shape and a rate that never saw the
+stopwatch**. The time the batched prompt does not spend is exactly the time it
 takes to stream the head's weights, once per token, at the rate this board
 moves weights.
 
