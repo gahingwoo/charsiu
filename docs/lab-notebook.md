@@ -9236,3 +9236,71 @@ carries the most extreme row gauge in the model and `blk.1.ffn_down` is not
 reconstructed at all — the per-column model leaves 147% of it, and the build
 prints `KEEPING REFERENCE` for it. That number measures my reconstruction, not
 their quality, and a harness that can print it will eventually have it quoted.
+
+### ⛔⛔⛔ THE SCOREBOARD'S MARGIN WAS best-of-N PICKING THE FAST MODE
+
+2026-09-11, ROCK 4D, one boot, performance governor, REPEAT=7. The table has
+reported BEST of N since it learned to repeat at all, and this is the round
+that printed every reading beside it:
+
+```
+  model         readings (decode, in time order)                  best   median  theirs
+  Qwen3      20.76 24.25 20.61 20.27 26.06 20.81 20.54            26.06   20.76   24.85
+  TinyLLAMA  19.11 19.41 22.83 21.94 19.24 19.15 20.08            22.83   19.41   19.71
+  Phi3        7.04  5.96  5.98  5.96  5.96  5.96  7.04             7.04    5.96    6.58
+  Gemma4      7.25  7.34  7.28  9.33  7.28  7.32  7.28             9.33    7.28    9.23
+```
+
+**Three of the four are TWO CLUSTERS** by `tools/spread_shape.py`, whose rule
+was fixed before this data existed: gap ratio 16.4, 4.4 and infinite, each with
+the gap IN THE MIDDLE and no drift. And all four split **5 low / 2 high**.
+
+⚠ Phi3 is the one to look at. It reads **5.96 five times and 7.04 twice, the
+same two values exactly**. The median gap between sorted readings is 0.0. That
+is not a noisy measurement, it is a switch with two positions.
+
+🔑 **And best-of-N lands on the high cluster every time, which is where the
+project's headline came from:**
+
+```
+  best of N     Qwen3 26.06 / 24.85 = +4.9%      TinyLLAMA 22.83 / 19.71 = +15.8%
+  the claim on record                +5.8%                                +16.1%
+  median of 7   Qwen3 20.76 / 24.85 = -16.5%     TinyLLAMA 19.41 / 19.71 =  -1.5%
+```
+
+**Every model is BEHIND on the median.** Qwen3 -16.5%, TinyLLAMA -1.5%,
+Phi3 -9.4%, Gemma4 -21.1%. The recorded superiority is a statistic choosing
+the better of two modes, and it reproduces the published claim almost to the
+decimal, which is how it stayed invisible.
+
+⚠⚠ The vendor column is still a CITATION -- their published benchmark.md at
+maximum frequency, no N, no spread. So "behind" is as unfalsifiable as "ahead"
+was: what changed is that OUR side now has a spread and it straddles their
+point. The honest statement is that on this board, at the performance
+governor, charsiu's decode has two modes and the vendor's figure sits between
+them on two models of four.
+
+⚠ TTFT is NOT bimodal in the same round -- Qwen3 598..623, gemma4 2182..2305,
+a few percent each. Whatever switches is in the decode loop.
+
+▶ THE OPEN QUESTION, and it is now the most valuable one in the project: what
+has two positions? The ratios are 1.26, 1.18, 1.18 and 1.28 -- suspiciously
+like A72 against A53 on an RK3576's 4+4, so the first arm is `taskset`.
+
+### ⚠⚠ And `set -e` plus a substitution that can fail killed the boot check
+
+Section 3 printed its header and nothing else -- no readings, no skip message,
+no end-of-round environment, and no BOOT ID CHECK, which is the one thing the
+round of record exists for. This board publishes no `thermal_zone` at all, so
+
+```
+  T=$(for z in /sys/class/thermal/thermal_zone*/temp; do
+        [ -e "$z" ] && awk ... "$z"; done)
+```
+
+left the glob literal, `[ -e ]` false, the substitution exiting non-zero, and
+`set -e` took the script with it. In silence.
+
+🔑 **It only appeared once gemma4 was FOUND.** While the sweep was skipping,
+that line never ran. Fixing the model resolution uncovered it -- which is the
+ordinary shape of this: a guard that skips hides the code behind it.

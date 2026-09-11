@@ -218,8 +218,23 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 	i=0
 	while [ $i -lt "$NSWEEP" ]; do
 		i=$((i + 1))
+		#
+		# ⚠⚠ `set -e` AND A COMMAND SUBSTITUTION THAT CAN FAIL KILLED
+		# THIS WHOLE SECTION, SILENTLY. This board publishes no
+		# thermal_zone at all, so the glob stayed literal, `[ -e ]`
+		# was false, the substitution exited non-zero and took the
+		# script with it -- no reading, no error, and the end-of-round
+		# environment block and the BOOT ID CHECK never ran either.
+		# The one check the round of record exists for.
+		#
+		# It only appeared once gemma4 was found: while the sweep was
+		# skipping, this line never ran. Fixing one fault uncovered it.
+		#
 		T=$(for z in /sys/class/thermal/thermal_zone*/temp; do
-			[ -e "$z" ] && awk '{printf "%.1f ", $1/1000}' "$z"; done)
+			[ -e "$z" ] || continue
+			awk '{printf "%.1f ", $1/1000}' "$z" 2>/dev/null
+		done; true)
+		[ -n "$T" ] || T="(no thermal zone on this board)"
 		MS=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 		     "$BIN/charsiu_run" "$GM" -p "Explain in plain words why a written record outlasts a memory." \
 		     -n 8 --ignore-eos -c 512 -t 4 2>/dev/null |
