@@ -10000,3 +10000,83 @@ third time today.**
 assumption with no name, and it only becomes visible when the format changes.
 `deq`'s crashed; the gate's returned an empty result that looked like a
 measurement.
+
+---
+
+## 2026-09-12 -- the ladder under the f16 origin, and "monotone" was one passage
+
+The last item the handoff left that needed neither the board nor a decision:
+the 91- and 105-matrix rungs had never been re-run with both sides quantising
+the original weights. They have been now, and both passages went with them.
+
+### 🏁 The instrument reproduced first
+
+The 43-matrix rung under f16 read `+13.81% / +7.45%` on `long.txt` and
+`+10.26% / +3.92%` on `long2.txt` -- the recorded numbers, to the last digit,
+after the harness had been changed underneath them. A new reading from an
+instrument that has just been rebuilt is worth what the old reading says about
+it.
+
+### ⛔ THE LADDER IS NOT MONOTONE, AND THAT CLAIM WAS ONE PASSAGE
+
+```
+                            long.txt                    long2.txt
+  reference (f16)            17.9023                     32.8163
+
+  matrices          vendor  charsiu  ratio      vendor  charsiu  ratio
+  43  (rho = 1)    +13.81%   +7.45%  1.85x     +10.26%   +3.92%  2.62x
+  91  (layers 3+)  +41.00%  +20.48%  2.00x     +26.01%  +18.38%  1.42x
+  105 (no layer 1) +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
+```
+
+`long.txt` climbs 1.85, 2.00, 2.18. That is where "2.0 to 2.4 times charsiu's,
+on three nested subsets, monotone" came from, and it is a clean-looking
+result: more matrices swapped, more of a gap. `long2.txt` reads 2.62, 1.42,
+1.65 and puts the 43-matrix rung at the TOP of the three instead of the
+bottom. Nothing about subset size orders these.
+
+🔑 **What survives is the direction: six cells of six, the vendor's four-bit
+excess is larger.** The size is an interval, 1.4x to 2.6x. That is a weaker
+sentence than the one it replaces and it is the one that is true on both
+passages.
+
+⚠⚠ **This is the fourth conclusion in this comparison read off `long.txt`
+alone and reversed by the second passage.** The other three were the group
+sweep's, yesterday. The pattern is not that I keep forgetting to run the
+second passage -- it is that the FIRST passage always produces a clean story,
+because a single sample of anything can be ordered and an ordering reads as
+structure. So the corpus is a list in the harness now and both passages are
+scored from one build. It costs a forward pass, not a rebuild: the arm's
+2.5 GB file is already on the disk and is deleted either way.
+
+### ⛔ Two ways a stale file wore a valid name
+
+Both turned up while setting the round up, and they are one shape: **the cache
+key did not carry the thing that makes the entry valid.**
+
+**The origin was not in the name.** Arms cached as
+`Llama-3.2-1B-<arm>-F16.gguf` say nothing about what they were built from, and
+two of them from 09-09 -- Q8_0 origin -- were still in `models/` when the f16
+round started. `ref` is in every arm list, so the f16 round would have taken
+its reference perplexity from the Q8_0 file and shifted every percentage in
+the ladder with nothing on screen to say so. The reference md5's first eight
+hex are in the filename now.
+
+This is the same landmine as `bmap` keyed on the row count alone while the
+width had become a per-tensor question. **A key that was complete stops being
+complete the moment a new axis is added, and nothing announces it.**
+
+**Existing was read as complete.** A rebuild killed mid-write by a session
+crash left 1046478848 bytes of a 2.48 GB arm under the final name, and the
+next round's `[ ! -f "$F" ]` accepted it. It failed loudly when scored, which
+was luck -- a truncated gguf that still loads would have been scored instead.
+The rebuild writes `.part` and renames after close now.
+
+### ⚠ rho1 and vendor43 are the same file
+
+They scored identically on both passages, which is the tell for an arm that
+never ran. They are the same file, md5 `9d8e82952e96a6f14eeaa4b016704dde`:
+both replace 43 matrices, both move away from the reference, and dividing the
+calibration out changes not one f16 weight on the rho = 1 subset. That is what
+the subset is FOR, so this is construction and not a null arm -- but it is one
+measurement printed as two agreeing ones, and the pack says so now.

@@ -182,28 +182,36 @@ The comparison nothing in the literature has: the vendor's stored weights,
 scored. It needs no board and no vendor install. `tools/rkllm_rebuild.py` reads
 the `.rkllm` and `tests/vendor_quality.sh` scores it.
 
-All arms are f16 files differing only in the swapped matrices, from the Q8_0
-source, on `tests/corpus/long.txt` at `-n 300`, with no quantiser running at
-inference:
+All arms are f16 files differing only in the swapped matrices, rebuilt from
+`Llama-3.2-1B-Instruct-f16.gguf` (md5 `3ba43423d342673e26016ffe85268937`) so
+that both sides quantise the ORIGINAL weights, at `-n 300`, with no quantiser
+running at inference. Every rung is scored on both passages:
 
 ```
-  matrices                   ref     vendor   charsiu    q4_0    vendor  charsiu  ratio
-  43  (rho = 1)          17.8719   20.2531   19.0597  17.9111  +13.32%   +6.65%  2.00x
-  91  (layers 3..15)     17.8719   25.1141   21.1186  18.0910  +40.52%  +18.17%  2.23x
-  105 (all but layer 1)  17.8719   29.9056   22.9824       --  +67.33%  +28.60%  2.35x
+                            tests/corpus/long.txt      tests/corpus/long2.txt
+  reference (f16)                  17.9023                     32.8163
+
+  matrices                vendor  charsiu  ratio      vendor  charsiu  ratio
+  43  (rho = 1)          +13.81%   +7.45%  1.85x     +10.26%   +3.92%  2.62x
+  91  (layers 3..15)     +41.00%  +20.48%  2.00x     +26.01%  +18.38%  1.42x
+  105 (all but layer 1)  +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
 ```
 
-The vendor's four-bit excess is 2.0 to 2.4 times charsiu's, on three nested
-subsets, monotone.
+**What is robust is the direction: six cells of six, the vendor's four-bit
+excess is larger than charsiu's.** The size of it is an interval, 1.4x to 2.6x,
+and the paper should quote the interval and nothing narrower.
 
-That ladder is on one passage, and the two sides quantised different things.
-Two controls have since been run on the 43-matrix subset and both move the
-headline, so read the next paragraphs before quoting a number from it.
+⛔ **The ladder is NOT monotone and the earlier text saying so was one
+passage.** On `long.txt` the ratio climbs with the subset, 1.85 to 2.00 to
+2.18, which is what "monotone" was read from. On `long2.txt` it does not:
+2.62, 1.42, 1.65, and the 43-matrix rung goes from the lowest of the three to
+the highest. Nothing about subset size orders these; only the sign survives.
 
-**The quantisation origin.** The vendor quantised the ORIGINAL weights; the
-charsiu arm quantised Q8_0, because that is what the reference pointed at. With
-both sides rebuilt from `Llama-3.2-1B-Instruct-f16.gguf` (md5
-`3ba43423d342673e26016ffe85268937`):
+**The quantisation origin, which is why the numbers above are not the ones
+first published.** The vendor quantised the ORIGINAL weights; the charsiu arm
+quantised Q8_0, because that is what the reference pointed at, so "asked to
+quantise the same thing" was not defensible. On the 43-matrix rung, both
+origins:
 
 ```
                         charsiu     vendor      ratio
@@ -214,9 +222,14 @@ both sides rebuilt from `Llama-3.2-1B-Instruct-f16.gguf` (md5
 ```
 
 The asymmetry is real and points no particular way: from f16 charsiu is worse
-on one passage and better on the other. Report the f16 row, and report an
-interval, 1.85x to 2.62x, because that is the arm whose precondition holds.
-The Q8_0 interval is narrower for no good reason.
+on one passage and better on the other. Report the f16 rows: they are the arm
+whose precondition holds. The Q8_0 interval is narrower for no good reason.
+
+⚠ `rho1` and `vendor43` are the SAME FILE, byte for byte, md5
+`9d8e82952e96a6f14eeaa4b016704dde`. That is the point of the rho = 1 subset
+rather than a second measurement of it: dividing the calibration out changes
+not one f16 weight there, so the two code paths land on the same weights. Do
+not report them as two agreeing arms.
 
 **The group size.** The vendor keeps one fp32 scale and one integer zero point
 per OUTPUT ROW, so its group is the whole of K against charsiu's 1024. Matching
@@ -484,10 +497,13 @@ Anything about a second RK3576. One board.
 
 The 112-matrix vendor rebuild, 58.76. It measures the reconstruction.
 
-A single figure for the vendor-to-charsiu ratio. Section 2: it is 1.85x to
-2.62x across two passages once both sides quantise the same original weights,
-and the 91- and 105-matrix rungs have not been re-run under that control. The
-ladder's shape holds; a point estimate taken from it does not.
+A single figure for the vendor-to-charsiu ratio. Section 2: all three rungs are
+now under the f16 origin on both passages, and the six ratios run 1.42x to
+2.62x. The direction is unanimous; the magnitude is an interval.
+
+That the ladder is monotone in subset size. It is on `long.txt` and it is not
+on `long2.txt`, where the 43-matrix rung is the highest of the three rather
+than the lowest. This was stated as a finding and it was one passage.
 
 Cross-machine quality comparisons made before 2026-09-11. They compared two
 different files.

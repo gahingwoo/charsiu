@@ -110,9 +110,55 @@ the f16 original:
               long2       +3.92%    +10.26%     2.62x
 ```
 
-The asymmetry is real and points no particular way. Report the f16 row as an
-interval, 1.85x to 2.62x: it is the arm whose precondition holds, and the Q8_0
-interval is narrower for no good reason.
+The asymmetry is real and points no particular way. Report the f16 rows: they
+are the arm whose precondition holds, and the Q8_0 interval is narrower for no
+good reason.
+
+### All three rungs under that control, both passages (2026-09-12)
+
+```
+                            long.txt                    long2.txt
+  reference (f16)            17.9023                     32.8163
+
+  matrices          vendor  charsiu  ratio      vendor  charsiu  ratio
+  43  (rho = 1)    +13.81%   +7.45%  1.85x     +10.26%   +3.92%  2.62x
+  91  (layers 3+)  +41.00%  +20.48%  2.00x     +26.01%  +18.38%  1.42x
+  105 (no layer 1) +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
+```
+
+**Six cells of six put the vendor's four-bit excess above charsiu's. That is
+the finding.** The interval is 1.4x to 2.6x and nothing narrower is supported.
+
+⛔ **And the ladder is not monotone.** `long.txt` climbs 1.85, 2.00, 2.18,
+which is where "monotone across three nested subsets" came from; `long2.txt`
+reads 2.62, 1.42, 1.65 and puts the 43-matrix rung at the top instead of the
+bottom. That is the FOURTH conclusion of this comparison read off one passage
+and reversed by the second.
+
+⚠ `rho1` and `vendor43` rebuild to the same file, md5
+`9d8e82952e96a6f14eeaa4b016704dde`, on both origins. Both arms report "43
+matrices replaced" and both move away from the reference, so neither is a
+null arm; they coincide because dividing the calibration out changes no f16
+weight on the rho = 1 subset, which is what that subset is for. They are one
+measurement and must not be printed as two agreeing ones.
+
+## ⛔ Two ways the harness reused a file it should have rebuilt
+
+Both were found while running the rungs above, and both are the same shape:
+the cache key did not carry what makes the entry valid.
+
+**The origin was not in the name.** An arm was cached as
+`Llama-3.2-1B-<arm>-F16.gguf`, which says nothing about what it was built
+from. Two such files from 2026-09-09, built from Q8_0, were still in `models/`
+when the f16 round started, and `ref` is in every arm list. The f16 round
+would have taken its reference perplexity from the Q8_0 origin and shifted
+every percentage in the ladder, silently. The reference md5's first eight hex
+are in the filename now (`rkllm_codes.ref_tag`).
+
+**Existing was being read as complete.** A rebuild killed mid-write left
+1046478848 bytes of a 2.48 GB arm under the final name; the next round's
+`[ ! -f "$F" ]` accepted it and scored it. It failed loudly that time, which
+was luck. The rebuild writes `<path>.part` and renames after close now.
 
 ⚠ Two gates had to be fixed to run this and only one failed loudly. `deq()`
 reshapes by 34, which is q8_0's block, and raised on an f16 tensor. The outer
