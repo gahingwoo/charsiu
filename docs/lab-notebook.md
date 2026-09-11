@@ -9184,3 +9184,55 @@ annotation and the practice disagree and one of them has to move.
 - **`find -maxdepth N` answering "nothing there" is not "nothing there".** I
   concluded from a truncated search that the host had one Llama gguf, and built
   a whole explanation on top of that. The unbounded search took 90 seconds.
+
+### 🏁🏁 The vendor's quantiser, scored on a PINNED protocol — and the ratio moved
+
+The empty cell has been filled since 2026-09-09, but the numbers behind it
+recorded `reference 19.8844` in three places and never said on what text or at
+what length. That is not a protocol, it is a number, and it cannot be put
+beside anything else in the tree. `tests/vendor_quality.sh` pins it:
+`tests/corpus/long.txt` at `-n 300`, the corpus `corpus_fixed.sh` locks by md5,
+from `Llama-3.2-1B-Instruct-Q8_0.gguf` — the least lossy source available, so
+what is scored is each quantiser and not what happened to the file before it.
+
+43 matrices, the ones whose scale still satisfies `(max-min)/15` so the
+reference IS what they quantised, no calibration anywhere in the arm:
+
+```
+  ref (f16)     17.8719
+  vendor43      20.2531   +13.32%     their layout, their codes
+  chr43         19.0597    +6.65%     charsiu int4, group 1024
+  q4043         17.9111    +0.22%     llama.cpp q4_0, group 32
+  noise         28.5954   +60.00%     THE CONTROL
+```
+
+**The vendor's four-bit excess is 2.00x charsiu's** — 13.32 against 6.65.
+
+⚠ **THAT RATIO WAS 1.65 ON THE UNRECORDED PROTOCOL AND IT IS 2.00 HERE.** Same
+43 tensors, same code, different corpus and length. Nothing is wrong with
+either number; what is wrong is that the first one was quotable without its
+protocol. The 1.65 / 1.71 / 1.81 ladder across nested subsets keeps its shape
+as an ordering, but **no single figure from it should be carried into prose
+without the corpus and the token count beside it**.
+
+🔑 **The control is the row that decides whether any of this means anything.**
+Unstructured Gaussian noise at the same per-tensor relative error costs
+**60.00%** where the vendor's actual quantisation costs 13.32%. The vendor row
+is four and a half times further from noise than it is from the reference, so
+it is measuring their quantiser and not my reconstruction. That is the same
+control that caught the 1700.98: a column scaled by the wrong factor is a
+systematically wrong channel, and a Frobenius norm hardly charges for it.
+
+⚠ **`rho1` and `vendor43` agree to the last digit, and that is a check, not a
+null arm.** They are two separately written readers — `vendor_weight(RAW=1)`
+and `vendor_raw` — with two separately written selectors, and they pick the
+same 43 tensors and produce the same weights. What it does NOT do is confirm
+the layout independently: both go through the same solved map. The held-out
+99.72% on rows 768..2047 is what does that.
+
+⛔ **There is deliberately no `full` arm in the harness.** All 112 matrices
+reads 58.76 against 32.13 for the same set minus layer 1, because `blk.1`
+carries the most extreme row gauge in the model and `blk.1.ffn_down` is not
+reconstructed at all — the per-column model leaves 147% of it, and the build
+prints `KEEPING REFERENCE` for it. That number measures my reconstruction, not
+their quality, and a harness that can print it will eventually have it quoted.
