@@ -199,11 +199,75 @@ On a convex curve a secant over a higher range is steeper, so the two slopes
 are not comparable even if each were exact.
 
 What stands from this section is the part above it: the same string reads 1.76x
-in each direction depending on which question is asked, and that is a tokeniser
-difference, not a prefill result. **The per-token prefill rate against their
-runtime is currently unmeasured.** Measuring it needs each runtime's own TTFT
-curve over a ladder of lengths, compared at matched token counts inside each
-curve -- `tests/board_ttft_curve.sh` does our half.
+in each direction depending on which question is asked. That is a tokeniser
+difference, and r393 makes it exact: **their chat template costs 33 tokens, the
+same 33 at all eight prompt lengths from 27 to 852.** It is not a different
+tokenisation of the body, it is one tokenisation plus a fixed wrapper.
+
+### 1b-ii. Both curves, measured, and what the fit says
+
+Eight prompt lengths through each runtime, one script so the TEXT is the same,
+NPU 594 MHz on both sides, rail 800 mV, CPU pinned at maximum, 3 readings a
+point. Least squares `a + b*n + c*n^2` on each -- three parameters, eight
+points, which is a fit rather than the arithmetic 1g threw out:
+
+```
+                 fixed a      linear b        quadratic c
+    charsiu     187.9 ms   5.456 ms/tok   0.004483 ms/tok^2
+    vendor       45.8 ms   6.095 ms/tok   0.000743 ms/tok^2
+                   4.1x          0.90x               6.0x
+```
+
+Residuals are inside 2% of each point beyond 200 tokens on both curves; the
+5-11% at the short end is the chunk stepping, which a smooth curve cannot
+follow (1h).
+
+🏁 **Our per-token linear rate is 12% BETTER than theirs.** ⛔ The withdrawn
+"the vendor is 1.23x faster per prompt token" was not merely unsupported --
+**it had the sign backwards.** Two points a side, taken over two different
+token ranges on a curve with a large quadratic term, produced a number that
+pointed the wrong way.
+
+🏁 **They win on the other two terms and both are large.** Their fixed cost is
+a quarter of ours, 45.8 against 187.9 ms, and their quadratic term is a sixth
+of ours. ⭐ The quadratic term is the attention scaling. Per prompt token we
+are ahead; what we lose is how that cost GROWS, and a fixed cost four times
+theirs on top of it.
+
+🏁 **So "who starts a prompt faster" is a crossover, not a ratio.** With their
+33 tokens included the fits cross at 248 of our tokens; measured, we are ahead
+at 202 and behind at 302.
+
+```
+  matched INPUT TEXT, what a user waits for
+    ch tok   ch ms    vn tok   vn ms    ratio
+       102   852.0       135   931.8    charsiu 1.094x
+       202  1457.0       235  1528.5    charsiu 1.049x
+       302  2266.0       335  2145.0    vendor  1.056x
+       602  5149.0       635  4200.5    vendor  1.226x
+       852  8081.0       885  6026.8    vendor  1.341x
+
+  matched TOKEN COUNT, what a runtime does with a token
+       160  vendor 1.121x     410  vendor 1.175x     710  vendor 1.351x
+       210  vendor 1.078x     510  vendor 1.216x     810  vendor 1.387x
+```
+
+⚠ **The two runtimes cannot share a boot** -- one arm binds one driver -- so
+this breaks the rule against comparing across sessions. The drift was measured
+rather than assumed: the same charsiu ladder, one boot apart, is **2.2% at
+worst and -0.64% on average** across the eight points. Everything above is far
+outside that.
+
+⚠ The matched-token rows start at 160 because below it our curve has two points
+and one of them carries a token-loop leftover; dropping it moves the 60-token
+row from 1.160x to 1.225x and leaves 160 upward unchanged.
+
+⚠ The per-point marginal ms/token is not usable -- both curves step. What the
+stepping does not hide is the trend: ours more than doubles across the range,
+5.5 to 11.9 ms a token, and theirs moves 24%.
+
+⛔ Not supported by this: why their quadratic term is six times smaller. That
+is the next question and nothing here touches it.
 
 ⚠ The rail differs: 800 mV for charsiu, 750 for the vendor, because their
 driver sets it through `npu-supply` and its OPP table rather than taking the
@@ -862,12 +926,18 @@ concession survives for prefill, where both runtimes gain more from the CPU at
 a short prompt than at a long one, so any TTFT claim has to name the governor
 AND the prompt length it was measured under.
 
-⛔ **And the paper must not carry a per-token prefill rate against their
-runtime.** The 1.23x came from fitting a line through two prompt lengths a side
-and 1g withdraws that fit; section 8 now lists the gap as unmeasured. Anywhere
-the prose says charsiu's prefill is within 23% of theirs per token, or that the
-two runtimes' fixed costs are within 8%, comes out until the curves are
-measured against each other.
+⛔ **The paper's prefill claim has to be rebuilt from 1b-ii, and its sign
+changes.** The 1.23x came from fitting a line through two prompt lengths a
+side; the curves say our per-token linear rate is 12% BETTER than theirs, and
+that we lose on the fixed cost (4x) and the attention scaling (6x). Anywhere
+the prose says the vendor's prefill is faster per token, or that the two fixed
+costs are within 8%, is wrong rather than unsupported.
+
+⭐ **And there is a new claim worth making that the old framing could not
+reach**: the answer is a crossover at about 248 prompt tokens, so "who starts a
+prompt faster" has a measured answer that depends on the prompt, not a ratio.
+That is a better result than the one it replaces and it is the kind of thing a
+reader can check.
 
 ## 8. What is not supported
 
@@ -889,15 +959,14 @@ figure for this model class. Neither section claims to reproduce their table;
 what 1g supports is that moving to their condition does not change the RATIO,
 because it moves both columns by the same 22%.
 
-ANY number for the prefill gap, including the 1.23x this list used to give.
-Section 1b: the same string reads 1.76x in our favour on wall-clock TTFT and
-1.76x against us on throughput, which is a tokeniser difference and not a
-prefill result. The per-token rate that was supposed to settle it came from
-fitting a line through two prompt lengths a side, and 1g withdraws that fit:
-TTFT is convex in length, our long point carries a token-loop step our short
-one does not, the chunking changes with the length, and the two sides' secants
-were taken over different token ranges. The per-token prefill rate against
-their runtime is unmeasured.
+ANY single number for the prefill gap, and in particular the 1.23x this list
+used to give -- 1b-ii now has both curves and the answer is a CROSSOVER at
+about 248 of our tokens, with our per-token linear rate 12% BETTER than theirs
+and their fixed cost and quadratic term 4x and 6x smaller. The 1.23x was two
+points a side over two different token ranges and it pointed the wrong way.
+What cannot be quoted as one number: the matched-text ratio changes sign with
+prompt length, and the matched-token ratio runs 1.08x to 1.39x over the
+measured span.
 
 That the overlap fault is gone. Section 4a: it is rail-conditioned, this board
 is at 800 mV, and a probe that did not fire says nothing on its own.
