@@ -17,7 +17,7 @@ are NOT supported; read it before quoting anything.
   4   the output head                 4a  the two cores and the overlap fault
   5   bandwidth figures
   6   variability, and what one passage can order
-  7   reproduction
+  7   reproduction                    7a  what the PAPER has to change
   8   what is NOT supported
 ```
 
@@ -319,9 +319,17 @@ running at inference. Every rung is scored on both passages:
   105 (all but layer 1)  +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
 ```
 
-**What is robust is the direction: six cells of six, the vendor's four-bit
-excess is larger than charsiu's.** The size of it is an interval, 1.4x to 2.6x,
-and the paper should quote the interval and nothing narrower.
+**What is robust is the direction: in every cell the vendor's four-bit excess
+is larger than charsiu's.** The size of it is an interval, 1.4x to 2.6x, and
+the paper should quote the interval and nothing narrower.
+
+⚠⚠ **SIX CELLS ARE NOT SIX INDEPENDENT SAMPLES AND MUST NOT BE WRITTEN AS
+STATISTICAL STRENGTH.** The three subsets are NESTED: the 43 matrices are
+inside the 91, which are inside the 105, so the rungs share most of their
+weights and cannot disagree freely. The two passages are independent of each
+other; the three rungs are not. What the table supports is "the direction did
+not reverse under either axis we varied", which is a robustness check, not six
+trials.
 
 ⛔ **The ladder is NOT monotone and the earlier text saying so was one
 passage.** On `long.txt` the ratio climbs with the subset, 1.85 to 2.00 to
@@ -622,6 +630,38 @@ the governor, the NPU rail, both CPU clusters' clock, and the boot id at both
 ends, and refuses to be read as one round if the boot id moved.
 
 ---
+
+## 7a. What the paper has to change because of these rounds
+
+Not evidence; a list of places the prose is now wrong, kept here because the
+`.tex` is not in this repository and nothing else tracks it.
+
+**Section 2 lost its headline number.** It was "2.0 to 2.4x, monotone across
+three nested subsets". It is now a direction with an interval, 1.4x to 2.6x.
+Every place that writes 2.0-2.4 has to move: abstract, introduction, results.
+
+⛔ **And "monotone" was load-bearing, not decorative.** It was one of the
+arguments that the ladder measured a real difference between quantisers rather
+than an artefact of the reconstruction: damage that grows with the subset looks
+like a property of the weights. That argument needs a different support now.
+What survives in its place is section 2a: the layout is fitted on blocks 0 to
+47 and scored on rows 768 to 2047, 99.72% of codes away from a rounding
+boundary, residuals of plus or minus one.
+
+**Sections 1 and 1b disagree and both belong in the paper.** Section 1 is four
+models at maximum frequency against a published point estimate; 1b is one model
+at 594 MHz against a measurement of their runtime. They do not agree on which
+side leads TTFT, for the tokeniser reason 1b gives. They must not be merged
+into one table.
+
+⛔ **The ordering argument for putting quality first no longer holds alone.**
+The vendor-quality comparison led the results because it was the only one where
+both sides ran here. Section 1b is now also that. If quality still leads it
+needs a different reason -- the obvious one being that it is the comparison
+nothing in the literature has, while a speed comparison against a vendor
+runtime is ordinary.
+
+**Anything saying their runtime has never been run here.** It has, in 1b.
 
 ## 8. What is not supported
 

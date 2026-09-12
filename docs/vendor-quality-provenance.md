@@ -169,8 +169,14 @@ good reason.
   105 (no layer 1) +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
 ```
 
-**Six cells of six put the vendor's four-bit excess above charsiu's. That is
-the finding.** The interval is 1.4x to 2.6x and nothing narrower is supported.
+**In every cell the vendor's four-bit excess is above charsiu's. That is the
+finding.** The interval is 1.4x to 2.6x and nothing narrower is supported.
+
+⚠⚠ **Not six independent samples.** The subsets are NESTED -- 43 inside 91
+inside 105 -- so the rungs share most of their matrices and cannot disagree
+freely. The two passages are independent of each other; the three rungs are
+not. "The direction did not reverse under either axis" is what this is, and it
+is a robustness check rather than a count of trials.
 
 ⛔ **And the ladder is not monotone.** `long.txt` climbs 1.85, 2.00, 2.18,
 which is where "monotone across three nested subsets" came from; `long2.txt`
