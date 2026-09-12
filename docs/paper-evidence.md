@@ -381,6 +381,20 @@ lengths per condition, so the rate and the intercept separate:
                                                     -7.0%       -23.9%
 ```
 
+⚠ **Two points fit a line, and prefill is chunked, so "ms/token" here is a
+SECANT and "fixed cost" is an extrapolation.** For charsiu the labels are safe:
+`llama_prefill_chunk_cap()` is `163840 / widest_k_slice`, which for
+Llama-3.2-1B at KMAX 1024 is 160 tokens, so 16 and 79 are both a single chunk
+and the line is fitted inside one regime. For the vendor it is not checked --
+their int4 dispatches top out around M=80, so 50 and 113 may straddle a chunk
+boundary, and their slope would then carry one boundary crossing in it.
+
+What survives either way is the COMPARISON, because chunking does not depend on
+the CPU clock: the same two prompt lengths, the same chunking, measured under
+two governors. The +1.4% and the -51.9% are changes in a quantity measured
+identically in both arms. It is the absolute decomposition into "rate" and
+"fixed cost" that needs the linearity, and only on their side.
+
 Their per-token prefill rate does not use the CPU at all; the whole of their
 TTFT improvement is the intercept, and it halves. With 1b's 6.5% for the NPU
 clock: their rate is the NPU's and their fixed cost is the CPU's. Ours splits
