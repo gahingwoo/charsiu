@@ -88,7 +88,14 @@ echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_fre
 if [ "$ARM" = charsiu ]; then
 	echo "   binary    $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
 	echo "   model     $M"
-	echo "   chunk cap 160 tokens for this model at KMAX 1024 -- the sweep crosses it"
+	# ⚠ ASK THE RUNTIME, DO NOT ASSERT IT. This line used to say "chunk cap
+	# 160 tokens for this model at KMAX 1024" as a string, which is a claim
+	# about llama_prefill_chunk_cap() rather than a reading of it -- and the
+	# cap depends on the model and on KMAX, neither of which this script
+	# owns. One short run prints what the runtime actually chose.
+	CAP=$(env $E "$RUN" "$M" -p "hello" -n 1 -c 1024 -t 4 2>&1 >/dev/null \
+	      | grep -oE 'in chunks of [0-9]+|ceiling \([0-9]+\)' | grep -oE '[0-9]+' | head -1)
+	echo "   chunk     nominal ${CAP:-unknown}, and onechunk widens a fitting prompt past it"
 else
 	echo "   binary    $VBIN, librkllmrt in $VLIB"
 	echo "   model     $VMODEL"
