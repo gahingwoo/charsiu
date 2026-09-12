@@ -785,11 +785,22 @@ md5sum tests/corpus/long.txt tests/corpus/long2.txt
 # and the vendor's file, which section 1b times and section 2 scores
 #   2d3962468e2e7c0d0571157f8c9eae71  Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm
 
-# quality, the CPU reference at the group the board runs
+# quality, the CPU reference at the group the board runs.
+#
+# ⚠⚠ CHECK THE md5 FIRST AND DO NOT SKIP IT. This number belongs to the file,
+# not to the path. In a fresh clone the curl above puts 48ff0243 at that path
+# and it reads 34.2425. In THIS project's working tree the same path is a
+# SYMLINK into rootfs-overlay, which is the older c82c0340 the board image
+# carries, and the identical command reads 33.8071 -- a 1.3% difference with
+# nothing on screen to say the input changed. Both files are in the table in
+# section 3; neither number is wrong and only one of them answers this command.
+md5sum models/Llama-3.2-1B-Instruct-Q4_0.gguf   # must be 48ff0243...
 CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
   CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
   build/charsiu_ppl models/Llama-3.2-1B-Instruct-Q4_0.gguf \
-                    tests/corpus/long.txt -n 300          # 34.2425
+                    tests/corpus/long.txt -n 300
+#   48ff0243  ->  34.2425     the model of record, what a reader gets
+#   c82c0340  ->  33.8071     the board image's older copy, this tree's symlink
 
 # the vendor's own weights, scored. ⚠ CHARSIU_RKLLM_REF IS NOT OPTIONAL: the
 # default reference is Q8_0, and the round of record is from the f16 original,
