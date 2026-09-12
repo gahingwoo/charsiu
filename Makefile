@@ -96,8 +96,15 @@ $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
 
-$(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
-	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+#
+# ⚠ THE SOURCE LIST HAS TO TRACK charsiu_run's. This rule went stale when
+# vision landed: it kept the old list, so the board's static binary stopped
+# linking (undefined charsiu_vision_open and three more) and nobody noticed,
+# because nothing builds it by default. A target that is never built is a
+# target that is already broken.
+#
+$(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
 # The control: same code with the NEON kernels compiled out, and slower.
 #
