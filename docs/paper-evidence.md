@@ -663,5 +663,11 @@ theirs, and read/fence does not track the gap across models.
 `CHARSIU_NPU_INT8_LAYERS` on hardware. `npu_mixed_test` shows that one open
 device alternates w8a8 and w4a16 correctly, 0 of 18 dispatches wrong over eight
 alternations in both directions, at K=256 and N=64. That says the per-tensor
-width refactor is justified. It does not say the knob works at the scale a real
-model dispatches at, because the refactor is not written.
+width refactor is justified, and the refactor IS written: `w4_for(g, t)` is
+threaded through all 42 sites that ask, and the bmap cache key carries the
+width. What is not written is the one line that makes it answer differently.
+`w4_for()` still ignores its tensor and returns the device's width, which is
+why the tree is bit identical. The version that did answer per tensor was
+reverted on 2026-09-11 after nine of nine models disagreed with their own token
+loop, so the knob's behaviour on a real model is not just unmeasured, it is
+known to have been wrong once.
