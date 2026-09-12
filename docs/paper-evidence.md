@@ -197,9 +197,10 @@ driver sets it through `npu-supply` and its OPP table rather than taking the
 device tree's floor. Both compute correctly at 594 MHz and voltage does not set
 clock rate, so this is a caveat and not a confound.
 
-⚠ Neither side scaled. Their device tree asks for devfreq over an OPP table
-reaching 800 MHz; Kiln's patch pins the clock. So this says nothing about
-either side at the frequency their published figures were taken at.
+⚠ Neither side scaled its NPU. Their device tree asks for devfreq over an OPP
+table reaching 800 MHz; Kiln's patch pins the clock. So this section says
+nothing about either side at the frequency their published figures were taken
+at -- section 1g does, for the CPU half, and finds the ratio unmoved by it.
 
 ⛔ **Their runtime cannot be asked for perplexity, so section 2 cannot be
 cross-checked this way.** `RKLLM_INFER_GET_LOGITS` is in their API and the
@@ -326,6 +327,75 @@ batch would report "text identical" meaning only that the token loop agrees
 with itself; none did. This is the check that caught gemma4 emitting
 "31 32 1 2 3" on the card in 2026-08-30, after six architectures had passed on
 a desktop.
+
+### 1g. What the CPU clock is worth, and what it does to the ratio
+
+Section 1b varied the NPU clock only, and said so: their header names maximum
+CPU *and* NPU, and a decode that ignores the NPU clock is a decode to suspect
+the CPU of. r391 is that measurement.
+
+🔑 It is a stronger experiment than 1b's. The NPU rate lives in the device
+tree, so 1b spent a reboot per point and had to price the boot-to-boot drift it
+was warned about. cpufreq is sysfs: every point below is one boot, one load,
+one binary, swept up and then back down, with the frequency read back from
+`scaling_cur_freq` rather than assumed from the write to `scaling_setspeed`.
+
+A CPU-only arm runs at every point. Without it a flat measured arm and a knob
+that never took effect are the same reading; it moved 2.49x.
+
+```
+  decode t/s, -n 64        1008 MHz    1416 MHz    max (2016/2208)   1008 -> max
+    vendor  (NPU 786)        12.68       13.84          15.44          x1.2177
+    charsiu (NPU 594)        17.65       19.51          21.51          x1.2188
+    control (CPU only)       15.76       23.14          39.17          x2.485
+```
+
+**The CPU clock is worth the same to both, so the decode ratio does not move
+with it**: 1.392, 1.410, 1.393 across a clock that more than doubles. That is
+the opposite of 1b, where the NPU clock moved it from 1.389 to 1.461.
+
+⚠ The two runtimes are at different NPU clocks in that table, so the ratio
+VALUES are not like-for-like; what is compared across them is each one's own
+elasticity, measured inside one boot and one arm.
+
+**What the governor was actually giving them.** Sampling `scaling_cur_freq` 111
+times during one vendor run, `schedutil` held the A72 cluster at 1200 MHz for
+66% of samples and scored 13.27 t/s. r389 read 12.85 and r390 read 12.73 on
+that governor, so every round this tree has run against their runtime measured
+them at about 1200 MHz, not at the maximum their benchmark.md names. The gap to
+maximum is 16.4% -- and by the line above it is the same 16% on our side, so it
+does not move the ratio.
+
+**Prefill splits the other way, and the fixed costs cross over.** Two prompt
+lengths per condition, so the rate and the intercept separate:
+
+```
+                              short      long     ms/token    fixed cost
+  vendor,  50 and 113 tok
+    schedutil                 437.3     772.8       5.325       171.0 ms
+    max CPU                   352.3     692.6       5.402        82.2 ms
+                                                    +1.4%       -51.9%
+  charsiu, 16 and 79 tok
+    schedutil                   267       754       7.730       143.3 ms
+    max CPU                     224       677       7.190       109.0 ms
+                                                    -7.0%       -23.9%
+```
+
+Their per-token prefill rate does not use the CPU at all; the whole of their
+TTFT improvement is the intercept, and it halves. With 1b's 6.5% for the NPU
+clock: their rate is the NPU's and their fixed cost is the CPU's. Ours splits
+the other way, and the consequence is that **at `schedutil` our fixed cost is
+16% below theirs and at maximum CPU it is 33% above** -- which runtime starts a
+prompt faster depends on the governor, and every round so far picked the one
+that flatters us.
+
+⛔ The first charsiu sweep of this round was thrown away rather than published.
+It read 13.85 t/s at maximum CPU where r388 had recorded 17.85 at a lower
+clock, which is impossible. Reproduced against the alternative on the same
+boot, the variable was `CHARSIU_NPU_MAXN`: its C default of 8192 is below every
+vocabulary, so the output head silently stayed on the CPU, and it was worth 55%
+of decode at maximum CPU and 83% at `schedutil`. The default is now 262144,
+which is what every board round in this tree had already been setting.
 
 ---
 
@@ -694,21 +764,38 @@ runtime is ordinary.
 
 **Anything saying their runtime has never been run here.** It has, in 1b.
 
+**The fairness caveat about frequency can be narrowed, and one half of it
+reversed.** The paper has been carrying "their published figures are at maximum
+CPU and NPU and our arms are not" as an open concession. Section 1g measures
+it: on decode the two runtimes have the same CPU elasticity to three digits, so
+their condition moves both columns together and leaves the ratio alone. The
+concession survives only for prefill, where it now points the other way -- our
+fixed cost beats theirs at `schedutil` and loses to theirs at maximum CPU, so
+any TTFT claim has to name the governor it was measured under.
+
+⛔ **And every TTFT number in the pack was measured under `schedutil`**, which
+1g shows is the governor that flatters us on fixed cost. That is not a reason
+to drop them; it is a reason that each one has to say so beside it.
+
 ## 8. What is not supported
 
 The vendor at the frequency their published figures were taken at. Their
-runtime HAS now been run here, in section 1b, but at 594 MHz on both sides with
-neither scaling; section 1's right column is still a citation at maximum
-frequency and the two must not be combined.
+runtime HAS now been run here -- 1b at 594 MHz on both sides, 1g across the
+whole CPU range including their published maximum -- but section 1's right
+column is still a citation, with no N and no spread, and the two must not be
+combined. What 1g removes is the WORRY that their condition would change the
+comparison; it does not turn their published row into a measurement.
 
 A single number for the decode ratio against their runtime. Section 1b: 1.389
 at 594 MHz and 1.461 at 786, a 5.2% move against arm spreads of 0.3 and 0.6%.
 It is an interval, and each end has a clock attached.
 
-Their published figures reproduced at any clock measured here. Section 1b
-varied the NPU clock only; their header says maximum CPU *and* NPU, and their
-decode ignoring the NPU clock is a reason to suspect the CPU, which was not
-varied.
+Their published figures reproduced at any clock measured here. Both clocks have
+now been varied -- the NPU in 1b, the CPU in 1g -- and at maximum CPU with the
+NPU at 786 MHz their decode reads 15.44 t/s, still short of the published
+figure for this model class. Neither section claims to reproduce their table;
+what 1g supports is that moving to their condition does not change the RATIO,
+because it moves both columns by the same 22%.
 
 A single number for the prefill gap. Section 1b: 1.76x in our favour on
 wall-clock TTFT for one string, 1.76x against us on throughput for the same
