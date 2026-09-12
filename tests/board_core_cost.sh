@@ -39,7 +39,13 @@
 # a minimum is not. A round whose individual readings were discarded cannot be
 # re-read later with a different statistic.
 #
-#   sh board_core_cost.sh            (CHARSIU_CC_REPEAT=5 by default)
+#   sh board_core_cost.sh [MODEL-substring ...]   (default: the four 13/14 used)
+#
+# ⚠ ONE MODEL AN INVOCATION IS FINE AND IS HOW THIS GETS DRIVEN OVER A SERIAL
+# LINE. Every run reloads the model, so four models times five repeats times
+# two arms does not fit in one command's timeout. What must NOT be split is the
+# two arms: they alternate inside a model so that a drift across the round does
+# not land on one of them.
 #
 set -u
 
@@ -99,7 +105,8 @@ one() {
 	    2>/dev/null | grep '^\[load'
 }
 
-for want in qwen3 tinyllama phi-3.5 gemma-4; do
+WANT=${*:-"qwen3 tinyllama phi-3.5 gemma-4"}
+for want in $WANT; do
 	M=$(find_model "$want") || { echo "-- $want: NOT FOUND under [$MODELDIRS]"; echo; continue; }
 	echo "-- $(basename "$M")"
 
