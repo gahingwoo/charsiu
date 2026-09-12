@@ -255,6 +255,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 #
 	python3 -P tools/check_consistency.py --self-test
 	python3 -P tools/check_consistency.py docs/paper-evidence.md
+	python3 -P tools/ttft_compare.py --self-test
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
