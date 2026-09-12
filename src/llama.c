@@ -3692,8 +3692,12 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 				"board runs.\n");
 	}
 	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
+		/* 262144, not 8192: see pool_maxn() in npupool.c. The two
+		 * defaults have to agree or the gate and the open disagree
+		 * about which tensors are allowed. Clamped to n_vocab below,
+		 * so this asks for "no gate" rather than for a buffer. */
 		const char *e = getenv("CHARSIU_NPU_MAXN");
-		unsigned maxn = e ? (unsigned)atoi(e) : 8192;
+		unsigned maxn = e ? (unsigned)atoi(e) : 262144;
 		unsigned widest = state_widest(m);
 
 		if (maxn > m->n_vocab)
