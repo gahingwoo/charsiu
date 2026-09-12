@@ -381,13 +381,25 @@ lengths per condition, so the rate and the intercept separate:
                                                     -7.0%       -23.9%
 ```
 
-⚠ **Two points fit a line, and prefill is chunked, so "ms/token" here is a
-SECANT and "fixed cost" is an extrapolation.** For charsiu the labels are safe:
-`llama_prefill_chunk_cap()` is `163840 / widest_k_slice`, which for
-Llama-3.2-1B at KMAX 1024 is 160 tokens, so 16 and 79 are both a single chunk
-and the line is fitted inside one regime. For the vendor it is not checked --
-their int4 dispatches top out around M=80, so 50 and 113 may straddle a chunk
-boundary, and their slope would then carry one boundary crossing in it.
+⛔ **Two points fit a line, and the two points are not the same kind of
+prompt, so these absolute numbers are provisional.** Chunking is not the
+problem: `llama_prefill_chunk_cap()` is 160 tokens for this model and
+`onechunk_on()` widens a fitting prompt into a single dispatch, so 16 and 79
+are one chunk each. **The odd token is.** `prefill_width()` does `w &= ~1`, so
+79 tokens run as a batched 78 **plus one token through `llama_forward`**, and
+that token-loop step is inside the prompt timer. The 16-token point has no
+leftover. So the long point carries a whole decode step that the short point
+does not, and the slope absorbs it while the intercept does not.
+
+The runtime prints this -- *"prompt batched for 78 of 79 tokens, the rest a
+token at a time"* -- and the round was not reading the line. Subtracting a
+decode step of the measured size moves the slope to about 6.6-7.0 ms/token and
+the intercept to about 119-155 ms; `tests/board_ttft_curve.sh` measures it
+properly, on even token counts, rather than correcting it by arithmetic.
+
+For the vendor it is unchecked in a different way: their int4 dispatches top
+out around M=80, so 50 and 113 may straddle a boundary and their slope would
+carry the crossing.
 
 What survives either way is the COMPARISON, because chunking does not depend on
 the CPU clock: the same two prompt lengths, the same chunking, measured under
