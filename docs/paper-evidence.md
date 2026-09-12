@@ -65,6 +65,39 @@ Their TTFT and ours are not the same quantity. Theirs is time to the first
 token; ours is the prompt's forward passes, so the first token's own step is in
 theirs and not in ours, which is one token's worth in our favour.
 
+### 1a. Which of their three columns this is, and what the other two say
+
+`benchmark.md` gives three quantisations a model, not one. For the same four:
+
+```
+                 w4a16            w4a16_g128         w8a8
+              TTFT    t/s        TTFT    t/s      TTFT    t/s
+  Qwen3 0.6B  468.61  24.85     506.41  23.48    461.54  17.17
+  TinyLLAMA   543.68  19.71     672.61  18.08    534.13  12.18
+  Phi3 3.8B  1829.12   6.58    2253.14   6.06   1615.97   3.74
+  Gemma4 E2B 1219.25   9.23    1445.36   8.27   1166.94   5.56
+```
+
+**The comparison above uses w4a16, which is their FASTEST decode of the three.**
+Against w8a8 the same charsiu medians would read +52.9%, +87.1%, +88.0% and
++66.4% instead of +5.7%, +15.6%, +6.8% and +0.2%. A paper that reported the
+w8a8 row would be claiming roughly four times the margin for the same work.
+
+⚠ **It is not uniformly the conservative choice.** Their w8a8 TTFT is slightly
+FASTER than their w4a16 on three of the four, so picking w4a16 is conservative
+on the column we lead and slightly generous on the column we trail. Both halves
+of that belong in the sentence.
+
+⚠ w8a8 also costs roughly twice the memory: 796 MB against 513 for Qwen3,
+3767 against 1996 for Phi3. A reader choosing between them is not choosing on
+speed alone, and neither column is "the vendor's number" on its own.
+
+🔑 **`w4a16_g128` exists, and section 2's group caveat is about OUR FILE, not
+about what they can do.** The `.rkllm` scored there keeps one scale per output
+row; this column shows they ship a group-128 option as well. The asymmetry
+section 2 states is between two particular files, not between two vendors'
+capabilities.
+
 ### 1d. Their runtime, RUN
 
 `board-logs/r389`. The vendor's rknpu driver built against this board's own
@@ -115,6 +148,15 @@ clock rate, so this is a caveat and not a confound.
 ⚠ Neither side scaled. Their device tree asks for devfreq over an OPP table
 reaching 800 MHz; Kiln's patch pins the clock. So this says nothing about
 either side at the frequency their published figures were taken at.
+
+⛔ **Their runtime cannot be asked for perplexity, so section 2 cannot be
+cross-checked this way.** `RKLLM_INFER_GET_LOGITS` is in their API and the
+model refuses it: every sequence length tried, 64 through 544, returns
+`meet unkown shape, op name: matmul_qk_rkllm_spilt_0` and no logits. The
+model is exported for generation and the attention shapes for a logits pass
+are not in its compiled set. Section 2's reconstruction therefore remains
+unvalidated against their real runtime, and the pack still says the
+112-matrix figure measures the reconstruction.
 
 ### 1b. The decode margin is younger than the round
 
