@@ -539,6 +539,61 @@ that the default is not optimal at every length, which is enough to stop
 quoting a single TTFT figure as if chunking were settled, and not enough to
 change anything.
 
+### 1i. Why our quadratic term is six times theirs: attention is on the CPU
+
+1b-ii left one question: the prefill curves differ mostly in the `n^2` term,
+0.004483 against 0.000743 ms/tok^2, and the `n^2` term is attention. The batched
+stage table answers it directly. Llama-3.2-1B, 852 tokens, CPU pinned:
+
+```
+  attention      3.82 ms a row   42.1%    <- the largest row
+  gate + up      2.28            25.1%
+  down           1.43            15.7%
+  q k v          0.59             6.5%
+  matmul rows:   4.66 ms a row inside the NPU entry
+```
+
+4.66 is exactly the four projection rows summed, so attention's 3.82 ms is
+OUTSIDE the NPU entry: **every projection is on the hardware and attention is
+not.** 42.1% measured against 40.2% inferred from the fit is two methods
+agreeing to two points.
+
+**There is an NPU attention path, it is correct, and it is off.**
+`attn_npu_want_for()` states the reason: *"head_dim >= 128 is only half the
+rule and the other half (how long a prompt) has not been measured"*. Both
+halves, measured -- ratio is NPU arm over CPU arm, so below 1.00 the NPU wins:
+
+```
+  model            head_dim   ~52 tok   ~202    ~452    ~852
+  Llama-3.2-1B           64     1.269   1.259   1.250   1.257
+  Qwen3-0.6B            128     1.622   1.354   1.163   1.018
+  gemma-3-1b            256     1.121   1.021   0.923   0.877
+```
+
+🏁 Both halves are real, and they are **one quantity**: head_dim is the inner
+dimension of both attention matmuls and prompt length is the outer, so both
+feed arithmetic per dispatch. head_dim 64 is flat at 1.25 because no length in
+range makes a dispatch worth taking there; head_dim 256 wins from about 230
+tokens and by 12.3% at 852.
+
+⛔ **So the paper must not cite Llama-3.2-1B for this.** It is the model every
+speed round in this pack uses and the furthest below the threshold of anything
+on the card -- head_dim 64 against a rule about 128.
+`tools/gguf_head_dim.py` prints the census: 512, 256, 128, 128, 96, 64, 64, 64.
+
+⚠ **gemma-4-E2B is not a head_dim 512 point** and was nearly reported as one.
+It has two head_dims -- `key_length` 512 and `key_length_swa` 256 -- and the
+pool holds one, so 28 of its 35 layers never reach the hardware. Its 0.936 at
+852 tokens is what seven layers bought. The instrument said "fell back on 0"
+throughout, because five refusal paths touched no counter; there is one per
+reason now and it names `head_dim` directly.
+
+⛔ **Not supported: any change of default.** Three clean models is not a rule,
+`CHARSIU_ATTN_NPU=auto` was already withdrawn once, and the last chunk rule
+derived rather than measured cost SmolLM2 77% (1h). Nothing is changed on this
+evidence; what is established is that the vendor's smaller quadratic term has a
+named cause on our side and an existing, correct, measured lever.
+
 ---
 
 ## 2. Quality against the vendor's own int4
