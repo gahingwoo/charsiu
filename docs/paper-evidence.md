@@ -1,4 +1,25 @@
-# Evidence pack, 2026-09-11
+# Evidence pack, 2026-09-12
+
+Every number this paper may quote, the protocol that produced it, and the
+sentence that has to travel beside it. Section 8 is the list of things that
+are NOT supported; read it before quoting anything.
+
+```
+  0   what must be said beside the numbers
+  1   speed against the vendor        1a  their three columns, and which this uses
+                                      1b  their runtime, MEASURED
+                                      1c  the decode margin is younger than the round
+                                      1d  the TTFT gap is not attributed
+                                      1e  where the prompt's time actually goes
+                                      1f  the pinning default is safe everywhere
+  2   quality against the vendor's own int4   2a  why it is evidence, not my reconstruction
+  3   quality of charsiu's own quantiser
+  4   the output head                 4a  the two cores and the overlap fault
+  5   bandwidth figures
+  6   variability, and what one passage can order
+  7   reproduction
+  8   what is NOT supported
+```
 
 Every number a paper could quote from this project, with the protocol that
 produced it and the sentence that has to travel beside it. Assembled over a day
@@ -19,13 +40,13 @@ beyond that one sentence, so a margin over it cannot be inside anyone's noise
 in either direction. Section 1 is our median of seven with its range, against
 their published point.
 
-⚠ **Section 1d is different: their runtime has now been RUN here**, on the
+⚠ **Section 1b is different: their runtime has now been RUN here**, on the
 same board, the same kernel and the same clock as ours, and it is an arm.
-Section 1 and section 1d are two different comparisons and must not be merged
+Section 1 and section 1b are two different comparisons and must not be merged
 into one table: section 1 is four models at maximum frequency against a
-citation, section 1d is one model at 594 MHz against a measurement. The
+citation, section 1b is one model at 594 MHz against a measurement. The
 citation and the arm do not even agree about which side is ahead on TTFT, for
-a reason section 1d gives.
+a reason section 1b gives.
 
 **A perplexity needs a model, a corpus, and a file.** charsiu re-quantises
 whatever it loads, so the source format is inside every quality number. The
@@ -98,7 +119,7 @@ row; this column shows they ship a group-128 option as well. The asymmetry
 section 2 states is between two particular files, not between two vendors'
 capabilities.
 
-### 1d. Their runtime, RUN
+### 1b. Their runtime, measured
 
 `board-logs/r389`. The vendor's rknpu driver built against this board's own
 kernel from Kiln's mainline port, their `librkllmrt` 1.3.0 loading
@@ -158,7 +179,7 @@ are not in its compiled set. Section 2's reconstruction therefore remains
 unvalidated against their real runtime, and the pack still says the
 112-matrix figure measures the reconstruction.
 
-### 1b. The decode margin is younger than the round
+### 1c. The decode margin is younger than the round
 
 Before `a58086c` the decode was bimodal and the table reported best-of-N:
 
@@ -185,7 +206,7 @@ could do but would not do reliably. A paper should give the margin as
 +5.7%/+15.6% from a median, say that it required pinning, and not quote a
 best-of-N.
 
-### 1b-2. The TTFT gap is not attributed, and the obvious explanation does not fit
+### 1d. The TTFT gap is not attributed, and the obvious explanation does not fit
 
 The runtime's own report from the same round:
 
@@ -212,7 +233,7 @@ remainder is NEGATIVE, so the hardware path and the wall clock are counting
 different calls, the rate above is not a fact about the hardware"*. Do not
 quote them.
 
-### 1b-3. Where the prompt's time actually goes
+### 1e. Where the prompt's time actually goes
 
 `tests/board_prefill_stages.sh` with `-n 1`, so the table is the prompt's, and
 the protocol prompt, so the rows are the rows the TTFT column is measured over:
@@ -256,7 +277,7 @@ against 3.90 inside the entry. That one includes staging, 4135 ms of it on
 Qwen3, which is a once-per-process cost and is excluded from both the prompt
 total and TTFT. It is not prompt time.
 
-### 1c. The pinning default is safe across every architecture
+### 1f. The pinning default is safe across every architecture
 
 `a58086c` changes a default that touches every workload on every model, and
 what had been checked was one model's decode text. `board_text_all.sh` compares
@@ -327,7 +348,8 @@ on one passage and better on the other. Report the f16 rows: they are the arm
 whose precondition holds. The Q8_0 interval is narrower for no good reason.
 
 ⚠ `rho1` and `vendor43` are the SAME FILE, byte for byte, md5
-`9d8e82952e96a6f14eeaa4b016704dde`. That is the point of the rho = 1 subset
+`9d8e82952e96a6f14eeaa4b016704dde` (a BUILD PRODUCT, not an input, so it is
+deliberately not in section 7's list). That is the point of the rho = 1 subset
 rather than a second measurement of it: dividing the calibration out changes
 not one f16 weight there, so the two code paths land on the same weights. Do
 not report them as two agreeing arms.
@@ -343,7 +365,7 @@ A third asymmetry runs the other way and no arm removes it: the vendor is
 asymmetric with an integer zero point and charsiu is symmetric absmax, worth
 about 1.4% at group 1024 by this tree's own measurement.
 
-### What makes it evidence rather than a reconstruction of mine
+### 2a. What makes it evidence rather than a reconstruction of mine
 
 The weight layout is solved and held out: fitted on blocks 0 to 47, scored on
 rows 768 to 2047, 99.72% of codes away from a rounding boundary, with residuals
@@ -457,7 +479,7 @@ independent predictions rather than two estimates of one thing.
 
 ---
 
-## 4b. The two cores, the overlap fault, and what the speed numbers ran under
+### 4a. The two cores, the overlap fault, and what the speed numbers ran under
 
 The fault is real and it is attributed: it is the NPU's voltage margin, not the
 overlap. `src/overlap.h` states it and the notebook carries the sweep, four
@@ -504,7 +526,7 @@ margin over the vendor does not depend on the overlap.
 The four serial figures this project quoted before today (24.28, 20.34, 6.82,
 8.68 tok/s) are all BELOW the serial decode measured here, and they are from
 2026-09-04 at a different governor and before the calling thread was pinned.
-They measure the cost of not pinning, which section 1b measures directly at
+They measure the cost of not pinning, which section 1c measures directly at
 +25.5%, rather than the cost of serialising, which is zero. Replace them rather
 than dating them.
 
@@ -560,11 +582,21 @@ last. It was the same scheduling lottery.
 ## 7. Reproduction
 
 ```sh
-git clone <charsiu> && cd charsiu && git checkout 4057a39 && make
+git clone <charsiu> && cd charsiu && git checkout d97e212 && make
 # the model of record
 curl -L -o models/Llama-3.2-1B-Instruct-Q4_0.gguf \
   https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
 md5sum models/Llama-3.2-1B-Instruct-Q4_0.gguf   # 48ff0243978606fdba19d899b77802fc
+
+# the corpora. Every perplexity in this pack names one of these two, and the
+# checker rule is that a perplexity must name a file whose md5 is HERE.
+md5sum tests/corpus/long.txt tests/corpus/long2.txt
+#   4237c8fc3163a359fc21bde60c7b1d8b  long.txt
+#   9c1f92b423e3ab3d3f9279a8d70a4ae6  long2.txt
+# and the f16 original, which the vendor-quality round of record starts from
+#   3ba43423d342673e26016ffe85268937  Llama-3.2-1B-Instruct-f16.gguf
+# and the vendor's file, which section 1b times and section 2 scores
+#   2d3962468e2e7c0d0571157f8c9eae71  Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm
 
 # quality, the CPU reference at the group the board runs
 CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
@@ -572,8 +604,13 @@ CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
   build/charsiu_ppl models/Llama-3.2-1B-Instruct-Q4_0.gguf \
                     tests/corpus/long.txt -n 300          # 34.2425
 
-# the vendor's own weights, scored (needs the .rkllm and a Q8_0 reference)
-sh tests/vendor_quality.sh 43
+# the vendor's own weights, scored. ⚠ CHARSIU_RKLLM_REF IS NOT OPTIONAL: the
+# default reference is Q8_0, and the round of record is from the f16 original,
+# because the vendor quantised the ORIGINAL weights. Without it every
+# percentage in section 2 shifts. Each rung scores both passages from one
+# build, so this is the whole ladder:
+CHARSIU_RKLLM_REF=$PWD/models/Llama-3.2-1B-Instruct-f16.gguf \
+  sh tests/vendor_quality.sh 43     # and L3, and No1
 
 # the board round of record: speed, quality, the gemma4 sweep, one boot
 sh tests/board_record.sh
@@ -589,18 +626,18 @@ ends, and refuses to be read as one round if the boot id moved.
 ## 8. What is not supported
 
 The vendor at the frequency their published figures were taken at. Their
-runtime HAS now been run here, in section 1d, but at 594 MHz on both sides with
+runtime HAS now been run here, in section 1b, but at 594 MHz on both sides with
 neither scaling; section 1's right column is still a citation at maximum
 frequency and the two must not be combined.
 
-A single number for the prefill gap. Section 1d: 1.76x in our favour on
+A single number for the prefill gap. Section 1b: 1.76x in our favour on
 wall-clock TTFT for one string, 1.76x against us on throughput for the same
 string, and 1.23x against us per token once two prompt lengths separate the
 slope from the intercept. The last is the one that answers "how fast is the
 prefill"; the first answers "what does a user wait for" and is a tokeniser
 difference.
 
-That the overlap fault is gone. Section 4b: it is rail-conditioned, this board
+That the overlap fault is gone. Section 4a: it is rail-conditioned, this board
 is at 800 mV, and a probe that did not fire says nothing on its own.
 
 Anything about a second RK3576. One board.
@@ -618,7 +655,7 @@ than the lowest. This was stated as a finding and it was one passage.
 Cross-machine quality comparisons made before 2026-09-11. They compared two
 different files.
 
-The size of the TTFT gap against the vendor. Section 1b-3 attributes charsiu's
+The size of the TTFT gap against the vendor. Section 1e attributes charsiu's
 own prompt time, 69 to 81% inside the NPU entry, of which the read-back is 25
 to 36% of the whole and matches the fence. There is no equivalent breakdown of
 theirs, and read/fence does not track the gap across models.
