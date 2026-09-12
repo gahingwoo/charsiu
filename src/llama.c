@@ -4844,6 +4844,20 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
  * every column either way, and the softmax below already masks to
  * [tlo, pos] and zeroes the rest, so a masked column multiplies V by zero.
  */
+/* why a layer did not take the NPU path; one counter each, printed by name */
+enum {
+	AN_R_SHAPE,      /* no pool, no rows, or more heads than a group holds */
+	AN_R_HEAD_DIM,   /* this layer's head_dim is not the one the pool holds */
+	AN_R_LAYER,      /* layer index or kv head count outside the pool */
+	AN_R_EXTENT,     /* nothing to attend to, or past the K surface */
+	AN_R_KV,         /* past the V surface's reduction extent */
+	AN_R_UNPACKED,   /* the mirror does not hold the live positions yet */
+	AN_R_N
+};
+static const char *const an_reason[AN_R_N] = {
+	"shape", "head_dim", "layer index", "K extent", "V extent", "not packed"
+};
+
 struct attn_npu {
 	struct charsiu_fp16 *f;
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
@@ -4864,6 +4878,20 @@ struct attn_npu {
 	 * log2 of the context many repacks in a whole run.
 	 */
 	unsigned kvmax;
+	/*
+	 * ⚠⚠ "FELL BACK ON 0" WAS TRUE AND MEANT NOTHING. `fallbacks` counts
+	 * the two charsiu_fp16_matmul_group failures and nothing else, while
+	 * five earlier `return -1`s send a layer to the CPU without touching
+	 * any counter. On gemma-4 that read "ran 77 layers and fell back on 0"
+	 * while 308 of 385 layer-calls had silently gone to the CPU, because
+	 * its sliding-window layers are head_dim 256 against the 512 this pool
+	 * was built for. The number that was printed was the number that was
+	 * easy to count.
+	 *
+	 * One counter a reason, printed with the reason, so a refusal is
+	 * visible as a refusal. Same discipline as npudev.c's whine().
+	 */
+	unsigned long refused[AN_R_N];
 	unsigned char *dirty;               /* a layer with unflushed appends */
 	/*
 	 * ⚠⚠ HOW MANY POSITIONS EACH LAYER'S MIRROR ACTUALLY HOLDS.
@@ -4957,9 +4985,22 @@ static void attn_npu_free(struct attn_npu *a)
 
 	if (!a)
 		return;
-	if (a->layers || a->fallbacks)
-		fprintf(stderr, "charsiu: fp16 attention ran %lu layers and "
-			"fell back on %lu\n", a->layers, a->fallbacks);
+	if (a->layers || a->fallbacks) {
+		unsigned long ref = 0;
+		int r;
+
+		for (r = 0; r < AN_R_N; r++)
+			ref += a->refused[r];
+		fprintf(stderr, "charsiu: fp16 attention ran %lu layers, fell "
+			"back on %lu, refused %lu\n", a->layers, a->fallbacks, ref);
+		/* ⚠ BY REASON, because "refused 308" is the number that made
+		 * gemma-4 look like a head_dim 512 measurement when 28 of its
+		 * 35 layers are head_dim 256 and never reached the hardware. */
+		for (r = 0; r < AN_R_N; r++)
+			if (a->refused[r])
+				fprintf(stderr, "charsiu:   %-12s %lu\n",
+					an_reason[r], a->refused[r]);
+	}
 	if (a->f) {
 		for (i = 0; i < a->n_layer * a->nkv; i++) {
 			if (a->kb)
@@ -5263,17 +5304,29 @@ static int attn_npu_layer(struct attn_block_job *j)
 	unsigned H = j->n_head, hd = j->hd, i, h, rb;
 	unsigned T, npad;
 
-	if (!a || j->n <= 0 || H > FP16_GROUP_MAX)
-		return -1;
-	if (hd != a->hd || j->l >= a->n_layer || j->nkv != a->nkv)
-		return -1;
+	/* ⚠ ONE REASON A TEST. These used to be two compound conditions, so
+	 * even a counter on them could not have said WHICH clause refused --
+	 * and the clause that mattered on gemma-4 was head_dim, sharing a line
+	 * with two others. */
+	if (!a)
+		return -1;                      /* no pool: nothing to count on */
+	if (j->n <= 0 || H > FP16_GROUP_MAX) {
+		a->refused[AN_R_SHAPE]++; return -1;
+	}
+	if (hd != a->hd) {
+		a->refused[AN_R_HEAD_DIM]++; return -1;
+	}
+	if (j->l >= a->n_layer || j->nkv != a->nkv) {
+		a->refused[AN_R_LAYER]++; return -1;
+	}
 	T = (unsigned)(j->pos0 + j->n);
 	npad = (T + 15u) & ~15u;
 	/* ⚠ a matmul under the two byte feature atom on either axis is one
 	 * that wedged both cores, so the unit refuses it and so does this: a
 	 * prompt shorter than 32 positions runs on the CPU and always will */
-	if (T == 0 || npad < 32 || npad > a->nk)
-		return -1;
+	if (T == 0 || npad < 32 || npad > a->nk) {
+		a->refused[AN_R_EXTENT]++; return -1;
+	}
 	/*
 	 * ⚠ AND THE V SURFACE HAS TO COVER T. The appends climb the ladder as
 	 * positions arrive, so it normally does; if a growth ever failed, the
@@ -5281,13 +5334,16 @@ static int attn_npu_layer(struct attn_block_job *j)
 	 * back to the CPU is always safe -- the float cache is written either
 	 * way -- and a stale surface is a wrong answer.
 	 */
-	if (T > a->kv)
-		return -1;
+	if (T > a->kv) {
+		a->refused[AN_R_KV]++; return -1;
+	}
 	/* ⚠ before anything reads the mirror: a generation between two prompts
 	 * left positions in the float cache and not in here */
 	attn_npu_catchup(s, a, j->l, T);
-	if (a->packed[j->l] < T)
+	if (a->packed[j->l] < T) {
+		a->refused[AN_R_UNPACKED]++;
 		return -1;              /* could not fill it: the CPU is safe */
+	}
 
 	/*
 	 * ⚠ THE CACHES GO TO THE DEVICE ONCE A LAYER, NOT ONCE A TOKEN. fini
