@@ -25,9 +25,52 @@ its inputs. Collected 2026-09-11.
                    scored at -n 300
 ```
 
-⚠ The .rkllm's download URL is not recorded anywhere in this tree and I cannot
-reconstruct it. It has to come from whoever fetched it. Without it the md5 is a
-fingerprint of a file nobody else can obtain, which is half a provenance.
+## Where the .rkllm came from: it was CONVERTED here, not downloaded
+
+⛔ An earlier version of this section said the download URL was not recorded
+and had to come from whoever fetched it. That was the wrong question. The file
+was almost certainly never downloaded.
+
+Evidence, none of it needing the file's origin to be remembered:
+
+- **the file says so itself.** The last 29 bytes are the ASCII string
+  `rkllm-toolkit version: 1.1.4`. Nobody had read the tail; the reader in this
+  tree parses the weight area and the scale area and stops.
+- **no published RK3576 rkllm matches its size.** 1,300,605,380 bytes against
+  HanzoHuang's w4a16_g128 at 1,394,948,596 and w8a8 at 1,800,466,012, and
+  ThomasTheMaker's 1.2.0 build at 1,785,751,054.
+- **the name follows Kiln's convention, not a publisher's.** Kiln's README says
+  "put a `*-rk3576-w4a16.rkllm` in /opt/models"; every public release is named
+  `..._RK3576_w4a16_g128` or similar.
+
+So the provenance to record is the CONVERSION, not a link:
+
+```
+  toolkit          rkllm-toolkit 1.1.4      (from the file's own trailer)
+  quantisation     w4a16, ungrouped         (read out of the file: one fp32
+                   scale and one integer zero point per OUTPUT ROW)
+  calibration      none. w = scale*(q - zero) with a per-row absmax-style
+                   scale is data-free RTN, so no calibration set took part
+  source model     NOT RECOVERED. Nothing in the file names it, and nothing
+                   in this tree records which Llama-3.2-1B checkpoint or
+                   revision went in.
+```
+
+⚠ **Kiln's README pins 1.2.0 and this file is 1.1.4**, so it also predates the
+runtime the board runs. `librkllmrt` 1.3.0 loads it and generates correctly
+(section 1b of the evidence pack), so the version skew is not fatal, but it is
+not the combination Kiln specifies either.
+
+🔑 **The experiment that would close this is a RE-CONVERSION, not a link.**
+Being data-free, the quantiser should be deterministic: the same toolkit on the
+same source weights should produce the same bytes. Matching the md5 would prove
+the file is the vendor tool's output rather than something of unknown
+provenance, which is strictly more than a URL proves.
+
+⛔ It cannot be run on this machine. `rkllm-toolkit` ships only
+`linux_x86_64` wheels and this host is aarch64; the wheels present are 1.3.0,
+not the 1.1.4 that made the file. It needs an x86_64 machine, the 1.1.4
+toolkit, and the source checkpoint identified first.
 
 ## The vendor's quantiser, read out of the file
 
