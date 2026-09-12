@@ -4892,6 +4892,24 @@ struct attn_npu {
 	 * visible as a refusal. Same discipline as npudev.c's whine().
 	 */
 	unsigned long refused[AN_R_N];
+	/*
+	 * ⚠⚠ THE LAYER'S OWN HEAD, BESIDE a->hd WHICH IS THE CACHE'S STRIDE.
+	 *
+	 * They are the same number on every model but gemma4, whose window
+	 * layers are 256 long and whose full ones are 512 -- and m->head_dim
+	 * is already the LARGER of the two, because the float cache is one
+	 * allocation at one stride. That is why a->hd stays what it was: the
+	 * cache arithmetic in attn_kcache_at and attn_vcache_at is correct
+	 * only at the stride, and indexing it by the live head would make
+	 * layer 4 read where layer 0 wrote.
+	 *
+	 * What was sized by a->hd and should not have been is the MIRROR: a
+	 * 256 long head packed into a 512 wide fp16 buffer is 256 columns of
+	 * whatever was there. The mirror refused those layers rather than get
+	 * it wrong, which was the right call with nothing measured; r394 and
+	 * r395 measured it, and the refused head_dim is the one that wins.
+	 */
+	unsigned *lhd;                      /* [n_layer], this layer's head */
 	unsigned char *dirty;               /* a layer with unflushed appends */
 	/*
 	 * ⚠⚠ HOW MANY POSITIONS EACH LAYER'S MIRROR ACTUALLY HOLDS.
@@ -5012,6 +5030,7 @@ static void attn_npu_free(struct attn_npu *a)
 	}
 	free(a->kb);
 	free(a->vb);
+	free(a->lhd);
 	free(a->dirty);
 	free(a->packed);
 	free(a->sc);
@@ -5064,11 +5083,29 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
 	if (hd < 32 || a->nk < 32 || a->kv < 32 || !a->nkv || !a->mmax)
 		return NULL;
+	a->lhd = calloc(a->n_layer, sizeof(*a->lhd));
+	if (!a->lhd)
+		return NULL;
+	/* ⚠ a layer that states nothing takes the model's, which is the rule
+	 * llama_load already applies when it fills L->head_dim */
+	for (i = 0; i < a->n_layer; i++) {
+		a->lhd[i] = m->layers && m->layers[i].head_dim
+			  ? m->layers[i].head_dim : hd;
+		if (a->lhd[i] < 32 || a->lhd[i] > hd)
+			return NULL;    /* below the atom, or wider than the
+					 * stride the cache was built at */
+	}
 	/* ⚠ the CEILING is what the memory cap has to be judged against: kv
 	 * starts at one rung but a long enough run climbs to kvmax, and a cap
-	 * that only checked the first rung would refuse later, mid answer */
-	mb = (size_t)a->n_layer * a->nkv * ((size_t)hd * a->nk
-					    + (size_t)a->kvmax * hd) * 2;
+	 * that only checked the first rung would refuse later, mid answer.
+	 * ⚠ AND IT IS SUMMED PER LAYER NOW. Sizing every layer at the stride
+	 * over-counted gemma4 by a third -- 28 of its 35 layers mirror a 256
+	 * long head, not the 512 the cache is strided at -- which is a cap
+	 * that refuses a run the hardware would have taken. */
+	mb = 0;
+	for (i = 0; i < a->n_layer; i++)
+		mb += (size_t)a->nkv * ((size_t)a->lhd[i] * a->nk
+					+ (size_t)a->kvmax * a->lhd[i]) * 2;
 	{
 		const char *e = getenv("CHARSIU_ATTN_NPU_MB");
 		size_t cap = (size_t)(e ? atoi(e) : 2048) * 1024 * 1024;
@@ -5096,8 +5133,10 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	if (!a->kb || !a->vb || !a->dirty || !a->packed)
 		return NULL;
 	for (i = 0; i < nbuf; i++) {
-		a->kb[i] = charsiu_fp16_w_alloc(a->f, hd, a->nk);
-		a->vb[i] = charsiu_fp16_w_alloc(a->f, a->kv, hd);
+		unsigned lhd = a->lhd[i / a->nkv];
+
+		a->kb[i] = charsiu_fp16_w_alloc(a->f, lhd, a->nk);
+		a->vb[i] = charsiu_fp16_w_alloc(a->f, a->kv, lhd);
 		if (!a->kb[i] || !a->vb[i]) {
 			fprintf(stderr, "charsiu: the fp16 KV mirror ran out "
 				"at buffer %u of %u\n", i, nbuf);
@@ -5184,7 +5223,8 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		kv = a->kvmax;
 
 	for (i = 0; i < a->n_layer * a->nkv; i++) {
-		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->f, kv, a->hd);
+		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->f, kv,
+							a->lhd[i / a->nkv]);
 
 		if (!w) {
 			fprintf(stderr, "charsiu: the fp16 V surface would not "
@@ -5208,8 +5248,11 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			uint16_t *map = charsiu_fp16_w_map(
 					a->vb[l * a->nkv + kh]);
 
+			/* ⚠ TWO DIFFERENT WIDTHS ON ONE LINE: the mirror is
+			 * packed at the LAYER's head and the float cache is
+			 * addressed at the STRIDE. They differ on gemma4. */
 			for (p = 0; p + 1 < want; p++)
-				charsiu_fp16_pack_vcol(map, a->kv, a->hd, p,
+				charsiu_fp16_pack_vcol(map, a->kv, a->lhd[l], p,
 					attn_vcache_at(s, l, kh, a->hd, p));
 		}
 		a->dirty[l] = 1;
@@ -5232,7 +5275,7 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 
 	if (!a || pos < 0 || (unsigned)pos >= a->nk)
 		return;
-	if (l >= a->n_layer || kh >= a->nkv || hd != a->hd)
+	if (l >= a->n_layer || kh >= a->nkv || hd != a->lhd[l])
 		return;
 	/* ⚠ the ladder is climbed HERE, where the first position that does not
 	 * fit arrives, and the repack covers [0, pos) -- which is every
@@ -5240,9 +5283,9 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 	if ((unsigned)pos >= a->kv && attn_npu_fit(s, a, (unsigned)pos + 1))
 		return;
 	i = l * a->nkv + kh;
-	charsiu_fp16_pack_krow(charsiu_fp16_w_map(a->kb[i]), a->hd, a->nk,
+	charsiu_fp16_pack_krow(charsiu_fp16_w_map(a->kb[i]), a->lhd[l], a->nk,
 			       (unsigned)pos, k);
-	charsiu_fp16_pack_vcol(charsiu_fp16_w_map(a->vb[i]), a->kv, a->hd,
+	charsiu_fp16_pack_vcol(charsiu_fp16_w_map(a->vb[i]), a->kv, a->lhd[l],
 			       (unsigned)pos, v);
 	a->dirty[l] = 1;
 	/* ⚠ ON THE LAST KV HEAD, because a position is only mirrored once
@@ -5279,10 +5322,10 @@ static void attn_npu_catchup(struct llama_state *s, struct attn_npu *a,
 		uint16_t *vm = charsiu_fp16_w_map(a->vb[i]);
 
 		for (p = a->packed[l]; p < need; p++) {
-			charsiu_fp16_pack_krow(km, a->hd, a->nk, p,
+			charsiu_fp16_pack_krow(km, a->lhd[l], a->nk, p,
 					       attn_kcache_at(s, l, kh,
 							      a->hd, p));
-			charsiu_fp16_pack_vcol(vm, a->kv, a->hd, p,
+			charsiu_fp16_pack_vcol(vm, a->kv, a->lhd[l], p,
 					       attn_vcache_at(s, l, kh,
 							      a->hd, p));
 		}
@@ -5313,7 +5356,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	if (j->n <= 0 || H > FP16_GROUP_MAX) {
 		a->refused[AN_R_SHAPE]++; return -1;
 	}
-	if (hd != a->hd) {
+	if (j->l >= a->n_layer || hd != a->lhd[j->l]) {
 		a->refused[AN_R_HEAD_DIM]++; return -1;
 	}
 	if (j->l >= a->n_layer || j->nkv != a->nkv) {
