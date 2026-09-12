@@ -137,6 +137,37 @@ stdout: `Enabled cpus: [4, 5, 6, 7]`.
                    charsiu 1.44x
 ```
 
+⛔ **1.44x IS NOT A CONSTANT AND MUST NOT BE QUOTED AS ONE.** `board-logs/r390`
+measured both arms at a second clock, everything else held:
+
+```
+                594 MHz   786 MHz   change    spread at 786
+  charsiu         17.85     18.60    +4.2%    18.51..18.63
+  vendor          12.85     12.73    -0.9%    12.72..12.76
+  ratio           1.389     1.461    +5.2%
+```
+
+The ratio moves 5.2%, far outside either arm's spread. Report an interval, the
+way section 2 does, and say at which clock each end was taken.
+
+🏁 **And their decode does not use the NPU clock at all.** 32.4% more clock
+buys them -0.9%, with a 0.3% spread, so it is not noise; ours buys +4.2%.
+Whatever bounds their decode, it is not this clock.
+
+⭐ That weakens the fairness worry about section 1. Their published figures are
+at maximum CPU and NPU frequency and none of our arms are, but on DECODE the
+NPU clock is nearly inert for them.
+
+⚠⚠ **The obvious extension is NOT supported.** Only the NPU clock was varied.
+"Maximum frequency" in their header is CPU *and* NPU, and a decode that ignores
+the NPU clock is one that may well be bound by the CPU, which this round did
+not touch. Nothing here says their published figures would be reproduced at
+594 MHz.
+
+🔑 The two metrics swap sides: the clock is inert for their decode and worth
+6.5% of their prefill, while for charsiu it is worth 4.2% of decode and
+almost nothing on prefill.
+
 ⚠⚠ **The prefill answer depends on which question is asked, and the two
 readings point in OPPOSITE directions.** The vendor wraps the prompt in its own
 chat template: the same string is 50 tokens to them and 16 to us.
@@ -669,6 +700,15 @@ The vendor at the frequency their published figures were taken at. Their
 runtime HAS now been run here, in section 1b, but at 594 MHz on both sides with
 neither scaling; section 1's right column is still a citation at maximum
 frequency and the two must not be combined.
+
+A single number for the decode ratio against their runtime. Section 1b: 1.389
+at 594 MHz and 1.461 at 786, a 5.2% move against arm spreads of 0.3 and 0.6%.
+It is an interval, and each end has a clock attached.
+
+Their published figures reproduced at any clock measured here. Section 1b
+varied the NPU clock only; their header says maximum CPU *and* NPU, and their
+decode ignoring the NPU clock is a reason to suspect the CPU, which was not
+varied.
 
 A single number for the prefill gap. Section 1b: 1.76x in our favour on
 wall-clock TTFT for one string, 1.76x against us on throughput for the same
