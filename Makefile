@@ -245,6 +245,16 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
 	./tests/corpus_fixed.sh
+#
+# ⚠ THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
+# specified "every perplexity must name a file whose md5 appears in the
+# reproduction section" on 09-11 and nobody implemented it. Run for the first
+# time on 09-12 it failed at once: both corpora were scored by every
+# perplexity in the pack and NEITHER md5 was recorded. A rule nothing runs is
+# a sentence.
+#
+	python3 -P tools/check_consistency.py --self-test
+	python3 -P tools/check_consistency.py docs/paper-evidence.md
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
