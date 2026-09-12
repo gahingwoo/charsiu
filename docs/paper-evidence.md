@@ -181,16 +181,29 @@ Both are true. Two prompts separate the rate from the amount: a second, longer
 prompt is 79 tokens to us and 113 to them.
 
 ```
-               short              long             ms/token   fixed cost
-  charsiu   16 tok  265 ms     79 tok  751 ms        7.71       141.6 ms
-  vendor    50 tok  466 ms    113 tok  860 ms        6.25       153.6 ms
+               short              long
+  charsiu   16 tok  265 ms     79 tok  751 ms
+  vendor    50 tok  466 ms    113 tok  860 ms
 ```
 
-🔑 **The slope is the prefill rate and the intercept is the overhead.** Per
-prompt token the vendor is 1.23x faster, which is the real gap and is far
-smaller than either single-prompt reading. The fixed costs are within 8% and
-ours is the lower of the two. charsiu's wall-clock win on a short prompt is a
-tokeniser difference and must not be quoted as a prefill result.
+⛔ **THIS PAIR WAS FITTED TO A LINE AND THE FIT IS WITHDRAWN.** It read "7.71
+against 6.25 ms/token, fixed costs 141.6 against 153.6, so the vendor is 1.23x
+faster per prompt token, which is the real gap". None of those four numbers is
+supported. See 1g for the measurement that removed them: TTFT is convex in
+prompt length, charsiu's 79-token point carries a token-loop step its 16-token
+point does not, and the chunking changes with the length as well.
+
+And this pair has a fault the 1g pair does not: **the two secants are taken
+over different token ranges**, 16 to 79 on our side and 50 to 113 on theirs.
+On a convex curve a secant over a higher range is steeper, so the two slopes
+are not comparable even if each were exact.
+
+What stands from this section is the part above it: the same string reads 1.76x
+in each direction depending on which question is asked, and that is a tokeniser
+difference, not a prefill result. **The per-token prefill rate against their
+runtime is currently unmeasured.** Measuring it needs each runtime's own TTFT
+curve over a ladder of lengths, compared at matched token counts inside each
+curve -- `tests/board_ttft_curve.sh` does our half.
 
 ⚠ The rail differs: 800 mV for charsiu, 750 for the vendor, because their
 driver sets it through `npu-supply` and its OPP table rather than taking the
@@ -366,54 +379,49 @@ them at about 1200 MHz, not at the maximum their benchmark.md names. The gap to
 maximum is 16.4% -- and by the line above it is the same 16% on our side, so it
 does not move the ratio.
 
-**Prefill splits the other way, and the fixed costs cross over.** Two prompt
-lengths per condition, so the rate and the intercept separate:
+**Prefill: what the CPU is worth depends on the prompt length, and that is as
+far as this goes.** The raw numbers, with no model fitted to them:
 
 ```
-                              short      long     ms/token    fixed cost
-  vendor,  50 and 113 tok
-    schedutil                 437.3     772.8       5.325       171.0 ms
-    max CPU                   352.3     692.6       5.402        82.2 ms
-                                                    +1.4%       -51.9%
-  charsiu, 16 and 79 tok
-    schedutil                   267       754       7.730       143.3 ms
-    max CPU                     224       677       7.190       109.0 ms
-                                                    -7.0%       -23.9%
+                          TTFT ms                 gain at max CPU
+                     schedutil   max CPU
+  vendor    50 tok       437.3     352.3              -19.4%
+           113 tok       772.8     692.6              -10.4%
+  charsiu   16 tok         267       224              -16.1%
+            79 tok         754       677              -10.2%
 ```
 
-⛔ **Two points fit a line, and the two points are not the same kind of
-prompt, so these absolute numbers are provisional.** Chunking is not the
-problem: `llama_prefill_chunk_cap()` is 160 tokens for this model and
-`onechunk_on()` widens a fitting prompt into a single dispatch, so 16 and 79
-are one chunk each. **The odd token is.** `prefill_width()` does `w &= ~1`, so
-79 tokens run as a batched 78 **plus one token through `llama_forward`**, and
-that token-loop step is inside the prompt timer. The 16-token point has no
-leftover. So the long point carries a whole decode step that the short point
-does not, and the slope absorbs it while the intercept does not.
+Both runtimes gain more at a short prompt than at a long one, which is what
+"the part of prefill the CPU touches is more fixed than per-token" means
+without assuming a shape. The two runtimes' prompt lengths differ because their
+tokenisers do (1b), so the rows are not to be read across.
 
-The runtime prints this -- *"prompt batched for 78 of 79 tokens, the rest a
-token at a time"* -- and the round was not reading the line. Subtracting a
-decode step of the measured size moves the slope to about 6.6-7.0 ms/token and
-the intercept to about 119-155 ms; `tests/board_ttft_curve.sh` measures it
-properly, on even token counts, rather than correcting it by arithmetic.
+⛔ **AND THAT IS THE WHOLE CLAIM. The earlier version of this section fitted a
+line through each pair and reported a per-token rate and a fixed cost -- 5.325
+against 7.730 ms/token, 171.0 against 143.3 ms fixed, theirs halving and ours
+falling 24%. Every one of those numbers is withdrawn.** Three separate reasons,
+each on its own sufficient:
 
-For the vendor it is unchecked in a different way: their int4 dispatches top
-out around M=80, so 50 and 113 may straddle a boundary and their slope would
-carry the crossing.
+1. **TTFT is not linear in prompt length; it is convex, and measurably so.**
+   `tests/board_ttft_curve.sh`, one boot, CPU pinned at maximum, Llama-3.2-1B:
+   the marginal cost per token runs 6.200 ms between 102 and 202 tokens and
+   12.100 ms between 602 and 852. Attention is O(n^2) and this is what that
+   looks like. An intercept extrapolated to zero from two points on a curve is
+   not a fixed cost, it is an artefact of where the two points were.
+2. **The two points are not the same kind of prompt.** `prefill_width()` does
+   `w &= ~1`, so 79 tokens run as a batched 78 **plus one token through
+   `llama_forward`**, inside the prompt timer; 16 tokens have no leftover. The
+   runtime prints *"prompt batched for 78 of 79 tokens, the rest a token at a
+   time"* and the round was not reading the line.
+3. **Prompt length changes the CHUNKING as well as the work.** The marginal is
+   not even monotone -- 8.320 ms/token between 52 and 102 against 6.200 between
+   102 and 202 -- because at 102 tokens `onechunk_on()` widens the prompt into
+   a single chunk of 102, and that is 5.9% slower than letting it run as
+   `1x80+1x22`. See 1h.
 
-What survives either way is the COMPARISON, because chunking does not depend on
-the CPU clock: the same two prompt lengths, the same chunking, measured under
-two governors. The +1.4% and the -51.9% are changes in a quantity measured
-identically in both arms. It is the absolute decomposition into "rate" and
-"fixed cost" that needs the linearity, and only on their side.
-
-Their per-token prefill rate does not use the CPU at all; the whole of their
-TTFT improvement is the intercept, and it halves. With 1b's 6.5% for the NPU
-clock: their rate is the NPU's and their fixed cost is the CPU's. Ours splits
-the other way, and the consequence is that **at `schedutil` our fixed cost is
-16% below theirs and at maximum CPU it is 33% above** -- which runtime starts a
-prompt faster depends on the governor, and every round so far picked the one
-that flatters us.
+What survives is the table above, because chunking and the leftover token do
+not depend on the CPU clock: the same prompt, the same chunking, under two
+governors.
 
 ⛔ The first charsiu sweep of this round was thrown away rather than published.
 It read 13.85 t/s at maximum CPU where r388 had recorded 17.85 at a lower
@@ -422,6 +430,50 @@ boot, the variable was `CHARSIU_NPU_MAXN`: its C default of 8192 is below every
 vocabulary, so the output head silently stayed on the CPU, and it was worth 55%
 of decode at maximum CPU and 83% at `schedutil`. The default is now 262144,
 which is what every board round in this tree had already been setting.
+
+### 1h. The prompt's chunk width, and a default that is right at 128 and wrong at 102
+
+Found while measuring 1g's TTFT curve: the marginal cost per token is not
+monotone in prompt length -- 8.320 ms between 52 and 102 tokens against 6.200
+between 102 and 202 -- which a convex function cannot do. The cause is that the
+prompt length also decides the chunking.
+
+`charsiu_run` runs a nominal chunk of 80, and `onechunk_on()` widens the whole
+prompt into ONE chunk when it fits under the model's ceiling (160 tokens here).
+A 102-token prompt therefore runs as a single chunk of 102 rather than as
+`1x80+1x22`. One 102-token prompt, CPU pinned at maximum, chunk width the only
+variable, 3 readings a cell:
+
+```
+  chunk   widths actually run     median TTFT
+     48   2x48+1x6                    809 ms
+     80   1x80+1x22                   809 ms
+     52   1x52+1x50                   830 ms
+     64   1x64+1x38                   849 ms
+    102   1x102   <- the default      857 ms
+     34   3x34                        870 ms
+```
+
+Within a cell the spread is at most 6 ms; between the best and the default it
+is 48 ms, so the ordering is outside the noise. **The shipped default is 5.9%
+slower than chunking at 80 on this prompt length.**
+
+⚠ It is not "fewer chunks is better" -- one chunk of 102 is nearly the worst
+row and three chunks of 34 is the worst. It is not a clean multiple-of-16 rule
+either: `1x64+1x38` should then beat `1x52+1x50` and it does not.
+
+⚠⚠ **AND THE DEFAULT IS NOT SIMPLY WRONG.** `onechunk_on()` was turned on
+against measurement: TTFT fell on all four vendor-protocol models, 5.1% and
+5.7% on the two whose baselines repeat. Those are 128-token prompts. So the
+knob wins at 128 and loses at 102, which makes this a non-monotone response to
+prompt length and not a regression to revert.
+
+⛔ **Six cells at one prompt length cannot choose a new default.** The comment
+above the knob records what happened the last time a chunk rule was derived
+rather than measured -- SmolLM2 came back 77% slower. What is supported here is
+that the default is not optimal at every length, which is enough to stop
+quoting a single TTFT figure as if chunking were settled, and not enough to
+change anything.
 
 ---
 
@@ -795,13 +847,16 @@ reversed.** The paper has been carrying "their published figures are at maximum
 CPU and NPU and our arms are not" as an open concession. Section 1g measures
 it: on decode the two runtimes have the same CPU elasticity to three digits, so
 their condition moves both columns together and leaves the ratio alone. The
-concession survives only for prefill, where it now points the other way -- our
-fixed cost beats theirs at `schedutil` and loses to theirs at maximum CPU, so
-any TTFT claim has to name the governor it was measured under.
+concession survives for prefill, where both runtimes gain more from the CPU at
+a short prompt than at a long one, so any TTFT claim has to name the governor
+AND the prompt length it was measured under.
 
-⛔ **And every TTFT number in the pack was measured under `schedutil`**, which
-1g shows is the governor that flatters us on fixed cost. That is not a reason
-to drop them; it is a reason that each one has to say so beside it.
+⛔ **And the paper must not carry a per-token prefill rate against their
+runtime.** The 1.23x came from fitting a line through two prompt lengths a side
+and 1g withdraws that fit; section 8 now lists the gap as unmeasured. Anywhere
+the prose says charsiu's prefill is within 23% of theirs per token, or that the
+two runtimes' fixed costs are within 8%, comes out until the curves are
+measured against each other.
 
 ## 8. What is not supported
 
@@ -823,12 +878,15 @@ figure for this model class. Neither section claims to reproduce their table;
 what 1g supports is that moving to their condition does not change the RATIO,
 because it moves both columns by the same 22%.
 
-A single number for the prefill gap. Section 1b: 1.76x in our favour on
-wall-clock TTFT for one string, 1.76x against us on throughput for the same
-string, and 1.23x against us per token once two prompt lengths separate the
-slope from the intercept. The last is the one that answers "how fast is the
-prefill"; the first answers "what does a user wait for" and is a tokeniser
-difference.
+ANY number for the prefill gap, including the 1.23x this list used to give.
+Section 1b: the same string reads 1.76x in our favour on wall-clock TTFT and
+1.76x against us on throughput, which is a tokeniser difference and not a
+prefill result. The per-token rate that was supposed to settle it came from
+fitting a line through two prompt lengths a side, and 1g withdraws that fit:
+TTFT is convex in length, our long point carries a token-loop step our short
+one does not, the chunking changes with the length, and the two sides' secants
+were taken over different token ranges. The per-token prefill rate against
+their runtime is unmeasured.
 
 That the overlap fault is gone. Section 4a: it is rail-conditioned, this board
 is at 800 mV, and a probe that did not fire says nothing on its own.
