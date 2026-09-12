@@ -111,6 +111,16 @@ NTOK=${CHARSIU_AWQ_NTOK:-32}
 # long enough that the prompt is BATCHED, which is the whole subject of arm 1
 PROMPT=${CHARSIU_AWQ_PROMPT:-"The keeper of the lighthouse wrote down the barometer and the wind every morning for eleven years, and what he remembered afterwards was not the storms but the particular quality of the light in the hour before one arrived. Explain, in plain words, why a written record outlasts a memory:"}
 
+#
+# ⚠⚠ SAY WHICH FILE. charsiu re-quantises whatever it loads, so the source
+# format is inside every perplexity below: the same Llama-3.2-1B reads 33.8071
+# from Q4_0 and 28.7072 from Q8_0 at group 1024, a 20% spread, and a round that
+# does not name its file cannot be put beside one that does. A whole evening
+# went to a number that would not reproduce because the configuration was the
+# first suspect and the input was never one at all.
+#
+echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
+
 STATS=$T/awq.stats
 echo "== recording calibration statistics"
 env $W4 CHARSIU_NPU=0 CHARSIU_CALIB="$STATS" \
@@ -245,8 +255,8 @@ echo "== arm 5: does the factor's clamp BIND, which is worth a third of the meth
 # ⚠⚠ THE ARM IS "DOES IT BIND", NOT "WHICH hi". The factor has a SECOND bound:
 # the statistic is floored at 1e-3 * mean, which caps the factor at
 # (1/floor)^alpha whatever the data does. The clamp only acts while it is the
-# tighter of the two -- and at the shipped defaults that means it binds from
-# alpha 0.10 UPWARD, always. A sweep of hi below the cap measures the bound and
+# tighter of the two -- and at the 2.0 that was the default until 2026-09-10
+# that means it binds from alpha 0.10 UPWARD, always. A sweep of hi below the cap measures the bound and
 # the exponent together, which is what every alpha sweep in this tree did
 # before 2026-09-10.
 #

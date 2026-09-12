@@ -36,11 +36,36 @@ static double now_ms(void)
 
 double charsiu_pool_stage_ms;
 
+/*
+ * ⚠⚠ THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE ONE NOTHING
+ * HAD EVER RUN. This is the gate the output head hits -- see the refusal
+ * below, which already named the cost and kept the default that caused it.
+ * 8192 is under every vocabulary this runtime loads, so under it that head
+ * NEVER reaches the NPU, and the whole of the fix that went in here was to
+ * make the refusal audible rather than to stop refusing.
+ *
+ * r391 priced it: Llama-3.2-1B on a ROCK 4D, same boot, same binary, maximum
+ * CPU, one variable --
+ *
+ *   CHARSIU_NPU_MAXN=8192     13.89  13.86  tok/s
+ *   CHARSIU_NPU_MAXN=262144   21.50  21.52  tok/s
+ *
+ * 55%, and peak RSS moves 3 MB. Only charsiu-runner and charsiu-serve set the
+ * variable and every board test sets it too, so 8192 was what a bare
+ * charsiu_run, charsiu_vision, charsiu_whisper or charsiu_clip got and nothing
+ * whatsoever measured. 262144 is what every board round this project has run
+ * has used. That is the identical argument job.c makes for CHARSIU_COEF_ELEMS,
+ * three lines from where llama.c reads this one, and it was applied there and
+ * not here: the instance was fixed and the class was not.
+ *
+ * llama.c clamps this to the model's vocabulary, so 262144 asks for "no gate",
+ * not for a buffer of that size -- nothing here is sized by it.
+ */
 static unsigned pool_maxn(void)
 {
 	const char *e = getenv("CHARSIU_NPU_MAXN");
 
-	return e ? (unsigned)atoi(e) : 8192;
+	return e ? (unsigned)atoi(e) : 262144;
 }
 
 int charsiu_pool_init(struct charsiu_npu_pool *p, unsigned max_tensors,

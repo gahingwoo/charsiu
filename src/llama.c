@@ -605,12 +605,140 @@ static int cpus_parse(const char *spec, cpu_set_t *setp)
  * Neither has a default; a wrong guess baked in is a regression nobody could
  * see, which is the reason the first one is opt in already.
  */
+/*
+ * The fastest cluster, read from the board rather than assumed. Returns how
+ * many CPUs it has, and 0 when the machine is homogeneous or sysfs has no
+ * cpufreq at all -- on which nothing below should act.
+ *
+ * ⚠ IT INTERSECTS WITH THE INHERITED MASK. A caller who ran taskset has
+ * already answered this question, and widening their mask because we think we
+ * know better would be a runtime overriding an operator.
+ */
+/*
+ * ⚠⚠ THREADS INHERIT THE CREATOR'S MASK, so pinning the calling thread before
+ * pthread_create pins the whole pool with it -- which is NOT what the comment
+ * in cpus_pin() claims and not what this tree measured as best. The mask as it
+ * was inherited is kept here and handed back to the workers.
+ *
+ * That is the shape of the fault this file has hit before: a comment stating a
+ * property nobody verified. It was caught by asking where pool_start calls
+ * cpus_pin relative to pthread_create, which is a question about order rather
+ * than about intent.
+ */
+static cpu_set_t g_cpus_inherited;
+static int g_cpus_autopinned;
+
+static int cpus_fastest_cluster(cpu_set_t *out)
+{
+	long best = 0, khz[CPU_SETSIZE];
+	cpu_set_t allowed;
+	int n = 0;
+
+	CPU_ZERO(out);
+	if (sched_getaffinity(0, sizeof(allowed), &allowed))
+		return 0;
+	for (int c = 0; c < CPU_SETSIZE; c++) {
+		char path[128];
+		FILE *f;
+
+		khz[c] = 0;
+		if (!CPU_ISSET((size_t)c, &allowed))
+			continue;
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",
+			 c);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (fscanf(f, "%ld", &khz[c]) != 1)
+			khz[c] = 0;
+		fclose(f);
+		if (khz[c] > best)
+			best = khz[c];
+	}
+	if (!best)
+		return 0;               /* no cpufreq: say nothing, do nothing */
+	for (int c = 0; c < CPU_SETSIZE; c++)
+		if (khz[c] == best) {
+			CPU_SET((size_t)c, out);
+			n++;
+		}
+	/* homogeneous machine: the fastest cluster is the whole machine and
+	 * pinning to it is a no-op dressed as a decision. */
+	if (n == CPU_COUNT(&allowed))
+		return 0;
+	return n;
+}
+
 static void cpus_pin(void)
 {
 	const char *spec = getenv("CHARSIU_CPUS");
 	cpu_set_t set;
 
-	if (!spec || !*spec)
+	/*
+	 * ⚠⚠ THERE IS A DEFAULT NOW, AND THE PARAGRAPH ABOVE ARGUED AGAINST
+	 * ONE. It said "a wrong guess baked in is a regression nobody could
+	 * see", which was right while nobody had measured what NOT choosing
+	 * costs. On 2026-09-11 that was measured, and not choosing is the
+	 * expensive option. Qwen3-0.6B on a ROCK 4D, the scoreboard's own
+	 * invocation, ten passes, affinity the only variable:
+	 *
+	 *   default (no pin)   20.92 20.59 20.53 26.35 20.95 ... 26.37
+	 *   taskset -c 0-7     20.65 20.11 20.94 20.55 26.31 ... 26.40
+	 *   taskset -c 4-7     26.20 26.53 26.55 26.60 26.18 ... 26.49
+	 *   taskset -c 0-3     18.35 18.22 18.16 18.26 18.33 ... 18.34
+	 *
+	 * The unpinned arms are BIMODAL across a 28% spread; the pinned ones
+	 * are unimodal inside 1.6%. The high mode of the default arm IS the
+	 * big-four level -- it is the case where all four threads happened to
+	 * land on the four A72s. Median 20.67 unpinned against 26.40 pinned,
+	 * +27.7%, and the number stops moving.
+	 *
+	 * `taskset -c 0-7` behaving exactly like no taskset is the part that
+	 * settles it: this is not about which cores are permitted, it is about
+	 * where the scheduler puts four threads given eight and no
+	 * instruction. A scheduling lottery is worse than a small steady loss
+	 * because it cannot be planned around -- which is what the note above
+	 * this one already said about decode, on 2026-09-06, before anything
+	 * acted on it.
+	 *
+	 * ⚠ ONLY THE CALLING THREAD, and that is this tree's own measurement
+	 * too: the pool wants the whole machine (a prompt is 4.3% faster with
+	 * it open) while decode is one thread's work and loses 26% when that
+	 * thread lands on an A53. So the default pins the caller to the fast
+	 * cluster and pool_start hands the workers the inherited mask back --
+	 * which they would otherwise NOT have, because a thread inherits the
+	 * creator's affinity and cpus_pin() runs before pthread_create.
+	 *
+	 * CHARSIU_CPUS=off turns it off. An explicit CHARSIU_CPUS still wins.
+	 */
+	if (!spec || !*spec) {
+		cpu_set_t fast;
+		int n;
+
+		if (!charsiu_env_flag("CHARSIU_AFFINITY", 1))
+			return;
+		n = cpus_fastest_cluster(&fast);
+		if (n < 1)
+			return;
+		if (sched_getaffinity(0, sizeof(g_cpus_inherited),
+				      &g_cpus_inherited))
+			CPU_ZERO(&g_cpus_inherited);
+		if (sched_setaffinity(0, sizeof(fast), &fast)) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: could not pin to the "
+					"fast cluster\n");
+			return;
+		}
+		if (charsiu_diag())
+			fprintf(stderr, "charsiu: this thread on the fastest "
+				"cluster, %d CPUs (CHARSIU_AFFINITY=0 to "
+				"leave it to the scheduler)\n", n);
+		g_cpus_autopinned = 1;
+		cpu_clock_report(&fast);
+		return;
+	}
+	if (!strcmp(spec, "off"))
 		return;
 	/* ⚠ the FAILURE still speaks. A pin that did not apply changes the
 	 * numbers and is not a running commentary. */
@@ -651,7 +779,31 @@ static void pool_start(int nthreads)
 		cpu_set_t pset;
 		int n = 0, bad = 0;
 
-		if (pspec && *pspec && (n = cpus_parse(pspec, &pset)) > 0) {
+		/*
+		 * ⚠ GIVE THE POOL THE WHOLE MACHINE BACK. The workers were
+		 * created after the calling thread was pinned, so they
+		 * inherited its mask; this tree's own 09-06 table says the
+		 * pool wants every core (a Llama prompt is 4.3% faster with
+		 * it open) while DECODE is one thread's work that loses 26%
+		 * on an A53. Caller narrow, pool wide is the column that won
+		 * both.
+		 */
+		if ((!pspec || !*pspec) && g_cpus_autopinned &&
+		    CPU_COUNT(&g_cpus_inherited) > 0) {
+			for (long i = 0; i < nthreads; i++)
+				bad |= pthread_setaffinity_np(
+					g_pool.th[i],
+					sizeof(g_cpus_inherited),
+					&g_cpus_inherited) != 0;
+			if (bad)
+				fprintf(stderr, "charsiu: the pool kept the "
+					"caller's narrowed mask\n");
+			else if (charsiu_diag())
+				fprintf(stderr, "charsiu: the pool's %d threads"
+					" back on all %d CPUs\n", nthreads,
+					CPU_COUNT(&g_cpus_inherited));
+		} else if (pspec && *pspec &&
+			   (n = cpus_parse(pspec, &pset)) > 0) {
 			for (long i = 0; i < nthreads; i++)
 				bad |= pthread_setaffinity_np(g_pool.th[i],
 							      sizeof(pset),
@@ -3540,8 +3692,12 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 				"board runs.\n");
 	}
 	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
+		/* 262144, not 8192: see pool_maxn() in npupool.c. The two
+		 * defaults have to agree or the gate and the open disagree
+		 * about which tensors are allowed. Clamped to n_vocab below,
+		 * so this asks for "no gate" rather than for a buffer. */
 		const char *e = getenv("CHARSIU_NPU_MAXN");
-		unsigned maxn = e ? (unsigned)atoi(e) : 8192;
+		unsigned maxn = e ? (unsigned)atoi(e) : 262144;
 		unsigned widest = state_widest(m);
 
 		if (maxn > m->n_vocab)
@@ -3554,7 +3710,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 			/*
 			 * ⚠ SAY HOW MANY ARE COMING. Staging is about twenty
 			 * seconds of silence and the heartbeat below only
-				 * counts up, so a caller drawing a progress bar
+			 * counts up, so a caller drawing a progress bar
 			 * has no denominator. Seven projections a layer --
 			 * q k v o gate up down -- plus the output head, which
 			 * is 113 for the 16 layer model every board round uses

@@ -66,6 +66,24 @@ reach on this board, so they are at rate rather than idling. What is left to
 win is the number of bytes read back, and that is set by the quantisation
 group.
 
+⚠ **THREE DIFFERENT RATES GET CALLED "THE BANDWIDTH" IN THIS PROJECT AND ONLY
+SOME OF THEM ARE ONE.** The three above are a memcpy rate measured directly,
+and they are comparable to each other. Two others are quoted elsewhere and
+should not be:
+
+- **11.7 GB/s** is `npu_prep_cost`'s cache walk at 65536 bytes (round 151). It
+  is real, and it is the rate of buffer MAINTENANCE, not of weights.
+- ⛔ **9.9 GB/s is not a bandwidth at all.** It is gemma4's q/k/v stage,
+  81.0 MB a token over 8.15 ms, computed from gguf shapes -- and the entry it
+  comes from exists to argue that such a number is NOT a roof: in the same
+  table `gate + up` reaches **16.8**, the biggest stage being the fastest. A
+  roof does not have a 2.3x spread across shapes; a fixed cost does. Quoting
+  9.9 as a bandwidth cites a figure the tree derived in order to refute it.
+
+The one number that behaves like a roof is the weight rate the NPU summary
+reports, **10.58 GB/s**, and the head's own cost agrees with it to 1.4% from
+its shape alone (PLAN.md, section 2).
+
 **One line of device tree matters.** Mainline clocks the NPU at 786 MHz and
 leaves the rail wherever U-Boot put it, 750 mV, where the vendor's own table
 asks 800 mV of that speed. At 750 the two cores get about one row in a thousand
@@ -324,14 +342,62 @@ which is the whole reason the group exists.
 
 **Why the int4 row is +87%, and it is not exotic.** q4_0 carries one fp16
 scale per **32** weights; charsiu carries one per `CHARSIU_NPU_W4_GROUP`, which
-`llama_auto_kmax` sets to 1024. Thirty-two times coarser. The group cannot
-simply be narrowed, because the K slice **is** the group and the read back is `m·n·ceil(K/KMAX)·4` -- so a
-finer group is paid for in prefill. Narrowing it does work, and the ladder is
+`llama_auto_kmax` sets to 1024. Thirty-two times coarser.
+
+⛔⛔ **AND `llama_auto_kmax` RUNS ONLY WHEN THE NPU IS ON, so the host CPU
+reference has never reached it.** `CHARSIU_NPU=0` takes npuquant's own default
+instead -- one absmax a row, a quantiser the board never runs. Every quality
+number this tree measured on the desk before 2026-09-10 is of that ungrouped
+path, and the two differ by a fifth: Llama-3.2-1B reads **41.5289 ungrouped and
+33.8071 at group 1024**, and it is the second that the board reproduces
+(33.4149). To measure the board's quantiser on the desk, set it by hand:
+
+```
+  CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_KMAX=1024 \
+  CHARSIU_NPU_W4_GROUP=1024 build/charsiu_ppl model.gguf text.txt -n 300
+```
+
+`tests/host_awq.sh` exports both and says why at the export, and the runtime no
+longer takes that path silently: with `CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1` and
+no group set it prints, once, that it is measuring one scale a row and not what
+the board runs. It still runs -- the ungrouped path is a legitimate arm, it
+just has to be chosen.
+
+The group cannot simply be narrowed, because the K slice **is** the group and
+the read back is `m·n·ceil(K/KMAX)·4` -- so a finer group is paid for in
+prefill. Narrowing it does work, and the ladder is
 the evidence that the group is the cause:
 
 ```
   group 1024   49.89        group 256   38.97        group 128   36.33
 ```
+
+⚠⚠ **AND A PERPLEXITY BELONGS TO A FILE, NOT TO A MODEL.** charsiu re-quantises
+whatever it is handed, so the source format survives into the answer. Three
+files of the same Llama-3.2-1B, same 300 tokens of `tests/corpus/long.txt`,
+same binary, this desk:
+
+```
+                        one scale a row    group 1024
+  Q8_0                      34.6888         28.7072
+  Q4_0                      41.5289         33.8071   <- every Llama number here
+  Q4_0 "pure"               41.8712         30.2425
+```
+
+**Every Llama perplexity in this file is the Q4_0 row**, and it reproduces to
+the last digit. The board's own AWQ round read 33.4149 against that 33.8071, so
+the board ran the Q4_0 file too -- ⚠ which is not what `scripts/charsiu-get`
+says: its **Q8_0** line is annotated "THE ONE EVERY BOARD ROUND USES". Both can
+be true at once, the timing rounds on one file and the quality round on the
+other, and that is worse than either being wrong: it means the two halves of
+the scoreboard are not about the same weights. `tests/board_awq.sh` now prints
+the file it was handed, so the next round says so on its own.
+
+⛔ **The gap is 20% and it is not noise, so a quality number without its file
+is not a quality number.** Q8_0 is the honest source -- it is nearly lossless
+going in, so what the arm scores is charsiu's quantiser and nothing else.
+Handing it a file that is already four-bit scores the SECOND quantisation of an
+already-quantised tensor and calls the difference int4 damage.
 
 So the route is the vendor's: a coarse group and a calibrated quantiser. That
 sentence used to be a belief and is now read out of their file. Correlating
@@ -451,8 +517,8 @@ though: `3-27` on its own is still worth 19.3%.
 
 ⚠ **And its exponent had never been swept.** Every experiment before today
 pinned `CHARSIU_NPU_AWQ` at 0.5 -- the usual square-root balance -- and moved
-the clamp instead. Held at the default clamp of 2.0 it is a clean single
-minimum, and 0.5 is past it:
+the clamp instead. Held at the clamp default of the day, 2.0, it is a clean
+single minimum, and 0.5 is past it:
 
 ```
   alpha   0.25    0.30    0.35    0.40    0.45    0.50
@@ -465,8 +531,10 @@ the ordering holds on the shorter corpus at 200 tokens too (68.07 against
 
 ⚠⚠ **EVERY SWEEP IN THIS SECTION WAS MEASURED THROUGH A BINDING CLAMP, and
 that changes the answers.** The factor's clamp binds whenever
-`hi < (1/floor)^alpha`, which at the shipped defaults is from alpha 0.10
-upward -- so the numbers below are the exponent and the bound together. With
+`hi < (1/floor)^alpha`, which at the 2.0 these were measured through is from
+alpha 0.10 upward -- so the numbers below are the exponent and the bound
+together. (At the 6.0 that ships now it is from 0.26, since 1000^0.26 = 6.0,
+which is why the default moved.) With
 `CHARSIU_NPU_AWQ_CLAMP=64` so the clamp is inert:
 
 ```
@@ -488,10 +556,11 @@ worth much more than the clamped numbers show:**
 ⚠ **"0.5 is worse than not running AWQ at all" is an artefact of the clamp.**
 At hi=2.0 Llama's 0.50 reads 50.73 against 41.53 off; with the clamp inert it
 reads 37.68, which is better than off. The paragraphs below are kept because
-they are what the shipped defaults actually produce.
+they are what the defaults of that day, 2.0, actually produced -- and
+`CHARSIU_NPU_AWQ_CLAMP=2.0` still reproduces them exactly.
 
 ⚠ **The minimum itself is per model, but 0.5 is past it on both** (at the
-shipped clamp). The same sweep on Llama-3.2-1B, its own calibration, same
+clamp of the day, 2.0). The same sweep on Llama-3.2-1B, its own calibration, same
 corpus and length:
 
 ```
@@ -585,8 +654,8 @@ and every field that key had said "this is the same input". `CHARSIU_NPU_AWQ_BAT
 puts the refusal back.
 
 ⚠⚠ **And the factor's CLAMP is costing 7% of AWQ at the exponent you should
-use.** `CHARSIU_NPU_AWQ_CLAMP` defaults to 2.0, so the factor lives in
-[0.5, 2]. Its onset is measurable: at alpha 0.10 the width makes no difference
+use.** `CHARSIU_NPU_AWQ_CLAMP` defaulted to 2.0 when this was written, so the
+factor lived in [0.5, 2] (the default is 6.0 now, and why is below). Its onset is measurable: at alpha 0.10 the width makes no difference
 at all -- 80.1066 to the last digit at hi = 2, 4 and 8 -- and from 0.15 it
 does. At each model's own best setting:
 
@@ -618,6 +687,29 @@ binds, and there the answer is unanimous:
 to 1000^0.65 = 89 and the narrow clamp is what saves the model -- Llama 72.17
 at hi=2 against 86.66 at hi=4. The clamp earns its keep exactly where the
 exponent is too large to be used at all.
+
+🏁🏁 **CONFIRMED ON THE BOARD, 2026-09-10.** ROCK 4D, Llama-3.2-1B, the same
+corpus bytes as the desk:
+
+```
+                       board       host
+  int4                33.4149    33.8071
+  + AWQ alpha 0.20    23.7935    23.7173     board and host agree to 0.3%
+  + INT8_LAYERS=3-4   22.0356    22.0818
+  clamp 2.0 instead    26.9265    27.7029     the old default costs 13.2%
+```
+
+and the batched path applying AWQ's factor instead of refusing is worth
+**5.1x on prefill** -- 2643 ms against 515 ms -- because the refusal fell back
+to a row at a time. AWQ_SHARE gives identical tokens and +2.9% decode.
+
+⚠ **Two arms disagreed with the desk, both by about 2%, and both are cells the
+desk should never have ranked.** `AWQ_LAYERS=0-2` is better on the board
+(23.2380) and worse on the host (24.5122); `INT8_LAYERS=1-1` reverses the same
+way. One passage resolves about 10%, so neither is a contradiction -- they are
+two pairs that were never separable, ordered anyway because they happened to
+agree across two passages of the SAME corpus. Six arms, zero identity checks
+failed, 561 s.
 
 🏁 **The default moved 2.0 -> 6.0 on 2026-09-10**, because 2.0 binds from alpha
 0.10 upward and was taking a third of the method with it. 6.0 is inert wherever
@@ -661,10 +753,17 @@ The damage is not spread evenly over the layers. `CHARSIU_NPU_INT8_LAYERS=0-1`
 keeps the first two blocks at eight bits and leaves the rest at four:
 
 ```
-                        int4 g1024   INT8_LAYERS=0-1   all int8   of the gap
+                       int4, a row   INT8_LAYERS=0-1   all int8   of the gap
   Llama-3.2-1B            41.5289        26.0672       17.9772      65.6%
   Qwen3-0.6B             110.0549        85.0878       45.1214      38.4%
 ```
+
+⛔ **THAT HEADER SAID `int4 g1024` UNTIL 2026-09-11 AND THE COLUMN IS NOT
+GROUPED.** 41.5289 is one absmax a row; the same file at group 1024 is 33.8071.
+The warning two paragraphs down had said "measured UNGROUPED" since the table
+was written, so the table contradicted its own caption for as long as it
+existed -- and a header is what gets copied out into a paper, not the
+paragraph under it.
 
 The absolute fractions differ because the models have sixteen layers and
 twenty-eight, so the same two are 12.5% of one and 7.1% of the other. **The
@@ -699,7 +798,22 @@ replacements hold on both passages:
   3-4        23.1453 -8.8%   40.5593 -8.0%   12.5%   more, same bytes
 ```
 
-**Use `1-1` if bytes matter or `3-4` if quality does.**
+⛔ **`1-1` DID NOT SURVIVE THE BOARD.** Two host passages agreeing is not two
+independent samples of the hardware, and on the card `1-1` is worse than the
+range it was supposed to replace at half the cost:
+
+```
+                       board      host
+  INT8_LAYERS=off     23.7935    23.7173
+  0-1                 22.1619    22.5511
+  1-1                 22.4623    22.3404    the two disagree in SIGN
+  3-4                 22.0356    22.0818
+```
+
+⚠ Both gaps are under 1.4%, inside the ~10% that one passage resolves, so this
+is not a contradiction -- it is two cells that were never separable being
+ranked anyway. **`3-4` is the recommendation, and it is the only one of the
+three that holds on both.**
 
 ⛔ **It is host-side today.** `charsiu_npu_add` refuses an eight-bit tensor on
 a device opened for four, so those tensors take the CPU: slow, and right. The
@@ -1145,10 +1259,19 @@ Their measurements are worth reading before starting anything here, and they are
 collected in [rockchip-npu-notes](https://github.com/gregordinary/rockchip-npu-notes).
 
 Their central finding is that **the NPU is a prefill engine and decode belongs on the
-CPU**: a single-row matmul is about 82 times slower on the NPU than the batched shape
-it was built for, a feature height below four computes wrong output at all, and
-quantisation does not speed prefill up because the pipeline sits at a dispatch and DMA
-floor rather than a MAC one.
+CPU** -- `ggml-rocket`'s own words are *"Decode (M=1 GEMV) is forced to the CPU, ~82x
+slower on the NPU"*. A feature height below four computes wrong output at all
+(`rockchip-npu-notes`: *"a height below 4 mis-computes on the hardware at every dtype.
+That is the `M==1` single-vector or GEMV case"*), and quantisation does not speed
+prefill up because the pipeline sits at a dispatch and DMA floor rather than a MAC one.
+
+⚠ **They qualify that last one and this file used to drop the qualifier.**
+`ggml-rocket` says quantisation buys RAM rather than prefill speed *"at this operating
+point"*, and `rockchip-npu-notes` adds that it is *"bottleneck-conditional rather than
+a permanent silicon law"*. Checked against both repositories on 2026-09-11: the three
+findings are theirs and are stated as above, and the 82x and the decode
+recommendation are in **ggml-rocket** rather than in the notes collection this
+paragraph used to point at for them.
 
 **On the RK3576 the vendor does the thing that finding says not to do.** Reading the
 register command streams out of a vendor `.rkllm` for Llama-3.2-1B, 3752 of its

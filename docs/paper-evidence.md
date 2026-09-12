@@ -1,0 +1,935 @@
+# Evidence pack, 2026-09-12
+
+Every number this paper may quote, the protocol that produced it, and the
+sentence that has to travel beside it. Section 8 is the list of things that
+are NOT supported; read it before quoting anything.
+
+```
+  0   what must be said beside the numbers
+  1   speed against the vendor        1a  their three columns, and which this uses
+                                      1b  their runtime, MEASURED
+                                      1c  the decode margin is younger than the round
+                                      1d  the TTFT gap is not attributed
+                                      1e  where the prompt's time actually goes
+                                      1f  the pinning default is safe everywhere
+  2   quality against the vendor's own int4   2a  why it is evidence, not my reconstruction
+  3   quality of charsiu's own quantiser
+  4   the output head                 4a  the two cores and the overlap fault
+  5   bandwidth figures
+  6   variability, and what one passage can order
+  7   reproduction                    7a  what the PAPER has to change
+  8   what is NOT supported
+```
+
+Every number a paper could quote from this project, with the protocol that
+produced it and the sentence that has to travel beside it. Assembled over a day
+of board rounds on one ROCK 4D.
+
+Tree state: `dev 4057a39`. Board: Armbian, kernel `7.2.0-rc5-next-20260730+`,
+GCC 15.2.0, glibc 2.43. Desk: aarch64 VM, GCC 13.3.0, glibc 2.39.
+
+---
+
+## 0. Three things that must be said beside the numbers
+
+**The vendor column in section 1 is a citation, not an arm.** It is copied
+from `airockchip/rknn-llm/main/benchmark.md`, fetched 2026-08-28, and their
+header says the figures were "collected based on the maximum CPU and NPU
+frequencies of each platform". The column has no N, no spread, and no method
+beyond that one sentence, so a margin over it cannot be inside anyone's noise
+in either direction. Section 1 is our median of seven with its range, against
+their published point.
+
+⚠ **Section 1b is different: their runtime has now been RUN here**, on the
+same board, the same kernel and the same clock as ours, and it is an arm.
+Section 1 and section 1b are two different comparisons and must not be merged
+into one table: section 1 is four models at maximum frequency against a
+citation, section 1b is one model at 594 MHz against a measurement. The
+citation and the arm do not even agree about which side is ahead on TTFT, for
+a reason section 1b gives.
+
+**A perplexity needs a model, a corpus, and a file.** charsiu re-quantises
+whatever it loads, so the source format is inside every quality number. The
+same Llama-3.2-1B reads 41.37, or 34.24, or 28.71, depending on which file and
+which group. Every figure here names its md5.
+
+**One board.** Everything measured on hardware is a single ROCK 4D. That
+separates voltage from clock, and it does not separate this board from the
+part, so a leakage bin cannot be ruled out. The ArmSoM CM5 is RK3588S and
+cannot test this rail at all.
+
+---
+
+## 1. Speed against the vendor
+
+One boot, `performance` governor, `board_record.sh` REPEAT=7, median of seven
+with every reading kept. The binary pins its calling thread to the fast cluster
+(a58086c). Their protocol is a 128-token prompt and 64 new tokens.
+
+```
+              decode t/s                      TTFT ms
+            ours (median)   spread   theirs      ours (median)  range        theirs
+  Qwen3 0.6B      26.26      1.9%    24.85           613      601..623      468.61
+  TinyLLAMA       22.79      1.2%    19.71           890      876..903      543.68
+  Phi3 3.8B        7.03      0.1%     6.58          2987     2942..3013    1829.12
+  Gemma4 E2B       9.25      1.7%     9.23          2222     2193..2245    1219.25
+```
+
+Decode is ahead on all four: +5.7%, +15.6%, +6.8%, +0.2%.
+TTFT is behind on all four: 1.31x, 1.64x, 1.63x, 1.82x theirs.
+
+The prompt is where this runtime is still losing, and it is the half the vendor
+spends 3328 M=1 dispatches on. Reporting only the decode column would be
+choosing a column.
+
+Their TTFT and ours are not the same quantity. Theirs is time to the first
+token; ours is the prompt's forward passes, so the first token's own step is in
+theirs and not in ours, which is one token's worth in our favour.
+
+### 1a. Which of their three columns this is, and what the other two say
+
+`benchmark.md` gives three quantisations a model, not one. For the same four:
+
+```
+                 w4a16            w4a16_g128         w8a8
+              TTFT    t/s        TTFT    t/s      TTFT    t/s
+  Qwen3 0.6B  468.61  24.85     506.41  23.48    461.54  17.17
+  TinyLLAMA   543.68  19.71     672.61  18.08    534.13  12.18
+  Phi3 3.8B  1829.12   6.58    2253.14   6.06   1615.97   3.74
+  Gemma4 E2B 1219.25   9.23    1445.36   8.27   1166.94   5.56
+```
+
+**The comparison above uses w4a16, which is their FASTEST decode of the three.**
+Against w8a8 the same charsiu medians would read +52.9%, +87.1%, +88.0% and
++66.4% instead of +5.7%, +15.6%, +6.8% and +0.2%. A paper that reported the
+w8a8 row would be claiming roughly four times the margin for the same work.
+
+⚠ **It is not uniformly the conservative choice.** Their w8a8 TTFT is slightly
+FASTER than their w4a16 on three of the four, so picking w4a16 is conservative
+on the column we lead and slightly generous on the column we trail. Both halves
+of that belong in the sentence.
+
+⚠ w8a8 also costs roughly twice the memory: 796 MB against 513 for Qwen3,
+3767 against 1996 for Phi3. A reader choosing between them is not choosing on
+speed alone, and neither column is "the vendor's number" on its own.
+
+🔑 **`w4a16_g128` exists, and section 2's group caveat is about OUR FILE, not
+about what they can do.** The `.rkllm` scored there keeps one scale per output
+row; this column shows they ship a group-128 option as well. The asymmetry
+section 2 states is between two particular files, not between two vendors'
+capabilities.
+
+### 1b. Their runtime, measured
+
+`board-logs/r389`. The vendor's rknpu driver built against this board's own
+kernel from Kiln's mainline port, their `librkllmrt` 1.3.0 loading
+`Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm`, md5 `2d3962468e2e7c0d0571157f8c9eae71`,
+the same file section 2 scores. Timed with the runtime's own `RKLLMPerfStat`
+rather than from outside, so a disagreement about where prefill ends cannot be
+blamed on the harness.
+
+Held equal: one Image, 594 MHz, identical prompt strings, `-n 16`, ignore-eos,
+context 512. Both runtimes pin the big cluster, and the vendor's says so on
+stdout: `Enabled cpus: [4, 5, 6, 7]`.
+
+```
+  decode tok/s     charsiu 18.56 (18.47..18.58)   vendor 12.88 (12.71..12.95)
+                   charsiu 1.44x
+```
+
+⛔ **1.44x IS NOT A CONSTANT AND MUST NOT BE QUOTED AS ONE.** `board-logs/r390`
+measured both arms at a second clock, everything else held:
+
+```
+                594 MHz   786 MHz   change    spread at 786
+  charsiu         17.85     18.60    +4.2%    18.51..18.63
+  vendor          12.85     12.73    -0.9%    12.72..12.76
+  ratio           1.389     1.461    +5.2%
+```
+
+The ratio moves 5.2%, far outside either arm's spread. Report an interval, the
+way section 2 does, and say at which clock each end was taken.
+
+🏁 **And their decode does not use the NPU clock at all.** 32.4% more clock
+buys them -0.9%, with a 0.3% spread, so it is not noise; ours buys +4.2%.
+Whatever bounds their decode, it is not this clock.
+
+⭐ That weakens the fairness worry about section 1. Their published figures are
+at maximum CPU and NPU frequency and none of our arms are, but on DECODE the
+NPU clock is nearly inert for them.
+
+⚠⚠ **The obvious extension is NOT supported.** Only the NPU clock was varied.
+"Maximum frequency" in their header is CPU *and* NPU, and a decode that ignores
+the NPU clock is one that may well be bound by the CPU, which this round did
+not touch. Nothing here says their published figures would be reproduced at
+594 MHz.
+
+🔑 The two metrics swap sides: the clock is inert for their decode and worth
+6.5% of their prefill, while for charsiu it is worth 4.2% of decode and
+almost nothing on prefill.
+
+⚠⚠ **The prefill answer depends on which question is asked, and the two
+readings point in OPPOSITE directions.** The vendor wraps the prompt in its own
+chat template: the same string is 50 tokens to them and 16 to us.
+
+```
+  wall-clock TTFT, same string    charsiu 265 ms      vendor 466 ms   charsiu 1.76x
+  prefill throughput              charsiu 61 tok/s    vendor 107 tok/s vendor 1.76x
+```
+
+Both are true. Two prompts separate the rate from the amount: a second, longer
+prompt is 79 tokens to us and 113 to them.
+
+```
+               short              long
+  charsiu   16 tok  265 ms     79 tok  751 ms
+  vendor    50 tok  466 ms    113 tok  860 ms
+```
+
+⛔ **THIS PAIR WAS FITTED TO A LINE AND THE FIT IS WITHDRAWN.** It read "7.71
+against 6.25 ms/token, fixed costs 141.6 against 153.6, so the vendor is 1.23x
+faster per prompt token, which is the real gap". None of those four numbers is
+supported. See 1g for the measurement that removed them: TTFT is convex in
+prompt length, charsiu's 79-token point carries a token-loop step its 16-token
+point does not, and the chunking changes with the length as well.
+
+And this pair has a fault the 1g pair does not: **the two secants are taken
+over different token ranges**, 16 to 79 on our side and 50 to 113 on theirs.
+On a convex curve a secant over a higher range is steeper, so the two slopes
+are not comparable even if each were exact.
+
+What stands from this section is the part above it: the same string reads 1.76x
+in each direction depending on which question is asked, and that is a tokeniser
+difference, not a prefill result. **The per-token prefill rate against their
+runtime is currently unmeasured.** Measuring it needs each runtime's own TTFT
+curve over a ladder of lengths, compared at matched token counts inside each
+curve -- `tests/board_ttft_curve.sh` does our half.
+
+⚠ The rail differs: 800 mV for charsiu, 750 for the vendor, because their
+driver sets it through `npu-supply` and its OPP table rather than taking the
+device tree's floor. Both compute correctly at 594 MHz and voltage does not set
+clock rate, so this is a caveat and not a confound.
+
+⚠ Neither side scaled its NPU. Their device tree asks for devfreq over an OPP
+table reaching 800 MHz; Kiln's patch pins the clock. So this section says
+nothing about either side at the frequency their published figures were taken
+at -- section 1g does, for the CPU half, and finds the ratio unmoved by it.
+
+⛔ **Their runtime cannot be asked for perplexity, so section 2 cannot be
+cross-checked this way.** `RKLLM_INFER_GET_LOGITS` is in their API and the
+model refuses it: every sequence length tried, 64 through 544, returns
+`meet unkown shape, op name: matmul_qk_rkllm_spilt_0` and no logits. The
+model is exported for generation and the attention shapes for a logits pass
+are not in its compiled set. Section 2's reconstruction therefore remains
+unvalidated against their real runtime, and the pack still says the
+112-matrix figure measures the reconstruction.
+
+### 1c. The decode margin is younger than the round
+
+Before `a58086c` the decode was bimodal and the table reported best-of-N:
+
+```
+  Qwen3      20.76 24.25 20.61 20.27 26.06 20.81 20.54     best 26.06, median 20.76
+  TinyLLAMA  19.11 19.41 22.83 21.94 19.24 19.15 20.08     best 22.83, median 19.41
+  Phi3        7.04  5.96  5.98  5.96  5.96  5.96  7.04     best  7.04, median  5.96
+  Gemma4      7.25  7.34  7.28  9.33  7.28  7.32  7.28     best  9.33, median  7.28
+```
+
+Four threads (`-t 4`) on a part with four A72s and four A53s: when all four
+landed on the A72s it was fast. `taskset -c 0-7` behaved exactly like no
+taskset, so it was never about which cores were permitted, only about where the
+scheduler put them.
+
+```
+  default median  20.92 -> 26.25   +25.5%       spread 28.5% -> 2.3%
+```
+
+The new medians are the old best-of-seven to within 1%. The claim on record was
+therefore the right number reached the wrong way: the high mode was the
+machine's real capability, and best-of-N was reporting something the runtime
+could do but would not do reliably. A paper should give the margin as
++5.7%/+15.6% from a median, say that it required pinning, and not quote a
+best-of-N.
+
+### 1d. The TTFT gap is not attributed, and the obvious explanation does not fit
+
+The runtime's own report from the same round:
+
+```
+              TTFT  theirs  ratio   submits  MB/submit  "dispatch rather than bytes"
+  Qwen3        613  468.61  1.31x    14718     1.32          23%
+  TinyLLAMA    890  543.68  1.64x    11702     2.87          14%
+  Phi3        2987 1829.12  1.63x    16962     7.13           4%
+  Gemma4      2222 1219.25  1.82x    25790     2.92          13%
+```
+
+Per-call overhead does not explain the gap. The model with the most dispatch
+overhead has the smallest gap (Qwen3, 23% and 1.31x) and the one with the least
+has nearly the largest (Phi3, 4% and 1.63x). The correlation runs backwards.
+
+Those counters could not attribute TTFT even if they had pointed the right way.
+They cover the whole process, and at 64 generated tokens a run the calls are
+mostly decode's. Any attribution of prompt time from them is a category error,
+including the paragraph above, which is written down to close the road rather
+than to travel it.
+
+The report's own GB/s figures are self-flagged in all four models: *"that
+remainder is NEGATIVE, so the hardware path and the wall clock are counting
+different calls, the rate above is not a fact about the hardware"*. Do not
+quote them.
+
+### 1e. Where the prompt's time actually goes
+
+`tests/board_prefill_stages.sh` with `-n 1`, so the table is the prompt's, and
+the protocol prompt, so the rows are the rows the TTFT column is measured over:
+
+```
+              ms/row   in the NPU entry     pack   fence    read   read/fence  read/total
+  Qwen3         5.66    3.90   (69%)        0.85    1.28    1.39     1.09x        25%
+  TinyLLAMA     7.79    6.12   (79%)        0.89    2.22    2.79     1.26x        36%
+  Phi3         25.10   20.45   (81%)        2.72    8.72    8.63     0.99x        34%
+  Gemma4       17.38   12.79   (74%)        2.17    4.59    5.16     1.12x        30%
+```
+
+Three results, and the first two close roads.
+
+Zero rows fell back to the CPU on any model, so the silent-fallback
+explanation, a projection the hardware refuses becoming a matvec a row at a
+time, is dead. The batched path is entirely on the hardware.
+
+Submitting costs 0.06 to 0.12 ms a row, 1 to 2% of the prompt. Per-call
+dispatch is not the prefill story, which is the second independent way that
+explanation has failed.
+
+Reading the results back costs as much as computing them. `read` is 0.99 to
+1.26 times `fence`, the hardware's own MAC time, and is 25 to 36% of the whole
+prompt on every model.
+
+The read-back is therefore the largest single lever in prefill, and it is set
+by the quantisation group: the read volume is `m * n * ceil(K/KMAX) * 4`, so a
+finer group is paid for here. Prefill speed and answer quality are traded
+through one parameter, which is a tension a paper can state precisely.
+
+This attributes charsiu's prompt time. It does not by itself explain the size
+of the gap against the vendor, because there is no equivalent breakdown of
+theirs, and `read/fence` does not track the gap across the four models (Phi3
+has the lowest ratio and nearly the largest gap). What can be said is what
+charsiu spends the prompt on, and that the vendor dispatches at M=1 where
+charsiu batches, so the two are not paying the same costs in the same places.
+
+The probe also prints an `in its wrapper` figure, 24.21 ms a row on Qwen3
+against 3.90 inside the entry. That one includes staging, 4135 ms of it on
+Qwen3, which is a once-per-process cost and is excluded from both the prompt
+total and TTFT. It is not prompt time.
+
+### 1f. The pinning default is safe across every architecture
+
+`a58086c` changes a default that touches every workload on every model, and
+what had been checked was one model's decode text. `board_text_all.sh` compares
+each model's batched prompt against its own token loop, on the hardware:
+
+```
+  Phi-3.5-mini   Qwen2.5-1.5B   Qwen3-0.6B   SmolLM2-1.7B   SmolLM2-135M
+  gemma-3-1b     gemma-4-E2B    tinyllama-1.1b   Llama-3.2-1B
+
+  9 models compared, 0 differing, every one "prompt batched, text identical"
+```
+
+Every row says `prompt batched`, not `prompt a token`. A model that refuses to
+batch would report "text identical" meaning only that the token loop agrees
+with itself; none did. This is the check that caught gemma4 emitting
+"31 32 1 2 3" on the card in 2026-08-30, after six architectures had passed on
+a desktop.
+
+### 1g. What the CPU clock is worth, and what it does to the ratio
+
+Section 1b varied the NPU clock only, and said so: their header names maximum
+CPU *and* NPU, and a decode that ignores the NPU clock is a decode to suspect
+the CPU of. r391 is that measurement.
+
+🔑 It is a stronger experiment than 1b's. The NPU rate lives in the device
+tree, so 1b spent a reboot per point and had to price the boot-to-boot drift it
+was warned about. cpufreq is sysfs: every point below is one boot, one load,
+one binary, swept up and then back down, with the frequency read back from
+`scaling_cur_freq` rather than assumed from the write to `scaling_setspeed`.
+
+A CPU-only arm runs at every point. Without it a flat measured arm and a knob
+that never took effect are the same reading; it moved 2.49x.
+
+```
+  decode t/s, -n 64        1008 MHz    1416 MHz    max (2016/2208)   1008 -> max
+    vendor  (NPU 786)        12.68       13.84          15.44          x1.2177
+    charsiu (NPU 594)        17.65       19.51          21.51          x1.2188
+    control (CPU only)       15.76       23.14          39.17          x2.485
+```
+
+**The CPU clock is worth the same to both, so the decode ratio does not move
+with it**: 1.392, 1.410, 1.393 across a clock that more than doubles. That is
+the opposite of 1b, where the NPU clock moved it from 1.389 to 1.461.
+
+⚠ The two runtimes are at different NPU clocks in that table, so the ratio
+VALUES are not like-for-like; what is compared across them is each one's own
+elasticity, measured inside one boot and one arm.
+
+**What the governor was actually giving them.** Sampling `scaling_cur_freq` 111
+times during one vendor run, `schedutil` held the A72 cluster at 1200 MHz for
+66% of samples and scored 13.27 t/s. r389 read 12.85 and r390 read 12.73 on
+that governor, so every round this tree has run against their runtime measured
+them at about 1200 MHz, not at the maximum their benchmark.md names. The gap to
+maximum is 16.4% -- and by the line above it is the same 16% on our side, so it
+does not move the ratio.
+
+**Prefill: what the CPU is worth depends on the prompt length, and that is as
+far as this goes.** The raw numbers, with no model fitted to them:
+
+```
+                          TTFT ms                 gain at max CPU
+                     schedutil   max CPU
+  vendor    50 tok       437.3     352.3              -19.4%
+           113 tok       772.8     692.6              -10.4%
+  charsiu   16 tok         267       224              -16.1%
+            79 tok         754       677              -10.2%
+```
+
+Both runtimes gain more at a short prompt than at a long one, which is what
+"the part of prefill the CPU touches is more fixed than per-token" means
+without assuming a shape. The two runtimes' prompt lengths differ because their
+tokenisers do (1b), so the rows are not to be read across.
+
+⛔ **AND THAT IS THE WHOLE CLAIM. The earlier version of this section fitted a
+line through each pair and reported a per-token rate and a fixed cost -- 5.325
+against 7.730 ms/token, 171.0 against 143.3 ms fixed, theirs halving and ours
+falling 24%. Every one of those numbers is withdrawn.** Three separate reasons,
+each on its own sufficient:
+
+1. **TTFT is not linear in prompt length; it is convex, and measurably so.**
+   `tests/board_ttft_curve.sh`, one boot, CPU pinned at maximum, Llama-3.2-1B:
+   the marginal cost per token runs 6.200 ms between 102 and 202 tokens and
+   12.100 ms between 602 and 852. Attention is O(n^2) and this is what that
+   looks like. An intercept extrapolated to zero from two points on a curve is
+   not a fixed cost, it is an artefact of where the two points were.
+2. **The two points are not the same kind of prompt.** `prefill_width()` does
+   `w &= ~1`, so 79 tokens run as a batched 78 **plus one token through
+   `llama_forward`**, inside the prompt timer; 16 tokens have no leftover. The
+   runtime prints *"prompt batched for 78 of 79 tokens, the rest a token at a
+   time"* and the round was not reading the line.
+3. **Prompt length changes the CHUNKING as well as the work.** The marginal is
+   not even monotone -- 8.320 ms/token between 52 and 102 against 6.200 between
+   102 and 202 -- because at 102 tokens `onechunk_on()` widens the prompt into
+   a single chunk of 102, and that is 5.9% slower than letting it run as
+   `1x80+1x22`. See 1h.
+
+What survives is the table above, because chunking and the leftover token do
+not depend on the CPU clock: the same prompt, the same chunking, under two
+governors.
+
+⛔ The first charsiu sweep of this round was thrown away rather than published.
+It read 13.85 t/s at maximum CPU where r388 had recorded 17.85 at a lower
+clock, which is impossible. Reproduced against the alternative on the same
+boot, the variable was `CHARSIU_NPU_MAXN`: its C default of 8192 is below every
+vocabulary, so the output head silently stayed on the CPU, and it was worth 55%
+of decode at maximum CPU and 83% at `schedutil`. The default is now 262144,
+which is what every board round in this tree had already been setting.
+
+### 1h. The prompt's chunk width, and a default that is right at 128 and wrong at 102
+
+Found while measuring 1g's TTFT curve: the marginal cost per token is not
+monotone in prompt length -- 8.320 ms between 52 and 102 tokens against 6.200
+between 102 and 202 -- which a convex function cannot do. The cause is that the
+prompt length also decides the chunking.
+
+`charsiu_run` runs a nominal chunk of 80, and `onechunk_on()` widens the whole
+prompt into ONE chunk when it fits under the model's ceiling (160 tokens here).
+A 102-token prompt therefore runs as a single chunk of 102 rather than as
+`1x80+1x22`. One 102-token prompt, CPU pinned at maximum, chunk width the only
+variable, 3 readings a cell:
+
+```
+  chunk   widths actually run     median TTFT
+     48   2x48+1x6                    809 ms
+     80   1x80+1x22                   809 ms
+     52   1x52+1x50                   830 ms
+     64   1x64+1x38                   849 ms
+    102   1x102   <- the default      857 ms
+     34   3x34                        870 ms
+```
+
+Within a cell the spread is at most 6 ms; between the best and the default it
+is 48 ms, so the ordering is outside the noise. **The shipped default is 5.9%
+slower than chunking at 80 on this prompt length.**
+
+⚠ It is not "fewer chunks is better" -- one chunk of 102 is nearly the worst
+row and three chunks of 34 is the worst. It is not a clean multiple-of-16 rule
+either: `1x64+1x38` should then beat `1x52+1x50` and it does not.
+
+⚠⚠ **AND THE DEFAULT IS NOT SIMPLY WRONG.** `onechunk_on()` was turned on
+against measurement: TTFT fell on all four vendor-protocol models, 5.1% and
+5.7% on the two whose baselines repeat. Those are 128-token prompts. So the
+knob wins at 128 and loses at 102, which makes this a non-monotone response to
+prompt length and not a regression to revert.
+
+⛔ **Six cells at one prompt length cannot choose a new default.** The comment
+above the knob records what happened the last time a chunk rule was derived
+rather than measured -- SmolLM2 came back 77% slower. What is supported here is
+that the default is not optimal at every length, which is enough to stop
+quoting a single TTFT figure as if chunking were settled, and not enough to
+change anything.
+
+---
+
+## 2. Quality against the vendor's own int4
+
+The comparison nothing in the literature has: the vendor's stored weights,
+scored. It needs no board and no vendor install. `tools/rkllm_rebuild.py` reads
+the `.rkllm` and `tests/vendor_quality.sh` scores it.
+
+All arms are f16 files differing only in the swapped matrices, rebuilt from
+`Llama-3.2-1B-Instruct-f16.gguf` (md5 `3ba43423d342673e26016ffe85268937`) so
+that both sides quantise the ORIGINAL weights, at `-n 300`, with no quantiser
+running at inference. Every rung is scored on both passages:
+
+```
+                            tests/corpus/long.txt      tests/corpus/long2.txt
+  reference (f16)                  17.9023                     32.8163
+
+  matrices                vendor  charsiu  ratio      vendor  charsiu  ratio
+  43  (rho = 1)          +13.81%   +7.45%  1.85x     +10.26%   +3.92%  2.62x
+  91  (layers 3..15)     +41.00%  +20.48%  2.00x     +26.01%  +18.38%  1.42x
+  105 (all but layer 1)  +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
+```
+
+**What is robust is the direction: in every cell the vendor's four-bit excess
+is larger than charsiu's.** The size of it is an interval, 1.4x to 2.6x, and
+the paper should quote the interval and nothing narrower.
+
+⚠⚠ **SIX CELLS ARE NOT SIX INDEPENDENT SAMPLES AND MUST NOT BE WRITTEN AS
+STATISTICAL STRENGTH.** The three subsets are NESTED: the 43 matrices are
+inside the 91, which are inside the 105, so the rungs share most of their
+weights and cannot disagree freely. The two passages are independent of each
+other; the three rungs are not. What the table supports is "the direction did
+not reverse under either axis we varied", which is a robustness check, not six
+trials.
+
+⛔ **The ladder is NOT monotone and the earlier text saying so was one
+passage.** On `long.txt` the ratio climbs with the subset, 1.85 to 2.00 to
+2.18, which is what "monotone" was read from. On `long2.txt` it does not:
+2.62, 1.42, 1.65, and the 43-matrix rung goes from the lowest of the three to
+the highest. Nothing about subset size orders these; only the sign survives.
+
+**The quantisation origin, which is why the numbers above are not the ones
+first published.** The vendor quantised the ORIGINAL weights; the charsiu arm
+quantised Q8_0, because that is what the reference pointed at, so "asked to
+quantise the same thing" was not defensible. On the 43-matrix rung, both
+origins:
+
+```
+                        charsiu     vendor      ratio
+  from Q8_0   long        +6.65%    +13.32%     2.00x
+              long2       +4.39%     +9.50%     2.16x
+  from f16    long        +7.45%    +13.81%     1.85x
+              long2       +3.92%    +10.26%     2.62x
+```
+
+The asymmetry is real and points no particular way: from f16 charsiu is worse
+on one passage and better on the other. Report the f16 rows: they are the arm
+whose precondition holds. The Q8_0 interval is narrower for no good reason.
+
+⚠ `rho1` and `vendor43` are the SAME FILE, byte for byte, md5
+`9d8e82952e96a6f14eeaa4b016704dde` (a BUILD PRODUCT, not an input, so it is
+deliberately not in section 7's list). That is the point of the rho = 1 subset
+rather than a second measurement of it: dividing the calibration out changes
+not one f16 weight there, so the two code paths land on the same weights. Do
+not report them as two agreeing arms.
+
+**The group size.** The vendor keeps one fp32 scale and one integer zero point
+per OUTPUT ROW, so its group is the whole of K against charsiu's 1024. Matching
+the group is the obvious remedy and it is worse than the caveat: 2.00 and 2.16
+at group 1024 on the two passages, against 3.76 and 1.97 matched, which swings
+by a factor of two and cannot be quoted. State the difference; do not try to
+remove it.
+
+A third asymmetry runs the other way and no arm removes it: the vendor is
+asymmetric with an integer zero point and charsiu is symmetric absmax, worth
+about 1.4% at group 1024 by this tree's own measurement.
+
+### 2a. What makes it evidence rather than a reconstruction of mine
+
+The weight layout is solved and held out: fitted on blocks 0 to 47, scored on
+rows 768 to 2047, 99.72% of codes away from a rounding boundary, with residuals
+of plus or minus 1, which is the boundary signature.
+
+The calibration is not recovered, it cancels. The vendor folds 1/c into the
+RMSNorm ahead of each projection, so `corr(vendor_norm, ref/c)` runs 0.9905 to
+0.9945 against 0.78 to 0.89 for `corr(vendor_norm, ref)`.
+
+The noise control decides whether any of it means anything. Unstructured error
+at the same per-tensor magnitude costs +60.00% where their actual quantisation
+costs +13.32%, so the vendor row sits four and a half times further from noise
+than from the reference.
+
+An earlier version scored 1700.98 by recovering c through division, while the
+same magnitude as Gaussian noise scored 32.10. That is how the fault was found,
+and it is why the noise arm is inside the harness rather than beside it.
+
+Layer 1 is excluded and the reason is named. All 112 matrices read 58.76
+against 32.13 for the same set minus layer 1; `blk.1` carries the most extreme
+row gauge in the model and `blk.1.ffn_down` is not reconstructed at all. That
+number measures the reconstruction rather than their quality, and is not
+quoted.
+
+The unrecorded protocol gave 1.65 / 1.71 / 1.81 for the same three sets: same
+shape, consistently lower. Neither ladder is quotable without its corpus and
+length, and this one has them.
+
+---
+
+## 3. Quality of charsiu's own quantiser
+
+CPU reference (`CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1`) at the group the board
+runs, on `Llama-3.2-1B-Instruct-Q4_0.gguf` md5 `48ff0243`, 773025920 bytes,
+`tests/corpus/long.txt` at `-n 300`:
+
+```
+  int4, group 1024        34.2425
+  + AWQ alpha 0.20        23.6746     -30.9%
+  int8                    18.3604
+```
+
+On a second architecture, Qwen3-0.6B (md5 `45f23a28`), same group, same corpus,
+through `tests/host_awq.sh`:
+
+```
+  AWQ off                 95.5754
+  AWQ on, no statistics   95.5754     must equal off: it declines, and does
+  AWQ on, alpha 0.20      72.5107     -24.1%
+```
+
+So AWQ is worth 24 to 31% across two architectures at the configuration the
+board runs. Qwen3's own optimum is 0.25 rather than 0.20, so its 24.1% is the
+conservative reading of its own row.
+
+The middle arm is a tell rather than decoration. With no calibration statistics
+`CHARSIU_NPU_AWQ` declines and says so, and an AWQ arm that silently equals its
+control is what a missing calibration looks like. It cost a board round.
+
+Board and desk are bit-identical on all three arms, and the calibration pass
+writes the same 2647768 bytes, across two compilers, two glibcs, two kernels
+and two thread counts. Perplexity survives all of that.
+
+It does not survive a different file.
+`bartowski/Llama-3.2-1B-Instruct-GGUF` has been re-uploaded, and this project's
+image carries the older copy:
+
+```
+                                     md5        bytes      a row   g1024
+  in the rootfs-overlay          c82c0340   773025824   41.5289  33.8071
+  what Hugging Face serves now   48ff0243   773025920   41.3739  34.2425
+```
+
+Every quality figure recorded in this tree before 2026-09-11 is the first row.
+A reader reproducing today gets the second. Both are named by md5 in
+`tests/corpus/README.md`, and the file of record going forward is the one a
+reader will actually get.
+
+"Board and host agree to 0.3%" in the earlier AWQ round was two different files
+landing near each other. It is not evidence of anything.
+
+---
+
+## 4. The output head, and why 12.40 and 12.59 are not a disagreement
+
+`tests/prefill_control.sh` runs batched, control, batched on one binary:
+
+```
+  control   65 tok / 4304 ms   66.22 ms a token   15.10 tok/s
+  batched   65 tok / 3498 ms   53.82 ms a token   18.59 tok/s  (18.63, 18.54)
+  saved                        12.40 ms a token
+```
+
+The head runs once instead of 65 times, so the saving is `H * 64/65` where H is
+the head's own cost, 12.59 ms:
+
+```
+  12.59 * 64/65 = 12.396 ms   predicted
+                  12.40  ms   measured
+```
+
+Independently, Llama-3.2-1B's head is 128256 x 2048, which at int4 is 131.3 MB:
+
+```
+  131.3 MB / 12.59 ms = 10.43 GB/s   against the 10.58 GB/s the NPU summary reports
+```
+
+That is 1.4% apart, from a shape and a rate that never saw the stopwatch. It is
+the strongest triangulation in the project, and it is one measurement plus two
+independent predictions rather than two estimates of one thing.
+
+---
+
+### 4a. The two cores, the overlap fault, and what the speed numbers ran under
+
+The fault is real and it is attributed: it is the NPU's voltage margin, not the
+overlap. `src/overlap.h` states it and the notebook carries the sweep, four
+device trees, same probe, four passes of 5400 rows each:
+
+```
+  786 MHz, 750 mV (mainline as U-Boot leaves it)   11 to 25 wrong words a pass
+  594 MHz, 750 mV                                   0, 0, 0, 0   (10% slower)
+  786 MHz, 800 mV                                   0, 0, 0, 0   (full speed)
+  786 MHz, 850 mV                                   0, 0, 0, 0
+```
+
+Cite that sweep. It is a controlled voltage series across four DTBs, which is
+not the same kind of evidence as a probe that failed to fire, and this project
+has both.
+
+Every speed number in section 1 ran with the two cores overlapped. The board
+reads 800 mV, `overlap_safe()` approves, and `batch_serial()` defaults to
+`!overlap_safe()`, so the cores overlap by default.
+
+What that costs was measured in the same boot as the round of record, with
+`CHARSIU_NPU_BATCH_PARALLEL=0` the only thing changed. Same binary, same
+governor, same rail, same model file, boot id `929e85e2` at both ends:
+
+```
+             decode              TTFT ms
+           overlapped serial     overlapped serial
+  Qwen3       26.26   26.11        613     679    +10.8%
+  TinyLLAMA   22.79   22.82        890    1157    +30.0%
+  Phi3         7.03    7.04       2987    3896    +30.4%
+  Gemma4       9.25    9.20       2222    2687    +20.9%
+```
+
+**Serialising costs nothing on decode and 11 to 30% on TTFT.** All four decode
+figures move by less than 0.6%, which is inside the run-to-run spread, and two
+of the four move upward. That is what the mechanism predicts once stated:
+overlap puts two cores in flight at once, a decode step has one row and nothing
+to overlap, and the whole gain is on the batched prompt.
+
+So a reader on a 750 mV device tree, where `overlap_safe()` refuses, gets the
+decode numbers in section 1 unchanged and a TTFT 11 to 30% worse. The decode
+margin over the vendor does not depend on the overlap.
+
+The four serial figures this project quoted before today (24.28, 20.34, 6.82,
+8.68 tok/s) are all BELOW the serial decode measured here, and they are from
+2026-09-04 at a different governor and before the calling thread was pinned.
+They measure the cost of not pinning, which section 1c measures directly at
++25.5%, rather than the cost of serialising, which is zero. Replace them rather
+than dating them.
+
+One boot on 2026-09-11 could not fire the fault at all: 68 runs at the old
+map's worst cell (phi3, chunk 24, KMAX 2048) across `default`, `onedev`,
+`serial`, `parallel` and `zero`, with the affinity pin on and off. That is
+consistent with the sweep, since the board is at 800 mV, and it is worth
+exactly one sentence. It confirms the guard end to end on the shipped binary
+and establishes nothing on its own, because a probe that does not fire and a
+fault that no longer happens are the same picture.
+
+What those arms did establish is that the affinity default does not mask the
+race: 14 of 14 clean with `CHARSIU_AFFINITY=0` and 14 of 14 with the pin. A
+race that stops firing because the timing moved would be masked rather than
+fixed, and that is worth checking whenever a scheduling default changes.
+
+---
+
+## 5. Bandwidth figures, and which are quotable
+
+```
+  5.2 GB/s   the read back        measured directly    quotable
+  4.7 GB/s   the activation pack  measured directly    quotable
+  11.9 GB/s  what 8 threads reach measured directly    quotable
+  10.58 GB/s weight rate, NPU summary                  quotable (see section 4)
+  --------------------------------------------------------------------------
+  11.7 GB/s  npu_prep_cost cache walk at 65536 bytes   real, but it is BUFFER
+                                                       MAINTENANCE, not weights
+  9.9 GB/s   NOT A BANDWIDTH. gemma4's q/k/v stage from gguf shapes. The entry
+             it comes from exists to argue that such a figure is not a roof:
+             gate+up reaches 16.8 in the same table, the biggest stage being
+             the fastest. Quoting it cites a number derived to refute it.
+```
+
+---
+
+## 6. Variability, and what one passage can order
+
+A single reading cannot see a change worth less than about 25%. TinyLLAMA has
+read 12.64 and 17.39 tok/s on the same build minutes apart.
+
+One passage of 300 tokens resolves about 10% of perplexity. A sweep of AWQ's
+exponent on Qwen3 came back non-monotone at that length on the evaluation
+corpus while `charsiu_ppl` is deterministic, so that is the corpus's own
+sampling. `tests/corpus/long2.txt` is the second opinion.
+
+gemma4's TTFT spread was 46% at whatever governor the board had, 9.9% at
+`performance`, and 4.4% pinned. Two clusters at the middle step, none at the
+last. It was the same scheduling lottery.
+
+---
+
+## 7. Reproduction
+
+```sh
+git clone <charsiu> && cd charsiu && git checkout d97e212 && make
+# the model of record
+curl -L -o models/Llama-3.2-1B-Instruct-Q4_0.gguf \
+  https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_0.gguf
+md5sum models/Llama-3.2-1B-Instruct-Q4_0.gguf   # 48ff0243978606fdba19d899b77802fc
+
+# the corpora. Every perplexity in this pack names one of these two, and the
+# checker rule is that a perplexity must name a file whose md5 is HERE.
+md5sum tests/corpus/long.txt tests/corpus/long2.txt
+#   4237c8fc3163a359fc21bde60c7b1d8b  long.txt
+#   9c1f92b423e3ab3d3f9279a8d70a4ae6  long2.txt
+# and the f16 original, which the vendor-quality round of record starts from
+#   3ba43423d342673e26016ffe85268937  Llama-3.2-1B-Instruct-f16.gguf
+# and the vendor's file, which section 1b times and section 2 scores
+#   2d3962468e2e7c0d0571157f8c9eae71  Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm
+
+# quality, the CPU reference at the group the board runs.
+#
+# ⚠⚠ CHECK THE md5 FIRST AND DO NOT SKIP IT. This number belongs to the file,
+# not to the path. In a fresh clone the curl above puts 48ff0243 at that path
+# and it reads 34.2425. In THIS project's working tree the same path is a
+# SYMLINK into rootfs-overlay, which is the older c82c0340 the board image
+# carries, and the identical command reads 33.8071 -- a 1.3% difference with
+# nothing on screen to say the input changed. Both files are in the table in
+# section 3; neither number is wrong and only one of them answers this command.
+md5sum models/Llama-3.2-1B-Instruct-Q4_0.gguf   # must be 48ff0243...
+CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+  CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
+  build/charsiu_ppl models/Llama-3.2-1B-Instruct-Q4_0.gguf \
+                    tests/corpus/long.txt -n 300
+#   48ff0243  ->  34.2425     the model of record, what a reader gets
+#   c82c0340  ->  33.8071     the board image's older copy, this tree's symlink
+
+# the vendor's own weights, scored. ⚠ CHARSIU_RKLLM_REF IS NOT OPTIONAL: the
+# default reference is Q8_0, and the round of record is from the f16 original,
+# because the vendor quantised the ORIGINAL weights. Without it every
+# percentage in section 2 shifts. Each rung scores both passages from one
+# build, so this is the whole ladder:
+CHARSIU_RKLLM_REF=$PWD/models/Llama-3.2-1B-Instruct-f16.gguf \
+  sh tests/vendor_quality.sh 43     # and L3, and No1
+
+# the board round of record: speed, quality, the gemma4 sweep, one boot
+sh tests/board_record.sh
+```
+
+`tests/corpus_fixed.sh` locks the corpora by md5 and runs inside `make test`.
+`board_record.sh` stamps the model's md5, the binary's md5, the thread count,
+the governor, the NPU rail, both CPU clusters' clock, and the boot id at both
+ends, and refuses to be read as one round if the boot id moved.
+
+---
+
+## 7a. What the paper has to change because of these rounds
+
+Not evidence; a list of places the prose is now wrong, kept here because the
+`.tex` is not in this repository and nothing else tracks it.
+
+**Section 2 lost its headline number.** It was "2.0 to 2.4x, monotone across
+three nested subsets". It is now a direction with an interval, 1.4x to 2.6x.
+Every place that writes 2.0-2.4 has to move: abstract, introduction, results.
+
+⛔ **And "monotone" was load-bearing, not decorative.** It was one of the
+arguments that the ladder measured a real difference between quantisers rather
+than an artefact of the reconstruction: damage that grows with the subset looks
+like a property of the weights. That argument needs a different support now.
+What survives in its place is section 2a: the layout is fitted on blocks 0 to
+47 and scored on rows 768 to 2047, 99.72% of codes away from a rounding
+boundary, residuals of plus or minus one.
+
+**Sections 1 and 1b disagree and both belong in the paper.** Section 1 is four
+models at maximum frequency against a published point estimate; 1b is one model
+at 594 MHz against a measurement of their runtime. They do not agree on which
+side leads TTFT, for the tokeniser reason 1b gives. They must not be merged
+into one table.
+
+⛔ **The ordering argument for putting quality first no longer holds alone.**
+The vendor-quality comparison led the results because it was the only one where
+both sides ran here. Section 1b is now also that. If quality still leads it
+needs a different reason -- the obvious one being that it is the comparison
+nothing in the literature has, while a speed comparison against a vendor
+runtime is ordinary.
+
+**Anything saying their runtime has never been run here.** It has, in 1b.
+
+**The fairness caveat about frequency can be narrowed, and one half of it
+reversed.** The paper has been carrying "their published figures are at maximum
+CPU and NPU and our arms are not" as an open concession. Section 1g measures
+it: on decode the two runtimes have the same CPU elasticity to three digits, so
+their condition moves both columns together and leaves the ratio alone. The
+concession survives for prefill, where both runtimes gain more from the CPU at
+a short prompt than at a long one, so any TTFT claim has to name the governor
+AND the prompt length it was measured under.
+
+⛔ **And the paper must not carry a per-token prefill rate against their
+runtime.** The 1.23x came from fitting a line through two prompt lengths a side
+and 1g withdraws that fit; section 8 now lists the gap as unmeasured. Anywhere
+the prose says charsiu's prefill is within 23% of theirs per token, or that the
+two runtimes' fixed costs are within 8%, comes out until the curves are
+measured against each other.
+
+## 8. What is not supported
+
+The vendor at the frequency their published figures were taken at. Their
+runtime HAS now been run here -- 1b at 594 MHz on both sides, 1g across the
+whole CPU range including their published maximum -- but section 1's right
+column is still a citation, with no N and no spread, and the two must not be
+combined. What 1g removes is the WORRY that their condition would change the
+comparison; it does not turn their published row into a measurement.
+
+A single number for the decode ratio against their runtime. Section 1b: 1.389
+at 594 MHz and 1.461 at 786, a 5.2% move against arm spreads of 0.3 and 0.6%.
+It is an interval, and each end has a clock attached.
+
+Their published figures reproduced at any clock measured here. Both clocks have
+now been varied -- the NPU in 1b, the CPU in 1g -- and at maximum CPU with the
+NPU at 786 MHz their decode reads 15.44 t/s, still short of the published
+figure for this model class. Neither section claims to reproduce their table;
+what 1g supports is that moving to their condition does not change the RATIO,
+because it moves both columns by the same 22%.
+
+ANY number for the prefill gap, including the 1.23x this list used to give.
+Section 1b: the same string reads 1.76x in our favour on wall-clock TTFT and
+1.76x against us on throughput, which is a tokeniser difference and not a
+prefill result. The per-token rate that was supposed to settle it came from
+fitting a line through two prompt lengths a side, and 1g withdraws that fit:
+TTFT is convex in length, our long point carries a token-loop step our short
+one does not, the chunking changes with the length, and the two sides' secants
+were taken over different token ranges. The per-token prefill rate against
+their runtime is unmeasured.
+
+That the overlap fault is gone. Section 4a: it is rail-conditioned, this board
+is at 800 mV, and a probe that did not fire says nothing on its own.
+
+Anything about a second RK3576. One board.
+
+The 112-matrix vendor rebuild, 58.76. It measures the reconstruction.
+
+A single figure for the vendor-to-charsiu ratio. Section 2: all three rungs are
+now under the f16 origin on both passages, and the six ratios run 1.42x to
+2.62x. The direction is unanimous; the magnitude is an interval.
+
+That the ladder is monotone in subset size. It is on `long.txt` and it is not
+on `long2.txt`, where the 43-matrix rung is the highest of the three rather
+than the lowest. This was stated as a finding and it was one passage.
+
+Cross-machine quality comparisons made before 2026-09-11. They compared two
+different files.
+
+The size of the TTFT gap against the vendor. Section 1e attributes charsiu's
+own prompt time, 69 to 81% inside the NPU entry, of which the read-back is 25
+to 36% of the whole and matches the fence. There is no equivalent breakdown of
+theirs, and read/fence does not track the gap across models.
+
+`CHARSIU_NPU_INT8_LAYERS` on hardware. `npu_mixed_test` shows that one open
+device alternates w8a8 and w4a16 correctly, 0 of 18 dispatches wrong over eight
+alternations in both directions, at K=256 and N=64. That says the per-tensor
+width refactor is justified, and the refactor IS written: `w4_for(g, t)` is
+threaded through all 42 sites that ask, and the bmap cache key carries the
+width. What is not written is the one line that makes it answer differently.
+`w4_for()` still ignores its tensor and returns the device's width, which is
+why the tree is bit identical. The version that did answer per tensor was
+reverted on 2026-09-11 after nine of nine models disagreed with their own token
+loop, so the knob's behaviour on a real model is not just unmeasured, it is
+known to have been wrong once.

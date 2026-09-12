@@ -46,12 +46,61 @@ that came out of applying the vendor's (scale, zero) to charsiu's own rounding.
 Two routes, one number.
 """
 import sys
+import os
 import numpy as np
 sys.path.insert(0, "/home/parallels/Desktop/llama.cpp-ref/gguf-py")
 from gguf import GGUFReader     # noqa: E402
 
 RK = "/home/parallels/Documents/kiln/model/Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm"
-REF = "/home/parallels/Desktop/charsiu/models/Llama-3.2-1B-Instruct-Q8_0.gguf"
+#
+# ⚠⚠ THE REFERENCE IS ALSO THE THING CHARSIU QUANTISES, AND THE VENDOR DID NOT
+# QUANTISE IT. Their codes came from the original weights; ours come from
+# whatever this points at. With Q8_0 here the two sides start from different
+# things, which is a real asymmetry in every comparison built on this file, and
+# "asked to quantise the same thing" is not defensible while it stands.
+#
+# CHARSIU_RKLLM_REF overrides it, so the same three subsets can be rebuilt from
+# the f16 original and the ratio read with that difference removed.
+#
+REF = os.environ.get(
+        "CHARSIU_RKLLM_REF",
+        "/home/parallels/Desktop/charsiu/models/Llama-3.2-1B-Instruct-Q8_0.gguf")
+
+
+def ref_tag(path=None):
+    """Eight hex of the reference's md5 -- the ORIGIN, as part of a filename.
+
+    ⛔ A REBUILT ARM IS CACHED UNDER ITS ARM NAME, AND THE ARM NAME DOES NOT
+    SAY WHAT IT WAS BUILT FROM. `Llama-3.2-1B-ref-F16.gguf` from the Q8_0
+    source and the same name from the f16 source are the same path, so the
+    second round silently scores the first round's file and every percentage
+    in the ladder shifts. That is exactly what was sitting in models/ on
+    2026-09-11: two arms two days older than the control that would replace.
+
+    The md5 is the only identity this tree accepts for a model file, so it is
+    the key. It takes about six seconds over 2.5 GB, cached in a sidecar
+    keyed on (size, mtime_ns) because the rebuild and the harness both ask.
+    """
+    import hashlib
+    path = path or REF
+    st = os.stat(path)
+    stamp = f"{st.st_size} {st.st_mtime_ns}"
+    side = path + ".md5"
+    try:
+        c = open(side).read().split()
+        if len(c) == 3 and f"{c[1]} {c[2]}" == stamp:
+            return c[0][:8]
+    except OSError:
+        pass
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 22), b""):
+            h.update(b)
+    try:
+        open(side, "w").write(f"{h.hexdigest()} {stamp}\n")
+    except OSError:
+        pass
+    return h.hexdigest()[:8]
 LO = int(508.0 * 2**20)
 INT4 = 0x20DDA9C4
 mm = np.memmap(RK, dtype=np.uint8, mode="r")
@@ -66,7 +115,21 @@ def f32(slot, n):
 
 
 def deq(t):
+    """Dequantise one reference tensor to float64, whatever it is stored as.
+
+    ⚠⚠ THIS USED TO ASSUME Q8_0 AND NOTHING SAID SO. The 34 below is q8_0's
+    block: a two-byte scale and thirty-two int8 codes. Handed an f16 tensor it
+    raises a reshape error, which is the good failure -- but the reference is
+    now an environment variable, and the whole point of that is to pass a file
+    this function could not read.
+
+    f16 and f32 references are the ones that matter: the vendor quantised the
+    ORIGINAL weights, so comparing their codes against a Q8_0 reference has
+    both sides starting from different things.
+    """
     raw = np.array(t.data)
+    if raw.dtype in (np.float16, np.float32, np.float64):
+        return raw.astype(np.float64)
     bl = raw.reshape(raw.shape[0], -1, 34)
     d = bl[:, :, :2].reshape(-1, 2).copy().view(np.float16)
     d = d.reshape(bl.shape[0], -1).astype(np.float64)

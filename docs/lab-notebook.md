@@ -9077,3 +9077,1006 @@ without setting the group, and I was one passage away from calling that a bug
 in a command everyone copies. Sixth time today the second passage changed the
 answer; the first five all went the other way, which is exactly why the sixth
 has to be run rather than assumed.
+
+### 🏁🏁🏁 THE BOARD ROUND: six arms, zero identity checks failed
+
+`board_awq.sh` on the ROCK 4D, Llama-3.2-1B, `/opt/charsiu/corpus/long.txt`
+(md5 verified identical to the desk's), 561 s, relogins 0.
+
+**Board against host, at the corrected settings:**
+
+```
+                        board       host      delta
+  int4                 33.4149    33.8071     1.2%
+  + AWQ alpha 0.20     23.7935    23.7173     0.3%
+  + INT8_LAYERS=3-4    22.0356    22.0818     0.2%
+```
+
+🔑 **They agree to within 1.2%.** The host reference is a faithful instrument
+for the board's quantiser — once the group is set, which is the whole of what
+was wrong with it before today.
+
+### 🏁 And the TTFT answer was in arm 1, not in anything I chased tonight
+
+```
+  arm 1   prompt   refuse 2643 ms   batch 515 ms    5.1x
+```
+
+That is this morning's fix, priced. With AWQ on, the batched path used to
+REFUSE — falling back to a row at a time — so turning AWQ on cost **five times
+the prefill**. It does not any more.
+
+⚠ I spent the evening pricing read volume and K slices for 12% of a prefill
+row, and the 5x was sitting in a fix made twelve hours earlier that nobody had
+measured. **The cheapest TTFT work available was to measure what had already
+been repaired.**
+
+### 🏁 The clamp default change: the hardware agrees, independently
+
+```
+  arm 5   clamp 2.0  26.9265     6.0  23.7935     64.0  23.7935
+```
+
+6.0 and 64.0 are **identical to the last digit**, which is the proof that 6.0
+does not bind at alpha 0.20 — exactly as `1000^0.2 = 3.98` predicts. And 2.0
+costs 13.2% where the host measured 14.4%. Two independent measurements of the
+same claim, on different hardware, agreeing.
+
+**arm 4** is smooth and unimodal on the board with its minimum at 0.20, which
+is the host's answer. **arm 2**: AWQ_SHARE gives identical tokens and +2.9%
+decode (13.92 -> 14.33 tok/s), so the group can share one packed input.
+
+### ⚠ Two disagreements, both about 2%, both inside the resolution band
+
+```
+  arm 3   AWQ_LAYERS=0-2    board 23.2380 BETTER   host 24.5122 WORSE
+  arm 6   INT8_LAYERS=1-1   board 22.4623 worse than 0-1's 22.1619
+                            host  22.3404 better than 0-1's 22.5511
+```
+
+**So "1-1 gets the same for half the bytes" does NOT hold on the board.** It
+was two host passages agreeing; the hardware says otherwise. `3-4` being best
+holds on both — board 22.0356, host 22.0818.
+
+⚠ Both disagreements are ~2%, which is inside the ~10% one passage resolves.
+Neither is a contradiction; both are cells that were never separable.
+
+### ⛔⛔ A PERPLEXITY BELONGS TO A FILE, AND THE TREE'S NUMBERS ARE THE Q4_0 ONE
+
+Found while checking a sentence I had just written into README.md, which is the
+only reason it was found: the README now told a reader to reproduce the board's
+quantiser with `CHARSIU_NPU_W4_GROUP=1024`, and running my own instruction gave
+**30.2425** where the record says 33.8071. Same corpus md5, same binary — the
+pre-change `ppl_old` gives 30.2425 too — and no group width produces 33.8071
+(2048 gives 36.6621, 512 gives 26.6816). So it was not the configuration.
+
+It was the file. Three ggufs of the same Llama-3.2-1B, 300 tokens of
+`tests/corpus/long.txt`, current binary:
+
+```
+                        one scale a row    group 1024
+  Q8_0                      34.6888         28.7072
+  Q4_0                      41.5289         33.8071   <- the whole record
+  Q4_0 "pure"               41.8712         30.2425
+```
+
+**Q4_0 reproduces the record to the last digit**, so every Llama number in this
+tree is that file and always was. I had reached for `models-unshipped/`, which
+holds only the "pure" variant, and a `find -maxdepth 6` missed
+`rootfs-overlay/opt/charsiu/models/` where the real two live.
+
+⚠ **The 20% spread is the thing to keep.** charsiu re-quantises whatever it
+loads, so the source format is inside every quality number it prints. Q8_0 is
+the honest source — nearly lossless going in, so the arm scores charsiu's
+quantiser and nothing else. Handing it a file that is ALREADY four-bit scores
+the second quantisation of an already-quantised tensor.
+
+⚠ And `scripts/charsiu-get` annotates its **Q8_0** line "THE ONE EVERY BOARD
+ROUND USES", while the board's AWQ round read 33.4149 — the Q4_0 figure. The
+annotation and the practice disagree and one of them has to move.
+
+🔑 Two rules earned here, and the first is the one that keeps costing:
+
+- **when a number will not reproduce, the configuration is only the first
+  suspect — the INPUT is the second, and it is the one nobody varies.** I
+  swept group widths for a while, which was the disciplined-looking move and
+  the wrong axis entirely.
+- **`find -maxdepth N` answering "nothing there" is not "nothing there".** I
+  concluded from a truncated search that the host had one Llama gguf, and built
+  a whole explanation on top of that. The unbounded search took 90 seconds.
+
+### 🏁🏁 The vendor's quantiser, scored on a PINNED protocol — and the ratio moved
+
+The empty cell has been filled since 2026-09-09, but the numbers behind it
+recorded `reference 19.8844` in three places and never said on what text or at
+what length. That is not a protocol, it is a number, and it cannot be put
+beside anything else in the tree. `tests/vendor_quality.sh` pins it:
+`tests/corpus/long.txt` at `-n 300`, the corpus `corpus_fixed.sh` locks by md5,
+from `Llama-3.2-1B-Instruct-Q8_0.gguf` — the least lossy source available, so
+what is scored is each quantiser and not what happened to the file before it.
+
+43 matrices, the ones whose scale still satisfies `(max-min)/15` so the
+reference IS what they quantised, no calibration anywhere in the arm:
+
+```
+  ref (f16)     17.8719
+  vendor43      20.2531   +13.32%     their layout, their codes
+  chr43         19.0597    +6.65%     charsiu int4, group 1024
+  q4043         17.9111    +0.22%     llama.cpp q4_0, group 32
+  noise         28.5954   +60.00%     THE CONTROL
+```
+
+**The vendor's four-bit excess is 2.00x charsiu's** — 13.32 against 6.65.
+
+⚠ **THAT RATIO WAS 1.65 ON THE UNRECORDED PROTOCOL AND IT IS 2.00 HERE.** Same
+43 tensors, same code, different corpus and length. Nothing is wrong with
+either number; what is wrong is that the first one was quotable without its
+protocol. The 1.65 / 1.71 / 1.81 ladder across nested subsets keeps its shape
+as an ordering, but **no single figure from it should be carried into prose
+without the corpus and the token count beside it**.
+
+🔑 **The control is the row that decides whether any of this means anything.**
+Unstructured Gaussian noise at the same per-tensor relative error costs
+**60.00%** where the vendor's actual quantisation costs 13.32%. The vendor row
+is four and a half times further from noise than it is from the reference, so
+it is measuring their quantiser and not my reconstruction. That is the same
+control that caught the 1700.98: a column scaled by the wrong factor is a
+systematically wrong channel, and a Frobenius norm hardly charges for it.
+
+⚠ **`rho1` and `vendor43` agree to the last digit, and that is a check, not a
+null arm.** They are two separately written readers — `vendor_weight(RAW=1)`
+and `vendor_raw` — with two separately written selectors, and they pick the
+same 43 tensors and produce the same weights. What it does NOT do is confirm
+the layout independently: both go through the same solved map. The held-out
+99.72% on rows 768..2047 is what does that.
+
+⛔ **There is deliberately no `full` arm in the harness.** All 112 matrices
+reads 58.76 against 32.13 for the same set minus layer 1, because `blk.1`
+carries the most extreme row gauge in the model and `blk.1.ffn_down` is not
+reconstructed at all — the per-column model leaves 147% of it, and the build
+prints `KEEPING REFERENCE` for it. That number measures my reconstruction, not
+their quality, and a harness that can print it will eventually have it quoted.
+
+### ⛔⛔⛔ THE SCOREBOARD'S MARGIN WAS best-of-N PICKING THE FAST MODE
+
+2026-09-11, ROCK 4D, one boot, performance governor, REPEAT=7. The table has
+reported BEST of N since it learned to repeat at all, and this is the round
+that printed every reading beside it:
+
+```
+  model         readings (decode, in time order)                  best   median  theirs
+  Qwen3      20.76 24.25 20.61 20.27 26.06 20.81 20.54            26.06   20.76   24.85
+  TinyLLAMA  19.11 19.41 22.83 21.94 19.24 19.15 20.08            22.83   19.41   19.71
+  Phi3        7.04  5.96  5.98  5.96  5.96  5.96  7.04             7.04    5.96    6.58
+  Gemma4      7.25  7.34  7.28  9.33  7.28  7.32  7.28             9.33    7.28    9.23
+```
+
+**Three of the four are TWO CLUSTERS** by `tools/spread_shape.py`, whose rule
+was fixed before this data existed: gap ratio 16.4, 4.4 and infinite, each with
+the gap IN THE MIDDLE and no drift. And all four split **5 low / 2 high**.
+
+⚠ Phi3 is the one to look at. It reads **5.96 five times and 7.04 twice, the
+same two values exactly**. The median gap between sorted readings is 0.0. That
+is not a noisy measurement, it is a switch with two positions.
+
+🔑 **And best-of-N lands on the high cluster every time, which is where the
+project's headline came from:**
+
+```
+  best of N     Qwen3 26.06 / 24.85 = +4.9%      TinyLLAMA 22.83 / 19.71 = +15.8%
+  the claim on record                +5.8%                                +16.1%
+  median of 7   Qwen3 20.76 / 24.85 = -16.5%     TinyLLAMA 19.41 / 19.71 =  -1.5%
+```
+
+**Every model is BEHIND on the median.** Qwen3 -16.5%, TinyLLAMA -1.5%,
+Phi3 -9.4%, Gemma4 -21.1%. The recorded superiority is a statistic choosing
+the better of two modes, and it reproduces the published claim almost to the
+decimal, which is how it stayed invisible.
+
+⚠⚠ The vendor column is still a CITATION -- their published benchmark.md at
+maximum frequency, no N, no spread. So "behind" is as unfalsifiable as "ahead"
+was: what changed is that OUR side now has a spread and it straddles their
+point. The honest statement is that on this board, at the performance
+governor, charsiu's decode has two modes and the vendor's figure sits between
+them on two models of four.
+
+⚠ TTFT is NOT bimodal in the same round -- Qwen3 598..623, gemma4 2182..2305,
+a few percent each. Whatever switches is in the decode loop.
+
+▶ THE OPEN QUESTION, and it is now the most valuable one in the project: what
+has two positions? The ratios are 1.26, 1.18, 1.18 and 1.28 -- suspiciously
+like A72 against A53 on an RK3576's 4+4, so the first arm is `taskset`.
+
+### ⚠⚠ And `set -e` plus a substitution that can fail killed the boot check
+
+Section 3 printed its header and nothing else -- no readings, no skip message,
+no end-of-round environment, and no BOOT ID CHECK, which is the one thing the
+round of record exists for. This board publishes no `thermal_zone` at all, so
+
+```
+  T=$(for z in /sys/class/thermal/thermal_zone*/temp; do
+        [ -e "$z" ] && awk ... "$z"; done)
+```
+
+left the glob literal, `[ -e ]` false, the substitution exiting non-zero, and
+`set -e` took the script with it. In silence.
+
+🔑 **It only appeared once gemma4 was FOUND.** While the sweep was skipping,
+that line never ran. Fixing the model resolution uncovered it -- which is the
+ordinary shape of this: a guard that skips hides the code behind it.
+
+### 🏁 THE SWITCH IS CORE PLACEMENT — 1.72x between the clusters
+
+`tests/board_bimodal.sh`, Qwen3-0.6B, eight passes, arms ALTERNATING, first
+pass discarded, `CHARSIU_THREADS=4` in every arm so affinity is the only knob.
+The board reports its own topology: fast four are cpu 4..7, slow four cpu 0..3.
+
+```
+  any four    19.26 17.33 15.54 19.22 18.64 19.57 18.51    15.54..19.57   26%
+  big four    19.66 19.54 19.41 19.90 20.02 19.68 19.88    19.41..20.02    3%
+  little4     11.45 11.47 11.44 11.40 11.42 11.42 11.42    11.40..11.47   0.6%
+```
+
+**Both pinned arms are unimodal and tight; the unpinned one is the mess.** The
+cluster is worth **1.72x** on decode, and when nothing pins the threads the
+placement differs run to run and the rate goes with it.
+
+⛔ **AND THIS DOES NOT DEMONSTRATE THE BIMODALITY IT WAS WRITTEN FOR.** The
+5-low/2-high pattern was observed at the DEFAULT thread count, eight; this
+experiment pinned four to isolate affinity, so it changed two things at once.
+The levels do not match either: the clusters here are 19.7 and 11.4, a ratio of
+1.72, while the observed modes were 20.5 and 26.1, a ratio of 1.26 — and 26.1
+is ABOVE the big four's 19.7, so the little cores are contributing there.
+
+So: placement is a large real effect and a plausible mechanism. It is not yet
+the explanation. The arm that would settle it runs the DEFAULT eight threads
+against `taskset -c 0-7` and against eight oversubscribed onto the big four.
+
+### 🏁 R4 ANSWERED: gemma4's TTFT is TWO CLUSTERS, and only 6% apart
+
+Twenty readings, one boot, performance governor, in time order:
+
+```
+  1904 1921 1888 1858 2000 1898 1879 2046 1903 2024
+  2004 1862 1901 2019 1910 1876 1893 2028 1996 2012
+```
+
+`tools/spread_shape.py`: gap ratio **15.0 with the gap IN THE MIDDLE**, rho
+against index +0.247 so no drift, split 12 low / 8 high at 1958.5, and **10
+runs against the 10.6 independent flips would give** — so membership is decided
+afresh each run rather than drifting.
+
+**Two clusters, 1890 and 2010, 6.3% apart, total spread 9.9%.**
+
+⚠ **The seven readings that motivated R4 spanned 2133 to 3221, which is 46%.**
+This round spans 9.9% on twenty. The difference is the governor: those were
+taken with whatever the board was doing, these at `performance`. So the
+question "two clusters or a tail" was being asked of a configuration nobody
+would quote from anyway. It is two clusters — but the row IS quotable now, as
+a median with a 10% range beside it.
+
+### ⚠ And a third independent sighting of the published margin
+
+The single-reading table in the same session, `REPEAT=1`:
+
+```
+  Qwen3      26.33 against 24.85   +6.0%
+  TinyLLAMA  22.68 against 19.71   +15.1%
+```
+
+against +5.8% and +16.1% on record, and +4.9% / +15.8% from the best of seven.
+**Three different ways of taking one number out of a bimodal sample all land on
+the high mode and all reproduce the published claim.** The median of seven puts
+both behind. Nothing about the code changed between them.
+
+### 🏁🏁🏁 THE SWITCH IS CORE PLACEMENT, AND THE FAST MODE IS REACHABLE ON PURPOSE
+
+Asked properly this time: `board_vendor.sh`'s invocation verbatim -- the
+protocol prompt, `-n 64 --ignore-eos -c 512 -t 4`, MAXN and COEF_ELEMS -- with
+affinity the only thing that moves. Four arms alternating, ten passes, the
+first discarded. Qwen3-0.6B, one boot, performance governor.
+
+The board's own topology: cpu0-3 are 0x410fd034 at 2016 MHz, cpu4-7 are
+0x411fd080 at 2208 MHz.
+
+```
+  default     20.92 20.59 20.53 26.35 20.95 20.41 25.91 20.67 26.37   TWO CLUSTERS  28.5%
+  all eight   20.65 20.11 20.94 20.55 26.31 20.42 20.39 20.54 26.40   TWO CLUSTERS  30.6%
+  big four    26.20 26.53 26.55 26.60 26.18 26.40 26.52 26.33 26.49   1.6%
+  little4     18.35 18.22 18.16 18.26 18.33 18.27 18.29 18.33 18.34   1.0%
+```
+
+**The control passed first: `default` reproduced the bimodality**, so the other
+arms can be read. And then three facts arrive together:
+
+1. **The high mode of `default` IS the big-four level.** 25.91 to 26.37 against
+   26.18 to 26.60. Not close -- the same population.
+2. **Pinning to the big four removes the bimodality entirely**, at the FAST
+   value, with a 1.6% spread.
+3. **`taskset -c 0-7` behaves exactly like no taskset at all.** So it is not
+   about which cores are permitted, it is about where the scheduler puts four
+   threads when it has eight cores and no instruction.
+
+🔑 **So the fast mode was never luck -- it is the case where all four threads
+happened to land on the four A72s, and it can be asked for.** The median of the
+default arm is 20.67; pinned it is 26.40. **+27.7%, and the number stops
+moving.**
+
+🔑 **And this is what rescues the vendor comparison, honestly.** Against their
+published 24.85, the pinned arm is **+6.2% with a 1.6% spread** -- a claim that
+survives being measured again, rather than one that depends on choosing the
+best of seven. The earlier +4.9% from best-of-N was the same underlying fact
+seen through a statistic that could not be defended; the fix is not a better
+statistic, it is telling the runtime where to run.
+
+⚠ little4 at 18.3 against big4 at 26.4 is 1.44x, not the 1.72x the previous
+probe reported -- because that probe had changed the prompt, `-n`, and two
+environment variables away from the scoreboard's shape. This is why an arm
+meant to explain an observation has to begin at that observation's
+configuration.
+
+▶ NEXT, and it is a code change rather than a measurement: charsiu should
+detect the fastest cluster and pin its workers there when they fit.
+
+### ⚠ The instrument needed two fixes before it could report this
+
+`tools/spread_shape.py` got the answer backwards twice, and both were my rule
+rather than the data.
+
+**"No structure" is not "not quotable".** The first rule ended `one tail ->
+the row is NOT quotable`, which was written for gemma4's 46% spread and is
+exactly inverted for a 1.6% one: a tight unimodal arm is the most quotable
+thing there is. Shape and spread are separate questions and are reported
+separately now.
+
+**A gap ratio is scale-free.** Relaxing the split test made `big4` -- 1.6%
+wide, largest gap 0.1 tok/s -- come back as TWO CLUSTERS, because the ratio
+test cheerfully found structure in the readings' own last digit. Below a 5%
+spread the shape question is not asked at all now: at that width two clusters
+cannot be distinguished from rounding, and saying so is the answer.
+
+**And the middle-gap test was too strict in the other direction**: seven low
+and two high, gap ratio 49, was called "at an END" because both quartiles sat
+inside the low cluster. Two clusters of very different sizes are still two
+clusters; what must not pass is a single outlier, so the rule is now two
+readings a side.
+
+### 🏁🏁🏁 THE AFFINITY DEFAULT, VERIFIED ON HARDWARE — AND IT IS THE HONEST +5.6%
+
+`a58086c` pins the calling thread to the fastest cluster. The desk cannot test
+it: no cpufreq there, so the detection returns 0 and the code does nothing at
+all — 33.8071 before and after, and with `CHARSIU_AFFINITY=0` and
+`CHARSIU_CPUS=off`. "Written, legal, default on" was three things and only the
+last was certain until the board ran it.
+
+Three checks, expectation written before the round:
+
+```
+  the tell    charsiu: this thread on the fastest cluster, 4 CPUs
+  the text    TEXT IDENTICAL, pinned against CHARSIU_AFFINITY=0
+```
+
+and then the same four arms, same invocation, same board, one binary apart:
+
+```
+                   BEFORE (a58086c^)                       AFTER
+  default    20.92 20.59 20.53 26.35 ... 26.37   |  26.07 26.39 25.89 26.46 25.86 26.32 26.25
+  all eight  20.65 20.11 20.94 20.55 ... 26.40   |  26.62 25.62 26.36 26.24 26.10 26.49 26.35
+  big four   26.20 26.53 26.55 26.60 ... 26.49   |  26.16 26.06 26.48 26.67 26.49 26.43 26.51
+  little4    18.35 18.22 18.16 18.26 ... 18.34   |  18.26 18.32 18.31 18.18 18.30 18.32 18.26
+
+  default    BIMODAL, 28.5% spread               |  2.3% spread, one population
+  all eight  BIMODAL, 30.6%                      |  3.8%
+```
+
+```
+  default median   20.92 -> 26.25    +25.5%
+  against 24.85   -15.8% -> +5.6%
+  spread           28.5% ->   2.3%
+```
+
+**The default arm is now the big-four arm**, which is what the prediction said
+it would be, and the lottery is gone.
+
+🔑 **`little4` is unchanged at 18.3, and that is the intersection working.**
+`taskset -c 0-3` restricts the process to the slow cluster; charsiu looks for
+the fastest cluster WITHIN the inherited mask, finds all four equal, and
+declines to act. An operator who has answered this question is not overruled.
+`all eight` is fixed for the same reason in the other direction: the fast
+cluster inside 0-7 is 4-7.
+
+🔑 **And this is what the vendor comparison should have been all along.** +5.6%
+against their published 24.85, with a 2.3% spread, from a configuration that
+reproduces — instead of +4.9% from the best of seven readings spanning 28%.
+The margin barely moved; what changed is that it is now a measurement rather
+than a selection. **The fix was never a better statistic, it was telling the
+runtime where to run.**
+
+⚠ Still true and still has to be said beside it: their column is a citation,
+at maximum frequency, with no N and no spread. A 5.6% margin over a point
+estimate of unknown method is not a result, it is a comparison. What IS a
+result is 20.92 -> 26.25 on the same binary and the same board.
+
+### 🏁🏁🏁 THE SCOREBOARD ON THE PINNING BINARY — AND THE CLAIM WAS TRUE ALL ALONG
+
+One boot, performance governor, median of seven with every reading printed,
+the binary from a58086c. Quality table bit-identical to the previous round
+(34.2425 / 23.6746 / 18.3604), which is the free regression check that pinning
+changes scheduling and not arithmetic.
+
+```
+             old median  old best   NEW median  spread    gain   vs vendor
+  Qwen3         20.76     26.06       26.26     1.9%    +26.5%     +5.7%
+  TinyLLAMA     19.41     22.83       22.79     1.2%    +17.4%    +15.6%
+  Phi3           5.96      7.04        7.03     0.1%    +18.0%     +6.8%
+  Gemma4         7.28      9.33        9.25     1.7%    +27.1%     +0.2%
+```
+
+**All four are ahead on the MEDIAN now**, with spreads of 0.1 to 1.9%. Phi3
+reads 7.03, 7.04, 7.03, 7.03, 7.04, 7.04, 7.03 — a tenth of a percent.
+
+🔑🔑 **AND THE NEW MEDIANS ARE THE OLD BEST-OF-SEVEN, TO WITHIN 1%:**
+
+```
+  Qwen3     26.06 -> 26.26   +0.8%
+  TinyLLAMA 22.83 -> 22.79   -0.2%
+  Phi3       7.04 ->  7.03   -0.1%
+  Gemma4     9.33 ->  9.25   -0.9%
+```
+
+So the published claim's NUMBERS were right and its METHOD was not. The high
+mode was the machine's real capability all along; best-of-N was reporting a
+number the runtime could reach but would not deliver. **The finding is not
+"the claim was inflated" — it is "the claim was unreproducible", and the fix
+was to make the runtime do reliably what it had been doing by luck.**
+
+Against the published +5.8% (Qwen3) and +16.1% (TinyLLAMA), the medians now
+give +5.7% and +15.6%. The paper's headline survives, from a statistic that
+can be defended.
+
+⚠ **TTFT did not move, and should not have.** Qwen3 607 -> 613, Phi3 2923 ->
+2987, gemma4 2269 -> 2222 — a couple of percent either way. A prompt's work is
+on the pool, which still has the whole machine; decode is the one thread that
+was losing the lottery. That is the 09-06 table's shape exactly.
+
+🏁 **And gemma4's TTFT sweep closes R4 for good.** Twenty readings on the
+pinning binary: median 1978, spread **4.4%**, and `spread_shape.py` now refuses
+to call a shape at that width. The chain end to end:
+
+```
+  46%    seven readings, whatever governor the board had     <- what R4 asked about
+   9.9%  twenty readings, performance governor
+   4.4%  twenty readings, performance governor, pinned
+```
+
+Two clusters at the second step, none at the third. **gemma4's TTFT was the
+same lottery**, and the row is now quotable as a median without qualification.
+
+### 🏁 THE VENDOR LADDER, COMPLETE ON THE PINNED PROTOCOL
+
+`tests/vendor_quality.sh` over all three nested sets, `tests/corpus/long.txt`
+at `-n 300`, every arm from the Q8_0 source, no quantiser at inference:
+
+```
+  matrices                   ref     vendor   charsiu    q4_0    vendor  charsiu  ratio
+  43  (rho = 1)          17.8719   20.2531   19.0597  17.9111  +13.32%   +6.65%  2.00x
+  91  (layers 3..15)     17.8719   25.1141   21.1186  18.0910  +40.52%  +18.17%  2.23x
+  105 (all but layer 1)  17.8719   29.9056   22.9824       --  +67.33%  +28.60%  2.35x
+```
+
+**The vendor's four-bit excess is 2.0 to 2.4x charsiu's**, rising with the
+number of matrices, on three nested subsets.
+
+⚠ The unrecorded protocol gave 1.65 / 1.71 / 1.81 for the same three sets. Same
+shape, same monotone rise, consistently lower — which is what a different
+corpus and length do, and is why neither ladder is quotable without its
+protocol. **This one has one.**
+
+### 🏁 npu_mixed_test: ONE OPEN DEVICE RUNS BOTH PROGRAMS
+
+The longest-standing open item on the board, answered:
+
+```
+  one device, K=256 N=64, 8 alternations
+  controls, each program on its own      int8 0/64 wrong, int4 0/64 wrong
+  alternating on the same open device    16 arms, every one 0 of 64 wrong
+  0 of 18 dispatches wrong
+```
+
+So `CHARSIU_NPU_INT8_LAYERS` can reach the hardware, and the per-tensor width
+refactor in npudev.c is justified rather than speculative. The knob is worth
+having — on the host reference it takes Llama-3.2-1B from 41.53 to 26.07 for
+12.5% of the bytes — and the cheap way round it is already known to be
+dominated: opening a mixed model as int8 gives int8's bytes with a WORSE answer
+than all-int8 (26.07 against 17.98).
+
+⚠ **SCOPE.** K=256, N=64, eight alternations. This answers "is it
+fundamentally possible", not "is it reliable across the thousands of
+dispatches and dozens of shapes a real model makes". It de-risks the refactor;
+it does not stand in for verifying it.
+
+### 🏁 THE PINNING DEFAULT IS SAFE ACROSS ALL NINE MODELS
+
+`a58086c` changes a default that touches every workload on every architecture,
+and all that had been checked was Qwen3's decode text against
+`CHARSIU_AFFINITY=0`. `board_text_all.sh` on the board, each model's BATCHED
+prompt against its own token loop:
+
+```
+  9 models compared, 0 differing
+  Phi-3.5-mini, Qwen2.5-1.5B, Qwen3-0.6B, SmolLM2-1.7B, SmolLM2-135M,
+  gemma-3-1b, gemma-4-E2B, tinyllama-1.1b, Llama-3.2-1B
+```
+
+🔑 **Every row reads `prompt batched`, not `prompt a token`.** A refusal would
+have reported "text identical" meaning only that the token loop agrees with
+itself — the null result wearing the same words as the real one. None refused.
+
+### 🏁 AWQ ON A SECOND ARCHITECTURE, AT THE BOARD'S GROUP
+
+`tests/host_awq.sh models/Qwen3-0.6B-Q4_0.gguf` (md5 `45f23a28…`), group 1024,
+`tests/corpus/long.txt` at 300 tokens:
+
+```
+  AWQ off                 95.5754
+  AWQ on, no statistics   95.5754     declines, exactly as it must
+  AWQ on, alpha 0.20      72.5107     -24.1%
+```
+
+Against Llama-3.2-1B's 34.2425 -> 23.6746, **-30.9%**. So the method is worth
+**24 to 31% on two architectures** at the configuration the board actually
+runs, rather than 32-38% on one at the ungrouped configuration nobody runs.
+
+⚠ Qwen3's own optimum is 0.25, not the 0.20 used here, so 24.1% is the
+conservative reading of its row.
+
+### 🏁🏁 WHERE THE PROMPT'S TIME GOES: THE READ-BACK COSTS AS MUCH AS THE MATHS
+
+`tests/board_prefill_stages.sh`, one boot, `-n 1`, board_vendor's protocol
+prompt so the rows are the rows TTFT is measured over:
+
+```
+              ms/row   in the NPU entry     pack   fence    read   read/fence  read/total
+  Qwen3         5.66    3.90   (69%)        0.85    1.28    1.39     1.09x        25%
+  TinyLLAMA     7.79    6.12   (79%)        0.89    2.22    2.79     1.26x        36%
+  Phi3         25.10   20.45   (81%)        2.72    8.72    8.63     0.99x        34%
+  Gemma4       17.38   12.79   (74%)        2.17    4.59    5.16     1.12x        30%
+```
+
+1. ⛔ **Zero rows fell back on any model.** The silent fallback — a projection
+   the hardware refuses becoming a matvec a row at a time, which phase 9 found
+   eating a third of a prompt — is not happening here.
+2. ⛔ **Submit is 0.06 to 0.12 ms a row, 1 to 2%.** Per-call dispatch is not
+   the prefill story. That is twice today it has failed as an explanation: it
+   also ran backwards against the four models' gaps.
+3. 🔑 **read is 0.99 to 1.26x fence, and 25 to 36% of the prompt.** Reading
+   the results back costs what computing them costs.
+
+👉 The read volume is `m·n·ceil(K/KMAX)·4`, so it is the quantisation group
+that sets it — **prefill speed and answer quality are the same knob**, and the
+README's "what is left to win is the number of bytes read back" now has the
+measurement under it rather than an inference.
+
+⚠ It attributes OUR prompt, not the gap. `read/fence` does not track the gap
+across the four (Phi3 has the lowest ratio and nearly the largest gap), and
+there is no breakdown of the vendor's side at all.
+
+⚠ The `in its wrapper` figure — 24.21 ms a row on Qwen3 against 3.90 inside
+the entry — **includes staging**, 4135 ms of it, which is once per process and
+outside both the prompt total and TTFT. It is not prompt time.
+
+### ⛔⛔ THREE BOARD ROUNDS ON A QUESTION `src/overlap.h` ANSWERS ON LINE 11
+
+Asked to refresh the overlap evidence. What the rounds produced, in the order
+it matters:
+
+**1. Both overlap harnesses had been dead for a day.** `board_intermittent.sh`
+and `board_overlap_slots.sh` each carried a comment block between `W4="... \`
+and the rest of the string, so the `#` was DATA: `env` tried to execute a
+program called `#`, every arm died in under a second, `2>/dev/null` swallowed
+it. Introduced 2026-09-10 by `68b1a75`, *"two board harnesses were timing the
+CPU fallback and calling it the NPU"* — the commit that made them correct is
+the one that stopped them running. Found only because
+`board_intermittent.sh`'s own empty-reference guard refused to compare against
+a control that had produced nothing. `verify_selftest.sh` now checks every
+harness for a comment following a continuation of a command, verified against
+a deliberately broken file and against `board_awq.sh`'s commented example.
+
+**2. The fault did not fire, 68 runs at the map's own cell** — phi3, chunk 24,
+KMAX 2048 — across `default`, `onedev`, `serial`, `parallel`, `zero`, with the
+affinity pin on and off.
+
+**3. The pin does not mask it.** 14 of 14 clean with `CHARSIU_AFFINITY=0` and
+14 of 14 with the pin, identical. That was worth asking: overlap is a race, I
+shipped a default today that changes thread placement, and a race that stops
+firing because the timing moved is MASKED rather than fixed.
+
+⛔ **And none of that was the question.** `src/overlap.h`, line 11:
+
+> 🏁 2026-09-04: THE OVERLAP FAULT WAS THE NPU'S VOLTAGE MARGIN, NOT THE
+> OVERLAP.
+
+with the four-DTB sweep in this notebook beside it — 786 MHz at 750 mV gives
+11 to 25 wrong words a pass, at 800 mV 0, 0, 0, 0. **This board reads 800 mV.**
+The 68 clean runs re-confirm a settled result, and `serial` against `parallel`
+was probably one configuration twice, because `batch_serial()` defaults to
+`!overlap_safe()` and at 800 mV `overlap_safe()` approves — which this notebook
+already says, in the words *"m67's two arms were the same run twice"*.
+
+🔑 **The evidence for the claim is the 09-04 voltage sweep, not tonight.** Four
+device trees under a controlled sweep beats 68 runs of a probe that did not
+fire, and a paper should cite the former.
+
+⚠ What tonight IS good for, and it is not nothing: an end-to-end check that the
+09-04 guard still holds on the current binary **including today's affinity
+default**, at the width the old map called worst.
+
+🔑 **Second time in two days.** On 09-10 I re-opened the narrow-output-read
+road that 09-08 had measured dead. A closed question does not look closed from
+outside — it looks like an open one nobody has touched lately, and the instinct
+to go and measure is the same instinct that is usually right. What separates
+them is five minutes of reading, and reading does not feel like working.
+
+### 🏁 SCOPING THE PER-TENSOR WIDTH REFACTOR: the buffers already fit
+
+`npu_mixed_test` cleared the hardware question, so the remaining one is what it
+costs to write. Three findings, and the order matters because the first kills a
+cheaper idea I had.
+
+**1. There is no narrow path. An int8 device cannot carry int4 bytes.**
+The obvious shortcut is to open a mixed model as int8, since "an int8 DEVICE
+reading int4 codes" already works and every vision tower does it. It does not
+help, and `pack_rows` says why:
+
+```c
+  v = pk ? q_code(src, i) : src[i];          /* unpack the source */
+  dst[c] = g->w4 ? (v & 0xfu) : (v + 128);   /* one byte a code if int8 */
+```
+
+The codes are UNPACKED at staging when the device is int8. So a mixed model
+opened as int8 puts int4 layers on the wire at int8 bytes, which is int4's
+answer at int8's bandwidth -- the exact inverse of what `INT8_LAYERS` is for,
+and what `npu_mixed_test`'s header already said when it called that route
+dominated. Refuted by reading, before any code was written.
+
+**2. The tensor is in scope nearly everywhere `g->w4` is read.** 48 real uses,
+and the ones that matter sit where a tensor or an entry already is:
+
+```
+  charsiu_npu_open_mode, report, needs_q1     ~6   DEVICE level, unchanged
+  pack_rows, tensor_grouped, add_slice, ...   ~8   `t` is a parameter
+  read_rows{,2,4}, read_fused_rows            ~10  `c->e->t` is one hop
+  npu_matmul_inner, matvec_group              ~10  entries are in hand
+  bin_stride and the MB arithmetic             ~4  sizing, see below
+```
+
+`struct npu_entry` carries `const struct npu_tensor *t` as its second field, so
+the refactor threads no new state. Only `charsiu_npu_slot_word` has a slot and
+no entry.
+
+🔑 **3. AND THE BUFFERS ALREADY HAVE ROOM.** This was the risk worth checking
+first, because it is the one that could have made the refactor impossible
+rather than tedious. `charsiu_npu_open_mode` sizes the shared buffers from a
+shape that is explicitly int8:
+
+```c
+  struct charsiu_matmul widest = { 1, kwide, g->nmax, CHARSIU_INT8, CHARSIU_INT8 };
+  g->scratch = malloc(nmax * kmax_wide(g) + max_k);   /* one byte an element */
+  g->wpack   = malloc(nmax * kmax_wide(g) + 4096);
+  if (g->w4) g->in_stride *= 2;                        /* fp16 is two bytes */
+```
+
+So an int4 device's scratch and wpack are already the int8 size, and its
+`in_stride` is already TWICE what an int8 tensor needs, because an fp16
+activation is wider than an int8 one. Every shared buffer on a four-bit device
+has room for an eight-bit tensor.
+
+And the per-slice weight buffer follows the job rather than the device:
+`memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm))`, where
+`s->job.mm.wdtype` is the thing being made per-tensor. It resizes itself.
+
+▶ So the refactor is mechanical threading plus one function that decides the
+width, and the first candidate for that function is `t->packed`, which is
+exactly what the existing refusal tests: `if (g->w4 && !t->packed)`.
+
+⚠ Two things it still has to get right, neither of which the sizing covers:
+`slice_wsum`'s `if (!g->w4)` gate computes the zero-point correction that only
+int8 needs, and `adtype` differs (w4 wants fp16 activations, w8 wants int8), so
+a group that mixes widths cannot share one packed activation. The tree has
+already priced that second one at about 2%.
+
+### 🏁 THE SERIAL ARM, SAME BOOT: serialising costs NOTHING on decode
+
+The round of record ran with the two cores overlapped, because at 800 mV
+`overlap_safe()` approves and `batch_serial()` defaults to `!overlap_safe()`.
+What that is worth had only ever been quoted from 2026-09-04, a different
+governor and before the pin. This is the same boot as the round of record:
+boot id `929e85e2` at both ends, uptime 6920 s then 21794 s, same binary, same
+governor, same rail, same model file, and `CHARSIU_NPU_BATCH_PARALLEL=0` the
+only thing changed.
+
+```
+  Qwen3      ttft 799 686 671 677 688 676 679   decode 26.24 25.94 26.44 26.17 26.02 26.11 26.07
+  TinyLLAMA  ttft 1332 1167 1146 1159 1128 1140 1157   decode 22.57 22.78 22.82 22.84 22.87 22.75 22.83
+  Phi3       ttft 3976 3843 3896 3953 3953 3877 3842   decode 7.02 7.05 7.05 7.06 7.04 7.04 7.03
+  Gemma4     ttft 3225 2668 2687 2663 2668 2700 2706   decode 9.18 9.31 9.04 9.20 9.24 9.19 9.25
+```
+
+```
+             decode              TTFT
+           overlap  serial     overlap serial
+  Qwen3      26.26   26.11       613    679   +10.8%
+  TinyLLAMA  22.79   22.82       890   1157   +30.0%
+  Phi3        7.03    7.04      2987   3896   +30.4%
+  Gemma4      9.25    9.20      2222   2687   +20.9%
+```
+
+🔑 **Decode does not move: -0.6%, +0.1%, +0.1%, -0.5%.** Two of the four go UP.
+That is inside the run-to-run spread, so serialising is free on decode.
+
+And it is what the mechanism says once the mechanism is stated: overlap puts
+two cores in flight at the same time, a decode step is one row with nothing to
+overlap, and the entire gain is on the batched prompt. TTFT pays 11 to 30%.
+
+⛔ **So the four serial numbers this project has been quoting are not measuring
+serialisation.** 24.28 / 20.34 / 6.82 / 8.68, from 09-04, are ALL BELOW the
+serial decode here (26.11 / 22.82 / 7.04 / 9.20). They predate the affinity
+pin, so what they measure is the cost of not pinning, which is +25.5% and is
+measured directly elsewhere. Replacing them is right; dating them is not.
+
+🔑 **And the claim they supported gets stronger, not weaker.** "A reader on
+stock mainline gets neither these speeds nor these answers" is half wrong: the
+decode margin over the vendor survives serialisation intact, and only TTFT
+depends on the overlap.
+
+⚠ The first TTFT reading of every model is the high one (799, 1332, 3976,
+3225). Seven readings and a median absorb it; a single reading would not.
+
+### ⛔⛔ MIXED WIDTH DISPATCHES AND COMPUTES GARBAGE. REVERTED.
+
+`fae4f88` made `w4_for()` answer `t->packed` behind `CHARSIU_NPU_MIXED_WIDTH`
+and lifted the refusal. Every positive tell fired: the refusal stopped (1 with
+the switch off, 0 with it on), the diag line printed, the tensors staged. And
+the answer is garbage:
+
+```
+  without mixing   9 models compared, 0 differing
+  with mixing      9 models compared, 9 differing
+
+  <s> 1 2 3 ... 31 32!!!!!!!!
+  <|begin_of_text|>1 2 3 ... 31 32oooooooo
+```
+
+The prompt echoes correctly and then it emits filler, on all nine models. Nine
+of nine is systematic, not an edge. Reverted in `09c5b75`, refusal restored
+with the evidence in its comment.
+
+⚠ **Reverted rather than left switched off.** Default-off AND known-wrong is
+worse in a tree than a refusal, because the switch is an invitation.
+
+🏁 The threading (`d8cbb73`) stays. It is bit identical, the desk still reads
+34.2425, and it is what makes the next attempt one function instead of
+forty-eight edits. `npu_mixed_test` also stands: one open device alternates
+w8a8 and w4a16 correctly at K=256 N=64. The hardware can do this. What does not
+work is this way of asking.
+
+### 🔑🔑 AND THREE COMPARISONS COULD NOT RULE ON IT, ALL BROKEN THE SAME WAY
+
+Before the one that decided, I ran three text checks and every one of them put
+a FLOAT path against an INTEGER one:
+
+```
+  NPU mixed  vs  CPU reference      the control says these differ with
+                                    NOTHING mixed, so the arm proved nothing
+  int8-on-CPU vs int8-on-hardware   the same confound in another hat: the
+                                    switch moves those layers between float
+                                    and integer, so of course the text moves
+```
+
+Only NPU against NPU can decide, and **this tree already owned that comparison
+and says why on its own first page**: `board_text_all.sh` compares each model's
+batched prompt against its own TOKEN LOOP, both on the hardware, because the
+desk "could not have caught it" — with no NPU `matmul_rows` falls back to a
+matvec a row and the batched MATMUL never runs.
+
+⚠ I quoted that script earlier the same day, as the nine-architecture
+regression for the affinity default. Then I wrote a new comparison and reached
+for the reference it exists to avoid.
+
+**Second occurrence in one day of the same shape.** The other was three board
+rounds on the overlap fault whose answer is line 11 of `src/overlap.h`. Knowing
+the rule and owning the tool did not help, because neither got consulted at the
+moment a new check was being written. The question that would have caught both
+is "how does this tree already compare this?", asked before writing the
+comparison rather than after reading its result.
+
+### ⛔⛔ THE GROUP SWEEP: three readings taken from one passage, all three wrong
+
+The vendor keeps ONE fp32 scale and one integer zero point per OUTPUT ROW --
+read off the slot offsets, 4096 floats between two 2048-row tensors and 16384
+between two 8192-row ones -- so its group is the whole of K while charsiu's is
+1024. The comparison was never one difference, and the obvious worry is that
+the finer group flatters us.
+
+`chr43g` takes the group from `CHARSIU_CHR_GROUP`. 43 matrices, `-n 300`:
+
+```
+  group     long.txt            long2.txt
+  ref       17.8719             32.9174
+   32       17.9111  +0.22%
+  128       18.2978  +2.38%
+  256       18.3356  +2.59%
+  512       18.0920  +1.23%     33.4423  +1.59%
+ 1024       19.0597  +6.65%     34.3625  +4.39%
+ 2048       18.5473  +3.78%     34.5030  +4.82%
+  row       18.5053  +3.54%
+  vendor    20.2531 +13.32%     36.0449  +9.50%
+```
+
+🔑 **`chr43g` at 32 reads 17.9111, which is the q4043 arm to the last digit.**
+The parameterised path reproduces the arm it generalises, which is the check
+that it is the same quantiser.
+
+⛔ **And three things I said from `long.txt` alone are all wrong.**
+
+**"The finer group flatters charsiu."** It does not. On `long.txt` group 1024
+is WORSE than the whole row, +6.65% against +3.54%.
+
+**"1024 is a bad point in the quantiser."** `long.txt` has a clear spike there,
+2.7% above both neighbours, and the mechanism was ready: `d = vmax / -8` with
+`vmax` the SIGNED value at max|w| (npuquant.c 606, and identically llama.cpp's
+q4_0 at ggml-quants.c 132), so a negative `vmax` maps to +8 and clips to 7.
+**`long2.txt` is monotone: 512 < 1024 < 2048, no spike.** The dip is that
+passage, not the quantiser.
+
+**"Matching the group makes the section harder."** It reverses:
+
+```
+                      long.txt   long2.txt
+  charsiu group 1024     2.00x      2.16x
+  charsiu whole row      3.76x      1.97x
+```
+
+🔑 **So the configuration already in the paper is the stable one.** Group 1024
+gives 2.00 and 2.16 on two independent passages; the matched-group variant
+swings from 3.76 to 1.97 and is not quotable. The caveat is still worth stating
+-- the groups differ -- but the remedy for it is worse than the caveat.
+
+⚠⚠ **Every one of the three was read from differences of 1 to 7%, and this
+tree's own rule is that one passage of 300 tokens cannot order anything closer
+than about 10%.** `charsiu_ppl` is deterministic, so the numbers reproduce; what
+does not reproduce is the ORDER. The only figure here that survived a second
+passage is the main ratio, which is the one that was already being reported.
+
+### 🏁 THE bf16 CONTROL: the precondition holds, and the interval is wider than it looked
+
+The vendor quantised the ORIGINAL weights. charsiu's arm quantised whatever
+`RC.REF` pointed at, which was Q8_0, so the two sides started from different
+things and "asked to quantise the same thing" was not defensible. `REF` is
+`CHARSIU_RKLLM_REF` now, and the same 43 matrices were rebuilt from
+`Llama-3.2-1B-Instruct-f16.gguf` (md5 `3ba43423d342673e26016ffe85268937`).
+
+```
+                        charsiu     vendor      ratio
+  from Q8_0   long        +6.65%    +13.32%     2.00x
+              long2       +4.39%     +9.50%     2.16x
+  from f16    long        +7.45%    +13.81%     1.85x
+              long2       +3.92%    +10.26%     2.62x
+```
+
+**The asymmetry is real and it does not point one way.** From f16 charsiu is
+worse on `long` and better on `long2`; the vendor is slightly worse on both.
+There is no systematic flattering, which is what the caveat feared.
+
+🔑 **Report the f16 row, and report an interval.** 1.85x to 2.62x across two
+passages, because that is the arm whose precondition actually holds: both sides
+quantising the same original weights. The Q8_0 interval is narrower, 2.00 to
+2.16, and narrower for no good reason -- part of what makes it narrow is the
+two sides starting from different places and the difference happening to
+cancel.
+
+### ⚠⚠ AND THE REFERENCE SWAP FOUND TWO GATES THAT SAID "Q8_0" WITHOUT SAYING IT
+
+```
+  deq()                    reshape(-1, 34) -- q8_0's block, 2-byte scale + 32 int8
+  if tensor_type == 8      8 is q8_0's type id
+```
+
+`deq` raised on an f16 tensor, which is the GOOD failure: loud, immediate,
+unmistakable.
+
+⛔ **The type gate is the other kind.** Handed an f16 file every tensor fell
+past it to a plain copy, and the run printed **"chr43: 0 matrices and 0 norms
+replaced"** and wrote a complete file. A charsiu arm identical to the
+reference, scored, would have read as charsiu losing nothing at all. The only
+thing between that and a published number was reading the count.
+
+⚠ And widening the gate to `(0, 1, 8)` immediately let the 1-D norms through --
+F32 in an f16 file, never q8_0 -- into a shape assertion that indexes `shp[1]`.
+The rank is part of the gate now. **Fixing one fault uncovering the next is the
+third time today.**
+
+🔑 The lesson that generalises: a constant like `34` or `8` is a format
+assumption with no name, and it only becomes visible when the format changes.
+`deq`'s crashed; the gate's returned an empty result that looked like a
+measurement.
+
+---
+
+## 2026-09-12 -- the ladder under the f16 origin, and "monotone" was one passage
+
+The last item the handoff left that needed neither the board nor a decision:
+the 91- and 105-matrix rungs had never been re-run with both sides quantising
+the original weights. They have been now, and both passages went with them.
+
+### 🏁 The instrument reproduced first
+
+The 43-matrix rung under f16 read `+13.81% / +7.45%` on `long.txt` and
+`+10.26% / +3.92%` on `long2.txt` -- the recorded numbers, to the last digit,
+after the harness had been changed underneath them. A new reading from an
+instrument that has just been rebuilt is worth what the old reading says about
+it.
+
+### ⛔ THE LADDER IS NOT MONOTONE, AND THAT CLAIM WAS ONE PASSAGE
+
+```
+                            long.txt                    long2.txt
+  reference (f16)            17.9023                     32.8163
+
+  matrices          vendor  charsiu  ratio      vendor  charsiu  ratio
+  43  (rho = 1)    +13.81%   +7.45%  1.85x     +10.26%   +3.92%  2.62x
+  91  (layers 3+)  +41.00%  +20.48%  2.00x     +26.01%  +18.38%  1.42x
+  105 (no layer 1) +67.19%  +30.82%  2.18x     +54.30%  +32.93%  1.65x
+```
+
+`long.txt` climbs 1.85, 2.00, 2.18. That is where "2.0 to 2.4 times charsiu's,
+on three nested subsets, monotone" came from, and it is a clean-looking
+result: more matrices swapped, more of a gap. `long2.txt` reads 2.62, 1.42,
+1.65 and puts the 43-matrix rung at the TOP of the three instead of the
+bottom. Nothing about subset size orders these.
+
+🔑 **What survives is the direction: six cells of six, the vendor's four-bit
+excess is larger.** The size is an interval, 1.4x to 2.6x. That is a weaker
+sentence than the one it replaces and it is the one that is true on both
+passages.
+
+⚠⚠ **This is the fourth conclusion in this comparison read off `long.txt`
+alone and reversed by the second passage.** The other three were the group
+sweep's, yesterday. The pattern is not that I keep forgetting to run the
+second passage -- it is that the FIRST passage always produces a clean story,
+because a single sample of anything can be ordered and an ordering reads as
+structure. So the corpus is a list in the harness now and both passages are
+scored from one build. It costs a forward pass, not a rebuild: the arm's
+2.5 GB file is already on the disk and is deleted either way.
+
+### ⛔ Two ways a stale file wore a valid name
+
+Both turned up while setting the round up, and they are one shape: **the cache
+key did not carry the thing that makes the entry valid.**
+
+**The origin was not in the name.** Arms cached as
+`Llama-3.2-1B-<arm>-F16.gguf` say nothing about what they were built from, and
+two of them from 09-09 -- Q8_0 origin -- were still in `models/` when the f16
+round started. `ref` is in every arm list, so the f16 round would have taken
+its reference perplexity from the Q8_0 file and shifted every percentage in
+the ladder with nothing on screen to say so. The reference md5's first eight
+hex are in the filename now.
+
+This is the same landmine as `bmap` keyed on the row count alone while the
+width had become a per-tensor question. **A key that was complete stops being
+complete the moment a new axis is added, and nothing announces it.**
+
+**Existing was read as complete.** A rebuild killed mid-write by a session
+crash left 1046478848 bytes of a 2.48 GB arm under the final name, and the
+next round's `[ ! -f "$F" ]` accepted it. It failed loudly when scored, which
+was luck -- a truncated gguf that still loads would have been scored instead.
+The rebuild writes `.part` and renames after close now.
+
+### ⚠ rho1 and vendor43 are the same file
+
+They scored identically on both passages, which is the tell for an arm that
+never ran. They are the same file, md5 `9d8e82952e96a6f14eeaa4b016704dde`:
+both replace 43 matrices, both move away from the reference, and dividing the
+calibration out changes not one f16 weight on the rho = 1 subset. That is what
+the subset is FOR, so this is construction and not a null arm -- but it is one
+measurement printed as two agreeing ones, and the pack says so now.

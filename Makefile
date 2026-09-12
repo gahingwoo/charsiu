@@ -96,8 +96,15 @@ $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
 
-$(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
-	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+#
+# ⚠ THE SOURCE LIST HAS TO TRACK charsiu_run's. This rule went stale when
+# vision landed: it kept the old list, so the board's static binary stopped
+# linking (undefined charsiu_vision_open and three more) and nobody noticed,
+# because nothing builds it by default. A target that is never built is a
+# target that is already broken.
+#
+$(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
 # The control: same code with the NEON kernels compiled out, and slower.
 #
@@ -238,6 +245,16 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
 	./tests/corpus_fixed.sh
+#
+# ⚠ THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
+# specified "every perplexity must name a file whose md5 appears in the
+# reproduction section" on 09-11 and nobody implemented it. Run for the first
+# time on 09-12 it failed at once: both corpora were scored by every
+# perplexity in the pack and NEITHER md5 was recorded. A rule nothing runs is
+# a sentence.
+#
+	python3 -P tools/check_consistency.py --self-test
+	python3 -P tools/check_consistency.py docs/paper-evidence.md
 
 $(BUILD)/pack_int4: tests/pack_int4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm

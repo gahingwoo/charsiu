@@ -73,7 +73,7 @@ OUTDIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUTDIR"
 
 # the int4 environment board_intermittent.sh runs, at the K slice asked for
-W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+#
 # ⚠⚠ THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
 # wants t->kgroup == g->kmax -- the hardware sums a whole K slice into one
 # accumulator, so a slice carries exactly one group's scale -- and
@@ -81,6 +81,19 @@ W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 # honour. A hardcoded 1024 beside a KMAX that is anything else sends every
 # tensor with k > 1024 to the CPU, which on Llama is all of attention and
 # ffn_down. It whines; no harness read it.
+#
+# ⚠⚠⚠ AND THIS NOTE USED TO SIT INSIDE THE STRING BELOW, BETWEEN A
+# BACKSLASH AND ITS CONTINUATION -- so `#` was not a comment, it was DATA.
+# W4 expanded to the environment followed by nine lines of prose, `env`
+# tried to execute a program called `#`, every arm died in under a second,
+# and `2>/dev/null` swallowed the reason. Introduced 2026-09-10 by 68b1a75,
+# whose subject is "two board harnesses were timing the CPU fallback and
+# calling it the NPU": the commit that made these harnesses correct is the
+# one that stopped them running at all. Nothing caught it for a day because
+# nothing ran them -- until board_intermittent's own empty-reference guard
+# refused to compare against a control that had produced nothing.
+#
+W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=$KMAX CHARSIU_NPU_W4_GROUP=$KMAX \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 CHARSIU_PROBE_WIDTHS=$W ${CHARSIU_OVL_MAXT:+CHARSIU_PROBE_MAXT=$CHARSIU_OVL_MAXT} ${CHARSIU_OVL_EXTRA:-}"

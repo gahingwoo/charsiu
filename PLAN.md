@@ -57,6 +57,22 @@ The prompt goes in chunks of 32, because the buffers scale with the batch and
 the probe's sweep flattens after 16. `CHARSIU_PREFILL_CHUNK` caps that, and the
 cap is rounded down to a width the hardware can express.
 
+⚠⚠ **AND IT WAS NOT BATCHING AT ALL FOR ANYONE WHO TURNED AWQ ON, WHICH WAS
+5.1x.** `npu_matmul_inner` refused any tensor carrying an AWQ factor, so the
+whole range fell back to a row at a time -- correct answers, at the pre-batch
+price, on the path this section calls DONE. The factor goes on at the gather
+now. Board, Llama-3.2-1B, 2026-09-10:
+
+```
+  refuse   prompt 2643 ms
+  batch    prompt  515 ms      5.1x, tokens identical
+```
+
+🔑 **That number sat unmeasured for a day because the change was filed as a
+correctness fix**, which is what it was -- decode was right and prefill was
+wrong. A fix that removes a fallback is also a performance result, and nothing
+benchmarks a correctness fix. `CHARSIU_NPU_AWQ_BATCH=0` puts the refusal back.
+
 ### The other three modalities, measured on the board 2026-08-28
 
 Seeing, hearing and matching all give the right answer on a ROCK 4D -- jfk.wav
@@ -1825,10 +1841,27 @@ knob apart:
 ```
   int4, one scale a row                       114.22
   int4, group 1024                             91.66
-  int4, group 1024 + AWQ 0.5 clamp 2           72.36
+  int4, group 1024 + AWQ 0.5 clamp 2           72.36   ⛔ see below
   int8, group 1024                             44.81
   int8, one scale a row                        43.66
 ```
+
+⛔ **THE AWQ ROW IS MIS-SET TWICE OVER AND 72.36 IS NOT WHAT FOUR BITS WITH
+AWQ IS WORTH.** Both faults were found on 2026-09-10, and each is worth more
+than the row's own margin. The exponent is 0.5, which is past the minimum on
+every model swept since (0.20 to 0.25). And the clamp is 2.0, which binds from
+alpha 0.10 upward, so the row measures the exponent and the bound together --
+that is why the default moved to 6.0 the same day. On Llama-3.2-1B those two
+fixes together are 41.5289 -> 28.0368, a third of the method.
+
+⚠ **What that changes here is the MARGIN, not the direction -- and the margin
+is what has not been measured.** Qwen3 is no longer on this host, so the row
+cannot simply be re-run; the arm someone should run is qwen3-0.6B at
+`CHARSIU_NPU_AWQ=0.20 CHARSIU_NPU_AWQ_CLAMP=6.0` against these same 200 tokens.
+Until it exists, read the comparison as "eight bits still ahead, by less than
+this table says", and do not quote 72.36. What is known at the settings that
+ship, on the board's own quantiser, is in README.md's AWQ section: Llama
+33.4149 -> 23.7935 on hardware.
 
 Eight bits, with no group and no AWQ, is better than four bits with both. And
 the coarser group is not a cost there at all -- 43.66 beats 44.81 -- because a
@@ -1863,15 +1896,28 @@ board that warms over a minute cannot be mistaken for the flag:
   saved                        12.40 ms a token
 ```
 
-⚠ AND THE SAVING IS THE OUTPUT HEAD, TO WITHIN 1.4%, BY AN ARITHMETIC THAT
-NEVER SAW THESE TIMINGS. The head runs once instead of 65 times, so the saving
-per token is H * 64/65 and H is 12.59 ms. Llama-3.2-1B's head is 128256 x 2048,
-which at int4 is 131.3 MB of weights, and
+🔑 AND THE SAVING IS THE OUTPUT HEAD, BY AN ARITHMETIC THAT NEVER SAW THESE
+TIMINGS. The head runs once instead of 65 times, so the saving per token is
+`H * 64/65` where H is the head's own cost, 12.59 ms:
+
+  12.59 * 64/65 = 12.396 ms   predicted
+                  12.40  ms   measured, above
+
+⚠⚠ **12.40 AND 12.59 ARE NOT TWO ESTIMATES OF ONE QUANTITY** and reading them
+as a disagreement to be settled by another board round is a mistake this file
+has invited at least once. 12.59 is what the head costs ONCE; 12.40 is what a
+token saves, and the ratio between them is 64/65 exactly. Nothing is
+unresolved here.
+
+The 1.4% is a different check, and it is the one that makes this evidence
+rather than bookkeeping. Llama-3.2-1B's head is 128256 x 2048, which at int4 is
+131.3 MB of weights, and
 
   131.3 MB / 12.59 ms = 10.43 GB/s
 
 against the 10.58 GB/s this model's own NPU summary reports for weight
-bandwidth. The time the batched prompt does not spend is exactly the time it
+bandwidth -- **1.4% apart, from a shape and a rate that never saw the
+stopwatch**. The time the batched prompt does not spend is exactly the time it
 takes to stream the head's weights, once per token, at the rate this board
 moves weights.
 

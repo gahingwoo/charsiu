@@ -60,8 +60,17 @@ if [ -n "${CHARSIU_VENDOR_PRICE_SERIAL:-}" ]; then
 	echo
 fi
 
+#
+# ⚠⚠ RESOLVE PER FILE, NOT PER DIRECTORY. This picked $HOME/.charsiu/models
+# whenever that directory merely EXISTED, and on a board where `charsiu pull`
+# had put gemma4 there while the installer had put the other three in
+# /opt/charsiu/models, the table came back saying "charsiu pull" for models
+# that were on the card. The loop below already walks a list; the list just
+# has to contain both.
+#
 MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
-[ -d "$MODELS" ] || MODELS=/opt/charsiu/models
+ALTMODELS=/opt/charsiu/models
+[ -d "$MODELS" ] || MODELS=$ALTMODELS
 
 # ⚠ CHARSIU_RUN_BIN, so the shell around the table can be exercised without a
 # board. The repeat loop below went in untested because a missing model takes a
@@ -114,12 +123,39 @@ echo "  governor: $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>
 [ "$W4V" = 1 ] || echo "  ⚠ OUR column is w8a8 (CHARSIU_BENCH_W4V=0); theirs is still their w4a16."
 echo
 
+#
+# ⚠⚠ THE TWO COLUMNS ARE NOT THE SAME KIND OF NUMBER, AND A MARGIN READ ACROSS
+# THEM IS NOT A MEASUREMENT OF A DIFFERENCE. "ours" is measured here, now, on
+# this board, with a spread this script prints. "theirs" is a PUBLISHED POINT
+# ESTIMATE with no N, no spread and no method beyond their one sentence about
+# maximum frequencies -- so it cannot be beaten "within the noise", because it
+# has not got any. Say so wherever the ratio is quoted.
+#
+# ⚠⚠ AND THE STATISTIC MATTERS MORE THAN THE COUNT. This printed BEST of N,
+# and best-of-N systematically favours the arm with the wider spread: run the
+# noisier side more times and it wins by its own variance. gemma4's TTFT has
+# read 2133 to 3221 in one build while phi3 repeats to 0.2%, so the models here
+# do not even share a spread with each other, let alone with the vendor.
+#
+# It reports the MEDIAN now, with the full range and every reading beside it.
+# The best is still printed, because every earlier round in this tree recorded
+# one and they have to remain readable -- but it is no longer the headline.
+#
+# mid: median of a whitespace-separated list. Even N takes the two central.
+mid() {
+	printf '%s\n' $1 | sort -g |
+		awk '{a[NR]=$0}
+		     END{ if (NR == 0) exit
+		          if (NR % 2) printf "%g\n", a[(NR+1)/2]
+		          else         printf "%g\n", (a[NR/2] + a[NR/2+1]) / 2 }'
+}
+
 printf '%-16s %10s %10s   %10s %10s   %8s %8s\n' \
 	model "ours t/s" "theirs" "ours TTFT" "theirs" "ours MB" "theirs"
 
 rows | while IFS='|' read -r name file vt vttft vmb label; do
 	M=""
-	for d in "$MODELS" "$DIR"; do
+	for d in "$MODELS" "$ALTMODELS" "$DIR"; do
 		[ -f "$d/$file" ] && { M="$d/$file"; break; }
 	done
 	if [ -z "$M" ]; then
@@ -160,6 +196,10 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# one reading. A 27% spread on the number this table exists to report.
 	BEST_TT=; BEST_TS=; BEST_MB=; BEST_NP=; WORST_TT=; nrun=0
 	BTS=; WTS=
+	# ⚠ EVERY READING IS KEPT. A median cannot be computed from two
+	# extremes, and a round whose individual readings were thrown away
+	# cannot be re-read later with a different statistic.
+	TTL=; TSL=
 	while [ $nrun -lt "$REPEAT" ]; do
 		nrun=$((nrun + 1))
 		# ⚠⚠ env, NOT A BARE ASSIGNMENT PREFIX. A shell only treats
@@ -200,6 +240,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		[ -n "$WTS" ] || WTS=$TS
 		BTS=$(awk -v a="$BTS" -v b="$TS" 'BEGIN{print (b>a)?b:a}')
 		WTS=$(awk -v a="$WTS" -v b="$TS" 'BEGIN{print (b<a)?b:a}')
+		TTL="$TTL $TT"; TSL="$TSL $TS"
 	done
 	# ⚠⚠ A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
 	# plus OUT=$(cmd) means one model that will not load takes every model
@@ -212,14 +253,24 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		tail -3 "$DIR/.v.err" | sed 's/^/     /'
 		continue
 	fi
-	TS=${BTS:-$BEST_TS}; TT=$BEST_TT; MB=$BEST_MB; NP=$BEST_NP
+	MB=$BEST_MB; NP=$BEST_NP
+	# ⚠ THE HEADLINE IS THE MEDIAN. The decode column also reports its own
+	# statistic rather than the reading that came with the best prompt --
+	# the two are not the same run and there is no reason they should be.
+	TS=$(mid "$TSL"); TT=$(mid "$TTL")
+	[ -n "$TS" ] || TS=${BTS:-$BEST_TS}
+	[ -n "$TT" ] || TT=$BEST_TT
 	spread=""
-	# ⚠ THE DECODE COLUMN NOW REPORTS ITS OWN BEST, not the one that came
-	# with the best prompt. The two are not the same run and there is no
-	# reason they should be.
 	[ "$REPEAT" -gt 1 ] && spread=" ttft $BEST_TT..$WORST_TT, decode $WTS..$BTS over $REPEAT runs"
 	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)%s\n' \
 		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP" "$spread"
+	# ⚠ AND THE READINGS THEMSELVES, so a later question can ask a
+	# different statistic of this round instead of needing a new one.
+	if [ "$REPEAT" -gt 1 ]; then
+		printf '     readings  ttft %s\n' "$(echo $TTL)"
+		printf '     readings  decode %s   best ttft %s, best decode %s\n' \
+			"$(echo $TSL)" "$BEST_TT" "$BTS"
+	fi
 	# ⚠ THE REFUSAL STRING MOVED ON 2026-08-29 and this grep did not: it
 	# looked for "int4 computes one row", which no longer exists anywhere,
 	# so it matched nothing and said nothing for a round. It looks for the
@@ -270,7 +321,8 @@ if [ "$REPEAT" -eq 1 ]; then
 	echo "   17.39 tok/s on the same build minutes apart, and Qwen3's TTFT"
 	echo "   2055, 1867 and 2191 -- so a change worth less than about 25%"
 	echo "   cannot be seen here at all, and a single round must not be read"
-	echo "   as a regression. CHARSIU_BENCH_REPEAT=3 prints best and spread."
+	echo "   as a regression. CHARSIU_BENCH_REPEAT=N prints the MEDIAN, the
+   full range, and every individual reading."
 	echo
 fi
 echo "⚠ THE MEMORY COLUMN IS VmHWM AND DOES NOT SEE THE DEVICE BUFFERS."
