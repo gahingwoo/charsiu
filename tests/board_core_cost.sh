@@ -54,13 +54,17 @@ REPEAT=${CHARSIU_CC_REPEAT:-5}
 NTOK=${CHARSIU_CC_NTOK:-64}
 PROMPT=${CHARSIU_CC_PROMPT:-"Explain in plain words why a written record outlasts a memory."}
 
-RUN=
-for d in "$D/../build" /opt/charsiu/bin /usr/local/bin /usr/bin; do
+# ⚠ THE SAME SEARCH board_vendor.sh USES. /opt/charsiu/bin does not exist on
+# the board; the probes sit in /opt/charsiu itself. CHARSIU_RUN_BIN overrides,
+# so the shell around the table can be exercised with no board at all.
+RUN=${CHARSIU_RUN_BIN:-}
+[ -n "$RUN" ] || for d in /usr/bin /opt/charsiu "$D/../build" "$PWD/build"; do
 	[ -x "$d/charsiu_run" ] && { RUN="$d/charsiu_run"; break; }
 done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-MODELDIRS="$HOME/.charsiu/models /opt/charsiu/models $D/../models"
+# ⚠⚠ MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
+MODELDIRS=${CHARSIU_CC_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models $D/../models"}
 find_model() {
 	for d in $MODELDIRS; do
 		[ -d "$d" ] || continue
