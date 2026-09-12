@@ -11,13 +11,21 @@ GCC 15.2.0, glibc 2.43. Desk: aarch64 VM, GCC 13.3.0, glibc 2.39.
 
 ## 0. Three things that must be said beside the numbers
 
-**The vendor column is a citation, not an arm.** It is copied from
-`airockchip/rknn-llm/main/benchmark.md`, fetched 2026-08-28, and their header
-says the figures were "collected based on the maximum CPU and NPU frequencies
-of each platform". Nothing in this project runs their runtime. The column has
-no N, no spread, and no method beyond that one sentence, so a margin over it
-cannot be inside anyone's noise in either direction. Every comparison below is
-our median of seven with its range, against their published point.
+**The vendor column in section 1 is a citation, not an arm.** It is copied
+from `airockchip/rknn-llm/main/benchmark.md`, fetched 2026-08-28, and their
+header says the figures were "collected based on the maximum CPU and NPU
+frequencies of each platform". The column has no N, no spread, and no method
+beyond that one sentence, so a margin over it cannot be inside anyone's noise
+in either direction. Section 1 is our median of seven with its range, against
+their published point.
+
+⚠ **Section 1d is different: their runtime has now been RUN here**, on the
+same board, the same kernel and the same clock as ours, and it is an arm.
+Section 1 and section 1d are two different comparisons and must not be merged
+into one table: section 1 is four models at maximum frequency against a
+citation, section 1d is one model at 594 MHz against a measurement. The
+citation and the arm do not even agree about which side is ahead on TTFT, for
+a reason section 1d gives.
 
 **A perplexity needs a model, a corpus, and a file.** charsiu re-quantises
 whatever it loads, so the source format is inside every quality number. The
@@ -56,6 +64,57 @@ choosing a column.
 Their TTFT and ours are not the same quantity. Theirs is time to the first
 token; ours is the prompt's forward passes, so the first token's own step is in
 theirs and not in ours, which is one token's worth in our favour.
+
+### 1d. Their runtime, RUN
+
+`board-logs/r389`. The vendor's rknpu driver built against this board's own
+kernel from Kiln's mainline port, their `librkllmrt` 1.3.0 loading
+`Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm`, md5 `2d3962468e2e7c0d0571157f8c9eae71`,
+the same file section 2 scores. Timed with the runtime's own `RKLLMPerfStat`
+rather than from outside, so a disagreement about where prefill ends cannot be
+blamed on the harness.
+
+Held equal: one Image, 594 MHz, identical prompt strings, `-n 16`, ignore-eos,
+context 512. Both runtimes pin the big cluster, and the vendor's says so on
+stdout: `Enabled cpus: [4, 5, 6, 7]`.
+
+```
+  decode tok/s     charsiu 18.56 (18.47..18.58)   vendor 12.88 (12.71..12.95)
+                   charsiu 1.44x
+```
+
+⚠⚠ **The prefill answer depends on which question is asked, and the two
+readings point in OPPOSITE directions.** The vendor wraps the prompt in its own
+chat template: the same string is 50 tokens to them and 16 to us.
+
+```
+  wall-clock TTFT, same string    charsiu 265 ms      vendor 466 ms   charsiu 1.76x
+  prefill throughput              charsiu 61 tok/s    vendor 107 tok/s vendor 1.76x
+```
+
+Both are true. Two prompts separate the rate from the amount: a second, longer
+prompt is 79 tokens to us and 113 to them.
+
+```
+               short              long             ms/token   fixed cost
+  charsiu   16 tok  265 ms     79 tok  751 ms        7.71       141.6 ms
+  vendor    50 tok  466 ms    113 tok  860 ms        6.25       153.6 ms
+```
+
+🔑 **The slope is the prefill rate and the intercept is the overhead.** Per
+prompt token the vendor is 1.23x faster, which is the real gap and is far
+smaller than either single-prompt reading. The fixed costs are within 8% and
+ours is the lower of the two. charsiu's wall-clock win on a short prompt is a
+tokeniser difference and must not be quoted as a prefill result.
+
+⚠ The rail differs: 800 mV for charsiu, 750 for the vendor, because their
+driver sets it through `npu-supply` and its OPP table rather than taking the
+device tree's floor. Both compute correctly at 594 MHz and voltage does not set
+clock rate, so this is a caveat and not a confound.
+
+⚠ Neither side scaled. Their device tree asks for devfreq over an OPP table
+reaching 800 MHz; Kiln's patch pins the clock. So this says nothing about
+either side at the frequency their published figures were taken at.
 
 ### 1b. The decode margin is younger than the round
 
@@ -487,8 +546,17 @@ ends, and refuses to be read as one round if the boot id moved.
 
 ## 8. What is not supported
 
-Any claim about the vendor's runtime speed measured here. It has never been run
-in this project, and section 1's right column is a citation.
+The vendor at the frequency their published figures were taken at. Their
+runtime HAS now been run here, in section 1d, but at 594 MHz on both sides with
+neither scaling; section 1's right column is still a citation at maximum
+frequency and the two must not be combined.
+
+A single number for the prefill gap. Section 1d: 1.76x in our favour on
+wall-clock TTFT for one string, 1.76x against us on throughput for the same
+string, and 1.23x against us per token once two prompt lengths separate the
+slope from the intercept. The last is the one that answers "how fast is the
+prefill"; the first answers "what does a user wait for" and is a tokeniser
+difference.
 
 That the overlap fault is gone. Section 4b: it is rail-conditioned, this board
 is at 800 mV, and a probe that did not fire says nothing on its own.
