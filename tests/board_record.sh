@@ -250,7 +250,15 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 			awk '{printf "%.1f ", $1/1000}' "$z" 2>/dev/null
 		done; true)
 		[ -n "$T" ] || T="(no thermal zone on this board)"
+		# ⚠ THE FULL BOARD ENVIRONMENT, SPELLED. This line carried three
+		# knobs where the speed table it sits beside carries five. The
+		# two missing ones are the tree's board environment, and one of
+		# them -- CHARSIU_NPU_MAXN -- decided whether the output head
+		# reached the NPU at all until its default was fixed on
+		# 2026-09-12. A sweep that reads differently from the table
+		# above it is a sweep nobody can compare to the table above it.
 		MS=$(env CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
+		     CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 		     "$BIN/charsiu_run" "$GM" -p "Explain in plain words why a written record outlasts a memory." \
 		     -n 8 --ignore-eos -c 512 -t 4 2>/dev/null |
 		     grep -o 'prompt [0-9]* tok in [0-9]* ms' | head -1 | awk '{print $5}')

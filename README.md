@@ -17,12 +17,23 @@ column of two, and the other one is why this table has three rows:
   the vendor's runtime       24.85          469          ?         ?
 ```
 
-⚠⚠ **THE EMPTY CELL IS THE POINT.** The speed column is measured against the
-vendor's runtime; the quality column is measured against llama.cpp's own q4_0
-on the same tokens (26.64) -- **a different program, on a different build.**
-Nobody has scored the vendor's `.rkllm` for quality, so the row that the speed
-claim is made against is the one row with no quality number at all, and until
-it exists neither of the other two rows can be read as "better".
+⚠ **THE EMPTY CELL IS FILLED NOW, AND NOT THE WAY IT WAS MEANT TO BE.**
+`tools/rkllm_rebuild.py` reads the vendor's stored weights and scores them with
+this project's own quantiser, on the same corpus, from the same f16 original
+both quantisations came from. Their weights come out **1.4 to 2.6 times worse
+in perplexity** than charsiu's across three nested subsets and two passages --
+a direction, not a single number, because the six cells do not agree on an
+ordering. `docs/paper-evidence.md` section 2 has the protocol.
+
+⛔ **That is a reconstruction, and it is the ONLY route there is.** Three ways
+into their runtime and all three refuse: `RKLLM_INFER_GET_LOGITS` fails on an
+uncompiled shape, `RKLLM_INPUT_TOKEN` is accepted and returns token 0 (asked
+for ten tokens it says `"!!!!!!!!!!"`), and text prompts work but apply a chat
+template we cannot reproduce. So the reconstruction is not second best; it is
+what there is, and section 1b says why in four lines.
+
+⚠ The speed column is still measured against their PUBLISHED figure rather
+than their runtime. 1b and 1g run their runtime on this board.
 
 **Neither of charsiu's rows wins outright and they lose in different places.**
 int4 decodes 5.9% faster than the vendor and starts 28% slower. int8 starts
@@ -982,17 +993,33 @@ The four-model speed table, best of six under `board_verify.sh 7`, on the
 vendor's own prompt and protocol:
 
 ```
-                     decode tok/s            time to first token, ms
-                     charsiu   vendor        charsiu   vendor
-  Qwen3 0.6B          26.30    24.85           594      469
-  TinyLLAMA 1.1B      22.89    19.71           869      544
-  Phi3 3.8B            7.06     6.58          2818     1829
-  Gemma4 E2B           9.42     9.23          2190     1219
+                  decode tok/s              TTFT ms            our prompt
+                  charsiu  range     vendor  charsiu   vendor  in tokens
+  Qwen3 0.6B       26.02   25.68..26.03  24.85     699   468.61   110
+  TinyLLAMA 1.1B   21.88   21.87..21.88  19.71     933   543.68   116
+  Phi3 3.8B         6.69    6.68..6.72    6.58    3244  1829.12   116
+  Gemma4 E2B        8.92    8.92..8.93    9.23    2180  1219.25   111
 ```
 
-⚠ **Gemma4 is +2.1% and has read +0.3% on a different session.** This board
-drifts about 3% between boots, so that row is "level with the vendor", not
-"past it", and the three above it are the ones with a margin worth the name.
+`board_vendor.sh`, `CHARSIU_BENCH_REPEAT=3`, performance governor, median of
+three with the range beside it. An earlier version of this table read 26.30,
+22.89, 7.06 and 9.42 and was a BEST of six from a different harness; best-of-N
+is biased upward and the two are not comparable, which is why the range is
+printed now instead.
+
+⚠⚠ **THE TWO TTFT COLUMNS ARE NOT AT THE SAME PROMPT LENGTH.** Theirs is their
+published 128-token protocol, in their tokenisation. The same string is 110 to
+116 tokens in ours, because their runtime wraps a prompt in a chat template
+worth a constant 33 tokens. TTFT is convex in prompt length, so part of every
+gap in those two columns is the length and not the runtime.
+
+⚠ And their column is a published point estimate: no N, no spread, taken at
+maximum CPU and NPU frequency. Ours has a range because it was measured here.
+`docs/paper-evidence.md` 1b and 1g have their runtime actually run on this
+board, which is a different and better comparison than this table can be.
+
+⚠ **Gemma4 is behind here and has been ahead on other sessions.** This board
+drifts about 3% between boots, so that row is "level", not "past".
 ⚠ And this is the int4 column: see the three-row table at the top for what
 these tok/s cost in perplexity.
 
@@ -1161,16 +1188,48 @@ board confirms the offsets do not move as the cache grows, which is what makes
 that legal. And an op that hands over a NULL `Y` leaves its answer in the
 device buffer for a caller that is about to reduce over it anyway.
 
-`CHARSIU_ATTN_NPU` puts it in the model, and the honest result is two things.
-It is **correct**: `CHARSIU_ATTN_NPU_CHECK` runs both arms on the same rows and
-they land 0.25 to 0.5% apart over 112 layers with nothing falling back, which
-is fp16 inputs against an fp32 CPU arm and not a cache written in the wrong
-order. And it is **slower**: 6710 ms against the CPU arm's 4889 on a 513 token
-prompt, and 52558 against 35686 on a 2074 token one. The gap widens with the
-cache rather than closing, because the scores matmul's n is the number of
-positions and the values matmul's k is the context -- the hardware's work grows
-with the cache exactly as the CPU's does, and it starts from behind. It is off by default, and with the flag unset
-four models produce text identical to the build from before any of this.
+`CHARSIU_ATTN_NPU` puts it in the model. It is **correct**:
+`CHARSIU_ATTN_NPU_CHECK` runs both arms on the same rows and they land 0.2 to
+1.3% apart with nothing falling back, which is fp16 inputs against an fp32 CPU
+arm and not a cache written in the wrong order.
+
+⛔ **Whether it is slower depends on the model, and the first measurement was
+taken on the worst one this card has.** `attn_npu_want_for()` carried a
+withdrawn rule saying so -- *"head_dim >= 128 is only half the rule and the
+other half (how long a prompt) has not been measured"* -- and both halves are
+measured now. Ratio is the NPU arm over the CPU arm, so below 1.00 the NPU
+wins:
+
+```
+  model            head_dim   ~52 tok   ~202    ~452    ~852
+  Llama-3.2-1B           64     1.269   1.259   1.250   1.257
+  SmolLM2-1.7B           64     1.478   1.452   1.341   1.358
+  tinyllama-1.1b         64     1.237   1.293   1.275   1.290
+  Phi-3.5-mini           96     1.369   1.365   1.278   1.213
+  Qwen2.5-1.5B          128     1.109   1.094   1.084   1.023
+  Qwen3-0.6B            128     1.622   1.354   1.163   1.018
+  gemma-3-1b            256     1.121   1.021   0.923   0.877
+```
+
+Monotone in head_dim across seven models and five architectures, and the two
+head_dim 128 models agree to 0.5% on different architectures. The two halves
+are one quantity: head_dim is the INNER dimension of both attention matmuls
+and the prompt length is the outer, so both feed arithmetic per dispatch.
+
+⚠ **So "the gap widens with the cache" was true of head_dim 64 and of nothing
+else.** At head_dim 256 the gap CLOSES with length and crosses at about 230
+tokens. `tools/gguf_head_dim.py` prints which side of the rule a model is on;
+Llama-3.2-1B, which every speed round here uses, is the furthest below it.
+
+gemma-4-E2B is a mixture, 512 for its global layers and 256 for its window
+ones, and the fp16 mirror used to hold one head_dim and refuse the other 28 of
+its 35 layers. It holds one per layer now: 0.936 to **0.804** at 852 tokens,
+19900 ms of prompt down to 16000.
+
+⛔ **It is still off by default.** Two models win and both are gemma; one clean
+head_dim 256 point is not a rule, and this project has withdrawn an automatic
+rule here once already. With the flag unset, nine models produce text identical
+to their own token loops, and so do they with it set.
 
 `docs/lab-notebook.md` has what had to be found, including the six
 register-level fixes tried against a fault that was in a buffer, and the
