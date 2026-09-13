@@ -13,12 +13,14 @@ for, and it is the only comparison here where nothing is quoted:
 
   decode      charsiu 1.39x to 1.46x faster       the multiple moves with the
                                                   clock, so it is not one number
-  prompt      charsiu faster below about 250      a crossover, not a ratio: at
-              tokens, the vendor above it         102 tokens 808 ms against 932,
-                                                  at 852 tokens 7191 against 6027
+  prompt      charsiu faster below about 330      a crossover, not a ratio: at
+              tokens, the vendor above it         102 tokens 761 ms against 932,
+                                                  at 302 level (2126 / 2145),
+                                                  at 852 tokens 6815 against 6027
 
-              their lead at 852 tokens was        r402, after the fp16 attention
-              1.38x and is now 1.19x              arm became the default
+              their lead at 852 tokens was        r402's fp16 attention arm took
+              1.34x and is now 1.13x              it to 1.16x, r408's gather
+                                                  overlap to 1.13x
   quality     charsiu's weights 1.4x to 2.6x      their stored weights scored
               better in perplexity                against the same f16 original
 ```
