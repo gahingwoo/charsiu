@@ -2495,7 +2495,26 @@ static int fast_softmax(void)
  * or two elements, and a vector prologue for those is slower than the loop it
  * replaces.
  */
-static void softmax(float *x, int n)
+/*
+ * ⚠ THE SCALE RIDES ALONG, AND IT COSTS NOTHING BECAUSE IT IS POSITIVE.
+ *
+ * Attention wants softmax(x * scale) and used to get it by multiplying the
+ * row through first -- a whole extra pass over the row, read and write, and
+ * at 852 tokens the rows total 186 million floats. It does not need one:
+ * multiplication by a positive constant is monotonic, so max(x * s) is
+ * max(x) * s, and the multiply then folds into the exponential pass's
+ * existing load. Four passes a row become three.
+ *
+ * ⚠ AND IT IS BIT IDENTICAL, not merely close. The old form stored x[i] * s
+ * and read it back; an fp32 product is exactly representable in fp32, so the
+ * store and reload changed nothing, and the subtraction is the same two
+ * operands either way. scale = 1.0f is an exact identity, which is what makes
+ * softmax() a wrapper rather than a second implementation.
+ *
+ * ⛔ A NEGATIVE OR ZERO SCALE WOULD BREAK THE max IDENTITY. Attention's is
+ * 1/sqrt(head_dim); the wrapper's is 1.
+ */
+static void softmax_scaled(float *x, int n, float scale)
 {
 	float mx, sum = 0.0f;
 	int i = 0;
@@ -2505,6 +2524,7 @@ static void softmax(float *x, int n)
 		float32x4_t mv = vdupq_n_f32(x[0]);
 		float32x4_t s0 = vdupq_n_f32(0.0f);
 		float32x4_t s1 = vdupq_n_f32(0.0f);
+		float32x4_t sv = vdupq_n_f32(scale);
 		float32x4_t mxv, iv;
 		float inv;
 
@@ -2514,12 +2534,13 @@ static void softmax(float *x, int n)
 		for (; i < n; i++)
 			if (x[i] > mx)
 				mx = x[i];
+		mx *= scale;
 		mxv = vdupq_n_f32(mx);
 		for (i = 0; i + 8 <= n; i += 8) {
-			float32x4_t a = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i),
-							        mxv));
-			float32x4_t b = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i + 4),
-							        mxv));
+			float32x4_t a = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i), sv), mxv));
+			float32x4_t b = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i + 4), sv), mxv));
 
 			vst1q_f32(x + i, a);
 			vst1q_f32(x + i + 4, b);
@@ -2528,7 +2549,7 @@ static void softmax(float *x, int n)
 		}
 		sum = vaddvq_f32(vaddq_f32(s0, s1));
 		for (; i < n; i++) {
-			x[i] = expf(x[i] - mx);
+			x[i] = expf(x[i] * scale - mx);
 			sum += x[i];
 		}
 		inv = 1.0f / sum;
@@ -2544,12 +2565,18 @@ static void softmax(float *x, int n)
 	for (i = 1; i < n; i++)
 		if (x[i] > mx)
 			mx = x[i];
+	mx *= scale;
 	for (i = 0; i < n; i++) {
-		x[i] = expf(x[i] - mx);
+		x[i] = expf(x[i] * scale - mx);
 		sum += x[i];
 	}
 	for (i = 0; i < n; i++)
 		x[i] /= sum;
+}
+
+static void softmax(float *x, int n)
+{
+	softmax_scaled(x, n, 1.0f);
 }
 
 /*
@@ -5034,17 +5061,23 @@ struct attn_npu {
  * handle -- so neither sizes the other's buffers for the cache syncs -- moved
  * it again within the same day:
  *
- *     tokens     52     102     202     452     852
- *     NPU/CPU  1.196   1.174   1.108   1.002   0.916
+ *     tokens      52     102     202     452     852    crossover
+ *     two handles  1.196   1.174   1.108   1.002   0.916    ~452
+ *     in place     1.204   1.162   1.092   0.977   0.886    ~402
  *
- * Crossover about 452 tokens now, on Llama-3.2-1B, head_dim 64, three repeats
- * an arm, alternating, one boot, clock pinned.
+ * Llama-3.2-1B, head_dim 64, three repeats an arm, alternating, one boot,
+ * clock pinned. It was ~680 before the two handles and ~768 was the threshold
+ * then; the number below has been re-derived twice in one day.
  *
- * ⚠ THE DEFAULT IS 512 AND NOT 452 ON PURPOSE. One model, one boot. Above the
- * measured crossing with margin, so `auto` cannot make a short prompt worse
- * while the number rests on a single curve. It was 768 against a crossing of
- * 680 an hour earlier; if this arm gets faster again, re-measure rather than
- * scaling the old number.
+ * ⚠ AND IT IS STAYING AT 512 THIS TIME, WHICH IS A DECISION AND NOT AN
+ * OVERSIGHT. 512 was 13% above the crossing when it was chosen and is now
+ * 27% above it, so `auto` leaves the 402..512 band on the CPU arm -- where
+ * the measured gap is 2.3% at 452, which is inside a single length's spread.
+ * Against that: this curve is one model, gemma-3 crosses far earlier, and a
+ * model that crosses LATER than Llama would be the one a tight threshold
+ * hurts. Buying 2% on a narrow band is not worth spending the margin.
+ *
+ * ⚠ If this arm gets faster again, re-measure. Do not scale this number.
  *
  * ⚠ AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
  * the NPU arm ahead at head_dim 256 -- with the SLOWER code. That inference
@@ -5520,13 +5553,13 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 			? pos + 1 - j->n_swa : 0;
 		int t;
 
-		/* ⚠ the scale the CPU arm applies inside attn_dot, applied
-		 * here on the way past */
+		/* ⚠ the scale the CPU arm applies inside attn_dot rides
+		 * along inside the softmax here -- see softmax_scaled. It was
+		 * a pass of its own over the row, and the row is the context
+		 * length. */
 		for (t = 0; t < tlo; t++)
 			sr[t] = 0.0f;
-		for (t = tlo; t <= pos; t++)
-			sr[t] *= j->scale;
-		softmax(sr + tlo, pos + 1 - tlo);
+		softmax_scaled(sr + tlo, pos + 1 - tlo, j->scale);
 		/*
 		 * ⚠⚠ AND THE TAIL IS NOT ZEROED HERE ANY MORE. It used to be
 		 * `for (t = pos + 1; t < npad; t++) sr[t] = 0.0f`, which is
