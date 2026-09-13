@@ -51,6 +51,10 @@ struct charsiu_fp16 {
 	 * rather than per call -- the two differ by a factor of the CONTEXT
 	 * LENGTH, because the values matmul contracts over the whole of it */
 	unsigned long long packel, trisk, partial;
+	/* which handle this is, when a caller runs more than one -- the
+	 * attention mirror runs two, one a matmul, so that two stage tables
+	 * in a log can be told apart */
+	const char *name;
 	struct charsiu_fp16_times t;
 	/* what is currently sitting in the coefficient buffer, so a group
 	 * that asks for the same shapes twice does not build it twice */
@@ -242,6 +246,19 @@ struct charsiu_fp16 *charsiu_fp16_open_on(struct charsiu_device *dev)
 	f->dev = dev;
 	f->borrowed = 1;
 	return f;
+}
+
+/* the device this handle runs on, so a caller can open a SECOND handle on it
+ * rather than a second file. See the two-handle note in struct attn_npu. */
+void charsiu_fp16_name(struct charsiu_fp16 *f, const char *name)
+{
+	if (f)
+		f->name = name;
+}
+
+struct charsiu_device *charsiu_fp16_device(struct charsiu_fp16 *f)
+{
+	return f ? f->dev : NULL;
 }
 
 struct charsiu_fp16 *charsiu_fp16_open(void)
@@ -523,8 +540,9 @@ static void fp16_report(const struct charsiu_fp16 *f)
 
 	if (!f->calls)
 		return;
-	fprintf(stderr, "charsiu fp16: %lu calls, %lu submits, %lu refused;"
-		" %.0f ms accounted\n", f->calls, f->submits, f->refused, tot);
+	fprintf(stderr, "charsiu fp16 %s: %lu calls, %lu submits, %lu"
+		" refused; %.0f ms accounted\n", f->name ? f->name : "-",
+		f->calls, f->submits, f->refused, tot);
 	if (tot <= 0.0)
 		return;
 	fprintf(stderr, "charsiu fp16:  plan %.0f  wcopy %.0f  pack %.0f"

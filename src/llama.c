@@ -4860,7 +4860,28 @@ static const char *const an_reason[AN_R_N] = {
 };
 
 struct attn_npu {
-	struct charsiu_fp16 *f;
+	/*
+	 * ⚠⚠ TWO HANDLES ON ONE DEVICE, AND THE REASON IS THE CACHE SYNCS.
+	 *
+	 * charsiu_bo_prep and _fini are dma_sync over a WHOLE buffer object,
+	 * and charsiu_fp16's `want` grows its five buffers and never shrinks
+	 * them -- so one handle serving both attention matmuls sizes every
+	 * buffer for the larger of the two shapes and then syncs that size for
+	 * both. At 852 tokens the scores group needs 393 kB of input and pays
+	 * for 5.2 MB; the values group needs 655 kB of output and pays for
+	 * 8.6 MB. Thirteen times, each way, four syncs a call.
+	 *
+	 * This is the third time the tree has met it -- round 318's shared
+	 * output buffer and round 366's per-device sizing are the same
+	 * sentence -- and the fix is the same one: give each shape its own
+	 * buffer object. charsiu_fp16_open_on borrows the device, so the
+	 * second handle costs no second file descriptor.
+	 *
+	 * ⚠ THE K SURFACES BELONG TO f AND THE V SURFACES TO fv, because a
+	 * job names the buffers it reads by handle and a handle is per file.
+	 */
+	struct charsiu_fp16 *f;        /* the scores matmul: q . K */
+	struct charsiu_fp16 *fv;       /* the values matmul: p . V */
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
 	unsigned n_layer, nkv, hd, nk, kv, mmax;
 	/*
@@ -5082,15 +5103,19 @@ static void attn_npu_free(struct attn_npu *a)
 				fprintf(stderr, "charsiu:   %-12s %lu\n",
 					an_reason[r], a->refused[r]);
 	}
-	if (a->f) {
-		for (i = 0; i < a->n_layer * a->nkv; i++) {
-			if (a->kb)
-				charsiu_fp16_w_free(a->f, a->kb[i]);
-			if (a->vb)
-				charsiu_fp16_w_free(a->f, a->vb[i]);
-		}
-		charsiu_fp16_close(a->f);
+	for (i = 0; a->f && i < a->n_layer * a->nkv; i++) {
+		if (a->kb)
+			charsiu_fp16_w_free(a->f, a->kb[i]);
+		if (a->vb)
+			charsiu_fp16_w_free(a->fv, a->vb[i]);
 	}
+	/* ⚠ fv FIRST. It BORROWS f's device, and charsiu_fp16_close on the
+	 * owner closes that device -- the other order frees fv's buffer
+	 * objects through a file descriptor that is already shut. */
+	if (a->fv)
+		charsiu_fp16_close(a->fv);
+	if (a->f)
+		charsiu_fp16_close(a->f);
 	free(a->kb);
 	free(a->vb);
 	free(a->lhd);
@@ -5210,6 +5235,15 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->f = charsiu_fp16_open_on(charsiu_npu_device(s->pool.dev));
 	if (!a->f)
 		a->f = charsiu_fp16_open();   /* no pool: the probes' path */
+	if (a->f) {
+		a->fv = charsiu_fp16_open_on(charsiu_fp16_device(a->f));
+		charsiu_fp16_name(a->f, "scores");
+		charsiu_fp16_name(a->fv, "values");
+		if (!a->fv) {
+			charsiu_fp16_close(a->f);
+			a->f = NULL;
+		}
+	}
 	if (!a->f)
 		return NULL;
 	nbuf = a->n_layer * a->nkv;
@@ -5223,7 +5257,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		unsigned lhd = a->lhd[i / a->nkv];
 
 		a->kb[i] = charsiu_fp16_w_alloc(a->f, lhd, a->nk);
-		a->vb[i] = charsiu_fp16_w_alloc(a->f, a->kv, lhd);
+		a->vb[i] = charsiu_fp16_w_alloc(a->fv, a->kv, lhd);
 		if (!a->kb[i] || !a->vb[i]) {
 			fprintf(stderr, "charsiu: the fp16 KV mirror ran out "
 				"at buffer %u of %u\n", i, nbuf);
@@ -5310,7 +5344,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		kv = a->kvmax;
 
 	for (i = 0; i < a->n_layer * a->nkv; i++) {
-		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->f, kv,
+		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->fv, kv,
 							a->lhd[i / a->nkv]);
 
 		if (!w) {
@@ -5318,7 +5352,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 				"grow to %u positions\n", kv);
 			return -1;
 		}
-		charsiu_fp16_w_free(a->f, a->vb[i]);
+		charsiu_fp16_w_free(a->fv, a->vb[i]);
 		a->vb[i] = w;
 	}
 	a->kv = kv;
@@ -5571,7 +5605,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	if (a->dirty[j->l]) {
 		for (i = 0; i < a->nkv; i++) {
 			charsiu_fp16_w_end(a->f, a->kb[j->l * a->nkv + i]);
-			charsiu_fp16_w_end(a->f, a->vb[j->l * a->nkv + i]);
+			charsiu_fp16_w_end(a->fv, a->vb[j->l * a->nkv + i]);
 		}
 		a->dirty[j->l] = 0;
 	}
@@ -5658,7 +5692,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].n = hd;
 		}
 		tg0 = attn_npu_now_ms();
-		if (charsiu_fp16_matmul_group(a->f, op, H)) {
+		if (charsiu_fp16_matmul_group(a->fv, op, H)) {
 			a->fallbacks++;
 			return -1;
 		}

@@ -376,6 +376,10 @@ struct charsiu_fp16 *charsiu_fp16_open(void);
  * never submitted anything. Anything with a device of its own should lend it.
  */
 struct charsiu_fp16 *charsiu_fp16_open_on(struct charsiu_device *dev);
+/* the device a handle runs on, for opening a second handle beside it */
+struct charsiu_device *charsiu_fp16_device(struct charsiu_fp16 *f);
+/* a name for this handle's stage table, when a caller runs more than one */
+void charsiu_fp16_name(struct charsiu_fp16 *f, const char *name);
 struct charsiu_device *charsiu_npu_device(struct charsiu_npu *g);
 void charsiu_fp16_close(struct charsiu_fp16 *f);
 size_t charsiu_fp16_wbytes(unsigned k, unsigned n);
