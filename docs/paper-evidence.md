@@ -222,6 +222,34 @@ Residuals are inside 2% of each point beyond 200 tokens on both curves; the
 5-11% at the short end is the chunk stepping, which a smooth curve cannot
 follow (1h).
 
+⛔⛔ **THE 6.0x IS NOT SUPPORTED BY THIS DATA AND NOTHING SHOULD BE BUILT ON
+IT.** A fit can describe a curve to 2% and still not determine its individual
+coefficients, and this one does not. Two independent readings say so:
+
+- **The same configuration, two boots.** 1j re-ran the `CHARSIU_ATTN_NPU=0`
+  ladder, which is exactly this row, and fitted `196.4 / 5.278 / 0.004974`
+  against the `187.9 / 5.456 / 0.004483` here -- an **11% swing in c** between
+  curves that agree to 3% point by point. Over eight points the three
+  parameters trade against each other; a lower c is bought with a higher b.
+- **The marginal, which does not trade them.** `(T(n2)-T(n1))/(n2-n1)` is
+  `b + 2cn`, so the slope of the marginal column is `2c` and it is local.
+  Taken from 200 tokens up it puts the ratio at **1.6x**; taken from 100
+  tokens up, at **19x**. One vendor point -- their 135 token reading, the
+  worst residual in their own curve at +5.3% -- moves it by a factor of
+  twelve.
+
+🏁 **The direction survives and the magnitude does not.** Our prefill grows
+faster with length than theirs: we are ahead at 202 tokens and behind at 852,
+which is a fact about the measured points and needs no fit at all. "Six times"
+is an artefact.
+
+⚠ **This matters beyond a number.** "The quadratic term is the whole deficit
+and theirs is six times smaller" organised months of work, and 1i is named
+after it. What that work produced stands -- the attention arm is real and 1j
+measures it -- but the TARGET it was aimed at was never determined. The
+comparison that is determined is the point-by-point one in 1j, and the plan
+that follows from it is stage costs, not coefficients.
+
 🏁 **Our per-token linear rate is 12% BETTER than theirs.** ⛔ The withdrawn
 "the vendor is 1.23x faster per prompt token" was not merely unsupported --
 **it had the sign backwards.** Two points a side, taken over two different
@@ -565,10 +593,15 @@ that the default is not optimal at every length, which is enough to stop
 quoting a single TTFT figure as if chunking were settled, and not enough to
 change anything.
 
-### 1i. Why our quadratic term is six times theirs: attention is on the CPU
+### 1i. Why our quadratic term is larger than theirs: attention is on the CPU
+
+⚠ **This section was called "six times theirs" and that factor is withdrawn --
+see 1b-ii.** The fitted coefficients do not determine it; the direction is
+sound and the magnitude is not. Everything below is about the direction, which
+is what it actually establishes.
 
 1b-ii left one question: the prefill curves differ mostly in the `n^2` term,
-0.004483 against 0.000743 ms/tok^2, and the `n^2` term is attention. The batched
+0.004483 against 0.000743 ms/tok^2 as fitted, and the `n^2` term is attention. The batched
 stage table answers it directly. Llama-3.2-1B, 852 tokens, CPU pinned:
 
 ```

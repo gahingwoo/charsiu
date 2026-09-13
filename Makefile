@@ -46,6 +46,12 @@ $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# ⚠ AND STATICALLY, FOR THE BOARD. tools/cmp_vendor.py needs this emitter and
+# the vendor's .rkllm in the same place, and the .rkllm is 1.3 GB on a board
+# whose desk has 2.5 GB free -- so the diff runs there, not here.
+$(BUILD)/emit_job.aarch64: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
 # ⚠ THE OTHER m > 1 PROBE, AND IT HAD NO NATIVE TARGET AT ALL.
 #
 # npu_gemm_test asks the hardware for the raw int32 accumulator and reads it
