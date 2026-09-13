@@ -5061,21 +5061,22 @@ struct attn_npu {
  * handle -- so neither sizes the other's buffers for the cache syncs -- moved
  * it again within the same day:
  *
- *     tokens      52     102     202     452     852    crossover
- *     two handles  1.196   1.174   1.108   1.002   0.916    ~452
- *     in place     1.204   1.162   1.092   0.977   0.886    ~402
+ *     tokens      52     102     202     302     452     852   crossover
+ *     first        1.202   1.182   1.133     -     1.043   0.967    ~680
+ *     two handles  1.196   1.174   1.108     -     1.002   0.916    ~452
+ *     in place     1.204   1.162   1.092     -     0.977   0.886    ~402
+ *     final        1.207   1.153   1.087   1.035   0.964   0.864    ~376
  *
  * Llama-3.2-1B, head_dim 64, three repeats an arm, alternating, one boot,
- * clock pinned. It was ~680 before the two handles and ~768 was the threshold
- * then; the number below has been re-derived twice in one day.
+ * clock pinned. The threshold has been re-derived from this curve four times
+ * in one day, which is the point: it is a DATED NUMBER, not a derived one.
  *
- * ⚠ AND IT IS STAYING AT 512 THIS TIME, WHICH IS A DECISION AND NOT AN
- * OVERSIGHT. 512 was 13% above the crossing when it was chosen and is now
- * 27% above it, so `auto` leaves the 402..512 band on the CPU arm -- where
- * the measured gap is 2.3% at 452, which is inside a single length's spread.
- * Against that: this curve is one model, gemma-3 crosses far earlier, and a
- * model that crosses LATER than Llama would be the one a tight threshold
- * hurts. Buying 2% on a narrow band is not worth spending the margin.
+ * ⚠ 448 IS THE NEAREST ROUND NUMBER BELOW THE SHORTEST LENGTH MEASURED TO
+ * WIN. At 452 tokens the NPU arm is 3.6% ahead; at 302 it is 3.5% behind. The
+ * cost of a threshold that is too high and one that is too low are the same
+ * size, so the best one is the crossing itself and the only reason to sit
+ * above it is that this is one model. gemma-3 crosses near 250, so head_dim
+ * 64 is the latest crosser measured -- which is what r395's axis predicts.
  *
  * ⚠ If this arm gets faster again, re-measure. Do not scale this number.
  *
@@ -5093,7 +5094,7 @@ static unsigned attn_npu_min_tokens(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_NPU_MIN");
 
-		v = e && *e ? atol(e) : 512;
+		v = e && *e ? atol(e) : 448;
 		if (v < 0)
 			v = 0;
 	}
