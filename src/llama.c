@@ -5101,7 +5101,47 @@ static unsigned attn_npu_min_tokens(void)
 	return (unsigned)v;
 }
 
-/* 0 off, 1 on for every layer, 2 decide per call on the prompt's length */
+/*
+ * ⭐ AND auto IS THE DEFAULT NOW, WHICH IS THE FIRST TIME THIS ARM HAS BEEN ON
+ * WITHOUT BEING ASKED FOR.
+ *
+ * Ten models on one board, 852 token prompt, clock pinned, auto against the
+ * CPU arm. Leading with the one that did not win:
+ *
+ *     Phi-3.5-mini       -0.3%      SmolLM2-135M      +12.9%
+ *     SmolLM2-1.7B       +2.3%      tinyllama-1.1B    +17.0%
+ *     Llama-3.2-1B Q4_0 +13.2%      Qwen2.5-1.5B      +17.5%
+ *     Llama-3.2-1B Q8_0 +13.5%      gemma-3-1b        +19.8%
+ *                                   gemma-4-E2B       +28.5%
+ *                                   Qwen3-0.6B        +28.6%
+ *
+ * The gain tracks attention's SHARE of the prompt, which is why the two that
+ * do not move are the two largest models: their matmuls dominate. Nothing
+ * loses outside noise, every one is text identical to the CPU arm, and none
+ * of the ten refuses a single layer.
+ *
+ * ⚠ AND THE TWO THINGS A DEFAULT HAS TO ANSWER THAT SPEED DOES NOT:
+ *
+ *   quality  perplexity on tests/corpus/long.txt, batched, Llama-3.2-1B Q4_0:
+ *            40.9987 off, 40.9213 on, reproduced exactly twice. Deterministic,
+ *            so that is a numerics difference and not an improvement to claim
+ *            -- but it is not a cost either, which is the question.
+ *   memory   peak 1474 -> 1459 MB on Llama, 2671 -> 2670 on gemma-4.
+ *
+ * ⚠ BELOW THE THRESHOLD auto AND off RUN THE SAME CODE. attn_npu_get returns
+ * NULL before the mirror is built, so a short prompt is not "about the same
+ * speed", it is the same path. That is what makes a default defensible from
+ * one board: the change is confined to prompts long enough to have been
+ * measured winning.
+ *
+ * ⚠ AND IT ONLY REACHES A CALLER THAT SAYS HOW LONG THE PROMPT IS. `auto`
+ * needs llama_prefill_hint; a tool that does not call it gets 0 and stays on
+ * the CPU arm. That is a deliberate rollout and not an oversight.
+ *
+ * CHARSIU_ATTN_NPU=0 turns it off, =1 forces it on at every length.
+ *
+ * 0 off, 1 on for every layer, 2 decide per prompt on its length.
+ */
 static int attn_npu_want_for(unsigned head_dim)
 {
 	static int v = -2;
@@ -5110,7 +5150,7 @@ static int attn_npu_want_for(unsigned head_dim)
 		const char *e = getenv("CHARSIU_ATTN_NPU");
 
 		if (!e || !*e)
-			v = 0;
+			v = 2;
 		else if (!strcmp(e, "auto"))
 			v = 2;
 		else
