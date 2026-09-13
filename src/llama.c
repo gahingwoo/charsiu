@@ -5210,6 +5210,99 @@ static int kv_bits(void)
 	return v;
 }
 
+/*
+ * ⚠⚠ AND THE V SURFACE'S SCALE LIVES ON THE OTHER AXIS, which is what r406
+ * flagged and what this answers.
+ *
+ * The coefficient buffer holds one scale per OUTPUT CHANNEL. For the scores
+ * matmul the output channels are POSITIONS, so kv_round above -- one scale a
+ * position, shared across head_dim -- is exactly right. For the values matmul
+ * they are HEAD_DIM INDICES: one scale per index, shared across every position
+ * in the context. A scale shared across a whole context is far coarser than
+ * one shared across 64 elements of one position, and V's magnitude varies with
+ * position, so r406's values row was a LOWER BOUND on the damage.
+ *
+ * This simulates the real axis. It keeps the unrounded V in a shadow, tracks a
+ * running absmax per channel, and when a channel's max GROWS it re-rounds
+ * every earlier position of that channel from the shadow -- which is what a
+ * real surface would do, because it would have to repack when its scale moved.
+ * The shadow is why: the cache itself holds rounded values by then, and
+ * re-rounding a rounded value is not the same operation.
+ *
+ * ⚠ It is a simulation and it makes nothing faster. CHARSIU_KV_V_AXIS=chan.
+ */
+static int kv_v_chan(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_KV_V_AXIS")
+		    && !strcmp(getenv("CHARSIU_KV_V_AXIS"), "chan");
+	return v;
+}
+
+struct kv_chan {
+	float *orig;       /* the unrounded V, same shape as vcache */
+	float *mx;         /* [n_layer][nkv][hd] running absmax */
+	size_t cells;
+};
+
+static struct kv_chan g_kvc;
+
+static void kv_round_chan(struct llama_state *s, const struct llama_model *m,
+			  uint32_t l, uint32_t kh, unsigned hd,
+			  unsigned hdmax, int pos, const float *src, int bits)
+{
+	size_t base = ((size_t)(l * m->n_head_kv + kh) * s->n_ctx);
+	float *mx;
+	unsigned d;
+	int lv = (1 << (bits - 1)) - 1;
+
+	if (!g_kvc.orig) {
+		g_kvc.cells = (size_t)m->n_layer * m->n_head_kv
+			    * s->n_ctx * hdmax;
+		g_kvc.orig = calloc(g_kvc.cells, sizeof(float));
+		g_kvc.mx = calloc((size_t)m->n_layer * m->n_head_kv * hdmax,
+				  sizeof(float));
+		if (!g_kvc.orig || !g_kvc.mx)
+			return;
+	}
+	mx = g_kvc.mx + (size_t)(l * m->n_head_kv + kh) * hdmax;
+	memcpy(g_kvc.orig + (base + pos) * hdmax, src, hd * sizeof(float));
+	for (d = 0; d < hd; d++) {
+		float a = src[d] < 0.0f ? -src[d] : src[d];
+		int grew = a > mx[d];
+
+		if (grew)
+			mx[d] = a;
+		if (mx[d] == 0.0f)
+			continue;
+		/* ⚠ EVERY EARLIER POSITION OF THIS CHANNEL, from the shadow.
+		 * A real surface repacks when its scale moves, and the cache
+		 * holds rounded values by now. */
+		if (grew) {
+			float sc = mx[d] / (float)lv, inv = 1.0f / sc;
+			int q;
+
+			for (q = 0; q < pos; q++) {
+				float o = g_kvc.orig[(base + q) * hdmax + d];
+				float t = o * inv;
+				int r = (int)(t < 0.0f ? t - 0.5f : t + 0.5f);
+
+				s->vcache[(base + q) * hdmax + d] =
+					(float)r * sc;
+			}
+		}
+		{
+			float sc = mx[d] / (float)lv;
+			float t = src[d] / sc;
+			int r = (int)(t < 0.0f ? t - 0.5f : t + 0.5f);
+
+			s->vcache[(base + pos) * hdmax + d] = (float)r * sc;
+		}
+	}
+}
+
 static void kv_round(float *dst, const float *src, unsigned hd, int bits)
 {
 	float mx = 0.0f, sc, inv;
@@ -7277,8 +7370,15 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					if (kv_bits()) {
 						kv_round(s->kcache + off, ks,
 							 hd, kv_bits());
-						kv_round(s->vcache + off, vs,
-							 hd, kv_bits());
+						if (kv_v_chan())
+							kv_round_chan(s, m, l,
+								kh, hd, hdmax,
+								pos, vs,
+								kv_bits());
+						else
+							kv_round(s->vcache
+								 + off, vs, hd,
+								 kv_bits());
 						ks = s->kcache + off;
 						vs = s->vcache + off;
 					} else {
@@ -7948,10 +8048,24 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 					      * s->n_ctx + pos) * hdmax;
 
 				if (kv_bits()) {
+					/* ⚠ THE TOKEN LOOP TOO. The first
+					 * version patched only the batched
+					 * path, and charsiu_ppl without
+					 * --batch runs THIS one -- so the
+					 * per-channel arm returned its control
+					 * to the last digit, which is what an
+					 * arm that never ran looks like. */
 					kv_round(s->kcache + off,
 						 s->k + kh * hd, hd, kv_bits());
-					kv_round(s->vcache + off,
-						 s->v + kh * hd, hd, kv_bits());
+					if (kv_v_chan())
+						kv_round_chan(s, m, l, kh, hd,
+							      hdmax, pos,
+							      s->v + kh * hd,
+							      kv_bits());
+					else
+						kv_round(s->vcache + off,
+							 s->v + kh * hd, hd,
+							 kv_bits());
 				} else {
 				memcpy(s->kcache + off, s->k + kh * hd,
 				       hd * sizeof(float));
