@@ -5771,6 +5771,12 @@ static int attn_npu_layer(struct attn_block_job *j)
 			a->fallbacks++;
 			return -1;
 		}
+		/* ⚠ THE VALUES PACK HAS NOW FINISHED READING THE SCORES, and
+		 * this is the only moment at which the next call's sentinels
+		 * can be written: after the softmax stopped overwriting them
+		 * and before the buffer goes back to the device. It saves two
+		 * whole-buffer dma_syncs a call. */
+		charsiu_fp16_poison_and_release(a->f);
 		a->t_pack2 += attn_npu_now_ms() - tg0;
 	}
 	a->layers++;

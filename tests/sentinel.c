@@ -38,6 +38,50 @@ static void expect(const char *what, int got, int want,
 	fail = 1;
 }
 
+/*
+ * The predicate that decides whether the buffer is still poisoned for this
+ * group. It is the one piece of the early-sentinel path that fails SILENTLY:
+ * a wrong yes leaves no sentinels, the readback then finds live data and
+ * reports a healthy job, which is what it reports for a healthy job.
+ */
+static void matches(void)
+{
+	size_t off[3]  = { 0, 8192, 24576 };
+	unsigned m[3]  = { 78, 78, 78 }, n[3] = { 864, 864, 864 };
+	size_t poff[3] = { 0, 8192, 24576 };
+	unsigned pm[3] = { 78, 78, 78 }, pn[3] = { 864, 864, 864 };
+	unsigned ok = 0, cases = 0;
+
+#define WANT(w, what) do {                                              \
+	int got = charsiu_poison_matches(3, off, m, n, 3, poff, pm, pn);\
+	cases++;                                                        \
+	if (got == (w)) { ok++; printf("  ok    %-32s %d\n", what, got); }\
+	else { printf("  FAIL  %-32s %d want %d\n", what, got, (w));    \
+	       fail = 1; }                                              \
+} while (0)
+
+	printf("== the early-sentinel predicate\n");
+	WANT(1, "everything the same");
+	m[1] = 77;   WANT(0, "one op's m moved");       m[1] = 78;
+	n[2] = 880;  WANT(0, "one op's n moved");       n[2] = 864;
+	off[0] = 4096; WANT(0, "one op's offset moved"); off[0] = 0;
+	WANT(1, "and back again");
+	cases++;
+	if (charsiu_poison_matches(2, off, m, n, 3, poff, pm, pn) == 0) {
+		ok++; printf("  ok    %-32s 0\n", "fewer ops than poisoned");
+	} else {
+		printf("  FAIL  fewer ops than poisoned\n"); fail = 1;
+	}
+	cases++;
+	if (charsiu_poison_matches(0, off, m, n, 0, poff, pm, pn) == 0) {
+		ok++; printf("  ok    %-32s 0\n", "no ops at all");
+	} else {
+		printf("  FAIL  no ops at all\n"); fail = 1;
+	}
+#undef WANT
+	printf("sentinel: %u of %u predicate cases as expected\n", ok, cases);
+}
+
 int main(void)
 {
 	const unsigned shape[][2] = { {1, 1}, {1, 4096}, {160, 864},
@@ -86,6 +130,7 @@ int main(void)
 
 		free(o);
 	}
+	matches();
 	printf("sentinel: %s\n", fail ? "FAILED" : "ok");
 	return fail;
 }

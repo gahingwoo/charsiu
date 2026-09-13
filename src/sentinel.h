@@ -53,4 +53,42 @@ static inline int charsiu_poison_verdict(const uint32_t *o, unsigned m,
 	return live ? 0 : -1;
 }
 
+/*
+ * ⚠⚠ IS THE BUFFER STILL POISONED FOR EXACTLY THIS GROUP?
+ *
+ * The sentinels can be written early -- once the previous group's answers have
+ * been read -- so that the release's cache flush carries them and the next
+ * group skips a prep and a fini of the whole output buffer. That is only sound
+ * while the shapes repeat, and this is the predicate that decides.
+ *
+ * ⛔ GETTING IT WRONG IS SILENT. If it says yes when the sentinels are not
+ * there, the readback reads whatever was in the buffer, finds it is not
+ * poison, and reports a healthy job -- which is what it would report for a
+ * healthy job. The check would simply stop being a check, and nothing in a
+ * log would say so. That is why it is a testable function and not four
+ * conditions inside a loop.
+ *
+ * Offsets alone are NOT enough: a sentinel sits at o[r * n] for r < m, so a
+ * group with the same regions and a different m or n inspects words nobody
+ * wrote.
+ */
+static inline int charsiu_poison_matches(unsigned nops,
+					 const size_t *ooff,
+					 const unsigned *m,
+					 const unsigned *n,
+					 unsigned pnops,
+					 const size_t *pooff,
+					 const unsigned *pm,
+					 const unsigned *pn)
+{
+	unsigned i;
+
+	if (!nops || nops != pnops)
+		return 0;
+	for (i = 0; i < nops; i++)
+		if (ooff[i] != pooff[i] || m[i] != pm[i] || n[i] != pn[i])
+			return 0;
+	return 1;
+}
+
 #endif /* CHARSIU_SENTINEL_H */

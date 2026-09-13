@@ -50,7 +50,7 @@ struct charsiu_fp16 {
 	/* elements converted by the pack, so `pack` can be read per element
 	 * rather than per call -- the two differ by a factor of the CONTEXT
 	 * LENGTH, because the values matmul contracts over the whole of it */
-	unsigned long long packel, trisk, partial;
+	unsigned long long packel, trisk, partial, preskip, prewrote;
 	/* which handle this is, when a caller runs more than one -- the
 	 * attention mirror runs two, one a matmul, so that two stage tables
 	 * in a log can be told apart */
@@ -65,6 +65,16 @@ struct charsiu_fp16 {
 	 * held open for a caller reading the answers where they lie */
 	struct charsiu_fp16_plan last;
 	int held;
+	/*
+	 * ⚠ THE SENTINELS FOR THE NEXT CALL, IF A CALLER WROTE THEM EARLY.
+	 *
+	 * `last` records every op's offset but osz is m * n * 4, which does
+	 * not say which m and which n -- and the row sentinel sits at
+	 * o[r * n] for r < m, so both are needed to know what was poisoned
+	 * and whether the next call's shapes still match it.
+	 */
+	unsigned pm[FP16_GROUP_MAX], pn[FP16_GROUP_MAX];
+	int prepoisoned;
 };
 
 static double now_ms(void)
@@ -568,6 +578,10 @@ static void fp16_report(const struct charsiu_fp16 *f)
 			" each (%s arm)\n", f->packel,
 			f->t.pack * 1e6 / (double)f->packel,
 			pack_vector() ? "vector" : "scalar");
+	if (f->preskip || f->prewrote)
+		fprintf(stderr, "charsiu fp16:  the sentinels were already in"
+			" the buffer for %llu of %llu groups\n", f->preskip,
+			f->preskip + f->prewrote);
 	if (f->trisk)
 		fprintf(stderr, "charsiu fp16:  %llu of them memset as the"
 			" causal tail (%.0f%%)\n", f->trisk,
@@ -771,6 +785,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	struct charsiu_task task[FP16_GROUP_MAX];
 	struct charsiu_fp16_plan pl;
 	unsigned i, bad = 0, borrowed = 0;
+	int prepoisoned = 0;
 	struct charsiu_joblist jl;
 	uint32_t ins[3 + FP16_GROUP_MAX], outs[1];
 	unsigned nin;
@@ -832,6 +847,27 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	if (want(f, pl.wtot + 4096, pl.itot + 4096, pl.otot + 4096,
 		 pl.ctot + 4096, (size_t)nops * FP16_REG_STRIDE + 4096))
 		return -1;
+	/*
+	 * ⚠ IS THE BUFFER ALREADY POISONED FOR EXACTLY THIS GROUP? Offsets
+	 * alone are not enough: the row sentinel sits at o[r * n] for r < m,
+	 * so a group with the same regions but a different m or n would be
+	 * checking words nobody wrote.
+	 */
+	if (f->prepoisoned) {
+		unsigned om[FP16_GROUP_MAX], on[FP16_GROUP_MAX];
+
+		for (i = 0; i < nops; i++) {
+			om[i] = ops[i].m;
+			on[i] = ops[i].n;
+		}
+		prepoisoned = charsiu_poison_matches(pl.nops, pl.ooff, om, on,
+						     f->last.nops,
+						     f->last.ooff,
+						     f->pm, f->pn);
+	}
+	f->prepoisoned = 0;
+	f->preskip += prepoisoned;
+	f->prewrote += !prepoisoned;
 	f->t.plan += now_ms() - t0;
 
 	/* ONE prep and ONE fini a buffer for the whole group. Cache
@@ -992,14 +1028,16 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	 * so the arms are coherent and a board round can price it in one boot.
 	 */
 	t0 = now_ms();
-	charsiu_bo_prep(f->dev, &f->ob, 1000000000);
-	{
-		struct fp16_ops_ctx qc = { f, ops, &pl, vec, {0}, {0},
-					   {0}, {0}, {0} };
+	if (!prepoisoned) {
+		charsiu_bo_prep(f->dev, &f->ob, 1000000000);
+		{
+			struct fp16_ops_ctx qc = { f, ops, &pl, vec, {0}, {0},
+						   {0}, {0}, {0} };
 
-		fp16_run_ops(fp16_poison_ops, &qc, nops);
+			fp16_run_ops(fp16_poison_ops, &qc, nops);
+		}
+		charsiu_bo_fini(f->dev, &f->ob);
 	}
-	charsiu_bo_fini(f->dev, &f->ob);
 	f->t.poison += now_ms() - t0;
 
 	t0 = now_ms();
@@ -1077,6 +1115,10 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		}
 	}
 	f->last = pl;
+	for (i = 0; i < nops; i++) {
+		f->pm[i] = ops[i].m;
+		f->pn[i] = ops[i].n;
+	}
 	if (borrowed) {
 		f->held = 1;
 	} else {
@@ -1130,7 +1172,54 @@ void charsiu_fp16_release(struct charsiu_fp16 *f)
 	if (f && f->held) {
 		charsiu_bo_fini(f->dev, &f->ob);
 		f->held = 0;
+		f->prepoisoned = 0;
 	}
+}
+
+/*
+ * ⚠⚠ RELEASE, BUT LEAVE THE NEXT CALL'S SENTINELS BEHIND. This exists to
+ * remove two whole-buffer dma_syncs a call, and it has to be a caller-side
+ * entry point rather than something charsiu_fp16_matmul_group does at the end
+ * of itself.
+ *
+ * The output buffer is poisoned before every submit so that "the job wrote
+ * nothing" can be told from "the job computed zero", and doing it in the usual
+ * place costs a prep and a fini of the WHOLE buffer -- 8.6 MB an attention
+ * scores call. Those two go away if the sentinels are already in the buffer
+ * when the release's fini pushes it to the device.
+ *
+ * ⛔ AND THEY CANNOT BE WRITTEN AT THE END OF THE PREVIOUS CALL, which was the
+ * obvious way and is wrong: a row's sentinel is its FIRST WORD, and a caller
+ * that reduces over the answer in place -- which is the only kind of caller
+ * that holds the buffer at all -- writes every word of every row afterwards.
+ * The sentinel has to go in after the caller has finished reading, which only
+ * the caller knows.
+ *
+ * Shapes must repeat for it to pay: matmul_group compares the next plan's
+ * offsets and each op's m and n against what was poisoned, and poisons
+ * normally if anything moved. In attention that is 15 of every 16 calls --
+ * one per layer at a fixed shape, changing only when the chunk does.
+ */
+void charsiu_fp16_poison_and_release(struct charsiu_fp16 *f)
+{
+	unsigned i;
+
+	if (!f || !f->held)
+		return;
+	for (i = 0; i < f->last.nops; i++) {
+		uint32_t *o = (uint32_t *)((uint8_t *)f->ob.map
+					   + f->last.ooff[i]);
+
+		if (fullscan()) {
+			for (unsigned e = 0; e < f->pm[i] * f->pn[i]; e++)
+				o[e] = CHARSIU_POISON;
+		} else {
+			charsiu_poison_rows(o, f->pm[i], f->pn[i]);
+		}
+	}
+	charsiu_bo_fini(f->dev, &f->ob);
+	f->held = 0;
+	f->prepoisoned = 1;
 }
 
 void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,

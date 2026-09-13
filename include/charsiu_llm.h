@@ -510,6 +510,13 @@ const float *charsiu_fp16_out(const struct charsiu_fp16 *f, unsigned i);
  * it lies instead of copying it out first */
 float *charsiu_fp16_out_w(struct charsiu_fp16 *f, unsigned i);
 void charsiu_fp16_release(struct charsiu_fp16 *f);
+/*
+ * Release, but leave the NEXT call's sentinels in the buffer first, so the
+ * next group skips a prep and a fini of the whole thing. Call it once the
+ * held answers have been read; it only pays while the shapes repeat, and
+ * charsiu_fp16_matmul_group checks that they did.
+ */
+void charsiu_fp16_poison_and_release(struct charsiu_fp16 *f);
 
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			      const struct charsiu_fp16_op *ops, unsigned nops);
