@@ -36,24 +36,11 @@
  * Checked against the scalar converter over 464 million float bit patterns
  * spanning the whole 32 bit space: zero differ.
  */
-static inline uint16x4_t charsiu_vhalf(float32x4_t x)
-{
-	uint32x4_t u = vreinterpretq_u32_f32(x);
-	uint32x4_t sign = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(0x8000));
-	int32x4_t exp = vsubq_s32(vreinterpretq_s32_u32(
-					  vandq_u32(vshrq_n_u32(u, 23),
-						    vdupq_n_u32(0xff))),
-				  vdupq_n_s32(112));
-	uint32x4_t man = vandq_u32(u, vdupq_n_u32(0x7fffff));
-	uint32x4_t h = vorrq_u32(sign,
-			 vorrq_u32(vshlq_n_u32(vreinterpretq_u32_s32(exp), 10),
-				   vshrq_n_u32(man, 13)));
-
-	h = vbslq_u32(vcleq_s32(exp, vdupq_n_s32(0)), sign, h);
-	h = vbslq_u32(vcgeq_s32(exp, vdupq_n_s32(0x1f)),
-		      vorrq_u32(sign, vdupq_n_u32(0x7c00)), h);
-	return vmovn_u32(h);
-}
+/* charsiu_f2h_x4 in charsiu.h, next to the scalar definition it has to match.
+ * It lived here as a file static until 09-13, when a second copy of it got
+ * written for the fp16 attention pack before anyone grepped -- one converter
+ * with one exhaustive test (tests/pack_f16run.c) rather than three. */
+#define charsiu_vhalf charsiu_f2h_x4
 
 /*
  * The int8 activation bias, SIXTEEN BYTES AT A TIME, and it is one XOR.

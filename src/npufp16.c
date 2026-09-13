@@ -292,6 +292,21 @@ static int tri_on(void)
 	return v;
 }
 
+/*
+ * ⚠ THE ARM IS NAMED IN BOTH DIRECTIONS. CHARSIU_FP16_FULLSCAN=1 counts every
+ * poisoned word the way this file shipped, =0 stops at the first one that is
+ * not. Same outcome either way; the knob exists so a board round can price the
+ * difference inside one boot.
+ */
+static int fullscan(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_FP16_FULLSCAN", 0);
+	return v;
+}
+
 static int tri_check(void)
 {
 	static int v = -1;
@@ -875,11 +890,36 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	for (i = 0; i < nops; i++) {
 		const uint32_t *o = (const uint32_t *)
 			((const uint8_t *)f->ob.map + pl.ooff[i]);
-		unsigned untouched = 0, cells = ops[i].m * ops[i].n;
+		unsigned cells = ops[i].m * ops[i].n, e = 0;
 
-		for (unsigned e = 0; e < cells; e++)
-			untouched += o[e] == 0xdeadbeefu;
-		if (untouched == cells) {
+		/*
+		 * ⚠⚠ THE QUESTION IS "ARE THEY ALL POISON", AND IT WAS BEING
+		 * ANSWERED BY COUNTING ALL OF THEM.
+		 *
+		 * The loop here read every output word and summed the matches
+		 * before comparing the sum against the cell count, which for
+		 * the scores shape is m * npad words an op and thirty two ops
+		 * a group -- a full scalar pass over the answer, on top of the
+		 * memcpy that follows it. It can stop at the first word that
+		 * is not poison, and that word is the first one unless the op
+		 * really did write nothing.
+		 *
+		 * ⚠ A PARTIALLY written output is still accepted silently, as
+		 * before: the old sum was compared against the whole count and
+		 * never reported anything in between, so short circuiting
+		 * changes no outcome, only what it costs to reach it.
+		 */
+		if (!fullscan()) {
+			while (e < cells && o[e] == 0xdeadbeefu)
+				e++;
+		} else {
+			unsigned untouched = 0;
+
+			for (e = 0; e < cells; e++)
+				untouched += o[e] == 0xdeadbeefu;
+			e = untouched;
+		}
+		if (e == cells) {
 			bad++;
 			continue;              /* this op wrote nothing */
 		}

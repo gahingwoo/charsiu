@@ -289,8 +289,18 @@ static inline uint16_t charsiu_f2h(float f)
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
 
-static inline uint16x4_t charsiu_f2h_x4(uint32x4_t u)
+/*
+ * ⚠ THIS WAS ALREADY IN THE TREE, as a file static `charsiu_vhalf` in
+ * regcmd.c, twenty lines above the prefill pack it was written for -- and a
+ * second one got written here before anyone looked. It is the same arithmetic
+ * to the bit; the two differed only in which of the two selects came last,
+ * which cannot matter because exp cannot be both <= 0 and >= 0x1f. regcmd.c
+ * calls this one now, so there is one vector converter beside the one scalar
+ * definition, which is what the paragraph above claims.
+ */
+static inline uint16x4_t charsiu_f2h_x4(float32x4_t x)
 {
+	uint32x4_t u = vreinterpretq_u32_f32(x);
 	uint32x4_t sign = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(0x8000));
 	int32x4_t  exp  = vsubq_s32(vreinterpretq_s32_u32(
 					vandq_u32(vshrq_n_u32(u, 23),
@@ -314,13 +324,10 @@ static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
 {
 	size_t e = 0;
 
-	for (; e + 8 <= n; e += 8) {
-		uint32x4_t a = vld1q_u32((const uint32_t *)(x + e));
-		uint32x4_t b = vld1q_u32((const uint32_t *)(x + e + 4));
-
-		vst1q_u16(d + e, vcombine_u16(charsiu_f2h_x4(a),
-					      charsiu_f2h_x4(b)));
-	}
+	for (; e + 8 <= n; e += 8)
+		vst1q_u16(d + e,
+			  vcombine_u16(charsiu_f2h_x4(vld1q_f32(x + e)),
+				       charsiu_f2h_x4(vld1q_f32(x + e + 4))));
 	for (; e < n; e++)
 		d[e] = charsiu_f2h(x[e]);
 }
