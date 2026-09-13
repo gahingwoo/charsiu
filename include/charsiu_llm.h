@@ -344,6 +344,32 @@ int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
  * the CONTENTS: a buffer rewritten between two calls at the same address is
  * exactly the misuse this cannot see.
  */
+/*
+ * ⭐⭐ THE SAME MATMUL, BUT THE ANSWER STAYS IN THE DEVICE BUFFER.
+ *
+ * Y is NOT written when these return. It is written by the next
+ * charsiu_npu_matmul* call on this pool -- from just after that call's SUBMIT,
+ * so the gather runs while the next job is on the hardware -- or by
+ * charsiu_npu_flush, whichever comes first.
+ *
+ * r407 is why: the gather is 1.93 ms a row against 1.82 of fence, the largest
+ * line in the prefill and larger than both of attention's fences together, and
+ * the fence is a sleeping ioctl with every core idle. CHARSIU_NPU_NO_READ=1
+ * measured the ceiling for moving it at 5450 ms against 6931.
+ *
+ * ⚠⚠ A MISSED FLUSH IS FLUENT WRONG TEXT, NOT A CRASH. Use these only where
+ * the very next thing is another matmul that does not read Y -- gate before
+ * up, q before k -- and call charsiu_npu_flush before anything reads Y,
+ * including the fallback path where the next matmul never reaches the NPU.
+ *
+ * CHARSIU_NPU_DEFER_READ=0 turns the deferral off and is the control.
+ */
+int  charsiu_npu_matmul_defer(struct charsiu_npu *g, int id, const float *X,
+			      unsigned m, float *Y);
+int  charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
+				   const float *X, unsigned m, float *Y);
+int  charsiu_npu_flush(struct charsiu_npu *g);
+
 int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
 /* how often the declaration was honoured, and how often it had to pack anyway */

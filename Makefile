@@ -262,6 +262,14 @@ $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 $(BUILD)/bench_gather: tools/bench_gather.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# ⚠ AND THE BOARD BUILD, because this tool's OWN HEADER says the host cannot
+# answer its question -- "the host is aarch64 with caches that dwarf the
+# board's ... the ratio is the thing to carry". It had a host rule only, and
+# no board log mentions it, so the one instrument written for the largest line
+# in the prefill had never been run where the argument lives.
+$(BUILD)/bench_gather.aarch64: tools/bench_gather.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
 $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 

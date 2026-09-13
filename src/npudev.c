@@ -244,6 +244,10 @@ struct npu_outbuf {
 	 * never be handed the same one.
 	 */
 	struct charsiu_bo bo[2];
+	/* ⭐ this buffer still holds an answer nobody has gathered: a deferred
+	 * read owns it until npu_flush_pending runs, and batch_outbuf must not
+	 * hand it to another tensor before then */
+	unsigned pending;
 };
 
 struct charsiu_npu {
@@ -615,6 +619,37 @@ struct charsiu_npu {
 				 * takes at the end, over the whole of Y */
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
+	/*
+	 * ⭐⭐ THE ONE TENSOR WHOSE ANSWER IS STILL IN A DEVICE BUFFER.
+	 *
+	 * A caller that has two INDEPENDENT matmuls in a row -- gate and up, q
+	 * and k -- can let the first one's gather happen while the second one's
+	 * job runs, which is 1.93 ms a row of CPU work moved into 1.82 ms a row
+	 * of sleeping fence. Only one is ever outstanding: the flush is the
+	 * first thing the next call does after its own submit.
+	 *
+	 * `bseen` is a SNAPSHOT and not a pointer, because the live array is
+	 * reset per call and this read needs the deferred tensor's own.
+	 */
+	struct {
+		struct npu_outbuf *ob;
+		const struct npu_entry *e;
+		float *Y;
+		unsigned m, dmask;
+		unsigned char *bseen;
+		unsigned bseen_n;
+		/*
+		 * ⚠⚠ AND THE OUTPUT STRIDE, which is set PER CALL --
+		 * g->bout_stride = wide * m * 4 -- and is what the read uses to
+		 * find each slot's region. gate and up happen to share it, so
+		 * the first version of this worked by luck; q and k do not.
+		 * Anything else the deferred read takes off `g` rather than off
+		 * `e` belongs here too.
+		 */
+		size_t bout_stride;
+		int live;
+	} pend;
+	unsigned long bdefer_n, bdefer_done;
 	double balloc_us;	/* the output BO allocation, inside prep */
 	unsigned balloc_n;
 	float *bd1;                /* each row's own quantisation scale */
@@ -1950,10 +1985,18 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 	}
 }
 
+static int npu_flush_pending(struct charsiu_npu *g);
+
 void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
+	/* ⚠ a deferred gather owns a buffer this is about to free, and the
+	 * caller's Y is still unwritten. Finish it before anything goes. */
+	npu_flush_pending(g);
+	free(g->pend.bseen);
+	g->pend.bseen = NULL;
+	g->pend.bseen_n = 0;
 	charsiu_npu_idle(g, 1);
 	if (g->dev[0]) {
 		for (unsigned i = 0; i < g->n_slot; i++) {
@@ -4283,8 +4326,16 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	double ta;
 	size_t want;
 
+	/*
+	 * ⚠⚠ AND NOT ONE THAT STILL OWES A GATHER. gate and up are the same
+	 * shape, so they land on the same entry -- which is exactly the pair
+	 * whose overlap this is for. Skipping a pending entry makes the second
+	 * one allocate its own rather than flushing the first before it has
+	 * even submitted, which would be the whole saving given back.
+	 */
 	for (unsigned i = 0; i < g->n_obuf; i++)
-		if (g->obuf[i].wide == wide && g->obuf[i].slots == slots) {
+		if (g->obuf[i].wide == wide && g->obuf[i].slots == slots &&
+		    !g->obuf[i].pending) {
 			ob = &g->obuf[i];
 			break;
 		}
@@ -5172,8 +5223,305 @@ static int npu_noread(void)
 	return v;
 }
 
+/*
+ * ⭐⭐ ONE DEVICE'S ANSWER, GATHERED OUT OF THE ACCUMULATOR -- AND IT IS A
+ * FUNCTION SO THAT IT CAN RUN LATER THAN THE FENCE THAT RELEASED IT.
+ *
+ * r407 read the prefill's own stage table: the gather is the LARGEST line in
+ * it, 1.93 ms a row against the 1.82 of fence it sits behind, larger than both
+ * of attention's fences together. Every lever on the gather ITSELF has been
+ * measured and lost -- pooling is already on by size, the four row form lost
+ * 2.3x, READ_FUSE 2.3% -- and what none of them touched is WHEN it runs. The
+ * fence is a SLEEPING ioctl (CHARSIU_NPU_SPIN_US is 0 by default), so all four
+ * cores are idle for it, and CHARSIU_NPU_NO_READ=1 measured the ceiling for
+ * moving it: 5450/5422 ms against 6931/6933 at 852 tokens.
+ *
+ * ⚠ IT READS g->bseen, WHICH IS PER CALL. A deferred gather runs inside the
+ * NEXT tensor's call, which has already reset that array for its own slices,
+ * so npu_flush_pending restores a snapshot first. Getting that wrong makes the
+ * first K slice ACCUMULATE onto whatever was in Y instead of assigning it --
+ * a wrong answer that still reads as fluent text.
+ */
+static int batch_read_device(struct charsiu_npu *g,
+			     const struct npu_entry *e,
+			     struct npu_outbuf *ob, unsigned d, float *Y,
+			     unsigned m)
+{
+	double tf;
+	unsigned nt;
+
+	tf = now_us();
+	if (npu_noread()) {
+		/* the ceiling arm: no gather, and Y is garbage */
+	} else {
+		/* ⚠ THE KEY IS m ALONE and that is still right: the
+		 * format and the axis are fixed for the life of a
+		 * pool, so only the width can change under it. */
+		/*
+		 * ⚠⚠ ONE ENTRY PER FOUR CHANNELS, because the read
+		 * order is FOUR CONSECUTIVE SLOTS and always has been.
+		 *
+		 * charsiu_acc_index(r, j+q) == charsiu_acc_index(r, j)
+		 * + q for q of 1, 2 and 3 at every j that is a
+		 * multiple of four: checked at 1503680 groups over
+		 * both formats, m of 2 to 80 and n of 64 to 8192, with
+		 * none broken. The `t % 4` term is the only one that
+		 * moves inside a group of four and it moves by one.
+		 *
+		 * The table was a uint32 per output channel, so the
+		 * gather below read FOUR BYTES OF INDEX FOR EVERY FOUR
+		 * BYTES OF DATA -- half its memory traffic was the
+		 * table. At m = 32 that gather is 368 ms of a 702 ms
+		 * batched matmul and at m = 80 it is 933 of 1746: the
+		 * dominant cost of a batched projection now that the
+		 * hardware part is right.
+		 */
+		if (g->bmap_m != m ||
+		    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
+			unsigned n4 = (g->nmax + 3) / 4;
+			uint32_t *t2 = realloc(g->bmap,
+				(size_t)m * n4 * sizeof(*t2));
+
+			if (!t2) {
+				whine(g, "the read order table would not allocate",
+				      m, g->nmax);
+				return -1;
+			}
+			g->bmap = t2;
+			g->bmap_n4 = n4;
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < n4; j++)
+					g->bmap[(size_t)r * n4 + j] =
+					  (uint32_t)charsiu_acc_index(r, j * 4, m,
+						w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+			g->bmap_m = m;
+			g->bmap_w4 = (unsigned)w4_for(g, e->t);
+			/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
+			g->bmap2 = m % 2 == 0;
+			for (unsigned r = 0; g->bmap2 && r < m; r += 2)
+				for (unsigned j = 0; g->bmap2 && j < n4; j++)
+					if (g->bmap[(size_t)(r + 1) * n4 + j] !=
+					    g->bmap[(size_t)r * n4 + j] + 4) {
+						g->bmap2 = 0;
+						break;
+					}
+			/* read_rows4's premise, read off the table just built */
+			g->bmap4 = m % 4 == 0;
+			for (unsigned r = 0; g->bmap4 && r < m; r += 4)
+				for (unsigned j = 0; g->bmap4 && j < n4; j++)
+					for (unsigned lo = 1; lo < 4; lo++)
+						if (g->bmap[(size_t)(r + lo) * n4 + j] !=
+						    g->bmap[(size_t)r * n4 + j] + lo * 4) {
+							g->bmap4 = 0;
+							break;
+						}
+		}
+		/*
+		 * ⚠⚠ NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
+		 * LOST TWICE.
+		 *
+		 * Round one: 283 ms became 463, and I blamed the table
+		 * being rebuilt inside every dispatch. Round two, with
+		 * the table built once and nothing in the worker but
+		 * the gather: 241 ms became 430. Same 190 ms either
+		 * time, which is what says it is the pool and not the
+		 * work -- 226 dispatches a pass, one per tensor per
+		 * device, at about 0.84 ms of barrier each.
+		 *
+		 * The work per dispatch is one tensor's rows, and there
+		 * is not enough of it to pay for a wakeup. Parallelism
+		 * here would have to be at a coarser grain than a
+		 * tensor, which means the caller's loop rather than
+		 * this one.
+		 */
+		/*
+		 * ⚠ THE FUSED PASS FIRST, and it walks the slots in
+		 * exactly the order the loop below would: n range
+		 * outermost, K slice ascending inside it, which is
+		 * what makes the sum bit identical. Anything it does
+		 * not take -- READ4 on, more than 8 slices on one
+		 * device, a range with a single slice to fuse -- falls
+		 * through to the per slot loop untouched.
+		 */
+		unsigned fused_ni = 0;
+
+		if (g->readfuse && !g->read4 && g->bmap) {
+			unsigned ni;
+
+			for (ni = 0; ni < e->n_slices; ni++) {
+				struct read_fused c;
+				unsigned i, cnt = 0, ntc = 0;
+
+				c.g = g; c.e = e; c.Y = Y; c.m = m;
+				c.s0 = NULL;
+				for (i = 0; i < e->count; i++) {
+					const struct npu_slot *s =
+						&g->slot[e->first + i];
+
+					if (s->di != d)
+						continue;
+					if (i % e->n_slices != ni) {
+						ntc++;
+						continue;
+					}
+					/*
+					 * ⚠ MORE THAN THE ARRAY HOLDS
+					 * MEANS DO NOT FUSE AT ALL. An
+					 * earlier cut kept the first
+					 * eight and let the per slot
+					 * loop skip the whole range,
+					 * which DROPS every slice past
+					 * the eighth -- a wrong answer
+					 * with nothing reporting one.
+					 */
+					if (cnt >= 8) {
+						cnt = 0;
+						break;
+					}
+					c.fo[cnt] = (const float *)
+						((uint8_t *)ob->bo[d].map
+						 + (size_t)ntc
+						 * g->bout_stride);
+					c.sc[cnt] = s->sc;
+					c.ki[cnt] = i / e->n_slices;
+					if (!cnt) c.s0 = s;
+					cnt++;
+					ntc++;
+				}
+				if (cnt < 2 || !c.s0)
+					continue;   /* nothing to fuse */
+				c.ns = cnt;
+				c.sn = c.s0->job.mm.n;
+				c.grp = tensor_grouped(g, e->t);
+				c.firstw = !g->bseen[c.s0->n0 / g->nmax];
+				g->bread_passes += cnt;
+				if (!((g->bseen_dev >> (d * 16))
+				      & (1u << (c.s0->n0 / g->nmax))))
+					g->bread_ranges++;
+				g->bseen_dev |= (uint64_t)1
+					<< (d * 16 + c.s0->n0 / g->nmax);
+				if (g->poolread == 1 ||
+				    (g->poolread == 2 &&
+				     (size_t)m * c.sn >= poolread_min(g)))
+					charsiu_parallel_for(read_fused_rows,
+							     &c, m);
+				else
+					read_fused_rows(&c, 0, m);
+				g->bseen[c.s0->n0 / g->nmax] = 1;
+				g->bfused_groups++;
+				g->bfused_slices += cnt;
+				fused_ni |= 1u << ni;
+			}
+		}
+		nt = 0;
+		for (unsigned i = 0; i < e->count; i++) {
+			const struct npu_slot *s = &g->slot[e->first + i];
+			unsigned sn = s->job.mm.n, ki = i / e->n_slices;
+
+			if (s->di == d && ((fused_ni >> (i % e->n_slices)) & 1u)) {
+				nt++;
+				continue;   /* the fused pass took it */
+			}
+			const float *fo;
+			const int32_t *io;
+			int grp = tensor_grouped(g, e->t);
+
+			if (s->di != d)
+				continue;
+			fo = (const float *)((uint8_t *)ob->bo[d].map
+					     + (size_t)nt * g->bout_stride);
+			io = (const int32_t *)fo;
+			/*
+			 * ⚠ THE TABLE IS BUILT AT `wide` AND A SLICE
+			 * CAN BE NARROWER -- the head's last one is
+			 * 5376 against 8192. charsiu_acc_index does not
+			 * depend on n at all, so the table is valid for
+			 * any narrower slice, but only if the entries
+			 * beyond its width are skipped rather than the
+			 * stride being changed. Indexing it at sn
+			 * instead cost exactly one tensor: 3585 rows of
+			 * 3616.
+			 */
+			{
+				unsigned ni = s->n0 / g->nmax;
+				struct read_rows rr = {
+					g, e, s, fo, io, Y, m, sn, ki,
+					grp, !g->bseen[ni]
+				};
+
+				g->bread_passes++;
+				if (!((g->bseen_dev >> (d * 16)) & (1u << ni)))
+					g->bread_ranges++;
+				g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
+				if (g->poolread == 1 ||
+				    (g->poolread == 2 &&
+				     (size_t)m * sn >= poolread_min(g))) {
+					/* ⚠ THE PAIR FORM NEEDS EVEN
+					 * RANGES, and before the grain
+					 * it got them only where the
+					 * chunk arithmetic happened to
+					 * land even. See pool_arm. */
+					charsiu_parallel_for_grain(
+						read_rows, &rr, m,
+						g->read4 == 2 ? 2 : 1);
+					g->bread_pooled++;
+				} else {
+					read_rows(&rr, 0, m);
+					g->bread_serial++;
+				}
+			}
+			/* ⚠ AFTER the row loop: every row of this slot
+			 * shares the flag, and setting it inside would
+			 * make row 0 assign and rows 1.. accumulate onto
+			 * whatever was in the caller's buffer. */
+			g->bseen[s->n0 / g->nmax] = 1;
+			nt++;
+		}
+	}
+	g->bread_us += now_us() - tf;
+	if (!g->nofini)
+		charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+	return 0;
+}
+
+/*
+ * ⭐ FINISH A GATHER THAT WAS PUT OFF, and restore the per call state it reads.
+ */
+static int npu_flush_pending(struct charsiu_npu *g)
+{
+	unsigned char *save;
+	unsigned d;
+	int rc = 0;
+
+	if (!g->pend.live)
+		return 0;
+	save = malloc(g->bseen_n ? g->bseen_n : 1);
+	if (!save)
+		return -1;
+	{
+		size_t stride = g->bout_stride;
+
+		memcpy(save, g->bseen, g->bseen_n);
+		memcpy(g->bseen, g->pend.bseen, g->bseen_n);
+		g->bout_stride = g->pend.bout_stride;
+		for (d = 0; d < g->ndev; d++)
+			if (g->pend.dmask & (1u << d))
+				if (batch_read_device(g, g->pend.e,
+						      g->pend.ob, d,
+						      g->pend.Y, g->pend.m))
+					rc = -1;
+		g->bout_stride = stride;
+	}
+	memcpy(g->bseen, save, g->bseen_n);
+	free(save);
+	g->pend.ob->pending = 0;
+	g->pend.live = 0;
+	g->bdefer_done++;
+	return rc;
+}
+
 static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
-			    unsigned m, float *Y)
+			    unsigned m, float *Y, int defer)
 {
 	struct npu_entry *e;
 	struct npu_outbuf *ob;
@@ -5977,11 +6325,32 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 	}
 
-	/* ⚠ both submitted, then both waited on: that is the point */
-	for (unsigned d = 0; d < g->ndev; d++) {
-		double tf;
-		unsigned nt;
+	/*
+	 * ⭐⭐ THE PREVIOUS TENSOR'S GATHER GOES HERE, BETWEEN THIS SUBMIT AND
+	 * THIS FENCE, which is the only place in the call where the hardware is
+	 * busy and the CPU is not.
+	 *
+	 * ⚠ It is not a correctness hazard for THIS tensor: the deferred read
+	 * writes a different Y and reads a different buffer object, and
+	 * batch_outbuf has already refused to hand this call a buffer that owes
+	 * one. What it does need is the deferred tensor's own g->bseen, which
+	 * npu_flush_pending swaps in.
+	 */
+	if (npu_flush_pending(g))
+		return -1;
 
+	/*
+	 * ⚠ both submitted, then both waited on: that is the point.
+	 *
+	 * ⭐ AND THE GATHER MAY BE PUT OFF. `defer` means the caller has another
+	 * INDEPENDENT matmul to issue next -- gate and up, or q and k, which
+	 * multiply one RMSNorm output and are adjacent calls in llama.c -- so
+	 * this tensor's answer can stay in its device buffer and be gathered
+	 * while THAT job runs. npu_flush_pending does it, from just after the
+	 * next call's submit; batch_outbuf refuses to hand out a buffer that
+	 * still owes one.
+	 */
+	for (unsigned d = 0; d < g->ndev; d++) {
 		{
 			double w = fence_bo(g, d, &ob->bo[d]);
 
@@ -5994,237 +6363,35 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				    w, mac_for_dev(g, e, d, m));
 		}
 		ob->busy &= ~(1u << d);
-		tf = now_us();
-		if (npu_noread()) {
-			/* the ceiling arm: no gather, and Y is garbage */
-		} else {
-			/* ⚠ THE KEY IS m ALONE and that is still right: the
-			 * format and the axis are fixed for the life of a
-			 * pool, so only the width can change under it. */
-			/*
-			 * ⚠⚠ ONE ENTRY PER FOUR CHANNELS, because the read
-			 * order is FOUR CONSECUTIVE SLOTS and always has been.
-			 *
-			 * charsiu_acc_index(r, j+q) == charsiu_acc_index(r, j)
-			 * + q for q of 1, 2 and 3 at every j that is a
-			 * multiple of four: checked at 1503680 groups over
-			 * both formats, m of 2 to 80 and n of 64 to 8192, with
-			 * none broken. The `t % 4` term is the only one that
-			 * moves inside a group of four and it moves by one.
-			 *
-			 * The table was a uint32 per output channel, so the
-			 * gather below read FOUR BYTES OF INDEX FOR EVERY FOUR
-			 * BYTES OF DATA -- half its memory traffic was the
-			 * table. At m = 32 that gather is 368 ms of a 702 ms
-			 * batched matmul and at m = 80 it is 933 of 1746: the
-			 * dominant cost of a batched projection now that the
-			 * hardware part is right.
-			 */
-			if (g->bmap_m != m ||
-			    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
-				unsigned n4 = (g->nmax + 3) / 4;
-				uint32_t *t2 = realloc(g->bmap,
-					(size_t)m * n4 * sizeof(*t2));
+		if (!defer && batch_read_device(g, e, ob, d, Y, m))
+			return -1;
+	}
+	if (defer) {
+		/* ⚠ A SNAPSHOT, not a pointer: the next call resets g->bseen */
+		if (g->bseen_n > g->pend.bseen_n) {
+			unsigned char *t2 = realloc(g->pend.bseen, g->bseen_n);
 
-				if (!t2) {
-					whine(g, "the read order table would not allocate",
-					      m, g->nmax);
-					return -1;
-				}
-				g->bmap = t2;
-				g->bmap_n4 = n4;
-				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < n4; j++)
-						g->bmap[(size_t)r * n4 + j] =
-						  (uint32_t)charsiu_acc_index(r, j * 4, m,
-							w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
-				g->bmap_m = m;
-				g->bmap_w4 = (unsigned)w4_for(g, e->t);
-				/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
-				g->bmap2 = m % 2 == 0;
-				for (unsigned r = 0; g->bmap2 && r < m; r += 2)
-					for (unsigned j = 0; g->bmap2 && j < n4; j++)
-						if (g->bmap[(size_t)(r + 1) * n4 + j] !=
-						    g->bmap[(size_t)r * n4 + j] + 4) {
-							g->bmap2 = 0;
-							break;
-						}
-				/* read_rows4's premise, read off the table just built */
-				g->bmap4 = m % 4 == 0;
-				for (unsigned r = 0; g->bmap4 && r < m; r += 4)
-					for (unsigned j = 0; g->bmap4 && j < n4; j++)
-						for (unsigned lo = 1; lo < 4; lo++)
-							if (g->bmap[(size_t)(r + lo) * n4 + j] !=
-							    g->bmap[(size_t)r * n4 + j] + lo * 4) {
-								g->bmap4 = 0;
-								break;
-							}
-			}
-			/*
-			 * ⚠⚠ NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
-			 * LOST TWICE.
-			 *
-			 * Round one: 283 ms became 463, and I blamed the table
-			 * being rebuilt inside every dispatch. Round two, with
-			 * the table built once and nothing in the worker but
-			 * the gather: 241 ms became 430. Same 190 ms either
-			 * time, which is what says it is the pool and not the
-			 * work -- 226 dispatches a pass, one per tensor per
-			 * device, at about 0.84 ms of barrier each.
-			 *
-			 * The work per dispatch is one tensor's rows, and there
-			 * is not enough of it to pay for a wakeup. Parallelism
-			 * here would have to be at a coarser grain than a
-			 * tensor, which means the caller's loop rather than
-			 * this one.
-			 */
-			/*
-			 * ⚠ THE FUSED PASS FIRST, and it walks the slots in
-			 * exactly the order the loop below would: n range
-			 * outermost, K slice ascending inside it, which is
-			 * what makes the sum bit identical. Anything it does
-			 * not take -- READ4 on, more than 8 slices on one
-			 * device, a range with a single slice to fuse -- falls
-			 * through to the per slot loop untouched.
-			 */
-			unsigned fused_ni = 0;
-
-			if (g->readfuse && !g->read4 && g->bmap) {
-				unsigned ni;
-
-				for (ni = 0; ni < e->n_slices; ni++) {
-					struct read_fused c;
-					unsigned i, cnt = 0, ntc = 0;
-
-					c.g = g; c.e = e; c.Y = Y; c.m = m;
-					c.s0 = NULL;
-					for (i = 0; i < e->count; i++) {
-						const struct npu_slot *s =
-							&g->slot[e->first + i];
-
-						if (s->di != d)
-							continue;
-						if (i % e->n_slices != ni) {
-							ntc++;
-							continue;
-						}
-						/*
-						 * ⚠ MORE THAN THE ARRAY HOLDS
-						 * MEANS DO NOT FUSE AT ALL. An
-						 * earlier cut kept the first
-						 * eight and let the per slot
-						 * loop skip the whole range,
-						 * which DROPS every slice past
-						 * the eighth -- a wrong answer
-						 * with nothing reporting one.
-						 */
-						if (cnt >= 8) {
-							cnt = 0;
-							break;
-						}
-						c.fo[cnt] = (const float *)
-							((uint8_t *)ob->bo[d].map
-							 + (size_t)ntc
-							 * g->bout_stride);
-						c.sc[cnt] = s->sc;
-						c.ki[cnt] = i / e->n_slices;
-						if (!cnt) c.s0 = s;
-						cnt++;
-						ntc++;
-					}
-					if (cnt < 2 || !c.s0)
-						continue;   /* nothing to fuse */
-					c.ns = cnt;
-					c.sn = c.s0->job.mm.n;
-					c.grp = tensor_grouped(g, e->t);
-					c.firstw = !g->bseen[c.s0->n0 / g->nmax];
-					g->bread_passes += cnt;
-					if (!((g->bseen_dev >> (d * 16))
-					      & (1u << (c.s0->n0 / g->nmax))))
-						g->bread_ranges++;
-					g->bseen_dev |= (uint64_t)1
-						<< (d * 16 + c.s0->n0 / g->nmax);
-					if (g->poolread == 1 ||
-					    (g->poolread == 2 &&
-					     (size_t)m * c.sn >= poolread_min(g)))
-						charsiu_parallel_for(read_fused_rows,
-								     &c, m);
-					else
-						read_fused_rows(&c, 0, m);
-					g->bseen[c.s0->n0 / g->nmax] = 1;
-					g->bfused_groups++;
-					g->bfused_slices += cnt;
-					fused_ni |= 1u << ni;
-				}
-			}
-			nt = 0;
-			for (unsigned i = 0; i < e->count; i++) {
-				const struct npu_slot *s = &g->slot[e->first + i];
-				unsigned sn = s->job.mm.n, ki = i / e->n_slices;
-
-				if (s->di == d && ((fused_ni >> (i % e->n_slices)) & 1u)) {
-					nt++;
-					continue;   /* the fused pass took it */
-				}
-				const float *fo;
-				const int32_t *io;
-				int grp = tensor_grouped(g, e->t);
-
-				if (s->di != d)
-					continue;
-				fo = (const float *)((uint8_t *)ob->bo[d].map
-						     + (size_t)nt * g->bout_stride);
-				io = (const int32_t *)fo;
-				/*
-				 * ⚠ THE TABLE IS BUILT AT `wide` AND A SLICE
-				 * CAN BE NARROWER -- the head's last one is
-				 * 5376 against 8192. charsiu_acc_index does not
-				 * depend on n at all, so the table is valid for
-				 * any narrower slice, but only if the entries
-				 * beyond its width are skipped rather than the
-				 * stride being changed. Indexing it at sn
-				 * instead cost exactly one tensor: 3585 rows of
-				 * 3616.
-				 */
-				{
-					unsigned ni = s->n0 / g->nmax;
-					struct read_rows rr = {
-						g, e, s, fo, io, Y, m, sn, ki,
-						grp, !g->bseen[ni]
-					};
-
-					g->bread_passes++;
-					if (!((g->bseen_dev >> (d * 16)) & (1u << ni)))
-						g->bread_ranges++;
-					g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
-					if (g->poolread == 1 ||
-					    (g->poolread == 2 &&
-					     (size_t)m * sn >= poolread_min(g))) {
-						/* ⚠ THE PAIR FORM NEEDS EVEN
-						 * RANGES, and before the grain
-						 * it got them only where the
-						 * chunk arithmetic happened to
-						 * land even. See pool_arm. */
-						charsiu_parallel_for_grain(
-							read_rows, &rr, m,
-							g->read4 == 2 ? 2 : 1);
-						g->bread_pooled++;
-					} else {
-						read_rows(&rr, 0, m);
-						g->bread_serial++;
-					}
-				}
-				/* ⚠ AFTER the row loop: every row of this slot
-				 * shares the flag, and setting it inside would
-				 * make row 0 assign and rows 1.. accumulate onto
-				 * whatever was in the caller's buffer. */
-				g->bseen[s->n0 / g->nmax] = 1;
-				nt++;
+			if (!t2)
+				defer = 0;
+			else {
+				g->pend.bseen = t2;
+				g->pend.bseen_n = g->bseen_n;
 			}
 		}
-		g->bread_us += now_us() - tf;
-		if (!g->nofini)
-			charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+		if (defer) {
+			memcpy(g->pend.bseen, g->bseen, g->bseen_n);
+			g->pend.ob = ob; g->pend.e = e; g->pend.Y = Y;
+			g->pend.m = m;
+			g->pend.bout_stride = g->bout_stride;
+			g->pend.dmask = (1u << g->ndev) - 1u;
+			g->pend.live = 1;
+			ob->pending = 1;
+			g->bdefer_n++;
+		} else {
+			for (unsigned d = 0; d < g->ndev; d++)
+				if (batch_read_device(g, e, ob, d, Y, m))
+					return -1;
+		}
 	}
 
 	g->busy_us += now_us() - t0;
@@ -6272,7 +6439,7 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	int rc;
 
 	g->reuse_ask = 0;
-	rc = npu_matmul_inner(g, id, X, m, Y);
+	rc = npu_matmul_inner(g, id, X, m, Y, 0);
 	g->bwall_us += now_us() - t0;
 	return rc;
 }
@@ -6307,6 +6474,61 @@ static int reuse_enabled(void)
 	return v;
 }
 
+/*
+ * ⭐⭐ THE SAME MATMUL, BUT LEAVE THE ANSWER IN THE DEVICE BUFFER.
+ *
+ * Y is NOT written when this returns. It is written by the next
+ * charsiu_npu_matmul* call on this pool, from just after that call's submit,
+ * or by charsiu_npu_flush -- whichever comes first. So a caller may only use
+ * it when the VERY NEXT thing it does is another matmul that does not read Y,
+ * and it must flush before anything reads Y.
+ *
+ * ⚠⚠ A MISSED FLUSH IS FLUENT WRONG TEXT, not a crash. The two call sites
+ * that qualify are the ones llama.c already marks as sharing an input: q/k/v
+ * and gate/up, which multiply one RMSNorm output and are adjacent. Anything
+ * else should use charsiu_npu_matmul.
+ *
+ * CHARSIU_NPU_DEFER_READ=0 makes this the plain call, which is the control.
+ */
+static int defer_read_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_DEFER_READ", 1);
+	return v;
+}
+
+int charsiu_npu_matmul_defer(struct charsiu_npu *g, int id, const float *X,
+			     unsigned m, float *Y)
+{
+	double t0 = now_us();
+	int rc;
+
+	g->reuse_ask = 0;
+	rc = npu_matmul_inner(g, id, X, m, Y, defer_read_on());
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+int charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
+				  const float *X, unsigned m, float *Y)
+{
+	double t0 = now_us();
+	int rc;
+
+	g->reuse_ask = reuse_enabled();
+	rc = npu_matmul_inner(g, id, X, m, Y, defer_read_on());
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+/* every deferred answer written out; safe to call when there are none */
+int charsiu_npu_flush(struct charsiu_npu *g)
+{
+	return g ? npu_flush_pending(g) : 0;
+}
+
 int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			    unsigned m, float *Y)
 {
@@ -6314,7 +6536,7 @@ int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 	int rc;
 
 	g->reuse_ask = reuse_enabled();
-	rc = npu_matmul_inner(g, id, X, m, Y);
+	rc = npu_matmul_inner(g, id, X, m, Y, 0);
 	g->reuse_ask = 0;
 	g->bwall_us += now_us() - t0;
 	return rc;

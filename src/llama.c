@@ -6707,8 +6707,18 @@ static int prefill_grouped(void)
  * into 3n separate ones the moment the batch is refused, which on int4 is
  * always. I did that to this loop two commits ago.
  */
-static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
-		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
+/*
+ * ⭐⭐ `defer` LEAVES THE ANSWER IN THE DEVICE BUFFER for the NEXT matmul's
+ * submit to gather behind, which is 1.93 ms a row of CPU work moved into
+ * 1.82 ms a row of sleeping fence (r407). It is only legal when the very next
+ * thing the caller does is another matmul that does not read Y -- gate before
+ * up, q before k -- and the caller owes a charsiu_npu_flush before the
+ * consumer, because the next matmul can be REFUSED and then nothing on the
+ * hardware path will do it.
+ */
+static int matmul_rows_x(struct llama_state *s, const struct gguf_tensor *w,
+			 const float *X, int n, float *Y, uint32_t k,
+			 uint32_t nout, int defer)
 {
 	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
 	int id = npu_id_for(s, w);   /* stages the tensor on first use */
@@ -6716,7 +6726,10 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 	bmm_calls++;
 	if (id >= 0) {
 		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
-		if (!charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y)) {
+		if (!(defer ? charsiu_npu_matmul_defer(s->pool.dev, id, X,
+						       (unsigned)n, Y)
+			    : charsiu_npu_matmul(s->pool.dev, id, X,
+						 (unsigned)n, Y))) {
 			if (stage_on > 0) {
 				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
 
@@ -6797,14 +6810,29 @@ static int reuse_site(char which)
 	return 1;
 }
 
-static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
-			    const float *X, int n, float *Y, uint32_t k,
-			    uint32_t nout, char site)
+static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
+		       const float *X, int n, float *Y, uint32_t k,
+		       uint32_t nout)
+{
+	return matmul_rows_x(s, w, X, n, Y, k, nout, 0);
+}
+
+static int matmul_rows_defer(struct llama_state *s,
+			     const struct gguf_tensor *w, const float *X,
+			     int n, float *Y, uint32_t k, uint32_t nout)
+{
+	return matmul_rows_x(s, w, X, n, Y, k, nout, 1);
+}
+
+static int matmul_rows_same_x(struct llama_state *s,
+			      const struct gguf_tensor *w, const float *X,
+			      int n, float *Y, uint32_t k, uint32_t nout,
+			      char site, int defer)
 {
 	int id = npu_id_for(s, w);
 
 	if (!reuse_site(site))
-		return matmul_rows(s, w, X, n, Y, k, nout);
+		return matmul_rows_x(s, w, X, n, Y, k, nout, defer);
 	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
 	/* id was taken above, before t0: the staging on first use is not in this
 	 * wrapper's column, and the stage clock subtracts it on its own */
@@ -6812,7 +6840,10 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 	bmm_calls++;
 	if (id >= 0) {
 		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
-		if (!charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y)) {
+		if (!(defer ? charsiu_npu_matmul_same_defer(s->pool.dev, id, X,
+							   (unsigned)n, Y)
+			    : charsiu_npu_matmul_same(s->pool.dev, id, X,
+						      (unsigned)n, Y))) {
 			if (stage_on > 0) {
 				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
 
@@ -6830,6 +6861,22 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 	if (stage_on > 0)
 		bmm_fell_ms += now_ms() - t0;
 	return 0;
+}
+
+static int matmul_rows_same(struct llama_state *s,
+			    const struct gguf_tensor *w, const float *X,
+			    int n, float *Y, uint32_t k, uint32_t nout,
+			    char site)
+{
+	return matmul_rows_same_x(s, w, X, n, Y, k, nout, site, 0);
+}
+
+static int matmul_rows_same_defer(struct llama_state *s,
+				  const struct gguf_tensor *w, const float *X,
+				  int n, float *Y, uint32_t k, uint32_t nout,
+				  char site)
+{
+	return matmul_rows_same_x(s, w, X, n, Y, k, nout, site, 1);
 }
 
 /*
@@ -7340,15 +7387,26 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
-			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
-				    m->n_head * hd);
 			/* ⚠ nothing writes bxb between these three: the
-			 * declaration below is only true because of that */
-			matmul_rows_same(s, L->wk, s->bxb, n, s->bk, m->n_embd,
-					 m->n_head_kv * hd, 'k');
+			 * declaration below is only true because of that --
+			 * and it is also what makes the deferral legal. q's
+			 * answer is gathered while k's job runs and k's while
+			 * v's does; the flush covers a refusal that would
+			 * otherwise leave the last one unwritten. */
+			matmul_rows_defer(s, L->wq, s->bxb, n, s->bq,
+					  m->n_embd, m->n_head * hd);
+			if (L->wv)
+				matmul_rows_same_defer(s, L->wk, s->bxb, n,
+						       s->bk, m->n_embd,
+						       m->n_head_kv * hd, 'k');
+			else
+				matmul_rows_same(s, L->wk, s->bxb, n, s->bk,
+						 m->n_embd,
+						 m->n_head_kv * hd, 'k');
 			if (L->wv)
 				matmul_rows_same(s, L->wv, s->bxb, n, s->bv,
 						 m->n_embd, m->n_head_kv * hd, 'v');
+			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
@@ -7547,10 +7605,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 
 		/* gate and up read one norm as well: the same choice */
 		if (!prefill_grouped() || will_batch(s, L->gate)) {
-			matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd,
-				    nff);
+			/* ⭐ gate's answer is gathered while UP's job runs:
+			 * they multiply the same norm and neither reads the
+			 * other, which is the only condition the deferral has.
+			 * The flush below covers the case where up is refused
+			 * and never reaches the hardware to do it. */
+			matmul_rows_defer(s, L->gate, s->bxb, n, s->bhb,
+					  m->n_embd, nff);
 			matmul_rows_same(s, L->up, s->bxb, n, s->bhb2,
 					 m->n_embd, nff, 'u');
+			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
