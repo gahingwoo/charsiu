@@ -185,7 +185,11 @@ $(BUILD)/charsiu_matmul.aarch64: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 $(BUILD)/charsiu_bench.aarch64: tools/charsiu_bench.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
-$(BUILD)/charsiu_int4.aarch64: tools/charsiu_int4.c $(SRC) | $(BUILD)
+# ⚠ AND src/gguf.c, WHICH IS WHERE charsiu_env_flag LIVES. This rule is in
+# `board:` and has not linked -- a third instance today of the sentence three
+# rules above: a target that is never built is a target that is already broken.
+# Nothing in `make test` builds it either, which is why nothing said so.
+$(BUILD)/charsiu_int4.aarch64: tools/charsiu_int4.c $(SRC) src/gguf.c | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
 $(BUILD)/charsiu_vendor.aarch64: tools/charsiu_vendor.c $(SRC) | $(BUILD)

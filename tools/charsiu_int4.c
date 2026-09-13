@@ -46,9 +46,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <math.h>
 
 #include "charsiu.h"
+/* charsiu_env_flag lives here; without it the call above was an implicit
+ * declaration returning int, which happened to work and would not have if
+ * the signature had ever changed */
+#include "charsiu_llm.h"
 
 enum pattern { PAT_ALL, PAT_LOW, PAT_HIGH, PAT_FIRST, PAT_DEAD };
 
@@ -123,6 +128,14 @@ static void fit_line(const char *what, const double *x, const double *y,
 	if (want != 0)
 		printf("   (a real MAC wants a slope of %g)", want);
 	printf("\n");
+}
+
+static double cost_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
 static void fill(uint8_t *dst, size_t bytes, enum pattern p)
@@ -503,12 +516,27 @@ int main(int argc, char **argv)
 	 * a live byte is 0x07 rather than a nibble, which is a legal small
 	 * positive weight in the biased domain the packer would have produced.
 	 */
-	job.mm.wdtype = getenv("CHARSIU_MAP_W8") ? CHARSIU_INT8 : CHARSIU_INT4;
+	/*
+	 * ⚠ CHARSIU_MAP_W16 IS FOR --cost AND NOTHING ELSE. It makes the
+	 * weights fp16 so that ONE probe prices all three dtypes at the SAME
+	 * batching -- r403 compared int4 here against fp16 from npu_fp16_test,
+	 * which submits eight jobs at a time against this one's one, and a
+	 * ratio across two batching schemes is not a ratio. Every other mode
+	 * in this tool reads nibbles and means nothing with fp16 weights.
+	 */
+	job.mm.wdtype = getenv("CHARSIU_MAP_W16") ? CHARSIU_FP16
+		      : getenv("CHARSIU_MAP_W8") ? CHARSIU_INT8 : CHARSIU_INT4;
 	if (getenv("CHARSIU_INT4_LIVE"))
 		g_live = (unsigned)atoi(getenv("CHARSIU_INT4_LIVE")) & 0xf;
 	if (getenv("CHARSIU_KPAIR_AMP"))
 		g_amp = (unsigned)atoi(getenv("CHARSIU_KPAIR_AMP")) & 0x7f;
-	job.mm.adtype = CHARSIU_INT8;
+	/*
+	 * ⚠ CHARSIU_INT4_A16 MAKES THIS w4a16, which is the arrangement the
+	 * runtime's projections actually use and the one attention would have
+	 * to use if its KV surfaces became int4. The probe's own checks are
+	 * written for a8, so this is for --cost and nothing else.
+	 */
+	job.mm.adtype = getenv("CHARSIU_INT4_A16") ? CHARSIU_FP16 : CHARSIU_INT8;
 	/*
 	 * CHARSIU_MAP_ROW isolates one row of the activation, zeroing the rest
 	 * to the input zero point. At M = 1 it does nothing. At M > 1 it is the
@@ -643,6 +671,65 @@ int main(int argc, char **argv)
 	 * the weight dtype is int4. Its control caught it. Any sub command now
 	 * gets a clean device.
 	 */
+	/*
+	 * ⭐ --cost: WHAT DOES THE HARDWARE CHARGE FOR THIS SHAPE?
+	 *
+	 * r403 measured fp16 at the two attention shapes and at a fat one and
+	 * found six to seven of the twenty times charsiu's attention gives
+	 * away is the SHAPE, inside fp16. The rest is the dtype, and it could
+	 * only be BOUNDED -- 0.190 TMAC/s for fp16 at k=1024 n=1024 against
+	 * 0.36 to 0.69 for int4 at k=2048 -- because no probe in this tree
+	 * priced int4 at a shape of its caller's choosing. charsiu_int4 and
+	 * charsiu_matmul take m, k and n and print no time; npu_fp16_test
+	 * prints time and is fp16 only. This is that missing measurement.
+	 *
+	 * ⚠⚠ IT IS A TIMING PROBE AND IT CHECKS NOTHING. The weight buffer
+	 * holds whatever the setup left in it and the output is not read. That
+	 * is legitimate for this question and only for this question: the NPU's
+	 * MAC array does not branch on data, so a dispatch of the right shape
+	 * and dtype costs what it costs. Any number from here is a COST, never
+	 * an answer -- the correctness of these shapes is what the rest of this
+	 * tool is for.
+	 */
+	if (argc > 4 && !strcmp(argv[4], "--cost")) {
+		unsigned reps = getenv("CHARSIU_COST_REPS")
+			      ? (unsigned)atoi(getenv("CHARSIU_COST_REPS")) : 32;
+		double t0, fence = 0.0;
+		unsigned r;
+		double macs = (double)m * k * n * reps;
+
+		/* one warm-up, discarded: the first submit of a device pays
+		 * for staging that no later one repeats */
+		charsiu_submit(dev, &regcmd, (unsigned)nreg, in_handles, 3,
+			       out_handles, 1);
+		charsiu_bo_prep(dev, &outbo, 2000000000);
+		for (r = 0; r < reps; r++) {
+			if (charsiu_submit(dev, &regcmd, (unsigned)nreg,
+					   in_handles, 3, out_handles, 1)) {
+				printf("  --cost: submit FAILED at %u\n", r);
+				return 1;
+			}
+			t0 = cost_now_ms();
+			if (charsiu_bo_prep(dev, &outbo, 2000000000)) {
+				printf("  --cost: wait FAILED at %u\n", r);
+				return 1;
+			}
+			fence += cost_now_ms() - t0;
+		}
+		printf("  --cost  m=%u k=%u n=%u  %s weights  %u submits\n",
+		       m, k, n,
+		       job.mm.wdtype == CHARSIU_INT4 ? "int4"
+		       : job.mm.wdtype == CHARSIU_INT8 ? "int8" : "fp16",
+		       reps);
+		printf("          activation %s\n",
+		       job.mm.adtype == CHARSIU_FP16 ? "fp16 (w4a16)" : "int8 (w4a8)");
+		printf("          %.1f MMAC in %.1f ms of fence"
+		       " = %.3f TMAC/s, %.0f us a submit\n",
+		       macs / 1e6, fence, macs / fence / 1e9,
+		       1000.0 * fence / reps);
+		printf("  ⚠ a COST, not an answer: nothing here was checked\n");
+		return 0;
+	}
 	if (argc > 4)
 		printf("  pattern probes SKIPPED for a sub command: no job has run\n"
 		       "  on this device yet\n\n");
