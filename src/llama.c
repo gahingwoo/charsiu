@@ -5087,6 +5087,21 @@ struct attn_npu {
  * board has no head_dim 256 model on it to measure one. A clause nobody has
  * measured is what got `auto` withdrawn the first time.
  */
+/* 0 = no cap. See the probe note beside a->mmax. */
+static unsigned attn_npu_mmax_cap(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_NPU_MMAX");
+
+		v = e && *e ? atol(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
 static unsigned attn_npu_min_tokens(void)
 {
 	static long v = -1;
@@ -5284,6 +5299,17 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	 * 2048 context allows 80 rows a pass and a 4096 one allows 40.
 	 */
 	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
+	/*
+	 * ⚠ A PROBE, AND IT ONLY EVER MAKES THINGS SMALLER. The fp16 attention
+	 * fence is 2881 us for a 32 task submit whose tasks are 2.3 MMAC each
+	 * -- about 4.6 us of arithmetic at the rate the int4 path gets out of
+	 * the same silicon in the same process. If that 90 us a task is
+	 * overhead rather than work, then halving mmax should roughly DOUBLE
+	 * the fence at constant total arithmetic, and the answer decides
+	 * whether merging heads is worth writing.
+	 */
+	if (attn_npu_mmax_cap() && a->mmax > attn_npu_mmax_cap())
+		a->mmax = attn_npu_mmax_cap();
 	if (hd < 32 || a->nk < 32 || a->kv < 32 || !a->nkv || !a->mmax)
 		return NULL;
 	a->lhd = calloc(a->n_layer, sizeof(*a->lhd));
@@ -5448,6 +5474,8 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 	}
 	a->kv = kv;
 	a->mmax = 5120u / (kv / 32u);
+	if (attn_npu_mmax_cap() && a->mmax > attn_npu_mmax_cap())
+		a->mmax = attn_npu_mmax_cap();
 	if (!a->mmax)
 		return -1;
 

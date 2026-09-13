@@ -115,6 +115,14 @@ $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c src/vision.c src/image.c $(LLM)
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
+# ⚠ THE SHAPE PROBE, ON THE BOARD. npu_fp16_test only ever built for the host,
+# and the host build is dynamically linked against a glibc the board does not
+# have -- so the one tool that can price an fp16 matmul at a CHOSEN shape could
+# not be run where the shapes matter. Same caveat as every rule here: this
+# source list has to track npu_fp16_test's.
+$(BUILD)/npu_fp16_test.aarch64: tools/npu_fp16_test.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+
 # ⚠ THE QUALITY INSTRUMENT, ON THE BOARD. charsiu_ppl only ever built for the
 # host, so every perplexity and every --top1 in this tree came from the CPU
 # path. The board's own quantiser is the one that ships, and scoring it needed
@@ -146,7 +154,7 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64 \
        $(BUILD)/charsiu_serve.aarch64 $(BUILD)/charsiu_vision.aarch64 \
        $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64 \
-       $(BUILD)/vattn_bench.aarch64
+       $(BUILD)/vattn_bench.aarch64 $(BUILD)/npu_fp16_test.aarch64
 
 # ⚠ THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
 # round reaches for, and a tool that is only in the native build is one that has

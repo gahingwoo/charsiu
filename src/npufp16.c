@@ -51,6 +51,9 @@ struct charsiu_fp16 {
 	 * rather than per call -- the two differ by a factor of the CONTEXT
 	 * LENGTH, because the values matmul contracts over the whole of it */
 	unsigned long long packel, trisk, partial, preskip, prewrote;
+	/* ⚠ THE ARITHMETIC, so "the hardware is the wall" is a reading
+	 * and not a division somebody did in a report. sum of m*k*n. */
+	unsigned long long macs;
 	/* which handle this is, when a caller runs more than one -- the
 	 * attention mirror runs two, one a matmul, so that two stage tables
 	 * in a log can be told apart */
@@ -578,6 +581,12 @@ static void fp16_report(const struct charsiu_fp16 *f)
 			" each (%s arm)\n", f->packel,
 			f->t.pack * 1e6 / (double)f->packel,
 			pack_vector() ? "vector" : "scalar");
+	if (f->macs && f->t.fence > 0.0)
+		fprintf(stderr, "charsiu fp16:  %.1f GMAC in %.0f ms of fence"
+			" = %.3f TMAC/s, %.0f us a submit\n",
+			f->macs / 1e9, f->t.fence,
+			f->macs / f->t.fence / 1e9,
+			1000.0 * f->t.fence / (double)f->submits);
 	if (f->preskip || f->prewrote)
 		fprintf(stderr, "charsiu fp16:  the sentinels were already in"
 			" the buffer for %llu of %llu groups\n", f->preskip,
@@ -1096,6 +1105,8 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			return -1;
 	}
 	f->submits++;
+	for (i = 0; i < nops; i++)
+		f->macs += (unsigned long long)ops[i].m * ops[i].k * ops[i].n;
 	f->t.submit += now_ms() - t0;
 
 	t0 = now_ms();
