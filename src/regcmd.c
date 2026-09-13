@@ -36,24 +36,11 @@
  * Checked against the scalar converter over 464 million float bit patterns
  * spanning the whole 32 bit space: zero differ.
  */
-static inline uint16x4_t charsiu_vhalf(float32x4_t x)
-{
-	uint32x4_t u = vreinterpretq_u32_f32(x);
-	uint32x4_t sign = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(0x8000));
-	int32x4_t exp = vsubq_s32(vreinterpretq_s32_u32(
-					  vandq_u32(vshrq_n_u32(u, 23),
-						    vdupq_n_u32(0xff))),
-				  vdupq_n_s32(112));
-	uint32x4_t man = vandq_u32(u, vdupq_n_u32(0x7fffff));
-	uint32x4_t h = vorrq_u32(sign,
-			 vorrq_u32(vshlq_n_u32(vreinterpretq_u32_s32(exp), 10),
-				   vshrq_n_u32(man, 13)));
-
-	h = vbslq_u32(vcleq_s32(exp, vdupq_n_s32(0)), sign, h);
-	h = vbslq_u32(vcgeq_s32(exp, vdupq_n_s32(0x1f)),
-		      vorrq_u32(sign, vdupq_n_u32(0x7c00)), h);
-	return vmovn_u32(h);
-}
+/* charsiu_f2h_x4 in charsiu.h, next to the scalar definition it has to match.
+ * It lived here as a file static until 09-13, when a second copy of it got
+ * written for the fp16 attention pack before anyone grepped -- one converter
+ * with one exhaustive test (tests/pack_f16run.c) rather than three. */
+#define charsiu_vhalf charsiu_f2h_x4
 
 /*
  * The int8 activation bias, SIXTEEN BYTES AT A TIME, and it is one XOR.
@@ -1052,13 +1039,13 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
  * bit pattern layout is NOT in here: it accumulates with |=, so two channels
  * can share a byte and ranges would race. charsiu_pack_weights below keeps it.
  */
+static size_t w_group_index(const struct charsiu_matmul *mm, unsigned n,
+			    unsigned k);
+
 void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 			       const uint8_t *src, uint8_t *dst,
 			       unsigned n0, unsigned nrows)
 {
-	unsigned ng = charsiu_weight_ngroup(mm->wdtype);
-	unsigned kg = charsiu_weight_kgroup(mm->wdtype);
-	unsigned n_pad = ALIGN_UP(mm->n, 2);
 	unsigned ke = charsiu_k_eff(mm);
 	unsigned n, k;
 
@@ -1094,19 +1081,10 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 		return;
 	}
 
-	for (n = n0; n < n0 + nrows; n++) {
-		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
-
-		for (k = 0; k < mm->k; k++) {
-			unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
-			size_t off = (size_t)ngi * ng * ke
-				   + (size_t)kgi * kg * ngsz
-				   + (size_t)(n % ng) * kgsz
-				   + (k % kg);
-
-			dst[off] = (uint8_t)(src[(size_t)n * mm->k + k] - 0x80);
-		}
-	}
+	for (n = n0; n < n0 + nrows; n++)
+		for (k = 0; k < mm->k; k++)
+			dst[w_group_index(mm, n, k)] =
+				(uint8_t)(src[(size_t)n * mm->k + k] - 0x80);
 }
 
 /*
@@ -1180,6 +1158,30 @@ void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
 	}
 }
 
+/*
+ * THE GROUP TILING, ONCE, IN ELEMENTS.
+ *
+ * [N/ng][K/kg][N%ng][K%kg], edge tiles cut short rather than padded, with ng
+ * and kg read off mm->wdtype. It is the same arithmetic for an fp16 weight and
+ * an int8 one -- only the element WIDTH differs, and the two callers below
+ * apply that. charsiu_pack_weights_rows used to carry a second copy of these
+ * four lines for int8; it now calls this, because a layout that exists twice
+ * is a layout that can disagree with itself.
+ */
+static size_t w_group_index(const struct charsiu_matmul *mm, unsigned n,
+			    unsigned k)
+{
+	unsigned n_pad = ALIGN_UP(mm->n, 2);
+	unsigned ke = charsiu_k_eff(mm);
+	unsigned ng = charsiu_weight_ngroup(mm->wdtype);
+	unsigned kg = charsiu_weight_kgroup(mm->wdtype);
+	unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
+	unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
+
+	return (size_t)ngi * ng * ke + (size_t)kgi * kg * ngsz
+	     + (size_t)(n % ng) * kgsz + (k % kg);
+}
+
 size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
 			  unsigned k, enum charsiu_w16_layout layout)
 {
@@ -1196,20 +1198,34 @@ size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
 	case CHARSIU_W16_ATOM:
 		off = (size_t)(k / 8) * n_pad * 8 + (size_t)n * 8 + k % 8;
 		break;
-	case CHARSIU_W16_GROUP: {
-		unsigned ng = charsiu_weight_ngroup(mm->wdtype);
-		unsigned kg = charsiu_weight_kgroup(mm->wdtype);
-		unsigned ngi = n / ng, ngsz = MIN2(n_pad - ngi * ng, ng);
-		unsigned kgi = k / kg, kgsz = MIN2(ke - kgi * kg, kg);
-
-		off = (size_t)ngi * ng * ke + (size_t)kgi * kg * ngsz
-		    + (size_t)(n % ng) * kgsz + (k % kg);
+	case CHARSIU_W16_GROUP:
+		off = w_group_index(mm, n, k);
 		break;
-	}
 	default:
 		return (size_t)-1;
 	}
 	return off * 2;
+}
+
+/*
+ * The same tile with ONE BYTE elements, which is what an int8 weight buffer
+ * is: charsiu_pack_weights has written exactly this since round 139 and it has
+ * never had a name a caller could use. A KV cache that wants to be int8 needs
+ * one, for the same reason the fp16 cache needed charsiu_w16_offset -- to be
+ * written in place, a position at a time, and never packed.
+ *
+ * ⚠ ng IS 32 FOR int8 AND 16 FOR fp16. The fp16 surface can be appended along
+ * n and read at any multiple of 16 because an offset stops depending on n once
+ * every group is full; the int8 one has the same property at a multiple of 32.
+ * A caller that rounds its extent to 16 and hands it to an int8 surface is
+ * reading a DIFFERENT permutation of the same bytes.
+ */
+size_t charsiu_w8_offset(const struct charsiu_matmul *mm, unsigned n,
+			 unsigned k)
+{
+	if (n >= ALIGN_UP(mm->n, 2) || k >= mm->k)
+		return (size_t)-1;
+	return w_group_index(mm, n, k);
 }
 
 void charsiu_pack_weights_f16(const struct charsiu_matmul *mm,

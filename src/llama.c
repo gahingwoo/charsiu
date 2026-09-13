@@ -2495,7 +2495,26 @@ static int fast_softmax(void)
  * or two elements, and a vector prologue for those is slower than the loop it
  * replaces.
  */
-static void softmax(float *x, int n)
+/*
+ * ⚠ THE SCALE RIDES ALONG, AND IT COSTS NOTHING BECAUSE IT IS POSITIVE.
+ *
+ * Attention wants softmax(x * scale) and used to get it by multiplying the
+ * row through first -- a whole extra pass over the row, read and write, and
+ * at 852 tokens the rows total 186 million floats. It does not need one:
+ * multiplication by a positive constant is monotonic, so max(x * s) is
+ * max(x) * s, and the multiply then folds into the exponential pass's
+ * existing load. Four passes a row become three.
+ *
+ * ⚠ AND IT IS BIT IDENTICAL, not merely close. The old form stored x[i] * s
+ * and read it back; an fp32 product is exactly representable in fp32, so the
+ * store and reload changed nothing, and the subtraction is the same two
+ * operands either way. scale = 1.0f is an exact identity, which is what makes
+ * softmax() a wrapper rather than a second implementation.
+ *
+ * ⛔ A NEGATIVE OR ZERO SCALE WOULD BREAK THE max IDENTITY. Attention's is
+ * 1/sqrt(head_dim); the wrapper's is 1.
+ */
+static void softmax_scaled(float *x, int n, float scale)
 {
 	float mx, sum = 0.0f;
 	int i = 0;
@@ -2505,6 +2524,7 @@ static void softmax(float *x, int n)
 		float32x4_t mv = vdupq_n_f32(x[0]);
 		float32x4_t s0 = vdupq_n_f32(0.0f);
 		float32x4_t s1 = vdupq_n_f32(0.0f);
+		float32x4_t sv = vdupq_n_f32(scale);
 		float32x4_t mxv, iv;
 		float inv;
 
@@ -2514,12 +2534,13 @@ static void softmax(float *x, int n)
 		for (; i < n; i++)
 			if (x[i] > mx)
 				mx = x[i];
+		mx *= scale;
 		mxv = vdupq_n_f32(mx);
 		for (i = 0; i + 8 <= n; i += 8) {
-			float32x4_t a = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i),
-							        mxv));
-			float32x4_t b = charsiu_vexpq(vsubq_f32(vld1q_f32(x + i + 4),
-							        mxv));
+			float32x4_t a = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i), sv), mxv));
+			float32x4_t b = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i + 4), sv), mxv));
 
 			vst1q_f32(x + i, a);
 			vst1q_f32(x + i + 4, b);
@@ -2528,7 +2549,7 @@ static void softmax(float *x, int n)
 		}
 		sum = vaddvq_f32(vaddq_f32(s0, s1));
 		for (; i < n; i++) {
-			x[i] = expf(x[i] - mx);
+			x[i] = expf(x[i] * scale - mx);
 			sum += x[i];
 		}
 		inv = 1.0f / sum;
@@ -2544,12 +2565,18 @@ static void softmax(float *x, int n)
 	for (i = 1; i < n; i++)
 		if (x[i] > mx)
 			mx = x[i];
+	mx *= scale;
 	for (i = 0; i < n; i++) {
-		x[i] = expf(x[i] - mx);
+		x[i] = expf(x[i] * scale - mx);
 		sum += x[i];
 	}
 	for (i = 0; i < n; i++)
 		x[i] /= sum;
+}
+
+static void softmax(float *x, int n)
+{
+	softmax_scaled(x, n, 1.0f);
 }
 
 /*
@@ -4831,18 +4858,28 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
  * channel, so it can be appended to and run at whatever multiple of 16 it has
  * reached. For the V cache a position is part of the reduction, so its k
  * cannot move: it is allocated at the context length and the matmul always
- * runs there, with the probabilities past the last token left zero. That costs
+ * runs there, with the probabilities past the last token zeroed by the pack
+ * (see xtri0, and the paragraph below). That costs
  * a fetch of the whole V surface every call and buys never repacking.
  *
  * ⚠ WHY THE PROBABILITIES SIT IN A SCRATCH WHOSE ROWS ARE THE CONTEXT LENGTH
  * APART. They are the values matmul's activation, and that matmul runs at
- * k = the context length, so a row must BE that long. It is zeroed once at
- * allocation and only ever rewritten inside [0, npad), so the tail past the
- * last token is zero for the life of the run without anyone clearing it.
+ * k = the context length, so a row must BE that long.
  *
- * Sliding window layers need nothing special: the scores are computed for
- * every column either way, and the softmax below already masks to
- * [tlo, pos] and zeroes the rest, so a masked column multiplies V by zero.
+ * ⚠⚠ AND WHAT MAKES THE TAIL ZERO MOVED, 2026-09-13. This paragraph used to
+ * say the scratch is zeroed once at allocation, rewritten only inside
+ * [0, npad), and that "the softmax below masks to [tlo, pos] and zeroes the
+ * rest" -- and the second half of that stopped being true when the trailing
+ * zero loop was removed. Past pos the scratch now holds the RAW scores the
+ * matmul wrote. What makes those columns contribute nothing is the PACK: the
+ * values op carries xtri0, and charsiu_fp16_matmul_group memsets from
+ * xtri0 + r to the end of the row. The zeros are in the device buffer, not
+ * here.
+ *
+ * Sliding window layers still need nothing special. The scores are computed
+ * for every column either way, the softmax masks [0, tlo) to zero itself --
+ * that loop is still here, it is only the TRAILING one that went -- and
+ * everything past pos is the pack's memset.
  */
 /* why a layer did not take the NPU path; one counter each, printed by name */
 enum {
@@ -4855,11 +4892,33 @@ enum {
 	AN_R_N
 };
 static const char *const an_reason[AN_R_N] = {
-	"shape", "head_dim", "layer index", "K extent", "V extent", "not packed"
+	"shape", "head_dim", "layer index", "K extent", "V extent",
+	"not packed"
 };
 
 struct attn_npu {
-	struct charsiu_fp16 *f;
+	/*
+	 * ⚠⚠ TWO HANDLES ON ONE DEVICE, AND THE REASON IS THE CACHE SYNCS.
+	 *
+	 * charsiu_bo_prep and _fini are dma_sync over a WHOLE buffer object,
+	 * and charsiu_fp16's `want` grows its five buffers and never shrinks
+	 * them -- so one handle serving both attention matmuls sizes every
+	 * buffer for the larger of the two shapes and then syncs that size for
+	 * both. At 852 tokens the scores group needs 393 kB of input and pays
+	 * for 5.2 MB; the values group needs 655 kB of output and pays for
+	 * 8.6 MB. Thirteen times, each way, four syncs a call.
+	 *
+	 * This is the third time the tree has met it -- round 318's shared
+	 * output buffer and round 366's per-device sizing are the same
+	 * sentence -- and the fix is the same one: give each shape its own
+	 * buffer object. charsiu_fp16_open_on borrows the device, so the
+	 * second handle costs no second file descriptor.
+	 *
+	 * ⚠ THE K SURFACES BELONG TO f AND THE V SURFACES TO fv, because a
+	 * job names the buffers it reads by handle and a handle is per file.
+	 */
+	struct charsiu_fp16 *f;        /* the scores matmul: q . K */
+	struct charsiu_fp16 *fv;       /* the values matmul: p . V */
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
 	unsigned n_layer, nkv, hd, nk, kv, mmax;
 	/*
@@ -4927,9 +4986,16 @@ struct attn_npu {
 	 * hole is filled where it is needed rather than everywhere it might be.
 	 */
 	unsigned *packed;                   /* [n_layer], positions mirrored */
-	float *sc;                          /* [H][m][kv] probabilities */
-	size_t sc_cells;
 	unsigned long layers, fallbacks;
+	/* ⚠ MEASURED, NOT SUBTRACTED. The softmax between the two matmuls was
+	 * bounded at first by taking the stage table's attention and removing
+	 * what charsiu_fp16_times accounts for -- which is a residual, and
+	 * this tree has been wrong three times in one day by calling one a
+	 * measurement. It has its own clock now. */
+	double t_soft;
+	/* and the rest of the layer, so "attention minus what is accounted"
+	 * is never again a number anybody reasons from */
+	double t_layer, t_kv, t_pack1, t_pack2;
 	int off;                            /* tried and refused */
 };
 
@@ -4972,6 +5038,125 @@ struct attn_npu {
  * move. This computes attention in fp16 where the CPU computes it in fp32, so
  * the text can differ, and that is a call about the answer, not the clock.
  */
+/*
+ * ⭐ THE OTHER HALF OF THE RULE IS A LENGTH, AND IT IS MEASURED NOW.
+ *
+ * `auto` was withdrawn because "head_dim >= 128" was only half of it. r400
+ * then measured the other half and got a NEGATIVE answer at head_dim 64: the
+ * NPU arm was 1.19 to 1.23 times the CPU arm over an eight-fold range of
+ * prompt length, FLAT, and a flat ratio has no crossover to find.
+ *
+ * ⚠ THAT ANSWER WAS ABOUT THE CODE, NOT THE HARDWARE, and r401 overturned it.
+ * The ratio was flat because the fp16 path's per-element costs -- the pack,
+ * the poison, the readback, the softmax between the two matmuls -- grew with
+ * the prompt exactly as the CPU arm's arithmetic does. With those on the pool
+ * and the poison down to one sentinel a row, the ratio falls with length and
+ * crosses:
+ *
+ *     tokens     52     102     202     452     852
+ *     NPU/CPU  1.202   1.182   1.133   1.043   0.967
+ *
+ * ⚠ AND THE CROSSOVER MOVES EVERY TIME THE ARM GETS FASTER, so the number
+ * here is dated, not derived. Giving each attention matmul its own fp16
+ * handle -- so neither sizes the other's buffers for the cache syncs -- moved
+ * it again within the same day:
+ *
+ *     tokens      52     102     202     302     452     852   crossover
+ *     first        1.202   1.182   1.133     -     1.043   0.967    ~680
+ *     two handles  1.196   1.174   1.108     -     1.002   0.916    ~452
+ *     in place     1.204   1.162   1.092     -     0.977   0.886    ~402
+ *     final        1.207   1.153   1.087   1.035   0.964   0.864    ~376
+ *
+ * Llama-3.2-1B, head_dim 64, three repeats an arm, alternating, one boot,
+ * clock pinned. The threshold has been re-derived from this curve four times
+ * in one day, which is the point: it is a DATED NUMBER, not a derived one.
+ *
+ * ⚠ 448 IS THE NEAREST ROUND NUMBER BELOW THE SHORTEST LENGTH MEASURED TO
+ * WIN. At 452 tokens the NPU arm is 3.6% ahead; at 302 it is 3.5% behind. The
+ * cost of a threshold that is too high and one that is too low are the same
+ * size, so the best one is the crossing itself and the only reason to sit
+ * above it is that this is one model. gemma-3 crosses near 250, so head_dim
+ * 64 is the latest crosser measured -- which is what r395's axis predicts.
+ *
+ * ⚠ If this arm gets faster again, re-measure. Do not scale this number.
+ *
+ * ⚠ AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
+ * the NPU arm ahead at head_dim 256 -- with the SLOWER code. That inference
+ * still holds (nothing here touches the CPU arm, so a faster NPU arm cannot
+ * have lost ground), but "still ahead" is not a crossover length, and this
+ * board has no head_dim 256 model on it to measure one. A clause nobody has
+ * measured is what got `auto` withdrawn the first time.
+ */
+/* 0 = no cap. See the probe note beside a->mmax. */
+static unsigned attn_npu_mmax_cap(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_NPU_MMAX");
+
+		v = e && *e ? atol(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+static unsigned attn_npu_min_tokens(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_NPU_MIN");
+
+		v = e && *e ? atol(e) : 448;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/*
+ * ⭐ AND auto IS THE DEFAULT NOW, WHICH IS THE FIRST TIME THIS ARM HAS BEEN ON
+ * WITHOUT BEING ASKED FOR.
+ *
+ * Ten models on one board, 852 token prompt, clock pinned, auto against the
+ * CPU arm. Leading with the one that did not win:
+ *
+ *     Phi-3.5-mini       -0.3%      SmolLM2-135M      +12.9%
+ *     SmolLM2-1.7B       +2.3%      tinyllama-1.1B    +17.0%
+ *     Llama-3.2-1B Q4_0 +13.2%      Qwen2.5-1.5B      +17.5%
+ *     Llama-3.2-1B Q8_0 +13.5%      gemma-3-1b        +19.8%
+ *                                   gemma-4-E2B       +28.5%
+ *                                   Qwen3-0.6B        +28.6%
+ *
+ * The gain tracks attention's SHARE of the prompt, which is why the two that
+ * do not move are the two largest models: their matmuls dominate. Nothing
+ * loses outside noise, every one is text identical to the CPU arm, and none
+ * of the ten refuses a single layer.
+ *
+ * ⚠ AND THE TWO THINGS A DEFAULT HAS TO ANSWER THAT SPEED DOES NOT:
+ *
+ *   quality  perplexity on tests/corpus/long.txt, batched, Llama-3.2-1B Q4_0:
+ *            40.9987 off, 40.9213 on, reproduced exactly twice. Deterministic,
+ *            so that is a numerics difference and not an improvement to claim
+ *            -- but it is not a cost either, which is the question.
+ *   memory   peak 1474 -> 1459 MB on Llama, 2671 -> 2670 on gemma-4.
+ *
+ * ⚠ BELOW THE THRESHOLD auto AND off RUN THE SAME CODE. attn_npu_get returns
+ * NULL before the mirror is built, so a short prompt is not "about the same
+ * speed", it is the same path. That is what makes a default defensible from
+ * one board: the change is confined to prompts long enough to have been
+ * measured winning.
+ *
+ * ⚠ AND IT ONLY REACHES A CALLER THAT SAYS HOW LONG THE PROMPT IS. `auto`
+ * needs llama_prefill_hint; a tool that does not call it gets 0 and stays on
+ * the CPU arm. That is a deliberate rollout and not an oversight.
+ *
+ * CHARSIU_ATTN_NPU=0 turns it off, =1 forces it on at every length.
+ *
+ * 0 off, 1 on for every layer, 2 decide per prompt on its length.
+ */
 static int attn_npu_want_for(unsigned head_dim)
 {
 	static int v = -2;
@@ -4980,15 +5165,10 @@ static int attn_npu_want_for(unsigned head_dim)
 		const char *e = getenv("CHARSIU_ATTN_NPU");
 
 		if (!e || !*e)
-			v = 0;
-		else if (!strcmp(e, "auto")) {
-			fprintf(stderr, "charsiu: CHARSIU_ATTN_NPU=auto is "
-				"withdrawn -- head_dim >= 128 is only half the "
-				"rule and the other half (how long a prompt) "
-				"has not been measured; attention stays on the "
-				"CPU\n");
-			v = 0;
-		} else
+			v = 2;
+		else if (!strcmp(e, "auto"))
+			v = 2;
+		else
 			v = atoi(e) != 0;
 	}
 	(void)head_dim;
@@ -4996,6 +5176,160 @@ static int attn_npu_want_for(unsigned head_dim)
 }
 
 
+
+/*
+ * ⚠⚠ A SIMULATION, AND IT MAKES NOTHING FASTER.
+ *
+ * r404 measured what an int8 or int4 KV surface would be worth on the
+ * hardware -- 2.4x on the scores matmul, 1.8x on the values one -- and that is
+ * the largest remaining lever on prefill. Building it is a real project: a
+ * different packer, a scale per surface, a different weight dtype in the job,
+ * and every number in the tree re-measured. This asks the question that gates
+ * it, on a desk, before any of that: WHAT DOES IT COST IN QUALITY?
+ *
+ * CHARSIU_KV_BITS=8 (or 4) rounds each head's hd floats through a symmetric
+ * absmax quantiser as they enter the cache, which is exactly what such a
+ * surface would hold, and then leaves them as floats. Perplexity then measures
+ * the damage with nothing else changed.
+ *
+ * ⚠ It is applied BEFORE the mirror is appended as well, so both attention
+ * arms see the same numbers. A simulation that only one arm sees would compare
+ * two changes at once.
+ */
+static int kv_bits(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_KV_BITS");
+
+		v = e && *e ? atoi(e) : 0;
+		if (v != 4 && v != 8)
+			v = 0;
+	}
+	return v;
+}
+
+/*
+ * ⚠⚠ AND THE V SURFACE'S SCALE LIVES ON THE OTHER AXIS, which is what r406
+ * flagged and what this answers.
+ *
+ * The coefficient buffer holds one scale per OUTPUT CHANNEL. For the scores
+ * matmul the output channels are POSITIONS, so kv_round above -- one scale a
+ * position, shared across head_dim -- is exactly right. For the values matmul
+ * they are HEAD_DIM INDICES: one scale per index, shared across every position
+ * in the context. A scale shared across a whole context is far coarser than
+ * one shared across 64 elements of one position, and V's magnitude varies with
+ * position, so r406's values row was a LOWER BOUND on the damage.
+ *
+ * This simulates the real axis. It keeps the unrounded V in a shadow, tracks a
+ * running absmax per channel, and when a channel's max GROWS it re-rounds
+ * every earlier position of that channel from the shadow -- which is what a
+ * real surface would do, because it would have to repack when its scale moved.
+ * The shadow is why: the cache itself holds rounded values by then, and
+ * re-rounding a rounded value is not the same operation.
+ *
+ * ⚠ It is a simulation and it makes nothing faster. CHARSIU_KV_V_AXIS=chan.
+ */
+static int kv_v_chan(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = getenv("CHARSIU_KV_V_AXIS")
+		    && !strcmp(getenv("CHARSIU_KV_V_AXIS"), "chan");
+	return v;
+}
+
+struct kv_chan {
+	float *orig;       /* the unrounded V, same shape as vcache */
+	float *mx;         /* [n_layer][nkv][hd] running absmax */
+	size_t cells;
+};
+
+static struct kv_chan g_kvc;
+
+static void kv_round_chan(struct llama_state *s, const struct llama_model *m,
+			  uint32_t l, uint32_t kh, unsigned hd,
+			  unsigned hdmax, int pos, const float *src, int bits)
+{
+	size_t base = ((size_t)(l * m->n_head_kv + kh) * s->n_ctx);
+	float *mx;
+	unsigned d;
+	int lv = (1 << (bits - 1)) - 1;
+
+	if (!g_kvc.orig) {
+		g_kvc.cells = (size_t)m->n_layer * m->n_head_kv
+			    * s->n_ctx * hdmax;
+		g_kvc.orig = calloc(g_kvc.cells, sizeof(float));
+		g_kvc.mx = calloc((size_t)m->n_layer * m->n_head_kv * hdmax,
+				  sizeof(float));
+		if (!g_kvc.orig || !g_kvc.mx)
+			return;
+	}
+	mx = g_kvc.mx + (size_t)(l * m->n_head_kv + kh) * hdmax;
+	memcpy(g_kvc.orig + (base + pos) * hdmax, src, hd * sizeof(float));
+	for (d = 0; d < hd; d++) {
+		float a = src[d] < 0.0f ? -src[d] : src[d];
+		int grew = a > mx[d];
+
+		if (grew)
+			mx[d] = a;
+		if (mx[d] == 0.0f)
+			continue;
+		/* ⚠ EVERY EARLIER POSITION OF THIS CHANNEL, from the shadow.
+		 * A real surface repacks when its scale moves, and the cache
+		 * holds rounded values by now. */
+		if (grew) {
+			float sc = mx[d] / (float)lv, inv = 1.0f / sc;
+			int q;
+
+			for (q = 0; q < pos; q++) {
+				float o = g_kvc.orig[(base + q) * hdmax + d];
+				float t = o * inv;
+				int r = (int)(t < 0.0f ? t - 0.5f : t + 0.5f);
+
+				s->vcache[(base + q) * hdmax + d] =
+					(float)r * sc;
+			}
+		}
+		{
+			float sc = mx[d] / (float)lv;
+			float t = src[d] / sc;
+			int r = (int)(t < 0.0f ? t - 0.5f : t + 0.5f);
+
+			s->vcache[(base + pos) * hdmax + d] = (float)r * sc;
+		}
+	}
+}
+
+static void kv_round(float *dst, const float *src, unsigned hd, int bits)
+{
+	float mx = 0.0f, sc, inv;
+	unsigned i;
+
+	for (i = 0; i < hd; i++) {
+		float a = src[i] < 0.0f ? -src[i] : src[i];
+
+		if (a > mx)
+			mx = a;
+	}
+	if (mx == 0.0f) {
+		memcpy(dst, src, hd * sizeof(*dst));
+		return;
+	}
+	/* symmetric, so the level count is 2^(bits-1) - 1 either side */
+	sc = mx / (float)((1 << (bits - 1)) - 1);
+	inv = 1.0f / sc;
+	for (i = 0; i < hd; i++) {
+		float q = src[i] * inv;
+		int r = (int)(q < 0.0f ? q - 0.5f : q + 0.5f);
+
+		dst[i] = (float)r * sc;
+	}
+}
+
+static int attn_npu_soft_pool(void);
 
 static void attn_npu_free(struct attn_npu *a)
 {
@@ -5011,6 +5345,15 @@ static void attn_npu_free(struct attn_npu *a)
 			ref += a->refused[r];
 		fprintf(stderr, "charsiu: fp16 attention ran %lu layers, fell "
 			"back on %lu, refused %lu\n", a->layers, a->fallbacks, ref);
+		if (a->t_layer > 0.0)
+			fprintf(stderr, "charsiu:   of %.0f ms in the layer:"
+				" kv surfaces %.0f  scores group %.0f"
+				"  softmax %.0f (%s)  values group %.0f"
+				"  unaccounted %.0f ms\n",
+				a->t_layer, a->t_kv, a->t_pack1, a->t_soft,
+				attn_npu_soft_pool() ? "pooled" : "one core",
+				a->t_pack2, a->t_layer - a->t_kv - a->t_pack1
+					  - a->t_soft - a->t_pack2);
 		/* ⚠ BY REASON, because "refused 308" is the number that made
 		 * gemma-4 look like a head_dim 512 measurement when 28 of its
 		 * 35 layers are head_dim 256 and never reached the hardware. */
@@ -5019,21 +5362,24 @@ static void attn_npu_free(struct attn_npu *a)
 				fprintf(stderr, "charsiu:   %-12s %lu\n",
 					an_reason[r], a->refused[r]);
 	}
-	if (a->f) {
-		for (i = 0; i < a->n_layer * a->nkv; i++) {
-			if (a->kb)
-				charsiu_fp16_w_free(a->f, a->kb[i]);
-			if (a->vb)
-				charsiu_fp16_w_free(a->f, a->vb[i]);
-		}
-		charsiu_fp16_close(a->f);
+	for (i = 0; a->f && i < a->n_layer * a->nkv; i++) {
+		if (a->kb)
+			charsiu_fp16_w_free(a->f, a->kb[i]);
+		if (a->vb)
+			charsiu_fp16_w_free(a->fv, a->vb[i]);
 	}
+	/* ⚠ fv FIRST. It BORROWS f's device, and charsiu_fp16_close on the
+	 * owner closes that device -- the other order frees fv's buffer
+	 * objects through a file descriptor that is already shut. */
+	if (a->fv)
+		charsiu_fp16_close(a->fv);
+	if (a->f)
+		charsiu_fp16_close(a->f);
 	free(a->kb);
 	free(a->vb);
 	free(a->lhd);
 	free(a->dirty);
 	free(a->packed);
-	free(a->sc);
 	free(a);
 }
 
@@ -5055,9 +5401,33 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	 * and there is nothing to decide without it */
 	if (!m)
 		return NULL;
-	if (!attn_npu_want_for(m->head_dim ? m->head_dim
-					   : m->n_embd / m->n_head))
-		return NULL;
+	{
+		int want = attn_npu_want_for(m->head_dim ? m->head_dim
+					     : m->n_embd / m->n_head);
+
+		if (!want)
+			return NULL;
+		/*
+		 * ⚠⚠ THE DECISION IS HERE, BEFORE THE MIRROR EXISTS, AND THAT
+		 * IS THE WHOLE POINT. r401 put the length test inside
+		 * attn_npu_layer instead and measured it: at 202 tokens every
+		 * threshold cost 107 ms MORE than the CPU arm while refusing
+		 * every single layer, because the K and V surfaces are still
+		 * allocated and still fed by attn_npu_append, which builds the
+		 * mirror itself. A refusal that leaves the cost behind is not
+		 * a refusal.
+		 *
+		 * ⚠ AND IT IS ALL OR NOTHING FOR THE PROMPT. Choosing per
+		 * chunk sounds better and is not: at 852 tokens no threshold
+		 * beat simply being on (7755 to 7911 against 7782), because
+		 * the early chunks lose little and the upkeep is paid either
+		 * way.
+		 */
+		if (want == 2 && (s->prompt_total <= 0 ||
+				  (unsigned)s->prompt_total
+					< attn_npu_min_tokens()))
+			return NULL;
+	}
 	a = calloc(1, sizeof(*a));
 	if (!a)
 		return NULL;
@@ -5081,6 +5451,17 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	 * 2048 context allows 80 rows a pass and a 4096 one allows 40.
 	 */
 	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
+	/*
+	 * ⚠ A PROBE, AND IT ONLY EVER MAKES THINGS SMALLER. The fp16 attention
+	 * fence is 2881 us for a 32 task submit whose tasks are 2.3 MMAC each
+	 * -- about 4.6 us of arithmetic at the rate the int4 path gets out of
+	 * the same silicon in the same process. If that 90 us a task is
+	 * overhead rather than work, then halving mmax should roughly DOUBLE
+	 * the fence at constant total arithmetic, and the answer decides
+	 * whether merging heads is worth writing.
+	 */
+	if (attn_npu_mmax_cap() && a->mmax > attn_npu_mmax_cap())
+		a->mmax = attn_npu_mmax_cap();
 	if (hd < 32 || a->nk < 32 || a->kv < 32 || !a->nkv || !a->mmax)
 		return NULL;
 	a->lhd = calloc(a->n_layer, sizeof(*a->lhd));
@@ -5123,6 +5504,15 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->f = charsiu_fp16_open_on(charsiu_npu_device(s->pool.dev));
 	if (!a->f)
 		a->f = charsiu_fp16_open();   /* no pool: the probes' path */
+	if (a->f) {
+		a->fv = charsiu_fp16_open_on(charsiu_fp16_device(a->f));
+		charsiu_fp16_name(a->f, "scores");
+		charsiu_fp16_name(a->fv, "values");
+		if (!a->fv) {
+			charsiu_fp16_close(a->f);
+			a->f = NULL;
+		}
+	}
 	if (!a->f)
 		return NULL;
 	nbuf = a->n_layer * a->nkv;
@@ -5136,7 +5526,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		unsigned lhd = a->lhd[i / a->nkv];
 
 		a->kb[i] = charsiu_fp16_w_alloc(a->f, lhd, a->nk);
-		a->vb[i] = charsiu_fp16_w_alloc(a->f, a->kv, lhd);
+		a->vb[i] = charsiu_fp16_w_alloc(a->fv, a->kv, lhd);
 		if (!a->kb[i] || !a->vb[i]) {
 			fprintf(stderr, "charsiu: the fp16 KV mirror ran out "
 				"at buffer %u of %u\n", i, nbuf);
@@ -5223,7 +5613,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		kv = a->kvmax;
 
 	for (i = 0; i < a->n_layer * a->nkv; i++) {
-		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->f, kv,
+		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->fv, kv,
 							a->lhd[i / a->nkv]);
 
 		if (!w) {
@@ -5231,15 +5621,15 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 				"grow to %u positions\n", kv);
 			return -1;
 		}
-		charsiu_fp16_w_free(a->f, a->vb[i]);
+		charsiu_fp16_w_free(a->fv, a->vb[i]);
 		a->vb[i] = w;
 	}
 	a->kv = kv;
 	a->mmax = 5120u / (kv / 32u);
+	if (attn_npu_mmax_cap() && a->mmax > attn_npu_mmax_cap())
+		a->mmax = attn_npu_mmax_cap();
 	if (!a->mmax)
 		return -1;
-	if (a->sc)
-		memset(a->sc, 0, a->sc_cells * sizeof(*a->sc));
 
 	/* every position that already exists, through the packer the append
 	 * path uses, out of the float cache that both paths write */
@@ -5336,6 +5726,150 @@ static void attn_npu_catchup(struct llama_state *s, struct attn_npu *a,
 }
 
 /*
+ * ⚠⚠ THE SOFTMAX BETWEEN THE TWO MATMULS WAS THE BIGGEST THING IN THIS ARM
+ * AND NOTHING WAS COUNTING IT.
+ *
+ * The fp16 counters account for 2129 ms of an 852 token prompt's attention;
+ * the stage table puts the whole stage at 4669 ms. The other 2540 ms is the
+ * loop below, and it was a bare `for (h) for (r)` -- the one stage of this
+ * path that never used the pool, sitting between two that do. Same shape as
+ * `silu * up`, which was 11% of a batched prompt for the same reason.
+ *
+ * A unit is one (head, row). Rows cost O(pos), so a worker handed a
+ * contiguous span would be unbalanced if the span were part of a head -- but
+ * H * m units over four workers is whole heads each, and every head has the
+ * same distribution of rows, so the split is even by construction.
+ */
+static double attn_npu_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+struct attn_npu_soft {
+	struct attn_npu *a;
+	const struct attn_block_job *j;
+	unsigned m, rb, npad;
+	float *sc[FP16_GROUP_MAX];   /* head h's scores, where they lie */
+};
+
+static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
+{
+	struct attn_npu_soft *c = ctx;
+	const struct attn_block_job *j = c->j;
+	uint64_t u;
+
+	for (u = u0; u < u0 + n; u++) {
+		unsigned h = (unsigned)(u / c->m), r = (unsigned)(u % c->m);
+		/* ⚠ WHERE THE SCORES MATMUL LEFT THEM, not in a copy of them.
+		 * The rows are npad apart here and not kv, because this is
+		 * the answer's own layout; the values pack is told the same
+		 * stride and never reads past a row because xtri0 stops it
+		 * at pos + 1 <= npad. */
+		float *sr = c->sc[h] + (size_t)r * c->npad;
+		int pos = j->pos0 + (int)c->rb + (int)r;
+		int tlo = j->swa && pos + 1 > j->n_swa
+			? pos + 1 - j->n_swa : 0;
+		int t;
+
+		/* ⚠ the scale the CPU arm applies inside attn_dot rides
+		 * along inside the softmax here -- see softmax_scaled. It was
+		 * a pass of its own over the row, and the row is the context
+		 * length. */
+		for (t = 0; t < tlo; t++)
+			sr[t] = 0.0f;
+		softmax_scaled(sr + tlo, pos + 1 - tlo, j->scale);
+		/*
+		 * ⚠⚠ AND THE TAIL IS NOT ZEROED HERE ANY MORE. It used to be
+		 * `for (t = pos + 1; t < npad; t++) sr[t] = 0.0f`, which is
+		 * 58% of the row at 852 tokens and k = 1024 -- and the only
+		 * reader of it is the values pack, which is told the same
+		 * triangle through xtri0 and memsets its own destination.
+		 * Zeroing the source so the pack can convert a zero into a
+		 * zero was the work being done twice.
+		 *
+		 * ⚠ THE ORDER THIS WAS DONE IN IS THE ARGUMENT. The promise
+		 * was verified on hardware FIRST, while this loop still
+		 * enforced it: r400 ran CHARSIU_FP16_TRI_CHECK=1 at 852
+		 * tokens, read back all 98,114,560 elements the pack was told
+		 * to skip, and every one was zero. Only then was the
+		 * enforcement removed. What is left past pos is now the RAW
+		 * scores the matmul wrote, so the pack's memset is no longer
+		 * an optimisation -- it is what makes the answer right, which
+		 * is why xtri0 has no knob.
+		 */
+	}
+}
+
+/* the arm is named in both directions: =0 is the bare loop it replaced */
+static int attn_npu_soft_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_POOL", 1);
+	return v;
+}
+
+/*
+ * ⚠⚠⚠ THE SCORES MATMUL IS A WRITE, AND IT WAS WRITING A RECTANGLE WHERE THE
+ * ANSWER IS A TRIANGLE.
+ *
+ * r407 held the OUTPUT WIDTH still and re-measured the dtype factor that this
+ * whole road was built on: at m=78 k=64 n=864 the fp16 arm is 166 us and the
+ * int8 arm is 172 and 159 -- the same. r404's "2.4x for an int8 KV surface"
+ * was its fp16 arm writing four bytes an output and its int8 arm writing one,
+ * and the weight dtype was worth nothing at all.
+ *
+ * What that measurement leaves behind is the real shape of the cost. Holding
+ * m and k still and moving only n: 864 -> 174 us, 432 -> 94, 224 -> 61,
+ * 112 -> 42. About 22 us of fixed cost and 0.176 us a column, which at this
+ * shape is 74% of the fence in the output write and the weight fetch.
+ *
+ * And n did not have to be the whole prompt. A chunk of rows starting at
+ * position p0 attends to nothing after its own last row, so every column past
+ * p0 + m is computed, written, and then MEMSET BY THE VALUES PACK -- xtri0 has
+ * been telling the pack that since r400. The scores matmul was the one stage
+ * that did not know.
+ *
+ * ⚠ THE ROUNDING IS NOT COSMETIC. charsiu_fp16_woffset stops depending on n
+ * once every n group is full, which is what lets one surface be appended to
+ * and run at many widths -- and the group is 16. A width that is not a
+ * multiple of 16 is a different permutation of the same bytes, so this rounds
+ * UP to 16 and never down. 32 is the floor the unit refuses below.
+ *
+ * 🏁 AND IT IS WORTH EXACTLY NOTHING AT THE SHIPPED BLOCK SIZE, MEASURED.
+ * r407, four prompt lengths, arms alternating: the scores fence is 19/19,
+ * 70/70, 216/216, 385/385 ms and TTFT 0.999, 0.985, 0.993, 1.000. Identical
+ * text.
+ *
+ * The reason is in this function and not in the hardware. T is pos0 + j->n --
+ * the block's OWN last position, not the prompt's -- so npad is already the
+ * causal width of the block. The rb loop is what this could narrow, and it
+ * runs once: llama_prefill_chunk_cap is 163840/1024 = 160 on this model and
+ * a->mmax is 5120/(kv/32) = 160 too, so j->n never exceeds mmax.
+ *
+ * ⚠ AND SUB-CHUNKING TO MAKE IT LIVE IS A NET LOSS, by arithmetic rather than
+ * by a round: at 852 tokens, splitting the 160 row block in two takes the
+ * columns computed from 537600 to 499200, 7%, while doubling the task count --
+ * which r403 priced at 0.27 ms a row per doubling, 10% of attention.
+ *
+ * It stays on because it is never MORE work and it pays if a->mmax ever falls
+ * below the chunk cap (a longer context lowers mmax). The measurement is here
+ * so the next reader does not spend a round rediscovering the zero.
+ */
+static int attn_npu_causal_n(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_CAUSAL_N", 1);
+	return v;
+}
+
+/*
  * A whole layer of attention for a chunk of rows, or -1 to say the CPU should
  * do it. Returning -1 is always safe; the float cache is written either way.
  */
@@ -5346,6 +5880,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	struct charsiu_fp16_op op[FP16_GROUP_MAX];
 	unsigned H = j->n_head, hd = j->hd, i, h, rb;
 	unsigned T, npad;
+	double tl0 = 0.0, tk0 = 0.0, tg0;
 
 	/* ⚠ ONE REASON A TEST. These used to be two compound conditions, so
 	 * even a counter on them could not have said WHICH clause refused --
@@ -5380,6 +5915,8 @@ static int attn_npu_layer(struct attn_block_job *j)
 	if (T > a->kv) {
 		a->refused[AN_R_KV]++; return -1;
 	}
+	tl0 = attn_npu_now_ms();
+	tk0 = tl0;
 	/* ⚠ before anything reads the mirror: a generation between two prompts
 	 * left positions in the float cache and not in here */
 	attn_npu_catchup(s, a, j->l, T);
@@ -5398,77 +5935,119 @@ static int attn_npu_layer(struct attn_block_job *j)
 	if (a->dirty[j->l]) {
 		for (i = 0; i < a->nkv; i++) {
 			charsiu_fp16_w_end(a->f, a->kb[j->l * a->nkv + i]);
-			charsiu_fp16_w_end(a->f, a->vb[j->l * a->nkv + i]);
+			charsiu_fp16_w_end(a->fv, a->vb[j->l * a->nkv + i]);
 		}
 		a->dirty[j->l] = 0;
 	}
+	a->t_kv += attn_npu_now_ms() - tk0;
 
 	for (rb = 0; rb < (unsigned)j->n; rb += a->mmax) {
 		unsigned m = (unsigned)j->n - rb < a->mmax
 			   ? (unsigned)j->n - rb : a->mmax;
-		/*
-		 * ⚠⚠ THE SCRATCH IS INDEXED BY mmax AND NOT BY m, AND THE
-		 * DIFFERENCE IS A WRONG ANSWER.
-		 *
-		 * The zeros past the last token are what makes the values
-		 * matmul legal: it runs at k = the context length whatever the
-		 * prompt has reached, and the tail must contribute nothing.
-		 * They come from the calloc and survive because nothing ever
-		 * writes there. Index a head's block by the CURRENT m and a
-		 * chunk with fewer rows than the last one moves every row
-		 * boundary, so a row's tail lands on the previous chunk's
-		 * probabilities instead of on zero -- and every token after it
-		 * attends to positions that are not in its prompt. Fixed
-		 * strides, always mmax.
-		 */
-		size_t need = (size_t)H * a->mmax * a->kv;
-		size_t qstride = (size_t)H * hd;
+		/* the columns THIS chunk can reach, rounded to the n group.
+		 * Everything past it is a score no row of this chunk will
+		 * ever read: the softmax stops at pos + 1 and the values pack
+		 * memsets from xtri0 + r. */
+		unsigned cn = (unsigned)j->pos0 + rb + m;
 
-		if (a->sc_cells < need) {
-			free(a->sc);
-			a->sc = calloc(need, sizeof(*a->sc));
-			a->sc_cells = a->sc ? need : 0;
-			if (!a->sc)
-				return -1;
-		}
+		cn = (cn + 15u) & ~15u;
+		if (cn < 32u)
+			cn = 32u;
+		if (cn > npad || !attn_npu_causal_n())
+			cn = npad;
+		/*
+		 * ⚠⚠ THE SCRATCH THAT USED TO BE HERE IS GONE, AND SO IS THE
+		 * TRAP IT CARRIED.
+		 *
+		 * It was [H][mmax][kv] floats, and this paragraph warned that
+		 * indexing a head's block by the CURRENT m rather than by mmax
+		 * moves every row boundary, so a chunk with fewer rows than
+		 * the last one lands a row's tail on the previous chunk's
+		 * probabilities and every token after it attends to positions
+		 * that are not in its prompt. That was a real fault and the
+		 * comment was the only thing holding it off.
+		 *
+		 * The scores now stay in the device buffer the matmul wrote
+		 * them into, laid out by ITS plan rather than by a stride this
+		 * file chooses -- so there is no stride here to get wrong, no
+		 * 10.5 MB allocation, and no tail inherited from the last
+		 * chunk. What makes the values matmul legal past the last
+		 * token is xtri0 and the pack's memset, not a calloc.
+		 */
+		size_t qstride = (size_t)H * hd;
 		for (h = 0; h < H; h++) {
 			memset(&op[h], 0, sizeof(op[h]));
 			op[h].X = j->q + (size_t)rb * qstride + (size_t)h * hd;
 			op[h].xstride = (unsigned)qstride;
 			op[h].Wbuf = a->kb[j->l * a->nkv + h / j->gqa];
-			op[h].Y = a->sc + (size_t)h * a->mmax * a->kv;
-			op[h].ystride = a->kv;
+			/* ⚠ A NULL Y LEAVES THE ANSWER IN THE DEVICE BUFFER,
+			 * which the softmax below then reduces over in place.
+			 * The copy this replaces was 1.5 GB and 245 ms of
+			 * `read` at 852 tokens, and a softmax reads every one
+			 * of those floats either way. Safe only because the
+			 * values matmul runs on a DIFFERENT handle: the
+			 * buffer is held until the next group on this one. */
+			op[h].Y = NULL;
+			op[h].ystride = 0;
 			op[h].m = m;
 			op[h].k = hd;
-			op[h].n = npad;
+			op[h].n = cn;
 		}
+		tg0 = attn_npu_now_ms();
 		if (charsiu_fp16_matmul_group(a->f, op, H)) {
 			a->fallbacks++;
 			return -1;
 		}
-		for (h = 0; h < H; h++)
-			for (unsigned r = 0; r < m; r++) {
-				float *sr = a->sc
-					  + ((size_t)h * a->mmax + r) * a->kv;
-				int pos = j->pos0 + (int)rb + (int)r;
-				int tlo = j->swa && pos + 1 > j->n_swa
-					? pos + 1 - j->n_swa : 0;
-				int t;
+		a->t_pack1 += attn_npu_now_ms() - tg0;
+		{
+			struct attn_npu_soft sc = { a, j, m, rb, cn, {0} };
+			double ts = attn_npu_now_ms();
 
-				/* ⚠ the scale the CPU arm applies inside
-				 * attn_dot, applied here on the way past */
-				for (t = 0; t < tlo; t++)
-					sr[t] = 0.0f;
-				for (t = tlo; t <= pos; t++)
-					sr[t] *= j->scale;
-				softmax(sr + tlo, pos + 1 - tlo);
-				for (t = pos + 1; t < (int)npad; t++)
-					sr[t] = 0.0f;
+			for (h = 0; h < H; h++) {
+				sc.sc[h] = charsiu_fp16_out_w(a->f, h);
+				if (!sc.sc[h]) {
+					a->fallbacks++;
+					return -1;
+				}
 			}
+
+			if (attn_npu_soft_pool())
+				charsiu_parallel_for(attn_npu_soft_units, &sc,
+						     (uint64_t)H * m);
+			else
+				attn_npu_soft_units(&sc, 0, (uint64_t)H * m);
+			a->t_soft += attn_npu_now_ms() - ts;
+		}
 		for (h = 0; h < H; h++) {
 			memset(&op[h], 0, sizeof(op[h]));
-			op[h].X = a->sc + (size_t)h * a->mmax * a->kv;
-			op[h].xstride = a->kv;
+			op[h].X = charsiu_fp16_out_w(a->f, h);
+			/* ⚠ THE ANSWER'S OWN STRIDE, which is the width the
+			 * scores matmul ran at and not the prompt's. */
+			op[h].xstride = cn;
+			/*
+			 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
+			 * NOTHING AFTER ITSELF, AND THE PACK IS WHAT ENFORCES
+			 * THAT NOW.
+			 *
+			 * The loop above used to zero [pos+1, npad) itself and
+			 * [npad, kv) came from the scratch's calloc, so this
+			 * promise was merely an optimisation: the pack could
+			 * memset a tail that was already zero instead of
+			 * converting it. That trailing loop is gone -- it was
+			 * 58% of a row, in the one stage of this path with no
+			 * pool behind it -- so past pos this scratch holds the
+			 * RAW scores the matmul wrote, and the memset in
+			 * charsiu_fp16_matmul_group is what makes those
+			 * positions contribute nothing.
+			 *
+			 * ⚠ Which also means the calloc is no longer load
+			 * bearing, and the promise is no longer optional. The
+			 * order that made the swap safe is in r400/r401: the
+			 * tail was READ BACK on hardware and found zero while
+			 * the loop still wrote it, and only then was the loop
+			 * removed.
+			 */
+			op[h].xtri0 = (unsigned)j->pos0 + rb + 1;
 			op[h].Wbuf = a->vb[j->l * a->nkv + h / j->gqa];
 			op[h].Y = j->out + (size_t)rb * qstride
 				+ (size_t)h * hd;
@@ -5477,12 +6056,21 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].k = a->kv;
 			op[h].n = hd;
 		}
-		if (charsiu_fp16_matmul_group(a->f, op, H)) {
+		tg0 = attn_npu_now_ms();
+		if (charsiu_fp16_matmul_group(a->fv, op, H)) {
 			a->fallbacks++;
 			return -1;
 		}
+		/* ⚠ THE VALUES PACK HAS NOW FINISHED READING THE SCORES, and
+		 * this is the only moment at which the next call's sentinels
+		 * can be written: after the softmax stopped overwriting them
+		 * and before the buffer goes back to the device. It saves two
+		 * whole-buffer dma_syncs a call. */
+		charsiu_fp16_poison_and_release(a->f);
+		a->t_pack2 += attn_npu_now_ms() - tg0;
 	}
 	a->layers++;
+	a->t_layer += attn_npu_now_ms() - tl0;
 	return 0;
 }
 
@@ -6119,8 +6707,18 @@ static int prefill_grouped(void)
  * into 3n separate ones the moment the batch is refused, which on int4 is
  * always. I did that to this loop two commits ago.
  */
-static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
-		       const float *X, int n, float *Y, uint32_t k, uint32_t nout)
+/*
+ * ⭐⭐ `defer` LEAVES THE ANSWER IN THE DEVICE BUFFER for the NEXT matmul's
+ * submit to gather behind, which is 1.93 ms a row of CPU work moved into
+ * 1.82 ms a row of sleeping fence (r407). It is only legal when the very next
+ * thing the caller does is another matmul that does not read Y -- gate before
+ * up, q before k -- and the caller owes a charsiu_npu_flush before the
+ * consumer, because the next matmul can be REFUSED and then nothing on the
+ * hardware path will do it.
+ */
+static int matmul_rows_x(struct llama_state *s, const struct gguf_tensor *w,
+			 const float *X, int n, float *Y, uint32_t k,
+			 uint32_t nout, int defer)
 {
 	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
 	int id = npu_id_for(s, w);   /* stages the tensor on first use */
@@ -6128,7 +6726,10 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 	bmm_calls++;
 	if (id >= 0) {
 		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
-		if (!charsiu_npu_matmul(s->pool.dev, id, X, (unsigned)n, Y)) {
+		if (!(defer ? charsiu_npu_matmul_defer(s->pool.dev, id, X,
+						       (unsigned)n, Y)
+			    : charsiu_npu_matmul(s->pool.dev, id, X,
+						 (unsigned)n, Y))) {
 			if (stage_on > 0) {
 				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
 
@@ -6209,14 +6810,29 @@ static int reuse_site(char which)
 	return 1;
 }
 
-static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
-			    const float *X, int n, float *Y, uint32_t k,
-			    uint32_t nout, char site)
+static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
+		       const float *X, int n, float *Y, uint32_t k,
+		       uint32_t nout)
+{
+	return matmul_rows_x(s, w, X, n, Y, k, nout, 0);
+}
+
+static int matmul_rows_defer(struct llama_state *s,
+			     const struct gguf_tensor *w, const float *X,
+			     int n, float *Y, uint32_t k, uint32_t nout)
+{
+	return matmul_rows_x(s, w, X, n, Y, k, nout, 1);
+}
+
+static int matmul_rows_same_x(struct llama_state *s,
+			      const struct gguf_tensor *w, const float *X,
+			      int n, float *Y, uint32_t k, uint32_t nout,
+			      char site, int defer)
 {
 	int id = npu_id_for(s, w);
 
 	if (!reuse_site(site))
-		return matmul_rows(s, w, X, n, Y, k, nout);
+		return matmul_rows_x(s, w, X, n, Y, k, nout, defer);
 	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
 	/* id was taken above, before t0: the staging on first use is not in this
 	 * wrapper's column, and the stage clock subtracts it on its own */
@@ -6224,7 +6840,10 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 	bmm_calls++;
 	if (id >= 0) {
 		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
-		if (!charsiu_npu_matmul_same(s->pool.dev, id, X, (unsigned)n, Y)) {
+		if (!(defer ? charsiu_npu_matmul_same_defer(s->pool.dev, id, X,
+							   (unsigned)n, Y)
+			    : charsiu_npu_matmul_same(s->pool.dev, id, X,
+						      (unsigned)n, Y))) {
 			if (stage_on > 0) {
 				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
 
@@ -6242,6 +6861,93 @@ static int matmul_rows_same(struct llama_state *s, const struct gguf_tensor *w,
 	if (stage_on > 0)
 		bmm_fell_ms += now_ms() - t0;
 	return 0;
+}
+
+static int matmul_rows_same_defer(struct llama_state *s,
+				  const struct gguf_tensor *w, const float *X,
+				  int n, float *Y, uint32_t k, uint32_t nout,
+				  char site)
+{
+	return matmul_rows_same_x(s, w, X, n, Y, k, nout, site, 1);
+}
+
+/*
+ * ⭐⭐⭐ SPLIT THE ROWS SO THERE IS ALWAYS SOMETHING TO HIDE THE GATHER BEHIND.
+ *
+ * The deferral above only pays where the caller has a second INDEPENDENT
+ * matmul to issue -- gate/up and q/k/v -- and that covers about a quarter of
+ * the gather. Rows are independent ALWAYS: chunk rows [0, h) and [h, n) of one
+ * tensor read different activations and write different rows of Y, so the
+ * first half's answer can be gathered while the second half's job runs, on
+ * every tensor including the ones with no partner.
+ *
+ * ⚠ IT IS NOT FREE ON THE HARDWARE SIDE. charsiu_int4 --cost at the gate/up
+ * shape, k=2048 n=8192, fp16 activations, two passes each:
+ *
+ *     m = 78   4792 / 4801 us      m = 39   2925 / 2925      m = 20  1976
+ *
+ * so two halves cost 22% more NPU time than one whole. The trade is only worth
+ * making because the gather is LARGER than the fence it hides behind (1.93
+ * against 1.82 a row), and 22% of the smaller one buys overlap on the bigger.
+ *
+ * ⚠ BOTH HALVES MUST BE EVEN. w4_batch_why_not refuses an odd width -- the
+ * accumulator surface is organised in PAIRS of rows and no integer P works for
+ * an odd m, which tools/acc_index_check asserts rather than prints.
+ *
+ * ⚠ AND BOTH DEFER. The tail is flushed by the caller's charsiu_npu_flush,
+ * which every site that uses this already owes.
+ *
+ * ⛔⛔ AND THE BOARD SAYS NO: 9153 / 9004 ms against 6829 / 6631, text
+ * identical. The arithmetic that predicted a win was right about the hardware
+ * and wrong about the CPU, and the entry split says exactly where:
+ *
+ *     no split      pack 0.81   fence 1.33   read 2.05 ms a row
+ *     ROWSPLIT=8    pack 1.46   fence 1.13   read 4.35
+ *
+ * The FENCE did fall -- the overlap works -- and the gather more than DOUBLED
+ * for the same total bytes, with the pack close behind. Both are per CALL
+ * costs that do not scale with m: charsiu_pack_input fills the whole input
+ * buffer with the zero point before writing anything, and the read walks Y
+ * once per slot. Halving the rows doubles the calls and pays each of those
+ * twice, which is larger than all the fence there was to hide.
+ *
+ * 🔑 Same shape as the dma_sync note in npufp16.c: a cost charged on the WHOLE
+ * buffer does not halve when the work does. Default 0; the code is kept so the
+ * next person to have this idea can run it rather than write it again.
+ */
+static int rowsplit_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_ROWSPLIT");
+
+		/* 0 disables it; otherwise the smallest n worth splitting */
+		v = e ? atoi(e) : 0;
+	}
+	return v;
+}
+
+static int matmul_rows_split(struct llama_state *s,
+			     const struct gguf_tensor *w, const float *X,
+			     int n, float *Y, uint32_t k, uint32_t nout,
+			     char site, int same)
+{
+	int lo = rowsplit_min(), h;
+
+	h = (n / 2) & ~1;
+	if (!lo || n < lo || h < 2 || n - h < 2)
+		return same ? matmul_rows_same_defer(s, w, X, n, Y, k, nout,
+						     site)
+			    : matmul_rows_defer(s, w, X, n, Y, k, nout);
+	/* ⚠ the FIRST half takes the `same` reuse key if there is one; the
+	 * second is a different X and would miss anyway */
+	if (same)
+		matmul_rows_same_defer(s, w, X, h, Y, k, nout, site);
+	else
+		matmul_rows_defer(s, w, X, h, Y, k, nout);
+	return matmul_rows_defer(s, w, X + (size_t)h * k, n - h,
+				 Y + (size_t)h * nout, k, nout);
 }
 
 /*
@@ -6752,15 +7458,21 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
-			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
-				    m->n_head * hd);
 			/* ⚠ nothing writes bxb between these three: the
-			 * declaration below is only true because of that */
-			matmul_rows_same(s, L->wk, s->bxb, n, s->bk, m->n_embd,
-					 m->n_head_kv * hd, 'k');
+			 * declaration below is only true because of that --
+			 * and it is also what makes the deferral legal. q's
+			 * answer is gathered while k's job runs and k's while
+			 * v's does; the flush covers a refusal that would
+			 * otherwise leave the last one unwritten. */
+			matmul_rows_split(s, L->wq, s->bxb, n, s->bq,
+					  m->n_embd, m->n_head * hd, 0, 0);
+			matmul_rows_split(s, L->wk, s->bxb, n, s->bk,
+					  m->n_embd, m->n_head_kv * hd, 'k', 1);
 			if (L->wv)
-				matmul_rows_same(s, L->wv, s->bxb, n, s->bv,
-						 m->n_embd, m->n_head_kv * hd, 'v');
+				matmul_rows_split(s, L->wv, s->bxb, n, s->bv,
+						  m->n_embd,
+						  m->n_head_kv * hd, 'v', 1);
+			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
@@ -6838,17 +7550,42 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						      + kh)
 						      * s->n_ctx + pos) * hdmax;
 
-					memcpy(s->kcache + off, kr + kh * hd,
-					       hd * sizeof(float));
-					memcpy(s->vcache + off, vr + kh * hd,
-					       hd * sizeof(float));
+					const float *ks = kr + kh * hd;
+					const float *vs = vr + kh * hd;
+
+					/* ⚠ NOT BY MOVING kr. The first draft
+					 * rebased kr inside this loop, which
+					 * made head kh+1 read one head_dim on
+					 * from head kh's slot instead of a
+					 * whole context away. A simulation with
+					 * that in it would have been measured
+					 * and believed. */
+					if (kv_bits()) {
+						kv_round(s->kcache + off, ks,
+							 hd, kv_bits());
+						if (kv_v_chan())
+							kv_round_chan(s, m, l,
+								kh, hd, hdmax,
+								pos, vs,
+								kv_bits());
+						else
+							kv_round(s->vcache
+								 + off, vs, hd,
+								 kv_bits());
+						ks = s->kcache + off;
+						vs = s->vcache + off;
+					} else {
+						memcpy(s->kcache + off, ks,
+						       hd * sizeof(float));
+						memcpy(s->vcache + off, vs,
+						       hd * sizeof(float));
+					}
 					/* ⚠ the fp16 mirror is written HERE and
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
 					 * cannot drift by a rope or a norm */
 					attn_npu_append(s, l, kh, hd, pos,
-							kr + kh * hd,
-							vr + kh * hd);
+							ks, vs);
 				}
 			if (attn_block_rows() > 0) {
 				/*
@@ -6934,10 +7671,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 
 		/* gate and up read one norm as well: the same choice */
 		if (!prefill_grouped() || will_batch(s, L->gate)) {
-			matmul_rows(s, L->gate, s->bxb, n, s->bhb, m->n_embd,
-				    nff);
-			matmul_rows_same(s, L->up, s->bxb, n, s->bhb2,
-					 m->n_embd, nff, 'u');
+			/* ⭐ gate's answer is gathered while UP's job runs:
+			 * they multiply the same norm and neither reads the
+			 * other, which is the only condition the deferral has.
+			 * The flush below covers the case where up is refused
+			 * and never reaches the hardware to do it. */
+			matmul_rows_split(s, L->gate, s->bxb, n, s->bhb,
+					  m->n_embd, nff, 0, 0);
+			matmul_rows_split(s, L->up, s->bxb, n, s->bhb2,
+					  m->n_embd, nff, 'u', 1);
+			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
 				matvec_pair(s, s->bxb + (size_t)r * m->n_embd,
@@ -6956,7 +7699,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				silu_rows(&sj, 0, (uint64_t)n);
 		}
 		BSTAGE(ST_SILU);
-		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
+		if (rowsplit_min()) {
+			matmul_rows_split(s, L->down, s->bhb, n, s->bxo, nff,
+					  m->n_embd, 0, 0);
+			charsiu_npu_flush(s->pool.dev);
+		} else {
+			matmul_rows(s, L->down, s->bhb, n, s->bxo, nff,
+				    m->n_embd);
+		}
 		BSTAGE(ST_DOWN);
 		{
 			struct norm_rows_job nj = { s, m, L };
@@ -7175,6 +7925,12 @@ int llama_prefill_chunk_cap(const struct llama_model *m)
 	/* ⚠ a floor of 2, because a chunk of one is the token loop wearing
 	 * the batched path's name, and the caller has its own minimum */
 	return cap < 2 ? 2 : (int)cap;
+}
+
+void llama_prefill_hint(struct llama_state *s, int total)
+{
+	if (s)
+		s->prompt_total = total;
 }
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
@@ -7497,10 +8253,31 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
 					      * s->n_ctx + pos) * hdmax;
 
+				if (kv_bits()) {
+					/* ⚠ THE TOKEN LOOP TOO. The first
+					 * version patched only the batched
+					 * path, and charsiu_ppl without
+					 * --batch runs THIS one -- so the
+					 * per-channel arm returned its control
+					 * to the last digit, which is what an
+					 * arm that never ran looks like. */
+					kv_round(s->kcache + off,
+						 s->k + kh * hd, hd, kv_bits());
+					if (kv_v_chan())
+						kv_round_chan(s, m, l, kh, hd,
+							      hdmax, pos,
+							      s->v + kh * hd,
+							      kv_bits());
+					else
+						kv_round(s->vcache + off,
+							 s->v + kh * hd, hd,
+							 kv_bits());
+				} else {
 				memcpy(s->kcache + off, s->k + kh * hd,
 				       hd * sizeof(float));
 				memcpy(s->vcache + off, s->v + kh * hd,
 				       hd * sizeof(float));
+				}
 				/*
 				 * ⚠ THE DECODE PATH NO LONGER WRITES THE
 				 * MIRROR. It used to, so that a prompt

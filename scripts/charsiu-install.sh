@@ -931,12 +931,19 @@ RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 # six attention defaults chosen on a compute bound desktop are still the
 # defaults on a bandwidth bound board. Anything added to PROBE_SCRIPTS that
 # runs a binary has to add the binary here in the same edit.
-PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt npu_mixed_test out16_bound"
+PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt npu_mixed_test out16_bound bench_gather"
 # ⚠ EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
 # down says a probe that lives only in the source tree under ~/.cache is a
 # board round that does not happen -- and then only prefill_control.sh was
 # listed, so every board_*.sh written since has been exactly that: reachable
 # by a path nobody types.
+#
+# ⚠⚠ AND IT DRIFTED AGAIN, which is why `make test` now diffs this list
+# against tests/board_*.sh. Six scripts written between 09-11 and 09-13 --
+# board_cpu_clock, board_ttft_curve, board_attn_npu, board_chunk_band,
+# board_width_atom, board_core_cost -- were all missing on 09-13. A warning in
+# a comment does not survive the next person in a hurry, and the person in a
+# hurry was the one who wrote the warning.
 PROBE_SCRIPTS="board_next.sh spec_identity.sh prefill_control.sh board_w4_axis.sh board_rows_sweep.sh \
 board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh \
 board_threads.sh board_w4_m8.sh vattn_sweep.sh vattn_edges.sh \
@@ -944,7 +951,10 @@ board_text_all.sh board_refused_onedev.sh board_chunk_sweep.sh board_intermitten
 board_ab.sh board_width_law.sh board_verify.sh verify_selftest.sh whisper_transcribe.sh \
 board_overlap_slots.sh board_attn_block.sh board_awq.sh host_awq.sh \
 corpus_fixed.sh board_record.sh vendor_quality.sh board_bimodal.sh \
-board_prefill_stages.sh"
+board_prefill_stages.sh board_cpu_clock.sh board_ttft_curve.sh \
+board_attn_npu.sh board_chunk_band.sh board_width_atom.sh \
+board_core_cost.sh board_fp16_pack.sh board_fp16_tri.sh board_fp16_read.sh
+board_w8a16.sh board_causal_n.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;

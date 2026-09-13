@@ -46,6 +46,12 @@ $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# ⚠ AND STATICALLY, FOR THE BOARD. tools/cmp_vendor.py needs this emitter and
+# the vendor's .rkllm in the same place, and the .rkllm is 1.3 GB on a board
+# whose desk has 2.5 GB free -- so the diff runs there, not here.
+$(BUILD)/emit_job.aarch64: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
 # ⚠ THE OTHER m > 1 PROBE, AND IT HAD NO NATIVE TARGET AT ALL.
 #
 # npu_gemm_test asks the hardware for the raw int32 accumulator and reads it
@@ -93,8 +99,17 @@ $(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BU
 $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
-$(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
-	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
+#
+# ⚠⚠ AND IT WENT STALE THE SAME WAY, IN BOTH SCALAR RULES. The paragraph
+# below this one says "a target that is never built is a target that is
+# already broken" about exactly this, and then the two charsiu_run_scalar
+# rules kept the pre-vision source list anyway -- so tests/neon_control.sh,
+# the tree's own control for "a vector kernel that is wrong still produces
+# fluent text", has not linked since vision landed and therefore has not run.
+# `make test` builds it now, which is the only thing that keeps a list honest.
+#
+$(BUILD)/charsiu_run_scalar: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
 
 #
 # ⚠ THE SOURCE LIST HAS TO TRACK charsiu_run's. This rule went stale when
@@ -105,6 +120,14 @@ $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 #
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
+
+# ⚠ THE SHAPE PROBE, ON THE BOARD. npu_fp16_test only ever built for the host,
+# and the host build is dynamically linked against a glibc the board does not
+# have -- so the one tool that can price an fp16 matmul at a CHOSEN shape could
+# not be run where the shapes matter. Same caveat as every rule here: this
+# source list has to track npu_fp16_test's.
+$(BUILD)/npu_fp16_test.aarch64: tools/npu_fp16_test.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
 # ⚠ THE QUALITY INSTRUMENT, ON THE BOARD. charsiu_ppl only ever built for the
 # host, so every perplexity and every --top1 in this tree came from the CPU
@@ -127,8 +150,8 @@ $(BUILD)/charsiu_ppl.aarch64: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 #
 # which is checked on the host and is still a NEON bug detector: every vector
 # path that is meant to be bit identical still has to reproduce it.
-$(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
-	$(CROSS)gcc $(CFLAGS) -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
+$(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
 
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
@@ -137,7 +160,7 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_membw.aarch64 $(BUILD)/charsiu_check.aarch64 \
        $(BUILD)/charsiu_serve.aarch64 $(BUILD)/charsiu_vision.aarch64 \
        $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64 \
-       $(BUILD)/vattn_bench.aarch64
+       $(BUILD)/vattn_bench.aarch64 $(BUILD)/npu_fp16_test.aarch64
 
 # ⚠ THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
 # round reaches for, and a tool that is only in the native build is one that has
@@ -168,7 +191,11 @@ $(BUILD)/charsiu_matmul.aarch64: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 $(BUILD)/charsiu_bench.aarch64: tools/charsiu_bench.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
-$(BUILD)/charsiu_int4.aarch64: tools/charsiu_int4.c $(SRC) | $(BUILD)
+# ⚠ AND src/gguf.c, WHICH IS WHERE charsiu_env_flag LIVES. This rule is in
+# `board:` and has not linked -- a third instance today of the sentence three
+# rules above: a target that is never built is a target that is already broken.
+# Nothing in `make test` builds it either, which is why nothing said so.
+$(BUILD)/charsiu_int4.aarch64: tools/charsiu_int4.c $(SRC) src/gguf.c | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
 $(BUILD)/charsiu_vendor.aarch64: tools/charsiu_vendor.c $(SRC) | $(BUILD)
@@ -235,13 +262,21 @@ $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 $(BUILD)/bench_gather: tools/bench_gather.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# ⚠ AND THE BOARD BUILD, because this tool's OWN HEADER says the host cannot
+# answer its question -- "the host is aarch64 with caches that dwarf the
+# board's ... the ratio is the thing to carry". It had a host rule only, and
+# no board log mentions it, so the one instrument written for the largest line
+# in the prefill had never been run where the argument lives.
+$(BUILD)/bench_gather.aarch64: tools/bench_gather.c $(SRC) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
+
 $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -249,10 +284,15 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
+	./$(BUILD)/pack_w8
+	./$(BUILD)/pack_f16run
+	./$(BUILD)/sentinel
+	./$(BUILD)/coef_scales
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
 	./tests/corpus_fixed.sh
+	./tests/probe_list.sh
 #
 # ⚠ THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the
@@ -272,6 +312,30 @@ $(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# charsiu_w8_offset against charsiu_pack_weights, cell by cell. Two pieces of
+# code describing one permutation is the arrangement that lets a KV surface be
+# written in place, and a disagreement between them prints nothing
+$(BUILD)/pack_w8: tests/pack_w8.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the vector fp16 conversion against the per element definition, over all 2^32
+# floats. It is header only, so this links nothing: the run and the definition
+# both live in charsiu.h precisely so they cannot drift into two conversions
+$(BUILD)/pack_f16run: tests/pack_f16run.c include/charsiu.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
+
+# the output sentinel, driven through all three verdicts. It is a header rule
+# for the same reason overlap.h and reusekey.h are: a check that has never
+# been seen to fire is not a check, and the hardware will not fire this one
+$(BUILD)/sentinel: tests/sentinel.c src/sentinel.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ $<
+
+# the per-output-channel scale table, read back entry by entry. A table off by
+# one channel gives every output a plausible wrong magnitude, and this tree's
+# own history says a plausible wrong number survives a text check
+$(BUILD)/coef_scales: tests/coef_scales.c src/job.c src/regcmd.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the packer split by groups against the whole buffer it replaces: a byte

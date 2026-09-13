@@ -344,6 +344,32 @@ int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
  * the CONTENTS: a buffer rewritten between two calls at the same address is
  * exactly the misuse this cannot see.
  */
+/*
+ * ⭐⭐ THE SAME MATMUL, BUT THE ANSWER STAYS IN THE DEVICE BUFFER.
+ *
+ * Y is NOT written when these return. It is written by the next
+ * charsiu_npu_matmul* call on this pool -- from just after that call's SUBMIT,
+ * so the gather runs while the next job is on the hardware -- or by
+ * charsiu_npu_flush, whichever comes first.
+ *
+ * r407 is why: the gather is 1.93 ms a row against 1.82 of fence, the largest
+ * line in the prefill and larger than both of attention's fences together, and
+ * the fence is a sleeping ioctl with every core idle. CHARSIU_NPU_NO_READ=1
+ * measured the ceiling for moving it at 5450 ms against 6931.
+ *
+ * ⚠⚠ A MISSED FLUSH IS FLUENT WRONG TEXT, NOT A CRASH. Use these only where
+ * the very next thing is another matmul that does not read Y -- gate before
+ * up, q before k -- and call charsiu_npu_flush before anything reads Y,
+ * including the fallback path where the next matmul never reaches the NPU.
+ *
+ * CHARSIU_NPU_DEFER_READ=0 turns the deferral off and is the control.
+ */
+int  charsiu_npu_matmul_defer(struct charsiu_npu *g, int id, const float *X,
+			      unsigned m, float *Y);
+int  charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
+				   const float *X, unsigned m, float *Y);
+int  charsiu_npu_flush(struct charsiu_npu *g);
+
 int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
 /* how often the declaration was honoured, and how often it had to pack anyway */
@@ -376,6 +402,10 @@ struct charsiu_fp16 *charsiu_fp16_open(void);
  * never submitted anything. Anything with a device of its own should lend it.
  */
 struct charsiu_fp16 *charsiu_fp16_open_on(struct charsiu_device *dev);
+/* the device a handle runs on, for opening a second handle beside it */
+struct charsiu_device *charsiu_fp16_device(struct charsiu_fp16 *f);
+/* a name for this handle's stage table, when a caller runs more than one */
+void charsiu_fp16_name(struct charsiu_fp16 *f, const char *name);
 struct charsiu_device *charsiu_npu_device(struct charsiu_npu *g);
 void charsiu_fp16_close(struct charsiu_fp16 *f);
 size_t charsiu_fp16_wbytes(unsigned k, unsigned n);
@@ -420,8 +450,10 @@ void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
  * -- harmless, because a softmax over [tlo, pos] never looks at them. The
  * values matmul's k is the number of positions, so its buffer is allocated at
  * the context length and run there every time, with the probabilities past the
- * last token left zero. One wastes a little of the output, the other a little
- * of the reduction, and neither needs a repack.
+ * last token zeroed BY THE PACK -- see xtri0 below; the caller used to zero
+ * them in its own scratch and stopped, so this is now what makes them zero
+ * rather than a saving on top of it. One wastes a little of the output, the
+ * other a little of the reduction, and neither needs a repack.
  *
  * ⚠ THE LAYOUT IS ONLY STABLE WHERE EVERY GROUP IS FULL. charsiu_fp16_woffset
  * is (n/16)*16*ke + (k/32)*32*ngsz + (n%16)*kgsz + k%32, and ngsz is 16 for
@@ -457,6 +489,40 @@ struct charsiu_fp16_op {
 	 *   matmul must run at.
 	 */
 	unsigned xstride, ystride;
+	/*
+	 * ⚠ A CAUSAL TRIANGLE, so the pack does not convert the zeros.
+	 *
+	 * Attention's values matmul contracts over k = THE CONTEXT LENGTH
+	 * whatever the prompt has reached, because the V surface is packed at
+	 * that k and a buffer written at one k and run at another is a
+	 * different permutation of the same weights. So row r of X is a row of
+	 * probabilities with (xtri0 + r) leading entries that can be nonzero
+	 * and zeros from there to k -- the softmax wrote those zeros itself,
+	 * and past the scores matmul's n they are the scratch's calloc.
+	 *
+	 * On an 852 token prompt at k = 1024 that is 58% of every element the
+	 * pack touches. With xtri0 set the tail is a memset instead.
+	 *
+	 * ⚠⚠ AND IT IS NOT AN OPTIMISATION ANY MORE. The caller used to zero
+	 * that tail itself and this only saved converting a zero into a zero;
+	 * since the caller stopped (it was 58% of a row, in the one stage of
+	 * that path with no pool behind it), what lies past xtri0 + r is the
+	 * RAW scores, and the memset here is what makes those positions
+	 * contribute nothing. So there is no arm that turns it off.
+	 *
+	 * The promise was verified on hardware BEFORE the caller's zeroing was
+	 * removed, which is the only order in which that verification means
+	 * anything: r400 read back all 98,114,560 elements the pack was told
+	 * to skip at 852 tokens and every one was zero.
+	 *
+	 * 0 means no promise and everything is converted.
+	 *
+	 * ⚠ memset is the right filler and that is not obvious: charsiu_f2h
+	 * maps +0.0 to 0x0000 but -0.0 to 0x8000, so this is only equivalent
+	 * because every zero in that tail is a written +0.0 or an untouched
+	 * calloc, never a negative zero.
+	 */
+	unsigned xtri0;
 };
 
 /*
@@ -466,7 +532,17 @@ struct charsiu_fp16_op {
  * them once either way, and the copy is a write and a second read on top.
  */
 const float *charsiu_fp16_out(const struct charsiu_fp16 *f, unsigned i);
+/* the same address, writable, for a caller that reduces over the answer where
+ * it lies instead of copying it out first */
+float *charsiu_fp16_out_w(struct charsiu_fp16 *f, unsigned i);
 void charsiu_fp16_release(struct charsiu_fp16 *f);
+/*
+ * Release, but leave the NEXT call's sentinels in the buffer first, so the
+ * next group skips a prep and a fini of the whole thing. Call it once the
+ * held answers have been read; it only pays while the shapes repeat, and
+ * charsiu_fp16_matmul_group checks that they did.
+ */
+void charsiu_fp16_poison_and_release(struct charsiu_fp16 *f);
 
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			      const struct charsiu_fp16_op *ops, unsigned nops);
@@ -479,6 +555,17 @@ unsigned long charsiu_fp16_submits(const struct charsiu_fp16 *f);
  * of what writing a KV cache through charsiu_fp16_woffset would remove. */
 struct charsiu_fp16_times {
 	double wcopy, pack, coefs, emit, submit, fence, read;
+	/* the two cache maintenance ioctls around the pack. They are NOT
+	 * proportional to what the pack writes: PREP_BO and FINI_BO
+	 * dma_sync the WHOLE buffer object, and `want` grows it and never
+	 * shrinks it, so a group that packs 32 kB can pay for 384. */
+	double psync;
+	/* ⚠ plan is release + make_plan + want, and `other` is whatever the
+	 * call took that none of the rest names. It exists because the layer
+	 * timer said 2929 ms in the two group calls while these fields
+	 * accounted for 2128, and an 800 ms hole is not something to reason
+	 * about by subtraction somewhere else. */
+	double plan, poison, other;
 };
 void charsiu_fp16_get_times(const struct charsiu_fp16 *f,
 			    struct charsiu_fp16_times *t);
@@ -933,6 +1020,22 @@ struct llama_state {
 	const struct llama_model *m;
 	int n_ctx;
 	int pos;               /* how many tokens are in the cache */
+	/*
+	 * ⚠ HOW LONG THE PROMPT IS, WHICH NOTHING INSIDE THIS FILE CAN SEE.
+	 *
+	 * A prompt arrives one chunk at a time through llama_prefill_batch, so
+	 * every function below knows the running position and none of them
+	 * knows the total. CHARSIU_ATTN_NPU=auto needs the total: the fp16
+	 * attention arm loses on short prompts and wins on long ones, and
+	 * choosing per chunk was measured (r401) and buys nothing -- at 852
+	 * tokens no threshold beat simply being on, and at 202 every threshold
+	 * cost 107 ms because the mirror is built and fed whether or not a
+	 * layer ever uses it.
+	 *
+	 * 0 means the caller did not say, and `auto` then stays off. See
+	 * llama_prefill_hint.
+	 */
+	int prompt_total;
 
 	float *kcache;         /* [n_layer][n_ctx][n_head_kv * head_dim] */
 	float *vcache;
@@ -1061,6 +1164,14 @@ uint64_t charsiu_pool_min(double units_per_us, int threads);
 double charsiu_pool_barrier_us(void);
 
 int charsiu_env_flag(const char *name, int dflt);
+
+/*
+ * How many prompt tokens the caller is about to feed in, before the first
+ * chunk of them. Only CHARSIU_ATTN_NPU=auto reads it, and a caller that never
+ * calls this gets the behaviour it had. Call it again, or with 0, when the
+ * prompt is done; it is a hint about the NEXT prefill and nothing else.
+ */
+void llama_prefill_hint(struct llama_state *s, int total);
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);

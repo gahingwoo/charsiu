@@ -215,6 +215,21 @@ void charsiu_pack_weights_f16(const struct charsiu_matmul *mm,
 size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
 			  unsigned k, enum charsiu_w16_layout layout);
 
+/*
+ * The same for a ONE BYTE weight, which is the layout charsiu_pack_weights has
+ * written for int8 since round 139 -- the GROUP tiling with ng = 32 rather
+ * than fp16's 16. Byte offsets, SIZE_MAX if outside.
+ *
+ * ⚠ THE ng DIFFERENCE IS THE TRAP. An fp16 KV surface is appended along n and
+ * may be run at any multiple of 16 because the offset stops depending on n
+ * once every group is full. The int8 one has that property at a multiple of
+ * 32, and running it at a multiple of 16 that is not one of 32 reads a
+ * different permutation of the same bytes -- a plausible wrong answer with
+ * nothing reporting an error.
+ */
+size_t charsiu_w8_offset(const struct charsiu_matmul *mm, unsigned n,
+			 unsigned k);
+
 unsigned charsiu_k_eff(const struct charsiu_matmul *mm);
 int charsiu_w4_paired(const struct charsiu_matmul *mm);
 int charsiu_cbuf_window(void);
@@ -266,6 +281,78 @@ static inline uint16_t charsiu_f2h(float f)
 		return (uint16_t)(sign | 0x7c00);
 	return (uint16_t)(sign | ((uint32_t)exp << 10) | (man >> 13));
 }
+
+/*
+ * ⚠⚠ A RUN OF THEM, AND THE SCALAR LOOP IS FOURTEEN INSTRUCTIONS AN ELEMENT.
+ *
+ * Packing a group's activations is where an fp16 attention layer spends its
+ * CPU time, and the run is long: the VALUES matmul contracts over k = the
+ * whole context length, so one head of one chunk is m * kv elements and a
+ * 32 head group at m = 80, kv = 1024 is 2.6 MILLION conversions. gcc does not
+ * vectorise the loop at -O2 -- the two branches stop it -- so `objdump` shows
+ * ubfx/sub/lsr/and/cmp/orr/orr/cmp/orr/and/strh once per float, which the
+ * board reads as about 2.8 ns an element.
+ *
+ * ⚠ THIS IS NOT vcvt_f16_f32. The hardware instruction rounds to nearest even
+ * and keeps subnormals; charsiu_f2h TRUNCATES and flushes them, and every fp16
+ * buffer this project has checked against the NPU was built that way. So the
+ * vector form is the same INTEGER arithmetic done four lanes at a time, not
+ * the native convert -- the two disagree on the low mantissa bit of most
+ * inputs, and swapping them would silently move every number the NPU sees.
+ * tests/pack_f16run.c walks all 2^32 float bit patterns against charsiu_f2h.
+ */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+#include <arm_neon.h>
+
+/*
+ * ⚠ THIS WAS ALREADY IN THE TREE, as a file static `charsiu_vhalf` in
+ * regcmd.c, twenty lines above the prefill pack it was written for -- and a
+ * second one got written here before anyone looked. It is the same arithmetic
+ * to the bit; the two differed only in which of the two selects came last,
+ * which cannot matter because exp cannot be both <= 0 and >= 0x1f. regcmd.c
+ * calls this one now, so there is one vector converter beside the one scalar
+ * definition, which is what the paragraph above claims.
+ */
+static inline uint16x4_t charsiu_f2h_x4(float32x4_t x)
+{
+	uint32x4_t u = vreinterpretq_u32_f32(x);
+	uint32x4_t sign = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(0x8000));
+	int32x4_t  exp  = vsubq_s32(vreinterpretq_s32_u32(
+					vandq_u32(vshrq_n_u32(u, 23),
+						  vdupq_n_u32(0xff))),
+				    vdupq_n_s32(127 - 15));
+	uint32x4_t man  = vshrq_n_u32(vandq_u32(u, vdupq_n_u32(0x7fffff)), 13);
+	uint32x4_t norm = vorrq_u32(sign,
+			  vorrq_u32(vreinterpretq_u32_s32(vshlq_n_s32(exp, 10)),
+				    man));
+	uint32x4_t inf  = vorrq_u32(sign, vdupq_n_u32(0x7c00));
+	uint32x4_t r;
+
+	/* the two branches, as selects: exp <= 0 flushes, exp >= 0x1f
+	 * saturates, and the flush wins because it is tested first */
+	r = vbslq_u32(vcgeq_s32(exp, vdupq_n_s32(0x1f)), inf, norm);
+	r = vbslq_u32(vcleq_s32(exp, vdupq_n_s32(0)), sign, r);
+	return vmovn_u32(r);
+}
+
+static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
+{
+	size_t e = 0;
+
+	for (; e + 8 <= n; e += 8)
+		vst1q_u16(d + e,
+			  vcombine_u16(charsiu_f2h_x4(vld1q_f32(x + e)),
+				       charsiu_f2h_x4(vld1q_f32(x + e + 4))));
+	for (; e < n; e++)
+		d[e] = charsiu_f2h(x[e]);
+}
+#else
+static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
+{
+	for (size_t e = 0; e < n; e++)
+		d[e] = charsiu_f2h(x[e]);
+}
+#endif
 
 /*
  * ONE POSITION OF A KV CACHE, straight into the buffer the hardware reads.
@@ -366,6 +453,22 @@ struct charsiu_job {
 
 	float input_scale;
 	float weight_scale;
+	/*
+	 * ⭐ ONE SCALE PER OUTPUT CHANNEL, when a caller has them. NULL means
+	 * weight_scale for every channel, which is what every caller did until
+	 * 2026-09-13 -- and the hardware has had a per channel fp16 table all
+	 * along: charsiu_build_coefs writes `n` of them and filled every one
+	 * with the same scalar.
+	 *
+	 * It is what an int8 KV surface needs. The coefficient is per OUTPUT
+	 * CHANNEL, so for attention's scores matmul that is one scale a
+	 * POSITION -- fixed when the position is appended and never revised --
+	 * and r406 measured the quality of exactly that arrangement at
+	 * +0.008% perplexity.
+	 *
+	 * The array is read for channels [0, n) and must be that long.
+	 */
+	const float *weight_scales;
 	float output_scale;
 	int input_zero_point;
 	int weight_zero_point;
