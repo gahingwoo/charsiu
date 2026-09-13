@@ -268,7 +268,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -276,6 +276,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
+	./$(BUILD)/pack_w8
 	./$(BUILD)/pack_f16run
 	./$(BUILD)/sentinel
 	./$(BUILD)/coef_scales
@@ -303,6 +304,12 @@ $(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# charsiu_w8_offset against charsiu_pack_weights, cell by cell. Two pieces of
+# code describing one permutation is the arrangement that lets a KV surface be
+# written in place, and a disagreement between them prints nothing
+$(BUILD)/pack_w8: tests/pack_w8.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the vector fp16 conversion against the per element definition, over all 2^32

@@ -215,6 +215,21 @@ void charsiu_pack_weights_f16(const struct charsiu_matmul *mm,
 size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
 			  unsigned k, enum charsiu_w16_layout layout);
 
+/*
+ * The same for a ONE BYTE weight, which is the layout charsiu_pack_weights has
+ * written for int8 since round 139 -- the GROUP tiling with ng = 32 rather
+ * than fp16's 16. Byte offsets, SIZE_MAX if outside.
+ *
+ * ⚠ THE ng DIFFERENCE IS THE TRAP. An fp16 KV surface is appended along n and
+ * may be run at any multiple of 16 because the offset stops depending on n
+ * once every group is full. The int8 one has that property at a multiple of
+ * 32, and running it at a multiple of 16 that is not one of 32 reads a
+ * different permutation of the same bytes -- a plausible wrong answer with
+ * nothing reporting an error.
+ */
+size_t charsiu_w8_offset(const struct charsiu_matmul *mm, unsigned n,
+			 unsigned k);
+
 unsigned charsiu_k_eff(const struct charsiu_matmul *mm);
 int charsiu_w4_paired(const struct charsiu_matmul *mm);
 int charsiu_cbuf_window(void);
