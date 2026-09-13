@@ -10,13 +10,21 @@
 # scalar pass over the answer, on top of the memcpy that follows it. For the
 # scores shape that is m * npad words an op and thirty two ops a group.
 #
-# The stage table at 852 tokens says `read` is 977 ms of 3337 -- 29%, second
-# only to the fence -- so this is not a tidying.
+# ⚠⚠ AND THE READ SIDE WAS THE CHEAP HALF. The buffer is POISONED the same way
+# before every submit -- another full scalar pass over the answer, in the one
+# region of that function with no clock on it. At 852 tokens the readback was
+# 581 ms and the poisoning 668, together more than the hardware`s own 915.
 #
-# The short circuit stops at the first word that is NOT poison, which is the
-# first word unless the op really did write nothing, and a partially written
-# output is accepted silently exactly as before. Same outcome, so the control
-# that matters is the text.
+# One sentinel a row answers both questions instead: a job writes its whole
+# output or none of it, so a row whose first word survived is a row that was
+# not written. That is strictly more than the every-cell form could say -- it
+# could only ever answer all or not-all, so a half written output was accepted
+# in silence -- and it costs m words instead of m * n. tests/sentinel.c drives
+# all three verdicts on the desk, because the hardware will not.
+#
+# CHARSIU_FP16_FULLSCAN=1 is the every-cell form on BOTH sides, =0 the row
+# sentinel on both. Same outcome for every output the board has ever produced,
+# so the control that matters is the text.
 #
 #   CHARSIU_READ_REPS="4 12 24 34"   clause counts (about 25 tokens each)
 #   CHARSIU_READ_N=2                 repeats an arm a length
@@ -40,7 +48,7 @@ for p in /sys/devices/system/cpu/cpufreq/policy*; do
 done
 sleep 1
 
-echo "== the poison check: count every word, or stop at the first live one"
+echo "== the poison check: every cell, or one sentinel a row"
 echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
 echo "   npu clk   $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null) Hz"
 echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
@@ -59,14 +67,16 @@ one() {
 	    --ignore-eos -c 1024 -t 4 2>"$ERR" \
 	    | grep '^\[load' \
 	    | sed 's/.*prompt \([0-9]*\) tok in \([0-9]*\) ms.*/\1 \2/')
-	rd=$(grep 'charsiu fp16:  wcopy' "$ERR" | sed 's/.*read \([0-9]*\) ms.*/\1/')
-	printf '%s %s\n' "$t" "${rd:-?}"
+	l=$(grep 'charsiu fp16:  plan' "$ERR")
+	rd=$(printf '%s' "$l" | sed 's/.*read \([0-9]*\) .*/\1/')
+	po=$(printf '%s' "$l" | sed 's/.*poison \([0-9]*\) .*/\1/')
+	printf '%s %s\n' "$t" "$(( ${rd:-0} + ${po:-0} ))"
 }
 
-printf '   %6s  %8s %8s   %8s %8s   %s\n' \
-	tokens 'count ms' 'read ms' 'first ms' 'read ms' 'TTFT f/c'
-printf '   %6s  %8s %8s   %8s %8s   %s\n' \
-	------ -------- ------- -------- ------- --------
+printf '   %6s  %9s %11s   %9s %11s   %s\n' \
+	tokens 'cell ms' 'poison+read' 'row ms' 'poison+read' 'TTFT r/c'
+printf '   %6s  %9s %11s   %9s %11s   %s\n' \
+	------ --------- ----------- --------- ----------- --------
 
 LAST=""
 for R in $REPS; do
@@ -88,9 +98,9 @@ for R in $REPS; do
 	[ -n "$A" ] && [ -n "$B" ] || { echo "   $R clauses: NO OUTPUT"; continue; }
 	MA=$(mid "$A"); MB=$(mid "$B")
 	RAT=$(awk "BEGIN{printf \"%.3f\", $MB/$MA}" 2>/dev/null || echo "?")
-	printf '   %6s  %8s %8s   %8s %8s   %s\n' \
+	printf '   %6s  %9s %11s   %9s %11s   %s\n' \
 		"$TOK" "$MA" "$(mid "$RA")" "$MB" "$(mid "$RB")" "$RAT"
-	echo "          TTFT count $(lo "$A")..$(hi "$A")   first $(lo "$B")..$(hi "$B")"
+	echo "          TTFT every cell $(lo "$A")..$(hi "$A")   one a row $(lo "$B")..$(hi "$B")"
 	LAST="$P"
 done
 
@@ -102,12 +112,12 @@ if [ "$a" = "$b" ]; then
 	echo "   identical: $(printf '%s' "$a" | md5sum | cut -c1-12)"
 else
 	echo "   ⛔ DIFFER"
-	echo "   count $a"
-	echo "   first $b"
+	echo "   every cell $a"
+	echo "   one a row  $b"
 fi
 
 echo
-echo "== the whole stage table at the longest length, short circuit on"
+echo "== the whole stage table at the longest length, row sentinel on"
 env $E CHARSIU_FP16_FULLSCAN=0 "$RUN" "$M" -p "$LAST" -n 1 --ignore-eos \
 	-c 1024 -t 4 2>&1 >/dev/null | grep 'charsiu fp16' | awk '{print "   " $0}'
 

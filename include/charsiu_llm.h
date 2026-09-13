@@ -523,7 +523,7 @@ struct charsiu_fp16_times {
 	 * timer said 2929 ms in the two group calls while these fields
 	 * accounted for 2128, and an 800 ms hole is not something to reason
 	 * about by subtraction somewhere else. */
-	double plan, other;
+	double plan, poison, other;
 };
 void charsiu_fp16_get_times(const struct charsiu_fp16 *f,
 			    struct charsiu_fp16_times *t);

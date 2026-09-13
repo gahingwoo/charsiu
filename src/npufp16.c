@@ -39,6 +39,7 @@
 #include "charsiu.h"
 #include "charsiu_llm.h"
 #include "fp16plan.h"
+#include "sentinel.h"
 
 struct charsiu_fp16 {
 	struct charsiu_device *dev;
@@ -49,7 +50,7 @@ struct charsiu_fp16 {
 	/* elements converted by the pack, so `pack` can be read per element
 	 * rather than per call -- the two differ by a factor of the CONTEXT
 	 * LENGTH, because the values matmul contracts over the whole of it */
-	unsigned long long packel, trisk;
+	unsigned long long packel, trisk, partial;
 	struct charsiu_fp16_times t;
 	/* what is currently sitting in the coefficient buffer, so a group
 	 * that asks for the same shapes twice does not build it twice */
@@ -282,6 +283,140 @@ static inline void pack_run(int vec, uint16_t *d, const float *x, size_t n)
 	}
 }
 
+static int fullscan(void);
+
+/*
+ * ⚠⚠ THREE OF THIS FUNCTION'S LOOPS ARE PER OP AND WERE ALL ON ONE CORE.
+ *
+ * pack, the poison and the readback each walk nops independent regions, and
+ * at 852 tokens they were 489, 668 and 404 ms against the hardware's own 915.
+ * The pool is right there -- the softmax two frames up this stack uses it --
+ * and this path never asked for it, which is the same shape as `silu * up`
+ * and as the softmax itself.
+ *
+ * ⚠ The pool degrades to one core when nothing started it (a whisper or a
+ * vision graph has no llama_state), so this is safe in every caller; it is
+ * simply not a speed-up there.
+ *
+ * ⚠ AND THE SHARED COUNTERS BECOME PER OP ARRAYS. `f->packel += nel` from
+ * four workers is a lost update, and a counter that is quietly low is worse
+ * than no counter: it is the number somebody divides by.
+ */
+struct fp16_ops_ctx {
+	struct charsiu_fp16 *f;
+	const struct charsiu_fp16_op *ops;
+	const struct charsiu_fp16_plan *pl;
+	int vec;
+	unsigned long long el[FP16_GROUP_MAX], sk[FP16_GROUP_MAX];
+	unsigned unwritten[FP16_GROUP_MAX];
+	unsigned char bad[FP16_GROUP_MAX], borrowed[FP16_GROUP_MAX];
+};
+
+static int fp16_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_FP16_POOL", 1);
+	return v;
+}
+
+static void fp16_run_ops(void (*fn)(void *, uint64_t, uint64_t),
+			 struct fp16_ops_ctx *c, unsigned nops)
+{
+	if (fp16_pool())
+		charsiu_parallel_for(fn, c, (uint64_t)nops);
+	else
+		fn(c, 0, (uint64_t)nops);
+}
+
+static void fp16_pack_ops(void *ctx, uint64_t i0, uint64_t n)
+{
+	struct fp16_ops_ctx *c = ctx;
+	uint64_t i;
+
+	for (i = i0; i < i0 + n; i++) {
+		/*
+		 * ⚠ THE BOUND, THE STORE AND THE ZEROING WERE ALL PER ELEMENT,
+		 * and this loop runs 262 thousand times at 32 ops.
+		 *
+		 * It was a call into another translation unit, a comparison
+		 * against the region size, and two byte stores an element, on
+		 * top of zeroing the whole region first. The board put it at
+		 * 1.69 ms a round. The bound is loop arithmetic, the store is
+		 * one aligned 16 bit write -- the region starts on a page --
+		 * the conversion is charsiu_f2h inline -- a native 16 bit
+		 * store, and this SoC is little endian, which is the same
+		 * bytes the two byte stores wrote -- and only the TAIL past
+		 * the activation needs zeroing, because that is the only part
+		 * the hardware reads that this does not write.
+		 */
+		const struct charsiu_fp16_op *op = &c->ops[i];
+		uint16_t *d = (uint16_t *)((uint8_t *)c->f->in.map
+					   + c->pl->ioff[i]);
+		size_t nel = (size_t)op->m * op->k;
+		size_t cap = c->pl->isz[i] / 2;
+		size_t xs = op->xstride ? op->xstride : op->k;
+		const float *X = op->X;
+		unsigned long long sk = 0;
+		int tri = op->xtri0 != 0;
+
+		if (nel > cap)
+			nel = cap;
+		if (xs == op->k && !tri) {
+			pack_run(c->vec, d, X, nel);
+		} else {
+			size_t e = 0;
+
+			/* the bound was per element and the row length is
+			 * known: a row contributes min(k, what is left) */
+			for (unsigned r = 0; r < op->m && e < nel; r++) {
+				const float *xr = X + (size_t)r * xs;
+				size_t cn = op->k, keep;
+
+				if (cn > nel - e)
+					cn = nel - e;
+				keep = cn;
+				if (tri) {
+					keep = (size_t)op->xtri0 + r;
+					if (keep > cn)
+						keep = cn;
+				}
+				pack_run(c->vec, d + e, xr, keep);
+				if (keep < cn) {
+					memset(d + e + keep, 0,
+					       (cn - keep) * 2);
+					sk += cn - keep;
+				}
+				e += cn;
+			}
+		}
+		c->el[i] = nel;
+		c->sk[i] = sk;
+		memset(d + nel, 0,
+		       charsiu_fp16_up4k(c->pl->isz[i]) - nel * 2);
+	}
+}
+
+static void fp16_poison_ops(void *ctx, uint64_t i0, uint64_t n)
+{
+	struct fp16_ops_ctx *c = ctx;
+	uint64_t i;
+
+	for (i = i0; i < i0 + n; i++) {
+		uint32_t *o = (uint32_t *)((uint8_t *)c->f->ob.map
+					   + c->pl->ooff[i]);
+
+		if (fullscan()) {
+			for (unsigned e = 0; e < c->ops[i].m * c->ops[i].n;
+			     e++)
+				o[e] = CHARSIU_POISON;
+		} else {
+			charsiu_poison_rows(o, c->ops[i].m, c->ops[i].n);
+		}
+	}
+}
+
 /*
  * ⚠ THE CAUSAL TRIANGLE HAS NO KNOB, AND THAT IS DELIBERATE. It began as one
  * -- CHARSIU_FP16_TRI=0 converted the tail instead of zeroing it, and r400
@@ -298,6 +433,64 @@ static inline void pack_run(int vec, uint16_t *d, const float *x, size_t n)
  * not. Same outcome either way; the knob exists so a board round can price the
  * difference inside one boot.
  */
+static void fp16_read_ops(void *ctx, uint64_t i0, uint64_t n)
+{
+	struct fp16_ops_ctx *c = ctx;
+	uint64_t i;
+
+	for (i = i0; i < i0 + n; i++) {
+		const struct charsiu_fp16_op *op = &c->ops[i];
+		const uint32_t *o = (const uint32_t *)
+			((const uint8_t *)c->f->ob.map + c->pl->ooff[i]);
+		unsigned cells = op->m * op->n;
+
+		/*
+		 * THE OTHER SIDE OF THE SENTINEL. With one a row the question
+		 * "did this op write nothing" is m comparisons, and "did it
+		 * write only some of its rows" becomes askable for the first
+		 * time -- the every-cell form could only ever say all or not
+		 * all, so a half written output was accepted in silence.
+		 */
+		if (fullscan()) {
+			unsigned untouched = 0, e;
+
+			for (e = 0; e < cells; e++)
+				untouched += o[e] == CHARSIU_POISON;
+			if (untouched == cells) {
+				c->bad[i] = 1;
+				continue;      /* this op wrote nothing */
+			}
+		} else {
+			unsigned unwritten;
+
+			if (charsiu_poison_verdict(o, op->m, op->n,
+						   &unwritten)) {
+				c->bad[i] = 1;
+				continue;      /* this op wrote nothing */
+			}
+			c->unwritten[i] = unwritten;
+		}
+		/*
+		 * ⚠ A NULL Y MEANS LEAVE IT WHERE IT IS. The board put the
+		 * copy out at 1.17 ms a round on the 80 row scores shape, and
+		 * a caller that is about to run a softmax over these numbers
+		 * reads them once either way -- the copy is a write and a
+		 * second read on top. charsiu_fp16_out hands back the address
+		 * and charsiu_fp16_release closes the buffer.
+		 */
+		if (op->Y && (!op->ystride || op->ystride == op->n)) {
+			memcpy(op->Y, o, (size_t)cells * 4);
+		} else if (op->Y) {
+			for (unsigned r = 0; r < op->m; r++)
+				memcpy(op->Y + (size_t)r * op->ystride,
+				       (const float *)o + (size_t)r * op->n,
+				       (size_t)op->n * 4);
+		} else {
+			c->borrowed[i] = 1;
+		}
+	}
+}
+
 static int fullscan(void)
 {
 	static int v = -1;
@@ -325,8 +518,8 @@ static int fullscan(void)
 static void fp16_report(const struct charsiu_fp16 *f)
 {
 	double tot = f->t.plan + f->t.wcopy + f->t.pack + f->t.psync
-		   + f->t.coefs + f->t.emit + f->t.submit + f->t.fence
-		   + f->t.read + f->t.other;
+		   + f->t.coefs + f->t.emit + f->t.poison + f->t.submit
+		   + f->t.fence + f->t.read + f->t.other;
 
 	if (!f->calls)
 		return;
@@ -335,10 +528,14 @@ static void fp16_report(const struct charsiu_fp16 *f)
 	if (tot <= 0.0)
 		return;
 	fprintf(stderr, "charsiu fp16:  plan %.0f  wcopy %.0f  pack %.0f"
-		"  psync %.0f  coefs %.0f  emit %.0f  submit %.0f  fence %.0f"
-		"  read %.0f  other %.0f ms\n",
+		"  psync %.0f  coefs %.0f  emit %.0f  poison %.0f  submit %.0f"
+		"  fence %.0f  read %.0f  other %.0f ms\n",
 		f->t.plan, f->t.wcopy, f->t.pack, f->t.psync, f->t.coefs,
-		f->t.emit, f->t.submit, f->t.fence, f->t.read, f->t.other);
+		f->t.emit, f->t.poison, f->t.submit, f->t.fence, f->t.read,
+		f->t.other);
+	if (f->partial)
+		fprintf(stderr, "charsiu fp16:  ⛔ %llu ROWS WERE NEVER"
+			" WRITTEN by a job that wrote others\n", f->partial);
 	fprintf(stderr, "charsiu fp16:  %.0f%% fence, %.0f%% weight copy,"
 		" %.3f ms a call\n", 100.0 * f->t.fence / tot,
 		100.0 * f->t.wcopy / tot, tot / (double)f->calls);
@@ -567,7 +764,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		return -1;
 	tcall = now_ms();
 	tprev = f->t.plan + f->t.wcopy + f->t.pack + f->t.psync + f->t.coefs
-	      + f->t.emit + f->t.submit + f->t.fence + f->t.read;
+	      + f->t.emit + f->t.poison + f->t.submit + f->t.fence + f->t.read;
 	t0 = tcall;
 	/* a previous group's answers are still being read out of the buffer
 	 * this is about to overwrite */
@@ -645,61 +842,15 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	charsiu_bo_prep(f->dev, &f->in, 1000000000);
 	f->t.psync += now_ms() - t0;
 	t0 = now_ms();
-	for (i = 0; i < nops; i++) {
-		/*
-		 * ⚠ THE BOUND, THE STORE AND THE ZEROING WERE ALL PER ELEMENT,
-		 * and this loop runs 262 thousand times at 32 ops.
-		 *
-		 * It was a call into another translation unit, a comparison
-		 * against the region size, and two byte stores an element, on
-		 * top of zeroing the whole region first. The board put it at
-		 * 1.69 ms a round. The bound is loop arithmetic, the store is
-		 * one aligned 16 bit write -- the region starts on a page --
-		 * the conversion is charsiu_f2h inline -- a native 16 bit
-		 * store, and this SoC is little endian, which is the same
-		 * bytes the two byte stores wrote -- and only the TAIL past
-		 * the activation needs zeroing, because that is the only part
-		 * the hardware reads that this does not write.
-		 */
-		uint16_t *d = (uint16_t *)((uint8_t *)f->in.map + pl.ioff[i]);
-		size_t nel = (size_t)ops[i].m * ops[i].k;
-		size_t cap = pl.isz[i] / 2;
-		size_t xs = ops[i].xstride ? ops[i].xstride : ops[i].k;
-		const float *X = ops[i].X;
-		int tri = ops[i].xtri0 != 0;
+	{
+		struct fp16_ops_ctx pc = { f, ops, &pl, vec, {0}, {0},
+					   {0}, {0}, {0} };
 
-		if (nel > cap)
-			nel = cap;
-		if (xs == ops[i].k && !tri) {
-			pack_run(vec, d, X, nel);
-		} else {
-			size_t e = 0;
-
-			/* the bound was per element and the row length is
-			 * known: a row contributes min(k, what is left) */
-			for (unsigned r = 0; r < ops[i].m && e < nel; r++) {
-				const float *xr = X + (size_t)r * xs;
-				size_t cn = ops[i].k, keep;
-
-				if (cn > nel - e)
-					cn = nel - e;
-				keep = cn;
-				if (tri) {
-					keep = (size_t)ops[i].xtri0 + r;
-					if (keep > cn)
-						keep = cn;
-				}
-				pack_run(vec, d + e, xr, keep);
-				if (keep < cn) {
-					memset(d + e + keep, 0,
-					       (cn - keep) * 2);
-					f->trisk += cn - keep;
-				}
-				e += cn;
-			}
+		fp16_run_ops(fp16_pack_ops, &pc, nops);
+		for (i = 0; i < nops; i++) {
+			f->packel += pc.el[i];
+			f->trisk += pc.sk[i];
 		}
-		f->packel += nel;
-		memset(d + nel, 0, charsiu_fp16_up4k(pl.isz[i]) - nel * 2);
 	}
 	f->t.pack += now_ms() - t0;
 	t0 = now_ms();
@@ -801,16 +952,37 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	charsiu_bo_fini(f->dev, &f->reg);
 	f->t.emit += now_ms() - t0;
 
-	/* the sentinel, per op: a job that never wrote and a job that computed
-	 * zero are the same four bytes otherwise */
+	/*
+	 * ⚠⚠ THE SENTINEL, AND IT WAS WRITTEN INTO EVERY CELL OF EVERY OUTPUT.
+	 *
+	 * A job that never wrote and a job that computed zero are the same
+	 * four bytes otherwise, so the buffer is poisoned before the submit.
+	 * Poisoning ALL of it is a full scalar pass over the answer before the
+	 * hardware is even asked -- for the scores shape that is m * npad
+	 * words an op and thirty two ops a group -- and at 852 tokens it was
+	 * 668 ms, 23% of the two group calls, sitting in the one region of
+	 * this function that had no clock on it. Its twin on the readback side
+	 * was found a round earlier; this is the expensive half.
+	 *
+	 * ⚠ ONE SENTINEL A ROW IS STRICTLY MORE INFORMATIVE, not a weakening.
+	 * A job writes its whole output or none of it, so if any row's first
+	 * word survived, that row was not written -- and the old check could
+	 * only ever say "ALL of it is poison", never "some of it". This one
+	 * says both, and it costs m words instead of m * n.
+	 *
+	 * CHARSIU_FP16_FULLSCAN=1 puts back the every-cell form on BOTH sides,
+	 * so the arms are coherent and a board round can price it in one boot.
+	 */
+	t0 = now_ms();
 	charsiu_bo_prep(f->dev, &f->ob, 1000000000);
-	for (i = 0; i < nops; i++) {
-		uint32_t *o = (uint32_t *)((uint8_t *)f->ob.map + pl.ooff[i]);
+	{
+		struct fp16_ops_ctx qc = { f, ops, &pl, vec, {0}, {0},
+					   {0}, {0}, {0} };
 
-		for (unsigned e = 0; e < ops[i].m * ops[i].n; e++)
-			o[e] = 0xdeadbeefu;
+		fp16_run_ops(fp16_poison_ops, &qc, nops);
 	}
 	charsiu_bo_fini(f->dev, &f->ob);
+	f->t.poison += now_ms() - t0;
 
 	t0 = now_ms();
 	ins[0] = f->in.handle;
@@ -875,60 +1047,15 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	f->t.fence += now_ms() - t0;
 
 	t0 = now_ms();
-	for (i = 0; i < nops; i++) {
-		const uint32_t *o = (const uint32_t *)
-			((const uint8_t *)f->ob.map + pl.ooff[i]);
-		unsigned cells = ops[i].m * ops[i].n, e = 0;
+	{
+		struct fp16_ops_ctx rc = { f, ops, &pl, vec, {0}, {0},
+					   {0}, {0}, {0} };
 
-		/*
-		 * ⚠⚠ THE QUESTION IS "ARE THEY ALL POISON", AND IT WAS BEING
-		 * ANSWERED BY COUNTING ALL OF THEM.
-		 *
-		 * The loop here read every output word and summed the matches
-		 * before comparing the sum against the cell count, which for
-		 * the scores shape is m * npad words an op and thirty two ops
-		 * a group -- a full scalar pass over the answer, on top of the
-		 * memcpy that follows it. It can stop at the first word that
-		 * is not poison, and that word is the first one unless the op
-		 * really did write nothing.
-		 *
-		 * ⚠ A PARTIALLY written output is still accepted silently, as
-		 * before: the old sum was compared against the whole count and
-		 * never reported anything in between, so short circuiting
-		 * changes no outcome, only what it costs to reach it.
-		 */
-		if (!fullscan()) {
-			while (e < cells && o[e] == 0xdeadbeefu)
-				e++;
-		} else {
-			unsigned untouched = 0;
-
-			for (e = 0; e < cells; e++)
-				untouched += o[e] == 0xdeadbeefu;
-			e = untouched;
-		}
-		if (e == cells) {
-			bad++;
-			continue;              /* this op wrote nothing */
-		}
-		/*
-		 * ⚠ A NULL Y MEANS LEAVE IT WHERE IT IS. The board put the
-		 * copy out at 1.17 ms a round on the 80 row scores shape, and
-		 * a caller that is about to run a softmax over these numbers
-		 * reads them once either way -- the copy is a write and a
-		 * second read on top. charsiu_fp16_out hands back the address
-		 * and charsiu_fp16_release closes the buffer.
-		 */
-		if (ops[i].Y && (!ops[i].ystride ||
-				 ops[i].ystride == ops[i].n)) {
-			memcpy(ops[i].Y, o, (size_t)cells * 4);
-		} else if (ops[i].Y) {
-			for (unsigned r = 0; r < ops[i].m; r++)
-				memcpy(ops[i].Y + (size_t)r * ops[i].ystride,
-				       (const float *)o + (size_t)r * ops[i].n,
-				       (size_t)ops[i].n * 4);
-		} else {
-			borrowed = 1;
+		fp16_run_ops(fp16_read_ops, &rc, nops);
+		for (i = 0; i < nops; i++) {
+			bad += rc.bad[i];
+			borrowed |= rc.borrowed[i];
+			f->partial += rc.unwritten[i];
 		}
 	}
 	f->last = pl;
@@ -941,8 +1068,8 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	f->t.read += now_ms() - t0;
 	f->t.other += now_ms() - tcall
 		    - (f->t.plan + f->t.wcopy + f->t.pack + f->t.psync
-		       + f->t.coefs + f->t.emit + f->t.submit + f->t.fence
-		       + f->t.read - tprev);
+		       + f->t.coefs + f->t.emit + f->t.poison + f->t.submit
+		       + f->t.fence + f->t.read - tprev);
 	if (bad) {
 		f->refused += bad;
 		return -1;

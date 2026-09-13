@@ -250,7 +250,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_f16run $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -259,6 +259,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
 	./$(BUILD)/pack_f16run
+	./$(BUILD)/sentinel
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
@@ -290,6 +291,12 @@ $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
 # both live in charsiu.h precisely so they cannot drift into two conversions
 $(BUILD)/pack_f16run: tests/pack_f16run.c include/charsiu.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
+
+# the output sentinel, driven through all three verdicts. It is a header rule
+# for the same reason overlap.h and reusekey.h are: a check that has never
+# been seen to fire is not a check, and the hardware will not fire this one
+$(BUILD)/sentinel: tests/sentinel.c src/sentinel.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ $<
 
 # the packer split by groups against the whole buffer it replaces: a byte
 # wrong here is a slightly wrong sentence and not a fault
