@@ -253,10 +253,46 @@ struct charsiu_fp16 *charsiu_fp16_open(void)
 	return f;
 }
 
+/*
+ * ⚠⚠ EVERY ONE OF THESE COUNTERS ALREADY EXISTED AND NOTHING READ THEM.
+ *
+ * `calls`, `submits`, `refused` and the whole `t` struct -- wcopy, pack,
+ * coefs, emit, submit, fence, read -- have been accumulated since this file
+ * was written, and no caller has ever printed one. So "attention on the NPU is
+ * 61% dearer than on the CPU at head_dim 64" was a wall-clock difference with
+ * nothing inside it, and the obvious next question -- IS IT THE FENCE, or the
+ * weight copy this file's own comment says charsiu_fp16_woffset exists to
+ * remove -- could not be asked.
+ *
+ * Same shape as the attention refusal counters two rounds ago: the number that
+ * was printed was the number that was easy to count.
+ */
+static void fp16_report(const struct charsiu_fp16 *f)
+{
+	double tot = f->t.wcopy + f->t.pack + f->t.coefs + f->t.emit
+		   + f->t.submit + f->t.fence + f->t.read;
+
+	if (!f->calls)
+		return;
+	fprintf(stderr, "charsiu fp16: %lu calls, %lu submits, %lu refused;"
+		" %.0f ms accounted\n", f->calls, f->submits, f->refused, tot);
+	if (tot <= 0.0)
+		return;
+	fprintf(stderr, "charsiu fp16:  wcopy %.0f  pack %.0f  coefs %.0f"
+		"  emit %.0f  submit %.0f  fence %.0f  read %.0f ms\n",
+		f->t.wcopy, f->t.pack, f->t.coefs, f->t.emit,
+		f->t.submit, f->t.fence, f->t.read);
+	fprintf(stderr, "charsiu fp16:  %.0f%% fence, %.0f%% weight copy,"
+		" %.3f ms a call\n", 100.0 * f->t.fence / tot,
+		100.0 * f->t.wcopy / tot, tot / (double)f->calls);
+}
+
 void charsiu_fp16_close(struct charsiu_fp16 *f)
 {
 	if (!f)
 		return;
+	if (charsiu_env_flag("CHARSIU_STAGES", 0))
+		fp16_report(f);
 	charsiu_fp16_release(f);
 	charsiu_bo_free(f->dev, &f->reg);  charsiu_bo_free(f->dev, &f->coef);
 	charsiu_bo_free(f->dev, &f->ob);   charsiu_bo_free(f->dev, &f->in);
