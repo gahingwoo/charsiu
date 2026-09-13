@@ -13,8 +13,10 @@ only comparison here where nothing is quoted.
 ```
   Llama-3.2-1B, one board, NPU 594 MHz both sides, CPU pinned at maximum
 
-  decode     charsiu 1.39x to 1.46x faster. The multiple moves with the clock,
-             so it is not one number.
+  decode     charsiu 1.39x faster at 594 MHz. It is 1.46x if the NPU clock is
+             raised to 786, because their decode ignores that clock and ours
+             does not, so the multiple is a function of the condition and not
+             a property of either runtime.
 
   prompt     a crossover, not a ratio. charsiu is faster below about 250 of its
              own tokens and the vendor is faster above it:
@@ -99,16 +101,36 @@ model, both NPU cores, and the CPUs held out of deep idle while the NPU is open.
   Gemma4 E2B       8.92    8.92..8.93      9.23     2180 1219.3      111
 ```
 
-`board_vendor.sh`, `CHARSIU_BENCH_REPEAT=3`, performance governor, median of three
-with the range beside it. The vendor column here is their published figure, which
-has no N, no spread, and was taken at maximum CPU and NPU frequency. The
-head-to-head at the top of this file is the better comparison, because it ran
-their runtime on this board. The two TTFT columns are also not at the same prompt
-length, and TTFT is convex in length, so part of every gap there is the length
-rather than the runtime.
+Gemma4 decodes 3.4% BELOW the vendor's figure there, and it has been above it in
+other sessions; the board drifts about 3% between boots, so that row is level
+rather than either. The other three are 1.7%, 4.7% and 11.0% above.
 
-Gemma4 is behind in that table and has been ahead in other sessions. The board
-drifts about 3% between boots, so that row is level rather than past.
+`board_vendor.sh`, `CHARSIU_BENCH_REPEAT=3`, performance governor, median of
+three with the range beside it. Four things make this a weaker comparison than
+the head-to-head at the top of this file, and they do not all push the same way.
+
+Two favour them. Their column is a published point estimate with no N and no
+spread, taken at maximum CPU and NPU frequency, where the head-to-head ran their
+runtime on this board at 594 MHz. It is also their w4a16 row, the fastest decode
+of the three quantisations `benchmark.md` lists; against their w8a8 row the same
+charsiu medians would read tens of percent ahead instead of a few.
+
+One favours us: ours is the int4 arm, the one that costs 87% in perplexity.
+Picking their fastest quantisation and our least accurate one is a choice in
+both directions at once, and neither side of it is stated in the table.
+
+The fourth just makes it uncheckable. These are four models this project does
+not have their runtime for, so none of them can be verified the way
+Llama-3.2-1B was.
+
+So the multiples here, roughly 0.97x to 1.11x, are not the 1.39x at the top of
+the file and neither number is "charsiu's decode multiple". The top one is one
+model measured against their running code; this one is four models against a
+number they published under a faster condition.
+
+The two TTFT columns are not at the same prompt length either, and TTFT is
+convex in length, so part of every gap there is the length rather than the
+runtime.
 
 One line of device tree matters. Mainline clocks the NPU at 786 MHz and leaves the
 rail wherever U-Boot put it, 750 mV, where the vendor's own table asks 800 mV of
