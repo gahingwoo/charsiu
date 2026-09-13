@@ -5177,6 +5177,65 @@ static int attn_npu_want_for(unsigned head_dim)
 
 
 
+/*
+ * ⚠⚠ A SIMULATION, AND IT MAKES NOTHING FASTER.
+ *
+ * r404 measured what an int8 or int4 KV surface would be worth on the
+ * hardware -- 2.4x on the scores matmul, 1.8x on the values one -- and that is
+ * the largest remaining lever on prefill. Building it is a real project: a
+ * different packer, a scale per surface, a different weight dtype in the job,
+ * and every number in the tree re-measured. This asks the question that gates
+ * it, on a desk, before any of that: WHAT DOES IT COST IN QUALITY?
+ *
+ * CHARSIU_KV_BITS=8 (or 4) rounds each head's hd floats through a symmetric
+ * absmax quantiser as they enter the cache, which is exactly what such a
+ * surface would hold, and then leaves them as floats. Perplexity then measures
+ * the damage with nothing else changed.
+ *
+ * ⚠ It is applied BEFORE the mirror is appended as well, so both attention
+ * arms see the same numbers. A simulation that only one arm sees would compare
+ * two changes at once.
+ */
+static int kv_bits(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_KV_BITS");
+
+		v = e && *e ? atoi(e) : 0;
+		if (v != 4 && v != 8)
+			v = 0;
+	}
+	return v;
+}
+
+static void kv_round(float *dst, const float *src, unsigned hd, int bits)
+{
+	float mx = 0.0f, sc, inv;
+	unsigned i;
+
+	for (i = 0; i < hd; i++) {
+		float a = src[i] < 0.0f ? -src[i] : src[i];
+
+		if (a > mx)
+			mx = a;
+	}
+	if (mx == 0.0f) {
+		memcpy(dst, src, hd * sizeof(*dst));
+		return;
+	}
+	/* symmetric, so the level count is 2^(bits-1) - 1 either side */
+	sc = mx / (float)((1 << (bits - 1)) - 1);
+	inv = 1.0f / sc;
+	for (i = 0; i < hd; i++) {
+		float q = src[i] * inv;
+		int r = (int)(q < 0.0f ? q - 0.5f : q + 0.5f);
+
+		dst[i] = (float)r * sc;
+	}
+}
+
 static int attn_npu_soft_pool(void);
 
 static void attn_npu_free(struct attn_npu *a)
@@ -7205,17 +7264,35 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						      + kh)
 						      * s->n_ctx + pos) * hdmax;
 
-					memcpy(s->kcache + off, kr + kh * hd,
-					       hd * sizeof(float));
-					memcpy(s->vcache + off, vr + kh * hd,
-					       hd * sizeof(float));
+					const float *ks = kr + kh * hd;
+					const float *vs = vr + kh * hd;
+
+					/* ⚠ NOT BY MOVING kr. The first draft
+					 * rebased kr inside this loop, which
+					 * made head kh+1 read one head_dim on
+					 * from head kh's slot instead of a
+					 * whole context away. A simulation with
+					 * that in it would have been measured
+					 * and believed. */
+					if (kv_bits()) {
+						kv_round(s->kcache + off, ks,
+							 hd, kv_bits());
+						kv_round(s->vcache + off, vs,
+							 hd, kv_bits());
+						ks = s->kcache + off;
+						vs = s->vcache + off;
+					} else {
+						memcpy(s->kcache + off, ks,
+						       hd * sizeof(float));
+						memcpy(s->vcache + off, vs,
+						       hd * sizeof(float));
+					}
 					/* ⚠ the fp16 mirror is written HERE and
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
 					 * cannot drift by a rope or a norm */
 					attn_npu_append(s, l, kh, hd, pos,
-							kr + kh * hd,
-							vr + kh * hd);
+							ks, vs);
 				}
 			if (attn_block_rows() > 0) {
 				/*
@@ -7870,10 +7947,17 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
 					      * s->n_ctx + pos) * hdmax;
 
+				if (kv_bits()) {
+					kv_round(s->kcache + off,
+						 s->k + kh * hd, hd, kv_bits());
+					kv_round(s->vcache + off,
+						 s->v + kh * hd, hd, kv_bits());
+				} else {
 				memcpy(s->kcache + off, s->k + kh * hd,
 				       hd * sizeof(float));
 				memcpy(s->vcache + off, s->v + kh * hd,
 				       hd * sizeof(float));
+				}
 				/*
 				 * ⚠ THE DECODE PATH NO LONGER WRITES THE
 				 * MIRROR. It used to, so that a prompt
