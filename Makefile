@@ -93,8 +93,17 @@ $(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BU
 $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
-$(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
-	$(CC) $(CFLAGS) -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
+#
+# ⚠⚠ AND IT WENT STALE THE SAME WAY, IN BOTH SCALAR RULES. The paragraph
+# below this one says "a target that is never built is a target that is
+# already broken" about exactly this, and then the two charsiu_run_scalar
+# rules kept the pre-vision source list anyway -- so tests/neon_control.sh,
+# the tree's own control for "a vector kernel that is wrong still produces
+# fluent text", has not linked since vision landed and therefore has not run.
+# `make test` builds it now, which is the only thing that keeps a list honest.
+#
+$(BUILD)/charsiu_run_scalar: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -Ithird_party -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
 
 #
 # ⚠ THE SOURCE LIST HAS TO TRACK charsiu_run's. This rule went stale when
@@ -127,8 +136,8 @@ $(BUILD)/charsiu_ppl.aarch64: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 #
 # which is checked on the host and is still a NEON bug detector: every vector
 # path that is meant to be bit identical still has to reproduce it.
-$(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c $(LLM) | $(BUILD)
-	$(CROSS)gcc $(CFLAGS) -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
+$(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
 
 board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_bench.aarch64 $(BUILD)/charsiu_int4.aarch64 \
@@ -241,7 +250,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -253,6 +262,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
 	./tests/corpus_fixed.sh
+	./tests/probe_list.sh
 #
 # ⚠ THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the
