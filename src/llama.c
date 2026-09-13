@@ -4831,18 +4831,28 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
  * channel, so it can be appended to and run at whatever multiple of 16 it has
  * reached. For the V cache a position is part of the reduction, so its k
  * cannot move: it is allocated at the context length and the matmul always
- * runs there, with the probabilities past the last token left zero. That costs
+ * runs there, with the probabilities past the last token zeroed by the pack
+ * (see xtri0, and the paragraph below). That costs
  * a fetch of the whole V surface every call and buys never repacking.
  *
  * ⚠ WHY THE PROBABILITIES SIT IN A SCRATCH WHOSE ROWS ARE THE CONTEXT LENGTH
  * APART. They are the values matmul's activation, and that matmul runs at
- * k = the context length, so a row must BE that long. It is zeroed once at
- * allocation and only ever rewritten inside [0, npad), so the tail past the
- * last token is zero for the life of the run without anyone clearing it.
+ * k = the context length, so a row must BE that long.
  *
- * Sliding window layers need nothing special: the scores are computed for
- * every column either way, and the softmax below already masks to
- * [tlo, pos] and zeroes the rest, so a masked column multiplies V by zero.
+ * ⚠⚠ AND WHAT MAKES THE TAIL ZERO MOVED, 2026-09-13. This paragraph used to
+ * say the scratch is zeroed once at allocation, rewritten only inside
+ * [0, npad), and that "the softmax below masks to [tlo, pos] and zeroes the
+ * rest" -- and the second half of that stopped being true when the trailing
+ * zero loop was removed. Past pos the scratch now holds the RAW scores the
+ * matmul wrote. What makes those columns contribute nothing is the PACK: the
+ * values op carries xtri0, and charsiu_fp16_matmul_group memsets from
+ * xtri0 + r to the end of the row. The zeros are in the device buffer, not
+ * here.
+ *
+ * Sliding window layers still need nothing special. The scores are computed
+ * for every column either way, the softmax masks [0, tlo) to zero itself --
+ * that loop is still here, it is only the TRAILING one that went -- and
+ * everything past pos is the pack's memset.
  */
 /* why a layer did not take the NPU path; one counter each, printed by name */
 enum {
@@ -5682,15 +5692,27 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].X = a->sc + (size_t)h * a->mmax * a->kv;
 			op[h].xstride = a->kv;
 			/*
-			 * ⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
-			 * NOTHING AFTER ITSELF. The loop above wrote the zeros
-			 * itself -- [pos+1, npad) explicitly, and [npad, kv)
-			 * is the scratch's calloc, which is why that calloc is
-			 * load bearing. So the pack can memset the tail rather
-			 * than convert it -- and since the softmax loop no
-			 * longer zeroes it either, the pack's memset is what
-			 * makes those positions contribute nothing. Past pos
-			 * this scratch holds the RAW scores.
+			 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
+			 * NOTHING AFTER ITSELF, AND THE PACK IS WHAT ENFORCES
+			 * THAT NOW.
+			 *
+			 * The loop above used to zero [pos+1, npad) itself and
+			 * [npad, kv) came from the scratch's calloc, so this
+			 * promise was merely an optimisation: the pack could
+			 * memset a tail that was already zero instead of
+			 * converting it. That trailing loop is gone -- it was
+			 * 58% of a row, in the one stage of this path with no
+			 * pool behind it -- so past pos this scratch holds the
+			 * RAW scores the matmul wrote, and the memset in
+			 * charsiu_fp16_matmul_group is what makes those
+			 * positions contribute nothing.
+			 *
+			 * ⚠ Which also means the calloc is no longer load
+			 * bearing, and the promise is no longer optional. The
+			 * order that made the swap safe is in r400/r401: the
+			 * tail was READ BACK on hardware and found zero while
+			 * the loop still wrote it, and only then was the loop
+			 * removed.
 			 */
 			op[h].xtri0 = (unsigned)j->pos0 + rb + 1;
 			op[h].Wbuf = a->vb[j->l * a->nkv + h / j->gqa];
