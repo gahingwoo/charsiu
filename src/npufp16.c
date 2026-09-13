@@ -422,6 +422,40 @@ static void fp16_pack_ops(void *ctx, uint64_t i0, uint64_t n)
 
 		if (nel > cap)
 			nel = cap;
+		if (op->fill) {
+			/* ⭐ the caller writes the halves; this still owns the
+			 * offsets, the bound and the causal tail, so xtri0
+			 * means exactly what it means on the converting path */
+			size_t e = 0;
+
+			for (unsigned r = 0; r < op->m && e < nel; r++) {
+				size_t cn = op->k, keep;
+
+				if (cn > nel - e)
+					cn = nel - e;
+				keep = cn;
+				if (tri) {
+					keep = (size_t)op->xtri0 + r;
+					if (keep > cn)
+						keep = cn;
+				}
+				if (keep < cn) {
+					memset(d + e + keep, 0,
+					       (cn - keep) * 2);
+					sk += cn - keep;
+				}
+				op->fill(op->fill_ctx, d + e, (unsigned)i, r,
+					 (unsigned)keep);
+				e += cn;
+			}
+			c->el[i] = nel;
+			c->sk[i] = sk;
+			/* ⚠ the same slack the converting path zeroes below:
+			 * the CBUF reads past what a matmul writes */
+			memset(d + nel, 0,
+			       charsiu_fp16_up4k(c->pl->isz[i]) - nel * 2);
+			continue;
+		}
 		if (xs == op->k && !tri) {
 			pack_run(c->vec, d, X, nel);
 		} else {
@@ -860,7 +894,9 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		 * answer stays in the device buffer and charsiu_fp16_out
 		 * points at it. Refusing it here made the whole feature
 		 * unreachable and the probe's own arm is what said so. */
-		if (!o->X || (!o->W && !o->Wbuf)) {
+		/* ⚠ X may be NULL when the caller fills the surface itself,
+		 * and only then: a NULL X with no fill is a missing argument */
+		if ((!o->X && !o->fill) || (!o->W && !o->Wbuf)) {
 			f->refused++;
 			return -1;
 		}

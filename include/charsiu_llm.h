@@ -523,6 +523,34 @@ struct charsiu_fp16_op {
 	 * calloc, never a negative zero.
 	 */
 	unsigned xtri0;
+	/*
+	 * ⭐⭐ THE CALLER PRODUCES THE HALVES ITSELF, instead of handing over
+	 * floats for this to convert.
+	 *
+	 * Attention's values matmul takes the softmax's output, and the
+	 * softmax has just walked every one of those numbers. Writing them as
+	 * floats so that this can read them back and write them as halves is a
+	 * whole extra round trip over the largest array in the prompt: at 852
+	 * tokens the values group's pack alone is 152 ms.
+	 *
+	 * With `fill` set, X is not read. For each row r this memsets the
+	 * causal tail exactly as it would have -- so xtri0 still means what it
+	 * means -- and calls fill for the live part:
+	 *
+	 *     fill(ctx, dst, op, r, n)   write n halves at dst
+	 *
+	 * `op` is the index into the group, so one context can serve all of
+	 * them. The call happens on the pool, one op a worker, so the callback
+	 * must not touch anything the other ops touch.
+	 *
+	 * ⚠ n IS THE LIVE LENGTH AND THE TAIL IS ALREADY ZERO. A callback that
+	 * writes fewer than n halves leaves whatever the last group left
+	 * there, which is a plausible wrong answer; one that writes more runs
+	 * into the next row.
+	 */
+	void (*fill)(void *ctx, uint16_t *dst, unsigned op, unsigned r,
+		     unsigned n);
+	void *fill_ctx;
 };
 
 /*

@@ -276,7 +276,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -286,6 +286,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/pack_f16w
 	./$(BUILD)/pack_w8
 	./$(BUILD)/patch_waddr
+	./$(BUILD)/softmax_half
 	./$(BUILD)/pack_f16run
 	./$(BUILD)/sentinel
 	./$(BUILD)/coef_scales
@@ -326,6 +327,12 @@ $(BUILD)/pack_w8: tests/pack_w8.c src/regcmd.c src/job.c | $(BUILD)
 # nothing but this holds the emitter there
 $(BUILD)/patch_waddr: tests/patch_waddr.c src/job.c src/regcmd.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the fused softmax against the separate one, to the last bit of the half. Two
+# copies of one piece of arithmetic is the hazard; that they AGREE is what is
+# held, and a tolerance would not hold it
+$(BUILD)/softmax_half: tests/softmax_half.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 # the vector fp16 conversion against the per element definition, over all 2^32
 # floats. It is header only, so this links nothing: the run and the definition

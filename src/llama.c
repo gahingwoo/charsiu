@@ -2580,6 +2580,145 @@ static void softmax(float *x, int n)
 }
 
 /*
+ * ⭐⭐ THE SAME SOFTMAX, READING x AND WRITING HALVES, with the exponentials
+ * kept in a small scratch instead of going back where they came from.
+ *
+ * The scores matmul leaves m by npad floats in the device buffer, the softmax
+ * rewrites them in place, and then the values pack reads them all back and
+ * writes halves. That middle array is the largest thing in a prompt -- at 852
+ * tokens the values group's pack alone is 152 ms -- and none of it needs to
+ * reach DRAM twice: `tmp` is one row, four kilobytes, and stays in cache.
+ *
+ * ⚠ THE ARITHMETIC IS UNCHANGED, WHICH IS THE ONLY REASON THE TEXT CAN BE.
+ * The shipped path computes exp into the row, normalises the row in float,
+ * and the pack converts `exp * inv`. This computes exp into tmp, normalises
+ * tmp in float, and converts `exp * inv`. Same value, same rounding, same
+ * order. Normalising the HALVES instead would have been one pass fewer and a
+ * different number.
+ */
+static void softmax_scaled_half(const float *x, float *tmp, uint16_t *dst,
+				int n, float scale)
+{
+	float mx, sum = 0.0f, inv;
+	int i = 0;
+
+	if (n <= 0)
+		return;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_softmax() && n >= 8) {
+		float32x4_t mv = vdupq_n_f32(x[0]);
+		float32x4_t s0 = vdupq_n_f32(0.0f);
+		float32x4_t s1 = vdupq_n_f32(0.0f);
+		float32x4_t sv = vdupq_n_f32(scale);
+		float32x4_t mxv, iv;
+
+		for (; i + 4 <= n; i += 4)
+			mv = vmaxq_f32(mv, vld1q_f32(x + i));
+		mx = vmaxvq_f32(mv);
+		for (; i < n; i++)
+			if (x[i] > mx)
+				mx = x[i];
+		mx *= scale;
+		mxv = vdupq_n_f32(mx);
+		for (i = 0; i + 8 <= n; i += 8) {
+			float32x4_t a = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i), sv), mxv));
+			float32x4_t b = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i + 4), sv), mxv));
+
+			vst1q_f32(tmp + i, a);
+			vst1q_f32(tmp + i + 4, b);
+			s0 = vaddq_f32(s0, a);
+			s1 = vaddq_f32(s1, b);
+		}
+		sum = vaddvq_f32(vaddq_f32(s0, s1));
+		for (; i < n; i++) {
+			tmp[i] = expf(x[i] * scale - mx);
+			sum += tmp[i];
+		}
+		inv = 1.0f / sum;
+		iv = vdupq_n_f32(inv);
+		for (i = 0; i + 4 <= n; i += 4)
+			vst1q_f32(tmp + i, vmulq_f32(vld1q_f32(tmp + i), iv));
+		for (; i < n; i++)
+			tmp[i] *= inv;
+		charsiu_f2h_run(dst, tmp, (size_t)n);
+		return;
+	}
+#endif
+	mx = x[0];
+	for (i = 1; i < n; i++)
+		if (x[i] > mx)
+			mx = x[i];
+	mx *= scale;
+	for (i = 0; i < n; i++) {
+		tmp[i] = expf(x[i] * scale - mx);
+		sum += tmp[i];
+	}
+	for (i = 0; i < n; i++)
+		dst[i] = charsiu_f2h(tmp[i] / sum);
+}
+
+/*
+ * ⚠ THE TWO SOFTMAXES AGAINST EACH OTHER, on a desk, to the last bit.
+ *
+ * softmax_scaled_half exists so the values pack does not have to read back
+ * what the softmax just wrote, and it is a second copy of that arithmetic by
+ * construction. What holds it is not that there is one copy but that the two
+ * agree -- and they have to agree EXACTLY, because what reaches the hardware
+ * is a half: one element rounding the other way changes a token.
+ *
+ * tests/softmax_half.c calls this. It lives here because both functions are
+ * static and both arms of fast_softmax have to be reachable.
+ */
+int charsiu_softmax_half_selftest(void);
+int charsiu_softmax_half_selftest(void)
+{
+	static const int ns[] = { 1, 2, 3, 7, 8, 9, 12, 15, 16, 31, 64, 100,
+				  853, 1024 };
+	float *a, *tmp;
+	uint16_t *h;
+	int fail = 0, i, k, pass;
+
+	a = malloc(2048 * sizeof(*a));
+	tmp = malloc(2048 * sizeof(*tmp));
+	h = malloc(2048 * sizeof(*h));
+	if (!a || !tmp || !h)
+		return 1;
+	/* both arms of fast_softmax(), which is what the NEON path is behind */
+	for (pass = 0; pass < 2; pass++) {
+		setenv("CHARSIU_FAST_SOFTMAX", pass ? "0" : "1", 1);
+		for (k = 0; k < (int)(sizeof(ns) / sizeof(ns[0])); k++) {
+			int n = ns[k];
+			float *b = malloc((size_t)n * sizeof(*b));
+			float sc = 0.0883883f;   /* 1/sqrt(128) */
+
+			if (!b) { fail++; break; }
+			for (i = 0; i < n; i++)
+				a[i] = (float)((i * 37 % 101) - 50) * 0.17f
+				     + (i % 7 == 0 ? 6.0f : 0.0f);
+			memcpy(b, a, (size_t)n * sizeof(*b));
+			softmax_scaled(b, n, sc);
+			softmax_scaled_half(a, tmp, h, n, sc);
+			for (i = 0; i < n; i++)
+				if (h[i] != charsiu_f2h(b[i])) {
+					printf("  arm %d n=%d: element %d is "
+					       "%04x fused and %04x separate"
+					       "\n",
+					       pass, n, i, h[i],
+					       charsiu_f2h(b[i]));
+					fail++;
+					break;
+				}
+			free(b);
+		}
+	}
+	unsetenv("CHARSIU_FAST_SOFTMAX");
+	free(a); free(tmp); free(h);
+	return fail;
+}
+
+/*
  * RoPE, in BOTH pairings, because a gguf can want either and the wrong one is
  * not a crash.
  *
@@ -4996,6 +5135,13 @@ struct attn_npu {
 	/* and the rest of the layer, so "attention minus what is accounted"
 	 * is never again a number anybody reasons from */
 	double t_layer, t_kv, t_pack1, t_pack2;
+	/*
+	 * ⭐ ONE ROW OF EXPONENTIALS PER OP, so the softmax's intermediate
+	 * never reaches DRAM. FP16_GROUP_MAX rows of kvmax floats, which at a
+	 * 1024 context is 128 kB, and the pool splits the values pack one op
+	 * to a worker so no two workers share a row.
+	 */
+	float *softbuf;
 	int off;                            /* tried and refused */
 };
 
@@ -5380,6 +5526,7 @@ static void attn_npu_free(struct attn_npu *a)
 	free(a->lhd);
 	free(a->dirty);
 	free(a->packed);
+	free(a->softbuf);
 	free(a);
 }
 
@@ -5520,7 +5667,9 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->vb = calloc(nbuf, sizeof(*a->vb));
 	a->dirty = calloc(a->n_layer, 1);
 	a->packed = calloc(a->n_layer, sizeof(*a->packed));
-	if (!a->kb || !a->vb || !a->dirty || !a->packed)
+	a->softbuf = calloc((size_t)FP16_GROUP_MAX * a->kvmax,
+			    sizeof(*a->softbuf));
+	if (!a->kb || !a->vb || !a->dirty || !a->packed || !a->softbuf)
 		return NULL;
 	for (i = 0; i < nbuf; i++) {
 		unsigned lhd = a->lhd[i / a->nkv];
@@ -5803,6 +5952,55 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 	}
 }
 
+/*
+ * ⭐⭐ THE SOFTMAX, RUN INSIDE THE VALUES PACK INSTEAD OF BEFORE IT.
+ *
+ * The shipped order is: the scores matmul leaves m by npad floats in a device
+ * buffer, the softmax rewrites them in place, and the values pack reads them
+ * all back and writes halves. That middle array is the largest thing in a
+ * prompt and it crosses DRAM twice for no reason: the softmax has the number
+ * in a register at the moment the pack wants it.
+ *
+ * charsiu_fp16_op.fill is the hook. npufp16 keeps the offsets, the bound and
+ * the causal tail -- xtri0 still memsets [pos + 1, k) exactly as it did -- and
+ * asks for the live part. So this writes the same values the pack would have
+ * converted, and softmax_scaled_half keeps the arithmetic identical.
+ *
+ * ⚠ n IS pos + 1 AND THE CALLBACK OWES EVERY ONE OF THEM. The sliding-window
+ * zeros below used to be written into the scores buffer by the softmax pass;
+ * nothing writes them now except this, and a short write leaves the previous
+ * group's halves in place.
+ *
+ * CHARSIU_ATTN_FUSE_SOFTMAX=0 puts the separate pass back.
+ */
+static int attn_fuse_softmax(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_FUSE_SOFTMAX", 1);
+	return v;
+}
+
+static void attn_npu_fill(void *ctx, uint16_t *dst, unsigned op, unsigned r,
+			  unsigned n)
+{
+	struct attn_npu_soft *c = ctx;
+	const struct attn_block_job *j = c->j;
+	const float *sr = c->sc[op] + (size_t)r * c->npad;
+	int pos = j->pos0 + (int)c->rb + (int)r;
+	int tlo = j->swa && pos + 1 > j->n_swa ? pos + 1 - j->n_swa : 0;
+	int live = (int)n - tlo;
+
+	if ((unsigned)tlo > n)
+		tlo = (int)n;
+	memset(dst, 0, (size_t)tlo * 2);
+	if (live > 0)
+		softmax_scaled_half(sr + tlo,
+				    c->a->softbuf + (size_t)op * c->a->kvmax,
+				    dst + tlo, live, j->scale);
+}
+
 /* the arm is named in both directions: =0 is the bare loop it replaced */
 static int attn_npu_soft_pool(void)
 {
@@ -5999,8 +6197,8 @@ static int attn_npu_layer(struct attn_block_job *j)
 			return -1;
 		}
 		a->t_pack1 += attn_npu_now_ms() - tg0;
+		struct attn_npu_soft sc = { a, j, m, rb, cn, {0} };
 		{
-			struct attn_npu_soft sc = { a, j, m, rb, cn, {0} };
 			double ts = attn_npu_now_ms();
 
 			for (h = 0; h < H; h++) {
@@ -6011,7 +6209,12 @@ static int attn_npu_layer(struct attn_block_job *j)
 				}
 			}
 
-			if (attn_npu_soft_pool())
+			/* ⭐ with the fused arm the softmax happens inside the
+			 * values pack below, one pass instead of two over the
+			 * largest array in the prompt */
+			if (attn_fuse_softmax())
+				;
+			else if (attn_npu_soft_pool())
 				charsiu_parallel_for(attn_npu_soft_units, &sc,
 						     (uint64_t)H * m);
 			else
@@ -6024,6 +6227,10 @@ static int attn_npu_layer(struct attn_block_job *j)
 			/* ⚠ THE ANSWER'S OWN STRIDE, which is the width the
 			 * scores matmul ran at and not the prompt's. */
 			op[h].xstride = cn;
+			if (attn_fuse_softmax()) {
+				op[h].fill = attn_npu_fill;
+				op[h].fill_ctx = &sc;
+			}
 			/*
 			 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
 			 * NOTHING AFTER ITSELF, AND THE PACK IS WHAT ENFORCES
