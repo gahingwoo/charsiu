@@ -732,10 +732,39 @@ inside each curve and never fits across them; that is why it exists.
 ⛔ **Still not supported: that charsiu beats the vendor on prefill.** It does
 not, above about 250 tokens. Their attention remains roughly 4.3x cheaper than
 ours -- our fence alone is 880 ms against their entire quadratic term's 539 at
-852 tokens -- because the fp16 attention matmuls run at 0.119 TMAC/s where the
-same silicon does 0.45 to 0.70 on int4. Both matmuls are skinny on one axis,
-k = 64 for the scores and n = 64 for the values. That is the remaining gap and
-it is not CPU-side.
+852 tokens.
+
+⛔⛔ **AND THE EXPLANATION THAT WAS ATTACHED TO THAT WAS NOT MEASURED.** This
+paragraph said 0.119 TMAC/s against the int4 path's 0.45 to 0.70, and called
+it structural. 0.119 was arithmetic done on a stage table in a write-up. The
+measured figures are **0.026 (scores) and 0.048 (values)** -- wrong by four
+times in the direction that flatters the claim -- and the parts are nothing
+like the sentence implied:
+
+```
+  dispatch   10% of attention. A task costs 20 us, not the 90 the submit
+             count suggests: forcing 1x/2x/4x/8x the tasks at constant
+             arithmetic gives 2.77/3.05/3.60/4.67 ms a row, a straight line.
+             Merging the four GQA heads that share a surface is worth 7%.
+  cores      both of them is SLOWER, 2.91 against 2.76 ms a row, twice.
+  shape      6 to 7 times, and measured INSIDE fp16 with dtype, m and group
+             held still: k=1024 n=1024 runs at 0.190 TMAC/s against 0.026 for
+             the scores shape -- 16x the arithmetic for 2.6x the fence.
+  dtype      the rest, 2 to 3.5x, BOUNDED not measured: 0.190 for fp16 against
+             0.36 to 0.69 for int4, at shapes that are not the same.
+```
+
+⭐ **What that leaves open is a road, not a wall.** Attention's weights ARE the
+KV cache and charsiu packs them itself, so they can be int4 with an fp16
+activation -- the w4a16 arrangement the projections already run at 0.36 to
+0.69. Nothing about attention requires fp16 weights.
+
+⚠ **The first measurement of that road does not exist**: int4 at the attention
+shapes. `charsiu_int4` and `charsiu_matmul` take m, k and n and print no time;
+`npu_fp16_test` is fp16 only. Until that probe exists the dtype factor above is
+two shapes apart, and the projection that follows from it -- attention 2343 ms
+becoming about 780, TTFT about 5630 against their 6027 -- is arithmetic on a
+bound and **not a result**.
 
 ---
 
