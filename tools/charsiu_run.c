@@ -1047,6 +1047,14 @@ int main(int argc, char **argv)
 			 */
 			int probe = prefill_width(n_ids, chunk);
 
+			/* ⚠ the only thing in the library that needs to know
+			 * how long the whole prompt is, rather than how long
+			 * this chunk is: CHARSIU_ATTN_NPU=auto. Said before
+			 * the first chunk, because the decision it feeds is
+			 * made when the fp16 mirror is first built and a
+			 * mirror built for a prompt that will not use it
+			 * costs 107 ms of upkeep it never earns back. */
+			llama_prefill_hint(st, n_ids);
 			if (probe >= 2 &&
 			    !llama_prefill_batch(st, &m, ids, probe, st->pos)) {
 				done = probe;
@@ -1065,6 +1073,8 @@ int main(int argc, char **argv)
 				logits = st->logits;
 			}
 		}
+		/* the hint was about this prompt and it is over */
+		llama_prefill_hint(st, 0);
 		/* whatever is left, and everything if nothing was batched */
 		for (i = done; i < n_ids; i++)
 			logits = llama_forward(st, ids[i], st->pos);

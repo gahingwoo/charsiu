@@ -4855,7 +4855,8 @@ enum {
 	AN_R_N
 };
 static const char *const an_reason[AN_R_N] = {
-	"shape", "head_dim", "layer index", "K extent", "V extent", "not packed"
+	"shape", "head_dim", "layer index", "K extent", "V extent",
+	"not packed"
 };
 
 struct attn_npu {
@@ -4981,6 +4982,53 @@ struct attn_npu {
  * move. This computes attention in fp16 where the CPU computes it in fp32, so
  * the text can differ, and that is a call about the answer, not the clock.
  */
+/*
+ * ⭐ THE OTHER HALF OF THE RULE IS A LENGTH, AND IT IS MEASURED NOW.
+ *
+ * `auto` was withdrawn because "head_dim >= 128" was only half of it. r400
+ * then measured the other half and got a NEGATIVE answer at head_dim 64: the
+ * NPU arm was 1.19 to 1.23 times the CPU arm over an eight-fold range of
+ * prompt length, FLAT, and a flat ratio has no crossover to find.
+ *
+ * ⚠ THAT ANSWER WAS ABOUT THE CODE, NOT THE HARDWARE, and r401 overturned it.
+ * The ratio was flat because the fp16 path's per-element costs -- the pack,
+ * the poison, the readback, the softmax between the two matmuls -- grew with
+ * the prompt exactly as the CPU arm's arithmetic does. With those on the pool
+ * and the poison down to one sentinel a row, the ratio falls with length and
+ * crosses:
+ *
+ *     tokens     52     102     202     452     852
+ *     NPU/CPU  1.202   1.182   1.133   1.043   0.967
+ *
+ * Crossover about 680 tokens on Llama-3.2-1B, head_dim 64, three repeats an
+ * arm, alternating, one boot, clock pinned.
+ *
+ * ⚠ THE DEFAULT IS 768 AND NOT 680 ON PURPOSE. One model, one boot. Above the
+ * measured crossing with margin, so `auto` cannot make a short prompt worse
+ * while the number rests on a single curve.
+ *
+ * ⚠ AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
+ * the NPU arm ahead at head_dim 256 -- with the SLOWER code. That inference
+ * still holds (nothing here touches the CPU arm, so a faster NPU arm cannot
+ * have lost ground), but "still ahead" is not a crossover length, and this
+ * board has no head_dim 256 model on it to measure one. A clause nobody has
+ * measured is what got `auto` withdrawn the first time.
+ */
+static unsigned attn_npu_min_tokens(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_NPU_MIN");
+
+		v = e && *e ? atol(e) : 768;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/* 0 off, 1 on for every layer, 2 decide per call on the prompt's length */
 static int attn_npu_want_for(unsigned head_dim)
 {
 	static int v = -2;
@@ -4990,14 +5038,9 @@ static int attn_npu_want_for(unsigned head_dim)
 
 		if (!e || !*e)
 			v = 0;
-		else if (!strcmp(e, "auto")) {
-			fprintf(stderr, "charsiu: CHARSIU_ATTN_NPU=auto is "
-				"withdrawn -- head_dim >= 128 is only half the "
-				"rule and the other half (how long a prompt) "
-				"has not been measured; attention stays on the "
-				"CPU\n");
-			v = 0;
-		} else
+		else if (!strcmp(e, "auto"))
+			v = 2;
+		else
 			v = atoi(e) != 0;
 	}
 	(void)head_dim;
@@ -5075,9 +5118,33 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	 * and there is nothing to decide without it */
 	if (!m)
 		return NULL;
-	if (!attn_npu_want_for(m->head_dim ? m->head_dim
-					   : m->n_embd / m->n_head))
-		return NULL;
+	{
+		int want = attn_npu_want_for(m->head_dim ? m->head_dim
+					     : m->n_embd / m->n_head);
+
+		if (!want)
+			return NULL;
+		/*
+		 * ⚠⚠ THE DECISION IS HERE, BEFORE THE MIRROR EXISTS, AND THAT
+		 * IS THE WHOLE POINT. r401 put the length test inside
+		 * attn_npu_layer instead and measured it: at 202 tokens every
+		 * threshold cost 107 ms MORE than the CPU arm while refusing
+		 * every single layer, because the K and V surfaces are still
+		 * allocated and still fed by attn_npu_append, which builds the
+		 * mirror itself. A refusal that leaves the cost behind is not
+		 * a refusal.
+		 *
+		 * ⚠ AND IT IS ALL OR NOTHING FOR THE PROMPT. Choosing per
+		 * chunk sounds better and is not: at 852 tokens no threshold
+		 * beat simply being on (7755 to 7911 against 7782), because
+		 * the early chunks lose little and the upkeep is paid either
+		 * way.
+		 */
+		if (want == 2 && (s->prompt_total <= 0 ||
+				  (unsigned)s->prompt_total
+					< attn_npu_min_tokens()))
+			return NULL;
+	}
 	a = calloc(1, sizeof(*a));
 	if (!a)
 		return NULL;
@@ -7291,6 +7358,12 @@ int llama_prefill_chunk_cap(const struct llama_model *m)
 	/* ⚠ a floor of 2, because a chunk of one is the token loop wearing
 	 * the batched path's name, and the caller has its own minimum */
 	return cap < 2 ? 2 : (int)cap;
+}
+
+void llama_prefill_hint(struct llama_state *s, int total)
+{
+	if (s)
+		s->prompt_total = total;
 }
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,

@@ -978,6 +978,22 @@ struct llama_state {
 	const struct llama_model *m;
 	int n_ctx;
 	int pos;               /* how many tokens are in the cache */
+	/*
+	 * ⚠ HOW LONG THE PROMPT IS, WHICH NOTHING INSIDE THIS FILE CAN SEE.
+	 *
+	 * A prompt arrives one chunk at a time through llama_prefill_batch, so
+	 * every function below knows the running position and none of them
+	 * knows the total. CHARSIU_ATTN_NPU=auto needs the total: the fp16
+	 * attention arm loses on short prompts and wins on long ones, and
+	 * choosing per chunk was measured (r401) and buys nothing -- at 852
+	 * tokens no threshold beat simply being on, and at 202 every threshold
+	 * cost 107 ms because the mirror is built and fed whether or not a
+	 * layer ever uses it.
+	 *
+	 * 0 means the caller did not say, and `auto` then stays off. See
+	 * llama_prefill_hint.
+	 */
+	int prompt_total;
 
 	float *kcache;         /* [n_layer][n_ctx][n_head_kv * head_dim] */
 	float *vcache;
@@ -1106,6 +1122,14 @@ uint64_t charsiu_pool_min(double units_per_us, int threads);
 double charsiu_pool_barrier_us(void);
 
 int charsiu_env_flag(const char *name, int dflt);
+
+/*
+ * How many prompt tokens the caller is about to feed in, before the first
+ * chunk of them. Only CHARSIU_ATTN_NPU=auto reads it, and a caller that never
+ * calls this gets the behaviour it had. Call it again, or with 0, when the
+ * prompt is done; it is a hint about the NEXT prefill and nothing else.
+ */
+void llama_prefill_hint(struct llama_state *s, int total);
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);
