@@ -276,7 +276,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -285,6 +285,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
 	./$(BUILD)/pack_w8
+	./$(BUILD)/patch_waddr
 	./$(BUILD)/pack_f16run
 	./$(BUILD)/sentinel
 	./$(BUILD)/coef_scales
@@ -318,6 +319,12 @@ $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
 # code describing one permutation is the arrangement that lets a KV surface be
 # written in place, and a disagreement between them prints nothing
 $(BUILD)/pack_w8: tests/pack_w8.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the weight address patched into a stream against emitting it that way. The
+# patch is only safe while exactly one word depends on that address, and
+# nothing but this holds the emitter there
+$(BUILD)/patch_waddr: tests/patch_waddr.c src/job.c src/regcmd.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the vector fp16 conversion against the per element definition, over all 2^32

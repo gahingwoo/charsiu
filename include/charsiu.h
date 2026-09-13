@@ -129,6 +129,15 @@ struct charsiu_matmul {
  * at zero: they are patched in at submit time, and a stream with none in it is
  * directly comparable against one read out of a vendor model file.
  */
+/*
+ * Rewrite the weight address inside an emitted stream, which is the only word
+ * that differs between two dispatches of one shape over different KV surfaces.
+ * Returns how many words changed; a caller that does not get exactly one
+ * should emit from scratch. tests/patch_waddr.c requires the result to be
+ * byte-identical to emitting with that address in the first place.
+ */
+unsigned charsiu_patch_weight_addr(uint64_t *stream, size_t n, uint32_t addr);
+
 size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 			   uint64_t *out, size_t max);
 

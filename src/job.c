@@ -1024,6 +1024,39 @@ int charsiu_m_axis_wide_for(int w4)
 	return a < 0 ? w4 : a;
 }
 
+/*
+ * ⭐ THE WEIGHT ADDRESS, PATCHED INTO A STREAM THAT IS OTHERWISE THE SAME.
+ *
+ * A layer of fp16 attention asks for the same shapes at the same offsets in
+ * buffers that have not moved, sixteen layers running, and exactly one word
+ * differs between them: CNA 0x1110, which carries where the KV surface is.
+ * Rebuilding the whole stream to change one word was 57 ms of an 852 token
+ * prompt.
+ *
+ * This is the same substitution the vendor-stream replay makes -- that one
+ * patches three addresses into a captured stream and changes nothing else --
+ * and tests/patch_waddr.c holds it to the only standard that matters: the
+ * patched stream must be byte for byte what emit_job would have produced.
+ *
+ * Returns how many words were changed, so a caller can refuse when it is not
+ * exactly one.
+ */
+unsigned charsiu_patch_weight_addr(uint64_t *stream, size_t n, uint32_t addr)
+{
+	unsigned hits = 0;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if ((unsigned)(stream[i] >> 48) != CNA ||
+		    (unsigned)(stream[i] & 0xffffu) != 0x1110u)
+			continue;
+		stream[i] = ((uint64_t)CNA << 48)
+			  | ((uint64_t)addr << 16) | 0x1110u;
+		hits++;
+	}
+	return hits;
+}
+
 size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max)
 {
 	size_t vend = emit_vendor_stream(job, out, max);
