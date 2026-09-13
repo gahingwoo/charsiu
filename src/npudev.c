@@ -419,6 +419,7 @@ struct charsiu_npu {
 	int bin_one;               /* CHARSIU_NPU_BIN_ONEBO=1 */
 	struct charsiu_bo breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
+	size_t bd1_n;              /* elements in bd1, for the deferred snapshot */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
 	/*
 	 * What EACH DEVICE'S input BO holds right now, so a caller that
@@ -663,6 +664,16 @@ struct charsiu_npu {
 		 * `e` belongs here too.
 		 */
 		size_t bout_stride;
+		/*
+		 * ⚠⚠ AND int8's PER ROW ACTIVATION SCALE. The note over the
+		 * allocation of g->bd1 says "a single array would hand every
+		 * slice the last one's scales"; with a deferred gather the
+		 * same sentence is one scope up, and it hands the deferred
+		 * tensor the NEXT tensor's. r408's bisection put 4 of 9 model
+		 * failures in the pack region on its own.
+		 */
+		float *bd1;
+		size_t bd1_n;
 		int live;
 	} pend;
 	unsigned long bdefer_n, bdefer_done;
@@ -2032,6 +2043,9 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
 	free(g->pend.bseen);
+	free(g->pend.bd1);
+	g->pend.bd1 = NULL;
+	g->pend.bd1_n = 0;
 	g->pend.bseen = NULL;
 	g->pend.bseen_n = 0;
 	charsiu_npu_idle(g, 1);
@@ -4017,6 +4031,10 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	 * array would hand every slice the last one's scales.
 	 */
 	g->bd1 = malloc((size_t)nks * m * sizeof(*g->bd1));
+	/* ⚠ and its length, because a deferred read needs its OWN copy: the
+	 * sentence above is one scope up as soon as the gather can outlive the
+	 * call that packed for it */
+	g->bd1_n = (size_t)nks * m;
 	if (!g->bscr || !g->bq || !g->bd1) {
 		whine(g, "the batch scratch would not allocate", g->kmax, m);
 		g->bm = 0;
@@ -5555,6 +5573,7 @@ static int batch_read_device(struct charsiu_npu *g,
 static int npu_flush_pending(struct charsiu_npu *g)
 {
 	unsigned char *save;
+	float *d1save = NULL;
 	unsigned d;
 	int rc = 0;
 
@@ -5572,6 +5591,19 @@ static int npu_flush_pending(struct charsiu_npu *g)
 		memcpy(save, g->bseen, g->bseen_n);
 		memcpy(g->bseen, g->pend.bseen, nb);
 		g->bout_stride = g->pend.bout_stride;
+		/* int8's read multiplies by this and the next tensor's pack
+		 * has already overwritten the live one */
+		if (g->bd1 && g->pend.bd1 && g->pend.bd1_n >= g->bd1_n) {
+			d1save = malloc(g->bd1_n * sizeof(*d1save));
+			if (!d1save) {
+				memcpy(g->bseen, save, g->bseen_n);
+				free(save);
+				return -1;
+			}
+			memcpy(d1save, g->bd1, g->bd1_n * sizeof(*d1save));
+			memcpy(g->bd1, g->pend.bd1,
+			       g->bd1_n * sizeof(*d1save));
+		}
 		for (d = 0; d < g->ndev; d++)
 			if (g->pend.dmask & (1u << d))
 				if (batch_read_device(g, g->pend.e,
@@ -5579,6 +5611,10 @@ static int npu_flush_pending(struct charsiu_npu *g)
 						      g->pend.Y, g->pend.m))
 					rc = -1;
 		g->bout_stride = stride;
+		if (d1save) {
+			memcpy(g->bd1, d1save, g->bd1_n * sizeof(*d1save));
+			free(d1save);
+		}
 	}
 	memcpy(g->bseen, save, g->bseen_n);
 	free(save);
@@ -6481,6 +6517,22 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		if (defer) {
 			memcpy(g->pend.bseen, g->bseen, g->bseen_n);
 			g->pend.bseen_live = g->bseen_n;
+			if (g->bd1 && g->bd1_n) {
+				if (g->pend.bd1_n < g->bd1_n) {
+					float *t3 = realloc(g->pend.bd1,
+						g->bd1_n * sizeof(*t3));
+
+					if (t3) {
+						g->pend.bd1 = t3;
+						g->pend.bd1_n = g->bd1_n;
+					}
+				}
+				if (g->pend.bd1_n >= g->bd1_n)
+					memcpy(g->pend.bd1, g->bd1,
+					       g->bd1_n * sizeof(*g->bd1));
+				else
+					defer = 0;
+			}
 			g->pend.obi = (unsigned)(ob - g->obuf);
 			g->pend.e = e; g->pend.Y = Y;
 			g->pend.m = m;

@@ -6915,6 +6915,30 @@ static int matmul_rows_same_defer(struct llama_state *s,
  * buffer does not halve when the work does. Default 0; the code is kept so the
  * next person to have this idea can run it rather than write it again.
  */
+/*
+ * ⚠ WHICH CALL SITES MAY DEFER, so the residual failures can be attributed to
+ * one of them. r408's bisection put 4 of 9 model failures in the pack region
+ * and 5 somewhere before the next call even starts; this splits the second
+ * group by where it was deferred.
+ *
+ *   CHARSIU_DEFER_SITE=qkv    only q, k and v
+ *   CHARSIU_DEFER_SITE=ffn    only gate and up
+ *   anything else, or unset   both
+ */
+static int defer_site(char c)
+{
+	static const char *v;
+
+	if (!v) {
+		v = getenv("CHARSIU_DEFER_SITE");
+		if (!v)
+			v = "";
+	}
+	if (!*v)
+		return 1;
+	return c == 'q' ? !strcmp(v, "qkv") : !strcmp(v, "ffn");
+}
+
 static int rowsplit_min(void)
 {
 	static int v = -1;
@@ -6931,10 +6955,14 @@ static int rowsplit_min(void)
 static int matmul_rows_split(struct llama_state *s,
 			     const struct gguf_tensor *w, const float *X,
 			     int n, float *Y, uint32_t k, uint32_t nout,
-			     char site, int same)
+			     char site, int same, char group)
 {
 	int lo = rowsplit_min(), h;
 
+	if (!defer_site(group))
+		return same ? matmul_rows_same_x(s, w, X, n, Y, k, nout,
+						 site, 0)
+			    : matmul_rows(s, w, X, n, Y, k, nout);
 	h = (n / 2) & ~1;
 	if (!lo || n < lo || h < 2 || n - h < 2)
 		return same ? matmul_rows_same_defer(s, w, X, n, Y, k, nout,
@@ -7465,13 +7493,15 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * v's does; the flush covers a refusal that would
 			 * otherwise leave the last one unwritten. */
 			matmul_rows_split(s, L->wq, s->bxb, n, s->bq,
-					  m->n_embd, m->n_head * hd, 0, 0);
+					  m->n_embd, m->n_head * hd, 0, 0, 'q');
 			matmul_rows_split(s, L->wk, s->bxb, n, s->bk,
-					  m->n_embd, m->n_head_kv * hd, 'k', 1);
+					  m->n_embd, m->n_head_kv * hd, 'k', 1,
+					  'q');
 			if (L->wv)
 				matmul_rows_split(s, L->wv, s->bxb, n, s->bv,
 						  m->n_embd,
-						  m->n_head_kv * hd, 'v', 1);
+						  m->n_head_kv * hd, 'v', 1,
+						  'q');
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -7677,9 +7707,9 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * The flush below covers the case where up is refused
 			 * and never reaches the hardware to do it. */
 			matmul_rows_split(s, L->gate, s->bxb, n, s->bhb,
-					  m->n_embd, nff, 0, 0);
+					  m->n_embd, nff, 0, 0, 'f');
 			matmul_rows_split(s, L->up, s->bxb, n, s->bhb2,
-					  m->n_embd, nff, 'u', 1);
+					  m->n_embd, nff, 'u', 1, 'f');
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -7701,7 +7731,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		BSTAGE(ST_SILU);
 		if (rowsplit_min()) {
 			matmul_rows_split(s, L->down, s->bhb, n, s->bxo, nff,
-					  m->n_embd, 0, 0);
+					  m->n_embd, 0, 0, 'f');
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			matmul_rows(s, L->down, s->bhb, n, s->bxo, nff,
