@@ -5021,12 +5021,22 @@ struct attn_npu {
  *     tokens     52     102     202     452     852
  *     NPU/CPU  1.202   1.182   1.133   1.043   0.967
  *
- * Crossover about 680 tokens on Llama-3.2-1B, head_dim 64, three repeats an
- * arm, alternating, one boot, clock pinned.
+ * ⚠ AND THE CROSSOVER MOVES EVERY TIME THE ARM GETS FASTER, so the number
+ * here is dated, not derived. Giving each attention matmul its own fp16
+ * handle -- so neither sizes the other's buffers for the cache syncs -- moved
+ * it again within the same day:
  *
- * ⚠ THE DEFAULT IS 768 AND NOT 680 ON PURPOSE. One model, one boot. Above the
+ *     tokens     52     102     202     452     852
+ *     NPU/CPU  1.196   1.174   1.108   1.002   0.916
+ *
+ * Crossover about 452 tokens now, on Llama-3.2-1B, head_dim 64, three repeats
+ * an arm, alternating, one boot, clock pinned.
+ *
+ * ⚠ THE DEFAULT IS 512 AND NOT 452 ON PURPOSE. One model, one boot. Above the
  * measured crossing with margin, so `auto` cannot make a short prompt worse
- * while the number rests on a single curve.
+ * while the number rests on a single curve. It was 768 against a crossing of
+ * 680 an hour earlier; if this arm gets faster again, re-measure rather than
+ * scaling the old number.
  *
  * ⚠ AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
  * the NPU arm ahead at head_dim 256 -- with the SLOWER code. That inference
@@ -5042,7 +5052,7 @@ static unsigned attn_npu_min_tokens(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_NPU_MIN");
 
-		v = e && *e ? atol(e) : 768;
+		v = e && *e ? atol(e) : 512;
 		if (v < 0)
 			v = 0;
 	}
