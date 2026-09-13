@@ -598,9 +598,14 @@ halves, measured -- ratio is NPU arm over CPU arm, so below 1.00 the NPU wins:
 
 🏁 Both halves are real, and they are **one quantity**: head_dim is the inner
 dimension of both attention matmuls and prompt length is the outer, so both
-feed arithmetic per dispatch. head_dim 64 is flat at 1.25 because no length in
-range makes a dispatch worth taking there; head_dim 256 wins from about 230
-tokens and by 12.3% at 852.
+feed arithmetic per dispatch. head_dim 256 wins from about 230 tokens and by
+12.3% at 852.
+
+⛔ **"head_dim 64 is flat at 1.25 because no length makes a dispatch worth
+taking there" is WITHDRAWN — see 1j.** It was flat because the fp16 path spent
+1550 ms of its 2924 on one core doing work proportional to the answer, not
+because of anything about head_dim 64. With that gone the ratio falls with
+length and crosses at about 376 tokens.
 
 ⛔ **So the paper must not cite Llama-3.2-1B for this.** It is the model every
 speed round in this pack uses and the furthest below the threshold of anything
@@ -608,17 +613,129 @@ on the card -- head_dim 64 against a rule about 128.
 `tools/gguf_head_dim.py` prints the census: 512, 256, 128, 128, 96, 64, 64, 64.
 
 ⚠ **gemma-4-E2B is not a head_dim 512 point** and was nearly reported as one.
-It has two head_dims -- `key_length` 512 and `key_length_swa` 256 -- and the
-pool holds one, so 28 of its 35 layers never reach the hardware. Its 0.936 at
-852 tokens is what seven layers bought. The instrument said "fell back on 0"
+It has two head_dims -- `key_length` 512 and `key_length_swa` 256 -- and at the
+time the pool held one, so 28 of its 35 layers never reached the hardware. Its
+0.936 at 852 tokens is what seven layers bought. ⚠ **That is no longer true of
+the tree**: the mirror holds a head per layer, and gemma-4 now runs 385 of 385
+layer calls with zero refusals (1j). The paragraph is kept because the number
+above was measured under the old behaviour and must not be read as current. The instrument said "fell back on 0"
 throughout, because five refusal paths touched no counter; there is one per
 reason now and it names `head_dim` directly.
 
-⛔ **Not supported: any change of default.** Three clean models is not a rule,
-`CHARSIU_ATTN_NPU=auto` was already withdrawn once, and the last chunk rule
-derived rather than measured cost SmolLM2 77% (1h). Nothing is changed on this
-evidence; what is established is that the vendor's smaller quadratic term has a
-named cause on our side and an existing, correct, measured lever.
+⛔ **Not supported on this evidence: any change of default.** Three clean
+models is not a rule, `CHARSIU_ATTN_NPU=auto` was already withdrawn once, and
+the last chunk rule derived rather than measured cost SmolLM2 77% (1h). What is
+established here is that the vendor's smaller quadratic term has a named cause
+on our side and an existing, correct, measured lever.
+
+**The default DID change, on different evidence: 1j.** Ten models rather than
+three, the arm itself 2x faster than it is here, perplexity and peak memory
+measured, and a rule that leaves short prompts on the identical code path.
+
+---
+
+### 1j. The attention arm made the default, and half the prefill gap
+
+1i established that the vendor's smaller quadratic term is our attention being
+on the CPU, and left the lever off because three models is not a rule. This is
+what the lever is worth once the arm itself was made fast, and what that did
+to the curve in 1b-ii.
+
+**The arm, first.** At 852 tokens on Llama-3.2-1B the attention stage went
+5.48 -> 2.75 ms a row against a CPU arm at 4.00, across five builds. Nothing
+in it is a new algorithm; it is four things that were each a stage doing work
+on one core:
+
+```
+  the softmax between the two matmuls   1305 -> 466 ms   it never used the pool
+  the activation pack                   1132 -> 228 ms   scalar, then pooled
+  poisoning the output buffer            668 ->  24 ms   every cell, then one
+                                                         sentinel a row, then
+                                                         written before release
+  the scores readback                    257 ->  10 ms   copied out, then
+                                                         reduced in place
+```
+
+⚠ **1i's own conclusion about head_dim 64 is what this overturns**, and the
+shape of that matters: r400 measured the NPU arm at 1.19 to 1.23 times the CPU
+arm over an eight-fold range of prompt length, FLAT, and concluded there is no
+crossover at head_dim 64. That was a fact about the code. The ratio was flat
+because the fp16 path's per-element costs grew with the prompt exactly as the
+CPU arm's arithmetic does.
+
+```
+  tokens        52     102     202     302     452     852   crossover
+  r400        1.229   1.208     -       -     1.220   1.186   none, flat
+  final       1.207   1.153   1.087   1.035   0.964   0.864    ~376
+```
+
+**The default.** `CHARSIU_ATTN_NPU=auto` decides once per prompt, before the
+mirror is built, on a length the caller supplies (`llama_prefill_hint`).
+Ten models, 852 token prompt, clock pinned, leading with the one that lost:
+
+```
+  Phi-3.5-mini       -0.3%      SmolLM2-135M      +12.9%
+  SmolLM2-1.7B       +2.3%      tinyllama-1.1B    +17.0%
+  Llama-3.2-1B Q4_0 +13.2%      Qwen2.5-1.5B      +17.5%
+  Llama-3.2-1B Q8_0 +13.5%      gemma-3-1b        +19.8%
+                                gemma-4-E2B       +28.5%
+                                Qwen3-0.6B        +28.6%
+```
+
+Every one is text-identical to the CPU arm and none refuses a single layer --
+including gemma-4, which 1i describes as refusing 28 of 35. The gain tracks
+attention's SHARE of the prompt, which is why the two that do not move are the
+two largest models.
+
+⚠ **The two questions a default has to answer that speed does not.**
+Perplexity on `tests/corpus/long.txt`, batched, Llama-3.2-1B Q4_0: **40.9987
+off, 40.9213 on**, reproduced exactly twice. Deterministic, so that is a
+numerics difference and not an improvement to claim -- but it is not a cost
+either, which is the question. Peak memory 1474 -> 1459 MB on Llama, 2671 ->
+2670 on gemma-4.
+
+⚠ **Below the threshold the two arms run the same code**, not merely at the
+same speed: `attn_npu_get` returns NULL before the mirror exists. That is what
+makes a default defensible from one board -- the change is confined to prompts
+long enough to have been measured winning. Verified with an empty environment:
+202 tokens 1477 against 1483 ms, 852 tokens 7004 against 8053.
+
+**And the curve in 1b-ii.** Both charsiu arms measured in ONE boot, so
+`CHARSIU_ATTN_NPU=0` is a drift control on the vendor curve being from
+another: it reproduces that boot's charsiu points to within 3% at seven of
+eight lengths.
+
+```
+  charsiu tok    CPU arm (the 1b-ii config)    the default now
+       102          charsiu 1.146x               charsiu 1.153x
+       202          charsiu 1.033x               charsiu 1.031x
+       302          vendor  1.054x               vendor  1.064x
+       452          vendor  1.126x               vendor  1.087x
+       602          vendor  1.225x               vendor  1.167x
+       852          vendor  1.380x               vendor  1.193x
+```
+
+🏁 **The vendor's lead at 852 tokens is halved, 1.380x to 1.193x.** The
+crossover does not move -- it is still between 202 and 302 tokens -- and that
+is by construction, because the arm does not turn on below 448.
+
+⛔ **Do not quote the fitted coefficients for this.** Fitting `a + bn + cn^2`
+to both arms shows the quadratic more than halving, 0.004974 -> 0.002106, and
+folding in the vendor's own fit puts the crossover at 195 tokens -- *worse*
+than 1b-ii's 248, from a change that made the runtime faster at every length
+it touched. The control says why: the same configuration fits 0.004483 in
+1b-ii and 0.004974 here, an 11% swing between curves that agree to 3% point by
+point. Over an eight-point ladder the three parameters are correlated, and a
+lower `c` is bought with a higher `b`. `tools/ttft_compare.py` interpolates
+inside each curve and never fits across them; that is why it exists.
+
+⛔ **Still not supported: that charsiu beats the vendor on prefill.** It does
+not, above about 250 tokens. Their attention remains roughly 4.3x cheaper than
+ours -- our fence alone is 880 ms against their entire quadratic term's 539 at
+852 tokens -- because the fp16 attention matmuls run at 0.119 TMAC/s where the
+same silicon does 0.45 to 0.70 on int4. Both matmuls are skinny on one axis,
+k = 64 for the scores and n = 64 for the values. That is the remaining gap and
+it is not CPU-side.
 
 ---
 
