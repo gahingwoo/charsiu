@@ -5593,7 +5593,8 @@ static int npu_flush_pending(struct charsiu_npu *g)
 		g->bout_stride = g->pend.bout_stride;
 		/* int8's read multiplies by this and the next tensor's pack
 		 * has already overwritten the live one */
-		if (g->bd1 && g->pend.bd1 && g->pend.bd1_n >= g->bd1_n) {
+		if (g->bd1 && g->pend.bd1 && g->pend.bd1_n &&
+		    g->pend.bd1_n >= g->bd1_n) {
 			d1save = malloc(g->bd1_n * sizeof(*d1save));
 			if (!d1save) {
 				memcpy(g->bseen, save, g->bseen_n);
@@ -6527,11 +6528,17 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						g->pend.bd1_n = g->bd1_n;
 					}
 				}
+				/* ⚠ NOT `defer = 0` HERE: this block is already
+				 * inside `if (defer)`, so clearing it does not
+				 * stop pend.live being set two lines down. A
+				 * snapshot that did not happen would then be
+				 * restored over the live array. Mark it absent
+				 * instead and let the flush skip the swap. */
 				if (g->pend.bd1_n >= g->bd1_n)
 					memcpy(g->pend.bd1, g->bd1,
 					       g->bd1_n * sizeof(*g->bd1));
 				else
-					defer = 0;
+					g->pend.bd1_n = 0;
 			}
 			g->pend.obi = (unsigned)(ob - g->obuf);
 			g->pend.e = e; g->pend.Y = Y;
