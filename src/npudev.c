@@ -2002,6 +2002,27 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 }
 
 static int npu_flush_pending(struct charsiu_npu *g);
+static int defer_read_on(void);
+
+/*
+ * ⚠ THE BISECTION. CHARSIU_NPU_DEFER_READ selects WHERE the previous tensor's
+ * deferred gather is flushed, so the position can be moved without moving
+ * anything else:
+ *
+ *   1  after this call's submit loop, which is the only position that overlaps
+ *   2  at the end of the DEFERRING call, so the machinery runs at the moment
+ *      the plain path would have -- 0 of 9 models differ here
+ *   3  at the top of the next call, before any of its own state is touched
+ *   4  after batch_outbuf, before the pack
+ *   5  after the pack and the emit, before the submit
+ *
+ * =2 clean and =1 dirty says the fault is in what the next call CHANGES before
+ * the flush, and 3, 4 and 5 say which part of it.
+ */
+static int flush_at(struct charsiu_npu *g, int pos)
+{
+	return defer_read_on() == pos ? npu_flush_pending(g) : 0;
+}
 
 void charsiu_npu_close(struct charsiu_npu *g)
 {
@@ -5577,6 +5598,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
 		return -1;
+	if (flush_at(g, 3))
+		return -1;
 	/*
 	 * ⚠⚠ int8 IS THE PATH THAT DOES MORE THAN ONE ROW, and that is not a
 	 * preference, it is the only thing on this board with evidence.
@@ -5719,8 +5742,6 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * calls. After that the field is found by reading the list rather than
 	 * by guessing.
 	 */
-	if (defer && !w4_for(g, e->t))
-		defer = 0;
 	/*
 	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
 	 *
@@ -5936,6 +5957,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		g->last_ob = ob;
 		g->last_id = id;
 	}
+	if (flush_at(g, 4))
+		return -1;
 
 	/*
 	 * ⚠⚠ THE ZERO OF Y WAS 26% OF A BATCHED MATMUL, and it was a whole
@@ -6025,6 +6048,9 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 */
 	if (!g->reuse_ask)
 		reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
+
+	if (flush_at(g, 5))
+		return -1;
 
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
@@ -6410,7 +6436,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * one. What it does need is the deferred tensor's own g->bseen, which
 	 * npu_flush_pending swaps in.
 	 */
-	if (npu_flush_pending(g))
+	if (flush_at(g, 1))
 		return -1;
 
 	/*
