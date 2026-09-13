@@ -4,9 +4,31 @@ An open LLM runtime for the **RK3576 NPU on a mainline Linux kernel**, driving t
 hardware through the mainline `rocket` DRM-accel driver with no vendor userspace in
 the execution path.
 
-**Status.** On a ROCK 4D, under the vendor's own measuring protocol, charsiu's
-default format decodes faster than the vendor on all four models. That is one
-column of two, and the other one is why this table has three rows:
+**Status.** Both runtimes have now been run on the same board, at the same NPU
+clock, with the CPU pinned. Llama-3.2-1B is the one model this project has both
+for, and it is the only comparison here where nothing is quoted:
+
+```
+  Llama-3.2-1B, one board, NPU 594 MHz both sides, CPU pinned at maximum
+
+  decode      charsiu 1.39x to 1.46x faster       the multiple moves with the
+                                                  clock, so it is not one number
+  prompt      charsiu faster below about 250      a crossover, not a ratio: at
+              tokens, the vendor above it         102 tokens 852 ms against 932,
+                                                  at 852 tokens 8081 against 6027
+  quality     charsiu's weights 1.4x to 2.6x      their stored weights scored
+              better in perplexity                against the same f16 original
+```
+
+⚠ **One model, one board.** The decode and prompt rows are `docs/paper-evidence.md`
+1b, 1g and 1b-ii; the quality row is section 2 and is a reconstruction, because
+their runtime refuses every route to its own accuracy (1b).
+
+The table below is a different kind of comparison and it is worth being explicit
+about which: it puts a measurement of charsiu next to the vendor's PUBLISHED
+figures. Those have no N, no spread, and are taken at maximum CPU and NPU
+frequency. Where the two disagree, the head-to-head above is the one that was
+measured.
 
 ```
   qwen3 0.6B, one board, one session
@@ -14,14 +36,20 @@ column of two, and the other one is why this table has three rows:
                         decode tok/s     TTFT ms      perplexity, 600 tokens
   charsiu int4 (default)     26.31          602        49.89     +87%
   charsiu int8               17.23          543        27.07     +1.6%
-  the vendor's runtime       24.85          469          ?         ?
+  the vendor, PUBLISHED      24.85          469          ?         ?
 ```
 
-⚠ **THE EMPTY CELL IS FILLED NOW, AND NOT THE WAY IT WAS MEANT TO BE.**
+⚠ **THE THIRD ROW IS A CITATION, NOT AN ARM.** It has no N, no spread, and was
+taken at maximum CPU and NPU frequency; the two above it were measured here. On
+Llama-3.2-1B, where their runtime HAS been run on this board, charsiu decodes
+1.39x to 1.46x faster than it -- see the head-to-head at the top.
+
+⚠ **AND THE EMPTY CELL IS FILLED NOW, THOUGH NOT FOR THIS MODEL.**
 `tools/rkllm_rebuild.py` reads the vendor's stored weights and scores them with
 this project's own quantiser, on the same corpus, from the same f16 original
 both quantisations came from. Their weights come out **1.4 to 2.6 times worse
-in perplexity** than charsiu's across three nested subsets and two passages --
+in perplexity** than charsiu's across three nested subsets and two passages,
+**on Llama-3.2-1B**, which is the only `.rkllm` this project has --
 a direction, not a single number, because the six cells do not agree on an
 ordering. `docs/paper-evidence.md` section 2 has the protocol.
 
@@ -989,8 +1017,9 @@ dispatch path and the numbers move with it.
 model, both cores, and the CPUs held out of deep idle while the NPU is open (see
 below). `CHARSIU_STAGES=1` prints where a token goes, once per half of the run.
 
-The four-model speed table, best of six under `board_verify.sh 7`, on the
-vendor's own prompt and protocol:
+The four-model table, **charsiu measured here against the vendor's published
+figures** -- not against their runtime, which only the head-to-head at the top
+of this file does:
 
 ```
                   decode tok/s              TTFT ms            our prompt
