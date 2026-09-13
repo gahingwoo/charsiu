@@ -4930,6 +4930,15 @@ struct attn_npu {
 	float *sc;                          /* [H][m][kv] probabilities */
 	size_t sc_cells;
 	unsigned long layers, fallbacks;
+	/* ⚠ MEASURED, NOT SUBTRACTED. The softmax between the two matmuls was
+	 * bounded at first by taking the stage table's attention and removing
+	 * what charsiu_fp16_times accounts for -- which is a residual, and
+	 * this tree has been wrong three times in one day by calling one a
+	 * measurement. It has its own clock now. */
+	double t_soft;
+	/* and the rest of the layer, so "attention minus what is accounted"
+	 * is never again a number anybody reasons from */
+	double t_layer, t_kv, t_pack1, t_pack2;
 	int off;                            /* tried and refused */
 };
 
@@ -4997,6 +5006,8 @@ static int attn_npu_want_for(unsigned head_dim)
 
 
 
+static int attn_npu_soft_pool(void);
+
 static void attn_npu_free(struct attn_npu *a)
 {
 	unsigned i;
@@ -5011,6 +5022,15 @@ static void attn_npu_free(struct attn_npu *a)
 			ref += a->refused[r];
 		fprintf(stderr, "charsiu: fp16 attention ran %lu layers, fell "
 			"back on %lu, refused %lu\n", a->layers, a->fallbacks, ref);
+		if (a->t_layer > 0.0)
+			fprintf(stderr, "charsiu:   of %.0f ms in the layer:"
+				" kv surfaces %.0f  scores group %.0f"
+				"  softmax %.0f (%s)  values group %.0f"
+				"  unaccounted %.0f ms\n",
+				a->t_layer, a->t_kv, a->t_pack1, a->t_soft,
+				attn_npu_soft_pool() ? "pooled" : "one core",
+				a->t_pack2, a->t_layer - a->t_kv - a->t_pack1
+					  - a->t_soft - a->t_pack2);
 		/* ⚠ BY REASON, because "refused 308" is the number that made
 		 * gemma-4 look like a head_dim 512 measurement when 28 of its
 		 * 35 layers are head_dim 256 and never reached the hardware. */
@@ -5336,6 +5356,89 @@ static void attn_npu_catchup(struct llama_state *s, struct attn_npu *a,
 }
 
 /*
+ * ⚠⚠ THE SOFTMAX BETWEEN THE TWO MATMULS WAS THE BIGGEST THING IN THIS ARM
+ * AND NOTHING WAS COUNTING IT.
+ *
+ * The fp16 counters account for 2129 ms of an 852 token prompt's attention;
+ * the stage table puts the whole stage at 4669 ms. The other 2540 ms is the
+ * loop below, and it was a bare `for (h) for (r)` -- the one stage of this
+ * path that never used the pool, sitting between two that do. Same shape as
+ * `silu * up`, which was 11% of a batched prompt for the same reason.
+ *
+ * A unit is one (head, row). Rows cost O(pos), so a worker handed a
+ * contiguous span would be unbalanced if the span were part of a head -- but
+ * H * m units over four workers is whole heads each, and every head has the
+ * same distribution of rows, so the split is even by construction.
+ */
+static double attn_npu_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+struct attn_npu_soft {
+	struct attn_npu *a;
+	const struct attn_block_job *j;
+	unsigned m, rb, npad;
+};
+
+static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
+{
+	struct attn_npu_soft *c = ctx;
+	const struct attn_block_job *j = c->j;
+	uint64_t u;
+
+	for (u = u0; u < u0 + n; u++) {
+		unsigned h = (unsigned)(u / c->m), r = (unsigned)(u % c->m);
+		float *sr = c->a->sc
+			  + ((size_t)h * c->a->mmax + r) * c->a->kv;
+		int pos = j->pos0 + (int)c->rb + (int)r;
+		int tlo = j->swa && pos + 1 > j->n_swa
+			? pos + 1 - j->n_swa : 0;
+		int t;
+
+		/* ⚠ the scale the CPU arm applies inside attn_dot, applied
+		 * here on the way past */
+		for (t = 0; t < tlo; t++)
+			sr[t] = 0.0f;
+		for (t = tlo; t <= pos; t++)
+			sr[t] *= j->scale;
+		softmax(sr + tlo, pos + 1 - tlo);
+		/*
+		 * ⚠⚠ AND THE TAIL IS NOT ZEROED HERE ANY MORE. It used to be
+		 * `for (t = pos + 1; t < npad; t++) sr[t] = 0.0f`, which is
+		 * 58% of the row at 852 tokens and k = 1024 -- and the only
+		 * reader of it is the values pack, which is told the same
+		 * triangle through xtri0 and memsets its own destination.
+		 * Zeroing the source so the pack can convert a zero into a
+		 * zero was the work being done twice.
+		 *
+		 * ⚠ THE ORDER THIS WAS DONE IN IS THE ARGUMENT. The promise
+		 * was verified on hardware FIRST, while this loop still
+		 * enforced it: r400 ran CHARSIU_FP16_TRI_CHECK=1 at 852
+		 * tokens, read back all 98,114,560 elements the pack was told
+		 * to skip, and every one was zero. Only then was the
+		 * enforcement removed. What is left past pos is now the RAW
+		 * scores the matmul wrote, so the pack's memset is no longer
+		 * an optimisation -- it is what makes the answer right, which
+		 * is why xtri0 has no knob.
+		 */
+	}
+}
+
+/* the arm is named in both directions: =0 is the bare loop it replaced */
+static int attn_npu_soft_pool(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_POOL", 1);
+	return v;
+}
+
+/*
  * A whole layer of attention for a chunk of rows, or -1 to say the CPU should
  * do it. Returning -1 is always safe; the float cache is written either way.
  */
@@ -5346,6 +5449,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	struct charsiu_fp16_op op[FP16_GROUP_MAX];
 	unsigned H = j->n_head, hd = j->hd, i, h, rb;
 	unsigned T, npad;
+	double tl0 = 0.0, tk0 = 0.0, tg0;
 
 	/* ⚠ ONE REASON A TEST. These used to be two compound conditions, so
 	 * even a counter on them could not have said WHICH clause refused --
@@ -5380,6 +5484,8 @@ static int attn_npu_layer(struct attn_block_job *j)
 	if (T > a->kv) {
 		a->refused[AN_R_KV]++; return -1;
 	}
+	tl0 = attn_npu_now_ms();
+	tk0 = tl0;
 	/* ⚠ before anything reads the mirror: a generation between two prompts
 	 * left positions in the float cache and not in here */
 	attn_npu_catchup(s, a, j->l, T);
@@ -5402,6 +5508,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 		}
 		a->dirty[j->l] = 0;
 	}
+	a->t_kv += attn_npu_now_ms() - tk0;
 
 	for (rb = 0; rb < (unsigned)j->n; rb += a->mmax) {
 		unsigned m = (unsigned)j->n - rb < a->mmax
@@ -5442,29 +5549,23 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].k = hd;
 			op[h].n = npad;
 		}
+		tg0 = attn_npu_now_ms();
 		if (charsiu_fp16_matmul_group(a->f, op, H)) {
 			a->fallbacks++;
 			return -1;
 		}
-		for (h = 0; h < H; h++)
-			for (unsigned r = 0; r < m; r++) {
-				float *sr = a->sc
-					  + ((size_t)h * a->mmax + r) * a->kv;
-				int pos = j->pos0 + (int)rb + (int)r;
-				int tlo = j->swa && pos + 1 > j->n_swa
-					? pos + 1 - j->n_swa : 0;
-				int t;
+		a->t_pack1 += attn_npu_now_ms() - tg0;
+		{
+			struct attn_npu_soft sc = { a, j, m, rb, npad };
+			double ts = attn_npu_now_ms();
 
-				/* ⚠ the scale the CPU arm applies inside
-				 * attn_dot, applied here on the way past */
-				for (t = 0; t < tlo; t++)
-					sr[t] = 0.0f;
-				for (t = tlo; t <= pos; t++)
-					sr[t] *= j->scale;
-				softmax(sr + tlo, pos + 1 - tlo);
-				for (t = pos + 1; t < (int)npad; t++)
-					sr[t] = 0.0f;
-			}
+			if (attn_npu_soft_pool())
+				charsiu_parallel_for(attn_npu_soft_units, &sc,
+						     (uint64_t)H * m);
+			else
+				attn_npu_soft_units(&sc, 0, (uint64_t)H * m);
+			a->t_soft += attn_npu_now_ms() - ts;
+		}
 		for (h = 0; h < H; h++) {
 			memset(&op[h], 0, sizeof(op[h]));
 			op[h].X = a->sc + (size_t)h * a->mmax * a->kv;
@@ -5475,10 +5576,10 @@ static int attn_npu_layer(struct attn_block_job *j)
 			 * itself -- [pos+1, npad) explicitly, and [npad, kv)
 			 * is the scratch's calloc, which is why that calloc is
 			 * load bearing. So the pack can memset the tail rather
-			 * than convert a float zero into a half zero, which on
-			 * an 852 token prompt is more than half of every
-			 * element it touches. CHARSIU_FP16_TRI_CHECK=1 reads
-			 * the tail back and counts what is not zero.
+			 * than convert it -- and since the softmax loop no
+			 * longer zeroes it either, the pack's memset is what
+			 * makes those positions contribute nothing. Past pos
+			 * this scratch holds the RAW scores.
 			 */
 			op[h].xtri0 = (unsigned)j->pos0 + rb + 1;
 			op[h].Wbuf = a->vb[j->l * a->nkv + h / j->gqa];
@@ -5489,12 +5590,15 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].k = a->kv;
 			op[h].n = hd;
 		}
+		tg0 = attn_npu_now_ms();
 		if (charsiu_fp16_matmul_group(a->f, op, H)) {
 			a->fallbacks++;
 			return -1;
 		}
+		a->t_pack2 += attn_npu_now_ms() - tg0;
 	}
 	a->layers++;
+	a->t_layer += attn_npu_now_ms() - tl0;
 	return 0;
 }
 

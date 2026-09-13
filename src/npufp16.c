@@ -49,7 +49,7 @@ struct charsiu_fp16 {
 	/* elements converted by the pack, so `pack` can be read per element
 	 * rather than per call -- the two differ by a factor of the CONTEXT
 	 * LENGTH, because the values matmul contracts over the whole of it */
-	unsigned long long packel, trisk, tribad;
+	unsigned long long packel, trisk;
 	struct charsiu_fp16_times t;
 	/* what is currently sitting in the coefficient buffer, so a group
 	 * that asks for the same shapes twice does not build it twice */
@@ -282,15 +282,15 @@ static inline void pack_run(int vec, uint16_t *d, const float *x, size_t n)
 	}
 }
 
-/* the caller's causal triangle, and the arm that reads what it skipped */
-static int tri_on(void)
-{
-	static int v = -1;
-
-	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_FP16_TRI", 1);
-	return v;
-}
+/*
+ * ⚠ THE CAUSAL TRIANGLE HAS NO KNOB, AND THAT IS DELIBERATE. It began as one
+ * -- CHARSIU_FP16_TRI=0 converted the tail instead of zeroing it, and r400
+ * priced the difference at 8% of the pack. Then the caller stopped zeroing
+ * the source, because it only ever zeroed it so this could convert a zero
+ * into a zero. Past xtri0 + r the source now holds the RAW scores, so the
+ * memset is not an optimisation any more: it is the answer. An arm that
+ * turned it off would be an arm that is wrong.
+ */
 
 /*
  * ⚠ THE ARM IS NAMED IN BOTH DIRECTIONS. CHARSIU_FP16_FULLSCAN=1 counts every
@@ -307,14 +307,6 @@ static int fullscan(void)
 	return v;
 }
 
-static int tri_check(void)
-{
-	static int v = -1;
-
-	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_FP16_TRI_CHECK", 0);
-	return v;
-}
 
 /*
  * ⚠⚠ EVERY ONE OF THESE COUNTERS ALREADY EXISTED AND NOTHING READ THEM.
@@ -332,8 +324,9 @@ static int tri_check(void)
  */
 static void fp16_report(const struct charsiu_fp16 *f)
 {
-	double tot = f->t.wcopy + f->t.pack + f->t.psync + f->t.coefs
-		   + f->t.emit + f->t.submit + f->t.fence + f->t.read;
+	double tot = f->t.plan + f->t.wcopy + f->t.pack + f->t.psync
+		   + f->t.coefs + f->t.emit + f->t.submit + f->t.fence
+		   + f->t.read + f->t.other;
 
 	if (!f->calls)
 		return;
@@ -341,11 +334,11 @@ static void fp16_report(const struct charsiu_fp16 *f)
 		" %.0f ms accounted\n", f->calls, f->submits, f->refused, tot);
 	if (tot <= 0.0)
 		return;
-	fprintf(stderr, "charsiu fp16:  wcopy %.0f  pack %.0f  psync %.0f"
-		"  coefs %.0f  emit %.0f  submit %.0f  fence %.0f"
-		"  read %.0f ms\n",
-		f->t.wcopy, f->t.pack, f->t.psync, f->t.coefs, f->t.emit,
-		f->t.submit, f->t.fence, f->t.read);
+	fprintf(stderr, "charsiu fp16:  plan %.0f  wcopy %.0f  pack %.0f"
+		"  psync %.0f  coefs %.0f  emit %.0f  submit %.0f  fence %.0f"
+		"  read %.0f  other %.0f ms\n",
+		f->t.plan, f->t.wcopy, f->t.pack, f->t.psync, f->t.coefs,
+		f->t.emit, f->t.submit, f->t.fence, f->t.read, f->t.other);
 	fprintf(stderr, "charsiu fp16:  %.0f%% fence, %.0f%% weight copy,"
 		" %.3f ms a call\n", 100.0 * f->t.fence / tot,
 		100.0 * f->t.wcopy / tot, tot / (double)f->calls);
@@ -362,12 +355,8 @@ static void fp16_report(const struct charsiu_fp16 *f)
 			pack_vector() ? "vector" : "scalar");
 	if (f->trisk)
 		fprintf(stderr, "charsiu fp16:  %llu of them memset as the"
-			" causal tail (%.0f%%)%s\n", f->trisk,
-			100.0 * (double)f->trisk / (double)f->packel,
-			tri_check()
-			  ? (f->tribad ? ", ⛔ AND THE TAIL WAS NOT ZERO"
-				       : ", read back and every one was zero")
-			  : "");
+			" causal tail (%.0f%%)\n", f->trisk,
+			100.0 * (double)f->trisk / (double)f->packel);
 }
 
 void charsiu_fp16_close(struct charsiu_fp16 *f)
@@ -572,10 +561,14 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	unsigned nin;
 	int32_t *zero;
 	int vec = pack_vector();
-	double t0;
+	double t0, tcall = 0.0, tprev = 0.0;
 
 	if (!f)
 		return -1;
+	tcall = now_ms();
+	tprev = f->t.plan + f->t.wcopy + f->t.pack + f->t.psync + f->t.coefs
+	      + f->t.emit + f->t.submit + f->t.fence + f->t.read;
+	t0 = tcall;
 	/* a previous group's answers are still being read out of the buffer
 	 * this is about to overwrite */
 	charsiu_fp16_release(f);
@@ -624,6 +617,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	if (want(f, pl.wtot + 4096, pl.itot + 4096, pl.otot + 4096,
 		 pl.ctot + 4096, (size_t)nops * FP16_REG_STRIDE + 4096))
 		return -1;
+	f->t.plan += now_ms() - t0;
 
 	/* ONE prep and ONE fini a buffer for the whole group. Cache
 	 * maintenance per op would put back a per dispatch cost of exactly
@@ -672,8 +666,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		size_t cap = pl.isz[i] / 2;
 		size_t xs = ops[i].xstride ? ops[i].xstride : ops[i].k;
 		const float *X = ops[i].X;
-		int tri = ops[i].xtri0 && tri_on();
-		int chk = tri && tri_check();
+		int tri = ops[i].xtri0 != 0;
 
 		if (nel > cap)
 			nel = cap;
@@ -701,11 +694,6 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 					memset(d + e + keep, 0,
 					       (cn - keep) * 2);
 					f->trisk += cn - keep;
-					if (chk)
-						for (size_t c = keep; c < cn;
-						     c++)
-							f->tribad +=
-								xr[c] != 0.0f;
 				}
 				e += cn;
 			}
@@ -951,6 +939,10 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		f->held = 0;
 	}
 	f->t.read += now_ms() - t0;
+	f->t.other += now_ms() - tcall
+		    - (f->t.plan + f->t.wcopy + f->t.pack + f->t.psync
+		       + f->t.coefs + f->t.emit + f->t.submit + f->t.fence
+		       + f->t.read - tprev);
 	if (bad) {
 		f->refused += bad;
 		return -1;

@@ -19,8 +19,19 @@
 # ones that are not zero. A pack that quietly zeroes live probabilities still
 # produces fluent text.
 #
-# Both arms name the knob: CHARSIU_FP16_TRI=1 keeps the promise, =0 converts
-# everything. The vector pack is on in both, so this prices one change.
+# ⛔⛔ THE KNOB THIS SCRIPT SWEEPS WAS REMOVED THE SAME DAY IT MEASURED IT, and
+# this script now REFUSES rather than quietly measuring one arm twice.
+#
+# r400 section 2 priced CHARSIU_FP16_TRI at 8% of the pack and nothing outside
+# TTFT's own spread. What made it worth keeping was the next result: the caller
+# was zeroing that tail itself, in the one stage of the path with no pool behind
+# it, and it only did so in order that this could convert a zero into a zero.
+# With the caller's zeroing gone, what lies past the triangle is the RAW scores
+# and the memset is the answer, not a saving -- so there is no off arm.
+#
+# Kept because r400 is reproducible against charsiu at 235635d, where the knob
+# still existed. Against anything newer the two arms are the same arm, which is
+# exactly the null arm this tree has been caught by before.
 #
 #   CHARSIU_TRI_REPS="4 12 24 34"   clause counts (about 25 tokens each)
 #   CHARSIU_TRI_N=2                 repeats an arm a length
@@ -36,6 +47,15 @@ ERR=/tmp/fp16tri.$$
 
 [ -e /dev/accel/accel0 ] || { echo "no /dev/accel -- this needs the rocket arm"; exit 1; }
 [ -x "$RUN" ] || { echo "no $RUN"; exit 1; }
+# ⚠ A NULL ARM IS NOT A NULL RESULT. If the binary does not carry the knob,
+# both arms below are the default and the table would read 1.000 everywhere.
+if ! strings "$RUN" 2>/dev/null | grep -q '^CHARSIU_FP16_TRI$'; then
+	echo "⛔ $RUN has no CHARSIU_FP16_TRI: the knob was removed on 09-13"
+	echo "   when the caller stopped zeroing the tail, which made the"
+	echo "   triangle load bearing rather than optional. This script only"
+	echo "   reproduces r400 section 2 against charsiu at 235635d."
+	exit 1
+fi
 
 for p in /sys/devices/system/cpu/cpufreq/policy*; do
 	echo userspace > "$p/scaling_governor" 2>/dev/null || true

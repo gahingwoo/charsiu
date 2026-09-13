@@ -469,13 +469,21 @@ struct charsiu_fp16_op {
 	 * and past the scores matmul's n they are the scratch's calloc.
 	 *
 	 * On an 852 token prompt at k = 1024 that is 58% of every element the
-	 * pack touches, converted from a float that is zero into a half that
-	 * is zero. With xtri0 set the tail is a memset instead.
+	 * pack touches. With xtri0 set the tail is a memset instead.
 	 *
-	 * 0 means no promise and everything is converted. A caller that sets
-	 * it and is WRONG gets a silently wrong answer, so
-	 * CHARSIU_FP16_TRI_CHECK=1 reads the tail it was told to skip and
-	 * counts what is not zero.
+	 * ⚠⚠ AND IT IS NOT AN OPTIMISATION ANY MORE. The caller used to zero
+	 * that tail itself and this only saved converting a zero into a zero;
+	 * since the caller stopped (it was 58% of a row, in the one stage of
+	 * that path with no pool behind it), what lies past xtri0 + r is the
+	 * RAW scores, and the memset here is what makes those positions
+	 * contribute nothing. So there is no arm that turns it off.
+	 *
+	 * The promise was verified on hardware BEFORE the caller's zeroing was
+	 * removed, which is the only order in which that verification means
+	 * anything: r400 read back all 98,114,560 elements the pack was told
+	 * to skip at 852 tokens and every one was zero.
+	 *
+	 * 0 means no promise and everything is converted.
 	 *
 	 * ⚠ memset is the right filler and that is not obvious: charsiu_f2h
 	 * maps +0.0 to 0x0000 but -0.0 to 0x8000, so this is only equivalent
@@ -510,6 +518,12 @@ struct charsiu_fp16_times {
 	 * dma_sync the WHOLE buffer object, and `want` grows it and never
 	 * shrinks it, so a group that packs 32 kB can pay for 384. */
 	double psync;
+	/* ⚠ plan is release + make_plan + want, and `other` is whatever the
+	 * call took that none of the rest names. It exists because the layer
+	 * timer said 2929 ms in the two group calls while these fields
+	 * accounted for 2128, and an 800 ms hole is not something to reason
+	 * about by subtraction somewhere else. */
+	double plan, other;
 };
 void charsiu_fp16_get_times(const struct charsiu_fp16 *f,
 			    struct charsiu_fp16_times *t);
