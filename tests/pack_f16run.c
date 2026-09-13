@@ -94,6 +94,81 @@ static void strided_new(uint16_t *d, const float *X, unsigned m, unsigned k,
 	}
 }
 
+/*
+ * The causal triangle: row r may be nonzero only in its first (tri0 + r)
+ * entries, so the pack memsets the rest instead of converting it. The claim
+ * is that the two produce the same bytes, and it holds ONLY because every
+ * zero in that tail is a positive zero -- charsiu_f2h(-0.0f) is 0x8000, not
+ * 0x0000, so a negative zero in the tail would make memset wrong. This puts
+ * one in deliberately, in the part the promise does NOT cover, and a matching
+ * positive zero where it does.
+ */
+static void triangle(void)
+{
+	const unsigned m = 37, k = 128;
+	float *X = malloc((size_t)m * k * sizeof(*X));
+	uint16_t *a = malloc((size_t)m * k * sizeof(*a));
+	uint16_t *b = malloc((size_t)m * k * sizeof(*b));
+	unsigned tri0 = 9, cases = 0, ok = 0;
+
+	if (!X || !a || !b) { fail = 1; return; }
+	for (unsigned pass = 0; pass < 2; pass++) {
+		for (unsigned r = 0; r < m; r++) {
+			size_t keep = (size_t)tri0 + r;
+
+			if (keep > k)
+				keep = k;
+			for (unsigned c = 0; c < k; c++) {
+				float *p = &X[(size_t)r * k + c];
+
+				if (c < keep)
+					/* pass 1 puts a NEGATIVE zero inside
+					 * the promise, where it is converted */
+					*p = (pass && c + 1 == keep) ? -0.0f
+					   : (float)((int)c - 40) * 0.031f;
+				else
+					*p = 0.0f;
+			}
+		}
+		for (unsigned r = 0; r < m; r++) {
+			size_t keep = (size_t)tri0 + r;
+
+			if (keep > k)
+				keep = k;
+			/* everything, the way the pack ran before */
+			for (unsigned c = 0; c < k; c++)
+				a[(size_t)r * k + c] =
+					charsiu_f2h(X[(size_t)r * k + c]);
+			/* the promise, the way it runs now */
+			charsiu_f2h_run(b + (size_t)r * k, X + (size_t)r * k,
+					keep);
+			memset(b + (size_t)r * k + keep, 0, (k - keep) * 2);
+		}
+		cases++;
+		if (memcmp(a, b, (size_t)m * k * sizeof(*a)) == 0)
+			ok++;
+		else
+			printf("pack_f16run: FAIL triangle pass %u\n", pass);
+	}
+	/* and the control: a triangle whose tail is NOT zero must differ,
+	 * or this test would pass on a promise nobody keeps */
+	X[(size_t)5 * k + k - 1] = 1.5f;
+	for (unsigned c = 0; c < k; c++)
+		a[(size_t)5 * k + c] = charsiu_f2h(X[(size_t)5 * k + c]);
+	charsiu_f2h_run(b + (size_t)5 * k, X + (size_t)5 * k, tri0 + 5);
+	memset(b + (size_t)5 * k + tri0 + 5, 0, (k - tri0 - 5) * 2);
+	cases++;
+	if (memcmp(a + (size_t)5 * k, b + (size_t)5 * k, k * sizeof(*a)))
+		ok++;
+	else
+		printf("pack_f16run: FAIL the broken-promise control agreed\n");
+	if (ok != cases)
+		fail = 1;
+	printf("pack_f16run: %u of %u triangle cases as expected, negative"
+	       " zero and broken promise included\n", ok, cases);
+	free(X); free(a); free(b);
+}
+
 static void strided(void)
 {
 	/* m, k, xstride, and a cap that TRUNCATES the last row -- the bound
@@ -153,6 +228,7 @@ static void strided(void)
 int main(void)
 {
 	strided();
+	triangle();
 	exhaustive();
 	if (fail)
 		printf("pack_f16run: FAILED\n");

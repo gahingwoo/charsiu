@@ -457,6 +457,32 @@ struct charsiu_fp16_op {
 	 *   matmul must run at.
 	 */
 	unsigned xstride, ystride;
+	/*
+	 * ⚠ A CAUSAL TRIANGLE, so the pack does not convert the zeros.
+	 *
+	 * Attention's values matmul contracts over k = THE CONTEXT LENGTH
+	 * whatever the prompt has reached, because the V surface is packed at
+	 * that k and a buffer written at one k and run at another is a
+	 * different permutation of the same weights. So row r of X is a row of
+	 * probabilities with (xtri0 + r) leading entries that can be nonzero
+	 * and zeros from there to k -- the softmax wrote those zeros itself,
+	 * and past the scores matmul's n they are the scratch's calloc.
+	 *
+	 * On an 852 token prompt at k = 1024 that is 58% of every element the
+	 * pack touches, converted from a float that is zero into a half that
+	 * is zero. With xtri0 set the tail is a memset instead.
+	 *
+	 * 0 means no promise and everything is converted. A caller that sets
+	 * it and is WRONG gets a silently wrong answer, so
+	 * CHARSIU_FP16_TRI_CHECK=1 reads the tail it was told to skip and
+	 * counts what is not zero.
+	 *
+	 * ⚠ memset is the right filler and that is not obvious: charsiu_f2h
+	 * maps +0.0 to 0x0000 but -0.0 to 0x8000, so this is only equivalent
+	 * because every zero in that tail is a written +0.0 or an untouched
+	 * calloc, never a negative zero.
+	 */
+	unsigned xtri0;
 };
 
 /*

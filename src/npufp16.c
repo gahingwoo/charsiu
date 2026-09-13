@@ -49,7 +49,7 @@ struct charsiu_fp16 {
 	/* elements converted by the pack, so `pack` can be read per element
 	 * rather than per call -- the two differ by a factor of the CONTEXT
 	 * LENGTH, because the values matmul contracts over the whole of it */
-	unsigned long long packel;
+	unsigned long long packel, trisk, tribad;
 	struct charsiu_fp16_times t;
 	/* what is currently sitting in the coefficient buffer, so a group
 	 * that asks for the same shapes twice does not build it twice */
@@ -282,6 +282,25 @@ static inline void pack_run(int vec, uint16_t *d, const float *x, size_t n)
 	}
 }
 
+/* the caller's causal triangle, and the arm that reads what it skipped */
+static int tri_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_FP16_TRI", 1);
+	return v;
+}
+
+static int tri_check(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_FP16_TRI_CHECK", 0);
+	return v;
+}
+
 /*
  * ⚠⚠ EVERY ONE OF THESE COUNTERS ALREADY EXISTED AND NOTHING READ THEM.
  *
@@ -326,6 +345,14 @@ static void fp16_report(const struct charsiu_fp16 *f)
 			" each (%s arm)\n", f->packel,
 			f->t.pack * 1e6 / (double)f->packel,
 			pack_vector() ? "vector" : "scalar");
+	if (f->trisk)
+		fprintf(stderr, "charsiu fp16:  %llu of them memset as the"
+			" causal tail (%.0f%%)%s\n", f->trisk,
+			100.0 * (double)f->trisk / (double)f->packel,
+			tri_check()
+			  ? (f->tribad ? ", ⛔ AND THE TAIL WAS NOT ZERO"
+				       : ", read back and every one was zero")
+			  : "");
 }
 
 void charsiu_fp16_close(struct charsiu_fp16 *f)
@@ -630,10 +657,12 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		size_t cap = pl.isz[i] / 2;
 		size_t xs = ops[i].xstride ? ops[i].xstride : ops[i].k;
 		const float *X = ops[i].X;
+		int tri = ops[i].xtri0 && tri_on();
+		int chk = tri && tri_check();
 
 		if (nel > cap)
 			nel = cap;
-		if (xs == ops[i].k) {
+		if (xs == ops[i].k && !tri) {
 			pack_run(vec, d, X, nel);
 		} else {
 			size_t e = 0;
@@ -641,11 +670,28 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			/* the bound was per element and the row length is
 			 * known: a row contributes min(k, what is left) */
 			for (unsigned r = 0; r < ops[i].m && e < nel; r++) {
-				size_t cn = ops[i].k;
+				const float *xr = X + (size_t)r * xs;
+				size_t cn = ops[i].k, keep;
 
 				if (cn > nel - e)
 					cn = nel - e;
-				pack_run(vec, d + e, X + (size_t)r * xs, cn);
+				keep = cn;
+				if (tri) {
+					keep = (size_t)ops[i].xtri0 + r;
+					if (keep > cn)
+						keep = cn;
+				}
+				pack_run(vec, d + e, xr, keep);
+				if (keep < cn) {
+					memset(d + e + keep, 0,
+					       (cn - keep) * 2);
+					f->trisk += cn - keep;
+					if (chk)
+						for (size_t c = keep; c < cn;
+						     c++)
+							f->tribad +=
+								xr[c] != 0.0f;
+				}
 				e += cn;
 			}
 		}

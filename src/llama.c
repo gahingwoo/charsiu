@@ -5469,6 +5469,18 @@ static int attn_npu_layer(struct attn_block_job *j)
 			memset(&op[h], 0, sizeof(op[h]));
 			op[h].X = a->sc + (size_t)h * a->mmax * a->kv;
 			op[h].xstride = a->kv;
+			/*
+			 * ⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
+			 * NOTHING AFTER ITSELF. The loop above wrote the zeros
+			 * itself -- [pos+1, npad) explicitly, and [npad, kv)
+			 * is the scratch's calloc, which is why that calloc is
+			 * load bearing. So the pack can memset the tail rather
+			 * than convert a float zero into a half zero, which on
+			 * an 852 token prompt is more than half of every
+			 * element it touches. CHARSIU_FP16_TRI_CHECK=1 reads
+			 * the tail back and counts what is not zero.
+			 */
+			op[h].xtri0 = (unsigned)j->pos0 + rb + 1;
 			op[h].Wbuf = a->vb[j->l * a->nkv + h / j->gqa];
 			op[h].Y = j->out + (size_t)rb * qstride
 				+ (size_t)h * hd;
