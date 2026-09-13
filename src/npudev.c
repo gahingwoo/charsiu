@@ -5461,9 +5461,37 @@ static int batch_read_device(struct charsiu_npu *g,
 					 * it got them only where the
 					 * chunk arithmetic happened to
 					 * land even. See pool_arm. */
+					/*
+					 * ⚠ THE GRAIN MUST MATCH THE FORM.
+					 * read_rows4 refuses a range that is
+					 * not four aligned and read_rows2 one
+					 * that is not two, so `read4 == 2 ? 2
+					 * : 1` gave the FOUR row form a grain
+					 * of 1 and every worker fell through
+					 * to the row loop: a knob that
+					 * disabled the thing it selects.
+					 *
+					 * ⚠ FIXED, AND IT CHANGED NOTHING:
+					 * read 2.31/2.46 ms a row against the
+					 * pair form's 2.04/2.46 and the row
+					 * loop's 2.29/2.29. The four row form
+					 * really is no better here, so the
+					 * note above is confirmed rather than
+					 * overturned.
+					 *
+					 * 🔑 AND tools/bench_gather DISAGREES
+					 * -- 1.26 to 1.33x FASTER for that
+					 * form, the first time it has been run
+					 * on the board rather than the desk.
+					 * The difference is the POOL: the
+					 * bench is one thread with four write
+					 * streams, this is four threads with
+					 * sixteen.
+					 */
 					charsiu_parallel_for_grain(
 						read_rows, &rr, m,
-						g->read4 == 2 ? 2 : 1);
+						g->read4 == 4 ? 4
+						: g->read4 == 2 ? 2 : 1);
 					g->bread_pooled++;
 				} else {
 					read_rows(&rr, 0, m);
