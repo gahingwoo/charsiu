@@ -279,14 +279,40 @@ table reaching 800 MHz; Kiln's patch pins the clock. So this section says
 nothing about either side at the frequency their published figures were taken
 at -- section 1g does, for the CPU half, and finds the ratio unmoved by it.
 
-⛔ **Their runtime cannot be asked for perplexity, so section 2 cannot be
-cross-checked this way.** `RKLLM_INFER_GET_LOGITS` is in their API and the
-model refuses it: every sequence length tried, 64 through 544, returns
-`meet unkown shape, op name: matmul_qk_rkllm_spilt_0` and no logits. The
-model is exported for generation and the attention shapes for a logits pass
-are not in its compiled set. Section 2's reconstruction therefore remains
-unvalidated against their real runtime, and the pack still says the
-112-matrix figure measures the reconstruction.
+⛔ **Their runtime cannot be asked for its accuracy at all, by any route this
+project can find, and section 2's reconstruction is therefore the only way to
+it rather than the second best.** Three refusals, r398:
+
+1. **Logits.** `RKLLM_INFER_GET_LOGITS` is in their API and every sequence
+   length tried, 64 through 544, returns
+   `meet unkown shape, op name: matmul_qk_rkllm_spilt_0`.
+2. **Raw tokens.** Accuracy does not actually need logits: teacher-forced
+   top-1 agreement against the f16 origin has perplexity's structure and needs
+   only a token back, and `RKLLM_INPUT_TOKEN` would bypass their chat template
+   so both runtimes could be asked about the same sequence. It is accepted, it
+   returns a value, and **the value is token 0**. Asked for ten tokens it says
+   `"!!!!!!!!!!"`. Across 65 prefixes: 7232 `meet unkown shape, op name:
+   matmul_qkv_rkllm_spilt_0` lines, a token back every time, and prefixes 32
+   to 62 report no error at all and still answer 0.
+3. **Text prompts.** These work, and they apply a chat template we cannot
+   reproduce: our token count against theirs is +34 on one string and +33 on
+   another, so the two templates are not the same and a comparison through
+   them compares two framings as well as two runtimes.
+
+🔑 **Which also corrects what (1) was taken to mean.** It was recorded as "the
+model refuses logits". `matmul_qk` and `matmul_qkv` are sibling ops and the
+error is the same class, so the constraint was never about logits: **their
+export carries a fixed set of compiled shapes** and anything off that set
+fails. ⛔ And it fails by returning the null result rather than an error, which
+is the same shape as the all-0x80 buffer of a cancelled rocket job and the
+unwritten shmem BO that reads back a uniform 128 (1b, and Igor's 2026-09-12
+correction on the v12 thread).
+
+⚠ What the attempt did leave is arm A, which had never been run either: **every
+quality number in this pack before 2026-09-13 came from the CPU path**, because
+`charsiu_ppl` had no aarch64 target. Built now, our q4_0 through the board's NPU
+agrees with the f16 origin's top-1 on **55.0% of 420 positions**, with its own
+hit rate on the text 29.5% against the origin's 37.1%.
 
 ### 1c. The decode margin is younger than the round
 
@@ -971,6 +997,13 @@ nothing in the literature has, while a speed comparison against a vendor
 runtime is ordinary.
 
 **Anything saying their runtime has never been run here.** It has, in 1b.
+
+⭐ **Section 2 can be stated more strongly than it has been.** It has read as a
+fallback -- "we could not ask their runtime, so we reconstructed". r398 tried
+all three routes into their runtime and all three refuse, one of them by
+returning the null result without an error. So the reconstruction is not a
+second best; it is the only route, and the paper can say why in four lines
+instead of apologising for it in one.
 
 **The fairness caveat about frequency can be narrowed, and one half of it
 reversed.** The paper has been carrying "their published figures are at maximum

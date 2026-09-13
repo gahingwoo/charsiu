@@ -106,6 +106,14 @@ $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
+# ⚠ THE QUALITY INSTRUMENT, ON THE BOARD. charsiu_ppl only ever built for the
+# host, so every perplexity and every --top1 in this tree came from the CPU
+# path. The board's own quantiser is the one that ships, and scoring it needed
+# this target to exist. Same caveat as the rule above: this source list has to
+# track charsiu_ppl's.
+$(BUILD)/charsiu_ppl.aarch64: tools/charsiu_ppl.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
+
 # The control: same code with the NEON kernels compiled out, and slower.
 #
 # ⚠ SINCE ROUND 372 IT NO LONGER MATCHES THE DEFAULT BUILD, and the invariant
