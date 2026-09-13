@@ -6863,20 +6863,91 @@ static int matmul_rows_same_x(struct llama_state *s,
 	return 0;
 }
 
-static int matmul_rows_same(struct llama_state *s,
-			    const struct gguf_tensor *w, const float *X,
-			    int n, float *Y, uint32_t k, uint32_t nout,
-			    char site)
-{
-	return matmul_rows_same_x(s, w, X, n, Y, k, nout, site, 0);
-}
-
 static int matmul_rows_same_defer(struct llama_state *s,
 				  const struct gguf_tensor *w, const float *X,
 				  int n, float *Y, uint32_t k, uint32_t nout,
 				  char site)
 {
 	return matmul_rows_same_x(s, w, X, n, Y, k, nout, site, 1);
+}
+
+/*
+ * ⭐⭐⭐ SPLIT THE ROWS SO THERE IS ALWAYS SOMETHING TO HIDE THE GATHER BEHIND.
+ *
+ * The deferral above only pays where the caller has a second INDEPENDENT
+ * matmul to issue -- gate/up and q/k/v -- and that covers about a quarter of
+ * the gather. Rows are independent ALWAYS: chunk rows [0, h) and [h, n) of one
+ * tensor read different activations and write different rows of Y, so the
+ * first half's answer can be gathered while the second half's job runs, on
+ * every tensor including the ones with no partner.
+ *
+ * ⚠ IT IS NOT FREE ON THE HARDWARE SIDE. charsiu_int4 --cost at the gate/up
+ * shape, k=2048 n=8192, fp16 activations, two passes each:
+ *
+ *     m = 78   4792 / 4801 us      m = 39   2925 / 2925      m = 20  1976
+ *
+ * so two halves cost 22% more NPU time than one whole. The trade is only worth
+ * making because the gather is LARGER than the fence it hides behind (1.93
+ * against 1.82 a row), and 22% of the smaller one buys overlap on the bigger.
+ *
+ * ⚠ BOTH HALVES MUST BE EVEN. w4_batch_why_not refuses an odd width -- the
+ * accumulator surface is organised in PAIRS of rows and no integer P works for
+ * an odd m, which tools/acc_index_check asserts rather than prints.
+ *
+ * ⚠ AND BOTH DEFER. The tail is flushed by the caller's charsiu_npu_flush,
+ * which every site that uses this already owes.
+ *
+ * ⛔⛔ AND THE BOARD SAYS NO: 9153 / 9004 ms against 6829 / 6631, text
+ * identical. The arithmetic that predicted a win was right about the hardware
+ * and wrong about the CPU, and the entry split says exactly where:
+ *
+ *     no split      pack 0.81   fence 1.33   read 2.05 ms a row
+ *     ROWSPLIT=8    pack 1.46   fence 1.13   read 4.35
+ *
+ * The FENCE did fall -- the overlap works -- and the gather more than DOUBLED
+ * for the same total bytes, with the pack close behind. Both are per CALL
+ * costs that do not scale with m: charsiu_pack_input fills the whole input
+ * buffer with the zero point before writing anything, and the read walks Y
+ * once per slot. Halving the rows doubles the calls and pays each of those
+ * twice, which is larger than all the fence there was to hide.
+ *
+ * 🔑 Same shape as the dma_sync note in npufp16.c: a cost charged on the WHOLE
+ * buffer does not halve when the work does. Default 0; the code is kept so the
+ * next person to have this idea can run it rather than write it again.
+ */
+static int rowsplit_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_ROWSPLIT");
+
+		/* 0 disables it; otherwise the smallest n worth splitting */
+		v = e ? atoi(e) : 0;
+	}
+	return v;
+}
+
+static int matmul_rows_split(struct llama_state *s,
+			     const struct gguf_tensor *w, const float *X,
+			     int n, float *Y, uint32_t k, uint32_t nout,
+			     char site, int same)
+{
+	int lo = rowsplit_min(), h;
+
+	h = (n / 2) & ~1;
+	if (!lo || n < lo || h < 2 || n - h < 2)
+		return same ? matmul_rows_same_defer(s, w, X, n, Y, k, nout,
+						     site)
+			    : matmul_rows_defer(s, w, X, n, Y, k, nout);
+	/* ⚠ the FIRST half takes the `same` reuse key if there is one; the
+	 * second is a different X and would miss anyway */
+	if (same)
+		matmul_rows_same_defer(s, w, X, h, Y, k, nout, site);
+	else
+		matmul_rows_defer(s, w, X, h, Y, k, nout);
+	return matmul_rows_defer(s, w, X + (size_t)h * k, n - h,
+				 Y + (size_t)h * nout, k, nout);
 }
 
 /*
@@ -7393,19 +7464,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * answer is gathered while k's job runs and k's while
 			 * v's does; the flush covers a refusal that would
 			 * otherwise leave the last one unwritten. */
-			matmul_rows_defer(s, L->wq, s->bxb, n, s->bq,
-					  m->n_embd, m->n_head * hd);
+			matmul_rows_split(s, L->wq, s->bxb, n, s->bq,
+					  m->n_embd, m->n_head * hd, 0, 0);
+			matmul_rows_split(s, L->wk, s->bxb, n, s->bk,
+					  m->n_embd, m->n_head_kv * hd, 'k', 1);
 			if (L->wv)
-				matmul_rows_same_defer(s, L->wk, s->bxb, n,
-						       s->bk, m->n_embd,
-						       m->n_head_kv * hd, 'k');
-			else
-				matmul_rows_same(s, L->wk, s->bxb, n, s->bk,
-						 m->n_embd,
-						 m->n_head_kv * hd, 'k');
-			if (L->wv)
-				matmul_rows_same(s, L->wv, s->bxb, n, s->bv,
-						 m->n_embd, m->n_head_kv * hd, 'v');
+				matmul_rows_split(s, L->wv, s->bxb, n, s->bv,
+						  m->n_embd,
+						  m->n_head_kv * hd, 'v', 1);
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -7610,10 +7676,10 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * other, which is the only condition the deferral has.
 			 * The flush below covers the case where up is refused
 			 * and never reaches the hardware to do it. */
-			matmul_rows_defer(s, L->gate, s->bxb, n, s->bhb,
-					  m->n_embd, nff);
-			matmul_rows_same(s, L->up, s->bxb, n, s->bhb2,
-					 m->n_embd, nff, 'u');
+			matmul_rows_split(s, L->gate, s->bxb, n, s->bhb,
+					  m->n_embd, nff, 0, 0);
+			matmul_rows_split(s, L->up, s->bxb, n, s->bhb2,
+					  m->n_embd, nff, 'u', 1);
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -7633,7 +7699,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				silu_rows(&sj, 0, (uint64_t)n);
 		}
 		BSTAGE(ST_SILU);
-		matmul_rows(s, L->down, s->bhb, n, s->bxo, nff, m->n_embd);
+		if (rowsplit_min()) {
+			matmul_rows_split(s, L->down, s->bhb, n, s->bxo, nff,
+					  m->n_embd, 0, 0);
+			charsiu_npu_flush(s->pool.dev);
+		} else {
+			matmul_rows(s, L->down, s->bhb, n, s->bxo, nff,
+				    m->n_embd);
+		}
 		BSTAGE(ST_DOWN);
 		{
 			struct norm_rows_job nj = { s, m, L };
