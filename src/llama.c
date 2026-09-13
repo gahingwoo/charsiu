@@ -4959,8 +4959,6 @@ struct attn_npu {
 	 * hole is filled where it is needed rather than everywhere it might be.
 	 */
 	unsigned *packed;                   /* [n_layer], positions mirrored */
-	float *sc;                          /* [H][m][kv] probabilities */
-	size_t sc_cells;
 	unsigned long layers, fallbacks;
 	/* ⚠ MEASURED, NOT SUBTRACTED. The softmax between the two matmuls was
 	 * bounded at first by taking the stage table's attention and removing
@@ -5141,7 +5139,6 @@ static void attn_npu_free(struct attn_npu *a)
 	free(a->lhd);
 	free(a->dirty);
 	free(a->packed);
-	free(a->sc);
 	free(a);
 }
 
@@ -5379,8 +5376,6 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 	a->mmax = 5120u / (kv / 32u);
 	if (!a->mmax)
 		return -1;
-	if (a->sc)
-		memset(a->sc, 0, a->sc_cells * sizeof(*a->sc));
 
 	/* every position that already exists, through the packer the append
 	 * path uses, out of the float cache that both paths write */
@@ -5503,6 +5498,7 @@ struct attn_npu_soft {
 	struct attn_npu *a;
 	const struct attn_block_job *j;
 	unsigned m, rb, npad;
+	float *sc[FP16_GROUP_MAX];   /* head h's scores, where they lie */
 };
 
 static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
@@ -5513,8 +5509,12 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 
 	for (u = u0; u < u0 + n; u++) {
 		unsigned h = (unsigned)(u / c->m), r = (unsigned)(u % c->m);
-		float *sr = c->a->sc
-			  + ((size_t)h * c->a->mmax + r) * c->a->kv;
+		/* ⚠ WHERE THE SCORES MATMUL LEFT THEM, not in a copy of them.
+		 * The rows are npad apart here and not kv, because this is
+		 * the answer's own layout; the values pack is told the same
+		 * stride and never reads past a row because xtri0 stops it
+		 * at pos + 1 <= npad. */
+		float *sr = c->sc[h] + (size_t)r * c->npad;
 		int pos = j->pos0 + (int)c->rb + (int)r;
 		int tlo = j->swa && pos + 1 > j->n_swa
 			? pos + 1 - j->n_swa : 0;
@@ -5635,37 +5635,39 @@ static int attn_npu_layer(struct attn_block_job *j)
 		unsigned m = (unsigned)j->n - rb < a->mmax
 			   ? (unsigned)j->n - rb : a->mmax;
 		/*
-		 * ⚠⚠ THE SCRATCH IS INDEXED BY mmax AND NOT BY m, AND THE
-		 * DIFFERENCE IS A WRONG ANSWER.
+		 * ⚠⚠ THE SCRATCH THAT USED TO BE HERE IS GONE, AND SO IS THE
+		 * TRAP IT CARRIED.
 		 *
-		 * The zeros past the last token are what makes the values
-		 * matmul legal: it runs at k = the context length whatever the
-		 * prompt has reached, and the tail must contribute nothing.
-		 * They come from the calloc and survive because nothing ever
-		 * writes there. Index a head's block by the CURRENT m and a
-		 * chunk with fewer rows than the last one moves every row
-		 * boundary, so a row's tail lands on the previous chunk's
-		 * probabilities instead of on zero -- and every token after it
-		 * attends to positions that are not in its prompt. Fixed
-		 * strides, always mmax.
+		 * It was [H][mmax][kv] floats, and this paragraph warned that
+		 * indexing a head's block by the CURRENT m rather than by mmax
+		 * moves every row boundary, so a chunk with fewer rows than
+		 * the last one lands a row's tail on the previous chunk's
+		 * probabilities and every token after it attends to positions
+		 * that are not in its prompt. That was a real fault and the
+		 * comment was the only thing holding it off.
+		 *
+		 * The scores now stay in the device buffer the matmul wrote
+		 * them into, laid out by ITS plan rather than by a stride this
+		 * file chooses -- so there is no stride here to get wrong, no
+		 * 10.5 MB allocation, and no tail inherited from the last
+		 * chunk. What makes the values matmul legal past the last
+		 * token is xtri0 and the pack's memset, not a calloc.
 		 */
-		size_t need = (size_t)H * a->mmax * a->kv;
 		size_t qstride = (size_t)H * hd;
-
-		if (a->sc_cells < need) {
-			free(a->sc);
-			a->sc = calloc(need, sizeof(*a->sc));
-			a->sc_cells = a->sc ? need : 0;
-			if (!a->sc)
-				return -1;
-		}
 		for (h = 0; h < H; h++) {
 			memset(&op[h], 0, sizeof(op[h]));
 			op[h].X = j->q + (size_t)rb * qstride + (size_t)h * hd;
 			op[h].xstride = (unsigned)qstride;
 			op[h].Wbuf = a->kb[j->l * a->nkv + h / j->gqa];
-			op[h].Y = a->sc + (size_t)h * a->mmax * a->kv;
-			op[h].ystride = a->kv;
+			/* ⚠ A NULL Y LEAVES THE ANSWER IN THE DEVICE BUFFER,
+			 * which the softmax below then reduces over in place.
+			 * The copy this replaces was 1.5 GB and 245 ms of
+			 * `read` at 852 tokens, and a softmax reads every one
+			 * of those floats either way. Safe only because the
+			 * values matmul runs on a DIFFERENT handle: the
+			 * buffer is held until the next group on this one. */
+			op[h].Y = NULL;
+			op[h].ystride = 0;
 			op[h].m = m;
 			op[h].k = hd;
 			op[h].n = npad;
@@ -5677,8 +5679,16 @@ static int attn_npu_layer(struct attn_block_job *j)
 		}
 		a->t_pack1 += attn_npu_now_ms() - tg0;
 		{
-			struct attn_npu_soft sc = { a, j, m, rb, npad };
+			struct attn_npu_soft sc = { a, j, m, rb, npad, {0} };
 			double ts = attn_npu_now_ms();
+
+			for (h = 0; h < H; h++) {
+				sc.sc[h] = charsiu_fp16_out_w(a->f, h);
+				if (!sc.sc[h]) {
+					a->fallbacks++;
+					return -1;
+				}
+			}
 
 			if (attn_npu_soft_pool())
 				charsiu_parallel_for(attn_npu_soft_units, &sc,
@@ -5689,8 +5699,8 @@ static int attn_npu_layer(struct attn_block_job *j)
 		}
 		for (h = 0; h < H; h++) {
 			memset(&op[h], 0, sizeof(op[h]));
-			op[h].X = a->sc + (size_t)h * a->mmax * a->kv;
-			op[h].xstride = a->kv;
+			op[h].X = charsiu_fp16_out_w(a->f, h);
+			op[h].xstride = npad;
 			/*
 			 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
 			 * NOTHING AFTER ITSELF, AND THE PACK IS WHAT ENFORCES

@@ -1103,9 +1103,26 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
  */
 const float *charsiu_fp16_out(const struct charsiu_fp16 *f, unsigned i)
 {
+	return charsiu_fp16_out_w((struct charsiu_fp16 *)f, i);
+}
+
+/*
+ * The same address, writable, for a caller that REDUCES OVER THE ANSWER IN
+ * PLACE. Attention's softmax does: it reads every score of a row, scales,
+ * exponentiates and divides, and the alternative is to copy the whole m by n
+ * answer into the caller's own array first and then read it again. At 852
+ * tokens that copy is 1.5 GB and 245 ms of `read`.
+ *
+ * ⚠ THE BUFFER IS STILL THE DEVICE'S. It is held until the next group on THIS
+ * handle, so a caller doing this must not run its next group through the same
+ * handle before it has finished -- which is why the attention mirror runs the
+ * two matmuls on two handles.
+ */
+float *charsiu_fp16_out_w(struct charsiu_fp16 *f, unsigned i)
+{
 	if (!f || !f->held || i >= f->last.nops)
 		return NULL;
-	return (const float *)((const uint8_t *)f->ob.map + f->last.ooff[i]);
+	return (float *)((uint8_t *)f->ob.map + f->last.ooff[i]);
 }
 
 void charsiu_fp16_release(struct charsiu_fp16 *f)

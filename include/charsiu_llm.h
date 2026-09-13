@@ -506,6 +506,9 @@ struct charsiu_fp16_op {
  * them once either way, and the copy is a write and a second read on top.
  */
 const float *charsiu_fp16_out(const struct charsiu_fp16 *f, unsigned i);
+/* the same address, writable, for a caller that reduces over the answer where
+ * it lies instead of copying it out first */
+float *charsiu_fp16_out_w(struct charsiu_fp16 *f, unsigned i);
 void charsiu_fp16_release(struct charsiu_fp16 *f);
 
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
