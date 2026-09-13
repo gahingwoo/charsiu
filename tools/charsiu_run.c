@@ -925,12 +925,48 @@ int main(int argc, char **argv)
 		 *
 		 * CHARSIU_PREFILL_ONECHUNK=0 is the control.
 		 */
-		if (onechunk_on() && n_ids > chunk && n_ids <= cap) {
+		/*
+		 * ⚠⚠ NOT WHEN THE WIDENED WIDTH LANDS ON THE WRONG RESIDUE.
+		 *
+		 * r397 swept the width itself, on prompts built to an exact
+		 * token count. Every width that is a multiple of FOUR is
+		 * cheaper a token than both its neighbours two away -- eleven
+		 * of eleven on Llama-3.2-1B at about 11%, six of six on
+		 * Qwen3-0.6B at 6.3%, and five of six on gemma-3-1b where only
+		 * the tail can vary and the effect is diluted to 2%.
+		 *
+		 * That is the whole of what looked like a per-model split. At
+		 * 113 tokens Qwen3 widens to 1x112, which is a multiple of 4,
+		 * and WINS 5.6%. At 114 Llama and tinyllama widen to 1x114,
+		 * which is not, and LOSE 6.9 and 7.4%. One rule, two residues.
+		 *
+		 * ⚠ THE REPAIR IS TO DECLINE, NOT TO ROUND. Rounding 114 down
+		 * to 112 sends two tokens through the token loop: about 940 ms
+		 * against 957 for 1x114, a 1.8% win. Declining gives
+		 * 1x80+1x34, measured at 892 -- better than both, because the
+		 * per-token rate is not the whole cost. So this only ever
+		 * refuses to widen; it never picks a different width.
+		 *
+		 * prefill_width() rounds down to even, so the width this would
+		 * produce is n_ids & ~1, and what it must avoid is that being
+		 * 2 mod 4.
+		 *
+		 * CHARSIU_PREFILL_ONECHUNK=0 still turns the whole thing off.
+		 */
+		if (onechunk_on() && n_ids > chunk && n_ids <= cap &&
+		    ((n_ids & ~1) & 3) == 0) {
 			if (charsiu_diag())
 				fprintf(stderr, "charsiu: the whole prompt (%d) "
 					"fits under this model's ceiling (%d), "
 					"so it goes in one chunk\n", n_ids, cap);
 			chunk = n_ids;
+		} else if (onechunk_on() && n_ids > chunk && n_ids <= cap) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: the whole prompt (%d) "
+					"would widen to %d, which is 2 mod 4 and "
+					"costs about 7%% a token here; keeping "
+					"the %d chunk\n", n_ids, n_ids & ~1,
+					chunk);
 		}
 		int done = 0;
 		/* which widths ran, for the line at the bottom of this block */

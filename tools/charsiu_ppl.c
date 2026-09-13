@@ -59,7 +59,7 @@ int main(int argc, char **argv)
 	int32_t *ids = NULL;
 	char *text = NULL;
 	size_t tlen = 0, cap = 0;
-	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0;
+	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0, top1 = 0;
 	double nll = 0.0;
 	const char *path = NULL, *tfile = NULL;
 	FILE *f;
@@ -71,6 +71,16 @@ int main(int argc, char **argv)
 			want = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--batch"))
 			batch = 1;
+		/* ⚠ THE ARGMAX IS ALREADY BEING COMPUTED HERE. The log softmax
+		 * needs the largest logit, so the position it came from is one
+		 * extra assignment, and printing it turns this into a top-1
+		 * oracle for any runtime that can only be asked for a token.
+		 * The vendor's cannot be asked for logits at all
+		 * (RKLLM_INFER_GET_LOGITS is refused by their export), so
+		 * top-1 agreement against a common origin is the only shape of
+		 * accuracy comparison their runtime admits. */
+		else if (!strcmp(argv[i], "--top1"))
+			top1 = 1;
 		else if (!path)
 			path = argv[i];
 		else
@@ -78,7 +88,11 @@ int main(int argc, char **argv)
 	}
 	if (!path || !tfile) {
 		fprintf(stderr, "usage: charsiu_ppl MODEL.gguf TEXT [-c ctx]"
-			" [-n tokens] [--batch]\n");
+			" [-n tokens] [--batch] [--top1]\n"
+			"  --top1  print \"prefix_len argmax_id actual_id\" a line,"
+			" so a runtime that\n"
+			"          cannot be asked for logits can be scored against"
+			" the same origin\n");
 		return 2;
 	}
 	f = fopen(tfile, "rb");
@@ -187,15 +201,20 @@ int main(int argc, char **argv)
 	for (i = 0; i + 1 < n; i++) {
 		const float *lg = llama_forward(st, ids[i], i);
 		float mx = lg[0], sum = 0.0f;
-		uint32_t j;
+		uint32_t j, am = 0;
 
 		if (!lg) { fprintf(stderr, "forward failed at %d\n", i); return 1; }
 		/* log softmax, shifted by the max so the exp cannot overflow */
 		for (j = 1; j < m.n_vocab; j++)
-			if (lg[j] > mx) mx = lg[j];
+			if (lg[j] > mx) { mx = lg[j]; am = j; }
 		for (j = 0; j < m.n_vocab; j++)
 			sum += expf(lg[j] - mx);
 		nll -= (double)(lg[ids[i + 1]] - mx) - log((double)sum);
+		/* ⚠ the prefix length, not i: position i has seen i+1 tokens,
+		 * which is what another runtime has to be fed to be asked the
+		 * same question */
+		if (top1)
+			printf("%d %u %u\n", i + 1, am, ids[i + 1]);
 		scored++;
 		if ((i & 31) == 31)
 			fprintf(stderr, "\r  %d/%d  ppl %.4f", scored, n - 1,
