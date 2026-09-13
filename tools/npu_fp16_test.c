@@ -350,6 +350,211 @@ static void reference(unsigned m, unsigned k, unsigned n,
 
 static float asf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
+/*
+ * ⚠⚠⚠ int8 WEIGHTS AGAINST fp16 ACTIVATIONS, WHICH IS A COMBINATION NOTHING
+ * HAS EVER RUN.
+ *
+ * r404 priced it -- 0.058 TMAC/s against fp16's 0.024 at the scores shape,
+ * 2.4x -- with charsiu_int4 --cost, and that probe's own header says it
+ * CHECKS NOTHING: the weight buffer holds whatever the setup left in it and
+ * the output is never read. So the road to an int8 KV cache rests on a number
+ * that says the dispatch is fast and says nothing about whether it is right.
+ *
+ * The precision register composes this arrangement out of two halves that are
+ * each confirmed separately -- 0x00000000 for int8 weights, 0x20000000 for a
+ * 16 bit activation -- and their SUM appears nowhere in the vendor's file:
+ * zero of its 8308 dispatches carry 0x20000000. Two confirmed halves are not
+ * a confirmed whole.
+ *
+ * Two questions, and the second is the one that decides the design:
+ *
+ *   (a) does w8a16 compute the MAC at all, and to what accuracy
+ *   (b) does the per output channel fp16 scale table REACH the output, in
+ *       acc_out mode, where the answer is the raw accumulator
+ *
+ * If (b) is yes, an int8 K surface is a drop in: one scale a position, fixed
+ * when the position is appended. If it is no, the scale has to be applied on
+ * the CPU -- which for the scores matmul the softmax is already walking every
+ * element of, so it is one multiply an element and not a new pass, but it is
+ * a different design and it has to be known which one is being built.
+ *
+ * The arms differ ONLY in whether job.weight_scales is set, so the answer to
+ * (b) is a ratio between two hardware readings and not a comparison against a
+ * model of the output stage.
+ */
+/* set to m*k biased bytes to run the activation as int8; NULL leaves it
+ * fp16, which the board says the hardware ignores for an int8 weight */
+static const uint8_t *a8_bytes;
+
+static int run_w8(struct charsiu_device *dev, unsigned m, unsigned k,
+		  unsigned n, const float *A, const uint8_t *Q,
+		  const float *scales, uint32_t *out, double *fence_ms)
+{
+	/* A8 means the caller has already quantised the activation and `A`
+	 * carries m*k BYTES in the biased domain, not floats */
+	const int A8 = a8_bytes != NULL;
+	struct charsiu_job job = { 0 };
+	size_t nreg, insz, wsz;
+	double tp;
+	int rc = -1;
+
+	job.cbuf_window = (unsigned)charsiu_cbuf_window();
+	job.mm.m = m; job.mm.k = k; job.mm.n = n;
+	job.mm.wdtype = CHARSIU_INT8;
+	/*
+	 * ⚠⚠ THE ACTIVATION HAS TO BE int8 TOO, AND THE BOARD SAID SO.
+	 *
+	 * This ran as w8a16 first -- int8 weights, the precision register's
+	 * 16 bit activation bit set, the query left as halves -- because the
+	 * register composes out of two halves that are each confirmed. The
+	 * grid in --w8map decomposed what came back and it is not a MAC over
+	 * halves: out[0][0] was 60 times the signed weight byte, and 60 is
+	 * 0x3c, the HIGH BYTE of an fp16 1.0. Every one of the twelve cells
+	 * reads that way, including all-ones, which counted 32 live bytes --
+	 * the odd byte of each half in the first 64 byte positions.
+	 *
+	 * So int8 weights make the hardware read the activation as BYTES
+	 * whatever 0x20000000 says. w8a16 is not an arrangement this silicon
+	 * has; the int8 KV road is w8a8 and the query has to be quantised.
+	 */
+	job.mm.adtype = A8 ? CHARSIU_INT8 : CHARSIU_FP16;
+	job.input_zero_point = A8 ? 0x80 : 0;
+	job.weight_zero_point = 0x80;   /* symmetric: the stored byte is q+128 */
+	job.output_zero_point = 0;
+	job.input_scale = 1.0f;
+	job.weight_scale = 1.0f;
+	job.weight_scales = scales;     /* NULL is the control arm */
+	job.output_scale = 1.0f;
+	job.acc_out = 1;
+
+	wsz = charsiu_weight_bytes(&job.mm);
+	insz = (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096;
+	if (pool_want(dev, wsz + 4096, insz, (size_t)m * n * 4 + 4096,
+		      charsiu_coef_bytes(&job.mm) + 4096))
+		return -1;
+
+	tp = now_ms();
+	charsiu_bo_prep(dev, &pool.wt, 1000000000);
+	/*
+	 * ⚠⚠ THE STORED BYTE IS w - 0x80, NOT w, AND THIS PROBE HAD IT WRONG.
+	 *
+	 * charsiu_pack_weights has written `src - 0x80` for int8 since round
+	 * 139 and charsiu_w8_offset is only the address half of that packer --
+	 * the bias is the other half and a caller writing in place owes it.
+	 * Writing Q verbatim put every weight 128 above where it belongs, and
+	 * the arm came back with a plausible wrong number and no error.
+	 *
+	 * tests/pack_w8.c had the bias right, which is what finally named it:
+	 * the desk test and the probe were describing the same permutation and
+	 * only one of them was writing it.
+	 *
+	 * So the fill is 0 -- which IS the zero point in the stored domain --
+	 * and not 0x80.
+	 */
+	memset(pool.wt.map, 0, wsz);
+	{
+		uint8_t *d = pool.wt.map;
+
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++) {
+				size_t off = charsiu_w8_offset(&job.mm, c, i);
+
+				if (off == (size_t)-1 || off >= wsz)
+					continue;
+				d[off] = (uint8_t)(Q[(size_t)c * k + i] - 0x80);
+			}
+	}
+	charsiu_bo_fini(dev, &pool.wt);
+
+	charsiu_bo_prep(dev, &pool.in, 1000000000);
+	if (A8) {
+		/* the int8 activation surface, [k/atom][m][atom], through the
+		 * packer the int8 model path has always used -- this file does
+		 * not restate that layout */
+		charsiu_pack_input(&job.mm, a8_bytes, pool.in.map, insz,
+				   (uint8_t)job.input_zero_point);
+	} else {
+		uint8_t *d = pool.in.map;
+
+		memset(d, 0, insz);
+		for (size_t i = 0; i < (size_t)m * k; i++) {
+			uint16_t h = charsiu_float_to_half(A[i]);
+
+			if ((i + 1) * 2 > insz)
+				break;
+			d[i * 2] = (uint8_t)(h & 0xff);
+			d[i * 2 + 1] = (uint8_t)(h >> 8);
+		}
+	}
+	charsiu_bo_fini(dev, &pool.in);
+	t_split.pack += now_ms() - tp;
+
+	{
+		int32_t *zero = calloc(n, sizeof(int32_t));
+
+		if (!zero) { fprintf(stderr, "  out of memory\n"); return -1; }
+		charsiu_bo_prep(dev, &pool.coef, 1000000000);
+		charsiu_build_coefs(&job, zero, zero, pool.coef.map);
+		charsiu_bo_fini(dev, &pool.coef);
+		free(zero);
+	}
+
+	job.input_addr = (uint32_t)pool.in.dma_address;
+	job.output_addr = (uint32_t)pool.ob.dma_address;
+	job.weight_addr = (uint32_t)pool.wt.dma_address;
+	job.coef_addr = (uint32_t)pool.coef.dma_address;
+
+	charsiu_bo_prep(dev, &pool.reg, 1000000000);
+	nreg = charsiu_emit_job(&job, pool.reg.map, 4096 / 8);
+	charsiu_bo_fini(dev, &pool.reg);
+	if (!nreg) {
+		fprintf(stderr, "  the register stream came back empty\n");
+		return -1;
+	}
+
+	charsiu_bo_prep(dev, &pool.ob, 1000000000);
+	for (unsigned i = 0; i < m * n; i++)
+		((uint32_t *)pool.ob.map)[i] = 0xdeadbeefu;
+	charsiu_bo_fini(dev, &pool.ob);
+	{
+		uint32_t ins[2] = { pool.in.handle, pool.wt.handle };
+		uint32_t outs[1] = { pool.ob.handle };
+
+		if (charsiu_submit(dev, &pool.reg, (unsigned)nreg, ins, 2,
+				   outs, 1)) {
+			fprintf(stderr, "  the submit failed\n");
+			return -1;
+		}
+	}
+	tp = now_ms();
+	charsiu_bo_prep(dev, &pool.ob, 1000000000);   /* the fence wait */
+	if (fence_ms)
+		*fence_ms += now_ms() - tp;
+	memcpy(out, pool.ob.map, (size_t)m * n * 4);
+	charsiu_bo_fini(dev, &pool.ob);
+	rc = 0;
+	return rc;
+}
+
+/*
+ * The fp16 arm at the same shape, for a fence to compare against. It is
+ * run_core, wrapped only to charge the fence to a caller's accumulator --
+ * t_read.fence is cumulative over every call in the process and a ratio of
+ * two cumulative numbers is not a ratio of two arms.
+ */
+static int run_f16_timed(struct charsiu_device *dev, unsigned m, unsigned k,
+			 unsigned n, const float *A, const float *B,
+			 uint32_t *out, double *fence_ms)
+{
+	double before = t_read.fence;
+	int rc = run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, out);
+
+	if (fence_ms)
+		*fence_ms += t_read.fence - before;
+	return rc;
+}
+
+
 int main(int argc, char **argv)
 {
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
@@ -374,6 +579,9 @@ int main(int argc, char **argv)
 	int doout = argc > 3 && !strcmp(argv[3], "--outmap");
 	int doin = argc > 3 && !strcmp(argv[3], "--inmap");
 	int doinsl = argc > 3 && !strcmp(argv[3], "--inslots");
+	int dow8 = argc > 3 && !strcmp(argv[3], "--w8");
+	int dow8map = argc > 3 && !strcmp(argv[3], "--w8map");
+	int dow8a8 = argc > 3 && !strcmp(argv[3], "--w8a8");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -387,6 +595,473 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (dow8a8) {
+		/*
+		 * ⭐⭐ THE ARRANGEMENT THE BOARD LEAVES: int8 WEIGHTS AND AN
+		 * int8 ACTIVATION.
+		 *
+		 * --w8map settled that an int8 weight makes the hardware read
+		 * the activation as bytes whatever the precision register's
+		 * 16 bit bit says, so an int8 KV cache needs the QUERY
+		 * quantised as well. That is a bigger change than the one the
+		 * handoff described and it has a quality question of its own
+		 * that no round has asked -- r406 gated an int8 K and V
+		 * surface and said nothing about an int8 query.
+		 *
+		 * So this asks the two hardware questions and leaves quality
+		 * to the desk, where charsiu_ppl can answer it deterministically:
+		 *
+		 *   (a) does w8a8 compute the integer MAC exactly
+		 *   (b) does the per OUTPUT CHANNEL fp16 scale table reach the
+		 *       output in acc_out mode, where the answer is the raw
+		 *       accumulator. Attention needs it: the K surface's scale
+		 *       is per position, which IS the output channel. The
+		 *       activation's own scale is per ROW, and a row is what
+		 *       the softmax already scales, so that half is free
+		 *       either way.
+		 *
+		 * ⚠ The two scale arms differ ONLY in job.weight_scales.
+		 */
+		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
+		uint8_t *Q = malloc((size_t)n * k);
+		uint8_t *Ab = malloc((size_t)m * k);
+		float *sb = calloc(n, sizeof(*sb));
+		float *sa = calloc(m, sizeof(*sa));
+		double *acc = calloc((size_t)m * n, sizeof(*acc));
+		double f16f = 0, w8f = 0;
+		double worst_acc = 0, worst_accix = 0, worst_scaled = 0;
+		uint32_t *tmp;
+		int any = 0;
+		long biggest = 0;
+
+		if (!Q || !Ab || !sb || !sa || !acc) goto done;
+		for (unsigned i = 0; i < m * k; i++)
+			A[i] = (float)((int)(i % 13) - 6) * 0.25f;
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] =
+					(float)((int)((c * 7 + i) % 11) - 5)
+					* (0.1f + 0.03f * (float)(c % 9));
+
+		/* the weight: symmetric int8, one scale an OUTPUT CHANNEL */
+		for (unsigned c = 0; c < n; c++) {
+			float amax = 0;
+
+			for (unsigned i = 0; i < k; i++) {
+				float v = fabsf(B[(size_t)c * k + i]);
+
+				if (v > amax) amax = v;
+			}
+			sb[c] = amax > 0 ? amax / 127.0f : 1.0f;
+			for (unsigned i = 0; i < k; i++) {
+				float q = B[(size_t)c * k + i] / sb[c];
+				int qi = (int)(q < 0 ? q - 0.5f : q + 0.5f);
+
+				if (qi > 127) qi = 127;
+				if (qi < -127) qi = -127;
+				Q[(size_t)c * k + i] = (uint8_t)(qi + 0x80);
+			}
+		}
+		/* the activation: symmetric int8, one scale a ROW, which is
+		 * what a query would have */
+		for (unsigned r = 0; r < m; r++) {
+			float amax = 0;
+
+			for (unsigned i = 0; i < k; i++) {
+				float v = fabsf(A[(size_t)r * k + i]);
+
+				if (v > amax) amax = v;
+			}
+			sa[r] = amax > 0 ? amax / 127.0f : 1.0f;
+			for (unsigned i = 0; i < k; i++) {
+				float q = A[(size_t)r * k + i] / sa[r];
+				int qi = (int)(q < 0 ? q - 0.5f : q + 0.5f);
+
+				if (qi > 127) qi = 127;
+				if (qi < -127) qi = -127;
+				Ab[(size_t)r * k + i] = (uint8_t)(qi + 0x80);
+			}
+		}
+		/* the exact integer MAC, in doubles so the reference cannot
+		 * itself overflow or round */
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++) {
+				long v = 0;
+
+				for (unsigned i = 0; i < k; i++)
+					v += ((int)Ab[(size_t)r * k + i] - 0x80)
+					   * ((int)Q[(size_t)c * k + i] - 0x80);
+				acc[(size_t)r * n + c] = (double)v;
+				if (v > biggest) biggest = v;
+				if (-v > biggest) biggest = -v;
+			}
+
+		printf("int8 weights AND int8 activations, K=%u N=%u M=%u,"
+		       " %u reps\n", k, n, m, reps);
+
+		/* ⚠ THE CONTROL ARM NEEDS ITS OWN OUTPUT. Handing run() the
+		 * same buffer would leave the fp16 answer in `got` and the
+		 * checks below would be reading the wrong arm; handing it NULL
+		 * would be a memcpy to NULL. */
+		tmp = calloc((size_t)m * n, sizeof(*tmp));
+		if (!tmp) goto done;
+		a8_bytes = Ab;
+		for (unsigned r = 0; r <= reps; r++) {
+			if (run_w8(dev, m, k, n, A, Q, NULL, got,
+				   r ? &w8f : NULL)) {
+				printf("  the w8a8 arm could not run\n");
+				a8_bytes = NULL; goto done;
+			}
+			if (run_f16_timed(dev, m, k, n, A, B, tmp,
+					  r ? &f16f : NULL)) {
+				printf("  the fp16 control could not run\n");
+				a8_bytes = NULL; goto done;
+			}
+		}
+		/*
+		 * ⚠⚠ TWO READINGS, BECAUSE THE int8 ACCUMULATOR IS NOT FLAT.
+		 *
+		 * The fp16 path's wide output is w4_dpu's and --outmap
+		 * measured it row major. The int8 path's is wide8's, and
+		 * charsiu_acc_index is the order the board solved for it at
+		 * m = 2, 4 and 8 -- m = 1 is flat and is the only width at
+		 * which the two readings agree.
+		 *
+		 * Reporting only the flat one would have said "w8a8 computes
+		 * the wrong answer at m = 78" when what it means is "this
+		 * probe does not know how to read it", which is the shape of
+		 * mistake this file already carries a note about.
+		 */
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++) {
+				size_t fi = (size_t)r * n + c;
+				size_t ai = charsiu_acc_index(r, c, m, 0);
+				double want = acc[fi];
+				double d1 = fabs((double)(int32_t)got[fi]
+						 - want);
+				double d2 = ai < (size_t)m * n
+					  ? fabs((double)(int32_t)got[ai] - want)
+					  : d1;
+
+				if (got[fi] != 0xdeadbeefu && got[fi]) any = 1;
+				if (d1 > worst_acc) worst_acc = d1;
+				if (d2 > worst_accix) worst_accix = d2;
+			}
+		/* and the same bytes with a per channel scale */
+		if (run_w8(dev, m, k, n, A, Q, sb, got, NULL)) {
+			printf("  the scaled arm could not run\n");
+			a8_bytes = NULL; goto done;
+		}
+		for (unsigned i = 0; i < m * n; i++) {
+			double want = acc[i] * sb[i % n];
+			double as_int = (double)(int32_t)got[i];
+			double as_flt = (double)asf(got[i]);
+			double d1 = fabs(as_int - want);
+			double d2 = fabs(as_flt - want);
+			double d = d1 < d2 ? d1 : d2;
+
+			if (d > worst_scaled) worst_scaled = d;
+		}
+		a8_bytes = NULL;
+
+		printf("\n  (a) DOES w8a8 COMPUTE THE INTEGER MAC\n");
+		printf("      read FLAT             worst %.6g%s\n",
+		       worst_acc, any ? "" : "   (nothing was written)");
+		printf("      read charsiu_acc_index worst %.6g"
+		       "   (largest |MAC| %ld)\n", worst_accix, biggest);
+		printf("      first four: %d %d %d %d   want %.0f %.0f %.0f"
+		       " %.0f\n", (int32_t)got[0], (int32_t)got[1],
+		       (int32_t)got[2], (int32_t)got[3],
+		       acc[0], acc[1], acc[2], acc[3]);
+		printf("\n  (b) DOES THE PER CHANNEL SCALE REACH THE OUTPUT\n");
+		printf("      worst |read - MAC*scale|, best of an int32 and"
+		       " an fp32 reading: %.6g\n", worst_scaled);
+		printf("      if this is not near zero the table does NOT"
+		       " apply in acc_out mode\n");
+		printf("      with scales: %d %d %d %d\n", (int32_t)got[0],
+		       (int32_t)got[1], (int32_t)got[2], (int32_t)got[3]);
+		printf("      MAC*scale  : %.3f %.3f %.3f %.3f\n",
+		       acc[0] * sb[0], acc[1] * sb[1], acc[2] * sb[2],
+		       acc[3] * sb[3]);
+		printf("\n  (c) WHAT IT COSTS, fence only, %u reps,"
+		       " arms alternating\n", reps);
+		printf("      fp16 w a16   %8.3f ms   %8.4f ms a submit\n",
+		       f16f, f16f / reps);
+		printf("      int8 w a8    %8.3f ms   %8.4f ms a submit"
+		       "   %.2fx\n", w8f, w8f / reps,
+		       w8f > 0 ? f16f / w8f : 0.0);
+		free(Q); free(Ab); free(sb); free(sa); free(acc); free(tmp);
+		rc = 0;
+		goto done;
+	}
+
+	if (dow8map) {
+		/*
+		 * ⚠⚠ WHAT DOES THE HARDWARE READ, when the weights are int8
+		 * and the precision register says 16 bit activations.
+		 *
+		 * The first form of this probe swept a one-hot activation and
+		 * got a straight line -- 120p - 7560 -- which is neither the
+		 * MAC, nor the MAC of the bytes, nor either plus the lift. A
+		 * fourth guess is not a method. This DECOMPOSES it instead:
+		 * three weight patterns against four activations, so each term
+		 * of whatever the hardware is computing can be read off on its
+		 * own rather than fitted.
+		 *
+		 *   weights   all 0     all 1     w[i] = i+1
+		 *   acts      all 0     one-hot at 0    one-hot at 1   all 1
+		 *
+		 * all-zero against all-zero is the constant the coefficient
+		 * record contributes. all-zero activation against a live
+		 * weight is what the activation's zero point leaks. A one-hot
+		 * moved by one names the index the hardware paired it with.
+		 *
+		 * The fp16 control runs the same grid, because "the int8 arm
+		 * reads something else" and "this probe addresses the output
+		 * wrongly" look identical from one arm.
+		 */
+		static const char *wname[3] = { "w=0", "w=1", "w=i+1" };
+		static const char *aname[4] = { "a=0", "a=onehot0",
+						"a=onehot1", "a=1" };
+		uint8_t *Q = malloc((size_t)n * k);
+
+		if (!Q) goto done;
+		printf("int8 weights, fp16 activations: the grid\n");
+		printf("  K=%u N=%u M=%u   every cell is out[0][0] as int32\n",
+		       k, n, m);
+		printf("  %-12s %12s %12s %12s %12s\n", "", aname[0], aname[1],
+		       aname[2], aname[3]);
+		for (unsigned wp = 0; wp < 3; wp++) {
+			printf("  %-12s", wname[wp]);
+			for (unsigned ap = 0; ap < 4; ap++) {
+				for (unsigned c = 0; c < n; c++)
+					for (unsigned i = 0; i < k; i++) {
+						int w = wp == 0 ? 0
+						      : wp == 1 ? 1
+						      : (int)(i % 100) + 1;
+
+						Q[(size_t)c * k + i] =
+							(uint8_t)(0x80 + w);
+					}
+				memset(A, 0, (size_t)m * k * sizeof(*A));
+				if (ap == 1) A[0] = 1.0f;
+				if (ap == 2) A[1] = 1.0f;
+				if (ap == 3)
+					for (unsigned i = 0; i < m * k; i++)
+						A[i] = 1.0f;
+				if (run_w8(dev, m, k, n, A, Q, NULL, got,
+					   NULL)) {
+					printf(" %12s", "FAILED");
+					continue;
+				}
+				printf(" %12d", (int32_t)got[0]);
+			}
+			printf("\n");
+		}
+
+		printf("\n  the fp16 control, same grid, same reader\n");
+		printf("  %-12s %12s %12s %12s %12s\n", "", aname[0], aname[1],
+		       aname[2], aname[3]);
+		for (unsigned wp = 0; wp < 3; wp++) {
+			printf("  %-12s", wname[wp]);
+			for (unsigned ap = 0; ap < 4; ap++) {
+				for (unsigned c = 0; c < n; c++)
+					for (unsigned i = 0; i < k; i++)
+						B[(size_t)c * k + i] =
+							wp == 0 ? 0.0f
+						      : wp == 1 ? 1.0f
+						      : (float)((i % 100) + 1);
+				memset(A, 0, (size_t)m * k * sizeof(*A));
+				if (ap == 1) A[0] = 1.0f;
+				if (ap == 2) A[1] = 1.0f;
+				if (ap == 3)
+					for (unsigned i = 0; i < m * k; i++)
+						A[i] = 1.0f;
+				if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP,
+					got)) {
+					printf(" %12s", "FAILED");
+					continue;
+				}
+				printf(" %12g", (double)asf(got[0]));
+			}
+			printf("\n");
+		}
+		free(Q);
+		rc = 0;
+		goto done;
+	}
+
+	if (dow8) {
+		/*
+		 * ⚠ THE REPS ARE THE POINT OF THE TIMING HALF. A single submit
+		 * carries a fixed cost that r404 measured at 59 to 183 us and
+		 * that is dtype independent, so a one-shot ratio understates
+		 * the dtype factor. Same reps for both arms, alternating, one
+		 * discarded warm-up -- the board drifts and a fixed order has
+		 * an order bias.
+		 */
+		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
+		uint8_t *Q = malloc((size_t)n * k);
+		float *sc = calloc(n, sizeof(*sc));
+		float *deq = calloc((size_t)n * k, sizeof(*deq));
+		float *raw = calloc((size_t)m * n, sizeof(*raw));
+		double f16f = 0, w8f = 0, w8sf = 0;
+		double worst_raw = 0, worst_scaled = 0, worst_f16 = 0;
+		int any_raw = 0, any_scaled = 0;
+
+		if (!Q || !sc || !deq || !raw) goto done;
+		for (unsigned i = 0; i < m * k; i++)
+			A[i] = (float)((int)(i % 13) - 6) * 0.25f;
+		/* ⚠ A DIFFERENT ABSMAX PER CHANNEL, or the per channel table
+		 * and a single scalar would write the same bytes and the arm
+		 * that is meant to distinguish them could not. */
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				B[(size_t)c * k + i] =
+					(float)((int)((c * 7 + i) % 11) - 5)
+					* (0.1f + 0.03f * (float)(c % 9));
+
+		/* symmetric int8, one scale an OUTPUT CHANNEL -- which for
+		 * attention's scores matmul is one scale a POSITION */
+		for (unsigned c = 0; c < n; c++) {
+			float amax = 0;
+
+			for (unsigned i = 0; i < k; i++) {
+				float v = fabsf(B[(size_t)c * k + i]);
+
+				if (v > amax) amax = v;
+			}
+			sc[c] = amax > 0 ? amax / 127.0f : 1.0f;
+			for (unsigned i = 0; i < k; i++) {
+				float q = B[(size_t)c * k + i] / sc[c];
+				int qi = (int)(q < 0 ? q - 0.5f : q + 0.5f);
+
+				if (qi > 127) qi = 127;
+				if (qi < -127) qi = -127;
+				Q[(size_t)c * k + i] = (uint8_t)(qi + 0x80);
+				deq[(size_t)c * k + i] = (float)qi * sc[c];
+			}
+		}
+		/* the raw MAC the hardware would compute with every scale 1:
+		 * sum over k of fp16(A) times the INTEGER weight */
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++) {
+				float acc = 0;
+
+				for (unsigned i = 0; i < k; i++)
+					acc += charsiu_half_to_float(
+						charsiu_float_to_half(
+							A[(size_t)r * k + i]))
+					     * (float)((int)Q[(size_t)c * k + i]
+						       - 0x80);
+				raw[(size_t)r * n + c] = acc;
+			}
+		/* and the fp16 arm's own reference, on the DEQUANTISED weights,
+		 * so the two arms are answering the same question */
+		reference(m, k, n, A, deq, ref);
+
+		printf("int8 weights against fp16 activations, K=%u N=%u M=%u,"
+		       " %u reps\n", k, n, m, reps);
+		printf("  ⚠ this combination appears in ZERO of the vendor's"
+		       " 8308 dispatches\n");
+
+		for (unsigned r = 0; r <= reps; r++) {
+			double *ff = r ? &f16f : NULL;
+			double *w8 = r ? &w8f : NULL;
+			double *w8s = r ? &w8sf : NULL;
+
+			/* arm 1: fp16 weights, the shipped path */
+			if (run_f16_timed(dev, m, k, n, A, deq, got, ff)) {
+				printf("  the fp16 arm could not run\n");
+				goto done;
+			}
+			if (r == reps)
+				for (unsigned i = 0; i < m * n; i++) {
+					double d = fabs(asf(got[i]) - ref[i]);
+
+					if (isfinite(d) && d > worst_f16)
+						worst_f16 = d;
+				}
+
+			/* arm 2: int8 weights, EVERY SCALE 1.0 */
+			if (run_w8(dev, m, k, n, A, Q, NULL, got, w8)) {
+				printf("  the int8 arm could not run\n");
+				goto done;
+			}
+			if (r == reps)
+				for (unsigned i = 0; i < m * n; i++) {
+					double d = fabs(asf(got[i])
+							- raw[i]);
+
+					if (got[i] && got[i] != 0xdeadbeefu)
+						any_raw = 1;
+					if (isfinite(d) && d > worst_raw)
+						worst_raw = d;
+				}
+
+			/* arm 3: the same bytes, one scale an output channel */
+			if (run_w8(dev, m, k, n, A, Q, sc, got, w8s)) {
+				printf("  the scaled int8 arm could not run\n");
+				goto done;
+			}
+			if (r == reps)
+				for (unsigned i = 0; i < m * n; i++) {
+					double d = fabs(asf(got[i]) - ref[i]);
+
+					if (got[i] && got[i] != 0xdeadbeefu)
+						any_scaled = 1;
+					if (isfinite(d) && d > worst_scaled)
+						worst_scaled = d;
+				}
+		}
+
+		{
+			double amax = 0;
+
+			for (unsigned i = 0; i < m * n; i++)
+				if (fabs(ref[i]) > amax) amax = fabs(ref[i]);
+			printf("\n  (a) DOES IT COMPUTE\n");
+			printf("      int8 w, scales 1  vs the raw integer"
+			       " MAC : worst %.6g%s\n", worst_raw,
+			       any_raw ? "" : "   (nothing was written)");
+			printf("      fp16 w            vs the CPU reference:"
+			       " worst %.6g  (largest %.4g)\n",
+			       worst_f16, amax);
+			printf("\n  (b) DOES THE PER CHANNEL SCALE REACH THE"
+			       " OUTPUT\n");
+			printf("      int8 w + scales   vs the CPU reference:"
+			       " worst %.6g%s\n", worst_scaled,
+			       any_scaled ? "" : "   (nothing was written)");
+			printf("      the two int8 arms differ only in"
+			       " job.weight_scales\n");
+			printf("      first four, scaled : %g %g %g %g\n",
+			       (double)asf(got[0]),
+			       (double)asf(m * n > 1 ? got[1] : 0),
+			       (double)asf(m * n > 2 ? got[2] : 0),
+			       (double)asf(m * n > 3 ? got[3] : 0));
+			printf("      want               : %g %g %g %g\n",
+			       (double)ref[0], (double)(m * n > 1 ? ref[1] : 0),
+			       (double)(m * n > 2 ? ref[2] : 0),
+			       (double)(m * n > 3 ? ref[3] : 0));
+			printf("      the raw MAC would be: %g %g %g %g\n",
+			       (double)raw[0], (double)(m * n > 1 ? raw[1] : 0),
+			       (double)(m * n > 2 ? raw[2] : 0),
+			       (double)(m * n > 3 ? raw[3] : 0));
+			printf("\n  (c) WHAT IT COSTS, fence only, %u reps\n",
+			       reps);
+			printf("      fp16 w   %8.3f ms   %8.4f ms a submit\n",
+			       f16f, f16f / reps);
+			printf("      int8 w   %8.3f ms   %8.4f ms a submit"
+			       "   %.2fx\n", w8f, w8f / reps,
+			       w8f > 0 ? f16f / w8f : 0.0);
+			printf("      int8 w + scales %8.3f ms   %.2fx\n",
+			       w8sf, w8sf > 0 ? f16f / w8sf : 0.0);
+		}
+		free(Q); free(sc); free(deq); free(raw);
+		rc = 0;
+		goto done;
+	}
+
 	if (doinsl) {
 		/*
 		 * ⚠⚠ THE ACTIVATION LAYOUT, MEASURED THE WAY THE WEIGHT LAYOUT

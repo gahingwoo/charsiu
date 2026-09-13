@@ -953,7 +953,8 @@ board_overlap_slots.sh board_attn_block.sh board_awq.sh host_awq.sh \
 corpus_fixed.sh board_record.sh vendor_quality.sh board_bimodal.sh \
 board_prefill_stages.sh board_cpu_clock.sh board_ttft_curve.sh \
 board_attn_npu.sh board_chunk_band.sh board_width_atom.sh \
-board_core_cost.sh board_fp16_pack.sh board_fp16_tri.sh board_fp16_read.sh"
+board_core_cost.sh board_fp16_pack.sh board_fp16_tri.sh board_fp16_read.sh
+board_w8a16.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
