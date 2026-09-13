@@ -32,6 +32,8 @@
 #   CHARSIU_W8_SHAPES="k:n ..."   default: the two attention shapes + a square
 #   CHARSIU_W8_M=78               rows a dispatch
 #   CHARSIU_W8_REPS=8             submits an arm
+. "$(dirname "$0")/board_clk.sh"
+NPUCLK=$(npu_clk) || exit 1
 set -u
 
 SHAPES=${CHARSIU_W8_SHAPES:-64:864 128:864 64:64 1024:64 1024:1024}
@@ -57,7 +59,7 @@ sleep 1
 
 echo "== int8 weights, fp16 activations: does it compute, and does the scale apply"
 echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
-echo "   npu clk   $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null) Hz"
+echo "   npu clk   $NPUCLK Hz"
 echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary    $T  $(ls -l --full-time "$T" 2>/dev/null | awk '{print $6}')"
 echo "   m         $M rows, $REPS reps an arm, arms alternating"

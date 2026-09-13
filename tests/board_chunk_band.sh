@@ -23,6 +23,8 @@
 #
 #   CHARSIU_BAND_REPS="..."   clause counts (the clause is about 6 tokens)
 #   CHARSIU_BAND_N=3
+. "$(dirname "$0")/board_clk.sh"
+NPUCLK=$(npu_clk) || exit 1
 set -u
 
 REPS=${CHARSIU_BAND_REPS:-10 14 16 18 20 22 24 32}
@@ -43,7 +45,7 @@ sleep 1
 
 echo "== the one-chunk widening, inside and outside its own band"
 echo "   boot    $(cat /proc/sys/kernel/random/boot_id)"
-echo "   npu     $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null) Hz"
+echo "   npu     $NPUCLK Hz"
 echo "   cpu     $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary  $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
 case $((N % 2)) in 1) echo "   ⚠ N=$N is odd; the order bias does not cancel";; esac
