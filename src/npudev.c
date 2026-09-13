@@ -5142,6 +5142,36 @@ static void tail_scale_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+/*
+ * ⚠⚠ A TIMING ARM THAT RETURNS THE WRONG ANSWER, ON PURPOSE.
+ *
+ * CHARSIU_NPU_NO_READ=1 skips the gather entirely: the fence still runs, the
+ * hardware still computes, and the caller's Y is left holding whatever was
+ * there. The text is garbage and is MEANT to be.
+ *
+ * It exists because r407's next target is a projection otherwise. The gather
+ * is 1.96 ms a row against 1.82 of fence, and the claim is that a pipeline
+ * which hid it behind the next tensor's execution would take the matmul entry
+ * from 4.65 to about 2.76 ms a row. That arithmetic is only as good as the
+ * assumption that `read` is 1.96 ms of WALL CLOCK and not 1.96 ms of a counter
+ * that overlaps something else already. This measures the ceiling directly:
+ * with the gather gone the entry is pack + submit + fence, which is the floor
+ * any pipeline can reach.
+ *
+ * ⚠ IT IS NOT AN OPTIMISATION AND HAS NO CORRECT ARM. Every plan this project
+ * has written for three months ended in a projection from a measured factor,
+ * and two of those factors turned out not to be factors at all. A ceiling that
+ * can be measured should be measured before the work that aims at it.
+ */
+static int npu_noread(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_NO_READ", 0);
+	return v;
+}
+
 static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			    unsigned m, float *Y)
 {
@@ -5965,7 +5995,9 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 		ob->busy &= ~(1u << d);
 		tf = now_us();
-		{
+		if (npu_noread()) {
+			/* the ceiling arm: no gather, and Y is garbage */
+		} else {
 			/* ⚠ THE KEY IS m ALONE and that is still right: the
 			 * format and the axis are fixed for the life of a
 			 * pool, so only the width can change under it. */
