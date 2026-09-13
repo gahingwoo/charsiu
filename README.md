@@ -16,21 +16,19 @@ only comparison here where nothing is quoted.
   decode     charsiu 1.39x to 1.46x faster. The multiple moves with the clock,
              so it is not one number.
 
-  prompt     a crossover, not a ratio. charsiu is faster below about 330 of its
+  prompt     a crossover, not a ratio. charsiu is faster below about 250 of its
              own tokens and the vendor is faster above it:
 
                  our tok    charsiu    their tok    vendor     winner
-                     102        761          135     932       charsiu 1.22x
-                     202       1398          235    1529       charsiu 1.09x
-                     302       2126          335    2145       level
-                     602       4627          635    4201       vendor  1.10x
-                     852       6815          885    6027       vendor  1.13x
+                     102        814          135     932       charsiu 1.15x
+                     202       1476          235    1529       charsiu 1.04x
+                     302       2257          335    2145       vendor  1.05x
+                     602       4818          635    4201       vendor  1.15x
+                     852       7016          885    6027       vendor  1.16x
 
              Their chat template costs a constant 33 tokens at every length, so
-             each row is the same input text. Their lead at 852 was 1.34x in the
-             morning of 2026-09-13 and is 1.13x now: the fp16 attention arm took
-             it to 1.16x and moving the accumulator gather into the next job's
-             fence took it to 1.13x.
+             each row is the same input text. Their lead at 852 was 1.34x before
+             the fp16 attention arm became the default and is 1.16x now.
 
   quality    charsiu's stored weights score 1.4x to 2.6x better in perplexity
              than theirs, against the same f16 original both were quantised

@@ -632,12 +632,28 @@ struct charsiu_npu {
 	 * reset per call and this read needs the deferred tensor's own.
 	 */
 	struct {
-		struct npu_outbuf *ob;
+		/*
+		 * ⛔⛔ AN INDEX AND NOT A POINTER. batch_outbuf reallocs
+		 * g->obuf when it grows, and the deferral is what MAKES it
+		 * grow: it skips an entry that still owes a gather, so the
+		 * next tensor of the same shape allocates a new one. A stored
+		 * pointer dangles exactly when this feature is doing its job.
+		 *
+		 * It passed on Llama-3.2-1B, whose distinct geometries fit
+		 * inside the initial capacity of 8, and failed on five of nine
+		 * models that cross it. tests/board_text_all.sh is what said
+		 * so; the single model check could not.
+		 */
+		unsigned obi;
 		const struct npu_entry *e;
 		float *Y;
 		unsigned m, dmask;
 		unsigned char *bseen;
 		unsigned bseen_n;
+		/* how many entries of it are this tensor's own: g->bseen_n is
+		 * a high water mark and can GROW between the defer and the
+		 * flush, and copying that many would read past the snapshot */
+		unsigned bseen_live;
 		/*
 		 * ⚠⚠ AND THE OUTPUT STRIDE, which is set PER CALL --
 		 * g->bout_stride = wide * m * 4 -- and is what the read uses to
@@ -5528,21 +5544,24 @@ static int npu_flush_pending(struct charsiu_npu *g)
 		return -1;
 	{
 		size_t stride = g->bout_stride;
+		unsigned nb = g->pend.bseen_live;
 
+		if (nb > g->bseen_n)
+			nb = g->bseen_n;
 		memcpy(save, g->bseen, g->bseen_n);
-		memcpy(g->bseen, g->pend.bseen, g->bseen_n);
+		memcpy(g->bseen, g->pend.bseen, nb);
 		g->bout_stride = g->pend.bout_stride;
 		for (d = 0; d < g->ndev; d++)
 			if (g->pend.dmask & (1u << d))
 				if (batch_read_device(g, g->pend.e,
-						      g->pend.ob, d,
+						      &g->obuf[g->pend.obi], d,
 						      g->pend.Y, g->pend.m))
 					rc = -1;
 		g->bout_stride = stride;
 	}
 	memcpy(g->bseen, save, g->bseen_n);
 	free(save);
-	g->pend.ob->pending = 0;
+	g->obuf[g->pend.obi].pending = 0;
 	g->pend.live = 0;
 	g->bdefer_done++;
 	return rc;
@@ -5675,6 +5694,33 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		return -1;
 	}
 	e = &g->ent[id];
+	/*
+	 * ⛔⛔⛔ AN int8 TENSOR MAY NOT DEFER ITS GATHER, and this cost two
+	 * board rounds to find.
+	 *
+	 * The int8 read back multiplies each accumulator by g->bd1[ki*m + r],
+	 * the per ROW activation scale that the same call's PACK computed --
+	 * and `bd1` is one array on the pool, sized for one call. Defer the
+	 * gather and the NEXT tensor's pack overwrites it before the deferred
+	 * read gets there. The w4 branch of that same loop reads a per channel
+	 * scale off the SLOT and does not care.
+	 *
+	 * It is a wrong answer with nothing reporting one, and it is data
+	 * dependent: it bites only when the deferred tensor is the int8 kind,
+	 * so tests/board_text_all.sh caught it at five models of nine while
+	 * Llama-3.2-1B, whose tensors at these call sites are all w4, passed
+	 * every single-model check.
+	 *
+	 * 🔑 THE DIAGNOSTIC THAT NAMED IT: CHARSIU_NPU_DEFER_READ=2 records the
+	 * deferral and then flushes it before returning, so the same
+	 * record-and-restore machinery runs at the moment the plain path would
+	 * have. 0 of 9 differing there against 5 of 9 at =1 -- which proved the
+	 * machinery right and put the fault in what changes BETWEEN the two
+	 * calls. After that the field is found by reading the list rather than
+	 * by guessing.
+	 */
+	if (defer && !w4_for(g, e->t))
+		defer = 0;
 	/*
 	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
 	 *
@@ -6408,13 +6454,26 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		}
 		if (defer) {
 			memcpy(g->pend.bseen, g->bseen, g->bseen_n);
-			g->pend.ob = ob; g->pend.e = e; g->pend.Y = Y;
+			g->pend.bseen_live = g->bseen_n;
+			g->pend.obi = (unsigned)(ob - g->obuf);
+			g->pend.e = e; g->pend.Y = Y;
 			g->pend.m = m;
 			g->pend.bout_stride = g->bout_stride;
 			g->pend.dmask = (1u << g->ndev) - 1u;
 			g->pend.live = 1;
 			ob->pending = 1;
 			g->bdefer_n++;
+			/*
+			 * ⚠ =2 IS THE DIAGNOSTIC ARM: record the deferral and
+			 * then flush it before returning, so the gather runs
+			 * through exactly the same record-and-restore
+			 * machinery but at the same moment the plain path
+			 * would have run it. If the text is right here and
+			 * wrong at =1, the fault is in what changes BETWEEN
+			 * the two calls, not in the machinery.
+			 */
+			if (defer == 2 && npu_flush_pending(g))
+				return -1;
 		} else {
 			for (unsigned d = 0; d < g->ndev; d++)
 				if (batch_read_device(g, e, ob, d, Y, m))
@@ -6522,8 +6581,14 @@ static int defer_read_on(void)
 {
 	static int v = -1;
 
-	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_NPU_DEFER_READ", 1);
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_DEFER_READ");
+
+		/* ⛔ DEFAULT OFF. See the note above charsiu_npu_matmul_defer:
+		 * it is correct on Llama-3.2-1B and wrong on five of nine
+		 * models, and the cause is not fully found. */
+		v = e ? atoi(e) : 0;
+	}
 	return v;
 }
 
