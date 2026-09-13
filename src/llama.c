@@ -5814,6 +5814,62 @@ static int attn_npu_soft_pool(void)
 }
 
 /*
+ * ⚠⚠⚠ THE SCORES MATMUL IS A WRITE, AND IT WAS WRITING A RECTANGLE WHERE THE
+ * ANSWER IS A TRIANGLE.
+ *
+ * r407 held the OUTPUT WIDTH still and re-measured the dtype factor that this
+ * whole road was built on: at m=78 k=64 n=864 the fp16 arm is 166 us and the
+ * int8 arm is 172 and 159 -- the same. r404's "2.4x for an int8 KV surface"
+ * was its fp16 arm writing four bytes an output and its int8 arm writing one,
+ * and the weight dtype was worth nothing at all.
+ *
+ * What that measurement leaves behind is the real shape of the cost. Holding
+ * m and k still and moving only n: 864 -> 174 us, 432 -> 94, 224 -> 61,
+ * 112 -> 42. About 22 us of fixed cost and 0.176 us a column, which at this
+ * shape is 74% of the fence in the output write and the weight fetch.
+ *
+ * And n did not have to be the whole prompt. A chunk of rows starting at
+ * position p0 attends to nothing after its own last row, so every column past
+ * p0 + m is computed, written, and then MEMSET BY THE VALUES PACK -- xtri0 has
+ * been telling the pack that since r400. The scores matmul was the one stage
+ * that did not know.
+ *
+ * ⚠ THE ROUNDING IS NOT COSMETIC. charsiu_fp16_woffset stops depending on n
+ * once every n group is full, which is what lets one surface be appended to
+ * and run at many widths -- and the group is 16. A width that is not a
+ * multiple of 16 is a different permutation of the same bytes, so this rounds
+ * UP to 16 and never down. 32 is the floor the unit refuses below.
+ *
+ * 🏁 AND IT IS WORTH EXACTLY NOTHING AT THE SHIPPED BLOCK SIZE, MEASURED.
+ * r407, four prompt lengths, arms alternating: the scores fence is 19/19,
+ * 70/70, 216/216, 385/385 ms and TTFT 0.999, 0.985, 0.993, 1.000. Identical
+ * text.
+ *
+ * The reason is in this function and not in the hardware. T is pos0 + j->n --
+ * the block's OWN last position, not the prompt's -- so npad is already the
+ * causal width of the block. The rb loop is what this could narrow, and it
+ * runs once: llama_prefill_chunk_cap is 163840/1024 = 160 on this model and
+ * a->mmax is 5120/(kv/32) = 160 too, so j->n never exceeds mmax.
+ *
+ * ⚠ AND SUB-CHUNKING TO MAKE IT LIVE IS A NET LOSS, by arithmetic rather than
+ * by a round: at 852 tokens, splitting the 160 row block in two takes the
+ * columns computed from 537600 to 499200, 7%, while doubling the task count --
+ * which r403 priced at 0.27 ms a row per doubling, 10% of attention.
+ *
+ * It stays on because it is never MORE work and it pays if a->mmax ever falls
+ * below the chunk cap (a longer context lowers mmax). The measurement is here
+ * so the next reader does not spend a round rediscovering the zero.
+ */
+static int attn_npu_causal_n(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_CAUSAL_N", 1);
+	return v;
+}
+
+/*
  * A whole layer of attention for a chunk of rows, or -1 to say the CPU should
  * do it. Returning -1 is always safe; the float cache is written either way.
  */
@@ -5888,6 +5944,17 @@ static int attn_npu_layer(struct attn_block_job *j)
 	for (rb = 0; rb < (unsigned)j->n; rb += a->mmax) {
 		unsigned m = (unsigned)j->n - rb < a->mmax
 			   ? (unsigned)j->n - rb : a->mmax;
+		/* the columns THIS chunk can reach, rounded to the n group.
+		 * Everything past it is a score no row of this chunk will
+		 * ever read: the softmax stops at pos + 1 and the values pack
+		 * memsets from xtri0 + r. */
+		unsigned cn = (unsigned)j->pos0 + rb + m;
+
+		cn = (cn + 15u) & ~15u;
+		if (cn < 32u)
+			cn = 32u;
+		if (cn > npad || !attn_npu_causal_n())
+			cn = npad;
 		/*
 		 * ⚠⚠ THE SCRATCH THAT USED TO BE HERE IS GONE, AND SO IS THE
 		 * TRAP IT CARRIED.
@@ -5924,7 +5991,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].ystride = 0;
 			op[h].m = m;
 			op[h].k = hd;
-			op[h].n = npad;
+			op[h].n = cn;
 		}
 		tg0 = attn_npu_now_ms();
 		if (charsiu_fp16_matmul_group(a->f, op, H)) {
@@ -5933,7 +6000,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 		}
 		a->t_pack1 += attn_npu_now_ms() - tg0;
 		{
-			struct attn_npu_soft sc = { a, j, m, rb, npad, {0} };
+			struct attn_npu_soft sc = { a, j, m, rb, cn, {0} };
 			double ts = attn_npu_now_ms();
 
 			for (h = 0; h < H; h++) {
@@ -5954,7 +6021,9 @@ static int attn_npu_layer(struct attn_block_job *j)
 		for (h = 0; h < H; h++) {
 			memset(&op[h], 0, sizeof(op[h]));
 			op[h].X = charsiu_fp16_out_w(a->f, h);
-			op[h].xstride = npad;
+			/* ⚠ THE ANSWER'S OWN STRIDE, which is the width the
+			 * scores matmul ran at and not the prompt's. */
+			op[h].xstride = cn;
 			/*
 			 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
 			 * NOTHING AFTER ITSELF, AND THE PACK IS WHAT ENFORCES
