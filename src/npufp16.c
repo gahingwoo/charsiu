@@ -46,6 +46,10 @@ struct charsiu_fp16 {
 	struct charsiu_bo wt, in, ob, coef, reg;
 	size_t wsz, insz, obsz, coefsz, regsz;
 	unsigned long calls, refused, submits;
+	/* elements converted by the pack, so `pack` can be read per element
+	 * rather than per call -- the two differ by a factor of the CONTEXT
+	 * LENGTH, because the values matmul contracts over the whole of it */
+	unsigned long long packel;
 	struct charsiu_fp16_times t;
 	/* what is currently sitting in the coefficient buffer, so a group
 	 * that asks for the same shapes twice does not build it twice */
@@ -254,6 +258,31 @@ struct charsiu_fp16 *charsiu_fp16_open(void)
 }
 
 /*
+ * ⚠ THE ARM IS NAMED IN BOTH DIRECTIONS. CHARSIU_FP16_PACK=1 is the vector
+ * run, =0 the per element loop this file shipped with; the scalar arm stays
+ * compiled so a board round can price the change against itself in one boot
+ * rather than against a number from another one.
+ */
+static int pack_vector(void)
+{
+	static int vec = -1;
+
+	if (vec < 0)
+		vec = charsiu_env_flag("CHARSIU_FP16_PACK", 1);
+	return vec;
+}
+
+static inline void pack_run(int vec, uint16_t *d, const float *x, size_t n)
+{
+	if (vec) {
+		charsiu_f2h_run(d, x, n);
+	} else {
+		for (size_t e = 0; e < n; e++)
+			d[e] = charsiu_f2h(x[e]);
+	}
+}
+
+/*
  * ⚠⚠ EVERY ONE OF THESE COUNTERS ALREADY EXISTED AND NOTHING READ THEM.
  *
  * `calls`, `submits`, `refused` and the whole `t` struct -- wcopy, pack,
@@ -269,8 +298,8 @@ struct charsiu_fp16 *charsiu_fp16_open(void)
  */
 static void fp16_report(const struct charsiu_fp16 *f)
 {
-	double tot = f->t.wcopy + f->t.pack + f->t.coefs + f->t.emit
-		   + f->t.submit + f->t.fence + f->t.read;
+	double tot = f->t.wcopy + f->t.pack + f->t.psync + f->t.coefs
+		   + f->t.emit + f->t.submit + f->t.fence + f->t.read;
 
 	if (!f->calls)
 		return;
@@ -278,13 +307,25 @@ static void fp16_report(const struct charsiu_fp16 *f)
 		" %.0f ms accounted\n", f->calls, f->submits, f->refused, tot);
 	if (tot <= 0.0)
 		return;
-	fprintf(stderr, "charsiu fp16:  wcopy %.0f  pack %.0f  coefs %.0f"
-		"  emit %.0f  submit %.0f  fence %.0f  read %.0f ms\n",
-		f->t.wcopy, f->t.pack, f->t.coefs, f->t.emit,
+	fprintf(stderr, "charsiu fp16:  wcopy %.0f  pack %.0f  psync %.0f"
+		"  coefs %.0f  emit %.0f  submit %.0f  fence %.0f"
+		"  read %.0f ms\n",
+		f->t.wcopy, f->t.pack, f->t.psync, f->t.coefs, f->t.emit,
 		f->t.submit, f->t.fence, f->t.read);
 	fprintf(stderr, "charsiu fp16:  %.0f%% fence, %.0f%% weight copy,"
 		" %.3f ms a call\n", 100.0 * f->t.fence / tot,
 		100.0 * f->t.wcopy / tot, tot / (double)f->calls);
+	/*
+	 * ⚠ THE PER ELEMENT COST IS THE NUMBER, NOT THE PER CALL ONE. Reading
+	 * `pack` against `calls` put a conversion at 235 ns, which is fifty
+	 * times what fourteen instructions can cost and sent one round looking
+	 * for a wall that was not there. The count is right here now.
+	 */
+	if (f->packel)
+		fprintf(stderr, "charsiu fp16:  pack %llu elements, %.2f ns"
+			" each (%s arm)\n", f->packel,
+			f->t.pack * 1e6 / (double)f->packel,
+			pack_vector() ? "vector" : "scalar");
 }
 
 void charsiu_fp16_close(struct charsiu_fp16 *f)
@@ -488,6 +529,7 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	uint32_t ins[3 + FP16_GROUP_MAX], outs[1];
 	unsigned nin;
 	int32_t *zero;
+	int vec = pack_vector();
 	double t0;
 
 	if (!f)
@@ -565,6 +607,8 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	/* row major, [m][k], which is what --inslots measured slot by slot */
 	t0 = now_ms();
 	charsiu_bo_prep(f->dev, &f->in, 1000000000);
+	f->t.psync += now_ms() - t0;
+	t0 = now_ms();
 	for (i = 0; i < nops; i++) {
 		/*
 		 * ⚠ THE BOUND, THE STORE AND THE ZEROING WERE ALL PER ELEMENT,
@@ -590,23 +634,28 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		if (nel > cap)
 			nel = cap;
 		if (xs == ops[i].k) {
-			for (size_t e = 0; e < nel; e++)
-				d[e] = charsiu_f2h(X[e]);
+			pack_run(vec, d, X, nel);
 		} else {
 			size_t e = 0;
 
+			/* the bound was per element and the row length is
+			 * known: a row contributes min(k, what is left) */
 			for (unsigned r = 0; r < ops[i].m && e < nel; r++) {
-				const float *xr = X + (size_t)r * xs;
+				size_t cn = ops[i].k;
 
-				for (unsigned c = 0; c < ops[i].k && e < nel;
-				     c++, e++)
-					d[e] = charsiu_f2h(xr[c]);
+				if (cn > nel - e)
+					cn = nel - e;
+				pack_run(vec, d + e, X + (size_t)r * xs, cn);
+				e += cn;
 			}
 		}
+		f->packel += nel;
 		memset(d + nel, 0, charsiu_fp16_up4k(pl.isz[i]) - nel * 2);
 	}
-	charsiu_bo_fini(f->dev, &f->in);
 	f->t.pack += now_ms() - t0;
+	t0 = now_ms();
+	charsiu_bo_fini(f->dev, &f->in);
+	f->t.psync += now_ms() - t0;
 
 	for (i = 0; i < nops; i++) {
 		memset(&job[i], 0, sizeof(job[i]));

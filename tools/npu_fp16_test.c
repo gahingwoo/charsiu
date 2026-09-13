@@ -840,22 +840,28 @@ int main(int argc, char **argv)
 			       "  (%.1f ms a round)   %.2fx\n",
 			       ts / (reps * G), ts / reps,
 			       ts > 0 ? tl / ts : 0.0);
-			printf("      wcopy %.3f  pack %.3f  coefs %.3f"
-			       "  emit %.3f  submit %.3f  fence %.3f"
-			       "  read %.3f ms\n",
+			printf("      wcopy %.3f  pack %.3f  psync %.3f"
+			       "  coefs %.3f  emit %.3f  submit %.3f"
+			       "  fence %.3f  read %.3f ms\n",
 			       (b.wcopy - a.wcopy) / reps,
 			       (b.pack - a.pack) / reps,
+			       (b.psync - a.psync) / reps,
 			       (b.coefs - a.coefs) / reps,
 			       (b.emit - a.emit) / reps,
 			       (b.submit - a.submit) / reps,
 			       (b.fence - a.fence) / reps,
 			       (b.read - a.read) / reps);
 		}
+		/* ⚠ psync is its own column now. It used to be inside `pack`,
+		 * and it is the two cache maintenance ioctls, which are
+		 * charged on the WHOLE buffer object and not on what the pack
+		 * wrote -- so adding it to the conversion hid both. */
 		printf("    of a grouped round: wcopy %.3f  pack %.3f"
-		       "  coefs %.3f  emit %.3f  submit %.3f  fence %.3f"
-		       "  read %.3f ms\n",
+		       "  psync %.3f  coefs %.3f  emit %.3f  submit %.3f"
+		       "  fence %.3f  read %.3f ms\n",
 		       (t1t.wcopy - t0t.wcopy) / reps,
 		       (t1t.pack - t0t.pack) / reps,
+		       (t1t.psync - t0t.psync) / reps,
 		       (t1t.coefs - t0t.coefs) / reps,
 		       (t1t.emit - t0t.emit) / reps,
 		       (t1t.submit - t0t.submit) / reps,

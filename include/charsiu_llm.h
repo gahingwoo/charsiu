@@ -479,6 +479,11 @@ unsigned long charsiu_fp16_submits(const struct charsiu_fp16 *f);
  * of what writing a KV cache through charsiu_fp16_woffset would remove. */
 struct charsiu_fp16_times {
 	double wcopy, pack, coefs, emit, submit, fence, read;
+	/* the two cache maintenance ioctls around the pack. They are NOT
+	 * proportional to what the pack writes: PREP_BO and FINI_BO
+	 * dma_sync the WHOLE buffer object, and `want` grows it and never
+	 * shrinks it, so a group that packs 32 kB can pay for 384. */
+	double psync;
 };
 void charsiu_fp16_get_times(const struct charsiu_fp16 *f,
 			    struct charsiu_fp16_times *t);

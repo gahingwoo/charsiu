@@ -250,7 +250,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_f16run $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -258,6 +258,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
 	./$(BUILD)/even_ks
 	./$(BUILD)/pack_f16w
+	./$(BUILD)/pack_f16run
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
@@ -283,6 +284,12 @@ $(BUILD)/pack_stride: tests/pack_stride.c src/regcmd.c src/job.c | $(BUILD)
 
 $(BUILD)/pack_f16w: tests/pack_f16w.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the vector fp16 conversion against the per element definition, over all 2^32
+# floats. It is header only, so this links nothing: the run and the definition
+# both live in charsiu.h precisely so they cannot drift into two conversions
+$(BUILD)/pack_f16run: tests/pack_f16run.c include/charsiu.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
 
 # the packer split by groups against the whole buffer it replaces: a byte
 # wrong here is a slightly wrong sentence and not a fault
