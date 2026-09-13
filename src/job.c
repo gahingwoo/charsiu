@@ -751,8 +751,19 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 	/* The scale table and the operand live between the record table and the
 	 * float region, which the size above covers with room to spare. */
 	scales = (uint16_t *)(dst + tb);
-	for (oc = 0; oc < sb / 2; oc++)
-		scales[oc] = charsiu_float_to_half(job->weight_scale);
+	for (oc = 0; oc < sb / 2; oc++) {
+		/*
+		 * ⚠ THE TABLE IS PADDED TO A WHOLE GROUP OF EIGHT and the
+		 * padding channels are computed by the CNA and never written
+		 * by the DPU, so what goes in them cannot reach an output.
+		 * They take the scalar rather than reading off the end of a
+		 * caller's array.
+		 */
+		float w = job->weight_scales && oc < mm->n
+			? job->weight_scales[oc] : job->weight_scale;
+
+		scales[oc] = charsiu_float_to_half(w);
+	}
 
 	/* The second operand. 0x1004 is fp16 0.00049, a value this hardware's
 	 * own configuration accepts; the vendor's 0x0E0E does not, under ours. */

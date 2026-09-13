@@ -438,6 +438,22 @@ struct charsiu_job {
 
 	float input_scale;
 	float weight_scale;
+	/*
+	 * ⭐ ONE SCALE PER OUTPUT CHANNEL, when a caller has them. NULL means
+	 * weight_scale for every channel, which is what every caller did until
+	 * 2026-09-13 -- and the hardware has had a per channel fp16 table all
+	 * along: charsiu_build_coefs writes `n` of them and filled every one
+	 * with the same scalar.
+	 *
+	 * It is what an int8 KV surface needs. The coefficient is per OUTPUT
+	 * CHANNEL, so for attention's scores matmul that is one scale a
+	 * POSITION -- fixed when the position is appended and never revised --
+	 * and r406 measured the quality of exactly that arrangement at
+	 * +0.008% perplexity.
+	 *
+	 * The array is read for channels [0, n) and must be that long.
+	 */
+	const float *weight_scales;
 	float output_scale;
 	int input_zero_point;
 	int weight_zero_point;

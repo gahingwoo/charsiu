@@ -268,7 +268,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -278,6 +278,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/pack_f16w
 	./$(BUILD)/pack_f16run
 	./$(BUILD)/sentinel
+	./$(BUILD)/coef_scales
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
@@ -315,6 +316,12 @@ $(BUILD)/pack_f16run: tests/pack_f16run.c include/charsiu.h | $(BUILD)
 # been seen to fire is not a check, and the hardware will not fire this one
 $(BUILD)/sentinel: tests/sentinel.c src/sentinel.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ $<
+
+# the per-output-channel scale table, read back entry by entry. A table off by
+# one channel gives every output a plausible wrong magnitude, and this tree's
+# own history says a plausible wrong number survives a text check
+$(BUILD)/coef_scales: tests/coef_scales.c src/job.c src/regcmd.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the packer split by groups against the whole buffer it replaces: a byte
 # wrong here is a slightly wrong sentence and not a fault
