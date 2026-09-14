@@ -22,16 +22,18 @@ only comparison here where nothing is quoted.
              own tokens and the vendor is faster above it:
 
                  our tok    charsiu    their tok    vendor     winner
-                     102        799          135     932       charsiu 1.17x
-                     202       1465          235    1529       charsiu 1.04x
-                     302       2226          335    2145       vendor  1.04x
-                     602       4654          635    4201       vendor  1.11x
-                     852       6818          885    6027       vendor  1.13x
+                     102        809          135     932       charsiu 1.15x
+                     202       1490          235    1529       charsiu 1.03x
+                     302       2265          335    2145       vendor  1.06x
+                     452       3226          485    3195       vendor  1.01x
+                     602       4387          635    4201       vendor  1.04x
+                     852       6328          885    6027       vendor  1.05x
 
              Their chat template costs a constant 33 tokens at every length, so
              each row is the same input text. Their lead at 852 was 1.34x before
-             the fp16 attention arm became the default, 1.16x after it, and
-             1.13x now.
+             the fp16 attention arm became the default, 1.16x after it, 1.13x
+             once the int4 accumulator work was done, and 1.05x now that the
+             softmax runs during the fence instead of after it.
 
   quality    charsiu's stored weights score 1.4x to 2.6x better in perplexity
              than theirs, against the same f16 original both were quantised
