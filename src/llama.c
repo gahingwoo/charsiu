@@ -5794,15 +5794,31 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	}
 	a->off = 0;
 	/*
-	 * ⭐ THE WIDEST GROUP, RESERVED NOW RATHER THAN GROWN INTO.
+	 * ⛔⛔ RESERVED AT THE WIDEST GROUP, AND IT LOSES. DEFAULT OFF.
 	 *
-	 * The input surface ceiling is (k/32)*m <= 5120 and the scores width
-	 * cannot exceed the reduction extent, so m * n is the SAME 160 * 1024
-	 * on every rung of the ladder: a big m against a short extent early, a
-	 * small m against the full one at the end. One reservation at the last
-	 * rung's shape therefore covers all of them, and the five buffer
-	 * objects -- 21 MB of scores output among them -- are allocated once
-	 * at open instead of inside the first layer of five prompt chunks.
+	 * The idea was sound and the size was not. Growing into the buffers
+	 * costs 73 ms of `plan` on the scores unit and 19 on the values one at
+	 * 852 tokens -- five reallocations of five buffer objects, the largest
+	 * 21 MB -- and reserving removes all of it: plan 73 -> 1, 19 -> 1.
+	 *
+	 * It also made every prep and every fini charge the RESERVED size.
+	 * Same binary, 852 tokens, three repeats:
+	 *
+	 *     CHARSIU_ATTN_RESERVE=1   PIPE=1 7027  PIPE=2 6794
+	 *     CHARSIU_ATTN_RESERVE=0   PIPE=1 6661  PIPE=2 6316
+	 *
+	 * 478 ms, and the stage table says where: the scores fence 503 -> 738
+	 * and the values psync 67 -> 167, both whole-buffer dma_syncs.
+	 *
+	 * ⚠ THE SIZE IS THE FAULT, NOT THE IDEA. The ceiling arithmetic below
+	 * is right about the LADDER -- m * n is the same 160 * 1024 on every
+	 * rung -- and wrong about the caller: charsiu_run's prefill chunk is
+	 * 80 rows, so a real group is 80 * 864 and this reserves 2.4x it. A
+	 * version that waits for the first layer call and reserves at ITS m
+	 * would be correctly sized, and has not been measured.
+	 *
+	 * This is the fourth time this tree has paid a whole-buffer sync for a
+	 * buffer bigger than the work: see the note in npufp16.c.
 	 */
 	{
 		unsigned mm = a->kvmax >= 32 ? 5120u / (a->kvmax / 32u) : 1;
@@ -5820,7 +5836,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		if (G > 1)
 			nops = (nops + G - 1) / G;
 		if (mm && a->nk >= 32 && hd >= 32 &&
-		    charsiu_env_flag("CHARSIU_ATTN_RESERVE", 1)) {
+		    charsiu_env_flag("CHARSIU_ATTN_RESERVE", 0)) {
 			for (i = 0; i < nops; i++) {
 				memset(&r[i], 0, sizeof(r[i]));
 				r[i].m = mm;
