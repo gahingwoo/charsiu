@@ -256,11 +256,14 @@ that follows from it is stage costs, not coefficients.
 token ranges on a curve with a large quadratic term, produced a number that
 pointed the wrong way.
 
-🏁 **They win on the other two terms and both are large.** Their fixed cost is
-a quarter of ours, 45.8 against 187.9 ms, and their quadratic term is a sixth
-of ours. ⭐ The quadratic term is the attention scaling. Per prompt token we
-are ahead; what we lose is how that cost GROWS, and a fixed cost four times
-theirs on top of it.
+🏁 **They win on the other two terms.** ⚠ And only one of the two is a number:
+their fixed cost is a quarter of ours, 45.8 against 187.9 ms, which the short
+end of the measured ladder shows directly. Their quadratic term is SMALLER and
+by how much is not determined -- see the refutation above, which this
+paragraph used to contradict by restating the 6.0x as a finding. ⭐ The
+quadratic term is the attention scaling. Per prompt token we are ahead; what
+we lose is how that cost GROWS, and a fixed cost four times theirs on top of
+it.
 
 🏁 **So "who starts a prompt faster" is a crossover, not a ratio.** With their
 33 tokens included the fits cross at 248 of our tokens; measured, we are ahead
@@ -1229,7 +1232,8 @@ because it moves both columns by the same 22%.
 ANY single number for the prefill gap, and in particular the 1.23x this list
 used to give -- 1b-ii now has both curves and the answer is a CROSSOVER at
 about 248 of our tokens, with our per-token linear rate 12% BETTER than theirs
-and their fixed cost and quadratic term 4x and 6x smaller. The 1.23x was two
+and their fixed cost 4x smaller. ⚠ Their quadratic term is smaller too and the
+6x that used to stand here is withdrawn: the fit does not determine it. The 1.23x was two
 points a side over two different token ranges and it pointed the wrong way.
 What cannot be quoted as one number: the matched-text ratio changes sign with
 prompt length, and the matched-token ratio runs 1.08x to 1.39x over the
