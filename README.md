@@ -72,6 +72,9 @@ text prompts apply a chat template we cannot reproduce.
 Their runtime was run here, not quoted from a table. What ran:
 
 ```
+  Every md5 below was re-read off the board on 2026-09-14, not copied
+  forward from an older note.
+
   runtime   librkllmrt 1.3.0, md5 78d6d4094a64ee7659bbafde6b07c408, 7.6 MB.
             The version is the library's own: it prints "rkllm-runtime
             version: 1.3.0, rknpu driver version: 0.9.8, platform: RK3576"
@@ -104,15 +107,26 @@ boots was measured on the same charsiu ladder at worst 2.2%.
 ## int4 or int8
 
 Neither of charsiu's two weight formats wins outright, and they lose in different
-places: int4 decodes faster and costs accuracy, int8 the other way round. int4 is
-the default because chat is a short prompt and a long answer; `CHARSIU_NPU_W4V=0`
-selects int8 for the other shape of work.
+places. Qwen3 0.6B, one board, `-c 1024`, three runs a cell, perplexity on
+`tests/corpus/long.txt` (md5 `4237c8fc3163a359fc21bde60c7b1d8b`), NPU 594 MHz:
 
-⚠ The four numbers that used to be in this paragraph -- 26.31 and 17.23 tok/s,
-87% and 1.6% -- are not in any board log or evidence section in either
-repository, so they are unsourced and have been removed rather than repeated.
-They are being re-measured; until that lands this paragraph says the direction
-and no figure.
+```
+          TTFT ms            decode tok/s          perplexity
+  int4    151 / 153 / 168    28.09 28.50 28.68     87.7503
+  int8    210 / 215 / 226    16.09 16.37 16.37     44.1828
+```
+
+int4 decodes 1.74x faster and scores 1.99x worse. It is the default because chat
+is a short prompt and a long answer; `CHARSIU_NPU_W4V=0` selects int8 for the
+other shape of work.
+
+⚠ The figures that used to be here -- 26.31 and 17.23 tok/s, 87% and 1.6% --
+appeared in no board log and no evidence section in either repository, and the
+re-measurement above does not reproduce them. They were removed rather than
+repeated. The two perplexities are the same deterministic instrument on the same
+corpus and are comparable to each other; a comparison against a plain q4_0
+reference is not quoted because that run came back without a figure and has not
+been re-done.
 
 Perplexity is the only number here that survives a reboot. `tools/charsiu_ppl` is
 deterministic to the last digit across boots, while everything else on this board

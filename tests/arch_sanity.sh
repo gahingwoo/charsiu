@@ -34,12 +34,15 @@
 set -e
 DIR="${1:?usage: arch_sanity.sh MODEL_DIR}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUN="$ROOT/build/charsiu_run"
+# ⚠ CHARSIU_RUN SO THIS CAN RUN WHERE THE MODELS ARE. The models live on the
+# board and the board has no compiler, so a script that builds before it checks
+# is a check that cannot run on the only machine that has something to check.
+RUN="${CHARSIU_RUN:-$ROOT/build/charsiu_run}"
 
 PROMPT="The capital of France is"
 WANT="Paris"
 
-make -C "$ROOT" build/charsiu_run >/dev/null
+[ -n "${CHARSIU_RUN:-}" ] || make -C "$ROOT" build/charsiu_run >/dev/null
 
 # ⚠ ONCE WITH CHARSIU_STAGES, because a crash that needs an environment
 # variable is still a crash. The sliding window's start was shadowed by
