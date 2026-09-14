@@ -129,6 +129,17 @@ fi
 # gate rather than a timing sweep. The build stamp is what it needs.
 echo "  governor: $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
   echo "  build    $(charsiu_build "$RUN")"
+# THE BOOT ID, AT BOTH ENDS, because this table is the round of record and the
+# rule this project runs on is that a comparison never crosses a boot. Round
+# 413 made "the boot id is the same at the start and the finish" its first
+# check, and then the script that produces the table printed neither. A round
+# whose own output cannot say which boot it ran on is a round that has to be
+# taken on trust, and the previous attempt at this table died when the board
+# reset mid-run. The closing line is printed by the trap below so it survives
+# an interrupt.
+  echo "  binary   $RUN  md5 $(md5sum "$RUN" 2>/dev/null | cut -c1-12)"
+  echo "  boot     $(npu_boot)"
+trap 'echo ""; echo "  boot at the finish  $(npu_boot)"' EXIT
 # SAY WHICH FORMAT WAS SCORED. A table that does not is a table whose rows
 # cannot be compared to any other table.
 [ "$W4V" = 1 ] || echo "  OUR column is w8a8 (CHARSIU_BENCH_W4V=0); theirs is still their w4a16."
