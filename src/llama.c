@@ -2610,7 +2610,7 @@ static void softmax_scaled_half(const float *x, float *tmp, uint16_t *dst,
 		float32x4_t s0 = vdupq_n_f32(0.0f);
 		float32x4_t s1 = vdupq_n_f32(0.0f);
 		float32x4_t sv = vdupq_n_f32(scale);
-		float32x4_t mxv, iv;
+		float32x4_t mxv;
 
 		for (; i + 4 <= n; i += 4)
 			mv = vmaxq_f32(mv, vld1q_f32(x + i));
@@ -2637,12 +2637,12 @@ static void softmax_scaled_half(const float *x, float *tmp, uint16_t *dst,
 			sum += tmp[i];
 		}
 		inv = 1.0f / sum;
-		iv = vdupq_n_f32(inv);
-		for (i = 0; i + 4 <= n; i += 4)
-			vst1q_f32(tmp + i, vmulq_f32(vld1q_f32(tmp + i), iv));
-		for (; i < n; i++)
-			tmp[i] *= inv;
-		charsiu_f2h_run(dst, tmp, (size_t)n);
+		/* ⚠ ONE WALK, NOT TWO. Normalising the scratch in place and
+		 * then converting it reads and writes every element twice for
+		 * no reason; the scratch is not read again after this. The
+		 * arithmetic is unchanged, which tests/softmax_half.c holds
+		 * to the last bit against the arm that does not fuse. */
+		charsiu_f2h_scale_run(dst, tmp, (size_t)n, inv);
 		return;
 	}
 #endif
@@ -5589,6 +5589,12 @@ static void attn_npu_free(struct attn_npu *a)
 				fprintf(stderr, "charsiu:   %-12s %lu\n",
 					an_reason[r], a->refused[r]);
 	}
+	/* ⚠ BEFORE THE BUFFERS GO. A layer that gave up mid group left a job
+	 * writing into an output buffer this is about to free. */
+	charsiu_fp16_drain(a->f);
+	charsiu_fp16_drain(a->fv);
+	charsiu_fp16_drain(a->f2);
+	charsiu_fp16_drain(a->fv2);
 	for (i = 0; a->f && i < a->n_layer * a->nkv; i++) {
 		if (a->kb)
 			charsiu_fp16_w_free(a->f, a->kb[i]);
@@ -6422,6 +6428,14 @@ static int attn_npu_group(struct attn_group *g)
 	 * goes back to the device. It saves two whole-buffer dma_syncs a
 	 * call. */
 	charsiu_fp16_poison_and_release(g->fs);
+	/* ⚠ THE TWO BUCKETS HAVE TO STAY WHAT THEY SAY. Charging everything
+	 * between two scores waits to `scores` put the values pack in the
+	 * scores column the moment the groups interleaved -- 832 against 527,
+	 * which is the pair the other way round. t_pack1 is now the wait for
+	 * THIS group's scores and t_pack2 is everything the values side
+	 * costs. */
+	a->t_pack2 += attn_npu_now_ms() - *g->tg0;
+	*g->tg0 = attn_npu_now_ms();
 	return 0;
 }
 
@@ -6613,6 +6627,8 @@ static int attn_npu_layer(struct attn_block_job *j)
 				a->fallbacks++;
 				return -1;
 			}
+			a->t_pack2 += attn_npu_now_ms() - tg0;
+			tg0 = attn_npu_now_ms();
 		}
 		if (charsiu_fp16_matmul_group_wait(fvs[(G - 1) & 1])) {
 			a->fallbacks++;

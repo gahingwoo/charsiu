@@ -591,6 +591,9 @@ int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
 				     const struct charsiu_fp16_op *ops,
 				     unsigned nops);
 int charsiu_fp16_matmul_group_wait(struct charsiu_fp16 *f);
+/* wait out a submitted group without reading it back, for a caller that gave
+ * up between the two halves */
+void charsiu_fp16_drain(struct charsiu_fp16 *f);
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			      const struct charsiu_fp16_op *ops, unsigned nops);
 

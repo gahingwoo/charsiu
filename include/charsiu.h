@@ -355,11 +355,41 @@ static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
 	for (; e < n; e++)
 		d[e] = charsiu_f2h(x[e]);
 }
+
+/*
+ * The same run, scaled on the way. A softmax that normalises in place and then
+ * converts walks its scratch twice; this is the two loops as one, and it is
+ * bit identical because a float32 multiply stored and reloaded is the same
+ * float32 multiply.
+ */
+static inline void charsiu_f2h_scale_run(uint16_t *d, const float *x, size_t n,
+					 float sc)
+{
+	float32x4_t v = vdupq_n_f32(sc);
+	size_t e = 0;
+
+	for (; e + 8 <= n; e += 8)
+		vst1q_u16(d + e,
+			  vcombine_u16(charsiu_f2h_x4(
+					       vmulq_f32(vld1q_f32(x + e), v)),
+				       charsiu_f2h_x4(
+					       vmulq_f32(vld1q_f32(x + e + 4),
+							 v))));
+	for (; e < n; e++)
+		d[e] = charsiu_f2h(x[e] * sc);
+}
 #else
 static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
 {
 	for (size_t e = 0; e < n; e++)
 		d[e] = charsiu_f2h(x[e]);
+}
+
+static inline void charsiu_f2h_scale_run(uint16_t *d, const float *x, size_t n,
+					 float sc)
+{
+	for (size_t e = 0; e < n; e++)
+		d[e] = charsiu_f2h(x[e] * sc);
 }
 #endif
 

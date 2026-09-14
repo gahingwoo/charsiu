@@ -122,6 +122,7 @@ struct charsiu_fp16 {
 	struct charsiu_fp16_op inops[FP16_GROUP_MAX];
 	unsigned innops;
 	int invec, inflight;
+	unsigned long abandoned;
 	double intcall, intprev;
 };
 
@@ -643,6 +644,9 @@ static void fp16_report(const struct charsiu_fp16 *f)
 		f->t.plan, f->t.wcopy, f->t.pack, f->t.psync, f->t.coefs,
 		f->t.emit, f->t.poison, f->t.submit, f->t.fence, f->t.read,
 		f->t.other);
+	if (f->abandoned)
+		fprintf(stderr, "charsiu fp16:  ⚠ %lu groups were submitted"
+			" and never waited on\n", f->abandoned);
 	if (f->partial)
 		fprintf(stderr, "charsiu fp16:  ⛔ %llu ROWS WERE NEVER"
 			" WRITTEN by a job that wrote others\n", f->partial);
@@ -921,6 +925,22 @@ int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
 	tprev = f->t.plan + f->t.wcopy + f->t.pack + f->t.psync + f->t.coefs
 	      + f->t.emit + f->t.poison + f->t.submit + f->t.fence + f->t.read;
 	t0 = tcall;
+	/*
+	 * ⚠⚠ A JOB STILL IN FLIGHT OWNS THIS BUFFER. Since the group split,
+	 * a caller that gives up between submit() and wait() -- every
+	 * `fallbacks++; return -1` in the attention layer does -- leaves the
+	 * hardware writing into the output buffer this call is about to
+	 * re-plan. Wait it out and throw the answers away: the caller that
+	 * abandoned them has already fallen back to the CPU for that layer.
+	 */
+	if (f->inflight) {
+		charsiu_bo_prep(f->dev, &f->ob, 1000000000);
+		charsiu_bo_fini(f->dev, &f->ob);
+		f->inflight = 0;
+		f->held = 0;
+		f->prepoisoned = 0;
+		f->abandoned++;
+	}
 	/* a previous group's answers are still being read out of the buffer
 	 * this is about to overwrite */
 	charsiu_fp16_release(f);
@@ -1432,6 +1452,19 @@ float *charsiu_fp16_out_w(struct charsiu_fp16 *f, unsigned i)
 	if (!f || !f->held || i >= f->last.nops)
 		return NULL;
 	return (float *)((uint8_t *)f->ob.map + f->last.ooff[i]);
+}
+
+/* the hardware is done with the output buffer and nothing was read out of it */
+void charsiu_fp16_drain(struct charsiu_fp16 *f)
+{
+	if (f && f->inflight) {
+		charsiu_bo_prep(f->dev, &f->ob, 1000000000);
+		charsiu_bo_fini(f->dev, &f->ob);
+		f->inflight = 0;
+		f->held = 0;
+		f->prepoisoned = 0;
+		f->abandoned++;
+	}
 }
 
 void charsiu_fp16_release(struct charsiu_fp16 *f)
