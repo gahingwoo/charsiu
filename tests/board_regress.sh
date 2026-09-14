@@ -75,7 +75,18 @@ done
 echo
 
 echo "================ 5. perplexity, the deterministic instrument"
-env $E "$PPL" "$M" "$B/corpus/long.txt" 2>&1 | tail -4
+# ⚠⚠ NAME BOTH INPUTS, BY md5. A perplexity is not a property of the runtime:
+# it belongs to the model file AND the corpus file, and neither is identified
+# by a round that just prints a number. The stable merge at 0c85c71 quotes
+# "perplexity 32.8025 int4 on the NPU" and this section, on
+# Llama-3.2-1B-Instruct-Q4_0 against corpus/long.txt, reads 41.2777 -- the same
+# to the digit on two different binaries, so it is not a regression, it is a
+# different input that was never written down. long2.txt on the same model and
+# the same binary reads 71.2016, which is the size of the effect.
+CORPUS="${CHARSIU_PPL_CORPUS:-$B/corpus/long.txt}"
+echo "   model  $(basename "$M")  md5 $(md5sum "$M" | cut -c1-12)"
+echo "   corpus $(basename "$CORPUS")  md5 $(md5sum "$CORPUS" | cut -c1-12)"
+env $E "$PPL" "$M" "$CORPUS" 2>&1 | tail -4
 echo
 
 echo "================ 6. decode"
