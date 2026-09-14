@@ -873,6 +873,18 @@ int main(int argc, char **argv)
 		 * 80 stays the default. CHARSIU_PREFILL_CHUNK=160 is worth
 		 * about 9% on Qwen3 at every length measured and is a
 		 * deployment's call until the SmolLM2 case is explained.
+		 *
+		 * ⛔⛔ AND IT MOVES THE TEXT, which this note did not say.
+		 * r411, Llama-3.2-1B at 852 tokens, 24 generated, same boot
+		 * and same binary: chunk 80 gives 8b02145bf030 and chunk 160
+		 * gives d80c57a8bf86. It is also 6.8% SLOWER there -- 6787 ms
+		 * against 6355 -- so on this model it loses twice.
+		 *
+		 * A different chunk is a different set of matmul shapes and so
+		 * a different summation order, and that alone can move a
+		 * token; what it is NOT is a knob a deployment can turn
+		 * without re-checking its output. The Qwen3 9% was measured
+		 * against the clock and nobody diffed the text.
 		 */
 		const char *ec = getenv("CHARSIU_PREFILL_CHUNK");
 		int chunk = ec ? atoi(ec) : 80;

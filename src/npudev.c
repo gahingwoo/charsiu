@@ -6823,10 +6823,21 @@ static int defer_read_on(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_NPU_DEFER_READ");
 
-		/* ⛔ DEFAULT OFF. See the note above charsiu_npu_matmul_defer:
-		 * it is correct on Llama-3.2-1B and wrong on five of nine
-		 * models, and the cause is not fully found. */
-		v = e ? atoi(e) : 0;
+		/*
+		 * ⭐ DEFAULT ON SINCE r411. The five of nine was one line:
+		 * the per channel tail scale ran at the end of the deferring
+		 * call with Y still unwritten. With it moved into
+		 * npu_flush_pending, tests/board_text_all.sh is 9 of 9
+		 * identical with this on and 9 of 9 with it off, and the
+		 * board puts it at 326 ms of an 852 token prompt -- 6355 ms
+		 * against 6029, text byte identical.
+		 *
+		 * ⚠ ITS SPREAD IS WIDER THAN THE ARMS AROUND IT: 5999..6375
+		 * against base's 6352..6361. The gather now races the
+		 * hardware for memory, so a run where the fence finishes
+		 * early pays for it.
+		 */
+		v = e ? atoi(e) : 1;
 	}
 	return v;
 }

@@ -282,7 +282,21 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 		if (spin_us < 0) {
 			const char *e = getenv("CHARSIU_NPU_SPIN_US");
 
-			spin_us = e ? atol(e) : 0;
+			/*
+			 * ⭐ 200 SINCE r411, WHICH IS THE FIRST TIME IT WAS
+			 * PRICED. Phase 20 wrote it and left it off "until
+			 * phase 21 has priced it against the arm that disables
+			 * CPU_SLEEP outright", and phase 21 never did.
+			 *
+			 * 852 tokens, three repeats, arms rotated: 6355 ms at
+			 * 0 against 6279 at 200 and 6292 at 1000, text byte
+			 * identical in all three. The poll wins 81% of 6476
+			 * waits at 200 us with a mean of 73, and the 19% that
+			 * fall back polled 252 us first -- which is why 1000
+			 * is not better: it spends four times as long on the
+			 * waits it was never going to win.
+			 */
+			spin_us = e ? atol(e) : 200;
 		}
 		if (spin_us > 0) {
 			charsiu_spin_tries++;
