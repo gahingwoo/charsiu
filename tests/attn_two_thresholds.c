@@ -5,7 +5,7 @@
  *
  * attn_npu_min_for() answers one question -- how long a prompt this model
  * needs before the arm pays -- out of two measured numbers and nothing in
- * between: attn_npu_min_tokens() (320) when the model shares KV heads across
+ * between: attn_npu_min_tokens() (272) when the model shares KV heads across
  * query heads, attn_npu_min_tokens_mha() (448) when it shares none. That
  * decision had no test, and it was wrong twice in one day in two different
  * directions: once as a flat 448 for everybody, once as an outright refusal
@@ -15,7 +15,7 @@
  * each side reads, and that a length equal to the threshold is in and one
  * below it is out -- none of which needs hardware.
  *
- * ⚠ THIS TEST DOES NOT CLAIM 320 AND 448 ARE THE RIGHT NUMBERS. They are
+ * ⚠ THIS TEST DOES NOT CLAIM 272 AND 448 ARE THE RIGHT NUMBERS. They are
  * board measurements and they can move; the test pins them so that moving
  * them is a deliberate edit of two lines here and not a silent drift, and it
  * pins the two override knobs so a sweep can still name either half.
@@ -65,7 +65,7 @@
 #include <unistd.h>
 
 /* the two numbers this tree currently ships, quoted once */
-#define GQA_MIN 320u
+#define GQA_MIN 272u
 #define MHA_MIN 448u
 
 #define ENGAGE 1
@@ -118,12 +118,12 @@ static const struct arm arms[] = {
 	  NULL, NULL, NULL, 32, 0, 852, MHA_MIN, ENGAGE },
 
 	/* ---- the length, against the shared threshold ---- */
-	{ "gqa, one token below 320, refuses",
-	  NULL, NULL, NULL, 32, 8, 319, GQA_MIN, REFUSE },
-	{ "gqa, exactly 320, engages",
-	  NULL, NULL, NULL, 32, 8, 320, GQA_MIN, ENGAGE },
-	{ "gqa, one token above 320, engages",
-	  NULL, NULL, NULL, 32, 8, 321, GQA_MIN, ENGAGE },
+	{ "gqa, one token below 272, refuses",
+	  NULL, NULL, NULL, 32, 8, 271, GQA_MIN, REFUSE },
+	{ "gqa, exactly 272, engages",
+	  NULL, NULL, NULL, 32, 8, 272, GQA_MIN, ENGAGE },
+	{ "gqa, one token above 272, engages",
+	  NULL, NULL, NULL, 32, 8, 273, GQA_MIN, ENGAGE },
 	/*
 	 * ⚠ 352 AND 452 ARE THE TWO MEASURED LENGTHS, and they are the reason
 	 * the two numbers are not one. r412 read both models at 352: the two
@@ -178,7 +178,7 @@ static const struct arm arms[] = {
 	{ "CHARSIU_ATTN_NPU_MHA_MIN, one below, refuses",
 	  NULL, "64", NULL, 32, 32, 63, 64u, REFUSE },
 	{ "CHARSIU_ATTN_NPU_MHA_MIN does not move the shared threshold",
-	  NULL, "64", NULL, 32, 8, 319, GQA_MIN, REFUSE },
+	  NULL, "64", NULL, 32, 8, 271, GQA_MIN, REFUSE },
 	{ "both knobs at once, each on its own model: GQA",
 	  "600", "64", NULL, 32, 8, 599, 600u, REFUSE },
 	{ "both knobs at once, each on its own model: no-GQA",
@@ -209,7 +209,7 @@ static const struct arm arms[] = {
 	 * and default for the other, and this row is which.
 	 */
 	{ "CHARSIU_ATTN_NPU_MIN set empty is the default",
-	  "", NULL, NULL, 32, 8, 319, GQA_MIN, REFUSE },
+	  "", NULL, NULL, 32, 8, 271, GQA_MIN, REFUSE },
 	{ "CHARSIU_ATTN_NPU_MHA_MIN set empty is the default",
 	  NULL, "", NULL, 32, 32, 447, MHA_MIN, REFUSE },
 
@@ -224,10 +224,10 @@ static const struct arm arms[] = {
 	  NULL, NULL, "1", 32, 8, 1, GQA_MIN, ENGAGE },
 	{ "CHARSIU_ATTN_NPU=1 engages with no hint at all",
 	  NULL, NULL, "1", 32, 32, 0, MHA_MIN, ENGAGE },
-	{ "CHARSIU_ATTN_NPU=auto is the default, and refuses below 320",
-	  NULL, NULL, "auto", 32, 8, 319, GQA_MIN, REFUSE },
-	{ "CHARSIU_ATTN_NPU=auto engages at 320",
-	  NULL, NULL, "auto", 32, 8, 320, GQA_MIN, ENGAGE },
+	{ "CHARSIU_ATTN_NPU=auto is the default, and refuses below 272",
+	  NULL, NULL, "auto", 32, 8, 271, GQA_MIN, REFUSE },
+	{ "CHARSIU_ATTN_NPU=auto engages at 272",
+	  NULL, NULL, "auto", 32, 8, 272, GQA_MIN, ENGAGE },
 	/*
 	 * ⛔ AND =2 IS NOT auto, WHICH THE COMMENT OVER attn_npu_want_for
 	 * SAYS IT IS. That comment's last line reads "0 off, 1 on for every

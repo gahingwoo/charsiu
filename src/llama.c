@@ -5280,6 +5280,30 @@ struct attn_npu {
  * so it is level and 320 sits above it. 352 is the shortest length where the
  * margin clears the spread.
  *
+ * ⛔⛔ AND 320 HAD THE DEFECT 448 HAD. It came from r412 section 2, which the
+ * round's own header says ran on the r411 shipping binary with nothing
+ * rebuilt -- and section 7 of the SAME round landed the in place ladder, which
+ * makes this arm faster at every length it is on. Nobody re-ran the threshold.
+ * The rule was in this file ("If this arm gets faster again, re-measure") and
+ * in that round's section 10, and neither fired, because both halves were
+ * right separately and only the ORDER was wrong.
+ *
+ * 🏁 RE-MEASURED ON THE ARM THAT SHIPS (r413, commit 58d2d360d971, three GQA
+ * models, three repeats an arm alternating, one boot):
+ *
+ *     tokens   Llama-3.2-1B   Qwen3-0.6B   gemma-3-1b
+ *        252         +1.4%        -0.4%        +4.6%
+ *        272         +2.9%        +3.5%        +4.8%
+ *        302         +5.9%        +6.6%        +7.4%
+ *        352         +7.7%       +11.6%        +9.7%
+ *
+ * ⚠⚠ GRADED AGAINST 2.5% AND NOT AGAINST THE SPREAD THIS TABLE PRINTS. Three
+ * readings put the spread at 0.2 to 1.7%; twenty readings of ONE arm at one
+ * length on one boot, changing nothing, put it at 2.5% (r413 section 5). Three
+ * samples underestimate it, so the floor is the honest test and 252 is inside
+ * it on two of the three models. 272 is the shortest length where all three
+ * clear, and that is why this is 272 and not 256.
+ *
  * ⚠ If this arm gets faster again, re-measure. Do not scale this number.
  *
  * ⚠ AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
@@ -5385,7 +5409,7 @@ static unsigned attn_npu_min_tokens(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_NPU_MIN");
 
-		v = e && *e ? atol(e) : 320;
+		v = e && *e ? atol(e) : 272;
 		if (v < 0)
 			v = 0;
 	}
