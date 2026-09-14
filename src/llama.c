@@ -5076,6 +5076,9 @@ struct attn_npu {
 	 * log2 of the context many repacks in a whole run.
 	 */
 	unsigned kvmax;
+	/* the rungs this run actually stood on, because the ladder's shape is
+	 * the thing being tuned and a count of repacks does not show it */
+	unsigned rung[20], nrung;
 	/*
 	 * ⚠⚠ "FELL BACK ON 0" WAS TRUE AND MEANT NOTHING. `fallbacks` counts
 	 * the two charsiu_fp16_matmul_group failures and nothing else, while
@@ -5135,6 +5138,13 @@ struct attn_npu {
 	/* and the rest of the layer, so "attention minus what is accounted"
 	 * is never again a number anybody reasons from */
 	double t_layer, t_kv, t_pack1, t_pack2;
+	/* ⚠ OUTSIDE t_layer ON PURPOSE: a growth is not a layer's work,
+	 * it is the ladder's, and charging it to the layer is what would
+	 * hide a step that buys extent and pays for it in repacks. */
+	double t_grow, t_grow_alloc;
+	/* set the moment one growth has to fall back to the packer,
+	 * so the line above names the path that was actually run */
+	unsigned grow_packed;
 	/*
 	 * ⭐ ONE ROW OF EXPONENTIALS PER OP, so the softmax's intermediate
 	 * never reaches DRAM. FP16_GROUP_MAX rows of kvmax floats, which at a
@@ -5244,6 +5254,61 @@ static unsigned attn_npu_mmax_cap(void)
 		v = e && *e ? atol(e) : 0;
 		if (v < 0)
 			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/*
+ * ⚠⚠ THE LADDER OVERSHOOTS AND THE HINT SAYS BY HOW MUCH. kv doubles, so a
+ * 852 token prompt finishes its prefill on the 1024 rung and every row from
+ * position 512 on pays a reduction extent 19% longer than any of them needs.
+ * The vendor's own file grows this length in steps of 32 instead.
+ *
+ * ⛔ AND THE OBVIOUS FIX IS THE WRONG ONE: starting kv AT the prompt total is
+ * SLOWER, not faster. Cost is the sum of kv over positions, so a ladder that
+ * begins at 864 charges the first 512 rows 864 apiece where the doubling one
+ * charges them 32, 64, ... 512 -- 736k units against 523k, 1.4x worse. What
+ * the hint is good for is the CEILING, not the floor: keep the ladder, and
+ * refuse to climb past what the prompt will actually use.
+ *
+ * The step is a knob because the repack is not free either (one BO alloc per
+ * layer per kv head, then every live position packed again), so where the
+ * optimum sits between "few repacks, much overshoot" and the vendor's 32 is a
+ * board question and not an arithmetic one.
+ */
+/* ⚠ SEPARATE FROM THE STEP, so an arm can be exactly today: step 200, cap
+ * off. Two knobs on one line is how a sweep stops being able to name which
+ * half moved. */
+static int attn_npu_kv_cap_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV_CAP", 1);
+	return v;
+}
+
+/* the block copy, with an off switch: an arm that cannot be turned off cannot
+ * be priced, and this one replaces a path that is known correct */
+static int attn_npu_kv_copy(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV_COPY", 1);
+	return v;
+}
+
+static unsigned attn_npu_kv_step(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_KV_STEP");
+
+		v = e && *e ? atol(e) : 200;
+		if (v < 110)
+			v = 110;
 	}
 	return (unsigned)v;
 }
@@ -5500,6 +5565,18 @@ static void attn_npu_free(struct attn_npu *a)
 				attn_npu_soft_pool() ? "pooled" : "one core",
 				a->t_pack2, a->t_layer - a->t_kv - a->t_pack1
 					  - a->t_soft - a->t_pack2);
+		if (a->nrung) {
+			unsigned r2;
+
+			fprintf(stderr, "charsiu:   V surface ladder:");
+			for (r2 = 0; r2 < a->nrung; r2++)
+				fprintf(stderr, " %u", a->rung[r2]);
+			fprintf(stderr, "  (%u repacks, %.0f ms: %.0f in"
+				" alloc, %.0f in %s)\n", a->nrung - 1,
+				a->t_grow, a->t_grow_alloc,
+				a->t_grow - a->t_grow_alloc,
+				a->grow_packed ? "the packer" : "block copy");
+		}
 		/* ⚠ BY REASON, because "refused 308" is the number that made
 		 * gemma-4 look like a head_dim 512 measurement when 28 of its
 		 * 35 layers are head_dim 256 and never reached the hardware. */
@@ -5591,6 +5668,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->kvmax = ((unsigned)s->n_ctx + 31u) & ~31u;
 	/* the smallest rung the unit will take; attn_npu_fit climbs from here */
 	a->kv = a->kvmax < 32u ? a->kvmax : 32u;
+	a->rung[a->nrung++] = a->kv;
 	/*
 	 * ⚠ THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
 	 * (k/32)*m up to 5120 -- measured, and the vendor's own file never
@@ -5747,33 +5825,87 @@ static const float *attn_kcache_at(struct llama_state *s, unsigned l,
  *
  * Returns 0 if kv now covers `want`, -1 if it cannot.
  */
+static double attn_npu_now_ms(void);
+
 static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			unsigned want)
 {
 	unsigned kv = a->kv, i, l, kh, p;
+	/* every position already in the float cache; this one is not in it
+	 * yet, which is why the packer below stops one short of `want` */
+	unsigned live = want ? want - 1 : 0;
+	int copied = attn_npu_kv_copy();
+	double tg0, tg1, tga = 0.0;
+	unsigned step = attn_npu_kv_step();
+	unsigned cap = (s->prompt_total > 0 && attn_npu_kv_cap_on())
+		     ? (((unsigned)s->prompt_total + 31u) & ~31u) : 0u;
 
+	if (cap > a->kvmax)
+		cap = a->kvmax;
 	if (want <= a->kv)
 		return 0;
 	if (want > a->kvmax)
 		return -1;
-	while (kv < want)
-		kv *= 2;
+	while (kv < want) {
+		unsigned nx = (unsigned)(((uint64_t)kv * step) / 100u);
+
+		/* 32 is the surface's grain and also the smallest step that
+		 * makes progress, so a step percentage that rounds down to
+		 * nothing still climbs */
+		nx = (nx + 31u) & ~31u;
+		if (nx <= kv)
+			nx = kv + 32u;
+		kv = nx;
+		if (kv >= a->kvmax) {
+			kv = a->kvmax;
+			break;
+		}
+	}
+	/*
+	 * ⚠ THE PROMPT'S OWN CEILING, AND ONLY WHILE THE PROMPT IS WHAT IS
+	 * BEING SERVED. `want` past it means generation has run off the end of
+	 * the hint, and then the ladder is all there is again.
+	 */
+	if (cap && want <= cap && kv > cap)
+		kv = cap;
 	if (kv > a->kvmax)
 		kv = a->kvmax;
 
+	tg0 = attn_npu_now_ms();
 	for (i = 0; i < a->n_layer * a->nkv; i++) {
-		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->fv, kv,
-							a->lhd[i / a->nkv]);
+		struct charsiu_fp16_w *w;
+		double ta = attn_npu_now_ms();
+
+		w = charsiu_fp16_w_alloc(a->fv, kv, a->lhd[i / a->nkv]);
 
 		if (!w) {
 			fprintf(stderr, "charsiu: the fp16 V surface would not "
 				"grow to %u positions\n", kv);
 			return -1;
 		}
+		tga += attn_npu_now_ms() - ta;
+		/*
+		 * ⭐ THE RUNG'S BYTES ARE THE NEXT RUNG'S BYTES AT ANOTHER
+		 * BASE. The padded extent appears in one term of the offset,
+		 * so the positions already packed are already in order and
+		 * only the output channel groups move. tests/fp16_regrow.c
+		 * holds that against the packer, 1584 shapes byte for byte.
+		 *
+		 * ⚠ BEFORE THE FREE, obviously, and out of the map that is
+		 * about to go away. A refusal here is not a fault: `copied`
+		 * falls to 0 and the packer below does the whole job.
+		 */
+		if (copied && live
+		    && charsiu_fp16_regrow_vcols(charsiu_fp16_w_map(w), kv,
+				charsiu_fp16_w_map(a->vb[i]), a->kv,
+				a->lhd[i / a->nkv], live))
+			copied = 0;
 		charsiu_fp16_w_free(a->fv, a->vb[i]);
 		a->vb[i] = w;
 	}
 	a->kv = kv;
+	if (a->nrung < sizeof(a->rung) / sizeof(a->rung[0]))
+		a->rung[a->nrung++] = kv;
 	a->mmax = 5120u / (kv / 32u);
 	if (attn_npu_mmax_cap() && a->mmax > attn_npu_mmax_cap())
 		a->mmax = attn_npu_mmax_cap();
@@ -5781,8 +5913,9 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		return -1;
 
 	/* every position that already exists, through the packer the append
-	 * path uses, out of the float cache that both paths write */
-	for (l = 0; l < a->n_layer; l++) {
+	 * path uses, out of the float cache that both paths write -- unless
+	 * the block copy above already moved them all */
+	for (l = 0; !copied && l < a->n_layer; l++) {
 		for (kh = 0; kh < a->nkv; kh++) {
 			uint16_t *map = charsiu_fp16_w_map(
 					a->vb[l * a->nkv + kh]);
@@ -5790,12 +5923,21 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			/* ⚠ TWO DIFFERENT WIDTHS ON ONE LINE: the mirror is
 			 * packed at the LAYER's head and the float cache is
 			 * addressed at the STRIDE. They differ on gemma4. */
-			for (p = 0; p + 1 < want; p++)
+			for (p = 0; p < live; p++)
 				charsiu_fp16_pack_vcol(map, a->kv, a->lhd[l], p,
 					attn_vcache_at(s, l, kh, a->hd, p));
 		}
-		a->dirty[l] = 1;
 	}
+	/* ⚠ EITHER WAY. The surface moved, so every layer's upload is stale
+	 * whether the bytes got there by a copy or by the packer. */
+	for (l = 0; l < a->n_layer; l++)
+		a->dirty[l] = 1;
+	a->grow_packed += !copied;
+	tg1 = attn_npu_now_ms();
+	a->t_grow += tg1 - tg0;
+	/* alloc and free against pack, because the two have different fixes:
+	 * one is 128 buffer objects a rung, the other is every live position */
+	a->t_grow_alloc += tga;
 	charsiu_note("attention: the V surface grew", kv, a->mmax);
 	return 0;
 }

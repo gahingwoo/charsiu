@@ -34,6 +34,7 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/vattn_bench \
      $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
      $(BUILD)/fp16_plan \
+     $(BUILD)/fp16_regrow \
      $(BUILD)/charsiu_ppl \
      $(BUILD)/charsiu_membw
 
@@ -276,7 +277,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -291,6 +292,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/sentinel
 	./$(BUILD)/coef_scales
 	./$(BUILD)/fp16_plan
+	./$(BUILD)/fp16_regrow
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
 	./tests/corpus_fixed.sh
@@ -364,6 +366,9 @@ $(BUILD)/pack_groups: tests/pack_groups.c src/regcmd.c src/job.c | $(BUILD)
 # overlaps two regions returns another op's answer rather than an error
 $(BUILD)/fp16_plan: tests/fp16_plan.c src/fp16plan.h src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fp16_plan.c src/regcmd.c src/job.c -lm
+
+$(BUILD)/fp16_regrow: tests/fp16_regrow.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/fp16_regrow.c src/regcmd.c src/job.c -lm
 
 # the guard is its own unit for exactly this reason: the table is testable on a
 # desk without linking the hardware path behind it

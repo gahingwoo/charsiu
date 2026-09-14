@@ -383,6 +383,9 @@ static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
  */
 void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
 			    const float *k);
+/* the same packing at a longer reduction extent, by block copy; 0 or -1 */
+int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
+			      unsigned kv_old, unsigned hd, unsigned live);
 void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
 			    const float *v);
 

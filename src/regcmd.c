@@ -1124,6 +1124,62 @@ void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
 	}
 }
 
+/*
+ * ⭐ A LONGER REDUCTION EXTENT IS THE SAME BYTES AT A DIFFERENT BLOCK BASE.
+ *
+ * w_group_index is  ngi*ng*ke + kgi*kg*ngsz + (n%ng)*kgsz + k%kg,  and ke --
+ * the padded reduction extent -- appears in exactly ONE of those four terms.
+ * So growing kv moves each output channel group's block and changes nothing
+ * inside it: the positions already packed are already in the right order, at
+ * the wrong address.
+ *
+ * That matters because the V surface grows on a ladder and every rung used to
+ * re-pack every live position out of the float cache, one call to
+ * charsiu_fp16_pack_vcol per position per layer per kv head, each of them
+ * converting and computing offsets. This is the same bytes as one memcpy a
+ * group.
+ *
+ * Returns 0, or -1 for a shape it will not move -- and a refusal here is not
+ * a correctness risk, it just means the caller re-packs. The conditions are
+ * both about the four terms above staying still: kgsz must be kg for every
+ * k group (so a padded extent that is not a whole number of groups refuses)
+ * and the destination must be at least as long as the source.
+ *
+ * ⚠ THE OFFSETS COME FROM charsiu_w16_offset, NOT FROM A SECOND COPY OF THE
+ * FORMULA. tests/fp16_regrow.c holds this against the packer itself.
+ */
+int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
+			      unsigned kv_old, unsigned hd, unsigned live)
+{
+	struct charsiu_matmul mo = { 1, kv_old, hd, CHARSIU_FP16,
+				     CHARSIU_FP16 };
+	struct charsiu_matmul mn = { 1, kv_new, hd, CHARSIU_FP16,
+				     CHARSIU_FP16 };
+	unsigned ng = charsiu_weight_ngroup(CHARSIU_FP16);
+	unsigned kg = charsiu_weight_kgroup(CHARSIU_FP16);
+	unsigned n_pad = ALIGN_UP(hd, 2);
+	unsigned keo = charsiu_k_eff(&mo), ken = charsiu_k_eff(&mn);
+	const uint16_t *s = src;
+	uint16_t *d = dst;
+	unsigned n0;
+
+	if (!dst || !src || !hd || !live || kv_new < kv_old || live > kv_old)
+		return -1;
+	if (!kg || !ng || (keo % kg) || (ken % kg))
+		return -1;
+	for (n0 = 0; n0 < n_pad; n0 += ng) {
+		unsigned ngsz = n_pad - n0 < ng ? n_pad - n0 : ng;
+		size_t oo = charsiu_w16_offset(&mo, n0, 0, CHARSIU_W16_GROUP);
+		size_t on = charsiu_w16_offset(&mn, n0, 0, CHARSIU_W16_GROUP);
+		size_t len = (size_t)((live + kg - 1) / kg) * kg * ngsz;
+
+		if (oo == (size_t)-1 || on == (size_t)-1)
+			return -1;
+		memcpy(d + on / 2, s + oo / 2, len * 2);
+	}
+	return 0;
+}
+
 void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
 			    const float *v)
 {
