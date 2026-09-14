@@ -819,17 +819,28 @@ discarded, all eight points on one boot.
        852    5953  5948..5959     885   6026.8  charsiu   1.012
 ```
 
-🏁 **What this supports: the vendor no longer wins at any measured prompt
-length.** 852 goes 8081 (r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953.
+🏁 **What this supports: two regimes.** charsiu leads by 1.09x to 1.28x below
+about 250 of its own tokens, and from 302 up the two are level. 852 goes 8081
+(r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953, so their 1.341x lead
+there is gone.
 
-⚠⚠ **What it does NOT support is a margin at every length.** Their column is
-r393's ladder with their runtime, which needs their driver bound and so cannot
-share a boot with ours; 1b-ii measured the boot-to-boot drift of this same
-charsiu ladder at **2.2% at worst**. Three rows are inside it and have to be
-quoted as level, not as a win:
+⛔⛔ **WHAT IT DOES NOT SUPPORT IS "AHEAD AT EVERY LENGTH", and this list said
+that for an hour before it was corrected.** Every point estimate favours
+charsiu, but a margin has to clear TWO things, not one:
 
-    clear      27 (+24.5%)  52 (+27.6%)  102 (+22.4%)  202 (+9.2%)  452 (+4.4%)
-    level     302 (+0.7%)  602 (+2.1%)  852 (+1.2%)
+  - **the cross-boot drift.** Their column needs their driver bound, so the two
+    columns cannot share a boot; 1b-ii measured the boot-to-boot drift of this
+    same charsiu ladder at **2.2% at worst**. 302 (+0.7%), 602 (+2.1%) and 852
+    (+1.2%) are inside it.
+  - **the arm's own spread AT THAT POINT.** 452 is +4.4% over them and its own
+    three readings span 3037..3179, which is 142 ms and **4.6% of its median**.
+    A margin smaller than the spread of the arm it came from is not a margin,
+    and comparing only against the drift bound missed this one.
+
+```
+    clear    27 (+24.5%)  52 (+27.6%)  102 (+22.4%)  202 (+9.2%)
+    level   302  452  602  852
+```
 
 ⚠ The four changes behind it, each measured against its own control on this
 board and each text identical to it: two head groups so the softmax runs

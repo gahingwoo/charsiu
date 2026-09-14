@@ -18,32 +18,41 @@ only comparison here where nothing is quoted.
              does not, so the multiple is a function of the condition and not
              a property of either runtime.
 
-  prompt     charsiu is ahead at every length measured. It used to be a
-             crossover at about 250 tokens; it is not one any more:
+  prompt     two regimes, not one ratio. charsiu leads by 1.09x to 1.28x below
+             about 250 of its own tokens, and from 302 up the two are level:
 
-                 our tok    charsiu    their tok    vendor     winner
-                      27        332           60     413       charsiu 1.24x
-                      52        415           85     530       charsiu 1.28x
-                     102        761          135     932       charsiu 1.22x
-                     202       1400          235    1529       charsiu 1.09x
-                     302       2131          335    2145       level
-                     452       3059          485    3195       charsiu 1.04x
-                     602       4115          635    4201       level
-                     852       5953          885    6027       level
+                 our tok    charsiu       range    their tok  vendor   verdict
+                      27        332   327..332           60     413    1.24x
+                      52        415   413..417           85     530    1.28x
+                     102        761   750..762          135     932    1.22x
+                     202       1400  1398..1401         235    1529    1.09x
+                     302       2131  2124..2134         335    2145    level
+                     452       3059  3037..3179         485    3195    level
+                     602       4115  4111..4156         635    4201    level
+                     852       5953  5948..5959         885    6027    level
 
              Their chat template costs a constant 33 tokens at every length, so
              each row is the same input text.
 
-             Three rows say "level" rather than a number, and that is the
-             honest reading: their runtime needs their driver bound, so the two
-             columns cannot share a boot, and the boot-to-boot drift of this
-             ladder was measured at 2.2% at worst. 302, 602 and 852 are inside
-             that. The five that are not are 27, 52, 102, 202 and 452.
+             Every point estimate in the table favours charsiu, and four of the
+             eight are still written "level", because a margin has to clear two
+             things and those four clear neither:
 
-             At 852 their lead was 1.34x before the fp16 attention arm became
-             the default, 1.16x after it, 1.13x once the int4 accumulator work
-             was done, 1.05x once the softmax ran during the fence, and gone
-             once the int4 accumulator gather ran during it too.
+               the drift  their runtime needs their driver bound, so the two
+                          columns cannot share a boot, and the boot-to-boot
+                          drift of this same charsiu ladder was measured at
+                          2.2% at worst. 302 (+0.7%), 602 (+2.1%) and 852
+                          (+1.2%) are inside it.
+               the spread  452 is +4.4% over them and its own three readings
+                          span 142 ms, which is 4.6% of its median. A margin
+                          smaller than the arm's own spread at that point is
+                          not a margin.
+
+             What did change: at 852 their lead was 1.34x before the fp16
+             attention arm became the default, 1.16x after it, 1.13x once the
+             int4 accumulator work was done, 1.05x once the softmax ran during
+             the fence, and level once the int4 accumulator gather ran during
+             it too. Level is the claim; ahead everywhere is not.
 
   quality    charsiu's stored weights score 1.4x to 2.6x better in perplexity
              than theirs, against the same f16 original both were quantised
@@ -51,11 +60,42 @@ only comparison here where nothing is quoted.
              on an ordering.
 ```
 
-One model, one board. The decode and prompt rows are `docs/paper-evidence.md`
-sections 1b, 1g and 1b-ii. The quality row is section 2 and is a reconstruction,
-because their runtime refuses every route to its own accuracy: the logits call
-fails on an uncompiled shape, token input returns token 0, and text prompts apply
-a chat template we cannot reproduce.
+One model, one board. Every row above is a measurement with a round behind it:
+decode is `docs/paper-evidence.md` sections 1b and 1g, the prompt ladder is
+section 1k, and the quality row is section 2. The quality row alone is a
+reconstruction, because their runtime refuses every route to its own accuracy:
+the logits call fails on an uncompiled shape, token input returns token 0, and
+text prompts apply a chat template we cannot reproduce.
+
+### What the vendor column actually is
+
+Their runtime was run here, not quoted from a table. What ran:
+
+```
+  runtime   librkllmrt 1.3.0, md5 78d6d4094a64ee7659bbafde6b07c408, 7.6 MB.
+            The version is the library's own: it prints "rkllm-runtime
+            version: 1.3.0, rknpu driver version: 0.9.8, platform: RK3576"
+            at init.
+  weights   Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm, 1.30 GB,
+            md5 2d3962468e2e7c0d0571157f8c9eae71 -- the same file section 2
+            scores. Its own last 29 bytes read "rkllm-toolkit version: 1.1.4",
+            so it was produced by Rockchip's converter and is not a published
+            artefact somebody else can diff against.
+  harness   vendor_bench, md5 6350eaef99f472404b05bdb7a38af6e2, 14 kB, calling
+            rkllm_init / rkllm_run / rkllm_destroy and reading the runtime's
+            own RKLLMPerfStat rather than timing from outside.
+  driver    their rknpu, built against this board's own mainline kernel.
+  ladder    tests/board_ttft_curve.sh, vendor arm, board-logs r393: three
+            readings a point, NPU 594 MHz on both sides, rail 800 mV, CPU
+            pinned 2016/2208 with the userspace governor, context 1024 on both
+            sides. Decode is r389 and r390.
+```
+
+⚠ **The harness's source is not in this repository.** `vendor_bench` was
+written, built and deployed to the board, and only the binary survives. Its
+identity is recorded above so the runs can be tied to it, but a reader cannot
+rebuild it from here, and re-measuring the vendor column needs the board booted
+into the vendor arm. That is a gap, not a result.
 
 The two runtimes cannot share a boot, since one needs `rocket` and the other the
 vendor `rknpu`. The vendor column is a different boot, and the drift between
@@ -211,9 +251,9 @@ and the ops an LLM needs, on the NPU, in the precisions the vendor uses, plus a
 frontend that runs a real model end to end. Out of scope: any vendor library in
 the execution path, and any claim about an SoC this has not been run on.
 
-The target is the vendor's own number on the same board and model. Decode meets
-it and prefill now does too, at every length measured; the table at the top says
-by how much, and which three rows are level rather than ahead.
+The target is the vendor's own number on the same board and model. Decode beats
+it; prefill leads below about 250 tokens and is level above, which the table at
+the top gives row by row with the ranges that decide which is which.
 
 ## Why this exists, and why it is not a port
 
