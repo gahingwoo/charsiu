@@ -818,7 +818,52 @@ two shapes apart, and the projection that follows from it -- attention 2343 ms
 becoming about 780, TTFT about 5630 against their 6027 -- is arithmetic on a
 bound and **not a result**.
 
+### 1k-ii. The ladder re-measured on the shipping binary: ahead to 602, level at 852
+
+r413, commit 58d2d360d971, five repeats a point, one boot (0c9923fe), clock and
+governor pinned. Supersedes 1k below, which is kept because its numbers are a
+dated reading of a different binary.
+
+```
+    ch tok   ch ms       range   vn tok    vn ms   margin   spread   verdict
+        27     331   330..332        60    413.2   +24.8%     0.6%   ahead
+        52     409   407..416        85    529.6   +29.5%     2.2%   ahead
+       102     750   745..767       135    931.8   +24.2%     2.9%   ahead
+       202    1395  1390..1402      235   1528.5    +9.6%     0.9%   ahead
+       302    2045  2030..2050      335   2145.0    +4.9%     1.0%   ahead
+       452    2991  2974..3014      485   3194.7    +6.8%     1.3%   ahead
+       602    4060  4055..4072      635   4200.5    +3.5%     0.4%   ahead
+       852    5905  5892..5936      885   6026.8    +2.1%     0.7%   LEVEL
+```
+
+🔑 **The bound is measured now, not quoted.** r413 ran twenty readings of ONE
+arm at 302 tokens on one boot with nothing changed: median 2130, range
+2110..2164, **spread 2.5%**. That is the floor a margin has to clear, and it is
+slightly LARGER than the 2.2% cross-boot figure this section used to quote. All
+eight rows clear their own spread, so the floor is what separates them.
+
+⚠ **852 does not clear it** (+2.1%) and stays level. ⚠ **602 is the thin row**:
++3.5% clears 2.5% by one point and a slightly stricter bound puts it back.
+
+🏁 **What moved 302 and 452 from level to ahead** is the attention threshold
+coming down from 320 to 272, re-derived against the arm that ships. 320 itself
+had the defect 448 had: it was measured in r412 section 2 on the r411 binary,
+and section 7 of the same round made that arm faster.
+
+⚠ **And the null control held.** The four rows below the threshold -- 27, 52,
+102, 202 -- run the SAME code in both arms, because attn_npu_get returns NULL
+before the mirror is built. They moved -0.3 to -1.4%, all inside the floor. If
+any of them had moved, this whole re-read would be suspect.
+
+⛔ **This table was overclaimed once**, when every point estimate favoured
+charsiu and it was written up as "completely surpassed" and withdrawn the same
+day. The difference is a measured floor, one row still level and one row thin.
+
 ### 1k. The ladder with the overlap work in: a lead under 250, level above
+
+⚠ **SUPERSEDED BY 1k-ii above**, which re-measured this on the shipping binary
+with five repeats and a measured noise floor. Kept as a dated reading.
+
 
 r411, shipping defaults, board to itself, three repeats a point, one warm-up
 discarded, all eight points on one boot.

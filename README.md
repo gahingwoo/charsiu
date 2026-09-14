@@ -18,41 +18,51 @@ only comparison here where nothing is quoted.
              does not, so the multiple is a function of the condition and not
              a property of either runtime.
 
-  prompt     two regimes, not one ratio. charsiu leads by 1.09x to 1.28x below
-             about 250 of its own tokens, and from 302 up the two are level:
+  prompt     ahead from 27 through 602 of its own tokens, and level at 852.
+             Five repeats a point, one boot, clock and governor pinned:
 
                  our tok    charsiu       range    their tok  vendor   verdict
-                      27        332   327..332           60     413    1.24x
-                      52        415   413..417           85     530    1.28x
-                     102        761   750..762          135     932    1.22x
-                     202       1400  1398..1401         235    1529    1.09x
-                     302       2131  2124..2134         335    2145    level
-                     452       3059  3037..3179         485    3195    level
-                     602       4115  4111..4156         635    4201    level
-                     852       5953  5948..5959         885    6027    level
+                      27        331   330..332           60     413    1.25x
+                      52        409   407..416           85     530    1.30x
+                     102        750   745..767          135     932    1.24x
+                     202       1395  1390..1402         235    1529    1.10x
+                     302       2045  2030..2050         335    2145    +4.9%
+                     452       2991  2974..3014         485    3195    +6.8%
+                     602       4060  4055..4072         635    4201    +3.5%
+                     852       5905  5892..5936         885    6027    level
 
              Their chat template costs a constant 33 tokens at every length, so
              each row is the same input text.
 
-             Every point estimate in the table favours charsiu, and four of the
-             eight are still written "level", because a margin has to clear two
-             things and those four clear neither:
+             A margin has to clear two things, and the first one is now
+             MEASURED rather than quoted:
 
-               the drift  their runtime needs their driver bound, so the two
-                          columns cannot share a boot, and the boot-to-boot
-                          drift of this same charsiu ladder was measured at
-                          2.2% at worst. 302 (+0.7%), 602 (+2.1%) and 852
-                          (+1.2%) are inside it.
-               the spread  452 is +4.4% over them and its own three readings
-                          span 142 ms, which is 4.6% of its median. A margin
-                          smaller than the arm's own spread at that point is
-                          not a margin.
+               the floor  their runtime needs their driver bound, so the two
+                          columns cannot share a boot. Twenty readings of ONE
+                          arm at 302 tokens on one boot, changing nothing,
+                          spanned 2.5% of their median. That is the floor a
+                          margin has to clear, and it is slightly larger than
+                          the 2.2% this table used to quote.
+               the spread  each row's own range, above. All eight clear their
+                          own spread; the floor is what separates them.
 
-             What did change: at 852 their lead was 1.34x before the fp16
+             ⚠ 852 is +2.1% and does not clear the floor, so it stays level.
+             ⚠ 602 is the thin row: +3.5% clears 2.5% by one point, and a
+             slightly stricter bound puts it back to level. 302 and 452 clear
+             comfortably.
+
+             What changed: at 852 their lead was 1.34x before the fp16
              attention arm became the default, 1.16x after it, 1.13x once the
              int4 accumulator work was done, 1.05x once the softmax ran during
              the fence, and level once the int4 accumulator gather ran during
-             it too. Level is the claim; ahead everywhere is not.
+             it too. 302 and 452 moved from level to ahead when the attention
+             threshold came down to 272, re-derived against the arm that ships.
+
+             ⛔ This table has been overclaimed once. Every point estimate
+             favoured charsiu then too, it was written up as "completely
+             surpassed", and it was withdrawn the same day. What is different
+             is that the floor is measured and that one row is still level and
+             one is thin. Both of those are part of the result.
 
   quality    charsiu's stored weights score 1.4x to 2.6x better in perplexity
              than theirs, against the same f16 original both were quantised
