@@ -83,3 +83,35 @@ charsiu_build() {
 	* ) echo "$_b" ;;
 	esac
 }
+
+# ⚠⚠⚠ TWO NAMES FOR ONE KNOB, AND PICKING THE WRONG ONE IS SILENT.
+#
+# Fifteen board scripts read CHARSIU_RUN and thirteen read CHARSIU_RUN_BIN.
+# Neither name is documented anywhere. A round that sets the one this script
+# does not read gets the INSTALLED binary instead, runs to completion, prints a
+# full table, and says nothing -- and deployment here IS "scp a binary under a
+# new name and point the knob at it", so the wrong arm is the normal failure
+# rather than an exotic one.
+#
+# The build line added in f699991 makes it visible after the fact, because the
+# binary now answers --version. This makes it not happen: whichever name is
+# set, both are, so whichever name the script reads it gets what was meant.
+#
+# ⚠ AND IF BOTH ARE SET TO DIFFERENT THINGS THAT IS A REFUSAL, not a
+# precedence rule. A precedence rule here would be a silent choice between two
+# binaries somebody deliberately named, which is the same failure one level up.
+if [ -n "${CHARSIU_RUN:-}" ] && [ -n "${CHARSIU_RUN_BIN:-}" ] &&
+   [ "$CHARSIU_RUN" != "$CHARSIU_RUN_BIN" ]; then
+	echo "" >&2
+	echo "⛔ CHARSIU_RUN AND CHARSIU_RUN_BIN ARE BOTH SET AND DIFFER." >&2
+	echo "     CHARSIU_RUN=$CHARSIU_RUN" >&2
+	echo "     CHARSIU_RUN_BIN=$CHARSIU_RUN_BIN" >&2
+	echo "   They are two names for one knob. Different scripts read" >&2
+	echo "   different ones, so this round would measure whichever this" >&2
+	echo "   script happens to read and would not say which." >&2
+	echo "" >&2
+	exit 1
+fi
+[ -z "${CHARSIU_RUN:-}" ] || CHARSIU_RUN_BIN="${CHARSIU_RUN_BIN:-$CHARSIU_RUN}"
+[ -z "${CHARSIU_RUN_BIN:-}" ] || CHARSIU_RUN="${CHARSIU_RUN:-$CHARSIU_RUN_BIN}"
+export CHARSIU_RUN CHARSIU_RUN_BIN 2>/dev/null || true

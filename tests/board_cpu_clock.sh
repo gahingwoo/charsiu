@@ -86,7 +86,14 @@ setfreq() {  # $1 = frequency, or the word "max"
 
 echo "== what the CPU clock is worth"
 echo "   boot id   $(cat /proc/sys/kernel/random/boot_id)"
-echo "   npu clk   $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null || cat /sys/kernel/debug/clk/aclk_rknn_root/clk_rate 2>/dev/null) Hz  (unchanged all round)"
+# ⚠ A MISSING CLOCK READS AS A CLOCK OF NOTHING. Inline, this printed a BLANK
+# between "npu clk" and "Hz" whenever debugfs came up unmounted, which is the
+# hole board_clk.sh was written to close and it cost a whole TTFT ladder. The
+# `||` did not help: it fires on a FAILED cat, so an empty file fell straight
+# through it. Test the value, and say "unknown" the way board_core_cost.sh does.
+_nc=$(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null)
+[ -n "$_nc" ] || _nc=$(cat /sys/kernel/debug/clk/aclk_rknn_root/clk_rate 2>/dev/null)
+echo "   npu clk   ${_nc:-unknown} Hz  (unchanged all round)"
 echo "   rail      $(awk '/vdd_npu_s0/{print $6; exit}' /sys/kernel/debug/regulator/regulator_summary 2>/dev/null)"
 echo "   accel     $(ls /dev/accel/ 2>/dev/null | tr '\n' ' ')$(ls /sys/bus/platform/drivers/RKNPU/ 2>/dev/null | grep -q npu && echo '(RKNPU bound)')"
 echo "   charsiu   $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
