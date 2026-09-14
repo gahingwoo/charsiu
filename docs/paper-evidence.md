@@ -1292,7 +1292,7 @@ same numerator is 32%. Four things are wrong with quoting it:
 - the five stage times it was fitted from exist in **no board log in either
   repository**. There is no round record for 2026-08-31, so the run behind it
   cannot be reproduced or checked;
-- its per task coefficient, 36.8 us, was refuted 48 hours later by round 152,
+- its per task coefficient, 36.8 us, was refuted eight days later by round 152,
   which measured a job directly at 16.85 us + 4.81 us a task on a matmul with
   no arithmetic in it. At 4.81 the share is **26%**;
 - the same fit was hand computed twice in one file on one day, from different

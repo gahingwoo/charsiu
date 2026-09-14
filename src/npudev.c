@@ -814,7 +814,7 @@ struct charsiu_npu {
 	 *   - the five stage times it was fitted from appear NOWHERE but this comment.
 	 *     There is no board log for 2026-08-31 in either repository, so the run
 	 *     behind it cannot be reproduced or checked;
-	 *   - its per task coefficient, 36.8 us, was refuted 48 hours later by round
+	 *   - its per task coefficient, 36.8 us, was refuted eight days later by round
 	 *     152, which measured a job at 16.85 us + 4.81 us a task on a matmul with
 	 *     no arithmetic in it. tools/charsiu_shapes.c already says the two "disagree
 	 *     by 8x on the task term and both cannot be right". With 4.81 the share is
@@ -2764,7 +2764,7 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * PLACE IN THE TREE WHERE A WITHDRAWN NUMBER IS STILL RUNNING.
  *
  * The line above is the 2026-08-31 hand computed stage fit. Its per task term
- * was refuted 48 hours later by round 152, which measured a job directly at
+ * was refuted eight days later by round 152, which measured a job directly at
  * 16.85 us + 4.81 us a task on a matmul with no arithmetic in it, and r412's
  * counter reads 7.7 us a task on gemma4 and 3.2 on gemma3. See the withdrawal
  * beside busy_us for the whole of it.
@@ -5443,7 +5443,9 @@ static int npu_noread(void)
  * of attention's fences together. Every lever on the gather ITSELF has been
  * measured and lost -- pooling is already on by size, the four row form lost
  * 2.3x, READ_FUSE 2.3% -- and what none of them touched is WHEN it runs. The
- * fence is a SLEEPING ioctl (CHARSIU_NPU_SPIN_US is 0 by default), so all four
+ * fence is a SLEEPING ioctl (CHARSIU_NPU_SPIN_US was 0 by default when this
+ * was written and is 200 since r411, so the thread polls first and falls back
+ * to the sleep on the 19% of waits it does not win), so all four
  * cores are idle for it, and CHARSIU_NPU_NO_READ=1 measured the ceiling for
  * moving it: 5450/5422 ms against 6931/6933 at 852 tokens.
  *
