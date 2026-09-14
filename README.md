@@ -224,6 +224,15 @@ which runs on a desk.
 
 It loads llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3 gguf files.
 
+Six of those seven have a model that has actually been run. `tests/arch_sanity.sh`
+now prints the architecture count separately from the file count, and it reads
+`6/6 ARCHITECTURES knew it: gemma3 gemma4 llama phi3 qwen2 qwen3`. **smollm3 is
+accepted by the loader and has never been exercised** — no smollm3 gguf is in
+either model directory, the smallest one the fetcher knows is SmolLM3-3B-Q4_0 at
+1727 MB, and neither machine has room for it: the desk is at 93% of 125 GB and
+the board's model partition has 1.1 GB free. Read the seven as what the loader
+accepts, not as seven architectures that have answered a question.
+
 ## It also sees, hears, and matches pictures to words
 
 A vision tower read out of llama.cpp's `mmproj` gguf, on the same primitives. A
