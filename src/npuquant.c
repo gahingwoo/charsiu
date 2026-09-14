@@ -33,7 +33,7 @@
 
 
 /*
- * ⚠⚠ FOUR BITS IN MEMORY, NOT EIGHT: WHAT t->q HOLDS, AND WHY THAT IS ONE BOOL.
+ * FOUR BITS IN MEMORY, NOT EIGHT: WHAT t->q HOLDS, AND WHY THAT IS ONE BOOL.
  *
  * t->q used to keep one whole int8_t per int4 code, which is a second copy of
  * every routed weight at DOUBLE the width of the gguf it was read from and
@@ -61,7 +61,7 @@
  * share of a split projection, nibble order included -- which is why that copy
  * is now a memcpy of the row instead of a gather.
  *
- * ⚠ ROW STRIDED, ((k + 1) / 2) BYTES A ROW, and NOT the flat (n*k + 1)/2 the
+ * ROW STRIDED, ((k + 1) / 2) BYTES A ROW, and NOT the flat (n*k + 1)/2 the
  * weight cache file used to hold. Three reasons, and the third is not a
  * preference:
  *
@@ -72,7 +72,7 @@
  *     npudev records what that costs when it is missed: "at k = 34 with groups
  *     of 17 the test measured 2.26 relative against 1e-6 elsewhere".
  *   - it makes e->cq a memcpy rather than a gather and a shift.
- *   - ⚠⚠ quant_rows RUNS ON THE THREAD POOL, SPLIT BY ROWS. Under flat packing
+ *   - quant_rows RUNS ON THE THREAD POOL, SPLIT BY ROWS. Under flat packing
  *     at an odd k the last code of row r and the first code of row r+1 share a
  *     byte, so two workers read-modify-write the same address and one of the
  *     two nibbles is lost -- silently, and only for the shapes nobody has.
@@ -83,7 +83,7 @@
  * whose k is a multiple of 32 because that is gguf's own block. Which is also
  * why the weight cache file did not change length for any model that has one.
  *
- * ⚠ AND IT IS A PROCESS WIDE CONSTANT, DELIBERATELY NARROWER THAN bits == 4.
+ * AND IT IS A PROCESS WIDE CONSTANT, DELIBERATELY NARROWER THAN bits == 4.
  *
  * npu_tensor_build picks four bits per TENSOR: CHARSIU_NPU_W4_ONLY narrows int4
  * to the tensors whose name contains a substring. npudev has to read q back and
@@ -100,7 +100,7 @@
  * function and that nothing per tensor can make disagree.
  */
 /*
- * ⚠⚠ AN EMPTY OR ZERO VALUE MEANS OFF, AND HERE IT DID NOT.
+ * AN EMPTY OR ZERO VALUE MEANS OFF, AND HERE IT DID NOT.
  *
  * npudev.c fixed exactly this for the device side and wrote down what it
  * cost: `!= NULL` makes CHARSIU_NPU_W4V= turn int4 ON, there is no way to get
@@ -124,7 +124,7 @@ static int w4_env(void)
 /*
  * "0-2", or "4": is this tensor's block inside that range?
  *
- * ⚠ UNSET OR EMPTY MEANS NO, NOT YES. Two knobs read this and both would be
+ * UNSET OR EMPTY MEANS NO, NOT YES. Two knobs read this and both would be
  * dangerous if an unparseable range quietly meant "everything": one of them
  * decides a tensor's WIDTH.
  *
@@ -198,7 +198,7 @@ static inline int q_at(const int8_t *row, uint64_t i, int pk)
 }
 
 /*
- * ⚠ EVEN COLUMNS ASSIGN, ODD COLUMNS OR, and that is what leaves a row fully
+ * EVEN COLUMNS ASSIGN, ODD COLUMNS OR, and that is what leaves a row fully
  * defined after ONE ascending pass over its columns. q is malloc'd and not
  * calloc'd, so a read-modify-write on the even half would be reading
  * uninitialised memory, and at an odd k it would also leave the row's trailing
@@ -234,14 +234,14 @@ static inline void q_put(int8_t *row, uint64_t i, int v, int pk)
  * quantising. On the test SD card it is closer to a wash, which is why round
  * 356 measures the card as well.
  *
- * ⚠ IT MUST NEVER SILENTLY DISAGREE WITH THE CODE. The header carries a format
+ * IT MUST NEVER SILENTLY DISAGREE WITH THE CODE. The header carries a format
  * version, the quantiser's own version, the bit width, the group size and a
  * stamp of the model file, and every record re-checks n, k and the group count.
  * Anything that does not match rebuilds from scratch rather than being patched
  * up: a cache that is subtly wrong is worse than no cache, because the failure
  * shows up as a slightly wrong sentence rather than as an error.
  *
- * ⚠ THE RECORD IS A STRAIGHT COPY OF q, which is what it was not. It used to
+ * THE RECORD IS A STRAIGHT COPY OF q, which is what it was not. It used to
  * pack the nibbles on the way out and unpack them on the way back in, because
  * q was one byte a code in memory and half that in the file; now that q is
  * packed itself the record is an fwrite and the read is an fread. That is the
@@ -249,7 +249,7 @@ static inline void q_put(int8_t *row, uint64_t i, int v, int pk)
  * gemma-3-1b's 999 751 680 codes came back in 710 to 1054 ms of staging when
  * every one of them had to be widened on the way in, and in 85 to 93 ms now.
  *
- * ⚠⚠ WHICH MEANS THE WIDTH IS PART OF THE KEY. A cache written when q was one
+ * WHICH MEANS THE WIDTH IS PART OF THE KEY. A cache written when q was one
  * byte a code cannot be read by a build that packs it -- at an odd k the two
  * are not even the same length -- so npu_q_packed() goes into the group word
  * below. int8 caches are untouched by any of this and stay valid.
@@ -266,7 +266,7 @@ static int midrise_grid(void)
 
 #define WCACHE_MAGIC  0x43535743u        /* "CSWC" */
 #define WCACHE_FORMAT 1u
-/* ⚠ BUMP THIS whenever the quantiser's arithmetic changes, or an old cache
+/* BUMP THIS whenever the quantiser's arithmetic changes, or an old cache
  * will quietly feed the new code the old numbers.
  *
  * 2 -> 3 on 2026-09-08: int8 now writes one scale a row where it used to write
@@ -294,7 +294,7 @@ static struct {
 } wc;
 
 /*
- * ⚠ THE CACHE IS ONE SEQUENTIAL FILE AND ONE STATIC HANDLE. Records go in in
+ * THE CACHE IS ONE SEQUENTIAL FILE AND ONE STATIC HANDLE. Records go in in
  * the order the tensors are built and come back in the same order, so two
  * graphs staging into it at once would interleave and neither could read the
  * result. That was fine while the language model was the only thing that
@@ -331,7 +331,7 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 	if (!path || !*path)
 		return;
 	/*
-	 * ⚠ THE CACHE HEADER HOLDS ONE `bits` FOR THE WHOLE FILE, and
+	 * THE CACHE HEADER HOLDS ONE `bits` FOR THE WHOLE FILE, and
 	 * wcache_read validates a record's name, n, k and ngrp but not its
 	 * width. That is safe while every tensor has the same width and is not
 	 * safe the moment they do not, so a mixed model does not use the cache
@@ -470,7 +470,7 @@ bad:
  * already has -- and a cold start was 7.9 seconds of it on the board, on one
  * core, while three sat idle.
  *
- * ⚠ THE ONE THING THAT DOES CROSS ROWS is the squared error the --info
+ * THE ONE THING THAT DOES CROSS ROWS is the squared error the --info
  * diagnostic accumulates, so a run that asks for it stays serial rather than
  * growing a lock for a number nothing in the decode reads.
  */
@@ -482,7 +482,7 @@ struct qrows {
 	float qmax;
 	int w4sym, w4clip, rms, midrise;
 	/*
-	 * ⚠ THE ROW STRIDE IS NOT k ANY MORE. Read once here rather than per
+	 * THE ROW STRIDE IS NOT k ANY MORE. Read once here rather than per
 	 * row: npu_q_stride goes through npu_q_packed, which is a getenv behind
 	 * a static, and this struct is what the whole quantiser reads its
 	 * constants out of for exactly that reason.
@@ -546,7 +546,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 		 * one direction.
 		 */
 		/*
-		 * ⚠ USE ALL SIXTEEN LEVELS. amax/7 is symmetric and throws away
+		 * USE ALL SIXTEEN LEVELS. amax/7 is symmetric and throws away
 		 * -8, which is one level of the sixteen a nibble has -- and
 		 * q4_0, the yardstick this is measured against, takes the
 		 * element of largest magnitude and divides by -8 so the range is
@@ -574,7 +574,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 			 * 0.5 * d * sum(a), one number a channel a token, which
 			 * npudev adds at the accumulate.
 			 *
-			 * ⛔ AND IT MEASURED WORSE, so it is OFF by default and
+			 * AND IT MEASURED WORSE, so it is OFF by default and
 			 * kept only as the record of a refuted idea. On the
 			 * host with the real model:
 			 *
@@ -587,7 +587,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 			 *   MIDRISE g1024  "the total number of employees of
 			 *                   the company is the total number"
 			 *
-			 * ⚠ AND THE NEGATIVE WAS PREDICTABLE, which is the part
+			 * AND THE NEGATIVE WAS PREDICTABLE, which is the part
 			 * worth remembering. A grid with no zero forces every
 			 * near zero weight to +-0.5d, and network weights are
 			 * strongly peaked at zero, so midtread beats midrise on
@@ -605,7 +605,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 		} else if (bits == 4 && !w4sym) {
 			d = vmax / -8.0f;
 			/*
-			 * ⚠ absmax IS THE WRONG SCALE FOR FOUR BITS, and it is
+			 * absmax IS THE WRONG SCALE FOR FOUR BITS, and it is
 			 * the cheapest thing to fix. One outlier in two thousand
 			 * weights sets the step for all of them, so every other
 			 * weight rounds into a grid that is far too coarse.
@@ -617,7 +617,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 			 * -- and nothing changes on the hardware. This is the
 			 * cheap half of what a calibrating quantiser does.
 			 *
-			 * ⚠ MEASURED AND IT IS WORSE: KL went 0.0989 to 0.2084
+			 * MEASURED AND IT IS WORSE: KL went 0.0989 to 0.2084
 			 * and 0.3660 to 0.5535 on two prompts. Minimising the
 			 * WEIGHT error clips exactly the large weights that
 			 * carry the output, which is why AWQ and GPTQ optimise
@@ -673,7 +673,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 			q_put(dst, i, v, pk);
 			sum += v;
 			/*
-			 * ⚠ A DIAGNOSTIC, AND IT COSTS ABOUT 3%. I guessed a
+			 * A DIAGNOSTIC, AND IT COSTS ABOUT 3%. I guessed a
 			 * third before measuring it, and three repeats on the
 			 * real model say 3.37 ns a weight against 3.46. Two
 			 * doubles multiplied and accumulated for every
@@ -701,7 +701,7 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 }
 
 /*
- * ⚠ CHARSIU_W4_FILE IS ONE BYTE A CODE AND q MAY NOT BE. The offline format is
+ * CHARSIU_W4_FILE IS ONE BYTE A CODE AND q MAY NOT BE. The offline format is
  * documented below as n*k signed bytes and nothing about it changes here -- a
  * file prepared by tools/gptq.py months ago still loads -- so the rows are read
  * one at a time into a k byte scratch and packed on the way in. The straight
@@ -735,7 +735,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	double se = 0.0, sw = 0.0;
 
 	/*
-	 * ⚠ THE AWQ PAIR, SET HERE RATHER THAN ASSUMED OF THE CALLER. Both
+	 * THE AWQ PAIR, SET HERE RATHER THAN ASSUMED OF THE CALLER. Both
 	 * callers today hand this a zeroed tensor -- npupool calloc's its
 	 * array and npu_slice_test writes `= { 0 }` -- and the factor is only
 	 * ever allocated further down, so nothing is leaked by this.
@@ -752,7 +752,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	t->kshash = 0;
 
 	/*
-	 * ⚠ THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
+	 * THE ACCURACY QUESTION int4 HAS TO ANSWER BEFORE IT IS WORTH WIRING
 	 * IN. The hardware's coefficient buffer carries ONE multiplier per
 	 * output channel, so charsiu's NPU weights are quantised per channel --
 	 * fine at eight bits, and q4_0 uses a scale every 32 weights precisely
@@ -795,7 +795,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	uint64_t grp = getenv("CHARSIU_NPU_W4_GROUP")
 		? (uint64_t)atoi(getenv("CHARSIU_NPU_W4_GROUP")) : k;
 	/*
-	 * ⚠⚠ READ ONCE. These two sat inside loops over every weight in the
+	 * READ ONCE. These two sat inside loops over every weight in the
 	 * tensor, and getenv walks the environment with a strcmp per entry.
 	 * Round 354's heartbeat split settled where 114 to 144 seconds of
 	 * staging went: 4 to 5 s inside charsiu_npu_add and ALL THE REST in
@@ -814,7 +814,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	if (grp == 0 || grp > k)
 		grp = k;
 	/*
-	 * ⚠⚠ A PARTIAL LAST GROUP IS QUANTISED HERE AND CONSUMED AS THOUGH IT
+	 * A PARTIAL LAST GROUP IS QUANTISED HERE AND CONSUMED AS THOUGH IT
 	 * DID NOT EXIST. npudev's tensor_grouped() requires k % kgroup == 0, so
 	 * a tensor with a remainder is treated as UNGROUPED and its scales are
 	 * read as scale[row] -- but this had already written them as
@@ -833,7 +833,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	if (k % grp)
 		grp = k;
 	/*
-	 * ⚠⚠ AND THE SAME DISAGREEMENT AGAIN, ON THE OTHER SIDE OF bits.
+	 * AND THE SAME DISAGREEMENT AGAIN, ON THE OTHER SIDE OF bits.
 	 *
 	 * tensor_grouped() also requires g->w4. So an INT8 tensor whose k
 	 * divides the group exactly walks past the remainder collapse above,
@@ -861,7 +861,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	ngrp = (k + grp - 1) / grp;
 
 	/*
-	 * ⚠ THE k FACTOR, and why it is free.
+	 * THE k FACTOR, and why it is free.
 	 *
 	 * charsiu reads the RAW int32 accumulator (acc_out), so the hardware's
 	 * per channel multiplier is not in the path at all: the dequantise
@@ -880,7 +880,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * root balance and is what this tree used from the day the factor was
 	 * written; it is NOT the best value here.
 	 *
-	 * ⚠ THE EXPONENT WAS NEVER SWEPT. Every earlier experiment pinned it
+	 * THE EXPONENT WAS NEVER SWEPT. Every earlier experiment pinned it
 	 * at 0.5 and moved the clamp instead. Swept with the clamp held at the
 	 * default OF THE DAY, 2.0 -- qwen3, host CPU reference, 500 tokens --
 	 * it is a clean single minimum and 0.5 is on the wrong side of it:
@@ -891,7 +891,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * 65.12 against 76.36 is 14.7%, and the same ordering holds on the
 	 * shorter corpus at 200 tokens (68.07 against 73.77).
 	 *
-	 * ⚠ THE MINIMUM IS PER MODEL. Llama-3.2-1B, its own calibration, same
+	 * THE MINIMUM IS PER MODEL. Llama-3.2-1B, its own calibration, same
 	 * corpus and length: off 52.34, then
 	 *
 	 *   alpha  0.20   0.25   0.30   0.35   0.40   0.50   0.65
@@ -901,7 +901,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * per model; what both models agree on is only that 0.5 is past the
 	 * minimum.
 	 *
-	 * ⛔ "WORSE THAN OFF AT 0.5" IS AN ARTEFACT OF THE CLAMP, and so is
+	 * "WORSE THAN OFF AT 0.5" IS AN ARTEFACT OF THE CLAMP, and so is
 	 * every number in the two grids above: the clamp binds from alpha 0.10
 	 * upward at the 2.0 they were measured through, so they are the
 	 * exponent and the bound together. With it truly inert -- hi >= 31.6,
@@ -914,7 +914,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * comment below. What survives unchanged is that 0.5 is past the
 	 * minimum, which is 0.20 to 0.25 on both models.
 	 *
-	 * ⚠⚠ "ITS MINIMUM IS 0.20" WAS THE FLOOR OF THAT GRID. Swept downward
+	 * "ITS MINIMUM IS 0.20" WAS THE FLOOR OF THAT GRID. Swept downward
 	 * on tests/corpus at 300 tokens, Llama reads off 41.5289, 0.10
 	 * 33.7566, 0.15 32.5094, 0.20 35.2041 -- and qwen3's row at the same
 	 * length is NOT monotone, with a band from 0.12 to 0.15 that is worse
@@ -936,14 +936,14 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * factor cannot share a packed input, so grouped q/k/v drop to single
 	 * calls -- so WHERE it can be switched off is worth a knob.
 	 *
-	 * ⚠ THAT DECODE COST IS NOW OPTIONAL. q, k and v of one layer read the
+	 * THAT DECODE COST IS NOW OPTIONAL. q, k and v of one layer read the
 	 * same normed input and therefore carry the SAME factor, so the group
 	 * can share after all; CHARSIU_NPU_AWQ_SHARE=1 lets it, guarded by the
 	 * factor's hash so a group whose factors differ still refuses aloud.
 	 * On the board it gives identical tokens and 13.92 -> 14.33 tok/s. It
 	 * is off by default because the guard is younger than the path.
 	 *
-	 * ⚠ UNSET OR EMPTY MEANS EVERY LAYER, which is what AWQ did before
+	 * UNSET OR EMPTY MEANS EVERY LAYER, which is what AWQ did before
 	 * this existed. A range this cannot parse must not quietly turn the
 	 * method off: the arm that says "AWQ on" would then be the arm with
 	 * AWQ off, and this tree has already run four of those.
@@ -963,7 +963,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * CONTAINS a substring -- "ffn_down", "attn", "ffn" -- which is the
 	 * other axis the LAYERS knob does not cover.
 	 *
-	 * ⚠⚠ IT IS A PROBE FOR ONE QUESTION AND THE QUESTION IS WORTH SAYING.
+	 * IT IS A PROBE FOR ONE QUESTION AND THE QUESTION IS WORTH SAYING.
 	 * The exponent's ppl curve has a BAND where it is worse than on either
 	 * side (qwen3, 0.12 to 0.15, reproduced on two independent passages),
 	 * and the band is an ordinary local maximum of a continuous curve: AWQ
@@ -974,12 +974,12 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * curves whose optima sit in different places -- which is exactly how
 	 * a global value lands in a region bad for many tensors at once.
 	 *
-	 * 🔑 The vendor chooses alpha PER TENSOR: 0.00 to 0.40, typically 0.03
+	 * The vendor chooses alpha PER TENSOR: 0.00 to 0.40, typically 0.03
 	 * to 0.15, read out of its own .rkllm. This knob is how a desk asks
 	 * whether the optima really do differ by tensor kind before anybody
 	 * writes a per-tensor search.
 	 *
-	 * ⚠ UNSET OR EMPTY MEANS EVERY TENSOR, the same rule the LAYERS knob
+	 * UNSET OR EMPTY MEANS EVERY TENSOR, the same rule the LAYERS knob
 	 * has and for the same reason: a filter this cannot satisfy must not
 	 * quietly turn the method off, or the arm that says "AWQ on" is the
 	 * arm with AWQ off.
@@ -1000,7 +1000,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * turns the method off for that kind, which is a setting one kind
 	 * actually wants.
 	 *
-	 * ⚠⚠ IT EXISTS BECAUSE THE PER-KIND TABLE CANNOT BE ASSEMBLED FROM ITS
+	 * IT EXISTS BECAUSE THE PER-KIND TABLE CANNOT BE ASSEMBLED FROM ITS
 	 * OWN ROWS. Sweeping CHARSIU_NPU_AWQ_ONLY one kind at a time measures
 	 * each kind AGAINST AWQ-OFF EVERYWHERE ELSE, and the best cell of each
 	 * row is not the best combination -- the tensors compose. The table
@@ -1009,13 +1009,13 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * attn_q, and attn_k never wins at all); this is what turns that into
 	 * something that can be run and scored.
 	 *
-	 * 🔑 And it is the shape the vendor ships: alpha per tensor, 0.00 to
+	 * And it is the shape the vendor ships: alpha per tensor, 0.00 to
 	 * 0.40, typically 0.03 to 0.15, read out of its own .rkllm.
 	 *
-	 * ⚠ FIRST MATCH WINS, so order the entries most specific first.
+	 * FIRST MATCH WINS, so order the entries most specific first.
 	 * "attn_q" before "attn" -- otherwise "attn" swallows all four.
 	 *
-	 * ⚠ A MALFORMED ENTRY MUST NOT QUIETLY MEAN OFF. atof of nonsense
+	 * A MALFORMED ENTRY MUST NOT QUIETLY MEAN OFF. atof of nonsense
 	 * returns 0.0, which would silently disable AWQ for that kind and make
 	 * "AWQ on" the arm with AWQ off -- this tree has run four of those. An
 	 * entry with no '=' is skipped rather than parsed.
@@ -1050,7 +1050,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	}
 
 	/*
-	 * ⚠⚠ AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
+	 * AND IT IS A FOUR BIT METHOD, ON A PATH THAT CANNOT SAY SO.
 	 *
 	 * The factor only cancels because the weights are divided by it and the
 	 * activation is multiplied by it. charsiu_npu_matvec does that multiply
@@ -1091,18 +1091,18 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	row = malloc((size_t)k * sizeof(float));
 	if (!t->q || !t->scale || !t->wsum || !row) {
 		/*
-		 * ⚠ SAY WHICH TENSOR AND HOW MUCH. This returns -1 into a
+		 * SAY WHICH TENSOR AND HOW MUCH. This returns -1 into a
 		 * caller that returns NULL into a matvec that quietly runs on
 		 * the CPU, so a tensor whose quantised copy would not fit
 		 * looked exactly like a tensor nobody had asked to route.
 		 *
-		 * ⚠ AND THE FIGURE IS THE REAL ONE NOW. The copy used to be one
+		 * AND THE FIGURE IS THE REAL ONE NOW. The copy used to be one
 		 * BYTE a weight whatever the bit width, so gemma3's 262144 by
 		 * 1152 output head asked for 302 MB even at four bits and this
 		 * line said so, while npudev's own weight_mb for the same tensor
 		 * said 151. It is 151 in both places now.
 		 *
-		 * ⚠ WHICH DOES NOT MEAN THE HEAD IS ROUTED. It is refused by the
+		 * WHICH DOES NOT MEAN THE HEAD IS ROUTED. It is refused by the
 		 * maxn gate in charsiu_pool_get long before this, and that is
 		 * still 44% of a gemma token on the CPU -- this line is only
 		 * about what the message claims when the malloc is what fails.
@@ -1117,7 +1117,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	}
 
 	/*
-	 * ⚠ THE CACHE IS SKIPPED WHENEVER SOMETHING ELSE DECIDES THE WEIGHTS.
+	 * THE CACHE IS SKIPPED WHENEVER SOMETHING ELSE DECIDES THE WEIGHTS.
 	 * AWQ folds a per k factor into them and keeps it in t->kscale, and
 	 * CHARSIU_W4_FILE replaces them outright; neither is in the record, so
 	 * caching either would store weights that cannot be reproduced from
@@ -1158,7 +1158,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		}
 		if (!got) {
 			/*
-			 * ⚠⚠ AND THIS FALLBACK IS THE REFUTED VARIANT, SAID OUT
+			 * AND THIS FALLBACK IS THE REFUTED VARIANT, SAID OUT
 			 * LOUD. The column means of |w| are what the first
 			 * version of AWQ used here, and the note further down
 			 * records why they are wrong: the weights worth
@@ -1170,7 +1170,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			static int said;
 
 			/*
-			 * ⚠⚠ AND IT IS WORSE THAN NOT RUNNING AWQ AT ALL, so
+			 * AND IT IS WORSE THAN NOT RUNNING AWQ AT ALL, so
 			 * warning was not enough. Llama-3.2-1B, host CPU
 			 * reference, 300 tokens:
 			 *
@@ -1224,7 +1224,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		t->kscale = malloc((size_t)k * sizeof(float));
 		if (!t->kscale) { free(col); free(row); npu_tensor_free(t); return -1; }
 		/*
-		 * ⚠ FLOOR THE STATISTIC AND CLAMP THE FACTOR. The first version
+		 * FLOOR THE STATISTIC AND CLAMP THE FACTOR. The first version
 		 * did neither and produced KL of 8 to 12, which is not a method
 		 * failing, it is a divide by nearly zero: a k whose mean |x| is
 		 * tiny gets a tiny factor, the weights of that column are
@@ -1237,7 +1237,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			const char *fl = getenv("CHARSIU_NPU_AWQ_FLOOR");
 			double awq_floor = fl && *fl ? atof(fl) : 1e-3;
 
-			/* ⚠ A FLOOR OF 0 OR LESS IS NOT "no floor", IT IS A
+			/* A FLOOR OF 0 OR LESS IS NOT "no floor", IT IS A
 			 * DIVIDE BY NEARLY ZERO -- the fault this exists to
 			 * prevent. An unusable value keeps the default rather
 			 * than silently disabling the guard. */
@@ -1247,7 +1247,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 				mean += col[i];
 			mean /= (double)n * (double)k;
 			/*
-			 * ⚠⚠ THE FLOOR IS THE OTHER BOUND ON THE FACTOR, AND IT
+			 * THE FLOOR IS THE OTHER BOUND ON THE FACTOR, AND IT
 			 * IS THE ONE NOBODY HAS EVER SWEPT.
 			 *
 			 * Flooring the statistic at `floor * mean` bounds the
@@ -1255,7 +1255,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			 * so at the shipped 1e-3 the factor can never exceed
 			 * 1000^alpha: 2.82 at alpha 0.15, 5.62 at 0.25.
 			 *
-			 * 🔑 That is measurable two ways and they agree. Widen
+			 * That is measurable two ways and they agree. Widen
 			 * CHARSIU_NPU_AWQ_CLAMP and the perplexity STOPS MOVING
 			 * once hi passes the bound, because the clamp is no
 			 * longer the tighter of the two: Llama at alpha 0.15
@@ -1263,7 +1263,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			 * straight off the statistics file, the largest factor
 			 * in that model is 2.806.
 			 *
-			 * ⚠ AND IT IS THE FLOOR THAT BINDS, NOT THE DATA. Llama
+			 * AND IT IS THE FLOOR THAT BINDS, NOT THE DATA. Llama
 			 * and Qwen3 have the SAME maximum factor at the same
 			 * alpha -- 2.806 against 2.784 at 0.15, 5.581 against
 			 * 5.508 at 0.25 -- because both are pinned here rather
@@ -1271,7 +1271,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 			 * differently on the two models" was never true; they
 			 * were being measured at different alphas.
 			 *
-			 * ⚠ The clamp only does anything while hi < (1/floor)^
+			 * The clamp only does anything while hi < (1/floor)^
 			 * alpha. Above that it is inert and the floor is the
 			 * whole bound.
 			 */
@@ -1281,7 +1281,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 				if (v < awq_floor * mean)
 					v = awq_floor * mean;
 				/*
-				 * ⚠⚠ NEGATIVE, AND THAT IS THE WHOLE METHOD.
+				 * NEGATIVE, AND THAT IS THE WHOLE METHOD.
 				 *
 				 * quant_rows DIVIDES the weights by this factor
 				 * and the activation is MULTIPLIED by it, so
@@ -1303,7 +1303,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		gm = exp(gm / (double)k);            /* keep the mean factor at 1 */
 		{
 		/*
-		 * ⚠⚠ THE CLAMP IS 64x WIDE AND THAT IS THE SUSPECT.
+		 * THE CLAMP IS 64x WIDE AND THAT IS THE SUSPECT.
 		 *
 		 * The factor divides the weights: a k with f = 0.125 has its
 		 * column multiplied by EIGHT before rounding. One such column
@@ -1323,7 +1323,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * written, so the factor lived in [0.5, 2].
 		 */
 		/*
-		 * ⚠⚠ THE DEFAULT MOVED 2.0 -> 6.0 ON 2026-09-10, AND EVERY AWQ
+		 * THE DEFAULT MOVED 2.0 -> 6.0 ON 2026-09-10, AND EVERY AWQ
 		 * NUMBER RECORDED BEFORE THAT DATE WAS MEASURED AT 2.0.
 		 * `CHARSIU_NPU_AWQ_CLAMP=2.0` reproduces all of them exactly.
 		 *
@@ -1349,12 +1349,12 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 		 * At the recommended exponent that is 35.20 -> 28.04, and
 		 * against AWQ off the method goes from -15% to -32%.
 		 *
-		 * ⚠ The one row 2.0 wins is 0.65, where every arm is unusable
+		 * The one row 2.0 wins is 0.65, where every arm is unusable
 		 * -- off is 41.5289 and the best of the three is 72.17. A
 		 * default should not be chosen on the behaviour of a setting
 		 * nobody should reach.
 		 *
-		 * ⚠ AND THE CLAMP IS NON-MONOTONE UP THERE: at 0.65, hi=6.0 is
+		 * AND THE CLAMP IS NON-MONOTONE UP THERE: at 0.65, hi=6.0 is
 		 * worse than hi=2.0 AND worse than not clamping. Noted, not
 		 * explained, and off the map.
 		 */
@@ -1503,7 +1503,7 @@ static int32_t idot(const int8_t *w, const int8_t *x, uint64_t n)
  * THE SAME DOT PRODUCT AGAINST A PACKED ROW: sum over [lo, lo+len) of
  * code(row, i) * x[i], with row and x both indexed by absolute column.
  *
- * ⚠⚠ THIS IS THE FALLBACK, WHICH IS THE ONE THAT HAS TO BE RIGHT. Everything
+ * THIS IS THE FALLBACK, WHICH IS THE ONE THAT HAS TO BE RIGHT. Everything
  * routed to the hardware can arrive back here at run time -- a width the batch
  * refuses, a buffer object that would not allocate, a job that timed out -- and
  * llama.c's matvec_again takes that path SILENTLY on purpose, because a run
@@ -1511,7 +1511,7 @@ static int32_t idot(const int8_t *w, const int8_t *x, uint64_t n)
  * answering. Which means a reader one nibble out of step with q_put would not
  * raise anything. It would answer, in whole sentences, slightly wrong.
  *
- * ⚠ THE VECTOR PATH READS BYTE i/2 AND TAKES ITS LOW NIBBLE AS COLUMN i, so it
+ * THE VECTOR PATH READS BYTE i/2 AND TAKES ITS LOW NIBBLE AS COLUMN i, so it
  * only means that when the start is EVEN. Groups begin at multiples of
  * CHARSIU_NPU_W4_GROUP, which is 1024 on the board and even at every shape this
  * has ever run -- but an odd group size that divides an odd k starts a group on
@@ -1565,7 +1565,7 @@ static int32_t qdot(const int8_t *row, const int8_t *x, uint64_t lo,
 }
 
 /*
- * ⚠ THE k FACTOR HAS TO COME FROM THE ACTIVATIONS, NOT THE WEIGHTS.
+ * THE k FACTOR HAS TO COME FROM THE ACTIVATIONS, NOT THE WEIGHTS.
  *
  * The first version of this took the column means of |w| and it made the KL
  * worse. That is not AWQ: AWQ's whole claim is that the weights worth
@@ -1588,7 +1588,7 @@ void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
 	t->acalls++;
 
 	/*
-	 * ⚠ THE ONE MEASUREMENT THAT DECIDES WHETHER GPTQ IS WORTH DAYS.
+	 * THE ONE MEASUREMENT THAT DECIDES WHETHER GPTQ IS WORTH DAYS.
 	 *
 	 * GPTQ's whole premise is that the activations are CORRELATED, so the
 	 * error made rounding one weight can be pushed onto the others through
@@ -1603,7 +1603,7 @@ void npu_calib_note(struct npu_tensor *t, const struct charsiu_act *a)
 	 * means.
 	 */
 	/*
-	 * ⚠ VECTORS, NOT THE COVARIANCE. GPTQ needs H = X^T X, and at k = 8192
+	 * VECTORS, NOT THE COVARIANCE. GPTQ needs H = X^T X, and at k = 8192
 	 * that matrix is 512 MB per tensor in doubles, while the vectors it is
 	 * built from are 8 MB. Keep the vectors, build H offline where numpy
 	 * has BLAS: a Cholesky at k = 8192 is 5.5e11 flops and does not belong
@@ -1641,11 +1641,11 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 	 * one multiply a k before the pack; here it is done straight so the
 	 * measurement is honest.
 	 *
-	 * ⚠ PER CALL, NOT static. npu_matvec runs on the worker threads, and a
+	 * PER CALL, NOT static. npu_matvec runs on the worker threads, and a
 	 * static scratch buffer here was a race and a double free: three of
 	 * the five exponents in the first sweep produced no output at all.
 	 *
-	 * ⚠⚠ AND IT WAS PER ROW, WHICH THE PARAGRAPH ABOVE ALREADY SAID IT
+	 * AND IT WAS PER ROW, WHICH THE PARAGRAPH ABOVE ALREADY SAID IT
 	 * SHOULD NOT BE. The scaled activation depends on `a` and on
 	 * `t->kscale` and on nothing else -- `r` does not appear in it -- so
 	 * every row of a tensor was mallocing k bytes, taking a maximum over
@@ -1696,7 +1696,7 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		double acc = 0.0;
 
 		/*
-		 * ⚠ WHAT PRECISION IS THE ACTIVATION, REALLY.
+		 * WHAT PRECISION IS THE ACTIVATION, REALLY.
 		 *
 		 * charsiu's int4 path already tells the hardware 16 bit
 		 * activations: charsiu_effective_adtype returns FP16 and 0x100c
@@ -1740,7 +1740,7 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 				: (double)idot(qr + lo, aq + lo, len);
 
 			/*
-			 * ⚠ THE MIDRISE HALF STEP BELONGS HERE TOO. This is the
+			 * THE MIDRISE HALF STEP BELONGS HERE TOO. This is the
 			 * CPU reference for the same weights, and it computed
 			 * sum(s * a) while scaling by a d that means
 			 * w = (s + 0.5) * d. The first host test of the grid
@@ -1759,7 +1759,7 @@ void npu_matvec(const struct npu_tensor *t, const struct charsiu_act *a,
 		}
 		y[n] = (float)(acc * ad);
 	}
-	/* ⚠ ONCE, AFTER THE LOOP. It used to be freed at the bottom of every
+	/* ONCE, AFTER THE LOOP. It used to be freed at the bottom of every
 	 * iteration, which was consistent with allocating at the top of every
 	 * iteration and is a double free the moment either one moves. */
 	free(free_after);
@@ -1836,7 +1836,7 @@ void npu_quantise_output(struct npu_tensor *t, float *y, uint64_t n, int mode,
 		}
 		d = t->out_scale;
 		/*
-		 * ⚠⚠ MODE 4: THE FROZEN PART IS PER CHANNEL, THE MOVING PART
+		 * MODE 4: THE FROZEN PART IS PER CHANNEL, THE MOVING PART
 		 * IS THE ACTIVATION'S OWN SCALE.
 		 *
 		 * The note above says a coefficient buffer cannot look at the

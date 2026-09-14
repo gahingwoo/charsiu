@@ -10,14 +10,14 @@
 # vendor's driver. Their protocol is a 128 token prompt and 64 new tokens, so
 # that is what this runs.
 #
-# ⚠⚠ THEIR NUMBERS ARE AT MAXIMUM CPU AND NPU FREQUENCY. Their own header says
+# THEIR NUMBERS ARE AT MAXIMUM CPU AND NPU FREQUENCY. Their own header says
 # so: "collected based on the maximum CPU and NPU frequencies of each platform",
 # with a script in their repo to set them. This runs at whatever the governor is
 # doing, which on an idle board is ondemand. That is not a small difference and
 # it is not one to quietly leave out of a comparison -- CHARSIU_BENCH_PERF=1
 # sets the performance governor first and says it did.
 #
-# ⚠ AND w4a16 IS THEIR int4, WHICH IS OURS. w4a16_g128 is a finer group size
+# AND w4a16 IS THEIR int4, WHICH IS OURS. w4a16_g128 is a finer group size
 # and w8a8 is int8; the rows compared here are w4a16 against CHARSIU_NPU_W4V=1.
 #
 # CHARSIU_BENCH_W4V=0 scores our w8a8 instead, which is a different question and
@@ -31,7 +31,7 @@
 #   sh tests/board_vendor.sh
 set -eu
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -42,7 +42,7 @@ REPEAT=${CHARSIU_BENCH_REPEAT:-1}
 W4V=${CHARSIU_BENCH_W4V:-1}
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$DIR"
-# ⚠⚠ PRICING THE CORRECTNESS FIX, AND THIS ARM RETURNS WRONG TEXT.
+# PRICING THE CORRECTNESS FIX, AND THIS ARM RETURNS WRONG TEXT.
 #
 # The two NPU cores corrupt each other when their batched submits overlap --
 # phi3 at width 24 came back wrong 13 runs of 16 overlapped and 0 of 16
@@ -57,7 +57,7 @@ PRICE_ENV=""
 if [ -n "${CHARSIU_VENDOR_PRICE_SERIAL:-}" ]; then
 	PRICE_ENV="CHARSIU_NPU_BATCH_PARALLEL=1"
 	echo "======================================================================"
-	echo "⚠⚠ CHARSIU_VENDOR_PRICE_SERIAL: the two cores' submits OVERLAP in"
+	echo "CHARSIU_VENDOR_PRICE_SERIAL: the two cores' submits OVERLAP in"
 	echo "   this round. That is the configuration measured wrong 13 runs of"
 	echo "   16 on phi3. EVERY NUMBER BELOW IS THE SPEED OF A POSSIBLY WRONG"
 	echo "   ANSWER, and exists only to price what serialising costs."
@@ -68,7 +68,7 @@ if [ -n "${CHARSIU_VENDOR_PRICE_SERIAL:-}" ]; then
 fi
 
 #
-# ⚠⚠ RESOLVE PER FILE, NOT PER DIRECTORY. This picked $HOME/.charsiu/models
+# RESOLVE PER FILE, NOT PER DIRECTORY. This picked $HOME/.charsiu/models
 # whenever that directory merely EXISTED, and on a board where `charsiu pull`
 # had put gemma4 there while the installer had put the other three in
 # /opt/charsiu/models, the table came back saying "charsiu pull" for models
@@ -79,7 +79,7 @@ MODELS=${CHARSIU_MODELS:-$HOME/.charsiu/models}
 ALTMODELS=/opt/charsiu/models
 [ -d "$MODELS" ] || MODELS=$ALTMODELS
 
-# ⚠ CHARSIU_RUN_BIN, so the shell around the table can be exercised without a
+# CHARSIU_RUN_BIN, so the shell around the table can be exercised without a
 # board. The repeat loop below went in untested because a missing model takes a
 # different branch and a present-but-empty one takes the failure branch, so
 # neither reaches it; a stand-in binary that prints one [load ...] line does.
@@ -89,7 +89,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-# ⚠ THE PULL NAME IS IN THE ROW, because "not here" without it is a dead end:
+# THE PULL NAME IS IN THE ROW, because "not here" without it is a dead end:
 # the zoo's name and the file's name are not the same string and nobody should
 # have to grep charsiu-get to find out which to type.
 #
@@ -103,7 +103,7 @@ gemma4-e2b-q4|gemma-4-E2B-it-Q4_0.gguf|9.23|1219.25|1463.42|Gemma4 E2B
 ROWS
 }
 
-# ⚠ 128 TOKENS IS THEIR SEQLEN, so the prompt has to be about that and the
+# 128 TOKENS IS THEIR SEQLEN, so the prompt has to be about that and the
 # actual count is printed rather than assumed -- a comparison whose left column
 # ran 40 tokens against their 128 is not a comparison.
 PROMPT="The history of computing begins long before the first electronic machine.
@@ -121,28 +121,28 @@ if [ "${CHARSIU_BENCH_PERF:-0}" = 1 ]; then
 	done
 	echo "  governors now: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
 else
-	echo "⚠ the governor is left alone; their numbers are at MAXIMUM frequency."
+	echo "the governor is left alone; their numbers are at MAXIMUM frequency."
 	echo "  CHARSIU_BENCH_PERF=1 sets it, and this line changes when you do."
 fi
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and this script is a correctness
 # gate rather than a timing sweep. The build stamp is what it needs.
 echo "  governor: $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
   echo "  build    $(charsiu_build "$RUN")"
-# ⚠ SAY WHICH FORMAT WAS SCORED. A table that does not is a table whose rows
+# SAY WHICH FORMAT WAS SCORED. A table that does not is a table whose rows
 # cannot be compared to any other table.
-[ "$W4V" = 1 ] || echo "  ⚠ OUR column is w8a8 (CHARSIU_BENCH_W4V=0); theirs is still their w4a16."
+[ "$W4V" = 1 ] || echo "  OUR column is w8a8 (CHARSIU_BENCH_W4V=0); theirs is still their w4a16."
 echo
 
 #
-# ⚠⚠ THE TWO COLUMNS ARE NOT THE SAME KIND OF NUMBER, AND A MARGIN READ ACROSS
+# THE TWO COLUMNS ARE NOT THE SAME KIND OF NUMBER, AND A MARGIN READ ACROSS
 # THEM IS NOT A MEASUREMENT OF A DIFFERENCE. "ours" is measured here, now, on
 # this board, with a spread this script prints. "theirs" is a PUBLISHED POINT
 # ESTIMATE with no N, no spread and no method beyond their one sentence about
 # maximum frequencies -- so it cannot be beaten "within the noise", because it
 # has not got any. Say so wherever the ratio is quoted.
 #
-# ⚠⚠ AND THE STATISTIC MATTERS MORE THAN THE COUNT. This printed BEST of N,
+# AND THE STATISTIC MATTERS MORE THAN THE COUNT. This printed BEST of N,
 # and best-of-N systematically favours the arm with the wider spread: run the
 # noisier side more times and it wins by its own variance. gemma4's TTFT has
 # read 2133 to 3221 in one build while phi3 repeats to 0.2%, so the models here
@@ -174,16 +174,16 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 			"$label" "-" "$vt" "-" "$vttft" "-" "$vmb" "$name"
 		continue
 	fi
-	# ⚠ STDERR IS KEPT. The refusal that decides whether the batched prefill
+	# STDERR IS KEPT. The refusal that decides whether the batched prefill
 	# does anything at all -- "int4 computes one row" -- is on it, and a
 	# comparison that throws it away cannot tell a batched run from a run
 	# that fell back to exactly what it was being compared against.
-	# ⚠⚠ A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
+	# A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
 	# plus OUT=$(cmd) means one model that will not load takes every model
 	# after it with it -- three rounds of this table printed exactly one row
 	# and nobody, me included, asked where the other four went. A row that
 	# fails is a row, and it says so.
-	# ⚠⚠ ONE RUN IS A READING AND THIS COLUMN IS THE HEADLINE. Qwen3's TTFT
+	# ONE RUN IS A READING AND THIS COLUMN IS THE HEADLINE. Qwen3's TTFT
 	# came back 2055, 1867 and 2191 on three consecutive rounds of the same
 	# build -- a spread of 9% -- because the governor is ondemand and each
 	# model runs once. A change worth less than that cannot be seen here at
@@ -195,7 +195,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# best with the spread beside it, so a number and its noise arrive
 	# together. The default is still 1, because three times four models is
 	# a long round.
-	# ⚠⚠ THE DECODE COLUMN NEEDS ITS OWN BEST AND WORST, and it had
+	# THE DECODE COLUMN NEEDS ITS OWN BEST AND WORST, and it had
 	# neither. BEST_TS was whatever the run with the best TTFT happened to
 	# decode at, and no spread was printed for it at any REPEAT -- so the
 	# headline tokens-a-second was an unqualified single reading even when
@@ -207,13 +207,13 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	# one reading. A 27% spread on the number this table exists to report.
 	BEST_TT=; BEST_TS=; BEST_MB=; BEST_NP=; WORST_TT=; nrun=0
 	BTS=; WTS=
-	# ⚠ EVERY READING IS KEPT. A median cannot be computed from two
+	# EVERY READING IS KEPT. A median cannot be computed from two
 	# extremes, and a round whose individual readings were thrown away
 	# cannot be re-read later with a different statistic.
 	TTL=; TSL=
 	while [ $nrun -lt "$REPEAT" ]; do
 		nrun=$((nrun + 1))
-		# ⚠⚠ env, NOT A BARE ASSIGNMENT PREFIX. A shell only treats
+		# env, NOT A BARE ASSIGNMENT PREFIX. A shell only treats
 		# NAME=VALUE as an assignment when it is written literally in
 		# the command position; a VARIABLE that expands to NAME=VALUE is
 		# looked up as a COMMAND. Adding $PRICE_ENV to the prefix form
@@ -223,7 +223,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		#
 		# `env` takes them as arguments, so an expanded one works.
 		# shellcheck disable=SC2086
-		# ⚠⚠ KMAX IS NOT PINNED, AND THAT IS THE POINT. This set
+		# KMAX IS NOT PINNED, AND THAT IS THE POINT. This set
 		# CHARSIU_NPU_KMAX=1024 and CHARSIU_NPU_W4_GROUP=1024 until
 		# llama_auto_kmax landed, and pinning them turns it off -- so
 		# the scoreboard would have scored a configuration nobody
@@ -246,14 +246,14 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		if [ -z "$WORST_TT" ] || [ "$TT" -gt "$WORST_TT" ] 2>/dev/null; then
 			WORST_TT=$TT
 		fi
-		# ⚠ awk, because tok/s is a float and the shell cannot compare one
+		# awk, because tok/s is a float and the shell cannot compare one
 		[ -n "$BTS" ] || BTS=$TS
 		[ -n "$WTS" ] || WTS=$TS
 		BTS=$(awk -v a="$BTS" -v b="$TS" 'BEGIN{print (b>a)?b:a}')
 		WTS=$(awk -v a="$WTS" -v b="$TS" 'BEGIN{print (b<a)?b:a}')
 		TTL="$TTL $TT"; TSL="$TSL $TS"
 	done
-	# ⚠⚠ A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
+	# A FAILING RUN USED TO END THE WHOLE SCRIPT, IN SILENCE. `set -e`
 	# plus OUT=$(cmd) means one model that will not load takes every model
 	# after it with it -- three rounds of this table printed exactly one row
 	# and nobody, me included, asked where the other four went. A row that
@@ -265,7 +265,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 		continue
 	fi
 	MB=$BEST_MB; NP=$BEST_NP
-	# ⚠ THE HEADLINE IS THE MEDIAN. The decode column also reports its own
+	# THE HEADLINE IS THE MEDIAN. The decode column also reports its own
 	# statistic rather than the reading that came with the best prompt --
 	# the two are not the same run and there is no reason they should be.
 	TS=$(mid "$TSL"); TT=$(mid "$TTL")
@@ -275,24 +275,24 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 	[ "$REPEAT" -gt 1 ] && spread=" ttft $BEST_TT..$WORST_TT, decode $WTS..$BTS over $REPEAT runs"
 	printf '%-16s %10s %10s   %10s %10s   %8s %8s   (%s tok prompt)%s\n' \
 		"$label" "$TS" "$vt" "$TT" "$vttft" "$MB" "$vmb" "$NP" "$spread"
-	# ⚠ AND THE READINGS THEMSELVES, so a later question can ask a
+	# AND THE READINGS THEMSELVES, so a later question can ask a
 	# different statistic of this round instead of needing a new one.
 	if [ "$REPEAT" -gt 1 ]; then
 		printf '     readings  ttft %s\n' "$(echo $TTL)"
 		printf '     readings  decode %s   best ttft %s, best decode %s\n' \
 			"$(echo $TSL)" "$BEST_TT" "$BTS"
 	fi
-	# ⚠ THE REFUSAL STRING MOVED ON 2026-08-29 and this grep did not: it
+	# THE REFUSAL STRING MOVED ON 2026-08-29 and this grep did not: it
 	# looked for "int4 computes one row", which no longer exists anywhere,
 	# so it matched nothing and said nothing for a round. It looks for the
 	# m = 8 fallback and the batch_why_not list now.
 	#
-	# ⚠ AND THE DEVICE'S OWN REPORT. "how many submits" is the difference
+	# AND THE DEVICE'S OWN REPORT. "how many submits" is the difference
 	# between a prefill that runs on the hardware one row at a time -- a
 	# fence each, and the fence has been measured at 94% of the hardware
 	# path -- and one that fell back to the CPU. Nothing else in this table
 	# can tell those two apart.
-	# ⚠ MATCH THE REFUSAL BY ITS PREFIX, NOT BY ONE OF ITS REASONS. This
+	# MATCH THE REFUSAL BY ITS PREFIX, NOT BY ONE OF ITS REASONS. This
 	# read "int4 at m=", which is the m = 8 refusal's own words, so the
 	# odd-width refusal added later would have gone through this filter
 	# unseen -- a prefill silently falling back a row at a time, in the
@@ -304,7 +304,7 @@ rows | while IFS='|' read -r name file vt vttft vmb label; do
 done
 
 echo
-# ⚠⚠ THE MEMORY COLUMN UNDERSTATES US, AND BY MORE THAN THE GAP IT SHOWS.
+# THE MEMORY COLUMN UNDERSTATES US, AND BY MORE THAN THE GAP IT SHOWS.
 #
 # charsiu_run's `peak N MB` is VmHWM, and every DRM buffer object is invisible
 # to it: rocket's objects come from drm_gem_shmem, whose mmap sets VM_PFNMAP
@@ -323,12 +323,12 @@ echo
 # r371 sweeps CPU_FRAC, whose buffer is host anon, and the peak tracks it
 # exactly.
 #
-# ⚠ AND THE UNITS DIFFER. This column is MiB (hwm/1024) and Rockchip's is
+# AND THE UNITS DIFFER. This column is MiB (hwm/1024) and Rockchip's is
 # labelled MB, so 1068 here is 1120 of theirs and the honest ratio is 2.18x
 # rather than 2.08x.
 echo
 if [ "$REPEAT" -eq 1 ]; then
-	echo "⚠⚠ EVERY NUMBER ABOVE IS ONE READING. TinyLLAMA has read 12.64 and"
+	echo "EVERY NUMBER ABOVE IS ONE READING. TinyLLAMA has read 12.64 and"
 	echo "   17.39 tok/s on the same build minutes apart, and Qwen3's TTFT"
 	echo "   2055, 1867 and 2191 -- so a change worth less than about 25%"
 	echo "   cannot be seen here at all, and a single round must not be read"
@@ -336,14 +336,14 @@ if [ "$REPEAT" -eq 1 ]; then
    full range, and every individual reading."
 	echo
 fi
-echo "⚠ THE MEMORY COLUMN IS VmHWM AND DOES NOT SEE THE DEVICE BUFFERS."
+echo "THE MEMORY COLUMN IS VmHWM AND DOES NOT SEE THE DEVICE BUFFERS."
 echo "  Weights on the hardware, coefficient buffers and batched output"
 echo "  buffers are all VM_PFNMAP and never counted. Computed at these"
 echo "  settings that is another 488 MiB on Qwen3 and 2618 MiB on Phi-3.5."
 echo "  It is not the number that decides which models fit on the board."
 echo "  Our column is MiB and theirs is MB, which is a further 5%."
 echo
-echo "⚠ TTFT AND PROMPT TIME ARE NOT THE SAME THING. Theirs is time to the first"
+echo "TTFT AND PROMPT TIME ARE NOT THE SAME THING. Theirs is time to the first"
 echo "  token, ours is the prompt's forward passes; the first token's own step is"
 echo "  in theirs and not in ours, which is one token's worth in our favour."
 echo
@@ -361,7 +361,7 @@ if [ -f "$DIR/mmproj.gguf" ] && [ -f "$DIR/smolvlm.gguf" ]; then
 		t1=$(awk '{printf "%d", $1 * 1000}' /proc/uptime)
 		echo "  ours     img-encoder 512x512   $((t1 - t0)) ms   (staging included)"
 		echo
-		# ⚠ WHERE, not just how much. 768 ms against ours is a number to
+		# WHERE, not just how much. 768 ms against ours is a number to
 		# chase and the table is the only thing that says which part of
 		# it to chase.
 		sed -n '/charsiu vision:/,/pixel shuffle/p' "$DIR/.vis2.err" \

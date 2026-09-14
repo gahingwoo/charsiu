@@ -4,7 +4,7 @@
  * What a device's input BO holds right now, so a caller that declares its
  * input unchanged (charsiu_npu_matmul_same) can skip the pack.
  *
- * ⚠⚠ THE RULE, AND THE ROUND THAT WROTE IT. The key is the pointer, the
+ * THE RULE, AND THE ROUND THAT WROTE IT. The key is the pointer, the
  * width, K, the zero point and which K slices landed; the CONTENTS are the
  * caller's word, and the caller's word covers exactly one thing: "X is what
  * it was at the call before this one". So a key is good only from the pack
@@ -24,7 +24,7 @@
  * follower dealt to a core the leader never packed) that happened to look
  * the same from the text.
  *
- * ⚠⚠ AND THE BYTES ARE NOT X WHEN AWQ IS ON. npuquant scales a tensor's
+ * AND THE BYTES ARE NOT X WHEN AWQ IS ON. npuquant scales a tensor's
  * weights by kscale[k] and leaves the inverse for the caller to put on the
  * ACTIVATION, so what a device's BO holds is X times THAT TENSOR'S factor,
  * and the next tensor's factor is a different vector. The pointer is the

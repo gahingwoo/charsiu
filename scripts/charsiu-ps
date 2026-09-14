@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0
 # `charsiu ps`
 #
-# ⚠ There is no daemon holding models in memory, so this is not ollama's ps and
+# There is no daemon holding models in memory, so this is not ollama's ps and
 # does not pretend to be. It answers the question people actually ask it here:
 # is the NPU busy, and who has it.
 set -eu
@@ -11,7 +11,7 @@ printf '%-8s %-9s %s\n' PID STATE WHAT
 found=0
 for p in /proc/[0-9]*; do
 	[ -r "$p/cmdline" ] || continue
-	# ⚠ 2>/dev/null MUST COME BEFORE THE INPUT REDIRECT. Redirections are
+	# 2>/dev/null MUST COME BEFORE THE INPUT REDIRECT. Redirections are
 	# processed left to right, so with it after, the shell reports the
 	# failed open on a stderr that is still the terminal -- and a process
 	# exiting between the glob and this read is normal, not exceptional.

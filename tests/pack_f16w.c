@@ -54,7 +54,7 @@ static void check(unsigned k, unsigned n, enum charsiu_w16_layout L)
 }
 
 /*
- * ⚠⚠ THE LAW A KV CACHE RESTS ON: while every group of 16 output channels is
+ * THE LAW A KV CACHE RESTS ON: while every group of 16 output channels is
  * full, a GROUP offset does not depend on n at all.
  *
  * charsiu_fp16_woffset is
@@ -92,7 +92,7 @@ static void stable_in_n(unsigned k, unsigned n, unsigned nbig)
 }
 
 /*
- * ⚠ AND THE PRECONDITION IS REAL, which is the half that makes the check
+ * AND THE PRECONDITION IS REAL, which is the half that makes the check
  * above worth having. With a partial last group the offsets DO move, so a
  * cache read at a width that is not a multiple of 16 is a different
  * permutation of the same bytes. If this ever stops finding a difference,
@@ -103,7 +103,7 @@ static void moves_in_n(unsigned k, unsigned n, unsigned nbig)
 	struct charsiu_matmul a = { 1, k, n, CHARSIU_FP16, CHARSIU_FP16 };
 	struct charsiu_matmul b = { 1, k, nbig, CHARSIU_FP16, CHARSIU_FP16 };
 	/*
-	 * ⚠ ngsz REACHES THE OFFSET ONLY THROUGH (k/32)*32*ngsz, so with one
+	 * ngsz REACHES THE OFFSET ONLY THROUGH (k/32)*32*ngsz, so with one
 	 * k group -- k up to the 32 element k group -- it cancels and a
 	 * partial n group moves nothing. This test asked for a difference at
 	 * k=8 and did not get one, which is the arithmetic saying so and not a
@@ -129,7 +129,7 @@ static void moves_in_n(unsigned k, unsigned n, unsigned nbig)
 }
 
 /*
- * ⚠⚠ THE TWO CACHE WRITERS AGAINST THE DEFINITION.
+ * THE TWO CACHE WRITERS AGAINST THE DEFINITION.
  *
  * charsiu_fp16_pack_krow and _vcol take a run base from charsiu_w16_offset and
  * then walk it -- contiguously for a K row, at one stride for a V column --

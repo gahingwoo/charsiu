@@ -5,7 +5,7 @@
 # One environment variable, two arms, one binary, one session: does setting it
 # change the batched matmul, and by more than the run to run spread?
 #
-# ⚠⚠ ONE BINARY, ONE SESSION, THE PERFORMANCE GOVERNOR. Three phase 9 runs
+# ONE BINARY, ONE SESSION, THE PERFORMANCE GOVERNOR. Three phase 9 runs
 # measured this by rebuilding between them and disagreed by more than the
 # change: Phi-3.5 packed 4384, 6583 and 3158 ms on paths that were the same
 # twice over, because phase 9 runs under ondemand and packing is CPU work.
@@ -19,7 +19,7 @@
 #   CHARSIU_AB_MAXT=40     tensors a pass, so a repeat is quick
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -41,7 +41,7 @@ if [ -z "$M" ]; then
 fi
 [ -r "${M:-/nonexistent}" ] || { echo "no model" >&2; exit 1; }
 
-# ⚠ THE GOVERNOR IS THE WHOLE POINT. Put it back on the way out.
+# THE GOVERNOR IS THE WHOLE POINT. Put it back on the way out.
 OLD=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "")
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
 	[ -w "$g" ] && echo performance > "$g" 2>/dev/null
@@ -49,7 +49,7 @@ done
 trap '[ -n "$OLD" ] && for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo "$OLD" > "$g" 2>/dev/null; done' EXIT
 
 #
-# ⚠⚠ KMAX AND W4_GROUP MUST BE EQUAL, AND THIS SCRIPT HAD THEM AT 2048 AND
+# KMAX AND W4_GROUP MUST BE EQUAL, AND THIS SCRIPT HAD THEM AT 2048 AND
 # 1024, WHICH SENDS EVERY WIDE TENSOR TO THE CPU.
 #
 # tensor_grouped() wants `t->kgroup == g->kmax` -- the hardware sums a whole K
@@ -70,7 +70,7 @@ W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_KMAX=1024 \
 CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 CHARSIU_PROBE_WIDTHS=$W CHARSIU_PROBE_MAXT=${CHARSIU_AB_MAXT:-40}"
 
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -91,7 +91,7 @@ while [ "$i" -le "$N" ]; do
 		# shellcheck disable=SC2086
 		out=$(env $W4 $E "$RUN" "$M" --batch-probe "$W" 2>&1)
 		#
-		# ⚠⚠ THE TELL THAT THIS HARNESS DID NOT HAVE. If the grouping
+		# THE TELL THAT THIS HARNESS DID NOT HAVE. If the grouping
 		# the quantiser chose is one the consumer cannot honour, every
 		# affected tensor falls to the CPU and the "batched matmul"
 		# being timed is the fallback. It whined all along; nothing
@@ -100,7 +100,7 @@ while [ "$i" -le "$N" ]; do
 		#
 		if printf '%s' "$out" | grep -q "the consumer cannot honour"; then
 			echo
-			echo "⚠⚠ ABORT: tensors fell to the CPU -- the grouping is one"
+			echo "ABORT: tensors fell to the CPU -- the grouping is one"
 			echo "   the consumer cannot honour, so this would time the CPU"
 			echo "   fallback and call it the batched matmul."
 			printf '%s' "$out" | grep "the consumer cannot honour" | head -1
@@ -108,10 +108,10 @@ while [ "$i" -le "$N" ]; do
 			exit 3
 		fi
 		line=$(printf '%s' "$out" | grep -E "^ *$W  " | tail -1)
-		# ⚠ THE SECOND 'ms' IS THE BATCHED ONE. The first is the row at a
+		# THE SECOND 'ms' IS THE BATCHED ONE. The first is the row at a
 		# time reference, which no arm here can move: reading it as the
 		# result made two arms look identical when one was 18% faster.
-		# ⚠ NO LINE IS AN ANSWER TOO. awk over an empty line prints nothing,
+		# NO LINE IS AN ANSWER TOO. awk over an empty line prints nothing,
 		# `set --` then leaves $1 unset, and under set -u the script dies
 		# mid table: that is what happened when the NPU had moved to
 		# another accel node and every probe came back empty.
@@ -124,7 +124,7 @@ while [ "$i" -le "$N" ]; do
 				if ($i=="fence") f=$(i+1);
 			}
 			print (b==""?"?":b), (p==""?"?":p), (r==""?"?":r), (f==""?"?":f) }')
-		[ "$#" -ge 4 ] || set -- "?" "?" "?" "?" 
+		[ "$#" -ge 4 ] || set -- "?" "?" "?" "?"
 		rows=$(printf '%s' "$line" | sed -n 's/.*\([0-9]* of [0-9]*\).*/\1/p')
 		printf '%-6s %-5s %-12s %-6s %-6s %-7s %s\n' "$arm" "$i" "$1" "$2" "$3" "$4" "${rows:-?}"
 	done

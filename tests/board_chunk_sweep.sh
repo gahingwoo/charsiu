@@ -4,7 +4,7 @@
 #
 # Which prefill chunk widths give the RIGHT TEXT, on the board?
 #
-# ⚠⚠ WHY THIS AND NOT ANOTHER PROBE ROUND.
+# WHY THIS AND NOT ANOTHER PROBE ROUND.
 #
 # board_w4_axis.sh says phi3's batched matmul is exact: 225 tensors, every
 # width it asks about, 18000 of 18000 rows at m = 80, worst relative 1.61e-04.
@@ -24,7 +24,7 @@
 # width and no tail; a chunk that does not runs that width and a tail of
 # whatever is left.
 #
-# ⚠ CHARSIU_BATCH_FORCE IS A PROBE SWITCH. These models are refused; a number
+# CHARSIU_BATCH_FORCE IS A PROBE SWITCH. These models are refused; a number
 # measured here is a number about a model that is still refused.
 #
 # `charsiu update dev` installs this at /opt/charsiu/board_chunk_sweep.sh.
@@ -35,7 +35,7 @@
 #   CHARSIU_CHUNK_NGEN=8                     tokens generated
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -49,7 +49,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
 # minor, so the NPU can sit at accel1 or accel2 and a test that looks only
 # for accel0 refuses on a board that has one.
 if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
@@ -83,7 +83,7 @@ fi
 }
 
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+# ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
 # board_text_all.sh spelled this literally and every other script built it with
 # `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
@@ -104,7 +104,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -117,7 +117,7 @@ echo
 # shellcheck disable=SC2086
 env $W4 CHARSIU_NO_BATCH_PREFILL=1 "$RUN" "$MODEL" -p "$PROMPT" -n "$NGEN" \
 	--ignore-eos >"$T/c.out" 2>"$T/c.err"
-# ⚠ READ THE TOKEN COUNT BEFORE STRIPPING THE LINE IT IS ON. charsiu_run puts
+# READ THE TOKEN COUNT BEFORE STRIPPING THE LINE IT IS ON. charsiu_run puts
 # "prompt N tok in ..." in the bracketed summary on STDOUT, and the next line
 # deletes every bracketed line because the text is what gets compared. The
 # first version parsed after the strip and printed "prompt is ? tokens" -- the
@@ -128,7 +128,7 @@ echo "prompt is ${NTOK:-?} tokens"
 echo "control (token loop): ...$(tr -d '\n' < "$T/c.out" | tail -c 52)"
 echo
 
-# ⚠⚠ REPEATS, BECAUSE ONE RUN A CELL CANNOT SEE AN INTERMITTENT FAULT -- and
+# REPEATS, BECAUSE ONE RUN A CELL CANNOT SEE AN INTERMITTENT FAULT -- and
 # this one is intermittent. Chunk 32 came back `same` in the sweep that found
 # 29 and 24 wrong, on the same board, in the same minute, from the command that
 # had produced wrong text twice before. A table of one run a cell invites
@@ -148,7 +148,7 @@ for c in $CHUNKS; do
 		cmp -s "$T/c.out" "$T/b.out" && agree=$((agree + 1))
 		r=$((r + 1))
 	done
-	# ⚠ WHAT WIDTHS THIS CHUNK ACTUALLY RAN, spelled out. "chunk 32" is
+	# WHAT WIDTHS THIS CHUNK ACTUALLY RAN, spelled out. "chunk 32" is
 	# not a width -- on 87 tokens it is 32, 32 and 23, and the 23 is the
 	# whole question.
 	if [ -n "${NTOK:-}" ]; then
@@ -158,7 +158,7 @@ for c in $CHUNKS; do
 	else
 		w="?"
 	fi
-	# ⚠ WIDE ENOUGH FOR "chunks of 32". cut -c8-40 rendered it "chunks of
+	# WIDE ENOUGH FOR "chunks of 32". cut -c8-40 rendered it "chunks of
 	# 3" and "chunks of 2", so the column that says which chunk ran
 	# disagreed with the column that asked for it.
 	p=$(grep -oE "prompt batched.*" "$T/b.err" | head -1 | cut -c1-48)
@@ -171,7 +171,7 @@ for c in $CHUNKS; do
 		if [ "${rem:-0}" -ne 0 ]; then tailrem="$tailrem $c/$rem"
 		else counter="$counter wrong-no-tail:$c"; fi
 	else
-		# ⚠ THE MOST IMPORTANT CELL IN THE TABLE. Same command, same
+		# THE MOST IMPORTANT CELL IN THE TABLE. Same command, same
 		# board, both answers. Nothing about widths explains this.
 		v="$agree/$REPS FLAKY"; nflaky=$((nflaky + 1))
 	fi
@@ -182,7 +182,7 @@ done
 
 echo
 echo "======================================================================"
-# ⚠⚠ INTERMITTENCY OUTRANKS EVERY OTHER READING. If one chunk gave both
+# INTERMITTENCY OUTRANKS EVERY OTHER READING. If one chunk gave both
 # answers, then no row in this table is a property of its width, and the
 # tail-versus-no-tail story cannot be told at all.
 if [ "$nflaky" -gt 0 ]; then
@@ -209,12 +209,12 @@ else
 	echo "SOME CHUNKS ARE RIGHT AND SOME ARE WRONG. Read the widths column:"
 	[ -n "$taildiv" ] && echo "  right with no tail:$taildiv"
 	[ -n "$tailrem" ] && echo "  wrong with a tail (chunk/tail):$tailrem"
-	# ⚠⚠ AND THE ROWS THAT CONTRADICT IT, IN THE SAME BREATH. The first
+	# AND THE ROWS THAT CONTRADICT IT, IN THE SAME BREATH. The first
 	# version of this summary listed only the rows that fitted the tail
 	# story, so a table containing "29, no tail, DIFFERS" and "32, tail 24,
 	# same" printed a verdict that read as clean support for it.
 	if [ -n "$counter" ]; then
-		echo "  ⚠ AGAINST THE TAIL STORY:$counter"
+		echo "  AGAINST THE TAIL STORY:$counter"
 		echo "    With those in the table the tail is NOT the rule."
 	else
 		echo "  no counter-examples: every wrong row has a tail and every"

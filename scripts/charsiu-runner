@@ -14,7 +14,7 @@
 #   CHARSIU_NPU_W4_GROUP=1024 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 #   charsiu_run /opt/charsiu/models/....gguf -p "..." -n 64 -c 512 -t 4
 #
-# ⚠ KMAX AND GROUP MUST BE EQUAL. npudev.c gates the int4 path on
+# KMAX AND GROUP MUST BE EQUAL. npudev.c gates the int4 path on
 # `t->kgroup == g->kmax`; set them differently and the tensor silently takes
 # the other path. config.ini keeps one value and writes both.
 #
@@ -50,13 +50,13 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-# ⚠⚠ A BARE WORD IS THE PROMPT, and it was not. `charsiu "what is a bandgap"`
+# A BARE WORD IS THE PROMPT, and it was not. `charsiu "what is a bandgap"`
 # is line two of --help and the second line of the front door's own header,
 # and the words went to charsiu_run as a positional it does not accept, so the
 # most prominently documented form of this command answered with charsiu_run's
 # usage. `charsiu run MODEL PROMPT` was broken the same way.
 #
-# ⚠ Flags and their values pass through untouched, so `charsiu -n 32 "hello"`
+# Flags and their values pass through untouched, so `charsiu -n 32 "hello"`
 # still means what it looks like and `charsiu -n 32` does not treat 32 as a
 # question. The list of value-taking flags is charsiu_run's own.
 _skip=0; _hasp=0; _bare=0
@@ -83,7 +83,7 @@ if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
 	done
 	if [ -n "$_p" ]; then
 		set -- "$@" -p "$_p"
-		# ⚠ A SINGLE BARE WORD IS AMBIGUOUS, AND GETTING IT WRONG WAS
+		# A SINGLE BARE WORD IS AMBIGUOUS, AND GETTING IT WRONG WAS
 		# SILENT. On an install predating a subcommand, `charsiu update`
 		# was read as a question and the model answered with a cheerful
 		# paragraph about workouts, which looks like the update ran and
@@ -95,7 +95,7 @@ if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
 		*) echo "charsiu: reading \"$_p\" as a question, not a command." \
 			"\`charsiu --help\` lists the commands." >&2 ;;
 		esac
-		# ⚠ ASKING IS NOT COMPLETING. --help draws exactly this line:
+		# ASKING IS NOT COMPLETING. --help draws exactly this line:
 		# `charsiu "what is a bandgap"` asks once, `charsiu -p "..."` is
 		# print mode for a pipe. Without the chat template the question was
 		# echoed back and continued as a document -- "Name one color." came
@@ -103,7 +103,7 @@ if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
 		# An explicit -p is left alone: that form chose completion.
 		case " $* " in *" --chat "*|*" -i "*|*" --interactive "*) ;;
 		*) set -- "$@" --chat ;; esac
-		# ⚠ AND -q, OR THE QUESTION COMES BACK WITH THE ANSWER. Without it
+		# AND -q, OR THE QUESTION COMES BACK WITH THE ANSWER. Without it
 		# charsiu_run echoes the prompt it was given, which for a chat turn
 		# is the whole template: somebody who asked "Name one color." got
 		# "<|im_start|>system ... <|im_end|> ..." and then the answer.
@@ -111,10 +111,10 @@ if [ "$_bare" = 1 ] && [ "$_hasp" = 0 ]; then
 	fi
 fi
 
-# ⚠ NO ARGUMENTS MEANS A CONVERSATION, not the built-in demo prompt. Staging
+# NO ARGUMENTS MEANS A CONVERSATION, not the built-in demo prompt. Staging
 # costs about twenty seconds and a one-shot pays it for a single answer, so the
 # default has to be the mode that pays it once.
-# ⚠ NO PROMPT MEANS A CONVERSATION, and the test used to be "no arguments
+# NO PROMPT MEANS A CONVERSATION, and the test used to be "no arguments
 # at all". `charsiu -n 10` therefore ran the built-in demo prompt instead
 # of talking, which is not what anyone typing that meant. Reuse the scan
 # above: a bare word or -p/-f is a question, anything else is not.
@@ -130,7 +130,7 @@ case " $* " in *" --info "*|*" --tokens "*|*" --logits "*) _askish=1 ;; esac
 MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
 [ -n "$MODEL" ] && MODEL=$(resolve_model "$MODEL")
 
-# ⚠ THE SHIPPED CONFIG NAMES A MODEL NOBODY HAS YET. A clean install where the
+# THE SHIPPED CONFIG NAMES A MODEL NOBODY HAS YET. A clean install where the
 # wizard downloaded SmolLM2 still ended at "Llama-3.2-1B-Instruct-Q8_0.gguf does
 # not exist", because the default path is a placeholder and the download never
 # wrote over it. What is on disk beats what the config guessed.
@@ -174,14 +174,14 @@ yes|1|true|on)
 	env_default CHARSIU_NPU 1
 	env_default CHARSIU_NPU_QUANT 1
 	env_default CHARSIU_NPU_W4V 1
-	# ⚠ kslice writes BOTH, and they must match. See the note above.
+	# kslice writes BOTH, and they must match. See the note above.
 	env_default CHARSIU_NPU_KMAX "$KSLICE"
 	env_default CHARSIU_NPU_W4_GROUP "$KSLICE"
 	env_default CHARSIU_NPU_MAXN "$MAXN"
 	env_default CHARSIU_COEF_ELEMS "$COEF" ;;
 esac
 [ -n "$CPUS" ] && env_default CHARSIU_CPUS "$CPUS"
-# ⚠ THE POOL WANTS DIFFERENT CORES FROM THE CALLING THREAD, and the board
+# THE POOL WANTS DIFFERENT CORES FROM THE CALLING THREAD, and the board
 # measured both halves: a prompt is 4.3% faster with the pool on all eight,
 # and decode is 26% SLOWER two runs in three if the CALLING thread can land on
 # an A53. cpus keeps the caller on the fast cores, pool_cpus opens the machine
@@ -189,7 +189,7 @@ esac
 POOLCPUS=$(ini_get run pool_cpus)
 [ -n "$POOLCPUS" ] && env_default CHARSIU_POOL_CPUS "$POOLCPUS"
 
-# ⚠ ONE SWITCH, NOT A SET OF ENVIRONMENT VARIABLES NOBODY WILL REMEMBER. The
+# ONE SWITCH, NOT A SET OF ENVIRONMENT VARIABLES NOBODY WILL REMEMBER. The
 # stage timings existed only as CHARSIU_STAGES, which meant they were reachable
 # by whoever already knew the name. [debug] enable makes them a setting.
 DEBUG=$(ini_get debug enable)
@@ -199,7 +199,7 @@ esac
 
 # anything under [extra] is passed through verbatim, which is the escape hatch
 # for the other hundred variables without putting them in the TUI.
-# ⚠ A line that STARTS with # is a comment too. An earlier version only
+# A line that STARTS with # is a comment too. An earlier version only
 # stripped ` #...` and so passed the section's own comment to env as an
 # argument. Anything that is not literally CHARSIU_NAME=VALUE is dropped.
 EX=$(awk '/^[ \t]*\[extra\][ \t]*$/{f=1;next} /^[ \t]*\[/{f=0}
@@ -212,7 +212,7 @@ EX=$(awk '/^[ \t]*\[extra\][ \t]*$/{f=1;next} /^[ \t]*\[/{f=0}
 	}' "$CONF")
 [ -n "$EX" ] && E="$E $EX"
 
-# ⚠ TWENTY SECONDS OF SILENCE IS THE MOST OFF-PUTTING PART OF A FIRST RUN, and
+# TWENTY SECONDS OF SILENCE IS THE MOST OFF-PUTTING PART OF A FIRST RUN, and
 # the runtime already says enough to draw a bar: it announces how many tensors
 # it will stage (n_layer * 7 + 1, seven projections a layer plus the output
 # head, 113 for the model every board round uses, which is exactly what its logs
@@ -227,7 +227,7 @@ if awk -Winteractive '' </dev/null >/dev/null 2>&1; then
 fi
 
 stage_filter() {
-	# ⚠⚠ DO NOT WRITE TO "/dev/stderr" FROM awk. mawk, which is Debian's awk,
+	# DO NOT WRITE TO "/dev/stderr" FROM awk. mawk, which is Debian's awk,
 	# opens it as an ordinary file and buffers it whole, and fflush() on that
 	# name does not help. Measured: three lines fed a second apart all came
 	# out together at the end. Meanwhile stdout goes straight to the terminal
@@ -238,7 +238,7 @@ stage_filter() {
 	# Write to plain stdout, flush every line, and let the caller point that
 	# at stderr.
 	#
-	# ⚠⚠ AND fflush() IS NOT ENOUGH, BECAUSE mawk IGNORES IT. Measured on
+	# AND fflush() IS NOT ENOUGH, BECAUSE mawk IGNORES IT. Measured on
 	# mawk 1.3.4: two lines fed a second apart came out 1 ms apart with
 	# `{ print; fflush() }`, and a second apart with `-Winteractive`. So the
 	# flag is what does the work; the fflush() calls stay for awks that
@@ -252,7 +252,7 @@ stage_filter() {
 		n = $3 + 0
 		if (tot > 0) {
 			pct = int(n * 100 / tot); if (pct > 100) pct = 100
-			# ⚠ THE HEARTBEAT ONLY FIRES EVERY SIXTEENTH TENSOR, so for
+			# THE HEARTBEAT ONLY FIRES EVERY SIXTEENTH TENSOR, so for
 			# 113 the last one is 112 and the bar stops at 99% with no
 			# later line to close it. The generated text then lands on
 			# the same line: "99%  112/113OK, Bob!". Close it on the
@@ -271,7 +271,7 @@ stage_filter() {
 		}
 		next
 	}
-	# ⚠ THE DENOMINATOR IS A PREDICTION AND THE BAR CLOSES ITSELF, so the
+	# THE DENOMINATOR IS A PREDICTION AND THE BAR CLOSES ITSELF, so the
 	# bar cannot notice a tensor that never staged. The heartbeat fires
 	# every sixteenth tensor, the last one for 183 lands at 176, and the
 	# rule above prints 183/183 to keep the answer off the bar line. A
@@ -286,7 +286,7 @@ stage_filter() {
 			       tot - ($3 + 0), tot
 		fflush(); next
 	}
-	# ⚠ a pass-through line lands mid-bar unless the bar is closed first,
+	# a pass-through line lands mid-bar unless the bar is closed first,
 	# and \r leaves the cursor at column 0 of a line that still has a bar on it.
 	{ if (bar) { printf "\n"; bar = 0 }
 	  print; fflush() }
@@ -299,7 +299,7 @@ if [ "$BENCH" = 1 ]; then
 	printf '  %s, %s threads, context %s\n\n' \
 	       "$(case "$NPU" in yes|1|true|on) echo "NPU int4";; *) echo "CPU";; esac)" \
 	       "$THREADS" "$CTX"
-	# ⚠ 64 tokens is what every board round measures, so the number here is
+	# 64 tokens is what every board round measures, so the number here is
 	# comparable with the logs rather than being a new metric nobody can
 	# check. --ignore-eos so a short answer does not shorten the sample.
 	out=$( { env $E "$RUN" "$MODEL" -p "The capital of France is" -n 64 \
@@ -308,7 +308,7 @@ if [ "$BENCH" = 1 ]; then
 		| sed 's/^/  /' || echo "  (no rate reported)"
 	echo "$out" | grep -oE '[0-9.]+ GB/s of weights' | sed 's/^/  /' || true
 
-	# ⚠ THE ONE NUMBER THAT DECIDES THE NEXT PIECE OF WORK, and it differs
+	# THE ONE NUMBER THAT DECIDES THE NEXT PIECE OF WORK, and it differs
 	# between a development host and the board. Batching the projections
 	# measured 1.1x to 1.4x on a host with cache and memory to spare; the
 	# board is 10 GB/s of LPDDR5 behind four A72s, where the same kernel
@@ -343,7 +343,7 @@ fi
 
 # shellcheck disable=SC2086
 if [ -t 2 ] && [ -z "${CHARSIU_NO_PROGRESS:-}" ]; then
-	# stderr through the bar, stdout straight to the terminal. ⚠ The exit
+	# stderr through the bar, stdout straight to the terminal. The exit
 	# status has to come from charsiu_run and not from awk, hence the
 	# explicit plumbing rather than a plain pipeline.
 	{ env $E "$RUN" "$MODEL" -c "$CTX" -t "$THREADS" "$@" 2>&1 1>&3 \

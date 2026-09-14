@@ -4,7 +4,7 @@
 #
 # Does EVERY model's batched prompt say what its token loop says, ON THE BOARD?
 #
-# ⚠⚠ WHY THIS EXISTS. On 2026-08-30 gemma4's batched prompt came back 3.5x
+# WHY THIS EXISTS. On 2026-08-30 gemma4's batched prompt came back 3.5x
 # faster and WRONG on the card -- "31 32 1 2 3" where the token loop counted on
 # to 35 -- after passing on a desktop: six architectures, text identical to
 # their token loops, top-12 logits compared, ASAN clean.
@@ -26,7 +26,7 @@
 #   sh board_text_all.sh [N_GEN]
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -41,20 +41,20 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-# ⚠ /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and it
+# /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and it
 # was reached only by setting CHARSIU_BOARD_DIR by hand. A round that forgot
 # found three, which is under the floor below and so refused -- but a floor
 # that fires every time is a floor nobody reads. The directory goes in the
 # list; the listing below still prints what each one held.
 DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
-# ⚠⚠ AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
+# AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
 # falls back to a matvec a row: the batched loop's ORDER runs and the batched
 # MATMUL does not, so every arm agrees and the round reads as a pass. That is
 # precisely the false pass that let gemma4 and phi3 ship wrong -- six
 # architectures, text identical, logits compared, ASAN clean, all of it on a
 # machine that could not see the bug. Refuse rather than reassure.
-# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
 # minor, so the NPU can sit at accel1 or accel2 and a test that looks only
 # for accel0 refuses on a board that has one.
 if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
@@ -68,7 +68,7 @@ if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:
 	echo "======================================================================" >&2
 	exit 1
 fi
-# ⚠⚠⚠ AND SAY WHAT IT SEARCHED AND WHAT IT FOUND, because a model directory
+# AND SAY WHAT IT SEARCHED AND WHAT IT FOUND, because a model directory
 # that is not mounted looks exactly like a model directory with nothing in it.
 # 2026-09-14: /opt/vendor is its own partition and it came unmounted between
 # two rounds. The script found 2 models instead of 9, printed "2 models
@@ -89,7 +89,7 @@ done
 MINM=${CHARSIU_TEXT_MIN_MODELS:-4}
 if [ "$FOUND" -lt "$MINM" ]; then
 	echo "" >&2
-	echo "⛔ $FOUND gguf files in those directories, fewer than $MINM." >&2
+	echo "$FOUND gguf files in those directories, fewer than $MINM." >&2
 	echo "   A missing mount reads as an empty directory and the summary" >&2
 	echo "   line would still say 'N models compared, 0 differing'." >&2
 	echo "   CHARSIU_TEXT_MIN_MODELS=$FOUND runs it anyway." >&2
@@ -99,7 +99,7 @@ fi
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
-# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+# ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
 # board_text_all.sh spelled this literally and every other script built it with
 # `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
@@ -112,7 +112,7 @@ trap 'rm -rf "$T"' EXIT
 CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
 PROMPT="$(seq 1 32 | tr '\n' ' ')"
 PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
-# ⚠⚠ KMAX IS NOT PINNED HERE, AND THAT IS THE POINT. This file used to set
+# KMAX IS NOT PINNED HERE, AND THAT IS THE POINT. This file used to set
 # CHARSIU_NPU_KMAX=1024 and CHARSIU_NPU_W4_GROUP=1024 under a comment claiming
 # it was "the int4 environment the board actually runs". That stopped being
 # true when llama_auto_kmax landed: the runtime now picks the widest K slice
@@ -127,13 +127,13 @@ PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 # the int4 environment the board actually runs, same as board_vendor.sh
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 ${CHARSIU_TEXT_ENV:-}"
-# ⚠ CHARSIU_TEXT_ENV IS HOW AN ARM GETS CHECKED FOR TEXT. Every change that
+# CHARSIU_TEXT_ENV IS HOW AN ARM GETS CHECKED FOR TEXT. Every change that
 # touches the KV mirror has to come through here with CHARSIU_ATTN_NPU=1, and
 # until r412 the only way to do that was to export it and rely on `env` not
 # clearing the environment -- which works and which nothing says. The header
 # below prints it so a run that forgot is visible in its own output.
 
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and this script is a correctness
 # gate rather than a timing sweep. The build stamp is what it needs.
 echo "binary   $RUN"
@@ -153,7 +153,7 @@ for d in $DIRS; do
 		case " $seen " in *" $b "*) continue ;; esac
 		seen="$seen $b"
 		case "$b" in *Q4_0*|*q4_0*) ;; *) continue ;; esac
-		# ⚠ A SUBSTRING FILTER, for callers isolating one axis. Phase 13
+		# A SUBSTRING FILTER, for callers isolating one axis. Phase 13
 		# sweeps the K slice width and can only do that on models whose
 		# K divides none of the candidate widths -- on any other model
 		# the weights change with the width and the comparison stops
@@ -170,7 +170,7 @@ for d in $DIRS; do
 			-n "$NGEN" --ignore-eos >"$T/c.out" 2>"$T/c.err"
 		p=$(grep -oE "prompt batched|prompt a token" "$T/b.err" | head -1)
 		nrun=$((nrun + 1))
-		# ⚠ strip only the bracketed report lines; the text is the point
+		# strip only the bracketed report lines; the text is the point
 		# -- but read the token count off them FIRST, because a prompt
 		# whose length nobody prints is how this script and its
 		# neighbours came to compare different prompts silently.
@@ -180,7 +180,7 @@ for d in $DIRS; do
 		if cmp -s "$T/b.out" "$T/c.out"; then
 			v="text identical"
 		else
-			v="⚠ TEXT DIFFERS"
+			v="TEXT DIFFERS"
 			nbad=$((nbad + 1))
 		fi
 		printf '%-38s %-14s %s\n' "$b" "${p:-?}" "$v  (${ntok:-?} tok)"
@@ -192,12 +192,12 @@ done
 
 echo
 if [ "$nrun" -eq 0 ]; then
-	echo "⚠ NO Q4_0 MODEL FOUND in $DIRS -- nothing was checked, and that is"
+	echo "NO Q4_0 MODEL FOUND in $DIRS -- nothing was checked, and that is"
 	echo "  not a pass."
 	exit 1
 fi
 echo "$nrun models compared, $nbad differing."
-echo "⚠ A model that says 'prompt a token' is REFUSED, not verified: its"
+echo "A model that says 'prompt a token' is REFUSED, not verified: its"
 echo "  batched path was never exercised, so 'text identical' means only that"
 echo "  the token loop agrees with itself."
 [ "$nbad" -eq 0 ] || exit 1

@@ -250,7 +250,7 @@ struct tokenizer {
 	int add_bos;
 
 	/*
-	 * ⚠ TWO FAMILIES, NOT ONE. A gguf that says tokenizer.ggml.model = gpt2
+	 * TWO FAMILIES, NOT ONE. A gguf that says tokenizer.ggml.model = gpt2
 	 * carries BPE merges; one that says llama carries SentencePiece pieces
 	 * with a SCORE each and no merges at all, and the two are segmented by
 	 * different algorithms. Phi-3.5 and Gemma are the second kind, and this
@@ -329,7 +329,7 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 			tk->special[tk->n_special++] = (int32_t)i;
 
 	/*
-	 * ⚠⚠ gemma4 HAS BOTH, AND THE SCORES ARE THE ONES TO USE.
+	 * gemma4 HAS BOTH, AND THE SCORES ARE THE ONES TO USE.
 	 *
 	 * Its tokenizer.ggml.model is "gemma4", which llama.cpp reads as BPE
 	 * with escape_whitespaces on: spaces become U+2581 the way
@@ -343,7 +343,7 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 	 * which is the order BPE merges in. The two arrive at the same
 	 * segmentation from the two halves of the same table.
 	 *
-	 * ⚠ THIS IS A CLAIM THAT CAN BE WRONG, and tools/tokenizer_roundtrip.c
+	 * THIS IS A CLAIM THAT CAN BE WRONG, and tools/tokenizer_roundtrip.c
 	 * is where it gets checked: a file whose scores are not ranks would
 	 * segment differently and the round trip would still pass, so the
 	 * check that matters is the model answering in words.
@@ -357,7 +357,7 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 	}
 
 	/*
-	 * ⚠⚠ THE MODEL KEY DECIDES, NOT THE PRESENCE OF MERGES. TheBloke's
+	 * THE MODEL KEY DECIDES, NOT THE PRESENCE OF MERGES. TheBloke's
 	 * TinyLlama-1.1B gguf declares tokenizer.ggml.model = llama --
 	 * SentencePiece -- AND carries a 61249 entry merge table, and this
 	 * chose BPE because the merges were there. So a SentencePiece
@@ -411,7 +411,7 @@ struct tokenizer *tokenizer_from_gguf(const struct gguf *g)
 		}
 	} else {
 		/*
-		 * ⚠ NO MERGES IS NOT NECESSARILY A BROKEN FILE. SentencePiece
+		 * NO MERGES IS NOT NECESSARILY A BROKEN FILE. SentencePiece
 		 * carries a score per piece instead, and the segmentation is a
 		 * search over those rather than a sequence of merges. Take that
 		 * path when the scores are there, and only give up when neither
@@ -490,7 +490,7 @@ void tokenizer_free(struct tokenizer *tk)
  * exactly what round 372's 384 token arm shows, the model closing a turn it
  * was never given and the tags landing in the text.
  *
- * ⚠ TYPE 3 ONLY, not 4. USER_DEFINED tokens are added vocabulary that is
+ * TYPE 3 ONLY, not 4. USER_DEFINED tokens are added vocabulary that is
  * usually meant to be seen; the encoder's special list takes both because it
  * is matching literal spellings in a prompt, which is a different question.
  */
@@ -517,7 +517,7 @@ enum chat_fmt chat_format_of(const struct tokenizer *tk)
 }
 
 /*
- * ⚠ GEMMA CALLS THE ASSISTANT "model", and a turn opened with the word
+ * GEMMA CALLS THE ASSISTANT "model", and a turn opened with the word
  * "assistant" is a turn the model has never seen.
  */
 static const char *gemma_role(const char *role)
@@ -529,7 +529,7 @@ size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 		 const char *role, const char *text)
 {
 	/*
-	 * ⚠ AN EMPTY TURN IS NO TURN. phi3's own template guards its system
+	 * AN EMPTY TURN IS NO TURN. phi3's own template guards its system
 	 * message with `if role == 'system' and message['content']`, and this
 	 * wrote the markers with nothing between them.
 	 */
@@ -539,7 +539,7 @@ size_t chat_turn(char *out, size_t max, enum chat_fmt f,
 	}
 
 	/*
-	 * ⚠ GEMMA HAS NO SYSTEM ROLE AT ALL. Its template alternates user and
+	 * GEMMA HAS NO SYSTEM ROLE AT ALL. Its template alternates user and
 	 * model and nothing else; Google's own rendering folds a system
 	 * message into the first user turn. Writing a third role would hand
 	 * the model a marker sequence it has never seen, which is the phi3
@@ -872,7 +872,7 @@ static int bpe_word(const struct tokenizer *tk, const char *w, size_t wn,
 		id = smap_get(&tk->vocab, sy[j].text, sy[j].n);
 		if (id < 0) {
 			/*
-			 * ⚠⚠ THE BYTE FALLBACK WAS WRITTEN AND NEVER WIRED IN.
+			 * THE BYTE FALLBACK WAS WRITTEN AND NEVER WIRED IN.
 			 * spm_byte and the paragraph above it say a byte no
 			 * piece covers is not an error -- the vocabulary
 			 * carries <0x00> through <0xff> for exactly this -- and
@@ -954,11 +954,11 @@ static int32_t special_at(const struct tokenizer *tk, const char *s, size_t n,
  * reaching its start. One pass, and the pieces are recovered by walking the
  * back pointers.
  *
- * ⚠ SPM SPELLS A SPACE AS U+2581, and prepends one to the text. Feeding raw
+ * SPM SPELLS A SPACE AS U+2581, and prepends one to the text. Feeding raw
  * spaces finds no piece at all, since the vocabulary contains none: every
  * word-initial piece begins with the marker.
  *
- * ⚠ AND A BYTE THAT NO PIECE COVERS IS NOT AN ERROR. The vocabulary carries
+ * AND A BYTE THAT NO PIECE COVERS IS NOT AN ERROR. The vocabulary carries
  * <0x00> through <0xff> for exactly that, so an unmatched byte becomes its own
  * token rather than <unk>, and no input is unrepresentable.
  */
@@ -975,7 +975,7 @@ static int32_t spm_byte(const struct tokenizer *tk, unsigned char b)
  * SentencePiece, as the gguf format actually means it: a GREEDY BIGRAM MERGE,
  * not a Viterbi over the piece scores.
  *
- * ⚠ THE SCORES ARE NOT ALWAYS LOG PROBABILITIES, and that is the whole reason
+ * THE SCORES ARE NOT ALWAYS LOG PROBABILITIES, and that is the whole reason
  * this is not the shortest-path search it looks like it should be. Llama 2 and
  * phi3 store real unigram log probabilities, where adding them along a
  * segmentation means something. Gemma stores what is effectively MINUS A RANK:
@@ -1064,7 +1064,7 @@ static int encode_span_spm(const struct tokenizer *tk, const char *s, size_t n,
 	if (!buf)
 		return -1;
 	/*
-	 * ⚠ THE PREPENDED MARKER IS FOR THE START OF THE TEXT, NOT EVERY SPAN.
+	 * THE PREPENDED MARKER IS FOR THE START OF THE TEXT, NOT EVERY SPAN.
 	 * Prepending it to each run between special tokens put a space after
 	 * every one of them: the prompt echoed as "<|system|> \nYou are..."
 	 * and the model, handed a template it had never seen, answered nothing
@@ -1108,7 +1108,7 @@ static int encode_span_spm(const struct tokenizer *tk, const char *s, size_t n,
 	}
 
 	/*
-	 * ⚠ THE ARGUMENTS ARE COPIED FIRST, and the local is not called bg.
+	 * THE ARGUMENTS ARE COPIED FIRST, and the local is not called bg.
 	 * The obvious spelling of this macro declares a `struct spm_bigram bg`
 	 * and is then called as TRY_BIGRAM(bg.left, ...) from a loop that has
 	 * its own bg: the inner one shadows it, `bg_.left = (L)` becomes an
@@ -1323,7 +1323,7 @@ const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len)
 	}
 
 	/*
-	 * ⚠ SentencePiece PIECES ARE NOT BYTE-ENCODED. They are the text
+	 * SentencePiece PIECES ARE NOT BYTE-ENCODED. They are the text
 	 * itself, with U+2581 standing in for a space, and a byte the
 	 * vocabulary could not spell written as the four characters <0xNN>.
 	 * Running them through the GPT-2 byte map would mangle every one.

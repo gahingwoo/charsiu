@@ -13,7 +13,7 @@
  * an eight-bit tensor on a device opened for four and those tensors fall back
  * to the CPU.
  *
- * ⚠⚠ AND THE CHEAP WAY ROUND IT IS DOMINATED, which is why this probe exists
+ * AND THE CHEAP WAY ROUND IT IS DOMINATED, which is why this probe exists
  * rather than a patch. The OTHER direction of the mismatch already works and
  * is shipped: an int8 DEVICE reading int4 codes is what every vision tower
  * does (pack_rows tests t->packed and g->w4 separately and has since it was
@@ -27,7 +27,7 @@
  * the int4 DEVICE runs the int8 tensors, because its entire value is int8's
  * quality at int4's bandwidth. So the question is the one in the title.
  *
- * ⚠ THE ACTIVATION COSTS ALMOST NOTHING AT FOUR BITS, measured on the host
+ * THE ACTIVATION COSTS ALMOST NOTHING AT FOUR BITS, measured on the host
  * reference the same day: w4a8 41.5289, w4a16 40.7016, a 2.0% gap. That
  * matters here because a mixed dispatch would hand the int4 tensors whatever
  * activation the int8 ones need if sharing one pack turned out to be easier
@@ -39,7 +39,7 @@
  * and checks they are two distinct programs. Run it before carrying the tool
  * to the board.
  *
- * ⚠⚠ USE A REAL SHAPE. K=16 N=8 and K=64 N=8 WEDGE THE NPU -- see the note at
+ * USE A REAL SHAPE. K=16 N=8 and K=64 N=8 WEDGE THE NPU -- see the note at
  * the top of npu_fp16_test.c, which cost six wrong explanations. The defaults
  * here are K=256 N=64, which ran 32 of 32 with a clean dmesg.
  *
@@ -52,7 +52,7 @@
  *                          register the emitter only writes on a change --
  *                          fails HERE and passes 1 and 2.
  *
- * ⚠ AN ALTERNATION THAT PASSES ONCE HAS PROVED LITTLE. --loop runs the
+ * AN ALTERNATION THAT PASSES ONCE HAS PROVED LITTLE. --loop runs the
  * alternation N times; a latch that takes two switches to show, or a state
  * that only leaks when a buffer is reused, needs the repeats.
  */
@@ -84,7 +84,7 @@ static int mix4(unsigned a, unsigned b)
 }
 
 /*
- * ⚠ THE ACTIVATION IS EXACTLY REPRESENTABLE IN fp16 ON PURPOSE. The question
+ * THE ACTIVATION IS EXACTLY REPRESENTABLE IN fp16 ON PURPOSE. The question
  * is whether the two programs coexist, not what fp16 rounds to, and a
  * reference that disagrees in the last bit would be read as the former.
  * Sixteenths in [-8, 8) are exact in fp16 and in float.
@@ -152,7 +152,7 @@ static int build(struct charsiu_device *dev, struct charsiu_job *job,
 	}
 
 	/*
-	 * ⚠ THE BYTE, NOT THE VALUE. int8 wants the code around a zero point
+	 * THE BYTE, NOT THE VALUE. int8 wants the code around a zero point
 	 * of 128; int4 wants the signed code in the low nibble, which two's
 	 * complement already puts there for anything in [-8, 7]. This is
 	 * pack_rows' own rule, kept in one place there and repeated here on
@@ -233,7 +233,7 @@ static int fire(struct charsiu_device *dev, struct charsiu_job *job,
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -251,7 +251,7 @@ int main(int argc, char **argv)
 	int32_t *want8 = NULL, *got8 = NULL;
 	int rc = 1, pos = 1, bad = 0, ran = 0, dry = 0, npos = 0;
 
-	/* ⚠ POSITION COUNTED, NOT INFERRED FROM argv INDEX. "--loop 3 512 128"
+	/* POSITION COUNTED, NOT INFERRED FROM argv INDEX. "--loop 3 512 128"
 	 * read 512 as N and left K at its default, silently. */
 	while (pos < argc) {
 		if (!strcmp(argv[pos], "--loop") && pos + 1 < argc)
@@ -273,7 +273,7 @@ int main(int argc, char **argv)
 	printf("one device, K=%u N=%u, %u alternations\n", k, n, loop);
 
 	/*
-	 * ⚠ THE HALF A DESK CAN DECIDE, and it is worth having separately: a
+	 * THE HALF A DESK CAN DECIDE, and it is worth having separately: a
 	 * board round that dies because the emitter refuses one of the two
 	 * dtypes has spent the round on a question the host could have
 	 * answered. --dry builds both jobs with no buffer objects at all and
@@ -310,12 +310,12 @@ int main(int argc, char **argv)
 				diff++;
 		printf("  %zu words differ over the shorter stream\n", diff);
 		if (!n8 || !n4) {
-			puts("⚠⚠ AN EMITTER REFUSED ONE OF THE TWO. There is "
+			puts("AN EMITTER REFUSED ONE OF THE TWO. There is "
 			     "nothing for the board to answer yet.");
 			return 1;
 		}
 		if (!diff && n8 == n4) {
-			puts("⚠⚠ THE TWO PROGRAMS ARE IDENTICAL, which cannot "
+			puts("THE TWO PROGRAMS ARE IDENTICAL, which cannot "
 			     "be right: the dtype fields alone must differ. "
 			     "This probe is not building what it says.");
 			return 1;
@@ -341,7 +341,7 @@ int main(int argc, char **argv)
 		A8[i] = mix8(0, i, 64);
 	}
 	/*
-	 * ⚠ ONE W, TWO READINGS OF IT. The same codes go into both jobs --
+	 * ONE W, TWO READINGS OF IT. The same codes go into both jobs --
 	 * as a byte around 128 for int8 and as a nibble for int4 -- so the two
 	 * references are the same arithmetic and a difference between the arms
 	 * cannot be the test data.
@@ -382,7 +382,7 @@ int main(int argc, char **argv)
 		ran++;                                                        \
 	} while (0)
 	/*
-	 * ⚠ AN ABSOLUTE TOLERANCE, because the reference is a double and the
+	 * AN ABSOLUTE TOLERANCE, because the reference is a double and the
 	 * hardware accumulates the fp16 products. The activations are exact
 	 * sixteenths and the codes are integers, so every product is exact and
 	 * only the SUM can drift; 1e-3 on a dot product of a few hundred terms
@@ -406,7 +406,7 @@ int main(int argc, char **argv)
 	if (!fire(dev, &j8, &b8, n, got8)) CHECK8("int8 alone");
 	if (!fire(dev, &j4, &b4, n, got4)) CHECK4("int4 alone");
 	if (bad) {
-		puts("\n⚠⚠ A CONTROL FAILED. Nothing below this line means "
+		puts("\nA CONTROL FAILED. Nothing below this line means "
 		     "anything: fix the arm that is wrong before reading the "
 		     "alternation.");
 		charsiu_close(dev);

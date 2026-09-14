@@ -15,12 +15,12 @@
 # the width axis it is now 2 registers away at M = 32 and 64 -- fewer than at
 # M = 1, where this hardware is known to be right. This is the board's half.
 #
-# ⚠ IT CHECKS BEFORE IT TIMES. llama_batch_probe compares every row against the
+# IT CHECKS BEFORE IT TIMES. llama_batch_probe compares every row against the
 # one row path and prints which rows agree, so a fast wrong answer cannot pass:
 # this tree has already shipped one, an int4 prompt that came back
 # "ITES  (un- a- -  ( -  ' \ l'" at a very respectable 37.46 tok/s.
 #
-# ⚠ AND IT RUNS THE HEIGHT AXIS FIRST, as the control. If the height arm also
+# AND IT RUNS THE HEIGHT AXIS FIRST, as the control. If the height arm also
 # reports rows agreeing then the probe is not discriminating and neither arm
 # means anything -- five rounds say it must fail.
 #
@@ -32,7 +32,7 @@
 #   CHARSIU_AXIS_TIMEOUT=600 seconds one arm may take before it is killed
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -50,13 +50,13 @@ done
 [ -n "${RUN:-}" ] || { echo "board_w4_axis: charsiu_run not found" >&2; exit 1; }
 
 # --- the model -------------------------------------------------------------
-# ⚠ int4 AND llama, the same file prefill_control.sh uses, so the two rounds
+# int4 AND llama, the same file prefill_control.sh uses, so the two rounds
 # are about one model.
 DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models"
-# ⚠ A SUBSTRING IS ENOUGH. Two rounds have now been spent on a path typed
+# A SUBSTRING IS ENOUGH. Two rounds have now been spent on a path typed
 # by hand: one ran the wrong model entirely and answered its question
 # perfectly. `board_w4_axis.sh phi3` cannot miss the file it means.
-# ⚠ AND IT FOLDS CASE AND PUNCTUATION. The file is `Phi-3.5-mini-...` and
+# AND IT FOLDS CASE AND PUNCTUATION. The file is `Phi-3.5-mini-...` and
 # the thing anyone types is `phi3`; a literal substring matches neither that
 # nor `gemma4` against `gemma-4-E2B-it`. Both sides go to lowercase letters
 # and digits before they are compared.
@@ -100,11 +100,11 @@ fi
 
 OUTDIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUTDIR"
-# ⚠ 80, NOT 32. The probe's widths are 2 4 8 16 32 48 64 80 and this argument
+# 80, NOT 32. The probe's widths are 2 4 8 16 32 48 64 80 and this argument
 # CAPS them. It said 32 for one round after the widths were extended, so the
 # round that existed to reach 48, 64 and 80 never left 32.
 MMAX=${CHARSIU_PROBE_MMAX:-80}
-# ⚠⚠ ONE WEDGED ARM MUST NOT TAKE THE OTHER DOWN. The gemma4 round ran the
+# ONE WEDGED ARM MUST NOT TAKE THE OTHER DOWN. The gemma4 round ran the
 # height control first, the control hung the NPU, and the width arm -- the only
 # one with anything to say about that model -- never printed. A refused model is
 # being probed precisely because it is misbehaving, so the control is the arm
@@ -115,7 +115,7 @@ command -v timeout >/dev/null 2>&1 || TMO=
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -124,7 +124,7 @@ echo "probe    --batch-probe $MMAX   (widths up to that, checked then timed)"
 echo "arms     $ARMS${TMO:+   (${TMO}s each, then killed)}"
 echo
 
-# ⚠⚠ THE WHOLE int4 ENVIRONMENT, NOT JUST THE AXIS. This is the set
+# THE WHOLE int4 ENVIRONMENT, NOT JUST THE AXIS. This is the set
 # board_vendor.sh runs and it is the one that puts the run on the int4 path at
 # all; CHARSIU_NPU_W4V=1 alone with no CHARSIU_NPU=1 stages nothing, and the
 # probe then says "no NPU staged" and exits 1 -- a round that fails loudly is
@@ -134,7 +134,7 @@ W4_ENV="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
-# ⚠ AND THE READ ORDER'S SECOND HALF, which the in place scan pointed at.
+# AND THE READ ORDER'S SECOND HALF, which the in place scan pointed at.
 # Row 0 agrees on EXACTLY half its channels and the first it misses is 16;
 # charsiu_acc_index splits the channel as a = (c%32)/16, so a = 0 is exactly
 # half of them and 16 is the first of the other half. `a * 4` is the only term
@@ -150,12 +150,12 @@ for AXIS in $ARMS; do
 	esac
 	echo "===== M axis: $AXIS -- $label ====="
 	out="$OUTDIR/w4-axis-$AXIS.txt"
-	# ⚠ THE CONTROL MUST REACH THE HARDWARE. Round one set W4_BATCH=1 on
+	# THE CONTROL MUST REACH THE HARDWARE. Round one set W4_BATCH=1 on
 	# both arms, and on the height arm the gate in npudev.c refused it --
 	# so the arm that had to fail failed in software and said nothing about
 	# the silicon. "height" is the value that lets the wrong axis through
 	# on purpose.
-	# ⚠ int4 batching is ON BY DEFAULT now, so only the control needs a
+	# int4 batching is ON BY DEFAULT now, so only the control needs a
 	# switch: "height" is what lets the arm that must fail reach the
 	# hardware at all.
 	case $AX in h) GATE=height ;; *) GATE= ;; esac
@@ -192,7 +192,7 @@ for AXIS in $ARMS; do
 		echo
 		continue
 	fi
-	# ⚠ NO head CAP. This had one at 18 lines and the landing table is
+	# NO head CAP. This had one at 18 lines and the landing table is
 	# exactly 18 lines long, so the round came back with row 0 sampled to
 	# channel 384 and nothing else -- no row 1, and none of the timing
 	# table either. The round before that lost m = 8 to a head -80 in
@@ -203,7 +203,7 @@ for AXIS in $ARMS; do
 done
 
 echo "======================================================================"
-# ⚠ DO NOT TELL A ONE ARM ROUND TO READ AN ARM IT DID NOT RUN. Skipping the
+# DO NOT TELL A ONE ARM ROUND TO READ AN ARM IT DID NOT RUN. Skipping the
 # control is a real choice on a model whose control hangs, and the footer
 # saying "the height arm must disagree" under an output with no height arm is
 # how a round gets read as inconclusive when it was not.
@@ -241,7 +241,7 @@ echo "  5.1e-05 at every one. This round should reproduce that with nothing"
 echo "  set, and it reaches 48, 64 and 80 as well -- the widths a real prompt"
 echo "  actually hands it, which have never been asked."
 echo
-echo "  ⚠ m = 8 IS THE ONE THAT BENDS: 871 of 904, worst 3.1e+04, where every"
+echo "  m = 8 IS THE ONE THAT BENDS: 871 of 904, worst 3.1e+04, where every"
 echo "  other width is exact. It has been four to six orders out in every arm"
 echo "  of every round. Nothing here explains it and the refusal stays until"
 echo "  something does."

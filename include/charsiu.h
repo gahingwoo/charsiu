@@ -4,7 +4,7 @@
 #define CHARSIU_H
 
 /*
- * ⚠ THE COMMIT THE BINARY WAS BUILT FROM, compiled in by the Makefile. A
+ * THE COMMIT THE BINARY WAS BUILT FROM, compiled in by the Makefile. A
  * board binary is copied to a name like /root/charsiu_run_win and /opt/charsiu
  * is not a checkout, so nothing on the board can otherwise say which version
  * produced a number. "unknown" is what a build outside the tree gets, and it
@@ -175,7 +175,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 /*
  * fp16 WEIGHTS, which is the precision the vendor runs attention in.
  *
- * ⚠⚠ THE LAYOUT IS THE ONE THING THE VENDOR'S FILE CANNOT SETTLE. Its size
+ * THE LAYOUT IS THE ONE THING THE VENDOR'S FILE CANNOT SETTLE. Its size
  * registers are exact and dense -- 0x101c = ic*oc*2, 0x1020 = ic*2, both the
  * true byte count over all 8308 dispatches that write them -- but a grouping
  * does not change a total, so the byte ORDER inside a kernel is invisible from
@@ -189,7 +189,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  *   CHARSIU_W16_ATOM    the activation packer's shape, [k/8][n][8]
  *   CHARSIU_W16_GROUP   int8's ngroup/kgroup tiling with 2 byte elements
  *
- * 🏁 THE BOARD SAID **GROUP**, 2026-09-05: ngroup 16, kgroup 32, two byte
+ * THE BOARD SAID **GROUP**, 2026-09-05: ngroup 16, kgroup 32, two byte
  * elements, which is exactly what charsiu_weight_ngroup() and
  * charsiu_weight_kgroup() already return for fp16 by inheriting int8's
  * numbers. The inherited guess was right.
@@ -204,7 +204,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  * The base slot of channel n is 1024 * (n / 16) + 32 * (n % 16), and k runs
  * contiguously from it.
  *
- * ⚠⚠⚠ AND I PUBLISHED "DENSE, MEASURED THREE TIMES" BEFORE THIS. Every earlier
+ * AND I PUBLISHED "DENSE, MEASURED THREE TIMES" BEFORE THIS. Every earlier
  * reading was taken at K=16 N=8, and AT THAT SHAPE THE TWO LAYOUTS ARE
  * IDENTICAL IN ALL 128 CELLS: ngroup 16 exceeds N=8 and kgroup 32 exceeds
  * K=16, so the grouping degenerates to 16n + k, which is also what dense
@@ -216,7 +216,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  * probes look unreliable for an evening. One bad choice of shape produced a
  * wrong answer AND the noise that hid it.
  *
- * ⚠ A LAYOUT PROBE MUST RUN WHERE THE CANDIDATES DIFFER. Check that first, on
+ * A LAYOUT PROBE MUST RUN WHERE THE CANDIDATES DIFFER. Check that first, on
  * a desk, before spending a board round: tests/pack_f16w.c can compare two
  * layouts for any shape without hardware.
  */
@@ -240,7 +240,7 @@ size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
  * written for int8 since round 139 -- the GROUP tiling with ng = 32 rather
  * than fp16's 16. Byte offsets, SIZE_MAX if outside.
  *
- * ⚠ THE ng DIFFERENCE IS THE TRAP. An fp16 KV surface is appended along n and
+ * THE ng DIFFERENCE IS THE TRAP. An fp16 KV surface is appended along n and
  * may be run at any multiple of 16 because the offset stops depending on n
  * once every group is full. The int8 one has that property at a multiple of
  * 32, and running it at a multiple of 16 that is not one of 32 reads a
@@ -303,7 +303,7 @@ static inline uint16_t charsiu_f2h(float f)
 }
 
 /*
- * ⚠⚠ A RUN OF THEM, AND THE SCALAR LOOP IS FOURTEEN INSTRUCTIONS AN ELEMENT.
+ * A RUN OF THEM, AND THE SCALAR LOOP IS FOURTEEN INSTRUCTIONS AN ELEMENT.
  *
  * Packing a group's activations is where an fp16 attention layer spends its
  * CPU time, and the run is long: the VALUES matmul contracts over k = the
@@ -313,7 +313,7 @@ static inline uint16_t charsiu_f2h(float f)
  * ubfx/sub/lsr/and/cmp/orr/orr/cmp/orr/and/strh once per float, which the
  * board reads as about 2.8 ns an element.
  *
- * ⚠ THIS IS NOT vcvt_f16_f32. The hardware instruction rounds to nearest even
+ * THIS IS NOT vcvt_f16_f32. The hardware instruction rounds to nearest even
  * and keeps subnormals; charsiu_f2h TRUNCATES and flushes them, and every fp16
  * buffer this project has checked against the NPU was built that way. So the
  * vector form is the same INTEGER arithmetic done four lanes at a time, not
@@ -325,7 +325,7 @@ static inline uint16_t charsiu_f2h(float f)
 #include <arm_neon.h>
 
 /*
- * ⚠ THIS WAS ALREADY IN THE TREE, as a file static `charsiu_vhalf` in
+ * THIS WAS ALREADY IN THE TREE, as a file static `charsiu_vhalf` in
  * regcmd.c, twenty lines above the prefill pack it was written for -- and a
  * second one got written here before anyone looked. It is the same arithmetic
  * to the bit; the two differed only in which of the two selects came last,
@@ -467,7 +467,7 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m,
 int charsiu_m_axis_wide_for(int w4);
 
 /*
- * ⚠ A CONVERSATION SHOWS THE CONVERSATION, AND NOTHING ELSE.
+ * A CONVERSATION SHOWS THE CONVERSATION, AND NOTHING ELSE.
  *
  * This tree prints a running commentary on stderr -- which CPUs it pinned, what
  * the governor is, which tensors did not reach the hardware and why, which path
@@ -507,7 +507,7 @@ struct charsiu_job {
 	float input_scale;
 	float weight_scale;
 	/*
-	 * ⭐ ONE SCALE PER OUTPUT CHANNEL, when a caller has them. NULL means
+	 * ONE SCALE PER OUTPUT CHANNEL, when a caller has them. NULL means
 	 * weight_scale for every channel, which is what every caller did until
 	 * 2026-09-13 -- and the hardware has had a per channel fp16 table all
 	 * along: charsiu_build_coefs writes `n` of them and filled every one

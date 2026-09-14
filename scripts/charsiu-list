@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0
 # `charsiu list`. Not meant to be run directly; charsiu dispatches to it.
 #
-# ⚠ Columns, in the order ollama uses, so the output is legible to anyone who
+# Columns, in the order ollama uses, so the output is legible to anyone who
 # has used that: NAME, SIZE, then what is particular to us. The last column is
 # the one that matters here and no other runner has it: whether the file can
 # actually run, read out of the file rather than off its name.

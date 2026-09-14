@@ -3,7 +3,7 @@
 /*
  * getenv, once per name.
  *
- * ⚠ THE REGISTER STREAM IS EMITTED PER CALL ON THE BATCHED PATH, and
+ * THE REGISTER STREAM IS EMITTED PER CALL ON THE BATCHED PATH, and
  * charsiu_emit_job asked the environment fifteen times per emission --
  * CHARSIU_DPU_4038, CHARSIU_W4_BITPAT, CHARSIU_CNA_1098 and the rest, every
  * one a linear scan of environ with a strcmp per entry. Phase 20 priced the

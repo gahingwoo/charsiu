@@ -40,7 +40,7 @@ struct charsiu_device {
 };
 
 /*
- * ⚠ A BOARD WITH NO DEBUGGER DESERVES BETTER THAN "Segmentation fault".
+ * A BOARD WITH NO DEBUGGER DESERVES BETTER THAN "Segmentation fault".
  *
  * Every crash this project has had on hardware arrived as that one word and
  * nothing else: no tensor, no shape, no stage. Two rounds went into narrowing
@@ -52,7 +52,7 @@ struct charsiu_device {
  * plus two numbers; the handler writes them and re-raises, so the shell still
  * reports the real signal and a core file is still produced.
  *
- * ⚠ ASYNC SIGNAL SAFE, which rules out printf and every string function that
+ * ASYNC SIGNAL SAFE, which rules out printf and every string function that
  * allocates. write() and a hand rolled integer are all that is allowed here,
  * and the note must point at a string literal or a buffer that outlives the
  * crash -- never at something on a stack that is about to be unwound.
@@ -114,7 +114,7 @@ void charsiu_note_install(void)
 }
 
 /*
- * ⚠ THE NODE IS NOT ALWAYS accel0. An accel device is numbered in the order
+ * THE NODE IS NOT ALWAYS accel0. An accel device is numbered in the order
  * the class hands minors out, so unbinding rocket and binding it again gives
  * accel1, then accel2: after two unbind and rebind rounds on a ROCK 4D the
  * NPU was at accel2 and everything here opened accel0, found nothing, and
@@ -255,7 +255,7 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 
 	req.handle = bo->handle;
 	/*
-	 * ⚠⚠ SPIN BEFORE SLEEPING, BECAUSE THE SLEEP IS WHAT COSTS.
+	 * SPIN BEFORE SLEEPING, BECAUSE THE SLEEP IS WHAT COSTS.
 	 *
 	 * The kernel's wait is dma_resv_wait_timeout(): the task sleeps, the
 	 * NPU finishes, the hardirq wakes an irq thread, the thread signals
@@ -283,7 +283,7 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 			const char *e = getenv("CHARSIU_NPU_SPIN_US");
 
 			/*
-			 * ⭐ 200 SINCE r411, WHICH IS THE FIRST TIME IT WAS
+			 * 200 SINCE r411, WHICH IS THE FIRST TIME IT WAS
 			 * PRICED. Phase 20 wrote it and left it off "until
 			 * phase 21 has priced it against the arm that disables
 			 * CPU_SLEEP outright", and phase 21 never did.
@@ -343,7 +343,7 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 }
 
 /*
- * ⚠⚠ WHETHER THE SPIN EVER WON, BECAUSE OTHERWISE A NULL RESULT HAS TWO
+ * WHETHER THE SPIN EVER WON, BECAUSE OTHERWISE A NULL RESULT HAS TWO
  * READINGS AND THIS TREE HAS PAID FOR THAT FOUR TIMES IN ONE NIGHT.
  *
  * CHARSIU_NPU_SPIN_US polls before falling back to the blocking wait. If a

@@ -23,7 +23,7 @@
 # which is the method that worked on 0x4050 and on 0x40b8, and scores each by
 # the one number that cannot be argued with: how many words the board wrote.
 #
-# ⚠ THE BASELINE IS THE CONTROL AND IT RUNS FIRST. It must reproduce 92 of 128.
+# THE BASELINE IS THE CONTROL AND IT RUNS FIRST. It must reproduce 92 of 128.
 # If it does not, the build or the shape moved and no row below means anything.
 #
 # `charsiu update dev` installs this at /opt/charsiu/board_width_short.sh.
@@ -32,9 +32,9 @@
 set -u
 
 #
-# ⚠⚠ NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
+# NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
 # npu_gemm_test is compiled with the same -DCHARSIU_BUILD as charsiu_run and
-# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
 # no --version to print it back" and warned that its first argument is read
 # through atoi, so asking would submit a dimension of zero. Both halves were
 # true when written; the flag went into every tool afterwards and is checked
@@ -58,7 +58,7 @@ WANT=128                          # m * n, the number of words a full surface ha
 
 # how many words the board wrote, and how many reference values never appeared.
 #
-# ⚠ THE ABSENT COUNT IS ON ITS OWN LINE. The first version read it off the
+# THE ABSENT COUNT IS ON ITS OWN LINE. The first version read it off the
 # "of N reference values:" line, which ends at the comma before it, and got the
 # empty string for every row -- a whole column of "?" that would have been read
 # as the tool not reporting it.
@@ -85,7 +85,7 @@ echo
 
 set -- $(score "")
 BASE=$1
-# ⚠ THE EXPECTED BASELINE MOVED WHEN THE SWEEP SUCCEEDED. It was 92 of 128
+# THE EXPECTED BASELINE MOVED WHEN THE SWEEP SUCCEEDED. It was 92 of 128
 # because 0x40b8 was 3 at every M on this axis. It is 3 * M now, so a correct
 # build writes the full surface with no override at all and this script's own
 # answer became its baseline. CHARSIU_WS_BASE=92 restores the old expectation
@@ -94,7 +94,7 @@ EXPECT=${CHARSIU_WS_BASE:-$WANT}
 echo "baseline (no override):  wrote $1 of $WANT words, $2 values absent"
 if [ "$BASE" != "$EXPECT" ]; then
 	echo
-	echo "⚠ STOP. The baseline must be $EXPECT of $WANT and it is $BASE."
+	echo "STOP. The baseline must be $EXPECT of $WANT and it is $BASE."
 	echo "  Every row below is measured against it, so nothing here can be"
 	echo "  read. If this is a build from before 0x40b8 was fixed, the old"
 	echo "  expectation is CHARSIU_WS_BASE=92."
@@ -104,7 +104,7 @@ echo
 printf '  %-9s %-11s %-9s %-9s %s\n' register value wrote absent verdict
 printf '  %-9s %-11s %-9s %-9s %s\n' -------- ----- ----- ------ -------
 
-# ⚠ ONE FIELD AT A TIME, FROM THE BASELINE. Two at once and a pair that helps
+# ONE FIELD AT A TIME, FROM THE BASELINE. Two at once and a pair that helps
 # and hurts reads as no change.
 #
 # The values are ours at m=2 on the width axis, then multiples: 0x1090 is 8,

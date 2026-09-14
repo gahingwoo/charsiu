@@ -5,7 +5,7 @@
 # charsiu-config: a front end to config.ini -- $HOME/.charsiu's if there is one,
 # /etc/charsiu's otherwise -- and to the charsiu tools.
 #
-# ⚠ NO CURSES. kiln's equivalent is a whiptail TUI because kiln runs on Armbian,
+# NO CURSES. kiln's equivalent is a whiptail TUI because kiln runs on Armbian,
 # which has one. charsiu's rootfs is a minimal buildroot with no whiptail, no
 # dialog, no newt and no slang, and the board is normally driven over a
 # 1.5 Mbaud serial console where a full-screen redraw is worse than a numbered
@@ -27,7 +27,7 @@ done
 command -v ini_get >/dev/null 2>&1 \
 	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
-# ⚠ WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION. charsiu_conf_w
+# WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION. charsiu_conf_w
 # copies an unwritable system config into $HOME rather than replacing the NAME
 # with one that does not exist, which is what made this screen say
 # "now: (unset)" on a board whose config was fine and whose model was running.
@@ -55,7 +55,7 @@ else C_B=; C_G=; C_Y=; C_D=; C_0=; fi
 # ---------------------------------------------------------------------------
 # ini_set lives in charsiu-lib.sh: charsiu update writes settings too now.
 
-# ⚠ A cancelled ui_input must not silently write an empty value into the
+# A cancelled ui_input must not silently write an empty value into the
 # config. ask keeps the old value when the user backs out.
 ask() {   # ask PROMPT DEFAULT -> the answer, or DEFAULT if cancelled
 	v=$(ui_input "$1" "$2") || v="$2"
@@ -76,7 +76,7 @@ page_model() {
 	while :; do
 		cur=$(ini_get model path)
 		set --
-		# ⚠ BOTH DIRECTORIES. Every other place in this file already looks
+		# BOTH DIRECTORIES. Every other place in this file already looks
 		# in /opt/charsiu/models as well, and only this screen did not, so
 		# the board's own model was invisible to the one page whose job is
 		# to pick it: the menu offered [get] and nothing else.
@@ -104,7 +104,7 @@ now: ${cur:-(unset)}" "$@") || return
 			for _d in "$MODELS_DIR" /opt/charsiu/models; do
 				[ -f "$_d/$sel" ] && { sel="$_d/$sel"; break; }
 			done
-			# ⚠ never point the config at a file the runtime cannot load
+			# never point the config at a file the runtime cannot load
 			CK=$(find_bin charsiu_check)
 			if [ -n "$CK" ] && ! out=$("$CK" -q "$sel" 2>&1); then
 				ui_msg "Not selected.
@@ -167,14 +167,14 @@ page_show() {
 # ---------------------------------------------------------------------------
 # FIRST RUN, as a list of steps rather than a queue of questions.
 #
-# ⚠ Taken from codex's onboarding (codex-rs/tui/src/onboarding/): a list of
+# Taken from codex's onboarding (codex-rs/tui/src/onboarding/): a list of
 # steps, each of which ASSESSES ITSELF as hidden, complete or in progress. A
 # step that is already satisfied is never shown, a finished one stays on screen
 # as a record of what happened, and exactly one is being worked on. Somebody
 # coming back a second time sees only what is left, which is the difference
 # between a wizard and an interrogation.
 #
-# ⚠ And from crush's splash: the empty state SHOWS EXAMPLES. A bare ">" teaches
+# And from crush's splash: the empty state SHOWS EXAMPLES. A bare ">" teaches
 # a new owner of this board nothing at all; three things they can type teach
 # them the whole idea.
 #
@@ -184,7 +184,7 @@ page_show() {
 # ---------------------------------------------------------------------------
 STEPS="kernel model pick ready"
 
-# ⚠ NOT A TODO. Nothing this screen can do makes an NPU appear, and a step that
+# NOT A TODO. Nothing this screen can do makes an NPU appear, and a step that
 # reports "todo" forever is picked again on every pass -- which is exactly what
 # the first version did, looping on the same message. codex's model has a place
 # for this: a COMPLETE step whose label carries the finding. It is checked, it
@@ -223,7 +223,7 @@ step_pick_label() {
 	                              || echo "no model chosen"
 }
 step_pick_do() {
-	# ⚠ One model and nothing to decide: choose it and say so, rather than
+	# One model and nothing to decide: choose it and say so, rather than
 	# opening a menu with one row in it.
 	only=$(ls "$MODELS_DIR"/*.gguf /opt/charsiu/models/*.gguf 2>/dev/null)
 	n=$(echo "$only" | wc -l)
@@ -242,11 +242,11 @@ step_ready_label() { echo "ready"; }
 step_ready_do() {
 	mkdir -p "$(dirname "$STAMP")" 2>/dev/null || true
 	: > "$STAMP" 2>/dev/null || true
-	# ⚠ crush's lesson: do not hand anyone an empty prompt.
+	# crush's lesson: do not hand anyone an empty prompt.
 	hint=""
 	[ -e "${CHARSIU_ACCEL_DEV:-/dev/accel/accel0}" ] || hint="
 
-⚠ There is no NPU on this kernel, so this runs on the CPU. To fix
+There is no NPU on this kernel, so this runs on the CPU. To fix
 that, /opt/charsiu/charsiu-install.sh can fetch a kernel that has
 the driver."
 	ui_msg "Ready.$hint
@@ -309,7 +309,7 @@ case "${1:-}" in
 --setup)      setup_walk; exit $? ;;
 --setup-once) [ -e "$STAMP" ] && exit 0; setup_walk; exit $? ;;
 -h|--help)
-	# ⚠ THIS WAS NOT HANDLED, so `charsiu-config --help` fell through to the
+	# THIS WAS NOT HANDLED, so `charsiu-config --help` fell through to the
 	# menu and opened a full-screen dialog. On a board whose test harness
 	# logs to the same console that is not a small thing: whiptail clears the
 	# screen, and round 381 lost its first two arms to it.
@@ -352,7 +352,7 @@ while :; do
 	debug)  page_debug ;;
 	chat)   L=$(find_bin charsiu); [ -n "$L" ] && CHARSIU_CONFIG="$CONF" "$L" --chat || true; pause ;;
 	update)
-		# ⚠ IT REPLACES THE SCRIPTS THIS MENU IS RUNNING FROM, so hand
+		# IT REPLACES THE SCRIPTS THIS MENU IS RUNNING FROM, so hand
 		# over with exec rather than returning into a page that is no
 		# longer the one on disk.
 		U=$(find_bin charsiu-update)

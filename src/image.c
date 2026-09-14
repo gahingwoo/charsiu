@@ -3,7 +3,7 @@
 /*
  * A picture off the disk, in the shape a vision tower reads.
  *
- * ⚠ THE PREPROCESSING IS PART OF THE MODEL. A tower trained on one resize and
+ * THE PREPROCESSING IS PART OF THE MODEL. A tower trained on one resize and
  * one normalisation, fed another, does not fail: it answers confidently about
  * a different picture. So the mean and the standard deviation come from the
  * mmproj's own keys, and the resize is written down here rather than left to
@@ -27,7 +27,7 @@
 /*
  * Bilinear, on the half pixel centres.
  *
- * ⚠ HALF PIXEL CENTRES, not corner aligned. torchvision's default and PIL's
+ * HALF PIXEL CENTRES, not corner aligned. torchvision's default and PIL's
  * both map dst pixel i to src (i + 0.5) * scale - 0.5, and the corner aligned
  * form ((i * (w - 1)) / (dw - 1)) differs by half a pixel at every point. On a
  * 512 wide image that is a shift no test of ours would notice and every caption
@@ -79,7 +79,7 @@ static void resize_bilinear(const unsigned char *src, int sw, int sh, int comp,
  * Load `path`, resize it to `side` x `side`, scale to 0..1 and lay it out as
  * [3][side][side]. The caller normalises with the tower's own mean and std.
  *
- * ⚠ IT SQUASHES RATHER THAN CROPS. Every tower here takes a square, and the
+ * IT SQUASHES RATHER THAN CROPS. Every tower here takes a square, and the
  * two ways to get one are to letterbox and to stretch. Stretching is what
  * transformers' image processors do for these models, so it is what this does;
  * it is written here so that when a caption is subtly wrong about a very tall

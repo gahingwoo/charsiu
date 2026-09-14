@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0
 """Compare two TTFT-against-length curves without fitting a line to two points.
 
-⚠⚠ WHY THIS EXISTS. The prefill gap against the vendor was quoted as "1.23x
+WHY THIS EXISTS. The prefill gap against the vendor was quoted as "1.23x
 per prompt token" for weeks. That came from timing two prompt lengths a side
 and reading the slope. r392 measured eight lengths and killed it: the curve is
 convex, it is not even monotone in its marginal because prompt length decides
@@ -23,7 +23,7 @@ rather than averaging them into one number:
 Both are true and they do not agree. Reporting one without the other is how
 the 1.76x-in-both-directions reading happened in the first place.
 
-⚠ The interpolation is quadratic in n and local -- three nearest points -- so
+The interpolation is quadratic in n and local -- three nearest points -- so
 one chunking step does not bend the whole curve. Extrapolation is refused: a
 target outside a curve's measured range prints nothing rather than a number.
 
@@ -63,7 +63,7 @@ def at(pts, x):
 
 
 def self_test():
-    """⚠ THIS TOOL IS ABOUT TO PRODUCE A HEADLINE NUMBER, so the interpolation
+    """THIS TOOL IS ABOUT TO PRODUCE A HEADLINE NUMBER, so the interpolation
     it rests on is checked against functions whose answer is known."""
     ok = True
 

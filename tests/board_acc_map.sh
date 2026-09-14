@@ -21,22 +21,22 @@
 # npu_gemm_test --read prints the permutation itself rather than a candidate
 # for it. That is what solved the height axis and it is what this asks for.
 #
-# ⚠ THE HEIGHT ARM IS THE CONTROL AND IT IS SOLVED. It must come back EXACT.
+# THE HEIGHT ARM IS THE CONTROL AND IT IS SOLVED. It must come back EXACT.
 # If it does not, the shape or the build moved and the width map cannot be
 # read against anything.
 #
-# ⚠ THE WIDTH ARM WROTE A SHORT SURFACE THE FIRST TIME THIS RAN, 92 of 128
+# THE WIDTH ARM WROTE A SHORT SURFACE THE FIRST TIME THIS RAN, 92 of 128
 # words, and that was 0x40b8: it is 3 * the batch count, and `rows` -- which is
 # what the code multiplied -- is 1 on the width axis. Swept on the board, 6 at
 # m = 2 writes all 128 with nothing absent. The default now computes it from
 # whichever of ow and rows carries M, so this run should come back FULL, and
 # the map underneath it is the thing that was never legible before.
 #
-# ⚠ AND IT RUNS m = 8 TOO. 3 * M is confirmed at m = 1, 2 and 4 on the height
+# AND IT RUNS m = 8 TOO. 3 * M is confirmed at m = 1, 2 and 4 on the height
 # axis and at m = 2 on the width. m = 8 is a width it has not been seen at,
 # which is the whole point of asking.
 #
-# ⚠ K = 64 N = 64 ON PURPOSE. locate() reports the FIRST index holding a value,
+# K = 64 N = 64 ON PURPOSE. locate() reports the FIRST index holding a value,
 # so a reference with few distinct values answers a question it was not asked.
 # At this shape it has 112 distinct in 128, and it prints that count itself.
 #
@@ -46,9 +46,9 @@
 set -u
 
 #
-# ⚠⚠ NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
+# NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
 # npu_gemm_test is compiled with the same -DCHARSIU_BUILD as charsiu_run and
-# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
 # no --version to print it back" and warned that its first argument is read
 # through atoi, so asking would submit a dimension of zero. Both halves were
 # true when written; the flag went into every tool afterwards and is checked
@@ -102,7 +102,7 @@ for AXIS in h w; do
 			echo
 			continue
 		fi
-		# ⚠ THE VERDICT BEFORE THE MAP, NOT AFTER IT. This printed the
+		# THE VERDICT BEFORE THE MAP, NOT AFTER IT. This printed the
 		# map with head -80 and the summary lines come AFTER the map,
 		# so at m = 8 -- where the map is 512 words -- the counts were
 		# cut off on BOTH arms and that width was silently not
@@ -111,7 +111,7 @@ for AXIS in h w; do
 		grep "distinct values in" "$out" | sed 's/^/  /'
 		grep "are absent from the buffer" "$out" | sed 's/^/  /'
 		grep "the board wrote" "$out" | sed 's/^/  /'
-		grep "never computed, so no read order" "$out" | sed 's/^/  ⚠ /'
+		grep "never computed, so no read order" "$out" | sed 's/^/  /'
 		echo "  --- the map (first 40 rows of it) ---"
 		sed -n '/the whole output, as the/,$p' "$out" \
 			| head -44 | sed 's/^/  /'

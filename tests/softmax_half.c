@@ -4,7 +4,7 @@
  * softmax_scaled followed by the fp16 conversion, against softmax_scaled_half,
  * bit for bit.
  *
- * ⚠⚠ WHY THIS EXISTS. Two copies of one piece of arithmetic is the hazard this
+ * WHY THIS EXISTS. Two copies of one piece of arithmetic is the hazard this
  * tree keeps meeting: the fp16 weight layout, the accumulator read order, the
  * activation packer. The fused softmax is a second copy by construction -- it
  * has to be, because the point of it is to write halves instead of floats --

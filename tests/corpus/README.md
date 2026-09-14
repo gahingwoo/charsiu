@@ -11,7 +11,7 @@ measured on these three files. A reboot would have taken them, and with them
 the comparability of every one of those numbers -- 41.5289 would still be
 written down and nothing would be able to produce it again.
 
-⚠ **They are inputs to a measurement, so they do not get edited.** Not a
+**They are inputs to a measurement, so they do not get edited.** Not a
 typo, not a wrapped line, not a trailing newline. Anything that changes a
 byte changes every number this tree has ever recorded and silently makes the
 old ones incomparable; a new question gets a new file next to these.
@@ -41,7 +41,7 @@ question.
 `ppl.txt` is the short arm, for smoke tests where 300 tokens is more wall
 clock than the question deserves.
 
-⚠⚠ **`long2.txt` is the SECOND OPINION, and it exists because one passage was
+**`long2.txt` is the SECOND OPINION, and it exists because one passage was
 not enough.** On 2026-09-10 a sweep of AWQ's exponent on Qwen3-0.6B came back
 NOT MONOTONE at 300 tokens of `long.txt` -- 0.15 above both its neighbours by
 eight to ten percent -- while `charsiu_ppl` is deterministic, so that is the
@@ -77,7 +77,7 @@ recipe reproduced, to the last digit:
   int8                    17.9772
 ```
 
-⛔⛔ **THAT FIRST ROW SAID `int4, group 1024` UNTIL 2026-09-11 AND THE RECIPE
+**THAT FIRST ROW SAID `int4, group 1024` UNTIL 2026-09-11 AND THE RECIPE
 ABOVE IT DOES NOT SET A GROUP.** `llama_auto_kmax()` pins the group to 1024 and
 is called only when the NPU is on, so `CHARSIU_NPU=0` never reaches it and
 takes npuquant's own default of one absmax a row. The same file at group 1024
@@ -95,7 +95,7 @@ CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 
 The runtime says which of the two it is taking, once, on stderr.
 
-## ⛔⛔ THE RECORDED NUMBERS ARE ON A FILE HUGGING FACE NO LONGER SERVES
+## THE RECORDED NUMBERS ARE ON A FILE HUGGING FACE NO LONGER SERVES
 
 2026-09-11. The board and the desk disagreed by 1.3% on the same nominal model.
 It was neither the toolchain nor the thread count: **it was the file.**
@@ -108,7 +108,7 @@ the copy baked into this project's rootfs-overlay is the older one.
   what Hugging Face serves today           48ff0243...   773025920   41.3739  34.2425
 ```
 
-🔑 **With the SAME file the two machines agree to the last digit.** Desk against
+**With the SAME file the two machines agree to the last digit.** Desk against
 board, three arms, and the calibration pass writing the same 2647768 bytes:
 
 ```
@@ -123,12 +123,12 @@ on GCC 15.2 and glibc 2.43, a different kernel and a different thread count.
 **Perplexity survives all of that. It does not survive a different file**, and
 the file is the one thing nobody writes down.
 
-⚠ So a reader reproducing the README's 33.8071 today will get **34.2425** and
+So a reader reproducing the README's 33.8071 today will get **34.2425** and
 have no way to see why. Every recorded figure stands, on the file named beside
 it; the file of record going forward is the one Hugging Face serves, because
 that is what a reader will get and what the board already runs.
 
-## ⚠⚠ A perplexity needs THREE names, and the third is the one nobody writes
+## A perplexity needs THREE names, and the third is the one nobody writes
 
 **A model, a corpus, and a FILE.** charsiu re-quantises whatever it loads, so
 the source format survives into the answer. Three ggufs of the same
@@ -142,21 +142,21 @@ Llama-3.2-1B, these same 300 tokens, the same binary:
   Q4_0 "pure"                          41.8712         30.2425
 ```
 
-⚠ **The two Q4_0 rows are the same URL at different times.** A file name and a
+**The two Q4_0 rows are the same URL at different times.** A file name and a
 quantisation are not an identity; only the md5 is.
 
 **Every Llama figure on record is the Q4_0 file**, and it reproduces to the
 last digit. A number from one file put beside a number from another is a 20%
 error with nothing on the page to show it.
 
-⚠ `scripts/charsiu-get` annotates its **Q8_0** line "THE ONE EVERY BOARD ROUND
+`scripts/charsiu-get` annotates its **Q8_0** line "THE ONE EVERY BOARD ROUND
 USES", and the board's own AWQ round read 33.4149 -- the Q4_0 figure. Both may
 be true, the timing rounds on one file and the quality round on the other, and
 that is worse than either being wrong: it means the two halves of the
 scoreboard are not about the same weights. It is not resolved yet, and this
 paragraph is here so it is not resolved silently.
 
-🔑 **`tests/vendor_quality.sh` is the exception and says so**: its arms all
+**`tests/vendor_quality.sh` is the exception and says so**: its arms all
 descend from the Q8_0 file, because there the question is which QUANTISER is
 better and a source that is already four bits flatters whichever one is asked
 to quantise it again.

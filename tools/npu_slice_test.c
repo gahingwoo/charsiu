@@ -20,7 +20,7 @@
  * compares against npu_matvec -- the CPU path, reading the SAME quantised
  * weights, which is the same comparison phase 2 makes at model scale.
  *
- * ⚠ m=1 IS THE CONTROL AND RUNS FIRST. charsiu_npu_matvec on the same staged
+ * m=1 IS THE CONTROL AND RUNS FIRST. charsiu_npu_matvec on the same staged
  * tensor is the decode path; if it disagrees then the harness is wrong and
  * says so, rather than blaming the slicing it was built to examine.
  *
@@ -47,7 +47,7 @@ static float frand(unsigned *s)
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -61,7 +61,7 @@ int main(int argc, char **argv)
 	const char *kmaxe = argc > 4 ? argv[4] : getenv("CHARSIU_NPU_KMAX");
 	unsigned kmax = kmaxe ? (unsigned)atoi(kmaxe) : 1024;
 	/*
-	 * ⚠ THE SEED IS A KNOB BECAUSE THE ROW INDEX IS THE EVIDENCE. A single
+	 * THE SEED IS A KNOB BECAUSE THE ROW INDEX IS THE EVIDENCE. A single
 	 * wrong row at a fixed index is either structure or one row of random
 	 * data sitting on a quantisation boundary, and those two look identical
 	 * in one run. Move the data: structure keeps the row, a boundary does
@@ -83,7 +83,7 @@ int main(int argc, char **argv)
 		setenv("CHARSIU_NPU_KMAX", argv[4], 1);
 
 	/*
-	 * ⚠ THE SURFACE IS NOT ONE FORMULA, and printing it as if it were is
+	 * THE SURFACE IS NOT ONE FORMULA, and printing it as if it were is
 	 * how the guard in npudev.c came to reach a path it was never measured
 	 * on. charsiu_emit_job sets inw = m only on the WIDTH axis, so int4's
 	 * surface is (slice / 32) * m and int8's is (slice / 32) * 1 -- the m
@@ -101,7 +101,7 @@ int main(int argc, char **argv)
 		       (slice / 32) * (wideax ? m : 1));
 	}
 	if ((k + kmax - 1) / kmax < 2)
-		printf("  ⚠ ONE SLICE: this cannot show a fault that needs"
+		printf("  ONE SLICE: this cannot show a fault that needs"
 		       " several. Raise K or lower KMAX.\n");
 
 	raw = malloc((size_t)n * k * sizeof(float));
@@ -132,7 +132,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠⚠ THE HALF A DESK CAN VERIFY, AND IT RUNS BEFORE THE HARDWARE IS
+	 * THE HALF A DESK CAN VERIFY, AND IT RUNS BEFORE THE HARDWARE IS
 	 * OPENED. The reference below is the NPU's own row loop and needs a
 	 * board; the tensor and the activation do not -- and the bug this file
 	 * shipped with was exactly there. charsiu_act_set quantises NOTHING,
@@ -151,7 +151,7 @@ int main(int argc, char **argv)
 				nz++;
 		printf("  CPU on row 0: %u of %u channels non-zero\n", nz, n);
 		if (!nz) {
-			printf("  ⚠⚠ THE HARNESS CANNOT COMPUTE ANYTHING.\n"
+			printf("  THE HARNESS CANNOT COMPUTE ANYTHING.\n"
 			       "     npu_matvec reads a->q1 and charsiu_act_q1\n"
 			       "     fills it only when CHARSIU_NPU_QUANT=1%s.\n",
 			       getenv("CHARSIU_NPU_QUANT")
@@ -162,7 +162,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠⚠ AND THE TWO QUANTISERS, SIDE BY SIDE, ON A DESK. charsiu_act_q1
+	 * AND THE TWO QUANTISERS, SIDE BY SIDE, ON A DESK. charsiu_act_q1
 	 * multiplies by 1/d and the batched packer in npudev.c used to divide
 	 * by d. Those are not the same float -- the reciprocal rounds once and
 	 * the product rounds again -- so a value halfway between two codes came
@@ -228,7 +228,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠⚠ THE REFERENCE IS THE NPU'S OWN ROW LOOP, NOT THE CPU'S.
+	 * THE REFERENCE IS THE NPU'S OWN ROW LOOP, NOT THE CPU'S.
 	 *
 	 * Two earlier versions compared the batch against npu_matvec and their
 	 * controls failed on 1536 channels and then 1327. Neither was the
@@ -246,7 +246,7 @@ int main(int argc, char **argv)
 		if (charsiu_npu_needs_q1(g))
 			charsiu_act_q1(&act);
 		if (charsiu_npu_matvec(g, id, &act, Yref + (size_t)r * n)) {
-			printf("  ⚠ the reference did not run at row %u\n", r);
+			printf("  the reference did not run at row %u\n", r);
 			return 1;
 		}
 	}
@@ -263,12 +263,12 @@ int main(int argc, char **argv)
 		printf("  reference (NPU, row by row): %u of %zu non-zero,"
 		       " %u distinct\n", nz, (size_t)m * n, nd);
 		if (!nz || !nd) {
-			printf("  ⚠⚠ THE REFERENCE IS DEGENERATE -- the harness,"
+			printf("  THE REFERENCE IS DEGENERATE -- the harness,"
 			       " not the hardware.\n");
 			return 1;
 		}
 		/*
-		 * ⚠ AND LOOSELY AGAINST THE CPU, at 10% and not 0.1%. The
+		 * AND LOOSELY AGAINST THE CPU, at 10% and not 0.1%. The
 		 * activation quantisation makes a tight comparison meaningless
 		 * here; this only has to catch the hardware returning noise.
 		 */
@@ -278,14 +278,14 @@ int main(int argc, char **argv)
 				far++;
 		printf("  sanity vs the CPU on row 0: %u of %u channels more"
 		       " than 10%% apart%s\n", far, n,
-		       far > n / 2 ? "  ⚠ the reference is not this tensor" : "");
+		       far > n / 2 ? "  the reference is not this tensor" : "");
 		if (far > n / 2)
 			return 1;
 	}
 
 	memset(Yb, 0, (size_t)m * n * sizeof(float));
 	if (charsiu_npu_matmul(g, id, X, m, Yb)) {
-		printf("  ⚠ the batched call was REFUSED -- see the whine"
+		printf("  the batched call was REFUSED -- see the whine"
 		       " above. Nothing was compared.\n");
 		return 1;
 	}
@@ -302,11 +302,11 @@ int main(int argc, char **argv)
 		}
 	printf("  m=%u batched vs the same call row by row: %u of %zu off by"
 	       " more than 0.1%%, worst %.3e\n", m, bad, (size_t)m * n, worst);
-	printf("  %s\n", bad ? "⚠⚠ THE SLICED BATCH DISAGREES WITH ITS OWN"
+	printf("  %s\n", bad ? "THE SLICED BATCH DISAGREES WITH ITS OWN"
 			       " ROW LOOP" : "exact");
 
 	/*
-	 * ⚠⚠ WHERE IT IS WRONG IS THE DIAGNOSIS; THAT IT IS WRONG IS NOT.
+	 * WHERE IT IS WRONG IS THE DIAGNOSIS; THAT IT IS WRONG IS NOT.
 	 *
 	 * This fault has been chased for a day on "a model answers differently"
 	 * and every hypothesis fitted to that died. The shape of the error
@@ -361,7 +361,7 @@ int main(int argc, char **argv)
 			       fabs(rsum / rn - 1.0) < 0.5
 			       ? "" : "   (far from 1: not a rounding difference)");
 		/*
-		 * ⚠⚠ AND HOW BIG THE DISAGREEING VALUES ARE, because a 0.1%
+		 * AND HOW BIG THE DISAGREEING VALUES ARE, because a 0.1%
 		 * RELATIVE threshold on a channel whose true value is a
 		 * thousandth of the row is not a correctness test -- it is a
 		 * test of whether two int8 activation codes rounded the same

@@ -2,7 +2,7 @@
  * charsiu_ppl -- perplexity, so a quantiser change stops being a matter of
  * reading one paragraph and deciding it looks fine.
  *
- * ⛔⛔ THAT IS TRUE ONLY OF THE PLAIN DEFAULT, AND THIS PARAGRAPH USED TO SAY
+ * THAT IS TRUE ONLY OF THE PLAIN DEFAULT, AND THIS PARAGRAPH USED TO SAY
  * OTHERWISE. It read "IT HAS TO RUN ON THE BOARD. The host has no NPU, so
  * npu_get returns NULL and every matvec falls back to the gguf weights --
  * which measures llama.cpp's q4_0 and not charsiu's int4 at all." The last
@@ -18,7 +18,7 @@
  * npu_matvec here takes the int8 activation unless CHARSIU_NPU_A16=1. The
  * board is w4a16; this defaults to w4a8.
  *
- * 🏁🏁 SO THE HOST REPRODUCES THE BOARD, AND NOT MERELY TO A FEW PERCENT.
+ * SO THE HOST REPRODUCES THE BOARD, AND NOT MERELY TO A FEW PERCENT.
  * Measured on r413 with the model and the corpus checked by md5 to be the same
  * FILES on both sides (c82c0340d974 and 4237c8fc3163, long.txt, -n 300):
  *
@@ -31,20 +31,20 @@
  * all; what it needs is both of those set, because the board is w4a16 and this
  * defaults to w4a8.
  *
- * ⚠ THE FIRST VERSION OF THIS PARAGRAPH SAID "BRACKETS ... TO ABOUT 1 TO 4%",
+ * THE FIRST VERSION OF THIS PARAGRAPH SAID "BRACKETS ... TO ABOUT 1 TO 4%",
  * comparing against a board figure of 33.4149 taken from a different round
  * under conditions nobody had matched. The bracket is real but it is an
  * artefact of the DEFAULT activation width, not the limit of what the desk can
  * do. A number belongs to its input file, and that is also true of the number
  * you are comparing against.
  *
- * ⚠⚠ AND THE GROUP IS THE WHOLE OF IT, NOT KMAX. The quantiser's group is
+ * AND THE GROUP IS THE WHOLE OF IT, NOT KMAX. The quantiser's group is
  * CHARSIU_NPU_W4_GROUP (npuquant.c); CHARSIU_NPU_KMAX is not read in that file
  * at all and moving it changes nothing here. They are set together on the
  * BOARD because tensor_grouped() requires kgroup == kmax there, and that is a
  * fact about the device path, not about this instrument.
  *
- * ⚠ CHARSIU_NPU=1 on a machine with no /dev/accel reaches llama_auto_kmax,
+ * CHARSIU_NPU=1 on a machine with no /dev/accel reaches llama_auto_kmax,
  * fails to open, says so, and gives the board's group for free -- bit
  * identical to setting it by hand. It is a good diagnostic and a BAD recipe:
  * on a machine that does have the device it silently becomes a hardware run.
@@ -54,11 +54,11 @@
  * batching: the batched path is a different arithmetic and this is meant to
  * price the WEIGHTS.
  *
- * ⚠ The first token has no prediction to score and is skipped. A run reports
+ * The first token has no prediction to score and is skipped. A run reports
  * how many positions it actually scored, because a comparison between two
  * arms is only a comparison if both scored the same ones.
  *
- * ⚠⚠ --batch SCORES THE OTHER ARITHMETIC, WHICH IS THE ONE THAT SHIPS.
+ * --batch SCORES THE OTHER ARITHMETIC, WHICH IS THE ONE THAT SHIPS.
  *
  * The loop above is one position at a time on purpose: it prices the WEIGHTS.
  * But a prompt does not run that way -- llama_prefill_batch takes it in chunks
@@ -96,7 +96,7 @@
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
@@ -125,7 +125,7 @@ int main(int argc, char **argv)
 			want = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--batch"))
 			batch = 1;
-		/* ⚠ THE ARGMAX IS ALREADY BEING COMPUTED HERE. The log softmax
+		/* THE ARGMAX IS ALREADY BEING COMPUTED HERE. The log softmax
 		 * needs the largest logit, so the position it came from is one
 		 * extra assignment, and printing it turns this into a top-1
 		 * oracle for any runtime that can only be asked for a token.
@@ -178,7 +178,7 @@ int main(int argc, char **argv)
 
 	if (batch) {
 		/*
-		 * ⚠ REFUSE LOUDLY. A model the batched path declines would
+		 * REFUSE LOUDLY. A model the batched path declines would
 		 * otherwise fall back row by row and produce the token loop's
 		 * number under the --batch label, which is the two arms being
 		 * one arm.
@@ -186,7 +186,7 @@ int main(int argc, char **argv)
 		const char *why = llama_batch_why_not(&m);
 		int cap = llama_prefill_chunk_cap(&m);
 		/*
-		 * ⚠⚠ THE SAME RULE charsiu_run USES, OR THIS MEASURES A WIDTH
+		 * THE SAME RULE charsiu_run USES, OR THIS MEASURES A WIDTH
 		 * NOBODY SHIPS. The runner's default chunk is 80 and
 		 * CHARSIU_PREFILL_CHUNK overrides it, capped by the surface
 		 * ceiling. This took `cap` -- 160 on qwen3 -- for its first
@@ -264,7 +264,7 @@ int main(int argc, char **argv)
 		for (j = 0; j < m.n_vocab; j++)
 			sum += expf(lg[j] - mx);
 		nll -= (double)(lg[ids[i + 1]] - mx) - log((double)sum);
-		/* ⚠ the prefix length, not i: position i has seen i+1 tokens,
+		/* the prefix length, not i: position i has seen i+1 tokens,
 		 * which is what another runtime has to be fed to be asked the
 		 * same question */
 		if (top1)

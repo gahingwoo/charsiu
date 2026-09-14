@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# ⭐⭐ THE FENCE IS A SLEEPING ioctl AND THE SOFTMAX IS FOUR BUSY CORES, AND
+# THE FENCE IS A SLEEPING ioctl AND THE SOFTMAX IS FOUR BUSY CORES, AND
 # THEY HAPPEN ONE AFTER THE OTHER.
 #
 # r407 read the layer at 852 tokens: scores fence 504 ms, values pack 477 (the
@@ -17,11 +17,11 @@
 # serialised on one file descriptor -- so this is not the two cores in flight
 # together, which corrupts.
 #
-# ⚠ 1 IS NOT QUITE TODAY, and the log should say so: at 1 the next call's
+# 1 IS NOT QUITE TODAY, and the log should say so: at 1 the next call's
 # sentinels are written while the values job runs rather than after it. The arm
 # to read is 1 against 2 in THIS binary.
 #
-# ⚠⚠ AND THE TEXT MUST BE IDENTICAL. Splitting a group changes which op index a
+# AND THE TEXT MUST BE IDENTICAL. Splitting a group changes which op index a
 # head has, and a head that reads another head's V surface is fluent and wrong.
 #
 #   CHARSIU_PIPE_REPS="4 12 24 34"   clause counts (about 25 tokens each)
@@ -43,7 +43,7 @@ ERR=/tmp/pipe.$$
 [ -e /dev/accel/accel0 ] || { echo "no /dev/accel -- this needs the rocket arm"; exit 1; }
 [ -x "$RUN" ] || { echo "no $RUN"; exit 1; }
 if ! strings "$RUN" 2>/dev/null | grep -q '^CHARSIU_ATTN_PIPE$'; then
-	echo "⛔ $RUN has no CHARSIU_ATTN_PIPE: both arms would be the default"
+	echo "$RUN has no CHARSIU_ATTN_PIPE: both arms would be the default"
 	echo "   and the table would read 1.000 everywhere"
 	exit 1
 fi
@@ -127,7 +127,7 @@ b=$(env $E CHARSIU_ATTN_PIPE=$PG "$RUN" "$M" -p "$LAST" -n 24 --ignore-eos -q -c
 if [ "$a" = "$b" ]; then
 	echo "   identical: $(printf '%s' "$a" | md5sum | cut -c1-12)"
 else
-	echo "   ⛔ DIFFER"
+	echo "   DIFFER"
 	echo "   one $a"
 	echo "   two $b"
 fi

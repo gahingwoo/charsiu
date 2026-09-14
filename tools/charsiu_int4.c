@@ -233,7 +233,7 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		      size_t byte, unsigned high)
 {
 	/*
-	 * ⚠ ROUND 267. This had the same defect --kpair did, and it is the
+	 * ROUND 267. This had the same defect --kpair did, and it is the
 	 * THIRD place in this file to carry it: it cleared and read m*n BYTES
 	 * on the w4a16 path, whose element is a four byte signed integer.
 	 * --bmap, --osweep and --pre all read m*n*4. It is correct as written
@@ -303,7 +303,7 @@ static void map_probe(struct charsiu_device *dev, struct charsiu_job *job,
 		       byte, high ? "high" : "low", first_w, first_v, wrote, hi, hib);
 	else if (lit > 1) {
 		/*
-		 * ⚠ ALL of them, not the first. At M = 1 a live nibble lights
+		 * ALL of them, not the first. At M = 1 a live nibble lights
 		 * exactly one word and "first" was the whole answer for eleven
 		 * geometries. Round 292 swept M = 2 and the grid was unreadable
 		 * because a byte can light a word in more than one row and only
@@ -358,7 +358,7 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 			size_t byte, unsigned high, uint8_t *a_raw)
 {
 	/*
-	 * ⚠ ROUND 265 WIDENED THE READ, and every "channel" this probe printed
+	 * ROUND 265 WIDENED THE READ, and every "channel" this probe printed
 	 * before it is an OUTPUT BYTE OFFSET.
 	 *
 	 * It cleared and read m*n BYTES on a path whose output element is not a
@@ -386,7 +386,7 @@ static void kpair_probe(struct charsiu_device *dev, struct charsiu_job *job,
 	 * here for that reason; it used to be the LIVE macro, which is why the
 	 * environment variable did nothing for --kpair.
 	 *
-	 * ⚠ ROUND 266 WIDENED IT AGAIN, because 265 left the same hole one
+	 * ROUND 266 WIDENED IT AGAIN, because 265 left the same hole one
 	 * level up. It read m*n*4, which is words 0 to n-1, and the buffer is
 	 * allocated m*n*4 + 4096. A byte whose element landed at word n or
 	 * beyond would have come back "dead" for the second round running, and
@@ -517,7 +517,7 @@ int main(int argc, char **argv)
 	 * positive weight in the biased domain the packer would have produced.
 	 */
 	/*
-	 * ⚠ CHARSIU_MAP_W16 IS FOR --cost AND NOTHING ELSE. It makes the
+	 * CHARSIU_MAP_W16 IS FOR --cost AND NOTHING ELSE. It makes the
 	 * weights fp16 so that ONE probe prices all three dtypes at the SAME
 	 * batching -- r403 compared int4 here against fp16 from npu_fp16_test,
 	 * which submits eight jobs at a time against this one's one, and a
@@ -531,7 +531,7 @@ int main(int argc, char **argv)
 	if (getenv("CHARSIU_KPAIR_AMP"))
 		g_amp = (unsigned)atoi(getenv("CHARSIU_KPAIR_AMP")) & 0x7f;
 	/*
-	 * ⚠ CHARSIU_INT4_A16 MAKES THIS w4a16, which is the arrangement the
+	 * CHARSIU_INT4_A16 MAKES THIS w4a16, which is the arrangement the
 	 * runtime's projections actually use and the one attention would have
 	 * to use if its KV surfaces became int4. The probe's own checks are
 	 * written for a8, so this is for --cost and nothing else.
@@ -672,7 +672,7 @@ int main(int argc, char **argv)
 	 * gets a clean device.
 	 */
 	/*
-	 * ⭐ --cost: WHAT DOES THE HARDWARE CHARGE FOR THIS SHAPE?
+	 * --cost: WHAT DOES THE HARDWARE CHARGE FOR THIS SHAPE?
 	 *
 	 * r403 measured fp16 at the two attention shapes and at a fat one and
 	 * found six to seven of the twenty times charsiu's attention gives
@@ -683,7 +683,7 @@ int main(int argc, char **argv)
 	 * charsiu_matmul take m, k and n and print no time; npu_fp16_test
 	 * prints time and is fp16 only. This is that missing measurement.
 	 *
-	 * ⚠⚠ IT IS A TIMING PROBE AND IT CHECKS NOTHING. The weight buffer
+	 * IT IS A TIMING PROBE AND IT CHECKS NOTHING. The weight buffer
 	 * holds whatever the setup left in it and the output is not read. That
 	 * is legitimate for this question and only for this question: the NPU's
 	 * MAC array does not branch on data, so a dispatch of the right shape
@@ -727,7 +727,7 @@ int main(int argc, char **argv)
 		       " = %.3f TMAC/s, %.0f us a submit\n",
 		       macs / 1e6, fence, macs / fence / 1e9,
 		       1000.0 * fence / reps);
-		printf("  ⚠ a COST, not an answer: nothing here was checked\n");
+		printf("  a COST, not an answer: nothing here was checked\n");
 		return 0;
 	}
 	if (argc > 4)
@@ -1413,7 +1413,7 @@ int main(int argc, char **argv)
 		 * Bytes 248 and 255 are dead, so the live set inside the first
 		 * 256 is not contiguous either.
 		 *
-		 * ⚠ No formula is fitted here on purpose. Every reading tried
+		 * No formula is fitted here on purpose. Every reading tried
 		 * against those points has bit 3 of the byte contributing to
 		 * BOTH the k and the channel, which is not how a bitfield
 		 * splits, and a fit through gaps is exactly what this project
@@ -1468,7 +1468,7 @@ int main(int argc, char **argv)
 		 * channels at every N is a different animal from one that
 		 * covers all of a small N.
 		 *
-		 * ⚠ No two-option prediction here on purpose. Three rounds
+		 * No two-option prediction here on purpose. Three rounds
 		 * running, the answer was outside the two I wrote down: byte 8
 		 * was channel 4 at k 16 when the options were channel 1 or
 		 * channel 0, and the channel width was two when the options

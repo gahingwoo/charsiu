@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# ⭐ THE FENCE SLEEPS, AND UNTIL NOW NOBODY HAS PRICED NOT SLEEPING.
+# THE FENCE SLEEPS, AND UNTIL NOW NOBODY HAS PRICED NOT SLEEPING.
 #
 # charsiu_bo_prep blocks in the kernel, so every fence pays a wake-up. The int4
 # projections fence 2464 times in an 852 token prompt (1232 calls, two devices)
@@ -12,13 +12,13 @@
 # it since phase 20 under "off unless asked, until phase 21 has priced it", and
 # phase 21 never did.
 #
-# ⚠ IT IS NOT FREE ANY MORE. Since r411 the attention fences have CPU work
+# IT IS NOT FREE ANY MORE. Since r411 the attention fences have CPU work
 # happening beside them, so a poll there competes with the softmax rather than
 # filling an idle core. That is why the table prints the attention layer as
 # well as TTFT: a knob that buys the projections and sells attention is two
 # results, not one.
 #
-# ⚠ AND EACH POLL IS AN ioctl. A spin that never wins is a syscall storm with
+# AND EACH POLL IS AN ioctl. A spin that never wins is a syscall storm with
 # the blocking wait still at the end of it, so the won/lost counts are printed
 # and a round where `won` is near zero has answered the question.
 #
@@ -41,7 +41,7 @@ ERR=/tmp/spin.$$
 [ -e /dev/accel/accel0 ] || { echo "no /dev/accel -- this needs the rocket arm"; exit 1; }
 [ -x "$RUN" ] || { echo "no $RUN"; exit 1; }
 if ! strings "$RUN" 2>/dev/null | grep -q '^CHARSIU_NPU_SPIN_US$'; then
-	echo "⛔ $RUN has no CHARSIU_NPU_SPIN_US: every arm would be the"
+	echo "$RUN has no CHARSIU_NPU_SPIN_US: every arm would be the"
 	echo "   blocking wait and the table would be one arm four times"
 	exit 1
 fi
@@ -132,7 +132,7 @@ for k in $ARMS; do
 	if [ "$a" = "$b" ]; then
 		printf '   spin %-6s identical: %s\n' "$k" "$(printf '%s' "$b" | md5sum | cut -c1-12)"
 	else
-		printf '   spin %-6s ⛔ DIFFERS\n' "$k"
+		printf '   spin %-6s DIFFERS\n' "$k"
 	fi
 done
 

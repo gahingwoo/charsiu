@@ -3,7 +3,7 @@
 #
 # charsiu-lib.sh: the two things every command needs, written once.
 #
-# ⚠⚠ WHY THIS FILE EXISTS. Reading a key out of the ini and finding a binary
+# WHY THIS FILE EXISTS. Reading a key out of the ini and finding a binary
 # were written out again in nearly every script: eight copies of the first and
 # seven of the second. Three of the bugs found on the board were a fix applied
 # to one copy and not the others -- `charsiu list` reporting every model as "?"
@@ -20,7 +20,7 @@ CHARSIU_SYS_CONF=/etc/charsiu/config.ini
 
 # --- the config -----------------------------------------------------------
 #
-# ⚠ WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION, and collapsing
+# WHERE TO READ AND WHERE TO WRITE ARE NOT THE SAME QUESTION, and collapsing
 # them is what made the setup screen say "now: (unset)" on a board whose config
 # was fine: /etc is not writable by an ordinary user, so the NAME was replaced
 # by one in $HOME that did not exist yet.
@@ -63,7 +63,7 @@ ini_get() {
 
 # --- finding what was installed -------------------------------------------
 #
-# ⚠ FIVE PLACES, IN THIS ORDER, AND EVERY COMMAND USES THE SAME FIVE. From
+# FIVE PLACES, IN THIS ORDER, AND EVERY COMMAND USES THE SAME FIVE. From
 # $PREFIX/usr/bin the staged /opt is TWO levels up, not one; getting that wrong
 # is why a --prefix install reported its own binaries missing.
 find_bin() {
@@ -79,7 +79,7 @@ find_bin() {
 
 # file_bytes FILE: the size, without reading the file.
 #
-# ⚠⚠ NOT `wc -c`. Two of these scripts chose wc over stat on purpose, with the
+# NOT `wc -c`. Two of these scripts chose wc over stat on purpose, with the
 # comment "busybox is often built without the stat applet and `stat -c%s ||
 # echo 0` then reports every model as 0 MB". The reasoning was right and the
 # conclusion was backwards: BUSYBOX wc -c READS THE WHOLE FILE. GNU coreutils
@@ -107,7 +107,7 @@ file_bytes() {
 
 # model_dirs: every directory to look in, user first, each at most once.
 #
-# ⚠ THE SAME DIRECTORY TWICE LISTS EVERY MODEL TWICE, and that is the normal
+# THE SAME DIRECTORY TWICE LISTS EVERY MODEL TWICE, and that is the normal
 # case rather than a corner one: the installer and charsiu-serve both set
 # CHARSIU_MODELS to /opt/charsiu/models, which is exactly the system directory.
 model_dirs() {
@@ -129,7 +129,7 @@ all_models() {
 }
 
 # resolve_model NAME: a path, a bare name, or a name without .gguf.
-# ⚠ ALWAYS RETURNS 0. Under set -e an assignment from a failing command
+# ALWAYS RETURNS 0. Under set -e an assignment from a failing command
 # substitution kills the caller, so a lookup that finds nothing must not be a
 # failure -- it is an empty answer.
 resolve_model() {
@@ -145,7 +145,7 @@ resolve_model() {
 # current_model: what the config names, or empty.
 current_model() { ini_get model path; }
 
-# ⚠⚠ AN EXPORTED VARIABLE WINS OVER THE CONFIG FILE, and it did not.
+# AN EXPORTED VARIABLE WINS OVER THE CONFIG FILE, and it did not.
 #
 # Callers build a list of NAME=VALUE for `env`, and an assignment there is put
 # in FRONT of the inherited environment -- so a caller who exported one of these names had it
@@ -174,7 +174,7 @@ env_default() {
 # INI: read, and write IN PLACE. Present -> replace where it is. Absent -> append
 # to the END OF ITS OWN SECTION, creating the section if there is none.
 #
-# ⚠ A naive `sed -i "s/^key =.*/key = $v/"` silently does NOTHING when the key
+# A naive `sed -i "s/^key =.*/key = $v/"` silently does NOTHING when the key
 # is missing, and corrupts the file when the value contains / or &. The value is
 # passed to awk as a VARIABLE, never interpolated into a pattern.
 # ---------------------------------------------------------------------------

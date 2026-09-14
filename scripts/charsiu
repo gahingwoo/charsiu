@@ -4,7 +4,7 @@
 #
 # charsiu: the front door.
 #
-# ⚠ ONE RULE DECIDES WHO SEES WHAT, AND THERE IS NO FLAG FOR IT:
+# ONE RULE DECIDES WHO SEES WHAT, AND THERE IS NO FLAG FOR IT:
 #
 #     charsiu, nothing set up yet -> the guided screen
 #     charsiu, already set up      -> a conversation
@@ -14,7 +14,7 @@
 # and is led through it. Somebody who lives in a terminal types `charsiu pull x`
 # and never meets a dialog at all. Neither has to know the other mode exists.
 #
-# ⚠ THE CLI SHAPE IS NOT INVENTED HERE. It follows ollama, whose users already
+# THE CLI SHAPE IS NOT INVENTED HERE. It follows ollama, whose users already
 # know `run / pull / list / ls / rm / show / ps / serve`, and claude code, where
 # a bare command is interactive, a quoted argument is one-shot, and -p prints
 # and accepts a pipe. Copying a convention people already have is most of what
@@ -45,7 +45,7 @@ CTUI_TITLE="charsiu"
 # ---------------------------------------------------------------------------
 # WHERE THINGS LIVE
 #
-# ⚠ USER FIRST, SYSTEM AS A FALLBACK. The old layout put the config in
+# USER FIRST, SYSTEM AS A FALLBACK. The old layout put the config in
 # /etc/charsiu and the models in /opt/charsiu/models, so a plain user could
 # neither configure nor download without root. ollama, codex and claude code all
 # keep per-user state under $HOME and so does this. The system paths are still
@@ -103,7 +103,7 @@ setup)           exec "$(find_bin charsiu-config)" --setup ;;
 update)          shift; exec "$(find_bin charsiu-update)" "$@" ;;
 doctor)          shift; exec "$(find_bin charsiu-doctor)" "$@" ;;
 pull)            shift
-                 # ⚠ ${1:+"$@"} ${1:-x} repeats the first argument. Set the
+                 # ${1:+"$@"} ${1:-x} repeats the first argument. Set the
                  # default by replacing the list instead.
                  [ $# -gt 0 ] || set -- --wizard
                  exec env CHARSIU_MODELS_DIR="$MODELS" "$(find_bin charsiu-get)" "$@" ;;
@@ -123,7 +123,7 @@ esac
 # No subcommand. Decide between the guided screen and a conversation.
 # ---------------------------------------------------------------------------
 if [ $# -eq 0 ] && { ! configured || ! have_model; }; then
-	# ⚠ Not an error and not a lecture. A board with nothing on it should walk
+	# Not an error and not a lecture. A board with nothing on it should walk
 	# somebody through it, once, and never mention it again.
 	exec "$(find_bin charsiu-config)" --setup
 fi

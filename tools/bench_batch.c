@@ -4,7 +4,7 @@
  *
  * Does batching the projections pay on THIS machine?
  *
- * ⚠ IT HAS TO WALK EVERY LAYER. The first version of this looped on one
+ * IT HAS TO WALK EVERY LAYER. The first version of this looped on one
  * tensor 200 times, which left it in cache and measured arithmetic rather
  * than memory: it reported 1.09x where the question is entirely about how
  * often the weights are read from DRAM. Walking the model streams them the
@@ -29,7 +29,7 @@ static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);retur
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
@@ -68,14 +68,14 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ ONE M IS NOT AN ANSWER. The board reported M=8 SLOWER than one at a
+	 * ONE M IS NOT AN ANSWER. The board reported M=8 SLOWER than one at a
 	 * time (1855 ms against 1711), which rules out M=8 and says nothing
 	 * about M=2. Four A72s have 32 NEON registers and 32 KB of L1: eight
 	 * accumulators and eight activation streams do not fit, and narrower
 	 * ones might. Sweep, and let the machine say where the crossover is.
 	 */
 	/*
-	 * ⚠ WARM UP FIRST. Without this the first M measured pays for every
+	 * WARM UP FIRST. Without this the first M measured pays for every
 	 * cold page of the model and reported 2.74x for M=1 -- where the two
 	 * sides are LITERALLY the same code, since gguf_matmul(m=1) calls
 	 * gguf_matvec. A ratio that cannot be anything but 1.00 coming out at

@@ -4,7 +4,7 @@
 #
 # The evaluation corpora have not changed.
 #
-# ⚠ THIS IS NOT A UNIT TEST, IT IS A LOCK. charsiu_ppl is deterministic, which
+# THIS IS NOT A UNIT TEST, IT IS A LOCK. charsiu_ppl is deterministic, which
 # is the only reason a number measured last week can be compared with one
 # measured today -- and that holds for exactly as long as the text is the same
 # bytes. An edit here does not fail anything: it silently re-bases every

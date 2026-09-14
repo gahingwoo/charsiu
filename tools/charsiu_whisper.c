@@ -11,7 +11,7 @@
 #include "charsiu_whisper.h"
 
 /*
- * ⚠ A GENERATED SIGNAL, for the same reason the vision probe generates its
+ * A GENERATED SIGNAL, for the same reason the vision probe generates its
  * pixels: a cross check needs both sides to hold the same audio, and passing it
  * costs a decoder before either side has been shown right. Integers only, so
  * the reference computes the identical samples.
@@ -27,7 +27,7 @@ static void fake_audio(float *pcm, size_t n)
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the

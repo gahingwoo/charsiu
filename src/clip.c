@@ -77,7 +77,7 @@ static const struct gguf_tensor *bind1(struct charsiu_clip_text *t,
 /* ---- the vocabulary ------------------------------------------------------ */
 
 /*
- * ⚠ A HASH OVER THE PIECES, because the tokenizer asks "is this string a token"
+ * A HASH OVER THE PIECES, because the tokenizer asks "is this string a token"
  * once per adjacent pair per merge step, and a linear scan of 49408 entries
  * would make a three word prompt take longer than the twelve transformer
  * blocks it feeds.
@@ -310,7 +310,7 @@ void charsiu_clip_text_describe(const struct charsiu_clip_text *t, FILE *out)
 /* ---- the tokenizer ------------------------------------------------------- */
 
 /*
- * ⚠ THE BYTE ENCODER, which is GPT-2's and CLIP inherits it. Bytes 33..126,
+ * THE BYTE ENCODER, which is GPT-2's and CLIP inherits it. Bytes 33..126,
  * 161..172 and 174..255 stand for themselves as codepoints; every other byte
  * gets 256 + n, in order. The vocabulary holds the UTF-8 of those codepoints,
  * so a byte outside the printable range is not itself in the file.
@@ -345,7 +345,7 @@ static void byte_to_piece(uint8_t b, char *out)
 }
 
 /*
- * ⚠ BIG ENOUGH FOR A MERGED SYMBOL, which is the whole word by the end. The
+ * BIG ENOUGH FOR A MERGED SYMBOL, which is the whole word by the end. The
  * first version sized these at eight bytes, which is fine for the single
  * characters a word starts as and truncates the moment two merges have
  * happened -- "photograph</w>" is fourteen. A truncated symbol is not found in
@@ -383,7 +383,7 @@ static int bpe_word(const struct charsiu_clip_text *t, const char *w,
 			size_t la = strlen(sym[i]), lb = strlen(sym[i + 1]);
 			int32_t id;
 
-			/* ⚠ a pair that will not fit is not merged rather than
+			/* a pair that will not fit is not merged rather than
 			 * merged truncated: a short symbol is a real token and
 			 * would be accepted silently. */
 			if (la + lb >= SYMLEN)
@@ -476,7 +476,7 @@ int charsiu_clip_tokenize(const struct charsiu_clip_text *t, const char *text,
 					word[w++] = *p++;
 			} else if (is_digit(*p)) {
 				/*
-				 * ⚠ ONE DIGIT AT A TIME. CLIP's pattern is
+				 * ONE DIGIT AT A TIME. CLIP's pattern is
 				 * [\p{N}] and not [\p{N}]+, so "2024" is four
 				 * words and four tokens, and reading it as a
 				 * run gives a different sentence.
@@ -539,7 +539,7 @@ static void tlayernorm(float *out, const float *x, const float *w,
 }
 
 /*
- * ⚠⚠ THE TANH GELU IS A SIGMOID, WHICH IS AN IDENTITY AND NOT AN
+ * THE TANH GELU IS A SIGMOID, WHICH IS AN IDENTITY AND NOT AN
  * APPROXIMATION OF AN APPROXIMATION. tanh y = 1 - 2/(e^2y + 1), so
  *
  *     0.5 (1 + tanh y) = 1 / (1 + e^-2y)
@@ -552,14 +552,14 @@ static void tlayernorm(float *out, const float *x, const float *w,
  * 2.66 with an exponential over 3145728 elements -- and this is the third and
  * last copy of it in the tree.
  *
- * ⚠ GELU QUICK'S FORMULA DID NOT CHANGE, only its expf became charsiu_vexpq,
+ * GELU QUICK'S FORMULA DID NOT CHANGE, only its expf became charsiu_vexpq,
  * so the whole of the risk on that branch is the polynomial. It is worth
  * saying out loud that nothing here exercises it: clip.use_gelu is 1 on every
  * checkpoint on this desk and on the synthetic model clip_cross.py builds, so
  * that branch is one no test catches. It is written to match the tanh branch
  * line for line for exactly that reason.
  *
- * ⚠⚠ AND IT IS DELIBERATELY NOT THREADED, WHICH IS A MEASUREMENT AND NOT AN
+ * AND IT IS DELIBERATELY NOT THREADED, WHICH IS A MEASUREMENT AND NOT AN
  * OVERSIGHT. The vision tower puts its activation on charsiu_parallel_for and
  * whisper's encoder does too, because a picture is 1024 patches by 3072 wide
  * and a mel window is 1500 frames by 1536; A CAPTION IS NEITHER. This tower's
@@ -579,13 +579,13 @@ static void tlayernorm(float *out, const float *x, const float *w,
  * would exclude every call this tower ever makes, and the code that would
  * implement it is code that never runs.
  *
- * ⚠ AND IT WOULD NOT EVEN HAVE RUN. charsiu_parallel_for on an unstarted pool
+ * AND IT WOULD NOT EVEN HAVE RUN. charsiu_parallel_for on an unstarted pool
  * is a plain call on one thread -- it looks exactly like success -- and
  * nothing on the text tower's path calls charsiu_threads_start. The vision
  * tower and whisper both do it in their open. A parallel_for added here would
  * have been serial, silently, and measured as a win against tanhf either way.
  *
- * ⚠ WHAT THE VECTOR KERNEL ALONE IS WORTH, in situ and not by arithmetic. A
+ * WHAT THE VECTOR KERNEL ALONE IS WORTH, in situ and not by arithmetic. A
  * ViT-B/32 text tower is 512 wide, 2048 in the middle and twelve layers deep;
  * one seven token caption through it, best of thirty, three times interleaved
  * against a binary built from before this change:
@@ -639,7 +639,7 @@ static void tgelu(float *x, unsigned n, int tanh_form)
 		const float32x4_t kk = vdupq_n_f32(tanh_form ? -k2 : -1.702f);
 
 		/*
-		 * ⚠ THE BRANCH STAYS INSIDE THE LOOP, as it does in the
+		 * THE BRANCH STAYS INSIDE THE LOOP, as it does in the
 		 * tower. It is one perfectly predicted test against a divide
 		 * and a six term polynomial, and hoisting it means two copies
 		 * of the kernel for a difference the tower measured at 2.13 ms
@@ -781,7 +781,7 @@ int charsiu_clip_encode_text(struct charsiu_clip_text *t, const int32_t *ids,
 		trows(L->v_w, trow1(L->v_b, b1), xb, n, W, v, W, &a);
 
 		/*
-		 * ⚠ CAUSAL. This is the one structural difference from the
+		 * CAUSAL. This is the one structural difference from the
 		 * vision tower, and it is invisible in the output: with full
 		 * attention every embedding still comes back finite and the
 		 * cosine similarities still order themselves plausibly. The
@@ -824,7 +824,7 @@ int charsiu_clip_encode_text(struct charsiu_clip_text *t, const int32_t *ids,
 	}
 
 	/*
-	 * ⚠ THE SENTENCE IS THE LAST ROW, and it is the last row because that
+	 * THE SENTENCE IS THE LAST ROW, and it is the last row because that
 	 * is where the END OF TEXT token sits -- not because it is the end of
 	 * the buffer. charsiu_clip_tokenize puts eot last, and a caller that
 	 * builds ids some other way has to keep that true.

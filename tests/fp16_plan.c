@@ -110,7 +110,7 @@ static void check(struct charsiu_fp16_op *ops, unsigned n)
 			if (overlap(p.ooff[i], p.osz[i], p.ooff[j], p.osz[j]))
 				bad("outputs overlap", i, j);
 			/*
-			 * ⚠ COEFFICIENTS ARE THE ONE THING TWO OPS MAY SHARE,
+			 * COEFFICIENTS ARE THE ONE THING TWO OPS MAY SHARE,
 			 * and only when sharing is exact. Two ops with the same
 			 * n and the same size have byte identical coefficients
 			 * and point at one region; anything else must be
@@ -200,7 +200,7 @@ int main(void)
 	}
 
 	/*
-	 * ⚠ AND WITH SOME WEIGHTS ALREADY ON THE DEVICE. An op whose Wbuf is
+	 * AND WITH SOME WEIGHTS ALREADY ON THE DEVICE. An op whose Wbuf is
 	 * set contributes nothing to the shared weight buffer, so the ops
 	 * either side of it must still not overlap -- which is the arithmetic
 	 * that breaks if a zero sized region is given a page anyway.

@@ -8,7 +8,7 @@
 #include <string.h>
 
 /*
- * 🏁 2026-09-04: THE OVERLAP FAULT WAS THE NPU'S VOLTAGE MARGIN, NOT THE
+ * 2026-09-04: THE OVERLAP FAULT WAS THE NPU'S VOLTAGE MARGIN, NOT THE
  * OVERLAP. At width 24 with both cores in flight, core 1 wrote one word of
  * a row wrong -- the right value plus 1024, or a few bits around bit 10 of
  * the accumulator -- one row in a few thousand, on the same board, same
@@ -44,14 +44,14 @@ static long sysfs_long(const char *path)
 }
 
 /*
- * ⚠ WALK THE DIRECTORY, DO NOT GUESS THE NUMBERS. regulator.N is numbered by
+ * WALK THE DIRECTORY, DO NOT GUESS THE NUMBERS. regulator.N is numbered by
  * probe order and nothing bounds N: a loop to 64 finds the rail on this board
  * and would silently return "unreadable" -- which this code reads as unsafe,
  * so a board that is fine would serialise for a reason nobody could see.
  */
 static long npu_rail_uv(void)
 {
-	/* ⚠ THE PROBE HATCH. A guard whose inputs cannot be set is a guard that
+	/* THE PROBE HATCH. A guard whose inputs cannot be set is a guard that
 	 * can only be tested by rebooting the board into a different voltage.
 	 * CHARSIU_NPU_RAIL_UV and CHARSIU_NPU_CLK_HZ replace the two readings,
 	 * so tests/overlap_guard.c walks the vendor's whole table on a desk and

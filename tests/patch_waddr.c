@@ -4,7 +4,7 @@
  * Patching the weight address into an emitted stream against emitting it that
  * way in the first place, byte for byte.
  *
- * ⚠⚠ WHY THIS IS A TEST AND NOT A READING. charsiu_patch_weight_addr exists so
+ * WHY THIS IS A TEST AND NOT A READING. charsiu_patch_weight_addr exists so
  * a layer of attention can reuse one register stream over sixteen different KV
  * surfaces, and the whole safety of that is the claim that ONE word depends on
  * the weight address. That claim is true of the emitter as it is written today

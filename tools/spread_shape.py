@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Is a set of timings TWO CLUSTERS or ONE TAIL? Decided by a rule fixed first.
 
-⚠⚠ THIS EXISTS BECAUSE THE ALTERNATIVE IS INVENTING A STORY. gemma4's TTFT
+THIS EXISTS BECAUSE THE ALTERNATIVE IS INVENTING A STORY. gemma4's TTFT
 read 2133, 2182, 2185, 2325, 2408, 2707 and 3221 in one build, and "that looks
 like two clusters rather than a tail" is a sentence written by a person looking
 at seven numbers. This tree has already published a shape property for two
@@ -34,19 +34,19 @@ THE RULE, fixed here:
   drift          |rho_index| >= 0.5 or |rho_temp| >= 0.5
   no structure   anything else
 
-⚠⚠ AND QUOTABILITY IS A SEPARATE QUESTION FROM SHAPE. The first version said
+AND QUOTABILITY IS A SEPARATE QUESTION FROM SHAPE. The first version said
 "no structure -> the row is NOT quotable", which is written for a 46% spread
 and is exactly backwards for a 1.6% one: a tight unimodal arm is the most
 quotable thing there is. Shape and spread are reported separately now, and the
 quotable line keys off the SPREAD.
 
-⚠⚠ AND A GAP RATIO IS SCALE-FREE, so on a very tight sample the readings'
+AND A GAP RATIO IS SCALE-FREE, so on a very tight sample the readings'
 own last digit manufactures structure: the big-cluster arm spans 1.6% and its
 "largest gap" is 0.1 tok/s, which the ratio test happily called two clusters.
 Below a 5% spread the shape question is not asked -- at that width two
 clusters cannot be told from rounding, and saying so is the honest answer.
 
-⚠ The middle-gap test was also too strict. It required the split to sit
+The middle-gap test was also too strict. It required the split to sit
 between the quartiles, so 7 low and 2 high -- a gap ratio of 49 -- came back
 "at an END" because both quartiles were inside the low cluster. Two clusters
 of very different sizes are still two clusters; what a single outlier must not
@@ -123,14 +123,14 @@ def main():
     ratio = gmax / medgap if medgap > 0 else float("inf")
     split = (sv[gi] + sv[gi + 1]) / 2.0
     q25, q75 = pct(sv, 0.25), pct(sv, 0.75)
-    # ⚠ 2 A SIDE, NOT "between the quartiles": a lopsided split is still a
+    # 2 A SIDE, NOT "between the quartiles": a lopsided split is still a
     # split, and gi is the index of the gap in the sorted list, so the sides
     # are gi+1 below and n-gi-1 above.
     middle = (gi + 1) >= 2 and (n - gi - 1) >= 2
 
     rho_i = spearman(vals, list(range(n)))
     #
-    # ⚠⚠ A PERFECTLY MONOTONE INPUT IS ALMOST CERTAINLY A SORTED QUOTE, NOT A
+    # A PERFECTLY MONOTONE INPUT IS ALMOST CERTAINLY A SORTED QUOTE, NOT A
     # TIME SERIES, and the drift test then reads +1.000 by construction. The
     # seven gemma4 readings this tool was written for are quoted ascending
     # everywhere they appear -- feeding them in gives DRIFT, which is a
@@ -162,7 +162,7 @@ def main():
     print()
 
     if presorted and n >= 6:
-        print("  ⛔ THE INPUT IS PERFECTLY SORTED, so it is a quoted list and")
+        print("  THE INPUT IS PERFECTLY SORTED, so it is a quoted list and")
         print("     not a time series. rho index is +-1 by construction and")
         print("     means nothing here. Re-run with the readings IN THE ORDER")
         print("     THEY WERE TAKEN -- board_record.sh stamps each with its")
@@ -172,7 +172,7 @@ def main():
 
     spread = (sv[-1] - sv[0]) / pct(sv, 0.5) * 100
     #
-    # ⚠⚠ THE WIDTH GATE. A ratio has no units, so a sample spanning 1.6% has
+    # THE WIDTH GATE. A ratio has no units, so a sample spanning 1.6% has
     # a "largest gap" made of its own last digit. Do not ask the shape
     # question of something too tight to hold an answer.
     #
@@ -197,7 +197,7 @@ def main():
     else:
         print("  VERDICT: NO STRUCTURE -- one population, not two, no trend.")
     #
-    # ⚠⚠ SHAPE IS NOT QUOTABILITY. A tight unimodal arm is the most quotable
+    # SHAPE IS NOT QUOTABILITY. A tight unimodal arm is the most quotable
     # thing there is; a 46% spread is not, whatever its shape.
     #
     print()

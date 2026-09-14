@@ -12,7 +12,7 @@
  * -- and the emitter differentiates: m=2 doubles the input surface width in
  * 0x1028 and sets the height fields to 1. None of that has ever been run.
  *
- * ⚠ m=1 IS THE CONTROL AND IT RUNS FIRST. If m=1 disagrees with the CPU then
+ * m=1 IS THE CONTROL AND IT RUNS FIRST. If m=1 disagrees with the CPU then
  * this test is wrong and says so, rather than blaming a field it was built to
  * examine. Only m=1 passing makes an m=2 failure mean anything.
  *
@@ -47,7 +47,7 @@ static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
 	job.acc_out = 1;              /* the raw int32 accumulator */
 
 	/*
-	 * ⚠ entries_per_row IS PER ROW, and the packed input holds m of them
+	 * entries_per_row IS PER ROW, and the packed input holds m of them
 	 * interleaved: [K/atom][M][atom]. Sizing it without the m factor gave a
 	 * 64 byte buffer for a 128 byte pack, which only survived on the slack
 	 * and would have failed on the board as something mysterious. Verified
@@ -77,7 +77,7 @@ static int run(struct charsiu_device *dev, unsigned m, unsigned k, unsigned n,
 	charsiu_bo_fini(dev, &in);
 
 	/*
-	 * ⚠ NEITHER OF THESE MAY BE NULL. charsiu_build_coefs dereferences
+	 * NEITHER OF THESE MAY BE NULL. charsiu_build_coefs dereferences
 	 * bias[oc] and weight_sums[oc] unconditionally, and passing NULL
 	 * segfaulted on the board before the control had printed a single
 	 * result. Zeros are the right values here anyway: input_zero_point is
@@ -182,7 +182,7 @@ static int check(const char *what, unsigned m, unsigned n,
 }
 
 /*
- * ⚠ "WRONG" AND "SOMEWHERE ELSE" ARE DIFFERENT ANSWERS, and only one of them
+ * "WRONG" AND "SOMEWHERE ELSE" ARE DIFFERENT ANSWERS, and only one of them
  * means m>1 is unusable. The first m=2 run had its first four outputs exactly
  * right and then diverged, which is what a layout looks like rather than an
  * arithmetic fault. So before concluding anything, ask whether the numbers are
@@ -203,7 +203,7 @@ static int check(const char *what, unsigned m, unsigned n,
  * holds the value the CPU computed for it. A layout is then read off the
  * table rather than matched against a list.
  *
- * ⚠ AMBIGUOUS HITS ARE MARKED. A dot product of 256 int8 pairs can repeat, so
+ * AMBIGUOUS HITS ARE MARKED. A dot product of 256 int8 pairs can repeat, so
  * a value found at three places is three candidates and not a fact; the count
  * is printed so a reader can discount it.
  */
@@ -238,13 +238,13 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	unsigned shown = 0;
 
 	/*
-	 * ⚠ ROW 0 ACROSS THE WHOLE ROW, not its first six channels. Round 381
+	 * ROW 0 ACROSS THE WHOLE ROW, not its first six channels. Round 381
 	 * sampled six, saw them land at 0 1 2 3 8 9 -- which is exactly
 	 * [n/4][m][4] -- and then had to explain why the same layout scored
 	 * only 15 of 128. Six channels cannot say where a pattern STOPS.
 	 */
 	/*
-	 * ⚠ SAY HOW TRUSTWORTHY THIS TABLE IS. Every row of it reports the
+	 * SAY HOW TRUSTWORTHY THIS TABLE IS. Every row of it reports the
 	 * FIRST index holding a value, so a value the reference produces twice
 	 * gives an answer that is one of two and reads like one of one.
 	 */
@@ -304,7 +304,7 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	printf("    a contiguous [m][n] would put (r,c) at r*%u + c\n", n);
 
 	/*
-	 * ⚠ AND THE WHOLE BUFFER, not a sample of it. Thirty sampled rows say
+	 * AND THE WHOLE BUFFER, not a sample of it. Thirty sampled rows say
 	 * where a pattern holds and cannot say where it STOPS, which is the
 	 * only interesting thing left: round 383's samples were exact for
 	 * channels 0 to 11 and then broke, and no sampling density would have
@@ -319,7 +319,7 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 		const char *ap = getenv("CHARSIU_ENTRY_ATOMICS");
 
 		/*
-		 * ⚠ SAY WHICH CONFIGURATION THIS MAP IS OF. Round 384's map
+		 * SAY WHICH CONFIGURATION THIS MAP IS OF. Round 384's map
 		 * was printed with CHARSIU_ENTRY_ATOMICS left at 8 by the
 		 * sweep and round 385's at 4, and the two look nothing alike
 		 * -- which read as the hardware being non-deterministic until
@@ -351,7 +351,7 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 	       " reference\n");
 
 	/*
-	 * ⚠⚠ THE QUESTION THIS WHOLE FILE IS ACTUALLY ASKING. If every value
+	 * THE QUESTION THIS WHOLE FILE IS ACTUALLY ASKING. If every value
 	 * the reference computes appears exactly once in the buffer, then the
 	 * ARITHMETIC IS RIGHT and only the read order is wrong -- and a
 	 * batched prefill is available today, through a permutation, without
@@ -388,7 +388,7 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 		       placed && injective ? "; the unique ones collide with"
 					     " nothing" : "");
 		if (!absent && injective)
-			printf("\n  ⚑ THE ARITHMETIC IS RIGHT AND ONLY THE READ"
+			printf("\n  THE ARITHMETIC IS RIGHT AND ONLY THE READ"
 			       " ORDER IS WRONG.\n  A batched prefill is"
 			       " available through a permutation, with no\n"
 			       "  further register work.\n");
@@ -397,7 +397,7 @@ static void locate(unsigned m, unsigned n, const int32_t *got,
 			       " order recovers them.\n", absent);
 
 		/*
-		 * ⚠ AND THE ONE NUMBER THAT SAYS WHAT IT RAN OUT OF. If the
+		 * AND THE ONE NUMBER THAT SAYS WHAT IT RAN OUT OF. If the
 		 * hardware always writes the same COUNT of words whatever N
 		 * is, something has a fixed capacity -- a CBUF bank, a task's
 		 * output allowance. If it always writes the same FRACTION,
@@ -491,7 +491,7 @@ static int layouts(unsigned m, unsigned n, const int32_t *got, const int32_t *wa
  * One pass of the M sweep. `ape` is CHARSIU_ENTRY_ATOMICS: how many channel
  * atoms this tree thinks fit in a CBUF entry.
  *
- * ⚠ 4 IS WHAT THIS TREE HAS ALWAYS SAID AND 8 IS WHAT MESA SAYS. Same
+ * 4 IS WHAT THIS TREE HAS ALWAYS SAID AND 8 IS WHAT MESA SAYS. Same
  * function, one constant apart -- rkt_task.c divides by CBUF_ENTRY_SIZE /
  * FEATURE_ATOMIC_SIZE = 128/16 = 8. With 8, charsiu's stream agrees with
  * Mesa's generic RK3576 encoder on ALL 25 geometry words at M = 1, 2, 4 and
@@ -538,7 +538,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 		(*tried)++;
 		if (check(what, m, n, got, want)) {
 			/*
-			 * ⚠⚠ WRONG VALUES AND WRONG ORDER ARE NOT THE SAME
+			 * WRONG VALUES AND WRONG ORDER ARE NOT THE SAME
 			 * ANSWER, and check() cannot tell them apart because
 			 * it compares position by position.
 			 *
@@ -560,7 +560,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 				for (size_t i = 0; i < total; i++)
 					if (got[i] == want[q]) { live++; break; }
 			if (live == total)
-				printf("      ⚑ but ALL %zu values are in the"
+				printf("      but ALL %zu values are in the"
 				       " buffer: right arithmetic, wrong"
 				       " order\n", total);
 			else
@@ -572,7 +572,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 		}
 
 		/*
-		 * ⚠ m=1 IS THE CONTROL AND NOTHING BELOW IT MEANS ANYTHING. If
+		 * m=1 IS THE CONTROL AND NOTHING BELOW IT MEANS ANYTHING. If
 		 * the one width this tree has always run disagrees with the
 		 * CPU, the pass is broken and says so rather than blaming a
 		 * field it was built to examine.
@@ -587,7 +587,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
 }
 
 /*
- * ⚠⚠ HOW SMALL CAN THE COEFFICIENT BUFFER BE?
+ * HOW SMALL CAN THE COEFFICIENT BUFFER BE?
  *
  * charsiu_coef_bytes bounds the coefficient surface by k*n, which makes it
  * four times the weight buffer -- 67 MB for an N=8192 slice. A 262144 wide
@@ -600,14 +600,14 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * 1280 bytes against 20800 -- and nothing has ever measured the read growing
  * with k*n. At 65536 elements the same head would want 10.5 MB.
  *
- * ⚠ UNDER ALLOCATING DOES NOT RETURN AN ERROR. The RDMA reads past the buffer,
+ * UNDER ALLOCATING DOES NOT RETURN AN ERROR. The RDMA reads past the buffer,
  * the IOMMU faults and the job times out with every register correct, so this
  * walks DOWNWARD from the current bound and stops at the first value that is
  * not exact. The last good one is the answer, and everything below it is
  * unexplored rather than known bad.
  */
 /*
- * ⚠⚠ THE PARTITION THAT WAS IN THE RECORD ALL ALONG: m > 1 IS EXACT WHERE
+ * THE PARTITION THAT WAS IN THE RECORD ALL ALONG: m > 1 IS EXACT WHERE
  * surf IS 1.
  *
  * Every shape this tree has ever computed correctly above one row has
@@ -637,7 +637,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * nothing about surf at all.
  */
 /*
- * ⚠⚠ THE HARDWARE COMPUTES m > 1. THE READING IS WHAT IS WRONG.
+ * THE HARDWARE COMPUTES m > 1. THE READING IS WHAT IS WRONG.
  *
  * charsiu_matmul asks for the REQUANTISED INT8 output and reads it as
  * [n/atom][m][n%atom] with a 16 byte atom. On the board at M=2 K=64 N=64 that
@@ -650,7 +650,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * int8 output is one, so if the surface is the same shape the atom is a
  * different number of ELEMENTS, and nobody has measured which.
  *
- * ⚠ DO NOT GUESS IT. The nearest guess -- a 16 byte atom, so four words --
+ * DO NOT GUESS IT. The nearest guess -- a 16 byte atom, so four words --
  * predicts 8 positions surviving a flat read at m=2, which is what the board
  * writes, and 16 at m=4, where the board writes 8. Right at one width and
  * wrong at the next is what four rounds of fitting produced. So this asks the
@@ -660,7 +660,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * them must score n; a candidate that does not is a bug in this function.
  */
 /*
- * ⚠⚠ ONE REGISTER, SWEPT AT A WIDTH WHERE IT CAN VARY.
+ * ONE REGISTER, SWEPT AT A WIDTH WHERE IT CAN VARY.
  *
  * 0x40b8 is ow * rows on the int8 arm, which is the row count and scales with
  * M, and a literal 3 on the acc_out arm at every M. Round 312 chose that 3 by
@@ -673,7 +673,7 @@ static int sweep(struct charsiu_device *dev, unsigned ape, char axis,
  * than only the flat one: a value that fixes the arithmetic should show up
  * whatever the layout turns out to be, and the layout is not known.
  *
- * ⚠ THE CONTROL IS M = 1. The default 3 has to score n there, or the sweep is
+ * THE CONTROL IS M = 1. The default 3 has to score n there, or the sweep is
  * measuring a broken build rather than a register.
  */
 static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
@@ -739,7 +739,7 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 					}
 				if (ex > best[y]) {
 					best[y] = ex;
-					/* ⚠ NAME THE READING. "surf" alone
+					/* NAME THE READING. "surf" alone
 					 * cannot be acted on: the next round
 					 * has to hold the atom. */
 					if (atom)
@@ -757,7 +757,7 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 		       best[2], 4 * n, how[2], v == 3 ? "   <- today's default" : "");
 	}
 	unsetenv("CHARSIU_DPU_40B8");
-	printf("\n  ⚠ the m=1 column is the CONTROL and 3 must score %u there.\n"
+	printf("\n  the m=1 column is the CONTROL and 3 must score %u there.\n"
 	       "  A candidate that scores 2n at m=2 is the answer; check it at\n"
 	       "  m=4 in the same row before believing it.\n", n);
 	free(A); free(B); free(got); free(want);
@@ -765,7 +765,7 @@ static int b8_sweep(struct charsiu_device *dev, unsigned k, unsigned n)
 }
 
 /*
- * ⚠⚠ DOES charsiu_acc_index HOLD AT A PROJECTION'S WIDTH?
+ * DOES charsiu_acc_index HOLD AT A PROJECTION'S WIDTH?
  *
  * It was solved at N = 32 and confirmed at 64 and 128. A projection is 2048
  * wide, sixteen times the largest N it has ever seen, and the batched runtime
@@ -837,7 +837,7 @@ static int nwide_sweep(struct charsiu_device *dev, unsigned k)
 		       n, uniq, live, total, ex, total,
 		       ex == total ? "  EXACT" : "");
 	}
-	printf("\n  ⚠ present is reading independent: if it stays at m*n while\n"
+	printf("\n  present is reading independent: if it stays at m*n while\n"
 	       "  exact falls away, the arithmetic is fine and the expression's\n"
 	       "  super group term is what stops.\n");
 	free(A); free(B); free(got); free(want);
@@ -887,7 +887,7 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 			continue;
 		}
 		/*
-		 * ⚠ HOW MANY DISTINCT VALUES THE REFERENCE HAS, printed beside
+		 * HOW MANY DISTINCT VALUES THE REFERENCE HAS, printed beside
 		 * the score. charsiu_matmul's own data is five distinct values
 		 * in 128 and it says so; a match count means nothing without
 		 * this number next to it.
@@ -943,7 +943,7 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 	       "  does, the accumulator surface is not this shape and the\n"
 	       "  present column says whether the values are even there.\n");
 	/*
-	 * ⚠ AND THEN STOP GUESSING SHAPES AND READ THE MAP. locate() prints the
+	 * AND THEN STOP GUESSING SHAPES AND READ THE MAP. locate() prints the
 	 * index each wanted value came back at, which is the permutation itself
 	 * rather than a candidate for it. It was untrustworthy while the
 	 * reference had fifteen distinct values in 128; at K = 64 N = 64 it has
@@ -951,7 +951,7 @@ static int read_sweep(struct charsiu_device *dev, unsigned k, unsigned n,
 	 * reader can check rather than take my word.
 	 */
 	/*
-	 * ⚠ THE MAP AT THE m THAT IS OPEN, not always at 2. m = 2 is solved and
+	 * THE MAP AT THE m THAT IS OPEN, not always at 2. m = 2 is solved and
 	 * printing it again says nothing; the fourth argument picks the width,
 	 * so `--read 4` returns the table that would settle A.
 	 */
@@ -1023,12 +1023,12 @@ static int surf_sweep(struct charsiu_device *dev, unsigned n)
 		}
 	}
 	/*
-	 * ⚠ WHAT WOULD MAKE THIS RUN MEAN NOTHING: the surf 1 rows failing at
+	 * WHAT WOULD MAKE THIS RUN MEAN NOTHING: the surf 1 rows failing at
 	 * m > 1. They are the control. If K = 48 and K = 64 do not compute at
 	 * m = 2 and m = 4, the partition is not surf and this table is a
 	 * different fault being reported under the wrong name.
 	 */
-	printf("\n  ⚠ K=48 and K=64 are surf 1 and are the CONTROL: they have\n"
+	printf("\n  K=48 and K=64 are surf 1 and are the CONTROL: they have\n"
 	       "  to be exact at m=2 and m=4, or the axis is not surf.\n"
 	       "  K=80 and K=128 are surf 2, which nothing has ever measured.\n");
 	free(A); free(B); free(got); free(want);
@@ -1075,13 +1075,13 @@ static int coef_floor(struct charsiu_device *dev, unsigned k, unsigned n,
 		       " nothing about the floor.\n");
 		return 1;
 	}
-	printf("\n  ⚑ the smallest exact bound here is %zu elements, %.2f MB.\n"
+	printf("\n  the smallest exact bound here is %zu elements, %.2f MB.\n"
 	       "  A 262144 wide head is 32 slices, so that is %.1f MB of"
 	       " coefficients\n  against 151 MB of weights, where the k*n bound"
 	       " asks for 1210.\n",
 	       last_ok, (double)(last_ok * 4) / 1e6,
 	       (double)(last_ok * 4 * 32) / 1e6);
-	printf("\n  ⚠ Everything below that is UNEXPLORED, not known bad: the"
+	printf("\n  Everything below that is UNEXPLORED, not known bad: the"
 	       " walk stops at\n  the first failure and an under-allocated"
 	       " surface faults rather than\n  returning an error.\n");
 	return 0;
@@ -1090,7 +1090,7 @@ static int coef_floor(struct charsiu_device *dev, unsigned k, unsigned n,
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
@@ -1102,7 +1102,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	/*
-	 * ⚠ M IS A SWEEP NOW, NOT A PAIR. Round 379 ran m=1 and m=2 only and
+	 * M IS A SWEEP NOW, NOT A PAIR. Round 379 ran m=1 and m=2 only and
 	 * concluded "m>1 does not work" from one failing width. The register
 	 * fix in 2184557 is about the input surface block, which is degenerate
 	 * at m=1 and rounds to four at m=2, so those two widths are the two
@@ -1116,7 +1116,7 @@ int main(int argc, char **argv)
 	unsigned maxm;
 
 	/*
-	 * ⚠⚠ CHARSIU_GEMM_M EXISTS TO ASK ONE QUESTION: is the wide K slice
+	 * CHARSIU_GEMM_M EXISTS TO ASK ONE QUESTION: is the wide K slice
 	 * fault int4's, or the encoder's?
 	 *
 	 * The board has the batched int4 path disagreeing with the token loop
@@ -1132,7 +1132,7 @@ int main(int argc, char **argv)
 	 * shares and int4 is a bystander. If int8 is clean at every width then
 	 * it is the int4 path, and that is a much smaller place to look.
 	 *
-	 * ⚠ m = 1 STAYS FIRST WHATEVER IS ASKED FOR, because it is the control:
+	 * m = 1 STAYS FIRST WHATEVER IS ASKED FOR, because it is the control:
 	 * an m = 80 failure means nothing if m = 1 is already wrong.
 	 */
 	{
@@ -1177,7 +1177,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	/*
-	 * ⚠ EVERY ROW OF A MUST DIFFER, or a wide m could be right by copying
+	 * EVERY ROW OF A MUST DIFFER, or a wide m could be right by copying
 	 * one row over the rest. The stride is coprime with the row length so
 	 * no two rows repeat.
 	 */
@@ -1185,7 +1185,7 @@ int main(int argc, char **argv)
 		for (unsigned i = 0; i < k; i++)
 			A[(size_t)r * k + i] = mix(r * 2u + 1u, i, 15);
 	/*
-	 * ⚠ EVERY OUTPUT CHANNEL MUST BE A DIFFERENT NUMBER, and the obvious
+	 * EVERY OUTPUT CHANNEL MUST BE A DIFFERENT NUMBER, and the obvious
 	 * B[c][i] = (c + i) % 9 is not: it has PERIOD NINE in c, so channel 9
 	 * computes the same dot product as channel 0. Round 382's locator then
 	 * reported the first flat index holding each value, which for a
@@ -1245,7 +1245,7 @@ int main(int argc, char **argv)
 
 	printf("K=%u N=%u, int8 weights and activations, raw accumulator\n", k, n);
 	/*
-	 * ⚠ SAY WHICH GEOMETRY RAN. Round 380's "control" was typed as
+	 * SAY WHICH GEOMETRY RAN. Round 380's "control" was typed as
 	 *
 	 *     CHARSIU_M_LEGACY=1
 	 *     /opt/charsiu/npu_gemm_test 256 64
@@ -1258,7 +1258,7 @@ int main(int argc, char **argv)
 	       getenv("CHARSIU_CNA_1098") ? " (CHARSIU_CNA_1098 set)" : "");
 
 	/*
-	 * ⚠ FOUR CONFIGURATIONS, AND THE AXIS IS THE INTERESTING ONE. Round
+	 * FOUR CONFIGURATIONS, AND THE AXIS IS THE INTERESTING ONE. Round
 	 * 384's output map showed the second position being spent on output
 	 * CHANNEL c+16 rather than row 1, and 0x4020 -- the DPU's output width
 	 * -- is 0 at every M on the height axis. CHARSIU_M_AXIS=w is Mesa's
@@ -1277,10 +1277,10 @@ int main(int argc, char **argv)
 			fail = sweep(dev, CFG[c].ape, CFG[c].axis, MS, nms,
 				     k, n, A, B, got, want, &p, &t);
 			if (!fail && t > 1) {
-				printf("\n  ⚑ THIS ONE WORKS: M on the %s, "
+				printf("\n  THIS ONE WORKS: M on the %s, "
 				       "CHARSIU_ENTRY_ATOMICS=%u.\n"
 				       "  %u of %u widths exact.\n"
-				       "  ⚠ Decode has only ever run at M = 1 "
+				       "  Decode has only ever run at M = 1 "
 				       "on the height axis with 4,\n"
 				       "  so check TOKENS before changing any "
 				       "default.\n",
@@ -1367,7 +1367,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ AND THE SAME COUNT AT m=4, because two widths ruled out N and two
+	 * AND THE SAME COUNT AT m=4, because two widths ruled out N and two
 	 * K values have now ruled out K.
 	 *
 	 * K=256 has surf 4 and gave a row stride of 20, which is 5 * surf and
@@ -1378,7 +1378,7 @@ int main(int argc, char **argv)
 	 * search over-determined rather than merely unique.
 	 */
 	/*
-	 * ⚠⚠ THE SERIES IN m, WHICH IS WHAT THE COUNTS ACTUALLY FIT.
+	 * THE SERIES IN m, WHICH IS WHAT THE COUNTS ACTUALLY FIT.
 	 *
 	 *     N=64 m=2   92 of 128     N=32 m=2   52 of  64
 	 *     N=64 m=4  148 of 256
@@ -1428,7 +1428,7 @@ int main(int argc, char **argv)
 			g_live_at_m4 = livem;
 	}
 	/*
-	 * ⚠⚠ THE PREDICTION THIS WHOLE SERIES MAKES, AND IT CAN FAIL.
+	 * THE PREDICTION THIS WHOLE SERIES MAKES, AND IT CAN FAIL.
 	 *
 	 * The budget per extra row measured 28 words at N=64 and 20 at N=32,
 	 * which is N/4 + 12 through both. A row needs N. The two meet at
@@ -1449,7 +1449,7 @@ int main(int argc, char **argv)
 		       " enough =====\n");
 		sweep(dev, 4, 'h', MS, nms, k, 16, A, B, got, want, &p, &t);
 		/*
-		 * ⚠ "exact" here still means position by position. Read the
+		 * "exact" here still means position by position. Read the
 		 * per-width lines above for whether the values are all
 		 * present, which is the question the budget makes a prediction
 		 * about; a permutation is a pass for the budget and a fail for
@@ -1457,7 +1457,7 @@ int main(int argc, char **argv)
 		 */
 		printf("  %u of %u widths exact position by position at"
 		       " N=16.\n"
-		       "  ⚠ The budget predicts every VALUE is present here,"
+		       "  The budget predicts every VALUE is present here,"
 		       " not that the order is\n"
 		       "  right -- the lines above say which.\n", p, t);
 	}
@@ -1478,7 +1478,7 @@ int main(int argc, char **argv)
 			       " capacity, the same PERCENTAGE a stride.\n", n);
 
 			/*
-			 * ⚠⚠ AND SOLVE FOR THE STRIDES, because two counts
+			 * AND SOLVE FOR THE STRIDES, because two counts
 			 * pin them. The address function fitted to the r385
 			 * map, 80 of 80 cells:
 			 *
@@ -1518,14 +1518,14 @@ int main(int argc, char **argv)
 					unsigned surf =
 						charsiu_entries_per_row(&sm);
 
-					printf("\n  ⚑ exactly one stride pair"
+					printf("\n  exactly one stride pair"
 					       " reproduces both counts:\n"
 					       "  row stride %u, block stride"
 					       " %u -- an injective surface"
 					       " needs %u and %u at N=%u.\n",
 					       fr, fs, 2 * n / 4, 4 * n / 4, n);
 					/*
-					 * ⚠ AND surf BESIDE IT, because the
+					 * AND surf BESIDE IT, because the
 					 * whole question is what the wrong
 					 * stride was computed FROM. It does
 					 * not move with N -- two widths said
@@ -1549,7 +1549,7 @@ int main(int argc, char **argv)
 				else
 					printf("\n  %u stride pairs fit all"
 					       " the counts.\n"
-					       "  ⚠ The function that fits the"
+					       "  The function that fits the"
 					       " m=2 MAP exactly -- 80 of 80\n"
 					       "  cells, R=20 S=40 -- predicts"
 					       " %zu words at m=4 and the board\n"
@@ -1565,7 +1565,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ THE MAP AT m=4 AS WELL, because three counts turned out to be too
+	 * THE MAP AT m=4 AS WELL, because three counts turned out to be too
 	 * weak to fit what one map pinned exactly.
 	 *
 	 * At m=2 the address function is unique: searching a four parameter
@@ -1575,7 +1575,7 @@ int main(int argc, char **argv)
 	 * width perfectly and misses the next is a model of that width, so the
 	 * m dependence has to be read rather than extrapolated.
 	 *
-	 * ⚠ And the layout is not the critical path anyway. At m=2 thirty six
+	 * And the layout is not the critical path anyway. At m=2 thirty six
 	 * reference values were never computed and at m=4 it is a hundred and
 	 * eight, so no permutation recovers them; what the second map is for
 	 * is which ones are missing and in what pattern.

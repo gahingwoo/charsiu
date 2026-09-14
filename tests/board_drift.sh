@@ -2,13 +2,13 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# ⭐⭐ HOW MUCH ONE ARM MOVES INSIDE ONE BOOT, WITH NOTHING CHANGED.
+# HOW MUCH ONE ARM MOVES INSIDE ONE BOOT, WITH NOTHING CHANGED.
 #
 # Every margin in this tree is read against two bounds: the 2.2% cross-boot
 # drift, and the arm's own spread inside a run. Neither of those is the bound
 # that matters when two cells of one table are measured twenty minutes apart.
 #
-# ⚠⚠ AND THAT BOUND HAS A READING NOW. r411 measured the CPU attention arm at
+# AND THAT BOUND HAS A READING NOW. r411 measured the CPU attention arm at
 # 302 tokens twice on boot 2f21a2e1, same binary, clock pinned: 2274 ms in its
 # section 8 and 2138 ms in r412's re-run. 6.4% apart, WITHIN one boot, larger
 # than the cross-boot number this tree quotes -- and each run reported a spread
@@ -26,7 +26,7 @@
 #                            this spread is, and tables have to alternate arms
 #                            rather than finish one before starting the other
 #
-# ⚠ The governor is pinned exactly as every other board script pins it, so a
+# The governor is pinned exactly as every other board script pins it, so a
 # frequency that still moves is the SoC refusing, not the governor choosing.
 #
 #   CHARSIU_DRIFT_N=12        readings
@@ -92,7 +92,7 @@ printf '%s\n' $T | sort -n | awk '{a[NR]=$0}
 	END{ m=(NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2;
 	     printf "   median %.0f  range %s..%s  spread %.1f%% of the median\n",
 	            m, a[1], a[NR], 100*(a[NR]-a[1])/m }'
-echo "   ⚠ THAT SPREAD IS THE FLOOR ON ANY WITHIN-BOOT COMPARISON IN THIS TREE."
+echo "   THAT SPREAD IS THE FLOOR ON ANY WITHIN-BOOT COMPARISON IN THIS TREE."
 
 echo
 echo "restoring schedutil"

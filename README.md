@@ -46,8 +46,8 @@ only comparison here where nothing is quoted.
                the spread  each row's own range, above. All eight clear their
                           own spread; the floor is what separates them.
 
-             ⚠ 852 is +2.1% and does not clear the floor, so it stays level.
-             ⚠ 602 is the thin row: +3.5% clears 2.5% by one point, and a
+             852 is +2.1% and does not clear the floor, so it stays level.
+             602 is the thin row: +3.5% clears 2.5% by one point, and a
              slightly stricter bound puts it back to level. 302 and 452 clear
              comfortably.
 
@@ -58,7 +58,7 @@ only comparison here where nothing is quoted.
              it too. 302 and 452 moved from level to ahead when the attention
              threshold came down to 272, re-derived against the arm that ships.
 
-             ⛔ This table has been overclaimed once. Every point estimate
+             This table has been overclaimed once. Every point estimate
              favoured charsiu then too, it was written up as "completely
              surpassed", and it was withdrawn the same day. What is different
              is that the floor is measured and that one row is still level and
@@ -104,7 +104,7 @@ Their runtime was run here, not quoted from a table. What ran:
             sides. Decode is r389 and r390.
 ```
 
-⚠ **The harness's source is not in this repository.** `vendor_bench` was
+**The harness's source is not in this repository.** `vendor_bench` was
 written, built and deployed to the board, and only the binary survives. Its
 identity is recorded above so the runs can be tied to it, but a reader cannot
 rebuild it from here, and re-measuring the vendor column needs the board booted
@@ -133,7 +133,7 @@ requantisation, which is what the other two are a loss against. int4 decodes
 2.02x. int4 is the default because chat is a short prompt and a long answer;
 `CHARSIU_NPU_W4V=0` selects int8 for the other shape of work.
 
-⚠ The figures this replaces -- 26.31 and 17.23 tok/s, 87% and 1.6% -- appear in
+The figures this replaces -- 26.31 and 17.23 tok/s, 87% and 1.6% -- appear in
 no board log and no evidence section in either repository. The two perplexity
 percentages were close (1.6 against 1.8, 87 against 102) and the two decode
 figures were not; all four are now measured here rather than carried forward.
@@ -258,14 +258,14 @@ encoder, and a decoder with the first cross attention in this tree. Every stage 
 diffed against numpy on the real weights, the spectrogram at 1.7e-05, the encoder
 at 1.7e-04 over 576000 values, and the decoder's logits with the same argmax.
 
-⚠ Those three tolerances are the printed output of
+Those three tolerances are the printed output of
 `tests/whisper_encoder_cross.py` and `tests/whisper_decoder_cross.py`, which
 parse the container independently of charsiu and are what anybody should re-run
 to check them. They are reproducible but not recorded with their conditions in
 either repository, unlike every speed number above, so treat them as "run the
 script" rather than as a citation.
 
-⚠ Two of the three have now been re-run and neither matched what was written
+Two of the three have now been re-run and neither matched what was written
 here. The encoder read 1.8e-04 when written and reads **1.699e-04** at HEAD,
 which is real drift from the attention and gelu rewrites since; the figure
 above is corrected. The decoder's **3.8e-05 has no audio beside it**, and that
@@ -285,7 +285,7 @@ $ charsiu_clip clip-b32.gguf --image logo.png \
   0.1474  a dog on grass
 ```
 
-⚠ This block used to print 0.2537 / 0.1743 / 0.1533 and was not one run. Rows
+This block used to print 0.2537 / 0.1743 / 0.1533 and was not one run. Rows
 one and two are the **f16** CLIP file, reproduced here to the last digit; the
 file `tests/board_modalities.sh` actually downloads is the q4_0 above, which
 gives the numbers now shown. Row three reproduces from neither: f16 gives

@@ -25,7 +25,7 @@ and the quantiser is `w = scale * (q - zero)` with `q` in [-8, +7]:
     -- four digits, and the +-0.004 is q8_0's own rounding.  Sixteen levels,
     asymmetric, ONE SCALE AND ONE INTEGER ZERO POINT PER OUTPUT ROW.
 
-⚠ THE OTHER 106 TENSORS DO NOT SATISFY THAT, and the deviation is a per-tensor
+THE OTHER 106 TENSORS DO NOT SATISFY THAT, and the deviation is a per-tensor
 factor with a few percent of per-row spread, which is what quantising
 TRANSFORMED weights looks like. The vendor has a calibration step in front of
 its quantiser. Scoring its scales against the untransformed reference produced
@@ -139,7 +139,7 @@ def cmd_verify(rk, ref):
         s = sig[slot:slot + rows]
         z = sig[slot + rows:slot + 2 * rows]
         g = (w.max(axis=1) - w.min(axis=1)) / np.where(s > 0, s, 1.0)
-        # ⚠ z is read through region()'s positive filter, so read it raw.
+        # z is read through region()'s positive filter, so read it raw.
         good = abs(g.mean() - 15.0) < 0.05 and g.std() < 0.02
         if good:
             ok.append(name)
@@ -214,7 +214,7 @@ def cmd_compare(rk, ref):
     print("-" * 84)
     print(f"{'THE ' + str(scored) + ' SCORABLE':28s} " + " ".join(
         f"{np.sqrt(tot[a][0] / tot[a][1]) * 100:12.3f}%" for a in arms))
-    print("\n⚠ Weight error, not perplexity. CHARSIU_NPU_W4_CLIP minimises "
+    print("\nWeight error, not perplexity. CHARSIU_NPU_W4_CLIP minimises "
           "exactly this\n  number and made KL worse, 0.0989 to 0.2084.")
     return 0
 
@@ -290,7 +290,7 @@ def cmd_weights(rk, ref):
     predicts with a total variation of 0.00025 -- the best of 7393 windows over
     the whole 464 MB, 13x better than the 1st percentile.
 
-    ⛔ The ORDER inside a tensor is still unknown. Row major, column major and
+    The ORDER inside a tensor is still unknown. Row major, column major and
     4 orderings x 8 output tiles x 6 input tiles were scored at the confirmed
     offset, on signs (142 candidates) and again on code values (194), and every
     one sat at the noise floor -- best |r| 0.023 against a floor of 0.002.
@@ -327,7 +327,7 @@ def cmd_weights(rk, ref):
                / (w.max(axis=1) - w.min(axis=1))).mean()
         print(f"{name:22s} {off:>12x} {sd:8.3f} "
               f"{hh[np.abs(cc) >= 4].sum() * 100:7.2f}% {rho:7.3f}")
-    print("\n🔑 The codes fill the grid the SAME WAY at rho 22.3 as at rho 1.000,")
+    print("\nThe codes fill the grid the SAME WAY at rho 22.3 as at rho 1.000,")
     print("   so the vendor's scale fits whatever it quantised: rho is the size")
     print("   of a real transform of the weights, not a badly chosen scale.")
     return 0
@@ -346,7 +346,7 @@ def cmd_zero(rk, ref):
     """
     step = 4 if "--fast" in sys.argv else 1
     r = GGUFReader(ref)
-    # ⚠ The row arm's group is the tensor's own k, which is 2048 on most of
+    # The row arm's group is the tensor's own k, which is 2048 on most of
     # these and 8192 on ffn_down, so its scale bytes are counted per tensor
     # rather than assumed.  Quoting one group size for it would be a fiction.
     groups = [("row", None), ("1024", 1024), ("512", 512),

@@ -5,7 +5,7 @@
 # Is a one-chunk prefill width that is a multiple of 16 cheaper than its
 # neighbours?
 #
-# ⚠⚠ WHERE THE QUESTION CAME FROM. The one-chunk widening wins 5.6% on
+# WHERE THE QUESTION CAME FROM. The one-chunk widening wins 5.6% on
 # Qwen3-0.6B and loses ~7% on Llama-3.2-1B and tinyllama, at the same prompt
 # length and with clean controls. The widths it produces are 1x112 on Qwen3
 # and 1x114 on the other two. 112 is 16 x 7 and 114 is not a multiple of 16,
@@ -18,12 +18,12 @@
 # of that width. A dip at 112, 128 and 144 against a smooth rise is the atom;
 # no dip is the atom not applying here.
 #
-# ⚠ THE READOUT IS THE SECOND DIFFERENCE, not the raw time. TTFT rises with
+# THE READOUT IS THE SECOND DIFFERENCE, not the raw time. TTFT rises with
 # length whatever the width does, so what a 16-wide periodicity looks like is
 # a dip in ms-per-token, and the eye is bad at that on a rising line.
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -47,7 +47,7 @@ sleep 1
 echo "== one-chunk prefill width against the 16 atom"
 echo "   boot   $(cat /proc/sys/kernel/random/boot_id)"
 echo "   model  $(basename "$M")   binary $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -78,7 +78,7 @@ for T in $LENS; do
 	[ -n "$R" ] || { echo "   $T: NO OUTPUT"; continue; }
 	MT=$(mid "$R")
 	D=-
-	# ⚠ TWO ROWS CAN TIE. $G is what the prompt TOKENISED to, not what was
+	# TWO ROWS CAN TIE. $G is what the prompt TOKENISED to, not what was
 	# asked for, and the whole point of this sweep is that it quantises --
 	# so consecutive rows share a $G routinely and the slope's denominator
 	# is zero. mawk prints "+inf" into the column and busybox awk fails the
@@ -86,7 +86,7 @@ for T in $LENS; do
 	# board_ttft_curve.sh guards the same division on the same quantity.
 	[ -n "$PREV" ] && [ "$G" != "$PREV" ] && \
 		D=$(awk "BEGIN{printf \"%+.1f\", ($MT-$PT)/(($G)-($PREV))*2}")
-	# ⚠ mark the multiples of 16 so the eye does not have to find them
+	# mark the multiples of 16 so the eye does not have to find them
 	MARK=""; [ $((G % 16)) = 0 ] && MARK="  <- 16 x $((G / 16))"
 	printf '   %6s %6s  %8s %10s  %7s %s%s\n' "$T" "$G" "$MT" \
 		"$(awk "BEGIN{printf \"%.3f\", $MT/$G}")" "$D" "$W" "$MARK"

@@ -26,14 +26,14 @@
 /* ---- where the time goes -------------------------------------------------- */
 
 /*
- * ⚠ STAGES, BECAUSE THE ONLY THING MEASURED SO FAR WAS THE MATMUL. The pool
+ * STAGES, BECAUSE THE ONLY THING MEASURED SO FAR WAS THE MATMUL. The pool
  * counter said the encoder's twenty four matmuls took 936 ms of a thirty second
  * transcription, which settles what the routing bought and says nothing about
  * the other twenty nine seconds. Guessing where they are is what produced a 17x
  * that had to be withdrawn.
  */
 /*
- * ⚠⚠ AND "feed forward" WAS TWO DIFFERENT MACHINES UNDER ONE ROW, exactly as
+ * AND "feed forward" WAS TWO DIFFERENT MACHINES UNDER ONE ROW, exactly as
  * the vision tower's was. Both it and "the two convolutions" were a matmul
  * added to a scalar libm loop, and the two do not answer to the same thing:
  * the matmuls are routed to the hardware and priced by the row chunk, and the
@@ -129,7 +129,7 @@ static const struct gguf_tensor *find(struct charsiu_whisper *w,
 			gi *= t->ne[d];
 		go = t->n_dims ? t->ne[t->n_dims - 1] : 1;
 		/*
-		 * ⚠ SHAPE AS WELL AS NAME, for the same reason the vision
+		 * SHAPE AS WELL AS NAME, for the same reason the vision
 		 * loader does it: a name that exists with the wrong shape
 		 * contracts over the wrong axis and produces a transcript
 		 * rather than an error.
@@ -160,7 +160,7 @@ static void block(struct charsiu_whisper *w, struct whisper_block *B,
 	B->q_w = find(w, NM("attn.query.weight"), i, 0, W, W);
 	B->q_b = find(w, NM("attn.query.bias"), i, 0, 0, W);
 	/*
-	 * ⚠ THE KEY PROJECTION HAS NO BIAS. Whisper leaves it out -- query,
+	 * THE KEY PROJECTION HAS NO BIAS. Whisper leaves it out -- query,
 	 * value and out have one and key does not -- so asking for it as
 	 * required would report a miss on every layer of every model.
 	 */
@@ -269,7 +269,7 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 	}
 
 	/*
-	 * ⚠ THE ENGLISH ONLY MODELS SHIFT EVERY SPECIAL ID BY ONE. whisper.cpp
+	 * THE ENGLISH ONLY MODELS SHIFT EVERY SPECIAL ID BY ONE. whisper.cpp
 	 * decides on n_vocab == 51865, and tiny.en is 51864. Off by one here is
 	 * a decoder that never emits its own end of text.
 	 */
@@ -313,7 +313,7 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 		t.data = c.p;
 		t.nbytes = nb;
 		/*
-		 * ⚠ THE NAMES ARE VARIABLE LENGTH AND NOTHING IS PADDED, so a
+		 * THE NAMES ARE VARIABLE LENGTH AND NOTHING IS PADDED, so a
 		 * tensor's data can begin at an odd address. An f16 read off an
 		 * odd pointer is undefined and, on the machines where it is
 		 * not, slow. Copy only the ones that need it and say how many.
@@ -348,7 +348,7 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 		uint32_t T = (uint32_t)w->n_text_state;
 
 		/*
-		 * ⚠ conv1 IS [kernel][in][out] AND THAT IS A REAL CONVOLUTION.
+		 * conv1 IS [kernel][in][out] AND THAT IS A REAL CONVOLUTION.
 		 * Unlike a patch embedding, whose stride equals its kernel,
 		 * these overlap: kernel 3, stride 1 then 2, padding 1. It is
 		 * three matmuls summed, not one.
@@ -384,12 +384,12 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 			 "%zu tensors were copied to align them", misaligned);
 
 	/*
-	 * ⚠ int8, AND SIZED FOR THE ENCODER. n_audio_state by 4 * n_audio_state
+	 * int8, AND SIZED FOR THE ENCODER. n_audio_state by 4 * n_audio_state
 	 * covers every 2D weight in it; the decoder's tied output head is 51864
 	 * rows and is m = 1 anyway, so leaving it out of max_n costs nothing
 	 * and keeps the device small.
 	 */
-	/* ⚠ nothing else starts it outside the language model */
+	/* nothing else starts it outside the language model */
 	charsiu_threads_start(0);
 
 	if (charsiu_env_flag("CHARSIU_NPU", 0) && !w->n_missing) {
@@ -399,7 +399,7 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 		if (!charsiu_pool_init(&w->pool, nt * 12 + 8, 4 * A, 4 * A, 0))
 			w->npu = w->pool.dev != NULL;
 		/*
-		 * ⚠ SAY SO WHEN IT DOES NOT GET ONE. The vision tower prints
+		 * SAY SO WHEN IT DOES NOT GET ONE. The vision tower prints
 		 * this and whisper did not, so with CHARSIU_NPU=1 on a machine
 		 * with no device whisper said NOTHING: the absence of a line
 		 * could not be told from the flag never having been read. The
@@ -411,7 +411,7 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 				"on the CPU\n");
 		if (w->npu) {
 			/*
-			 * ⚠ THE ENCODER'S WEIGHTS, ALL OF THEM, NOW. Same
+			 * THE ENCODER'S WEIGHTS, ALL OF THEM, NOW. Same
 			 * reason as the vision tower: the board spent 19 s of
 			 * a 30 s transcription inside the quantiser. The
 			 * decoder is not here -- it runs one row at a time and
@@ -515,7 +515,7 @@ void charsiu_whisper_describe(const struct charsiu_whisper *w, FILE *out)
  * A discrete Fourier transform, split radix where the length is even and a
  * direct sum where it is not.
  *
- * ⚠ 400 IS NOT A POWER OF TWO. 400 = 2^4 * 25, so this recurses four times and
+ * 400 IS NOT A POWER OF TWO. 400 = 2^4 * 25, so this recurses four times and
  * finishes with a 25 point sum, which is 625 multiplies out of the 3000 frames'
  * worth of work and is not worth a mixed radix kernel. whisper.cpp does the
  * same thing for the same reason.
@@ -529,7 +529,7 @@ static void dft_naive(const float *in, int n, float *out)
 
 		for (t = 0; t < n; t++) {
 			/*
-			 * ⚠⚠ REDUCE k * t MODULO n BEFORE THE ANGLE. At k = t =
+			 * REDUCE k * t MODULO n BEFORE THE ANGLE. At k = t =
 			 * 24 the unreduced angle is -145 radians, and an f32
 			 * cannot hold that to better than a part in 10^5 -- so
 			 * cosf returns a faithful cosine of the WRONG angle.
@@ -660,13 +660,13 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 	double mx = -1e30, t_mel = 0.0;
 	int i, rc = -1;
 
-	/* ⚠ the per frame scratch lives in the worker: see mel_frames */
+	/* the per frame scratch lives in the worker: see mel_frames */
 	hann = malloc((size_t)nfft * sizeof(float));
 	if (!hann)
 		goto out;
 
 	/*
-	 * ⚠ PERIODIC, NOT SYMMETRIC. torch.hann_window's default divides by N
+	 * PERIODIC, NOT SYMMETRIC. torch.hann_window's default divides by N
 	 * and numpy.hanning divides by N - 1. On a 400 point window the two
 	 * differ by a quarter of a percent at the edges, which is nothing to
 	 * look at and moves every mel bin.
@@ -679,13 +679,13 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 		wstage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	t_mel = wnow();
 	/*
-	 * ⚠ 3000 FRAMES, EACH ONE INDEPENDENT, AND IT WAS SERIAL. On the board
+	 * 3000 FRAMES, EACH ONE INDEPENDENT, AND IT WAS SERIAL. On the board
 	 * this was 1625 ms of a 9.4 s transcription -- second only to the
 	 * attention -- and every frame is its own window, its own transform and
 	 * its own eighty dot products against the filterbank. Nothing is shared
 	 * but the filters and the window, both read only.
 	 *
-	 * ⚠ THE MAXIMUM IS NOT REDUCED HERE. It is over the whole spectrogram
+	 * THE MAXIMUM IS NOT REDUCED HERE. It is over the whole spectrogram
 	 * and the clamp below already walks every value, so taking it there
 	 * costs one pass over 240000 floats and saves a reduction that would
 	 * have to be right.
@@ -707,7 +707,7 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 			mx = out[i];
 
 	/*
-	 * ⚠ THE CLAMP IS OVER THE WHOLE CLIP, not the frame. Eight decades below
+	 * THE CLAMP IS OVER THE WHOLE CLIP, not the frame. Eight decades below
 	 * the loudest bin ANYWHERE in the spectrogram, then (x + 4) / 4. Doing
 	 * it per frame normalises silence up to speech and the transcript comes
 	 * out as a room's worth of hallucinated words.
@@ -733,7 +733,7 @@ static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v;
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
 /*
- * ⚠ 16 kHz MONO IS NOT A SUGGESTION. Whisper's positional embedding is 1500
+ * 16 kHz MONO IS NOT A SUGGESTION. Whisper's positional embedding is 1500
  * long and each position is ten milliseconds of audio at that rate; feed it
  * 44.1 kHz and every word arrives at the wrong time and the model transcribes
  * something shorter and confident. This resamples linearly and says it did.
@@ -868,12 +868,12 @@ static void wlayernorm(float *out, const float *x, const float *w,
 			 (b ? b[i] : 0.0f);
 }
 
-/* ⚠ THE TANH APPROXIMATION. Whisper's reference is torch's exact erf GELU, and
+/* THE TANH APPROXIMATION. Whisper's reference is torch's exact erf GELU, and
  * ggml -- which is what every measured whisper output in the world comes from --
  * uses the tanh one. Following ggml keeps this comparable to the thing people
  * actually run. */
 /*
- * ⚠⚠ AND THE TANH FORM IS A SIGMOID, WHICH IS AN IDENTITY AND NOT A SECOND
+ * AND THE TANH FORM IS A SIGMOID, WHICH IS AN IDENTITY AND NOT A SECOND
  * APPROXIMATION ON TOP OF THE FIRST.
  *
  * tanh y = 1 - 2/(e^2y + 1), so
@@ -886,7 +886,7 @@ static void wlayernorm(float *out, const float *x, const float *w,
  * SiLU already uses. Nothing about which approximation whisper is following
  * changed: this is still ggml's tanh gelu, written the cheap way round.
  *
- * ⚠ THE PRICE IT WAS PAYING, AT tiny.en's OWN SHAPE. The encoder calls this
+ * THE PRICE IT WAS PAYING, AT tiny.en's OWN SHAPE. The encoder calls this
  * three times: 3000 x 384 after conv1, 1500 x 384 after conv2, and 1500 x 1536
  * in every one of the four feed forwards -- 10.94 MILLION elements for one
  * thirty second window, of which 9.2 million are the feed forward's. That last
@@ -899,7 +899,7 @@ static void wlayernorm(float *out, const float *x, const float *w,
  *
  * 22.7x on the pass, 8.6x of it before a single extra core is asked for.
  *
- * ⚠ AND IN SITU, in this file's own stage table, which is the reading that
+ * AND IN SITU, in this file's own stage table, which is the reading that
  * counts because it is the one a board can reproduce. tiny.en on jfk.wav, one
  * binary, one environment variable each, best of five interleaved, the "gelu"
  * row:
@@ -915,12 +915,12 @@ static void wlayernorm(float *out, const float *x, const float *w,
  * 1.3 s, and the two rows the gelu used to hide inside go 84 ms to 69 (the
  * convolutions) and 772 ms to 692 (the feed forward's matmuls).
  *
- * ⚠ THE DISAGREEMENT IS ONE ULP AND IT WAS MEASURED, NOT ASSUMED. Over
+ * THE DISAGREEMENT IS ONE ULP AND IT WAS MEASURED, NOT ASSUMED. Over
  * 2304000 elements spread across [-6, 6] the worst absolute difference between
  * the tanhf form and this one is 4.768e-07, at values where gelu is order 1 --
  * a float's own last bit, which is the summation order and nothing else.
  *
- * ⚠ A FINITE INPUT CANNOT BECOME A NaN HERE. x^3 overflows f32 above 4.6e12
+ * A FINITE INPUT CANNOT BECOME A NaN HERE. x^3 overflows f32 above 4.6e12
  * and carries an infinity into the exponent; charsiu_vexpq clamps its argument
  * to [-88, 88] so the divisor stays finite, and x / (1 + e^-88) is x, which is
  * what gelu does out there. The scalar tail gets expf(-inf) = 0 and the same x.
@@ -982,7 +982,7 @@ static void wgelu_span(float *x, size_t n)
 /*
  * The same span across the thread pool, in blocks.
  *
- * ⚠ THE BLOCK IS A MULTIPLE OF FOUR SO THE ANSWER CANNOT DEPEND ON THE
+ * THE BLOCK IS A MULTIPLE OF FOUR SO THE ANSWER CANNOT DEPEND ON THE
  * THREAD COUNT. Split anywhere that is not a multiple of the vector width and
  * the elements either side of the seam fall into the scalar tail instead of the
  * vector body, which is a different exponential and a different last bit -- so
@@ -1012,7 +1012,7 @@ static void wgelu_blocks(void *ctx, uint64_t b0, uint64_t nb)
 }
 
 /*
- * ⚠ AND A SIZE FLOOR, BECAUSE THE SAME FUNCTION IS ON THE PER TOKEN PATH.
+ * AND A SIZE FLOOR, BECAUSE THE SAME FUNCTION IS ON THE PER TOKEN PATH.
  * The encoder's three call sites are 576000, 1152000 and 2304000 elements; the
  * DECODER calls it once a layer a token at n_text_state * 4, which on tiny.en
  * is 1536. Measured on this host, a pool dispatch costs 0.040 ms of broadcast
@@ -1022,7 +1022,7 @@ static void wgelu_blocks(void *ctx, uint64_t b0, uint64_t nb)
  * transcript. That is the counter-example npudev already has written down, and
  * this is the shape that would have walked into it.
  *
- * ⚠ THE FLOOR IS WHERE IT IS BECAUSE IT WAS SWEPT, not because 2^18 is a
+ * THE FLOOR IS WHERE IT IS BECAUSE IT WAS SWEPT, not because 2^18 is a
  * round number. NEON alone against NEON over six threads, best of three
  * hundred, on this host:
  *
@@ -1092,11 +1092,11 @@ static void wrows(const struct gguf_tensor *t, const float *bias,
 	unsigned r, i;
 
 	/*
-	 * ⚠ m > 1 IS THE WHOLE GATE, and it is what keeps the decoder out
+	 * m > 1 IS THE WHOLE GATE, and it is what keeps the decoder out
 	 * without a second condition: it feeds one token at a time and the
 	 * encoder feeds 1500 positions.
 	 *
-	 * ⚠ AND ONLY 2D WEIGHTS. The conv kernels are [tap][in][out] and this
+	 * AND ONLY 2D WEIGHTS. The conv kernels are [tap][in][out] and this
 	 * file already gathers them into a temporary, whose address changes
 	 * every call -- the pool keys on the pointer, so a temporary would
 	 * stage a new tensor each time until the slots ran out.
@@ -1124,7 +1124,7 @@ static void wrows(const struct gguf_tensor *t, const float *bias,
 /*
  * A whole 1D tensor, whatever shape it claims to be.
  *
- * ⚠⚠ THE CONVOLUTION BIASES ARE [1][384], NOT [384]. gguf_row_f32 reads ne[0]
+ * THE CONVOLUTION BIASES ARE [1][384], NOT [384]. gguf_row_f32 reads ne[0]
  * elements, so asking for row 0 of one of those returns ONE value and leaves
  * the rest of the caller's buffer as whatever was on the heap -- which came out
  * of the encoder as 3e24 and would, in a quieter model, have come out as a
@@ -1183,7 +1183,7 @@ static void wrows_qkv(const struct whisper_block *B, const float *xb, unsigned T
 /*
  * conv1d, kernel 3, padding 1, stride `stride`.
  *
- * ⚠ THE WEIGHT IS [tap][in][out] WITH tap FASTEST, so tap `p`'s slice is not
+ * THE WEIGHT IS [tap][in][out] WITH tap FASTEST, so tap `p`'s slice is not
  * contiguous: it is every third element. Rather than gather it, this walks the
  * three taps and treats each as a matmul over `in` with a stride of 3 between
  * consecutive input channels -- which is what a flattened view of ne[0]=3 makes
@@ -1207,7 +1207,7 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 		return -1;
 	}
 	/*
-	 * ⚠⚠ THE TAP TENSORS ARE STACK LOCALS AND THE POOL KEYS ON THE POINTER.
+	 * THE TAP TENSORS ARE STACK LOCALS AND THE POOL KEYS ON THE POINTER.
 	 * Three taps and two convolutions all go through this one slot, so
 	 * routing them stages the first tap's weights and then uses them for
 	 * every one after. The board came back with an EMPTY transcript.
@@ -1225,7 +1225,7 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
 	memset(&g, 0, sizeof(g));
 
 	/*
-	 * ⚠ READ THE WEIGHT THROUGH gguf_row_f32 RATHER THAN CASTING IT. The
+	 * READ THE WEIGHT THROUGH gguf_row_f32 RATHER THAN CASTING IT. The
 	 * flattened view is [3 * in][out], so ROW i is output channel i's whole
 	 * kernel, contiguous and already laid out [in][tap] with tap fastest.
 	 * One call an output channel dequantises f16 or f32 without this file
@@ -1287,7 +1287,7 @@ static int conv1d3(const struct gguf_tensor *wt, const float *bias,
  * One (head, query) each: the scores against every key, a softmax, and the
  * weighted sum of the values.
  *
- * ⚠ THE SCRATCH IS PER RANGE, NOT PER ITEM. att is T floats and a range covers
+ * THE SCRATCH IS PER RANGE, NOT PER ITEM. att is T floats and a range covers
  * hundreds of items; allocating inside the item loop would be a malloc per
  * query and the allocator would become the attention.
  */
@@ -1299,7 +1299,7 @@ struct wattn {
 };
 
 /*
- * ⚠⚠ A BLOCK OF QUERIES AT A TIME, BECAUSE THIS IS BOUND BY MEMORY AND NOT BY
+ * A BLOCK OF QUERIES AT A TIME, BECAUSE THIS IS BOUND BY MEMORY AND NOT BY
  * ARITHMETIC.
  *
  * One query reads every key and every value: 2 * T * head_dim floats, which at
@@ -1313,7 +1313,7 @@ struct wattn {
  * bandwidth. QB queries share one pass over K and one over V, so the traffic
  * divides by QB and the arithmetic is unchanged.
  *
- * ⚠ THE ORDER WITHIN A DOT PRODUCT IS UNTOUCHED. Only the order the dot
+ * THE ORDER WITHIN A DOT PRODUCT IS UNTOUCHED. Only the order the dot
  * products are ISSUED in changes, so every output is bit identical to the
  * unblocked form -- which the tests check rather than take on trust.
  */
@@ -1400,7 +1400,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		goto out;
 
 	/*
-	 * ⚠ A STOP AFTER EACH STAGE, because "every one of 576000 values is
+	 * A STOP AFTER EACH STAGE, because "every one of 576000 values is
 	 * wrong" says nothing about which stage did it. The reference can stop
 	 * at the same places and the first one that disagrees is the one to
 	 * read.
@@ -1429,7 +1429,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 	}
 
 	/*
-	 * ⚠ conv2 READS ITS INPUT AS [channel][time] AND conv1 WROTE
+	 * conv2 READS ITS INPUT AS [channel][time] AND conv1 WROTE
 	 * [time][channel]. Feeding one straight into the other transposes the
 	 * whole spectrogram, which stays finite and produces a transcript.
 	 */
@@ -1475,13 +1475,13 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 		WSTAGE(W_QKV, wrows_qkv(B, xb, T, W, q, k, v, b1, &a));
 
 		/*
-		 * ⚠ THIS IS 63% OF A TRANSCRIPTION and it is not a matmul
+		 * THIS IS 63% OF A TRANSCRIPTION and it is not a matmul
 		 * against a weight, so none of the NPU machinery reaches it:
 		 * 1500 queries against 1500 keys, six heads, four layers. Every
 		 * (head, query) is independent of every other, which is the
 		 * one thing that makes it worth a thread each.
 		 *
-		 * ⚠ ONE DISPATCH A LAYER, over H * T items. The prefill lost
+		 * ONE DISPATCH A LAYER, over H * T items. The prefill lost
 		 * twice on this pool at 226 dispatches of a fraction of a
 		 * millisecond each; four dispatches of nine thousand rows is
 		 * the other end of that ratio, and the barrier is paid four
@@ -1527,7 +1527,7 @@ out:
 /* ---- the text decoder ---------------------------------------------------- */
 
 /*
- * ⚠ THE CROSS ATTENTION KEYS AND VALUES ARE PER CLIP, NOT PER TOKEN. They come
+ * THE CROSS ATTENTION KEYS AND VALUES ARE PER CLIP, NOT PER TOKEN. They come
  * from the encoder's 1500 positions, which do not change while a transcript is
  * being generated, so computing them inside the token loop would repeat
  * 1500 x 384 x 384 x 2 multiplies per layer per token -- more work than the
@@ -1610,7 +1610,7 @@ struct whisper_decoder *charsiu_whisper_decoder_new(const struct charsiu_whisper
 		d->sv[l] = malloc((size_t)w->n_text_ctx * d->W * sizeof(float));
 		if (!d->xk[l] || !d->xv[l] || !d->sk[l] || !d->sv[l])
 			goto fail;
-		/* ⚠ no bias on the key projection, here as everywhere */
+		/* no bias on the key projection, here as everywhere */
 		{
 			/* the cross keys and values read one encoding: one pack */
 			const struct gguf_tensor *ws[2] = { B->xk_w, B->xv_w };
@@ -1696,7 +1696,7 @@ const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
 			const float *qi = d->q + off;
 			float *o = d->xb + off;
 
-			/* ⚠ 1500 KEYS PER TOKEN PER HEAD PER LAYER: the cross
+			/* 1500 KEYS PER TOKEN PER HEAD PER LAYER: the cross
 			 * attention is the decoder's whole cost. */
 			for (j = 0; j < d->T; j++)
 				d->att[j] = charsiu_dot_f32(qi,
@@ -1731,7 +1731,7 @@ const float *charsiu_whisper_step(struct whisper_decoder *d, int32_t token,
 		   wrow1(w->d_ln_b, d->b1), W, 1e-5f);
 
 	/*
-	 * ⚠ THE OUTPUT HEAD IS THE EMBEDDING TABLE, transposed -- whisper ties
+	 * THE OUTPUT HEAD IS THE EMBEDDING TABLE, transposed -- whisper ties
 	 * them. token_embedding.weight is [n_vocab][n_text_state] and that is
 	 * exactly a matmul against it, one row a vocabulary entry.
 	 */
@@ -1758,7 +1758,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 	double t_dec = 0.0;
 
 	/*
-	 * ⚠ REFUSED RATHER THAN GUESSED. A multilingual model wants a language
+	 * REFUSED RATHER THAN GUESSED. A multilingual model wants a language
 	 * token and a task token between the two markers, and picking them
 	 * needs a language detection pass this does not do. Transcribing a
 	 * French clip with an English prompt does not fail: it answers in
@@ -1775,7 +1775,7 @@ int charsiu_whisper_transcribe(const struct charsiu_whisper *w,
 	prompt[1] = w->tok_not;
 
 	/*
-	 * ⚠ THE LOGITS AFTER THE LAST PROMPT TOKEN ARE THE FIRST PREDICTION.
+	 * THE LOGITS AFTER THE LAST PROMPT TOKEN ARE THE FIRST PREDICTION.
 	 * There is no extra step for it, and adding one -- which the first
 	 * version of this did -- feeds the marker twice and shifts the whole
 	 * transcript by a token.

@@ -95,7 +95,7 @@ def text_tensors():
 def tensors(kind="mlp"):
     """(name, ne) with ne in gguf order: ne[0] is the fastest axis.
 
-    ⚠ THE FEED FORWARD NAMES ARE THE REAL ONES, WHICH ARE BACKWARDS. A real
+    THE FEED FORWARD NAMES ARE THE REAL ONES, WHICH ARE BACKWARDS. A real
     mmproj calls the FIRST matmul ffn_down (n_embd -> n_ff) and the second
     ffn_up, the opposite way round from the language model. Writing them the
     intuitive way here would have made the synthetic file the only one the

@@ -3,7 +3,7 @@
 /*
  * Reading a vision tower out of an mmproj gguf.
  *
- * ⚠ THIS FILE'S ONE JOB IS TO BE LOUD. Every tensor name here is llama.cpp's
+ * THIS FILE'S ONE JOB IS TO BE LOUD. Every tensor name here is llama.cpp's
  * clip naming as this tree understands it, and none of it has been checked
  * against a real file yet. So the loader binds what it can and REPORTS what it
  * could not, by name, in the order it wanted them -- because the failure this
@@ -53,7 +53,7 @@ static void wshape(const struct gguf_tensor *t, uint64_t *in, uint64_t *out)
 /*
  * Bind one tensor by name and CHECK ITS SHAPE.
  *
- * ⚠ A NAME THAT EXISTS WITH THE WRONG SHAPE IS THE DANGEROUS CASE. A missing
+ * A NAME THAT EXISTS WITH THE WRONG SHAPE IS THE DANGEROUS CASE. A missing
  * name is loud on its own; a present one that contracts over the wrong axis
  * produces finite, plausible numbers all the way to a sentence. `in` or `out`
  * of 0 means "do not check that side".
@@ -120,7 +120,7 @@ static const struct gguf_tensor *bind1(struct charsiu_vision *v,
 	return bind(v, fmt, idx, opt, 0, n);
 }
 
-/* ⚠ gguf_get_u32 RETURNS 0 ON SUCCESS. Reading it as a truth value inverts
+/* gguf_get_u32 RETURNS 0 ON SUCCESS. Reading it as a truth value inverts
  * every check in this file, which is how the first run of the synthetic test
  * reported "no vision encoder" about a file that had one. */
 static int need(struct charsiu_vision *v, const char *key, uint32_t *out)
@@ -158,7 +158,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 	v->opened = 1;
 
 	/*
-	 * ⚠ AN LLM GGUF OPENS FINE HERE. `charsiu foo.gguf --image` pointed at
+	 * AN LLM GGUF OPENS FINE HERE. `charsiu foo.gguf --image` pointed at
 	 * the language half is the mistake a person actually makes, and without
 	 * this it would come back as twenty missing tensors rather than one
 	 * sentence.
@@ -183,7 +183,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 		v->eps = 1e-6f;
 
 	/*
-	 * ⚠ THE PREPROCESSING IS PART OF THE MODEL. A tower trained on one
+	 * THE PREPROCESSING IS PART OF THE MODEL. A tower trained on one
 	 * normalisation and fed another does not fail, it answers about a
 	 * different picture. CLIP's numbers are the default because a file
 	 * without the keys is almost certainly CLIP's.
@@ -212,7 +212,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 	}
 
 	/*
-	 * ⚠ THE PROJECTOR IS THE ONE PART THAT IS NOT A ViT, and it differs per
+	 * THE PROJECTOR IS THE ONE PART THAT IS NOT A ViT, and it differs per
 	 * model family. clip.projector_type says which; a file without the key
 	 * gets the mlp shape, which is what llava writes.
 	 */
@@ -237,7 +237,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 				v->scale = 1;
 			s2 = v->scale * v->scale;
 			/*
-			 * ⚠ THE PIXEL SHUFFLE IS WHY THE fc IS SO WIDE. It
+			 * THE PIXEL SHUFFLE IS WHY THE fc IS SO WIDE. It
 			 * folds scale_factor squared patches into one, so the
 			 * fc contracts over n_embd * scale^2 -- 768 * 16 =
 			 * 12288 on SmolVLM-256M -- and an image becomes
@@ -295,7 +295,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 		L->ln2_b  = bind1(v, "v.blk.%d.ln2.bias", (int)i, 1, W);
 
 		/*
-		 * ⚠ BY SHAPE, NOT BY NAME. In this file ffn_down is the FIRST
+		 * BY SHAPE, NOT BY NAME. In this file ffn_down is the FIRST
 		 * matmul, n_embd -> n_ff, and ffn_up is the second -- the
 		 * opposite of the language model's use of the same two words.
 		 * Binding by name would have contracted fc1 over 3072 where
@@ -315,7 +315,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 		}
 
 		/*
-		 * ⚠ ONE LAYER'S WORTH OF MISSES IS THE WHOLE STORY. Twenty four
+		 * ONE LAYER'S WORTH OF MISSES IS THE WHOLE STORY. Twenty four
 		 * layers of the same wrong guess is twenty four identical lines
 		 * and a full table, which pushes the hparams off the screen.
 		 */
@@ -331,11 +331,11 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 	}
 
 	/*
-	 * ⚠ int8, AND ONLY IF CHARSIU_NPU ASKED. The tower is eight weights a
+	 * int8, AND ONLY IF CHARSIU_NPU ASKED. The tower is eight weights a
 	 * layer plus the projector; the widest contraction is the projector's,
 	 * which on a pixel shuffled one is n_embd * scale^2.
 	 */
-	/* ⚠ nothing else starts it outside the language model */
+	/* nothing else starts it outside the language model */
 	charsiu_threads_start(0);
 
 	if (charsiu_env_flag("CHARSIU_NPU", 0)) {
@@ -355,7 +355,7 @@ int charsiu_vision_open(struct charsiu_vision *v, const char *path)
 				"the CPU\n");
 		if (v->npu) {
 			/*
-			 * ⚠ ALL OF IT, NOW, AND INTO A CACHE. A board round
+			 * ALL OF IT, NOW, AND INTO A CACHE. A board round
 			 * measured 75 s of this tower's 82 s inside the
 			 * quantiser -- the matmuls underneath were about 8 s
 			 * against the CPU's 148. Staging lazily also
@@ -456,13 +456,13 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
 /* ---- where the time goes -------------------------------------------------- */
 
 /*
- * ⚠ THE SAME INSTRUMENT THAT SETTLED WHISPER. Its stage table said the matmuls
+ * THE SAME INSTRUMENT THAT SETTLED WHISPER. Its stage table said the matmuls
  * were 26% and the attention 63%, after four commits aimed at the matmuls. This
  * tower has had no such table and the board says it is 15.5 s against a vendor's
  * 768 ms for the same model, of which 3.1 s is the hardware.
  */
 /*
- * ⚠⚠ AND "feed forward" WAS TWO DIFFERENT MACHINES UNDER ONE ROW.
+ * AND "feed forward" WAS TWO DIFFERENT MACHINES UNDER ONE ROW.
  *
  * The board's table read 2398 ms against a 5.7 s encode -- the largest single
  * stage -- and that row was a pair of NPU matmuls AND a scalar libm loop added
@@ -472,7 +472,7 @@ void charsiu_vision_describe(const struct charsiu_vision *v, FILE *out)
  * layer on one core. Reading them as one row is how a memory-traffic story got
  * told about a stage that was arithmetic.
  *
- * ⚠ AND THE RESIDUALS AND THE PATCH GATHER WERE IN NO ROW AT ALL. The row
+ * AND THE RESIDUALS AND THE PATCH GATHER WERE IN NO ROW AT ALL. The row
  * called "patch gather + embed" timed the embed only -- the gather ran above
  * the line that turns the clock on -- and the two residual adds a layer, 18.9
  * million elements over the tower, were never counted anywhere. A table whose
@@ -498,7 +498,7 @@ static double vnow(void)
 }
 
 /*
- * ⚠ VARIADIC BECAUSE A BLOCK IS NOT ONE MACRO ARGUMENT. Braces do not protect a
+ * VARIADIC BECAUSE A BLOCK IS NOT ONE MACRO ARGUMENT. Braces do not protect a
  * comma from the preprocessor the way parentheses do, so `unsigned gy = a, gx =
  * b;` inside a timed loop is two arguments and the build stops. Taking the rest
  * as __VA_ARGS__ and pasting it back is what lets the patch gather -- which was
@@ -529,7 +529,7 @@ void charsiu_vision_stages(FILE *out)
 /* ---- the forward pass ---------------------------------------------------- */
 
 /*
- * ⚠ A 4D PATCH EMBEDDING IS A 2D MATMUL, and gguf_matvec reads ne[0] as the
+ * A 4D PATCH EMBEDDING IS A 2D MATMUL, and gguf_matvec reads ne[0] as the
  * columns and ne[1] as the rows. llama.cpp stores the patch weight as a
  * convolution kernel, [kw][kh][in_c][out], so handed to gguf_matvec unchanged
  * it would contract over kw alone. The data is contiguous and in the right
@@ -560,7 +560,7 @@ static uint64_t rows_of(const struct gguf_tensor *w)
 }
 
 /*
- * ⚠ ITS OWN SOFTMAX, because llama.c's is static and this one runs over a
+ * ITS OWN SOFTMAX, because llama.c's is static and this one runs over a
  * different axis: every patch against every patch, with no mask.
  */
 static void vsoftmax(float *x, unsigned n)
@@ -572,7 +572,7 @@ static void vsoftmax(float *x, unsigned n)
 		if (x[i] > mx)
 			mx = x[i];
 	/*
-	 * ⚠ THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED, and it is a
+	 * THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED, and it is a
 	 * shared kernel now: a picture asks for n^2 per head per layer, 151
 	 * million of them at this tower's shape. See charsiu_expsum_f32.
 	 */
@@ -607,7 +607,7 @@ static void layernorm(float *out, const float *x, const float *w,
 }
 
 /*
- * ⚠⚠ clip.use_gelu PICKS AN ACTIVATION, IT DOES NOT SWITCH ONE OFF.
+ * clip.use_gelu PICKS AN ACTIVATION, IT DOES NOT SWITCH ONE OFF.
  *
  * 1 is the tanh approximation, which is ggml's GGML_OP_GELU and llama.c's
  * gelu_mul. 0 is GELU QUICK, x * sigmoid(1.702 x), which is what OpenAI's CLIP
@@ -620,7 +620,7 @@ static void layernorm(float *out, const float *x, const float *w,
  * second branch to multiply against.
  */
 /*
- * ⚠⚠ AND BOTH OF THEM ARE ONE EXPONENTIAL, WHICH IS THE WHOLE OF THIS ROUND.
+ * AND BOTH OF THEM ARE ONE EXPONENTIAL, WHICH IS THE WHOLE OF THIS ROUND.
  *
  * The tanh form was written as written, with a tanhf per element, and that is
  * 0.5 x (1 + tanh y). Since tanh y = 1 - 2/(e^2y + 1),
@@ -635,13 +635,13 @@ static void layernorm(float *out, const float *x, const float *w,
  * ulp, which is the summation order and nothing else. A dense sweep of
  * [-20, 20] finds the same worst absolute and no larger.
  *
- * ⚠ GELU QUICK'S FORMULA DID NOT CHANGE AT ALL -- only its expf became
+ * GELU QUICK'S FORMULA DID NOT CHANGE AT ALL -- only its expf became
  * charsiu_vexpq -- so the whole of the risk on that branch is the polynomial,
  * and a dense sweep of [-25, 25] puts it at 2.24e-07 relative, one ulp again.
  * It is checked separately because no model on this desk uses it: SmolVLM has
  * clip.use_gelu 1, and a branch nothing runs is a branch nothing catches.
  *
- * ⚠ THE PRICE THIS WAS PAYING. A picture is 1024 patches, the feed forward is
+ * THE PRICE THIS WAS PAYING. A picture is 1024 patches, the feed forward is
  * 3072 wide and there are twelve layers: 37.7 MILLION activations. On this
  * development host, one layer's 3145728 elements:
  *
@@ -654,7 +654,7 @@ static void layernorm(float *out, const float *x, const float *w,
  * ALONE costs on this host (0.77 ms), so what remains is moving 25.2 MB and no
  * arithmetic worth naming.
  *
- * ⚠ AND IN SITU, in the tower's own table at SmolVLM-256M's shape, which is
+ * AND IN SITU, in the tower's own table at SmolVLM-256M's shape, which is
  * the reading that counts because it is the one a board can reproduce. One
  * binary, one environment variable each, best of five interleaved:
  *
@@ -667,13 +667,13 @@ static void layernorm(float *out, const float *x, const float *w,
  * are and is the part certain to transfer, and 2.4x more is the pool on this
  * host's six. What shipped was the 373 with a separate bias pass on top.
  *
- * ⚠ AND DO NOT READ THE WHOLE ENCODE OFF THIS HOST. The ffn matmul row beside
+ * AND DO NOT READ THE WHOLE ENCODE OFF THIS HOST. The ffn matmul row beside
  * these four numbers came back 4930, 4937, 5016, 5157, 5208, 5328, 5431, 5453,
  * 5923, 6560 and 6637 ms for the SAME work -- this machine is shared and the
  * spread is three times the thing being measured. Only the row moves; the wall
  * clock cannot see it.
  *
- * ⚠ THE ANSWER MOVED BY ONE ULP AND THE CONTROL PROVES IT IS ONLY THIS. Over
+ * THE ANSWER MOVED BY ONE ULP AND THE CONTROL PROVES IT IS ONLY THIS. Over
  * the 36864 embeddings a 512x512 image leaves as, against the binary from
  * before this change: worst 3.33e-06 absolute on an output whose rms is 1.53,
  * and 5.06e-07 of that rms rms-for-rms. With CHARSIU_EXACT_GELU set the two
@@ -681,7 +681,7 @@ static void layernorm(float *out, const float *x, const float *w,
  * folded bias, the threading and the stage split changed nothing, and the
  * exponential is the only thing here that touches the numbers.
  *
- * ⚠ THE BOARD'S SHARE OF THAT IS AN ESTIMATE, not a reading, and this commit
+ * THE BOARD'S SHARE OF THAT IS AN ESTIMATE, not a reading, and this commit
  * adds the row that turns it into one. Its pool reported 2680 ms of hardware
  * across all 73 matmuls, and the two stages that are matmul-and-bias only --
  * q k v at 1057 ms and out proj at 380 -- price the (1024, 768, 768) shape at
@@ -691,7 +691,7 @@ static void layernorm(float *out, const float *x, const float *w,
  * for glibc's expf on the same board -- consistent, and tanhf is the slower
  * of the two everywhere it has been asked.
  *
- * ⚠ THE OVERFLOW BEHAVIOUR IS NOT THE SAME CODE BUT IS THE SAME ANSWER, and it
+ * THE OVERFLOW BEHAVIOUR IS NOT THE SAME CODE BUT IS THE SAME ANSWER, and it
  * was checked rather than assumed. x^3 overflows f32 above 4.6e12; the cube
  * then carries an infinity into the exponent, charsiu_vexpq clamps its input
  * to [-88, 88] so the result stays finite, and x / (1 + e^-88) is x -- which
@@ -714,7 +714,7 @@ static int gelu_exact(void)
 /*
  * y[0..n) <- act(y + b), for ONE row, with the bias folded into the same pass.
  *
- * ⚠ FOLDED, NOT SEQUENCED, AND THAT IS A SECOND SAVING ON TOP OF THE FIRST.
+ * FOLDED, NOT SEQUENCED, AND THAT IS A SECOND SAVING ON TOP OF THE FIRST.
  * rows_mul used to add the bias in a pass of its own and this function then
  * read the whole intermediate back. At this tower's shape the intermediate is
  * 1024 x 3072 x 4 = 12.6 MB, which is not in any cache on this board, so that
@@ -722,7 +722,7 @@ static int gelu_exact(void)
  * tower, about 42 ms of the board's 7.13 GB/s, thrown away to visit the same
  * numbers twice. It is worth 0.69 ms of the 2.66 above.
  *
- * ⚠ b MAY BE NULL and the test is inside the vector loop on purpose: it is one
+ * b MAY BE NULL and the test is inside the vector loop on purpose: it is one
  * perfectly predicted branch against a divide and a six term polynomial. The
  * hand-hoisted form was written and timed interleaved against this one -- 2.13
  * ms to this one's 2.09 over 3145728 elements -- so removing the branch is not
@@ -784,7 +784,7 @@ static void act_span(float *y, const float *b, unsigned n, int tanh_form)
 /*
  * The same over a block of m rows sharing one bias, across the thread pool.
  *
- * ⚠ A ROW EACH, BECAUSE THE THING BEING DIVIDED IS BYTES. Every row is
+ * A ROW EACH, BECAUSE THE THING BEING DIVIDED IS BYTES. Every row is
  * independent and every row is n floats read and n written; there is no shared
  * state, no reduction and no barrier inside the pass. That makes this exactly
  * the shape the attention round found transfers -- the win there was moving
@@ -792,7 +792,7 @@ static void act_span(float *y, const float *b, unsigned n, int tanh_form)
  * the board, because the board is the one that is short of bandwidth and has
  * cores sitting idle to pull more of it.
  *
- * ⚠ AND A SIZE FLOOR, because npudev has the counter-example written down: a
+ * AND A SIZE FLOOR, because npudev has the counter-example written down: a
  * gather put on this same pool lost twice, 190 ms both times, at about 0.84 ms
  * of barrier per dispatch with not enough work behind it. Here it is twelve
  * dispatches for a whole picture with 3.1 million elements behind each, so the
@@ -847,7 +847,7 @@ static const float *row1(const struct gguf_tensor *t, float *buf, unsigned n)
 static struct charsiu_npu_pool *rows_pool;
 
 /*
- * ⚠ ONLY THE 2D WEIGHTS GO TO THE HARDWARE, and the one that does not is the
+ * ONLY THE 2D WEIGHTS GO TO THE HARDWARE, and the one that does not is the
  * patch embedding: it is a 4D convolution kernel, the pool keys on the tensor
  * POINTER, and a flattened view is a different address every call. It is 1.8 of
  * the tower's 90 G-mac, so this is two percent left on the CPU rather than a
@@ -934,7 +934,7 @@ unsigned charsiu_vision_tokens(const struct charsiu_vision *v)
 {
 	unsigned s2 = v->scale ? v->scale * v->scale : 1;
 
-	/* ⚠ ONE, not one per patch: a retrieval tower pools to a single vector */
+	/* ONE, not one per patch: a retrieval tower pools to a single vector */
 	if (v->proj == CHARSIU_PROJ_CLIP)
 		return 1;
 	return s2 > 1 ? v->n_patches / s2 : v->n_patches;
@@ -958,7 +958,7 @@ unsigned charsiu_vision_width(const struct charsiu_vision *v)
  * into one embedding scale^2 times as wide, so an image costs the language
  * model n_patches / scale^2 tokens instead of n_patches.
  *
- * ⚠ THE INDEX MAPPING IS THE WHOLE OF IT, and it is two reshapes with a
+ * THE INDEX MAPPING IS THE WHOLE OF IT, and it is two reshapes with a
  * transpose between them rather than a plain block gather. Written out from
  * transformers' Idefics3 pixel_shuffle:
  *
@@ -991,7 +991,7 @@ struct vattn {
 };
 
 /*
- * ⚠ A BLOCK OF PATCHES AT A TIME. One query reads every key and every value, so
+ * A BLOCK OF PATCHES AT A TIME. One query reads every key and every value, so
  * doing it per query streams 2 * n * head_dim floats off DRAM 1025 times a head
  * -- and the board measured this shape as bandwidth bound rather than
  * arithmetic bound, which is why vectorising it bought 2.9x on a host and 1.24x
@@ -1003,7 +1003,7 @@ struct vattn {
  * read three times by the softmax and read again by the value pass, so past the
  * point where they stop fitting in cache the block starts paying for itself.
  *
- * ⚠ THE NUMBER IS MEASURED, NOT CHOSEN, AND IT IS THE MACHINE'S ANSWER. It is a
+ * THE NUMBER IS MEASURED, NOT CHOSEN, AND IT IS THE MACHINE'S ANSWER. It is a
  * runtime value so vattn_bench -Q can sweep it in ONE process against the same
  * interference, and so a board can re-ask without a rebuild; nq was already a
  * runtime bound, so nothing in the inner loops changed shape.
@@ -1016,7 +1016,7 @@ struct vattn {
 #endif
 
 /*
- * ⚠⚠ AND THE SCORES ARE WHAT CAPS THE BLOCK, NOT THE KEYS.
+ * AND THE SCORES ARE WHAT CAPS THE BLOCK, NOT THE KEYS.
  *
  * QB queries share one pass over K and one over V, so raising QB divides the
  * K/V traffic -- but the scores it has to hold are QB * n floats, written once,
@@ -1039,7 +1039,7 @@ struct vattn {
  * keys and values are still read exactly once per query block, so raising QB
  * keeps dividing their traffic with nothing growing to pay for it.
  *
- * ⚠ IT IS NOT BIT IDENTICAL AND THAT IS THE WHOLE OF THE RISK. Everything else
+ * IT IS NOT BIT IDENTICAL AND THAT IS THE WHOLE OF THE RISK. Everything else
  * in this stage reorders only the ISSUE of the arithmetic; this reorders the
  * arithmetic. exp(x - m) for a running m, rescaled, is the same number in exact
  * arithmetic and a few ulp away in f32. This tree has shipped one fast wrong
@@ -1075,7 +1075,7 @@ static void vattn_block_fused(const struct vattn *c, float *sc, unsigned off,
 				if (su[j] > m)
 					m = su[j];
 			/*
-			 * ⚠ ONLY WHEN THE MAX ACTUALLY MOVED. After the first
+			 * ONLY WHEN THE MAX ACTUALLY MOVED. After the first
 			 * few tiles it usually has not, and the rescale is a
 			 * pass over the accumulator -- the one piece of work
 			 * this kernel adds that the three pass form does not.
@@ -1142,7 +1142,7 @@ static void vattn_block(const struct vattn *c, float *sc, unsigned off,
 }
 
 /*
- * ⚠⚠ WHICH THREAD IS ON WHICH HEAD, AND IT IS THE WHOLE OF THIS STAGE ON THE
+ * WHICH THREAD IS ON WHICH HEAD, AND IT IS THE WHOLE OF THIS STAGE ON THE
  * BOARD.
  *
  * A head's keys and values are n * head_dim * 2 * 4 bytes -- half a megabyte at
@@ -1200,7 +1200,7 @@ static void vattn_one_head(void *ctx, uint64_t r0, uint64_t n)
 }
 
 /*
- * ⚠ THE RANGE IS WALKED OUT OF ORDER ON PURPOSE. The items are the same items;
+ * THE RANGE IS WALKED OUT OF ORDER ON PURPOSE. The items are the same items;
  * visiting the ones with the same head together is what makes all the threads
  * read one head's keys at one time. The stride is n_head because that is the
  * numbering, and the first item of head h is the first r >= r0 with r % nh == h.
@@ -1225,13 +1225,13 @@ static void vattn_share(void *ctx, uint64_t r0, uint64_t n)
 }
 
 /*
- * ⚠ PUBLIC SO IT CAN BE TIMED WITHOUT THE TOWER AROUND IT. On the board this
+ * PUBLIC SO IT CAN BE TIMED WITHOUT THE TOWER AROUND IT. On the board this
  * is half the encode; on this development host it is under a tenth of it,
  * because the board's matmuls go to the NPU and the host's do not. Measuring it
  * through charsiu_vision_encode means reading a 6% row of a stage table and
  * calling the difference a result. tools/vattn_bench.c calls this directly.
  *
- * ⚠ THE SCHEDULE IS A KNOB BECAUSE THE ANSWER IS THE MACHINE'S. None of the
+ * THE SCHEDULE IS A KNOB BECAUSE THE ANSWER IS THE MACHINE'S. None of the
  * three touches the arithmetic or the order within it, so all three are bit
  * identical to each other and to the unblocked form -- which vattn_bench -c
  * checks with a checksum rather than assuming.
@@ -1279,7 +1279,7 @@ void charsiu_vision_attn_kt_set(unsigned kt)
 }
 
 /*
- * ⚠ THE ONE KNOB THAT CHANGES THE ANSWER. Every other choice in this stage
+ * THE ONE KNOB THAT CHANGES THE ANSWER. Every other choice in this stage
  * reorders the issue of the same arithmetic and is bit identical; the fused
  * kernel reorders the arithmetic itself, and a wrong answer that arrives faster
  * is the failure this tree has already shipped once. Default on, with the exact
@@ -1317,7 +1317,7 @@ int charsiu_vision_attn_sched_get(void)
 }
 
 /*
- * ⚠ SETTABLE BECAUSE THE COMPARISON HAS TO HAPPEN IN ONE PROCESS. This host
+ * SETTABLE BECAUSE THE COMPARISON HAS TO HAPPEN IN ONE PROCESS. This host
  * runs six cores shared with an editor and two other agents, and two builds
  * timed one after the other disagreed by 1.8x with the SAME binary on both
  * sides. Interleaving the schedules inside one run puts them on the same cores,
@@ -1372,7 +1372,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	unsigned np = v->n_patches, W = v->n_embd, P = v->patch_size;
 	unsigned pin = 3u * P * P, hd, l, p, i;
 	/*
-	 * ⚠ THE SEQUENCE IS NOT THE PATCHES. CLIP prepends a class token, so
+	 * THE SEQUENCE IS NOT THE PATCHES. CLIP prepends a class token, so
 	 * everything from the position embedding to the attention runs over
 	 * np + 1 rows, and only the gather and the pixel shuffle are about
 	 * patches. Sizing the buffers by np was a read one row past every one
@@ -1397,7 +1397,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	scale = 1.0f / sqrtf((float)hd);
 
 	/*
-	 * ⚠ THE WIDEST CONTRACTION IS THE PROJECTOR, not the feed forward. A
+	 * THE WIDEST CONTRACTION IS THE PROJECTOR, not the feed forward. A
 	 * pixel shuffled fc contracts over n_embd * scale^2 -- 12288 where
 	 * n_ff is 3072 -- and an activation buffer sized for the ffn would be
 	 * overrun by four times.
@@ -1408,7 +1408,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 	if (charsiu_act_alloc(&a, (int)(pin > wide ? pin : wide)))
 		return -1;
 	/*
-	 * ⚠ A FILE SCOPE POINTER, SET FOR THE LENGTH OF ONE CALL. rows_mul is
+	 * A FILE SCOPE POINTER, SET FOR THE LENGTH OF ONE CALL. rows_mul is
 	 * the one place a weight is multiplied and it is called from eleven
 	 * sites; threading a pool through all of them would be eleven more
 	 * arguments for one bit of information. It is cleared on the way out so
@@ -1431,14 +1431,14 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		goto out;
 
 	/*
-	 * ⚠ THE PATCH GATHER IS THE CONVOLUTION. Stride equals kernel, so the
+	 * THE PATCH GATHER IS THE CONVOLUTION. Stride equals kernel, so the
 	 * patches do not overlap and each one is just its own pixels in the
 	 * kernel's own order: x fastest, then y, then channel, which is the
 	 * order ggml stores [kw][kh][in_c] in. Get this order wrong and every
 	 * number downstream is still finite and still plausible.
 	 */
 	/*
-	 * ⚠ THE CLOCK GOES ON HERE, NOT BELOW THE GATHER. It used to be turned
+	 * THE CLOCK GOES ON HERE, NOT BELOW THE GATHER. It used to be turned
 	 * on after this loop, so the row named "patch gather + embed" timed the
 	 * embed and the gather ran outside every row in the table.
 	 */
@@ -1502,7 +1502,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		VSTAGE(V_QKV, rows_mul3(L, xb, nt, W, q, k, val, bias, &a));
 
 		/*
-		 * ⚠ FULL ATTENTION, EVERY PATCH AGAINST EVERY PATCH, and on a
+		 * FULL ATTENTION, EVERY PATCH AGAINST EVERY PATCH, and on a
 		 * thread each. whisper's identical loop measured 62% of a
 		 * transcription and came down 3.46x on four cores; this one is
 		 * 1025 against 1025, twelve heads, twelve layers.
@@ -1532,7 +1532,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		}
 
 		/*
-		 * ⚠⚠ THE FEED FORWARD IS NOT BANDWIDTH BOUND, AND THAT IS THE
+		 * THE FEED FORWARD IS NOT BANDWIDTH BOUND, AND THAT IS THE
 		 * FINDING, not the speedup beside it.
 		 *
 		 * Counted out at SmolVLM-256M's shape -- 1024 patches, 768
@@ -1565,7 +1565,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		 * and 384 hardware dispatches at roughly 3.3 ms each against
 		 * about 1.4 ms of bytes in one.
 		 *
-		 * ⚠ AND 905 MB OF THE 3.00 GB IS THE WEIGHTS READ SIXTEEN
+		 * AND 905 MB OF THE 3.00 GB IS THE WEIGHTS READ SIXTEEN
 		 * TIMES. 30% of the traffic exists only because the batch is
 		 * cut into 64 row chunks -- at one chunk it would be 57 MB. It
 		 * is not a thing to fix here: 80 is the last width whose output
@@ -1573,7 +1573,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 		 * that bound is the board's, written down in npupool.c.
 		 */
 		/*
-		 * ⚠ THE BIAS GOES TO bias_act, NOT TO rows_mul, and that is the
+		 * THE BIAS GOES TO bias_act, NOT TO rows_mul, and that is the
 		 * whole of the fusion. rows_mul's own bias loop is a separate
 		 * full pass over an intermediate that is 12.6 MB at this shape;
 		 * handing it to the activation instead visits those numbers
@@ -1599,7 +1599,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
 
 		if (!g || !b) { free(g); free(b); goto out; }
 		/*
-		 * ⚠ CLIP POST NORMALISES THE POOLED TOKEN ONLY. HF takes
+		 * CLIP POST NORMALISES THE POOLED TOKEN ONLY. HF takes
 		 * last_hidden_state[:, 0] and then applies post_layernorm; a
 		 * tower feeding a language model applies it to every patch.
 		 * Same tensor, different number of rows.

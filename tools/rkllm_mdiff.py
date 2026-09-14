@@ -21,9 +21,9 @@ outright -- no board, no sweep.
     rkllm_mdiff.py <model.rkllm>              the block, across every M at one shape
     rkllm_mdiff.py <model.rkllm> --all        every register that varies with M
 
-⚠ NEEDS numpy < 2 on this VM: the 2.x aarch64 wheel dies with SIGILL.
+NEEDS numpy < 2 on this VM: the 2.x aarch64 wheel dies with SIGILL.
 
-⚠⚠ WHAT THIS TOOL CANNOT TELL YOU, learned by acting on it and being wrong.
+WHAT THIS TOOL CANNOT TELL YOU, learned by acting on it and being wrong.
 Every vendor stream at M > 1 is fp16, against the KV cache; its int4 and int8
 weight matmuls are M = 1 without exception. The fp16 ops were never identified
 -- ic=1312 matches no dimension of Llama-3.2-1B -- so a register that tracks M
@@ -47,7 +47,7 @@ from rkllm_regcmd import streams, decode, geometry, TARGETS, CNA   # noqa: E402
 # The input surface block. Everything here is degenerate at M = 1: a stride
 # over one row, a count of one, a last index of zero.
 #
-# ⚠ M IS geo["m"], THE PIXEL COUNT, and this file used geo["rows"] -- which is
+# M IS geo["m"], THE PIXEL COUNT, and this file used geo["rows"] -- which is
 # what produced its "4.0 bit weights   M=1 only   3328 dispatches" line and the
 # conclusion that the vendor never batches a weight matmul. It batches 2816 of
 # those 3328, up to M = 80; they are one row high and M pixels wide.

@@ -1,7 +1,7 @@
 /* Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0
  *
- * ⭐ GROWING THE V SURFACE IS A BLOCK COPY, AND THIS IS WHAT SAYS SO.
+ * GROWING THE V SURFACE IS A BLOCK COPY, AND THIS IS WHAT SAYS SO.
  *
  * charsiu_fp16_regrow_vcols claims that a surface packed at kv_old, carrying
  * `live` positions, becomes the same surface at kv_new by moving each output
@@ -10,12 +10,12 @@
  * same positions DIRECTLY at kv_new with charsiu_fp16_pack_vcol and require
  * the two buffers to be byte identical, the zeros past `live` included.
  *
- * ⚠ WITH A NEGATIVE CONTROL, because a test that only ever compares a thing
+ * WITH A NEGATIVE CONTROL, because a test that only ever compares a thing
  * to itself passes on a regrow that does nothing. The control packs one extra
  * position into the reference and requires the comparison to FAIL: if it does
  * not, the comparison is not looking at the bytes it thinks it is.
  *
- * ⭐ AND IN PLACE IS ITS OWN ARM. The surface can be allocated once at the
+ * AND IN PLACE IS ITS OWN ARM. The surface can be allocated once at the
  * prompt's ceiling and re-laid-out where it lies, which is what removes
  * n_layer * n_kv buffer objects a rung -- 2048 of them on a 32 layer model
  * with no GQA. In place is only correct because the groups are walked from the
@@ -79,7 +79,7 @@ static int one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 		for (i = 0; i < bn / 2; i++)
 			if (ref[i] != got[i])
 				break;
-		printf("  hd %3u  %4u -> %4u  live %4u   ⛔ first differing "
+		printf("  hd %3u  %4u -> %4u  live %4u   first differing "
 		       "half at %zu: %04x want %04x\n", hd, kv_old, kv_new,
 		       live, i, got[i], ref[i]);
 		bad = 1;
@@ -93,12 +93,12 @@ static int one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 	fill(v, hd, live);
 	charsiu_fp16_pack_vcol(ref, kv_new, hd, live, v);
 	if (!memcmp(ref, got, bn)) {
-		printf("  hd %3u  %4u -> %4u  live %4u   ⛔ CONTROL: an extra "
+		printf("  hd %3u  %4u -> %4u  live %4u   CONTROL: an extra "
 		       "packed position did not change the buffer\n",
 		       hd, kv_old, kv_new, live);
 		bad = 1;
 	}
-	/* ⭐ THE IN PLACE ARM, against the same reference. `ip` is allocated at
+	/* THE IN PLACE ARM, against the same reference. `ip` is allocated at
 	 * the NEW size and packed in the OLD layout, which is exactly the
 	 * surface a caller has when it allocated once at the ceiling. */
 	{
@@ -115,12 +115,12 @@ static int one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 		free(w);
 		/* ref has the extra control position in it by now, so compare
 		 * against `got`, which this arm has already been shown equal
-		 * to the reference for. ⚠ That makes the in place arm's check
+		 * to the reference for. That makes the in place arm's check
 		 * transitive and it is only sound because the line above
 		 * failed the test if got != ref. */
 		if (charsiu_fp16_regrow_vcols(ip, kv_new, ip, kv_old, hd,
 					      live)) {
-			printf("  hd %3u  %4u -> %4u  live %4u   ⛔ IN PLACE "
+			printf("  hd %3u  %4u -> %4u  live %4u   IN PLACE "
 			       "REFUSED what the copy accepted\n",
 			       hd, kv_old, kv_new, live);
 			bad = 1;
@@ -130,7 +130,7 @@ static int one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 			for (i = 0; i < bn / 2; i++)
 				if (got[i] != ip[i])
 					break;
-			printf("  hd %3u  %4u -> %4u  live %4u   ⛔ IN PLACE "
+			printf("  hd %3u  %4u -> %4u  live %4u   IN PLACE "
 			       "differs at half %zu: %04x want %04x\n",
 			       hd, kv_old, kv_new, live, i, ip[i], got[i]);
 			bad = 1;
@@ -169,6 +169,6 @@ int main(void)
 					ran++;
 				}
 			}
-	printf("fp16_regrow: %d cases, %s\n", ran, bad ? "⛔ FAILED" : "all ok");
+	printf("fp16_regrow: %d cases, %s\n", ran, bad ? "FAILED" : "all ok");
 	return bad;
 }

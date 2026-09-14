@@ -10,11 +10,11 @@ twelve heads, twelve layers, and a toy cannot see it. The weights here are
 random and the answer is meaningless -- this measures TIME ONLY, and the
 correctness oracle stays vision_cross.py.
 
-⚠ THE HOST IS COMPUTE BOUND AND THE BOARD IS BANDWIDTH BOUND. A win here is
+THE HOST IS COMPUTE BOUND AND THE BOARD IS BANDWIDTH BOUND. A win here is
 not automatically a win there. Quote the BYTES a change removes as well as the
 seconds, because the bytes are what transfers.
 
-⚠ THE FILE IS CACHED AT --keep. It is a third of a gigabyte of random weights
+THE FILE IS CACHED AT --keep. It is a third of a gigabyte of random weights
 and building it costs more than the run does; delete it if SHAPE changes.
 
     tests/vision_bench.py build/charsiu_vision [--reps N] [--keep PATH]

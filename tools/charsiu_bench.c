@@ -128,7 +128,7 @@ static int bench_setup(struct bench *b, struct charsiu_device *dev,
 	b->dev = dev;
 	b->job.mm.m = m; b->job.mm.k = k; b->job.mm.n = n;
 	/*
-	 * ⚠ CHARSIU_W4 BENCHES THE int4 PATH, which this file has never had.
+	 * CHARSIU_W4 BENCHES THE int4 PATH, which this file has never had.
 	 * The whole int4 line, rounds 265 to 303, exists to answer "what does it
 	 * buy", and until now the only benchmark in the repo was int8 only, so
 	 * the question could not be asked at all.
@@ -258,7 +258,7 @@ static double bench_run(struct bench *b, unsigned tasks, unsigned reps)
 	charsiu_bo_fini(b->dev, &b->outbo);
 
 	/*
-	 * ⚠ EVERY REP, NOT ONE TIMER ROUND ALL OF THEM. This measured the whole
+	 * EVERY REP, NOT ONE TIMER ROUND ALL OF THEM. This measured the whole
 	 * loop and divided, which cannot tell "every rep takes 5 ms" from "one
 	 * rep in twenty takes 100 ms and the rest take 200 us" -- and those two
 	 * are completely different faults. int4's collapse above 512 KiB was
@@ -405,7 +405,7 @@ static void n_sweep(struct charsiu_device *dev, unsigned k, unsigned reps)
 		       n, mb, us, mb / us * 1e3, g_stats.min, g_stats.med,
 		       g_stats.max, g_stats.slow, g_stats.n);
 		/*
-		 * ⚠ AND FIT THE MEDIAN, not the mean. One stall in twenty moves
+		 * AND FIT THE MEDIAN, not the mean. One stall in twenty moves
 		 * a mean by the whole stall and a median not at all, and which
 		 * of those the number is decides whether "int4 is slow" or
 		 * "int4 stalls" is the right sentence.

@@ -3,7 +3,7 @@
 /*
  * How one tensor's contraction axis is cut into slices, as arithmetic alone.
  *
- * ⚠⚠ THE OLD RULE AND WHY IT COST SOMETHING. Every slice took KMAX and the
+ * THE OLD RULE AND WHY IT COST SOMETHING. Every slice took KMAX and the
  * last one took the remainder, so at KMAX 2048 a K of 3072 is 2048 + 1024 and
  * Qwen2.5's 8960 is 2048 x4 + 768. Two costs, and phase 9 on 2026-09-05
  * measured the second:
@@ -21,7 +21,7 @@
  * stable by construction and the cores get equal work: one change for both,
  * without touching the dealer or the reuse key.
  *
- * ⚠⚠ MEASURED, AND IT IS WORTH ALMOST NOTHING. Board, 2026-09-05, phase 2
+ * MEASURED, AND IT IS WORTH ALMOST NOTHING. Board, 2026-09-05, phase 2
  * clean on nine models and phase 9 with it on:
  *
  *   gemma4      528 misses -> 0,   prompt 30110 -> 29884 ms   (-0.8%)
@@ -32,7 +32,7 @@
  * reuse worth chasing", and it is no. OFF by default, kept because the
  * arithmetic is right and the next person should not re-derive it.
  *
- * ⚠ AND WHY PHI-3.5 DID NOT MOVE, WHICH IS NOT WHAT THE FIRST COMMIT SAID.
+ * AND WHY PHI-3.5 DID NOT MOVE, WHICH IS NOT WHAT THE FIRST COMMIT SAID.
  * llama.c picks KMAX itself: 1024 unless NO n_ff of the model is a multiple
  * of a candidate. Phi-3.5's n_ff is 8192, a multiple of both, so it runs at
  * KMAX 1024 -- where its K of 3072 is already 1024 x3 and its 8192 is
@@ -89,7 +89,7 @@ static inline unsigned charsiu_slice_kw(uint64_t k, unsigned ks, unsigned ki,
 	unsigned base = charsiu_even_k_base(k, ks, kmax, even, kfit);
 	unsigned step = base ? base : kmax;
 
-	/* ⚠ THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is more
+	/* THE LAST SLICE TAKES WHATEVER IS LEFT. Under KFIT that is more
 	 * than KMAX, and clamping it here would drop the tail of the tensor
 	 * without a word. */
 	return ki + 1 == ks ? (unsigned)(k - (uint64_t)ki * step) : step;

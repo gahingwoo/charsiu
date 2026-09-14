@@ -18,7 +18,7 @@
 # numbers disagree by more than the gap being measured, this round says
 # nothing and the answer is to run it again cold.
 #
-# ⚠⚠ THE FIRST VERSION OF THIS MEASURED NOTHING AND LOOKED LIKE IT HAD. It
+# THE FIRST VERSION OF THIS MEASURED NOTHING AND LOOKED LIKE IT HAD. It
 # picked whatever Q4_0 it found first -- Phi-3.5-mini, whose K and V are fused,
 # which llama_prefill_batch refuses outright -- so all three runs took the same
 # token loop and returned 4.96, 5.00 and 5.10 tok/s. Three numbers that agree
@@ -32,7 +32,7 @@
 # Usage: prefill_control.sh [MODEL.gguf] [N_GEN]
 set -eu
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -51,7 +51,7 @@ done
 [ -n "${RUN:-}" ] || { echo "prefill_control: charsiu_run not found" >&2; exit 1; }
 
 # --- the model -------------------------------------------------------------
-# ⚠⚠ AND IT PREFERS LLAMA EVEN WHEN OTHER MODELS ARE THERE, which is right and
+# AND IT PREFERS LLAMA EVEN WHEN OTHER MODELS ARE THERE, which is right and
 # is also how a round got wasted: told to "just run it, it will find gemma4",
 # this picked Llama-3.2 because that is the first pattern, ran perfectly, and
 # answered a question nobody had asked. The model IS printed at the top -- read
@@ -60,18 +60,18 @@ done
 # To check another architecture, PASS ITS PATH. There is no auto-detection that
 # could be right here: the number this script exists to explain is llama's.
 #
-# ⚠ int4, and llama, and SAID OUT LOUD. The 19.24 this exists to explain came
+# int4, and llama, and SAID OUT LOUD. The 19.24 this exists to explain came
 # off Llama-3.2-1B-Instruct-Q4_0; another model is a different number that
 # cannot be compared to it, and another architecture may not batch at all.
 # ~/.charsiu/models first: that is the directory the installer chowns to the
 # user and the one charsiu-get fills.
-# ⚠ THE BOARD DIRECTORY TOO. board_vendor.sh falls back to $CHARSIU_BOARD_DIR
+# THE BOARD DIRECTORY TOO. board_vendor.sh falls back to $CHARSIU_BOARD_DIR
 # and pulls models into it, so a model that table can find was invisible here:
 # a round meant to check gemma4's text came back "no int4 gguf found" while
 # board_vendor.sh had just benchmarked that very file.
 DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
-# ⚠⚠ AND A PATH THAT WAS PASSED GETS ITS OWN MESSAGE. This said "no int4 gguf
+# AND A PATH THAT WAS PASSED GETS ITS OWN MESSAGE. This said "no int4 gguf
 # found in <dirs> -- pass one" even when one HAD been passed and simply was not
 # there, which sends the reader to look in the wrong place. A search that
 # failed and an argument that is wrong are different faults.
@@ -106,7 +106,7 @@ trap 'rm -rf "$D"' EXIT
 
 # The same counting prompt the 19.24 came from: the model continues the
 # sequence, so a wrong answer is visible without a reference.
-# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+# ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
 # board_text_all.sh spelled this literally and every other script built it with
 # `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
@@ -123,26 +123,26 @@ PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 TASK=""
 command -v taskset >/dev/null 2>&1 && TASK="taskset -c 4-7"
 
-# ⚠ THE SIX THAT DECIDE WHETHER A PROJECTION REACHES THE NPU AT ALL, and
+# THE SIX THAT DECIDE WHETHER A PROJECTION REACHES THE NPU AT ALL, and
 # KMAX == W4_GROUP or the int4 path is silently not taken.
 export CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
        CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
        CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536
 
-# ⚠ AND CHARSIU_NO_BATCH_PREFILL IS NEVER EXPORTED. It is read with getenv()
+# AND CHARSIU_NO_BATCH_PREFILL IS NEVER EXPORTED. It is read with getenv()
 # and tested against NULL, so an exported empty string means ON -- which is how
 # a whole round meant to measure int8 ran int4 instead. The batched half must
 # run with the name ABSENT from its environment, not present and empty, so it
 # goes on the command line as a prefix and nowhere else.
 unset CHARSIU_NO_BATCH_PREFILL 2>/dev/null || true
 
-# ⚠ THE MODEL FIRST AND ON ITS OWN LINE, because the verdict at the bottom says
+# THE MODEL FIRST AND ON ITS OWN LINE, because the verdict at the bottom says
 # nothing about which file produced it.
 echo "model    $MODEL"
 echo "prompt   \"1 2 ... 32\",  gen $NGEN,  binary $RUN"
 echo
 
-# ⚠ charsiu_run puts the summary line on STDOUT, with the generated text. The
+# charsiu_run puts the summary line on STDOUT, with the generated text. The
 # first version of this grepped stderr for it and printed an empty table.
 one() {
 	_tag=$1
@@ -171,7 +171,7 @@ gen_of()  { grep -h 'gen .* tok in' "$D/$1.txt" 2>/dev/null \
 # timings, so comparing them as text makes every pair of runs "differ".
 text_of() { grep -v '^\[' "$D/$1.txt" | grep -v '^[[:space:]]*$'; }
 
-# ⚠ ONE RUN FIRST, AND STOP IF IT NEVER BATCHED. Three runs of an architecture
+# ONE RUN FIRST, AND STOP IF IT NEVER BATCHED. Three runs of an architecture
 # that cannot batch cost four minutes and produce three numbers that agree.
 one batched1
 case "$(path_of batched1)" in
@@ -198,7 +198,7 @@ for t in batched1 control batched2; do
 	printf '%-9s decode %s\n' "$t" "$(gen_of "$t")"
 done
 echo
-# ⚠⚠ THIS CHECK'S EXPECTATION INVERTED ON 2026-08-29 AND THE OLD ONE WOULD
+# THIS CHECK'S EXPECTATION INVERTED ON 2026-08-29 AND THE OLD ONE WOULD
 # HAVE READ AS A FAILURE.
 #
 # It used to say "batched must be >0, control must be 0", and it was right
@@ -214,7 +214,7 @@ echo
 # The proof of the batched path is the PATH column and the rate above it, and
 # the proof of correctness is the text comparison below. This line is now the
 # m = 8 fallback counter and says so.
-# ⚠ TWO KINDS NOW, COUNTED APART. m = 8 is the core pair and an ODD width is
+# TWO KINDS NOW, COUNTED APART. m = 8 is the core pair and an ODD width is
 # the accumulator read order -- two different faults, and a single total would
 # hide which one a prompt met. Since the chunker only emits even widths, both
 # columns should read 0: an odd refusal here means the chunker let one through.
@@ -230,7 +230,7 @@ text_of batched1 >"$D/a.txt"; text_of control >"$D/b.txt"
 if cmp -s "$D/a.txt" "$D/b.txt"; then
 	echo "text      IDENTICAL to the control"
 else
-	echo "text      ⚠ DIFFERS FROM THE CONTROL -- the rate is beside the point"
+	echo "text      DIFFERS FROM THE CONTROL -- the rate is beside the point"
 	diff "$D/b.txt" "$D/a.txt" || true
 fi
 echo "======================================================================="

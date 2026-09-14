@@ -5,7 +5,7 @@
 # How OFTEN is a refused model's batched text wrong, and does zeroing the
 # output buffer stop it?
 #
-# ⚠⚠ WHY A RATE AND NOT ANOTHER TABLE.
+# WHY A RATE AND NOT ANOTHER TABLE.
 #
 # gemma4 came back clean ten times on 2026-08-30 -- five runs on each core
 # count, text identical to its token loop -- and wrong twice the same day, once
@@ -18,7 +18,7 @@
 # sometimes, and every round that runs each cell once will keep drawing a
 # different picture of it. So: one configuration, many runs, one number.
 #
-# ⚠⚠ AND THE ARM THAT MATTERS IS onedev, NOT zero. I had this backwards.
+# AND THE ARM THAT MATTERS IS onedev, NOT zero. I had this backwards.
 #
 # CHARSIU_NPU_BATCH_ZERO=1 puts back the whole-buffer memset that
 # assign-on-first-write removed. It was added here as a SEMANTIC control -- if
@@ -46,7 +46,7 @@
 # m = 8, at a lower rate, and the whole residual collapses into it. Dirty on
 # one core too is something else and keeps its own investigation.
 #
-# ⚠ CHARSIU_BATCH_FORCE IS A PROBE SWITCH: these models are refused.
+# CHARSIU_BATCH_FORCE IS A PROBE SWITCH: these models are refused.
 #
 # `charsiu update dev` installs this at /opt/charsiu/board_intermittent.sh.
 #
@@ -58,7 +58,7 @@
 #   CHARSIU_INT_KMAX=1024              K slice; 1024 is the 08-30 reading's,
 #                                      2048 is what ships
 #
-# ⚠ THE 08-30 READING, for the record: phi3, chunk 24, KMAX 1024, sixteen
+# THE 08-30 READING, for the record: phi3, chunk 24, KMAX 1024, sixteen
 # runs an arm -- parallel 13 of 16 WRONG, onedev 0, serial 0 -- on the
 # August kernel, where rocket attaches and detaches the IOMMU per job. On
 # 2026-09-02 the attach-once kernel ran phase 2 with the overlap on and all
@@ -66,7 +66,7 @@
 # runtime is exactly this script at chunk 24 on each kernel in turn.
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -80,7 +80,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
 # minor, so the NPU can sit at accel1 or accel2 and a test that looks only
 # for accel0 refuses on a board that has one.
 if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
@@ -118,14 +118,14 @@ CHUNK=${CHARSIU_INT_CHUNK:-32}
 NGEN=${CHARSIU_INT_NGEN:-8}
 ARMS=${CHARSIU_INT_ARMS:-"default onedev serial"}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-# ⚠ ONE PROCESS NOW DOES $RUNS PROMPTS, so the clock is per ARM, not per
+# ONE PROCESS NOW DOES $RUNS PROMPTS, so the clock is per ARM, not per
 # run: 90s of staging and prompt each, floored at 300.
 TMOS=${CHARSIU_INT_TIMEOUT:-0}
 [ "$TMOS" -gt 0 ] 2>/dev/null || TMOS=$((RUNS * 90 + 300))
 TMO=""
 command -v timeout >/dev/null 2>&1 && TMO="timeout $TMOS"
 WEDGED=0
-# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+# ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
 # board_text_all.sh spelled this literally and every other script built it with
 # `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
@@ -138,12 +138,12 @@ WEDGED=0
 CHARSIU_PROMPT_END=${CHARSIU_PROMPT_END:-}
 PROMPT="$(seq 1 32 | tr '\n' ' ')"
 PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
-# ⚠ THE K SLICE IS PINNED TO 1024, WHICH IS THE 2026-08-30 READING'S, not the
+# THE K SLICE IS PINNED TO 1024, WHICH IS THE 2026-08-30 READING'S, not the
 # shipped 2048: this script exists to reproduce that reading's 13 of 16, and
 # a reproduction at a different width is a different experiment. To ask the
 # shipped width the same question, CHARSIU_INT_KMAX=2048.
 #
-# ⚠⚠ THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
+# THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
 # wants t->kgroup == g->kmax -- the hardware sums a whole K slice into one
 # accumulator, so a slice carries exactly one group's scale -- and
 # charsiu_npu_add REFUSES a tensor whose grouping the consumer cannot
@@ -151,7 +151,7 @@ PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 # tensor with k > 1024 to the CPU, which on Llama is all of attention and
 # ffn_down. It whines; no harness read it.
 #
-# ⚠⚠⚠ AND THIS NOTE USED TO SIT INSIDE THE STRING BELOW, BETWEEN A
+# AND THIS NOTE USED TO SIT INSIDE THE STRING BELOW, BETWEEN A
 # BACKSLASH AND ITS CONTINUATION -- so `#` was not a comment, it was DATA.
 # W4 expanded to the environment followed by nine lines of prose, `env`
 # tried to execute a program called `#`, every arm died in under a second,
@@ -169,12 +169,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
 echo "build    $(charsiu_build "$RUN")"
-# ⚠⚠ SAY WHICH KERNEL, the same way board_verify does: every kernel this
+# SAY WHICH KERNEL, the same way board_verify does: every kernel this
 # project ships has the same uname, and this script's whole purpose now is to
 # tell two of them apart.
 _ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
@@ -186,7 +186,7 @@ c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
 *)        _kname="not a release this script knows" ;;
 esac
 echo "kernel   $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
-# ⚠ AGAINST now - uptime, NOT /proc/1. The old test was
+# AGAINST now - uptime, NOT /proc/1. The old test was
 # `[ /boot/Image -nt /proc/1 ]` and it fires on a board where the Image is
 # fifteen hours OLDER than the boot: /proc/1's mtime is not the boot instant,
 # it moves. This compares the Image's mtime against the clock minus uptime,
@@ -197,11 +197,11 @@ if [ -f /boot/Image ]; then
 	_imt=$(date -r /boot/Image +%s 2>/dev/null || echo 0)
 	_boot=$(awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0)
 	[ "$_imt" -gt 0 ] && [ "$_boot" -gt 0 ] && [ "$_imt" -gt "$_boot" ] && \
-		echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+		echo "/boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 fi
 echo "config   chunk $CHUNK, gen $NGEN, $RUNS runs an arm"
 echo "arms     $ARMS"
-# ⚠ DESCRIBE ONLY THE ARMS THAT WILL RUN. The header listed all four while
+# DESCRIBE ONLY THE ARMS THAT WILL RUN. The header listed all four while
 # ARMS held three, which is the same class of lie as a computed width: the
 # thing on screen has to be the thing that happened.
 for A in $ARMS; do case $A in
@@ -219,14 +219,14 @@ esac; done
 echo
 
 # --- the control, twice, because the token loop must be stable too ---------
-# ⚠ IF THE TOKEN LOOP ITSELF IS NOT REPRODUCIBLE then every comparison below
+# IF THE TOKEN LOOP ITSELF IS NOT REPRODUCIBLE then every comparison below
 # is against a moving target, and the first thing to fix is not the batching.
 i=1
 while [ "$i" -le 2 ]; do
 	# shellcheck disable=SC2086
 	env $W4 CHARSIU_NO_BATCH_PREFILL=1 "$RUN" "$MODEL" -p "$PROMPT" \
 		-n "$NGEN" --ignore-eos >"$T/c$i.out" 2>/dev/null
-	# ⚠ BEFORE THE STRIP: the count lives on the bracketed line the next
+	# BEFORE THE STRIP: the count lives on the bracketed line the next
 	# command deletes, and a prompt whose length nobody prints is how two
 	# rounds compared different prompts and called it a flip.
 	[ "$i" -eq 1 ] && NTOK=$(sed -n 's/.*prompt \([0-9]*\) tok in.*/\1/p' \
@@ -235,7 +235,7 @@ while [ "$i" -le 2 ]; do
 	i=$((i + 1))
 done
 if ! cmp -s "$T/c1.out" "$T/c2.out"; then
-	echo "⚠⚠ THE TOKEN LOOP DISAGREED WITH ITSELF on two runs of the same"
+	echo "THE TOKEN LOOP DISAGREED WITH ITSELF on two runs of the same"
 	echo "   prompt. The reference is not stable, so nothing measured against"
 	echo "   it means anything. Stop here and chase that."
 	diff "$T/c1.out" "$T/c2.out" | head -6 | sed 's/^/   /'
@@ -244,13 +244,13 @@ fi
 cp "$T/c1.out" "$T/ref.out"
 # the reference, normalised the same way the segments are
 sed -e 's/^\[.*//' -e '/^[[:space:]]*$/d' "$T/ref.out" >"$T/refn.out"
-# ⚠⚠ AN EMPTY REFERENCE MATCHES EVERYTHING. If the control produced no text
+# AN EMPTY REFERENCE MATCHES EVERYTHING. If the control produced no text
 # -- a model that would not load, a normalisation that ate the whole file --
 # then every segment below compares equal and the round reports a perfect
 # score having measured nothing. This is the cheapest possible check against
 # the failure this whole script exists to avoid.
 if [ ! -s "$T/refn.out" ]; then
-	echo "⚠⚠ THE CONTROL PRODUCED NO TEXT after normalisation, so every" >&2
+	echo "THE CONTROL PRODUCED NO TEXT after normalisation, so every" >&2
 	echo "   comparison below would trivially pass. Refusing to run." >&2
 	sed -n '1,10p' "$T/ref.out" | sed 's/^/    /' >&2
 	exit 1
@@ -261,7 +261,7 @@ printf 'reference is %s line(s), %s bytes\n' \
 # shellcheck disable=SC2086
 env $W4 CHARSIU_BATCH_FORCE=1 CHARSIU_PREFILL_CHUNK="$CHUNK" "$RUN" "$MODEL" \
 	-p "$PROMPT" -n 1 --ignore-eos >/dev/null 2>"$T/w.err"
-# ⚠⚠ ASK THE RUN WHICH WIDTHS IT USED. DO NOT COMPUTE THEM.
+# ASK THE RUN WHICH WIDTHS IT USED. DO NOT COMPUTE THEM.
 #
 # This line was `NTOK % CHUNK` and it printed "a tail of 23" for a phi3 round
 # that ran a tail of TWENTY TWO -- because the chunker had been changed to
@@ -277,12 +277,12 @@ if [ -n "$WIDTHS" ]; then
 	printf 'batched widths, as the binary reports them: %s\n' "$WIDTHS"
 	case $WIDTHS in
 	*x8+*|*x8|*x10+*|*x10)
-		echo "⚠ that includes a width the gate refuses (8 or 10): those"
+		echo "that includes a width the gate refuses (8 or 10): those"
 		echo "  chunks fall back a row at a time, so this round is not"
 		echo "  measuring them on the batched path at all." ;;
 	esac
 else
-	echo "⚠ THE BATCHED PATH PRINTED NO WIDTH BREAKDOWN. Either this binary"
+	echo "THE BATCHED PATH PRINTED NO WIDTH BREAKDOWN. Either this binary"
 	echo "  predates the even-only chunker or the prompt was not batched at"
 	echo "  all -- and either way the arms below are not testing what the"
 	echo "  header says."
@@ -304,7 +304,7 @@ for ARM in $ARMS; do
 	zero)    EXTRA="CHARSIU_NPU_BATCH_ZERO=1" ;;
 	*) echo "unknown arm '$ARM'" >&2; continue ;;
 	esac
-	# ⚠⚠ ONE PROCESS AN ARM, NOT ONE A SAMPLE.
+	# ONE PROCESS AN ARM, NOT ONE A SAMPLE.
 	#
 	# This asked a rate question by starting charsiu_run once per sample:
 	# 16 runs an arm, three arms, plus controls, is 51 loads of a 2.2 GB
@@ -316,7 +316,7 @@ for ARM in $ARMS; do
 	# --repeat runs the prompt N times in one process, resetting only the
 	# cache position, and separates the answers with a marker line.
 	#
-	# ⚠ It is not the identical experiment: N repeats share one staging and
+	# It is not the identical experiment: N repeats share one staging and
 	# one set of device buffers where N processes did not. For a race in
 	# the submit path that is the same question -- and if a fault ever
 	# turns out to need a fresh process, CHARSIU_INT_PROC=1 puts the old
@@ -330,13 +330,13 @@ for ARM in $ARMS; do
 	rc=$?
 	if [ $rc -eq 124 ]; then
 		echo
-		echo "⚠⚠ THE $ARM ARM DID NOT FINISH IN ${TMOS}s. Almost certainly"
+		echo "THE $ARM ARM DID NOT FINISH IN ${TMOS}s. Almost certainly"
 		echo "   a wedged NPU. Nothing measured."
 		WEDGED=1
 	fi
 	if grep -qiE "job timed out|not functioning|iommu" "$T/b.err"; then
 		echo
-		echo "⚠⚠ THE NPU WEDGED during the $ARM arm:"
+		echo "THE NPU WEDGED during the $ARM arm:"
 		grep -iE "job timed out|not functioning|iommu" "$T/b.err" \
 			| head -3 | sed 's/^/     /'
 		WEDGED=1
@@ -345,7 +345,7 @@ for ARM in $ARMS; do
 	awk -v d="$T" '''BEGIN { n = 1; f = d "/seg1" }
 		/^--- charsiu repeat [0-9]+ ---$/ { n++; f = d "/seg" n; next }
 		{ print > f }''' "$T/b.out"
-	# ⚠ BLANK LINES GO FROM BOTH SIDES. The marker carries a leading
+	# BLANK LINES GO FROM BOTH SIDES. The marker carries a leading
 	# newline, so segment one ends with a blank line the control does not
 	# have. Nothing this prompt generates is a blank line, and the control
 	# gets the same treatment, so this cannot hide a difference in the text.
@@ -364,12 +364,12 @@ for ARM in $ARMS; do
 	done
 	if [ "$did" -lt "$RUNS" ] && [ "$WEDGED" -eq 0 ]; then
 		echo
-		echo "⚠ ONLY $did OF $RUNS REPEATS CAME BACK on the $ARM arm."
+		echo "ONLY $did OF $RUNS REPEATS CAME BACK on the $ARM arm."
 		echo "  Either this binary has no --repeat (charsiu update dev) or"
 		echo "  the run stopped early. Its rate below is over $did."
 		tail -3 "$T/b.err" | sed 's/^/    /'
 	fi
-	# ⚠ THE DENOMINATOR IS REPEATS THAT CAME BACK, never RUNS: an arm that
+	# THE DENOMINATOR IS REPEATS THAT CAME BACK, never RUNS: an arm that
 	# stopped early must not claim every sample happened.
 	printf '%-9s %-6s %s\n' "$ARM" "$bad/$did" "$marks"
 	[ "$WEDGED" -eq 0 ] || break
@@ -381,7 +381,7 @@ done
 echo
 echo "======================================================================"
 if [ "$WEDGED" -ne 0 ]; then
-	echo "⚠⚠ THE ROUND STOPPED ON A WEDGED NPU. NOTHING HERE IS A RESULT."
+	echo "THE ROUND STOPPED ON A WEDGED NPU. NOTHING HERE IS A RESULT."
 	echo
 	echo "This board's reset path does not recover the block after a job"
 	echo "times out -- the IOMMU says MMU_DTE_ADDR is not functioning and"
@@ -393,14 +393,14 @@ if [ "$WEDGED" -ne 0 ]; then
 	exit 1
 fi
 d=${res_default:-}; o=${res_onedev:-}; z=${res_zero:-}
-# ⚠ ANY arm firing counts. A fault that shows up only under the timing
+# ANY arm firing counts. A fault that shows up only under the timing
 # perturbation is still a fault on this hardware; the perturbation is not a
 # configuration anyone ships, but it is not a fault the perturbation invented
 # either.
 two=0
 [ -n "$d" ] && [ "$d" -gt 0 ] && two=$((two + d))
 [ -n "$z" ] && [ "$z" -gt 0 ] && two=$((two + z))
-# ⚠⚠ THE PARALLEL ARM COUNTS TOO. This verdict summed `default` and `zero`
+# THE PARALLEL ARM COUNTS TOO. This verdict summed `default` and `zero`
 # only, so a round whose parallel arm was WRONG 15 OF 16 -- on the attach-once
 # kernel, 2026-09-03, the round that decided the overlap was not the old
 # kernel's -- ended with "IT DID NOT FIRE" printed under it. The arm that
@@ -414,7 +414,7 @@ if [ -n "$p" ]; then
 		echo "parallel (both cores, overlapped): $RUNS of $RUNS CLEAN"
 	fi
 fi
-# ⚠ THE SERIAL ARM IS WHAT SHIPS, so it is reported on its own line whatever
+# THE SERIAL ARM IS WHAT SHIPS, so it is reported on its own line whatever
 # the rest says. It is also what `default` now runs, so the two agreeing is the
 # expected result and only `parallel` puts the overlap back.
 sr=${res_serial:-}
@@ -436,7 +436,7 @@ elif [ "$two" -gt 0 ] && [ "$o" -eq 0 ]; then
 	echo "  fault the dense sweep proved at m = 8 and m = 10 -- two cores on"
 	echo "  row 0 of a wide output -- firing rarely at this width instead of"
 	echo "  densely. The residual is not a second bug."
-	echo "  ⚠ It also means the sweep's \"every even width exact\" is ONE"
+	echo "  It also means the sweep's \"every even width exact\" is ONE"
 	echo "    sample a width, and cannot see a one-in-sixteen fault."
 elif [ "$two" -gt 0 ] && [ "$o" -gt 0 ]; then
 	echo "→ NOT THE CORE PAIR. Wrong $o of $RUNS on one core as well, so"

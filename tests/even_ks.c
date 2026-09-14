@@ -9,7 +9,7 @@
  * every slice but the last is the same width and a multiple of the feature
  * atom, and the last is no wider than the others.
  *
- * ⚠ THE POINT OF THE EVEN RULE IS deal_pick's STABILITY, so the last check is
+ * THE POINT OF THE EVEN RULE IS deal_pick's STABILITY, so the last check is
  * the one that matters: two slices of equal width cost the load balancer the
  * same, which is what makes the slice to device map repeat from tensor to
  * tensor. A slicing that is "nearly" even does not buy that.
@@ -105,7 +105,7 @@ int main(void)
 			for (int e = 0; e < 2; e++, n++)
 				check(k, kmaxes[i], e);
 	/*
-	 * ⚠ AND THE ONE THAT MATTERS: the two shapes that lost every reuse.
+	 * AND THE ONE THAT MATTERS: the two shapes that lost every reuse.
 	 * Phi-3.5's 3072 and gemma4's, at the shipped KMAX, must come out as
 	 * equal halves -- if they do not, the change buys nothing on the only
 	 * two models it was written for.

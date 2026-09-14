@@ -32,7 +32,7 @@
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
 /*
- * ⚠ e^x FOUR AT A TIME NOW LIVES IN THE HEADER, as charsiu_vexpq. It was
+ * e^x FOUR AT A TIME NOW LIVES IN THE HEADER, as charsiu_vexpq. It was
  * written here for SiLU and the vision tower's softmax turned out to want it
  * far more: a picture asks for 151 million exponentials against a feed
  * forward's 131072 a token.
@@ -90,7 +90,7 @@ static int attn_perhead(void)
 }
 
 /*
- * ⚠⚠ POOL THE DECODE ATTENTION ONCE THE CONTEXT PAYS FOR THE FAN OUT, WHICH IS
+ * POOL THE DECODE ATTENTION ONCE THE CONTEXT PAYS FOR THE FAN OUT, WHICH IS
  * ROUND 368'S OWN FOLLOW-UP.
  *
  * That round measured the heads on the pool at 22.70 ms a token against 7.75
@@ -108,7 +108,7 @@ static int attn_perhead(void)
  *   llama      20.98 -> 21.57 +2.8%
  *   gemma3     21.26 -> 21.04 -1.0%     14.24 -> 18.53 +30%
  *
- * ⚠ AND THE 15 ms UNPINNED PENALTY IS GONE. Round 368's worst case was the
+ * AND THE 15 ms UNPINNED PENALTY IS GONE. Round 368's worst case was the
  * scheduler moving the process; unpinned now it is the best case of all, which
  * is the QoS hold and the affinity work that landed since. A default fitted
  * under conditions that changed is the thing this tree keeps finding.
@@ -123,7 +123,7 @@ static int attn_perhead(void)
  * rounds above used.
  */
 /*
- * ⛔⛔ AND THE SENTINEL CAME BACK MEANING ITS OPPOSITE. charsiu_pool_min()
+ * AND THE SENTINEL CAME BACK MEANING ITS OPPOSITE. charsiu_pool_min()
  * returns (uint64_t)-1 for "never pool", which is what it answers whenever
  * charsiu_threads() is under two. This read it into an int, got -1, and then
  * ran `if (v < 0) v = 0` -- and 0 is not "never", it is "pool at EVERY
@@ -135,7 +135,7 @@ static int attn_perhead(void)
  * A `static int v = -1` cannot do that, because -1 is already this function's
  * "not computed yet". Hence the separate flag.
  *
- * ⚠ An explicit negative from the environment still means "no floor", which is
+ * An explicit negative from the environment still means "no floor", which is
  * what it meant before. Only the SENTINEL means never, and it can only come
  * from charsiu_pool_min.
  */
@@ -172,7 +172,7 @@ static int attn_pool_for(int pos)
 }
 
 /*
- * ⚠ OPT IN, AND IT MOVES TOKENS.
+ * OPT IN, AND IT MOVES TOKENS.
  *
  * vexpq is accurate to about one last bit and glibc's expf is correctly
  * rounded, so the vector path is the slightly WORSE of the two. That is
@@ -226,7 +226,7 @@ static int fast_silu(void)
 }
 
 /*
- * ⚠⚠ AND THE TANH GELU IS THE SAME SIGMOID, WHICH IS AN IDENTITY RATHER THAN
+ * AND THE TANH GELU IS THE SAME SIGMOID, WHICH IS AN IDENTITY RATHER THAN
  * AN APPROXIMATION.
  *
  *   0.5 * (1 + tanh y)  ==  1 / (1 + e^-2y)
@@ -279,7 +279,7 @@ static void silu_mul(float *hb, const float *hb2, uint32_t n)
 /*
  * hb = gelu(hb) * hb2, which is the same join with gemma's activation.
  *
- * ⚠ THE TANH APPROXIMATION, not the exact erf one. ggml's GGML_OP_GELU is the
+ * THE TANH APPROXIMATION, not the exact erf one. ggml's GGML_OP_GELU is the
  * tanh form and that is what the gemma files were quantised against; the two
  * differ by about 1e-3 in the middle of the range, which is small and is not
  * nothing when it is applied 3072 times a layer.
@@ -339,7 +339,7 @@ struct pool {
 	void (*fn)(void *ctx, uint64_t r0, uint64_t n);
 	void *ctx;
 	/*
-	 * ⚠ THE SPLIT WAS STATIC AND THE BOARD IS BIG.LITTLE. Every thread took
+	 * THE SPLIT WAS STATIC AND THE BOARD IS BIG.LITTLE. Every thread took
 	 * an equal contiguous share, so a dispatch ended when the slowest A53
 	 * finished its eighth while the A72s, three times as fast, sat at the
 	 * barrier. CHARSIU_POOL_DYNAMIC=1 hands out chunks from a cursor as
@@ -378,7 +378,7 @@ static int pool_dynamic(void)
  * host caught it as changed text on the first run.
  */
 /*
- * ⚠⚠ THE GRAIN IS NOT COSMETIC, AND read_rows2 FOUND THAT OUT BY LUCK.
+ * THE GRAIN IS NOT COSMETIC, AND read_rows2 FOUND THAT OUT BY LUCK.
  *
  * A callback that consumes rows in pairs -- two rows off one cache line -- can
  * only do it when the range it is handed starts even and is even long. The
@@ -474,7 +474,7 @@ static void *worker(void *arg)
  * regression nobody could see.
  */
 /*
- * ⚠ SAY WHAT THE CORES WERE DOING, because a tokens-per-second number is not
+ * SAY WHAT THE CORES WERE DOING, because a tokens-per-second number is not
  * comparable without it.
  *
  * Round 389 measured 15.91 tok/s where an earlier board run on a different
@@ -491,7 +491,7 @@ static void *worker(void *arg)
 static int g_pinned_cpu = -1;
 
 /*
- * ⚠⚠ scaling_cur_freq AT STARTUP IS AN IDLE CPU, and ondemand has not seen any
+ * scaling_cur_freq AT STARTUP IS AN IDLE CPU, and ondemand has not seen any
  * work yet. Two consecutive board runs of the same command reported 2208 MHz
  * and 1200 MHz from this line, both with the governor at ondemand, purely
  * because of when it was read. A number that swings by a factor of two on the
@@ -594,7 +594,7 @@ static int cpus_parse(const char *spec, cpu_set_t *setp)
 }
 
 /*
- * ⚠⚠ THE MAIN THREAD AND THE POOL WANT DIFFERENT CORES, AND THE BOARD SAID SO
+ * THE MAIN THREAD AND THE POOL WANT DIFFERENT CORES, AND THE BOARD SAID SO
  * TWICE IN ONE MORNING.
  *
  * The note below this one pinned everything to the four A72s because in NPU
@@ -634,12 +634,12 @@ static int cpus_parse(const char *spec, cpu_set_t *setp)
  * many CPUs it has, and 0 when the machine is homogeneous or sysfs has no
  * cpufreq at all -- on which nothing below should act.
  *
- * ⚠ IT INTERSECTS WITH THE INHERITED MASK. A caller who ran taskset has
+ * IT INTERSECTS WITH THE INHERITED MASK. A caller who ran taskset has
  * already answered this question, and widening their mask because we think we
  * know better would be a runtime overriding an operator.
  */
 /*
- * ⚠⚠ THREADS INHERIT THE CREATOR'S MASK, so pinning the calling thread before
+ * THREADS INHERIT THE CREATOR'S MASK, so pinning the calling thread before
  * pthread_create pins the whole pool with it -- which is NOT what the comment
  * in cpus_pin() claims and not what this tree measured as best. The mask as it
  * was inherited is kept here and handed back to the workers.
@@ -700,7 +700,7 @@ static void cpus_pin(void)
 	cpu_set_t set;
 
 	/*
-	 * ⚠⚠ THERE IS A DEFAULT NOW, AND THE PARAGRAPH ABOVE ARGUED AGAINST
+	 * THERE IS A DEFAULT NOW, AND THE PARAGRAPH ABOVE ARGUED AGAINST
 	 * ONE. It said "a wrong guess baked in is a regression nobody could
 	 * see", which was right while nobody had measured what NOT choosing
 	 * costs. On 2026-09-11 that was measured, and not choosing is the
@@ -726,7 +726,7 @@ static void cpus_pin(void)
 	 * this one already said about decode, on 2026-09-06, before anything
 	 * acted on it.
 	 *
-	 * ⚠ ONLY THE CALLING THREAD, and that is this tree's own measurement
+	 * ONLY THE CALLING THREAD, and that is this tree's own measurement
 	 * too: the pool wants the whole machine (a prompt is 4.3% faster with
 	 * it open) while decode is one thread's work and loses 26% when that
 	 * thread lands on an A53. So the default pins the caller to the fast
@@ -764,7 +764,7 @@ static void cpus_pin(void)
 	}
 	if (!strcmp(spec, "off"))
 		return;
-	/* ⚠ the FAILURE still speaks. A pin that did not apply changes the
+	/* the FAILURE still speaks. A pin that did not apply changes the
 	 * numbers and is not a running commentary. */
 	if (cpus_parse(spec, &set) && sched_setaffinity(0, sizeof(set), &set))
 		fprintf(stderr, "charsiu: CHARSIU_CPUS=%s did not apply\n", spec);
@@ -804,7 +804,7 @@ static void pool_start(int nthreads)
 		int n = 0, bad = 0;
 
 		/*
-		 * ⚠ GIVE THE POOL THE WHOLE MACHINE BACK. The workers were
+		 * GIVE THE POOL THE WHOLE MACHINE BACK. The workers were
 		 * created after the calling thread was pinned, so they
 		 * inherited its mask; this tree's own 09-06 table says the
 		 * pool wants every core (a Llama prompt is 4.3% faster with
@@ -885,7 +885,7 @@ void charsiu_parallel_for_grain(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
 }
 
 /*
- * ⚠ THE POOL IS STARTED BY llama_state_new AND NOTHING ELSE STARTED IT. A
+ * THE POOL IS STARTED BY llama_state_new AND NOTHING ELSE STARTED IT. A
  * whisper transcription or a vision tower has no llama_state, so every
  * charsiu_parallel_for in those graphs ran on one core -- silently, because
  * pool_run's single thread path is a plain call and looks like success.
@@ -901,7 +901,7 @@ int charsiu_threads(void)
 }
 
 /*
- * ⚠ NOT A STAGE, A SLICE THROUGH THEM. charsiu_act_set runs at the top of
+ * NOT A STAGE, A SLICE THROUGH THEM. charsiu_act_set runs at the top of
  * every matvec, inside whichever row the stage table is counting, so it is
  * accumulated separately and printed as a note rather than a row.
  *
@@ -913,7 +913,7 @@ int charsiu_threads(void)
  * result.
  */
 static double act_ms;
-/* ⚠ NOT stage_ms: that name is the per stage table further down */
+/* NOT stage_ms: that name is the per stage table further down */
 /* the staging clock lives in npupool.c with the staging */
 
 double llama_stage_ms(void)
@@ -947,14 +947,14 @@ static double now_ms(void)
  * Not a synthetic matmul: the staged tensors of a real model, walked once so
  * the weights come from memory the way a forward pass makes them.
  *
- * ⚠ IT SWEEPS m, and that is the point rather than a convenience. m = 2 and
+ * IT SWEEPS m, and that is the point rather than a convenience. m = 2 and
  * m = 4 are the widths charsiu_acc_index was solved on and m = 8 is the one it
  * was confirmed on. 32 extrapolates both that expression and 0x40b8 = 3 * rows,
  * which was swept to m = 4. If the small widths agree and the large ones do
  * not, the plumbing is right and one of those two formulas stops somewhere. If
  * m = 2 disagrees, it is the plumbing.
  *
- * ⚠ AND IT SAYS WHICH ROWS. A wrong permutation puts a neighbour's value in a
+ * AND IT SAYS WHICH ROWS. A wrong permutation puts a neighbour's value in a
  * slot; a wrong scale multiplies every slot. "Row 0 agrees and the rest do
  * not" and "everything is off by a factor" are different faults, and one
  * worst-case number cannot tell them apart.
@@ -963,7 +963,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		      unsigned mmax)
 {
 	/*
-	 * ⚠ THE WIDTHS THE PREFILL WILL ACTUALLY USE, not just the ones the
+	 * THE WIDTHS THE PREFILL WILL ACTUALLY USE, not just the ones the
 	 * read order was solved on. roleswap2 is exact at 2, 4, 16 and 32 and
 	 * m = 8 is 871 of 904, so the question is now where else it bends --
 	 * and a chunk of 48, 64 or 80 is what a real prompt hands it.
@@ -971,7 +971,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 */
 	static const unsigned MS_DEFAULT[] = { 2, 4, 8, 16, 32, 48, 64, 80 };
 	/*
-	 * ⚠⚠ THE WIDTHS A REAL PROMPT HANDS IT ARE NOT THIS LIST.
+	 * THE WIDTHS A REAL PROMPT HANDS IT ARE NOT THIS LIST.
 	 *
 	 * phi3's prompt is 87 tokens, which at a chunk of 32 is 32, 32 and
 	 * TWENTY THREE -- a width this sweep has never asked about, on a model
@@ -987,7 +987,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	unsigned n_ms = sizeof(MS_DEFAULT) / sizeof(MS_DEFAULT[0]);
 	const char *wenv = getenv("CHARSIU_PROBE_WIDTHS");
 	/*
-	 * ⚠⚠ CHARSIU_PROBE_MAXT: HOW MANY STAGED TENSORS A WIDTH COSTS, which
+	 * CHARSIU_PROBE_MAXT: HOW MANY STAGED TENSORS A WIDTH COSTS, which
 	 * is what stops a dense sweep from being affordable.
 	 *
 	 * The one row reference is O(m) matvecs per tensor and it runs over
@@ -998,7 +998,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 * dropping widths, and dropping widths is the whole point of the
 	 * sweep.
 	 *
-	 * ⚠ IT TAKES THE FIRST N STAGED TENSORS, AND THAT IS A BIAS WITH A
+	 * IT TAKES THE FIRST N STAGED TENSORS, AND THAT IS A BIAS WITH A
 	 * SHAPE. The pool fills lazily in the order the first forward pass
 	 * touches things, so the first N are layer 0's projections -- q, k, v,
 	 * o, then gate, up, down -- and N = 8 reaches into layer 1. That is
@@ -1032,7 +1032,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		const unsigned cap = sizeof(ms_buf) / sizeof(ms_buf[0]);
 
 		/*
-		 * ⚠⚠ EVERY WAY THIS CAN GO WRONG REFUSES OUT LOUD, and none of
+		 * EVERY WAY THIS CAN GO WRONG REFUSES OUT LOUD, and none of
 		 * them shortens the list quietly.
 		 *
 		 * The first draft stopped on a full buffer and stopped on the
@@ -1079,7 +1079,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			n++;
 		}
 		/*
-		 * ⚠ AND THE LIST RAISES THE CAP. --batch-probe caps the sweep,
+		 * AND THE LIST RAISES THE CAP. --batch-probe caps the sweep,
 		 * and a round that asks for width 87 under a cap of 80 gets 80
 		 * and a table that does not mention it. Asking explicitly is
 		 * the whole point of this switch.
@@ -1117,11 +1117,11 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			widest = (unsigned)s->pool.t[i].k;
 	}
 	/*
-	 * ⚠ ONCE, NOT ONCE A ROW. The first version allocated and blocked the
+	 * ONCE, NOT ONCE A ROW. The first version allocated and blocked the
 	 * activation inside the timing loop and charged all of it to the one
 	 * row path, which is the side it was trying to beat.
 	 *
-	 * ⚠ AND IT IS SIZED OFF THE WIDEST STAGED TENSOR, NOT THE WIDEST
+	 * AND IT IS SIZED OFF THE WIDEST STAGED TENSOR, NOT THE WIDEST
 	 * CHECKED ONE, so CHARSIU_PROBE_MAXT does not reach it. The cap is
 	 * about time; sizing this to the first N as well would make one switch
 	 * quietly change what the tensors it did not check could have been.
@@ -1130,7 +1130,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		return -1;
 
 	/*
-	 * ⚠ SAY WHICH WIDTHS, because the caller caps this and the two have
+	 * SAY WHICH WIDTHS, because the caller caps this and the two have
 	 * already disagreed. MS[] was widened to 80 and the board script was
 	 * still passing --batch-probe 32, so a round that was run to reach 48,
 	 * 64 and 80 stopped at 32 and its header said 32 while the reason for
@@ -1143,14 +1143,14 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			printf(" %u", MS[i]);
 	printf("   (--batch-probe caps at %u)\n", mmax);
 	/*
-	 * ⚠⚠ A CAPPED ROUND MUST NEVER BE READABLE AS A FULL ONE. It is said
+	 * A CAPPED ROUND MUST NEVER BE READABLE AS A FULL ONE. It is said
 	 * here in words and again in the tensors column on every single row,
 	 * because the line that gets pasted out of a round is a table row and
 	 * not a header, and "225" and "8" are both just a number until one of
 	 * them is written as a fraction of the other.
 	 */
 	if (maxt && maxt < n_staged)
-		printf("  ⚠ CHARSIU_PROBE_MAXT=%u: only the FIRST %u of %u"
+		printf("  CHARSIU_PROBE_MAXT=%u: only the FIRST %u of %u"
 		       " staged tensors are checked. Those are layer 0's"
 		       " projections and the start of layer 1, so every shape"
 		       " an ordinary layer has is covered -- but NOT the output"
@@ -1167,7 +1167,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	       " output zero; rest is what none of them caught)\n");
 
 	/*
-	 * ⚠⚠ TWO AXES AND SEVEN READINGS, at m = 2 on one tensor, before any
+	 * TWO AXES AND SEVEN READINGS, at m = 2 on one tensor, before any
 	 * timing.
 	 *
 	 * charsiu_acc_index is solved and confirmed on the int8 accumulator on
@@ -1180,7 +1180,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 	 * So the axis and the reading are one question with two knobs, and this
 	 * asks both at once rather than fitting either.
 	 *
-	 * ⚠ ROW 0 IS NOT A CONTROL HERE. On the wrong axis it is wrong too --
+	 * ROW 0 IS NOT A CONTROL HERE. On the wrong axis it is wrong too --
 	 * the last round read "row 0 is exact" off six of two thousand values
 	 * and spent itself on the one term row 0 cannot see. Both rows are
 	 * counted and both are printed.
@@ -1209,7 +1209,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 							(int)t->k);
 					charsiu_act_blocks(&a);
 					/*
-					 * ⚠ int8's matvec READS a->q1 and the
+					 * int8's matvec READS a->q1 and the
 					 * float path does not, so without this
 					 * the reference came back all zeros on
 					 * an int8 model -- and the run that
@@ -1255,7 +1255,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					}
 				}
 				/*
-				 * ⚠ AND THE ROW TERM, on the reading that just
+				 * AND THE ROW TERM, on the reading that just
 				 * returned a whole row. Row 0 contributes
 				 * nothing to it, so it is a control that
 				 * cannot move: a step that changes row 0 is
@@ -1294,7 +1294,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				}
 				unsetenv("CHARSIU_BATCH_ROWSTEP");
 				/*
-				 * ⚠ AND THE INPUT. Row 1 came back the right
+				 * AND THE INPUT. Row 1 came back the right
 				 * magnitude and the wrong number at every row
 				 * step, which is a real dot product of the
 				 * wrong activation rather than a misplaced
@@ -1332,7 +1332,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				}
 				unsetenv("CHARSIU_BATCH_PACK");
 				/*
-				 * ⚠⚠ AND 0x40b8, WHICH IS THE ONE REGISTER
+				 * AND 0x40b8, WHICH IS THE ONE REGISTER
 				 * WITH A KNOWN m DEPENDENCE.
 				 *
 				 * Everything else is now confirmed on this
@@ -1351,7 +1351,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * for int4 and w4_dpu takes over -- and nothing
 				 * has swept it there.
 				 *
-				 * ⚠ Row 0 is the control and it is a real one:
+				 * Row 0 is the control and it is a real one:
 				 * 2048 of 2048, and it has survived twelve row
 				 * steps and three packings without moving.
 				 */
@@ -1383,7 +1383,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				}
 				unsetenv("CHARSIU_DPU_40B8");
 				/*
-				 * ⚠⚠ THE LAST REGISTER THAT COUNTS ROWS, and
+				 * THE LAST REGISTER THAT COUNTS ROWS, and
 				 * the second one on this path chosen at a width
 				 * where it cannot show.
 				 *
@@ -1425,7 +1425,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				}
 				unsetenv("CHARSIU_W4_301C");
 				/*
-				 * ⚠⚠ THE CNA, ONE WORD AT A TIME, AGAINST A
+				 * THE CNA, ONE WORD AT A TIME, AGAINST A
 				 * STREAM THAT PRODUCES TWO ROWS.
 				 *
 				 * Five knobs are swept and settled and row 1 is
@@ -1437,7 +1437,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * own, which is round 260's method.
 				 */
 				/*
-				 * ⚠⚠ IS ROW 1 PRODUCED AT ALL? Ask before
+				 * IS ROW 1 PRODUCED AT ALL? Ask before
 				 * explaining why it is wrong.
 				 *
 				 * Feed both rows the SAME activation. If the
@@ -1493,7 +1493,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						if (fabs(Y[t->n+j] - w1) <= (fabs(w1) > 1e-3 ? fabs(w1)*1e-3 : 1e-3)) ok1++;
 					}
 					/*
-					 * ⚠⚠ A HEALTH CHECK BETWEEN STEPS, and
+					 * A HEALTH CHECK BETWEEN STEPS, and
 					 * this sweep exists because there was
 					 * not one. One override faulted the
 					 * IOMMU, the reset left the block with
@@ -1521,7 +1521,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       ok0, (unsigned)t->n,
 					       ok1, (unsigned)t->n,
 					       well, (unsigned)t->n,
-					       well < t->n ? "   ⚠ THE BLOCK IS GONE, stop reading here"
+					       well < t->n ? "   THE BLOCK IS GONE, stop reading here"
 					       : ok1 > 100 ? "   <== rows appear" : "");
 					if (well < t->n)
 						break;
@@ -1556,7 +1556,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			if (s->pool.id[i] < 0)
 				continue;
 			/*
-			 * ⚠ COUNTED HERE AND NOT OFF `tested`, which is
+			 * COUNTED HERE AND NOT OFF `tested`, which is
 			 * incremented at the BOTTOM of the body and is skipped
 			 * by the `continue` a failed matmul takes. A cap read
 			 * off it would let a width whose matmuls are all being
@@ -1589,7 +1589,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 							(int)t->k);
 					charsiu_act_blocks(&a);
 					/*
-					 * ⚠ int8's matvec READS a->q1 and the
+					 * int8's matvec READS a->q1 and the
 					 * float path does not, so without this
 					 * the reference came back all zeros on
 					 * an int8 model -- and the run that
@@ -1632,7 +1632,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				rows_ok += ok;
 				rows_tot++;
 				/*
-				 * ⚠ NAME THE TENSOR AND THE ROW when a width
+				 * NAME THE TENSOR AND THE ROW when a width
 				 * that is otherwise exact loses a few. m = 8
 				 * comes back 871 of 904 -- 33 rows, not a
 				 * whole tensor and not a whole row of them --
@@ -1641,7 +1641,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * shape, one row index, or scattered. Eight
 				 * lines is enough to tell those apart.
 				 *
-				 * ⚠ FORTY, NOT EIGHT, AND THE ARITHMETIC IS
+				 * FORTY, NOT EIGHT, AND THE ARITHMETIC IS
 				 * WHY. 33 was written down as "every ffn_gate
 				 * and ffn_up in the model, once each" and that
 				 * is 32 -- there is a thirty third miss nobody
@@ -1660,7 +1660,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       (unsigned)t->n, r, mr, rworst);
 					nbad++;
 					/*
-					 * ⚠⚠ WHICH CHANNELS, AND WHOSE SLOT.
+					 * WHICH CHANNELS, AND WHOSE SLOT.
 					 *
 					 * A wrong row is a sum over K slices of
 					 * the n slices that cover it, and the deal
@@ -1720,7 +1720,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 							printf("\n");
 						}
 						/*
-						 * ⚠⚠ WHICH SIDE OF THE BUS. For the
+						 * WHICH SIDE OF THE BUS. For the
 						 * first wrong channels: every slot's
 						 * word for (r, c) as the gather saw
 						 * it, then the same word after the
@@ -1789,7 +1789,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					}
 				}
 				/*
-				 * ⚠⚠ ABSENT OR MISPLACED, ASKED OF THE ROW
+				 * ABSENT OR MISPLACED, ASKED OF THE ROW
 				 * THAT MISSED. The count above says a row is
 				 * wrong and cannot say why, and the two
 				 * answers want different work.
@@ -1810,7 +1810,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 *               the wrong place, and the
 				 *               deduction above is wrong
 				 *
-				 * ⚠ ONE ROW OF ONE TENSOR A WIDTH, AND ON A
+				 * ONE ROW OF ONE TENSOR A WIDTH, AND ON A
 				 * WORK BUDGET. Each wanted value is looked for
 				 * in the whole batch, so the cost is
 				 * (values scanned) * m * n. The whole row at
@@ -1871,7 +1871,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				}
 			}
 			/*
-			 * ⚠⚠ WRONG PLACE OR WRONG NUMBER, which are different
+			 * WRONG PLACE OR WRONG NUMBER, which are different
 			 * faults and the row count above cannot tell apart.
 			 *
 			 * This is the question that cracked the accumulator's
@@ -1903,7 +1903,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				       " are somewhere in the batch\n",
 				       t->name, mr, live, tot);
 				/*
-				 * ⚠ BOTH ROWS OF BOTH PATHS. Row 0 came back
+				 * BOTH ROWS OF BOTH PATHS. Row 0 came back
 				 * exact and the run still agreed on nothing,
 				 * so the question is what row 1 is: a copy of
 				 * row 0 means the activation was packed once,
@@ -1922,7 +1922,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					printf("\n");
 				}
 				/*
-				 * ⚠ AND WHERE THE MISSING ONES ARE. 74% present
+				 * AND WHERE THE MISSING ONES ARE. 74% present
 				 * with row 0 exact says the loss is not spread
 				 * evenly, and a per row count says which row
 				 * lost them.
@@ -1946,7 +1946,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       r, have, (unsigned)t->n);
 				}
 				/*
-				 * ⚠⚠ AND WHERE EACH ONE LANDED, which is the
+				 * AND WHERE EACH ONE LANDED, which is the
 				 * permutation itself rather than a count of it.
 				 *
 				 * This is what npu_gemm_test --read does for
@@ -1958,19 +1958,19 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * output surface mapped at m > 1. This is that
 				 * map, on the real path, with the real weights.
 				 *
-				 * ⚠ Y IS ALREADY READ THROUGH charsiu_acc_index.
+				 * Y IS ALREADY READ THROUGH charsiu_acc_index.
 				 * The table below is therefore the permutation
 				 * that is LEFT after this tree's read order, so
 				 * "landed at (r, c) itself" is what correct
 				 * looks like and anything else is the residue.
 				 *
-				 * ⚠ THE WHOLE OF ROW 0, not its first six.
+				 * THE WHOLE OF ROW 0, not its first six.
 				 * Round 381 sampled six, saw 0 1 2 3 8 9, and
 				 * had to explain afterwards why a layout that
 				 * fit them scored 15 of 128. Six cannot say
 				 * where a pattern stops.
 				 *
-				 * ⚠ AND HOW TRUSTWORTHY IT IS. Every row
+				 * AND HOW TRUSTWORTHY IT IS. Every row
 				 * reports the FIRST slot holding the value, so
 				 * a value the reference produces twice gives
 				 * one answer out of two and reads like one out
@@ -1978,7 +1978,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 * for exactly that reason.
 				 */
 				/*
-				 * ⚠⚠ POSITION BY POSITION FIRST, because the
+				 * POSITION BY POSITION FIRST, because the
 				 * search below is fuzzy and this is not.
 				 *
 				 * "Is the value somewhere in the batch" matches
@@ -2022,7 +2022,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 						       first);
 				}
 				/*
-				 * ⚠ AN OFFLINE SWEEP OF THE READ ORDER WAS
+				 * AN OFFLINE SWEEP OF THE READ ORDER WAS
 				 * WRITTEN HERE AND REMOVED, and the reason is
 				 * worth keeping.
 				 *
@@ -2048,7 +2048,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 				 */
 				{
 					size_t uniq = 0, q, o;
-					/* ⚠ NOT A MULTIPLE OF 32, or every sampled
+					/* NOT A MULTIPLE OF 32, or every sampled
 					 * channel has a = 0 and the half that is
 					 * wrong is never looked at. The last round
 					 * stepped by 64 and every one of its 32
@@ -2075,7 +2075,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 					       "(row,ch)", "want", "landed at",
 					       "hits", "correct is (row,ch) itself");
 					/*
-					 * ⚠ THE FIRST 64 CHANNELS IN FULL, then
+					 * THE FIRST 64 CHANNELS IN FULL, then
 					 * a coarse tail. The structure repeats
 					 * every 32 -- a is (c%32)/16 and t is
 					 * c%16 -- so one pair of super groups
@@ -2123,7 +2123,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		if (!tested)
 			continue;
 		/*
-		 * ⚠ GB/s, BECAUSE A SPEEDUP CANNOT SAY WHETHER THERE IS ROOM
+		 * GB/s, BECAUSE A SPEEDUP CANNOT SAY WHETHER THERE IS ROOM
 		 * LEFT. 3.73x against a one row loop sounds finished; the same
 		 * run at 1.3 GB/s against a 9.5 GB/s hardware path says most of
 		 * the time is not the hardware at all.
@@ -2136,14 +2136,14 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			charsiu_npu_batch_split(s->pool.dev, &pk, &sb, &fn, &rd, 1);
 			pr = charsiu_npu_batch_prep(s->pool.dev, 1);
 			al = charsiu_npu_batch_alloc(s->pool.dev, &an, 1);
-			/* ⚠ RESET IT TOO, or this per width row keeps a whole
+			/* RESET IT TOO, or this per width row keeps a whole
 			 * run's tail scale while its other four segments are
 			 * cleared each iteration -- two counters in one line
 			 * disagreeing about what they cover, which is the
 			 * exact shape of the bug the note above records. */
 			sc = charsiu_npu_batch_scale(s->pool.dev, 1);
 			/*
-			 * ⚠ AND WHAT IS STILL MISSING. The five segments are
+			 * AND WHAT IS STILL MISSING. The five segments are
 			 * printed with the remainder beside them, because the
 			 * four of them came to 451 ms of a 606 ms matmul and
 			 * nobody noticed until the shares were added up by
@@ -2152,7 +2152,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 			 * third.
 			 */
 			/*
-			 * ⚠ THE TENSOR COUNT IS A FRACTION, ALWAYS. An
+			 * THE TENSOR COUNT IS A FRACTION, ALWAYS. An
 			 * uncapped row reads 225/225 and a capped one 8/225,
 			 * so the two can never be confused for each other by
 			 * anyone reading a single pasted line.
@@ -2172,7 +2172,7 @@ int llama_batch_probe(struct llama_state *s, const struct llama_model *m,
 		}
 		rc = 0;
 	}
-	printf("\n  ⚠ a speed with rows that do not agree is the speed of a"
+	printf("\n  a speed with rows that do not agree is the speed of a"
 	       " wrong answer.\n  the bar is relative and 1e-3: these are float"
 	       " sums of thousands of\n  terms in two orders and will not be bit"
 	       " identical.\n");
@@ -2197,13 +2197,13 @@ static void act_set_timed(struct charsiu_act *a, const float *x, int n)
 }
 
 /*
- * ⚠ THE REALISERS ARE TIMED TOO, and they have to be. Once the work became
+ * THE REALISERS ARE TIMED TOO, and they have to be. Once the work became
  * lazy, timing only charsiu_act_set would read 0.00 whether the quantisation
  * VANISHED or merely MOVED to a fallback -- and those are the two answers this
  * number exists to tell apart. The instrument follows the work.
  */
 /*
- * ⚠⚠ THE UNTIMED BRANCH CALLS THE REAL FUNCTION, NOT ITSELF. Both of these
+ * THE UNTIMED BRANCH CALLS THE REAL FUNCTION, NOT ITSELF. Both of these
  * recursed instead, which is one word in a wrapper whose whole body is four
  * lines, and it was fatal in one place and silent in the other.
  *
@@ -2271,7 +2271,7 @@ static int npu_mode(void)
 }
 
 /*
- * ⚠ THE BODY OF THIS MOVED TO src/npupool.c, so that a graph which is not the
+ * THE BODY OF THIS MOVED TO src/npupool.c, so that a graph which is not the
  * language model can stage a weight the same way. What is left is the shape the
  * rest of this file calls it in.
  */
@@ -2325,7 +2325,7 @@ static int group_off(void)
 }
 
 /*
- * ⚠⚠ THE PER CALL COST IS CHARGED TO THE CALL, SO THE GATE BELONGS ON THE CALL
+ * THE PER CALL COST IS CHARGED TO THE CALL, SO THE GATE BELONGS ON THE CALL
  * AND NOT ON THE TENSOR.
  *
  * npudev fits about 78 us a call before a byte has moved, so a dispatch can be
@@ -2337,13 +2337,13 @@ static int group_off(void)
  * reads what inp_gate wrote. Six fences a layer against gemma3's four: 70 extra
  * a token, for 27.5 MMAC of work.
  *
- * ⚠ A TENSOR GATE WOULD HAVE BROKEN THE PAIR. gemma4's attn_k and attn_v are
+ * A TENSOR GATE WOULD HAVE BROKEN THE PAIR. gemma4's attn_k and attn_v are
  * 256 x 1536 -- the SAME shape as inp_gate, to the element -- so a rule keyed
  * on the tensor refuses k and v as well, and those two ride q's fence for free.
  * Summing the pair is what tells the two cases apart: q, k and v together are
  * 3.9 MMAC and stay.
  *
- * ⚠ THIS REFUSES THE DISPATCH, NOT THE STAGING. The quantised copy is still
+ * THIS REFUSES THE DISPATCH, NOT THE STAGING. The quantised copy is still
  * built and the fallback multiplies with it (npu_matvec, not gguf_matvec), so
  * both arms do the same arithmetic on the same numbers and the tokens have to
  * be identical. That is also what makes the A/B clean: same memory, same load
@@ -2470,7 +2470,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	}
 
 	/*
-	 * ⚠ REALISE BEFORE THE FAN OUT, not inside the kernels: gguf_matvec and
+	 * REALISE BEFORE THE FAN OUT, not inside the kernels: gguf_matvec and
 	 * npu_matvec both run on the pool, and filling a shared buffer from
 	 * four threads would be a race. Everything below this line is a
 	 * FALLBACK -- the hardware path returned above -- so it is also the
@@ -2532,7 +2532,7 @@ static void rmsnorm(float *out, const float *x, const struct gguf_tensor *g,
 	 */
 	{
 		/*
-		 * ⚠⚠ _Thread_local, AND IT COST A WRONG ANSWER TO FIND OUT.
+		 * _Thread_local, AND IT COST A WRONG ANSWER TO FIND OUT.
 		 *
 		 * This scratch was a plain function static, which is safe for
 		 * exactly as long as nothing calls rmsnorm from two threads.
@@ -2570,7 +2570,7 @@ static int fast_softmax(void)
 }
 
 /*
- * ⚠⚠ THE LAST SCALAR expf LOOP IN THE ATTENTION, with charsiu_vexpq sitting
+ * THE LAST SCALAR expf LOOP IN THE ATTENTION, with charsiu_vexpq sitting
  * in the header this file already includes.
  *
  * The serial split of a batched prompt on the board: scores 3.26, softmax
@@ -2585,12 +2585,12 @@ static int fast_softmax(void)
  * instead of dividing n times. CHARSIU_EXACT_SOFTMAX is the arm that says
  * whether any of that moved a token.
  *
- * ⚠ Short rows stay scalar. The first positions of a prompt softmax over one
+ * Short rows stay scalar. The first positions of a prompt softmax over one
  * or two elements, and a vector prologue for those is slower than the loop it
  * replaces.
  */
 /*
- * ⚠ THE SCALE RIDES ALONG, AND IT COSTS NOTHING BECAUSE IT IS POSITIVE.
+ * THE SCALE RIDES ALONG, AND IT COSTS NOTHING BECAUSE IT IS POSITIVE.
  *
  * Attention wants softmax(x * scale) and used to get it by multiplying the
  * row through first -- a whole extra pass over the row, read and write, and
@@ -2599,13 +2599,13 @@ static int fast_softmax(void)
  * max(x) * s, and the multiply then folds into the exponential pass's
  * existing load. Four passes a row become three.
  *
- * ⚠ AND IT IS BIT IDENTICAL, not merely close. The old form stored x[i] * s
+ * AND IT IS BIT IDENTICAL, not merely close. The old form stored x[i] * s
  * and read it back; an fp32 product is exactly representable in fp32, so the
  * store and reload changed nothing, and the subtraction is the same two
  * operands either way. scale = 1.0f is an exact identity, which is what makes
  * softmax() a wrapper rather than a second implementation.
  *
- * ⛔ A NEGATIVE OR ZERO SCALE WOULD BREAK THE max IDENTITY. Attention's is
+ * A NEGATIVE OR ZERO SCALE WOULD BREAK THE max IDENTITY. Attention's is
  * 1/sqrt(head_dim); the wrapper's is 1.
  */
 static void softmax_scaled(float *x, int n, float scale)
@@ -2674,7 +2674,7 @@ static void softmax(float *x, int n)
 }
 
 /*
- * ⭐⭐ THE SAME SOFTMAX, READING x AND WRITING HALVES, with the exponentials
+ * THE SAME SOFTMAX, READING x AND WRITING HALVES, with the exponentials
  * kept in a small scratch instead of going back where they came from.
  *
  * The scores matmul leaves m by npad floats in the device buffer, the softmax
@@ -2683,7 +2683,7 @@ static void softmax(float *x, int n)
  * tokens the values group's pack alone is 152 ms -- and none of it needs to
  * reach DRAM twice: `tmp` is one row, four kilobytes, and stays in cache.
  *
- * ⚠ THE ARITHMETIC IS UNCHANGED, WHICH IS THE ONLY REASON THE TEXT CAN BE.
+ * THE ARITHMETIC IS UNCHANGED, WHICH IS THE ONLY REASON THE TEXT CAN BE.
  * The shipped path computes exp into the row, normalises the row in float,
  * and the pack converts `exp * inv`. This computes exp into tmp, normalises
  * tmp in float, and converts `exp * inv`. Same value, same rounding, same
@@ -2731,7 +2731,7 @@ static void softmax_scaled_half(const float *x, float *tmp, uint16_t *dst,
 			sum += tmp[i];
 		}
 		inv = 1.0f / sum;
-		/* ⚠ ONE WALK, NOT TWO. Normalising the scratch in place and
+		/* ONE WALK, NOT TWO. Normalising the scratch in place and
 		 * then converting it reads and writes every element twice for
 		 * no reason; the scratch is not read again after this. The
 		 * arithmetic is unchanged, which tests/softmax_half.c holds
@@ -2754,7 +2754,7 @@ static void softmax_scaled_half(const float *x, float *tmp, uint16_t *dst,
 }
 
 /*
- * ⚠ THE TWO SOFTMAXES AGAINST EACH OTHER, on a desk, to the last bit.
+ * THE TWO SOFTMAXES AGAINST EACH OTHER, on a desk, to the last bit.
  *
  * softmax_scaled_half exists so the values pack does not have to read back
  * what the softmax just wrote, and it is a second copy of that arithmetic by
@@ -2821,7 +2821,7 @@ int charsiu_softmax_half_selftest(void)
  * interleaved (2i, 2i+1) one, and the runtime rotates interleaved. For qwen2,
  * qwen3 and phi3 it does not permute, so the runtime has to rotate halves.
  *
- * ⚠ THE WRONG PAIRING STILL PRODUCES WORDS. Every element is still rotated by
+ * THE WRONG PAIRING STILL PRODUCES WORDS. Every element is still rotated by
  * an angle from the right table, just partnered with the wrong neighbour, so
  * the output stays inside the model's vocabulary and reads as English -- it
  * just loses track of position and repeats. That is what "the the capital of
@@ -2891,7 +2891,7 @@ static void qk_norm(float *v, uint32_t nheads, uint32_t hd,
 	if (!gain)
 		return;
 	/*
-	 * ⚠ NO GAIN IS A REAL CASE, not a missing argument. gemma4 normalises
+	 * NO GAIN IS A REAL CASE, not a missing argument. gemma4 normalises
 	 * V with a bare RMS and no weight at all, so a NULL here means one
 	 * rather than nothing.
 	 */
@@ -2930,7 +2930,7 @@ static void qk_norm(float *v, uint32_t nheads, uint32_t hd,
 }
 
 /*
- * ⚠⚠ THE SAME NORM WITH THE GAIN ALREADY IN HAND, BECAUSE qk_norm CANNOT BE
+ * THE SAME NORM WITH THE GAIN ALREADY IN HAND, BECAUSE qk_norm CANNOT BE
  * CALLED FROM TWO THREADS.
  *
  * qk_norm keeps the dequantised gain in a `static` -- the buffer, its length,
@@ -3018,7 +3018,7 @@ static int subtensor(struct gguf_tensor *dst, const struct gguf_tensor *src,
 		return -1;
 	*dst = *src;
 	/*
-	 * ⚠ A SLICE NEEDS ITS OWN NAME. The weight cache is keyed on name, n
+	 * A SLICE NEEDS ITS OWN NAME. The weight cache is keyed on name, n
 	 * and k, and phi3's three slices of attn_qkv agree on all three: q's
 	 * weights would come back for k and for v. Nothing reads it today
 	 * because the cache is opt-in, which is exactly the kind of bug that
@@ -3044,7 +3044,7 @@ int llama_load(struct llama_model *m, const char *path)
 		return -1;
 
 	/*
-	 * ⚠ AWQ NEEDS A FILE AND NOTHING POINTED AT ONE.
+	 * AWQ NEEDS A FILE AND NOTHING POINTED AT ONE.
 	 *
 	 * The factor is built from mean |x_k| recorded by a calibration pass
 	 * and read back through CHARSIU_AWQ_STATS. With that unset, npuquant
@@ -3074,16 +3074,16 @@ int llama_load(struct llama_model *m, const char *path)
 
 	gguf_get_str(&m->gguf, "general.architecture", arch, sizeof(arch));
 	/*
-	 * ⚠ qwen2 RUNS ON THE LLAMA GRAPH. Read out of the files rather than
+	 * qwen2 RUNS ON THE LLAMA GRAPH. Read out of the files rather than
 	 * assumed: Qwen2.5-1.5B-Instruct declares the same nine weights a
 	 * layer under the same names, ties its output head to the embedding
 	 * the way Llama 3.2 1B does, and carries no softcapping or sliding
 	 * window key at all. The whole difference is a bias on Q, K and V.
 	 *
-	 * ⚠ THE ARCH NAME IS ALSO THE KEY PREFIX, so it has to stay whatever
+	 * THE ARCH NAME IS ALSO THE KEY PREFIX, so it has to stay whatever
 	 * the file said: qwen2.embedding_length, not llama.embedding_length.
 	 *
-	 * ⚠ qwen3 IS THE SAME GRAPH AGAIN, with the biases gone and a norm on
+	 * qwen3 IS THE SAME GRAPH AGAIN, with the biases gone and a norm on
 	 * Q and K instead. It is also the first one here whose head is not
 	 * n_embd / n_head: 16 heads of 128 against an embedding of 1024.
 	 *
@@ -3127,7 +3127,7 @@ int llama_load(struct llama_model *m, const char *path)
 
 			m->ff_arr = ff;
 			/*
-			 * ⚠ THE LARGEST, not the first. Every buffer
+			 * THE LARGEST, not the first. Every buffer
 			 * below is sized from m->n_ff and the widest
 			 * layer is the one that has to fit; taking
 			 * arr[0] gives 6144 where a later layer wants
@@ -3159,7 +3159,7 @@ int llama_load(struct llama_model *m, const char *path)
 		goto fail;
 	}
 	/*
-	 * ⚠ READ attention.key_length RATHER THAN TRUSTING rope.dimension_count
+	 * READ attention.key_length RATHER THAN TRUSTING rope.dimension_count
 	 * TO BE THE HEAD. They agree on every architecture here -- qwen3 rotates
 	 * the whole head -- but they are different questions, and a model that
 	 * rotates part of a head would size the KV cache wrong if this used the
@@ -3177,13 +3177,13 @@ int llama_load(struct llama_model *m, const char *path)
 	m->attn_scale = 1.0f / sqrtf((float)m->head_dim);
 	m->n_layer_kv = m->n_layer;
 	/*
-	 * ⚠ BY ARCHITECTURE, and there is no key in the file that says it --
+	 * BY ARCHITECTURE, and there is no key in the file that says it --
 	 * llama.cpp carries the same thing as a switch over the architecture
 	 * enum. llama and smollm3 are the permuted, interleaved ones; qwen2,
 	 * qwen3 and phi3 are not.
 	 */
 	/*
-	 * ⚠ EVERY BUFFER TAKES THE WIDER HEAD. gemma4's window layers are 256
+	 * EVERY BUFFER TAKES THE WIDER HEAD. gemma4's window layers are 256
 	 * where its full ones are 512, and q, the KV cache and xb are one
 	 * allocation each for all of them.
 	 */
@@ -3216,7 +3216,7 @@ int llama_load(struct llama_model *m, const char *path)
 	 */
 	m->embd_scale = 1.0f;
 	/*
-	 * ⚠ 10000, NOT rope_base, WHEN THE FILE DOES NOT SAY. gemma-3-1b-it
+	 * 10000, NOT rope_base, WHEN THE FILE DOES NOT SAY. gemma-3-1b-it
 	 * carries sliding_window but no rope.freq_base_swa, and llama.cpp's
 	 * gemma3 path -- unlike its gemma2, olmo2 and cohere2 paths -- does
 	 * NOT seed the field from the model's own base first, so it keeps the
@@ -3240,14 +3240,14 @@ int llama_load(struct llama_model *m, const char *path)
 	} while (0)
 	GETU("attention.sliding_window", m->n_swa, 0);
 	/*
-	 * ⚠ THE PATTERN COUNTS FROM THE WINDOW LAYERS. llama.cpp's
+	 * THE PATTERN COUNTS FROM THE WINDOW LAYERS. llama.cpp's
 	 * set_swa_pattern is `il % n < n - 1`, so with the gemma default of 6
 	 * layers 0..4 slide and layer 5 sees everything -- five windows and a
 	 * full one, not one window in six.
 	 */
 	GETU("attention.sliding_window_pattern", m->swa_pattern, 6);
 	/*
-	 * ⚠⚠ gemma4 WRITES THE SAME KEY AS AN ARRAY, one flag a layer, where
+	 * gemma4 WRITES THE SAME KEY AS AN ARRAY, one flag a layer, where
 	 * gemma3 writes a scalar period. llama.cpp reads it with
 	 * get_key_or_arr into is_swa_impl[] for exactly that reason.
 	 *
@@ -3298,7 +3298,7 @@ int llama_load(struct llama_model *m, const char *path)
 		uint32_t v2;
 
 		/*
-		 * ⚠ gemma4 SETS THE ATTENTION SCALE TO ONE. Its python is
+		 * gemma4 SETS THE ATTENTION SCALE TO ONE. Its python is
 		 * `self.scaling = 1.0`; the factor that would be 1/sqrt(head)
 		 * is folded into the QK norms instead. Leaving 1/sqrt(head)
 		 * here does not crash and does not read as wrong -- it
@@ -3306,7 +3306,7 @@ int llama_load(struct llama_model *m, const char *path)
 		 */
 		m->attn_scale = 1.0f;
 		/*
-		 * ⚠ THE KEY IS embedding_length_per_layer_INPUT. llama.cpp's
+		 * THE KEY IS embedding_length_per_layer_INPUT. llama.cpp's
 		 * LLM_KV_EMBEDDING_LENGTH_PER_LAYER renders to that string, and
 		 * the shorter name it reads like is in no file.
 		 */
@@ -3316,7 +3316,7 @@ int llama_load(struct llama_model *m, const char *path)
 			v2 = 0;
 		m->n_embd_pl = v2;
 		/*
-		 * ⚠ A WINDOW LAYER MAY HAVE A SHORTER HEAD. gemma4 declares
+		 * A WINDOW LAYER MAY HAVE A SHORTER HEAD. gemma4 declares
 		 * attention.key_length_swa on its own, and the KV cache has to
 		 * be sized for whichever of the two is larger.
 		 */
@@ -3325,7 +3325,7 @@ int llama_load(struct llama_model *m, const char *path)
 			v2 = m->head_dim;
 		m->head_dim_swa = v2;
 		/*
-		 * ⚠ THE LAYERS PAST THIS SHARE AN EARLIER LAYER'S KV, and have
+		 * THE LAYERS PAST THIS SHARE AN EARLIER LAYER'S KV, and have
 		 * no wk or wv of their own. The key counts the SHARED ones, so
 		 * the first that shares is n_layer minus it.
 		 */
@@ -3337,7 +3337,7 @@ int llama_load(struct llama_model *m, const char *path)
 	}
 	if (!strcmp(arch, "gemma3") || !strcmp(arch, "gemma4")) {
 		/*
-		 * ⚠ sqrt(n_embd) ON THE EMBEDDING, and it is not a detail: at
+		 * sqrt(n_embd) ON THE EMBEDDING, and it is not a detail: at
 		 * n_embd 1152 it is a factor of 34, so leaving it out feeds
 		 * the first norm a vector 34 times too small.
 		 *
@@ -3351,7 +3351,7 @@ int llama_load(struct llama_model *m, const char *path)
 	}
 
 	/*
-	 * ⚠ SAY WHICH MODEL, because the output is the only clue otherwise. A
+	 * SAY WHICH MODEL, because the output is the only clue otherwise. A
 	 * board decoding nonsense looked like a broken runtime until it turned
 	 * out to be a particular file; the name and the architecture would have
 	 * said so on the first line. The basename only: the full path is in the
@@ -3381,12 +3381,12 @@ int llama_load(struct llama_model *m, const char *path)
 
 	m->rope_freqs = gguf_tensor(&m->gguf, "rope_freqs.weight");
 	/*
-	 * ⚠ phi3 CALLS THEM SOMETHING ELSE, and has two sets: short factors for
+	 * phi3 CALLS THEM SOMETHING ELSE, and has two sets: short factors for
 	 * a context within its original 4096 and long ones beyond. rope_table
 	 * already divides theta by factor[i] over hd/2, which is exactly the
 	 * 48 floats phi3 stores, so the short set plugs straight in.
 	 *
-	 * ⚠ Only the short set. A context past the original length wants the
+	 * Only the short set. A context past the original length wants the
 	 * long one and would be wrong here; charsiu's default is 2048 and this
 	 * refuses to pretend otherwise.
 	 */
@@ -3416,7 +3416,7 @@ int llama_load(struct llama_model *m, const char *path)
 		struct llama_layer *L = &m->layers[l];
 
 		/*
-		 * ⚠ RESOLVE THE WINDOW FLAG ONCE, HERE. The forward pass asks
+		 * RESOLVE THE WINDOW FLAG ONCE, HERE. The forward pass asks
 		 * it every layer of every token and there are two ways a file
 		 * can say it; deciding in the loop would put the two forms in
 		 * the hot path and in two places.
@@ -3436,13 +3436,13 @@ int llama_load(struct llama_model *m, const char *path)
 				 (l % m->swa_pattern) < m->swa_pattern - 1;
 		}
 		/*
-		 * ⚠ WHOSE KV THIS LAYER READS. gemma4's last few layers carry
+		 * WHOSE KV THIS LAYER READS. gemma4's last few layers carry
 		 * no wk or wv and attend against the last layer that had them.
 		 * -1 is "its own", which is every layer of everything else.
 		 */
 		L->kv_from = -1;
 		/*
-		 * ⚠ THE LAYER'S OWN SHAPES, resolved here so the forward pass
+		 * THE LAYER'S OWN SHAPES, resolved here so the forward pass
 		 * reads a field instead of a rule. Everything before gemma4
 		 * takes the model's, which is what the fallback is.
 		 */
@@ -3492,7 +3492,7 @@ int llama_load(struct llama_model *m, const char *path)
 			L->up = &L->split[4];
 		} else if (!strcmp(arch, "gemma4")) {
 			/*
-			 * ⚠ ONLY wq IS ALWAYS THERE.
+			 * ONLY wq IS ALWAYS THERE.
 			 *
 			 * gemma4's last layers share an earlier layer's KV and
 			 * carry no attn_k at all; and attn_v is optional in
@@ -3510,7 +3510,7 @@ int llama_load(struct llama_model *m, const char *path)
 			if (L->wv && !L->wv->nbytes)
 				L->wv = NULL;
 			/*
-			 * ⚠⚠ THE LAST LAYER OF THE SAME KIND, not simply the
+			 * THE LAST LAYER OF THE SAME KIND, not simply the
 			 * last one.
 			 *
 			 * gemma4 keeps two caches, one for its window layers
@@ -3567,7 +3567,7 @@ int llama_load(struct llama_model *m, const char *path)
 		OW(attn_post_norm, "post_attention_norm");
 		OW(ffn_post_norm, "post_ffw_norm");
 		/*
-		 * ⚠ gemma4 only, and the names are SHORTER than the model wide
+		 * gemma4 only, and the names are SHORTER than the model wide
 		 * ones they belong to: per_layer_token_embd and
 		 * per_layer_model_proj sit at the top level, but a layer's
 		 * three are blk.N.inp_gate, blk.N.proj and blk.N.post_norm.
@@ -3583,7 +3583,7 @@ int llama_load(struct llama_model *m, const char *path)
 		OW(rope_freqs, "rope_freqs");
 #undef OW
 		/*
-		 * ⚠ EXCEPT WHERE THERE IS NO K. gemma4's shared KV layers carry
+		 * EXCEPT WHERE THERE IS NO K. gemma4's shared KV layers carry
 		 * neither attn_k nor attn_k_norm, and layer 15 of E2B is the
 		 * first of them, so the symmetry this checks is the wrong
 		 * symmetry there: it is q_norm against a K THAT EXISTS.
@@ -3594,7 +3594,7 @@ int llama_load(struct llama_model *m, const char *path)
 			goto fail;
 		}
 		/*
-		 * ⚠ REFUSE A MIXTURE OF EXPERTS RATHER THAN COMPUTE HALF OF IT.
+		 * REFUSE A MIXTURE OF EXPERTS RATHER THAN COMPUTE HALF OF IT.
 		 *
 		 * A gemma4 MoE layer runs a dense MLP and an expert branch in
 		 * PARALLEL and adds them. The dense half is the nine weights
@@ -3654,7 +3654,7 @@ static uint32_t state_widest(const struct llama_model *m)
 }
 
 /*
- * ⚠⚠ A WIDER K SLICE IS FREE ON SOME MODELS AND BUYS QUALITY ON OTHERS, and
+ * A WIDER K SLICE IS FREE ON SOME MODELS AND BUYS QUALITY ON OTHERS, and
  * which one a model is can be read off two integers.
  *
  * The read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
@@ -3664,7 +3664,7 @@ static uint32_t state_widest(const struct llama_model *m)
  * CHARSIU_NPU_W4_GROUP move together, and moving them changes how the weights
  * were quantised.
  *
- * ⚠ EXCEPT WHERE THEY WERE NEVER GROUPED. npuquant falls back to one scale a
+ * EXCEPT WHERE THEY WERE NEVER GROUPED. npuquant falls back to one scale a
  * row when K % group is non-zero. A model whose every K misses every candidate
  * width is on that per-row path at all of them, so widening changes the
  * SLICING and not one weight -- and the board says so: gemma-3-1b (1152, 6912)
@@ -3672,7 +3672,7 @@ static uint32_t state_widest(const struct llama_model *m)
  * Phi-3.5 (3072, 8192) and SmolLM2-1.7B (2048, 8192) degraded, the latter to
  * "cold.  .  .  .  ." at 4096.
  *
- * ⚠ AND THE COUNTING PROMPT COULD NOT SEE ANY OF THAT. An earlier round swept
+ * AND THE COUNTING PROMPT COULD NOT SEE ANY OF THAT. An earlier round swept
  * KMAX with "1 2 3 ... 256" and reported text identical on all eight models,
  * because continuing a count is the least quantisation sensitive thing a
  * language model does. The degradation above was found only once the probe
@@ -3685,7 +3685,7 @@ static uint32_t state_widest(const struct llama_model *m)
 static void llama_auto_kmax(const struct llama_model *m)
 {
 	/*
-	 * ⚠ 2048 ONLY, AND 4096 IS DELIBERATELY NOT HERE. Phase 13 put the
+	 * 2048 ONLY, AND 4096 IS DELIBERATELY NOT HERE. Phase 13 put the
 	 * batched path against the model's own token loop at 1024, 2048, 3072
 	 * and 4096, on the three models whose K divides none of them -- so the
 	 * quantiser emits the same bytes across the sweep and only the slicing
@@ -3705,7 +3705,7 @@ static void llama_auto_kmax(const struct llama_model *m)
 	 *
 	 * 2048 is also what the vendor uses for 81% of its own int4 dispatches.
 	 *
-	 * ⚠⚠ AND IT IS THE OPTIMUM, NOT A COMPROMISE, under the surface ceiling
+	 * AND IT IS THE OPTIMUM, NOT A COMPROMISE, under the surface ceiling
 	 * npudev enforces: (slice / 32) * m <= 5120, so a wider slice buys
 	 * itself a narrower chunk. Scored on Qwen2.5-1.5B, where read work is
 	 * sum over tensors of ceil(K / KMAX) * n and does not depend on m:
@@ -3735,7 +3735,7 @@ static void llama_auto_kmax(const struct llama_model *m)
 		return;                 /* asked for by hand, leave it alone */
 
 	/*
-	 * ⚠⚠ SET THE BASELINE FIRST, ALWAYS, BEFORE DECIDING ANYTHING. Falling
+	 * SET THE BASELINE FIRST, ALWAYS, BEFORE DECIDING ANYTHING. Falling
 	 * out of this function without setting them does NOT leave 1024: the
 	 * code defaults are CHARSIU_NPU_KMAX 4096 in npudev.c and, in
 	 * npuquant.c, a group of k -- one absmax over a whole row. No board
@@ -3751,7 +3751,7 @@ static void llama_auto_kmax(const struct llama_model *m)
 	setenv("CHARSIU_NPU_W4_GROUP", "1024", 1);
 
 	/*
-	 * ⚠ THE WIDENING IS ON, AND WHAT TURNED IT ON WAS ONE PHASE. Phase 13
+	 * THE WIDENING IS ON, AND WHAT TURNED IT ON WAS ONE PHASE. Phase 13
 	 * compares the batched path against the model's own TOKEN LOOP at each
 	 * width -- phases 10 and 12 compare batched against batched and are
 	 * blind to a batched-path fault by construction, which is how a wide
@@ -3782,7 +3782,7 @@ static void llama_auto_kmax(const struct llama_model *m)
 	if (m->n_ff)
 		k[nk++] = m->n_ff;
 	/*
-	 * ⚠⚠ EVERY LAYER'S OWN WIDTH, NOT THE MODEL'S. gemma4 gives each layer
+	 * EVERY LAYER'S OWN WIDTH, NOT THE MODEL'S. gemma4 gives each layer
 	 * its own feed_forward_length -- 6144 for its first fifteen and 12288
 	 * after -- and the model wide n_ff is only the fallback. Checking that
 	 * one number would clear a model whose per layer widths include a
@@ -3855,7 +3855,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	s->vcache = calloc(kvn, sizeof(float));
 	s->x   = calloc(m->n_embd, sizeof(float));
 	/*
-	 * ⚠ xb IS BOTH the normalised embedding and the attention output, and
+	 * xb IS BOTH the normalised embedding and the attention output, and
 	 * those are two different widths. Attention writes n_head * head_dim,
 	 * which on qwen3 is larger than n_embd; sizing this by n_embd alone
 	 * was correct for three architectures and is a heap overflow on the
@@ -3906,7 +3906,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	}
 
 	/*
-	 * ⚠⚠ charsiu_env_flag, BECAUSE `CHARSIU_NPU=0` USED TO OPEN THE NPU.
+	 * charsiu_env_flag, BECAUSE `CHARSIU_NPU=0` USED TO OPEN THE NPU.
 	 *
 	 * This was `if (getenv("CHARSIU_NPU"))` -- an existence test, so the
 	 * one spelling anybody would reach for to turn the device OFF turned it
@@ -3921,7 +3921,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	 * every board round sets.
 	 */
 	/*
-	 * ⚠⚠ THE HOST REFERENCE MEASURES AN UNGROUPED QUANTISER UNLESS TOLD
+	 * THE HOST REFERENCE MEASURES AN UNGROUPED QUANTISER UNLESS TOLD
 	 * OTHERWISE, AND FOR A LONG TIME NOBODY SAID SO.
 	 *
 	 * llama_auto_kmax() pins KMAX and W4_GROUP to 1024, and it is called
@@ -3968,7 +3968,7 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 			fprintf(stderr, "charsiu: no NPU; staying on the CPU\n");
 		} else {
 			/*
-			 * ⚠ SAY HOW MANY ARE COMING. Staging is about twenty
+			 * SAY HOW MANY ARE COMING. Staging is about twenty
 			 * seconds of silence and the heartbeat below only
 			 * counts up, so a caller drawing a progress bar
 			 * has no denominator. Seven projections a layer --
@@ -4004,7 +4004,7 @@ void llama_state_free(struct llama_state *s)
 	free(s->plb);
 	free(s->plc);
 	/*
-	 * ⚠ THE BATCHED PREFILL'S ROWS WERE NEVER FREED. They are allocated
+	 * THE BATCHED PREFILL'S ROWS WERE NEVER FREED. They are allocated
 	 * lazily on the first prompt that takes that path and nothing here ever
 	 * mentioned them -- six buffers, and at a 32 row chunk of a wide feed
 	 * forward that is megabytes a state. It never showed because a run
@@ -4048,7 +4048,7 @@ void llama_state_free(struct llama_state *s)
 
 				snprintf(xp, sizeof(xp), "%s.x",
 					 getenv("CHARSIU_CALIB"));
-				/* ⚠ truncate on the FIRST tensor that writes, not on tensor 0:
+				/* truncate on the FIRST tensor that writes, not on tensor 0:
 				 * keyed on i, a run whose first tensor has no vectors
 				 * appends to the previous run's file. */
 				xf = fopen(xp, xwrote++ ? "ab" : "wb");
@@ -4090,7 +4090,7 @@ void llama_state_free(struct llama_state *s)
 	if (s->pool.dev) {
 		charsiu_npu_report(s->pool.dev);
 		/*
-		 * ⚠ llama had NO batched breakdown at all. The five counters
+		 * llama had NO batched breakdown at all. The five counters
 		 * behind this have existed since they were written with no
 		 * caller anywhere, and vision and whisper reach them only
 		 * through charsiu_pool_report, which nothing on this path
@@ -4137,7 +4137,7 @@ static const char *stage_name[ST_N] = {
 static double stage_ms[ST_N];
 static unsigned stage_tok;
 /*
- * ⚠ THE BATCHED PROMPT HAD NO STAGES. The fourteen above are the token
+ * THE BATCHED PROMPT HAD NO STAGES. The fourteen above are the token
  * loop's; batch_layers, which is where every prompt token goes, was never
  * instrumented, so on a board where Qwen3's prompt takes 1298 ms and its
  * batched matmul entry about 300 of them, nothing had ever said where the
@@ -4149,7 +4149,7 @@ static unsigned bstage_rows, bstage_chunks;
 /* the serial block arm's attention, in three parts: scores, softmax, values */
 static double battn_ms[3];
 /*
- * ⚠ THE MATMUL STAGES WERE TWICE THE NPU ENTRY. Phase 9 on the board,
+ * THE MATMUL STAGES WERE TWICE THE NPU ENTRY. Phase 9 on the board,
  * 2026-09-04, Qwen3: the seven projection rows of the batched stage table
  * summed to 12.3 ms a row while the NPU's own batched entry reported 5.8, and
  * the 6.4 between them had no name -- a third of the prompt. A projection the
@@ -4172,7 +4172,7 @@ void llama_stages_reset(void)
 }
 
 /*
- * ⚠⚠ STDERR, AND IT USED TO BE STDOUT. Three rounds tonight compared md5 sums
+ * STDERR, AND IT USED TO BE STDOUT. Three rounds tonight compared md5 sums
  * of `charsiu_run ... 2>/dev/null` and got four different hashes from one
  * binary, because this table -- milliseconds and all -- was printed on the
  * same stream as the generated text, interleaved with it. Neither redirecting
@@ -4216,7 +4216,7 @@ void llama_stages_report(void)
 			       battn_ms[0] / bstage_rows, battn_ms[1] / bstage_rows,
 			       battn_ms[2] / bstage_rows);
 		/*
-		 * ⚠⚠ AND WHAT THE 60% INSIDE THE NPU ENTRY IS MADE OF, because
+		 * AND WHAT THE 60% INSIDE THE NPU ENTRY IS MADE OF, because
 		 * "the matmuls" is not an answer anybody can act on.
 		 *
 		 * The entry packs the activation, submits, waits, and reads
@@ -4232,7 +4232,7 @@ void llama_stages_report(void)
 		if (bmm_calls && bmm_dev) {
 			double pk, sb, fn, rd;
 
-			/* ⚠ reset = 0. npudev prints its own report AFTER
+			/* reset = 0. npudev prints its own report AFTER
 			 * this one and reads the same four counters; resetting
 			 * here left it dividing by what was left over, and its
 			 * "57 ms submitting and waiting" against a fence of
@@ -4243,7 +4243,7 @@ void llama_stages_report(void)
 						&rd, 0);
 			double ga, pc;
 			/*
-			 * ⚠ THE FIFTH SEGMENT, which bench_batch has printed
+			 * THE FIFTH SEGMENT, which bench_batch has printed
 			 * since it was written and this table never did. Qwen3
 			 * left 0.36 ms a row unaccounted here against Llama's
 			 * 0.04, and the difference is layer count: `prep` is
@@ -4254,7 +4254,7 @@ void llama_stages_report(void)
 			 */
 			double pr = charsiu_npu_batch_prep(bmm_dev, 0);
 			/*
-			 * ⚠ THE SIXTH SEGMENT, AND int8 IS WHY IT NEEDED ONE.
+			 * THE SIXTH SEGMENT, AND int8 IS WHY IT NEEDED ONE.
 			 *
 			 * charsiu_npu_batch_scale has existed as long as the
 			 * pool's own report, which has printed it all along;
@@ -4279,7 +4279,7 @@ void llama_stages_report(void)
 			       (bmm_entry_ms - pk - sb - fn - rd - sc - pr)
 			       / bstage_rows);
 			/*
-			 * ⚠⚠ THE FENCE BY WIDTH, INSIDE ONE RUN OF ONE MODEL.
+			 * THE FENCE BY WIDTH, INSIDE ONE RUN OF ONE MODEL.
 			 *
 			 * Dividing each model's MACs a row by its fence gives
 			 * 0.72 TMAC/s on Llama (widest 8192), 0.37 on Qwen3
@@ -4314,7 +4314,7 @@ void llama_stages_report(void)
 			       ga / bstage_rows, pc / bstage_rows,
 			       (pk - ga - pc) / bstage_rows);
 			/*
-			 * ⚠⚠ AND WHAT `packer` IS MADE OF, which has never been
+			 * AND WHAT `packer` IS MADE OF, which has never been
 			 * printed on this path.
 			 *
 			 * npudev.c has split it since 2026-09-04 and says why:
@@ -4338,7 +4338,7 @@ void llama_stages_report(void)
 				charsiu_npu_batch_pack_split(bmm_dev, &em,
 							     &fi, 0);
 				/*
-				 * ⚠ THESE SPLIT `the rest`, NOT `packer`.
+				 * THESE SPLIT `the rest`, NOT `packer`.
 				 * npudev's tpe starts AFTER bpackcall_us is
 				 * banked, so emit and fini do not overlap the
 				 * packer call at all -- and the board agrees to
@@ -4357,7 +4357,7 @@ void llama_stages_report(void)
 						fi / bstage_rows);
 			}
 			/*
-			 * ⚠ AND OF THE FENCE, when the probe was asked for.
+			 * AND OF THE FENCE, when the probe was asked for.
 			 * prep_bo waits and then invalidates the whole output
 			 * buffer, so this row says how much of "fence" was the
 			 * hardware and how much was cache maintenance the read
@@ -4413,7 +4413,7 @@ static inline float attn_dot(const float *qh, const float *kt, uint32_t hd)
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 	/*
-	 * ⚠ OPT OUT ONLY. A dot product is a reduction and four lanes add it
+	 * OPT OUT ONLY. A dot product is a reduction and four lanes add it
 	 * up in a different ORDER; that is a last bit, and a last bit moved a
 	 * token on the host. It did not on the board in round 370, and it is
 	 * the default since 372. CHARSIU_EXACT_ATTN goes back.
@@ -4514,14 +4514,14 @@ static inline void attn_dot4(const float *qh, const float *k0, const float *k1,
 }
 
 /*
- * ⚠⚠ EIGHT POSITIONS, AND IT IS BIT EXACT WITH THE FOUR WIDE FORM.
+ * EIGHT POSITIONS, AND IT IS BIT EXACT WITH THE FOUR WIDE FORM.
  *
  * The values half is 47% of attention on Llama and attention is 30% of a
  * prefilled row, and this loop is not FMA bound: per four output floats it does
  * four multiplies, four adds, four V loads and ONE LOAD AND STORE OF THE
  * OUTPUT. Widening the group halves that output traffic per multiply.
  *
- * ⚠ AND IT CHANGES NO ARITHMETIC. The additions still happen in the order a0,
+ * AND IT CHANGES NO ARITHMETIC. The additions still happen in the order a0,
  * a1, a2 ... -- what goes away is a store and a reload of a float32 between the
  * fourth and the fifth, and a float32 that goes to memory and comes back is the
  * same float32. The multiplies keep the barrier that stops the compiler
@@ -4575,7 +4575,7 @@ static int attn_axpy8_on(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_AXPY8");
 
-		/* ⚠ ON. Llama's attention 2.34 -> 2.16 and Qwen3's 8.13 ->
+		/* ON. Llama's attention 2.34 -> 2.16 and Qwen3's 8.13 ->
 		 * 7.60, with both models' text md5 unchanged on the board and
 		 * tests/axpy8 finding no shape out of 520 that differs in a
 		 * bit. CHARSIU_ATTN_AXPY8=0 is the control. */
@@ -4642,7 +4642,7 @@ struct attn_job {
 	 */
 	int t0;
 	/*
-	 * ⚠ hd IS THIS LAYER'S HEAD AND hdmax IS THE CACHE'S STRIDE, and on
+	 * hd IS THIS LAYER'S HEAD AND hdmax IS THE CACHE'S STRIDE, and on
 	 * gemma4 they differ: its window layers have a 256 long head and its
 	 * full ones 512, while the KV cache is one allocation with one stride
 	 * for all of them. Indexing the cache by the live head would make
@@ -4650,7 +4650,7 @@ struct attn_job {
 	 */
 	uint32_t hd, hdmax, kvdim, gqa, nkv;
 	/*
-	 * ⚠ THE QUERY, EXPLICIT. attn_heads read s->q, which made the caller's
+	 * THE QUERY, EXPLICIT. attn_heads read s->q, which made the caller's
 	 * job to have put this row's roped q there -- a per row scratch buffer
 	 * the batched loop only filled by copying a row of s->bq into it and
 	 * copying it back afterwards. With the rope done in place that copy is
@@ -4663,7 +4663,7 @@ struct attn_job {
 };
 
 /*
- * ⚠ ONE PASS OVER THE KV CACHE PER GROUP, NOT PER HEAD.
+ * ONE PASS OVER THE KV CACHE PER GROUP, NOT PER HEAD.
  *
  * This model has 32 query heads and 8 key/value heads, so four queries share
  * every kv row -- and the loop below used to walk the whole cache once for each
@@ -4747,7 +4747,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 
 		for (q = 0; q < n; q++) {
 			/*
-			 * ⚠ SOFTMAX OVER THE WINDOW, not over the cache. The
+			 * SOFTMAX OVER THE WINDOW, not over the cache. The
 			 * positions before t0 were never scored, so including
 			 * them would normalise against whatever the buffer
 			 * happens to hold from an earlier token.
@@ -4770,7 +4770,7 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 }
 
 /*
- * ⚠⚠ THE BATCHED PROMPT'S ATTENTION, SEVERAL ROWS A PASS OVER THE CACHE.
+ * THE BATCHED PROMPT'S ATTENTION, SEVERAL ROWS A PASS OVER THE CACHE.
  *
  * Phase 9 on the board, 2026-09-03, a 915 token prompt: attention was 72% of
  * Qwen3's prefill, 61% of tinyllama's, 43% of Phi-3.5's -- 33 ms a row on
@@ -4797,7 +4797,7 @@ static int attn_block_rows(void)
 		const char *e = getenv("CHARSIU_ATTN_BLOCK");
 
 		/*
-		 * ⚠ EIGHT ROWS A PASS, ON THE POOL, AND THE BOARD IS WHY, TWICE.
+		 * EIGHT ROWS A PASS, ON THE POOL, AND THE BOARD IS WHY, TWICE.
 		 *
 		 * The block alone was SLOWER: 44 ms a row on Qwen3 against 33 a
 		 * row at a time (phase 9, 2026-09-03), slower on four models
@@ -4824,7 +4824,7 @@ static int attn_block_rows(void)
 		 * L1 is. 0 is the row-at-a-time control; the pool is
 		 * CHARSIU_ATTN_BLOCK_POOL=0 to switch off on its own.
 		 *
-		 * ⚠ AND 8 WAS SWEPT, 2026-09-05, board_attn_block.sh -- because
+		 * AND 8 WAS SWEPT, 2026-09-05, board_attn_block.sh -- because
 		 * "the axpy's traffic through L1" above predicts a wider block
 		 * keeps winning, and it does not. ms a row, two passes each,
 		 * alternating, governor pinned, text identical at every block:
@@ -4858,7 +4858,7 @@ static int attn_block_rows(void)
 }
 
 /*
- * ⚠ ITS OWN NAME. CHARSIU_ATTN_POOL already exists and gates the TOKEN
+ * ITS OWN NAME. CHARSIU_ATTN_POOL already exists and gates the TOKEN
  * loop's attention, the one round 368 measured at 22.70 ms a token pooled
  * against 7.75 serial; an arm that set it to test this would have slowed
  * decode in the same run and read the two together.
@@ -4895,7 +4895,7 @@ struct attn_block_job {
  * same window, attn_axpy in ascending t.
  */
 /*
- * ⚠⚠ THE UNIT IS (HEAD, ROW BLOCK), NOT THE HEAD, AND THE HEAD COUNT IS WHY.
+ * THE UNIT IS (HEAD, ROW BLOCK), NOT THE HEAD, AND THE HEAD COUNT IS WHY.
  *
  * This pooled over heads, so the threads only divide evenly when the head
  * count does. Over the models on the card that is not a detail:
@@ -4912,7 +4912,7 @@ struct attn_block_job {
  * cache and writes its own rows -- so the unit is their product, which is
  * n_head * ceil(n/R) and is 192 on qwen3 at a 90 row chunk. That divides.
  *
- * ⚠ THE SCRATCH HAD TO FOLLOW. `sc` was indexed by head, which is only safe
+ * THE SCRATCH HAD TO FOLLOW. `sc` was indexed by head, which is only safe
  * while one worker owns a whole head; it is indexed by the flat (h, rb) unit
  * now, so the buffer grows by ceil(n/R). CHARSIU_ATTN_HR=0 is the old
  * head-only split, in the same binary, because a change that reorders work
@@ -5030,7 +5030,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
 					/*
-					 * ⚠ THE PARTIAL WINDOW GOES ONE
+					 * THE PARTIAL WINDOW GOES ONE
 					 * POSITION AT A TIME AND THAT IS NOT A
 					 * DIFFERENT ANSWER: every form here
 					 * adds a0, a1, a2 ... in that order,
@@ -5064,7 +5064,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 }
 
 /*
- * ⚠⚠ ATTENTION ON THE NPU, IN FP16, WHICH IS HOW THE VENDOR RUNS IT.
+ * ATTENTION ON THE NPU, IN FP16, WHICH IS HOW THE VENDOR RUNS IT.
  *
  * 56% of what the vendor's own model file asks this hardware to do is fp16,
  * and 2908 of those dispatches carry oc = head_dim. charsiu has run attention
@@ -5084,7 +5084,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
  * fence: 2 waits a layer where a loop would pay 2H. That is the whole reason
  * the group exists; the board measured 8 to 19x for it.
  *
- * ⚠ THE TWO CACHES ARE SHAPED DIFFERENTLY AND ONLY ONE MAY GROW.
+ * THE TWO CACHES ARE SHAPED DIFFERENTLY AND ONLY ONE MAY GROW.
  *
  * A GROUP offset does not depend on n while every group of 16 output channels
  * is full, and always depends on k. For the K cache a POSITION is an output
@@ -5095,11 +5095,11 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
  * (see xtri0, and the paragraph below). That costs
  * a fetch of the whole V surface every call and buys never repacking.
  *
- * ⚠ WHY THE PROBABILITIES SIT IN A SCRATCH WHOSE ROWS ARE THE CONTEXT LENGTH
+ * WHY THE PROBABILITIES SIT IN A SCRATCH WHOSE ROWS ARE THE CONTEXT LENGTH
  * APART. They are the values matmul's activation, and that matmul runs at
  * k = the context length, so a row must BE that long.
  *
- * ⚠⚠ AND WHAT MAKES THE TAIL ZERO MOVED, 2026-09-13. This paragraph used to
+ * AND WHAT MAKES THE TAIL ZERO MOVED, 2026-09-13. This paragraph used to
  * say the scratch is zeroed once at allocation, rewritten only inside
  * [0, npad), and that "the softmax below masks to [tlo, pos] and zeroes the
  * rest" -- and the second half of that stopped being true when the trailing
@@ -5131,7 +5131,7 @@ static const char *const an_reason[AN_R_N] = {
 
 struct attn_npu {
 	/*
-	 * ⚠⚠ TWO HANDLES ON ONE DEVICE, AND THE REASON IS THE CACHE SYNCS.
+	 * TWO HANDLES ON ONE DEVICE, AND THE REASON IS THE CACHE SYNCS.
 	 *
 	 * charsiu_bo_prep and _fini are dma_sync over a WHOLE buffer object,
 	 * and charsiu_fp16's `want` grows its five buffers and never shrinks
@@ -5147,7 +5147,7 @@ struct attn_npu {
 	 * buffer object. charsiu_fp16_open_on borrows the device, so the
 	 * second handle costs no second file descriptor.
 	 *
-	 * ⚠ THE K SURFACES BELONG TO f AND THE V SURFACES TO fv, because a
+	 * THE K SURFACES BELONG TO f AND THE V SURFACES TO fv, because a
 	 * job names the buffers it reads by handle and a handle is per file.
 	 */
 	struct charsiu_fp16 *f;        /* the scores matmul: q . K */
@@ -5158,7 +5158,7 @@ struct attn_npu {
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
 	unsigned n_layer, nkv, hd, nk, kv, mmax;
 	/*
-	 * ⚠⚠ kv IS THE V SURFACE'S REDUCTION EXTENT AND IT USED TO BE THE
+	 * kv IS THE V SURFACE'S REDUCTION EXTENT AND IT USED TO BE THE
 	 * CONTEXT LENGTH FOR THE LIFE OF THE RUN.
 	 *
 	 * The values matmul runs at k = kv whatever the prompt has reached, so
@@ -5180,7 +5180,7 @@ struct attn_npu {
 	 * will ask for; see attn_reserve_mode */
 	int reserved;
 	/*
-	 * ⚠⚠ "FELL BACK ON 0" WAS TRUE AND MEANT NOTHING. `fallbacks` counts
+	 * "FELL BACK ON 0" WAS TRUE AND MEANT NOTHING. `fallbacks` counts
 	 * the two charsiu_fp16_matmul_group failures and nothing else, while
 	 * five earlier `return -1`s send a layer to the CPU without touching
 	 * any counter. On gemma-4 that read "ran 77 layers and fell back on 0"
@@ -5194,7 +5194,7 @@ struct attn_npu {
 	 */
 	unsigned long refused[AN_R_N];
 	/*
-	 * ⚠⚠ THE LAYER'S OWN HEAD, BESIDE a->hd WHICH IS THE CACHE'S STRIDE.
+	 * THE LAYER'S OWN HEAD, BESIDE a->hd WHICH IS THE CACHE'S STRIDE.
 	 *
 	 * They are the same number on every model but gemma4, whose window
 	 * layers are 256 long and whose full ones are 512 -- and m->head_dim
@@ -5213,7 +5213,7 @@ struct attn_npu {
 	unsigned *lhd;                      /* [n_layer], this layer's head */
 	unsigned char *dirty;               /* a layer with unflushed appends */
 	/*
-	 * ⚠⚠ HOW MANY POSITIONS EACH LAYER'S MIRROR ACTUALLY HOLDS.
+	 * HOW MANY POSITIONS EACH LAYER'S MIRROR ACTUALLY HOLDS.
 	 *
 	 * The decode path used to append here as well, deliberately, so that a
 	 * prompt continued after a generation would not read a cache with a
@@ -5229,7 +5229,7 @@ struct attn_npu {
 	 */
 	unsigned *packed;                   /* [n_layer], positions mirrored */
 	unsigned long layers, fallbacks;
-	/* ⚠ MEASURED, NOT SUBTRACTED. The softmax between the two matmuls was
+	/* MEASURED, NOT SUBTRACTED. The softmax between the two matmuls was
 	 * bounded at first by taking the stage table's attention and removing
 	 * what charsiu_fp16_times accounts for -- which is a residual, and
 	 * this tree has been wrong three times in one day by calling one a
@@ -5238,20 +5238,20 @@ struct attn_npu {
 	/* and the rest of the layer, so "attention minus what is accounted"
 	 * is never again a number anybody reasons from */
 	double t_layer, t_kv, t_pack1, t_pack2;
-	/* ⚠ OUTSIDE t_layer ON PURPOSE: a growth is not a layer's work,
+	/* OUTSIDE t_layer ON PURPOSE: a growth is not a layer's work,
 	 * it is the ladder's, and charging it to the layer is what would
 	 * hide a step that buys extent and pays for it in repacks. */
 	double t_grow, t_grow_alloc;
 	/* set the moment one growth has to fall back to the packer,
 	 * so the line above names the path that was actually run */
 	unsigned grow_packed;
-	/* ⚠ HOW MANY SURFACES A RUNG MOVED WITHOUT ALLOCATING ONE. The
+	/* HOW MANY SURFACES A RUNG MOVED WITHOUT ALLOCATING ONE. The
 	 * difference between this and n_layer * n_kv a rung is what the
 	 * ladder still pays the allocator, and a reader who cannot see the
 	 * split will read a cheap rung and an expensive one the same way. */
 	unsigned long inplace;
 	/*
-	 * ⭐ ONE ROW OF EXPONENTIALS PER OP, so the softmax's intermediate
+	 * ONE ROW OF EXPONENTIALS PER OP, so the softmax's intermediate
 	 * never reaches DRAM. FP16_GROUP_MAX rows of kvmax floats, which at a
 	 * 1024 context is 128 kB, and the pool splits the values pack one op
 	 * to a worker so no two workers share a row.
@@ -5261,7 +5261,7 @@ struct attn_npu {
 };
 
 /*
- * ⚠⚠ OFF, auto, OR ON -- AND OFF IS THE DEFAULT FOR A REASON THAT IS NOT SPEED.
+ * OFF, auto, OR ON -- AND OFF IS THE DEFAULT FOR A REASON THAT IS NOT SPEED.
  *
  * fp16 attention on the NPU is now a large win on a wide head and a loss on a
  * narrow one, and the board has four points, monotone in head_dim:
@@ -5273,7 +5273,7 @@ struct attn_npu {
  *
  * A wider head is a wider matmul and this hardware wants width.
  *
- * ⚠⚠ AND THAT IS ONLY HALF A RULE, WHICH `auto` SHIPPED AS THOUGH IT WERE THE
+ * AND THAT IS ONLY HALF A RULE, WHICH `auto` SHIPPED AS THOUGH IT WERE THE
  * WHOLE ONE. Every number above is a 916 or 918 token prompt. On the vendor's
  * protocol -- a 110 token prompt and 64 generated tokens -- the same gate turns
  * the same models ON and LOSES:
@@ -5294,20 +5294,20 @@ struct attn_npu {
  * between. `auto` is withdrawn until it is, because a threshold placed between
  * two points eight times apart is the chunk formula again.
  *
- * ⚠ AND IT IS OFF BY DEFAULT FOR A SEPARATE REASON: it is not bit exact.
+ * AND IT IS OFF BY DEFAULT FOR A SEPARATE REASON: it is not bit exact.
  * Everything else turned on in this tree today shipped on a hash that did not
  * move. This computes attention in fp16 where the CPU computes it in fp32, so
  * the text can differ, and that is a call about the answer, not the clock.
  */
 /*
- * ⭐ THE OTHER HALF OF THE RULE IS A LENGTH, AND IT IS MEASURED NOW.
+ * THE OTHER HALF OF THE RULE IS A LENGTH, AND IT IS MEASURED NOW.
  *
  * `auto` was withdrawn because "head_dim >= 128" was only half of it. r400
  * then measured the other half and got a NEGATIVE answer at head_dim 64: the
  * NPU arm was 1.19 to 1.23 times the CPU arm over an eight-fold range of
  * prompt length, FLAT, and a flat ratio has no crossover to find.
  *
- * ⚠ THAT ANSWER WAS ABOUT THE CODE, NOT THE HARDWARE, and r401 overturned it.
+ * THAT ANSWER WAS ABOUT THE CODE, NOT THE HARDWARE, and r401 overturned it.
  * The ratio was flat because the fp16 path's per-element costs -- the pack,
  * the poison, the readback, the softmax between the two matmuls -- grew with
  * the prompt exactly as the CPU arm's arithmetic does. With those on the pool
@@ -5317,7 +5317,7 @@ struct attn_npu {
  *     tokens     52     102     202     452     852
  *     NPU/CPU  1.202   1.182   1.133   1.043   0.967
  *
- * ⚠ AND THE CROSSOVER MOVES EVERY TIME THE ARM GETS FASTER, so the number
+ * AND THE CROSSOVER MOVES EVERY TIME THE ARM GETS FASTER, so the number
  * here is dated, not derived. Giving each attention matmul its own fp16
  * handle -- so neither sizes the other's buffers for the cache syncs -- moved
  * it again within the same day:
@@ -5332,7 +5332,7 @@ struct attn_npu {
  * clock pinned. The threshold has been re-derived from this curve four times
  * in one day, which is the point: it is a DATED NUMBER, not a derived one.
  *
- * ⚠ 448 WAS THE NEAREST ROUND NUMBER BELOW THE SHORTEST LENGTH MEASURED TO
+ * 448 WAS THE NEAREST ROUND NUMBER BELOW THE SHORTEST LENGTH MEASURED TO
  * WIN, AND IT IS 320 NOW. The 448 reading came from a sweep whose CPU column
  * was the EMPTY environment -- which stopped being the CPU arm the moment
  * `auto` became the default, so at 452 and up it was the NPU arm in both
@@ -5345,12 +5345,12 @@ struct attn_npu {
  *        352     2534   2510..2553       2390   2386..2396   +5.7%    1.7%
  *        452     3402   3359..3415       3036   3026..3044  +10.8%    1.6%
  *
- * ⚠ THE SPREAD COLUMN IS PART OF THE READING. 302 is ahead in all four pairs
+ * THE SPREAD COLUMN IS PART OF THE READING. 302 is ahead in all four pairs
  * and its margin is the size of the noise on the arm it is measured against,
  * so it is level and 320 sits above it. 352 is the shortest length where the
  * margin clears the spread.
  *
- * ⛔⛔ AND 320 HAD THE DEFECT 448 HAD. It came from r412 section 2, which the
+ * AND 320 HAD THE DEFECT 448 HAD. It came from r412 section 2, which the
  * round's own header says ran on the r411 shipping binary with nothing
  * rebuilt -- and section 7 of the SAME round landed the in place ladder, which
  * makes this arm faster at every length it is on. Nobody re-ran the threshold.
@@ -5358,7 +5358,7 @@ struct attn_npu {
  * in that round's section 10, and neither fired, because both halves were
  * right separately and only the ORDER was wrong.
  *
- * 🏁 RE-MEASURED ON THE ARM THAT SHIPS (r413, commit 58d2d360d971, three GQA
+ * RE-MEASURED ON THE ARM THAT SHIPS (r413, commit 58d2d360d971, three GQA
  * models, three repeats an arm alternating, one boot):
  *
  *     tokens   Llama-3.2-1B   Qwen3-0.6B   gemma-3-1b
@@ -5367,16 +5367,16 @@ struct attn_npu {
  *        302         +5.9%        +6.6%        +7.4%
  *        352         +7.7%       +11.6%        +9.7%
  *
- * ⚠⚠ GRADED AGAINST 2.5% AND NOT AGAINST THE SPREAD THIS TABLE PRINTS. Three
+ * GRADED AGAINST 2.5% AND NOT AGAINST THE SPREAD THIS TABLE PRINTS. Three
  * readings put the spread at 0.2 to 1.7%; twenty readings of ONE arm at one
  * length on one boot, changing nothing, put it at 2.5% (r413 section 5). Three
  * samples underestimate it, so the floor is the honest test and 252 is inside
  * it on two of the three models. 272 is the shortest length where all three
  * clear, and that is why this is 272 and not 256.
  *
- * ⚠ If this arm gets faster again, re-measure. Do not scale this number.
+ * If this arm gets faster again, re-measure. Do not scale this number.
  *
- * ⚠ AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
+ * AND IT IS LENGTH ONLY, with no head_dim clause, even though r395 found
  * the NPU arm ahead at head_dim 256 -- with the SLOWER code. That inference
  * still holds (nothing here touches the CPU arm, so a faster NPU arm cannot
  * have lost ground), but "still ahead" is not a crossover length, and this
@@ -5399,12 +5399,12 @@ static unsigned attn_npu_mmax_cap(void)
 }
 
 /*
- * ⚠⚠ THE LADDER OVERSHOOTS AND THE HINT SAYS BY HOW MUCH. kv doubles, so a
+ * THE LADDER OVERSHOOTS AND THE HINT SAYS BY HOW MUCH. kv doubles, so a
  * 852 token prompt finishes its prefill on the 1024 rung and every row from
  * position 512 on pays a reduction extent 19% longer than any of them needs.
  * The vendor's own file grows this length in steps of 32 instead.
  *
- * ⛔ AND THE OBVIOUS FIX IS THE WRONG ONE: starting kv AT the prompt total is
+ * AND THE OBVIOUS FIX IS THE WRONG ONE: starting kv AT the prompt total is
  * SLOWER, not faster. Cost is the sum of kv over positions, so a ladder that
  * begins at 864 charges the first 512 rows 864 apiece where the doubling one
  * charges them 32, 64, ... 512 -- 736k units against 523k, 1.4x worse. What
@@ -5416,7 +5416,7 @@ static unsigned attn_npu_mmax_cap(void)
  * optimum sits between "few repacks, much overshoot" and the vendor's 32 is a
  * board question and not an arithmetic one.
  */
-/* ⚠ SEPARATE FROM THE STEP, so an arm can be exactly today: step 200, cap
+/* SEPARATE FROM THE STEP, so an arm can be exactly today: step 200, cap
  * off. Two knobs on one line is how a sweep stops being able to name which
  * half moved. */
 static int attn_npu_kv_cap_on(void)
@@ -5487,7 +5487,7 @@ static unsigned attn_npu_min_tokens(void)
 }
 
 /*
- * ⛔⛔ AND A MODEL THAT SHARES NO KV HEAD IS A DIFFERENT QUESTION, WHICH IS
+ * AND A MODEL THAT SHARES NO KV HEAD IS A DIFFERENT QUESTION, WHICH IS
  * WHY IT GETS ITS OWN ANSWER AND NOT A SCALED ONE.
  *
  * r412, 352 tokens, three repeats an arm, arms alternating, one boot:
@@ -5503,12 +5503,12 @@ static unsigned attn_npu_min_tokens(void)
  * head, and the attention it buys is done per QUERY head. A model that shares
  * nothing pays the whole mirror for the least work.
  *
- * ⚠ AND THE QUANTITATIVE VERSION OF THAT STORY IS DEAD. "Crossover scales as
+ * AND THE QUANTITATIVE VERSION OF THAT STORY IS DEAD. "Crossover scales as
  * 1/gqa" was written down before the rows ran and predicted Qwen3 (gqa 2)
  * would lose at 352. It wins by 7.7%. So this is not a scaled threshold. It
  * is a SECOND one, measured on the two models that have it.
  *
- * ⛔⛔ AND THE FIRST ANSWER TO THIS WAS A REFUSAL, WHICH WAS WRONG WITHIN THE
+ * AND THE FIRST ANSWER TO THIS WAS A REFUSAL, WHICH WAS WRONG WITHIN THE
  * HOUR. It turned the arm off for gqa 1 outright, on the ground that no
  * measured length had it winning -- true of the arm as it stood, and the
  * sentence names its own expiry. The in place ladder landed, nobody re-asked,
@@ -5520,11 +5520,11 @@ static unsigned attn_npu_min_tokens(void)
  *                    851   12859 -> 10358  +19.4%, spread 2.5%
  *
  * 452 is the shortest measured win for both, so 448, by the same rule that
- * puts the other threshold at 320. ⚠ That it is the SAME 448 this round spent
+ * puts the other threshold at 320. That it is the SAME 448 this round spent
  * its morning removing is a coincidence and not a vindication: the sweep that
  * produced the old one compared an arm against itself at exactly that length.
  *
- * ⚠ IT IS TWO MODELS, both 32/32. A gqa 1 model with four heads has never
+ * IT IS TWO MODELS, both 32/32. A gqa 1 model with four heads has never
  * been run, and 352 is a loss for both of these, so the number below is a
  * floor that has been measured from both sides and nothing more.
  */
@@ -5553,7 +5553,7 @@ static unsigned attn_npu_min_for(const struct llama_model *m)
 }
 
 /*
- * ⭐ AND auto IS THE DEFAULT NOW, WHICH IS THE FIRST TIME THIS ARM HAS BEEN ON
+ * AND auto IS THE DEFAULT NOW, WHICH IS THE FIRST TIME THIS ARM HAS BEEN ON
  * WITHOUT BEING ASKED FOR.
  *
  * Ten models on one board, 852 token prompt, clock pinned, auto against the
@@ -5571,14 +5571,14 @@ static unsigned attn_npu_min_for(const struct llama_model *m)
  * loses outside noise, every one is text identical to the CPU arm, and none
  * of the ten refuses a single layer.
  *
- * ⚠ TWO OF THOSE TEN REACH THIS ARM ONLY FROM 448 TOKENS UP, and the table is
+ * TWO OF THOSE TEN REACH THIS ARM ONLY FROM 448 TOKENS UP, and the table is
  * kept because it is what was measured. Phi-3.5-mini and SmolLM2-1.7B share no
  * KV head, and r412 found them 15.9% and 11.2% BEHIND the CPU arm at 352
  * tokens and 15.3% and 19.4% AHEAD of it at 852; attn_npu_min_for gives them
  * their own threshold. Their rows above are the two at the top of the "did not
  * win" list, which is the same fact read at one length with a slower arm.
  *
- * ⚠ AND THE TWO THINGS A DEFAULT HAS TO ANSWER THAT SPEED DOES NOT:
+ * AND THE TWO THINGS A DEFAULT HAS TO ANSWER THAT SPEED DOES NOT:
  *
  *   quality  perplexity on tests/corpus/long.txt, batched, Llama-3.2-1B Q4_0:
  *            40.9987 off, 40.9213 on, reproduced exactly twice. Deterministic,
@@ -5586,13 +5586,13 @@ static unsigned attn_npu_min_for(const struct llama_model *m)
  *            -- but it is not a cost either, which is the question.
  *   memory   peak 1474 -> 1459 MB on Llama, 2671 -> 2670 on gemma-4.
  *
- * ⚠ BELOW THE THRESHOLD auto AND off RUN THE SAME CODE. attn_npu_get returns
+ * BELOW THE THRESHOLD auto AND off RUN THE SAME CODE. attn_npu_get returns
  * NULL before the mirror is built, so a short prompt is not "about the same
  * speed", it is the same path. That is what makes a default defensible from
  * one board: the change is confined to prompts long enough to have been
  * measured winning.
  *
- * ⚠ AND IT ONLY REACHES A CALLER THAT SAYS HOW LONG THE PROMPT IS. `auto`
+ * AND IT ONLY REACHES A CALLER THAT SAYS HOW LONG THE PROMPT IS. `auto`
  * needs llama_prefill_hint; a tool that does not call it gets 0 and stays on
  * the CPU arm. That is a deliberate rollout and not an oversight.
  *
@@ -5621,7 +5621,7 @@ static int attn_npu_want_for(unsigned head_dim)
 
 
 /*
- * ⚠⚠ A SIMULATION, AND IT MAKES NOTHING FASTER.
+ * A SIMULATION, AND IT MAKES NOTHING FASTER.
  *
  * r404 measured what an int8 or int4 KV surface would be worth on the
  * hardware -- 2.4x on the scores matmul, 1.8x on the values one -- and that is
@@ -5635,7 +5635,7 @@ static int attn_npu_want_for(unsigned head_dim)
  * surface would hold, and then leaves them as floats. Perplexity then measures
  * the damage with nothing else changed.
  *
- * ⚠ It is applied BEFORE the mirror is appended as well, so both attention
+ * It is applied BEFORE the mirror is appended as well, so both attention
  * arms see the same numbers. A simulation that only one arm sees would compare
  * two changes at once.
  */
@@ -5654,7 +5654,7 @@ static int kv_bits(void)
 }
 
 /*
- * ⚠⚠ AND THE V SURFACE'S SCALE LIVES ON THE OTHER AXIS, which is what r406
+ * AND THE V SURFACE'S SCALE LIVES ON THE OTHER AXIS, which is what r406
  * flagged and what this answers.
  *
  * The coefficient buffer holds one scale per OUTPUT CHANNEL. For the scores
@@ -5672,7 +5672,7 @@ static int kv_bits(void)
  * The shadow is why: the cache itself holds rounded values by then, and
  * re-rounding a rounded value is not the same operation.
  *
- * ⚠ It is a simulation and it makes nothing faster. CHARSIU_KV_V_AXIS=chan.
+ * It is a simulation and it makes nothing faster. CHARSIU_KV_V_AXIS=chan.
  */
 static int kv_v_chan(void)
 {
@@ -5720,7 +5720,7 @@ static void kv_round_chan(struct llama_state *s, const struct llama_model *m,
 			mx[d] = a;
 		if (mx[d] == 0.0f)
 			continue;
-		/* ⚠ EVERY EARLIER POSITION OF THIS CHANNEL, from the shadow.
+		/* EVERY EARLIER POSITION OF THIS CHANNEL, from the shadow.
 		 * A real surface repacks when its scale moves, and the cache
 		 * holds rounded values by now. */
 		if (grew) {
@@ -5813,7 +5813,7 @@ static void attn_npu_free(struct attn_npu *a)
 				a->inplace,
 				(a->nrung - 1) * a->n_layer * a->nkv);
 		}
-		/* ⚠ BY REASON, because "refused 308" is the number that made
+		/* BY REASON, because "refused 308" is the number that made
 		 * gemma-4 look like a head_dim 512 measurement when 28 of its
 		 * 35 layers are head_dim 256 and never reached the hardware. */
 		for (r = 0; r < AN_R_N; r++)
@@ -5821,7 +5821,7 @@ static void attn_npu_free(struct attn_npu *a)
 				fprintf(stderr, "charsiu:   %-12s %lu\n",
 					an_reason[r], a->refused[r]);
 	}
-	/* ⚠ BEFORE THE BUFFERS GO. A layer that gave up mid group left a job
+	/* BEFORE THE BUFFERS GO. A layer that gave up mid group left a job
 	 * writing into an output buffer this is about to free. */
 	charsiu_fp16_drain(a->f);
 	charsiu_fp16_drain(a->fv);
@@ -5833,7 +5833,7 @@ static void attn_npu_free(struct attn_npu *a)
 		if (a->vb)
 			charsiu_fp16_w_free(a->fv, a->vb[i]);
 	}
-	/* ⚠ fv FIRST. It BORROWS f's device, and charsiu_fp16_close on the
+	/* fv FIRST. It BORROWS f's device, and charsiu_fp16_close on the
 	 * owner closes that device -- the other order frees fv's buffer
 	 * objects through a file descriptor that is already shut. Same rule
 	 * for the second pair: every borrower before the owner. */
@@ -5855,7 +5855,7 @@ static void attn_npu_free(struct attn_npu *a)
 }
 
 /*
- * ⚠ ONE ATTEMPT, THEN NEVER AGAIN. Opening the device and allocating a few
+ * ONE ATTEMPT, THEN NEVER AGAIN. Opening the device and allocating a few
  * hundred buffer objects is not something to retry a token at a time, so a
  * refusal is recorded in the handle and every later call reads it.
  */
@@ -5873,7 +5873,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 
 	if (s->anpu)
 		return s->anpu->off ? NULL : s->anpu;
-	/* ⚠ the model FIRST, because `auto` is a decision about its head_dim
+	/* the model FIRST, because `auto` is a decision about its head_dim
 	 * and there is nothing to decide without it */
 	if (!m)
 		return NULL;
@@ -5884,7 +5884,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		if (!want)
 			return NULL;
 		/*
-		 * ⚠⚠ THE DECISION IS HERE, BEFORE THE MIRROR EXISTS, AND THAT
+		 * THE DECISION IS HERE, BEFORE THE MIRROR EXISTS, AND THAT
 		 * IS THE WHOLE POINT. r401 put the length test inside
 		 * attn_npu_layer instead and measured it: at 202 tokens every
 		 * threshold cost 107 ms MORE than the CPU arm while refusing
@@ -5893,7 +5893,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		 * mirror itself. A refusal that leaves the cost behind is not
 		 * a refusal.
 		 *
-		 * ⚠ AND IT IS ALL OR NOTHING FOR THE PROMPT. Choosing per
+		 * AND IT IS ALL OR NOTHING FOR THE PROMPT. Choosing per
 		 * chunk sounds better and is not: at 852 tokens no threshold
 		 * beat simply being on (7755 to 7911 against 7782), because
 		 * the early chunks lose little and the upkeep is paid either
@@ -5922,14 +5922,14 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->kv = a->kvmax < 32u ? a->kvmax : 32u;
 	a->rung[a->nrung++] = a->kv;
 	/*
-	 * ⚠ THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
+	 * THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
 	 * (k/32)*m up to 5120 -- measured, and the vendor's own file never
 	 * exceeds it -- and the values matmul's k is the context length, so a
 	 * 2048 context allows 80 rows a pass and a 4096 one allows 40.
 	 */
 	a->mmax = a->kv ? 5120u / (a->kv / 32u) : 0;
 	/*
-	 * ⚠ A PROBE, AND IT ONLY EVER MAKES THINGS SMALLER. The fp16 attention
+	 * A PROBE, AND IT ONLY EVER MAKES THINGS SMALLER. The fp16 attention
 	 * fence is 2881 us for a 32 task submit whose tasks are 2.3 MMAC each
 	 * -- about 4.6 us of arithmetic at the rate the int4 path gets out of
 	 * the same silicon in the same process. If that 90 us a task is
@@ -5944,7 +5944,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->lhd = calloc(a->n_layer, sizeof(*a->lhd));
 	if (!a->lhd)
 		return NULL;
-	/* ⚠ a layer that states nothing takes the model's, which is the rule
+	/* a layer that states nothing takes the model's, which is the rule
 	 * llama_load already applies when it fills L->head_dim */
 	for (i = 0; i < a->n_layer; i++) {
 		a->lhd[i] = m->layers && m->layers[i].head_dim
@@ -5953,10 +5953,10 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			return NULL;    /* below the atom, or wider than the
 					 * stride the cache was built at */
 	}
-	/* ⚠ the CEILING is what the memory cap has to be judged against: kv
+	/* the CEILING is what the memory cap has to be judged against: kv
 	 * starts at one rung but a long enough run climbs to kvmax, and a cap
 	 * that only checked the first rung would refuse later, mid answer.
-	 * ⚠ AND IT IS SUMMED PER LAYER NOW. Sizing every layer at the stride
+	 * AND IT IS SUMMED PER LAYER NOW. Sizing every layer at the stride
 	 * over-counted gemma4 by a third -- 28 of its 35 layers mirror a 256
 	 * long head, not the 512 the cache is strided at -- which is a cap
 	 * that refuses a run the hardware would have taken. */
@@ -5976,7 +5976,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			return NULL;
 		}
 	}
-	/* ⚠ BORROW THE POOL'S DEVICE. Opening a second one costs decode 12 to
+	/* BORROW THE POOL'S DEVICE. Opening a second one costs decode 12 to
 	 * 14% for a handle it never submits through; see charsiu_fp16_open_on */
 	a->f = charsiu_fp16_open_on(charsiu_npu_device(s->pool.dev));
 	if (!a->f)
@@ -5990,7 +5990,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			a->f = NULL;
 		}
 	}
-	/* ⚠ THE SECOND PAIR ONLY WHEN IT WILL BE USED. They borrow the same
+	/* THE SECOND PAIR ONLY WHEN IT WILL BE USED. They borrow the same
 	 * device, but each carries its own five shared buffers, and a unit
 	 * that is never submitted through still pays for them. */
 	if (a->f && attn_pipe_groups() > 1) {
@@ -6022,7 +6022,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		unsigned lhd = a->lhd[i / a->nkv];
 
 		a->kb[i] = charsiu_fp16_w_alloc(a->f, lhd, a->nk);
-		/* ⭐ THE ROOM IS TAKEN ONCE, HERE, so the first rung is
+		/* THE ROOM IS TAKEN ONCE, HERE, so the first rung is
 		 * already an in place move. The K surface needs none: its
 		 * growth is along n, which no offset depends on. */
 		a->vb[i] = charsiu_fp16_w_alloc_room(a->fv, a->kv, lhd,
@@ -6035,7 +6035,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	}
 	a->off = 0;
 	/*
-	 * ⛔⛔ RESERVED AT THE WIDEST GROUP, AND IT LOSES. DEFAULT OFF.
+	 * RESERVED AT THE WIDEST GROUP, AND IT LOSES. DEFAULT OFF.
 	 *
 	 * The idea was sound and the size was not. Growing into the buffers
 	 * costs 73 ms of `plan` on the scores unit and 19 on the values one at
@@ -6051,7 +6051,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	 * 478 ms, and the stage table says where: the scores fence 503 -> 738
 	 * and the values psync 67 -> 167, both whole-buffer dma_syncs.
 	 *
-	 * ⚠ THE SIZE IS THE FAULT, NOT THE IDEA. The ceiling arithmetic below
+	 * THE SIZE IS THE FAULT, NOT THE IDEA. The ceiling arithmetic below
 	 * is right about the LADDER -- m * n is the same 160 * 1024 on every
 	 * rung -- and wrong about the caller: charsiu_run's prefill chunk is
 	 * 80 rows, so a real group is 80 * 864 and this reserves 2.4x it. A
@@ -6071,7 +6071,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			mm = attn_npu_mmax_cap();
 		if (nops > FP16_GROUP_MAX)
 			nops = FP16_GROUP_MAX;
-		/* ⚠ A UNIT ONLY EVER SEES ITS OWN GROUP, so reserving the
+		/* A UNIT ONLY EVER SEES ITS OWN GROUP, so reserving the
 		 * whole head count would allocate twice what any of them
 		 * runs */
 		if (G > 1)
@@ -6138,7 +6138,7 @@ static const float *attn_kcache_at(struct llama_state *s, unsigned l,
 }
 
 /*
- * ⚠⚠ GROW THE V SURFACE TO COVER `want` POSITIONS, REPACKING WHAT IS LIVE.
+ * GROW THE V SURFACE TO COVER `want` POSITIONS, REPACKING WHAT IS LIVE.
  *
  * A GROUP offset depends on the reduction extent, so every element of the V
  * surface moves when kv changes and there is no incremental form of this. What
@@ -6146,14 +6146,14 @@ static const float *attn_kcache_at(struct llama_state *s, unsigned l,
  * length in at most log2 of it many repacks, and each one costs a pass over the
  * positions that already exist.
  *
- * ⚠ THE REPACK CALLS THE SAME PACKER THE APPEND DOES. It would be easy to
+ * THE REPACK CALLS THE SAME PACKER THE APPEND DOES. It would be easy to
  * write the new layout out by hand here and easy to get it wrong; instead this
  * walks the float V cache -- which is the source of truth and is written on
  * every path -- and hands each position to charsiu_fp16_pack_vcol exactly as
  * attn_npu_append does. There is one layout in this file and this is not a
  * second copy of it.
  *
- * ⚠ AND THE PROBABILITY SCRATCH IS RE-ZEROED. Its rows are kv apart, so a
+ * AND THE PROBABILITY SCRATCH IS RE-ZEROED. Its rows are kv apart, so a
  * changed kv reinterprets every byte in it; the zeros past the last token are
  * what makes the values matmul legal (see the note in attn_npu_layer), and a
  * stale row boundary would put the previous rung's numbers where those zeros
@@ -6165,7 +6165,7 @@ static const float *attn_kcache_at(struct llama_state *s, unsigned l,
 static double attn_npu_now_ms(void);
 
 /*
- * ⭐ THE ROOM A V SURFACE CAN BE GIVEN UP FRONT, which is the prompt's own
+ * THE ROOM A V SURFACE CAN BE GIVEN UP FRONT, which is the prompt's own
  * ceiling and nothing else. A surface allocated with this much room climbs the
  * ladder WHERE IT LIES: charsiu_fp16_regrow_vcols moves the blocks in place
  * and charsiu_fp16_w_set_k says the layout changed. What that removes is an
@@ -6173,13 +6173,13 @@ static double attn_npu_now_ms(void);
  * 128 of them on Llama-3.2-1B and 1024 on a 32 layer model with no GQA, which
  * is why the models that lose to this arm are exactly the ones without GQA.
  *
- * ⚠ 0 MEANS "NO ROOM TO RESERVE" and the caller allocates a fresh surface at
+ * 0 MEANS "NO ROOM TO RESERVE" and the caller allocates a fresh surface at
  * each rung, which is what this did before. That is the honest answer when
  * there is no prompt hint: the ladder then has no ceiling to aim at, and
  * reserving kvmax would allocate the whole context for a prompt that may be
  * twenty tokens long.
  *
- * ⚠ AND IT IS GATED ON THE BLOCK COPY. In place growth is the block copy; with
+ * AND IT IS GATED ON THE BLOCK COPY. In place growth is the block copy; with
  * the copier off the packer rewrites every live position, which in the same
  * buffer would leave the bytes past `live` as they were.
  */
@@ -6233,7 +6233,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		}
 	}
 	/*
-	 * ⚠ THE PROMPT'S OWN CEILING, AND ONLY WHILE THE PROMPT IS WHAT IS
+	 * THE PROMPT'S OWN CEILING, AND ONLY WHILE THE PROMPT IS WHAT IS
 	 * BEING SERVED. `want` past it means generation has run off the end of
 	 * the hint, and then the ladder is all there is again.
 	 */
@@ -6250,7 +6250,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		double ta;
 
 		/*
-		 * ⭐ THE RUNG THAT COSTS NO BUFFER OBJECT. If this surface was
+		 * THE RUNG THAT COSTS NO BUFFER OBJECT. If this surface was
 		 * allocated with room for the new extent, the blocks move
 		 * where they lie and set_k records the new layout. A refusal
 		 * from either falls through to the allocating path below,
@@ -6279,7 +6279,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 				continue;
 			}
 			/*
-			 * ⛔ AND A FAILURE HERE POISONS THE COPY PATH BELOW.
+			 * AND A FAILURE HERE POISONS THE COPY PATH BELOW.
 			 * charsiu_fp16_regrow_vcols validates before it moves
 			 * anything, but a refusal from inside the loop would
 			 * leave this surface half moved -- and the allocating
@@ -6300,13 +6300,13 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		}
 		tga += attn_npu_now_ms() - ta;
 		/*
-		 * ⭐ THE RUNG'S BYTES ARE THE NEXT RUNG'S BYTES AT ANOTHER
+		 * THE RUNG'S BYTES ARE THE NEXT RUNG'S BYTES AT ANOTHER
 		 * BASE. The padded extent appears in one term of the offset,
 		 * so the positions already packed are already in order and
 		 * only the output channel groups move. tests/fp16_regrow.c
 		 * holds that against the packer, 1584 shapes byte for byte.
 		 *
-		 * ⚠ BEFORE THE FREE, obviously, and out of the map that is
+		 * BEFORE THE FREE, obviously, and out of the map that is
 		 * about to go away. A refusal here is not a fault: `copied`
 		 * falls to 0 and the packer below does the whole job.
 		 */
@@ -6335,7 +6335,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			uint16_t *map = charsiu_fp16_w_map(
 					a->vb[l * a->nkv + kh]);
 
-			/* ⚠ TWO DIFFERENT WIDTHS ON ONE LINE: the mirror is
+			/* TWO DIFFERENT WIDTHS ON ONE LINE: the mirror is
 			 * packed at the LAYER's head and the float cache is
 			 * addressed at the STRIDE. They differ on gemma4. */
 			for (p = 0; p < live; p++)
@@ -6343,7 +6343,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 					attn_vcache_at(s, l, kh, a->hd, p));
 		}
 	}
-	/* ⚠ EITHER WAY. The surface moved, so every layer's upload is stale
+	/* EITHER WAY. The surface moved, so every layer's upload is stale
 	 * whether the bytes got there by a copy or by the packer. */
 	for (l = 0; l < a->n_layer; l++)
 		a->dirty[l] = 1;
@@ -6373,7 +6373,7 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 		return;
 	if (l >= a->n_layer || kh >= a->nkv || hd != a->lhd[l])
 		return;
-	/* ⚠ the ladder is climbed HERE, where the first position that does not
+	/* the ladder is climbed HERE, where the first position that does not
 	 * fit arrives, and the repack covers [0, pos) -- which is every
 	 * position already in the float cache, this one not being in it yet */
 	if ((unsigned)pos >= a->kv && attn_npu_fit(s, a, (unsigned)pos + 1))
@@ -6384,14 +6384,14 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 	charsiu_fp16_pack_vcol(charsiu_fp16_w_map(a->vb[i]), a->kv, a->lhd[l],
 			       (unsigned)pos, v);
 	a->dirty[l] = 1;
-	/* ⚠ ON THE LAST KV HEAD, because a position is only mirrored once
+	/* ON THE LAST KV HEAD, because a position is only mirrored once
 	 * every head of it is, and the catch-up below trusts this number */
 	if (kh + 1 == a->nkv && a->packed[l] < (unsigned)pos + 1)
 		a->packed[l] = (unsigned)pos + 1;
 }
 
 /*
- * ⚠⚠ FILL WHAT DECODE NO LONGER APPENDS, WHERE IT IS NEEDED.
+ * FILL WHAT DECODE NO LONGER APPENDS, WHERE IT IS NEEDED.
  *
  * Every position of this layer below `need` has to be in the mirror before the
  * layer runs, and the ones a generation produced are not: decode stopped
@@ -6432,7 +6432,7 @@ static void attn_npu_catchup(struct llama_state *s, struct attn_npu *a,
 }
 
 /*
- * ⚠⚠ THE SOFTMAX BETWEEN THE TWO MATMULS WAS THE BIGGEST THING IN THIS ARM
+ * THE SOFTMAX BETWEEN THE TWO MATMULS WAS THE BIGGEST THING IN THIS ARM
  * AND NOTHING WAS COUNTING IT.
  *
  * The fp16 counters account for 2129 ms of an 852 token prompt's attention;
@@ -6469,7 +6469,7 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 
 	for (u = u0; u < u0 + n; u++) {
 		unsigned h = (unsigned)(u / c->m), r = (unsigned)(u % c->m);
-		/* ⚠ WHERE THE SCORES MATMUL LEFT THEM, not in a copy of them.
+		/* WHERE THE SCORES MATMUL LEFT THEM, not in a copy of them.
 		 * The rows are npad apart here and not kv, because this is
 		 * the answer's own layout; the values pack is told the same
 		 * stride and never reads past a row because xtri0 stops it
@@ -6480,7 +6480,7 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 			? pos + 1 - j->n_swa : 0;
 		int t;
 
-		/* ⚠ the scale the CPU arm applies inside attn_dot rides
+		/* the scale the CPU arm applies inside attn_dot rides
 		 * along inside the softmax here -- see softmax_scaled. It was
 		 * a pass of its own over the row, and the row is the context
 		 * length. */
@@ -6488,7 +6488,7 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 			sr[t] = 0.0f;
 		softmax_scaled(sr + tlo, pos + 1 - tlo, j->scale);
 		/*
-		 * ⚠⚠ AND THE TAIL IS NOT ZEROED HERE ANY MORE. It used to be
+		 * AND THE TAIL IS NOT ZEROED HERE ANY MORE. It used to be
 		 * `for (t = pos + 1; t < npad; t++) sr[t] = 0.0f`, which is
 		 * 58% of the row at 852 tokens and k = 1024 -- and the only
 		 * reader of it is the values pack, which is told the same
@@ -6496,7 +6496,7 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 		 * Zeroing the source so the pack can convert a zero into a
 		 * zero was the work being done twice.
 		 *
-		 * ⚠ THE ORDER THIS WAS DONE IN IS THE ARGUMENT. The promise
+		 * THE ORDER THIS WAS DONE IN IS THE ARGUMENT. The promise
 		 * was verified on hardware FIRST, while this loop still
 		 * enforced it: r400 ran CHARSIU_FP16_TRI_CHECK=1 at 852
 		 * tokens, read back all 98,114,560 elements the pack was told
@@ -6510,7 +6510,7 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 }
 
 /*
- * ⭐⭐ THE SOFTMAX, RUN INSIDE THE VALUES PACK INSTEAD OF BEFORE IT.
+ * THE SOFTMAX, RUN INSIDE THE VALUES PACK INSTEAD OF BEFORE IT.
  *
  * The shipped order is: the scores matmul leaves m by npad floats in a device
  * buffer, the softmax rewrites them in place, and the values pack reads them
@@ -6523,7 +6523,7 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
  * asks for the live part. So this writes the same values the pack would have
  * converted, and softmax_scaled_half keeps the arithmetic identical.
  *
- * ⚠ n IS pos + 1 AND THE CALLBACK OWES EVERY ONE OF THEM. The sliding-window
+ * n IS pos + 1 AND THE CALLBACK OWES EVERY ONE OF THEM. The sliding-window
  * zeros below used to be written into the scores buffer by the softmax pass;
  * nothing writes them now except this, and a short write leaves the previous
  * group's halves in place.
@@ -6559,7 +6559,7 @@ static void attn_npu_fill(void *ctx, uint16_t *dst, unsigned op, unsigned r,
 }
 
 /*
- * ⭐⭐ THE FENCE IS A SLEEPING ioctl AND THE SOFTMAX IS FOUR BUSY CORES, AND
+ * THE FENCE IS A SLEEPING ioctl AND THE SOFTMAX IS FOUR BUSY CORES, AND
  * THEY HAPPEN ONE AFTER THE OTHER.
  *
  * r407 read the layer: scores fence 504 ms, values pack 477 (which is the
@@ -6574,7 +6574,7 @@ static void attn_npu_fill(void *ctx, uint16_t *dst, unsigned op, unsigned r,
  * driver serialises them on one fd -- so this is not the two cores in flight
  * together, which corrupts.
  *
- * ⚠ 1 IS NOT QUITE TODAY: at G = 1 the sentinels for the next call are
+ * 1 IS NOT QUITE TODAY: at G = 1 the sentinels for the next call are
  * written while the values job is still running rather than after it, which
  * is free but real. The arm to compare is 1 against 2 inside ONE binary.
  */
@@ -6585,7 +6585,7 @@ static unsigned attn_pipe_groups(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_PIPE");
 
-		/* ⭐ TWO IS THE DEFAULT SINCE r411. Nine models on the board,
+		/* TWO IS THE DEFAULT SINCE r411. Nine models on the board,
 		 * batched against their own token loops, identical at 1, 2 and
 		 * 4; Llama at 852 tokens identical at all three; and 4 is not
 		 * faster than 2 (6311 against 6320, layer 1441 against 1402).
@@ -6595,7 +6595,7 @@ static unsigned attn_pipe_groups(void)
 			v = 1;
 		if (v > 8)
 			v = 8;
-		/* ⚠ TWO UNITS, ANY NUMBER OF GROUPS. The ring is two deep
+		/* TWO UNITS, ANY NUMBER OF GROUPS. The ring is two deep
 		 * because a group's values are collected one iteration later,
 		 * so unit u is free again by the time group u + 2 wants it. */
 	}
@@ -6613,7 +6613,7 @@ static int attn_npu_soft_pool(void)
 }
 
 /*
- * ⚠⚠⚠ THE SCORES MATMUL IS A WRITE, AND IT WAS WRITING A RECTANGLE WHERE THE
+ * THE SCORES MATMUL IS A WRITE, AND IT WAS WRITING A RECTANGLE WHERE THE
  * ANSWER IS A TRIANGLE.
  *
  * r407 held the OUTPUT WIDTH still and re-measured the dtype factor that this
@@ -6633,13 +6633,13 @@ static int attn_npu_soft_pool(void)
  * been telling the pack that since r400. The scores matmul was the one stage
  * that did not know.
  *
- * ⚠ THE ROUNDING IS NOT COSMETIC. charsiu_fp16_woffset stops depending on n
+ * THE ROUNDING IS NOT COSMETIC. charsiu_fp16_woffset stops depending on n
  * once every n group is full, which is what lets one surface be appended to
  * and run at many widths -- and the group is 16. A width that is not a
  * multiple of 16 is a different permutation of the same bytes, so this rounds
  * UP to 16 and never down. 32 is the floor the unit refuses below.
  *
- * 🏁 AND IT IS WORTH EXACTLY NOTHING AT THE SHIPPED BLOCK SIZE, MEASURED.
+ * AND IT IS WORTH EXACTLY NOTHING AT THE SHIPPED BLOCK SIZE, MEASURED.
  * r407, four prompt lengths, arms alternating: the scores fence is 19/19,
  * 70/70, 216/216, 385/385 ms and TTFT 0.999, 0.985, 0.993, 1.000. Identical
  * text.
@@ -6650,7 +6650,7 @@ static int attn_npu_soft_pool(void)
  * runs once: llama_prefill_chunk_cap is 163840/1024 = 160 on this model and
  * a->mmax is 5120/(kv/32) = 160 too, so j->n never exceeds mmax.
  *
- * ⚠ AND SUB-CHUNKING TO MAKE IT LIVE IS A NET LOSS, by arithmetic rather than
+ * AND SUB-CHUNKING TO MAKE IT LIVE IS A NET LOSS, by arithmetic rather than
  * by a round: at 852 tokens, splitting the 160 row block in two takes the
  * columns computed from 537600 to 499200, 7%, while doubling the task count --
  * which r403 priced at 0.27 ms a row per doubling, 10% of attention.
@@ -6707,7 +6707,7 @@ static int attn_npu_group(struct attn_group *g)
 		if (!g->sc->sc[h])
 			return -1;
 	}
-	/* ⭐ with the fused arm the softmax happens inside the values pack
+	/* with the fused arm the softmax happens inside the values pack
 	 * below, one pass instead of two over the largest array in the prompt */
 	if (attn_fuse_softmax())
 		;
@@ -6721,7 +6721,7 @@ static int attn_npu_group(struct attn_group *g)
 	for (h = 0; h < g->ng; h++) {
 		memset(&vop[h], 0, sizeof(vop[h]));
 		vop[h].X = charsiu_fp16_out_w(g->fs, h);
-		/* ⚠ THE ANSWER'S OWN STRIDE, which is the width the scores
+		/* THE ANSWER'S OWN STRIDE, which is the width the scores
 		 * matmul ran at and not the prompt's. */
 		vop[h].xstride = g->cn;
 		if (attn_fuse_softmax()) {
@@ -6729,7 +6729,7 @@ static int attn_npu_group(struct attn_group *g)
 			vop[h].fill_ctx = g->sc;
 		}
 		/*
-		 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO NOTHING
+		 * ROW r IS POSITION pos0 + rb + r AND ATTENDS TO NOTHING
 		 * AFTER ITSELF, AND THE PACK IS WHAT ENFORCES THAT NOW.
 		 *
 		 * The loop above used to zero [pos+1, npad) itself and
@@ -6742,14 +6742,14 @@ static int attn_npu_group(struct attn_group *g)
 		 * memset in the pack is what makes those positions contribute
 		 * nothing.
 		 *
-		 * ⚠ Which also means the calloc is no longer load bearing,
+		 * Which also means the calloc is no longer load bearing,
 		 * and the promise is no longer optional. The order that made
 		 * the swap safe is in r400/r401: the tail was READ BACK on
 		 * hardware and found zero while the loop still wrote it, and
 		 * only then was the loop removed.
 		 */
 		vop[h].xtri0 = (unsigned)j->pos0 + g->rb + 1;
-		/* ⚠ THE HEAD IS GLOBAL, THE OP INDEX IS NOT: the kv head a
+		/* THE HEAD IS GLOBAL, THE OP INDEX IS NOT: the kv head a
 		 * query head shares is (h0 + h) / gqa, and getting that wrong
 		 * reads another head's values and still produces fluent text */
 		vop[h].Wbuf = a->vb[j->l * a->nkv + (g->h0 + h) / j->gqa];
@@ -6762,13 +6762,13 @@ static int attn_npu_group(struct attn_group *g)
 	}
 	if (charsiu_fp16_matmul_group_submit(g->fvs, vop, g->ng))
 		return -1;
-	/* ⚠ THE VALUES PACK HAS NOW FINISHED READING THE SCORES, and this is
+	/* THE VALUES PACK HAS NOW FINISHED READING THE SCORES, and this is
 	 * the only moment at which the next call's sentinels can be written:
 	 * after the softmax stopped overwriting them and before the buffer
 	 * goes back to the device. It saves two whole-buffer dma_syncs a
 	 * call. */
 	charsiu_fp16_poison_and_release(g->fs);
-	/* ⚠ THE TWO BUCKETS HAVE TO STAY WHAT THEY SAY. Charging everything
+	/* THE TWO BUCKETS HAVE TO STAY WHAT THEY SAY. Charging everything
 	 * between two scores waits to `scores` put the values pack in the
 	 * scores column the moment the groups interleaved -- 832 against 527,
 	 * which is the pair the other way round. t_pack1 is now the wait for
@@ -6792,7 +6792,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	unsigned T, npad;
 	double tl0 = 0.0, tk0 = 0.0, tg0;
 
-	/* ⚠ ONE REASON A TEST. These used to be two compound conditions, so
+	/* ONE REASON A TEST. These used to be two compound conditions, so
 	 * even a counter on them could not have said WHICH clause refused --
 	 * and the clause that mattered on gemma-4 was head_dim, sharing a line
 	 * with two others. */
@@ -6809,14 +6809,14 @@ static int attn_npu_layer(struct attn_block_job *j)
 	}
 	T = (unsigned)(j->pos0 + j->n);
 	npad = (T + 15u) & ~15u;
-	/* ⚠ a matmul under the two byte feature atom on either axis is one
+	/* a matmul under the two byte feature atom on either axis is one
 	 * that wedged both cores, so the unit refuses it and so does this: a
 	 * prompt shorter than 32 positions runs on the CPU and always will */
 	if (T == 0 || npad < 32 || npad > a->nk) {
 		a->refused[AN_R_EXTENT]++; return -1;
 	}
 	/*
-	 * ⚠ AND THE V SURFACE HAS TO COVER T. The appends climb the ladder as
+	 * AND THE V SURFACE HAS TO COVER T. The appends climb the ladder as
 	 * positions arrive, so it normally does; if a growth ever failed, the
 	 * appends returned without writing and this surface is stale. Falling
 	 * back to the CPU is always safe -- the float cache is written either
@@ -6827,7 +6827,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	}
 	tl0 = attn_npu_now_ms();
 	tk0 = tl0;
-	/* ⚠ before anything reads the mirror: a generation between two prompts
+	/* before anything reads the mirror: a generation between two prompts
 	 * left positions in the float cache and not in here */
 	attn_npu_catchup(s, a, j->l, T);
 	if (a->packed[j->l] < T) {
@@ -6836,7 +6836,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 	}
 
 	/*
-	 * ⚠ THE CACHES GO TO THE DEVICE ONCE A LAYER, NOT ONCE A TOKEN. fini
+	 * THE CACHES GO TO THE DEVICE ONCE A LAYER, NOT ONCE A TOKEN. fini
 	 * is dma_sync_sgtable_for_device over the WHOLE buffer object -- the
 	 * board measured 6.5 GB/s -- so one per append would be the entire
 	 * cache per token. No prep: the hardware only ever reads these, so the
@@ -6866,7 +6866,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 		if (cn > npad || !attn_npu_causal_n())
 			cn = npad;
 		/*
-		 * ⚠⚠ THE SCRATCH THAT USED TO BE HERE IS GONE, AND SO IS THE
+		 * THE SCRATCH THAT USED TO BE HERE IS GONE, AND SO IS THE
 		 * TRAP IT CARRIED.
 		 *
 		 * It was [H][mmax][kv] floats, and this paragraph warned that
@@ -6890,7 +6890,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].X = j->q + (size_t)rb * qstride + (size_t)h * hd;
 			op[h].xstride = (unsigned)qstride;
 			op[h].Wbuf = a->kb[j->l * a->nkv + h / j->gqa];
-			/* ⚠ A NULL Y LEAVES THE ANSWER IN THE DEVICE BUFFER,
+			/* A NULL Y LEAVES THE ANSWER IN THE DEVICE BUFFER,
 			 * which the softmax below then reduces over in place.
 			 * The copy this replaces was 1.5 GB and 245 ms of
 			 * `read` at 852 tokens, and a softmax reads every one
@@ -6904,7 +6904,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].n = cn;
 		}
 		/*
-		 * ⭐⭐ THE HEADS IN G GROUPS, SO ONE GROUP'S SOFTMAX RUNS WHILE
+		 * THE HEADS IN G GROUPS, SO ONE GROUP'S SOFTMAX RUNS WHILE
 		 * THE NEXT GROUP'S SCORES ARE ON THE HARDWARE.
 		 *
 		 * The order the hardware sees is S(0) S(1) V(0) V(1), one job
@@ -6920,7 +6920,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 		struct attn_group gj;
 
 		/*
-		 * ⚠ ONE ROW HAS NOTHING TO HIDE. What the split buys is a
+		 * ONE ROW HAS NOTHING TO HIDE. What the split buys is a
 		 * softmax long enough to cover the next group's scores, and
 		 * what it costs is a second plan, emit, poison and submit --
 		 * about 0.85 ms a group call at 852 tokens. At m = 1 the
@@ -6935,7 +6935,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 		fvs[0] = a->fv; fvs[1] = G > 1 ? a->fv2 : a->fv;
 
 		/*
-		 * ⭐ THE SAME RESERVATION, SIZED FROM THE CALL INSTEAD OF FROM
+		 * THE SAME RESERVATION, SIZED FROM THE CALL INSTEAD OF FROM
 		 * THE CEILING. The open-time version guessed m from the input
 		 * surface ceiling and got 160 where the caller uses 80, so
 		 * every whole-buffer sync afterwards charged 2.4x the work.
@@ -6989,7 +6989,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 		for (g = 0; g < G; g++) {
 			unsigned u = g & 1, h0 = g * gh;
 
-			/* ⚠ THE NEXT GROUP GOES IN BEFORE THIS ONE'S PACK,
+			/* THE NEXT GROUP GOES IN BEFORE THIS ONE'S PACK,
 			 * and that ordering is the whole feature: queued
 			 * behind work that is already running it costs
 			 * nothing to submit, and it is what the hardware
@@ -7013,7 +7013,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 				a->fallbacks++;
 				return -1;
 			}
-			/* ⚠ ONE GROUP BEHIND. Collecting this group's values
+			/* ONE GROUP BEHIND. Collecting this group's values
 			 * here would put the CPU back to sleep in the ioctl
 			 * with the next group's pack still to do. */
 			if (g && charsiu_fp16_matmul_group_wait(fvs[!u])) {
@@ -7036,7 +7036,7 @@ static int attn_npu_layer(struct attn_block_job *j)
 }
 
 /*
- * ⚠⚠ THE ELEMENTWISE STAGES WERE THE LAST SINGLE THREADED THING IN A BATCHED
+ * THE ELEMENTWISE STAGES WERE THE LAST SINGLE THREADED THING IN A BATCHED
  * PROMPT, AND ONE OF THEM IS 11% OF IT.
  *
  * The stage table for a 512 row prompt on Llama-3.2-1B: the matmuls 57%, the
@@ -7050,7 +7050,7 @@ static int attn_npu_layer(struct attn_block_job *j)
  * a stage can be too small to pay for one.
  */
 /*
- * ⚠⚠ 262144 tanhf CALLS A TOKEN, SINGLE THREADED, INSIDE `output head`.
+ * 262144 tanhf CALLS A TOKEN, SINGLE THREADED, INSIDE `output head`.
  *
  * gemma4 declares final_logit_softcapping and gemma3 does not, and that one
  * line of metadata is the whole of why their heads price differently. Every
@@ -7104,7 +7104,7 @@ static void softcap_logits(float *y, size_t n, float c)
 }
 
 /*
- * ⚠⚠ `silu * up` IS 3.50 ms A TOKEN ON gemma4 AND IT NEVER SAW THE POOL.
+ * `silu * up` IS 3.50 ms A TOKEN ON gemma4 AND IT NEVER SAW THE POOL.
  *
  * The join is elementwise -- element i reads hb[i] and hb2[i] and writes
  * hb[i], and touches nothing else -- so it is the same shape as the tail
@@ -7121,7 +7121,7 @@ static void softcap_logits(float *y, size_t n, float c)
  * 10.4 ns an element in both, which is the same rate on two models and so is a
  * property of the loop rather than of either.
  *
- * ⚠⚠ THE HOST AND THE BOARD DISAGREE, AND THE BOARD IS THE ONE THAT SHIPS.
+ * THE HOST AND THE BOARD DISAGREE, AND THE BOARD IS THE ONE THAT SHIPS.
  *
  *                          silu * up a token       decode
  *   host, gemma-3-1b     0.18 -> 1.91   10x WORSE     --
@@ -7133,14 +7133,14 @@ static void softcap_logits(float *y, size_t n, float c)
  * serial loop is 10.4 ns an element on the board against 1.0 on the host, so
  * the same barrier has ten times the work to hide behind.
  *
- * ⚠ I still had it default-ON first, from an analogy to the rope and tail
+ * I still had it default-ON first, from an analogy to the rope and tail
  * scale wins, with nothing measured either way. The host then said 10x worse.
  * The analogy was worth nothing in both directions -- it was right about the
  * board by luck and wrong about the host -- and llama.c's own note on the
  * batched version of this stage already said which way to think: a pool call
  * is a barrier and a stage can be too small to pay for one.
  *
- * ⚠⚠ WHERE THE THRESHOLD COMES FROM, and it is not a guess now. Both models
+ * WHERE THE THRESHOLD COMES FROM, and it is not a guess now. Both models
  * back out the SAME barrier from their own two arms -- P = W/T + L*B with
  * T = 8 gives 47.8 us on gemma3's 26 layers and 52.4 on gemma4's 35 -- so
  *
@@ -7151,7 +7151,7 @@ static void softcap_logits(float *y, size_t n, float c)
  * Qwen3's n_ff is 3072 and TinyLLAMA's 5632, and both sit below it untested,
  * which is where they stay until a round says otherwise.
  *
- * ⚠ gemma4's per-layer embedding calls gelu_mul on 256 elements directly, 35
+ * gemma4's per-layer embedding calls gelu_mul on 256 elements directly, 35
  * times a token, and does NOT come through here. Routing it would pay eight
  * wake-ups for 256 multiplies.
  *
@@ -7182,7 +7182,7 @@ static int act_pool_min(void)
 		const char *e = getenv("CHARSIU_ACT_POOL_MIN");
 
 		/*
-		 * ⚠ 6144 WAS THE ANSWER, NOT THE RULE. It came off two models'
+		 * 6144 WAS THE ANSWER, NOT THE RULE. It came off two models'
 		 * measured barrier on 2026-09-08 and it is only right at the
 		 * thread count it was measured at. charsiu_pool_min derives it
 		 * from the barrier, the rate and the threads actually running:
@@ -7204,7 +7204,7 @@ static void act_mul(float *hb, const float *hb2, uint32_t n, int gelu)
 	int pool = e && *e ? *e != '0' : (m >= 0 && (int)n >= m);
 
 	/*
-	 * ⚠ The NEON paths above step four at a time and fall through to a
+	 * The NEON paths above step four at a time and fall through to a
 	 * scalar tail, so a range that is not a multiple of four is still
 	 * exact -- but every range starting on a multiple of four keeps the
 	 * whole split on the vector path. Hence the grain.
@@ -7338,16 +7338,16 @@ static int row_pool(void)
 /*
  * THE ROPE STAGE FOR EVERY ROW, ON THE POOL.
  *
- * ⚠ IT IS ONLY PARALLEL BECAUSE THE ROPE STOPPED GOING THROUGH A SHARED
+ * IT IS ONLY PARALLEL BECAUSE THE ROPE STOPPED GOING THROUGH A SHARED
  * SCRATCH. While q, k and v were copied into s->q, s->k and s->v, every row
  * wrote the same three buffers and this could not be split at all. In place
  * they are one contiguous row each of s->bq, s->bk and s->bv, so a row touches
  * nothing another row touches.
  *
- * ⚠ THE TABLE FLAGS ARE SAFE FOR THE SAME REASON: bcstab_have is indexed by
+ * THE TABLE FLAGS ARE SAFE FOR THE SAME REASON: bcstab_have is indexed by
  * (variant, row) and a thread owns whole rows.
  *
- * ⚠⚠ WHAT IS NOT IN HERE. The KV cache write is per row and would
+ * WHAT IS NOT IN HERE. The KV cache write is per row and would
  * parallelise, but attn_npu_append beside it will not: it mutates a->dirty and
  * a->packed, and attn_npu_fit can REALLOCATE the mirror mid-loop. Both stay in
  * the serial loop rather than splitting a pair that has to see one instant.
@@ -7381,12 +7381,12 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 
 
 		/*
-		 * ⚠ A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
+		 * A WINDOW LAYER ROTATES AT ITS OWN BASE AND ITS OWN
 		 * HEAD. gemma3's window layers turn at 10000 and its
 		 * full ones at the model's own 1000000, and the file
 		 * carries no key saying so.
 		 *
-		 * ⚠⚠ AND WITH NO FREQUENCY FACTORS. llama.cpp gives
+		 * AND WITH NO FREQUENCY FACTORS. llama.cpp gives
 		 * rope_freqs to the FULL layers only; this handed them
 		 * to both, which scales a frequency table a window
 		 * layer was never built for. It could not show on
@@ -7403,14 +7403,14 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 			     (m->rope_base_swa != m->rope_base ||
 			      m->head_dim_swa != m->head_dim);
 
-		/* ⚠ BUILT ONCE PER (POSITION, VARIANT) AND REUSED BY
+		/* BUILT ONCE PER (POSITION, VARIANT) AND REUSED BY
 		 * EVERY LAYER. See the allocation. */
 		unsigned tv = swatab ? 1u : 0u;
 		float *cs = s->bcstab
 			  + ((size_t)tv * (size_t)n + (size_t)r)
 			    * hdmax;
 
-		/* ⚠ THE CONTROL, in the same binary: CHARSIU_ROPE_TAB=0
+		/* THE CONTROL, in the same binary: CHARSIU_ROPE_TAB=0
 		 * rebuilds the table every row of every layer, the way
 		 * it was, so the two arms can be interleaved in one
 		 * session and on the host. */
@@ -7425,7 +7425,7 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 			s->bcstab_have[(size_t)tv * (size_t)n + r] = 1;
 		}
 		/*
-		 * ⚠⚠ IN PLACE, NOT THROUGH THE PER ROW SCRATCH.
+		 * IN PLACE, NOT THROUGH THE PER ROW SCRATCH.
 		 *
 		 * This copied q, k and v out of the batched buffers
 		 * into s->q, s->k and s->v, transformed them there,
@@ -7439,7 +7439,7 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 		 * each of k and v, per row PER LAYER: 672 kB a row over
 		 * 28 layers, 74 MB across a 110 token prompt.
 		 *
-		 * ⚠ bk AND bv HOLD NOTHING WHEN THERE IS NO wk, and the
+		 * bk AND bv HOLD NOTHING WHEN THERE IS NO wk, and the
 		 * property that mattered survives: the token loop
 		 * leaves s->k and s->v from the previous layer and
 		 * never reads them, and these pointers likewise address
@@ -7451,7 +7451,7 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 		float *vr = s->bv + (size_t)r * m->n_head_kv * hd;
 
 		/*
-		 * ⚠ BIAS, THEN NORM, THEN ROPE -- the one order in
+		 * BIAS, THEN NORM, THEN ROPE -- the one order in
 		 * here that is not interchangeable, and it is copied
 		 * from the token loop rather than reasoned about
 		 * again. Rope mixes element 2i with 2i+1, so norming
@@ -7461,7 +7461,7 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 		 */
 		if (L->bq) {
 			add_bias(qr, L->bq, m->n_head * hd);
-			/* ⚠ NO K MEANS NO K BIAS. The token loop adds
+			/* NO K MEANS NO K BIAS. The token loop adds
 			 * all three unguarded and would dereference
 			 * NULL here; no file in the zoo has both a
 			 * shared KV and attention biases, so neither
@@ -7481,7 +7481,7 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 					j->kgain, m->rms_eps);
 		}
 		/*
-		 * ⚠ THE VALUE NORM IS THE SAME CALL, and refusing a
+		 * THE VALUE NORM IS THE SAME CALL, and refusing a
 		 * model for it was right only while this line did not
 		 * exist. gemma4 norms V with no gain -- llama.cpp
 		 * writes it as a bare rms_norm, so there is no weight
@@ -7507,11 +7507,11 @@ static int attn_block(struct attn_block_job *j)
 		return 0;
 	if (R > n)
 		R = n;
-	/* ⚠ BEFORE either arm runs: the CPU one sizes its scores buffer from
+	/* BEFORE either arm runs: the CPU one sizes its scores buffer from
 	 * j->R, and the check arm calls it directly */
 	j->R = R;
 	/*
-	 * ⚠⚠ THIS IS NOT A BIT EXACT SUBSTITUTION AND MUST NOT BE CHECKED AS
+	 * THIS IS NOT A BIT EXACT SUBSTITUTION AND MUST NOT BE CHECKED AS
 	 * ONE. Every matmul the group runs was proved identical to the same
 	 * matmul alone, but the CPU arm carries the whole of attention in
 	 * fp32 and this carries the inputs in fp16, so the two agree to fp16
@@ -7569,7 +7569,7 @@ static int attn_block_cpu(struct attn_block_job *j)
 
 	/* scores: [n_head][R][n_ctx], each head's block its own */
 	{
-		/* ⚠ THE SCRATCH IS PER UNIT NOW, and the unit is (head, row
+		/* THE SCRATCH IS PER UNIT NOW, and the unit is (head, row
 		 * block), so it grows by ceil(n/R). A head-indexed buffer was
 		 * only safe while one worker owned a whole head. */
 		unsigned nblk = attn_hr() ? (unsigned)((j->n + R - 1) / R) : 1;
@@ -7603,7 +7603,7 @@ static int attn_block_cpu(struct attn_block_job *j)
  * a token at a time re-streams the whole model per token. The probe measures
  * 5.14x at m = 32 on the projections alone.
  *
- * ⚠⚠ THIS IS A SECOND COPY OF THE LAYER LOOP AND IT IS DELIBERATELY BLIND.
+ * THIS IS A SECOND COPY OF THE LAYER LOOP AND IT IS DELIBERATELY BLIND.
  *
  * llama_forward carries seven architectures: gemma3's sliding window and two
  * rope bases, gemma4's per layer embeddings and shared KV, qwen3's q and k
@@ -7612,13 +7612,13 @@ static int attn_block_cpu(struct attn_block_job *j)
  * REFUSES the rest, once and up front, and the caller falls back to the token
  * loop -- which is correct for all seven and merely slower.
  *
- * ⚠ WHAT IS BATCHED: the feed forward, 63% of the projection time (gate and up
+ * WHAT IS BATCHED: the feed forward, 63% of the projection time (gate and up
  * 39%, down 24%). q, k, v and o stay one row at a time, because batching those
  * means duplicating the attention half too, and that is where the architectures
  * differ. Rows are still walked in order inside a layer: row r's attention
  * reads the KV that the rows before it wrote.
  *
- * ⚠ AND THE HEAD IS NOT BATCHED AT ALL. A prompt needs logits for its last
+ * AND THE HEAD IS NOT BATCHED AT ALL. A prompt needs logits for its last
  * token and no other, so the widest projection in the model is skipped n - 1
  * times rather than made n times wider.
  */
@@ -7645,7 +7645,7 @@ static int will_batch(struct llama_state *s, const struct gguf_tensor *w)
 }
 
 /*
- * ⚠ OFF BY DEFAULT, and the default is the one the board preferred. See the
+ * OFF BY DEFAULT, and the default is the one the board preferred. See the
  * long note at the call site: fewer fences lost to more weight refetches.
  */
 static int prefill_grouped(void)
@@ -7661,7 +7661,7 @@ static int prefill_grouped(void)
  * Returns 1 when the hardware took the whole batch and 0 when this fell back to
  * a row at a time.
  *
- * ⚠ THE CALLER NEEDS TO KNOW. q, k and v all multiply one RMSNorm output, and
+ * THE CALLER NEEDS TO KNOW. q, k and v all multiply one RMSNorm output, and
  * matvec_pair sends the three of them in ONE submit -- round 321 measured the
  * fence at 94% of the hardware path and that grouping took 113 fences a token
  * down to 65. Calling matmul_rows three times instead turns n grouped submits
@@ -7669,7 +7669,7 @@ static int prefill_grouped(void)
  * always. I did that to this loop two commits ago.
  */
 /*
- * ⭐⭐ `defer` LEAVES THE ANSWER IN THE DEVICE BUFFER for the NEXT matmul's
+ * `defer` LEAVES THE ANSWER IN THE DEVICE BUFFER for the NEXT matmul's
  * submit to gather behind, which is 1.93 ms a row of CPU work moved into
  * 1.82 ms a row of sleeping fence (r407). It is only legal when the very next
  * thing the caller does is another matmul that does not read Y -- gate before
@@ -7704,10 +7704,10 @@ static int matmul_rows_x(struct llama_state *s, const struct gguf_tensor *w,
 	if (stage_on > 0)
 		bmm_fell_rows += (unsigned long)n;
 	/*
-	 * ⚠ AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
+	 * AND IT HAS TO WORK WITHOUT THE NPU, or the loop restructuring
 	 * above can only ever be checked on the board.
 	 *
-	 * ⚠⚠ BUT NOT ONE ROW AT A TIME. This fell back to n calls to matvec,
+	 * BUT NOT ONE ROW AT A TIME. This fell back to n calls to matvec,
 	 * which reads every weight row n times -- and the board's own numbers
 	 * say what that costs: with CHARSIU_NPU_W4V=1, which is the default and
 	 * what Rockchip's table compares against, charsiu_npu_matmul REFUSES
@@ -7716,7 +7716,7 @@ static int matmul_rows_x(struct llama_state *s, const struct gguf_tensor *w,
 	 * 63: a token loop with the output head skipped, which is exactly what
 	 * the numbers looked like.
 	 *
-	 * ⚠⚠ AND gguf_matmul IS NOT THE ANSWER, MEASURED. It reads each weight
+	 * AND gguf_matmul IS NOT THE ANSWER, MEASURED. It reads each weight
 	 * row once for all m rows, which is the right idea and the wrong
 	 * function: matvec here is LLAMA'S matvec, not gguf_matvec. It uses the
 	 * requantised NPU copy when npu_mode is on and the activation's own q1
@@ -7745,7 +7745,7 @@ static int matmul_rows_x(struct llama_state *s, const struct gguf_tensor *w,
  * one -- k and v after q, up after gate. The CPU fallback is the same loop.
  */
 /*
- * ⚠ WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. Every
+ * WHICH OF THE THREE SITES MAY REUSE, so a board round can bisect. Every
  * site reuses unless CHARSIU_REUSE_SITES names a subset: any of k, v, up,
  * comma separated. Phase 2 broke Phi-3.5 and gemma4 with all three on, and
  * phase 22 walking the sites is what found the key with no expiry
@@ -7833,7 +7833,7 @@ static int matmul_rows_same_defer(struct llama_state *s,
 }
 
 /*
- * ⭐⭐⭐ SPLIT THE ROWS SO THERE IS ALWAYS SOMETHING TO HIDE THE GATHER BEHIND.
+ * SPLIT THE ROWS SO THERE IS ALWAYS SOMETHING TO HIDE THE GATHER BEHIND.
  *
  * The deferral above only pays where the caller has a second INDEPENDENT
  * matmul to issue -- gate/up and q/k/v -- and that covers about a quarter of
@@ -7842,7 +7842,7 @@ static int matmul_rows_same_defer(struct llama_state *s,
  * first half's answer can be gathered while the second half's job runs, on
  * every tensor including the ones with no partner.
  *
- * ⚠ IT IS NOT FREE ON THE HARDWARE SIDE. charsiu_int4 --cost at the gate/up
+ * IT IS NOT FREE ON THE HARDWARE SIDE. charsiu_int4 --cost at the gate/up
  * shape, k=2048 n=8192, fp16 activations, two passes each:
  *
  *     m = 78   4792 / 4801 us      m = 39   2925 / 2925      m = 20  1976
@@ -7851,14 +7851,14 @@ static int matmul_rows_same_defer(struct llama_state *s,
  * making because the gather is LARGER than the fence it hides behind (1.93
  * against 1.82 a row), and 22% of the smaller one buys overlap on the bigger.
  *
- * ⚠ BOTH HALVES MUST BE EVEN. w4_batch_why_not refuses an odd width -- the
+ * BOTH HALVES MUST BE EVEN. w4_batch_why_not refuses an odd width -- the
  * accumulator surface is organised in PAIRS of rows and no integer P works for
  * an odd m, which tools/acc_index_check asserts rather than prints.
  *
- * ⚠ AND BOTH DEFER. The tail is flushed by the caller's charsiu_npu_flush,
+ * AND BOTH DEFER. The tail is flushed by the caller's charsiu_npu_flush,
  * which every site that uses this already owes.
  *
- * ⛔⛔ AND THE BOARD SAYS NO: 9153 / 9004 ms against 6829 / 6631, text
+ * AND THE BOARD SAYS NO: 9153 / 9004 ms against 6829 / 6631, text
  * identical. The arithmetic that predicted a win was right about the hardware
  * and wrong about the CPU, and the entry split says exactly where:
  *
@@ -7872,12 +7872,12 @@ static int matmul_rows_same_defer(struct llama_state *s,
  * once per slot. Halving the rows doubles the calls and pays each of those
  * twice, which is larger than all the fence there was to hide.
  *
- * 🔑 Same shape as the dma_sync note in npufp16.c: a cost charged on the WHOLE
+ * Same shape as the dma_sync note in npufp16.c: a cost charged on the WHOLE
  * buffer does not halve when the work does. Default 0; the code is kept so the
  * next person to have this idea can run it rather than write it again.
  */
 /*
- * ⚠ WHICH CALL SITES MAY DEFER, so the residual failures can be attributed to
+ * WHICH CALL SITES MAY DEFER, so the residual failures can be attributed to
  * one of them. r408's bisection put 4 of 9 model failures in the pack region
  * and 5 somewhere before the next call even starts; this splits the second
  * group by where it was deferred.
@@ -7929,7 +7929,7 @@ static int matmul_rows_split(struct llama_state *s,
 		return same ? matmul_rows_same_defer(s, w, X, n, Y, k, nout,
 						     site)
 			    : matmul_rows_defer(s, w, X, n, Y, k, nout);
-	/* ⚠ the FIRST half takes the `same` reuse key if there is one; the
+	/* the FIRST half takes the `same` reuse key if there is one; the
 	 * second is a different X and would miss anyway */
 	if (same)
 		matmul_rows_same_defer(s, w, X, h, Y, k, nout, site);
@@ -7940,7 +7940,7 @@ static int matmul_rows_split(struct llama_state *s,
 }
 
 /*
- * ⚠ WHY IT WILL NOT, NOT JUST THAT IT WILL NOT. A refusal that returns 0 makes
+ * WHY IT WILL NOT, NOT JUST THAT IT WILL NOT. A refusal that returns 0 makes
  * the caller fall back silently, and a board log then shows a batched run and a
  * control run at the same rate with nothing to say which of the two things that
  * means: the flag did nothing, or the architecture was never batchable and both
@@ -7952,7 +7952,7 @@ static int matmul_rows_split(struct llama_state *s,
 const char *llama_batch_why_not(const struct llama_model *m)
 {
 	/*
-	 * ⚠⚠ EVERY REASON, NOT THE FIRST ONE. Returning the first costs a
+	 * EVERY REASON, NOT THE FIRST ONE. Returning the first costs a
 	 * board round each time it is fixed: gemma4 came back "a value norm",
 	 * and the round after that would have said "KV shared between layers",
 	 * and the one after that something else again. One line should say the
@@ -7962,7 +7962,7 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	size_t n = 0;
 
 	/*
-	 * ⚠ THE MODEL IS UNUSED TODAY AND THE PARAMETER STAYS. Every refusal
+	 * THE MODEL IS UNUSED TODAY AND THE PARAMETER STAYS. Every refusal
 	 * that ever lived here was a property of the model, and the next one
 	 * will be too; taking it out would make putting one back an API change
 	 * across four call sites and two tools, at the moment somebody is
@@ -7981,7 +7981,7 @@ const char *llama_batch_why_not(const struct llama_model *m)
 
 	WHY(kv_posmajor(), "a position major KV cache");
 	/*
-	 * 🏁 GEMMA4 AND PHI3 CAME OFF THIS LIST ON 2026-08-30, and what they
+	 * GEMMA4 AND PHI3 CAME OFF THIS LIST ON 2026-08-30, and what they
 	 * were refused for was never true of either of them.
 	 *
 	 * gemma4 was refused for its per layer embeddings and phi3 for having
@@ -8008,7 +8008,7 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 *     core, 0 of 16 with the submits serialised. Serialised is the
 	 *     default now.
 	 *
-	 * ⚠ WHAT WOULD PUT SOMETHING BACK HERE. This list is empty but for a
+	 * WHAT WOULD PUT SOMETHING BACK HERE. This list is empty but for a
 	 * debug switch, so the next architecture will not be refused by it --
 	 * it will be MISSED by it, the way blk.N.layer_output_scale was: a
 	 * tensor this loop did not apply, on a model nothing refused. A new
@@ -8020,7 +8020,7 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	if (n)
 		return buf;
 	/*
-	 * ⚠ FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
+	 * FOUR REFUSALS LEFT THIS LIST ON 2026-08-28, and what they cost is
 	 * why. Rockchip publish Qwen3-0.6B at 468 ms to the first token on this
 	 * board; charsiu took 7354, because a query norm sent the whole prompt
 	 * through the token loop. Of the five models in their table that this
@@ -8033,7 +8033,7 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * them was right while they were unwritten and became the dominant cost
 	 * the moment there was a scoreboard.
 	 *
-	 * ⚠ AN ABSENT K OR V AND A SHARED KV LEFT THIS LIST on 2026-08-29, and
+	 * AN ABSENT K OR V AND A SHARED KV LEFT THIS LIST on 2026-08-29, and
 	 * neither was a different computation either. gemma4 makes attn_v
 	 * optional in every layer, where its absence means V IS K, and drops
 	 * attn_k entirely in its last ones, where the layer attends against
@@ -8043,27 +8043,27 @@ const char *llama_batch_why_not(const struct llama_model *m)
 	 * are not there, skip the cache write, and read the cache the layer
 	 * names.
 	 *
-	 * ⚠ A VARYING FEED FORWARD WIDTH LEFT THIS LIST on 2026-08-29, and it
+	 * A VARYING FEED FORWARD WIDTH LEFT THIS LIST on 2026-08-29, and it
 	 * was never a computation at all -- it was one buffer sized from
 	 * layers[0] instead of from the widest layer. m->n_ff has been the max
 	 * since gemma4 landed, so the fix was to allocate from it and read
 	 * L->n_ff in the loop, which is what the token loop already did.
 	 *
-	 * ⚠ PER LAYER EMBEDDINGS LEFT THIS LIST on 2026-08-29 and they WERE a
+	 * PER LAYER EMBEDDINGS LEFT THIS LIST on 2026-08-29 and they WERE a
 	 * computation -- the only one of the five that was. They are a second
 	 * embedding table, a projection of the first, a norm a layer slice, and
 	 * a gated residual at the bottom of every layer, which is the whole of
 	 * what "E2B" means. What made them batchable was that all of it is per
 	 * ROW: two matmuls that take n rows and scalar work that does not.
 	 *
-	 * ⚠⚠ THE LIST IS NOW EMPTY BUT FOR A DEBUG SWITCH, so the next
+	 * THE LIST IS NOW EMPTY BUT FOR A DEBUG SWITCH, so the next
 	 * architecture will not be refused by it -- it will be MISSED by it,
 	 * the way blk.N.layer_output_scale was: a tensor this loop did not
 	 * apply, on a model nothing else refused. A new architecture means
 	 * reading llama_forward against this loop line by line, not trusting
 	 * a NULL from here.
 	 *
-	 * ⚠ THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
+	 * THE SLIDING WINDOW LEFT THIS LIST TOO, and it was the reason Phi3
 	 * and Gemma4 took 23.6 s and 17.6 s to a first token against
 	 * Rockchip's 1.8 and 1.2. It is not a mask this loop had to learn: the
 	 * attention already takes t0, the oldest position a layer may look at,
@@ -8081,7 +8081,7 @@ static int batch_ok(const struct llama_model *m)
 	if (!why)
 		return 1;
 	/*
-	 * ⚠ A REFUSAL WITH NO WAY PAST IT CANNOT BE TESTED.
+	 * A REFUSAL WITH NO WAY PAST IT CANNOT BE TESTED.
 	 *
 	 * gemma4 and phi3 are refused because the board says their batched
 	 * prompt is wrong, and each refusal names the property that
@@ -8111,7 +8111,7 @@ static int batch_ok(const struct llama_model *m)
 }
 
 /*
- * ⚠ THE LAYERS, AND ONLY THE LAYERS. Everything from the embedding lookup to
+ * THE LAYERS, AND ONLY THE LAYERS. Everything from the embedding lookup to
  * the last residual add, over n rows at pos0, with the KV cache written for
  * every row. What it leaves behind is s->bx: n rows of the final residual
  * stream, unnormed. Two callers finish it two ways -- llama_prefill_batch runs
@@ -8127,7 +8127,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0)
 {
 	/*
-	 * ⚠ hdmax IS THE CACHE'S STRIDE AND L->head_dim IS THE LAYER'S HEAD,
+	 * hdmax IS THE CACHE'S STRIDE AND L->head_dim IS THE LAYER'S HEAD,
 	 * and they are two different numbers. gemma4's window layers have a 256
 	 * long head and its full ones 512 while the KV cache is one allocation
 	 * with one stride, so indexing the cache by the live head makes layer 4
@@ -8143,7 +8143,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	uint32_t hdmax = m->head_dim ? m->head_dim : m->n_embd / m->n_head;
 	uint32_t kvdim = m->n_head_kv * hdmax;
 	/*
-	 * ⚠ THE WIDEST LAYER'S FEED FORWARD, NOT LAYER ZERO'S. gemma4 states a
+	 * THE WIDEST LAYER'S FEED FORWARD, NOT LAYER ZERO'S. gemma4 states a
 	 * width PER LAYER and E2B uses two of them, so a buffer sized from
 	 * layers[0] and then written L->n_ff floats deep is a heap overflow on
 	 * the first layer that disagrees with the first.
@@ -8170,7 +8170,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		s->bhb2 = malloc((size_t)n * nffmax * sizeof(float));
 		s->bcs = malloc((size_t)hdmax * sizeof(float));
 		/*
-		 * ⚠⚠ THE ROPE TABLE ONLY DEPENDS ON THE POSITION, AND IT WAS
+		 * THE ROPE TABLE ONLY DEPENDS ON THE POSITION, AND IT WAS
 		 * BEING REBUILT ONCE PER ROW PER LAYER.
 		 *
 		 * rope_table is head_dim/2 iterations of powf, cosf and sinf.
@@ -8194,7 +8194,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		s->qkgain = malloc((size_t)hdmax * sizeof(float));
 		s->qkgain2 = malloc((size_t)hdmax * sizeof(float));
 		/*
-		 * ⚠ q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
+		 * q IS n_head * head_dim WIDE AND THAT IS NOT n_embd. Qwen3
 		 * 0.6B is 16 heads of 128 against an embedding of 1024, so a
 		 * buffer sized by n_embd is half of what the projection
 		 * writes -- the same trap qwen3's attn_output buffer fell into
@@ -8205,7 +8205,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		s->bk = malloc((size_t)n * kvdim * sizeof(float));
 		s->bv = malloc((size_t)n * kvdim * sizeof(float));
 		/*
-		 * ⚠⚠ AND THE ATTENTION'S OUTPUT IS n_head * head_dim WIDE TOO,
+		 * AND THE ATTENTION'S OUTPUT IS n_head * head_dim WIDE TOO,
 		 * WHICH IS THE SAME TRAP A SECOND TIME. Qwen3 0.6B is 16 heads
 		 * of 128 against an embedding of 1024, so attention produces
 		 * 2048 floats and hands them to wo, which contracts over 2048.
@@ -8219,7 +8219,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 */
 		s->bao = malloc((size_t)n * m->n_head * hdmax * sizeof(float));
 		/*
-		 * ⚠ gemma4's PER LAYER EMBEDDINGS ARE PER ROW. s->pl is one
+		 * gemma4's PER LAYER EMBEDDINGS ARE PER ROW. s->pl is one
 		 * token's -- looked up by that token's id and projected from
 		 * that token's own embedding -- so a chunk needs n of them.
 		 * Sharing one would give every row of the prompt the last
@@ -8243,14 +8243,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		}
 		s->bx_n = n;
 	}
-	/* ⚠ ONCE A CHUNK, not once an allocation: the buffers survive between
+	/* ONCE A CHUNK, not once an allocation: the buffers survive between
 	 * chunks and the positions do not. A stale `have` would hand layer 0 of
 	 * the next chunk the previous chunk's rotation, which is a wrong answer
 	 * that no allocation path would ever reach. */
 	memset(s->bcstab_have, 0, (size_t)n * 2);
 
 	/*
-	 * ⚠⚠ THE ROPE FREQUENCY FACTORS, WHICH THIS LOOP HAS NEVER READ. The
+	 * THE ROPE FREQUENCY FACTORS, WHICH THIS LOOP HAS NEVER READ. The
 	 * token loop pulls m->rope_freqs into a buffer and hands it to
 	 * rope_table; the batched copy passed NULL from the day it was written.
 	 * Every model that carries that tensor -- Phi-3.5-mini's longrope is
@@ -8280,7 +8280,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	}
 
 	/*
-	 * ⚠ gemma4's PER LAYER EMBEDDINGS, built once for the whole chunk:
+	 * gemma4's PER LAYER EMBEDDINGS, built once for the whole chunk:
 	 *
 	 *   pl[r][l][j] = ( proj[r][l][j] + tok[r][l][j] * sqrt(n_embd_pl) )
 	 *                 / sqrt(2)
@@ -8291,12 +8291,12 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	 * table looked up by the same token. Every line of it is the token
 	 * loop's, in the token loop's order, with one index added.
 	 *
-	 * ⚠ THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
+	 * THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
 	 * is n_embd_pl long and llama.cpp reshapes to [n_embd_pl][n_layer]
 	 * before normalising. Over the concatenation every layer would be
 	 * divided by every other layer's magnitude.
 	 *
-	 * ⚠ THE PROJECTION IS THE ONLY PART THAT BATCHES. The rest reads one
+	 * THE PROJECTION IS THE ONLY PART THAT BATCHES. The rest reads one
 	 * row's table entry and normalises one row's slices, which is n times
 	 * the same scalar code and not a matmul.
 	 */
@@ -8307,7 +8307,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		float half = 1.0f / sqrtf(2.0f);
 
 		/*
-		 * ⚠ READ ONCE. The token loop reads this gain inside its layer
+		 * READ ONCE. The token loop reads this gain inside its layer
 		 * loop, which is the same vector every time; here that would be
 		 * n_layer reads a row. Same values, so it cannot move a token.
 		 */
@@ -8343,7 +8343,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	if (stage_on < 0)
 		stage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	/*
-	 * ⚠⚠ STAGING IS NOT A STAGE. The first chunk's projections upload every
+	 * STAGING IS NOT A STAGE. The first chunk's projections upload every
 	 * tensor to the hardware on first use, inside npu_id_for, and the first
 	 * cut of this clock charged that to whichever projection touched the
 	 * tensor: on the board Qwen3's four matmul rows summed to 12.5 ms a row
@@ -8365,7 +8365,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 	for (uint32_t l = 0; l < m->n_layer; l++) {
 		const struct llama_layer *L = &m->layers[l];
 		uint32_t hd = L->head_dim ? L->head_dim : hdmax;
-		/* ⚠ THIS LAYER'S WIDTH; m->n_ff is only the fallback */
+		/* THIS LAYER'S WIDTH; m->n_ff is only the fallback */
 		uint32_t nff = L->n_ff ? L->n_ff : m->n_ff;
 		int swa = L->swa;
 
@@ -8373,7 +8373,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			BSTAGE(ST_EMBD);
 
 		/*
-		 * ⚠⚠ THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
+		 * THE PROJECTIONS BATCH, THE ATTENTION DOES NOT. Only
 		 * gate, up and down were batched here, which is three of the
 		 * seven matmuls a layer does -- and the board showed what that
 		 * left on the table: Qwen3 0.6B prefilled at 50 ms a token
@@ -8398,7 +8398,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		}
 		BSTAGE(ST_NORM1);
 		/*
-		 * ⚠⚠ TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
+		 * TENSOR MAJOR OR ROW MAJOR, AND THE BOARD SAYS TENSOR.
 		 *
 		 * Three calls to matmul_rows do all n rows of q, then all n of
 		 * k, then all n of v -- the same weight, n submits in a row.
@@ -8415,12 +8415,12 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 * SAME weight do not pay for it twice, and grouping threw that
 		 * away to save a fence.
 		 *
-		 * ⚠ It is a reading of two runs on a warming board, so it is a
+		 * It is a reading of two runs on a warming board, so it is a
 		 * switch rather than a deletion: CHARSIU_PREFILL_GROUPED=1
 		 * restores the grouping and the two can be compared in one
 		 * session.
 		 *
-		 * ⚠ AND THIS IS WHAT THE VENDOR DOES TOO. Their own w4a16
+		 * AND THIS IS WHAT THE VENDOR DOES TOO. Their own w4a16
 		 * RK3576 model -- the model in the row this is measured
 		 * against -- has 9296 four bit weight matmuls and NOT ONE of
 		 * them is above M = 1. Every batched op in it is fp16 and is
@@ -8428,14 +8428,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 * mechanism behind their 469 ms.
 		 */
 		/*
-		 * ⚠ ASKED, NOT TRIED. A first version wrote this as
+		 * ASKED, NOT TRIED. A first version wrote this as
 		 * `!grouped() || matmul_rows(wq)`, and the short circuit meant
 		 * that in the tensor major case matmul_rows was never called
 		 * for wq at all -- q was simply not computed, and all three
 		 * models came back DIFFERENT. The control caught it in one run.
 		 */
 		/*
-		 * ⚠ A SHARED KV LAYER PROJECTS ONLY Q, and there is nothing to
+		 * A SHARED KV LAYER PROJECTS ONLY Q, and there is nothing to
 		 * group. gemma4's last layers carry no attn_k and attend
 		 * against an earlier layer's cache, so handing matmul_rows
 		 * L->wk here would dereference NULL -- the same three cases the
@@ -8447,7 +8447,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
-			/* ⚠ nothing writes bxb between these three: the
+			/* nothing writes bxb between these three: the
 			 * declaration below is only true because of that --
 			 * and it is also what makes the deferral legal. q's
 			 * answer is gathered while k's job runs and k's while
@@ -8475,7 +8475,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						   m->n_head_kv * hd);
 		}
 		/*
-		 * ⚠ WHERE attn_v IS ABSENT AND attn_k IS NOT, V IS K. That is
+		 * WHERE attn_v IS ABSENT AND attn_k IS NOT, V IS K. That is
 		 * llama.cpp's `Vcur = Kcur` and not a projection this file
 		 * failed to find, so it is a copy of the rows just computed and
 		 * not a third matmul. gemma4 declares attn_v optional in EVERY
@@ -8486,14 +8486,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			       (size_t)n * m->n_head_kv * hd * sizeof(float));
 
 		/*
-		 * ⚠ ONE POOLED PASS, THEN A SERIAL ONE. The stage markers move
+		 * ONE POOLED PASS, THEN A SERIAL ONE. The stage markers move
 		 * out of the row loop with the work: BSTAGE accumulates a
 		 * difference of timestamps, so calling it once a layer rather
 		 * than once a row changes the granularity, not the totals.
 		 */
 		BSTAGE(ST_QKV);   /* the three projections, before any row */
 		{
-			/* ⚠ ONCE A LAYER AND OFF THE POOL: gguf_row_f32 is what
+			/* ONCE A LAYER AND OFF THE POOL: gguf_row_f32 is what
 			 * qk_norm's static was caching, and it is exactly the
 			 * thing two rows must not do at once. */
 			const float *qg = NULL, *kg = NULL;
@@ -8509,7 +8509,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			}
 			rj = (struct rope_rows_job){ s, m, L, hd, hdmax, pos0,
 						     swa, n, freqf, qg, kg };
-			/* ⚠ ITS OWN KNOB, NOT row_pool(). CHARSIU_ROW_POOL=0
+			/* ITS OWN KNOB, NOT row_pool(). CHARSIU_ROW_POOL=0
 			 * turns off every row stage at once -- silu, the
 			 * residuals, the norms -- so an arm using it measures
 			 * all of them and calls the answer the rope's. This
@@ -8530,7 +8530,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			float *vr = s->bv + (size_t)r * m->n_head_kv * hd;
 
 			(void)qr; (void)kr; (void)vr;
-			/* ⚠ the cache is strided by hdmax, written at hd, and
+			/* the cache is strided by hdmax, written at hd, and
 			 * a shared KV layer has nothing of its own to store:
 			 * it reads what L->kv_from wrote. Writing here would
 			 * put this layer's q-only garbage over the slot the
@@ -8544,7 +8544,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					const float *ks = kr + kh * hd;
 					const float *vs = vr + kh * hd;
 
-					/* ⚠ NOT BY MOVING kr. The first draft
+					/* NOT BY MOVING kr. The first draft
 					 * rebased kr inside this loop, which
 					 * made head kh+1 read one head_dim on
 					 * from head kh's slot instead of a
@@ -8571,7 +8571,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						memcpy(s->vcache + off, vs,
 						       hd * sizeof(float));
 					}
-					/* ⚠ the fp16 mirror is written HERE and
+					/* the fp16 mirror is written HERE and
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
 					 * cannot drift by a rope or a norm */
@@ -8585,11 +8585,11 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				 * over the cache (attn_block). The cache rows
 				 * this row will read are all written by then.
 				 */
-				/* ⚠ NOTHING TO COPY BACK: the rope wrote the
+				/* NOTHING TO COPY BACK: the rope wrote the
 				 * row where it already lives. */
 			} else {
 				/*
-				 * ⚠⚠ t0 IS THE OLDEST POSITION THIS LAYER MAY
+				 * t0 IS THE OLDEST POSITION THIS LAYER MAY
 				 * READ, and the batched loop passed 0 for every
 				 * layer -- which is a full attention wearing a
 				 * window layer's weights. The token loop's own
@@ -8603,7 +8603,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				int tlo = swa && pos + 1 > (int)m->n_swa
 					? pos + 1 - (int)m->n_swa : 0;
 				/*
-				 * ⚠ WHOSE CACHE, and it is not always this
+				 * WHOSE CACHE, and it is not always this
 				 * layer's. gemma4's shared layers name an
 				 * earlier one in L->kv_from; -1 is "its own",
 				 * which is every layer of everything else.
@@ -8647,7 +8647,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		matmul_rows(s, L->wo, s->bao, n, s->bxo, m->n_head * hd,
 			    m->n_embd);
 		BSTAGE(ST_WO);
-		/* ⚠ the post norm is on the branch, BEFORE the residual add:
+		/* the post norm is on the branch, BEFORE the residual add:
 		 * after it would normalise the residual stream too */
 		{
 			struct norm_rows_job nj = { s, m, L };
@@ -8662,7 +8662,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 
 		/* gate and up read one norm as well: the same choice */
 		if (!prefill_grouped() || will_batch(s, L->gate)) {
-			/* ⭐ gate's answer is gathered while UP's job runs:
+			/* gate's answer is gathered while UP's job runs:
 			 * they multiply the same norm and neither reads the
 			 * other, which is the only condition the deferral has.
 			 * The flush below covers the case where up is refused
@@ -8710,7 +8710,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		}
 
 		/*
-		 * ⚠ gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not
+		 * gemma4's PER LAYER EMBEDDING, A RESIDUAL OF ITS OWN and not
 		 * a replacement:
 		 *
 		 *   g = gelu(per_layer_inp_gate . x)      [n_embd_pl]
@@ -8734,14 +8734,14 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						 + ((size_t)r * m->n_layer + l)
 						   * np;
 
-				/* ⚠ the same gate, so the same function:
+				/* the same gate, so the same function:
 				 * two open coded copies of this loop were
 				 * still calling tanhf an element after
 				 * gelu_mul stopped. */
 				gelu_mul(g, plr, np);
 			}
 			/*
-			 * ⚠ bxo IS FREE HERE. The feed forward's down
+			 * bxo IS FREE HERE. The feed forward's down
 			 * projection went into it and was added into bx on the
 			 * loop above; nothing reads it again this layer, and it
 			 * is already n rows of n_embd, which is this
@@ -8761,7 +8761,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			}
 		}
 		/*
-		 * ⚠⚠ THE MARK IS HERE, AFTER THE PER LAYER EMBEDDING, AND IT
+		 * THE MARK IS HERE, AFTER THE PER LAYER EMBEDDING, AND IT
 		 * USED TO BE BEFORE IT -- which charged gemma4's two pl
 		 * projections to whatever ran next, and what runs next is the
 		 * NEXT LAYER'S attn rmsnorm. The table said so for weeks:
@@ -8778,13 +8778,13 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		 * sits after the same block -- so the two paths disagreed
 		 * about which stage pays for gemma4's whole architecture.
 		 *
-		 * ⚠ This moves no arithmetic. It is the instrument, and the
+		 * This moves no arithmetic. It is the instrument, and the
 		 * instrument was pointing at the wrong stage: an afternoon of
 		 * this round went into asking why gemma4's rmsnorm is slow.
 		 */
 		BSTAGE(ST_RES2);
 		/*
-		 * ⚠ ONE SCALAR THE WHOLE LAYER OUTPUT IS MULTIPLIED BY, and
+		 * ONE SCALAR THE WHOLE LAYER OUTPUT IS MULTIPLIED BY, and
 		 * this loop never had it. It is not in llama_batch_why_not
 		 * either, so a model carrying blk.N.layer_output_scale and
 		 * none of the listed refusals would have been prefilled
@@ -8808,7 +8808,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			}
 		}
 		/*
-		 * ⚠ THE LAST ROW, BECAUSE THAT IS THE ONE THE TOKEN LOOP CAN BE
+		 * THE LAST ROW, BECAUSE THAT IS THE ONE THE TOKEN LOOP CAN BE
 		 * HELD AGAINST. CHARSIU_DBG_LAYERS makes llama_forward print
 		 * this line for every layer of every token; run a prompt of
 		 * exactly one chunk and its final n_layer lines are the same
@@ -8835,7 +8835,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 }
 
 /*
- * ⚠⚠ THE WIDEST CHUNK THAT DOES NOT SEND THE WHOLE PROMPT TO THE CPU.
+ * THE WIDEST CHUNK THAT DOES NOT SEND THE WHOLE PROMPT TO THE CPU.
  *
  * npudev refuses a dispatch whose input surface (k_slice / 32) * m exceeds
  * 5120 -- measured, and the vendor's own file never exceeds it either. A
@@ -8857,7 +8857,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
  * CHUNK is now safe to raise on any model because it cannot cross the cliff.
  */
 /*
- * ⚠⚠ THE WIDEST SLICE A K BECOMES, AND UNDER KFIT THAT IS WIDER THAN KMAX.
+ * THE WIDEST SLICE A K BECOMES, AND UNDER KFIT THAT IS WIDER THAN KMAX.
  *
  * charsiu_slice_kw gives the last slice whatever is left, and its own comment
  * says clamping it would drop the tail of the tensor without a word. So KFIT
@@ -8913,7 +8913,7 @@ int llama_prefill_chunk_cap(const struct llama_model *m)
 	if (!widest)
 		return 80;
 	cap = 163840u / widest;
-	/* ⚠ a floor of 2, because a chunk of one is the token loop wearing
+	/* a floor of 2, because a chunk of one is the token loop wearing
 	 * the batched path's name, and the caller has its own minimum */
 	return cap < 2 ? 2 : (int)cap;
 }
@@ -8938,7 +8938,7 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 }
 
 /*
- * ⚠⚠ THE SAME FORWARD, WITH THE HEAD ON EVERY ROW.
+ * THE SAME FORWARD, WITH THE HEAD ON EVERY ROW.
  *
  * A speculative pass feeds the last committed token as row 0 and k drafted
  * tokens as rows 1..k. Whether draft i was right is decided by the logits of
@@ -8971,7 +8971,7 @@ int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 }
 
 /*
- * ⚠ ONE CALL, THEN IT CLEARS ITSELF. A left-over embd_in would silently turn
+ * ONE CALL, THEN IT CLEARS ITSELF. A left-over embd_in would silently turn
  * the next real token into the previous picture, which is a fluent answer about
  * nothing that was asked.
  */
@@ -9001,7 +9001,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	if (stage_on < 0)
 		stage_on = charsiu_env_flag("CHARSIU_STAGES", 0);
 	/*
-	 * ⚠ THE STAGE IS ALSO THE BREADCRUMB. A crash anywhere in the forward
+	 * THE STAGE IS ALSO THE BREADCRUMB. A crash anywhere in the forward
 	 * pass used to arrive as "Segmentation fault" with nothing else, and
 	 * once charsiu_note started clearing itself on the way out of the NPU
 	 * code, everything that was NOT the NPU became "something outside the
@@ -9033,7 +9033,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	 * layer: theta depends on the base, the pair and the position.
 	 */
 	/*
-	 * ⚠ THE WINDOW TABLE IS ITS OWN LENGTH AND HAS NO FACTORS. gemma4
+	 * THE WINDOW TABLE IS ITS OWN LENGTH AND HAS NO FACTORS. gemma4
 	 * rotates 256 of a window layer's head against 512 of a full one, and
 	 * llama.cpp gives rope_freqs to the FULL layers only -- a window layer
 	 * gets the plain rotation. Handing it the full layers' factors would
@@ -9060,7 +9060,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	}
 
 	/*
-	 * ⚠ gemma4's PER LAYER EMBEDDINGS, built once for the whole token.
+	 * gemma4's PER LAYER EMBEDDINGS, built once for the whole token.
 	 *
 	 *   pl[l][j] = ( proj[l][j] + tok[l][j] * sqrt(n_embd_pl) ) / sqrt(2)
 	 *
@@ -9069,7 +9069,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 	 * against per_layer_proj_norm. tok is a row of a second embedding
 	 * table, n_embd_pl * n_layer wide, looked up by the same token.
 	 *
-	 * ⚠ THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
+	 * THE NORM IS PER LAYER SLICE, not over the whole vector: the gain
 	 * is n_embd_pl long and llama.cpp reshapes to [n_embd_pl][n_layer]
 	 * before normalising. Doing it over the concatenation would divide
 	 * every layer by every other layer's magnitude.
@@ -9106,18 +9106,18 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 		cur_layer = l;
 		/*
-		 * ⚠ `il % n < n - 1` IS THE PATTERN, taken from llama.cpp's
+		 * `il % n < n - 1` IS THE PATTERN, taken from llama.cpp's
 		 * set_swa_pattern: with the gemma default of 6 that is five
 		 * window layers and then a full one, not one window in six.
 		 */
 		/*
-		 * ⚠ RESOLVED AT LOAD, not here. gemma3 states a period and
+		 * RESOLVED AT LOAD, not here. gemma3 states a period and
 		 * gemma4 states one flag a layer, and the forward pass should
 		 * not have to know which form the file used.
 		 */
 		int swa = L->swa;
 		/*
-		 * ⚠ THIS LAYER'S HEAD, not the model's. gemma4 is the first
+		 * THIS LAYER'S HEAD, not the model's. gemma4 is the first
 		 * architecture here whose layers disagree about it.
 		 */
 		uint32_t hd = L->head_dim;
@@ -9128,7 +9128,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 * INCLUDING this one: llama.cpp masks when pos - t >= n_swa.
 		 */
 		/*
-		 * ⚠⚠ NOT t0, AND THIS ONE COST FOUR BOARD ROUNDS.
+		 * NOT t0, AND THIS ONE COST FOUR BOARD ROUNDS.
 		 *
 		 * llama_forward's timing variable is a double called t0 and the
 		 * STAGE macro assigns to it. An int t0 declared inside the
@@ -9154,7 +9154,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		STAGE(ST_NORM1);
 
 		/*
-		 * ⚠ A SHARED KV LAYER PROJECTS ONLY Q. gemma4's last layers
+		 * A SHARED KV LAYER PROJECTS ONLY Q. gemma4's last layers
 		 * carry no attn_k and attend against an earlier layer's cache,
 		 * so asking matvec_pair for k and v would dereference NULL.
 		 * And where attn_v is absent but attn_k is not, V IS K -- that
@@ -9172,7 +9172,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				    L->wv, s->v);
 		}
 		/*
-		 * ⚠ BEFORE ROPE, NOT AFTER. The bias is part of the projection;
+		 * BEFORE ROPE, NOT AFTER. The bias is part of the projection;
 		 * rotating a biased vector is not the same as biasing a rotated
 		 * one, and the wrong order is the kind of mistake that still
 		 * produces fluent-looking text.
@@ -9183,7 +9183,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			add_bias(s->v, L->bv, m->n_head_kv * hd);
 		}
 		/*
-		 * ⚠ AFTER THE BIAS AND BEFORE ROPE, which is the one order
+		 * AFTER THE BIAS AND BEFORE ROPE, which is the one order
 		 * that is not interchangeable: rope mixes element 2i with
 		 * 2i+1, so normalising afterwards divides a rotated pair by a
 		 * sum of squares that rotation already changed. V is NOT
@@ -9197,7 +9197,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 					m->rms_eps);
 		}
 		/*
-		 * ⚠ gemma4 NORMS V TOO, AND WITH NO GAIN. llama.cpp writes it
+		 * gemma4 NORMS V TOO, AND WITH NO GAIN. llama.cpp writes it
 		 * as a bare ggml_rms_norm rather than a build_norm, so there is
 		 * no weight to look for and nothing in the tensor list to
 		 * notice it by -- the only place it exists is the graph.
@@ -9216,7 +9216,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			     (unsigned long)kvdim);
 
 		/*
-		 * ⚠ HEAD MAJOR: [layer][kv head][position][head dim].
+		 * HEAD MAJOR: [layer][kv head][position][head dim].
 		 *
 		 * The cache used to be [layer][position][kv dim], which puts
 		 * one kv head's consecutive positions 2048 bytes apart -- and
@@ -9245,7 +9245,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 					      * s->n_ctx + pos) * hdmax;
 
 				if (kv_bits()) {
-					/* ⚠ THE TOKEN LOOP TOO. The first
+					/* THE TOKEN LOOP TOO. The first
 					 * version patched only the batched
 					 * path, and charsiu_ppl without
 					 * --batch runs THIS one -- so the
@@ -9270,7 +9270,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				       hd * sizeof(float));
 				}
 				/*
-				 * ⚠ THE DECODE PATH NO LONGER WRITES THE
+				 * THE DECODE PATH NO LONGER WRITES THE
 				 * MIRROR. It used to, so that a prompt
 				 * continued after a generation would not read a
 				 * cache with a hole in it -- and the board
@@ -9296,7 +9296,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				     (unsigned long)m->n_head);
 
 			/*
-			 * ⚠ SERIAL, AND ROUND 368 IS WHY.
+			 * SERIAL, AND ROUND 368 IS WHY.
 			 *
 			 * Splitting these heads over the pool was measured at
 			 * 22.70 ms a token against 7.75 serial when the
@@ -9327,7 +9327,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		matvec(s, L->wo, s->xb, s->xb2);
 		STAGE(ST_WO);
 		/*
-		 * ⚠ ON THE BRANCH, BEFORE THE RESIDUAL ADD. Normalising after
+		 * ON THE BRANCH, BEFORE THE RESIDUAL ADD. Normalising after
 		 * the add would normalise the residual stream as well, which
 		 * is a different model.
 		 */
@@ -9353,7 +9353,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			s->x[i] += s->xb2[i];
 
 		/*
-		 * ⚠ gemma4's PER LAYER EMBEDDING, and it is a RESIDUAL of its
+		 * gemma4's PER LAYER EMBEDDING, and it is a RESIDUAL of its
 		 * own rather than a replacement:
 		 *
 		 *   g = gelu(per_layer_inp_gate . x)      [n_embd_pl]
@@ -9510,7 +9510,7 @@ int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
 }
 
 /*
- * ⚠⚠ SPECULATIVE DECODING, AND WHY IT IS THE ONE ALGORITHM THAT CAN GO PAST
+ * SPECULATIVE DECODING, AND WHY IT IS THE ONE ALGORITHM THAT CAN GO PAST
  * THE VENDOR RATHER THAN TO IT.
  *
  * At m = 1 every token reads every weight, and that is the whole cost of a
@@ -9541,7 +9541,7 @@ int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
  * the one with no model to get wrong; the pass itself does not care where the
  * drafts come from.
  *
- * ⚠ WHAT THIS DOES NOT DO. Sampling at a temperature is left to the plain
+ * WHAT THIS DOES NOT DO. Sampling at a temperature is left to the plain
  * loop: lossless speculative SAMPLING exists (accept with p_target(d), else
  * draw from the residual) and is not written here, so with --temp the runner
  * says so once and does not speculate. And a pass at m = 4 has never been
@@ -9565,7 +9565,7 @@ int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 	if (k < 1)
 		k = 1;
 	/*
-	 * ⚠ AT MOST 5, BECAUSE THE ROWS ARE 1 + k AND THE BOARD REFUSES 8 AND
+	 * AT MOST 5, BECAUSE THE ROWS ARE 1 + k AND THE BOARD REFUSES 8 AND
 	 * 10. npudev's dense sweep has 2, 4 and 6 exact on both cores and 8
 	 * and 10 missing row 0 of the wide projections, so a pass is 2, 4 or 6
 	 * rows and nothing between 6 and 12 is asked for.
@@ -9614,7 +9614,7 @@ static int spec_draft(const struct llama_spec *sp, int32_t *out, int k)
 	int n = sp->n_hist;
 
 	/*
-	 * ⚠ THE CONTROL. Junk drafts must be rejected every time and the text
+	 * THE CONTROL. Junk drafts must be rejected every time and the text
 	 * must not move; a run where they are accepted, or where the text
 	 * changes, is a verifier that is not verifying. Deterministic in the
 	 * history length so a run reproduces.
@@ -9672,7 +9672,7 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		rows[1 + i] = drafts[i];
 	n = 1 + d;
 	/*
-	 * ⚠ AN ODD WIDTH HAS NO EXPRESSION ON THE SURFACE, so pad to even with
+	 * AN ODD WIDTH HAS NO EXPRESSION ON THE SURFACE, so pad to even with
 	 * a row that is never read: it sits after the last draft, nothing
 	 * before it can see it, and the roll back below discards it.
 	 */
@@ -9680,7 +9680,7 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		rows[n++] = drafts[d - 1];
 	if (llama_verify_batch(s, m, rows, n, pos0, sp->logits_all)) {
 		/*
-		 * ⚠ REFUSED, AND SAID ONCE. batch_layers refuses before it
+		 * REFUSED, AND SAID ONCE. batch_layers refuses before it
 		 * touches the cache, so nothing needs undoing; the rest of the
 		 * run is the plain loop and the report line says so, because
 		 * a speculative run that quietly ran plain would read as
@@ -9721,7 +9721,7 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	 */
 	s->pos = pos0 + 1 + a;
 	/*
-	 * ⚠ EVERY TOKEN ENTERS THE HISTORY EXACTLY ONCE. The caller feeds the
+	 * EVERY TOKEN ENTERS THE HISTORY EXACTLY ONCE. The caller feeds the
 	 * LAST committed token back as the next pass's `tok`, which pushes it
 	 * then; everything before it is pushed here.
 	 */

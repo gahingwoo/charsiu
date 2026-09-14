@@ -4,7 +4,7 @@
 """
 Diff charsiu's image resize against a numpy reference.
 
-⚠ WHY THIS HAS ITS OWN TEST. The resize is the one step whose errors are
+WHY THIS HAS ITS OWN TEST. The resize is the one step whose errors are
 invisible in the output: half a pixel of shift produces a caption that is
 fluent, confident and about a slightly different crop. Nothing downstream can
 catch it, so it is checked here on its own, against the half pixel centre

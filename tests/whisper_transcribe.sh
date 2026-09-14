@@ -4,7 +4,7 @@
 #
 # The end to end regression: a known clip has to come out as the known words.
 #
-# ⚠ THIS IS THE ONE TEST THAT WOULD SURVIVE EVERY OTHER ONE PASSING. The mel,
+# THIS IS THE ONE TEST THAT WOULD SURVIVE EVERY OTHER ONE PASSING. The mel,
 # the encoder and the decoder are each checked against numpy, and a wiring
 # mistake BETWEEN them -- a window fed to the encoder before the clamp, the
 # prompt built at the wrong positions -- passes all three and produces confident

@@ -2,14 +2,14 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# ⭐ THE V SURFACE'S LADDER DOUBLES, AND AT 852 TOKENS THAT FINISHES ON 1024.
+# THE V SURFACE'S LADDER DOUBLES, AND AT 852 TOKENS THAT FINISHES ON 1024.
 #
 # kv is the values matmul's reduction extent, so the cost of a prompt is the
 # sum of kv over its positions. A doubling ladder pays 523k units where an
 # extent that tracked the position exactly would pay 363k: 1.44x. The vendor's
 # own file grows this length in steps of 32.
 #
-# ⛔ THE OBVIOUS FIX IS SLOWER, WHICH IS WHY THIS IS A SWEEP AND NOT A PATCH.
+# THE OBVIOUS FIX IS SLOWER, WHICH IS WHY THIS IS A SWEEP AND NOT A PATCH.
 # Starting kv at the prompt total charges the first 512 rows 864 apiece where
 # the ladder charges them 32, 64, ... 512 -- 736k against 523k. The hint is a
 # CEILING, not a floor. Two knobs, named separately:
@@ -19,18 +19,18 @@
 #   CHARSIU_ATTN_KV_STEP=n   grow by n percent instead of 200
 #                            150 -> 439k, 133 -> 420k, 125 -> 412k
 #
-# ⚠⚠ AND THE COUNTER-COST IS REAL AND IS NOT IN THAT ARITHMETIC. Every growth
+# AND THE COUNTER-COST IS REAL AND IS NOT IN THAT ARITHMETIC. Every growth
 # frees and re-allocates one buffer object per layer per kv head, memsets the
 # whole of each, and syncs it twice -- then packs every live position again.
 # A finer step buys extent and pays repacks: 5 repacks at 200, 11 at 125, and
 # the rows repacked go 992 -> 3232. Which side wins is a board question.
 #
-# ⚠ THE LADDER ITSELF IS PRINTED, because a count of repacks does not say
+# THE LADDER ITSELF IS PRINTED, because a count of repacks does not say
 # which rungs, and the rungs are what the arithmetic above predicts. If a row
 # of this table does not show the ladder the model predicted, the knob did not
 # reach the code and the timing is two copies of one arm.
 #
-# ⭐ AND THE THIRD FIELD IS THE FIX FOR THE REPACK. The padded extent appears
+# AND THE THIRD FIELD IS THE FIX FOR THE REPACK. The padded extent appears
 # in ONE term of the packed offset, so a rung's bytes are the next rung's bytes
 # at another base: a growth is a block copy per output channel group, not a
 # conversion per position. r411 measured the old way at about 68 ms a rung,
@@ -58,7 +58,7 @@ ERR=/tmp/kvl.$$
 [ -x "$RUN" ] || { echo "no $RUN"; exit 1; }
 for k in CHARSIU_ATTN_KV_STEP CHARSIU_ATTN_KV_CAP CHARSIU_ATTN_KV_COPY; do
 	strings "$RUN" 2>/dev/null | grep -q "^$k\$" && continue
-	echo "⛔ $RUN has no $k: every arm would be the default and the"
+	echo "$RUN has no $k: every arm would be the default and the"
 	echo "   table would be one arm measured five times"
 	exit 1
 done
@@ -169,7 +169,7 @@ for a in $ARMS; do
 	if [ -z "$REF" ]; then REF="$h"; RT="$o"; printf '   %-10s %s  (reference)\n' "$a" "$h"
 	elif [ "$h" = "$REF" ]; then printf '   %-10s %s\n' "$a" "$h"
 	else
-		printf '   %-10s %s  ⛔ DIFFERS\n' "$a" "$h"
+		printf '   %-10s %s  DIFFERS\n' "$a" "$h"
 		echo "      ref $RT"
 		echo "      arm $o"
 	fi

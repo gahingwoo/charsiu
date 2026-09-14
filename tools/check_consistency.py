@@ -12,7 +12,7 @@ It was written on 2026-09-11 and first run on 09-12, and it failed immediately:
 BOTH corpora were scored by every perplexity in the pack and NEITHER md5 was in
 section 7. A rule that has never been run is not a rule, it is a sentence.
 
-⚠ THESE ARE CONDITIONS, NOT VERDICTS, and that is deliberate. A check for
+THESE ARE CONDITIONS, NOT VERDICTS, and that is deliberate. A check for
 "beats the vendor" goes stale the moment the measurement moves; a check for
 "this number names a file whose hash is recorded" stays true or false on its
 own terms. Nothing here asserts which side is faster.
@@ -35,7 +35,7 @@ FENCE = re.compile(r'^```', re.M)
 def _strip_fenced(text):
     """Blank out fenced code blocks, keeping line numbers and length.
 
-    ⛔ THE FIRST VERSION OF THIS CHECKER FAILED ON ITS OWN DOCUMENT. Section 7
+    THE FIRST VERSION OF THIS CHECKER FAILED ON ITS OWN DOCUMENT. Section 7
     is a shell block whose comments start with '#', so the heading regex read
     `# the model of record` as a heading and cut the reproduction section short
     at its first comment -- which is exactly where the hashes are. The checker
@@ -161,7 +161,7 @@ def check(path):
 
 
 def self_test():
-    """⚠ A RULE THAT HAS NEVER FAILED HAS NOT BEEN TESTED. Each rule is given
+    """A RULE THAT HAS NEVER FAILED HAS NOT BEEN TESTED. Each rule is given
     a document that violates it and must report exactly that violation."""
     import tempfile
     cases = [
@@ -183,7 +183,7 @@ def self_test():
             tmp = f.name
         try:
             got = fn(body, tmp)
-            print("  %-32s %s" % (name, "caught" if got else "⛔ NOT CAUGHT"))
+            print("  %-32s %s" % (name, "caught" if got else "NOT CAUGHT"))
             if not got:
                 bad += 1
         finally:

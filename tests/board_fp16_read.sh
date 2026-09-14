@@ -10,7 +10,7 @@
 # scalar pass over the answer, on top of the memcpy that follows it. For the
 # scores shape that is m * npad words an op and thirty two ops a group.
 #
-# ⚠⚠ AND THE READ SIDE WAS THE CHEAP HALF. The buffer is POISONED the same way
+# AND THE READ SIDE WAS THE CHEAP HALF. The buffer is POISONED the same way
 # before every submit -- another full scalar pass over the answer, in the one
 # region of that function with no clock on it. At 852 tokens the readback was
 # 581 ms and the poisoning 668, together more than the hardware`s own 915.
@@ -114,7 +114,7 @@ b=$(env $E CHARSIU_FP16_FULLSCAN=0 "$RUN" "$M" -p "$LAST" -n 24 --ignore-eos -q 
 if [ "$a" = "$b" ]; then
 	echo "   identical: $(printf '%s' "$a" | md5sum | cut -c1-12)"
 else
-	echo "   ⛔ DIFFER"
+	echo "   DIFFER"
 	echo "   every cell $a"
 	echo "   one a row  $b"
 fi

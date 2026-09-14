@@ -4,13 +4,13 @@
  * The vision tower: a ViT read out of llama.cpp's `mmproj-*.gguf`, producing
  * the embeddings a multimodal model splices into its token stream.
  *
- * ⚠ WHY THIS IS NOT A CONVOLUTION. A patch embedding is a k x k convolution
+ * WHY THIS IS NOT A CONVOLUTION. A patch embedding is a k x k convolution
  * with stride k, which is to say the patches do not overlap -- so it is a
  * gather into rows followed by one matmul, and charsiu's job encoder, which
  * only ever speaks (m, k, n), can express the whole tower. The real 2D
  * convolution lives in Mesa and is not needed here.
  *
- * ⚠ AND THE TOWER WANTS int8. An image arrives as 256 to 1600 patches AT ONCE,
+ * AND THE TOWER WANTS int8. An image arrives as 256 to 1600 patches AT ONCE,
  * which is exactly the batched matmul measured on 2026-08-27 at 2.94x. w4a16
  * computes exactly one row whatever it is asked for, so an int4 tower would run
  * those patches one at a time -- 256 dispatches where int8 does one.
@@ -30,7 +30,7 @@ enum charsiu_proj {
 };
 
 /*
- * ⚠ fc1 AND fc2, NOT up AND down. In a real mmproj the feed forward is named
+ * fc1 AND fc2, NOT up AND down. In a real mmproj the feed forward is named
  * the other way round from the language model's: v.blk.N.ffn_down is the FIRST
  * matmul, n_embd -> n_ff, and ffn_up is the second. Reading a real
  * SmolVLM-256M mmproj is what said so -- ffn_down.weight is (768, 3072) and
@@ -49,7 +49,7 @@ struct charsiu_vision_layer {
 };
 
 /*
- * ⚠ EVERY NAME IN HERE IS UNVERIFIED AGAINST A REAL FILE. They are llama.cpp's
+ * EVERY NAME IN HERE IS UNVERIFIED AGAINST A REAL FILE. They are llama.cpp's
  * clip names as this tree understands them, and the whole point of the loader
  * below is that a name it does not find is REPORTED rather than skipped.
  *
@@ -65,7 +65,7 @@ struct charsiu_vision {
 	uint32_t image_size, patch_size, n_embd, n_ff, n_head, n_layer;
 	uint32_t proj_dim, grid, n_patches;
 	/*
-	 * ⚠ AN IMAGE IS NOT ONE TOKEN PER PATCH. idefics3 rearranges the patch
+	 * AN IMAGE IS NOT ONE TOKEN PER PATCH. idefics3 rearranges the patch
 	 * grid by scale_factor before the projector -- 32 x 32 patches at
 	 * scale 4 is 64 embeddings of 768 * 16, not 1024 of 768 -- so the
 	 * number of tokens an image costs the language model is n_patches
@@ -82,7 +82,7 @@ struct charsiu_vision {
 	const struct gguf_tensor *mm_w[2], *mm_b[2];   /* the mlp projector */
 	const struct gguf_tensor *fc_w, *fc_b;         /* idefics3's single fc */
 	/*
-	 * ⚠ CLIP PREPENDS A CLASS TOKEN, so the position embedding has one more
+	 * CLIP PREPENDS A CLASS TOKEN, so the position embedding has one more
 	 * row than there are patches and the image's single embedding is that
 	 * token's, post normalised and projected -- not the patches at all.
 	 * A tower for a language model hands over every patch; a tower for
@@ -97,7 +97,7 @@ struct charsiu_vision {
 	char why[160];
 
 	/*
-	 * ⚠ THE TOWER'S OWN NPU POOL, opened in int8 whatever the environment
+	 * THE TOWER'S OWN NPU POOL, opened in int8 whatever the environment
 	 * says. A picture is 1024 patches against weights that do not change,
 	 * which is the batched matmul; w4a16 makes one row, so an int4 device
 	 * here would dispatch those patches one at a time and be slower than
@@ -123,7 +123,7 @@ const char *charsiu_vision_why_not(const struct charsiu_vision *v);
 /*
  * Where the time went, under CHARSIU_STAGES.
  *
- * ⚠ "feed forward" IS NOW TWO ROWS, and the split is the point. The board read
+ * "feed forward" IS NOW TWO ROWS, and the split is the point. The board read
  * 2398 ms under one heading that was a pair of NPU matmuls added to a scalar
  * libm loop, and the two do not answer to the same thing: the matmuls are 384
  * hardware dispatches fixed by the 64 row chunk, the activation was 37.7
@@ -131,7 +131,7 @@ const char *charsiu_vision_why_not(const struct charsiu_vision *v);
  * did not exist and covered nothing, and the patch gather used to run above the
  * line that starts the clock, so the row named for it timed only the matmul.
  *
- * ⚠ CHARSIU_EXACT_GELU IS THE CONTROL for the activation. The tanh form is
+ * CHARSIU_EXACT_GELU IS THE CONTROL for the activation. The tanh form is
  * algebraically one sigmoid, so the shipped kernel is one exponential four at a
  * time instead of a tanhf an element; setting this puts the tanhf back and, as
  * of this writing, reproduces the previous binary's embeddings bit for bit.
@@ -152,7 +152,7 @@ unsigned charsiu_vision_width(const struct charsiu_vision *v);
  * with the tower's own numbers, which charsiu_vision_normalise does. `out` holds
  * charsiu_vision_tokens() * charsiu_vision_width() floats.
  *
- * ⚠ NO CAUSAL MASK. A ViT's attention is full: patch 0 sees patch 255. Carrying
+ * NO CAUSAL MASK. A ViT's attention is full: patch 0 sees patch 255. Carrying
  * the language model's mask in here would be a picture that can only see up and
  * to the left of itself, which is a plausible looking answer about the wrong
  * image.
@@ -163,7 +163,7 @@ int charsiu_vision_encode(struct charsiu_vision *v, const float *px, float *out)
  * The tower's self attention on its own: q, k, v and o are [n][W] with the
  * heads laid side by side across W, and `scale` is 1/sqrt(head_dim).
  *
- * ⚠ EXPOSED BECAUSE IT IS THE HALF OF THE ENCODE THAT NEEDS MEASURING and the
+ * EXPOSED BECAUSE IT IS THE HALF OF THE ENCODE THAT NEEDS MEASURING and the
  * stage table cannot see it clearly on a host: here the matmuls are CPU and
  * dwarf it, on the board they are NPU and it is half the run. tools/vattn_bench
  * drives this directly so a change can be timed at the board's shape without
@@ -182,14 +182,14 @@ void charsiu_vision_attention(const float *q, const float *k, const float *v,
  * identical and differ only in what stays in cache, so the right answer is the
  * machine's, not the code's.
  *
- * ⚠ A HOST ANSWERS THIS WRONG FOR THE BOARD. Read the note above the function.
+ * A HOST ANSWERS THIS WRONG FOR THE BOARD. Read the note above the function.
  */
 /*
  * How many queries share one pass over the keys and one over the values. The
  * K and V traffic divides by it; the scores it has to hold are qb * n floats
  * and stop fitting in cache. CHARSIU_VATTN_QB sets it.
  *
- * ⚠ RUNTIME SO IT CAN BE SWEPT IN ONE PROCESS. Two builds compared one after
+ * RUNTIME SO IT CAN BE SWEPT IN ONE PROCESS. Two builds compared one after
  * the other cannot tell a block size apart from the load on the machine.
  */
 unsigned charsiu_vision_attn_qb(void);
@@ -201,7 +201,7 @@ void charsiu_vision_attn_qb_set(unsigned qb);
  * a scratch array. CHARSIU_VATTN_FUSED=0 restores the three pass kernel and
  * CHARSIU_VATTN_KT sets the key tile.
  *
- * ⚠⚠ THIS IS THE ONE THAT CHANGES THE ANSWER. Everything else here reorders
+ * THIS IS THE ONE THAT CHANGES THE ANSWER. Everything else here reorders
  * only the ISSUE of the arithmetic and is bit identical; a running maximum with
  * a rescale is the same number in exact arithmetic and a few ulp away in f32.
  * The exact kernel is kept as the control it has to be diffed against.

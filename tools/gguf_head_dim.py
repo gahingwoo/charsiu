@@ -4,7 +4,7 @@
 """A gguf's head_dim and layer count, which is what decides whether a rule
 about head_dim applies to a model.
 
-⚠ WHY THIS EXISTS. attn_npu_want_for() carries a withdrawn rule -- "head_dim
+WHY THIS EXISTS. attn_npu_want_for() carries a withdrawn rule -- "head_dim
 >= 128 is only half the rule" -- and nothing in this tree could say which of
 the models on the card were on which side of that line. Llama-3.2-1B, the
 model every speed round uses, turns out to be 64: the FURTHEST BELOW the
@@ -34,7 +34,7 @@ def rval(f,t):
     if t==T_I64: return rd(f,'<q')
     if t==T_F64: return rd(f,'<d')
     if t==T_ARR:
-        # ⚠ EVERY ELEMENT MUST BE CONSUMED even when only a few are kept, or
+        # EVERY ELEMENT MUST BE CONSUMED even when only a few are kept, or
         # the file position is wrong for every key after this one -- which is
         # how a 128k-entry tokeniser array turned into a MemoryError three
         # keys later rather than an error here.

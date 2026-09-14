@@ -5,7 +5,7 @@
 # How many rows should the batched prompt's attention take in one pass over
 # the cache?
 #
-# ⚠ THE NUMBER 8 WAS NEVER SWEPT. attn_block_rows() returns 8 and llama.c's
+# THE NUMBER 8 WAS NEVER SWEPT. attn_block_rows() returns 8 and llama.c's
 # note beside it explains why blocking won and why the pool won, but the two
 # arms it compares are 8-on-the-pool against one-row-at-a-time. Nothing has
 # ever asked whether 8 is the right 8: a wider block reads the same K and V
@@ -27,7 +27,7 @@
 #   CHARSIU_ATTN_REPEATS=2
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -53,7 +53,7 @@ if [ -z "$MODELS" ]; then
 fi
 [ -n "$MODELS" ] || { echo "no models" >&2; exit 1; }
 
-# ⚠ THE GOVERNOR IS THE WHOLE POINT, and attention is pure CPU: under ondemand
+# THE GOVERNOR IS THE WHOLE POINT, and attention is pure CPU: under ondemand
 # this measures the governor. Put it back on the way out.
 OLD=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "")
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -66,7 +66,7 @@ P=${P% }
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 CHARSIU_STAGES=1"
 
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -80,14 +80,14 @@ for M in $MODELS; do
 	b=$(basename "$M" .gguf)
 	printf '  %s\n' "$b"
 	printf '    %-7s %-10s %-12s %-12s %s\n' block pass "prompt ms" "attn ms/row" "text"
-	# ⚠ THE TEXT IS PART OF THE MEASUREMENT. A block that is faster and
+	# THE TEXT IS PART OF THE MEASUREMENT. A block that is faster and
 	# wrong is the fault this project has shipped twice; the first arm's
 	# output is the reference and every later one is compared to it.
 	ref=""
 	i=1
 	while [ "$i" -le "$N" ]; do
 		for B in $VALUES; do
-			# ⚠ THE PROMPT LINE IS ON EITHER STREAM depending on the
+			# THE PROMPT LINE IS ON EITHER STREAM depending on the
 			# runner, and phase 9 greps both. stdout is kept apart
 			# because the generated text is compared out of it.
 			err=${TMPDIR:-/tmp}/attn_block.err
@@ -105,7 +105,7 @@ for M in $MODELS; do
 			elif [ "$tx" = "$ref" ]; then
 				v=same
 			else
-				v="⚠ DIFFERS"
+				v="DIFFERS"
 			fi
 			printf '    %-7s %-10s %-12s %-12s %s\n' \
 			    "$B" "$i" "${ms:-?}" "${at:-?}" "$v"

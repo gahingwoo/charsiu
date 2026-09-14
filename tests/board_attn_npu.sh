@@ -5,7 +5,7 @@
 # The other half of the withdrawn rule: how long a prompt does fp16 attention
 # on the NPU need before it pays?
 #
-# ⚠⚠ THE KNOB EXISTS, IT IS CORRECT, AND IT IS OFF FOR A REASON THAT IS NOW
+# THE KNOB EXISTS, IT IS CORRECT, AND IT IS OFF FOR A REASON THAT IS NOW
 # ANSWERABLE. attn_npu_want_for() says so itself:
 #
 #   CHARSIU_ATTN_NPU=auto is withdrawn -- head_dim >= 128 is only half the
@@ -22,7 +22,7 @@
 # this arm, which already exists and already agrees with the CPU to fp16
 # rounding, is faster -- and from what length.
 #
-# ⚠ CORRECTNESS IS NOT ASSUMED HERE EITHER. CHARSIU_ATTN_NPU_CHECK=1 runs both
+# CORRECTNESS IS NOT ASSUMED HERE EITHER. CHARSIU_ATTN_NPU_CHECK=1 runs both
 # arms on the same rows and prints the worst disagreement per layer; on
 # Llama-3.2-1B at 202 tokens that is 0.0024 relative and the generated text is
 # byte-identical. This script re-checks it at the LONGEST length it sweeps,
@@ -32,7 +32,7 @@
 # pinned, arms ALTERNATING at each length, repeats so the spread sits beside
 # the difference.
 #
-# ⚠⚠ BOTH ARMS NAME THE KNOB NOW, AND THAT IS A CORRECTION. Until r411 the
+# BOTH ARMS NAME THE KNOB NOW, AND THAT IS A CORRECTION. Until r411 the
 # CPU arm here was the EMPTY environment, which was the CPU arm because off was
 # the default. r411 made `auto` the default, so the empty environment is a
 # THIRD thing: the CPU arm below 448 tokens and the NPU arm above it. Run
@@ -94,7 +94,7 @@ for R in $REPS; do
 	A=; B=; TOK=; n=0
 	while [ $n -lt "$N" ]; do
 		n=$((n+1))
-		# ⚠ ALTERNATE. All of A then all of B measures the board warming
+		# ALTERNATE. All of A then all of B measures the board warming
 		# up as much as it measures the arms.
 		r=$(ttft "CHARSIU_ATTN_NPU=0" "$P"); TOK=${r%% *}; A="$A ${r##* }"
 		r=$(ttft "CHARSIU_ATTN_NPU=1" "$P"); B="$B ${r##* }"

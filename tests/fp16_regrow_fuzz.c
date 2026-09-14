@@ -1,7 +1,7 @@
 /* Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0
  *
- * ⛔ AN ATTACK ON charsiu_fp16_regrow_vcols, NOT A CONFIRMATION OF IT.
+ * AN ATTACK ON charsiu_fp16_regrow_vcols, NOT A CONFIRMATION OF IT.
  *
  * tests/fp16_regrow.c sweeps a FIXED table of eight head dims and twelve
  * rungs, one step at a time, into destinations that are always freshly
@@ -30,7 +30,7 @@
  * a poisoned destination tail, and a refusal arm that requires every -1 to be
  * a refusal before any byte moved.
  *
- * ⚠ AND TWO CONTROLS THAT HAVE TO FAIL. A comparison that cannot see the bug
+ * AND TWO CONTROLS THAT HAVE TO FAIL. A comparison that cannot see the bug
  * that shipped is not evidence. regrow_variant() below is the same block walk
  * with the two properties the function gained today turned OFF -- ascending,
  * and no clear -- and the run FAILS if either of them ever reaches the
@@ -127,7 +127,7 @@ static void pack_into(uint16_t *buf, unsigned kv, unsigned hd, unsigned lo,
 }
 
 /*
- * ⚠ DECODE LEAVES GAPS. attn_npu_fit passes live = pos -- every position in
+ * DECODE LEAVES GAPS. attn_npu_fit passes live = pos -- every position in
  * the FLOAT cache -- and the mirror below it is not full: decode stopped
  * appending and attn_npu_catchup fills the holes later. So the surface handed
  * to the regrow routinely has zeros at positions below `live`, and the
@@ -229,7 +229,7 @@ static int all_equal(const uint16_t *a, const uint16_t *b, size_t halves,
 
 /* ------------------------------------------------------------------ */
 /*
- * ⚠⚠ THE MUTANTS, BECAUSE A COMPARISON THAT CANNOT SEE A BUG IS NOT EVIDENCE.
+ * THE MUTANTS, BECAUSE A COMPARISON THAT CANNOT SEE A BUG IS NOT EVIDENCE.
  *
  * The same block walk as src/regcmd.c, with one property broken at a time.
  * Every one of these is a plausible way to write this function and two of them
@@ -237,7 +237,7 @@ static int all_equal(const uint16_t *a, const uint16_t *b, size_t halves,
  * never caught by the same comparison the real function is held to -- that is
  * the only thing that makes "all ok" mean anything.
  *
- * ⚠ MUT_NONE is the faithfulness check: the unmutated copy has to agree with
+ * MUT_NONE is the faithfulness check: the unmutated copy has to agree with
  * the real function byte for byte on every shape, or the mutants below are
  * mutations of something else.
  */
@@ -324,7 +324,7 @@ static void bad(const char *arm, unsigned hd, unsigned kv_old,
 		unsigned kv_new, unsigned live, const char *what, size_t at)
 {
 	if (fails < 40)
-		printf("  ⛔ %-4s hd=%u kv_old=%u kv_new=%u live=%u : %s"
+		printf("  %-4s hd=%u kv_old=%u kv_new=%u live=%u : %s"
 		       " (half %zu)\n", arm, hd, kv_old, kv_new, live, what,
 		       at);
 	fails++;
@@ -389,7 +389,7 @@ static void one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 			bad("COPY", hd, kv_old, kv_new, live,
 			    "REFUSED a shape the documented conditions accept",
 			    0);
-		/* ⚠ a refusal must be a refusal BEFORE any byte moved: the
+		/* a refusal must be a refusal BEFORE any byte moved: the
 		 * caller treats -1 as "nothing happened" and then hands this
 		 * very buffer to the packer */
 		for (i = 0; i < bn / 2; i++)
@@ -453,7 +453,7 @@ static void one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 			    "in place leans on a pre zeroed destination tail",
 			    at);
 	}
-	/* ⚠ THE MUTANTS, on this shape, held to the SAME three checks the real
+	/* THE MUTANTS, on this shape, held to the SAME three checks the real
 	 * function is held to: the compared region, the poisoned room above
 	 * the new extent, and the guard halves. Counted rather than asserted
 	 * per case -- an ascending walk is the same walk when there is only
@@ -504,7 +504,7 @@ out:
 
 /* ------------------------------------------------------------------ */
 /*
- * ⭐ THE LADDER, IN ONE BUFFER, WITH POSITIONS APPENDED BETWEEN RUNGS.
+ * THE LADDER, IN ONE BUFFER, WITH POSITIONS APPENDED BETWEEN RUNGS.
  *
  * attn_npu_append calls attn_npu_fit when the position that has arrived does
  * not fit, with live = pos -- every position already in the float cache, this
@@ -545,7 +545,7 @@ static void chain(unsigned hd, const unsigned *rungs, unsigned nr,
 			}
 			if (nk <= p)
 				break;         /* the ladder cannot reach */
-			/* ⚠ mode 1 is the allocating rung the caller still
+			/* mode 1 is the allocating rung the caller still
 			 * takes when the surface has no room, and mode 2 is
 			 * what attn_npu_fit does when `copied` drops in the
 			 * middle of the layer loop: some rungs in place, some
@@ -568,7 +568,7 @@ static void chain(unsigned hd, const unsigned *rungs, unsigned nr,
 			}
 			kv = nk;
 			nrung++;
-			/* ⚠ AT EVERY RUNG. An error repaired by the next move
+			/* AT EVERY RUNG. An error repaired by the next move
 			 * is still an error: the surface is uploaded to the
 			 * hardware at each one. */
 			{
@@ -581,7 +581,7 @@ static void chain(unsigned hd, const unsigned *rungs, unsigned nr,
 					bad("RUNG", hd, kv, kv, live,
 					    "the climbing surface differs from "
 					    "one packed at this rung", at);
-				/* ⭐ AND GROWING TO THE EXTENT IT IS ALREADY
+				/* AND GROWING TO THE EXTENT IT IS ALREADY
 				 * AT MUST BE A NO OP. kv_new == kv_old is
 				 * accepted, memmoves every block onto itself
 				 * and then clears past `live` -- on a live
@@ -636,7 +636,7 @@ static void chain(unsigned hd, const unsigned *rungs, unsigned nr,
 }
 
 /*
- * ⭐ THE SAME LADDER WITH NOTHING APPENDED BETWEEN THE RUNGS, which is the
+ * THE SAME LADDER WITH NOTHING APPENDED BETWEEN THE RUNGS, which is the
  * worst case for the clear: `live` stays where it started while the extent
  * climbs, so the vacated area grows at every rung and nothing ever writes
  * over it again. live 1 against a 32 -> 864 ladder leaves 863 positions of
@@ -698,7 +698,7 @@ static void grow_only(unsigned hd, const unsigned *rungs, unsigned nr,
 }
 
 /*
- * ⭐ A REAL CONTEXT LENGTH. kvmax is n_ctx rounded to 32, so a 32k context
+ * A REAL CONTEXT LENGTH. kvmax is n_ctx rounded to 32, so a 32k context
  * gives a top rung of 32768 and an offset of ngi*ng*ke that has to be done in
  * size_t: at head dim 256 that is 8.4 million halves. Light arms only -- the
  * copy and the in place move against a direct pack -- because the buffers are
@@ -732,7 +732,7 @@ static void huge(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 
 /* ------------------------------------------------------------------ */
 /*
- * ⭐ PROT_NONE PAGES, because guard halves only catch a write that lands in
+ * PROT_NONE PAGES, because guard halves only catch a write that lands in
  * the slack. A read OR a write one byte past the surface faults here instead.
  * Two sub arms: the surface flush against a dead page at its END catches an
  * overrun, flush against one at its START catches an underrun.
@@ -1073,7 +1073,7 @@ int main(void)
 		paged(hd, 512, 512, 400, 1);
 		paged(hd, 512, 512, 400, 0);
 	}
-	/* ⚠ AND RANDOMISED, because this is the ONLY arm that can see a read
+	/* AND RANDOMISED, because this is the ONLY arm that can see a read
 	 * or a write one half past the surface: the guard halves live inside
 	 * the same allocation and a read into them is legal to the allocator.
 	 * The source here ends flush against a page with no permissions. */
@@ -1097,7 +1097,7 @@ int main(void)
 			       "reference anyway %6ld\n", mut_name[m],
 			       mut_n[m], mut_same[m]);
 			if (!mut_n[m] || mut_same[m] == mut_n[m]) {
-				printf("  ⛔ CONTROL: \"%s\" was NEVER caught "
+				printf("  CONTROL: \"%s\" was NEVER caught "
 				       "-- this comparison cannot see that "
 				       "class of bug\n", mut_name[m]);
 				fails++;
@@ -1109,7 +1109,7 @@ int main(void)
 	}
 
 	printf("fp16_regrow_fuzz: %ld cases (%ld moved, %ld refused), %s\n",
-	       cases, accepted, refused, fails ? "⛔ FAILED" : "all ok");
+	       cases, accepted, refused, fails ? "FAILED" : "all ok");
 	if (fails > 40)
 		printf("  (%d failures, only the first 40 printed)\n", fails);
 	return fails ? 1 : 0;

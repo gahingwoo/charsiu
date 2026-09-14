@@ -21,12 +21,12 @@
 # RK3576 is four A72 and four A53. That is the shape of a thread landing on one
 # cluster or the other, so the first arm is affinity.
 #
-# ⚠⚠ THE ARMS ALTERNATE, THEY ARE NOT RUN IN BLOCKS. A board that warms over
+# THE ARMS ALTERNATE, THEY ARE NOT RUN IN BLOCKS. A board that warms over
 # ten minutes gives its last block the worst numbers whatever the arm, and this
 # tree has read that as a property of the arm before. One pass runs every arm
 # once, in order, and the passes repeat.
 #
-# ⚠ AND THE FIRST PASS IS DISCARDED. The first run of anything here is cold --
+# AND THE FIRST PASS IS DISCARDED. The first run of anything here is cold --
 # page cache, the NPU's own clocks, the governor settling -- and a cold first
 # point has been read as a 38% win in this tree before.
 #
@@ -51,7 +51,7 @@ M=${1:-$(find_model 'Qwen3-0.6B-Q4_0.gguf' || true)}
 [ -n "$M" ] && [ -f "$M" ] || { echo "no model"; exit 2; }
 PASSES=${2:-10}
 #
-# ⚠⚠ THE INVOCATION IS board_vendor.sh's, VERBATIM, AND THAT IS THE POINT.
+# THE INVOCATION IS board_vendor.sh's, VERBATIM, AND THAT IS THE POINT.
 # The first version of this probe used its own prompt, -n 48, and neither of
 # the two environment variables the scoreboard sets -- so it changed three
 # things away from the configuration where the bimodality was SEEN, and then
@@ -67,7 +67,7 @@ PASSES=${2:-10}
 P="The history of computing begins long before the first electronic machine. Merchants kept accounts on clay, astronomers ruled tables by hand, and the abacus moved beads along a wire for two thousand years before anyone thought to make the beads move themselves. What changed was not arithmetic but who did it: a machine that could be told the order of operations once and would then repeat them without tiring, without a wage, and without the small drift of attention that makes a long column of figures a gamble. Explain, in plain words, why that shift mattered more than the speed:"
 
 #
-# ⚠ READ THE TOPOLOGY, DO NOT ASSUME IT. "cpu0-3 is the little cluster" is true
+# READ THE TOPOLOGY, DO NOT ASSUME IT. "cpu0-3 is the little cluster" is true
 # on most Rockchip parts and is not a fact about this one until it is read.
 #
 echo "== the cores, from the board rather than from memory"
@@ -87,11 +87,11 @@ LIT=$(for c in /sys/devices/system/cpu/cpu[0-9]*; do
 	echo "$f $(basename "$c" | tr -dc 0-9)"; done | sort -n | head -4 |
 	awk '{printf "%s%s", (NR>1?",":""), $2}')
 echo "   fast four: $BIG      slow four: $LIT"
-command -v taskset >/dev/null || { echo "⛔ no taskset on this board"; exit 2; }
+command -v taskset >/dev/null || { echo "no taskset on this board"; exit 2; }
 echo
 
 #
-# ⚠⚠ THE THREAD COUNT IS PINNED IN EVERY ARM. taskset does not change what
+# THE THREAD COUNT IS PINNED IN EVERY ARM. taskset does not change what
 # sysconf(_SC_NPROCESSORS_ONLN) reports, so an unpinned run would start eight
 # threads and a pinned one would start eight threads on four cores -- two
 # differences at once, and the knob would not be affinity.
@@ -106,14 +106,14 @@ run_one() {   # $1 = label, $2 = taskset prefix or empty
 }
 
 echo "== $(basename "$M"), $PASSES passes, arms ALTERNATING, pass 1 discarded"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
 . "$(dirname "$0")/board_clk.sh"
 echo "   build $(charsiu_build "$BIN/charsiu_run")"
 echo "   board_vendor.sh's own invocation; -t 4, so four threads in every arm"
-echo "   ⚠ the DEFAULT arm is the scoreboard exactly: no taskset at all"
+echo "   the DEFAULT arm is the scoreboard exactly: no taskset at all"
 echo
 DEF=; ALL8=; BG=; LT=
 i=0
@@ -138,18 +138,18 @@ echo "   big four   $BG"
 echo "   little4    $LT"
 echo
 #
-# ⚠ WHAT WOULD MAKE THIS RED. If all three arms stay bimodal, affinity is not
+# WHAT WOULD MAKE THIS RED. If all three arms stay bimodal, affinity is not
 # the switch and the ratio was a coincidence of scale. If the pinned arms are
 # each UNIMODAL and sit at the two levels, it is the scheduler, and the fix is
 # a policy rather than a finding. Say which before reading the numbers.
 #
 #
-# ⚠⚠ THE FIRST THING TO CHECK IS THAT THE DEFAULT ARM REPRODUCED THE THING.
+# THE FIRST THING TO CHECK IS THAT THE DEFAULT ARM REPRODUCED THE THING.
 # If `default` comes back unimodal, this round did not observe the effect at
 # all and NOTHING below it can be read -- not as a confirmation and not as a
 # refutation. A probe that cannot see the phenomenon cannot rule on its cause.
 #
-echo "⚠ FIRST: is the DEFAULT arm bimodal? If not, this round saw nothing and"
+echo "FIRST: is the DEFAULT arm bimodal? If not, this round saw nothing and"
 echo "  none of the other arms mean anything either way."
 echo
 echo "  then: pinned arms unimodal, default bimodal   -> placement IS the switch"

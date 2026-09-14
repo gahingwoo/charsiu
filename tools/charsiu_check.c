@@ -27,7 +27,7 @@
  *   2  it is not a gguf, or it cannot be opened at all
  *   3  charsiu can run this, but NOT as a chat model
  *
- * ⚠ 3 EXISTS BECAUSE THE ZOO STOPPED BEING ALL CHAT MODELS. A vision tower and
+ * 3 EXISTS BECAUSE THE ZOO STOPPED BEING ALL CHAT MODELS. A vision tower and
  * a whisper model are both things charsiu runs and neither is something the
  * front door can hold a conversation with, and the two failure modes of not
  * saying so are opposite and both bad: charsiu-get DELETED a whisper download
@@ -70,7 +70,7 @@ struct seen {
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -108,7 +108,7 @@ int main(int argc, char **argv)
 
 	if (gguf_open(&g, path)) {
 		/*
-		 * ⚠ A whisper MODEL IS NOT A gguf AND IS NOT A FAILURE. It is
+		 * A whisper MODEL IS NOT A gguf AND IS NOT A FAILURE. It is
 		 * whisper.cpp's own container, charsiu reads it, and reporting
 		 * it as unreadable made charsiu-get delete a finished 78 MB
 		 * download. Look at the magic before saying no.
@@ -143,7 +143,7 @@ int main(int argc, char **argv)
 	gguf_get_str(&g, "general.name", name, sizeof(name));
 
 	/*
-	 * ⚠ THIS LIST MUST MATCH llama_load's. It exists to save a 2 GB
+	 * THIS LIST MUST MATCH llama_load's. It exists to save a 2 GB
 	 * download, so it is wrong in both directions: refusing something that
 	 * runs wastes a model, and accepting something that does not wastes the
 	 * download this is here to prevent.
@@ -166,7 +166,7 @@ int main(int argc, char **argv)
 		bad_graph = 1;
 
 	/*
-	 * ⚠ THE GRAPH IS NOT THE ONLY THING THAT HAS TO MATCH. charsiu's
+	 * THE GRAPH IS NOT THE ONLY THING THAT HAS TO MATCH. charsiu's
 	 * tokenizer is BPE and needs a merge table; a file that declares
 	 * tokenizer.ggml.model = llama carries SentencePiece scores instead and
 	 * will load its weights and then fail to turn text into tokens.
@@ -179,7 +179,7 @@ int main(int argc, char **argv)
 
 		gguf_get_str(&g, "tokenizer.ggml.model", tok, 64);
 		/*
-		 * ⚠ TWO FAMILIES ARE FINE NOW: BPE with merges, and
+		 * TWO FAMILIES ARE FINE NOW: BPE with merges, and
 		 * SentencePiece with a score per piece. What is not fine is
 		 * NEITHER, which is a file this cannot turn into tokens.
 		 */
@@ -214,7 +214,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ BEFORE THE VERDICT, in both modes. A vision tower's architecture is
+	 * BEFORE THE VERDICT, in both modes. A vision tower's architecture is
 	 * "clip", which is not a graph charsiu builds, so the ordinary path
 	 * reported it as unrunnable -- true of a chat, false of the file.
 	 */

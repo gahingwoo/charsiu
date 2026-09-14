@@ -4,7 +4,7 @@
 """
 Read a whisper.cpp model in numpy, so the references have real weights.
 
-⚠ THIS IS A SECOND READER, ON PURPOSE. Checking charsiu's encoder against a
+THIS IS A SECOND READER, ON PURPOSE. Checking charsiu's encoder against a
 reference that shares charsiu's own file parsing would pass a misread tensor,
 so this parses the container independently, from the format description alone.
 """

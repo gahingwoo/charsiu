@@ -5,7 +5,7 @@
 # Is speculative decoding bit-identical to the plain greedy loop, and did it
 # actually speculate?
 #
-# ⚠ THREE ARMS, AND THE THIRD ONE IS THE POINT. A verifier that accepts
+# THREE ARMS, AND THE THIRD ONE IS THE POINT. A verifier that accepts
 # everything produces fluent text at a wonderful rate; a verifier that runs
 # plain produces the right text at the old rate and a report line that reads
 # as "speculation gained nothing". Neither is visible from the text alone.
@@ -22,7 +22,7 @@
 # on open prose it mostly proposes nothing and this test could pass with an
 # acceptance of zero, which would say nothing about the verifier.
 #
-# ⚠ THIS NEEDS NO HARDWARE. On a machine with no NPU the batched forward runs a
+# THIS NEEDS NO HARDWARE. On a machine with no NPU the batched forward runs a
 # row at a time on the CPU, so the ORDER of the speculative pass is exercised
 # and the batched MATMUL is not -- which is the same blind spot phase 2 has, and
 # why the board round still has to run it. What this can prove is that the
@@ -36,13 +36,13 @@
 
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
 # INSTALLED binary for twenty minutes while believing otherwise.
 . "$(dirname "$0")/board_clk.sh"
-# ⚠ THE ENVIRONMENT IS THE SECOND WAY IN. The board's regress.sh calls
+# THE ENVIRONMENT IS THE SECOND WAY IN. The board's regress.sh calls
 # this with no argument, having exported CHARSIU_BOARD_DIR, and a hard ${1:?}
 # turned that into a usage line inside a pipeline -- so the section printed
 # its heading and nothing else, and the regression carried on green. Same
@@ -60,7 +60,7 @@ fi
 N="${2:-48}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROMPT="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
-# ⚠ ON THE BOARD THERE IS NO MAKEFILE AND NO build/: the binaries sit beside
+# ON THE BOARD THERE IS NO MAKEFILE AND NO build/: the binaries sit beside
 # this script in /opt/charsiu. The first board run of this died on
 # "No rule to make target build/charsiu_run" before measuring anything.
 RUN=${CHARSIU_RUN_BIN:-}
@@ -72,7 +72,7 @@ if [ -z "$RUN" ] && [ -f "$ROOT/Makefile" ]; then
 	make -C "$ROOT" build/charsiu_run >/dev/null && RUN="$ROOT/build/charsiu_run"
 fi
 [ -x "${RUN:-/nonexistent}" ] || { echo "no charsiu_run to test with"; exit 2; }
-# ⚠⚠ NOT UNDER $ROOT/build. On the board ROOT is /opt and there is no build/,
+# NOT UNDER $ROOT/build. On the board ROOT is /opt and there is no build/,
 # and a redirection that cannot open its file stops the whole command: phase
 # 20's first board run ran the spec arm of ten models ZERO times and reported
 # all ten as differing from plain.
@@ -93,13 +93,13 @@ for mdl in "$DIR"/*.gguf; do
 	case "$(basename "$mdl")" in mmproj-*) continue;; esac
 	n=$((n + 1))
 	name=$(basename "$mdl")
-	# ⚠ A MODEL THAT STOPS AT ONCE VERIFIES NOTHING. gemma-3-1b answers a
+	# A MODEL THAT STOPS AT ONCE VERIFIES NOTHING. gemma-3-1b answers a
 	# bare prompt with its end-of-turn token as the very first token, so
 	# every arm commits one token and the identity is vacuous. Push it past
 	# its own end: the text is then a continuation of a finished turn, which
 	# is a poor answer and a perfectly good oracle -- the three arms still
 	# have to agree on every token of it.
-	# ⚠ DECIDED ON THE PASS COUNT, NOT ON THE TEXT: the runner echoes the
+	# DECIDED ON THE PASS COUNT, NOT ON THE TEXT: the runner echoes the
 	# prompt, so a word count of the output is never small.
 	EXTRA=""
 	spec=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 2>"$ERR")
@@ -127,28 +127,28 @@ for mdl in "$DIR"/*.gguf; do
 
 	ok=1
 	if [ "$tp" != "$ts" ]; then
-		echo "  ⚠⚠ $name: speculative text DIFFERS from plain greedy"
+		echo "  $name: speculative text DIFFERS from plain greedy"
 		printf '     plain: %.100s\n     spec:  %.100s\n' "$tp" "$ts"
 		ok=0
 	fi
 	if [ "$tp" != "$tj" ]; then
-		echo "  ⚠⚠ $name: text moved under JUNK drafts -- the verifier is not verifying"
+		echo "  $name: text moved under JUNK drafts -- the verifier is not verifying"
 		ok=0
 	fi
 	if [ -z "$ls" ]; then
-		echo "  ⚠⚠ $name: no [spec ...] line -- the arm ran plain and said nothing"
+		echo "  $name: no [spec ...] line -- the arm ran plain and said nothing"
 		ok=0
 	elif [ "$as" -lt 1 ]; then
-		echo "  ⚠⚠ $name: identical text but ZERO drafts accepted -- this proved nothing"
+		echo "  $name: identical text but ZERO drafts accepted -- this proved nothing"
 		echo "     $ls"
 		ok=0
 	fi
 	if [ "$aj" -gt 1 ]; then
-		echo "  ⚠⚠ $name: junk drafts were accepted $aj times"
+		echo "  $name: junk drafts were accepted $aj times"
 		ok=0
 	fi
 	if [ $ok = 1 ]; then
-		printf '  ✓ %-40s identical x3   %s%s\n' "$name" \
+		printf '  %-40s identical x3   %s%s\n' "$name" \
 		    "$(printf '%s' "$ls" | sed 's/^\[spec k=3: //; s/\]$//')" \
 		    "${EXTRA:+   (past its own end)}"
 	else

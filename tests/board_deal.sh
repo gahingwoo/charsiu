@@ -20,7 +20,7 @@ mid() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' | sort -n | awk '{a[NR]=
 lo() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' | sort -n | head -1; }
 hi() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' | sort -n | tail -1; }
 rate() { grep '^\[load' "$1" | sed 's/.*gen [0-9]* tok in [0-9]* ms, \([0-9.]*\) tok.s.*/\1/'; }
-# ⚠ charsiu_run prints TWO timing lines on stdout: [load ...] and [first 8 tok
+# charsiu_run prints TWO timing lines on stdout: [load ...] and [first 8 tok
 # ...].  Hashing with only the first filtered gave five different hashes for
 # five identical runs of one arm, in the min_mac round -- the check said
 # "DIFFERS" and was measuring the clock.  Filter every line that starts '['.

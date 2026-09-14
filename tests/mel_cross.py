@@ -4,7 +4,7 @@
 """
 Diff charsiu's log mel spectrogram against a numpy reference.
 
-⚠ WHY THIS IS ITS OWN TEST. Everything about the front end fails quietly. A
+WHY THIS IS ITS OWN TEST. Everything about the front end fails quietly. A
 symmetric window instead of a periodic one, centre padding that reflects the
 wrong way, a clamp taken per frame instead of over the clip: none of them
 crashes, none of them makes a number infinite, and every one of them produces a
@@ -41,10 +41,10 @@ def reference(pcm, filt, dtype=np.float64):
     reference and an f32 one bracket what rounding alone can produce."""
     n_mel, bins = filt.shape
     filt = filt.astype(dtype)
-    # ⚠ PERIODIC: 1 - cos(2 pi i / N), not numpy.hanning's N - 1
+    # PERIODIC: 1 - cos(2 pi i / N), not numpy.hanning's N - 1
     win = (0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(N_FFT) / N_FFT))
            ).astype(dtype)
-    # ⚠ REFLECTED AT THE FRONT, SILENCE AT THE BACK. whisper.cpp mirrors 200
+    # REFLECTED AT THE FRONT, SILENCE AT THE BACK. whisper.cpp mirrors 200
     # samples about sample 0 and then zero fills a whole 30 s window. Padding
     # both ends by reflection -- torch.stft(center=True), np.pad("reflect") --
     # fills the empty part of the clip with a repeat of the speech.
@@ -58,7 +58,7 @@ def reference(pcm, filt, dtype=np.float64):
         spec = np.fft.rfft(seg, n=N_FFT)[:bins]
         power = (spec.real ** 2 + spec.imag ** 2)
         out[:, f] = np.log10(np.maximum(filt @ power, 1e-10))
-    # ⚠ the clamp is over the WHOLE spectrogram
+    # the clamp is over the WHOLE spectrogram
     out = np.maximum(out, out.max() - 8.0)
     return ((out + 4.0) / 4.0).astype(np.float32)
 
@@ -89,7 +89,7 @@ def main():
         want = reference(pcm, filt)
         want32 = reference(pcm, filt, np.float32).astype(np.float64)
         err = np.abs(got - want)
-        # ⚠ THE NOISE FLOOR IS MEASURED, NOT ASSUMED. charsiu's FFT is f32 and
+        # THE NOISE FLOOR IS MEASURED, NOT ASSUMED. charsiu's FFT is f32 and
         # this reference is f64, so the same computation in f32 says what
         # rounding alone can produce. A tolerance picked to make a test pass is
         # not a tolerance.

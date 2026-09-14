@@ -18,7 +18,7 @@
  * all 2^32 bit patterns. It runs in a couple of seconds on the desk, because
  * the development host is itself aarch64.
  *
- * ⚠ The SEQUENCE the strided pack walks is checked here too, but against a
+ * The SEQUENCE the strided pack walks is checked here too, but against a
  * copy of the loop it replaced rather than against npufp16.c itself, which
  * needs a device. npu_fp16_test --group is what checks the real path, bit for
  * bit at mixed shapes, on the board.
@@ -217,7 +217,7 @@ static void strided(void)
 			ok++;
 		}
 	}
-	/* ⚠ the count that AGREED, not the count that ran. The first draft
+	/* the count that AGREED, not the count that ran. The first draft
 	 * printed s either way, so a run with eight failures above it still
 	 * ended in a line saying twelve shapes agree. */
 	printf("pack_f16run: %u of %u strided shapes agree with the per"

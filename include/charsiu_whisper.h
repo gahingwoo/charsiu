@@ -3,7 +3,7 @@
 /*
  * Whisper: a board that hears.
  *
- * ⚠ NOT A gguf. whisper.cpp has its own container and every model anybody
+ * NOT A gguf. whisper.cpp has its own container and every model anybody
  * actually has is in it, so this reads that: a magic, eleven int32 hparams, the
  * MEL FILTERBANK, the vocabulary, and then the tensors back to back. Two of
  * those are a gift -- the filterbank and the vocabulary are in the file, so
@@ -13,7 +13,7 @@
  * mean f32 and f16, so gguf_matvec and gguf_row_f32 work on them unchanged and
  * the encoder is the same matmul the rest of this tree is built out of.
  *
- * ⚠ AND THE ENCODER IS THE BATCHED CASE AGAIN. Thirty seconds of audio is 3000
+ * AND THE ENCODER IS THE BATCHED CASE AGAIN. Thirty seconds of audio is 3000
  * mel frames and 1500 encoder positions, all present at once -- the same shape
  * as an image's patches and a prompt's tokens.
  */
@@ -57,7 +57,7 @@ struct charsiu_whisper {
 	char **vocab;
 	int32_t n_vocab_file;
 	/*
-	 * ⚠ THE SPECIAL IDS ARE NOT IN THE FILE. whisper.cpp assigns them by
+	 * THE SPECIAL IDS ARE NOT IN THE FILE. whisper.cpp assigns them by
 	 * arithmetic on n_vocab, and the ENGLISH ONLY models shift them by one
 	 * from the multilingual ones. Getting this wrong is a decoder that
 	 * never stops, or one that emits timestamps as words.
@@ -80,7 +80,7 @@ struct charsiu_whisper {
 	char why[192];
 
 	/*
-	 * ⚠ THE ENCODER'S POOL, int8, and the encoder only. Thirty seconds of
+	 * THE ENCODER'S POOL, int8, and the encoder only. Thirty seconds of
 	 * audio is 1500 positions at once against weights that do not change --
 	 * the batched matmul. The DECODER runs one token at a time, so it never
 	 * meets the m > 1 gate and stays where it was; its own weights are a
@@ -102,7 +102,7 @@ void charsiu_whisper_describe(const struct charsiu_whisper *w, FILE *out);
  * `out` is [n_mels][WHISPER_N_FRAMES], padded with the pad value where the
  * audio ran out. Returns 0, or -1.
  *
- * ⚠ THE NORMALISATION IS PART OF THE MODEL. log10, then clamped to eight
+ * THE NORMALISATION IS PART OF THE MODEL. log10, then clamped to eight
  * decades below the LOUDEST BIN IN THE WHOLE SPECTROGRAM, then (x + 4) / 4.
  * That maximum makes the transform depend on the entire clip, so a frame does
  * not have a value until the last frame has been computed.
@@ -113,7 +113,7 @@ int charsiu_whisper_mel(const struct charsiu_whisper *w, const float *pcm,
 /*
  * The audio encoder: [n_mels][3000] in, [n_audio_ctx][n_audio_state] out.
  *
- * ⚠ THE TWO CONVOLUTIONS ARE REAL ONES. Kernel 3, stride 1 then 2, padding 1 --
+ * THE TWO CONVOLUTIONS ARE REAL ONES. Kernel 3, stride 1 then 2, padding 1 --
  * the windows OVERLAP, unlike a patch embedding whose stride equals its kernel.
  * So each is three matmuls summed over the three kernel taps rather than one,
  * and the second halves 3000 frames into 1500 positions.
@@ -126,7 +126,7 @@ int charsiu_whisper_encode(const struct charsiu_whisper *w, const float *mel,
 /*
  * The text decoder, one token at a time.
  *
- * ⚠ CROSS ATTENTION IS THE NEW THING IN THIS TREE. Every attention charsiu had
+ * CROSS ATTENTION IS THE NEW THING IN THIS TREE. Every attention charsiu had
  * before this reads its own keys and values from the same sequence; a decoder
  * block reads them from the ENCODER's 1500 positions instead, and those do not
  * change from token to token. So they are computed once per clip, per layer,

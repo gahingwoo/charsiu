@@ -4,7 +4,7 @@
 #
 # The fused kernel against the exact one at every awkward shape.
 #
-# ⚠⚠ THE RAGGED ENDS ARE WHERE A TILED KERNEL IS WRONG. vision_cross runs a toy
+# THE RAGGED ENDS ARE WHERE A TILED KERNEL IS WRONG. vision_cross runs a toy
 # tower whose sequence is 16, which is smaller than the query block and an exact
 # multiple of the key tile -- so it exercises neither remainder. The tower's own
 # sequence is 1024, or 1025 when the model has a class token, and 1025 is a
@@ -16,7 +16,7 @@
 #
 #     tests/vattn_edges.sh [build/vattn_bench]
 
-# ⚠ THE INSTALLED PATH, NOT THE SOURCE TREE'S. `charsiu update dev` puts the
+# THE INSTALLED PATH, NOT THE SOURCE TREE'S. `charsiu update dev` puts the
 # binary in /opt/charsiu and this defaulted to build/vattn_bench, which exists
 # only where it was compiled -- so shipping the script alone would have failed
 # a second time, one line further on.
