@@ -19,7 +19,21 @@ set -e
 # alias too late to be read -- which is how round 414 measured the
 # INSTALLED binary for twenty minutes while believing otherwise.
 . "$(dirname "$0")/board_clk.sh"
-DIR="${1:?usage: neon_control.sh MODEL_DIR [PROMPT]}"
+# ⚠ THE ENVIRONMENT IS THE SECOND WAY IN. The board's regress.sh calls
+# this with no argument, having exported CHARSIU_BOARD_DIR, and a hard ${1:?}
+# turned that into a usage line inside a pipeline -- so the section printed
+# its heading and nothing else, and the regression carried on green. Same
+# hole arch_sanity.sh had; censused by the property rather than the name.
+DIR="${1:-${CHARSIU_BOARD_DIR:-}}"
+if [ -z "$DIR" ]; then
+	echo "neon_control.sh: no model directory." >&2
+	echo "  give one as \$1, or set CHARSIU_BOARD_DIR." >&2
+	exit 2
+fi
+if [ ! -d "$DIR" ]; then
+	echo "neon_control.sh: $DIR is not a directory" >&2
+	exit 2
+fi
 P="${2:-The capital of France is}"
 N=32
 

@@ -42,7 +42,21 @@ set -u
 # alias too late to be read -- which is how round 414 measured the
 # INSTALLED binary for twenty minutes while believing otherwise.
 . "$(dirname "$0")/board_clk.sh"
-DIR="${1:?usage: spec_identity.sh MODEL_DIR [N_TOKENS]}"
+# ⚠ THE ENVIRONMENT IS THE SECOND WAY IN. The board's regress.sh calls
+# this with no argument, having exported CHARSIU_BOARD_DIR, and a hard ${1:?}
+# turned that into a usage line inside a pipeline -- so the section printed
+# its heading and nothing else, and the regression carried on green. Same
+# hole arch_sanity.sh had; censused by the property rather than the name.
+DIR="${1:-${CHARSIU_BOARD_DIR:-}}"
+if [ -z "$DIR" ]; then
+	echo "spec_identity.sh: no model directory." >&2
+	echo "  give one as \$1, or set CHARSIU_BOARD_DIR." >&2
+	exit 2
+fi
+if [ ! -d "$DIR" ]; then
+	echo "spec_identity.sh: $DIR is not a directory" >&2
+	exit 2
+fi
 N="${2:-48}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROMPT="Repeat this sentence exactly three times, word for word: the quick brown fox jumps over the lazy dog."
