@@ -885,7 +885,9 @@ struct charsiu_npu {
 	 * of it back -- and 50410 is still 5.1% WORSE than staying at 1024.
 	 *
 	 * ⚠⚠ WHICH IS ARITHMETIC RATHER THAN A SURPRISE, AND IT CLOSES THE
-	 * IDEA. Merging two K slices into one removes ONE task, worth 36.8 us,
+	 * IDEA. Merging two K slices into one removes ONE task, worth 36.8 us at
+	 * the withdrawn fit and 4.81 to 7.7 as measured, which only makes the
+	 * case below stronger,
 	 * and hands the surviving slice both halves' bytes -- which on a
 	 * 1.05 MB slice is 115 us. The task term is only 7.4 ms of a token
 	 * against the per call term's 11.5, and the per call term is untouched
@@ -1058,10 +1060,19 @@ struct charsiu_npu {
 	 * read is one pass over its own range of the caller's Y: the first
 	 * assigns and the K slices after it add. Fusing the slices a device
 	 * holds for one output range would make that one pass instead of
-	 * several, and whether that is worth writing depends entirely on how
-	 * the deal spread the slices -- one slice per device per range and
-	 * there is nothing to fuse. So count the passes and count the ranges
-	 * before touching the loop.
+	 * several.
+	 *
+	 * ⛔ IT WAS WRITTEN AND IT LOST. CHARSIU_NPU_READ_FUSE is 2.3% slower
+	 * on Llama-3.2-1B and flat on Qwen3, because it trades s sequential Y
+	 * round trips for s scattered source streams and this loop is already
+	 * bandwidth bound; the note above read_rows has the numbers. This used
+	 * to read "whether that is worth writing depends entirely on how the
+	 * deal spread the slices... count the passes before touching the
+	 * loop", and anyone following the counter back from the stderr line
+	 * landed here and read an open road. r412 did exactly that.
+	 *
+	 * The counters stay because they are the answer if the deal or KMAX
+	 * ever changes, not because the loop is worth touching.
 	 */
 	unsigned long bread_passes, bread_ranges;
 	uint64_t bseen_dev;        /* (device, output range) pairs seen this call */
@@ -2717,6 +2728,26 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * only add a constant to both sides of every comparison. What is left says a
  * task is worth a third of a megabyte, which is why the deal cannot be by bytes
  * alone: a run of tiny slices piled on one core costs real time.
+ *
+ * ⛔⛔⛔ AND THAT FIT IS WITHDRAWN, WHICH MAKES THESE TWO CONSTANTS THE ONLY
+ * PLACE IN THE TREE WHERE A WITHDRAWN NUMBER IS STILL RUNNING.
+ *
+ * The line above is the 2026-08-31 hand computed stage fit. Its per task term
+ * was refuted 48 hours later by round 152, which measured a job directly at
+ * 16.85 us + 4.81 us a task on a matmul with no arithmetic in it, and r412's
+ * counter reads 7.7 us a task on gemma4 and 3.2 on gemma3. See the withdrawal
+ * beside busy_us for the whole of it.
+ *
+ * So "a task is worth a third of a megabyte" is 1/15 to 1/36 at the measured
+ * coefficients, and this deal is charging a task five to twelve times what it
+ * costs. The megabyte term is fine: 110.0 against a measured 114.3 to 116.7.
+ *
+ * ⚠ THE CONSTANT IS LEFT ALONE ON PURPOSE. Changing it changes which core
+ * every slice lands on, and that is a board question, not a desk one: the last
+ * reading had the busier core carrying 1.05x an even share, which is close
+ * enough that over weighting tasks may be doing no harm or may be the reason
+ * it is that even. Swapping 36.8 for 4.81 without measuring would replace a
+ * refuted number with an unmeasured one. It is on the board list.
  *
  * ⚠ CHARSIU_NPU_DEAL_INDEX PUTS THE OLD DEAL BACK, and it has to be here
  * rather than at the call site because the sizing pass and the staging pass

@@ -10084,8 +10084,8 @@ memory.
 ⛔ **"fp16 attention on the NPU is slower at every cache depth and is shut" --
 OVERTAKEN, and the entries above that say it are dated readings that stand.**
 The arm came back, went behind `CHARSIU_ATTN_NPU=auto` with a length threshold,
-and was on by default above 448 tokens (r412: **320, and never for a model with
-no GQA** -- see the two corrections below this entry). r411 then split its heads into two groups
+and was on by default above 448 tokens (r412: **320, and a second threshold of
+448 for a model with no GQA** -- see the two corrections below this entry). r411 then split its heads into two groups
 over two unit pairs so the softmax runs during the scores fence instead of after
 it -- 322 ms of layer at 852 tokens, and the wait itself collapses, scores fence
 503 ms to 38.

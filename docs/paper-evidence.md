@@ -1284,6 +1284,36 @@ on the prompt is now the size of our lead, not who has it.
 
 ## 8. What is not supported
 
+⛔ **"39% of a decode token is dispatch." WITHDRAWN r412, and it was never a
+token share.** It is `(fix + tsk) / busy_us` = (11.5 + 7.4) / 48.0, a share of
+the decode HARDWARE PATH; against the 58.4 ms token in the same paragraph the
+same numerator is 32%. Four things are wrong with quoting it:
+
+- the five stage times it was fitted from exist in **no board log in either
+  repository**. There is no round record for 2026-08-31, so the run behind it
+  cannot be reproduced or checked;
+- its per task coefficient, 36.8 us, was refuted 48 hours later by round 152,
+  which measured a job directly at 16.85 us + 4.81 us a task on a matmul with
+  no arithmetic in it. At 4.81 the share is **26%**;
+- the same fit was hand computed twice in one file on one day, from different
+  assumed call and task counts, and written down as 39 in one place and 40 in
+  another;
+- the counter that replaced it reads **14.5% and 15.0%** on gemma4 and gemma3.
+  The per call term fell from 128.7 us to 43-51 across the qos hold, the v11
+  tree and the two rocket patches, so even the corrected 26% describes a
+  runtime that no longer exists.
+
+⚠ **Do not confuse it with a different number that is NOT withdrawn**: `130 us
+x 150 calls = 19.5 ms of a 51.7 ms token, 38%` is Qwen3, 2026-09-02, and its
+denominator is a real wall clock token. That one is dated rather than wrong,
+and its per call term has also moved.
+
+⚠ **And the withdrawn fit is still executing.** `DEAL_US_TASK 36.8` in
+npudev.c decides which core every slice lands on. It is left alone until a
+board round can price the alternatives, because swapping it for 4.81 without
+measuring replaces a refuted number with an unmeasured one; the comment there
+says so.
+
 The vendor at the frequency their published figures were taken at. Their
 runtime HAS now been run here -- 1b at 594 MHz on both sides, 1g across the
 whole CPU range including their published maximum -- but section 1's right
