@@ -572,6 +572,25 @@ void charsiu_fp16_release(struct charsiu_fp16 *f);
  */
 void charsiu_fp16_poison_and_release(struct charsiu_fp16 *f);
 
+/* size the shared buffers for the widest group this unit will run, so the
+ * growth does not land in the middle of a prompt. 0, or -1 for a shape the
+ * unit cannot plan. */
+int charsiu_fp16_reserve(struct charsiu_fp16 *f,
+			 const struct charsiu_fp16_op *ops, unsigned nops);
+/*
+ * ⭐ THE SAME GROUP IN TWO HALVES, so a caller can do CPU work while the
+ * hardware runs. submit() returns as soon as the job is queued; wait() takes
+ * the fence and reads the answers back. One group in flight per unit: a
+ * second submit before the wait is a caller bug, and a wait with nothing in
+ * flight returns -1.
+ *
+ * ⚠ THE OPS ARE COPIED, THE BUFFERS THEY NAME ARE NOT. X, Y, W and the fill
+ * context must all still be alive and unchanged at the wait.
+ */
+int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
+				     const struct charsiu_fp16_op *ops,
+				     unsigned nops);
+int charsiu_fp16_matmul_group_wait(struct charsiu_fp16 *f);
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			      const struct charsiu_fp16_op *ops, unsigned nops);
 

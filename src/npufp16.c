@@ -107,6 +107,22 @@ struct charsiu_fp16 {
 	 */
 	unsigned pm[FP16_GROUP_MAX], pn[FP16_GROUP_MAX];
 	int prepoisoned;
+	/*
+	 * ⭐ ONE GROUP IN FLIGHT, which is what lets a caller do CPU work
+	 * between the submit and the fence.
+	 *
+	 * The fence is a sleeping ioctl, so every millisecond of it is four
+	 * idle cores; the softmax between the two attention groups is the
+	 * mirror image, NPU idle. Splitting this function in two lets a caller
+	 * hold two units and interleave them. The ops are COPIED because the
+	 * caller's array is usually a local that goes out of scope -- the
+	 * buffers they point AT must still be alive at the wait.
+	 */
+	struct charsiu_fp16_plan inpl;
+	struct charsiu_fp16_op inops[FP16_GROUP_MAX];
+	unsigned innops;
+	int invec, inflight;
+	double intcall, intprev;
 };
 
 static double now_ms(void)
@@ -857,13 +873,40 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
  * straight into the buffer pays none of it -- and the times below name it
  * separately so the next round can see what is left after it goes.
  */
-int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
-			      const struct charsiu_fp16_op *ops, unsigned nops)
+/*
+ * ⭐ ALLOCATE FOR THE WIDEST SHAPE ONCE, INSTEAD OF GROWING INTO IT.
+ *
+ * want() only grows, so a caller whose shapes get bigger reallocates all five
+ * buffers every time -- five buffer objects, one of them 21 MB for the
+ * attention scores, mmap and first touch included. At 852 tokens the scores
+ * unit spent 73 ms in `plan`, which is where that lands, for about five
+ * growths in the first layer of each prompt chunk; every later layer runs the
+ * same shapes and grows nothing.
+ *
+ * ⚠ IT ONLY EVER MAKES THE BUFFERS BIGGER, and it does not poison, submit or
+ * touch `last`: it is the allocation half of a call and nothing else. A caller
+ * that reserves a shape it never runs has wasted memory and changed no answer.
+ */
+int charsiu_fp16_reserve(struct charsiu_fp16 *f,
+			 const struct charsiu_fp16_op *ops, unsigned nops)
+{
+	struct charsiu_fp16_plan pl;
+
+	if (!f || charsiu_fp16_make_plan(ops, nops, &pl))
+		return -1;
+	return want(f, pl.wtot + 4096, pl.itot + 4096, pl.otot + 4096,
+		    pl.ctot + 4096,
+		    (size_t)nops * FP16_REG_STRIDE + 4096);
+}
+
+int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
+				     const struct charsiu_fp16_op *ops,
+				     unsigned nops)
 {
 	struct charsiu_job job[FP16_GROUP_MAX];
 	struct charsiu_task task[FP16_GROUP_MAX];
 	struct charsiu_fp16_plan pl;
-	unsigned i, bad = 0, borrowed = 0;
+	unsigned i;
 	int prepoisoned = 0;
 	struct charsiu_joblist jl;
 	uint32_t ins[3 + FP16_GROUP_MAX], outs[1];
@@ -1280,6 +1323,40 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		f->macs += (unsigned long long)ops[i].m * ops[i].k * ops[i].n;
 	f->t.submit += now_ms() - t0;
 
+	/* everything the wait needs that this half computed */
+	f->inpl = pl;
+	memcpy(f->inops, ops, nops * sizeof(*ops));
+	f->innops = nops;
+	f->invec = vec;
+	f->intcall = tcall;
+	f->intprev = tprev;
+	f->inflight = 1;
+	return 0;
+}
+
+/*
+ * The other half: the fence, the readback and the bookkeeping. A unit with
+ * nothing in flight returns -1 rather than waiting on whatever the buffer
+ * last held.
+ */
+int charsiu_fp16_matmul_group_wait(struct charsiu_fp16 *f)
+{
+	const struct charsiu_fp16_op *ops;
+	struct charsiu_fp16_plan pl;
+	unsigned i, nops, bad = 0, borrowed = 0;
+	double t0, tcall, tprev;
+	int vec;
+
+	if (!f || !f->inflight)
+		return -1;
+	f->inflight = 0;
+	ops = f->inops;
+	pl = f->inpl;
+	nops = f->innops;
+	vec = f->invec;
+	tcall = f->intcall;
+	tprev = f->intprev;
+
 	t0 = now_ms();
 	charsiu_bo_prep(f->dev, &f->ob, 1000000000);   /* the one fence wait */
 	f->t.fence += now_ms() - t0;
@@ -1318,6 +1395,14 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	}
 	f->calls += nops;
 	return 0;
+}
+
+int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
+			      const struct charsiu_fp16_op *ops, unsigned nops)
+{
+	if (charsiu_fp16_matmul_group_submit(f, ops, nops))
+		return -1;
+	return charsiu_fp16_matmul_group_wait(f);
 }
 
 /*

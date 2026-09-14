@@ -34,7 +34,12 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+# ⚠ /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and it
+# was reached only by setting CHARSIU_BOARD_DIR by hand. A round that forgot
+# found three, which is under the floor below and so refused -- but a floor
+# that fires every time is a floor nobody reads. The directory goes in the
+# list; the listing below still prints what each one held.
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
 # ⚠⚠ AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
 # falls back to a matvec a row: the batched loop's ORDER runs and the batched
