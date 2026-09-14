@@ -1069,6 +1069,64 @@ A reader reproducing today gets the second. Both are named by md5 in
 `tests/corpus/README.md`, and the file of record going forward is the one a
 reader will actually get.
 
+### The weight group, and the five models that do not get one
+
+A tensor is grouped only when the group width divides its K and is strictly
+narrower than it; npuquant falls back to one scale a row otherwise, and
+`llama_auto_kmax` pins the width at 1024 and only ever considers WIDENING.
+Counted with `CHARSIU_NPU_VERBOSE` on 2026-09-15:
+
+```
+  model             distinct K                       widest width dividing all
+  Llama-3.2-1B      2048 8192                        1024   grouped as shipped
+  Phi-3.5-mini      3072 8192                        1024   grouped as shipped
+  SmolLM2-1.7B      2048 8192                        1024   grouped as shipped
+  Qwen3-0.6B        1024 2048 3072                    512
+  tinyllama-1.1b    2048 5632                         512
+  Qwen2.5-1.5B      1536 8960                         256
+  gemma-3-1b        1024 1152 6912                    128
+  gemma-4-E2B       256 1536 2048 4096 6144 12288     128
+```
+
+Three of eight are fully grouped at the shipping width. The rest carry tensors
+on the per-row path, and gemma-3-1b carries all of them there.
+
+**What that costs gemma-3-1b, and what a narrower group returns.** Quality on
+the desk over 511 scored positions of `tests/corpus/long.txt`; decode on the
+board, boot afe55e04, 594 MHz, performance governor, three readings an arm,
+medians, spreads under 0.2%.
+
+```
+  group  1152->      6912->     decode t/s        ppl
+  1024   ungrouped   ungrouped   20.10         108.7063   ships
+   576   2 groups    12 groups   20.70  +3.0%   79.2824   -27.1%
+   384   3 groups    18 groups   18.69  -7.0%   65.4765   -39.8%
+   192   6 groups    36 groups   14.68 -27.0%   57.1298   -47.4%
+   128   9 groups    54 groups    -             47.0269   -56.7%
+  the file's own q4_0 on the CPU, no charsiu requantisation:  49.0532
+```
+
+576 is not a trade. It is faster AND better than the shipping default, on a
+model the shipping default groups nowhere.
+
+**At 128, charsiu's four bits pass the gguf's own q4_0**: 47.0269 against
+49.0532. q4_0 is blocks of 32 with an fp16 scale, finer than anything in that
+table, and charsiu at 128 with an fp32 scale and the wsum correction still
+scores better. **One model, one corpus, one length. It is not a general claim**
+and the three sentences this pack requires of every quality figure apply to it
+unchanged.
+
+**It does not generalise as a constant.** The same 1024 against 512 costs
+tinyllama 11.7% of decode and Qwen3-0.6B 5.5%, and both already have grouped
+tensors at 1024. gemma-3-1b is the only one of the three with nothing to get
+out of, and the only one that gains. What this asks for is a per model
+decision, which is what `llama_auto_kmax` already is; it only ever looks
+upward.
+
+**The shipping arm IS grouping, and that was checked rather than assumed.** A
+group width of 99991 divides nothing, so nothing groups, and Llama-3.2-1B reads
+50.7838 there against 41.2763 at the shipping 1024.
+
 **And it does not survive a different length either.** Every number in that
 table is `-n 300`, which scores 299 positions. `charsiu_ppl` with no `-n`
 scores 511, and on the same file, the same corpus and the same grouped arm that
