@@ -1090,6 +1090,18 @@ static int coef_floor(struct charsiu_device *dev, unsigned k, unsigned n,
 int main(int argc, char **argv)
 {
 	/*
+	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. It also has to exist at
+	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
+	 * stamp" for a tool that cannot answer, which is FALSE for these -- they
+	 * carry the define and merely had no flag.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
+	/*
 	 * ⚠ M IS A SWEEP NOW, NOT A PAIR. Round 379 ran m=1 and m=2 only and
 	 * concluded "m>1 does not work" from one failing width. The register
 	 * fix in 2184557 is about the input surface block, which is degenerate

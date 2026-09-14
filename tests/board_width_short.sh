@@ -31,6 +31,14 @@
 # Usage: board_width_short.sh
 set -u
 
+#
+# ⚠⚠ NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
+# npu_gemm_test is compiled with the same -DCHARSIU_BUILD as charsiu_run and
+# has no --version to print it back. Worse, its first argument is K, read
+# through atoi: asking it for --version asks the hardware for a K = 0 gemm.
+# What this round ran is the path below and its mtime, and nothing finer,
+# until the tool grows the flag.
+#
 GEMM=${CHARSIU_GEMM_BIN:-}
 [ -n "$GEMM" ] || GEMM=$(command -v npu_gemm_test 2>/dev/null || true)
 [ -n "$GEMM" ] || for d in /opt/charsiu /usr/bin ./build .; do

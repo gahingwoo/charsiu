@@ -90,6 +90,12 @@ echo "   npu clk   $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/nul
 echo "   rail      $(awk '/vdd_npu_s0/{print $6; exit}' /sys/kernel/debug/regulator/regulator_summary 2>/dev/null)"
 echo "   accel     $(ls /dev/accel/ 2>/dev/null | tr '\n' ' ')$(ls /sys/bus/platform/drivers/RKNPU/ 2>/dev/null | grep -q npu && echo '(RKNPU bound)')"
 echo "   charsiu   $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build     $(charsiu_build "$RUN")"
 echo "   thermal   $(ls /sys/class/thermal/ 2>/dev/null | tr '\n' ' ')"
 echo "   repeats   $REPEAT per point, one warm-up discarded, swept up then down"
 echo

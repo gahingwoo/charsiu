@@ -40,6 +40,12 @@ sleep 1
 echo "== one-chunk prefill width against the 16 atom"
 echo "   boot   $(cat /proc/sys/kernel/random/boot_id)"
 echo "   model  $(basename "$M")   binary $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build  $(charsiu_build "$RUN")"
 echo "   $N repeats a length, one warm-up discarded, clock pinned"
 echo
 

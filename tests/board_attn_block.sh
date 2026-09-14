@@ -59,6 +59,12 @@ P=${P% }
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 CHARSIU_STAGES=1"
 
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build     $(charsiu_build "$RUN")"
 echo "governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null) (was $OLD)"
 echo "blocks    $VALUES ($N repeats each, alternating), prompt 256 words"
 echo

@@ -87,6 +87,12 @@ V=$(awk '/vdd_npu_s0/{print $6; exit}' /sys/kernel/debug/regulator/regulator_sum
 echo "   vdd_npu    ${V:-unknown}"
 echo "   cores      $(ls /dev/accel/ 2>/dev/null | tr '\n' ' ')"
 echo "   governor   $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build      $(charsiu_build "$RUN")"
 echo "   repeats    $REPEAT per arm, alternating, one warm-up discarded"
 echo
 

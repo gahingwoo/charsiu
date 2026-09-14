@@ -28,7 +28,13 @@ CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
 #
 # ⚠ := AND NOT =, or every compile line re-runs git.
 CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
-CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
+#
+# ⚠ override, NOT a plain +=. CFLAGS is `?=` above, and a value given on the
+# COMMAND LINE beats both -- make then ignores every `+=` to it, the define
+# never reaches the compiler, and charsiu.h's fallback makes --version answer
+# "unknown". An environment CFLAGS is fine; only the command line does this.
+# A stamp that silently disappears under `make CFLAGS=...` is worse than none.
+override CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
 BUILD  := build
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
@@ -51,6 +57,22 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/fp16_regrow \
      $(BUILD)/charsiu_ppl \
      $(BUILD)/charsiu_membw
+
+#
+# ⚠⚠ AND THE STAMP HAS TO GO STALE NEVER. Nothing in a link line depends on the
+# commit, so a pull that changes no source leaves the OLD commit inside a
+# binary that is otherwise up to date -- and then it answers --version with a
+# confident wrong number, which is worse than not answering. This file changes
+# only when the commit does (cmp before write, so an unchanged commit does not
+# relink the world), and the binaries that carry the stamp depend on it.
+STAMP  := $(BUILD)/.commit
+
+.PHONY: FORCE
+FORCE:
+
+$(STAMP): FORCE | $(BUILD)
+	@printf '%s\n' '$(CHARSIU_BUILD)' | cmp -s - $@ 2>/dev/null \
+		|| printf '%s\n' '$(CHARSIU_BUILD)' > $@
 
 $(BUILD):
 	@mkdir -p $(BUILD)

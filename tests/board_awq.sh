@@ -121,6 +121,22 @@ PROMPT=${CHARSIU_AWQ_PROMPT:-"The keeper of the lighthouse wrote down the barome
 #
 echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
 
+#
+# ⚠⚠ AND WHICH BUILD, FOR charsiu_run ONLY. charsiu_ppl is compiled from
+# this same tree with the same -DCHARSIU_BUILD, but it has no --version to
+# print it back, so every perplexity below is identified by the path on the
+# ppl line and nothing finer. A build line read as covering both binaries is
+# worse than no build line: the next round would assume the number and the
+# hash came from one tree.
+#
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build $(charsiu_build "$RUN")   (charsiu_run only)"
+echo "   ppl   $PPL"
+
 STATS=$T/awq.stats
 echo "== recording calibration statistics"
 env $W4 CHARSIU_NPU=0 CHARSIU_CALIB="$STATS" \

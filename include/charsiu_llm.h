@@ -3,6 +3,13 @@
 #ifndef CHARSIU_LLM_H
 #define CHARSIU_LLM_H
 
+/* the commit this binary was built from; see the note in charsiu.h. Repeated
+ * here because the tools that include only this header need it too, and the
+ * #ifndef makes the two copies idempotent. */
+#ifndef CHARSIU_BUILD
+#define CHARSIU_BUILD "unknown"
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>

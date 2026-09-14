@@ -100,6 +100,12 @@ CHARSIU_PROBE_WIDTHS=$W ${CHARSIU_OVL_MAXT:+CHARSIU_PROBE_MAXT=$CHARSIU_OVL_MAXT
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
 _ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
 case "$_ksha" in
 c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
