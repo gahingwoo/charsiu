@@ -6250,7 +6250,12 @@ static unsigned attn_pipe_groups(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_PIPE");
 
-		v = e && *e ? atol(e) : 1;
+		/* ⭐ TWO IS THE DEFAULT SINCE r411. Nine models on the board,
+		 * batched against their own token loops, identical at 1, 2 and
+		 * 4; Llama at 852 tokens identical at all three; and 4 is not
+		 * faster than 2 (6311 against 6320, layer 1441 against 1402).
+		 */
+		v = e && *e ? atol(e) : 2;
 		if (v < 1)
 			v = 1;
 		if (v > 8)
@@ -6579,7 +6584,15 @@ static int attn_npu_layer(struct attn_block_job *j)
 		struct attn_npu_soft scg[2];
 		struct attn_group gj;
 
-		if (!a->f2 || !a->fv2 || G > H)
+		/*
+		 * ⚠ ONE ROW HAS NOTHING TO HIDE. What the split buys is a
+		 * softmax long enough to cover the next group's scores, and
+		 * what it costs is a second plan, emit, poison and submit --
+		 * about 0.85 ms a group call at 852 tokens. At m = 1 the
+		 * softmax is one row of the layer's ~1 ms, so decode would pay
+		 * the overhead twice for nothing to overlap.
+		 */
+		if (!a->f2 || !a->fv2 || G > H || m < 2)
 			G = 1;
 		gh = (H + G - 1) / G;
 		n0 = H < gh ? H : gh;
