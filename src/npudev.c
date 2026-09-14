@@ -915,6 +915,37 @@ struct charsiu_npu {
 	 * megabyte term on the busier core is the SAME and only the task term
 	 * falls.
 	 *
+	 * ⛔⛔⛔ AND THE TABLE BELOW IS SCORED WITH THE WITHDRAWN COEFFICIENT, SO
+	 * EVERY PERCENTAGE IN IT IS FIVE TO EIGHT TIMES TOO LARGE.
+	 *
+	 * "The line above" is the 2026-08-31 stage fit, and its task term is
+	 * refuted; see the withdrawal beside busy_us and beside DEAL_US_TASK.
+	 * The table is simply tasks_removed * 36.8: Llama's 48825 -> 45587 is
+	 * 3238 us over the 88 tasks it names, which is 36.795 us each. At the
+	 * measured 4.81 (round 152) or the 7.7 and 3.2 the r412 counter reads
+	 * on two models, those same 88 tasks are 423 to 678 us, so Llama is
+	 * -0.87% to -1.39% and not -6.6%.
+	 *
+	 * 🔑 AND THE BOARD HAS ALREADY RUN THE EXPERIMENT. r411 cut slices
+	 * 937 -> 486, a 37% drop in tasks, and bought 1.2% of the token. At
+	 * 36.8 us a task that cut should have bought about 7%. The lever is
+	 * measured dead; this table is the only thing still saying otherwise.
+	 *
+	 * ⚠ The numbers are LEFT as they were scored, because they are a
+	 * record of what that exercise computed. What is withdrawn is the
+	 * conclusion drawn from them, and the closing sentence of this comment
+	 * with it: "the reachable part of the 7.4 ms task term" is the
+	 * withdrawn fit's own task term, and at 4.81 us over 202 tasks it is
+	 * 1.0 ms, not 7.4.
+	 *
+	 * ⚠⚠ THIS IS THE SECOND HALF OF A PARAGRAPH THAT WAS HALF CORRECTED
+	 * EARLIER THE SAME DAY. Thirty lines up, the same 36.8 was annotated
+	 * where it CLOSES an idea, and a cheaper task only strengthens a
+	 * refusal so the correction was easy to make and easy to stop at. Here
+	 * the same number OPENS one, and the correction runs the other way.
+	 * Withdrawing a number means sweeping every direction it points, not
+	 * every place it is spelled.
+	 *
 	 * Scored with the line above over the real .gguf geometry, with the cut
 	 * chosen freely PER TENSOR and capped at K <= 4096 and N <= 8192 (the
 	 * widest of each that has ever run on this board -- see round 322 for
