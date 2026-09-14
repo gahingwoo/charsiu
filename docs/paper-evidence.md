@@ -766,8 +766,8 @@ eight lengths.
 🏁 **The vendor's lead at 852 tokens is halved, 1.380x to 1.193x.** The
 crossover does not move -- it is still between 202 and 302 tokens -- and that
 is by construction, because the arm did not turn on below 448 when this was
-measured. ⚠ **That threshold is 320 as of r412 and the arm now refuses models
-with no GQA outright**; the reading above is unaffected (it is a 852 token row,
+measured. ⚠ **That threshold is 320 as of r412, and a model with no GQA has a
+second one at 448**; the reading above is unaffected (it is a 852 token row,
 above either threshold, on a GQA model) but a re-run at 302 or 352 would not
 reproduce the "by construction" clause.
 

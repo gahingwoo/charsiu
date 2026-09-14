@@ -10101,10 +10101,17 @@ noise 302 sits on.
 SmolLM2-1.7B -11.2%, both against spreads under 1.5% -- while the three with
 GQA win by 5.7 to 8.4%. 448 turned the arm ON for those two from 448 tokens up.
 The mirror costs one pack per position per layer per KV head and buys attention
-per QUERY head, so a model that shares nothing pays the most for the least. The
-arm now refuses `n_head_kv >= n_head` outright, because there is no measured
-length at which those two win: r411's own ten model table has them at -0.3% and
-+2.3% at 852, which is noise.
+per QUERY head, so a model that shares nothing pays the most for the least.
+
+⛔ **The first answer to that was a refusal, and it was wrong within the hour.**
+It turned the arm off for `n_head_kv >= n_head` on the ground that no measured
+length had those two winning. That was true of the arm as it stood and stopped
+being true when the in place ladder landed in the same session, and nobody
+re-asked. Re-measured with it: Phi-3.5-mini +2.3% at 452 and +15.3% at 852,
+SmolLM2-1.7B +2.8% and +19.4%. So it is a SECOND threshold, 448, not a refusal,
+and 452 being the shortest measured win for both is why. 🔑 **A refusal whose
+reason is "nothing measured says otherwise" names its own expiry, and has to be
+re-asked the moment the thing it refuses gets faster.**
 
 ⛔ **And one road closed rather than overturned.** The named target after r407 is
 the int4 readback, and the gather exists because that accumulator comes back

@@ -5387,25 +5387,51 @@ static unsigned attn_npu_min_tokens(void)
  *
  * ⚠ AND THE QUANTITATIVE VERSION OF THAT STORY IS DEAD. "Crossover scales as
  * 1/gqa" was written down before the rows ran and predicted Qwen3 (gqa 2)
- * would lose at 352. It wins by 7.7%. So this is not a scaled threshold; it
- * is a refusal, because the length at which a gqa 1 model would cross has not
- * been measured and r411's ten model table has both of them inside noise at
- * 852 (-0.3% and +2.3%). There is no measured length at which they win.
+ * would lose at 352. It wins by 7.7%. So this is not a scaled threshold. It
+ * is a SECOND one, measured on the two models that have it.
  *
- * ⚠ IT IS TWO MODELS. Both happen to be 32/32; a gqa 1 model with four heads
- * has never been run. The refusal is the conservative side of that ignorance:
- * it restores exactly the CPU arm, which is what shipped before r411.
+ * ⛔⛔ AND THE FIRST ANSWER TO THIS WAS A REFUSAL, WHICH WAS WRONG WITHIN THE
+ * HOUR. It turned the arm off for gqa 1 outright, on the ground that no
+ * measured length had it winning -- true of the arm as it stood, and the
+ * sentence names its own expiry. The in place ladder landed, nobody re-asked,
+ * and the same two models then won:
  *
- * CHARSIU_ATTN_NPU_MHA=1 turns the arm on for them anyway, so the crossover
- * stays measurable from the outside.
+ *     Phi-3.5-mini   451   11749 -> 11481   +2.3%, spread 0.2%
+ *                    851   25964 -> 21985  +15.3%, spread 0.7%
+ *     SmolLM2-1.7B   451    5574 ->  5420   +2.8%, spread 1.2%
+ *                    851   12859 -> 10358  +19.4%, spread 2.5%
+ *
+ * 452 is the shortest measured win for both, so 448, by the same rule that
+ * puts the other threshold at 320. ⚠ That it is the SAME 448 this round spent
+ * its morning removing is a coincidence and not a vindication: the sweep that
+ * produced the old one compared an arm against itself at exactly that length.
+ *
+ * ⚠ IT IS TWO MODELS, both 32/32. A gqa 1 model with four heads has never
+ * been run, and 352 is a loss for both of these, so the number below is a
+ * floor that has been measured from both sides and nothing more.
  */
-static int attn_npu_mha_ok(void)
+static unsigned attn_npu_min_tokens_mha(void)
 {
-	static int v = -1;
+	static long v = -1;
 
-	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_ATTN_NPU_MHA", 0);
-	return v;
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_NPU_MHA_MIN");
+
+		v = e && *e ? atol(e) : 448;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/* how long a prompt this model needs before the arm pays, which is one of two
+ * numbers and not a scale between them */
+static unsigned attn_npu_min_for(const struct llama_model *m)
+{
+	unsigned kvh = m->n_head_kv ? m->n_head_kv : m->n_head;
+
+	return kvh >= m->n_head ? attn_npu_min_tokens_mha()
+			        : attn_npu_min_tokens();
 }
 
 /*
@@ -5427,11 +5453,12 @@ static int attn_npu_mha_ok(void)
  * loses outside noise, every one is text identical to the CPU arm, and none
  * of the ten refuses a single layer.
  *
- * ⚠ TWO OF THOSE TEN NO LONGER REACH THIS ARM AT ALL, and the table is kept
- * because it is what was measured. Phi-3.5-mini and SmolLM2-1.7B share no KV
- * head, and r412 found them 15.9% and 11.2% BEHIND the CPU arm at 352 tokens;
- * attn_npu_mha_ok refuses them now. Their rows above are the two at the top of
- * the "did not win" list, which is the same fact read at one length.
+ * ⚠ TWO OF THOSE TEN REACH THIS ARM ONLY FROM 448 TOKENS UP, and the table is
+ * kept because it is what was measured. Phi-3.5-mini and SmolLM2-1.7B share no
+ * KV head, and r412 found them 15.9% and 11.2% BEHIND the CPU arm at 352
+ * tokens and 15.3% and 19.4% AHEAD of it at 852; attn_npu_min_for gives them
+ * their own threshold. Their rows above are the two at the top of the "did not
+ * win" list, which is the same fact read at one length with a slower arm.
  *
  * ⚠ AND THE TWO THINGS A DEFAULT HAS TO ANSWER THAT SPEED DOES NOT:
  *
@@ -5756,12 +5783,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		 */
 		if (want == 2 && (s->prompt_total <= 0 ||
 				  (unsigned)s->prompt_total
-					< attn_npu_min_tokens()))
-			return NULL;
-		/* ⛔ see attn_npu_mha_ok: no KV head shared, no measured
-		 * length at which this arm wins */
-		if (want == 2 && !attn_npu_mha_ok() &&
-		    m->n_head_kv >= m->n_head)
+					< attn_npu_min_for(m)))
 			return NULL;
 	}
 	a = calloc(1, sizeof(*a));
