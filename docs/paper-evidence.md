@@ -134,8 +134,14 @@ stdout: `Enabled cpus: [4, 5, 6, 7]`.
 
 ```
   decode tok/s     charsiu 18.56 (18.47..18.58)   vendor 12.88 (12.71..12.95)
-                   charsiu 1.44x
+                   charsiu 1.44x          <- r389
 ```
+
+⚠ **1.44 here and 1.39 in the README are the same condition in two rounds.**
+r389 read 18.56 against 12.88; r390, below, read 17.85 against 12.85 at the same
+594 MHz. The README quotes r390 because r390 is the round that has a second
+clock beside it and so can say the ratio moves. Two rounds apart is the size of
+the disagreement, and it is why the next line exists.
 
 ⛔ **1.44x IS NOT A CONSTANT AND MUST NOT BE QUOTED AS ONE.** `board-logs/r390`
 measured both arms at a second clock, everything else held:
@@ -205,6 +211,12 @@ same 33 at all eight prompt lengths from 27 to 852.** It is not a different
 tokenisation of the body, it is one tokenisation plus a fixed wrapper.
 
 ### 1b-ii. Both curves, measured, and what the fit says
+
+⚠ **The charsiu column here is r393 and four rounds of work have landed since.
+1k is the current ladder** -- 852 tokens go 8081 ms here to 5953 there. What
+this section is still the source for is the VENDOR column, which has not been
+re-measured since, and the 2.2% boot-to-boot drift bound that every comparison
+against it has to clear.
 
 Eight prompt lengths through each runtime, one script so the TEXT is the same,
 NPU 594 MHz on both sides, rail 800 mV, CPU pinned at maximum, 3 readings a
@@ -802,7 +814,7 @@ two shapes apart, and the projection that follows from it -- attention 2343 ms
 becoming about 780, TTFT about 5630 against their 6027 -- is arithmetic on a
 bound and **not a result**.
 
-### 1k. The ladder with the overlap work in, and the crossover gone
+### 1k. The ladder with the overlap work in: a lead under 250, level above
 
 r411, shipping defaults, board to itself, three repeats a point, one warm-up
 discarded, all eight points on one boot.
@@ -1249,15 +1261,22 @@ AND the prompt length it was measured under.
 ⛔ **The paper's prefill claim has to be rebuilt from 1b-ii, and its sign
 changes.** The 1.23x came from fitting a line through two prompt lengths a
 side; the curves say our per-token linear rate is 12% BETTER than theirs, and
-that we lose on the fixed cost (4x) and the attention scaling (6x). Anywhere
-the prose says the vendor's prefill is faster per token, or that the two fixed
-costs are within 8%, is wrong rather than unsupported.
+that we lose on the fixed cost (4x measured directly at the short end) and on
+the attention scaling. ⛔ The "(6x)" that stood here is the same withdrawn
+factor 1b-ii refutes two pages earlier -- the fit does not determine it -- and
+this sentence was restating it as a finding. Anywhere the prose says the
+vendor's prefill is faster per token, or that the two fixed costs are within
+8%, is wrong rather than unsupported.
 
 ⭐ **And there is a new claim worth making that the old framing could not
-reach**: the answer is a crossover at about 248 prompt tokens, so "who starts a
-prompt faster" has a measured answer that depends on the prompt, not a ratio.
-That is a better result than the one it replaces and it is the kind of thing a
-reader can check.
+reach**: "who starts a prompt faster" has a measured answer that depends on the
+prompt, not a ratio.
+
+⚠ The shape of that answer has since moved and this paragraph used to give the
+old one. When it was written the crossover sat at about 248 of our tokens with
+the vendor ahead above it. 1k is the current ladder: charsiu leads by 1.09x to
+1.28x below about 250 tokens and the two are LEVEL from 302 up, so what depends
+on the prompt is now the size of our lead, not who has it.
 
 ## 8. What is not supported
 
