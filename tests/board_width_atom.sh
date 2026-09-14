@@ -23,6 +23,13 @@
 # a dip in ms-per-token, and the eye is bad at that on a rising line.
 set -u
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 N=${ATOM_N:-3}
 RUN=${CHARSIU_RUN:-/root/charsiu_run_lhd}
 M=${CHARSIU_MODEL:-/opt/charsiu/models/Llama-3.2-1B-Instruct-Q4_0.gguf}
@@ -44,7 +51,6 @@ echo "   model  $(basename "$M")   binary $RUN"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "   build  $(charsiu_build "$RUN")"
 echo "   $N repeats a length, one warm-up discarded, clock pinned"
 echo

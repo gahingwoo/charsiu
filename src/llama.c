@@ -2324,6 +2324,68 @@ static int group_off(void)
 	return m;
 }
 
+/*
+ * ⚠⚠ THE PER CALL COST IS CHARGED TO THE CALL, SO THE GATE BELONGS ON THE CALL
+ * AND NOT ON THE TENSOR.
+ *
+ * npudev fits about 78 us a call before a byte has moved, so a dispatch can be
+ * small enough that the fence costs more than the arithmetic is worth.
+ * gemma-4-E2B is the model that has them, and it is the one model that lost the
+ * round of record -- 8.91 against the vendor's 9.23. Its per layer embedding
+ * runs inp_gate (256 x 1536) and proj (1536 x 256) once a layer, 0.39 MMAC
+ * each, and neither can join a matvec_pair the way q, k and v do because proj
+ * reads what inp_gate wrote. Six fences a layer against gemma3's four: 70 extra
+ * a token, for 27.5 MMAC of work.
+ *
+ * ⚠ A TENSOR GATE WOULD HAVE BROKEN THE PAIR. gemma4's attn_k and attn_v are
+ * 256 x 1536 -- the SAME shape as inp_gate, to the element -- so a rule keyed
+ * on the tensor refuses k and v as well, and those two ride q's fence for free.
+ * Summing the pair is what tells the two cases apart: q, k and v together are
+ * 3.9 MMAC and stay.
+ *
+ * ⚠ THIS REFUSES THE DISPATCH, NOT THE STAGING. The quantised copy is still
+ * built and the fallback multiplies with it (npu_matvec, not gguf_matvec), so
+ * both arms do the same arithmetic on the same numbers and the tokens have to
+ * be identical. That is also what makes the A/B clean: same memory, same load
+ * time, and the only thing that moves is which processor multiplies.
+ *
+ * Default 0, which is OFF, because a default that moves rewrites every script
+ * that read the empty environment as an arm. The number that belongs here is
+ * the one a paired board round measures.
+ */
+static uint64_t npu_min_mac(void)
+{
+	static uint64_t v;
+	static int set;
+
+	if (!set) {
+		const char *e = getenv("CHARSIU_NPU_MIN_MAC");
+
+		v = e && *e ? strtoull(e, NULL, 10) : 0;
+		set = 1;
+	}
+	return v;
+}
+
+static int npu_call_worth(uint64_t mac, const char *name)
+{
+	uint64_t min = npu_min_mac();
+	static int said;
+
+	if (mac >= min)
+		return 1;
+	/*
+	 * Once, on stderr, naming a tensor and the knob. The maxn refusal next
+	 * door spent months silent and it was the gate the output head hit.
+	 */
+	if (!said++)
+		fprintf(stderr, "charsiu: %s stays on the CPU -- that call is "
+			"%llu MACs, under CHARSIU_NPU_MIN_MAC=%llu (said once)\n",
+			name, (unsigned long long)mac,
+			(unsigned long long)min);
+	return 0;
+}
+
 static void matvec_pair(struct llama_state *s, const float *x,
 			const struct gguf_tensor *wa, float *ya,
 			const struct gguf_tensor *wb, float *yb,
@@ -2334,10 +2396,15 @@ static void matvec_pair(struct llama_state *s, const float *x,
 	const struct npu_tensor *nt[3];
 	int ids[3];
 	unsigned n = wc ? 3 : 2, i;
+	uint64_t mac = 0;
 
 	act_set_timed(&s->act, x, (int)wa->ne[0]);
 
-	if (s->pool.dev && !group_off() && npu_mode() && s->act.npu_ok) {
+	for (i = 0; i < n; i++)
+		mac += (uint64_t)w[i]->ne[0] * (uint64_t)w[i]->ne[1];
+
+	if (s->pool.dev && !group_off() && npu_mode() && s->act.npu_ok &&
+	    npu_call_worth(mac, wa->name)) {
 		/* int8 takes q1; int4 takes the float and never looks */
 		if (charsiu_npu_needs_q1(s->pool.dev))
 			act_q1_timed(&s->act);
@@ -2376,11 +2443,14 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 	if (nt) {
 		int id = -1;
 
-		for (unsigned i = 0; i < s->pool.n; i++)
-			if (&s->pool.t[i] == nt) {
-				id = s->pool.id[i];
-				break;
-			}
+		/* one tensor is one dispatch here -- see npu_min_mac */
+		if (npu_call_worth((uint64_t)w->ne[0] * (uint64_t)w->ne[1],
+				   w->name))
+			for (unsigned i = 0; i < s->pool.n; i++)
+				if (&s->pool.t[i] == nt) {
+					id = s->pool.id[i];
+					break;
+				}
 		/*
 		 * A failure here FALLS BACK rather than aborting. Round 313
 		 * wedged the block on the first feed forward projection and the

@@ -18,41 +18,51 @@ only comparison here where nothing is quoted.
              does not, so the multiple is a function of the condition and not
              a property of either runtime.
 
-  prompt     two regimes, not one ratio. charsiu leads by 1.09x to 1.28x below
-             about 250 of its own tokens, and from 302 up the two are level:
+  prompt     ahead from 27 through 602 of its own tokens, and level at 852.
+             Five repeats a point, one boot, clock and governor pinned:
 
                  our tok    charsiu       range    their tok  vendor   verdict
-                      27        332   327..332           60     413    1.24x
-                      52        415   413..417           85     530    1.28x
-                     102        761   750..762          135     932    1.22x
-                     202       1400  1398..1401         235    1529    1.09x
-                     302       2131  2124..2134         335    2145    level
-                     452       3059  3037..3179         485    3195    level
-                     602       4115  4111..4156         635    4201    level
-                     852       5953  5948..5959         885    6027    level
+                      27        331   330..332           60     413    1.25x
+                      52        409   407..416           85     530    1.30x
+                     102        750   745..767          135     932    1.24x
+                     202       1395  1390..1402         235    1529    1.10x
+                     302       2045  2030..2050         335    2145    +4.9%
+                     452       2991  2974..3014         485    3195    +6.8%
+                     602       4060  4055..4072         635    4201    +3.5%
+                     852       5905  5892..5936         885    6027    level
 
              Their chat template costs a constant 33 tokens at every length, so
              each row is the same input text.
 
-             Every point estimate in the table favours charsiu, and four of the
-             eight are still written "level", because a margin has to clear two
-             things and those four clear neither:
+             A margin has to clear two things, and the first one is now
+             MEASURED rather than quoted:
 
-               the drift  their runtime needs their driver bound, so the two
-                          columns cannot share a boot, and the boot-to-boot
-                          drift of this same charsiu ladder was measured at
-                          2.2% at worst. 302 (+0.7%), 602 (+2.1%) and 852
-                          (+1.2%) are inside it.
-               the spread  452 is +4.4% over them and its own three readings
-                          span 142 ms, which is 4.6% of its median. A margin
-                          smaller than the arm's own spread at that point is
-                          not a margin.
+               the floor  their runtime needs their driver bound, so the two
+                          columns cannot share a boot. Twenty readings of ONE
+                          arm at 302 tokens on one boot, changing nothing,
+                          spanned 2.5% of their median. That is the floor a
+                          margin has to clear, and it is slightly larger than
+                          the 2.2% this table used to quote.
+               the spread  each row's own range, above. All eight clear their
+                          own spread; the floor is what separates them.
 
-             What did change: at 852 their lead was 1.34x before the fp16
+             ⚠ 852 is +2.1% and does not clear the floor, so it stays level.
+             ⚠ 602 is the thin row: +3.5% clears 2.5% by one point, and a
+             slightly stricter bound puts it back to level. 302 and 452 clear
+             comfortably.
+
+             What changed: at 852 their lead was 1.34x before the fp16
              attention arm became the default, 1.16x after it, 1.13x once the
              int4 accumulator work was done, 1.05x once the softmax ran during
              the fence, and level once the int4 accumulator gather ran during
-             it too. Level is the claim; ahead everywhere is not.
+             it too. 302 and 452 moved from level to ahead when the attention
+             threshold came down to 272, re-derived against the arm that ships.
+
+             ⛔ This table has been overclaimed once. Every point estimate
+             favoured charsiu then too, it was written up as "completely
+             surpassed", and it was withdrawn the same day. What is different
+             is that the floor is measured and that one row is still level and
+             one is thin. Both of those are part of the result.
 
   quality    charsiu's stored weights score 1.4x to 2.6x better in perplexity
              than theirs, against the same f16 original both were quantised
@@ -214,6 +224,15 @@ which runs on a desk.
 
 It loads llama, qwen2, qwen3, gemma3, gemma4, phi3 and smollm3 gguf files.
 
+Six of those seven have a model that has actually been run. `tests/arch_sanity.sh`
+now prints the architecture count separately from the file count, and it reads
+`6/6 ARCHITECTURES knew it: gemma3 gemma4 llama phi3 qwen2 qwen3`. **smollm3 is
+accepted by the loader and has never been exercised** — no smollm3 gguf is in
+either model directory, the smallest one the fetcher knows is SmolLM3-3B-Q4_0 at
+1727 MB, and neither machine has room for it: the desk is at 93% of 125 GB and
+the board's model partition has 1.1 GB free. Read the seven as what the loader
+accepts, not as seven architectures that have answered a question.
+
 ## It also sees, hears, and matches pictures to words
 
 A vision tower read out of llama.cpp's `mmproj` gguf, on the same primitives. A
@@ -237,8 +256,7 @@ $ charsiu_whisper ggml-tiny.en.bin --transcribe --audio jfk.wav
 Whisper comes out of whisper.cpp's own container: the mel spectrogram, the audio
 encoder, and a decoder with the first cross attention in this tree. Every stage is
 diffed against numpy on the real weights, the spectrogram at 1.7e-05, the encoder
-at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the same
-argmax.
+at 1.7e-04 over 576000 values, and the decoder's logits with the same argmax.
 
 ⚠ Those three tolerances are the printed output of
 `tests/whisper_encoder_cross.py` and `tests/whisper_decoder_cross.py`, which
@@ -247,13 +265,38 @@ to check them. They are reproducible but not recorded with their conditions in
 either repository, unlike every speed number above, so treat them as "run the
 script" rather than as a citation.
 
+⚠ Two of the three have now been re-run and neither matched what was written
+here. The encoder read 1.8e-04 when written and reads **1.699e-04** at HEAD,
+which is real drift from the attention and gelu rewrites since; the figure
+above is corrected. The decoder's **3.8e-05 has no audio beside it**, and that
+is the whole problem: run against `jfk.wav` it reads 4.005e-05 with argmax 843
+(`b' And'`), and against the script's own default it reads 5.430e-05 with
+argmax 357 (`b' ('`). Three readings of one "tolerance". It is not quoted above
+any more, because a worst-case difference over a decoder's logits belongs to
+the audio that produced it, the same way a perplexity belongs to its corpus.
+Both PASS their thresholds, which are 2e-3 and 3e-3, ten to eighty times
+looser.
+
 ```
-$ charsiu_clip clip-vit-base-patch32.gguf --image logo.png \
+$ charsiu_clip clip-b32.gguf --image logo.png \
       --text "a drawing of a llama" "the statue of liberty" "a dog on grass"
-  0.2537  a drawing of a llama
-  0.1743  the statue of liberty
-  0.1533  a dog on grass
+  0.2745  a drawing of a llama
+  0.1854  the statue of liberty
+  0.1474  a dog on grass
 ```
+
+⚠ This block used to print 0.2537 / 0.1743 / 0.1533 and was not one run. Rows
+one and two are the **f16** CLIP file, reproduced here to the last digit; the
+file `tests/board_modalities.sh` actually downloads is the q4_0 above, which
+gives the numbers now shown. Row three reproduces from neither: f16 gives
+0.1273 for this sentence and 0.1323 for board_modalities' wording, and ten
+other phrasings ranged 0.1016 to 0.1850 without reaching 0.1533. Each sentence
+scores independently, so rows one and two pin the image and the model exactly
+and row three came from somewhere else.
+
+A score belongs to its model file as much as a perplexity does. What the board
+test checks is unaffected -- it asserts only that "llama" ranks first, which
+holds in every arm.
 
 ## Reading the vendor's model file
 

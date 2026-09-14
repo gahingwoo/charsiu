@@ -35,6 +35,13 @@
 #   CHARSIU_CHUNK_NGEN=8                     tokens generated
 set -u
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 RUN=${CHARSIU_RUN_BIN:-}
 [ -n "$RUN" ] || RUN=$(command -v charsiu_run 2>/dev/null || true)
 [ -n "$RUN" ] || for d in /opt/charsiu /usr/bin "$PWD/build" ./build .; do
@@ -52,7 +59,7 @@ if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:
 	exit 1
 fi
 
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
 norm() { echo "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9'; }
 
@@ -101,7 +108,6 @@ echo "binary   $RUN"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "build    $(charsiu_build "$RUN")"
 echo "prompt   \"1 2 ... 32\", gen $NGEN, int4 on the NPU"
 echo "chunks   $CHUNKS"

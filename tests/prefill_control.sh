@@ -32,6 +32,13 @@
 # Usage: prefill_control.sh [MODEL.gguf] [N_GEN]
 set -eu
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 MODEL=${1:-}
 NGEN=${2:-16}
 

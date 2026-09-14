@@ -398,6 +398,17 @@ int charsiu_whisper_open(struct charsiu_whisper *w, const char *path)
 
 		if (!charsiu_pool_init(&w->pool, nt * 12 + 8, 4 * A, 4 * A, 0))
 			w->npu = w->pool.dev != NULL;
+		/*
+		 * ⚠ SAY SO WHEN IT DOES NOT GET ONE. The vision tower prints
+		 * this and whisper did not, so with CHARSIU_NPU=1 on a machine
+		 * with no device whisper said NOTHING: the absence of a line
+		 * could not be told from the flag never having been read. The
+		 * only report was charsiu_pool_report on close, which needs
+		 * w->npu to be true and so can only ever confirm success.
+		 */
+		if (!w->npu && charsiu_diag())
+			fprintf(stderr, "charsiu: the whisper encoder stays "
+				"on the CPU\n");
 		if (w->npu) {
 			/*
 			 * ⚠ THE ENCODER'S WEIGHTS, ALL OF THEM, NOW. Same

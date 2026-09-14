@@ -45,6 +45,13 @@
 # The model must be one AWQ can help: four bits (CHARSIU_NPU_W4V=1) and a
 # calibration file beside it, or one recorded here.
 set -u
+
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
 D=$(cd "$(dirname "$0")" && pwd)
 M=${1:?usage: board_awq.sh MODEL.gguf [CALIB.txt]}
 C=${2:-$D/corpus/calib.txt}
@@ -123,6 +130,11 @@ echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
 
 #
 # ⚠⚠ AND WHICH BUILD, FOR charsiu_run ONLY. charsiu_ppl is compiled from
+# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# no --version to print it back" and warned that its first argument is read
+# through atoi, so asking would submit a dimension of zero. Both halves were
+# true when written; the flag went into every tool afterwards and is checked
+# before any positional argument, so asking is safe now.
 # this same tree with the same -DCHARSIU_BUILD, but it has no --version to
 # print it back, so every perplexity below is identified by the path on the
 # ppl line and nothing finer. A build line read as covering both binaries is
@@ -133,7 +145,6 @@ echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "   build $(charsiu_build "$RUN")   (charsiu_run only)"
 echo "   ppl   $PPL"
 

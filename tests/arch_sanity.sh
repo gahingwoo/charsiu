@@ -27,17 +27,52 @@
 # would have failed on the first qwen2 run.
 #
 #   tests/arch_sanity.sh MODEL_DIR
+#   CHARSIU_BOARD_DIR=... tests/arch_sanity.sh
 #
 # Every gguf in the directory is asked the same question. A file whose answer
 # does not contain the word is reported; the exit status is the number of them.
 
 set -e
-DIR="${1:?usage: arch_sanity.sh MODEL_DIR}"
+
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+# ⚠ THE ENVIRONMENT IS THE SECOND WAY IN, AND IT HAD TO BE. The board's
+# regress.sh exports CHARSIU_BOARD_DIR and then calls this with no argument,
+# which this refused -- so section 1 of the r411 regression, "every
+# architecture still knows a fact", has printed a usage line and NOTHING ELSE
+# every time it has run. `set -e` does not stop it because the call is inside a
+# pipeline, so the regression carried on and reported the rest as if the
+# architectures had passed. Same shape as the prefill script that found no
+# models and exited 0: a check that cannot run reads exactly like a check that
+# found nothing wrong.
+DIR="${1:-${CHARSIU_BOARD_DIR:-}}"
+if [ -z "$DIR" ]; then
+	echo "arch_sanity.sh: no model directory." >&2
+	echo "  give one as \$1, or set CHARSIU_BOARD_DIR." >&2
+	exit 2
+fi
+if [ ! -d "$DIR" ]; then
+	echo "arch_sanity.sh: $DIR is not a directory" >&2
+	exit 2
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ⚠ CHARSIU_RUN SO THIS CAN RUN WHERE THE MODELS ARE. The models live on the
 # board and the board has no compiler, so a script that builds before it checks
 # is a check that cannot run on the only machine that has something to check.
 RUN="${CHARSIU_RUN:-$ROOT/build/charsiu_run}"
+# ⚠⚠ AND charsiu_check THE SAME WAY, WHICH IT WAS NOT. This resolved only
+# $ROOT/build/charsiu_check, and on the board there is no tree -- the binaries
+# live in /opt/charsiu. So `arch` was EMPTY on every row and the architecture
+# column, the one this whole section is named after, printed `?` on the only
+# machine where the check means anything. Look next to whichever charsiu_run we
+# were given first, then fall back to the tree.
+CHECK="${CHARSIU_CHECK:-}"
+[ -n "$CHECK" ] || { _d=$(dirname "$RUN"); [ -x "$_d/charsiu_check" ] && CHECK="$_d/charsiu_check"; }
+[ -n "$CHECK" ] || CHECK="$ROOT/build/charsiu_check"
 
 PROMPT="The capital of France is"
 WANT="Paris"
@@ -53,15 +88,19 @@ WANT="Paris"
 : "${CHARSIU_STAGES_PASS:=1}"
 
 bad=0
+dunno=0
 n=0
+archs=""
+archs_ok=""
 for m in "$DIR"/*.gguf; do
 	[ -e "$m" ] || continue
 	n=$((n + 1))
 	# ⚠ ONLY ON "OK". charsiu_check's refusals start with NO and put a
 	# reason in the second field, so an unconditional $2 labels a rejected
 	# file with a fragment of the sentence explaining why.
-	arch=$("$ROOT/build/charsiu_check" -q "$m" 2>/dev/null |
+	arch=$("$CHECK" -q "$m" 2>/dev/null |
 	       awk '$1 == "OK" { print $2 }')
+	archs="$archs ${arch:-?}"
 	out=$("$RUN" "$m" -p "$PROMPT" -n 24 -c 512 -q 2>/dev/null | head -1)
 	case "$out" in
 	*"$WANT"*)
@@ -80,11 +119,37 @@ for m in "$DIR"/*.gguf; do
 			esac
 		fi
 		printf 'ok   %-16s %s\n' "${arch:-?}" "$(basename "$m")"
+		archs_ok="$archs_ok ${arch:-?}"
 		;;
 	*)
-		printf 'BAD  %-16s %s\n' "${arch:-?}" "$(basename "$m")"
-		printf '       %s\n' "$out"
-		bad=$((bad + 1))
+		# ⚠⚠ A MODEL TOO SMALL TO KNOW THE FACT IS NOT A BROKEN RUNTIME,
+		# AND THIS COULD NOT TELL THEM APART.
+		#
+		# SmolLM2-135M answers "the capital of the United States" here.
+		# The shipping binary, tonight's binary and the CPU-only path all
+		# produce that SAME sentence, byte for byte -- so nothing about
+		# the hardware path is implicated; 135M parameters simply do not
+		# hold the fact and the model continues plausibly instead.
+		#
+		# So ask the CPU. If both paths agree, this is not a difference
+		# between the NPU and the CPU, which is the only thing this probe
+		# can actually decide -- say that, and count it apart from a real
+		# failure rather than folding it in. If they DISAGREE, the
+		# hardware path is implicated and it is a failure.
+		cpu=$(CHARSIU_NPU=0 "$RUN" "$m" -p "$PROMPT" -n 24 -c 512 -q \
+			2>/dev/null | head -1) || cpu=""
+		if [ "$cpu" = "$out" ]; then
+			printf '??   %-16s %s  (does not know it; the CPU path says the same, so this is the model)\n' \
+				"${arch:-?}" "$(basename "$m")"
+			printf '       %s\n' "$out"
+			dunno=$((dunno + 1))
+		else
+			printf 'BAD  %-16s %s  (the CPU path does NOT say the same)\n' \
+				"${arch:-?}" "$(basename "$m")"
+			printf '       npu %s\n' "$out"
+			printf '       cpu %s\n' "$cpu"
+			bad=$((bad + 1))
+		fi
 		;;
 	esac
 done
@@ -93,5 +158,17 @@ if [ "$n" -eq 0 ]; then
 	echo "no gguf in $DIR"
 	exit 1
 fi
-echo "$((n - bad))/$n knew the capital of France"
+# ⚠⚠ FILES AND ARCHITECTURES ARE DIFFERENT COUNTS, and this printed only the
+# first while being quoted as the second. The stable merge at 0c85c71 says
+# "7/7 architectures"; seven is the number of GGUF FILES in /opt/vendor/models,
+# and five architectures cover them. Print both, and say which is which.
+na=$(printf '%s\n' $archs | grep -v '^?$' | sort -u | wc -l)
+nk=$(printf '%s\n' $archs_ok | grep -v '^?$' | sort -u | wc -l)
+nq=$(printf '%s\n' $archs | grep -c '^?$' || true)
+echo "$((n - bad - dunno))/$n FILES knew the capital of France"
+[ "$dunno" -eq 0 ] || echo "$dunno did not know it and agreed with their own CPU path -- the model, not the runtime"
+if [ "$na" -gt 0 ]; then
+	echo "$nk/$na ARCHITECTURES knew it: $(printf '%s\n' $archs | grep -v '^?$' | sort -u | tr '\n' ' ')"
+fi
+[ "${nq:-0}" -eq 0 ] || echo "⚠ $nq file(s) have no architecture: charsiu_check ($CHECK) did not answer for them"
 exit "$bad"

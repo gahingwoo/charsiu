@@ -162,6 +162,14 @@ static void fill(struct charsiu_joblist *jl, struct unit *u, unsigned ntask)
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned reps = argc > 1 ? (unsigned)atoi(argv[1]) : 400;
 	struct charsiu_device *d0, *d1;
 	struct unit a, b, b1;

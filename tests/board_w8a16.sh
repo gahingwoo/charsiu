@@ -42,6 +42,11 @@ REPS=${CHARSIU_W8_REPS:-8}
 #
 # ⚠⚠ NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
 # npu_fp16_test is compiled with the same -DCHARSIU_BUILD as charsiu_run and
+# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# no --version to print it back" and warned that its first argument is read
+# through atoi, so asking would submit a dimension of zero. Both halves were
+# true when written; the flag went into every tool afterwards and is checked
+# before any positional argument, so asking is safe now.
 # has no --version to print it back. Worse, its first argument is K, read
 # through atoi: asking it for --version asks the hardware for a K = 0 shape.
 # What this round ran is $T and its mtime, and nothing finer, until the tool

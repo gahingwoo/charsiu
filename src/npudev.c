@@ -143,6 +143,30 @@ struct npu_entry {
 	 * the CPU, which is already here and is already BLOCKED in prep_bo for
 	 * most of the fence.
 	 *
+	 * ⛔⛔⛔ AND ROUND 371 RAN IT AND IT LOST, BADLY. This paragraph read as
+	 * a live idea for forty rounds because the round that refuted it wrote
+	 * the numbers into a board log and not into this file.
+	 *
+	 *   CHARSIU_NPU_CPU_FRAC   0      0.10    0.20    0.30
+	 *   decode tok/s          12.33    7.20    3.98    2.76
+	 *   the CPU's own share       0    8449   16388   24211 ms
+	 *
+	 * 845 ms a percent, dead linear, against a whole decode the hardware
+	 * finishes in 5192 ms. The CPU is about sixteen times slower per row
+	 * than the NPU here, so a tenth of the rows is more than the other nine
+	 * tenths and the fence waits for the CPU every single call.
+	 *
+	 * 🔑 THE THEORY WAS ABOUT BANDWIDTH AND cpu_rows IS COMPUTE BOUND. The
+	 * 5 GB/s is real and it is still unused; what is not true is that this
+	 * is the way to spend it. A second engine has to be fast enough that
+	 * its share of the rows finishes inside the fence, and one CPU thread
+	 * dequantising int4 is not. Anything that revives this has to price the
+	 * CPU's rows FIRST, in us a row, against the hardware's -- not against
+	 * the memory controller.
+	 *
+	 * The mechanism stays, default 0, because it is the instrument that
+	 * measured this and the next candidate second engine will want it.
+	 *
 	 * cq holds those rows' weights packed two to a byte, row major. It has
 	 * to be packed, because the whole idea is bandwidth: reading rows at
 	 * one byte a code would cost twice what the NPU pays for the same
@@ -978,6 +1002,54 @@ struct charsiu_npu {
 	unsigned long tasks_hi;    /* tasks on whichever device got more */
 	double mb_hi;              /* and megabytes on that device */
 	/*
+	 * ⭐⭐ HOW OFTEN CORE 0 WOULD HAVE TO CHANGE IOMMU DOMAIN -- THE CEILING
+	 * ON attach-once, COUNTED HERE INSTEAD OF IN THE KERNEL.
+	 *
+	 * r413 §8 said this number needed a debug patch and therefore a flash,
+	 * and r413 §7 guessed the answer was "nearly every job, so attach-once
+	 * is a LOSS". Both were wrong, and the second one was wrong because it
+	 * stopped at "one entity spans all cores" without reading how the
+	 * scheduler picks within it.
+	 *
+	 * drm_sched_pick_best takes the FIRST STRICT MINIMUM (sched_main.c:976,
+	 * `num_score < min_score`), so a tie always goes to sched_list[0], which
+	 * is core 0. rocket_job_push arms and pushes inside one guard on
+	 * rdev->sched_lock, which is per DEVICE and not per file, so two
+	 * sequential submits from this thread are strictly ordered and the
+	 * first one's score is visible to the second. And this file submits
+	 * both devices before waiting on either -- see the note over `sent` --
+	 * so when both are sent, file 0 arms against (0,0) and takes core 0,
+	 * and file 1 arms against (1,0) and takes core 1.
+	 *
+	 *   both devices sent  -> core 0 gets domain 0, core 1 gets domain 1
+	 *   only device 0      -> core 0 gets domain 0, core 1 idle
+	 *   only device 1      -> core 0 gets domain 1 (a tie), core 1 idle
+	 *
+	 * So CORE 1 NEVER CHANGES DOMAIN, structurally, and core 0 changes only
+	 * across a boundary where one side was a device-1-only call. That is
+	 * exactly the case the note over `sent` already describes as the least
+	 * loaded deal's new common case, and it is a quantity this file knows:
+	 * a device with no slices contributes no megabytes.
+	 *
+	 * ⚠⚠ THIS IS A MODEL OF THE SCHEDULER, NOT A READING FROM IT. It is
+	 * arithmetic over charsiu's own submit shape plus the tie rule above,
+	 * and it is printed as such. Two things it cannot see:
+	 *
+	 *  - the (1,1) case is a RACE, not a guarantee. If device 0's job
+	 *    retires in the microseconds between the two ioctls, core 0's score
+	 *    is back to zero and file 1 ties onto core 0 as well -- which is a
+	 *    flip this count does not have. So core 0's figure is a LOWER
+	 *    bound.
+	 *  - it assumes the two opens are the only entities on these cores.
+	 *
+	 * The number still settles the question r413 could not: if it comes
+	 * back near zero, attach-once removes nearly every attach and detach in
+	 * the run, and it was never "a saving that was not available".
+	 */
+	unsigned long dev_both, dev_only0, dev_only1;
+	unsigned long core0_flips;
+	int core0_dom;             /* -1 until the first call */
+	/*
 	 * ⚠ AND THE SAME CALLS' TOTAL, WHICH IS WHAT MAKES mb_hi READABLE.
 	 *
 	 * mb_hi on its own cannot say whether a call was balanced: 16 MB on the
@@ -1110,7 +1182,9 @@ struct charsiu_npu {
 	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
-	 * 0 is the hardware doing all of it, which is every round before 371.
+	 * 0 is the hardware doing all of it, which is every round before 371 --
+	 * AND every round since, because 371 measured the split and it lost 42%
+	 * at the first rung. See the withdrawal beside npu_entry.n_npu.
 	 */
 	double cpu_frac;
 	float *afscr;              /* the activation, rounded through fp16 */
@@ -1560,6 +1634,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->qos_fd = -1;
 	g->dev[0] = charsiu_open(NULL);
 	g->ndev = 1;
+	g->core0_dom = -1;   /* no call has landed yet; see core0_flips */
 	/* ⚠ charsiu_env_flag, NOT `!getenv`. As an existence test
 	 * CHARSIU_NPU_ONEDEV=0 -- the spelling anybody reaching for two cores
 	 * would write -- turned the second core OFF, and round 150 wants this
@@ -2450,6 +2525,30 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				? " -- CHARSIU_NPU_DEAL_INDEX is set, so this "
 				  "is the old per tensor deal" : "");
 		/*
+		 * ⭐ AND THE IOMMU DOMAIN CEILING, WHICH IS THE SAME DEAL READ
+		 * FOR A DIFFERENT PURPOSE. See the note over g->core0_flips for
+		 * why a device with no slices is the only thing that moves a
+		 * core's domain, and for the two things this model cannot see.
+		 */
+		if (g->ndev > 1 && g->calls) {
+			unsigned long used = g->dev_both + g->dev_only0
+					   + g->dev_only1;
+
+			fprintf(stderr,
+				"charsiu NPU: of %lu calls %lu used both cores, "
+				"%lu device 0 only, %lu device 1 only\n",
+				used, g->dev_both, g->dev_only0, g->dev_only1);
+			fprintf(stderr,
+				"charsiu NPU: so core 0 would change IOMMU "
+				"domain %lu times (%.2f%% of its jobs) and "
+				"core 1 zero -- MODELLED from the submit shape "
+				"and drm_sched_pick_best's tie, not read from "
+				"the kernel, and core 0's is a LOWER bound\n",
+				g->core0_flips,
+				used ? 100.0 * (double)g->core0_flips
+				       / (double)used : 0.0);
+		}
+		/*
 		 * ⚠ SAY WHEN THE FIT DECLINES. Phase 21's second arm printed
 		 * the stage table and no cost-model line, and the phase could
 		 * only report "no line": the fit had been refused silently.
@@ -2760,8 +2859,11 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * task is worth a third of a megabyte, which is why the deal cannot be by bytes
  * alone: a run of tiny slices piled on one core costs real time.
  *
- * ⛔⛔⛔ AND THAT FIT IS WITHDRAWN, WHICH MAKES THESE TWO CONSTANTS THE ONLY
- * PLACE IN THE TREE WHERE A WITHDRAWN NUMBER IS STILL RUNNING.
+ * ⛔⛔⛔ AND THAT FIT IS WITHDRAWN. Its per task term was, until round 414, the
+ * only place in the tree where a withdrawn number was still RUNNING rather than
+ * quoted. It is not any more -- see the round below the paragraph after next --
+ * and what is left of the fit here is the megabyte term, which the same
+ * withdrawal leaves standing.
  *
  * The line above is the 2026-08-31 hand computed stage fit. Its per task term
  * was refuted eight days later by round 152, which measured a job directly at
@@ -2769,16 +2871,39 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * counter reads 7.7 us a task on gemma4 and 3.2 on gemma3. See the withdrawal
  * beside busy_us for the whole of it.
  *
- * So "a task is worth a third of a megabyte" is 1/15 to 1/36 at the measured
- * coefficients, and this deal is charging a task five to twelve times what it
- * costs. The megabyte term is fine: 110.0 against a measured 114.3 to 116.7.
+ * So "a task is worth a third of a megabyte" was 1/15 to 1/36 at the measured
+ * coefficients, and this deal was charging a task five to twelve times what it
+ * costs. The megabyte term is fine: 110.0 against a measured 114.3 to 116.7,
+ * and it is the term that turned out to be deciding the deal anyway.
  *
- * ⚠ THE CONSTANT IS LEFT ALONE ON PURPOSE. Changing it changes which core
- * every slice lands on, and that is a board question, not a desk one: the last
- * reading had the busier core carrying 1.05x an even share, which is close
- * enough that over weighting tasks may be doing no harm or may be the reason
- * it is that even. Swapping 36.8 for 4.81 without measuring would replace a
- * refuted number with an unmeasured one. It is on the board list.
+ * 🏁 THE BOARD ANSWERED THE BOARD QUESTION, ROUND 414. This stood as "left
+ * alone on purpose -- changing it changes which core every slice lands on, and
+ * that is a board question, not a desk one" for eight days, and it could not be
+ * acted on because the only way to try the other value was to edit this file
+ * and rebuild, and two binaries is the one thing a paired arm must not be.
+ * CHARSIU_NPU_DEAL_US_TASK made it one environment variable and one round.
+ *
+ * One binary, one boot, four alternating pairs, performance governor,
+ * tests/board_deal.sh:
+ *
+ *   model          36.8       4.81      margin   balance 36.8 -> 4.81
+ *   gemma-4-E2B    9.58 t/s   9.55 t/s  -0.31%   1.03x -> 1.02x
+ *   gemma-3-1b    21.68      21.66      -0.09%   1.08x -> 1.08x
+ *   Qwen3-0.6B    30.62      30.70      +0.26%   1.06x -> 1.06x
+ *
+ * Every margin is inside its own arm's spread, and the text is identical across
+ * both arms and all four repeats on all three models. The per task term does
+ * not decide this deal on these shapes -- the megabyte term does -- and the one
+ * place it moved anything, it moved gemma4 a hundredth TOWARDS balanced.
+ *
+ * So the default is the measured 4.81, which is also what npu_job_cost and
+ * charsiu_shapes have used since round 155. The reason for keeping a refuted
+ * number was that replacing it with an unmeasured one is no better. 4.81 is no
+ * longer unmeasured here.
+ *
+ * ⚠ THIS IS THREE MODELS, NOT NINE. It is level on the three that were run and
+ * that is what the sentence above says; the nine model regression is what says
+ * whether it is level on the rest.
  *
  * ⚠ CHARSIU_NPU_DEAL_INDEX PUTS THE OLD DEAL BACK, and it has to be here
  * rather than at the call site because the sizing pass and the staging pass
@@ -2791,8 +2916,34 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * copy on the stack and asks the same question without disturbing anything. One
  * function, two callers, and no way for them to answer differently.
  */
-#define DEAL_US_TASK   36.8
+#define DEAL_US_TASK    4.81
 #define DEAL_US_MB    110.0
+
+/*
+ * ⚠ THE KNOB THE PARAGRAPH ABOVE SAYS IS MISSING. "It is on the board list"
+ * was true for eight days and could not be acted on, because the only way to
+ * try 4.81 against 36.8 was to edit this file and rebuild -- which is a
+ * different binary, and two binaries is the one thing a paired arm must not
+ * be. Reading it from the environment makes both arms the same md5 and the
+ * question a single board round.
+ *
+ * The default is still 36.8. A refuted number that ships is a bad thing; a
+ * refuted number replaced by an unmeasured one is not an improvement, and the
+ * measurement is what this knob is for.
+ */
+static double deal_us_task(void)
+{
+	static double v;
+	static int set;
+
+	if (!set) {
+		const char *e = getenv("CHARSIU_NPU_DEAL_US_TASK");
+
+		v = e && *e ? atof(e) : DEAL_US_TASK;
+		set = 1;
+	}
+	return v;
+}
 
 static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
 			  int w4, unsigned ki, unsigned ni, unsigned ns,
@@ -2805,7 +2956,7 @@ static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
 	if (g->deal_index)
 		return (ki * ns + ni) & 1;
 	d = load[0] <= load[1] ? 0 : 1;
-	load[d] += DEAL_US_TASK + DEAL_US_MB * slice_mb(w4, k, n);
+	load[d] += deal_us_task() + DEAL_US_MB * slice_mb(w4, k, n);
 	return d;
 }
 
@@ -3407,6 +3558,25 @@ static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
 	g->tasks_hi += (unsigned long)ht;
 	g->mb_hi += hm;
 	g->mb_all += mb[0] + mb[1];
+
+	/* the domain ceiling; see the note over g->core0_flips */
+	if (g->ndev > 1) {
+		int d0 = mb[0] > 0.0, d1 = mb[1] > 0.0;
+
+		if (d0 && d1)
+			g->dev_both++;
+		else if (d0)
+			g->dev_only0++;
+		else if (d1)
+			g->dev_only1++;
+		if (d0 || d1) {
+			int dom = d0 ? 0 : 1;
+
+			if (g->core0_dom >= 0 && g->core0_dom != dom)
+				g->core0_flips++;
+			g->core0_dom = dom;
+		}
+	}
 
 	g->f_n  += 1.0;
 	g->f_t  += ht;

@@ -38,8 +38,14 @@ BIN=$D
 [ -x "$BIN/charsiu_run" ] || BIN=/opt/charsiu
 [ -x "$BIN/charsiu_run" ] || { echo "no charsiu_run"; exit 2; }
 
+# ⚠⚠ /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and
+# leaving it off this list is not a smaller round, it is a round that answers
+# nothing: every model reports "not on this card", the table prints with no
+# rows, and the script exits 0. board_text_all.sh had the identical list and
+# the identical hole, found when a round compared 2 models and printed
+# "0 differing" as though that were a pass.
 find_model() {
-	for _d in "$HOME/.charsiu/models" /opt/charsiu/models; do
+	for _d in "$HOME/.charsiu/models" /opt/charsiu/models /opt/vendor/models; do
 		for _f in "$_d"/$1; do
 			[ -f "$_f" ] && { echo "$_f"; return 0; }
 		done

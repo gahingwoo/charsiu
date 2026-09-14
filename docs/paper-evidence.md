@@ -213,7 +213,7 @@ tokenisation of the body, it is one tokenisation plus a fixed wrapper.
 ### 1b-ii. Both curves, measured, and what the fit says
 
 ⚠ **The charsiu column here is r393 and four rounds of work have landed since.
-1k is the current ladder** -- 852 tokens go 8081 ms here to 5953 there. What
+1k-ii is the current ladder** -- 852 tokens go 8081 ms here to 5905 there. What
 this section is still the source for is the VENDOR column, which has not been
 re-measured since, and the 2.2% boot-to-boot drift bound that every comparison
 against it has to clear.
@@ -766,7 +766,7 @@ eight lengths.
 🏁 **The vendor's lead at 852 tokens is halved, 1.380x to 1.193x.** The
 crossover does not move -- it is still between 202 and 302 tokens -- and that
 is by construction, because the arm did not turn on below 448 when this was
-measured. ⚠ **That threshold is 320 as of r412, and a model with no GQA has a
+measured. ⚠ **That threshold is 272 as of r413, and a model with no GQA has a
 second one at 448**; the reading above is unaffected (it is a 852 token row,
 above either threshold, on a GQA model) but a re-run at 302 or 352 would not
 reproduce the "by construction" clause.
@@ -818,7 +818,52 @@ two shapes apart, and the projection that follows from it -- attention 2343 ms
 becoming about 780, TTFT about 5630 against their 6027 -- is arithmetic on a
 bound and **not a result**.
 
+### 1k-ii. The ladder re-measured on the shipping binary: ahead to 602, level at 852
+
+r413, commit 58d2d360d971, five repeats a point, one boot (0c9923fe), clock and
+governor pinned. Supersedes 1k below, which is kept because its numbers are a
+dated reading of a different binary.
+
+```
+    ch tok   ch ms       range   vn tok    vn ms   margin   spread   verdict
+        27     331   330..332        60    413.2   +24.8%     0.6%   ahead
+        52     409   407..416        85    529.6   +29.5%     2.2%   ahead
+       102     750   745..767       135    931.8   +24.2%     2.9%   ahead
+       202    1395  1390..1402      235   1528.5    +9.6%     0.9%   ahead
+       302    2045  2030..2050      335   2145.0    +4.9%     1.0%   ahead
+       452    2991  2974..3014      485   3194.7    +6.8%     1.3%   ahead
+       602    4060  4055..4072      635   4200.5    +3.5%     0.4%   ahead
+       852    5905  5892..5936      885   6026.8    +2.1%     0.7%   LEVEL
+```
+
+🔑 **The bound is measured now, not quoted.** r413 ran twenty readings of ONE
+arm at 302 tokens on one boot with nothing changed: median 2130, range
+2110..2164, **spread 2.5%**. That is the floor a margin has to clear, and it is
+slightly LARGER than the 2.2% cross-boot figure this section used to quote. All
+eight rows clear their own spread, so the floor is what separates them.
+
+⚠ **852 does not clear it** (+2.1%) and stays level. ⚠ **602 is the thin row**:
++3.5% clears 2.5% by one point and a slightly stricter bound puts it back.
+
+🏁 **What moved 302 and 452 from level to ahead** is the attention threshold
+coming down from 320 to 272, re-derived against the arm that ships. 320 itself
+had the defect 448 had: it was measured in r412 section 2 on the r411 binary,
+and section 7 of the same round made that arm faster.
+
+⚠ **And the null control held.** The four rows below the threshold -- 27, 52,
+102, 202 -- run the SAME code in both arms, because attn_npu_get returns NULL
+before the mirror is built. They moved -0.3 to -1.4%, all inside the floor. If
+any of them had moved, this whole re-read would be suspect.
+
+⛔ **This table was overclaimed once**, when every point estimate favoured
+charsiu and it was written up as "completely surpassed" and withdrawn the same
+day. The difference is a measured floor, one row still level and one row thin.
+
 ### 1k. The ladder with the overlap work in: a lead under 250, level above
+
+⚠ **SUPERSEDED BY 1k-ii above**, which re-measured this on the shipping binary
+with five repeats and a measured noise floor. Kept as a dated reading.
+
 
 r411, shipping defaults, board to itself, three repeats a point, one warm-up
 discarded, all eight points on one boot.
@@ -837,7 +882,7 @@ discarded, all eight points on one boot.
 
 🏁 **What this supports: two regimes.** charsiu leads by 1.09x to 1.28x below
 about 250 of its own tokens, and from 302 up the two are level. 852 goes 8081
-(r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953, so their 1.341x lead
+(r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953 -> 5905 (r413), so their 1.341x lead
 there is gone.
 
 ⛔⛔ **WHAT IT DOES NOT SUPPORT IS "AHEAD AT EVERY LENGTH", and this list said
@@ -1308,11 +1353,56 @@ x 150 calls = 19.5 ms of a 51.7 ms token, 38%` is Qwen3, 2026-09-02, and its
 denominator is a real wall clock token. That one is dated rather than wrong,
 and its per call term has also moved.
 
-⚠ **And the withdrawn fit is still executing.** `DEAL_US_TASK 36.8` in
-npudev.c decides which core every slice lands on. It is left alone until a
-board round can price the alternatives, because swapping it for 4.81 without
-measuring replaces a refuted number with an unmeasured one; the comment there
-says so.
+🏁 **And the ceiling on removing the IOMMU half of it is 100%, measured, with
+no kernel change.** r413 §7 reasoned the other way -- an IOMMU domain belongs to
+an open DRM file, charsiu opens accel0 twice, rocket gives each file one
+scheduler entity spanning all cores, so "either domain can land on either core"
+and attach-once would degenerate into detach plus attach on nearly every job.
+The premise is right and the conclusion does not follow: `drm_sched_pick_best`
+takes the first strict minimum, so a tie goes to core 0; `rocket_job_push` arms
+and pushes under one per-device mutex, so two sequential submits are ordered;
+and charsiu submits every device before waiting on any. Round 414 counts the
+consequence in userspace, in `account_call`, where a device with no slices
+contributes no megabytes:
+
+```
+  model          calls    both cores   dev 0 only   dev 1 only   core 0 flips
+  gemma-4-E2B    13572        11332         2240            0        0 (0.00%)
+  gemma-3-1b      6724         5060         1664            0        0 (0.00%)
+  tinyllama       5700         5700            0            0        0 (0.00%)
+```
+
+No call in 26,000 sent device 1 alone, because `deal_pick` breaks its tie to
+device 0 and so the first slice of any call always lands there. Core 0 therefore
+always carries domain 0 and core 1 always carries domain 1, and neither ever
+changes. Every per-job attach and detach in the run is removable.
+
+⚠ **This is a MODEL of the scheduler, not a reading from it.** It is arithmetic
+over charsiu's submit shape plus `pick_best`'s tie rule, and the both-devices
+case is a race rather than a guarantee: if device 0's job retires between the
+two ioctls, file 1 ties onto core 0 as well. Core 0's figure is a lower bound.
+What it settles is r413's claim that the saving was not available -- it is.
+
+🏁 **The withdrawn fit is no longer executing, as of round 414.**
+`DEAL_US_TASK` in npudev.c decides which core every slice lands on, and it held
+the refuted 36.8 for eight days because there was no way to try the other value
+without rebuilding, and two binaries is the one thing a paired arm must not be.
+`CHARSIU_NPU_DEAL_US_TASK` made it one environment variable. One binary, one
+boot, four alternating pairs, performance governor:
+
+```
+  model          36.8       4.81      margin   balance 36.8 -> 4.81
+  gemma-4-E2B    9.58 t/s   9.55 t/s  -0.31%   1.03x -> 1.02x
+  gemma-3-1b    21.68      21.66      -0.09%   1.08x -> 1.08x
+  Qwen3-0.6B    30.62      30.70      +0.26%   1.06x -> 1.06x
+```
+
+Every margin is inside its own arm's spread and the text is identical across
+both arms and all four repeats. The per task term does not decide this deal on
+these shapes; the megabyte term does. The default is now the measured 4.81,
+which is what `npu_job_cost` and `charsiu_shapes` have used since round 155.
+
+⚠ **Three models, not nine.** That is what the table says and all it says.
 
 The vendor at the frequency their published figures were taken at. Their
 runtime HAS now been run here -- 1b at 594 MHz on both sides, 1g across the

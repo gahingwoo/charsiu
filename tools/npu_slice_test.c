@@ -47,6 +47,14 @@ static float frand(unsigned *s)
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 8960;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 1536;
 	unsigned m = argc > 3 ? (unsigned)atoi(argv[3]) : 80;

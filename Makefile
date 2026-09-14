@@ -185,16 +185,29 @@ $(BUILD)/charsiu_ppl.aarch64: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 # The control: same code with the NEON kernels compiled out, and slower.
 #
 # ⚠ SINCE ROUND 372 IT NO LONGER MATCHES THE DEFAULT BUILD, and the invariant
-# is written differently rather than quietly dropped. Two of the vector paths
-# reorder arithmetic on purpose -- the q.k dot product sums in four lanes and
-# the exponential is a polynomial rather than glibc's -- and neither has a
-# scalar twin. So:
+# is written differently rather than quietly dropped. Some vector paths reorder
+# arithmetic on purpose and have no scalar twin. So:
 #
-#   charsiu_run_scalar  ==  charsiu_run with CHARSIU_EXACT_ATTN and
-#                           CHARSIU_EXACT_SILU set
+#   charsiu_run_scalar  ==  charsiu_run with CHARSIU_EXACT_ATTN,
+#                           CHARSIU_EXACT_SILU and CHARSIU_EXACT_SOFTMAX set
 #
 # which is checked on the host and is still a NEON bug detector: every vector
 # path that is meant to be bit identical still has to reproduce it.
+#
+# ⚠⚠ THIS LIST SAID TWO UNTIL ROUND 414 AND THERE WERE THREE. It was written
+# when the reordering paths were the q.k dot product (four lanes) and the
+# exponential (a polynomial rather than glibc's), and it did not grow when the
+# softmax joined them. tests/neon_control.sh had never set ANY of them, so the
+# gap was invisible; the moment it set the two named here, two models still
+# differed, and adding CHARSIU_EXACT_SOFTMAX closed both:
+#
+#   ATTN + SILU             Llama-Q8_0 DIFFERS     Qwen3-Q4_0 DIFFERS
+#   ATTN + SILU + GELU      DIFFERS                DIFFERS
+#   ATTN + SILU + SOFTMAX   IDENTICAL              IDENTICAL
+#
+# CHARSIU_EXACT_GELU is NOT in the invariant: that path is meant to be bit
+# identical and the regression checks it separately. An invariant that names a
+# knob it does not need hides the regression that knob exists to catch.
 $(BUILD)/charsiu_run_scalar.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -DCHARSIU_NO_NEON -static -o $@ $^ -lm -lpthread
 

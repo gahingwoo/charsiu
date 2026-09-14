@@ -26,6 +26,13 @@
 #   sh board_text_all.sh [N_GEN]
 set -u
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 NGEN=${1:-8}
 RUN=${CHARSIU_RUN_BIN:-}
 [ -n "$RUN" ] || RUN=$(command -v charsiu_run 2>/dev/null || true)
@@ -129,7 +136,6 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 ${CHARSIU_TEXT_ENV:-}"
 # ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and this script is a correctness
 # gate rather than a timing sweep. The build stamp is what it needs.
-. "$(dirname "$0")/board_clk.sh"
 echo "binary   $RUN"
 echo "build    $(charsiu_build "$RUN")"
 echo "prompt   \"1 2 ... 32\", gen $NGEN, int4 on the NPU"

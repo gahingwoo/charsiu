@@ -4199,7 +4199,23 @@ runtime divides by `mv_busy_us` now, the same calls the fit counted, and says
 DECODE in the line so the two totals cannot be confused again. **The 14.5% and
 15.0% above are recomputed from the printed rows, so they carry that dilution
 too; they are the right formula on the old denominator and should be re-read
-off a run with the corrected counter.** Neither is bandwidth-starved and neither is
+off a run with the corrected counter.**
+
+🏁 **RE-READ, r413, on the corrected counter: 24% on BOTH.** gemma4 is 24% of a
+6384 ms decode hardware path and gemma3 24% of 2860 ms, and the printed line
+now names the total it divided by. The dilution was worth nine percentage
+points: the old denominator carried the batched prefill entry while the fit's
+numerator only ever saw decode calls.
+
+⛔ **And the per task coefficient got its third and fourth readings, on one
+boot.** Every fit printed that night: Qwen3 **-0.1**, the TinyLLAMA/Phi3 run
+**+22.6**, gemma4 **+14.7**, gemma3 **-5.9** us a task, against a shipped
+`DEAL_US_TASK` of **36.8**. Two of the four are NEGATIVE. That is not a noisy
+estimate of one quantity, it is a coefficient the data cannot determine, and it
+settles that re-deriving 36.8 from this fit will not work. The megabyte term,
+which IS determined, reads 129.1 and 125.2 against a shipped 110.0.
+
+Neither is bandwidth-starved and neither is
 dispatch-bound. gemma4 is simply a bigger model a token: 211 calls where
 gemma3 makes 105, and 1140 MB of weights where gemma3 reads 545.
 

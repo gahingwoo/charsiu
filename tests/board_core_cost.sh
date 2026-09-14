@@ -49,6 +49,13 @@
 #
 set -u
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 D=$(dirname "$0")
 REPEAT=${CHARSIU_CC_REPEAT:-5}
 NTOK=${CHARSIU_CC_NTOK:-64}
@@ -64,7 +71,7 @@ done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
 # ⚠⚠ MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
-MODELDIRS=${CHARSIU_CC_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models $D/../models"}
+MODELDIRS=${CHARSIU_CC_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models /opt/vendor/models $D/../models"}
 find_model() {
 	for d in $MODELDIRS; do
 		[ -d "$d" ] || continue
@@ -91,7 +98,6 @@ echo "   governor   $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "   build      $(charsiu_build "$RUN")"
 echo "   repeats    $REPEAT per arm, alternating, one warm-up discarded"
 echo
