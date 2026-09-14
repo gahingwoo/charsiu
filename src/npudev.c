@@ -2378,11 +2378,28 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		if (g->ndev > 1 && g->bwall_us > 0.0)
 			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
 				charsiu_npu_overlap_note());
+		/*
+		 * ⛔ THIS LINE USED TO END "so fusing the K slices a device
+		 * holds would save N of them", and fusing HAS been built and
+		 * measured: CHARSIU_NPU_READ_FUSE is 2.3% SLOWER on
+		 * Llama-3.2-1B and flat on Qwen3, because it trades s
+		 * sequential Y round trips for s scattered source streams and
+		 * this loop is already bandwidth bound. The note beside
+		 * read_rows says so at length.
+		 *
+		 * A runtime that keeps printing a suggestion the tree has
+		 * refuted will have it taken up again, and it was -- by the
+		 * round that read this very output. The count is still worth
+		 * printing; the advice is not, so the line names the knob and
+		 * says it lost.
+		 */
 		if (g->bread_passes)
 			fprintf(stderr, "charsiu NPU: the read walked Y %lu times"
-				" over %lu (device, output range) pairs, so fusing"
-				" the K slices a device holds would save %lu of"
-				" them\n", g->bread_passes, g->bread_ranges,
+				" over %lu (device, output range) pairs"
+				" (%lu of them are the K slices; fusing those"
+				" is CHARSIU_NPU_READ_FUSE and it measured"
+				" SLOWER, see read_rows)\n",
+				g->bread_passes, g->bread_ranges,
 				g->bread_passes - g->bread_ranges);
 		if (g->bfused_groups)
 			fprintf(stderr, "charsiu NPU: the fused read took %lu"

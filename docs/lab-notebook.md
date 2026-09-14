@@ -10069,7 +10069,8 @@ memory.
 ⛔ **"fp16 attention on the NPU is slower at every cache depth and is shut" --
 OVERTAKEN, and the entries above that say it are dated readings that stand.**
 The arm came back, went behind `CHARSIU_ATTN_NPU=auto` with a length threshold,
-and is on by default above 448 tokens. r411 then split its heads into two groups
+and was on by default above 448 tokens (r412: **320, and never for a model with
+no GQA** -- see the two corrections below this entry). r411 then split its heads into two groups
 over two unit pairs so the softmax runs during the scores fence instead of after
 it -- 322 ms of layer at 852 tokens, and the wait itself collapses, scores fence
 503 ms to 38.
@@ -10084,6 +10085,26 @@ softmax both arms have to do anyway. ⚠ At 302 tokens the NPU arm WINS by 3.2%
 and the threshold is 448, so that row of the ladder runs its attention on the CPU
 and gives back 72 ms; 452 reads the other way on two samples with a 187 ms range,
 so the threshold is not decided by that table.
+
+⛔ **r412 RE-MEASURED THAT TABLE AND BOTH OF ITS ODD ROWS WERE THE SAME FAULT.**
+The sweep's "CPU" column was the EMPTY environment, and the empty environment
+stopped being the CPU arm when `auto` became the default: at 452 it is the NPU
+arm, so that row compared an arm against itself and 1.027 is its own spread.
+With both arms naming the knob and four repeats, 302 is +2.3% against a 2.2%
+spread -- **level, not a 3.2% win** -- and 452 is +10.8% against 1.6%. The
+threshold is 320 now, and the paragraph above is kept because the reasoning it
+records (the lever is bookkeeping, not hardware) is unaffected by which side of
+noise 302 sits on.
+
+⛔ **And the same round found the threshold wrong in the OTHER direction.** At
+352 tokens the two models with no GQA lose badly -- Phi-3.5-mini -15.9%,
+SmolLM2-1.7B -11.2%, both against spreads under 1.5% -- while the three with
+GQA win by 5.7 to 8.4%. 448 turned the arm ON for those two from 448 tokens up.
+The mirror costs one pack per position per layer per KV head and buys attention
+per QUERY head, so a model that shares nothing pays the most for the least. The
+arm now refuses `n_head_kv >= n_head` outright, because there is no measured
+length at which those two win: r411's own ten model table has them at -0.3% and
++2.3% at 852, which is noise.
 
 ⛔ **And one road closed rather than overturned.** The named target after r407 is
 the int4 readback, and the gather exists because that accumulator comes back

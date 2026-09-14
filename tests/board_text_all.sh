@@ -119,10 +119,16 @@ PROMPT=${PROMPT% }$CHARSIU_PROMPT_END
 # sweeping. This one does not, because it is the scoreboard.
 # the int4 environment the board actually runs, same as board_vendor.sh
 W4="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
-CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
+CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 ${CHARSIU_TEXT_ENV:-}"
+# ⚠ CHARSIU_TEXT_ENV IS HOW AN ARM GETS CHECKED FOR TEXT. Every change that
+# touches the KV mirror has to come through here with CHARSIU_ATTN_NPU=1, and
+# until r412 the only way to do that was to export it and rely on `env` not
+# clearing the environment -- which works and which nothing says. The header
+# below prints it so a run that forgot is visible in its own output.
 
 echo "binary   $RUN"
 echo "prompt   \"1 2 ... 32\", gen $NGEN, int4 on the NPU"
+[ -z "${CHARSIU_TEXT_ENV:-}" ] || echo "arm      $CHARSIU_TEXT_ENV"
 echo
 printf '%-38s %-14s %s\n' model path verdict
 printf '%-38s %-14s %s\n' ----- ---- -------
