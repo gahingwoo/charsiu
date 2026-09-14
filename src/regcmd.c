@@ -1145,6 +1145,10 @@ void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
  * k group (so a padded extent that is not a whole number of groups refuses)
  * and the destination must be at least as long as the source.
  *
+ * ⚠ THE DESTINATION IS ASSUMED ZERO past what is copied -- which is true of a
+ * buffer that was just allocated, and NOT true of dst == src. The in place
+ * case clears what it vacates; see the memset below.
+ *
  * ⚠ THE OFFSETS COME FROM charsiu_w16_offset, NOT FROM A SECOND COPY OF THE
  * FORMULA. tests/fp16_regrow.c holds this against the packer itself.
  */
@@ -1167,7 +1171,26 @@ int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
 		return -1;
 	if (!kg || !ng || (keo % kg) || (ken % kg))
 		return -1;
-	for (n0 = 0; n0 < n_pad; n0 += ng) {
+	/*
+	 * ⭐ DESCENDING, SO dst MAY BE src. Every group's destination is at or
+	 * above its source (ken >= keo puts the ke term up, and nothing else
+	 * moves), and the gap grows with n0. Walking the groups from the top
+	 * down, the bytes still to be read all lie BELOW the block being
+	 * written: group j < i has oo_j + len <= oo_i <= on_i. The blocks
+	 * already written lie above, because the step between two group bases
+	 * is ng*ken and len is at most ngsz*ken <= ng*ken.
+	 *
+	 * That is what lets a caller allocate the surface once at the prompt's
+	 * ceiling and re-lay it out in place, instead of allocating a second
+	 * surface for every rung -- which is n_layer * n_kv buffer objects a
+	 * rung, and 2048 of them on a 32 layer model with no GQA.
+	 *
+	 * ⚠ THE SAME GROUP BASES THE ASCENDING LOOP VISITED, IN REVERSE. The
+	 * last base is the largest multiple of ng BELOW n_pad, and that is not
+	 * n_pad - ng when ng does not divide n_pad: head_dim 100 pads to 100
+	 * and its last group starts at 96 with four channels in it.
+	 */
+	for (n0 = ((n_pad - 1u) / ng) * ng; ; n0 -= ng) {
 		unsigned ngsz = n_pad - n0 < ng ? n_pad - n0 : ng;
 		size_t oo = charsiu_w16_offset(&mo, n0, 0, CHARSIU_W16_GROUP);
 		size_t on = charsiu_w16_offset(&mn, n0, 0, CHARSIU_W16_GROUP);
@@ -1175,7 +1198,31 @@ int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
 
 		if (oo == (size_t)-1 || on == (size_t)-1)
 			return -1;
-		memcpy(d + on / 2, s + oo / 2, len * 2);
+		/* memmove and not memcpy: with dst == src and kv_new ==
+		 * kv_old the two addresses are equal, and a short final group
+		 * can overlap its own source. */
+		memmove(d + on / 2, s + oo / 2, len * 2);
+		/*
+		 * ⛔ AND IN PLACE HAS TO CLEAR WHAT IT VACATED. A block that
+		 * moves up leaves its own old copy behind, inside the block
+		 * ABOVE it in the new layout -- the first version of this left
+		 * -1.0 sitting where the reference had zero, on every shape
+		 * whose live count was under the extent. A destination buffer
+		 * the caller just allocated is already zero there, so this
+		 * only pays where it is needed.
+		 *
+		 * The block is ngsz * ken halves: the largest index inside it
+		 * is (ken/kg - 1)*kg*ngsz + (ngsz-1)*kg + kg-1.
+		 */
+		if ((const uint16_t *)d == s) {
+			size_t blk = (size_t)ngsz * ken;
+
+			if (blk > len)
+				memset(d + on / 2 + len, 0,
+				       (blk - len) * 2);
+		}
+		if (!n0)
+			break;
 	}
 	return 0;
 }

@@ -205,32 +205,74 @@ static int want(struct charsiu_fp16 *f, size_t wsz, size_t insz, size_t obsz,
  */
 struct charsiu_fp16_w {
 	struct charsiu_bo bo;
-	size_t bytes;
+	size_t bytes;      /* what the CURRENT k and n occupy */
+	size_t room;       /* what was allocated, which may be more */
 	unsigned k, n;
+	unsigned kroom;    /* the largest k this allocation can be laid out at */
 };
 
-struct charsiu_fp16_w *charsiu_fp16_w_alloc(struct charsiu_fp16 *f,
-					    unsigned k, unsigned n)
+struct charsiu_fp16_w *charsiu_fp16_w_alloc_room(struct charsiu_fp16 *f,
+						 unsigned k, unsigned n,
+						 unsigned kroom)
 {
 	struct charsiu_matmul mm = { 1, k, n, CHARSIU_FP16, CHARSIU_FP16 };
+	struct charsiu_matmul mr = { 1, kroom, n, CHARSIU_FP16, CHARSIU_FP16 };
 	struct charsiu_fp16_w *w;
 
 	if (!f || k < 32 || n < 32)
 		return NULL;
+	if (kroom < k)
+		kroom = k;
+	mr.k = kroom;
 	w = calloc(1, sizeof(*w));
 	if (!w)
 		return NULL;
 	w->bytes = charsiu_weight_bytes(&mm);
+	w->room = charsiu_weight_bytes(&mr);
 	w->k = k;
 	w->n = n;
-	if (charsiu_bo_alloc(f->dev, w->bytes + 4096, &w->bo) || !w->bo.map) {
+	w->kroom = kroom;
+	if (charsiu_bo_alloc(f->dev, w->room + 4096, &w->bo) || !w->bo.map) {
 		free(w);
 		return NULL;
 	}
 	charsiu_bo_prep(f->dev, &w->bo, 1000000000);
-	memset(w->bo.map, 0, w->bytes + 4096);
+	/* ⚠ THE WHOLE ROOM, not the current bytes. A later set_k exposes the
+	 * rest of it to the hardware without anything else zeroing it, and
+	 * uninitialised memory in a KV surface is a NaN that spreads. */
+	memset(w->bo.map, 0, w->room + 4096);
 	charsiu_bo_fini(f->dev, &w->bo);
 	return w;
+}
+
+struct charsiu_fp16_w *charsiu_fp16_w_alloc(struct charsiu_fp16 *f,
+					    unsigned k, unsigned n)
+{
+	return charsiu_fp16_w_alloc_room(f, k, n, k);
+}
+
+/*
+ * The caller has re-laid the bytes out at `k` and is saying so. Refuses a k
+ * the allocation cannot hold; everything else is the caller's promise.
+ */
+int charsiu_fp16_w_set_k(struct charsiu_fp16_w *w, unsigned k)
+{
+	struct charsiu_matmul mm;
+
+	if (!w || k < 32 || k > w->kroom)
+		return -1;
+	mm.m = 1; mm.k = k; mm.n = w->n;
+	mm.wdtype = CHARSIU_FP16; mm.adtype = CHARSIU_FP16;
+	if (charsiu_weight_bytes(&mm) > w->room)
+		return -1;
+	w->bytes = charsiu_weight_bytes(&mm);
+	w->k = k;
+	return 0;
+}
+
+unsigned charsiu_fp16_w_room(const struct charsiu_fp16_w *w)
+{
+	return w ? w->kroom : 0;
 }
 
 void charsiu_fp16_w_free(struct charsiu_fp16 *f, struct charsiu_fp16_w *w)
