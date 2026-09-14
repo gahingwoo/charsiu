@@ -18,12 +18,25 @@
  * npu_matvec here takes the int8 activation unless CHARSIU_NPU_A16=1. The
  * board is w4a16; this defaults to w4a8.
  *
- * 🏁 SO THE HOST BRACKETS THE BOARD RATHER THAN MISSING IT. Same model, same
- * corpus, group 1024: host w4a8 33.8071, BOARD 33.4149, host w4a16 32.8008.
- * The board sits between the two activation arms, which is where fp16
- * activations with float accumulation should sit. Quality work does not need
- * the card to about 1 to 4%, and the default host arm is the conservative
- * side: it reads WORSE than the hardware.
+ * 🏁🏁 SO THE HOST REPRODUCES THE BOARD, AND NOT MERELY TO A FEW PERCENT.
+ * Measured on r413 with the model and the corpus checked by md5 to be the same
+ * FILES on both sides (c82c0340d974 and 4237c8fc3163, long.txt, -n 300):
+ *
+ *     host  CPU, group 1024, w4a8   33.8071    <- the default arm
+ *     BOARD real NPU, int4          32.8025
+ *     host  CPU, group 1024, w4a16  32.8008    <- 0.005% from the board
+ *
+ * Set CHARSIU_NPU_W4_GROUP=1024 and CHARSIU_NPU_A16=1 and the desk answers the
+ * board to five significant figures. Quality work does not need the card at
+ * all; what it needs is both of those set, because the board is w4a16 and this
+ * defaults to w4a8.
+ *
+ * ⚠ THE FIRST VERSION OF THIS PARAGRAPH SAID "BRACKETS ... TO ABOUT 1 TO 4%",
+ * comparing against a board figure of 33.4149 taken from a different round
+ * under conditions nobody had matched. The bracket is real but it is an
+ * artefact of the DEFAULT activation width, not the limit of what the desk can
+ * do. A number belongs to its input file, and that is also true of the number
+ * you are comparing against.
  *
  * ⚠⚠ AND THE GROUP IS THE WHOLE OF IT, NOT KMAX. The quantiser's group is
  * CHARSIU_NPU_W4_GROUP (npuquant.c); CHARSIU_NPU_KMAX is not read in that file
