@@ -702,6 +702,26 @@ struct charsiu_npu {
 	 */
 	double busy_us;
 	/*
+	 * ⛔⛔ AND THE SAME SPLIT AGAIN, ONE FIELD OVER. busy_us is incremented
+	 * in THREE places -- matvec, matvec_group and npu_matmul_inner -- and
+	 * account_call, which feeds calls, tasks_hi, mb_hi and the whole
+	 * normals fit, is called from only the first two. So the fit's fix,
+	 * tsk and byt describe DECODE and busy_us describes decode AND
+	 * PREFILL, and every line that divides one by the other reports a
+	 * share diluted by whatever prompt the run had in it.
+	 *
+	 * The comment on the end to end figure above records this exact
+	 * asymmetry being found and fixed for call_us. It was not fixed here,
+	 * and "39% of the hardware path is dispatch" -- a number hand computed
+	 * on 2026-08-31 from a five row stage table and quoted since -- is on
+	 * the wrong side of it twice over: it is a share of the hardware path
+	 * and not of a token, and the path it is a share of is this one.
+	 *
+	 * mv_busy_us is the SAME calls the fit sees, so the ratio has one
+	 * meaning.
+	 */
+	double mv_busy_us;
+	/*
 	 * And what that time is MADE of. bo_prep is not a read: it WAITS for the
 	 * job, so the fence and the copy have to be told apart or the 23 ms this
 	 * leaves over stays a residual rather than a measurement.
@@ -785,6 +805,29 @@ struct charsiu_npu {
 	 * shape sweep fitted synthetic matmuls at 32 chained tasks and got 26.3
 	 * us a task plus 172 us a submit plus 84.3 us a megabyte. Same three
 	 * terms, same order, from different shapes on a different day.
+	 *
+	 * ⛔⛔⛔ AND THE 39% BELOW IS WITHDRAWN AS A SHARE OF A TOKEN. It is a share
+	 * of the DECODE HARDWARE PATH -- (11.5 + 7.4) / 48.0 -- and the token in the
+	 * same paragraph is 58.4 ms, against which the same numerator is 32%, not 39%.
+	 * Three further things are wrong with quoting it at all:
+	 *
+	 *   - the five stage times it was fitted from appear NOWHERE but this comment.
+	 *     There is no board log for 2026-08-31 in either repository, so the run
+	 *     behind it cannot be reproduced or checked;
+	 *   - its per task coefficient, 36.8 us, was refuted 48 hours later by round
+	 *     152, which measured a job at 16.85 us + 4.81 us a task on a matmul with
+	 *     no arithmetic in it. tools/charsiu_shapes.c already says the two "disagree
+	 *     by 8x on the task term and both cannot be right". With 4.81 the share is
+	 *     26%, not 39%;
+	 *   - the same fit was hand computed twice in this file on the same day, with
+	 *     different assumed call and task counts, and printed 39 here and 40 in the
+	 *     report block. They are the same quantity.
+	 *
+	 * What is quotable is what the counter prints, from the run in front of it.
+	 * r412 reads 14.5% on gemma4 and 15.0% on gemma3: the per call term fell from
+	 * 128.7 us to 43-51 across the qos hold, the v11 tree and the two rocket
+	 * patches, so even the corrected 26% is a reading of a runtime that no longer
+	 * exists.
 	 *
 	 * ⚠⚠ WHAT THAT SPLIT SAYS ABOUT THE ROOF. Per token it is 11.5 ms of
 	 * per call cost, 7.4 ms of per task cost and 29.1 ms of weights. Those
@@ -2312,11 +2355,18 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	 *
 	 * ⚠ THE FIXED SHARE IS THE WHOLE POINT. If it is small then this
 	 * hardware path is bandwidth bound and the only thing left is to move
-	 * fewer bytes. If it is large -- and on TinyLLAMA decode the offline
-	 * fit puts it at 40% of the hardware path, 11.9 ms per call plus 7.3 ms
-	 * per task against 28.8 ms of weights -- then the tokens per second are
-	 * being spent on dispatch, and the bytes per second figure above is an
+	 * fewer bytes. If it is large then the tokens per second are being
+	 * spent on dispatch, and the bytes per second figure above is an
 	 * average across shapes rather than a roof anything is pressed against.
+	 *
+	 * ⛔ THIS SAID "and on TinyLLAMA decode the offline fit puts it at 40%
+	 * of the hardware path, 11.9 ms per call plus 7.3 ms per task against
+	 * 28.8 ms of weights", and the SAME fit on the SAME day is written up
+	 * as 39% with 11.5 / 7.4 / 29.1 in the comment beside busy_us. One
+	 * quantity, hand computed twice from a spreadsheet of assumed call and
+	 * task counts, two answers. Both are withdrawn there and the reasons
+	 * are there too. What this block prints, from the run in front of it,
+	 * is the answer.
 	 *
 	 * The GB/s here is the aggregate across the cores and it does NOT
 	 * assume they were given equal shares: it is the whole run's weight
@@ -2437,7 +2487,7 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				"%.0f ms in the hardware path %.0f ms is per "
 				"call, %.0f ms is per task and %.0f ms is the "
 				"weights at %.2f GB/s across %u core%s\n",
-				x[0], x[1], x[2], g->busy_us / 1e3, fix, tsk,
+				x[0], x[1], x[2], g->mv_busy_us / 1e3, fix, tsk,
 				byt, byt > 0.0 ? g->weight_mb / byt : 0.0,
 				g->ndev, g->ndev == 1 ? "" : "s");
 			/*
@@ -2451,19 +2501,25 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			 * three terms and the megabyte figure above should not
 			 * be quoted.
 			 */
-			if (g->busy_us > 0.0) {
+			if (g->mv_busy_us > 0.0) {
 				double ss = g->f_yy - x[0] * g->f_y
 					  - x[1] * g->f_ty - x[2] * g->f_my;
 				double rms = ss > 0.0
 					   ? sqrt(ss / (double)g->calls) : 0.0;
 
+				/* ⚠ SAY WHICH PATH, because "the hardware
+				 * path" has meant two different totals in this
+				 * file and the difference is every batched
+				 * millisecond of the run. */
 				fprintf(stderr,
-					"charsiu NPU: %.0f%% of the hardware "
-					"path is dispatch rather than bytes, "
-					"and a typical call sits %.0f us off "
-					"that line, %.1f%% of the %.0f us it "
-					"takes\n",
-					100.0 * (fix + tsk) / (g->busy_us / 1e3),
+					"charsiu NPU: %.0f%% of the %.0f ms "
+					"DECODE hardware path is dispatch "
+					"rather than bytes (the batched entry "
+					"is not in this ratio), and a typical "
+					"call sits %.0f us off that line, "
+					"%.1f%% of the %.0f us it takes\n",
+					100.0 * (fix + tsk) / (g->mv_busy_us / 1e3),
+					g->mv_busy_us / 1e3,
 					rms,
 					100.0 * rms * (double)g->calls / g->f_y,
 					g->f_y / (double)g->calls);
@@ -3587,6 +3643,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			 * a residual between them means nothing.
 			 */
 			g->busy_us += took;
+			g->mv_busy_us += took;
 			account_call(g, &id, 1, took);
 
 			if (took > g->slow_us * (g->nochain ? e->count : 1)
@@ -7456,6 +7513,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		double took = now_us() - t0;
 
 		g->busy_us += took;
+		g->mv_busy_us += took;
 		account_call(g, ids, n, took);
 	}
 	g->call_us += now_us() - tcall;

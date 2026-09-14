@@ -4183,8 +4183,23 @@ it mid-word before 412 finally kept it:
                                                       at 16.38 GB/s across 2 cores
 ```
 
-**The two models stream at the same rate.** Dispatch is 10% of gemma4's
-hardware path and 14% of gemma3's. Neither is bandwidth-starved and neither is
+**The two models stream at the same rate.** Dispatch is **14.5%** of gemma4's
+hardware path and **15.0%** of gemma3's.
+
+⛔ **This line said 10% and 14%, and both were the per-CALL term alone with the
+per-TASK term dropped** -- 435/4277 and 257/1881 instead of (435+185)/4277 and
+(257+26)/1881. The runtime prints `(fix + tsk) / path` and has since the
+counter was added; somebody re-derived the printed quantity by hand and got a
+different answer, which is the same failure as the number the counter was added
+to replace. ⚠ **And the denominator those came from is diluted**: `busy_us` was
+incremented by the batched prefill entry as well as by the two decode entries,
+while the fit behind `fix` and `tsk` only ever saw decode calls, so any run with
+a prompt in it divided a decode numerator by a decode-plus-prefill total. The
+runtime divides by `mv_busy_us` now, the same calls the fit counted, and says
+DECODE in the line so the two totals cannot be confused again. **The 14.5% and
+15.0% above are recomputed from the printed rows, so they carry that dilution
+too; they are the right formula on the old denominator and should be re-read
+off a run with the corrected counter.** Neither is bandwidth-starved and neither is
 dispatch-bound. gemma4 is simply a bigger model a token: 211 calls where
 gemma3 makes 105, and 1140 MB of weights where gemma3 reads 545.
 
