@@ -237,9 +237,14 @@ DRAM bound and not MAC bound:
 | int8 | 973 MB | 85 ms | **11.8** |
 | int4 | 487 MB | 44 ms | **22.7** |
 
-The vendor ships about 13 tokens a second on this board. **So int4 is not a
-nice-to-have, it is the only 2x available**, which is why it moves to the front of the
-queue despite its layout still being unconfirmed here.
+The vendor ships about 13 tokens a second on this board. ⚠ **UNCORROBORATED**:
+that figure names no model, no protocol and no source, and nothing else in this
+tree reproduces it -- the measured vendor decode figures are per model (24.85
+Qwen3-0.6B, 19.71 TinyLLAMA-1.1B, 6.58 Phi-3.5, 9.23 gemma-4-E2B) and this entry
+is about Llama-3.2-1B, for which no vendor decode reading exists here.
+
+**So int4 is not a nice-to-have, it is the only 2x available**, which is why it
+moves to the front of the queue despite its layout still being unconfirmed here.
 
 Prefill is a different machine entirely: at M = 32 the same weights are amortised over
 32 rows, 604 GOP/s and 6.9 us per row against 200 us per row at M = 1.
@@ -3017,11 +3022,17 @@ baseline and not under nmax4096 -- and the present-value count moving from
 8192 of 8192 to 8189. A knob that changed nothing would have reproduced the
 baseline exactly.
 
-### 🏁 The overlap at width 24 produced 21600 exact rows
+### m64 to m67: four rounds on the overlap, and none of them could rule
 
-`board_overlap_slots.sh` -- the probe npudev.c calls *"what turns this into a
-mechanism"* -- ran on 2026-09-04 at 21:37, on phi3, width 24, KMAX 2048, 225
-tensors a pass:
+⛔ **Read the correction that follows before any of this.** All four rounds
+below re-confirm a result that was settled on 2026-09-04 and written at the top
+of `src/overlap.h`, and two of them compare one configuration against itself.
+The tables are kept because they are readings; the claims they were run for are
+not earned.
+
+**m64, the element probe.** `board_overlap_slots.sh` -- the probe npudev.c calls
+*"what turns this into a mechanism"* -- ran on 2026-09-04 at 21:37, on phi3,
+width 24, KMAX 2048, 225 tensors a pass:
 
 ```
   arm            rows            worst rel   MISS   speedup   fence
@@ -3032,30 +3043,17 @@ tensors a pass:
   parallel 4     5400 of 5400    1.61e-04    0      -         -
 ```
 
-**Zero misses in four overlapped passes at the width whose TEXT is wrong 3 to
-15 times in 16.** And the overlap demonstrably engaged: the fence is what
-overlapping two cores is supposed to cut, and it collapses 409 -> 164 ms while
-the pass gets a third faster. That is a behavioural signature, not a flag being
-set -- which matters, because a knob that quietly does nothing has cost this
-tree a round before.
+21600 exact rows at the width whose text was wrong 3 to 15 times in 16, and the
+overlap demonstrably engaged: the fence collapses 409 -> 164 ms, which is a
+behavioural signature and not a flag being read back.
 
-The consequence is that the width-24 fault is **not in the batched matmul**,
-or is no longer there at all. npudev.c currently describes the whole residual
-as "two cores stepping on row 0 of a wide output"; that sentence is earned for
-m = 8 and m = 10, where the same probe DOES catch 33 misses, and it is not
-earned for 22 and 24, where this probe looks straight at the numbers and finds
-none.
+⛔ It does not say the text is right. `--batch-probe` exercises the batched
+matmul against the m = 1 path tensor by tensor and never runs a norm, a rope
+table or a cache offset, so a fault outside the matmul is invisible to it by
+construction.
 
-⛔ What this does NOT say: that the text is now right. The probe runs
-`--batch-probe`, which exercises the batched matmul against the m = 1 path
-tensor by tensor and never runs a norm, a rope table or a cache offset. A fault
-outside the matmul is invisible to it by construction. Round m65 asks the text
-question directly, with the KMAX 1024 cell as the positive control, because a
-round where nothing reproduces says the fault is gone rather than located.
-
-### m65: the overlap is clean at width 24, and the control never ran
-
-Phi-3.5, 87 token prompt, 16 runs an arm, on the board's current dev build.
+**m65, the text question -- and the positive control never ran.** Phi-3.5, 87
+token prompt, 16 runs an arm:
 
 ```
   KMAX 2048, chunk 24   widths 3x24+1x14   parallel 0/16 wrong   serial 0/16
@@ -3063,86 +3061,49 @@ Phi-3.5, 87 token prompt, 16 runs an arm, on the board's current dev build.
                                            onedev   0/16 wrong
 ```
 
-The KMAX 2048 cell is a real width-24 test and the overlap is clean sixteen
-times, where the 08-30 map has this configuration wrong 3 to 15 times in 16.
-Together with the slots probe's 21600 exact rows that is two independent reads
-saying the same thing.
-
 **⚠ The KMAX 1024 cell -- the one that exists to reproduce 13 of 16 -- did not
 run width 24 at all.** Its widths line says `1x86`: the chunk cap at KMAX 1024
 is 163840/1024 = 160, the prompt is 87 tokens, and `CHARSIU_PREFILL_ONECHUNK`
-(default ON since this week) replaced the requested chunk of 24 with one chunk
-of 86. A cell that was supposed to fail tested a width that has never failed.
+(default ON that week) replaced the requested chunk of 24 with one chunk of 86.
+A cell that was supposed to fail tested a width that has never failed. That is
+the fourth time that month a knob was set and did not engage, and the only
+reason it was caught is that the script prints the binary's own `widths` line
+beside the rate. **A number is worth what the line next to it says was run.**
 
-That is the fourth time this month a knob has been set and not engaged, and the
-only reason it was caught is that the script prints the binary's own `widths`
-line beside the rate. **A number is worth what the line next to it says was
-run.** m66 repeats the control with `CHARSIU_PREFILL_ONECHUNK=0`.
-
-So the standing claim after m65 is narrow and deliberately so: at KMAX 2048,
-chunk 24, phi3, on this kernel and this build, sixteen overlapped runs are
-right. Nothing here has yet reproduced the fault, so nothing here has yet
-proved it gone -- an experiment where the positive control does not fire
-cannot tell "fixed" from "not looking".
-
-### 🏁 m66: the overlap fault does not reproduce, control included
-
-The same script, the same model, `CHARSIU_PREFILL_ONECHUNK=0` so the requested
-chunk survives to the chunker:
+**m66, the control repeated with `CHARSIU_PREFILL_ONECHUNK=0`:**
 
 ```
   KMAX 1024, chunk 24   widths 3x24+1x14   parallel 0/16 wrong   serial 0/16
   KMAX 2048, chunk 22   widths 3x22+1x20   parallel 0/16 wrong   serial 0/16
 ```
 
-The first line is the 2026-08-30 reading's own cell -- phi3, chunk 24, KMAX
-1024, both cores overlapped -- which was **13 of 16 WRONG** when it was priced.
-It is now 16 of 16 right, and this time the widths line proves the width ran.
-Width 22, which failed 1 in 16, is clean 16 of 16 too.
+The first line is the 2026-08-30 reading's own cell, which was **13 of 16
+WRONG** when it was priced, and the widths line proves the width ran this time.
 
-Three independent reads now say the same thing: 21600 exact rows in the element
-probe, 16 clean at width 24, 16 clean at width 22.
-
-**What that supports:** the 13-in-16 fault is gone. A rate that large gives
-sixteen consecutive clean runs about once in 10^11 tries, so this is not luck.
-**What it does not support:** that nothing is left. Sixteen clean runs bound a
-rate at roughly one in six, so a fault firing one prompt in fifty would sail
-through all of this untouched. That is the whole reason the 28 default was held
-back before, and the answer to it is more runs on more models, not a louder
-adjective.
-
-**Which change fixed it is not established and this round cannot say.** The
-running kernel is `2ffc0913` -- attach-once-v11 plus the igorfix patches, #9,
-built 09-05 -- against the August kernel that attached and detached the IOMMU
-per job, and the runtime has moved a long way in the same window. Telling the
-two apart needs the other kernel booted, which is a flash, which is the user's.
+⚠ **Sixteen clean runs bound a rate at roughly one in six**, so a fault firing
+one prompt in fifty sails through all of it untouched. A rate of 13 in 16 gives
+sixteen consecutive clean runs about once in 10^11 tries, so THAT fault is gone;
+nothing here says nothing is left.
 
 ⚠ And the warning both board scripts print here -- *"/boot/Image is NEWER THAN
-THIS BOOT"* -- is a false alarm. The Image's mtime is 1788580697 and the boot
-was at `now - uptime` = 1788636058, so the Image is 15 hours OLDER than the
-boot and the kernel running is the one on disk. The test is
-`[ /boot/Image -nt /proc/1 ]` and /proc/1's mtime is not the boot instant.
+THIS BOOT"* -- is a false alarm. The Image's mtime is 1788580697 and the boot was
+at `now - uptime` = 1788636058, so the Image is 15 hours OLDER than the boot. The
+test is `[ /boot/Image -nt /proc/1 ]` and /proc/1's mtime is not the boot instant.
 
-### m67: 48 identical hashes across four models, and none of them proves the overlap ran
-
-Four models, two prompt lengths, the token loop as the reference and three runs
-each of the serial default and `CHARSIU_NPU_PARALLEL_MIN_M=28`:
+**m67, 48 identical hashes across four models, proving nothing.** Four models,
+two prompt lengths, the token loop as the reference, three runs each of the
+serial default and `CHARSIU_NPU_PARALLEL_MIN_M=28`:
 
 ```
   short  qwen3  1x156        tinyl 1x158       llama 1x110       gemma3 1x80+1x78
   long   qwen3  5x80+1x12    tinyl 5x80+1x14   llama 3x80+1x20   gemma3 5x80+1x14
 ```
 
-Every one of the 48 batched runs hashes exactly to its own token loop, and the
-widths line beside each says which chunks it batched -- including tails of 12,
-14 and 20.
-
-**⚠ And that is not evidence the overlap engaged.** `PARALLEL_MIN_M` is
-consulted only after `batch_serial()` has already said "serialise", and
-`batch_serial()` defaults to `!overlap_safe()` -- so on a rail `overlap_safe()`
-approves, the two arms are the same run twice and all 48 hashes match for a
-reason that has nothing to do with the question. m68 below confirms exactly
-that, so this round measured nothing about the overlap.
+Every one of the 48 batched runs hashes exactly to its own token loop. **⚠ That
+is not evidence the overlap engaged.** `PARALLEL_MIN_M` is consulted only after
+`batch_serial()` has already said "serialise", and `batch_serial()` defaults to
+`!overlap_safe()` -- so on a rail `overlap_safe()` approves, the two arms are the
+same run twice and all 48 hashes match for a reason unrelated to the question.
 
 ### ⛔ Correction: the overlap is already the default, and the fault was already solved
 
@@ -3459,15 +3420,13 @@ quantiser group, not the two cores -- all four of which the last two days
 spent rounds on.
 
 ⇒ The lever is a **pipeline**: pack chunk N+1 and read chunk N−1 while the
-hardware runs N. The ceiling is `max(CPU, NPU)` instead of `CPU + NPU`, which
-on qwen3 is 315 ms against 444 -- prompt 705 → ~576, gap 1.47x → 1.23x.
+hardware runs N, so the ceiling is `max(CPU, NPU)` instead of `CPU + NPU`.
 
-⚠ What blocks it, and it is structural rather than hard: `struct npu_outbuf`
-is one buffer per GEOMETRY, not per tensor -- k and v share one, gate and up
-share one -- so submitting ahead would have the second tensor's dispatch
-overwrite the first's accumulators before the CPU has read them. `ob->busy`
-guards exactly that today. A ping-pong pair on the wide geometry costs about
-5 MB a device.
+⛔ **The projection that followed -- qwen3's prompt 705 → ~576 and the gap
+1.47x → 1.23x -- is an estimate and it is wrong in sign.** The pair submit was
+built and measured a 12 to 28% LOSS on four models; see "The pair submit is a 12
+to 28% LOSS, built and reverted" below. ⛔ The per prompt token "1.23x" was
+separately withdrawn by r392/r393: it was two points a side.
 
 ### And two thirds of the pipeline idea does not exist to be built
 
@@ -3634,24 +3593,20 @@ Everything cheap is now measured and most of it is closed:
   hiding pack behind the NPU     no next tensor to pack: the chain is serial
 ```
 
-What is left, with its price:
+What was left, with its price at the time. All three have since been answered,
+so this list is kept for its prices and not as a plan:
 
 1. **Submit a group before reading it** -- `{q,k,v}` and `{gate,up}` are the
-   only independence inside a layer. Worth about 8%: the hideable reads are
-   bounded by the group's own NPU time, which on qwen3 is 19 ms in the first
-   group and 18 in the second against a 444 ms entry. Blocked by k and v
-   sharing an output geometry and gate and up sharing another; a ping-pong pair
-   costs about 5 MB a device.
-2. **The read, which is 21-37% of the entry and has never been split** the way
-   the pack now is. Its volume is `m·n·S·4` read plus `m·n·4` written -- on
-   llama 304 MB in 164.6 ms, **1.85 GB/s**, against the 7.13 GB/s one thread of
-   this board managed on a plain read. Three to four times off memory speed,
-   and the index gather is the suspect that the pack's FINI was.
-3. **Fewer K slices** would cut the read AND the fence's intercepts
-   proportionally, and it is blocked by the quantiser group, not by the
-   hardware. That is a quantiser question -- go where the vendor is, one scale
-   a row, and pay for it with a calibrated quantiser instead of RTN -- and
-   npudev.c has the offline price already.
+   only independence inside a layer. Estimated at about 8%, from hideable reads
+   bounded by the group's own NPU time (19 ms and 18 ms on qwen3 against a
+   444 ms entry). ⛔ Built and measured a 12 to 28% LOSS, below.
+2. **The read, which is 21-37% of the entry** -- `m·n·S·4` in plus `m·n·4` out,
+   on llama 304 MB in 164.6 ms, **1.85 GB/s**. ⚠ That rate is corrected to
+   5.2 GB/s two entries on: it counted only the int32 accumulator, and Y is read
+   and written once per K slice.
+3. **Fewer K slices**, blocked by the quantiser group and not by the hardware.
+   ⛔ Priced on 09-10 and the road stays closed: Llama 1024 → 4096 buys about
+   12% of a row and costs 10.5 to 39.7% of perplexity.
 
 ### The read is at a memory ceiling, and it is not the little cores
 
@@ -4708,18 +4663,13 @@ answers it in one command.
 
 ### ⚠⚠ How it was found: `CHARSIU_NPU=0` opened the NPU
 
-The round wanted a CPU control. `if (getenv("CHARSIU_NPU"))` is an existence
-test, so the one spelling anybody would reach for to disable the device
-enabled it, with W4V unset -- which is w8a8.
+`if (getenv("CHARSIU_NPU"))` is an existence test, so the one spelling anybody
+would reach for to disable the device enabled it, with W4V unset -- which is
+w8a8. **Two arms came back bit-for-bit identical, 272369.9386 twice, and that is
+the only reason it was caught.** The arm labelled "CPU, gguf weights" was the arm
+labelled "NPU int8 weights". The full census of this shape, and what it
+contaminated, is "the `=0` audit" the next day.
 
-**Two arms came back bit-for-bit identical, 272369.9386 twice, and that is the
-only reason it was caught.** The arm labelled "CPU, gguf weights" was the arm
-labelled "NPU int8 weights".
-
-Tonight's `charsiu_env_flag` sweep converted the twenty `!= NULL` switches and
-missed this shape entirely. There are 51 implicit existence tests in the tree;
-the three on `CHARSIU_NPU` itself are fixed, because that is the switch every
-board round and every installer sets.
 
 ### 🔑 And ppl is the one quantity here that survives a session boundary
 
@@ -6987,6 +6937,11 @@ support is narrower and more useful: the exponent has to be swept per model,
 and 0.5 -- the value every experiment in this tree used -- is on the wrong side
 of the minimum on both models tested, badly so on one.
 
+⛔ **And "Llama's minimum is 0.20" is withdrawn twice over below**: 0.20 was the
+smallest cell that grid contained, and every sweep on this page was taken
+through a clamp that binds from alpha 0.10 upward. With the clamp inert the
+optimum is 0.20 to 0.25 on both models and both passages.
+
 ### 🏁 The calibration, identified — and it says the same thing the ppl sweep did
 
 With the layout solved, the vendor's transformed weights are readable, so the
@@ -8058,41 +8013,27 @@ in the arm's own heading now.
 Llama's and qwen3's AWQ optima had been measured on **different corpora** —
 0.20 and 0.35 — so nobody had separated "per model" from "per corpus". Both on
 `tests/corpus/long.txt` at 300 tokens, host CPU reference, each with its own
-calibration recorded from `tests/corpus/calib.txt`:
+calibration recorded from `tests/corpus/calib.txt`. Llama's row is the one in
+the entry above; qwen3's reads
 
 ```
-  alpha        off      0.05     0.10     0.15     0.20     0.25     0.35     0.50
-  Llama-1B   41.5289  38.4906  33.7566  32.5094  35.2041     -     42.3752  50.7341
-  Qwen3-0.6B 110.0549    -     80.1066  86.1183  77.7821  71.7770 77.8404  77.5428
+  alpha        off      0.10     0.15     0.20     0.25     0.35     0.50
+  Qwen3-0.6B 110.0549  80.1066  86.1183  77.7821  71.7770  77.8404  77.5428
 ```
 
-**Qwen3's row is not monotone.** 0.15 sits *above* both its neighbours by eight
-to ten percent, and 0.50 sits *below* 0.35. `charsiu_ppl` is deterministic, so
-this is not measurement noise — it is **299 scored positions of one passage
-being unable to rank cells eight to ten percent apart.**
+**Qwen3's row is not monotone.** 0.15 sits above both its neighbours by eight to
+ten percent, and 0.50 sits below 0.35.
 
-⚠⚠ **And that retracts the sharp form of this morning's claim.** Llama's
-0.15-against-0.20 gap is eight percent, which is inside the band qwen3 has just
-demonstrated to be unrankable at this length. The surface being monotone on
-Llama is the tell's *absence*, which is weaker than its presence is damning.
+⛔ **What was concluded from that -- "299 scored positions of one passage cannot
+rank cells eight to ten percent apart", a resolution floor placed on every close
+comparison in this tree -- is WITHDRAWN by the retraction an hour later.** On an
+independent passage 0.15 is still worse than 0.10: the surface really is bumpy.
 
-**What survives, and it is the part that mattered:**
-
-- the good region for Llama extends **below 0.20**, which was the old grid's
-  floor: 0.10 and 0.15 both beat it, by 4 and 8%. "The minimum is at 0.20" was
-  read off a grid that could not have found anything smaller, and that is still
-  wrong.
-- 0.5 is still clearly bad on Llama — 50.73 against 41.53 with AWQ off.
-- AWQ is worth 20 to 35% on both models somewhere in 0.10 to 0.25.
-- ⚠ The vendor's own per-tensor exponents run 0.03 to 0.15 typical and never
-  exceed 0.401, which lands in the same region from a completely different
-  direction and is not subject to this corpus's sampling at all.
-
-🔑 **The instrument's resolution is a property of the corpus and the length,
-and it is now measured: ~10% at 299 positions on this passage.** Any two cells
-closer than that need a longer run or another corpus before they can be
-ordered. That is a number this tree did not have, and it applies to every ppl
-comparison in this file, not only to AWQ.
+What survives from this entry: Llama's good region extends **below 0.20**, which
+was the old grid's floor (0.10 and 0.15 beat it by 4 and 8%); 0.5 is clearly bad
+on Llama, 50.73 against 41.53 off; and the vendor's own per-tensor exponents run
+0.03 to 0.15 typical and never exceed 0.401, which lands in the same region from
+a direction no corpus here can affect.
 
 ### 🏁 The AWQ activation was rebuilt once per ROW, and the note above it said "per call"
 
@@ -8762,6 +8703,10 @@ over 112 tensors with a perplexity objective is not a desk experiment.
   do not bother with per-kind         three ways, all worse
   worth                               32-38% against AWQ off
 ```
+
+⚠ **That 32-38% is the UNGROUPED configuration, which the board does not run.**
+At the board's own group 1024 the same method is worth 24 to 31% on two
+architectures -- see "AWQ ON A SECOND ARCHITECTURE, AT THE BOARD'S GROUP" below.
 
 ### ⛔⛔⛔ THE HOST CPU REFERENCE HAS NEVER MEASURED THE BOARD'S QUANTISER
 
@@ -9709,11 +9654,18 @@ And the per-slice weight buffer follows the job rather than the device:
 width, and the first candidate for that function is `t->packed`, which is
 exactly what the existing refusal tests: `if (g->w4 && !t->packed)`.
 
+⛔ **That is what was tried, and it dispatches garbage.** See "MIXED WIDTH
+DISPATCHES AND COMPUTES GARBAGE. REVERTED." below: `w4_for()` answering
+`t->packed` gave fluent filler on all nine models. The scoping above stands as
+scoping -- there is no narrow path, the tensor is in scope, the buffers have
+room -- and the conclusion that one function is enough does not.
+
 ⚠ Two things it still has to get right, neither of which the sizing covers:
 `slice_wsum`'s `if (!g->w4)` gate computes the zero-point correction that only
 int8 needs, and `adtype` differs (w4 wants fp16 activations, w8 wants int8), so
 a group that mixes widths cannot share one packed activation. The tree has
 already priced that second one at about 2%.
+
 
 ### 🏁 THE SERIAL ARM, SAME BOOT: serialising costs NOTHING on decode
 

@@ -4,6 +4,11 @@
 on one ROCK 4D at the `performance` governor. charsiu `dev 4057a39`, all
 pushed.
 
+⚠ **This is a snapshot of 2026-09-11 and two of its verdicts have moved since.**
+R2's ladder is not monotone on a second passage, and the prefill state it
+assumes has been overtaken by rounds r393 to r411. Both are flagged where they
+appear; the lab notebook's closing section carries the detail.
+
 ---
 
 # R1: the margin was made by a statistic, and then it was really fixed
@@ -245,7 +250,7 @@ would have reached a paper as "AWQ does nothing on the board".
 | item | state |
 |---|---|
 | R1 | Diagnosed, fixed, and re-measured on four models. The margin was best-of-N picking the fast mode of a bimodal decode; the cause is core placement; `a58086c` pins the fast cluster by default, giving +17% to +27% across four models at spreads of 0.1 to 1.9%, all four ahead of the vendor on the median, with the new medians equal to the old best-of-seven to within 1% |
-| R2 | Done, entirely on the desk. On the pinned protocol the vendor's excess is 2.00, 2.23 and 2.35 times charsiu's across three nested subsets |
+| R2 | Done, entirely on the desk. On the pinned protocol the vendor's excess is 2.00, 2.23 and 2.35 times charsiu's across three nested subsets. ⛔ The rise across the subsets is `long.txt` alone: `long2.txt` reads 2.62 / 1.42 / 1.65 and puts the 43-matrix rung at the top. What is supported is the direction in every cell and an interval of 1.4x to 2.6x, and no single figure. See `vendor-quality-provenance.md` |
 | R3 | Done. One boot, boot id taken at both ends and unchanged |
 | R4 | Closed. It was two clusters 6.3% apart; after pinning the spread is 4.4% with no shape callable. The same lottery |
 | R5 | Not a run, a misreading. `12.59 * 64/65 = 12.40`, so the gate can come out |
@@ -255,21 +260,26 @@ would have reached a paper as "AWQ does nothing on the board".
 
 ---
 
-# Next
+# What happened next
 
-The `npudev.c` per-tensor width refactor. `npu_mixed_test` on the board answers
-the question that blocked it: one open device alternates w8a8 and w4a16
-correctly, 0 of 18 dispatches wrong over eight alternations in both directions.
-That was at K=256 and N=64, so it justifies the refactor rather than
-demonstrating the knob.
+The `npudev.c` per-tensor width refactor was scoped and then **attempted and
+reverted**. `npu_mixed_test` had answered the hardware question -- one open
+device alternates w8a8 and w4a16 correctly, 0 of 18 dispatches wrong over eight
+alternations in both directions, at K=256 and N=64 -- but making `w4_for()`
+answer `t->packed` produced fluent filler on all nine models (`9 models
+compared, 9 differing`) and was reverted rather than left behind a default-off
+switch. The threading of the tensor through the width decision stayed; that way
+of asking did not. See the lab notebook, "MIXED WIDTH DISPATCHES AND COMPUTES
+GARBAGE".
 
-The checker's ban on "beats the vendor" can now be lifted against a
-measurement. The rule should record what was measured and when, not the verdict
-it produced.
+The checker's ban on "beats the vendor" can be lifted against a measurement. The
+rule should record what was measured and when, not the verdict it produced.
 
 Every speed figure in a paper needs to say it is a median of seven with the
-calling thread pinned, and the vendor column needs to say it is a citation at
-maximum frequency with no N and no spread.
+calling thread pinned, and the DECODE vendor column needs to say it is a
+citation at maximum frequency with no N and no spread. ⚠ The TTFT ladder is not
+in that position any more: since r389 the vendor's column there is their own
+runtime measured on this board, which is an arm rather than a citation.
 
 Two notes for whoever runs the next round: one script per UART opener, and
 `charsiu update` is interactive so it needs `CTUI_ASSUME=yes ... </dev/null`.

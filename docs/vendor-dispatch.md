@@ -56,7 +56,8 @@ K = 2048 is the whole hidden size in one dispatch and K = 4096 is half the FFN.
 
 The int4 M ladder in full, over all 3328: M = 1 (512), 16 (384), 24 (64), 32 (512),
 40 (320), 48 (384), 64 (384), 80 (768). The widest is 80 and it is also the most
-common. charsiu's own batched prefill chunks at 32.
+common. charsiu's own batched prefill runs a default chunk of 80 -- the same
+width -- clamped down to each model's own surface ceiling.
 
 ### The projections are split across the two cores
 
@@ -172,9 +173,13 @@ the KV length it actually has, and neither pay for 128 buckets nor be capped at 
 and on up to 128. The RK3588 notes record that a feature height below four computes
 output uncorrelated with the reference, on every datatype, and that it is a hardware
 constraint rather than a stride bug. The RK3576 vendor dispatches heights of two and
-three as a matter of course. Either the constraint is not present on this chip or the
-vendor is configuring around it, and that is a question a single board round can
-answer.
+three as a matter of course.
+
+🏁 **Answered on the board, 2026-08-14, through the open driver and Mesa's own
+delegate.** Heights of one, two and three are exact on this silicon: a 512 to 1024
+projection came back 1024 of 1024 channels matching the CPU at M = 1, 2 and 3 --
+146 distinct values at M = 1 against the CPU's own 146, and 357 and 416 of the
+1024 confirmed computed at M = 2 and 3. The RK3588 constraint is not present here.
 
 ## What this does not say
 
@@ -185,7 +190,8 @@ answer.
   of elementwise work is on the NPU, but which ops those are is not decoded yet.
 - **Nothing about correctness at M = 1.** That the vendor dispatches it is not proof
   the hardware is exact there. It is proof the vendor believes it is, which is a
-  different and much cheaper thing to check on a board.
+  different and much cheaper thing to check on a board -- and the board has since
+  checked it; see the M ladder note above.
 
 ## The 4940 fp16 streams are attention, and here is what they write
 
@@ -284,12 +290,15 @@ repository contain no fp16-weight convolution, and rknn-toolkit2 is not
 installed on this host, so one cannot be compiled here either. The tile has to
 be walked on the board with sparse maps, the way int4's was.
 
-## And the answer to the one thing the file could not say
+## The tile was walked on the board, and the first answer was wrong
 
-The section above ends "the tile has to be walked on the board with sparse
-maps". It was, on 2026-09-05, and the answer is that there is no tile:
-
-**`slot = n * k_eff + k`, which is plain dense, output channel major.**
+⛔ **This section's headline -- `slot = n * k_eff + k`, plain dense, output channel
+major -- is REFUTED. See "Correction: the layout is GROUP, not dense" at the end of
+this file.** Every point behind it was taken at K=16 N=8, where the dense and grouped
+layouts are identical in all 128 cells, so the measurements were blind to the question
+by construction. What is kept here is the instrument, the three register findings it
+needed, and the probe that turned out to be invalid -- none of which the correction
+touches.
 
 `npu_fp16_test --slots` writes 1.0 into one slot of the weight buffer at a time
 and reads back which output channel it lands in and which `A[k]` it multiplied,
@@ -297,9 +306,6 @@ with `A` a ramp. That is the hardware's own mapping read directly, with no
 candidate layout in the way -- which matters, because `--map`, the obvious
 instrument, places the weight at the (n, k) that a CHOSEN layout picks and so
 can only ever light up where we were already right.
-
-Three independent sweeps at K=16 N=8, eighteen firing slots between them, and
-every one satisfies that formula exactly.
 
 ### Getting there took three register findings, each named by the board
 
@@ -352,9 +358,12 @@ first  (sparse)  12/12
 TOTAL 48 points, 0 exceptions
 ```
 
+⛔ At K=16 N=8, `16n + k` is what BOTH candidate layouts give, so those 48 points
+carry no layout information at all. See the correction below.
+
 Still open, and NOT a layout question: only 12 of 128 single-weight
 perturbations register at all, on the dense buffer too, and the set moves
-between runs. Every observation that carries layout information agrees.
+between runs.
 
 
 ## Correction: the layout is GROUP, not dense

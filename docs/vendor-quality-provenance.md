@@ -98,8 +98,9 @@ One scale per row means the vendor's group is the whole of K.
 ```
 
 **charsiu's scales are 2 to 8 times finer than the vendor's on the very
-tensors the comparison scores.** So the 2.00 / 2.23 / 2.35 ratio is not "the
-same quantiser configuration, different algorithm". It is at least two
+tensors the comparison scores.** So the 2.00 / 2.23 / 2.35 ladder (⛔ whose rise
+across the rungs is one passage -- see "the ladder is not monotone" below) is
+not "the same quantiser configuration, different algorithm". It is at least two
 differences at once: a different algorithm and a finer group.
 
 That is a larger asymmetry than the bf16-against-Q8_0 one, and it points the
