@@ -104,11 +104,15 @@ boots was measured on the same charsiu ladder at worst 2.2%.
 ## int4 or int8
 
 Neither of charsiu's two weight formats wins outright, and they lose in different
-places. On Qwen3 0.6B, int4 decodes at 26.31 tok/s with a 602 ms TTFT and scores
-87% worse in perplexity than a plain q4_0 gguf. int8 decodes at 17.23 with a
-543 ms TTFT and stays within 1.6%. int4 is the default because chat is a short
-prompt and a long answer; `CHARSIU_NPU_W4V=0` selects int8 for the other shape of
-work.
+places: int4 decodes faster and costs accuracy, int8 the other way round. int4 is
+the default because chat is a short prompt and a long answer; `CHARSIU_NPU_W4V=0`
+selects int8 for the other shape of work.
+
+⚠ The four numbers that used to be in this paragraph -- 26.31 and 17.23 tok/s,
+87% and 1.6% -- are not in any board log or evidence section in either
+repository, so they are unsourced and have been removed rather than repeated.
+They are being re-measured; until that lands this paragraph says the direction
+and no figure.
 
 Perplexity is the only number here that survives a reboot. `tools/charsiu_ppl` is
 deterministic to the last digit across boots, while everything else on this board
@@ -221,6 +225,13 @@ encoder, and a decoder with the first cross attention in this tree. Every stage 
 diffed against numpy on the real weights, the spectrogram at 1.7e-05, the encoder
 at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the same
 argmax.
+
+⚠ Those three tolerances are the printed output of
+`tests/whisper_encoder_cross.py` and `tests/whisper_decoder_cross.py`, which
+parse the container independently of charsiu and are what anybody should re-run
+to check them. They are reproducible but not recorded with their conditions in
+either repository, unlike every speed number above, so treat them as "run the
+script" rather than as a citation.
 
 ```
 $ charsiu_clip clip-vit-base-patch32.gguf --image logo.png \
