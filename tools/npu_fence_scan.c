@@ -77,6 +77,14 @@ static const unsigned NS[] = { 256, 512, 1024, 2048, 3072, 4096, 6144, 8192 };
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 1024;
 	unsigned m = argc > 2 ? (unsigned)atoi(argv[2]) : 80;
 	unsigned reps = argc > 3 ? (unsigned)atoi(argv[3]) : 20;

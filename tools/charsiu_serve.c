@@ -567,6 +567,14 @@ static void serve_one(int fd)
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	const char *path = NULL;
 	int port = 11434, i;   /* ollama's port, so existing clients just work */
 	const char *host = "0.0.0.0";

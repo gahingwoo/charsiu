@@ -233,6 +233,14 @@ static int fire(struct charsiu_device *dev, struct charsiu_job *job,
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned k = 256, n = 64, loop = 8;
 	struct charsiu_device *dev;
 	struct charsiu_job j8, j4;

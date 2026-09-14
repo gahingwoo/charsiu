@@ -130,6 +130,11 @@ echo " charsiu_ppl binary:  $BIN/charsiu_ppl  md5 $(md5sum "$BIN/charsiu_ppl" 2>
 # ⚠⚠ AND THE md5 IS ALL charsiu_ppl CAN SAY. The git line at the top of this
 # header answers for the SOURCE tree, and on the board it prints "not a git
 # tree here", which is where this round runs. charsiu_ppl is compiled from
+# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# no --version to print it back" and warned that its first argument is read
+# through atoi, so asking would submit a dimension of zero. Both halves were
+# true when written; the flag went into every tool afterwards and is checked
+# before any positional argument, so asking is safe now.
 # that same tree with the same -DCHARSIU_BUILD and has no --version to print
 # it back, so two rounds can be told apart by that hash but neither can be
 # tied to a commit through it. The build line below is charsiu_run, which is

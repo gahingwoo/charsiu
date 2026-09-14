@@ -16,6 +16,14 @@
 /* encode -> decode must give the text back, or the tokenizer is lying */
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	(void)argc;
 	struct llama_model m;
 	static const char *cases[] = {

@@ -36,6 +36,11 @@ fi
 
 #
 # ⚠ NO BUILD LINE HERE. charsiu_vision is compiled with the same -DCHARSIU_BUILD
+# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# no --version to print it back" and warned that its first argument is read
+# through atoi, so asking would submit a dimension of zero. Both halves were
+# true when written; the flag went into every tool afterwards and is checked
+# before any positional argument, so asking is safe now.
 # as charsiu_run and has no --version to print it back: it would read the
 # flag as the mmproj path and refuse. What this round ran is the path below
 # and its mtime, and nothing finer, until the tool grows the flag.

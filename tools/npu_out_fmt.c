@@ -37,6 +37,14 @@ static int charsiu_env_flag_local(const char *n, int dflt)
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read: several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. npu_slice_test did
+	 * exactly that until this went in. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 32;
 	struct charsiu_device *dev;

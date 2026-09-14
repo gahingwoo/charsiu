@@ -123,6 +123,11 @@ echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
 
 #
 # ⚠⚠ AND WHICH BUILD, FOR charsiu_run ONLY. charsiu_ppl is compiled from
+# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# no --version to print it back" and warned that its first argument is read
+# through atoi, so asking would submit a dimension of zero. Both halves were
+# true when written; the flag went into every tool afterwards and is checked
+# before any positional argument, so asking is safe now.
 # this same tree with the same -DCHARSIU_BUILD, but it has no --version to
 # print it back, so every perplexity below is identified by the path on the
 # ppl line and nothing finer. A build line read as covering both binaries is
