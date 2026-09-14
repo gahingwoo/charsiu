@@ -111,22 +111,22 @@ places. Qwen3 0.6B, one board, `-c 1024`, three runs a cell, perplexity on
 `tests/corpus/long.txt` (md5 `4237c8fc3163a359fc21bde60c7b1d8b`), NPU 594 MHz:
 
 ```
-          TTFT ms            decode tok/s          perplexity
-  int4    151 / 153 / 168    28.09 28.50 28.68     87.7503
-  int8    210 / 215 / 226    16.09 16.37 16.37     44.1828
+                 TTFT ms            decode tok/s       perplexity
+  int4           151 / 153 / 168    28.09 28.50 28.68    87.7503   +102%
+  int8           210 / 215 / 226    16.09 16.37 16.37    44.1828     +1.8%
+  the gguf       -                  -                    43.3981     --
 ```
 
-int4 decodes 1.74x faster and scores 1.99x worse. It is the default because chat
-is a short prompt and a long answer; `CHARSIU_NPU_W4V=0` selects int8 for the
-other shape of work.
+The third row is charsiu's own CPU path on the same file with no NPU
+requantisation, which is what the other two are a loss against. int4 decodes
+1.74x faster than int8 and scores 1.99x worse; against the untouched gguf it is
+2.02x. int4 is the default because chat is a short prompt and a long answer;
+`CHARSIU_NPU_W4V=0` selects int8 for the other shape of work.
 
-⚠ The figures that used to be here -- 26.31 and 17.23 tok/s, 87% and 1.6% --
-appeared in no board log and no evidence section in either repository, and the
-re-measurement above does not reproduce them. They were removed rather than
-repeated. The two perplexities are the same deterministic instrument on the same
-corpus and are comparable to each other; a comparison against a plain q4_0
-reference is not quoted because that run came back without a figure and has not
-been re-done.
+⚠ The figures this replaces -- 26.31 and 17.23 tok/s, 87% and 1.6% -- appear in
+no board log and no evidence section in either repository. The two perplexity
+percentages were close (1.6 against 1.8, 87 against 102) and the two decode
+figures were not; all four are now measured here rather than carried forward.
 
 Perplexity is the only number here that survives a reboot. `tools/charsiu_ppl` is
 deterministic to the last digit across boots, while everything else on this board
