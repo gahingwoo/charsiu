@@ -5082,6 +5082,9 @@ struct attn_npu {
 	/* the rungs this run actually stood on, because the ladder's shape is
 	 * the thing being tuned and a count of repacks does not show it */
 	unsigned rung[20], nrung;
+	/* the shared buffers have been sized for the widest group this run
+	 * will ask for; see attn_reserve_mode */
+	int reserved;
 	/*
 	 * ⚠⚠ "FELL BACK ON 0" WAS TRUE AND MEANT NOTHING. `fallbacks` counts
 	 * the two charsiu_fp16_matmul_group failures and nothing else, while
@@ -5293,6 +5296,25 @@ static int attn_npu_kv_cap_on(void)
 
 /* the block copy, with an off switch: an arm that cannot be turned off cannot
  * be priced, and this one replaces a path that is known correct */
+/*
+ * 0 off, 1 at open (measured at -478 ms, see the note by the open-time block),
+ * 2 at the first layer call, where m and the prompt's own ceiling are known
+ * and the reservation is exactly what growing would have reached.
+ */
+static int attn_reserve_mode(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_RESERVE");
+
+		v = e && *e ? atoi(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return v;
+}
+
 static int attn_npu_kv_copy(void)
 {
 	static int v = -1;
@@ -5836,7 +5858,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		if (G > 1)
 			nops = (nops + G - 1) / G;
 		if (mm && a->nk >= 32 && hd >= 32 &&
-		    charsiu_env_flag("CHARSIU_ATTN_RESERVE", 0)) {
+		    attn_reserve_mode() == 1) {
 			for (i = 0; i < nops; i++) {
 				memset(&r[i], 0, sizeof(r[i]));
 				r[i].m = mm;
@@ -6615,6 +6637,51 @@ static int attn_npu_layer(struct attn_block_job *j)
 		fs[0] = a->f;   fs[1] = G > 1 ? a->f2 : a->f;
 		fvs[0] = a->fv; fvs[1] = G > 1 ? a->fv2 : a->fv;
 
+		/*
+		 * ⭐ THE SAME RESERVATION, SIZED FROM THE CALL INSTEAD OF FROM
+		 * THE CEILING. The open-time version guessed m from the input
+		 * surface ceiling and got 160 where the caller uses 80, so
+		 * every whole-buffer sync afterwards charged 2.4x the work.
+		 * Here m is the chunk's own, and the two extents are capped
+		 * the way the ladder caps them, so this asks for exactly what
+		 * growing into it would have reached -- and pays none of the
+		 * five reallocations on the way.
+		 */
+		if (attn_reserve_mode() == 2 && !a->reserved) {
+			struct charsiu_fp16_op r[FP16_GROUP_MAX];
+			unsigned q, rn = a->nk, rk = a->kvmax;
+
+			a->reserved = 1;
+			if (s->prompt_total > 0) {
+				unsigned t16 = ((unsigned)s->prompt_total + 15u)
+					     & ~15u;
+				unsigned t32 = ((unsigned)s->prompt_total + 31u)
+					     & ~31u;
+
+				if (t16 < rn)
+					rn = t16;
+				if (t32 < rk)
+					rk = t32;
+			}
+			for (q = 0; q < n0; q++) {
+				memset(&r[q], 0, sizeof(r[q]));
+				r[q].m = m;
+				r[q].k = hd;
+				r[q].n = rn;
+				r[q].Wbuf = a->kb[0];
+			}
+			charsiu_fp16_reserve(fs[0], r, n0);
+			if (G > 1)
+				charsiu_fp16_reserve(fs[1], r, n0);
+			for (q = 0; q < n0; q++) {
+				r[q].k = rk;
+				r[q].n = hd;
+				r[q].Wbuf = a->vb[0];
+			}
+			charsiu_fp16_reserve(fvs[0], r, n0);
+			if (G > 1)
+				charsiu_fp16_reserve(fvs[1], r, n0);
+		}
 		tg0 = attn_npu_now_ms();
 		if (charsiu_fp16_matmul_group_submit(fs[0], op, n0)) {
 			a->fallbacks++;
