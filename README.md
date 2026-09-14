@@ -247,8 +247,7 @@ $ charsiu_whisper ggml-tiny.en.bin --transcribe --audio jfk.wav
 Whisper comes out of whisper.cpp's own container: the mel spectrogram, the audio
 encoder, and a decoder with the first cross attention in this tree. Every stage is
 diffed against numpy on the real weights, the spectrogram at 1.7e-05, the encoder
-at 1.8e-04 over 576000 values, the decoder's logits at 3.8e-05 with the same
-argmax.
+at 1.7e-04 over 576000 values, and the decoder's logits with the same argmax.
 
 ⚠ Those three tolerances are the printed output of
 `tests/whisper_encoder_cross.py` and `tests/whisper_decoder_cross.py`, which
@@ -257,13 +256,38 @@ to check them. They are reproducible but not recorded with their conditions in
 either repository, unlike every speed number above, so treat them as "run the
 script" rather than as a citation.
 
+⚠ Two of the three have now been re-run and neither matched what was written
+here. The encoder read 1.8e-04 when written and reads **1.699e-04** at HEAD,
+which is real drift from the attention and gelu rewrites since; the figure
+above is corrected. The decoder's **3.8e-05 has no audio beside it**, and that
+is the whole problem: run against `jfk.wav` it reads 4.005e-05 with argmax 843
+(`b' And'`), and against the script's own default it reads 5.430e-05 with
+argmax 357 (`b' ('`). Three readings of one "tolerance". It is not quoted above
+any more, because a worst-case difference over a decoder's logits belongs to
+the audio that produced it, the same way a perplexity belongs to its corpus.
+Both PASS their thresholds, which are 2e-3 and 3e-3, ten to eighty times
+looser.
+
 ```
-$ charsiu_clip clip-vit-base-patch32.gguf --image logo.png \
+$ charsiu_clip clip-b32.gguf --image logo.png \
       --text "a drawing of a llama" "the statue of liberty" "a dog on grass"
-  0.2537  a drawing of a llama
-  0.1743  the statue of liberty
-  0.1533  a dog on grass
+  0.2745  a drawing of a llama
+  0.1854  the statue of liberty
+  0.1474  a dog on grass
 ```
+
+⚠ This block used to print 0.2537 / 0.1743 / 0.1533 and was not one run. Rows
+one and two are the **f16** CLIP file, reproduced here to the last digit; the
+file `tests/board_modalities.sh` actually downloads is the q4_0 above, which
+gives the numbers now shown. Row three reproduces from neither: f16 gives
+0.1273 for this sentence and 0.1323 for board_modalities' wording, and ten
+other phrasings ranged 0.1016 to 0.1850 without reaching 0.1533. Each sentence
+scores independently, so rows one and two pin the image and the model exactly
+and row three came from somewhere else.
+
+A score belongs to its model file as much as a perplexity does. What the board
+test checks is unaffected -- it asserts only that "llama" ranks first, which
+holds in every arm.
 
 ## Reading the vendor's model file
 
