@@ -122,20 +122,44 @@ static int attn_perhead(void)
  * CHARSIU_ATTN_POOL=1 forces it on at any length and =0 off, which is what the
  * rounds above used.
  */
+/*
+ * ⛔⛔ AND THE SENTINEL CAME BACK MEANING ITS OPPOSITE. charsiu_pool_min()
+ * returns (uint64_t)-1 for "never pool", which is what it answers whenever
+ * charsiu_threads() is under two. This read it into an int, got -1, and then
+ * ran `if (v < 0) v = 0` -- and 0 is not "never", it is "pool at EVERY
+ * position". At one thread attention was fanning every position out to a pool
+ * of one while its three siblings correctly refused.
+ *
+ * The siblings are the shape to copy: npupool's two keep the value unsigned so
+ * the sentinel stays UINT_MAX, and act_pool_min keeps the -1 and tests m >= 0.
+ * A `static int v = -1` cannot do that, because -1 is already this function's
+ * "not computed yet". Hence the separate flag.
+ *
+ * ⚠ An explicit negative from the environment still means "no floor", which is
+ * what it meant before. Only the SENTINEL means never, and it can only come
+ * from charsiu_pool_min.
+ */
 static unsigned attn_pool_min(void)
 {
-	static int v = -1;
+	static unsigned v;
+	static int set;
 
-	if (v < 0) {
+	if (!set) {
 		const char *e = getenv("CHARSIU_ATTN_POOL_MIN");
 
 		/* 64 positions at eight threads implies 1.12 positions a
 		 * microsecond; derived so it tracks the pool. See gguf.c. */
-		v = e ? atoi(e) : (int)charsiu_pool_min(1.12, charsiu_threads());
-		if (v < 0)
-			v = 0;
+		if (e && *e) {
+			long ev = atol(e);
+
+			v = ev < 0 ? 0u : (unsigned)ev;
+		} else {
+			v = (unsigned)charsiu_pool_min(1.12,
+						       charsiu_threads());
+		}
+		set = 1;
 	}
-	return (unsigned)v;
+	return v;
 }
 
 static int attn_pool_for(int pos)
