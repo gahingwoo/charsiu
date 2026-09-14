@@ -1123,6 +1123,15 @@ out of, and the only one that gains. What this asks for is a per model
 decision, which is what `llama_auto_kmax` already is; it only ever looks
 upward.
 
+**And the trade cannot be engineered away.** A narrow group forces a narrow
+slice, because one dispatch cannot cover K wider than one group: the hardware
+returns one accumulator per output channel per slice (`fo[j]`,
+`src/npudev.c:3818`) and the CPU multiplies it by that slice's single scale
+afterwards, so the whole slice K is summed before any scale exists to apply.
+The NPU's own per-channel multiplier is per OUTPUT channel, not per K range.
+So the cost of a narrower group is exactly the cost of more slices, in every
+version of this.
+
 **The shipping arm IS grouping, and that was checked rather than assumed.** A
 group width of 99991 divides nothing, so nothing groups, and Llama-3.2-1B reads
 50.7838 there against 41.2763 at the shipping 1024.
