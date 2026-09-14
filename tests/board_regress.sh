@@ -31,6 +31,13 @@ DIR="${1:-${CHARSIU_BOARD_DIR:-/opt/vendor/models}}"
 B="${2:-${CHARSIU_DIR:-/opt/charsiu}}"
 RUN="${CHARSIU_RUN:-$B/charsiu_run}"
 PPL="${CHARSIU_PPL:-$B/charsiu_ppl}"
+# ⚠ THE SCALAR CONTROL COMES FROM THE ENVIRONMENT TOO, and it did not. Section
+# 3 hardcoded "$B/charsiu_run_scalar" and overrode whatever the caller had set,
+# so a round that deployed a matching control still measured the installed one.
+# Same shape as the CHARSIU_RUN/CHARSIU_RUN_BIN split: setting the knob a
+# script does not read is a silent wrong arm. neon_control.sh now refuses a
+# control that cannot say its commit, which is how this surfaced.
+SCAL="${CHARSIU_RUN_SCALAR:-$B/charsiu_run_scalar}"
 M="$B/models/Llama-3.2-1B-Instruct-Q4_0.gguf"
 E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
@@ -56,8 +63,12 @@ CHARSIU_RUN="$RUN" sh "$HERE/board_text_all.sh" 8 2>&1 | grep -E "gguf|models co
 echo
 
 echo "================ 3. the vector kernels against the scalar ones"
-CHARSIU_RUN="$RUN" CHARSIU_RUN_SCALAR="$B/charsiu_run_scalar" \
-	sh "$HERE/neon_control.sh" "$DIR" 2>&1 | tail -14
+# ⚠ NOT PIPED THROUGH tail. Section 3's whole output when it finds something
+# is the FAIL lines and the two sentences under each; tail -14 kept the end of
+# the list and could drop the first failures. It also swallows the refusal
+# above. Print it, and let the reader see the whole thing.
+CHARSIU_RUN="$RUN" CHARSIU_RUN_SCALAR="$SCAL" \
+	sh "$HERE/neon_control.sh" "$DIR" 2>&1 | grep -vE '^charsiu: (this thread|cpu[0-9]|the pool)'
 echo
 
 echo "================ 4. the gelu identity: an exact arm must not move a token"
