@@ -52,7 +52,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
 
 # ⚠⚠ AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`

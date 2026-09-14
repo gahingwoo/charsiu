@@ -27,7 +27,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 M=${CHARSIU_AB_MODEL:-}
 if [ -z "$M" ]; then
 	for p in '*Phi-3*Q4_0*.gguf' '*Qwen2.5*Q4_0*.gguf' '*Q4_0*.gguf'; do
-		for d in "$HOME/.charsiu/models" /opt/charsiu/models; do
+		for d in "$HOME/.charsiu/models" /opt/charsiu/models /opt/vendor/models; do
 			for f in $d/$p; do [ -r "$f" ] && { M=$f; break 3; }; done
 		done
 	done

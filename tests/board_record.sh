@@ -53,7 +53,7 @@ mkdir -p "$(dirname "$OUT")"
 #
 # Resolve per FILE, over every directory.
 #
-MODELDIRS=${CHARSIU_RECORD_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models"}
+MODELDIRS=${CHARSIU_RECORD_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models /opt/vendor/models"}
 find_model() {
 	for _d in $MODELDIRS; do
 		for _f in "$_d"/$1; do

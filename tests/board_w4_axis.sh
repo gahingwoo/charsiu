@@ -45,7 +45,7 @@ done
 # --- the model -------------------------------------------------------------
 # ⚠ int4 AND llama, the same file prefill_control.sh uses, so the two rounds
 # are about one model.
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models"
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models"
 # ⚠ A SUBSTRING IS ENOUGH. Two rounds have now been spent on a path typed
 # by hand: one ran the wrong model entirely and answered its question
 # perfectly. `board_w4_axis.sh phi3` cannot miss the file it means.

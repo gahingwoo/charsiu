@@ -64,7 +64,7 @@ done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
 # ⚠⚠ MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
-MODELDIRS=${CHARSIU_CC_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models $D/../models"}
+MODELDIRS=${CHARSIU_CC_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models /opt/vendor/models $D/../models"}
 find_model() {
 	for d in $MODELDIRS; do
 		[ -d "$d" ] || continue

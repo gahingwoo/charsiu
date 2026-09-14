@@ -160,7 +160,7 @@ printf '%-16s %10s %10s   %10s %10s   %8s %8s\n' \
 
 rows | while IFS='|' read -r name file vt vttft vmb label; do
 	M=""
-	for d in "$MODELS" "$ALTMODELS" "$DIR"; do
+	for d in "$MODELS" "$ALTMODELS" /opt/vendor/models "$DIR"; do
 		[ -f "$d/$file" ] && { M="$d/$file"; break; }
 	done
 	if [ -z "$M" ]; then

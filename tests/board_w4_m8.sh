@@ -78,7 +78,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "board_w4_m8: charsiu_run not found" >&2; exit 1; }
 
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models"
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models"
 if [ -z "$MODEL" ]; then
 	for pat in '*Llama-3.2*Q4_0*.gguf' '*llama*Q4_0*.gguf' '*Q4_0*.gguf'; do
 		for d in $DIRS; do

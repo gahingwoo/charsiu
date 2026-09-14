@@ -40,7 +40,7 @@ BIN=$D
 [ -x "$BIN/charsiu_run" ] || { echo "no charsiu_run"; exit 2; }
 
 find_model() {
-	for _d in "$HOME/.charsiu/models" /opt/charsiu/models; do
+	for _d in "$HOME/.charsiu/models" /opt/charsiu/models /opt/vendor/models; do
 		for _f in "$_d"/$1; do
 			[ -f "$_f" ] && { echo "$_f"; return 0; }
 		done

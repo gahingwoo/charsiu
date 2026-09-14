@@ -28,7 +28,7 @@ set -eu
 
 MM=${1:-}
 if [ -z "$MM" ]; then
-	for d in "$HOME/charsiu-board" "$HOME/.charsiu/models" /opt/charsiu/models; do
+	for d in "$HOME/charsiu-board" "$HOME/.charsiu/models" /opt/charsiu/models /opt/vendor/models; do
 		[ -f "$d/mmproj.gguf" ] && { MM="$d/mmproj.gguf"; break; }
 	done
 fi

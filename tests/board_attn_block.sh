@@ -37,7 +37,7 @@ done
 MODELS=${CHARSIU_ATTN_MODELS:-}
 if [ -z "$MODELS" ]; then
 	for p in '*Qwen3-0.6B*Q4_0*.gguf' '*SmolLM2-135M*Q4_0*.gguf' '*gemma-3-1b*Q4_0*.gguf'; do
-		for d in "$HOME/.charsiu/models" /opt/charsiu/models; do
+		for d in "$HOME/.charsiu/models" /opt/charsiu/models /opt/vendor/models; do
 			for f in $d/$p; do
 				[ -r "$f" ] && { MODELS="$MODELS $f"; break 2; }
 			done

@@ -131,7 +131,7 @@ fi
 # and answered its question perfectly. The file is `Phi-3.5-mini-...` and the
 # thing anyone types is `phi3`; both sides go to lowercase letters and digits
 # before they are compared.
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models"
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models"
 norm() { echo "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9'; }
 if [ -n "$MODEL" ] && [ ! -r "$MODEL" ]; then
 	want=$(norm "$MODEL")
