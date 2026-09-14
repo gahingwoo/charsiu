@@ -1002,6 +1002,54 @@ struct charsiu_npu {
 	unsigned long tasks_hi;    /* tasks on whichever device got more */
 	double mb_hi;              /* and megabytes on that device */
 	/*
+	 * ⭐⭐ HOW OFTEN CORE 0 WOULD HAVE TO CHANGE IOMMU DOMAIN -- THE CEILING
+	 * ON attach-once, COUNTED HERE INSTEAD OF IN THE KERNEL.
+	 *
+	 * r413 §8 said this number needed a debug patch and therefore a flash,
+	 * and r413 §7 guessed the answer was "nearly every job, so attach-once
+	 * is a LOSS". Both were wrong, and the second one was wrong because it
+	 * stopped at "one entity spans all cores" without reading how the
+	 * scheduler picks within it.
+	 *
+	 * drm_sched_pick_best takes the FIRST STRICT MINIMUM (sched_main.c:976,
+	 * `num_score < min_score`), so a tie always goes to sched_list[0], which
+	 * is core 0. rocket_job_push arms and pushes inside one guard on
+	 * rdev->sched_lock, which is per DEVICE and not per file, so two
+	 * sequential submits from this thread are strictly ordered and the
+	 * first one's score is visible to the second. And this file submits
+	 * both devices before waiting on either -- see the note over `sent` --
+	 * so when both are sent, file 0 arms against (0,0) and takes core 0,
+	 * and file 1 arms against (1,0) and takes core 1.
+	 *
+	 *   both devices sent  -> core 0 gets domain 0, core 1 gets domain 1
+	 *   only device 0      -> core 0 gets domain 0, core 1 idle
+	 *   only device 1      -> core 0 gets domain 1 (a tie), core 1 idle
+	 *
+	 * So CORE 1 NEVER CHANGES DOMAIN, structurally, and core 0 changes only
+	 * across a boundary where one side was a device-1-only call. That is
+	 * exactly the case the note over `sent` already describes as the least
+	 * loaded deal's new common case, and it is a quantity this file knows:
+	 * a device with no slices contributes no megabytes.
+	 *
+	 * ⚠⚠ THIS IS A MODEL OF THE SCHEDULER, NOT A READING FROM IT. It is
+	 * arithmetic over charsiu's own submit shape plus the tie rule above,
+	 * and it is printed as such. Two things it cannot see:
+	 *
+	 *  - the (1,1) case is a RACE, not a guarantee. If device 0's job
+	 *    retires in the microseconds between the two ioctls, core 0's score
+	 *    is back to zero and file 1 ties onto core 0 as well -- which is a
+	 *    flip this count does not have. So core 0's figure is a LOWER
+	 *    bound.
+	 *  - it assumes the two opens are the only entities on these cores.
+	 *
+	 * The number still settles the question r413 could not: if it comes
+	 * back near zero, attach-once removes nearly every attach and detach in
+	 * the run, and it was never "a saving that was not available".
+	 */
+	unsigned long dev_both, dev_only0, dev_only1;
+	unsigned long core0_flips;
+	int core0_dom;             /* -1 until the first call */
+	/*
 	 * ⚠ AND THE SAME CALLS' TOTAL, WHICH IS WHAT MAKES mb_hi READABLE.
 	 *
 	 * mb_hi on its own cannot say whether a call was balanced: 16 MB on the
@@ -1586,6 +1634,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->qos_fd = -1;
 	g->dev[0] = charsiu_open(NULL);
 	g->ndev = 1;
+	g->core0_dom = -1;   /* no call has landed yet; see core0_flips */
 	/* ⚠ charsiu_env_flag, NOT `!getenv`. As an existence test
 	 * CHARSIU_NPU_ONEDEV=0 -- the spelling anybody reaching for two cores
 	 * would write -- turned the second core OFF, and round 150 wants this
@@ -2475,6 +2524,30 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				g->deal_index
 				? " -- CHARSIU_NPU_DEAL_INDEX is set, so this "
 				  "is the old per tensor deal" : "");
+		/*
+		 * ⭐ AND THE IOMMU DOMAIN CEILING, WHICH IS THE SAME DEAL READ
+		 * FOR A DIFFERENT PURPOSE. See the note over g->core0_flips for
+		 * why a device with no slices is the only thing that moves a
+		 * core's domain, and for the two things this model cannot see.
+		 */
+		if (g->ndev > 1 && g->calls) {
+			unsigned long used = g->dev_both + g->dev_only0
+					   + g->dev_only1;
+
+			fprintf(stderr,
+				"charsiu NPU: of %lu calls %lu used both cores, "
+				"%lu device 0 only, %lu device 1 only\n",
+				used, g->dev_both, g->dev_only0, g->dev_only1);
+			fprintf(stderr,
+				"charsiu NPU: so core 0 would change IOMMU "
+				"domain %lu times (%.2f%% of its jobs) and "
+				"core 1 zero -- MODELLED from the submit shape "
+				"and drm_sched_pick_best's tie, not read from "
+				"the kernel, and core 0's is a LOWER bound\n",
+				g->core0_flips,
+				used ? 100.0 * (double)g->core0_flips
+				       / (double)used : 0.0);
+		}
 		/*
 		 * ⚠ SAY WHEN THE FIT DECLINES. Phase 21's second arm printed
 		 * the stage table and no cost-model line, and the phase could
@@ -3459,6 +3532,25 @@ static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
 	g->tasks_hi += (unsigned long)ht;
 	g->mb_hi += hm;
 	g->mb_all += mb[0] + mb[1];
+
+	/* the domain ceiling; see the note over g->core0_flips */
+	if (g->ndev > 1) {
+		int d0 = mb[0] > 0.0, d1 = mb[1] > 0.0;
+
+		if (d0 && d1)
+			g->dev_both++;
+		else if (d0)
+			g->dev_only0++;
+		else if (d1)
+			g->dev_only1++;
+		if (d0 || d1) {
+			int dom = d0 ? 0 : 1;
+
+			if (g->core0_dom >= 0 && g->core0_dom != dom)
+				g->core0_flips++;
+			g->core0_dom = dom;
+		}
+	}
 
 	g->f_n  += 1.0;
 	g->f_t  += ht;
