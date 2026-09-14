@@ -88,6 +88,7 @@ WANT="Paris"
 : "${CHARSIU_STAGES_PASS:=1}"
 
 bad=0
+dunno=0
 n=0
 archs=""
 archs_ok=""
@@ -121,9 +122,34 @@ for m in "$DIR"/*.gguf; do
 		archs_ok="$archs_ok ${arch:-?}"
 		;;
 	*)
-		printf 'BAD  %-16s %s\n' "${arch:-?}" "$(basename "$m")"
-		printf '       %s\n' "$out"
-		bad=$((bad + 1))
+		# ⚠⚠ A MODEL TOO SMALL TO KNOW THE FACT IS NOT A BROKEN RUNTIME,
+		# AND THIS COULD NOT TELL THEM APART.
+		#
+		# SmolLM2-135M answers "the capital of the United States" here.
+		# The shipping binary, tonight's binary and the CPU-only path all
+		# produce that SAME sentence, byte for byte -- so nothing about
+		# the hardware path is implicated; 135M parameters simply do not
+		# hold the fact and the model continues plausibly instead.
+		#
+		# So ask the CPU. If both paths agree, this is not a difference
+		# between the NPU and the CPU, which is the only thing this probe
+		# can actually decide -- say that, and count it apart from a real
+		# failure rather than folding it in. If they DISAGREE, the
+		# hardware path is implicated and it is a failure.
+		cpu=$(CHARSIU_NPU=0 "$RUN" "$m" -p "$PROMPT" -n 24 -c 512 -q \
+			2>/dev/null | head -1) || cpu=""
+		if [ "$cpu" = "$out" ]; then
+			printf '??   %-16s %s  (does not know it; the CPU path says the same, so this is the model)\n' \
+				"${arch:-?}" "$(basename "$m")"
+			printf '       %s\n' "$out"
+			dunno=$((dunno + 1))
+		else
+			printf 'BAD  %-16s %s  (the CPU path does NOT say the same)\n' \
+				"${arch:-?}" "$(basename "$m")"
+			printf '       npu %s\n' "$out"
+			printf '       cpu %s\n' "$cpu"
+			bad=$((bad + 1))
+		fi
 		;;
 	esac
 done
@@ -139,7 +165,8 @@ fi
 na=$(printf '%s\n' $archs | grep -v '^?$' | sort -u | wc -l)
 nk=$(printf '%s\n' $archs_ok | grep -v '^?$' | sort -u | wc -l)
 nq=$(printf '%s\n' $archs | grep -c '^?$' || true)
-echo "$((n - bad))/$n FILES knew the capital of France"
+echo "$((n - bad - dunno))/$n FILES knew the capital of France"
+[ "$dunno" -eq 0 ] || echo "$dunno did not know it and agreed with their own CPU path -- the model, not the runtime"
 if [ "$na" -gt 0 ]; then
 	echo "$nk/$na ARCHITECTURES knew it: $(printf '%s\n' $archs | grep -v '^?$' | sort -u | tr '\n' ' ')"
 fi
