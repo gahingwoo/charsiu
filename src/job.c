@@ -1734,19 +1734,51 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4010, WIDE(0) ? 0xa0000002u : 0x00000000u);
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
+	/*
+	 * ⚠⚠ THE fp16 OUTPUT STAGE, OFFERED TO int4, ONE REGISTER AT A TIME.
+	 *
+	 * The int4 accumulator comes back in charsiu_acc_index's order and the
+	 * fp16 one comes back FLAT, at the same m and the same n, and the read
+	 * back of that permutation is the largest single line in a prompt
+	 * (r407: 1.96 ms a row against the 1.82 of fence it waits behind).
+	 * npudev.c's note closes every lever on the gather with "the read is
+	 * at its floor FOR THIS ACCUMULATOR LAYOUT", and the layout is the one
+	 * variable nobody has moved.
+	 *
+	 * ⚠ AND THE SWEEP THAT LOOKS LIKE IT COVERED THIS DID NOT. Round 384
+	 * put "every word that differs between the two streams back one at a
+	 * time" -- between int8 and w4a16, whose DPU blocks are identical to
+	 * begin with. The stream that demonstrably produces flat rows at m > 1
+	 * is the fp16 one, and its DPU block is NOT identical: 0x401c, 0x4020
+	 * and 0x4028 all differ.
+	 *
+	 * CHARSIU_W4_F16DPU is a bitmask so each can be tried alone, which is
+	 * the method that worked on 0x4050 in round 260:
+	 *
+	 *   bit 0   0x401c = 1 and 0x4020 = 0, the fp16 window pair
+	 *   bit 1   0x4028 = n/4 - 1 rather than 0
+	 */
 	{
 		/* the other half of the fp16 window group; see 0x1094 */
 		const char *fw2 = envq("CHARSIU_FP16_WINDOW");
-		int f16w2 = mm->wdtype == CHARSIU_FP16 &&
-			    !(fw2 && !strcmp(fw2, "geom"));
+		const char *f4 = envq("CHARSIU_W4_F16DPU");
+		unsigned f4m = f4 ? (unsigned)strtoul(f4, NULL, 0) : 0;
+		int f16w2 = (mm->wdtype == CHARSIU_FP16 && !(fw2 &&
+			     !strcmp(fw2, "geom"))) || (f4m & 1u);
 
 		emit(&e, DPU, 0x401c, f16w2 ? 1u : ow * rows);
 		emit(&e, DPU, 0x4020, f16w2 ? 0u : ow - 1);
 	}
 	emit(&e, DPU, 0x4024, wide ? rows - 1 : lines);
 	/* fp16: oc / 4 - 1, exact over all 4940 vendor fp16 streams */
-	emit(&e, DPU, 0x4028,
-	     mm->wdtype == CHARSIU_FP16 ? mm->n / 4 - 1 : 0x00000000u);
+	{
+		const char *f4 = envq("CHARSIU_W4_F16DPU");
+		unsigned f4m = f4 ? (unsigned)strtoul(f4, NULL, 0) : 0;
+
+		emit(&e, DPU, 0x4028,
+		     (mm->wdtype == CHARSIU_FP16 || (f4m & 2u))
+		     ? mm->n / 4 - 1 : 0x00000000u);
+	}
 	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
 					     and it changed nothing */
 	/*

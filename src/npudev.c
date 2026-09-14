@@ -5344,11 +5344,39 @@ static int batch_read_device(struct charsiu_npu *g,
 			}
 			g->bmap = t2;
 			g->bmap_n4 = n4;
-			for (unsigned r = 0; r < m; r++)
-				for (unsigned j = 0; j < n4; j++)
-					g->bmap[(size_t)r * n4 + j] =
-					  (uint32_t)charsiu_acc_index(r, j * 4, m,
-						w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+			/*
+			 * ⚠⚠ CHARSIU_NPU_READ_FLAT=1 BUILDS THE IDENTITY,
+			 * which is what this table would hold if the
+			 * accumulator came back row major.
+			 *
+			 * The gather through this permutation is the largest
+			 * single line in a prompt -- r407 put it at 1.96 ms a
+			 * row against the 1.82 of fence it waits behind -- and
+			 * every lever on the gather ITSELF is measured and
+			 * lost. The note above says why that is not the end of
+			 * it: "the read is at its floor FOR THIS ACCUMULATOR
+			 * LAYOUT", and the fp16 path at the same m and n comes
+			 * back FLAT.
+			 *
+			 * On the shipped stream reading flat is WRONG, and
+			 * that is the positive control: it says the knob
+			 * reaches the read. Paired with CHARSIU_W4_F16DPU it
+			 * asks whether any register that differs between the
+			 * fp16 and int4 output stages puts the answer there.
+			 */
+			{
+				int flat = charsiu_env_flag(
+					"CHARSIU_NPU_READ_FLAT", 0);
+
+				for (unsigned r = 0; r < m; r++)
+					for (unsigned j = 0; j < n4; j++)
+						g->bmap[(size_t)r * n4 + j] =
+						  flat
+						  ? (uint32_t)((size_t)r
+							* g->nmax + j * 4)
+						  : (uint32_t)charsiu_acc_index(r, j * 4, m,
+							w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+			}
 			g->bmap_m = m;
 			g->bmap_w4 = (unsigned)w4_for(g, e->t);
 			/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
