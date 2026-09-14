@@ -213,7 +213,7 @@ tokenisation of the body, it is one tokenisation plus a fixed wrapper.
 ### 1b-ii. Both curves, measured, and what the fit says
 
 ⚠ **The charsiu column here is r393 and four rounds of work have landed since.
-1k is the current ladder** -- 852 tokens go 8081 ms here to 5953 there. What
+1k-ii is the current ladder** -- 852 tokens go 8081 ms here to 5905 there. What
 this section is still the source for is the VENDOR column, which has not been
 re-measured since, and the 2.2% boot-to-boot drift bound that every comparison
 against it has to clear.
@@ -766,7 +766,7 @@ eight lengths.
 🏁 **The vendor's lead at 852 tokens is halved, 1.380x to 1.193x.** The
 crossover does not move -- it is still between 202 and 302 tokens -- and that
 is by construction, because the arm did not turn on below 448 when this was
-measured. ⚠ **That threshold is 320 as of r412, and a model with no GQA has a
+measured. ⚠ **That threshold is 272 as of r413, and a model with no GQA has a
 second one at 448**; the reading above is unaffected (it is a 852 token row,
 above either threshold, on a GQA model) but a re-run at 302 or 352 would not
 reproduce the "by construction" clause.
@@ -882,7 +882,7 @@ discarded, all eight points on one boot.
 
 🏁 **What this supports: two regimes.** charsiu leads by 1.09x to 1.28x below
 about 250 of its own tokens, and from 302 up the two are level. 852 goes 8081
-(r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953, so their 1.341x lead
+(r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953 -> 5905 (r413), so their 1.341x lead
 there is gone.
 
 ⛔⛔ **WHAT IT DOES NOT SUPPORT IS "AHEAD AT EVERY LENGTH", and this list said
