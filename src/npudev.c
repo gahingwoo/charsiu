@@ -2859,8 +2859,11 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * task is worth a third of a megabyte, which is why the deal cannot be by bytes
  * alone: a run of tiny slices piled on one core costs real time.
  *
- * ⛔⛔⛔ AND THAT FIT IS WITHDRAWN, WHICH MAKES THESE TWO CONSTANTS THE ONLY
- * PLACE IN THE TREE WHERE A WITHDRAWN NUMBER IS STILL RUNNING.
+ * ⛔⛔⛔ AND THAT FIT IS WITHDRAWN. Its per task term was, until round 414, the
+ * only place in the tree where a withdrawn number was still RUNNING rather than
+ * quoted. It is not any more -- see the round below the paragraph after next --
+ * and what is left of the fit here is the megabyte term, which the same
+ * withdrawal leaves standing.
  *
  * The line above is the 2026-08-31 hand computed stage fit. Its per task term
  * was refuted eight days later by round 152, which measured a job directly at
@@ -2868,16 +2871,39 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * counter reads 7.7 us a task on gemma4 and 3.2 on gemma3. See the withdrawal
  * beside busy_us for the whole of it.
  *
- * So "a task is worth a third of a megabyte" is 1/15 to 1/36 at the measured
- * coefficients, and this deal is charging a task five to twelve times what it
- * costs. The megabyte term is fine: 110.0 against a measured 114.3 to 116.7.
+ * So "a task is worth a third of a megabyte" was 1/15 to 1/36 at the measured
+ * coefficients, and this deal was charging a task five to twelve times what it
+ * costs. The megabyte term is fine: 110.0 against a measured 114.3 to 116.7,
+ * and it is the term that turned out to be deciding the deal anyway.
  *
- * ⚠ THE CONSTANT IS LEFT ALONE ON PURPOSE. Changing it changes which core
- * every slice lands on, and that is a board question, not a desk one: the last
- * reading had the busier core carrying 1.05x an even share, which is close
- * enough that over weighting tasks may be doing no harm or may be the reason
- * it is that even. Swapping 36.8 for 4.81 without measuring would replace a
- * refuted number with an unmeasured one. It is on the board list.
+ * 🏁 THE BOARD ANSWERED THE BOARD QUESTION, ROUND 414. This stood as "left
+ * alone on purpose -- changing it changes which core every slice lands on, and
+ * that is a board question, not a desk one" for eight days, and it could not be
+ * acted on because the only way to try the other value was to edit this file
+ * and rebuild, and two binaries is the one thing a paired arm must not be.
+ * CHARSIU_NPU_DEAL_US_TASK made it one environment variable and one round.
+ *
+ * One binary, one boot, four alternating pairs, performance governor,
+ * tests/board_deal.sh:
+ *
+ *   model          36.8       4.81      margin   balance 36.8 -> 4.81
+ *   gemma-4-E2B    9.58 t/s   9.55 t/s  -0.31%   1.03x -> 1.02x
+ *   gemma-3-1b    21.68      21.66      -0.09%   1.08x -> 1.08x
+ *   Qwen3-0.6B    30.62      30.70      +0.26%   1.06x -> 1.06x
+ *
+ * Every margin is inside its own arm's spread, and the text is identical across
+ * both arms and all four repeats on all three models. The per task term does
+ * not decide this deal on these shapes -- the megabyte term does -- and the one
+ * place it moved anything, it moved gemma4 a hundredth TOWARDS balanced.
+ *
+ * So the default is the measured 4.81, which is also what npu_job_cost and
+ * charsiu_shapes have used since round 155. The reason for keeping a refuted
+ * number was that replacing it with an unmeasured one is no better. 4.81 is no
+ * longer unmeasured here.
+ *
+ * ⚠ THIS IS THREE MODELS, NOT NINE. It is level on the three that were run and
+ * that is what the sentence above says; the nine model regression is what says
+ * whether it is level on the rest.
  *
  * ⚠ CHARSIU_NPU_DEAL_INDEX PUTS THE OLD DEAL BACK, and it has to be here
  * rather than at the call site because the sizing pass and the staging pass
@@ -2890,7 +2916,7 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * copy on the stack and asks the same question without disturbing anything. One
  * function, two callers, and no way for them to answer differently.
  */
-#define DEAL_US_TASK   36.8
+#define DEAL_US_TASK    4.81
 #define DEAL_US_MB    110.0
 
 /*
