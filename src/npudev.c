@@ -143,6 +143,30 @@ struct npu_entry {
 	 * the CPU, which is already here and is already BLOCKED in prep_bo for
 	 * most of the fence.
 	 *
+	 * ⛔⛔⛔ AND ROUND 371 RAN IT AND IT LOST, BADLY. This paragraph read as
+	 * a live idea for forty rounds because the round that refuted it wrote
+	 * the numbers into a board log and not into this file.
+	 *
+	 *   CHARSIU_NPU_CPU_FRAC   0      0.10    0.20    0.30
+	 *   decode tok/s          12.33    7.20    3.98    2.76
+	 *   the CPU's own share       0    8449   16388   24211 ms
+	 *
+	 * 845 ms a percent, dead linear, against a whole decode the hardware
+	 * finishes in 5192 ms. The CPU is about sixteen times slower per row
+	 * than the NPU here, so a tenth of the rows is more than the other nine
+	 * tenths and the fence waits for the CPU every single call.
+	 *
+	 * 🔑 THE THEORY WAS ABOUT BANDWIDTH AND cpu_rows IS COMPUTE BOUND. The
+	 * 5 GB/s is real and it is still unused; what is not true is that this
+	 * is the way to spend it. A second engine has to be fast enough that
+	 * its share of the rows finishes inside the fence, and one CPU thread
+	 * dequantising int4 is not. Anything that revives this has to price the
+	 * CPU's rows FIRST, in us a row, against the hardware's -- not against
+	 * the memory controller.
+	 *
+	 * The mechanism stays, default 0, because it is the instrument that
+	 * measured this and the next candidate second engine will want it.
+	 *
 	 * cq holds those rows' weights packed two to a byte, row major. It has
 	 * to be packed, because the whole idea is bandwidth: reading rows at
 	 * one byte a code would cost twice what the NPU pays for the same
@@ -1110,7 +1134,9 @@ struct charsiu_npu {
 	int read4;      /* CHARSIU_NPU_READ4: four rows off one line, default on */
 	/*
 	 * What fraction of every projection's OUTPUT CHANNELS the CPU keeps.
-	 * 0 is the hardware doing all of it, which is every round before 371.
+	 * 0 is the hardware doing all of it, which is every round before 371 --
+	 * AND every round since, because 371 measured the split and it lost 42%
+	 * at the first rung. See the withdrawal beside npu_entry.n_npu.
 	 */
 	double cpu_frac;
 	float *afscr;              /* the activation, rounded through fp16 */
@@ -2794,6 +2820,32 @@ static double slice_mb(int w4, unsigned k, unsigned n)
 #define DEAL_US_TASK   36.8
 #define DEAL_US_MB    110.0
 
+/*
+ * ⚠ THE KNOB THE PARAGRAPH ABOVE SAYS IS MISSING. "It is on the board list"
+ * was true for eight days and could not be acted on, because the only way to
+ * try 4.81 against 36.8 was to edit this file and rebuild -- which is a
+ * different binary, and two binaries is the one thing a paired arm must not
+ * be. Reading it from the environment makes both arms the same md5 and the
+ * question a single board round.
+ *
+ * The default is still 36.8. A refuted number that ships is a bad thing; a
+ * refuted number replaced by an unmeasured one is not an improvement, and the
+ * measurement is what this knob is for.
+ */
+static double deal_us_task(void)
+{
+	static double v;
+	static int set;
+
+	if (!set) {
+		const char *e = getenv("CHARSIU_NPU_DEAL_US_TASK");
+
+		v = e && *e ? atof(e) : DEAL_US_TASK;
+		set = 1;
+	}
+	return v;
+}
+
 static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
 			  int w4, unsigned ki, unsigned ni, unsigned ns,
 			  unsigned k, unsigned n)
@@ -2805,7 +2857,7 @@ static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
 	if (g->deal_index)
 		return (ki * ns + ni) & 1;
 	d = load[0] <= load[1] ? 0 : 1;
-	load[d] += DEAL_US_TASK + DEAL_US_MB * slice_mb(w4, k, n);
+	load[d] += deal_us_task() + DEAL_US_MB * slice_mb(w4, k, n);
 	return d;
 }
 
