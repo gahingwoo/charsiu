@@ -1069,6 +1069,19 @@ A reader reproducing today gets the second. Both are named by md5 in
 `tests/corpus/README.md`, and the file of record going forward is the one a
 reader will actually get.
 
+**And it does not survive a different length either.** Every number in that
+table is `-n 300`, which scores 299 positions. `charsiu_ppl` with no `-n`
+scores 511, and on the same file, the same corpus and the same grouped arm that
+reads 33.8071 at 300 it reads **41.2763** at 511. That is near enough to the
+ungrouped 41.5289 above to be mistaken for it, and it was, for about an hour on
+2026-09-15: a run of the board regression came back 41.2777, which looked like
+the grouped arm having silently stopped grouping. It had not. The tool prints
+the count on every line it emits, so the tell is always on screen -- "over 299
+scored positions of 300 tokens" against "over 511 scored positions of 512" --
+but two numbers that happen to land four tenths of a percent apart will not
+announce that they are different measurements. A perplexity belongs to the
+model file, the corpus file AND the length.
+
 "Board and host agree to 0.3%" in the earlier AWQ round was two different files
 landing near each other. It is not evidence of anything.
 
