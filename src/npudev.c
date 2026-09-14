@@ -5598,6 +5598,62 @@ static int batch_read_device(struct charsiu_npu *g,
 /*
  * ⭐ FINISH A GATHER THAT WAS PUT OFF, and restore the per call state it reads.
  */
+/*
+ * ⛔⛔ THIS USED TO RUN AT THE END OF npu_matmul_inner, DEFERRED OR NOT, AND
+ * THAT IS WHY THE DEFERRED GATHER WAS WRONG ON FIVE MODELS OF NINE.
+ *
+ * An ungrouped tensor is scaled once per channel after the read; int8 always
+ * is, because its d1 went in during the read. With `defer` the read has NOT
+ * HAPPENED when this point is reached: the scale multiplied whatever Y held
+ * from the previous call, and then the deferred gather overwrote Y with
+ * values that never got scaled at all.
+ *
+ * Llama-3.2-1B Q4_0 is grouped w4 in every tensor, so this block is skipped
+ * for it and it was correct in both arms -- which is why a single model check
+ * could not see this and tests/board_text_all.sh could. Every model that has
+ * ONE tensor the grouping does not cover pays it on that tensor.
+ *
+ * tensor_grouped depends on the tensor and on g->kmax, both fixed for the life
+ * of the pool, so asking it again at flush time gives the same answer.
+ */
+static void tail_scale_apply(struct charsiu_npu *g,
+			     const struct npu_entry *e, float *Y, unsigned m)
+{
+	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
+		return;
+	{
+		struct tail_scale_job tj = { Y, e->t->scale,
+					     (unsigned)e->t->n };
+		double ts = now_us();
+
+		/*
+		 * ⚠ THE ROWS ARE INDEPENDENT, so the pool needs no grain and
+		 * the order cannot change: element (r, j) is multiplied by
+		 * scale[j] and by nothing else. The vector form below is the
+		 * same IEEE single multiply four at a time -- there is no add
+		 * for a compiler to fuse into an fma, which is the one way a
+		 * rewrite like this has changed a value in this tree before.
+		 */
+		/* ⚠ THE CONTROL, in the same binary: CHARSIU_NPU_TAIL_PLAIN=1
+		 * is the loop exactly as it was, one thread and scalar, so the
+		 * two arms can be interleaved in one session. The board drifts
+		 * 3% between sessions and that is the size of what this
+		 * measures. */
+		if (tail_plain())
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < (unsigned)e->t->n; j++)
+					Y[(size_t)r * e->t->n + j] *=
+						e->t->scale[j];
+		else if (g->poolread == 1 ||
+			 (g->poolread == 2 &&
+			  (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(tail_scale_rows, &tj, m);
+		else
+			tail_scale_rows(&tj, 0, m);
+		g->bscale_us += now_us() - ts;
+	}
+}
+
 static int npu_flush_pending(struct charsiu_npu *g)
 {
 	unsigned char *save;
@@ -5647,6 +5703,10 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	}
 	memcpy(g->bseen, save, g->bseen_n);
 	free(save);
+	/* ⛔ AND THE PER CHANNEL SCALE, which used to run at the end of the
+	 * DEFERRING call with Y still unwritten. This is the moment it
+	 * belongs at: the gather above has just filled Y. */
+	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m);
 	g->obuf[g->pend.obi].pending = 0;
 	g->pend.live = 0;
 	g->bdefer_done++;
@@ -6596,39 +6656,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	g->busy_us += now_us() - t0;
 
-	/* an ungrouped tensor is scaled once, per channel, at the end; int8
-	 * always is, because its d1 went in above */
-	if (!w4_for(g, e->t) || !tensor_grouped(g, e->t)) {
-		struct tail_scale_job tj = { Y, e->t->scale,
-					     (unsigned)e->t->n };
-		double ts = now_us();
-
-		/*
-		 * ⚠ THE ROWS ARE INDEPENDENT, so the pool needs no grain and
-		 * the order cannot change: element (r, j) is multiplied by
-		 * scale[j] and by nothing else. The vector form below is the
-		 * same IEEE single multiply four at a time -- there is no add
-		 * for a compiler to fuse into an fma, which is the one way a
-		 * rewrite like this has changed a value in this tree before.
-		 */
-		/* ⚠ THE CONTROL, in the same binary: CHARSIU_NPU_TAIL_PLAIN=1
-		 * is the loop exactly as it was, one thread and scalar, so the
-		 * two arms can be interleaved in one session. The board drifts
-		 * 3% between sessions and that is the size of what this
-		 * measures. */
-		if (tail_plain())
-			for (unsigned r = 0; r < m; r++)
-				for (unsigned j = 0; j < (unsigned)e->t->n; j++)
-					Y[(size_t)r * e->t->n + j] *=
-						e->t->scale[j];
-		else if (g->poolread == 1 ||
-			 (g->poolread == 2 &&
-			  (size_t)m * e->t->n >= poolread_min(g)))
-			charsiu_parallel_for(tail_scale_rows, &tj, m);
-		else
-			tail_scale_rows(&tj, 0, m);
-		g->bscale_us += now_us() - ts;
-	}
+	/* ⚠ NOT WHEN THE READ HAS NOT HAPPENED. npu_flush_pending applies it
+	 * after the deferred gather instead; see tail_scale_apply. */
+	if (!defer)
+		tail_scale_apply(g, e, Y, m);
 	return 0;
 }
 
