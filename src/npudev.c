@@ -687,7 +687,7 @@ struct charsiu_npu {
 		size_t shadow_n;
 		int live;
 	} pend;
-	unsigned long defer_bad;
+	unsigned long defer_bad, defer_cmp;
 	unsigned long bdefer_n, bdefer_done;
 	double balloc_us;	/* the output BO allocation, inside prep */
 	unsigned balloc_n;
@@ -2055,9 +2055,12 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	/* ⚠ a deferred gather owns a buffer this is about to free, and the
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
-	if (g->defer_bad)
-		fprintf(stderr, "charsiu: ⛔ the deferred gather differed on"
-			" %lu tensors\n", g->defer_bad);
+	/* ⚠ ZERO AND NEVER RAN LOOK THE SAME, so say how many were compared */
+	if (defer_check())
+		fprintf(stderr, "charsiu: the deferred gather was compared on"
+			" %lu tensors, %lu differed; %lu deferred, %lu"
+			" flushed\n", g->defer_cmp, g->defer_bad,
+			g->bdefer_n, g->bdefer_done);
 	free(g->pend.shadow);
 	free(g->pend.bseen);
 	free(g->pend.bd1);
@@ -5729,6 +5732,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 
 		if (n > g->pend.shadow_n)
 			n = g->pend.shadow_n;
+		g->defer_cmp++;
 		for (i = 0; i < n; i++) {
 			float a = g->pend.Y[i], b = g->pend.shadow[i];
 			float d = a - b < 0 ? b - a : a - b;
