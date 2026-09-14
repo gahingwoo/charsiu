@@ -5151,6 +5151,11 @@ struct attn_npu {
 	/* set the moment one growth has to fall back to the packer,
 	 * so the line above names the path that was actually run */
 	unsigned grow_packed;
+	/* ⚠ HOW MANY SURFACES A RUNG MOVED WITHOUT ALLOCATING ONE. The
+	 * difference between this and n_layer * n_kv a rung is what the
+	 * ladder still pays the allocator, and a reader who cannot see the
+	 * split will read a cheap rung and an expensive one the same way. */
+	unsigned long inplace;
 	/*
 	 * ⭐ ONE ROW OF EXPONENTIALS PER OP, so the softmax's intermediate
 	 * never reaches DRAM. FP16_GROUP_MAX rows of kvmax floats, which at a
@@ -5233,12 +5238,23 @@ struct attn_npu {
  * clock pinned. The threshold has been re-derived from this curve four times
  * in one day, which is the point: it is a DATED NUMBER, not a derived one.
  *
- * ⚠ 448 IS THE NEAREST ROUND NUMBER BELOW THE SHORTEST LENGTH MEASURED TO
- * WIN. At 452 tokens the NPU arm is 3.6% ahead; at 302 it is 3.5% behind. The
- * cost of a threshold that is too high and one that is too low are the same
- * size, so the best one is the crossing itself and the only reason to sit
- * above it is that this is one model. gemma-3 crosses near 250, so head_dim
- * 64 is the latest crosser measured -- which is what r395's axis predicts.
+ * ⚠ 448 WAS THE NEAREST ROUND NUMBER BELOW THE SHORTEST LENGTH MEASURED TO
+ * WIN, AND IT IS 320 NOW. The 448 reading came from a sweep whose CPU column
+ * was the EMPTY environment -- which stopped being the CPU arm the moment
+ * `auto` became the default, so at 452 and up it was the NPU arm in both
+ * columns. r412 re-measured with both arms naming the knob, four repeats,
+ * same boot, same binary:
+ *
+ *     tokens   CPU ms        range     NPU ms        range   margin  spread
+ *        252     1766   1744..1786       1759   1754..1766   +0.4%    2.4%
+ *        302     2138   2100..2146       2088   2082..2092   +2.3%    2.2%
+ *        352     2534   2510..2553       2390   2386..2396   +5.7%    1.7%
+ *        452     3402   3359..3415       3036   3026..3044  +10.8%    1.6%
+ *
+ * ⚠ THE SPREAD COLUMN IS PART OF THE READING. 302 is ahead in all four pairs
+ * and its margin is the size of the noise on the arm it is measured against,
+ * so it is level and 320 sits above it. 352 is the shortest length where the
+ * margin clears the spread.
  *
  * ⚠ If this arm gets faster again, re-measure. Do not scale this number.
  *
@@ -5345,11 +5361,51 @@ static unsigned attn_npu_min_tokens(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_ATTN_NPU_MIN");
 
-		v = e && *e ? atol(e) : 448;
+		v = e && *e ? atol(e) : 320;
 		if (v < 0)
 			v = 0;
 	}
 	return (unsigned)v;
+}
+
+/*
+ * ⛔⛔ AND A MODEL THAT SHARES NO KV HEAD IS A DIFFERENT QUESTION, WHICH IS
+ * WHY IT GETS ITS OWN ANSWER AND NOT A SCALED ONE.
+ *
+ * r412, 352 tokens, three repeats an arm, arms alternating, one boot:
+ *
+ *     Phi-3.5-mini    32 heads, 32 kv   8768 -> 10158   -15.9%, spread 1.4%
+ *     SmolLM2-1.7B    32 heads, 32 kv   4099 ->  4558   -11.2%, spread 1.5%
+ *     Qwen3-0.6B      16 heads,  8 kv   2550 ->  2354    +7.7%, spread 0.6%
+ *     Llama-3.2-1B    32 heads,  8 kv   2534 ->  2390    +5.7%, spread 1.7%
+ *     gemma-3-1b       4 heads,  1 kv   2489 ->  2280    +8.4%, spread 0.5%
+ *
+ * The two that lose are exactly the two with no GQA, and the mechanism says
+ * why in one line: the mirror costs one pack per position per layer per KV
+ * head, and the attention it buys is done per QUERY head. A model that shares
+ * nothing pays the whole mirror for the least work.
+ *
+ * ⚠ AND THE QUANTITATIVE VERSION OF THAT STORY IS DEAD. "Crossover scales as
+ * 1/gqa" was written down before the rows ran and predicted Qwen3 (gqa 2)
+ * would lose at 352. It wins by 7.7%. So this is not a scaled threshold; it
+ * is a refusal, because the length at which a gqa 1 model would cross has not
+ * been measured and r411's ten model table has both of them inside noise at
+ * 852 (-0.3% and +2.3%). There is no measured length at which they win.
+ *
+ * ⚠ IT IS TWO MODELS. Both happen to be 32/32; a gqa 1 model with four heads
+ * has never been run. The refusal is the conservative side of that ignorance:
+ * it restores exactly the CPU arm, which is what shipped before r411.
+ *
+ * CHARSIU_ATTN_NPU_MHA=1 turns the arm on for them anyway, so the crossover
+ * stays measurable from the outside.
+ */
+static int attn_npu_mha_ok(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_NPU_MHA", 0);
+	return v;
 }
 
 /*
@@ -5370,6 +5426,12 @@ static unsigned attn_npu_min_tokens(void)
  * do not move are the two largest models: their matmuls dominate. Nothing
  * loses outside noise, every one is text identical to the CPU arm, and none
  * of the ten refuses a single layer.
+ *
+ * ⚠ TWO OF THOSE TEN NO LONGER REACH THIS ARM AT ALL, and the table is kept
+ * because it is what was measured. Phi-3.5-mini and SmolLM2-1.7B share no KV
+ * head, and r412 found them 15.9% and 11.2% BEHIND the CPU arm at 352 tokens;
+ * attn_npu_mha_ok refuses them now. Their rows above are the two at the top of
+ * the "did not win" list, which is the same fact read at one length.
  *
  * ⚠ AND THE TWO THINGS A DEFAULT HAS TO ANSWER THAT SPEED DOES NOT:
  *
@@ -5598,10 +5660,13 @@ static void attn_npu_free(struct attn_npu *a)
 			for (r2 = 0; r2 < a->nrung; r2++)
 				fprintf(stderr, " %u", a->rung[r2]);
 			fprintf(stderr, "  (%u repacks, %.0f ms: %.0f in"
-				" alloc, %.0f in %s)\n", a->nrung - 1,
+				" alloc, %.0f in %s; %lu of %u surfaces"
+				" moved in place)\n", a->nrung - 1,
 				a->t_grow, a->t_grow_alloc,
 				a->t_grow - a->t_grow_alloc,
-				a->grow_packed ? "the packer" : "block copy");
+				a->grow_packed ? "the packer" : "block copy",
+				a->inplace,
+				(a->nrung - 1) * a->n_layer * a->nkv);
 		}
 		/* ⚠ BY REASON, because "refused 308" is the number that made
 		 * gemma-4 look like a head_dim 512 measurement when 28 of its
@@ -5649,6 +5714,11 @@ static void attn_npu_free(struct attn_npu *a)
  * hundred buffer objects is not something to retry a token at a time, so a
  * refusal is recorded in the handle and every later call reads it.
  */
+/* defined with the ladder it belongs to; the mirror is allocated here and
+ * climbed there, and both have to agree about the ceiling */
+static unsigned attn_npu_kv_room(const struct llama_state *s,
+				 const struct attn_npu *a);
+
 static struct attn_npu *attn_npu_get(struct llama_state *s)
 {
 	const struct llama_model *m = s->m;
@@ -5687,6 +5757,11 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		if (want == 2 && (s->prompt_total <= 0 ||
 				  (unsigned)s->prompt_total
 					< attn_npu_min_tokens()))
+			return NULL;
+		/* ⛔ see attn_npu_mha_ok: no KV head shared, no measured
+		 * length at which this arm wins */
+		if (want == 2 && !attn_npu_mha_ok() &&
+		    m->n_head_kv >= m->n_head)
 			return NULL;
 	}
 	a = calloc(1, sizeof(*a));
@@ -5807,7 +5882,11 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		unsigned lhd = a->lhd[i / a->nkv];
 
 		a->kb[i] = charsiu_fp16_w_alloc(a->f, lhd, a->nk);
-		a->vb[i] = charsiu_fp16_w_alloc(a->fv, a->kv, lhd);
+		/* ⭐ THE ROOM IS TAKEN ONCE, HERE, so the first rung is
+		 * already an in place move. The K surface needs none: its
+		 * growth is along n, which no offset depends on. */
+		a->vb[i] = charsiu_fp16_w_alloc_room(a->fv, a->kv, lhd,
+						     attn_npu_kv_room(s, a));
 		if (!a->kb[i] || !a->vb[i]) {
 			fprintf(stderr, "charsiu: the fp16 KV mirror ran out "
 				"at buffer %u of %u\n", i, nbuf);
@@ -5945,6 +6024,39 @@ static const float *attn_kcache_at(struct llama_state *s, unsigned l,
  */
 static double attn_npu_now_ms(void);
 
+/*
+ * ⭐ THE ROOM A V SURFACE CAN BE GIVEN UP FRONT, which is the prompt's own
+ * ceiling and nothing else. A surface allocated with this much room climbs the
+ * ladder WHERE IT LIES: charsiu_fp16_regrow_vcols moves the blocks in place
+ * and charsiu_fp16_w_set_k says the layout changed. What that removes is an
+ * allocation and a free of n_layer * n_kv buffer objects at every rung --
+ * 128 of them on Llama-3.2-1B and 1024 on a 32 layer model with no GQA, which
+ * is why the models that lose to this arm are exactly the ones without GQA.
+ *
+ * ⚠ 0 MEANS "NO ROOM TO RESERVE" and the caller allocates a fresh surface at
+ * each rung, which is what this did before. That is the honest answer when
+ * there is no prompt hint: the ladder then has no ceiling to aim at, and
+ * reserving kvmax would allocate the whole context for a prompt that may be
+ * twenty tokens long.
+ *
+ * ⚠ AND IT IS GATED ON THE BLOCK COPY. In place growth is the block copy; with
+ * the copier off the packer rewrites every live position, which in the same
+ * buffer would leave the bytes past `live` as they were.
+ */
+static unsigned attn_npu_kv_room(const struct llama_state *s,
+				 const struct attn_npu *a)
+{
+	unsigned cap;
+
+	if (!attn_npu_kv_copy() || !attn_npu_kv_cap_on() ||
+	    s->prompt_total <= 0)
+		return 0;
+	cap = ((unsigned)s->prompt_total + 31u) & ~31u;
+	if (cap > a->kvmax)
+		cap = a->kvmax;
+	return cap;
+}
+
 static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			unsigned want)
 {
@@ -5955,6 +6067,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 	int copied = attn_npu_kv_copy();
 	double tg0, tg1, tga = 0.0;
 	unsigned step = attn_npu_kv_step();
+	unsigned room;
 	unsigned cap = (s->prompt_total > 0 && attn_npu_kv_cap_on())
 		     ? (((unsigned)s->prompt_total + 31u) & ~31u) : 0u;
 
@@ -5990,11 +6103,55 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		kv = a->kvmax;
 
 	tg0 = attn_npu_now_ms();
+	room = attn_npu_kv_room(s, a);
 	for (i = 0; i < a->n_layer * a->nkv; i++) {
 		struct charsiu_fp16_w *w;
-		double ta = attn_npu_now_ms();
+		unsigned lhd = a->lhd[i / a->nkv];
+		double ta;
 
-		w = charsiu_fp16_w_alloc(a->fv, kv, a->lhd[i / a->nkv]);
+		/*
+		 * ⭐ THE RUNG THAT COSTS NO BUFFER OBJECT. If this surface was
+		 * allocated with room for the new extent, the blocks move
+		 * where they lie and set_k records the new layout. A refusal
+		 * from either falls through to the allocating path below,
+		 * which is always correct.
+		 */
+		if (copied && charsiu_fp16_w_room(a->vb[i]) >= kv) {
+			uint16_t *vm = charsiu_fp16_w_map(a->vb[i]);
+			int ok;
+
+			if (live) {
+				ok = !charsiu_fp16_regrow_vcols(vm, kv, vm,
+						a->kv, lhd, live);
+			} else {
+				/* nothing packed yet, so nothing to move --
+				 * but a surface reused between two prompts
+				 * still holds the last one's bytes, and the
+				 * new layout would expose them. */
+				struct charsiu_matmul mr = { 1, kv, lhd,
+						CHARSIU_FP16, CHARSIU_FP16 };
+
+				memset(vm, 0, charsiu_weight_bytes(&mr));
+				ok = 1;
+			}
+			if (ok && !charsiu_fp16_w_set_k(a->vb[i], kv)) {
+				a->inplace++;
+				continue;
+			}
+			/*
+			 * ⛔ AND A FAILURE HERE POISONS THE COPY PATH BELOW.
+			 * charsiu_fp16_regrow_vcols validates before it moves
+			 * anything, but a refusal from inside the loop would
+			 * leave this surface half moved -- and the allocating
+			 * path would then copy those bytes into the new buffer
+			 * and never know. The packer reads the float cache,
+			 * which is whole either way, so that is what has to
+			 * run.
+			 */
+			copied = 0;
+		}
+		ta = attn_npu_now_ms();
+		w = charsiu_fp16_w_alloc_room(a->fv, kv, lhd, room);
 
 		if (!w) {
 			fprintf(stderr, "charsiu: the fp16 V surface would not "
@@ -6016,7 +6173,7 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		if (copied && live
 		    && charsiu_fp16_regrow_vcols(charsiu_fp16_w_map(w), kv,
 				charsiu_fp16_w_map(a->vb[i]), a->kv,
-				a->lhd[i / a->nkv], live))
+				lhd, live))
 			copied = 0;
 		charsiu_fp16_w_free(a->fv, a->vb[i]);
 		a->vb[i] = w;
