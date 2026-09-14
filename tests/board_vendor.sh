@@ -117,7 +117,12 @@ else
 	echo "⚠ the governor is left alone; their numbers are at MAXIMUM frequency."
 	echo "  CHARSIU_BENCH_PERF=1 sets it, and this line changes when you do."
 fi
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and this script is a correctness
+# gate rather than a timing sweep. The build stamp is what it needs.
+. "$(dirname "$0")/board_clk.sh"
 echo "  governor: $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+  echo "  build    $(charsiu_build "$RUN")"
 # ⚠ SAY WHICH FORMAT WAS SCORED. A table that does not is a table whose rows
 # cannot be compared to any other table.
 [ "$W4V" = 1 ] || echo "  ⚠ OUR column is w8a8 (CHARSIU_BENCH_W4V=0); theirs is still their w4a16."

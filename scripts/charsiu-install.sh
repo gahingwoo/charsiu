@@ -900,6 +900,28 @@ fi
 
 as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 
+#
+# ⚠⚠⚠ WHICH COMMIT THIS TREE IS, WRITTEN DOWN, because /opt/charsiu is not a
+# git checkout and nothing in it could answer that. Every board round has
+# recorded the machine, the NPU clock, the boot id and the binary's mtime, and
+# then the round's numbers were tied to a version by somebody remembering which
+# file they had copied. "The date matches" is not "the version matches", and a
+# ratio whose numerator and denominator came from two builds is the failure
+# this project keeps finding after the fact.
+#
+# The binaries carry it too (Makefile -DCHARSIU_BUILD, `charsiu_run --version`,
+# and tests/board_clk.sh's charsiu_build reads it back). This file is for the
+# TREE: a round can say which install it ran against even when the binary it
+# used was copied somewhere else under another name.
+#
+# ⚠ -dirty is part of the answer and is not to be stripped. An install built
+# from an edited tree is not the commit it names.
+# ⚠ AND A SOURCE THAT IS NOT A CHECKOUT SAYS SO. "unknown" in this file is
+# ugly on purpose; an empty file would read like a clean tree.
+_commit=$(git -C "$SRC" describe --always --dirty --abbrev=12 2>/dev/null || true)
+printf '%s\n' "${_commit:-unknown}" | as_root tee "$BIN/COMMIT" >/dev/null
+ui_info "commit ${_commit:-unknown (the source is not a git checkout)}"
+
 # ⚠ SPELLING THIS LIST OUT IS HOW `charsiu list` SHIPPED BROKEN. The front door
 # execs one helper per subcommand, and six of them (list, ps, rm, show, runner,
 # serve) arrived after the list was written. A fresh Debian install got a

@@ -63,3 +63,23 @@ npu_clk() {
 # about 3% between boots and r393 measured that on a ladder; a table that does
 # not carry its boot cannot be compared with one that does.
 npu_boot() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+# ⚠⚠⚠ WHICH COMMIT PRODUCED THIS NUMBER, which is the one piece of provenance
+# every round has recorded WRONG by omission. The scripts print the machine,
+# the clock, the boot id and the binary's mtime, and then the round's numbers
+# get tied to a version by somebody remembering which file they copied. They
+# arrive as /root/charsiu_run_<name> and /opt/charsiu is not a git checkout, so
+# there was nothing on the board that could answer it.
+#
+# The commit is compiled into the binary now (Makefile -DCHARSIU_BUILD), and
+# this asks the binary rather than its timestamp.
+#
+# ⚠ A binary too old to know is "no --version", not a blank. A blank is what a
+# missing clock looked like and it cost a whole ladder.
+charsiu_build() {
+	_b=$("${1:-charsiu_run}" --version 2>/dev/null | head -1)
+	case "$_b" in
+	"" | *[!0-9a-zA-Z.-]* ) echo "no --version (binary predates the stamp)" ;;
+	* ) echo "$_b" ;;
+	esac
+}

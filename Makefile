@@ -15,6 +15,20 @@
 # explicitly so a gcc that lacks it is not a silent downgrade; ?= means a
 # caller can still override the whole line.
 CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
+#
+# ⚠⚠ THE BUILD STAMPS ITSELF, because /opt/charsiu is not a git checkout and
+# neither is /root/charsiu_run_<whatever>. Every board round has recorded the
+# machine, the clock and the wall time and NOT the commit, so a round's numbers
+# have been tied to a version by somebody remembering which binary they copied.
+# That is how "the numerator and the denominator came from different builds"
+# happens without anybody noticing.
+#
+# -dirty is part of it. A binary built from an edited tree is not the commit it
+# names, and saying so is the whole point.
+#
+# ⚠ := AND NOT =, or every compile line re-runs git.
+CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
 BUILD  := build
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)

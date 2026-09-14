@@ -126,7 +126,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 ${CHARSIU_TEXT_ENV:-}"
 # clearing the environment -- which works and which nothing says. The header
 # below prints it so a run that forgot is visible in its own output.
 
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and this script is a correctness
+# gate rather than a timing sweep. The build stamp is what it needs.
+. "$(dirname "$0")/board_clk.sh"
 echo "binary   $RUN"
+echo "build    $(charsiu_build "$RUN")"
 echo "prompt   \"1 2 ... 32\", gen $NGEN, int4 on the NPU"
 [ -z "${CHARSIU_TEXT_ENV:-}" ] || echo "arm      $CHARSIU_TEXT_ENV"
 echo

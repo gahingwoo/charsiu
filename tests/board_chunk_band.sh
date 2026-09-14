@@ -48,6 +48,7 @@ echo "   boot    $(cat /proc/sys/kernel/random/boot_id)"
 echo "   npu     $NPUCLK Hz"
 echo "   cpu     $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary  $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
+echo "   build     $(charsiu_build "$RUN")"
 case $((N % 2)) in 1) echo "   ⚠ N=$N is odd; the order bias does not cancel";; esac
 echo "   $N repeats an arm a length, arms AND ORDER alternating, one warm-up discarded"
 echo "   the band is 81..160 tokens; outside it the two arms must agree"

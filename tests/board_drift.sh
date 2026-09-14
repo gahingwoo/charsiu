@@ -60,6 +60,7 @@ echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
 echo "   npu clk   $NPUCLK Hz"
 echo "   arm       $ARM"
 echo "   binary    $RUN"
+echo "   build     $(charsiu_build "$RUN")"
 echo "   model     $(basename "$M")"
 printf '   zones    '
 for z in $ZONES; do printf ' %s' "$(cat "$z/type" 2>/dev/null)"; done
