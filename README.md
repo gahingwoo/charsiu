@@ -18,22 +18,32 @@ only comparison here where nothing is quoted.
              does not, so the multiple is a function of the condition and not
              a property of either runtime.
 
-  prompt     a crossover, not a ratio. charsiu is faster below about 250 of its
-             own tokens and the vendor is faster above it:
+  prompt     charsiu is ahead at every length measured. It used to be a
+             crossover at about 250 tokens; it is not one any more:
 
                  our tok    charsiu    their tok    vendor     winner
-                     102        809          135     932       charsiu 1.15x
-                     202       1490          235    1529       charsiu 1.03x
-                     302       2265          335    2145       vendor  1.06x
-                     452       3226          485    3195       vendor  1.01x
-                     602       4387          635    4201       vendor  1.04x
-                     852       6328          885    6027       vendor  1.05x
+                      27        332           60     413       charsiu 1.24x
+                      52        415           85     530       charsiu 1.28x
+                     102        761          135     932       charsiu 1.22x
+                     202       1400          235    1529       charsiu 1.09x
+                     302       2131          335    2145       level
+                     452       3059          485    3195       charsiu 1.04x
+                     602       4115          635    4201       level
+                     852       5953          885    6027       level
 
              Their chat template costs a constant 33 tokens at every length, so
-             each row is the same input text. Their lead at 852 was 1.34x before
-             the fp16 attention arm became the default, 1.16x after it, 1.13x
-             once the int4 accumulator work was done, and 1.05x now that the
-             softmax runs during the fence instead of after it.
+             each row is the same input text.
+
+             Three rows say "level" rather than a number, and that is the
+             honest reading: their runtime needs their driver bound, so the two
+             columns cannot share a boot, and the boot-to-boot drift of this
+             ladder was measured at 2.2% at worst. 302, 602 and 852 are inside
+             that. The five that are not are 27, 52, 102, 202 and 452.
+
+             At 852 their lead was 1.34x before the fp16 attention arm became
+             the default, 1.16x after it, 1.13x once the int4 accumulator work
+             was done, 1.05x once the softmax ran during the fence, and gone
+             once the int4 accumulator gather ran during it too.
 
   quality    charsiu's stored weights score 1.4x to 2.6x better in perplexity
              than theirs, against the same f16 original both were quantised
@@ -202,7 +212,8 @@ frontend that runs a real model end to end. Out of scope: any vendor library in
 the execution path, and any claim about an SoC this has not been run on.
 
 The target is the vendor's own number on the same board and model. Decode meets
-it, prefill does not yet, and the table at the top says by how much.
+it and prefill now does too, at every length measured; the table at the top says
+by how much, and which three rows are level rather than ahead.
 
 ## Why this exists, and why it is not a port
 
