@@ -1353,11 +1353,56 @@ x 150 calls = 19.5 ms of a 51.7 ms token, 38%` is Qwen3, 2026-09-02, and its
 denominator is a real wall clock token. That one is dated rather than wrong,
 and its per call term has also moved.
 
-⚠ **And the withdrawn fit is still executing.** `DEAL_US_TASK 36.8` in
-npudev.c decides which core every slice lands on. It is left alone until a
-board round can price the alternatives, because swapping it for 4.81 without
-measuring replaces a refuted number with an unmeasured one; the comment there
-says so.
+🏁 **And the ceiling on removing the IOMMU half of it is 100%, measured, with
+no kernel change.** r413 §7 reasoned the other way -- an IOMMU domain belongs to
+an open DRM file, charsiu opens accel0 twice, rocket gives each file one
+scheduler entity spanning all cores, so "either domain can land on either core"
+and attach-once would degenerate into detach plus attach on nearly every job.
+The premise is right and the conclusion does not follow: `drm_sched_pick_best`
+takes the first strict minimum, so a tie goes to core 0; `rocket_job_push` arms
+and pushes under one per-device mutex, so two sequential submits are ordered;
+and charsiu submits every device before waiting on any. Round 414 counts the
+consequence in userspace, in `account_call`, where a device with no slices
+contributes no megabytes:
+
+```
+  model          calls    both cores   dev 0 only   dev 1 only   core 0 flips
+  gemma-4-E2B    13572        11332         2240            0        0 (0.00%)
+  gemma-3-1b      6724         5060         1664            0        0 (0.00%)
+  tinyllama       5700         5700            0            0        0 (0.00%)
+```
+
+No call in 26,000 sent device 1 alone, because `deal_pick` breaks its tie to
+device 0 and so the first slice of any call always lands there. Core 0 therefore
+always carries domain 0 and core 1 always carries domain 1, and neither ever
+changes. Every per-job attach and detach in the run is removable.
+
+⚠ **This is a MODEL of the scheduler, not a reading from it.** It is arithmetic
+over charsiu's submit shape plus `pick_best`'s tie rule, and the both-devices
+case is a race rather than a guarantee: if device 0's job retires between the
+two ioctls, file 1 ties onto core 0 as well. Core 0's figure is a lower bound.
+What it settles is r413's claim that the saving was not available -- it is.
+
+🏁 **The withdrawn fit is no longer executing, as of round 414.**
+`DEAL_US_TASK` in npudev.c decides which core every slice lands on, and it held
+the refuted 36.8 for eight days because there was no way to try the other value
+without rebuilding, and two binaries is the one thing a paired arm must not be.
+`CHARSIU_NPU_DEAL_US_TASK` made it one environment variable. One binary, one
+boot, four alternating pairs, performance governor:
+
+```
+  model          36.8       4.81      margin   balance 36.8 -> 4.81
+  gemma-4-E2B    9.58 t/s   9.55 t/s  -0.31%   1.03x -> 1.02x
+  gemma-3-1b    21.68      21.66      -0.09%   1.08x -> 1.08x
+  Qwen3-0.6B    30.62      30.70      +0.26%   1.06x -> 1.06x
+```
+
+Every margin is inside its own arm's spread and the text is identical across
+both arms and all four repeats. The per task term does not decide this deal on
+these shapes; the megabyte term does. The default is now the measured 4.81,
+which is what `npu_job_cost` and `charsiu_shapes` have used since round 155.
+
+⚠ **Three models, not nine.** That is what the table says and all it says.
 
 The vendor at the frequency their published figures were taken at. Their
 runtime HAS now been run here -- 1b at 594 MHz on both sides, 1g across the

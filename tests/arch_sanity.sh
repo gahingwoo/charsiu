@@ -27,12 +27,31 @@
 # would have failed on the first qwen2 run.
 #
 #   tests/arch_sanity.sh MODEL_DIR
+#   CHARSIU_BOARD_DIR=... tests/arch_sanity.sh
 #
 # Every gguf in the directory is asked the same question. A file whose answer
 # does not contain the word is reported; the exit status is the number of them.
 
 set -e
-DIR="${1:?usage: arch_sanity.sh MODEL_DIR}"
+# ⚠ THE ENVIRONMENT IS THE SECOND WAY IN, AND IT HAD TO BE. The board's
+# regress.sh exports CHARSIU_BOARD_DIR and then calls this with no argument,
+# which this refused -- so section 1 of the r411 regression, "every
+# architecture still knows a fact", has printed a usage line and NOTHING ELSE
+# every time it has run. `set -e` does not stop it because the call is inside a
+# pipeline, so the regression carried on and reported the rest as if the
+# architectures had passed. Same shape as the prefill script that found no
+# models and exited 0: a check that cannot run reads exactly like a check that
+# found nothing wrong.
+DIR="${1:-${CHARSIU_BOARD_DIR:-}}"
+if [ -z "$DIR" ]; then
+	echo "arch_sanity.sh: no model directory." >&2
+	echo "  give one as \$1, or set CHARSIU_BOARD_DIR." >&2
+	exit 2
+fi
+if [ ! -d "$DIR" ]; then
+	echo "arch_sanity.sh: $DIR is not a directory" >&2
+	exit 2
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ⚠ CHARSIU_RUN SO THIS CAN RUN WHERE THE MODELS ARE. The models live on the
 # board and the board has no compiler, so a script that builds before it checks
