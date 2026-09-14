@@ -419,6 +419,7 @@ struct charsiu_npu {
 	int bin_one;               /* CHARSIU_NPU_BIN_ONEBO=1 */
 	struct charsiu_bo breg[2];
 	unsigned bm;               /* the m those are sized for, 0 if unbuilt */
+	size_t bd1_n;              /* elements in bd1, for the deferred snapshot */
 	unsigned bnks, bnslots;    /* and how many K slices and slots */
 	/*
 	 * What EACH DEVICE'S input BO holds right now, so a caller that
@@ -663,8 +664,30 @@ struct charsiu_npu {
 		 * `e` belongs here too.
 		 */
 		size_t bout_stride;
+		/*
+		 * ⚠⚠ AND int8's PER ROW ACTIVATION SCALE. The note over the
+		 * allocation of g->bd1 says "a single array would hand every
+		 * slice the last one's scales"; with a deferred gather the
+		 * same sentence is one scope up, and it hands the deferred
+		 * tensor the NEXT tensor's. r408's bisection put 4 of 9 model
+		 * failures in the pack region on its own.
+		 */
+		float *bd1;
+		size_t bd1_n;
+		/*
+		 * ⭐ THE ORACLE. CHARSIU_NPU_DEFER_CHECK=1 gathers the answer
+		 * TWICE: once at the moment of deferring, with the state the
+		 * plain path would have used, into `shadow`; and once at the
+		 * flush, the deferred way, into Y. Then it compares. A
+		 * pass/fail count over a model suite says five of nine are
+		 * wrong; this says which tensor, which row, which channel and
+		 * by how much.
+		 */
+		float *shadow;
+		size_t shadow_n;
 		int live;
 	} pend;
+	unsigned long defer_bad, defer_cmp;
 	unsigned long bdefer_n, bdefer_done;
 	double balloc_us;	/* the output BO allocation, inside prep */
 	unsigned balloc_n;
@@ -2002,6 +2025,28 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 }
 
 static int npu_flush_pending(struct charsiu_npu *g);
+static int defer_read_on(void);
+static int defer_check(void);
+
+/*
+ * ⚠ THE BISECTION. CHARSIU_NPU_DEFER_READ selects WHERE the previous tensor's
+ * deferred gather is flushed, so the position can be moved without moving
+ * anything else:
+ *
+ *   1  after this call's submit loop, which is the only position that overlaps
+ *   2  at the end of the DEFERRING call, so the machinery runs at the moment
+ *      the plain path would have -- 0 of 9 models differ here
+ *   3  at the top of the next call, before any of its own state is touched
+ *   4  after batch_outbuf, before the pack
+ *   5  after the pack and the emit, before the submit
+ *
+ * =2 clean and =1 dirty says the fault is in what the next call CHANGES before
+ * the flush, and 3, 4 and 5 say which part of it.
+ */
+static int flush_at(struct charsiu_npu *g, int pos)
+{
+	return defer_read_on() == pos ? npu_flush_pending(g) : 0;
+}
 
 void charsiu_npu_close(struct charsiu_npu *g)
 {
@@ -2010,7 +2055,17 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	/* ⚠ a deferred gather owns a buffer this is about to free, and the
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
+	/* ⚠ ZERO AND NEVER RAN LOOK THE SAME, so say how many were compared */
+	if (defer_check())
+		fprintf(stderr, "charsiu: the deferred gather was compared on"
+			" %lu tensors, %lu differed; %lu deferred, %lu"
+			" flushed\n", g->defer_cmp, g->defer_bad,
+			g->bdefer_n, g->bdefer_done);
+	free(g->pend.shadow);
 	free(g->pend.bseen);
+	free(g->pend.bd1);
+	g->pend.bd1 = NULL;
+	g->pend.bd1_n = 0;
 	g->pend.bseen = NULL;
 	g->pend.bseen_n = 0;
 	charsiu_npu_idle(g, 1);
@@ -3996,6 +4051,10 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 	 * array would hand every slice the last one's scales.
 	 */
 	g->bd1 = malloc((size_t)nks * m * sizeof(*g->bd1));
+	/* ⚠ and its length, because a deferred read needs its OWN copy: the
+	 * sentence above is one scope up as soon as the gather can outlive the
+	 * call that packed for it */
+	g->bd1_n = (size_t)nks * m;
 	if (!g->bscr || !g->bq || !g->bd1) {
 		whine(g, "the batch scratch would not allocate", g->kmax, m);
 		g->bm = 0;
@@ -5305,11 +5364,39 @@ static int batch_read_device(struct charsiu_npu *g,
 			}
 			g->bmap = t2;
 			g->bmap_n4 = n4;
-			for (unsigned r = 0; r < m; r++)
-				for (unsigned j = 0; j < n4; j++)
-					g->bmap[(size_t)r * n4 + j] =
-					  (uint32_t)charsiu_acc_index(r, j * 4, m,
-						w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+			/*
+			 * ⚠⚠ CHARSIU_NPU_READ_FLAT=1 BUILDS THE IDENTITY,
+			 * which is what this table would hold if the
+			 * accumulator came back row major.
+			 *
+			 * The gather through this permutation is the largest
+			 * single line in a prompt -- r407 put it at 1.96 ms a
+			 * row against the 1.82 of fence it waits behind -- and
+			 * every lever on the gather ITSELF is measured and
+			 * lost. The note above says why that is not the end of
+			 * it: "the read is at its floor FOR THIS ACCUMULATOR
+			 * LAYOUT", and the fp16 path at the same m and n comes
+			 * back FLAT.
+			 *
+			 * On the shipped stream reading flat is WRONG, and
+			 * that is the positive control: it says the knob
+			 * reaches the read. Paired with CHARSIU_W4_F16DPU it
+			 * asks whether any register that differs between the
+			 * fp16 and int4 output stages puts the answer there.
+			 */
+			{
+				int flat = charsiu_env_flag(
+					"CHARSIU_NPU_READ_FLAT", 0);
+
+				for (unsigned r = 0; r < m; r++)
+					for (unsigned j = 0; j < n4; j++)
+						g->bmap[(size_t)r * n4 + j] =
+						  flat
+						  ? (uint32_t)((size_t)r
+							* g->nmax + j * 4)
+						  : (uint32_t)charsiu_acc_index(r, j * 4, m,
+							w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+			}
 			g->bmap_m = m;
 			g->bmap_w4 = (unsigned)w4_for(g, e->t);
 			/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
@@ -5531,9 +5618,66 @@ static int batch_read_device(struct charsiu_npu *g,
 /*
  * ⭐ FINISH A GATHER THAT WAS PUT OFF, and restore the per call state it reads.
  */
+/*
+ * ⛔⛔ THIS USED TO RUN AT THE END OF npu_matmul_inner, DEFERRED OR NOT, AND
+ * THAT IS WHY THE DEFERRED GATHER WAS WRONG ON FIVE MODELS OF NINE.
+ *
+ * An ungrouped tensor is scaled once per channel after the read; int8 always
+ * is, because its d1 went in during the read. With `defer` the read has NOT
+ * HAPPENED when this point is reached: the scale multiplied whatever Y held
+ * from the previous call, and then the deferred gather overwrote Y with
+ * values that never got scaled at all.
+ *
+ * Llama-3.2-1B Q4_0 is grouped w4 in every tensor, so this block is skipped
+ * for it and it was correct in both arms -- which is why a single model check
+ * could not see this and tests/board_text_all.sh could. Every model that has
+ * ONE tensor the grouping does not cover pays it on that tensor.
+ *
+ * tensor_grouped depends on the tensor and on g->kmax, both fixed for the life
+ * of the pool, so asking it again at flush time gives the same answer.
+ */
+static void tail_scale_apply(struct charsiu_npu *g,
+			     const struct npu_entry *e, float *Y, unsigned m)
+{
+	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
+		return;
+	{
+		struct tail_scale_job tj = { Y, e->t->scale,
+					     (unsigned)e->t->n };
+		double ts = now_us();
+
+		/*
+		 * ⚠ THE ROWS ARE INDEPENDENT, so the pool needs no grain and
+		 * the order cannot change: element (r, j) is multiplied by
+		 * scale[j] and by nothing else. The vector form below is the
+		 * same IEEE single multiply four at a time -- there is no add
+		 * for a compiler to fuse into an fma, which is the one way a
+		 * rewrite like this has changed a value in this tree before.
+		 */
+		/* ⚠ THE CONTROL, in the same binary: CHARSIU_NPU_TAIL_PLAIN=1
+		 * is the loop exactly as it was, one thread and scalar, so the
+		 * two arms can be interleaved in one session. The board drifts
+		 * 3% between sessions and that is the size of what this
+		 * measures. */
+		if (tail_plain())
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < (unsigned)e->t->n; j++)
+					Y[(size_t)r * e->t->n + j] *=
+						e->t->scale[j];
+		else if (g->poolread == 1 ||
+			 (g->poolread == 2 &&
+			  (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(tail_scale_rows, &tj, m);
+		else
+			tail_scale_rows(&tj, 0, m);
+		g->bscale_us += now_us() - ts;
+	}
+}
+
 static int npu_flush_pending(struct charsiu_npu *g)
 {
 	unsigned char *save;
+	float *d1save = NULL;
 	unsigned d;
 	int rc = 0;
 
@@ -5551,6 +5695,20 @@ static int npu_flush_pending(struct charsiu_npu *g)
 		memcpy(save, g->bseen, g->bseen_n);
 		memcpy(g->bseen, g->pend.bseen, nb);
 		g->bout_stride = g->pend.bout_stride;
+		/* int8's read multiplies by this and the next tensor's pack
+		 * has already overwritten the live one */
+		if (g->bd1 && g->pend.bd1 && g->pend.bd1_n &&
+		    g->pend.bd1_n >= g->bd1_n) {
+			d1save = malloc(g->bd1_n * sizeof(*d1save));
+			if (!d1save) {
+				memcpy(g->bseen, save, g->bseen_n);
+				free(save);
+				return -1;
+			}
+			memcpy(d1save, g->bd1, g->bd1_n * sizeof(*d1save));
+			memcpy(g->bd1, g->pend.bd1,
+			       g->bd1_n * sizeof(*d1save));
+		}
 		for (d = 0; d < g->ndev; d++)
 			if (g->pend.dmask & (1u << d))
 				if (batch_read_device(g, g->pend.e,
@@ -5558,9 +5716,44 @@ static int npu_flush_pending(struct charsiu_npu *g)
 						      g->pend.Y, g->pend.m))
 					rc = -1;
 		g->bout_stride = stride;
+		if (d1save) {
+			memcpy(g->bd1, d1save, g->bd1_n * sizeof(*d1save));
+			free(d1save);
+		}
 	}
 	memcpy(g->bseen, save, g->bseen_n);
 	free(save);
+	/* ⛔ AND THE PER CHANNEL SCALE, which used to run at the end of the
+	 * DEFERRING call with Y still unwritten. This is the moment it
+	 * belongs at: the gather above has just filled Y. */
+	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m);
+	if (defer_check() && g->pend.shadow) {
+		size_t n = (size_t)g->pend.m * g->pend.e->t->n, i;
+
+		if (n > g->pend.shadow_n)
+			n = g->pend.shadow_n;
+		g->defer_cmp++;
+		for (i = 0; i < n; i++) {
+			float a = g->pend.Y[i], b = g->pend.shadow[i];
+			float d = a - b < 0 ? b - a : a - b;
+			float s2 = (a < 0 ? -a : a) + (b < 0 ? -b : b);
+
+			if (d > 1e-4f * (s2 > 1.0f ? s2 : 1.0f)) {
+				if (g->defer_bad < 8)
+					fprintf(stderr, "charsiu: the deferred"
+						" gather differs at tensor"
+						" k=%u n=%u, row %u channel"
+						" %u: %g against %g\n",
+						(unsigned)g->pend.e->t->k,
+						(unsigned)g->pend.e->t->n,
+						(unsigned)(i / g->pend.e->t->n),
+						(unsigned)(i % g->pend.e->t->n),
+						(double)a, (double)b);
+				g->defer_bad++;
+				break;
+			}
+		}
+	}
 	g->obuf[g->pend.obi].pending = 0;
 	g->pend.live = 0;
 	g->bdefer_done++;
@@ -5576,6 +5769,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	double t0, tprep = now_us();
 
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
+		return -1;
+	if (flush_at(g, 3))
 		return -1;
 	/*
 	 * ⚠⚠ int8 IS THE PATH THAT DOES MORE THAN ONE ROW, and that is not a
@@ -5719,8 +5914,6 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * calls. After that the field is found by reading the list rather than
 	 * by guessing.
 	 */
-	if (defer && !w4_for(g, e->t))
-		defer = 0;
 	/*
 	 * ⚠⚠ THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
 	 *
@@ -5936,6 +6129,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		g->last_ob = ob;
 		g->last_id = id;
 	}
+	if (flush_at(g, 4))
+		return -1;
 
 	/*
 	 * ⚠⚠ THE ZERO OF Y WAS 26% OF A BATCHED MATMUL, and it was a whole
@@ -6025,6 +6220,9 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 */
 	if (!g->reuse_ask)
 		reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
+
+	if (flush_at(g, 5))
+		return -1;
 
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
@@ -6410,7 +6608,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * one. What it does need is the deferred tensor's own g->bseen, which
 	 * npu_flush_pending swaps in.
 	 */
-	if (npu_flush_pending(g))
+	if (flush_at(g, 1))
 		return -1;
 
 	/*
@@ -6440,6 +6638,44 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		if (!defer && batch_read_device(g, e, ob, d, Y, m))
 			return -1;
 	}
+	/*
+	 * ⭐ THE REFERENCE GATHER, taken here because here is where the plain
+	 * path would have taken it: same bseen, same bout_stride, same bd1,
+	 * same everything. The flush compares its own answer against this one
+	 * and names the first element that differs.
+	 */
+	if (defer && defer_check()) {
+		size_t want = (size_t)m * e->t->n;
+		unsigned char *sv = malloc(g->bseen_n ? g->bseen_n : 1);
+
+		if (sv && g->pend.shadow_n < want) {
+			float *t4 = realloc(g->pend.shadow,
+					    want * sizeof(*t4));
+
+			if (t4) {
+				g->pend.shadow = t4;
+				g->pend.shadow_n = want;
+			}
+		}
+		if (sv && g->pend.shadow_n >= want) {
+			unsigned d2;
+
+			memcpy(sv, g->bseen, g->bseen_n);
+			/* ⚠ START FROM WHAT Y HOLDS. The gather assigns on
+			 * the first write to a range and accumulates after,
+			 * so anything no range covers stays whatever was
+			 * there -- and Y will keep the same stale bytes. A
+			 * shadow that started from zero would differ there
+			 * for a reason that is not the bug. */
+			memcpy(g->pend.shadow, Y, want * sizeof(float));
+			for (d2 = 0; d2 < g->ndev; d2++)
+				batch_read_device(g, e, ob, d2,
+						  g->pend.shadow, m);
+			tail_scale_apply(g, e, g->pend.shadow, m);
+			memcpy(g->bseen, sv, g->bseen_n);
+		}
+		free(sv);
+	}
 	if (defer) {
 		/* ⚠ A SNAPSHOT, not a pointer: the next call resets g->bseen */
 		if (g->bseen_n > g->pend.bseen_n) {
@@ -6455,6 +6691,28 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		if (defer) {
 			memcpy(g->pend.bseen, g->bseen, g->bseen_n);
 			g->pend.bseen_live = g->bseen_n;
+			if (g->bd1 && g->bd1_n) {
+				if (g->pend.bd1_n < g->bd1_n) {
+					float *t3 = realloc(g->pend.bd1,
+						g->bd1_n * sizeof(*t3));
+
+					if (t3) {
+						g->pend.bd1 = t3;
+						g->pend.bd1_n = g->bd1_n;
+					}
+				}
+				/* ⚠ NOT `defer = 0` HERE: this block is already
+				 * inside `if (defer)`, so clearing it does not
+				 * stop pend.live being set two lines down. A
+				 * snapshot that did not happen would then be
+				 * restored over the live array. Mark it absent
+				 * instead and let the flush skip the swap. */
+				if (g->pend.bd1_n >= g->bd1_n)
+					memcpy(g->pend.bd1, g->bd1,
+					       g->bd1_n * sizeof(*g->bd1));
+				else
+					g->pend.bd1_n = 0;
+			}
 			g->pend.obi = (unsigned)(ob - g->obuf);
 			g->pend.e = e; g->pend.Y = Y;
 			g->pend.m = m;
@@ -6483,39 +6741,10 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	g->busy_us += now_us() - t0;
 
-	/* an ungrouped tensor is scaled once, per channel, at the end; int8
-	 * always is, because its d1 went in above */
-	if (!w4_for(g, e->t) || !tensor_grouped(g, e->t)) {
-		struct tail_scale_job tj = { Y, e->t->scale,
-					     (unsigned)e->t->n };
-		double ts = now_us();
-
-		/*
-		 * ⚠ THE ROWS ARE INDEPENDENT, so the pool needs no grain and
-		 * the order cannot change: element (r, j) is multiplied by
-		 * scale[j] and by nothing else. The vector form below is the
-		 * same IEEE single multiply four at a time -- there is no add
-		 * for a compiler to fuse into an fma, which is the one way a
-		 * rewrite like this has changed a value in this tree before.
-		 */
-		/* ⚠ THE CONTROL, in the same binary: CHARSIU_NPU_TAIL_PLAIN=1
-		 * is the loop exactly as it was, one thread and scalar, so the
-		 * two arms can be interleaved in one session. The board drifts
-		 * 3% between sessions and that is the size of what this
-		 * measures. */
-		if (tail_plain())
-			for (unsigned r = 0; r < m; r++)
-				for (unsigned j = 0; j < (unsigned)e->t->n; j++)
-					Y[(size_t)r * e->t->n + j] *=
-						e->t->scale[j];
-		else if (g->poolread == 1 ||
-			 (g->poolread == 2 &&
-			  (size_t)m * e->t->n >= poolread_min(g)))
-			charsiu_parallel_for(tail_scale_rows, &tj, m);
-		else
-			tail_scale_rows(&tj, 0, m);
-		g->bscale_us += now_us() - ts;
-	}
+	/* ⚠ NOT WHEN THE READ HAS NOT HAPPENED. npu_flush_pending applies it
+	 * after the deferred gather instead; see tail_scale_apply. */
+	if (!defer)
+		tail_scale_apply(g, e, Y, m);
 	return 0;
 }
 
@@ -6577,6 +6806,16 @@ static int reuse_enabled(void)
  *
  * CHARSIU_NPU_DEFER_READ=0 makes this the plain call, which is the control.
  */
+/* the oracle beside the deferral; see the note over pend.shadow */
+static int defer_check(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_DEFER_CHECK", 0);
+	return v;
+}
+
 static int defer_read_on(void)
 {
 	static int v = -1;
@@ -6584,10 +6823,21 @@ static int defer_read_on(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_NPU_DEFER_READ");
 
-		/* ⛔ DEFAULT OFF. See the note above charsiu_npu_matmul_defer:
-		 * it is correct on Llama-3.2-1B and wrong on five of nine
-		 * models, and the cause is not fully found. */
-		v = e ? atoi(e) : 0;
+		/*
+		 * ⭐ DEFAULT ON SINCE r411. The five of nine was one line:
+		 * the per channel tail scale ran at the end of the deferring
+		 * call with Y still unwritten. With it moved into
+		 * npu_flush_pending, tests/board_text_all.sh is 9 of 9
+		 * identical with this on and 9 of 9 with it off, and the
+		 * board puts it at 326 ms of an 852 token prompt -- 6355 ms
+		 * against 6029, text byte identical.
+		 *
+		 * ⚠ ITS SPREAD IS WIDER THAN THE ARMS AROUND IT: 5999..6375
+		 * against base's 6352..6361. The gather now races the
+		 * hardware for memory, so a run where the fence finishes
+		 * early pays for it.
+		 */
+		v = e ? atoi(e) : 1;
 	}
 	return v;
 }

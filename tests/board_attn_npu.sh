@@ -34,6 +34,8 @@
 #
 #   CHARSIU_ATTN_REPS="2 4 8 18 34"   clause counts (about 25 tokens each)
 #   CHARSIU_ATTN_N=2                  repeats an arm a length
+. "$(dirname "$0")/board_clk.sh"
+NPUCLK=$(npu_clk) || exit 1
 set -u
 
 REPS=${CHARSIU_ATTN_REPS:-2 4 8 18 34}
@@ -54,7 +56,7 @@ sleep 1
 
 echo "== fp16 attention on the NPU, against the CPU arm, by prompt length"
 echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
-echo "   npu clk   $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null) Hz"
+echo "   npu clk   $NPUCLK Hz"
 echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary    $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
 echo "   model     $(basename "$M")"

@@ -256,11 +256,14 @@ that follows from it is stage costs, not coefficients.
 token ranges on a curve with a large quadratic term, produced a number that
 pointed the wrong way.
 
-🏁 **They win on the other two terms and both are large.** Their fixed cost is
-a quarter of ours, 45.8 against 187.9 ms, and their quadratic term is a sixth
-of ours. ⭐ The quadratic term is the attention scaling. Per prompt token we
-are ahead; what we lose is how that cost GROWS, and a fixed cost four times
-theirs on top of it.
+🏁 **They win on the other two terms.** ⚠ And only one of the two is a number:
+their fixed cost is a quarter of ours, 45.8 against 187.9 ms, which the short
+end of the measured ladder shows directly. Their quadratic term is SMALLER and
+by how much is not determined -- see the refutation above, which this
+paragraph used to contradict by restating the 6.0x as a finding. ⭐ The
+quadratic term is the attention scaling. Per prompt token we are ahead; what
+we lose is how that cost GROWS, and a fixed cost four times theirs on top of
+it.
 
 🏁 **So "who starts a prompt faster" is a crossover, not a ratio.** With their
 33 tokens included the fits cross at 248 of our tokens; measured, we are ahead
@@ -799,6 +802,56 @@ two shapes apart, and the projection that follows from it -- attention 2343 ms
 becoming about 780, TTFT about 5630 against their 6027 -- is arithmetic on a
 bound and **not a result**.
 
+### 1k. The ladder with the overlap work in, and the crossover gone
+
+r411, shipping defaults, board to itself, three repeats a point, one warm-up
+discarded, all eight points on one boot.
+
+```
+    ch tok   ch ms      range   vn tok    vn ms   winner   ratio
+        27     332   327..332       60    413.2  charsiu   1.245
+        52     415   413..417       85    529.6  charsiu   1.276
+       102     761   750..762      135    931.8  charsiu   1.224
+       202    1400  1398..1401     235   1528.5  charsiu   1.092
+       302    2131  2124..2134     335   2145.0  charsiu   1.007
+       452    3059  3037..3179     485   3194.7  charsiu   1.044
+       602    4115  4111..4156     635   4200.5  charsiu   1.021
+       852    5953  5948..5959     885   6026.8  charsiu   1.012
+```
+
+🏁 **What this supports: two regimes.** charsiu leads by 1.09x to 1.28x below
+about 250 of its own tokens, and from 302 up the two are level. 852 goes 8081
+(r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953, so their 1.341x lead
+there is gone.
+
+⛔⛔ **WHAT IT DOES NOT SUPPORT IS "AHEAD AT EVERY LENGTH", and this list said
+that for an hour before it was corrected.** Every point estimate favours
+charsiu, but a margin has to clear TWO things, not one:
+
+  - **the cross-boot drift.** Their column needs their driver bound, so the two
+    columns cannot share a boot; 1b-ii measured the boot-to-boot drift of this
+    same charsiu ladder at **2.2% at worst**. 302 (+0.7%), 602 (+2.1%) and 852
+    (+1.2%) are inside it.
+  - **the arm's own spread AT THAT POINT.** 452 is +4.4% over them and its own
+    three readings span 3037..3179, which is 142 ms and **4.6% of its median**.
+    A margin smaller than the spread of the arm it came from is not a margin,
+    and comparing only against the drift bound missed this one.
+
+```
+    clear    27 (+24.5%)  52 (+27.6%)  102 (+22.4%)  202 (+9.2%)
+    level   302  452  602  852
+```
+
+⚠ The four changes behind it, each measured against its own control on this
+board and each text identical to it: two head groups so the softmax runs
+during the scores fence (322 ms of layer at 852), the kv ladder's ceiling and
+its block copy (126), the deferred int4 accumulator gather (326), and the
+fence poll (76). `tests/board_text_all.sh` is 9 models 0 differing with the
+shipping defaults.
+
+⚠ Decode did not pay for it: 18.15 tok/s against 18.06 before the round, peak
+1448 MB against 1449.
+
 ---
 
 ## 2. Quality against the vendor's own int4
@@ -1229,7 +1282,8 @@ because it moves both columns by the same 22%.
 ANY single number for the prefill gap, and in particular the 1.23x this list
 used to give -- 1b-ii now has both curves and the answer is a CROSSOVER at
 about 248 of our tokens, with our per-token linear rate 12% BETTER than theirs
-and their fixed cost and quadratic term 4x and 6x smaller. The 1.23x was two
+and their fixed cost 4x smaller. ⚠ Their quadratic term is smaller too and the
+6x that used to stand here is withdrawn: the fit does not determine it. The 1.23x was two
 points a side over two different token ranges and it pointed the wrong way.
 What cannot be quoted as one number: the matched-text ratio changes sign with
 prompt length, and the matched-token ratio runs 1.08x to 1.39x over the

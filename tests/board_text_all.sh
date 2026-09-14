@@ -34,7 +34,12 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "${RUN:-}" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models \
+# ⚠ /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and it
+# was reached only by setting CHARSIU_BOARD_DIR by hand. A round that forgot
+# found three, which is under the floor below and so refused -- but a floor
+# that fires every time is a floor nobody reads. The directory goes in the
+# list; the listing below still prints what each one held.
+DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
 # ⚠⚠ AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
 # falls back to a matvec a row: the batched loop's ORDER runs and the batched
@@ -56,6 +61,34 @@ if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:
 	echo "======================================================================" >&2
 	exit 1
 fi
+# ⚠⚠⚠ AND SAY WHAT IT SEARCHED AND WHAT IT FOUND, because a model directory
+# that is not mounted looks exactly like a model directory with nothing in it.
+# 2026-09-14: /opt/vendor is its own partition and it came unmounted between
+# two rounds. The script found 2 models instead of 9, printed "2 models
+# compared, 0 differing", and that read as a pass. Nothing was wrong with the
+# check; the round was answering a smaller question than the one asked.
+#
+# CHARSIU_TEXT_MIN_MODELS is the expectation, and a round that finds fewer
+# REFUSES rather than reporting on a subset.
+for d in $DIRS; do
+	n=$(ls "$d"/*.gguf 2>/dev/null | wc -l)
+	printf '  %-40s %s\n' "$d" \
+		"$([ -d "$d" ] && echo "$n gguf" || echo 'not a directory')"
+done
+FOUND=0
+for d in $DIRS; do
+	FOUND=$((FOUND + $(ls "$d"/*.gguf 2>/dev/null | wc -l)))
+done
+MINM=${CHARSIU_TEXT_MIN_MODELS:-4}
+if [ "$FOUND" -lt "$MINM" ]; then
+	echo "" >&2
+	echo "⛔ $FOUND gguf files in those directories, fewer than $MINM." >&2
+	echo "   A missing mount reads as an empty directory and the summary" >&2
+	echo "   line would still say 'N models compared, 0 differing'." >&2
+	echo "   CHARSIU_TEXT_MIN_MODELS=$FOUND runs it anyway." >&2
+	exit 1
+fi
+
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 

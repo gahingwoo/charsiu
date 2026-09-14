@@ -523,6 +523,34 @@ struct charsiu_fp16_op {
 	 * calloc, never a negative zero.
 	 */
 	unsigned xtri0;
+	/*
+	 * ⭐⭐ THE CALLER PRODUCES THE HALVES ITSELF, instead of handing over
+	 * floats for this to convert.
+	 *
+	 * Attention's values matmul takes the softmax's output, and the
+	 * softmax has just walked every one of those numbers. Writing them as
+	 * floats so that this can read them back and write them as halves is a
+	 * whole extra round trip over the largest array in the prompt: at 852
+	 * tokens the values group's pack alone is 152 ms.
+	 *
+	 * With `fill` set, X is not read. For each row r this memsets the
+	 * causal tail exactly as it would have -- so xtri0 still means what it
+	 * means -- and calls fill for the live part:
+	 *
+	 *     fill(ctx, dst, op, r, n)   write n halves at dst
+	 *
+	 * `op` is the index into the group, so one context can serve all of
+	 * them. The call happens on the pool, one op a worker, so the callback
+	 * must not touch anything the other ops touch.
+	 *
+	 * ⚠ n IS THE LIVE LENGTH AND THE TAIL IS ALREADY ZERO. A callback that
+	 * writes fewer than n halves leaves whatever the last group left
+	 * there, which is a plausible wrong answer; one that writes more runs
+	 * into the next row.
+	 */
+	void (*fill)(void *ctx, uint16_t *dst, unsigned op, unsigned r,
+		     unsigned n);
+	void *fill_ctx;
 };
 
 /*
@@ -544,6 +572,28 @@ void charsiu_fp16_release(struct charsiu_fp16 *f);
  */
 void charsiu_fp16_poison_and_release(struct charsiu_fp16 *f);
 
+/* size the shared buffers for the widest group this unit will run, so the
+ * growth does not land in the middle of a prompt. 0, or -1 for a shape the
+ * unit cannot plan. */
+int charsiu_fp16_reserve(struct charsiu_fp16 *f,
+			 const struct charsiu_fp16_op *ops, unsigned nops);
+/*
+ * ⭐ THE SAME GROUP IN TWO HALVES, so a caller can do CPU work while the
+ * hardware runs. submit() returns as soon as the job is queued; wait() takes
+ * the fence and reads the answers back. One group in flight per unit: a
+ * second submit before the wait is a caller bug, and a wait with nothing in
+ * flight returns -1.
+ *
+ * ⚠ THE OPS ARE COPIED, THE BUFFERS THEY NAME ARE NOT. X, Y, W and the fill
+ * context must all still be alive and unchanged at the wait.
+ */
+int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
+				     const struct charsiu_fp16_op *ops,
+				     unsigned nops);
+int charsiu_fp16_matmul_group_wait(struct charsiu_fp16 *f);
+/* wait out a submitted group without reading it back, for a caller that gave
+ * up between the two halves */
+void charsiu_fp16_drain(struct charsiu_fp16 *f);
 int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 			      const struct charsiu_fp16_op *ops, unsigned nops);
 

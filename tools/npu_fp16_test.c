@@ -582,6 +582,7 @@ int main(int argc, char **argv)
 	int dow8 = argc > 3 && !strcmp(argv[3], "--w8");
 	int dow8map = argc > 3 && !strcmp(argv[3], "--w8map");
 	int dow8a8 = argc > 3 && !strcmp(argv[3], "--w8a8");
+	int dow4map = argc > 3 && !strcmp(argv[3], "--w4map");
 	struct charsiu_device *dev = charsiu_open(NULL);
 	float *A, *B, *ref;
 	uint32_t *got;
@@ -595,6 +596,163 @@ int main(int argc, char **argv)
 	if (!A || !B || !ref || !got) return 1;
 
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
+	if (dow4map) {
+		/*
+		 * ⭐⭐⭐ WHERE THE w4a16 ACCUMULATOR PUTS ROW r CHANNEL c, and
+		 * whether any register makes it flat.
+		 *
+		 * The int4 read back is the largest single line in a prompt --
+		 * 1.96 ms a row against the 1.82 of fence it waits behind --
+		 * and it is a gather through charsiu_acc_index's permutation.
+		 * Every lever on the gather itself is measured and lost, and
+		 * npudev.c's own note says why that is not the end of it: "the
+		 * read is at its floor FOR THIS ACCUMULATOR LAYOUT".
+		 *
+		 * The fp16 path at the same m and n comes back FLAT, and
+		 * npu_fp16_test's default arm is the proof. So the question is
+		 * not what the int4 order is -- round 384 solved that -- but
+		 * whether the difference between the two output stages is a
+		 * register.
+		 *
+		 * ⚠ THE SWEEP THAT LOOKS LIKE IT ANSWERED THIS COMPARED w4a16
+		 * AGAINST int8, whose DPU block is identical to w4a16's to
+		 * begin with. fp16's is not: 0x401c, 0x4020 and 0x4028 differ,
+		 * and CHARSIU_W4_F16DPU offers them to int4 one at a time.
+		 *
+		 * This runs a w4a16 job with a known answer and reports BOTH
+		 * readings, so "flat is wrong" and "this probe cannot read it"
+		 * are different lines.
+		 */
+		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 0;
+		uint8_t *W = malloc((size_t)n * k);
+		uint8_t *packed;
+		float *ref = NULL;
+		struct charsiu_job job = { 0 };
+		size_t nreg, insz, wsz;
+		double worst_flat = 0, worst_acc = 0;
+		unsigned any = 0;
+
+		(void)reps;
+		job.cbuf_window = (unsigned)charsiu_cbuf_window();
+		job.mm.m = m; job.mm.k = k; job.mm.n = n;
+		job.mm.wdtype = CHARSIU_INT4;
+		job.mm.adtype = CHARSIU_FP16;
+		job.input_zero_point = 0;
+		job.weight_zero_point = 0;   /* a nibble is not biased */
+		job.output_zero_point = 0;
+		job.input_scale = 1.0f; job.weight_scale = 1.0f;
+		job.output_scale = 1.0f;
+		job.acc_out = 1;
+
+		wsz = charsiu_weight_bytes(&job.mm);
+		insz = (size_t)charsiu_entries_per_row(&job.mm) * 64 * m + 4096;
+		ref = calloc((size_t)m * n, sizeof(*ref));
+		packed = calloc(wsz + 64, 1);
+		if (!W || !ref || !packed) goto done;
+		if (pool_want(dev, wsz + 4096, insz, (size_t)m * n * 4 + 4096,
+			      charsiu_coef_bytes(&job.mm) + 4096))
+			goto done;
+
+		/* ⚠ A DISTINCT ANSWER PER CELL, so a permutation cannot pass
+		 * by landing a value on a cell that wanted the same number.
+		 * The activation is one-hot per row and the weight a ramp, so
+		 * out[r][c] = W[c][r % k] exactly. */
+		for (unsigned i = 0; i < m * k; i++)
+			A[i] = 0.0f;
+		for (unsigned r = 0; r < m; r++)
+			A[(size_t)r * k + (r % k)] = 1.0f;
+		for (unsigned c = 0; c < n; c++)
+			for (unsigned i = 0; i < k; i++)
+				W[(size_t)c * k + i] =
+					(uint8_t)((c * 5 + i * 3) % 15 + 1);
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++)
+				ref[(size_t)r * n + c] =
+					(float)W[(size_t)c * k + (r % k)];
+
+		charsiu_pack_weights(&job.mm, W, packed);
+		charsiu_bo_prep(dev, &pool.wt, 1000000000);
+		memset(pool.wt.map, 0, wsz);
+		memcpy(pool.wt.map, packed, wsz);
+		charsiu_bo_fini(dev, &pool.wt);
+
+		charsiu_bo_prep(dev, &pool.in, 1000000000);
+		memset(pool.in.map, 0, insz);
+		charsiu_pack_input_f16(&job.mm, A, pool.in.map, insz);
+		charsiu_bo_fini(dev, &pool.in);
+
+		{
+			int32_t *zero = calloc(n, sizeof(int32_t));
+
+			if (!zero) goto done;
+			charsiu_bo_prep(dev, &pool.coef, 1000000000);
+			charsiu_build_coefs(&job, zero, zero, pool.coef.map);
+			charsiu_bo_fini(dev, &pool.coef);
+			free(zero);
+		}
+		job.input_addr = (uint32_t)pool.in.dma_address;
+		job.output_addr = (uint32_t)pool.ob.dma_address;
+		job.weight_addr = (uint32_t)pool.wt.dma_address;
+		job.coef_addr = (uint32_t)pool.coef.dma_address;
+
+		charsiu_bo_prep(dev, &pool.reg, 1000000000);
+		nreg = charsiu_emit_job(&job, pool.reg.map, 4096 / 8);
+		charsiu_bo_fini(dev, &pool.reg);
+		if (!nreg) { printf("  empty stream\n"); goto done; }
+
+		charsiu_bo_prep(dev, &pool.ob, 1000000000);
+		for (unsigned i = 0; i < m * n; i++)
+			((uint32_t *)pool.ob.map)[i] = 0xdeadbeefu;
+		charsiu_bo_fini(dev, &pool.ob);
+		{
+			uint32_t ins[2] = { pool.in.handle, pool.wt.handle };
+			uint32_t outs[1] = { pool.ob.handle };
+
+			if (charsiu_submit(dev, &pool.reg, (unsigned)nreg, ins,
+					   2, outs, 1)) {
+				printf("  the submit failed\n");
+				goto done;
+			}
+		}
+		charsiu_bo_prep(dev, &pool.ob, 1000000000);
+		memcpy(got, pool.ob.map, (size_t)m * n * 4);
+		charsiu_bo_fini(dev, &pool.ob);
+
+		printf("w4a16 accumulator map: K=%u N=%u M=%u   W4_F16DPU=%s\n",
+		       k, n, m, getenv("CHARSIU_W4_F16DPU")
+				 ? getenv("CHARSIU_W4_F16DPU") : "0");
+		for (unsigned r = 0; r < m; r++)
+			for (unsigned c = 0; c < n; c++) {
+				size_t fi = (size_t)r * n + c;
+				size_t ai = charsiu_acc_index(r, c, m,
+					charsiu_m_axis_wide_for(1));
+				double want = ref[fi];
+				double df = fabs((double)(int32_t)got[fi]
+						 - want);
+				double da = ai < (size_t)m * n
+					  ? fabs((double)(int32_t)got[ai] - want)
+					  : df;
+
+				if (got[fi] != 0xdeadbeefu) any++;
+				if (df > worst_flat) worst_flat = df;
+				if (da > worst_acc) worst_acc = da;
+			}
+		printf("  read FLAT              worst %.6g\n", worst_flat);
+		printf("  read charsiu_acc_index worst %.6g\n", worst_acc);
+		printf("  %u of %u cells were written\n", any, m * n);
+		printf("  row 0: got %d %d %d %d   want %.0f %.0f %.0f %.0f\n",
+		       (int32_t)got[0], (int32_t)got[1], (int32_t)got[2],
+		       (int32_t)got[3], ref[0], ref[1], ref[2], ref[3]);
+		if (m > 1)
+			printf("  row 1: got %d %d %d %d   want %.0f %.0f %.0f"
+			       " %.0f\n", (int32_t)got[n], (int32_t)got[n + 1],
+			       (int32_t)got[n + 2], (int32_t)got[n + 3],
+			       ref[n], ref[n + 1], ref[n + 2], ref[n + 3]);
+		free(W); free(ref); free(packed);
+		rc = 0;
+		goto done;
+	}
+
 	if (dow8a8) {
 		/*
 		 * ⭐⭐ THE ARRANGEMENT THE BOARD LEAVES: int8 WEIGHTS AND AN

@@ -2580,6 +2580,145 @@ static void softmax(float *x, int n)
 }
 
 /*
+ * ⭐⭐ THE SAME SOFTMAX, READING x AND WRITING HALVES, with the exponentials
+ * kept in a small scratch instead of going back where they came from.
+ *
+ * The scores matmul leaves m by npad floats in the device buffer, the softmax
+ * rewrites them in place, and then the values pack reads them all back and
+ * writes halves. That middle array is the largest thing in a prompt -- at 852
+ * tokens the values group's pack alone is 152 ms -- and none of it needs to
+ * reach DRAM twice: `tmp` is one row, four kilobytes, and stays in cache.
+ *
+ * ⚠ THE ARITHMETIC IS UNCHANGED, WHICH IS THE ONLY REASON THE TEXT CAN BE.
+ * The shipped path computes exp into the row, normalises the row in float,
+ * and the pack converts `exp * inv`. This computes exp into tmp, normalises
+ * tmp in float, and converts `exp * inv`. Same value, same rounding, same
+ * order. Normalising the HALVES instead would have been one pass fewer and a
+ * different number.
+ */
+static void softmax_scaled_half(const float *x, float *tmp, uint16_t *dst,
+				int n, float scale)
+{
+	float mx, sum = 0.0f, inv;
+	int i = 0;
+
+	if (n <= 0)
+		return;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_softmax() && n >= 8) {
+		float32x4_t mv = vdupq_n_f32(x[0]);
+		float32x4_t s0 = vdupq_n_f32(0.0f);
+		float32x4_t s1 = vdupq_n_f32(0.0f);
+		float32x4_t sv = vdupq_n_f32(scale);
+		float32x4_t mxv;
+
+		for (; i + 4 <= n; i += 4)
+			mv = vmaxq_f32(mv, vld1q_f32(x + i));
+		mx = vmaxvq_f32(mv);
+		for (; i < n; i++)
+			if (x[i] > mx)
+				mx = x[i];
+		mx *= scale;
+		mxv = vdupq_n_f32(mx);
+		for (i = 0; i + 8 <= n; i += 8) {
+			float32x4_t a = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i), sv), mxv));
+			float32x4_t b = charsiu_vexpq(vsubq_f32(
+				vmulq_f32(vld1q_f32(x + i + 4), sv), mxv));
+
+			vst1q_f32(tmp + i, a);
+			vst1q_f32(tmp + i + 4, b);
+			s0 = vaddq_f32(s0, a);
+			s1 = vaddq_f32(s1, b);
+		}
+		sum = vaddvq_f32(vaddq_f32(s0, s1));
+		for (; i < n; i++) {
+			tmp[i] = expf(x[i] * scale - mx);
+			sum += tmp[i];
+		}
+		inv = 1.0f / sum;
+		/* ⚠ ONE WALK, NOT TWO. Normalising the scratch in place and
+		 * then converting it reads and writes every element twice for
+		 * no reason; the scratch is not read again after this. The
+		 * arithmetic is unchanged, which tests/softmax_half.c holds
+		 * to the last bit against the arm that does not fuse. */
+		charsiu_f2h_scale_run(dst, tmp, (size_t)n, inv);
+		return;
+	}
+#endif
+	mx = x[0];
+	for (i = 1; i < n; i++)
+		if (x[i] > mx)
+			mx = x[i];
+	mx *= scale;
+	for (i = 0; i < n; i++) {
+		tmp[i] = expf(x[i] * scale - mx);
+		sum += tmp[i];
+	}
+	for (i = 0; i < n; i++)
+		dst[i] = charsiu_f2h(tmp[i] / sum);
+}
+
+/*
+ * ⚠ THE TWO SOFTMAXES AGAINST EACH OTHER, on a desk, to the last bit.
+ *
+ * softmax_scaled_half exists so the values pack does not have to read back
+ * what the softmax just wrote, and it is a second copy of that arithmetic by
+ * construction. What holds it is not that there is one copy but that the two
+ * agree -- and they have to agree EXACTLY, because what reaches the hardware
+ * is a half: one element rounding the other way changes a token.
+ *
+ * tests/softmax_half.c calls this. It lives here because both functions are
+ * static and both arms of fast_softmax have to be reachable.
+ */
+int charsiu_softmax_half_selftest(void);
+int charsiu_softmax_half_selftest(void)
+{
+	static const int ns[] = { 1, 2, 3, 7, 8, 9, 12, 15, 16, 31, 64, 100,
+				  853, 1024 };
+	float *a, *tmp;
+	uint16_t *h;
+	int fail = 0, i, k, pass;
+
+	a = malloc(2048 * sizeof(*a));
+	tmp = malloc(2048 * sizeof(*tmp));
+	h = malloc(2048 * sizeof(*h));
+	if (!a || !tmp || !h)
+		return 1;
+	/* both arms of fast_softmax(), which is what the NEON path is behind */
+	for (pass = 0; pass < 2; pass++) {
+		setenv("CHARSIU_FAST_SOFTMAX", pass ? "0" : "1", 1);
+		for (k = 0; k < (int)(sizeof(ns) / sizeof(ns[0])); k++) {
+			int n = ns[k];
+			float *b = malloc((size_t)n * sizeof(*b));
+			float sc = 0.0883883f;   /* 1/sqrt(128) */
+
+			if (!b) { fail++; break; }
+			for (i = 0; i < n; i++)
+				a[i] = (float)((i * 37 % 101) - 50) * 0.17f
+				     + (i % 7 == 0 ? 6.0f : 0.0f);
+			memcpy(b, a, (size_t)n * sizeof(*b));
+			softmax_scaled(b, n, sc);
+			softmax_scaled_half(a, tmp, h, n, sc);
+			for (i = 0; i < n; i++)
+				if (h[i] != charsiu_f2h(b[i])) {
+					printf("  arm %d n=%d: element %d is "
+					       "%04x fused and %04x separate"
+					       "\n",
+					       pass, n, i, h[i],
+					       charsiu_f2h(b[i]));
+					fail++;
+					break;
+				}
+			free(b);
+		}
+	}
+	unsetenv("CHARSIU_FAST_SOFTMAX");
+	free(a); free(tmp); free(h);
+	return fail;
+}
+
+/*
  * RoPE, in BOTH pairings, because a gguf can want either and the wrong one is
  * not a crash.
  *
@@ -4919,6 +5058,9 @@ struct attn_npu {
 	 */
 	struct charsiu_fp16 *f;        /* the scores matmul: q . K */
 	struct charsiu_fp16 *fv;       /* the values matmul: p . V */
+	/* the second pair, so one group can be in flight while the other's
+	 * answers are being reduced; NULL when CHARSIU_ATTN_PIPE is 1 */
+	struct charsiu_fp16 *f2, *fv2;
 	struct charsiu_fp16_w **kb, **vb;   /* [n_layer * nkv] */
 	unsigned n_layer, nkv, hd, nk, kv, mmax;
 	/*
@@ -4937,6 +5079,12 @@ struct attn_npu {
 	 * log2 of the context many repacks in a whole run.
 	 */
 	unsigned kvmax;
+	/* the rungs this run actually stood on, because the ladder's shape is
+	 * the thing being tuned and a count of repacks does not show it */
+	unsigned rung[20], nrung;
+	/* the shared buffers have been sized for the widest group this run
+	 * will ask for; see attn_reserve_mode */
+	int reserved;
 	/*
 	 * ⚠⚠ "FELL BACK ON 0" WAS TRUE AND MEANT NOTHING. `fallbacks` counts
 	 * the two charsiu_fp16_matmul_group failures and nothing else, while
@@ -4996,6 +5144,20 @@ struct attn_npu {
 	/* and the rest of the layer, so "attention minus what is accounted"
 	 * is never again a number anybody reasons from */
 	double t_layer, t_kv, t_pack1, t_pack2;
+	/* ⚠ OUTSIDE t_layer ON PURPOSE: a growth is not a layer's work,
+	 * it is the ladder's, and charging it to the layer is what would
+	 * hide a step that buys extent and pays for it in repacks. */
+	double t_grow, t_grow_alloc;
+	/* set the moment one growth has to fall back to the packer,
+	 * so the line above names the path that was actually run */
+	unsigned grow_packed;
+	/*
+	 * ⭐ ONE ROW OF EXPONENTIALS PER OP, so the softmax's intermediate
+	 * never reaches DRAM. FP16_GROUP_MAX rows of kvmax floats, which at a
+	 * 1024 context is 128 kB, and the pool splits the values pack one op
+	 * to a worker so no two workers share a row.
+	 */
+	float *softbuf;
 	int off;                            /* tried and refused */
 };
 
@@ -5098,6 +5260,80 @@ static unsigned attn_npu_mmax_cap(void)
 		v = e && *e ? atol(e) : 0;
 		if (v < 0)
 			v = 0;
+	}
+	return (unsigned)v;
+}
+
+/*
+ * ⚠⚠ THE LADDER OVERSHOOTS AND THE HINT SAYS BY HOW MUCH. kv doubles, so a
+ * 852 token prompt finishes its prefill on the 1024 rung and every row from
+ * position 512 on pays a reduction extent 19% longer than any of them needs.
+ * The vendor's own file grows this length in steps of 32 instead.
+ *
+ * ⛔ AND THE OBVIOUS FIX IS THE WRONG ONE: starting kv AT the prompt total is
+ * SLOWER, not faster. Cost is the sum of kv over positions, so a ladder that
+ * begins at 864 charges the first 512 rows 864 apiece where the doubling one
+ * charges them 32, 64, ... 512 -- 736k units against 523k, 1.4x worse. What
+ * the hint is good for is the CEILING, not the floor: keep the ladder, and
+ * refuse to climb past what the prompt will actually use.
+ *
+ * The step is a knob because the repack is not free either (one BO alloc per
+ * layer per kv head, then every live position packed again), so where the
+ * optimum sits between "few repacks, much overshoot" and the vendor's 32 is a
+ * board question and not an arithmetic one.
+ */
+/* ⚠ SEPARATE FROM THE STEP, so an arm can be exactly today: step 200, cap
+ * off. Two knobs on one line is how a sweep stops being able to name which
+ * half moved. */
+static int attn_npu_kv_cap_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV_CAP", 1);
+	return v;
+}
+
+/* the block copy, with an off switch: an arm that cannot be turned off cannot
+ * be priced, and this one replaces a path that is known correct */
+/*
+ * 0 off, 1 at open (measured at -478 ms, see the note by the open-time block),
+ * 2 at the first layer call, where m and the prompt's own ceiling are known
+ * and the reservation is exactly what growing would have reached.
+ */
+static int attn_reserve_mode(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_RESERVE");
+
+		v = e && *e ? atoi(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return v;
+}
+
+static int attn_npu_kv_copy(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV_COPY", 1);
+	return v;
+}
+
+static unsigned attn_npu_kv_step(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_KV_STEP");
+
+		v = e && *e ? atol(e) : 200;
+		if (v < 110)
+			v = 110;
 	}
 	return (unsigned)v;
 }
@@ -5330,6 +5566,7 @@ static void kv_round(float *dst, const float *src, unsigned hd, int bits)
 }
 
 static int attn_npu_soft_pool(void);
+static unsigned attn_pipe_groups(void);
 
 static void attn_npu_free(struct attn_npu *a)
 {
@@ -5354,6 +5591,18 @@ static void attn_npu_free(struct attn_npu *a)
 				attn_npu_soft_pool() ? "pooled" : "one core",
 				a->t_pack2, a->t_layer - a->t_kv - a->t_pack1
 					  - a->t_soft - a->t_pack2);
+		if (a->nrung) {
+			unsigned r2;
+
+			fprintf(stderr, "charsiu:   V surface ladder:");
+			for (r2 = 0; r2 < a->nrung; r2++)
+				fprintf(stderr, " %u", a->rung[r2]);
+			fprintf(stderr, "  (%u repacks, %.0f ms: %.0f in"
+				" alloc, %.0f in %s)\n", a->nrung - 1,
+				a->t_grow, a->t_grow_alloc,
+				a->t_grow - a->t_grow_alloc,
+				a->grow_packed ? "the packer" : "block copy");
+		}
 		/* ⚠ BY REASON, because "refused 308" is the number that made
 		 * gemma-4 look like a head_dim 512 measurement when 28 of its
 		 * 35 layers are head_dim 256 and never reached the hardware. */
@@ -5362,6 +5611,12 @@ static void attn_npu_free(struct attn_npu *a)
 				fprintf(stderr, "charsiu:   %-12s %lu\n",
 					an_reason[r], a->refused[r]);
 	}
+	/* ⚠ BEFORE THE BUFFERS GO. A layer that gave up mid group left a job
+	 * writing into an output buffer this is about to free. */
+	charsiu_fp16_drain(a->f);
+	charsiu_fp16_drain(a->fv);
+	charsiu_fp16_drain(a->f2);
+	charsiu_fp16_drain(a->fv2);
 	for (i = 0; a->f && i < a->n_layer * a->nkv; i++) {
 		if (a->kb)
 			charsiu_fp16_w_free(a->f, a->kb[i]);
@@ -5370,7 +5625,12 @@ static void attn_npu_free(struct attn_npu *a)
 	}
 	/* ⚠ fv FIRST. It BORROWS f's device, and charsiu_fp16_close on the
 	 * owner closes that device -- the other order frees fv's buffer
-	 * objects through a file descriptor that is already shut. */
+	 * objects through a file descriptor that is already shut. Same rule
+	 * for the second pair: every borrower before the owner. */
+	if (a->fv2)
+		charsiu_fp16_close(a->fv2);
+	if (a->f2)
+		charsiu_fp16_close(a->f2);
 	if (a->fv)
 		charsiu_fp16_close(a->fv);
 	if (a->f)
@@ -5380,6 +5640,7 @@ static void attn_npu_free(struct attn_npu *a)
 	free(a->lhd);
 	free(a->dirty);
 	free(a->packed);
+	free(a->softbuf);
 	free(a);
 }
 
@@ -5444,6 +5705,7 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->kvmax = ((unsigned)s->n_ctx + 31u) & ~31u;
 	/* the smallest rung the unit will take; attn_npu_fit climbs from here */
 	a->kv = a->kvmax < 32u ? a->kvmax : 32u;
+	a->rung[a->nrung++] = a->kv;
 	/*
 	 * ⚠ THE SURFACE CEILING IS WHAT CAPS THE ROW BLOCK. The hardware takes
 	 * (k/32)*m up to 5120 -- measured, and the vendor's own file never
@@ -5513,6 +5775,23 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 			a->f = NULL;
 		}
 	}
+	/* ⚠ THE SECOND PAIR ONLY WHEN IT WILL BE USED. They borrow the same
+	 * device, but each carries its own five shared buffers, and a unit
+	 * that is never submitted through still pays for them. */
+	if (a->f && attn_pipe_groups() > 1) {
+		a->f2 = charsiu_fp16_open_on(charsiu_fp16_device(a->f));
+		a->fv2 = charsiu_fp16_open_on(charsiu_fp16_device(a->f));
+		charsiu_fp16_name(a->f2, "scores2");
+		charsiu_fp16_name(a->fv2, "values2");
+		if (!a->f2 || !a->fv2) {
+			fprintf(stderr, "charsiu: the pipelined attention "
+				"wanted a second unit pair and did not get "
+				"it; running one group\n");
+			charsiu_fp16_close(a->fv2);
+			charsiu_fp16_close(a->f2);
+			a->f2 = a->fv2 = NULL;
+		}
+	}
 	if (!a->f)
 		return NULL;
 	nbuf = a->n_layer * a->nkv;
@@ -5520,7 +5799,9 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 	a->vb = calloc(nbuf, sizeof(*a->vb));
 	a->dirty = calloc(a->n_layer, 1);
 	a->packed = calloc(a->n_layer, sizeof(*a->packed));
-	if (!a->kb || !a->vb || !a->dirty || !a->packed)
+	a->softbuf = calloc((size_t)FP16_GROUP_MAX * a->kvmax,
+			    sizeof(*a->softbuf));
+	if (!a->kb || !a->vb || !a->dirty || !a->packed || !a->softbuf)
 		return NULL;
 	for (i = 0; i < nbuf; i++) {
 		unsigned lhd = a->lhd[i / a->nkv];
@@ -5534,6 +5815,70 @@ static struct attn_npu *attn_npu_get(struct llama_state *s)
 		}
 	}
 	a->off = 0;
+	/*
+	 * ⛔⛔ RESERVED AT THE WIDEST GROUP, AND IT LOSES. DEFAULT OFF.
+	 *
+	 * The idea was sound and the size was not. Growing into the buffers
+	 * costs 73 ms of `plan` on the scores unit and 19 on the values one at
+	 * 852 tokens -- five reallocations of five buffer objects, the largest
+	 * 21 MB -- and reserving removes all of it: plan 73 -> 1, 19 -> 1.
+	 *
+	 * It also made every prep and every fini charge the RESERVED size.
+	 * Same binary, 852 tokens, three repeats:
+	 *
+	 *     CHARSIU_ATTN_RESERVE=1   PIPE=1 7027  PIPE=2 6794
+	 *     CHARSIU_ATTN_RESERVE=0   PIPE=1 6661  PIPE=2 6316
+	 *
+	 * 478 ms, and the stage table says where: the scores fence 503 -> 738
+	 * and the values psync 67 -> 167, both whole-buffer dma_syncs.
+	 *
+	 * ⚠ THE SIZE IS THE FAULT, NOT THE IDEA. The ceiling arithmetic below
+	 * is right about the LADDER -- m * n is the same 160 * 1024 on every
+	 * rung -- and wrong about the caller: charsiu_run's prefill chunk is
+	 * 80 rows, so a real group is 80 * 864 and this reserves 2.4x it. A
+	 * version that waits for the first layer call and reserves at ITS m
+	 * would be correctly sized, and has not been measured.
+	 *
+	 * This is the fourth time this tree has paid a whole-buffer sync for a
+	 * buffer bigger than the work: see the note in npufp16.c.
+	 */
+	{
+		unsigned mm = a->kvmax >= 32 ? 5120u / (a->kvmax / 32u) : 1;
+		unsigned nops = m->n_head ? m->n_head : 1;
+		unsigned G = a->f2 && a->fv2 ? attn_pipe_groups() : 1;
+		struct charsiu_fp16_op r[FP16_GROUP_MAX];
+
+		if (attn_npu_mmax_cap() && mm > attn_npu_mmax_cap())
+			mm = attn_npu_mmax_cap();
+		if (nops > FP16_GROUP_MAX)
+			nops = FP16_GROUP_MAX;
+		/* ⚠ A UNIT ONLY EVER SEES ITS OWN GROUP, so reserving the
+		 * whole head count would allocate twice what any of them
+		 * runs */
+		if (G > 1)
+			nops = (nops + G - 1) / G;
+		if (mm && a->nk >= 32 && hd >= 32 &&
+		    attn_reserve_mode() == 1) {
+			for (i = 0; i < nops; i++) {
+				memset(&r[i], 0, sizeof(r[i]));
+				r[i].m = mm;
+				r[i].k = hd;
+				r[i].n = a->nk;
+				r[i].Wbuf = a->kb[0];
+			}
+			charsiu_fp16_reserve(a->f, r, nops);
+			if (a->f2)
+				charsiu_fp16_reserve(a->f2, r, nops);
+			for (i = 0; i < nops; i++) {
+				r[i].k = a->kvmax;
+				r[i].n = hd;
+				r[i].Wbuf = a->vb[0];
+			}
+			charsiu_fp16_reserve(a->fv, r, nops);
+			if (a->fv2)
+				charsiu_fp16_reserve(a->fv2, r, nops);
+		}
+	}
 	charsiu_note("attention: the fp16 mirror is open", a->n_layer, a->nkv);
 	return a;
 }
@@ -5598,33 +5943,87 @@ static const float *attn_kcache_at(struct llama_state *s, unsigned l,
  *
  * Returns 0 if kv now covers `want`, -1 if it cannot.
  */
+static double attn_npu_now_ms(void);
+
 static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			unsigned want)
 {
 	unsigned kv = a->kv, i, l, kh, p;
+	/* every position already in the float cache; this one is not in it
+	 * yet, which is why the packer below stops one short of `want` */
+	unsigned live = want ? want - 1 : 0;
+	int copied = attn_npu_kv_copy();
+	double tg0, tg1, tga = 0.0;
+	unsigned step = attn_npu_kv_step();
+	unsigned cap = (s->prompt_total > 0 && attn_npu_kv_cap_on())
+		     ? (((unsigned)s->prompt_total + 31u) & ~31u) : 0u;
 
+	if (cap > a->kvmax)
+		cap = a->kvmax;
 	if (want <= a->kv)
 		return 0;
 	if (want > a->kvmax)
 		return -1;
-	while (kv < want)
-		kv *= 2;
+	while (kv < want) {
+		unsigned nx = (unsigned)(((uint64_t)kv * step) / 100u);
+
+		/* 32 is the surface's grain and also the smallest step that
+		 * makes progress, so a step percentage that rounds down to
+		 * nothing still climbs */
+		nx = (nx + 31u) & ~31u;
+		if (nx <= kv)
+			nx = kv + 32u;
+		kv = nx;
+		if (kv >= a->kvmax) {
+			kv = a->kvmax;
+			break;
+		}
+	}
+	/*
+	 * ⚠ THE PROMPT'S OWN CEILING, AND ONLY WHILE THE PROMPT IS WHAT IS
+	 * BEING SERVED. `want` past it means generation has run off the end of
+	 * the hint, and then the ladder is all there is again.
+	 */
+	if (cap && want <= cap && kv > cap)
+		kv = cap;
 	if (kv > a->kvmax)
 		kv = a->kvmax;
 
+	tg0 = attn_npu_now_ms();
 	for (i = 0; i < a->n_layer * a->nkv; i++) {
-		struct charsiu_fp16_w *w = charsiu_fp16_w_alloc(a->fv, kv,
-							a->lhd[i / a->nkv]);
+		struct charsiu_fp16_w *w;
+		double ta = attn_npu_now_ms();
+
+		w = charsiu_fp16_w_alloc(a->fv, kv, a->lhd[i / a->nkv]);
 
 		if (!w) {
 			fprintf(stderr, "charsiu: the fp16 V surface would not "
 				"grow to %u positions\n", kv);
 			return -1;
 		}
+		tga += attn_npu_now_ms() - ta;
+		/*
+		 * ⭐ THE RUNG'S BYTES ARE THE NEXT RUNG'S BYTES AT ANOTHER
+		 * BASE. The padded extent appears in one term of the offset,
+		 * so the positions already packed are already in order and
+		 * only the output channel groups move. tests/fp16_regrow.c
+		 * holds that against the packer, 1584 shapes byte for byte.
+		 *
+		 * ⚠ BEFORE THE FREE, obviously, and out of the map that is
+		 * about to go away. A refusal here is not a fault: `copied`
+		 * falls to 0 and the packer below does the whole job.
+		 */
+		if (copied && live
+		    && charsiu_fp16_regrow_vcols(charsiu_fp16_w_map(w), kv,
+				charsiu_fp16_w_map(a->vb[i]), a->kv,
+				a->lhd[i / a->nkv], live))
+			copied = 0;
 		charsiu_fp16_w_free(a->fv, a->vb[i]);
 		a->vb[i] = w;
 	}
 	a->kv = kv;
+	if (a->nrung < sizeof(a->rung) / sizeof(a->rung[0]))
+		a->rung[a->nrung++] = kv;
 	a->mmax = 5120u / (kv / 32u);
 	if (attn_npu_mmax_cap() && a->mmax > attn_npu_mmax_cap())
 		a->mmax = attn_npu_mmax_cap();
@@ -5632,8 +6031,9 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 		return -1;
 
 	/* every position that already exists, through the packer the append
-	 * path uses, out of the float cache that both paths write */
-	for (l = 0; l < a->n_layer; l++) {
+	 * path uses, out of the float cache that both paths write -- unless
+	 * the block copy above already moved them all */
+	for (l = 0; !copied && l < a->n_layer; l++) {
 		for (kh = 0; kh < a->nkv; kh++) {
 			uint16_t *map = charsiu_fp16_w_map(
 					a->vb[l * a->nkv + kh]);
@@ -5641,12 +6041,21 @@ static int attn_npu_fit(struct llama_state *s, struct attn_npu *a,
 			/* ⚠ TWO DIFFERENT WIDTHS ON ONE LINE: the mirror is
 			 * packed at the LAYER's head and the float cache is
 			 * addressed at the STRIDE. They differ on gemma4. */
-			for (p = 0; p + 1 < want; p++)
+			for (p = 0; p < live; p++)
 				charsiu_fp16_pack_vcol(map, a->kv, a->lhd[l], p,
 					attn_vcache_at(s, l, kh, a->hd, p));
 		}
-		a->dirty[l] = 1;
 	}
+	/* ⚠ EITHER WAY. The surface moved, so every layer's upload is stale
+	 * whether the bytes got there by a copy or by the packer. */
+	for (l = 0; l < a->n_layer; l++)
+		a->dirty[l] = 1;
+	a->grow_packed += !copied;
+	tg1 = attn_npu_now_ms();
+	a->t_grow += tg1 - tg0;
+	/* alloc and free against pack, because the two have different fixes:
+	 * one is 128 buffer objects a rung, the other is every live position */
+	a->t_grow_alloc += tga;
 	charsiu_note("attention: the V surface grew", kv, a->mmax);
 	return 0;
 }
@@ -5803,6 +6212,99 @@ static void attn_npu_soft_units(void *ctx, uint64_t u0, uint64_t n)
 	}
 }
 
+/*
+ * ⭐⭐ THE SOFTMAX, RUN INSIDE THE VALUES PACK INSTEAD OF BEFORE IT.
+ *
+ * The shipped order is: the scores matmul leaves m by npad floats in a device
+ * buffer, the softmax rewrites them in place, and the values pack reads them
+ * all back and writes halves. That middle array is the largest thing in a
+ * prompt and it crosses DRAM twice for no reason: the softmax has the number
+ * in a register at the moment the pack wants it.
+ *
+ * charsiu_fp16_op.fill is the hook. npufp16 keeps the offsets, the bound and
+ * the causal tail -- xtri0 still memsets [pos + 1, k) exactly as it did -- and
+ * asks for the live part. So this writes the same values the pack would have
+ * converted, and softmax_scaled_half keeps the arithmetic identical.
+ *
+ * ⚠ n IS pos + 1 AND THE CALLBACK OWES EVERY ONE OF THEM. The sliding-window
+ * zeros below used to be written into the scores buffer by the softmax pass;
+ * nothing writes them now except this, and a short write leaves the previous
+ * group's halves in place.
+ *
+ * CHARSIU_ATTN_FUSE_SOFTMAX=0 puts the separate pass back.
+ */
+static int attn_fuse_softmax(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_FUSE_SOFTMAX", 1);
+	return v;
+}
+
+static void attn_npu_fill(void *ctx, uint16_t *dst, unsigned op, unsigned r,
+			  unsigned n)
+{
+	struct attn_npu_soft *c = ctx;
+	const struct attn_block_job *j = c->j;
+	const float *sr = c->sc[op] + (size_t)r * c->npad;
+	int pos = j->pos0 + (int)c->rb + (int)r;
+	int tlo = j->swa && pos + 1 > j->n_swa ? pos + 1 - j->n_swa : 0;
+	int live = (int)n - tlo;
+
+	if ((unsigned)tlo > n)
+		tlo = (int)n;
+	memset(dst, 0, (size_t)tlo * 2);
+	if (live > 0)
+		softmax_scaled_half(sr + tlo,
+				    c->a->softbuf + (size_t)op * c->a->kvmax,
+				    dst + tlo, live, j->scale);
+}
+
+/*
+ * ⭐⭐ THE FENCE IS A SLEEPING ioctl AND THE SOFTMAX IS FOUR BUSY CORES, AND
+ * THEY HAPPEN ONE AFTER THE OTHER.
+ *
+ * r407 read the layer: scores fence 504 ms, values pack 477 (which is the
+ * softmax since r409 fused it), values fence 385. Every millisecond of the
+ * two fences is four idle cores, and every millisecond of the pack is an idle
+ * NPU. Nothing makes them exclusive except that one function does both halves
+ * of a group.
+ *
+ * The heads are independent, so splitting them into G groups over G units
+ * lets group g+1's scores run on the hardware while group g's softmax runs on
+ * the CPU. The hardware order does not change -- one job per submit, the
+ * driver serialises them on one fd -- so this is not the two cores in flight
+ * together, which corrupts.
+ *
+ * ⚠ 1 IS NOT QUITE TODAY: at G = 1 the sentinels for the next call are
+ * written while the values job is still running rather than after it, which
+ * is free but real. The arm to compare is 1 against 2 inside ONE binary.
+ */
+static unsigned attn_pipe_groups(void)
+{
+	static long v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_PIPE");
+
+		/* ⭐ TWO IS THE DEFAULT SINCE r411. Nine models on the board,
+		 * batched against their own token loops, identical at 1, 2 and
+		 * 4; Llama at 852 tokens identical at all three; and 4 is not
+		 * faster than 2 (6311 against 6320, layer 1441 against 1402).
+		 */
+		v = e && *e ? atol(e) : 2;
+		if (v < 1)
+			v = 1;
+		if (v > 8)
+			v = 8;
+		/* ⚠ TWO UNITS, ANY NUMBER OF GROUPS. The ring is two deep
+		 * because a group's values are collected one iteration later,
+		 * so unit u is free again by the time group u + 2 wants it. */
+	}
+	return (unsigned)v;
+}
+
 /* the arm is named in both directions: =0 is the bare loop it replaced */
 static int attn_npu_soft_pool(void)
 {
@@ -5867,6 +6369,117 @@ static int attn_npu_causal_n(void)
 	if (v < 0)
 		v = charsiu_env_flag("CHARSIU_ATTN_NPU_CAUSAL_N", 1);
 	return v;
+}
+
+/*
+ * ONE GROUP OF HEADS: take its scores off the hardware, reduce them, and put
+ * its values on. Everything the caller has to keep is in the struct, because
+ * the caller runs two of these interleaved and a local would be one group's.
+ */
+struct attn_group {
+	struct attn_npu *a;
+	struct attn_block_job *j;
+	struct charsiu_fp16 *fs, *fvs;
+	struct attn_npu_soft *sc;
+	size_t qstride;
+	unsigned h0, ng, m, rb, cn, hd;
+	double *tg0;
+};
+
+static int attn_npu_group(struct attn_group *g)
+{
+	struct attn_npu *a = g->a;
+	struct attn_block_job *j = g->j;
+	struct charsiu_fp16_op vop[FP16_GROUP_MAX];
+	unsigned h;
+	double ts;
+
+	if (charsiu_fp16_matmul_group_wait(g->fs))
+		return -1;
+	a->t_pack1 += attn_npu_now_ms() - *g->tg0;
+	*g->tg0 = attn_npu_now_ms();
+
+	g->sc->a = a;
+	g->sc->j = j;
+	g->sc->m = g->m;
+	g->sc->rb = g->rb;
+	g->sc->npad = g->cn;
+	ts = attn_npu_now_ms();
+	for (h = 0; h < g->ng; h++) {
+		g->sc->sc[h] = charsiu_fp16_out_w(g->fs, h);
+		if (!g->sc->sc[h])
+			return -1;
+	}
+	/* ⭐ with the fused arm the softmax happens inside the values pack
+	 * below, one pass instead of two over the largest array in the prompt */
+	if (attn_fuse_softmax())
+		;
+	else if (attn_npu_soft_pool())
+		charsiu_parallel_for(attn_npu_soft_units, g->sc,
+				     (uint64_t)g->ng * g->m);
+	else
+		attn_npu_soft_units(g->sc, 0, (uint64_t)g->ng * g->m);
+	a->t_soft += attn_npu_now_ms() - ts;
+
+	for (h = 0; h < g->ng; h++) {
+		memset(&vop[h], 0, sizeof(vop[h]));
+		vop[h].X = charsiu_fp16_out_w(g->fs, h);
+		/* ⚠ THE ANSWER'S OWN STRIDE, which is the width the scores
+		 * matmul ran at and not the prompt's. */
+		vop[h].xstride = g->cn;
+		if (attn_fuse_softmax()) {
+			vop[h].fill = attn_npu_fill;
+			vop[h].fill_ctx = g->sc;
+		}
+		/*
+		 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO NOTHING
+		 * AFTER ITSELF, AND THE PACK IS WHAT ENFORCES THAT NOW.
+		 *
+		 * The loop above used to zero [pos+1, npad) itself and
+		 * [npad, kv) came from the scratch's calloc, so this promise
+		 * was merely an optimisation: the pack could memset a tail
+		 * that was already zero instead of converting it. That
+		 * trailing loop is gone -- it was 58% of a row, in the one
+		 * stage of this path with no pool behind it -- so past pos
+		 * this scratch holds the RAW scores the matmul wrote, and the
+		 * memset in the pack is what makes those positions contribute
+		 * nothing.
+		 *
+		 * ⚠ Which also means the calloc is no longer load bearing,
+		 * and the promise is no longer optional. The order that made
+		 * the swap safe is in r400/r401: the tail was READ BACK on
+		 * hardware and found zero while the loop still wrote it, and
+		 * only then was the loop removed.
+		 */
+		vop[h].xtri0 = (unsigned)j->pos0 + g->rb + 1;
+		/* ⚠ THE HEAD IS GLOBAL, THE OP INDEX IS NOT: the kv head a
+		 * query head shares is (h0 + h) / gqa, and getting that wrong
+		 * reads another head's values and still produces fluent text */
+		vop[h].Wbuf = a->vb[j->l * a->nkv + (g->h0 + h) / j->gqa];
+		vop[h].Y = j->out + (size_t)g->rb * g->qstride
+			 + (size_t)(g->h0 + h) * g->hd;
+		vop[h].ystride = (unsigned)g->qstride;
+		vop[h].m = g->m;
+		vop[h].k = a->kv;
+		vop[h].n = g->hd;
+	}
+	if (charsiu_fp16_matmul_group_submit(g->fvs, vop, g->ng))
+		return -1;
+	/* ⚠ THE VALUES PACK HAS NOW FINISHED READING THE SCORES, and this is
+	 * the only moment at which the next call's sentinels can be written:
+	 * after the softmax stopped overwriting them and before the buffer
+	 * goes back to the device. It saves two whole-buffer dma_syncs a
+	 * call. */
+	charsiu_fp16_poison_and_release(g->fs);
+	/* ⚠ THE TWO BUCKETS HAVE TO STAY WHAT THEY SAY. Charging everything
+	 * between two scores waits to `scores` put the values pack in the
+	 * scores column the moment the groups interleaved -- 832 against 527,
+	 * which is the pair the other way round. t_pack1 is now the wait for
+	 * THIS group's scores and t_pack2 is everything the values side
+	 * costs. */
+	a->t_pack2 += attn_npu_now_ms() - *g->tg0;
+	*g->tg0 = attn_npu_now_ms();
+	return 0;
 }
 
 /*
@@ -5993,81 +6606,132 @@ static int attn_npu_layer(struct attn_block_job *j)
 			op[h].k = hd;
 			op[h].n = cn;
 		}
+		/*
+		 * ⭐⭐ THE HEADS IN G GROUPS, SO ONE GROUP'S SOFTMAX RUNS WHILE
+		 * THE NEXT GROUP'S SCORES ARE ON THE HARDWARE.
+		 *
+		 * The order the hardware sees is S(0) S(1) V(0) V(1), one job
+		 * a submit, serialised on one file descriptor -- the same work
+		 * in the same sequence. What changes is that the CPU is inside
+		 * group 0's pack while the NPU is inside group 1's scores,
+		 * instead of asleep in an ioctl.
+		 */
+		{
+		unsigned G = attn_pipe_groups(), g, gh, n0;
+		struct charsiu_fp16 *fs[2], *fvs[2];
+		struct attn_npu_soft scg[2];
+		struct attn_group gj;
+
+		/*
+		 * ⚠ ONE ROW HAS NOTHING TO HIDE. What the split buys is a
+		 * softmax long enough to cover the next group's scores, and
+		 * what it costs is a second plan, emit, poison and submit --
+		 * about 0.85 ms a group call at 852 tokens. At m = 1 the
+		 * softmax is one row of the layer's ~1 ms, so decode would pay
+		 * the overhead twice for nothing to overlap.
+		 */
+		if (!a->f2 || !a->fv2 || G > H || m < 2)
+			G = 1;
+		gh = (H + G - 1) / G;
+		n0 = H < gh ? H : gh;
+		fs[0] = a->f;   fs[1] = G > 1 ? a->f2 : a->f;
+		fvs[0] = a->fv; fvs[1] = G > 1 ? a->fv2 : a->fv;
+
+		/*
+		 * ⭐ THE SAME RESERVATION, SIZED FROM THE CALL INSTEAD OF FROM
+		 * THE CEILING. The open-time version guessed m from the input
+		 * surface ceiling and got 160 where the caller uses 80, so
+		 * every whole-buffer sync afterwards charged 2.4x the work.
+		 * Here m is the chunk's own, and the two extents are capped
+		 * the way the ladder caps them, so this asks for exactly what
+		 * growing into it would have reached -- and pays none of the
+		 * five reallocations on the way.
+		 */
+		if (attn_reserve_mode() == 2 && !a->reserved) {
+			struct charsiu_fp16_op r[FP16_GROUP_MAX];
+			unsigned q, rn = a->nk, rk = a->kvmax;
+
+			a->reserved = 1;
+			if (s->prompt_total > 0) {
+				unsigned t16 = ((unsigned)s->prompt_total + 15u)
+					     & ~15u;
+				unsigned t32 = ((unsigned)s->prompt_total + 31u)
+					     & ~31u;
+
+				if (t16 < rn)
+					rn = t16;
+				if (t32 < rk)
+					rk = t32;
+			}
+			for (q = 0; q < n0; q++) {
+				memset(&r[q], 0, sizeof(r[q]));
+				r[q].m = m;
+				r[q].k = hd;
+				r[q].n = rn;
+				r[q].Wbuf = a->kb[0];
+			}
+			charsiu_fp16_reserve(fs[0], r, n0);
+			if (G > 1)
+				charsiu_fp16_reserve(fs[1], r, n0);
+			for (q = 0; q < n0; q++) {
+				r[q].k = rk;
+				r[q].n = hd;
+				r[q].Wbuf = a->vb[0];
+			}
+			charsiu_fp16_reserve(fvs[0], r, n0);
+			if (G > 1)
+				charsiu_fp16_reserve(fvs[1], r, n0);
+		}
 		tg0 = attn_npu_now_ms();
-		if (charsiu_fp16_matmul_group(a->f, op, H)) {
+		if (charsiu_fp16_matmul_group_submit(fs[0], op, n0)) {
 			a->fallbacks++;
 			return -1;
 		}
-		a->t_pack1 += attn_npu_now_ms() - tg0;
-		{
-			struct attn_npu_soft sc = { a, j, m, rb, cn, {0} };
-			double ts = attn_npu_now_ms();
+		gj.a = a; gj.j = j; gj.m = m; gj.rb = rb; gj.cn = cn;
+		gj.hd = hd; gj.qstride = qstride; gj.tg0 = &tg0;
+		for (g = 0; g < G; g++) {
+			unsigned u = g & 1, h0 = g * gh;
 
-			for (h = 0; h < H; h++) {
-				sc.sc[h] = charsiu_fp16_out_w(a->f, h);
-				if (!sc.sc[h]) {
+			/* ⚠ THE NEXT GROUP GOES IN BEFORE THIS ONE'S PACK,
+			 * and that ordering is the whole feature: queued
+			 * behind work that is already running it costs
+			 * nothing to submit, and it is what the hardware
+			 * chews on while the softmax has the cores. */
+			if (g + 1 < G) {
+				unsigned h1 = (g + 1) * gh;
+				unsigned n1 = H - h1 < gh ? H - h1 : gh;
+
+				if (charsiu_fp16_matmul_group_submit(
+					    fs[(g + 1) & 1], op + h1, n1)) {
 					a->fallbacks++;
 					return -1;
 				}
 			}
-
-			if (attn_npu_soft_pool())
-				charsiu_parallel_for(attn_npu_soft_units, &sc,
-						     (uint64_t)H * m);
-			else
-				attn_npu_soft_units(&sc, 0, (uint64_t)H * m);
-			a->t_soft += attn_npu_now_ms() - ts;
+			gj.fs = fs[u];
+			gj.fvs = fvs[u];
+			gj.h0 = h0;
+			gj.ng = H - h0 < gh ? H - h0 : gh;
+			gj.sc = &scg[u];
+			if (attn_npu_group(&gj)) {
+				a->fallbacks++;
+				return -1;
+			}
+			/* ⚠ ONE GROUP BEHIND. Collecting this group's values
+			 * here would put the CPU back to sleep in the ioctl
+			 * with the next group's pack still to do. */
+			if (g && charsiu_fp16_matmul_group_wait(fvs[!u])) {
+				a->fallbacks++;
+				return -1;
+			}
+			a->t_pack2 += attn_npu_now_ms() - tg0;
+			tg0 = attn_npu_now_ms();
 		}
-		for (h = 0; h < H; h++) {
-			memset(&op[h], 0, sizeof(op[h]));
-			op[h].X = charsiu_fp16_out_w(a->f, h);
-			/* ⚠ THE ANSWER'S OWN STRIDE, which is the width the
-			 * scores matmul ran at and not the prompt's. */
-			op[h].xstride = cn;
-			/*
-			 * ⚠⚠ ROW r IS POSITION pos0 + rb + r AND ATTENDS TO
-			 * NOTHING AFTER ITSELF, AND THE PACK IS WHAT ENFORCES
-			 * THAT NOW.
-			 *
-			 * The loop above used to zero [pos+1, npad) itself and
-			 * [npad, kv) came from the scratch's calloc, so this
-			 * promise was merely an optimisation: the pack could
-			 * memset a tail that was already zero instead of
-			 * converting it. That trailing loop is gone -- it was
-			 * 58% of a row, in the one stage of this path with no
-			 * pool behind it -- so past pos this scratch holds the
-			 * RAW scores the matmul wrote, and the memset in
-			 * charsiu_fp16_matmul_group is what makes those
-			 * positions contribute nothing.
-			 *
-			 * ⚠ Which also means the calloc is no longer load
-			 * bearing, and the promise is no longer optional. The
-			 * order that made the swap safe is in r400/r401: the
-			 * tail was READ BACK on hardware and found zero while
-			 * the loop still wrote it, and only then was the loop
-			 * removed.
-			 */
-			op[h].xtri0 = (unsigned)j->pos0 + rb + 1;
-			op[h].Wbuf = a->vb[j->l * a->nkv + h / j->gqa];
-			op[h].Y = j->out + (size_t)rb * qstride
-				+ (size_t)h * hd;
-			op[h].ystride = (unsigned)qstride;
-			op[h].m = m;
-			op[h].k = a->kv;
-			op[h].n = hd;
-		}
-		tg0 = attn_npu_now_ms();
-		if (charsiu_fp16_matmul_group(a->fv, op, H)) {
+		if (charsiu_fp16_matmul_group_wait(fvs[(G - 1) & 1])) {
 			a->fallbacks++;
 			return -1;
 		}
-		/* ⚠ THE VALUES PACK HAS NOW FINISHED READING THE SCORES, and
-		 * this is the only moment at which the next call's sentinels
-		 * can be written: after the softmax stopped overwriting them
-		 * and before the buffer goes back to the device. It saves two
-		 * whole-buffer dma_syncs a call. */
-		charsiu_fp16_poison_and_release(a->f);
 		a->t_pack2 += attn_npu_now_ms() - tg0;
+		}
 	}
 	a->layers++;
 	a->t_layer += attn_npu_now_ms() - tl0;
@@ -6915,6 +7579,30 @@ static int matmul_rows_same_defer(struct llama_state *s,
  * buffer does not halve when the work does. Default 0; the code is kept so the
  * next person to have this idea can run it rather than write it again.
  */
+/*
+ * ⚠ WHICH CALL SITES MAY DEFER, so the residual failures can be attributed to
+ * one of them. r408's bisection put 4 of 9 model failures in the pack region
+ * and 5 somewhere before the next call even starts; this splits the second
+ * group by where it was deferred.
+ *
+ *   CHARSIU_DEFER_SITE=qkv    only q, k and v
+ *   CHARSIU_DEFER_SITE=ffn    only gate and up
+ *   anything else, or unset   both
+ */
+static int defer_site(char c)
+{
+	static const char *v;
+
+	if (!v) {
+		v = getenv("CHARSIU_DEFER_SITE");
+		if (!v)
+			v = "";
+	}
+	if (!*v)
+		return 1;
+	return c == 'q' ? !strcmp(v, "qkv") : !strcmp(v, "ffn");
+}
+
 static int rowsplit_min(void)
 {
 	static int v = -1;
@@ -6931,10 +7619,14 @@ static int rowsplit_min(void)
 static int matmul_rows_split(struct llama_state *s,
 			     const struct gguf_tensor *w, const float *X,
 			     int n, float *Y, uint32_t k, uint32_t nout,
-			     char site, int same)
+			     char site, int same, char group)
 {
 	int lo = rowsplit_min(), h;
 
+	if (!defer_site(group))
+		return same ? matmul_rows_same_x(s, w, X, n, Y, k, nout,
+						 site, 0)
+			    : matmul_rows(s, w, X, n, Y, k, nout);
 	h = (n / 2) & ~1;
 	if (!lo || n < lo || h < 2 || n - h < 2)
 		return same ? matmul_rows_same_defer(s, w, X, n, Y, k, nout,
@@ -7465,13 +8157,15 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * v's does; the flush covers a refusal that would
 			 * otherwise leave the last one unwritten. */
 			matmul_rows_split(s, L->wq, s->bxb, n, s->bq,
-					  m->n_embd, m->n_head * hd, 0, 0);
+					  m->n_embd, m->n_head * hd, 0, 0, 'q');
 			matmul_rows_split(s, L->wk, s->bxb, n, s->bk,
-					  m->n_embd, m->n_head_kv * hd, 'k', 1);
+					  m->n_embd, m->n_head_kv * hd, 'k', 1,
+					  'q');
 			if (L->wv)
 				matmul_rows_split(s, L->wv, s->bxb, n, s->bv,
 						  m->n_embd,
-						  m->n_head_kv * hd, 'v', 1);
+						  m->n_head_kv * hd, 'v', 1,
+						  'q');
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -7677,9 +8371,9 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * The flush below covers the case where up is refused
 			 * and never reaches the hardware to do it. */
 			matmul_rows_split(s, L->gate, s->bxb, n, s->bhb,
-					  m->n_embd, nff, 0, 0);
+					  m->n_embd, nff, 0, 0, 'f');
 			matmul_rows_split(s, L->up, s->bxb, n, s->bhb2,
-					  m->n_embd, nff, 'u', 1);
+					  m->n_embd, nff, 'u', 1, 'f');
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -7701,7 +8395,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		BSTAGE(ST_SILU);
 		if (rowsplit_min()) {
 			matmul_rows_split(s, L->down, s->bhb, n, s->bxo, nff,
-					  m->n_embd, 0, 0);
+					  m->n_embd, 0, 0, 'f');
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			matmul_rows(s, L->down, s->bhb, n, s->bxo, nff,

@@ -5,6 +5,12 @@ the record of how the int4 layout, the accumulator read order, the batching and 
 rest were established on the board, with the numbers of the day each was written.
 The README carries what is true now; this carries how it was found out.
 
+⚠ **It stops on 2026-09-12.** Rounds r393 to r411 are in `board-logs/` in the
+driver repository, and four claims made below were withdrawn there. The closing
+section of this file lists each one and what refuted it, so a reader who
+remembers a claim finds its refutation and not the claim.
+
+
 
 ---
 
@@ -586,6 +592,9 @@ open, and both are measured rather than untried
     the hardware computes M rows while feeding every one from row 0's activation.
     It does not block the project, decoding LLM tokens is M = 1, and int4 at
     M = 1 is exact across eleven geometries. M > 1 is a chaining problem.
+    ⛔ **Superseded.** "What charsiu's own M > 1 turned out to be", below,
+    solves it: two defects of ours -- `0x40b8` written as the literal 3, and an
+    unknown accumulator read order -- and no hardware wall.
   N not a multiple of 8: the hardware does not put the short group LAST. Its live
     channels at N = 20 are 0-11 and 16-23, and at N = 36 they are 0-19 and 24-39,
     so bytes 160-191 and 544-575 are dead and the packer writes logical channels
@@ -1493,7 +1502,9 @@ paths. Priced on that verified computation, with the governor pinned and arms
 alternating, attention would cost 3.68 ms a row against the CPU's 6.67 at a
 batch of 178 -- 1.81x on attention, about 1.31x on a Qwen3 prompt. That is a
 step and not a finish: the vendor's TTFT is 2.2 to 3.0x ahead of ours, and this
-closes perhaps a third of it.
+closes perhaps a third of it. ⛔ That ratio is a 2026-09-05 reading and does not
+stand; as of r411 the vendor no longer wins at any measured prompt length. See
+the closing section.
 
 ### What had to be found
 
@@ -1926,22 +1937,18 @@ leftovers: "57 ms submitting and waiting" on a run whose fence alone was 189.
 The one that prints first is not the counter's owner.
 
 **4. "Bit exact by construction."** The fused read's derivation was about the
-ORDER OF THE ADDITIONS and never checked the OPERANDS. Every K slice carries
-its own scale, `t->scale[(n0+j)*ng + k0/kgroup]`, and the loop used the first
-slice's for all of them. Llama printed "000alivherherher"; Qwen3 counted 251,
-254, 256 for 257, 258, 259. **Neither faulted.** A proof about half an
+ORDER OF THE ADDITIONS and never checked the OPERANDS -- narrated in full under
+"The part that is worth more than the result" above, with the scale expression
+and both models' wrong output. **Neither faulted.** A proof about half an
 expression is not a proof about the expression.
 
 ### And two about experiments rather than instruments
 
-**A data race that read as a property of the model.** rmsnorm keeps its gain row
-in a plain function static, which was safe until the norm stages went on the
-pool. Qwen3 stopped being reproducible and the first reading was "that model is
-nondeterministic anyway" -- true of the build with the bug and false of every
-build before it. What settled it was running one binary ten times and then the
-previous commit ten times: 8/2 against 10/0. **A difference between two arms
-cannot be told from a difference between two runs without running one arm
-twice.**
+**A data race that read as a property of the model.** rmsnorm's gain row in a
+plain function static, narrated under "The one that was not a speedup at all"
+above: 8 of one sentence and 2 of another against 10 of 10 on the previous
+commit. **A difference between two arms cannot be told from a difference between
+two runs without running one arm twice.**
 
 **Two variables in one arm.** The chunk width experiment set
 `CHARSIU_NPU_KMAX=1024` and `CHARSIU_PREFILL_CHUNK=160` together and the result
@@ -2640,11 +2647,10 @@ the PREVIOUS round's mirror arm and called the 14% difference the fix. That is a
 cross round comparison, which this file spent the afternoon establishing is
 worthless here, written down at 15:00 and broken at 17:17.
 
-**So decode is not to be priced with board_vendor.sh.** It runs a prompt before
-it generates, and whatever the prefill leaves behind -- the NPU's own operating
-point is the first suspect -- follows into the window being timed. What that
-needs is a decode-only harness with many repeats and the arms alternating inside
-one process, and it does not exist yet.
+**So decode is not to be priced with board_vendor.sh.** ⛔ Which was one step
+too far, and "The fix was repeats" below withdraws it: the harness already
+reports a best of N, the low mode is the contamination, and best-of-six finds
+the clean mode where best-of-two does not. No new harness was needed.
 
 The prefill side of the same work needs none of that, because the stage table
 compares inside one run: Qwen3 at 916 tokens goes 12.41 to 11.21 ms a row with
@@ -3129,20 +3135,14 @@ each of the serial default and `CHARSIU_NPU_PARALLEL_MIN_M=28`:
 
 Every one of the 48 batched runs hashes exactly to its own token loop, and the
 widths line beside each says which chunks it batched -- including tails of 12,
-14 and 20, and the 80s the chunker really emits.
+14 and 20.
 
-**⚠ And that is not yet evidence the overlap engaged.** `PARALLEL_MIN_M` is
+**⚠ And that is not evidence the overlap engaged.** `PARALLEL_MIN_M` is
 consulted only after `batch_serial()` has already said "serialise", and
 `batch_serial()` defaults to `!overlap_safe()` -- so on a rail `overlap_safe()`
-approves, the two arms would be the same run twice and all 48 hashes would
-match for a reason that has nothing to do with the question. Identical output
-across arms is exactly what a knob that never engaged produces, which this
-month has already cost four rounds.
-
-m68 reads the two things that cannot stay quiet if the arms really differ: the
-line the runtime prints about what it decided, and the fence, which is the
-stage overlapping the cores cuts -- 409 ms to 164 ms when the element probe
-engaged it.
+approves, the two arms are the same run twice and all 48 hashes match for a
+reason that has nothing to do with the question. m68 below confirms exactly
+that, so this round measured nothing about the overlap.
 
 ### ⛔ Correction: the overlap is already the default, and the fault was already solved
 
@@ -3293,7 +3293,9 @@ Unchanged by the day's work, and that is the expected result rather than a
 disappointment: the default chunker emits one wide chunk at these prompt
 lengths and never asks for 8 or 10, so nothing shipped today is on this path.
 What the day bought is that three "open" faults are closed and two gates now
-name the real condition. The gap itself is still the NPU entry.
+name the real condition. The gap itself is still the NPU entry. ⛔ That last
+sentence is a 2026-09-06 reading and is superseded: as of r411 there is no
+prompt gap left to place. See the closing section.
 
 ## 2026-09-06 evening: where the prompt actually goes at the scoreboard's length
 
@@ -4840,67 +4842,6 @@ Nothing in the conclusion, and two things around it:
 here. The two do not share a path in the way the CPU-side numbers assume, which
 is why the fence can sit at the MAC rate while read and pack are held at 11.9.
 
-## 2026-09-07 late: AWQ was two bugs deep, and the second one is the interesting one
-
-### Bug one: the factor was never applied to the activation
-
-npuquant folds the AWQ factor into the weights (`row[i] /= t->kscale[i]` in
-quant_rows) and leaves `t->kscale` for the caller to undo on the input. Its
-note: *"on the board this is one multiply a k before the pack"*. Nothing did
-it -- `kscale` appeared twelve times in npuquant.c and zero times in npudev.c.
-
-```
-  CHARSIU_NPU_AWQ off                     75.17
-  CHARSIU_NPU_AWQ=0.5, column means      10755.75
-  CHARSIU_NPU_AWQ=0.5, real |x| stats  65233808
-```
-
-The better the statistic, the worse the output: the signature of a factor
-nothing undoes, since a truer mean |x_k| gives a more extreme one.
-
-`charsiu_npu_matvec` applies it now. `charsiu_npu_matvec_group` refuses a
-tensor that carries one -- the whole point of that entry is that q, k and v
-share one packed input, and a per-tensor factor means per-tensor inputs.
-
-### Bug two: with the multiply in, it still collapsed -- and the CPU said it was not mine
-
-```
-  board, NPU, factor now applied   AWQ 0.5   2155726
-                                   AWQ 0.25     1103.80
-```
-
-⚠ The CPU reference path applies the factor too (`a->f[i] * t->kscale[i]`) and
-touches none of tonight's code. On the host:
-
-```
-  CPU reference, AWQ off        114.22
-  CPU reference, AWQ 0.5   7252312.56
-```
-
-**So it was broken in the quantiser, on every path, since it was written.**
-That is what made it debuggable: the host runs the same collapse in seconds.
-
-The factor is clamped to `[0.125, 8]` -- sixty-four fold. It DIVIDES the
-weights, so a k with f = 0.125 has its column multiplied by eight before
-rounding, and one such column sets vmax for the whole row: the int4 step for
-every other weight in that row goes eight times coarser. That is the shape of
-a collapse, not of a trade. Published AWQ keeps the factor near 1; the point is
-to protect a few salient channels, not to rescale the tensor.
-
-```
-  CPU reference, qwen3, 200 tokens, AWQ 0.5
-    off                    114.22
-    clamp [0.95, 1.05]     111.08     <- AWQ starts working
-    clamp [0.125, 8]  7252312.56      <- what it shipped as
-```
-
-`CHARSIU_NPU_AWQ_CLAMP` sets the bound, default 2.0.
-
-⚠ Both alpha and the clamp move the same quantity -- how far the factor may
-stray from 1 -- which is why alpha 0.25 was a thousand and alpha 0.5 was two
-million on the same clamp. The clamp is the direct control and the exponent
-should not be doing that job.
-
 ## 2026-09-07 late: AWQ was three bugs deep, and each was found by the layer under it
 
 ### 1. The factor was never applied to the activation
@@ -4932,6 +4873,27 @@ The CPU reference applies the factor itself and touches none of the npudev
 work. Both collapsed, so the bug was in the quantiser and had been since it
 was written -- which also made it debuggable in seconds on the host instead of
 minutes over a UART.
+
+The factor is clamped to `[0.125, 8]` -- sixty-four fold -- and it DIVIDES the
+weights, so a k with f = 0.125 has its column multiplied by eight before
+rounding, and one such column sets vmax for the whole row: the int4 step for
+every other weight in that row goes eight times coarser. That is the shape of a
+collapse, not of a trade, and published AWQ keeps the factor near 1. Narrowing
+the bound is what made the method do anything at all:
+
+```
+  CPU reference, qwen3, 200 tokens, AWQ 0.5
+    off                    114.22
+    clamp [0.95, 1.05]     111.08     <- AWQ starts working
+    clamp [0.125, 8]  7252312.56      <- what it shipped as
+```
+
+`CHARSIU_NPU_AWQ_CLAMP` sets the bound. ⚠ Both alpha and the clamp move the same
+quantity -- how far the factor may stray from 1 -- which is why alpha 0.25 was a
+thousand and alpha 0.5 was two million on the same clamp. ⛔ And "the clamp is
+the direct control" is only half of it: the factor has TWO bounds and the clamp
+acts only while it is the tighter one, which is 2026-09-10's finding and is what
+moved the default from 2.0 to 6.0.
 
 ### 3. The exponent was positive, and that is the whole method
 
@@ -6071,7 +6033,7 @@ exactly, and the arithmetic closes to within a tenth of a percent:
                       offset          size      expected      error
   metadata          0            7.3 MB       header + tokenizer
   fp16 embedding    7.3 MB     501.0 MB       128256 x 2048 x 2
-  fp16 SCALES     514.6 MB      11.2 MB       ?
+  fp16 SCALES     514.6 MB      11.2 MB       ⛔ WRONG, see below
   int4 layers     525.8 MB     463.8 MB       973 M x 0.5 = 464.0   -0.04%
   int8 head       989.6 MB     250.7 MB       263 M x 1   = 250.5   +0.10%
 ```
@@ -6080,37 +6042,21 @@ exactly, and the arithmetic closes to within a tenth of a percent:
 predicted -- so the scales are not interleaved with them, which the 0.26%
 nibble symmetry already implied and this confirms by size.
 
-**The scales are their own region and it is findable by what a scale IS.**
-Embeddings are symmetric about zero; a scale is positive. Sweeping the fraction
-of positive fp16 values walks from 49.9% to 99.4% at 514.6 MB, and the region
-from there to the int4 boundary is 11.203 MB -- 5,873,759 halves, 90 to 99%
-positive, magnitudes from 1e-7 to 1e-3, and about 300 distinct values in any
-64 KB.
+⛔ **The 11.2 MB band is NOT a scale array, and every reading this entry
+originally took off it -- "90 to 99% positive", "mostly powers of two", "an
+obvious period of four" -- is what `u64` REGISTER WRITES look like read as
+`fp16`.** See "the 11.2 MB fp16 SCALES region was the REGISTER COMMAND STREAM"
+below, and the corrected region map beside it. The tell was in this entry's own
+arithmetic: dividing the count by the weights gave group 165.7 or 210.4, neither
+an integer, and a non-integral group is also what "these are not scales" looks
+like.
 
-⚠ **Mostly powers of two.** `frexp` mantissas over 2000 samples: 0.5 in 80% of
-them, 0.75 in 12%, 1.0 in 5%. A scale quantised to a shift, not a free fp16.
+**The int4 and int8 boundaries above survive.** They were fixed by the
+nibble-half statistic rather than by the positive-fraction one and close to
+within a tenth of a percent, and the real scale region (fp32, 3.6 MB at
+508.47 MB) is found later by a statistic that discriminates.
 
-⚠⚠ **And it is not a flat array of one scale a group.** The tail has an
-obvious period of four:
-
-```
-  0.000488758   2.10156   3.75509e-06   1.78814e-07
-  0.000488758   2.10938   4.94719e-06   0
-  0.000488758   2.11719   ...
-```
-
-First slot constant, second drifting slowly, third and fourth small. Dividing
-the count by the weights gives group 165.7 or 210.4 depending on whether the
-head is included -- **neither is an integer**, which is the arithmetic saying
-the layout is a record and not an array.
-
-**So: the file is fully readable and the scales are located. What is left is a
-record format, not a search.** Whether the vendor's four-bit quantiser is
-better than charsiu's can be answered by decoding ONE tensor -- no tokenizer,
-no forward pass, no board -- and that is now a bounded piece of work rather
-than an open question.
-
-⚠ Everything above is structure and arithmetic. No vendor weight has been
+⚠ Everything here is structure and arithmetic. No vendor weight has been
 dequantised yet, and until one is, nothing here says anything about quality.
 
 ### ⚠ Round 158: the predictor's held-out extremes, and it fails at both ends
@@ -7421,11 +7367,9 @@ host says is that the knob is in the binary, that AWQ's perplexity is identical
 with it on and off (35.2041 both ways, so nothing leaked into the CPU path),
 and that arch_sanity is 8/8.
 
-**The round it needs**: `CHARSIU_NPU_AWQ=0.2` with `AWQ_SHARE` 0 and 1, on the
-board, same prompt. The tokens must be identical -- the arithmetic is unchanged
-either way -- and the stage table should show the group path taken instead of
-three single calls. If they are, AWQ stops costing decode and can be considered
-for default-on, which is worth 16% of perplexity on Llama and 35% on qwen3.
+🏁 **That round ran**, as arm 2 of `board_awq.sh` further down this file:
+`AWQ_SHARE` gives identical tokens and +2.9% decode, 13.92 -> 14.33 tok/s. The
+group can share one packed input, so AWQ no longer costs decode.
 
 ### ⛔ AWQ's factor was never applied on the batched path, and nothing refused
 
@@ -7934,22 +7878,18 @@ round, it is a plan for one.
 
 ### 🏁 The narrow output read: which tensors, and what share of the read
 
-⛔⛔ **RETRACTED — see "the narrow read was measured dead on 09-08" at the end
-of this file.** This section and the next treat a road that rounds 167-168 had
-already closed. Read them as documentation for `tools/out16_bound.c` and not
-as a plan.
+⛔⛔ **RETRACTED -- see "the narrow read was measured dead on 09-08" immediately
+below.** Rounds 167-168 had already closed this road: the width register bundle
+has exactly two values, 1 and 4, so there is no fp16 output to select at all,
+and the one byte width that IS selectable was measured at ppl 125.30 against
+43.66. What is kept here is the bound itself, which is `tools/out16_bound.c`'s
+output and is correct, and the two census bugs found writing it. Read it as the
+tool's documentation and not as a plan.
 
-The read is four bytes an output element, every K slice, every row of a
-prefill, because `job.acc_out` takes the raw int32 accumulator before the
-convert. Round 165 priced it at **0.94 ms a prefill row**; two bytes would be
-0.47. The int8 TTFT gap to the vendor is **0.67 ms a row**. The whole gap is
-inside one read width.
-
-The gate is a static property of the weights and `tools/out16_bound.c` is it.
-At int8 the group is the whole row, so the per-channel requant applies exactly
-the scale the CPU applies now and the hardware emits the value in units of the
-activation scale; every `|a_q| <= 127`, so a channel is bounded by
-`127 * sum_k |w[c][k]|`.
+The gate is a static property of the weights. At int8 the group is the whole
+row, so the per-channel requant applies exactly the scale the CPU applies now
+and the hardware emits the value in units of the activation scale; every
+`|a_q| <= 127`, so a channel is bounded by `127 * sum_k |w[c][k]|`.
 
 ```
   Llama-3.2-1B     100.0%   worst 0.80x   ffn_up
@@ -7959,15 +7899,13 @@ activation scale; every `|a_q| <= 127`, so a channel is bounded by
   Phi-3.5-mini      92.6%   ffn_down 20 of 32 OVER, worst 2.13x
 ```
 
-**Worth the board round, and it must be per-tensor.** A global switch breaks
-Phi-3.5, whose `blk.0.ffn_down` is 2.13x over -- and that is the tensor `job.c`
-already named for varying 2971x between tokens, without ever doing the
-arithmetic. Even there 92.6% of the read is narrow.
+A global switch would break Phi-3.5, whose `blk.0.ffn_down` is 2.13x over -- the
+tensor `job.c` already named for varying 2971x between tokens, without ever
+doing the arithmetic.
 
 ⚠ The bound is worst case: every `|a_q|` at 127 with every sign agreeing. Real
-activations run about a third of that, so Phi-3.5 would probably not overflow
--- and an overflow is an inf that destroys the token, so "probably" cannot gate
-it.
+activations run about a third of that, so Phi-3.5 would probably not overflow --
+and an overflow is an inf that destroys the token, so "probably" cannot gate it.
 
 ⚠ **Two bugs on the way, both the same shape, and both are why the tool prints
 a coverage percentage rather than a verdict.** It routed by SPELLING first -- a
@@ -7985,11 +7923,7 @@ the result.** Both of those printed a clean, plausible table.
 ### ⚠⚠ The second gate on a narrow read, and it applies to only one of the two widths
 
 ⛔ **Also retracted, except for the fp16-vs-int8 partial-sum distinction, which
-survives.** See the retraction at the end of this file.
-
-The first version of this entry said a narrow read cannot carry a partial sum.
-That is right for one width and wrong for the other, and the difference decides
-which of the two is worth chasing.
+survives.** See the retraction immediately below.
 
 What makes a K split free today is `acc_out`: the hardware writes the raw int32
 accumulator and the CPU adds the slices, so a tensor wider than KMAX costs
@@ -8006,8 +7940,7 @@ depends on whether its precision is **relative or absolute**.
          roundings add. A four-way split is nearer six bits than eight.
 ```
 
-And one byte is the one worth chasing — 0.70 ms a row against 0.47, on a gap of
-0.67 — so the split gate is the one that matters. At KMAX 2048:
+`tools/out16_bound.c --kmax N` prints both shares. At KMAX 2048:
 
 ```
                    under 65504    one K slice
@@ -8016,18 +7949,11 @@ And one byte is the one worth chasing — 0.70 ms a row against 0.47, on a gap o
   Phi-3.5-mini         87.8%          0.0%
 ```
 
-⚠⚠ **Phi-3.5 is zero, and that is a KMAX choice rather than a property of the
-model.** Its K is 3072 and every tensor is cut in two at 2048. At KMAX 4096 the
-same file reads **82.8%**. So the model with the worst TTFT in the table — 2764
-ms — gets nothing from a one-byte read at the shipped slice width and most of
-it at a wider one.
-
-⚠ And a wider KMAX is not free: the input surface ceiling is `(k/32) * m <=
-5120`, so K 2048 allows m 80 and K 4096 allows m 40. That is the vendor's own
-trade, from its own file, and it is now on both sides of a decision rather than
-just recorded.
-
-`tools/out16_bound.c --kmax N` prints both shares.
+⚠ Phi-3.5's zero is a KMAX choice and not a property of the model: its K is 3072
+and every tensor is cut in two at 2048, while at KMAX 4096 the same file reads
+82.8%. ⛔ Do not read that as a lead -- the retraction below prices a wider KMAX
+as a loss. And a wider KMAX is not free either: the input surface ceiling is
+`(k/32) * m <= 5120`, so K 2048 allows m 80 and K 4096 allows m 40.
 
 ### ⛔⛔ RETRACTION: the narrow read was measured dead on 09-08 and I reopened it
 
@@ -8378,16 +8304,18 @@ one kind that AWQ never helps anywhere.** A single global exponent cannot serve
 that, which is the whole case for a per-tensor one and is what the vendor does
 (0.00 to 0.40, typically 0.03 to 0.15).
 
-🔑 **`ffn_down` alone at 0.10 is 86.56 against 110.05, a 21% win from one kind
-— and it is SHARPLY PEAKED**: 0.05 gives 102.95 and 0.15 gives 103.77. A sweep
-at 0.05 spacing finds it; a sweep at 0.10 spacing steps over it. That is the
-concrete version of "a coarse grid over a non-smooth parameter cannot be
-interpolated", and it is worth 21% on one kind.
+⛔ **Everything in the 0.15, 0.25 and 0.40 columns of that table was measured
+through a BINDING CLAMP and is superseded** -- see "the per-kind table
+re-measured" below, where five of seven optima move and attn_k reverses. The
+0.05 and 0.10 columns re-measure identically, because `1000^0.10 = 2.0` and the
+clamp was not yet the tighter bound there, so what survives from this table is
+the left half of it.
 
-⚠ **`attn_k`: the honest reading is "never better than off", not "hurts".** Its
-best cell is 111.76 against 110.05 — 1.6%, which is not separable at this
-resolution. 118.61 at 0.15 is 7.8% worse and probably real. The distinction
-matters because "AWQ hurts attn_k" is the sort of sentence that becomes a rule.
+🔑 **From that surviving half: `ffn_down` alone at 0.10 is 86.56 against 110.05,
+a 21% win from one kind, and it is SHARPLY PEAKED** -- 0.05 gives 102.95. A
+sweep at 0.05 spacing finds it; a sweep at 0.10 spacing steps over it. That is
+the concrete version of "a coarse grid over a non-smooth parameter cannot be
+interpolated".
 
 ⚠ **And a per-kind optimum measured in isolation is not the optimum in
 combination.** Every row here is that kind alone against AWQ-off everywhere
@@ -8396,11 +8324,11 @@ cell of each row — which needs a knob that takes a per-kind alpha map, and tha
 does not exist yet.
 
 ▶ **Four of seven kinds have their WORST cell at exactly 0.15**, which is where
-the global curve's band is. Several independent kinds peaking at one exponent
-points at a common cause rather than seven coincidences; the candidate under
-test is the factor's clamp beginning to bind at a similar alpha across tensors
-that share activation statistics. If widening the clamp moves the band, that is
-the mechanism.
+the global curve's band is, and several independent kinds peaking at one
+exponent points at a common cause rather than seven coincidences. The candidate
+under test is the factor's clamp beginning to bind at a similar alpha across
+tensors that share activation statistics. The two entries below say it is: the
+clamp is a contributing cause, though not the whole one.
 
 ### 🏁🏁 The factor's CLAMP is costing 7 to 20% of AWQ, at the exponents anyone should use
 
@@ -9357,17 +9285,12 @@ a median with a 10% range beside it.
 
 ### ⚠ And a third independent sighting of the published margin
 
-The single-reading table in the same session, `REPEAT=1`:
-
-```
-  Qwen3      26.33 against 24.85   +6.0%
-  TinyLLAMA  22.68 against 19.71   +15.1%
-```
-
-against +5.8% and +16.1% on record, and +4.9% / +15.8% from the best of seven.
+The single-reading table in the same session, `REPEAT=1`, reads Qwen3 26.33
+against 24.85 (+6.0%) and TinyLLAMA 22.68 against 19.71 (+15.1%) -- against the
++5.8% and +16.1% on record and the +4.9% / +15.8% from the best of seven.
 **Three different ways of taking one number out of a bimodal sample all land on
 the high mode and all reproduce the published claim.** The median of seven puts
-both behind. Nothing about the code changed between them.
+both behind, and nothing about the code changed between them.
 
 ### 🏁🏁🏁 THE SWITCH IS CORE PLACEMENT, AND THE FAST MODE IS REACHABLE ON PURPOSE
 
@@ -9571,6 +9494,13 @@ number of matrices, on three nested subsets.
 shape, same monotone rise, consistently lower — which is what a different
 corpus and length do, and is why neither ladder is quotable without its
 protocol. **This one has one.**
+
+⛔ **"Rising with the number of matrices" did not survive the second passage.**
+On `tests/corpus/long2.txt` the same three rungs read 2.62 / 1.42 / 1.65 and put
+the 43-matrix rung at the top instead of the bottom -- see "THE LADDER IS NOT
+MONOTONE" at the end of this file. What survives is the direction, which holds
+in every cell of both passages, and an interval of 1.4x to 2.6x. No single
+figure from either ladder is quotable.
 
 ### 🏁 npu_mixed_test: ONE OPEN DEVICE RUNS BOTH PROGRAMS
 
@@ -10080,3 +10010,110 @@ both replace 43 matrices, both move away from the reference, and dividing the
 calibration out changes not one f16 weight on the rho = 1 subset. That is what
 the subset is FOR, so this is construction and not a null arm -- but it is one
 measurement printed as two agreeing ones, and the pack says so now.
+
+
+---
+
+## 2026-09-13/14 -- what rounds r393 to r411 overturned
+
+This notebook stops on 2026-09-12. Rounds r393 to r411 are logged in full in the
+driver repository under `board-logs/`. Four claims made above were withdrawn
+there by measurement, and they are listed here so that a reader who remembers
+one finds its refutation and not the claim.
+
+⛔ **"The vendor's quadratic term is six times smaller than ours" -- WITHDRAWN by
+r405.** It was least squares `a + b n + c n^2` over eight points a side, charsiu
+0.004483 against 0.000743. The fit does not determine its own `c`: the same
+configuration on two boots read `c` 0.004483 and 0.004974, an 11% swing from
+curves that agree to 3% point by point at seven of eight lengths, and the
+marginal slope gives a ratio of 1.60x from 200 tokens up and 19.1x from 100 up
+-- one point moving it twelve times. 🏁 **The direction survives and the
+magnitude does not**: our prefill grows faster with length than theirs, which is
+a statement about measured points and needs no fit. Everything r393 to r404
+aimed at that coefficient was aimed at a number nobody had determined.
+
+⛔ **"The vendor is 1.23x faster per prompt token" -- WITHDRAWN by r392/r393.**
+Two points a side, and N points always fit an N-parameter model. Eight points
+say the curve is convex, the ratio is not monotone in length, the two secants
+were taken over different intervals, and the sign was backwards.
+
+⛔ **"An int8 KV surface is worth 2.4x" -- WITHDRAWN by r407.** The two arms had
+different OUTPUT BYTE COUNTS, four bytes an output against one. Holding the
+width with `CHARSIU_WIDE8=0x3f`, same binary and boot, two passes, us a submit:
+
+```
+    shape             fp16 w    int8 w 1B out    int8 w 4B out
+    k=64   n=864     180/166       74/75          160/160
+    k=1024 n=64      103/103       71/70           71/70
+    k=1024 n=1024    402/409      233/244         281/282
+```
+
+**The scores shape is 1.04x, not 2.4x**; the values shape is real at 1.45x,
+where the output is 20 kB and the width cannot matter. That inverts the risk
+order the plan carried, since K was the clean surface that never repacks. ⚠ And
+r406 gates the surface's quality on the board, `tests/corpus/long.txt` (md5
+4237c8fc), Llama-3.2-1B Q4_0: KV int8 costs 0.2 to 0.4% of perplexity (40.9987
+-> 41.1458 CPU, 40.9213 -> 41.0076 NPU) and **KV int4 costs 38 to 53% and is
+dead**. The values row of that simulation is a LOWER BOUND on the damage: the
+coefficient buffer holds one scale per output channel, which there is a head_dim
+index shared across the context, and the simulation quantises the other axis.
+🔑 The cheap check that would have caught the 2.4x is printing both arms' byte
+counts.
+
+⛔ **"The vendor wins the prompt at long lengths" -- NOT TRUE as of r411.** Every
+scoreboard and TTFT gap above is a dated reading and stands as one; the standing
+conclusion built on them does not. The ladder with the shipping defaults, board
+to itself, three repeats a point, one warm-up discarded, against r393's measured
+ladder of the vendor's own runtime on this board:
+
+```
+    ch tok   ch ms      range   vn tok    vn ms   ratio
+        27     332   327..332       60    413.2   1.245
+        52     415   413..417       85    529.6   1.276
+       102     761   750..762      135    931.8   1.224
+       202    1400  1398..1401     235   1528.5   1.092
+       302    2131  2124..2134     335   2145.0   1.007
+       452    3059  3037..3179     485   3194.7   1.044
+       602    4115  4111..4156     635   4200.5   1.021
+       852    5953  5948..5959     885   6026.8   1.012
+```
+
+⚠⚠ **Three of the eight are inside the measured drift and read as LEVEL.** Their
+column needs their driver bound and cannot share a boot with ours, and r393 put
+the boot-to-boot drift of the same charsiu ladder at 2.2% at worst, so 302
+(+0.7%), 602 (+2.1%) and 852 (+1.2%) sit inside it. The statement that survives
+is **the vendor no longer wins at any measured prompt length**, clearly ahead
+below 250 tokens and at 452, level from 302 up. ⚠ Their chat template costs a
+constant 33 tokens at every length, so each row is the same input text. 852 went
+8081 -> 7016 -> 6818 -> 6328 -> 5953 across r393, r408, r410 and r411's two
+halves, and decode did not pay for it (18.15 tok/s against 18.06).
+
+⛔ **"`CHARSIU_NPU_DEFER_READ` is wrong on five models of nine" -- WITHDRAWN by
+r411**, twice over. The count itself was not a measurement, and the fault was one
+line: `npu_matmul_inner` ended with the per channel tail scale --
+
+```
+    if (!w4_for(g, e->t) || !tensor_grouped(g, e->t))
+            Y[r*n + j] *= e->t->scale[j];
+```
+
+-- which with `defer` ran before the read had happened, so it scaled whatever `Y`
+held from the previous call and the deferred gather then overwrote `Y` with
+values that were never scaled at all. 🔑 Llama-3.2-1B Q4_0 is grouped w4 in every
+tensor and skips that block entirely, which is why every speed round agreed; the
+models it touched are the four with a tensor the grouping does not cover. With
+the scale moved into `npu_flush_pending` the knob is **on by default since
+r411**: 9 of 9 identical with it on and 9 of 9 with it off, worth 326 ms of an
+852 token prompt. ⚠ Its spread is wider than the arms around it, 5999..6375
+against a base of 6352..6361, because the gather now races the hardware for
+memory.
+
+⛔ **And one road closed rather than overturned.** The named target after r407 is
+the int4 readback, and the gather exists because that accumulator comes back
+permuted. r410 asked whether any register makes the hardware write it flat, the
+way fp16 does: **none does.** `0x4028` is inert on the int4 path and the
+`0x401c`/`0x4020` pair actively breaks it, because those are write masks; all
+four `CHARSIU_W4_F16DPU` arms are wrong and the positive control fired. ⭐ What
+is not closed is the M axis itself -- nothing has read the int4 accumulator
+order at m > 1 against a known answer, the way `npu_fp16_test --outmap` does for
+fp16.

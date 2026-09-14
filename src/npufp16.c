@@ -54,6 +54,9 @@ struct charsiu_fp16 {
 	/* ⚠ THE ARITHMETIC, so "the hardware is the wall" is a reading
 	 * and not a division somebody did in a report. sum of m*k*n. */
 	unsigned long long macs;
+	/* how often the register streams had to be rebuilt, against how often
+	 * the same bytes were already there */
+	unsigned long long emitbuilt, emitskip;
 	/* which handle this is, when a caller runs more than one -- the
 	 * attention mirror runs two, one a matmul, so that two stage tables
 	 * in a log can be told apart */
@@ -64,6 +67,32 @@ struct charsiu_fp16 {
 	unsigned gen, coef_gen, ncoef;
 	unsigned coefn[FP16_GROUP_MAX];
 	size_t coefoff[FP16_GROUP_MAX], coefsz_[FP16_GROUP_MAX];
+	/*
+	 * ⭐ THE REGISTER STREAMS, WHICH ARE THE SAME BYTES EVERY LAYER.
+	 *
+	 * charsiu_emit_job depends on the shape and on four addresses, and a
+	 * layer of attention asks for the same shapes at the same offsets in
+	 * buffers that have not moved -- sixteen layers and eleven chunks of
+	 * one prompt, 32 ops a group, all identical. At 852 tokens that was
+	 * 56 ms of rebuilding streams byte for byte, plus a prep and a fini of
+	 * the register buffer around it.
+	 *
+	 * Same shape as the coefficient cache above and keyed the same way:
+	 * f->gen covers the buffers moving, and the per op signature covers
+	 * everything else emit_job reads.
+	 *
+	 * 🏁 171 of 176 groups on the values handle and 165 of 176 on the
+	 * scores one, emit 28 -> 10 ms and 29 -> 11. The misses are the chunk
+	 * boundaries, where the prompt's extent changes the shape.
+	 *
+	 * CHARSIU_FP16_REGCACHE=0 rebuilds every stream, which is the control.
+	 */
+	struct {
+		unsigned m, k, n;
+		uint32_t in, out, wt, coef;
+		size_t nreg;
+	} regsig[FP16_GROUP_MAX];
+	unsigned reg_gen, nregsig;
 	/* the last group's layout, and whether its output buffer is still
 	 * held open for a caller reading the answers where they lie */
 	struct charsiu_fp16_plan last;
@@ -78,6 +107,23 @@ struct charsiu_fp16 {
 	 */
 	unsigned pm[FP16_GROUP_MAX], pn[FP16_GROUP_MAX];
 	int prepoisoned;
+	/*
+	 * ⭐ ONE GROUP IN FLIGHT, which is what lets a caller do CPU work
+	 * between the submit and the fence.
+	 *
+	 * The fence is a sleeping ioctl, so every millisecond of it is four
+	 * idle cores; the softmax between the two attention groups is the
+	 * mirror image, NPU idle. Splitting this function in two lets a caller
+	 * hold two units and interleave them. The ops are COPIED because the
+	 * caller's array is usually a local that goes out of scope -- the
+	 * buffers they point AT must still be alive at the wait.
+	 */
+	struct charsiu_fp16_plan inpl;
+	struct charsiu_fp16_op inops[FP16_GROUP_MAX];
+	unsigned innops;
+	int invec, inflight;
+	unsigned long abandoned;
+	double intcall, intprev;
 };
 
 static double now_ms(void)
@@ -393,6 +439,40 @@ static void fp16_pack_ops(void *ctx, uint64_t i0, uint64_t n)
 
 		if (nel > cap)
 			nel = cap;
+		if (op->fill) {
+			/* ⭐ the caller writes the halves; this still owns the
+			 * offsets, the bound and the causal tail, so xtri0
+			 * means exactly what it means on the converting path */
+			size_t e = 0;
+
+			for (unsigned r = 0; r < op->m && e < nel; r++) {
+				size_t cn = op->k, keep;
+
+				if (cn > nel - e)
+					cn = nel - e;
+				keep = cn;
+				if (tri) {
+					keep = (size_t)op->xtri0 + r;
+					if (keep > cn)
+						keep = cn;
+				}
+				if (keep < cn) {
+					memset(d + e + keep, 0,
+					       (cn - keep) * 2);
+					sk += cn - keep;
+				}
+				op->fill(op->fill_ctx, d + e, (unsigned)i, r,
+					 (unsigned)keep);
+				e += cn;
+			}
+			c->el[i] = nel;
+			c->sk[i] = sk;
+			/* ⚠ the same slack the converting path zeroes below:
+			 * the CBUF reads past what a matmul writes */
+			memset(d + nel, 0,
+			       charsiu_fp16_up4k(c->pl->isz[i]) - nel * 2);
+			continue;
+		}
 		if (xs == op->k && !tri) {
 			pack_run(c->vec, d, X, nel);
 		} else {
@@ -564,6 +644,9 @@ static void fp16_report(const struct charsiu_fp16 *f)
 		f->t.plan, f->t.wcopy, f->t.pack, f->t.psync, f->t.coefs,
 		f->t.emit, f->t.poison, f->t.submit, f->t.fence, f->t.read,
 		f->t.other);
+	if (f->abandoned)
+		fprintf(stderr, "charsiu fp16:  ⚠ %lu groups were submitted"
+			" and never waited on\n", f->abandoned);
 	if (f->partial)
 		fprintf(stderr, "charsiu fp16:  ⛔ %llu ROWS WERE NEVER"
 			" WRITTEN by a job that wrote others\n", f->partial);
@@ -591,6 +674,10 @@ static void fp16_report(const struct charsiu_fp16 *f)
 		fprintf(stderr, "charsiu fp16:  the sentinels were already in"
 			" the buffer for %llu of %llu groups\n", f->preskip,
 			f->preskip + f->prewrote);
+	if (f->emitbuilt || f->emitskip)
+		fprintf(stderr, "charsiu fp16:  the register streams were"
+			" already there for %llu of %llu groups\n",
+			f->emitskip, f->emitskip + f->emitbuilt);
 	if (f->trisk)
 		fprintf(stderr, "charsiu fp16:  %llu of them memset as the"
 			" causal tail (%.0f%%)\n", f->trisk,
@@ -707,6 +794,9 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
 		 * whatever the single call left there -- a wrong number with
 		 * nothing anywhere reporting an error. */
 		f->ncoef = 0;
+		/* ⚠ AND THE REGISTER STREAMS FOR THE SAME REASON. This call
+		 * emits its own stream over the group's first slot. */
+		f->nregsig = 0;
 	}
 
 	job.input_addr = (uint32_t)f->in.dma_address;
@@ -787,13 +877,40 @@ int charsiu_fp16_matmul(struct charsiu_fp16 *f, const float *X, unsigned m,
  * straight into the buffer pays none of it -- and the times below name it
  * separately so the next round can see what is left after it goes.
  */
-int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
-			      const struct charsiu_fp16_op *ops, unsigned nops)
+/*
+ * ⭐ ALLOCATE FOR THE WIDEST SHAPE ONCE, INSTEAD OF GROWING INTO IT.
+ *
+ * want() only grows, so a caller whose shapes get bigger reallocates all five
+ * buffers every time -- five buffer objects, one of them 21 MB for the
+ * attention scores, mmap and first touch included. At 852 tokens the scores
+ * unit spent 73 ms in `plan`, which is where that lands, for about five
+ * growths in the first layer of each prompt chunk; every later layer runs the
+ * same shapes and grows nothing.
+ *
+ * ⚠ IT ONLY EVER MAKES THE BUFFERS BIGGER, and it does not poison, submit or
+ * touch `last`: it is the allocation half of a call and nothing else. A caller
+ * that reserves a shape it never runs has wasted memory and changed no answer.
+ */
+int charsiu_fp16_reserve(struct charsiu_fp16 *f,
+			 const struct charsiu_fp16_op *ops, unsigned nops)
+{
+	struct charsiu_fp16_plan pl;
+
+	if (!f || charsiu_fp16_make_plan(ops, nops, &pl))
+		return -1;
+	return want(f, pl.wtot + 4096, pl.itot + 4096, pl.otot + 4096,
+		    pl.ctot + 4096,
+		    (size_t)nops * FP16_REG_STRIDE + 4096);
+}
+
+int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
+				     const struct charsiu_fp16_op *ops,
+				     unsigned nops)
 {
 	struct charsiu_job job[FP16_GROUP_MAX];
 	struct charsiu_task task[FP16_GROUP_MAX];
 	struct charsiu_fp16_plan pl;
-	unsigned i, bad = 0, borrowed = 0;
+	unsigned i;
 	int prepoisoned = 0;
 	struct charsiu_joblist jl;
 	uint32_t ins[3 + FP16_GROUP_MAX], outs[1];
@@ -808,6 +925,22 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	tprev = f->t.plan + f->t.wcopy + f->t.pack + f->t.psync + f->t.coefs
 	      + f->t.emit + f->t.poison + f->t.submit + f->t.fence + f->t.read;
 	t0 = tcall;
+	/*
+	 * ⚠⚠ A JOB STILL IN FLIGHT OWNS THIS BUFFER. Since the group split,
+	 * a caller that gives up between submit() and wait() -- every
+	 * `fallbacks++; return -1` in the attention layer does -- leaves the
+	 * hardware writing into the output buffer this call is about to
+	 * re-plan. Wait it out and throw the answers away: the caller that
+	 * abandoned them has already fallen back to the CPU for that layer.
+	 */
+	if (f->inflight) {
+		charsiu_bo_prep(f->dev, &f->ob, 1000000000);
+		charsiu_bo_fini(f->dev, &f->ob);
+		f->inflight = 0;
+		f->held = 0;
+		f->prepoisoned = 0;
+		f->abandoned++;
+	}
 	/* a previous group's answers are still being read out of the buffer
 	 * this is about to overwrite */
 	charsiu_fp16_release(f);
@@ -824,7 +957,9 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		 * answer stays in the device buffer and charsiu_fp16_out
 		 * points at it. Refusing it here made the whole feature
 		 * unreachable and the probe's own arm is what said so. */
-		if (!o->X || (!o->W && !o->Wbuf)) {
+		/* ⚠ X may be NULL when the caller fills the surface itself,
+		 * and only then: a NULL X with no fill is a missing argument */
+		if ((!o->X && !o->fill) || (!o->W && !o->Wbuf)) {
 			f->refused++;
 			return -1;
 		}
@@ -901,8 +1036,34 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	f->t.wcopy += now_ms() - t0;
 
 	/* row major, [m][k], which is what --inslots measured slot by slot */
+	/*
+	 * ⚠ THE PREP ON THE INPUT IS AN INVALIDATE FOR A BUFFER THE HARDWARE
+	 * ONLY EVER READS.
+	 *
+	 * attn_npu_layer already makes this argument for the KV surfaces --
+	 * "No prep: the hardware only ever reads these, so the CPU's copy is
+	 * never stale and there is nothing to invalidate" -- and the input
+	 * surface is the same kind of buffer. What the prep also does is wait
+	 * on the buffer's fence, and that wait is already over: the previous
+	 * group's own fence ran before this call started.
+	 *
+	 * It is not free. The sync is charged on the WHOLE buffer object and
+	 * `want` grows it and never shrinks it, so at 852 tokens the values
+	 * group's two syncs were 112 ms of 877.
+	 *
+	 * 🏁 OFF BY DEFAULT, AND THE BOARD SAID SO. 852 tokens, the two fp16
+	 * handles, arms alternating: psync 111 -> 62 on the values group and
+	 * 18 -> 11 on the scores one, 56 ms. The pack pays 13 of that back,
+	 * because it now takes the cache misses the invalidate used to absorb,
+	 * so the net is about 43 ms. All nine models on the card are identical
+	 * to their token loops with fp16 attention forced on, which is the
+	 * check that matters for a cache maintenance change.
+	 *
+	 * CHARSIU_FP16_IN_PREP=1 puts it back.
+	 */
 	t0 = now_ms();
-	charsiu_bo_prep(f->dev, &f->in, 1000000000);
+	if (charsiu_env_flag("CHARSIU_FP16_IN_PREP", 0))
+		charsiu_bo_prep(f->dev, &f->in, 1000000000);
 	f->t.psync += now_ms() - t0;
 	t0 = now_ms();
 	{
@@ -997,22 +1158,95 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	f->t.coefs += now_ms() - t0;
 
 	t0 = now_ms();
-	charsiu_bo_prep(f->dev, &f->reg, 1000000000);
-	for (i = 0; i < nops; i++) {
-		size_t nreg = charsiu_emit_job(&job[i],
-			(uint64_t *)((uint8_t *)f->reg.map
-				     + (size_t)i * FP16_REG_STRIDE),
-			FP16_REG_STRIDE / 8);
+	{
+		/*
+		 * ⚠ THE WEIGHT ADDRESS IS NOT IN THE SIGNATURE, and that is
+		 * the whole reason this cache pays.
+		 *
+		 * Every other field repeats across a chunk's sixteen layers;
+		 * the KV surface does not, because each layer has its own. A
+		 * cache that required it too hit 0 of 176 groups, measured.
+		 * charsiu_patch_weight_addr rewrites the one word that carries
+		 * it, and tests/patch_waddr.c requires the result to be byte
+		 * for byte what emit_job would have produced -- at every shape
+		 * attention runs and all three weight dtypes.
+		 */
+		int stale = !charsiu_env_flag("CHARSIU_FP16_REGCACHE", 1) ||
+			    f->reg_gen != f->gen || f->nregsig != nops;
+		int patched = 0;
 
-		if (!nreg) {
-			charsiu_bo_fini(f->dev, &f->reg);
-			return -1;
+		for (i = 0; !stale && i < nops; i++)
+			stale = f->regsig[i].m != job[i].mm.m ||
+				f->regsig[i].k != job[i].mm.k ||
+				f->regsig[i].n != job[i].mm.n ||
+				f->regsig[i].in != job[i].input_addr ||
+				f->regsig[i].out != job[i].output_addr ||
+				f->regsig[i].coef != job[i].coef_addr;
+		if (!stale) {
+			for (i = 0; i < nops; i++)
+				patched += f->regsig[i].wt
+					!= job[i].weight_addr;
+			if (patched) {
+				charsiu_bo_prep(f->dev, &f->reg, 1000000000);
+				for (i = 0; i < nops; i++) {
+					uint64_t *st;
+
+					if (f->regsig[i].wt ==
+					    job[i].weight_addr)
+						continue;
+					st = (uint64_t *)((uint8_t *)f->reg.map
+						+ (size_t)i * FP16_REG_STRIDE);
+					/* ⚠ exactly one word, or give up and
+					 * emit: the test says one, and a
+					 * stream that disagrees is not one
+					 * this code has ever seen */
+					if (charsiu_patch_weight_addr(st,
+						f->regsig[i].nreg,
+						job[i].weight_addr) != 1) {
+						stale = 1;
+						break;
+					}
+					f->regsig[i].wt = job[i].weight_addr;
+				}
+				charsiu_bo_fini(f->dev, &f->reg);
+			}
 		}
-		task[i].regcmd = (uint32_t)f->reg.dma_address
-			       + (uint32_t)(i * FP16_REG_STRIDE);
-		task[i].regcmd_count = (uint32_t)nreg;
+		if (stale) {
+			charsiu_bo_prep(f->dev, &f->reg, 1000000000);
+			for (i = 0; i < nops; i++) {
+				size_t nreg = charsiu_emit_job(&job[i],
+					(uint64_t *)((uint8_t *)f->reg.map
+						     + (size_t)i
+						     * FP16_REG_STRIDE),
+					FP16_REG_STRIDE / 8);
+
+				if (!nreg) {
+					charsiu_bo_fini(f->dev, &f->reg);
+					f->nregsig = 0;
+					return -1;
+				}
+				f->regsig[i].m = job[i].mm.m;
+				f->regsig[i].k = job[i].mm.k;
+				f->regsig[i].n = job[i].mm.n;
+				f->regsig[i].in = job[i].input_addr;
+				f->regsig[i].out = job[i].output_addr;
+				f->regsig[i].wt = job[i].weight_addr;
+				f->regsig[i].coef = job[i].coef_addr;
+				f->regsig[i].nreg = nreg;
+			}
+			charsiu_bo_fini(f->dev, &f->reg);
+			f->nregsig = nops;
+			f->reg_gen = f->gen;
+			f->emitbuilt++;
+		} else {
+			f->emitskip++;
+		}
+		for (i = 0; i < nops; i++) {
+			task[i].regcmd = (uint32_t)f->reg.dma_address
+				       + (uint32_t)(i * FP16_REG_STRIDE);
+			task[i].regcmd_count = (uint32_t)f->regsig[i].nreg;
+		}
 	}
-	charsiu_bo_fini(f->dev, &f->reg);
 	f->t.emit += now_ms() - t0;
 
 	/*
@@ -1109,6 +1343,40 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 		f->macs += (unsigned long long)ops[i].m * ops[i].k * ops[i].n;
 	f->t.submit += now_ms() - t0;
 
+	/* everything the wait needs that this half computed */
+	f->inpl = pl;
+	memcpy(f->inops, ops, nops * sizeof(*ops));
+	f->innops = nops;
+	f->invec = vec;
+	f->intcall = tcall;
+	f->intprev = tprev;
+	f->inflight = 1;
+	return 0;
+}
+
+/*
+ * The other half: the fence, the readback and the bookkeeping. A unit with
+ * nothing in flight returns -1 rather than waiting on whatever the buffer
+ * last held.
+ */
+int charsiu_fp16_matmul_group_wait(struct charsiu_fp16 *f)
+{
+	const struct charsiu_fp16_op *ops;
+	struct charsiu_fp16_plan pl;
+	unsigned i, nops, bad = 0, borrowed = 0;
+	double t0, tcall, tprev;
+	int vec;
+
+	if (!f || !f->inflight)
+		return -1;
+	f->inflight = 0;
+	ops = f->inops;
+	pl = f->inpl;
+	nops = f->innops;
+	vec = f->invec;
+	tcall = f->intcall;
+	tprev = f->intprev;
+
 	t0 = now_ms();
 	charsiu_bo_prep(f->dev, &f->ob, 1000000000);   /* the one fence wait */
 	f->t.fence += now_ms() - t0;
@@ -1149,6 +1417,14 @@ int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
 	return 0;
 }
 
+int charsiu_fp16_matmul_group(struct charsiu_fp16 *f,
+			      const struct charsiu_fp16_op *ops, unsigned nops)
+{
+	if (charsiu_fp16_matmul_group_submit(f, ops, nops))
+		return -1;
+	return charsiu_fp16_matmul_group_wait(f);
+}
+
 /*
  * The answer of op i, where the hardware left it: m by n floats, row major,
  * valid until the next call or charsiu_fp16_release. NULL if op i was given a
@@ -1176,6 +1452,19 @@ float *charsiu_fp16_out_w(struct charsiu_fp16 *f, unsigned i)
 	if (!f || !f->held || i >= f->last.nops)
 		return NULL;
 	return (float *)((uint8_t *)f->ob.map + f->last.ooff[i]);
+}
+
+/* the hardware is done with the output buffer and nothing was read out of it */
+void charsiu_fp16_drain(struct charsiu_fp16 *f)
+{
+	if (f && f->inflight) {
+		charsiu_bo_prep(f->dev, &f->ob, 1000000000);
+		charsiu_bo_fini(f->dev, &f->ob);
+		f->inflight = 0;
+		f->held = 0;
+		f->prepoisoned = 0;
+		f->abandoned++;
+	}
 }
 
 void charsiu_fp16_release(struct charsiu_fp16 *f)

@@ -129,6 +129,15 @@ struct charsiu_matmul {
  * at zero: they are patched in at submit time, and a stream with none in it is
  * directly comparable against one read out of a vendor model file.
  */
+/*
+ * Rewrite the weight address inside an emitted stream, which is the only word
+ * that differs between two dispatches of one shape over different KV surfaces.
+ * Returns how many words changed; a caller that does not get exactly one
+ * should emit from scratch. tests/patch_waddr.c requires the result to be
+ * byte-identical to emitting with that address in the first place.
+ */
+unsigned charsiu_patch_weight_addr(uint64_t *stream, size_t n, uint32_t addr);
+
 size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 			   uint64_t *out, size_t max);
 
@@ -346,11 +355,41 @@ static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
 	for (; e < n; e++)
 		d[e] = charsiu_f2h(x[e]);
 }
+
+/*
+ * The same run, scaled on the way. A softmax that normalises in place and then
+ * converts walks its scratch twice; this is the two loops as one, and it is
+ * bit identical because a float32 multiply stored and reloaded is the same
+ * float32 multiply.
+ */
+static inline void charsiu_f2h_scale_run(uint16_t *d, const float *x, size_t n,
+					 float sc)
+{
+	float32x4_t v = vdupq_n_f32(sc);
+	size_t e = 0;
+
+	for (; e + 8 <= n; e += 8)
+		vst1q_u16(d + e,
+			  vcombine_u16(charsiu_f2h_x4(
+					       vmulq_f32(vld1q_f32(x + e), v)),
+				       charsiu_f2h_x4(
+					       vmulq_f32(vld1q_f32(x + e + 4),
+							 v))));
+	for (; e < n; e++)
+		d[e] = charsiu_f2h(x[e] * sc);
+}
 #else
 static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
 {
 	for (size_t e = 0; e < n; e++)
 		d[e] = charsiu_f2h(x[e]);
+}
+
+static inline void charsiu_f2h_scale_run(uint16_t *d, const float *x, size_t n,
+					 float sc)
+{
+	for (size_t e = 0; e < n; e++)
+		d[e] = charsiu_f2h(x[e] * sc);
 }
 #endif
 
@@ -374,6 +413,9 @@ static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
  */
 void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
 			    const float *k);
+/* the same packing at a longer reduction extent, by block copy; 0 or -1 */
+int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
+			      unsigned kv_old, unsigned hd, unsigned live);
 void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
 			    const float *v);
 

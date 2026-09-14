@@ -46,6 +46,8 @@
 # interpolating inside each curve, never by lining the rows up.
 #
 #   sh tests/board_ttft_curve.sh
+. "$(dirname "$0")/board_clk.sh"
+NPUCLK=$(npu_clk) || exit 1
 set -u
 
 REPEAT=${TC_REPEAT:-3}
@@ -83,7 +85,7 @@ fi
 echo "== TTFT against prompt length"
 echo "   runtime   $ARM"
 echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
-echo "   npu clk   $(cat /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate 2>/dev/null) Hz"
+echo "   npu clk   $NPUCLK Hz"
 echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz, governor $(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_governor)"
 if [ "$ARM" = charsiu ]; then
 	echo "   binary    $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"

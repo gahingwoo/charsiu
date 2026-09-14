@@ -17,10 +17,13 @@ P="${2:-The capital of France is}"
 N=32
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NEON="$ROOT/build/charsiu_run"
-SCAL="$ROOT/build/charsiu_run_scalar"
+# ⚠ SAME REASON AS arch_sanity.sh: the models are on the board and the board has
+# no compiler, so both binaries may be handed in instead of built.
+NEON="${CHARSIU_RUN:-$ROOT/build/charsiu_run}"
+SCAL="${CHARSIU_RUN_SCALAR:-$ROOT/build/charsiu_run_scalar}"
 
-make -C "$ROOT" build/charsiu_run build/charsiu_run_scalar >/dev/null
+[ -n "${CHARSIU_RUN:-}${CHARSIU_RUN_SCALAR:-}" ] || \
+	make -C "$ROOT" build/charsiu_run build/charsiu_run_scalar >/dev/null
 
 bad=0
 for m in "$DIR"/*.gguf; do
