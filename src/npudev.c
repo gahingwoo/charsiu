@@ -674,8 +674,20 @@ struct charsiu_npu {
 		 */
 		float *bd1;
 		size_t bd1_n;
+		/*
+		 * ⭐ THE ORACLE. CHARSIU_NPU_DEFER_CHECK=1 gathers the answer
+		 * TWICE: once at the moment of deferring, with the state the
+		 * plain path would have used, into `shadow`; and once at the
+		 * flush, the deferred way, into Y. Then it compares. A
+		 * pass/fail count over a model suite says five of nine are
+		 * wrong; this says which tensor, which row, which channel and
+		 * by how much.
+		 */
+		float *shadow;
+		size_t shadow_n;
 		int live;
 	} pend;
+	unsigned long defer_bad;
 	unsigned long bdefer_n, bdefer_done;
 	double balloc_us;	/* the output BO allocation, inside prep */
 	unsigned balloc_n;
@@ -2014,6 +2026,7 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 
 static int npu_flush_pending(struct charsiu_npu *g);
 static int defer_read_on(void);
+static int defer_check(void);
 
 /*
  * ⚠ THE BISECTION. CHARSIU_NPU_DEFER_READ selects WHERE the previous tensor's
@@ -2042,6 +2055,10 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	/* ⚠ a deferred gather owns a buffer this is about to free, and the
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
+	if (g->defer_bad)
+		fprintf(stderr, "charsiu: ⛔ the deferred gather differed on"
+			" %lu tensors\n", g->defer_bad);
+	free(g->pend.shadow);
 	free(g->pend.bseen);
 	free(g->pend.bd1);
 	g->pend.bd1 = NULL;
@@ -5707,6 +5724,32 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	 * DEFERRING call with Y still unwritten. This is the moment it
 	 * belongs at: the gather above has just filled Y. */
 	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m);
+	if (defer_check() && g->pend.shadow) {
+		size_t n = (size_t)g->pend.m * g->pend.e->t->n, i;
+
+		if (n > g->pend.shadow_n)
+			n = g->pend.shadow_n;
+		for (i = 0; i < n; i++) {
+			float a = g->pend.Y[i], b = g->pend.shadow[i];
+			float d = a - b < 0 ? b - a : a - b;
+			float s2 = (a < 0 ? -a : a) + (b < 0 ? -b : b);
+
+			if (d > 1e-4f * (s2 > 1.0f ? s2 : 1.0f)) {
+				if (g->defer_bad < 8)
+					fprintf(stderr, "charsiu: the deferred"
+						" gather differs at tensor"
+						" k=%u n=%u, row %u channel"
+						" %u: %g against %g\n",
+						(unsigned)g->pend.e->t->k,
+						(unsigned)g->pend.e->t->n,
+						(unsigned)(i / g->pend.e->t->n),
+						(unsigned)(i % g->pend.e->t->n),
+						(double)a, (double)b);
+				g->defer_bad++;
+				break;
+			}
+		}
+	}
 	g->obuf[g->pend.obi].pending = 0;
 	g->pend.live = 0;
 	g->bdefer_done++;
@@ -6591,6 +6634,44 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		if (!defer && batch_read_device(g, e, ob, d, Y, m))
 			return -1;
 	}
+	/*
+	 * ⭐ THE REFERENCE GATHER, taken here because here is where the plain
+	 * path would have taken it: same bseen, same bout_stride, same bd1,
+	 * same everything. The flush compares its own answer against this one
+	 * and names the first element that differs.
+	 */
+	if (defer && defer_check()) {
+		size_t want = (size_t)m * e->t->n;
+		unsigned char *sv = malloc(g->bseen_n ? g->bseen_n : 1);
+
+		if (sv && g->pend.shadow_n < want) {
+			float *t4 = realloc(g->pend.shadow,
+					    want * sizeof(*t4));
+
+			if (t4) {
+				g->pend.shadow = t4;
+				g->pend.shadow_n = want;
+			}
+		}
+		if (sv && g->pend.shadow_n >= want) {
+			unsigned d2;
+
+			memcpy(sv, g->bseen, g->bseen_n);
+			/* ⚠ START FROM WHAT Y HOLDS. The gather assigns on
+			 * the first write to a range and accumulates after,
+			 * so anything no range covers stays whatever was
+			 * there -- and Y will keep the same stale bytes. A
+			 * shadow that started from zero would differ there
+			 * for a reason that is not the bug. */
+			memcpy(g->pend.shadow, Y, want * sizeof(float));
+			for (d2 = 0; d2 < g->ndev; d2++)
+				batch_read_device(g, e, ob, d2,
+						  g->pend.shadow, m);
+			tail_scale_apply(g, e, g->pend.shadow, m);
+			memcpy(g->bseen, sv, g->bseen_n);
+		}
+		free(sv);
+	}
 	if (defer) {
 		/* ⚠ A SNAPSHOT, not a pointer: the next call resets g->bseen */
 		if (g->bseen_n > g->pend.bseen_n) {
@@ -6721,6 +6802,16 @@ static int reuse_enabled(void)
  *
  * CHARSIU_NPU_DEFER_READ=0 makes this the plain call, which is the control.
  */
+/* the oracle beside the deferral; see the note over pend.shadow */
+static int defer_check(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_DEFER_CHECK", 0);
+	return v;
+}
+
 static int defer_read_on(void)
 {
 	static int v = -1;
