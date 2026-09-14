@@ -64,6 +64,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # board and the board has no compiler, so a script that builds before it checks
 # is a check that cannot run on the only machine that has something to check.
 RUN="${CHARSIU_RUN:-$ROOT/build/charsiu_run}"
+# ⚠⚠ AND charsiu_check THE SAME WAY, WHICH IT WAS NOT. This resolved only
+# $ROOT/build/charsiu_check, and on the board there is no tree -- the binaries
+# live in /opt/charsiu. So `arch` was EMPTY on every row and the architecture
+# column, the one this whole section is named after, printed `?` on the only
+# machine where the check means anything. Look next to whichever charsiu_run we
+# were given first, then fall back to the tree.
+CHECK="${CHARSIU_CHECK:-}"
+[ -n "$CHECK" ] || { _d=$(dirname "$RUN"); [ -x "$_d/charsiu_check" ] && CHECK="$_d/charsiu_check"; }
+[ -n "$CHECK" ] || CHECK="$ROOT/build/charsiu_check"
 
 PROMPT="The capital of France is"
 WANT="Paris"
@@ -80,14 +89,17 @@ WANT="Paris"
 
 bad=0
 n=0
+archs=""
+archs_ok=""
 for m in "$DIR"/*.gguf; do
 	[ -e "$m" ] || continue
 	n=$((n + 1))
 	# ⚠ ONLY ON "OK". charsiu_check's refusals start with NO and put a
 	# reason in the second field, so an unconditional $2 labels a rejected
 	# file with a fragment of the sentence explaining why.
-	arch=$("$ROOT/build/charsiu_check" -q "$m" 2>/dev/null |
+	arch=$("$CHECK" -q "$m" 2>/dev/null |
 	       awk '$1 == "OK" { print $2 }')
+	archs="$archs ${arch:-?}"
 	out=$("$RUN" "$m" -p "$PROMPT" -n 24 -c 512 -q 2>/dev/null | head -1)
 	case "$out" in
 	*"$WANT"*)
@@ -106,6 +118,7 @@ for m in "$DIR"/*.gguf; do
 			esac
 		fi
 		printf 'ok   %-16s %s\n' "${arch:-?}" "$(basename "$m")"
+		archs_ok="$archs_ok ${arch:-?}"
 		;;
 	*)
 		printf 'BAD  %-16s %s\n' "${arch:-?}" "$(basename "$m")"
@@ -119,5 +132,16 @@ if [ "$n" -eq 0 ]; then
 	echo "no gguf in $DIR"
 	exit 1
 fi
-echo "$((n - bad))/$n knew the capital of France"
+# ⚠⚠ FILES AND ARCHITECTURES ARE DIFFERENT COUNTS, and this printed only the
+# first while being quoted as the second. The stable merge at 0c85c71 says
+# "7/7 architectures"; seven is the number of GGUF FILES in /opt/vendor/models,
+# and five architectures cover them. Print both, and say which is which.
+na=$(printf '%s\n' $archs | grep -v '^?$' | sort -u | wc -l)
+nk=$(printf '%s\n' $archs_ok | grep -v '^?$' | sort -u | wc -l)
+nq=$(printf '%s\n' $archs | grep -c '^?$' || true)
+echo "$((n - bad))/$n FILES knew the capital of France"
+if [ "$na" -gt 0 ]; then
+	echo "$nk/$na ARCHITECTURES knew it: $(printf '%s\n' $archs | grep -v '^?$' | sort -u | tr '\n' ' ')"
+fi
+[ "${nq:-0}" -eq 0 ] || echo "⚠ $nq file(s) have no architecture: charsiu_check ($CHECK) did not answer for them"
 exit "$bad"
