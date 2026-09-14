@@ -1508,8 +1508,8 @@ alternating, attention would cost 3.68 ms a row against the CPU's 6.67 at a
 batch of 178 -- 1.81x on attention, about 1.31x on a Qwen3 prompt. That is a
 step and not a finish: the vendor's TTFT is 2.2 to 3.0x ahead of ours, and this
 closes perhaps a third of it. ⛔ That ratio is a 2026-09-05 reading and does not
-stand; as of r411 the vendor no longer wins at any measured prompt length. See
-the closing section.
+stand; as of r411 charsiu leads by 1.09x to 1.28x below about 250 tokens and the
+two are level from 302 up. See the closing section.
 
 ### What had to be found
 
@@ -10012,7 +10012,8 @@ index shared across the context, and the simulation quantises the other axis.
 🔑 The cheap check that would have caught the 2.4x is printing both arms' byte
 counts.
 
-⛔ **"The vendor wins the prompt at long lengths" -- NOT TRUE as of r411.** Every
+⛔ **"The vendor wins the prompt at long lengths" -- NOT TRUE as of r411, and
+"we win everywhere" is not true either.** Every
 scoreboard and TTFT gap above is a dated reading and stands as one; the standing
 conclusion built on them does not. The ladder with the shipping defaults, board
 to itself, three repeats a point, one warm-up discarded, against r393's measured
@@ -10030,12 +10031,17 @@ ladder of the vendor's own runtime on this board:
        852    5953  5948..5959     885   6026.8   1.012
 ```
 
-⚠⚠ **Three of the eight are inside the measured drift and read as LEVEL.** Their
-column needs their driver bound and cannot share a boot with ours, and r393 put
-the boot-to-boot drift of the same charsiu ladder at 2.2% at worst, so 302
-(+0.7%), 602 (+2.1%) and 852 (+1.2%) sit inside it. The statement that survives
-is **the vendor no longer wins at any measured prompt length**, clearly ahead
-below 250 tokens and at 452, level from 302 up. ⚠ Their chat template costs a
+⚠⚠ **Four of the eight read as LEVEL, and a margin has to clear two things.**
+Their column needs their driver bound and cannot share a boot with ours, and
+r393 put the boot-to-boot drift of the same charsiu ladder at 2.2% at worst --
+302 (+0.7%), 602 (+2.1%) and 852 (+1.2%) sit inside it. The second test is the
+arm's OWN spread at that point: 452 is +4.4% over them and its three readings
+span 3037..3179, which is 4.6% of its median, so a margin smaller than the
+spread it came from is not a margin. ⛔ The first version of this entry said
+"the vendor no longer wins at any measured prompt length, clearly ahead below
+250 tokens and at 452" and checked only the drift. **What survives is two
+regimes: clearly ahead below about 250 tokens at 1.09x to 1.28x, level from 302
+up.** ⚠ Their chat template costs a
 constant 33 tokens at every length, so each row is the same input text. 852 went
 8081 -> 7016 -> 6818 -> 6328 -> 5953 across r393, r408, r410 and r411's two
 halves, and decode did not pay for it (18.15 tok/s against 18.06).
@@ -10059,6 +10065,25 @@ r411**: 9 of 9 identical with it on and 9 of 9 with it off, worth 326 ms of an
 852 token prompt. ⚠ Its spread is wider than the arms around it, 5999..6375
 against a base of 6352..6361, because the gather now races the hardware for
 memory.
+
+⛔ **"fp16 attention on the NPU is slower at every cache depth and is shut" --
+OVERTAKEN, and the entries above that say it are dated readings that stand.**
+The arm came back, went behind `CHARSIU_ATTN_NPU=auto` with a length threshold,
+and is on by default above 448 tokens. r411 then split its heads into two groups
+over two unit pairs so the softmax runs during the scores fence instead of after
+it -- 322 ms of layer at 852 tokens, and the wait itself collapses, scores fence
+503 ms to 38.
+
+⚠ **And against the CPU arm it is now a wash at 852: 6300 ms against 6332,
+0.5%.** That is not a regression -- r409 measured the same arm 18% BEHIND the
+CPU one at that length -- it is the arm having spent its gains on its own per
+call bookkeeping. Of its 1400 ms layer about 264 is the hardware and the rest is
+pack, psync, poison, plan and read. 🔑 So the lever on attention is no longer the
+hardware; it is the roughly 350 ms of per call cost the NPU path adds on top of a
+softmax both arms have to do anyway. ⚠ At 302 tokens the NPU arm WINS by 3.2%
+and the threshold is 448, so that row of the ladder runs its attention on the CPU
+and gives back 72 ms; 452 reads the other way on two samples with a 187 ms range,
+so the threshold is not decided by that table.
 
 ⛔ **And one road closed rather than overturned.** The named target after r407 is
 the int4 readback, and the gather exists because that accumulator comes back
