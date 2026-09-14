@@ -60,6 +60,7 @@ echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
 echo "   npu clk   $NPUCLK Hz"
 echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary    $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
+echo "   build     $(charsiu_build "$RUN")"
 echo "   model     $(basename "$M")"
 echo "   $N repeats an arm a length, arms alternating, one warm-up discarded"
 echo

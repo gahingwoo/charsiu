@@ -30,8 +30,12 @@
  * carries `128.7 + 36.8*tasks + 110.0*MB` fitted from five decode stages,
  * where tasks and MB move together; npu_job_cost measured 16.85 us a job and
  * 4.81 a task directly, on a matmul with no arithmetic in it. Those disagree
- * by 8x on the task term and both cannot be right. --coef overrides all three
- * so a calibration round can be applied without a rebuild.
+ * by 8x on the task term, and r412 settled which side: the stage fit is
+ * withdrawn. Its task coefficient carries weight fetch time, because tasks and
+ * megabytes move together across only five points, and the board's own counter
+ * now reads 7.7 us a task on gemma4 and 3.2 on gemma3. Use 4.81 or a fresh
+ * calibration, not 36.8. --coef overrides all three so a calibration round can
+ * be applied without a rebuild.
  *
  *   charsiu_shapes MODEL.gguf [MODEL.gguf ...] [--kmax N] [--coef a,b,c]
  */
@@ -146,6 +150,12 @@ static double call_us(double mb)
 
 int main(int argc, char **argv)
 {
+	/* ⚠ before any positional argument is read; see the note in the other
+	 * tools. This one is in PROBE_BINS, so it gets installed on a board. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	/* provisional: npu_job_cost's a and b, npudev's c. See the note above. */
 	double A = 37.2, B = 4.81, C = 89.1;
 	unsigned kmax = 1024, nmax = 8192;

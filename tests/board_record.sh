@@ -126,6 +126,25 @@ echo " charsiu   $(cd "$D/.." 2>/dev/null && git log --oneline -1 2>/dev/null ||
 echo " quality model file:  ${QMODEL:-NOT FOUND}"
 [ -n "$QMODEL" ] && echo " quality model md5:   $(md5sum "$QMODEL" 2>/dev/null | cut -c1-32)  ($(stat -Lc%s "$QMODEL" 2>/dev/null) bytes)"
 echo " charsiu_ppl binary:  $BIN/charsiu_ppl  md5 $(md5sum "$BIN/charsiu_ppl" 2>/dev/null | cut -c1-32)"
+#
+# ⚠⚠ AND THE md5 IS ALL charsiu_ppl CAN SAY. The git line at the top of this
+# header answers for the SOURCE tree, and on the board it prints "not a git
+# tree here", which is where this round runs. charsiu_ppl is compiled from
+# that same tree with the same -DCHARSIU_BUILD and has no --version to print
+# it back, so two rounds can be told apart by that hash but neither can be
+# tied to a commit through it. The build line below is charsiu_run, which is
+# the gemma4 sweep at the end and nothing above it.
+#
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+if [ -x "$BIN/charsiu_run" ]; then
+	echo " charsiu_run build:   $(charsiu_build "$BIN/charsiu_run")"
+else
+	echo " charsiu_run build:   not installed beside charsiu_ppl"
+fi
 echo " threads:             ${CHARSIU_THREADS:-all $(nproc 2>/dev/null) cores}"
 echo " corpus:              $CORPUS  ($(md5sum "$CORPUS" 2>/dev/null | cut -c1-32))"
 echo " speed REPEAT:        $REPEAT      gemma4 sweep N: $NSWEEP"

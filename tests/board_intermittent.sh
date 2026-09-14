@@ -162,6 +162,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
 # ⚠⚠ SAY WHICH KERNEL, the same way board_verify does: every kernel this
 # project ships has the same uname, and this script's whole purpose now is to
 # tell two of them apart.

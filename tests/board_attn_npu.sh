@@ -32,6 +32,13 @@
 # pinned, arms ALTERNATING at each length, repeats so the spread sits beside
 # the difference.
 #
+# ⚠⚠ BOTH ARMS NAME THE KNOB NOW, AND THAT IS A CORRECTION. Until r411 the
+# CPU arm here was the EMPTY environment, which was the CPU arm because off was
+# the default. r411 made `auto` the default, so the empty environment is a
+# THIRD thing: the CPU arm below 448 tokens and the NPU arm above it. Run
+# unchanged, this script would have printed the NPU arm in both columns at 452
+# and up and called the ratio 1.000. The CPU arm is `CHARSIU_ATTN_NPU=0`.
+#
 #   CHARSIU_ATTN_REPS="2 4 8 18 34"   clause counts (about 25 tokens each)
 #   CHARSIU_ATTN_N=2                  repeats an arm a length
 . "$(dirname "$0")/board_clk.sh"
@@ -59,8 +66,10 @@ echo "   boot      $(cat /proc/sys/kernel/random/boot_id)"
 echo "   npu clk   $NPUCLK Hz"
 echo "   cpu       $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary    $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
+echo "   build     $(charsiu_build "$RUN")"
 echo "   model     $(basename "$M")"
 echo "   $N repeats an arm a length, arms alternating, one warm-up discarded"
+echo "   arms      CHARSIU_ATTN_NPU=0 against =1; the default (auto) is NEITHER"
 echo
 
 mid() { printf '%s\n' $1 | tr ' ' '\n' | grep -v '^$' | sort -n | awk '{a[NR]=$0} END{if(NR%2)printf "%s\n",a[(NR+1)/2]; else printf "%.0f\n",(a[NR/2]+a[NR/2+1])/2}'; }
@@ -80,14 +89,14 @@ for R in $REPS; do
 	P=""; i=0
 	while [ $i -lt "$R" ]; do P="$P$CLAUSE"; i=$((i+1)); done
 	# one warm-up an arm, discarded
-	ttft "" "$P" >/dev/null 2>&1
+	ttft "CHARSIU_ATTN_NPU=0" "$P" >/dev/null 2>&1
 	ttft "CHARSIU_ATTN_NPU=1" "$P" >/dev/null 2>&1
 	A=; B=; TOK=; n=0
 	while [ $n -lt "$N" ]; do
 		n=$((n+1))
 		# ⚠ ALTERNATE. All of A then all of B measures the board warming
 		# up as much as it measures the arms.
-		r=$(ttft "" "$P"); TOK=${r%% *}; A="$A ${r##* }"
+		r=$(ttft "CHARSIU_ATTN_NPU=0" "$P"); TOK=${r%% *}; A="$A ${r##* }"
 		r=$(ttft "CHARSIU_ATTN_NPU=1" "$P"); B="$B ${r##* }"
 	done
 	[ -n "$A" ] && [ -n "$B" ] || { echo "   $R clauses: NO OUTPUT"; continue; }

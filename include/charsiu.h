@@ -3,6 +3,17 @@
 #ifndef CHARSIU_H
 #define CHARSIU_H
 
+/*
+ * ⚠ THE COMMIT THE BINARY WAS BUILT FROM, compiled in by the Makefile. A
+ * board binary is copied to a name like /root/charsiu_run_win and /opt/charsiu
+ * is not a checkout, so nothing on the board can otherwise say which version
+ * produced a number. "unknown" is what a build outside the tree gets, and it
+ * is deliberately ugly in a log.
+ */
+#ifndef CHARSIU_BUILD
+#define CHARSIU_BUILD "unknown"
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 

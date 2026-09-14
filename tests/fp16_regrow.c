@@ -14,6 +14,15 @@
  * to itself passes on a regrow that does nothing. The control packs one extra
  * position into the reference and requires the comparison to FAIL: if it does
  * not, the comparison is not looking at the bytes it thinks it is.
+ *
+ * ⭐ AND IN PLACE IS ITS OWN ARM. The surface can be allocated once at the
+ * prompt's ceiling and re-laid-out where it lies, which is what removes
+ * n_layer * n_kv buffer objects a rung -- 2048 of them on a 32 layer model
+ * with no GQA. In place is only correct because the groups are walked from the
+ * top down; walked the other way each block overwrites the next one's source,
+ * and the bytes that come out are still a plausible looking surface. So the
+ * in place arm compares against the SAME reference as the copying one, on
+ * every shape, rather than against the copying arm's output.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +97,45 @@ static int one(unsigned hd, unsigned kv_old, unsigned kv_new, unsigned live)
 		       "packed position did not change the buffer\n",
 		       hd, kv_old, kv_new, live);
 		bad = 1;
+	}
+	/* ⭐ THE IN PLACE ARM, against the same reference. `ip` is allocated at
+	 * the NEW size and packed in the OLD layout, which is exactly the
+	 * surface a caller has when it allocated once at the ceiling. */
+	{
+		uint16_t *ip = calloc(1, bn + 4096);
+		float *w = malloc(hd * sizeof(*w));
+		unsigned p;
+
+		if (!ip || !w)
+			exit(2);
+		for (p = 0; p < live; p++) {
+			fill(w, hd, p);
+			charsiu_fp16_pack_vcol(ip, kv_old, hd, p, w);
+		}
+		free(w);
+		/* ref has the extra control position in it by now, so compare
+		 * against `got`, which this arm has already been shown equal
+		 * to the reference for. ⚠ That makes the in place arm's check
+		 * transitive and it is only sound because the line above
+		 * failed the test if got != ref. */
+		if (charsiu_fp16_regrow_vcols(ip, kv_new, ip, kv_old, hd,
+					      live)) {
+			printf("  hd %3u  %4u -> %4u  live %4u   ⛔ IN PLACE "
+			       "REFUSED what the copy accepted\n",
+			       hd, kv_old, kv_new, live);
+			bad = 1;
+		} else if (!bad && memcmp(got, ip, bn)) {
+			size_t i;
+
+			for (i = 0; i < bn / 2; i++)
+				if (got[i] != ip[i])
+					break;
+			printf("  hd %3u  %4u -> %4u  live %4u   ⛔ IN PLACE "
+			       "differs at half %zu: %04x want %04x\n",
+			       hd, kv_old, kv_new, live, i, ip[i], got[i]);
+			bad = 1;
+		}
+		free(ip);
 	}
 	free(old); free(ref); free(got); free(v);
 	return bad;

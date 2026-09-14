@@ -702,6 +702,26 @@ struct charsiu_npu {
 	 */
 	double busy_us;
 	/*
+	 * ⛔⛔ AND THE SAME SPLIT AGAIN, ONE FIELD OVER. busy_us is incremented
+	 * in THREE places -- matvec, matvec_group and npu_matmul_inner -- and
+	 * account_call, which feeds calls, tasks_hi, mb_hi and the whole
+	 * normals fit, is called from only the first two. So the fit's fix,
+	 * tsk and byt describe DECODE and busy_us describes decode AND
+	 * PREFILL, and every line that divides one by the other reports a
+	 * share diluted by whatever prompt the run had in it.
+	 *
+	 * The comment on the end to end figure above records this exact
+	 * asymmetry being found and fixed for call_us. It was not fixed here,
+	 * and "39% of the hardware path is dispatch" -- a number hand computed
+	 * on 2026-08-31 from a five row stage table and quoted since -- is on
+	 * the wrong side of it twice over: it is a share of the hardware path
+	 * and not of a token, and the path it is a share of is this one.
+	 *
+	 * mv_busy_us is the SAME calls the fit sees, so the ratio has one
+	 * meaning.
+	 */
+	double mv_busy_us;
+	/*
 	 * And what that time is MADE of. bo_prep is not a read: it WAITS for the
 	 * job, so the fence and the copy have to be told apart or the 23 ms this
 	 * leaves over stays a residual rather than a measurement.
@@ -786,6 +806,29 @@ struct charsiu_npu {
 	 * us a task plus 172 us a submit plus 84.3 us a megabyte. Same three
 	 * terms, same order, from different shapes on a different day.
 	 *
+	 * ⛔⛔⛔ AND THE 39% BELOW IS WITHDRAWN AS A SHARE OF A TOKEN. It is a share
+	 * of the DECODE HARDWARE PATH -- (11.5 + 7.4) / 48.0 -- and the token in the
+	 * same paragraph is 58.4 ms, against which the same numerator is 32%, not 39%.
+	 * Three further things are wrong with quoting it at all:
+	 *
+	 *   - the five stage times it was fitted from appear NOWHERE but this comment.
+	 *     There is no board log for 2026-08-31 in either repository, so the run
+	 *     behind it cannot be reproduced or checked;
+	 *   - its per task coefficient, 36.8 us, was refuted eight days later by round
+	 *     152, which measured a job at 16.85 us + 4.81 us a task on a matmul with
+	 *     no arithmetic in it. tools/charsiu_shapes.c already says the two "disagree
+	 *     by 8x on the task term and both cannot be right". With 4.81 the share is
+	 *     26%, not 39%;
+	 *   - the same fit was hand computed twice in this file on the same day, with
+	 *     different assumed call and task counts, and printed 39 here and 40 in the
+	 *     report block. They are the same quantity.
+	 *
+	 * What is quotable is what the counter prints, from the run in front of it.
+	 * r412 reads 14.5% on gemma4 and 15.0% on gemma3: the per call term fell from
+	 * 128.7 us to 43-51 across the qos hold, the v11 tree and the two rocket
+	 * patches, so even the corrected 26% is a reading of a runtime that no longer
+	 * exists.
+	 *
 	 * ⚠⚠ WHAT THAT SPLIT SAYS ABOUT THE ROOF. Per token it is 11.5 ms of
 	 * per call cost, 7.4 ms of per task cost and 29.1 ms of weights. Those
 	 * three add to the 48.0 ms stage total exactly, and that is arithmetic
@@ -842,7 +885,9 @@ struct charsiu_npu {
 	 * of it back -- and 50410 is still 5.1% WORSE than staying at 1024.
 	 *
 	 * ⚠⚠ WHICH IS ARITHMETIC RATHER THAN A SURPRISE, AND IT CLOSES THE
-	 * IDEA. Merging two K slices into one removes ONE task, worth 36.8 us,
+	 * IDEA. Merging two K slices into one removes ONE task, worth 36.8 us at
+	 * the withdrawn fit and 4.81 to 7.7 as measured, which only makes the
+	 * case below stronger,
 	 * and hands the surviving slice both halves' bytes -- which on a
 	 * 1.05 MB slice is 115 us. The task term is only 7.4 ms of a token
 	 * against the per call term's 11.5, and the per call term is untouched
@@ -869,6 +914,37 @@ struct charsiu_npu {
 	 * out even splits its weight bytes in half whatever the cut, so the
 	 * megabyte term on the busier core is the SAME and only the task term
 	 * falls.
+	 *
+	 * ⛔⛔⛔ AND THE TABLE BELOW IS SCORED WITH THE WITHDRAWN COEFFICIENT, SO
+	 * EVERY PERCENTAGE IN IT IS FIVE TO EIGHT TIMES TOO LARGE.
+	 *
+	 * "The line above" is the 2026-08-31 stage fit, and its task term is
+	 * refuted; see the withdrawal beside busy_us and beside DEAL_US_TASK.
+	 * The table is simply tasks_removed * 36.8: Llama's 48825 -> 45587 is
+	 * 3238 us over the 88 tasks it names, which is 36.795 us each. At the
+	 * measured 4.81 (round 152) or the 7.7 and 3.2 the r412 counter reads
+	 * on two models, those same 88 tasks are 423 to 678 us, so Llama is
+	 * -0.87% to -1.39% and not -6.6%.
+	 *
+	 * 🔑 AND THE BOARD HAS ALREADY RUN THE EXPERIMENT. r411 cut slices
+	 * 937 -> 486, a 37% drop in tasks, and bought 1.2% of the token. At
+	 * 36.8 us a task that cut should have bought about 7%. The lever is
+	 * measured dead; this table is the only thing still saying otherwise.
+	 *
+	 * ⚠ The numbers are LEFT as they were scored, because they are a
+	 * record of what that exercise computed. What is withdrawn is the
+	 * conclusion drawn from them, and the closing sentence of this comment
+	 * with it: "the reachable part of the 7.4 ms task term" is the
+	 * withdrawn fit's own task term, and at 4.81 us over 202 tasks it is
+	 * 1.0 ms, not 7.4.
+	 *
+	 * ⚠⚠ THIS IS THE SECOND HALF OF A PARAGRAPH THAT WAS HALF CORRECTED
+	 * EARLIER THE SAME DAY. Thirty lines up, the same 36.8 was annotated
+	 * where it CLOSES an idea, and a cheaper task only strengthens a
+	 * refusal so the correction was easy to make and easy to stop at. Here
+	 * the same number OPENS one, and the correction runs the other way.
+	 * Withdrawing a number means sweeping every direction it points, not
+	 * every place it is spelled.
 	 *
 	 * Scored with the line above over the real .gguf geometry, with the cut
 	 * chosen freely PER TENSOR and capped at K <= 4096 and N <= 8192 (the
@@ -1015,10 +1091,19 @@ struct charsiu_npu {
 	 * read is one pass over its own range of the caller's Y: the first
 	 * assigns and the K slices after it add. Fusing the slices a device
 	 * holds for one output range would make that one pass instead of
-	 * several, and whether that is worth writing depends entirely on how
-	 * the deal spread the slices -- one slice per device per range and
-	 * there is nothing to fuse. So count the passes and count the ranges
-	 * before touching the loop.
+	 * several.
+	 *
+	 * ⛔ IT WAS WRITTEN AND IT LOST. CHARSIU_NPU_READ_FUSE is 2.3% slower
+	 * on Llama-3.2-1B and flat on Qwen3, because it trades s sequential Y
+	 * round trips for s scattered source streams and this loop is already
+	 * bandwidth bound; the note above read_rows has the numbers. This used
+	 * to read "whether that is worth writing depends entirely on how the
+	 * deal spread the slices... count the passes before touching the
+	 * loop", and anyone following the counter back from the stderr line
+	 * landed here and read an open road. r412 did exactly that.
+	 *
+	 * The counters stay because they are the answer if the deal or KMAX
+	 * ever changes, not because the loop is worth touching.
 	 */
 	unsigned long bread_passes, bread_ranges;
 	uint64_t bseen_dev;        /* (device, output range) pairs seen this call */
@@ -2312,11 +2397,18 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 	 *
 	 * ⚠ THE FIXED SHARE IS THE WHOLE POINT. If it is small then this
 	 * hardware path is bandwidth bound and the only thing left is to move
-	 * fewer bytes. If it is large -- and on TinyLLAMA decode the offline
-	 * fit puts it at 40% of the hardware path, 11.9 ms per call plus 7.3 ms
-	 * per task against 28.8 ms of weights -- then the tokens per second are
-	 * being spent on dispatch, and the bytes per second figure above is an
+	 * fewer bytes. If it is large then the tokens per second are being
+	 * spent on dispatch, and the bytes per second figure above is an
 	 * average across shapes rather than a roof anything is pressed against.
+	 *
+	 * ⛔ THIS SAID "and on TinyLLAMA decode the offline fit puts it at 40%
+	 * of the hardware path, 11.9 ms per call plus 7.3 ms per task against
+	 * 28.8 ms of weights", and the SAME fit on the SAME day is written up
+	 * as 39% with 11.5 / 7.4 / 29.1 in the comment beside busy_us. One
+	 * quantity, hand computed twice from a spreadsheet of assumed call and
+	 * task counts, two answers. Both are withdrawn there and the reasons
+	 * are there too. What this block prints, from the run in front of it,
+	 * is the answer.
 	 *
 	 * The GB/s here is the aggregate across the cores and it does NOT
 	 * assume they were given equal shares: it is the whole run's weight
@@ -2378,11 +2470,28 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		if (g->ndev > 1 && g->bwall_us > 0.0)
 			fprintf(stderr, "charsiu NPU: batched calls, %s\n",
 				charsiu_npu_overlap_note());
+		/*
+		 * ⛔ THIS LINE USED TO END "so fusing the K slices a device
+		 * holds would save N of them", and fusing HAS been built and
+		 * measured: CHARSIU_NPU_READ_FUSE is 2.3% SLOWER on
+		 * Llama-3.2-1B and flat on Qwen3, because it trades s
+		 * sequential Y round trips for s scattered source streams and
+		 * this loop is already bandwidth bound. The note beside
+		 * read_rows says so at length.
+		 *
+		 * A runtime that keeps printing a suggestion the tree has
+		 * refuted will have it taken up again, and it was -- by the
+		 * round that read this very output. The count is still worth
+		 * printing; the advice is not, so the line names the knob and
+		 * says it lost.
+		 */
 		if (g->bread_passes)
 			fprintf(stderr, "charsiu NPU: the read walked Y %lu times"
-				" over %lu (device, output range) pairs, so fusing"
-				" the K slices a device holds would save %lu of"
-				" them\n", g->bread_passes, g->bread_ranges,
+				" over %lu (device, output range) pairs"
+				" (%lu of them are the K slices; fusing those"
+				" is CHARSIU_NPU_READ_FUSE and it measured"
+				" SLOWER, see read_rows)\n",
+				g->bread_passes, g->bread_ranges,
 				g->bread_passes - g->bread_ranges);
 		if (g->bfused_groups)
 			fprintf(stderr, "charsiu NPU: the fused read took %lu"
@@ -2420,7 +2529,7 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				"%.0f ms in the hardware path %.0f ms is per "
 				"call, %.0f ms is per task and %.0f ms is the "
 				"weights at %.2f GB/s across %u core%s\n",
-				x[0], x[1], x[2], g->busy_us / 1e3, fix, tsk,
+				x[0], x[1], x[2], g->mv_busy_us / 1e3, fix, tsk,
 				byt, byt > 0.0 ? g->weight_mb / byt : 0.0,
 				g->ndev, g->ndev == 1 ? "" : "s");
 			/*
@@ -2434,19 +2543,25 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 			 * three terms and the megabyte figure above should not
 			 * be quoted.
 			 */
-			if (g->busy_us > 0.0) {
+			if (g->mv_busy_us > 0.0) {
 				double ss = g->f_yy - x[0] * g->f_y
 					  - x[1] * g->f_ty - x[2] * g->f_my;
 				double rms = ss > 0.0
 					   ? sqrt(ss / (double)g->calls) : 0.0;
 
+				/* ⚠ SAY WHICH PATH, because "the hardware
+				 * path" has meant two different totals in this
+				 * file and the difference is every batched
+				 * millisecond of the run. */
 				fprintf(stderr,
-					"charsiu NPU: %.0f%% of the hardware "
-					"path is dispatch rather than bytes, "
-					"and a typical call sits %.0f us off "
-					"that line, %.1f%% of the %.0f us it "
-					"takes\n",
-					100.0 * (fix + tsk) / (g->busy_us / 1e3),
+					"charsiu NPU: %.0f%% of the %.0f ms "
+					"DECODE hardware path is dispatch "
+					"rather than bytes (the batched entry "
+					"is not in this ratio), and a typical "
+					"call sits %.0f us off that line, "
+					"%.1f%% of the %.0f us it takes\n",
+					100.0 * (fix + tsk) / (g->mv_busy_us / 1e3),
+					g->mv_busy_us / 1e3,
 					rms,
 					100.0 * rms * (double)g->calls / g->f_y,
 					g->f_y / (double)g->calls);
@@ -2644,6 +2759,26 @@ static double slice_mb(int w4, unsigned k, unsigned n)
  * only add a constant to both sides of every comparison. What is left says a
  * task is worth a third of a megabyte, which is why the deal cannot be by bytes
  * alone: a run of tiny slices piled on one core costs real time.
+ *
+ * ⛔⛔⛔ AND THAT FIT IS WITHDRAWN, WHICH MAKES THESE TWO CONSTANTS THE ONLY
+ * PLACE IN THE TREE WHERE A WITHDRAWN NUMBER IS STILL RUNNING.
+ *
+ * The line above is the 2026-08-31 hand computed stage fit. Its per task term
+ * was refuted eight days later by round 152, which measured a job directly at
+ * 16.85 us + 4.81 us a task on a matmul with no arithmetic in it, and r412's
+ * counter reads 7.7 us a task on gemma4 and 3.2 on gemma3. See the withdrawal
+ * beside busy_us for the whole of it.
+ *
+ * So "a task is worth a third of a megabyte" is 1/15 to 1/36 at the measured
+ * coefficients, and this deal is charging a task five to twelve times what it
+ * costs. The megabyte term is fine: 110.0 against a measured 114.3 to 116.7.
+ *
+ * ⚠ THE CONSTANT IS LEFT ALONE ON PURPOSE. Changing it changes which core
+ * every slice lands on, and that is a board question, not a desk one: the last
+ * reading had the busier core carrying 1.05x an even share, which is close
+ * enough that over weighting tasks may be doing no harm or may be the reason
+ * it is that even. Swapping 36.8 for 4.81 without measuring would replace a
+ * refuted number with an unmeasured one. It is on the board list.
  *
  * ⚠ CHARSIU_NPU_DEAL_INDEX PUTS THE OLD DEAL BACK, and it has to be here
  * rather than at the call site because the sizing pass and the staging pass
@@ -3570,6 +3705,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			 * a residual between them means nothing.
 			 */
 			g->busy_us += took;
+			g->mv_busy_us += took;
 			account_call(g, &id, 1, took);
 
 			if (took > g->slow_us * (g->nochain ? e->count : 1)
@@ -5307,7 +5443,9 @@ static int npu_noread(void)
  * of attention's fences together. Every lever on the gather ITSELF has been
  * measured and lost -- pooling is already on by size, the four row form lost
  * 2.3x, READ_FUSE 2.3% -- and what none of them touched is WHEN it runs. The
- * fence is a SLEEPING ioctl (CHARSIU_NPU_SPIN_US is 0 by default), so all four
+ * fence is a SLEEPING ioctl (CHARSIU_NPU_SPIN_US was 0 by default when this
+ * was written and is 200 since r411, so the thread polls first and falls back
+ * to the sleep on the 19% of waits it does not win), so all four
  * cores are idle for it, and CHARSIU_NPU_NO_READ=1 measured the ceiling for
  * moving it: 5450/5422 ms against 6931/6933 at 852 tokens.
  *
@@ -7439,6 +7577,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		double took = now_us() - t0;
 
 		g->busy_us += took;
+		g->mv_busy_us += took;
 		account_call(g, ids, n, took);
 	}
 	g->call_us += now_us() - tcall;

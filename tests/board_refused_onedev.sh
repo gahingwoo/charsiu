@@ -135,6 +135,12 @@ fi
 [ -n "${MODELS# }" ] || { echo "no Q4_0 model found in $DIRS" >&2; exit 1; }
 
 echo "binary   $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
 echo "prompt   \"1 2 ... 32\", int4 on the NPU"
 echo "conds    $CONDS   (forced arms $REPS time(s) each)"
 echo "  plain   no pinning, default threads, gen $NGEN"

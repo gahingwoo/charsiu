@@ -58,6 +58,22 @@ ms() { awk '{printf "%d", $1 * 1000}' /proc/uptime 2>/dev/null || echo 0; }
 took() { echo "$(( $(ms) - $1 ))"; }
 secs() { awk -v m="$1" 'BEGIN{printf "%.1f", m/1000}'; }
 
+#
+# ⚠⚠ WHICH BUILD, AND IT COVERS charsiu_run ONLY. Sections 1 and 3 run
+# charsiu_whisper and charsiu_clip, which are compiled from this same tree
+# with the same -DCHARSIU_BUILD and have no --version to print it back, so
+# those two timings are identified by their paths and nothing finer. A build
+# line read as covering all three binaries is worse than none. Section 2 is
+# charsiu_run with --mmproj, so the vision tower is covered.
+#
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
+echo "         charsiu_run only; whisper and clip have no --version"
+echo
 echo "== what this round needs =="
 HF=https://huggingface.co
 get "$HF/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin" "$DIR/ggml-tiny.en.bin"

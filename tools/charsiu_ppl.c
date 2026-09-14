@@ -2,10 +2,52 @@
  * charsiu_ppl -- perplexity, so a quantiser change stops being a matter of
  * reading one paragraph and deciding it looks fine.
  *
- * ⚠⚠ IT HAS TO RUN ON THE BOARD. The host has no NPU, so npu_get returns NULL
- * and every matvec falls back to the gguf weights -- which measures llama.cpp's
- * q4_0 and not charsiu's int4 at all. On the card the staged, requantised
- * weights are the ones in the loop, which is the thing under test.
+ * ⛔⛔ THAT IS TRUE ONLY OF THE PLAIN DEFAULT, AND THIS PARAGRAPH USED TO SAY
+ * OTHERWISE. It read "IT HAS TO RUN ON THE BOARD. The host has no NPU, so
+ * npu_get returns NULL and every matvec falls back to the gguf weights --
+ * which measures llama.cpp's q4_0 and not charsiu's int4 at all." The last
+ * clause is wrong, and the disproof is one measurement: if the host were
+ * scoring llama.cpp's q4_0, setting CHARSIU_NPU_W4_GROUP could not move the
+ * number, and it moves it 18.6%.
+ *
+ * With CHARSIU_NPU_QUANT=1 the host builds charsiu's own quantised copy
+ * through charsiu_pool_get with dev == NULL and matvec_again uses it, so the
+ * weights in the loop ARE charsiu's int4. What the host does not reproduce is
+ * the ACTIVATION: the board's int4 decode packs the real activation as fp16
+ * (npudev.c, charsiu_pack_input_f16) and accumulates slices in float, while
+ * npu_matvec here takes the int8 activation unless CHARSIU_NPU_A16=1. The
+ * board is w4a16; this defaults to w4a8.
+ *
+ * 🏁🏁 SO THE HOST REPRODUCES THE BOARD, AND NOT MERELY TO A FEW PERCENT.
+ * Measured on r413 with the model and the corpus checked by md5 to be the same
+ * FILES on both sides (c82c0340d974 and 4237c8fc3163, long.txt, -n 300):
+ *
+ *     host  CPU, group 1024, w4a8   33.8071    <- the default arm
+ *     BOARD real NPU, int4          32.8025
+ *     host  CPU, group 1024, w4a16  32.8008    <- 0.005% from the board
+ *
+ * Set CHARSIU_NPU_W4_GROUP=1024 and CHARSIU_NPU_A16=1 and the desk answers the
+ * board to five significant figures. Quality work does not need the card at
+ * all; what it needs is both of those set, because the board is w4a16 and this
+ * defaults to w4a8.
+ *
+ * ⚠ THE FIRST VERSION OF THIS PARAGRAPH SAID "BRACKETS ... TO ABOUT 1 TO 4%",
+ * comparing against a board figure of 33.4149 taken from a different round
+ * under conditions nobody had matched. The bracket is real but it is an
+ * artefact of the DEFAULT activation width, not the limit of what the desk can
+ * do. A number belongs to its input file, and that is also true of the number
+ * you are comparing against.
+ *
+ * ⚠⚠ AND THE GROUP IS THE WHOLE OF IT, NOT KMAX. The quantiser's group is
+ * CHARSIU_NPU_W4_GROUP (npuquant.c); CHARSIU_NPU_KMAX is not read in that file
+ * at all and moving it changes nothing here. They are set together on the
+ * BOARD because tensor_grouped() requires kgroup == kmax there, and that is a
+ * fact about the device path, not about this instrument.
+ *
+ * ⚠ CHARSIU_NPU=1 on a machine with no /dev/accel reaches llama_auto_kmax,
+ * fails to open, says so, and gives the board's group for free -- bit
+ * identical to setting it by hand. It is a good diagnostic and a BAD recipe:
+ * on a machine that does have the device it silently becomes a hardware run.
  *
  * The number is exp of the mean negative log likelihood of each token given
  * everything before it, over the token loop, one position at a time. No
@@ -53,6 +95,18 @@
 
 int main(int argc, char **argv)
 {
+	/*
+	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. It also has to exist at
+	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
+	 * stamp" for a tool that cannot answer, which is FALSE for these -- they
+	 * carry the define and merely had no flag.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	struct llama_model m;
 	struct llama_state *st;
 	struct tokenizer *tk;

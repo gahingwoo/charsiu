@@ -15,12 +15,40 @@
 # explicitly so a gcc that lacks it is not a silent downgrade; ?= means a
 # caller can still override the whole line.
 CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
+#
+# ⚠⚠ THE BUILD STAMPS ITSELF, because /opt/charsiu is not a git checkout and
+# neither is /root/charsiu_run_<whatever>. Every board round has recorded the
+# machine, the clock and the wall time and NOT the commit, so a round's numbers
+# have been tied to a version by somebody remembering which binary they copied.
+# That is how "the numerator and the denominator came from different builds"
+# happens without anybody noticing.
+#
+# -dirty is part of it. A binary built from an edited tree is not the commit it
+# names, and saying so is the whole point.
+#
+# ⚠ := AND NOT =, or every compile line re-runs git.
+CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+#
+# ⚠ override, NOT a plain +=. CFLAGS is `?=` above, and a value given on the
+# COMMAND LINE beats both -- make then ignores every `+=` to it, the define
+# never reaches the compiler, and charsiu.h's fallback makes --version answer
+# "unknown". An environment CFLAGS is fine; only the command line does this.
+# A stamp that silently disappears under `make CFLAGS=...` is worse than none.
+override CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
 BUILD  := build
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
 
 SRC    := src/regcmd.c src/device.c src/job.c
 LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
+          src/npudev.c src/npupool.c src/npufp16.c src/device.c src/job.c src/regcmd.c
+# ⚠ THE SAME LIST WITHOUT llama.c, for one test that IS a llama.c translation
+# unit. tests/attn_two_thresholds.c includes src/llama.c so it can reach the
+# two static threshold functions and the gate that composes them, so llama.c
+# must not also arrive as an object or every symbol in it is defined twice.
+# ⚠ Its RULE still depends on $(LLM), llama.c included, or an edit to the file
+# it tests would not rebuild it.
+LLMNOLL := src/gguf.c src/tokenizer.c src/npuquant.c \
           src/npudev.c src/npupool.c src/npufp16.c src/device.c src/job.c src/regcmd.c
 
 all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
@@ -37,6 +65,22 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/fp16_regrow \
      $(BUILD)/charsiu_ppl \
      $(BUILD)/charsiu_membw
+
+#
+# ⚠⚠ AND THE STAMP HAS TO GO STALE NEVER. Nothing in a link line depends on the
+# commit, so a pull that changes no source leaves the OLD commit inside a
+# binary that is otherwise up to date -- and then it answers --version with a
+# confident wrong number, which is worse than not answering. This file changes
+# only when the commit does (cmp before write, so an unchanged commit does not
+# relink the world), and the binaries that carry the stamp depend on it.
+STAMP  := $(BUILD)/.commit
+
+.PHONY: FORCE
+FORCE:
+
+$(STAMP): FORCE | $(BUILD)
+	@printf '%s\n' '$(CHARSIU_BUILD)' | cmp -s - $@ 2>/dev/null \
+		|| printf '%s\n' '$(CHARSIU_BUILD)' > $@
 
 $(BUILD):
 	@mkdir -p $(BUILD)
@@ -277,7 +321,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/charsiu_run_scalar
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -293,8 +337,10 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/coef_scales
 	./$(BUILD)/fp16_plan
 	./$(BUILD)/fp16_regrow
+	./$(BUILD)/fp16_regrow_fuzz
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
+	./$(BUILD)/attn_two_thresholds
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
 #
@@ -369,6 +415,28 @@ $(BUILD)/fp16_plan: tests/fp16_plan.c src/fp16plan.h src/regcmd.c src/job.c | $(
 
 $(BUILD)/fp16_regrow: tests/fp16_regrow.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fp16_regrow.c src/regcmd.c src/job.c -lm
+
+# ⛔ AND THE ADVERSARIAL ARM. fp16_regrow above sweeps a FIXED table into
+# freshly zeroed destinations, one step at a time; this one randomises the
+# shape, climbs the ladder IN ONE BUFFER with positions appended between
+# rungs, poisons the destination tail, puts PROT_NONE pages on both ends, and
+# holds nine deliberate mutations of the walk to the same comparison so that
+# "all ok" means the comparison can see a bug. CHARSIU_FUZZ_SEED changes the
+# draw; the default seed is fixed so a failure reproduces.
+$(BUILD)/fp16_regrow_fuzz: tests/fp16_regrow_fuzz.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/fp16_regrow_fuzz.c src/regcmd.c src/job.c -lm
+
+# ⭐ THE TWO ATTENTION THRESHOLDS, WHICH WERE WRONG TWICE IN ONE DAY AND HAD NO
+# TEST. attn_npu_min_for picks 320 or 448 from the model's head counts, and the
+# gate that uses it also has to refuse a caller that never said how long the
+# prompt is. Neither needs an NPU: the inputs are two head counts and an
+# integer. The test includes src/llama.c rather than asking for a shim, so the
+# link line is $(LLMNOLL) and the dependency is $(LLM).
+# ⚠ ONE FORK PER CASE. Every knob it moves is cached in a function static on
+# first read, so a second case in the same process would read the first one's
+# environment.
+$(BUILD)/attn_two_thresholds: tests/attn_two_thresholds.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/attn_two_thresholds.c $(LLMNOLL) -lm -lpthread
 
 # the guard is its own unit for exactly this reason: the table is testable on a
 # desk without linking the hardware path behind it

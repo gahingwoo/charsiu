@@ -400,6 +400,20 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "-q")) quiet = 1;
 		else if (!strcmp(a, "--image")) image = NEXT();
 		else if (!strcmp(a, "--mmproj")) mmproj = NEXT();
+		/*
+		 * ⚠⚠ WHICH COMMIT IS THIS BINARY. /opt/charsiu is not a git
+		 * checkout and neither is /root/charsiu_run_<name>, which is
+		 * how every board binary actually arrives. So every round has
+		 * recorded the machine, the clock and the wall time, and tied
+		 * its numbers to a version by somebody remembering which file
+		 * they copied. The commit is compiled in; this prints it and
+		 * exits, so a script can ask a binary what it is rather than
+		 * asking its mtime.
+		 */
+		else if (!strcmp(a, "--version")) {
+			printf("%s\n", CHARSIU_BUILD);
+			return 0;
+		}
 		else { usage(); return 2; }
 #undef NEXT
 	}

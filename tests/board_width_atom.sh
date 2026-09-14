@@ -40,6 +40,12 @@ sleep 1
 echo "== one-chunk prefill width against the 16 atom"
 echo "   boot   $(cat /proc/sys/kernel/random/boot_id)"
 echo "   model  $(basename "$M")   binary $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build  $(charsiu_build "$RUN")"
 echo "   $N repeats a length, one warm-up discarded, clock pinned"
 echo
 
@@ -66,7 +72,14 @@ for T in $LENS; do
 	[ -n "$R" ] || { echo "   $T: NO OUTPUT"; continue; }
 	MT=$(mid "$R")
 	D=-
-	[ -n "$PREV" ] && D=$(awk "BEGIN{printf \"%+.1f\", ($MT-$PT)/(($G)-($PREV))*2}")
+	# ⚠ TWO ROWS CAN TIE. $G is what the prompt TOKENISED to, not what was
+	# asked for, and the whole point of this sweep is that it quantises --
+	# so consecutive rows share a $G routinely and the slope's denominator
+	# is zero. mawk prints "+inf" into the column and busybox awk fails the
+	# whole substitution, leaving it BLANK, which reads as a measured zero.
+	# board_ttft_curve.sh guards the same division on the same quantity.
+	[ -n "$PREV" ] && [ "$G" != "$PREV" ] && \
+		D=$(awk "BEGIN{printf \"%+.1f\", ($MT-$PT)/(($G)-($PREV))*2}")
 	# ⚠ mark the multiples of 16 so the eye does not have to find them
 	MARK=""; [ $((G % 16)) = 0 ] && MARK="  <- 16 x $((G / 16))"
 	printf '   %6s %6s  %8s %10s  %7s %s%s\n' "$T" "$G" "$MT" \

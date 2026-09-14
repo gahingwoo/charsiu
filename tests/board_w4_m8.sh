@@ -110,6 +110,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_W4_M8=1"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
 echo "probe    --batch-probe $MMAX   (widths 2, 4, 8; 8 is the question)"
 # ⚠⚠ THE RAIL, BEFORE ANYTHING ELSE. This whole probe's 08-29 map was drawn at
 # 750 mV and read as a property of the width. A round that does not say which

@@ -91,6 +91,18 @@ static int resize_mode(const char *path, unsigned side)
 
 int main(int argc, char **argv)
 {
+	/*
+	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. It also has to exist at
+	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
+	 * stamp" for a tool that cannot answer, which is FALSE for these -- they
+	 * carry the define and merely had no flag.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	struct charsiu_vision v;
 	const char *image = NULL;
 	int rc, want_encode = 0, i;

@@ -54,6 +54,12 @@ P="The history of computing begins long before the first electronic machine. Mer
 
 echo "== where the prompt's time goes, $(date -Is)"
 echo "   binary $BIN/charsiu_run"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build  $(charsiu_build "$BIN/charsiu_run")"
 echo "   -n 1, so the table below is the PROMPT's and not the token loop's"
 echo
 

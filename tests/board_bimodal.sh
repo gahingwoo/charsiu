@@ -106,6 +106,12 @@ run_one() {   # $1 = label, $2 = taskset prefix or empty
 }
 
 echo "== $(basename "$M"), $PASSES passes, arms ALTERNATING, pass 1 discarded"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "   build $(charsiu_build "$BIN/charsiu_run")"
 echo "   board_vendor.sh's own invocation; -t 4, so four threads in every arm"
 echo "   ⚠ the DEFAULT arm is the scoreboard exactly: no taskset at all"
 echo

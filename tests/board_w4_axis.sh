@@ -108,6 +108,12 @@ command -v timeout >/dev/null 2>&1 || TMO=
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
 echo "probe    --batch-probe $MMAX   (widths up to that, checked then timed)"
 echo "arms     $ARMS${TMO:+   (${TMO}s each, then killed)}"
 echo

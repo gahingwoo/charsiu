@@ -34,6 +34,12 @@ if [ -z "$MM" ]; then
 fi
 [ -n "$MM" ] && [ -f "$MM" ] || { echo "usage: board_rows_sweep.sh MMPROJ.gguf" >&2; exit 1; }
 
+#
+# ⚠ NO BUILD LINE HERE. charsiu_vision is compiled with the same -DCHARSIU_BUILD
+# as charsiu_run and has no --version to print it back: it would read the
+# flag as the mmproj path and refuse. What this round ran is the path below
+# and its mtime, and nothing finer, until the tool grows the flag.
+#
 VIS=""
 for d in /usr/bin /opt/charsiu "$PWD/build"; do
 	[ -x "$d/charsiu_vision" ] && { VIS="$d/charsiu_vision"; break; }

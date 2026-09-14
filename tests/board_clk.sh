@@ -63,3 +63,55 @@ npu_clk() {
 # about 3% between boots and r393 measured that on a ladder; a table that does
 # not carry its boot cannot be compared with one that does.
 npu_boot() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+# ⚠⚠⚠ WHICH COMMIT PRODUCED THIS NUMBER, which is the one piece of provenance
+# every round has recorded WRONG by omission. The scripts print the machine,
+# the clock, the boot id and the binary's mtime, and then the round's numbers
+# get tied to a version by somebody remembering which file they copied. They
+# arrive as /root/charsiu_run_<name> and /opt/charsiu is not a git checkout, so
+# there was nothing on the board that could answer it.
+#
+# The commit is compiled into the binary now (Makefile -DCHARSIU_BUILD), and
+# this asks the binary rather than its timestamp.
+#
+# ⚠ A binary too old to know is "no --version", not a blank. A blank is what a
+# missing clock looked like and it cost a whole ladder.
+charsiu_build() {
+	_b=$("${1:-charsiu_run}" --version 2>/dev/null | head -1)
+	case "$_b" in
+	"" | *[!0-9a-zA-Z.-]* ) echo "no --version (binary predates the stamp)" ;;
+	* ) echo "$_b" ;;
+	esac
+}
+
+# ⚠⚠⚠ TWO NAMES FOR ONE KNOB, AND PICKING THE WRONG ONE IS SILENT.
+#
+# Fifteen board scripts read CHARSIU_RUN and thirteen read CHARSIU_RUN_BIN.
+# Neither name is documented anywhere. A round that sets the one this script
+# does not read gets the INSTALLED binary instead, runs to completion, prints a
+# full table, and says nothing -- and deployment here IS "scp a binary under a
+# new name and point the knob at it", so the wrong arm is the normal failure
+# rather than an exotic one.
+#
+# The build line added in f699991 makes it visible after the fact, because the
+# binary now answers --version. This makes it not happen: whichever name is
+# set, both are, so whichever name the script reads it gets what was meant.
+#
+# ⚠ AND IF BOTH ARE SET TO DIFFERENT THINGS THAT IS A REFUSAL, not a
+# precedence rule. A precedence rule here would be a silent choice between two
+# binaries somebody deliberately named, which is the same failure one level up.
+if [ -n "${CHARSIU_RUN:-}" ] && [ -n "${CHARSIU_RUN_BIN:-}" ] &&
+   [ "$CHARSIU_RUN" != "$CHARSIU_RUN_BIN" ]; then
+	echo "" >&2
+	echo "⛔ CHARSIU_RUN AND CHARSIU_RUN_BIN ARE BOTH SET AND DIFFER." >&2
+	echo "     CHARSIU_RUN=$CHARSIU_RUN" >&2
+	echo "     CHARSIU_RUN_BIN=$CHARSIU_RUN_BIN" >&2
+	echo "   They are two names for one knob. Different scripts read" >&2
+	echo "   different ones, so this round would measure whichever this" >&2
+	echo "   script happens to read and would not say which." >&2
+	echo "" >&2
+	exit 1
+fi
+[ -z "${CHARSIU_RUN:-}" ] || CHARSIU_RUN_BIN="${CHARSIU_RUN_BIN:-$CHARSIU_RUN}"
+[ -z "${CHARSIU_RUN_BIN:-}" ] || CHARSIU_RUN="${CHARSIU_RUN:-$CHARSIU_RUN_BIN}"
+export CHARSIU_RUN CHARSIU_RUN_BIN 2>/dev/null || true

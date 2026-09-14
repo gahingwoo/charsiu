@@ -3,6 +3,13 @@
 #ifndef CHARSIU_LLM_H
 #define CHARSIU_LLM_H
 
+/* the commit this binary was built from; see the note in charsiu.h. Repeated
+ * here because the tools that include only this header need it too, and the
+ * #ifndef makes the two copies idempotent. */
+#ifndef CHARSIU_BUILD
+#define CHARSIU_BUILD "unknown"
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>
@@ -461,10 +468,28 @@ void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
  * not depend on n at all when n is a multiple of 16 -- append along n freely --
  * and it DOES depend on k through ke, so a buffer that will grow along k must
  * be allocated at its final k and run at that k with the unused part zero.
+ *
+ * ⭐ OR ALLOCATED AT THE FINAL k AND RUN AT A SMALLER ONE, which is the third
+ * option and the one a KV ladder wants. charsiu_fp16_w_alloc_room takes the
+ * room to reserve separately from the k the buffer is currently laid out at;
+ * charsiu_fp16_w_set_k moves that k up once the caller has re-laid the bytes
+ * out, which charsiu_fp16_regrow_vcols does IN PLACE. The reason this exists:
+ * the ladder used to allocate a second surface at every rung and free the
+ * first, and that is n_layer * n_kv buffer objects a rung -- 128 on
+ * Llama-3.2-1B and 1024 on a 32 layer model with no GQA.
+ *
+ * ⚠ set_k does NOT move any bytes and does not check that anybody did. It is
+ * the caller saying "the layout is now this", and the caller has to have made
+ * that true.
  */
 struct charsiu_fp16_w;
 struct charsiu_fp16_w *charsiu_fp16_w_alloc(struct charsiu_fp16 *f,
 					    unsigned k, unsigned n);
+struct charsiu_fp16_w *charsiu_fp16_w_alloc_room(struct charsiu_fp16 *f,
+						 unsigned k, unsigned n,
+						 unsigned kroom);
+int charsiu_fp16_w_set_k(struct charsiu_fp16_w *w, unsigned k);
+unsigned charsiu_fp16_w_room(const struct charsiu_fp16_w *w);
 void charsiu_fp16_w_free(struct charsiu_fp16 *f, struct charsiu_fp16_w *w);
 void *charsiu_fp16_w_map(struct charsiu_fp16_w *w);
 size_t charsiu_fp16_w_bytes(const struct charsiu_fp16_w *w);

@@ -4183,8 +4183,23 @@ it mid-word before 412 finally kept it:
                                                       at 16.38 GB/s across 2 cores
 ```
 
-**The two models stream at the same rate.** Dispatch is 10% of gemma4's
-hardware path and 14% of gemma3's. Neither is bandwidth-starved and neither is
+**The two models stream at the same rate.** Dispatch is **14.5%** of gemma4's
+hardware path and **15.0%** of gemma3's.
+
+⛔ **This line said 10% and 14%, and both were the per-CALL term alone with the
+per-TASK term dropped** -- 435/4277 and 257/1881 instead of (435+185)/4277 and
+(257+26)/1881. The runtime prints `(fix + tsk) / path` and has since the
+counter was added; somebody re-derived the printed quantity by hand and got a
+different answer, which is the same failure as the number the counter was added
+to replace. ⚠ **And the denominator those came from is diluted**: `busy_us` was
+incremented by the batched prefill entry as well as by the two decode entries,
+while the fit behind `fix` and `tsk` only ever saw decode calls, so any run with
+a prompt in it divided a decode numerator by a decode-plus-prefill total. The
+runtime divides by `mv_busy_us` now, the same calls the fit counted, and says
+DECODE in the line so the two totals cannot be confused again. **The 14.5% and
+15.0% above are recomputed from the printed rows, so they carry that dilution
+too; they are the right formula on the old denominator and should be re-read
+off a run with the corrected counter.** Neither is bandwidth-starved and neither is
 dispatch-bound. gemma4 is simply a bigger model a token: 211 calls where
 gemma3 makes 105, and 1140 MB of weights where gemma3 reads 545.
 
@@ -10069,7 +10084,8 @@ memory.
 ⛔ **"fp16 attention on the NPU is slower at every cache depth and is shut" --
 OVERTAKEN, and the entries above that say it are dated readings that stand.**
 The arm came back, went behind `CHARSIU_ATTN_NPU=auto` with a length threshold,
-and is on by default above 448 tokens. r411 then split its heads into two groups
+and was on by default above 448 tokens (r412: **320, and a second threshold of
+448 for a model with no GQA** -- see the two corrections below this entry). r411 then split its heads into two groups
 over two unit pairs so the softmax runs during the scores fence instead of after
 it -- 322 ms of layer at 852 tokens, and the wait itself collapses, scores fence
 503 ms to 38.
@@ -10084,6 +10100,33 @@ softmax both arms have to do anyway. ⚠ At 302 tokens the NPU arm WINS by 3.2%
 and the threshold is 448, so that row of the ladder runs its attention on the CPU
 and gives back 72 ms; 452 reads the other way on two samples with a 187 ms range,
 so the threshold is not decided by that table.
+
+⛔ **r412 RE-MEASURED THAT TABLE AND BOTH OF ITS ODD ROWS WERE THE SAME FAULT.**
+The sweep's "CPU" column was the EMPTY environment, and the empty environment
+stopped being the CPU arm when `auto` became the default: at 452 it is the NPU
+arm, so that row compared an arm against itself and 1.027 is its own spread.
+With both arms naming the knob and four repeats, 302 is +2.3% against a 2.2%
+spread -- **level, not a 3.2% win** -- and 452 is +10.8% against 1.6%. The
+threshold is 320 now, and the paragraph above is kept because the reasoning it
+records (the lever is bookkeeping, not hardware) is unaffected by which side of
+noise 302 sits on.
+
+⛔ **And the same round found the threshold wrong in the OTHER direction.** At
+352 tokens the two models with no GQA lose badly -- Phi-3.5-mini -15.9%,
+SmolLM2-1.7B -11.2%, both against spreads under 1.5% -- while the three with
+GQA win by 5.7 to 8.4%. 448 turned the arm ON for those two from 448 tokens up.
+The mirror costs one pack per position per layer per KV head and buys attention
+per QUERY head, so a model that shares nothing pays the most for the least.
+
+⛔ **The first answer to that was a refusal, and it was wrong within the hour.**
+It turned the arm off for `n_head_kv >= n_head` on the ground that no measured
+length had those two winning. That was true of the arm as it stood and stopped
+being true when the in place ladder landed in the same session, and nobody
+re-asked. Re-measured with it: Phi-3.5-mini +2.3% at 452 and +15.3% at 852,
+SmolLM2-1.7B +2.8% and +19.4%. So it is a SECOND threshold, 448, not a refusal,
+and 452 being the shortest measured win for both is why. 🔑 **A refusal whose
+reason is "nothing measured says otherwise" names its own expiry, and has to be
+re-asked the moment the thing it refuses gets faster.**
 
 ⛔ **And one road closed rather than overturned.** The named target after r407 is
 the int4 readback, and the gather exists because that accumulator comes back

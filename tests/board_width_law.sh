@@ -234,6 +234,12 @@ GATES="CHARSIU_NPU_W4_M8=1 CHARSIU_NPU_W4_ANYM=1"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+echo "build    $(charsiu_build "$RUN")"
 echo "widths   $NW of them, 2..$MMAX: $WIDTHS"
 echo "tensors  first $MAXT staged per width (CHARSIU_PROBE_MAXT)"
 echo "arms     $ARMS${TMO:+   (${TMO}s each, then killed)}"

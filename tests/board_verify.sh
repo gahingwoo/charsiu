@@ -115,6 +115,23 @@ skip() { SKIP="$SKIP $1($2)"; printf '  – skipped: %s\n' "$2"; }
 
 echo "charsiu board verification"
 echo "  binaries  $BIN"
+#
+# ⚠⚠ AND THE BUILD, FOR charsiu_run ONLY. Phase 14 drives npu_gemm_test and
+# phase 15 charsiu_matmul; both carry the same -DCHARSIU_BUILD from this same
+# tree and neither has a --version to print it back, and neither may have
+# been copied to this board in the same minute as charsiu_run. Read the line
+# below as the runtime and not as the round.
+#
+# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# it refuses when debugfs is unmounted, and turning this probe into one that
+# refuses to start is a different change from making it say which build
+# produced its numbers.
+. "$(dirname "$0")/board_clk.sh"
+if have charsiu_run; then
+	echo "  build     $(charsiu_build "$BIN/charsiu_run")"
+else
+	echo "  build     no charsiu_run in $BIN"
+fi
 echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"

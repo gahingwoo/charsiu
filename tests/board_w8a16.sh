@@ -39,6 +39,14 @@ set -u
 SHAPES=${CHARSIU_W8_SHAPES:-64:864 128:864 64:64 1024:64 1024:1024}
 M=${CHARSIU_W8_M:-78}
 REPS=${CHARSIU_W8_REPS:-8}
+#
+# ⚠⚠ NO BUILD LINE HERE, AND charsiu_build MUST NOT BE POINTED AT THIS ONE.
+# npu_fp16_test is compiled with the same -DCHARSIU_BUILD as charsiu_run and
+# has no --version to print it back. Worse, its first argument is K, read
+# through atoi: asking it for --version asks the hardware for a K = 0 shape.
+# What this round ran is $T and its mtime, and nothing finer, until the tool
+# grows the flag.
+#
 T=${CHARSIU_W8_TEST:-/root/npu_fp16_test}
 
 [ -e /dev/accel/accel0 ] || { echo "no /dev/accel -- this needs the rocket arm"; exit 1; }

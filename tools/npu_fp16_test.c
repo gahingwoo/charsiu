@@ -557,6 +557,18 @@ static int run_f16_timed(struct charsiu_device *dev, unsigned m, unsigned k,
 
 int main(int argc, char **argv)
 {
+	/*
+	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * argv[1] straight through atoi, so an unrecognised --version becomes a
+	 * dimension of ZERO submitted to the hardware. It also has to exist at
+	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
+	 * stamp" for a tool that cannot answer, which is FALSE for these -- they
+	 * carry the define and merely had no flag.
+	 */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 8;
 	/*

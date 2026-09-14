@@ -19,6 +19,12 @@
 set -eu
 
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
+#
+# ⚠ NO BUILD LINE HERE. charsiu_whisper is compiled with the same -DCHARSIU_BUILD
+# as charsiu_run and has no --version to print it back: it would read the
+# flag as a model that is not there and refuse. What this round ran is the path below
+# and its mtime, and nothing finer, until the tool grows the flag.
+#
 WSP=""
 for d in /usr/bin /opt/charsiu "$PWD/build"; do
 	[ -x "$d/charsiu_whisper" ] && { WSP="$d/charsiu_whisper"; break; }
