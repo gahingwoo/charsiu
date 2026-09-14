@@ -802,6 +802,45 @@ two shapes apart, and the projection that follows from it -- attention 2343 ms
 becoming about 780, TTFT about 5630 against their 6027 -- is arithmetic on a
 bound and **not a result**.
 
+### 1k. The ladder with the overlap work in, and the crossover gone
+
+r411, shipping defaults, board to itself, three repeats a point, one warm-up
+discarded, all eight points on one boot.
+
+```
+    ch tok   ch ms      range   vn tok    vn ms   winner   ratio
+        27     332   327..332       60    413.2  charsiu   1.245
+        52     415   413..417       85    529.6  charsiu   1.276
+       102     761   750..762      135    931.8  charsiu   1.224
+       202    1400  1398..1401     235   1528.5  charsiu   1.092
+       302    2131  2124..2134     335   2145.0  charsiu   1.007
+       452    3059  3037..3179     485   3194.7  charsiu   1.044
+       602    4115  4111..4156     635   4200.5  charsiu   1.021
+       852    5953  5948..5959     885   6026.8  charsiu   1.012
+```
+
+🏁 **What this supports: the vendor no longer wins at any measured prompt
+length.** 852 goes 8081 (r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953.
+
+⚠⚠ **What it does NOT support is a margin at every length.** Their column is
+r393's ladder with their runtime, which needs their driver bound and so cannot
+share a boot with ours; 1b-ii measured the boot-to-boot drift of this same
+charsiu ladder at **2.2% at worst**. Three rows are inside it and have to be
+quoted as level, not as a win:
+
+    clear      27 (+24.5%)  52 (+27.6%)  102 (+22.4%)  202 (+9.2%)  452 (+4.4%)
+    level     302 (+0.7%)  602 (+2.1%)  852 (+1.2%)
+
+⚠ The four changes behind it, each measured against its own control on this
+board and each text identical to it: two head groups so the softmax runs
+during the scores fence (322 ms of layer at 852), the kv ladder's ceiling and
+its block copy (126), the deferred int4 accumulator gather (326), and the
+fence poll (76). `tests/board_text_all.sh` is 9 models 0 differing with the
+shipping defaults.
+
+⚠ Decode did not pay for it: 18.15 tok/s against 18.06 before the round, peak
+1448 MB against 1449.
+
 ---
 
 ## 2. Quality against the vendor's own int4
