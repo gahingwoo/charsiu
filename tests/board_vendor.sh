@@ -31,6 +31,13 @@
 #   sh tests/board_vendor.sh
 set -eu
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 REPEAT=${CHARSIU_BENCH_REPEAT:-1}
 W4V=${CHARSIU_BENCH_W4V:-1}
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
@@ -120,7 +127,6 @@ fi
 # ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and this script is a correctness
 # gate rather than a timing sweep. The build stamp is what it needs.
-. "$(dirname "$0")/board_clk.sh"
 echo "  governor: $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
   echo "  build    $(charsiu_build "$RUN")"
 # ⚠ SAY WHICH FORMAT WAS SCORED. A table that does not is a table whose rows

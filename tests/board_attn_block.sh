@@ -26,6 +26,13 @@
 #   CHARSIU_ATTN_MODELS=              ggufs, space separated (default: three)
 #   CHARSIU_ATTN_REPEATS=2
 set -u
+
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
 VALUES=${CHARSIU_ATTN_VALUES:-4 8 16 32}
 N=${CHARSIU_ATTN_REPEATS:-2}
 RUN=${CHARSIU_RUN_BIN:-}
@@ -63,7 +70,6 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 CHARSIU_STAGES=1"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "build     $(charsiu_build "$RUN")"
 echo "governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null) (was $OLD)"
 echo "blocks    $VALUES ($N repeats each, alternating), prompt 256 words"

@@ -32,6 +32,13 @@
 #   CHARSIU_AXIS_TIMEOUT=600 seconds one arm may take before it is killed
 set -u
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 MODEL=${1:-}
 
 # --- the binary ------------------------------------------------------------
@@ -112,7 +119,6 @@ echo "binary   $RUN"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "build    $(charsiu_build "$RUN")"
 echo "probe    --batch-probe $MMAX   (widths up to that, checked then timed)"
 echo "arms     $ARMS${TMO:+   (${TMO}s each, then killed)}"

@@ -18,6 +18,13 @@
 #   CHARSIU_AB_REPEATS=3
 #   CHARSIU_AB_MAXT=40     tensors a pass, so a repeat is quick
 set -u
+
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
 VAR=${CHARSIU_AB_VAR:-CHARSIU_NPU_PACK_GATHER=1}
 W=${CHARSIU_AB_WIDTH:-80}
 N=${CHARSIU_AB_REPEATS:-3}
@@ -67,7 +74,6 @@ CHARSIU_PROBE_WIDTHS=$W CHARSIU_PROBE_MAXT=${CHARSIU_AB_MAXT:-40}"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "build     $(charsiu_build "$RUN")"
 echo "model     $M"
 echo "governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null) (was $OLD)"

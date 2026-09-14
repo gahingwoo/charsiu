@@ -41,6 +41,13 @@
 # Usage: board_overlap_slots.sh [MODEL.gguf]
 set -u
 
+# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
+# script picks its binary below. Sourcing it after that point set the
+# alias too late to be read -- which is how round 414 measured the
+# INSTALLED binary for twenty minutes while believing otherwise.
+. "$(dirname "$0")/board_clk.sh"
+
 MODEL=${1:-}
 W=${CHARSIU_OVL_WIDTH:-24}
 KMAX=${CHARSIU_OVL_KMAX:-2048}
@@ -104,7 +111,6 @@ echo "binary   $RUN"
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
-. "$(dirname "$0")/board_clk.sh"
 echo "build    $(charsiu_build "$RUN")"
 _ksha=$(sha256sum /boot/Image 2>/dev/null | cut -c1-8)
 case "$_ksha" in
