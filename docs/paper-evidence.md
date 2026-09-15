@@ -883,7 +883,7 @@ any of them had moved, this whole re-read would be suspect.
 charsiu and it was written up as "completely surpassed" and withdrawn the same
 day. The difference is a measured floor, one row still level and one row thin.
 
-### 1k. The ladder with the overlap work in: a lead under 250, level above
+### 1k. SUPERSEDED BY 1k-ii: the ladder with the overlap work in, on an older binary
 
 **SUPERSEDED BY 1k-ii above**, which re-measured this on the shipping binary
 with five repeats and a measured noise floor. Kept as a dated reading.
