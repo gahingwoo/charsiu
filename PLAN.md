@@ -47,6 +47,20 @@ one flag apart:
 **2.94x, and the two runs generate the same text word for word.** Prefill used
 to cost more per token than decode; it now costs a third of it.
 
+**AND THE DENOMINATOR IS THIS RUNTIME, NOT THE VENDOR.** Both rows above are
+charsiu, one flag apart. "DONE" means the batched path landed and is correct;
+it does not mean the gap to the vendor closed, and on the day it landed this
+same document recorded that gap as 3.6x to 14.4x on four models. The line
+further down says so in its own terms -- "TTFT against where this line
+started" -- but a heading that reads DONE with no denominator beside it invites
+exactly the reading it does not support, and it got that reading.
+
+Where it has gone since, on Qwen3 TTFT: 7354 ms when this line started, 1792
+when the batched path landed, 613 in the current round of record, against the
+vendor's 468.61 published. As a ratio to them: 15.7x, then 3.8x, then 1.31x.
+Still behind, and the four-model table in docs/paper-evidence.md section 1 is
+where the current numbers live.
+
 `llama_prefill_batch` runs the layer loop with n rows, batching every
 projection -- q, k, v and o as well as gate, up and down. Rows are walked in
 order inside a layer because row r's attention reads the KV the rows before it
