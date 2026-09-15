@@ -830,6 +830,46 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * One scale a row is what the consumer will apply, so it is what gets
 	 * written. Coarser for these shapes, and correct.
 	 */
+	/*
+	 * A GROUP WIDTH THE TENSOR CAN ACTUALLY USE, instead of none at all.
+	 *
+	 * The fallback below is correct and coarse: a K the requested width
+	 * does not divide gets ONE scale for the whole row. Round 415 counted
+	 * what that costs -- five of the eight models in the zoo have tensors
+	 * on that path at the shipping width, and gemma-3-1b has ALL of them
+	 * there, which is 108.7063 against 79.2824 at a width its K does
+	 * divide.
+	 *
+	 * Nothing requires the width to be the same for every tensor. The
+	 * hardware's rule is that one dispatch cannot cover K wider than one
+	 * group, because it sums a whole slice before any scale is applied --
+	 * so a tensor needs its slices inside its OWN group, and that is all.
+	 * With this on, a tensor whose K misses the requested width takes the
+	 * widest divisor of its K that is narrower than the width, and
+	 * npudev slices it at that instead of at KMAX.
+	 *
+	 * Off by default. It changes the weights, so it changes the text, and
+	 * it costs slices: the widest divisor can be much narrower than the
+	 * width asked for, and a narrower group is more dispatches. Round 415
+	 * has the board's side of that trade and it runs from +3% to -12% of
+	 * decode depending on the model.
+	 */
+	if (charsiu_env_flag("CHARSIU_NPU_W4_GROUP_FIT", 0) && k > 1) {
+		/*
+		 * The widest PROPER divisor of k that is no wider than the
+		 * width asked for. Proper matters: a group exactly as wide as
+		 * K is refused downstream by kgroup < k, so a tensor whose K
+		 * equals the width -- Qwen3-0.6B's 1024 wide ones, gemma-3-1b's
+		 * o_proj -- is on the per-row path today even though its K
+		 * divides the width perfectly.
+		 */
+		uint64_t d = grp < k ? grp : k - 1;
+
+		while (d > 1 && (k % d))
+			d--;
+		if (d > 1)
+			grp = d;
+	}
 	if (k % grp)
 		grp = k;
 	/*

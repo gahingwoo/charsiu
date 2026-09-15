@@ -1110,6 +1110,7 @@ struct charsiu_npu {
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
 	int poolread_set, packpool_set;
+	int gfit;         /* CHARSIU_NPU_W4_GROUP_FIT, see eff_kmax() */
 	int kfit;
 	int even_ks;      /* K slices of equal width, see slice_k() */
 	/*
@@ -1533,7 +1534,29 @@ static int w4_for(const struct charsiu_npu *g, const struct npu_tensor *t)
 static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *t)
 {
 	return w4_for(g, t) && t->kgroup && t->kgroup < t->k &&
-	       (t->k % t->kgroup) == 0 && t->kgroup == (uint64_t)g->kmax;
+	       (t->k % t->kgroup) == 0 && t->kgroup <= (uint64_t)g->kmax;
+}
+
+/*
+ * THE SLICE WIDTH FOR THIS TENSOR, which is not always KMAX.
+ *
+ * One dispatch cannot cover K wider than one quantisation group: the hardware
+ * sums a whole slice into one accumulator per output channel and the CPU
+ * multiplies by that slice's single scale afterwards, so a slice spanning two
+ * groups would apply the first group's scale to both. That is why the
+ * condition above used to be kgroup == kmax.
+ *
+ * It only ever needed kgroup <= kmax. A grouped tensor slices at its own
+ * group; an ungrouped one, and every int8 one, slices at KMAX as before. Every
+ * buffer in this file is sized by kmax_wide(), so a narrower slice fits what
+ * is already allocated.
+ *
+ * With CHARSIU_NPU_W4_GROUP_FIT off, npuquant only ever emits kgroup == the
+ * requested width or kgroup == k, so this returns exactly what it used to.
+ */
+static unsigned eff_kmax(const struct charsiu_npu *g, const struct npu_tensor *t)
+{
+	return tensor_grouped(g, t) ? (unsigned)t->kgroup : g->kmax;
 }
 
 /*
@@ -1855,11 +1878,41 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * UNGROUPED TENSORS ONLY. A grouped tensor carries one scale per
 	 * (channel, K group) and the gather in add_slice reads the group at
 	 * k0 / kgroup, so a slice that spans two groups would apply the first
-	 * group's scale to both. Ungrouped ones are scaled once at the end and
-	 * their K split is free: acc_out sums int32 across the slices, so any
-	 * split of the same K gives the same accumulator.
+	 * group's scale to both. Ungrouped ones are scaled once at the end.
 	 *
-	 * Off until a board round says it is both correct and faster.
+	 * IT SAID THEIR K SPLIT WAS FREE -- "acc_out sums int32 across the
+	 * slices, so any split of the same K gives the same accumulator" --
+	 * AND THAT IS AN int8 ARGUMENT ON AN int4 PATH. Read the accumulate
+	 * itself: the branch above it is commented "int4 writes float32, int8
+	 * the raw int32 accumulator", and the ungrouped int4 case does
+	 * af[n0 + j] += fo[j] with fo a float. Only the int8 case below it
+	 * takes const int32_t *out. Float addition is not associative, so a
+	 * different number of slices is a different rounding, and int4 is what
+	 * ships.
+	 *
+	 * THE BOARD AGREES, ROUND 415. gemma-3-1b's text MOVES with this on,
+	 * reproducibly, three passes each way, and the two answers swap when
+	 * KMAX does:
+	 *
+	 *   (KMAX 2048, KFIT 0) and (KMAX 1024, KFIT 1)  ->  one answer
+	 *   (KMAX 2048, KFIT 1) and (KMAX 1024, KFIT 0)  ->  the other
+	 *
+	 * which is the signature of a split-dependent sum rather than of a
+	 * bug in one arm. No other model of the ten moved, so this is the
+	 * shape of a model sitting near a token boundary, not of gemma3 being
+	 * special.
+	 *
+	 * AND IT IS NOT FASTER EITHER, which is the other half the paragraph
+	 * asked for. Ten models, three readings an arm, one boot:
+	 *
+	 *   gemma-4-E2B  +1.3%   the only gain
+	 *   Qwen2.5 -0.1  Qwen3 -0.1  Phi-3.5 -0.3  Llama-Q4 -0.3
+	 *   SmolLM2-1.7B -0.6  Llama-Q8 -0.7  SmolLM2-135M -0.9
+	 *   tinyllama -2.9  gemma-3-1b -3.1
+	 *
+	 * So: neither correct nor faster, and it stays off. An earlier arm in
+	 * the same round read +7.3% on gemma3 and was a different baseline --
+	 * it pinned KMAX to 1024 while llama_auto_kmax gives that model 2048.
 	 *
 	 * AND THE "UNGROUPED TENSORS ONLY" RESTRICTION COSTS IT NOTHING ON
 	 * THE MODELS IT IS FOR, which is not obvious and is why it is written
@@ -1876,6 +1929,39 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * Qwen3 and Phi-3.5 are unchanged, all their K being multiples of 1024.
 	 */
 	g->kfit = charsiu_env_flag("CHARSIU_NPU_KFIT", 0);
+	/*
+	 * SAY IT OUT LOUD ON int4. The K split is answer preserving only where
+	 * the cross slice sum is the int32 one, which is int8; int4 accumulates
+	 * in float and a different split is a different rounding. Round 415
+	 * watched gemma-3-1b's text move. Nobody should turn this on and find
+	 * that out from the output.
+	 */
+	if (g->kfit && g->w4)
+		fprintf(stderr, "charsiu: CHARSIU_NPU_KFIT changes the K split "
+			"and int4 sums its slices in FLOAT, so the answer can "
+			"move -- it did on gemma-3-1b in round 415\n");
+	/*
+	 * CHARSIU_NPU_W4_GROUP_FIT lets npuquant give a tensor whose K misses
+	 * the requested group width the widest divisor of its K instead of no
+	 * grouping at all, and eff_kmax() then slices that tensor at its own
+	 * group. This flag is read here only so that the two things that
+	 * depend on the slice width being KMAX can be handled.
+	 */
+	g->gfit = charsiu_env_flag("CHARSIU_NPU_W4_GROUP_FIT", 0);
+	/*
+	 * MIDRISE INDEXES asum BY k0 / kmax, which is a slice number only
+	 * while every slice is kmax wide. Refuse the pair rather than read the
+	 * wrong activation sum: both are off by default and nothing has ever
+	 * asked for them together.
+	 */
+	if (g->gfit && charsiu_env_flag("CHARSIU_NPU_W4_MIDRISE", 0)) {
+		fprintf(stderr, "charsiu: CHARSIU_NPU_W4_GROUP_FIT and "
+			"CHARSIU_NPU_W4_MIDRISE cannot both be on -- midrise "
+			"indexes the activation sums by k0 / KMAX, which is a "
+			"slice number only while every slice is KMAX wide\n");
+		g->gfit = 0;
+		g->midrise = 0;
+	}
 	/*
 	 * EQUAL K SLICES, AND WHAT MADE IT WORTH ASKING. slice_k() gives
 	 * every slice KMAX and lets the last one take the remainder, so
@@ -2036,6 +2122,17 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	g->deal_index = charsiu_env_flag("CHARSIU_NPU_DEAL_INDEX", 0);
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
+	/*
+	 * ROOM FOR A NARROWER SLICE. With CHARSIU_NPU_W4_GROUP_FIT a grouped
+	 * tensor slices at its own group rather than at KMAX, so it can need
+	 * more slots than this: the widest divisor of 5632 under 1024 is 512,
+	 * which is eleven slices where KMAX gave six. Measured over the eight
+	 * models in the zoo the worst ratio is 1.83, so two is enough and the
+	 * "no slice slots left" refusal below is the backstop if a model ever
+	 * needs more.
+	 */
+	if (charsiu_env_flag("CHARSIU_NPU_W4_GROUP_FIT", 0))
+		ks *= 2;
 	g->max_slices = ns * ks;
 	g->slot_cap = max_tensors * g->max_slices;
 
@@ -2822,16 +2919,18 @@ static void cq_fill(const struct npu_tensor *t, unsigned n0, uint8_t *cq)
  * to agree exactly or a slice writes past the end of a buffer sized for fewer,
  * so the widths are computed here rather than written out twice.
  */
-static unsigned slice_k0(const struct charsiu_npu *g, uint64_t k, unsigned ks,
+static unsigned slice_k0(const struct charsiu_npu *g,
+			 const struct npu_tensor *t, uint64_t k, unsigned ks,
 			 unsigned ki)
 {
-	return charsiu_slice_k0(k, ks, ki, g->kmax, g->even_ks, g->kfit);
+	return charsiu_slice_k0(k, ks, ki, eff_kmax(g, t), g->even_ks, g->kfit);
 }
 
-static unsigned slice_k(const struct charsiu_npu *g, uint64_t k, unsigned ks,
+static unsigned slice_k(const struct charsiu_npu *g,
+			const struct npu_tensor *t, uint64_t k, unsigned ks,
 			unsigned ki)
 {
-	return charsiu_slice_kw(k, ks, ki, g->kmax, g->even_ks, g->kfit);
+	return charsiu_slice_kw(k, ks, ki, eff_kmax(g, t), g->even_ks, g->kfit);
 }
 
 static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni)
@@ -3294,7 +3393,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	}
 
 	ns = (unsigned)((e_n_npu + g->nmax - 1) / g->nmax);
-	ks = (unsigned)((t->k + g->kmax - 1) / g->kmax);
+	ks = (unsigned)((t->k + eff_kmax(g, t) - 1) / eff_kmax(g, t));
 	/* the last slice absorbs the remainder rather than being it */
 	if (g->kfit) {
 		g->kfit_seen++;
@@ -3343,7 +3442,7 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 
 		nslot[0] = nslot[1] = 0;
 		for (unsigned ki = 0; ki < ks; ki++) {
-			unsigned kw = slice_k(g, t->k, ks, ki);
+			unsigned kw = slice_k(g, t, t->k, ks, ki);
 
 			for (unsigned ni = 0; ni < ns; ni++)
 				nslot[deal_pick(g, probe, w4_for(g, t), ki, ni, ns, kw,
@@ -3407,8 +3506,8 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	unsigned sid[2] = { 0, 0 };
 
 	for (unsigned ki = 0; ki < ks; ki++) {
-		unsigned k0 = slice_k0(g, t->k, ks, ki);
-		unsigned k = slice_k(g, t->k, ks, ki);
+		unsigned k0 = slice_k0(g, t, t->k, ks, ki);
+		unsigned k = slice_k(g, t, t->k, ks, ki);
 
 		for (unsigned ni = 0; ni < ns; ni++, si++) {
 			unsigned n0 = ni * g->nmax;
