@@ -4151,9 +4151,15 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
  * this accepts; if the two ever fall out of step the result is a refused chunk
  * run a row at a time -- a slower prefill and the same text.
  */
+/*
+ * AND THE RULE ITSELF IS charsiu_acc_width_ok, beside the map it comes from.
+ * This used to spell `(m % 2) == 0` here, which meant the offline sweep in
+ * tools/acc_index_check.c was asserting the map against its own copy of the
+ * law and never against the gate that ships.
+ */
 static int w4_width_expressible(unsigned m)
 {
-	return (m % 2) == 0;
+	return charsiu_acc_width_ok(m);
 }
 
 /*

@@ -87,7 +87,14 @@ static int prefill_width(int rem, int cap)
 {
 	int w = rem < cap ? rem : cap;
 
-	w &= ~1;	/* an odd width has no expression on the surface */
+	/*
+	 * DOWN TO A WIDTH THE SURFACE CAN NAME. This was `w &= ~1`, which is
+	 * the same answer for today's law and a second copy of it; the law is
+	 * charsiu_acc_width_ok, beside the map, and tools/acc_index_check
+	 * sweeps that one against charsiu_acc_index.
+	 */
+	while (w >= 2 && !charsiu_acc_width_ok((unsigned)w))
+		w--;
 	/*
 	 * 4 + 4 RATHER THAN 6 + 2, and the two cost the same: two batched
 	 * calls over the same eight tokens either way. 4 is a width the board

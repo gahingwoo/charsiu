@@ -19,9 +19,15 @@
  * map -- every index in range, no collision, no hole, and the four
  * consecutive slots the gather moves off one index -- then ASSERTS the law
  * rather than only printing it. A table nobody reads is how `m must be even`
- * would quietly stop being true the next time that function is touched, and
- * the two places that encode it (w4_batch_why_not in src/npudev.c, and
- * prefill_width in tools/charsiu_run.c) cannot see each other.
+ * would quietly stop being true the next time that function is touched.
+ *
+ * AND IT ASSERTS IT AGAINST THE PREDICATE THAT SHIPS. The law used to be
+ * written out four separate times -- the gate in src/npudev.c, the chunker in
+ * tools/charsiu_run.c, this sweep, and the map itself -- and this sweep
+ * compared the map only against its own copy, so the two that reach the
+ * hardware were never checked by anything. They all call charsiu_acc_width_ok
+ * now, which lives next to charsiu_acc_index because P = m / 2 is where the
+ * rule comes from, and that is the one this sweeps.
  *
  * It links against the real src/job.c, so it cannot drift from the function
  * that actually runs.
@@ -108,20 +114,28 @@ int main(int argc, char **argv)
 			}
 		}
 		printf("%s\n", all ? "SAFE" : "BROKEN");
-		if (all != (int)(m % 2 == 0)) {
-			printf("\n*** THE LAW IS BROKEN AT m = %u: predicted %s,"
-			       " measured %s (%s)\n", m,
-			       m % 2 == 0 ? "SAFE" : "BROKEN",
+		/*
+		 * AGAINST THE PREDICATE THAT SHIPS, not against a copy of it
+		 * written here. charsiu_acc_width_ok is what the gate in
+		 * npudev.c and the chunker in charsiu_run.c both call, so a
+		 * map that disagrees with it fails this sweep whichever of the
+		 * two somebody edited.
+		 */
+		if (all != !!charsiu_acc_width_ok(m)) {
+			printf("\n*** THE LAW IS BROKEN AT m = %u: charsiu_acc"
+			       "_width_ok says %s, the map is %s (%s)\n", m,
+			       charsiu_acc_width_ok(m) ? "SAFE" : "BROKEN",
 			       all ? "SAFE" : "BROKEN", why);
 			bad++;
 		}
 	}
 	if (bad) {
-		printf("\n%d width(s) contradict `m %% 2 == 0`. The gate in"
-		       " npudev.c and the chunker in charsiu_run.c are both"
-		       " built on it.\n", bad);
+		printf("\n%d width(s) contradict charsiu_acc_width_ok. The"
+		       " gate in npudev.c and the chunker in charsiu_run.c"
+		       " both call it, so both are now wrong too.\n", bad);
 		return 1;
 	}
-	printf("\nevery width 2..96 agrees with `m %% 2 == 0`, at every n.\n");
+	printf("\nevery width 2..96 agrees with charsiu_acc_width_ok, at"
+	       " every n.\n");
 	return 0;
 }
