@@ -381,6 +381,16 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./tests/version_all.sh $(BUILD)
 	./tests/host_checks.sh
 #
+# A HOMOGLYPH IN AN IDENTIFIER IS ALWAYS A BUG. npuquant.c declared
+# `double best<CYRILLIC IE> = -1.0` and used it three more times with the same
+# spelling, so it built, ran, was correct, and `grep beste` found nothing. The
+# checker parses comments and strings rather than grepping around them,
+# because a non-ASCII character in either of those is usually data that has to
+# stay -- the SentencePiece meta-space, a model's own garbled output.
+#
+	python3 -P tools/check_ascii.py --self-test
+	python3 -P tools/check_ascii.py
+#
 # THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the
 # reproduction section" on 09-11 and nobody implemented it. Run for the first

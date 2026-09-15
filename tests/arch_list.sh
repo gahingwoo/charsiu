@@ -27,7 +27,7 @@ for f in "$LOAD" "$CHECK"; do
 	[ -r "$f" ] || { echo "arch_list.sh: cannot read $f" >&2; exit 2; }
 done
 
-# ⚠ THE ARCHITECTURE COMPARISONS ONLY. Both files compare other strings with
+# THE ARCHITECTURE COMPARISONS ONLY. Both files compare other strings with
 # strcmp -- tensor names, tokenizer models -- so this matches strcmp(arch, ...)
 # and nothing else, which is the variable both lists are about.
 archs() { grep -oE 'strcmp\(arch, "[a-z0-9_]+"\)' "$1" | sed 's/.*"\(.*\)".*/\1/' | sort -u; }
@@ -35,13 +35,13 @@ archs() { grep -oE 'strcmp\(arch, "[a-z0-9_]+"\)' "$1" | sed 's/.*"\(.*\)".*/\1/
 a=$(archs "$LOAD")
 b=$(archs "$CHECK")
 
-# ⚠ clip IS NOT A GRAPH AND IS NOT IN THIS COMPARISON. charsiu_check reads
+# clip IS NOT A GRAPH AND IS NOT IN THIS COMPARISON. charsiu_check reads
 # mmproj files as well, and "clip" is how it tells one apart; llama_load never
 # sees one. Excluded by name here rather than by being quietly absent, so that
 # a future architecture cannot hide behind the exception.
 b=$(printf '%s\n' "$b" | grep -v '^clip$')
 
-# ⚠ NO PROCESS SUBSTITUTION. The first draft used comm with <(...), which is
+# NO PROCESS SUBSTITUTION. The first draft used comm with <(...), which is
 # a bashism: the board runs busybox sh, where that is a syntax error, and this
 # is meant to be runnable anywhere the rest of tests/ is. Two plain loops.
 bad=0

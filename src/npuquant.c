@@ -648,7 +648,11 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 			 * says a weight space objective is the wrong one.
 			 */
 			if (w4clip) {
-				double bestе = -1.0;
+				/* best_err, in Latin letters. This was spelt
+				 * with a CYRILLIC small ie where the final e
+				 * should be, in all four places, so it built
+				 * and ran and `grep beste` found nothing. */
+				double best_err = -1.0;
 				float bestd = d;
 				int ci;
 
@@ -667,8 +671,8 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 						e = (double)row[i] - (double)v * dc;
 						err += e * e;
 					}
-					if (bestе < 0.0 || err < bestе) {
-						bestе = err;
+					if (best_err < 0.0 || err < best_err) {
+						best_err = err;
 						bestd = dc;
 					}
 				}
