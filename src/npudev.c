@@ -129,6 +129,11 @@ struct npu_slot {
 struct npu_entry {
 	const struct npu_tensor *t;
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
+	/*
+	 * THE STRIDE BETWEEN THIS ENTRY'S OUTPUT SLOTS, which used to be
+	 * g->out_stride for every tensor in the model. See out_fit_stride.
+	 */
+	unsigned out_stride;
 	unsigned first, count;     /* slots, n fastest */
 	unsigned n_slices, k_slices;
 	double weight_mb;
@@ -142,6 +147,17 @@ struct npu_entry {
 	 * engine part of the SAME tensor -- and the cheapest second engine is
 	 * the CPU, which is already here and is already BLOCKED in prep_bo for
 	 * most of the fence.
+	 *
+	 * AND THE SPARE IS LARGER THAN THAT, MEASURED BOTH WAYS. Round 419 ran
+	 * charsiu_membw against a decode instead of inferring the pair's total:
+	 * eight reader threads get 11.92 GB/s alongside a 256 token decode
+	 * against 11.93 alone, and the decode reads 20.82 tok/s against 20.79.
+	 * One reader thread is 8.64 against 8.63. NEITHER SIDE LOSES ANYTHING,
+	 * so the controller is not the binding constraint at decode's demand
+	 * and the figure above understates what is there. Four threads is also
+	 * a bad place to measure it from: the reader sweep is not monotone,
+	 * because four threads land across the A72 and A53 clusters and reach
+	 * 7.54 GB/s where one thread reaches 8.63.
 	 *
 	 * AND ROUND 371 RAN IT AND IT LOST, BADLY. This paragraph read as
 	 * a live idea for forty rounds because the round that refuted it wrote
@@ -300,6 +316,28 @@ struct charsiu_npu {
 	int qos_fd;
 	struct charsiu_bo in[2];      /* one per device: they cannot be shared */
 	unsigned in_stride, out_stride, max_slices, maxtask;
+	/*
+	 * WHAT THE OUTPUT INVALIDATE IS CHARGED ON, AND WHAT IT WOULD BE
+	 * CHARGED ON IF THE STRIDE FITTED THE TENSOR.
+	 *
+	 * out_stride is nmax * 4, which is 32 KB whatever the tensor's own n
+	 * is, and bo_prep works over a WHOLE buffer object. So a tensor of
+	 * n = 2048 pays the invalidate on four times the bytes it wrote, and
+	 * how much that costs depends on how many slices the deal gave this
+	 * device -- which is not a number anybody had. These two count it.
+	 */
+	uint64_t outprep_b, outneed_b;
+	unsigned long outprep_n;
+	/*
+	 * AND THE SAME QUESTION ON THE INPUT SIDE. Its prep is already off
+	 * by default -- the device only reads that buffer -- but its FINI
+	 * is not optional: the CPU wrote the activation and that clean is
+	 * what makes the bytes visible to the hardware. It is charged on
+	 * the whole shared buffer, sized for the widest k times every k
+	 * slice a model can want, while a call touches only its own.
+	 */
+	uint64_t infini_b, inneed_b;
+	unsigned long infini_n;
 	uint8_t *scratch;
 	int32_t *acc;
 	/*
@@ -2708,6 +2746,38 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				" SLOWER, see read_rows)\n",
 				g->bread_passes, g->bread_ranges,
 				g->bread_passes - g->bread_ranges);
+		/*
+		 * THE OUTPUT INVALIDATE, ON WHAT IT IS CHARGED AND ON WHAT IT
+		 * WOULD BE. npu_prep_cost measures cache maintenance alone at
+		 * 13.8 GB/s with a 1.4 us floor an ioctl, so the difference
+		 * between these two numbers can be priced without another
+		 * board round. The saving is an UPPER bound: it assumes a
+		 * stride that fits the tensor costs nothing else, and
+		 * out_stride is read by the job's output address and by the
+		 * read back, so making it per tensor is a change to both.
+		 */
+		if (g->infini_n)
+			fprintf(stderr, "charsiu NPU: the activation clean was"
+				" charged on %.1f MB over %lu finis; the slots a"
+				" call touches are %.1f MB. Its PREP is already"
+				" off (CHARSIU_NPU_INPREP) because the device only"
+				" reads it; the clean is what makes the bytes"
+				" visible, and DRM_ROCKET_FINI_BO takes a handle"
+				" with no range\n",
+				g->infini_b / 1e6, g->infini_n,
+				g->inneed_b / 1e6);
+		if (g->outprep_n)
+			fprintf(stderr, "charsiu NPU: the output invalidate was"
+				" charged on %.1f MB over %lu preps; the slots"
+				" actually written are %.1f MB, so %.1f MB is"
+				" out_stride being nmax*4 rather than the"
+				" tensor's n (about %.0f ms at npu_prep_cost's"
+				" 13.8 GB/s, an upper bound)\n",
+				g->outprep_b / 1e6, g->outprep_n,
+				g->outneed_b / 1e6,
+				(g->outprep_b - g->outneed_b) / 1e6,
+				(double)(g->outprep_b - g->outneed_b) / 13.8e9
+					* 1e3);
 		if (g->bfused_groups)
 			fprintf(stderr, "charsiu NPU: the fused read took %lu"
 				" ranges carrying %lu slices, so Y was touched"
@@ -2959,6 +3029,64 @@ static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni
 	return (n_npu - n0) < g->nmax ? (n_npu - n0) : g->nmax;
 }
 
+/*
+ * THE OUTPUT SLOT STRIDE, AND WHY IT IS A KNOB RATHER THAN A FIX.
+ *
+ * g->out_stride is nmax * 4 -- 32 KB at the default 8192 -- whatever the
+ * tensor's own n is, and charsiu_bo_prep invalidates a WHOLE buffer object:
+ * DRM_ROCKET_PREP_BO takes a handle and has no offset or length, so the
+ * kernel has no way to be told about a range. Counted on boot 1b50bcda, 32
+ * tokens, four models:
+ *
+ *   model            charged   written   ratio
+ *   Llama-3.2-1B     289.0 MB   78.1 MB   3.7
+ *   gemma-3-1b       273.6      55.4      4.9
+ *   Qwen3-0.6B       301.9      38.4      7.9
+ *   Phi-3.5-mini     535.5     151.1      3.5
+ *
+ * At npu_prep_cost's 13.8 GB/s that difference is 15 to 28 ms of a run. Giving
+ * each entry a stride of its own widest slice instead is the same change the
+ * buffer SIZE makes, so the saving is real bytes and not an accounting trick:
+ * on Llama the charge falls from 559.5 MB to 207.2 MB for the same 150.6 MB
+ * written.
+ *
+ * IT IS THE DEFAULT, AND THE EVIDENCE IS BOTH HALVES. Boot 1b50bcda, 594 MHz,
+ * performance governor, one binary, arms alternating, three readings each,
+ * 128 generated tokens:
+ *
+ *   model            FIT=0 (range)     FIT=1 (range)     margin
+ *   Llama-3.2-1B     21.18 (0.38%)     21.60 (0.19%)     +1.98%
+ *   Qwen3-0.6B       26.21 (1.68%)     27.04 (0.55%)     +3.17%
+ *   gemma-3-1b       20.21 (0.00%)     20.62 (0.34%)     +2.03%
+ *   tinyllama-1.1b   22.03 (1.70%)     22.54 (0.27%)     +2.29%
+ *
+ * Every margin clears BOTH arms' own spread, and the text is identical on all
+ * ten models the board holds, which is the bar board_text_all.sh sets. A
+ * wrong stride is a wrong answer and not a slow one -- it moves the address
+ * every slot writes to, the address the read back walks, and the bounds check
+ * between them, and all three move together here.
+ *
+ * CHARSIU_NPU_OUT_FIT=0 puts the nmax-wide stride back.
+ *
+ * AND THE BYTES DO NOT EXPLAIN THE WHOLE GAIN. 352 MB at 13.8 GB/s is 25 ms
+ * of a 6042 ms run, 0.42%, against a measured 1.98% on that model. So
+ * something besides the cache maintenance moved -- a smaller buffer is also
+ * fewer pages to allocate and map, and this tree has measured an allocation
+ * and called it a matmul before. That is an open attribution, not an
+ * explanation, and the knob is what a round would use to close it.
+ */
+static unsigned out_fit_stride(const struct charsiu_npu *g, unsigned n_npu)
+{
+	unsigned w;
+
+	if (!charsiu_env_flag("CHARSIU_NPU_OUT_FIT", 1))
+		return g->out_stride;
+	w = n_npu < g->nmax ? n_npu : g->nmax;
+	/* the slots of one entry index by a single stride, so it is the widest
+	 * slice's width; slice_n only ever returns less for the last one */
+	return w * 4u;
+}
+
 /* the weight megabytes a slice costs the device it lands on, at its own width */
 static double slice_mb(int w4, unsigned k, unsigned n)
 {
@@ -3082,7 +3210,8 @@ static unsigned deal_pick(const struct charsiu_npu *g, double load[2],
 static int add_slice(struct charsiu_npu *g, unsigned di,
 		     const struct npu_tensor *t,
 		     unsigned n0, unsigned n, unsigned k0, unsigned k,
-		     unsigned ki, unsigned si, uint32_t out_base)
+		     unsigned ki, unsigned si, uint32_t out_base,
+		     unsigned ostride)
 {
 	struct npu_slot *s = &g->slot[g->n_slot];
 
@@ -3167,7 +3296,7 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 
 	/* its own slot in each shared buffer, baked into the stream */
 	s->job.input_addr = (uint32_t)g->in[di].dma_address + ki * g->in_stride;
-	s->job.output_addr = out_base + si * g->out_stride;
+	s->job.output_addr = out_base + si * ostride;
 	s->job.weight_addr = (uint32_t)s->wt.dma_address;
 	s->job.coef_addr = (uint32_t)s->coef.dma_address;
 
@@ -3498,11 +3627,12 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * also SMALLER wherever the deal is uneven, which is the same cache
 	 * maintenance argument running the other way.
 	 */
+	e->out_stride = out_fit_stride(g, e_n_npu);
 	for (unsigned d = 0; d < g->ndev; d++) {
 		size_t slots = (size_t)nslot[d] + 1;
 
 		if (charsiu_bo_alloc(g->dev[d],
-				     slots * g->out_stride + 4096,
+				     slots * e->out_stride + 4096,
 				     &e->out[d])) {
 			whine(g, "an output buffer would not allocate",
 			      (unsigned)t->k, (unsigned)t->n);
@@ -3536,7 +3666,8 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 					       k, n);
 
 			if (add_slice(g, d, t, n0, n, k0, k, ki, sid[d]++,
-				      (uint32_t)e->out[d].dma_address) < 0) {
+				      (uint32_t)e->out[d].dma_address,
+				      e->out_stride) < 0) {
 				g->n_slot = first;
 				return -1;
 			}
@@ -3804,6 +3935,9 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 	}
 	charsiu_bo_fini(g->dev[d], &g->in[d]);
+	g->infini_b += g->in[d].size;
+	g->inneed_b += (uint64_t)e->k_slices * g->in_stride;
+	g->infini_n++;
 	}
 	g->pack_us += now_us() - tpack;
 	/*
@@ -3901,9 +4035,20 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		double t1 = now_us();
 
 		for (unsigned d = 0; d < g->ndev; d++)
-			if (sent & (1u << d))
+			if (sent & (1u << d)) {
 				charsiu_bo_prep(g->dev[d], &e->out[d],
 						2000000000);
+				g->outprep_b += e->out[d].size;
+				g->outprep_n++;
+			}
+		/* and what the same slots would need at their own widths */
+		for (i = 0; i < e->count; i++) {
+			const struct npu_slot *s_ = &g->slot[e->first + i];
+
+			if (sent & (1u << s_->di))
+				g->outneed_b += (uint64_t)slice_n(g, e->n_npu,
+						 s_->n0 / g->nmax) * 4u;
+		}
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
 		int grp = tensor_grouped(g, e->t);
@@ -3929,7 +4074,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			const uint8_t *base = (const uint8_t *)e->out[s->di].map +
-					      s->out_slot * g->out_stride;
+					      s->out_slot * e->out_stride;
 
 			/* int4 writes float32, int8 the raw int32 accumulator */
 			if (w4_for(g, e->t)) {
@@ -7762,7 +7907,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				return -1;
 			}
 			base = (const uint8_t *)e->out[s->di].map +
-			       s->out_slot * g->out_stride;
+			       s->out_slot * e->out_stride;
 
 			/*
 			 * THE SLICE'S OWN WIDTH AND OFFSET, which decide how
@@ -7776,7 +7921,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				     (unsigned long)s->n0);
 			if (s->n0 + s->job.mm.n > g->max_n ||
 			    s->job.mm.n > g->nmax ||
-			    (s->out_slot + 1) * (size_t)g->out_stride
+			    (s->out_slot + 1) * (size_t)e->out_stride
 				    > e->out[s->di].size) {
 				fprintf(stderr, "charsiu: slice %u of tensor "
 					"%u wants n0 %u + n %u of %u, slot %u "
