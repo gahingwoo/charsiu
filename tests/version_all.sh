@@ -41,12 +41,26 @@ else
 fi
 trap 'rm -f "$TMP"' EXIT INT TERM
 
+# A TRAIL THAT SURVIVES THE MACHINE, because twice now the board has gone
+# silent during this script and neither time could say which binary it was on.
+# Everything this prints goes to a pipe that is lost when the far end dies, and
+# the loop only prints AFTER a binary returns -- so the one that does not
+# return is exactly the one with no line. The trail is written and synced
+# BEFORE each child starts, so what is on the disk after a power cycle is the
+# name of the binary that was running.
+#
+# sync per binary is 32 syncs. This script measures nothing timed.
+TRAIL="${CHARSIU_VERSION_TRAIL:-$DIR/version_all.last}"
+: > "$TRAIL" 2>/dev/null || TRAIL=/dev/null
+
 ok=0; bad=0; missing=0
 for b in $BINS; do
 	if [ ! -x "$DIR/$b" ]; then
 		missing=$((missing + 1))
 		continue
 	fi
+	printf 'starting %s\n' "$b" >> "$TRAIL" 2>/dev/null
+	sync 2>/dev/null || true
 	# A TIMEOUT, because the failure mode IS running: a tool that does not
 	# recognise --version starts its real work, and several of these take
 	# minutes or drive the NPU. Without one the check hangs on exactly the
@@ -93,5 +107,9 @@ for b in $BINS; do
 	    bad=$((bad + 1)) ;;
 	esac
 done
+# A FINISHED RUN SAYS SO IN THE TRAIL, or a stale "starting X" from a clean
+# run reads exactly like the binary that killed the machine.
+printf 'finished cleanly\n' >> "$TRAIL" 2>/dev/null
+sync 2>/dev/null || true
 echo "$ok answered, $bad did not, $missing not present in $DIR"
 exit "$bad"
