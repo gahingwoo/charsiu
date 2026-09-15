@@ -786,10 +786,24 @@ point. Over an eight-point ladder the three parameters are correlated, and a
 lower `c` is bought with a higher `b`. `tools/ttft_compare.py` interpolates
 inside each curve and never fits across them; that is why it exists.
 
-**Still not supported: that charsiu beats the vendor on prefill.** It does
-not, above about 250 tokens. Their attention remains roughly 4.3x cheaper than
-ours -- our fence alone is 880 ms against their entire quadratic term's 539 at
-852 tokens.
+**THE 250 TOKEN BOUND IN THIS PARAGRAPH IS SUPERSEDED BY 1k-ii AND WAS LEFT
+STANDING.** It read "Still not supported: that charsiu beats the vendor on
+prefill. It does not, above about 250 tokens." That was true of the binary
+this section measured. r413 re-ran the whole ladder on the SHIPPING binary,
+five repeats a point, one boot, clock and governor pinned, and charsiu is
+ahead at every rung to 602 tokens and level at 852 -- +24.8% at 27 tokens,
++9.6% at 202, +4.9% at 302, +3.5% at 602, +2.1% and LEVEL at 852. The
+crossover this paragraph names does not exist on that binary.
+
+What survives is the direction and the cause, not the bound: the margin
+SHRINKS with prompt length, because their attention remains roughly 4.3x
+cheaper than ours -- our fence alone is 880 ms against their entire quadratic
+term's 539 at 852 tokens. Extended far enough that still crosses; 852 is where
+it reaches level, and nothing here measures beyond it.
+
+Two paragraphs in one document disagreeing about who leads prefill is exactly
+what section 0 warns about when it says the citation and the arm do not agree
+about TTFT. Read 1k-ii, which names its binary, its boot and its spread.
 
 **AND THE EXPLANATION THAT WAS ATTACHED TO THAT WAS NOT MEASURED.** This
 paragraph said 0.119 TMAC/s against the int4 path's 0.45 to 0.70, and called
