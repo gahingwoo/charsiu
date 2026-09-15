@@ -1359,6 +1359,37 @@ fixed, and that is worth checking whenever a scheduling default changes.
              the fastest. Quoting it cites a number derived to refute it.
 ```
 
+### 5a. The controller is not the binding constraint at decode
+
+Both loads were run against each other on 2026-09-15, boot 8934c5ee, 594 MHz,
+performance governor: `charsiu_membw` reading a 256 MB buffer for 8 s inside
+the 12.3 s generation window of a 256 token Llama-3.2-1B decode.
+
+```
+                            readers alone   alongside a decode   decode t/s
+  1 reader thread              8.63 GB/s          8.64             20.84
+  8 reader threads            11.93 GB/s         11.92             20.82
+  decode alone                     --               --             20.79
+```
+
+**Neither side loses anything.** Eight cores reading DRAM flat out move decode
+by 0.1%, and the decode moves them by 0.1%. So a second engine taking part of
+the work is not zero sum for want of bandwidth, which is what the tool was
+written to find out.
+
+That is consistent with the per-call floor being 38% of a token: the NPU pulls
+its weights in bursts and waits between them, so its average demand is well
+under the peak even though the total bytes a token are large. **It does not
+show that decode is compute bound, and it does not measure the GPU.** The
+readers here are an independent load, not a second engine taking part of the
+same tensor, and they were not placed on the runtime's own cores.
+
+**And the thread count belongs to the figure.** The reader sweep is not
+monotone: 1 thread 8.63, 2 threads 8.09, 3 threads 7.68, 4 threads 7.54, 6
+threads 10.59, 8 threads 11.92. Four threads are worse than one. That is the
+A72 and A53 clusters, the same split that makes decode bimodal, so "the CPU
+reaches X GB/s" is not a quantity without a thread count beside it.
+
 ---
 
 ## 6. Variability, and what one passage can order
