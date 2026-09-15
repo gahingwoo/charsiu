@@ -1123,6 +1123,99 @@ out of, and the only one that gains. What this asks for is a per model
 decision, which is what `llama_auto_kmax` already is; it only ever looks
 upward.
 
+### Looking downward, tried on all eight, and why the default stays up
+
+`CHARSIU_NPU_W4_GROUP_FIT=1`, default off, gives each tensor the widest PROPER
+divisor of its own K that is no wider than the width asked for. It is the
+narrowest form of "look downward": the requested width is still the ceiling,
+and nothing changes for a tensor the ceiling already divides. Quality on the
+desk, 511 scored positions of `tests/corpus/long.txt`; decode on the board,
+boot afe55e04, 594 MHz, boot entry 1, performance governor, three readings an
+arm, medians, binary 95e72869ba97.
+
+```
+  model            ppl FIT=0   FIT=1       ppl     decode 0   1     decode
+  Qwen2.5-1.5B      37.6358   27.1185   -27.9%      14.96  15.29    +2.2%
+  gemma-3-1b       108.7063   82.4102   -24.2%      21.61  21.71    +0.5%
+  tinyllama-1.1b    29.9309   28.2998    -5.4%      22.87  22.80    -0.3%
+  Llama-3.2-1B      41.2763   41.2763     0.0%      21.52  21.43    -0.4%
+  Phi-3.5-mini      17.8023   17.8023     0.0%       7.25   7.22    -0.4%
+  SmolLM2-1.7B      31.1293   31.1293     0.0%      15.30  15.24    -0.4%
+  Qwen3-0.6B        87.8019   89.2738    +1.7%      30.64  29.22    -4.6%
+  gemma-4-E2B       89.0370   99.8674   +12.2%       9.51   9.88    +3.9%
+```
+
+**Two models are strictly better on both axes**, and a third is nearly free:
+Qwen2.5-1.5B gains 27.9% of perplexity and 2.2% of decode, gemma-3-1b 24.2%
+and 0.5%, tinyllama 5.4% of quality for 0.3% of decode.
+
+**Three are unchanged to the digit, which is the property that makes it
+safe to leave on.** Llama, Phi-3.5 and SmolLM2-1.7B read the same perplexity
+with the flag on as off, because their K values already have a proper divisor
+at the requested width and the fit picks the same number. It is a no-op where
+it is not needed, ON as well as off.
+
+**Their -0.4% of decode is the flag's own cost, and it is not nothing.**
+Nothing about those three models' weights changes, so that column is the
+doubled slot capacity the flag allocates, measured on models where it buys
+nothing.
+
+**And two models get worse from a strictly finer quantisation.** Qwen3-0.6B's
+only change is its 1024-wide tensors going from one scale a row to two groups
+of 512; its 2048 and 3072 tensors are untouched and read the same rms either
+way. gemma-4-E2B's are 1536 to three groups of 512 and 256 to two of 128.
+Nothing else moves in either model, and both lose.
+
+That is not float rounding from a different slice count. These are desk
+numbers, where `CHARSIU_NPU=0` means there are no slices at all: `npu_matvec`
+walks the groups and accumulates in double. The difference is the
+quantisation itself. **Both signs hold on the second corpus**, which is what
+this pack requires of a result it does not like. On `tests/corpus/long2.txt`,
+same arms, same lengths:
+
+```
+  Qwen3-0.6B     long   87.8019 ->  89.2738   +1.7%
+                 long2 120.4219 -> 124.7481   +3.6%
+  Qwen2.5-1.5B   long   37.6358 ->  27.1185  -27.9%
+                 long2  51.3478 ->  37.4671  -27.0%
+```
+
+Qwen2.5's gain reproduces to within a point of its own size; Qwen3's loss
+reproduces in sign and grows. Neither is one passage.
+
+**The weight error falls on every model and the perplexity goes both ways.**
+`CHARSIU_NPU_RMS=1` makes the quantiser report each tensor's reconstruction
+error:
+
+```
+  model          mean rms FIT=0   FIT=1             ppl
+  gemma-3-1b        14.2882%   12.4938%   -12.6%   -24.2%   better
+  gemma-4-E2B       14.2980%   13.1508%    -8.0%   +12.2%   worse
+  Qwen3-0.6B        13.6892%   12.0744%   -11.8%    +1.7%   worse
+```
+
+It has to fall: a finer partition of the same row cannot have a worse absmax.
+The reductions are all the same size, 8 to 12.6%, while the quality outcome
+differs in SIGN. **So the Frobenius error cannot predict the direction of the
+quality change, let alone its size**, and no ranking built on it can order
+these models. This pack already has that statement from the other side, in the
+reconstruction that scored ppl 1701 at 18.3% weight error where Gaussian noise
+of the same magnitude scored 32.10. This is the same fact read backwards: a
+genuine reduction in weight error, and two models of eight pay for it.
+
+**What that leaves `llama_auto_kmax`.** A downward rule would need a
+predictor, evaluated before any weights are quantised, for which side of zero
+a model lands on. The candidates measured here do not supply one: it is not
+the group count (gemma-3-1b's odd rungs are among its best), not the widths
+involved (Qwen3 and Qwen2.5 both go 1024-wide tensors to 512 and move in
+opposite directions), and not the weight error, which moves the same way for
+everyone. Choosing per model is possible and costs one perplexity run per
+model per candidate width; choosing per model **without running the model** is
+not something this data supports.
+
+So the flag ships default off. Two of eight models get worse, and a default
+that changes output under a shipped model belongs to whoever ships it.
+
 **And the trade cannot be engineered away.** A narrow group forces a narrow
 slice, because one dispatch cannot cover K wider than one group: the hardware
 returns one accumulator per output channel per slice (`fo[j]`,
