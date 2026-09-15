@@ -3068,6 +3068,15 @@ static unsigned slice_n(const struct charsiu_npu *g, unsigned n_npu, unsigned ni
  *
  * CHARSIU_NPU_OUT_FIT=0 puts the nmax-wide stride back.
  *
+ * AND THE ANSWER WAS ALREADY IN THIS FILE, ON THE OTHER PATH. The BATCHED
+ * output has been sized this way since the round that found 652 ms of a 1811
+ * ms matmul in its allocations, and its comment gives the same reason in the
+ * same words: "SIZED FOR THIS TENSOR'S OWN WIDEST SLICE, not for nmax. attn_q
+ * is 2048 wide and the head is 8192; one buffer for both makes attn_q pay the
+ * head's cache maintenance on every call." Prefill learned it and decode did
+ * not, and nothing compared the two paths, so the decode side kept paying for
+ * another forty rounds.
+ *
  * AND THE BYTES DO NOT EXPLAIN THE WHOLE GAIN. 352 MB at 13.8 GB/s is 25 ms
  * of a 6042 ms run, 0.42%, against a measured 1.98% on that model. So
  * something besides the cache maintenance moved -- a smaller buffer is also
