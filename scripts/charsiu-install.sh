@@ -489,7 +489,7 @@ package, or U-Boot environment variables), and guessing at it would
 be worse than doing nothing.
 
 Install a kernel built from the series by hand instead:
-  https://github.com/$REPO  (rfc-send-v9/, kernel/base.config)"
+  https://github.com/$REPO  (rfc-send-v13/, kernel/base.config)"
 		return 1
 	fi
 
@@ -509,7 +509,7 @@ Install a kernel built from the series by hand instead:
 		ui_msg "Could not reach the GitHub API.
 
 Check the network (charsiu-doctor reports it), or build a kernel
-from rfc-send-v9/ by hand."
+from rfc-send-v13/ by hand."
 		return 1
 	fi
 	URLS=$(echo "$J" | tr ',' '\n' | grep -o '"browser_download_url":[ ]*"[^"]*"' \
