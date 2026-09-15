@@ -29,7 +29,26 @@ int main(int argc, char **argv)
 	static const char *cases[] = {
 		"The capital of France is Paris.",
 		"hello  world   with   runs of spaces",
-		"unicode: 你好世界 ünïcödé emoji ",
+		/*
+		 * THE THREE AND FOUR BYTE CASES ARE HEX ESCAPES, NOT GLYPHS, AND
+		 * THEY WERE ONCE MISSING ALTOGETHER.
+		 *
+		 * This line used to carry a literal U+2713 and U+1F642. Commit
+		 * 5051745, "strip every emoji from the tree", took both out of
+		 * this TEST INPUT and left the word "emoji" pointing at nothing,
+		 * so the round trip stopped covering three and four byte UTF-8 and
+		 * said so in its own string while doing it.
+		 *
+		 * Written as escapes the source stays ASCII and the bytes reach
+		 * the tokenizer unchanged, which is what the case is for. They are
+		 * separate literals because a hex escape in C eats as many hex
+		 * digits as it can find, and the next character here is a space
+		 * only by luck.
+		 */
+		"unicode: 你好世界 ünïcödé "
+		"\xE2\x9C\x93"          /* U+2713, three bytes */
+		" emoji "
+		"\xF0\x9F\x99\x82",     /* U+1F642, four bytes */
 		"punctuation!?;:'\"[]{}()<>@#$%^&*",
 		"digits 0123456789 mixed42with7text",
 		"",

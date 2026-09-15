@@ -431,7 +431,7 @@ if [ -z "$o" ]; then
 	echo "already explains m = 8 and m = 10 -- was not tested. Run:"
 	echo "  CHARSIU_INT_ARMS=\"default onedev zero\" sh $0 $(basename "$MODEL") $RUNS"
 elif [ "$two" -gt 0 ] && [ "$o" -eq 0 ]; then
-	echo "→ THE CORE PAIR, AT A LOW RATE. Wrong $two time(s) across the two"
+	echo "-> THE CORE PAIR, AT A LOW RATE. Wrong $two time(s) across the two"
 	echo "  core arms and $RUNS of $RUNS clean on ONE core. That is the same"
 	echo "  fault the dense sweep proved at m = 8 and m = 10 -- two cores on"
 	echo "  row 0 of a wide output -- firing rarely at this width instead of"
@@ -439,17 +439,17 @@ elif [ "$two" -gt 0 ] && [ "$o" -eq 0 ]; then
 	echo "  It also means the sweep's \"every even width exact\" is ONE"
 	echo "    sample a width, and cannot see a one-in-sixteen fault."
 elif [ "$two" -gt 0 ] && [ "$o" -gt 0 ]; then
-	echo "→ NOT THE CORE PAIR. Wrong $o of $RUNS on one core as well, so"
+	echo "-> NOT THE CORE PAIR. Wrong $o of $RUNS on one core as well, so"
 	echo "  concurrency is excluded with a rate on both sides and this is a"
 	echo "  fault of its own. Next: CHARSIU_DBG_LAYERS=1 on both paths."
 elif [ "$two" -eq 0 ] && [ "$o" -eq 0 ]; then
-	echo "→ IT DID NOT FIRE, $RUNS runs on each of $ARMS."
+	echo "-> IT DID NOT FIRE, $RUNS runs on each of $ARMS."
 	echo "  Not a pass on its own: this fault has gone ten and sixteen runs"
 	echo "  clean before. Raise the run count or change the condition"
 	echo "  (chunk, gen length, taskset) until it fires, and only then"
 	echo "  compare arms."
 else
-	echo "→ CLEAN ON TWO CORES AND DIRTY ON ONE, which nothing predicts."
+	echo "-> CLEAN ON TWO CORES AND DIRTY ON ONE, which nothing predicts."
 	echo "  Suspect the run before the silicon and repeat it."
 fi
 echo "======================================================================"

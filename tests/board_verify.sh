@@ -111,7 +111,7 @@ wedged() {
 
 have() { [ -x "$BIN/$1" ] || [ -f "$BIN/$1" ]; }
 run()  { RAN="$RAN $1"; }
-skip() { SKIP="$SKIP $1($2)"; printf '  – skipped: %s\n' "$2"; }
+skip() { SKIP="$SKIP $1($2)"; printf '  -- skipped: %s\n' "$2"; }
 
 echo "charsiu board verification"
 echo "  binaries  $BIN"
@@ -493,7 +493,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	       else
 	         printf "     the widening is free, so net == slicing and the range is\n     %+.1f%% .. %+.1f%%.\n", worst, best
 	     }' "$OUT/.kfit_rows"
-	[ "$ndead" = 0 ] || printf '\n  – %s model(s) never generated; see above.\n' "$ndead"
+	[ "$ndead" = 0 ] || printf '\n  -- %s model(s) never generated; see above.\n' "$ndead"
    fi
    ;;
 

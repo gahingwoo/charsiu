@@ -253,7 +253,7 @@ for MODEL in $MODELS; do
 	  *" pinned "*)
 	    pl=${R_plain%%/*}; pn=${R_pinned%%/*}
 	    if [ "$pl" = yes ] && [ "$pn" = no ]; then
-		echo "  → IT IS THE CPU SIDE, NOT THE MODEL. Right unpinned at the"
+		echo "  -> IT IS THE CPU SIDE, NOT THE MODEL. Right unpinned at the"
 		echo "    default thread count, wrong pinned to four cores with"
 		echo "    -t 4. No tensor is a function of the thread count, so"
 		echo "    this is a race in the batched loop's own threaded work"
@@ -261,18 +261,18 @@ for MODEL in $MODELS; do
 		echo "    Next: sweep -t alone (1 2 4 8) with no taskset, then"
 		echo "    taskset alone at the default -t. One of the two moves it."
 	    elif [ "$pl" = no ] && [ "$pn" = no ]; then
-		echo "  → WRONG UNDER BOTH CONDITIONS, so it is not the pinning."
+		echo "  -> WRONG UNDER BOTH CONDITIONS, so it is not the pinning."
 		echo "    The matmul is exact at every width, so the fault is"
 		echo "    non matmul work in the batched loop. Next:"
 		echo "      CHARSIU_DBG_LAYERS=1 against the token loop -- it is"
 		echo "      the tool that found gemma4's three."
 	    elif [ "$pl" = yes ] && [ "$pn" = yes ]; then
-		echo "  → RIGHT UNDER BOTH CONDITIONS, $REPS run(s) each. If this"
+		echo "  -> RIGHT UNDER BOTH CONDITIONS, $REPS run(s) each. If this"
 		echo "    model was ever seen wrong, neither condition here"
 		echo "    reproduces it -- do not lift the refusal on this; find"
 		echo "    the round that saw it and copy its exact command."
 	    else
-		echo "  → WRONG UNPINNED AND RIGHT PINNED, which is the way round"
+		echo "  -> WRONG UNPINNED AND RIGHT PINNED, which is the way round"
 		echo "    no story predicts. Suspect the run before the silicon."
 	    fi ;;
 	  esac ;;

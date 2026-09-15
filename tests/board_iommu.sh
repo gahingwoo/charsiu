@@ -122,7 +122,7 @@ M=${CHARSIU_MODEL:-/opt/charsiu/models/Llama-3.2-1B-Instruct-Q4_0.gguf}
 PROMPT=${CHARSIU_IOMMU_PROMPT:-"Explain in plain words why a written record outlasts a memory."}
 E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
-# ── the refusals, before anything is armed or any governor is touched ────────
+# ---- the refusals, before anything is armed or any governor is touched ----
 [ -x "$RUN" ] || { echo "no $RUN" >&2; exit 1; }
 [ -r "$M" ]  || { echo "no model $M" >&2; exit 1; }
 
@@ -177,7 +177,7 @@ fi
 
 NPUCLK=$(npu_clk) || exit 1
 
-# ── conditions, printed, because a reading without them is not comparable ────
+# ---- conditions, printed, because a reading without them is not comparable ----
 echo "== the IOMMU attach/detach floor, measured instead of derived"
 echo "   boot id   $(npu_boot)"
 echo "   kernel    $(uname -r)"
