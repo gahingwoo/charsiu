@@ -356,6 +356,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/attn_two_thresholds
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
+	./tests/arch_list.sh
 #
 # THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the

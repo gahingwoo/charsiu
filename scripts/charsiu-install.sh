@@ -979,7 +979,7 @@ board_core_cost.sh board_fp16_pack.sh board_fp16_tri.sh board_fp16_read.sh
 board_w8a16.sh board_causal_n.sh board_kv_ladder.sh board_attn_pipe.sh board_spin.sh \
 board_attn_min.sh board_drift.sh board_clk.sh board_iommu.sh \
 board_min_mac.sh board_deal.sh board_regress.sh board_remount.sh \
-version_all.sh"
+version_all.sh arch_list.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
