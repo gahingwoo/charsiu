@@ -27,6 +27,7 @@
  * that actually runs.
  */
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include "charsiu.h"
 
@@ -71,8 +72,19 @@ static int check(unsigned m, unsigned n, const char **why)
 	return ok;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 415 lost
+	 * a comparison to an installed control that predated the build stamp,
+	 * and round 413 added this to eleven of the eighteen probe tools and
+	 * recorded that it had done all of them. This is one of the five it
+	 * never reached. Before any argument parsing, because the usual
+	 * failure is argv[1] going straight to atoi and an unrecognised
+	 * --version becoming a dimension of ZERO submitted to the hardware. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned ns[] = { 512, 2048, 8192 };
 	int bad = 0;
 

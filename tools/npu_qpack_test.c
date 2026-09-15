@@ -24,9 +24,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "charsiu.h"
+
 #if !defined(__ARM_NEON) || defined(CHARSIU_NO_NEON)
-int main(void)
+int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 413
+	 * added this to eleven of the eighteen probe tools and recorded that it
+	 * had done all of them; this is one of the seven it never reached.
+	 * Before any argument parsing, because the usual failure is argv[1]
+	 * going straight into atoi or fopen. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	printf("npu_qpack_test: needs NEON, and this build has none -- "
 	       "nothing compared\n");
 	return 0;
@@ -101,8 +112,17 @@ static void neon(const float *row, unsigned sk, uint8_t *out, float *d1o)
 	}
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 413
+	 * added this to eleven of the eighteen probe tools and recorded that it
+	 * had done all of them; this is one of the seven it never reached.
+	 * Before any argument parsing, because the usual failure is argv[1]
+	 * going straight into atoi or fopen. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	unsigned widths[] = { 1, 3, 4, 15, 16, 17, 31, 32, 33, 64, 1023, 1024, 2048, 3072 };
 	unsigned nw = sizeof(widths) / sizeof(*widths), w, i, trial;
 	unsigned long bad = 0, checked = 0, dbad = 0;

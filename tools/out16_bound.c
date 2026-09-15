@@ -277,6 +277,15 @@ static int one(const char *path, unsigned kmax)
 
 int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 413
+	 * added this to eleven of the eighteen probe tools and recorded that it
+	 * had done all of them; this is one of the seven it never reached.
+	 * Before any argument parsing, because the usual failure is argv[1]
+	 * going straight into atoi or fopen. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	int bad = 0, nfile = 0;
 	unsigned kmax = 2048;
 
