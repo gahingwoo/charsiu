@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
+#
+# No emoji in a commit message.
+#
+# The rule is no emoji anywhere in git, and 2026-09-15 swept 167 files in this
+# repository and 122 in the kernel-log one to make the working tree obey it.
+# Then the very next commit message carried a warning sign, because the rule
+# lived in someone's head and the working tree had a checker while the messages
+# did not.
+#
+# A message is caught before the commit exists, which is the only moment fixing
+# it is free: once it is pushed, correcting it means a force-push over a
+# published branch, and that is not a decision a hook or a script gets to make.
+#
+# Install for both repositories:
+#   git config core.hooksPath scripts/git-hooks
+set -u
+MSG="${1:?usage: commit-msg FILE}"
+
+# The same ranges tests/ and the 09-15 sweep used: pictographs, dingbats,
+# arrows and the variation selector. Deliberately NOT a blanket non-ASCII rule
+# -- these messages quote model output and file names, and a commit that has to
+# name a byte should be able to.
+if grep -qP "[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{2B00}-\x{2BFF}\x{FE0F}\x{2190}-\x{21FF}]" "$MSG" 2>/dev/null; then
+	echo "" >&2
+	echo "commit-msg: this message contains an emoji or a marker glyph." >&2
+	echo "" >&2
+	grep -nP "[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{2B00}-\x{2BFF}\x{FE0F}\x{2190}-\x{21FF}]" "$MSG" 2>/dev/null |
+		sed 's/^/    /' >&2
+	echo "" >&2
+	echo "   No emoji anywhere in git, messages included. Say it in words:" >&2
+	echo "   a warning sign becomes \"the trap here is\", a target becomes" >&2
+	echo "   \"what this settles\". Nothing is lost that a sentence cannot" >&2
+	echo "   carry." >&2
+	echo "" >&2
+	exit 1
+fi
+exit 0
