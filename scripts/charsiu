@@ -99,24 +99,24 @@ USAGE
 case "${1:-}" in
 -h|--help|help)  usage; exit 0 ;;
 -V|--version)    echo "charsiu $VERSION"; exit 0 ;;
-setup)           exec "$(find_bin charsiu-config)" --setup ;;
-update)          shift; exec "$(find_bin charsiu-update)" "$@" ;;
-doctor)          shift; exec "$(find_bin charsiu-doctor)" "$@" ;;
+setup)           _b=$(need_bin charsiu-config) || exit; exec "$_b" --setup ;;
+update)          shift; _b=$(need_bin charsiu-update) || exit; exec "$_b" "$@" ;;
+doctor)          shift; _b=$(need_bin charsiu-doctor) || exit; exec "$_b" "$@" ;;
 pull)            shift
                  # ${1:+"$@"} ${1:-x} repeats the first argument. Set the
                  # default by replacing the list instead.
                  [ $# -gt 0 ] || set -- --wizard
-                 exec env CHARSIU_MODELS_DIR="$MODELS" "$(find_bin charsiu-get)" "$@" ;;
-list|ls)         shift; exec "$(find_bin charsiu-list)" "$@" ;;
-rm)              shift; exec "$(find_bin charsiu-rm)" "$@" ;;
-show)            shift; exec "$(find_bin charsiu-show)" "$@" ;;
-ps)              shift; exec "$(find_bin charsiu-ps)" "$@" ;;
-bench)           shift; exec "$(find_bin charsiu-runner)" bench "$@" ;;
-serve)           shift; exec "$(find_bin charsiu-serve)" "$@" ;;
+                 _b=$(need_bin charsiu-get) || exit; exec env CHARSIU_MODELS_DIR="$MODELS" "$_b" "$@" ;;
+list|ls)         shift; _b=$(need_bin charsiu-list) || exit; exec "$_b" "$@" ;;
+rm)              shift; _b=$(need_bin charsiu-rm) || exit; exec "$_b" "$@" ;;
+show)            shift; _b=$(need_bin charsiu-show) || exit; exec "$_b" "$@" ;;
+ps)              shift; _b=$(need_bin charsiu-ps) || exit; exec "$_b" "$@" ;;
+bench)           shift; _b=$(need_bin charsiu-runner) || exit; exec "$_b" bench "$@" ;;
+serve)           shift; _b=$(need_bin charsiu-serve) || exit; exec "$_b" "$@" ;;
 run)             shift
                  [ $# -ge 1 ] || { echo "$SELF run: which model?" >&2; exit 2; }
                  M="$1"; shift
-                 exec env CHARSIU_MODEL="$M" "$(find_bin charsiu-runner)" "$@" ;;
+                 _b=$(need_bin charsiu-runner) || exit; exec env CHARSIU_MODEL="$M" "$_b" "$@" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -125,7 +125,7 @@ esac
 if [ $# -eq 0 ] && { ! configured || ! have_model; }; then
 	# Not an error and not a lecture. A board with nothing on it should walk
 	# somebody through it, once, and never mention it again.
-	exec "$(find_bin charsiu-config)" --setup
+	_b=$(need_bin charsiu-config) || exit; exec "$_b" --setup
 fi
 
-exec "$(find_bin charsiu-runner)" "$@"
+_b=$(need_bin charsiu-runner) || exit; exec "$_b" "$@"

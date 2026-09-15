@@ -77,6 +77,30 @@ find_bin() {
 	command -v "$1" 2>/dev/null || true
 }
 
+# need_bin NAME: find_bin, but a miss is fatal and says which one.
+#
+# find_bin RETURNS EMPTY ON A MISS AND THAT CONTRACT HAS TO STAY -- several
+# callers test it with [ -n "$X" ] and take a different path. What must not
+# stay is `exec "$(find_bin X)"`, which on a miss execs the empty string and
+# the shell reports
+#
+#     /usr/bin/charsiu: exec: line 131: : Permission denied
+#
+# naming neither the missing program nor the one that wanted it. That is what
+# a board with charsiu-runner not installed actually printed. Twelve exec
+# sites in the front door had it.
+need_bin() {
+	_n=$(find_bin "$1")
+	[ -n "$_n" ] || {
+		echo "${0##*/}: cannot find '$1'." >&2
+		echo "  looked in: \$CHARSIU_LIB, beside this script, ../build," >&2
+		echo "             ../../opt/charsiu, \$CHARSIU_SYS_LIB, and \$PATH" >&2
+		echo "  install the dev channel, or set CHARSIU_LIB to where it is." >&2
+		exit 127
+	}
+	echo "$_n"
+}
+
 # file_bytes FILE: the size, without reading the file.
 #
 # NOT `wc -c`. Two of these scripts chose wc over stat on purpose, with the

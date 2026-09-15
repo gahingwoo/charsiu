@@ -288,8 +288,13 @@ we lose is how that cost GROWS, and a fixed cost four times theirs on top of
 it.
 
 **So "who starts a prompt faster" is a crossover, not a ratio.** With their
-33 tokens included the fits cross at 248 of our tokens; measured, we are ahead
-at 202 and behind at 302.
+33 tokens included the fits cross at 248 of our tokens; on THIS section's
+binary, measured, we are ahead at 202 and behind at 302.
+
+**That crossover is gone on the shipping binary.** 1k-ii has 302 at +4.9% and
+every rung to 602 ahead, with 852 level. The sentence above is kept because
+this section is still the source for the vendor column; its charsiu half is a
+dated reading and must not be quoted as where the crossover is now.
 
 ```
   matched INPUT TEXT, what a user waits for
