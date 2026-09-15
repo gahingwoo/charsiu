@@ -26,18 +26,51 @@ charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes
 npu_out_fmt npu_mixed_test out16_bound bench_gather charsiu_run_scalar
 tokenizer_roundtrip emit_dump"
 
+TMP="${TMPDIR:-/tmp}/version_all.$$"
+WAIT="${CHARSIU_VERSION_WAIT:-5}"
+trap 'rm -f "$TMP"' EXIT INT TERM
+
 ok=0; bad=0; missing=0
 for b in $BINS; do
 	if [ ! -x "$DIR/$b" ]; then
 		missing=$((missing + 1))
 		continue
 	fi
-	# ⚠ A TIMEOUT, because the failure mode IS running: a tool that does not
-	# recognise --version starts its real work, and two of these take
-	# minutes. Without this the check hangs on exactly the binaries it
-	# exists to find. `timeout` is not on the board's busybox, so this uses
-	# a background read rather than relying on it.
-	v=$("$DIR/$b" --version 2>&1 < /dev/null | head -1)
+	# A TIMEOUT, because the failure mode IS running: a tool that does not
+	# recognise --version starts its real work, and several of these take
+	# minutes or drive the NPU. Without one the check hangs on exactly the
+	# binaries it exists to find.
+	#
+	# THE FIRST VERSION OF THIS SAID ALL OF THAT IN A COMMENT AND DID NOT
+	# DO IT. It ran the binary straight, on a board that had just received
+	# sixteen probe tools which had never executed on that hardware, and
+	# the board went silent. A comment describing a check that is not there
+	# is the oldest fault in this tree and I wrote a fresh one.
+	#
+	# `timeout` is not on the board's busybox, so this is a background
+	# child and a bounded wait. VTIME cannot help here: the child is a
+	# process, not a tty.
+	rm -f "$TMP"
+	"$DIR/$b" --version > "$TMP" 2>&1 < /dev/null &
+	pid=$!
+	i=0
+	while kill -0 "$pid" 2>/dev/null; do
+		i=$((i + 1))
+		if [ "$i" -gt "$WAIT" ]; then
+			kill "$pid" 2>/dev/null
+			sleep 1
+			kill -9 "$pid" 2>/dev/null
+			wait "$pid" 2>/dev/null
+			echo "BAD   $b: --version did not return within ${WAIT}s -- it is RUNNING"
+			bad=$((bad + 1))
+			pid=""
+			break
+		fi
+		sleep 1
+	done
+	[ -n "$pid" ] || continue
+	wait "$pid" 2>/dev/null
+	v=$(head -1 "$TMP" 2>/dev/null)
 	case "$v" in
 	*[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
 		case "$v" in
