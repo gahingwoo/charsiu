@@ -1390,6 +1390,46 @@ threads 10.59, 8 threads 11.92. Four threads are worse than one. That is the
 A72 and A53 clusters, the same split that makes decode bimodal, so "the CPU
 reaches X GB/s" is not a quantity without a thread count beside it.
 
+### 5b. What one dispatch costs, and int4 against int8 measured rather than halved
+
+`npu_fence_scan` holds k, m and the buffers still and moves only the output
+width. Buffers are allocated once at the widest point, so no row pays for an
+allocation. Least squares on all eight widths of each row, m=1, 20 repeats a
+point, same boot and clock as 5a.
+
+```
+    k      int8 us/n    int4 us/n    ratio    int8 GB/s    int4 GB/s
+    1024     0.1167       0.0595     0.51        8.83         8.32
+    2048     0.2300       0.1168     0.51        8.94         8.84
+    4096     0.4370       0.2224     0.51        9.40         9.24
+```
+
+**The slope doubles when k doubles**, over a 16x range: the int8 per-channel
+cost runs 0.0328, 0.0618, 0.1167, 0.2300, 0.4370 for k of 256 to 4096, which
+is x1.89, x1.89, x1.97, x1.90. So a dispatch at m=1 costs its weight BYTES,
+k*n of them for int8 and half that for int4, at 8.3 to 9.4 GB/s either way.
+
+**The int4 halving used to be an inference.** Every earlier sweep in this tree
+dispatched int8 and the w4a16 cost model was reached by halving the weight
+bytes on paper. Measured at three k, the ratio is 0.51 three times.
+
+**That rate is the single-stream memory roof.** Section 5a gives one CPU core
+8.63 GB/s of DRAM on the same boot, and a dispatch reads its weights at 8.3 to
+9.4. So at m=1 what is left to win is bytes, not calls.
+
+**The intercept is not quoted and should not be.** The fits put it between 13
+and 104 us, and the same k measured twice in one round gave 71.4 and 52.0. The
+line describes the wide end to 6.5% at k=4096 and to 31% at k=256. It
+describes without determining its constant.
+
+**The m axis, on the same surface.** At k=1024 int8, the per-channel cost runs
+0.111 at m=1, 0.118 at m=8, 0.122 at m=20, 0.131 at m=40 and 0.202 at m=80:
+eighty times the rows for 1.8 times the cost, because the weights are read
+once for the whole batch. That is 0.0025 us a channel a row at m=80 against
+0.111 at m=1, a factor of 44, and it is why prefill batches and decode cannot.
+The slope is flat to m=40 and then jumps by half, so the widest chunk is not
+free either.
+
 ---
 
 ## 6. Variability, and what one passage can order
