@@ -1715,6 +1715,25 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * its clamp until 2026-09-10.
 	 */
 	g->nmax = env_u("CHARSIU_NPU_NMAX", 8192);
+	/*
+	 * 4096 IS THE CODE DEFAULT AND THE LANGUAGE MODEL NEVER USES IT.
+	 * llama_auto_kmax() pins KMAX to 1024 before charsiu_npu_open, so every
+	 * decode and every quality number in this tree is at 1024. This value
+	 * is what a caller that does NOT go through that path gets, and there
+	 * are two of them: the vision tower and the whisper encoder, which call
+	 * charsiu_pool_init directly.
+	 *
+	 * SO THE TOWERS SLICE AT 4096 AND THE MODEL SLICES AT 1024, AND NO
+	 * ROUND HAS COMPARED THEM. Round 418 established what kind of question
+	 * that is, which is narrower than it looks: both towers pass want_w4=0,
+	 * so they open int8, and tensor_grouped's first condition is w4_for --
+	 * they are never grouped and the group width cannot reach them. int8
+	 * also accumulates its slices as int32 rather than float, so the split
+	 * is exact and the slice width cannot move their answer either.
+	 *
+	 * What is left is speed, and it is unmeasured. CHARSIU_NPU_KMAX moves
+	 * it for a tower the same way it does for anything else.
+	 */
 	g->kmax = env_u("CHARSIU_NPU_KMAX", 4096);
 	g->slow_us = (double)env_u("CHARSIU_NPU_SLOW_US", 100000);
 	/*
