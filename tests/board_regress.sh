@@ -79,6 +79,30 @@ echo "   npu clk $NPUCLK Hz"
 echo "   models  $DIR"
 echo
 
+#
+# EVERYTHING THIS NEEDS, CHECKED BEFORE ANYTHING RUNS. Section 2 died twenty
+# minutes into a run because board_text_all.sh was not on the board: it is in
+# the installer's PROBE_SCRIPTS list, probe_list.sh passes, and the board's
+# /opt/charsiu was simply older than the list. r418 found the same thing for
+# the probe BINARIES -- the installer shipped eighteen and the board had two --
+# and a list being right is not the same as a machine being current.
+#
+# A missing file is the same failure as a check that cannot run, and it costs
+# the most when it is found last. One second here.
+#
+miss=0
+for f in arch_sanity.sh board_text_all.sh neon_control.sh board_clk.sh; do
+	[ -r "$HERE/$f" ] || { echo "   !! missing script: $HERE/$f"; miss=1; }
+done
+for f in "$RUN" "$PPL" "$SCAL"; do
+	[ -x "$f" ] || { echo "   !! missing binary: $f"; miss=1; }
+done
+[ -r "$M" ] || { echo "   !! missing model: $M"; miss=1; }
+if [ "$miss" -ne 0 ]; then
+	echo "   nothing ran. install the dev channel or pass the right directories."
+	exit 1
+fi
+
 echo "================ 1. every architecture still knows a fact"
 run "CHARSIU_RUN='$RUN' sh '$HERE/arch_sanity.sh' '$DIR'" "tail -16"
 echo "   and the ones in $B/models"

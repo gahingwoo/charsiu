@@ -256,9 +256,14 @@ coefficients, and this one does not. Two independent readings say so:
   twelve.
 
 **The direction survives and the magnitude does not.** Our prefill grows
-faster with length than theirs: we are ahead at 202 tokens and behind at 852,
-which is a fact about the measured points and needs no fit at all. "Six times"
-is an artefact.
+faster with length than theirs, which is a fact about the measured points and
+needs no fit at all. "Six times" is an artefact.
+
+**"BEHIND AT 852" WAS TRUE OF THIS SECTION'S BINARY AND IS NOT TRUE OF THE
+SHIPPING ONE.** That is what 1k-ii measures: ahead at every rung to 602 and
+LEVEL at 852, +2.1% against a 2.5% floor. The direction is unchanged -- the
+margin shrinks as the prompt grows -- and where it ends up is 1k-ii's to say,
+not this section's.
 
 **This matters beyond a number.** "The quadratic term is the whole deficit
 and theirs is six times smaller" organised months of work, and 1i is named
@@ -1586,9 +1591,14 @@ prompt, not a ratio.
 
 The shape of that answer has since moved and this paragraph used to give the
 old one. When it was written the crossover sat at about 248 of our tokens with
-the vendor ahead above it. 1k is the current ladder: charsiu leads by 1.09x to
-1.28x below about 250 tokens and the two are LEVEL from 302 up, so what depends
-on the prompt is now the size of our lead, not who has it.
+the vendor ahead above it.
+
+**1k-ii IS THE CURRENT LADDER, NOT 1k**, and this paragraph pointed at the
+superseded one. On the shipping binary charsiu is ahead at every rung from 27
+to 602 tokens -- +24.8%, +29.5%, +24.2%, +9.6%, +4.9%, +6.8%, +3.5% -- and
+LEVEL at 852. So what depends on the prompt is the size of our lead and not
+who has it, which is what this paragraph said; the numbers it said it with
+were a ladder ago.
 
 ## 8. What is not supported
 
