@@ -25,7 +25,34 @@
 #
 # Both are the same failure: a check that cannot run reads exactly like a check
 # that found nothing wrong.
+#
+# AND HOLE ONE'S MECHANISM WAS STILL OPEN AFTER HOLE ONE WAS FIXED. r414 gave
+# arch_sanity its argument and left the `| tail -16` in place, so `set -e`
+# still could not see a failure: a pipeline's status is its LAST command's, and
+# tail always succeeds. The argument was the bug of that day; the pipe is what
+# made it invisible, and the pipe is what would make the next one invisible
+# too.
+#
+# `run` below puts the output in a file, checks the real status, and then shows
+# the slice the section wants. A section that fails now stops the regression
+# with the name of what failed, which is the whole point of a harness that
+# gates a merge to stable.
 set -e
+TMPD="${TMPDIR:-/tmp}/regress.$$"
+mkdir -p "$TMPD"
+trap 'rm -rf "$TMPD"' EXIT INT TERM
+nrun=0
+# run WHAT SHOW -- command in $1 as a single string, a filter in $2
+run() {
+	nrun=$((nrun + 1))
+	out="$TMPD/sec$nrun"
+	if ! sh -c "$1" > "$out" 2>&1; then
+		echo "   !! FAILED: $1"
+		sed 's/^/   | /' "$out"
+		exit 1
+	fi
+	eval "$2" < "$out"
+}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="${1:-${CHARSIU_BOARD_DIR:-/opt/vendor/models}}"
 B="${2:-${CHARSIU_DIR:-/opt/charsiu}}"
@@ -53,13 +80,13 @@ echo "   models  $DIR"
 echo
 
 echo "================ 1. every architecture still knows a fact"
-CHARSIU_RUN="$RUN" sh "$HERE/arch_sanity.sh" "$DIR" 2>&1 | tail -16
+run "CHARSIU_RUN='$RUN' sh '$HERE/arch_sanity.sh' '$DIR'" "tail -16"
 echo "   and the ones in $B/models"
-CHARSIU_RUN="$RUN" sh "$HERE/arch_sanity.sh" "$B/models" 2>&1 | tail -8
+run "CHARSIU_RUN='$RUN' sh '$HERE/arch_sanity.sh' '$B/models'" "tail -8"
 echo
 
 echo "================ 2. nine models, batched against their own token loop"
-CHARSIU_RUN="$RUN" sh "$HERE/board_text_all.sh" 8 2>&1 | grep -E "gguf|models compared"
+run "CHARSIU_RUN='$RUN' sh '$HERE/board_text_all.sh' 8" "grep -E 'gguf|models compared'"
 echo
 
 echo "================ 3. the vector kernels against the scalar ones"
@@ -68,7 +95,7 @@ echo "================ 3. the vector kernels against the scalar ones"
 # the list and could drop the first failures. It also swallows the refusal
 # above. Print it, and let the reader see the whole thing.
 CHARSIU_RUN="$RUN" CHARSIU_RUN_SCALAR="$SCAL" \
-	sh "$HERE/neon_control.sh" "$DIR" 2>&1 | grep -vE '^charsiu: (this thread|cpu[0-9]|the pool)'
+	run "sh '$HERE/neon_control.sh' '$DIR'" "grep -vE '^charsiu: (this thread|cpu[0-9]|the pool)'" 
 echo
 
 echo "================ 4. the gelu identity: an exact arm must not move a token"
@@ -97,10 +124,10 @@ echo "================ 5. perplexity, the deterministic instrument"
 CORPUS="${CHARSIU_PPL_CORPUS:-$B/corpus/long.txt}"
 echo "   model  $(basename "$M")  md5 $(md5sum "$M" | cut -c1-12)"
 echo "   corpus $(basename "$CORPUS")  md5 $(md5sum "$CORPUS" | cut -c1-12)"
-env $E "$PPL" "$M" "$CORPUS" 2>&1 | tail -4
+run "env $E '$PPL' '$M' '$CORPUS'" "tail -4"
 echo
 
 echo "================ 6. decode"
-env $E "$RUN" "$M" -p "The capital of France is" -n 64 --ignore-eos -q -c 1024 -t 4 2>&1 | grep '^.load'
+run "env $E '$RUN' '$M' -p 'The capital of France is' -n 64 --ignore-eos -q -c 1024 -t 4" "grep '^.load'" 
 echo
 echo "   boot $(cat /proc/sys/kernel/random/boot_id)"
