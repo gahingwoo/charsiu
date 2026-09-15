@@ -1646,6 +1646,16 @@ both arms and all four repeats. The per task term does not decide this deal on
 these shapes; the megabyte term does. The default is now the measured 4.81,
 which is what `npu_job_cost` and `charsiu_shapes` have used since round 155.
 
+**And 4.81 was measured at 64 x 32, which section 5b says cannot order
+anything.** `npu_job_cost`'s task table at that shape reads 70.06 us for one
+task, 67.49 for four and 222.76 for sixteen, so a straight line through it has
+no single slope to give. Re-run at k=1024 n=1024 the same table is FLAT in us
+a task -- 137.51 for one, 131.39 for four, 124.01 for sixteen, and a second
+pass moves in the other direction -- because at m=1 a task costs what its
+weights cost to read. So the per task coefficient is not a per task cost at a
+shape the runtime actually submits. The board A/B above is what makes it
+harmless here: the term does not decide this deal either way.
+
 **Three models, not nine.** That is what the table says and all it says.
 
 The vendor at the frequency their published figures were taken at. Their
