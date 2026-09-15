@@ -34,6 +34,15 @@ CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 
 # never reaches the compiler, and charsiu.h's fallback makes --version answer
 # "unknown". An environment CFLAGS is fine; only the command line does this.
 # A stamp that silently disappears under `make CFLAGS=...` is worse than none.
+#
+# AND THE CONSEQUENCE, WHICH COSTS AN HOUR IF YOU MEET IT THE OTHER WAY ROUND:
+# because this is `override +=`, it is appended AFTER anything the caller put
+# in CFLAGS, so a caller's own -DCHARSIU_BUILD is silently overridden by the
+# git describe value. To compare two builds byte for byte, pin the stamp where
+# it is SET -- `make CHARSIU_BUILD=fixed` -- not through CFLAGS. Pinned through
+# CFLAGS the two builds differ by a dirty-tree suffix in .rodata, that shifts
+# every address after it, and .text then differs too: a comment-only change
+# looks like it moved the code.
 override CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
 BUILD  := build
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
