@@ -249,7 +249,7 @@ would have reached a paper as "AWQ does nothing on the board".
 
 | item | state |
 |---|---|
-| R1 | Diagnosed, fixed, and re-measured on four models. The margin was best-of-N picking the fast mode of a bimodal decode; the cause is core placement; `a58086c` pins the fast cluster by default, giving +17% to +27% across four models at spreads of 0.1 to 1.9%, all four ahead of the vendor on the median, with the new medians equal to the old best-of-seven to within 1% |
+| R1 | Diagnosed, fixed, and re-measured on four models. The margin was best-of-N picking the fast mode of a bimodal decode; the cause is core placement; `a58086c` pins the fast cluster by default, giving +17% to +27% across four models at spreads of 0.1 to 1.9%, three of four ahead of the vendor on the median and gemma4 LEVEL (its +0.2% does not clear its own 1.7% spread), with the new medians equal to the old best-of-seven to within 1% |
 | R2 | Done, entirely on the desk. On the pinned protocol the vendor's excess is 2.00, 2.23 and 2.35 times charsiu's across three nested subsets. The rise across the subsets is `long.txt` alone: `long2.txt` reads 2.62 / 1.42 / 1.65 and puts the 43-matrix rung at the top. What is supported is the direction in every cell and an interval of 1.4x to 2.6x, and no single figure. See `vendor-quality-provenance.md` |
 | R3 | Done. One boot, boot id taken at both ends and unchanged |
 | R4 | Closed. It was two clusters 6.3% apart; after pinning the spread is 4.4% with no shape callable. The same lottery |
