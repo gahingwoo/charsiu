@@ -22,6 +22,32 @@
  *   CHARSIU_MB       buffer megabytes, default 256
  *   CHARSIU_SECONDS  how long to read for, default 5
  *   CHARSIU_THREADS  how many readers, default 1
+ *
+ * 2026-09-15, THE PAIR OF NUMBERS, ON boot 8934c5ee AT 594 MHz. This ran for
+ * the first time on that day, and the answer is that the controller has room.
+ *
+ *   readers alone            1 thread 8.63 GB/s, 8 threads 11.92
+ *   Llama-3.2-1B decode      20.79 tok/s, gen 256 tok
+ *   both at once             8.64 and 20.84, then 11.92 and 20.82
+ *
+ * NEITHER SIDE LOSES ANYTHING. Eight cores reading DRAM flat out for 8 s of a
+ * 12.3 s generation move decode by 0.1%, and decode moves them by 0.1%. So the
+ * split is not zero sum at decode's actual demand, and the premise at the top
+ * of this comment needs reading carefully: decode READS the weights, and it is
+ * not saturating the controller while it does.
+ *
+ * That is consistent with the per-call floor being 38% of a token. The NPU
+ * pulls its weights in bursts and waits between them, so the average demand is
+ * well under the peak even though the total bytes are large.
+ *
+ * WHAT IS NOT MEASURED HERE: the GPU, a reader placed deliberately on the same
+ * cores as the runtime's threads, and any arm where the second engine takes
+ * part of the SAME tensor. The readers here are an independent load.
+ *
+ * AND THE THREAD COLUMN IS NOT MONOTONE: 1 thread 8.63, 2 threads 8.09, 3
+ * 7.68, 4 7.54, 6 10.59, 8 11.92. Four threads are WORSE than one. That is the
+ * A72 and A53 clusters, the same split that makes decode bimodal, and it is a
+ * reason to name the thread count in any bandwidth figure taken from this.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <pthread.h>
@@ -87,8 +113,19 @@ static void *read_loop(void *vr)
 	return NULL;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 415 lost
+	 * a comparison to an installed control that predated the build stamp,
+	 * and round 413 added this to eleven of the eighteen probe tools and
+	 * recorded that it had done all of them. This is one of the five it
+	 * never reached. Before any argument parsing, because the usual
+	 * failure is argv[1] going straight to atoi and an unrecognised
+	 * --version becoming a dimension of ZERO submitted to the hardware. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	const char *e;
 	size_t mb = (e = getenv("CHARSIU_MB")) ? (size_t)atoi(e) : 256;
 	double secs = (e = getenv("CHARSIU_SECONDS")) ? atof(e) : 5.0;

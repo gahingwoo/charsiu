@@ -536,11 +536,11 @@ END {
 	else    print  "  (c) NOT TESTED -- m = 8 produced no row in either arm"
 	print ""
 	if (na + nb + nc == 0 && ((8 in btot) || (8 in otot)))
-		print "  → THE ROUND PASSES. The safe set is m % 2 == 0 && m != 8, verified"
+		print "  -> THE ROUND PASSES. The safe set is m % 2 == 0 && m != 8, verified"
 	else if (na + nb + nc == 0)
-		print "  → the three checks that ran all hold, but m = 8 was never measured"
+		print "  -> the three checks that ran all hold, but m = 8 was never measured"
 	else {
-		print "  → THE ROUND DOES NOT PASS, and the deviations above ARE the"
+		print "  -> THE ROUND DOES NOT PASS, and the deviations above ARE the"
 		print "    headline. Every one of them is named; none of them is a"
 		print "    rounding story. Read them before anything else here, because"
 		print "    a prediction contradicted at one width is not a prediction"

@@ -34,6 +34,15 @@ CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 
 # never reaches the compiler, and charsiu.h's fallback makes --version answer
 # "unknown". An environment CFLAGS is fine; only the command line does this.
 # A stamp that silently disappears under `make CFLAGS=...` is worse than none.
+#
+# AND THE CONSEQUENCE, WHICH COSTS AN HOUR IF YOU MEET IT THE OTHER WAY ROUND:
+# because this is `override +=`, it is appended AFTER anything the caller put
+# in CFLAGS, so a caller's own -DCHARSIU_BUILD is silently overridden by the
+# git describe value. To compare two builds byte for byte, pin the stamp where
+# it is SET -- `make CHARSIU_BUILD=fixed` -- not through CFLAGS. Pinned through
+# CFLAGS the two builds differ by a dirty-tree suffix in .rodata, that shifts
+# every address after it, and .text then differs too: a comment-only change
+# looks like it moved the code.
 override CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
 BUILD  := build
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
@@ -334,7 +343,15 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+#
+# THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
+# that it ASSERTS the law rather than only printing it, and that it is the
+# check that should have existed before the first board round -- and it was
+# built by `all` and invoked by no target, so four rounds' worth of proof sat
+# in a binary nobody executed. 0.14 s.
+#
+	./$(BUILD)/acc_index_check >/dev/null
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/overlap_guard
@@ -356,6 +373,32 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/attn_two_thresholds
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
+	./tests/arch_list.sh
+#
+# TWO MORE CHECKERS THAT NEEDED NEITHER A BOARD NOR A MODEL AND THAT NOTHING
+# RAN. verify_selftest.sh asks whether every phase of board_verify.sh can run
+# alone, and whether anything still pins the K slice width that the product
+# now chooses -- the second of those already shipped a wrong answer once, a
+# round reporting nine of nine models correct in a configuration that had
+# stopped being the one that ships. vattn_edges.sh puts the fused vision
+# attention against the exact one at the ragged shapes vision_cross never
+# reaches. Both were installed to the board and invoked by no target: 1.1 s
+# and 0.2 s. Watched failing, the second on a stub that reports 3.10e-02.
+#
+	./tests/verify_selftest.sh
+	./tests/vattn_edges.sh $(BUILD)/vattn_bench
+	./tests/version_all.sh $(BUILD)
+	./tests/host_checks.sh
+#
+# A HOMOGLYPH IN AN IDENTIFIER IS ALWAYS A BUG. npuquant.c declared
+# `double best<CYRILLIC IE> = -1.0` and used it three more times with the same
+# spelling, so it built, ran, was correct, and `grep beste` found nothing. The
+# checker parses comments and strings rather than grepping around them,
+# because a non-ASCII character in either of those is usually data that has to
+# stay -- the SentencePiece meta-space, a model's own garbled output.
+#
+	python3 -P tools/check_ascii.py --self-test
+	python3 -P tools/check_ascii.py
 #
 # THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the

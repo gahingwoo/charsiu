@@ -132,11 +132,18 @@ page_run() {
 page_npu() {
 	printf '\n%sNPU%s\n' "$C_B" "$C_0"
 	e=$(ask "use the NPU (yes/no)" "$(ini_get npu enable)"); ini_set npu enable "$e"
-	printf '  %sone value, written to both CHARSIU_NPU_KMAX and CHARSIU_NPU_W4_GROUP;\n' "$C_D"
-	printf '  npudev only takes the int4 path when the two are equal.%s\n' "$C_0"
+	printf '  %sone value, written to both CHARSIU_NPU_KMAX and CHARSIU_NPU_W4_GROUP.\n' "$C_D"
+	printf '  The group has to divide a tensor K or that tensor gets one scale\n'
+	printf '  for its whole row, and the slice can be no wider than the group.%s\n' "$C_0"
 	k=$(ask "K slice" "$(ini_get npu kslice)"); ini_set npu kslice "$k"
 	m=$(ask "max N" "$(ini_get npu maxn)"); ini_set npu maxn "$m"
 	f=$(ask "coefficient elements" "$(ini_get npu coef_elems)"); ini_set npu coef_elems "$f"
+	printf '  %sgroup fit gives a tensor whose K misses the width above the widest\n' "$C_D"
+	printf '  divisor of its own K instead of one scale a row. Measured on eight\n'
+	printf '  models: two are better on BOTH perplexity and decode, three are\n'
+	printf '  identical to the digit, two are worse. It is worth trying on your\n'
+	printf '  model and scoring it, and it is off because two of eight lose.%s\n' "$C_0"
+	g=$(ask "group fit (yes/no)" "$(ini_get npu group_fit)"); ini_set npu group_fit "$g"
 	pause
 }
 

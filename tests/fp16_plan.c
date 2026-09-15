@@ -142,8 +142,19 @@ static void refuses(struct charsiu_fp16_op *ops, unsigned n, const char *why)
 	}
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 415 lost
+	 * a comparison to an installed control that predated the build stamp,
+	 * and round 413 added this to eleven of the eighteen probe tools and
+	 * recorded that it had done all of them. This is one of the five it
+	 * never reached. Before any argument parsing, because the usual
+	 * failure is argv[1] going straight to atoi and an unrecognised
+	 * --version becoming a dimension of ZERO submitted to the hardware. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	static const unsigned ms[] = { 1, 2, 4, 8, 32, 80, 178 };
 	static const unsigned ks[] = { 32, 64, 128, 256, 512, 1024, 2048 };
 	static const unsigned ns[] = { 32, 64, 96, 128, 512, 1024 };

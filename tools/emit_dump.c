@@ -10,6 +10,12 @@
 
 int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM, and this one
+	 * answered --version with a register dump. See tests/version_all.sh. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	struct charsiu_matmul mm = { 1, 2048, 1024, CHARSIU_INT4, CHARSIU_FP16 };
 	uint64_t buf[256];
 	size_t n, i;

@@ -320,7 +320,7 @@ int main(int argc, char **argv)
 			     "This probe is not building what it says.");
 			return 1;
 		}
-		puts("→ the emitter produces two distinct programs. The "
+		puts("-> the emitter produces two distinct programs. The "
 		     "silicon question is the rest of this tool, on a board.");
 		return 0;
 	}
@@ -428,11 +428,11 @@ int main(int argc, char **argv)
 done:
 	printf("\n%d of %d dispatches wrong\n", bad, ran);
 	if (!bad && ran > 2)
-		puts("→ one open device runs both programs. The per-tensor "
+		puts("-> one open device runs both programs. The per-tensor "
 		     "width refactor in npudev.c is worth doing: "
 		     "CHARSIU_NPU_INT8_LAYERS can reach the hardware.");
 	else if (bad)
-		puts("→ the two programs do NOT coexist on one open device. "
+		puts("-> the two programs do NOT coexist on one open device. "
 		     "INT8_LAYERS stays a host-side research knob unless a "
 		     "second device is opened for the other width.");
 	rc = bad != 0;

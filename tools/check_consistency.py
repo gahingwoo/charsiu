@@ -28,7 +28,10 @@ import sys
 import os
 
 MD5 = re.compile(r'\b[0-9a-f]{32}\b')
-SECTION = re.compile(r'^#{1,3} (?:(\d[a-z]?)\.\s*)?(.+)$', re.M)
+# The label may carry a roman suffix: 1b-ii and 1k-ii are real sections, and
+# with the narrower pattern they were not labels at all -- a reference to
+# "section 1k-ii" resolved by matching the 1k prefix and checking nothing.
+SECTION = re.compile(r'^#{1,3} (?:(\d[a-z]?(?:-[ivx]+)?)\.\s*)?(.+)$', re.M)
 FENCE = re.compile(r'^```', re.M)
 
 
@@ -95,7 +98,7 @@ def rule_sections_resolve(text, path):
     """Every 'section N' reference points at a heading that exists."""
     have = {lab for lab, _, _ in sections(text) if lab}
     bad = []
-    for m in re.finditer(r'[Ss]ection (\d[a-z]?)\b', text):
+    for m in re.finditer(r'[Ss]ection (\d[a-z]?(?:-[ivx]+)?)\b', text):
         if m.group(1) not in have:
             bad.append((f"reference to section {m.group(1)}, which has no heading",
                         text.count("\n", 0, m.start()) + 1))
@@ -114,6 +117,37 @@ def rule_commits_exist(text, path):
         if r.stdout.strip() != "commit":
             bad.append((f"git checkout {sha}: not a commit in this repository",
                         text.count("\n", 0, m.start()) + 1))
+    return bad
+
+
+def rule_supersession_is_mutual(text, path):
+    """A section that supersedes another must be findable FROM the other.
+
+    THREE VERDICTS SURVIVED A SUPERSESSION IN ONE DOCUMENT. 1k-ii re-measured
+    the TTFT ladder on the shipping binary and said "Supersedes 1k below". 1k
+    was marked. Three OTHER paragraphs still carried the old reading, and a
+    reader who reached one of them first -- as one did -- got the opposite of
+    the newer measurement.
+
+    Only half of that is mechanical, and this is the half: if a section claims
+    to supersede another, the superseded one has to say so where a reader will
+    land on it. The other half, a conclusion restated somewhere with no link at
+    all, needs a person.
+    """
+    bad = []
+    secs = {lab: body for lab, _, body in sections(text) if lab}
+    for lab, _, body in sections(text):
+        if not lab:
+            continue
+        for m in re.finditer(r'[Ss]upersedes (\d[a-z]?(?:-[ivx]+)?)\b', body):
+            old = m.group(1)
+            if old not in secs:
+                bad.append((f"section {lab} supersedes {old}, which has no heading",
+                            text.count("\n", 0, m.start()) + 1))
+            elif not re.search(r'superseded', secs[old], re.I):
+                bad.append((f"section {lab} supersedes {old} and {old} does not "
+                            f"say so; a reader who lands on {old} is not told",
+                            text.count("\n", 0, m.start()) + 1))
     return bad
 
 
@@ -141,6 +175,7 @@ RULES = [
     ("every section reference resolves",                          rule_sections_resolve),
     ("every commit named for checkout exists",                    rule_commits_exist),
     ("every corpus hash matches the file",                        rule_corpus_hashes_match),
+    ("every supersession is marked in both directions",           rule_supersession_is_mutual),
 ]
 
 
@@ -174,6 +209,13 @@ def self_test():
         ("a corpus hash that is wrong",
          "## 7. Reproduction\n\n00000000000000000000000000000000  long.txt\n",
          rule_corpus_hashes_match),
+        ("a one-way supersession",
+         "## 1k. the ladder\n\nold numbers\n\n"
+         "### 1k-ii. the ladder again\n\nSupersedes 1k below.\n",
+         rule_supersession_is_mutual),
+        ("a supersession of nothing",
+         "## 1. x\n\nSupersedes 9 below.\n",
+         rule_supersession_is_mutual),
     ]
     bad = 0
     for name, body, fn in cases:

@@ -61,6 +61,29 @@ static uint64_t slices(uint64_t k, unsigned kmax)
  *     0.0328 -> 40.13     1.0486 -> 144.00     8.3886 -> 785.00
  *     0.2621 -> 44.44     4.1943 -> 406.81
  *
+ * 2026-09-15: THIS BOARD NO LONGER REPRODUCES THAT TABLE, and the difference
+ * is not a scale factor. npu_job_cost's own byte sweep on boot 8934c5ee at
+ * 594 MHz, run twice, agreeing with itself to 7%:
+ *
+ *     MB        round 155    boot 8934c5ee     difference
+ *     0.0328       40.13         23.2            -42%
+ *     0.2621       44.44         47.8             +8%
+ *     1.0486      144.00        131.1             -9%
+ *     4.1943      406.81        470.2            +16%
+ *     8.3886      785.00        982.8            +25%
+ *
+ * IT CHANGES SIGN, so no single constant repairs it, and the ends move in
+ * opposite directions -- the small calls got cheaper and the large ones got
+ * dearer. The "+-10% over seven models" this predictor claims was established
+ * against the round 155 table on the board of that day, and it has NOT been
+ * re-validated against these points. The numbers below are left as they are
+ * for that reason: replacing the table would invalidate the only hold-out this
+ * tool has ever had, silently.
+ *
+ * What a round that wants to use this should do is run npu_job_cost's byte
+ * sweep on its own boot, pass the result through --coef or a rebuilt table,
+ * and re-run the hold-out. What it should not do is quote the +-10%.
+ *
  * The line through the large end predicts 38 and 129 for the first two, so a
  * megabyte in a SMALL call costs more than a megabyte in a large one. Phi-3.5
  * has the fattest tensors of the five, so an average rate overcharges it most

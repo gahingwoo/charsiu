@@ -145,6 +145,52 @@ time is the binding constraint on this project, so every speed claim needs its
 baseline re-run beside it, while a quality regression can be caught weeks after it
 lands.
 
+## The weight group, and when it is worth moving
+
+charsiu quantises int4 weights in groups along K, one scale per group, and the
+group width has to divide a tensor's K or the quantiser falls back to one scale
+for the whole row. The width ships at 1024, and `llama_auto_kmax()` only ever
+considers WIDENING it. Counted with `CHARSIU_NPU_VERBOSE`, five of the eight
+models in the zoo therefore carry tensors on the per-row path, and `gemma-3-1b`
+carries all of them there: its K values are 1024, 1152 and 6912 and none of
+them qualifies.
+
+`CHARSIU_NPU_W4_GROUP_FIT=1` gives each tensor the widest proper divisor of its
+own K that is no wider than the requested width, and slices it at that.
+**Default off.** Quality on the desk over 511 scored positions of
+`tests/corpus/long.txt`, decode on the board at 594 MHz, three readings an arm:
+
+```
+  model            perplexity      decode        verdict
+  Qwen2.5-1.5B      -27.9%          +2.2%        better on both
+  gemma-3-1b        -24.2%          +0.5%        better on both
+  tinyllama-1.1b     -5.4%          -0.3%        quality for almost nothing
+  Llama-3.2-1B        0.0%          -0.4%        identical to the digit
+  Phi-3.5-mini        0.0%          -0.4%        identical to the digit
+  SmolLM2-1.7B        0.0%          -0.4%        identical to the digit
+  Qwen3-0.6B         +1.7%          -4.6%        worse on both
+  gemma-4-E2B       +12.2%          +3.9%        mixed
+```
+
+The three unchanged rows are models whose K already has a proper divisor at
+1024, so the fit picks the same number and nothing moves: the flag is a no-op
+where it is not needed, on as well as off. Their -0.4% of decode is the flag's
+own cost, which is the larger slot capacity it reserves.
+
+**Two models get worse, and that is not a bug.** A finer group strictly reduces
+the weight reconstruction error -- measured, 8 to 12.6% on every model with
+`CHARSIU_NPU_RMS=1` -- and the perplexity still goes both ways. What a
+quantisation costs a model is the structure of its error and not the magnitude,
+which this project has measured from the other direction too. Try the flag on
+your model and score it; do not assume.
+
+Two more knobs landed with it, both off, both instruments rather than
+features. `CHARSIU_NPU_DEAL_US_TASK` is the per-task weight in the two-core
+deal, now the measured 4.81 instead of a withdrawn 36.8, and moving it is level
+on every model tried. `CHARSIU_NPU_MIN_MAC` keeps a dispatch below a MAC count
+off the NPU; the board says the hardware wins even at 0.39 MMAC, so it exists to
+have measured that.
+
 ## Install
 
 ```
@@ -320,8 +366,17 @@ frontend that runs a real model end to end. Out of scope: any vendor library in
 the execution path, and any claim about an SoC this has not been run on.
 
 The target is the vendor's own number on the same board and model. Decode beats
-it; prefill leads below about 250 tokens and is level above, which the table at
-the top gives row by row with the ranges that decide which is which.
+it; prefill leads at every prompt length measured up to 602 tokens and is level
+at 852, which the table at the top gives row by row with the ranges that decide
+which is which.
+
+That bound used to read "below about 250 tokens" here, and it was a ladder out
+of date: `docs/paper-evidence.md` section 1k-ii re-ran the whole ladder on the
+shipping binary, five repeats a point, one boot with clock and governor pinned,
+and every rung from 27 to 602 tokens clears its own spread. The direction is
+unchanged and it is the part worth carrying: the margin SHRINKS as the prompt
+grows, from +24.8% at 27 tokens to +3.5% at 602, and 852 is where it reaches
+level. Their attention is roughly 4.3x cheaper than ours and that is why.
 
 ## Why this exists, and why it is not a port
 

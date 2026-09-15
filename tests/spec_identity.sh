@@ -110,7 +110,7 @@ for mdl in "$DIR"/*.gguf; do
 	fi
 	plain=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
 	if grep -q "refuses this model\|speculation is off" "$ERR"; then
-		printf '  – %-40s refused: %s\n' "$name" \
+		printf '  -- %-40s refused: %s\n' "$name" \
 		    "$(sed -n 's/.*(\(.*\)).*/\1/p' "$ERR" | head -1)"
 		skipped=$((skipped + 1))
 		continue

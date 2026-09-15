@@ -464,6 +464,12 @@ unsigned charsiu_entries_per_row(const struct charsiu_matmul *mm);
  */
 size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m,
 			 int w4wide);
+/*
+ * The even width law of that map, in one place. The gate in src/npudev.c,
+ * the chunker in tools/charsiu_run.c and tools/acc_index_check.c all call
+ * this rather than each spelling it, so the sweep tests what ships.
+ */
+int charsiu_acc_width_ok(unsigned m);
 int charsiu_m_axis_wide_for(int w4);
 
 /*

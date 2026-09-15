@@ -350,9 +350,31 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 	want.bits = bits;
 	/* the grid is part of what the codes mean, so it is part of the key --
 	 * and so is the WIDTH q is held at, because the record is a straight
-	 * copy of it. Bit 63 is the grid, bit 62 is npu_q_packed(). */
+	 * copy of it. Bit 63 is the grid, bit 62 is npu_q_packed().
+	 *
+	 * BIT 61 IS W4_GROUP_FIT, AND IT IS HERE BECAUSE `grp` STOPPED
+	 * STANDING FOR THE MODEL. This function runs once, on the FIRST
+	 * tensor, so want.group is that tensor's group -- which was a fair
+	 * summary while every tensor took the same width. With the fit on they
+	 * do not: each takes the widest proper divisor of its own K. A model
+	 * whose first staged tensor happens to be unaffected then produces the
+	 * SAME key with the fit on and off, while every other tensor's codes
+	 * differ.
+	 *
+	 * Nothing would be read wrongly even so -- wcache_read compares each
+	 * record's ngrp against the tensor's current kgroup, and every case
+	 * where the fit moves a group moves ngrp with it, so the first
+	 * differing tensor is caught and the cache abandoned. But that is a
+	 * downstream check doing a key's job, loudly and halfway through. The
+	 * flag belongs in the key.
+	 *
+	 * This is the same fault the 2 -> 3 quant bump above records, arriving
+	 * the same way: a header written once standing in for a decision made
+	 * per tensor. */
 	want.group = grp | (midrise_grid() ? (1ull << 63) : 0)
-			 | (npu_q_packed() ? (1ull << 62) : 0);
+			 | (npu_q_packed() ? (1ull << 62) : 0)
+			 | (charsiu_env_flag("CHARSIU_NPU_W4_GROUP_FIT", 0)
+			    ? (1ull << 61) : 0);
 	snprintf(want.stamp, sizeof(want.stamp), "%s", stamp ? stamp : "");
 
 	wc.f = fopen(path, "rb");
@@ -626,7 +648,11 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 			 * says a weight space objective is the wrong one.
 			 */
 			if (w4clip) {
-				double bestе = -1.0;
+				/* best_err, in Latin letters. This was spelt
+				 * with a CYRILLIC small ie where the final e
+				 * should be, in all four places, so it built
+				 * and ran and `grep beste` found nothing. */
+				double best_err = -1.0;
 				float bestd = d;
 				int ci;
 
@@ -645,8 +671,8 @@ static void quant_rows(void *vc, uint64_t r0, uint64_t nr)
 						e = (double)row[i] - (double)v * dc;
 						err += e * e;
 					}
-					if (bestе < 0.0 || err < bestе) {
-						bestе = err;
+					if (best_err < 0.0 || err < best_err) {
+						best_err = err;
 						bestd = dc;
 					}
 				}

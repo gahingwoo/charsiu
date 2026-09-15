@@ -75,7 +75,12 @@ with every reading kept. The binary pins its calling thread to the fast cluster
   Gemma4 E2B       9.25      1.7%     9.23          2222     2193..2245    1219.25
 ```
 
-Decode is ahead on all four: +5.7%, +15.6%, +6.8%, +0.2%.
+Decode is ahead on three: +5.7%, +15.6%, +6.8%. **Gemma4 is LEVEL, not ahead**
+-- its +0.2% does not clear its own 1.7% spread, and their column has no
+spread at all to clear, so there is no margin there to report. This pack's own
+rule is that a lead smaller than the arm's dispersion is not a lead, and
+writing "ahead on all four" applies the rule to three of them.
+
 TTFT is behind on all four: 1.31x, 1.64x, 1.63x, 1.82x theirs.
 
 The prompt is where this runtime is still losing, and it is the half the vendor
@@ -251,9 +256,14 @@ coefficients, and this one does not. Two independent readings say so:
   twelve.
 
 **The direction survives and the magnitude does not.** Our prefill grows
-faster with length than theirs: we are ahead at 202 tokens and behind at 852,
-which is a fact about the measured points and needs no fit at all. "Six times"
-is an artefact.
+faster with length than theirs, which is a fact about the measured points and
+needs no fit at all. "Six times" is an artefact.
+
+**"BEHIND AT 852" WAS TRUE OF THIS SECTION'S BINARY AND IS NOT TRUE OF THE
+SHIPPING ONE.** That is what 1k-ii measures: ahead at every rung to 602 and
+LEVEL at 852, +2.1% against a 2.5% floor. The direction is unchanged -- the
+margin shrinks as the prompt grows -- and where it ends up is 1k-ii's to say,
+not this section's.
 
 **This matters beyond a number.** "The quadratic term is the whole deficit
 and theirs is six times smaller" organised months of work, and 1i is named
@@ -781,10 +791,24 @@ point. Over an eight-point ladder the three parameters are correlated, and a
 lower `c` is bought with a higher `b`. `tools/ttft_compare.py` interpolates
 inside each curve and never fits across them; that is why it exists.
 
-**Still not supported: that charsiu beats the vendor on prefill.** It does
-not, above about 250 tokens. Their attention remains roughly 4.3x cheaper than
-ours -- our fence alone is 880 ms against their entire quadratic term's 539 at
-852 tokens.
+**THE 250 TOKEN BOUND IN THIS PARAGRAPH IS SUPERSEDED BY 1k-ii AND WAS LEFT
+STANDING.** It read "Still not supported: that charsiu beats the vendor on
+prefill. It does not, above about 250 tokens." That was true of the binary
+this section measured. r413 re-ran the whole ladder on the SHIPPING binary,
+five repeats a point, one boot, clock and governor pinned, and charsiu is
+ahead at every rung to 602 tokens and level at 852 -- +24.8% at 27 tokens,
++9.6% at 202, +4.9% at 302, +3.5% at 602, +2.1% and LEVEL at 852. The
+crossover this paragraph names does not exist on that binary.
+
+What survives is the direction and the cause, not the bound: the margin
+SHRINKS with prompt length, because their attention remains roughly 4.3x
+cheaper than ours -- our fence alone is 880 ms against their entire quadratic
+term's 539 at 852 tokens. Extended far enough that still crosses; 852 is where
+it reaches level, and nothing here measures beyond it.
+
+Two paragraphs in one document disagreeing about who leads prefill is exactly
+what section 0 warns about when it says the citation and the arm do not agree
+about TTFT. Read 1k-ii, which names its binary, its boot and its spread.
 
 **AND THE EXPLANATION THAT WAS ATTACHED TO THAT WAS NOT MEASURED.** This
 paragraph said 0.119 TMAC/s against the int4 path's 0.45 to 0.70, and called
@@ -859,7 +883,7 @@ any of them had moved, this whole re-read would be suspect.
 charsiu and it was written up as "completely surpassed" and withdrawn the same
 day. The difference is a measured floor, one row still level and one row thin.
 
-### 1k. The ladder with the overlap work in: a lead under 250, level above
+### 1k. SUPERSEDED BY 1k-ii: the ladder with the overlap work in, on an older binary
 
 **SUPERSEDED BY 1k-ii above**, which re-measured this on the shipping binary
 with five repeats and a measured noise floor. Kept as a dated reading.
@@ -1123,6 +1147,99 @@ out of, and the only one that gains. What this asks for is a per model
 decision, which is what `llama_auto_kmax` already is; it only ever looks
 upward.
 
+### Looking downward, tried on all eight, and why the default stays up
+
+`CHARSIU_NPU_W4_GROUP_FIT=1`, default off, gives each tensor the widest PROPER
+divisor of its own K that is no wider than the width asked for. It is the
+narrowest form of "look downward": the requested width is still the ceiling,
+and nothing changes for a tensor the ceiling already divides. Quality on the
+desk, 511 scored positions of `tests/corpus/long.txt`; decode on the board,
+boot afe55e04, 594 MHz, boot entry 1, performance governor, three readings an
+arm, medians, binary 95e72869ba97.
+
+```
+  model            ppl FIT=0   FIT=1       ppl     decode 0   1     decode
+  Qwen2.5-1.5B      37.6358   27.1185   -27.9%      14.96  15.29    +2.2%
+  gemma-3-1b       108.7063   82.4102   -24.2%      21.61  21.71    +0.5%
+  tinyllama-1.1b    29.9309   28.2998    -5.4%      22.87  22.80    -0.3%
+  Llama-3.2-1B      41.2763   41.2763     0.0%      21.52  21.43    -0.4%
+  Phi-3.5-mini      17.8023   17.8023     0.0%       7.25   7.22    -0.4%
+  SmolLM2-1.7B      31.1293   31.1293     0.0%      15.30  15.24    -0.4%
+  Qwen3-0.6B        87.8019   89.2738    +1.7%      30.64  29.22    -4.6%
+  gemma-4-E2B       89.0370   99.8674   +12.2%       9.51   9.88    +3.9%
+```
+
+**Two models are strictly better on both axes**, and a third is nearly free:
+Qwen2.5-1.5B gains 27.9% of perplexity and 2.2% of decode, gemma-3-1b 24.2%
+and 0.5%, tinyllama 5.4% of quality for 0.3% of decode.
+
+**Three are unchanged to the digit, which is the property that makes it
+safe to leave on.** Llama, Phi-3.5 and SmolLM2-1.7B read the same perplexity
+with the flag on as off, because their K values already have a proper divisor
+at the requested width and the fit picks the same number. It is a no-op where
+it is not needed, ON as well as off.
+
+**Their -0.4% of decode is the flag's own cost, and it is not nothing.**
+Nothing about those three models' weights changes, so that column is the
+doubled slot capacity the flag allocates, measured on models where it buys
+nothing.
+
+**And two models get worse from a strictly finer quantisation.** Qwen3-0.6B's
+only change is its 1024-wide tensors going from one scale a row to two groups
+of 512; its 2048 and 3072 tensors are untouched and read the same rms either
+way. gemma-4-E2B's are 1536 to three groups of 512 and 256 to two of 128.
+Nothing else moves in either model, and both lose.
+
+That is not float rounding from a different slice count. These are desk
+numbers, where `CHARSIU_NPU=0` means there are no slices at all: `npu_matvec`
+walks the groups and accumulates in double. The difference is the
+quantisation itself. **Both signs hold on the second corpus**, which is what
+this pack requires of a result it does not like. On `tests/corpus/long2.txt`,
+same arms, same lengths:
+
+```
+  Qwen3-0.6B     long   87.8019 ->  89.2738   +1.7%
+                 long2 120.4219 -> 124.7481   +3.6%
+  Qwen2.5-1.5B   long   37.6358 ->  27.1185  -27.9%
+                 long2  51.3478 ->  37.4671  -27.0%
+```
+
+Qwen2.5's gain reproduces to within a point of its own size; Qwen3's loss
+reproduces in sign and grows. Neither is one passage.
+
+**The weight error falls on every model and the perplexity goes both ways.**
+`CHARSIU_NPU_RMS=1` makes the quantiser report each tensor's reconstruction
+error:
+
+```
+  model          mean rms FIT=0   FIT=1             ppl
+  gemma-3-1b        14.2882%   12.4938%   -12.6%   -24.2%   better
+  gemma-4-E2B       14.2980%   13.1508%    -8.0%   +12.2%   worse
+  Qwen3-0.6B        13.6892%   12.0744%   -11.8%    +1.7%   worse
+```
+
+It has to fall: a finer partition of the same row cannot have a worse absmax.
+The reductions are all the same size, 8 to 12.6%, while the quality outcome
+differs in SIGN. **So the Frobenius error cannot predict the direction of the
+quality change, let alone its size**, and no ranking built on it can order
+these models. This pack already has that statement from the other side, in the
+reconstruction that scored ppl 1701 at 18.3% weight error where Gaussian noise
+of the same magnitude scored 32.10. This is the same fact read backwards: a
+genuine reduction in weight error, and two models of eight pay for it.
+
+**What that leaves `llama_auto_kmax`.** A downward rule would need a
+predictor, evaluated before any weights are quantised, for which side of zero
+a model lands on. The candidates measured here do not supply one: it is not
+the group count (gemma-3-1b's odd rungs are among its best), not the widths
+involved (Qwen3 and Qwen2.5 both go 1024-wide tensors to 512 and move in
+opposite directions), and not the weight error, which moves the same way for
+everyone. Choosing per model is possible and costs one perplexity run per
+model per candidate width; choosing per model **without running the model** is
+not something this data supports.
+
+So the flag ships default off. Two of eight models get worse, and a default
+that changes output under a shipped model belongs to whoever ships it.
+
 **And the trade cannot be engineered away.** A narrow group forces a narrow
 slice, because one dispatch cannot cover K wider than one group: the hardware
 returns one accumulator per output channel per slice (`fo[j]`,
@@ -1266,6 +1383,77 @@ fixed, and that is worth checking whenever a scheduling default changes.
              the fastest. Quoting it cites a number derived to refute it.
 ```
 
+### 5a. The controller is not the binding constraint at decode
+
+Both loads were run against each other on 2026-09-15, boot 8934c5ee, 594 MHz,
+performance governor: `charsiu_membw` reading a 256 MB buffer for 8 s inside
+the 12.3 s generation window of a 256 token Llama-3.2-1B decode.
+
+```
+                            readers alone   alongside a decode   decode t/s
+  1 reader thread              8.63 GB/s          8.64             20.84
+  8 reader threads            11.93 GB/s         11.92             20.82
+  decode alone                     --               --             20.79
+```
+
+**Neither side loses anything.** Eight cores reading DRAM flat out move decode
+by 0.1%, and the decode moves them by 0.1%. So a second engine taking part of
+the work is not zero sum for want of bandwidth, which is what the tool was
+written to find out.
+
+That is consistent with the per-call floor being 38% of a token: the NPU pulls
+its weights in bursts and waits between them, so its average demand is well
+under the peak even though the total bytes a token are large. **It does not
+show that decode is compute bound, and it does not measure the GPU.** The
+readers here are an independent load, not a second engine taking part of the
+same tensor, and they were not placed on the runtime's own cores.
+
+**And the thread count belongs to the figure.** The reader sweep is not
+monotone: 1 thread 8.63, 2 threads 8.09, 3 threads 7.68, 4 threads 7.54, 6
+threads 10.59, 8 threads 11.92. Four threads are worse than one. That is the
+A72 and A53 clusters, the same split that makes decode bimodal, so "the CPU
+reaches X GB/s" is not a quantity without a thread count beside it.
+
+### 5b. What one dispatch costs, and int4 against int8 measured rather than halved
+
+`npu_fence_scan` holds k, m and the buffers still and moves only the output
+width. Buffers are allocated once at the widest point, so no row pays for an
+allocation. Least squares on all eight widths of each row, m=1, 20 repeats a
+point, same boot and clock as 5a.
+
+```
+    k      int8 us/n    int4 us/n    ratio    int8 GB/s    int4 GB/s
+    1024     0.1167       0.0595     0.51        8.83         8.32
+    2048     0.2300       0.1168     0.51        8.94         8.84
+    4096     0.4370       0.2224     0.51        9.40         9.24
+```
+
+**The slope doubles when k doubles**, over a 16x range: the int8 per-channel
+cost runs 0.0328, 0.0618, 0.1167, 0.2300, 0.4370 for k of 256 to 4096, which
+is x1.89, x1.89, x1.97, x1.90. So a dispatch at m=1 costs its weight BYTES,
+k*n of them for int8 and half that for int4, at 8.3 to 9.4 GB/s either way.
+
+**The int4 halving used to be an inference.** Every earlier sweep in this tree
+dispatched int8 and the w4a16 cost model was reached by halving the weight
+bytes on paper. Measured at three k, the ratio is 0.51 three times.
+
+**That rate is the single-stream memory roof.** Section 5a gives one CPU core
+8.63 GB/s of DRAM on the same boot, and a dispatch reads its weights at 8.3 to
+9.4. So at m=1 what is left to win is bytes, not calls.
+
+**The intercept is not quoted and should not be.** The fits put it between 13
+and 104 us, and the same k measured twice in one round gave 71.4 and 52.0. The
+line describes the wide end to 6.5% at k=4096 and to 31% at k=256. It
+describes without determining its constant.
+
+**The m axis, on the same surface.** At k=1024 int8, the per-channel cost runs
+0.111 at m=1, 0.118 at m=8, 0.122 at m=20, 0.131 at m=40 and 0.202 at m=80:
+eighty times the rows for 1.8 times the cost, because the weights are read
+once for the whole batch. That is 0.0025 us a channel a row at m=80 against
+0.111 at m=1, a factor of 44, and it is why prefill batches and decode cannot.
+The slope is flat to m=40 and then jumps by half, so the widest chunk is not
+free either.
+
 ---
 
 ## 6. Variability, and what one passage can order
@@ -1403,9 +1591,14 @@ prompt, not a ratio.
 
 The shape of that answer has since moved and this paragraph used to give the
 old one. When it was written the crossover sat at about 248 of our tokens with
-the vendor ahead above it. 1k is the current ladder: charsiu leads by 1.09x to
-1.28x below about 250 tokens and the two are LEVEL from 302 up, so what depends
-on the prompt is now the size of our lead, not who has it.
+the vendor ahead above it.
+
+**1k-ii IS THE CURRENT LADDER, NOT 1k**, and this paragraph pointed at the
+superseded one. On the shipping binary charsiu is ahead at every rung from 27
+to 602 tokens -- +24.8%, +29.5%, +24.2%, +9.6%, +4.9%, +6.8%, +3.5% -- and
+LEVEL at 852. So what depends on the prompt is the size of our lead and not
+who has it, which is what this paragraph said; the numbers it said it with
+were a ladder ago.
 
 ## 8. What is not supported
 
@@ -1481,6 +1674,16 @@ Every margin is inside its own arm's spread and the text is identical across
 both arms and all four repeats. The per task term does not decide this deal on
 these shapes; the megabyte term does. The default is now the measured 4.81,
 which is what `npu_job_cost` and `charsiu_shapes` have used since round 155.
+
+**And 4.81 was measured at 64 x 32, which section 5b says cannot order
+anything.** `npu_job_cost`'s task table at that shape reads 70.06 us for one
+task, 67.49 for four and 222.76 for sixteen, so a straight line through it has
+no single slope to give. Re-run at k=1024 n=1024 the same table is FLAT in us
+a task -- 137.51 for one, 131.39 for four, 124.01 for sixteen, and a second
+pass moves in the other direction -- because at m=1 a task costs what its
+weights cost to read. So the per task coefficient is not a per task cost at a
+shape the runtime actually submits. The board A/B above is what makes it
+harmless here: the term does not decide this deal either way.
 
 **Three models, not nine.** That is what the table says and all it says.
 

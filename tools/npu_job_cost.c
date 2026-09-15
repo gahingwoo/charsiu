@@ -175,7 +175,7 @@ int main(int argc, char **argv)
 	struct unit a, b, b1;
 	struct charsiu_joblist jl[2];
 	double t0;
-	unsigned r, nt;
+	unsigned r, nt, ak, an;
 	int have_d1 = 0;
 
 	d0 = charsiu_open(NULL);
@@ -183,16 +183,60 @@ int main(int argc, char **argv)
 	d1 = charsiu_open(NULL);
 	have_d1 = d1 != NULL;
 
-	if (unit_make(d0, &a, 1, 64, 32) || unit_make(d0, &b, 1, 64, 32)) {
+	/*
+	 * THE FOUR ARMS NEEDED A SECOND SHAPE, AND THE FIRST RUN IS WHY.
+	 *
+	 * At 64 x 32 the arithmetic is nothing, which is what prices dispatch
+	 * -- and it is also what makes the answer unable to say whether B
+	 * reached both cores. Two jobs that compute nothing cost the same
+	 * whether they ran side by side or one after the other, so a cheap B
+	 * is a cheap SUBMISSION and not yet a parallel one.
+	 *
+	 * With a shape whose compute dominates, the two readings separate: B
+	 * near one job's time means the driver put the pair on both cores, and
+	 * B near twice it means one core ran them in turn. CHARSIU_JOB_K and
+	 * CHARSIU_JOB_N move only these four arms; the default is the shape
+	 * every earlier number was taken at, so nothing already recorded
+	 * moves.
+	 */
+	{
+		const char *ek = getenv("CHARSIU_JOB_K");
+		const char *en = getenv("CHARSIU_JOB_N");
+
+		ak = ek && *ek ? (unsigned)atoi(ek) : 64;
+		an = en && *en ? (unsigned)atoi(en) : 32;
+		/* the device's own bounds, checked here rather than by
+		 * submitting past them: n > 8192 once took the IOMMU with it */
+		if (an > 8192 || an == 0)
+			an = 32;
+		if (ak == 0 || (size_t)(ak / 32) * 1 > 5120)
+			ak = 64;
+	}
+	if (unit_make(d0, &a, 1, ak, an) || unit_make(d0, &b, 1, ak, an)) {
 		fprintf(stderr, "npu_job_cost: could not build a job on fd 0\n");
 		return 1;
 	}
-	if (have_d1 && unit_make(d1, &b1, 1, 64, 32)) {
+	if (have_d1 && unit_make(d1, &b1, 1, ak, an)) {
 		fprintf(stderr, "npu_job_cost: could not build a job on fd 1\n");
 		have_d1 = 0;
 	}
 	printf("m=1 k=64 n=32, so the arithmetic is nothing and this is dispatch.\n");
+	if (ak != 64 || an != 32)
+		printf("the four arms below run k=%u n=%u instead.\n", ak, an);
 	printf("%u repetitions an arm.\n\n", reps);
+
+	/*
+	 * CHARSIU_JOB_ARMS_ONLY=1 skips both sweeps. The four arms are the
+	 * part that has to be re-run at many shapes to find where the second
+	 * device starts paying for itself, and the byte sweep in front of them
+	 * is five passes over ten shapes that answer a different question.
+	 */
+	{
+		const char *ao = getenv("CHARSIU_JOB_ARMS_ONLY");
+
+		if (ao && *ao && *ao != '0')
+			goto arms;
+	}
 
 	/* --- the task sweep on ONE job: what does chaining cost --- */
 	printf("  one job, tasks chained inside it\n");
@@ -357,6 +401,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+arms:
 	/* --- the four ways to get two jobs onto the hardware --- */
 	printf("\n  two jobs, four ways\n");
 	{

@@ -575,6 +575,36 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
 	return (size_t)G * m * 32u + (size_t)(mi / P) * (32u * P) + j;
 }
 
+/*
+ * IS THIS BATCH WIDTH EXPRESSIBLE ON THE ACCUMULATOR SURFACE?
+ *
+ * THE LAW LIVES HERE BECAUSE THE MAP DOES. P = m / 2 above is the whole of
+ * it: the surface covers 64 * P slots per group of 32 channels where the
+ * group needs 32 * m, and 64P == 32m only when m is even. The surface is
+ * organised in PAIRS OF ROWS and an odd width is not a thing it can name.
+ *
+ * IT WAS WRITTEN OUT FOUR TIMES AND CHECKED IN ONE OF THEM. w4_width_
+ * expressible in src/npudev.c spelt it `(m % 2) == 0`, prefill_width in
+ * tools/charsiu_run.c spelt it `w &= ~1`, tools/acc_index_check.c spelt it
+ * `m % 2 == 0` again -- and that last one is the only one the sweep ever
+ * compared against this function. So the checker asserted the map against a
+ * COPY of the rule while the two decisions that actually reach the hardware
+ * were unwatched: edit the map and its test together and the gate and the
+ * chunker keep the old law with nothing reporting it.
+ *
+ * Now all three call this, and acc_index_check sweeps THIS against the map.
+ * A map that stops being a bijection at some even width, or starts being one
+ * at an odd width, is a failed `make test` rather than a board round.
+ *
+ * m = 0 and m = 1 are not this predicate's business: charsiu_acc_index is
+ * flat below 2 and the batched path has its own minimum. The answer for them
+ * is the same as it has always been, which is what `m % 2` says.
+ */
+int charsiu_acc_width_ok(unsigned m)
+{
+	return (m % 2) == 0;
+}
+
 size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 {
 	/*

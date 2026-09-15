@@ -92,6 +92,17 @@ static float worst(const float *a, const float *b, size_t n)
 
 int main(int argc, char **argv)
 {
+	/* A BINARY THAT CANNOT SAY ITS COMMIT CANNOT BE AN ARM. Round 415 lost
+	 * a comparison to an installed control that predated the build stamp,
+	 * and round 413 added this to eleven of the eighteen probe tools and
+	 * recorded that it had done all of them. This is one of the five it
+	 * never reached. Before any argument parsing, because the usual
+	 * failure is argv[1] going straight to atoi and an unrecognised
+	 * --version becoming a dimension of ZERO submitted to the hardware. */
+	if (argc > 1 && !strcmp(argv[1], "--version")) {
+		printf("%s\n", CHARSIU_BUILD);
+		return 0;
+	}
 	/* the block sizes worth asking about: 1 is the unblocked form */
 	static const unsigned qbs[] = { 1, 4, 8, 16, 32, 64, 128, 256 };
 	static const unsigned kts[] = { 16, 32, 64, 128, 256, 512 };
