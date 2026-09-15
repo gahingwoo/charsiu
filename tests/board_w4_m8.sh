@@ -10,7 +10,7 @@
 # The 33 that miss are ROW 0 of the n = 8192 tensors, every ffn_gate and
 # ffn_up, at that width and no other.
 #
-# ⚠ IT NEEDS BOTH NUMBERS. m = 8 is exact at n = 512 and n = 2048, and n = 8192
+# IT NEEDS BOTH NUMBERS. m = 8 is exact at n = 512 and n = 2048, and n = 8192
 # is exact at every other m. A desktop round retired everything that is a
 # function of only one of them:
 #
@@ -42,12 +42,12 @@
 #            and ours is the only shape that asks for twice that. If m = 8 is
 #            exact the fault is the WIDTH.
 #
-# ⚠ THE BASELINE RUNS FIRST AND IT MUST FAIL. Both arms are read against it,
+# THE BASELINE RUNS FIRST AND IT MUST FAIL. Both arms are read against it,
 # and the refusal in npudev.c means m = 8 does not reach the hardware unless
 # CHARSIU_NPU_W4_M8 is set -- a control that cannot reach the thing it is
 # controlling for is not a control, which this tree has already paid for once.
 #
-# 🏁 AND ON 2026-09-06 IT DID NOT FAIL, WHICH IS THE ANSWER. Re-run unchanged
+# AND ON 2026-09-06 IT DID NOT FAIL, WHICH IS THE ANSWER. Re-run unchanged
 # with the NPU rail reading 800000 uV instead of the 750 mV U-Boot leaves, all
 # three arms came back 904 of 904 with ZERO MISS lines, against this script's
 # own 871 of 904 and 33 misses on 08-29. m = 8 was the voltage margin
@@ -58,7 +58,7 @@
 # prints the rail first so a run can be read either way, and npudev.c gates the
 # refusal on charsiu_npu_overlap_ok() rather than on the width.
 #
-# ⚠ AND READ THE where-did-it-go LINE, not just the row count. The probe now
+# AND READ THE where-did-it-go LINE, not just the row count. The probe now
 # scans the row that missed and says whether its wanted values are SOMEWHERE in
 # the batch or absent from it. Absent means the block never wrote them and no
 # reading recovers them; somewhere means they were written and misplaced, and
@@ -69,7 +69,7 @@
 # Usage: board_w4_m8.sh [MODEL.gguf]
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -104,7 +104,7 @@ fi
 OUTDIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUTDIR"
 
-# ⚠ 8, NOT 80. Every other width is settled and each one costs a full pass over
+# 8, NOT 80. Every other width is settled and each one costs a full pass over
 # 113 tensors twice -- once a row at a time for the reference. This round is
 # about one width, so it caps there and the other seven do not get re-measured.
 MMAX=${CHARSIU_PROBE_MMAX:-8}
@@ -117,13 +117,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_W4_M8=1"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
 echo "build    $(charsiu_build "$RUN")"
 echo "probe    --batch-probe $MMAX   (widths 2, 4, 8; 8 is the question)"
-# ⚠⚠ THE RAIL, BEFORE ANYTHING ELSE. This whole probe's 08-29 map was drawn at
+# THE RAIL, BEFORE ANYTHING ELSE. This whole probe's 08-29 map was drawn at
 # 750 mV and read as a property of the width. A round that does not say which
 # voltage it ran at cannot be compared with either reading.
 for _r in /sys/class/regulator/regulator.*; do
@@ -168,7 +168,7 @@ for ARM in baseline onedev nmax4096; do
 		echo
 		continue
 	fi
-	# ⚠ NO head CAP: the deciding lines are at the BOTTOM of this output,
+	# NO head CAP: the deciding lines are at the BOTTOM of this output,
 	# and this tree has lost two rounds to a cap that cut them.
 	sed -n '/batching .* layers/,$p' "$out" | sed 's/^/  /'
 	echo
@@ -198,7 +198,7 @@ echo "  4. THEN THE TWO ARMS. Exactly one of them going exact at m = 8 is"
 echo "     the answer; both staying wrong says it is neither the core pair"
 echo "     nor the width, and the next question is the surface itself."
 echo
-echo "  ⚠ ONEDEV HALVES THE HARDWARE, so its tok/s and its us-a-row are not"
+echo "  ONEDEV HALVES THE HARDWARE, so its tok/s and its us-a-row are not"
 echo "  comparable with the others. This arm is about the ROWS column."
 echo
 echo "  full logs: $OUTDIR/w4-m8-{baseline,onedev,nmax4096}.txt"

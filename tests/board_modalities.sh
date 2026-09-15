@@ -4,7 +4,7 @@
 #
 # The first board round for seeing, matching and hearing.
 #
-# ⚠ THE TOWERS REACH THE HARDWARE NOW, and this round is the one that says what
+# THE TOWERS REACH THE HARDWARE NOW, and this round is the one that says what
 # that bought. Run it with CHARSIU_NPU=1 in the environment and again without,
 # and the two columns are the answer. The decoder side of whisper and CLIP's
 # text tower are still on the CPU on purpose: both feed one row at a time, which
@@ -49,7 +49,7 @@ get() {   # url, destination
 	curl -fsSL -o "$2.part" "$1" && mv "$2.part" "$2"
 }
 
-# ⚠ /proc/uptime, NOT `date +%s%3N`. busybox's date has no %N, and it does not
+# /proc/uptime, NOT `date +%s%3N`. busybox's date has no %N, and it does not
 # fail on it either -- the first board round came back with 34215439249 ms for
 # an eleven second clip and PASSED, because the three checks that mattered were
 # string comparisons and nothing looked at the clock's own answer. /proc/uptime
@@ -59,14 +59,14 @@ took() { echo "$(( $(ms) - $1 ))"; }
 secs() { awk -v m="$1" 'BEGIN{printf "%.1f", m/1000}'; }
 
 #
-# ⚠⚠ WHICH BUILD, AND IT COVERS charsiu_run ONLY. Sections 1 and 3 run
+# WHICH BUILD, AND IT COVERS charsiu_run ONLY. Sections 1 and 3 run
 # charsiu_whisper and charsiu_clip, which are compiled from this same tree
 # with the same -DCHARSIU_BUILD, and they answer --version now, so
 # those two timings are identified by their paths and nothing finer. A build
 # line read as covering all three binaries is worse than none. Section 2 is
 # charsiu_run with --mmproj, so the vision tower is covered.
 #
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -107,7 +107,7 @@ echo
 
 echo "== 2. seeing: SmolVLM-256M on the llama.cpp logo =="
 t0=$(ms)
-# ⚠⚠ STDERR IS KEPT NOW. This discarded it, so the vision tower's staging and
+# STDERR IS KEPT NOW. This discarded it, so the vision tower's staging and
 # pool lines -- the only place that says whether the hardware did any of the
 # work -- were thrown away for three board rounds while their numbers were being
 # argued about, and a 17x was announced and withdrawn in between.
@@ -141,7 +141,7 @@ echo "  $OUT"
 echo
 
 echo "== 5. the batched prefill, against the token loop, on this board =="
-# ⚠⚠ THE ONE CHECK THIS ROUND WAS MISSING. The batched prefill is verified byte
+# THE ONE CHECK THIS ROUND WAS MISSING. The batched prefill is verified byte
 # for byte on a development host across six architectures, and the board has
 # never compared its text against the token loop -- while every round of it runs
 # through hardware the host does not have. Same binary, one flag apart.
@@ -169,7 +169,7 @@ if [ -n "${CHARSIU_NPU:-}" ]; then
 	echo "  went to the hardware. Against the CPU round of 2026-08-28:"
 	echo "    whisper 34.5 s   vision 153.1 s   clip 4.7 s"
 else
-	echo "  ⚠ CHARSIU_NPU was NOT set, so this is the CPU column. Run it"
+	echo "  CHARSIU_NPU was NOT set, so this is the CPU column. Run it"
 	echo "    again with CHARSIU_NPU=1 to get the other one."
 fi
 [ "$FAIL" = 0 ] && echo "  PASS" || echo "  FAILED"

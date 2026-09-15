@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# ⭐ THE SCORES MATMUL WAS WRITING A RECTANGLE WHERE THE ANSWER IS A TRIANGLE.
+# THE SCORES MATMUL WAS WRITING A RECTANGLE WHERE THE ANSWER IS A TRIANGLE.
 #
 # A chunk of rows starting at position p0 attends to nothing after its own last
 # row. Every column past that is computed, written to memory, and then memset by
@@ -14,11 +14,11 @@
 # at the shipped width three quarters of the fence is the output write and the
 # weight fetch, and both scale with n.
 #
-# ⚠ THE ARM IS NAMED IN BOTH DIRECTIONS. CHARSIU_ATTN_NPU_CAUSAL_N=0 is the
+# THE ARM IS NAMED IN BOTH DIRECTIONS. CHARSIU_ATTN_NPU_CAUSAL_N=0 is the
 # rectangle this replaces, 1 is the triangle, and the script refuses a binary
 # that does not carry the knob rather than measuring one arm twice.
 #
-# ⚠⚠ AND THE TEXT MUST BE IDENTICAL. This changes what the hardware computes,
+# AND THE TEXT MUST BE IDENTICAL. This changes what the hardware computes,
 # not how it is read: the columns dropped are ones no reader ever looked at. If
 # that is wrong anywhere, the text moves -- and a wrong answer here is fluent.
 #
@@ -39,7 +39,7 @@ ERR=/tmp/cn.$$
 [ -e /dev/accel/accel0 ] || { echo "no /dev/accel -- this needs the rocket arm"; exit 1; }
 [ -x "$RUN" ] || { echo "no $RUN"; exit 1; }
 if ! strings "$RUN" 2>/dev/null | grep -q '^CHARSIU_ATTN_NPU_CAUSAL_N$'; then
-	echo "⛔ $RUN has no CHARSIU_ATTN_NPU_CAUSAL_N: both arms would be the"
+	echo "$RUN has no CHARSIU_ATTN_NPU_CAUSAL_N: both arms would be the"
 	echo "   default and the table would read 1.000 everywhere"
 	exit 1
 fi
@@ -113,7 +113,7 @@ b=$(env $E CHARSIU_ATTN_NPU_CAUSAL_N=1 "$RUN" "$M" -p "$LAST" -n 24 --ignore-eos
 if [ "$a" = "$b" ]; then
 	echo "   identical: $(printf '%s' "$a" | md5sum | cut -c1-12)"
 else
-	echo "   ⛔ DIFFER"
+	echo "   DIFFER"
 	echo "   rect $a"
 	echo "   tri  $b"
 fi

@@ -20,12 +20,12 @@ has not reached yet, through the inverse Hessian of the calibration activations.
 Nothing is stored beyond the same per channel scale, and nothing changes at run
 time.
 
-⚠ It only works because THIS model's activations are correlated, which was
+It only works because THIS model's activations are correlated, which was
 measured before the work rather than assumed: the input covariance of
 blk.0.ffn_gate has its top eigenvalue carrying 10.4% and its top sixteen 33.7%.
 With uncorrelated inputs H is the identity and GPTQ degenerates to RTN.
 
-⚠ And "GPTQ scored worse than RTN" means the code is wrong, not the method:
+And "GPTQ scored worse than RTN" means the code is wrong, not the method:
 it is RTN plus a correction to the same objective. The Cholesky is the place to
 look. U must satisfy U^T U = H^-1, so U = cholesky(inv(H)).T, with no second
 inversion.

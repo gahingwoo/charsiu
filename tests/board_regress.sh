@@ -6,7 +6,7 @@
 #
 #   tests/board_regress.sh [MODEL_DIR] [CHARSIU_DIR]
 #
-# ⛔ HOLE ONE, and it is the reason this file exists. The board copy called
+# HOLE ONE, and it is the reason this file exists. The board copy called
 #    `sh arch_sanity.sh` with no argument, having exported CHARSIU_BOARD_DIR
 #    instead. arch_sanity has REQUIRED $1 since it gained one, so section 1 --
 #    "every architecture still knows a fact" -- printed a usage line and
@@ -15,7 +15,7 @@
 #    green sections underneath a heading that had checked nothing. A merge to
 #    stable quoted "7/7 architectures" from it.
 #
-# ⛔ HOLE TWO, the same shape. The board copy read the clock as
+# HOLE TWO, the same shape. The board copy read the clock as
 #       cat clk_npu_dsu0 || cat aclk_rknn_root || echo UNREADABLE
 #    and the node that exists is clk_rknn_dsu0. So it printed UNREADABLE and
 #    carried on. board_clk.sh has done this properly since round 399: it
@@ -31,7 +31,7 @@ DIR="${1:-${CHARSIU_BOARD_DIR:-/opt/vendor/models}}"
 B="${2:-${CHARSIU_DIR:-/opt/charsiu}}"
 RUN="${CHARSIU_RUN:-$B/charsiu_run}"
 PPL="${CHARSIU_PPL:-$B/charsiu_ppl}"
-# ⚠ THE SCALAR CONTROL COMES FROM THE ENVIRONMENT TOO, and it did not. Section
+# THE SCALAR CONTROL COMES FROM THE ENVIRONMENT TOO, and it did not. Section
 # 3 hardcoded "$B/charsiu_run_scalar" and overrode whatever the caller had set,
 # so a round that deployed a matching control still measured the installed one.
 # Same shape as the CHARSIU_RUN/CHARSIU_RUN_BIN split: setting the knob a
@@ -63,7 +63,7 @@ CHARSIU_RUN="$RUN" sh "$HERE/board_text_all.sh" 8 2>&1 | grep -E "gguf|models co
 echo
 
 echo "================ 3. the vector kernels against the scalar ones"
-# ⚠ NOT PIPED THROUGH tail. Section 3's whole output when it finds something
+# NOT PIPED THROUGH tail. Section 3's whole output when it finds something
 # is the FAIL lines and the two sentences under each; tail -14 kept the end of
 # the list and could drop the first failures. It also swallows the refusal
 # above. Print it, and let the reader see the whole thing.
@@ -79,14 +79,14 @@ for m in "$M" "$DIR/gemma-3-1b-it-Q4_0.gguf"; do
 	if [ "$a" = "$b" ]; then
 		echo "   $(basename "$m")  gelu identical"
 	else
-		echo "   $(basename "$m")  ⛔ GELU MOVED THE TEXT"
+		echo "   $(basename "$m")  GELU MOVED THE TEXT"
 		echo "      $a"; echo "      $b"
 	fi
 done
 echo
 
 echo "================ 5. perplexity, the deterministic instrument"
-# ⚠⚠ NAME BOTH INPUTS, BY md5. A perplexity is not a property of the runtime:
+# NAME BOTH INPUTS, BY md5. A perplexity is not a property of the runtime:
 # it belongs to the model file AND the corpus file, and neither is identified
 # by a round that just prints a number. The stable merge at 0c85c71 quotes
 # "perplexity 32.8025 int4 on the NPU" and this section, on

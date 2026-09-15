@@ -26,7 +26,7 @@
  * float to half FOUR AT A TIME, and it TRUNCATES, exactly as
  * charsiu_float_to_half does.
  *
- * ⚠ NOT vcvt_f16_f32. The hardware instruction rounds to nearest even and this
+ * NOT vcvt_f16_f32. The hardware instruction rounds to nearest even and this
  * project's converter drops the low thirteen mantissa bits, which is a
  * different number by up to half a last place -- about 5e-4 relative in half
  * precision, four thousand times the gap that moved a token in the SiLU
@@ -146,7 +146,7 @@ enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm)
 /*
  * How many channel atoms fit in one CBUF entry.
  *
- * ⚠ MESA SAYS EIGHT AND THIS TREE HAS ALWAYS SAID FOUR. Same function, same
+ * MESA SAYS EIGHT AND THIS TREE HAS ALWAYS SAID FOUR. Same function, same
  * shape, one constant apart: rkt_task.c's calc_entries_per_slice() divides by
  * CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE = 128 / 16 = 8, and this divides by 4,
  * which is a 64 byte entry.
@@ -167,7 +167,7 @@ enum charsiu_dtype charsiu_effective_adtype(const struct charsiu_matmul *mm)
  * question, and npu_gemm_test asks it.
  */
 /*
- * ⚠ NOT CACHED IN A STATIC. npu_gemm_test sweeps this between phases in one
+ * NOT CACHED IN A STATIC. npu_gemm_test sweeps this between phases in one
  * process, and a value latched on the first matmul would make the second phase
  * a silent copy of the first -- which is exactly how round 380's control ran
  * twice with the same geometry and nobody noticed until the log was read.
@@ -250,7 +250,7 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	 * sent plain 0x00600120 for int4 at 16 bit activations, which is
 	 * charsiu's own w4a16 shape and 1920 of the vendor's dispatches.
 	 *
-	 * ⚠ CHECKED AGAINST THE FILE, NOT AGAINST emit_dump. The note further
+	 * CHECKED AGAINST THE FILE, NOT AGAINST emit_dump. The note further
 	 * down this function is about exactly that mistake: emit_dump IS this
 	 * function, so it cannot fail a check on it. The four rows above are
 	 * read out of the .rkllm with tools/rkllm_regcmd.py, and the four cases
@@ -277,7 +277,7 @@ size_t charsiu_emit_matmul(const struct charsiu_matmul *mm,
 	 * A matmul emitted here is one window by construction: it is not tiled
 	 * yet. Tiling is what makes this false, and it is not written.
 	 *
-	 * ⚠⚠ AND THE RUNTIME DOES NOT COME THROUGH HERE. charsiu_emit_matmul
+	 * AND THE RUNTIME DOES NOT COME THROUGH HERE. charsiu_emit_matmul
 	 * has exactly one caller in the tree, tools/emit_dump.c. npudev submits
 	 * through charsiu_emit_job in job.c, which HAS the split rule --
 	 * `split = wide && surf * rows > 4096`, derived from the same vendor
@@ -415,7 +415,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 	 * next step and is what charsiu_pack_input_f16 below is for.
 	 */
 	/*
-	 * ⚠ THE ROW TERM IN THIS LAYOUT HAS NEVER BEEN TESTED. Every matmul in
+	 * THE ROW TERM IN THIS LAYOUT HAS NEVER BEEN TESTED. Every matmul in
 	 * this project ran M = 1 until round 289, where m drops out of the
 	 * expression entirely and any arrangement of the rows is correct.
 	 *
@@ -425,7 +425,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 	 * on --map, and NONE of them makes it read its own data. So the place
 	 * left is the arrangement itself.
 	 *
-	 * ⚠ ROUND 296 RAN THREE ARRANGEMENTS AND THEY ARE THREE POINTS OF ONE
+	 * ROUND 296 RAN THREE ARRANGEMENTS AND THEY ARE THREE POINTS OF ONE
 	 * FAMILY. What separates them is the GRANULARITY at which rows
 	 * interleave: the shipped layout switches rows every atom, 8 elements
 	 * and 16 bytes, and the "rows outermost" one switches every k, the whole
@@ -461,7 +461,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 		{
 		/*
-		 * ⚠⚠ THE INT8 PACKER'S COST IS NOT A CALL. IT IS A DIVIDE, AND
+		 * THE INT8 PACKER'S COST IS NOT A CALL. IT IS A DIVIDE, AND
 		 * A RELOAD OF THE STRUCT, PER ELEMENT.
 		 *
 		 * The fp16 packer above was fixed by removing a cross unit call
@@ -511,14 +511,14 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 		 *   k=2048 m=1     1.21 -> 10.99 GB/s    9.1x   decode
 		 *   k=4096 m=1     1.23 -> 16.08 GB/s   13.1x   decode
 		 *
-		 * ⚠ A BIGGER RATIO THAN THE FP16 ROUND'S 4.3x DOES NOT MEAN A
+		 * A BIGGER RATIO THAN THE FP16 ROUND'S 4.3x DOES NOT MEAN A
 		 * FASTER FUNCTION. int8 writes one byte an element where fp16
 		 * writes two, so 37 GB/s here is 37 G elements a second against
 		 * fp16's 24.5 GB/s = 12.3 G. The ratio is large because the
 		 * baseline was much worse, and it was worse because of the
 		 * divide.
 		 *
-		 * ⚠ GROUPS OUTERMOST, for the reason the fp16 packer's comment
+		 * GROUPS OUTERMOST, for the reason the fp16 packer's comment
 		 * gives at length: the destination is a cached write back DRM
 		 * mapping that PREP_BO has just synced for the CPU, so it is
 		 * cold every time, and walking rows outermost touches every
@@ -526,12 +526,12 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 		 * ring of destinations so each timed call really does meet a
 		 * cold one.
 		 *
-		 * ⚠ AND THE RING HAS TO BE WALKED ALL THE WAY ROUND. A fixed
+		 * AND THE RING HAS TO BE WALKED ALL THE WAY ROUND. A fixed
 		 * iteration count over a 4 KB destination touches 1.6 MB of the
 		 * ring, which fits in cache and reports a warm number as if it
 		 * were cold. The iteration count is the slot count.
 		 *
-		 * ⚠ THE WHOLE BUFFER MEMSET WAS THE OTHER SUSPECT AND IT IS
+		 * THE WHOLE BUFFER MEMSET WAS THE OTHER SUSPECT AND IT IS
 		 * WORTH NOTHING. Putting it back in front of the fast path,
 		 * best of ten, gives 36.9 against 36.2 at k=2048 m=32, 30.7
 		 * against 36.3 at m=64, 31.5 against 26.5 at k=1024 m=32, 17.7
@@ -543,13 +543,13 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 		 * the speed in the table above is the vectorisation and the
 		 * blocking, not the memset.
 		 *
-		 * ⚠ m = 1 IS ON THIS PATH, and m = 1 is int8 DECODE. At m = 1
+		 * m = 1 IS ON THIS PATH, and m = 1 is int8 DECODE. At m = 1
 		 * the offset collapses to kk for every layout in this function,
 		 * so the destination is one flat biased copy; those are the two
 		 * decode rows above. Decode is this runtime's headline number,
 		 * so it is in the 189168 shape sweep rather than assumed.
 		 *
-		 * ⚠ AND THE PROOF NEEDS TWO PROCESSES. `plain` is cached in the
+		 * AND THE PROOF NEEDS TWO PROCESSES. `plain` is cached in the
 		 * static below on first use, so setting CHARSIU_NPU_PLAIN
 		 * between two calls in one program compares this path against
 		 * ITSELF and passes vacuously. Dump every packed buffer twice,
@@ -590,7 +590,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 			unsigned g;
 
 			/*
-			 * ⚠ ONLY THE TAIL IS CLEARED. Every byte below `base`
+			 * ONLY THE TAIL IS CLEARED. Every byte below `base`
 			 * is written by the loops underneath -- for the 16 bit
 			 * slot case the low bytes too, which is why
 			 * charsiu_bias_copy_hi stores an explicit zero lane
@@ -616,7 +616,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 			if (dst_size > base)
 				memset(dst + base, fill, dst_size - base);
 			/*
-			 * ⚠⚠ TWO GROUPS AT A TIME, AND THIS SECOND STEP IS
+			 * TWO GROUPS AT A TIME, AND THIS SECOND STEP IS
 			 * WORTH MORE THAN THE VECTOR STORE WAS.
 			 *
 			 * A group is 16 elements, so one pass over the rows
@@ -648,7 +648,7 @@ void charsiu_pack_input(const struct charsiu_matmul *mm, const uint8_t *src,
 			 * apart, which at m = 64 is 1 KB and starts colliding
 			 * in the L1 sets.
 			 *
-			 * ⚠ AND THE LENGTH HAS TO BE A CONSTANT, which is why
+			 * AND THE LENGTH HAS TO BE A CONSTANT, which is why
 			 * the int8 default is written out here rather than left
 			 * to the generic path underneath. charsiu_bias_copy
 			 * takes `gran` as a runtime argument, so gcc emits the
@@ -758,7 +758,7 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
 }
 
 /*
- * ⚠⚠ THE SOURCE ROW STRIDE, WHICH IS WHERE A THIRD OF PREFILL'S PACKING WENT.
+ * THE SOURCE ROW STRIDE, WHICH IS WHERE A THIRD OF PREFILL'S PACKING WENT.
  *
  * A tensor is cut into K slices and each slice packs columns [k0, k0 + sk) of
  * every row. With no stride the caller has to gather those columns into a
@@ -780,13 +780,13 @@ void charsiu_pack_input_f16(const struct charsiu_matmul *mm, const float *src,
  * touches them. That is what lets the pool have it, the same way
  * charsiu_pack_weights_rows lets staging split.
  *
- * ⚠ Splitting by GROUPS and not by rows on purpose. The note on the whole
+ * Splitting by GROUPS and not by rows on purpose. The note on the whole
  * buffer entry has the measurement: rows outermost falls to 6.87 GB/s against
  * groups outermost at 24.57 on a cold destination, which is the only kind this
  * ever meets, because PREP_BO invalidates the input buffer object immediately
  * before the loop runs. A row split would hand every thread the slow order.
  *
- * ⚠ THE CALLER OWNS THE EDGES: charsiu_pack_input_f16_edges does the tail
+ * THE CALLER OWNS THE EDGES: charsiu_pack_input_f16_edges does the tail
  * memset and the k % atom remainder, once, before any range runs. The values
  * are the values -- this is the same loop body, so a split changes no byte.
  */
@@ -873,14 +873,14 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 	 * still reads, and everything before it is about to be overwritten.
 	 */
 	/*
-	 * ⚠⚠ m = 1 IS ON THIS PATH TOO, WHICH IS NOT WHAT IT LOOKS LIKE. The
+	 * m = 1 IS ON THIS PATH TOO, WHICH IS NOT WHAT IT LOOKS LIKE. The
 	 * diff that added this block deletes nothing, so it reads as an
 	 * insertion that leaves decode alone -- and it is not: the branch
 	 * below takes m == 1 through the vector converter as well. Decode is
 	 * this runtime's headline number, so that had to be proved rather
 	 * than assumed.
 	 *
-	 * ⚠ AND THE PROOF NEEDS TWO PROCESSES. `plain` is cached in a static
+	 * AND THE PROOF NEEDS TWO PROCESSES. `plain` is cached in a static
 	 * on first use, so setting CHARSIU_NPU_PLAIN between two calls in one
 	 * program compares this path against ITSELF and passes vacuously. A
 	 * 315 shape check written that way came back "0 mismatched" while
@@ -911,7 +911,7 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 		return;
 	}
 	/*
-	 * ⚠⚠ AND m > 1 IS THE BATCHED PATH, WHICH WAS LEFT SCALAR.
+	 * AND m > 1 IS THE BATCHED PATH, WHICH WAS LEFT SCALAR.
 	 *
 	 * The case above was vectorised because it is the whole of decode. The
 	 * rows case underneath it is the whole of PREFILL, and it still went one
@@ -927,7 +927,7 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 	 * `strb`. The memset ahead of it is the other: it zeroes the whole
 	 * buffer, and the loop then overwrites almost all of what it zeroed.
 	 *
-	 * ⚠ THE FIRST BENCHMARK OF THIS PUT THE CONVERTER IN THE SAME UNIT and
+	 * THE FIRST BENCHMARK OF THIS PUT THE CONVERTER IN THE SAME UNIT and
 	 * so measured a build that does not exist. With it inlined gcc
 	 * auto-vectorises even a plain scalar loop, and a scalar rewrite that
 	 * only hoists the index arithmetic came out fastest of everything tried:
@@ -936,7 +936,7 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 	 * same shape, 1.3x, and nothing like a fix. The CALL is the cost, so
 	 * removing the call is the fix, and that means the vector converter.
 	 *
-	 * ⚠⚠ THE LOOP ORDER IS NOT FREE, AND ONLY A COLD DESTINATION SHOWS IT.
+	 * THE LOOP ORDER IS NOT FREE, AND ONLY A COLD DESTINATION SHOWS IT.
 	 *
 	 * A group of 8 consecutive k is 16 contiguous destination bytes, so
 	 * either loop can be the outer one. Walking ROWS outermost keeps the
@@ -965,14 +965,14 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 	 *   k=1024 m=64   0.0687 -> 0.0160 ms    5.73 ->  24.59 GB/s   4.30x
 	 *   k=2048 m=1    0.0005 ms, 24.64 GB/s, untouched
 	 *
-	 * ⚠ THE VALUES ARE THE SAME VALUES. charsiu_vhalf truncates exactly as
+	 * THE VALUES ARE THE SAME VALUES. charsiu_vhalf truncates exactly as
 	 * charsiu_float_to_half does, which was checked again here over all
 	 * 4294967296 float bit patterns, eight threads, ZERO differing --
 	 * denormals, both infinities, quiet and signalling NaN, 65504 and the
 	 * pattern one ulp past it, and the truncation boundary at 0x3f801fff /
 	 * 0x3f802000. Nothing in this rounds where the old path truncated.
 	 *
-	 * ⚠ ONLY THE TAIL IS CLEARED, for the reason the m = 1 case gives: with
+	 * ONLY THE TAIL IS CLEARED, for the reason the m = 1 case gives: with
 	 * k a multiple of the atom every byte below `base` is written by the
 	 * loop, and everything from `base` up is padding the CBUF reads past the
 	 * end of the data. A k that is NOT a multiple of the atom leaves holes
@@ -1035,7 +1035,7 @@ void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
  * over the pool: about 620 MB of nibbles for this model, 4.4 seconds of a cold
  * start on the board, on one core.
  *
- * ⚠ THE CALLER OWNS THE ZEROING, once, before any range runs. And the legacy
+ * THE CALLER OWNS THE ZEROING, once, before any range runs. And the legacy
  * bit pattern layout is NOT in here: it accumulates with |=, so two channels
  * can share a byte and ranges would race. charsiu_pack_weights below keeps it.
  */
@@ -1088,7 +1088,7 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 }
 
 /*
- * ⚠⚠ THREE CANDIDATES, NOT ONE, AND THE BOARD PICKS. The vendor's size
+ * THREE CANDIDATES, NOT ONE, AND THE BOARD PICKS. The vendor's size
  * registers pin the buffer to ic*oc*2 bytes with ic*2 per output channel, and
  * that is exact over all 4940 of its fp16 streams -- but a tiling does not
  * change a total, so nothing in a static file can say what order the bytes go
@@ -1125,7 +1125,7 @@ void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
 }
 
 /*
- * ⭐ A LONGER REDUCTION EXTENT IS THE SAME BYTES AT A DIFFERENT BLOCK BASE.
+ * A LONGER REDUCTION EXTENT IS THE SAME BYTES AT A DIFFERENT BLOCK BASE.
  *
  * w_group_index is  ngi*ng*ke + kgi*kg*ngsz + (n%ng)*kgsz + k%kg,  and ke --
  * the padded reduction extent -- appears in exactly ONE of those four terms.
@@ -1145,11 +1145,11 @@ void charsiu_fp16_pack_krow(void *dst, unsigned hd, unsigned nk, unsigned pos,
  * k group (so a padded extent that is not a whole number of groups refuses)
  * and the destination must be at least as long as the source.
  *
- * ⚠ THE DESTINATION IS ASSUMED ZERO past what is copied -- which is true of a
+ * THE DESTINATION IS ASSUMED ZERO past what is copied -- which is true of a
  * buffer that was just allocated, and NOT true of dst == src. The in place
  * case clears what it vacates; see the memset below.
  *
- * ⚠ THE OFFSETS COME FROM charsiu_w16_offset, NOT FROM A SECOND COPY OF THE
+ * THE OFFSETS COME FROM charsiu_w16_offset, NOT FROM A SECOND COPY OF THE
  * FORMULA. tests/fp16_regrow.c holds this against the packer itself.
  */
 int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
@@ -1172,7 +1172,7 @@ int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
 	if (!kg || !ng || (keo % kg) || (ken % kg))
 		return -1;
 	/*
-	 * ⭐ DESCENDING, SO dst MAY BE src. Every group's destination is at or
+	 * DESCENDING, SO dst MAY BE src. Every group's destination is at or
 	 * above its source (ken >= keo puts the ke term up, and nothing else
 	 * moves), and the gap grows with n0. Walking the groups from the top
 	 * down, the bytes still to be read all lie BELOW the block being
@@ -1185,7 +1185,7 @@ int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
 	 * surface for every rung -- which is n_layer * n_kv buffer objects a
 	 * rung, and 2048 of them on a 32 layer model with no GQA.
 	 *
-	 * ⚠ THE SAME GROUP BASES THE ASCENDING LOOP VISITED, IN REVERSE. The
+	 * THE SAME GROUP BASES THE ASCENDING LOOP VISITED, IN REVERSE. The
 	 * last base is the largest multiple of ng BELOW n_pad, and that is not
 	 * n_pad - ng when ng does not divide n_pad: head_dim 100 pads to 100
 	 * and its last group starts at 96 with four channels in it.
@@ -1203,7 +1203,7 @@ int charsiu_fp16_regrow_vcols(void *dst, unsigned kv_new, const void *src,
 		 * can overlap its own source. */
 		memmove(d + on / 2, s + oo / 2, len * 2);
 		/*
-		 * ⛔ AND IN PLACE HAS TO CLEAR WHAT IT VACATED. A block that
+		 * AND IN PLACE HAS TO CLEAR WHAT IT VACATED. A block that
 		 * moves up leaves its own old copy behind, inside the block
 		 * ABOVE it in the new layout -- the first version of this left
 		 * -1.0 sitting where the reference had zero, on every shape
@@ -1244,7 +1244,7 @@ void charsiu_fp16_pack_vcol(void *dst, unsigned kv, unsigned hd, unsigned pos,
 
 		if (o0 == (size_t)-1)
 			return;
-		/* ⚠ the step between two output channels of one group, taken
+		/* the step between two output channels of one group, taken
 		 * from the offset function rather than restated: it is kgsz,
 		 * which depends on the padded k, and a second copy of that
 		 * arithmetic here is a second layout */
@@ -1317,7 +1317,7 @@ size_t charsiu_w16_offset(const struct charsiu_matmul *mm, unsigned n,
  * one, for the same reason the fp16 cache needed charsiu_w16_offset -- to be
  * written in place, a position at a time, and never packed.
  *
- * ⚠ ng IS 32 FOR int8 AND 16 FOR fp16. The fp16 surface can be appended along
+ * ng IS 32 FOR int8 AND 16 FOR fp16. The fp16 surface can be appended along
  * n and read at any multiple of 16 because an offset stops depending on n once
  * every group is full; the int8 one has the same property at a multiple of 32.
  * A caller that rounds its extent to 16 and hands it to an int8 surface is
@@ -1386,7 +1386,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * with n = byte / 32 and k = byte % 32, which is what the int8 path below
 	 * writes, so the probe is known good on a case whose answer is known.
 	 *
-	 * ⚠ WHAT WAS NOT KNOWN IS NOW MEASURED. Rounds 265 to 277 fixed a byte
+	 * WHAT WAS NOT KNOWN IS NOW MEASURED. Rounds 265 to 277 fixed a byte
 	 * width defect in the probe itself, which had been reading a four byte
 	 * output as bytes, and re-read the whole fetch densely. Two things came
 	 * out that this branch was written without:
@@ -1420,14 +1420,14 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 * filling a gap with a guess and this branch is not going to be the
 	 * fifth.
 	 *
-	 * ⚠ THE ADDRESS MAP WAS READ AT 0x3020 = 111. charsiu emits n - 1
+	 * THE ADDRESS MAP WAS READ AT 0x3020 = 111. charsiu emits n - 1
 	 * there, which gives 40 channels, so this layout only describes the
 	 * hardware when that register is overridden. Until the driver sets it,
 	 * a job packed this way and run without the override reaches only its
 	 * first 40 channels.
 	 */
 	/*
-	 * ⚠⚠ THE int4 LAYOUT, AS THE HARDWARE ACTUALLY FETCHES IT. Round 345.
+	 * THE int4 LAYOUT, AS THE HARDWARE ACTUALLY FETCHES IT. Round 345.
 	 *
 	 * Everything in the block below this one describes how the hardware
 	 * fetched while CORE 0x3018 was wrong and the DPU was multiplying fp16
@@ -1461,7 +1461,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 	 */
 	if (mm->wdtype == CHARSIU_INT4 && !envq("CHARSIU_W4_BITPAT")) {
 		/*
-		 * ⚠ THE BOUND AND THE DIVISIONS ARE HOISTED. The first version
+		 * THE BOUND AND THE DIVISIONS ARE HOISTED. The first version
 		 * called charsiu_weight_bytes() inside the inner loop, which is
 		 * one function call per nibble -- about 1.4 billion of them for
 		 * this model -- and round 352's int4 arm never finished loading.
@@ -1524,7 +1524,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 * is below.
 		 */
 		/*
-		 * ⚠ K = 32 AND 64 ARE THE ONLY TWO EVER SWEPT, and an LLM wants
+		 * K = 32 AND 64 ARE THE ONLY TWO EVER SWEPT, and an LLM wants
 		 * K in the thousands. The skeleton is K independent where it has
 		 * been checked: the slot table by group count reproduces both,
 		 * and only the block stride 8*K and the k+ offset 4*K scale. So
@@ -1535,7 +1535,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 * 2048, 2176, 3072, 3136 with the k+ group 512 bytes on.
 		 */
 		/*
-		 * ⚠ K MUST BE A MULTIPLE OF 32, which is the run count K/32
+		 * K MUST BE A MULTIPLE OF 32, which is the run count K/32
 		 * being a whole number. Round 302 ran every multiple of 16
 		 * between 128 and 192:
 		 *
@@ -1544,7 +1544,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 *   K = 176, K/32 = 5.5    8 of 64 exact
 		 *   K = 192, K/32 = 6     64 of 64
 		 *
-		 * ⚠ AND K = 192 WAS NEVER A LAYOUT FAULT. Rounds 300 and 301
+		 * AND K = 192 WAS NEVER A LAYOUT FAULT. Rounds 300 and 301
 		 * recorded it as "writes every channel and computes none, the
 		 * first non power of two K", and it was this guard: 192 was not
 		 * in the whitelist, so the packer returned without writing a
@@ -1552,7 +1552,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 		 * not go through here.
 		 */
 		/*
-		 * ⚠ THE UPPER BOUND HERE IS MINE, NOT THE HARDWARE'S. 256 was
+		 * THE UPPER BOUND HERE IS MINE, NOT THE HARDWARE'S. 256 was
 		 * the largest K anything had been run at, and K = 256 fails on
 		 * the CHANNEL COUNT rather than the layout, so nothing has ever
 		 * said the layout stops. Round 305 lifts it to 2048, which is
@@ -1579,7 +1579,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * than fitted and it is not a cap: 3*512 + 128 + 56 is
 			 * well inside a 2048 byte buffer.
 			 *
-			 * ⚠ "LAST" IS THE HIGHEST GROUP IN USE, NOT g == 7.
+			 * "LAST" IS THE HIGHEST GROUP IN USE, NOT g == 7.
 			 * Round 281 wrote 7 because the map was read at N = 64
 			 * where the two coincide, and N = 32 came back 24 of 32
 			 * and N = 16 came back 8 of 16, which is one group of
@@ -1600,7 +1600,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * number.
 			 */
 			/*
-			 * ⚠ THE THIRD CLOSED FORM, and this one has eight
+			 * THE THIRD CLOSED FORM, and this one has eight
 			 * measured tables behind it rather than one.
 			 *
 			 * Two died in the round after they were written:
@@ -1645,7 +1645,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			size_t row;
 
 			/*
-			 * ⚠ THIS GUARD WAS READ AS A HARDWARE RESULT ONCE
+			 * THIS GUARD WAS READ AS A HARDWARE RESULT ONCE
 			 * ALREADY. Round 306 ran K = 2048 at N = 512 and 1024
 			 * and got exact 0, which is this line refusing: G is 64
 			 * and 128 there. The same mistake as the K whitelist in
@@ -1696,7 +1696,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			 * nibbles, and the k they carry is 16*(n&1) + 32*half.
 			 */
 			/*
-			 * ⚠ THE GROUP COUNT IS K/32 AND THE SPACING IS A
+			 * THE GROUP COUNT IS K/32 AND THE SPACING IS A
 			 * CONSTANT 256, and both were K = 64 coincidences.
 			 *
 			 * Round 298 swept K = 128 and the group bases landed

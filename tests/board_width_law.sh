@@ -5,7 +5,7 @@
 # The safe batch widths are `m % 2 == 0 && m != 8`. This is the board round
 # that VERIFIES that, densely, and separates the one fault that is still open.
 #
-# ⚠⚠ WHAT IS SETTLED, AND WHY THIS IS NO LONGER A SEARCH.
+# WHAT IS SETTLED, AND WHY THIS IS NO LONGER A SEARCH.
 #
 # The rule used to be `m <= 4 || m % 16 == 0`, fitted to nine measured widths.
 # It was a bad fit: every multiple of 16 is even, so nine points could not tell
@@ -33,7 +33,7 @@
 #                   CHARSIU_NPU_ONEDEV=1                DIFFERENT fault
 #   even, not 8     exact
 #
-# ⚠⚠ THE CBUF WINDOW SPLIT IS REFUTED. DO NOT REOPEN IT.
+# THE CBUF WINDOW SPLIT IS REFUTED. DO NOT REOPEN IT.
 #
 # The obvious story for m = 8 was that src/job.c decides
 #
@@ -47,7 +47,7 @@
 # SMALL and ODD M, and 48, 64 and 80 are exact. The split flag is the opposite
 # of the failure pattern, in both directions. It is not the mechanism.
 #
-# ⚠ SO ODD WIDTHS ARE EXPECTED TO FAIL HERE, AND THAT IS THE CONTROL. A round
+# SO ODD WIDTHS ARE EXPECTED TO FAIL HERE, AND THAT IS THE CONTROL. A round
 # in which odd widths come back exact is not good news: it means the probe has
 # stopped discriminating -- the batch fell back to a row at a time, or the
 # comparison is against itself -- and nothing else in the round can be read.
@@ -64,7 +64,7 @@
 # Those need every tensor in the model, which is why that pass drops the tensor
 # cap the dense sweep depends on.
 #
-# ⚠ WHAT IT COSTS. The one row reference is m matvecs per tensor, and summed
+# WHAT IT COSTS. The one row reference is m matvecs per tensor, and summed
 # over 2..64 that is 2079 matvecs a tensor -- CHARSIU_PROBE_MAXT is the only
 # reason a dense sweep is affordable at all. At the default cap of 8 tensors
 # that is about 17k one row submits an arm plus the batched side, minutes
@@ -76,7 +76,7 @@
 # round is the expectation; the timeout is 1800s an arm so a wedged arm cannot
 # eat the others.
 #
-# ⚠ AND THE TENSOR CAP IS A BIAS WITH A SHAPE. CHARSIU_PROBE_MAXT takes the
+# AND THE TENSOR CAP IS A BIAS WITH A SHAPE. CHARSIU_PROBE_MAXT takes the
 # FIRST N staged tensors, which are layer 0's projections and the start of
 # layer 1 -- every distinct (k, n) an ordinary layer has, including the
 # n = 8192 gate/up pair that m = 8 misses. What it does NOT cover is the output
@@ -97,7 +97,7 @@
 #   CHARSIU_LAW_TIMEOUT=1800        seconds an arm may take before it is killed
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -115,13 +115,13 @@ done
 [ -n "${RUN:-}" ] || { echo "board_width_law: charsiu_run not found" >&2; exit 1; }
 
 # --- the NPU ---------------------------------------------------------------
-# ⚠ WITHOUT THE NPU THERE IS NO ROUND AT ALL. The batched matmul never reaches
+# WITHOUT THE NPU THERE IS NO ROUND AT ALL. The batched matmul never reaches
 # hardware, the probe says "no NPU staged" and returns -- and charsiu_run still
 # EXITS 0, so an exit status check does not catch it. That is the exact shape
 # of the failure this tree keeps shipping: a run that exits clean having
 # measured nothing. It is caught below by looking for the table itself, and
 # this guard is here so the common case says so before spending the time.
-# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
 # minor, so the NPU can sit at accel1 or accel2 and a test that looks only
 # for accel0 refuses on a board that has one.
 if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
@@ -133,7 +133,7 @@ if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:
 fi
 
 # --- the model -------------------------------------------------------------
-# ⚠ A SUBSTRING IS ENOUGH, AND IT FOLDS CASE AND PUNCTUATION. Two rounds have
+# A SUBSTRING IS ENOUGH, AND IT FOLDS CASE AND PUNCTUATION. Two rounds have
 # been spent on a path typed by hand, one of which ran the wrong model entirely
 # and answered its question perfectly. The file is `Phi-3.5-mini-...` and the
 # thing anyone types is `phi3`; both sides go to lowercase letters and digits
@@ -162,7 +162,7 @@ if [ -n "$MODEL" ] && [ ! -r "$MODEL" ]; then
 	}
 	echo "board_width_law: '$1' -> $MODEL"
 fi
-# ⚠ THE SAME FILE THE WIDTH RECORD WAS MADE ON. Every number this round is read
+# THE SAME FILE THE WIDTH RECORD WAS MADE ON. Every number this round is read
 # against -- 871 of 904 at m = 8, 0 of 6975 at m = 31, exact at 2, 4, 16, 32,
 # 48, 64, 80 -- came off Llama-3.2-1B in Q4_0. Defaulting to some other gguf
 # would produce a table that looks like the record and is not comparable to it.
@@ -186,13 +186,13 @@ mkdir -p "$OUTDIR"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 # --- the widths ------------------------------------------------------------
-# ⚠ DENSE, AND STILL DENSE EVEN THOUGH THE ANSWER IS KNOWN. The prediction is
+# DENSE, AND STILL DENSE EVEN THOUGH THE ANSWER IS KNOWN. The prediction is
 # about a parity, and a parity is the one kind of rule a sparse list is worst
 # at testing: the old rule agreed with this one on all nine widths anybody had
 # ever run. Sixty three widths asked once is what tells `even` from
 # `multiple of 16` and from every other rule that happens to fit.
 WIDTHS=${CHARSIU_LAW_WIDTHS:-$(awk 'BEGIN{for(i=2;i<=64;i++)printf "%s%d",(i>2?",":""),i}')}
-# ⚠ THE PROBE'S LIST BUFFER IS 64 ENTRIES AND IT STOPS THERE SILENTLY. A longer
+# THE PROBE'S LIST BUFFER IS 64 ENTRIES AND IT STOPS THERE SILENTLY. A longer
 # list would be truncated, the table would be short, and the missing widths
 # would read as "not measured" rather than "never asked".
 NW=$(echo "$WIDTHS" | tr ',' ' ' | wc -w)
@@ -208,7 +208,7 @@ DO_M8=${CHARSIU_LAW_M8:-1}
 TMO=${CHARSIU_LAW_TIMEOUT:-1800}
 command -v timeout >/dev/null 2>&1 || TMO=
 
-# ⚠⚠ THE WHOLE int4 ENVIRONMENT, NOT JUST THE AXIS. This is the set
+# THE WHOLE int4 ENVIRONMENT, NOT JUST THE AXIS. This is the set
 # board_vendor.sh runs and it is what puts the run on the int4 path at all;
 # CHARSIU_NPU_W4V=1 with no CHARSIU_NPU=1 stages nothing, and the probe then
 # says "no NPU staged" and measures the CPU in silence.
@@ -216,7 +216,7 @@ W4_ENV="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 CHARSIU_NPU_KMAX=1024 CHARSIU_NPU_W4_GROUP=1024 \
 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
-# ⚠⚠ THE ESCAPE HATCHES, AND A CONTROL THAT CANNOT RUN IS NOT A CONTROL.
+# THE ESCAPE HATCHES, AND A CONTROL THAT CANNOT RUN IS NOT A CONTROL.
 #
 # npudev.c REFUSES the widths it believes are unsafe: it returns -1 before the
 # job is built, the probe's matmul fails, the tensor is skipped, and a width
@@ -241,7 +241,7 @@ GATES="CHARSIU_NPU_W4_M8=1 CHARSIU_NPU_W4_ANYM=1"
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -281,7 +281,7 @@ probe() {
 		tail -12 "$_out" | sed 's/^/    /'
 		return 1
 	fi
-	# ⚠⚠ EXIT 0 IS NOT EVIDENCE OF A MEASUREMENT. charsiu_run returns 0
+	# EXIT 0 IS NOT EVIDENCE OF A MEASUREMENT. charsiu_run returns 0
 	# from the --batch-probe path whatever the probe did, including the
 	# case where it found nothing staged and returned immediately. The
 	# table is the only thing that proves a round happened.
@@ -320,14 +320,14 @@ for ARM in $ARMS; do
 		echo
 		continue
 	fi
-	# ⚠ NO head CAP, EVER. This tree has lost two rounds to one: eighteen
+	# NO head CAP, EVER. This tree has lost two rounds to one: eighteen
 	# lines of head over an eighteen line landing table took the whole
 	# timing table with it, and a head -80 in board_acc_map.sh lost m = 8.
 	# The deciding lines of this tool -- the MISS lines and the
 	# where-did-it-go scan -- are at the BOTTOM of what it prints.
 	sed -n '/batching .* layers/,$p' "$out" | sed 's/^/  /'
 	echo
-	# ⚠ THE TABLE ROW IS RECOGNISED BY ITS TENSOR FRACTION AND ITS "of".
+	# THE TABLE ROW IS RECOGNISED BY ITS TENSOR FRACTION AND ITS "of".
 	# `8/225` in the second column and `of` in the fifth is a shape no MISS
 	# line, no landing table row and no prose line has. Matching on the
 	# leading number alone would eat half the landing map.
@@ -342,7 +342,7 @@ done
 # --- did anything happen at all? -------------------------------------------
 if [ "$RAN" -eq 0 ]; then
 	echo "======================================================================"
-	echo "⚠⚠ THIS ROUND MEASURED NOTHING. Not one arm produced a table row,"
+	echo "THIS ROUND MEASURED NOTHING. Not one arm produced a table row,"
 	echo "   so there is no verdict below and there is nothing to read into"
 	echo "   the absence of one. A clean looking empty table is exactly how"
 	echo "   this tree has shipped four silent fallbacks in two days."
@@ -366,7 +366,7 @@ if [ "$RAN" -eq 0 ]; then
 fi
 
 # --- the uncapped m = 8 pass, which is the one open question ---------------
-# ⚠ UNCAPPED ON PURPOSE, and it is the only pass in this script that is. The
+# UNCAPPED ON PURPOSE, and it is the only pass in this script that is. The
 # dense sweep can afford eight tensors because it is asking about a parity, and
 # a parity shows on one shape. m = 8 is asking whether the fault follows n, and
 # that question is exactly the one the cap cannot answer: the first eight
@@ -397,7 +397,7 @@ if [ "$DO_M8" != 0 ]; then
 fi
 
 # --- the verdict -----------------------------------------------------------
-# ⚠ ONE awk OVER BOTH ARMS, because the blocks below are the same join and
+# ONE awk OVER BOTH ARMS, because the blocks below are the same join and
 # splitting them into three passes is how two of them end up computed over
 # different width sets.
 awk -v widths="$WIDTHS" -v arms="$ARMS" -v maxt="$MAXT" '
@@ -472,7 +472,7 @@ END {
 		printf "      predicted PASS, FAILED      %d%s\n", fp, (fp ? " :" fpl : "")
 		printf "      predicted FAIL, PASSED      %d%s\n", fn, (fn ? " :" fnl : "")
 		if (tn == 0 && tested > 0) {
-			print  "      ⚠⚠ NOTHING FAILED IN THIS ARM AT ALL. Odd widths"
+			print  "      NOTHING FAILED IN THIS ARM AT ALL. Odd widths"
 			print  "         collide in the read order by construction, so an"
 			print  "         arm in which they pass is an arm where the probe"
 			print  "         is not discriminating -- a fallback to a row at a"
@@ -487,7 +487,7 @@ END {
 		if (has_one && !(m in otot)) { nm++; nml = nml " " m "(one core)" }
 	}
 	if (nm) {
-		printf "  ⚠ %d arm-widths produced NO TABLE ROW and are in no count above:%s\n", nm, nml
+		printf "  %d arm-widths produced NO TABLE ROW and are in no count above:%s\n", nm, nml
 		print  "    A width with no row is a width whose every matmul was refused"
 		print  "    or failed. It is not a PASS and it is not a FAIL; it is a width"
 		print  "    this round did not ask. If it is most of the odd list, the gate"
@@ -540,7 +540,7 @@ END {
 	else if (na + nb + nc == 0)
 		print "  → the three checks that ran all hold, but m = 8 was never measured"
 	else {
-		print "  → ⚠⚠ THE ROUND DOES NOT PASS, and the deviations above ARE the"
+		print "  → THE ROUND DOES NOT PASS, and the deviations above ARE the"
 		print "    headline. Every one of them is named; none of them is a"
 		print "    rounding story. Read them before anything else here, because"
 		print "    a prediction contradicted at one width is not a prediction"
@@ -565,7 +565,7 @@ END {
 		printf "  safe widths measured   %d:%s\n", nsafe, sfl
 		printf "  largest safe <= 32     %s\n", (big32 ? big32 "" : "NONE -- and 32 is the shipped chunk")
 		printf "  largest safe overall   %d\n", bigall
-		# ⚠⚠ A CHUNK SIZE IS NOT ENOUGH: EVERY PROMPT HAS A TAIL.
+		# A CHUNK SIZE IS NOT ENOUGH: EVERY PROMPT HAS A TAIL.
 		# phi3 is 87 tokens, which at a chunk of 32 is 32, 32 and
 		# TWENTY THREE -- a width no sweep before this one ever asked
 		# about, on a model whose text is wrong on the board. So the
@@ -599,7 +599,7 @@ END {
 		}
 		print ""
 		print "  prompt lengths a chunker could tile using ONLY safe widths:"
-		# ⚠ THE PARITY CASE IS CALLED BY NAME, because it is the one that
+		# THE PARITY CASE IS CALLED BY NAME, because it is the one that
 		# will actually happen and "no unbroken run of tileable lengths"
 		# reads like a wall when it is arithmetic. Every safe width even
 		# means every reachable length even, and nothing else.
@@ -616,11 +616,11 @@ END {
 				print  "    no unbroken run of tileable lengths -- see the list below"
 			if (nbad) printf "    NOT tileable:%s%s\n", badl, (nbad > 24 ? " ... (" nbad " in all)" : "")
 			else      print  "    every length from 2 up is tileable"
-			if (nbad) print  "    ⚠ a length that cannot be tiled is one the chunker has to"
+			if (nbad) print  "    a length that cannot be tiled is one the chunker has to"
 			if (nbad) print  "      finish a row at a time, which is correct and merely slower."
 		}
 		print ""
-		print "  ⚠ every number in this block is measured over the first"
+		print "  every number in this block is measured over the first"
 		printf "  %s tensors only. It is a statement about a layer, not about\n", maxt
 		print "  the model: the output head is staged last and is not in it."
 	}
@@ -629,7 +629,7 @@ END {
 ' "$T/both.tsv" "$T/onedev.tsv"
 
 # --- m = 8, on its own, over every tensor ----------------------------------
-# ⚠ THIS IS THE ONLY BLOCK IN THE ROUND THAT CAN DISCOVER SOMETHING. Everything
+# THIS IS THE ONLY BLOCK IN THE ROUND THAT CAN DISCOVER SOMETHING. Everything
 # above confirms a rule that was settled by sweeping the read order itself. The
 # m = 8 fault is even -- the read order is a clean bijection there -- so it is
 # not the read order at all, and the two questions it raises can only be
@@ -640,7 +640,7 @@ if [ "$DO_M8" != 0 ]; then
 	echo "  m = 8, UNCAPPED, THE ONE OPEN QUESTION"
 	echo
 	if [ "$M8_OK" -eq 0 ]; then
-		echo "  ⚠⚠ NO m = 8 PASS PRODUCED A TABLE. The question this round"
+		echo "  NO m = 8 PASS PRODUCED A TABLE. The question this round"
 		echo "     exists to move is unanswered, and the blocks above are"
 		echo "     confirmation only. Do not read the absence as a result."
 	else
@@ -650,7 +650,7 @@ if [ "$DO_M8" != 0 ]; then
 			line=$(awk '$1 == "8" && $2 ~ /^[0-9]+\/[0-9]+$/ && $5 == "of" \
 				    { print $4 " of " $6 " rows, worst rel " $3 }' "$f")
 			printf '  %-8s %s\n' "$ARM" "${line:-no table row}"
-			# ⚠ THE MISS LINES CARRY THE n, AND THE n IS THE WHOLE
+			# THE MISS LINES CARRY THE n, AND THE n IS THE WHOLE
 			# QUESTION. `row R of 8` is how a MISS line names its
 			# width, so this filters on the width and then counts
 			# the distinct n. "every ffn_gate and ffn_up" was
@@ -679,7 +679,7 @@ if [ "$DO_M8" != 0 ]; then
 		echo "      capped sweeps that only ever saw two or three n have"
 		echo "      been reporting a shape that is not there."
 		echo
-		echo "  ⚠ the split flag in src/job.c is NOT the mechanism and was"
+		echo "  the split flag in src/job.c is NOT the mechanism and was"
 		echo "    checked: surf * rows > 4096 turns ON above M = 42 at"
 		echo "    k = 3072 and above M = 128 at the k = 1024 slices this"
 		echo "    environment produces, so it is off at m = 8 and on at"
@@ -692,6 +692,6 @@ fi
 echo
 echo "  full logs: $OUTDIR/width-law-{both,onedev}.txt"
 echo "             $OUTDIR/width-law-m8-{both,onedev}.txt"
-echo "  ⚠ they are uncapped on purpose. The MISS lines and the where-did-it-go"
+echo "  they are uncapped on purpose. The MISS lines and the where-did-it-go"
 echo "    scan sit UNDER the timing table, and every summary above is a"
 echo "    summary -- the reason a width failed is in the log and nowhere else."

@@ -21,7 +21,7 @@ Held out properly -- solved on blocks 0..47, scored on rows 768..2047 --
 it reads 99.72% on codes away from a rounding boundary, and the residual
 disagreements are +-1, which is the boundary signature.
 
-⚠ SOLVE IT ON A TENSOR THE VENDOR DID NOT TRANSFORM. Caching the map by shape
+SOLVE IT ON A TENSOR THE VENDOR DID NOT TRANSFORM. Caching the map by shape
 and letting the first tensor of that shape fill the cache put blk.0.attn_q
 (rho 3.507) in charge of the 2048x2048 map and the whole table came back at
 279%: a mapping fitted to predictions that are wrong fits nothing.
@@ -53,7 +53,7 @@ from gguf import GGUFReader     # noqa: E402
 
 RK = "/home/parallels/Documents/kiln/model/Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm"
 #
-# ⚠⚠ THE REFERENCE IS ALSO THE THING CHARSIU QUANTISES, AND THE VENDOR DID NOT
+# THE REFERENCE IS ALSO THE THING CHARSIU QUANTISES, AND THE VENDOR DID NOT
 # QUANTISE IT. Their codes came from the original weights; ours come from
 # whatever this points at. With Q8_0 here the two sides start from different
 # things, which is a real asymmetry in every comparison built on this file, and
@@ -70,7 +70,7 @@ REF = os.environ.get(
 def ref_tag(path=None):
     """Eight hex of the reference's md5 -- the ORIGIN, as part of a filename.
 
-    ⛔ A REBUILT ARM IS CACHED UNDER ITS ARM NAME, AND THE ARM NAME DOES NOT
+    A REBUILT ARM IS CACHED UNDER ITS ARM NAME, AND THE ARM NAME DOES NOT
     SAY WHAT IT WAS BUILT FROM. `Llama-3.2-1B-ref-F16.gguf` from the Q8_0
     source and the same name from the f16 source are the same path, so the
     second round silently scores the first round's file and every percentage
@@ -117,7 +117,7 @@ def f32(slot, n):
 def deq(t):
     """Dequantise one reference tensor to float64, whatever it is stored as.
 
-    ⚠⚠ THIS USED TO ASSUME Q8_0 AND NOTHING SAID SO. The 34 below is q8_0's
+    THIS USED TO ASSUME Q8_0 AND NOTHING SAID SO. The 34 below is q8_0's
     block: a two-byte scale and thirty-two int8 codes. Handed an f16 tensor it
     raises a reshape error, which is the good failure -- but the reference is
     now an environment variable, and the whole point of that is to pass a file
@@ -191,7 +191,7 @@ def main():
             WOFF[f"blk.{L}.{nm}.weight"] = (a, n, k)
             a += n * k // 2
     #
-    # ⚠ SOLVE THE MAP ON A TENSOR THE VENDOR DID NOT TRANSFORM. Caching it by
+    # SOLVE THE MAP ON A TENSOR THE VENDOR DID NOT TRANSFORM. Caching it by
     # shape and letting the first tensor of that shape fill the cache put
     # blk.0.attn_q (rho 3.507) in charge of the 2048x2048 map, and the whole
     # table came back at 279% -- a mapping fitted to predictions that are
@@ -277,7 +277,7 @@ def main():
     print("-" * 60)
     print(f"{'THE SCORABLE ONES':24s} " + " ".join(
         f"{np.sqrt(T[x][0] / T[x][1]) * 100:8.3f}%" for x in ("vendor", "chr1024", "q40")))
-    print("\n⚠ The vendor column is its ACTUAL stored codes read through the")
+    print("\nThe vendor column is its ACTUAL stored codes read through the")
     print("  solved layout, against the same q8_0 reference. Tensors the vendor")
     print("  transformed before quantising will read HIGH here -- the transform")
     print("  is not undone -- so this is an upper bound on their error, tight")

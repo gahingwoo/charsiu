@@ -27,7 +27,7 @@ its inputs. Collected 2026-09-11.
 
 ## Where the .rkllm came from: it was CONVERTED here, not downloaded
 
-⛔ An earlier version of this section said the download URL was not recorded
+An earlier version of this section said the download URL was not recorded
 and had to come from whoever fetched it. That was the wrong question. The file
 was almost certainly never downloaded.
 
@@ -56,18 +56,18 @@ So the provenance to record is the CONVERSION, not a link:
                    revision went in.
 ```
 
-⚠ **Kiln's README pins 1.2.0 and this file is 1.1.4**, so it also predates the
+**Kiln's README pins 1.2.0 and this file is 1.1.4**, so it also predates the
 runtime the board runs. `librkllmrt` 1.3.0 loads it and generates correctly
 (section 1b of the evidence pack), so the version skew is not fatal, but it is
 not the combination Kiln specifies either.
 
-🔑 **The experiment that would close this is a RE-CONVERSION, not a link.**
+**The experiment that would close this is a RE-CONVERSION, not a link.**
 Being data-free, the quantiser should be deterministic: the same toolkit on the
 same source weights should produce the same bytes. Matching the md5 would prove
 the file is the vendor tool's output rather than something of unknown
 provenance, which is strictly more than a URL proves.
 
-⛔ It cannot be run on this machine. `rkllm-toolkit` ships only
+It cannot be run on this machine. `rkllm-toolkit` ships only
 `linux_x86_64` wheels and this host is aarch64; the wheels present are 1.3.0,
 not the 1.1.4 that made the file. It needs an x86_64 machine, the 1.1.4
 toolkit, and the source checkpoint identified first.
@@ -86,7 +86,7 @@ scales plus 2048 zero points; `blk.15.ffn_gate` (8192 rows) to `ffn_up` is
 `scale = (max - min) / 15` exactly against this reference. The 43-tensor subset
 the comparison uses is the wider band, rho within 5% of 1.
 
-## ⚠⚠ THE GROUP SIZES ARE NOT THE SAME, AND THIS IS NOT IN THE PAPER
+## THE GROUP SIZES ARE NOT THE SAME, AND THIS IS NOT IN THE PAPER
 
 One scale per row means the vendor's group is the whole of K.
 
@@ -98,7 +98,7 @@ One scale per row means the vendor's group is the whole of K.
 ```
 
 **charsiu's scales are 2 to 8 times finer than the vendor's on the very
-tensors the comparison scores.** So the 2.00 / 2.23 / 2.35 ladder (⛔ whose rise
+tensors the comparison scores.** So the 2.00 / 2.23 / 2.35 ladder (whose rise
 across the rungs is one passage -- see "the ladder is not monotone" below) is
 not "the same quantiser configuration, different algorithm". It is at least two
 differences at once: a different algorithm and a finer group.
@@ -125,14 +125,14 @@ cannot be quoted.
 So the caveat stands and stays a caveat: the groups differ, the paper should
 say so, and it should NOT try to fix it by matching them.
 
-⚠ Three readings taken from `long.txt` alone were all wrong, including two I
+Three readings taken from `long.txt` alone were all wrong, including two I
 stated confidently. The finer group does not flatter charsiu (on that passage
 group 1024 is worse than the whole row). There is no bad point at 1024
 (`long.txt` spikes, `long2.txt` is monotone). And matching the group does not
 harden the section. All three came from differences of 1 to 7%, and one passage
 of 300 tokens cannot order anything closer than about 10%.
 
-⚠ A third asymmetry runs the OTHER way and no arm removes it: the vendor is
+A third asymmetry runs the OTHER way and no arm removes it: the vendor is
 asymmetric with an integer zero point, charsiu here is symmetric absmax. This
 tree measures the zero point at about 1.4% at group 1024, so it is the small
 one, and it favours the vendor.
@@ -173,26 +173,26 @@ good reason.
 **In every cell the vendor's four-bit excess is above charsiu's. That is the
 finding.** The interval is 1.4x to 2.6x and nothing narrower is supported.
 
-⚠⚠ **Not six independent samples.** The subsets are NESTED -- 43 inside 91
+**Not six independent samples.** The subsets are NESTED -- 43 inside 91
 inside 105 -- so the rungs share most of their matrices and cannot disagree
 freely. The two passages are independent of each other; the three rungs are
 not. "The direction did not reverse under either axis" is what this is, and it
 is a robustness check rather than a count of trials.
 
-⛔ **And the ladder is not monotone.** `long.txt` climbs 1.85, 2.00, 2.18,
+**And the ladder is not monotone.** `long.txt` climbs 1.85, 2.00, 2.18,
 which is where "monotone across three nested subsets" came from; `long2.txt`
 reads 2.62, 1.42, 1.65 and puts the 43-matrix rung at the top instead of the
 bottom. That is the FOURTH conclusion of this comparison read off one passage
 and reversed by the second.
 
-⚠ `rho1` and `vendor43` rebuild to the same file, md5
+`rho1` and `vendor43` rebuild to the same file, md5
 `9d8e82952e96a6f14eeaa4b016704dde`, on both origins. Both arms report "43
 matrices replaced" and both move away from the reference, so neither is a
 null arm; they coincide because dividing the calibration out changes no f16
 weight on the rho = 1 subset, which is what that subset is for. They are one
 measurement and must not be printed as two agreeing ones.
 
-## ⛔ Two ways the harness reused a file it should have rebuilt
+## Two ways the harness reused a file it should have rebuilt
 
 Both were found while running the rungs above, and both are the same shape:
 the cache key did not carry what makes the entry valid.
@@ -210,7 +210,7 @@ are in the filename now (`rkllm_codes.ref_tag`).
 `[ ! -f "$F" ]` accepted it and scored it. It failed loudly that time, which
 was luck. The rebuild writes `<path>.part` and renames after close now.
 
-⚠ Two gates had to be fixed to run this and only one failed loudly. `deq()`
+Two gates had to be fixed to run this and only one failed loudly. `deq()`
 reshapes by 34, which is q8_0's block, and raised on an f16 tensor. The outer
 gate tested `tensor_type == 8`, which is q8_0's type id, and handed an f16 file
 it let every tensor fall past to a plain copy, printed "0 matrices and 0 norms
@@ -226,6 +226,6 @@ Per trap 2's method: inject a violation first (change one md5 digit, or add a
 perplexity whose file is not listed), confirm the checker FAILS, revert,
 confirm it PASSES. A rule that has never failed has not been tested.
 
-⚠ The rule as stated encodes a CONDITION, not a verdict, so it will not go
+The rule as stated encodes a CONDITION, not a verdict, so it will not go
 stale the way `BANNED: beats the vendor` did. Conditions stay true or false;
 verdicts change when the measurement behind them changes.

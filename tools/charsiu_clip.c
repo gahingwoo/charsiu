@@ -5,7 +5,7 @@
  *
  *   charsiu_clip MODEL.gguf --image cat.jpg --text "a cat" "a dog" "a plane"
  *
- * ⚠ THE SCORE IS A COSINE, not a probability. CLIP's own softmax over these
+ * THE SCORE IS A COSINE, not a probability. CLIP's own softmax over these
  * uses a learned temperature that is not in the gguf, so this prints the
  * similarities themselves. The ORDER is the answer; the gaps are not
  * calibrated to anything.
@@ -22,7 +22,7 @@
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
@@ -46,7 +46,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--tokens"))
 			tokens_only = 1;
 		/*
-		 * ⚠ IDS IN DIRECTLY, so the text tower is checkable against a
+		 * IDS IN DIRECTLY, so the text tower is checkable against a
 		 * reference without the tokenizer in the way. Two things that
 		 * can each be wrong should not be tested only together.
 		 */
@@ -81,7 +81,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* ⚠ the tokens on their own, so the BPE is checkable without a tower */
+	/* the tokens on their own, so the BPE is checkable without a tower */
 	if (tokens_only) {
 		for (i = first_text; i < argc; i++) {
 			int32_t ids[128];

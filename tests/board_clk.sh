@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Jiaxing Hu <gahing@gahingwoo.com>
 # SPDX-License-Identifier: GPL-2.0
 #
-# ⚠⚠⚠ THE NPU CLOCK, OR A REFUSAL. Sourced by every board script.
+# THE NPU CLOCK, OR A REFUSAL. Sourced by every board script.
 #
 # Ten scripts read the rate as `$(cat /sys/kernel/debug/clk/... 2>/dev/null)`
 # and print it into their header. On 2026-09-14 the board rebooted mid-session
@@ -13,7 +13,7 @@
 # every number this project compares across rounds assumes 594 MHz. A round at
 # an unknown rate is not a slower round, it is an unusable one.
 #
-# ⚠⚠ AND THE REFUSAL HAS TO BE OUTSIDE THE SUBSTITUTION. The first version of
+# AND THE REFUSAL HAS TO BE OUTSIDE THE SUBSTITUTION. The first version of
 # this put `exit 1` inside npu_clk and every caller used it as `$(npu_clk)` --
 # which is a SUBSHELL, so the exit ended the substitution and the script
 # printed a blank clock and carried on. Exactly the hole it was written to
@@ -43,7 +43,7 @@ npu_clk() {
 			return 0
 		fi
 		echo "" >&2
-		echo "⛔ THE NPU CLOCK CANNOT BE READ, and this round would" >&2
+		echo "THE NPU CLOCK CANNOT BE READ, and this round would" >&2
 		echo "   have printed a blank where the rate goes." >&2
 		echo "" >&2
 		echo "   /sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate is not" >&2
@@ -64,7 +64,7 @@ npu_clk() {
 # not carry its boot cannot be compared with one that does.
 npu_boot() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 
-# ⚠⚠⚠ WHICH COMMIT PRODUCED THIS NUMBER, which is the one piece of provenance
+# WHICH COMMIT PRODUCED THIS NUMBER, which is the one piece of provenance
 # every round has recorded WRONG by omission. The scripts print the machine,
 # the clock, the boot id and the binary's mtime, and then the round's numbers
 # get tied to a version by somebody remembering which file they copied. They
@@ -74,7 +74,7 @@ npu_boot() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 # The commit is compiled into the binary now (Makefile -DCHARSIU_BUILD), and
 # this asks the binary rather than its timestamp.
 #
-# ⚠ A binary too old to know is "no --version", not a blank. A blank is what a
+# A binary too old to know is "no --version", not a blank. A blank is what a
 # missing clock looked like and it cost a whole ladder.
 charsiu_build() {
 	_b=$("${1:-charsiu_run}" --version 2>/dev/null | head -1)
@@ -84,7 +84,7 @@ charsiu_build() {
 	esac
 }
 
-# ⚠⚠⚠ TWO NAMES FOR ONE KNOB, AND PICKING THE WRONG ONE IS SILENT.
+# TWO NAMES FOR ONE KNOB, AND PICKING THE WRONG ONE IS SILENT.
 #
 # Fifteen board scripts read CHARSIU_RUN and thirteen read CHARSIU_RUN_BIN.
 # Neither name is documented anywhere. A round that sets the one this script
@@ -97,13 +97,13 @@ charsiu_build() {
 # binary now answers --version. This makes it not happen: whichever name is
 # set, both are, so whichever name the script reads it gets what was meant.
 #
-# ⚠ AND IF BOTH ARE SET TO DIFFERENT THINGS THAT IS A REFUSAL, not a
+# AND IF BOTH ARE SET TO DIFFERENT THINGS THAT IS A REFUSAL, not a
 # precedence rule. A precedence rule here would be a silent choice between two
 # binaries somebody deliberately named, which is the same failure one level up.
 if [ -n "${CHARSIU_RUN:-}" ] && [ -n "${CHARSIU_RUN_BIN:-}" ] &&
    [ "$CHARSIU_RUN" != "$CHARSIU_RUN_BIN" ]; then
 	echo "" >&2
-	echo "⛔ CHARSIU_RUN AND CHARSIU_RUN_BIN ARE BOTH SET AND DIFFER." >&2
+	echo "CHARSIU_RUN AND CHARSIU_RUN_BIN ARE BOTH SET AND DIFFER." >&2
 	echo "     CHARSIU_RUN=$CHARSIU_RUN" >&2
 	echo "     CHARSIU_RUN_BIN=$CHARSIU_RUN_BIN" >&2
 	echo "   They are two names for one knob. Different scripts read" >&2

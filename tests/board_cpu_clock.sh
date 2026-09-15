@@ -11,30 +11,30 @@
 # frequencies", and a decode that ignores the NPU clock is a decode that may
 # well be bound by the CPU. This is that measurement.
 #
-# 🔑 UNLIKE THE NPU CLOCK, THIS ONE MOVES WITHIN ONE BOOT. The NPU rate lives
+# UNLIKE THE NPU CLOCK, THIS ONE MOVES WITHIN ONE BOOT. The NPU rate lives
 # in the device tree, so r390 had to spend a reboot per arm and then measure
 # the boot-to-boot drift it was warned about. cpufreq is sysfs, so every
 # frequency point here is the same boot, the same load, the same binary --
 # which is a much stronger experiment than r390 could run.
 #
-# ⚠⚠ THE FREQUENCY IS CONFIRMED, NOT ASSUMED. Writing scaling_setspeed is a
+# THE FREQUENCY IS CONFIRMED, NOT ASSUMED. Writing scaling_setspeed is a
 # request; scaling_cur_freq is what happened. Every block prints what it got,
 # and a block that did not get what it asked for says so and is still printed,
 # because a silently-ignored knob is exactly how a null result gets
 # manufactured.
 #
-# ⚠⚠ THE CPU-ONLY ARM IS A POSITIVE CONTROL AND IT IS NOT OPTIONAL. If the
+# THE CPU-ONLY ARM IS A POSITIVE CONTROL AND IT IS NOT OPTIONAL. If the
 # NPU arms come back flat, "the CPU clock does not matter here" and "my knob
 # never took effect" are the same reading. A pure CPU decode MUST scale with
 # this knob; if it does not, nothing else on the page can be believed.
 #
-# ⚠ UP THEN DOWN. The points are swept low->high->low so that anything
+# UP THEN DOWN. The points are swept low->high->low so that anything
 # monotone in time -- warming silicon, a background job, a drifting rail --
 # shows up as a disagreement between a point and its own repeat rather than as
 # a slope. This kernel exposes no thermal zone, so that disagreement is the
 # only throttling detector there is.
 #
-# ⚠ WHICH BINARY. A number belongs to the binary that produced it. The image's
+# WHICH BINARY. A number belongs to the binary that produced it. The image's
 # /opt/charsiu/charsiu_run is dated 2026-08-24 and predates the affinity pin;
 # it read 14.8% spread and one core faster than two. This script refuses to
 # run against a charsiu_run older than the affinity pin and prints the date of
@@ -43,7 +43,7 @@
 #   sh tests/board_cpu_clock.sh
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -67,7 +67,7 @@ hi()  { printf '%s\n' $1 | tr ' ' '\n' | grep -v '^$' | sort -n | tail -1; }
 POL=$(ls -d /sys/devices/system/cpu/cpufreq/policy* 2>/dev/null)
 [ -n "$POL" ] || { echo "no cpufreq policies"; exit 1; }
 
-# ⚠ THE TOP POINT IS PER-POLICY MAX, THE OTHERS ARE EQUAL ON BOTH. The
+# THE TOP POINT IS PER-POLICY MAX, THE OTHERS ARE EQUAL ON BOTH. The
 # vendor's condition is "maximum CPU frequency", which on this SoC is 2016 MHz
 # for the A53 cluster and 2208 for the A72 -- so the top point is deliberately
 # NOT one number. Every lower point is a frequency both clusters have, so the
@@ -88,12 +88,12 @@ setfreq() {  # $1 = frequency, or the word "max"
 		GOT="$GOT $(basename "$p")=$got"
 		[ "$got" = "$want" ] || OK=0
 	done
-	echo "   asked $1 -> got$GOT $([ "$OK" = 1 ] || echo '  ⚠ THE KNOB DID NOT TAKE')"
+	echo "   asked $1 -> got$GOT $([ "$OK" = 1 ] || echo '  THE KNOB DID NOT TAKE')"
 }
 
 echo "== what the CPU clock is worth"
 echo "   boot id   $(cat /proc/sys/kernel/random/boot_id)"
-# ⚠ A MISSING CLOCK READS AS A CLOCK OF NOTHING. Inline, this printed a BLANK
+# A MISSING CLOCK READS AS A CLOCK OF NOTHING. Inline, this printed a BLANK
 # between "npu clk" and "Hz" whenever debugfs came up unmounted, which is the
 # hole board_clk.sh was written to close and it cost a whole TTFT ladder. The
 # `||` did not help: it fires on a FAILED cat, so an empty file fell straight
@@ -104,7 +104,7 @@ echo "   npu clk   ${_nc:-unknown} Hz  (unchanged all round)"
 echo "   rail      $(awk '/vdd_npu_s0/{print $6; exit}' /sys/kernel/debug/regulator/regulator_summary 2>/dev/null)"
 echo "   accel     $(ls /dev/accel/ 2>/dev/null | tr '\n' ' ')$(ls /sys/bus/platform/drivers/RKNPU/ 2>/dev/null | grep -q npu && echo '(RKNPU bound)')"
 echo "   charsiu   $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -114,11 +114,11 @@ echo "   repeats   $REPEAT per point, one warm-up discarded, swept up then down"
 echo
 
 case "$(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')" in
-2026-08-2*) echo "⚠⚠ $RUN predates the affinity pin. Refusing."; exit 1;;
+2026-08-2*) echo "$RUN predates the affinity pin. Refusing."; exit 1;;
 esac
 
 vendor_arm() {
-	# ⚠ THE VENDOR RUNTIME FINDS THE NPU THROUGH THE DRM RENDER NODE, which
+	# THE VENDOR RUNTIME FINDS THE NPU THROUGH THE DRM RENDER NODE, which
 	# only their driver publishes. On the rocket arm the binary and the model
 	# are both still mounted and it will start, spend its load time and then
 	# fail -- so the arm is skipped on the driver, not on the files.
@@ -128,7 +128,7 @@ vendor_arm() {
 	echo "$O" | grep -E '^   (TTFT|tok/s)' | sed 's/^   /   vendor  /'
 }
 
-# ⚠⚠ THIS IS THE TREE'S BOARD ENVIRONMENT AND THE SHORT VERSION IS NOT IT.
+# THIS IS THE TREE'S BOARD ENVIRONMENT AND THE SHORT VERSION IS NOT IT.
 # The first run of this script copied clock_cost.sh's three knobs and read
 # 13.85 tok/s where r388 recorded 17.85. The missing knob was
 # CHARSIU_NPU_MAXN: its C default is 8192, the model's output head is 128256
@@ -153,7 +153,7 @@ charsiu_npu_arm() {
 	printf '   charsiu tok/s median %s      range %s..%s\n' "$(mid "$S")" "$(lo "$S")" "$(hi "$S")"
 }
 
-# ⚠⚠ THE CONTROL. A pure CPU decode, same harness, same parser. It is here to
+# THE CONTROL. A pure CPU decode, same harness, same parser. It is here to
 # prove the knob bites, so its numbers are meaningless on their own and MUST
 # move with the frequency.
 control_arm() {

@@ -44,7 +44,7 @@ struct charsiu_fp16_plan {
 	size_t woff[FP16_GROUP_MAX], wsz[FP16_GROUP_MAX];
 	size_t ioff[FP16_GROUP_MAX], isz[FP16_GROUP_MAX];
 	size_t ooff[FP16_GROUP_MAX], osz[FP16_GROUP_MAX];
-	/* ⚠ coff MAY BE SHARED: two ops with the same n and the same
+	/* coff MAY BE SHARED: two ops with the same n and the same
 	 * coefficient size have byte identical coefficients here, and the
 	 * board says building them twice is not free. See below. */
 	size_t coff[FP16_GROUP_MAX], csz[FP16_GROUP_MAX];
@@ -86,7 +86,7 @@ static inline int charsiu_fp16_make_plan(const struct charsiu_fp16_op *ops,
 
 		if (!o->m || o->k < 32 || o->n < 32)
 			return -1;
-		/* ⚠ an op whose weight is already on the device takes no room
+		/* an op whose weight is already on the device takes no room
 		 * in the shared buffer, and must take none: giving a zero
 		 * sized region a page would make the plan disagree with what
 		 * the group copies, and the ops either side of it would still
@@ -100,7 +100,7 @@ static inline int charsiu_fp16_make_plan(const struct charsiu_fp16_op *ops,
 		p->ioff[i] = p->itot; p->itot += charsiu_fp16_up4k(p->isz[i]);
 		p->ooff[i] = p->otot; p->otot += charsiu_fp16_up4k(p->osz[i]);
 		/*
-		 * ⚠⚠ ONE COEFFICIENT REGION PER DISTINCT n, NOT PER OP.
+		 * ONE COEFFICIENT REGION PER DISTINCT n, NOT PER OP.
 		 *
 		 * This unit builds coefficients from a zero bias, zero weight
 		 * sums and unit scales, so their content depends on n and on

@@ -4,7 +4,7 @@
 #
 # WHAT ONE NPU CORE IS WORTH, at whatever clock and rail the board booted with.
 #
-# ⚠⚠ WHY THIS EXISTS. v12's 13/14 argued "losing 192 MHz costs less than
+# WHY THIS EXISTS. v12's 13/14 argued "losing 192 MHz costs less than
 # losing a core" from a single row that compared "one core at 786 MHz" against
 # "both cores at 594". Three things were wrong with it and all three are the
 # same mistake, which is putting two variables in one cell:
@@ -27,21 +27,21 @@
 #                                                                    the other
 #                                                                    device tree
 #
-# ⚠ BOTH ARMS NAME THE KNOB. ("", "ONEDEV=1") is not two arms, it is the
+# BOTH ARMS NAME THE KNOB. ("", "ONEDEV=1") is not two arms, it is the
 # default against one value, and the default is not written down anywhere the
 # round can print.
 #
-# ⚠ THE FIRST READING OF A ROUND IS COLD. One warm-up per model is taken and
+# THE FIRST READING OF A ROUND IS COLD. One warm-up per model is taken and
 # thrown away, and the arms ALTERNATE rather than running one after the other,
 # because a drift across the round otherwise lands entirely on the second arm.
 #
-# ⚠⚠ EVERY READING IS PRINTED. The median and the full range are the report;
+# EVERY READING IS PRINTED. The median and the full range are the report;
 # a minimum is not. A round whose individual readings were discarded cannot be
 # re-read later with a different statistic.
 #
 #   sh board_core_cost.sh [MODEL-substring ...]   (default: the four 13/14 used)
 #
-# ⚠ ONE MODEL AN INVOCATION IS FINE AND IS HOW THIS GETS DRIVEN OVER A SERIAL
+# ONE MODEL AN INVOCATION IS FINE AND IS HOW THIS GETS DRIVEN OVER A SERIAL
 # LINE. Every run reloads the model, so four models times five repeats times
 # two arms does not fit in one command's timeout. What must NOT be split is the
 # two arms: they alternate inside a model so that a drift across the round does
@@ -49,7 +49,7 @@
 #
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -61,7 +61,7 @@ REPEAT=${CHARSIU_CC_REPEAT:-5}
 NTOK=${CHARSIU_CC_NTOK:-64}
 PROMPT=${CHARSIU_CC_PROMPT:-"Explain in plain words why a written record outlasts a memory."}
 
-# ⚠ THE SAME SEARCH board_vendor.sh USES. /opt/charsiu/bin does not exist on
+# THE SAME SEARCH board_vendor.sh USES. /opt/charsiu/bin does not exist on
 # the board; the probes sit in /opt/charsiu itself. CHARSIU_RUN_BIN overrides,
 # so the shell around the table can be exercised with no board at all.
 RUN=${CHARSIU_RUN_BIN:-}
@@ -70,7 +70,7 @@ RUN=${CHARSIU_RUN_BIN:-}
 done
 [ -n "$RUN" ] || { echo "charsiu_run not found" >&2; exit 1; }
 
-# ⚠⚠ MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
+# MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
 MODELDIRS=${CHARSIU_CC_MODELS:-"$HOME/.charsiu/models /opt/charsiu/models /opt/vendor/models $D/../models"}
 find_model() {
 	for d in $MODELDIRS; do
@@ -82,7 +82,7 @@ find_model() {
 }
 
 #
-# ⚠⚠ THE CONDITIONS ARE PART OF THE ANSWER AND THE ROUND PRINTS THEM. 13/14
+# THE CONDITIONS ARE PART OF THE ANSWER AND THE ROUND PRINTS THEM. 13/14
 # quoted numbers whose clock and rail lived only in the prose around them, and
 # the prose was wrong about both. A reading here carries its own conditions.
 #
@@ -94,7 +94,7 @@ V=$(awk '/vdd_npu_s0/{print $6; exit}' /sys/kernel/debug/regulator/regulator_sum
 echo "   vdd_npu    ${V:-unknown}"
 echo "   cores      $(ls /dev/accel/ 2>/dev/null | tr '\n' ' ')"
 echo "   governor   $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -126,7 +126,7 @@ for want in $WANT; do
 	M=$(find_model "$want") || { echo "-- $want: NOT FOUND under [$MODELDIRS]"; echo; continue; }
 	echo "-- $(basename "$M")"
 
-	# ⚠ discarded on purpose, and the round says so rather than folding it in
+	# discarded on purpose, and the round says so rather than folding it in
 	one 0 "$M" >/dev/null 2>&1
 
 	T2=; S2=; T1=; S1=; n=0
@@ -158,6 +158,6 @@ for want in $WANT; do
 	echo
 done
 
-echo "⚠ This is what a CORE is worth at the clock and rail printed above, and"
+echo "This is what a CORE is worth at the clock and rail printed above, and"
 echo "  nothing else. What 192 MHz is worth needs the other device tree, and"
 echo "  the two must not be quoted as one comparison."

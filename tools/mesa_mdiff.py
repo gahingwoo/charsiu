@@ -15,7 +15,7 @@ So model that encoder here for a 1x1 convolution and diff it against what
 emit_job prints. Everything is symbolic in (M, K, N), so the same run answers
 "where do they differ at M=2" and "do they agree at M=1".
 
-⚠ M = 1 IS THE CONTROL AND IT RUNS FIRST. charsiu's M = 1 stream computes
+M = 1 IS THE CONTROL AND IT RUNS FIRST. charsiu's M = 1 stream computes
 correctly on the board, so if this model disagrees with it at M = 1 then the
 MODEL is wrong -- a mis-transcribed formula -- and nothing it says about M = 2
 can be trusted. That check is what makes the tool worth anything.
@@ -139,7 +139,7 @@ def main():
             bad_control = True
 
     if bad_control:
-        print("\n  ⚠ M=1 DISAGREES, and charsiu's M=1 is correct on the board.\n"
+        print("\n  M=1 DISAGREES, and charsiu's M=1 is correct on the board.\n"
               "  So this model is mis-transcribed and its M>1 rows mean nothing.\n"
               "  Fix the model against rkt_regcmd.c before reading further.")
         return 1

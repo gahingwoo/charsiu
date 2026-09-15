@@ -8,7 +8,7 @@
  * surface needs the table used as intended: attention's scores matmul has one
  * output channel per POSITION, so a per-position quantisation scale goes here.
  *
- * ⚠ THE FAILURE THIS GUARDS AGAINST IS SILENT. A scale table off by one
+ * THE FAILURE THIS GUARDS AGAINST IS SILENT. A scale table off by one
  * channel, or one that reads past the caller's array into the padding, gives
  * every output a plausible wrong magnitude -- and this project's own history
  * says a plausible wrong number survives a text check. So the table is read

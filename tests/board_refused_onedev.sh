@@ -4,7 +4,7 @@
 #
 # A refused model, batched anyway, under the conditions that disagree.
 #
-# ⚠⚠ WHAT THE FIRST TWO ROUNDS ESTABLISHED, because it changed the question
+# WHAT THE FIRST TWO ROUNDS ESTABLISHED, because it changed the question
 # twice.
 #
 # Round one asked whether gemma4 and phi3 are wrong because of what they ARE
@@ -31,7 +31,7 @@
 # same condition again. So this runs BOTH, and the interesting cell is the one
 # where they disagree.
 #
-# ⚠ CHARSIU_BATCH_FORCE IS A PROBE SWITCH. It batches a model this tree
+# CHARSIU_BATCH_FORCE IS A PROBE SWITCH. It batches a model this tree
 # refuses, says so on stderr and on the summary line, and a number measured
 # under it is a number about a model that is still refused.
 #
@@ -45,7 +45,7 @@
 #   CHARSIU_REFUSED_NGEN=8                 tokens generated in the plain arm
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -62,13 +62,13 @@ done
 DIRS="$HOME/.charsiu/models $HOME/models /opt/charsiu/models /opt/vendor/models \
 ${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}"
 
-# ⚠⚠ AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
+# AND THIS MACHINE MUST HAVE THE NPU. With no /dev/accel, `matmul_rows`
 # falls back to a matvec a row: the batched loop's ORDER runs and the batched
 # MATMUL does not, so every arm agrees and the round reads as a pass. That is
 # precisely the false pass that let gemma4 and phi3 ship wrong -- six
 # architectures, text identical, logits compared, ASAN clean, all of it on a
 # machine that could not see the bug. Refuse rather than reassure.
-# ⚠ ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
+# ANY accel NODE, NOT accel0. A rebind of rocket takes the next free
 # minor, so the NPU can sit at accel1 or accel2 and a test that looks only
 # for accel0 refuses on a board that has one.
 if [ -z "$(ls /dev/accel/accel* 2>/dev/null)" ] && [ -z "${CHARSIU_ALLOW_NO_NPU:-}" ]; then
@@ -86,7 +86,7 @@ fi
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
-# ⚠⚠ ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
+# ONE PROMPT, DEFINED ONE WAY, AND ITS TOKEN COUNT PRINTED.
 #
 # board_text_all.sh spelled this literally and every other script built it with
 # `seq 1 32 | tr`, which leaves a TRAILING SPACE. That is not cosmetic: it
@@ -106,7 +106,7 @@ CONDS=${CHARSIU_REFUSED_CONDS:-"plain pinned"}
 REPS=${CHARSIU_REFUSED_REPS:-1}
 NGEN=${CHARSIU_REFUSED_NGEN:-8}
 
-# ⚠ CASE AND PUNCTUATION FOLDED, because the file is `Phi-3.5-mini-...` and
+# CASE AND PUNCTUATION FOLDED, because the file is `Phi-3.5-mini-...` and
 # the thing anyone types is `phi3`.
 norm() { echo "$1" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9'; }
 
@@ -142,7 +142,7 @@ fi
 [ -n "${MODELS# }" ] || { echo "no Q4_0 model found in $DIRS" >&2; exit 1; }
 
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -153,7 +153,7 @@ echo "  plain   no pinning, default threads, gen $NGEN"
 echo "  pinned  taskset -c 4-7, -t 4, -c 512, gen 16   <- prefill_control's"
 echo
 
-# ⚠ THE TAIL, NOT THE HEAD. Round one printed the first 64 characters of each
+# THE TAIL, NOT THE HEAD. Round one printed the first 64 characters of each
 # arm, which on a "1 2 ... 32" prompt is 64 characters of prompt echo: all
 # three lines read identical while cmp said they were not. The generated text
 # -- the only part that can differ -- is at the END.
@@ -164,7 +164,7 @@ run_arm() { # run_arm <outfile-stem> <extra env...>
 	# shellcheck disable=SC2086
 	$PIN env $W4 "$@" "$RUN" "$MODEL" -p "$PROMPT" -n "$NG" \
 		--ignore-eos $EXTRA >"$o.out" 2>"$o.err"
-	# ⚠ BEFORE THE STRIP. Two rounds of this script ran two different
+	# BEFORE THE STRIP. Two rounds of this script ran two different
 	# prompts -- one literal, one from seq with a trailing space -- and the
 	# difference was read as the model flipping.
 	NTOK=$(sed -n 's/.*prompt \([0-9]*\) tok in.*/\1/p' "$o.out" | head -1)
@@ -175,10 +175,10 @@ nref=0; nbad=0; ncond=0
 for MODEL in $MODELS; do
 	b=$(basename "$MODEL")
 
-	# ⚠ ONLY THE REFUSED ONES, AND ASK BEFORE RUNNING ANYTHING ELSE. A model
+	# ONLY THE REFUSED ONES, AND ASK BEFORE RUNNING ANYTHING ELSE. A model
 	# that batches by default has nothing to force here.
 	#
-	# ⚠ AND THE CONTROL CANNOT ANSWER THIS. Under CHARSIU_NO_BATCH_PREFILL
+	# AND THE CONTROL CANNOT ANSWER THIS. Under CHARSIU_NO_BATCH_PREFILL
 	# the diagnostic says so and never reaches the "not batched: <reason>"
 	# line, so asking the control why a model is refused comes back empty.
 	# shellcheck disable=SC2086
@@ -213,12 +213,12 @@ for MODEL in $MODELS; do
 			cmp -s "$T/c.out" "$T/o.out" && oagree=$((oagree + 1))
 			r=$((r + 1))
 		done
-		# ⚠ EVERY run must agree, not the last one: one disagreement in
+		# EVERY run must agree, not the last one: one disagreement in
 		# five is still a wrong answer shipped one prompt in five.
 		fok=no; ook=no; sok=no
 		[ "$fagree" -eq "$REPS" ] && fok=yes
 		[ "$oagree" -eq "$REPS" ] && ook=yes
-		# ⚠ AND THE TWO FORCED ARMS AGAINST EACH OTHER. Both wrong and
+		# AND THE TWO FORCED ARMS AGAINST EACH OTHER. Both wrong and
 		# identical is deterministic; both wrong and different is a
 		# race, and then one core proves nothing -- it still runs two K
 		# slices in sequence through one queue.
@@ -240,7 +240,7 @@ for MODEL in $MODELS; do
 		eval "R_$COND=$fok/$ook/$sok"
 	done
 
-	# ⚠ THE CELL WHERE THE CONDITIONS DISAGREE IS THE RESULT. Everything
+	# THE CELL WHERE THE CONDITIONS DISAGREE IS THE RESULT. Everything
 	# else is one more run of a question already answered.
 	echo "  ---------------------------------------------------------------"
 	for COND in $CONDS; do
@@ -290,7 +290,7 @@ if [ "$nref" -eq 0 ]; then
 fi
 echo "$nref refused models, $ncond condition runs, $nbad models wrong somewhere."
 echo
-echo "⚠ EVERY NUMBER HERE IS FROM A REFUSED MODEL. Nothing in this round"
+echo "EVERY NUMBER HERE IS FROM A REFUSED MODEL. Nothing in this round"
 echo "  unrefuses anything by itself -- it decides WHICH question the next"
 echo "  round asks."
 echo "======================================================================"

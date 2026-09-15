@@ -16,7 +16,7 @@
 /* encode -> decode must give the text back, or the tokenizer is lying */
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -29,7 +29,7 @@ int main(int argc, char **argv)
 	static const char *cases[] = {
 		"The capital of France is Paris.",
 		"hello  world   with   runs of spaces",
-		"unicode: 你好世界 ünïcödé ✓ emoji 🙂",
+		"unicode: 你好世界 ünïcödé emoji ",
 		"punctuation!?;:'\"[]{}()<>@#$%^&*",
 		"digits 0123456789 mixed42with7text",
 		"",
@@ -50,11 +50,11 @@ int main(int argc, char **argv)
 			if (w + (size_t)len < sizeof(out)) { memcpy(out + w, s, len); w += len; }
 		}
 		out[w] = 0;
-		/* ⚠ SPM ALWAYS prepends one space marker, so the decode always
+		/* SPM ALWAYS prepends one space marker, so the decode always
 		 * has one more than the input -- including when the input
 		 * already starts with a space. Stripping it only in the other
 		 * case was the TEST being wrong, not the tokenizer. */
-		/* ⚠ BPE does NOT prepend one, so accept either -- the only
+		/* BPE does NOT prepend one, so accept either -- the only
 		 * ambiguity in a round trip is that one marker, and hard-coding
 		 * a family into the test is how it got this wrong twice. */
 		const char *got = out;

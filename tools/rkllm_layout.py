@@ -56,7 +56,7 @@ def nibble_signs(mm, b0, b1):
 def xcorr_max(path, pat, start, end, topk=8):
     """Every alignment of pat over the file, by overlap-save FFT.
 
-    ⚠ ONE BLOCK AT A TIME.  The first version built the whole nibble stream
+    ONE BLOCK AT A TIME.  The first version built the whole nibble stream
     first -- 1.5 G entries for a 1.3 GB .rkllm -- and the OOM killer took it
     before it printed anything.  Nothing here is larger than one FFT block, so
     the peak is tens of megabytes whatever the file size.
@@ -122,7 +122,7 @@ def main():
         print("not a matrix")
         return 1
     #
-    # ⚠ gguf-py hands back the RAW BLOCKS for a quantised tensor, not floats,
+    # gguf-py hands back the RAW BLOCKS for a quantised tensor, not floats,
     # and round one of this tool took np.sign of those bytes -- which is +1
     # nearly everywhere and correlated with the file's mean rather than with
     # anything. q8_0 is 34 bytes a block: an fp16 scale then 32 signed bytes,
@@ -156,7 +156,7 @@ def main():
     print("\n  correlation   nibble        byte offset   note")
     for c, i in hits:
         #
-        # ⚠ i IS ALREADY ABSOLUTE. The whole-file version counted nibbles from
+        # i IS ALREADY ABSOLUTE. The whole-file version counted nibbles from
         # `start` and printed `start + i // 2`; the streaming one seeds its
         # cursor at `start * 2`, so adding it again put every hit outside the
         # range that was searched. The correlations were right and the
@@ -168,7 +168,7 @@ def main():
     print("\n  |r| ~ 0.9  the tensor is here and stored in this order")
     print("  |r| < 0.1  it is not stored this way anywhere in the file")
     #
-    # ⚠ RUN --selftest FIRST ON A NEW FILE.  A miss and a broken correlator
+    # RUN --selftest FIRST ON A NEW FILE.  A miss and a broken correlator
     # look identical, and lifting the pattern out of the file at a known offset
     # scores exactly +1.0000 there when the machinery works.
     #

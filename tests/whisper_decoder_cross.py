@@ -4,7 +4,7 @@
 """
 Diff charsiu's whisper decoder against numpy, on the real weights.
 
-⚠ CROSS ATTENTION IS WHAT THIS IS FOR. It is the one mechanism in this tree that
+CROSS ATTENTION IS WHAT THIS IS FOR. It is the one mechanism in this tree that
 reads its keys and values from a different sequence than its queries, and every
 way of getting it wrong -- the wrong tensor, the cache built from the wrong
 side, the encoder's positions transposed -- leaves a decoder that still produces
@@ -54,7 +54,7 @@ def decoder_logits(m, enc, prompt):
             o[:, sl] = (s / s.sum(-1, keepdims=True)) @ v[:, sl]
         x = x + o @ m[p + "attn.out.weight"].T + m[p + "attn.out.bias"]
 
-        # ⚠ the keys and values come from the ENCODER, the queries from here
+        # the keys and values come from the ENCODER, the queries from here
         xb = layernorm(x, m[p + "cross_attn_ln.weight"],
                        m[p + "cross_attn_ln.bias"])
         q = xb @ m[p + "cross_attn.query.weight"].T + m[p + "cross_attn.query.bias"]
@@ -73,7 +73,7 @@ def decoder_logits(m, enc, prompt):
         x = x + h1 @ m[p + "mlp.2.weight"].T + m[p + "mlp.2.bias"]
 
     x = layernorm(x, m["decoder.ln.weight"], m["decoder.ln.bias"])
-    # ⚠ the head is the embedding table, tied
+    # the head is the embedding table, tied
     return (x[-1] @ m["decoder.token_embedding.weight"].T).astype(np.float32)
 
 

@@ -40,7 +40,7 @@ beyond that one sentence, so a margin over it cannot be inside anyone's noise
 in either direction. Section 1 is our median of seven with its range, against
 their published point.
 
-⚠ **Section 1b is different: their runtime has now been RUN here**, on the
+**Section 1b is different: their runtime has now been RUN here**, on the
 same board, the same kernel and the same clock as ours, and it is an arm.
 Section 1 and section 1b are two different comparisons and must not be merged
 into one table: section 1 is four models at maximum frequency against a
@@ -104,16 +104,16 @@ Against w8a8 the same charsiu medians would read +52.9%, +87.1%, +88.0% and
 +66.4% instead of +5.7%, +15.6%, +6.8% and +0.2%. A paper that reported the
 w8a8 row would be claiming roughly four times the margin for the same work.
 
-⚠ **It is not uniformly the conservative choice.** Their w8a8 TTFT is slightly
+**It is not uniformly the conservative choice.** Their w8a8 TTFT is slightly
 FASTER than their w4a16 on three of the four, so picking w4a16 is conservative
 on the column we lead and slightly generous on the column we trail. Both halves
 of that belong in the sentence.
 
-⚠ w8a8 also costs roughly twice the memory: 796 MB against 513 for Qwen3,
+w8a8 also costs roughly twice the memory: 796 MB against 513 for Qwen3,
 3767 against 1996 for Phi3. A reader choosing between them is not choosing on
 speed alone, and neither column is "the vendor's number" on its own.
 
-🔑 **`w4a16_g128` exists, and section 2's group caveat is about OUR FILE, not
+**`w4a16_g128` exists, and section 2's group caveat is about OUR FILE, not
 about what they can do.** The `.rkllm` scored there keeps one scale per output
 row; this column shows they ship a group-128 option as well. The asymmetry
 section 2 states is between two particular files, not between two vendors'
@@ -137,13 +137,13 @@ stdout: `Enabled cpus: [4, 5, 6, 7]`.
                    charsiu 1.44x          <- r389
 ```
 
-⚠ **1.44 here and 1.39 in the README are the same condition in two rounds.**
+**1.44 here and 1.39 in the README are the same condition in two rounds.**
 r389 read 18.56 against 12.88; r390, below, read 17.85 against 12.85 at the same
 594 MHz. The README quotes r390 because r390 is the round that has a second
 clock beside it and so can say the ratio moves. Two rounds apart is the size of
 the disagreement, and it is why the next line exists.
 
-⛔ **1.44x IS NOT A CONSTANT AND MUST NOT BE QUOTED AS ONE.** `board-logs/r390`
+**1.44x IS NOT A CONSTANT AND MUST NOT BE QUOTED AS ONE.** `board-logs/r390`
 measured both arms at a second clock, everything else held:
 
 ```
@@ -156,25 +156,25 @@ measured both arms at a second clock, everything else held:
 The ratio moves 5.2%, far outside either arm's spread. Report an interval, the
 way section 2 does, and say at which clock each end was taken.
 
-🏁 **And their decode does not use the NPU clock at all.** 32.4% more clock
+**And their decode does not use the NPU clock at all.** 32.4% more clock
 buys them -0.9%, with a 0.3% spread, so it is not noise; ours buys +4.2%.
 Whatever bounds their decode, it is not this clock.
 
-⭐ That weakens the fairness worry about section 1. Their published figures are
+That weakens the fairness worry about section 1. Their published figures are
 at maximum CPU and NPU frequency and none of our arms are, but on DECODE the
 NPU clock is nearly inert for them.
 
-⚠⚠ **The obvious extension is NOT supported.** Only the NPU clock was varied.
+**The obvious extension is NOT supported.** Only the NPU clock was varied.
 "Maximum frequency" in their header is CPU *and* NPU, and a decode that ignores
 the NPU clock is one that may well be bound by the CPU, which this round did
 not touch. Nothing here says their published figures would be reproduced at
 594 MHz.
 
-🔑 The two metrics swap sides: the clock is inert for their decode and worth
+The two metrics swap sides: the clock is inert for their decode and worth
 6.5% of their prefill, while for charsiu it is worth 4.2% of decode and
 almost nothing on prefill.
 
-⚠⚠ **The prefill answer depends on which question is asked, and the two
+**The prefill answer depends on which question is asked, and the two
 readings point in OPPOSITE directions.** The vendor wraps the prompt in its own
 chat template: the same string is 50 tokens to them and 16 to us.
 
@@ -192,7 +192,7 @@ prompt is 79 tokens to us and 113 to them.
   vendor    50 tok  466 ms    113 tok  860 ms
 ```
 
-⛔ **THIS PAIR WAS FITTED TO A LINE AND THE FIT IS WITHDRAWN.** It read "7.71
+**THIS PAIR WAS FITTED TO A LINE AND THE FIT IS WITHDRAWN.** It read "7.71
 against 6.25 ms/token, fixed costs 141.6 against 153.6, so the vendor is 1.23x
 faster per prompt token, which is the real gap". None of those four numbers is
 supported. See 1g for the measurement that removed them: TTFT is convex in
@@ -212,7 +212,7 @@ tokenisation of the body, it is one tokenisation plus a fixed wrapper.
 
 ### 1b-ii. Both curves, measured, and what the fit says
 
-⚠ **The charsiu column here is r393 and four rounds of work have landed since.
+**The charsiu column here is r393 and four rounds of work have landed since.
 1k-ii is the current ladder** -- 852 tokens go 8081 ms here to 5905 there. What
 this section is still the source for is the VENDOR column, which has not been
 re-measured since, and the 2.2% boot-to-boot drift bound that every comparison
@@ -234,7 +234,7 @@ Residuals are inside 2% of each point beyond 200 tokens on both curves; the
 5-11% at the short end is the chunk stepping, which a smooth curve cannot
 follow (1h).
 
-⛔⛔ **THE 6.0x IS NOT SUPPORTED BY THIS DATA AND NOTHING SHOULD BE BUILT ON
+**THE 6.0x IS NOT SUPPORTED BY THIS DATA AND NOTHING SHOULD BE BUILT ON
 IT.** A fit can describe a curve to 2% and still not determine its individual
 coefficients, and this one does not. Two independent readings say so:
 
@@ -250,34 +250,34 @@ coefficients, and this one does not. Two independent readings say so:
   worst residual in their own curve at +5.3% -- moves it by a factor of
   twelve.
 
-🏁 **The direction survives and the magnitude does not.** Our prefill grows
+**The direction survives and the magnitude does not.** Our prefill grows
 faster with length than theirs: we are ahead at 202 tokens and behind at 852,
 which is a fact about the measured points and needs no fit at all. "Six times"
 is an artefact.
 
-⚠ **This matters beyond a number.** "The quadratic term is the whole deficit
+**This matters beyond a number.** "The quadratic term is the whole deficit
 and theirs is six times smaller" organised months of work, and 1i is named
 after it. What that work produced stands -- the attention arm is real and 1j
 measures it -- but the TARGET it was aimed at was never determined. The
 comparison that is determined is the point-by-point one in 1j, and the plan
 that follows from it is stage costs, not coefficients.
 
-🏁 **Our per-token linear rate is 12% BETTER than theirs.** ⛔ The withdrawn
+**Our per-token linear rate is 12% BETTER than theirs.** The withdrawn
 "the vendor is 1.23x faster per prompt token" was not merely unsupported --
 **it had the sign backwards.** Two points a side, taken over two different
 token ranges on a curve with a large quadratic term, produced a number that
 pointed the wrong way.
 
-🏁 **They win on the other two terms.** ⚠ And only one of the two is a number:
+**They win on the other two terms.** And only one of the two is a number:
 their fixed cost is a quarter of ours, 45.8 against 187.9 ms, which the short
 end of the measured ladder shows directly. Their quadratic term is SMALLER and
 by how much is not determined -- see the refutation above, which this
-paragraph used to contradict by restating the 6.0x as a finding. ⭐ The
+paragraph used to contradict by restating the 6.0x as a finding. The
 quadratic term is the attention scaling. Per prompt token we are ahead; what
 we lose is how that cost GROWS, and a fixed cost four times theirs on top of
 it.
 
-🏁 **So "who starts a prompt faster" is a crossover, not a ratio.** With their
+**So "who starts a prompt faster" is a crossover, not a ratio.** With their
 33 tokens included the fits cross at 248 of our tokens; measured, we are ahead
 at 202 and behind at 302.
 
@@ -295,34 +295,34 @@ at 202 and behind at 302.
        210  vendor 1.078x     510  vendor 1.216x     810  vendor 1.387x
 ```
 
-⚠ **The two runtimes cannot share a boot** -- one arm binds one driver -- so
+**The two runtimes cannot share a boot** -- one arm binds one driver -- so
 this breaks the rule against comparing across sessions. The drift was measured
 rather than assumed: the same charsiu ladder, one boot apart, is **2.2% at
 worst and -0.64% on average** across the eight points. Everything above is far
 outside that.
 
-⚠ The matched-token rows start at 160 because below it our curve has two points
+The matched-token rows start at 160 because below it our curve has two points
 and one of them carries a token-loop leftover; dropping it moves the 60-token
 row from 1.160x to 1.225x and leaves 160 upward unchanged.
 
-⚠ The per-point marginal ms/token is not usable -- both curves step. What the
+The per-point marginal ms/token is not usable -- both curves step. What the
 stepping does not hide is the trend: ours more than doubles across the range,
 5.5 to 11.9 ms a token, and theirs moves 24%.
 
-⛔ Not supported by this: why their quadratic term is six times smaller. That
+Not supported by this: why their quadratic term is six times smaller. That
 is the next question and nothing here touches it.
 
-⚠ The rail differs: 800 mV for charsiu, 750 for the vendor, because their
+The rail differs: 800 mV for charsiu, 750 for the vendor, because their
 driver sets it through `npu-supply` and its OPP table rather than taking the
 device tree's floor. Both compute correctly at 594 MHz and voltage does not set
 clock rate, so this is a caveat and not a confound.
 
-⚠ Neither side scaled its NPU. Their device tree asks for devfreq over an OPP
+Neither side scaled its NPU. Their device tree asks for devfreq over an OPP
 table reaching 800 MHz; Kiln's patch pins the clock. So this section says
 nothing about either side at the frequency their published figures were taken
 at -- section 1g does, for the CPU half, and finds the ratio unmoved by it.
 
-⛔ **Their runtime cannot be asked for its accuracy at all, by any route this
+**Their runtime cannot be asked for its accuracy at all, by any route this
 project can find, and section 2's reconstruction is therefore the only way to
 it rather than the second best.** Three refusals, r398:
 
@@ -342,16 +342,16 @@ it rather than the second best.** Three refusals, r398:
    another, so the two templates are not the same and a comparison through
    them compares two framings as well as two runtimes.
 
-🔑 **Which also corrects what (1) was taken to mean.** It was recorded as "the
+**Which also corrects what (1) was taken to mean.** It was recorded as "the
 model refuses logits". `matmul_qk` and `matmul_qkv` are sibling ops and the
 error is the same class, so the constraint was never about logits: **their
 export carries a fixed set of compiled shapes** and anything off that set
-fails. ⛔ And it fails by returning the null result rather than an error, which
+fails. And it fails by returning the null result rather than an error, which
 is the same shape as the all-0x80 buffer of a cancelled rocket job and the
 unwritten shmem BO that reads back a uniform 128 (1b, and Igor's 2026-09-12
 correction on the v12 thread).
 
-⚠ What the attempt did leave is arm A, which had never been run either: **every
+What the attempt did leave is arm A, which had never been run either: **every
 quality number in this pack before 2026-09-13 came from the CPU path**, because
 `charsiu_ppl` had no aarch64 target. Built now, our q4_0 through the board's NPU
 agrees with the f16 origin's top-1 on **55.0% of 420 positions**, with its own
@@ -480,7 +480,7 @@ Section 1b varied the NPU clock only, and said so: their header names maximum
 CPU *and* NPU, and a decode that ignores the NPU clock is a decode to suspect
 the CPU of. r391 is that measurement.
 
-🔑 It is a stronger experiment than 1b's. The NPU rate lives in the device
+It is a stronger experiment than 1b's. The NPU rate lives in the device
 tree, so 1b spent a reboot per point and had to price the boot-to-boot drift it
 was warned about. cpufreq is sysfs: every point below is one boot, one load,
 one binary, swept up and then back down, with the frequency read back from
@@ -500,7 +500,7 @@ that never took effect are the same reading; it moved 2.49x.
 with it**: 1.392, 1.410, 1.393 across a clock that more than doubles. That is
 the opposite of 1b, where the NPU clock moved it from 1.389 to 1.461.
 
-⚠ The two runtimes are at different NPU clocks in that table, so the ratio
+The two runtimes are at different NPU clocks in that table, so the ratio
 VALUES are not like-for-like; what is compared across them is each one's own
 elasticity, measured inside one boot and one arm.
 
@@ -529,7 +529,7 @@ Both runtimes gain more at a short prompt than at a long one, which is what
 without assuming a shape. The two runtimes' prompt lengths differ because their
 tokenisers do (1b), so the rows are not to be read across.
 
-⛔ **AND THAT IS THE WHOLE CLAIM. The earlier version of this section fitted a
+**AND THAT IS THE WHOLE CLAIM. The earlier version of this section fitted a
 line through each pair and reported a per-token rate and a fixed cost -- 5.325
 against 7.730 ms/token, 171.0 against 143.3 ms fixed, theirs halving and ours
 falling 24%. Every one of those numbers is withdrawn.** Three separate reasons,
@@ -556,7 +556,7 @@ What survives is the table above, because chunking and the leftover token do
 not depend on the CPU clock: the same prompt, the same chunking, under two
 governors.
 
-⛔ The first charsiu sweep of this round was thrown away rather than published.
+The first charsiu sweep of this round was thrown away rather than published.
 It read 13.85 t/s at maximum CPU where r388 had recorded 17.85 at a lower
 clock, which is impossible. Reproduced against the alternative on the same
 boot, the variable was `CHARSIU_NPU_MAXN`: its C default of 8192 is below every
@@ -591,17 +591,17 @@ Within a cell the spread is at most 6 ms; between the best and the default it
 is 48 ms, so the ordering is outside the noise. **The shipped default is 5.9%
 slower than chunking at 80 on this prompt length.**
 
-⚠ It is not "fewer chunks is better" -- one chunk of 102 is nearly the worst
+It is not "fewer chunks is better" -- one chunk of 102 is nearly the worst
 row and three chunks of 34 is the worst. It is not a clean multiple-of-16 rule
 either: `1x64+1x38` should then beat `1x52+1x50` and it does not.
 
-⚠⚠ **AND THE DEFAULT IS NOT SIMPLY WRONG.** `onechunk_on()` was turned on
+**AND THE DEFAULT IS NOT SIMPLY WRONG.** `onechunk_on()` was turned on
 against measurement: TTFT fell on all four vendor-protocol models, 5.1% and
 5.7% on the two whose baselines repeat. Those are 128-token prompts. So the
 knob wins at 128 and loses at 102, which makes this a non-monotone response to
 prompt length and not a regression to revert.
 
-⛔ **Six cells at one prompt length cannot choose a new default.** The comment
+**Six cells at one prompt length cannot choose a new default.** The comment
 above the knob records what happened the last time a chunk rule was derived
 rather than measured -- SmolLM2 came back 77% slower. What is supported here is
 that the default is not optimal at every length, which is enough to stop
@@ -610,7 +610,7 @@ change anything.
 
 ### 1i. Why our quadratic term is larger than theirs: attention is on the CPU
 
-⚠ **This section was called "six times theirs" and that factor is withdrawn --
+**This section was called "six times theirs" and that factor is withdrawn --
 see 1b-ii.** The fitted coefficients do not determine it; the direction is
 sound and the magnitude is not. Everything below is about the direction, which
 is what it actually establishes.
@@ -644,33 +644,33 @@ halves, measured -- ratio is NPU arm over CPU arm, so below 1.00 the NPU wins:
   gemma-3-1b            256     1.121   1.021   0.923   0.877
 ```
 
-🏁 Both halves are real, and they are **one quantity**: head_dim is the inner
+Both halves are real, and they are **one quantity**: head_dim is the inner
 dimension of both attention matmuls and prompt length is the outer, so both
 feed arithmetic per dispatch. head_dim 256 wins from about 230 tokens and by
 12.3% at 852.
 
-⛔ **"head_dim 64 is flat at 1.25 because no length makes a dispatch worth
+**"head_dim 64 is flat at 1.25 because no length makes a dispatch worth
 taking there" is WITHDRAWN — see 1j.** It was flat because the fp16 path spent
 1550 ms of its 2924 on one core doing work proportional to the answer, not
 because of anything about head_dim 64. With that gone the ratio falls with
 length and crosses at about 376 tokens.
 
-⛔ **So the paper must not cite Llama-3.2-1B for this.** It is the model every
+**So the paper must not cite Llama-3.2-1B for this.** It is the model every
 speed round in this pack uses and the furthest below the threshold of anything
 on the card -- head_dim 64 against a rule about 128.
 `tools/gguf_head_dim.py` prints the census: 512, 256, 128, 128, 96, 64, 64, 64.
 
-⚠ **gemma-4-E2B is not a head_dim 512 point** and was nearly reported as one.
+**gemma-4-E2B is not a head_dim 512 point** and was nearly reported as one.
 It has two head_dims -- `key_length` 512 and `key_length_swa` 256 -- and at the
 time the pool held one, so 28 of its 35 layers never reached the hardware. Its
-0.936 at 852 tokens is what seven layers bought. ⚠ **That is no longer true of
+0.936 at 852 tokens is what seven layers bought. **That is no longer true of
 the tree**: the mirror holds a head per layer, and gemma-4 now runs 385 of 385
 layer calls with zero refusals (1j). The paragraph is kept because the number
 above was measured under the old behaviour and must not be read as current. The instrument said "fell back on 0"
 throughout, because five refusal paths touched no counter; there is one per
 reason now and it names `head_dim` directly.
 
-⛔ **Not supported on this evidence: any change of default.** Three clean
+**Not supported on this evidence: any change of default.** Three clean
 models is not a rule, `CHARSIU_ATTN_NPU=auto` was already withdrawn once, and
 the last chunk rule derived rather than measured cost SmolLM2 77% (1h). What is
 established here is that the vendor's smaller quadratic term has a named cause
@@ -704,7 +704,7 @@ on one core:
                                                          reduced in place
 ```
 
-⚠ **1i's own conclusion about head_dim 64 is what this overturns**, and the
+**1i's own conclusion about head_dim 64 is what this overturns**, and the
 shape of that matters: r400 measured the NPU arm at 1.19 to 1.23 times the CPU
 arm over an eight-fold range of prompt length, FLAT, and concluded there is no
 crossover at head_dim 64. That was a fact about the code. The ratio was flat
@@ -735,14 +735,14 @@ including gemma-4, which 1i describes as refusing 28 of 35. The gain tracks
 attention's SHARE of the prompt, which is why the two that do not move are the
 two largest models.
 
-⚠ **The two questions a default has to answer that speed does not.**
+**The two questions a default has to answer that speed does not.**
 Perplexity on `tests/corpus/long.txt`, batched, Llama-3.2-1B Q4_0: **40.9987
 off, 40.9213 on**, reproduced exactly twice. Deterministic, so that is a
 numerics difference and not an improvement to claim -- but it is not a cost
 either, which is the question. Peak memory 1474 -> 1459 MB on Llama, 2671 ->
 2670 on gemma-4.
 
-⚠ **Below the threshold the two arms run the same code**, not merely at the
+**Below the threshold the two arms run the same code**, not merely at the
 same speed: `attn_npu_get` returns NULL before the mirror exists. That is what
 makes a default defensible from one board -- the change is confined to prompts
 long enough to have been measured winning. Verified with an empty environment:
@@ -763,15 +763,15 @@ eight lengths.
        852          vendor  1.380x               vendor  1.193x
 ```
 
-🏁 **The vendor's lead at 852 tokens is halved, 1.380x to 1.193x.** The
+**The vendor's lead at 852 tokens is halved, 1.380x to 1.193x.** The
 crossover does not move -- it is still between 202 and 302 tokens -- and that
 is by construction, because the arm did not turn on below 448 when this was
-measured. ⚠ **That threshold is 272 as of r413, and a model with no GQA has a
+measured. **That threshold is 272 as of r413, and a model with no GQA has a
 second one at 448**; the reading above is unaffected (it is a 852 token row,
 above either threshold, on a GQA model) but a re-run at 302 or 352 would not
 reproduce the "by construction" clause.
 
-⛔ **Do not quote the fitted coefficients for this.** Fitting `a + bn + cn^2`
+**Do not quote the fitted coefficients for this.** Fitting `a + bn + cn^2`
 to both arms shows the quadratic more than halving, 0.004974 -> 0.002106, and
 folding in the vendor's own fit puts the crossover at 195 tokens -- *worse*
 than 1b-ii's 248, from a change that made the runtime faster at every length
@@ -781,12 +781,12 @@ point. Over an eight-point ladder the three parameters are correlated, and a
 lower `c` is bought with a higher `b`. `tools/ttft_compare.py` interpolates
 inside each curve and never fits across them; that is why it exists.
 
-⛔ **Still not supported: that charsiu beats the vendor on prefill.** It does
+**Still not supported: that charsiu beats the vendor on prefill.** It does
 not, above about 250 tokens. Their attention remains roughly 4.3x cheaper than
 ours -- our fence alone is 880 ms against their entire quadratic term's 539 at
 852 tokens.
 
-⛔⛔ **AND THE EXPLANATION THAT WAS ATTACHED TO THAT WAS NOT MEASURED.** This
+**AND THE EXPLANATION THAT WAS ATTACHED TO THAT WAS NOT MEASURED.** This
 paragraph said 0.119 TMAC/s against the int4 path's 0.45 to 0.70, and called
 it structural. 0.119 was arithmetic done on a stage table in a write-up. The
 measured figures are **0.026 (scores) and 0.048 (values)** -- wrong by four
@@ -806,12 +806,12 @@ like the sentence implied:
              0.36 to 0.69 for int4, at shapes that are not the same.
 ```
 
-⭐ **What that leaves open is a road, not a wall.** Attention's weights ARE the
+**What that leaves open is a road, not a wall.** Attention's weights ARE the
 KV cache and charsiu packs them itself, so they can be int4 with an fp16
 activation -- the w4a16 arrangement the projections already run at 0.36 to
 0.69. Nothing about attention requires fp16 weights.
 
-⚠ **The first measurement of that road does not exist**: int4 at the attention
+**The first measurement of that road does not exist**: int4 at the attention
 shapes. `charsiu_int4` and `charsiu_matmul` take m, k and n and print no time;
 `npu_fp16_test` is fp16 only. Until that probe exists the dtype factor above is
 two shapes apart, and the projection that follows from it -- attention 2343 ms
@@ -836,32 +836,32 @@ dated reading of a different binary.
        852    5905  5892..5936      885   6026.8    +2.1%     0.7%   LEVEL
 ```
 
-🔑 **The bound is measured now, not quoted.** r413 ran twenty readings of ONE
+**The bound is measured now, not quoted.** r413 ran twenty readings of ONE
 arm at 302 tokens on one boot with nothing changed: median 2130, range
 2110..2164, **spread 2.5%**. That is the floor a margin has to clear, and it is
 slightly LARGER than the 2.2% cross-boot figure this section used to quote. All
 eight rows clear their own spread, so the floor is what separates them.
 
-⚠ **852 does not clear it** (+2.1%) and stays level. ⚠ **602 is the thin row**:
+**852 does not clear it** (+2.1%) and stays level. **602 is the thin row**:
 +3.5% clears 2.5% by one point and a slightly stricter bound puts it back.
 
-🏁 **What moved 302 and 452 from level to ahead** is the attention threshold
+**What moved 302 and 452 from level to ahead** is the attention threshold
 coming down from 320 to 272, re-derived against the arm that ships. 320 itself
 had the defect 448 had: it was measured in r412 section 2 on the r411 binary,
 and section 7 of the same round made that arm faster.
 
-⚠ **And the null control held.** The four rows below the threshold -- 27, 52,
+**And the null control held.** The four rows below the threshold -- 27, 52,
 102, 202 -- run the SAME code in both arms, because attn_npu_get returns NULL
 before the mirror is built. They moved -0.3 to -1.4%, all inside the floor. If
 any of them had moved, this whole re-read would be suspect.
 
-⛔ **This table was overclaimed once**, when every point estimate favoured
+**This table was overclaimed once**, when every point estimate favoured
 charsiu and it was written up as "completely surpassed" and withdrawn the same
 day. The difference is a measured floor, one row still level and one row thin.
 
 ### 1k. The ladder with the overlap work in: a lead under 250, level above
 
-⚠ **SUPERSEDED BY 1k-ii above**, which re-measured this on the shipping binary
+**SUPERSEDED BY 1k-ii above**, which re-measured this on the shipping binary
 with five repeats and a measured noise floor. Kept as a dated reading.
 
 
@@ -880,12 +880,12 @@ discarded, all eight points on one boot.
        852    5953  5948..5959     885   6026.8  charsiu   1.012
 ```
 
-🏁 **What this supports: two regimes.** charsiu leads by 1.09x to 1.28x below
+**What this supports: two regimes.** charsiu leads by 1.09x to 1.28x below
 about 250 of its own tokens, and from 302 up the two are level. 852 goes 8081
 (r393) -> 7016 (r408) -> 6818 (r410) -> 6328 -> 5953 -> 5905 (r413), so their 1.341x lead
 there is gone.
 
-⛔⛔ **WHAT IT DOES NOT SUPPORT IS "AHEAD AT EVERY LENGTH", and this list said
+**WHAT IT DOES NOT SUPPORT IS "AHEAD AT EVERY LENGTH", and this list said
 that for an hour before it was corrected.** Every point estimate favours
 charsiu, but a margin has to clear TWO things, not one:
 
@@ -903,14 +903,14 @@ charsiu, but a margin has to clear TWO things, not one:
     level   302  452  602  852
 ```
 
-⚠ The four changes behind it, each measured against its own control on this
+The four changes behind it, each measured against its own control on this
 board and each text identical to it: two head groups so the softmax runs
 during the scores fence (322 ms of layer at 852), the kv ladder's ceiling and
 its block copy (126), the deferred int4 accumulator gather (326), and the
 fence poll (76). `tests/board_text_all.sh` is 9 models 0 differing with the
 shipping defaults.
 
-⚠ Decode did not pay for it: 18.15 tok/s against 18.06 before the round, peak
+Decode did not pay for it: 18.15 tok/s against 18.06 before the round, peak
 1448 MB against 1449.
 
 ---
@@ -940,7 +940,7 @@ running at inference. Every rung is scored on both passages:
 is larger than charsiu's.** The size of it is an interval, 1.4x to 2.6x, and
 the paper should quote the interval and nothing narrower.
 
-⚠⚠ **SIX CELLS ARE NOT SIX INDEPENDENT SAMPLES AND MUST NOT BE WRITTEN AS
+**SIX CELLS ARE NOT SIX INDEPENDENT SAMPLES AND MUST NOT BE WRITTEN AS
 STATISTICAL STRENGTH.** The three subsets are NESTED: the 43 matrices are
 inside the 91, which are inside the 105, so the rungs share most of their
 weights and cannot disagree freely. The two passages are independent of each
@@ -948,7 +948,7 @@ other; the three rungs are not. What the table supports is "the direction did
 not reverse under either axis we varied", which is a robustness check, not six
 trials.
 
-⛔ **The ladder is NOT monotone and the earlier text saying so was one
+**The ladder is NOT monotone and the earlier text saying so was one
 passage.** On `long.txt` the ratio climbs with the subset, 1.85 to 2.00 to
 2.18, which is what "monotone" was read from. On `long2.txt` it does not:
 2.62, 1.42, 1.65, and the 43-matrix rung goes from the lowest of the three to
@@ -972,7 +972,7 @@ The asymmetry is real and points no particular way: from f16 charsiu is worse
 on one passage and better on the other. Report the f16 rows: they are the arm
 whose precondition holds. The Q8_0 interval is narrower for no good reason.
 
-⚠ `rho1` and `vendor43` are the SAME FILE, byte for byte, md5
+`rho1` and `vendor43` are the SAME FILE, byte for byte, md5
 `9d8e82952e96a6f14eeaa4b016704dde` (a BUILD PRODUCT, not an input, so it is
 deliberately not in section 7's list). That is the point of the rho = 1 subset
 rather than a second measurement of it: dividing the calibration out changes
@@ -1068,6 +1068,86 @@ Every quality figure recorded in this tree before 2026-09-11 is the first row.
 A reader reproducing today gets the second. Both are named by md5 in
 `tests/corpus/README.md`, and the file of record going forward is the one a
 reader will actually get.
+
+### The weight group, and the five models that do not get one
+
+A tensor is grouped only when the group width divides its K and is strictly
+narrower than it; npuquant falls back to one scale a row otherwise, and
+`llama_auto_kmax` pins the width at 1024 and only ever considers WIDENING.
+Counted with `CHARSIU_NPU_VERBOSE` on 2026-09-15:
+
+```
+  model             distinct K                       widest width dividing all
+  Llama-3.2-1B      2048 8192                        1024   grouped as shipped
+  Phi-3.5-mini      3072 8192                        1024   grouped as shipped
+  SmolLM2-1.7B      2048 8192                        1024   grouped as shipped
+  Qwen3-0.6B        1024 2048 3072                    512
+  tinyllama-1.1b    2048 5632                         512
+  Qwen2.5-1.5B      1536 8960                         256
+  gemma-3-1b        1024 1152 6912                    128
+  gemma-4-E2B       256 1536 2048 4096 6144 12288     128
+```
+
+Three of eight are fully grouped at the shipping width. The rest carry tensors
+on the per-row path, and gemma-3-1b carries all of them there.
+
+**What that costs gemma-3-1b, and what a narrower group returns.** Quality on
+the desk over 511 scored positions of `tests/corpus/long.txt`; decode on the
+board, boot afe55e04, 594 MHz, performance governor, three readings an arm,
+medians, spreads under 0.2%.
+
+```
+  group  1152->      6912->     decode t/s        ppl
+  1024   ungrouped   ungrouped   20.10         108.7063   ships
+   576   2 groups    12 groups   20.70  +3.0%   79.2824   -27.1%
+   384   3 groups    18 groups   18.69  -7.0%   65.4765   -39.8%
+   192   6 groups    36 groups   14.68 -27.0%   57.1298   -47.4%
+   128   9 groups    54 groups    -             47.0269   -56.7%
+  the file's own q4_0 on the CPU, no charsiu requantisation:  49.0532
+```
+
+576 is not a trade. It is faster AND better than the shipping default, on a
+model the shipping default groups nowhere.
+
+**At 128, charsiu's four bits pass the gguf's own q4_0**: 47.0269 against
+49.0532. q4_0 is blocks of 32 with an fp16 scale, finer than anything in that
+table, and charsiu at 128 with an fp32 scale and the wsum correction still
+scores better. **One model, one corpus, one length. It is not a general claim**
+and the three sentences this pack requires of every quality figure apply to it
+unchanged.
+
+**It does not generalise as a constant.** The same 1024 against 512 costs
+tinyllama 11.7% of decode and Qwen3-0.6B 5.5%, and both already have grouped
+tensors at 1024. gemma-3-1b is the only one of the three with nothing to get
+out of, and the only one that gains. What this asks for is a per model
+decision, which is what `llama_auto_kmax` already is; it only ever looks
+upward.
+
+**And the trade cannot be engineered away.** A narrow group forces a narrow
+slice, because one dispatch cannot cover K wider than one group: the hardware
+returns one accumulator per output channel per slice (`fo[j]`,
+`src/npudev.c:3818`) and the CPU multiplies it by that slice's single scale
+afterwards, so the whole slice K is summed before any scale exists to apply.
+The NPU's own per-channel multiplier is per OUTPUT channel, not per K range.
+So the cost of a narrower group is exactly the cost of more slices, in every
+version of this.
+
+**The shipping arm IS grouping, and that was checked rather than assumed.** A
+group width of 99991 divides nothing, so nothing groups, and Llama-3.2-1B reads
+50.7838 there against 41.2763 at the shipping 1024.
+
+**And it does not survive a different length either.** Every number in that
+table is `-n 300`, which scores 299 positions. `charsiu_ppl` with no `-n`
+scores 511, and on the same file, the same corpus and the same grouped arm that
+reads 33.8071 at 300 it reads **41.2763** at 511. That is near enough to the
+ungrouped 41.5289 above to be mistaken for it, and it was, for about an hour on
+2026-09-15: a run of the board regression came back 41.2777, which looked like
+the grouped arm having silently stopped grouping. It had not. The tool prints
+the count on every line it emits, so the tell is always on screen -- "over 299
+scored positions of 300 tokens" against "over 511 scored positions of 512" --
+but two numbers that happen to land four tenths of a percent apart will not
+announce that they are different measurements. A perplexity belongs to the
+model file, the corpus file AND the length.
 
 "Board and host agree to 0.3%" in the earlier AWQ round was two different files
 landing near each other. It is not evidence of anything.
@@ -1225,7 +1305,7 @@ md5sum tests/corpus/long.txt tests/corpus/long2.txt
 
 # quality, the CPU reference at the group the board runs.
 #
-# ⚠⚠ CHECK THE md5 FIRST AND DO NOT SKIP IT. This number belongs to the file,
+# CHECK THE md5 FIRST AND DO NOT SKIP IT. This number belongs to the file,
 # not to the path. In a fresh clone the curl above puts 48ff0243 at that path
 # and it reads 34.2425. In THIS project's working tree the same path is a
 # SYMLINK into rootfs-overlay, which is the older c82c0340 the board image
@@ -1240,7 +1320,7 @@ CHARSIU_NPU=0 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 \
 #   48ff0243  ->  34.2425     the model of record, what a reader gets
 #   c82c0340  ->  33.8071     the board image's older copy, this tree's symlink
 
-# the vendor's own weights, scored. ⚠ CHARSIU_RKLLM_REF IS NOT OPTIONAL: the
+# the vendor's own weights, scored. CHARSIU_RKLLM_REF IS NOT OPTIONAL: the
 # default reference is Q8_0, and the round of record is from the f16 original,
 # because the vendor quantised the ORIGINAL weights. Without it every
 # percentage in section 2 shifts. Each rung scores both passages from one
@@ -1268,7 +1348,7 @@ Not evidence; a list of places the prose is now wrong, kept here because the
 three nested subsets". It is now a direction with an interval, 1.4x to 2.6x.
 Every place that writes 2.0-2.4 has to move: abstract, introduction, results.
 
-⛔ **And "monotone" was load-bearing, not decorative.** It was one of the
+**And "monotone" was load-bearing, not decorative.** It was one of the
 arguments that the ladder measured a real difference between quantisers rather
 than an artefact of the reconstruction: damage that grows with the subset looks
 like a property of the weights. That argument needs a different support now.
@@ -1282,7 +1362,7 @@ at 594 MHz against a measurement of their runtime. They do not agree on which
 side leads TTFT, for the tokeniser reason 1b gives. They must not be merged
 into one table.
 
-⛔ **The ordering argument for putting quality first no longer holds alone.**
+**The ordering argument for putting quality first no longer holds alone.**
 The vendor-quality comparison led the results because it was the only one where
 both sides ran here. Section 1b is now also that. If quality still leads it
 needs a different reason -- the obvious one being that it is the comparison
@@ -1291,7 +1371,7 @@ runtime is ordinary.
 
 **Anything saying their runtime has never been run here.** It has, in 1b.
 
-⭐ **Section 2 can be stated more strongly than it has been.** It has read as a
+**Section 2 can be stated more strongly than it has been.** It has read as a
 fallback -- "we could not ask their runtime, so we reconstructed". r398 tried
 all three routes into their runtime and all three refuse, one of them by
 returning the null result without an error. So the reconstruction is not a
@@ -1307,21 +1387,21 @@ concession survives for prefill, where both runtimes gain more from the CPU at
 a short prompt than at a long one, so any TTFT claim has to name the governor
 AND the prompt length it was measured under.
 
-⛔ **The paper's prefill claim has to be rebuilt from 1b-ii, and its sign
+**The paper's prefill claim has to be rebuilt from 1b-ii, and its sign
 changes.** The 1.23x came from fitting a line through two prompt lengths a
 side; the curves say our per-token linear rate is 12% BETTER than theirs, and
 that we lose on the fixed cost (4x measured directly at the short end) and on
-the attention scaling. ⛔ The "(6x)" that stood here is the same withdrawn
+the attention scaling. The "(6x)" that stood here is the same withdrawn
 factor 1b-ii refutes two pages earlier -- the fit does not determine it -- and
 this sentence was restating it as a finding. Anywhere the prose says the
 vendor's prefill is faster per token, or that the two fixed costs are within
 8%, is wrong rather than unsupported.
 
-⭐ **And there is a new claim worth making that the old framing could not
+**And there is a new claim worth making that the old framing could not
 reach**: "who starts a prompt faster" has a measured answer that depends on the
 prompt, not a ratio.
 
-⚠ The shape of that answer has since moved and this paragraph used to give the
+The shape of that answer has since moved and this paragraph used to give the
 old one. When it was written the crossover sat at about 248 of our tokens with
 the vendor ahead above it. 1k is the current ladder: charsiu leads by 1.09x to
 1.28x below about 250 tokens and the two are LEVEL from 302 up, so what depends
@@ -1329,7 +1409,7 @@ on the prompt is now the size of our lead, not who has it.
 
 ## 8. What is not supported
 
-⛔ **"39% of a decode token is dispatch." WITHDRAWN r412, and it was never a
+**"39% of a decode token is dispatch." WITHDRAWN r412, and it was never a
 token share.** It is `(fix + tsk) / busy_us` = (11.5 + 7.4) / 48.0, a share of
 the decode HARDWARE PATH; against the 58.4 ms token in the same paragraph the
 same numerator is 32%. Four things are wrong with quoting it:
@@ -1348,12 +1428,12 @@ same numerator is 32%. Four things are wrong with quoting it:
   tree and the two rocket patches, so even the corrected 26% describes a
   runtime that no longer exists.
 
-⚠ **Do not confuse it with a different number that is NOT withdrawn**: `130 us
+**Do not confuse it with a different number that is NOT withdrawn**: `130 us
 x 150 calls = 19.5 ms of a 51.7 ms token, 38%` is Qwen3, 2026-09-02, and its
 denominator is a real wall clock token. That one is dated rather than wrong,
 and its per call term has also moved.
 
-🏁 **And the ceiling on removing the IOMMU half of it is 100%, measured, with
+**And the ceiling on removing the IOMMU half of it is 100%, measured, with
 no kernel change.** r413 §7 reasoned the other way -- an IOMMU domain belongs to
 an open DRM file, charsiu opens accel0 twice, rocket gives each file one
 scheduler entity spanning all cores, so "either domain can land on either core"
@@ -1377,13 +1457,13 @@ device 0 and so the first slice of any call always lands there. Core 0 therefore
 always carries domain 0 and core 1 always carries domain 1, and neither ever
 changes. Every per-job attach and detach in the run is removable.
 
-⚠ **This is a MODEL of the scheduler, not a reading from it.** It is arithmetic
+**This is a MODEL of the scheduler, not a reading from it.** It is arithmetic
 over charsiu's submit shape plus `pick_best`'s tie rule, and the both-devices
 case is a race rather than a guarantee: if device 0's job retires between the
 two ioctls, file 1 ties onto core 0 as well. Core 0's figure is a lower bound.
 What it settles is r413's claim that the saving was not available -- it is.
 
-🏁 **The withdrawn fit is no longer executing, as of round 414.**
+**The withdrawn fit is no longer executing, as of round 414.**
 `DEAL_US_TASK` in npudev.c decides which core every slice lands on, and it held
 the refuted 36.8 for eight days because there was no way to try the other value
 without rebuilding, and two binaries is the one thing a paired arm must not be.
@@ -1402,7 +1482,7 @@ both arms and all four repeats. The per task term does not decide this deal on
 these shapes; the megabyte term does. The default is now the measured 4.81,
 which is what `npu_job_cost` and `charsiu_shapes` have used since round 155.
 
-⚠ **Three models, not nine.** That is what the table says and all it says.
+**Three models, not nine.** That is what the table says and all it says.
 
 The vendor at the frequency their published figures were taken at. Their
 runtime HAS now been run here -- 1b at 594 MHz on both sides, 1g across the
@@ -1425,7 +1505,7 @@ because it moves both columns by the same 22%.
 ANY single number for the prefill gap, and in particular the 1.23x this list
 used to give -- 1b-ii now has both curves and the answer is a CROSSOVER at
 about 248 of our tokens, with our per-token linear rate 12% BETTER than theirs
-and their fixed cost 4x smaller. ⚠ Their quadratic term is smaller too and the
+and their fixed cost 4x smaller. Their quadratic term is smaller too and the
 6x that used to stand here is withdrawn: the fit does not determine it. The 1.23x was two
 points a side over two different token ranges and it pointed the wrong way.
 What cannot be quoted as one number: the matched-text ratio changes sign with

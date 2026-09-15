@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0
 # `charsiu rm NAME...`
 #
-# ⚠ It will not delete the model the config is pointing at without being told
+# It will not delete the model the config is pointing at without being told
 # twice. Removing the thing the next `charsiu` was going to run, silently, is
 # not a convenience.
 set -eu

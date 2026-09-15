@@ -15,13 +15,13 @@
 #   sh charsiu-install.sh --no-demo    do not offer the one-sentence run at the end
 #   CHARSIU_PLAIN=1 ...                no full-screen dialogs
 #
-# ⚠ TWO CHANNELS. stable is the runtime and is what a fresh install gets. dev
+# TWO CHANNELS. stable is the runtime and is what a fresh install gets. dev
 # adds npu_gemm_test, charsiu_matmul and bench_batch, which exist to ask the
 # hardware questions and have wedged the block doing it, and tracks the branch
 # the work happens on. `charsiu update dev` switches later; nothing here needs
 # reinstalling to change channel.
 #
-# ⚠⚠ RK3576 NPU SUPPORT IS NOT UPSTREAM, SO NO STOCK KERNEL CAN RUN THIS.
+# RK3576 NPU SUPPORT IS NOT UPSTREAM, SO NO STOCK KERNEL CAN RUN THIS.
 #
 # The rocket driver is mainline for RK3588. The commit adding
 # `rockchip,rk3576-rknn-core` is ours, from 2026-08-06, and is not reachable
@@ -30,10 +30,10 @@
 # check was a dead end wearing a helpful expression. It now OFFERS A KERNEL:
 # CI builds linux-next plus the v9 series and publishes it, and this fetches it.
 #
-# ⚠ AND IT KEEPS THE ONE ALREADY THERE. The new kernel becomes the default boot
+# AND IT KEEPS THE ONE ALREADY THERE. The new kernel becomes the default boot
 # entry and the previous one stays on the card as a second entry, because a
 # kernel that does not boot is not a thing to discover with no way back.
-# ⚠⚠ THE WHOLE SCRIPT IS ONE BRACE GROUP, ON PURPOSE.
+# THE WHOLE SCRIPT IS ONE BRACE GROUP, ON PURPOSE.
 #
 # `sh` reads a piped script in chunks and runs each one as it arrives. This
 # script reattaches the terminal with `exec < /dev/tty`, which CLOSES the pipe
@@ -52,10 +52,10 @@ set -eu
 # BOOTSTRAP: the `curl ... | sh` case, before anything else can need it.
 # ---------------------------------------------------------------------------
 #
-# ⚠ Read before the terminal check, which branches on it.
+# Read before the terminal check, which branches on it.
 _BOOT_DRY=0; _BOOT_NOTTY=0
 for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
-# ⚠ THE CHANNEL HAS TO BE KNOWN BEFORE THE SOURCE IS FETCHED, because it
+# THE CHANNEL HAS TO BE KNOWN BEFORE THE SOURCE IS FETCHED, because it
 # decides which ref to fetch. The full argument parsing happens much later, in
 # the tree this is about to download.
 _BOOT_REF=stable
@@ -67,12 +67,12 @@ esac; done
 CHARSIU_SRC_REPO="${CHARSIU_SRC_REPO:-https://github.com/gahingwoo/charsiu}"
 CHARSIU_SELF_URL="https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh"
 
-# ⚠⚠ PIPED IN, STDIN IS THE SCRIPT ITSELF. Every `read` would eat the rest of
+# PIPED IN, STDIN IS THE SCRIPT ITSELF. Every `read` would eat the rest of
 # this file, and a wizard that asks questions cannot run that way. Reattach the
 # terminal first, and if there is not one, say so rather than silently
 # consuming ourselves.
 if [ ! -t 0 ]; then
-	# ⚠ A FAILED REDIRECTION ON `exec` KILLS THE SHELL. Testing with
+	# A FAILED REDIRECTION ON `exec` KILLS THE SHELL. Testing with
 	# `exec < /dev/tty` meant that when there was no controlling terminal the
 	# script exited silently instead of saying why. And `[ -r /dev/tty ]`
 	# is not the test either: the device node can be readable while opening
@@ -80,7 +80,7 @@ if [ ! -t 0 ]; then
 	if ( : < /dev/tty ) 2>/dev/null; then
 		exec < /dev/tty
 	elif [ "$_BOOT_DRY" = 1 ]; then
-		# ⚠ A REHEARSAL NEEDS NO CONSENT. It writes nothing, so refusing to
+		# A REHEARSAL NEEDS NO CONSENT. It writes nothing, so refusing to
 		# run for want of a terminal would be refusing the one thing asked
 		# for, and piping this into a container is exactly how it gets
 		# rehearsed. Answer every question with yes and carry on.
@@ -98,7 +98,7 @@ if [ ! -t 0 ]; then
 	fi
 fi
 
-# ⚠ THE TUI LAYER DOES NOT EXIST YET. It lives in the source, which is the very
+# THE TUI LAYER DOES NOT EXIST YET. It lives in the source, which is the very
 # thing this stage is here to fetch, so the bootstrap cannot source it. But
 # whiptail may well be installed already, and a wizard that opens with a bare
 # shell prompt and only becomes a dialog later is worse than one that is a
@@ -118,7 +118,7 @@ _boot_yesno() {
 	fi
 }
 
-# ⚠ Piped in, "$(dirname "$0")" is meaningless: there is no tree beside us.
+# Piped in, "$(dirname "$0")" is meaningless: there is no tree beside us.
 # Anything that needs the source (the build, the scripts, the TUI layer) has to
 # come from somewhere, so fetch it and hand over to the copy that has neighbours.
 _boot_src=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || echo "")
@@ -127,7 +127,7 @@ if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
 	DIR="${CHARSIU_DIR:-}"
 	if [ -z "$DIR" ]; then
 		if [ "$_BOOT_DRY" = 1 ]; then
-			# ⚠ A REHEARSAL THAT WRITES 900 KB INTO /opt IS NOT A
+			# A REHEARSAL THAT WRITES 900 KB INTO /opt IS NOT A
 			# REHEARSAL. The dialog says nothing is written or
 			# downloaded, and on a real Debian this stage was quietly
 			# doing both, into a root-owned directory, before the
@@ -138,7 +138,7 @@ if [ -z "$_boot_src" ] || [ ! -f "$_boot_src/Makefile" ] || \
 		elif [ "$(id -u)" -eq 0 ]; then
 			DIR=/opt/charsiu/src
 		else
-			# ⚠ HAVING sudo IS NOT A REASON TO PUT THE SOURCE WHERE YOU
+			# HAVING sudo IS NOT A REASON TO PUT THE SOURCE WHERE YOU
 			# CANNOT BUILD. This used to fetch into /opt/charsiu/src with
 			# sudo, leaving a root-owned tree, and then ran `make` as the
 			# user, which could not even create build/. On the board that
@@ -160,7 +160,7 @@ It will be fetched into
 Continue?" || { echo "  stopped."; exit 1; }
 	fi
 
-	# ⚠ `-w` ON A PATH THAT DOES NOT EXIST YET IS ALWAYS FALSE. This asked for
+	# `-w` ON A PATH THAT DOES NOT EXIST YET IS ALWAYS FALSE. This asked for
 	# a sudo password to create a directory inside the user's own home, which
 	# on the board arrived as a bare "[sudo] password for" right after a
 	# dialog had cleared the screen. Try to make it first; only a real failure
@@ -171,10 +171,10 @@ Continue?" || { echo "  stopped."; exit 1; }
 	fi
 	if [ -d "$DIR/.git" ]; then
 		printf '  updating %s (%s)\n' "$DIR" "$_BOOT_REF"
-		# ⚠ fetch and move to the ref rather than pull, or a tree that
+		# fetch and move to the ref rather than pull, or a tree that
 		# is on one branch stays there however stable was asked for.
 		#
-		# ⚠⚠ AND A FAILED FETCH USED TO BE SWALLOWED BY `|| true`, so a
+		# AND A FAILED FETCH USED TO BE SWALLOWED BY `|| true`, so a
 		# ref that does not exist meant building whatever was already in
 		# the directory and saying "updating" while doing it. The
 		# development branch was renamed from main to dev on 2026-08-28
@@ -196,7 +196,7 @@ Continue?" || { echo "  stopped."; exit 1; }
 			"$CHARSIU_SRC_REPO" "$DIR" \
 			|| { echo "  clone failed: $CHARSIU_SRC_REPO ($_BOOT_REF)" >&2; exit 1; }
 	else
-		# ⚠ no git is a normal state on a minimal rootfs, and a tarball
+		# no git is a normal state on a minimal rootfs, and a tarball
 		# needs neither git nor a key.
 		printf '  git is not installed; taking a tarball instead\n'
 		$_sudo mkdir -p "$DIR"
@@ -215,7 +215,7 @@ unset _boot_src
 # THE DIALOG ITSELF
 # ---------------------------------------------------------------------------
 #
-# ⚠ WITHOUT whiptail EVERY PAGE SILENTLY BECOMES A SHELL PROMPT. charsiu-tui.sh
+# WITHOUT whiptail EVERY PAGE SILENTLY BECOMES A SHELL PROMPT. charsiu-tui.sh
 # falls back on purpose, because a serial console with no TERM has to work, but
 # a fresh Debian or Ubuntu has no whiptail and falling back there is not a
 # feature, it is the wizard quietly not being one. So ask, once, and install it.
@@ -230,7 +230,7 @@ if ! command -v whiptail >/dev/null 2>&1 && [ -z "${CHARSIU_PLAIN:-}" ]; then
 	elif command -v pacman  >/dev/null 2>&1; then _pm="pacman -S --noconfirm libnewt"
 	fi
 	if [ -n "$_pm" ]; then
-		# ⚠ THE ONE THING A DRY RUN DOES FOR REAL, AND WHY. whiptail is the
+		# THE ONE THING A DRY RUN DOES FOR REAL, AND WHY. whiptail is the
 		# MEDIUM, not the content. Deferring it made the rehearsal run
 		# entirely in text, so it rehearsed everything except the interface
 		# it exists to show. A dry run that cannot draw the wizard is not
@@ -243,7 +243,7 @@ so every page would be a plain shell prompt instead.
 Answering no is fine. Everything still works, in text."
 		[ "$_BOOT_DRY" = 1 ] && _why="$_why
 
-⚠ This is the ONE thing this dry run would actually do. Without it
+This is the ONE thing this dry run would actually do. Without it
 there is no dialog to show you, and the rehearsal would be text."
 		if [ "$_BOOT_NOTTY" = 1 ]; then
 			printf '\n  no terminal, so whiptail is not installed and this runs in text\n'
@@ -276,7 +276,7 @@ while [ $# -gt 0 ]; do
 	--no-kernel) DOKERNEL=no; shift ;;
 	--no-model)  DOMODEL=0; shift ;;
 	--no-build)  DOBUILD=0; shift ;;
-	# ⚠ --yes IS THE SAME SWITCH THE DRY RUN USES WITHOUT A TERMINAL, and it
+	# --yes IS THE SAME SWITCH THE DRY RUN USES WITHOUT A TERMINAL, and it
 	# answers EVERY question yes, the kernel step included; charsiu update
 	# passes it together with --no-kernel, so there the only questions left
 	# are "install the compiler" and the demo, and it takes --no-demo too.
@@ -297,7 +297,7 @@ while [ $# -gt 0 ]; do
 done
 
 SRC=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || echo /opt/charsiu)
-# ⚠ The TUI layer has to be findable from every layout this ships in: a source
+# The TUI layer has to be findable from every layout this ships in: a source
 # tree, a real install under /opt/charsiu, and a staged --prefix install where
 # /opt is not at the root. CHARSIU_LIB names it outright; the rest are guesses
 # in the order they are likely to be right.
@@ -311,9 +311,9 @@ done
 command -v ui_msg >/dev/null 2>&1 || { echo "charsiu-tui.sh not found" >&2; exit 1; }
 CTUI_TITLE="charsiu setup"
 
-# ⚠ --prefix / gives //opt/charsiu without this. Harmless to the kernel and
+# --prefix / gives //opt/charsiu without this. Harmless to the kernel and
 # ugly in a dry run's summary, which is the one place people read these paths.
-# ⚠ Two different needs. For BUILDING paths the trailing slash has to go, and
+# Two different needs. For BUILDING paths the trailing slash has to go, and
 # "/" trimmed to "" is exactly right, because "$PREFIX/opt/..." then gives /opt/...
 # rather than //opt/... . For SHOWING it, the empty string reads as a blank.
 PREFIX=$(printf '%s' "$PREFIX" | sed 's|/*$||')
@@ -321,7 +321,7 @@ PDISP="${PREFIX:-/}"
 BIN="$PREFIX/opt/charsiu"
 SBIN="$PREFIX/usr/bin"
 ETC="$PREFIX/etc/charsiu"
-# ⚠ THE MODELS DIRECTORY MUST NOT NEED A CHOWN AT ALL. Under /opt it lands
+# THE MODELS DIRECTORY MUST NOT NEED A CHOWN AT ALL. Under /opt it lands
 # root-owned, and then charsiu-get, which nobody should have to run as root to
 # download a file, fails at the last step, after the download. A user's models
 # belong in the user's own directory; only a root install puts them in /opt.
@@ -343,7 +343,7 @@ writable "$BIN" && writable "$SBIN" && writable "$ETC" || NEEDROOT=1
 SUDO=""
 if [ "$NEEDROOT" = 1 ] && [ "$(id -u)" -ne 0 ]; then
 	SUDO=$(command -v sudo || true)
-	# ⚠ A DRY RUN WRITES NOTHING, so it has no business demanding root. This
+	# A DRY RUN WRITES NOTHING, so it has no business demanding root. This
 	# refused to even rehearse as an ordinary user, which is the one case a
 	# rehearsal is most wanted.
 	if [ -z "$SUDO" ] && [ "$DRY" = 0 ]; then
@@ -351,7 +351,7 @@ if [ "$NEEDROOT" = 1 ] && [ "$(id -u)" -ne 0 ]; then
 	fi
 	[ -z "$SUDO" ] && ui_warn "not root and no sudo: a real run would need one"
 fi
-# ⚠ A BARE "[sudo] password for ..." APPEARING AFTER A DIALOG HAS CLEARED THE
+# A BARE "[sudo] password for ..." APPEARING AFTER A DIALOG HAS CLEARED THE
 # SCREEN LOOKS LIKE THE INSTALLER BROKE. Ask once, deliberately, with the
 # reason still on screen, and let sudo's own timestamp cover everything after.
 if [ -n "$SUDO" ] && [ "$DRY" = 0 ] && ! $SUDO -n true 2>/dev/null; then
@@ -363,7 +363,7 @@ needs root, so sudo will ask for your password on the next screen.
 Nothing else in this install asks for it."
 	$SUDO -v || die "sudo was declined, so nothing was installed."
 fi
-# ⚠ EVERY MUTATION GOES THROUGH THIS. --dry-run prints the command instead of
+# EVERY MUTATION GOES THROUGH THIS. --dry-run prints the command instead of
 # running it, so the difference between a rehearsal and the real thing is one
 # branch in one place rather than a flag threaded through twenty call sites --
 # which is how a dry run ends up writing something anyway.
@@ -406,14 +406,14 @@ if [ "$UNINSTALL" = 1 ]; then
 The models in $MODELS and your $ETC/config.ini are LEFT ALONE.
 A kernel this installed is NOT removed either. Pick the previous
 entry in the boot menu instead, then remove it by hand." defaultno || exit 0
-	# ⚠⚠ REMOVE WHAT IS THERE, NOT WHAT THE LIST SAID WHEN IT WAS WRITTEN --
+	# REMOVE WHAT IS THERE, NOT WHAT THE LIST SAID WHEN IT WAS WRITTEN --
 	# which is what the sentence that used to be here promised and the six
 	# hardcoded names underneath it did not do. It missed npu_gemm_test,
 	# charsiu_matmul, prefill_control.sh, charsiu_vision, charsiu_clip and
 	# charsiu_whisper, so an uninstall left most of a dev install behind and
 	# said "Removed."
 	#
-	# ⚠ FILES ONLY, AND NOT RECURSIVELY. $BIN is /opt/charsiu and the
+	# FILES ONLY, AND NOT RECURSIVELY. $BIN is /opt/charsiu and the
 	# default models directory is /opt/charsiu/models, which the message
 	# above promises to leave alone.
 	as_root rm -f "$SBIN/charsiu"
@@ -462,7 +462,7 @@ fi
 # THE KERNEL
 # ---------------------------------------------------------------------------
 install_kernel() {
-	# ⚠ THE ONE THING NOT TO GUESS. If this board does not boot through
+	# THE ONE THING NOT TO GUESS. If this board does not boot through
 	# extlinux, writing an extlinux.conf achieves nothing at best and
 	# confuses the next person at worst. Say so and leave the board alone.
 	# CHARSIU_BOOTDIR names it outright, for a boot partition mounted
@@ -472,7 +472,7 @@ install_kernel() {
 		if [ -f "$b/extlinux/extlinux.conf" ]; then
 			BOOTDIR="$b"; BOOTKIND=extlinux; break
 		fi
-		# ⚠ ARMBIAN IS THE OTHER LAYOUT WORTH KNOWING, and it is what most
+		# ARMBIAN IS THE OTHER LAYOUT WORTH KNOWING, and it is what most
 		# of these boards actually run: boot.scr reads armbianEnv.txt and
 		# loads ${prefix}Image and dtb/${fdtfile}. Since no distro kernel
 		# binds this NPU, refusing here left the one thing charsiu needs
@@ -493,7 +493,7 @@ Install a kernel built from the series by hand instead:
 		return 1
 	fi
 
-	# ⚠ A NAMED RELEASE, FOR A TEST KERNEL. CHARSIU_KERNEL_TAG=<tag> asks for
+	# A NAMED RELEASE, FOR A TEST KERNEL. CHARSIU_KERNEL_TAG=<tag> asks for
 	# that release instead of the latest one, which is how a pre-release --
 	# something `releases/latest` never returns -- gets installed on purpose
 	# and only on purpose. The board scripts use it to put a kernel with
@@ -537,11 +537,11 @@ The kernel now on this board is kept as a SECOND boot entry. The new
 one becomes the default; if it misbehaves, interrupt the boot and
 pick the old one.
 
-⚠ This rewrites $BOOTDIR/extlinux/extlinux.conf. The kernel command
+This rewrites $BOOTDIR/extlinux/extlinux.conf. The kernel command
 line already in it is carried over unchanged. root=, console= and
 the rest are board-specific and are not re-invented here." || return 1
 	else
-		# ⚠ SAY THE PART THAT IS WORSE HERE. boot.scr loads one Image and
+		# SAY THE PART THAT IS WORSE HERE. boot.scr loads one Image and
 		# there is no menu, so unlike extlinux the old kernel cannot be
 		# offered at boot. It is kept as a file, and putting it back needs
 		# either a system that still boots or the card in another machine.
@@ -555,7 +555,7 @@ the rest are board-specific and are not re-invented here." || return 1
 The kernel now on this board is copied aside as Image.previous, and
 the dtb likewise.
 
-⚠ THIS LAYOUT HAS NO BOOT MENU. boot.scr loads one Image, so the old
+THIS LAYOUT HAS NO BOOT MENU. boot.scr loads one Image, so the old
 kernel cannot be offered at boot the way extlinux can. If the new one
 does not boot, put the old file back:
 
@@ -564,7 +564,7 @@ does not boot, put the old file back:
 which needs a system that still boots, or this card in another
 machine. Have a way to do that before saying yes.
 
-⚠ armbianEnv.txt is NOT touched. root=, console= and the rest stay
+armbianEnv.txt is NOT touched. root=, console= and the rest stay
 exactly as Armbian set them." || return 1
 	fi
 
@@ -596,7 +596,7 @@ exactly as Armbian set them." || return 1
 		fetch "$u" "$TMP/$(basename "$u")" || { ui_msg "download failed: $u"; return 1; }
 	done
 
-	# ⚠ Verify before touching /boot. A truncated Image that overwrites a
+	# Verify before touching /boot. A truncated Image that overwrites a
 	# working one is the exact failure this whole step is meant to avoid.
 	if [ -n "$SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
 		( cd "$TMP" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
@@ -613,7 +613,7 @@ exactly as Armbian set them." || return 1
 			"$BOOTDIR/extlinux/extlinux.conf")
 		[ -n "$APPEND" ] || { ui_msg "Could not read the current kernel command line. Nothing was written."; return 1; }
 	else
-		# ⚠ WRITE THE DTB WHERE fdtfile ALREADY POINTS, and do not edit
+		# WRITE THE DTB WHERE fdtfile ALREADY POINTS, and do not edit
 		# armbianEnv.txt. boot.scr loads dtb/${fdtfile}; putting ours at a
 		# name of our own choosing would load the OLD one and look like the
 		# new kernel had simply failed.
@@ -634,11 +634,11 @@ Armbian layout after all. Nothing was written."
 		APPEND=""
 	fi
 
-	# ⚠ Do not clobber a good backup with a bad one. If .previous already
+	# Do not clobber a good backup with a bad one. If .previous already
 	# exists, the kernel currently in place may itself be one of ours from a
 	# previous run, so keep the ORIGINAL as the fallback.
 	if [ ! -f "$BOOTDIR/Image.previous" ] && [ -e "$BOOTDIR/Image" ]; then
-		# ⚠ `cp` FOLLOWS THE SYMLINK ON PURPOSE. On Armbian /boot/Image is
+		# `cp` FOLLOWS THE SYMLINK ON PURPOSE. On Armbian /boot/Image is
 		# usually a link to vmlinuz-<version>, and copying the link itself
 		# would leave a fallback that points at whatever replaces the
 		# target later. -L takes the bytes.
@@ -649,7 +649,7 @@ Armbian layout after all. Nothing was written."
 		ui_info "Image.previous already exists and was left as it is"
 	fi
 
-	# ⚠ REMOVE BEFORE COPYING. Writing through a symlink would overwrite
+	# REMOVE BEFORE COPYING. Writing through a symlink would overwrite
 	# whatever it points at, which on Armbian is the distro's own
 	# vmlinuz-<version> and is not ours to replace.
 	TAGREL=$(strings "$TMP/Image" 2>/dev/null | sed -n 's/^Linux version \([^ ]*\).*/\1/p' | head -1)
@@ -658,7 +658,7 @@ Armbian layout after all. Nothing was written."
 	as_root rm -f "$DTBDEST"
 	as_root cp "$TMP/$DTBNAME" "$DTBDEST"
 	if [ -n "$MODS" ]; then
-		# ⚠⚠ NEVER `tar -C /`. Armbian is merged-usr: /lib is a SYMLINK to
+		# NEVER `tar -C /`. Armbian is merged-usr: /lib is a SYMLINK to
 		# usr/lib, and GNU tar, extracting a `lib/` directory member over
 		# it, deletes the symlink and makes a real directory. Every
 		# dynamically linked program then fails to exec -- the loader is
@@ -677,7 +677,7 @@ Armbian layout after all. Nothing was written."
 			as_root mkdir -p /lib/modules
 			as_root cp -a "$MODDIR" "/lib/modules/$(basename "$MODDIR")"
 		fi
-		# ⚠ MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD, and neither
+		# MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD, and neither
 		# layout was running it. The version is whatever the tarball says,
 		# not `uname -r`: the running kernel is still the old one.
 		KVER=$(tar tzf "$TMP/$(basename "$MODS")" \
@@ -735,7 +735,7 @@ Reboot, then run this again to finish the userspace."
   dtb        $DTBDEST
   fallback   $BOOTDIR/Image.previous
 
-⚠ There is no boot menu on this layout. If it does not come back,
+There is no boot menu on this layout. If it does not come back,
 put the old kernel back with
 
   cp $BOOTDIR/Image.previous $BOOTDIR/Image
@@ -786,7 +786,7 @@ fi
 # USERSPACE
 # ---------------------------------------------------------------------------
 if [ "$DOBUILD" = 1 ]; then
-	# ⚠ A DRY RUN MUST NOT STOP AT A MISSING TOOL. Finding out what is absent
+	# A DRY RUN MUST NOT STOP AT A MISSING TOOL. Finding out what is absent
 	# is most of the reason to rehearse. Dying on the first gap shows one
 	# problem where the run could have shown all of them.
 	miss=""
@@ -794,7 +794,7 @@ if [ "$DOBUILD" = 1 ]; then
 	{ command -v cc || command -v gcc; } >/dev/null 2>&1 || miss="$miss a-C-compiler"
 	[ -f "$SRC/Makefile" ] || miss="$miss the-charsiu-source"
 	if [ -n "$miss" ]; then
-		# ⚠ A STOCK DEBIAN HAS NO COMPILER. This is not an edge case, it is
+		# A STOCK DEBIAN HAS NO COMPILER. This is not an edge case, it is
 		# what every `curl ... | sh` into a fresh install hits, and stopping
 		# here left the reader to work out the package name themselves.
 		# Offer it the same way whiptail is offered at the bootstrap.
@@ -825,7 +825,7 @@ Install it now?
 			ui_note "installing $_pmname..."
 			command -v apt-get >/dev/null 2>&1 && \
 				as_root apt-get update -qq >/dev/null 2>&1 || true
-			# ⚠ SWALLOWING APT'S OUTPUT LEAVES "it failed" AND NOTHING TO ACT
+			# SWALLOWING APT'S OUTPUT LEAVES "it failed" AND NOTHING TO ACT
 			# ON. It fails for ordinary reasons (no network, a held
 			# package, another apt holding the lock) and each one has a
 			# different fix, so keep the last lines and show them.
@@ -850,7 +850,7 @@ if [ "$DOBUILD" = 1 ]; then
 	if [ "$DRY" = 1 ]; then
 		would "make all   (in $SRC)"
 	else
-		# ⚠ A BUILD IS THE LONGEST SILENT STRETCH OF THE WHOLE INSTALL, and
+		# A BUILD IS THE LONGEST SILENT STRETCH OF THE WHOLE INSTALL, and
 		# it used to print one line and then nothing for minutes. Drive a
 		# gauge off the binaries as they actually appear in build/, which is
 		# a real measure rather than an animation.
@@ -874,7 +874,7 @@ if [ "$DOBUILD" = 1 ]; then
 
 This is C, not a download: a minute or two on a board."
 		if ! wait "$_mpid"; then
-			# ⚠ `>/dev/null 2>&1` ON THE BUILD MEANT THE ONE MESSAGE THAT
+			# `>/dev/null 2>&1` ON THE BUILD MEANT THE ONE MESSAGE THAT
 			# COULD HAVE EXPLAINED IT WAS THROWN AWAY, and the board only
 			# ever said "the build failed".
 			printf '\n%s\n' "$(tail -n 12 "$BLOG")" >&2
@@ -892,7 +892,7 @@ Run 'make all' in $SRC to see it live."
 fi
 RUNBIN="$SRC/build/charsiu_run"; CHKBIN="$SRC/build/charsiu_check"
 if [ ! -x "$RUNBIN" ]; then
-	# ⚠ In a dry run the build did not happen, so the binary legitimately is
+	# In a dry run the build did not happen, so the binary legitimately is
 	# not there yet. Saying so is useful; dying is not.
 	[ "$DRY" = 1 ] && ui_info "$RUNBIN is not built yet (the build was skipped)" \
 		|| die "$RUNBIN does not exist."
@@ -901,7 +901,7 @@ fi
 as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 
 #
-# ⚠⚠⚠ WHICH COMMIT THIS TREE IS, WRITTEN DOWN, because /opt/charsiu is not a
+# WHICH COMMIT THIS TREE IS, WRITTEN DOWN, because /opt/charsiu is not a
 # git checkout and nothing in it could answer that. Every board round has
 # recorded the machine, the NPU clock, the boot id and the binary's mtime, and
 # then the round's numbers were tied to a version by somebody remembering which
@@ -914,32 +914,32 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # TREE: a round can say which install it ran against even when the binary it
 # used was copied somewhere else under another name.
 #
-# ⚠ -dirty is part of the answer and is not to be stripped. An install built
+# -dirty is part of the answer and is not to be stripped. An install built
 # from an edited tree is not the commit it names.
-# ⚠ AND A SOURCE THAT IS NOT A CHECKOUT SAYS SO. "unknown" in this file is
+# AND A SOURCE THAT IS NOT A CHECKOUT SAYS SO. "unknown" in this file is
 # ugly on purpose; an empty file would read like a clean tree.
 _commit=$(git -C "$SRC" describe --always --dirty --abbrev=12 2>/dev/null || true)
 printf '%s\n' "${_commit:-unknown}" | as_root tee "$BIN/COMMIT" >/dev/null
 ui_info "commit ${_commit:-unknown (the source is not a git checkout)}"
 
-# ⚠ SPELLING THIS LIST OUT IS HOW `charsiu list` SHIPPED BROKEN. The front door
+# SPELLING THIS LIST OUT IS HOW `charsiu list` SHIPPED BROKEN. The front door
 # execs one helper per subcommand, and six of them (list, ps, rm, show, runner,
 # serve) arrived after the list was written. A fresh Debian install got a
 # charsiu that printed --help and then died with "exec: : Permission denied" on
 # every subcommand. Install whatever the source actually has.
-# ⚠ bench_batch too: [debug] enable makes `charsiu bench` reach for it, and a
+# bench_batch too: [debug] enable makes `charsiu bench` reach for it, and a
 # setting that points at a binary nobody installed is a setting that lies.
-# ⚠ npu_gemm_test as well: it is the only thing that can answer whether the
+# npu_gemm_test as well: it is the only thing that can answer whether the
 # hardware does a matmul with more than one row, which is the whole of prefill,
 # and asking somebody to go find it under ~/.cache is how a board round does
 # not happen.
-# ⚠⚠ THE PROBES ARE A DEV THING, and installing them on somebody who asked for
+# THE PROBES ARE A DEV THING, and installing them on somebody who asked for
 # a way to run a model is how a tool stops being trusted. npu_gemm_test,
 # charsiu_matmul and bench_batch exist to ask the hardware questions -- what a
 # register does at a width nobody has run, whether batching pays -- and they
 # have wedged the block, timed out and printed the opposite of their own data
 # on the way to the answers. `charsiu update dev` asks for them.
-# ⚠⚠ charsiu_vision, charsiu_clip AND charsiu_whisper ARE RUNTIME, NOT PROBES.
+# charsiu_vision, charsiu_clip AND charsiu_whisper ARE RUNTIME, NOT PROBES.
 # `charsiu pull` offers whisper-tiny.en and clip-b32 and both are useless
 # without their binary -- and the paragraph above is the record of what leaving
 # a name off this list costs. They are read only, they do not touch the NPU's
@@ -947,20 +947,20 @@ ui_info "commit ${_commit:-unknown (the source is not a git checkout)}"
 # done all three.
 RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 	      charsiu_vision charsiu_clip charsiu_whisper"
-# ⚠ A SCRIPT WITHOUT ITS BINARY IS A ROUND THAT DOES NOT HAPPEN, and this has
+# A SCRIPT WITHOUT ITS BINARY IS A ROUND THAT DOES NOT HAPPEN, and this has
 # now happened twice. vattn_sweep.sh went to the board without vattn_bench and
 # without itself, and came back "cannot open /opt/charsiu/vattn_sweep.sh" -- so
 # six attention defaults chosen on a compute bound desktop are still the
 # defaults on a bandwidth bound board. Anything added to PROBE_SCRIPTS that
 # runs a binary has to add the binary here in the same edit.
 PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt npu_mixed_test out16_bound bench_gather"
-# ⚠ EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
+# EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
 # down says a probe that lives only in the source tree under ~/.cache is a
 # board round that does not happen -- and then only prefill_control.sh was
 # listed, so every board_*.sh written since has been exactly that: reachable
 # by a path nobody types.
 #
-# ⚠⚠ AND IT DRIFTED AGAIN, which is why `make test` now diffs this list
+# AND IT DRIFTED AGAIN, which is why `make test` now diffs this list
 # against tests/board_*.sh. Six scripts written between 09-11 and 09-13 --
 # board_cpu_clock, board_ttft_curve, board_attn_npu, board_chunk_band,
 # board_width_atom, board_core_cost -- were all missing on 09-13. A warning in
@@ -977,7 +977,8 @@ board_prefill_stages.sh board_cpu_clock.sh board_ttft_curve.sh \
 board_attn_npu.sh board_chunk_band.sh board_width_atom.sh \
 board_core_cost.sh board_fp16_pack.sh board_fp16_tri.sh board_fp16_read.sh
 board_w8a16.sh board_causal_n.sh board_kv_ladder.sh board_attn_pipe.sh board_spin.sh \
-board_attn_min.sh board_drift.sh board_clk.sh board_iommu.sh"
+board_attn_min.sh board_drift.sh board_clk.sh board_iommu.sh \
+board_min_mac.sh board_deal.sh board_regress.sh board_remount.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
@@ -986,7 +987,7 @@ for f in $INSTALL_BINS; do
 	[ "$DRY" = 1 ] || [ -x "$SRC/build/$f" ] || continue
 	as_root cp "$SRC/build/$f" "$BIN/$f"
 done
-# ⚠⚠ AND THE ONES A PERSON TYPES GO WHERE A PERSON CAN TYPE THEM. $BIN is
+# AND THE ONES A PERSON TYPES GO WHERE A PERSON CAN TYPE THEM. $BIN is
 # /opt/charsiu and is NOT on anybody's PATH -- charsiu_run does not need to be,
 # because the front door execs it by path, but charsiu_whisper and charsiu_clip
 # are commands in their own right and the README tells people to run them by
@@ -998,7 +999,7 @@ for f in $TYPED_BINS; do
 	as_root cp "$SRC/build/$f" "$SBIN/$f"
 	as_root chmod 0755 "$SBIN/$f"
 done
-# ⚠ AND THE PROBES THAT ARE SHELL RATHER THAN C. prefill_control.sh is a probe
+# AND THE PROBES THAT ARE SHELL RATHER THAN C. prefill_control.sh is a probe
 # by everything that matters -- it asks the hardware a question the runtime
 # cannot answer about itself, and it is dev only for the same reason the other
 # three are. It goes next to them, because the paragraph above is right: a
@@ -1011,7 +1012,7 @@ dev)	for f in $PROBE_SCRIPTS; do
 		as_root chmod 0755 "$BIN/$f"
 	done
 	#
-	# ⚠⚠ AND THE TEXT THEY SCORE ON, which is not a script and is not a
+	# AND THE TEXT THEY SCORE ON, which is not a script and is not a
 	# binary and would have been the thing nobody copied.
 	#
 	# board_awq.sh and host_awq.sh both default to tests/corpus, and every
@@ -1029,7 +1030,7 @@ dev)	for f in $PROBE_SCRIPTS; do
 		as_root cp "$SRC/tests/corpus/$f" "$BIN/corpus/$f"
 	done ;;
 esac
-# ⚠ BOTH LIBRARIES, OR EVERY COMMAND EXITS ON THE FIRST LINE. charsiu-lib.sh
+# BOTH LIBRARIES, OR EVERY COMMAND EXITS ON THE FIRST LINE. charsiu-lib.sh
 # is where ini_get and find_bin live now; a script that cannot source it
 # says so and stops rather than guessing.
 for f in charsiu-tui.sh charsiu-lib.sh; do
@@ -1043,15 +1044,15 @@ for p in "$SRC"/scripts/charsiu "$SRC"/scripts/charsiu-*; do
 	as_root chmod 0755 "$SBIN/$f"
 done
 
-# ⚠ THE MODELS DIRECTORY MUST BELONG TO WHOEVER WILL FILL IT. Installed under
+# THE MODELS DIRECTORY MUST BELONG TO WHOEVER WILL FILL IT. Installed under
 # sudo it lands root-owned, and then charsiu-get, which nobody should have to
 # run as root to download a file, fails at the last step, after the download.
 OWNER="${SUDO_USER:-$(id -un)}"
 if [ "$OWNER" != root ] && id "$OWNER" >/dev/null 2>&1; then
-	# ⚠ as_root RETURNS 0 IN A DRY RUN, so a `&& ui_ok "..."` here announced
+	# as_root RETURNS 0 IN A DRY RUN, so a `&& ui_ok "..."` here announced
 	# a chown that never happened. A rehearsal that claims work it did not do
 	# is worse than no rehearsal.
-	# ⚠ `2>/dev/null` on the as_root call SWALLOWS the dry run's own notice,
+	# `2>/dev/null` on the as_root call SWALLOWS the dry run's own notice,
 	# which goes to stderr. The action then appeared in the final summary
 	# but not in the live output. Split the two cases.
 	if [ "$DRY" = 1 ]; then
@@ -1066,12 +1067,12 @@ if [ -f "$ETC/config.ini" ]; then
 	[ "$DRY" = 0 ] && ui_info "your $ETC/config.ini was left alone (template: config.ini.default)"
 else
 	as_root cp "$SRC/etc/config.ini" "$ETC/config.ini"
-	# ⚠ so that a later plain `charsiu update` stays on the channel that
+	# so that a later plain `charsiu update` stays on the channel that
 	# was installed rather than quietly going back to stable.
 	[ "$CHANNEL" = stable ] || as_root sh -c \
 		"sed -i 's/^channel = .*/channel = $CHANNEL/' '$ETC/config.ini'"
 fi
-# ⚠ THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
+# THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
 # root's, so charsiu-get could not record the model it had just downloaded and
 # every later run went looking for the placeholder in the shipped template. The
 # front door already prefers ~/.charsiu/config.ini, so put one there, pointing
@@ -1095,7 +1096,7 @@ if [ "$DOMODEL" = 1 ] && [ -z "$(ls "$MODELS"/*.gguf 2>/dev/null || true)" ]; th
 	if [ "$DRY" = 1 ]; then
 		would "charsiu-get --wizard   (pick and download a model into $MODELS)"
 	else
-		# ⚠ charsiu-get RECORDS WHAT IT FETCHED, so it has to be told which
+		# charsiu-get RECORDS WHAT IT FETCHED, so it has to be told which
 		# config is in effect. Left to guess it looked at ~/.charsiu and then
 		# /etc, found neither in a staged install, and the download went
 		# unrecorded, which is the bug that shipped a working install unable
@@ -1109,13 +1110,13 @@ fi
 
 ui_hdr "checking"
 if [ "$DRY" = 1 ]; then
-	# ⚠ the doctor is READ-ONLY, so a dry run should still run it. What it
+	# the doctor is READ-ONLY, so a dry run should still run it. What it
 	# reports is the most useful thing this rehearsal produces. It is pointed
 	# at the SOURCE tree's tools, since nothing was installed.
 	CHARSIU_CONFIG="$SRC/etc/config.ini" CHARSIU_LIB="$SRC/scripts" \
 		"$SRC/scripts/charsiu-doctor" || true
 else
-	# ⚠ THE LONGEST STRETCH OF LOOSE TEXT IN THE WHOLE INSTALL. On a serial
+	# THE LONGEST STRETCH OF LOOSE TEXT IN THE WHOLE INSTALL. On a serial
 	# console it scrolls past between two dialogs and reads as the wizard
 	# having given up. Keep printing it, so it is in the log and in a pipe,
 	# and also put it on screen as something you can read and scroll.
@@ -1126,7 +1127,7 @@ else
 	rm -f "$DLOG"
 fi
 
-# ⚠ A REPORT IS NOT A DEMONSTRATION. Ending on a list of ticks leaves someone
+# A REPORT IS NOT A DEMONSTRATION. Ending on a list of ticks leaves someone
 # who has waited through a build and a download with no evidence the thing
 # talks. One sentence is cheap and it is the whole point of installing it.
 if [ "$DEMO" = 0 ]; then
@@ -1157,7 +1158,7 @@ Run it again without --dry-run to do it for real."
 	exit 0
 fi
 
-# ⚠ The closing screen still named the old scripts one by one, from before the
+# The closing screen still named the old scripts one by one, from before the
 # front door existed. Say the commands a user will actually type.
 ui_msg "Done.
 
@@ -1171,7 +1172,7 @@ ui_msg "Done.
   This build can also SEE. `charsiu pull` lists the models that take a
   picture, and they are two files -- it fetches both:
 
-  charsiu --image photo.jpg \"what is in this picture?\" 
+  charsiu --image photo.jpg \"what is in this picture?\"
 
   channel $CHANNEL$([ "$CHANNEL" = stable ] && echo "      charsiu update dev  adds the hardware probes" || echo "         charsiu update stable  goes back to the runtime alone")$([ "$CHANNEL" = dev ] && echo "
   probes  $BIN: $PROBE_BINS $PROBE_SCRIPTS")

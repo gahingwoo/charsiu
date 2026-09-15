@@ -2,7 +2,7 @@
 /*
  * npu_out_fmt -- what the NPU actually writes, read as three formats at once.
  *
- * ⚠⚠ WHY THIS IS THE QUESTION. TTFT is 15.8% behind the vendor on int8 and the
+ * WHY THIS IS THE QUESTION. TTFT is 15.8% behind the vendor on int8 and the
  * prefill row spends 0.94 ms of 4.59 reading accumulators back. That read is
  * `m * n * ceil(K/KMAX) * 4` -- four bytes an element, because npudev reads the
  * output as int32. If the hardware is already writing something narrower, or
@@ -37,7 +37,7 @@ static int charsiu_env_flag_local(const char *n, int dflt)
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -65,7 +65,7 @@ int main(int argc, char **argv)
 	job.weight_zero_point = 128;
 	job.input_scale = job.weight_scale = job.output_scale = 1.0f;
 	/*
-	 * ⚠ ACC_OUT IS THE WHOLE QUESTION NOW. With it set, job.c forces
+	 * ACC_OUT IS THE WHOLE QUESTION NOW. With it set, job.c forces
 	 * CHARSIU_WIDE8 = 0x3f -- the vendor's float output stage -- and the
 	 * hardware still writes a raw int32 accumulator, exactly right: k=1024
 	 * of (1-128)*(1-128) reads back 16516096 = 1024 * 127^2. So acc_out
@@ -77,7 +77,7 @@ int main(int argc, char **argv)
 	 * fp16 and still correct, the read back halves and TTFT's 0.67 ms a row
 	 * gap has a 0.47 ms answer.
 	 *
-	 * ⚠ The coefficient buffer is zeroed here, so a requant that actually
+	 * The coefficient buffer is zeroed here, so a requant that actually
 	 * multiplies will produce zero, not a wrong number. That is a clean
 	 * negative: it says the stage ran.
 	 */
@@ -138,7 +138,7 @@ int main(int argc, char **argv)
 		       (double)charsiu_half_to_float(h1),
 		       p[0], p[1], p[2], p[3]);
 	}
-	printf("\n⚠ Whichever column reads %u is the format the hardware writes.\n",
+	printf("\nWhichever column reads %u is the format the hardware writes.\n",
 	       k * 16129);
 	charsiu_close(dev);
 	return 0;

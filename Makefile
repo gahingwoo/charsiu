@@ -8,7 +8,7 @@
 # is now: use it if it is still there, otherwise build NATIVELY, which works
 # because the development host is itself aarch64. Override CROSS= for anything
 # else.
-# ⚠ -Winfinite-recursion IS NOT IN -Wall OR -Wextra, and it would have caught
+# -Winfinite-recursion IS NOT IN -Wall OR -Wextra, and it would have caught
 # the one that mattered: act_q1_timed called itself instead of charsiu_act_q1,
 # which killed every NPU run on the board and was invisible in an -O2 build
 # because the compiler is entitled to delete an infinite recursion. Named
@@ -16,7 +16,7 @@
 # caller can still override the whole line.
 CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
 #
-# ⚠⚠ THE BUILD STAMPS ITSELF, because /opt/charsiu is not a git checkout and
+# THE BUILD STAMPS ITSELF, because /opt/charsiu is not a git checkout and
 # neither is /root/charsiu_run_<whatever>. Every board round has recorded the
 # machine, the clock and the wall time and NOT the commit, so a round's numbers
 # have been tied to a version by somebody remembering which binary they copied.
@@ -26,10 +26,10 @@ CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
 # -dirty is part of it. A binary built from an edited tree is not the commit it
 # names, and saying so is the whole point.
 #
-# ⚠ := AND NOT =, or every compile line re-runs git.
+# := AND NOT =, or every compile line re-runs git.
 CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
 #
-# ⚠ override, NOT a plain +=. CFLAGS is `?=` above, and a value given on the
+# override, NOT a plain +=. CFLAGS is `?=` above, and a value given on the
 # COMMAND LINE beats both -- make then ignores every `+=` to it, the define
 # never reaches the compiler, and charsiu.h's fallback makes --version answer
 # "unknown". An environment CFLAGS is fine; only the command line does this.
@@ -42,11 +42,11 @@ CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
 SRC    := src/regcmd.c src/device.c src/job.c
 LLM    := src/gguf.c src/tokenizer.c src/llama.c src/npuquant.c \
           src/npudev.c src/npupool.c src/npufp16.c src/device.c src/job.c src/regcmd.c
-# ⚠ THE SAME LIST WITHOUT llama.c, for one test that IS a llama.c translation
+# THE SAME LIST WITHOUT llama.c, for one test that IS a llama.c translation
 # unit. tests/attn_two_thresholds.c includes src/llama.c so it can reach the
 # two static threshold functions and the gate that composes them, so llama.c
 # must not also arrive as an object or every symbol in it is defined twice.
-# ⚠ Its RULE still depends on $(LLM), llama.c included, or an edit to the file
+# Its RULE still depends on $(LLM), llama.c included, or an edit to the file
 # it tests would not rebuild it.
 LLMNOLL := src/gguf.c src/tokenizer.c src/npuquant.c \
           src/npudev.c src/npupool.c src/npufp16.c src/device.c src/job.c src/regcmd.c
@@ -67,7 +67,7 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_membw
 
 #
-# ⚠⚠ AND THE STAMP HAS TO GO STALE NEVER. Nothing in a link line depends on the
+# AND THE STAMP HAS TO GO STALE NEVER. Nothing in a link line depends on the
 # commit, so a pull that changes no source leaves the OLD commit inside a
 # binary that is otherwise up to date -- and then it answers --version with a
 # confident wrong number, which is worse than not answering. This file changes
@@ -91,13 +91,13 @@ $(BUILD)/emit_dump: tools/emit_dump.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/emit_job: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-# ⚠ AND STATICALLY, FOR THE BOARD. tools/cmp_vendor.py needs this emitter and
+# AND STATICALLY, FOR THE BOARD. tools/cmp_vendor.py needs this emitter and
 # the vendor's .rkllm in the same place, and the .rkllm is 1.3 GB on a board
 # whose desk has 2.5 GB free -- so the diff runs there, not here.
 $(BUILD)/emit_job.aarch64: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
-# ⚠ THE OTHER m > 1 PROBE, AND IT HAD NO NATIVE TARGET AT ALL.
+# THE OTHER m > 1 PROBE, AND IT HAD NO NATIVE TARGET AT ALL.
 #
 # npu_gemm_test asks the hardware for the raw int32 accumulator and reads it
 # flat; this one takes the requantised int8 output and reads it as a surface,
@@ -109,14 +109,14 @@ $(BUILD)/emit_job.aarch64: tools/emit_job.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/charsiu_matmul: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-# ⚠ WHAT AN mmproj ACTUALLY CONTAINS, against what this reads. Every vision
+# WHAT AN mmproj ACTUALLY CONTAINS, against what this reads. Every vision
 # tensor name in the tree is a guess until a real file says otherwise, and a
 # guess that finds nothing has cost this project a model that answered while
 # missing half of itself. This prints the misses by name.
 $(BUILD)/charsiu_vision: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
 
-# ⚠ THE ATTENTION IS HALF THE BOARD'S ENCODE AND 6% OF THE HOST'S, because the
+# THE ATTENTION IS HALF THE BOARD'S ENCODE AND 6% OF THE HOST'S, because the
 # board's matmuls go to the NPU and the host's do not. Timing it through the
 # whole tower on a host is reading the feed forward's noise; this drives the
 # one stage, at whatever shape is asked for.
@@ -126,12 +126,12 @@ $(BUILD)/vattn_bench: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BU
 $(BUILD)/vattn_bench.aarch64: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
-# ⚠ CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
+# CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
 # model's: causal, pooled at the end of text token, its own BPE.
 $(BUILD)/charsiu_clip: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -Ithird_party -o $@ $^ -lm -lpthread
 
-# ⚠ WHISPER READS ITS OWN CONTAINER, not a gguf: whisper.cpp's format is what
+# WHISPER READS ITS OWN CONTAINER, not a gguf: whisper.cpp's format is what
 # every model anybody has is in, and it carries the mel filterbank and the
 # vocabulary as well as the weights.
 $(BUILD)/charsiu_whisper: tools/charsiu_whisper.c src/whisper.c $(LLM) | $(BUILD)
@@ -145,7 +145,7 @@ $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
 #
-# ⚠⚠ AND IT WENT STALE THE SAME WAY, IN BOTH SCALAR RULES. The paragraph
+# AND IT WENT STALE THE SAME WAY, IN BOTH SCALAR RULES. The paragraph
 # below this one says "a target that is never built is a target that is
 # already broken" about exactly this, and then the two charsiu_run_scalar
 # rules kept the pre-vision source list anyway -- so tests/neon_control.sh,
@@ -157,7 +157,7 @@ $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c src/vision.c src/image.c $(LLM)
 	$(CC) $(CFLAGS) -Ithird_party -DCHARSIU_NO_NEON -o $@ $^ -lm -lpthread
 
 #
-# ⚠ THE SOURCE LIST HAS TO TRACK charsiu_run's. This rule went stale when
+# THE SOURCE LIST HAS TO TRACK charsiu_run's. This rule went stale when
 # vision landed: it kept the old list, so the board's static binary stopped
 # linking (undefined charsiu_vision_open and three more) and nobody noticed,
 # because nothing builds it by default. A target that is never built is a
@@ -166,7 +166,7 @@ $(BUILD)/charsiu_run_scalar: tools/charsiu_run.c src/vision.c src/image.c $(LLM)
 $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
-# ⚠ THE SHAPE PROBE, ON THE BOARD. npu_fp16_test only ever built for the host,
+# THE SHAPE PROBE, ON THE BOARD. npu_fp16_test only ever built for the host,
 # and the host build is dynamically linked against a glibc the board does not
 # have -- so the one tool that can price an fp16 matmul at a CHOSEN shape could
 # not be run where the shapes matter. Same caveat as every rule here: this
@@ -174,7 +174,7 @@ $(BUILD)/charsiu_run.aarch64: tools/charsiu_run.c src/vision.c src/image.c $(LLM
 $(BUILD)/npu_fp16_test.aarch64: tools/npu_fp16_test.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-# ⚠ THE QUALITY INSTRUMENT, ON THE BOARD. charsiu_ppl only ever built for the
+# THE QUALITY INSTRUMENT, ON THE BOARD. charsiu_ppl only ever built for the
 # host, so every perplexity and every --top1 in this tree came from the CPU
 # path. The board's own quantiser is the one that ships, and scoring it needed
 # this target to exist. Same caveat as the rule above: this source list has to
@@ -184,7 +184,7 @@ $(BUILD)/charsiu_ppl.aarch64: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 
 # The control: same code with the NEON kernels compiled out, and slower.
 #
-# ⚠ SINCE ROUND 372 IT NO LONGER MATCHES THE DEFAULT BUILD, and the invariant
+# SINCE ROUND 372 IT NO LONGER MATCHES THE DEFAULT BUILD, and the invariant
 # is written differently rather than quietly dropped. Some vector paths reorder
 # arithmetic on purpose and have no scalar twin. So:
 #
@@ -194,7 +194,7 @@ $(BUILD)/charsiu_ppl.aarch64: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 # which is checked on the host and is still a NEON bug detector: every vector
 # path that is meant to be bit identical still has to reproduce it.
 #
-# ⚠⚠ THIS LIST SAID TWO UNTIL ROUND 414 AND THERE WERE THREE. It was written
+# THIS LIST SAID TWO UNTIL ROUND 414 AND THERE WERE THREE. It was written
 # when the reordering paths were the q.k dot product (four lanes) and the
 # exponential (a polynomial rather than glibc's), and it did not grow when the
 # softmax joined them. tests/neon_control.sh had never set ANY of them, so the
@@ -220,7 +220,7 @@ board: $(BUILD)/charsiu_probe.aarch64 $(BUILD)/charsiu_matmul.aarch64 \
        $(BUILD)/charsiu_clip.aarch64 $(BUILD)/charsiu_whisper.aarch64 \
        $(BUILD)/vattn_bench.aarch64 $(BUILD)/npu_fp16_test.aarch64
 
-# ⚠ THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
+# THE OTHER MODALITIES CROSS COMPILE TOO. `make board` is the target a board
 # round reaches for, and a tool that is only in the native build is one that has
 # to be rebuilt on the card before it can be asked anything.
 $(BUILD)/charsiu_vision.aarch64: tools/charsiu_vision.c src/vision.c src/image.c $(LLM) | $(BUILD)
@@ -249,7 +249,7 @@ $(BUILD)/charsiu_matmul.aarch64: tools/charsiu_matmul.c $(SRC) | $(BUILD)
 $(BUILD)/charsiu_bench.aarch64: tools/charsiu_bench.c $(SRC) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm
 
-# ⚠ AND src/gguf.c, WHICH IS WHERE charsiu_env_flag LIVES. This rule is in
+# AND src/gguf.c, WHICH IS WHERE charsiu_env_flag LIVES. This rule is in
 # `board:` and has not linked -- a third instance today of the sentence three
 # rules above: a target that is never built is a target that is already broken.
 # Nothing in `make test` builds it either, which is why nothing said so.
@@ -281,7 +281,7 @@ $(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
-# ⚠ NO $(LLM). This one links nothing: it is the two arms of one loop lifted
+# NO $(LLM). This one links nothing: it is the two arms of one loop lifted
 # out of npudev.c so a rewrite of them can be proved identical without a
 # model, a device, or a board that has to boot first.
 $(BUILD)/npu_qpack_test: tools/npu_qpack_test.c | $(BUILD)
@@ -320,7 +320,7 @@ $(BUILD)/acc_index_check: tools/acc_index_check.c $(SRC) | $(BUILD)
 $(BUILD)/bench_gather: tools/bench_gather.c $(SRC) | $(BUILD)
 	$(CROSS)$(CC) $(CFLAGS) -o $@ $^ -lm
 
-# ⚠ AND THE BOARD BUILD, because this tool's OWN HEADER says the host cannot
+# AND THE BOARD BUILD, because this tool's OWN HEADER says the host cannot
 # answer its question -- "the host is aarch64 with caches that dwarf the
 # board's ... the ratio is the thing to carry". It had a host rule only, and
 # no board log mentions it, so the one instrument written for the largest line
@@ -357,7 +357,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
 #
-# ⚠ THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
+# THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the
 # reproduction section" on 09-11 and nobody implemented it. Run for the first
 # time on 09-12 it failed at once: both corpora were scored by every
@@ -429,7 +429,7 @@ $(BUILD)/fp16_plan: tests/fp16_plan.c src/fp16plan.h src/regcmd.c src/job.c | $(
 $(BUILD)/fp16_regrow: tests/fp16_regrow.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fp16_regrow.c src/regcmd.c src/job.c -lm
 
-# ⛔ AND THE ADVERSARIAL ARM. fp16_regrow above sweeps a FIXED table into
+# AND THE ADVERSARIAL ARM. fp16_regrow above sweeps a FIXED table into
 # freshly zeroed destinations, one step at a time; this one randomises the
 # shape, climbs the ladder IN ONE BUFFER with positions appended between
 # rungs, poisons the destination tail, puts PROT_NONE pages on both ends, and
@@ -439,13 +439,13 @@ $(BUILD)/fp16_regrow: tests/fp16_regrow.c src/regcmd.c src/job.c | $(BUILD)
 $(BUILD)/fp16_regrow_fuzz: tests/fp16_regrow_fuzz.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fp16_regrow_fuzz.c src/regcmd.c src/job.c -lm
 
-# ⭐ THE TWO ATTENTION THRESHOLDS, WHICH WERE WRONG TWICE IN ONE DAY AND HAD NO
+# THE TWO ATTENTION THRESHOLDS, WHICH WERE WRONG TWICE IN ONE DAY AND HAD NO
 # TEST. attn_npu_min_for picks 320 or 448 from the model's head counts, and the
 # gate that uses it also has to refuse a caller that never said how long the
 # prompt is. Neither needs an NPU: the inputs are two head counts and an
 # integer. The test includes src/llama.c rather than asking for a shim, so the
 # link line is $(LLMNOLL) and the dependency is $(LLM).
-# ⚠ ONE FORK PER CASE. Every knob it moves is cached in a function static on
+# ONE FORK PER CASE. Every knob it moves is cached in a function static on
 # first read, so a second case in the same process would read the first one's
 # environment.
 $(BUILD)/attn_two_thresholds: tests/attn_two_thresholds.c $(LLM) | $(BUILD)

@@ -9,7 +9,7 @@ shapes a real mmproj uses -- and the reference forward is fifty lines of numpy
 directly above the comparison. So the C and the reference disagree only where
 one of them is wrong, and both run on a laptop in a second.
 
-⚠ WHAT THIS DOES NOT COVER, and both are the same kind of thing: the reference
+WHAT THIS DOES NOT COVER, and both are the same kind of thing: the reference
 was written by whoever wrote the C, so a convention they SHARE passes.
 
   - the tensor NAMES. Given tensors under those names the arithmetic is right;
@@ -52,7 +52,7 @@ def layernorm(x, w, b, eps):
 def pixel_shuffle(x, grid, E, s):
     """transformers' Idefics3 pixel_shuffle, transcribed from the model file.
 
-    ⚠ TWO RESHAPES WITH A TRANSPOSE BETWEEN THEM, not a block gather. The two
+    TWO RESHAPES WITH A TRANSPOSE BETWEEN THEM, not a block gather. The two
     differ, and both produce finite numbers."""
     x = x.reshape(grid, grid, E)
     x = x.reshape(grid, grid // s, E * s)

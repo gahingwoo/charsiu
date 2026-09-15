@@ -20,7 +20,7 @@
 #   alpha          where is the exponent's minimum on this      the number the
 #                  board's own quantiser                        README prints
 #
-# ⚠⚠ THE IDENTITY ARMS COMPARE charsiu TO charsiu, AND HERE THAT IS THE RIGHT
+# THE IDENTITY ARMS COMPARE charsiu TO charsiu, AND HERE THAT IS THE RIGHT
 # QUESTION. It is the wrong question when both arms are the same graph -- a
 # shared bug is invisible to it. These two are not that: the control arm in
 # each is the path that has ALWAYS applied the factor and has evidence behind
@@ -28,7 +28,7 @@
 # is a new place to apply the same factor. So "identical" means the new place
 # computes what the old one does, which is exactly the claim being made.
 #
-# ⚠⚠ AND AN ARM THAT NEVER RAN IS NOT A NULL RESULT. Every identity here can
+# AND AN ARM THAT NEVER RAN IS NOT A NULL RESULT. Every identity here can
 # pass vacuously: if the batched path refuses for some OTHER reason, arm B is
 # arm A and the tokens match for no reason at all. So each identity arm also
 # checks a positive tell that the path it is about actually ran, and says so
@@ -46,7 +46,7 @@
 # calibration file beside it, or one recorded here.
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -73,7 +73,7 @@ T=${TMPDIR:-/tmp}/charsiu-awq.$$
 mkdir -p "$T"
 trap 'rm -rf "$T"' EXIT
 
-# ⚠ THE GOVERNOR. Every timing below is CPU work as much as hardware work and
+# THE GOVERNOR. Every timing below is CPU work as much as hardware work and
 # the board ships ondemand; three phase 9 runs disagreed by more than the
 # change they were measuring because of it. Put it back on the way out.
 OLD=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "")
@@ -83,9 +83,9 @@ done
 trap 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -n "$OLD" ] && [ -w "$g" ] && echo "$OLD" > "$g" 2>/dev/null; done; rm -rf "$T"' EXIT
 
 #
-# ⚠ CHARSIU_AWQ_BASE EXISTS SO THIS SCRIPT CAN BE RUN BEFORE THE BOARD IS.
+# CHARSIU_AWQ_BASE EXISTS SO THIS SCRIPT CAN BE RUN BEFORE THE BOARD IS.
 #
-# ⚠⚠ AND A DESK OVERRIDE MUST CARRY W4_GROUP=1024 ITSELF. llama_auto_kmax()
+# AND A DESK OVERRIDE MUST CARRY W4_GROUP=1024 ITSELF. llama_auto_kmax()
 # pins KMAX and the group to 1024 and is called only when the NPU is on, so a
 # base with CHARSIU_NPU=0 measures one absmax a row -- not what the board runs.
 # The full desk base is:
@@ -101,7 +101,7 @@ trap 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -n "$
 # it is a plan for one, and this tree has lost a round to a dead loop before.
 #
 W4=${CHARSIU_AWQ_BASE:-"CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"}
-# ⚠⚠ 0.20 IS THE CORRECTED OPTIMUM, AND EVERY EARLIER NUMBER IN THIS SCRIPT
+# 0.20 IS THE CORRECTED OPTIMUM, AND EVERY EARLIER NUMBER IN THIS SCRIPT
 # WAS MEASURED THROUGH A BINDING CLAMP. The clamp acts while it is tighter
 # than the floor's (1/floor)^alpha, which at the old default of 2.0 meant from
 # alpha 0.10 upward -- so the exponent and the bound were being swept together.
@@ -111,7 +111,7 @@ W4=${CHARSIU_AWQ_BASE:-"CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1"}
 # Llama-3.2-1B, host, at the board's own group 1024:
 #   int4 33.8071 -> +AWQ 25.3664 -> +INT8_LAYERS=3-4 23.1453 ; all int8 17.9772
 #
-# ⚠ qwen3 prefers 0.25. Arm 4 sweeps it; this is only the default the other
+# qwen3 prefers 0.25. Arm 4 sweeps it; this is only the default the other
 # arms run at.
 ALPHA=${CHARSIU_AWQ_ALPHA:-0.20}
 NTOK=${CHARSIU_AWQ_NTOK:-32}
@@ -119,7 +119,7 @@ NTOK=${CHARSIU_AWQ_NTOK:-32}
 PROMPT=${CHARSIU_AWQ_PROMPT:-"The keeper of the lighthouse wrote down the barometer and the wind every morning for eleven years, and what he remembered afterwards was not the storms but the particular quality of the light in the hour before one arrived. Explain, in plain words, why a written record outlasts a memory:"}
 
 #
-# ⚠⚠ SAY WHICH FILE. charsiu re-quantises whatever it loads, so the source
+# SAY WHICH FILE. charsiu re-quantises whatever it loads, so the source
 # format is inside every perplexity below: the same Llama-3.2-1B reads 33.8071
 # from Q4_0 and 28.7072 from Q8_0 at group 1024, a 20% spread, and a round that
 # does not name its file cannot be put beside one that does. A whole evening
@@ -129,8 +129,8 @@ PROMPT=${CHARSIU_AWQ_PROMPT:-"The keeper of the lighthouse wrote down the barome
 echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
 
 #
-# ⚠⚠ AND WHICH BUILD, FOR charsiu_run ONLY. charsiu_ppl is compiled from
-# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# AND WHICH BUILD, FOR charsiu_run ONLY. charsiu_ppl is compiled from
+# THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
 # no --version to print it back" and warned that its first argument is read
 # through atoi, so asking would submit a dimension of zero. Both halves were
 # true when written; the flag went into every tool afterwards and is checked
@@ -141,7 +141,7 @@ echo "   model $M  ($(wc -c < "$M" 2>/dev/null || echo '?') bytes)"
 # worse than no build line: the next round would assume the number and the
 # hash came from one tree.
 #
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -156,7 +156,7 @@ env $W4 CHARSIU_NPU=0 CHARSIU_CALIB="$STATS" \
 echo "   $(wc -c < "$STATS") bytes"
 
 #
-# ⚠⚠ THE SUMMARY IS ON STDOUT AND IT DOES NOT SAY "TTFT". charsiu_run prints
+# THE SUMMARY IS ON STDOUT AND IT DOES NOT SAY "TTFT". charsiu_run prints
 #
 #   [load N ms | staging N ms | prompt N tok in N ms, N tok/s
 #                             | gen N tok in N ms, N tok/s | peak N MB]
@@ -187,7 +187,7 @@ arm() {
 fail=0
 say_same() {
 	if [ "$1" = "$2" ]; then echo "   tokens IDENTICAL"; else
-		echo "   ⚠⚠ TOKENS DIFFER"
+		echo "   TOKENS DIFFER"
 		printf '      A: %.90s\n      B: %.90s\n' "$1" "$2"
 		fail=$((fail + 1))
 	fi
@@ -201,16 +201,16 @@ A=$(text < "$T/b0.out"); B=$(text < "$T/b1.out")
 say_same "$A" "$B"
 # the tell: A refused and B did not
 if ! grep -q "applied a row at a time by request" "$T/b0.err"; then
-	echo "   ⚠⚠ arm A never refused -- this identity proved nothing"
+	echo "   arm A never refused -- this identity proved nothing"
 	echo "      (no kscale on any tensor? AWQ off? then the whole arm is vacuous)"
 	fail=$((fail + 1))
 fi
 if grep -q "applied a row at a time by request" "$T/b1.err"; then
-	echo "   ⚠⚠ arm B refused too -- the batched path did not run"
+	echo "   arm B refused too -- the batched path did not run"
 	fail=$((fail + 1))
 fi
 if ! grep -q "charsiu NPU batched" "$T/b1.err"; then
-	echo "   ⚠ no batched matmul entry in arm B's report -- nothing was batched"
+	echo "   no batched matmul entry in arm B's report -- nothing was batched"
 	fail=$((fail + 1))
 fi
 printf '   prompt   refuse %s ms   batch %s ms\n' \
@@ -223,16 +223,16 @@ arm "CHARSIU_NPU_AWQ_SHARE=0" s0
 arm "CHARSIU_NPU_AWQ_SHARE=1" s1
 A=$(text < "$T/s0.out"); B=$(text < "$T/s1.out")
 say_same "$A" "$B"
-# ⚠ THE TELL, because identical tokens is what BOTH "the knob works" and "the
+# THE TELL, because identical tokens is what BOTH "the knob works" and "the
 # knob never ran" look like. npudev whines this only where a factored tensor
 # meets the group path with sharing off.
 SH="does not share a packed input unless"
 if ! grep -q "$SH" "$T/s0.err"; then
-	echo "   ⚠⚠ arm A never refused to share -- this identity proved nothing"
+	echo "   arm A never refused to share -- this identity proved nothing"
 	fail=$((fail + 1))
 fi
 if grep -q "$SH" "$T/s1.err"; then
-	echo "   ⚠⚠ arm B refused to share too -- the knob did not take effect"
+	echo "   arm B refused to share too -- the knob did not take effect"
 	fail=$((fail + 1))
 fi
 grep -h "cannot share one packed input" "$T/s1.err" | sed 's/^/   /'
@@ -240,7 +240,7 @@ printf '   decode %s tok/s (no share)   %s tok/s (shared)\n' \
 	"$(gen_tps < "$T/s0.out")" "$(gen_tps < "$T/s1.out")"
 
 echo
-# ⚠ AT WHATEVER CHARSIU_AWQ_ALPHA IS, WHICH ARM 4 IS WHAT CHOOSES. The two
+# AT WHATEVER CHARSIU_AWQ_ALPHA IS, WHICH ARM 4 IS WHAT CHOOSES. The two
 # arms are in this order because arm 3 only needs the comparison to be
 # internally consistent, but a LAYERS number quoted without its alpha is not
 # comparable to anything -- Llama's optimum measures 0.15 on the tree corpus,
@@ -259,7 +259,7 @@ echo
 echo "== arm 4: the exponent, on this board's own quantiser"
 for a in 0.00 0.05 0.10 0.15 0.20 0.35 0.50; do
 	# shellcheck disable=SC2086
-	# ⚠ alpha 0.00 IS "AWQ OFF", not "AWQ at zero". The knob's absence is
+	# alpha 0.00 IS "AWQ OFF", not "AWQ at zero". The knob's absence is
 	# the control arm; setting it to 0 still walks the factor code with a
 	# vector of ones and rounds differently, which is a third thing.
 	[ "$a" = 0.00 ] && A="" || A="CHARSIU_NPU_AWQ=$a"
@@ -269,17 +269,17 @@ for a in 0.00 0.05 0.10 0.15 0.20 0.35 0.50; do
 	printf '   alpha %s   ppl %s\n' "$a" "${P:-?}"
 done
 echo
-echo "⚠⚠ THE SURFACE MUST BE MONOTONE ON EACH SIDE OF ITS MINIMUM, AND ON THE
+echo "THE SURFACE MUST BE MONOTONE ON EACH SIDE OF ITS MINIMUM, AND ON THE
    HOST AT 300 TOKENS QWEN3'S IS NOT. That measures the instrument rather
    than the knob: ~10% resolution at 299 scored positions of one passage.
    Two cells closer than that cannot be ordered -- re-run the best pair at
    -n 500, or on another corpus, before believing either.
-⚠ And a winner on the boundary of the grid is not a winner, it is an edge:
+And a winner on the boundary of the grid is not a winner, it is an edge:
    extend the grid before naming it."
 
 echo
 echo "== arm 5: does the factor's clamp BIND, which is worth a third of the method"
-# ⚠⚠ THE ARM IS "DOES IT BIND", NOT "WHICH hi". The factor has a SECOND bound:
+# THE ARM IS "DOES IT BIND", NOT "WHICH hi". The factor has a SECOND bound:
 # the statistic is floored at 1e-3 * mean, which caps the factor at
 # (1/floor)^alpha whatever the data does. The clamp only acts while it is the
 # tighter of the two -- and at the 2.0 that was the default until 2026-09-10
@@ -289,10 +289,10 @@ echo "== arm 5: does the factor's clamp BIND, which is worth a third of the meth
 #
 # 64 is inert for any alpha up to 0.6, since 1000^0.6 = 63.1.
 #
-# ⚠ On the host, releasing it is worth a third of the whole method:
+# On the host, releasing it is worth a third of the whole method:
 # Llama 41.5289 off -> 32.5094 at clamp 2.0 -> 28.0368 clamp-free (alpha 0.20).
 #
-# ⚠ NOT "remove the clamp". At alpha 0.65 the floor allows factors to 89 and
+# NOT "remove the clamp". At alpha 0.65 the floor allows factors to 89 and
 # the narrow clamp is what saves the model -- it earns its keep exactly where
 # the exponent is too large to be used at all.
 for c in 2.0 6.0 64.0; do
@@ -303,14 +303,14 @@ for c in 2.0 6.0 64.0; do
 ' "$c" "$ALPHA" "${P:-?}" \
 	       "$([ "$c" = 64.0 ] && echo '   (inert: the floor is the only bound)')$([ "$c" = 6.0 ] && echo '   (the shipped default since 09-10)')"
 done
-echo "⚠ The default IS 6.0 as of 09-10, chosen because it is inert wherever the
+echo "The default IS 6.0 as of 09-10, chosen because it is inert wherever the
    exponent is usable (1000^0.25 = 5.62) and still bounds above it. hi=2.0
    reproduces every AWQ number recorded before that date. If the board
    disagrees with the host here, the default is what to revisit."
 
 echo
 echo "== arm 6: INT8_LAYERS -- is 0-1 still the range, with AWQ on?"
-# ⚠⚠ 0-1 WAS CHOSEN FROM A TABLE MEASURED UNGROUPED AND WITH AWQ OFF, and at
+# 0-1 WAS CHOSEN FROM A TABLE MEASURED UNGROUPED AND WITH AWQ OFF, and at
 # the board's own group with AWQ on, blk.0 ranks NINTH of sixteen for the
 # damage it carries -- AWQ already treats what the first layers suffer from.
 # Host, Llama, both passages, against a 25.3664 / 44.0703 baseline:

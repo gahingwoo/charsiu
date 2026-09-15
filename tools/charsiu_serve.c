@@ -5,7 +5,7 @@
  * charsiu serve: an OpenAI compatible endpoint, so that every chat front end
  * that already exists works against this board.
  *
- * ⚠ WHY THIS AND NOT A GUI OF OUR OWN. The audience for this board is not only
+ * WHY THIS AND NOT A GUI OF OUR OWN. The audience for this board is not only
  * people who live in a terminal. The shortest path to "open a browser and talk
  * to it" is to speak a protocol the browsers' front ends already speak, which
  * is what ollama did and why it had a graphical story long before it had a GUI.
@@ -14,15 +14,15 @@
  *     POST /v1/chat/completions      with stream:true as server-sent events
  *     GET  /v1/models
  *
- * ⚠ ONE REQUEST AT A TIME, ON PURPOSE. The NPU is a single serial resource:
+ * ONE REQUEST AT A TIME, ON PURPOSE. The NPU is a single serial resource:
  * two decodes do not overlap, they queue, and a threaded server would only move
  * the queue somewhere less visible. Requests are served in order.
  *
- * ⚠ AND THE MODEL STAYS STAGED. Building the NPU tensors takes about twenty
+ * AND THE MODEL STAYS STAGED. Building the NPU tensors takes about twenty
  * seconds, which is the whole reason a server is worth having: it is paid once
  * at startup and never again.
  *
- * ⚠ WHAT THIS COSTS, SAID PLAINLY: the OpenAI API is stateless, so every
+ * WHAT THIS COSTS, SAID PLAINLY: the OpenAI API is stateless, so every
  * request carries the whole conversation and the whole conversation is fed
  * again. On this board a prompt token costs about what a generated one does, so
  * a long history is a real wait before the first new word. That is the contract,
@@ -48,7 +48,7 @@ static float TEMP = 0.0f, TOP_P = 0.9f;
 static enum chat_fmt CHAT = CHAT_LLAMA3;   /* set from the vocabulary at load */
 
 /*
- * ⚠ WHAT THE KV CACHE ACTUALLY HOLDS, prompt and reply both, so the next
+ * WHAT THE KV CACHE ACTUALLY HOLDS, prompt and reply both, so the next
  * request can keep the part that has not changed.
  *
  * The API is stateless and the client resends the whole history every turn, so
@@ -87,7 +87,7 @@ static const char *j_find(const char *s, const char *end, const char *key)
 			continue;
 		}
 		if (*p == '"') {
-			/* ⚠ only a key at OUR depth counts: a "content" inside a
+			/* only a key at OUR depth counts: a "content" inside a
 			 * nested message object must not answer for the request's
 			 * own fields. */
 			if (depth == 1 && (size_t)(end - p) > kl + 1 &&
@@ -122,7 +122,7 @@ static size_t j_str(const char *p, const char *end, char *dst, size_t max)
 			case 'b': dst[n++] = '\b'; break;
 			case 'f': dst[n++] = '\f'; break;
 			case 'u': {
-				/* ⚠ \uXXXX has to become utf-8 or the prompt is
+				/* \uXXXX has to become utf-8 or the prompt is
 				 * mangled for every language that needs it. */
 				unsigned cp = 0;
 				for (int i = 1; i <= 4 && p + i < end; i++) {
@@ -156,7 +156,7 @@ static size_t j_str(const char *p, const char *end, char *dst, size_t max)
 /*
  * Copy a message's content.
  *
- * ⚠ OPENAI SENDS A STRING, ANTHROPIC SENDS EITHER. Its content is often an
+ * OPENAI SENDS A STRING, ANTHROPIC SENDS EITHER. Its content is often an
  * array of typed blocks, and reading that with j_str() returns nothing at all,
  * so the turn arrives empty and the model answers a question nobody asked.
  * Take the text out of every text block and ignore the rest: an image or a
@@ -207,7 +207,7 @@ static void j_escape(FILE *f, const char *s, size_t n)
 		case '\r': fputs("\\r", f); break;
 		case '\t': fputs("\\t", f); break;
 		default:
-			/* ⚠ control bytes must be escaped or the JSON is invalid
+			/* control bytes must be escaped or the JSON is invalid
 			 * and the client drops the whole message. Everything at
 			 * 0x20 and above, utf-8 included, goes through as it is. */
 			if (c < 0x20) fprintf(f, "\\u%04x", c);
@@ -221,7 +221,7 @@ static void j_escape(FILE *f, const char *s, size_t n)
 /*
  * Turn the messages array into a Llama 3 conversation.
  *
- * ⚠ THE MIDDLE TOKEN OF A TURN HEADER IS ORDINARY TEXT.
+ * THE MIDDLE TOKEN OF A TURN HEADER IS ORDINARY TEXT.
  * <|start_header_id|>user<|end_header_id|> is marker, word, marker, and getting
  * that wrong is what put a bare "assistant" into four rounds of board logs.
  */
@@ -233,7 +233,7 @@ static size_t build_prompt(const char *body, const char *end, char *out, size_t 
 	if (!msgs || *msgs != '[') return 0;
 
 	/*
-	 * ⚠ ANTHROPIC PUTS THE SYSTEM PROMPT AT THE TOP LEVEL, not in the
+	 * ANTHROPIC PUTS THE SYSTEM PROMPT AT THE TOP LEVEL, not in the
 	 * messages array. Dropping it means ignoring every instruction a client
 	 * like Claude Code sends, while looking like it worked.
 	 */
@@ -380,18 +380,18 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 	if (n_ids + n_gen >= ST->n_ctx) n_gen = ST->n_ctx - n_ids - 1;
 
 	/*
-	 * ⚠ COMPARE THE TOKENS, DO NOT TRUST THE HISTORY. The client may edit,
+	 * COMPARE THE TOKENS, DO NOT TRUST THE HISTORY. The client may edit,
 	 * branch or truncate what it sends, so the only safe thing is the
 	 * longest prefix that is IDENTICAL token for token. Anything after the
 	 * first difference is recomputed, which is the same answer the old
 	 * code gave -- it just no longer recomputes the part that matched.
 	 *
-	 * ⚠ AND AT LEAST ONE TOKEN MUST BE FED, or there are no logits to
+	 * AND AT LEAST ONE TOKEN MUST BE FED, or there are no logits to
 	 * sample from. Keeping all n would return whatever the last request
 	 * left in the buffer.
 	 */
 	int keep = 0;
-	/* ⚠ the control, so a round can measure against the old behaviour
+	/* the control, so a round can measure against the old behaviour
 	 * without rebuilding: CHARSIU_NO_KV_REUSE throws the cache away the
 	 * way this used to. */
 	static int noreuse = -1;
@@ -467,7 +467,7 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 		if (!logits) break;
 	}
 
-	/* ⚠ Both dialects distinguish "it finished" from "it ran out of room",
+	/* Both dialects distinguish "it finished" from "it ran out of room",
 	 * and this reported "stop" either way, so a truncated answer looked
 	 * complete to any client that checks. */
 	const char *why = anth ? (hit_eog ? "end_turn" : "max_tokens")
@@ -552,7 +552,7 @@ static void serve_one(int fd)
 		size_t got = clen ? fread(body, 1, clen, f) : 0;
 		body[got] = 0;
 		fprintf(stderr, "  POST %s  %zu bytes\n", path, got);
-		/* ⚠ count_tokens must be tested BEFORE /messages: it contains it. */
+		/* count_tokens must be tested BEFORE /messages: it contains it. */
 		if (strstr(path, "/count_tokens"))
 			count_tokens(f, body, got);
 		else
@@ -567,7 +567,7 @@ static void serve_one(int fd)
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -596,7 +596,7 @@ int main(int argc, char **argv)
 	}
 	if (!path) { fprintf(stderr, "charsiu_serve: which model?\n"); return 2; }
 
-	/* ⚠ a client that hangs up mid-stream must not take the server with it */
+	/* a client that hangs up mid-stream must not take the server with it */
 	signal(SIGPIPE, SIG_IGN);
 
 	fprintf(stderr, "charsiu_serve: loading %s\n", path);
@@ -615,7 +615,7 @@ int main(int argc, char **argv)
 	ST = llama_state_new(&M, N_CTX);
 	if (!ST) { fprintf(stderr, "charsiu_serve: no room for %d tokens\n", N_CTX); return 1; }
 
-	/* ⚠ stage the NPU NOW, not on the first request. Twenty seconds of
+	/* stage the NPU NOW, not on the first request. Twenty seconds of
 	 * silence is acceptable at startup and is not acceptable in a reply. */
 	{
 		int32_t warm[4];
@@ -626,7 +626,7 @@ int main(int argc, char **argv)
 		ST = llama_state_new(&M, N_CTX);
 	}
 	/*
-	 * ⚠ THE QoS HOLD IS FOR A REQUEST, NOT FOR THE PROCESS. Opening the
+	 * THE QoS HOLD IS FOR A REQUEST, NOT FOR THE PROCESS. Opening the
 	 * NPU forbids the CPUs their deep idle states -- a quarter of decode
 	 * on this board -- and a one-shot run closes the device minutes
 	 * later. A server sits at accept() for hours between requests, and

@@ -8,18 +8,18 @@
 # the plain path is what runs when someone pipes this into a script or runs it
 # over a link too dumb for a full-screen redraw.
 #
-# ⚠ EVERY FUNCTION HERE WRITES ITS PROMPT TO STDERR AND ITS ANSWER TO STDOUT,
+# EVERY FUNCTION HERE WRITES ITS PROMPT TO STDERR AND ITS ANSWER TO STDOUT,
 # so `x=$(ui_input ...)` captures the answer and not the question. whiptail
 # needs the 3>&1 1>&2 2>&3 dance for the same reason and gets it here once.
 #
-# ⚠ A CANCELLED DIALOG IS NOT AN EMPTY ANSWER. ui_input and ui_menu return
+# A CANCELLED DIALOG IS NOT AN EMPTY ANSWER. ui_input and ui_menu return
 # non-zero when the user backs out, so a caller can tell "they chose nothing"
 # from "they left". Check the exit status, not the string.
 
 CTUI=plain
 command -v whiptail >/dev/null 2>&1 && CTUI=whiptail
 [ -t 0 ] && [ -t 2 ] || CTUI=plain          # no terminal, no full screen
-# ⚠ whiptail REFUSES to run without TERM and prints "TERM environment variable
+# whiptail REFUSES to run without TERM and prints "TERM environment variable
 # needs set.", which a serial console often is. Measured: without this guard
 # every dialog fails and, worse, the error text arrives where the answer should
 # be (see the fd note below). Fall back rather than fail.
@@ -28,7 +28,7 @@ case "${TERM:-}" in ""|dumb|unknown) CTUI=plain ;; esac
 
 CTUI_TITLE="charsiu"
 
-# ⚠ CTUI_ASSUME makes every question answer itself, without a terminal. That is
+# CTUI_ASSUME makes every question answer itself, without a terminal. That is
 # what a rehearsal piped into a container needs: a dry run writes nothing, so
 # there is nothing to consent to, and refusing to run for want of a tty would
 # be refusing to do the one thing that was asked.
@@ -42,12 +42,12 @@ if [ -t 2 ]; then
 else T_B=; T_G=; T_R=; T_Y=; T_D=; T_0=; fi
 
 # ui_msg TEXT           say something and wait for acknowledgement
-# ⚠ A THREE LINE MESSAGE IN A TWENTY ROW BOX LOOKS BROKEN, and every dialog
+# A THREE LINE MESSAGE IN A TWENTY ROW BOX LOOKS BROKEN, and every dialog
 # here was a fixed 20x74 whatever it held. whiptail will not size itself, so
 # measure the text: the widest line for the width, the wrapped line count for
 # the height, both clamped to the terminal.
 #
-# ⚠ AND `stty size` REPORTS 0 0 ON A SERIAL CONSOLE, which has no way to tell
+# AND `stty size` REPORTS 0 0 ON A SERIAL CONSOLE, which has no way to tell
 # anyone how big it is. Falling through with zero would ask for a box of no
 # rows; 24x80 is what a serial terminal is until told otherwise.
 ctui_size() {   # ctui_size TEXT EXTRA_ROWS  ->  sets BOX_H, BOX_W
@@ -123,7 +123,7 @@ ui_yesno() {
 
 # ui_input PROMPT DEFAULT   the answer on stdout; non-zero if cancelled
 #
-# ⚠⚠ THE fd DANCE PUTS whiptail's ERRORS WHERE THE ANSWER GOES. 3>&1 1>&2 2>&3
+# THE fd DANCE PUTS whiptail's ERRORS WHERE THE ANSWER GOES. 3>&1 1>&2 2>&3
 # swaps stdout and stderr so the selection comes back on stdout, and so does
 # any diagnostic whiptail decides to print. Measured: with TERM unset the caller
 # received the string "TERM environment variable needs set." as the user's
@@ -145,7 +145,7 @@ ui_input() {
 # ui_menu TEXT  tag1 desc1  tag2 desc2 ...   the chosen tag on stdout
 ui_menu() {
 	text="$1"; shift
-	# ⚠ assuming an ANSWER to a menu is not possible, so it declines instead
+	# assuming an ANSWER to a menu is not possible, so it declines instead
 	# of guessing which entry someone meant.
 	if [ -n "$CTUI_ASSUME" ]; then printf '\n%s\n  [skipped]\n' "$text" >&2; return 1; fi
 	if [ "$CTUI" = whiptail ]; then
@@ -158,7 +158,7 @@ ui_menu() {
 	else
 		printf '\n%s\n\n' "$text" >&2
 		i=0
-		# ⚠ "$@" is consumed as we walk it, so the tags are stashed in
+		# "$@" is consumed as we walk it, so the tags are stashed in
 		# positional slots that survive the loop.
 		set -- "$@"
 		saved=""
@@ -197,14 +197,14 @@ ui_progress() {
 # question. Plain mode does nothing, because there the text already went to the
 # screen in the order it was produced.
 ui_pane() {
-	# ⚠ THIS WAS THE ONE DIALOG --yes DID NOT COVER. Every question honoured
+	# THIS WAS THE ONE DIALOG --yes DID NOT COVER. Every question honoured
 	# CTUI_ASSUME and this report did not, so `charsiu update --auto` ran
 	# unattended right up to the doctor's pane and then waited for an Enter
 	# nobody was there to press. The text already went to stderr through
 	# tee; a pane is only ever a second showing of it.
 	if [ -n "$CTUI_ASSUME" ]; then return 0; fi
 	if [ "$CTUI" = whiptail ] && [ -s "$1" ]; then
-		# ⚠ NOT --scrolltext. It moves focus off the button, so Enter stops
+		# NOT --scrolltext. It moves focus off the button, so Enter stops
 		# dismissing the dialog and the install hangs on its last screen with
 		# no way out that a serial console makes obvious. A plain --textbox
 		# already scrolls with the arrow keys AND still exits on Enter;

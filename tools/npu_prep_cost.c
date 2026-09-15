@@ -11,7 +11,7 @@
  * report cannot separate them, because the ioctl that waits is the ioctl that
  * invalidates.
  *
- * ⚠ A BUFFER THAT WAS NEVER SUBMITTED HAS NO FENCE TO WAIT ON. So prep on a
+ * A BUFFER THAT WAS NEVER SUBMITTED HAS NO FENCE TO WAIT ON. So prep on a
  * freshly allocated BO is the invalidate alone, timed without a job, without
  * the NPU doing anything, and without any risk of disturbing a run. That is
  * the whole trick here.
@@ -41,7 +41,7 @@ static double now_us(void)
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -96,7 +96,7 @@ int main(int argc, char **argv)
 		       sizes[i] / tp / 1e3, sizes[i] / tf / 1e3);
 		charsiu_bo_free(dev, &bo);
 	}
-	printf("\n⚠ An ioctl with no work still costs an ioctl, so read the\n"
+	printf("\nAn ioctl with no work still costs an ioctl, so read the\n"
 	       "  smallest row as the syscall floor and the slope as the cache.\n");
 	charsiu_close(dev);
 	return 0;

@@ -3,7 +3,7 @@
 /*
  * What is in an mmproj file, and is it a tower this can run?
  *
- * ⚠ THIS EXISTS BECAUSE THE NAMES ARE A GUESS. Every tensor name the loader
+ * THIS EXISTS BECAUSE THE NAMES ARE A GUESS. Every tensor name the loader
  * reaches for is llama.cpp's clip naming as this tree understands it, checked
  * against nothing. Pointed at a real mmproj this prints either "every tensor
  * this needs is here" or the exact names it wanted and did not find, which is
@@ -19,7 +19,7 @@
 #include "charsiu_vision.h"
 
 /*
- * ⚠ THE PIXELS ARE GENERATED, NOT READ. A cross check needs both sides to hold
+ * THE PIXELS ARE GENERATED, NOT READ. A cross check needs both sides to hold
  * the same image, and passing one costs a file format and a decoder before
  * either side has been shown to be right. An integer formula both sides can
  * compute EXACTLY -- no sin, no float parsing -- removes the image from the
@@ -69,7 +69,7 @@ static int encode(struct charsiu_vision *v, const char *image)
 }
 
 /*
- * ⚠ THE RESIZE IS TESTABLE ON ITS OWN, and it has to be: a half pixel shift is
+ * THE RESIZE IS TESTABLE ON ITS OWN, and it has to be: a half pixel shift is
  * invisible in a caption and fatal to a comparison. This mode needs no model.
  */
 static int resize_mode(const char *path, unsigned side)
@@ -92,7 +92,7 @@ static int resize_mode(const char *path, unsigned side)
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the

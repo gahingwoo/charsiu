@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0
 # `charsiu show [MODEL]`
 #
-# ⚠ THE POINT OF THIS COMMAND IS THE VERDICT. A gguf's name lies in both
+# THE POINT OF THIS COMMAND IS THE VERDICT. A gguf's name lies in both
 # directions, measured: ...-Q4_0_4_4.gguf is type 31 in 210 tensors, a Q4_0
 # repacked for ARM dotprod that passes any name test, and ...-Q6_K_L.gguf is
 # perfectly runnable although the suffix looks exotic. Only the contents decide,

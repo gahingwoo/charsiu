@@ -41,7 +41,7 @@
 # Usage: board_overlap_slots.sh [MODEL.gguf]
 set -u
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
@@ -81,7 +81,7 @@ mkdir -p "$OUTDIR"
 
 # the int4 environment board_intermittent.sh runs, at the K slice asked for
 #
-# ⚠⚠ THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
+# THE GROUP IS DERIVED FROM KMAX, NOT WRITTEN OUT. tensor_grouped()
 # wants t->kgroup == g->kmax -- the hardware sums a whole K slice into one
 # accumulator, so a slice carries exactly one group's scale -- and
 # charsiu_npu_add REFUSES a tensor whose grouping the consumer cannot
@@ -89,7 +89,7 @@ mkdir -p "$OUTDIR"
 # tensor with k > 1024 to the CPU, which on Llama is all of attention and
 # ffn_down. It whines; no harness read it.
 #
-# ⚠⚠⚠ AND THIS NOTE USED TO SIT INSIDE THE STRING BELOW, BETWEEN A
+# AND THIS NOTE USED TO SIT INSIDE THE STRING BELOW, BETWEEN A
 # BACKSLASH AND ITS CONTINUATION -- so `#` was not a comment, it was DATA.
 # W4 expanded to the environment followed by nine lines of prose, `env`
 # tried to execute a program called `#`, every arm died in under a second,
@@ -107,7 +107,7 @@ CHARSIU_PROBE_WIDTHS=$W ${CHARSIU_OVL_MAXT:+CHARSIU_PROBE_MAXT=$CHARSIU_OVL_MAXT
 
 echo "model    $MODEL"
 echo "binary   $RUN"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -121,7 +121,7 @@ c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
 *)        _kname="not a release this script knows" ;;
 esac
 echo "kernel   $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
-# ⚠ AGAINST now - uptime, NOT /proc/1. The old test was
+# AGAINST now - uptime, NOT /proc/1. The old test was
 # `[ /boot/Image -nt /proc/1 ]` and it fires on a board where the Image is
 # fifteen hours OLDER than the boot: /proc/1's mtime is not the boot instant,
 # it moves. This compares the Image's mtime against the clock minus uptime,
@@ -132,7 +132,7 @@ if [ -f /boot/Image ]; then
 	_imt=$(date -r /boot/Image +%s 2>/dev/null || echo 0)
 	_boot=$(awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0)
 	[ "$_imt" -gt 0 ] && [ "$_boot" -gt 0 ] && [ "$_imt" -gt "$_boot" ] && \
-		echo "⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+		echo "/boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 fi
 echo "config   width $W, KMAX $KMAX, serial once then parallel x$PASSES${CHARSIU_OVL_EXTRA:+, extra: $CHARSIU_OVL_EXTRA}"
 echo

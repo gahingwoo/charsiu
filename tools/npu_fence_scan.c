@@ -16,21 +16,21 @@
  *
  * So: one dispatch, one device, k and m FIXED, and only n moving.
  *
- * ⚠⚠ THE BUFFERS ARE ALLOCATED ONCE, AT THE WIDEST n IN THE SWEEP, AND REUSED.
+ * THE BUFFERS ARE ALLOCATED ONCE, AT THE WIDEST n IN THE SWEEP, AND REUSED.
  * This tree has already measured an allocation and called it a matmul: the
  * batched output buffer used to be allocated per tensor and the counter said
  * 225 allocations and 652 ms at ONE width, 36% of an 1811 ms round. A sweep
  * that reallocates per point measures malloc and mmap and IOVA, and the shape
  * of that is also "bigger n costs more".
  *
- * ⚠ AND THE FENCE STILL CONTAINS AN INVALIDATE. rocket_ioctl_prep_bo is a
+ * AND THE FENCE STILL CONTAINS AN INVALIDATE. rocket_ioctl_prep_bo is a
  * dma_resv wait followed by dma_sync_sgtable_for_cpu over the WHOLE buffer, so
  * with one buffer sized for the widest point that invalidate is a CONSTANT
  * across the sweep rather than something that grows with n. That is deliberate:
  * a constant lands in the intercept, and the slope is then the part that is
  * really about the width. Both are printed.
  *
- * ⚠⚠ AND IT REPEATS ONE SHAPE, WHICH THIS TREE HAS WARNED ABOUT IN WRITING.
+ * AND IT REPEATS ONE SHAPE, WHICH THIS TREE HAS WARNED ABOUT IN WRITING.
  *
  * bench_batch's own header says: "the first version looped on one tensor 200
  * times, which left it in cache and measured arithmetic rather than memory".
@@ -77,7 +77,7 @@ static const unsigned NS[] = { 256, 512, 1024, 2048, 3072, 4096, 6144, 8192 };
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -89,7 +89,7 @@ int main(int argc, char **argv)
 	unsigned m = argc > 2 ? (unsigned)atoi(argv[2]) : 80;
 	unsigned reps = argc > 3 ? (unsigned)atoi(argv[3]) : 20;
 	/*
-	 * ⚠⚠ COLD: a RING of weight buffers, so a repeat never re-reads the one
+	 * COLD: a RING of weight buffers, so a repeat never re-reads the one
 	 * before it. The warm sweep loops a single buffer, which is what
 	 * bench_batch's header warns leaves a tensor in cache -- and the two
 	 * readings of that sweep's slope (a cache, or a per channel floor) are
@@ -102,7 +102,7 @@ int main(int argc, char **argv)
 	 */
 	unsigned ring = argc > 4 ? (unsigned)atoi(argv[4]) : 1;
 	/*
-	 * ⚠ THE DTYPE, BECAUSE int8 IS NOT WHAT THE PREFILL RUNS. Every sweep
+	 * THE DTYPE, BECAUSE int8 IS NOT WHAT THE PREFILL RUNS. Every sweep
 	 * before this one dispatched int8, and the cost model fitted to it was
 	 * then carried to a w4a16 prefill by halving the weight bytes on paper.
 	 * The halving is an inference; this makes it a measurement. argv[5]:
@@ -110,7 +110,7 @@ int main(int argc, char **argv)
 	 * activations, which is the pair llama.c actually submits.
 	 */
 	/*
-	 * ⚠⚠ AND 48 IS w4a8, WHICH THE VENDOR RUNS AND THIS TREE NEVER HAS.
+	 * AND 48 IS w4a8, WHICH THE VENDOR RUNS AND THIS TREE NEVER HAS.
 	 *
 	 * CNA 0x100c bit 29 selects 16 bit activations (charsiu_int4.c's own
 	 * header, from diffing the vendor's int4 against its int8), and
@@ -127,7 +127,7 @@ int main(int argc, char **argv)
 	 * carry 0x20600120. Two activation precisions per weight, chosen by
 	 * batch width.
 	 *
-	 * ⚠ THE CALLER MUST ALSO SET CHARSIU_A8_STRIDE1, because
+	 * THE CALLER MUST ALSO SET CHARSIU_A8_STRIDE1, because
 	 * charsiu_effective_adtype is what every buffer size, the surface and
 	 * the packing derive from -- without it the stream would say 8 bit and
 	 * the buffers would still be built for 16, which is two descriptions of
@@ -255,7 +255,7 @@ int main(int argc, char **argv)
 		charsiu_bo_fini(dev, &reg);
 		if (!nreg) { printf("  %6u  the stream came back empty\n", NS[i]); continue; }
 		/*
-		 * ⚠ A STREAM PER RING ENTRY, because the weight address is IN
+		 * A STREAM PER RING ENTRY, because the weight address is IN
 		 * the stream. One stream reused would submit the same buffer
 		 * every time however many were allocated, and the ring would be
 		 * decoration -- the failure would look exactly like "the cache
@@ -292,7 +292,7 @@ int main(int argc, char **argv)
 			}
 			t1 = us();
 			charsiu_bo_prep(dev, &ob, 2000000000);
-			/* ⚠ the first repeat warms whatever the first repeat
+			/* the first repeat warms whatever the first repeat
 			 * warms; it is dropped rather than explained */
 			if (r) { sub[i] += t1 - t0; fen[i] += us() - t1; }
 			charsiu_bo_fini(dev, &ob);

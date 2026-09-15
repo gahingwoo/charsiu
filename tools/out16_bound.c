@@ -4,7 +4,7 @@
  * WHICH TENSORS COULD HAVE THEIR OUTPUT READ BACK AS fp16, AND WHAT SHARE OF
  * THE READ THAT IS.
  *
- * ⛔⛔ AND THE ROAD THIS SERVES IS CLOSED. Read this paragraph before acting on
+ * AND THE ROAD THIS SERVES IS CLOSED. Read this paragraph before acting on
  * anything below it.
  *
  * Rounds 167-168 swept the output width on the board and it has EXACTLY TWO
@@ -28,7 +28,7 @@
  * two bytes would be 0.47 -- against a TTFT gap to the vendor of 0.67 ms a row
  * on int8. So the whole gap is inside one read width.
  *
- * ⚠⚠ THE BOUND IS A STATIC PROPERTY OF THE WEIGHTS, WHICH IS WHY THIS TOOL
+ * THE BOUND IS A STATIC PROPERTY OF THE WEIGHTS, WHICH IS WHY THIS TOOL
  * EXISTS. At int8 the group is the whole row, so the DPU's per-channel requant
  * can apply exactly the scale the CPU applies now, and the hardware would emit
  * the requantised value in units of the activation scale. Every |a_q| <= 127,
@@ -40,16 +40,16 @@
  * exact; if it does not, the overflow is an inf and the token is destroyed. So
  * only the worst case can gate it, and the worst case is computable here.
  *
- * ⚠ IT IS A WORST CASE AND SAYS SO. It assumes every |a_q| is 127 and every
+ * IT IS A WORST CASE AND SAYS SO. It assumes every |a_q| is 127 and every
  * sign agrees. Real activations run about a third of that, so a tensor over
  * the line would probably not overflow in practice -- and "probably" is not a
  * thing to gate an inf on.
  *
- * ⚠ AND IT IS AN int8 QUESTION. At four bits the group is 1024 and the requant
+ * AND IT IS AN int8 QUESTION. At four bits the group is 1024 and the requant
  * is per channel, so the hardware cannot apply a per-group scale and the raw
  * accumulator is the only correct read. Nothing here applies to w4a16.
  *
- * ⚠⚠ AND THE K SPLIT IS A SECOND GATE, BUT ONLY FOR ONE OF THE TWO WIDTHS.
+ * AND THE K SPLIT IS A SECOND GATE, BUT ONLY FOR ONE OF THE TWO WIDTHS.
  * This is worth getting right because the obvious version of it is wrong.
  *
  * What makes a K split free today is `acc_out`: the hardware writes the raw
@@ -71,7 +71,7 @@
  * and it is the interesting number because one byte saves 0.70 ms a row where
  * two saves 0.47 and the gap is 0.67.
  *
- * ⚠ THE WEIGHTS ARE THE GGUF'S, NOT charsiu'S QUANTISATION OF THEM. The
+ * THE WEIGHTS ARE THE GGUF'S, NOT charsiu'S QUANTISATION OF THEM. The
  * hardware would emit sum a_q * w_q * w_scale and this sums |w| off the file.
  * They differ by the quantiser's error on a sum of thousands of magnitudes,
  * which is far below the 2.1x margins that decide anything here -- but if a
@@ -96,7 +96,7 @@
 /*
  * The tensors charsiu routes to the NPU: a 2-D weight it multiplies by.
  *
- * ⚠⚠ BY PROPERTY, NOT BY SPELLING, and the first version of this was by
+ * BY PROPERTY, NOT BY SPELLING, and the first version of this was by
  * spelling. A list of eight suffixes -- attn_q, attn_k, attn_v, ... -- read
  * Phi-3.5 as having no attention weights at all, because Phi fuses them into
  * `attn_qkv.weight` and no suffix matched. It reported four kinds where the
@@ -106,7 +106,7 @@
  * So: any 2-D tensor big enough to be a projection, minus the one named
  * exception.
  *
- * ⚠⚠ AND THE EXCEPTION IS CONDITIONAL, which the first version of it was not.
+ * AND THE EXCEPTION IS CONDITIONAL, which the first version of it was not.
  * token_embd is a LOOKUP and output.weight is the head -- EXCEPT where the
  * model ties them, and then llama.c does `m->output = m->tok_embd` and
  * token_embd IS the head. Excluding it there drops the single widest tensor
@@ -119,7 +119,7 @@ static int routed(const struct gguf_tensor *t, int tied)
 	if (t->n_dims != 2 || t->ne[0] < 32 || t->ne[1] < 32)
 		return 0;
 	/*
-	 * ⚠ EXACT, NOT A SUBSTRING. gemma4's per_layer_token_embd CONTAINS
+	 * EXACT, NOT A SUBSTRING. gemma4's per_layer_token_embd CONTAINS
 	 * "token_embd" and is a lookup in every model that has it, tied or
 	 * not -- llama.c reads a row of it per token. A substring test made
 	 * it the head on gemma4 and put a vocabulary-wide tensor into the
@@ -219,7 +219,7 @@ static int one(const char *path, unsigned kmax)
 		k = find(kinds, &nk, kn);
 		k->ntensor++;
 		/*
-		 * ⚠ PER K SLICE, because that is what is READ. Every slice
+		 * PER K SLICE, because that is what is READ. Every slice
 		 * writes the tensor's full n outputs and the CPU sums them,
 		 * so a tensor cut four ways is read four times over -- which
 		 * is exactly why ffn_down dominates the read and exactly why
@@ -288,7 +288,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--kmax") && i + 1 < argc)
 			kmax = (unsigned)strtoul(argv[++i], NULL, 10);
 	puts("The worst case a channel can emit, against fp16's 65504.");
-	puts("⚠ WORST CASE: every |a_q| = 127 and every sign agreeing. Real "
+	puts("WORST CASE: every |a_q| = 127 and every sign agreeing. Real "
 	     "activations run about a third of that -- but an overflow is an "
 	     "inf, so only the worst case can gate it.");
 	for (int i = 1; i < argc; i++) {

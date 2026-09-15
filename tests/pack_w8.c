@@ -4,7 +4,7 @@
  * charsiu_w8_offset against the packer that has written the int8 weight tile
  * since round 139, cell by cell.
  *
- * ⚠⚠ WHY THIS TEST AND NOT A READING OF THE FORMULA. An int8 KV surface is
+ * WHY THIS TEST AND NOT A READING OF THE FORMULA. An int8 KV surface is
  * written a position at a time, in place, by an offset function -- exactly
  * what charsiu_fp16_woffset does for the fp16 one. The whole safety of that
  * arrangement is that the offset function and the bulk packer describe the
@@ -104,7 +104,7 @@ out:
 }
 
 /*
- * ⚠ THE PROPERTY THE KV SURFACE RESTS ON. A surface is allocated at its final
+ * THE PROPERTY THE KV SURFACE RESTS ON. A surface is allocated at its final
  * width and read at whatever width the prompt has reached, so the offset of
  * (n, k) must be the same in a buffer of N1 channels and one of N2 -- for
  * every n and k -- as long as both widths are multiples of the n group. If
@@ -153,7 +153,7 @@ int main(void)
 	width_stable(64, 64, 1024, 1);
 	width_stable(64, 864, 1024, 1);
 	width_stable(128, 32, 256, 1);
-	/* ⚠ and 16, which is the fp16 surface's rung, is NOT */
+	/* and 16, which is the fp16 surface's rung, is NOT */
 	width_stable(64, 16, 1024, 0);
 	width_stable(64, 848, 1024, 0);
 

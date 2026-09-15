@@ -18,7 +18,7 @@
  * round 171 sparse map in round 280, and int4 has decoded bit-identical to
  * the CPU on the card since (14.70 tok/s on two cores).
  *
- * ⚠ THIS SAT RED FOR THIRTEEN DAYS after round 280: its map was the withdrawn
+ * THIS SAT RED FOR THIRTEEN DAYS after round 280: its map was the withdrawn
  * one and nobody ran make test, so a red here had come to mean nothing. It
  * means something again: a pass says the packer does what the board verified,
  * and a failure says the PACKER moved, since the hardware does not.

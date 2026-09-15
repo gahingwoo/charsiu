@@ -15,7 +15,7 @@
 # one chunk is m * kv elements, not m * head_dim. The counter is in the report
 # now and this script reads it rather than dividing.
 #
-# ⚠ THE CONVERSION IS NOT vcvt_f16_f32 AND MUST NOT BECOME IT. charsiu_f2h
+# THE CONVERSION IS NOT vcvt_f16_f32 AND MUST NOT BECOME IT. charsiu_f2h
 # truncates the mantissa and flushes subnormals; the hardware instruction
 # rounds to nearest even and keeps them. tests/pack_f16run.c walks all 2^32
 # float bit patterns against the scalar definition, on the desk, because the
@@ -91,7 +91,7 @@ for R in $REPS; do
 	A=; B=; PA=; PB=; NA=; NB=; TOK=; EL=; n=0
 	while [ $n -lt "$N" ]; do
 		n=$((n+1))
-		# ⚠ ALTERNATE, and run the SCALAR arm first at odd repeats and
+		# ALTERNATE, and run the SCALAR arm first at odd repeats and
 		# the vector one first at even, because running one arm before
 		# the other inside every repeat penalises whichever goes first
 		if [ $((n % 2)) -eq 1 ]; then
@@ -121,7 +121,7 @@ b=$(env $E CHARSIU_FP16_PACK=1 "$RUN" "$M" -p "$LAST" -n 24 --ignore-eos -q -c 1
 if [ "$a" = "$b" ]; then
 	echo "   identical: $(printf '%s' "$a" | md5sum | cut -c1-12)"
 else
-	echo "   ⛔ DIFFER"
+	echo "   DIFFER"
 	echo "   scalar $a"
 	echo "   vector $b"
 fi

@@ -16,7 +16,7 @@
  * group, on both sides of the submit -- and at 852 tokens that was 668 ms of
  * poisoning plus 581 of counting, more than the hardware's own 915.
  *
- * ⚠ ONE SENTINEL A ROW IS NOT A WEAKENING. A job writes its whole output or
+ * ONE SENTINEL A ROW IS NOT A WEAKENING. A job writes its whole output or
  * none of it, so a row whose first word survived is a row that was not
  * written. The every-cell form could only ever answer "all of it is poison"
  * or "not all of it" -- a half written output was accepted in silence. This
@@ -54,14 +54,14 @@ static inline int charsiu_poison_verdict(const uint32_t *o, unsigned m,
 }
 
 /*
- * ⚠⚠ IS THE BUFFER STILL POISONED FOR EXACTLY THIS GROUP?
+ * IS THE BUFFER STILL POISONED FOR EXACTLY THIS GROUP?
  *
  * The sentinels can be written early -- once the previous group's answers have
  * been read -- so that the release's cache flush carries them and the next
  * group skips a prep and a fini of the whole output buffer. That is only sound
  * while the shapes repeat, and this is the predicate that decides.
  *
- * ⛔ GETTING IT WRONG IS SILENT. If it says yes when the sentinels are not
+ * GETTING IT WRONG IS SILENT. If it says yes when the sentinels are not
  * there, the readback reads whatever was in the buffer, finds it is not
  * poison, and reports a healthy job -- which is what it would report for a
  * healthy job. The check would simply stop being a check, and nothing in a

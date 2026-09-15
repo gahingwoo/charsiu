@@ -28,7 +28,7 @@ for a in "$@"; do
 	case "$a" in
 	-q) QUIET=1 ;;
 	--run) DORUN=1 ;;
-	# ⚠ --paste is for an issue report, so it must be plain: no colour, no
+	# --paste is for an issue report, so it must be plain: no colour, no
 	# ANSI, and it carries the things that are always asked for anyway --
 	# which kernel, which dtb, which model, what rate.
 	--paste) PASTE=1 ;;
@@ -38,7 +38,7 @@ if [ "$PASTE" = 1 ]; then
 	printf '```\n'
 	printf 'charsiu-doctor --paste\n'
 	printf 'kernel   %s\n' "$(uname -r)"
-	# ⚠ tr succeeds on empty input, so `cat ... | tr ... || uname -m` never
+	# tr succeeds on empty input, so `cat ... | tr ... || uname -m` never
 	# reaches the fallback. Test the file instead of the pipeline.
 	if [ -r /proc/device-tree/model ]; then
 		printf 'machine  %s\n' "$(tr -d '\0' < /proc/device-tree/model)"
@@ -53,7 +53,7 @@ if [ "$PASTE" = 1 ]; then
 		[ "$(cat "$r/name")" = vdd_npu_s0 ] || continue
 		printf 'rail     vdd_npu_s0 %s\n' "$(cat "$r/state" 2>/dev/null)"
 	done
-	# ⚠ grep -c EXITS 1 WHEN THE COUNT IS ZERO, so `|| echo ?` fires on the
+	# grep -c EXITS 1 WHEN THE COUNT IS ZERO, so `|| echo ?` fires on the
 	# perfectly good answer "0" and both get printed. Capture, then default.
 	nf=$(dmesg 2>/dev/null | grep -c 'MMU_DTE_ADDR\|job timed out') || nf=${nf:-0}
 	printf 'faults   %s in dmesg\n' "${nf:-?}"
@@ -145,7 +145,7 @@ fi
 hdr "the configuration"
 if [ -f "$CONF" ]; then
 	ok "config at $CONF"
-	# ⚠ SAY WHICH CHANNEL. A dev install has the probes on it and a paste
+	# SAY WHICH CHANNEL. A dev install has the probes on it and a paste
 	# from one is a different thing to read: npu_gemm_test and
 	# charsiu_matmul can wedge the block, so "it hung" from a dev board and
 	# from a stable one are not the same report.
@@ -168,14 +168,14 @@ if [ -z "$M" ]; then
 elif [ ! -f "$M" ]; then
 	bad "$M does not exist. charsiu-get fetches one"
 else
-	# ⚠ busybox's stat needs FEATURE_STAT_FORMAT for -c and a rootfs here was
+	# busybox's stat needs FEATURE_STAT_FORMAT for -c and a rootfs here was
 	# built without it, so a 1321 MB model reported as 0 MB and the memory
 	# check below became meaningless. That is why file_bytes falls back to
 	# ls -ln rather than to wc -c: busybox's wc READS THE WHOLE FILE.
 	sz=$(( $(file_bytes "$M") / 1048576 ))
 	ok "$M (${sz} MB)"
 	if [ -n "$CK" ]; then
-		# ⚠ EXIT 3 IS NOT A FAILURE, it is "runnable, but not as a chat
+		# EXIT 3 IS NOT A FAILURE, it is "runnable, but not as a chat
 		# model". Reported as CANNOT it sends somebody to re-download a
 		# file that is fine and is simply in the wrong setting.
 		out=$("$CK" -q "$M" 2>&1) && _r=0 || _r=$?
@@ -203,7 +203,7 @@ else
 	fi
 fi
 
-# ⚠ WHAT ELSE IS ON THIS MACHINE, because the models directory stopped holding
+# WHAT ELSE IS ON THIS MACHINE, because the models directory stopped holding
 # only chat models and a person who pulled a whisper model has no way to ask
 # whether the binary that runs it got installed.
 hdr "the other things it can run"

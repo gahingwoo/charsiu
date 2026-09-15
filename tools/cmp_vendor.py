@@ -8,20 +8,20 @@ The vendor's own dispatches are the oracle: if what we build matches the geometr
 of what the closed runtime submits, the board round is a confirmation rather than
 a discovery. This runs entirely on a desktop.
 
-⚠ IT DIFFS THE EMITTER THAT ACTUALLY RUNS. This called build/emit_dump, which
+IT DIFFS THE EMITTER THAT ACTUALLY RUNS. This called build/emit_dump, which
 is regcmd.c -- a geometry only emitter nothing else uses. The stream that
 reaches the hardware comes from charsiu_emit_job() in job.c, and the two do not
 agree about the M axis, so every comparison this tool ran was of a file that no
 board has ever executed. build/emit_job is the product one.
 
-⚠ AND IT MERGES THE VENDOR'S TWO STREAMS. The vendor's matmul used to come back
+AND IT MERGES THE VENDOR'S TWO STREAMS. The vendor's matmul used to come back
 as a CNA stream and a DPU stream behind it; charsiu emits one. Comparing
 against the CNA stream alone reports every DPU register as "charsiu only",
 which is how the DPU's output width -- the register that decides whether M rows
 are written at all -- stayed invisible. rkllm_regcmd.py knowing target 0x0401
 has since joined the two, so the merge only fires on a fragment now.
 
-⚠⚠ AND IT NOW ASKS FOR acc_out, BECAUSE THE BOARD DOES. npudev.c's add_slice
+AND IT NOW ASKS FOR acc_out, BECAUSE THE BOARD DOES. npudev.c's add_slice
 sets job.acc_out = 1 on every staged projection slice, unconditionally, and
 emit_job only sets it from CHARSIU_ACC_OUT. Without it the tool compared a
 stream no projection has ever submitted, and reported 0x40b8 as a difference
@@ -34,7 +34,7 @@ Usage: cmp_vendor.py <model.rkllm> <M> <K> <N> [wdtype] [adtype]
        cmp_vendor.py <model.rkllm> --plan <K> <N>   how each side CUTS a tensor
        CHARSIU_M_AXIS=w cmp_vendor.py ...   compare the width axis form
 
-⚠ THE SHAPE YOU PASS IS ONE DISPATCH, NOT ONE TENSOR. charsiu slices a tensor
+THE SHAPE YOU PASS IS ONE DISPATCH, NOT ONE TENSOR. charsiu slices a tensor
 into ceil(K/KMAX) * ceil(N/NMAX) dispatches before any of this, so a register
 diff at a tensor's full shape compares something neither side submits. --plan
 is what compares the CUTS, and the cut is where the two stacks actually differ.
@@ -97,7 +97,7 @@ def vendor(path, m, k, n, bits):
             continue
         merged = dict(regs)
         #
-        # ⚠ ONLY IF THIS RUN IS MISSING ITS OWN DPU BLOCK. rkllm_regcmd.py now
+        # ONLY IF THIS RUN IS MISSING ITS OWN DPU BLOCK. rkllm_regcmd.py now
         # knows target 0x0401, so an op comes back as ONE run with its CNA,
         # its 0x2810 block and its DPU registers together, and merging the run
         # behind it would then pull in a DIFFERENT op's output stage. The merge
@@ -119,7 +119,7 @@ def census(path, m, bits):
     """Every (ic, oc) the vendor dispatches at this M and weight width, with
     the number of streams the file holds for each.
 
-    ⚠ THE STREAM COUNT IS NOT A DISPATCH COUNT. At one shape and one M the file
+    THE STREAM COUNT IS NOT A DISPATCH COUNT. At one shape and one M the file
     carries a stream per CBUF window as well as per piece of the tensor -- two
     of the four at K=2048 N=1024 differ from the other two ONLY in 0x1018,
     0x1038, 0x103c and 0x1040 -- and only one window runs on a given core. Read
@@ -155,7 +155,7 @@ def plan(path, k, n, kmax, nmax, wd):
             print("   %2d x  K=%-6d N=%-6d %8.2f MB of weights each"
                   % (cnt, kk, nn, kk * nn * per / 1e6))
     #
-    # ⚠ SUM(dispatches * N) IS THE NUMBER THAT MOVES, not the weight bytes.
+    # SUM(dispatches * N) IS THE NUMBER THAT MOVES, not the weight bytes.
     # Both sides read every weight once whatever the cut, so the weight column
     # is equal by construction and says nothing. What a K cut multiplies is the
     # PER OUTPUT CHANNEL work: every K piece writes the full N wide accumulator
@@ -169,7 +169,7 @@ def plan(path, k, n, kmax, nmax, wd):
     print("\nvendor: shapes in this file at M=1 that tile %d by %d exactly," % (k, n))
     print("        widest tile first -- and the widest is the one to read.")
     #
-    # ⚠ ARITHMETIC ALONE CANNOT PICK THE TILE. A 2048 by 2048 tensor is tiled
+    # ARITHMETIC ALONE CANNOT PICK THE TILE. A 2048 by 2048 tensor is tiled
     # exactly by their K=2048 N=1024 shape AND by their K=2048 N=256 one, and
     # both are in the file, because 256 is the k_proj half of a 512 wide tensor
     # and has nothing to do with q_proj. What settles it is the file's own
@@ -198,7 +198,7 @@ def main():
             return 1
         a = sys.argv
         k, n = int(a[3]), int(a[4])
-        # npudev.c's own defaults. ⚠ scripts/charsiu-runner writes its kslice,
+        # npudev.c's own defaults. scripts/charsiu-runner writes its kslice,
         # 1024 by default, into CHARSIU_NPU_KMAX -- and into W4_GROUP with it,
         # because npudev.c gates the int4 path on kgroup == kmax. So the board
         # runs a K cut this default does not show, and raising KMAX alone

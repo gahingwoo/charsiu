@@ -3,12 +3,12 @@
 /*
  * What is on the hardware, for any graph.
  *
- * ⚠ THIS WAS FIVE FIELDS INSIDE struct llama_state, and that is why the vision
+ * THIS WAS FIVE FIELDS INSIDE struct llama_state, and that is why the vision
  * tower, CLIP and whisper were all on the CPU: staging a weight was something
  * only the language model could do. Measured on the board at 0.6 G-mac/s, three
  * times, by three graphs that never touched the hardware they ran on.
  *
- * ⚠ ONE STAGING PATH. Everything a weight needs to reach the NPU is here once --
+ * ONE STAGING PATH. Everything a weight needs to reach the NPU is here once --
  * the requantised copy, CHARSIU_NPU_ONLY, and the maxn gate that kept an output
  * head on the CPU for a fortnight while saying nothing about it. A second copy
  * for the towers is how the two drift, and the maxn refusal is the proof: it
@@ -37,7 +37,7 @@ static double now_ms(void)
 double charsiu_pool_stage_ms;
 
 /*
- * ⚠⚠ THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE ONE NOTHING
+ * THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE ONE NOTHING
  * HAD EVER RUN. This is the gate the output head hits -- see the refusal
  * below, which already named the cost and kept the default that caused it.
  * 8192 is under every vocabulary this runtime loads, so under it that head
@@ -110,7 +110,7 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 	for (i = 0; i < p->n; i++)
 		if (p->key[i] == w) {
 			/*
-			 * ⚠⚠ THE SAME ADDRESS IS NOT THE SAME TENSOR. This
+			 * THE SAME ADDRESS IS NOT THE SAME TENSOR. This
 			 * keys on the pointer, and a caller that builds a
 			 * temporary struct gguf_tensor on the stack hands over
 			 * the SAME address with different weights behind it
@@ -146,7 +146,7 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 		return NULL;
 	}
 	/*
-	 * ⚠ w->name IS INSIDE THE MAPPED FILE for a whole tensor and inside
+	 * w->name IS INSIDE THE MAPPED FILE for a whole tensor and inside
 	 * the layer for one of phi3's slices; both outlive a crash.
 	 */
 	charsiu_note(w->name, (unsigned long)w->ne[1], (unsigned long)w->ne[0]);
@@ -165,7 +165,7 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 			p->id[p->n] = charsiu_npu_add(p->dev, &p->t[p->n]);
 		} else if (!only && w->ne[1] > (uint64_t)pool_maxn()) {
 			/*
-			 * ⚠ THE ONE REFUSAL THAT COST THE MOST AND SAID THE
+			 * THE ONE REFUSAL THAT COST THE MOST AND SAID THE
 			 * LEAST. Every other way onto the hardware whines when
 			 * it declines; this one only spoke under
 			 * CHARSIU_NPU_VERBOSE, and it is the gate the output
@@ -197,7 +197,7 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 }
 
 /*
- * ⚠⚠ THE BATCH IS CHUNKED, AND 32 IS THE ONLY WIDTH THAT HAS EVER BEEN CHECKED.
+ * THE BATCH IS CHUNKED, AND 32 IS THE ONLY WIDTH THAT HAS EVER BEEN CHECKED.
  *
  * charsiu_npu_matmul was verified at m = 2 to 32, against a CPU reference, value
  * for value. The towers hand it 1024 patches and 1500 encoder positions, and the
@@ -215,23 +215,23 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
  * has evidence behind it rather than the number that looks safe.
  */
 /*
- * ⚠ 64, AND THE BOARD SAID WHERE THE EDGE IS: 80 is the last width whose output
+ * 64, AND THE BOARD SAID WHERE THE EDGE IS: 80 is the last width whose output
  * is IDENTICAL to two rows, and 96 is the first that is not.
  *
  *     4 8 16 32 48 64 80   0.000000   identical
  *     96 112 128 ... 1024  56 to 95   a different tower
  *
- * ⚠ AND THE RATE IS FLAT ACROSS ALL OF THEM -- 78 to 81 s at every width, so
+ * AND THE RATE IS FLAT ACROSS ALL OF THEM -- 78 to 81 s at every width, so
  * there is nothing to buy by sitting next to the edge. 64 is inside it with a
  * whole step to spare, and what the sweep also showed is that the time is not
  * here at all: 75 of the tower's 82 s was the quantiser.
  *
- * ⚠ AND 80 WAS MEASURED ON ONE TOWER, at K = 768 and 3072. Whether the limit is
+ * AND 80 WAS MEASURED ON ONE TOWER, at K = 768 and 3072. Whether the limit is
  * m alone or m against K is not known, which is the other reason not to sit at
  * the edge.
  */
 /*
- * ⚠ 80 NOW, NOT 64, AND ON TWO MEASUREMENTS. The sweep above has 80 identical
+ * 80 NOW, NOT 64, AND ON TWO MEASUREMENTS. The sweep above has 80 identical
  * at K = 768 and 3072, and board_verify phase 18 has K = 3072 at 80 rows EXACT
  * against the row loop on the height axis (surface 7680; the next cell up,
  * 10240, is wrong and phase 19 walks the gap). When the tower took 82 s the
@@ -247,7 +247,7 @@ static unsigned rows_max(void)
 }
 
 /*
- * ⚠⚠ THE HEIGHT AXIS HAS A CEILING OF ITS OWN, AND PHASE 19 WALKED IT:
+ * THE HEIGHT AXIS HAS A CEILING OF ITS OWN, AND PHASE 19 WALKED IT:
  *
  *   surf x rows   4096  6144  7680  8192   exact
  *                 8960 10240               WRONG, every row, every channel
@@ -263,7 +263,7 @@ static unsigned rows_fit(const struct charsiu_npu_pool *p, uint64_t k)
 {
 	unsigned cap = rows_max();
 	/*
-	 * ⚠ THE SLICE, NOT THE TENSOR. npudev slices a tensor wider than its
+	 * THE SLICE, NOT THE TENSOR. npudev slices a tensor wider than its
 	 * kmax into dispatches of at most kmax, and the surface ceiling is per
 	 * DISPATCH. The first version of this took the whole K: SmolVLM's
 	 * idefics3 projector is K = 12288, which is three slices of 4096 and
@@ -339,7 +339,7 @@ int charsiu_pool_rowsn(struct charsiu_npu_pool *p,
 		const float *x = X + (size_t)done * k;
 
 		/*
-		 * ⚠ THE CHUNK IS THE UNIT OF REUSE. Whole-tensor calls in a
+		 * THE CHUNK IS THE UNIT OF REUSE. Whole-tensor calls in a
 		 * row would pack every chunk once per tensor, because the
 		 * input BO only ever holds the LAST chunk packed; all the
 		 * projections on one chunk before the next is what makes the
@@ -408,7 +408,7 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 		if (charsiu_npu_matmul(p->dev, (int)id, X + (size_t)done * k, c,
 				       Y + (size_t)done * n)) {
 			/*
-			 * ⚠ A REFUSAL PART WAY THROUGH LEAVES HALF AN ANSWER,
+			 * A REFUSAL PART WAY THROUGH LEAVES HALF AN ANSWER,
 			 * and the caller redoes the whole thing on the CPU, so
 			 * the rows already written are overwritten and nothing
 			 * is lost. It is counted separately because "it fell
@@ -427,7 +427,7 @@ int charsiu_pool_rows(struct charsiu_npu_pool *p, const struct gguf_tensor *w,
 }
 
 /*
- * ⚠ THE ONE LINE THAT SAYS WHETHER ANY OF THIS IS HAPPENING. Without it a run
+ * THE ONE LINE THAT SAYS WHETHER ANY OF THIS IS HAPPENING. Without it a run
  * that quietly fell back to the CPU looks exactly like a run that did not, and
  * the only visible difference is a wall clock that did not move -- which is how
  * a 17x got announced from a subtraction.
@@ -447,7 +447,7 @@ void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out)
 }
 
 /*
- * ⚠⚠ WHERE A BATCHED MATMUL'S TIME GOES, AND THE PART WITH NO NAME.
+ * WHERE A BATCHED MATMUL'S TIME GOES, AND THE PART WITH NO NAME.
  *
  * charsiu_npu_batch_split and charsiu_npu_batch_prep have counted five shares
  * of a batched call since they were written and NOTHING HAS EVER CALLED THEM.
@@ -463,14 +463,14 @@ void charsiu_pool_report(const struct charsiu_npu_pool *p, FILE *out)
  * batched matmul -- so the work is on this side of the ioctl and this is the
  * only thing that can say which part.
  *
- * ⚠ THE UNNAMED ROW IS THE POINT, not the five named ones. A previous round
+ * THE UNNAMED ROW IS THE POINT, not the five named ones. A previous round
  * named a 44% share and a 26% one had no name at all; optimising the first
  * while the second is unaccounted is how this tree has been caught before. The
  * denominator is charsiu_npu_batch_wall, the clock around every
  * charsiu_npu_matmul call, so whatever the five do not add up to is printed
  * rather than left out.
  *
- * ⚠ IT IS NOT THE POOL'S hw_ms, WHICH WOULD HAVE BEEN ZERO HERE. hw_ms is only
+ * IT IS NOT THE POOL'S hw_ms, WHICH WOULD HAVE BEEN ZERO HERE. hw_ms is only
  * incremented by charsiu_pool_rows, and only vision and whisper call that --
  * llama calls charsiu_npu_matmul directly. Dividing by it would have printed
  * nan or a divide by zero on exactly the workload this was written to explain.
@@ -516,7 +516,7 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 	fprintf(out, "    read  %8.1f ms  %5.1f%%  reading the accumulators "
 		"back\n", read, 100.0 * read / wall);
 	/*
-	 * ⚠ SAID EVEN WHEN ZERO, because zero is a fact about the model: a
+	 * SAID EVEN WHEN ZERO, because zero is a fact about the model: a
 	 * tensor is on this path only when it is UNGROUPED, so a grouped model
 	 * prints 0.0 here and an ungrouped one prints the largest line after
 	 * the fence and the read. It was 14 to 17% of the entry with no name.
@@ -527,7 +527,7 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 	fprintf(out, "    other %8.1f ms  %5.1f%%  %s\n", other,
 		100.0 * other / wall,
 		/*
-		 * ⚠ COMPARED AGAINST THE SHARES ANYONE WOULD ACTUALLY TARGET,
+		 * COMPARED AGAINST THE SHARES ANYONE WOULD ACTUALLY TARGET,
 		 * which is pack and read. The first board round tested it
 		 * against `prep` too, and prep collapsed to 0.2% once the
 		 * buffers went into a pool -- so a 3% unnamed share was
@@ -536,7 +536,7 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 		 * reader to skip the line.
 		 */
 		other > pack || other > read
-		? "⚠ LARGER THAN A SHARE WORTH OPTIMISING -- name it first"
+		? "LARGER THAN A SHARE WORTH OPTIMISING -- name it first"
 		: "unaccounted");
 	if (nbuf)
 		fprintf(out, "    (%u batch buffer allocations, %.1f ms, inside "
@@ -552,7 +552,7 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 
 		charsiu_npu_reuse_stats(p->dev, &hits, &misses, why);
 		/*
-		 * ⚠ SAID EVEN WHEN ZERO. A reuse that silently never fired
+		 * SAID EVEN WHEN ZERO. A reuse that silently never fired
 		 * would read as "pack did not move", which is a different
 		 * fact from "the declaration was never honoured".
 		 */
@@ -576,7 +576,7 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 }
 
 /*
- * ⚠ WHERE A CACHE GOES. Not beside the model: that directory is the user's and
+ * WHERE A CACHE GOES. Not beside the model: that directory is the user's and
  * an 85 MB file appearing in it unasked is a surprise. XDG_CACHE_HOME is the
  * place for a file that can be deleted without losing anything, and this one
  * can -- it rebuilds in the time it saves.
@@ -618,7 +618,7 @@ int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
 	for (i = 0; i < n; i++)
 		if (w[i] && charsiu_pool_get(p, w[i]))
 			staged++;
-	/* ⚠ STAGED IS NOT ROUTED. charsiu_pool_get returns the quantised copy
+	/* STAGED IS NOT ROUTED. charsiu_pool_get returns the quantised copy
 	 * whether or not the hardware took it, and the first version of this
 	 * message said "on the NPU" about both. */
 	{
@@ -630,7 +630,7 @@ int charsiu_pool_stage_all(struct charsiu_npu_pool *p,
 		staged = on;
 	}
 	/*
-	 * ⚠ HAND IT BACK. The language model stages after this in the same
+	 * HAND IT BACK. The language model stages after this in the same
 	 * process when a picture is part of a prompt, and it has its own file.
 	 */
 	if (cache)

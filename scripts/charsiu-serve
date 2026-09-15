@@ -4,7 +4,7 @@
 # `charsiu serve`. Not meant to be run directly; charsiu dispatches to it.
 #
 # It exists to turn config.ini into the environment the NPU path needs, which is
-# the same job the runner does for a conversation. ⚠ Six variables decide whether
+# the same job the runner does for a conversation. Six variables decide whether
 # a decode reaches the NPU at all, and getting one wrong does not fail loudly, it
 # quietly runs a third as fast on the CPU. KMAX and W4_GROUP must be EQUAL.
 set -eu
@@ -26,7 +26,7 @@ BIN=$(find_bin charsiu_serve)
 [ -n "$BIN" ] || { echo "charsiu serve: charsiu_serve is not built" >&2; exit 1; }
 
 MODEL="${CHARSIU_MODEL:-$(ini_get model path)}"
-# ⚠ THE SAME FALLBACK THE RUNNER HAS. It was added there and not here, so a
+# THE SAME FALLBACK THE RUNNER HAS. It was added there and not here, so a
 # config naming a model that is gone worked from `charsiu` and died from
 # `charsiu serve`, which is a worse place to find out.
 if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
@@ -66,10 +66,10 @@ esac
 POOLCPUS=$(ini_get run pool_cpus)
 [ -n "$POOLCPUS" ] && env_default CHARSIU_POOL_CPUS "$POOLCPUS"
 
-# ⚠ Tell whoever started it where to point a browser. "listening on 0.0.0.0" is
+# Tell whoever started it where to point a browser. "listening on 0.0.0.0" is
 # not an address anybody can type.
 #
-# ⚠ AND THE PORT HAS TO BE THE REAL ONE. The first version printed the default
+# AND THE PORT HAS TO BE THE REAL ONE. The first version printed the default
 # whatever --port said, which is worse than printing nothing: it hands somebody
 # an address that does not answer and sends them looking for a network fault.
 PORT=11434

@@ -4,7 +4,7 @@
 #
 # How many rows can the batched matmul actually do?
 #
-# ⚠ THE ANSWER IS 32 AND THE QUESTION HAS NEVER BEEN ASKED ABOVE IT.
+# THE ANSWER IS 32 AND THE QUESTION HAS NEVER BEEN ASKED ABOVE IT.
 # charsiu_npu_matmul was checked value for value at m = 2 to 32. The towers hand
 # it 1024 and 1500, and the first board round that did so produced a picture the
 # model called "I am not sure" and an EMPTY transcript -- while CLIP, whose tower
@@ -14,7 +14,7 @@
 # m = 320 and the row split above m = 640. That is a prediction, and this is the
 # measurement.
 #
-# ⚠⚠ THE ORACLE IS THE NPU AT ONE ROW, NOT THE CPU. The tower on the hardware is
+# THE ORACLE IS THE NPU AT ONE ROW, NOT THE CPU. The tower on the hardware is
 # int8 and on the CPU it is f32, so the two differ by the quantisation whatever
 # the batch does -- the board's CLIP scored 0.2662 against the CPU's 0.2745 and
 # was RIGHT. Comparing against the CPU would call that a failure at every width
@@ -35,8 +35,8 @@ fi
 [ -n "$MM" ] && [ -f "$MM" ] || { echo "usage: board_rows_sweep.sh MMPROJ.gguf" >&2; exit 1; }
 
 #
-# ⚠ NO BUILD LINE HERE. charsiu_vision is compiled with the same -DCHARSIU_BUILD
-# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# NO BUILD LINE HERE. charsiu_vision is compiled with the same -DCHARSIU_BUILD
+# THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
 # no --version to print it back" and warned that its first argument is read
 # through atoi, so asking would submit a dimension of zero. Both halves were
 # true when written; the flag went into every tool afterwards and is checked
@@ -59,7 +59,7 @@ t0=$(ms)
 "$VIS" "$MM" --encode > "$T/cpu.txt"
 echo "  $(awk -v m="$(( $(ms) - t0 ))" 'BEGIN{printf "%.1f", m/1000}') s, $(wc -l < "$T/cpu.txt") values"
 
-# ⚠⚠ TWO ROWS, NOT ONE. charsiu_npu_matmul REFUSES m = 1 -- a decode has its own
+# TWO ROWS, NOT ONE. charsiu_npu_matmul REFUSES m = 1 -- a decode has its own
 # path -- so ROWS_MAX=1 falls back to the CPU for every chunk, and the first run
 # of this sweep printed "int8 against the CPU's f32: 0.000e+00" and did not stop.
 # A reference that is secretly the thing it is a reference FOR is worse than no
@@ -85,7 +85,7 @@ if [ "$Q" = "0.000000" ]; then
 fi
 echo
 
-# ⚠ SWEEP BOTH AXES. This tower's matmuls are int8 and this sweep has only ever
+# SWEEP BOTH AXES. This tower's matmuls are int8 and this sweep has only ever
 # run them with M on the HEIGHT: one column, M rows. That is the arrangement
 # that stops being exact at 96.
 #
@@ -95,7 +95,7 @@ echo
 # sweep found may be a property of the axis rather than of the hardware, and the
 # question costs one more pass.
 #
-# ⚠ THE HEIGHT ARM IS THE CONTROL and runs first. It must reproduce the known
+# THE HEIGHT ARM IS THE CONTROL and runs first. It must reproduce the known
 # bound; if it does not, the board or the build has changed and neither arm
 # means anything.
 for AXIS in h w; do
@@ -114,11 +114,11 @@ for R in 4 8 16 32 48 64 80 96 112 128 160 256 512 1024; do
 		continue
 	fi
 	SEC=$(awk -v m="$(( $(ms) - t0 ))" 'BEGIN{printf "%.1f", m/1000}')
-	# ⚠ line 1 is the shape; compare the numbers only
+	# line 1 is the shape; compare the numbers only
 	D=$(paste "$T/ref.txt" "$T/npu.txt" | awk 'NR==1{next}
 		{d = $1 - $2; if (d < 0) d = -d; if (d > w) w = d}
 		END{printf "%.6f", w}')
-	# ⚠ EXACT. Same weights, same quantisation, same kernel: only the number
+	# EXACT. Same weights, same quantisation, same kernel: only the number
 	# of rows in a submit differs, and that must not change an output at all.
 	V=$(awk -v d="$D" 'BEGIN{print (d == 0) ? "identical" : "DIFFERS"}')
 	printf '%8s  %10s  %12s  %s\n' "$R" "$SEC" "$D" "$V"

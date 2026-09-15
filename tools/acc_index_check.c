@@ -4,7 +4,7 @@
  *
  * Is the accumulator read order a bijection at this batch width?
  *
- * ⚠⚠ THIS IS THE CHECK THAT SHOULD HAVE EXISTED BEFORE THE FIRST BOARD ROUND.
+ * THIS IS THE CHECK THAT SHOULD HAVE EXISTED BEFORE THE FIRST BOARD ROUND.
  *
  * Four rounds went into asking the hardware which batch widths are wrong, and
  * the answer was in charsiu_acc_index the whole time. In its roleswap2 branch

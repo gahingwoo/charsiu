@@ -4,7 +4,7 @@
 #
 # How many threads, and on which cores?
 #
-# ⚠ THE TOWERS PIN NOTHING. charsiu-runner writes CHARSIU_CPUS from [run] cpus
+# THE TOWERS PIN NOTHING. charsiu-runner writes CHARSIU_CPUS from [run] cpus
 # for the language model; charsiu_whisper and charsiu_vision are their own
 # commands and nobody sets it for them, so pool_start takes every core the
 # machine has. On this board that is four A53s and four A72s, and a barrier
@@ -20,8 +20,8 @@ set -eu
 
 DIR=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 #
-# ⚠ NO BUILD LINE HERE. charsiu_whisper is compiled with the same -DCHARSIU_BUILD
-# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# NO BUILD LINE HERE. charsiu_whisper is compiled with the same -DCHARSIU_BUILD
+# THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
 # no --version to print it back" and warned that its first argument is read
 # through atoi, so asking would submit a dimension of zero. Both halves were
 # true when written; the flag went into every tool afterwards and is checked
@@ -64,5 +64,5 @@ run "4 threads on the A53s"       CHARSIU_NPU=1 CHARSIU_THREADS=4 CHARSIU_CPUS=0
 run "2 threads on the A72s"       CHARSIU_NPU=1 CHARSIU_THREADS=2 CHARSIU_CPUS=4-7
 run "1 thread"                    CHARSIU_NPU=1 CHARSIU_THREADS=1
 echo
-echo "⚠ A barrier waits for the slowest range, so a row on the A53s holds the"
+echo "A barrier waits for the slowest range, so a row on the A53s holds the"
 echo "  A72s up. If 4 on the A72s beats 8 on everything, that is what it is."

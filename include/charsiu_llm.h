@@ -185,7 +185,7 @@ void charsiu_act_free(struct charsiu_act *a);
  */
 void charsiu_act_set(struct charsiu_act *a, const float *x, int n);
 /*
- * ⚠ CALL THESE ON THE CALLING THREAD, BEFORE ANY FAN OUT. They fill a buffer
+ * CALL THESE ON THE CALLING THREAD, BEFORE ANY FAN OUT. They fill a buffer
  * shared by every worker, so realising one from inside gguf_matvec or
  * npu_matvec -- both of which run on the pool -- is a race.
  */
@@ -209,7 +209,7 @@ void charsiu_act_q1(struct charsiu_act *a);
  */
 struct npu_tensor {
 	/*
-	 * ⚠ TWO LAYOUTS, AND npu_q_packed() IN src/npuquant.c DECIDES WHICH.
+	 * TWO LAYOUTS, AND npu_q_packed() IN src/npuquant.c DECIDES WHICH.
 	 * [n][k] one signed byte a code for int8, or [n][(k+1)/2] with two int4
 	 * codes a byte -- low nibble the even column, each ROW byte aligned so
 	 * a reader strides by npu_q_stride() and the column alone picks the
@@ -308,7 +308,7 @@ struct charsiu_npu;
 /*
  * want_w4: -1 asks CHARSIU_NPU_W4V, 0 forces int8, 1 forces int4.
  *
- * ⚠ A CALLER THAT BATCHES MUST FORCE int8. w4a16 makes exactly one row whatever
+ * A CALLER THAT BATCHES MUST FORCE int8. w4a16 makes exactly one row whatever
  * it is asked for, so a device opened in int4 turns a 1024 row tower into 1024
  * dispatches -- correct, and slower than the CPU it was moved off.
  */
@@ -352,7 +352,7 @@ int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
  * exactly the misuse this cannot see.
  */
 /*
- * ⭐⭐ THE SAME MATMUL, BUT THE ANSWER STAYS IN THE DEVICE BUFFER.
+ * THE SAME MATMUL, BUT THE ANSWER STAYS IN THE DEVICE BUFFER.
  *
  * Y is NOT written when these return. It is written by the next
  * charsiu_npu_matmul* call on this pool -- from just after that call's SUBMIT,
@@ -364,7 +364,7 @@ int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
  * the fence is a sleeping ioctl with every core idle. CHARSIU_NPU_NO_READ=1
  * measured the ceiling for moving it at 5450 ms against 6931.
  *
- * ⚠⚠ A MISSED FLUSH IS FLUENT WRONG TEXT, NOT A CRASH. Use these only where
+ * A MISSED FLUSH IS FLUENT WRONG TEXT, NOT A CRASH. Use these only where
  * the very next thing is another matmul that does not read Y -- gate before
  * up, q before k -- and call charsiu_npu_flush before anything reads Y,
  * including the fallback path where the next matmul never reaches the NPU.
@@ -462,14 +462,14 @@ void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
  * rather than a saving on top of it. One wastes a little of the output, the
  * other a little of the reduction, and neither needs a repack.
  *
- * ⚠ THE LAYOUT IS ONLY STABLE WHERE EVERY GROUP IS FULL. charsiu_fp16_woffset
+ * THE LAYOUT IS ONLY STABLE WHERE EVERY GROUP IS FULL. charsiu_fp16_woffset
  * is (n/16)*16*ke + (k/32)*32*ngsz + (n%16)*kgsz + k%32, and ngsz is 16 for
  * every group except a partial last one, ke is the padded k. So an offset does
  * not depend on n at all when n is a multiple of 16 -- append along n freely --
  * and it DOES depend on k through ke, so a buffer that will grow along k must
  * be allocated at its final k and run at that k with the unused part zero.
  *
- * ⭐ OR ALLOCATED AT THE FINAL k AND RUN AT A SMALLER ONE, which is the third
+ * OR ALLOCATED AT THE FINAL k AND RUN AT A SMALLER ONE, which is the third
  * option and the one a KV ladder wants. charsiu_fp16_w_alloc_room takes the
  * room to reserve separately from the k the buffer is currently laid out at;
  * charsiu_fp16_w_set_k moves that k up once the caller has re-laid the bytes
@@ -478,7 +478,7 @@ void charsiu_fp16_stats(const struct charsiu_fp16 *f, unsigned long *calls,
  * first, and that is n_layer * n_kv buffer objects a rung -- 128 on
  * Llama-3.2-1B and 1024 on a 32 layer model with no GQA.
  *
- * ⚠ set_k does NOT move any bytes and does not check that anybody did. It is
+ * set_k does NOT move any bytes and does not check that anybody did. It is
  * the caller saying "the layout is now this", and the caller has to have made
  * that true.
  */
@@ -503,7 +503,7 @@ struct charsiu_fp16_op {
 	float *Y;                      /* NULL to read it where it lies */
 	unsigned m, k, n;
 	/*
-	 * ⚠ ROW STRIDES, because attention's rows live inside wider arrays and
+	 * ROW STRIDES, because attention's rows live inside wider arrays and
 	 * a gather is a copy of exactly the data the pack is about to read
 	 * anyway. 0 means tight: k for X, n for Y.
 	 *
@@ -515,7 +515,7 @@ struct charsiu_fp16_op {
 	 */
 	unsigned xstride, ystride;
 	/*
-	 * ⚠ A CAUSAL TRIANGLE, so the pack does not convert the zeros.
+	 * A CAUSAL TRIANGLE, so the pack does not convert the zeros.
 	 *
 	 * Attention's values matmul contracts over k = THE CONTEXT LENGTH
 	 * whatever the prompt has reached, because the V surface is packed at
@@ -528,7 +528,7 @@ struct charsiu_fp16_op {
 	 * On an 852 token prompt at k = 1024 that is 58% of every element the
 	 * pack touches. With xtri0 set the tail is a memset instead.
 	 *
-	 * ⚠⚠ AND IT IS NOT AN OPTIMISATION ANY MORE. The caller used to zero
+	 * AND IT IS NOT AN OPTIMISATION ANY MORE. The caller used to zero
 	 * that tail itself and this only saved converting a zero into a zero;
 	 * since the caller stopped (it was 58% of a row, in the one stage of
 	 * that path with no pool behind it), what lies past xtri0 + r is the
@@ -542,14 +542,14 @@ struct charsiu_fp16_op {
 	 *
 	 * 0 means no promise and everything is converted.
 	 *
-	 * ⚠ memset is the right filler and that is not obvious: charsiu_f2h
+	 * memset is the right filler and that is not obvious: charsiu_f2h
 	 * maps +0.0 to 0x0000 but -0.0 to 0x8000, so this is only equivalent
 	 * because every zero in that tail is a written +0.0 or an untouched
 	 * calloc, never a negative zero.
 	 */
 	unsigned xtri0;
 	/*
-	 * ⭐⭐ THE CALLER PRODUCES THE HALVES ITSELF, instead of handing over
+	 * THE CALLER PRODUCES THE HALVES ITSELF, instead of handing over
 	 * floats for this to convert.
 	 *
 	 * Attention's values matmul takes the softmax's output, and the
@@ -568,7 +568,7 @@ struct charsiu_fp16_op {
 	 * them. The call happens on the pool, one op a worker, so the callback
 	 * must not touch anything the other ops touch.
 	 *
-	 * ⚠ n IS THE LIVE LENGTH AND THE TAIL IS ALREADY ZERO. A callback that
+	 * n IS THE LIVE LENGTH AND THE TAIL IS ALREADY ZERO. A callback that
 	 * writes fewer than n halves leaves whatever the last group left
 	 * there, which is a plausible wrong answer; one that writes more runs
 	 * into the next row.
@@ -603,13 +603,13 @@ void charsiu_fp16_poison_and_release(struct charsiu_fp16 *f);
 int charsiu_fp16_reserve(struct charsiu_fp16 *f,
 			 const struct charsiu_fp16_op *ops, unsigned nops);
 /*
- * ⭐ THE SAME GROUP IN TWO HALVES, so a caller can do CPU work while the
+ * THE SAME GROUP IN TWO HALVES, so a caller can do CPU work while the
  * hardware runs. submit() returns as soon as the job is queued; wait() takes
  * the fence and reads the answers back. One group in flight per unit: a
  * second submit before the wait is a caller bug, and a wait with nothing in
  * flight returns -1.
  *
- * ⚠ THE OPS ARE COPIED, THE BUFFERS THEY NAME ARE NOT. X, Y, W and the fill
+ * THE OPS ARE COPIED, THE BUFFERS THEY NAME ARE NOT. X, Y, W and the fill
  * context must all still be alive and unchanged at the wait.
  */
 int charsiu_fp16_matmul_group_submit(struct charsiu_fp16 *f,
@@ -635,7 +635,7 @@ struct charsiu_fp16_times {
 	 * dma_sync the WHOLE buffer object, and `want` grows it and never
 	 * shrinks it, so a group that packs 32 kB can pay for 384. */
 	double psync;
-	/* ⚠ plan is release + make_plan + want, and `other` is whatever the
+	/* plan is release + make_plan + want, and `other` is whatever the
 	 * call took that none of the rest names. It exists because the layer
 	 * timer said 2929 ms in the two group calls while these fields
 	 * accounted for 2128, and an 800 ms hole is not something to reason
@@ -708,7 +708,7 @@ void gguf_matvec(const struct gguf_tensor *w, const struct charsiu_act *a,
 /*
  * The two kernels an attention is made of, which is not a matmul against a
  * weight and so has none of the machinery above. NEON where there is NEON.
- * ⚠ The summation order is not the scalar loop's.
+ * The summation order is not the scalar loop's.
  */
 float charsiu_dot_f32(const float *a, const float *b, uint64_t n);
 void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
@@ -717,7 +717,7 @@ void charsiu_axpy_f32(float *y, const float *x, float a, uint64_t n);
  * x[i] <- e^(x[i] - m), in place, returning the sum -- the middle pass of every
  * softmax in this tree, done in one read of the row instead of two.
  *
- * ⚠⚠ THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED. A ViT softmax is n^2 of
+ * THE EXPONENTIAL IS THE ARITHMETIC NOBODY COUNTED. A ViT softmax is n^2 of
  * them a head, and the vision tower is 1024 against 1024 over twelve heads and
  * twelve layers: 151 million for one picture, against a feed forward's 131072 a
  * token. glibc's expf measured 23 ns an element on the board.
@@ -733,7 +733,7 @@ float charsiu_expsum_f32(float *x, uint64_t n, float m);
  * as [n][n_embd] and the scores as [nq][key_tile], and the accumulator is
  * either a contiguous block or a slice of the output rows.
  *
- * ⚠ THE POINT IS THE ACCUMULATOR STAYING IN REGISTERS. One axpy per (query,
+ * THE POINT IS THE ACCUMULATOR STAYING IN REGISTERS. One axpy per (query,
  * key) pays two vector loads and a store for every FMA; holding four
  * accumulators across the tile pays half a memory operation per FMA. Bit
  * identical: the sum over j for any one output element is in the same order.
@@ -748,7 +748,7 @@ void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
  * product per pair reloads both operands for every FMA, and four queries
  * against two keys reuses each.
  *
- * ⚠ BIT IDENTICAL, INCLUDING THE LANES. dot_f32 sums in two vectors and
+ * BIT IDENTICAL, INCLUDING THE LANES. dot_f32 sums in two vectors and
  * reduces at the end; this keeps two accumulators per pair so it reproduces
  * that exactly, which is what caps the block at 4 x 2 rather than 4 x 4.
  */
@@ -785,7 +785,7 @@ int tokenizer_encode(const struct tokenizer *tk, const char *text,
 const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
 
 /*
- * ⚠ THE CHAT TEMPLATE IS NOT THE SAME FOR EVERY MODEL, and both tools wrote
+ * THE CHAT TEMPLATE IS NOT THE SAME FOR EVERY MODEL, and both tools wrote
  * the Llama 3 one for all of them. SmolLM2, which is what the setup wizard
  * downloads by default, uses ChatML, saw the Llama headers as ordinary text
  * and answered with them. The gguf carries a Jinja template in
@@ -795,7 +795,7 @@ const char *tokenizer_decode(const struct tokenizer *tk, int32_t id, int *len);
 enum chat_fmt {
 	CHAT_LLAMA3 = 0, CHAT_CHATML = 1, CHAT_PHI3 = 2, CHAT_GEMMA = 3,
 	/*
-	 * ⚠ gemma4 IS NOT gemma3's FORMAT. It opens a turn with <|turn> and
+	 * gemma4 IS NOT gemma3's FORMAT. It opens a turn with <|turn> and
 	 * closes it with <turn|> -- the same four characters mirrored -- where
 	 * gemma3 used <start_of_turn> and <end_of_turn>, and neither of those
 	 * is in gemma4's vocabulary at all. A file whose markers are not found
@@ -833,14 +833,14 @@ struct llama_layer {
 	const struct gguf_tensor *attn_norm;
 	const struct gguf_tensor *wq, *wk, *wv, *wo;
 	/*
-	 * ⚠ qwen2 IS A LLAMA WITH THREE MORE TENSORS. Measured against
+	 * qwen2 IS A LLAMA WITH THREE MORE TENSORS. Measured against
 	 * Qwen2.5-1.5B-Instruct-Q4_0: identical nine weights a layer, plus a
 	 * bias on each of Q, K and V, f32 and one dimensional, sized exactly
 	 * like the projections they follow. NULL on llama, which has none.
 	 */
 	const struct gguf_tensor *bq, *bk, *bv;
 	/*
-	 * ⚠ qwen3 DROPPED THE BIASES AND ADDED THESE. One gain of head_dim
+	 * qwen3 DROPPED THE BIASES AND ADDED THESE. One gain of head_dim
 	 * each, shared by every head, applied to q and k AFTER the projection
 	 * and BEFORE rope -- the same order the bias has to keep, and for the
 	 * same reason: normalising a rotated vector is not normalising it.
@@ -849,14 +849,14 @@ struct llama_layer {
 	 */
 	const struct gguf_tensor *q_norm, *k_norm;
 	/*
-	 * ⚠ gemma NORMALISES THE BRANCH, NOT JUST THE INPUT TO IT. These sit
+	 * gemma NORMALISES THE BRANCH, NOT JUST THE INPUT TO IT. These sit
 	 * between the projection and the residual add -- after attn_output and
 	 * after ffn_down -- which is a second norm a layer that no llama has.
 	 * NULL everywhere else.
 	 */
 	const struct gguf_tensor *attn_post_norm, *ffn_post_norm;
 	/*
-	 * ⚠ gemma4's PER LAYER EMBEDDING, which is where its "E2B" name comes
+	 * gemma4's PER LAYER EMBEDDING, which is where its "E2B" name comes
 	 * from: the model carries more parameters than it activates, and this
 	 * is the path that decides which. After the feed forward's residual a
 	 * layer gates itself against a slice of a second embedding table, and
@@ -868,14 +868,14 @@ struct llama_layer {
 	/* one scalar the whole layer output is multiplied by, gemma4 only */
 	const struct gguf_tensor *out_scale;
 	/*
-	 * ⚠ PER LAYER ROPE FACTORS, and only the FULL attention layers have
+	 * PER LAYER ROPE FACTORS, and only the FULL attention layers have
 	 * them. gemma4 gives its window layers a plain rotation and its global
 	 * ones a scaled one, which is a second axis on top of the two bases
 	 * gemma3 already needed.
 	 */
 	const struct gguf_tensor *rope_freqs;
 	/*
-	 * ⚠ gemma4 GIVES EVERY LAYER ITS OWN SHAPE. feed_forward_length is an
+	 * gemma4 GIVES EVERY LAYER ITS OWN SHAPE. feed_forward_length is an
 	 * ARRAY -- 6144 for its first fifteen layers and 12288 after -- and a
 	 * window layer's head is 256 where a full layer's is 512. Nothing
 	 * before this had either, so n_ff and head_dim were model wide and are
@@ -883,7 +883,7 @@ struct llama_layer {
 	 */
 	uint32_t n_ff, head_dim;
 	/*
-	 * ⚠ WHICH LAYER'S KV THIS ONE READS. gemma4 shares the cache: the
+	 * WHICH LAYER'S KV THIS ONE READS. gemma4 shares the cache: the
 	 * layers past attention.shared_kv_layers have no wk or wv at all and
 	 * attend against an earlier layer's. -1 means its own.
 	 */
@@ -893,7 +893,7 @@ struct llama_layer {
 	const struct gguf_tensor *ffn_norm;
 	const struct gguf_tensor *gate, *up, *down;
 	/*
-	 * ⚠ phi3 STACKS ITS PROJECTIONS: one attn_qkv holding q, k and v, and
+	 * phi3 STACKS ITS PROJECTIONS: one attn_qkv holding q, k and v, and
 	 * one ffn_up holding gate and up. A row range of a row-major tensor is
 	 * contiguous, so the halves are the same bytes at an offset -- these
 	 * are the descriptors the pointers above are aimed at, not copies.
@@ -908,7 +908,7 @@ struct llama_model {
 	uint32_t n_embd, n_layer, n_head, n_head_kv, n_ff, n_vocab;
 	uint32_t head_dim, n_ctx_train;
 	/*
-	 * ⚠ n_head * head_dim, WHICH IS NOT ALWAYS n_embd. It is on llama,
+	 * n_head * head_dim, WHICH IS NOT ALWAYS n_embd. It is on llama,
 	 * qwen2 and phi3, and assuming so is what sized every buffer here for
 	 * three architectures. Qwen3-0.6B is 16 heads of 128 against an
 	 * embedding of 1024, so attention produces 2048 floats and feeds them
@@ -924,13 +924,13 @@ struct llama_model {
 	 * them. n_swa 0 means every layer is a full one, which is every
 	 * architecture before this.
 	 *
-	 * ⚠ The two kinds of layer also ROTATE DIFFERENTLY. A window layer
+	 * The two kinds of layer also ROTATE DIFFERENTLY. A window layer
 	 * uses rope_base_swa (10000 in the files measured) and a full one
 	 * rope_base (1000000), so a token needs two angle tables, not one.
 	 */
 	uint32_t n_swa, swa_pattern;
 	/*
-	 * ⚠ gemma4 writes sliding_window_pattern as an ARRAY, one flag a
+	 * gemma4 writes sliding_window_pattern as an ARRAY, one flag a
 	 * layer, where gemma3 writes a scalar period. When this is set it wins:
 	 * gemma4's pattern is not periodic and a period cannot express it.
 	 */
@@ -949,7 +949,7 @@ struct llama_model {
 	int v_norm;
 
 	/*
-	 * ⚠ THE ATTENTION SCALE IS NOT ALWAYS 1/sqrt(head_dim). gemma4 sets it
+	 * THE ATTENTION SCALE IS NOT ALWAYS 1/sqrt(head_dim). gemma4 sets it
 	 * to 1.0 -- its python calls that self.scaling = 1.0 -- and folds the
 	 * scaling into the QK norms instead. Getting this wrong does not crash
 	 * and does not look wrong; it flattens or sharpens every softmax in
@@ -963,7 +963,7 @@ struct llama_model {
 	const struct gguf_tensor *pl_model_proj;
 	const struct gguf_tensor *pl_proj_norm;
 	/*
-	 * ⚠ A SWA LAYER MAY HAVE A DIFFERENT HEAD LENGTH from a full one.
+	 * A SWA LAYER MAY HAVE A DIFFERENT HEAD LENGTH from a full one.
 	 * gemma4 declares attention.key_length_swa separately, and the KV cache
 	 * has to be sized for the larger of the two.
 	 */
@@ -986,13 +986,13 @@ struct llama_model {
 /*
  * WHAT IS ON THE HARDWARE, and how a weight gets there.
  *
- * ⚠ THIS USED TO BE FIVE FIELDS INSIDE struct llama_state, which meant the only
+ * THIS USED TO BE FIVE FIELDS INSIDE struct llama_state, which meant the only
  * graph that could reach the NPU was the language model. The vision tower, CLIP
  * and whisper are not llama and were therefore all on the CPU -- measured on the
  * board at 0.6 G-mac/s, three times, by three graphs that never touched the
  * hardware they were running on.
  *
- * ⚠ ONE STAGING PATH, NOT TWO. Everything a tensor needs to reach the NPU --
+ * ONE STAGING PATH, NOT TWO. Everything a tensor needs to reach the NPU --
  * the requantised copy, the width refusals, CHARSIU_NPU_ONLY, the maxn gate that
  * kept an output head on the CPU for a fortnight while saying nothing -- lives
  * here once. A second copy for the towers is how the two drift.
@@ -1001,7 +1001,7 @@ struct charsiu_npu_pool {
 	struct npu_tensor *t;
 	const struct gguf_tensor **key;
 	/*
-	 * ⚠ THE WEIGHTS THAT WERE STAGED, because the key is an address and a
+	 * THE WEIGHTS THAT WERE STAGED, because the key is an address and a
 	 * caller building a temporary tensor on the stack reuses one address
 	 * for several different weights. See charsiu_pool_get.
 	 */
@@ -1009,7 +1009,7 @@ struct charsiu_npu_pool {
 	int *id;                  /* >= 0 when the tensor is on the hardware */
 
 	/*
-	 * ⚠ WHAT ACTUALLY WENT TO THE HARDWARE, counted rather than assumed.
+	 * WHAT ACTUALLY WENT TO THE HARDWARE, counted rather than assumed.
 	 * A board round subtracted a staging figure from a wall clock and
 	 * announced 17x; the next round dropped that staging by 19 seconds and
 	 * the wall clock did not move. Neither number was wrong -- the
@@ -1037,7 +1037,7 @@ void charsiu_wcache_use(const char *path, const char *stamp);
 /*
  * Stage every one of `n` tensors now, into `cache` if it is given.
  *
- * ⚠ EAGERLY, BECAUSE THE CACHE IS ORDERED. Lazy staging interleaves with
+ * EAGERLY, BECAUSE THE CACHE IS ORDERED. Lazy staging interleaves with
  * whatever else is running and the records come back in a different order than
  * they went in; and a board round measured 75 s of the vision tower's 82 s
  * inside the quantiser, so this is also where the time is.
@@ -1096,7 +1096,7 @@ struct llama_state {
 	int n_ctx;
 	int pos;               /* how many tokens are in the cache */
 	/*
-	 * ⚠ HOW LONG THE PROMPT IS, WHICH NOTHING INSIDE THIS FILE CAN SEE.
+	 * HOW LONG THE PROMPT IS, WHICH NOTHING INSIDE THIS FILE CAN SEE.
 	 *
 	 * A prompt arrives one chunk at a time through llama_prefill_batch, so
 	 * every function below knows the running position and none of them
@@ -1117,7 +1117,7 @@ struct llama_state {
 
 	float *x, *xb, *xb2;   /* n_embd */
 	/*
-	 * ⚠ AN EMBEDDING THAT DID NOT COME FROM THE VOCABULARY. A picture
+	 * AN EMBEDDING THAT DID NOT COME FROM THE VOCABULARY. A picture
 	 * enters the model as rows in this space rather than as token ids, so
 	 * llama_forward_embd parks one here and llama_forward uses it INSTEAD
 	 * of the table lookup, for exactly one call. Doing it this way rather
@@ -1126,7 +1126,7 @@ struct llama_state {
 	 */
 	const float *embd_in;
 	/*
-	 * ⚠ THE BATCHED PREFILL'S OWN ROWS, allocated only if a prompt takes
+	 * THE BATCHED PREFILL'S OWN ROWS, allocated only if a prompt takes
 	 * that path and never touched by a decode, which is one row and uses
 	 * the three above.
 	 */
@@ -1140,7 +1140,7 @@ struct llama_state {
 	unsigned char *bcstab_have;
 	/*
 	 * The batched q k v and the attention's output.
-	 * ⚠ bq AND bao ARE n_head * head_dim WIDE, NOT n_embd. Qwen3 0.6B is
+	 * bq AND bao ARE n_head * head_dim WIDE, NOT n_embd. Qwen3 0.6B is
 	 * 16 heads of 128 against an embedding of 1024 and the two are not the
 	 * same number; a buffer sized by n_embd truncates every row.
 	 */
@@ -1150,13 +1150,13 @@ struct llama_state {
 	 * gemma4's per layer embeddings, batched: bpl is [n][n_layer][n_embd_pl]
 	 * and bplg is the gate, [n][n_embd_pl], reused a layer at a time.
 	 *
-	 * ⚠ ONE SET A ROW, NOT ONE A CHUNK. s->pl above is per TOKEN -- it is
+	 * ONE SET A ROW, NOT ONE A CHUNK. s->pl above is per TOKEN -- it is
 	 * looked up from the token id and projected from that token's own
 	 * embedding -- so a chunk of 32 rows needs 32 of them, not one.
 	 */
 	float *bpl, *bplg;
 	/*
-	 * ⚠ MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
+	 * MEASURED AND ABANDONED: one activation a row, so gguf_matmul could
 	 * read each weight row once for all m. It is four times SLOWER than n
 	 * calls to llama's own matvec and it changes the text, because matvec
 	 * is not gguf_matvec -- see the note in matmul_rows. Kept as fields
@@ -1200,7 +1200,7 @@ void llama_state_free(struct llama_state *s);
  * Milliseconds spent turning weights into what the hardware takes, which
  * happens lazily inside the FIRST forward pass that touches each tensor.
  *
- * ⚠ THAT LANDS INSIDE THE PROMPT AND IT IS NOT PREFILL. A gemma3 board round
+ * THAT LANDS INSIDE THE PROMPT AND IT IS NOT PREFILL. A gemma3 board round
  * read "prompt 6 tok in 6516 ms, 0.92 tok/s" where the six tokens were 678 ms
  * of it and the rest was staging 182 tensors. Prefill is the number this
  * project has left to move, so it has to be reported without staging in it.
@@ -1268,7 +1268,7 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos);
  * past the vocabulary lookup: `embd` is n_embd floats, which is what a vision
  * projector produces.
  *
- * ⚠ NOT SCALED BY embd_scale. That factor belongs to the token embedding table
+ * NOT SCALED BY embd_scale. That factor belongs to the token embedding table
  * -- gemma multiplies its lookup by sqrt(n_embd) -- and a projector's output is
  * already in the model's own space. UNVERIFIED against a gemma vision model,
  * because the only mmproj this has been run against is llama shaped and has

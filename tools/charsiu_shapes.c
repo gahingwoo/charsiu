@@ -3,7 +3,7 @@
  * charsiu_shapes -- what a model asks the hardware for, from its gguf, on a
  * desktop, with no NPU and no board.
  *
- * ⚠⚠ WHY. Nine architectures produce identical text; four have a tok/s
+ * WHY. Nine architectures produce identical text; four have a tok/s
  * number, and those four are the four the vendor publishes a benchmark for.
  * Correctness generality and PERFORMANCE generality are different claims and
  * this repo has only been making one of them.
@@ -26,7 +26,7 @@
  * coefficients, and the point of doing it here is that ONE board round
  * calibrates a, b, c and every gguf gets a prediction for free.
  *
- * ⚠ THE COEFFICIENTS IN THIS FILE ARE PROVISIONAL AND SAY SO. npudev.c
+ * THE COEFFICIENTS IN THIS FILE ARE PROVISIONAL AND SAY SO. npudev.c
  * carries `128.7 + 36.8*tasks + 110.0*MB` fitted from five decode stages,
  * where tasks and MB move together; npu_job_cost measured 16.85 us a job and
  * 4.81 a task directly, on a matmul with no arithmetic in it. Those disagree
@@ -50,7 +50,7 @@ static uint64_t slices(uint64_t k, unsigned kmax)
 }
 
 /*
- * ⚠⚠ THE COST OF A CALL IS NOT LINEAR IN ITS BYTES, AND A TOTAL HIDES THAT.
+ * THE COST OF A CALL IS NOT LINEAR IN ITS BYTES, AND A TOTAL HIDES THAT.
  *
  * The first version of this fitted a token as calls*a + tasks*b + MB*c with
  * MB the model's whole weight, and its hold-out error was +4.4% on qwen3,
@@ -71,7 +71,7 @@ static uint64_t slices(uint64_t k, unsigned kmax)
  * is the same measurement asked per call instead of once.
  */
 /*
- * ⚠⚠ A CALL IS TWO JOBS, AND THE PROBE MEASURED ONE.
+ * A CALL IS TWO JOBS, AND THE PROBE MEASURED ONE.
  *
  * npu_job_cost times a single job on a single fd. charsiu issues one per core
  * and waits on both, so a call moves its bytes through two devices. Pricing it
@@ -85,12 +85,12 @@ static uint64_t slices(uint64_t k, unsigned kmax)
  * takes the hold-out from a 34.5% systematic overestimate to +6.0 / -3.9 /
  * -11.1% -- no longer one-sided, and no longer growing with the model.
  *
- * ⚠ CHARSIU_SHAPES_CORES overrides it, because 1.286 is one board's number at
+ * CHARSIU_SHAPES_CORES overrides it, because 1.286 is one board's number at
  * one governor and it will move. It is not a fitted parameter: sweeping it
  * (1.0, 1.15, 1.286, 1.4, 1.6, 2.0) has its minimum AT the measured value,
  * which is the only reason to trust it as a mechanism rather than a knob.
  *
- * ⚠ What is still missing and is not this: the predictor counts MATMULS only,
+ * What is still missing and is not this: the predictor counts MATMULS only,
  * and round 147 measured those at 87.8% of a qwen3 token and 90.6% of a
  * tinyllama one. Attention, the norms and the elementwise joins are 9 to 12%
  * that this number does not contain.
@@ -108,7 +108,7 @@ static double call_us(double mb)
 	/*
 	 * npu_job_cost, round 163, **with CHARSIU_JOB_GAP_US=40**, mean of five.
 	 *
-	 * ⚠⚠ THE GAP IS THE WHOLE POINT. The probe's loop submits the next job
+	 * THE GAP IS THE WHOLE POINT. The probe's loop submits the next job
 	 * the instant the previous prep returns, and consecutive dispatches
 	 * then overlap. A decode cannot: between two calls it has to rmsnorm,
 	 * rope, run attention or a residual, which is tens of microseconds of
@@ -125,7 +125,7 @@ static double call_us(double mb)
 	 * this predictor was low, so it was calibrated against an overlap the
 	 * product never gets.
 	 *
-	 * ⚠ And round 162's "two shapes disagree with themselves by 90.9% and
+	 * And round 162's "two shapes disagree with themselves by 90.9% and
 	 * 36.9%" did not reproduce -- both read 3.3% and 1.5% here. I gave a
 	 * random pair of cells a shape explanation. The instability is the
 	 * first points measured in a pass, whatever they are.
@@ -150,7 +150,7 @@ static double call_us(double mb)
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read; see the note in the other
+	/* before any positional argument is read; see the note in the other
 	 * tools. This one is in PROBE_BINS, so it gets installed on a board. */
 	if (argc > 1 && !strcmp(argv[1], "--version")) {
 		printf("%s\n", CHARSIU_BUILD);
@@ -209,7 +209,7 @@ int main(int argc, char **argv)
 			    + call_us((double)dn * 0.5 / 1e6 / core_pair());
 		}
 		/*
-		 * ⚠⚠ THE HEAD IS NOT ONE 156 MB CALL, IT IS ceil(n_vocab/NMAX)
+		 * THE HEAD IS NOT ONE 156 MB CALL, IT IS ceil(n_vocab/NMAX)
 		 * SLICES OF AT MOST NMAX.
 		 *
 		 * Pricing it whole asked call_us for 38 MB on Phi-3.5 and 157
@@ -250,7 +250,7 @@ int main(int argc, char **argv)
 		       bytes, tasks / bytes, ms);
 		llama_free(&m);
 	}
-	printf("\n⚠ t/MB is the shape's own signature: a model with many thin\n"
+	printf("\nt/MB is the shape's own signature: a model with many thin\n"
 	       "  tensors pays dispatch where a model with few fat ones pays\n"
 	       "  bandwidth, and a constant tuned on one is wrong on the other.\n");
 	return 0;

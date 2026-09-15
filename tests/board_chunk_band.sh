@@ -4,7 +4,7 @@
 #
 # Where inside its own band does the one-chunk widening pay?
 #
-# ⚠⚠ THE KNOB HAS A NARROW DOMAIN AND NOBODY HAD NAMED IT. charsiu_run runs a
+# THE KNOB HAS A NARROW DOMAIN AND NOBODY HAD NAMED IT. charsiu_run runs a
 # nominal chunk of 80 and onechunk_on() widens the whole prompt into ONE chunk
 # when `n_ids > chunk && n_ids <= cap`. cap is 160 for Llama-3.2-1B at KMAX
 # 1024. So the widening only ever engages for prompts of 81..160 tokens:
@@ -17,7 +17,7 @@
 # Both are inside the band. So the knob is non-monotone in prompt length and
 # two points cannot say where it turns.
 #
-# ⚠ THE CONTROLS ARE OUTSIDE THE BAND, and they are the point of including
+# THE CONTROLS ARE OUTSIDE THE BAND, and they are the point of including
 # them: below 80 and above the cap the knob cannot act, so the two arms must
 # read the SAME. An arm that differs there is measuring the board, not the knob.
 #
@@ -28,7 +28,7 @@ NPUCLK=$(npu_clk) || exit 1
 set -u
 
 REPS=${CHARSIU_BAND_REPS:-10 14 16 18 20 22 24 32}
-# ⚠ EVEN, so each arm runs first exactly as often as it runs second.
+# EVEN, so each arm runs first exactly as often as it runs second.
 N=${CHARSIU_BAND_N:-4}
 RUN=${CHARSIU_RUN:-/root/charsiu_run_lhd}
 M=${CHARSIU_MODEL:-/opt/charsiu/models/Llama-3.2-1B-Instruct-Q4_0.gguf}
@@ -49,7 +49,7 @@ echo "   npu     $NPUCLK Hz"
 echo "   cpu     $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq)/$(cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq) kHz"
 echo "   binary  $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
 echo "   build     $(charsiu_build "$RUN")"
-case $((N % 2)) in 1) echo "   ⚠ N=$N is odd; the order bias does not cancel";; esac
+case $((N % 2)) in 1) echo "   N=$N is odd; the order bias does not cancel";; esac
 echo "   $N repeats an arm a length, arms AND ORDER alternating, one warm-up discarded"
 echo "   the band is 81..160 tokens; outside it the two arms must agree"
 echo
@@ -69,7 +69,7 @@ for R in $REPS; do
 	WA=$(widths "" "$P"); WB=$(widths "CHARSIU_PREFILL_ONECHUNK=0" "$P")
 	ttft "" "$P" >/dev/null 2>&1
 	ttft "CHARSIU_PREFILL_ONECHUNK=0" "$P" >/dev/null 2>&1
-	# ⚠⚠ THE ORDER ALTERNATES TOO, NOT JUST THE ARMS. The first draft ran
+	# THE ORDER ALTERNATES TOO, NOT JUST THE ARMS. The first draft ran
 	# "on" then "off" inside every repeat, so the on arm always took the
 	# colder of the pair. gemma-3-1b caught it: the knob never engages on
 	# that model at any length here -- both arms ran identical widths --

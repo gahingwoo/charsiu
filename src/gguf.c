@@ -24,7 +24,7 @@
 /* ---- half ---------------------------------------------------------------- */
 
 /*
- * ⚠⚠ AN ENV FLAG THAT `=0` ACTUALLY TURNS OFF.
+ * AN ENV FLAG THAT `=0` ACTUALLY TURNS OFF.
  *
  * Twenty-odd switches in this tree read `getenv("X") != NULL`, so `X=0` turns
  * them ON -- the opposite of what anyone types it for. npudev.c already caught
@@ -42,7 +42,7 @@
  * Unset returns `dflt`. "" and "0" are off. Anything else is on.
  */
 /*
- * ⚠⚠ WHERE A POOLING THRESHOLD COMES FROM, INSTEAD OF WHAT IT WAS TUNED TO.
+ * WHERE A POOLING THRESHOLD COMES FROM, INSTEAD OF WHAT IT WAS TUNED TO.
  *
  * Four constants in this tree decide the same thing in four different units:
  *
@@ -72,7 +72,7 @@
  * barrier. Change the governor, the core count or the CPU set and every
  * threshold moves with it, which is exactly what four tuned numbers cannot do.
  *
- * ⚠ THE BARRIER IS THE ONE MEASURED INPUT and it is measured, not guessed:
+ * THE BARRIER IS THE ONE MEASURED INPUT and it is measured, not guessed:
  * 47.8 and 52.4 us backed out of two models on the board, 2026-09-08.
  * CHARSIU_POOL_BARRIER_US overrides it for a sweep.
  */
@@ -91,7 +91,7 @@ double charsiu_pool_barrier_us(void)
 }
 
 /*
- * ⚠ THE THREAD COUNT IS A PARAMETER, NOT A LOOKUP. charsiu_threads() lives in
+ * THE THREAD COUNT IS A PARAMETER, NOT A LOOKUP. charsiu_threads() lives in
  * llama.c and gguf.c is linked on its own by charsiu_check, so reaching for it
  * here breaks a tool that has no business knowing about a thread pool. Passing
  * it also lets a caller ask the question for a pool it is NOT currently on --
@@ -170,7 +170,7 @@ static const struct type_traits g_traits[] = {
 	[GGML_Q8_0] = { "q8_0", 32, 34 },
 	[GGML_Q6_K] = { "q6_K", 256, 210 },
 	/*
-	 * ⚠ bf16 IS f32 WITH THE BOTTOM SIXTEEN BITS THROWN AWAY, not a
+	 * bf16 IS f32 WITH THE BOTTOM SIXTEEN BITS THROWN AWAY, not a
 	 * different float. gemma4's per_layer_model_proj arrives as this and
 	 * nothing else in any file here has, which is why it is the only
 	 * non-quantised type that had to be added rather than already being
@@ -935,13 +935,13 @@ static float dot_q6_K(const struct block_q6_K *b, const float *x, uint64_t nb)
 /* ---- the three kernels an attention is made of ---------------------------- */
 
 /*
- * ⚠ THESE ARE FOR THE ATTENTION, WHICH IS NOT A MATMUL AGAINST A WEIGHT and so
+ * THESE ARE FOR THE ATTENTION, WHICH IS NOT A MATMUL AGAINST A WEIGHT and so
  * has none of the machinery above. On the board it is 68% of a transcription
  * with every core already working on it: 1500 queries against 1500 keys, and
  * the innermost thing is a dot product of head_dim floats and a scaled add of
  * head_dim floats. Both were written as plain loops.
  *
- * ⚠ THE SUMMATION ORDER CHANGES. dot_f32 accumulates in eight lanes, so a
+ * THE SUMMATION ORDER CHANGES. dot_f32 accumulates in eight lanes, so a
  * result is not bit identical to the scalar loop -- which is why the transcript
  * and the numpy cross check are run against this rather than assumed.
  */
@@ -951,7 +951,7 @@ float charsiu_dot_f32(const float *a, const float *b, uint64_t n)
 }
 
 /*
- * ⚠⚠ AND THE THIRD ONE IS THE EXPONENTIAL, WHICH NOBODY COUNTED.
+ * AND THE THIRD ONE IS THE EXPONENTIAL, WHICH NOBODY COUNTED.
  *
  * A softmax over every patch against every patch asks for n^2 exponentials a
  * head. The vision tower is 1024 against 1024, twelve heads, twelve layers:
@@ -964,7 +964,7 @@ float charsiu_dot_f32(const float *a, const float *b, uint64_t n)
  * place, and the sum back -- because splitting it into an exp pass and a sum
  * pass reads the row twice.
  *
- * ⚠ THE POLYNOMIAL IS THE SLIGHTLY WORSE OF THE TWO. glibc's expf is correctly
+ * THE POLYNOMIAL IS THE SLIGHTLY WORSE OF THE TWO. glibc's expf is correctly
  * rounded and this is about one last bit out, the same trade llama.c's vexpq
  * makes for SiLU. There it is opt in because a near tie in greedy decoding
  * changes a word and the project's anchor sentence with it; here the consumer
@@ -982,7 +982,7 @@ static int softmax_exact(void)
 }
 
 /*
- * ⚠ SETTABLE FOR THE SAME REASON THE SCHEDULE IS. Two runs of this host, one
+ * SETTABLE FOR THE SAME REASON THE SCHEDULE IS. Two runs of this host, one
  * with the polynomial and one without, disagreed with each other by more than
  * the thing being measured; the only reading worth having interleaves them in
  * one process.
@@ -1019,7 +1019,7 @@ float charsiu_expsum_f32(float *x, uint64_t n, float m)
 }
 
 /*
- * ⚠⚠ AND THE FOURTH IS THE ONE THE SCALED ADD SHOULD HAVE BEEN ALL ALONG.
+ * AND THE FOURTH IS THE ONE THE SCALED ADD SHOULD HAVE BEEN ALL ALONG.
  *
  * acc[u] += sum over the key tile of s[u][j] * v[j], for a BLOCK of queries at
  * once. Called one query and one key at a time -- which is what an axpy per
@@ -1032,7 +1032,7 @@ float charsiu_expsum_f32(float *x, uint64_t n, float m)
  * value row for all four of them makes it four vector loads and four scalar
  * loads for sixteen FMAs: half a memory operation per FMA, six times fewer.
  *
- * ⚠ AND IT IS STILL BIT IDENTICAL. For a given output element the sum over j
+ * AND IT IS STILL BIT IDENTICAL. For a given output element the sum over j
  * is in the same order, starting from the same accumulator; only the order the
  * ELEMENTS are visited in changes. The bench diffs it element wise against the
  * unblocked form rather than taking that on trust.
@@ -1043,7 +1043,7 @@ float charsiu_expsum_f32(float *x, uint64_t n, float m)
  * the output rows the three pass kernel writes in place.
  */
 /*
- * ⚠ THE CONTROL, AND IT IS NOT OPTIONAL. This kernel is meant to be BIT
+ * THE CONTROL, AND IT IS NOT OPTIONAL. This kernel is meant to be BIT
  * identical to the axpy per (query, key) it replaces, which means a stopwatch
  * is the only thing that can tell them apart -- and on a loaded host two builds
  * timed one after the other cannot. CHARSIU_PLAIN_ATTN puts the one-pair-at-a-
@@ -1082,7 +1082,7 @@ void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
 		return;
 	}
 	/*
-	 * ⚠⚠ WRITTEN OUT, NOT LOOPED, AND THE FIRST VERSION WAS SLOWER THAN THE
+	 * WRITTEN OUT, NOT LOOPED, AND THE FIRST VERSION WAS SLOWER THAN THE
 	 * AXPY IT REPLACED. With the sixteen accumulators in a float32x4_t[4]
 	 * and a `for (i = 0; i < 4; i++)` over them, -O2 does not unroll -- so
 	 * they stayed in memory and the inner loop came out as four FMAs
@@ -1139,7 +1139,7 @@ void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
 			vst1q_f32(a3 + 8, z2); vst1q_f32(a3 + 12, z3);
 		}
 		/*
-		 * ⚠ THE TAIL IS THE OLD KERNEL, not a second copy of the new
+		 * THE TAIL IS THE OLD KERNEL, not a second copy of the new
 		 * one. head_dim is 64 or 80 in every tower this reads, so this
 		 * runs for the last 0 or 16 lanes and never for the hot part.
 		 */
@@ -1170,7 +1170,7 @@ void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
 }
 
 /*
- * ⚠⚠ AND THE FIFTH IS THE OTHER HALF OF THE SAME MISTAKE.
+ * AND THE FIFTH IS THE OTHER HALF OF THE SAME MISTAKE.
  *
  * s[u][j] = q[u] . k[j] was one dot product per (query, key) pair, and a dot
  * product of head_dim floats loads head_dim of each operand for head_dim FMAs:
@@ -1183,7 +1183,7 @@ void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
  * accumulators, eight query registers and four key registers is 28 of the 32
  * a64 has.
  *
- * ⚠ FOUR BY TWO AND NOT FOUR BY FOUR, BECAUSE THE SUMMATION ORDER IS KEPT.
+ * FOUR BY TWO AND NOT FOUR BY FOUR, BECAUSE THE SUMMATION ORDER IS KEPT.
  * dot_f32 accumulates in TWO vectors -- eight lanes -- and reduces at the end,
  * so reproducing it needs two accumulators per pair, and 4 x 4 of those would
  * be 32 registers before a single operand is loaded. One accumulator per pair
@@ -1192,7 +1192,7 @@ void charsiu_pv_f32(float *acc, uint64_t astride, const float *v,
  * what lets this be diffed byte for byte against the kernel it replaces instead
  * of argued about.
  *
- * ⚠ AND THE ACCUMULATORS ARE NAMED, NOT INDEXED. -O2 does not unroll a loop
+ * AND THE ACCUMULATORS ARE NAMED, NOT INDEXED. -O2 does not unroll a loop
  * over an array of them, and the version of charsiu_pv_f32 that did that
  * measured 0.94x -- slower than the code it replaced, because the accumulator
  * went back to memory.
@@ -1266,7 +1266,7 @@ void charsiu_qk_f32(float *s, uint64_t sstride, const float *q,
 			r6 = vaddvq_f32(vaddq_f32(a3l, a3h));
 			r7 = vaddvq_f32(vaddq_f32(b3l, b3h));
 			/*
-			 * ⚠ THE SAME TAIL dot_f32 HAS, in the same place: the
+			 * THE SAME TAIL dot_f32 HAS, in the same place: the
 			 * lanes are reduced first and the leftover elements are
 			 * then added scalar, one at a time, onto that. Doing
 			 * them before the reduction would be a different sum.
@@ -1541,7 +1541,7 @@ static float dotq_q4_0(const struct block_q4_0 *b, const struct charsiu_act *a,
 }
 
 /*
- * ⚠ THE WEIGHT ROW IS THE EXPENSIVE PART, AND PREFILL WAS PAYING FOR IT ONCE A
+ * THE WEIGHT ROW IS THE EXPENSIVE PART, AND PREFILL WAS PAYING FOR IT ONCE A
  * TOKEN. Measured: prompt throughput was FLAT at ~64-68 tok/s whatever the
  * length, which is the signature of no batching -- 241 prompt tokens read the
  * whole weight set 241 times. These take M activations against one row, so the
@@ -1806,7 +1806,7 @@ static void dotq_q8_0_m(const struct block_q8_0 *b, const struct charsiu_act *a,
 /*
  * M activations against one weight, reading the weight ONCE.
  *
- * ⚠ IT FALLS BACK PER TOKEN FOR ANYTHING IT DOES NOT HAVE A BATCHED KERNEL
+ * IT FALLS BACK PER TOKEN FOR ANYTHING IT DOES NOT HAVE A BATCHED KERNEL
  * FOR, so the answer is the same everywhere and only the speed differs. A
  * shape that quietly took a different arithmetic path would be the one bug
  * this is least able to notice.
@@ -1819,7 +1819,7 @@ void gguf_matmul(const struct gguf_tensor *w, const struct charsiu_act *a,
 	const uint8_t *base = w->data;
 
 	/*
-	 * ⚠ THE BATCHED KERNELS BELOW ACCUMULATE INTO float s[CHARSIU_BATCH_MAX]
+	 * THE BATCHED KERNELS BELOW ACCUMULATE INTO float s[CHARSIU_BATCH_MAX]
 	 * ON THE STACK, and nothing here stopped a caller asking for more. No
 	 * caller in the runtime does -- only bench_batch, which caps itself --
 	 * so this has never fired, which is exactly the kind of check that is

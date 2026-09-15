@@ -7,7 +7,7 @@
 # knows how to build and where things go, so this does not reimplement any of
 # that: it updates the tree and hands over.
 #
-# ⚠ THE KERNEL AND THE MODEL ARE NOT TOUCHED. Updating the runtime should not
+# THE KERNEL AND THE MODEL ARE NOT TOUCHED. Updating the runtime should not
 # reboot the board or spend an hour of somebody's link, so --no-kernel and
 # --no-model are not optional here.
 set -eu
@@ -22,7 +22,7 @@ done
 command -v ini_get >/dev/null 2>&1 \
 	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
-# ⚠⚠ TWO CHANNELS, BECAUSE THIS TREE IS A LABORATORY AND A PRODUCT AT ONCE.
+# TWO CHANNELS, BECAUSE THIS TREE IS A LABORATORY AND A PRODUCT AT ONCE.
 #
 # `stable` is what somebody who wants to run a model should get: the runtime,
 # and the other modalities with it -- charsiu_vision, charsiu_clip and
@@ -36,7 +36,7 @@ command -v ini_get >/dev/null 2>&1 \
 # being trusted. The channel is remembered, so `charsiu update` after
 # `charsiu update dev` stays on dev, and `charsiu update stable` goes back.
 #
-# ⚠ --auto (or -y): NO QUESTIONS. An update on a board that has already run a
+# --auto (or -y): NO QUESTIONS. An update on a board that has already run a
 # model asks exactly one thing on a good day, "ask it something, to see it
 # work?", and somebody updating ten times an afternoon has to answer it ten
 # times. With --auto the demo is skipped and whatever else the installer would
@@ -69,7 +69,7 @@ if [ -z "$SRC" ]; then
 	exit 1
 fi
 
-# ⚠ charsiu_conf_w, not charsiu_conf: ini_set writes to $CONF, and the readable
+# charsiu_conf_w, not charsiu_conf: ini_set writes to $CONF, and the readable
 # one can be /etc where this has no business writing.
 CONF=$(charsiu_conf_w 2>/dev/null || echo "")
 if [ -n "$CHANNEL" ]; then
@@ -78,7 +78,7 @@ else
 	CHANNEL=$(ini_get update channel 2>/dev/null || echo "")
 	: "${CHANNEL:=stable}"
 fi
-# ⚠ ONE PLACE WHERE A CHANNEL BECOMES A BRANCH. The installer has the same
+# ONE PLACE WHERE A CHANNEL BECOMES A BRANCH. The installer has the same
 # mapping in its bootstrap, and the two drifting apart means `charsiu update`
 # and a fresh install land on different code while both say the same word.
 case "$CHANNEL" in
@@ -99,11 +99,11 @@ echo "  source  $SRC${was:+  ($was)}"
 echo "  channel $CHANNEL  ($REF)"
 [ -n "$AUTO" ] && echo "  auto    no questions, no demo"
 
-# ⚠ `git pull` INTO A TREE SOMEBODY EDITED would either fail or merge. This is
+# `git pull` INTO A TREE SOMEBODY EDITED would either fail or merge. This is
 # a working copy of ours, not theirs, so --ff-only: if it will not fast forward
 # something is going on that a script should not resolve on its own.
 if [ -d "$SRC/.git" ] && command -v git >/dev/null 2>&1; then
-	# ⚠ FETCH FIRST, then move to the channel's ref. A plain `git pull`
+	# FETCH FIRST, then move to the channel's ref. A plain `git pull`
 	# would follow whatever branch the tree happens to be on, which is how
 	# somebody who asked for stable stays on dev without being told.
 	( cd "$SRC" && git fetch --quiet origin "$REF" ) || {
@@ -134,7 +134,7 @@ else
 	echo "  updated${now:+ to $now}"
 fi
 
-# ⚠ HAND OVER RATHER THAN REBUILD HERE. The installer is the one place that
+# HAND OVER RATHER THAN REBUILD HERE. The installer is the one place that
 # knows how to build, where the binaries go, and how to ask for root once.
 [ -n "$AUTO" ] && set -- --yes --no-demo "$@"
 exec sh "$SRC/scripts/charsiu-install.sh" --no-kernel --no-model \

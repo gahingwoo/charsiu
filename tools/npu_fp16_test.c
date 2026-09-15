@@ -20,7 +20,7 @@
  *              anywhere else. What actually lights up IS the permutation, and
  *              it is printed whether or not it matches a candidate.
  *
- * ⚠⚠⚠ USE A REAL SHAPE. K=16 N=8 AND K=64 N=8 WEDGE THE NPU.
+ * USE A REAL SHAPE. K=16 N=8 AND K=64 N=8 WEDGE THE NPU.
  *
  * Measured 2026-09-05, --loop 32, the same job every time:
  *
@@ -38,7 +38,7 @@
  * The board is fine: npu_gemm_test at 256x64 runs six times over with zero
  * timeouts, and a model decodes normally.
  *
- * ⚠ THIS COST SIX WRONG EXPLANATIONS. A coverage defect, a zero-skipping
+ * THIS COST SIX WRONG EXPLANATIONS. A coverage defect, a zero-skipping
  * weight fetch, a single zero killing the job, an fp16 register wedging the
  * core, the buffer churn, a read that beat the fence -- every one of them a
  * story about the thing under test, while the parameter that was actually
@@ -46,7 +46,7 @@
  * round: reading dmesg, and varying the shape. npu_gemm_test has always used
  * 256x64 and has never shown this, which was sitting there the whole time.
  *
- * ⚠ THE ACCUMULATOR IS PRINTED BOTH WAYS. acc_out gives the raw accumulator
+ * THE ACCUMULATOR IS PRINTED BOTH WAYS. acc_out gives the raw accumulator
  * and nothing here has established whether an fp16 job accumulates in int32 or
  * in fp32. Reading it as one and not saying so is how a probe reports "wrong"
  * when what it means is "I do not know how to read this".
@@ -64,7 +64,7 @@
 #include "charsiu_llm.h"
 
 /*
- * ⚠ WHERE THE 2 ms GOES, because without this the loop times the PROBE and
+ * WHERE THE 2 ms GOES, because without this the loop times the PROBE and
  * calls it the hardware. K=512 N=64, K=1024 N=64 and K=64 N=512 all came back
  * 2.09 to 2.28 ms, which is nearly independent of both dimensions -- the shape
  * of a fixed cost, not of a matmul. The pack alone walks k*n elements through
@@ -72,7 +72,7 @@
  */
 static struct { double pack, cf, emit, run, rd, rd_prev; } t_split;
 /*
- * ⚠ fence+read IS THREE THINGS AND THE 0.4 ms HAS TO BE ATTRIBUTED TO ONE.
+ * fence+read IS THREE THINGS AND THE 0.4 ms HAS TO BE ATTRIBUTED TO ONE.
  * The vendor issues 24 int4 dispatches a layer where we issue 7 and is still
  * 2.2 to 3.0x ahead on TTFT, so the gap is per-dispatch cost, not count. This
  * tree records a 130 us per-call floor; a raw fp16 job measures 0.4 ms. These
@@ -96,7 +96,7 @@ static size_t raw_in_len;
 static const char *lname[CHARSIU_W16_NLAYOUT] = { "dense", "atom", "group" };
 
 /*
- * ⚠⚠ THE BUFFERS ARE ALLOCATED ONCE, AND THE BOARD IS WHY.
+ * THE BUFFERS ARE ALLOCATED ONCE, AND THE BOARD IS WHY.
  *
  * This allocated five buffer objects, submitted, and freed them, every call.
  * Run the SAME job 128 times that way and only about twelve of them write
@@ -167,7 +167,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	job.cbuf_window = (unsigned)charsiu_cbuf_window();
 	job.mm.m = m; job.mm.k = k; job.mm.n = n;
 	/*
-	 * ⚠ THE CONTROL ARM. CHARSIU_TEST_INT8 runs this identical loop as an
+	 * THE CONTROL ARM. CHARSIU_TEST_INT8 runs this identical loop as an
 	 * int8 job, which is the only way to say whether "an fp16 job writes
 	 * nothing 89% of the time" is about fp16 or about submitting 128 jobs
 	 * in one process with five BOs allocated and freed each time.
@@ -266,7 +266,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	}
 
 	/*
-	 * ⚠⚠ A SENTINEL, NOT ZEROS. --holes reported the entire output zero for
+	 * A SENTINEL, NOT ZEROS. --holes reported the entire output zero for
 	 * 116 of 128 single weight holes, and "the hardware computed zero" and
 	 * "the job never wrote" are the same four bytes when the buffer starts
 	 * at zero. This project has read the second as the first three times in
@@ -293,7 +293,7 @@ static int run_core(struct charsiu_device *dev, unsigned m, unsigned k,
 	t_read.fence += now_ms() - tp;
 	tp = now_ms();
 	/*
-	 * ⚠ FLAT, AND MEASURED. --outmap put B[c] = 2^c through the hardware
+	 * FLAT, AND MEASURED. --outmap put B[c] = 2^c through the hardware
 	 * and read 2^0..2^7 at slots 0..7 and again at 64..71 -- m by n, row
 	 * major, exactly. An earlier version of this indexed through
 	 * charsiu_acc_index on the strength of its comment about m>1, which
@@ -351,7 +351,7 @@ static void reference(unsigned m, unsigned k, unsigned n,
 static float asf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
 /*
- * ⚠⚠⚠ int8 WEIGHTS AGAINST fp16 ACTIVATIONS, WHICH IS A COMBINATION NOTHING
+ * int8 WEIGHTS AGAINST fp16 ACTIVATIONS, WHICH IS A COMBINATION NOTHING
  * HAS EVER RUN.
  *
  * r404 priced it -- 0.058 TMAC/s against fp16's 0.024 at the scores shape,
@@ -402,7 +402,7 @@ static int run_w8(struct charsiu_device *dev, unsigned m, unsigned k,
 	job.mm.m = m; job.mm.k = k; job.mm.n = n;
 	job.mm.wdtype = CHARSIU_INT8;
 	/*
-	 * ⚠⚠ THE ACTIVATION HAS TO BE int8 TOO, AND THE BOARD SAID SO.
+	 * THE ACTIVATION HAS TO BE int8 TOO, AND THE BOARD SAID SO.
 	 *
 	 * This ran as w8a16 first -- int8 weights, the precision register's
 	 * 16 bit activation bit set, the query left as halves -- because the
@@ -436,7 +436,7 @@ static int run_w8(struct charsiu_device *dev, unsigned m, unsigned k,
 	tp = now_ms();
 	charsiu_bo_prep(dev, &pool.wt, 1000000000);
 	/*
-	 * ⚠⚠ THE STORED BYTE IS w - 0x80, NOT w, AND THIS PROBE HAD IT WRONG.
+	 * THE STORED BYTE IS w - 0x80, NOT w, AND THIS PROBE HAD IT WRONG.
 	 *
 	 * charsiu_pack_weights has written `src - 0x80` for int8 since round
 	 * 139 and charsiu_w8_offset is only the address half of that packer --
@@ -558,7 +558,7 @@ static int run_f16_timed(struct charsiu_device *dev, unsigned m, unsigned k,
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
@@ -572,7 +572,7 @@ int main(int argc, char **argv)
 	unsigned k = argc > 1 ? (unsigned)atoi(argv[1]) : 64;
 	unsigned n = argc > 2 ? (unsigned)atoi(argv[2]) : 8;
 	/*
-	 * ⚠ m WAS HARDCODED TO 1 AND THAT IS THE WHOLE QUESTION. The vendor
+	 * m WAS HARDCODED TO 1 AND THAT IS THE WHOLE QUESTION. The vendor
 	 * batches rows -- M up to 48 in its own attention dispatches -- so a
 	 * dispatch serves a chunk, not a row, and the per-row share of a
 	 * 419 us job is what decides whether attention can leave the CPU.
@@ -610,7 +610,7 @@ int main(int argc, char **argv)
 	printf("fp16 weights: K=%u N=%u M=%u\n", k, n, m);
 	if (dow4map) {
 		/*
-		 * ⭐⭐⭐ WHERE THE w4a16 ACCUMULATOR PUTS ROW r CHANNEL c, and
+		 * WHERE THE w4a16 ACCUMULATOR PUTS ROW r CHANNEL c, and
 		 * whether any register makes it flat.
 		 *
 		 * The int4 read back is the largest single line in a prompt --
@@ -626,7 +626,7 @@ int main(int argc, char **argv)
 		 * whether the difference between the two output stages is a
 		 * register.
 		 *
-		 * ⚠ THE SWEEP THAT LOOKS LIKE IT ANSWERED THIS COMPARED w4a16
+		 * THE SWEEP THAT LOOKS LIKE IT ANSWERED THIS COMPARED w4a16
 		 * AGAINST int8, whose DPU block is identical to w4a16's to
 		 * begin with. fp16's is not: 0x401c, 0x4020 and 0x4028 differ,
 		 * and CHARSIU_W4_F16DPU offers them to int4 one at a time.
@@ -665,7 +665,7 @@ int main(int argc, char **argv)
 			      charsiu_coef_bytes(&job.mm) + 4096))
 			goto done;
 
-		/* ⚠ A DISTINCT ANSWER PER CELL, so a permutation cannot pass
+		/* A DISTINCT ANSWER PER CELL, so a permutation cannot pass
 		 * by landing a value on a cell that wanted the same number.
 		 * The activation is one-hot per row and the weight a ramp, so
 		 * out[r][c] = W[c][r % k] exactly. */
@@ -767,7 +767,7 @@ int main(int argc, char **argv)
 
 	if (dow8a8) {
 		/*
-		 * ⭐⭐ THE ARRANGEMENT THE BOARD LEAVES: int8 WEIGHTS AND AN
+		 * THE ARRANGEMENT THE BOARD LEAVES: int8 WEIGHTS AND AN
 		 * int8 ACTIVATION.
 		 *
 		 * --w8map settled that an int8 weight makes the hardware read
@@ -790,7 +790,7 @@ int main(int argc, char **argv)
 		 *       the softmax already scales, so that half is free
 		 *       either way.
 		 *
-		 * ⚠ The two scale arms differ ONLY in job.weight_scales.
+		 * The two scale arms differ ONLY in job.weight_scales.
 		 */
 		unsigned reps = argc > 4 ? (unsigned)atoi(argv[4]) : 8;
 		uint8_t *Q = malloc((size_t)n * k);
@@ -869,7 +869,7 @@ int main(int argc, char **argv)
 		printf("int8 weights AND int8 activations, K=%u N=%u M=%u,"
 		       " %u reps\n", k, n, m, reps);
 
-		/* ⚠ THE CONTROL ARM NEEDS ITS OWN OUTPUT. Handing run() the
+		/* THE CONTROL ARM NEEDS ITS OWN OUTPUT. Handing run() the
 		 * same buffer would leave the fp16 answer in `got` and the
 		 * checks below would be reading the wrong arm; handing it NULL
 		 * would be a memcpy to NULL. */
@@ -889,7 +889,7 @@ int main(int argc, char **argv)
 			}
 		}
 		/*
-		 * ⚠⚠ TWO READINGS, BECAUSE THE int8 ACCUMULATOR IS NOT FLAT.
+		 * TWO READINGS, BECAUSE THE int8 ACCUMULATOR IS NOT FLAT.
 		 *
 		 * The fp16 path's wide output is w4_dpu's and --outmap
 		 * measured it row major. The int8 path's is wide8's, and
@@ -967,7 +967,7 @@ int main(int argc, char **argv)
 
 	if (dow8map) {
 		/*
-		 * ⚠⚠ WHAT DOES THE HARDWARE READ, when the weights are int8
+		 * WHAT DOES THE HARDWARE READ, when the weights are int8
 		 * and the precision register says 16 bit activations.
 		 *
 		 * The first form of this probe swept a one-hot activation and
@@ -1063,7 +1063,7 @@ int main(int argc, char **argv)
 
 	if (dow8) {
 		/*
-		 * ⚠ THE REPS ARE THE POINT OF THE TIMING HALF. A single submit
+		 * THE REPS ARE THE POINT OF THE TIMING HALF. A single submit
 		 * carries a fixed cost that r404 measured at 59 to 183 us and
 		 * that is dtype independent, so a one-shot ratio understates
 		 * the dtype factor. Same reps for both arms, alternating, one
@@ -1082,7 +1082,7 @@ int main(int argc, char **argv)
 		if (!Q || !sc || !deq || !raw) goto done;
 		for (unsigned i = 0; i < m * k; i++)
 			A[i] = (float)((int)(i % 13) - 6) * 0.25f;
-		/* ⚠ A DIFFERENT ABSMAX PER CHANNEL, or the per channel table
+		/* A DIFFERENT ABSMAX PER CHANNEL, or the per channel table
 		 * and a single scalar would write the same bytes and the arm
 		 * that is meant to distinguish them could not. */
 		for (unsigned c = 0; c < n; c++)
@@ -1132,7 +1132,7 @@ int main(int argc, char **argv)
 
 		printf("int8 weights against fp16 activations, K=%u N=%u M=%u,"
 		       " %u reps\n", k, n, m, reps);
-		printf("  ⚠ this combination appears in ZERO of the vendor's"
+		printf("  this combination appears in ZERO of the vendor's"
 		       " 8308 dispatches\n");
 
 		for (unsigned r = 0; r <= reps; r++) {
@@ -1234,7 +1234,7 @@ int main(int argc, char **argv)
 
 	if (doinsl) {
 		/*
-		 * ⚠⚠ THE ACTIVATION LAYOUT, MEASURED THE WAY THE WEIGHT LAYOUT
+		 * THE ACTIVATION LAYOUT, MEASURED THE WAY THE WEIGHT LAYOUT
 		 * WAS. Everything else is now excluded by measurement: the
 		 * output is flat, the weights are GROUP, the stream matches the
 		 * vendor at M=32, the four window constants are required
@@ -1290,7 +1290,7 @@ int main(int argc, char **argv)
 	}
 	if (doin) {
 		/*
-		 * ⚠⚠ THE FAULT IS IN THE ACTIVATION LAYOUT, AND --outmap FOUND
+		 * THE FAULT IS IN THE ACTIVATION LAYOUT, AND --outmap FOUND
 		 * IT BY DUMPING RATHER THAN GUESSING.
 		 *
 		 * The output is flat and right: with B[c] = 2^c the raw
@@ -1344,7 +1344,7 @@ int main(int argc, char **argv)
 	}
 	if (doout) {
 		/*
-		 * ⚠⚠ MEASURE THE OUTPUT ORDER, DO NOT GUESS IT.
+		 * MEASURE THE OUTPUT ORDER, DO NOT GUESS IT.
 		 *
 		 * fp16 is exact at m=1 and wrong above it. A flat read and
 		 * charsiu_acc_index are both wrong (14.12 and 16.25 at m=2), so
@@ -1379,7 +1379,7 @@ int main(int argc, char **argv)
 					? (float)(1u << c) : 0.0f;
 		if (run(dev, m, k, n, A, B, CHARSIU_W16_GROUP, p2)) goto done;
 		/*
-		 * ⚠⚠ DUMP, DO NOT FILTER. The first version of this printed
+		 * DUMP, DO NOT FILTER. The first version of this printed
 		 * only slots whose two values were positive powers of two, and
 		 * came back with NOTHING at m=2, 4 and 8 -- which says the
 		 * values are not what I assumed and says nothing about what
@@ -1402,7 +1402,7 @@ int main(int argc, char **argv)
 	}
 	if (doapi) {
 		/*
-		 * ⚠ THE UNIT THE RUNTIME WILL ACTUALLY CALL, end to end.
+		 * THE UNIT THE RUNTIME WILL ACTUALLY CALL, end to end.
 		 * Everything above drives job.c directly; this goes through
 		 * src/npufp16.c, packs the weight with charsiu_fp16_woffset --
 		 * the entry point that exists so a KV cache can be written in
@@ -1455,7 +1455,7 @@ int main(int argc, char **argv)
 	}
 	if (dogrp) {
 		/*
-		 * ⚠⚠ THE GROUP AGAINST THE SAME OPS ONE AT A TIME, both bit
+		 * THE GROUP AGAINST THE SAME OPS ONE AT A TIME, both bit
 		 * for bit and on the clock.
 		 *
 		 * The whole claim of charsiu_fp16_matmul_group is that N
@@ -1463,7 +1463,7 @@ int main(int argc, char **argv)
 		 * and wait once instead of N times. Two arms, and the first
 		 * one has to pass before the second is worth reading.
 		 *
-		 * ⚠ THE CORRECTNESS ARM USES DIFFERENT SHAPES PER OP ON
+		 * THE CORRECTNESS ARM USES DIFFERENT SHAPES PER OP ON
 		 * PURPOSE. With every op the same size, an offset that is
 		 * wrong by a whole sub buffer still lands on a legal one, and
 		 * every op's answer would be some other op's answer -- which
@@ -1548,9 +1548,9 @@ int main(int argc, char **argv)
 		printf("  the group    vs CPU: worst %.4g%s\n",
 		       wb, wb == 0.0 ? "   <== EXACT" : "");
 		printf("  cells where the two arms differ: %.0f%s\n",
-		       cross, cross == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+		       cross, cross == 0 ? "   <== IDENTICAL" : "  <== ");
 		/*
-		 * ⚠ AND THE SAME OPS THROUGH WIDER ARRAYS. Attention's q rows
+		 * AND THE SAME OPS THROUGH WIDER ARRAYS. Attention's q rows
 		 * sit inside a [rows][n_head * hd] block and its output goes
 		 * back into one, so the group reads and writes with a row
 		 * stride rather than tightly. A stride that is applied to the
@@ -1591,7 +1591,7 @@ int main(int argc, char **argv)
 							sd += 1;
 			}
 			printf("  cells the strided arm differs in: %.0f%s\n",
-			       sd, sd == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+			       sd, sd == 0 ? "   <== IDENTICAL" : "  <== ");
 			if (sd != 0)
 				failed = 1;
 			for (unsigned i = 0; i < G; i++) {
@@ -1617,7 +1617,7 @@ int main(int argc, char **argv)
 
 			op[i].n = n;
 			memset(Yb[i], 0, (size_t)m * n * sizeof(float));
-			/* ⚠ REPACK. Ws[i] holds the n + 32i layout from the
+			/* REPACK. Ws[i] holds the n + 32i layout from the
 			 * arm above, and a buffer packed for one n is not the
 			 * buffer for another. Timing it would still time a
 			 * matmul, but it would be a matmul of nothing anyone
@@ -1664,7 +1664,7 @@ int main(int argc, char **argv)
 		       tg > 0 ? tl / tg : 0.0);
 		printf("    %lu matmuls over %lu submits\n", c1 - c0, s1 - s0);
 		/*
-		 * ⚠ AND THE SAME GROUP BACK TO BACK, which is what a layer
+		 * AND THE SAME GROUP BACK TO BACK, which is what a layer
 		 * loop does. The alternating arms above are the fair
 		 * comparison, but every single call in between rebuilds the
 		 * coefficients this unit caches -- so the arm that is fair to
@@ -1697,7 +1697,7 @@ int main(int argc, char **argv)
 			       (b.fence - a.fence) / reps,
 			       (b.read - a.read) / reps);
 		}
-		/* ⚠ psync is its own column now. It used to be inside `pack`,
+		/* psync is its own column now. It used to be inside `pack`,
 		 * and it is the two cache maintenance ioctls, which are
 		 * charged on the WHOLE buffer object and not on what the pack
 		 * wrote -- so adding it to the conversion hid both. */
@@ -1722,7 +1722,7 @@ int main(int argc, char **argv)
 	}
 	if (doown) {
 		/*
-		 * ⚠⚠ THE WEIGHT WHERE IT LIES, AND THE APPENDING LAW ON THE
+		 * THE WEIGHT WHERE IT LIES, AND THE APPENDING LAW ON THE
 		 * HARDWARE.
 		 *
 		 * Round two put the weight memcpy at up to 55% of a grouped
@@ -1852,9 +1852,9 @@ int main(int argc, char **argv)
 		printf("  cells where the two arms differ: %.0f%s\n", cross,
 		       cross == 0 ? "   <== IDENTICAL, and the appending law"
 				    " holds on the hardware"
-				  : "  <== ⚠ the law or the buffer");
+				  : "  <== the law or the buffer");
 		/*
-		 * ⚠ AND THE SAME ANSWERS WITHOUT THE COPY OUT. A NULL Y leaves
+		 * AND THE SAME ANSWERS WITHOUT THE COPY OUT. A NULL Y leaves
 		 * the result in the device buffer; charsiu_fp16_out points at
 		 * it. If borrowing were reading the wrong region it would show
 		 * here as another op's answer, which is why this compares
@@ -1879,7 +1879,7 @@ int main(int argc, char **argv)
 			}
 			charsiu_fp16_release(fp);
 			printf("  cells the borrowed answers differ in: %.0f%s\n",
-			       bd, bd == 0 ? "   <== IDENTICAL" : "  <== ⚠");
+			       bd, bd == 0 ? "   <== IDENTICAL" : "  <== ");
 			if (bd)
 				failed = 1;
 			for (unsigned i = 0; i < G; i++)
@@ -1955,7 +1955,7 @@ int main(int argc, char **argv)
 	}
 	if (dosync) {
 		/*
-		 * ⚠⚠ WHAT IT COSTS TO HAND A BUFFER BACK TO THE HARDWARE, and
+		 * WHAT IT COSTS TO HAND A BUFFER BACK TO THE HARDWARE, and
 		 * why the answer decides how a KV cache is laid out.
 		 *
 		 * rocket_ioctl_fini_bo is dma_sync_sgtable_for_device over the
@@ -2020,7 +2020,7 @@ int main(int argc, char **argv)
 	}
 	if (doloop) {
 		/*
-		 * ⚠⚠ THE SAME JOB, N TIMES, COUNTING HOW MANY WRITE.
+		 * THE SAME JOB, N TIMES, COUNTING HOW MANY WRITE.
 		 *
 		 * --holes with a hole of 1.0 is no hole at all, and 116 of its
 		 * 128 submits still wrote nothing. So the weight contents were
@@ -2061,7 +2061,7 @@ int main(int argc, char **argv)
 		       " silent submit was number %u\n", wrote, reps,
 		       first_fail);
 		/*
-		 * ⚠ AND WHAT IT COSTS, because the whole reason for an fp16
+		 * AND WHAT IT COSTS, because the whole reason for an fp16
 		 * matmul here is attention, and attention is only worth moving
 		 * if the hardware beats the 6 to 13 ms a row the CPU takes.
 		 * Timed over the submits that actually wrote; a wedged shape
@@ -2087,7 +2087,7 @@ int main(int argc, char **argv)
 	}
 	if (doholes) {
 		/*
-		 * ⚠⚠ THE ONE HOT PROBE WAS NOT VALID AND --bits IS WHY.
+		 * THE ONE HOT PROBE WAS NOT VALID AND --bits IS WHY.
 		 *
 		 * --slots puts ONE non zero half in the weight buffer and
 		 * leaves the other 99.99% zero. Its firing set moved from run
@@ -2115,7 +2115,7 @@ int main(int argc, char **argv)
 		uint8_t *raw = calloc(wsz, 1);
 		uint16_t one = charsiu_float_to_half(1.0f);
 		/*
-		 * ⚠⚠ THE HOLE DOES NOT HAVE TO BE ZERO, AND THAT IS THE
+		 * THE HOLE DOES NOT HAVE TO BE ZERO, AND THAT IS THE
 		 * EXPERIMENT. With a hole of 0.0, 116 of 128 slots made the job
 		 * write NOTHING -- the sentinel survived in every channel -- and
 		 * only 12 gave a clean answer. A weight fetch that skips zero
@@ -2215,7 +2215,7 @@ int main(int argc, char **argv)
 	}
 	if (dobits) {
 		/*
-		 * ⚠⚠ ONE RUN FOR THE WHOLE COVERAGE MAP.
+		 * ONE RUN FOR THE WHOLE COVERAGE MAP.
 		 *
 		 * --slots needs a run per slot and each run draws a different
 		 * subset, so 128 runs give 128 unrelated samples rather than one
@@ -2255,7 +2255,7 @@ int main(int argc, char **argv)
 	}
 	if (doslots) {
 		/*
-		 * ⚠⚠ SWEEP THE BYTE OFFSET, NOT THE LOGICAL INDEX.
+		 * SWEEP THE BYTE OFFSET, NOT THE LOGICAL INDEX.
 		 *
 		 * --map places a weight at the (n, k) THIS layout chooses, so a
 		 * cell only lights up where our layout already agrees with the
@@ -2309,7 +2309,7 @@ int main(int argc, char **argv)
 	}
 	if (domap) {
 		/*
-		 * ⚠ ONE NON ZERO WEIGHT AT A TIME. A is a ramp with no repeats,
+		 * ONE NON ZERO WEIGHT AT A TIME. A is a ramp with no repeats,
 		 * so the VALUE that comes back names the k it was fetched from
 		 * and the channel it lands in names the n. That is the whole
 		 * permutation, read directly, with no candidate assumed.
@@ -2338,7 +2338,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠⚠ (i % 13) - 6 ON AN UNSIGNED i IS 4 BILLION, NOT -6, and the first
+	 * (i % 13) - 6 ON AN UNSIGNED i IS 4 BILLION, NOT -6, and the first
 	 * run of this probe was entirely that. The data came out ~1e9, fp16
 	 * turned it into inf, inf + -inf made the reference NaN, and the
 	 * hardware wrote 0x7f7f7f7f. Cast before subtracting.
@@ -2365,7 +2365,7 @@ int main(int argc, char **argv)
 			continue;
 		}
 		/*
-		 * ⚠⚠ A NaN MUST NOT SCORE ZERO. `d > worst` is false when d is
+		 * A NaN MUST NOT SCORE ZERO. `d > worst` is false when d is
 		 * NaN, so the first version of this loop reported a worst error
 		 * of 0 -- a perfect match -- for a run whose reference was
 		 * entirely NaN, on all three layouts at once. A probe that

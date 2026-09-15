@@ -4,7 +4,7 @@
 """
 Diff charsiu's CLIP BPE against one driven by the REAL merges.txt.
 
-⚠ WHY THIS TEST EXISTS. The gguf carries `tokenizer.ggml.tokens` and no merge
+WHY THIS TEST EXISTS. The gguf carries `tokenizer.ggml.tokens` and no merge
 list -- clip.cpp never ran the text tower, so its converter had no reason to
 write one. charsiu recovers the ranks from the vocabulary ORDER instead, on the
 claim that CLIP's vocabulary IS the merge order: 256 byte symbols, the same 256

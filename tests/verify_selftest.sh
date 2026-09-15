@@ -1,7 +1,7 @@
 #!/bin/sh
 # Can every phase of board_verify.sh run ALONE?
 #
-# ⚠⚠ WHY THIS EXISTS. Phase 10 shipped with its prompt built inside phase 9's
+# WHY THIS EXISTS. Phase 10 shipped with its prompt built inside phase 9's
 # case arm, so `board_verify.sh 10` -- one phase, which is exactly how a sweep
 # gets run -- died on its first model with "P9: parameter not set". The same
 # mistake had already been made once and fixed once, for the short prompt, and
@@ -21,7 +21,7 @@ TMP=${TMPDIR:-/tmp}/charsiu-selftest.$$
 mkdir -p "$TMP/models" "$TMP/out"
 trap 'rm -rf "$TMP"' EXIT
 
-# ⚠ THE LIST COMES FROM THE SCRIPT, NOT FROM HERE. A hardcoded 1..10 in this
+# THE LIST COMES FROM THE SCRIPT, NOT FROM HERE. A hardcoded 1..10 in this
 # file goes stale the moment a phase is added, and it goes stale SILENTLY -- the
 # new phase is the one nobody checked. Read the case labels out of
 # board_verify.sh instead.
@@ -31,7 +31,7 @@ for ph in $PHASES; do
 	out=$(CHARSIU_BIN_DIR=${CHARSIU_BIN_DIR:-$HERE/../build} \
 	      CHARSIU_MODELS="$TMP/models" CHARSIU_BOARD_DIR="$TMP/out" \
 	      timeout 120 sh "$HERE/board_verify.sh" "$ph" 2>&1)
-	# ⚠ THE TWO WORDINGS ARE TWO SHELLS. dash says "parameter not set" and
+	# THE TWO WORDINGS ARE TWO SHELLS. dash says "parameter not set" and
 	# bash says "unbound variable"; matching only one of them passes on the
 	# board and fails on the desk, or the other way round.
 	if printf '%s' "$out" | grep -qE "parameter not set|unbound variable"; then
@@ -44,7 +44,7 @@ for ph in $PHASES; do
 	fi
 done
 
-# ⚠⚠ AND DOES ANYTHING STILL PIN WHAT THE PRODUCT NOW CHOOSES?
+# AND DOES ANYTHING STILL PIN WHAT THE PRODUCT NOW CHOOSES?
 #
 # board_text_all.sh and board_vendor.sh both set CHARSIU_NPU_KMAX=1024 under a
 # comment claiming it was "the int4 environment the board actually runs". That
@@ -72,7 +72,7 @@ for f in board_text_all.sh board_vendor.sh; do
 done
 
 #
-# ⚠⚠⚠ A COMMENT DIRECTLY AFTER A LINE CONTINUATION IS ALWAYS A BUG, and on
+# A COMMENT DIRECTLY AFTER A LINE CONTINUATION IS ALWAYS A BUG, and on
 # 2026-09-10 it killed both of the harnesses that map the overlap fault. A
 # nine-line note sat between `W4="... \` and the rest of the string, so the
 # `#` was DATA: W4 expanded to the environment followed by prose, `env` tried
@@ -87,7 +87,7 @@ done
 for f in "$HERE"/*.sh; do
 	[ -r "$f" ] || continue
 	#
-	# ⚠ THE CONTINUED LINE MUST NOT ITSELF BE A COMMENT. board_awq.sh
+	# THE CONTINUED LINE MUST NOT ITSELF BE A COMMENT. board_awq.sh
 	# documents a command a reader would type, wrapped over two commented
 	# lines, and the first version of this check called that a fault. A
 	# comment continuing a comment is prose; only a comment continuing a

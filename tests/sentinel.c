@@ -10,7 +10,7 @@
  * constant. This drives it deliberately: nothing written, everything written,
  * and the case nothing could report before, a job that wrote some rows.
  *
- * ⚠ AND THE POISON VALUE IS A LEGAL FLOAT. 0xdeadbeef read as one is about
+ * AND THE POISON VALUE IS A LEGAL FLOAT. 0xdeadbeef read as one is about
  * -6.26e13, so an op that genuinely computes it in a row's first cell is read
  * as an op that did not write that row. That is not new -- the every-cell
  * form had the same exposure, needing every cell to collide instead of one --

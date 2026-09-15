@@ -24,7 +24,7 @@ lo() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' | sort -n | head -1; }
 hi() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' | sort -n | tail -1; }
 
 # rate, and the md5 of the TEXT (not of the timings).
-# ⚠ charsiu_run prints TWO timing lines on stdout: [load ...] and [first 8 tok
+# charsiu_run prints TWO timing lines on stdout: [load ...] and [first 8 tok
 # ...].  The first version of this filtered only '^\[load' and so hashed the
 # second one -- five identical runs of one arm gave five different hashes and
 # the check reported "text DIFFERS" while measuring the clock.  Filter every

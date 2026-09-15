@@ -8,14 +8,14 @@
 #
 #   usage: tests/host_awq.sh MODEL.gguf [CALIB.txt [EVAL.txt]]
 #
-# ⚠ THE TEXTS DEFAULT TO tests/corpus, WHICH IS THE POINT. Every perplexity
+# THE TEXTS DEFAULT TO tests/corpus, WHICH IS THE POINT. Every perplexity
 # recorded in this tree was measured on those bytes, so an arm run against
 # anything else is a number that cannot be put beside them. Pass your own only
 # when the question is about the corpus.
 set -e
 D=$(dirname "$0")
 M=${1:?model} C=${2:-$D/corpus/calib.txt} E=${3:-$D/corpus/long.txt}
-# ⚠ ON THE BOARD THERE IS NO build/. The binaries sit beside this script in
+# ON THE BOARD THERE IS NO build/. The binaries sit beside this script in
 # /opt/charsiu, which is what `charsiu update dev` installs -- spec_identity.sh
 # lost a whole board run to exactly this and says so at its own resolver.
 B=$D/../build
@@ -25,7 +25,7 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
 #
-# ⚠ A SIBLING WOULD BE FOUND BY THE ARM THAT IS SUPPOSED TO FIND NOTHING.
+# A SIBLING WOULD BE FOUND BY THE ARM THAT IS SUPPOSED TO FIND NOTHING.
 # llama_load picks up <model>.awq on its own, so the "no statistics" arm is
 # only that arm when there is no such file.
 #
@@ -35,7 +35,7 @@ if [ -f "$M.awq" ]; then
 fi
 
 #
-# ⚠⚠ W4_GROUP=1024 BECAUSE THE HOST REFERENCE DOES NOT GET IT FOR FREE.
+# W4_GROUP=1024 BECAUSE THE HOST REFERENCE DOES NOT GET IT FOR FREE.
 # llama_auto_kmax() pins the group to 1024 and is called only when the NPU is
 # on, so `CHARSIU_NPU=0` takes npuquant's code default of one absmax a row --
 # a quantiser the board never runs. The assertions here are relational and

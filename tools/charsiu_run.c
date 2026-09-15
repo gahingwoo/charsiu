@@ -36,7 +36,7 @@ static double now_ms(void)
 }
 
 /*
- * ⚠⚠ A BATCHED PREFILL CHUNK IS EVEN, AND NEVER EIGHT.
+ * A BATCHED PREFILL CHUNK IS EVEN, AND NEVER EIGHT.
  *
  * A batched int4 matmul carries the batch size m on the WIDTH axis, and the
  * accumulator read order -- charsiu_acc_index, in src/job.c -- can only
@@ -57,7 +57,7 @@ static double now_ms(void)
  * and a tail of 1, which is below the batching minimum and went to the token
  * loop, and its text has always been right.
  *
- * ⚠ EIGHT WAS READ AS A DIFFERENT FAULT AND IT IS THE SAME ONE. m = 8 is even
+ * EIGHT WAS READ AS A DIFFERENT FAULT AND IT IS THE SAME ONE. m = 8 is even
  * and its read order is a bijection, and the board missed 33 rows of 904 at
  * it -- unless CHARSIU_NPU_ONEDEV put both K slices on one core. That looked
  * like the core pair. It was the NPU rail: every one of those runs was at 750
@@ -65,7 +65,7 @@ static double now_ms(void)
  * 904 (2026-09-06, and 1130 of 1130 at m = 10). Both halves of the law below
  * now ask charsiu_npu_overlap_ok() instead of asking the width.
  *
- * ⚠⚠ AND THIS IS THE SPEED HALF, NOT THE SAFETY HALF. The safety half is
+ * AND THIS IS THE SPEED HALF, NOT THE SAFETY HALF. The safety half is
  * w4_batch_why_not() in src/npudev.c, which refuses an odd width -- and 8 and
  * 10 only below the OPP envelope -- and sends that chunk to a correct row at a
  * time path. This is what stops the
@@ -77,7 +77,7 @@ static double now_ms(void)
  * conservative here costs rate, being too generous costs correctness, and only
  * npudev.c stands between the two.
  *
- * ⚠ IT IS APPLIED WHATEVER THE WEIGHTS ARE. This loop cannot see whether the
+ * IT IS APPLIED WHATEVER THE WEIGHTS ARE. This loop cannot see whether the
  * device opened int4, int8, or never opened at all, and int8 has no known bad
  * width. A CPU only or int8 prefill therefore pays an even chunk it does not
  * need -- one token of a long prompt moved into the token loop, identical
@@ -89,7 +89,7 @@ static int prefill_width(int rem, int cap)
 
 	w &= ~1;	/* an odd width has no expression on the surface */
 	/*
-	 * ⚠ 4 + 4 RATHER THAN 6 + 2, and the two cost the same: two batched
+	 * 4 + 4 RATHER THAN 6 + 2, and the two cost the same: two batched
 	 * calls over the same eight tokens either way. 4 is a width the board
 	 * has measured EXACT on 225 to 277 real tensors; 6 is even, so the
 	 * layout proof covers it, but it has never been run on this hardware --
@@ -98,7 +98,7 @@ static int prefill_width(int rem, int cap)
 	 * forced anyway, take the arm with the board evidence.
 	 */
 	/*
-	 * ⚠⚠ 10 AS WELL AS 8, and the dense sweep is why. Both come back
+	 * 10 AS WELL AS 8, and the dense sweep is why. Both come back
 	 * missing ROW 0 of the n = 8192 tensors -- 62 of 64 at m = 8, 79 of 80
 	 * at m = 10 -- so the second fault is not one width, and the version
 	 * of this function that shipped an hour earlier would have handed the
@@ -111,7 +111,7 @@ static int prefill_width(int rem, int cap)
 	 * layout proof alone is not enough.
 	 */
 	/*
-	 * 🏁 2026-09-06: AND THE SPLIT IS NOW CONDITIONAL, because the fault it
+	 * 2026-09-06: AND THE SPLIT IS NOW CONDITIONAL, because the fault it
 	 * avoids is the NPU RAIL and not the width.
 	 *
 	 * Both maps quoted above were drawn at 750 mV, which overlap.h has
@@ -125,7 +125,7 @@ static int prefill_width(int rem, int cap)
 	 *   22   2486 of 2486   2486 of 2486         before this
 	 *   24   2712 of 2712   2712 of 2712
 	 *
-	 * ⚠ THE SPLIT STAYS FOR AN OFF-ENVELOPE BOARD, and not out of caution:
+	 * THE SPLIT STAYS FOR AN OFF-ENVELOPE BOARD, and not out of caution:
 	 * there it is the FASTER of the two correct paths. npudev.c refuses 8
 	 * and 10 below the envelope, and a refused chunk runs a row at a time,
 	 * which is far worse than two batched calls of 4. So the same reading
@@ -138,7 +138,7 @@ static int prefill_width(int rem, int cap)
 }
 
 /*
- * ⚠ WHICH WIDTHS ACTUALLY RAN, on the line a round pastes out.
+ * WHICH WIDTHS ACTUALLY RAN, on the line a round pastes out.
  *
  * "chunks of 32" is not a width: on 87 tokens it is 32, 32 and 23, and the 23
  * was the whole question -- board_chunk_sweep.sh had to reconstruct it from
@@ -232,7 +232,7 @@ static void usage(void)
 }
 
 /*
- * ⚠ THE BOARD'S TEMPERATURE, AND THE RATE IN TWO HALVES.
+ * THE BOARD'S TEMPERATURE, AND THE RATE IN TWO HALVES.
  *
  * An earlier run of the same model at the same weight width reached 17.1 tok/s
  * and was not kept; the likeliest reason is that the board had just been
@@ -271,7 +271,7 @@ static double board_temp_c(void)
 }
 
 /*
- * ⚠ THERE ARE THREE EXITS AND THE FIRST ONE IN THE FILE IS THE PROBE'S. The
+ * THERE ARE THREE EXITS AND THE FIRST ONE IN THE FILE IS THE PROBE'S. The
  * vision tower's close landed there -- a branch an ordinary run never takes --
  * so the tower was never closed, its pool never freed, and the one line saying
  * how much of the picture reached the hardware never printed. Three board
@@ -289,7 +289,7 @@ int main(int argc, char **argv)
 {
 	const char *path = NULL, *prompt = NULL, *promptfile = NULL;
 	/*
-	 * ⚠ MEASURED: Phi-3.5-mini answers NOTHING AT ALL when given a system
+	 * MEASURED: Phi-3.5-mini answers NOTHING AT ALL when given a system
 	 * turn -- six generated tokens, every one a newline -- and answers
 	 * properly without one. The template and the token count are identical
 	 * either way, checked against a hand-written prompt, so this is the
@@ -304,7 +304,7 @@ int main(int argc, char **argv)
 	int have_vision = 0, n_img_at = -1;
 	int show_tokens = 0, show_logits = 0, show_info = 0;
 	/*
-	 * ⚠ -1 MEANS ASK THE FILE. tokenizer_encode has always taken that and
+	 * -1 MEANS ASK THE FILE. tokenizer_encode has always taken that and
 	 * gguf's tokenizer.ggml.add_bos_token has always been read into the
 	 * tokenizer, but this tool passed a hard 1, so a model whose file says
 	 * not to prepend one got one anyway. Llama 3 says true, which is why it
@@ -339,7 +339,7 @@ int main(int argc, char **argv)
 	int hold_secs = 0;
 	int interactive = 0, turn;
 	/*
-	 * ⚠⚠ --repeat EXISTS BECAUSE THE PROBES WERE PAYING FOR A MODEL LOAD
+	 * --repeat EXISTS BECAUSE THE PROBES WERE PAYING FOR A MODEL LOAD
 	 * PER SAMPLE.
 	 *
 	 * board_intermittent asks a rate question -- how often does the batched
@@ -384,7 +384,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
 		else if (!strcmp(a, "--spec")) spec_k = atoi(NEXT());
 		/*
-		 * ⚠ AFTER STAGING AND INSTEAD OF GENERATING. The question is
+		 * AFTER STAGING AND INSTEAD OF GENERATING. The question is
 		 * what batching buys on this board's own weights, and a token
 		 * loop would only add noise to it.
 		 */
@@ -401,7 +401,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--image")) image = NEXT();
 		else if (!strcmp(a, "--mmproj")) mmproj = NEXT();
 		/*
-		 * ⚠⚠ WHICH COMMIT IS THIS BINARY. /opt/charsiu is not a git
+		 * WHICH COMMIT IS THIS BINARY. /opt/charsiu is not a git
 		 * checkout and neither is /root/charsiu_run_<name>, which is
 		 * how every board binary actually arrives. So every round has
 		 * recorded the machine, the clock and the wall time, and tied
@@ -430,14 +430,14 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ A CONVERSATION SHOWS THE CONVERSATION. Everything this tree prints
+	 * A CONVERSATION SHOWS THE CONVERSATION. Everything this tree prints
 	 * to explain itself -- the CPU pin, the governor, which tensors did not
 	 * reach the hardware and why, which path the prompt took -- is written
 	 * for a board log, and in a chat it lands in front of somebody who
 	 * typed a question and is waiting. A stable install is somebody's way
 	 * to run a model, not a probe.
 	 *
-	 * ⚠ BEFORE THE LOAD, because the thread pool pins and reports on its
+	 * BEFORE THE LOAD, because the thread pool pins and reports on its
 	 * way up and that happens inside it.
 	 */
 	if (interactive)
@@ -477,7 +477,7 @@ int main(int argc, char **argv)
 	fmt = chat_format_of(m.tk);
 
 	/*
-	 * ⚠ AN mmproj IS A SEPARATE FILE FROM THE MODEL, and it is the most
+	 * AN mmproj IS A SEPARATE FILE FROM THE MODEL, and it is the most
 	 * likely thing a person does not have. Guess the conventional name
 	 * beside the model before asking for it, and if that fails say the two
 	 * paths tried rather than "no such file".
@@ -501,7 +501,7 @@ int main(int argc, char **argv)
 		}
 		have_vision = 1;
 		/*
-		 * ⚠ THE PROJECTOR HAS TO LAND IN THIS MODEL'S SPACE. An mmproj
+		 * THE PROJECTOR HAS TO LAND IN THIS MODEL'S SPACE. An mmproj
 		 * from a different model opens, reads and computes, and then
 		 * hands over rows of the wrong width -- which as a memcpy is a
 		 * fluent answer about nothing.
@@ -599,7 +599,7 @@ int main(int argc, char **argv)
 		prompt = "The capital of France is";
 
 	/*
-	 * ⚠ INTERACTIVE IMPLIES THE CHAT TEMPLATE. A conversation fed as raw
+	 * INTERACTIVE IMPLIES THE CHAT TEMPLATE. A conversation fed as raw
 	 * completion text has no turn structure for the model to close, which
 	 * is exactly how rounds 372-377 ended up with a model that opens a
 	 * header and never shuts it.
@@ -619,7 +619,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ THE STATE IS BUILT ONCE AND EVERY TURN SHARES IT. That is the whole
+	 * THE STATE IS BUILT ONCE AND EVERY TURN SHARES IT. That is the whole
 	 * point of -i: staging the NPU tensors takes about twenty seconds, so a
 	 * conversation that reloaded per turn would be unusable. The kv cache
 	 * carries the history, which is also why the second turn feeds its
@@ -663,7 +663,7 @@ int main(int argc, char **argv)
 		}
 
 		/*
-		 * ⚠ Turn 0 opens with the system message; later turns must
+		 * Turn 0 opens with the system message; later turns must
 		 * first CLOSE the assistant turn the model just finished. The
 		 * generation loop breaks ON the end-of-turn token without
 		 * feeding it, so <|eot_id|> is not in the cache yet and the
@@ -690,9 +690,9 @@ int main(int argc, char **argv)
 		feed = turnbuf;
 	}
 
-	/* ⚠ add_bos only once: a second one mid-conversation is a new document */
+	/* add_bos only once: a second one mid-conversation is a new document */
 	/*
-	 * ⚠ WHERE THE PICTURE GOES IS PART OF THE PROMPT. Every family spells
+	 * WHERE THE PICTURE GOES IS PART OF THE PROMPT. Every family spells
 	 * its placeholder differently and puts it somewhere different in its
 	 * template, so this does not guess: `<image>` in the prompt text is
 	 * split on, the two halves are tokenized separately, and the tower's
@@ -758,7 +758,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* ⚠ what is LEFT, not what the context is: turn five starts at st->pos */
+	/* what is LEFT, not what the context is: turn five starts at st->pos */
 	if (st->pos + n_ids + (int)(n_img_at >= 0 ? img_tok : 0) + n_gen >=
 	    st->n_ctx) {
 		if (interactive) {
@@ -789,7 +789,7 @@ int main(int argc, char **argv)
 	const float *logits = NULL;
 
 	/*
-	 * ⚠ THE PROMPT IN ONE GO WHERE THE MODEL ALLOWS IT, and a token at a
+	 * THE PROMPT IN ONE GO WHERE THE MODEL ALLOWS IT, and a token at a
 	 * time where it does not. llama_prefill_batch refuses any architecture
 	 * it does not implement rather than computing something else, so the
 	 * fallback below is not an error path, it is the other half of the
@@ -800,19 +800,19 @@ int main(int argc, char **argv)
 	 */
 	{
 		/*
-		 * ⚠ IN CHUNKS, BECAUSE THE BUFFERS SCALE WITH THE CHUNK. A
+		 * IN CHUNKS, BECAUSE THE BUFFERS SCALE WITH THE CHUNK. A
 		 * whole prompt as one batch means n rows of every intermediate
 		 * and n rows of the batched output buffer, which at a 512 token
 		 * prompt is tens of megabytes for nothing: the probe's own
 		 * sweep flattens after m = 16, so a longer batch buys almost no
 		 * rate and costs memory linearly.
 		 *
-		 * ⚠ AND THE FALLBACK IS DECIDED ONCE. If the first chunk is
+		 * AND THE FALLBACK IS DECIDED ONCE. If the first chunk is
 		 * refused the whole prompt goes through the token loop, rather
 		 * than half of it taking one path and half the other.
 		 */
 		/*
-		 * ⚠ 80, AND IT IS THE VENDOR'S NUMBER. Their int4 M ladder,
+		 * 80, AND IT IS THE VENDOR'S NUMBER. Their int4 M ladder,
 		 * read off a .rkllm, is 1, 16, 24, 32, 40, 48, 64 and 80, and
 		 * 80 is both the widest and the most common -- 768 of 3328.
 		 * The board swept 32, 64, 80 and 96 over eight models: the text
@@ -820,13 +820,13 @@ int main(int argc, char **argv)
 		 * changes no arithmetic, and 80 was fastest on five of the
 		 * eight and never the worst.
 		 *
-		 * ⚠ 96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR
+		 * 96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR
 		 * stops and not where the hardware does. It was in the sweep
 		 * for exactly that reason: a sweep that stops where they stop
 		 * cannot tell a ceiling from a choice.
 		 */
 		/*
-		 * ⚠⚠ 80 WAS THE VENDOR'S NUMBER, NOT THE HARDWARE'S, AND THE
+		 * 80 WAS THE VENDOR'S NUMBER, NOT THE HARDWARE'S, AND THE
 		 * NOTE BELOW SAID SO BEFORE ANY SWEEP WENT LOOKING.
 		 *
 		 * "96 ALSO CAME BACK IDENTICAL, so 80 is where the VENDOR
@@ -858,13 +858,13 @@ int main(int argc, char **argv)
 		 * than the chunk saves. Qwen3's 1024 sits exactly at 5120 and
 		 * pays nothing.
 		 *
-		 * ⚠ AND 224 IS A CLIFF, NOT A SLOPE. Qwen3's 404 token prompt
+		 * AND 224 IS A CLIFF, NOT A SLOPE. Qwen3's 404 token prompt
 		 * takes 3272 ms at 160 and 13507 at 224, Llama's 257 goes 1862
 		 * to 8595: the batched path REFUSES and every token goes
 		 * through the token loop. Anything derived here must stay
 		 * under it.
 		 *
-		 * ⛔⛔ AND THE FORMULA IS NOT THE RULE. IT SHIPPED FOR TWENTY
+		 * AND THE FORMULA IS NOT THE RULE. IT SHIPPED FOR TWENTY
 		 * MINUTES AND SmolLM2-135M CAME BACK 77% SLOWER.
 		 *
 		 * n_embd 576 puts it at 284, capped to 160, and the surface
@@ -888,7 +888,7 @@ int main(int argc, char **argv)
 		 * about 9% on Qwen3 at every length measured and is a
 		 * deployment's call until the SmolLM2 case is explained.
 		 *
-		 * ⛔⛔ AND IT MOVES THE TEXT, which this note did not say.
+		 * AND IT MOVES THE TEXT, which this note did not say.
 		 * r411, Llama-3.2-1B at 852 tokens, 24 generated, same boot
 		 * and same binary: chunk 80 gives 8b02145bf030 and chunk 160
 		 * gives d80c57a8bf86. It is also 6.8% SLOWER there -- 6787 ms
@@ -904,7 +904,7 @@ int main(int argc, char **argv)
 		int chunk = ec ? atoi(ec) : 80;
 		int cap = llama_prefill_chunk_cap(&m);
 
-		/* ⚠ the cliff, not a preference: above this the projection is
+		/* the cliff, not a preference: above this the projection is
 		 * refused and every row of the prompt takes the token loop */
 		if (chunk > cap) {
 			if (charsiu_diag())
@@ -914,7 +914,7 @@ int main(int argc, char **argv)
 			chunk = cap;
 		}
 		/*
-		 * ⚠ ONE CHUNK WHEN THE WHOLE PROMPT FITS IN ONE, and this is
+		 * ONE CHUNK WHEN THE WHOLE PROMPT FITS IN ONE, and this is
 		 * NOT the derived default that shipped for twenty minutes.
 		 *
 		 * That one asked "how wide may a chunk be" and answered it from
@@ -931,7 +931,7 @@ int main(int argc, char **argv)
 		 * vendor's own protocol is a 128 token prompt, which is exactly
 		 * the case it changes.
 		 *
-		 * ⚠ ON. TTFT fell on all four vendor-protocol models -- 5.1%
+		 * ON. TTFT fell on all four vendor-protocol models -- 5.1%
 		 * and 5.7% on Phi-3.5 and TinyLLAMA, the two whose baseline
 		 * repeats, and further on the two whose baseline swings 16 to
 		 * 27% between identical runs -- with the DECODE column
@@ -939,7 +939,7 @@ int main(int argc, char **argv)
 		 * change cannot touch decode, and if it had moved, the arm
 		 * would have been measuring the board.
 		 *
-		 * ⚠⚠ AND IT IS VERIFIED WHERE IT ENGAGES, WHICH TOOK THREE
+		 * AND IT IS VERIFIED WHERE IT ENGAGES, WHICH TOOK THREE
 		 * TRIES. board_text_all.sh cleared eight architectures at 86 to
 		 * 88 tokens; the ninth runs a 64 token prompt, below the chunk,
 		 * so the knob did nothing and its matching hash said nothing. A
@@ -952,7 +952,7 @@ int main(int argc, char **argv)
 		 * CHARSIU_PREFILL_ONECHUNK=0 is the control.
 		 */
 		/*
-		 * ⚠⚠ NOT WHEN THE WIDENED WIDTH LANDS ON THE WRONG RESIDUE.
+		 * NOT WHEN THE WIDENED WIDTH LANDS ON THE WRONG RESIDUE.
 		 *
 		 * r397 swept the width itself, on prompts built to an exact
 		 * token count. Every width that is a multiple of FOUR is
@@ -966,7 +966,7 @@ int main(int argc, char **argv)
 		 * and WINS 5.6%. At 114 Llama and tinyllama widen to 1x114,
 		 * which is not, and LOSE 6.9 and 7.4%. One rule, two residues.
 		 *
-		 * ⚠ THE REPAIR IS TO DECLINE, NOT TO ROUND. Rounding 114 down
+		 * THE REPAIR IS TO DECLINE, NOT TO ROUND. Rounding 114 down
 		 * to 112 sends two tokens through the token loop: about 940 ms
 		 * against 957 for 1x114, a 1.8% win. Declining gives
 		 * 1x80+1x34, measured at 892 -- better than both, because the
@@ -1001,19 +1001,19 @@ int main(int argc, char **argv)
 		if (chunk < 2)
 			chunk = 2;
 		/*
-		 * ⚠ THE CHUNK IS A MAXIMUM, AND IT IS ROUNDED DOWN TO A WIDTH
+		 * THE CHUNK IS A MAXIMUM, AND IT IS ROUNDED DOWN TO A WIDTH
 		 * THE HARDWARE CAN EXPRESS. CHARSIU_PREFILL_CHUNK is how every
 		 * sweep of this has been steered -- board_chunk_sweep.sh walks
 		 * 32 31 30 29 24 16 4 2 -- so it still has to be honoured, and
 		 * 31 and 29 are exactly the values that produced wrong text. It
 		 * caps the width instead of being used as one.
 		 *
-		 * ⚠ AND IT SAYS SO, ONCE. A sweep that asked for 31, silently
+		 * AND IT SAYS SO, ONCE. A sweep that asked for 31, silently
 		 * got 30 and printed "chunks of 31" would be a table indexed by
 		 * a number that never ran, which is the failure that sweep
 		 * exists to avoid.
 		 *
-		 * ⚠ UNDER charsiu_diag(), WHICH A CONVERSATION TURNS OFF. The
+		 * UNDER charsiu_diag(), WHICH A CONVERSATION TURNS OFF. The
 		 * user who set the variable by hand is owed the answer that it
 		 * did not take -- and every probe and sweep runs one shot, with
 		 * diag on, so they all get it. Somebody talking to the model
@@ -1038,7 +1038,7 @@ int main(int argc, char **argv)
 			}
 		}
 		/*
-		 * ⚠ A PROMPT WITH A PICTURE IN IT TAKES THE TOKEN LOOP. The
+		 * A PROMPT WITH A PICTURE IN IT TAKES THE TOKEN LOOP. The
 		 * batched path builds its rows from the embedding table by
 		 * token id, and half of these rows did not come from there.
 		 * Sending them through it would batch the text and drop the
@@ -1056,13 +1056,13 @@ int main(int argc, char **argv)
 			done = n_img_at;
 		} else if (!getenv("CHARSIU_NO_BATCH_PREFILL") && n_ids >= 2) {
 			/*
-			 * ⚠ EVERY CHUNK IS AN EVEN WIDTH, so AT MOST ONE token
+			 * EVERY CHUNK IS AN EVEN WIDTH, so AT MOST ONE token
 			 * ever falls through to the token loop below -- 87
 			 * tokens at a cap of 32 is 32 + 32 + 22 and a single
 			 * token, where the old form ran a 23 the hardware
 			 * cannot express.
 			 *
-			 * ⚠ THE FALLBACK IS STILL DECIDED ONCE, and the two
+			 * THE FALLBACK IS STILL DECIDED ONCE, and the two
 			 * ways out of this loop are not the same thing. A
 			 * REFUSAL by llama_prefill_batch on the first chunk
 			 * leaves done at 0 and sends the whole prompt through
@@ -1073,7 +1073,7 @@ int main(int argc, char **argv)
 			 */
 			int probe = prefill_width(n_ids, chunk);
 
-			/* ⚠ the only thing in the library that needs to know
+			/* the only thing in the library that needs to know
 			 * how long the whole prompt is, rather than how long
 			 * this chunk is: CHARSIU_ATTN_NPU=auto. Said before
 			 * the first chunk, because the decision it feeds is
@@ -1106,7 +1106,7 @@ int main(int argc, char **argv)
 			logits = llama_forward(st, ids[i], st->pos);
 
 		/*
-		 * ⚠ AND SAY WHICH PATH IT TOOK. A run could not tell you this,
+		 * AND SAY WHICH PATH IT TOOK. A run could not tell you this,
 		 * so a batched run and a control run at the same rate could
 		 * mean the flag did nothing OR the architecture was never
 		 * batchable, and a board round went on Phi-3.5 producing three
@@ -1116,7 +1116,7 @@ int main(int argc, char **argv)
 		if (!quiet && charsiu_diag()) {
 			const char *why = llama_batch_why_not(&m);
 			/*
-			 * ⚠ AND SAY SO ON THE BATCHED LINE, not only in the
+			 * AND SAY SO ON THE BATCHED LINE, not only in the
 			 * one time warning far above it. This line is what
 			 * gets pasted out of a round, and "prompt batched" on
 			 * a model this tree refuses reads as good news.
@@ -1126,7 +1126,7 @@ int main(int argc, char **argv)
 					   : "";
 
 			/*
-			 * ⚠ THE CHUNKS ARE NO LONGER UNIFORM, so "chunks of
+			 * THE CHUNKS ARE NO LONGER UNIFORM, so "chunks of
 			 * %d" is the CAP and the widths that ran follow it.
 			 * The line still opens "charsiu: prompt batched" and
 			 * still carries the token count, because that prefix
@@ -1166,7 +1166,7 @@ int main(int argc, char **argv)
 	t_prompt = now_ms() - t0;
 
 	/*
-	 * ⚠ AFTER THE PROMPT, because the NPU tensors are staged lazily on the
+	 * AFTER THE PROMPT, because the NPU tensors are staged lazily on the
 	 * first forward pass that touches each one. Probing before it would
 	 * find nothing routed and say so.
 	 */
@@ -1179,7 +1179,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ THE STAGE TIMERS START HERE, NOT AT THE FIRST TOKEN. Round 327
+	 * THE STAGE TIMERS START HERE, NOT AT THE FIRST TOKEN. Round 327
 	 * read its own stage table as a decode split and it was 86% the
 	 * PROMPT: six tokens that fault 1.3 GB of weights in off the card
 	 * and build the NPU tensors take 31 seconds, and dividing by 38
@@ -1248,7 +1248,7 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * ⚠ SAY WHY IT IS OFF, EVERY WAY IT CAN BE. A run asked to speculate
+	 * SAY WHY IT IS OFF, EVERY WAY IT CAN BE. A run asked to speculate
 	 * that ran plain looks like speculation gaining nothing, and that is
 	 * a different fact.
 	 */
@@ -1274,7 +1274,7 @@ int main(int argc, char **argv)
 	t0 = now_ms();
 	int produced = 0;
 	/*
-	 * ⚠ A ROLE MARKER IS THREE TOKENS AND ONLY TWO OF THEM ARE CONTROL.
+	 * A ROLE MARKER IS THREE TOKENS AND ONLY TWO OF THEM ARE CONTROL.
 	 *
 	 * Llama 3 writes a turn header as <|start_header_id|>assistant
 	 * <|end_header_id|>, and the middle one is an ORDINARY TEXT token.
@@ -1285,7 +1285,7 @@ int main(int argc, char **argv)
 	 *
 	 * The whole header is suppressed now, markers and content.
 	 *
-	 * ⚠ AND IT BUFFERS RATHER THAN DROPS, because the first two attempts at
+	 * AND IT BUFFERS RATHER THAN DROPS, because the first two attempts at
 	 * this both lost text. Pushed past its own end with --ignore-eos on a
 	 * prompt that was never in chat format, this model opens a header and
 	 * NEVER CLOSES IT: the stream reads
@@ -1304,7 +1304,7 @@ int main(int argc, char **argv)
 	int in_header = 0, eog_at = -1, nheld = 0, heldn = 0;
 	const int HDR_MAX = 8;
 	/*
-	 * ⚠ THE BYTES, NOT THE POINTER. tokenizer_decode hands back a pointer
+	 * THE BYTES, NOT THE POINTER. tokenizer_decode hands back a pointer
 	 * into a single reused per-thread buffer for anything that is not a
 	 * control token, so holding the pointer and printing it later prints
 	 * whatever the LATEST call left there. The second attempt at this did
@@ -1333,7 +1333,7 @@ int main(int argc, char **argv)
 			if (!ignore_eos)
 				break;
 			/*
-			 * ⚠ WHERE THE MODEL WANTED TO STOP. Past this point
+			 * WHERE THE MODEL WANTED TO STOP. Past this point
 			 * the text is a continuation of a finished turn, and
 			 * greedy decoding on an unchanged context regenerates
 			 * near-identical paragraphs -- which is what every 384
@@ -1372,7 +1372,7 @@ int main(int argc, char **argv)
 			nheld = heldn = 0;
 		}
 		/*
-		 * ⚠ A CONTROL TOKEN IS NOT TEXT. decode hands back its literal
+		 * A CONTROL TOKEN IS NOT TEXT. decode hands back its literal
 		 * spelling, and this loop used to write whatever came back, so
 		 * a sampled <|eot_id|> or <|start_header_id|> was printed as
 		 * those characters. It STILL COUNTS and it still goes back into
@@ -1385,12 +1385,12 @@ int main(int argc, char **argv)
 			fflush(stdout);
 		}
 		produced++;
-		/* ⚠ counted in PRODUCED tokens, not iterations: a control
+		/* counted in PRODUCED tokens, not iterations: a control
 		 * token that is not printed still costs a forward pass. */
 		if (!t_half && produced * 2 >= n_gen) {
 			t_half = now_ms();
 			/*
-			 * ⚠ AND THE STAGE TABLE FOR THIS HALF, while it still
+			 * AND THE STAGE TABLE FOR THIS HALF, while it still
 			 * describes only this half.
 			 *
 			 * Round 390 measured 17.31 tok/s over the first 32
@@ -1405,13 +1405,13 @@ int main(int argc, char **argv)
 			 * whole run can never say it.
 			 */
 			/*
-			 * ⚠ ON THE SAME STREAM AS THE TABLE, which is stdout.
+			 * ON THE SAME STREAM AS THE TABLE, which is stdout.
 			 * A label on stderr sorts ahead of every table in a
 			 * pipe, because stdout is block buffered there and
 			 * stderr is not -- both labels came out before both
 			 * tables, which is worse than no label at all.
 			 *
-			 * ⚠ THE TABLES ARE ON STDERR NOW and the labels follow
+			 * THE TABLES ARE ON STDERR NOW and the labels follow
 			 * them, for that same reason: one stream, one
 			 * buffering. The `[load ...]` summary stays on stdout
 			 * -- board_vendor.sh redirects stderr to a file and
@@ -1450,7 +1450,7 @@ next:
 		double t_gen = now_ms() - t0;
 		double temp_end = board_temp_c();
 		long hwm = 0;
-		/* ⚠ NOT `st`: that is the llama state, and shadowing it here
+		/* NOT `st`: that is the llama state, and shadowing it here
 		 * made the interactive report read st->pos off a FILE. */
 		FILE *pf = fopen("/proc/self/status", "r");
 
@@ -1471,7 +1471,7 @@ next:
 			       st->pos, st->n_ctx);
 		else {
 		/*
-		 * ⚠ STAGING IS NOT PREFILL, AND IT LANDS INSIDE IT. The NPU
+		 * STAGING IS NOT PREFILL, AND IT LANDS INSIDE IT. The NPU
 		 * copies are built lazily, on the first forward pass that
 		 * touches each tensor, so all of it is charged to the prompt: a
 		 * gemma3 round read "prompt 6 tok in 6516 ms, 0.92 tok/s" for
@@ -1486,7 +1486,7 @@ next:
 		if (t_stage > 1.0)
 			printf("staging %.0f ms | ", t_stage);
 		/*
-		 * ⚠ THE PICTURE'S EMBEDDINGS ARE PROMPT TOKENS. They are 64 of
+		 * THE PICTURE'S EMBEDDINGS ARE PROMPT TOKENS. They are 64 of
 		 * the 78 forward passes a SmolVLM caption makes, and counting
 		 * only the 14 that came from the vocabulary reported 15.90
 		 * tok/s for work that ran at 88. A denominator that leaves out
@@ -1506,7 +1506,7 @@ next:
 		}
 		}
 		/*
-		 * ⚠ THE HALVES, NOT A ROLLING AVERAGE. Attention grows with the
+		 * THE HALVES, NOT A ROLLING AVERAGE. Attention grows with the
 		 * context too, so the second half is expected to be a little
 		 * slower on its own; what a throttle looks like is a gap wider
 		 * than that alongside a temperature that climbed.
@@ -1547,13 +1547,13 @@ next:
 		if (turn + 1 >= repeat)
 			break;
 		/*
-		 * ⚠ THE CACHE POSITION, AND NOTHING ELSE. Everything the next
+		 * THE CACHE POSITION, AND NOTHING ELSE. Everything the next
 		 * repeat reads at a position it is about to write is
 		 * overwritten from zero, so the cache contents do not need
 		 * clearing -- but pos does, or repeat two starts where repeat
 		 * one stopped and prefills a different length.
 		 *
-		 * ⚠ AND A MARKER ON STDOUT, because the caller has to be able
+		 * AND A MARKER ON STDOUT, because the caller has to be able
 		 * to split N answers out of one stream. Without it a comparison
 		 * would see one long string and call every repeat identical.
 		 */

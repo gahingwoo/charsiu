@@ -3,13 +3,13 @@
 /*
  * Time the vision tower's attention on its own, at the board's shape.
  *
- * ⚠⚠ THE HOST CANNOT SEE THIS STAGE THROUGH THE TOWER. On the board the
+ * THE HOST CANNOT SEE THIS STAGE THROUGH THE TOWER. On the board the
  * matmuls run on the NPU and the attention is 4010 ms of an 8156 ms encode --
  * half of it. On a development host the same matmuls run on the CPU, so the
  * stage table reads: feed forward 66%, attention 5.8%. Tuning a 5.8% row by
  * running the whole tower is measuring the feed forward's noise.
  *
- * ⚠⚠ AND THE HOST IS COMPUTE BOUND WHERE THE BOARD IS BANDWIDTH BOUND. This
+ * AND THE HOST IS COMPUTE BOUND WHERE THE BOARD IS BANDWIDTH BOUND. This
  * host holds the whole q/k/v/o working set -- 12 MB at n = 1024 -- in cache,
  * and the board, with about a megabyte of L2 for the whole A72 cluster, does
  * not. So a change that only removes DRAM traffic reads as a NON RESULT here.
@@ -18,7 +18,7 @@
  * appears at n = 8192 and not at n = 1024 is a BOARD win and a host non result,
  * and saying so is the whole point of running both.
  *
- * ⚠⚠ AND THE TWO VARIANTS ARE TIMED IN ONE PROCESS, INTERLEAVED. Two builds
+ * AND THE TWO VARIANTS ARE TIMED IN ONE PROCESS, INTERLEAVED. Two builds
  * run one after the other disagreed by 1.8x on this host with the SAME binary
  * on both sides, because six cores are shared with an editor and other agents.
  * -c runs both schedules rep by rep so they meet the same interference.
@@ -54,7 +54,7 @@ static double now_ms(void)
 }
 
 /*
- * ⚠ NOT rand(). The same stream every run means two builds are compared on the
+ * NOT rand(). The same stream every run means two builds are compared on the
  * same numbers, and a softmax over random scores is sensitive to the spread:
  * scaled to about a unit normal, which is where a trained ViT's scores live.
  */
@@ -69,7 +69,7 @@ static void fill(float *p, size_t n, uint32_t seed)
 }
 
 /*
- * ⚠ ELEMENT WISE, NOT A CHECKSUM. Most of the variants here reorder only the
+ * ELEMENT WISE, NOT A CHECKSUM. Most of the variants here reorder only the
  * issue of the arithmetic and are bit identical, and a checksum would catch
  * those. The fused kernel is not bit identical, and a checksum cannot tell a
  * few ulp of rounding from an output that is wrong in two places and right
@@ -176,7 +176,7 @@ int main(int argc, char **argv)
 	lo = cmp ? 0 : (unsigned)charsiu_vision_attn_sched_get();
 	hi = cmp ? nv : lo + 1;
 	/*
-	 * ⚠ REP OUTSIDE, SCHEDULE INSIDE. The other way round is two benchmarks
+	 * REP OUTSIDE, SCHEDULE INSIDE. The other way round is two benchmarks
 	 * run at two different times, which on a host whose six cores are shared
 	 * with an editor disagreed by 1.8x with the same code on both sides.
 	 */
@@ -187,7 +187,7 @@ int main(int argc, char **argv)
 
 			if (bef) {
 				/*
-				 * ⚠ THE WHOLE ROUND IN ONE PROCESS. Every one
+				 * THE WHOLE ROUND IN ONE PROCESS. Every one
 				 * of these four was measured on its own; this
 				 * is the only number that says what a person
 				 * actually gets, and it has to meet the same
@@ -219,7 +219,7 @@ int main(int argc, char **argv)
 			if (!best[s] || dt < best[s])
 				best[s] = dt;
 			/*
-			 * ⚠ AND THE RESULT HAS TO BE READ, AND COMPARED.
+			 * AND THE RESULT HAS TO BE READ, AND COMPARED.
 			 * Without it -O2 is entitled to notice the output is
 			 * dead; and a variant that is faster because it stopped
 			 * computing the answer is the failure mode a stopwatch

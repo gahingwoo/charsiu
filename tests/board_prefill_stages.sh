@@ -4,7 +4,7 @@
 #
 # WHERE THE PROMPT'S TIME GOES, per model, on the hardware.
 #
-# ⚠⚠ THIS EXISTS BECAUSE THE GAP IS UNATTRIBUTED. charsiu is behind the
+# THIS EXISTS BECAUSE THE GAP IS UNATTRIBUTED. charsiu is behind the
 # vendor's published TTFT on all four models -- 1.31x, 1.64x, 1.63x, 1.82x --
 # and the obvious explanation does not fit: the model with the MOST per-call
 # dispatch overhead has the SMALLEST gap (Qwen3, 23% and 1.31x) and the one
@@ -20,11 +20,11 @@
 # table summing to twice the NPU's own entry with a third of the prompt
 # unnamed. Nothing had ever run it across the four scoreboard models.
 #
-# ⚠ -n 1, SO THE TABLE IS THE PROMPT'S. One generated token, so decode cannot
+# -n 1, SO THE TABLE IS THE PROMPT'S. One generated token, so decode cannot
 # contribute anything but its own single step, and CHARSIU_STAGES keeps the
 # batched rows apart from the token loop's regardless.
 #
-# ⚠ THE MATMUL SPLIT IS THE LINE TO READ FIRST. "N calls: X ms a row inside
+# THE MATMUL SPLIT IS THE LINE TO READ FIRST. "N calls: X ms a row inside
 # the NPU entry" against what is in its wrapper and what fell to the CPU: a
 # projection the hardware refuses falls back to a matvec a row at a time IN
 # SILENCE, and that is the shape of an unnamed third of a prompt.
@@ -38,7 +38,7 @@ BIN=$D
 [ -x "$BIN/charsiu_run" ] || BIN=/opt/charsiu
 [ -x "$BIN/charsiu_run" ] || { echo "no charsiu_run"; exit 2; }
 
-# ⚠⚠ /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and
+# /opt/vendor/models IS WHERE SEVEN OF THE NINE LIVE ON THIS BOARD, and
 # leaving it off this list is not a smaller round, it is a round that answers
 # nothing: every model reports "not on this card", the table prints with no
 # rows, and the script exits 0. board_text_all.sh had the identical list and
@@ -60,7 +60,7 @@ P="The history of computing begins long before the first electronic machine. Mer
 
 echo "== where the prompt's time goes, $(date -Is)"
 echo "   binary $BIN/charsiu_run"
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -90,6 +90,6 @@ for spec in "Qwen3 0.6B:Qwen3-0.6B-Q4_0.gguf" \
 	echo
 done
 
-echo "⚠ READ THE MATMUL SPLIT FIRST. Rows that fell to the CPU are a silent"
+echo "READ THE MATMUL SPLIT FIRST. Rows that fell to the CPU are a silent"
 echo "  fallback and are the shape of an unnamed third of a prompt; the stage"
 echo "  percentages below them are only meaningful once that line is zero."

@@ -2,7 +2,7 @@
 /*
  * npu_job_cost -- what a JOB costs to start, measured instead of subtracted.
  *
- * ⚠⚠ WHY THIS EXISTS. Rounds 148 to 151 took decode's 71 us per-call floor
+ * WHY THIS EXISTS. Rounds 148 to 151 took decode's 71 us per-call floor
  * apart: ~11 us of blocking wakeup, 9.2 us of cache maintenance, ~5 us of
  * syscalls. The remaining ~46 us was then written down as "the device starting
  * a job, which no userspace work removes" -- and that number was never
@@ -59,7 +59,7 @@ static double now_us(void)
 
 /* the smallest matmul that still assembles: the arithmetic must not matter */
 /*
- * ⚠⚠ THE PROBE'S LOOP IS NOT THE SHAPE OF A DECODE, AND THE SMALL END KNOWS.
+ * THE PROBE'S LOOP IS NOT THE SHAPE OF A DECODE, AND THE SMALL END KNOWS.
  *
  * Rounds 155 and 161 disagreed by a factor of two below 1 MB and round 161 was
  * non monotone inside itself. But decode -- which issues exactly these small
@@ -162,7 +162,7 @@ static void fill(struct charsiu_joblist *jl, struct unit *u, unsigned ntask)
 
 int main(int argc, char **argv)
 {
-	/* ⚠ before any positional argument is read: several of these tools take
+	/* before any positional argument is read: several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. npu_slice_test did
 	 * exactly that until this went in. */
@@ -216,7 +216,7 @@ int main(int argc, char **argv)
 
 	/* --- the MB axis: is the bandwidth term a constant at all --- */
 	/*
-	 * ⚠⚠ THE COEFFICIENT THE SHAPE PREDICTOR NEEDS AND CANNOT ASSUME.
+	 * THE COEFFICIENT THE SHAPE PREDICTOR NEEDS AND CANNOT ASSUME.
 	 *
 	 * charsiu_shapes fits a token as calls*a + tasks*b + MB*c. Calibrated
 	 * on qwen3 alone it predicts gemma4 +12.6% and Phi-3.5 +25.1%, both
@@ -229,7 +229,7 @@ int main(int argc, char **argv)
 	 * will fix a predictor built on one.
 	 */
 	/*
-	 * ⚠⚠ THE SMALL END IS NOISE AND TWO ROUNDS PROVED IT, so it is
+	 * THE SMALL END IS NOISE AND TWO ROUNDS PROVED IT, so it is
 	 * repeated more and reported with a spread rather than as a point.
 	 *
 	 * Rounds 155 and 161 on the same shapes: 0.0020 MB read 60.10 then
@@ -253,7 +253,7 @@ int main(int argc, char **argv)
 	       "k", "n", "MB", "us mean", "us best", "us a MB", "spread");
 	{
 		/*
-		 * ⚠ THE RANGE HAS TO COVER WHAT A MODEL ACTUALLY ASKS FOR.
+		 * THE RANGE HAS TO COVER WHAT A MODEL ACTUALLY ASKS FOR.
 		 * The first sweep stopped at 8.39 MB and charsiu_shapes then
 		 * had to extrapolate Phi-3.5's gate+up, which is 19.6 MB in one
 		 * call -- 2.3x outside the data. Its predictions came back
@@ -273,7 +273,7 @@ int main(int argc, char **argv)
 			double us, mb;
 
 			/*
-			 * ⚠⚠ REFUSE WHAT THE DEVICE WILL NOT TAKE, HERE, NOT BY
+			 * REFUSE WHAT THE DEVICE WILL NOT TAKE, HERE, NOT BY
 			 * SUBMITTING IT.
 			 *
 			 * The sweep was widened to 67 MB with 4096 x 16384 on
@@ -329,7 +329,7 @@ int main(int argc, char **argv)
 					sum += us;
 				}
 				/*
-				 * ⚠⚠ THE MEAN, NOT THE BEST, AND THAT WAS A
+				 * THE MEAN, NOT THE BEST, AND THAT WAS A
 				 * REAL MISTAKE.
 				 *
 				 * Round 162 reported best-of-five and the
@@ -375,7 +375,7 @@ int main(int argc, char **argv)
 		for (r = 0; r < reps; r++) {
 			fill(&jl[0], &a, 1);
 			fill(&jl[1], &b, 1);
-			/* ⚠ THE ARM NOBODY HAS RUN: one ioctl, two jobs, and
+			/* THE ARM NOBODY HAS RUN: one ioctl, two jobs, and
 			 * the driver is free to put them on both cores. */
 			if (charsiu_submit_jobs(d0, jl, 2))
 				break;
@@ -414,9 +414,9 @@ int main(int argc, char **argv)
 			printf("  D  (a second fd would not open)\n");
 		}
 	}
-	printf("\n⚠ B against D is the question. If B is faster, charsiu's second\n"
+	printf("\nB against D is the question. If B is faster, charsiu's second\n"
 	       "  core has been starting a syscall late since it was written.\n"
-	       "⚠ And A against C says what an ioctl costs when the work is the\n"
+	       "And A against C says what an ioctl costs when the work is the\n"
 	       "  same, which is the control for reading B at all.\n");
 
 	unit_free(d0, &a); unit_free(d0, &b);

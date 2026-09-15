@@ -5,7 +5,7 @@
 # TTFT against prompt length, so the fixed cost is MEASURED rather than
 # extrapolated from two points.
 #
-# ⚠⚠ WHY THIS EXISTS. r391 separated charsiu's prefill into a per-token rate
+# WHY THIS EXISTS. r391 separated charsiu's prefill into a per-token rate
 # and a fixed cost by timing two prompt lengths and fitting a line through
 # them. Two points always fit a line. What that fit assumed -- that TTFT is
 # linear in the token count -- is only true inside one chunk:
@@ -14,7 +14,7 @@
 # r391's points were 16 and 79, both inside one chunk, so its fit was safe by
 # luck rather than by design.
 #
-# ⚠⚠ AND THE REAL TRAP IS NOT THE CAP, IT IS THE ODD TOKEN. `prefill_width()`
+# AND THE REAL TRAP IS NOT THE CAP, IT IS THE ODD TOKEN. `prefill_width()`
 # does `w &= ~1`, so a prompt of 79 tokens runs as a batched 78 plus ONE token
 # through `llama_forward` -- and that token-loop step is inside the prompt
 # timer. r391's two points were 16 (no leftover) and 79 (one leftover), so its
@@ -28,17 +28,17 @@
 # This also sweeps far enough to cross the cap, so the step is visible if it is
 # there and the linear region is identified rather than assumed.
 #
-# 🔑 THE NUMBER THIS IS FOR. r391 put charsiu's fixed cost at 109 ms at maximum
+# THE NUMBER THIS IS FOR. r391 put charsiu's fixed cost at 109 ms at maximum
 # CPU against the vendor's 82.2 ms -- the one half of prefill where their
 # runtime is ahead of ours, and a part of the prompt that NOTHING in this tree
 # has ever decomposed. board_prefill_stages.sh measures milliseconds a ROW and
 # explicitly excludes staging; the intercept is neither of those.
 #
-# ⚠ The token count is READ BACK from the runtime, never assumed from the text.
+# The token count is READ BACK from the runtime, never assumed from the text.
 # A prompt built by repeating a clause does not tokenise to a round number, and
 # the whole point of the x axis is that it is exact.
 #
-# ⚠⚠ BOTH RUNTIMES RUN FROM THIS ONE FILE, on whichever arm is booted, because
+# BOTH RUNTIMES RUN FROM THIS ONE FILE, on whichever arm is booted, because
 # the comparison is only worth anything if the PROMPTS are the same text. Their
 # tokeniser wraps the prompt in a chat template, so the same text is a
 # different token count to each of them -- which is exactly why each side is
@@ -56,12 +56,12 @@ M=${CHARSIU_MODEL:-/opt/charsiu/models/Llama-3.2-1B-Instruct-Q4_0.gguf}
 VBIN=${VENDOR_BENCH:-/opt/vendor/bin/vendor_bench}
 VLIB=${VENDOR_LIB:-/opt/vendor/lib}
 VMODEL=${VENDOR_MODEL:-/opt/vendor/model/Llama-3.2-1B-Instruct-rk3576-w4a16.rkllm}
-# ⚠ MAXN is the default since the r391 round, but every other board script in
+# MAXN is the default since the r391 round, but every other board script in
 # this tree still spells the environment out and a round that reads differently
 # from its neighbours is a round nobody can compare.
 E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 
-# ⚠ PIN THE CLOCK. r391 measured the intercept moving 143.3 -> 109.0 ms across
+# PIN THE CLOCK. r391 measured the intercept moving 143.3 -> 109.0 ms across
 # the governor, which is larger than anything this sweep is looking for.
 for p in /sys/devices/system/cpu/cpufreq/policy*; do
 	echo userspace > "$p/scaling_governor" 2>/dev/null || true
@@ -70,7 +70,7 @@ for p in /sys/devices/system/cpu/cpufreq/policy*; do
 done
 sleep 1
 
-# ⚠ WHICH RUNTIME CAN RUN HERE IS DECIDED BY THE DRIVER, NOT BY A FLAG. The
+# WHICH RUNTIME CAN RUN HERE IS DECIDED BY THE DRIVER, NOT BY A FLAG. The
 # vendor's runtime finds the NPU through the DRM render node only their driver
 # publishes; ours needs /dev/accel. One arm has one of them.
 if ls /sys/bus/platform/drivers/RKNPU 2>/dev/null | grep -q npu; then
@@ -91,7 +91,7 @@ if [ "$ARM" = charsiu ]; then
 	echo "   binary    $RUN  $(ls -l --full-time "$RUN" 2>/dev/null | awk '{print $6}')"
 	echo "   build     $(charsiu_build "$RUN")"
 	echo "   model     $M"
-	# ⚠ ASK THE RUNTIME, DO NOT ASSERT IT. This line used to say "chunk cap
+	# ASK THE RUNTIME, DO NOT ASSERT IT. This line used to say "chunk cap
 	# 160 tokens for this model at KMAX 1024" as a string, which is a claim
 	# about llama_prefill_chunk_cap() rather than a reading of it -- and the
 	# cap depends on the model and on KMAX, neither of which this script
@@ -102,7 +102,7 @@ if [ "$ARM" = charsiu ]; then
 else
 	echo "   binary    $VBIN, librkllmrt in $VLIB"
 	echo "   model     $VMODEL"
-	echo "   ⚠ their tokeniser wraps the prompt, so the token column is THEIRS"
+	echo "   their tokeniser wraps the prompt, so the token column is THEIRS"
 fi
 echo "   repeats   $REPEAT per point, one warm-up discarded"
 echo
@@ -122,12 +122,12 @@ for REPS in ${TC_REPS:-1 2 4 8 12 18 24 34}; do
 	while [ $i -lt "$REPS" ]; do P="$P$CLAUSE"; i=$((i+1)); done
 
 	if [ "$ARM" = vendor ]; then
-		# ⚠ vendor_bench does its own warm-up and its own median, and
+		# vendor_bench does its own warm-up and its own median, and
 		# reports ITS OWN token count -- which is the number that goes
 		# in the table, not ours.
 		O=$(cd "$(dirname "$VBIN")" && LD_LIBRARY_PATH="$VLIB" \
 		    "$VBIN" "$VMODEL" "$REPEAT" 1 "$P" 2>/dev/null)
-		# ⚠ MATCH THE SUCCESS LINE, NOT THE RUN LINE. `run 1: FAILED
+		# MATCH THE SUCCESS LINE, NOT THE RUN LINE. `run 1: FAILED
 		# rc=-1` also starts with "run 1:", the sed then substitutes
 		# nothing, and the whole failure message went into the token
 		# column and out of awk as a syntax error.
@@ -138,7 +138,7 @@ for REPS in ${TC_REPS:-1 2 4 8 12 18 24 34}; do
 		if [ -z "${N:-}" ] || [ -z "${MT:-}" ]; then
 			echo "   ${REPS} clauses: THEIR RUNTIME REFUSED IT"
 			echo "$O" | grep -E 'FAILED|error|rkllm' | head -2 | sed 's/^/      /'
-			echo "      ⚠ check VENDOR_CTX before calling this their limit"
+			echo "      check VENDOR_CTX before calling this their limit"
 			continue
 		fi
 		MARG=-
@@ -151,7 +151,7 @@ for REPS in ${TC_REPS:-1 2 4 8 12 18 24 34}; do
 		continue
 	fi
 
-	# The warm-up doubles as the width read. ⚠ There is NO env var for
+	# The warm-up doubles as the width read. There is NO env var for
 	# this: charsiu_diag() is a static that is ON unless the binary calls
 	# charsiu_diag_quiet(), so the widths line is already on stderr and the
 	# only thing needed is to stop discarding it. That line is the only
@@ -174,7 +174,7 @@ for REPS in ${TC_REPS:-1 2 4 8 12 18 24 34}; do
 	[ -n "${BATCHED:-}" ] || BATCHED=$N
 	LEFT=$((N - BATCHED))
 
-	# ⚠ a marginal slope across a point with a leftover token is a slope
+	# a marginal slope across a point with a leftover token is a slope
 	# with a decode step hidden in it. Say so rather than printing it.
 	MARG=-
 	if [ -n "$PREV_N" ] && [ "$N" != "$PREV_N" ]; then

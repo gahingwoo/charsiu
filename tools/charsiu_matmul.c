@@ -98,7 +98,7 @@ static int cpu_reference(const struct charsiu_job *job, const uint8_t *a,
  * add the two.** out[c] + out[c+N] is then the full dot product, the buffer
  * stays exactly N*K/2 bytes, and every nibble in it is used.
  *
- * ⚠ Round 329 set 0x40b8 = 3 and 0x3020 = 2N-1, which is what makes the
+ * Round 329 set 0x40b8 = 3 and 0x3020 = 2N-1, which is what makes the
  * hardware compute and write those 2N words, but left the PACKING alone -- so
  * the phantom words held nothing and nothing changed. The registers were half
  * the change.
@@ -124,7 +124,7 @@ static void pack_phantom(const struct charsiu_matmul *mm, const uint8_t *b_raw,
 	 *   w64  byte 1024 -> k 0,1                    byte 1280 -> k 32,33
 	 *
 	 * So **w0 and w1 together cover all 64 k**, and w64 is a duplicate of
-	 * w0's k in a different part of the buffer. ⚠ That kills round 330's
+	 * w0's k in a different part of the buffer. That kills round 330's
 	 * pairing -- c with c+N is two copies of the same half -- and hands
 	 * over the real one: **a channel is the pair (2r, 2r+1)**. With
 	 * 0x3020 = 2N-1 there are 2N words, so N real channels each with the
@@ -159,7 +159,7 @@ static void pack_phantom(const struct charsiu_matmul *mm, const uint8_t *b_raw,
 int main(int argc, char **argv)
 {
 	/*
-	 * ⚠ BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
+	 * BEFORE ANY POSITIONAL ARGUMENT IS READ. Several of these tools take
 	 * argv[1] straight through atoi, so an unrecognised --version becomes a
 	 * dimension of ZERO submitted to the hardware. It also has to exist at
 	 * all: tests/board_clk.sh's charsiu_build prints "binary predates the
@@ -248,7 +248,7 @@ int main(int argc, char **argv)
 		if (!getenv("CHARSIU_W4_SMALLSCALE"))
 			job.weight_scale = 0.18f;
 		/*
-		 * ⚠ ROUND 324 CAUGHT THIS WITH ITS OWN CONTROL. The generator
+		 * ROUND 324 CAUGHT THIS WITH ITS OWN CONTROL. The generator
 		 * was `i * 13 % 15`, which has FIFTEEN residues, so channel c
 		 * and channel c + 15 hold an identical weight vector, and the
 		 * halfk parity doubles that to thirty. Every reference value
@@ -436,7 +436,7 @@ int main(int argc, char **argv)
 					: (uint8_t)(j == c % span ? 128 + 100 : 128);
 		memset(bias, 0, n * sizeof(*bias));
 		/*
-		 * ⚠ IT SAYS WHICH BRANCH IT TOOK AND WHAT IT SET.
+		 * IT SAYS WHICH BRANCH IT TOOK AND WHAT IT SET.
 		 *
 		 * Five knobs in this family have turned out to miss the code
 		 * they were meant to reach and returned a clean negative that
@@ -479,7 +479,7 @@ int main(int argc, char **argv)
 		unsigned j, zeroed = 0;
 
 		/*
-		 * ⚠ THE MASK IS PER CHANNEL AND 278 AND 279 BOTH GOT IT WRONG.
+		 * THE MASK IS PER CHANNEL AND 278 AND 279 BOTH GOT IT WRONG.
 		 * They zeroed (k mod 32) >= 16 for every channel, which is what
 		 * an EVEN channel is fed. An odd channel is fed the other half,
 		 * k 16..31 and 48..63, so the mask was exactly backwards on half
@@ -525,7 +525,7 @@ int main(int argc, char **argv)
 	 * more than m*n bytes. Round 199's N = 40 came back "0 of 40 bytes
 	 * written", which is what a short output buffer looks like. */
 	/*
-	 * ⚠ FOUR BYTES AN ELEMENT ON THE int4 PATH. w4a16 does not requantise:
+	 * FOUR BYTES AN ELEMENT ON THE int4 PATH. w4a16 does not requantise:
 	 * 0x40ac, 0x40b0 and 0x40b4 are 0, 1, 0, so what lands is the raw
 	 * accumulator, a signed 32 bit integer per channel. Rounds 265, 267 and
 	 * 278 each found a probe in this repo reading it as bytes; this is the
@@ -557,7 +557,7 @@ int main(int argc, char **argv)
 	 * bring the fault back has not been shown to be the fix.
 	 */
 	/*
-	 * ⚠ CHARSIU_W4_AF16: A REAL HALF IN THE SLOT, not an int8 in its high
+	 * CHARSIU_W4_AF16: A REAL HALF IN THE SLOT, not an int8 in its high
 	 * byte.
 	 *
 	 * The int4 arithmetic this tree measured is
@@ -679,7 +679,7 @@ int main(int argc, char **argv)
 	 */
 	if (job.mm.wdtype == CHARSIU_INT4) {
 		/*
-		 * ⚠ THE int4 COMPARISON IS NOT THE int8 ONE AND ROUND 278 RAN
+		 * THE int4 COMPARISON IS NOT THE int8 ONE AND ROUND 278 RAN
 		 * IT ANYWAY. Two things were wrong at once. The output was read
 		 * as bytes, and the giveaway is in 278's own log: every group of
 		 * four reads "X Y 255 255" or "X Y 0 0", which is a little
@@ -697,7 +697,7 @@ int main(int argc, char **argv)
 		 * charsiu packs an int8 into the HIGH byte of a 2 byte slot, so
 		 * abits is (a - 0x80) << 8.
 		 *
-		 * ⚠ WHERE THE SHIFT GOES IS NOT MEASURED. Every point behind
+		 * WHERE THE SHIFT GOES IS NOT MEASURED. Every point behind
 		 * that formula had ONE live nibble, so a shift per element and a
 		 * shift on the sum are indistinguishable in all of them. Both
 		 * are computed here and both counts are printed, because picking
@@ -705,14 +705,14 @@ int main(int argc, char **argv)
 		 * reading.
 		 */
 		/*
-		 * ⚠ THE SURFACE READING, not row major. Every int4 matmul in
+		 * THE SURFACE READING, not row major. Every int4 matmul in
 		 * this project has been M = 1, where [n/atom][m][n%atom]
 		 * collapses to n and a row major read is accidentally right.
 		 * The int8 path has read the surface since round 199 and this
 		 * one never had to. It does now.
 		 */
 		/*
-		 * ⚠ THE ATOM IS THE int4 PATH'S OWN, NOT 16. w4a16 packs its
+		 * THE ATOM IS THE int4 PATH'S OWN, NOT 16. w4a16 packs its
 		 * activation as a 2 byte element whose feature atom is 8, and
 		 * this reader hardcoded charsiu_feature_atom(CHARSIU_INT8),
 		 * which is 16. At M = 1 both collapse to n and the difference
@@ -720,14 +720,14 @@ int main(int argc, char **argv)
 		 * and the odd numbered groups came back 0 of 8 at M = 4, which
 		 * is exactly the set the two readings disagree on.
 		 *
-		 * ⚠ IT IS NOT THE WHOLE STORY. The even groups came back 4 of 8
+		 * IT IS NOT THE WHOLE STORY. The even groups came back 4 of 8
 		 * where both readings agree, and M = 2 gave every group 4 of 8
 		 * with only g7 at zero, which is a different shape again. So the
 		 * atom is corrected here and the surface is DUMPED below rather
 		 * than guessed at a second time.
 		 */
 		/*
-		 * ⚠ THE SURFACE GROUPS BY SIXTEEN BYTES, NOT SIXTEEN ELEMENTS.
+		 * THE SURFACE GROUPS BY SIXTEEN BYTES, NOT SIXTEEN ELEMENTS.
 		 * Round 290 dumped the raw surface at M = 2, N = 16 and read it
 		 * off directly: row 0's channels 0 to 3 are at words 0 to 3 and
 		 * its channels 4 to 7 are at words 8 to 11, so an atom group is
@@ -771,7 +771,7 @@ int main(int argc, char **argv)
 				got = o[(size_t)(ni / atom) * m * atom
 					+ (size_t)mi * atom + ni % atom];
 				/*
-				 * ⚠ THE PHANTOM WORD IS THE OTHER HALF OF THE
+				 * THE PHANTOM WORD IS THE OTHER HALF OF THE
 				 * SUM, not a spare. Its index follows the same
 				 * surface formula at channel ni + n.
 				 */
@@ -882,7 +882,7 @@ int main(int argc, char **argv)
 						hit++;
 				}
 				/*
-				 * ⚠ A DEAD OUTPUT SCORED n OF n. Round 339's
+				 * A DEAD OUTPUT SCORED n OF n. Round 339's
 				 * 3d timed out, every word came back zero, the
 				 * least squares scale fitted to 0.000000 and
 				 * every channel was "within 1% of zero". That
@@ -911,7 +911,7 @@ int main(int argc, char **argv)
 		       "%u EXACT with the shift on the sum\n",
 		       written, m * n, ex_pe, ex_sum);
 		/*
-		 * ⚠ WHICH channels, in groups of eight, because the layout is
+		 * WHICH channels, in groups of eight, because the layout is
 		 * indexed by n/8 and a whole group being wrong is a different
 		 * fault from a scatter. Round 281 printed only channels 0 to 7
 		 * and its two partial results, 24 of 32 and 8 of 16, could not
@@ -953,7 +953,7 @@ int main(int argc, char **argv)
 			printf("\n");
 
 			/*
-			 * ⚠ AND WHICH ONES. "g1 4/8" is as consistent with the
+			 * AND WHICH ONES. "g1 4/8" is as consistent with the
 			 * even channels failing as with the odd, and round 289's
 			 * N = 20 and round 290's M > 1 both come down to that
 			 * distinction. Name them.
@@ -993,7 +993,7 @@ int main(int argc, char **argv)
 			}
 		}
 		/*
-		 * ⚠ WHERE THE VALUES WENT, which a score cannot say. Round 312
+		 * WHERE THE VALUES WENT, which a score cannot say. Round 312
 		 * set 0x40b8 = 3 on int4: the words WRITTEN went from 136 to 256
 		 * and the exact count FELL from 128 to 16, with the survivors at
 		 * group 0 and group 30. Those two numbers together are equally
@@ -1039,7 +1039,7 @@ int main(int argc, char **argv)
 				refv[ci] = pe;
 			}
 			/*
-			 * ⚠ HOW MANY OF THE REFERENCES ARE EVEN DIFFERENT FROM EACH
+			 * HOW MANY OF THE REFERENCES ARE EVEN DIFFERENT FROM EACH
 			 * OTHER. This is the line round 324 needed and did not have:
 			 * its generator gave only 30 distinct channel patterns, so a
 			 * search for a value found a DUPLICATE and every count below
@@ -1070,7 +1070,7 @@ int main(int argc, char **argv)
 					continue;
 				nz++;
 				/*
-				 * ⚠ THE OWN INDEX IS CHECKED AGAINST ALL THE HITS, not
+				 * THE OWN INDEX IS CHECKED AGAINST ALL THE HITS, not
 				 * against the first one. Round 324 printed ident = 30 on
 				 * a run whose score was 64 of 64, because a duplicate at
 				 * a lower index won the search. A metric that disagrees
@@ -1107,7 +1107,7 @@ int main(int argc, char **argv)
 				}
 			}
 			/*
-			 * ⚠ READ THE PAIRING, DO NOT GUESS IT. Round 330 packed
+			 * READ THE PAIRING, DO NOT GUESS IT. Round 330 packed
 			 * the second half of each channel's k into word c+N and
 			 * added out[c] + out[c+N], and got zero of 64 -- but the
 			 * hardware DID write 2N words (128 at N=64, exactly 2N,

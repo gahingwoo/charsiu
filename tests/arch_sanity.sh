@@ -4,7 +4,7 @@
 #
 # Does each architecture still know a fact?
 #
-# ⚠ THIS IS NOT A CORRECTNESS ORACLE and must not be read as one. It is a smoke
+# THIS IS NOT A CORRECTNESS ORACLE and must not be read as one. It is a smoke
 # test for one specific failure mode that nothing else here catches: a graph
 # that is wrong in a way which still produces FLUENT ENGLISH.
 #
@@ -34,13 +34,13 @@
 
 set -e
 
-# ⚠ SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
+# SOURCED HERE AND NOT FURTHER DOWN: board_clk.sh is what makes
 # CHARSIU_RUN and CHARSIU_RUN_BIN two names for one knob, and this
 # script picks its binary below. Sourcing it after that point set the
 # alias too late to be read -- which is how round 414 measured the
 # INSTALLED binary for twenty minutes while believing otherwise.
 . "$(dirname "$0")/board_clk.sh"
-# ⚠ THE ENVIRONMENT IS THE SECOND WAY IN, AND IT HAD TO BE. The board's
+# THE ENVIRONMENT IS THE SECOND WAY IN, AND IT HAD TO BE. The board's
 # regress.sh exports CHARSIU_BOARD_DIR and then calls this with no argument,
 # which this refused -- so section 1 of the r411 regression, "every
 # architecture still knows a fact", has printed a usage line and NOTHING ELSE
@@ -60,11 +60,11 @@ if [ ! -d "$DIR" ]; then
 	exit 2
 fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# ⚠ CHARSIU_RUN SO THIS CAN RUN WHERE THE MODELS ARE. The models live on the
+# CHARSIU_RUN SO THIS CAN RUN WHERE THE MODELS ARE. The models live on the
 # board and the board has no compiler, so a script that builds before it checks
 # is a check that cannot run on the only machine that has something to check.
 RUN="${CHARSIU_RUN:-$ROOT/build/charsiu_run}"
-# ⚠⚠ AND charsiu_check THE SAME WAY, WHICH IT WAS NOT. This resolved only
+# AND charsiu_check THE SAME WAY, WHICH IT WAS NOT. This resolved only
 # $ROOT/build/charsiu_check, and on the board there is no tree -- the binaries
 # live in /opt/charsiu. So `arch` was EMPTY on every row and the architecture
 # column, the one this whole section is named after, printed `?` on the only
@@ -79,7 +79,7 @@ WANT="Paris"
 
 [ -n "${CHARSIU_RUN:-}" ] || make -C "$ROOT" build/charsiu_run >/dev/null
 
-# ⚠ ONCE WITH CHARSIU_STAGES, because a crash that needs an environment
+# ONCE WITH CHARSIU_STAGES, because a crash that needs an environment
 # variable is still a crash. The sliding window's start was shadowed by
 # llama_forward's timing variable, which only the STAGE macro assigns to, so
 # every run with stages on took a wild pointer into softmax -- and the board
@@ -95,7 +95,7 @@ archs_ok=""
 for m in "$DIR"/*.gguf; do
 	[ -e "$m" ] || continue
 	n=$((n + 1))
-	# ⚠ ONLY ON "OK". charsiu_check's refusals start with NO and put a
+	# ONLY ON "OK". charsiu_check's refusals start with NO and put a
 	# reason in the second field, so an unconditional $2 labels a rejected
 	# file with a fragment of the sentence explaining why.
 	arch=$("$CHECK" -q "$m" 2>/dev/null |
@@ -122,7 +122,7 @@ for m in "$DIR"/*.gguf; do
 		archs_ok="$archs_ok ${arch:-?}"
 		;;
 	*)
-		# ⚠⚠ A MODEL TOO SMALL TO KNOW THE FACT IS NOT A BROKEN RUNTIME,
+		# A MODEL TOO SMALL TO KNOW THE FACT IS NOT A BROKEN RUNTIME,
 		# AND THIS COULD NOT TELL THEM APART.
 		#
 		# SmolLM2-135M answers "the capital of the United States" here.
@@ -158,7 +158,7 @@ if [ "$n" -eq 0 ]; then
 	echo "no gguf in $DIR"
 	exit 1
 fi
-# ⚠⚠ FILES AND ARCHITECTURES ARE DIFFERENT COUNTS, and this printed only the
+# FILES AND ARCHITECTURES ARE DIFFERENT COUNTS, and this printed only the
 # first while being quoted as the second. The stable merge at 0c85c71 says
 # "7/7 architectures"; seven is the number of GGUF FILES in /opt/vendor/models,
 # and five architectures cover them. Print both, and say which is which.
@@ -170,5 +170,5 @@ echo "$((n - bad - dunno))/$n FILES knew the capital of France"
 if [ "$na" -gt 0 ]; then
 	echo "$nk/$na ARCHITECTURES knew it: $(printf '%s\n' $archs | grep -v '^?$' | sort -u | tr '\n' ' ')"
 fi
-[ "${nq:-0}" -eq 0 ] || echo "⚠ $nq file(s) have no architecture: charsiu_check ($CHECK) did not answer for them"
+[ "${nq:-0}" -eq 0 ] || echo "$nq file(s) have no architecture: charsiu_check ($CHECK) did not answer for them"
 exit "$bad"

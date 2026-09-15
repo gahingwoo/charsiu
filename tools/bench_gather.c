@@ -29,7 +29,7 @@
  *            share a 64-byte line of the surface are read off it once and
  *            written to four row streams
  *
- * ⚠ WHAT THE HOST CAN AND CANNOT SAY. The host is aarch64 with caches that
+ * WHAT THE HOST CAN AND CANNOT SAY. The host is aarch64 with caches that
  * dwarf the board's; a surface that fits in its L2 will not show the DRAM
  * argument at all. The shapes are chosen to exceed it (m = 80 by n = 8192 is
  * 2.6 MB a slot, and the loop runs over 24 slots the way a layer does) and the
@@ -339,7 +339,7 @@ static int bench(unsigned m, unsigned n, unsigned nslot, int reps)
 		printf("  m=%3u n=%5u x%u (%6.1f MB): gather %7.2f ms"
 		       "  walk %.2fx  walk-f %.2fx  gather4 %7.2f ms (%.2fx)%s\n",
 		       m, n, nslot, mb, tg, tg / tw, tg / tf, t4, tg / t4,
-		       rc ? "  ⚠ NOT IDENTICAL" : "  identical");
+		       rc ? "  NOT IDENTICAL" : "  identical");
 	}
 	free(fo); free(sc); free(Y1); free(Y2); free(Y3); free(Y4); free(map); free(inv);
 	return rc;

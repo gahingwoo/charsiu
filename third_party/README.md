@@ -4,7 +4,7 @@
 
 v2.30, public domain (or MIT, at your option), from https://github.com/nothings/stb
 
-⚠ **Vendored rather than depended on.** charsiu builds with `-lm -lpthread` and
+**Vendored rather than depended on.** charsiu builds with `-lm -lpthread` and
 nothing else, on a board where the distribution is whatever fitted on the card.
 A JPEG and PNG decoder is not something to write, and it is not something to
 make somebody install either.

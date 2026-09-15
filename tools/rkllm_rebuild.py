@@ -28,20 +28,20 @@ arm; the quantisation has already happened, into f16.
     vendorfull all 112, their norms                             see LAYER 1
     noise      THE CONTROL: same per-tensor relative error, unstructured
 
-🔑 THE CALIBRATION IS NOT RECOVERED, IT CANCELS. The vendor folds 1/c into the
+THE CALIBRATION IS NOT RECOVERED, IT CANCELS. The vendor folds 1/c into the
 RMSNorm ahead of each projection instead of dividing the activation at runtime,
 so taking THEIR norms with THEIR weights makes c cancel by construction --
 corr(vendor_norm, ref/c) is 0.9905 to 0.9945 where corr(vendor_norm, ref) is
 0.78 to 0.89. Recovering c by division instead is what scored 1700.98.
 
-⚠⚠ AND THAT 1701 IS WHY `noise` EXISTS. The median per-tensor weight error of
+AND THAT 1701 IS WHY `noise` EXISTS. The median per-tensor weight error of
 that file was 18.3%, and charsiu's own int4 at 13.9% scores 41 -- so either
 18.3% is simply that expensive, or the reconstruction was wrong in a way a
 Frobenius norm does not charge for. A fourth file, the reference plus Gaussian
 noise at the SAME per-tensor relative error, scores 32.10. The magnitude is
 worth 32 and the structure is worth 1701. Run `noise` beside any new arm.
 
-⛔ LAYER 1 IS EXCLUDED AND THE REASON IS NAMED. Everything except layer 1 reads
+LAYER 1 IS EXCLUDED AND THE REASON IS NAMED. Everything except layer 1 reads
 32.13; with it, 58.76. It carries the most extreme row gauge in the model --
 ffn_up at rho 22.3 against ffn_down at 0.298 -- and a gauge cancels at inference
 only if both halves are reconstructed exactly. `blk.1.ffn_down` is not
@@ -49,13 +49,13 @@ reconstructed at all: the per-column model leaves 147% of it, so it is KEPT AS
 THE REFERENCE and the run says so. The 112-matrix number is not a measurement
 of the vendor's quality and must not be quoted as one.
 
-⚠ THE SCRIPT LIVED IN A SCRATCHPAD UNTIL 2026-09-11. The project's most
+THE SCRIPT LIVED IN A SCRATCHPAD UNTIL 2026-09-11. The project's most
 valuable measurement depended on a file in /tmp for two days.
 
 Usage:
     python3 -P tools/rkllm_rebuild.py <which>
 
-⚠ -P, AND IT IS NOT OPTIONAL. This imports `gguf`, and a stray gguf.py in the
+-P, AND IT IS NOT OPTIONAL. This imports `gguf`, and a stray gguf.py in the
 working directory is imported instead -- which has happened in this tree, with
 a module that reset the board's USB at import time. -P drops the script's own
 directory from sys.path.
@@ -84,7 +84,7 @@ OUT = os.environ.get("CHARSIU_REBUILD_OUT", os.path.join(_ROOT, "models"))
 
 
 def outpath(which):
-    """⛔ THE ORIGIN IS IN THE FILENAME BECAUSE IT IS PART OF THE ANSWER.
+    """THE ORIGIN IS IN THE FILENAME BECAUSE IT IS PART OF THE ANSWER.
 
     An arm rebuilt from Q8_0 and the same arm rebuilt from the f16 original
     are different files that answer differently, and the arm name alone does
@@ -96,7 +96,7 @@ def outpath(which):
 
 
 def _partpath(which):
-    """⛔ A HALF-WRITTEN FILE MUST NOT WEAR THE FINISHED NAME.
+    """A HALF-WRITTEN FILE MUST NOT WEAR THE FINISHED NAME.
 
     tests/vendor_quality.sh skips the rebuild when the path exists, and
     `exists` is not `complete`: a build killed mid-write on 2026-09-11 left
@@ -238,7 +238,7 @@ def main():
     for t in r.tensors:
         name = t.name
         #
-        # ⚠⚠ 8 IS Q8_0'S TYPE ID AND THIS USED TO BE THE WHOLE TEST. Handed an
+        # 8 IS Q8_0'S TYPE ID AND THIS USED TO BE THE WHOLE TEST. Handed an
         # f16 reference every tensor fell through to a plain copy and the run
         # reported "0 matrices replaced" -- a complete, plausible, empty
         # result. The reference became an environment variable so that the
@@ -248,7 +248,7 @@ def main():
         # 1 is F16, 0 is F32. What the gate means is "a 2-D weight tensor
         # this script might replace", so it says that instead.
         #
-        # ⚠ THE RANK IS PART OF IT. Widening the type alone let the 1-D norms
+        # THE RANK IS PART OF IT. Widening the type alone let the 1-D norms
         # through, which are F32 in an f16 file and were never Q8_0, and the
         # shape assertion below indexes shp[1]. The norms have their own
         # branches further down and must reach them.
@@ -297,7 +297,7 @@ def main():
                                / (Wr.max(axis=1) - Wr.min(axis=1))).mean())
                 if abs(rho_t - 1.0) <= 0.05:
                     #
-                    # ⚠⚠ THE GROUPS ARE NOT THE SAME SIZE AND THE PAPER DOES
+                    # THE GROUPS ARE NOT THE SAME SIZE AND THE PAPER DOES
                     # NOT SAY SO. The vendor keeps ONE fp32 scale and one
                     # integer zero point per OUTPUT ROW -- confirmed from the
                     # slot offsets, 4096 floats between two 2048-row tensors --
@@ -310,14 +310,14 @@ def main():
                     # the group the whole row, which is the vendor's own, so
                     # the ratio can be read with that difference removed.
                     #
-                    # ⚠ A third difference runs the OTHER way and is not
+                    # A third difference runs the OTHER way and is not
                     # removed by this: the vendor is asymmetric with an integer
                     # zero point and charsiu here is symmetric absmax. The zero
                     # point is worth about 1.4% at group 1024 by this tree's
                     # own measurement, so it is the small one.
                     #
                     #
-                    # ⚠ AND THE THREE ARMS ARE ONE QUANTISER AT THREE GROUPS.
+                    # AND THE THREE ARMS ARE ONE QUANTISER AT THREE GROUPS.
                     # llama.cpp's q4_0 is `d = max / -8` with max the signed
                     # value at max|x| (ggml-quants.c:132); charsiu's is
                     # `d = vmax / -8.0f` (npuquant.c:606); this is
@@ -376,7 +376,7 @@ def main():
                 # any machinery for it: layers 0 and 1 carry 44% of the damage.
                 #
                 # "mix<EARLY>_<FINE>_<COARSE>": mix2_128_1024 is layers 0 and
-                # 1 at group 128 and the rest at 1024.  ⚠ split("_") on that
+                # 1 at group 128 and the rest at 1024.  split("_") on that
                 # gives THREE parts, not four -- the prefix and the count are
                 # one token -- and the first version unpacked four, which
                 # produced five blank arms and no error anyone saw.
@@ -504,7 +504,7 @@ def main():
                 ref = deq(t)
                 e = float(np.linalg.norm(ref - v) / np.linalg.norm(ref))
                 #
-                # ⚠ ONE TENSOR IS NOT RECOVERED. blk.1.ffn_down has rho 0.298,
+                # ONE TENSOR IS NOT RECOVERED. blk.1.ffn_down has rho 0.298,
                 # the only value in the whole table well below 0.8, and the
                 # per-column model leaves 147% of it -- a reconstruction with
                 # no relation to its input. It is kept as the reference rather
@@ -545,7 +545,7 @@ def main():
             nn[0] += L >= 3
         elif which == "vendorfull" and name in NORM:
             #
-            # 🔑 c IS STORED, AS THE FOLDED NORM. The vendor divides the
+            # c IS STORED, AS THE FOLDED NORM. The vendor divides the
             # RMSNorm weight by its per-channel factor instead of dividing the
             # activation at runtime, so taking THEIR norms with THEIR weights
             # makes c cancel and nothing has to be recovered. Using the

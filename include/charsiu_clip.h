@@ -58,7 +58,7 @@ void charsiu_clip_text_describe(const struct charsiu_clip_text *t, FILE *out);
 /*
  * CLIP's BPE, out of the vocabulary alone.
  *
- * ⚠ THE gguf CARRIES NO MERGE LIST. clip.cpp never ran the text tower, so its
+ * THE gguf CARRIES NO MERGE LIST. clip.cpp never ran the text tower, so its
  * converter wrote tokenizer.ggml.tokens and nothing else. The ranks are
  * recoverable anyway, because CLIP's vocabulary IS the merge order: 256 byte
  * symbols, then the same 256 with the end of word marker, then every merge in
@@ -66,7 +66,7 @@ void charsiu_clip_text_describe(const struct charsiu_clip_text *t, FILE *out);
  * the lowest index" is the same algorithm as merging by rank, and
  * tests/clip_tokenizer_cross.py checks that against the real merges.txt.
  *
- * ⚠ ASCII WORD SPLITTING. CLIP's pattern is a unicode one and this splits on
+ * ASCII WORD SPLITTING. CLIP's pattern is a unicode one and this splits on
  * ASCII letter, digit and everything-else runs. English prompts, which is what
  * these models are trained on, tokenize identically; a prompt with accents or
  * CJK in it will not, and charsiu_clip_tokenize says so rather than guessing.

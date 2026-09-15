@@ -76,7 +76,7 @@ struct emitter {
  * against task 16, the same op prepared for the other core. 0x1c00 is 7168 and
  * appears in three of them as what reads like a base offset.
  *
- * ⚠ 0x1040 is taken LITERALLY rather than derived. Its two halves both change,
+ * 0x1040 is taken LITERALLY rather than derived. Its two halves both change,
  * 0x1000 to 0x2c00 and 0 to 0x1c00, and one capture is not enough to say what
  * either half means. The others are a clean substitution on charsiu's own value.
  */
@@ -110,7 +110,7 @@ int charsiu_cbuf_window(void)
  * window 1's ADDRESS.
  */
 /*
- * ⚠⚠ THE THIRD CBUF WINDOW STATE, WHICH THIS TREE ASKED SOMEBODY TO SEARCH FOR.
+ * THE THIRD CBUF WINDOW STATE, WHICH THIS TREE ASKED SOMEBODY TO SEARCH FOR.
  *
  * npudev.c, on the input surface ceiling: "the fix, if somebody wants these
  * widths, is not a bigger number here. It is whatever the vendor emits above
@@ -136,7 +136,7 @@ int charsiu_cbuf_window(void)
  *   CHARSIU_CBUF_W0_END    0x1038's window 0 value, default 7
  *   CHARSIU_CBUF_W0_DATA   0x1040's data bound, default 0x1000
  *
- * ⚠ A window that spans everything leaves the other core nowhere to put its
+ * A window that spans everything leaves the other core nowhere to put its
  * own, so this can only ever be a one-device configuration. That is a real
  * cost -- round 150 put one core 28% behind two on decode -- and it is why
  * this is a probe and not a default. It is worth the search anyway, because
@@ -341,7 +341,7 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
 }
 
 /*
- * ⚠⚠ THE ACCUMULATOR'S READ ORDER, SOLVED.
+ * THE ACCUMULATOR'S READ ORDER, SOLVED.
  *
  * With 0x40b8 following the row count every wanted value is in the buffer at
  * every shape and every m measured, so the arithmetic is right and this is all
@@ -362,15 +362,15 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
  * pair into blocks of 64 and the two rows of a pair alternate every eight
  * words. Both are what the board printed.
  *
- * ⚠ m = 1 IS FLAT AND IS NOT THIS. P would be zero, and the expression does not
+ * m = 1 IS FLAT AND IS NOT THIS. P would be zero, and the expression does not
  * collapse to the identity at P = 1 either. Decode has read m = 1 flat for
  * hundreds of rounds and the sweep scores it 64 of 64 flat, so it is a separate
  * case rather than a limit of this one.
  *
- * ⚠ P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
+ * P = m/2 IS FITTED ON m = 2 AND m = 4. Those are the only two widths whose
  * map has been printed. m = 8 is scored by the sweep and has not been read.
  *
- * ⚠ AND THE SAME EXPRESSION SAYS HOW BIG AN OUTPUT SLOT HAS TO BE, which is
+ * AND THE SAME EXPRESSION SAYS HOW BIG AN OUTPUT SLOT HAS TO BE, which is
  * worth writing down here because the place that sizes one is nowhere near it.
  *
  * Its range is exactly n * m words. G tops out at (n - 1) / 32, j at 32P - 1
@@ -391,7 +391,7 @@ static size_t scale_table_bytes(const struct charsiu_matmul *mm)
  * 9.7 MB, and a per-entry stride would make it 18.2. Counted, not measured:
  * no host in this tree has an NPU to measure it on.
  *
- * ⚠ A SLOT BASE STILL HAS TO CLEAR 16 BYTES, which is the one thing a tighter
+ * A SLOT BASE STILL HAS TO CLEAR 16 BYTES, which is the one thing a tighter
  * stride could get wrong. The vendor's own streams step 0x4018 by 16 for each
  * output position skipped -- see the note on 0x40b8, which is where that read
  * comes from -- so 16 is the granularity the output base has evidence for.
@@ -418,7 +418,7 @@ int charsiu_diag(void)
 }
 
 /*
- * ⚠ THE a TERM IS SWEEPABLE, because the board says w4a16 needs a different
+ * THE a TERM IS SWEEPABLE, because the board says w4a16 needs a different
  * one and nothing says what.
  *
  * The in place scan on the real path: row 0 agrees on EXACTLY HALF its
@@ -431,7 +431,7 @@ int charsiu_diag(void)
  * A variant that is not a permutation will collide and score badly, which is
  * the honest outcome rather than a guard here.
  *
- * ⚠ READ ONCE PER PROCESS AND CACHED, which is safe only because the sweep
+ * READ ONCE PER PROCESS AND CACHED, which is safe only because the sweep
  * runs one variant per process. Sweeping it inside one process would need this
  * cleared and g->bmap_m invalidated -- the read order reaches the hardware path
  * through a TABLE built once per m, not through this function.
@@ -459,7 +459,7 @@ static unsigned acc_a_coeff(int *swap)
 }
 
 /*
- * ⚠⚠ THE READ ORDER DEPENDS ON THE FORMAT, NOT ONLY THE AXIS, and the board
+ * THE READ ORDER DEPENDS ON THE FORMAT, NOT ONLY THE AXIS, and the board
  * said both halves of that.
  *
  *   int8, height axis   a * 4        exact to m = 80, the tower sweep
@@ -489,7 +489,7 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
 	a = c / 16u;
 	t = c % 16u;
 	/*
-	 * ⚠⚠ roleswap: a AND mi/P TRADE PLACES, and the board's own map is
+	 * roleswap: a AND mi/P TRADE PLACES, and the board's own map is
 	 * where it comes from rather than a guess at what might work.
 	 *
 	 * The in place scan says the default is right on exactly two quadrants
@@ -505,13 +505,13 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
 	 * and reproduces all 36 of the swapped arm's printed landings with none
 	 * missed. It is a permutation at m = 2, 4, 8, 32 and 80.
 	 *
-	 * ⚠ EVERY ONE OF THOSE 36 IS AT m = 2, where P is 1 and (mi % P) * 8 is
+	 * EVERY ONE OF THOSE 36 IS AT m = 2, where P is 1 and (mi % P) * 8 is
 	 * inert. Which of the row's two parts takes the 4 and which keeps the 8
 	 * is therefore a choice at wider m, not a reading. The probe sweeps m
 	 * to 32 and its per m row count is what would catch it.
 	 */
 	/*
-	 * ⚠⚠ AND WHICH PART OF THE ROW TAKES WHICH SLOT, which m = 2 cannot
+	 * AND WHICH PART OF THE ROW TAKES WHICH SLOT, which m = 2 cannot
 	 * see and the board has now said.
 	 *
 	 * Once a takes the 32P block the row has two slots left: one of stride
@@ -531,13 +531,13 @@ size_t charsiu_acc_index(unsigned mi, unsigned ni, unsigned m, int w4wide)
 	 *   32     0, 31              226 of 3616 226 of 3616
 	 *   8      0, 7               226 of 904  194 of 904   <-- the one miss
 	 *
-	 * ⚠ m = 8 IS NOT THIS AND HAS NEVER BEEN. Its worst relative error is
+	 * m = 8 IS NOT THIS AND HAS NEVER BEEN. Its worst relative error is
 	 * four to six orders out in EVERY arm of every round -- 1.3e4, 3.2e4,
 	 * 2.9e5, 9.7e3, 7.5e4, 1.7e5, 4.7e4 -- where its neighbours sit at 1e3.
 	 * Something else is wrong at that one width and this does not explain
 	 * it or claim to.
 	 *
-	 * ⚠⚠ AND THIS FUNCTION IS NOW EXCLUDED FROM IT, on the desktop, with a
+	 * AND THIS FUNCTION IS NOW EXCLUDED FROM IT, on the desktop, with a
 	 * check that could have failed.
 	 *
 	 * Two facts, and between them there is no room for the read order to be
@@ -596,7 +596,7 @@ size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 	 * job that timed out with a register stream identical to Mesa's.
 	 */
 	/*
-	 * ⚠ THE k*n BOUND IS A GUESS, AND IT DOES NOT SCALE. It makes the
+	 * THE k*n BOUND IS A GUESS, AND IT DOES NOT SCALE. It makes the
 	 * coefficient buffer FOUR TIMES the weight buffer -- 8.4 MB for a
 	 * K=2048 N=1024 slice, 67 MB at N=8192 -- so a whole 1B model's
 	 * projections would want 3.9 GB of it on top of 973 MB of weights.
@@ -612,7 +612,7 @@ size_t charsiu_coef_bytes(const struct charsiu_matmul *mm)
 	 * on purpose. The default is unchanged until one does.
 	 */
 	/*
-	 * ⚠⚠ THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE
+	 * THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE
 	 * GUESS. This read `mm->k * mm->n` when the variable was unset, and
 	 * the paragraph above already says that bound is a guess that does not
 	 * scale. What it did not say is who was actually exposed to it.
@@ -645,7 +645,7 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 			 const int32_t *weight_sums, uint8_t *dst)
 {
 	const struct charsiu_matmul *mm = &job->mm;
-	/* ⚠ once, not once an output channel. The same shape of mistake cost
+	/* once, not once an output channel. The same shape of mistake cost
 	 * round 354 two minutes a run in the quantiser. */
 	const int16_t coef_c = (int16_t)(envq("CHARSIU_COEF_C")
 					 ? atoi(envq("CHARSIU_COEF_C")) : 16);
@@ -753,7 +753,7 @@ void charsiu_build_coefs(const struct charsiu_job *job, const int32_t *bias,
 	scales = (uint16_t *)(dst + tb);
 	for (oc = 0; oc < sb / 2; oc++) {
 		/*
-		 * ⚠ THE TABLE IS PADDED TO A WHOLE GROUP OF EIGHT and the
+		 * THE TABLE IS PADDED TO A WHOLE GROUP OF EIGHT and the
 		 * padding channels are computed by the CNA and never written
 		 * by the DPU, so what goes in them cannot reach an output.
 		 * They take the scalar rather than reading off the end of a
@@ -1025,7 +1025,7 @@ int charsiu_m_axis_wide_for(int w4)
 }
 
 /*
- * ⭐ THE WEIGHT ADDRESS, PATCHED INTO A STREAM THAT IS OTHERWISE THE SAME.
+ * THE WEIGHT ADDRESS, PATCHED INTO A STREAM THAT IS OTHERWISE THE SAME.
  *
  * A layer of fp16 attention asks for the same shapes at the same offsets in
  * buffers that have not moved, sixteen layers running, and exactly one word
@@ -1066,7 +1066,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	struct requant rq = requant_of(job);
 	unsigned n_pad = ALIGN_UP(mm->n, 2);
 	/*
-	 * ⚠⚠ WHICH AXIS THE M ROWS GO ON, and the board says the current one
+	 * WHICH AXIS THE M ROWS GO ON, and the board says the current one
 	 * is not producing rows at all.
 	 *
 	 * This tree puts M on the HEIGHT: one column, M rows. Round 384 read
@@ -1104,13 +1104,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	unsigned lines = (wide ? ow : rows) - 1;   /* the DPU's line count */
 
 	/*
-	 * ⚠ surf IS PER SLICE OF THE INPUT SURFACE, so it counts inw columns.
+	 * surf IS PER SLICE OF THE INPUT SURFACE, so it counts inw columns.
 	 * charsiu_entries_per_row() hard codes one column, which is right for
 	 * the height axis and undercounts by exactly inw for the width one.
 	 */
 	surf = charsiu_entries_per_row(&surfmm) * inw;
 	/*
-	 * ⚠ THE SPLIT WINDOW, AND WHY IT IS SCOPED TO THE WIDTH AXIS.
+	 * THE SPLIT WINDOW, AND WHY IT IS SCOPED TO THE WIDTH AXIS.
 	 *
 	 * surf * rows is the whole input surface either way round: inw * M on
 	 * the width axis and 1 * M on the height. Above 4096 of them the
@@ -1191,7 +1191,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1010, 0x00000fff);
 	emit(&e, CNA, 0x1014, (1u << 3) | 1u);
 	/*
-	 * ⚠ THE SPLIT CBUF PAIR IS A FUNCTION OF surf * M, and this wrote the
+	 * THE SPLIT CBUF PAIR IS A FUNCTION OF surf * M, and this wrote the
 	 * unsplit one at every M.
 	 *
 	 * The rule is exact on the vendor's own file: of its 3328 int4 streams,
@@ -1220,7 +1220,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * K=64. Both are right for their own precision.
 	 */
 	/*
-	 * ⚠ AND THE DOUBLING MUST NOT REACH FP16, whose bytes are already two.
+	 * AND THE DOUBLING MUST NOT REACH FP16, whose bytes are already two.
 	 * The vendor writes (ic * 2) << 16 here in all 4940 of its fp16 streams,
 	 * exactly, and wbytes / n_pad IS ic * 2 for fp16 -- so doubling it again
 	 * asks for ic * 4. The comment above is about int8, where the kernel
@@ -1262,7 +1262,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1088, job->input_addr);
 	emit(&e, CNA, 0x108c, 0x000f000f);
 	/*
-	 * ⚠⚠ DO NOT "FIX" THESE FROM THE VENDOR'S .rkllm. Round 380 did, and
+	 * DO NOT "FIX" THESE FROM THE VENDOR'S .rkllm. Round 380 did, and
 	 * the board said no.
 	 *
 	 * The reasoning was: the vendor dispatches thousands of ops at M = 2
@@ -1272,13 +1272,13 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * 0). Changing them made no difference at all: m = 2, 4, 8 and 32 were
 	 * as wrong after as before, at both K=256 N=64 and K=2048 N=1024.
 	 *
-	 * ⚠ WHAT THE INFERENCE MISSED. Every vendor stream at M > 1 is fp16,
+	 * WHAT THE INFERENCE MISSED. Every vendor stream at M > 1 is fp16,
 	 * against the KV cache; its int4 and int8 weight matmuls are M = 1
 	 * without exception, all 3368 of them. Those fp16 ops were never
 	 * identified -- ic=1312 matches no dimension of the model -- so three
 	 * registers were changed on the strength of an op nobody had named.
 	 *
-	 * 🏁 THEY HAVE A NAME NOW, 2026-09-05: THEY ARE ATTENTION. 2908 of the
+	 * THEY HAVE A NAME NOW, 2026-09-05: THEY ARE ATTENTION. 2908 of the
 	 * 4940 fp16 dispatches carry oc = 64, which is Llama-3.2-1B's head_dim,
 	 * and their ic walks in steps of 32 with M chosen so the input surface
 	 * lands just under 4096 every time (ic 2688 M 48, ic 2848 M 46, ic 4032
@@ -1294,7 +1294,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * them at 1 and 0 in all 4940, int4 carries 0x60 or 0x80 and 0x4f004f
 	 * or 0x1f001f, and DPU 0x401c and 0x4020 move with them.
 	 *
-	 * ⚠ AND THOSE FOUR ARE THE WINDOW, NOT THE WEIGHTS. The lines below
+	 * AND THOSE FOUR ARE THE WINDOW, NOT THE WEIGHTS. The lines below
 	 * emit them as inw * rows, ow * rows, ((inw - 1) << 16) | (inh - 1) and
 	 * ow - 1, so fp16 holding them at 1, 1, 0, 0 says that regime describes
 	 * its window as 1 x 1 and carries the count elsewhere -- 0x1098, which
@@ -1306,7 +1306,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * the same mistake 0x100c above describes, a constant carried across
 	 * regimes.
 	 *
-	 * ⚠ AND THE VALUES BELOW ARE NOT A GUESS. They are Mesa's generic
+	 * AND THE VALUES BELOW ARE NOT A GUESS. They are Mesa's generic
 	 * RK3576 encoder, rkt_regcmd.c, with inw = 1 and full_inh = M:
 	 *
 	 *     R_CNA(0x1090, inw * 4);
@@ -1325,7 +1325,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * rounds and regcmd.c does not.
 	 */
 	/*
-	 * ⚠ FP16 COUNTS THE CONTRACTION AXIS HERE, NOT THE WINDOW. Exact over
+	 * FP16 COUNTS THE CONTRACTION AXIS HERE, NOT THE WINDOW. Exact over
 	 * all 4940 vendor fp16 streams: 0x1090 = ic / 8, the 2 byte feature
 	 * atom. inw * 4 is the int8/int4 form and gives 4 for a 1 wide window,
 	 * which is what this emitted for an fp16 job before.
@@ -1333,7 +1333,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1090,
 	     mm->wdtype == CHARSIU_FP16 ? mm->k / 8 : inw * 4);
 	/*
-	 * ⚠ FP16 DESCRIBES ITS WINDOW AS 1 x 1, and these four registers are
+	 * FP16 DESCRIBES ITS WINDOW AS 1 x 1, and these four registers are
 	 * where it says so. Over all 4940 of the vendor's fp16 streams,
 	 * 0x1094 and DPU 0x401c are 1 and 0x118c and DPU 0x4020 are 0, without
 	 * exception, while its int4 streams carry the geometry these lines
@@ -1341,7 +1341,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * today is bit identical to before these branches existed.
 	 */
 	/*
-	 * ⚠⚠ THE FOUR fp16 WINDOW REGISTERS AND WHAT THEY COST. These carry
+	 * THE FOUR fp16 WINDOW REGISTERS AND WHAT THEY COST. These carry
 	 * the vendor's constants -- 1, 0, 1, 0 -- and every one of them is a
 	 * quantity WITH rows IN IT: inw * rows, the window corners, ow * rows,
 	 * ow - 1. Telling the block the window is 1 x 1 and then handing it m
@@ -1373,7 +1373,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, CNA, 0x1140, 0x00000000);
 	emit(&e, CNA, 0x1144, 0x00000000);
 	/*
-	 * ⚠ BOTH HALVES ARE M - 1 ON THE WIDTH AXIS, not the width and the
+	 * BOTH HALVES ARE M - 1 ON THE WIDTH AXIS, not the width and the
 	 * height. The vendor's int4 streams carry 0x004f004f at M = 80 on an
 	 * image ONE ROW HIGH, so the low half is not the row count there; and
 	 * ((M-1) << 16) | (M-1) is exact on all 3328 of them.
@@ -1389,7 +1389,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	}
 
 	/*
-	 * ⚠⚠ THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
+	 * THE THREE REGISTERS THAT MAKE int4 A WEIGHTED SUM. Rounds 344 to
 	 * 347.
 	 *
 	 * Every int4 result in this tree from round 265 to round 343 was exact
@@ -1408,7 +1408,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * other two are needed for the job to run: alone, 0x301c is VOID and
 	 * 0x3020 fails its repeat control.
 	 *
-	 * ⚠ 0x3018 was recorded as "hangs" in rounds 339 and 341. It was tried
+	 * 0x3018 was recorded as "hangs" in rounds 339 and 341. It was tried
 	 * ALONE, at a different shape, without the other two. A register judged
 	 * dead in one configuration is not dead.
 	 *
@@ -1419,7 +1419,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * and round 347 checked all 1024 output words against a CPU reference:
 	 * 1024 of 1024 within 1e-4 relative, 1017 within 1e-5, worst 5.46e-05.
 	 *
-	 * ⚠ M > 1 IS NOT THIS. At M = 8 the same three give 8 of 4096, because
+	 * M > 1 IS NOT THIS. At M = 8 the same three give 8 of 4096, because
 	 * the vendor puts M on the WIDTH axis and this file puts it on the
 	 * height axis, and at M = 1 alone the two collapse to the same thing.
 	 * LLM decode is M = 1, so this is enough to be useful and is NOT enough
@@ -1459,7 +1459,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * that.
 	 */
 	/*
-	 * ⚠⚠ AND FP16 NEEDS IT TOO, which is the only thing left in the stream.
+	 * AND FP16 NEEDS IT TOO, which is the only thing left in the stream.
 	 * The vendor writes all five of these in its fp16 dispatches exactly as
 	 * it does in its int4 ones; this emitted them for int4 alone, so an
 	 * fp16 job left the block unset. After DPU 0x40b8's closed form went in,
@@ -1489,7 +1489,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 			  !envq("CHARSIU_W4_BITPAT");
 
 		/*
-		 * ⚠⚠ AND THE w4v FORM OF 0x301c WAS CHOSEN WHERE IT CANNOT
+		 * AND THE w4v FORM OF 0x301c WAS CHOSEN WHERE IT CANNOT
 		 * SHOW, EXACTLY LIKE 0x40b8's LITERAL 3.
 		 *
 		 * lines is rows - 1, so at M = 1 it is ZERO and the two forms
@@ -1514,7 +1514,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		int high = e31 && !strcmp(e31, "high");
 
 		/*
-		 * ⚠⚠ AND FP16 TAKES THE 0x200 FORM TOO. The board's own words:
+		 * AND FP16 TAKES THE 0x200 FORM TOO. The board's own words:
 		 * with 0x10000001 here, a single fp16 weight of 1.0 against
 		 * A[0] = 1.0 came back 3600, and 3600 is 0x3c * 0x3c -- the
 		 * HIGH BYTES of the two fp16 patterns multiplied as int8. A[8]
@@ -1534,7 +1534,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 			  : ((w4v && !high) ? lines : ((uint32_t)lines << 16)));
 	}
 	/*
-	 * ⚠ int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
+	 * int4 NEEDS A DIFFERENT CHANNEL COUNT HERE, and this is the register
 	 * that carries it. Rounds 274 to 276 read it directly: the DPU writes
 	 * ceil((v+1)/2) + extra(SIZE_E_2) channels, six for six across v of 31,
 	 * 47, 79, 95, 111 and 127, with SIZE_E_2 at its shipped 3 contributing
@@ -1543,7 +1543,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * short. Inverting it, v = 2*(n - 8) - 1, and at n = 64 that is 111,
 	 * which is the value the whole layout above was measured at.
 	 *
-	 * ⚠ AND THE WRITE QUANTISES TO 16 CHANNELS. Round 282 ran seven values
+	 * AND THE WRITE QUANTISES TO 16 CHANNELS. Round 282 ran seven values
 	 * of n and the number of words the hardware wrote was floor(n/16) * 16
 	 * every time:
 	 *
@@ -1557,7 +1557,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * ignored.
 	 */
 	/*
-	 * ⚠ CHARSIU_W4_PAIRED IS THE int4 RECIPE, and it replaces the round-280
+	 * CHARSIU_W4_PAIRED IS THE int4 RECIPE, and it replaces the round-280
 	 * workaround above rather than adding to it.
 	 *
 	 * Rounds 332 to 334 read the layout off the board instead of guessing
@@ -1632,7 +1632,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * without it the run is not w4a16 at all.
 	 */
 	/*
-	 * ⚠⚠ AND AN FP16 WEIGHT JOB WANTS THE SAME OUTPUT STAGE, because both
+	 * AND AN FP16 WEIGHT JOB WANTS THE SAME OUTPUT STAGE, because both
 	 * produce a 16 bit result and the int8 stage produces a byte. The board
 	 * said so first: an fp16 job with this false came back 0x80808080 in
 	 * every written word, which is the int8 zero point in all four bytes --
@@ -1646,7 +1646,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 *   0x4050  0x00023333
 	 *   0x40ac / 0x40b0 / 0x40b4   0 / 1 / 0, which is no requant at all
 	 *
-	 * ⚠ AND THE FILTER THAT NEARLY HID IT. I diffed our fp16 stream against
+	 * AND THE FILTER THAT NEARLY HID IT. I diffed our fp16 stream against
 	 * the vendor's and dropped every register where the vendor's int4 value
 	 * equals its fp16 one, reasoning that those cannot be fp16 specific
 	 * since our int4 path differs there too and works. 0x4010 is exactly
@@ -1735,7 +1735,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	emit(&e, DPU, 0x4014, 0x00000000);
 	emit(&e, DPU, 0x4018, job->output_addr);
 	/*
-	 * ⚠⚠ THE fp16 OUTPUT STAGE, OFFERED TO int4, ONE REGISTER AT A TIME.
+	 * THE fp16 OUTPUT STAGE, OFFERED TO int4, ONE REGISTER AT A TIME.
 	 *
 	 * The int4 accumulator comes back in charsiu_acc_index's order and the
 	 * fp16 one comes back FLAT, at the same m and the same n, and the read
@@ -1745,7 +1745,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * at its floor FOR THIS ACCUMULATOR LAYOUT", and the layout is the one
 	 * variable nobody has moved.
 	 *
-	 * ⚠ AND THE SWEEP THAT LOOKS LIKE IT COVERED THIS DID NOT. Round 384
+	 * AND THE SWEEP THAT LOOKS LIKE IT COVERED THIS DID NOT. Round 384
 	 * put "every word that differs between the two streams back one at a
 	 * time" -- between int8 and w4a16, whose DPU blocks are identical to
 	 * begin with. The stream that demonstrably produces flat rows at m > 1
@@ -1779,7 +1779,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		     (mm->wdtype == CHARSIU_FP16 || (f4m & 2u))
 		     ? mm->n / 4 - 1 : 0x00000000u);
 	}
-	emit(&e, DPU, 0x402c, mm->n - 1);   /* ⚠ NOT doubled: round 334 tried
+	emit(&e, DPU, 0x402c, mm->n - 1);   /* NOT doubled: round 334 tried
 					     and it changed nothing */
 	/*
 	 * 0x4030's low half. Mesa uses 0x0710 for a regular convolution and
@@ -1881,7 +1881,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * exact 4, 8, 12, 64, 16, 16, 16 at 0, 1, 2, 3, 4, 7, 15.
 	 */
 	/*
-	 * ⚠⚠ AND ROUND 312 SWEPT IT AT M = 1, WHERE IT CANNOT VARY.
+	 * AND ROUND 312 SWEPT IT AT M = 1, WHERE IT CANNOT VARY.
 	 *
 	 * The int8 arm computes ow * rows, which is the row count on the height
 	 * axis and does scale with M. The acc_out arm is a literal 3 at every
@@ -1892,7 +1892,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * npu_gemm_test, which takes the acc_out arm, has never been right
 	 * above one row under any reading.
 	 *
-	 * ⚠⚠ AND THE BOARD SAID IT IS 3 * rows.
+	 * AND THE BOARD SAID IT IS 3 * rows.
 	 *
 	 * Swept 0 to 16 at three widths, scoring every candidate under every
 	 * reading. The peak walks with M and nothing else comes near it:
@@ -1905,7 +1905,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * that follows the row count, exactly as the int8 arm's does, and
 	 * round 312 could not have seen that: it swept at M = 1.
 	 *
-	 * ⚠ IT IS NOT THE WHOLE FIX. Each peak is worth about ONE ROW -- 64
+	 * IT IS NOT THE WHOLE FIX. Each peak is worth about ONE ROW -- 64
 	 * values whatever m is -- so the other rows are still wrong. What this
 	 * buys is a reproducible signal well clear of the 8 to 20 noise floor,
 	 * and a default that cannot change decode, since 3 * rows is 3 at
@@ -1914,7 +1914,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * CHARSIU_DPU_40B8 replaces the value so the next sweep can hold it.
 	 */
 	/*
-	 * ⚠⚠ AND `rows` IS NOT THE BATCH COUNT ON THE WIDTH AXIS, WHERE IT IS
+	 * AND `rows` IS NOT THE BATCH COUNT ON THE WIDTH AXIS, WHERE IT IS
 	 * 1. 3 * rows is 3 there at every M, and 3 is exactly what the board
 	 * wrote when it produced 92 of 128 words at m = 2: the baseline of the
 	 * sweep and the `0x40b8 = 3` row of it are the same number twice.
@@ -1929,7 +1929,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * not a trend either -- 8 is worse than 4 -- so the fill point is a
 	 * point and not a floor.
 	 *
-	 * ⚠ THE SAME VALUE BUYS SOMETHING DIFFERENT ON EACH AXIS. The height
+	 * THE SAME VALUE BUYS SOMETHING DIFFERENT ON EACH AXIS. The height
 	 * sweep above found 3, 6, 12 at m = 1, 2, 4 and each peak was worth
 	 * about ONE ROW, 64 values whatever m was. On the width axis 6 at m = 2
 	 * is all 128. Same expression, and the axis is what decides whether it
@@ -1938,7 +1938,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * `wide ? ow : rows` is M under both arrangements and is bit identical
 	 * on the height axis, where ow is 1 and rows is M.
 	 *
-	 * 🏁 AND THE VENDOR'S OWN FILE CONFIRMS IT, all 3328 int4 streams, with
+	 * AND THE VENDOR'S OWN FILE CONFIRMS IT, all 3328 int4 streams, with
 	 * no exception -- so 3 * M is not a fit to two board points any more.
 	 *
 	 * Their output block carries a CHUNK and a TOTAL, which is what makes
@@ -1958,11 +1958,11 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 	 * those registers collapses to what this file already emits: 0x4018 at
 	 * the base, 0x401c = M, 0x4028 = 0, and 0x40b8 = 4M - M = 3M.
 	 *
-	 * ⚠ THE int8 HEAD TAKES A DIFFERENT CONSTANT -- 7 * W, read off their
+	 * THE int8 HEAD TAKES A DIFFERENT CONSTANT -- 7 * W, read off their
 	 * 8160 wide output head at W of 1, 32 and 64. The rule above is the
 	 * int4 one and the 3328 it holds on are exactly the int4 streams.
 	 *
-	 * ⚠ AND 16 BYTES A POSITION IS THE READ ORDER'S OWN CLAIM. 0x4018
+	 * AND 16 BYTES A POSITION IS THE READ ORDER'S OWN CLAIM. 0x4018
 	 * stepping by 16 for each position skipped says consecutive rows sit
 	 * four floats apart in the output surface, which is what
 	 * charsiu_acc_index puts at (mi/2)*8 + (mi%2)*4. That is the first
@@ -1977,7 +1977,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 			   ? 3u * batch : (uint32_t)(ow * (2 * rows - rows));
 
 		/*
-		 * ⚠⚠ FP16 HAS A CLOSED FORM AND IT IS THE LAST REGISTER THAT
+		 * FP16 HAS A CLOSED FORM AND IT IS THE LAST REGISTER THAT
 		 * DIFFERED. With acc_out set -- which is what the fp16 probe
 		 * submits -- our stream matched the vendor's on every register
 		 * but this one, at BOTH attention shapes:
@@ -1991,7 +1991,7 @@ size_t charsiu_emit_job(const struct charsiu_job *job, uint64_t *out, size_t max
 		 * int4 and acc_out arms above keep the values this board
 		 * measured for them.
 		 *
-		 * ⚠ AND THE DIFF THAT FOUND IT HAD BEEN COMPARING THE WRONG ARM
+		 * AND THE DIFF THAT FOUND IT HAD BEEN COMPARING THE WRONG ARM
 		 * ALL EVENING. emit_job leaves acc_out OFF unless
 		 * CHARSIU_ACC_OUT is set, while npu_fp16_test sets it, so every
 		 * stream comparison before this one was of a stream nobody

@@ -1,6 +1,6 @@
 # Suggest the setup once, on the first interactive login, and never again.
 #
-# ⚠ It does NOT auto-run a full-screen wizard at every login -- that is hostile
+# It does NOT auto-run a full-screen wizard at every login -- that is hostile
 # on a board people ssh into to do other things. It runs once, and only on a
 # real terminal, and only when charsiu has never been set up.
 case "$-" in *i*) ;; *) return 2>/dev/null || true ;; esac

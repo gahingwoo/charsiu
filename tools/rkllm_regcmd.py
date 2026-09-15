@@ -17,7 +17,7 @@ with targets 0x0201 CNA, 0x0801 CORE, 0x1001 DPU, 0x2001 DPU_RDMA, 0x0401 the
 block at 0x2810, 0x0041 sync and 0x0081 broadcast. A stream is a maximal run of
 such words, and every op the model runs is one of them.
 
-⚠ 0x0401 WAS MISSING AND IT CUT EVERY OP INTO THREE. The vendor writes five
+0x0401 WAS MISSING AND IT CUT EVERY OP INTO THREE. The vendor writes five
 words at 0x2810..0x2820 between its CNA registers and its DPU ones, and a
 target this table does not know ENDS the run: one op came back as a 47 word CNA
 stream, a lost fragment, and a 71 word DPU stream. Two things followed. The
@@ -25,7 +25,7 @@ five registers read as "charsiu only" in a stream diff when the vendor writes
 them too, and every consumer had to guess which DPU stream belonged to which
 convolution. With it listed, one op is one 123 word run.
 
-⚠ THE COUNTS THIS PRINTS CHANGED WITH THAT FIX, so a number quoted from an
+THE COUNTS THIS PRINTS CHANGED WITH THAT FIX, so a number quoted from an
 older run will not match: Llama-3.2-1B goes from 21532 streams (8808 conv,
 12724 DPU only) to 13224 (8808 conv, 4416 DPU only). The convolution count and
 every shape census are UNCHANGED -- 8808 either way, and the int4 M=1 census is
@@ -73,7 +73,7 @@ CNA = {
 
 def streams(path, min_len=20):
     """Every maximal run of register command words, as (byte offset, words)."""
-    # ⚠ MEMORY MAP IT. This read the whole file with np.fromfile and then
+    # MEMORY MAP IT. This read the whole file with np.fromfile and then
     # called .tobytes(), which is a SECOND full copy, so a 1.3 GB .rkllm asked
     # for 2.6 GB and the OOM killer took it twice. A memmap is zero copies and
     # the kernel pages what the scan touches.
@@ -116,7 +116,7 @@ def geometry(regs):
     return {
         "ic": ic,
         "oc": oc,
-        # ⚠⚠ M IS THE PIXEL COUNT, NOT THE ROW COUNT, and reading the row
+        # M IS THE PIXEL COUNT, NOT THE ROW COUNT, and reading the row
         # count instead is how this file was made to say the vendor never
         # batches an int4 weight matmul. It does: 85% of them, up to M = 80.
         #
@@ -166,7 +166,7 @@ def main():
         return 1
 
     if args and args[0] == "--dpu":
-        # ⚠ THE OPS THAT ARE NOT MATMULS, which is the question "what does
+        # THE OPS THAT ARE NOT MATMULS, which is the question "what does
         # the vendor keep on the NPU between the projections". Read on
         # 2026-09-03 for Llama-3.2-1B: 4416 DPU only streams in two
         # families and 500 weight-less convolutions, no LUT written by any
@@ -233,7 +233,7 @@ def main():
           % (len(runs), kinds["conv"], kinds["dpu only"]))
     print("  distinct shapes    %d" % len(shapes))
     print("  weight bits        %s" % dict(bits.most_common(5)))
-    # ⚠ THE LABEL IS THE BUG THIS FILE FIXED. It counts geo["m"], which is
+    # THE LABEL IS THE BUG THIS FILE FIXED. It counts geo["m"], which is
     # the PIXEL count, and calling it "rows per op" is exactly the reading
     # that made this tool say the vendor never batches.
     print("  M (pixels a dispatch) %s" % dict(rows.most_common(5)))

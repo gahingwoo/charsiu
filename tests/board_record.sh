@@ -5,7 +5,7 @@
 # THE ROUND OF RECORD: every number a paper quotes, from ONE boot, with the
 # environment that produced them printed beside them.
 #
-# ⚠⚠ WHY THIS EXISTS. The figures currently in circulation are spread across
+# WHY THIS EXISTS. The figures currently in circulation are spread across
 # 09-04, 09-06, 09-07, 09-08 and 09-10. Mixing two rounds has already produced
 # one defect in this project that no checker could catch, because both figures
 # were true in their own round and nothing on the page said they were different
@@ -17,7 +17,7 @@
 #
 #   sh tests/board_record.sh [OUTFILE]
 #
-# ⚠ It is long -- four models at REPEAT runs each, plus a 20-reading sweep.
+# It is long -- four models at REPEAT runs each, plus a 20-reading sweep.
 # CHARSIU_RECORD_REPEAT and CHARSIU_RECORD_N cut it for a dry run, and the
 # header says when they have been cut, because a round of record that was
 # quietly shortened is not one.
@@ -36,14 +36,14 @@ NSWEEP=${CHARSIU_RECORD_N:-20}
 mkdir -p "$(dirname "$OUT")"
 
 #
-# ⚠⚠ THE MODEL FILE IS NAMED, NOT THE MODEL. charsiu re-quantises whatever it
+# THE MODEL FILE IS NAMED, NOT THE MODEL. charsiu re-quantises whatever it
 # loads, so the source format is inside every perplexity: the same
 # Llama-3.2-1B reads 41.5289 from Q4_0 and 34.6888 from Q8_0 with one scale a
 # row. A quality number without its file is a 20% error with nothing on the
 # page to show it.
 #
 #
-# ⚠⚠ MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
+# MODELS LIVE IN TWO PLACES AND A ROUND THAT PICKS ONE FINDS HALF OF THEM.
 # `charsiu pull` puts them in $HOME/.charsiu/models; the installer puts them in
 # /opt/charsiu/models. On this board gemma4 is in the first and the other three
 # are in the second, so a script that resolves a DIRECTORY and then looks
@@ -71,7 +71,7 @@ env_block() {
 	echo "   kernel    $(uname -r)"
 	echo "   governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')" \
 	     "(cpu0) / $(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor 2>/dev/null || echo '?') (cpu4)"
-	# ⚠ THE RAIL, ALWAYS. m=8 was read as a property of the width for a
+	# THE RAIL, ALWAYS. m=8 was read as a property of the width for a
 	# fortnight and it was the NPU rail at 750 mV: 871 of 904 correct at
 	# 750, 904 of 904 at 800. A round that does not say which voltage it
 	# ran at cannot be compared with either reading.
@@ -82,7 +82,7 @@ env_block() {
 		esac
 	done
 	#
-	# ⚠⚠ LIST EVERY devfreq, NOT THE ONES WHOSE PATH SAYS "npu". The first
+	# LIST EVERY devfreq, NOT THE ONES WHOSE PATH SAYS "npu". The first
 	# version matched the path against *npu* and printed NOTHING on this
 	# board -- the devfreq nodes are named after their platform device, so
 	# the NPU's is something like fdab0000.npu or is not a devfreq at all.
@@ -116,7 +116,7 @@ echo " charsiu round of record   $(date -Is)"
 echo "================================================================"
 echo " charsiu   $(cd "$D/.." 2>/dev/null && git log --oneline -1 2>/dev/null || echo 'not a git tree here')"
 #
-# ⚠⚠ THE FINGERPRINT, NOT THE FILENAME. Two machines can hold different bytes
+# THE FINGERPRINT, NOT THE FILENAME. Two machines can hold different bytes
 # under one name, and charsiu re-quantises whatever it loads, so the source
 # file is inside every perplexity it prints. The desk and this board disagree
 # by about 1.3% on the same nominal model, and an md5 on each side is what
@@ -127,10 +127,10 @@ echo " quality model file:  ${QMODEL:-NOT FOUND}"
 [ -n "$QMODEL" ] && echo " quality model md5:   $(md5sum "$QMODEL" 2>/dev/null | cut -c1-32)  ($(stat -Lc%s "$QMODEL" 2>/dev/null) bytes)"
 echo " charsiu_ppl binary:  $BIN/charsiu_ppl  md5 $(md5sum "$BIN/charsiu_ppl" 2>/dev/null | cut -c1-32)"
 #
-# ⚠⚠ AND THE md5 IS ALL charsiu_ppl CAN SAY. The git line at the top of this
+# AND THE md5 IS ALL charsiu_ppl CAN SAY. The git line at the top of this
 # header answers for the SOURCE tree, and on the board it prints "not a git
 # tree here", which is where this round runs. charsiu_ppl is compiled from
-# ⚠ THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
+# THIS COMMENT DESCRIBED THE OPPOSITE FOR A WHILE. It said the tool "has
 # no --version to print it back" and warned that its first argument is read
 # through atoi, so asking would submit a dimension of zero. Both halves were
 # true when written; the flag went into every tool afterwards and is checked
@@ -140,7 +140,7 @@ echo " charsiu_ppl binary:  $BIN/charsiu_ppl  md5 $(md5sum "$BIN/charsiu_ppl" 2>
 # tied to a commit through it. The build line below is charsiu_run, which is
 # the gemma4 sweep at the end and nothing above it.
 #
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -153,8 +153,8 @@ fi
 echo " threads:             ${CHARSIU_THREADS:-all $(nproc 2>/dev/null) cores}"
 echo " corpus:              $CORPUS  ($(md5sum "$CORPUS" 2>/dev/null | cut -c1-32))"
 echo " speed REPEAT:        $REPEAT      gemma4 sweep N: $NSWEEP"
-[ "$REPEAT" -ge 7 ] || echo " ⚠⚠ REPEAT WAS CUT -- this is a dry run, not a round of record"
-[ "$NSWEEP" -ge 20 ] || echo " ⚠⚠ SWEEP WAS CUT -- this is a dry run, not a round of record"
+[ "$REPEAT" -ge 7 ] || echo " REPEAT WAS CUT -- this is a dry run, not a round of record"
+[ "$NSWEEP" -ge 20 ] || echo " SWEEP WAS CUT -- this is a dry run, not a round of record"
 echo
 
 BOOT0=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
@@ -166,7 +166,7 @@ echo
 #    published column is at maximum CPU and NPU frequency and a comparison
 #    across two governors is not one.
 #
-# ⚠⚠ AND THE VENDOR COLUMN IS STILL A CITATION, NOT AN ARM. It is copied from
+# AND THE VENDOR COLUMN IS STILL A CITATION, NOT AN ARM. It is copied from
 # their benchmark.md; nothing here runs their runtime. It has no N and no
 # spread, so "inside the noise" cannot be said of it in either direction. The
 # only honest form of the claim names both: our median of N with its range,
@@ -174,7 +174,7 @@ echo
 #
 echo "== 1. the speed table, performance governor, median of $REPEAT"
 CHARSIU_BENCH_PERF=1 CHARSIU_BENCH_REPEAT="$REPEAT" \
-	sh "$D/board_vendor.sh" 2>&1 || echo "  ⚠⚠ THE SPEED TABLE FAILED"
+	sh "$D/board_vendor.sh" 2>&1 || echo "  THE SPEED TABLE FAILED"
 echo
 
 #
@@ -188,14 +188,14 @@ echo
 echo "== 2. quality, CPU reference, group 1024 (what the board runs)"
 if [ -f "$QMODEL" ]; then
 	#
-	# ⚠⚠ AWQ NEEDS ITS STATISTICS AND DECLINES WITHOUT THEM. The first
+	# AWQ NEEDS ITS STATISTICS AND DECLINES WITHOUT THEM. The first
 	# version of this set CHARSIU_NPU_AWQ=0.20 and nothing else, and the
 	# board printed `int4 34.2425` and `int4+AWQ 34.2425` -- the same
 	# number to the last digit, because with no calibration charsiu
 	# refuses the method and says so on a stderr this was discarding.
 	# An arm equal to its control to the last digit never ran.
 	#
-	# ⚠ AND THE CALIBRATION TEXT IS NOT THE EVALUATION TEXT. Calibrating
+	# AND THE CALIBRATION TEXT IS NOT THE EVALUATION TEXT. Calibrating
 	# on the passage being scored measures how well the statistics fit
 	# that passage, which is not the question.
 	#
@@ -209,7 +209,7 @@ if [ -f "$QMODEL" ]; then
 	if [ -s "$STATS" ]; then
 		echo "   calibration      $(wc -c < "$STATS") bytes from $(basename "$CAL")"
 	else
-		echo "   ⚠⚠ THE CALIBRATION PASS WROTE NOTHING -- the AWQ arm below"
+		echo "   THE CALIBRATION PASS WROTE NOTHING -- the AWQ arm below"
 		echo "      cannot run and will equal the int4 arm. Do not read it."
 	fi
 	INT4=; AWQ=
@@ -229,16 +229,16 @@ if [ -f "$QMODEL" ]; then
 		esac
 	done
 	rm -f "$STATS"
-	# ⚠⚠ THE TELL. Identical tokens is what BOTH "the knob works" and "the
+	# THE TELL. Identical tokens is what BOTH "the knob works" and "the
 	# knob never ran" look like, and so is an identical perplexity.
 	if [ -n "$INT4" ] && [ "$INT4" = "$AWQ" ]; then
-		echo "   ⚠⚠ THE AWQ ARM EQUALS THE int4 ARM TO THE LAST DIGIT."
+		echo "   THE AWQ ARM EQUALS THE int4 ARM TO THE LAST DIGIT."
 		echo "      It did not run. AWQ declines without statistics, and a"
 		echo "      null arm is not a null result. This table's AWQ row is"
 		echo "      VOID for this round."
 	fi
 else
-	echo "   ⚠ no Llama-3.2-1B-Instruct-Q4_0.gguf under [$MODELDIRS]"
+	echo "   no Llama-3.2-1B-Instruct-Q4_0.gguf under [$MODELDIRS]"
 	echo "     -- quality table SKIPPED"
 fi
 echo
@@ -258,7 +258,7 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 	while [ $i -lt "$NSWEEP" ]; do
 		i=$((i + 1))
 		#
-		# ⚠⚠ `set -e` AND A COMMAND SUBSTITUTION THAT CAN FAIL KILLED
+		# `set -e` AND A COMMAND SUBSTITUTION THAT CAN FAIL KILLED
 		# THIS WHOLE SECTION, SILENTLY. This board publishes no
 		# thermal_zone at all, so the glob stayed literal, `[ -e ]`
 		# was false, the substitution exited non-zero and took the
@@ -274,7 +274,7 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 			awk '{printf "%.1f ", $1/1000}' "$z" 2>/dev/null
 		done; true)
 		[ -n "$T" ] || T="(no thermal zone on this board)"
-		# ⚠ THE FULL BOARD ENVIRONMENT, SPELLED. This line carried three
+		# THE FULL BOARD ENVIRONMENT, SPELLED. This line carried three
 		# knobs where the speed table it sits beside carries five. The
 		# two missing ones are the tree's board environment, and one of
 		# them -- CHARSIU_NPU_MAXN -- decided whether the output head
@@ -290,7 +290,7 @@ if [ -n "$GM" ] && [ -x "$BIN/charsiu_run" ]; then
 			"$i" "$(date +%H:%M:%S)" "${MS:-FAIL}" "$T"
 	done
 else
-	echo "   ⚠ no gemma4 under [$MODELDIRS] or no charsiu_run -- sweep SKIPPED"
+	echo "   no gemma4 under [$MODELDIRS] or no charsiu_run -- sweep SKIPPED"
 	echo "     (charsiu pull gemma4-e2b-q4 puts it in ~/.charsiu/models)"
 fi
 echo
@@ -299,14 +299,14 @@ env_block "end"
 BOOT1=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 echo
 #
-# ⚠⚠ THE WHOLE POINT, CHECKED. If the board rebooted in the middle -- a panic,
+# THE WHOLE POINT, CHECKED. If the board rebooted in the middle -- a panic,
 # a watchdog, a power blip on a long sweep -- then this file is two rounds
 # wearing one header, which is the exact defect it was written to prevent.
 #
 if [ "$BOOT0" = "$BOOT1" ]; then
-	echo "🏁 ONE BOOT: boot id unchanged, $BOOT0"
+	echo "ONE BOOT: boot id unchanged, $BOOT0"
 else
-	echo "⛔⛔ THE BOARD REBOOTED DURING THIS ROUND."
+	echo "THE BOARD REBOOTED DURING THIS ROUND."
 	echo "   start $BOOT0"
 	echo "   end   $BOOT1"
 	echo "   This file is TWO rounds under one header. Do not quote across it."

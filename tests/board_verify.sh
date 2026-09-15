@@ -4,7 +4,7 @@
 #
 # One round that verifies everything unverified.
 #
-# ⚠⚠ WHY THIS EXISTS. Seven changes have landed since the last board round and
+# WHY THIS EXISTS. Seven changes have landed since the last board round and
 # not one of them has executed on the hardware -- this desk has no /dev/accel,
 # so every number attached to them is construction or a host proxy. Verifying
 # them one at a time is how a batch stops being attributable: if the eighth
@@ -64,7 +64,7 @@ OUT=${CHARSIU_BOARD_DIR:-$HOME/charsiu-board}
 mkdir -p "$OUT"
 FAIL=0; SKIP=""; RAN=""
 
-# ⚠⚠ ONE PROMPT FOR THE WHOLE ROUND. `seq 1 32 | tr` leaves a TRAILING SPACE,
+# ONE PROMPT FOR THE WHOLE ROUND. `seq 1 32 | tr` leaves a TRAILING SPACE,
 # which tokenises differently, and phases 3, 7 and 8 each built their own copy
 # -- two with the space and one without. Inside a phase both arms saw the same
 # string so the comparisons held, but a tok/s from one phase was not comparable
@@ -73,7 +73,7 @@ FAIL=0; SKIP=""; RAN=""
 # below so a log says what it measured.
 P=$(seq 1 32 | tr '\n' ' '); P=${P% }
 
-# ⚠⚠ AND THE LONG ONE TOO, FOR EXACTLY THE SAME REASON THE SHORT ONE IS
+# AND THE LONG ONE TOO, FOR EXACTLY THE SAME REASON THE SHORT ONE IS
 # HERE. P9 was built inside phase 9's own case arm, so `board_verify.sh 10`
 # -- phase 10 alone, which is how a sweep gets run -- died on its first
 # model with "P9: parameter not set". The lesson from hoisting P was that a
@@ -84,15 +84,15 @@ P9=$(i=1; while [ $i -le 256 ]; do printf '%d ' "$i"; i=$((i+1)); done)
 P9=${P9% }
 
 say() { printf '\n=========== %s ===========\n' "$*"; }
-bad() { printf '  ⚠⚠ %s\n' "$*"; FAIL=$((FAIL + 1)); }
-ok()  { printf '  ✓ %s\n' "$*"; }
+bad() { printf '  %s\n' "$*"; FAIL=$((FAIL + 1)); }
+ok()  { printf '  %s\n' "$*"; }
 
-# ⚠⚠ THE NPU DOES NOT COME BACK FROM A TIMEOUT, and after it wedges every run
+# THE NPU DOES NOT COME BACK FROM A TIMEOUT, and after it wedges every run
 # falls back to the CPU a row at a time -- which is CORRECT, so every later
 # phase reads CLEAN. A round has already died printing a header and no rows.
 # Check dmesg between phases and stop at the first sign.
 DMESG0=$(dmesg 2>/dev/null | grep -c "NPU job timed out" || echo 0)
-# ⚠⚠ ONCE, AND THEN TRUE FOREVER. This is called from inside a sweep (to stop
+# ONCE, AND THEN TRUE FOREVER. This is called from inside a sweep (to stop
 # it at the cell that wedged) and again after it (to skip the phase's ok line),
 # so it must report exactly once and keep saying yes afterwards. Without the
 # WEDGED latch the second call would count a second failure for the same event.
@@ -116,13 +116,13 @@ skip() { SKIP="$SKIP $1($2)"; printf '  – skipped: %s\n' "$2"; }
 echo "charsiu board verification"
 echo "  binaries  $BIN"
 #
-# ⚠⚠ AND THE BUILD, FOR charsiu_run ONLY. Phase 14 drives npu_gemm_test and
+# AND THE BUILD, FOR charsiu_run ONLY. Phase 14 drives npu_gemm_test and
 # phase 15 charsiu_matmul; both carry the same -DCHARSIU_BUILD from this same
 # tree and neither has a --version to print it back, and neither may have
 # been copied to this board in the same minute as charsiu_run. Read the line
 # below as the runtime and not as the round.
 #
-# ⚠ SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
+# SOURCED FOR charsiu_build ONLY, and npu_clk is deliberately NOT called:
 # it refuses when debugfs is unmounted, and turning this probe into one that
 # refuses to start is a different change from making it say which build
 # produced its numbers.
@@ -136,7 +136,7 @@ echo "  logs      $OUT"
 echo "  models    $MODELS"
 echo "  phases    $PHASES"
 echo "  governor  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
-# ⚠⚠ SAY WHICH KERNEL. Every kernel this project ships is 7.2.0-rc5-next-20260730
+# SAY WHICH KERNEL. Every kernel this project ships is 7.2.0-rc5-next-20260730
 # by uname, so a round pasted from the board cannot be told apart by release
 # string, and the one that decided whether the core-pair overlap is a kernel
 # fault or a runtime fault was pasted without any. The Image hash can.
@@ -149,9 +149,9 @@ c0772d2a) _kname="August release (latest): rocket attaches the IOMMU per job" ;;
 *)        _kname="not a release this script knows" ;;
 esac
 echo "  kernel    $(uname -r) built $(uname -v | sed 's/^#[0-9]* *//; s/SMP PREEMPT *//'), Image ${_ksha:-?} = $_kname"
-# ⚠ AN IMAGE INSTALLED SINCE THIS BOOT IS NOT THE KERNEL RUNNING. /proc/1 is
+# AN IMAGE INSTALLED SINCE THIS BOOT IS NOT THE KERNEL RUNNING. /proc/1 is
 # as old as the boot; an Image newer than it has not been booted yet.
-# ⚠ AGAINST now - uptime, NOT /proc/1. The old test was
+# AGAINST now - uptime, NOT /proc/1. The old test was
 # `[ /boot/Image -nt /proc/1 ]` and it fires on a board where the Image is
 # fifteen hours OLDER than the boot: /proc/1's mtime is not the boot instant,
 # it moves. This compares the Image's mtime against the clock minus uptime,
@@ -162,16 +162,16 @@ if [ -f /boot/Image ]; then
 	_imt=$(date -r /boot/Image +%s 2>/dev/null || echo 0)
 	_boot=$(awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0)
 	[ "$_imt" -gt 0 ] && [ "$_boot" -gt 0 ] && [ "$_imt" -gt "$_boot" ] && \
-		echo "  ⚠⚠ /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
+		echo "  /boot/Image is NEWER THAN THIS BOOT: the kernel running is the one before it"
 fi
-# ⚠⚠ SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
+# SAY WHICH COPY OF THIS SCRIPT IS RUNNING. A round has already been read as
 # new data when it was the previous version of this file: `charsiu update dev`
 # had not taken, the output was byte identical to the round before, and the only
 # thing that gave it away was one word in a header nobody was checking. A stale
 # probe is a wasted board trip and it looks exactly like a result.
 echo "  script    $(cksum "$0" 2>/dev/null | cut -d" " -f1), $(wc -l <"$0") lines"
 echo "  prompt    $(printf '%s' "$P" | wc -w) words, no trailing space"
-echo "  ⚠ phases 7 and 9 set the performance governor themselves and put it back."
+echo "  phases 7 and 9 set the performance governor themselves and put it back."
 
 for p in $PHASES; do
 case $p in
@@ -197,7 +197,7 @@ case $p in
    if [ $rc = 0 ] && grep -q "0 differing" "$OUT/verify-text.txt"; then
 	ok "every model's batched prompt matches its token loop"
    elif ! grep -q "^model " "$OUT/verify-text.txt"; then
-	# ⚠⚠ COULD NOT RUN IS NOT THE SAME AS FAILED, and this branch used to
+	# COULD NOT RUN IS NOT THE SAME AS FAILED, and this branch used to
 	# say the second when it meant the first. board_text_all.sh refusing --
 	# no NPU node, no models, no binary -- also exits non-zero, and the
 	# round then reported nine models disagreeing when nothing had been
@@ -213,7 +213,7 @@ case $p in
    fi ;;
 
 3) say "3. the gelu identity: the exact control must not change any text"
-   # ⚠ CHARSIU_EXACT_GELU puts back the tanhf every one of these paths used
+   # CHARSIU_EXACT_GELU puts back the tanhf every one of these paths used
    # to run. If it changes a single token, the identity is not an identity
    # here and four commits are wrong. It is the cheapest check in the round.
    run 3
@@ -236,13 +236,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	if cmp -s "$OUT/.g_fast" "$OUT/.g_exact"; then
 		printf '  %-40s same\n' "$b"
 	else
-		printf '  %-40s ⚠ DIFFERS\n' "$b"
+		printf '  %-40s DIFFERS\n' "$b"
 		diff "$OUT/.g_exact" "$OUT/.g_fast" | head -4 | sed 's/^/       /'
 		nb=$((nb + 1))
 	fi
    done
    if wedged "phase 3"; then break; fi
-   # ⚠⚠ ZERO MODELS IS NOT ZERO DIFFERENCES. With no *Q4_0*.gguf under
+   # ZERO MODELS IS NOT ZERO DIFFERENCES. With no *Q4_0*.gguf under
    # $MODELS the loop above runs no iterations and nb stays 0, which reads
    # as a clean phase having compared nothing at all. That is the exact
    # shape of false pass this round exists to avoid.
@@ -290,7 +290,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    fi ;;
 
 6) say "6. the deal: least loaded against the old index deal"
-   # ⚠ THE NUMBER TO READ IS "the busier core carried N.NNx an even share".
+   # THE NUMBER TO READ IS "the busier core carried N.NNx an even share".
    # 1.00 is balanced and 2.00 is one core idle. Qwen3-0.6B's n_embd is 1024,
    # so q, k, v, gate and up are single K slices and the old deal put all five
    # on device 0 -- it should be the model that moves most.
@@ -315,9 +315,9 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    "$OUT/.deal_$arm" "$OUT/.deal_$arm.err" | head -1 \
 		    | sed 's/^/      /'
 	done
-	# ⚠ AND THE TEXT MUST MATCH BETWEEN THE ARMS. A deal that changes the
+	# AND THE TEXT MUST MATCH BETWEEN THE ARMS. A deal that changes the
 	# answer is not a scheduling change.
-	# ⚠⚠ STDOUT AND STDERR SEPARATELY, OR THE DIAGNOSTICS ARE THE DIFF.
+	# STDOUT AND STDERR SEPARATELY, OR THE DIAGNOSTICS ARE THE DIFF.
 	# The first version captured 2>&1 into the file it then compared, so the
 	# index arm's own "CHARSIU_NPU_DEAL_INDEX is set" note and the staging
 	# progress lines -- whose millisecond counts differ every run -- made
@@ -328,7 +328,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	cmp -s "$OUT/.deal_least" "$OUT/.deal_index" \
 	    && printf '      text identical between the two deals\n' \
 	    || bad "$b: the two deals disagree about the ANSWER, not just the speed"
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 6" && break
@@ -338,7 +338,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 7) say "7. the scoreboard, three runs a model"
-   # ⚠ REPEAT=3 IS NOT OPTIONAL HERE. TinyLLAMA has read 12.64 and 17.39 tok/s
+   # REPEAT=3 IS NOT OPTIONAL HERE. TinyLLAMA has read 12.64 and 17.39 tok/s
    # on the same build minutes apart, and a single reading of this table was
    # once read as a 24% regression that did not exist.
    run 7
@@ -350,7 +350,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 8) say "8. KFIT: what the wider buffers cost, and what the slicing buys"
-   # ⚠⚠ TURNING KFIT ON DOES TWO INDEPENDENT THINGS, and two board rounds
+   # TURNING KFIT ON DOES TWO INDEPENDENT THINGS, and two board rounds
    # priced them together and could not tell them apart.
    #
    #   1. it widens five buffers to 2 * kmax -- UNCONDITIONALLY, on every
@@ -374,7 +374,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    #   on   - wide  what the slicing BUYS, with the cost already paid
    #   on   - off   the net, which is what a user would see
    #
-   # ⚠ ONE READING IS NOT A MEASUREMENT: --repeat pays the model load once and
+   # ONE READING IS NOT A MEASUREMENT: --repeat pays the model load once and
    # generates REP times, and the spread is printed under every row.
    run 8
    REP=${KFIT_REPEAT:-3}
@@ -399,7 +399,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    "$BIN/charsiu_run" "$M" -p "$P" -n 32 --ignore-eos \
 		    --repeat "$REP" >"$OUT/.kfit_$arm" \
 		    2>"$OUT/.kfit_$arm.err"
-		# ⚠ READ THE RATES BEFORE THE STRIP BELOW EATS THEM, and isolate
+		# READ THE RATES BEFORE THE STRIP BELOW EATS THEM, and isolate
 		# the GENERATION one. The summary is a single line carrying the
 		# prompt rate and the gen rate, the halves line below it carries
 		# two more, and the sed that prepares the text for comparison
@@ -419,7 +419,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	    | head -1 | awk '{print $3"/"$5}')
 	[ -n "$hits" ] || hits="?"
 	sed -i 's/^\[.*//' "$OUT/.kfit_off" "$OUT/.kfit_wide" "$OUT/.kfit_on"
-	# ⚠⚠ A SHORT ARM IS A DEAD ARM. An arm that crashed on repeat two of
+	# A SHORT ARM IS A DEAD ARM. An arm that crashed on repeat two of
 	# three leaves rates behind, which is not empty, so it reads as healthy
 	# -- and its text is then shorter than the others', so the comparison
 	# calls it "KFIT changes the answer". That is the wrong diagnosis of a
@@ -442,7 +442,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	   cmp -s "$OUT/.kfit_off" "$OUT/.kfit_wide"; then
 		t=same
 	else
-		t="⚠ DIFFERS"
+		t="DIFFERS"
 		nchg=$((nchg + 1))
 	fi
 	printf '  %-30s %7s %7s %7s %9s  %s\n' "$b" "$bo" "$bw" "$bn" "$hits" "$t"
@@ -453,7 +453,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	           (w-a)/a*100, (n-w)/w*100, (n-a)/a*100 }'
 	[ "$t" = same ] || { diff "$OUT/.kfit_off" "$OUT/.kfit_on" | head -4 | sed 's/^/       /'; }
 	printf '%s %s %s %s %s\n' "$b" "${hits%%/*}" "$bo" "$bw" "$bn" >>"$OUT/.kfit_rows"
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 8" && break
@@ -487,9 +487,9 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	         printf "       %-30s %+6.1f%%  (net %+.1f%%, %d tensors)\n", \
 	                fname[i], fgain[i], fnet[i], fh[i] }
 	       print ""
-	       if (fc == 0) { print "     ⚠ NOTHING FIRED. This round says nothing about the slicing."; exit }
+	       if (fc == 0) { print "     NOTHING FIRED. This round says nothing about the slicing."; exit }
 	       if (csum/c < -0.4)
-	         printf "     ⚠ THE WIDENING IS NOT FREE (%+.1f%% mean) and it is paid by\n     every model. Size the buffers by the widest slice actually\n     staged and the net becomes the slicing figure above.\n", csum/c
+	         printf "     THE WIDENING IS NOT FREE (%+.1f%% mean) and it is paid by\n     every model. Size the buffers by the widest slice actually\n     staged and the net becomes the slicing figure above.\n", csum/c
 	       else
 	         printf "     the widening is free, so net == slicing and the range is\n     %+.1f%% .. %+.1f%%.\n", worst, best
 	     }' "$OUT/.kfit_rows"
@@ -498,26 +498,26 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 9) say "9. where TTFT goes: the five shares of a batched matmul, and the sixth"
-   # ⚠⚠ WHY THIS PHASE AND NOT MORE DECODE WORK. The two gaps to the vendor
+   # WHY THIS PHASE AND NOT MORE DECODE WORK. The two gaps to the vendor
    # are not the same size. On Qwen3-0.6B decode is 19.70 tok/s against 24.85,
    # which is 1.26x; time to first token is 1588 ms against 469, which is
    # 3.39x. The distance is in prefill, npudev's own note says the NPU is idle
    # for 91% of a batched matmul, and nothing has ever printed which part of
    # this side of the ioctl that idle time is.
    #
-   # ⚠ THE COUNTERS EXISTED AND NOTHING CALLED THEM. charsiu_npu_batch_split
+   # THE COUNTERS EXISTED AND NOTHING CALLED THEM. charsiu_npu_batch_split
    # and charsiu_npu_batch_prep have been in the tree with no caller anywhere;
    # vision and whisper could only have reached them through
    # charsiu_pool_report, and llama does not call that either. Same shape as
    # the switch that was "written, legal, default off" and corrupted the heap
    # the first time hardware ran it.
    #
-   # ⚠⚠ AND THE HOST CANNOT CHECK THIS ONE EITHER. With no /dev/accel the pool
+   # AND THE HOST CANNOT CHECK THIS ONE EITHER. With no /dev/accel the pool
    # has no device, the report suppresses itself and a desk run prints nothing
    # -- which is indistinguishable from the instrument being broken. So the
    # ABSENCE of the block is a FAILURE here, not a quiet skip.
    run 9
-   # ⚠⚠ AND THE GOVERNOR, OR THIS PHASE MEASURES THE GOVERNOR. Every share it
+   # AND THE GOVERNOR, OR THIS PHASE MEASURES THE GOVERNOR. Every share it
    # prints except the fence is CPU work, and under ondemand they do not
    # reproduce: three runs on 2026-09-04 read Phi-3.5's packing at 4384, 6583
    # and 3158 ms, two of them on identical code, and a change worth 5% was
@@ -532,7 +532,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # of the way; TTFT is the number this phase is about.
    printf '  prompt %s words, generation held to 4 tokens\n' \
        "$(printf '%s' "$P9" | wc -w)"
-   # ⚠⚠ TWO ARMS, because the read back is now split across the pool and the
+   # TWO ARMS, because the read back is now split across the pool and the
    # HOST CANNOT PRICE IT. With no /dev/accel read_rows never runs at all, so a
    # desk comparison of the two arms is two identical serial runs agreeing with
    # each other -- which looks exactly like a verified parallelisation.
@@ -541,7 +541,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # difference is not a performance result, it is the parallelisation being
    # wrong, and it is checked before the timing is read.
    n9=0; nmiss=0; ntx=0
-   # ⚠⚠ THE ONE ARM IS THE SHIPPED ONE. This was `serial`, which sets
+   # THE ONE ARM IS THE SHIPPED ONE. This was `serial`, which sets
    # CHARSIU_NPU_POOL_READ=0 and switches the size gate OFF -- so every
    # number this phase has printed since the gate shipped is of a
    # configuration nobody runs. It matters: on 2026-09-05 it put the read at
@@ -557,7 +557,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	[ -r "$M" ] || continue
 	n9=$((n9 + 1))
 	b=$(basename "$M" .gguf)
-	# ⚠ ONE ARM BY DEFAULT. The pooled read back is a settled negative -- it
+	# ONE ARM BY DEFAULT. The pooled read back is a settled negative -- it
 	# is correct and 5% to 18% slower on every model -- so a normal round
 	# should not pay double to re-measure it. READ_ARMS=1 asks for the
 	# comparison again, which is what to do after changing the granularity.
@@ -569,7 +569,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		*)      E=CHARSIU_READ_DUMMY=1 ;;
 		esac
 		# shellcheck disable=SC2086
-		# ⚠ THE SHIPPED WIDTHS, AND THE STAGE CLOCK. This pinned KMAX and
+		# THE SHIPPED WIDTHS, AND THE STAGE CLOCK. This pinned KMAX and
 		# the group to 1024 after the default had moved to 2048, so the
 		# split it printed was of a configuration nobody runs; and it
 		# never asked for CHARSIU_STAGES, so the prompt's CPU side --
@@ -583,7 +583,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		eval "t_$arm=\$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' \
 		    '$OUT/.ttft_$arm' | head -1 | grep -oE '[0-9.]+ ms')"
 	done
-	# ⚠⚠ READ THE ARM THAT ACTUALLY RAN. This copied .ttft_pool
+	# READ THE ARM THAT ACTUALLY RAN. This copied .ttft_pool
 	# unconditionally, and with the pool arm opt-in that file is a STALE
 	# LEFTOVER from an earlier run -- so the split printed below would have
 	# been another model's, or another round's, with nothing to say so.
@@ -592,10 +592,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	cp "$OUT/.ttft_$last.err" "$OUT/.ttft_err"
 	tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms, [0-9.]+ tok/s' \
 	    "$OUT/.ttft_out" "$OUT/.ttft_err" | head -1)
-	printf '\n  %s\n      %s\n' "$b" "${tt:-⚠ no prompt line at all}"
+	printf '\n  %s\n      %s\n' "$b" "${tt:-no prompt line at all}"
 	if [ "$ARMS9" = serial ] || [ "$ARMS9" = ship ]; then
 		:
-	# ⚠⚠ THE TEXT, NOT THE REPORT. This compared the whole of stdout, and
+	# THE TEXT, NOT THE REPORT. This compared the whole of stdout, and
 	# the stage table is printed there too, so the two arms differed on
 	# their own timings: the first round this check ever ran called eight
 	# models of nine corrupted and every differing line it printed was a
@@ -620,7 +620,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		awk '/charsiu NPU batched:/ { f = 1 }
 		     f { if (/charsiu NPU batched:/ || /^    /) print; else exit }' \
 		    "$OUT/.ttft_err" | sed 's/^/      /'
-		# ⚠ AND THE OTHER SIDE OF THE PROMPT: the batched path's own
+		# AND THE OTHER SIDE OF THE PROMPT: the batched path's own
 		# stage table, per row. It moved from stdout to stderr on
 		# 2026-09-07, because on stdout it landed inside every md5 of
 		# the generated text and cost three rounds. Matmul rows are the NPU
@@ -631,10 +631,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			     f && n == 1 { if (/charsiu batched stages:/ || /^  /) print; else exit }' \
 			    "$OUT/.ttft_err" | sed 's/^/      /'
 		else
-			printf '      ⚠ no batched stage table: the runner predates it, or CHARSIU_STAGES did not take\n'
+			printf '      no batched stage table: the runner predates it, or CHARSIU_STAGES did not take\n'
 		fi
 	else
-		# ⚠ NOT A SKIP. On the board this block is the whole phase, and
+		# NOT A SKIP. On the board this block is the whole phase, and
 		# its absence means either nothing took the batched path or the
 		# instrument did not fire -- and those look identical from here,
 		# which is exactly why it counts as a failure rather than a
@@ -646,7 +646,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    | head -3 | sed 's/^/       /'
 		nmiss=$((nmiss + 1))
 	fi
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 9" && break
@@ -666,13 +666,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 10) say "10. KMAX: read is m * n * ks, so buy ks down and see what it costs"
-   # ⚠⚠ THIS PHASE COMPARES BATCHED AGAINST BATCHED, AND SO DOES PHASE 12.
+   # THIS PHASE COMPARES BATCHED AGAINST BATCHED, AND SO DOES PHASE 12.
    # Both arms take the same path, so neither can see the batched path
    # disagreeing with the model's own token loop -- and at KMAX 4096 it DOES,
    # on Qwen2.5 and gemma-3-1b, which this phase and phase 12 both called
    # identical. Only phase 2 asks that question. Read a "text same" here as
    # "the quantiser did not move", never as "this width is correct".
-   # ⚠⚠ THIS IS A TRADE, NOT A FREE WIN, AND THE TREE ALREADY KNEW WHY. The
+   # THIS IS A TRADE, NOT A FREE WIN, AND THE TREE ALREADY KNEW WHY. The
    # read back is m * n * ks and ks is ceil(K / KMAX), so a wider slice is
    # directly less read work. But npudev's own note closes the obvious version
    # of this: ONE DISPATCH CANNOT COVER K WIDER THAN ONE QUANTISATION GROUP --
@@ -680,20 +680,20 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # register map segments the K reduction. So KMAX and CHARSIU_NPU_W4_GROUP
    # have to move together, and moving them COARSENS THE QUANTISER.
    #
-   # ⚠ That is why this phase prints text. A wider group is measured at 0.1067
+   # That is why this phase prints text. A wider group is measured at 0.1067
    # relative error per channel against group 32's 0.0666, and round 352's
    # symptom for one absmax over a long row was output that stayed "English, on
    # topic and repetitive". A differing answer here is EXPECTED and is the
    # PRICE; it is not a failure, and the phase does not call it one. What it
    # must not do is show a speed-up without showing what was paid for it.
    #
-   # ⚠ AND KMAX WAS MEASURED ONCE ALREADY, at 37% SLOWER, which is why the
+   # AND KMAX WAS MEASURED ONCE ALREADY, at 37% SLOWER, which is why the
    # board settled on 1024. That round is not evidence any more: the reason was
    # `d = (ki * ns + ni) & 1`, slices dealt to devices by an index that
    # restarts per tensor, so a single-slice tensor put everything on device 0.
    # The deal is least-loaded now and this has not been asked since.
    run 10
-   # ⚠ 4096 IS IN THE DEFAULT BECAUSE THE VENDOR USES IT. Read off its own
+   # 4096 IS IN THE DEFAULT BECAUSE THE VENDOR USES IT. Read off its own
    # .rkllm, every one of its 3328 int4 dispatches is K = 2048 (81%) or
    # K = 4096 (19%) and none is 1024, which is what these rounds have run.
    SW=${KMAX_SWEEP:-1024 2048 4096}
@@ -712,7 +712,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		    CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536 \
 		    "$BIN/charsiu_run" "$M" -p "$P9" -n 16 --ignore-eos \
 		    >"$OUT/.k_out" 2>"$OUT/.k_err"
-		# ⚠ READ EVERYTHING OUT BEFORE THE STRIP, which eats the
+		# READ EVERYTHING OUT BEFORE THE STRIP, which eats the
 		# bracketed line the prompt clause lives on.
 		tt=$(grep -hoE 'prompt [0-9]+ tok in [0-9.]+ ms' "$OUT/.k_out" \
 		     | head -1 | grep -oE '[0-9.]+ ms')
@@ -721,7 +721,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		fe=$(grep -hoE '^ *fence +[0-9.]+ ms +[0-9.]+%' "$OUT/.k_err" \
 		     | head -1 | tr -s ' ')
 		sed -i 's/^\[.*//' "$OUT/.k_out"
-		# ⚠⚠ A RUN THAT DID NOT RUN IS NOT A TEXT DIFFERENCE. Without
+		# A RUN THAT DID NOT RUN IS NOT A TEXT DIFFERENCE. Without
 		# this, a KMAX the hardware refuses leaves an empty .k_out,
 		# which compares unequal to the baseline and gets reported as
 		# "the quantiser changed the answer" -- a wrong diagnosis of a
@@ -738,10 +738,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		elif cmp -s "$OUT/.k_base" "$OUT/.k_out"; then
 			tx="text same"
 		else
-			# ⚠ NOT A FAILURE. See the note above: a wider group is
+			# NOT A FAILURE. See the note above: a wider group is
 			# a coarser quantiser and a different answer is what
 			# was bought with the time.
-			tx="⚠ TEXT CHANGED -- this is the price"
+			tx="TEXT CHANGED -- this is the price"
 		fi
 		printf '      KMAX %-5s TTFT %-11s %s\n' "$K" "${tt:-?}" "$tx"
 		printf '                 %s\n' "${rd:-  read  (no split printed)}"
@@ -751,7 +751,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# rather than inferred from the word "changed"
 	printf '      last answer: %s\n' \
 	    "$(tr '\n' ' ' <"$OUT/.k_out" | cut -c1-96)"
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 10" && break
@@ -774,7 +774,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # total read work, which is rows * n * ks, but it amortises everything
    # charged per CALL: prep, the submits, and the fence's own ramp.
    #
-   # ⚠ 96 IS IN THE SWEEP ON PURPOSE, ABOVE WHAT THE VENDOR EMITS. This tree
+   # 96 IS IN THE SWEEP ON PURPOSE, ABOVE WHAT THE VENDOR EMITS. This tree
    # has "the batch stops at m = 80" on record from the vision work, and a
    # sweep that stops where the vendor stops cannot tell a hardware ceiling
    # from a choice they made. If 96 comes back with different text, that is
@@ -782,7 +782,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    run 11
    CH=${CHUNK_SWEEP:-32 64 80 96}
    printf '  sweeping CHARSIU_PREFILL_CHUNK over: %s\n' "$CH"
-   printf '  ⚠ the chunk is a MAXIMUM and is rounded down to an expressible\n'
+   printf '  the chunk is a MAXIMUM and is rounded down to an expressible\n'
    printf '    width, so read the "chunks of" line, not the value asked for\n'
    n11=0; nbad11=0
    for M in "$MODELS"/*Q4_0*.gguf; do
@@ -815,7 +815,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		elif cmp -s "$OUT/.c_base" "$OUT/.c_out"; then
 			tx="text same"
 		else
-			# ⚠ UNLIKE PHASE 10, A DIFFERENCE HERE IS A FAILURE. The
+			# UNLIKE PHASE 10, A DIFFERENCE HERE IS A FAILURE. The
 			# chunk width changes no arithmetic -- same weights, same
 			# scales, same order -- so the answer must not move. This
 			# is the m = 8 class of fault, which is what that phase
@@ -823,13 +823,13 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			bad "$b at chunk $C: THE ANSWER MOVED. A chunk width changes"
 			printf '     no arithmetic, so this is a layout fault, not a trade.\n'
 			diff "$OUT/.c_base" "$OUT/.c_out" | head -4 | sed 's/^/       /'
-			tx="⚠ DIFFERS"
+			tx="DIFFERS"
 			nbad11=$((nbad11 + 1))
 		fi
 		printf '      chunk %-4s TTFT %-11s %-12s %s\n' \
 		    "$C" "$tt" "$tx" "${wd:-}"
 	done
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 11" && break
@@ -844,7 +844,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 12) say "12. the quality probe: something a coarser quantiser can actually break"
-   # ⚠⚠ WHY THIS EXISTS. Phase 10 compares text across KMAX and reported "text
+   # WHY THIS EXISTS. Phase 10 compares text across KMAX and reported "text
    # same" on all eight models -- and that is not evidence, because its prompt
    # is "1 2 3 ... 256" and the continuation is the model counting. Counting is
    # the least quantisation-sensitive thing a language model does. Phi-3.5 goes
@@ -857,7 +857,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # on topic and REPETITIVE", so distinct words over total words is a direct
    # probe for it.
    #
-   # ⚠ THE RATIO IS A SYMPTOM DETECTOR, NOT AN ORACLE. It cannot tell you the
+   # THE RATIO IS A SYMPTOM DETECTOR, NOT AN ORACLE. It cannot tell you the
    # answer is right; it can tell you the model started repeating itself, which
    # is the shape the failure takes here. Read it next to the text, never
    # instead of it.
@@ -886,7 +886,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			    "$(tr '\n' ' ' <"$OUT/.q_out" | cut -c1-70)"
 		done
 	done
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 12" && break
@@ -900,7 +900,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 13) say "13. the wide K slice: does the CBUF pair fix make it agree with m = 1"
-   # ⚠⚠ CORRECTION: NOTHING WAS FIXED TO GET 2048, IT WAS NEVER BROKEN. The
+   # CORRECTION: NOTHING WAS FIXED TO GET 2048, IT WAS NEVER BROKEN. The
    # commit that claimed credit put the split CBUF rule into regcmd.c, whose
    # only caller in this tree is tools/emit_dump.c -- the runtime submits
    # through charsiu_emit_job in job.c, which already had the rule and had it
@@ -915,7 +915,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    #     slice 3072   right   gemma-3-1b at KMAX 3072, surf 96
    #     slice 4096   WRONG   both, surf 128
    #
-   # ⚠⚠ THAT IS NOT A SIZE THRESHOLD. 3072 is wider than 2816 and works, so
+   # THAT IS NOT A SIZE THRESHOLD. 3072 is wider than 2816 and works, so
    # whatever is wrong above 2048 is not "too big" and the next round should
    # not be a bigger sweep of the same axis. K * M does not separate them
    # either: 245760 works and 225280 does not.
@@ -926,7 +926,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # split, both exactly 131072. Our shipped setting is 1024 x 80 = 81920,
    # which is why every round for months was right, and 4096 x 80 = 327680,
    # which is why phase 2 was not.
-   # ⚠⚠ WHAT THIS IS FOR. Phase 2 at KMAX 4096 had Qwen2.5 and gemma-3-1b
+   # WHAT THIS IS FOR. Phase 2 at KMAX 4096 had Qwen2.5 and gemma-3-1b
    # answering differently from their own token loop, while SmolLM2-135M was
    # fine -- and phases 10 and 12 had called all three identical at that width,
    # because both of THEIR arms were batched. A batched path that is wrong at a
@@ -942,12 +942,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # dispatches K = 2048 and K = 4096 -- the hardware does this, our encoder
    # does not.
    #
-   # ⚠ ONLY THESE THREE MODELS, AND THAT IS THE WHOLE DESIGN. K must divide
+   # ONLY THESE THREE MODELS, AND THAT IS THE WHOLE DESIGN. K must divide
    # none of the candidate widths, or the WEIGHTS change with the width and the
    # comparison stops being about slicing at all. 1536, 8960, 1152, 6912, 576
    # and 1536 divide none of 1024, 2048, 3072, 4096, so across this sweep the
    # quantiser emits the same bytes and only ks moves.
-   # ⚠⚠ AND A SECOND ARM, BECAUSE PHASE 15 EXONERATED THE DISPATCH. One int4
+   # AND A SECOND ARM, BECAUSE PHASE 15 EXONERATED THE DISPATCH. One int4
    # matmul at K=4096 N=1536, m=80, through the same emitter, is EXACT -- and
    # so is every other shape these models run. So the fault is not in the
    # register stream for one dispatch; it is in something the model does and a
@@ -960,7 +960,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # stay wrong, the pair is innocent and it is the slice accumulation.
    run 13
    KW=${KMAX_WIDTHS:-1024 2048 3072 4096}
-   # ⚠⚠ THE CHUNK IS THE SECOND AXIS NOW, and it is the sharper question.
+   # THE CHUNK IS THE SECOND AXIS NOW, and it is the sharper question.
    # onedev already answered its own: Qwen2.5 fails identically on one core and
    # two, so the core pair is not necessary for the fault. What has never been
    # run is a WIDE K SLICE AT A NARROW m.
@@ -985,7 +985,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    for MK in Qwen2.5-1.5B gemma-3-1b SmolLM2-135M; do
 	ls "$MODELS"/*"$MK"*Q4_0*.gguf >/dev/null 2>&1 || continue
 	n13=$((n13 + 1))
-	# ⚠⚠ gemma-3-1b IS AN INTERMITTENT REPRODUCER AND ITS CELLS ARE NOISE.
+	# gemma-3-1b IS AN INTERMITTENT REPRODUCER AND ITS CELLS ARE NOISE.
 	# It read WRONG at KMAX 4096 on one round and RIGHT on the next with a
 	# byte-identical runtime -- every commit between the two touched only
 	# tests and comments. Its two arms also inverted against each other in
@@ -1024,20 +1024,20 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 				printf '      %-7s KMAX %-5s agrees, %s of %s\n' \
 				    "$ARM" "$K" "$ok13" "$i13"
 			elif [ "$ok13" = 0 ]; then
-				printf '      %-7s KMAX %-5s ⚠ DISAGREES, %s of %s\n' \
+				printf '      %-7s KMAX %-5s DISAGREES, %s of %s\n' \
 				    "$ARM" "$K" "$no13" "$i13"
 				bad "$MK breaks at a K slice of $K on $ARM"
 			else
-				# ⚠ NOT A BOUND. A cell that disagrees with itself
+				# NOT A BOUND. A cell that disagrees with itself
 				# is the model being flaky, and fitting anything
 				# to it is how the last two hypotheses died.
-				printf '      %-7s KMAX %-5s ⚠⚠ UNSTABLE: %s right, %s wrong of %s\n' \
+				printf '      %-7s KMAX %-5s UNSTABLE: %s right, %s wrong of %s\n' \
 				    "$ARM" "$K" "$ok13" "$no13" "$i13"
 				bad "$MK at KMAX $K on $ARM is not repeatable"
 			fi
 		done
 	done
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 13" && break
@@ -1054,7 +1054,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 14) say "14. the same widths in int8: is it int4's fault or every dispatch's"
-   # ⚠⚠ EVERYTHING KNOWN ABOUT THIS FAULT IS INFERRED FROM WHOLE-MODEL TEXT.
+   # EVERYTHING KNOWN ABOUT THIS FAULT IS INFERRED FROM WHOLE-MODEL TEXT.
    # Phase 13 says a model answers differently, and the slice widths were then
    # worked out from its two dimensions. That is three layers away from the
    # dispatch that is actually wrong, and it is why the shape of the fault
@@ -1073,7 +1073,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # Either answer halves the search, which is more than another sweep of
    # whole-model text can do.
    #
-   # ⚠ m=1 RUNS FIRST WHATEVER IS ASKED FOR, inside the tool. An m=80 failure
+   # m=1 RUNS FIRST WHATEVER IS ASKED FOR, inside the tool. An m=80 failure
    # means nothing if the control is already wrong, and the tool says so itself.
    run 14
    have npu_gemm_test || { skip 14 "npu_gemm_test not installed (dev channel)"; break; }
@@ -1093,7 +1093,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	elif [ "$c" != 0 ]; then
 		bad "K=$K: the m=1 CONTROL disagrees, so this width says nothing"
 	else
-		# ⚠ "3 of 3" is exact and "2 of 3" is the fault. Compare the two
+		# "3 of 3" is exact and "2 of 3" is the fault. Compare the two
 		# numbers rather than printing the line and leaving it to a
 		# reader -- a table nobody has to interpret is a table nobody
 		# misreads at one in the morning.
@@ -1108,7 +1108,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 			    | head -6 | sed 's/^/       /'
 		fi
 	fi
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 14" && break
@@ -1119,7 +1119,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 15) say "15. one int4 matmul at a time: is the bound K, or is it K times N"
-   # ⚠⚠ THIS TOOL WAS HERE THE WHOLE TIME AND I INFERRED INSTEAD. charsiu_matmul
+   # THIS TOOL WAS HERE THE WHOLE TIME AND I INFERRED INSTEAD. charsiu_matmul
    # submits ONE matmul through charsiu's own emitter -- charsiu_emit_job, the
    # one npudev uses, on the width axis that int4 takes -- and checks it against
    # the CPU. Everything known about the wide slice fault so far was worked out
@@ -1137,7 +1137,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # the gap. It is the only reading that explains gemma-3-1b working at 3072
    # while Qwen2.5 does not: same K, different N.
    #
-   # ⚠ AND IT IS PROBABLY OURS, NOT THE HARDWARE'S. The vendor emits 0x101c =
+   # AND IT IS PROBABLY OURS, NOT THE HARDWARE'S. The vendor emits 0x101c =
    # 4194304 on its 2048x4096 int4 shape, which is 4 MiB of weight bytes in one
    # dispatch, so the block does this.
    #
@@ -1155,7 +1155,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	   >"$OUT/.mm" 2>&1; then
 		printf '      K=%-5s N=1536  %5s KiB  exact\n' "$K" "$wb"
 	else
-		printf '      K=%-5s N=1536  %5s KiB  ⚠ WRONG\n' "$K" "$wb"
+		printf '      K=%-5s N=1536  %5s KiB  WRONG\n' "$K" "$wb"
 		nb15=$((${nb15:-0} + 1))
 	fi
    done
@@ -1166,10 +1166,10 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	   >"$OUT/.mm" 2>&1; then
 		printf '      K=4096 N=%-5s %5s KiB  exact\n' "$N" "$wb"
 	else
-		printf '      K=4096 N=%-5s %5s KiB  ⚠ WRONG\n' "$N" "$wb"
+		printf '      K=4096 N=%-5s %5s KiB  WRONG\n' "$N" "$wb"
 		nb15=$((${nb15:-0} + 1))
 	fi
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 15" && break
@@ -1177,7 +1177,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    wedged "phase 15" && break
    printf '\n'
    if [ "${nb15:-0}" = 0 ]; then
-	# ⚠ NOT A PASS. The models are wrong at these widths, so a bench that
+	# NOT A PASS. The models are wrong at these widths, so a bench that
 	# says every shape is exact has failed to reproduce a fault that is
 	# certainly there -- and that is a finding about the bench.
 	bad "every shape here is exact, so this bench does NOT reproduce the"
@@ -1192,7 +1192,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 16) say "16. one tensor, sliced: the rung between a dispatch and a model"
-   # ⚠⚠ WHY THIS EXISTS. Two rungs are measured and they disagree:
+   # WHY THIS EXISTS. Two rungs are measured and they disagree:
    #
    #   phase 15   ONE dispatch, int4, K=4096 N=1536 m=80    EXACT
    #   phase 13   a whole model at KMAX 3072 or 4096        WRONG
@@ -1209,7 +1209,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # same quantised weights, which is the comparison phase 2 makes at model
    # scale.
    #
-   # ⚠ The shapes below are Qwen2.5's ffn down projection, K = 8960 N = 1536,
+   # The shapes below are Qwen2.5's ffn down projection, K = 8960 N = 1536,
    # because that is the tensor phase 13 implicates and the only multi-slice
    # one it has at KMAX 3072.
    run 16
@@ -1220,7 +1220,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    printf '  K=%s N=%s m=%s, KMAX walking. m=1 is the control inside the tool.\n' \
        "$SK" "$SN" "$SM"
    for K in ${SLICE_KMAX:-1024 2048 3072 4096}; do
-	# ⚠ CHARSIU_NPU_ANY_SURFACE=1 LIFTS THE GUARD THIS PHASE EXISTS TO
+	# CHARSIU_NPU_ANY_SURFACE=1 LIFTS THE GUARD THIS PHASE EXISTS TO
 	# INTERROGATE. Without it the first run of this phase came back with
 	# 3072 and 4096 "refused by the surface guard" -- my own tripwire
 	# blocking the only measurement that can explain it.
@@ -1228,7 +1228,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	    CHARSIU_NPU_W4_GROUP="$K" CHARSIU_NPU_MAXN=262144 \
 	    CHARSIU_COEF_ELEMS=65536 CHARSIU_NPU_ANY_SURFACE=1 \
 	    timeout 600 "$BIN/npu_slice_test" "$SK" "$SN" "$SM" "$K" 2>&1)
-	# ⚠ the detail lines came back EMPTY last round because this grepped
+	# the detail lines came back EMPTY last round because this grepped
 	# "batched:" with a colon and the tool prints "batched vs the same
 	# call". A phase that loses the diagnosis is a board round spent on one
 	# bit of information.
@@ -1236,7 +1236,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	if printf '%s' "$r" | grep -q "exact"; then
 		printf '      KMAX %-5s exact\n' "$K"
 	elif printf '%s' "$r" | grep -q "REFUSED"; then
-		# ⚠ WITH THE HATCH SET THIS SHOULD NOT HAPPEN, so it is a
+		# WITH THE HATCH SET THIS SHOULD NOT HAPPEN, so it is a
 		# failure and not a note: something else refused the batch and
 		# the cell was not measured either way.
 		bad "KMAX $K: the batch was refused even with the guard lifted"
@@ -1247,7 +1247,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	fi
    done
 
-   # ⚠⚠ THE FREE CONTROL: THE SAME SURFACE WITH ONE SLICE.
+   # THE FREE CONTROL: THE SAME SURFACE WITH ONE SLICE.
    #
    # phase 15 has a single dispatch at surface 10240 EXACT, but it submits a
    # raw job -- it never touches npudev's staging, slots or batched buffers.
@@ -1274,7 +1274,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		printf '     wide slice wrong through its own staging.\n'
 		printf '%s\n' "$r" | grep -E "rows wrong|channels |got/want" | sed 's/^/       /'
 	fi
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 16" && break
@@ -1287,7 +1287,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 17) say "17. the CBUF window: 0x1c00 is 7168, and is that where it ends"
-   # ⚠⚠ THE MECHANISM, AND IT WAS WRITTEN DOWN HERE BEFORE ANY OF THIS.
+   # THE MECHANISM, AND IT WAS WRITTEN DOWN HERE BEFORE ANY OF THIS.
    # job.c on charsiu_cbuf_window: "0x1c00 is 7168 and appears in three of them
    # as what reads like a base offset", and npudev sets cbuf_window = di, the
    # device index. So the CBUF is two windows and window 1 starts at entry
@@ -1300,7 +1300,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # charsiu_cbuf_window() returns 0 by default and one job has no second
    # window to collide with -- npudev always has one.
    #
-   # ⚠⚠ AND THIS PHASE ALREADY RAN AND KILLED THAT STORY. 6144 came back WRONG,
+   # AND THIS PHASE ALREADY RAN AND KILLED THAT STORY. 6144 came back WRONG,
    # which is below 7168, so window 1's base is not the line either -- it is
    # the fifth explanation to fit everything known and then die. The bracket
    # this phase actually left behind is (5120, 6144], the guard sits at the
@@ -1322,14 +1322,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	    timeout 600 "$BIN/npu_slice_test" 4096 1536 "$M" 4096 2>&1)
 	if printf '%s' "$r" | grep -q "exact"; then
 		printf '      m=%-4s surface %-6s exact%s\n' "$M" "$surf" \
-		    "$([ "$surf" -gt 7168 ] && echo '   ⚠ past 7168 and still right')"
+		    "$([ "$surf" -gt 7168 ] && echo '   past 7168 and still right')"
 	elif printf '%s' "$r" | grep -q "REFUSED"; then
 		bad "m=$M: refused even with the guard lifted"
 	else
-		printf '      m=%-4s surface %-6s ⚠ WRONG%s\n' "$M" "$surf" \
-		    "$([ "$surf" -le 7168 ] && echo '   ⚠ at or below 7168 and already wrong')"
+		printf '      m=%-4s surface %-6s WRONG%s\n' "$M" "$surf" \
+		    "$([ "$surf" -le 7168 ] && echo '   at or below 7168 and already wrong')"
 	fi
-   	# ⚠ INSIDE the sweep: a wedged block makes every later cell
+   	# INSIDE the sweep: a wedged block makes every later cell
    	# read as garbage, and this loop printed two of them as
    	# failures before the check below ever ran.
    	wedged "phase 17" && break
@@ -1340,7 +1340,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    ;;
 
 18) say "18. the surface guard has an axis, and int8 is not on it"
-   # ⚠⚠ THE SURFACE GUARD HAS AN AXIS, AND THE FIRST VERSION OF IT DID NOT.
+   # THE SURFACE GUARD HAS AN AXIS, AND THE FIRST VERSION OF IT DID NOT.
    #
    # (slice / 32) * m is the WIDTH axis's input surface. charsiu_emit_job sets
    # inw = m only when wide, so on the HEIGHT axis the input is one column of m
@@ -1358,18 +1358,18 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # (15.5 s was quoted first and is the wrong baseline -- that is
    # board_modalities' number from another round, not this scoreboard's.)
    #
-   # ⚠ SO THIS PHASE RUNS WITHOUT THE HATCH. Phases 16 and 17 lift the guard
+   # SO THIS PHASE RUNS WITHOUT THE HATCH. Phases 16 and 17 lift the guard
    # because they exist to interrogate what is above it; this one exists to
    # check that the guard is not standing where it was never measured, and
    # lifting it would verify nothing.
-   # ⚠⚠ K = 8192 WEDGED THE BLOCK the first time this phase ran, and a wedge is
+   # K = 8192 WEDGED THE BLOCK the first time this phase ran, and a wedge is
    # not a result: the two cells after it were measured on a dead NPU and
    # printed as failures. It runs LAST now, and the sweep stops at it. It is
    # here at all because job.c's split-window note cites k = 8192 at m = 64 as
    # the int8 batch that has been right since the 2.94x round -- a claim in the
    # tree that nothing had ever run on its own.
    #
-   # ⚠⚠ AND THE FIRST RUN'S OTHER TWO "FAILURES" WERE NOT THE BATCHING EITHER.
+   # AND THE FIRST RUN'S OTHER TWO "FAILURES" WERE NOT THE BATCHING EITHER.
    # charsiu_act_q1 multiplies by 1/d and npudev's batched packer divided by d.
    # Those are not the same float, so one value in 3072 landed a code apart and
    # moved all 768 outputs a hair -- 127 of them past a 0.1% RELATIVE threshold
@@ -1402,9 +1402,9 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		printf '%s\n' "$r" | grep -iE "NOT on the NPU|surface" | head -2 | sed 's/^/       /'
 	elif printf '%s' "$r" | grep -q "exact"; then
 		printf '      %s exact   [width %s]%s\n' "$lbl" "$wf" \
-		    "$([ "$wf" -gt 5120 ] && echo '  ⚠ the guard would have refused this')"
+		    "$([ "$wf" -gt 5120 ] && echo '  the guard would have refused this')"
 	else
-		# ⚠⚠ THERE IS NO EXCUSE BRANCH HERE ANY MORE. This had one for
+		# THERE IS NO EXCUSE BRANCH HERE ANY MORE. This had one for
 		# multi-slice cells, on the reasoning that npudev scales per K
 		# slice while charsiu_act_q1 scales per row, so the two could
 		# not agree. K = 8192 at 4 slices then came back EXACT, which
@@ -1415,18 +1415,18 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		bad "$lbl: not exact -- the quantisers match now, so this is the batching"
 		printf '%s\n' "$r" | grep -E "quantiser check|batched|rows wrong|channels |got/want|magnitude" | sed 's/^/       /'
 	fi
-	# ⚠ INSIDE the sweep: a wedged block makes every later cell read as
+	# INSIDE the sweep: a wedged block makes every later cell read as
 	# garbage, and this loop printed two of them as failures before the
 	# check below ever ran.
 	wedged "phase 18" && break
    done
    wedged "phase 18" && break
    ok "int8 batches past the int4 ceiling, so the gate belongs on the axis"
-   printf '     ⚠ the height axis has a ceiling of its own -- phase 19 walks it.\n'
+   printf '     the height axis has a ceiling of its own -- phase 19 walks it.\n'
    ;;
 
 19) say "19. the height axis has a ceiling too, and which quantity is it"
-   # ⚠⚠ PHASE 18 FOUND ONE AND THIS PHASE IS WHAT IT OWES. Four int8 cells ran
+   # PHASE 18 FOUND ONE AND THIS PHASE IS WHAT IT OWES. Four int8 cells ran
    # and three were exact:
    #
    #   K=3072 m=64  1 slice   surf 96  x 64 =  6144   exact
@@ -1438,11 +1438,11 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # and the quantiser check printed 0 differing codes on that cell, so the
    # thing phase 18 spent a round on is excluded by the tool itself.
    #
-   # ⚠ AND job.c NEVER CHECKS. Its split rule is `wide && surf * rows > 4096`,
+   # AND job.c NEVER CHECKS. Its split rule is `wide && surf * rows > 4096`,
    # and wide is 0 for int8, so an int8 dispatch never splits and nothing looks.
    # The int4 side has a guard at 5120; the height axis has nothing.
    #
-   # ⚠⚠ BUT DO NOT GUARD IT YET. Three quantities fit all four cells and they
+   # BUT DO NOT GUARD IT YET. Three quantities fit all four cells and they
    # are not the same rule:
    #
    #   (a) surf alone, i.e. K/32     128 fails, 96 and 64 pass
@@ -1452,7 +1452,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # Putting a guard on the wrong one of those is exactly what shipped last
    # round on the other axis. Each cell below says which candidate it kills.
    #
-   # ⚠ m STOPS AT 80. npupool's own sweep has 4..80 identical and 96 and up "a
+   # m STOPS AT 80. npupool's own sweep has 4..80 identical and 96 and up "a
    # different tower", so a cell above 80 would be measuring that instead.
    run 19
    have npu_slice_test || { skip 19 "npu_slice_test not installed (dev channel)"; break; }
@@ -1479,7 +1479,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	elif printf '%s' "$r" | grep -q "exact"; then
 		printf '      %s exact\n' "$lbl"
 	else
-		printf '      %s ⚠ WRONG\n' "$lbl"
+		printf '      %s WRONG\n' "$lbl"
 		printf '        %s\n' "$why"
 		printf '%s\n' "$r" | grep -E "rows wrong|got/want|magnitude" | sed 's/^/        /'
 	fi
@@ -1488,14 +1488,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    done
    wedged "phase 19" && break
    ok "the bracket is (8192, 8960] on surf x rows; npudev refuses above 8192 and the pool chunks under it"
-   printf '     ⚠ EXPOSURE, unguarded either way: whisper sizes its pool at\n'
+   printf '     EXPOSURE, unguarded either way: whisper sizes its pool at\n'
    printf '        4 * n_audio_state, so medium is K=4096 (surf 128) and large\n'
    printf '        is K=5120 (surf 160) -- both at or past the failing cell,\n'
    printf '        and the board has only ever run tiny (K=1536, surf 48).\n'
    ;;
 
 20) say "20. speculative decoding: the price of a pass, and the text"
-   # ⚠⚠ THE ONE NUMBER THE HOST CANNOT MEASURE. tests/spec_identity.sh has
+   # THE ONE NUMBER THE HOST CANNOT MEASURE. tests/spec_identity.sh has
    # already shown, on a machine with no NPU, that --spec commits exactly the
    # tokens greedy would have and that junk drafts are rejected every time; and
    # it has measured how many tokens a pass yields, which is a property of the
@@ -1510,11 +1510,11 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    # so at 2.29 tokens a pass the break-even cost is 2.29 steps, and anything
    # under that is a win the vendor's decode does not have.
    #
-   # ⚠ THE TEXT IS CHECKED HERE TOO, because on the board the pass is a real
+   # THE TEXT IS CHECKED HERE TOO, because on the board the pass is a real
    # batched matmul at m = 4 and the host only ever ran that a row at a time.
    run 20
    have spec_identity.sh || { skip 20 "spec_identity.sh not installed (dev channel)"; break; }
-   # ⚠⚠ WITH THE NPU ENVIRONMENT. The first board run of this phase called
+   # WITH THE NPU ENVIRONMENT. The first board run of this phase called
    # the script bare, which is the CPU: the identity it would have reported
    # is the host's, run on a board. (It reported nothing, because the script
    # also wrote its stderr file under a build/ the board does not have, and a
@@ -1532,14 +1532,14 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    for f in "$MODELS"/Qwen3-0.6B*.gguf "$MODELS"/*.gguf; do [ -r "$f" ] && SM=$f && break; done
    if [ -n "$SM" ]; then
 	printf '  price on %s, %s tokens:\n' "$(basename "$SM")" "${SPEC_N:-96}"
-	# ⚠ THE NPU ENVIRONMENT, AND A PROMPT THE LOOKUP CAN WORK WITH. The
+	# THE NPU ENVIRONMENT, AND A PROMPT THE LOOKUP CAN WORK WITH. The
 	# first run priced the CPU (2.6 tok/s on a model that decodes at 22)
 	# on P9, whose continuation 257 258 259 has never occurred before, so
 	# the lookup drafted nothing useful and accepted 11%. The identity
 	# test's prompt asks for repetition, which is the case this drafter
 	# is for.
 	#
-	# ⚠ THE FIRST REAL READING, 2026-09-02, Qwen3 on the attach-once
+	# THE FIRST REAL READING, 2026-09-02, Qwen3 on the attach-once
 	# kernel: plain 28.94 tok/s, --spec 3 21.65, --spec 5 21.32. A pass at
 	# m = 4 cost 2.51 decode steps and yielded 1.90 tokens, so speculation
 	# LOST 25% -- the batched path serialises the two cores (the overlap
@@ -1550,7 +1550,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# and the sum changes sign. Every spec arm's text is checked against
 	# plain: on the board the pass is a real batched matmul at m = 4.
 	#
-	# ⚠ SECOND READING, same night, harness fixed: 9 of 9 language models
+	# SECOND READING, same night, harness fixed: 9 of 9 language models
 	# identical x3 on the NPU, and +parallel IDENTICAL on Qwen3 at m = 4
 	# with a pass = 2.11 steps (2.51 serialised). One model at one width;
 	# the shape that failed was phi3 at m = 24, 13 of 16 wrong, so what
@@ -1576,7 +1576,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		if [ "$arm" = plain ]; then
 			PT=$t; PTOK=${tok:-0}; PMS=${ms:-0}
 		else
-			if [ "$t" = "$PT" ]; then v="text identical"; else v="⚠⚠ TEXT DIFFERS from plain"; fi
+			if [ "$t" = "$PT" ]; then v="text identical"; else v="TEXT DIFFERS from plain"; fi
 			case "$arm" in
 			*+parallel) ;;
 			*) [ "$t" = "$PT" ] || bad "phase 20: $arm text differs from plain on $(basename "$SM")";;
@@ -1586,7 +1586,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 				'BEGIN { printf "a pass = %.2f decode steps", (ms / p) / (pms / pt) }')
 		fi
 		printf '    %-18s %s%s%s%s\n' "$arm" "${gen:-no gen line}" "${sl:+   $sl}" "${steps:+   $steps}" "${v:+   $v}"
-		# ⚠ WHERE A PASS GOES. 2.11 steps a pass with the cores overlapped
+		# WHERE A PASS GOES. 2.11 steps a pass with the cores overlapped
 		# is still 1.1 steps of something that is not a decode step, and
 		# nothing had ever printed what. The runtime's batched report has
 		# the five shares; this divides them by the passes. The prompt's
@@ -1604,15 +1604,15 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 		fi
 		wedged "phase 20" && break
 	done
-	printf '  ⚠ speculation wins only where tok/pass is above the steps a pass costs.\n'
-	printf '  ⚠ +parallel is a PROBE: its text differing is the known fault, and identical\n'
+	printf '  speculation wins only where tok/pass is above the steps a pass costs.\n'
+	printf '  +parallel is a PROBE: its text differing is the known fault, and identical\n'
 	printf '    would mean the core pair overlap was the old kernel, and the pass is cheaper.\n'
    fi
    wedged "phase 20" && break
    ;;
 
 21) say "21. the price of a call: where 130 us goes"
-   # ⚠⚠ DECODE'S BIGGEST REMAINING COST IS NOT BYTES. Phase 7's own cost model
+   # DECODE'S BIGGEST REMAINING COST IS NOT BYTES. Phase 7's own cost model
    # on Qwen3 reads `us a call = 130 + 16 a task + 120 a MB`, and a token is
    # about 150 calls: 19.5 ms of the 51.7 ms token is the per-call floor, more
    # than the 18.6 ms the weights take at 16 GB/s. Halve the floor and decode
@@ -1642,18 +1642,18 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    [ -n "$SM" ] || { skip 21 "no model"; break; }
    IDLE=/sys/devices/system/cpu/cpu0/cpuidle/state1/disable
    [ -w "$IDLE" ] || { skip 21 "no cpuidle state1 to toggle at $IDLE"; break; }
-   # ⚠ THE FOURTH ARM NEEDS NO SYSFS AND NO KERNEL: CHARSIU_NPU_SPIN_US polls
+   # THE FOURTH ARM NEEDS NO SYSFS AND NO KERNEL: CHARSIU_NPU_SPIN_US polls
    # the fence for that long before sleeping on it, so the waiter never leaves
    # C0 and never pays the exit latency. If it matches the cpu-sleep-off arm
    # the latency was the waiter's; if cpu-sleep-off wins by more, the irq
    # thread and the scheduler thread were paying it too, and only the kernel
    # can fix those.
-   # ⚠ AT THE PERFORMANCE GOVERNOR, like phase 7: under ondemand the arms
+   # AT THE PERFORMANCE GOVERNOR, like phase 7: under ondemand the arms
    # carry the frequency ramp after every idle as well, and the "on" and
    # "on again" arms came back 9% apart. Restored on the way out.
    GOV0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo ondemand)
    for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance >"$c" 2>/dev/null; done
-   # ⚠ THE FOUR ARMS, AFTER THE FIRST RUN OF THIS PHASE (ondemand, August kernel):
+   # THE FOUR ARMS, AFTER THE FIRST RUN OF THIS PHASE (ondemand, August kernel):
    #   deep idle allowed   CHARSIU_NPU_IDLE=1, the control: 7.64 tok/s
    #   cpu-sleep OFF       the sysfs switch, plus the control: 9.46, +24%
    #   qos hold (default)  charsiu holds /dev/cpu_dma_latency at 100 us,
@@ -1664,15 +1664,15 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	case "$arm" in *spin*) SPIN=400 ;; *) SPIN=0 ;; esac
 	case "$arm" in "deep idle"*|*OFF) IDLE=1 ;; *) IDLE="" ;; esac
 	for c in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state1/disable; do echo $v >"$c"; done
-	# ⚠ THE SCOREBOARD'S OWN ENVIRONMENT, verbatim from board_vendor.sh.
+	# THE SCOREBOARD'S OWN ENVIRONMENT, verbatim from board_vendor.sh.
 	# The first run of this phase started charsiu_run bare and priced the
 	# CPU: 4.60 tok/s on a model that decodes at 19.5 on the hardware, no
 	# cost-model line at all, and a verdict line that read as a pass.
-	# ⚠ -c 2048, NOT THE SCOREBOARD'S 512: P9 is the numbers 1 to 256, which
+	# -c 2048, NOT THE SCOREBOARD'S 512: P9 is the numbers 1 to 256, which
 	# Qwen3's tokenizer makes well over 512 tokens, and the third run of
 	# this phase died on "the prompt is longer than the context" -- which
 	# only became visible once the output was kept.
-	# ⚠ THE WHOLE OUTPUT IS KEPT. The second run of this phase printed
+	# THE WHOLE OUTPUT IS KEPT. The second run of this phase printed
 	# "no cost-model line" four times and nothing else, and the reason was
 	# invisible because only two grep results survived. A phase that
 	# loses the error is a board round spent on one bit.
@@ -1683,7 +1683,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	    timeout 600 "$BIN/charsiu_run" "$SM" -p "$P9" -n 48 -c 2048 -t 4 >"$af" 2>&1
 	rc=$?
 	gen=$(sed -n 's/.*| gen \([0-9]*\) tok in [0-9]* ms, \([0-9.]*\) tok\/s.*/\2 tok\/s/p' "$af")
-	# ⚠ THE NUMBER THAT ALWAYS PRINTS IS THE AVERAGE. "N calls, M tasks and X
+	# THE NUMBER THAT ALWAYS PRINTS IS THE AVERAGE. "N calls, M tasks and X
 	# MB on the busier core, A us a call" is busy_us / calls, a direct
 	# measurement, and it is what the arms are compared on: same workload,
 	# same calls, so a change in A is the wake latency. The three-term fit
@@ -1693,7 +1693,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
 	# exists and decides nothing.
 	avg=$(grep -o "on the busier core, [0-9]* us a call" "$af" | grep -o "[0-9]* us a call" | head -1)
 	cm=$(grep -o "us a call = [0-9.]* + [0-9.]* a task + [0-9.]* a MB" "$af" | head -1)
-	printf '  %-20s %-12s %-16s %s\n' "$arm" "$gen" "${avg:-⚠ NO NPU SUMMARY}" "${cm:-(fit declined)}"
+	printf '  %-20s %-12s %-16s %s\n' "$arm" "$gen" "${avg:-NO NPU SUMMARY}" "${cm:-(fit declined)}"
 	if [ -z "$avg" ]; then
 		bad "phase 21 arm '$arm': no NPU summary line, exit $rc -- the last lines of $af:"
 		tail -8 "$af" | sed 's/^/       /'
@@ -1705,12 +1705,12 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo "$GOV0" >"$c" 2>/dev/null; done
    wedged "phase 21" && break
    ok "the qos arm should match cpu-sleep OFF, and both beat deep idle by about a quarter"
-   printf '     ⚠ these arms are the wake latency ALONE; the qos hold is now the default.\n'
+   printf '     these arms are the wake latency ALONE; the qos hold is now the default.\n'
    printf '        The attach/detach per job is the patched kernel, a separate round.\n'
    ;;
 
 22) say "22. input reuse: which site breaks which model"
-   # ⚠⚠ REUSE WAS OFF FOR A DAY BECAUSE OF THIS. Phase 2 stopped two rounds
+   # REUSE WAS OFF FOR A DAY BECAUSE OF THIS. Phase 2 stopped two rounds
    # on it: 6 of 9 models with one key for two devices, then Phi-3.5 and
    # gemma4 with a key per device. The host cannot see either fault. This
    # phase turns it on for those models one SITE at a time (k after q, v
@@ -1733,7 +1733,7 @@ CHARSIU_NPU_MAXN=262144 CHARSIU_COEF_ELEMS=65536"
    done
    wedged "phase 22" && break
    ok "read the table: the first site that says DIFFERS on a model is the one to look at"
-   printf '     ⚠ Qwen3 is the control: it passed with all three on when the key was per device.\n'
+   printf '     Qwen3 is the control: it passed with all three on when the key was per device.\n'
    ;;
 esac
 done
@@ -1744,10 +1744,10 @@ echo "  ran:     ${RAN:- nothing}"
 echo
 if [ "$FAIL" = 0 ]; then
 	echo "  no failure in any phase that ran."
-	echo "  ⚠ A phase that was SKIPPED verified nothing. Read the skip list"
+	echo "  A phase that was SKIPPED verified nothing. Read the skip list"
 	echo "    above before calling this a pass."
 else
-	echo "  ⚠⚠ $FAIL FAILURE(S). The speed numbers, if any printed, are the"
+	echo "  $FAIL FAILURE(S). The speed numbers, if any printed, are the"
 	echo "     speed of something that is wrong."
 fi
 echo "  logs: $OUT/verify-*.txt"

@@ -15,7 +15,7 @@
  * each side reads, and that a length equal to the threshold is in and one
  * below it is out -- none of which needs hardware.
  *
- * ⚠ THIS TEST DOES NOT CLAIM 272 AND 448 ARE THE RIGHT NUMBERS. They are
+ * THIS TEST DOES NOT CLAIM 272 AND 448 ARE THE RIGHT NUMBERS. They are
  * board measurements and they can move; the test pins them so that moving
  * them is a deliberate edit of two lines here and not a silent drift, and it
  * pins the two override knobs so a sweep can still name either half.
@@ -43,14 +43,14 @@
  * refuses, and assigns it in the same breath as the calloc when it passes.
  * That is the property the comment names, and it is the one checked here.
  *
- * ⚠ n_ctx IS 0 IN EVERY CASE ON PURPOSE. Past the gate, attn_npu_get's next
+ * n_ctx IS 0 IN EVERY CASE ON PURPOSE. Past the gate, attn_npu_get's next
  * guard is `a->nk < 32`, and with no context that is the end of the walk --
  * no buffer objects, no device open, no stderr, on a host that has no NPU to
  * open. s->anpu has already been assigned by then, so the oracle is intact
  * and nothing downstream of the decision runs. A test of the gate must not
  * depend on what the hardware would have said after it.
  *
- * ⚠ ONE CASE PER PROCESS. Every knob below is read once into a function
+ * ONE CASE PER PROCESS. Every knob below is read once into a function
  * static and cached for the life of the process, so a second case in the same
  * process would read the first case's environment. Each case is therefore a
  * fork, and the parent never calls any of these functions itself -- a fork
@@ -87,7 +87,7 @@ struct arm {
 };
 
 /*
- * ⚠ THE GGUF LOADER DEFAULTS head_count_kv TO head_count -- llama_load reads
+ * THE GGUF LOADER DEFAULTS head_count_kv TO head_count -- llama_load reads
  * it as GETU("attention.head_count_kv", m->n_head_kv, m->n_head) -- so a file
  * that never states it is a no-GQA file and has to take the MHA threshold.
  * n_head_kv == 0 reaching attn_npu_min_for at all means the model was not
@@ -125,7 +125,7 @@ static const struct arm arms[] = {
 	{ "gqa, one token above 272, engages",
 	  NULL, NULL, NULL, 32, 8, 273, GQA_MIN, ENGAGE },
 	/*
-	 * ⚠ 352 AND 452 ARE THE TWO MEASURED LENGTHS, and they are the reason
+	 * 352 AND 452 ARE THE TWO MEASURED LENGTHS, and they are the reason
 	 * the two numbers are not one. r412 read both models at 352: the two
 	 * that share KV heads won there, the two that do not lost by 15.9%
 	 * and 11.2%. A single threshold cannot express that, and these two
@@ -150,7 +150,7 @@ static const struct arm arms[] = {
 
 	/* ---- no hint at all ---- */
 	/*
-	 * ⚠ 0 IS NOT A SHORT PROMPT, IT IS NO ANSWER. llama_prefill_hint is
+	 * 0 IS NOT A SHORT PROMPT, IT IS NO ANSWER. llama_prefill_hint is
 	 * what fills prompt_total, and a tool that never calls it leaves 0
 	 * behind. auto has to read that as "I was not told" and stay on the
 	 * CPU arm, not as "this prompt is zero tokens long", which would be
@@ -184,7 +184,7 @@ static const struct arm arms[] = {
 	{ "both knobs at once, each on its own model: no-GQA",
 	  "600", "64", NULL, 32, 32, 64, 64u, ENGAGE },
 	/*
-	 * ⚠ 0 HERE MEANS NO MINIMUM, NOT OFF. Whoever sets
+	 * 0 HERE MEANS NO MINIMUM, NOT OFF. Whoever sets
 	 * CHARSIU_ATTN_NPU_MIN=0 expecting the arm to stop gets it on at every
 	 * length that has a hint. CHARSIU_ATTN_NPU=0 is the off switch; these
 	 * two rows are the difference, and they are the reason the off switch
@@ -203,7 +203,7 @@ static const struct arm arms[] = {
 	{ "a negative CHARSIU_ATTN_NPU_MHA_MIN clamps to 0",
 	  NULL, "-5", NULL, 32, 32, 1, 0u, ENGAGE },
 	/*
-	 * ⚠ SET BUT EMPTY IS THE DEFAULT FOR THESE TWO, and it is NOT for the
+	 * SET BUT EMPTY IS THE DEFAULT FOR THESE TWO, and it is NOT for the
 	 * flag knobs next to them: charsiu_env_flag reads an empty value as 0,
 	 * these read it as "nothing said". `FOO= cmd` is therefore off for one
 	 * and default for the other, and this row is which.
@@ -218,7 +218,7 @@ static const struct arm arms[] = {
 	  NULL, NULL, "0", 32, 8, 852, GQA_MIN, REFUSE },
 	{ "CHARSIU_ATTN_NPU=0 refuses a no-GQA prompt past 448",
 	  NULL, NULL, "0", 32, 32, 852, MHA_MIN, REFUSE },
-	/* ⚠ =1 does not consult the hint at all, which is what makes it a
+	/* =1 does not consult the hint at all, which is what makes it a
 	 * usable control arm: it is on at every length, including no hint */
 	{ "CHARSIU_ATTN_NPU=1 engages below the shared threshold",
 	  NULL, NULL, "1", 32, 8, 1, GQA_MIN, ENGAGE },
@@ -229,7 +229,7 @@ static const struct arm arms[] = {
 	{ "CHARSIU_ATTN_NPU=auto engages at 272",
 	  NULL, NULL, "auto", 32, 8, 272, GQA_MIN, ENGAGE },
 	/*
-	 * ⛔ AND =2 IS NOT auto, WHICH THE COMMENT OVER attn_npu_want_for
+	 * AND =2 IS NOT auto, WHICH THE COMMENT OVER attn_npu_want_for
 	 * SAYS IT IS. That comment's last line reads "0 off, 1 on for every
 	 * layer, 2 decide per prompt on its length", and the code under it
 	 * collapses every value that is neither empty nor the word `auto` to
@@ -241,7 +241,7 @@ static const struct arm arms[] = {
 	 */
 	{ "CHARSIU_ATTN_NPU=2 is forced on, not auto",
 	  NULL, NULL, "2", 32, 32, 447, MHA_MIN, ENGAGE },
-	/* ⚠ and set-but-empty is auto here too, not off: `CHARSIU_ATTN_NPU=
+	/* and set-but-empty is auto here too, not off: `CHARSIU_ATTN_NPU=
 	 * charsiu_run` is the DEFAULT, where the same spelling on any
 	 * charsiu_env_flag knob in this file means 0 */
 	{ "CHARSIU_ATTN_NPU set empty is auto, and refuses below 448",
@@ -289,7 +289,7 @@ static int run_arm(const struct arm *a)
 	}
 
 	/*
-	 * ⚠ THE COMPOSED DECISION, THROUGH THE DOOR THE RUNTIME USES.
+	 * THE COMPOSED DECISION, THROUGH THE DOOR THE RUNTIME USES.
 	 * charsiu_run calls llama_prefill_hint and then the forward pass
 	 * reaches attn_npu_get; so does this. n_ctx stays 0, which stops the
 	 * walk at the guard immediately after the gate.
@@ -329,7 +329,7 @@ int main(void)
 		pid_t p;
 		int st = 0;
 
-		/* ⚠ FLUSH BEFORE THE FORK, or the child inherits whatever is
+		/* FLUSH BEFORE THE FORK, or the child inherits whatever is
 		 * still in the parent's buffer and prints it a second time */
 		fflush(stdout);
 		p = fork();
@@ -338,7 +338,7 @@ int main(void)
 			return 1;
 		}
 		if (!p) {
-			/* ⚠ AND FLUSH AFTER THE ARM, NOT BEFORE IT. _exit does
+			/* AND FLUSH AFTER THE ARM, NOT BEFORE IT. _exit does
 			 * not flush, so a diagnosis written by run_arm is lost
 			 * unless it is pushed out here -- which is a failing
 			 * test that says nothing about why. */
@@ -357,7 +357,7 @@ int main(void)
 	}
 
 	/*
-	 * ⚠ AND THE TWO NUMBERS THEMSELVES, once, in a process of their own.
+	 * AND THE TWO NUMBERS THEMSELVES, once, in a process of their own.
 	 * Every row above is a shape; this is the only place the shipped
 	 * values appear as values, so moving one is a one line edit here and
 	 * not a test that quietly keeps passing.

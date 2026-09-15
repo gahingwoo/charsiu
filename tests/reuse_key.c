@@ -97,7 +97,7 @@ int main(void)
 	expect(reuse_key_hit(&ks[0], bufA, 4, 3072, 0x80, 3u, 0), 1, "the same");
 
 	/*
-	 * ⚠⚠ THE AWQ SHAPE, and every field above says hit.
+	 * THE AWQ SHAPE, and every field above says hit.
 	 *
 	 * With CHARSIU_NPU_AWQ on, what a device's BO holds is X times THAT
 	 * TENSOR'S per-k factor. q, k and v share one normed buffer and have

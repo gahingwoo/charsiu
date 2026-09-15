@@ -47,7 +47,7 @@
 #define WT_BYTES   (8u << 20)   /* N=2048 K=2048 int8 is 4 MiB */
 #define IN_BYTES   (1u << 20)
 /*
- * ⚠ THE OUTPUT BO IS SIZED FROM THE ENVIRONMENT because round 348's timing
+ * THE OUTPUT BO IS SIZED FROM THE ENVIRONMENT because round 348's timing
  * measured this tool and not the hardware: run() memsets the whole output
  * buffer and cache-maintains it twice a submit, and at 4 MiB that is most of
  * the 1418 us it reported. int8 came out at 1.31 GB/s against a standing 9.38,
@@ -107,7 +107,7 @@ static unsigned run(struct ctx *c, int32_t *dst, unsigned words)
 		exit(1);
 	}
 	/*
-	 * ⚠ DID THE DATA ARRIVE LATE, OR WAS IT NEVER WRITTEN.
+	 * DID THE DATA ARRIVE LATE, OR WAS IT NEVER WRITTEN.
 	 *
 	 * Round 359: a solo process is clean three times out of three, but with
 	 * two running concurrently some output words come back ZERO that should
@@ -257,7 +257,7 @@ int main(int argc, char **argv)
 	job.mm.m = getenv("CHARSIU_M") ? (unsigned)atoi(getenv("CHARSIU_M")) : 32;
 	job.mm.k = getenv("CHARSIU_K") ? (unsigned)atoi(getenv("CHARSIU_K")) : 2048;
 	job.mm.n = getenv("CHARSIU_N") ? (unsigned)atoi(getenv("CHARSIU_N")) : 1024;
-	/* ⚠ the two lines that used to sit here reassigned k and n to 2048 and
+	/* the two lines that used to sit here reassigned k and n to 2048 and
 	 * 1024, so round 350's whole N sweep ran four times at the same shape
 	 * and printed four nearly equal times as if they were a slope. */
 	printf("M = %u K = %u N = %u\n", job.mm.m, job.mm.k, job.mm.n);
@@ -324,7 +324,7 @@ int main(int argc, char **argv)
 					(uint8_t)((nn * 2654435761u + kk * 40503u
 						   + (nn ^ kk)) & 0xf);
 		/*
-		 * ⚠ EXACTLY REPRESENTABLE IN fp16, in sixteenths. Round 350
+		 * EXACTLY REPRESENTABLE IN fp16, in sixteenths. Round 350
 		 * generated multiples of 0.05, which fp16 cannot hold, so the
 		 * hardware multiplied by the rounded value while the reference
 		 * multiplied by the float -- 256 of 1024 "failed" at 2.4e-04
@@ -441,7 +441,7 @@ int main(int argc, char **argv)
 
 			poke(&c, byte, high, v);
 			/*
-			 * ⚠ A ROW WHOSE LIVE COUNT IS NOT THE REFERENCE'S DID
+			 * A ROW WHOSE LIVE COUNT IS NOT THE REFERENCE'S DID
 			 * NOT COMPUTE. Round 342 printed three impossible
 			 * values -- v = 3, 9 and 10, two of them sharing a
 			 * delta to the digit -- because the job timed out and
@@ -538,7 +538,7 @@ int main(int argc, char **argv)
 	 *   activation (k,m)   = fp16 slot  8*M*(k/8) + 8*m + (k%8)
 	 *   output word (n,m)  = 4*(M*(n/4) + m) + (n%4)
 	 *
-	 * ⚠ The comparison is RELATIVE and the tolerance is one part in 1e-5,
+	 * The comparison is RELATIVE and the tolerance is one part in 1e-5,
 	 * because the board returns float32 and this sums in double. An exact
 	 * equality test here would fail on rounding and read as a wrong layout.
 	 */
@@ -610,7 +610,7 @@ int main(int argc, char **argv)
 			}
 		}
 		/*
-		 * ⚠ TWO TOLERANCES, because 1e-5 cried wolf in round 346: five
+		 * TWO TOLERANCES, because 1e-5 cried wolf in round 346: five
 		 * words failed it whose printed digits agreed with the
 		 * reference. The board returns float32 and the reference sums
 		 * 2048 terms in double, so a cancelling sum reaches 1e-5

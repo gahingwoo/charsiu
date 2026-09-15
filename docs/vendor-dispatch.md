@@ -21,7 +21,7 @@ weight bits        {16.0: 4940, 4.0: 3328, 0.0: 500, 8.0: 40}
 M (pixels a dispatch) {32: 1628, 64: 1248, 80: 776, 96: 736, 128: 680}
 ```
 
-⚠ **Both of those lines used to say something else, and both changes were bugs in
+**Both of those lines used to say something else, and both changes were bugs in
 the reader rather than in the model.** The stream count was 21532 with 12724 DPU
 only, because target `0x0401` was missing from the table and an unknown target ENDS
 a run, cutting every op into three. And the M histogram used to be headed by
@@ -120,7 +120,7 @@ only the machine parameters differ.
 
 ## The 4416 DPU-only streams, and why "six programs" was an artifact
 
-⚠⚠ **THE TABLE BELOW IS SUPERSEDED AND IS KEPT AS A RECORD OF THE BUG, NOT OF THE
+**THE TABLE BELOW IS SUPERSEDED AND IS KEPT AS A RECORD OF THE BUG, NOT OF THE
 MODEL.** Its counts sum to 12724, which is the pre-fix DPU-only total: it was built
 when target `0x0401` was missing from the reader's table, so every op was cut into a
 CNA fragment, a lost middle and a DPU fragment. The "six kinds" were the fragments,
@@ -175,7 +175,7 @@ output uncorrelated with the reference, on every datatype, and that it is a hard
 constraint rather than a stride bug. The RK3576 vendor dispatches heights of two and
 three as a matter of course.
 
-🏁 **Answered on the board, 2026-08-14, through the open driver and Mesa's own
+**Answered on the board, 2026-08-14, through the open driver and Mesa's own
 delegate.** Heights of one, two and three are exact on this silicon: a 512 to 1024
 projection came back 1024 of 1024 channels matching the CPU at M = 1, 2 and 3 --
 146 distinct values at M = 1 against the CPU's own 146, and 357 and 416 of the
@@ -235,7 +235,7 @@ values differ. Six are constant within fp16 and differ from int4:
 | `DPU 0x401c` | `1` | `0x60` x896, `0x80` x896, `1` x512 |
 | `DPU 0x4020` | `0` | `0x4f` x768, `0` x512, `0x1f` x512 |
 
-⚠ A sixth, `CNA 0x1110`, looked like a differing constant and is **not one**:
+A sixth, `CNA 0x1110`, looked like a differing constant and is **not one**:
 `job.c` emits `job->weight_addr` there, and an address in a static file is an
 unpatched placeholder. It is listed here only so the next reader does not count
 it again.
@@ -247,12 +247,12 @@ describes its window as **1 x 1**, with the count carried elsewhere -- which is
 consistent with the round 380 note's observation that the vendor writes M
 exactly into `0x1098`.
 
-⚠ An earlier reading of this called the four "the weight group count and its
+An earlier reading of this called the four "the weight group count and its
 minus one, collapsed because a 16 bit weight carries its own exponent". That is
 WRONG and the emitter says so: they are the window, not the weights. The story
 was invented to fit four numbers before anyone looked at what writes them.
 
-⚠ This is what round 380 hit from the other side: it copied fp16's `0x1094`,
+This is what round 380 hit from the other side: it copied fp16's `0x1094`,
 `0x1098` and `0x118c` onto an int4 op, the board said no, and the op the values
 came from could not be named at the time. It can now, and the round's
 conclusion stands.
@@ -285,14 +285,14 @@ and `charsiu_weight_ngroup()` is in the same position. Nothing in a static
 model file can settle it: the fp16 "weights" here are the runtime KV cache, and
 address registers in a static file read 0.
 
-⚠ And there is no shortcut on a desk. The 30 vendor `.rknn` in the driver
+And there is no shortcut on a desk. The 30 vendor `.rknn` in the driver
 repository contain no fp16-weight convolution, and rknn-toolkit2 is not
 installed on this host, so one cannot be compiled here either. The tile has to
 be walked on the board with sparse maps, the way int4's was.
 
 ## The tile was walked on the board, and the first answer was wrong
 
-⛔ **This section's headline -- `slot = n * k_eff + k`, plain dense, output channel
+**This section's headline -- `slot = n * k_eff + k`, plain dense, output channel
 major -- is REFUTED. See "Correction: the layout is GROUP, not dense" at the end of
 this file.** Every point behind it was taken at K=16 N=8, where the dense and grouped
 layouts are identical in all 128 cells, so the measurements were blind to the question
@@ -329,7 +329,7 @@ channels of eight, two consecutive `k` each -- and which ones changes from run
 to run with nothing else changed. The mapping is stable and correct in every
 run; the set of products is not. Channel 0 fires at `k = 0, 1` every time.
 
-⚠ That drift is not a reason to go back and try another layout. It looked like
+That drift is not a reason to go back and try another layout. It looked like
 one for an hour: the first slot sweep and an earlier `--map` run disagreed at
 the same shape, which read as "one of these instruments is lying". Both were
 telling the truth about different draws.
@@ -358,7 +358,7 @@ first  (sparse)  12/12
 TOTAL 48 points, 0 exceptions
 ```
 
-⛔ At K=16 N=8, `16n + k` is what BOTH candidate layouts give, so those 48 points
+At K=16 N=8, `16n + k` is what BOTH candidate layouts give, so those 48 points
 carry no layout information at all. See the correction below.
 
 Still open, and NOT a layout question: only 12 of 128 single-weight
@@ -390,6 +390,6 @@ what `charsiu_weight_ngroup()` and `charsiu_weight_kgroup()` already returned
 for fp16 by inheriting int8's numbers. **The inherited guess was correct and
 the measurement that contradicted it was taken where it could not see.**
 
-⚠ K=16 N=8 was chosen because it was small. It also wedges the NPU after two
+K=16 N=8 was chosen because it was small. It also wedges the NPU after two
 jobs. One bad choice of shape produced the wrong answer and the noise that hid
 it, and cost six wrong explanations of the noise.

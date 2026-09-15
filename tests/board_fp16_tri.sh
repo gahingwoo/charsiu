@@ -13,13 +13,13 @@
 #
 # charsiu_fp16_op.xtri0 is the caller saying so, and the pack memsets the tail.
 #
-# ⚠⚠ A CALLER THAT SETS IT AND IS WRONG GETS A SILENTLY WRONG ANSWER, which
+# A CALLER THAT SETS IT AND IS WRONG GETS A SILENTLY WRONG ANSWER, which
 # is the whole reason this script runs CHARSIU_FP16_TRI_CHECK=1 at the longest
 # length: that arm READS BACK every element it was told to skip and counts the
 # ones that are not zero. A pack that quietly zeroes live probabilities still
 # produces fluent text.
 #
-# ⛔⛔ THE KNOB THIS SCRIPT SWEEPS WAS REMOVED THE SAME DAY IT MEASURED IT, and
+# THE KNOB THIS SCRIPT SWEEPS WAS REMOVED THE SAME DAY IT MEASURED IT, and
 # this script now REFUSES rather than quietly measuring one arm twice.
 #
 # r400 section 2 priced CHARSIU_FP16_TRI at 8% of the pack and nothing outside
@@ -49,10 +49,10 @@ ERR=/tmp/fp16tri.$$
 
 [ -e /dev/accel/accel0 ] || { echo "no /dev/accel -- this needs the rocket arm"; exit 1; }
 [ -x "$RUN" ] || { echo "no $RUN"; exit 1; }
-# ⚠ A NULL ARM IS NOT A NULL RESULT. If the binary does not carry the knob,
+# A NULL ARM IS NOT A NULL RESULT. If the binary does not carry the knob,
 # both arms below are the default and the table would read 1.000 everywhere.
 if ! strings "$RUN" 2>/dev/null | grep -q '^CHARSIU_FP16_TRI$'; then
-	echo "⛔ $RUN has no CHARSIU_FP16_TRI: the knob was removed on 09-13"
+	echo "$RUN has no CHARSIU_FP16_TRI: the knob was removed on 09-13"
 	echo "   when the caller stopped zeroing the tail, which made the"
 	echo "   triangle load bearing rather than optional. This script only"
 	echo "   reproduces r400 section 2 against charsiu at 235635d."
@@ -137,7 +137,7 @@ b=$(env $E CHARSIU_FP16_TRI=1 "$RUN" "$M" -p "$LAST" -n 24 --ignore-eos -q -c 10
 if [ "$a" = "$b" ]; then
 	echo "   identical: $(printf '%s' "$a" | md5sum | cut -c1-12)"
 else
-	echo "   ⛔ DIFFER"
+	echo "   DIFFER"
 	echo "   convert $a"
 	echo "   memset  $b"
 fi
