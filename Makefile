@@ -378,6 +378,8 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 #
 	./tests/verify_selftest.sh
 	./tests/vattn_edges.sh $(BUILD)/vattn_bench
+	./tests/version_all.sh $(BUILD)
+	./tests/host_checks.sh
 #
 # THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the

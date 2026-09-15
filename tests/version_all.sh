@@ -28,6 +28,17 @@ tokenizer_roundtrip emit_dump"
 
 TMP="${TMPDIR:-/tmp}/version_all.$$"
 WAIT="${CHARSIU_VERSION_WAIT:-5}"
+# THE POLL IS A SECOND AND THE ANSWER TAKES FIVE MILLISECONDS, so every
+# binary that passes still costs a whole tick and the desk run took 28 s for
+# 28 processes that had all exited. A fractional sleep is not POSIX, so ask
+# this shell for one rather than assume it: the board's busybox may refuse,
+# and then this is exactly the loop it was. The BOUND stays in seconds either
+# way -- ticks per second is the only thing that moves.
+if sleep 0.05 2>/dev/null; then
+	TICK="0.05"; HZ=20
+else
+	TICK="1"; HZ=1
+fi
 trap 'rm -f "$TMP"' EXIT INT TERM
 
 ok=0; bad=0; missing=0
@@ -56,7 +67,7 @@ for b in $BINS; do
 	i=0
 	while kill -0 "$pid" 2>/dev/null; do
 		i=$((i + 1))
-		if [ "$i" -gt "$WAIT" ]; then
+		if [ "$i" -gt $((WAIT * HZ)) ]; then
 			kill "$pid" 2>/dev/null
 			sleep 1
 			kill -9 "$pid" 2>/dev/null
@@ -66,7 +77,7 @@ for b in $BINS; do
 			pid=""
 			break
 		fi
-		sleep 1
+		sleep "$TICK"
 	done
 	[ -n "$pid" ] || continue
 	wait "$pid" 2>/dev/null
