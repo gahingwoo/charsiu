@@ -334,7 +334,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -365,6 +365,19 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
 	./tests/arch_list.sh
+#
+# TWO MORE CHECKERS THAT NEEDED NEITHER A BOARD NOR A MODEL AND THAT NOTHING
+# RAN. verify_selftest.sh asks whether every phase of board_verify.sh can run
+# alone, and whether anything still pins the K slice width that the product
+# now chooses -- the second of those already shipped a wrong answer once, a
+# round reporting nine of nine models correct in a configuration that had
+# stopped being the one that ships. vattn_edges.sh puts the fused vision
+# attention against the exact one at the ragged shapes vision_cross never
+# reaches. Both were installed to the board and invoked by no target: 1.1 s
+# and 0.2 s. Watched failing, the second on a stub that reports 3.10e-02.
+#
+	./tests/verify_selftest.sh
+	./tests/vattn_edges.sh $(BUILD)/vattn_bench
 #
 # THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
 # specified "every perplexity must name a file whose md5 appears in the
