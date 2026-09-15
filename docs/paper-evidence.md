@@ -75,7 +75,12 @@ with every reading kept. The binary pins its calling thread to the fast cluster
   Gemma4 E2B       9.25      1.7%     9.23          2222     2193..2245    1219.25
 ```
 
-Decode is ahead on all four: +5.7%, +15.6%, +6.8%, +0.2%.
+Decode is ahead on three: +5.7%, +15.6%, +6.8%. **Gemma4 is LEVEL, not ahead**
+-- its +0.2% does not clear its own 1.7% spread, and their column has no
+spread at all to clear, so there is no margin there to report. This pack's own
+rule is that a lead smaller than the arm's dispersion is not a lead, and
+writing "ahead on all four" applies the rule to three of them.
+
 TTFT is behind on all four: 1.31x, 1.64x, 1.63x, 1.82x theirs.
 
 The prompt is where this runtime is still losing, and it is the half the vendor
