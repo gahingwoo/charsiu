@@ -412,24 +412,12 @@ other chip is a hypothesis here, not a conclusion.
 ## Prerequisite
 
 RK3576 support in `rocket` is not upstream yet. It is on the list as
-[PATCH v13](https://lore.kernel.org/all/20260915104328.45901-1-gahing@gahingwoo.com/),
-sent 2026-09-15 against next-20260914, with an Acked-by from Conor Dooley on
-both dt-bindings, a Reviewed-by from Abel Vesa on both pmdomain patches, and a
-Tested-by from Igor Paunovic on each of the three reset-race patches.
-
-**What used to stand here is withdrawn by the person who measured it.** This
-section said his RK3588 testing had reproduced, once in 102 induced resets, an
-inference that signalled success while its output buffer was never written, on
-the unpatched arm only. On 2026-09-12 he found the error in his own reports:
-his script kept every inference's scorer output per round and never aggregated
-it, so his summaries scored only the one inference after the forced
-autosuspend. Aggregated, that constant-0x80 buffer is in nearly every run, on
-every arm, on all three dates. It is not a differential signal. It is what a
-job cancelled by the reset looks like from userspace, whatever made it miss its
-deadline, and `drm_sched_start()` completing detached jobs with `-ECANCELED` is
-the mechanism. v13 exists to carry that correction into the commit messages.
-The case for the three patches is the source analysis, which is what he said it
-was; the protocol bounds and does not prove.
+[PATCH v14](https://lore.kernel.org/all/20260924102135.92217-1-gahing@gahingwoo.com/),
+sent 2026-09-24 against next-20260914. Ulf Hansson has offered to take the
+pmdomain patches; the series carries review tags from Krzysztof Kozlowski,
+Conor Dooley, Heiko Stuebner and Abel Vesa, and Igor Paunovic's Tested-by on
+the three reset patches. His RK3588 runs reached the race those patches close
+without finding a fault, and he says that does not show it closed.
 
 The driver and the Mesa work it comes from are in
 [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu), which is where
