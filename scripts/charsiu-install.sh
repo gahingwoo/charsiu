@@ -788,6 +788,23 @@ elif [ "$NPU_OK" = 1 ]; then
 	[ "$DOKERNEL" = only ] && { ui_msg "Nothing to do: the NPU already works."; exit 0; }
 elif [ "$DOKERNEL" = no ]; then
 	ui_warn "no NPU and --no-kernel was given; charsiu will fall back to the CPU"
+elif [ "$DOKERNEL" = ask ] && [ -f /etc/armbian-release ]; then
+	# ON ARMBIAN THE KERNEL IS ARMBIAN'S. Its edge kernel carries the NPU
+	# series for the boards whose pull requests are in, and replacing the
+	# distribution's kernel with ours is a step to take on purpose, not one
+	# to be offered on the way to installing a userspace program.
+	ui_warn "$ACCEL is missing: this Armbian kernel does not drive the NPU yet"
+	ui_info "Armbian's edge kernel carries the RK3576 NPU series once the board's
+  pull request is in (armbian/build#11162 ArmSoM CM5, #11163 Radxa ROCK 4D).
+  To replace this kernel with charsiu's own instead, run the installer with
+  --kernel. charsiu will run on the CPU until then."
+elif [ "$DOKERNEL" = ask ] && [ "${CTUI_ASSUME:-}" = yes ]; then
+	# --yes AND --auto ANSWER QUESTIONS; THEY DO NOT REPLACE A KERNEL. Swapping
+	# what the board boots is the one step here that can leave it not booting,
+	# and it was being taken unattended because --yes answered this dialog too.
+	ui_warn "$ACCEL is missing, so this kernel cannot drive the NPU"
+	ui_info "--yes does not replace a kernel; run the installer with --kernel to
+  fetch charsiu's. charsiu will run on the CPU until then."
 else
 	HAVE_DT=no
 	[ -d /proc/device-tree ] && grep -rlq 'rknn-core' /proc/device-tree 2>/dev/null && HAVE_DT=yes
