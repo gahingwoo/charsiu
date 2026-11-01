@@ -27,7 +27,7 @@ CFLAGS ?= -O2 -Wall -Wextra -Winfinite-recursion -std=c11 -Iinclude
 # names, and saying so is the whole point.
 #
 # := AND NOT =, or every compile line re-runs git.
-CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 2>/dev/null || cat $(CURDIR)/.charsiu-commit 2>/dev/null || echo unknown)
 #
 # override, NOT a plain +=. CFLAGS is `?=` above, and a value given on the
 # COMMAND LINE beats both -- make then ignores every `+=` to it, the define

@@ -214,9 +214,28 @@ Continue?" || { echo "  stopped."; exit 1; }
 		# needs neither git nor a key.
 		printf '  git is not installed; taking a tarball instead\n'
 		$_sudo mkdir -p "$DIR"
-		curl -fsSL "$CHARSIU_SRC_REPO/archive/refs/heads/$_BOOT_REF.tar.gz" \
+		# A TARBALL HAS NO .git, SO NOTHING IN IT KNOWS WHICH COMMIT IT IS.
+		# A fresh Armbian minimal has no git, every install there was
+		# stamped "unknown", and board_regress.sh compared two "unknown"
+		# arms as the same commit (2026-11-01, ROCK 4D). Ask GitHub which
+		# commit the branch is, fetch THAT commit, and write it down for
+		# the Makefile. If the question cannot be answered, fetch the
+		# branch as before and stay "unknown".
+		_sha=""
+		case "$CHARSIU_SRC_REPO" in
+		https://github.com/*)
+			_slug=${CHARSIU_SRC_REPO#https://github.com/}; _slug=${_slug%.git}
+			_sha=$(curl -fsSL -H 'Accept: application/vnd.github.sha' \
+				"https://api.github.com/repos/$_slug/commits/$_BOOT_REF" 2>/dev/null \
+				| grep -E '^[0-9a-f]{40}$' || true) ;;
+		esac
+		curl -fsSL "$CHARSIU_SRC_REPO/archive/${_sha:-refs/heads/$_BOOT_REF}.tar.gz" \
 		 | $_sudo tar -xz -C "$DIR" --strip-components=1 \
 			|| { echo "  download failed" >&2; exit 1; }
+		if [ -n "$_sha" ]; then
+			printf '%s\n' "$_sha" | cut -c1-12 | $_sudo tee "$DIR/.charsiu-commit" >/dev/null
+			printf '  commit %s\n' "$(cut -c1-12 "$DIR/.charsiu-commit")"
+		fi
 	fi
 	[ -f "$DIR/scripts/charsiu-install.sh" ] \
 		|| { echo "  $DIR does not look like charsiu" >&2; exit 1; }
@@ -940,6 +959,9 @@ as_root mkdir -p "$BIN" "$SBIN" "$ETC" "$MODELS"
 # AND A SOURCE THAT IS NOT A CHECKOUT SAYS SO. "unknown" in this file is
 # ugly on purpose; an empty file would read like a clean tree.
 _commit=$(git -C "$SRC" describe --always --dirty --abbrev=12 2>/dev/null || true)
+# A tarball install has no checkout, but the bootstrap wrote down which commit
+# it fetched. Same 12 characters git would print, so the two compare.
+[ -n "$_commit" ] || _commit=$(cat "$SRC/.charsiu-commit" 2>/dev/null || true)
 printf '%s\n' "${_commit:-unknown}" | as_root tee "$BIN/COMMIT" >/dev/null
 ui_info "commit ${_commit:-unknown (the source is not a git checkout)}"
 
