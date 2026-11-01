@@ -7,7 +7,6 @@ name: Build the arm64 .deb
 on:
   push:
     tags: ['v*']
-    branches: [deb-test]
   workflow_dispatch:
 
 permissions:

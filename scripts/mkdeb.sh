@@ -31,7 +31,11 @@ tag=$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null || true)
 if [ -n "$tag" ]; then
 	VER=${tag#v}
 else
-	VER="0.0~git$(date -u +%Y%m%d).$(printf '%s' "$commit" | tr -c '0-9a-z\n' '.')"
+	# The commit's own time, so two snapshots of one day still order, and the
+	# same commit gives the same version wherever it is packaged.
+	when=$(TZ=UTC git log -1 --date=format-local:%Y%m%d%H%M%S --format=%cd 2>/dev/null \
+		|| date -u +%Y%m%d%H%M%S)
+	VER="0.0~git$when.$(printf '%s' "$commit" | tr -c '0-9a-z\n' '.')"
 fi
 [ "$CHANNEL" = dev ] && VER="$VER+dev"
 
