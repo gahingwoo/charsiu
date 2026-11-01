@@ -1,0 +1,53 @@
+name: Build the arm64 .deb
+
+# A tag vX.Y.Z builds the package and attaches it to that release. Built in
+# debian:bookworm so the binaries ask for glibc 2.36 at most and run on
+# bookworm, trixie and Ubuntu noble alike; built on the runner's own Ubuntu
+# they would need 2.38 and not start on bookworm.
+on:
+  push:
+    tags: ['v*']
+    branches: [deb-test]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04-arm
+    container: debian:bookworm
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential git ca-certificates dpkg-dev binutils curl
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build the package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sh scripts/mkdeb.sh stable
+          dpkg-deb -I build/deb/charsiu_*_arm64.deb
+          dpkg-deb -c build/deb/charsiu_*_arm64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: charsiu-deb
+          path: build/deb/charsiu_*_arm64.deb
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: install-log
+          path: build/deb/install.log
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/deb/charsiu_*_arm64.deb
