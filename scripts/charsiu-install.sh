@@ -871,7 +871,14 @@ if [ "$DOBUILD" = 1 ]; then
 		BLOG="${TMPDIR:-/tmp}/charsiu-build.$$"
 		TARGETS="emit_dump emit_job charsiu_run charsiu_check charsiu_serve"
 		ntot=0; for t in $TARGETS; do ntot=$((ntot + 1)); done
-		( cd "$SRC" && make -j"$(nproc 2>/dev/null || echo 2)" all ) \
+		# THE DEV CHANNEL'S REGRESSION NEEDS charsiu_run_scalar, the exact
+		# arm it compares the vector kernels against, and `all` does not
+		# build it. Installed without it, board_regress.sh refused to run
+		# on a fresh dev install (2026-11-01, CM5-IO).
+		MTARGETS=all
+		[ "$CHANNEL" = dev ] && MTARGETS="all build/charsiu_run_scalar"
+		# shellcheck disable=SC2086
+		( cd "$SRC" && make -j"$(nproc 2>/dev/null || echo 2)" $MTARGETS ) \
 			> "$BLOG" 2>&1 &
 		_mpid=$!
 		{
@@ -967,7 +974,7 @@ RUNTIME_BINS="charsiu_run charsiu_check charsiu_serve \
 # six attention defaults chosen on a compute bound desktop are still the
 # defaults on a bandwidth bound board. Anything added to PROBE_SCRIPTS that
 # runs a binary has to add the binary here in the same edit.
-PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt npu_mixed_test out16_bound bench_gather"
+PROBE_BINS="bench_batch npu_gemm_test npu_slice_test npu_fp16_test npu_fence_scan charsiu_matmul vattn_bench acc_index_check fp16_plan charsiu_ppl charsiu_membw npu_qpack_test npu_prep_cost npu_job_cost charsiu_shapes npu_out_fmt npu_mixed_test out16_bound bench_gather charsiu_run_scalar"
 # EVERY BOARD SCRIPT, NOT JUST THE FIRST ONE WRITTEN. The paragraph further
 # down says a probe that lives only in the source tree under ~/.cache is a
 # board round that does not happen -- and then only prefill_control.sh was
@@ -993,7 +1000,7 @@ board_core_cost.sh board_fp16_pack.sh board_fp16_tri.sh board_fp16_read.sh
 board_w8a16.sh board_causal_n.sh board_kv_ladder.sh board_attn_pipe.sh board_spin.sh \
 board_attn_min.sh board_drift.sh board_clk.sh board_iommu.sh \
 board_min_mac.sh board_deal.sh board_regress.sh board_remount.sh \
-version_all.sh arch_list.sh"
+version_all.sh arch_list.sh arch_sanity.sh neon_control.sh"
 case "$CHANNEL" in
 dev) INSTALL_BINS="$RUNTIME_BINS $PROBE_BINS" ;;
 *)   INSTALL_BINS="$RUNTIME_BINS" ;;
