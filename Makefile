@@ -45,6 +45,18 @@ CHARSIU_BUILD := $(shell git -C $(CURDIR) describe --always --dirty --abbrev=12 
 # looks like it moved the code.
 override CFLAGS += -DCHARSIU_BUILD=\"$(CHARSIU_BUILD)\"
 BUILD  := build
+#
+# A STAMP THAT NOTHING DEPENDS ON GOES STALE. The define above changes with the
+# commit, but no binary depended on it, so a commit that touched only scripts
+# left every binary in build/ carrying the previous commit's name. An Armbian
+# board updated in place (2026-11-01) had charsiu_run saying dc9b80f beside a
+# freshly built charsiu_run_scalar saying 9efb532, and board_regress.sh rightly
+# refused to compare them. So keep the stamp in a file, and when it changes,
+# delete what build/ holds: those files are not this commit, and a rule cannot
+# simply depend on the stamp, because most recipes link $^ and would hand the
+# stamp file to the linker.
+STAMP := $(BUILD)/.stamp
+$(shell mkdir -p $(BUILD) && { [ "$$(cat $(STAMP) 2>/dev/null)" = '$(CHARSIU_BUILD)' ] || { find $(BUILD) -maxdepth 1 -type f -delete; printf '%s\n' '$(CHARSIU_BUILD)' > $(STAMP); }; })
 BRCROSS := $(HOME)/Desktop/linux-rk3576-npu/buildroot/br-out/host/bin/aarch64-buildroot-linux-gnu-
 CROSS  ?= $(if $(wildcard $(BRCROSS)gcc),$(BRCROSS),)
 
