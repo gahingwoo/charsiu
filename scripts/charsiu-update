@@ -22,6 +22,17 @@ done
 command -v ini_get >/dev/null 2>&1 \
 	|| { echo "$(basename "$0"): charsiu-lib.sh not found" >&2; exit 1; }
 
+# A PACKAGED INSTALL IS UPDATED BY THE PACKAGE MANAGER. This script rebuilds
+# from source and copies over /opt/charsiu and /usr/bin, which on a .deb
+# install would overwrite files dpkg owns and leave its records describing
+# files that are no longer there. Say so and stop.
+if command -v dpkg-query >/dev/null 2>&1 \
+   && dpkg-query -W -f='${Status}' charsiu 2>/dev/null | grep -q 'install ok installed'; then
+	echo "$(basename "$0"): charsiu was installed as a package; update it with" >&2
+	echo "  sudo apt update && sudo apt install --only-upgrade charsiu" >&2
+	exit 1
+fi
+
 # TWO CHANNELS, BECAUSE THIS TREE IS A LABORATORY AND A PRODUCT AT ONCE.
 #
 # `stable` is what somebody who wants to run a model should get: the runtime,
