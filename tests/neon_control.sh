@@ -95,6 +95,20 @@ case "$vb" in
 	exit 2
 	;;
 esac
+# "unknown" ON BOTH SIDES IS NOT A MATCH. It is two builds that cannot say
+# what they are, and on 2026-11-01 a tarball install on a ROCK 4D passed this
+# check with exactly that. Refuse rather than compare.
+case "$va$vb" in
+*unknown*|"")
+	echo "" >&2
+	echo "AN ARM CANNOT SAY WHICH COMMIT IT IS." >&2
+	echo "     neon   ${va:-empty}" >&2
+	echo "     scalar ${vb:-empty}" >&2
+	echo "   Build from a git checkout, or reinstall so the tarball's commit" >&2
+	echo "   is recorded, then run this again." >&2
+	echo "" >&2
+	exit 2 ;;
+esac
 if [ "$va" != "$vb" ]; then
 	echo "" >&2
 	echo "THE TWO ARMS ARE DIFFERENT COMMITS." >&2
