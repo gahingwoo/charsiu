@@ -53,8 +53,15 @@ set -eu
 # ---------------------------------------------------------------------------
 #
 # Read before the terminal check, which branches on it.
-_BOOT_DRY=0; _BOOT_NOTTY=0
+_BOOT_DRY=0; _BOOT_NOTTY=0; _BOOT_YES=0
 for _a in "$@"; do case "$_a" in --dry-run|-n) _BOOT_DRY=1 ;; esac; done
+# --yes AND --auto ARE CONSENT GIVEN UP FRONT, and the questions this stage
+# asks (fetch the source, install whiptail) come before the argument parsing
+# that would otherwise honour them. Read them here, or `--auto` stops at the
+# first prompt and waits for a keypress nobody is there to give.
+for _a in "$@"; do case "$_a" in --yes|-y|--auto) _BOOT_YES=1 ;; esac; done
+[ "${CTUI_ASSUME:-}" = yes ] && _BOOT_YES=1
+if [ "$_BOOT_YES" = 1 ]; then CTUI_ASSUME=yes; export CTUI_ASSUME; fi
 # THE CHANNEL HAS TO BE KNOWN BEFORE THE SOURCE IS FETCHED, because it
 # decides which ref to fetch. The full argument parsing happens much later, in
 # the tree this is about to download.
@@ -79,8 +86,8 @@ if [ ! -t 0 ]; then
 	# it returns ENXIO. Probe in a subshell, where a failure costs nothing.
 	if ( : < /dev/tty ) 2>/dev/null; then
 		exec < /dev/tty
-	elif [ "$_BOOT_DRY" = 1 ]; then
-		# A REHEARSAL NEEDS NO CONSENT. It writes nothing, so refusing to
+	elif [ "$_BOOT_DRY" = 1 ] || [ "$_BOOT_YES" = 1 ]; then
+		# A REHEARSAL NEEDS NO CONSENT, and --yes has already given it. It writes nothing, so refusing to
 		# run for want of a terminal would be refusing the one thing asked
 		# for, and piping this into a container is exactly how it gets
 		# rehearsed. Answer every question with yes and carry on.
@@ -90,6 +97,9 @@ if [ ! -t 0 ]; then
 		echo "charsiu-install: there is no terminal to ask questions on." >&2
 		echo "" >&2
 		echo "  curl -fsSL $CHARSIU_SELF_URL -o install.sh && sh install.sh" >&2
+		echo "" >&2
+		echo "  or answer yes to every question, with no terminal needed:" >&2
+		echo "  curl -fsSL $CHARSIU_SELF_URL | sh -s -- --yes" >&2
 		echo "" >&2
 		echo "  or rehearse it without one:" >&2
 		echo "  curl -fsSL $CHARSIU_SELF_URL | sh -s -- --dry-run" >&2
@@ -110,6 +120,10 @@ _boot_msg() {
 	else printf '\n%s\n' "$1"; fi
 }
 _boot_yesno() {
+	if [ "$_BOOT_YES" = 1 ]; then
+		printf '\n%s\n\n  [Y/n] yes (--yes)\n' "$1"
+		return 0
+	fi
 	if _boot_ui; then whiptail --title "charsiu setup" --yesno "$1" 16 72
 	else
 		printf '\n%s\n\n  [Y/n] ' "$1"
@@ -245,8 +259,8 @@ Answering no is fine. Everything still works, in text."
 
 This is the ONE thing this dry run would actually do. Without it
 there is no dialog to show you, and the rehearsal would be text."
-		if [ "$_BOOT_NOTTY" = 1 ]; then
-			printf '\n  no terminal, so whiptail is not installed and this runs in text\n'
+		if [ "$_BOOT_NOTTY" = 1 ] || [ "$_BOOT_YES" = 1 ]; then
+			printf '\n  no questions will be asked, so whiptail is not installed and this runs in text\n'
 			printf '  (%s, if you want the dialogs)\n' "$_pm"
 		elif _boot_yesno "$_why" ; then
 			_bs=""
