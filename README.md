@@ -197,13 +197,26 @@ have measured that.
 curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh | sh
 ```
 
-It fetches the source, checks whether the running kernel can drive the NPU, and
-offers a kernel if it cannot. RK3576 NPU support is not upstream yet, so no
-distribution kernel anywhere will bind this hardware. A kernel it installs becomes
-the default boot entry; on an extlinux board the one already on the card stays
-selectable five seconds into the boot, and on Armbian the previous kernel is kept
-as `/boot/Image.previous`. Then it builds charsiu, fetches a model charsiu can
-actually run, and asks it something so you can see it work.
+On Armbian, or any Debian or Ubuntu on arm64, the package is simpler:
+
+```
+sudo apt install ./charsiu_0.1.0_arm64.deb    # from the releases page
+charsiu pull
+```
+
+The installer fetches the source, checks whether the running kernel can drive
+the NPU, builds charsiu, fetches a model charsiu can actually run, and asks it
+something so you can see it work.
+
+charsiu uses the kernel the board already has. RK3576 NPU support is not in
+mainline yet; Armbian's edge kernel carries it for the boards whose pull
+requests are in (armbian/build#11162 ArmSoM CM5, #11163 Radxa ROCK 4D). On a
+kernel that cannot drive the NPU, the installer asks whether to fetch one of
+ours, except on Armbian, where it leaves the kernel alone. `--kernel` fetches
+ours anywhere; `--yes` never does. A kernel it installs becomes the default
+boot entry; on an extlinux board the one already on the card stays selectable
+five seconds into the boot, and on Armbian the previous kernel is kept as
+`/boot/Image.previous`.
 
 `sh install.sh --dry-run` prints every action as `would ...` and changes nothing.
 The read-only checks still run, which is the point: it shows what the installer
