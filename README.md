@@ -197,10 +197,17 @@ have measured that.
 curl -fsSL https://raw.githubusercontent.com/gahingwoo/charsiu/stable/scripts/charsiu-install.sh | sh
 ```
 
-On Armbian, or any Debian or Ubuntu on arm64, the package is simpler:
+On Armbian the package is in the Armbian repository (armbian/external):
 
 ```
-sudo apt install ./charsiu_0.1.0_arm64.deb    # from the releases page
+sudo apt install charsiu
+charsiu pull
+```
+
+On any other Debian or Ubuntu on arm64, take the `.deb` from the releases page:
+
+```
+sudo apt install ./charsiu_0.1.0_arm64.deb
 charsiu pull
 ```
 
@@ -209,8 +216,8 @@ the NPU, builds charsiu, fetches a model charsiu can actually run, and asks it
 something so you can see it work.
 
 charsiu uses the kernel the board already has. RK3576 NPU support is not in
-mainline yet; Armbian's edge kernel carries it for the boards whose pull
-requests are in (armbian/build#11162 ArmSoM CM5, #11163 Radxa ROCK 4D). On a
+mainline yet; Armbian's edge kernel carries it for the ArmSoM CM5 and the
+Radxa ROCK 4D (armbian/build#11162 and #11163, merged 2 November). On a
 kernel that cannot drive the NPU, the installer asks whether to fetch one of
 ours, except on Armbian, where it leaves the kernel alone. `--kernel` fetches
 ours anywhere; `--yes` never does. A kernel it installs becomes the default
