@@ -218,12 +218,16 @@ something so you can see it work.
 charsiu uses the kernel the board already has. RK3576 NPU support is not in
 mainline yet; Armbian's edge kernel carries it for the ArmSoM CM5 and the
 Radxa ROCK 4D (armbian/build#11162 and #11163, merged 2 November). On a
-kernel that cannot drive the NPU, the installer asks whether to fetch one of
-ours, except on Armbian, where it leaves the kernel alone. `--kernel` fetches
-ours anywhere; `--yes` never does. A kernel it installs becomes the default
-boot entry; on an extlinux board the one already on the card stays selectable
-five seconds into the boot, and on Armbian the previous kernel is kept as
-`/boot/Image.previous`.
+kernel that cannot drive the NPU, the installer asks whether to install
+Armbian's edge kernel, except on Armbian, where it leaves the kernel alone
+(update it with apt there). `--kernel` installs it anywhere; `--yes` never
+does. It takes `linux-image-edge-rockchip64` and `linux-dtb-edge-rockchip64`
+from beta.armbian.com, checks them against the repository index, unpacks them
+with `dpkg-deb -x` instead of installing them, and copies the Image, the
+board's dtb and the modules into place. It refuses if that dtb does not enable
+the NPU. A kernel it installs becomes the default boot entry; on an extlinux
+board the one already on the card stays selectable five seconds into the
+boot, and on Armbian the previous kernel is kept as `/boot/Image.previous`.
 
 `sh install.sh --dry-run` prints every action as `would ...` and changes nothing.
 The read-only checks still run, which is the point: it shows what the installer
@@ -432,12 +436,9 @@ other chip is a hypothesis here, not a conclusion.
 ## Prerequisite
 
 RK3576 support in `rocket` is not upstream yet. It is on the list as
-[PATCH v14](https://lore.kernel.org/all/20260924102135.92217-1-gahing@gahingwoo.com/),
-sent 2026-09-24 against next-20260914. Ulf Hansson has offered to take the
-pmdomain patches; the series carries review tags from Krzysztof Kozlowski,
-Conor Dooley, Heiko Stuebner and Abel Vesa, and Igor Paunovic's Tested-by on
-the three reset patches. His RK3588 runs reached the race those patches close
-without finding a fault, and he says that does not show it closed.
+[PATCH v16](https://lore.kernel.org/all/20261108065917.135194-1-gahing@gahingwoo.com/),
+sent 2026-11-08 against next-20261105. Armbian's edge kernel carries v14 of
+the same series, which is what the installer puts on a board without it.
 
 The driver and the Mesa work it comes from are in
 [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu), which is where
