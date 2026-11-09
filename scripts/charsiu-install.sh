@@ -823,7 +823,11 @@ not give you /dev/accel. Nothing was written."
 	# /lib/modules/<release> of the kernel being kept as the fallback would
 	# leave that fallback loading modules built for a different Image. On
 	# Armbian, where the two can share a name, apt is the way to update.
-	if [ -n "$KVER" ] && [ -e "$MODROOT/lib/modules/$KVER" ]; then
+	#
+	# A MODULE TREE, not the directory. linux-headers leaves
+	# /lib/modules/<release>/build behind after its kernel is gone, and a
+	# directory holding only that is nobody's modules.
+	if [ -n "$KVER" ] && [ -e "$MODROOT/lib/modules/$KVER/kernel" ]; then
 		ui_msg "$MODROOT/lib/modules/$KVER already exists: the kernel on this board has
 the same release name as the one fetched. Replacing its modules would
 break the kernel kept as the fallback. Nothing was written.
@@ -901,7 +905,10 @@ Armbian layout after all. Nothing was written."
 	as_root cp "$TMP/$DTBNAME" "$DTBDEST"
 	if [ -n "$MODDIR" ]; then
 		as_root mkdir -p "$MODROOT/lib/modules"
-		as_root cp -a "$MODDIR" "$MODROOT/lib/modules/$KVER"
+		# INTO the directory, which may already exist (see above): cp -a
+		# of a directory onto an existing one nests it a level down.
+		as_root mkdir -p "$MODROOT/lib/modules/$KVER"
+		as_root cp -a "$MODDIR/." "$MODROOT/lib/modules/$KVER/"
 		# MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD. The version
 		# is the package's, not `uname -r`: the running kernel is still
 		# the old one.
