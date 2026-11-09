@@ -28,7 +28,10 @@
 # from any tag. An earlier version of this script checked for a working NPU and
 # stopped when it did not find one. That was every machine on earth, so the
 # check was a dead end wearing a helpful expression. It now OFFERS A KERNEL:
-# CI builds linux-next plus the v9 series and publishes it, and this fetches it.
+# Armbian's edge kernel, which carries the series (armbian/build#11162 and
+# #11163) and is built and published by Armbian, not by us. This takes its two
+# .debs apart and installs the pieces; our own CI kernels are only for patches
+# under test (CHARSIU_KERNEL_TAG).
 #
 # AND IT KEEPS THE ONE ALREADY THERE. The new kernel becomes the default boot
 # entry and the previous one stays on the card as a second entry, because a
@@ -292,6 +295,9 @@ there is no dialog to show you, and the rehearsal would be text."
 fi
 
 REPO="${CHARSIU_REPO:-gahingwoo/linux-rk3576-npu}"
+# WHERE THE MODULE TREE GOES, for rehearsing the kernel step without
+# touching this system's /lib/modules. Empty is the real thing.
+MODROOT="${CHARSIU_MODROOT:-}"
 PREFIX="/"
 DRY=0
 DOKERNEL=ask
@@ -521,43 +527,118 @@ This board boots some other way (its own boot.scr, a distro kernel
 package, or U-Boot environment variables), and guessing at it would
 be worse than doing nothing.
 
-Install a kernel built from the series by hand instead:
-  https://github.com/$REPO  (rfc-send-v13/, kernel/base.config)"
+Install Armbian's edge kernel for rockchip64 by hand instead
+(linux-image-edge-rockchip64 and linux-dtb-edge-rockchip64 from
+beta.armbian.com), which carries the RK3576 NPU series."
 		return 1
 	fi
 
-	# A NAMED RELEASE, FOR A TEST KERNEL. CHARSIU_KERNEL_TAG=<tag> asks for
-	# that release instead of the latest one, which is how a pre-release --
-	# something `releases/latest` never returns -- gets installed on purpose
-	# and only on purpose. The board scripts use it to put a kernel with
-	# patches under test on the board; nobody else should see it.
-	if [ -n "${CHARSIU_KERNEL_TAG:-}" ]; then
-		ui_note "asking $REPO for the kernel tagged $CHARSIU_KERNEL_TAG..."
-		J=$(api "https://api.github.com/repos/$REPO/releases/tags/$CHARSIU_KERNEL_TAG" 2>/dev/null || true)
+	# WHICH DTB: THE ONE THIS BOARD BOOTS NOW, BY NAME. The fdt line in
+	# extlinux.conf, or fdtfile in armbianEnv.txt. Armbian's package has a
+	# dtb for every rockchip64 board, and a name taken from anywhere else
+	# could be a sibling board's.
+	if [ "$BOOTKIND" = extlinux ]; then
+		CURDTB=$(awk '/^[ \t]*(fdt|devicetree)[ \t]/{print $2; exit}' \
+			"$BOOTDIR/extlinux/extlinux.conf")
 	else
-		ui_note "asking $REPO for the latest kernel..."
-		J=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+		CURDTB=$(awk -F= '/^[ \t]*fdtfile[ \t]*=/{sub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' \
+			"$BOOTDIR/armbianEnv.txt")
 	fi
-	if [ -z "$J" ]; then
-		ui_msg "Could not reach the GitHub API.
+	CURDTB=$(basename "${CURDTB:-none}")
 
-Check the network (charsiu-doctor reports it), or build a kernel
-from rfc-send-v13/ by hand."
-		return 1
-	fi
-	URLS=$(echo "$J" | tr ',' '\n' | grep -o '"browser_download_url":[ ]*"[^"]*"' \
-		| sed 's/.*"\(https[^"]*\)"/\1/')
-	TAG=$(echo "$J" | tr ',' '\n' | grep -m1 -o '"tag_name":[ ]*"[^"]*"' \
-		| sed 's/.*"\([^"]*\)"$/\1/')
-	IMG=$(echo "$URLS" | grep -m1 '/Image$'   || true)
-	DTB=$(echo "$URLS" | grep -m1 '\.dtb$'    || true)
-	MODS=$(echo "$URLS" | grep -m1 'modules-.*\.tar\.gz$' || true)
-	SUMS=$(echo "$URLS" | grep -m1 'SHA256SUMS$' || true)
-	if [ -z "$IMG" ] || [ -z "$DTB" ]; then
-		ui_msg "The latest release of $REPO has no kernel in it.
+	# WHERE THE KERNEL COMES FROM. By default it is Armbian's. Its edge
+	# kernel for rockchip64 carries the RK3576 NPU series (armbian/build
+	# #11162 and #11163) and enables the NPU in the ROCK 4D and CM5-IO
+	# dtbs, so there is a prebuilt, maintained kernel to take instead of
+	# one we build in CI ourselves. The two .debs are taken apart with
+	# dpkg-deb, NOT installed with dpkg: their maintainer scripts expect
+	# Armbian's /boot (armbianEnv.txt, boot.scr) and would rewrite it.
+	#
+	# THE DEFAULT IS THE BETA REPOSITORY because that is where the kernel
+	# with the series is. apt.armbian.com still had 7.2.8 on 2026-11-09,
+	# built before the merge. CHARSIU_ARMBIAN_APT moves it once a release
+	# carries the series; CHARSIU_ARMBIAN_VERSION pins one build.
+	#
+	# CHARSIU_KERNEL_TAG=<tag> installs one of OUR releases instead, which
+	# is how a kernel with patches under test reaches a board; nobody else
+	# should see it. CHARSIU_KERNEL_SOURCE=github takes our latest release.
+	KSRC=armbian
+	[ -n "${CHARSIU_KERNEL_TAG:-}" ] && KSRC=github
+	[ "${CHARSIU_KERNEL_SOURCE:-}" = github ] && KSRC=github
+
+	if [ "$KSRC" = armbian ]; then
+		for t in dpkg-deb gzip sha256sum; do
+			command -v "$t" >/dev/null 2>&1 || {
+				ui_msg "Armbian's kernel comes as .deb packages, and taking them apart
+needs $t, which this system does not have. Nothing was changed."
+				return 1
+			}
+		done
+		APT="${CHARSIU_ARMBIAN_APT:-https://beta.armbian.com}"
+		SUITE="${CHARSIU_ARMBIAN_SUITE:-trixie}"
+		ui_note "reading the Armbian package index ($APT, $SUITE)..."
+		# one line per package build: name version filename sha256
+		IDX=$(api "$APT/dists/$SUITE/main/binary-arm64/Packages.gz" 2>/dev/null \
+			| gzip -dc 2>/dev/null | awk '
+			function out() { if (p == "linux-image-edge-rockchip64" || p == "linux-dtb-edge-rockchip64") print p, v, f, s; p = "" }
+			/^Package: /  { p = $2; v = f = s = "" }
+			/^Version: /  { v = $2 }
+			/^Filename: / { f = $2 }
+			/^SHA256: /   { s = $2 }
+			/^$/          { out() }
+			END           { out() }' || true)
+		if [ -z "$IDX" ]; then
+			ui_msg "Could not read the Armbian package index at
+  $APT/dists/$SUITE/main/binary-arm64/Packages.gz
+
+Check the network (charsiu-doctor reports it). Nothing was changed."
+			return 1
+		fi
+		# THE NEWEST BUILD THAT HAS BOTH HALVES. A kernel without its dtb
+		# package, or the other way round, is half a kernel.
+		VER="${CHARSIU_ARMBIAN_VERSION:-}"
+		[ -n "$VER" ] || VER=$(echo "$IDX" | awk '!seen[$1" "$2]++ {n[$2]++}
+			END { for (v in n) if (n[v] == 2) print v }' | sort -V | tail -1)
+		KIMG_F=$(echo "$IDX" | awk -v v="$VER" '$1 == "linux-image-edge-rockchip64" && $2 == v {print $3; exit}')
+		KIMG_S=$(echo "$IDX" | awk -v v="$VER" '$1 == "linux-image-edge-rockchip64" && $2 == v {print $4; exit}')
+		KDTB_F=$(echo "$IDX" | awk -v v="$VER" '$1 == "linux-dtb-edge-rockchip64" && $2 == v {print $3; exit}')
+		KDTB_S=$(echo "$IDX" | awk -v v="$VER" '$1 == "linux-dtb-edge-rockchip64" && $2 == v {print $4; exit}')
+		if [ -z "$VER" ] || [ -z "$KIMG_F" ] || [ -z "$KDTB_F" ] || [ -z "$KIMG_S" ] || [ -z "$KDTB_S" ]; then
+			ui_msg "The Armbian index has no edge rockchip64 kernel${VER:+ at version $VER}
+with both its image and dtb package. Nothing was changed."
+			return 1
+		fi
+		TAG="Armbian edge $VER"
+		DTBNAME="$CURDTB"
+	else
+		if [ -n "${CHARSIU_KERNEL_TAG:-}" ]; then
+			ui_note "asking $REPO for the kernel tagged $CHARSIU_KERNEL_TAG..."
+			J=$(api "https://api.github.com/repos/$REPO/releases/tags/$CHARSIU_KERNEL_TAG" 2>/dev/null || true)
+		else
+			ui_note "asking $REPO for the latest kernel..."
+			J=$(api "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || true)
+		fi
+		if [ -z "$J" ]; then
+			ui_msg "Could not reach the GitHub API.
+
+Check the network (charsiu-doctor reports it). Nothing was changed."
+			return 1
+		fi
+		URLS=$(echo "$J" | tr ',' '\n' | grep -o '"browser_download_url":[ ]*"[^"]*"' \
+			| sed 's/.*"\(https[^"]*\)"/\1/')
+		TAG=$(echo "$J" | tr ',' '\n' | grep -m1 -o '"tag_name":[ ]*"[^"]*"' \
+			| sed 's/.*"\([^"]*\)"$/\1/')
+		IMG=$(echo "$URLS" | grep -m1 '/Image$'   || true)
+		DTB=$(echo "$URLS" | grep -m1 '\.dtb$'    || true)
+		MODS=$(echo "$URLS" | grep -m1 'modules-.*\.tar\.gz$' || true)
+		SUMS=$(echo "$URLS" | grep -m1 'SHA256SUMS$' || true)
+		if [ -z "$IMG" ] || [ -z "$DTB" ]; then
+			ui_msg "The release of $REPO has no kernel in it.
 
 Nothing was changed."
-		return 1
+			return 1
+		fi
+		DTBNAME=$(basename "$DTB")
 	fi
 
 	if [ "$BOOTKIND" = extlinux ]; then
@@ -602,14 +683,23 @@ exactly as Armbian set them." || return 1
 	fi
 
 	if [ "$DRY" = 1 ]; then
-		for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
-			would "fetch $u"
-		done
-		would "verify SHA256SUMS before touching $BOOTDIR"
+		if [ "$KSRC" = armbian ]; then
+			would "fetch $APT/$KIMG_F"
+			would "fetch $APT/$KDTB_F"
+			would "verify both against the SHA256 in the index before touching $BOOTDIR"
+			would "dpkg-deb -x both into a temporary directory (no dpkg, no maintainer scripts)"
+			would "take the dtb named $CURDTB from it, and check that it enables the NPU"
+		else
+			for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
+				would "fetch $u"
+			done
+			would "verify SHA256SUMS before touching $BOOTDIR"
+		fi
 		would "cp $BOOTDIR/Image $BOOTDIR/Image.previous   (only if it does not exist)"
 		would "cp <new> $BOOTDIR/Image  and the dtb"
-		would "tar -C / -xzf modules-*.tar.gz"
+		would "copy the module tree into $MODROOT/lib/modules/<release> (never tar -C /)"
 		if [ "$BOOTKIND" = extlinux ]; then
+			would "build an initrd for the new release if the current entry boots with one"
 			would "rewrite $BOOTDIR/extlinux/extlinux.conf with two entries, default the new one"
 		else
 			would "leave $BOOTDIR/armbianEnv.txt alone; boot.scr picks up the new Image"
@@ -617,34 +707,158 @@ exactly as Armbian set them." || return 1
 		would "depmod -a for the installed module tree"
 		ui_msg "DRY RUN. The kernel step stops here.
 
-  release  $TAG
+  kernel   $TAG
+  dtb      $DTBNAME
   boot     $BOOTDIR
   append   carried over from the file already there"
 		return 0
 	fi
 	TMP=$(mktemp -d)
 	trap 'rm -rf "$TMP"' EXIT
-	for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
-		ui_note "fetching $(basename "$u")"
-		fetch "$u" "$TMP/$(basename "$u")" || { ui_msg "download failed: $u"; return 1; }
-	done
 
-	# Verify before touching /boot. A truncated Image that overwrites a
-	# working one is the exact failure this whole step is meant to avoid.
-	if [ -n "$SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
+	# EVERY SOURCE ENDS IN THE SAME FOUR THINGS: $TMP/Image, $TMP/$DTBNAME,
+	# MODDIR (the module tree for the release, or empty) and KVER.
+	MODDIR=""; KVER=""
+	if [ "$KSRC" = armbian ]; then
+		for f in "$KIMG_F" "$KDTB_F"; do
+			ui_note "fetching $(basename "$f")"
+			fetch "$APT/$f" "$TMP/$(basename "$f")" || { ui_msg "download failed: $APT/$f"; return 1; }
+		done
+		# Verify before touching /boot, against the index the names came from.
+		{ echo "$KIMG_S  $(basename "$KIMG_F")"; echo "$KDTB_S  $(basename "$KDTB_F")"; } > "$TMP/SHA256SUMS"
 		( cd "$TMP" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
-			|| { ui_msg "The download does not match SHA256SUMS. Nothing was written."; return 1; }
-		ui_ok "checksums match"
+			|| { ui_msg "The download does not match the Armbian index. Nothing was written."; return 1; }
+		ui_ok "checksums match the Armbian index"
+		dpkg-deb -x "$TMP/$(basename "$KIMG_F")" "$TMP/k" \
+			&& dpkg-deb -x "$TMP/$(basename "$KDTB_F")" "$TMP/d" \
+			|| { ui_msg "dpkg-deb could not unpack the Armbian packages. Nothing was written."; return 1; }
+		KIMG=$(ls "$TMP"/k/boot/vmlinuz-* 2>/dev/null | head -1)
+		KVER=${KIMG##*/vmlinuz-}
+		# A RAW arm64 Image, which is what booti and extlinux load: the
+		# header carries "ARMd" at offset 0x38. A compressed one would
+		# copy cleanly and then not boot.
+		if [ -z "$KIMG" ] || [ "$(dd if="$KIMG" bs=1 skip=56 count=4 2>/dev/null)" != ARMd ]; then
+			ui_msg "The Armbian package has no raw arm64 kernel Image in /boot.
+Nothing was written."
+			return 1
+		fi
+		cp "$KIMG" "$TMP/Image"
+		for m in "$TMP/k/lib/modules/$KVER" "$TMP/k/usr/lib/modules/$KVER"; do
+			[ -d "$m" ] && { MODDIR="$m"; break; }
+		done
+		[ -n "$MODDIR" ] || { ui_msg "The Armbian package has no modules for $KVER. Nothing was written."; return 1; }
+		# THE DTB BY THE NAME THE BOARD ALREADY BOOTS. Failing that (an
+		# extlinux entry with fdtdir, or no fdt line at all), the one dtb
+		# whose compatible carries this board's first compatible string,
+		# and only if exactly one does.
+		DPATH=""
+		[ "$CURDTB" != none ] && DPATH=$(find "$TMP/d" -name "$CURDTB" -type f 2>/dev/null | head -1)
+		if [ -z "$DPATH" ] && [ -r /proc/device-tree/compatible ]; then
+			BC=$(tr '\0' '\n' < /proc/device-tree/compatible | head -1)
+			if [ -n "$BC" ]; then
+				CANDS=$(find "$TMP/d" -name '*.dtb' -type f -exec grep -l -a -F -- "$BC" {} + 2>/dev/null || true)
+				[ "$(echo "$CANDS" | grep -c .)" = 1 ] && DPATH="$CANDS"
+			fi
+		fi
+		if [ -z "$DPATH" ]; then
+			ui_msg "Armbian's kernel has no dtb for this board (looked for $CURDTB,
+then for this board's compatible string). Nothing was written."
+			return 1
+		fi
+		DTBNAME=$(basename "$DPATH")
+		# THE DTB HAS TO ENABLE THE NPU, not merely describe it: rk3576.dtsi
+		# has the nodes disabled and each board turns them on. Armbian
+		# carries that for the boards whose pull requests are in, and a
+		# kernel for any other board would install cleanly and still have no
+		# /dev/accel. With no dtc to read it, say so and go on.
+		if command -v dtc >/dev/null 2>&1; then
+			NOK=$(dtc -I dtb -O dts "$DPATH" 2>/dev/null \
+				| awk '/rknn-core/{c=1} c && /status/{if ($0 ~ /okay/) n++; c=0} END{print n+0}')
+			if [ "$NOK" = 0 ]; then
+				ui_msg "Armbian's $DTBNAME does not enable the NPU on this board
+(the board's support has not been merged there). Installing it would
+not give you /dev/accel. Nothing was written."
+				return 1
+			fi
+			ui_ok "$DTBNAME enables $NOK NPU core(s)"
+		else
+			ui_warn "no dtc here, so whether $DTBNAME enables the NPU was not checked"
+		fi
+		cp "$DPATH" "$TMP/$DTBNAME"
 	else
-		ui_warn "no SHA256SUMS to check against"
+		for u in "$IMG" "$DTB" ${MODS:+"$MODS"} ${SUMS:+"$SUMS"}; do
+			ui_note "fetching $(basename "$u")"
+			fetch "$u" "$TMP/$(basename "$u")" || { ui_msg "download failed: $u"; return 1; }
+		done
+		# Verify before touching /boot. A truncated Image that overwrites a
+		# working one is the exact failure this whole step is meant to avoid.
+		if [ -n "$SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
+			( cd "$TMP" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
+				|| { ui_msg "The download does not match SHA256SUMS. Nothing was written."; return 1; }
+			ui_ok "checksums match"
+		else
+			ui_warn "no SHA256SUMS to check against"
+		fi
+		if [ -n "$MODS" ]; then
+			# NEVER `tar -C /`. Armbian is merged-usr: /lib is a SYMLINK to
+			# usr/lib, and GNU tar, extracting a `lib/` directory member over
+			# it, deletes the symlink and makes a real directory. Every
+			# dynamically linked program then fails to exec -- the loader is
+			# reached as /lib/ld-linux-aarch64.so.1 -- init included, and the
+			# next boot panics in run-init. That is what happened on 2026-09-02
+			# with a modules tarball rooted at lib/. Extract aside, find the
+			# release directory wherever the tarball put it, and copy it
+			# THROUGH the existing /lib/modules path, whatever /lib is.
+			mkdir -p "$TMP/mods"
+			tar -C "$TMP/mods" -xzf "$TMP/$(basename "$MODS")"
+			TAGREL=$(strings "$TMP/Image" 2>/dev/null | sed -n 's/^Linux version \([^ ]*\).*/\1/p' | head -1)
+			MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/$TAGREL" 2>/dev/null | head -1)
+			[ -n "$MODDIR" ] || MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/*" 2>/dev/null | head -1)
+			[ -n "$MODDIR" ] && KVER=$(basename "$MODDIR")
+			[ -n "$MODDIR" ] || ui_msg "The modules tarball has no modules/<release> directory in it. Image and dtb will be installed; modules will not."
+		fi
 	fi
 
-	DTBNAME=$(basename "$DTB")
+	# A RELEASE THAT IS ALREADY HERE IS NOT OURS TO OVERWRITE. Copying over
+	# /lib/modules/<release> of the kernel being kept as the fallback would
+	# leave that fallback loading modules built for a different Image. On
+	# Armbian, where the two can share a name, apt is the way to update.
+	#
+	# A MODULE TREE, not the directory. linux-headers leaves
+	# /lib/modules/<release>/build behind after its kernel is gone, and a
+	# directory holding only that is nobody's modules.
+	if [ -n "$KVER" ] && [ -e "$MODROOT/lib/modules/$KVER/kernel" ]; then
+		ui_msg "$MODROOT/lib/modules/$KVER already exists: the kernel on this board has
+the same release name as the one fetched. Replacing its modules would
+break the kernel kept as the fallback. Nothing was written.
+
+On Armbian, update the kernel with apt instead."
+		return 1
+	fi
+
 	if [ "$BOOTKIND" = extlinux ]; then
 		DTBDEST="$BOOTDIR/$DTBNAME"
 		APPEND=$(awk '/^[ \t]*append /{sub(/^[ \t]*append[ \t]*/,""); print; exit}' \
 			"$BOOTDIR/extlinux/extlinux.conf")
 		[ -n "$APPEND" ] || { ui_msg "Could not read the current kernel command line. Nothing was written."; return 1; }
+		# PATHS AS THE CURRENT ENTRY SPELLS THEM. extlinux reads them from
+		# the root of the partition it is on: /Image when /boot is its own
+		# partition, /boot/Image when it is a directory on the root fs.
+		OLDFDT=$(awk '/^[ \t]*(fdt|devicetree)[ \t]/{print $2; exit}' "$BOOTDIR/extlinux/extlinux.conf")
+		OLDK=$(awk '/^[ \t]*(kernel|linux)[ \t]/{print $2; exit}' "$BOOTDIR/extlinux/extlinux.conf")
+		case "$OLDK" in /boot/*) PFX=/boot ;; *) PFX="" ;; esac
+		# THE INITRD THE CURRENT ENTRY BOOTS WITH. root=UUID= needs one to
+		# be resolved at all, so a new entry without it would not find its
+		# root. Build one for the new release with the system's own tool.
+		OLDINITRD=$(awk '/^[ \t]*initrd[ \t]/{print $2; exit}' "$BOOTDIR/extlinux/extlinux.conf")
+		NEWINITRD=""
+		if [ -n "$OLDINITRD" ] && { [ -z "$KVER" ] || ! command -v mkinitramfs >/dev/null 2>&1; }; then
+			ui_msg "The current boot entry uses an initrd ($OLDINITRD), and this
+system cannot build one for the new kernel (no mkinitramfs, or no
+module tree to build it from).
+Nothing was written."
+			return 1
+		fi
 	else
 		# WRITE THE DTB WHERE fdtfile ALREADY POINTS, and do not edit
 		# armbianEnv.txt. boot.scr loads dtb/${fdtfile}; putting ours at a
@@ -685,38 +899,35 @@ Armbian layout after all. Nothing was written."
 	# REMOVE BEFORE COPYING. Writing through a symlink would overwrite
 	# whatever it points at, which on Armbian is the distro's own
 	# vmlinuz-<version> and is not ours to replace.
-	TAGREL=$(strings "$TMP/Image" 2>/dev/null | sed -n 's/^Linux version \([^ ]*\).*/\1/p' | head -1)
 	as_root rm -f "$BOOTDIR/Image"
 	as_root cp "$TMP/Image" "$BOOTDIR/Image"
 	as_root rm -f "$DTBDEST"
 	as_root cp "$TMP/$DTBNAME" "$DTBDEST"
-	if [ -n "$MODS" ]; then
-		# NEVER `tar -C /`. Armbian is merged-usr: /lib is a SYMLINK to
-		# usr/lib, and GNU tar, extracting a `lib/` directory member over
-		# it, deletes the symlink and makes a real directory. Every
-		# dynamically linked program then fails to exec -- the loader is
-		# reached as /lib/ld-linux-aarch64.so.1 -- init included, and the
-		# next boot panics in run-init. That is what happened on 2026-09-02
-		# with a modules tarball rooted at lib/. Extract aside, find the
-		# release directory wherever the tarball put it, and copy it
-		# THROUGH the existing /lib/modules path, whatever /lib is.
-		as_root rm -rf "$TMP/mods" && as_root mkdir -p "$TMP/mods"
-		as_root tar -C "$TMP/mods" -xzf "$TMP/$(basename "$MODS")"
-		MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/$TAGREL" 2>/dev/null | head -1)
-		[ -n "$MODDIR" ] || MODDIR=$(find "$TMP/mods" -maxdepth 4 -type d -path "*modules/*" 2>/dev/null | head -1)
-		if [ -z "$MODDIR" ]; then
-			ui_msg "The modules tarball has no modules/<release> directory in it. Image and dtb are installed; modules were not."
+	if [ -n "$MODDIR" ]; then
+		as_root mkdir -p "$MODROOT/lib/modules"
+		# INTO the directory, which may already exist (see above): cp -a
+		# of a directory onto an existing one nests it a level down.
+		as_root mkdir -p "$MODROOT/lib/modules/$KVER"
+		as_root cp -a "$MODDIR/." "$MODROOT/lib/modules/$KVER/"
+		# MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD. The version
+		# is the package's, not `uname -r`: the running kernel is still
+		# the old one.
+		if [ -n "$MODROOT" ]; then
+			as_root depmod -b "$MODROOT" -a "$KVER" 2>/dev/null || true
 		else
-			as_root mkdir -p /lib/modules
-			as_root cp -a "$MODDIR" "/lib/modules/$(basename "$MODDIR")"
+			as_root depmod -a "$KVER" 2>/dev/null || true
 		fi
-		# MODULES WITHOUT depmod ARE MODULES NOBODY CAN LOAD, and neither
-		# layout was running it. The version is whatever the tarball says,
-		# not `uname -r`: the running kernel is still the old one.
-		KVER=$(tar tzf "$TMP/$(basename "$MODS")" \
-			| awk -F/ '/^lib\/modules\//{print $3; exit}')
-		[ -n "$KVER" ] && as_root depmod -a "$KVER" 2>/dev/null || true
-		ui_ok "modules installed${KVER:+ for $KVER}"
+		ui_ok "modules installed for $KVER"
+	fi
+	if [ "$BOOTKIND" = extlinux ] && [ -n "$OLDINITRD" ] && [ -n "$MODROOT" ]; then
+		# a rehearsal: mkinitramfs reads /lib/modules, which is not $MODROOT
+		ui_warn "CHARSIU_MODROOT is set, so no initrd was built"
+	elif [ "$BOOTKIND" = extlinux ] && [ -n "$OLDINITRD" ]; then
+		NEWINITRD="initrd.img-$KVER"
+		as_root mkinitramfs -o "$BOOTDIR/$NEWINITRD" "$KVER" \
+			|| { ui_msg "mkinitramfs failed for $KVER. The Image is in place but
+extlinux.conf was NOT changed, so the board still boots the old kernel."; return 1; }
+		ui_ok "initrd built for $KVER"
 	fi
 
 	if [ "$BOOTKIND" = extlinux ]; then
@@ -731,19 +942,25 @@ Armbian layout after all. Nothing was written."
 			echo ""
 			echo "label charsiu"
 			echo "    menu label charsiu NPU kernel ($TAG)"
-			echo "    kernel /Image"
-			echo "    fdt /$DTBNAME"
+			echo "    kernel $PFX/Image"
+			echo "    fdt $PFX/$DTBNAME"
+			[ -n "$NEWINITRD" ] && echo "    initrd $PFX/$NEWINITRD"
 			echo "    append $APPEND"
 			if [ -f "$BOOTDIR/Image.previous" ]; then
 				echo ""
 				echo "label previous"
 				echo "    menu label the kernel that was here before"
-				echo "    kernel /Image.previous"
+				echo "    kernel $PFX/Image.previous"
 				if [ -f "$BOOTDIR/$DTBNAME.previous" ]; then
-					echo "    fdt /$DTBNAME.previous"
+					echo "    fdt $PFX/$DTBNAME.previous"
+				elif [ -n "$OLDFDT" ]; then
+					# the dtb it booted with, wherever that was
+					echo "    fdt $OLDFDT"
 				else
-					echo "    fdt /$DTBNAME"
+					echo "    fdt $PFX/$DTBNAME"
 				fi
+				# the initrd it booted with, which is still there
+				[ -n "$OLDINITRD" ] && echo "    initrd $OLDINITRD"
 				echo "    append $APPEND"
 			fi
 		} > "$CONF"
@@ -796,15 +1013,15 @@ elif [ "$DOKERNEL" = ask ] && [ -f /etc/armbian-release ]; then
 	ui_warn "$ACCEL is missing: this Armbian kernel does not drive the NPU yet"
 	ui_info "Armbian's edge kernel carries the RK3576 NPU series once the board's
   pull request is in (armbian/build#11162 ArmSoM CM5, #11163 Radxa ROCK 4D).
-  To replace this kernel with charsiu's own instead, run the installer with
-  --kernel. charsiu will run on the CPU until then."
+  Update with apt, or run the installer with --kernel to take the newest
+  edge kernel from beta.armbian.com. charsiu will run on the CPU until then."
 elif [ "$DOKERNEL" = ask ] && [ "${CTUI_ASSUME:-}" = yes ]; then
 	# --yes AND --auto ANSWER QUESTIONS; THEY DO NOT REPLACE A KERNEL. Swapping
 	# what the board boots is the one step here that can leave it not booting,
 	# and it was being taken unattended because --yes answered this dialog too.
 	ui_warn "$ACCEL is missing, so this kernel cannot drive the NPU"
 	ui_info "--yes does not replace a kernel; run the installer with --kernel to
-  fetch charsiu's. charsiu will run on the CPU until then."
+  fetch Armbian's edge kernel. charsiu will run on the CPU until then."
 else
 	HAVE_DT=no
 	[ -d /proc/device-tree ] && grep -rlq 'rknn-core' /proc/device-tree 2>/dev/null && HAVE_DT=yes
@@ -819,11 +1036,11 @@ dtb does not describe the NPU at all."
 
 $WHY
 
-RK3576 NPU support is not upstream yet: the patches are ours and are
-still under review on the kernel lists. There is no distribution
-kernel anywhere that will bind this hardware.
+RK3576 NPU support is not upstream yet: the patches are still under
+review on the kernel lists. Armbian's edge kernel carries them, for
+the boards whose support is merged there (ROCK 4D, ArmSoM CM5-IO).
 
-Fetch a prebuilt one from $REPO?
+Fetch Armbian's edge kernel and install it here?
 The kernel now on this board is kept either way; whether it stays
 SELECTABLE at boot depends on how this board boots, and the next
 screen says which it is." \
