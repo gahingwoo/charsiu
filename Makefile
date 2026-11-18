@@ -302,6 +302,11 @@ $(BUILD)/bench_batch: tools/bench_batch.c $(LLM) | $(BUILD)
 $(BUILD)/npu_gemm_test: tools/npu_gemm_test.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
+# The RK3588 emitter and its exactness test. Only the device shim is shared
+# with the RK3576 path; job.c's register stream is not RK3588's.
+$(BUILD)/rk3588_gemm_test: tools/rk3588_gemm_test.c src/job_rk3588.c src/device.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 # NO $(LLM). This one links nothing: it is the two arms of one loop lifted
 # out of npudev.c so a rewrite of them can be proved identical without a
 # model, a device, or a board that has to boot first.

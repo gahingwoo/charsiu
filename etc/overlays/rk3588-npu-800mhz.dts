@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * RK3588 NPU at 800 MHz, rail unchanged.
+ *
+ * DO NOT INSTALL THIS. The one board it has been tried on, a ROCK 5T on
+ * Armbian (kernel 6.18.63-current-rockchip64), did not come back from the
+ * reboot that applied it (2026-11-18): no ping and no ssh for more than ten
+ * minutes. Without a serial console it is NOT KNOWN whether this overlay
+ * stopped the boot or the reboot hung for some other reason, so this is kept
+ * as the record of what was tried, not as something that works. The next
+ * attempt goes in with a serial console attached and a lower rung first.
+ *
+ * The mainline RK3588 device tree pins every rknn core at 200 MHz through
+ * assigned-clock-rates and carries no NPU OPP table, so nothing ever raises
+ * it: rocket has no devfreq. vdd_npu_s0 sits at 800 mV. Measured on a ROCK 5T
+ * (2026-11-18) with tools/rk3588_gemm_test --tiled: about 2 GB/s of weights,
+ * which is the clock and not the DRAM.
+ *
+ * ONE RUNG, AND NO VOLTAGE CHANGE. 800 MHz is asked for at the rail the board
+ * already runs. This is from memory of Rockchip's own RK3588 NPU OPP table,
+ * which wants less than 800 mV at this frequency, and NOT from a measurement
+ * on this silicon. Whether the clock took is read back from
+ * /sys/kernel/debug/clk/scmi_clk_npu/clk_rate after boot, and whether it
+ * helped is the same tiled run timed again; a rate that reads 800 MHz
+ * without the time moving has not been shown to be applied.
+ *
+ * Install on Armbian:   armbian-add-overlay rk3588-npu-800mhz.dts
+ * Remove:               delete it from user_overlays= in /boot/armbianEnv.txt
+ */
+/dts-v1/;
+/plugin/;
+
+&rknn_core_0 {
+	assigned-clock-rates = <800000000>;
+};
+
+&rknn_core_1 {
+	assigned-clock-rates = <800000000>;
+};
+
+&rknn_core_2 {
+	assigned-clock-rates = <800000000>;
+};
