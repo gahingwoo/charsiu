@@ -1322,7 +1322,29 @@ struct llama_spec {
 	int n_hist, cap_hist;
 	float *logits_all;      /* (k + 2) rows of n_vocab */
 	unsigned long passes, plain, drafted, accepted, committed;
+	/*
+	 * THE COST POLICY (auto = 1). Whether to speculate, and how many of
+	 * the drafts to send, is decided a pass at a time from what this run
+	 * has MEASURED: the cost of a plain step, the cost of a pass at each
+	 * width, and how often a draft at each position is right. The note
+	 * over spec_policy in llama.c has the rule and why it cannot make
+	 * decode slower than plain by more than a bounded amount.
+	 */
+	int autok;              /* 1: the policy decides; 0: always k (forced) */
+	double vscale;          /* CHARSIU_SPEC_VERIFY_SCALE, a desk test knob */
+	double t_plain;         /* ms, running mean of a plain step */
+	int n_tplain;           /* samples seen, the first (cold) discarded */
+	double t_ver[3];        /* ms, a pass at width 2, 4, 6 */
+	int n_tver[3];
+	double reach[5], hit[5];/* decayed counts: draft i tested, and right */
+	int32_t sh[5];          /* drafts not sent, checked against greedy */
+	int sh_n, sh_i;
+	int backoff, backoff_left;
+	double ledger;          /* ms saved by speculating since the last stop */
+	unsigned long n_nodraft, n_gate, n_hold, n_stops, n_probe;
+	double ms_spec, ms_plain;
 };
+/* k < 0 is the policy with up to -k drafts; k > 0 is forced k */
 int  llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 		     int n_ctx);
 void llama_spec_free(struct llama_spec *sp);

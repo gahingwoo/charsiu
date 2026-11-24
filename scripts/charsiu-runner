@@ -306,7 +306,9 @@ if [ "$BENCH" = 1 ]; then
 	# 64 tokens is what every board round measures, so the number here is
 	# comparable with the logs rather than being a new metric nobody can
 	# check. --ignore-eos so a short answer does not shorten the sample.
-	out=$( { env $E "$RUN" "$MODEL" -p "The capital of France is" -n 64 \
+	# THE PLAIN LOOP, BY NAME, for the same reason: charsiu_run speculates
+	# by default now and the logs this is compared with did not.
+	out=$( { env CHARSIU_SPEC="${CHARSIU_SPEC-0}" $E "$RUN" "$MODEL" -p "The capital of France is" -n 64 \
 		--ignore-eos -q -c "$CTX" -t "$THREADS" 2>&1 1>&3 | stage_filter >&2; } 3>&1 )
 	echo "$out" | grep -oE 'gen 64 tok in [0-9]+ ms, [0-9.]+ tok/s' \
 		| sed 's/^/  /' || echo "  (no rate reported)"
