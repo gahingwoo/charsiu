@@ -200,6 +200,25 @@ struct npu_entry {
 	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
 	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
 	/*
+	 * THE BATCHED GATHER HAS TO WAIT FOR THE LAST DEVICE, set at staging.
+	 *
+	 * batch_read_device is called a device at a time, device 0 first, and
+	 * sums each device's slots in index order. That is ascending K for one
+	 * n range only if the range's slices are dealt to non-decreasing
+	 * devices. Where they are not -- K = 3072 dealt k0@d0 k1@d1 k2@d0 --
+	 * the batched sum is (p0 + p2) + p1 where the m = 1 path computes
+	 * (p0 + p1) + p2. Measured on the CM5, 2026-11-25, tools/npu_rowpure:
+	 * blk.13.ffn_down of Qwen3-0.6B was the ONE tensor where batched !=
+	 * m = 1, by up to 9.5e-07, and re-summing the hardware's own partials
+	 * in m = 1 order gave m = 1 exactly; under CHARSIU_NPU_ONEDEV=1 every
+	 * tensor was bit equal. That difference is what moved the text under
+	 * speculative decoding. gmix = 1 makes the read of every device but
+	 * gdev_last a no-op and has gdev_last's call gather ALL the slots in
+	 * index order, each from its own device's buffer.
+	 */
+	int gmix;
+	unsigned gdev_last;
+	/*
 	 * WHAT EACH DEVICE WAS GIVEN, WORKED OUT ONCE WHERE IT IS DECIDED.
 	 *
 	 * The slice to device assignment is fixed at staging and never moves,
@@ -666,6 +685,9 @@ struct charsiu_npu {
 	unsigned packpool_min;
 	unsigned long bpack_pooled, bpack_serial;
 	int readfuse;
+	/* CHARSIU_NPU_GATHER_OLD=1: the batched gather in device order again,
+	 * the timing control for the K order one. See npu_entry.gmix. */
+	int gather_old;
 	unsigned long bfused_groups, bfused_slices;
 	/*
 	 * PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
@@ -2161,6 +2183,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * board prices it: it trades sequential Y round trips for several
 	 * scattered source streams at once. */
 	g->readfuse = charsiu_env_flag("CHARSIU_NPU_READ_FUSE", 0);
+	g->gather_old = charsiu_env_flag("CHARSIU_NPU_GATHER_OLD", 0);
 	/*
 	 * OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
@@ -3912,6 +3935,18 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * inside charsiu_npu_add, and whatever is left of the wall clock between
 	 * heartbeats belongs to npu_tensor_build, which is the quantiser.
 	 */
+	/* the deal is final here: add_slice is the only writer of s->di */
+	for (unsigned ni = 0; ni < e->n_slices; ni++)
+		for (unsigned ki = 0; ki < e->k_slices; ki++) {
+			const struct npu_slot *s =
+				&g->slot[e->first + ki * e->n_slices + ni];
+
+			if (s->di > e->gdev_last)
+				e->gdev_last = s->di;
+			if (ki && s->di < g->slot[e->first + (ki - 1)
+						   * e->n_slices + ni].di)
+				e->gmix = 1;
+		}
 	g->add_us += now_us() - t_add;
 	if ((g->n_ent % 16) == 15) {
 		fprintf(stderr,
@@ -5360,6 +5395,23 @@ static double fence_bo(struct charsiu_npu *g, unsigned d, struct charsiu_bo *bo)
  * was measured 37% slower once and attributed to the index deal that has since
  * been fixed, and has not been re-measured against the deal that replaced it.
  */
+/*
+ * WHAT THE FIRST K SLICE OF A RANGE IS ADDED TO, and why it is not assigned.
+ *
+ * charsiu_npu_matvec clears its accumulator and adds every slice to it, so
+ * its first slice lands as 0.0f + v, which is v except that -0 becomes +0
+ * (and its accumulator is never -0 after that). The batched gather used to
+ * ASSIGN the first slice and so kept a -0 the m = 1 path never produces.
+ * Adding to +0 is the m = 1 arithmetic exactly. CHARSIU_NPU_GATHER_OLD=1
+ * returns -0, and -0.0f + v is v bit for bit, so the old assign is back
+ * without a second copy of every loop. One add an element of the first
+ * slice only; the loops are bound by the scattered reads, not by adds.
+ */
+static inline float first_zero(const struct charsiu_npu *g)
+{
+	return g->gather_old ? -0.0f : 0.0f;
+}
+
 struct read_rows {
 	struct charsiu_npu *g;
 	const struct npu_entry *e;
@@ -5387,6 +5439,7 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned sn = c->sn, n4 = sn / 4, j;
 	int firstw = c->firstw;
+	const float z0 = first_zero(g);
 	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
 	if (g->read4 != 2 || !w4_for(g, e->t) || !g->bmap2 || r0 % 2 || nr % 2)
@@ -5406,10 +5459,10 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 			y1[q + 2] OP fp[6] * S2; y1[q + 3] OP fp[7] * S3;    \
 		}
 		if (sc) {
-			if (firstw) { ROW2(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			if (firstw) { ROW2(= z0 +, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 			else        { ROW2(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 		} else {
-			if (firstw) { ROW2(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			if (firstw) { ROW2(= z0 +, 1.0f, 1.0f, 1.0f, 1.0f) }
 			else        { ROW2(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
 		}
 #undef ROW2
@@ -5418,7 +5471,7 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 			float s0 = sc ? sc[j] : 1.0f;
 			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0;
 
-			if (firstw) { y0[j] = v0; y1[j] = v1; }
+			if (firstw) { y0[j] = z0 + v0; y1[j] = z0 + v1; }
 			else        { y0[j] += v0; y1[j] += v1; }
 		}
 	}
@@ -5461,6 +5514,7 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned sn = c->sn, n4 = sn / 4, j;
 	int firstw = c->firstw;
+	const float z0 = first_zero(g);
 	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
 	if (g->read4 != 4 || !w4_for(g, e->t) || !g->bmap4 || r0 % 4 || nr % 4)
@@ -5484,10 +5538,10 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 			y3[q + 2] OP fp[14] * S2; y3[q + 3] OP fp[15] * S3;  \
 		}
 		if (sc) {
-			if (firstw) { ROW4(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			if (firstw) { ROW4(= z0 +, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 			else        { ROW4(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 		} else {
-			if (firstw) { ROW4(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			if (firstw) { ROW4(= z0 +, 1.0f, 1.0f, 1.0f, 1.0f) }
 			else        { ROW4(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
 		}
 #undef ROW4
@@ -5498,7 +5552,7 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0,
 			      v2 = fo[base + 8] * s0, v3 = fo[base + 12] * s0;
 
-			if (firstw) { y0[j] = v0; y1[j] = v1; y2[j] = v2; y3[j] = v3; }
+			if (firstw) { y0[j] = z0 + v0; y1[j] = z0 + v1; y2[j] = z0 + v2; y3[j] = z0 + v3; }
 			else        { y0[j] += v0; y1[j] += v1; y2[j] += v2; y3[j] += v3; }
 		}
 	}
@@ -5602,6 +5656,7 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 	const struct npu_entry *e = c->e;
 	unsigned sn = c->sn, n4 = sn / 4, j, t;
 	int firstw = c->firstw;
+	const float z0 = first_zero(g);
 
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -5648,8 +5703,8 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 				}
 			}
 			if (firstw) {
-				yr[j * 4 + 0] = v0; yr[j * 4 + 1] = v1;
-				yr[j * 4 + 2] = v2; yr[j * 4 + 3] = v3;
+				yr[j * 4 + 0] = z0 + v0; yr[j * 4 + 1] = z0 + v1;
+				yr[j * 4 + 2] = z0 + v2; yr[j * 4 + 3] = z0 + v3;
 			} else {
 				yr[j * 4 + 0] += v0; yr[j * 4 + 1] += v1;
 				yr[j * 4 + 2] += v2; yr[j * 4 + 3] += v3;
@@ -5674,7 +5729,7 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 				v = t ? v + u : u;
 			}
 			if (firstw)
-				yr[j] = v;
+				yr[j] = z0 + v;
 			else
 				yr[j] += v;
 		}
@@ -5845,6 +5900,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned m = c->m, sn = c->sn, ki = c->ki;
 	int grp = c->grp, firstw = c->firstw;
+	const float z0 = first_zero(g);
 
 	(void)m; (void)ki; (void)grp; (void)io; (void)fo;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
@@ -5916,7 +5972,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						yp[2] SC_##OP v2;            \
 						yp[3] SC_##OP v3;            \
 					}
-#define SC_ASSIGN  =
+#define SC_ASSIGN  = z0 +
 #define SC_ADD     +=
 #define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
 	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
@@ -5934,7 +5990,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						for (j = n4 * 4; j < sn; j++) {
 							float v = fo[mp[j / 4] + j % 4] * sc[j];
 
-							if (firstw) yr[j] = v;
+							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
 						}
 					} else if (w4_for(g, e->t)) {
@@ -5943,7 +5999,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						for (j = n4 * 4; j < sn; j++) {
 							float v = fo[mp[j / 4] + j % 4];
 
-							if (firstw) yr[j] = v;
+							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
 						}
 					} else {
@@ -5954,7 +6010,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						for (j = n4 * 4; j < sn; j++) {
 							float v = (float)io[mp[j / 4] + j % 4] * d1;
 
-							if (firstw) yr[j] = v;
+							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
 						}
 					}
@@ -6064,8 +6120,28 @@ static int batch_read_device(struct charsiu_npu *g,
 			     unsigned m)
 {
 	double tf;
-	unsigned nt;
+	unsigned ntd[2] = { 0, 0 };
+	/*
+	 * IN K ORDER, WHICHEVER DEVICE HOLDS WHICH SLICE. See npu_entry.gmix:
+	 * for an entry whose deal is not monotone in K the reads of the earlier
+	 * devices are put off to the last one, which walks every slot in index
+	 * order -- K slice major, i = ki * n_slices + ni, so ascending K within
+	 * each n range, the order charsiu_npu_matvec sums in -- reading each
+	 * from its own device's buffer. Every caller fences each device before
+	 * reading it and reads them in ascending order, so all the buffers are
+	 * fenced by the time the last device is read. The fused pass is skipped
+	 * for such an entry: it fuses one device's slices only.
+	 */
+	const int korder = e->gmix && !g->gather_old;
+	unsigned finimask = 1u << d;
 
+	if (korder) {
+		if (d != e->gdev_last)
+			return 0;   /* read, and finied, with the last device */
+		finimask = 0;
+		for (unsigned i = 0; i < e->count; i++)
+			finimask |= 1u << g->slot[e->first + i].di;
+	}
 	tf = now_us();
 	if (npu_noread()) {
 		/* the ceiling arm: no gather, and Y is garbage */
@@ -6189,7 +6265,7 @@ static int batch_read_device(struct charsiu_npu *g,
 		 */
 		unsigned fused_ni = 0;
 
-		if (g->readfuse && !g->read4 && g->bmap) {
+		if (g->readfuse && !g->read4 && g->bmap && !korder) {
 			unsigned ni;
 
 			for (ni = 0; ni < e->n_slices; ni++) {
@@ -6257,23 +6333,25 @@ static int batch_read_device(struct charsiu_npu *g,
 				fused_ni |= 1u << ni;
 			}
 		}
-		nt = 0;
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			unsigned sn = s->job.mm.n, ki = i / e->n_slices;
 
 			if (s->di == d && ((fused_ni >> (i % e->n_slices)) & 1u)) {
-				nt++;
+				ntd[d]++;
 				continue;   /* the fused pass took it */
 			}
 			const float *fo;
 			const int32_t *io;
 			int grp = tensor_grouped(g, e->t);
 
-			if (s->di != d)
+			if (s->di != d && !korder)
 				continue;
-			fo = (const float *)((uint8_t *)ob->bo[d].map
-					     + (size_t)nt * g->bout_stride);
+			/* the slot's rank among ITS device's slots, which is
+			 * where the submit put its output */
+			fo = (const float *)((uint8_t *)ob->bo[s->di].map
+					     + (size_t)ntd[s->di]
+					       * g->bout_stride);
 			io = (const int32_t *)fo;
 			/*
 			 * THE TABLE IS BUILT AT `wide` AND A SLICE
@@ -6294,9 +6372,9 @@ static int batch_read_device(struct charsiu_npu *g,
 				};
 
 				g->bread_passes++;
-				if (!((g->bseen_dev >> (d * 16)) & (1u << ni)))
+				if (!((g->bseen_dev >> (s->di * 16)) & (1u << ni)))
 					g->bread_ranges++;
-				g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
+				g->bseen_dev |= (uint64_t)1 << (s->di * 16 + ni);
 				if (g->poolread == 1 ||
 				    (g->poolread == 2 &&
 				     (size_t)m * sn >= poolread_min(g))) {
@@ -6347,12 +6425,14 @@ static int batch_read_device(struct charsiu_npu *g,
 			 * make row 0 assign and rows 1.. accumulate onto
 			 * whatever was in the caller's buffer. */
 			g->bseen[s->n0 / g->nmax] = 1;
-			nt++;
+			ntd[s->di]++;
 		}
 	}
 	g->bread_us += now_us() - tf;
 	if (!g->nofini)
-		charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+		for (unsigned dd = 0; dd < g->ndev; dd++)
+			if (finimask & (1u << dd))
+				charsiu_bo_fini(g->dev[dd], &ob->bo[dd]);
 	return 0;
 }
 

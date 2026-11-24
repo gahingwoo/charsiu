@@ -97,6 +97,15 @@
  * in the NPU (height 1 vs height w) and, on >= 3 slice tensors with a split
  * deal, in the CPU gather order.
  *
+ * THE BOARD SAID THE LATTER, AND ONLY THE LATTER (CM5, Qwen3-0.6B Q4_0,
+ * 2026-11-25): batched rows row pure, NPU partials stable, batched != m1 on
+ * blk.13.ffn_down alone and equal to m1 when its own partials are re-summed
+ * in m1 order; everything bit equal under CHARSIU_NPU_ONEDEV=1. So the
+ * gather in npudev.c now sums in K order from +0 for every deal (see
+ * npu_entry.gmix there) and CHARSIU_NPU_GATHER_OLD=1 is the device order
+ * this analysis describes. Expected now: batched == m1 bitwise, and core (d)
+ * no longer differing, with or without ONEDEV.
+ *
  * ------------------------------------------------------------------------
  * WHAT A RESULT MEANS
  * ------------------------------------------------------------------------
@@ -440,7 +449,12 @@ static void member_slots(struct member *mb)
 
 /*
  * What the source predicts for the CPU gather order of this tensor: m = 1 sums
- * an n range's slices in slot order, batched in device order then slot order.
+ * an n range's slices in slot order, batched in device order then slot order
+ * -- UNDER CHARSIU_NPU_GATHER_OLD=1. By default since the K order fix (the
+ * verdict of this tool's first board run, 2026-11-25) a tensor whose deal is
+ * not monotone in K is gathered after its last device, in slot order, and
+ * the first slice is added to +0 as m = 1 does: the same arithmetic as m = 1
+ * on every tensor, sign of zero included.
  */
 static const char *order_prediction(const struct member *mb, char *buf,
 				    size_t max)
@@ -476,7 +490,16 @@ static const char *order_prediction(const struct member *mb, char *buf,
 				worst = lvl;
 		}
 	}
-	snprintf(buf, max, "%u K slice%s a range; %s", maxks,
+	if (!charsiu_env_flag("CHARSIU_NPU_GATHER_OLD", 0)) {
+		snprintf(buf, max, "%u K slice%s a range; batched gathers in K "
+			 "order from +0 (%s): the same arithmetic as m1, sign "
+			 "of zero included", maxks, maxks == 1 ? "" : "s",
+			 worst ? "deal not monotone in K: read after the last "
+				 "device"
+			       : "deal monotone in K");
+		return buf;
+	}
+	snprintf(buf, max, "%u K slice%s a range; GATHER_OLD: %s", maxks,
 		 maxks == 1 ? "" : "s",
 		 maxks <= 1 ? "m1 and batched gather are the same arithmetic "
 			      "(modulo the sign of an exact zero)"
@@ -1276,13 +1299,13 @@ int main(int argc, char **argv)
 #define ENV(x) (getenv(x) ? getenv(x) : "-")
 	printf("  env: CHARSIU_NPU=%s QUANT=%s W4V=%s KMAX=%s W4_GROUP=%s "
 	       "ONEDEV=%s BATCH_PARALLEL=%s READ_FUSE=%s READ4=%s "
-	       "DEFER_READ=%s CPU_FRAC=%s\n",
+	       "DEFER_READ=%s CPU_FRAC=%s GATHER_OLD=%s\n",
 	       ENV("CHARSIU_NPU"), ENV("CHARSIU_NPU_QUANT"),
 	       ENV("CHARSIU_NPU_W4V"), ENV("CHARSIU_NPU_KMAX"),
 	       ENV("CHARSIU_NPU_W4_GROUP"), ENV("CHARSIU_NPU_ONEDEV"),
 	       ENV("CHARSIU_NPU_BATCH_PARALLEL"), ENV("CHARSIU_NPU_READ_FUSE"),
 	       ENV("CHARSIU_NPU_READ4"), ENV("CHARSIU_NPU_DEFER_READ"),
-	       ENV("CHARSIU_NPU_CPU_FRAC"));
+	       ENV("CHARSIU_NPU_CPU_FRAC"), ENV("CHARSIU_NPU_GATHER_OLD"));
 	if (G) {
 		printf("  NPU: %s, batches %s, kmax %u\n",
 		       charsiu_npu_needs_q1(G) ? "int8 (W4V off: NOT the path "
