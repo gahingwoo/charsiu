@@ -365,7 +365,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/attn_tile $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -395,6 +395,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overl
 	./$(BUILD)/axpy8
 	./$(BUILD)/attn_two_thresholds
 	./$(BUILD)/dattn_exact
+	./$(BUILD)/attn_tile
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
 	./tests/arch_list.sh
@@ -523,6 +524,12 @@ $(BUILD)/attn_two_thresholds: tests/attn_two_thresholds.c $(LLM) | $(BUILD)
 # are static and the test has to call the shipped ones.
 $(BUILD)/dattn_exact: tests/dattn_exact.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/dattn_exact.c $(LLMNOLL) -lm -lpthread
+
+# THE BATCHED PROMPT'S TILED ATTENTION, BIT FOR BIT AGAINST THE KERNEL IT
+# REPLACED, which the test carries a copy of. The same translation unit trick;
+# `attn_tile --bench` times the two at the Qwen3-0.6B shape.
+$(BUILD)/attn_tile: tests/attn_tile.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/attn_tile.c $(LLMNOLL) -lm -lpthread
 
 # AND ITS TIMING, at the Qwen3-0.6B decode shape: old kernel against new,
 # float cache against half, one row and a verify pass. The same translation

@@ -5623,6 +5623,278 @@ static int attn_hr(void)
 	return v;
 }
 
+/*
+ * THE ROWS OF A BLOCK THROUGH THE KERNELS TOGETHER: CHARSIU_ATTN_TILE.
+ *
+ * The board's split of a 124 token Qwen3 prompt (2026-11-25): attention 1.31
+ * ms a row, 162 of 654 ms, about 22 GFLOP/s over four A72s -- a sixth of what
+ * their fmas can do. What the kernels ask of a core, counted from the code
+ * and not measured on the board: attn_dot4 is five vector loads for every
+ * four fmas, one q and four K; attn_axpy8 loads and stores the output row once
+ * per eight positions, nine loads and a store for sixteen multiplies and
+ * adds, and chains its eight adds through one register.
+ *
+ * Both halves of a block of rows read the same K and V, so this is the
+ * register tile:
+ *
+ *   scores  three rows against one quad of keys: seven loads for twelve
+ *           fmas, 24 accumulators laid out as attn_dot4 lays them;
+ *   values  four rows over every position they all see, eight output floats
+ *           a row held in registers from the first position to the last:
+ *           three loads for sixteen multiplies and sixteen adds, eight
+ *           independent add chains, no output traffic between positions.
+ *
+ * ON THE DESK, NOT THE BOARD (tests/attn_tile.c --bench, one thread, the
+ * Qwen3 shape at 124 rows, 28 layers): scores 17.2 -> 11.3 ms, softmax 3.1
+ * either way, values 18.5 -> 15.1, the whole 38.9 -> 29.8, 1.31x. The values
+ * half there is at 93% of what the desk's core multiplies and adds at, and
+ * the multiply and the add have to stay two rounded operations, so the desk
+ * cannot show 2x at all: even both halves at the core's peak leave 24 ms.
+ * What the board gives is the board's to say, against CHARSIU_ATTN_TILE=0.
+ *
+ * AND NO OUTPUT MOVES A BIT. Per (row, position) the score is attn_dot4's lane
+ * -- the two accumulators split at i % 8 < 4, the same horizontal add, the
+ * same `* scale` after -- and so attn_dot's. The softmax is the same call over
+ * the same window. Each output element is o += round(a * v) in ascending t,
+ * separately rounded, exactly as attn_axpy8 and attn_axpy add it; a float32
+ * kept in a register across positions is the same float32 that the old loop
+ * stored and loaded back between eights. tests/attn_tile.c holds the two
+ * against each other with memcmp, every arm.
+ *
+ * CHARSIU_ATTN_TILE=0 is the untiled kernel, in the same binary.
+ */
+static int attn_tile_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_TILE", 1);
+	return v;
+}
+
+#define ATTN_QK_ROWS 3
+#define ATTN_PV_ROWS 4
+
+/*
+ * attn_dot4 FOR UP TO THREE ROWS, every K and q load shared, each row's four
+ * scores scaled into os[g]. M IS ALWAYS A CONSTANT AT THE CALL, as in
+ * attn_dot4_hg, so the loops over it unroll and the accumulators stay in
+ * registers (the pragmas are what makes -O2 do that; without them the tile
+ * lived on the stack and the desk ran it 2.4x SLOWER than the kernel it
+ * replaced). A
+ * ragged head (hd % 8) and the exact arm take attn_dot4 itself, a row at a
+ * time.
+ */
+static inline __attribute__((always_inline)) void
+attn_dot4_rows(const float *const *qs, unsigned M, const float *k0,
+	       size_t ks, uint32_t hd, float scale, float *const *os)
+{
+	unsigned g, r;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn() && hd % 8 == 0) {
+		float32x4_t lo[ATTN_QK_ROWS][4], hi[ATTN_QK_ROWS][4];
+		const float *k1 = k0 + ks, *k2 = k1 + ks, *k3 = k2 + ks;
+		uint32_t i;
+
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++)
+			_Pragma("GCC unroll 4")
+			for (r = 0; r < 4; r++)
+				lo[g][r] = hi[g][r] = vdupq_n_f32(0.0f);
+		for (i = 0; i < hd; i += 8) {
+			float32x4_t x[ATTN_QK_ROWS], k;
+
+#define QK(ACC, KR, OFF)						\
+			k = vld1q_f32((KR) + i + (OFF));		\
+			_Pragma("GCC unroll 4")				\
+			for (g = 0; g < M; g++)				\
+				ACC = vfmaq_f32(ACC, x[g], k);
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				x[g] = vld1q_f32(qs[g] + i);
+			QK(lo[g][0], k0, 0) QK(lo[g][1], k1, 0)
+			QK(lo[g][2], k2, 0) QK(lo[g][3], k3, 0)
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				x[g] = vld1q_f32(qs[g] + i + 4);
+			QK(hi[g][0], k0, 4) QK(hi[g][1], k1, 4)
+			QK(hi[g][2], k2, 4) QK(hi[g][3], k3, 4)
+#undef QK
+		}
+		/*
+		 * THE HORIZONTAL ADD, FOUR AT ONCE. vaddvq_f32 is two faddp,
+		 * (l0 + l1) + (l2 + l3); two levels of pairwise adds across the
+		 * four sums put exactly that in each lane. The `* scale` is
+		 * then one multiply a lane, rounded as the scalar one is.
+		 */
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++) {
+			float32x4_t s0 = vaddq_f32(lo[g][0], hi[g][0]);
+			float32x4_t s1 = vaddq_f32(lo[g][1], hi[g][1]);
+			float32x4_t s2 = vaddq_f32(lo[g][2], hi[g][2]);
+			float32x4_t s3 = vaddq_f32(lo[g][3], hi[g][3]);
+			float32x4_t z = vpaddq_f32(vpaddq_f32(s0, s1),
+						   vpaddq_f32(s2, s3));
+
+			vst1q_f32(os[g], vmulq_n_f32(z, scale));
+		}
+		return;
+	}
+#endif
+	for (g = 0; g < M; g++) {
+		float o[4];
+
+		attn_dot4(qs[g], k0, k0 + ks, k0 + 2 * ks, k0 + 3 * ks, hd, o);
+		for (r = 0; r < 4; r++)
+			os[g][r] = o[r] * scale;
+	}
+}
+
+/* the rows queued against one quad of keys, and what each of them sees */
+struct attn_qk_tile {
+	const float *q[ATTN_QK_ROWS];
+	float *sr[ATTN_QK_ROWS];
+	int tlo[ATTN_QK_ROWS], pos[ATTN_QK_ROWS];
+	unsigned m;
+};
+
+static void attn_qk_flush(struct attn_qk_tile *T, const float *k0, size_t ks,
+			  int t, uint32_t hd, float scale)
+{
+	float tmp[ATTN_QK_ROWS][4], *dst[ATTN_QK_ROWS];
+	unsigned g;
+	int c;
+
+	/* a row that sees the whole quad is written in place */
+	for (g = 0; g < T->m; g++)
+		dst[g] = t >= T->tlo[g] && t + 3 <= T->pos[g]
+		       ? T->sr[g] + t : tmp[g];
+	switch (T->m) {
+	case 3: attn_dot4_rows(T->q, 3, k0, ks, hd, scale, dst); break;
+	case 2: attn_dot4_rows(T->q, 2, k0, ks, hd, scale, dst); break;
+	case 1: attn_dot4_rows(T->q, 1, k0, ks, hd, scale, dst); break;
+	default: return;
+	}
+	/*
+	 * ONLY THE POSITIONS THE ROW SEES ARE STORED. A row whose window
+	 * covers part of the quad was computed for all four, which is free in
+	 * a tile, and a lane of attn_dot4 is attn_dot to the bit, so the ones
+	 * it keeps are what the single position call gave. The others were
+	 * never read, so computing them changes nothing either: all four keys
+	 * are at or below the block's last position, which this chunk wrote.
+	 */
+	for (g = 0; g < T->m; g++)
+		if (dst[g] == tmp[g])
+			for (c = 0; c < 4; c++)
+				if (t + c >= T->tlo[g] && t + c <= T->pos[g])
+					T->sr[g][t + c] = tmp[g][c];
+	T->m = 0;
+}
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+/*
+ * THE VALUES OF UP TO FOUR ROWS OVER c CONSECUTIVE POSITIONS THEY ALL SEE.
+ * ps[g] is row g's weight at the first of them, v that position's V row.
+ * Eight output floats a row stay in registers over all c positions, each
+ * taking its products in ascending t. The multiply is by a lane of the
+ * weights, the same single rounding of the same product as attn_axpy8's
+ * broadcast, and it is written in asm for two reasons: GCC turns the lane
+ * intrinsic back into a broadcast held in a register per weight, which for
+ * four rows is sixteen registers and spilled the tile; and an asm result
+ * cannot be contracted into an fmla, which is the barrier attn_axpy8 needs.
+ * Sixteen floats a row was the first version and spilled four accumulators
+ * to the stack every pass. hd % 8 == 0 only.
+ */
+#define PV_MUL(P, X, W, L)						\
+	__asm__("fmul %0.4s, %1.4s, %2.s[" #L "]" : "=w"(P) : "w"(X), "w"(W))
+
+static inline __attribute__((always_inline)) void
+attn_pv_rows(float *const *os, const float *const *ps, unsigned M,
+	     const float *v, size_t vs, int c, uint32_t hd)
+{
+	unsigned g;
+	uint32_t i;
+	int q;
+
+	for (i = 0; i < hd; i += 8) {
+		float32x4_t o0[ATTN_PV_ROWS], o1[ATTN_PV_ROWS];
+
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++) {
+			o0[g] = vld1q_f32(os[g] + i);
+			o1[g] = vld1q_f32(os[g] + i + 4);
+		}
+#define PV(L, Q)							\
+		{							\
+			const float *vq = v + (size_t)(Q) * vs + i;	\
+			float32x4_t x0 = vld1q_f32(vq);			\
+			float32x4_t x1 = vld1q_f32(vq + 4);		\
+									\
+			_Pragma("GCC unroll 4")				\
+			for (g = 0; g < M; g++) {			\
+				float32x4_t p0, p1;			\
+									\
+				PV_MUL(p0, x0, w[g], L);		\
+				PV_MUL(p1, x1, w[g], L);		\
+				o0[g] = vaddq_f32(o0[g], p0);		\
+				o1[g] = vaddq_f32(o1[g], p1);		\
+			}						\
+		}
+		for (q = 0; q + 4 <= c; q += 4) {
+			float32x4_t w[ATTN_PV_ROWS];
+
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				w[g] = vld1q_f32(ps[g] + q);
+			PV(0, q) PV(1, q + 1) PV(2, q + 2) PV(3, q + 3)
+		}
+		for (; q < c; q++) {
+			float32x4_t w[ATTN_PV_ROWS];
+
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				w[g] = vld1q_dup_f32(ps[g] + q);
+			PV(0, q)
+		}
+#undef PV
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++) {
+			vst1q_f32(os[g] + i, o0[g]);
+			vst1q_f32(os[g] + i + 4, o1[g]);
+		}
+	}
+}
+#undef PV_MUL
+
+static void attn_pv_tile(float *const *os, const float *const *ps,
+			 unsigned m, const float *v, size_t vs, int c,
+			 uint32_t hd)
+{
+	if (c <= 0)
+		return;
+	switch (m) {
+	case 4: attn_pv_rows(os, ps, 4, v, vs, c, hd); break;
+	case 3: attn_pv_rows(os, ps, 3, v, vs, c, hd); break;
+	case 2: attn_pv_rows(os, ps, 2, v, vs, c, hd); break;
+	case 1: attn_pv_rows(os, ps, 1, v, vs, c, hd); break;
+	default: break;
+	}
+}
+#endif
+
+static int attn_pv_tiled(uint32_t hd)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	return attn_tile_on() && attn_axpy8_on() && !cpu_plain()
+	       && hd % 8 == 0;
+#else
+	(void)hd;
+	return 0;
+#endif
+}
+
+/* the tiles above when CHARSIU_ATTN_TILE is on, the kernels below them when not */
 static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 {
 	struct attn_block_job *j = ctx;
@@ -5632,6 +5904,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 	size_t qstride = (size_t)j->n_head * hd;
 	int timed = stage_on > 0 && !attn_block_pool();
 	int nblk = attn_hr() ? (n + R - 1) / R : 1;
+	int tile = attn_tile_on(), pvtile = attn_pv_tiled(hd);
 	uint64_t u;
 
 	for (u = u0; u < u0 + nu; u++) {
@@ -5671,7 +5944,9 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 			for (int t = tlo_first; t <= tmax; t += 4) {
 				const float *k0 = kbase + (size_t)t * kstride;
 				int quad = t + 3 <= tmax;
+				struct attn_qk_tile T;
 
+				T.m = 0;
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
 					int tlo = j->swa && pos + 1 > j->n_swa
@@ -5679,6 +5954,20 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 					const float *qh = j->q + (size_t)r * qstride + h * hd;
 					float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
+					/* a whole quad in the cache: the row
+					 * joins a tile if it sees any of it */
+					if (tile && quad) {
+						if (t + 3 < tlo || t > pos)
+							continue;
+						T.q[T.m] = qh;
+						T.sr[T.m] = sr;
+						T.tlo[T.m] = tlo;
+						T.pos[T.m] = pos;
+						if (++T.m == ATTN_QK_ROWS)
+							attn_qk_flush(&T, k0, kstride,
+								      t, hd, j->scale);
+						continue;
+					}
 					if (quad && t >= tlo && t + 3 <= pos) {
 						float o[4];
 
@@ -5698,6 +5987,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 								 hd) * j->scale;
 					}
 				}
+				attn_qk_flush(&T, k0, kstride, t, hd, j->scale);
 			}
 			if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
 			for (int r = rb; r < re; r++) {
@@ -5711,7 +6001,67 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 				       hd * sizeof(float));
 			}
 			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
-			{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+			/*
+			 * FOUR CONSECUTIVE ROWS AT A TIME. Their windows are
+			 * [tlo, pos] with both ends rising by row, so all four
+			 * see [lo, hi] = [the last row's tlo, the first row's
+			 * pos], and each row's own positions are a few before
+			 * that (a sliding window) and a few after. Each row
+			 * takes them in the order before, shared, after, which
+			 * is ascending t.
+			 */
+			for (int r0 = rb; pvtile && r0 < re; r0 += ATTN_PV_ROWS) {
+				int r1 = r0 + ATTN_PV_ROWS < re ? r0 + ATTN_PV_ROWS : re;
+				int lo = 0, hi = tmax;
+				float *os[ATTN_PV_ROWS];
+				const float *ps[ATTN_PV_ROWS];
+				unsigned m = 0;
+
+				for (int r = r0; r < r1; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+
+					if (tlo > lo)
+						lo = tlo;
+					if (pos < hi)
+						hi = pos;
+				}
+				for (int r = r0; r < r1; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+					float *out = j->out + (size_t)r * qstride + h * hd;
+					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
+					/* the positions before the shared run,
+					 * or all of them when there is none */
+					int b = lo <= hi ? lo - 1 : pos;
+					const float *pa = sr + tlo;
+
+					attn_pv_tile(&out, &pa, 1,
+						     vbase + (size_t)tlo * kstride,
+						     kstride, b - tlo + 1, hd);
+					os[m] = out;
+					ps[m++] = sr + lo;
+				}
+				if (lo > hi)
+					continue;
+				attn_pv_tile(os, ps, m, vbase + (size_t)lo * kstride,
+					     kstride, hi - lo + 1, hd);
+				for (int r = r0; r < r1; r++) {
+					int pos = j->pos0 + r;
+					float *out = os[r - r0];
+					const float *pa = sc + (size_t)(r - rb) * s->n_ctx
+							+ hi + 1;
+
+					attn_pv_tile(&out, &pa, 1,
+						     vbase + (size_t)(hi + 1) * kstride,
+						     kstride, pos - hi, hd);
+				}
+			}
+#endif
+			if (!pvtile) {
 			int step = attn_axpy8_on() ? 8 : 4;
 
 			for (int t = tlo_first; t <= tmax; t += step) {
