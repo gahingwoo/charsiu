@@ -40,7 +40,11 @@ fi
 [ -n "$MODEL" ] || { echo "charsiu serve: no model set. Try: charsiu setup" >&2; exit 1; }
 [ -f "$MODEL" ] || { echo "charsiu serve: $MODEL does not exist (charsiu pull)" >&2; exit 1; }
 
-CTX=$(ini_get run context);      : "${CTX:=2048}"
+# [serve] context first: a server holds whole conversations, a one-shot run
+# does not, and the template's 512 is the one-shot number.
+CTX=$(ini_get serve context)
+[ -n "$CTX" ] || CTX=$(ini_get run context)
+: "${CTX:=2048}"
 THREADS=$(ini_get run threads);  : "${THREADS:=4}"
 CPUS=$(ini_get run cpus)
 NPU=$(ini_get npu enable);       : "${NPU:=yes}"
