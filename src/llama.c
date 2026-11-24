@@ -8231,6 +8231,9 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+/* the CPU attention time inside verify passes, for CHARSIU_SPEC_TRACE */
+static double verify_attn_ms;
+
 static int attn_block(struct attn_block_job *j)
 {
 	int R = attn_block_rows(), n = j->n;
@@ -8243,8 +8246,13 @@ static int attn_block(struct attn_block_job *j)
 	 * j->R, and the check arm calls it directly */
 	j->R = R;
 	/* a verify pass stays on the CPU arm: see in_verify */
-	if (j->s->in_verify)
-		return attn_block_cpu(j);
+	if (j->s->in_verify) {
+		double t0 = now_ms();
+		int rc = attn_block_cpu(j);
+
+		verify_attn_ms += now_ms() - t0;
+		return rc;
+	}
 	/*
 	 * THIS IS NOT A BIT EXACT SUBSTITUTION AND MUST NOT BE CHECKED AS
 	 * ONE. Every matmul the group runs was proved identical to the same
@@ -9525,8 +9533,18 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
 					 * cannot drift by a rope or a norm */
-					attn_npu_append(s, l, kh, hd, pos,
-							ks, vs);
+					/* NOT FROM A VERIFY PASS: nothing in
+					 * it reads the mirror, its rejected
+					 * rows are rolled back, and the first
+					 * one past the prompt's rung repacked
+					 * every surface -- 690 ms at 1448
+					 * tokens, Qwen3-1.7B on the CM5.
+					 * attn_npu_catchup fills these
+					 * positions from the float cache when
+					 * a batched layer next needs them. */
+					if (!s->in_verify)
+						attn_npu_append(s, l, kh, hd,
+								pos, ks, vs);
 				}
 			if (attn_block_rows() > 0) {
 				/*
@@ -10727,12 +10745,9 @@ static int spec_policy(struct llama_spec *sp, int d)
 	 * first probes at six rows, two plain steps each. A model that
 	 * accepts reaches six rows a few passes later.
 	 *
-	 * IT DID NOT REMOVE THE LONG PROMPT LOSS. On the CM5, Qwen3-1.7B at
-	 * 1400 tokens of context still runs 0.96x the plain loop with auto
-	 * (6 speculative passes of 127, text identical): the warm passes are
-	 * w2 181 / w4 236 ms against a 152 ms step, but the mean over all of
-	 * them is 318 ms, so the cost is in the first pass at each width,
-	 * which the ledger leaves out as cold.
+	 * IT DID NOT REMOVE THE LONG PROMPT LOSS, and the probes were not its
+	 * cause: the first verify pass of a run repacked the fp16 attention
+	 * mirror (see the append in batch_layers).
 	 */
 	while (wmax < 2 && sp->n_tver[wmax] >= 2)
 		wmax++;
@@ -10859,6 +10874,17 @@ static int spec_draft(const struct llama_spec *sp, int32_t *out, int k)
 		}
 	}
 	return 0;
+}
+
+/* CHARSIU_SPEC_TRACE=1: one stderr line a speculative pass, its width,
+ * acceptance and time, to see where a run's pass time goes */
+static int spec_trace(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_SPEC_TRACE", 0);
+	return v;
 }
 
 static int spec_argmax(void)
@@ -10998,6 +11024,11 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	sp->ms_spec += dt;
 	wi = spec_wi(d);
 	cold = sp->n_tver[wi] == 0;
+	if (spec_trace())
+		fprintf(stderr, "charsiu: spec pass at %d, %d rows, %d of %d "
+			"accepted, %.1f ms, attention %.1f ms%s\n", pos0, n,
+			a, d, dt, verify_attn_ms, cold ? " (cold)" : "");
+	verify_attn_ms = 0.0;
 	spec_mean(&sp->t_ver[wi], &sp->n_tver[wi], dt * sp->vscale);
 	if (sp->autok) {
 		double cap = SPEC_LEDGER_CAP * sp->t_plain;
