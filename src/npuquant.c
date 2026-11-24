@@ -538,9 +538,14 @@ static int wcache_read(struct npu_tensor *t, const char *name)
 		return 0;
 	}
 	if (r->n != t->n || r->k != t->k || r->ngrp != ngrp) {
+		static int said;
+
+		if (said++)
+			return 0;
 		fprintf(stderr, "charsiu: weight cache has %s as %llu x %llu in "
 			"%llu groups and this run wants %llu x %llu in %llu; "
-			"quantising it\n", name, (unsigned long long)r->n,
+			"quantising it and any other that differs (the cache was "
+			"built with another CHARSIU_NPU_W4_GROUP)\n", name, (unsigned long long)r->n,
 			(unsigned long long)r->k, (unsigned long long)r->ngrp,
 			(unsigned long long)t->n, (unsigned long long)t->k,
 			(unsigned long long)ngrp);
