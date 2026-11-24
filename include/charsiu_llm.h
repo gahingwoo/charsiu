@@ -379,6 +379,26 @@ int  charsiu_npu_flush(struct charsiu_npu *g);
 
 int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
+/*
+ * SEVERAL TENSORS THAT MULTIPLY THE SAME m ROWS OF X, IN ONE CALL: q/k/v, or
+ * gate/up. X is packed once per device, every slot of every member goes into
+ * one submit per device, both devices are submitted before either is waited
+ * on (unless the cores must be serialised), and member i's answer is written
+ * to Ys[i] before this returns -- nothing is deferred, so there is no flush
+ * owed for this call, and any deferred gather from an EARLIER call has been
+ * flushed by it.
+ *
+ * ALL OR NONE. If any member would be refused by charsiu_npu_matmul at this
+ * m, or the members do not share K, its slicing and its zero point, or any
+ * carries an AWQ factor, this returns -1 having flushed, packed and submitted
+ * nothing, and the caller runs its per-tensor calls exactly as before. A fault
+ * past that point (an allocation, an empty register stream, a failed submit)
+ * also returns -1; the per-tensor calls then rewrite every Ys[i] in full.
+ * n is 2 to 4, and the Ys must not overlap.
+ */
+int  charsiu_npu_matmul_group(struct charsiu_npu *g, const int *ids,
+			      unsigned n, const float *X, unsigned m,
+			      float *const *Ys);
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses, unsigned long why[5]);

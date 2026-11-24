@@ -7940,6 +7940,66 @@ static int matmul_rows_split(struct llama_state *s,
 }
 
 /*
+ * q/k/v OR gate/up AS ONE NPU CALL: charsiu_npu_matmul_group.
+ *
+ * OFF BY DEFAULT, pending a board A/B: CHARSIU_NPU_BATCH_GROUP=1 turns it
+ * on. It is for the speculative verify pass, m = 2..8 rows, where each of
+ * these projections is one slot on Qwen3-0.6B and one slot is one core: the
+ * per tensor calls below keep one core busy at a time and pay a pack and a
+ * fence each. The group packs X once a device, submits both devices and
+ * fences once. The arithmetic is the same slots on the same cores, so the
+ * text must not move; the board says whether the time does.
+ *
+ * Returns 1 when the hardware did every member, all of Ys written, and 0
+ * when it did NONE of them usefully -- switched off, a tensor not staged,
+ * any member refused at this width -- and the caller must then run its per
+ * tensor calls exactly as it does with the switch off. Nothing is deferred:
+ * the caller's charsiu_npu_flush after it is a no-op, and harmless.
+ *
+ * NOT TOGETHER WITH CHARSIU_NPU_ROWSPLIT, which is a different experiment on
+ * the same calls; with that set this always says 0.
+ */
+static int batch_group(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_BATCH_GROUP", 0);
+	return v;
+}
+
+static int matmul_rows_group(struct llama_state *s,
+			     const struct gguf_tensor *const *ws,
+			     float *const *Ys, unsigned nt, const float *X,
+			     int n)
+{
+	int ids[4];
+	double t0, w0;
+
+	if (!batch_group() || rowsplit_min() || nt < 2 || nt > 4 || n < 2)
+		return 0;
+	t0 = stage_on > 0 ? now_ms() : 0.0;
+	for (unsigned i = 0; i < nt; i++) {
+		ids[i] = npu_id_for(s, ws[i]);   /* stages on first use */
+		if (ids[i] < 0)
+			return 0;
+	}
+	w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+	if (charsiu_npu_matmul_group(s->pool.dev, ids, nt, X, (unsigned)n, Ys))
+		return 0;
+	/* ONE ENTRY, so one call: the count is what this is meant to cut */
+	bmm_calls++;
+	if (stage_on > 0) {
+		double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+		bmm_entry_ms += dw;
+		bmm_dev = s->pool.dev;
+		bmm_wrap_ms += now_ms() - t0 - dw;
+	}
+	return 1;
+}
+
+/*
  * WHY IT WILL NOT, NOT JUST THAT IT WILL NOT. A refusal that returns 0 makes
  * the caller fall back silently, and a board log then shows a batched run and a
  * control run at the same rate with nothing to say which of the two things that
@@ -8447,6 +8507,17 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
+			/* CHARSIU_NPU_BATCH_GROUP=1 (off by default): q, k
+			 * and v -- or q and k where the layer has no attn_v --
+			 * in one NPU call. 0 means it did nothing usable and
+			 * the three calls below run exactly as without it.
+			 * The gate is the group's RETURN, not a flag that skips
+			 * a call: see "ASKED, NOT TRIED" above. */
+			const struct gguf_tensor *gw[3] = { L->wq, L->wk, L->wv };
+			float *gy[3] = { s->bq, s->bk, s->bv };
+
+			if (!matmul_rows_group(s, gw, gy, L->wv ? 3u : 2u,
+					       s->bxb, n)) {
 			/* nothing writes bxb between these three: the
 			 * declaration below is only true because of that --
 			 * and it is also what makes the deferral legal. q's
@@ -8463,6 +8534,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						  m->n_embd,
 						  m->n_head_kv * hd, 'v', 1,
 						  'q');
+			}
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -8667,10 +8739,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * other, which is the only condition the deferral has.
 			 * The flush below covers the case where up is refused
 			 * and never reaches the hardware to do it. */
+			/* and the same group switch for gate and up */
+			const struct gguf_tensor *gw[2] = { L->gate, L->up };
+			float *gy[2] = { s->bhb, s->bhb2 };
+
+			if (!matmul_rows_group(s, gw, gy, 2, s->bxb, n)) {
 			matmul_rows_split(s, L->gate, s->bxb, n, s->bhb,
 					  m->n_embd, nff, 0, 0, 'f');
 			matmul_rows_split(s, L->up, s->bxb, n, s->bhb2,
 					  m->n_embd, nff, 'u', 1, 'f');
+			}
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
