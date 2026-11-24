@@ -1544,7 +1544,7 @@ next:
 		int want = gen_pos0 + produced;
 
 		if (st->pos > want)
-			st->pos = want;
+			llama_cache_truncate(st, want);
 		else if (st->pos + 1 == want && last_tok >= 0 &&
 			 st->pos < st->n_ctx)
 			llama_forward(st, last_tok, st->pos);
@@ -1661,7 +1661,7 @@ next:
 		 * to split N answers out of one stream. Without it a comparison
 		 * would see one long string and call every repeat identical.
 		 */
-		st->pos = 0;
+		llama_cache_truncate(st, 0);
 		printf("\n--- charsiu repeat %d ---\n", turn + 2);
 		fflush(stdout);
 		continue;

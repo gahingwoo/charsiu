@@ -9905,14 +9905,69 @@ void llama_prefill_hint(struct llama_state *s, int total)
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0)
 {
+	return llama_prefill_batch_keep(s, m, toks, n, pos0, n);
+}
+
+/*
+ * A CHUNK OF n ROWS OF WHICH ONLY THE FIRST keep ARE THE PROMPT.
+ *
+ * The rows past keep are padding, there so the chunk is a width the hardware
+ * batches well rather than an odd one it cannot express at all. Attention is
+ * causal, so no real row reads a pad row; the pad rows write the cache at
+ * pos0 + keep .. pos0 + n - 1 like any row does, and that is the only trace
+ * they leave. The head runs on row keep - 1, the last REAL row, and the cache
+ * is then truncated to pos0 + keep, which is where the next token goes and
+ * what every "how far is this valid" mark must say.
+ */
+int llama_prefill_batch_keep(struct llama_state *s,
+			     const struct llama_model *m, const int32_t *toks,
+			     int n, int pos0, int keep)
+{
+	if (keep < 1 || keep > n)
+		return -1;
 	if (batch_layers(s, m, toks, n, pos0))
 		return -1;
-	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
+	rmsnorm(s->xb, s->bx + (size_t)(keep - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
 	softcap_logits(s->logits, m->n_vocab, m->final_softcap);
 	s->pos = pos0 + n;
+	if (keep < n)
+		llama_cache_truncate(s, pos0 + keep);
 	return 0;
+}
+
+/*
+ * THE CACHE ENDS AT pos, AND EVERY MARK OF HOW FAR IT IS VALID SAYS SO.
+ *
+ * The float caches and kc16/vc16 need nothing: nothing reads a position at or
+ * above s->pos, and the next write to one overwrites it. The fp16 attention
+ * mirror is different, because it keeps its own mark -- packed[l], the
+ * positions already mirrored -- and attn_npu_catchup trusts it. A pass that
+ * wrote rows the cache then gives back (a padded chunk, a verify pass, a kept
+ * prefix) would leave the mark above pos, and the next prompt would read
+ * whatever those rows held instead of re-packing what decode put there. That
+ * is the second-turn garbage of 4dce18c by another road.
+ */
+void llama_cache_truncate(struct llama_state *s, int pos)
+{
+	struct attn_npu *a;
+	unsigned l;
+
+	if (!s)
+		return;
+	if (pos < 0)
+		pos = 0;
+	if (pos < s->pos)
+		s->pos = pos;
+	/* not attn_npu_get: an "off" mirror can still hold marks, and one
+	 * that failed half way through being built has no array yet */
+	a = s->anpu;
+	if (!a || !a->packed)
+		return;
+	for (l = 0; l < a->n_layer; l++)
+		if (a->packed[l] > (unsigned)pos)
+			a->packed[l] = (unsigned)pos;
 }
 
 /*
@@ -10997,7 +11052,7 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 				"batched forward refused this model (%s)\n",
 				llama_batch_why_not(m));
 		sp->off = 1;
-		s->pos = pos0;
+		llama_cache_truncate(s, pos0);
 		return llama_spec_step(sp, s, m, tok, out, max_out);
 	}
 	/* the default arm still scans only the rows it reaches, as it did */
@@ -11069,7 +11124,7 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	 * Rows 1..a hold accepted tokens and their cache entries are right.
 	 * The correction is not in the cache yet: it is the next pass's row 0.
 	 */
-	s->pos = pos0 + 1 + a;
+	llama_cache_truncate(s, pos0 + 1 + a);
 	/*
 	 * EVERY TOKEN ENTERS THE HISTORY EXACTLY ONCE. The caller feeds the
 	 * LAST committed token back as the next pass's `tok`, which pushes it

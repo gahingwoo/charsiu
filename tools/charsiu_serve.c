@@ -403,7 +403,7 @@ static void chat(FILE *f, const char *body, size_t blen, int anth)
 		keep++;
 	if (keep > ST->pos)
 		keep = ST->pos;          /* never claim more than the cache holds */
-	ST->pos = keep;
+	llama_cache_truncate(ST, keep);
 	CACHED_N = keep;
 
 	const float *logits = NULL;

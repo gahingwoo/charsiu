@@ -1298,6 +1298,23 @@ int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);
 
 /*
+ * The same chunk with only its first `keep` rows real: the head runs on row
+ * keep - 1 and the cache ends at pos0 + keep (llama_cache_truncate), so the
+ * n - keep rows after it are padding that widens the chunk to a width the
+ * hardware batches well and is never read. keep == n is llama_prefill_batch.
+ */
+int llama_prefill_batch_keep(struct llama_state *s,
+			     const struct llama_model *m, const int32_t *toks,
+			     int n, int pos0, int keep);
+
+/*
+ * Move the end of the cache back to `pos` (never forward): s->pos, and every
+ * mark that records how far a mirror of the cache is valid. Use it, and not
+ * a bare assignment to s->pos, wherever the cache gives positions back.
+ */
+void llama_cache_truncate(struct llama_state *s, int pos);
+
+/*
  * Why llama_prefill_batch will refuse this model, as a short phrase, or NULL
  * if it will take it. A caller that falls back should SAY which of the two
  * happened: two runs at the same rate mean nothing without it.
