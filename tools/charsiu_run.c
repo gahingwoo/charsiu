@@ -251,10 +251,11 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
-"  --spec K      speculate: auto (the default, CHARSIU_SPEC unset) decides\n"
-"                 a pass at a time from measured costs; 0 is off; 1..5\n"
-"                 is that many drafts every pass. Greedy only, the text\n"
-"                 is identical either way.\n"
+"  --spec K      speculate: off by default; auto decides a pass at a time\n"
+"                 from measured costs; 1..5 is that many drafts every\n"
+"                 pass. Greedy only. On the NPU the text can differ from\n"
+"                 the plain loop's: a batched row is not bit identical to\n"
+"                 a single one, and a near tie can go the other way.\n"
 "  --repeat N     run the same prompt N times in ONE process, so a rate\n"
 "                 question does not pay for N model loads. The cache is\n"
 "                 reset between them and each is separated by a marker\n"
@@ -353,21 +354,26 @@ int main(int argc, char **argv)
 	 * --spec K, or CHARSIU_SPEC=K: prompt-lookup drafts verified in one
 	 * batched pass.
 	 *
-	 * AUTO BY DEFAULT, which is not the same as on. The board priced a
-	 * pass at two to three plain steps, so a fixed k made decode 22%
-	 * SLOWER on open prose and faster on copy-heavy text. Auto runs the
-	 * cost policy in llama.c (the note over spec_policy): it speculates
-	 * only where this run's own timings and acceptance say it pays, and
-	 * backs off when a pass loses. 0 is off -- the plain loop, untouched;
-	 * K > 0 is K drafts every pass, the old behaviour, no policy.
+	 * OFF BY DEFAULT, BECAUSE THE TEXT CAN MOVE. Auto runs the cost
+	 * policy in llama.c (the note over spec_policy): it speculates only
+	 * where this run's own timings and acceptance say it pays, and backs
+	 * off when a pass loses. On the CM5 it was 1.1-2.1x on copy-heavy
+	 * prompts and changed the text of one of 21: Qwen3-0.6B, a short
+	 * story, from token 39 on. The committed tokens agreed up to there;
+	 * what differed is which computation wrote each position's KV, a
+	 * single-row step or row r of a batch of 2, 4 or 6, and on the NPU a
+	 * batched row agrees with a single one to about 3e-5, not to the bit
+	 * (--batch-probe). A near tie then goes the other way. Every fixed K
+	 * matched on that prompt, by luck. Until a pass and a plain step
+	 * compute the same bits, speculation is something a user asks for.
+	 * 0 is off -- the plain loop, untouched; K > 0 is K drafts every
+	 * pass, no policy; auto is the policy.
 	 *
-	 * EVERY BOARD SCRIPT PINS 0 (tests/board_clk.sh), because they were
-	 * written with an unset CHARSIU_SPEC as their plain arm and a default
-	 * that moves breaks every script that took it as one. They spell auto
-	 * as CHARSIU_SPEC=auto when they want it.
+	 * The board scripts pin 0 anyway (tests/board_clk.sh) and spell the
+	 * policy CHARSIU_SPEC=auto when they want it.
 	 */
 	int spec_k = getenv("CHARSIU_SPEC") ? spec_parse(getenv("CHARSIU_SPEC"))
-					  : SPEC_AUTO;
+					  : 0;
 	struct llama_spec spec;
 	int spec_on = 0;
 	unsigned batch_probe = 0;

@@ -117,12 +117,10 @@ fi
 export CHARSIU_RUN CHARSIU_RUN_BIN 2>/dev/null || true
 
 # SPECULATION IS PINNED OFF HERE, for every script that sources this.
-# charsiu_run speculates by default now (CHARSIU_SPEC unset = the cost
-# policy), and every board script was written when unset meant the plain
-# loop: their "plain" arms, their per-token stage tables and their call
-# counts all assume one forward pass a token. A default that moves breaks
-# every script that took it as an arm, so the old arm is kept by name. A
-# script that wants the policy says CHARSIU_SPEC=auto; one that sets
-# CHARSIU_SPEC itself, or passes --spec, is unaffected.
+# Unset is off in charsiu_run as well, but a default can move again, and
+# every board script's "plain" arm, per-token stage table and call count
+# assume one forward pass a token, so the arm is kept by name. A script
+# that wants the policy says CHARSIU_SPEC=auto; one that sets CHARSIU_SPEC
+# itself, or passes --spec, is unaffected.
 CHARSIU_SPEC="${CHARSIU_SPEC-0}"
 export CHARSIU_SPEC

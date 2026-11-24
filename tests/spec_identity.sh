@@ -17,16 +17,17 @@
 #   junk        --spec 3 with CHARSIU_SPEC_JUNK=1            must match, AND
 #                                                            must have accepted
 #                                                            (almost) nothing
-#   auto        CHARSIU_SPEC unset: the cost policy          must match, and
+#   auto        CHARSIU_SPEC=auto: the cost policy           must match, and
 #                                                            must say what it
 #                                                            did
 #   auto x0.3   CHARSIU_SPEC=auto, passes priced at 0.3     must match, AND
 #                                                            must have accepted
 #                                                            something
 #
-# THE PLAIN ARM IS CHARSIU_SPEC=0 BY NAME. Unset is the policy now, and
-# board_clk.sh pins 0 for every script that sources it; this one spells it
-# out as well, because it is the arm the whole test is measured against.
+# THE PLAIN ARM IS CHARSIU_SPEC=0 BY NAME, though unset is off too: it is
+# the arm the whole test is measured against. On the desk every arm must
+# match it. On the board a batched row is not bit identical to a single
+# one, so a mismatch there is a near tie, not necessarily a broken verifier.
 #
 # WHY auto x0.3. With no NPU a pass runs its rows one at a time and costs
 # w plain steps, so on the desk the policy correctly stops after its first
@@ -134,7 +135,7 @@ for mdl in "$DIR"/*.gguf; do
 		continue
 	fi
 	junk=$(CHARSIU_SPEC_JUNK=1 "$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 $EXTRA 2>/dev/null)
-	auto=$(env -u CHARSIU_SPEC "$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
+	auto=$(CHARSIU_SPEC=auto "$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
 	autos=$(CHARSIU_SPEC=auto CHARSIU_SPEC_VERIFY_SCALE=0.3 "$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
 
 	tp=$(printf '%s' "$plain" | text)
