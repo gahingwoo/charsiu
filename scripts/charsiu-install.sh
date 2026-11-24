@@ -1350,6 +1350,18 @@ else
 	[ "$CHANNEL" = stable ] || as_root sh -c \
 		"sed -i 's/^channel = .*/channel = $CHANNEL/' '$ETC/config.ini'"
 fi
+# THE NPU WANTS THE CPUS OUT OF DEEP IDLE, AND /dev/cpu_dma_latency IS ROOT'S.
+# charsiu holds it while the NPU is open; run as a normal user it could not,
+# and decode lost about a sixth (Qwen3-0.6B on a CM5, same boot: 21.4 tok/s as
+# a user, 25.4 as root, 25.5 as a user with this rule). The rule gives the node
+# to group render, the group that can open the NPU.
+UDEV="$PREFIX/usr/lib/udev/rules.d"
+as_root mkdir -p "$UDEV"
+as_root cp "$SRC/etc/udev/60-charsiu-cpu-dma-latency.rules" "$UDEV/"
+if [ -z "$PREFIX" ] && command -v udevadm >/dev/null 2>&1; then
+	as_root udevadm control --reload 2>/dev/null || true
+	as_root udevadm trigger --sysname-match=cpu_dma_latency 2>/dev/null || true
+fi
 # THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
 # root's, so charsiu-get could not record the model it had just downloaded and
 # every later run went looking for the placeholder in the shipped template. The
