@@ -446,6 +446,12 @@ the RK3576 register knowledge in this repository was established.
 [kiln](https://github.com/gahingwoo/kiln) runs the vendor RKLLM stack on a
 mainline kernel; it is the measuring stick and the capture harness.
 
+charsiu also runs under Windows on Arm.
+[woa-rk3576-npu](https://github.com/gahingwoo/woa-rk3576-npu) is a Windows
+driver for the RK3576 NPU with a port of charsiu's device layer; on a
+TaishanPi 3M under Windows 11 23H2 it decodes Llama-3.2-1B at 14 to 16
+tokens a second (2026-11-24).
+
 ## On the name
 
 Char siu is Cantonese barbecue pork, eaten across Guangdong, Hong Kong and
