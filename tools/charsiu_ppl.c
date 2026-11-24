@@ -88,10 +88,33 @@
  * this label. The same run without --batch is unaffected.
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "charsiu_llm.h"
+
+
+/*
+ * THE BITS, NOT THE FOUR DECIMALS. "ppl 81.4696" in both modes says the two
+ * paths agree to about 1e-6, and a speculative pass needs more than that: one
+ * last bit of one logit can flip a near tie. So both modes also hash every
+ * scored row's logits, in position order, and print the hash and the nll sum
+ * in %a. The token loop and --batch at any chunk width either print the same
+ * two values or they computed different bits somewhere.
+ */
+static uint64_t logits_fnv(uint64_t h, const float *lg, uint32_t n)
+{
+	const unsigned char *b = (const unsigned char *)lg;
+	size_t i;
+
+	for (i = 0; i < (size_t)n * sizeof(*lg); i++) {
+		h ^= b[i];
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+#define FNV_INIT 0xcbf29ce484222325ULL
 
 int main(int argc, char **argv)
 {
@@ -115,6 +138,7 @@ int main(int argc, char **argv)
 	size_t tlen = 0, cap = 0;
 	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0, top1 = 0;
 	double nll = 0.0;
+	uint64_t fnv = FNV_INIT;
 	const char *path = NULL, *tfile = NULL;
 	FILE *f;
 
@@ -229,6 +253,8 @@ int main(int argc, char **argv)
 				float mx = lg[0], sum = 0.0f;
 				uint32_t j;
 
+				fnv = logits_fnv(fnv, lg, m.n_vocab);
+
 				for (j = 1; j < m.n_vocab; j++)
 					if (lg[j] > mx) mx = lg[j];
 				for (j = 0; j < m.n_vocab; j++)
@@ -242,6 +268,8 @@ int main(int argc, char **argv)
 		}
 		free(lga);
 		fprintf(stderr, "\r%*s\r", 40, "");
+		fprintf(stderr, "charsiu_ppl: logits fnv64 %016llx  nll %a\n",
+			(unsigned long long)fnv, nll);
 		printf("ppl %.4f  over %d scored positions of %d tokens"
 		       "  (%s, --batch in chunks of %d, ceiling %d)\n",
 		       exp(nll / scored), scored, n, path, chunk, cap);
@@ -258,6 +286,7 @@ int main(int argc, char **argv)
 		uint32_t j, am = 0;
 
 		if (!lg) { fprintf(stderr, "forward failed at %d\n", i); return 1; }
+		fnv = logits_fnv(fnv, lg, m.n_vocab);
 		/* log softmax, shifted by the max so the exp cannot overflow */
 		for (j = 1; j < m.n_vocab; j++)
 			if (lg[j] > mx) { mx = lg[j]; am = j; }
@@ -275,6 +304,8 @@ int main(int argc, char **argv)
 				exp(nll / scored));
 	}
 	fprintf(stderr, "\r%*s\r", 40, "");
+	fprintf(stderr, "charsiu_ppl: logits fnv64 %016llx  nll %a\n",
+		(unsigned long long)fnv, nll);
 	printf("ppl %.4f  over %d scored positions of %d tokens  (%s)\n",
 	       exp(nll / scored), scored, n, path);
 	llama_state_free(st);
