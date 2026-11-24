@@ -7336,6 +7336,42 @@ static int row_pool(void)
 }
 
 /*
+ * THE FEWEST ROWS WORTH A FAN OUT, for the per row stages of the batched
+ * loop: the two norms with their residuals, the rope and silu * up.
+ *
+ * A charsiu_parallel_for is a broadcast, a wakeup per worker and a barrier
+ * that waits for the slowest core (an A53), against a stage whose work at
+ * m = 6 is six rows of n_embd. A verify pass makes five of these a layer, 140
+ * on Qwen3, and npudev.c's read back already lost to the pool for exactly
+ * this reason -- too little work a dispatch. Its price HERE has not been
+ * measured, which is why this is a knob.
+ *
+ * A THRESHOLD AND NOT A GUESS: the default is 2, which is exactly the old
+ * `n > 1`, so nothing moves until the board has measured where the crossover
+ * is (CHARSIU_ROW_POOL_MIN=9 runs every verify pass inline). Inline or pooled
+ * cannot change a value: every row is computed by the same function, start
+ * to end, on one thread either way, and no row reads another.
+ */
+static unsigned row_pool_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROW_POOL_MIN");
+
+		v = e && *e ? atoi(e) : 2;
+		if (v < 2)
+			v = 2;
+	}
+	return (unsigned)v;
+}
+
+static int row_pool_for(int n)
+{
+	return row_pool() && n > 1 && (unsigned)n >= row_pool_min();
+}
+
+/*
  * THE ROPE STAGE FOR EVERY ROW, ON THE POOL.
  *
  * IT IS ONLY PARALLEL BECAUSE THE ROPE STOPPED GOING THROUGH A SHARED
@@ -7776,6 +7812,50 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       uint32_t nout)
 {
 	return matmul_rows_x(s, w, X, n, Y, k, nout, 0);
+}
+
+/*
+ * THE OUTPUT HEAD OF A GREEDY VERIFY, WHERE ONLY THE ARGMAX OF A ROW SURVIVES.
+ * best[r] is llama_argmax of row r after the softcap, on either path; Y is
+ * scratch. On the hardware the tail scale, the softcap and the argmax are one
+ * read of Y (src/argmaxrow.h); on the CPU it is the full logits, the softcap
+ * over all of them and llama_argmax, which is exactly what the caller did
+ * before, so the fallback cannot differ from it. Stage accounting is
+ * matmul_rows_x's, line for line.
+ */
+static int matmul_rows_argmax(struct llama_state *s,
+			      const struct gguf_tensor *w, const float *X,
+			      int n, float *Y, uint32_t k, uint32_t nout,
+			      float cap, int32_t *best)
+{
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+	int id = npu_id_for(s, w);
+
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul_argmax(s->pool.dev, id, X, (unsigned)n,
+					       Y, cap, best)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_dev = s->pool.dev;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
+	for (int r = 0; r < n; r++)
+		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	softcap_logits(Y, (size_t)n * nout, cap);
+	for (int r = 0; r < n; r++)
+		best[r] = llama_argmax(Y + (size_t)r * nout, nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
+	return 0;
 }
 
 static int matmul_rows_defer(struct llama_state *s,
@@ -8450,7 +8530,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(norm1_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8586,7 +8666,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * residuals, the norms -- so an arm using it measures
 			 * all of them and calls the answer the rope's. This
 			 * one moves only the rope. */
-			if (rope_pool() && row_pool() && n > 1)
+			if (rope_pool() && row_pool_for(n))
 				charsiu_parallel_for(rope_rows, &rj,
 						     (uint64_t)n);
 			else
@@ -8724,7 +8804,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(res1_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8761,7 +8841,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct silu_rows_job sj = { s, m->ffn_gelu, nff };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(silu_rows, &sj,
 						     (uint64_t)n);
 			else
@@ -8780,7 +8860,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(res2_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -9044,6 +9124,29 @@ int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 		    m->n_vocab);
 	softcap_logits(logits_all, (size_t)n * m->n_vocab,
 		       m->final_softcap);
+	s->pos = pos0 + n;
+	return 0;
+}
+
+/*
+ * THE SAME PASS FOR A VERIFIER THAT ONLY ASKS WHICH TOKEN. Everything up to
+ * the head is llama_verify_batch's; the head returns each row's argmax and
+ * never stores a scaled logit (matmul_rows_argmax). CHARSIU_SPEC_ARGMAX=1
+ * routes llama_spec_step here; anything that needs the logits themselves --
+ * charsiu_ppl --batch, a sampler -- keeps llama_verify_batch.
+ */
+int llama_verify_batch_argmax(struct llama_state *s,
+			      const struct llama_model *m, const int32_t *toks,
+			      int n, int pos0, float *scratch, int32_t *best)
+{
+	if (batch_layers(s, m, toks, n, pos0))
+		return -1;
+	for (int r = 0; r < n; r++)
+		rmsnorm(s->bxb + (size_t)r * m->n_embd,
+			s->bx + (size_t)r * m->n_embd, m->out_norm,
+			m->n_embd, m->rms_eps);
+	matmul_rows_argmax(s, m->output, s->bxb, n, scratch, m->n_embd,
+			   m->n_vocab, m->final_softcap, best);
 	s->pos = pos0 + n;
 	return 0;
 }
@@ -9723,6 +9826,15 @@ static int spec_draft(const struct llama_spec *sp, int32_t *out, int k)
 	return 0;
 }
 
+static int spec_argmax(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_SPEC_ARGMAX", 0);
+	return v;
+}
+
 int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		    const struct llama_model *m, int32_t tok, int32_t *out,
 		    int max_out)
@@ -9756,7 +9868,21 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	 */
 	if (n & 1)
 		rows[n++] = drafts[d - 1];
-	if (llama_verify_batch(s, m, rows, n, pos0, sp->logits_all)) {
+	/*
+	 * ONLY THE INDEX OF EACH ROW IS READ BELOW, so under
+	 * CHARSIU_SPEC_ARGMAX=1 the head hands back just that: best[i] is
+	 * llama_argmax of the row llama_verify_batch would have stored, and
+	 * logits_all becomes scratch. Off by default until the board has run
+	 * both arms; the desk holds the kernel against the three passes it
+	 * replaces (tests/argmax_fused.c).
+	 */
+	int32_t best[8];
+	int vrc = spec_argmax()
+		  ? llama_verify_batch_argmax(s, m, rows, n, pos0,
+					      sp->logits_all, best)
+		  : llama_verify_batch(s, m, rows, n, pos0, sp->logits_all);
+
+	if (vrc) {
 		/*
 		 * REFUSED, AND SAID ONCE. batch_layers refuses before it
 		 * touches the cache, so nothing needs undoing; the rest of the
@@ -9772,10 +9898,13 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		s->pos = pos0;
 		return llama_spec_step(sp, s, m, tok, out, max_out);
 	}
+	/* the default arm still scans only the rows it reaches, as it did */
+#define ROW_BEST(i) (spec_argmax() ? best[i]                                 \
+		     : llama_argmax(sp->logits_all + (size_t)(i) * m->n_vocab, \
+				    m->n_vocab))
 	a = 0;
 	for (int i = 0; i < d; i++) {
-		int32_t x = llama_argmax(sp->logits_all
-					 + (size_t)i * m->n_vocab, m->n_vocab);
+		int32_t x = ROW_BEST(i);
 
 		if (x != drafts[i])
 			break;
@@ -9791,8 +9920,8 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	for (int i = 0; i < a && nc < max_out; i++)
 		out[nc++] = drafts[i];
 	if (nc < max_out)
-		out[nc++] = llama_argmax(sp->logits_all + (size_t)a * m->n_vocab,
-					 m->n_vocab);
+		out[nc++] = ROW_BEST(a);
+#undef ROW_BEST
 	/*
 	 * Rows 1..a hold accepted tokens and their cache entries are right.
 	 * The correction is not in the cache yet: it is the next pass's row 0.

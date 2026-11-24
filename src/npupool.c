@@ -521,8 +521,11 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 	 * prints 0.0 here and an ungrouped one prints the largest line after
 	 * the fence and the read. It was 14 to 17% of the entry with no name.
 	 */
+	/* and, under CHARSIU_SPEC_ARGMAX=1, the verify head's fused scale and
+	 * argmax, which is charged here because it is the same pass over Y */
 	fprintf(out, "    scale %8.1f ms  %5.1f%%  the tail per channel scale, "
-		"ungrouped tensors only\n", scale, 100.0 * scale / wall);
+		"ungrouped tensors only (with the fused verify argmax)\n",
+		scale, 100.0 * scale / wall);
 	fprintf(out, "    ----\n");
 	fprintf(out, "    other %8.1f ms  %5.1f%%  %s\n", other,
 		100.0 * other / wall,

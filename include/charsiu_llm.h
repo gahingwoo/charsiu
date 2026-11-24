@@ -342,6 +342,14 @@ int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			unsigned m, float *Y);
 /*
+ * The same, for an output head whose rows only need their argmax: best[r] is
+ * llama_argmax of row r after the tail scale and a softcap of `cap` (<= 0 for
+ * none), bit identical to that, and Y is left as UNSCALED scratch. See
+ * src/argmaxrow.h.
+ */
+int  charsiu_npu_matmul_argmax(struct charsiu_npu *g, int id, const float *X,
+			       unsigned m, float *Y, float cap, int32_t *best);
+/*
  * The same call, with the INPUT DECLARED UNCHANGED since the previous batched
  * call: same X contents, same m. q, k and v multiply one RMSNorm output, and so
  * do gate and up, and the pack of that input -- gather, quantise, permute, and
@@ -1305,6 +1313,14 @@ const float *llama_forward_embd(struct llama_state *s, const float *embd,
  */
 int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 		       const int32_t *toks, int n, int pos0, float *logits_all);
+/*
+ * The same pass for a greedy verifier: best[r] is llama_argmax of what
+ * llama_verify_batch would have left in row r, and scratch (n * n_vocab
+ * floats) holds nothing a caller may read.
+ */
+int llama_verify_batch_argmax(struct llama_state *s,
+			      const struct llama_model *m, const int32_t *toks,
+			      int n, int pos0, float *scratch, int32_t *best);
 
 /*
  * Speculative decoding: k drafted tokens verified in one batched pass. Greedy

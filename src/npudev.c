@@ -34,6 +34,7 @@
 #include <math.h>
 
 #include "reusekey.h"
+#include "argmaxrow.h"
 #include "kslice.h"
 #include "overlap.h"
 #include "charsiu.h"
@@ -288,6 +289,26 @@ struct npu_outbuf {
 	 * read owns it until npu_flush_pending runs, and batch_outbuf must not
 	 * hand it to another tensor before then */
 	unsigned pending;
+	/* sized for m <= CHARSIU_NPU_SMALL_M and handed only to such calls;
+	 * see small_m() */
+	unsigned small;
+};
+
+/*
+ * THE PARKED HALF OF THE BATCHED INPUT STATE, one field for every field of
+ * struct charsiu_npu that is sized by the largest m the batched path has seen.
+ * bank_select swaps the two sets whole; nothing reads this struct directly.
+ */
+struct npu_inbank {
+	struct charsiu_bo *bin[2];
+	unsigned bin_nks;
+	struct charsiu_bo breg[2];
+	unsigned bm, bnks, bnslots;
+	size_t bd1_n, bin_stride;
+	struct reuse_key bin_key[2];
+	float *bscr;
+	uint8_t *bq;
+	float *bd1;
 };
 
 struct charsiu_npu {
@@ -501,6 +522,10 @@ struct charsiu_npu {
 	 * described neither.
 	 */
 	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
+	/* the other input bank and which one is live: see bank_select */
+	struct npu_inbank bank_other;
+	unsigned bank_small;
+	unsigned long bank_swaps;
 	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
 	/*
@@ -680,6 +705,9 @@ struct charsiu_npu {
 	 */
 	double bscale_us;       /* the per channel scale an ungrouped tensor
 				 * takes at the end, over the whole of Y */
+	/* charsiu_npu_matmul_argmax: this call's own tail scale is left to
+	 * the fused argmax pass, which charges bscale_us instead */
+	int tail_skip;
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
 	/*
@@ -2346,6 +2374,96 @@ static int defer_read_on(void);
 static int defer_check(void);
 
 /*
+ * A VERIFY PASS PAID FOR THE PROMPT'S BUFFERS.
+ *
+ * Every batched buffer object is sized by the LARGEST m this pool has seen --
+ * the input objects by batch_bufs, the output objects by batch_outbuf -- and
+ * never shrinks. The per call costs on them are not per byte USED, they are
+ * per byte OWNED: PREP_BO and FINI_BO take a handle and no range (see the note
+ * on the output slot stride), and the f16 pack's edge memset zeroes from the
+ * end of this call's rows to the end of the object. So after one 80 row
+ * prefill chunk, a speculative verify pass of 6 rows invalidates, cleans and
+ * zeroes buffers thirteen times larger than its own rows -- on every one of
+ * the ~200 calls a pass makes. A --batch-probe at m = 6, whose buffers are
+ * sized for 6, measured fence 35 and pack 17 ms against 64 and 27 in a real
+ * pass on the board.
+ *
+ * So calls at m <= CHARSIU_NPU_SMALL_M (default 8; 0 restores one pool for
+ * everything) get buffers of their own, sized by the largest SMALL m: a
+ * second input bank, swapped in whole by bank_select, and output buffers
+ * flagged `small` in the same geometry pool.
+ *
+ * IT CANNOT MOVE A VALUE. The layout inside each buffer is a function of the
+ * call's own m and not of the buffer's size: bout_stride is wide * m * 4 per
+ * call, the input slice sits at offset 0 with its rows packed at this m, and
+ * the bytes past the data are zero up to the object's end plus the 4096 pad
+ * either way. A small bank is exactly the geometry a process whose prompt
+ * never went past 8 rows has always used -- a short prompt, or the probe.
+ *
+ * THE SWAP FLUSHES A DEFERRED GATHER FIRST. npu_flush_pending restores
+ * pend.bd1 into g->bd1 only when pend.bd1_n covers g->bd1_n, and after a swap
+ * g->bd1 is the OTHER bank's array: an int8 tensor's deferred read would get
+ * the wrong per row scales, which is a fluent wrong answer. Flushing early is
+ * always legal -- CHARSIU_NPU_DEFER_READ=2 does it on every call.
+ */
+static unsigned small_m(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_SMALL_M");
+
+		v = e && *e ? atoi(e) : 8;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+static unsigned is_small_m(unsigned m)
+{
+	return small_m() && m <= small_m();
+}
+
+#define BANK_SWAP_FIELD(f) do { __typeof__(g->f) t_ = g->f;           \
+		g->f = g->bank_other.f; g->bank_other.f = t_; } while (0)
+static void bank_swap(struct charsiu_npu *g)
+{
+	for (unsigned d = 0; d < 2; d++) {
+		BANK_SWAP_FIELD(bin[d]);
+		BANK_SWAP_FIELD(breg[d]);
+		BANK_SWAP_FIELD(bin_key[d]);
+	}
+	BANK_SWAP_FIELD(bin_nks);
+	BANK_SWAP_FIELD(bm);
+	BANK_SWAP_FIELD(bnks);
+	BANK_SWAP_FIELD(bnslots);
+	BANK_SWAP_FIELD(bd1_n);
+	BANK_SWAP_FIELD(bin_stride);
+	BANK_SWAP_FIELD(bscr);
+	BANK_SWAP_FIELD(bq);
+	BANK_SWAP_FIELD(bd1);
+}
+#undef BANK_SWAP_FIELD
+
+static int bank_select(struct charsiu_npu *g, unsigned m)
+{
+	unsigned want = is_small_m(m);
+
+	if (want == g->bank_small)
+		return 0;
+	if (npu_flush_pending(g))
+		return -1;
+	bank_swap(g);
+	g->bank_small = want;
+	/* what the incoming bank's keys describe was packed before the other
+	 * bank ran; the caller's "unchanged" was about the other bank */
+	reuse_keys_drop(g->bin_key, 2);
+	g->bank_swaps++;
+	return 0;
+}
+
+/*
  * THE BISECTION. CHARSIU_NPU_DEFER_READ selects WHERE the previous tensor's
  * deferred gather is flushed, so the position can be moved without moving
  * anything else:
@@ -2385,6 +2503,11 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		fprintf(stderr, "charsiu: grouped batches: %lu calls of %lu"
 			" members, %lu fell back to one tensor a call\n",
 			g->bgroup_n, g->bgroup_members, g->bgroup_fell);
+	/* THE POSITIVE TELL for the small-m bank, under the stage clock only:
+	 * zero swaps on a run that verified means every call shared one bank */
+	if (charsiu_env_flag("CHARSIU_STAGES", 0) && small_m())
+		fprintf(stderr, "charsiu: small-m buffers (m <= %u): %lu bank"
+			" swaps\n", small_m(), g->bank_swaps);
 	free(g->pend.shadow);
 	free(g->pend.bseen);
 	free(g->pend.bd1);
@@ -2411,6 +2534,23 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_obuf; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->obuf[i].bo[d]);
+		/* the parked input bank first, while the devices are open;
+		 * the live one goes in the loop below as it always has */
+		bank_swap(g);
+		for (unsigned d = 0; d < g->ndev; d++) {
+			for (unsigned ki = 0; ki < g->bin_nks; ki++)
+				charsiu_bo_free(g->dev[d], &g->bin[d][ki]);
+			free(g->bin[d]);
+			g->bin[d] = NULL;
+			charsiu_bo_free(g->dev[d], &g->breg[d]);
+		}
+		free(g->bscr);
+		free(g->bq);
+		free(g->bd1);
+		g->bscr = NULL;
+		g->bq = NULL;
+		g->bd1 = NULL;
+		bank_swap(g);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
 			/* the batched path's, which a decode never allocates.
@@ -4571,6 +4711,9 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 {
 	size_t ins, regs;
 
+	/* which bank first: everything below is about the live one */
+	if (bank_select(g, m))
+		return -1;
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
 	reuse_keys_drop(g->bin_key, 2);   /* BOs replaced */
@@ -5004,6 +5147,7 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	 */
 	for (unsigned i = 0; i < g->n_obuf; i++)
 		if (g->obuf[i].wide == wide && g->obuf[i].slots == slots &&
+		    g->obuf[i].small == is_small_m(m) &&
 		    !g->obuf[i].pending) {
 			ob = &g->obuf[i];
 			break;
@@ -5027,6 +5171,7 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 		ob = &g->obuf[g->n_obuf++];
 		ob->wide = wide;
 		ob->slots = slots;
+		ob->small = is_small_m(m);
 	}
 	/*
 	 * WAIT FOR ANYTHING STILL WRITING IT BEFORE HANDING IT ON.
@@ -7371,7 +7516,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	/* NOT WHEN THE READ HAS NOT HAPPENED. npu_flush_pending applies it
 	 * after the deferred gather instead; see tail_scale_apply. */
-	if (!defer)
+	if (!defer && !g->tail_skip)
 		tail_scale_apply(g, e, Y, m);
 	return 0;
 }
@@ -7384,6 +7529,69 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 	g->reuse_ask = 0;
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+/*
+ * THE OUTPUT HEAD OF A GREEDY VERIFY PASS: the index of each row's maximum,
+ * and Y left holding the UNSCALED, UNCAPPED read back -- scratch, not logits.
+ * argmaxrow.h has why the index is bit identical to scale, softcap, then
+ * llama_argmax over the stored rows.
+ *
+ * THE SKIP IS THIS CALL'S TAIL AND NOTHING ELSE. npu_matmul_inner can flush
+ * an EARLIER tensor's deferred gather, and that one's tail_scale_apply runs
+ * inside npu_flush_pending, which tail_skip does not reach: only the line at
+ * the end of the inner call reads it.
+ */
+struct argmax_job {
+	const float *Y;
+	const float *scale;
+	unsigned n;
+	float cap;
+	int32_t *best;
+};
+
+static void argmax_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct argmax_job *a = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++)
+		a->best[r] = charsiu_argmax_scaled(a->Y + r * a->n, a->scale,
+						   a->n, a->cap);
+}
+
+int charsiu_npu_matmul_argmax(struct charsiu_npu *g, int id, const float *X,
+			      unsigned m, float *Y, float cap, int32_t *best)
+{
+	double t0 = now_us();
+	int rc;
+
+	g->reuse_ask = 0;
+	g->tail_skip = 1;
+	rc = npu_matmul_inner(g, id, X, m, Y, 0);
+	g->tail_skip = 0;
+	if (!rc) {
+		const struct npu_entry *e = &g->ent[id];
+		/* the same condition tail_scale_apply returns early on */
+		struct argmax_job aj = {
+			Y, w4_for(g, e->t) && tensor_grouped(g, e->t)
+			   ? NULL : e->t->scale,
+			(unsigned)e->t->n, cap, best
+		};
+		double ts = now_us();
+
+		/* rows are independent and a row is one thread's whole
+		 * scan, so the pool cannot change an index */
+		if (g->poolread == 1 ||
+		    (g->poolread == 2 &&
+		     (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(argmax_rows, &aj, m);
+		else
+			argmax_rows(&aj, 0, m);
+		g->bscale_us += now_us() - ts;
+	}
 	g->bwall_us += now_us() - t0;
 	return rc;
 }
