@@ -31,5 +31,8 @@ for a in "$@"; do
 		rc=1; continue
 	fi
 	rm -f "$t" && echo "removed $t"
+	# the weight cache beside it is the same model, quantised; without the
+	# model it is 600 MB nothing will ever read
+	[ -f "$t.wcache" ] && rm -f "$t.wcache" && echo "removed $t.wcache"
 done
 exit $rc

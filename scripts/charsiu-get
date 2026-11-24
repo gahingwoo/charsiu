@@ -10,6 +10,7 @@
 #   charsiu-get bartowski/Foo-GGUF F  fetch that exact file
 #   charsiu-get https://host/m.gguf   fetch a URL
 #   charsiu-get --check FILE          just gate a local file
+#   charsiu-get --zoo                 the zoo as data, for programs (below)
 #
 # WHY THIS IS NOT "curl the file and be done".
 #
@@ -227,8 +228,49 @@ claim_config() {
 	fi
 }
 
+# THE HASH HUGGING FACE PUBLISHES FOR A FILE, from the repo's tree: every
+# file stored in LFS carries its sha256 there as lfs.oid. Empty when the API
+# does not answer or the file has none; the caller says which.
+hf_sha256() {
+	api "$HF/api/models/$1/tree/main" 2>/dev/null | tr -d '\n' \
+		| sed 's/{"type"/\
+{"type"/g' | grep "\"path\":\"$2\"" \
+		| grep -o '"lfs":{"oid":"[0-9a-f]\{64\}"' | grep -o '[0-9a-f]\{64\}' | head -1
+}
+
+sha256_of() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+	elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+	elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | sed 's/.*= *//'
+	fi
+}
+
+# check_hash FILE REPO NAME. A RESUMED DOWNLOAD CAN BE WRONG IN A WAY THE GATE
+# CANNOT SEE: the header and every tensor's type are fine and a megabyte in
+# the middle is from a different revision of the file. The gate reads the
+# structure; only the hash reads the bytes.
+check_hash() {
+	[ -n "$2" ] || { say "no published hash for a plain URL; the gate alone decides"; return 0; }
+	_want=$(hf_sha256 "$2" "$3")
+	if [ -z "$_want" ]; then
+		warn "could not read the published sha256 for $3; the gate alone decides"
+		return 0
+	fi
+	_got=$(sha256_of "$1")
+	if [ -z "$_got" ]; then
+		warn "no sha256sum here to check $3 with; the gate alone decides"
+		return 0
+	fi
+	if [ "$_got" != "$_want" ]; then
+		rm -f "$1"
+		die "sha256 of $3 is $_got, and Hugging Face publishes $_want.
+  The download was deleted; running the same command again fetches it fresh."
+	fi
+	say "sha256 matches what Hugging Face publishes ($(echo "$_want" | cut -c1-12)...)"
+}
+
 fetch_and_gate() {
-	url="$1"; base="$2"; want_mb="${3:-0}"
+	url="$1"; base="$2"; want_mb="${3:-0}"; hrepo="${4:-}"
 	CK=$(find_check)
 	[ -z "$CK" ] && die "charsiu_check not found; build it (make charsiu_check) or set CHARSIU_CHECK"
 
@@ -312,6 +354,7 @@ about ${want_mb} MB"
   (curl -C - / wget -c). On a board's link that is normal, not a fault."
 	fi
 
+	check_hash "$part" "$hrepo" "$base"
 	say "checking what actually came down"
 	"$CK" "$part" || _grc=$?
 	_grc=${_grc:-0}
@@ -377,14 +420,14 @@ pull_row() {
 	_mmp=$(echo "$_row"  | cut -d'|' -f6)
 	_mmb=$(echo "$_row"  | cut -d'|' -f7)
 
-	fetch_and_gate "$HF/$_repo/resolve/main/$_file" "$_file" "$_mb" || return 1
+	fetch_and_gate "$HF/$_repo/resolve/main/$_file" "$_file" "$_mb" "$_repo" || return 1
 	if [ -z "$_mmp" ]; then
 		say_how "$_file"
 		return 0
 	fi
 	echo
 	echo "  and its vision tower, which is the other half of this model:"
-	fetch_and_gate "$HF/$_repo/resolve/main/$_mmp" "$_mmp" "$_mmb" || return 1
+	fetch_and_gate "$HF/$_repo/resolve/main/$_mmp" "$_mmp" "$_mmb" "$_repo" || return 1
 	echo
 	echo "  Both halves are here. To ask it about a picture:"
 	echo "    charsiu --image photo.jpg \"what is in this picture?\""
@@ -411,6 +454,20 @@ say_how() {
 case "${1:-}" in
 ""|--list|list) list_zoo; exit 0 ;;
 --wizard)       wizard; exit $? ;;
+# THE ZOO AS DATA, for a program and not a person: the desktop app draws its
+# own list from it rather than scraping the table above. One record a line,
+# fields split by |, the first field saying what the line is:
+#   dir|DIR  sysdir|DIR  current|PATH
+#   zoo|name|repo|file|MB|note|mmproj file|mmproj MB
+# A download lands in DIR as FILE.part and is renamed to FILE when it passes.
+--zoo)
+	printf 'dir|%s\n' "$MODELS_DIR"
+	[ -d "$CHARSIU_SYS_MODELS" ] && [ "$CHARSIU_SYS_MODELS" != "$MODELS_DIR" ] \
+		&& printf 'sysdir|%s\n' "$CHARSIU_SYS_MODELS"
+	_cur=$(current_model)
+	[ -n "$_cur" ] && printf 'current|%s\n' "$_cur"
+	zoo | awk -F'|' '{ printf "zoo|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, $7 }'
+	exit 0 ;;
 -h|--help)      sed -n '4,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 --check)
 	[ $# -ge 2 ] || die "--check needs a file"
@@ -438,7 +495,7 @@ http://*|https://*)
 	fetch_and_gate "$ARG" "$(basename "$ARG")" 0 ;;
 */*)
 	if [ $# -ge 2 ]; then
-		fetch_and_gate "$HF/$ARG/resolve/main/$2" "$2" 0
+		fetch_and_gate "$HF/$ARG/resolve/main/$2" "$2" 0 "$ARG"
 	else
 		list_repo "$ARG"
 	fi ;;

@@ -233,6 +233,13 @@ boot, and on Armbian the previous kernel is kept as `/boot/Image.previous`.
 The read-only checks still run, which is the point: it shows what the installer
 sees on your machine.
 
+On Windows on Arm (the TaishanPi 3M under Windows 11, with the rknpu.sys
+driver), charsiu is built and packaged by
+[woa-rk3576-npu](https://github.com/gahingwoo/woa-rk3576-npu), which carries
+the Windows device layer; the commands are the same (`charsiu`, `charsiu run`,
+`charsiu pull`, `charsiu serve`) and its `win/charsiu-install.ps1` is the
+installer.
+
 There are two channels. `stable` installs the runtime and the other modalities.
 `dev` adds the board probes, the test corpora and `charsiu_ppl`, which is what any
 measurement round needs.

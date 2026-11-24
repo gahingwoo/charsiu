@@ -73,18 +73,33 @@ POOLCPUS=$(ini_get run pool_cpus)
 # whatever --port said, which is worse than printing nothing: it hands somebody
 # an address that does not answer and sends them looking for a network fault.
 PORT=11434
+HOST=0.0.0.0
 prev=""
 for a in "$@"; do
-	[ "$prev" = "--port" ] && { PORT="$a"; break; }
+	[ "$prev" = "--port" ] && PORT="$a"
+	[ "$prev" = "--host" ] && HOST="$a"
 	prev="$a"
 done
-ip=$(ip -4 addr show scope global 2>/dev/null \
-     | awk '/inet /{sub("/.*","",$2); print $2; exit}')
+# A LOOPBACK SERVER IS NOT REACHABLE AT THE LAN ADDRESS, and --port 0 has no
+# port yet: charsiu_serve's own ready line names the real one. Printing the
+# LAN address in either case hands somebody an address that does not answer.
+ip=""
+if [ "$HOST" = 0.0.0.0 ] && [ "$PORT" != 0 ]; then
+	ip=$(ip -4 addr show scope global 2>/dev/null \
+	     | awk '/inet /{sub("/.*","",$2); print $2; exit}')
+fi
 if [ -n "$ip" ]; then
 	printf '\n  reachable at  http://%s:%s\n' "$ip" "$PORT" >&2
 	printf '    OpenAI     %s/v1/chat/completions\n' "http://$ip:$PORT" >&2
 	printf '    Anthropic  %s/v1/messages\n' "http://$ip:$PORT" >&2
 fi
+
+# THE WEIGHT CACHE, opt in as it is for charsiu_run: it puts a file the size
+# of the quantised model beside the model. [run] cache = yes turns it on.
+CACHE=$(ini_get run cache)
+case "$CACHE" in
+yes|1|true|on) set -- --cache "$@" ;;
+esac
 
 # shellcheck disable=SC2086
 exec env $E "$BIN" "$MODEL" -c "$CTX" -t "$THREADS" "$@"
