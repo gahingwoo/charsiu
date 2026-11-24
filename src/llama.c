@@ -121,18 +121,21 @@ static int kv16_on(void)
 }
 
 /*
- * CHARSIU_ATTN_GQA: THE GROUPED DECODE KERNEL OVER THE FLOAT CACHE. OFF until
- * the board times it. It is bit identical to attn_heads (tests/dattn_exact.c
- * holds it there at every shape it walks), so the board needs a timing and a
- * text md5 to turn it on, not a perplexity. CHARSIU_KV16 uses this kernel
- * whatever this says, because it is the only one that reads halves.
+ * CHARSIU_ATTN_GQA: THE GROUPED DECODE KERNEL OVER THE FLOAT CACHE. ON. It is
+ * bit identical to attn_heads (tests/dattn_exact.c holds it there at every
+ * shape it walks), so what turned it on was a timing and a text md5. On the
+ * CM5, three models, interleaved: text the same on all 21 short prompts and
+ * the 6 long ones, slower on none, 1.13-1.18x decode at 1400 tokens of
+ * context on the two Qwen3s. CHARSIU_ATTN_GQA=0 is the old kernel.
+ * CHARSIU_KV16 uses this kernel whatever this says, because it is the only
+ * one that reads halves.
  */
 static int attn_gqa_on(void)
 {
 	static int v = -1;
 
 	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_ATTN_GQA", 0) || kv16_on();
+		v = charsiu_env_flag("CHARSIU_ATTN_GQA", 1) || kv16_on();
 	return v;
 }
 

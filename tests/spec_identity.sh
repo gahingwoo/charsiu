@@ -24,10 +24,11 @@
 #                                                            must have accepted
 #                                                            something
 #
-# THE PLAIN ARM IS CHARSIU_SPEC=0 BY NAME, though unset is off too: it is
-# the arm the whole test is measured against. On the desk every arm must
-# match it. On the board a batched row is not bit identical to a single
-# one, so a mismatch there is a near tie, not necessarily a broken verifier.
+# THE PLAIN ARM IS CHARSIU_SPEC=0 BY NAME, because unset is auto: it is
+# the arm the whole test is measured against. Every arm must match it, on
+# the desk and on the board: a verify row computes the same bits as a
+# single step (charsiu_ppl's logits hash, token loop against --batch), so a
+# mismatch anywhere is a broken verifier, not a near tie.
 #
 # WHY auto x0.3. With no NPU a pass runs its rows one at a time and costs
 # w plain steps, so on the desk the policy correctly stops after its first

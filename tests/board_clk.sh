@@ -117,8 +117,7 @@ fi
 export CHARSIU_RUN CHARSIU_RUN_BIN 2>/dev/null || true
 
 # SPECULATION IS PINNED OFF HERE, for every script that sources this.
-# Unset is off in charsiu_run as well, but a default can move again, and
-# every board script's "plain" arm, per-token stage table and call count
+# Unset is auto in charsiu_run, and every board script's "plain" arm, per-token stage table and call count
 # assume one forward pass a token, so the arm is kept by name. A script
 # that wants the policy says CHARSIU_SPEC=auto; one that sets CHARSIU_SPEC
 # itself, or passes --spec, is unaffected.
