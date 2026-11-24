@@ -5113,6 +5113,40 @@ static int batch_serial_for(unsigned m)
 	return !(parallel_min_m() && m >= parallel_min_m());
 }
 
+/*
+ * THE SERIAL PAIR, PIPELINED ON THE CPU SIDE. CHARSIU_NPU_MM_PIPE=0 is the
+ * old order.
+ *
+ * Serialised (batch_serial_for), a batched call used to run strictly in
+ * series: pack d0 | hw d0 | pack d1 | hw d1 | read d0 | read d1 | scale.
+ * The guard is about the two CORES never computing at the same time, and
+ * says nothing about the CPU, so with this on it runs
+ *
+ *   pack d0 | hw d0              | hw d1                    |
+ *           | pack d1 (CPU)      | read d0, scale d0-only   | read d1 | scale
+ *
+ * and device 1 is still not submitted until device 0's fence has returned.
+ * Every read is the same batch_read_device on the same buffer with the same
+ * first-write flags, in the same ascending device order, so the sums are the
+ * same sums: this moves WHEN a read runs, never what it adds or in what
+ * order. CHARSIU_NPU_SUBMIT_FIRST=1 reverses the submit order and would put
+ * device 1's read before device 0's, so it keeps the old order.
+ */
+static int mm_pipe(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_MM_PIPE", 1);
+	return v;
+}
+
+static int mm_pipe_for(const struct charsiu_npu *g, unsigned m)
+{
+	return g->ndev == 2 && batch_serial_for(m) && !submit_first() &&
+	       mm_pipe();
+}
+
 /* CHARSIU_NPU_PACK_GATHER=1: gather every K slice into scratch before packing,
  * which is what this did before the stride, and the control for measuring it */
 static int pack_gather(void)
@@ -7050,6 +7084,22 @@ static int batch_refused(struct charsiu_npu *g, int id, unsigned m)
 	return 0;
 }
 
+/*
+ * AN EARLY RETURN WITH A DEVICE STILL COMPUTING. The pipe leaves one device
+ * submitted across the next device's pack and read; a fault in between must
+ * not hand the next call an input buffer the hardware is still reading. One
+ * prep is the wait; the fini hands the buffer back, as batch_outbuf does.
+ */
+static void pipe_drain_one(struct charsiu_npu *g, struct npu_outbuf *ob,
+			   int d)
+{
+	if (d < 0 || !(ob->busy & (1u << d)))
+		return;
+	charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+	charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+	ob->busy &= ~(1u << d);
+}
+
 static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			    unsigned m, float *Y, int defer)
 {
@@ -7233,6 +7283,12 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	if (flush_at(g, 5))
 		return -1;
 
+	/* see mm_pipe: fly is the device submitted and not yet fenced, fenced
+	 * and readd the devices the loop has already fenced and read */
+	const int pipe = mm_pipe_for(g, m);
+	int fly = -1;
+	unsigned fenced = 0, readd = 0;
+
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
 		unsigned nt = 0, nh = 0, done_ki = 0, use_ki = 0, need = 0;
@@ -7361,6 +7417,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						charsiu_bo_fini(g->dev[d],
 							&g->bin[d][kj]);
 				charsiu_bo_fini(g->dev[d], &g->breg[d]);
+				pipe_drain_one(g, ob, fly);
 				return -1;
 			}
 			g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
@@ -7394,6 +7451,18 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				      done_ki, ksh);
 		if (!nt)
 			continue;
+		/* THE PIPE: the other core finishes before this one starts,
+		 * which is the guard below, only fenced after this device's
+		 * pack instead of before it */
+		if (pipe && fly >= 0) {
+			double w = fence_bo(g, (unsigned)fly, &ob->bo[fly]);
+
+			fence_width(g, (unsigned)(g->bout_stride
+						  / ((size_t)m * 4)),
+				    w, mac_for_dev(g, e, (unsigned)fly, m));
+			ob->busy &= ~(1u << fly);
+			fenced |= 1u << fly;
+		}
 		tp = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
@@ -7412,6 +7481,19 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * fence below clears it again */
 		ob->busy |= 1u << d;
 		g->bsub_us += now_us() - tp;
+		if (pipe) {
+			/* and the fenced device is read while this one runs */
+			if (fly >= 0 && !defer) {
+				if (batch_read_device(g, e, ob, (unsigned)fly,
+						      Y, m)) {
+					pipe_drain_one(g, ob, (int)d);
+					return -1;
+				}
+				readd |= 1u << fly;
+			}
+			fly = (int)d;
+			continue;
+		}
 		/*
 		 * THE CORE PAIR, AND THE ONE KNOB THAT REMOVES IT.
 		 *
@@ -7476,7 +7558,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * still owes one.
 	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		{
+		if (!((fenced >> d) & 1u)) {
 			double w = fence_bo(g, d, &ob->bo[d]);
 
 			/* the WHOLE fence of this device is charged to this
@@ -7488,7 +7570,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				    w, mac_for_dev(g, e, d, m));
 		}
 		ob->busy &= ~(1u << d);
-		if (!defer && batch_read_device(g, e, ob, d, Y, m))
+		if (!defer && !((readd >> d) & 1u) &&
+		    batch_read_device(g, e, ob, d, Y, m))
 			return -1;
 	}
 	/*
@@ -7847,6 +7930,24 @@ int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
  */
 #define NPU_GROUP_MAX 4
 
+/* one member's read of one device, with that member's own first-write flags
+ * swapped in and out of g->bseen around it */
+static int group_read_member(struct charsiu_npu *g, const struct npu_entry *e,
+			     struct npu_outbuf *ob, unsigned d, float *Y,
+			     unsigned m, unsigned char *seen, uint64_t *sdev,
+			     size_t stride)
+{
+	int bad;
+
+	memcpy(g->bseen, seen, e->n_slices);
+	g->bseen_dev = *sdev;
+	g->bout_stride = stride;
+	bad = batch_read_device(g, e, ob, d, Y, m);
+	memcpy(seen, g->bseen, e->n_slices);
+	*sdev = g->bseen_dev;
+	return bad;
+}
+
 static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 				  unsigned n, const float *X, unsigned m,
 				  float *const *Ys)
@@ -7862,7 +7963,8 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 	struct charsiu_joblist jl;
 	double t0, tprep = now_us();
 	uint8_t zp;
-	int rc = -1;
+	int rc = -1, pipe = 0, fly = -1;
+	unsigned rd[NPU_GROUP_MAX], scaled = 0;
 
 	if (!g || g->dead || n < 2 || n > NPU_GROUP_MAX || m < 2 ||
 	    g->ndev > 2)
@@ -8007,6 +8109,11 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 	/* a LEADER: X is new everywhere, whatever the keys say (reusekey.h) */
 	reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
 
+	/* see mm_pipe; rd[i] is the devices member i has been read from */
+	pipe = mm_pipe_for(g, m);
+	for (i = 0; i < n; i++)
+		rd[i] = 0;
+
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
 		unsigned nt = 0, nh = 0, no = 0, done_ki = 0, use_ki = 0;
@@ -8107,6 +8214,20 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 				      done_ki, 0);
 		if (!nt)
 			continue;
+		/* THE PIPE: the device in flight is fenced only now, after
+		 * this one's pack, and still before this one is submitted */
+		if (pipe && fly >= 0)
+			for (i = 0; i < n; i++) {
+				if (!nsl[i][fly])
+					continue;
+				double w = fence_bo(g, (unsigned)fly,
+						    &obs[i]->bo[fly]);
+
+				fence_width(g, wide[i], w,
+					    mac_for_dev(g, es[i],
+							(unsigned)fly, m));
+				obs[i]->busy &= ~(1u << fly);
+			}
 		tp = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
@@ -8124,6 +8245,29 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 			if (nsl[i][d])
 				obs[i]->busy |= 1u << d;
 		g->bsub_us += now_us() - tp;
+		if (pipe) {
+			/* the fenced device's members are read while this one
+			 * computes, and a member that device finished is
+			 * scaled too: its sum is complete */
+			if (fly >= 0)
+				for (i = 0; i < n; i++) {
+					if (!nsl[i][fly])
+						continue;
+					if (group_read_member(g, es[i], obs[i],
+							(unsigned)fly, Ys[i], m,
+							seen + soff[i], &sdev[i],
+							stride[i]))
+						goto out;
+					rd[i] |= 1u << fly;
+					if (!nsl[i][d]) {
+						tail_scale_apply(g, es[i],
+								 Ys[i], m);
+						scaled |= 1u << i;
+					}
+				}
+			fly = (int)d;
+			continue;
+		}
 		/* THE CORE PAIR: see npu_matmul_inner. Serialised, this
 		 * device finishes before the other is submitted. */
 		if (batch_serial_for(m) && g->ndev > 1)
@@ -8148,9 +8292,7 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 	 */
 	for (unsigned d = 0; d < g->ndev; d++)
 		for (i = 0; i < n; i++) {
-			int bad;
-
-			if (!nsl[i][d])
+			if (!nsl[i][d] || ((rd[i] >> d) & 1u))
 				continue;
 			{
 				double w = fence_bo(g, d, &obs[i]->bo[d]);
@@ -8159,22 +8301,24 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 					    mac_for_dev(g, es[i], d, m));
 			}
 			obs[i]->busy &= ~(1u << d);
-			memcpy(g->bseen, seen + soff[i], es[i]->n_slices);
-			g->bseen_dev = sdev[i];
-			g->bout_stride = stride[i];
-			bad = batch_read_device(g, es[i], obs[i], d, Ys[i], m);
-			memcpy(seen + soff[i], g->bseen, es[i]->n_slices);
-			sdev[i] = g->bseen_dev;
-			if (bad)
+			if (group_read_member(g, es[i], obs[i], d, Ys[i], m,
+					      seen + soff[i], &sdev[i],
+					      stride[i]))
 				goto out;
 		}
 	g->busy_us += now_us() - t0;
 	for (i = 0; i < n; i++)
-		tail_scale_apply(g, es[i], Ys[i], m);
+		if (!((scaled >> i) & 1u))
+			tail_scale_apply(g, es[i], Ys[i], m);
 	g->bgroup_n++;
 	g->bgroup_members += n;
 	rc = 0;
 out:
+	/* a fault with a device still computing: see pipe_drain_one */
+	if (rc)
+		for (i = 0; i < n; i++)
+			for (unsigned d = 0; d < g->ndev; d++)
+				pipe_drain_one(g, obs[i], (int)d);
 	free(seen);
 	return rc;
 }
