@@ -165,6 +165,16 @@ $(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BU
 $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
 
+# IS ONE ROW OF THE int4 MATMUL A PURE FUNCTION OF THAT ROW? memcmp across
+# batch width, row index, neighbours, core and grouping, against the m = 1
+# decode path. Native for the CPU control on the desk, static for the board.
+# Same source list as charsiu_ppl's.
+$(BUILD)/npu_rowpure: tools/npu_rowpure.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/npu_rowpure.aarch64: tools/npu_rowpure.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+
 #
 # AND IT WENT STALE THE SAME WAY, IN BOTH SCALAR RULES. The paragraph
 # below this one says "a target that is never built is a target that is
