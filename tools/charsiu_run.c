@@ -203,6 +203,33 @@ static void prefill_say_widths(const struct prefill_widths *pw)
 		fprintf(stderr, "%s)", pw->over ? "+.." : "");
 }
 
+/*
+ * CHARSIU_SPEC / --spec: "auto" is the policy, a number is that many drafts
+ * a pass (0 off), and an empty value is off, as charsiu_env_flag reads one.
+ * ANYTHING ELSE IS SAID AND MEANS OFF: atoi("on") is 0, and a switch whose
+ * misspelling silently meant "off" would be read as speculation gaining
+ * nothing.
+ */
+#define SPEC_AUTO (-5)
+
+static int spec_parse(const char *v)
+{
+	char *end;
+	long k;
+
+	if (!v || !*v)
+		return 0;
+	if (!strcmp(v, "auto"))
+		return SPEC_AUTO;
+	k = strtol(v, &end, 10);
+	if (*end || k < 0) {
+		fprintf(stderr, "charsiu: speculation \"%s\" is not auto, 0 or"
+			" a draft count; not speculating\n", v);
+		return 0;
+	}
+	return (int)k;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -224,7 +251,10 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
-"  --spec K      speculate K tokens a pass (1..5; greedy only, text identical)\n"
+"  --spec K      speculate: auto (the default, CHARSIU_SPEC unset) decides\n"
+"                 a pass at a time from measured costs; 0 is off; 1..5\n"
+"                 is that many drafts every pass. Greedy only, the text\n"
+"                 is identical either way.\n"
 "  --repeat N     run the same prompt N times in ONE process, so a rate\n"
 "                 question does not pay for N model loads. The cache is\n"
 "                 reset between them and each is separated by a marker\n"
@@ -321,11 +351,23 @@ int main(int argc, char **argv)
 	int ignore_eos = 0;
 	/*
 	 * --spec K, or CHARSIU_SPEC=K: prompt-lookup drafts verified in one
-	 * batched pass. Off unless asked, because a pass at m = 4 has not been
-	 * priced on the board yet; the acceptance it reports is a property of
-	 * the model and is measured anywhere.
+	 * batched pass.
+	 *
+	 * AUTO BY DEFAULT, which is not the same as on. The board priced a
+	 * pass at two to three plain steps, so a fixed k made decode 22%
+	 * SLOWER on open prose and faster on copy-heavy text. Auto runs the
+	 * cost policy in llama.c (the note over spec_policy): it speculates
+	 * only where this run's own timings and acceptance say it pays, and
+	 * backs off when a pass loses. 0 is off -- the plain loop, untouched;
+	 * K > 0 is K drafts every pass, the old behaviour, no policy.
+	 *
+	 * EVERY BOARD SCRIPT PINS 0 (tests/board_clk.sh), because they were
+	 * written with an unset CHARSIU_SPEC as their plain arm and a default
+	 * that moves breaks every script that took it as one. They spell auto
+	 * as CHARSIU_SPEC=auto when they want it.
 	 */
-	int spec_k = getenv("CHARSIU_SPEC") ? atoi(getenv("CHARSIU_SPEC")) : 0;
+	int spec_k = getenv("CHARSIU_SPEC") ? spec_parse(getenv("CHARSIU_SPEC"))
+					  : SPEC_AUTO;
 	struct llama_spec spec;
 	int spec_on = 0;
 	unsigned batch_probe = 0;
@@ -389,7 +431,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bos")) add_bos = 1;
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
-		else if (!strcmp(a, "--spec")) spec_k = atoi(NEXT());
+		else if (!strcmp(a, "--spec")) spec_k = spec_parse(NEXT());
 		/*
 		 * AFTER STAGING AND INSTEAD OF GENERATING. The question is
 		 * what batching buys on this board's own weights, and a token
@@ -1260,7 +1302,31 @@ int main(int argc, char **argv)
 	 * a different fact.
 	 */
 	spec_on = 0;
-	if (spec_k > 0) {
+	/*
+	 * AUTO SAYS LESS THAN FORCED. Nobody asked auto to speculate, so a
+	 * sampled run stays quiet -- sampling is plain, as it always was --
+	 * and a refused model is said once, because "speculation gained
+	 * nothing" and "speculation never ran" still read the same in a log.
+	 */
+	if (spec_k == SPEC_AUTO) {
+		const char *why = llama_batch_why_not(&m);
+
+		if (temp > 0.0f)
+			;
+		else if (why) {
+			if (!quiet)
+				fprintf(stderr, "charsiu: speculation (auto) "
+					"off, the batched forward refuses "
+					"this model (%s)\n", why);
+		} else if (llama_spec_init(&spec, &m, spec_k, st->n_ctx))
+			fprintf(stderr, "charsiu: speculation off, no "
+				"memory\n");
+		else {
+			for (i = 0; i < n_ids; i++)
+				llama_spec_push(&spec, ids[i]);
+			spec_on = 1;
+		}
+	} else if (spec_k > 0) {
 		const char *why = llama_batch_why_not(&m);
 
 		if (temp > 0.0f)

@@ -8805,8 +8805,11 @@ static int matmul_rows_split(struct llama_state *s,
 /*
  * q/k/v OR gate/up AS ONE NPU CALL: charsiu_npu_matmul_group.
  *
- * OFF BY DEFAULT, pending a board A/B: CHARSIU_NPU_BATCH_GROUP=1 turns it
- * on. It is for the speculative verify pass, m = 2..8 rows, where each of
+ * ON BY DEFAULT since the board A/B of 2026-11-24 (CM5, Qwen3-0.6B int4):
+ * faster than the per tensor calls in every speculative run, 0 fall backs,
+ * plain decode untouched (m = 1 never comes here). CHARSIU_NPU_BATCH_GROUP=0
+ * restores the per tensor calls. UNMEASURED ON BATCHED PREFILL, which goes
+ * through here too at its own widths. It is for the speculative verify pass, m = 2..8 rows, where each of
  * these projections is one slot on Qwen3-0.6B and one slot is one core: the
  * per tensor calls below keep one core busy at a time and pay a pack and a
  * fence each. The group packs X once a device, submits both devices and
@@ -8827,7 +8830,7 @@ static int batch_group(void)
 	static int v = -1;
 
 	if (v < 0)
-		v = charsiu_env_flag("CHARSIU_NPU_BATCH_GROUP", 0);
+		v = charsiu_env_flag("CHARSIU_NPU_BATCH_GROUP", 1);
 	return v;
 }
 
@@ -9370,7 +9373,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
-			/* CHARSIU_NPU_BATCH_GROUP=1 (off by default): q, k
+			/* CHARSIU_NPU_BATCH_GROUP (on by default): q, k
 			 * and v -- or q and k where the layer has no attn_v --
 			 * in one NPU call. 0 means it did nothing usable and
 			 * the three calls below run exactly as without it.
@@ -10547,12 +10550,14 @@ int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
  * WHAT THIS DOES NOT DO. Sampling at a temperature is left to the plain
  * loop: lossless speculative SAMPLING exists (accept with p_target(d), else
  * draw from the residual) and is not written here, so with --temp the runner
- * says so once and does not speculate. And a pass at m = 4 has never been
- * PRICED on the board -- the argument that it costs about one decode step is
- * an argument about bytes, and the fence and the read back both grow with m.
+ * says so once and does not speculate. And the argument that a pass costs
+ * about one decode step was an argument about bytes, and the board says
+ * otherwise: the fence and the read back both grow with m, and a pass costs
+ * between two and three plain steps (the cost policy below has the numbers).
  * The acceptance statistics this prints are a property of the model and the
  * prompt and are measured on any machine; the pass cost is the one number
- * that needs the hardware.
+ * that needs the hardware -- which is why the policy measures it in the run
+ * rather than carrying it as a constant.
  */
 
 static void spec_push(struct llama_spec *sp, int32_t tok)
@@ -10561,10 +10566,181 @@ static void spec_push(struct llama_spec *sp, int32_t tok)
 		sp->hist[sp->n_hist++] = tok;
 }
 
+/*
+ * THE COST POLICY: SPECULATE ONLY WHERE THIS RUN HAS MEASURED IT PAYS.
+ *
+ * The board priced the pass on 2026-11-24 (CM5, Qwen3-0.6B int4, grouped
+ * submit): about 120 ms for a pass against 41-50 ms for a plain token, so a
+ * pass has to commit about 2.5 tokens to break even, and with the chat
+ * template prompt lookup managed 1.86, 1.34 and 1.15 tokens a pass on three
+ * prompts -- +12%, -4% and -22% against plain. A fixed k is a bet on the
+ * prompt. This makes the bet a pass at a time, from three measured things:
+ *
+ *   t_plain     a plain step, timed here (running mean, 1/8 weight)
+ *   t_ver[w]    a pass at width 2, 4 or 6, timed here the same way
+ *   alpha_i     how often draft i is right given drafts 0..i-1 were, as
+ *               counts decayed by 0.9 an observation (a window of about ten)
+ *
+ * and the rule: send d' of the d drafts, choosing d' to maximise
+ * E(d') / t_ver[width(d')], where E(d') = 1 + a0 + a0 a1 + ... is the tokens
+ * a pass is expected to commit; and only if E * t_plain > t_ver, i.e. only
+ * if that rate beats one token per t_plain. Otherwise the step is plain.
+ *
+ * THE ACCEPTANCE IS MEASURED ON PLAIN STEPS TOO, AT NO COST. A plain step
+ * still asks the drafter, keeps what it proposed, and checks it against the
+ * tokens greedy then actually produces -- which is exactly the test a pass
+ * would have applied, because greedy is deterministic. So a run that stopped
+ * speculating keeps measuring, and starts again the moment a copy-heavy
+ * stretch makes the drafts right, without paying a pass to find out.
+ *
+ * A WIDTH NOT YET MEASURED IS ESTIMATED OPTIMISTICALLY, so that it gets
+ * tried: between two measured widths it is interpolated; above the widest
+ * measured one it costs what that one does (a wider pass costs at least as
+ * much, and a batched pass is mostly fixed cost -- a line through a narrow
+ * pass and the plain step, which is a different code path, put width 6 at
+ * twice what the board measures); below the narrowest it is on the line from
+ * (1, t_plain); and with nothing measured it is t_plain * (1 + SPEC_SLOPE0
+ * a row after the first), 0.35 being about the board's (120 - 45) / 5 / 45.
+ * The guess only decides whether a width is TRIED. The first sample at every
+ * width, and of the plain step, is discarded as cold, so a width is tried
+ * at most twice on a guess before its own number replaces it -- six passes
+ * in a run at most, each of them still behind the gate and the ledger.
+ *
+ * THE BACK-OFF IS FOR WHEN THE ESTIMATE IS WRONG. Every pass is priced after
+ * the fact against what plain would have cost for the tokens it committed
+ * (nc * t_plain - its own time) and the result added to a ledger, capped at
+ * one plain step of credit. A pass that loses and leaves the ledger negative
+ * stops speculation for `backoff` plain tokens, which doubles each time this
+ * happens (8, 16, ... 256) and returns to 8 once the ledger has earned its
+ * cap again. So a stretch of speculation loses at most one pass's excess
+ * over plain plus one step of credit before it is stopped, and the stops are
+ * spaced exponentially: if the estimate were wrong every time, the loss would
+ * still tend to about (t_ver - t_plain + t_plain) / (256 t_plain), under 1.5%
+ * at the board's numbers, plus the ramp. On top of that the gate only opens
+ * where the measured numbers say the expected gain is positive.
+ *
+ * WHAT IT DOES NOT CHANGE: which tokens. Every committed token is still the
+ * plain loop's token; the policy only decides how many drafts a pass carries
+ * and whether there is a pass. Forced k (k > 0 to llama_spec_init) runs none
+ * of this and sends every draft, as before; only the timing is recorded, for
+ * the report.
+ */
+#define SPEC_DECAY        0.9
+#define SPEC_PRIOR_N      1.0   /* pseudo-observations, at mean 0.5 */
+#define SPEC_EWMA         0.125
+#define SPEC_SLOPE0       0.35  /* rows after the first, in plain steps */
+#define SPEC_BACKOFF0     8
+#define SPEC_BACKOFF_MAX  256
+#define SPEC_LEDGER_CAP   1.0   /* in plain steps */
+
+/* the width a pass of d drafts runs at, as 0, 1, 2 for 2, 4, 6 rows */
+static int spec_wi(int d)
+{
+	int n = 1 + d;
+
+	n += n & 1;
+	return n / 2 - 1;
+}
+
+/* THE FIRST SAMPLE IS COLD and is not kept: see "A WIDTH NOT YET MEASURED" */
+static void spec_mean(double *v, int *n, double x)
+{
+	if (*n == 1)
+		*v = x;
+	else if (*n > 1)
+		*v += SPEC_EWMA * (x - *v);
+	(*n)++;
+}
+
+static double spec_alpha(const struct llama_spec *sp, int i)
+{
+	return (sp->hit[i] + 0.5 * SPEC_PRIOR_N) / (sp->reach[i] + SPEC_PRIOR_N);
+}
+
+static void spec_obs(struct llama_spec *sp, int i, int ok)
+{
+	sp->reach[i] = SPEC_DECAY * sp->reach[i] + 1.0;
+	sp->hit[i] = SPEC_DECAY * sp->hit[i] + (ok ? 1.0 : 0.0);
+}
+
+/* one committed token, against the drafts a plain step did not send */
+static void spec_feed(struct llama_spec *sp, int32_t x)
+{
+	if (!sp->sh_n)
+		return;
+	if (sp->sh[sp->sh_i] == x) {
+		spec_obs(sp, sp->sh_i, 1);
+		if (++sp->sh_i == sp->sh_n)
+			sp->sh_n = 0;
+	} else {
+		spec_obs(sp, sp->sh_i, 0);
+		sp->sh_n = 0;
+	}
+}
+
+static double spec_tver(const struct llama_spec *sp, int wi)
+{
+	int lo = -1, hi = -1;
+
+	if (sp->n_tver[wi] >= 2)
+		return sp->t_ver[wi];
+	for (int j = wi - 1; j >= 0 && lo < 0; j--)
+		if (sp->n_tver[j] >= 2)
+			lo = j;
+	for (int j = wi + 1; j < 3 && hi < 0; j++)
+		if (sp->n_tver[j] >= 2)
+			hi = j;
+	if (lo >= 0 && hi >= 0) {
+		double x0 = 2.0 * (lo + 1), x1 = 2.0 * (hi + 1);
+
+		return sp->t_ver[lo] + (sp->t_ver[hi] - sp->t_ver[lo])
+		       * (2.0 * (wi + 1) - x0) / (x1 - x0);
+	}
+	if (lo >= 0)
+		return sp->t_ver[lo];   /* a wider pass costs at least this */
+	if (hi >= 0)                    /* the plain step is width 1 */
+		return sp->t_plain + (sp->t_ver[hi] - sp->t_plain)
+		       * (2.0 * (wi + 1) - 1.0) / (2.0 * (hi + 1) - 1.0);
+	return sp->t_plain * (1.0 + SPEC_SLOPE0 * (2.0 * (wi + 1) - 1.0));
+}
+
+/* how many of the d drafts to send, or 0 for a plain step */
+static int spec_policy(struct llama_spec *sp, int d)
+{
+	double best = 0.0, e = 1.0, p = 1.0;
+	int bd = 0;
+
+	if (sp->n_tplain < 2)
+		return 0;               /* nothing to compare a pass with yet */
+	for (int dd = 1; dd <= d; dd++) {
+		double t, r;
+
+		p *= spec_alpha(sp, dd - 1);
+		e += p;
+		t = spec_tver(sp, spec_wi(dd));
+		r = e / (t > 1e-6 ? t : 1e-6);
+		if (r > best) {
+			best = r;
+			bd = dd;
+		}
+	}
+	if (best * sp->t_plain <= 1.0)
+		return 0;
+	if (sp->n_tver[spec_wi(bd)] < 2)
+		sp->n_probe++;
+	return bd;
+}
+
 int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 		    int n_ctx)
 {
+	const char *e = getenv("CHARSIU_SPEC_VERIFY_SCALE");
+
 	memset(sp, 0, sizeof(*sp));
+	if (k < 0) {
+		sp->autok = 1;
+		k = -k;
+	}
 	if (k < 1)
 		k = 1;
 	/*
@@ -10583,6 +10759,17 @@ int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 	/* k drafts, row 0, and one row of padding to keep the width even */
 	sp->logits_all = malloc((size_t)(k + 2) * m->n_vocab * sizeof(float));
 	sp->junk = charsiu_env_flag("CHARSIU_SPEC_JUNK", 0);
+	/*
+	 * A DESK KNOB, NOT A BOARD ONE. On a machine with no NPU a pass runs
+	 * its rows one at a time and costs w plain steps, so the policy rightly
+	 * never speculates there and the paths that resume and choose a width
+	 * are never run. Scaling the pass's measured time (0.3 makes a desk
+	 * pass look like a board one) exercises them; the text must not move.
+	 */
+	sp->vscale = e && *e ? atof(e) : 1.0;
+	if (!(sp->vscale > 0.0))
+		sp->vscale = 1.0;
+	sp->backoff = SPEC_BACKOFF0;
 	if (!sp->hist || !sp->logits_all) {
 		llama_spec_free(sp);
 		return -1;
@@ -10662,19 +10849,51 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		    int max_out)
 {
 	int32_t rows[8], drafts[8];
-	int d, n, a, nc, pos0 = s->pos;
+	int d, nd, n, a, nc, wi, cold, pos0 = s->pos;
+	double t0, dt;
 
 	spec_push(sp, tok);
 	d = sp->off ? 0 : spec_draft(sp, drafts, sp->k);
 	/* every row must fit the cache, or the pass would write past it */
 	if (d && pos0 + 1 + d + 1 > s->n_ctx)
 		d = 0;
+	nd = d;
+	/*
+	 * THE FOUR WAYS A STEP IS PLAIN under the policy, counted apart so the
+	 * report can say which one a run spent its plain tokens on.
+	 */
+	if (sp->autok) {
+		if (sp->backoff_left > 0) {
+			sp->backoff_left--;
+			sp->n_hold++;
+			d = 0;
+		} else if (!d) {
+			sp->n_nodraft++;
+		} else if (!(d = spec_policy(sp, d))) {
+			sp->n_gate++;
+		}
+	}
 	if (d == 0) {
-		const float *lg = llama_forward(s, tok, s->pos);
+		const float *lg;
 
+		t0 = now_ms();
+		lg = llama_forward(s, tok, s->pos);
 		if (!lg)
 			return -1;
 		out[0] = llama_argmax(lg, m->n_vocab);
+		dt = now_ms() - t0;
+		spec_mean(&sp->t_plain, &sp->n_tplain, dt);
+		sp->ms_plain += dt;
+		if (sp->autok) {
+			/* the drafts it did not send, checked for free */
+			if (!sp->sh_n && nd) {
+				memcpy(sp->sh, drafts,
+				       (size_t)nd * sizeof(*drafts));
+				sp->sh_n = nd;
+				sp->sh_i = 0;
+			}
+			spec_feed(sp, out[0]);
+		}
 		sp->passes++;
 		sp->plain++;
 		return 1;
@@ -10699,7 +10918,10 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	 * replaces (tests/argmax_fused.c).
 	 */
 	int32_t best[8];
-	int vrc = spec_argmax()
+	int vrc;
+
+	t0 = now_ms();
+	vrc = spec_argmax()
 		  ? llama_verify_batch_argmax(s, m, rows, n, pos0,
 					      sp->logits_all, best)
 		  : llama_verify_batch(s, m, rows, n, pos0, sp->logits_all);
@@ -10744,6 +10966,42 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	if (nc < max_out)
 		out[nc++] = ROW_BEST(a);
 #undef ROW_BEST
+	dt = now_ms() - t0;
+	sp->ms_spec += dt;
+	wi = spec_wi(d);
+	cold = sp->n_tver[wi] == 0;
+	spec_mean(&sp->t_ver[wi], &sp->n_tver[wi], dt * sp->vscale);
+	if (sp->autok) {
+		double cap = SPEC_LEDGER_CAP * sp->t_plain;
+		double gain = nc * sp->t_plain - dt * sp->vscale;
+
+		for (int i = 0; i < a; i++)
+			spec_obs(sp, i, 1);
+		if (a < d)
+			spec_obs(sp, a, 0);
+		for (int i = 0; i < nc; i++)
+			spec_feed(sp, out[i]);
+		/*
+		 * A COLD PASS IS THE PRICE OF MEASURING, not evidence that the
+		 * estimate was wrong: its time was thrown away above and it is
+		 * kept out of the ledger for the same reason.
+		 */
+		if (!cold) {
+			sp->ledger += gain;
+			if (sp->ledger > cap)
+				sp->ledger = cap;
+			if (gain < 0.0 && sp->ledger < 0.0) {
+				sp->backoff_left = sp->backoff;
+				sp->n_stops++;
+				sp->backoff *= 2;
+				if (sp->backoff > SPEC_BACKOFF_MAX)
+					sp->backoff = SPEC_BACKOFF_MAX;
+				sp->ledger = 0.0;
+			} else if (sp->ledger >= cap) {
+				sp->backoff = SPEC_BACKOFF0;
+			}
+		}
+	}
 	/*
 	 * Rows 1..a hold accepted tokens and their cache entries are right.
 	 * The correction is not in the cache yet: it is the next pass's row 0.
@@ -10766,11 +11024,16 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 void llama_spec_report(const struct llama_spec *sp, FILE *out)
 {
 	unsigned long spec_passes = sp->passes - sp->plain;
+	char kk[16], w[3][16];
 
-	fprintf(out, "[spec k=%d: %lu passes, %lu plain, %lu speculative; "
+	if (sp->autok)
+		snprintf(kk, sizeof(kk), "auto<=%d", sp->k);
+	else
+		snprintf(kk, sizeof(kk), "%d", sp->k);
+	fprintf(out, "[spec k=%s: %lu passes, %lu plain, %lu speculative; "
 		"drafted %lu, accepted %lu (%.0f%%), committed %lu; "
-		"%.2f tok/pass%s%s]\n",
-		sp->k, sp->passes, sp->plain, spec_passes,
+		"%.2f tok/pass%s%s",
+		kk, sp->passes, sp->plain, spec_passes,
 		sp->drafted, sp->accepted,
 		sp->drafted ? 100.0 * sp->accepted / sp->drafted : 0.0,
 		sp->committed + sp->plain,
@@ -10778,4 +11041,42 @@ void llama_spec_report(const struct llama_spec *sp, FILE *out)
 			   : 0.0,
 		sp->off ? ", REFUSED by the batched forward" : "",
 		sp->junk ? ", JUNK drafts (control)" : "");
+	/*
+	 * THE FORCED LINE IS THE OLD LINE, closed where it always closed:
+	 * board_verify.sh and spec_identity.sh read it, and its costs go on a
+	 * line of their own, which does not start "[spec " because board_verify
+	 * greps that and takes every line it finds. Auto is ONE line: the old fields and then the
+	 * policy's, so the same readers find their numbers in it.
+	 *
+	 * THE TIMES ARE THE ONES THE POLICY USED: running means with the cold
+	 * first sample dropped, scaled by CHARSIU_SPEC_VERIFY_SCALE when that
+	 * is set. The plain and pass means are of every step, unscaled.
+	 */
+	for (int i = 0; i < 3; i++) {
+		if (sp->n_tver[i] >= 2)
+			snprintf(w[i], sizeof(w[i]), "%.1f", sp->t_ver[i]);
+		else
+			snprintf(w[i], sizeof(w[i]), "-");
+	}
+	if (sp->autok)
+		fprintf(out, "; policy: %lu tok speculative, %lu tok plain "
+			"(%lu no draft, %lu cost gate, %lu backing off), "
+			"%lu back-offs, next %d, %lu probes",
+			sp->committed, sp->plain, sp->n_nodraft, sp->n_gate,
+			sp->n_hold, sp->n_stops, sp->backoff, sp->n_probe);
+	else
+		fprintf(out, "]\n[pass costs: %lu tok speculative, %lu tok "
+			"plain", sp->committed, sp->plain);
+	fprintf(out, "; step %.1f ms, pass w2 %s w4 %s w6 %s ms; mean plain "
+		"%.1f, mean pass %.1f ms",
+		sp->n_tplain >= 2 ? sp->t_plain : 0.0, w[0], w[1], w[2],
+		sp->plain ? sp->ms_plain / sp->plain : 0.0,
+		spec_passes ? sp->ms_spec / spec_passes : 0.0);
+	if (sp->autok)
+		fprintf(out, "; accept %.2f %.2f %.2f %.2f %.2f",
+			spec_alpha(sp, 0), spec_alpha(sp, 1), spec_alpha(sp, 2),
+			spec_alpha(sp, 3), spec_alpha(sp, 4));
+	if (sp->vscale != 1.0)
+		fprintf(out, "; passes scaled x%.2f", sp->vscale);
+	fprintf(out, "]\n");
 }

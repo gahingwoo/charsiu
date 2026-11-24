@@ -2498,7 +2498,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 			g->bdefer_n, g->bdefer_done);
 	/* THE POSITIVE TELL that the grouped arm ran, since its text is meant
 	 * to be identical to the control's. Only nonzero when llama.c was asked
-	 * for groups (CHARSIU_NPU_BATCH_GROUP=1). */
+	 * for groups, which it is unless CHARSIU_NPU_BATCH_GROUP=0. */
 	if (g->bgroup_n || g->bgroup_fell)
 		fprintf(stderr, "charsiu: grouped batches: %lu calls of %lu"
 			" members, %lu fell back to one tensor a call\n",
@@ -7724,9 +7724,9 @@ int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 /*
  * A GROUPED BATCHED MATMUL: q/k/v, or gate/up, for m rows in ONE call.
  *
- * OFF BY DEFAULT, pending a board A/B. llama.c only calls this under
- * CHARSIU_NPU_BATCH_GROUP=1; with it unset every batched projection goes
- * through npu_matmul_inner one tensor at a time, exactly as before.
+ * ON BY DEFAULT since the board A/B of 2026-11-24. llama.c calls this unless
+ * CHARSIU_NPU_BATCH_GROUP=0; with that every batched projection goes through
+ * npu_matmul_inner one tensor at a time, exactly as before.
  *
  * WHY. A speculative verify pass is m = 2..8 rows, and at those widths
  * Qwen3-0.6B's q, k, v, gate and up are each ONE slot (KMAX = W4 group =
