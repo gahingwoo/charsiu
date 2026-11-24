@@ -167,6 +167,81 @@ static int onechunk_on(void)
 	return v;
 }
 
+/*
+ * PAD THE LAST CHUNK RATHER THAN SPLIT IT. A remainder of rem tokens that is
+ * not a multiple of four either cannot be batched at all (odd: the last token
+ * goes through the token loop, a whole decode step for one row) or batches at
+ * a width that costs about 7% a token (2 mod 4). Rounding it UP to the next
+ * multiple of four and filling the extra rows with a copy of the last real
+ * token costs at most three rows the causal mask keeps every real row from
+ * reading; llama_prefill_batch_keep takes the head from the last real row and
+ * gives the pad positions back.
+ *
+ * Returns the padded width, or 0 to run rem the old way: below 3 (2 is a
+ * width of its own and 1 has no pad worth a batched call), already a multiple
+ * of four, wider than `lim`, or a width prefill_width would not run as it is
+ * -- 8 below the envelope, say -- because a padded chunk must never be a width
+ * the unpadded path would have refused.
+ *
+ * CHARSIU_PREFILL_PAD=0 is the control: the split, as before.
+ */
+static int prefill_pad_width(int rem, int lim)
+{
+	static int on = -1;
+	int w;
+
+	if (on < 0)
+		on = charsiu_env_flag("CHARSIU_PREFILL_PAD", 1);
+	if (!on || rem < 3 || !(rem & 3))
+		return 0;
+	w = (rem + 3) & ~3;
+	if (w > lim || prefill_width(w, w) != w)
+		return 0;
+	return w;
+}
+
+/*
+ * ONE CHUNK OF THE PROMPT FROM ids, rem tokens left, no wider than chunk:
+ * padded when that is the last chunk and prefill_pad_width names a width,
+ * split as before otherwise. Returns how many PROMPT tokens it consumed, 0 if
+ * nothing ran (no width left, or the batch refused), with the width that ran
+ * in *ran and the pad rows it carried added to *pad.
+ */
+static int prefill_chunk(struct llama_state *st, const struct llama_model *m,
+			 const int32_t *ids, int rem, int chunk, int *ran,
+			 int *pad)
+{
+	int w = rem <= chunk ? prefill_pad_width(rem, chunk) : 0;
+	int c;
+
+	/* the pad rows are written to the cache, so they must fit in it */
+	if (w && st->pos + w <= st->n_ctx) {
+		int32_t *buf = malloc((size_t)w * sizeof(*buf));
+		int i, rc;
+
+		if (buf) {
+			memcpy(buf, ids, (size_t)rem * sizeof(*buf));
+			/* a real token, so every row is an ordinary row; it is
+			 * never read, the head and the cache stop at rem */
+			for (i = rem; i < w; i++)
+				buf[i] = ids[rem - 1];
+			rc = llama_prefill_batch_keep(st, m, buf, w, st->pos,
+						      rem);
+			free(buf);
+			if (rc)
+				return 0;
+			*ran = w;
+			*pad += w - rem;
+			return rem;
+		}
+	}
+	c = prefill_width(rem, chunk);
+	if (c < 2 || llama_prefill_batch(st, m, ids, c, st->pos))
+		return 0;
+	*ran = c;
+	return c;
+}
+
 struct prefill_widths {
 	int w[6];
 	int n[6];
@@ -1036,7 +1111,24 @@ int main(int argc, char **argv)
 		 *
 		 * CHARSIU_PREFILL_ONECHUNK=0 still turns the whole thing off.
 		 */
-		if (onechunk_on() && n_ids > chunk && n_ids <= cap &&
+		/*
+		 * AND NOW A WRONG RESIDUE IS PADDED RATHER THAN DECLINED,
+		 * when CHARSIU_PREFILL_PAD allows: 131 tokens run as one chunk
+		 * of 132 with a pad row, where they ran 80 + 50 and a token
+		 * through the token loop -- 835 ms on the board against 650
+		 * for 124 in one chunk. See prefill_pad_width.
+		 */
+		int onepad = (onechunk_on() && n_ids > chunk && n_ids <= cap)
+			   ? prefill_pad_width(n_ids, cap) : 0;
+
+		if (onepad) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: the whole prompt (%d) "
+					"fits under this model's ceiling (%d), "
+					"so it goes in one chunk padded to %d\n",
+					n_ids, cap, onepad);
+			chunk = onepad;
+		} else if (onechunk_on() && n_ids > chunk && n_ids <= cap &&
 		    ((n_ids & ~1) & 3) == 0) {
 			if (charsiu_diag())
 				fprintf(stderr, "charsiu: the whole prompt (%d) "
@@ -1052,6 +1144,7 @@ int main(int argc, char **argv)
 					chunk);
 		}
 		int done = 0;
+		int npad = 0;           /* pad rows the batched chunks carried */
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
 
@@ -1127,9 +1220,12 @@ int main(int argc, char **argv)
 			 * about. RUNNING OUT of width is not a refusal: it
 			 * happens with at most one token left, and that token
 			 * was always going to the token loop.
+			 *
+			 * AND WITH CHARSIU_PREFILL_PAD THAT ONE TOKEN IS
+			 * GONE TOO: the last chunk is padded up to a multiple
+			 * of four (prefill_chunk), so a prompt that ends on an
+			 * odd remainder no longer pays a decode step for it.
 			 */
-			int probe = prefill_width(n_ids, chunk);
-
 			/* the only thing in the library that needs to know
 			 * how long the whole prompt is, rather than how long
 			 * this chunk is: CHARSIU_ATTN_NPU=auto. Said before
@@ -1138,22 +1234,26 @@ int main(int argc, char **argv)
 			 * mirror built for a prompt that will not use it
 			 * costs 107 ms of upkeep it never earns back. */
 			llama_prefill_hint(st, n_ids);
-			if (probe >= 2 &&
-			    !llama_prefill_batch(st, &m, ids, probe, st->pos)) {
-				done = probe;
-				prefill_note_width(&pw, probe);
-				while (done < n_ids) {
-					int c = prefill_width(n_ids - done,
-							      chunk);
+			{
+				int ran = 0;
+				int c = prefill_chunk(st, &m, ids, n_ids, chunk,
+						      &ran, &npad);
 
-					if (c < 2 ||
-					    llama_prefill_batch(st, &m,
-							ids + done, c, st->pos))
-						break;
-					done += c;
-					prefill_note_width(&pw, c);
+				if (c > 0) {
+					done = c;
+					prefill_note_width(&pw, ran);
+					while (done < n_ids) {
+						c = prefill_chunk(st, &m,
+							ids + done,
+							n_ids - done, chunk,
+							&ran, &npad);
+						if (c <= 0)
+							break;
+						done += c;
+						prefill_note_width(&pw, ran);
+					}
+					logits = st->logits;
 				}
-				logits = st->logits;
 			}
 		}
 		/* the hint was about this prompt and it is over */
@@ -1199,12 +1299,18 @@ int main(int argc, char **argv)
 					"tokens in chunks of %d",
 					n_ids, chunk);
 				prefill_say_widths(&pw);
+				if (npad)
+					fprintf(stderr, " (%d pad row%s)", npad,
+						npad == 1 ? "" : "s");
 				fprintf(stderr, "%s\n", forced);
 			} else if (done > 0) {
 				fprintf(stderr, "charsiu: prompt batched for "
 					"%d of %d tokens, the rest a token at "
 					"a time", done, n_ids);
 				prefill_say_widths(&pw);
+				if (npad)
+					fprintf(stderr, " (%d pad row%s)", npad,
+						npad == 1 ? "" : "s");
 				fprintf(stderr, "%s\n", forced);
 			} else if (charsiu_env_flag("CHARSIU_NO_BATCH_PREFILL", 0)) {
 				fprintf(stderr, "charsiu: prompt a token at a "
