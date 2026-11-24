@@ -528,16 +528,21 @@ stats() {
 			print m, v[1], v[NR], NR
 		}'
 }
-# real if |mb - ma| exceeds both spreads and both arms have >= 3 runs
+# real if |mb - ma| exceeds both spreads, is at least MIN_EFFECT of A (3% by
+# default), and both arms have >= 3 runs. The floor is there because a null
+# control on the CM5 (the same binary as A and B, 3 reps) flagged a 1% prompt
+# difference whose two spreads happened to be 2 ms wide and not to overlap.
+MIN_EFFECT=${MIN_EFFECT:-0.03}
 judge() { # ma mina maxa na  mb minb maxb nb  higher-is-better(1/0)
 	awk -v ma="$1" -v la="$2" -v ha="$3" -v na="$4" \
-	    -v mb="$5" -v lb="$6" -v hb="$7" -v nb="$8" -v up="$9" 'BEGIN {
+	    -v mb="$5" -v lb="$6" -v hb="$7" -v nb="$8" -v up="$9" \
+	    -v fl="$MIN_EFFECT" 'BEGIN {
 		if (na < 1 || nb < 1) { print "FAILED"; exit }
 		r = up ? mb / ma : ma / mb
 		d = mb - ma; if (d < 0) d = -d
 		sa = ha - la; sb = hb - lb
 		if (na < 3 || nb < 3) tag = "n<3"
-		else if (d > sa && d > sb) tag = (r > 1) ? "B FASTER" : "B SLOWER"
+		else if (d > sa && d > sb && d > fl * ma) tag = (r > 1) ? "B FASTER" : "B SLOWER"
 		else tag = "within spread"
 		printf "%.3fx %s\n", r, tag
 	}'
