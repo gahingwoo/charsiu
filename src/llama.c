@@ -7081,8 +7081,12 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 			       (unsigned)pos, v);
 	a->dirty[l] = 1;
 	/* ON THE LAST KV HEAD, because a position is only mirrored once
-	 * every head of it is, and the catch-up below trusts this number */
-	if (kh + 1 == a->nkv && a->packed[l] < (unsigned)pos + 1)
+	 * every head of it is, and the catch-up below trusts this number.
+	 * AND ONLY WHEN IT IS THE NEXT ONE: decode and verify passes do not
+	 * append, so the first chunk of a later prompt arrives above a gap,
+	 * and moving the mark over it would tell the catch-up the generated
+	 * positions were already packed. */
+	if (kh + 1 == a->nkv && a->packed[l] == (unsigned)pos)
 		a->packed[l] = (unsigned)pos + 1;
 }
 
