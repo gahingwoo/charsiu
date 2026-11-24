@@ -7335,6 +7335,7 @@ static int row_pool(void)
 	return v;
 }
 
+
 /*
  * THE ROPE STAGE FOR EVERY ROW, ON THE POOL.
  *
@@ -7776,6 +7777,50 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 		       uint32_t nout)
 {
 	return matmul_rows_x(s, w, X, n, Y, k, nout, 0);
+}
+
+/*
+ * THE OUTPUT HEAD OF A GREEDY VERIFY, WHERE ONLY THE ARGMAX OF A ROW SURVIVES.
+ * best[r] is llama_argmax of row r after the softcap, on either path; Y is
+ * scratch. On the hardware the tail scale, the softcap and the argmax are one
+ * read of Y (src/argmaxrow.h); on the CPU it is the full logits, the softcap
+ * over all of them and llama_argmax, which is exactly what the caller did
+ * before, so the fallback cannot differ from it. Stage accounting is
+ * matmul_rows_x's, line for line.
+ */
+static int matmul_rows_argmax(struct llama_state *s,
+			      const struct gguf_tensor *w, const float *X,
+			      int n, float *Y, uint32_t k, uint32_t nout,
+			      float cap, int32_t *best)
+{
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+	int id = npu_id_for(s, w);
+
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul_argmax(s->pool.dev, id, X, (unsigned)n,
+					       Y, cap, best)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_dev = s->pool.dev;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
+	for (int r = 0; r < n; r++)
+		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	softcap_logits(Y, (size_t)n * nout, cap);
+	for (int r = 0; r < n; r++)
+		best[r] = llama_argmax(Y + (size_t)r * nout, nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
+	return 0;
 }
 
 static int matmul_rows_defer(struct llama_state *s,
@@ -9049,6 +9094,29 @@ int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 }
 
 /*
+ * THE SAME PASS FOR A VERIFIER THAT ONLY ASKS WHICH TOKEN. Everything up to
+ * the head is llama_verify_batch's; the head returns each row's argmax and
+ * never stores a scaled logit (matmul_rows_argmax). CHARSIU_SPEC_ARGMAX=1
+ * routes llama_spec_step here; anything that needs the logits themselves --
+ * charsiu_ppl --batch, a sampler -- keeps llama_verify_batch.
+ */
+int llama_verify_batch_argmax(struct llama_state *s,
+			      const struct llama_model *m, const int32_t *toks,
+			      int n, int pos0, float *scratch, int32_t *best)
+{
+	if (batch_layers(s, m, toks, n, pos0))
+		return -1;
+	for (int r = 0; r < n; r++)
+		rmsnorm(s->bxb + (size_t)r * m->n_embd,
+			s->bx + (size_t)r * m->n_embd, m->out_norm,
+			m->n_embd, m->rms_eps);
+	matmul_rows_argmax(s, m->output, s->bxb, n, scratch, m->n_embd,
+			   m->n_vocab, m->final_softcap, best);
+	s->pos = pos0 + n;
+	return 0;
+}
+
+/*
  * ONE CALL, THEN IT CLEARS ITSELF. A left-over embd_in would silently turn
  * the next real token into the previous picture, which is a fluent answer about
  * nothing that was asked.
@@ -9723,6 +9791,15 @@ static int spec_draft(const struct llama_spec *sp, int32_t *out, int k)
 	return 0;
 }
 
+static int spec_argmax(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_SPEC_ARGMAX", 0);
+	return v;
+}
+
 int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		    const struct llama_model *m, int32_t tok, int32_t *out,
 		    int max_out)
@@ -9756,7 +9833,21 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	 */
 	if (n & 1)
 		rows[n++] = drafts[d - 1];
-	if (llama_verify_batch(s, m, rows, n, pos0, sp->logits_all)) {
+	/*
+	 * ONLY THE INDEX OF EACH ROW IS READ BELOW, so under
+	 * CHARSIU_SPEC_ARGMAX=1 the head hands back just that: best[i] is
+	 * llama_argmax of the row llama_verify_batch would have stored, and
+	 * logits_all becomes scratch. Off by default until the board has run
+	 * both arms; the desk holds the kernel against the three passes it
+	 * replaces (tests/argmax_fused.c).
+	 */
+	int32_t best[8];
+	int vrc = spec_argmax()
+		  ? llama_verify_batch_argmax(s, m, rows, n, pos0,
+					      sp->logits_all, best)
+		  : llama_verify_batch(s, m, rows, n, pos0, sp->logits_all);
+
+	if (vrc) {
 		/*
 		 * REFUSED, AND SAID ONCE. batch_layers refuses before it
 		 * touches the cache, so nothing needs undoing; the rest of the
@@ -9772,10 +9863,13 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		s->pos = pos0;
 		return llama_spec_step(sp, s, m, tok, out, max_out);
 	}
+	/* the default arm still scans only the rows it reaches, as it did */
+#define ROW_BEST(i) (spec_argmax() ? best[i]                                 \
+		     : llama_argmax(sp->logits_all + (size_t)(i) * m->n_vocab, \
+				    m->n_vocab))
 	a = 0;
 	for (int i = 0; i < d; i++) {
-		int32_t x = llama_argmax(sp->logits_all
-					 + (size_t)i * m->n_vocab, m->n_vocab);
+		int32_t x = ROW_BEST(i);
 
 		if (x != drafts[i])
 			break;
@@ -9791,8 +9885,8 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	for (int i = 0; i < a && nc < max_out; i++)
 		out[nc++] = drafts[i];
 	if (nc < max_out)
-		out[nc++] = llama_argmax(sp->logits_all + (size_t)a * m->n_vocab,
-					 m->n_vocab);
+		out[nc++] = ROW_BEST(a);
+#undef ROW_BEST
 	/*
 	 * Rows 1..a hold accepted tokens and their cache entries are right.
 	 * The correction is not in the cache yet: it is the next pass's row 0.

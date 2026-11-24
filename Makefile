@@ -355,7 +355,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -366,6 +366,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/acc_index_check >/dev/null
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
+	./$(BUILD)/argmax_fused
 	./$(BUILD)/overlap_guard
 	./$(BUILD)/pack_stride
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
@@ -513,6 +514,9 @@ $(BUILD)/overlap_guard: tests/overlap_guard.c src/overlap.h | $(BUILD)
 
 $(BUILD)/reuse_key: tests/reuse_key.c src/reusekey.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD)/argmax_fused: tests/argmax_fused.c src/argmaxrow.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(BUILD)/even_ks: tests/even_ks.c src/kslice.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<

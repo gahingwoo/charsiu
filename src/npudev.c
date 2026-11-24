@@ -34,6 +34,7 @@
 #include <math.h>
 
 #include "reusekey.h"
+#include "argmaxrow.h"
 #include "kslice.h"
 #include "overlap.h"
 #include "charsiu.h"
@@ -704,6 +705,9 @@ struct charsiu_npu {
 	 */
 	double bscale_us;       /* the per channel scale an ungrouped tensor
 				 * takes at the end, over the whole of Y */
+	/* charsiu_npu_matmul_argmax: this call's own tail scale is left to
+	 * the fused argmax pass, which charges bscale_us instead */
+	int tail_skip;
 	unsigned char *bseen;	/* which n slices of Y have been written */
 	unsigned bseen_n;
 	/*
@@ -7512,7 +7516,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	/* NOT WHEN THE READ HAS NOT HAPPENED. npu_flush_pending applies it
 	 * after the deferred gather instead; see tail_scale_apply. */
-	if (!defer)
+	if (!defer && !g->tail_skip)
 		tail_scale_apply(g, e, Y, m);
 	return 0;
 }
@@ -7525,6 +7529,69 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 
 	g->reuse_ask = 0;
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+/*
+ * THE OUTPUT HEAD OF A GREEDY VERIFY PASS: the index of each row's maximum,
+ * and Y left holding the UNSCALED, UNCAPPED read back -- scratch, not logits.
+ * argmaxrow.h has why the index is bit identical to scale, softcap, then
+ * llama_argmax over the stored rows.
+ *
+ * THE SKIP IS THIS CALL'S TAIL AND NOTHING ELSE. npu_matmul_inner can flush
+ * an EARLIER tensor's deferred gather, and that one's tail_scale_apply runs
+ * inside npu_flush_pending, which tail_skip does not reach: only the line at
+ * the end of the inner call reads it.
+ */
+struct argmax_job {
+	const float *Y;
+	const float *scale;
+	unsigned n;
+	float cap;
+	int32_t *best;
+};
+
+static void argmax_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct argmax_job *a = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++)
+		a->best[r] = charsiu_argmax_scaled(a->Y + r * a->n, a->scale,
+						   a->n, a->cap);
+}
+
+int charsiu_npu_matmul_argmax(struct charsiu_npu *g, int id, const float *X,
+			      unsigned m, float *Y, float cap, int32_t *best)
+{
+	double t0 = now_us();
+	int rc;
+
+	g->reuse_ask = 0;
+	g->tail_skip = 1;
+	rc = npu_matmul_inner(g, id, X, m, Y, 0);
+	g->tail_skip = 0;
+	if (!rc) {
+		const struct npu_entry *e = &g->ent[id];
+		/* the same condition tail_scale_apply returns early on */
+		struct argmax_job aj = {
+			Y, w4_for(g, e->t) && tensor_grouped(g, e->t)
+			   ? NULL : e->t->scale,
+			(unsigned)e->t->n, cap, best
+		};
+		double ts = now_us();
+
+		/* rows are independent and a row is one thread's whole
+		 * scan, so the pool cannot change an index */
+		if (g->poolread == 1 ||
+		    (g->poolread == 2 &&
+		     (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(argmax_rows, &aj, m);
+		else
+			argmax_rows(&aj, 0, m);
+		g->bscale_us += now_us() - ts;
+	}
 	g->bwall_us += now_us() - t0;
 	return rc;
 }
