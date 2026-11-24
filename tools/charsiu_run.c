@@ -1401,6 +1401,8 @@ int main(int argc, char **argv)
 	 */
 	int32_t pend[16];
 	int npend = 0, ipend = 0;
+	int gen_pos0 = st->pos;
+	int32_t last_tok = -1;
 
 	for (i = 0; i < n_gen; i++) {
 		int32_t tok = ipend < npend ? pend[ipend++]
@@ -1510,6 +1512,7 @@ int main(int argc, char **argv)
 			}
 		}
 next:
+		last_tok = tok;
 
 		if (st->pos >= st->n_ctx)
 			break;
@@ -1525,6 +1528,26 @@ next:
 		logits = llama_forward(st, tok, st->pos);
 		if (!logits)
 			break;
+	}
+	/*
+	 * THE CACHE ENDS WHERE THE PLAIN LOOP'S WOULD. That loop forwards
+	 * every token it produces, so it stops at gen_pos0 + produced. A
+	 * speculative run can stop past it -- drafts accepted but not yet
+	 * printed when -n ran out or the model ended its turn -- or one short,
+	 * the last correction being the next pass's row 0 and not in the
+	 * cache. A single shot run never reads the cache again, but the next
+	 * turn of a conversation does: on the CM5, Qwen3-0.6B's second turn
+	 * started two unprinted tokens late and its text left the plain
+	 * loop's.
+	 */
+	if (spec_on) {
+		int want = gen_pos0 + produced;
+
+		if (st->pos > want)
+			st->pos = want;
+		else if (st->pos + 1 == want && last_tok >= 0 &&
+			 st->pos < st->n_ctx)
+			llama_forward(st, last_tok, st->pos);
 	}
 
 	{
