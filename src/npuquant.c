@@ -294,6 +294,83 @@ static struct {
 } wc;
 
 /*
+ * THE RECORDS ARE FOUND BY NAME, NOT BY ORDER. They used to be read back in
+ * the order they were written, and any other order dropped the whole cache:
+ * charsiu_run stages through a batched prompt and charsiu_serve through a
+ * one-token warm-up, which build the tensors in different orders, so a cache
+ * charsiu_run wrote was "out of step" for charsiu_serve, which quantised
+ * everything again on the CPU (210 s on the board under Windows). Reading
+ * the file once through its record headers gives every record's offset, and
+ * a second staging in the same process (a new llama_state) reads them again.
+ */
+struct wc_rec {
+	char name[80];
+	uint64_t n, k, ngrp;
+	int64_t off;            /* where the payload starts */
+};
+static struct wc_rec *wc_ix;
+static unsigned wc_nix, wc_next;
+static int wc_said_missing;
+
+#ifdef _WIN32
+#define wc_seek(f, o) _fseeki64((f), (__int64)(o), SEEK_SET)
+#define wc_tell(f) ((int64_t)_ftelli64(f))
+#define wc_end(f) _fseeki64((f), 0, SEEK_END)
+#else
+/* long is 64 bits on every LP64 target this builds for */
+#define wc_seek(f, o) fseek((f), (long)(o), SEEK_SET)
+#define wc_tell(f) ((int64_t)ftell(f))
+#define wc_end(f) fseek((f), 0, SEEK_END)
+#endif
+
+/* the payload of one record: q as it is held, then the scales, then wsum */
+static uint64_t wc_payload(uint64_t n, uint64_t k, uint64_t ngrp, int packed)
+{
+	return n * (packed ? (k + 1) / 2 : k) + n * ngrp * 4 + n * 4;
+}
+
+static void wc_index(int packed)
+{
+	int64_t size, at;
+	unsigned cap = 0;
+
+	free(wc_ix);
+	wc_ix = NULL;
+	wc_nix = wc_next = 0;
+	wc_said_missing = 0;
+	at = wc_tell(wc.f);
+	if (wc_end(wc.f) || (size = wc_tell(wc.f)) < 0 || wc_seek(wc.f, at))
+		return;
+	for (;;) {
+		struct wc_rec r;
+
+		if (fread(r.name, 1, sizeof(r.name), wc.f) != sizeof(r.name) ||
+		    fread(&r.n, sizeof(r.n), 1, wc.f) != 1 ||
+		    fread(&r.k, sizeof(r.k), 1, wc.f) != 1 ||
+		    fread(&r.ngrp, sizeof(r.ngrp), 1, wc.f) != 1)
+			break;
+		r.name[sizeof(r.name) - 1] = 0;
+		r.off = wc_tell(wc.f);
+		/* a record cut short by a crash is not a record */
+		if (r.off < 0 || (uint64_t)r.off + wc_payload(r.n, r.k, r.ngrp, packed)
+				> (uint64_t)size)
+			break;
+		if (wc_nix == cap) {
+			struct wc_rec *g;
+
+			cap = cap ? cap * 2 : 128;
+			g = realloc(wc_ix, cap * sizeof(*g));
+			if (!g)
+				break;
+			wc_ix = g;
+		}
+		wc_ix[wc_nix++] = r;
+		if (wc_seek(wc.f, r.off + (int64_t)wc_payload(r.n, r.k, r.ngrp, packed)))
+			break;
+	}
+}
+
+/*
  * THE CACHE IS ONE SEQUENTIAL FILE AND ONE STATIC HANDLE. Records go in in
  * the order the tensors are built and come back in the same order, so two
  * graphs staging into it at once would interleave and neither could read the
@@ -312,6 +389,9 @@ void charsiu_wcache_use(const char *path, const char *stamp)
 	}
 	wc.writing = 0;
 	wc.checked = 0;
+	free(wc_ix);
+	wc_ix = NULL;
+	wc_nix = wc_next = 0;
 	wc.overridden = path != NULL;
 	snprintf(wc.path, sizeof(wc.path), "%s", path ? path : "");
 	snprintf(wc.stamp, sizeof(wc.stamp), "%s", stamp ? stamp : "");
@@ -379,16 +459,37 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 
 	wc.f = fopen(path, "rb");
 	if (wc.f) {
-		if (fread(&h, sizeof(h), 1, wc.f) == 1 &&
-		    !memcmp(&h, &want, sizeof(h))) {
-			fprintf(stderr, "charsiu: weight cache %s, reading\n",
-				path);
+		int got = fread(&h, sizeof(h), 1, wc.f) == 1;
+
+		if (got && !memcmp(&h, &want, sizeof(h))) {
+			wc_index(npu_q_packed());
+			fprintf(stderr, "charsiu: weight cache %s, reading "
+				"(%u tensors in it)\n", path, wc_nix);
 			return;
 		}
 		fclose(wc.f);
 		wc.f = NULL;
-		fprintf(stderr, "charsiu: weight cache %s does not match this "
-			"model or this quantiser, rebuilding\n", path);
+		/* SAY WHICH PART OF THE KEY DIFFERS. "does not match" alone
+		 * sent a board session looking for a bug in the reader when
+		 * the answer was a model file copied with a new mtime. */
+		if (!got || h.magic != want.magic || h.format != want.format)
+			fprintf(stderr, "charsiu: weight cache %s is not a cache "
+				"this build reads, rebuilding\n", path);
+		else if (h.quant != want.quant)
+			fprintf(stderr, "charsiu: weight cache %s is from quantiser "
+				"version %u and this is %u, rebuilding\n", path,
+				h.quant, want.quant);
+		else if (h.bits != want.bits || h.group != want.group)
+			fprintf(stderr, "charsiu: weight cache %s was built with "
+				"%u bits, group 0x%llx; this run asks %u bits, group "
+				"0x%llx (CHARSIU_NPU_W4_GROUP / KMAX, the grid, "
+				"packing or W4_GROUP_FIT differ), rebuilding\n",
+				path, h.bits, (unsigned long long)h.group, want.bits,
+				(unsigned long long)want.group);
+		else
+			fprintf(stderr, "charsiu: weight cache %s is for a model "
+				"of size:mtime %.63s and this one is %s, "
+				"rebuilding\n", path, h.stamp, want.stamp);
 	}
 	wc.f = fopen(path, "wb");
 	if (!wc.f) {
@@ -413,39 +514,49 @@ static size_t wcache_qbytes(const struct npu_tensor *t)
 
 static int wcache_read(struct npu_tensor *t, const char *name)
 {
-	char nm[80];
-	uint64_t n, k, ngrp;
+	uint64_t ngrp = t->kgroup ? (t->k + t->kgroup - 1) / t->kgroup : 1;
+	const struct wc_rec *r = NULL;
 	size_t qb;
+	unsigned i;
 
-	if (!wc.f || wc.writing)
+	if (!wc.f || wc.writing || !wc_nix)
 		return 0;
-	if (fread(nm, 1, sizeof(nm), wc.f) != sizeof(nm) ||
-	    fread(&n, sizeof(n), 1, wc.f) != 1 ||
-	    fread(&k, sizeof(k), 1, wc.f) != 1 ||
-	    fread(&ngrp, sizeof(ngrp), 1, wc.f) != 1)
+	/* in order is the usual case, so look at the next record first */
+	for (i = 0; i < wc_nix; i++) {
+		unsigned j = (wc_next + i) % wc_nix;
+
+		if (!strncmp(wc_ix[j].name, name, sizeof(wc_ix[j].name) - 1)) {
+			r = &wc_ix[j];
+			wc_next = (j + 1) % wc_nix;
+			break;
+		}
+	}
+	if (!r) {
+		if (!wc_said_missing++)
+			fprintf(stderr, "charsiu: %s is not in the weight cache; "
+				"quantising it (and any other missing one)\n", name);
 		return 0;
-	/*
-	 * The records are written in the order the tensors are built and are
-	 * read back in the same order, so a mismatch means the two runs did not
-	 * ask for the same thing. Stop using the cache rather than hunt for the
-	 * record: an out of order cache is a bug, not a case to handle.
-	 */
-	if (strcmp(nm, name) || n != t->n || k != t->k ||
-	    ngrp != (t->kgroup ? (t->k + t->kgroup - 1) / t->kgroup : 1)) {
-		fprintf(stderr, "charsiu: weight cache is out of step at %s, "
-			"ignoring the rest of it\n", name);
-		fclose(wc.f);
-		wc.f = NULL;
+	}
+	if (r->n != t->n || r->k != t->k || r->ngrp != ngrp) {
+		fprintf(stderr, "charsiu: weight cache has %s as %llu x %llu in "
+			"%llu groups and this run wants %llu x %llu in %llu; "
+			"quantising it\n", name, (unsigned long long)r->n,
+			(unsigned long long)r->k, (unsigned long long)r->ngrp,
+			(unsigned long long)t->n, (unsigned long long)t->k,
+			(unsigned long long)ngrp);
 		return 0;
 	}
 	qb = wcache_qbytes(t);
-	if (fread(t->q, 1, qb, wc.f) != qb ||
-	    fread(t->scale, sizeof(float), (size_t)(n * ngrp), wc.f)
-		    != (size_t)(n * ngrp))
+	if (wc_seek(wc.f, r->off) ||
+	    fread(t->q, 1, qb, wc.f) != qb ||
+	    fread(t->scale, sizeof(float), (size_t)(t->n * ngrp), wc.f)
+		    != (size_t)(t->n * ngrp) ||
+	    /* wsum is n int32 and recomputing it is a whole pass over the codes */
+	    fread(t->wsum, sizeof(int32_t), (size_t)t->n, wc.f) != (size_t)t->n) {
+		fprintf(stderr, "charsiu: weight cache record %s could not be "
+			"read; quantising it\n", name);
 		return 0;
-	/* wsum is n int32 and recomputing it is a whole pass over the codes */
-	if (fread(t->wsum, sizeof(int32_t), (size_t)n, wc.f) != (size_t)n)
-		return 0;
+	}
 	return 1;
 }
 

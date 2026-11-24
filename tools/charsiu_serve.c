@@ -840,8 +840,16 @@ int main(int argc, char **argv)
 		int n = tokenizer_encode(M.tk, "hello", 1, warm, 4);
 
 		for (i = 0; i < n; i++) llama_forward(ST, warm[i], ST->pos);
-		llama_state_free(ST);
-		ST = llama_state_new(&M, N_CTX);
+		/*
+		 * KEEP THE STATE: rewind it, do not free it. Freeing closed the
+		 * NPU and dropped every staged tensor, so the warm-up was paid
+		 * and then thrown away and the first request staged it all
+		 * again -- on the board under Windows a minute of the first
+		 * answer's wait, quantising on the CPU. The KV cache is
+		 * overwritten from position 0, as every request does.
+		 */
+		ST->pos = 0;
+		CACHED_N = 0;
 	}
 	/*
 	 * THE QoS HOLD IS FOR A REQUEST, NOT FOR THE PROCESS. Opening the
