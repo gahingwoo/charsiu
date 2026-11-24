@@ -8242,6 +8242,9 @@ static int attn_block(struct attn_block_job *j)
 	/* BEFORE either arm runs: the CPU one sizes its scores buffer from
 	 * j->R, and the check arm calls it directly */
 	j->R = R;
+	/* a verify pass stays on the CPU arm: see in_verify */
+	if (j->s->in_verify)
+		return attn_block_cpu(j);
 	/*
 	 * THIS IS NOT A BIT EXACT SUBSTITUTION AND MUST NOT BE CHECKED AS
 	 * ONE. Every matmul the group runs was proved identical to the same
@@ -10924,10 +10927,12 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	int vrc;
 
 	t0 = now_ms();
+	s->in_verify = 1;
 	vrc = spec_argmax()
 		  ? llama_verify_batch_argmax(s, m, rows, n, pos0,
 					      sp->logits_all, best)
 		  : llama_verify_batch(s, m, rows, n, pos0, sp->logits_all);
+	s->in_verify = 0;
 
 	if (vrc) {
 		/*

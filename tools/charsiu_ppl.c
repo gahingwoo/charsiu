@@ -136,7 +136,7 @@ int main(int argc, char **argv)
 	int32_t *ids = NULL;
 	char *text = NULL;
 	size_t tlen = 0, cap = 0;
-	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0, top1 = 0;
+	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0, top1 = 0, verify = 0;
 	double nll = 0.0;
 	uint64_t fnv = FNV_INIT;
 	const char *path = NULL, *tfile = NULL;
@@ -149,6 +149,10 @@ int main(int argc, char **argv)
 			want = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--batch"))
 			batch = 1;
+		/* --batch with the arithmetic of a speculative pass, which
+		 * keeps attention on the CPU (llama_state.in_verify) */
+		else if (!strcmp(argv[i], "--verify"))
+			batch = verify = 1;
 		/* THE ARGMAX IS ALREADY BEING COMPUTED HERE. The log softmax
 		 * needs the largest logit, so the position it came from is one
 		 * extra assignment, and printing it turns this into a top-1
@@ -166,7 +170,7 @@ int main(int argc, char **argv)
 	}
 	if (!path || !tfile) {
 		fprintf(stderr, "usage: charsiu_ppl MODEL.gguf TEXT [-c ctx]"
-			" [-n tokens] [--batch] [--top1]\n"
+			" [-n tokens] [--batch | --verify] [--top1]\n"
 			"  --top1  print \"prefix_len argmax_id actual_id\" a line,"
 			" so a runtime that\n"
 			"          cannot be asked for logits can be scored against"
@@ -199,6 +203,7 @@ int main(int argc, char **argv)
 
 	st = llama_state_new(&m, n_ctx);
 	if (!st) { fprintf(stderr, "state failed\n"); return 1; }
+	st->in_verify = verify;
 
 	if (batch) {
 		/*
@@ -271,8 +276,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "charsiu_ppl: logits fnv64 %016llx  nll %a\n",
 			(unsigned long long)fnv, nll);
 		printf("ppl %.4f  over %d scored positions of %d tokens"
-		       "  (%s, --batch in chunks of %d, ceiling %d)\n",
-		       exp(nll / scored), scored, n, path, chunk, cap);
+		       "  (%s, %s in chunks of %d, ceiling %d)\n",
+		       exp(nll / scored), scored, n, path,
+		       verify ? "--verify" : "--batch", chunk, cap);
 		llama_state_free(st);
 		tokenizer_free(tk);
 		llama_free(&m);

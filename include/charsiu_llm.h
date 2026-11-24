@@ -1139,6 +1139,16 @@ struct llama_state {
 	 * llama_prefill_hint.
 	 */
 	int prompt_total;
+	/*
+	 * SET WHILE A VERIFY PASS RUNS, AND IT KEEPS ATTENTION ON THE CPU. A
+	 * speculative pass must compute the token loop's bits, or which rows
+	 * a run happened to verify -- a timing decision under the auto policy
+	 * -- changes the text. The fp16 attention arm agrees with the CPU to
+	 * fp16 and no further, so a verify pass never takes it; a prompt still
+	 * does. llama_spec_step sets it around its pass, and charsiu_ppl
+	 * --verify sets it to score that arithmetic.
+	 */
+	int in_verify;
 
 	float *kcache;         /* [n_layer][n_ctx][n_head_kv * head_dim] */
 	float *vcache;
