@@ -7335,6 +7335,41 @@ static int row_pool(void)
 	return v;
 }
 
+/*
+ * THE FEWEST ROWS WORTH A FAN OUT, for the per row stages of the batched
+ * loop: the two norms with their residuals, the rope and silu * up.
+ *
+ * A charsiu_parallel_for is a broadcast, a wakeup per worker and a barrier
+ * that waits for the slowest core (an A53), against a stage whose work at
+ * m = 6 is six rows of n_embd. A verify pass makes five of these a layer, 140
+ * on Qwen3, and npudev.c's read back already lost to the pool for exactly
+ * this reason -- too little work a dispatch. Its price HERE has not been
+ * measured, which is why this is a knob.
+ *
+ * A THRESHOLD AND NOT A GUESS: the default is 2, which is exactly the old
+ * `n > 1`, so nothing moves until the board has measured where the crossover
+ * is (CHARSIU_ROW_POOL_MIN=9 runs every verify pass inline). Inline or pooled
+ * cannot change a value: every row is computed by the same function, start
+ * to end, on one thread either way, and no row reads another.
+ */
+static unsigned row_pool_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROW_POOL_MIN");
+
+		v = e && *e ? atoi(e) : 2;
+		if (v < 2)
+			v = 2;
+	}
+	return (unsigned)v;
+}
+
+static int row_pool_for(int n)
+{
+	return row_pool() && n > 1 && (unsigned)n >= row_pool_min();
+}
 
 /*
  * THE ROPE STAGE FOR EVERY ROW, ON THE POOL.
@@ -8495,7 +8530,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(norm1_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8631,7 +8666,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * residuals, the norms -- so an arm using it measures
 			 * all of them and calls the answer the rope's. This
 			 * one moves only the rope. */
-			if (rope_pool() && row_pool() && n > 1)
+			if (rope_pool() && row_pool_for(n))
 				charsiu_parallel_for(rope_rows, &rj,
 						     (uint64_t)n);
 			else
@@ -8769,7 +8804,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(res1_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8806,7 +8841,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct silu_rows_job sj = { s, m->ffn_gelu, nff };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(silu_rows, &sj,
 						     (uint64_t)n);
 			else
@@ -8825,7 +8860,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(res2_rows, &nj,
 						     (uint64_t)n);
 			else
