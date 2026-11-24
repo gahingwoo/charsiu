@@ -1134,6 +1134,14 @@ struct llama_state {
 
 	float *kcache;         /* [n_layer][n_ctx][n_head_kv * head_dim] */
 	float *vcache;
+	/*
+	 * CHARSIU_KV16: the same cache again in fp16, head major
+	 * [layer][kv head][position][head_dim] whatever CHARSIU_KV_POSMAJOR
+	 * says, written beside the float one at both write sites and read
+	 * only by the decode and verify attention. NULL when the switch is
+	 * off. Raw IEEE half bits; see kv16_put in src/llama.c.
+	 */
+	uint16_t *kc16, *vc16;
 
 	float *x, *xb, *xb2;   /* n_embd */
 	/*

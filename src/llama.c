@@ -89,6 +89,53 @@ static int attn_perhead(void)
 	return v;
 }
 
+static int kv_v_chan(void);
+
+/*
+ * CHARSIU_KV16: AN fp16 COPY OF THE KV CACHE FOR THE CPU ATTENTION OF DECODE
+ * AND OF THE VERIFY ROWS. OFF, because it changes numerics: every K and V
+ * element goes through one round to nearest even into fp16 on the way in, and
+ * the arithmetic after that is the fp32 arithmetic of today, exactly. What that
+ * rounding costs in quality is a perplexity question and only the board's
+ * measurement of it can turn this on. See attn_gqa_group for the kernel and
+ * for why this is a second cache and not the NPU's fp16 mirror.
+ *
+ * It refuses CHARSIU_KV_V_AXIS=chan, which rewrites EARLIER positions of the
+ * float V cache when a channel's scale grows; nothing copies those rewrites
+ * into the half cache, so the two would silently disagree.
+ */
+static int kv16_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		v = charsiu_env_flag("CHARSIU_KV16", 0);
+		if (v && kv_v_chan()) {
+			fprintf(stderr, "charsiu: CHARSIU_KV16 refused: "
+				"CHARSIU_KV_V_AXIS=chan rewrites earlier V "
+				"positions the half cache does not follow\n");
+			v = 0;
+		}
+	}
+	return v;
+}
+
+/*
+ * CHARSIU_ATTN_GQA: THE GROUPED DECODE KERNEL OVER THE FLOAT CACHE. OFF until
+ * the board times it. It is bit identical to attn_heads (tests/dattn_exact.c
+ * holds it there at every shape it walks), so the board needs a timing and a
+ * text md5 to turn it on, not a perplexity. CHARSIU_KV16 uses this kernel
+ * whatever this says, because it is the only one that reads halves.
+ */
+static int attn_gqa_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_GQA", 0) || kv16_on();
+	return v;
+}
+
 /*
  * POOL THE DECODE ATTENTION ONCE THE CONTEXT PAYS FOR THE FAN OUT, WHICH IS
  * ROUND 368'S OWN FOLLOW-UP.
@@ -3853,6 +3900,21 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	kvn = (size_t)m->n_layer * (size_t)s->n_ctx * m->n_head_kv * m->head_dim;
 	s->kcache = calloc(kvn, sizeof(float));
 	s->vcache = calloc(kvn, sizeof(float));
+	/*
+	 * HALF AS MUCH AGAIN, NOT INSTEAD. The batched prompt's attention,
+	 * the NPU mirror's catch-up and the KV_BITS simulation all read the
+	 * float cache, so it stays; this is +50% of the KV memory when the
+	 * switch is on (235 MB on Qwen3-0.6B at -c 2048) and nothing when it
+	 * is off.
+	 */
+	if (kv16_on()) {
+		s->kc16 = calloc(kvn, sizeof(uint16_t));
+		s->vc16 = calloc(kvn, sizeof(uint16_t));
+		if (!s->kc16 || !s->vc16) {
+			llama_state_free(s);
+			return NULL;
+		}
+	}
 	s->x   = calloc(m->n_embd, sizeof(float));
 	/*
 	 * xb IS BOTH the normalised embedding and the attention output, and
@@ -3997,6 +4059,7 @@ void llama_state_free(struct llama_state *s)
 	if (!s)
 		return;
 	free(s->kcache); free(s->vcache);
+	free(s->kc16); free(s->vc16);
 	free(s->x); free(s->xb); free(s->xb2);
 	free(s->hb); free(s->hb2);
 	free(s->q); free(s->k); free(s->v);
@@ -4766,6 +4829,636 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 					  vt, hd);
 			}
 		}
+	}
+}
+
+/*
+ * ---- THE GROUPED DECODE KERNEL: CHARSIU_ATTN_GQA, AND CHARSIU_KV16 ----
+ *
+ * WHAT attn_heads COSTS, AND WHY IT IS NOT THE BYTES. On the CM5, Qwen3-0.6B,
+ * decode attention is 77 ms a token at 1480 positions, 63% of the token, over a
+ * float cache of 229 kB a position: 4.4 GB/s, several times under what the
+ * board's memory gives. attn_heads already reads each kv row once per GROUP
+ * (the paragraph above it), so the shortfall is not repeated reads. It is the
+ * shape of the two inner calls. attn_dot is one position against one query in
+ * two accumulator chains, so it waits on the fma latency sixteen times a
+ * position; attn_axpy loads and stores the whole output row for every
+ * position. Both are the forms attn_block_heads already replaced for the
+ * batched prompt with attn_dot4 and attn_axpy8 -- four positions a pass, eight
+ * positions per load and store of the output -- and decode never got them.
+ *
+ * SO THIS IS THOSE KERNELS, PLUS THE GROUP. For one kv head it takes every
+ * query that reads it (the gqa heads of a decode row; the gqa heads of every
+ * row of a speculative verify pass, m <= 8) and walks K once in blocks of four
+ * positions and V once in blocks of eight, with the two heads of one row going
+ * through pair kernels that share each K and V load between them.
+ *
+ * AND IT IS BIT IDENTICAL TO attn_heads, not close to it. Per (query,
+ * position) the score is attn_dot's arithmetic exactly: the same two lane
+ * accumulators split at i % 8 < 4, the same horizontal add, the same scalar
+ * tail, the same `* scale` afterwards. The softmax is softmax() over the same
+ * window. The output is o += round(p * v) in ascending t, separately rounded,
+ * which is attn_axpy's arithmetic and attn_axpy8's. Only the issue order of
+ * independent operations moves. tests/dattn_exact.c compares the two kernels
+ * bit for bit over head sizes, group sizes, lengths, windows and verify rows.
+ *
+ * CHARSIU_KV16 IS THE SAME KERNEL READING HALVES. The blocks of four K rows and
+ * eight V rows are widened to fp32 into a stack scratch that stays in L1 and
+ * then go through the same arithmetic, so a half cache gives exactly what the
+ * float kernel gives on a float cache whose values were rounded through fp16
+ * -- which is what tests/dattn_exact.c checks for that arm, and is why the
+ * only question CHARSIU_KV16 asks the board is the rounding's perplexity.
+ *
+ * WHY A SECOND CACHE AND NOT THE NPU's fp16 MIRROR (struct attn_npu). Four
+ * reasons, each enough:
+ *   1. it exists only when CHARSIU_ATTN_NPU took the prompt on an NPU build,
+ *      and the decode attention has to work on every run;
+ *   2. it is in the hardware's weight tiling, and the V surface is TRANSPOSED
+ *      (a position is one element of each of head_dim output channels, in
+ *      groups of 16 channels by a k group of positions) with a reduction extent
+ *      that moves on the doubling ladder and repacks;
+ *   3. decode was deliberately taken OFF it: appending to it every token was
+ *      priced on the board at 24.63 -> 20.84 tok/s on Qwen3, and
+ *      attn_npu_catchup fills the hole lazily on the next batched layer. Reading
+ *      it from decode would put that append back, plus a whole buffer object
+ *      marked dirty for the next sync, every token;
+ *   4. it is a DRM buffer object whose CPU mapping attribute nothing in this
+ *      tree has measured, and a cache read through a write combined mapping
+ *      would be many times slower than the float cache it replaces.
+ * The price of the second cache is memory, +50% of the KV (see
+ * llama_state_new). The float cache stays, because the batched prompt, the
+ * mirror's catch-up and the KV_BITS simulations read it.
+ */
+#define GQA_HDMAX 512    /* gemma4's full layers; a larger head falls back */
+#define GQA_QMAX 16      /* queries a pass over one kv head's cache */
+
+static inline uint16_t kv16_f2h(float f)
+{
+	/*
+	 * ROUND TO NEAREST EVEN, subnormals kept: what FCVTN does under the
+	 * FPCR Linux gives a process, so the CHARSIU_NO_NEON build stores the
+	 * same bits as the vector one (tests/dattn_exact.c checks the two
+	 * against each other). charsiu_f2h TRUNCATES and is the NPU's packer;
+	 * it is not reused here on purpose.
+	 */
+	uint32_t u, sign;
+	uint16_t o;
+
+	memcpy(&u, &f, 4);
+	sign = u & 0x80000000u;
+	u ^= sign;
+	if (u >= 0x47800000u) {                 /* >= 65536, inf, nan */
+		o = u > 0x7f800000u ? 0x7e00 : 0x7c00;
+	} else if (u < 0x38800000u) {           /* a half subnormal or 0 */
+		float t;
+
+		memcpy(&t, &u, 4);
+		t += 0.5f;
+		memcpy(&u, &t, 4);
+		o = (uint16_t)(u - 0x3f000000u);
+	} else {
+		uint32_t odd = (u >> 13) & 1u;
+
+		u += 0xc8000fffu;                   /* rebias, and half an ulp */
+		u += odd;
+		o = (uint16_t)(u >> 13);
+	}
+	return (uint16_t)(o | (sign >> 16));
+}
+
+static inline float kv16_h2f(uint16_t h)
+{
+	uint32_t u = (uint32_t)(h & 0x7fff) << 13, e = u & 0x0f800000u;
+	float f;
+
+	u += 0x38000000u;
+	if (e == 0x0f800000u) {
+		u += 0x38000000u;                   /* inf, nan */
+	} else if (e == 0) {
+		float m;
+		uint32_t mu = 0x38800000u;
+
+		u += 0x00800000u;
+		memcpy(&f, &u, 4);
+		memcpy(&m, &mu, 4);
+		f -= m;
+		memcpy(&u, &f, 4);
+	}
+	u |= (uint32_t)(h & 0x8000) << 16;
+	memcpy(&f, &u, 4);
+	return f;
+}
+
+static void kv16_put(uint16_t *d, const float *x, uint32_t n)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	for (; i + 4 <= n; i += 4)
+		vst1_u16(d + i, vreinterpret_u16_f16(
+				 vcvt_f16_f32(vld1q_f32(x + i))));
+#endif
+	for (; i < n; i++)
+		d[i] = kv16_f2h(x[i]);
+}
+
+static void kv16_get(float *d, const uint16_t *x, uint32_t n)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	for (; i + 8 <= n; i += 8) {
+		float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(x + i));
+
+		vst1q_f32(d + i, vcvt_f32_f16(vget_low_f16(h)));
+		vst1q_f32(d + i + 4, vcvt_high_f32_f16(h));
+	}
+#endif
+	for (; i < n; i++)
+		d[i] = kv16_h2f(x[i]);
+}
+
+/*
+ * attn_dot4 FOR TWO QUERIES, the K loads shared. Per (query, position) the
+ * same operations in the same order as attn_dot4, and so as attn_dot.
+ */
+static inline void attn_dot4x2(const float *qa, const float *qb,
+			       const float *k0, const float *k1,
+			       const float *k2, const float *k3, uint32_t hd,
+			       float *oa, float *ob)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn()) {
+		float32x4_t a0 = vdupq_n_f32(0.0f), a0h = vdupq_n_f32(0.0f);
+		float32x4_t a1 = vdupq_n_f32(0.0f), a1h = vdupq_n_f32(0.0f);
+		float32x4_t a2 = vdupq_n_f32(0.0f), a2h = vdupq_n_f32(0.0f);
+		float32x4_t a3 = vdupq_n_f32(0.0f), a3h = vdupq_n_f32(0.0f);
+		float32x4_t b0 = vdupq_n_f32(0.0f), b0h = vdupq_n_f32(0.0f);
+		float32x4_t b1 = vdupq_n_f32(0.0f), b1h = vdupq_n_f32(0.0f);
+		float32x4_t b2 = vdupq_n_f32(0.0f), b2h = vdupq_n_f32(0.0f);
+		float32x4_t b3 = vdupq_n_f32(0.0f), b3h = vdupq_n_f32(0.0f);
+		float s[8];
+		uint32_t i = 0;
+
+		for (; i + 8 <= hd; i += 8) {
+			float32x4_t xa = vld1q_f32(qa + i), xah = vld1q_f32(qa + i + 4);
+			float32x4_t xb = vld1q_f32(qb + i), xbh = vld1q_f32(qb + i + 4);
+			float32x4_t k, kh;
+
+			k = vld1q_f32(k0 + i); kh = vld1q_f32(k0 + i + 4);
+			a0 = vfmaq_f32(a0, xa, k); a0h = vfmaq_f32(a0h, xah, kh);
+			b0 = vfmaq_f32(b0, xb, k); b0h = vfmaq_f32(b0h, xbh, kh);
+			k = vld1q_f32(k1 + i); kh = vld1q_f32(k1 + i + 4);
+			a1 = vfmaq_f32(a1, xa, k); a1h = vfmaq_f32(a1h, xah, kh);
+			b1 = vfmaq_f32(b1, xb, k); b1h = vfmaq_f32(b1h, xbh, kh);
+			k = vld1q_f32(k2 + i); kh = vld1q_f32(k2 + i + 4);
+			a2 = vfmaq_f32(a2, xa, k); a2h = vfmaq_f32(a2h, xah, kh);
+			b2 = vfmaq_f32(b2, xb, k); b2h = vfmaq_f32(b2h, xbh, kh);
+			k = vld1q_f32(k3 + i); kh = vld1q_f32(k3 + i + 4);
+			a3 = vfmaq_f32(a3, xa, k); a3h = vfmaq_f32(a3h, xah, kh);
+			b3 = vfmaq_f32(b3, xb, k); b3h = vfmaq_f32(b3h, xbh, kh);
+		}
+		s[0] = vaddvq_f32(vaddq_f32(a0, a0h));
+		s[1] = vaddvq_f32(vaddq_f32(a1, a1h));
+		s[2] = vaddvq_f32(vaddq_f32(a2, a2h));
+		s[3] = vaddvq_f32(vaddq_f32(a3, a3h));
+		s[4] = vaddvq_f32(vaddq_f32(b0, b0h));
+		s[5] = vaddvq_f32(vaddq_f32(b1, b1h));
+		s[6] = vaddvq_f32(vaddq_f32(b2, b2h));
+		s[7] = vaddvq_f32(vaddq_f32(b3, b3h));
+		for (; i < hd; i++) {
+			s[0] += qa[i] * k0[i];
+			s[1] += qa[i] * k1[i];
+			s[2] += qa[i] * k2[i];
+			s[3] += qa[i] * k3[i];
+			s[4] += qb[i] * k0[i];
+			s[5] += qb[i] * k1[i];
+			s[6] += qb[i] * k2[i];
+			s[7] += qb[i] * k3[i];
+		}
+		memcpy(oa, s, 4 * sizeof(float));
+		memcpy(ob, s + 4, 4 * sizeof(float));
+		return;
+	}
+#endif
+	attn_dot4(qa, k0, k1, k2, k3, hd, oa);
+	attn_dot4(qb, k0, k1, k2, k3, hd, ob);
+}
+
+/*
+ * attn_axpy8 FOR TWO OUTPUTS, the V loads shared. Each output element still
+ * takes its eight products in ascending t, each multiply and add separately
+ * rounded, the barrier keeping the compiler from fusing them.
+ */
+static inline void attn_axpy8x2(float *oa, float *ob, const float *pa,
+				const float *pb, const float *v,
+				size_t vstride, uint32_t hd)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain()) {
+		float32x4_t wa[8], wb[8];
+		uint32_t i = 0;
+		unsigned q;
+
+		for (q = 0; q < 8; q++) {
+			wa[q] = vdupq_n_f32(pa[q]);
+			wb[q] = vdupq_n_f32(pb[q]);
+		}
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t xa = vld1q_f32(oa + i), xb = vld1q_f32(ob + i);
+
+			for (q = 0; q < 8; q++) {
+				float32x4_t vv = vld1q_f32(v + q * vstride + i);
+				float32x4_t ta = vmulq_f32(wa[q], vv);
+				float32x4_t tb = vmulq_f32(wb[q], vv);
+
+				__asm__("" : "+w"(ta), "+w"(tb));
+				xa = vaddq_f32(xa, ta);
+				xb = vaddq_f32(xb, tb);
+			}
+			vst1q_f32(oa + i, xa);
+			vst1q_f32(ob + i, xb);
+		}
+		for (; i < hd; i++) {
+			float x = oa[i], y = ob[i];
+
+			for (q = 0; q < 8; q++) {
+				x += pa[q] * v[q * vstride + i];
+				y += pb[q] * v[q * vstride + i];
+			}
+			oa[i] = x;
+			ob[i] = y;
+		}
+		return;
+	}
+#endif
+	attn_axpy8(oa, pa, v, vstride, hd);
+	attn_axpy8(ob, pb, v, vstride, hd);
+}
+
+/*
+ * THE SAME TWO PAIR KERNELS READING HALVES, widened in registers.
+ *
+ * Widening a block into a scratch first and then running the float kernels
+ * on it was the first version, and on the desk it was SLOWER than the float
+ * cache it halves (0.85x at 512 positions): every element was stored to L1
+ * and loaded back once per query on top of the conversion. Here each 8 halves
+ * are loaded once and widened once into two registers that both queries use.
+ * The widening is exact, so the arithmetic after it is the float kernels'
+ * to the bit and tests/dattn_exact.c holds the two together. Only the full
+ * blocks come here; a block a query only partly sees still goes through the
+ * scratch and the single position kernels.
+ */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+static inline void h8(const uint16_t *p, float32x4_t *lo, float32x4_t *hi)
+{
+	float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(p));
+
+	*lo = vcvt_f32_f16(vget_low_f16(h));
+	*hi = vcvt_high_f32_f16(h);
+}
+#endif
+
+/*
+ * G IS 1 OR 2 AND ALWAYS A CONSTANT AT THE CALL, so the loops over it unroll
+ * and the accumulators stay in registers: a single query (an odd group, or a
+ * model with no GQA) does not pay for a second one it would throw away.
+ */
+static inline __attribute__((always_inline)) void
+attn_dot4_hg(const float *const *qs, unsigned G, const uint16_t *k0,
+	     size_t ks, uint32_t hd, float *const *os)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn() && hd % 8 == 0) {
+		float32x4_t lo[2][4], hi[2][4];
+		uint32_t i;
+		unsigned r, g;
+
+		for (g = 0; g < G; g++)
+			for (r = 0; r < 4; r++)
+				lo[g][r] = hi[g][r] = vdupq_n_f32(0.0f);
+		for (i = 0; i < hd; i += 8) {
+			float32x4_t xl[2], xh[2];
+
+			for (g = 0; g < G; g++) {
+				xl[g] = vld1q_f32(qs[g] + i);
+				xh[g] = vld1q_f32(qs[g] + i + 4);
+			}
+			for (r = 0; r < 4; r++) {
+				float32x4_t k, kh;
+
+				h8(k0 + r * ks + i, &k, &kh);
+				for (g = 0; g < G; g++) {
+					lo[g][r] = vfmaq_f32(lo[g][r], xl[g], k);
+					hi[g][r] = vfmaq_f32(hi[g][r], xh[g], kh);
+				}
+			}
+		}
+		for (g = 0; g < G; g++)
+			for (r = 0; r < 4; r++)
+				os[g][r] = vaddvq_f32(vaddq_f32(lo[g][r],
+								hi[g][r]));
+		return;
+	}
+#endif
+	{
+		float buf[4 * GQA_HDMAX];
+		unsigned r, g;
+
+		for (r = 0; r < 4; r++)
+			kv16_get(buf + r * hd, k0 + r * ks, hd);
+		for (g = 0; g < G; g++)
+			attn_dot4(qs[g], buf, buf + hd, buf + 2 * hd,
+				  buf + 3 * hd, hd, os[g]);
+	}
+}
+
+static inline __attribute__((always_inline)) void
+attn_axpy8_hg(float *const *os, const float *const *ps, unsigned G,
+	      const uint16_t *v, size_t vs, uint32_t hd)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain() && hd % 8 == 0) {
+		uint32_t i;
+		unsigned q, g;
+
+		for (i = 0; i < hd; i += 8) {
+			float32x4_t xl[2], xh[2];
+
+			for (g = 0; g < G; g++) {
+				xl[g] = vld1q_f32(os[g] + i);
+				xh[g] = vld1q_f32(os[g] + i + 4);
+			}
+			for (q = 0; q < 8; q++) {
+				float32x4_t vl, vh;
+
+				h8(v + q * vs + i, &vl, &vh);
+				for (g = 0; g < G; g++) {
+					float32x4_t t0 = vmulq_n_f32(vl, ps[g][q]);
+					float32x4_t t1 = vmulq_n_f32(vh, ps[g][q]);
+
+					__asm__("" : "+w"(t0), "+w"(t1));
+					xl[g] = vaddq_f32(xl[g], t0);
+					xh[g] = vaddq_f32(xh[g], t1);
+				}
+			}
+			for (g = 0; g < G; g++) {
+				vst1q_f32(os[g] + i, xl[g]);
+				vst1q_f32(os[g] + i + 4, xh[g]);
+			}
+		}
+		return;
+	}
+#endif
+	{
+		float buf[8 * GQA_HDMAX];
+		unsigned r, g;
+
+		for (r = 0; r < 8; r++)
+			kv16_get(buf + r * hd, v + r * vs, hd);
+		for (g = 0; g < G; g++)
+			attn_axpy8(os[g], ps[g], buf, hd, hd);
+	}
+}
+
+/* one query of a group: where it reads, where it writes, what it may see */
+struct gqa_q {
+	const float *q;   /* hd floats, roped */
+	float *sc;        /* its scores, indexed by ABSOLUTE position */
+	float *out;       /* hd floats */
+	int tlo, pos;     /* the window, inclusive at both ends */
+};
+
+/* the next query shares this one's window, so the pair kernels may take both */
+static inline int gqa_paired(const struct gqa_q *Q, unsigned i, unsigned nq)
+{
+	return i + 1 < nq && Q[i + 1].tlo == Q[i].tlo
+	    && Q[i + 1].pos == Q[i].pos;
+}
+
+/*
+ * EVERY QUERY OF ONE KV HEAD, ONE PASS OVER ITS K AND ONE OVER ITS V.
+ *
+ * kf/vf is the float cache of this kv head at position 0, or kh/vh the half
+ * one; exactly one pair is non NULL. ks is the stride between two positions
+ * in whichever it is. The blocks are aligned on the lowest position any query
+ * sees; a block a query only partly sees goes position by position through
+ * attn_dot and attn_axpy, which is not a different answer (see attn_block_heads,
+ * which makes the same split).
+ */
+static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
+			   const float *kf, const float *vf,
+			   const uint16_t *kh, const uint16_t *vh, size_t ks,
+			   uint32_t hd, float scale)
+{
+	float buf[8 * GQA_HDMAX];
+	int tmin = Q[0].tlo, tmax = Q[0].pos;
+	unsigned i;
+	/*
+	 * WIDEN IN REGISTERS FOR ONE PAIR, INTO L1 FOR MORE. In registers
+	 * each half is widened once per pair that reads it, which is once for
+	 * a decode row and six times for a six row verify pass -- and on the
+	 * desk that made the verify pass 0.55x of the float kernel. With more
+	 * than one pair the block is widened once into buf and every pair runs
+	 * the float kernels on it. Either way is exact; this is only cost.
+	 */
+	int inreg = nq <= 2;
+
+	for (i = 1; i < nq; i++) {
+		if (Q[i].tlo < tmin)
+			tmin = Q[i].tlo;
+		if (Q[i].pos > tmax)
+			tmax = Q[i].pos;
+	}
+
+	for (int t = tmin; t <= tmax; t += 4) {
+		int nt = tmax - t + 1 < 4 ? tmax - t + 1 : 4;
+		const uint16_t *kb = kh ? kh + (size_t)t * ks : NULL;
+		const float *k[4];
+		int r, conv = 0;
+
+		if (kb && !inreg) {
+			for (r = 0; r < nt; r++)
+				kv16_get(buf + (size_t)r * hd,
+					 kb + (size_t)r * ks, hd);
+			kb = NULL;
+			conv = 1;
+		}
+
+		for (r = 0; r < 4; r++)
+			k[r] = kf ? kf + (size_t)(t + (r < nt ? r : 0)) * ks
+				  : buf + (size_t)(r < nt ? r : 0) * hd;
+		for (i = 0; i < nq; i++) {
+			const struct gqa_q *a = &Q[i];
+
+			if (nt == 4 && t >= a->tlo && t + 3 <= a->pos) {
+				float o[4], p[4];
+				int two = gqa_paired(Q, i, nq);
+				const struct gqa_q *b = two ? &Q[i + 1] : a;
+
+				if (kb) {
+					const float *qs[2] = { a->q, b->q };
+					float *os[2] = { o, p };
+
+					if (two)
+						attn_dot4_hg(qs, 2, kb, ks, hd, os);
+					else
+						attn_dot4_hg(qs, 1, kb, ks, hd, os);
+				} else if (two) {
+					attn_dot4x2(a->q, b->q, k[0], k[1],
+						    k[2], k[3], hd, o, p);
+				} else {
+					attn_dot4(a->q, k[0], k[1], k[2], k[3],
+						  hd, o);
+				}
+				for (r = 0; r < 4; r++)
+					a->sc[t + r] = o[r] * scale;
+				if (two) {
+					for (r = 0; r < 4; r++)
+						b->sc[t + r] = p[r] * scale;
+					i++;
+				}
+				continue;
+			}
+			/* a partial block: the halves widened once, here */
+			if (kb && !conv) {
+				for (r = 0; r < nt; r++)
+					kv16_get(buf + (size_t)r * hd,
+						 kb + (size_t)r * ks, hd);
+				conv = 1;
+			}
+			for (r = 0; r < nt; r++)
+				if (t + r >= a->tlo && t + r <= a->pos)
+					a->sc[t + r] =
+						attn_dot(a->q, k[r], hd) * scale;
+		}
+	}
+
+	for (i = 0; i < nq; i++) {
+		softmax(Q[i].sc + Q[i].tlo, Q[i].pos + 1 - Q[i].tlo);
+		memset(Q[i].out, 0, hd * sizeof(float));
+	}
+
+	for (int t = tmin; t <= tmax; t += 8) {
+		int nt = tmax - t + 1 < 8 ? tmax - t + 1 : 8;
+		const uint16_t *vb = vh ? vh + (size_t)t * ks : NULL;
+		const float *v = vf ? vf + (size_t)t * ks : buf;
+		size_t vs = vf ? ks : hd;
+		int r, conv = 0;
+
+		if (vb && !inreg) {
+			for (r = 0; r < nt; r++)
+				kv16_get(buf + (size_t)r * hd,
+					 vb + (size_t)r * ks, hd);
+			vb = NULL;
+			conv = 1;
+		}
+
+		for (i = 0; i < nq; i++) {
+			const struct gqa_q *a = &Q[i];
+
+			if (nt == 8 && t >= a->tlo && t + 7 <= a->pos) {
+				int two = gqa_paired(Q, i, nq);
+				const struct gqa_q *b = two ? &Q[i + 1] : a;
+
+				if (vb) {
+					float *os[2] = { a->out, b->out };
+					const float *ps[2] = { a->sc + t,
+							       b->sc + t };
+
+					if (two)
+						attn_axpy8_hg(os, ps, 2, vb, ks, hd);
+					else
+						attn_axpy8_hg(os, ps, 1, vb, ks, hd);
+				} else if (two) {
+					attn_axpy8x2(a->out, b->out, a->sc + t,
+						     b->sc + t, v, vs, hd);
+				} else {
+					attn_axpy8(a->out, a->sc + t, v, vs, hd);
+				}
+				if (two)
+					i++;
+				continue;
+			}
+			if (vb && !conv) {
+				for (r = 0; r < nt; r++)
+					kv16_get(buf + (size_t)r * hd,
+						 vb + (size_t)r * ks, hd);
+				conv = 1;
+			}
+			for (r = 0; r < nt; r++)
+				if (t + r >= a->tlo && t + r <= a->pos)
+					attn_axpy(a->out, a->sc[t + r],
+						  v + (size_t)r * vs, hd);
+		}
+	}
+}
+
+/*
+ * Where one kv head's cache starts, in whichever cache this run reads. The
+ * half cache is head major whatever CHARSIU_KV_POSMAJOR says.
+ */
+static void gqa_bases(struct llama_state *s, uint32_t l, uint32_t kvh,
+		      uint32_t hd, uint32_t hdmax, uint32_t kvdim,
+		      uint32_t nkv, const float **kf, const float **vf,
+		      const uint16_t **kh, const uint16_t **vh, size_t *ks)
+{
+	if (s->kc16 && kv16_on()) {
+		size_t b = (size_t)(l * nkv + kvh) * s->n_ctx * hdmax;
+
+		*kf = *vf = NULL;
+		*kh = s->kc16 + b;
+		*vh = s->vc16 + b;
+		*ks = hdmax;
+		return;
+	}
+	*kh = *vh = NULL;
+	if (kv_posmajor()) {
+		size_t b = (size_t)l * s->n_ctx * kvdim + (size_t)kvh * hd;
+
+		*kf = s->kcache + b;
+		*vf = s->vcache + b;
+		*ks = kvdim;
+	} else {
+		size_t b = (size_t)(l * nkv + kvh) * s->n_ctx * hdmax;
+
+		*kf = s->kcache + b;
+		*vf = s->vcache + b;
+		*ks = hdmax;
+	}
+}
+
+/*
+ * THE TOKEN LOOP'S ENTRY, the same contract as attn_heads: a range of query
+ * heads, the scores in s->att, the output in s->xb. A range that cuts a group
+ * takes the part of the group inside it, as attn_heads does.
+ */
+static void attn_gqa_heads(void *vj, uint64_t h0, uint64_t nh)
+{
+	const struct attn_job *j = vj;
+	struct llama_state *s = j->s;
+	uint64_t h = h0, end = h0 + nh;
+
+	while (h < end) {
+		uint32_t kvh = (uint32_t)h / j->gqa;
+		uint64_t g1 = (uint64_t)(kvh + 1) * j->gqa;
+		struct gqa_q Q[GQA_QMAX];
+		const float *kf, *vf;
+		const uint16_t *kh, *vh;
+		size_t ks;
+		unsigned n = 0;
+
+		if (g1 > end)
+			g1 = end;
+		if (g1 - h > GQA_QMAX)
+			g1 = h + GQA_QMAX;
+		gqa_bases(s, j->l, kvh, j->hd, j->hdmax, j->kvdim, j->nkv,
+			  &kf, &vf, &kh, &vh, &ks);
+		for (; h < g1; h++, n++)
+			Q[n] = (struct gqa_q){ j->q + h * j->hd,
+					       s->att + (size_t)h * s->n_ctx,
+					       s->xb + h * j->hd, j->t0, j->pos };
+		attn_gqa_group(Q, n, kf, vf, kh, vh, ks, j->hd, j->scale);
 	}
 }
 
@@ -7562,6 +8255,74 @@ static int attn_block(struct attn_block_job *j)
 	return attn_block_cpu(j);
 }
 
+/*
+ * THE VERIFY ROWS THROUGH THE GROUPED KERNEL. A speculative pass is 2 to 8
+ * rows at consecutive positions over one cache, so every query of every row
+ * that reads a kv head goes through ONE pass over that head's K and V, where
+ * attn_block_heads makes one pass a query head. Row r of the chunk sees
+ * [tlo(r), pos0 + r], the two heads of one row share it and pair.
+ *
+ * The unit is (kv head, a slice of the rows). With at least as many kv heads
+ * as threads a unit is a whole kv head and the cache is read once; with fewer
+ * (gemma-3-1b has one) the rows are split so the threads have work, and each
+ * slice reads the head again -- the trade attn_block_heads makes per head.
+ */
+#define GQA_VERIFY_ROWS 8
+
+struct gqa_rows_job {
+	struct attn_block_job *j;
+	unsigned split;      /* row slices a kv head */
+};
+
+static void attn_gqa_rows(void *ctx, uint64_t u0, uint64_t nu)
+{
+	struct gqa_rows_job *g = ctx;
+	struct attn_block_job *j = g->j;
+	struct llama_state *s = j->s;
+	size_t qstride = (size_t)j->n_head * j->hd;
+	uint64_t u;
+
+	for (u = u0; u < u0 + nu; u++) {
+		uint32_t kvh = (uint32_t)(u / g->split);
+		unsigned part = (unsigned)(u % g->split);
+		int r0 = (int)(part * (unsigned)j->n / g->split);
+		int r1 = (int)((part + 1) * (unsigned)j->n / g->split);
+		const float *kf, *vf;
+		const uint16_t *kh, *vh;
+		size_t ks;
+		struct gqa_q Q[GQA_QMAX];
+		unsigned n = 0;
+
+		gqa_bases(s, j->l, kvh, j->hd, j->hdmax, j->kvdim, j->nkv,
+			  &kf, &vf, &kh, &vh, &ks);
+		for (int r = r0; r < r1; r++) {
+			int pos = j->pos0 + r;
+			int tlo = j->swa && pos + 1 > j->n_swa
+				? pos + 1 - j->n_swa : 0;
+
+			for (uint32_t h = kvh * j->gqa; h < (kvh + 1) * j->gqa;
+			     h++) {
+				if (n == GQA_QMAX) {
+					attn_gqa_group(Q, n, kf, vf, kh, vh, ks,
+						       j->hd, j->scale);
+					n = 0;
+				}
+				/* the scores where attn_block_heads keeps
+				 * them: unit h, row r of its one block */
+				Q[n++] = (struct gqa_q){
+					j->q + (size_t)r * qstride + h * j->hd,
+					s->batt + ((size_t)h * j->R + r)
+						  * s->n_ctx,
+					j->out + (size_t)r * qstride + h * j->hd,
+					tlo, pos };
+			}
+		}
+		if (n)
+			attn_gqa_group(Q, n, kf, vf, kh, vh, ks, j->hd,
+				       j->scale);
+	}
+}
+
 static int attn_block_cpu(struct attn_block_job *j)
 {
 	struct llama_state *s = j->s;
@@ -7586,6 +8347,28 @@ static int attn_block_cpu(struct attn_block_job *j)
 			}
 			s->batt_rows = (unsigned)R;
 			s->batt_units = (size_t)j->n_head * nblk;
+		}
+		/*
+		 * A VERIFY PASS, OR A PROMPT CHUNK THAT SHORT, through the
+		 * grouped kernel. R == n here (attn_block clamps it), so the
+		 * scratch above is one block a head and attn_gqa_rows indexes
+		 * it the way attn_block_heads would.
+		 */
+		if (attn_gqa_on() && j->n <= GQA_VERIFY_ROWS && R == j->n
+		    && j->hd <= GQA_HDMAX) {
+			unsigned th = (unsigned)charsiu_threads();
+			struct gqa_rows_job g = { j, 1 };
+
+			if (attn_block_pool() && th > j->nkv)
+				g.split = (th + j->nkv - 1) / j->nkv;
+			if (g.split > (unsigned)j->n)
+				g.split = (unsigned)j->n;
+			if (attn_block_pool())
+				charsiu_parallel_for(attn_gqa_rows, &g,
+						     (uint64_t)j->nkv * g.split);
+			else
+				attn_gqa_rows(&g, 0, (uint64_t)j->nkv * g.split);
+			return 0;
 		}
 		if (attn_block_pool())
 			charsiu_parallel_for(attn_block_heads, j,
@@ -8643,6 +9426,12 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						memcpy(s->vcache + off, vs,
 						       hd * sizeof(float));
 					}
+					/* the half cache, from the same
+					 * numbers the float one now holds */
+					if (s->kc16) {
+						kv16_put(s->kc16 + off, ks, hd);
+						kv16_put(s->vc16 + off, vs, hd);
+					}
 					/* the fp16 mirror is written HERE and
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
@@ -9317,6 +10106,17 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 			memcpy(s->kcache + off, s->k, kvdim * sizeof(float));
 			memcpy(s->vcache + off, s->v, kvdim * sizeof(float));
+			if (s->kc16)
+				for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+					size_t o16 = ((size_t)(l * m->n_head_kv
+						      + kh) * s->n_ctx + pos)
+						     * hdmax;
+
+					kv16_put(s->kc16 + o16, s->k + kh * hd,
+						 hd);
+					kv16_put(s->vc16 + o16, s->v + kh * hd,
+						 hd);
+				}
 		} else {
 			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
@@ -9346,6 +10146,14 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				       hd * sizeof(float));
 				memcpy(s->vcache + off, s->v + kh * hd,
 				       hd * sizeof(float));
+				}
+				/* FROM THE FLOAT CACHE JUST WRITTEN, so a
+				 * KV_BITS rounding reaches the halves too */
+				if (s->kc16) {
+					kv16_put(s->kc16 + off,
+						 s->kcache + off, hd);
+					kv16_put(s->vc16 + off,
+						 s->vcache + off, hd);
 				}
 				/*
 				 * THE DECODE PATH NO LONGER WRITES THE
@@ -9389,12 +10197,26 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			 * context and 38 positions is not where this question
 			 * gets settled. CHARSIU_ATTN_POOL turns it on.
 			 */
+			/*
+			 * THE GROUPED KERNEL takes the same job and the same
+			 * pool rule; the grain keeps a dynamic chunk to whole
+			 * groups. The 64 position threshold was measured for
+			 * attn_heads, and a kernel that does the same work
+			 * faster has a later break even -- unmeasured, which is
+			 * why CHARSIU_ATTN_POOL_MIN is the knob a board round
+			 * sweeps for it.
+			 */
+			void (*fn)(void *, uint64_t, uint64_t) =
+				attn_gqa_on() && hd <= GQA_HDMAX
+				? attn_gqa_heads : attn_heads;
+
 			if (attn_pool_for(pos)) {
 				charsiu_note("attention over the pool",
 					     cur_layer, (unsigned long)g_pool.n);
-				pool_run(attn_heads, &aj, m->n_head, 1);
+				pool_run(fn, &aj, m->n_head,
+					 fn == attn_heads ? 1 : gqa);
 			} else {
-				attn_heads(&aj, 0, m->n_head);
+				fn(&aj, 0, m->n_head);
 			}
 			charsiu_note("attention: done", cur_layer,
 				     (unsigned long)pos);

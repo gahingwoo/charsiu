@@ -80,7 +80,7 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_matmul $(BUILD)/npu_fence_scan \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
-     $(BUILD)/vattn_bench \
+     $(BUILD)/vattn_bench $(BUILD)/dattn_bench \
      $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
      $(BUILD)/fp16_plan \
      $(BUILD)/fp16_regrow \
@@ -355,7 +355,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -383,6 +383,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/pack_groups
 	./$(BUILD)/axpy8
 	./$(BUILD)/attn_two_thresholds
+	./$(BUILD)/dattn_exact
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
 	./tests/arch_list.sh
@@ -505,6 +506,21 @@ $(BUILD)/fp16_regrow_fuzz: tests/fp16_regrow_fuzz.c src/regcmd.c src/job.c | $(B
 # environment.
 $(BUILD)/attn_two_thresholds: tests/attn_two_thresholds.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/attn_two_thresholds.c $(LLMNOLL) -lm -lpthread
+
+# THE GROUPED DECODE ATTENTION, BIT FOR BIT AGAINST THE KERNELS IT REPLACES.
+# A llama.c translation unit for the same reason as the one above: the kernels
+# are static and the test has to call the shipped ones.
+$(BUILD)/dattn_exact: tests/dattn_exact.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/dattn_exact.c $(LLMNOLL) -lm -lpthread
+
+# AND ITS TIMING, at the Qwen3-0.6B decode shape: old kernel against new,
+# float cache against half, one row and a verify pass. The same translation
+# unit trick, so it times the shipped kernels.
+$(BUILD)/dattn_bench: tools/dattn_bench.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tools/dattn_bench.c $(LLMNOLL) -lm -lpthread
+
+$(BUILD)/dattn_bench.aarch64: tools/dattn_bench.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ tools/dattn_bench.c $(LLMNOLL) -lm -lpthread
 
 # the guard is its own unit for exactly this reason: the table is testable on a
 # desk without linking the hardware path behind it
