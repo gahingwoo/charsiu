@@ -10716,11 +10716,31 @@ static int spec_policy(struct llama_spec *sp, int d)
 	double best = 0.0, e = 1.0, p = 1.0;
 	int bd = 0;
 
+	int wmax = 0;
+
 	if (sp->n_tplain < 2)
 		return 0;               /* nothing to compare a pass with yet */
+	/*
+	 * PROBE NARROWEST FIRST. A width is a candidate only once every
+	 * narrower one has been measured: an unmeasured width is priced from
+	 * a prior, and on a model that accepts little the prior sent the
+	 * first probes at six rows, two plain steps each. A model that
+	 * accepts reaches six rows a few passes later.
+	 *
+	 * IT DID NOT REMOVE THE LONG PROMPT LOSS. On the CM5, Qwen3-1.7B at
+	 * 1400 tokens of context still runs 0.96x the plain loop with auto
+	 * (6 speculative passes of 127, text identical): the warm passes are
+	 * w2 181 / w4 236 ms against a 152 ms step, but the mean over all of
+	 * them is 318 ms, so the cost is in the first pass at each width,
+	 * which the ledger leaves out as cold.
+	 */
+	while (wmax < 2 && sp->n_tver[wmax] >= 2)
+		wmax++;
 	for (int dd = 1; dd <= d; dd++) {
 		double t, r;
 
+		if (spec_wi(dd) > wmax)
+			break;
 		p *= spec_alpha(sp, dd - 1);
 		e += p;
 		t = spec_tver(sp, spec_wi(dd));
