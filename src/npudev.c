@@ -8798,7 +8798,7 @@ static unsigned mtile_n(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_NPU_MTILE");
 
-		v = e && *e ? atoi(e) : 1;
+		v = e && *e ? atoi(e) : 3;
 		if (v < 1)
 			v = 1;
 		if (v > MTILE_MAX)
@@ -8814,7 +8814,7 @@ static unsigned mtile_min(void)
 	if (v < 0) {
 		const char *e = getenv("CHARSIU_NPU_MTILE_MIN");
 
-		v = e && *e ? atoi(e) : 32;
+		v = e && *e ? atoi(e) : 38;
 		if (v < 2)
 			v = 2;
 	}
@@ -8832,8 +8832,19 @@ static int mtile_sync(void)
 
 /*
  * EVEN BLOCKS, AS EQUAL AS EVEN ALLOWS, WIDEST FIRST: w4 refuses an odd
- * width, and the pair read wants even ranges. 124 is 62 + 62, 116 is 58 + 58,
- * 140 in three is 48 + 46 + 46. Returns the block count, 1 for untiled.
+ * width, and the pair read wants even ranges. 124 in three is 42 + 42 + 40,
+ * 140 is 48 + 46 + 46. Returns the block count, 1 for untiled.
+ *
+ * THE DEFAULT IS THREE BLOCKS, NONE NARROWER THAN 38 ROWS, stepping down to
+ * two when three would be narrower (CM5, Qwen3-0.6B, final10 2026-11-26,
+ * interleaved, text identical in every rep). Wins: three blocks of 38 to 46
+ * rows (prompts of 115 to 139 tokens) 404-449 against 438-540 ms untiled;
+ * two of 42 and 40 (82 tokens) 287-303 against 312-334; and in board_arms
+ * the 244, 397 and 1406 token prompts of Llama-3.2-1B and Qwen3-1.7B
+ * 1.05-1.13x. Losses, which 38 excludes: three blocks of 34/32/32 (98
+ * tokens) 449 against 383, two of 34/32 (66 tokens) 313 against 260. Not
+ * stepping down at all (a build of this note's first draft) kept the
+ * losses away but gave back every board_arms win above.
  */
 static unsigned mtile_plan(unsigned m, unsigned *rows)
 {
