@@ -427,6 +427,7 @@ struct charsiu_npu {
 	 */
 	struct charsiu_npu *alt;
 	int exact8;
+	unsigned in_ks;            /* K slices g->in has room for */
 	float *bd1x;               /* exact8: each row's whole-K d1 */
 	unsigned bd1x_n;
 	/*
@@ -2339,6 +2340,22 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	/*
+	 * AND ROOM FOR A GROUP NARROWER THAN KMAX, which tensor_grouped has
+	 * allowed since kgroup == kmax became kgroup <= kmax -- while this
+	 * still sized the input buffer for K / KMAX slices. KMAX 1024 with
+	 * CHARSIU_NPU_W4_GROUP=256 slices Llama's ffn_down into 32 and its
+	 * activation was packed into an object that holds 8: the 2026-11-25
+	 * arms with group 256 and 128 printed nothing at all. Unchanged
+	 * whenever the group is KMAX, which is every default.
+	 */
+	{
+		const char *ge = getenv("CHARSIU_NPU_W4_GROUP");
+		unsigned grp = ge && *ge ? (unsigned)atoi(ge) : 0;
+
+		if (g->w4 && grp > 0 && grp < g->kmax)
+			ks = (max_k + grp - 1) / grp;
+	}
+	/*
 	 * ROOM FOR A NARROWER SLICE. With CHARSIU_NPU_W4_GROUP_FIT a grouped
 	 * tensor slices at its own group rather than at KMAX, so it can need
 	 * more slots than this: the widest divisor of 5632 under 1024 is 512,
@@ -2349,6 +2366,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 */
 	if (charsiu_env_flag("CHARSIU_NPU_W4_GROUP_FIT", 0))
 		ks *= 2;
+	g->in_ks = ks;
 	g->max_slices = ns * ks;
 	g->slot_cap = max_tensors * g->max_slices;
 
@@ -3880,6 +3898,14 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	}
 	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
+		return -1;
+	}
+	/* the backstop for the sizing at open: g->in holds in_ks slices.
+	 * Asked only of a group narrower than KMAX, the case it was missing;
+	 * nothing a default run stages can reach it. */
+	if (ks > g->in_ks && tensor_grouped(g, t) && t->kgroup < g->kmax) {
+		whine(g, "more K slices than the input buffer was opened for",
+		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
 
