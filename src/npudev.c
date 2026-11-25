@@ -397,6 +397,39 @@ struct charsiu_npu {
 	 */
 	int w4;
 	/*
+	 * THE EIGHT BIT LAYERS OF A MIXED MODEL, ON A DEVICE OF THEIR OWN.
+	 *
+	 * CHARSIU_NPU_INT8_LAYERS keeps some blocks at eight bits on a model
+	 * whose device is opened for four, and charsiu_npu_add refuses those
+	 * tensors (see the note there: lifting the refusal on ONE device was
+	 * tried on hardware and computed garbage). Refused, they ran on the
+	 * CPU, one prompt row at a time: Llama-3.2-1B's two eight bit layers
+	 * took its 124 token prompt from 926 ms to 2963 and its decode from
+	 * 18.5 tok/s to 13.2, where their bytes are worth about 12%.
+	 *
+	 * So a four bit device opens a second one, `alt`, at eight bits, and
+	 * stages there exactly the tensors it would have refused. An id from
+	 * alt is handed out as NPU_ALT_ID + its own id, and every public entry
+	 * that takes an id sends it to the device it belongs to.
+	 *
+	 * `exact8` IS WHAT MAKES THAT A SPEED CHANGE AND NOT A TEXT CHANGE.
+	 * alt does the CPU fallback's arithmetic, not the int8 device's usual
+	 * one: each row quantised ONCE over its whole K the way charsiu_act_q1
+	 * does it (the batched pack normally takes a range per K slice), the K
+	 * slices' raw int32 accumulators summed as integers, and the
+	 * dequantise in double in npu_matvec's order, acc * scale * d1. Every
+	 * step of that is exact or is the same rounding in the same order, so
+	 * the answer is the answer the CPU gave, bit for bit -- and anything
+	 * alt refuses still falls back to that same CPU code.
+	 *
+	 * CHARSIU_NPU_INT8_ALT=0 does not open it, which is the control: the
+	 * refusal and the CPU path exactly as before, in the same binary.
+	 */
+	struct charsiu_npu *alt;
+	int exact8;
+	float *bd1x;               /* exact8: each row's whole-K d1 */
+	unsigned bd1x_n;
+	/*
 	 * CHARSIU_NPU_W4_MIDRISE: the vendor's grid, w = (s + 0.5) * d, with no
 	 * code for zero. The hardware still computes sum(s * a), so the half
 	 * step is 0.5 * d * sum(a) -- one number per K slice per token, shared
@@ -1752,6 +1785,63 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
 /* defined after charsiu_npu_close, where the hold is dropped too */
 static void qos_hold(struct charsiu_npu *g, int say);
 
+/*
+ * A SECOND, EIGHT BIT DEVICE FOR CHARSIU_NPU_INT8_LAYERS (see `alt`), unless
+ * CHARSIU_NPU_INT8_ALT=0. The same parse as layer_in_range's: unset or empty
+ * means no eight bit layers, so no device.
+ */
+static int mixed_alt_wanted(void)
+{
+	const char *e = getenv("CHARSIU_NPU_INT8_LAYERS");
+
+	/*
+	 * AND NOT UNDER THE TWO SWITCHES THAT CHANGE npu_matvec's FORMULA FOR
+	 * EVERY TENSOR: A16 dots the float activation, and the midrise grid
+	 * adds a half step. exact8 reproduces the plain formula only.
+	 */
+	return e && *e && charsiu_env_flag("CHARSIU_NPU_INT8_ALT", 1) &&
+	       !charsiu_env_flag("CHARSIU_NPU_A16", 0) &&
+	       !charsiu_env_flag("CHARSIU_NPU_W4_MIDRISE", 0);
+}
+
+/* an id alt handed out, as the main device hands it on; see `alt` */
+#define NPU_ALT_ID 0x100000
+
+/*
+ * IS THIS ONE OF alt's IDS? Then it goes to alt, under alt's own number.
+ *
+ * A batched call that goes to alt first writes out the main device's deferred
+ * gather, if it owes one. It reads another Y and another buffer, so this is
+ * only earlier than the flush the caller already owes, never different.
+ */
+static int alt_id(const struct charsiu_npu *g, int id)
+{
+	return g && g->alt && id >= NPU_ALT_ID;
+}
+
+/*
+ * exact8's dequantise, which is npu_matvec's for a tensor with one scale a
+ * row, written the same way: acc = 0.0 + part * scale, then (float)(acc * d1).
+ * The 0.0 is kept because npu_matvec starts its accumulator there, and
+ * 0.0 + -0.0 is +0.0.
+ */
+static inline float exact8_y(int32_t acc, float scale, float d1)
+{
+	double v = 0.0;
+
+	v += (double)acc * scale;
+	return (float)(v * d1);
+}
+
+static int alt_ids(const struct charsiu_npu *g, const int *ids, unsigned n)
+{
+	unsigned i, k = 0;
+
+	for (i = 0; i < n; i++)
+		k += alt_id(g, ids[i]) ? 1u : 0u;
+	return k == 0 ? 0 : k == n ? 1 : -1;    /* -1: a group across both */
+}
+
 struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 					  unsigned max_tensors, int want_w4)
 {
@@ -2330,6 +2420,18 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * board has; without it this says so once and carries on.
 	 */
 	qos_hold(g, 1);
+	/* see the note over `alt` in struct charsiu_npu */
+	if (g->w4 && mixed_alt_wanted()) {
+		g->alt = charsiu_npu_open_mode(max_k, max_n, max_tensors, 0);
+		if (g->alt) {
+			g->alt->exact8 = 1;
+			g->alt->readfuse = 0;
+		} else {
+			fprintf(stderr, "charsiu: the eight bit device for "
+				"CHARSIU_NPU_INT8_LAYERS would not open; those "
+				"layers stay on the CPU\n");
+		}
+	}
 	return g;
 
 fail:
@@ -2397,6 +2499,7 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 {
 	if (!g)
 		return;
+	charsiu_npu_idle(g->alt, idle);
 	if (idle) {
 		if (g->qos_fd >= 0) {
 			close(g->qos_fd);      /* the CPUs may sleep deeply again */
@@ -2525,6 +2628,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
+	charsiu_npu_close(g->alt);
+	g->alt = NULL;
 	/* a deferred gather owns a buffer this is about to free, and the
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
@@ -2618,6 +2723,7 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
+	free(g->bd1x);
 	free(g);
 }
 
@@ -2642,7 +2748,8 @@ unsigned long charsiu_npu_submits(const struct charsiu_npu *g)
  */
 int charsiu_npu_needs_q1(const struct charsiu_npu *g)
 {
-	return !g || !g->w4;
+	/* alt's tensors read q1 and llama.c asks this of the main device */
+	return !g || !g->w4 || g->alt;
 }
 
 /*
@@ -3072,6 +3179,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
 			"in this run came from the CPU.\n");
+	if (g->alt) {
+		fprintf(stderr, "charsiu NPU: the eight bit layers "
+			"(CHARSIU_NPU_INT8_LAYERS), on their own device, %u "
+			"tensors:\n", g->alt->n_ent);
+		charsiu_npu_report(g->alt);
+	}
 }
 
 /*
@@ -3676,6 +3789,19 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * and not to anything on the host.
 	 */
 	if (g->w4 && !t->packed) {
+		/*
+		 * THE SECOND DEVICE TAKES THEM INSTEAD, when there is one --
+		 * see `alt` in struct charsiu_npu. Only a tensor whose CPU
+		 * arithmetic exact8 reproduces: one scale a row (npuquant
+		 * writes that for every eight bit tensor) and no AWQ factor,
+		 * which the CPU quantises its activation through.
+		 */
+		if (g->alt && !t->kscale &&
+		    (!t->kgroup || t->kgroup >= t->k)) {
+			int aid = charsiu_npu_add(g->alt, t);
+
+			return aid < 0 ? -1 : aid + NPU_ALT_ID;
+		}
 		whine(g, "eight bit weights on a device opened for four",
 		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
@@ -4063,6 +4189,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	double t0, tpack, tcall = now_us();
 	float *af;
 
+	if (alt_id(g, id))
+		return charsiu_npu_matvec(g->alt, id - NPU_ALT_ID, a, y);
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
 	charsiu_note("a matvec on one tensor", (unsigned long)id,
@@ -4415,6 +4543,11 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		if (g->midrise && !grp)
 			for (unsigned ki = 0; ki < e->k_slices; ki++)
 				hs += 0.5 * g->asum[ki];
+		if (g->exact8) {
+			for (i = 0; i < (unsigned)e->t->n; i++)
+				y[i] = exact8_y(g->acc[i], e->t->scale[i],
+						a->d1);
+		} else
 		for (i = 0; i < (unsigned)e->t->n; i++)
 			y[i] = w4_for(g, e->t)
 			     ? (grp ? g->accf[i]
@@ -4949,7 +5082,9 @@ void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
 
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset)
 {
-	double v = g->bwall_us / 1e3;
+	/* alt's calls are inside the main device's callers' clocks too */
+	double v = g->bwall_us / 1e3
+		 + (g->alt ? charsiu_npu_batch_wall(g->alt, reset) : 0.0);
 
 	if (reset)
 		g->bwall_us = 0.0;
@@ -5996,6 +6131,79 @@ struct qpack_job {
 	unsigned sk;
 };
 
+/*
+ * exact8: EACH ROW'S d1 OVER ITS WHOLE K, ONCE A CALL, as charsiu_act_q1
+ * takes it for the row loop this replaces -- same comparison, same divide.
+ * The pack below reads it for every K slice of the row.
+ */
+struct exact8_job {
+	const float *X;
+	float *d1;
+	unsigned k;
+};
+
+static void exact8_rows_w(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct exact8_job *j = ctx;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const float *x = j->X + (size_t)r * j->k;
+		float amax = 0.0f;
+
+		for (unsigned i = 0; i < j->k; i++) {
+			float av = x[i] < 0.0f ? -x[i] : x[i];
+
+			if (av > amax)
+				amax = av;
+		}
+		j->d1[r] = amax / 127.0f;
+	}
+}
+
+static int exact8_rows(struct charsiu_npu *g, const float *X, unsigned m,
+		       unsigned k)
+{
+	struct exact8_job j;
+
+	if (g->bd1x_n < m) {
+		float *t = realloc(g->bd1x, (size_t)m * sizeof(*t));
+
+		if (!t)
+			return -1;
+		g->bd1x = t;
+		g->bd1x_n = m;
+	}
+	j.X = X;
+	j.d1 = g->bd1x;
+	j.k = k;
+	if (g->packpool && (size_t)m * k >= 65536)
+		charsiu_parallel_for(exact8_rows_w, &j, m);
+	else
+		exact8_rows_w(&j, 0, m);
+	return 0;
+}
+
+/* and the codes, through charsiu_act_q1's reciprocal and lrintf */
+static void exact8_qpack_w(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct qpack_job *j = ctx;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const float *row = j->src + (size_t)r * j->sk;
+		uint8_t *out = j->dst + (size_t)r * j->sk;
+		float d = j->d1out[r];
+		float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+		for (unsigned kk = 0; kk < j->sk; kk++) {
+			int v = (int)lrintf(row[kk] * id);
+
+			if (v > 127) v = 127;
+			if (v < -127) v = -127;
+			out[kk] = (uint8_t)(v + 128);
+		}
+	}
+}
+
 static int qpack_plain(void)
 {
 	static int v = -1;
@@ -6106,6 +6314,35 @@ static void pack_f16_pooled(struct charsiu_npu *g,
 	g->bpack_serial++;
 }
 
+/*
+ * exact8's gather: the K slices' raw accumulators summed AS INTEGERS, held in
+ * Y's own bytes until tail_scale_apply turns each into exact8_y. Integer adds
+ * do not round, so the order the slices arrive in cannot move the sum, and it
+ * is the int32 npu_matvec's idot sums to. memcpy, not a cast: Y is float.
+ */
+static void read_rows_exact8(struct read_rows *c, uint64_t r0, uint64_t nr)
+{
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	unsigned sn = c->sn, j;
+
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *yr = c->Y + (size_t)r * e->t->n + s->n0;
+
+		for (j = 0; j < sn; j++) {
+			int32_t v = c->io[mp[j / 4] + j % 4], o;
+
+			if (!c->firstw) {
+				memcpy(&o, yr + j, sizeof(o));
+				v += o;
+			}
+			memcpy(yr + j, &v, sizeof(v));
+		}
+	}
+}
+
 static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 {
 	struct read_rows *c = ctx;
@@ -6113,6 +6350,10 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 	const struct npu_entry *e = c->e;
 	const struct npu_slot *s = c->s;
 
+	if (g->exact8) {
+		read_rows_exact8(c, r0, nr);
+		return;
+	}
 	if (read_rows2(c, r0, nr) || read_rows4(c, r0, nr))
 		return;
 	const float *fo = c->fo;
@@ -6387,7 +6628,7 @@ static int tail_fuse_on(void)
 static int tail_fuse_for(const struct charsiu_npu *g, const struct npu_entry *e)
 {
 	if (!tail_fuse_on() || g->tail_skip || g->readfuse || npu_noread() ||
-	    tail_plain())
+	    tail_plain() || g->exact8)
 		return 0;
 	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
 		return 0;
@@ -6778,10 +7019,48 @@ static int batch_read_device(struct charsiu_npu *g,
  * tensor_grouped depends on the tensor and on g->kmax, both fixed for the life
  * of the pool, so asking it again at flush time gives the same answer.
  */
+/* exact8: the integers read_rows_exact8 left in Y, made floats in place */
+struct exact8_tail_job {
+	float *Y;
+	const float *scale, *d1;
+	unsigned n;
+};
+
+static void exact8_tail_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct exact8_tail_job *j = ctx;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		float *y = j->Y + (size_t)r * j->n;
+		float d1 = j->d1[r];
+
+		for (unsigned i = 0; i < j->n; i++) {
+			int32_t v;
+
+			memcpy(&v, y + i, sizeof(v));
+			y[i] = exact8_y(v, j->scale[i], d1);
+		}
+	}
+}
+
 static void tail_scale_apply(struct charsiu_npu *g,
 			     const struct npu_entry *e, float *Y, unsigned m,
 			     int fused)
 {
+	if (g->exact8) {
+		struct exact8_tail_job tj = { Y, e->t->scale, g->bd1x,
+					      (unsigned)e->t->n };
+		double ts = now_us();
+
+		if (g->poolread == 1 ||
+		    (g->poolread == 2 &&
+		     (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(exact8_tail_rows, &tj, m);
+		else
+			exact8_tail_rows(&tj, 0, m);
+		g->bscale_us += now_us() - ts;
+		return;
+	}
 	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
 		return;
 	/* the last read of every range already multiplied; see tail_fuse_for */
@@ -7078,7 +7357,19 @@ static void batch_pack_slice(struct charsiu_npu *g, const struct npu_entry *e,
 		 * match the row loop to 0.1% -- and should not
 		 * be asked to.
 		 */
-		if (qpack_plain()) {
+		if (g->exact8) {
+			/* d1 is the row's, from exact8_rows; the read back
+			 * does not take it from bd1 at all */
+			struct qpack_job qj = { g->bscr, g->bq, g->bd1x, sk };
+
+			memcpy(g->bd1 + (size_t)ki * m, g->bd1x,
+			       (size_t)m * sizeof(*g->bd1));
+			if (g->packpool == 1 ||
+			    (g->packpool == 2 && m > 1))
+				charsiu_parallel_for(exact8_qpack_w, &qj, m);
+			else
+				exact8_qpack_w(&qj, 0, m);
+		} else if (qpack_plain()) {
 			for (unsigned r = 0; r < m; r++) {
 				float mx = 0.0f, d1, id1;
 
@@ -7474,6 +7765,13 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	if (batch_refused(g, id, m))
 		return -1;
 	e = &g->ent[id];
+	/* exact8 packs every call from X and reads every call itself */
+	if (g->exact8) {
+		defer = 0;
+		g->reuse_ask = 0;
+		if (exact8_rows(g, X, m, (unsigned)e->t->k))
+			return -1;
+	}
 	/*
 	 * AN int8 TENSOR MAY NOT DEFER ITS GATHER, and this cost two
 	 * board rounds to find.
@@ -8051,6 +8349,9 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	if (alt_id(g, id))
+		return npu_flush_pending(g) ? -1
+		     : charsiu_npu_matmul(g->alt, id - NPU_ALT_ID, X, m, Y);
 	g->reuse_ask = 0;
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
 	g->bwall_us += now_us() - t0;
@@ -8092,6 +8393,9 @@ int charsiu_npu_matmul_argmax(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 converts in the tail this skips; and it is never the head */
+	if (alt_id(g, id) || g->exact8)
+		return -1;
 	g->reuse_ask = 0;
 	g->tail_skip = 1;
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
@@ -8208,6 +8512,9 @@ int charsiu_npu_matmul_defer(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 neither defers nor reuses: the plain call */
+	if (alt_id(g, id))
+		return charsiu_npu_matmul(g, id, X, m, Y);
 	g->reuse_ask = 0;
 	rc = npu_matmul_inner(g, id, X, m, Y, defer_read_on());
 	g->bwall_us += now_us() - t0;
@@ -8220,6 +8527,9 @@ int charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 neither defers nor reuses: the plain call */
+	if (alt_id(g, id))
+		return charsiu_npu_matmul(g, id, X, m, Y);
 	g->reuse_ask = reuse_enabled();
 	rc = npu_matmul_inner(g, id, X, m, Y, defer_read_on());
 	g->bwall_us += now_us() - t0;
@@ -8229,6 +8539,8 @@ int charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
 /* every deferred answer written out; safe to call when there are none */
 int charsiu_npu_flush(struct charsiu_npu *g)
 {
+	if (g && g->alt && npu_flush_pending(g->alt))
+		return -1;
 	return g ? npu_flush_pending(g) : 0;
 }
 
@@ -8238,6 +8550,9 @@ int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 neither defers nor reuses: the plain call */
+	if (alt_id(g, id))
+		return charsiu_npu_matmul(g, id, X, m, Y);
 	g->reuse_ask = reuse_enabled();
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
 	g->reuse_ask = 0;
@@ -8418,6 +8733,9 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 	 * written out first: this call reuses its buffer pool and its g->bseen,
 	 * and owes the caller no deferral of its own. */
 	if (npu_flush_pending(g))
+		return -1;
+	/* the members share X and K, so one set of row scales serves all */
+	if (g->exact8 && exact8_rows(g, X, m, (unsigned)es[0]->t->k))
 		return -1;
 	if (batch_bufs(g, m, es[0]->k_slices, most))
 		return -1;
@@ -8699,6 +9017,16 @@ int charsiu_npu_matmul_group(struct charsiu_npu *g, const int *ids,
 
 	if (!g)
 		return -1;
+	if (alt_ids(g, ids, n)) {
+		int aids[NPU_GROUP_MAX];
+
+		if (alt_ids(g, ids, n) < 0 || n > NPU_GROUP_MAX ||
+		    npu_flush_pending(g))
+			return -1;
+		for (unsigned i = 0; i < n; i++)
+			aids[i] = ids[i] - NPU_ALT_ID;
+		return charsiu_npu_matmul_group(g->alt, aids, n, X, m, Ys);
+	}
 	g->reuse_ask = 0;
 	rc = npu_matmul_group_inner(g, ids, n, X, m, Ys);
 	if (rc)
@@ -8735,6 +9063,9 @@ int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
 	const struct npu_entry *e;
 	const struct npu_slot *s;
 
+	if (alt_id(g, id))
+		return charsiu_npu_slot_deal(g->alt, id - NPU_ALT_ID, i, di, ki,
+					     n0, n1);
 	if (!g || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
 	e = &g->ent[id];
@@ -8774,6 +9105,9 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 	const uint8_t *base;
 	unsigned nt = 0, d, cc, idx, ki;
 
+	if (alt_id(g, id))
+		return charsiu_npu_slot_word(g->alt, id - NPU_ALT_ID, i, r, c,
+					     fresh, raw, contrib, final);
 	if (!g || id < 0 || (unsigned)id >= g->n_ent || !g->last_ob ||
 	    g->last_id != id || !g->bmap)
 		return -1;
@@ -8871,6 +9205,15 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	unsigned nh = 0, ntask = 0, i, j;
 	double t0, t1, tpack, fspent = 0.0, tcall = now_us();
 
+	if (alt_ids(g, ids, n)) {
+		int aids[8];
+
+		if (alt_ids(g, ids, n) < 0 || n > 8)
+			return -1;
+		for (i = 0; i < n; i++)
+			aids[i] = ids[i] - NPU_ALT_ID;
+		return charsiu_npu_matvec_group(g->alt, aids, n, a, ys);
+	}
 	if (g->dead || !n || n > 8)
 		return -1;
 	for (i = 0; i < n; i++)
@@ -9237,6 +9580,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			 * the control a wrong answer, which is worse than
 			 * having no control.
 			 */
+			if (g->exact8)
+				for (unsigned q = 0; q < (unsigned)e->t->n; q++)
+					ys[i][q] = exact8_y(g->acc[q],
+							    e->t->scale[q],
+							    a->d1);
+			else
 			for (unsigned q = 0; q < (unsigned)e->t->n; q++)
 				ys[i][q] = w4_for(g, e->t)
 					 ? (grp ? g->accf[q]
@@ -9330,6 +9679,8 @@ int charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m)
 	unsigned claimed[2];
 	double a_us;
 
+	if (alt_id(g, id))
+		return charsiu_npu_prewarm(g->alt, id - NPU_ALT_ID, m);
 	if (!g || g->dead || !prewarm_on() || id < 0 ||
 	    (unsigned)id >= g->n_ent || m < 2 || is_small_m(m))
 		return 0;
