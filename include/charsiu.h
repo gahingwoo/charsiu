@@ -665,6 +665,7 @@ void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo);
 int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 		    int64_t timeout_ns);
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo);
+int charsiu_bo_poll(struct charsiu_device *dev, struct charsiu_bo *bo);
 
 /*
  * One task is one register stream. Tasks inside a job are chained on a single
