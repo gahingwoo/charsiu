@@ -2867,9 +2867,6 @@ static void matvec_pair(struct llama_state *s, const float *x,
 
 	if (s->pool.dev && !group_off() && npu_mode() && s->act.npu_ok &&
 	    npu_call_worth(mac, wa->name)) {
-		/* int8 takes q1; int4 takes the float and never looks */
-		if (charsiu_npu_needs_q1(s->pool.dev))
-			act_q1_timed(&s->act);
 		for (i = 0; i < n; i++) {
 			nt[i] = npu_get(s, w[i]);
 			ids[i] = -1;
@@ -2882,6 +2879,11 @@ static void matvec_pair(struct llama_state *s, const float *x,
 			if (ids[i] < 0)
 				break;
 		}
+		/* int8 takes q1; int4 takes the float and never looks. Asked
+		 * of the group's first id: a group across the two widths is
+		 * refused, and the fallback below asks per tensor. */
+		if (i == n && charsiu_npu_needs_q1_id(s->pool.dev, ids[0]))
+			act_q1_timed(&s->act);
 		if (i == n &&
 		    !charsiu_npu_matvec_group(s->pool.dev, ids, n, &s->act, y))
 			return;
@@ -2921,7 +2923,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		 * CPU still finishes and still reports which shape stopped
 		 * answering, which is worth more than either a hang or a crash.
 		 */
-		if (id >= 0 && charsiu_npu_needs_q1(s->pool.dev))
+		if (id >= 0 && charsiu_npu_needs_q1_id(s->pool.dev, id))
 			act_q1_timed(a);
 		if (id >= 0 && !charsiu_npu_matvec(s->pool.dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,

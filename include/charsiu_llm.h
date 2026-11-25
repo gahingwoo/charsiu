@@ -337,6 +337,7 @@ int  charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m);
 extern unsigned charsiu_pool_prewarm_m;
 /* int4 takes the float activation; int8 needs q1 realised first */
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
+int  charsiu_npu_needs_q1_id(const struct charsiu_npu *g, int id);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
 /*

@@ -2771,6 +2771,16 @@ int charsiu_npu_needs_q1(const struct charsiu_npu *g)
 }
 
 /*
+ * THE SAME QUESTION FOR ONE TENSOR. With alt open the answer above is yes for
+ * every call, and realising q1 for a four bit tensor that never reads it is a
+ * pass over K per call for nothing.
+ */
+int charsiu_npu_needs_q1_id(const struct charsiu_npu *g, int id)
+{
+	return !g || !g->w4 || alt_id(g, id);
+}
+
+/*
  * THE THREE TERM SOLVE, AND WHY IT REFUSES RATHER THAN GUESSES.
  *
  * Gaussian elimination with partial pivoting on a 3x3, which is about as much
