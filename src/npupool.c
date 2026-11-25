@@ -35,6 +35,7 @@ static double now_ms(void)
 }
 
 double charsiu_pool_stage_ms;
+unsigned charsiu_pool_prewarm_m;
 
 /*
  * THE DEFAULT IS THE VALUE WITH EVIDENCE, AND IT USED TO BE THE ONE NOTHING
@@ -163,6 +164,10 @@ const struct npu_tensor *charsiu_pool_get(struct charsiu_npu_pool *p,
 		if ((!only || strstr(w->name, only)) &&
 		    w->ne[1] <= (uint64_t)pool_maxn()) {
 			p->id[p->n] = charsiu_npu_add(p->dev, &p->t[p->n]);
+			/* inside the staging clock; see charsiu_npu_prewarm */
+			if (p->id[p->n] >= 0 && charsiu_pool_prewarm_m)
+				charsiu_npu_prewarm(p->dev, p->id[p->n],
+						    charsiu_pool_prewarm_m);
 		} else if (!only && w->ne[1] > (uint64_t)pool_maxn()) {
 			/*
 			 * THE ONE REFUSAL THAT COST THE MOST AND SAID THE
@@ -545,6 +550,15 @@ void charsiu_pool_report_batch(const struct charsiu_npu_pool *p, FILE *out)
 		fprintf(out, "    (%u batch buffer allocations, %.1f ms, inside "
 			"prep -- a pool that quietly reallocates is the old "
 			"bug in new clothes)\n", nbuf, alloc);
+	{
+		unsigned npw = 0;
+		double pw = charsiu_npu_batch_prewarmed(p->dev, &npw);
+
+		if (npw)
+			fprintf(out, "    (%u more allocated ahead, %.1f ms, at "
+				"staging by CHARSIU_NPU_PREWARM -- not in "
+				"prep)\n", npw, pw);
+	}
 	{
 		unsigned long hits = 0, misses = 0, why[5] = { 0, 0, 0, 0, 0 };
 		static const char *whyname[5] = {

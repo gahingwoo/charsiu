@@ -330,6 +330,11 @@ void charsiu_npu_close(struct charsiu_npu *g);
  */
 void charsiu_npu_idle(struct charsiu_npu *g, int idle);
 int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
+/* allocate and fault in what a batched call of m rows on tensor id will ask
+ * for, so its first call does not (CHARSIU_NPU_PREWARM) */
+int  charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m);
+/* the rows of the batched chunk being run while tensors stage, 0 outside one */
+extern unsigned charsiu_pool_prewarm_m;
 /* int4 takes the float activation; int8 needs q1 realised first */
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
@@ -707,6 +712,7 @@ void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
 				  double *fini, int reset);
 /* how much of prep is the output buffer allocation, and how often */
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
+double charsiu_npu_batch_prewarmed(const struct charsiu_npu *g, unsigned *n);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);
@@ -1294,8 +1300,8 @@ int charsiu_env_flag(const char *name, int dflt);
  */
 void llama_prefill_hint(struct llama_state *s, int total);
 /* n > 0 while a batched prompt chunk of n rows runs: the pool takes the
- * process's whole mask (CHARSIU_PREFILL_WIDE, CHARSIU_PREFILL_POOL_CPUS);
- * 0 hands the narrow one back */
+ * process's whole mask (CHARSIU_PREFILL_WIDE, CHARSIU_PREFILL_POOL_CPUS) and
+ * a tensor staged meanwhile pre-warms its buffers at n; 0 ends it */
 void llama_prefill_scope(int n);
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,

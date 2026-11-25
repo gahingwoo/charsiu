@@ -819,6 +819,8 @@ struct charsiu_npu {
 	unsigned long bgroup_n, bgroup_members, bgroup_fell;
 	double balloc_us;	/* the output BO allocation, inside prep */
 	unsigned balloc_n;
+	double bprewarm_us;	/* the same, done at staging by charsiu_npu_prewarm */
+	unsigned bprewarm_n;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -4973,6 +4975,13 @@ double charsiu_npu_batch_scale(struct charsiu_npu *g, int reset)
 	return v;
 }
 
+double charsiu_npu_batch_prewarmed(const struct charsiu_npu *g, unsigned *n)
+{
+	if (n)
+		*n = g ? g->bprewarm_n : 0;
+	return g ? g->bprewarm_us / 1e3 : 0.0;
+}
+
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
 {
 	double v = g->balloc_us / 1e3;
@@ -6389,6 +6398,85 @@ static int tail_fuse_for(const struct charsiu_npu *g, const struct npu_entry *e)
 }
 
 /*
+ * THE READ ORDER TABLE for width m, built where the read first needs it or
+ * earlier by charsiu_npu_prewarm. Keyed on m and the format alone; see the
+ * notes inside.
+ */
+static int bmap_build(struct charsiu_npu *g, const struct npu_entry *e,
+		      unsigned m)
+{
+	if (g->bmap_m != m ||
+	    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
+		unsigned n4 = (g->nmax + 3) / 4;
+		uint32_t *t2 = realloc(g->bmap,
+			(size_t)m * n4 * sizeof(*t2));
+
+		if (!t2) {
+			whine(g, "the read order table would not allocate",
+			      m, g->nmax);
+			return -1;
+		}
+		g->bmap = t2;
+		g->bmap_n4 = n4;
+		/*
+		 * CHARSIU_NPU_READ_FLAT=1 BUILDS THE IDENTITY,
+		 * which is what this table would hold if the
+		 * accumulator came back row major.
+		 *
+		 * The gather through this permutation is the largest
+		 * single line in a prompt -- r407 put it at 1.96 ms a
+		 * row against the 1.82 of fence it waits behind -- and
+		 * every lever on the gather ITSELF is measured and
+		 * lost. The note above says why that is not the end of
+		 * it: "the read is at its floor FOR THIS ACCUMULATOR
+		 * LAYOUT", and the fp16 path at the same m and n comes
+		 * back FLAT.
+		 *
+		 * On the shipped stream reading flat is WRONG, and
+		 * that is the positive control: it says the knob
+		 * reaches the read. Paired with CHARSIU_W4_F16DPU it
+		 * asks whether any register that differs between the
+		 * fp16 and int4 output stages puts the answer there.
+		 */
+		{
+			int flat = charsiu_env_flag(
+				"CHARSIU_NPU_READ_FLAT", 0);
+
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < n4; j++)
+					g->bmap[(size_t)r * n4 + j] =
+					  flat
+					  ? (uint32_t)((size_t)r
+						* g->nmax + j * 4)
+					  : (uint32_t)charsiu_acc_index(r, j * 4, m,
+						w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+		}
+		g->bmap_m = m;
+		g->bmap_w4 = (unsigned)w4_for(g, e->t);
+		/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
+		g->bmap2 = m % 2 == 0;
+		for (unsigned r = 0; g->bmap2 && r < m; r += 2)
+			for (unsigned j = 0; g->bmap2 && j < n4; j++)
+				if (g->bmap[(size_t)(r + 1) * n4 + j] !=
+				    g->bmap[(size_t)r * n4 + j] + 4) {
+					g->bmap2 = 0;
+					break;
+				}
+		/* read_rows4's premise, read off the table just built */
+		g->bmap4 = m % 4 == 0;
+		for (unsigned r = 0; g->bmap4 && r < m; r += 4)
+			for (unsigned j = 0; g->bmap4 && j < n4; j++)
+				for (unsigned lo = 1; lo < 4; lo++)
+					if (g->bmap[(size_t)(r + lo) * n4 + j] !=
+					    g->bmap[(size_t)r * n4 + j] + lo * 4) {
+						g->bmap4 = 0;
+						break;
+					}
+	}
+	return 0;
+}
+
+/*
  * ONE DEVICE'S ANSWER, GATHERED OUT OF THE ACCUMULATOR -- AND IT IS A
  * FUNCTION SO THAT IT CAN RUN LATER THAN THE FENCE THAT RELEASED IT.
  *
@@ -6463,74 +6551,8 @@ static int batch_read_device(struct charsiu_npu *g,
 		 * dominant cost of a batched projection now that the
 		 * hardware part is right.
 		 */
-		if (g->bmap_m != m ||
-		    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
-			unsigned n4 = (g->nmax + 3) / 4;
-			uint32_t *t2 = realloc(g->bmap,
-				(size_t)m * n4 * sizeof(*t2));
-
-			if (!t2) {
-				whine(g, "the read order table would not allocate",
-				      m, g->nmax);
-				return -1;
-			}
-			g->bmap = t2;
-			g->bmap_n4 = n4;
-			/*
-			 * CHARSIU_NPU_READ_FLAT=1 BUILDS THE IDENTITY,
-			 * which is what this table would hold if the
-			 * accumulator came back row major.
-			 *
-			 * The gather through this permutation is the largest
-			 * single line in a prompt -- r407 put it at 1.96 ms a
-			 * row against the 1.82 of fence it waits behind -- and
-			 * every lever on the gather ITSELF is measured and
-			 * lost. The note above says why that is not the end of
-			 * it: "the read is at its floor FOR THIS ACCUMULATOR
-			 * LAYOUT", and the fp16 path at the same m and n comes
-			 * back FLAT.
-			 *
-			 * On the shipped stream reading flat is WRONG, and
-			 * that is the positive control: it says the knob
-			 * reaches the read. Paired with CHARSIU_W4_F16DPU it
-			 * asks whether any register that differs between the
-			 * fp16 and int4 output stages puts the answer there.
-			 */
-			{
-				int flat = charsiu_env_flag(
-					"CHARSIU_NPU_READ_FLAT", 0);
-
-				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < n4; j++)
-						g->bmap[(size_t)r * n4 + j] =
-						  flat
-						  ? (uint32_t)((size_t)r
-							* g->nmax + j * 4)
-						  : (uint32_t)charsiu_acc_index(r, j * 4, m,
-							w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
-			}
-			g->bmap_m = m;
-			g->bmap_w4 = (unsigned)w4_for(g, e->t);
-			/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
-			g->bmap2 = m % 2 == 0;
-			for (unsigned r = 0; g->bmap2 && r < m; r += 2)
-				for (unsigned j = 0; g->bmap2 && j < n4; j++)
-					if (g->bmap[(size_t)(r + 1) * n4 + j] !=
-					    g->bmap[(size_t)r * n4 + j] + 4) {
-						g->bmap2 = 0;
-						break;
-					}
-			/* read_rows4's premise, read off the table just built */
-			g->bmap4 = m % 4 == 0;
-			for (unsigned r = 0; g->bmap4 && r < m; r += 4)
-				for (unsigned j = 0; g->bmap4 && j < n4; j++)
-					for (unsigned lo = 1; lo < 4; lo++)
-						if (g->bmap[(size_t)(r + lo) * n4 + j] !=
-						    g->bmap[(size_t)r * n4 + j] + lo * 4) {
-							g->bmap4 = 0;
-							break;
-						}
-		}
+		if (bmap_build(g, e, m))
+			return -1;
 		/*
 		 * NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
 		 * LOST TWICE.
@@ -9254,3 +9276,101 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	return 0;
 }
 
+/*
+ * THE FIRST PROMPT PAID FOR THE BUFFERS, AND THE VENDOR'S DOES NOT.
+ *
+ * Every batched geometry allocates its output objects, the input objects and
+ * the scratch on its first call, and the stage table counted it: 13 batch
+ * buffer allocations, 11.5 ms, inside `prep` of a 124 token Qwen3-0.6B
+ * prompt, plus the page faults the first CPU touch of each mapping takes
+ * inside `read` and `pack`, plus the read order table for the new width.
+ * rkllm does all of that in rkllm_init, before its prompt clock starts.
+ *
+ * So a tensor that is staged while a batched chunk of m rows is running gets
+ * them here, at m, inside the staging clock -- the same buffers, the same
+ * pool and the same keys batch_outbuf and batch_bufs would have built a
+ * moment later, so the first call finds them and allocates nothing. Two
+ * output buffers a geometry when the gather may be deferred, because gate
+ * and up are the same geometry and the second one would otherwise allocate
+ * its own while the first still owes a read (see batch_outbuf).
+ *
+ * IT MOVES THE COST, it does not remove it: a one shot run pays it in
+ * `staging` instead of `prompt`. Nothing about the arithmetic changes; the
+ * buffers are read only after the hardware writes them, the touch below is a
+ * READ (a dirty CPU line over an output object would be written back over
+ * the device's answer), and the prep before every read invalidates.
+ *
+ * CHARSIU_NPU_PREWARM=0 is the control.
+ */
+static int prewarm_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PREWARM", 1);
+	return v;
+}
+
+static void prewarm_touch(const struct charsiu_bo *bo)
+{
+	const volatile uint8_t *p = bo->map;
+	uint8_t sink = 0;
+
+	if (!p)
+		return;
+	for (size_t o = 0; o < bo->size; o += 4096)
+		sink ^= p[o];
+	(void)sink;
+}
+
+int charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m)
+{
+	const struct npu_entry *e;
+	unsigned nslots[2] = { 0, 0 }, wide = 0, most, need, got = 0, a_n;
+	unsigned claimed[2];
+	double a_us;
+
+	if (!g || g->dead || !prewarm_on() || id < 0 ||
+	    (unsigned)id >= g->n_ent || m < 2 || is_small_m(m))
+		return 0;
+	e = &g->ent[id];
+	if (batch_refused(g, id, m))
+		return 0;
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+
+		nslots[s->di]++;
+		if (s->job.mm.n > wide)
+			wide = (unsigned)s->job.mm.n;
+	}
+	most = nslots[0] > nslots[1] ? nslots[0] : nslots[1];
+	if (batch_bufs(g, m, e->k_slices, most))
+		return -1;
+	need = defer_read_on() ? 2 : 1;
+	/* charged to its own counter: batch_outbuf adds to balloc, which the
+	 * stage table prints as "inside prep" -- and this is not */
+	a_us = g->balloc_us;
+	a_n = g->balloc_n;
+	while (got < need) {
+		struct npu_outbuf *ob = batch_outbuf(g, wide, most, m);
+
+		if (!ob)
+			break;
+		for (unsigned d = 0; d < g->ndev; d++)
+			prewarm_touch(&ob->bo[d]);
+		claimed[got++] = (unsigned)(ob - g->obuf);
+		ob->pending = 1;
+	}
+	for (unsigned i = 0; i < got; i++)
+		g->obuf[claimed[i]].pending = 0;
+	g->bprewarm_us += g->balloc_us - a_us;
+	g->bprewarm_n += g->balloc_n - a_n;
+	g->balloc_us = a_us;
+	g->balloc_n = a_n;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			prewarm_touch(&g->bin[d][ki]);
+		prewarm_touch(&g->breg[d]);
+	}
+	return bmap_build(g, e, m);
+}

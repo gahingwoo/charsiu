@@ -983,6 +983,7 @@ static void pool_prefill(int on)
 void llama_prefill_scope(int n)
 {
 	pool_prefill(n > 0);
+	charsiu_pool_prewarm_m = n > 0 ? (unsigned)n : 0;
 }
 
 /*
