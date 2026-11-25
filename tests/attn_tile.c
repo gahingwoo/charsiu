@@ -181,7 +181,8 @@ static float rnd(void)
 }
 
 #define NL 2
-#define N_CTX 272
+/* the cache's length: the scores rows of attn_block_heads are this apart */
+static int N_CTX = 272;
 
 struct rig {
 	struct llama_state s;
@@ -209,8 +210,8 @@ static void rig_init(struct rig *r, uint32_t nkv, uint32_t hdmax,
 	r->s.n_ctx = N_CTX;
 	r->s.kcache = r->k;
 	r->s.vcache = r->v;
-	/* the largest scratch any case asks for: R = 1 at the longest chunk */
-	r->s.batt = malloc((size_t)nh * nmax * 13 * N_CTX * sizeof(float));
+	/* the largest scratch any case asks for: ceil(n / R) * R < n + 13 */
+	r->s.batt = malloc((size_t)nh * (nmax + 13) * N_CTX * sizeof(float));
 }
 
 static void rig_free(struct rig *r)
@@ -219,7 +220,7 @@ static void rig_free(struct rig *r)
 	free(r->s.batt);
 }
 
-static unsigned cases, bad;
+static unsigned cases, kvcases, bad;
 
 static void one(struct rig *r, uint32_t hd, uint32_t hdmax, uint32_t gqa,
 		uint32_t nkv, int pos0, int n, int swa, int n_swa, int R)
@@ -230,7 +231,7 @@ static void one(struct rig *r, uint32_t hd, uint32_t hdmax, uint32_t gqa,
 	size_t ob = (size_t)n * nh * hd * sizeof(float);
 	struct attn_block_job bj = {
 		&r->s, NL - 1, pos0, n, swa, n_swa, hd, hdmax, nkv * hdmax,
-		gqa, nkv, nh, 1.0f / sqrtf((float)hd), r->q, r->ref, R };
+		gqa, nkv, nh, 1.0f / sqrtf((float)hd), r->q, r->ref, R, 0, 0, 0 };
 
 	if (cut > nu)
 		cut = nu;
@@ -244,13 +245,54 @@ static void one(struct rig *r, uint32_t hd, uint32_t hdmax, uint32_t gqa,
 	if (memcmp(r->ref, r->mine, ob)) {
 		if (bad < 10)
 			printf("  differs: hd %u gqa %u nkv %u pos0 %d n %d "
-			       "swa %d/%d R %d\n", hd, gqa, nkv, pos0, n, swa,
-			       n_swa, R);
+			       "swa %d/%d R %d n_ctx %d\n", hd, gqa, nkv, pos0,
+			       n, swa, n_swa, R, N_CTX);
 		bad++;
 	}
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * THE KV UNIT, where it applies, over the same job: its units in
+	 * three ranges, the way the pool hands them out one at a time.
+	 */
+	if (attn_kv_plan(&bj)) {
+		int RB = bj.kv_rows;
+		uint64_t ku = (uint64_t)nkv * ((n + RB - 1) / RB);
+		uint64_t c1 = ku / 3, c2 = ku - ku / 3;
+
+		memset(r->mine, 0x77, ob);
+		attn_kv_units(&bj, 0, c1);
+		attn_kv_units(&bj, c1, c2 - c1);
+		attn_kv_units(&bj, c2, ku - c2);
+		kvcases++;
+		if (bj.kv_failed || memcmp(r->ref, r->mine, ob)) {
+			if (bad < 10)
+				printf("  kv unit differs: hd %u gqa %u nkv %u "
+				       "pos0 %d n %d swa %d/%d n_ctx %d\n", hd,
+				       gqa, nkv, pos0, n, swa, n_swa, N_CTX);
+			bad++;
+		}
+	}
+#endif
 }
 
+static void sweep_ctx(void);
+
 static int sweep(const char *arm)
+{
+	static const int ctxs[] = { 272, 1024, 2048, 4096 };
+	unsigned ci;
+
+	for (ci = 0; ci < sizeof(ctxs) / sizeof(ctxs[0]); ci++) {
+		N_CTX = ctxs[ci];
+		sweep_ctx();
+	}
+	printf("attn_tile: %-28s %u of %u cases (%u kv unit) differ in a "
+	       "single bit\n", arm, bad, cases + kvcases, kvcases);
+	return bad != 0;
+}
+
+/* the shapes at one cache length; the long caches take the default block */
+static void sweep_ctx(void)
 {
 	static const uint32_t hds[] = { 64, 72, 100, 128, 256 };
 	static const uint32_t gqas[] = { 1, 2, 4 };
@@ -279,12 +321,22 @@ static int sweep(const char *arm)
 
 					if (pos0 + n > N_CTX)
 						continue;
+					/* a chunk that ends on the cache's last
+					 * position, once per cache length */
+					if (N_CTX > 272 && ni == 0 && pi == 0
+					    && wi == 0 && ri == 0)
+						one(&r, hd, hdmax, gqa, nkv,
+						    N_CTX - 160, 160, 0, 0, 8);
 					/* attn_block clamps the block to the chunk */
 					if (R > n)
 						R = n;
 					/* the default block everywhere, the odd
 					 * ones on the smaller heads */
-					if (ri && hd > 128)
+					if (ri && (hd > 128 || N_CTX > 272))
+						continue;
+					/* past 272 the cache length is the
+					 * point, not the shape: fewer of them */
+					if (N_CTX > 272 && (pi % 2 || wi == 1))
 						continue;
 					one(&r, hd, hdmax, gqa, nkv, pos0, n,
 					    swas[wi][0], swas[wi][1], R);
@@ -292,9 +344,6 @@ static int sweep(const char *arm)
 				rig_free(&r);
 			}
 		}
-	printf("attn_tile: %-28s %u of %u cases differ in a single bit\n",
-	       arm, bad, cases);
-	return bad != 0;
 }
 
 static double now(void)
@@ -307,47 +356,85 @@ static double now(void)
 
 /*
  * Qwen3-0.6B: 16 query heads over 8 kv heads of 128, a chunk of n rows at
- * pos0, one thread, 28 layers a pass. Old and new alternate so a drift in the
- * desk's clock lands on both.
+ * pos0 in a 1024 position cache (the board's -c), 28 layers a pass. Three
+ * arms alternate so a drift in the clock lands on all of them: the untiled
+ * kernel, attn_block_heads (the tiles), attn_kv_units. `threads` above one
+ * runs them on the pool the way attn_block_cpu does.
  */
-static void bench(int n, int pos0)
+static void bench(int n, int pos0, int threads)
 {
 	const uint32_t nkv = 8, gqa = 2, hd = 128, nh = 16;
-	const int R = attn_block_rows() > 0 ? attn_block_rows() : 8, reps = 15;
+	const int R = attn_block_rows() > 0 ? attn_block_rows() : 8, reps = 9;
 	int nblk = (n + R - 1) / R, i, k;
 	struct rig r;
-	double best[2] = { 1e30, 1e30 }, split[2][3];
+	double best[3] = { 1e30, 1e30, 1e30 }, split[3][3];
+	float *outs[3];
+	static const char *const name[3] = { "untiled", "tiles", "kv unit" };
 
+	N_CTX = 1024;
 	rig_init(&r, nkv, hd, nh, n);
-	stage_on = 1;
+	outs[0] = r.ref;
+	outs[1] = r.mine;
+	outs[2] = malloc((size_t)n * nh * hd * sizeof(float));
+	stage_on = threads > 1 ? 0 : 1;
 	for (i = 0; i < reps; i++)
-		for (k = 0; k < 2; k++) {
+		for (k = 0; k < 3; k++) {
 			struct attn_block_job bj = {
 				&r.s, NL - 1, pos0, n, 0, 0, hd, hd, nkv * hd,
 				gqa, nkv, nh, 1.0f / sqrtf((float)hd), r.q,
-				k ? r.mine : r.ref, R };
+				outs[k], R, 0, 0, 0 };
+			uint64_t ku = 0;
 			double t0, t;
 			int l;
 
+			/* ATTN_TILE_BENCH_KV=1 times the kv unit alone */
+			if (k < 2 && getenv("ATTN_TILE_BENCH_KV"))
+				continue;
+			if (k == 2) {
+				if (!attn_kv_plan(&bj))
+					continue;
+				ku = (uint64_t)nkv * ((n + bj.kv_rows - 1)
+						      / bj.kv_rows);
+			}
 			memset(battn_ms, 0, sizeof(battn_ms));
 			t0 = now();
-			for (l = 0; l < 28; l++)
-				(k ? attn_block_heads : ref_block_heads)(
-					&bj, 0, (uint64_t)nh * nblk);
+			for (l = 0; l < 28; l++) {
+				if (k == 2) {
+					if (threads > 1)
+						pool_run_chunk(attn_kv_units, &bj,
+							       ku, 1, 1);
+					else
+						attn_kv_units(&bj, 0, ku);
+				} else if (threads > 1) {
+					charsiu_parallel_for(k ? attn_block_heads
+							       : ref_block_heads,
+							     &bj, (uint64_t)nh * nblk);
+				} else {
+					(k ? attn_block_heads : ref_block_heads)(
+						&bj, 0, (uint64_t)nh * nblk);
+				}
+			}
 			t = now() - t0;
 			if (t < best[k]) {
 				best[k] = t;
 				memcpy(split[k], battn_ms, sizeof(battn_ms));
 			}
 		}
-	printf("attn_tile: Qwen3-0.6B shape, %d rows at %d, one thread, 28 "
-	       "layers: old %.2f ms, new %.2f ms, %.2fx\n", n, pos0, best[0],
-	       best[1], best[0] / best[1]);
-	for (k = 0; k < 2; k++)
-		printf("  %s  scores %.2f  softmax %.2f  values %.2f ms\n",
-		       k ? "new" : "old", split[k][0], split[k][1], split[k][2]);
-	printf("  outputs %s\n", memcmp(r.ref, r.mine, (size_t)n * nh * hd
-					* sizeof(float)) ? "DIFFER" : "identical");
+	printf("attn_tile: Qwen3-0.6B shape, %d rows at %d, %d thread(s), 28 "
+	       "layers, ms a row:", n, pos0, threads);
+	for (k = 0; k < 3; k++)
+		printf("  %s %.3f", name[k], best[k] / n);
+	printf("  (kv unit %.2fx the tiles)\n", best[1] / best[2]);
+	if (threads <= 1)
+		for (k = 0; k < 3; k++)
+			printf("  %-8s scores %.3f  softmax %.3f  values %.3f "
+			       "ms a row\n", name[k], split[k][0] / n,
+			       split[k][1] / n, split[k][2] / n);
+	printf("  outputs %s\n",
+	       memcmp(r.ref, r.mine, (size_t)n * nh * hd * sizeof(float))
+	       || memcmp(r.ref, outs[2], (size_t)n * nh * hd * sizeof(float))
+	       ? "DIFFER" : "identical");
+	free(outs[2]);
 	rig_free(&r);
 }
 
@@ -361,6 +448,12 @@ int main(int argc, char **argv)
 		{ "CHARSIU_ATTN_AXPY8=0", "CHARSIU_ATTN_AXPY8" },
 		{ "CHARSIU_ATTN_HR=0", "CHARSIU_ATTN_HR" },
 		{ "CHARSIU_KV_POSMAJOR=1", "CHARSIU_KV_POSMAJOR" },
+		{ "CHARSIU_ATTN_KV=0", "CHARSIU_ATTN_KV" },
+		{ "CHARSIU_ATTN_KV_ROWS=5", "CHARSIU_ATTN_KV_ROWS" },
+		{ "CHARSIU_ATTN_KV_ROWS=1", "CHARSIU_ATTN_KV_ROWS=1" },
+		{ "CHARSIU_ATTN_KV_TB=7", "CHARSIU_ATTN_KV_TB" },
+		{ "CHARSIU_ATTN_KV_TB=4", "CHARSIU_ATTN_KV_TB=4" },
+		{ "CHARSIU_ATTN_KV_PACK=0", "CHARSIU_ATTN_KV_PACK=0" },
 	};
 #define NARM (sizeof(arms) / sizeof(arms[0]))
 	pid_t pid[NARM];
@@ -368,11 +461,21 @@ int main(int argc, char **argv)
 	int rc = 0;
 
 	if (argc > 1 && !strcmp(argv[1], "--bench")) {
-		/* the serial arm, so the kernel's own split is kept */
-		setenv("CHARSIU_ATTN_BLOCK_POOL", "0", 1);
-		bench(124, 0);
-		bench(80, 80);
-		bench(160, 0);
+		/* `--bench [threads [rows [pos0]]]`; one thread is the
+		 * serial arm, so the kernel's own split is kept */
+		int th = argc > 2 ? atoi(argv[2]) : 1;
+
+		if (th > 1)
+			pool_start(th);
+		else
+			setenv("CHARSIU_ATTN_BLOCK_POOL", "0", 1);
+		if (argc > 3) {
+			bench(atoi(argv[3]), argc > 4 ? atoi(argv[4]) : 0, th);
+			return 0;
+		}
+		bench(124, 0, th);
+		bench(80, 80, th);
+		bench(244, 0, th);
 		return 0;
 	}
 	/* every arm at once, a process each, so the test costs one sweep */
@@ -384,12 +487,24 @@ int main(int argc, char **argv)
 		if (pid[a] == 0) {
 			int st;
 
-			if (arms[a][1]) {
+			if (arms[a][1] && strchr(arms[a][1], '=')) {
+				char nm[64];
+				const char *eq = strchr(arms[a][1], '=');
+
+				snprintf(nm, sizeof(nm), "%.*s",
+					 (int)(eq - arms[a][1]), arms[a][1]);
+				setenv(nm, eq + 1, 1);
+			} else if (arms[a][1]) {
 				const char *val = !strcmp(arms[a][1],
 					"CHARSIU_ATTN_AXPY8")
 					|| !strcmp(arms[a][1], "CHARSIU_ATTN_HR")
 					|| !strcmp(arms[a][1], "CHARSIU_ATTN_TILE")
-					? "0" : "1";
+					|| !strcmp(arms[a][1], "CHARSIU_ATTN_KV")
+					? "0"
+					: !strcmp(arms[a][1], "CHARSIU_ATTN_KV_ROWS")
+					? "5"
+					: !strcmp(arms[a][1], "CHARSIU_ATTN_KV_TB")
+					? "7" : "1";
 
 				setenv(arms[a][1], val, 1);
 			}

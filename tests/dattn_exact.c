@@ -166,7 +166,7 @@ static void verify_case(struct rig *r, uint32_t hd, uint32_t gqa, int pos0,
 			struct attn_block_job bj = {
 				&r->s, r->nl - 1, pos0, n, swa, n_swa, hd,
 				r->hdmax, r->nkv * r->hdmax, gqa, r->nkv, nh,
-				1.0f / sqrtf((float)hd), q, ref, n };
+				1.0f / sqrtf((float)hd), q, ref, n, 0, 0, 0 };
 			struct gqa_rows_job g = { &bj, split > (unsigned)n
 						  ? (unsigned)n : split };
 

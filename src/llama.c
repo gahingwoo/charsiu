@@ -991,8 +991,8 @@ void llama_prefill_scope(int n)
  * inline rather than paying a broadcast and a condition variable to reach
  * itself.
  */
-static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
-		     uint64_t n, unsigned grain)
+static void pool_run_chunk(void (*fn)(void *, uint64_t, uint64_t),
+			   void *ctx, uint64_t n, unsigned grain, int one)
 {
 	if (g_pool.n <= 1) {
 		fn(ctx, 0, n);
@@ -1002,12 +1002,22 @@ static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
 	pool_arm(n, grain);
+	/* one item a take, for a job whose items are few, ordered largest
+	 * first and of very different cost */
+	if (one && g_pool.chunk)
+		g_pool.chunk = 1;
 	g_pool.gen++;
 	pthread_cond_broadcast(&g_pool.cv_work);
 	while (g_pool.done < g_pool.n)
 		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
 	g_pool.fn = NULL;
 	pthread_mutex_unlock(&g_pool.mu);
+}
+
+static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
+		     uint64_t n, unsigned grain)
+{
+	pool_run_chunk(fn, ctx, n, grain, 0);
 }
 
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
@@ -5674,6 +5684,9 @@ struct attn_block_job {
 	const float *q;      /* [n][n_head * hd], roped */
 	float *out;          /* [n][n_head * hd] */
 	int R;               /* rows a pass over the cache */
+	int kv_rows;         /* attn_kv_units: rows of the chunk a unit */
+	int kv_stride;       /* and its scores rows' stride in floats */
+	int kv_failed;       /* a worker could not get its scratch */
 };
 
 /*
@@ -6200,6 +6213,460 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
 		}
 	}
+}
+
+/*
+ * THE UNIT IS A KV HEAD: CHARSIU_ATTN_KV.
+ *
+ * attn_block_heads walks one query head over a block of eight rows. On the
+ * A72 the tiles in it bought nothing (2026-11-25), and what the board's
+ * cores were doing instead of arithmetic is where the bytes go:
+ *
+ *   - both query heads of a GQA group read the same K and V, once each;
+ *   - the values tile runs every head-dim slice over every position, so a
+ *     head's V (62 KB at 124 positions) comes in from L2 again for every
+ *     four rows;
+ *   - the scores rows sit n_ctx floats apart, 4, 8 or 16 KB -- the A72's
+ *     L1 way is 16 KB, so at n_ctx 4096 every row of a block is one set.
+ *
+ * So the unit here is (kv head, block of rows), every query head of the
+ * group inside it; the scores tile is up to ATTN_KV_M rows against
+ * ATTN_KV_P keys with each q and each key loaded once for the tile; the
+ * values loop goes a block of ATTN_KV_TB positions at a time with every row
+ * of the unit inside it, so a block of V is read into L1 once per unit; and
+ * the scores live in a scratch per thread, its rows an odd number of cache
+ * lines apart.
+ *
+ * WHAT THE A72 SAID (2026-11-25, tests/attn_tile.c --bench on the board,
+ * Qwen3-0.6B's shape, 124 rows in a 1024 cache, ms a row): one core, scores
+ * 1.28 -> 1.05, values 1.58 -> 1.32, softmax 0.24 -> 0.22; four cores 1.25 ->
+ * 0.86-0.93, and at 244 rows 2.52 -> 1.53-1.71. Its core issues ONE 128 bit
+ * FP operation a cycle (fmla, fmul and fadd alike, measured), so the values
+ * half, which may not fuse, is the floor: two operations for four products.
+ *
+ * AND NO OUTPUT MOVES A BIT. A score is attn_dot4's lane: the lo chain over
+ * i % 8 < 4 and the hi chain over the rest, each an fma from zero in
+ * ascending i, added lo + hi, reduced (s0 + s1) + (s2 + s3), then `* scale`.
+ * Here the lo chain runs first and is parked while the hi chain runs, which
+ * moves a store and a load and no arithmetic. The softmax is the same call
+ * over the same window. Each output element is the same sequence of
+ * separately rounded o += a * v in ascending t: the position blocks go in
+ * ascending order, inside a block a row takes the positions before the shared
+ * run, the shared run, the positions after it, and between blocks the float
+ * goes to memory and back unchanged. Only which unit does it and when moves.
+ *
+ * The units go largest first in chunks of one, because a unit's cost is its
+ * last row's position and the dynamic split otherwise ends on a big one.
+ *
+ * CHARSIU_ATTN_KV=0 is attn_block_heads, in the same binary, and
+ * tests/attn_tile.c holds the two against each other with memcmp.
+ */
+static int attn_kv_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV", 1);
+	return v;
+}
+
+/*
+ * THE BLOCK OF K OR V A UNIT IS ON, COPIED TO ROWS hd + 8 FLOATS APART.
+ * The cache's rows are hdmax floats apart, 512 bytes on every model with a
+ * 128 head, and the A72 ran the same scores loop 16% slower over keys 512
+ * bytes apart than over keys 544 apart (0.750 against 0.628 ns an fmla, one
+ * core, all of it in L1, 2026-11-25). Every row of the unit reads the block,
+ * so the copy is paid once for up to ATTN_KV_QMAX of them. A copy moves no
+ * value. CHARSIU_ATTN_KV_PACK=0 reads the cache in place.
+ */
+static int attn_kv_pack(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV_PACK", 1);
+	return v;
+}
+
+/* rows of the chunk a unit takes, before the group multiplies them */
+static int attn_kv_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_KV_ROWS");
+
+		v = e ? atoi(e) : 16;
+		if (v < 1)
+			v = 1;
+		if (v > 64)
+			v = 64;
+	}
+	return v;
+}
+
+/* positions of V a values block reads into L1 */
+static int attn_kv_tb(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_KV_TB");
+
+		v = e ? atoi(e) : 32;
+		if (v < 4)
+			v = 4;
+	}
+	return v;
+}
+
+#define ATTN_KV_M 4
+#define ATTN_KV_P 5
+#define ATTN_KV_QMAX 256     /* query rows a unit: rows times the group */
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+/*
+ * M rows against P consecutive keys, both constants at the call. The lo chain
+ * of every (row, key) first, parked in `lo`, then the hi chain; the sum and
+ * the reduction are attn_dot4_rows' to the instruction.
+ */
+static inline __attribute__((always_inline)) void
+attn_kv_qk(const float *const *qs, unsigned M, const float *k0, size_t ks,
+	   unsigned P, uint32_t hd, float scale, float *const *os)
+{
+	float32x4_t lo[ATTN_KV_M][ATTN_KV_P], acc[ATTN_KV_M][ATTN_KV_P];
+	unsigned g, p;
+	uint32_t i;
+
+#define KV_PASS(OFF)							\
+	_Pragma("GCC unroll 8")						\
+	for (g = 0; g < M; g++)						\
+		_Pragma("GCC unroll 8")					\
+		for (p = 0; p < P; p++)					\
+			acc[g][p] = vdupq_n_f32(0.0f);			\
+	for (i = (OFF); i < hd; i += 8) {				\
+		float32x4_t x[ATTN_KV_M];				\
+									\
+		_Pragma("GCC unroll 8")					\
+		for (g = 0; g < M; g++)					\
+			x[g] = vld1q_f32(qs[g] + i);			\
+		_Pragma("GCC unroll 8")					\
+		for (p = 0; p < P; p++) {				\
+			float32x4_t k = vld1q_f32(k0 + p * ks + i);	\
+									\
+			_Pragma("GCC unroll 8")				\
+			for (g = 0; g < M; g++)				\
+				acc[g][p] = vfmaq_f32(acc[g][p], x[g], k);\
+		}							\
+	}
+	KV_PASS(0)
+	_Pragma("GCC unroll 8")
+	for (g = 0; g < M; g++)
+		_Pragma("GCC unroll 8")
+		for (p = 0; p < P; p++)
+			lo[g][p] = acc[g][p];
+	KV_PASS(4)
+#undef KV_PASS
+	_Pragma("GCC unroll 8")
+	for (g = 0; g < M; g++) {
+		_Pragma("GCC unroll 8")
+		for (p = 0; p + 4 <= P; p += 4) {
+			float32x4_t s0 = vaddq_f32(lo[g][p], acc[g][p]);
+			float32x4_t s1 = vaddq_f32(lo[g][p + 1], acc[g][p + 1]);
+			float32x4_t s2 = vaddq_f32(lo[g][p + 2], acc[g][p + 2]);
+			float32x4_t s3 = vaddq_f32(lo[g][p + 3], acc[g][p + 3]);
+			float32x4_t z = vpaddq_f32(vpaddq_f32(s0, s1),
+						   vpaddq_f32(s2, s3));
+
+			vst1q_f32(os[g] + p, vmulq_n_f32(z, scale));
+		}
+		_Pragma("GCC unroll 8")
+		for (p = P & ~3u; p < P; p++)
+			os[g][p] = vaddvq_f32(vaddq_f32(lo[g][p], acc[g][p]))
+				 * scale;
+	}
+}
+
+#define KVQK_1(MM, PP)							\
+	case PP:							\
+		if (PP <= ATTN_KV_P)					\
+			attn_kv_qk(qs, MM, k0, ks, PP > ATTN_KV_P ? 1 : PP,\
+				   hd, scale, os);			\
+		break;
+#define KVQK_P(MM)							\
+	switch (P) {							\
+	KVQK_1(MM, 1) KVQK_1(MM, 2) KVQK_1(MM, 3) KVQK_1(MM, 4)	\
+	KVQK_1(MM, 5) KVQK_1(MM, 6)					\
+	default: break;							\
+	}
+#define KVQK_M(MM)							\
+	case MM:							\
+		if (MM <= ATTN_KV_M) {					\
+			KVQK_P(MM > ATTN_KV_M ? 1 : MM)			\
+		}							\
+		break;
+
+static void attn_kv_qk_tile(const float *const *qs, unsigned M,
+			    const float *k0, size_t ks, unsigned P,
+			    uint32_t hd, float scale, float *const *os)
+{
+	switch (M) {
+	KVQK_M(1) KVQK_M(2) KVQK_M(3) KVQK_M(4) KVQK_M(5) KVQK_M(6)
+	default: break;
+	}
+}
+#undef KVQK_M
+#undef KVQK_1
+#undef KVQK_P
+
+/* the thread's scores scratch, kept for the next unit */
+static __thread float *attn_kv_sc;
+static __thread size_t attn_kv_cap;
+static __thread float *attn_kv_kp;   /* the packed block of K or V */
+static __thread size_t attn_kv_kpcap;
+
+struct attn_kv_q {
+	const float *q;
+	float *sr;           /* this row's scores, indexed by position */
+	float *out;
+	int tlo, pos;
+};
+
+static void attn_kv_units(void *ctx, uint64_t u0, uint64_t nu)
+{
+	struct attn_block_job *j = ctx;
+	struct llama_state *s = j->s;
+	uint32_t hd = j->hd, gqa = j->gqa, nkv = j->nkv;
+	int RB = j->kv_rows, n = j->n, S = j->kv_stride;
+	int nblk = (n + RB - 1) / RB, TB = attn_kv_tb();
+	size_t qstride = (size_t)j->n_head * hd;
+	size_t need = (size_t)RB * gqa * S;
+	int timed = stage_on > 0 && !attn_block_pool();
+	int pack = attn_kv_pack(), KB = ATTN_KV_P * 4;
+	size_t PS = (size_t)hd + 8;
+	size_t kpneed = (size_t)(TB > KB ? TB : KB) * PS;
+	struct attn_kv_q Q[ATTN_KV_QMAX];
+	uint64_t u;
+
+	if (attn_kv_cap < need) {
+		free(attn_kv_sc);
+		attn_kv_sc = malloc(need * sizeof(float));
+		attn_kv_cap = attn_kv_sc ? need : 0;
+		if (!attn_kv_sc) {
+			__atomic_store_n(&j->kv_failed, 1, __ATOMIC_RELAXED);
+			return;
+		}
+	}
+	if (pack && attn_kv_kpcap < kpneed) {
+		free(attn_kv_kp);
+		attn_kv_kp = malloc(kpneed * sizeof(float));
+		attn_kv_kpcap = attn_kv_kp ? kpneed : 0;
+		if (!attn_kv_kp) {
+			__atomic_store_n(&j->kv_failed, 1, __ATOMIC_RELAXED);
+			return;
+		}
+	}
+	for (u = u0; u < u0 + nu; u++) {
+		/* largest first: the last row block of every kv head */
+		int b = nblk - 1 - (int)(u / nkv);
+		uint32_t kvh = (uint32_t)(u % nkv);
+		int rb = b * RB, re = rb + RB < n ? rb + RB : n;
+		int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
+			      ? j->pos0 + rb + 1 - j->n_swa : 0;
+		int tmax = j->pos0 + re - 1;
+		const float *kbase, *vbase;
+		size_t kstride;
+		int nq = 0, a, lo_q, hi_q, t;
+		double t0 = timed ? now_ms() : 0.0, t1;
+
+		if (kv_posmajor()) {
+			size_t base = (size_t)j->l * s->n_ctx * j->kvdim
+				    + (size_t)kvh * hd;
+
+			kbase = s->kcache + base;
+			vbase = s->vcache + base;
+			kstride = j->kvdim;
+		} else {
+			size_t base = (size_t)(j->l * nkv + kvh) * s->n_ctx
+				    * j->hdmax;
+
+			kbase = s->kcache + base;
+			vbase = s->vcache + base;
+			kstride = j->hdmax;
+		}
+		/* row major, the group inside: windows never fall with qi */
+		for (int r = rb; r < re; r++) {
+			int pos = j->pos0 + r;
+			int tlo = j->swa && pos + 1 > j->n_swa
+				? pos + 1 - j->n_swa : 0;
+
+			for (uint32_t g = 0; g < gqa; g++, nq++) {
+				uint32_t h = kvh * gqa + g;
+
+				Q[nq].q = j->q + (size_t)r * qstride + h * hd;
+				Q[nq].sr = attn_kv_sc + (size_t)nq * S;
+				Q[nq].out = j->out + (size_t)r * qstride + h * hd;
+				Q[nq].tlo = tlo;
+				Q[nq].pos = pos;
+			}
+		}
+
+		/*
+		 * SCORES. Every row whose window meets [t, t + P) joins the
+		 * tile and gets all P scores stored; the ones outside its
+		 * window land in its own scratch row below tmax and are never
+		 * read.
+		 */
+		lo_q = 0;
+		hi_q = -1;
+		for (int kb0 = tlo_first; kb0 <= tmax; kb0 += KB) {
+		int kb1 = kb0 + KB - 1 < tmax ? kb0 + KB - 1 : tmax;
+		const float *kb = kbase + (size_t)kb0 * kstride;
+		size_t kst = kstride;
+
+		if (pack) {
+			for (int c = 0; c <= kb1 - kb0; c++)
+				memcpy(attn_kv_kp + (size_t)c * PS,
+				       kb + (size_t)c * kstride,
+				       hd * sizeof(float));
+			kb = attn_kv_kp;
+			kst = PS;
+		}
+		for (t = kb0; t <= kb1; t += ATTN_KV_P) {
+			unsigned P = t + ATTN_KV_P - 1 <= kb1
+				   ? ATTN_KV_P : (unsigned)(kb1 - t + 1);
+			const float *k0 = kb + (size_t)(t - kb0) * kst;
+
+			while (lo_q < nq && Q[lo_q].pos < t)
+				lo_q++;
+			while (hi_q + 1 < nq && Q[hi_q + 1].tlo <= t + (int)P - 1)
+				hi_q++;
+			for (a = lo_q; a <= hi_q; a += ATTN_KV_M) {
+				unsigned m = hi_q - a + 1 < ATTN_KV_M
+					   ? (unsigned)(hi_q - a + 1) : ATTN_KV_M;
+				const float *qs[ATTN_KV_M];
+				float *os[ATTN_KV_M];
+
+				for (unsigned g = 0; g < m; g++) {
+					qs[g] = Q[a + g].q;
+					os[g] = Q[a + g].sr + t;
+				}
+				attn_kv_qk_tile(qs, m, k0, kst, P, hd,
+						j->scale, os);
+			}
+		}
+		}
+		if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
+		for (a = 0; a < nq; a++) {
+			softmax(Q[a].sr + Q[a].tlo, Q[a].pos + 1 - Q[a].tlo);
+			memset(Q[a].out, 0, hd * sizeof(float));
+		}
+		if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
+
+		/*
+		 * VALUES, a block of positions at a time, every row of the unit
+		 * inside it, four rows a tile. Inside a block a row's positions
+		 * are [s, e]; the tile shares [max s, min e] and each row takes
+		 * its own before and after alone, which is ascending t.
+		 */
+		for (int b0 = tlo_first; b0 <= tmax; b0 += TB) {
+			int b1 = b0 + TB - 1 < tmax ? b0 + TB - 1 : tmax;
+			/* position t of this block's V is vb + (t - b0) * vst */
+			const float *vb = vbase + (size_t)b0 * kstride;
+			size_t vst = kstride;
+
+			if (pack) {
+				for (int c = 0; c <= b1 - b0; c++)
+					memcpy(attn_kv_kp + (size_t)c * PS,
+					       vb + (size_t)c * kstride,
+					       hd * sizeof(float));
+				vb = attn_kv_kp;
+				vst = PS;
+			}
+
+			for (a = 0; a < nq; a += ATTN_PV_ROWS) {
+				int m = nq - a < ATTN_PV_ROWS ? nq - a : ATTN_PV_ROWS;
+				int sv[ATTN_PV_ROWS], ev[ATTN_PV_ROWS];
+				int lo = b0, hi = b1, any = 0;
+				float *os[ATTN_PV_ROWS];
+				const float *ps[ATTN_PV_ROWS];
+
+				for (int g = 0; g < m; g++) {
+					sv[g] = Q[a + g].tlo > b0 ? Q[a + g].tlo : b0;
+					ev[g] = Q[a + g].pos < b1 ? Q[a + g].pos : b1;
+					if (sv[g] <= ev[g])
+						any = 1;
+					if (sv[g] > lo)
+						lo = sv[g];
+					if (ev[g] < hi)
+						hi = ev[g];
+				}
+				if (!any)
+					continue;
+				if (lo > hi) {
+					for (int g = 0; g < m; g++) {
+						float *out = Q[a + g].out;
+						const float *pa = Q[a + g].sr + sv[g];
+
+						attn_pv_tile(&out, &pa, 1,
+							     vb + (size_t)(sv[g] - b0) * vst,
+							     vst, ev[g] - sv[g] + 1, hd);
+					}
+					continue;
+				}
+				for (int g = 0; g < m; g++) {
+					float *out = Q[a + g].out;
+					const float *pa = Q[a + g].sr + sv[g];
+
+					attn_pv_tile(&out, &pa, 1,
+						     vb + (size_t)(sv[g] - b0) * vst,
+						     vst, lo - sv[g], hd);
+					os[g] = out;
+					ps[g] = Q[a + g].sr + lo;
+				}
+				attn_pv_tile(os, ps, (unsigned)m,
+					     vb + (size_t)(lo - b0) * vst,
+					     vst, hi - lo + 1, hd);
+				for (int g = 0; g < m; g++) {
+					float *out = os[g];
+					const float *pa = Q[a + g].sr + hi + 1;
+
+					attn_pv_tile(&out, &pa, 1,
+						     vb + (size_t)(hi + 1 - b0) * vst,
+						     vst, ev[g] - hi, hd);
+				}
+			}
+		}
+		if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
+	}
+}
+#endif
+
+/*
+ * Whether this job can take the kv unit, and its shape if so. The scores
+ * scratch's row stride is the chunk's extent rounded to 16 floats and made an
+ * odd number of 64 byte lines, so consecutive rows walk through the L1 sets.
+ */
+static int attn_kv_plan(struct attn_block_job *j)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	int RB = attn_kv_rows(), S;
+
+	if (!attn_kv_on() || !attn_tile_on() || !attn_hr() || !fast_attn()
+	    || !attn_pv_tiled(j->hd) || j->gqa == 0
+	    || (size_t)RB * j->gqa > ATTN_KV_QMAX)
+		return 0;
+	S = ((j->pos0 + j->n + 15) / 16) * 16;
+	if ((S / 16) % 2 == 0)
+		S += 16;
+	j->kv_rows = RB;
+	j->kv_stride = S;
+	j->kv_failed = 0;
+	return 1;
+#else
+	(void)j;
+	return 0;
+#endif
 }
 
 /*
@@ -8824,7 +9291,27 @@ static int attn_block_cpu(struct attn_block_job *j)
 {
 	struct llama_state *s = j->s;
 	int R = j->R;
+	int verify = attn_gqa_on() && j->n <= GQA_VERIFY_ROWS && R == j->n
+		     && j->hd <= GQA_HDMAX;
 
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * A PROMPT CHUNK THROUGH THE KV UNIT, when it can take it; a worker
+	 * that could not get its scratch leaves the job to the head kernel
+	 * below, which rewrites every output it touched.
+	 */
+	if (!verify && attn_kv_plan(j)) {
+		int RB = j->kv_rows;
+		uint64_t nu = (uint64_t)j->nkv * ((j->n + RB - 1) / RB);
+
+		if (attn_block_pool())
+			pool_run_chunk(attn_kv_units, j, nu, 1, 1);
+		else
+			attn_kv_units(j, 0, nu);
+		if (!j->kv_failed)
+			return 0;
+	}
+#endif
 	/* scores: [n_head][R][n_ctx], each head's block its own */
 	{
 		/* THE SCRATCH IS PER UNIT NOW, and the unit is (head, row
@@ -8851,8 +9338,7 @@ static int attn_block_cpu(struct attn_block_job *j)
 		 * scratch above is one block a head and attn_gqa_rows indexes
 		 * it the way attn_block_heads would.
 		 */
-		if (attn_gqa_on() && j->n <= GQA_VERIFY_ROWS && R == j->n
-		    && j->hd <= GQA_HDMAX) {
+		if (verify) {
 			unsigned th = (unsigned)charsiu_threads();
 			struct gqa_rows_job g = { j, 1 };
 
@@ -10051,7 +10537,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				pos0, n, swa, (int)m->n_swa,
 				hd, hdmax, m->n_head_kv * hdmax, gqa,
 				m->n_head_kv, m->n_head, scale,
-				s->bq, s->bao, 0
+				s->bq, s->bao, 0, 0, 0, 0
 			};
 
 			if (attn_block(&bj))

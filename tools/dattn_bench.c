@@ -98,7 +98,7 @@ static double token(int arm, int rows, int P, int pooled)
 		} else {
 			struct attn_block_job bj = {
 				&S, l, P - rows, rows, 0, 0, HD, HD, NKV * HD,
-				GQA, NKV, NH, scale, Q, OUT, rows };
+				GQA, NKV, NH, scale, Q, OUT, rows, 0, 0, 0 };
 
 			if (arm == A_OLD) {
 				if (pooled)
