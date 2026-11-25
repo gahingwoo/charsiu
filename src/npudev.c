@@ -735,8 +735,15 @@ struct charsiu_npu {
 	/* charsiu_npu_matmul_argmax: this call's own tail scale is left to
 	 * the fused argmax pass, which charges bscale_us instead */
 	int tail_skip;
-	unsigned char *bseen;	/* which n slices of Y have been written */
+	/*
+	 * HOW MANY K slices of each n range of Y have been read back, not
+	 * just whether one has: 0 is still "the first write assigns", and the
+	 * count reaching the tensor's K slices is the LAST write, which is the
+	 * one that can carry the tail scale (btailf; see tail_fuse_for).
+	 */
+	unsigned char *bseen;
 	unsigned bseen_n;
+	int btailf;		/* this call's tail scale rides on its last read */
 	/*
 	 * THE ONE TENSOR WHOSE ANSWER IS STILL IN A DEVICE BUFFER.
 	 *
@@ -768,6 +775,7 @@ struct charsiu_npu {
 		unsigned m, dmask;
 		unsigned char *bseen;
 		unsigned bseen_n;
+		int btailf;	/* the deferred tensor's own, as bseen is */
 		/* how many entries of it are this tensor's own: g->bseen_n is
 		 * a high water mark and can GROW between the defer and the
 		 * flush, and copying that many would read past the snapshot */
@@ -5465,6 +5473,9 @@ struct read_rows {
 	float *Y;
 	unsigned m, sn, ki;
 	int grp, firstw;
+	/* the last K slice of this range: y = (y + v) * ts[j] */
+	int lastw;
+	const float *ts;	/* e->t->scale + s->n0 when lastw */
 };
 
 /*
@@ -5492,6 +5503,55 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
 		float *y0 = Y + (size_t)r * e->t->n + s->n0;
 		float *y1 = y0 + e->t->n;
+
+		/*
+		 * THE LAST SLICE CARRIES THE TAIL SCALE: the same add the
+		 * branch below does, then the same multiply tail_scale_rows
+		 * would have done on the stored value, in that order and
+		 * rounded at each step. Ungrouped only (sc is NULL), so the
+		 * plain branch's `fp * 1.0f` is fp exactly.
+		 */
+		if (c->lastw && !sc) {
+			const float *ts = c->ts;
+
+			for (j = 0; j < n4; j++) {
+				const float *fp = fo + mp[j];
+				unsigned q = j * 4;
+
+				if (firstw) {
+					y0[q + 0] = (z0 + fp[0]) * ts[q + 0];
+					y0[q + 1] = (z0 + fp[1]) * ts[q + 1];
+					y0[q + 2] = (z0 + fp[2]) * ts[q + 2];
+					y0[q + 3] = (z0 + fp[3]) * ts[q + 3];
+					y1[q + 0] = (z0 + fp[4]) * ts[q + 0];
+					y1[q + 1] = (z0 + fp[5]) * ts[q + 1];
+					y1[q + 2] = (z0 + fp[6]) * ts[q + 2];
+					y1[q + 3] = (z0 + fp[7]) * ts[q + 3];
+				} else {
+					y0[q + 0] = (y0[q + 0] + fp[0]) * ts[q + 0];
+					y0[q + 1] = (y0[q + 1] + fp[1]) * ts[q + 1];
+					y0[q + 2] = (y0[q + 2] + fp[2]) * ts[q + 2];
+					y0[q + 3] = (y0[q + 3] + fp[3]) * ts[q + 3];
+					y1[q + 0] = (y1[q + 0] + fp[4]) * ts[q + 0];
+					y1[q + 1] = (y1[q + 1] + fp[5]) * ts[q + 1];
+					y1[q + 2] = (y1[q + 2] + fp[6]) * ts[q + 2];
+					y1[q + 3] = (y1[q + 3] + fp[7]) * ts[q + 3];
+				}
+			}
+			for (j = n4 * 4; j < sn; j++) {
+				unsigned base = mp[j / 4] + j % 4;
+				float v0 = fo[base], v1 = fo[base + 4];
+
+				if (firstw) {
+					y0[j] = (z0 + v0) * ts[j];
+					y1[j] = (z0 + v1) * ts[j];
+				} else {
+					y0[j] = (y0[j] + v0) * ts[j];
+					y1[j] = (y1[j] + v1) * ts[j];
+				}
+			}
+			continue;
+		}
 
 #define ROW2(OP, S0, S1, S2, S3)                                             \
 		for (j = 0; j < n4; j++) {                                   \
@@ -5562,6 +5622,9 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
 	if (g->read4 != 4 || !w4_for(g, e->t) || !g->bmap4 || r0 % 4 || nr % 4)
+		return 0;
+	/* the four row form has no fused tail; the row loop has one */
+	if (c->lastw)
 		return 0;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -6120,6 +6183,16 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						yp[2] SC_##OP v2;            \
 						yp[3] SC_##OP v3;            \
 					}
+#define GATHER4T(FIRST, VAL)                                                 \
+					for (j = 0; j < n4; j++) {           \
+						float *yp = yr + j * 4;      \
+						const float *tq = ts + j * 4; \
+						VAL;                         \
+						yp[0] = ((FIRST ? z0 : yp[0]) + v0) * tq[0]; \
+						yp[1] = ((FIRST ? z0 : yp[1]) + v1) * tq[1]; \
+						yp[2] = ((FIRST ? z0 : yp[2]) + v2) * tq[2]; \
+						yp[3] = ((FIRST ? z0 : yp[3]) + v3) * tq[3]; \
+					}
 #define SC_ASSIGN  = z0 +
 #define SC_ADD     +=
 #define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
@@ -6141,6 +6214,19 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
 						}
+					} else if (w4_for(g, e->t) && c->lastw) {
+						/* (z0 + v) * ts, (y + v) * ts:
+						 * the add, then the tail's
+						 * multiply on the stored value */
+						const float *ts = c->ts;
+
+						if (firstw) { GATHER4T(1, W4) }
+						else        { GATHER4T(0, W4) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4];
+
+							yr[j] = ((firstw ? z0 : yr[j]) + v) * ts[j];
+						}
 					} else if (w4_for(g, e->t)) {
 						if (firstw) { GATHER4(ASSIGN, W4) }
 						else        { GATHER4(ADD, W4) }
@@ -6149,6 +6235,20 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 
 							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
+						}
+					} else if (c->lastw) {
+						/* d1 inside v as always, the
+						 * channel scale after the add:
+						 * never d1 * ts premultiplied */
+						const float *ts = c->ts;
+						float d1 = g->bd1[(size_t)ki * m + r];
+
+						if (firstw) { GATHER4T(1, I8) }
+						else        { GATHER4T(0, I8) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = (float)io[mp[j / 4] + j % 4] * d1;
+
+							yr[j] = ((firstw ? z0 : yr[j]) + v) * ts[j];
 						}
 					} else {
 						float d1 = g->bd1[(size_t)ki * m + r];
@@ -6163,6 +6263,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						}
 					}
 #undef GATHER4
+#undef GATHER4T
 #undef SC_ASSIGN
 #undef SC_ADD
 #undef W4G
@@ -6239,6 +6340,52 @@ static int npu_noread(void)
 	if (v < 0)
 		v = charsiu_env_flag("CHARSIU_NPU_NO_READ", 0);
 	return v;
+}
+
+/*
+ * THE TAIL SCALE ON THE LAST READ, NOT AS ITS OWN PASS.
+ *
+ * An ungrouped tensor's per channel scale was one more full read and write
+ * of Y after the gather -- 'scale' in the stage table, 0.26 to 0.31 ms a row
+ * on Qwen3-0.6B, where every k = 1024 projection is ungrouped. The gather
+ * already holds each element in a register for its last add, so the multiply
+ * rides on that store: y = (y + v) * scale[j] is exactly the add the read
+ * did, rounded, then the multiply tail_scale_rows did on the stored value,
+ * rounded -- -std=c11 does not contract it into an fma (the read's own note
+ * measured that), and d1 * scale is never formed.
+ *
+ * ONLY THE LAST SLICE CARRIES IT, which is what bseen counting tells the
+ * read: when a range's count reaches the tensor's K slices, that read is the
+ * last. A cut that put the multiply on every pass made the read 118 -> 152
+ * ms for nothing back. The count is order free -- device order, the pipe,
+ * the K order read and the deferred flush all just add -- and the deferred
+ * tensor keeps its own decision (pend.btailf) as it keeps its own bseen.
+ *
+ * NOT FUSED, the separate pass as before: grouped w4 (nothing to scale), the
+ * fused verify argmax (tail_skip: its pass scales), READ_FUSE (its own loop,
+ * off), the NO_READ ceiling, TAIL_PLAIN's control loop, and a grid the count
+ * cannot hold. CHARSIU_NPU_TAIL_FUSE=0 is the control.
+ */
+static int tail_fuse_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_TAIL_FUSE", 1);
+	return v;
+}
+
+static int tail_fuse_for(const struct charsiu_npu *g, const struct npu_entry *e)
+{
+	if (!tail_fuse_on() || g->tail_skip || g->readfuse || npu_noread() ||
+	    tail_plain())
+		return 0;
+	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
+		return 0;
+	if (!e->n_slices || e->count % e->n_slices ||
+	    e->count / e->n_slices >= 255)
+		return 0;
+	return 1;
 }
 
 /*
@@ -6475,7 +6622,7 @@ static int batch_read_device(struct charsiu_npu *g,
 							     &c, m);
 				else
 					read_fused_rows(&c, 0, m);
-				g->bseen[c.s0->n0 / g->nmax] = 1;
+				g->bseen[c.s0->n0 / g->nmax] += cnt;
 				g->bfused_groups++;
 				g->bfused_slices += cnt;
 				fused_ni |= 1u << ni;
@@ -6516,7 +6663,10 @@ static int batch_read_device(struct charsiu_npu *g,
 				unsigned ni = s->n0 / g->nmax;
 				struct read_rows rr = {
 					g, e, s, fo, io, Y, m, sn, ki,
-					grp, !g->bseen[ni]
+					grp, !g->bseen[ni],
+					g->btailf && (unsigned)g->bseen[ni] + 1
+						== e->count / e->n_slices,
+					e->t->scale + s->n0
 				};
 
 				g->bread_passes++;
@@ -6571,8 +6721,9 @@ static int batch_read_device(struct charsiu_npu *g,
 			/* AFTER the row loop: every row of this slot
 			 * shares the flag, and setting it inside would
 			 * make row 0 assign and rows 1.. accumulate onto
-			 * whatever was in the caller's buffer. */
-			g->bseen[s->n0 / g->nmax] = 1;
+			 * whatever was in the caller's buffer. A COUNT,
+			 * so the last slice can be told from the rest. */
+			g->bseen[s->n0 / g->nmax]++;
 			ntd[s->di]++;
 		}
 	}
@@ -6606,9 +6757,13 @@ static int batch_read_device(struct charsiu_npu *g,
  * of the pool, so asking it again at flush time gives the same answer.
  */
 static void tail_scale_apply(struct charsiu_npu *g,
-			     const struct npu_entry *e, float *Y, unsigned m)
+			     const struct npu_entry *e, float *Y, unsigned m,
+			     int fused)
 {
 	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
+		return;
+	/* the last read of every range already multiplied; see tail_fuse_for */
+	if (fused)
 		return;
 	{
 		struct tail_scale_job tj = { Y, e->t->scale,
@@ -6648,7 +6803,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	unsigned char *save;
 	float *d1save = NULL;
 	unsigned d;
-	int rc = 0;
+	int rc = 0, tailf_save;
 
 	if (!g->pend.live)
 		return 0;
@@ -6664,6 +6819,8 @@ static int npu_flush_pending(struct charsiu_npu *g)
 		memcpy(save, g->bseen, g->bseen_n);
 		memcpy(g->bseen, g->pend.bseen, nb);
 		g->bout_stride = g->pend.bout_stride;
+		tailf_save = g->btailf;
+		g->btailf = g->pend.btailf;
 		/* int8's read multiplies by this and the next tensor's pack
 		 * has already overwritten the live one */
 		if (g->bd1 && g->pend.bd1 && g->pend.bd1_n &&
@@ -6685,6 +6842,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 						      g->pend.Y, g->pend.m))
 					rc = -1;
 		g->bout_stride = stride;
+		g->btailf = tailf_save;
 		if (d1save) {
 			memcpy(g->bd1, d1save, g->bd1_n * sizeof(*d1save));
 			free(d1save);
@@ -6695,7 +6853,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	/* AND THE PER CHANNEL SCALE, which used to run at the end of the
 	 * DEFERRING call with Y still unwritten. This is the moment it
 	 * belongs at: the gather above has just filled Y. */
-	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m);
+	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m, g->pend.btailf);
 	if (defer_check() && g->pend.shadow) {
 		size_t n = (size_t)g->pend.m * g->pend.e->t->n, i;
 
@@ -7402,6 +7560,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		g->bseen_n = e->n_slices;
 	}
 	memset(g->bseen, 0, e->n_slices);
+	g->btailf = tail_fuse_for(g, e);
 	/*
 	 * THE CONTROL FOR ALL OF THE ABOVE, because assign-on-first-write
 	 * is the one thing here that can hand back a caller's stale buffer.
@@ -7786,7 +7945,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			for (d2 = 0; d2 < g->ndev; d2++)
 				batch_read_device(g, e, ob, d2,
 						  g->pend.shadow, m);
-			tail_scale_apply(g, e, g->pend.shadow, m);
+			tail_scale_apply(g, e, g->pend.shadow, m, g->btailf);
 			memcpy(g->bseen, sv, g->bseen_n);
 		}
 		free(sv);
@@ -7832,6 +7991,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			g->pend.e = e; g->pend.Y = Y;
 			g->pend.m = m;
 			g->pend.bout_stride = g->bout_stride;
+			g->pend.btailf = g->btailf;
 			g->pend.dmask = (1u << g->ndev) - 1u;
 			g->pend.live = 1;
 			ob->pending = 1;
@@ -7859,7 +8019,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	/* NOT WHEN THE READ HAS NOT HAPPENED. npu_flush_pending applies it
 	 * after the deferred gather instead; see tail_scale_apply. */
 	if (!defer && !g->tail_skip)
-		tail_scale_apply(g, e, Y, m);
+		tail_scale_apply(g, e, Y, m, g->btailf);
 	return 0;
 }
 
@@ -8116,12 +8276,15 @@ static int group_read_member(struct charsiu_npu *g, const struct npu_entry *e,
 			     unsigned m, unsigned char *seen, uint64_t *sdev,
 			     size_t stride)
 {
-	int bad;
+	int bad, tailf = g->btailf;
 
 	memcpy(g->bseen, seen, e->n_slices);
 	g->bseen_dev = *sdev;
 	g->bout_stride = stride;
+	/* the member's own: its tail_scale_apply asks the same question */
+	g->btailf = tail_fuse_for(g, e);
 	bad = batch_read_device(g, e, ob, d, Y, m);
+	g->btailf = tailf;
 	memcpy(seen, g->bseen, e->n_slices);
 	*sdev = g->bseen_dev;
 	return bad;
@@ -8441,7 +8604,8 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 					rd[i] |= 1u << fly;
 					if (!nsl[i][d]) {
 						tail_scale_apply(g, es[i],
-								 Ys[i], m);
+								 Ys[i], m,
+								 tail_fuse_for(g, es[i]));
 						scaled |= 1u << i;
 					}
 				}
@@ -8489,7 +8653,8 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 	g->busy_us += now_us() - t0;
 	for (i = 0; i < n; i++)
 		if (!((scaled >> i) & 1u))
-			tail_scale_apply(g, es[i], Ys[i], m);
+			tail_scale_apply(g, es[i], Ys[i], m,
+					 tail_fuse_for(g, es[i]));
 	g->bgroup_n++;
 	g->bgroup_members += n;
 	rc = 0;
@@ -9088,3 +9253,4 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	charsiu_note("something outside the NPU code", 0, 0);
 	return 0;
 }
+
