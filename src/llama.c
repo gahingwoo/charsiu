@@ -24,6 +24,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
@@ -397,10 +400,186 @@ struct pool {
 	 * prices it: the static split is what every number to date was taken
 	 * with. `chunk` is 0 for the static split.
 	 */
-	uint64_t next, chunk;
+	uint64_t chunk;
+	/*
+	 * THE CURSOR EVERY THREAD WRITES, ON A LINE OF ITS OWN. It shared one
+	 * with nrows and chunk, which every thread reads on every take, so
+	 * each fetch_add pulled the line away from the readers.
+	 */
+	_Alignas(64) uint64_t next;
+
+	/*
+	 * THE FAST DISPATCH (CHARSIU_POOL_FAST), and why it exists. The pool
+	 * above is a mutex, a condition variable and a broadcast, and the
+	 * caller sleeps on a second condition variable while the workers run.
+	 * Every dispatch therefore pays a futex wake per worker, a mutex the
+	 * workers queue on twice, and a wake of the caller; and the caller --
+	 * one of the cores the job was sized for -- does none of the work.
+	 *
+	 * In the fast form the pool has n - 1 threads and the CALLER is the
+	 * n-th share, the generation is a lone atomic the workers spin on for
+	 * a bounded time before they park on a futex, and the fan in is an
+	 * atomic count the caller spins on. Which rows a thread takes moves;
+	 * what is computed for each row does not, so the bits cannot.
+	 */
+	_Alignas(64) unsigned fgen;
+	_Alignas(64) unsigned fdone;
+	_Alignas(64) int fsleepers;     /* workers parked on fgen */
+	int fcaller_sleep;              /* the caller parked on fdone */
+	_Alignas(64) int fast;          /* fixed at pool_start */
+	int nw;                         /* worker threads: n, or n - 1 fast */
+	uint64_t spin_ticks;            /* how long a worker spins, in ticks */
 };
 
 static struct pool g_pool;
+
+/* ---- the fast dispatch's primitives -------------------------------------- */
+
+static long futex_op(unsigned *addr, int op, unsigned val)
+{
+	return syscall(SYS_futex, addr, op, val, NULL, NULL, 0);
+}
+
+static inline uint64_t pool_ticks(void)
+{
+#if defined(__aarch64__)
+	uint64_t v;
+
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static uint64_t pool_ticks_per_us(void)
+{
+#if defined(__aarch64__)
+	uint64_t f;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	return f / 1000000u ? f / 1000000u : 1;
+#else
+	return 1000;
+#endif
+}
+
+static inline uint64_t pool_spin_now(void)
+{
+	return __atomic_load_n(&g_pool.spin_ticks, __ATOMIC_RELAXED);
+}
+
+static inline void pool_relax(void)
+{
+#if defined(__aarch64__)
+	__asm__ volatile("yield" ::: "memory");
+#endif
+}
+
+static int pool_fast_on(void)
+{
+	return charsiu_env_flag("CHARSIU_POOL_FAST", 1);
+}
+
+/*
+ * HOW LONG A WORKER SPINS BEFORE IT PARKS, in microseconds. It is the gap
+ * between two dispatches it can bridge without a futex wake; past it the
+ * worker sleeps exactly as before. 0 parks at once.
+ *
+ * tools/pool_bench on the CM5, 4 threads, caller on 4-7: an empty dispatch
+ * of 64 items is 21 us on the condition variable pool (102 us with the
+ * prompt's pool on 0-7), 14 us fast with no spin, 1.5 us spinning; 64 units
+ * of 60 us take 1514 us against 962. A wake out of a park is still ~75 us,
+ * and the prompt's gaps include the NPU fence, so inside a batched prompt
+ * chunk the workers spin for 20 ms -- in practice the whole chunk, since
+ * llama_prefill_scope(0) drops the bound back the moment it ends. Qwen3-0.6B
+ * at 115..139 tokens, prompt ms: 200 us 446..558, 2000 us 458..555, 5000 us
+ * 442..545, 20000 us 441..544. Decode spins 200, which beat 0 on all four
+ * chat prompts.
+ */
+static unsigned pool_spin_us(void)
+{
+	const char *e = getenv("CHARSIU_POOL_SPIN_US");
+
+	return e && *e ? (unsigned)strtoul(e, NULL, 0) : 20000;
+}
+
+/* the same outside a batched prompt chunk: decode, the verify, the towers */
+static unsigned pool_spin_decode_us(void)
+{
+	const char *e = getenv("CHARSIU_POOL_SPIN_DECODE_US");
+
+	return e && *e ? (unsigned)strtoul(e, NULL, 0) : 200;
+}
+
+/*
+ * CHARSIU_POOL_STATS=1: every dispatch counted by callback, with the
+ * caller's wall time inside it, printed at exit. The callbacks are printed
+ * as addresses; `nm` on the same binary names them.
+ */
+#define POOL_NSTAT 64
+static struct {
+	void *fn;
+	int prompt;                     /* inside a batched prompt chunk */
+	uint64_t count, items;
+	double us;
+} g_pstat[POOL_NSTAT];
+static int g_pstat_on = -1, g_pstat_prompt;
+
+static void pool_stats_print(void)
+{
+	double tot = 0;
+	uint64_t cnt = 0;
+
+	for (int i = 0; i < POOL_NSTAT; i++) {
+		if (!g_pstat[i].fn)
+			continue;
+		fprintf(stderr, "charsiu: pool %s %p  %8llu dispatches  %10llu "
+			"items  %9.1f ms  %6.1f us each\n",
+			g_pstat[i].prompt ? "prompt" : "other ", g_pstat[i].fn,
+			(unsigned long long)g_pstat[i].count,
+			(unsigned long long)g_pstat[i].items,
+			g_pstat[i].us / 1000.0,
+			g_pstat[i].us / (double)g_pstat[i].count);
+		tot += g_pstat[i].us;
+		cnt += g_pstat[i].count;
+	}
+	fprintf(stderr, "charsiu: pool total %llu dispatches, %.1f ms (fast %d,"
+		" spin %u us, %u outside a prompt, %d workers + %s)\n",
+		(unsigned long long)cnt, tot / 1000.0, g_pool.fast,
+		pool_spin_us(), pool_spin_decode_us(), g_pool.nw,
+		g_pool.fast ? "the caller" : "a sleeping caller");
+}
+
+static int pool_stats_on(void)
+{
+	if (g_pstat_on < 0) {
+		g_pstat_on = charsiu_env_flag("CHARSIU_POOL_STATS", 0);
+		if (g_pstat_on)
+			atexit(pool_stats_print);
+	}
+	return g_pstat_on;
+}
+
+static void pool_stat_add(void *fn, uint64_t items, double us)
+{
+	unsigned h = (unsigned)((((uintptr_t)fn >> 2) + (unsigned)g_pstat_prompt)
+				% POOL_NSTAT);
+
+	for (int k = 0; k < POOL_NSTAT; k++, h = (h + 1) % POOL_NSTAT)
+		if (!g_pstat[h].fn || (g_pstat[h].fn == fn &&
+				       g_pstat[h].prompt == g_pstat_prompt)) {
+			g_pstat[h].fn = fn;
+			g_pstat[h].prompt = g_pstat_prompt;
+			g_pstat[h].count++;
+			g_pstat[h].items += items;
+			g_pstat[h].us += us;
+			return;
+		}
+}
 
 static int pool_dynamic(void)
 {
@@ -465,14 +644,156 @@ static void pool_do(uint64_t r0, uint64_t n)
 		gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
 }
 
+/* one thread's whole part of the current job: share `id` of g_pool.n */
+static void pool_share(long id)
+{
+	uint64_t per, r0, n;
+
+	if (g_pool.chunk) {
+		while ((r0 = __atomic_fetch_add(&g_pool.next, g_pool.chunk,
+						__ATOMIC_RELAXED)) < g_pool.nrows) {
+			n = g_pool.nrows - r0;
+			if (n > g_pool.chunk)
+				n = g_pool.chunk;
+			pool_do(r0, n);
+		}
+	} else {
+		per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
+		r0 = per * (uint64_t)id;
+		n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
+		if (n > per)
+			n = per;
+		if (n)
+			pool_do(r0, n);
+	}
+}
+
+static void *worker_fast(void *arg)
+{
+	long id = (long)arg;
+	unsigned mygen = 0;
+
+	for (;;) {
+		unsigned g = __atomic_load_n(&g_pool.fgen, __ATOMIC_ACQUIRE);
+
+		if (g == mygen) {
+			uint64_t t0 = pool_ticks();
+			unsigned k = 0;
+
+			while ((g = __atomic_load_n(&g_pool.fgen,
+						    __ATOMIC_ACQUIRE)) == mygen) {
+				pool_relax();
+				if ((++k & 63) == 0 &&
+				    pool_ticks() - t0 >= pool_spin_now())
+					break;
+			}
+			if (g == mygen) {
+				/*
+				 * PARK. The count goes up BEFORE the
+				 * generation is read again, and the caller
+				 * bumps the generation BEFORE it reads the
+				 * count -- both sequentially consistent -- so
+				 * one of the two always sees the other, and
+				 * futex_wait returns at once if the
+				 * generation moved in between.
+				 */
+				__atomic_fetch_add(&g_pool.fsleepers, 1,
+						   __ATOMIC_SEQ_CST);
+				while ((g = __atomic_load_n(&g_pool.fgen,
+						__ATOMIC_SEQ_CST)) == mygen)
+					futex_op(&g_pool.fgen,
+						 FUTEX_WAIT_PRIVATE, mygen);
+				__atomic_fetch_sub(&g_pool.fsleepers, 1,
+						   __ATOMIC_SEQ_CST);
+			}
+		}
+		mygen = g;
+		pool_share(id);
+		if (__atomic_add_fetch(&g_pool.fdone, 1, __ATOMIC_SEQ_CST)
+		    == (unsigned)g_pool.nw &&
+		    __atomic_load_n(&g_pool.fcaller_sleep, __ATOMIC_SEQ_CST))
+			futex_op(&g_pool.fdone, FUTEX_WAKE_PRIVATE, 1);
+	}
+	return NULL;
+}
+
+/*
+ * The fan out and fan in of the fast form. The job's fields are written and
+ * pool_arm has run; the release of the generation publishes them.
+ */
+static void pool_go_fast(void)
+{
+	unsigned d;
+
+	__atomic_store_n(&g_pool.fdone, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&g_pool.fgen, g_pool.fgen + 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&g_pool.fsleepers, __ATOMIC_SEQ_CST))
+		futex_op(&g_pool.fgen, FUTEX_WAKE_PRIVATE, INT_MAX);
+
+	/* the caller is the last share */
+	pool_share(g_pool.n - 1);
+
+	/*
+	 * THE TAIL. The caller spins: it is one of the n threads the job was
+	 * sized for, so its core is its own. Past the spin it parks too.
+	 */
+	{
+		uint64_t t0 = pool_ticks();
+		unsigned k = 0;
+
+		while ((d = __atomic_load_n(&g_pool.fdone, __ATOMIC_ACQUIRE))
+		       != (unsigned)g_pool.nw) {
+			pool_relax();
+			if ((++k & 63) == 0 &&
+			    pool_ticks() - t0 >= pool_spin_now())
+				break;
+		}
+	}
+	if (d != (unsigned)g_pool.nw) {
+		__atomic_store_n(&g_pool.fcaller_sleep, 1, __ATOMIC_SEQ_CST);
+		while ((d = __atomic_load_n(&g_pool.fdone, __ATOMIC_SEQ_CST))
+		       != (unsigned)g_pool.nw)
+			futex_op(&g_pool.fdone, FUTEX_WAIT_PRIVATE, d);
+		__atomic_store_n(&g_pool.fcaller_sleep, 0, __ATOMIC_RELAXED);
+	}
+	/* acquire: every worker's writes are visible from here */
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+
+/*
+ * Run the job whose fields are set, on whichever form the pool is.
+ */
+static void pool_go(void)
+{
+	double t0 = 0;
+	int st = pool_stats_on();
+
+	if (st)
+		t0 = (double)pool_ticks();
+	if (g_pool.fast) {
+		pool_go_fast();
+	} else {
+		pthread_mutex_lock(&g_pool.mu);
+		g_pool.gen++;
+		pthread_cond_broadcast(&g_pool.cv_work);
+		while (g_pool.done < g_pool.n)
+			pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
+		pthread_mutex_unlock(&g_pool.mu);
+	}
+	if (st)
+		pool_stat_add(g_pool.fn ? (void *)g_pool.fn
+			      : g_pool.nt ? (void *)npu_matvec
+			      : (void *)gguf_matvec, g_pool.nrows,
+			      ((double)pool_ticks() - t0)
+			      / (double)pool_ticks_per_us());
+}
+
 static void *worker(void *arg)
 {
 	long id = (long)arg;
 	int mygen = 0;
 
 	for (;;) {
-		uint64_t per, r0, n;
-
 		pthread_mutex_lock(&g_pool.mu);
 		while (g_pool.gen == mygen && !g_pool.stop)
 			pthread_cond_wait(&g_pool.cv_work, &g_pool.mu);
@@ -483,23 +804,7 @@ static void *worker(void *arg)
 		mygen = g_pool.gen;
 		pthread_mutex_unlock(&g_pool.mu);
 
-		if (g_pool.chunk) {
-			while ((r0 = __atomic_fetch_add(&g_pool.next, g_pool.chunk,
-							__ATOMIC_RELAXED)) < g_pool.nrows) {
-				n = g_pool.nrows - r0;
-				if (n > g_pool.chunk)
-					n = g_pool.chunk;
-				pool_do(r0, n);
-			}
-		} else {
-			per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
-			r0 = per * (uint64_t)id;
-			n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
-			if (n > per)
-				n = per;
-			if (n)
-				pool_do(r0, n);
-		}
+		pool_share(id);
 
 		pthread_mutex_lock(&g_pool.mu);
 		if (++g_pool.done == g_pool.n)
@@ -859,9 +1164,13 @@ static void pool_start(int nthreads)
 	pthread_mutex_init(&g_pool.mu, NULL);
 	pthread_cond_init(&g_pool.cv_work, NULL);
 	pthread_cond_init(&g_pool.cv_done, NULL);
-	g_pool.th = calloc((size_t)nthreads, sizeof(*g_pool.th));
-	for (long i = 0; i < nthreads; i++)
-		pthread_create(&g_pool.th[i], NULL, worker, (void *)i);
+	g_pool.fast = pool_fast_on();
+	g_pool.nw = g_pool.fast ? nthreads - 1 : nthreads;
+	g_pool.spin_ticks = (uint64_t)pool_spin_decode_us() * pool_ticks_per_us();
+	g_pool.th = calloc((size_t)g_pool.nw, sizeof(*g_pool.th));
+	for (long i = 0; i < g_pool.nw; i++)
+		pthread_create(&g_pool.th[i], NULL,
+			       g_pool.fast ? worker_fast : worker, (void *)i);
 	{
 		const char *pspec = getenv("CHARSIU_POOL_CPUS");
 		cpu_set_t pset;
@@ -878,7 +1187,7 @@ static void pool_start(int nthreads)
 		 */
 		if ((!pspec || !*pspec) && g_cpus_autopinned &&
 		    CPU_COUNT(&g_cpus_inherited) > 0) {
-			for (long i = 0; i < nthreads; i++)
+			for (long i = 0; i < g_pool.nw; i++)
 				bad |= pthread_setaffinity_np(
 					g_pool.th[i],
 					sizeof(g_cpus_inherited),
@@ -892,7 +1201,7 @@ static void pool_start(int nthreads)
 					CPU_COUNT(&g_cpus_inherited));
 		} else if (pspec && *pspec &&
 			   (n = cpus_parse(pspec, &pset)) > 0) {
-			for (long i = 0; i < nthreads; i++)
+			for (long i = 0; i < g_pool.nw; i++)
 				bad |= pthread_setaffinity_np(g_pool.th[i],
 							      sizeof(pset),
 							      &pset) != 0;
@@ -967,7 +1276,7 @@ static void pool_prefill(int on)
 	}
 	if (!wide_ok || on == g_pool_wide_now)
 		return;
-	for (int i = 0; i < g_pool.n; i++)
+	for (int i = 0; i < g_pool.nw; i++)
 		bad |= pthread_setaffinity_np(g_pool.th[i], sizeof(wide),
 					      on ? &wide : &g_pool_narrow) != 0;
 	g_pool_wide_now = on;
@@ -982,7 +1291,12 @@ static void pool_prefill(int on)
 
 void llama_prefill_scope(int n)
 {
+	g_pstat_prompt = n > 0;
 	pool_prefill(n > 0);
+	if (g_pool.fast)
+		__atomic_store_n(&g_pool.spin_ticks, (uint64_t)(n > 0
+				 ? pool_spin_us() : pool_spin_decode_us())
+				 * pool_ticks_per_us(), __ATOMIC_RELAXED);
 	charsiu_pool_prewarm_m = n > 0 ? (unsigned)n : 0;
 }
 
@@ -998,7 +1312,6 @@ static void pool_run_chunk(void (*fn)(void *, uint64_t, uint64_t),
 		fn(ctx, 0, n);
 		return;
 	}
-	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
 	pool_arm(n, grain);
@@ -1006,12 +1319,8 @@ static void pool_run_chunk(void (*fn)(void *, uint64_t, uint64_t),
 	 * first and of very different cost */
 	if (one && g_pool.chunk)
 		g_pool.chunk = 1;
-	g_pool.gen++;
-	pthread_cond_broadcast(&g_pool.cv_work);
-	while (g_pool.done < g_pool.n)
-		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
+	pool_go();
 	g_pool.fn = NULL;
-	pthread_mutex_unlock(&g_pool.mu);
 }
 
 static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
@@ -2646,18 +2955,13 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		return;
 	}
 
-	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = NULL;
 	g_pool.w = w;
 	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
 	pool_arm(w->ne[1], 1);
-	g_pool.gen++;
-	pthread_cond_broadcast(&g_pool.cv_work);
-	while (g_pool.done < g_pool.n)
-		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
-	pthread_mutex_unlock(&g_pool.mu);
+	pool_go();
 
 	/* after the fan in, because the scale is a property of the whole vector */
 	if (nt)

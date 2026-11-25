@@ -572,3 +572,8 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all board test clean
+
+# THE POOL'S OWN PRICE, a dispatch with nothing in it. Named charsiu_run_pool*
+# on the board so the shared board's lock check sees it.
+$(BUILD)/pool_bench.aarch64: tools/pool_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
