@@ -1525,6 +1525,52 @@ static void scaled_add(float *acc, const float *fo, const float *sc, unsigned n)
 #endif
 
 /*
+ * ---- ONE PASS FOR AN UNGROUPED int4 TENSOR OF ONE K SLICE ----
+ *
+ * CHARSIU_NPU_FAST_CONVERT (default on, =0 the control). q, k, v, gate, up
+ * and the head of a K = 1024 model are ungrouped (one scale a row, kgroup ==
+ * K) and one K slice each, and their gather was three passes: zero accf, add
+ * the slice into it, then y = (float)(((double)accf + 0.0) * scale). On the
+ * CM5 that was 38 us of gate+up's 50 us tail.
+ *
+ * It is one multiply. accf = 0.0f + fo is fo with -0 made +0; adding a double
+ * +0.0 to that changes nothing; and the double product of two floats is EXACT
+ * (24 + 24 significand bits < 53), so rounding it to float once is precisely
+ * the correctly rounded float product -- including overflow to inf and a
+ * subnormal result, since there is only the one rounding. So y = (0.0f + fo)
+ * * scale in float, vectorised, gives the same bits, and the zero add stays
+ * (behind a barrier the compiler cannot fold away).
+ */
+static int fast_convert_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_FAST_CONVERT", 1);
+	return v;
+}
+
+static void convert_one(float *y, const float *fo, const float *sc, unsigned n)
+{
+	unsigned j = 0;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	float32x4_t z = vdupq_n_f32(0.0f);
+
+	__asm__("" : "+w"(z));
+	for (; j + 4 <= n; j += 4) {
+		float32x4_t a = vaddq_f32(z, vld1q_f32(fo + j));
+
+		vst1q_f32(y + j, vmulq_f32(a, vld1q_f32(sc + j)));
+	}
+#endif
+	for (; j < n; j++) {
+		volatile float a = 0.0f + fo[j];
+
+		y[j] = (float)((double)a * (double)sc[j]);
+	}
+}
+
+/*
  * THE CPU'S SHARE OF A PROJECTION, run in the window the calling thread
  * currently spends BLOCKED in prep_bo.
  *
@@ -1696,6 +1742,16 @@ static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *
 	return w4_for(g, t) && t->kgroup && t->kgroup < t->k &&
 	       (t->k % t->kgroup) == 0 && t->kgroup <= (uint64_t)g->kmax;
 }
+
+/* see convert_one */
+static int convert_one_for(const struct charsiu_npu *g,
+			   const struct npu_entry *e)
+{
+	return fast_convert_on() && w4_for(g, e->t) && !tensor_grouped(g, e->t)
+	       && !g->plain && !g->midrise && !g->exact8 && !e->cq &&
+	       e->k_slices == 1 && e->n_npu == (unsigned)e->t->n;
+}
+
 
 /*
  * THE SLICE WIDTH FOR THIS TENSOR, which is not always KMAX.
@@ -5023,6 +5079,7 @@ static int ed_big(struct charsiu_npu *g, int id, float *y, unsigned sent)
 	unsigned ns = e->n_slices, ks = e->k_slices, left = ns, fenced = 0;
 	unsigned char nxt[64];
 	int grp = tensor_grouped(g, e->t), drained = 0;
+	int fastc = convert_one_for(g, e);
 	float *af = grp ? y : g->accf;
 	double hs = 0.0, t0 = now_us();
 
@@ -5041,6 +5098,15 @@ static int ed_big(struct charsiu_npu *g, int id, float *y, unsigned sent)
 				    !ed_slot_done(e, sl))
 					break;
 				fo = (const float *)ed_region(e, sl);
+				if (fastc) {
+					convert_one(y + sl->n0, fo,
+						    e->t->scale + sl->n0,
+						    sl->job.mm.n);
+					nxt[ni]++;
+					prog = 1;
+					left--;
+					continue;
+				}
 				if (nxt[ni] == 0)
 					memset(af + sl->n0, 0,
 					       (size_t)sl->job.mm.n * sizeof(*af));
@@ -5387,6 +5453,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		af = (w4_for(g, e->t) && grp && !g->plain) ? y : g->accf;
 		if (big_done)
 			goto gathered;
+		if (convert_one_for(g, e)) {
+			for (i = 0; i < e->count; i++) {
+				const struct npu_slot *s = &g->slot[e->first + i];
+
+				convert_one(y + s->n0, (const float *)((const
+					    uint8_t *)e->out[s->di].map
+					    + s->out_slot * e->out_stride),
+					    e->t->scale + s->n0, s->job.mm.n);
+			}
+			goto gathered;
+		}
 		/* the hardware's rows only: the CPU's are already written */
 		if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
@@ -5520,7 +5597,8 @@ gathered:
 		int grp = tensor_grouped(g, e->t);
 		double hs = 0.0;
 
-		if ((w4_for(g, e->t) && grp && !g->plain) || big_done) {
+		if ((w4_for(g, e->t) && grp && !g->plain) || big_done ||
+		    convert_one_for(g, e)) {
 			g->call_us += now_us() - tcall;
 			charsiu_note("something outside the NPU code", 0, 0);
 	return 0;              /* it was summed into y */
@@ -11286,9 +11364,13 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		 * and nothing else.
 		 */
 		/* the hardware's rows only: the CPU's are already written */
+		int fastc = convert_one_for(g, e);
+
 		charsiu_note("a group: clearing the accumulator",
 			     (unsigned long)e->t->n, (unsigned long)e->n_npu);
-		if (w4_for(g, e->t))
+		if (fastc)
+			;       /* convert_one writes every row once */
+		else if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
@@ -11347,6 +11429,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			if (w4_for(g, e->t)) {
 				const float *fo = (const float *)base;
 
+				if (fastc) {
+					convert_one(ys[i] + s->n0, fo,
+						    e->t->scale + s->n0,
+						    s->job.mm.n);
+					continue;
+				}
 				if (grp) {
 					double hs = g->midrise
 						  ? 0.5 * g->asum[s->k0 / g->kmax]
@@ -11386,7 +11474,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					charsiu_bo_fini(g->dev[d], &e->out[d]);
 			fspent += now_us() - tf;
 		}
-		if (af != ys[i]) {
+		if (af != ys[i] && !fastc) {
 			double hsu = 0.0;
 
 			charsiu_note("a group: converting to the caller's rows",
