@@ -311,6 +311,10 @@ struct npu_outbuf {
 	/* sized for m <= CHARSIU_NPU_SMALL_M and handed only to such calls;
 	 * see small_m() */
 	unsigned small;
+	/* the row block width of a tiled call (npu_mtile_run), 0 for every
+	 * other call: a block's buffer is sized for the block, so its whole
+	 * object prep and fini are not charged on the call's full m */
+	unsigned tile;
 };
 
 /*
@@ -577,6 +581,17 @@ struct charsiu_npu {
 	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
 	/* the other input bank and which one is live: see bank_select */
 	struct npu_inbank bank_other;
+	/* the two input banks a row tiled call alternates between, swapped
+	 * in and out around each block; see npu_mtile_run */
+	struct npu_inbank bank_tile[2];
+	unsigned long btile_calls, btile_blocks;
+	/* the read order tables for two more widths than the live one: a tiled
+	 * call reads at its block width, the head and anything untiled at m */
+	struct bmap_park {
+		uint32_t *bmap;
+		unsigned m, n4, w4;
+		int b4, b2;
+	} bmap_park[2];
 	unsigned bank_small;
 	unsigned long bank_swaps;
 	int reuse_ask;
@@ -2529,6 +2544,8 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 }
 
 static int npu_flush_pending(struct charsiu_npu *g);
+static unsigned mtile_n(void);
+static int mtile_sync(void);
 static int defer_read_on(void);
 static int defer_check(void);
 
@@ -2585,8 +2602,8 @@ static unsigned is_small_m(unsigned m)
 }
 
 #define BANK_SWAP_FIELD(f) do { __typeof__(g->f) t_ = g->f;           \
-		g->f = g->bank_other.f; g->bank_other.f = t_; } while (0)
-static void bank_swap(struct charsiu_npu *g)
+		g->f = o->f; o->f = t_; } while (0)
+static void bank_swap_with(struct charsiu_npu *g, struct npu_inbank *o)
 {
 	for (unsigned d = 0; d < 2; d++) {
 		BANK_SWAP_FIELD(bin[d]);
@@ -2604,6 +2621,11 @@ static void bank_swap(struct charsiu_npu *g)
 	BANK_SWAP_FIELD(bd1);
 }
 #undef BANK_SWAP_FIELD
+
+static void bank_swap(struct charsiu_npu *g)
+{
+	bank_swap_with(g, &g->bank_other);
+}
 
 static int bank_select(struct charsiu_npu *g, unsigned m)
 {
@@ -2660,6 +2682,11 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	/* THE POSITIVE TELL that the grouped arm ran, since its text is meant
 	 * to be identical to the control's. Only nonzero when llama.c was asked
 	 * for groups, which it is unless CHARSIU_NPU_BATCH_GROUP=0. */
+	if (g->btile_calls)
+		fprintf(stderr, "charsiu: row tiles: %lu batched calls in %lu"
+			" blocks (CHARSIU_NPU_MTILE=%u%s)\n", g->btile_calls,
+			g->btile_blocks, mtile_n(),
+			mtile_sync() ? ", each block fenced alone" : "");
 	if (g->bgroup_n || g->bgroup_fell)
 		fprintf(stderr, "charsiu: grouped batches: %lu calls of %lu"
 			" members, %lu fell back to one tensor a call\n",
@@ -2695,23 +2722,29 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_obuf; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->obuf[i].bo[d]);
-		/* the parked input bank first, while the devices are open;
+		/* the parked input banks first, while the devices are open;
 		 * the live one goes in the loop below as it always has */
-		bank_swap(g);
-		for (unsigned d = 0; d < g->ndev; d++) {
-			for (unsigned ki = 0; ki < g->bin_nks; ki++)
-				charsiu_bo_free(g->dev[d], &g->bin[d][ki]);
-			free(g->bin[d]);
-			g->bin[d] = NULL;
-			charsiu_bo_free(g->dev[d], &g->breg[d]);
+		for (unsigned b = 0; b < 3; b++) {
+			struct npu_inbank *o = b ? &g->bank_tile[b - 1]
+						 : &g->bank_other;
+
+			bank_swap_with(g, o);
+			for (unsigned d = 0; d < g->ndev; d++) {
+				for (unsigned ki = 0; ki < g->bin_nks; ki++)
+					charsiu_bo_free(g->dev[d],
+							&g->bin[d][ki]);
+				free(g->bin[d]);
+				g->bin[d] = NULL;
+				charsiu_bo_free(g->dev[d], &g->breg[d]);
+			}
+			free(g->bscr);
+			free(g->bq);
+			free(g->bd1);
+			g->bscr = NULL;
+			g->bq = NULL;
+			g->bd1 = NULL;
+			bank_swap_with(g, o);
 		}
-		free(g->bscr);
-		free(g->bq);
-		free(g->bd1);
-		g->bscr = NULL;
-		g->bq = NULL;
-		g->bd1 = NULL;
-		bank_swap(g);
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
 			/* the batched path's, which a decode never allocates.
@@ -2736,6 +2769,8 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bq);
 	free(g->bd1);
 	free(g->bmap);
+	free(g->bmap_park[0].bmap);
+	free(g->bmap_park[1].bmap);
 	free(g->obuf);
 	free(g->bseen);
 	free(g->asum);
@@ -5398,8 +5433,19 @@ static int batch_zero(void)
  * pool is zeroed as it grows: charsiu_bo_free returns immediately on a NULL
  * map, and every path into the allocation below frees before it allocates.
  */
+static struct npu_outbuf *batch_outbuf_t(struct charsiu_npu *g, unsigned wide,
+					 unsigned slots, unsigned m,
+					 unsigned tile);
+
 static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 				       unsigned slots, unsigned m)
+{
+	return batch_outbuf_t(g, wide, slots, m, 0);
+}
+
+static struct npu_outbuf *batch_outbuf_t(struct charsiu_npu *g, unsigned wide,
+					 unsigned slots, unsigned m,
+					 unsigned tile)
 {
 	struct npu_outbuf *ob = NULL;
 	double ta;
@@ -5415,6 +5461,7 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	for (unsigned i = 0; i < g->n_obuf; i++)
 		if (g->obuf[i].wide == wide && g->obuf[i].slots == slots &&
 		    g->obuf[i].small == is_small_m(m) &&
+		    g->obuf[i].tile == tile &&
 		    !g->obuf[i].pending) {
 			ob = &g->obuf[i];
 			break;
@@ -5439,6 +5486,7 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 		ob->wide = wide;
 		ob->slots = slots;
 		ob->small = is_small_m(m);
+		ob->tile = tile;
 	}
 	/*
 	 * WAIT FOR ANYTHING STILL WRITING IT BEFORE HANDING IT ON.
@@ -6685,6 +6733,40 @@ static int bmap_build(struct charsiu_npu *g, const struct npu_entry *e,
 	if (g->bmap_m != m ||
 	    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
 		unsigned n4 = (g->nmax + 3) / 4;
+		/*
+		 * A TABLE FOR ANOTHER WIDTH MAY BE PARKED. A row tiled call
+		 * reads at its block width and anything untiled at the call's
+		 * own, and one live table rebuilt between them would be built
+		 * on every call. The tables are the same function of
+		 * (m, w4) either way; parking only keeps them.
+		 */
+		struct bmap_park live = { g->bmap, g->bmap_m, g->bmap_n4,
+					  g->bmap_w4, g->bmap4, g->bmap2 }, t;
+
+		for (unsigned p = 0; p < 2; p++) {
+			struct bmap_park *q = &g->bmap_park[p];
+
+			if (q->bmap && q->m == m && q->n4 == n4 &&
+			    q->w4 == (unsigned)w4_for(g, e->t)) {
+				t = *q;
+				*q = live;
+				g->bmap = t.bmap;
+				g->bmap_m = t.m;
+				g->bmap_n4 = t.n4;
+				g->bmap_w4 = t.w4;
+				g->bmap4 = t.b4;
+				g->bmap2 = t.b2;
+				return 0;
+			}
+		}
+		/* park the live one, and build into the oldest parked one's
+		 * allocation */
+		t = g->bmap_park[1];
+		g->bmap_park[1] = g->bmap_park[0];
+		g->bmap_park[0] = live;
+		g->bmap = t.bmap;
+		g->bmap_m = 0;
+		g->bmap_w4 = 0;
 		uint32_t *t2 = realloc(g->bmap,
 			(size_t)m * n4 * sizeof(*t2));
 
@@ -7784,6 +7866,9 @@ static void pipe_drain_one(struct charsiu_npu *g, struct npu_outbuf *ob,
 	ob->busy &= ~(1u << d);
 }
 
+static int npu_mtile_try(struct charsiu_npu *g, const int *ids, unsigned n,
+			 const float *X, unsigned m, float *const *Ys);
+
 static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			    unsigned m, float *Y, int defer)
 {
@@ -7807,6 +7892,15 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		g->reuse_ask = 0;
 		if (exact8_rows(g, X, m, (unsigned)e->t->k))
 			return -1;
+	}
+	/* ROW TILES, when asked and when this call can take them; 1 is a
+	 * decline with nothing done. A deferred read keeps the untiled call:
+	 * the deferral machinery is one tensor's one buffer. */
+	if (!defer && !g->exact8) {
+		int tr = npu_mtile_try(g, &id, 1, X, m, &Y);
+
+		if (tr <= 0)
+			return tr;
 	}
 	/*
 	 * AN int8 TENSOR MAY NOT DEFER ITS GATHER, and this cost two
@@ -8663,6 +8757,450 @@ static int group_read_member(struct charsiu_npu *g, const struct npu_entry *e,
 	return bad;
 }
 
+/*
+ * ROW TILES: PACK ONE BLOCK OF ROWS WHILE THE NPU COMPUTES ANOTHER.
+ *
+ * A batched call is pack | submit | fence | read, and the two halves on the
+ * CPU never run beside the hardware except across the two devices. Rows are
+ * independent (tools/npu_rowpure: a batched row is a pure function of that
+ * row), so the call's m rows can go as T blocks, each its own job on the same
+ * slots, and the order becomes
+ *
+ *   pack 0 | pack 1      | read 0 , pack 2 | read 1 | ...
+ *          | hw 0        | hw 1            | hw 2   |
+ *
+ * Every block is a whole call of its own width: its input bank (two of
+ * them, alternated, swapped in whole like the small bank), its output
+ * buffers (keyed by the block width so the whole object prep and fini are
+ * charged on the block, not on m), its own first-write counts, and its rows
+ * of Y. The sums in a block are the sums of the untiled call's rows, slice
+ * by slice in the same order, because the read of a block is
+ * group_read_member over the same slots in the same ascending device order.
+ *
+ * NOT ROWSPLIT (llama.c), which deferred only the read and fenced each half
+ * before packing the next, and lost to per call costs this does not have
+ * (the f16 pack zeroes to the end of a bank sized for the block; the read
+ * order table for the block width is parked, not rebuilt).
+ *
+ * Each block re-streams every weight it touches, so the hardware does more
+ * work; CHARSIU_NPU_MTILE_SYNC=1 fences and reads each block before the next
+ * is packed, which prices exactly that. CHARSIU_NPU_MTILE=1 is the untiled
+ * call. Not with the cores serialised (the pair must not overlap and the
+ * tile pipeline overlaps them), not with AWQ, a deferred read, the fused
+ * verify argmax, or a block that would be small enough for the small bank.
+ */
+#define MTILE_MAX 4
+
+static unsigned mtile_n(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_MTILE");
+
+		v = e && *e ? atoi(e) : 1;
+		if (v < 1)
+			v = 1;
+		if (v > MTILE_MAX)
+			v = MTILE_MAX;
+	}
+	return (unsigned)v;
+}
+
+static unsigned mtile_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_MTILE_MIN");
+
+		v = e && *e ? atoi(e) : 32;
+		if (v < 2)
+			v = 2;
+	}
+	return (unsigned)v;
+}
+
+static int mtile_sync(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_MTILE_SYNC", 0);
+	return v;
+}
+
+/*
+ * EVEN BLOCKS, AS EQUAL AS EVEN ALLOWS, WIDEST FIRST: w4 refuses an odd
+ * width, and the pair read wants even ranges. 124 is 62 + 62, 116 is 58 + 58,
+ * 140 in three is 48 + 46 + 46. Returns the block count, 1 for untiled.
+ */
+static unsigned mtile_plan(unsigned m, unsigned *rows)
+{
+	unsigned t = mtile_n(), p, extra;
+
+	if (m % 2)
+		return 1;
+	while (t > 1 && m / t < mtile_min())
+		t--;
+	if (t < 2)
+		return 1;
+	p = m / 2;              /* pairs of rows */
+	extra = p % t;
+	for (unsigned b = 0; b < t; b++)
+		rows[b] = 2 * (p / t + (b < extra ? 1u : 0u));
+	return t;
+}
+
+struct mtile_blk {
+	unsigned r0, mb, bank, live, claimed;
+	unsigned obi[NPU_GROUP_MAX];
+	uint64_t sdev[NPU_GROUP_MAX];
+	size_t stride[NPU_GROUP_MAX];
+	unsigned char *seen;
+};
+
+struct mtile_call {
+	struct charsiu_npu *g;
+	struct npu_entry *const *es;
+	unsigned n;
+	const float *X;
+	float *const *Ys;
+	unsigned nsl[NPU_GROUP_MAX][2], wide[NPU_GROUP_MAX];
+	size_t soff[NPU_GROUP_MAX], stot;
+	unsigned nslots[2], mbmax;
+	int cur;                /* the tile bank swapped in, or -1 */
+};
+
+static void mtile_bank_in(struct mtile_call *c, unsigned bank)
+{
+	bank_swap_with(c->g, &c->g->bank_tile[bank]);
+	c->cur = (int)bank;
+}
+
+static void mtile_bank_out(struct mtile_call *c)
+{
+	if (c->cur >= 0)
+		bank_swap_with(c->g, &c->g->bank_tile[c->cur]);
+	c->cur = -1;
+}
+
+static int mtile_issue(struct mtile_call *c, struct mtile_blk *B)
+{
+	struct charsiu_npu *g = c->g;
+	struct npu_entry *const *es = c->es;
+	const float *Xb = c->X + (size_t)B->r0 * es[0]->t->k;
+	struct charsiu_joblist jl;
+	unsigned i, j;
+
+	mtile_bank_in(c, B->bank);
+	for (i = 0; i < c->n; i++) {
+		unsigned mo = c->nsl[i][0] > c->nsl[i][1] ? c->nsl[i][0]
+							  : c->nsl[i][1];
+		struct npu_outbuf *ob = batch_outbuf_t(g, c->wide[i], mo,
+						       B->mb, c->mbmax);
+
+		if (!ob)
+			return -1;
+		B->obi[i] = (unsigned)(ob - g->obuf);
+		ob->pending = 1;
+		B->claimed = i + 1;
+		B->stride[i] = (size_t)c->wide[i] * B->mb * 4;
+		B->sdev[i] = 0;
+	}
+	/* the bank holds rows the caller never declared anything about */
+	reuse_keys_drop(g->bin_key, 2);
+	pack2_call_reset(g);
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned nt = 0, nh = 0, no = 0, done_ki = 0, use_ki = 0;
+		uint32_t outh[NPU_GROUP_MAX];
+		double tp = now_us(), tpe;
+
+		if (!c->nslots[d])
+			continue;
+		for (i = 0; i < c->n; i++)
+			for (j = 0; j < es[i]->count; j++)
+				if (g->slot[es[i]->first + j].di == d)
+					use_ki |= 1u << (j / es[i]->n_slices);
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, use_ki))
+				g->handles[nh++] = g->bin[d][ki].handle;
+		for (i = 0; i < c->n; i++)
+			for (j = 0; j < es[i]->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[es[i]->first + j];
+				unsigned ki = j / es[i]->n_slices;
+
+				if (s->di != d || ((done_ki >> ki) & 1u))
+					continue;
+				done_ki |= 1u << ki;
+				batch_pack_slice(g, es[i], s, ki, d, Xb, B->mb,
+						 NULL);
+			}
+		tpe = now_us();
+		for (i = 0; i < c->n; i++) {
+			struct npu_outbuf *ob = &g->obuf[B->obi[i]];
+			unsigned nti = 0;
+
+			for (j = 0; j < es[i]->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[es[i]->first + j];
+				unsigned ki = j / es[i]->n_slices;
+				struct charsiu_job job = s->job;
+				size_t nreg;
+
+				if (s->di != d)
+					continue;
+				job.mm.m = B->mb;
+				job.input_addr = (uint32_t)g->bin[d][bin_idx(g, ki)].dma_address
+					       + (uint32_t)bin_off(g, ki);
+				job.output_addr = (uint32_t)ob->bo[d].dma_address
+						+ (uint32_t)(nti * B->stride[i]);
+				nreg = charsiu_emit_job(&job,
+					(uint64_t *)((uint8_t *)g->breg[d].map
+						     + (size_t)nt * 4096),
+					4096 / 8);
+				if (!nreg) {
+					whine(g, "the batched register stream "
+					      "came back empty",
+					      (unsigned)job.mm.k,
+					      (unsigned)job.mm.n);
+					return -1;
+				}
+				g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
+						    + (uint32_t)(nt * 4096);
+				g->tasks[nt].regcmd_count = (unsigned)nreg;
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+				nt++;
+				nti++;
+				g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
+			}
+			if (nti)
+				outh[no++] = ob->bo[d].handle;
+		}
+		/* ONE HANDLE ONCE: rocket drops a job that lists a BO twice */
+		{
+			unsigned w = 0;
+
+			for (unsigned a = 0; a < nh; a++) {
+				unsigned b;
+
+				for (b = 0; b < w; b++)
+					if (g->handles[b] == g->handles[a])
+						break;
+				if (b == w)
+					g->handles[w++] = g->handles[a];
+			}
+			nh = w;
+		}
+		g->bpack_emit_us += now_us() - tpe;
+		tpe = now_us();
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, done_ki))
+				charsiu_bo_fini(g->dev[d], &g->bin[d][ki]);
+		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_fini_us += now_us() - tpe;
+		g->bpack_us += now_us() - tp;
+		if (!nt)
+			continue;
+		tp = now_us();
+		jl.tasks = g->tasks;
+		jl.task_count = nt;
+		jl.in_handles = g->handles;
+		jl.in_count = nh;
+		jl.out_handles = outh;
+		jl.out_count = no;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			g->dead = 1;
+			return -1;
+		}
+		g->submits++;
+		B->live = 1;
+		for (i = 0; i < c->n; i++)
+			if (c->nsl[i][d])
+				g->obuf[B->obi[i]].busy |= 1u << d;
+		g->bsub_us += now_us() - tp;
+	}
+	mtile_bank_out(c);
+	return 0;
+}
+
+/* fence and read one block, device by device in ascending order, then its
+ * scale; the bank goes back in first because an int8 read takes its row
+ * scales out of the bank's d1 */
+static int mtile_complete(struct mtile_call *c, struct mtile_blk *B)
+{
+	struct charsiu_npu *g = c->g;
+	unsigned i;
+
+	mtile_bank_in(c, B->bank);
+	for (unsigned d = 0; d < g->ndev; d++)
+		for (i = 0; i < c->n; i++) {
+			struct npu_outbuf *ob = &g->obuf[B->obi[i]];
+			double w;
+
+			if (!c->nsl[i][d])
+				continue;
+			w = fence_bo(g, d, &ob->bo[d]);
+			fence_width(g, c->wide[i], w,
+				    mac_for_dev(g, c->es[i], d, B->mb));
+			ob->busy &= ~(1u << d);
+			if (group_read_member(g, c->es[i], ob, d,
+					      c->Ys[i] + (size_t)B->r0
+							 * c->es[i]->t->n,
+					      B->mb, B->seen + c->soff[i],
+					      &B->sdev[i], B->stride[i]))
+				return -1;
+		}
+	for (i = 0; i < c->n; i++)
+		tail_scale_apply(g, c->es[i],
+				 c->Ys[i] + (size_t)B->r0 * c->es[i]->t->n,
+				 B->mb, tail_fuse_for(g, c->es[i]));
+	B->live = 0;
+	for (i = 0; i < B->claimed; i++)
+		g->obuf[B->obi[i]].pending = 0;
+	B->claimed = 0;
+	mtile_bank_out(c);
+	return 0;
+}
+
+/*
+ * 1 when it declined and did nothing (the caller runs its untiled call), 0
+ * when every member's Y is written, -1 on a fault. Every refusal comes before
+ * the first side effect; past that, a fault drains every block still in
+ * flight and releases every buffer it claimed.
+ */
+static int npu_mtile_try(struct charsiu_npu *g, const int *ids, unsigned n,
+			 const float *X, unsigned m, float *const *Ys)
+{
+	struct npu_entry *es[NPU_GROUP_MAX];
+	struct mtile_blk blk[MTILE_MAX];
+	struct mtile_call c;
+	unsigned rows[MTILE_MAX], T, i, j, most, maxns = 0;
+	unsigned char *seen = NULL;
+	double t0, tprep = now_us();
+	int rc = -1;
+
+	if (mtile_n() < 2 || n < 1 || n > NPU_GROUP_MAX || g->ndev > 2 ||
+	    g->tail_skip || (g->ndev > 1 && batch_serial_for(m)))
+		return 1;
+	T = mtile_plan(m, rows);
+	if (T < 2 || is_small_m(rows[T - 1]))
+		return 1;
+	memset(&c, 0, sizeof(c));
+	c.g = g; c.es = es; c.n = n; c.X = X; c.Ys = Ys; c.cur = -1;
+	c.mbmax = rows[0];
+	for (i = 0; i < n; i++) {
+		es[i] = &g->ent[ids[i]];
+		if (es[i]->t->kscale || es[i]->k_slices > 32)
+			return 1;
+		/* every block width must batch on its own; asked once a
+		 * width, and the plan has at most two */
+		if (batch_refused(g, ids[i], rows[0]) ||
+		    (rows[T - 1] != rows[0] &&
+		     batch_refused(g, ids[i], rows[T - 1])))
+			return 1;
+		c.wide[i] = 0;
+		for (j = 0; j < es[i]->count; j++) {
+			const struct npu_slot *s = &g->slot[es[i]->first + j];
+
+			c.nsl[i][s->di]++;
+			c.nslots[s->di]++;
+			if (s->job.mm.n > c.wide[i])
+				c.wide[i] = (unsigned)s->job.mm.n;
+		}
+		if (es[i]->n_slices > maxns)
+			maxns = es[i]->n_slices;
+		c.soff[i] = c.stot;
+		c.stot += es[i]->n_slices;
+	}
+	most = c.nslots[0] > c.nslots[1] ? c.nslots[0] : c.nslots[1];
+	if (most > 4 * g->max_slices ||
+	    (size_t)es[0]->k_slices + 2 * (size_t)most >
+	    (size_t)9 * g->max_slices + 8)
+		return 1;
+
+	/* from here nothing declines */
+	if (npu_flush_pending(g))
+		return -1;
+	/* the large bank live, so neither swap below crosses the small one */
+	if (bank_select(g, m))
+		return -1;
+	for (unsigned b = 0; b < 2; b++) {
+		int bad;
+
+		mtile_bank_in(&c, b);
+		bad = batch_bufs(g, c.mbmax, es[0]->k_slices, most);
+		mtile_bank_out(&c);
+		if (bad)
+			return -1;
+	}
+	if (g->bseen_n < maxns) {
+		unsigned char *t2 = realloc(g->bseen, maxns);
+
+		if (!t2)
+			return -1;
+		g->bseen = t2;
+		g->bseen_n = maxns;
+	}
+	seen = calloc((size_t)T * (c.stot ? c.stot : 1), 1);
+	if (!seen)
+		return -1;
+	memset(blk, 0, sizeof(blk));
+	for (unsigned b = 0, r0 = 0; b < T; b++) {
+		blk[b].r0 = r0;
+		blk[b].mb = rows[b];
+		blk[b].bank = b & 1u;
+		blk[b].seen = seen + (size_t)b * c.stot;
+		r0 += rows[b];
+	}
+	/* the main bank's keys describe an X this call may be overwriting the
+	 * meaning of: a later "unchanged" must not match them */
+	reuse_keys_drop(g->bin_key, 2);
+	g->last_ob = NULL;
+	if (batch_zero())
+		for (i = 0; i < n; i++)
+			memset(Ys[i], 0, (size_t)m * es[i]->t->n * sizeof(float));
+	g->bprep_us += now_us() - tprep;
+	t0 = now_us();
+
+	if (mtile_sync()) {
+		for (unsigned b = 0; b < T; b++)
+			if (mtile_issue(&c, &blk[b]) ||
+			    mtile_complete(&c, &blk[b]))
+				goto out;
+	} else {
+		if (mtile_issue(&c, &blk[0]) || mtile_issue(&c, &blk[1]))
+			goto out;
+		for (unsigned b = 0; b < T; b++) {
+			if (mtile_complete(&c, &blk[b]))
+				goto out;
+			if (b + 2 < T && mtile_issue(&c, &blk[b + 2]))
+				goto out;
+		}
+	}
+	g->busy_us += now_us() - t0;
+	g->btile_calls++;
+	g->btile_blocks += T;
+	rc = 0;
+out:
+	mtile_bank_out(&c);
+	for (unsigned b = 0; b < T; b++) {
+		for (i = 0; i < blk[b].claimed; i++) {
+			struct npu_outbuf *ob = &g->obuf[blk[b].obi[i]];
+
+			for (unsigned d = 0; d < g->ndev; d++)
+				pipe_drain_one(g, ob, (int)d);
+			ob->pending = 0;
+		}
+		blk[b].claimed = 0;
+	}
+	free(seen);
+	return rc;
+}
+
 static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 				  unsigned n, const float *X, unsigned m,
 				  float *const *Ys)
@@ -8765,6 +9303,19 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 		return -1;
 	}
 
+	/* ROW TILES: every member checked above, so the tiled run asks only
+	 * its own questions; 1 is a decline with nothing done */
+	{
+		int tr = npu_mtile_try(g, ids, n, X, m, Ys);
+
+		if (tr < 0)
+			return -1;
+		if (!tr) {
+			g->bgroup_n++;
+			g->bgroup_members += n;
+			return 0;
+		}
+	}
 	/* from here nothing refuses. An earlier call's deferred answer is
 	 * written out first: this call reuses its buffer pool and its g->bseen,
 	 * and owes the caller no deferral of its own. */
@@ -9758,6 +10309,60 @@ int charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m)
 		for (unsigned ki = 0; ki < g->bin_nks; ki++)
 			prewarm_touch(&g->bin[d][ki]);
 		prewarm_touch(&g->breg[d]);
+	}
+	/*
+	 * AND THE ROW TILES' OWN, when this width will be tiled: both tile
+	 * banks at the widest block, four output buffers per geometry at the
+	 * block width (two blocks in flight, and gate and up -- or k and v --
+	 * share a geometry), and the read order table for each block width,
+	 * parked. The m table is built last so it is the live one, as before.
+	 */
+	if (mtile_n() > 1 && !e->t->kscale &&
+	    !(g->ndev > 1 && batch_serial_for(m))) {
+		unsigned rows[MTILE_MAX], T = mtile_plan(m, rows);
+
+		if (T > 1 && !is_small_m(rows[T - 1])) {
+			unsigned tc[4], tg = 0;
+
+			for (unsigned b = 0; b < 2; b++) {
+				int bad;
+
+				bank_swap_with(g, &g->bank_tile[b]);
+				bad = batch_bufs(g, rows[0], e->k_slices, most);
+				if (!bad)
+					for (unsigned d = 0; d < g->ndev; d++) {
+						for (unsigned ki = 0;
+						     ki < g->bin_nks; ki++)
+							prewarm_touch(&g->bin[d][ki]);
+						prewarm_touch(&g->breg[d]);
+					}
+				bank_swap_with(g, &g->bank_tile[b]);
+				if (bad)
+					return -1;
+			}
+			a_us = g->balloc_us;
+			a_n = g->balloc_n;
+			while (tg < 4) {
+				struct npu_outbuf *ob = batch_outbuf_t(g, wide,
+						most, rows[0], rows[0]);
+
+				if (!ob)
+					break;
+				for (unsigned d = 0; d < g->ndev; d++)
+					prewarm_touch(&ob->bo[d]);
+				tc[tg++] = (unsigned)(ob - g->obuf);
+				ob->pending = 1;
+			}
+			for (unsigned i = 0; i < tg; i++)
+				g->obuf[tc[i]].pending = 0;
+			g->bprewarm_us += g->balloc_us - a_us;
+			g->bprewarm_n += g->balloc_n - a_n;
+			g->balloc_us = a_us;
+			g->balloc_n = a_n;
+			if (bmap_build(g, e, rows[T - 1]) ||
+			    bmap_build(g, e, rows[0]))
+				return -1;
+		}
 	}
 	return bmap_build(g, e, m);
 }
