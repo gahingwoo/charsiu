@@ -824,12 +824,26 @@ static void cpus_pin(void)
 	cpu_clock_report(&set);
 }
 
+/*
+ * THE POOL'S OWN MASK, AND THE ONE A PROMPT GETS.
+ *
+ * g_pool_narrow is what the workers were left with when pool_start finished
+ * -- the caller's cluster, CHARSIU_POOL_CPUS, or the inherited mask -- and it
+ * is what decode and the spec verify keep. g_pool_wide is the process mask
+ * as it was before anything here pinned, which is the whole machine unless an
+ * operator ran taskset, and then it is theirs.
+ */
+static cpu_set_t g_proc_mask, g_pool_narrow;
+static int g_proc_mask_ok, g_pool_narrow_ok, g_pool_wide_now;
+
 static void pool_start(int nthreads)
 {
 	const char *env = getenv("CHARSIU_THREADS");
 
 	if (g_pool.n)
 		return;
+	if (!sched_getaffinity(0, sizeof(g_proc_mask), &g_proc_mask))
+		g_proc_mask_ok = 1;
 	cpus_pin();
 	if (nthreads < 1 && env)
 		nthreads = atoi(env);
@@ -891,6 +905,84 @@ static void pool_start(int nthreads)
 					pspec, n);
 		}
 	}
+	if (!pthread_getaffinity_np(g_pool.th[0], sizeof(g_pool_narrow),
+				    &g_pool_narrow))
+		g_pool_narrow_ok = 1;
+}
+
+/*
+ * THE WHOLE MACHINE FOR A PROMPT, THE FAST CLUSTER FOR EVERYTHING ELSE.
+ *
+ * CHARSIU_POOL_CPUS=0-7 took about 40 ms off a 124 token Qwen3-0.6B prompt
+ * (fence, read and scale all moved) and made decode BIMODAL at the same time:
+ * decode's pool work is small and latency bound, and a worker that lands on
+ * an A53 holds the barrier. The two want different masks, so a batched
+ * PROMPT chunk gets the wide one and is handed back the narrow one before its
+ * head runs. A spec verify pass is decode's and never widens.
+ *
+ * NOTHING ABOUT THE ARITHMETIC MOVES. Which thread takes which chunk was
+ * already a race under the dynamic split; every unit writes its own outputs
+ * from its own inputs, so the bits are the same on any mask.
+ *
+ * CHARSIU_PREFILL_WIDE=0 is the control. CHARSIU_PREFILL_POOL_CPUS picks the
+ * wide set; by default it is the mask the process started with.
+ */
+static int prefill_wide_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_PREFILL_WIDE", 1);
+	return v;
+}
+
+static void pool_prefill(int on)
+{
+	static cpu_set_t wide;
+	static int wide_ok = -1;
+	int bad = 0;
+
+	if (g_pool.n <= 1 || !g_pool_narrow_ok || !prefill_wide_on())
+		return;
+	if (wide_ok < 0) {
+		const char *spec = getenv("CHARSIU_PREFILL_POOL_CPUS");
+
+		wide_ok = 0;
+		if (spec && *spec) {
+			if (cpus_parse(spec, &wide) > 0)
+				wide_ok = 1;
+		} else if (g_proc_mask_ok) {
+			wide = g_proc_mask;
+			wide_ok = 1;
+		}
+		/* the same mask is not a change, and saying so per chunk
+		 * would be two syscalls a worker for nothing */
+		if (wide_ok && CPU_EQUAL(&wide, &g_pool_narrow))
+			wide_ok = 0;
+		if (wide_ok && charsiu_diag())
+			fprintf(stderr, "charsiu: a batched prompt runs the "
+				"pool on %d CPUs, decode on %d "
+				"(CHARSIU_PREFILL_WIDE=0 to keep one mask)\n",
+				CPU_COUNT(&wide), CPU_COUNT(&g_pool_narrow));
+	}
+	if (!wide_ok || on == g_pool_wide_now)
+		return;
+	for (int i = 0; i < g_pool.n; i++)
+		bad |= pthread_setaffinity_np(g_pool.th[i], sizeof(wide),
+					      on ? &wide : &g_pool_narrow) != 0;
+	g_pool_wide_now = on;
+	if (bad) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: the prompt's pool mask did "
+				"not apply\n");
+	}
+}
+
+void llama_prefill_scope(int n)
+{
+	pool_prefill(n > 0);
 }
 
 /*
@@ -10273,9 +10365,14 @@ int llama_prefill_batch_keep(struct llama_state *s,
 			     const struct llama_model *m, const int32_t *toks,
 			     int n, int pos0, int keep)
 {
+	int rc;
+
 	if (keep < 1 || keep > n)
 		return -1;
-	if (batch_layers(s, m, toks, n, pos0))
+	llama_prefill_scope(n);
+	rc = batch_layers(s, m, toks, n, pos0);
+	llama_prefill_scope(0);
+	if (rc)
 		return -1;
 	rmsnorm(s->xb, s->bx + (size_t)(keep - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);

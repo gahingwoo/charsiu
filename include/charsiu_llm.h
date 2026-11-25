@@ -1293,6 +1293,10 @@ int charsiu_env_flag(const char *name, int dflt);
  * prompt is done; it is a hint about the NEXT prefill and nothing else.
  */
 void llama_prefill_hint(struct llama_state *s, int total);
+/* n > 0 while a batched prompt chunk of n rows runs: the pool takes the
+ * process's whole mask (CHARSIU_PREFILL_WIDE, CHARSIU_PREFILL_POOL_CPUS);
+ * 0 hands the narrow one back */
+void llama_prefill_scope(int n);
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);

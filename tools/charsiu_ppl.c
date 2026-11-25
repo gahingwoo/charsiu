@@ -249,7 +249,12 @@ int main(int argc, char **argv)
 			int w = n - a < chunk ? n - a : chunk;
 			int r;
 
-			if (llama_verify_batch(st, &m, ids + a, w, a, lga)) {
+			/* a perplexity pass is a prompt, not a decode step:
+			 * the same pool mask llama_prefill_batch_keep runs */
+			llama_prefill_scope(w);
+			r = llama_verify_batch(st, &m, ids + a, w, a, lga);
+			llama_prefill_scope(0);
+			if (r) {
 				fprintf(stderr, "batched pass failed at %d\n", a);
 				return 1;
 			}
