@@ -63,7 +63,7 @@
  * The loop above is one position at a time on purpose: it prices the WEIGHTS.
  * But a prompt does not run that way -- llama_prefill_batch takes it in chunks
  * with m > 1, which is a different matmul on different hardware registers, and
- * PLAN.md's whole int4-against-int8 recommendation is about that path. Its
+ * the old PLAN.md's whole int4-against-int8 recommendation is about that path. Its
  * quality had never been measured.
  *
  * --batch runs the same corpus through llama_verify_batch, the all-rows form

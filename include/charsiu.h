@@ -179,7 +179,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  * registers are exact and dense -- 0x101c = ic*oc*2, 0x1020 = ic*2, both the
  * true byte count over all 8308 dispatches that write them -- but a grouping
  * does not change a total, so the byte ORDER inside a kernel is invisible from
- * outside. docs/vendor-dispatch.md has the whole read.
+ * outside. the vendor-dispatch notes (git history) has the whole read.
  *
  * So this takes the layout as an argument instead of picking one, and the
  * board decides. `src` is B[n][k] row major, float; `dst` holds

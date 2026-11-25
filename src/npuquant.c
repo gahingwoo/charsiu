@@ -987,7 +987,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * than either side and reproduces on a second, independent passage.
 	 * So the curve has more than one local extremum, a coarse grid cannot
 	 * be interpolated, and the good region is what is established rather
-	 * than a point inside it. docs/lab-notebook.md has the tables.
+	 * than a point inside it. the lab notebook (git history) has the tables.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;

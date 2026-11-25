@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The evidence pack, checked against its own rules.
 
-docs/vendor-quality-provenance.md specifies a rule and nobody implemented it:
+the old provenance notes (git history) specifies a rule and nobody implemented it:
 
     Every perplexity reported in the vendor-quality section must name a file
     whose md5 appears in the reproduction section.

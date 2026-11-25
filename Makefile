@@ -434,7 +434,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overl
 	python3 -P tools/check_ascii.py --self-test
 	python3 -P tools/check_ascii.py
 #
-# THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
+# THE PACK CHECKED AGAINST ITS OWN RULES. the old provenance notes (git history)
 # specified "every perplexity must name a file whose md5 appears in the
 # reproduction section" on 09-11 and nobody implemented it. Run for the first
 # time on 09-12 it failed at once: both corpora were scored by every

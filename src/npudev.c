@@ -956,7 +956,7 @@ struct charsiu_npu {
 	 * busy_us covers a window the two submits SHARED while g->submits
 	 * counted two of them. Every "us a submit" this project has printed is
 	 * therefore a call's wall clock divided by the core count, and the fit
-	 * recorded in PLAN.md as `us a submit = 102.7 * MB + 112` is describing
+	 * recorded in the old PLAN.md as `us a submit = 102.7 * MB + 112` is describing
 	 * a call whose fixed cost is 224 us, not 112.
 	 *
 	 * ITS PRODUCT IS RIGHT, WHICH IS WORSE THAN BEING WRONG OUTRIGHT:
@@ -1040,7 +1040,7 @@ struct charsiu_npu {
 	 * fit its own line, on its own shapes, for nine adds a call.
 	 *
 	 * AND THE OBVIOUS FIX IS STILL NOT FREE, FOR A SECOND REASON NOW.
-	 * PLAN.md already records that raising KMAX to cut the task count
+	 * the old PLAN.md already records that raising KMAX to cut the task count
 	 * coarsens int4, because the K slice must BE the quantisation group.
 	 * The geometry said it also COSTS A CORE: slices were dealt as
 	 * `di = (ki * ns + ni) & 1`, which restarts at 0 for every tensor, so a
@@ -7411,7 +7411,7 @@ static void pack_groups_worker(void *ctx, uint64_t g0, uint64_t ng)
  *   int8   pack 2.66  submit 0.09  fence 0.93  read 0.97  scale 0.25
  *
  * int8's fence and read are BOTH SMALLER -- its hardware path really is
- * faster, which is what PLAN.md has claimed since March -- and pack alone,
+ * faster, which is what the old PLAN.md had claimed since March -- and pack alone,
  * 3.1x wider, eats the whole advantage and 1.08 ms a row more. The tail scale
  * everybody suspected is 0.06 of it.
  *

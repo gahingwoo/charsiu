@@ -4,7 +4,7 @@
  * The register command stream for a matmul, as a 1x1 convolution.
  *
  * Every value here is either read off the vendor's own dispatches in a .rkllm
- * (tools/rkllm_regcmd.py, docs/vendor-dispatch.md) or established on hardware in
+ * (tools/rkllm_regcmd.py, the vendor-dispatch notes (git history)) or established on hardware in
  * the driver work at github.com/gahingwoo/linux-rk3576-npu. Where the two agree
  * the comment says so, because agreement between a vendor LLM dispatch and a
  * rule derived from vendor CONVOLUTION compiles is the strongest evidence this
