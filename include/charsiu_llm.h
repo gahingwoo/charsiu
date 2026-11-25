@@ -341,6 +341,18 @@ int  charsiu_npu_needs_q1_id(const struct charsiu_npu *g, int id);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
 /*
+ * One projection in two parts, one core each, split where the deal already
+ * split its K slices (see npudev.c). kparts says whether tensor id can be,
+ * and the activation column where part 1 starts; part_go packs and submits
+ * part 0 or 1 from a->f (only the columns that part reads need be written
+ * yet); part_end waits and gathers into y exactly as charsiu_npu_matvec does.
+ * part_end must follow a successful part_go 0, even if part 1 failed.
+ */
+int  charsiu_npu_kparts(const struct charsiu_npu *g, int id, unsigned *kcol);
+int  charsiu_npu_part_go(struct charsiu_npu *g, int id,
+			 const struct charsiu_act *a, unsigned part);
+int  charsiu_npu_part_end(struct charsiu_npu *g, int id, float *y);
+/*
  * M rows through one set of weights, which is the whole of prefill. X is m by
  * the tensor's K and Y is m by its N, both row major. Decode does not use this
  * and charsiu_npu_matvec is unchanged.

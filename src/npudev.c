@@ -130,6 +130,9 @@ struct npu_slot {
 struct npu_entry {
 	const struct npu_tensor *t;
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
+	/* CHARSIU_NPU_EARLY_DONE: bit d set while every word of this entry's
+	 * output slots on device d holds the sentinel in DRAM */
+	unsigned armed;
 	/*
 	 * THE STRIDE BETWEEN THIS ENTRY'S OUTPUT SLOTS, which used to be
 	 * g->out_stride for every tensor in the model. See out_fit_stride.
@@ -1264,6 +1267,8 @@ struct charsiu_npu {
 	double slow_worst;
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
+	unsigned long kparts_calls;   /* charsiu_npu_part_end, for the report */
+	unsigned long in_user_cleans; /* CHARSIU_NPU_USER_CLEAN */
 	int poolread_set, packpool_set;
 	int gfit;         /* CHARSIU_NPU_W4_GROUP_FIT, see eff_kmax() */
 	int kfit;
@@ -2664,6 +2669,8 @@ static int flush_at(struct charsiu_npu *g, int pos)
 	return defer_read_on() == pos ? npu_flush_pending(g) : 0;
 }
 
+static void ed_drop_all(const struct charsiu_npu *g);
+
 void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
@@ -2673,6 +2680,20 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	/* a deferred gather owns a buffer this is about to free, and the
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
+	/*
+	 * AND A JOB WHOSE ANSWER WAS READ BEFORE ITS FENCE (early done) may
+	 * still be in the kernel's completion path, holding no reference on
+	 * the weight objects it named nowhere (lean handles). Its hardware
+	 * finished, but nothing is freed until every fence has signalled.
+	 */
+	if (!g->dead)
+		for (unsigned i = 0; i < g->n_ent; i++)
+			for (unsigned d = 0; d < g->ndev; d++)
+				if (g->ent[i].out[d].map)
+					charsiu_bo_prep(g->dev[d],
+							&g->ent[i].out[d],
+							2000000000);
+	ed_drop_all(g);
 	/* ZERO AND NEVER RAN LOOK THE SAME, so say how many were compared */
 	if (defer_check())
 		fprintf(stderr, "charsiu: the deferred gather was compared on"
@@ -2880,6 +2901,9 @@ static int solve3(double m[3][3], double *v, double *x)
 	return 0;
 }
 
+static void cp_report(void);
+static void ed_report(void);
+
 void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)
@@ -2895,6 +2919,8 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		g->w4 ? "int4" : "int8", g->ndev);
 	/* silent unless CHARSIU_NPU_SPIN_US asked for the poll */
 	charsiu_spin_report();
+	cp_report();
+	ed_report();
 	fprintf(stderr,
 		"charsiu NPU: %u tensors, %lu slices, %lu submits, %.2f MB per "
 		"submit%s\n",
@@ -4196,6 +4222,269 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
  * mistake that made every int4 GB/s in this project double the real figure for
  * three rounds.
  */
+/*
+ * ---- CHARSIU_NPU_CALLPROF: WHERE ONE DECODE CALL'S TIME GOES, BY SITE ----
+ *
+ * The fit on `calls` reads 131 us a call before a byte moves and its own
+ * report calls the fit flaky, and every other figure for a call's overhead
+ * in this tree is a residual. This measures it instead: for each decode call
+ * it stamps the pack, each device's submit, and the moment each device's job
+ * is SEEN complete -- by polling both devices in turn rather than waiting on
+ * one and then asking the other, which would only bound the second -- then
+ * the read back. Keyed by the first tensor's name with the layer stripped, so
+ * q/k/v, o, gate/up, down and the head each get a line.
+ *
+ * DIAGNOSTIC ONLY. The poll replaces the waiter's spin for the duration of
+ * the call; the bytes and the arithmetic are untouched (the same prep runs
+ * afterwards and returns at once), so the text cannot move, but the timing of
+ * the arm that turns it on is not the shipping timing. Off by default.
+ */
+#define CP_SITES 12
+static struct cp_site {
+	char name[40];
+	unsigned long calls;
+	double pack, sub[2], done[2], tail, total, gap, mb[2], spread, prep;
+	unsigned long tasks[2], sent[2];
+} cp_tab[CP_SITES];
+static int cp_flag = -1;
+static double cp_last_end, cp_tprep;
+
+static int callprof(void)
+{
+	if (cp_flag < 0)
+		cp_flag = (int)env_u("CHARSIU_NPU_CALLPROF", 0);
+	return cp_flag;
+}
+
+static struct cp_site *cp_site(const char *tname)
+{
+	char nm[40];
+	const char *p = tname;
+	size_t l;
+	unsigned i;
+
+	if (!strncmp(p, "blk.", 4)) {
+		p += 4;
+		while (*p >= '0' && *p <= '9')
+			p++;
+		if (*p == '.')
+			p++;
+	}
+	snprintf(nm, sizeof(nm), "%s", p);
+	l = strlen(nm);
+	if (l > 7 && !strcmp(nm + l - 7, ".weight"))
+		nm[l - 7] = 0;
+	for (i = 0; i < CP_SITES; i++) {
+		if (!cp_tab[i].name[0]) {
+			snprintf(cp_tab[i].name, sizeof(cp_tab[i].name), "%s", nm);
+			return &cp_tab[i];
+		}
+		if (!strcmp(cp_tab[i].name, nm))
+			return &cp_tab[i];
+	}
+	return NULL;
+}
+
+/* poll each sent device's first output until all have finished; done[d] is
+ * the moment device d was seen complete */
+static void cp_wait(struct charsiu_npu *g, unsigned sent,
+		    struct charsiu_bo *const *bo, double *done)
+{
+	unsigned pend = sent;
+	double t0 = now_us();
+
+	while (pend) {
+		for (unsigned d = 0; d < g->ndev; d++) {
+			if (!(pend & (1u << d)))
+				continue;
+			int rc = charsiu_bo_poll(g->dev[d], bo[d]);
+
+			if (!rc || (rc != -EBUSY && rc != -EINTR)) {
+				done[d] = now_us();
+				pend &= ~(1u << d);
+			}
+		}
+		if (pend && now_us() - t0 > 2e6)
+			break;     /* the ordinary prep below takes over */
+	}
+}
+
+/*
+ * CHARSIU_NPU_CALLPROF=2 ALSO ASKS THE MEMORY. Every output word of the call
+ * is set to a NaN the hardware never writes and cleaned out to DRAM before the
+ * submit; the wait then polls both the fence AND the words (clean+invalidate
+ * from EL0, then read), and records when each device's words stopped being
+ * the sentinel and when its fence was seen. The difference is what the
+ * completion path -- interrupt, irq thread, IOMMU detach, fence signal, our
+ * poll -- costs after the data is already there. Small tensors only (the head
+ * would be 600 kB a poll).
+ */
+#define CP_SENT 0x7fbadbadu
+#define CP_NREG 32
+static struct { uint32_t *p; unsigned n, d; } cp_reg[CP_NREG];
+static unsigned cp_nreg;
+static double cp_memlead[2], cp_memlead_n[2], cp_memlate;
+
+static void cp_fill(struct charsiu_npu *g, const int *ids, unsigned n)
+{
+	cp_nreg = 0;
+	for (unsigned i = 0; i < n; i++) {
+		struct npu_entry *e = &g->ent[ids[i]];
+		unsigned used = 0;
+
+		if (e->t->n > 16384)
+			continue;
+		for (unsigned j = 0; j < e->count && cp_nreg < CP_NREG; j++) {
+			const struct npu_slot *sl = &g->slot[e->first + j];
+			uint32_t *w = (uint32_t *)((uint8_t *)e->out[sl->di].map
+				      + sl->out_slot * e->out_stride);
+
+			for (unsigned q = 0; q < sl->job.mm.n; q++)
+				w[q] = CP_SENT;
+			cp_reg[cp_nreg].p = w;
+			cp_reg[cp_nreg].n = sl->job.mm.n;
+			cp_reg[cp_nreg].d = sl->di;
+			cp_nreg++;
+			used |= 1u << sl->di;
+		}
+		for (unsigned d = 0; d < g->ndev; d++)
+			if (used & (1u << d))
+				charsiu_bo_fini(g->dev[d], &e->out[d]);
+	}
+}
+
+static int cp_mem_done(unsigned d)
+{
+	int any = 0;
+
+	for (unsigned r = 0; r < cp_nreg; r++) {
+		const uint32_t *w = cp_reg[r].p;
+
+		if (cp_reg[r].d != d)
+			continue;
+		any = 1;
+#if defined(__aarch64__)
+		for (unsigned q = 0; q < cp_reg[r].n; q += 16)
+			__asm__ volatile("dc civac, %0" :: "r"(w + q) : "memory");
+		__asm__ volatile("dsb ish" ::: "memory");
+#endif
+		for (unsigned q = 0; q < cp_reg[r].n; q++)
+			if (__atomic_load_n(&w[q], __ATOMIC_RELAXED) == CP_SENT)
+				return 0;
+	}
+	return any;
+}
+
+static void cp_wait2(struct charsiu_npu *g, unsigned sent,
+		     struct charsiu_bo *const *bo, double *done)
+{
+	unsigned pend = sent, mpend = sent;
+	double tm[2] = { 0, 0 }, t0 = now_us();
+
+	while (pend) {
+		for (unsigned d = 0; d < g->ndev; d++) {
+			if ((mpend & (1u << d)) && cp_mem_done(d)) {
+				tm[d] = now_us();
+				mpend &= ~(1u << d);
+			}
+			if (!(pend & (1u << d)))
+				continue;
+			int rc = charsiu_bo_poll(g->dev[d], bo[d]);
+
+			if (!rc || (rc != -EBUSY && rc != -EINTR)) {
+				done[d] = now_us();
+				pend &= ~(1u << d);
+			}
+		}
+		if (pend && now_us() - t0 > 2e6)
+			break;
+	}
+	for (unsigned d = 0; d < g->ndev; d++) {
+		if (!(sent & (1u << d)) || !cp_nreg)
+			continue;
+		if (mpend & (1u << d)) {
+			/* the fence came first, check the words once more */
+			if (!cp_mem_done(d))
+				cp_memlate++;
+			continue;
+		}
+		cp_memlead[d] += done[d] - tm[d];
+		cp_memlead_n[d]++;
+	}
+}
+
+static void cp_record(const char *tname, double tcall, double tpacked,
+		      const double *sub0, const double *sub1,
+		      const double *done, unsigned sent,
+		      const unsigned *tasks, const double *mb, double tend)
+{
+	struct cp_site *c = cp_site(tname);
+	double last = 0.0, first = 1e300;
+
+	if (!c)
+		return;
+	c->calls++;
+	c->pack += tpacked - tcall;
+	for (unsigned d = 0; d < 2; d++) {
+		if (!(sent & (1u << d)))
+			continue;
+		c->sent[d]++;
+		c->sub[d] += sub1[d] - sub0[d];
+		c->done[d] += done[d] - sub1[d];
+		c->tasks[d] += tasks[d];
+		c->mb[d] += mb[d];
+		if (done[d] > last)
+			last = done[d];
+		if (done[d] < first)
+			first = done[d];
+	}
+	if (last > 0.0) {
+		c->tail += tend - last;
+		if (cp_tprep > last)
+			c->prep += cp_tprep - last;
+		c->spread += last - first;
+	}
+	c->total += tend - tcall;
+	if (cp_last_end > 0.0 && tcall - cp_last_end < 50000.0)
+		c->gap += tcall - cp_last_end;
+	cp_last_end = tend;
+}
+
+static void cp_report(void)
+{
+	if (callprof() <= 0)
+		return;
+	fprintf(stderr, "charsiu callprof (us a call; done = submit returned"
+		" -> job seen complete, per device; tail = last done -> return;"
+		" gap = CPU time since the previous call ended)\n");
+	fprintf(stderr, "  %-18s %6s %6s %6s %6s %7s %7s %6s %6s %6s %6s %5s"
+		" %5s %6s\n", "site", "calls", "gap", "pack", "sub0", "done0",
+		"done1", "sub1", "spread", "tail", "total", "tsk0", "tsk1",
+		"MB0/1 prep");
+	if (callprof() == 2)
+		fprintf(stderr, "  the words were all written %.1f us (core 0, %.0f"
+			" calls) / %.1f us (core 1, %.0f) before the fence was seen;"
+			" %.0f calls had words missing AFTER the fence\n",
+			cp_memlead_n[0] ? cp_memlead[0] / cp_memlead_n[0] : 0.0,
+			cp_memlead_n[0],
+			cp_memlead_n[1] ? cp_memlead[1] / cp_memlead_n[1] : 0.0,
+			cp_memlead_n[1], cp_memlate);
+	for (unsigned i = 0; i < CP_SITES && cp_tab[i].name[0]; i++) {
+		const struct cp_site *c = &cp_tab[i];
+		double n = (double)c->calls;
+		double n0 = c->sent[0] ? (double)c->sent[0] : 1.0;
+		double n1 = c->sent[1] ? (double)c->sent[1] : 1.0;
+
+		fprintf(stderr, "  %-18s %6lu %6.1f %6.1f %6.1f %7.1f %7.1f %6.1f"
+			" %6.1f %6.1f %6.1f %5.2f %5.2f %.2f/%.2f %.1f\n", c->name,
+			c->calls, c->gap / n, c->pack / n, c->sub[0] / n0,
+			c->done[0] / n0, c->done[1] / n1, c->sub[1] / n1,
+			c->spread / n, c->tail / n, c->total / n,
+			c->tasks[0] / n0, c->tasks[1] / n1, c->mb[0] / n0,
+			c->mb[1] / n1, c->prep / n);
+	}
+}
+
 static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
 			 double us)
 {
@@ -4250,6 +4539,577 @@ static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
 	g->f_yy += us * us;
 }
 
+/*
+ * ---- CHARSIU_NPU_EARLY_DONE: SEE THE ANSWER, NOT THE FENCE ----
+ *
+ * CHARSIU_NPU_CALLPROF=2 measured it: every output word of a decode call is
+ * in DRAM 25.6 us (core 0) and 26.9 us (core 1) before the fence is seen,
+ * over 14336 calls, and never once after. That is the completion path -- the
+ * interrupt on CPU0, the irq thread, the IOMMU detach, dma_fence_signal, and
+ * the poll that notices -- and it sits between the hardware finishing and the
+ * CPU starting on every one of the 112 calls of a Qwen3-0.6B token.
+ *
+ * So the waiter watches the words. An armed entry's output slots hold a NaN
+ * the hardware never writes (ED_SENT), cleaned out to DRAM; the wait cleans
+ * and invalidates those lines from EL0 and reads them, and a device is done
+ * when none of its words is the sentinel any more -- or when its fence is
+ * seen, whichever is first, so a real output that happened to equal the
+ * sentinel costs the old latency and nothing else. The prep_bo that would
+ * have waited for the fence is skipped for a device finished this way: its
+ * only other job is the invalidate, and the poll has just done that line by
+ * line. The kernel's completion still runs, beside the CPU's next work; the
+ * next job on that core queues behind its fence in the scheduler as before.
+ *
+ * WHAT MAKES IT EXACT is that a decode task writes each output word once,
+ * with its final value -- the accumulation is inside the core -- so a word
+ * that is not the sentinel is the answer. The bytes the gather reads are the
+ * bytes prep_bo would have handed it, and the logits hash is the proof.
+ *
+ * RE-ARMING IS OFF THE CRITICAL PATH. After a call has read its outputs it
+ * queues the entry; later waits write the sentinel back and clean it, a few
+ * slots at a time, while they wait on their own hardware. An entry not yet
+ * re-armed takes the ordinary prep path, so correctness never depends on
+ * when the re-arm happens.
+ *
+ * Tensors up to CHARSIU_NPU_EARLY_DONE_MAXN rows (16384) are polled whole;
+ * a wider one -- the output head -- slice by slice (CHARSIU_NPU_EARLY_BIG,
+ * see ed_big).
+ *
+ * ON BY DEFAULT; CHARSIU_NPU_EARLY_DONE=0 is the control. CM5, Qwen3-0.6B,
+ * 124 token prompt, 64 tokens, spec 0, stage clock, same boot: 41.6-42.1 ms a
+ * token -> 38.0-38.2, every projection row shorter (q k v 7.3 -> 6.6, o 5.3 ->
+ * 4.4, gate+up 9.0 -> 7.7, down 6.5 -> 5.8 ms a token), text identical, and
+ * the logits fnv64 of Qwen3-0.6B, Llama-3.2-1B and Qwen3-1.7B over long.txt
+ * -n 400 unchanged in the token loop (the only one of the three ppl modes
+ * that reaches this path; --batch and --verify were run too).
+ */
+#define ED_SENT 0x7fbadbadu
+#define ED_QMAX 16
+static struct {
+	struct charsiu_npu *g;
+	int id;
+	unsigned next, used;      /* slots armed so far, and their devices */
+} ed_q[ED_QMAX];
+static unsigned ed_nq;
+static unsigned long ed_early[2], ed_fence[2], ed_plain;
+
+/*
+ * ---- THE ACTIVATION'S WAY IN, FOR A DECODE CALL ----
+ *
+ * CHARSIU_NPU_PACK_NEEDED (default on, =0 the control): pack into each
+ * device's input object only the K
+ * slices that device's tasks read, and skip a device with none. Every device
+ * used to get every K slice, so o proj (two K slices, one a core) and down
+ * (three, two and one) packed twice what their cores read. The bytes a task
+ * reads are packed exactly as before, at the same offsets.
+ *
+ * CHARSIU_NPU_USER_CLEAN (default on, =0 the control): make those bytes
+ * visible to the device with DC
+ * CVAC over exactly the packed slices instead of DRM_ROCKET_FINI_BO, which is
+ * an ioctl that cleans the WHOLE object (it takes a handle and no range).
+ * The kernel's fini is dma_sync_sgtable_for_device, which on arm64 is the
+ * same clean to the point of coherency followed by a dsb; EL0 may issue DC
+ * CVAC (SCTLR_EL1.UCI), so this is the same maintenance on fewer lines with
+ * no syscall.
+ *
+ * Together with CHARSIU_NPU_LEAN_HANDLES, on top of early done: 38.1 -> 37.7
+ * ms a token (o proj 4.37 -> 4.15, down 5.85 -> 5.71), both rounds, text
+ * identical.
+ */
+static int pack_needed_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PACK_NEEDED", 1);
+	return v;
+}
+
+static int user_clean_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+#if defined(__aarch64__)
+		v = charsiu_env_flag("CHARSIU_NPU_USER_CLEAN", 1);
+#else
+		v = 0;
+#endif
+	}
+	return v;
+}
+
+/*
+ * CHARSIU_NPU_LEAN_HANDLES (default on, =0 the control): a decode submit
+ * lists the input and output objects only. The weight and coefficient objects of every slice were in
+ * the in list too, two a task, and the kernel looks each one up, locks its
+ * reservation, reserves a fence slot and walks its fences for an implicit
+ * dependency -- for objects nothing ever writes after staging and that this
+ * process holds for its whole life. The register stream objects have never
+ * been listed, which is the precedent: rocket maps an object into the fd's
+ * IOMMU domain when it is created, not when a job names it. The weights are
+ * held by this process until charsiu_npu_close, which waits on every fence
+ * before freeing anything.
+ */
+static int submit_order_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_SUBMIT_ORDER", 1);
+	return v;
+}
+
+static int lean_handles_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_LEAN_HANDLES", 1);
+	return v;
+}
+
+/* the K slices of entry e that device d's tasks read, as a mask; all ones
+ * when there are more K slices than bits */
+static uint64_t kmask_for(const struct charsiu_npu *g,
+			  const struct npu_entry *e, unsigned d)
+{
+	uint64_t m = 0;
+
+	if (e->k_slices > 64 || !e->n_slices)
+		return ~0ull;
+	for (unsigned j = 0; j < e->count; j++)
+		if (g->slot[e->first + j].di == d)
+			m |= 1ull << (j / e->n_slices);
+	return m;
+}
+
+/* hand device d the K slices in mask m of its input object */
+static void in_flush(struct charsiu_npu *g, unsigned d, uint64_t m,
+		     unsigned k_slices)
+{
+#if defined(__aarch64__)
+	if (m == ~0ull && k_slices < 64)
+		m = (1ull << k_slices) - 1;
+	if (user_clean_on() && m != ~0ull) {
+		const char *base = (const char *)g->in[d].map;
+
+		for (unsigned ki = 0; ki < k_slices; ki++) {
+			const char *p;
+
+			if (!(m & (1ull << ki)))
+				continue;
+			p = base + (size_t)ki * g->in_stride;
+			for (size_t o = 0; o < g->in_stride; o += 64)
+				__asm__ volatile("dc cvac, %0" :: "r"(p + o)
+						 : "memory");
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		g->in_user_cleans++;
+		return;
+	}
+#endif
+	(void)m; (void)k_slices;
+	charsiu_bo_fini(g->dev[d], &g->in[d]);
+}
+
+static int early_done_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_EARLY_DONE", 1);
+	return v;
+}
+
+static unsigned early_done_maxn(void)
+{
+	static unsigned v;
+	static int set;
+
+	if (!set) {
+		v = env_u("CHARSIU_NPU_EARLY_DONE_MAXN", 16384);
+		set = 1;
+	}
+	return v;
+}
+
+static inline uint32_t *ed_region(const struct npu_entry *e,
+				  const struct npu_slot *sl)
+{
+	return (uint32_t *)((uint8_t *)e->out[sl->di].map
+			    + sl->out_slot * e->out_stride);
+}
+
+static inline void ed_civac(const void *p, size_t bytes)
+{
+#if defined(__aarch64__)
+	const char *c = p;
+
+	for (size_t o = 0; o < bytes; o += 64)
+		__asm__ volatile("dc civac, %0" :: "r"(c + o) : "memory");
+	__asm__ volatile("dsb ish" ::: "memory");
+#else
+	(void)p; (void)bytes;
+#endif
+}
+
+/*
+ * CHARSIU_NPU_EARLY_BIG (default on with early done, =0 the control): the
+ * same for a tensor too wide to poll whole -- the output head. Its slices finish one at a time over 4.6 ms, so instead
+ * of waiting for the last and then gathering 151936 rows, each slice is
+ * watched on its own and gathered the moment its words are all there, in
+ * the same order per output element (K slice ascending, into the same zeroed
+ * accumulator, then the same conversion). At the end only the last slice is
+ * left to add. Needs CHARSIU_NPU_EARLY_DONE. Qwen3-0.6B's head row 5.26 ->
+ * 4.65 ms a token, both rounds.
+ */
+static int ed_big_ok(const struct charsiu_npu *g, const struct npu_entry *e)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_EARLY_BIG", 1);
+	return v && w4_for(g, e->t) && !g->plain && !g->midrise &&
+	       !g->exact8 && e->n_npu == (unsigned)e->t->n &&
+	       e->count == e->k_slices * e->n_slices && e->n_slices <= 64 &&
+	       e->k_slices <= 64;
+}
+
+static int ed_entry_ok(const struct charsiu_npu *g, const struct npu_entry *e)
+{
+#if defined(__aarch64__)
+	return early_done_on() && g->ndev <= 2 && !e->cq &&
+	       (e->t->n <= early_done_maxn() || ed_big_ok(g, e));
+#else
+	(void)g; (void)e;
+	return 0;
+#endif
+}
+
+/* the sentinel over one slot's words, cleaned to DRAM (no barrier) */
+static size_t ed_arm_slot(struct npu_entry *e, const struct npu_slot *sl)
+{
+	uint32_t *w = ed_region(e, sl);
+	size_t bytes = (size_t)sl->job.mm.n * 4u;
+
+	for (unsigned q = 0; q < sl->job.mm.n; q++)
+		w[q] = ED_SENT;
+#if defined(__aarch64__)
+	for (size_t o = 0; o < bytes; o += 64)
+		__asm__ volatile("dc cvac, %0" :: "r"((char *)w + o) : "memory");
+#endif
+	return bytes;
+}
+
+/*
+ * The queued re-arms, a few slots at a time, run while the caller waits on
+ * something else. NEVER an entry of the call in flight: its device may be
+ * writing those very words. ed_drop removes those first; the call queues them
+ * again once it has read them. An entry is marked armed only when every slot
+ * is done and the barrier has run, so a half armed entry takes the ordinary
+ * path and is merely written over.
+ */
+static void ed_drop(struct charsiu_npu *g, const int *ids, unsigned n)
+{
+	unsigned w = 0;
+
+	for (unsigned i = 0; i < ed_nq; i++) {
+		int busy = 0;
+
+		if (ed_q[i].g == g)
+			for (unsigned k = 0; k < n; k++)
+				if (ids[k] == ed_q[i].id)
+					busy = 1;
+		if (busy)
+			g->ent[ed_q[i].id].armed = 0;
+		else
+			ed_q[w++] = ed_q[i];
+	}
+	ed_nq = w;
+}
+
+/* forget every queued re-arm of g, which is going away */
+static void ed_drop_all(const struct charsiu_npu *g)
+{
+	unsigned w = 0;
+
+	for (unsigned i = 0; i < ed_nq; i++)
+		if (ed_q[i].g != g)
+			ed_q[w++] = ed_q[i];
+	ed_nq = w;
+}
+
+/* arm up to `budget` bytes of the queue; returns whether it is empty */
+static int ed_step(size_t budget)
+{
+	size_t done = 0;
+
+	while (ed_nq && done < budget) {
+		struct charsiu_npu *g = ed_q[0].g;
+		struct npu_entry *e = &g->ent[ed_q[0].id];
+
+		while (ed_q[0].next < e->count && done < budget) {
+			const struct npu_slot *sl =
+				&g->slot[e->first + ed_q[0].next];
+
+			done += ed_arm_slot(e, sl);
+			ed_q[0].used |= 1u << sl->di;
+			ed_q[0].next++;
+		}
+		if (ed_q[0].next < e->count)
+			break;
+#if defined(__aarch64__)
+		__asm__ volatile("dsb ish" ::: "memory");
+#endif
+		e->armed = ed_q[0].used;
+		memmove(&ed_q[0], &ed_q[1], (ed_nq - 1) * sizeof(ed_q[0]));
+		ed_nq--;
+	}
+	return !ed_nq;
+}
+
+static void ed_queue(struct charsiu_npu *g, int id)
+{
+	if (!ed_entry_ok(g, &g->ent[id]))
+		return;
+	g->ent[id].armed = 0;
+	for (unsigned i = 0; i < ed_nq; i++)
+		if (ed_q[i].g == g && ed_q[i].id == id)
+			return;
+	if (ed_nq == ED_QMAX)
+		return;          /* stays unarmed: the ordinary path */
+	ed_q[ed_nq].g = g;
+	ed_q[ed_nq].id = id;
+	ed_q[ed_nq].next = 0;
+	ed_q[ed_nq].used = 0;
+	ed_nq++;
+}
+
+/* whether every word of the call's slots on device d is written */
+static int ed_mem_done(const struct charsiu_npu *g, const int *ids,
+		       unsigned n, unsigned d)
+{
+	/* the last line of every slot first: cheap, and the likely laggard */
+	for (unsigned i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+
+		for (unsigned j = 0; j < e->count; j++) {
+			const struct npu_slot *sl = &g->slot[e->first + j];
+			const uint32_t *w;
+			unsigned nw = sl->job.mm.n, q0;
+
+			if (sl->di != d)
+				continue;
+			w = ed_region(e, sl);
+			q0 = nw > 16 ? nw - 16 : 0;
+			ed_civac(w + q0, (size_t)(nw - q0) * 4u);
+			for (unsigned q = q0; q < nw; q++)
+				if (__atomic_load_n(&w[q], __ATOMIC_RELAXED)
+				    == ED_SENT)
+					return 0;
+		}
+	}
+	for (unsigned i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+
+		for (unsigned j = 0; j < e->count; j++) {
+			const struct npu_slot *sl = &g->slot[e->first + j];
+			const uint32_t *w;
+
+			if (sl->di != d)
+				continue;
+			w = ed_region(e, sl);
+			ed_civac(w, (size_t)sl->job.mm.n * 4u);
+			for (unsigned q = 0; q < sl->job.mm.n; q++)
+				if (__atomic_load_n(&w[q], __ATOMIC_RELAXED)
+				    == ED_SENT)
+					return 0;
+		}
+	}
+	return 1;
+}
+
+/*
+ * The wait for a call whose every entry is armed on every device it sent to.
+ * Returns with each sent device either seen complete in memory (no prep, the
+ * lines are already invalidated) or by its fence, in which case every BO of
+ * the call on that device is prepped as before. Entries are disarmed either
+ * way: their words are the answer now.
+ */
+static int ed_wait(struct charsiu_npu *g, const int *ids, unsigned n,
+		   unsigned sent)
+{
+	unsigned pend = sent;
+	double t0 = now_us();
+	int drained = 0;
+
+	ed_drop(g, ids, n);
+
+	while (pend) {
+		for (unsigned d = 0; d < g->ndev; d++) {
+			const struct npu_entry *e0 = NULL;
+
+			if (!(pend & (1u << d)))
+				continue;
+			if (ed_mem_done(g, ids, n, d)) {
+				pend &= ~(1u << d);
+				ed_early[d]++;
+				continue;
+			}
+			for (unsigned i = 0; i < n && !e0; i++)
+				if (g->ent[ids[i]].armed & (1u << d))
+					e0 = &g->ent[ids[i]];
+			if (e0 && !charsiu_bo_poll(g->dev[d],
+					(struct charsiu_bo *)&e0->out[d])) {
+				for (unsigned i = 0; i < n; i++)
+					if (g->ent[ids[i]].armed & (1u << d))
+						charsiu_bo_prep(g->dev[d],
+							&g->ent[ids[i]].out[d],
+							2000000000);
+				pend &= ~(1u << d);
+				ed_fence[d]++;
+			}
+		}
+		if (pend && !drained)
+			drained = ed_step(16384);
+		if (pend && now_us() - t0 > 2e6) {
+			/* the ordinary wait, with its own timeout */
+			for (unsigned d = 0; d < g->ndev; d++)
+				if (pend & (1u << d))
+					for (unsigned i = 0; i < n; i++)
+						if (charsiu_bo_prep(g->dev[d],
+							&g->ent[ids[i]].out[d],
+							2000000000))
+							return -1;
+			break;
+		}
+	}
+	for (unsigned i = 0; i < n; i++)
+		g->ent[ids[i]].armed = 0;
+	return 0;
+}
+
+static void ed_report(void)
+{
+	if (early_done_on())
+		fprintf(stderr, "charsiu NPU: early done: %lu+%lu device waits"
+			" ended on the words, %lu+%lu on the fence, %lu calls"
+			" took the ordinary wait (CHARSIU_NPU_EARLY_DONE)\n",
+			ed_early[0], ed_early[1], ed_fence[0], ed_fence[1],
+			ed_plain);
+}
+
+static int ed_slot_done(const struct npu_entry *e, const struct npu_slot *sl)
+{
+	const uint32_t *w = ed_region(e, sl);
+	unsigned nw = sl->job.mm.n, q0 = nw > 16 ? nw - 16 : 0;
+
+	ed_civac(w + q0, (size_t)(nw - q0) * 4u);
+	for (unsigned q = q0; q < nw; q++)
+		if (__atomic_load_n(&w[q], __ATOMIC_RELAXED) == ED_SENT)
+			return 0;
+	ed_civac(w, (size_t)q0 * 4u);
+	for (unsigned q = 0; q < q0; q++)
+		if (__atomic_load_n(&w[q], __ATOMIC_RELAXED) == ED_SENT)
+			return 0;
+	return 1;
+}
+
+/* wait for a big armed entry and gather it slice by slice into y */
+static int ed_big(struct charsiu_npu *g, int id, float *y, unsigned sent)
+{
+	struct npu_entry *e = &g->ent[id];
+	unsigned ns = e->n_slices, ks = e->k_slices, left = ns, fenced = 0;
+	unsigned char nxt[64];
+	int grp = tensor_grouped(g, e->t), drained = 0;
+	float *af = grp ? y : g->accf;
+	double hs = 0.0, t0 = now_us();
+
+	ed_drop(g, &id, 1);
+	memset(nxt, 0, sizeof(nxt));
+	while (left) {
+		int prog = 0;
+
+		for (unsigned ni = 0; ni < ns; ni++) {
+			while (nxt[ni] < ks) {
+				const struct npu_slot *sl = &g->slot[e->first
+						+ nxt[ni] * ns + ni];
+				const float *fo;
+
+				if (!(fenced & (1u << sl->di)) &&
+				    !ed_slot_done(e, sl))
+					break;
+				fo = (const float *)ed_region(e, sl);
+				if (nxt[ni] == 0)
+					memset(af + sl->n0, 0,
+					       (size_t)sl->job.mm.n * sizeof(*af));
+				if (grp) {
+					scaled_add(af + sl->n0, fo, sl->sc,
+						   sl->job.mm.n);
+				} else {
+					for (unsigned q = 0; q < sl->job.mm.n; q++)
+						af[sl->n0 + q] += fo[q];
+				}
+				nxt[ni]++;
+				prog = 1;
+				if (nxt[ni] < ks)
+					continue;
+				left--;
+				if (!grp)
+					for (unsigned q = sl->n0;
+					     q < sl->n0 + sl->job.mm.n; q++)
+						y[q] = (float)(((double)g->accf[q]
+							+ hs) * e->t->scale[q]);
+			}
+		}
+		if (!left || prog)
+			continue;
+		for (unsigned d = 0; d < g->ndev; d++)
+			if ((sent & (1u << d)) && !(fenced & (1u << d)) &&
+			    !charsiu_bo_poll(g->dev[d], &e->out[d])) {
+				fenced |= 1u << d;
+				ed_fence[d]++;
+			}
+		if (!drained)
+			drained = ed_step(16384);
+		if (now_us() - t0 > 2e6) {
+			for (unsigned d = 0; d < g->ndev; d++)
+				if ((sent & (1u << d)) && !(fenced & (1u << d))) {
+					if (charsiu_bo_prep(g->dev[d], &e->out[d],
+							    2000000000))
+						return -1;
+					fenced |= 1u << d;
+				}
+		}
+	}
+	for (unsigned d = 0; d < g->ndev; d++)
+		if ((sent & (1u << d)) && !(fenced & (1u << d)))
+			ed_early[d]++;
+	e->armed = 0;
+	return 0;
+}
+
+/* every entry armed on every device the call sends to */
+static int ed_ready(const struct charsiu_npu *g, const int *ids, unsigned n,
+		    unsigned sent)
+{
+	if (!early_done_on() || callprof() > 0)
+		return 0;
+	for (unsigned i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+		unsigned need = 0;
+
+		if (!ed_entry_ok(g, e))
+			return 0;
+		for (unsigned j = 0; j < e->count; j++)
+			need |= 1u << g->slot[e->first + j].di;
+		if ((e->armed & need) != need || (need & ~sent))
+			return 0;
+	}
+	return 1;
+}
+
 int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		       const struct charsiu_act *a, float *y)
 {
@@ -4258,6 +5118,10 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	const int32_t *out;
 	unsigned nh = 0, i;
 	double t0, tpack, tcall = now_us();
+	double cp_s0[2] = { 0, 0 }, cp_s1[2] = { 0, 0 }, cp_d[2] = { 0, 0 };
+	double cp_mb[2] = { 0, 0 }, tpacked = 0.0;
+	unsigned cp_nt[2] = { 0, 0 };
+	int big_done = 0;
 	float *af;
 
 	if (alt_id(g, id))
@@ -4288,11 +5152,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 */
 	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
+	uint64_t kneed = pack_needed_on() ? kmask_for(g, e, d) : ~0ull;
+
+	if (!kneed)
+		continue;               /* no task of this tensor on d */
 	if (g->inprep)
 		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
+		if (ki < 64 && !(kneed & (1ull << ki)))
+			continue;
 		if (w4_for(g, e->t)) {
 			const float *src = a->f + s->k0;
 			const float *ks = e->t->kscale;
@@ -4347,12 +5217,13 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev[d], &g->in[d]);
+	in_flush(g, d, kneed, e->k_slices);
 	g->infini_b += g->in[d].size;
 	g->inneed_b += (uint64_t)e->k_slices * g->in_stride;
 	g->infini_n++;
 	}
-	g->pack_us += now_us() - tpack;
+	tpacked = now_us();
+	g->pack_us += tpacked - tpack;
 	/*
 	 * WHICH DEVICES WERE ACTUALLY GIVEN WORK, because the sync below
 	 * used to ask both regardless.
@@ -4394,6 +5265,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * slices of this tensor alternate between the devices, so a projection
 	 * that is not part of a group still uses both cores.
 	 */
+	if (callprof() == 2)
+		cp_fill(g, &id, 1);
 	t0 = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0;
@@ -4408,12 +5281,18 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			g->tasks[nt].regcmd = (uint32_t)s->regcmd.dma_address;
 			g->tasks[nt].regcmd_count = s->nreg;
 			nt++;
-			g->handles[nh++] = s->wt.handle;
-			g->handles[nh++] = s->coef.handle;
+			if (!lean_handles_on()) {
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+			}
+			cp_mb[d] += slice_mb(w4_for(g, e->t), s->job.mm.k,
+					     s->job.mm.n);
 		}
 		if (!nt)
 			continue;
 		sent |= 1u << d;
+		cp_nt[d] = nt;
+		cp_s0[d] = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
@@ -4424,6 +5303,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			g->strikes = 3;
 			break;
 		}
+		cp_s1[d] = now_us();
 		g->submits++;
 	}
 	g->submit_us += now_us() - t0;
@@ -4447,6 +5327,30 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	if (g->strikes < 3) {
 		double t1 = now_us();
 
+		if (callprof() > 0) {
+			struct charsiu_bo *cpb[2] = { &e->out[0], &e->out[1] };
+
+			if (callprof() == 2)
+				cp_wait2(g, sent, cpb, cp_d);
+			else
+				cp_wait(g, sent, cpb, cp_d);
+		}
+		if (ed_ready(g, &id, 1, sent)) {
+			if (e->t->n > early_done_maxn()) {
+				if (ed_big(g, id, y, sent))
+					g->strikes = 3;
+				else
+					big_done = 1;
+			} else if (ed_wait(g, &id, 1, sent)) {
+				g->strikes = 3;
+			}
+		} else {
+		if (early_done_on()) {
+			ed_drop(g, &id, 1);
+			e->armed = 0;
+			ed_plain++;
+			ed_step(65536);
+		}
 		for (unsigned d = 0; d < g->ndev; d++)
 			if (sent & (1u << d)) {
 				charsiu_bo_prep(g->dev[d], &e->out[d],
@@ -4454,6 +5358,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				g->outprep_b += e->out[d].size;
 				g->outprep_n++;
 			}
+		}
 		/* and what the same slots would need at their own widths */
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s_ = &g->slot[e->first + i];
@@ -4464,6 +5369,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
+		cp_tprep = t1;
 		int grp = tensor_grouped(g, e->t);
 
 		/*
@@ -4479,6 +5385,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		 * written for no reason.
 		 */
 		af = (w4_for(g, e->t) && grp && !g->plain) ? y : g->accf;
+		if (big_done)
+			goto gathered;
 		/* the hardware's rows only: the CPU's are already written */
 		if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
@@ -4521,6 +5429,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
+gathered:
 		g->copy_us += now_us() - t1;
 		t1 = now_us();
 		/* the same mask: a buffer nobody prepped must not be finied,
@@ -4602,11 +5511,16 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * returns sum_k code(n,k) * a(k) in float and only the weight scale is
 	 * left. int8 took a->q1 and needs both.
 	 */
+	if (callprof() > 0)
+		cp_record(e->t->name, tcall, tpacked, cp_s0, cp_s1, cp_d, sent,
+			  cp_nt, cp_mb, now_us());
+	if (early_done_on())
+		ed_queue(g, id);
 	{
 		int grp = tensor_grouped(g, e->t);
 		double hs = 0.0;
 
-		if (w4_for(g, e->t) && grp && !g->plain) {
+		if ((w4_for(g, e->t) && grp && !g->plain) || big_done) {
 			g->call_us += now_us() - tcall;
 			charsiu_note("something outside the NPU code", 0, 0);
 	return 0;              /* it was summed into y */
@@ -4627,6 +5541,237 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
 	}
 	g->call_us += now_us() - tcall;
+	charsiu_note("something outside the NPU code", 0, 0);
+	return 0;
+}
+
+/*
+ * ---- ONE PROJECTION IN TWO PARTS, EACH PART ONE CORE'S K SLICES ----
+ *
+ * The callprof table says what a decode layer spends between attention and
+ * its output projection: attention is 220-260 us of CPU with both cores
+ * idle, and then o proj is a 0.52 MB job on EACH core (K = 2048 at KMAX 1024
+ * is two K slices, dealt one to a core) that cannot start until the last head
+ * is written. But the first K slice only reads the first half of the heads.
+ *
+ * So this splits the call where the deal already split it: when every K
+ * slice lives on one device and each device's slices are one contiguous run
+ * of K, part 0 is the first device's run and part 1 the second's. The caller
+ * finishes the heads part 0 reads, hands them over with charsiu_npu_part_go,
+ * and that core streams its weights while the CPU computes the rest of the
+ * heads; part 1 goes when they are done, and charsiu_npu_part_end waits and
+ * sums.
+ *
+ * NOTHING ABOUT THE ARITHMETIC MOVES. Each device reads exactly the slices
+ * of the activation it read before, packed by the same packer at the same
+ * offsets; the jobs are the same register streams; and the gather below is
+ * the gather in charsiu_npu_matvec, slot by slot in the same order into the
+ * same zeroed accumulator, so every output element is summed over its K
+ * slices in m1 order exactly as before. Only WHEN each core starts changes.
+ *
+ * Narrow on purpose: int4, grouped scales, no CPU rows, no midrise/plain
+ * controls, one main device (no alt). Anything else answers 0 from
+ * charsiu_npu_kparts and the caller takes the ordinary call.
+ *
+ * AND IT BUYS NOTHING, MEASURED. CM5, Qwen3-0.6B, two rounds: attention
+ * 6.6 -> 8.6 ms a token and o proj 5.3 -> 3.2, the sum unchanged to 0.1 ms.
+ * Only part 0's core is hidden behind the second half of the heads; part 1
+ * still starts after the last head with its whole job latency ahead of it,
+ * and the extra pack, submit and second fan-out of the heads eat what part 0
+ * saved. CHARSIU_NPU_WO_PARTS stays off; it is the instrument, not a win.
+ */
+static struct {
+	int id;                 /* the entry in flight, -1 when none */
+	unsigned sent;          /* devices submitted */
+	unsigned dev[2];        /* the device of part 0 and of part 1 */
+	unsigned kcut;          /* the first K slice of part 1 */
+	double tcall, t0;
+} kp = { -1, 0, { 0, 0 }, 0, 0.0, 0.0 };
+
+int charsiu_npu_kparts(const struct charsiu_npu *g, int id, unsigned *kcol)
+{
+	const struct npu_entry *e;
+	unsigned ki, ni, cut = 0, d0;
+
+	if (!g || g->dead || g->ndev != 2 || id < 0 || alt_id(g, id) ||
+	    (unsigned)id >= g->n_ent)
+		return 0;
+	e = &g->ent[id];
+	if (!w4_for(g, e->t) || !tensor_grouped(g, e->t) || g->plain ||
+	    g->midrise || e->cq || e->t->kscale || e->k_slices < 2 ||
+	    e->n_npu != (unsigned)e->t->n ||
+	    e->count != e->k_slices * e->n_slices)
+		return 0;
+	d0 = g->slot[e->first].di;
+	for (ki = 0; ki < e->k_slices; ki++) {
+		unsigned dk = g->slot[e->first + ki * e->n_slices].di;
+
+		for (ni = 1; ni < e->n_slices; ni++)
+			if (g->slot[e->first + ki * e->n_slices + ni].di != dk)
+				return 0;   /* a K slice split across cores */
+		if (dk != d0 && !cut)
+			cut = ki;
+		if (cut && dk == d0)
+			return 0;           /* not one run a device */
+	}
+	if (!cut)
+		return 0;                   /* all on one core */
+	if (kcol)
+		*kcol = g->slot[e->first + cut * e->n_slices].k0;
+	return 1;
+}
+
+int charsiu_npu_part_go(struct charsiu_npu *g, int id,
+			const struct charsiu_act *a, unsigned part)
+{
+	struct npu_entry *e;
+	struct charsiu_joblist jl;
+	unsigned d, ki, k_lo, k_hi, nt = 0, nh = 0, i;
+	double tpack;
+
+	if (part == 0) {
+		unsigned kc;
+
+		if (kp.id >= 0 || !charsiu_npu_kparts(g, id, &kc))
+			return -1;
+		e = &g->ent[id];
+		if (early_done_on())
+			ed_drop(g, &id, 1);
+		kp.id = id;
+		kp.sent = 0;
+		kp.dev[0] = g->slot[e->first].di;
+		kp.dev[1] = kp.dev[0] ^ 1u;
+		for (ki = 0; ki < e->k_slices; ki++)
+			if (g->slot[e->first + ki * e->n_slices].k0 == kc)
+				break;
+		kp.kcut = ki;
+		kp.tcall = now_us();
+	} else if (part != 1 || kp.id != id) {
+		return -1;
+	}
+	e = &g->ent[id];
+	if (g->dead || (unsigned)a->n != e->t->k)
+		return -1;
+	d = kp.dev[part];
+	k_lo = part ? kp.kcut : 0;
+	k_hi = part ? e->k_slices : kp.kcut;
+
+	charsiu_note("a projection part: packing", (unsigned long)id,
+		     (unsigned long)part);
+	tpack = now_us();
+	if (g->inprep)
+		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
+	for (ki = k_lo; ki < k_hi; ki++) {
+		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
+
+		charsiu_pack_input_f16(&s->job.mm, a->f + s->k0,
+				       (uint8_t *)g->in[d].map
+				       + ki * g->in_stride, g->in_stride);
+	}
+	{
+		uint64_t km = 0;
+
+		for (ki = k_lo; ki < k_hi && ki < 64; ki++)
+			km |= 1ull << ki;
+		in_flush(g, d, e->k_slices <= 64 ? km : ~0ull, e->k_slices);
+	}
+	g->infini_b += g->in[d].size;
+	g->inneed_b += (uint64_t)(k_hi - k_lo) * g->in_stride;
+	g->infini_n++;
+	g->pack_us += now_us() - tpack;
+
+	g->handles[nh++] = g->in[d].handle;
+	for (i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+
+		if (s->di != d)
+			continue;
+		g->tasks[nt].regcmd = (uint32_t)s->regcmd.dma_address;
+		g->tasks[nt].regcmd_count = s->nreg;
+		nt++;
+		if (!lean_handles_on()) {
+			g->handles[nh++] = s->wt.handle;
+			g->handles[nh++] = s->coef.handle;
+		}
+	}
+	jl.tasks = g->tasks;
+	jl.task_count = nt;
+	jl.in_handles = g->handles;
+	jl.in_count = nh;
+	jl.out_handles = &e->out[d].handle;
+	jl.out_count = 1;
+	tpack = now_us();
+	if (part == 0)
+		kp.t0 = tpack;
+	if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+		g->strikes = 3;
+		return -1;
+	}
+	g->submit_us += now_us() - tpack;
+	g->submits++;
+	kp.sent |= 1u << d;
+	return 0;
+}
+
+int charsiu_npu_part_end(struct charsiu_npu *g, int id, float *y)
+{
+	struct npu_entry *e;
+	unsigned sent = kp.sent, i;
+	int ok;
+	double t1, took;
+
+	if (kp.id != id || id < 0)
+		return -1;
+	e = &g->ent[id];
+	kp.id = -1;
+	kp.sent = 0;
+	e->armed = 0;           /* the device has written over any sentinel */
+	ok = sent == 3u && g->strikes < 3;
+
+	/* WAIT FOR WHATEVER WENT, even on failure: the input buffers are
+	 * about to be rewritten by the fallback */
+	t1 = now_us();
+	for (unsigned d = 0; d < g->ndev; d++)
+		if (sent & (1u << d)) {
+			if (charsiu_bo_prep(g->dev[d], &e->out[d], 2000000000))
+				ok = 0;
+			g->outprep_b += e->out[d].size;
+			g->outprep_n++;
+		}
+	g->fence_us += now_us() - t1;
+	if (!ok) {
+		if (g->strikes >= 3 && !g->dead) {
+			g->dead = 1;
+			fprintf(stderr, "charsiu: the NPU stopped answering on a "
+				"projection in parts (K=%u N=%u); everything from "
+				"here runs on the CPU\n", (unsigned)e->t->k,
+				(unsigned)e->t->n);
+		}
+		return -1;
+	}
+
+	/* the gather of charsiu_npu_matvec's grouped int4 branch, verbatim */
+	t1 = now_us();
+	memset(y, 0, (size_t)e->n_npu * sizeof(*y));
+	for (i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+		const float *fo = (const float *)((const uint8_t *)
+				  e->out[s->di].map + s->out_slot * e->out_stride);
+
+		scaled_add(y + s->n0, fo, s->sc, s->job.mm.n);
+	}
+	g->copy_us += now_us() - t1;
+	if (!g->nofini)
+		for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_fini(g->dev[d], &e->out[d]);
+	g->weight_mb += e->weight_mb;
+	took = now_us() - kp.t0;
+	g->busy_us += took;
+	g->mv_busy_us += took;
+	account_call(g, &id, 1, took);
+	g->strikes = 0;
+	g->call_us += now_us() - kp.tcall;
+	g->kparts_calls++;
 	charsiu_note("something outside the NPU code", 0, 0);
 	return 0;
 }
@@ -9802,6 +10947,10 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	uint32_t outh[8];
 	unsigned nh = 0, ntask = 0, i, j;
 	double t0, t1, tpack, fspent = 0.0, tcall = now_us();
+	double cp_s0[2] = { 0, 0 }, cp_s1[2] = { 0, 0 }, cp_d[2] = { 0, 0 };
+	double cp_mb[2] = { 0, 0 }, tpacked = 0.0;
+	unsigned cp_nt[2] = { 0, 0 }, cp_sent = 0;
+	struct charsiu_bo *cpb[2] = { NULL, NULL };
 
 	if (alt_ids(g, ids, n)) {
 		int aids[8];
@@ -9881,6 +11030,15 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 
 	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
+		uint64_t kneed = ~0ull;
+
+		if (pack_needed_on()) {
+			kneed = 0;
+			for (unsigned gi = 0; gi < n; gi++)
+				kneed |= kmask_for(g, &g->ent[ids[gi]], d);
+			if (!kneed)
+				continue;
+		}
 		nd++;
 	charsiu_note("a group: packing the activation", (unsigned long)d,
 		     (unsigned long)e0->k_slices);
@@ -9888,6 +11046,9 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
+
+		if (ki < 64 && !(kneed & (1ull << ki)))
+			continue;
 
 		if (w4_for(g, e0->t)) {
 			const float *src = a->f + s->k0;
@@ -9928,9 +11089,10 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev[d], &g->in[d]);
+	in_flush(g, d, kneed, e0->k_slices);
 	}
-	g->pack_us += now_us() - tpack;
+	tpacked = now_us();
+	g->pack_us += tpacked - tpack;
 	(void)nd;
 	}
 
@@ -9946,8 +11108,42 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	 * the only place in the decode where a second core can be worth
 	 * anything.
 	 */
+	if (callprof() == 2)
+		cp_fill(g, ids, n);
+	/*
+	 * CHARSIU_NPU_SUBMIT_ORDER (default on, =0 the control): the core
+	 * with more to do goes first. The
+	 * second submit starts its core about 10 us after the first, and on
+	 * Qwen3-0.6B's q/k/v it is core 1 that carries two tasks (k and v)
+	 * against core 0's one (q) -- so the call waited on the late starter.
+	 * Which core starts first changes nothing either core computes.
+	 * Measured +0.4..1.3% decode in three paired rounds, every pair the
+	 * same sign -- inside the arm's own 3% spread, so it is on because it
+	 * cannot be worse, not because it is proven better.
+	 */
+	unsigned sorder[2] = { 0, 1 };
+
+	if (g->ndev == 2 && submit_order_on()) {
+		double c[2] = { 0.0, 0.0 };
+
+		for (i = 0; i < n; i++) {
+			const struct npu_entry *e = &g->ent[ids[i]];
+
+			for (j = 0; j < e->count; j++) {
+				const struct npu_slot *sl = &g->slot[e->first + j];
+
+				c[sl->di] += 25.0 + 115.0 * slice_mb(w4_for(g, e->t),
+						sl->job.mm.k, sl->job.mm.n);
+			}
+		}
+		if (c[1] > c[0]) {
+			sorder[0] = 1;
+			sorder[1] = 0;
+		}
+	}
 	t0 = now_us();
-	for (unsigned d = 0; d < g->ndev; d++) {
+	for (unsigned dd = 0; dd < g->ndev; dd++) {
+		unsigned d = g->ndev == 2 ? sorder[dd] : dd;
 		unsigned no = 0;
 
 		charsiu_note("a group: building the joblist", (unsigned long)d,
@@ -9974,15 +11170,25 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					(uint32_t)s->regcmd.dma_address;
 				g->tasks[ntask].regcmd_count = s->nreg;
 				ntask++;
-				g->handles[nh++] = s->wt.handle;
-				g->handles[nh++] = s->coef.handle;
+				if (!lean_handles_on()) {
+					g->handles[nh++] = s->wt.handle;
+					g->handles[nh++] = s->coef.handle;
+				}
+				cp_mb[d] += slice_mb(w4_for(g, e->t),
+						     s->job.mm.k, s->job.mm.n);
 				any = 1;
 			}
-			if (any)
+			if (any) {
+				if (!cpb[d])
+					cpb[d] = &e->out[d];
 				outh[no++] = e->out[d].handle;
+			}
 		}
 		if (!no)
 			continue;
+		cp_sent |= 1u << d;
+		cp_nt[d] = ntask;
+		cp_s0[d] = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = ntask;
 		jl.in_handles = g->handles;
@@ -9998,6 +11204,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				"failed on device %u\n", ntask, d);
 			return -1;
 		}
+		cp_s1[d] = now_us();
 		g->submits++;
 	}
 	g->submit_us += now_us() - t0;
@@ -10031,6 +11238,23 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	}
 
 	t1 = now_us();
+	if (callprof() == 2)
+		cp_wait2(g, cp_sent, cpb, cp_d);
+	else if (callprof() > 0)
+		cp_wait(g, cp_sent, cpb, cp_d);
+	if (ed_ready(g, ids, n, cp_sent)) {
+		if (ed_wait(g, ids, n, cp_sent)) {
+			g->dead = 1;
+			return -1;
+		}
+	} else {
+	if (early_done_on()) {
+		ed_drop(g, ids, n);
+		for (i = 0; i < n; i++)
+			g->ent[ids[i]].armed = 0;
+		ed_plain++;
+		ed_step(65536);
+	}
 	for (i = 0; i < n; i++)
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_note("a group: waiting on the fence",
@@ -10038,9 +11262,11 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			charsiu_bo_prep(g->dev[d], &g->ent[ids[i]].out[d],
 					2000000000);
 		}
+	}
 	g->fence_us += now_us() - t1;
 
 	t1 = now_us();
+	cp_tprep = t1;
 	for (i = 0; i < n; i++) {
 		struct npu_entry *e = &g->ent[ids[i]];
 		const int32_t *out;
@@ -10212,6 +11438,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		account_call(g, ids, n, took);
 	}
 	g->call_us += now_us() - tcall;
+	if (early_done_on())
+		for (i = 0; i < n; i++)
+			ed_queue(g, ids[i]);
+	if (callprof() > 0)
+		cp_record(e0->t->name, tcall, tpacked, cp_s0, cp_s1, cp_d,
+			  cp_sent, cp_nt, cp_mb, now_us());
 	/*
 	 * CLEAR THE BREADCRUMB ON THE WAY OUT, or it outlives the function
 	 * and every crash in the CALLER is reported against the last thing

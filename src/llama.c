@@ -5658,6 +5658,43 @@ static inline int gqa_paired(const struct gqa_q *Q, unsigned i, unsigned nq)
  * attn_dot and attn_axpy, which is not a different answer (see attn_block_heads,
  * which makes the same split).
  */
+/*
+ * CHARSIU_ATTN_PF=N: prefetch the float cache N positions ahead of the K and
+ * V walks of the grouped decode kernel (0, the default, is off). The two
+ * walks are sequential streams, but a single A72 thread reached 3.6 GB/s on
+ * them against 8.6 for a bare reader, and four threads 5.8 against ~11: the
+ * loop is waiting on the line it is about to use. A prefetch reads nothing
+ * the kernel does not read and changes no arithmetic.
+ *
+ * MEASURED SLOWER, so off: 16 positions ahead took Qwen3-0.6B's attention
+ * from 6.27 to 6.92 ms a token in both rounds. The hardware prefetcher was
+ * already on these streams; the software one only adds issue slots.
+ */
+static int attn_pf_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_PF");
+
+		v = e && *e ? atoi(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return v;
+}
+
+static inline void attn_pf(const float *base, size_t ks, int t0, int nt,
+			   int tmax, uint32_t hd)
+{
+	for (int t = t0; t < t0 + nt && t <= tmax; t++) {
+		const char *p = (const char *)(base + (size_t)t * ks);
+
+		for (uint32_t o = 0; o < hd * 4u; o += 64)
+			__builtin_prefetch(p + o, 0, 3);
+	}
+}
+
 static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
 			   const float *kf, const float *vf,
 			   const uint16_t *kh, const uint16_t *vh, size_t ks,
@@ -5675,6 +5712,7 @@ static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
 	 * the float kernels on it. Either way is exact; this is only cost.
 	 */
 	int inreg = nq <= 2;
+	int pf = kf ? attn_pf_rows() : 0;
 
 	for (i = 1; i < nq; i++) {
 		if (Q[i].tlo < tmin)
@@ -5683,11 +5721,16 @@ static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
 			tmax = Q[i].pos;
 	}
 
+	if (pf)
+		attn_pf(kf, ks, tmin, pf, tmax, hd);
 	for (int t = tmin; t <= tmax; t += 4) {
 		int nt = tmax - t + 1 < 4 ? tmax - t + 1 : 4;
 		const uint16_t *kb = kh ? kh + (size_t)t * ks : NULL;
 		const float *k[4];
 		int r, conv = 0;
+
+		if (pf)
+			attn_pf(kf, ks, t + pf, 4, tmax, hd);
 
 		if (kb && !inreg) {
 			for (r = 0; r < nt; r++)
@@ -5746,6 +5789,8 @@ static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
 		}
 	}
 
+	if (pf && vf)
+		attn_pf(vf, ks, tmin, pf, tmax, hd);
 	for (i = 0; i < nq; i++) {
 		softmax(Q[i].sc + Q[i].tlo, Q[i].pos + 1 - Q[i].tlo);
 		memset(Q[i].out, 0, hd * sizeof(float));
@@ -5757,6 +5802,9 @@ static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
 		const float *v = vf ? vf + (size_t)t * ks : buf;
 		size_t vs = vf ? ks : hd;
 		int r, conv = 0;
+
+		if (pf && vf)
+			attn_pf(vf, ks, t + pf, 8, tmax, hd);
 
 		if (vb && !inreg) {
 			for (r = 0; r < nt; r++)
@@ -11271,6 +11319,80 @@ int llama_verify_batch_argmax(struct llama_state *s,
  * the next real token into the previous picture, which is a fluent answer about
  * nothing that was asked.
  */
+/*
+ * ---- THE OUTPUT PROJECTION STARTS WHILE ATTENTION IS STILL RUNNING ----
+ *
+ * CHARSIU_NPU_WO_PARTS. charsiu_npu_kparts in npudev.c is the hardware half;
+ * this is where the heads are split to match it. o proj's first K slice reads
+ * the first heads' outputs and nothing else, so once those heads are done
+ * their core can stream its half of the weights while the CPU finishes the
+ * rest. Per head the attention is the same kernel on the same range of
+ * positions, and per output element the gather is the same, so the tokens
+ * and the logits do not move; only the order in which independent work
+ * starts does.
+ *
+ * Off, and measured as no gain: see charsiu_npu_kparts.
+ */
+static int wo_parts_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_WO_PARTS", 0);
+	return v;
+}
+
+/* the npu id of wo when the call can go in two parts, and the first head of
+ * part 1; -1 when it cannot. Expects s->act already set from s->xb. */
+static int wo_parts_id(struct llama_state *s, const struct llama_layer *L,
+		       uint32_t nhead, uint32_t hd, uint32_t gqa,
+		       uint32_t *hsplit)
+{
+	const struct gguf_tensor *w = L->wo;
+	unsigned kcol = 0;
+	int id;
+
+	if (!wo_parts_on() || !w || !s->pool.dev || !s->act.npu_ok ||
+	    (uint64_t)nhead * hd != w->ne[0])
+		return -1;
+	if (!npu_call_worth((uint64_t)w->ne[0] * (uint64_t)w->ne[1], w->name))
+		return -1;
+	id = npu_id_for(s, w);
+	if (id < 0 || charsiu_npu_needs_q1_id(s->pool.dev, id) ||
+	    !charsiu_npu_kparts(s->pool.dev, id, &kcol))
+		return -1;
+	if (!kcol || kcol % hd || (kcol / hd) % gqa || kcol / hd >= nhead)
+		return -1;
+	*hsplit = kcol / hd;
+	return id;
+}
+
+struct attn_off {
+	void (*fn)(void *, uint64_t, uint64_t);
+	void *aj;
+	uint64_t base;
+};
+
+static void attn_off_fn(void *c, uint64_t h0, uint64_t nh)
+{
+	const struct attn_off *o = c;
+
+	o->fn(o->aj, o->base + h0, nh);
+}
+
+/* heads [h0, h1) through fn, on the pool when the position says so */
+static void attn_range(void (*fn)(void *, uint64_t, uint64_t), void *aj,
+		       uint64_t h0, uint64_t h1, int pos, unsigned grain)
+{
+	if (attn_pool_for(pos)) {
+		struct attn_off o = { fn, aj, h0 };
+
+		pool_run(attn_off_fn, &o, h1 - h0, grain);
+	} else {
+		fn(aj, h0, h1 - h0);
+	}
+}
+
 const float *llama_forward_embd(struct llama_state *s, const float *embd,
 				int pos)
 {
@@ -11445,6 +11567,8 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 */
 		int tlo = swa && pos + 1 > (int)m->n_swa ?
 			  pos + 1 - (int)m->n_swa : 0;
+		int wo_id = -1;
+		uint32_t wo_split = 0;
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 		STAGE(ST_NORM1);
@@ -11639,11 +11763,30 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				attn_gqa_on() && hd <= GQA_HDMAX
 				? attn_gqa_heads : attn_heads;
 
-			if (attn_pool_for(pos)) {
+			unsigned grain = fn == attn_heads ? 1 : gqa;
+
+			act_set_timed(&s->act, s->xb, (int)L->wo->ne[0]);
+			wo_id = wo_parts_id(s, L, m->n_head, hd, gqa,
+					    &wo_split);
+			if (wo_id >= 0) {
+				charsiu_note("attention: the heads o proj's first"
+					     " part reads", cur_layer,
+					     (unsigned long)wo_split);
+				attn_range(fn, &aj, 0, wo_split, pos, grain);
+				if (!charsiu_npu_part_go(s->pool.dev, wo_id,
+							 &s->act, 0)) {
+					attn_range(fn, &aj, wo_split, m->n_head,
+						   pos, grain);
+					charsiu_npu_part_go(s->pool.dev, wo_id,
+							    &s->act, 1);
+				} else {
+					attn_range(fn, &aj, wo_split, m->n_head,
+						   pos, grain);
+				}
+			} else if (attn_pool_for(pos)) {
 				charsiu_note("attention over the pool",
 					     cur_layer, (unsigned long)g_pool.n);
-				pool_run(fn, &aj, m->n_head,
-					 fn == attn_heads ? 1 : gqa);
+				pool_run(fn, &aj, m->n_head, grain);
 			} else {
 				fn(&aj, 0, m->n_head);
 			}
@@ -11653,7 +11796,10 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 		STAGE(ST_ATTN);
 
-		matvec(s, L->wo, s->xb, s->xb2);
+		/* a failed part leaves the ordinary call to do the work */
+		if (wo_id < 0 ||
+		    charsiu_npu_part_end(s->pool.dev, wo_id, s->xb2))
+			matvec(s, L->wo, s->xb, s->xb2);
 		STAGE(ST_WO);
 		/*
 		 * ON THE BRANCH, BEFORE THE RESIDUAL ADD. Normalising after
