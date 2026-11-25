@@ -684,6 +684,11 @@ struct charsiu_npu {
 	int packpool;
 	unsigned packpool_min;
 	unsigned long bpack_pooled, bpack_serial;
+	/* CHARSIU_NPU_PACK2: the K slices each device was packed with in THIS
+	 * call (bit ki), so the second device copies the first one's bytes
+	 * instead of packing X again; and how many slices went each way */
+	uint32_t bpk_mask[2];
+	unsigned long bpack_copied, bpack_direct;
 	int readfuse;
 	/* CHARSIU_NPU_GATHER_OLD=1: the batched gather in device order again,
 	 * the timing control for the K order one. See npu_entry.gmix. */
@@ -2964,6 +2969,11 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				g->packpool == 1 ? "CHARSIU_NPU_PACK_POOL=1, always" :
 				g->packpool == 0 ? "CHARSIU_NPU_PACK_POOL=0, never" :
 				"pooled from CHARSIU_NPU_PACK_POOL_MIN groups");
+		if (g->bpack_copied + g->bpack_direct)
+			fprintf(stderr, "charsiu NPU: pack2: %lu slices copied"
+				" from the other device's object, %lu packed"
+				" straight out of X with no gather\n",
+				g->bpack_copied, g->bpack_direct);
 		if (g->bread_pooled + g->bread_serial)
 			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
 				" and %lu one thread (%s)\n",
@@ -5770,6 +5780,98 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+/*
+ * CHARSIU_NPU_PACK2, THE SECOND ACTIVATION PACK. Default on; =0 is the pack
+ * exactly as it was. The three parts have their own controls so one binary
+ * can price each in one session (the board drifts between sessions):
+ *
+ *   CHARSIU_NPU_PACK2_COPY=0    the second device packs X again
+ *   CHARSIU_NPU_PACK2_DIRECT=0  a cut tensor's slice is gathered into bscr
+ *   CHARSIU_NPU_PACK2_ROWS=0    the pool splits the packer by groups
+ *
+ * Every one of them writes the same bytes into the input object; see
+ * batch_pack_slice and tests/pack2.c.
+ *
+ * WHY THE OLD PACK MOVED 0.3 GB/s. Not the ioctls and not the pool: on the
+ * CM5's A72 the integer fp16 converter alone tops out at 1.34 GB/s of halves
+ * from a hot cache on one core, the group order read m rows a page apart for
+ * every eight floats, and a cut tensor's slice was first copied into bscr and
+ * read back. Qwen3-0.6B, 124 rows in one chunk, CHARSIU_STAGES ms a row,
+ * three interleaved runs:
+ *
+ *   arm              gather   packer   pack (with emit, fini)
+ *   final6           0.20     0.69-0.71   1.08-1.13
+ *   PACK2=0          0.21     0.66-0.71   1.06-1.12
+ *   PACK2            0.00     0.44-0.46   0.63-0.69
+ *   PACK2_COPY=0     0.00     0.48-0.49   0.64-0.67
+ *
+ * The copy is the smallest part: with the cores overlapped most K slices
+ * live on one device only (227 of 787 slices were copies).
+ */
+static int pack2_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PACK2", 1);
+	return v;
+}
+
+static int pack2_copy(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = pack2_on() ? charsiu_env_flag("CHARSIU_NPU_PACK2_COPY", 1)
+			       : 0;
+	return v;
+}
+
+static int pack2_direct(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = pack2_on() ? charsiu_env_flag("CHARSIU_NPU_PACK2_DIRECT", 1)
+			       : 0;
+	return v;
+}
+
+static int pack2_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = pack2_on() ? charsiu_env_flag("CHARSIU_NPU_PACK2_ROWS", 1)
+			       : 0;
+	return v;
+}
+
+/* a new call: no device holds this call's X yet */
+static void pack2_call_reset(struct charsiu_npu *g)
+{
+	g->bpk_mask[0] = g->bpk_mask[1] = 0;
+}
+
+struct pack_copy_job {
+	const uint8_t *src;
+	uint8_t *dst;
+	size_t n;
+};
+
+#define PACK_COPY_CHUNK 16384
+
+static void pack_copy_worker(void *ctx, uint64_t c0, uint64_t nc)
+{
+	const struct pack_copy_job *j = ctx;
+	size_t a = (size_t)c0 * PACK_COPY_CHUNK;
+	size_t b = (size_t)(c0 + nc) * PACK_COPY_CHUNK;
+
+	if (b > j->n)
+		b = j->n;
+	memcpy(j->dst + a, j->src + a, b - a);
+}
+
 struct pack_groups_job {
 	const struct charsiu_matmul *mm;
 	const float *src;
@@ -5900,6 +6002,14 @@ static void qpack_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+static void pack_rows_worker(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct pack_groups_job *j = ctx;
+
+	charsiu_pack_input_f16_rows(j->mm, j->src, j->stride, j->dst,
+				    (unsigned)r0, (unsigned)nr);
+}
+
 static void pack_f16_pooled(struct charsiu_npu *g,
 			    const struct charsiu_matmul *mm,
 			    const float *src, size_t stride,
@@ -5912,7 +6022,11 @@ static void pack_f16_pooled(struct charsiu_npu *g,
 		struct pack_groups_job pj = { mm, src, stride, dst };
 
 		charsiu_pack_input_f16_edges(mm, src, stride, dst, dst_size);
-		charsiu_parallel_for(pack_groups_worker, &pj, ng);
+		if (pack2_rows())
+			charsiu_parallel_for_grain(pack_rows_worker, &pj,
+						   mm->m, 4);
+		else
+			charsiu_parallel_for(pack_groups_worker, &pj, ng);
 		g->bpack_pooled++;
 		return;
 	}
@@ -6627,8 +6741,66 @@ static void batch_pack_slice(struct charsiu_npu *g, const struct npu_entry *e,
 {
 	unsigned sk = s->job.mm.k;
 	struct charsiu_matmul mm = s->job.mm;
+	uint8_t *dst = (uint8_t *)g->bin[d][bin_idx(g, ki)].map
+		     + bin_off(g, ki);
+	int direct;
 
 	mm.m = m;
+	/*
+	 * THE OTHER DEVICE ALREADY HOLDS THESE BYTES. Both cores read their
+	 * own object, so a K slice both of them compute was packed twice out
+	 * of the same X -- the gather, the convert and the strided read all
+	 * paid a second time for bytes that come out identical. Every byte of
+	 * [0, bin_stride) is a function of (X, m, the slice, ks, zp) alone --
+	 * the data, then the tail memset or the fill -- and all of those are
+	 * fixed for the call (a group shares K slicing and zp, and passes no
+	 * ks), so copying the first object IS packing the second. int8's d1
+	 * is per K slice and was written by the first pack; it is the same
+	 * d1 the second would have computed.
+	 *
+	 * f16 copies only the data and its k % 8 row block and zeroes the rest,
+	 * which is what the edges memset wrote there: a bank sized for a wider
+	 * m than this call's would otherwise copy its zeros.
+	 */
+	if (pack2_copy() && g->ndev == 2 && ki < 32 &&
+	    ((g->bpk_mask[d ^ 1u] >> ki) & 1u)) {
+		double tc = now_us();
+		const uint8_t *src = (const uint8_t *)
+			g->bin[d ^ 1u][bin_idx(g, ki)].map + bin_off(g, ki);
+		size_t n = g->bin_stride, used = n;
+
+		if (w4_for(g, e->t)) {
+			used = (size_t)(sk / 8) * m * 16
+			     + (sk % 8 ? (size_t)m * 16 : 0);
+			if (used > n)
+				used = n;
+		}
+		if (g->packpool && used >= 4 * PACK_COPY_CHUNK) {
+			struct pack_copy_job cj = { src, dst, used };
+
+			charsiu_parallel_for(pack_copy_worker, &cj,
+				(used + PACK_COPY_CHUNK - 1) / PACK_COPY_CHUNK);
+		} else {
+			memcpy(dst, src, used);
+		}
+		if (n > used)
+			memset(dst + used, 0, n - used);
+		g->bpk_mask[d] |= 1u << ki;
+		g->bpack_copied++;
+		g->bpackcall_us += now_us() - tc;
+		return;
+	}
+	/*
+	 * AND A CUT TENSOR'S SLICE IS PACKED STRAIGHT OUT OF X. The gather
+	 * below copied columns [k0, k0 + sk) of every row into bscr so the
+	 * packer read rows sk apart; the rows packer walks four rows from k0
+	 * to the end, which is the same four sequential streams whatever the
+	 * row stride is, so the copy buys nothing it reads. Same floats, so
+	 * the same halves. Not with AWQ (ks): the scaled copy has to live
+	 * somewhere, and that is the gather's other job.
+	 */
+	direct = pack2_direct() && pack2_rows() && w4_for(g, e->t) && !ks &&
+		 !pack_gather() && sk != e->t->k;
 	/*
 	 * PACK OUT OF X ONLY WHEN THE SLICE IS THE WHOLE
 	 * ROW, AND THE BOARD IS WHY.
@@ -6678,7 +6850,8 @@ static void batch_pack_slice(struct charsiu_npu *g, const struct npu_entry *e,
 	 * through, so the factor goes on as the columns are
 	 * copied rather than in a pass of its own.
 	 */
-	if (!w4_for(g, e->t) || sk != e->t->k || pack_gather() || ks) {
+	if (!direct &&
+	    (!w4_for(g, e->t) || sk != e->t->k || pack_gather() || ks)) {
 		double tg = now_us();
 
 		for (unsigned r = 0; r < m; r++) {
@@ -6762,10 +6935,12 @@ static void batch_pack_slice(struct charsiu_npu *g, const struct npu_entry *e,
 			else
 				qpack_rows(&qj, 0, m);
 		}
-		charsiu_pack_input(&mm, g->bq,
-				   (uint8_t *)g->bin[d][bin_idx(g, ki)].map
-				   + bin_off(g, ki),
+		charsiu_pack_input(&mm, g->bq, dst,
 				   g->bin_stride, s->job.input_zero_point);
+	} else if (direct) {
+		pack_f16_pooled(g, &mm, X + s->k0, e->t->k, dst,
+				g->bin_stride);
+		g->bpack_direct++;
 	} else if (sk == e->t->k && !pack_gather() && !ks) {
 		/* the slice is the whole row, so k0 is 0.
 		 * !ks BECAUSE THIS IS NO LONGER THE
@@ -6784,6 +6959,8 @@ static void batch_pack_slice(struct charsiu_npu *g, const struct npu_entry *e,
 				g->bin_stride);
 	}
 	g->bpackcall_us += now_us() - tpc;
+	if (ki < 32)
+		g->bpk_mask[d] |= 1u << ki;
 }
 
 /*
@@ -7288,6 +7465,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	const int pipe = mm_pipe_for(g, m);
 	int fly = -1;
 	unsigned fenced = 0, readd = 0;
+
+	pack2_call_reset(g);
 
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
@@ -8113,6 +8292,7 @@ static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
 	pipe = mm_pipe_for(g, m);
 	for (i = 0; i < n; i++)
 		rd[i] = 0;
+	pack2_call_reset(g);
 
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;

@@ -147,6 +147,14 @@ $(BUILD)/vattn_bench: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BU
 $(BUILD)/vattn_bench.aarch64: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
+# CHARSIU_NPU_PACK2 priced on the CPU alone, old pack against new over a whole
+# prompt's slices, in plain memory: runs on the desk and, static, on a board
+$(BUILD)/pack2_bench: tools/pack2_bench.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/pack2_bench.aarch64: tools/pack2_bench.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+
 # CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
 # model's: causal, pooled at the end of text token, its own BPE.
 $(BUILD)/charsiu_clip: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
@@ -365,7 +373,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/attn_tile $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/pack2 $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/attn_tile $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -392,6 +400,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overl
 	./$(BUILD)/fp16_regrow
 	./$(BUILD)/fp16_regrow_fuzz
 	./$(BUILD)/pack_groups
+	./$(BUILD)/pack2
 	./$(BUILD)/axpy8
 	./$(BUILD)/attn_two_thresholds
 	./$(BUILD)/dattn_exact
@@ -487,6 +496,11 @@ $(BUILD)/axpy8: tests/axpy8.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD)/pack_groups: tests/pack_groups.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# CHARSIU_NPU_PACK2's rows split, direct read and device copy against the pack
+# they replace, both devices' whole objects, rows 1..160, the real K
+$(BUILD)/pack2: tests/pack2.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # the group's four buffers are addressed by arithmetic, and arithmetic that
