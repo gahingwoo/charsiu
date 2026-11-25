@@ -361,6 +361,20 @@ static double now(void)
  * kernel, attn_block_heads (the tiles), attn_kv_units. `threads` above one
  * runs them on the pool the way attn_block_cpu does.
  */
+/* busy time inside the kv unit, summed over threads, for the parallel
+ * efficiency: busy / (threads * wall) */
+static long kv_busy_ns;
+
+static void kv_units_timed(void *ctx, uint64_t u0, uint64_t nu)
+{
+	double t0 = now_ms();
+
+	attn_kv_units(ctx, u0, nu);
+	t0 = now_ms() - t0;
+	__atomic_fetch_add((long *)&kv_busy_ns, (long)(t0 * 1e6),
+			   __ATOMIC_RELAXED);
+}
+
 static void bench(int n, int pos0, int threads)
 {
 	const uint32_t nkv = 8, gqa = 2, hd = 128, nh = 16;
@@ -397,11 +411,14 @@ static void bench(int n, int pos0, int threads)
 						      / bj.kv_rows);
 			}
 			memset(battn_ms, 0, sizeof(battn_ms));
+			kv_busy_ns = 0;
 			t0 = now();
 			for (l = 0; l < 28; l++) {
 				if (k == 2) {
 					if (threads > 1)
-						pool_run_chunk(attn_kv_units, &bj,
+						pool_run_chunk(getenv("ATTN_TILE_BUSY")
+							       ? kv_units_timed
+							       : attn_kv_units, &bj,
 							       ku, 1, 1);
 					else
 						attn_kv_units(&bj, 0, ku);
@@ -415,6 +432,10 @@ static void bench(int n, int pos0, int threads)
 				}
 			}
 			t = now() - t0;
+			if (k == 2 && getenv("ATTN_TILE_BUSY"))
+				printf("  kv unit busy %.1f%% of %d x %.1f ms\n",
+				       100.0 * kv_busy_ns / 1e6 / (threads * t),
+				       threads, t);
 			if (t < best[k]) {
 				best[k] = t;
 				memcpy(split[k], battn_ms, sizeof(battn_ms));
@@ -423,13 +444,23 @@ static void bench(int n, int pos0, int threads)
 	printf("attn_tile: Qwen3-0.6B shape, %d rows at %d, %d thread(s), 28 "
 	       "layers, ms a row:", n, pos0, threads);
 	for (k = 0; k < 3; k++)
-		printf("  %s %.3f", name[k], best[k] / n);
-	printf("  (kv unit %.2fx the tiles)\n", best[1] / best[2]);
+		if (best[k] < 1e30)
+			printf("  %s %.3f", name[k], best[k] / n);
+	if (best[1] < 1e30)
+		printf("  (kv unit %.2fx the tiles)", best[1] / best[2]);
+	printf("\n");
 	if (threads <= 1)
 		for (k = 0; k < 3; k++)
-			printf("  %-8s scores %.3f  softmax %.3f  values %.3f "
-			       "ms a row\n", name[k], split[k][0] / n,
-			       split[k][1] / n, split[k][2] / n);
+			if (best[k] < 1e30)
+				printf("  %-8s scores %.3f  softmax %.3f  "
+				       "values %.3f ms a row\n", name[k],
+				       split[k][0] / n, split[k][1] / n,
+				       split[k][2] / n);
+	if (getenv("ATTN_TILE_BENCH_KV")) {
+		free(outs[2]);
+		rig_free(&r);
+		return;
+	}
 	printf("  outputs %s\n",
 	       memcmp(r.ref, r.mine, (size_t)n * nh * hd * sizeof(float))
 	       || memcmp(r.ref, outs[2], (size_t)n * nh * hd * sizeof(float))
