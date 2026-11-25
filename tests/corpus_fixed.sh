@@ -8,7 +8,7 @@
 # is the only reason a number measured last week can be compared with one
 # measured today -- and that holds for exactly as long as the text is the same
 # bytes. An edit here does not fail anything: it silently re-bases every
-# perplexity in docs/lab-notebook.md and the README against a corpus that is no
+# perplexity in the lab notebook (git history) and the README against a corpus that is no
 # longer the one they were measured on.
 #
 # So the hashes are checked rather than trusted, in `make test`, where a diff

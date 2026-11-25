@@ -6,6 +6,8 @@
 # CONTROL -- its smallest dispatch is 1.77 MMAC, so the gate cannot fire, and
 # the refusal line must not print for it.
 set -u
+# the plain loop, by name: charsiu_run speculates by default now (board_clk.sh)
+CHARSIU_SPEC="${CHARSIU_SPEC-0}"; export CHARSIU_SPEC
 BIN="${1:-/opt/charsiu/charsiu_run_minmac}"
 T="${2:-1000000}"
 N="${3:-5}"

@@ -63,7 +63,7 @@
  * The loop above is one position at a time on purpose: it prices the WEIGHTS.
  * But a prompt does not run that way -- llama_prefill_batch takes it in chunks
  * with m > 1, which is a different matmul on different hardware registers, and
- * PLAN.md's whole int4-against-int8 recommendation is about that path. Its
+ * the old PLAN.md's whole int4-against-int8 recommendation is about that path. Its
  * quality had never been measured.
  *
  * --batch runs the same corpus through llama_verify_batch, the all-rows form
@@ -88,10 +88,33 @@
  * this label. The same run without --batch is unaffected.
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "charsiu_llm.h"
+
+
+/*
+ * THE BITS, NOT THE FOUR DECIMALS. "ppl 81.4696" in both modes says the two
+ * paths agree to about 1e-6, and a speculative pass needs more than that: one
+ * last bit of one logit can flip a near tie. So both modes also hash every
+ * scored row's logits, in position order, and print the hash and the nll sum
+ * in %a. The token loop and --batch at any chunk width either print the same
+ * two values or they computed different bits somewhere.
+ */
+static uint64_t logits_fnv(uint64_t h, const float *lg, uint32_t n)
+{
+	const unsigned char *b = (const unsigned char *)lg;
+	size_t i;
+
+	for (i = 0; i < (size_t)n * sizeof(*lg); i++) {
+		h ^= b[i];
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+#define FNV_INIT 0xcbf29ce484222325ULL
 
 int main(int argc, char **argv)
 {
@@ -113,8 +136,9 @@ int main(int argc, char **argv)
 	int32_t *ids = NULL;
 	char *text = NULL;
 	size_t tlen = 0, cap = 0;
-	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0, top1 = 0;
+	int n_ctx = 512, want = 0, n = 0, i, scored = 0, batch = 0, top1 = 0, verify = 0;
 	double nll = 0.0;
+	uint64_t fnv = FNV_INIT;
 	const char *path = NULL, *tfile = NULL;
 	FILE *f;
 
@@ -125,6 +149,10 @@ int main(int argc, char **argv)
 			want = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--batch"))
 			batch = 1;
+		/* --batch with the arithmetic of a speculative pass, which
+		 * keeps attention on the CPU (llama_state.in_verify) */
+		else if (!strcmp(argv[i], "--verify"))
+			batch = verify = 1;
 		/* THE ARGMAX IS ALREADY BEING COMPUTED HERE. The log softmax
 		 * needs the largest logit, so the position it came from is one
 		 * extra assignment, and printing it turns this into a top-1
@@ -142,7 +170,7 @@ int main(int argc, char **argv)
 	}
 	if (!path || !tfile) {
 		fprintf(stderr, "usage: charsiu_ppl MODEL.gguf TEXT [-c ctx]"
-			" [-n tokens] [--batch] [--top1]\n"
+			" [-n tokens] [--batch | --verify] [--top1]\n"
 			"  --top1  print \"prefix_len argmax_id actual_id\" a line,"
 			" so a runtime that\n"
 			"          cannot be asked for logits can be scored against"
@@ -175,6 +203,7 @@ int main(int argc, char **argv)
 
 	st = llama_state_new(&m, n_ctx);
 	if (!st) { fprintf(stderr, "state failed\n"); return 1; }
+	st->in_verify = verify;
 
 	if (batch) {
 		/*
@@ -220,7 +249,12 @@ int main(int argc, char **argv)
 			int w = n - a < chunk ? n - a : chunk;
 			int r;
 
-			if (llama_verify_batch(st, &m, ids + a, w, a, lga)) {
+			/* a perplexity pass is a prompt, not a decode step:
+			 * the same pool mask llama_prefill_batch_keep runs */
+			llama_prefill_scope(w);
+			r = llama_verify_batch(st, &m, ids + a, w, a, lga);
+			llama_prefill_scope(0);
+			if (r) {
 				fprintf(stderr, "batched pass failed at %d\n", a);
 				return 1;
 			}
@@ -228,6 +262,8 @@ int main(int argc, char **argv)
 				const float *lg = lga + (size_t)r * m.n_vocab;
 				float mx = lg[0], sum = 0.0f;
 				uint32_t j;
+
+				fnv = logits_fnv(fnv, lg, m.n_vocab);
 
 				for (j = 1; j < m.n_vocab; j++)
 					if (lg[j] > mx) mx = lg[j];
@@ -242,9 +278,12 @@ int main(int argc, char **argv)
 		}
 		free(lga);
 		fprintf(stderr, "\r%*s\r", 40, "");
+		fprintf(stderr, "charsiu_ppl: logits fnv64 %016llx  nll %a\n",
+			(unsigned long long)fnv, nll);
 		printf("ppl %.4f  over %d scored positions of %d tokens"
-		       "  (%s, --batch in chunks of %d, ceiling %d)\n",
-		       exp(nll / scored), scored, n, path, chunk, cap);
+		       "  (%s, %s in chunks of %d, ceiling %d)\n",
+		       exp(nll / scored), scored, n, path,
+		       verify ? "--verify" : "--batch", chunk, cap);
 		llama_state_free(st);
 		tokenizer_free(tk);
 		llama_free(&m);
@@ -258,6 +297,7 @@ int main(int argc, char **argv)
 		uint32_t j, am = 0;
 
 		if (!lg) { fprintf(stderr, "forward failed at %d\n", i); return 1; }
+		fnv = logits_fnv(fnv, lg, m.n_vocab);
 		/* log softmax, shifted by the max so the exp cannot overflow */
 		for (j = 1; j < m.n_vocab; j++)
 			if (lg[j] > mx) { mx = lg[j]; am = j; }
@@ -275,6 +315,8 @@ int main(int argc, char **argv)
 				exp(nll / scored));
 	}
 	fprintf(stderr, "\r%*s\r", 40, "");
+	fprintf(stderr, "charsiu_ppl: logits fnv64 %016llx  nll %a\n",
+		(unsigned long long)fnv, nll);
 	printf("ppl %.4f  over %d scored positions of %d tokens  (%s)\n",
 	       exp(nll / scored), scored, n, path);
 	llama_state_free(st);

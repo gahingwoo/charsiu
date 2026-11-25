@@ -88,6 +88,68 @@ static long npu_rail_uv(void)
 	return uv;
 }
 
+/*
+ * DEBUGFS IS ROOT'S. Run as a user, the clock read failed, the clock was taken
+ * as 800 MHz, and a CM5 at 594 MHz on 750 mV serialised its two cores: prefill
+ * 18% and speculative decode 20% slower. The NPU nodes' assigned-clock-rates
+ * in the device tree are world readable, and with no devfreq on the NPU they
+ * are the rate the clock runs at. CLK_RKNN_DSU0 is clock 232 of the RK3576 CRU
+ * (dt-bindings/clock/rockchip,rk3576-cru.h); find it among assigned-clocks,
+ * which are <phandle id> pairs, and take the rate at the same index.
+ */
+static long be32_at(const unsigned char *p)
+{
+	return (long)((unsigned long)p[0] << 24 | (unsigned long)p[1] << 16 |
+		      (unsigned long)p[2] << 8 | p[3]);
+}
+
+static long npu_clk_hz_dt(void)
+{
+	static const char *base = "/proc/device-tree/soc";
+	DIR *d = opendir(base);
+	struct dirent *e;
+	long hz = -1;
+
+	if (!d)
+		return -1;
+	while (hz < 0 && (e = readdir(d))) {
+		unsigned char clk[64], rate[32];
+		char path[320], compat[128] = "";
+		size_t nc, nr;
+		FILE *f;
+
+		if (strncmp(e->d_name, "npu@", 4))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s/compatible", base, e->d_name);
+		if ((f = fopen(path, "rb"))) {
+			nc = fread(compat, 1, sizeof(compat) - 1, f);
+			fclose(f);
+			for (size_t i = 0; i < nc; i++)
+				if (!compat[i])
+					compat[i] = ' ';
+		}
+		if (!strstr(compat, "rknn-core"))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s/assigned-clocks", base, e->d_name);
+		if (!(f = fopen(path, "rb")))
+			continue;
+		nc = fread(clk, 1, sizeof(clk), f);
+		fclose(f);
+		snprintf(path, sizeof(path), "%s/%s/assigned-clock-rates", base, e->d_name);
+		if (!(f = fopen(path, "rb")))
+			continue;
+		nr = fread(rate, 1, sizeof(rate), f);
+		fclose(f);
+		for (size_t i = 0; (i + 1) * 8 <= nc && (i + 1) * 4 <= nr; i++)
+			if (be32_at(clk + i * 8 + 4) == 232) {
+				hz = be32_at(rate + i * 4);
+				break;
+			}
+	}
+	closedir(d);
+	return hz;
+}
+
 static long npu_clk_hz(void)
 {
 	const char *e = getenv("CHARSIU_NPU_CLK_HZ");
@@ -96,7 +158,10 @@ static long npu_clk_hz(void)
 	if (e && *e)
 		return atol(e);
 	hz = sysfs_long("/sys/kernel/debug/clk/clk_rknn_dsu0/clk_rate");
-	return hz > 0 ? hz : 800000000;   /* debugfs not mounted: mainline's default */
+	if (hz > 0)
+		return hz;
+	hz = npu_clk_hz_dt();
+	return hz > 0 ? hz : 800000000;   /* neither readable: mainline's default */
 }
 
 /* the vendor's worst-bin voltage for each NPU OPP step (rk3576 npu_opp_table, L0) */

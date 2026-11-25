@@ -1247,7 +1247,7 @@ PROBE_SCRIPTS="board_next.sh spec_identity.sh prefill_control.sh board_w4_axis.s
 board_acc_map.sh board_width_short.sh board_vendor.sh board_modalities.sh \
 board_threads.sh board_w4_m8.sh vattn_sweep.sh vattn_edges.sh \
 board_text_all.sh board_refused_onedev.sh board_chunk_sweep.sh board_intermittent.sh \
-board_ab.sh board_width_law.sh board_verify.sh verify_selftest.sh whisper_transcribe.sh \
+board_ab.sh board_arms.sh board_width_law.sh board_verify.sh verify_selftest.sh whisper_transcribe.sh \
 board_overlap_slots.sh board_attn_block.sh board_awq.sh host_awq.sh \
 corpus_fixed.sh board_record.sh vendor_quality.sh board_bimodal.sh \
 board_prefill_stages.sh board_cpu_clock.sh board_ttft_curve.sh \
@@ -1349,6 +1349,18 @@ else
 	# was installed rather than quietly going back to stable.
 	[ "$CHANNEL" = stable ] || as_root sh -c \
 		"sed -i 's/^channel = .*/channel = $CHANNEL/' '$ETC/config.ini'"
+fi
+# THE NPU WANTS THE CPUS OUT OF DEEP IDLE, AND /dev/cpu_dma_latency IS ROOT'S.
+# charsiu holds it while the NPU is open; run as a normal user it could not,
+# and decode lost about a sixth (Qwen3-0.6B on a CM5, same boot: 21.4 tok/s as
+# a user, 25.4 as root, 25.5 as a user with this rule). The rule gives the node
+# to group render, the group that can open the NPU.
+UDEV="$PREFIX/usr/lib/udev/rules.d"
+as_root mkdir -p "$UDEV"
+as_root cp "$SRC/etc/udev/60-charsiu-cpu-dma-latency.rules" "$UDEV/"
+if [ -z "$PREFIX" ] && command -v udevadm >/dev/null 2>&1; then
+	as_root udevadm control --reload 2>/dev/null || true
+	as_root udevadm trigger --sysname-match=cpu_dma_latency 2>/dev/null || true
 fi
 # THE CONFIG A USER OWNS HAS TO BE WRITABLE BY THAT USER. /etc/charsiu is
 # root's, so charsiu-get could not record the model it had just downloaded and

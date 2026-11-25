@@ -1,0 +1,5 @@
+# charsiu holds /dev/cpu_dma_latency while the NPU is open, to keep the CPUs
+# out of deep idle (src/npudev.c). The node is root-only by default, so a user
+# who can open the NPU could not hold it and lost about a sixth of decode.
+# Give it to the group that can open the NPU.
+KERNEL=="cpu_dma_latency", GROUP="render", MODE="0660"
