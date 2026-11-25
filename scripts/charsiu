@@ -21,7 +21,7 @@
 # "easy to use" means.
 set -eu
 
-VERSION=0.1
+VERSION=0.2
 SELF=$(basename "$0")
 CHARSIU_HERE=$(dirname "$0")
 for _l in ${CHARSIU_LIB:+"$CHARSIU_LIB/charsiu-lib.sh"} \

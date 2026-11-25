@@ -95,6 +95,11 @@ is on the list as
 and Armbian's edge kernel carries it. The kernel and Mesa work is in
 [linux-rk3576-npu](https://github.com/gahingwoo/linux-rk3576-npu).
 
+charsiu also runs under Windows on Arm through
+[woa-rk3576-npu](https://github.com/gahingwoo/woa-rk3576-npu), a Windows NPU
+driver with a port of charsiu's device layer (Llama-3.2-1B at 14 to 16 tok/s
+on a TaishanPi 3M, Windows 11 23H2, 2026-11-24).
+
 RK3588 support is being written on the `rk3588/llm` branch and has not run on a
 board.
 
