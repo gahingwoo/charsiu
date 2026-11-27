@@ -1157,6 +1157,52 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 }
 
 /*
+ * THE int4 PACK WITHOUT THE ROUND TRIP. Staging used to unpack each packed
+ * code to a byte (npudev's pack_rows) and then pack the bytes two to a byte
+ * again here, in the same low-nibble-first order. For a slice that starts on
+ * an even K the two cancel: the byte the loop above builds from codes kk + c
+ * and kk + c + 1 is byte (kk + c) / 2 of the packed row. So each 32 code
+ * block is a 16 byte copy, and only an odd last code is a nibble. Same
+ * layout, same guard, same bytes (tests/pack_q4.c holds it to the loop
+ * above at every edge it can reach); on a cached start it was most of what
+ * the board's "adding" time was.
+ */
+int charsiu_pack_weights_rows_q4(const struct charsiu_matmul *mm,
+				 const uint8_t *q, size_t qstride, uint8_t *dst,
+				 unsigned n0, unsigned nrows)
+{
+	unsigned ke = charsiu_k_eff(mm);
+	size_t cap;
+	unsigned kb, kmax, nn, kk;
+
+	if (mm->wdtype != CHARSIU_INT4)
+		return -1;
+	cap = charsiu_weight_bytes(mm);
+	kb = ALIGN_UP(ke, 32);
+	kmax = mm->k < ke ? mm->k : ke;
+	for (nn = n0; nn < n0 + nrows; nn++) {
+		size_t nbase = (size_t)(nn / 16) * 512 * (kb / 32)
+			     + (size_t)(nn % 16) * 32;
+		const uint8_t *row = q + (size_t)nn * qstride;
+
+		for (kk = 0; kk < kmax; kk += 32) {
+			size_t i = nbase + (size_t)(kk / 32) * 512;
+			unsigned run = kmax - kk < 32 ? kmax - kk : 32;
+			uint8_t *d;
+
+			if ((i + run - 1) >> 1 >= cap)
+				break;
+			d = dst + (i >> 1);
+			memcpy(d, row + kk / 2, run / 2);
+			if (run & 1)
+				d[run / 2] = (uint8_t)((d[run / 2] & 0xf0) |
+						       (row[(kk + run - 1) / 2] & 0xf));
+		}
+	}
+	return 0;
+}
+
+/*
  * THREE CANDIDATES, NOT ONE, AND THE BOARD PICKS. The vendor's size
  * registers pin the buffer to ic*oc*2 bytes with ic*2 per output channel, and
  * that is exact over all 4940 of its fp16 streams -- but a tiling does not

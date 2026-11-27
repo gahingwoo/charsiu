@@ -3344,10 +3344,76 @@ struct wrows {
 	unsigned n0, k0, k;
 };
 
+/*
+ * THE COPY INTO THE BUFFER OBJECT ON THE POOL. Once the pack is a copy too
+ * (CHARSIU_NPU_PACK_DIRECT), this one sequential memcpy of the slice, on the
+ * staging thread, is what is left of a cached start's CPU time: 620 MB for
+ * Llama-3.2-1B on one core. In 256 KiB pieces each thread still writes
+ * sequentially, which is what the comment at the copy asks of a buffer
+ * object's mapping. CHARSIU_NPU_COPY_POOL=0 is the one-thread control.
+ */
+struct wtcopy {
+	uint8_t *dst;
+	const uint8_t *src;
+	size_t bytes;
+};
+
+#define WT_COPY_PIECE ((size_t)256 << 10)
+
+static void wt_copy_rows(void *vc, uint64_t r0, uint64_t nr)
+{
+	const struct wtcopy *c = vc;
+	size_t a = (size_t)r0 * WT_COPY_PIECE, b = (size_t)(r0 + nr) * WT_COPY_PIECE;
+
+	if (b > c->bytes)
+		b = c->bytes;
+	if (a < b)
+		memcpy(c->dst + a, c->src + a, b - a);
+}
+
+static void wt_copy(struct charsiu_npu *g, void *dst, size_t bytes)
+{
+	static int pool = -1;
+	struct wtcopy c = { dst, g->wpack, bytes };
+
+	if (pool < 0)
+		pool = charsiu_env_flag("CHARSIU_NPU_COPY_POOL", 1);
+	if (!pool || g->serialpack || bytes < 2 * WT_COPY_PIECE) {
+		memcpy(dst, g->wpack, bytes);
+		return;
+	}
+	charsiu_parallel_for(wt_copy_rows, &c,
+			     (bytes + WT_COPY_PIECE - 1) / WT_COPY_PIECE);
+}
+
+/*
+ * CHARSIU_NPU_PACK_DIRECT (default on, =0 the control): an int4 slice whose
+ * codes are already packed two to a byte, starting on an even K, is copied
+ * into the layout sixteen bytes at a time by charsiu_pack_weights_rows_q4
+ * instead of being unpacked to one byte a code here and packed again there.
+ * The same bytes by construction (tests/pack_q4.c). It is the CPU half of a
+ * start from the weight cache, which reads q and does nothing else to it.
+ */
+static int pack_direct_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PACK_DIRECT", 1);
+	return v;
+}
+
 static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 {
 	const struct wrows *w = vw;
 	struct charsiu_npu *g = w->g;
+
+	if (w->t->packed && w4_for(g, w->t) && !(w->k0 & 1) && pack_direct_on() &&
+	    !charsiu_pack_weights_rows_q4(w->mm,
+			(const uint8_t *)w->t->q + (size_t)w->n0 * npu_q_stride_t(w->t)
+				+ w->k0 / 2,
+			npu_q_stride_t(w->t), g->wpack, (unsigned)r0, (unsigned)nr))
+		return;
 	/*
 	 * TWO SEPARATE QUESTIONS, and they used to be one. pk is how the
 	 * weight is STORED and g->w4 is what the device wants HANDED to it: an
@@ -3792,7 +3858,7 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	 * nearly sequential. The copy afterwards is one sequential pass.
 	 */
 	charsiu_bo_prep(g->dev[di], &s->wt, 1000000000);
-	memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm));
+	wt_copy(g, s->wt.map, charsiu_weight_bytes(&s->job.mm));
 	charsiu_bo_fini(g->dev[di], &s->wt);
 
 	bias = calloc(n, sizeof(*bias));

@@ -169,6 +169,19 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 			       const uint8_t *src, uint8_t *dst,
 			       unsigned n0, unsigned nrows);
 
+/*
+ * The same int4 bytes as charsiu_pack_weights_rows, read straight out of
+ * codes already held two to a byte (npuquant's packed q: row major, low
+ * nibble first). Row nn of the slice is q + nn * qstride, its first code in
+ * the low nibble of that byte, so the slice must start on an even K. Then
+ * every pair the layout packs is one byte of q, and a 32 code block is 16
+ * bytes copied. -1 (and nothing written) where that does not hold: not
+ * int4, or odd K padding the caller should leave to the general packer.
+ */
+int charsiu_pack_weights_rows_q4(const struct charsiu_matmul *mm,
+				 const uint8_t *q, size_t qstride, uint8_t *dst,
+				 unsigned n0, unsigned nrows);
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst);
 

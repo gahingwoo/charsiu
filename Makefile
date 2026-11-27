@@ -373,7 +373,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/pack2 $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/attn_tile $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/pack_q4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/pack2 $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/attn_tile $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -383,6 +383,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overl
 #
 	./$(BUILD)/acc_index_check >/dev/null
 	./$(BUILD)/pack_int4
+	./$(BUILD)/pack_q4
 	./$(BUILD)/reuse_key
 	./$(BUILD)/argmax_fused
 	./$(BUILD)/overlap_guard
@@ -496,6 +497,10 @@ $(BUILD)/axpy8: tests/axpy8.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD)/pack_groups: tests/pack_groups.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+# the int4 pack straight out of packed codes against unpack-then-pack
+$(BUILD)/pack_q4: tests/pack_q4.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 # CHARSIU_NPU_PACK2's rows split, direct read and device copy against the pack
