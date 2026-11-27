@@ -80,7 +80,7 @@ all: $(BUILD)/emit_dump $(BUILD)/emit_job $(BUILD)/charsiu_run \
      $(BUILD)/charsiu_matmul $(BUILD)/npu_fence_scan \
      $(BUILD)/charsiu_vision $(BUILD)/charsiu_clip \
      $(BUILD)/charsiu_whisper \
-     $(BUILD)/vattn_bench \
+     $(BUILD)/vattn_bench $(BUILD)/dattn_bench \
      $(BUILD)/tokenizer_roundtrip $(BUILD)/acc_index_check \
      $(BUILD)/fp16_plan \
      $(BUILD)/fp16_regrow \
@@ -147,6 +147,14 @@ $(BUILD)/vattn_bench: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BU
 $(BUILD)/vattn_bench.aarch64: tools/vattn_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread
 
+# CHARSIU_NPU_PACK2 priced on the CPU alone, old pack against new over a whole
+# prompt's slices, in plain memory: runs on the desk and, static, on a board
+$(BUILD)/pack2_bench: tools/pack2_bench.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/pack2_bench.aarch64: tools/pack2_bench.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
+
 # CLIP IS TWO TOWERS AND ONE SPACE, and the text one is not the language
 # model's: causal, pooled at the end of text token, its own BPE.
 $(BUILD)/charsiu_clip: tools/charsiu_clip.c src/vision.c src/clip.c src/image.c $(LLM) | $(BUILD)
@@ -164,6 +172,16 @@ $(BUILD)/charsiu_run: tools/charsiu_run.c src/vision.c src/image.c $(LLM) | $(BU
 
 $(BUILD)/charsiu_ppl: tools/charsiu_ppl.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+# IS ONE ROW OF THE int4 MATMUL A PURE FUNCTION OF THAT ROW? memcmp across
+# batch width, row index, neighbours, core and grouping, against the m = 1
+# decode path. Native for the CPU control on the desk, static for the board.
+# Same source list as charsiu_ppl's.
+$(BUILD)/npu_rowpure: tools/npu_rowpure.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+
+$(BUILD)/npu_rowpure.aarch64: tools/npu_rowpure.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
 #
 # AND IT WENT STALE THE SAME WAY, IN BOTH SCALAR RULES. The paragraph
@@ -355,7 +373,7 @@ $(BUILD)/tokenizer_roundtrip: tools/tokenizer_roundtrip.c $(LLM) | $(BUILD)
 $(BUILD)/charsiu_serve.aarch64: tools/charsiu_serve.c $(LLM) | $(BUILD)
 	$(CROSS)gcc $(CFLAGS) -static -o $@ $^ -lm -lpthread
 
-test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
+test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/argmax_fused $(BUILD)/overlap_guard $(BUILD)/pack_stride $(BUILD)/even_ks $(BUILD)/pack_f16w $(BUILD)/pack_w8 $(BUILD)/patch_waddr $(BUILD)/softmax_half $(BUILD)/pack_f16run $(BUILD)/sentinel $(BUILD)/coef_scales $(BUILD)/fp16_plan $(BUILD)/fp16_regrow $(BUILD)/fp16_regrow_fuzz $(BUILD)/pack_groups $(BUILD)/pack2 $(BUILD)/axpy8 $(BUILD)/attn_two_thresholds $(BUILD)/dattn_exact $(BUILD)/attn_tile $(BUILD)/acc_index_check $(BUILD)/vattn_bench $(BUILD)/charsiu_run_scalar
 #
 # THE WIDTH LAW, WHICH NOTHING RAN. tools/acc_index_check.c says of itself
 # that it ASSERTS the law rather than only printing it, and that it is the
@@ -366,6 +384,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/acc_index_check >/dev/null
 	./$(BUILD)/pack_int4
 	./$(BUILD)/reuse_key
+	./$(BUILD)/argmax_fused
 	./$(BUILD)/overlap_guard
 	./$(BUILD)/pack_stride
 	CHARSIU_NPU_PLAIN=1 ./$(BUILD)/pack_stride
@@ -381,8 +400,11 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	./$(BUILD)/fp16_regrow
 	./$(BUILD)/fp16_regrow_fuzz
 	./$(BUILD)/pack_groups
+	./$(BUILD)/pack2
 	./$(BUILD)/axpy8
 	./$(BUILD)/attn_two_thresholds
+	./$(BUILD)/dattn_exact
+	./$(BUILD)/attn_tile
 	./tests/corpus_fixed.sh
 	./tests/probe_list.sh
 	./tests/arch_list.sh
@@ -412,7 +434,7 @@ test: $(BUILD)/pack_int4 $(BUILD)/reuse_key $(BUILD)/overlap_guard $(BUILD)/pack
 	python3 -P tools/check_ascii.py --self-test
 	python3 -P tools/check_ascii.py
 #
-# THE PACK CHECKED AGAINST ITS OWN RULES. vendor-quality-provenance.md
+# THE PACK CHECKED AGAINST ITS OWN RULES. the old provenance notes (git history)
 # specified "every perplexity must name a file whose md5 appears in the
 # reproduction section" on 09-11 and nobody implemented it. Run for the first
 # time on 09-12 it failed at once: both corpora were scored by every
@@ -476,6 +498,11 @@ $(BUILD)/axpy8: tests/axpy8.c | $(BUILD)
 $(BUILD)/pack_groups: tests/pack_groups.c src/regcmd.c src/job.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# CHARSIU_NPU_PACK2's rows split, direct read and device copy against the pack
+# they replace, both devices' whole objects, rows 1..160, the real K
+$(BUILD)/pack2: tests/pack2.c src/regcmd.c src/job.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 # the group's four buffers are addressed by arithmetic, and arithmetic that
 # overlaps two regions returns another op's answer rather than an error
 $(BUILD)/fp16_plan: tests/fp16_plan.c src/fp16plan.h src/regcmd.c src/job.c | $(BUILD)
@@ -506,6 +533,27 @@ $(BUILD)/fp16_regrow_fuzz: tests/fp16_regrow_fuzz.c src/regcmd.c src/job.c | $(B
 $(BUILD)/attn_two_thresholds: tests/attn_two_thresholds.c $(LLM) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/attn_two_thresholds.c $(LLMNOLL) -lm -lpthread
 
+# THE GROUPED DECODE ATTENTION, BIT FOR BIT AGAINST THE KERNELS IT REPLACES.
+# A llama.c translation unit for the same reason as the one above: the kernels
+# are static and the test has to call the shipped ones.
+$(BUILD)/dattn_exact: tests/dattn_exact.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/dattn_exact.c $(LLMNOLL) -lm -lpthread
+
+# THE BATCHED PROMPT'S TILED ATTENTION, BIT FOR BIT AGAINST THE KERNEL IT
+# REPLACED, which the test carries a copy of. The same translation unit trick;
+# `attn_tile --bench` times the two at the Qwen3-0.6B shape.
+$(BUILD)/attn_tile: tests/attn_tile.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/attn_tile.c $(LLMNOLL) -lm -lpthread
+
+# AND ITS TIMING, at the Qwen3-0.6B decode shape: old kernel against new,
+# float cache against half, one row and a verify pass. The same translation
+# unit trick, so it times the shipped kernels.
+$(BUILD)/dattn_bench: tools/dattn_bench.c $(LLM) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tools/dattn_bench.c $(LLMNOLL) -lm -lpthread
+
+$(BUILD)/dattn_bench.aarch64: tools/dattn_bench.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -static -o $@ tools/dattn_bench.c $(LLMNOLL) -lm -lpthread
+
 # the guard is its own unit for exactly this reason: the table is testable on a
 # desk without linking the hardware path behind it
 $(BUILD)/overlap_guard: tests/overlap_guard.c src/overlap.h | $(BUILD)
@@ -514,6 +562,9 @@ $(BUILD)/overlap_guard: tests/overlap_guard.c src/overlap.h | $(BUILD)
 $(BUILD)/reuse_key: tests/reuse_key.c src/reusekey.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
+$(BUILD)/argmax_fused: tests/argmax_fused.c src/argmaxrow.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 $(BUILD)/even_ks: tests/even_ks.c src/kslice.h | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
@@ -521,3 +572,8 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all board test clean
+
+# THE POOL'S OWN PRICE, a dispatch with nothing in it. Named charsiu_run_pool*
+# on the board so the shared board's lock check sees it.
+$(BUILD)/pool_bench.aarch64: tools/pool_bench.c src/vision.c src/image.c $(LLM) | $(BUILD)
+	$(CROSS)gcc $(CFLAGS) -Ithird_party -static -o $@ $^ -lm -lpthread

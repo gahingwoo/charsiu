@@ -90,6 +90,17 @@ Description: open LLM runtime for the Rockchip RK3576 NPU
  Built from commit $commit, channel $CHANNEL.
 EOF
 printf '/etc/charsiu/config.ini\n' > "$PKG/DEBIAN/conffiles"
+# A .deb does not run the installer, so apply the udev rule it ships now
+# rather than at the next boot.
+cat > "$PKG/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = configure ] && command -v udevadm >/dev/null 2>&1; then
+	udevadm control --reload || true
+	udevadm trigger --sysname-match=cpu_dma_latency || true
+fi
+EOF
+chmod 0755 "$PKG/DEBIAN/postinst"
 (cd "$PKG" && find . -path ./DEBIAN -prune -o -type f -print \
 	| sed 's|^\./||' | sort | xargs md5sum) > "$PKG/DEBIAN/md5sums"
 

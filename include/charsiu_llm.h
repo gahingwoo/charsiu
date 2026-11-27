@@ -330,10 +330,28 @@ void charsiu_npu_close(struct charsiu_npu *g);
  */
 void charsiu_npu_idle(struct charsiu_npu *g, int idle);
 int  charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t);
+/* allocate and fault in what a batched call of m rows on tensor id will ask
+ * for, so its first call does not (CHARSIU_NPU_PREWARM) */
+int  charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m);
+/* the rows of the batched chunk being run while tensors stage, 0 outside one */
+extern unsigned charsiu_pool_prewarm_m;
 /* int4 takes the float activation; int8 needs q1 realised first */
 int  charsiu_npu_needs_q1(const struct charsiu_npu *g);
+int  charsiu_npu_needs_q1_id(const struct charsiu_npu *g, int id);
 int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			const struct charsiu_act *a, float *y);
+/*
+ * One projection in two parts, one core each, split where the deal already
+ * split its K slices (see npudev.c). kparts says whether tensor id can be,
+ * and the activation column where part 1 starts; part_go packs and submits
+ * part 0 or 1 from a->f (only the columns that part reads need be written
+ * yet); part_end waits and gathers into y exactly as charsiu_npu_matvec does.
+ * part_end must follow a successful part_go 0, even if part 1 failed.
+ */
+int  charsiu_npu_kparts(const struct charsiu_npu *g, int id, unsigned *kcol);
+int  charsiu_npu_part_go(struct charsiu_npu *g, int id,
+			 const struct charsiu_act *a, unsigned part);
+int  charsiu_npu_part_end(struct charsiu_npu *g, int id, float *y);
 /*
  * M rows through one set of weights, which is the whole of prefill. X is m by
  * the tensor's K and Y is m by its N, both row major. Decode does not use this
@@ -341,6 +359,14 @@ int  charsiu_npu_matvec(struct charsiu_npu *g, int id,
  */
 int  charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 			unsigned m, float *Y);
+/*
+ * The same, for an output head whose rows only need their argmax: best[r] is
+ * llama_argmax of row r after the tail scale and a softcap of `cap` (<= 0 for
+ * none), bit identical to that, and Y is left as UNSCALED scratch. See
+ * src/argmaxrow.h.
+ */
+int  charsiu_npu_matmul_argmax(struct charsiu_npu *g, int id, const float *X,
+			       unsigned m, float *Y, float cap, int32_t *best);
 /*
  * The same call, with the INPUT DECLARED UNCHANGED since the previous batched
  * call: same X contents, same m. q, k and v multiply one RMSNorm output, and so
@@ -379,6 +405,26 @@ int  charsiu_npu_flush(struct charsiu_npu *g);
 
 int  charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 			     unsigned m, float *Y);
+/*
+ * SEVERAL TENSORS THAT MULTIPLY THE SAME m ROWS OF X, IN ONE CALL: q/k/v, or
+ * gate/up. X is packed once per device, every slot of every member goes into
+ * one submit per device, both devices are submitted before either is waited
+ * on (unless the cores must be serialised), and member i's answer is written
+ * to Ys[i] before this returns -- nothing is deferred, so there is no flush
+ * owed for this call, and any deferred gather from an EARLIER call has been
+ * flushed by it.
+ *
+ * ALL OR NONE. If any member would be refused by charsiu_npu_matmul at this
+ * m, or the members do not share K, its slicing and its zero point, or any
+ * carries an AWQ factor, this returns -1 having flushed, packed and submitted
+ * nothing, and the caller runs its per-tensor calls exactly as before. A fault
+ * past that point (an allocation, an empty register stream, a failed submit)
+ * also returns -1; the per-tensor calls then rewrite every Ys[i] in full.
+ * n is 2 to 4, and the Ys must not overlap.
+ */
+int  charsiu_npu_matmul_group(struct charsiu_npu *g, const int *ids,
+			      unsigned n, const float *X, unsigned m,
+			      float *const *Ys);
 /* how often the declaration was honoured, and how often it had to pack anyway */
 void charsiu_npu_reuse_stats(const struct charsiu_npu *g, unsigned long *hits,
 			     unsigned long *misses, unsigned long why[5]);
@@ -679,6 +725,7 @@ void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
 				  double *fini, int reset);
 /* how much of prep is the output buffer allocation, and how often */
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset);
+double charsiu_npu_batch_prewarmed(const struct charsiu_npu *g, unsigned *n);
 /* several independent projections of the same activation, one submit, one fence */
 int  charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			      const struct charsiu_act *a, float **ys);
@@ -1111,9 +1158,27 @@ struct llama_state {
 	 * llama_prefill_hint.
 	 */
 	int prompt_total;
+	/*
+	 * SET WHILE A VERIFY PASS RUNS, AND IT KEEPS ATTENTION ON THE CPU. A
+	 * speculative pass must compute the token loop's bits, or which rows
+	 * a run happened to verify -- a timing decision under the auto policy
+	 * -- changes the text. The fp16 attention arm agrees with the CPU to
+	 * fp16 and no further, so a verify pass never takes it; a prompt still
+	 * does. llama_spec_step sets it around its pass, and charsiu_ppl
+	 * --verify sets it to score that arithmetic.
+	 */
+	int in_verify;
 
 	float *kcache;         /* [n_layer][n_ctx][n_head_kv * head_dim] */
 	float *vcache;
+	/*
+	 * CHARSIU_KV16: the same cache again in fp16, head major
+	 * [layer][kv head][position][head_dim] whatever CHARSIU_KV_POSMAJOR
+	 * says, written beside the float one at both write sites and read
+	 * only by the decode and verify attention. NULL when the switch is
+	 * off. Raw IEEE half bits; see kv16_put in src/llama.c.
+	 */
+	uint16_t *kc16, *vc16;
 
 	float *x, *xb, *xb2;   /* n_embd */
 	/*
@@ -1247,9 +1312,30 @@ int charsiu_env_flag(const char *name, int dflt);
  * prompt is done; it is a hint about the NEXT prefill and nothing else.
  */
 void llama_prefill_hint(struct llama_state *s, int total);
+/* n > 0 while a batched prompt chunk of n rows runs: the pool takes the
+ * process's whole mask (CHARSIU_PREFILL_WIDE, CHARSIU_PREFILL_POOL_CPUS) and
+ * a tensor staged meanwhile pre-warms its buffers at n; 0 ends it */
+void llama_prefill_scope(int n);
 
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0);
+
+/*
+ * The same chunk with only its first `keep` rows real: the head runs on row
+ * keep - 1 and the cache ends at pos0 + keep (llama_cache_truncate), so the
+ * n - keep rows after it are padding that widens the chunk to a width the
+ * hardware batches well and is never read. keep == n is llama_prefill_batch.
+ */
+int llama_prefill_batch_keep(struct llama_state *s,
+			     const struct llama_model *m, const int32_t *toks,
+			     int n, int pos0, int keep);
+
+/*
+ * Move the end of the cache back to `pos` (never forward): s->pos, and every
+ * mark that records how far a mirror of the cache is valid. Use it, and not
+ * a bare assignment to s->pos, wherever the cache gives positions back.
+ */
+void llama_cache_truncate(struct llama_state *s, int pos);
 
 /*
  * Why llama_prefill_batch will refuse this model, as a short phrase, or NULL
@@ -1285,6 +1371,14 @@ const float *llama_forward_embd(struct llama_state *s, const float *embd,
  */
 int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 		       const int32_t *toks, int n, int pos0, float *logits_all);
+/*
+ * The same pass for a greedy verifier: best[r] is llama_argmax of what
+ * llama_verify_batch would have left in row r, and scratch (n * n_vocab
+ * floats) holds nothing a caller may read.
+ */
+int llama_verify_batch_argmax(struct llama_state *s,
+			      const struct llama_model *m, const int32_t *toks,
+			      int n, int pos0, float *scratch, int32_t *best);
 
 /*
  * Speculative decoding: k drafted tokens verified in one batched pass. Greedy
@@ -1302,7 +1396,29 @@ struct llama_spec {
 	int n_hist, cap_hist;
 	float *logits_all;      /* (k + 2) rows of n_vocab */
 	unsigned long passes, plain, drafted, accepted, committed;
+	/*
+	 * THE COST POLICY (auto = 1). Whether to speculate, and how many of
+	 * the drafts to send, is decided a pass at a time from what this run
+	 * has MEASURED: the cost of a plain step, the cost of a pass at each
+	 * width, and how often a draft at each position is right. The note
+	 * over spec_policy in llama.c has the rule and why it cannot make
+	 * decode slower than plain by more than a bounded amount.
+	 */
+	int autok;              /* 1: the policy decides; 0: always k (forced) */
+	double vscale;          /* CHARSIU_SPEC_VERIFY_SCALE, a desk test knob */
+	double t_plain;         /* ms, running mean of a plain step */
+	int n_tplain;           /* samples seen, the first (cold) discarded */
+	double t_ver[3];        /* ms, a pass at width 2, 4, 6 */
+	int n_tver[3];
+	double reach[5], hit[5];/* decayed counts: draft i tested, and right */
+	int32_t sh[5];          /* drafts not sent, checked against greedy */
+	int sh_n, sh_i;
+	int backoff, backoff_left;
+	double ledger;          /* ms saved by speculating since the last stop */
+	unsigned long n_nodraft, n_gate, n_hold, n_stops, n_probe;
+	double ms_spec, ms_plain;
 };
+/* k < 0 is the policy with up to -k drafts; k > 0 is forced k */
 int  llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 		     int n_ctx);
 void llama_spec_free(struct llama_spec *sp);

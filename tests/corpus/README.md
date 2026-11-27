@@ -6,7 +6,7 @@ is deterministic, so a ppl measured today can be put next to one measured a
 week ago. That property is worth exactly as much as the text it was measured
 on, and until 2026-09-10 the text lived in a temp directory.
 
-Every figure in `docs/lab-notebook.md` and in the README's quality table was
+Every figure in the lab notebook (git history) and in the README's quality table was
 measured on these three files. A reboot would have taken them, and with them
 the comparability of every one of those numbers -- 41.5289 would still be
 written down and nothing would be able to produce it again.

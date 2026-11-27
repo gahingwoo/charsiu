@@ -167,6 +167,81 @@ static int onechunk_on(void)
 	return v;
 }
 
+/*
+ * PAD THE LAST CHUNK RATHER THAN SPLIT IT. A remainder of rem tokens that is
+ * not a multiple of four either cannot be batched at all (odd: the last token
+ * goes through the token loop, a whole decode step for one row) or batches at
+ * a width that costs about 7% a token (2 mod 4). Rounding it UP to the next
+ * multiple of four and filling the extra rows with a copy of the last real
+ * token costs at most three rows the causal mask keeps every real row from
+ * reading; llama_prefill_batch_keep takes the head from the last real row and
+ * gives the pad positions back.
+ *
+ * Returns the padded width, or 0 to run rem the old way: below 3 (2 is a
+ * width of its own and 1 has no pad worth a batched call), already a multiple
+ * of four, wider than `lim`, or a width prefill_width would not run as it is
+ * -- 8 below the envelope, say -- because a padded chunk must never be a width
+ * the unpadded path would have refused.
+ *
+ * CHARSIU_PREFILL_PAD=0 is the control: the split, as before.
+ */
+static int prefill_pad_width(int rem, int lim)
+{
+	static int on = -1;
+	int w;
+
+	if (on < 0)
+		on = charsiu_env_flag("CHARSIU_PREFILL_PAD", 1);
+	if (!on || rem < 3 || !(rem & 3))
+		return 0;
+	w = (rem + 3) & ~3;
+	if (w > lim || prefill_width(w, w) != w)
+		return 0;
+	return w;
+}
+
+/*
+ * ONE CHUNK OF THE PROMPT FROM ids, rem tokens left, no wider than chunk:
+ * padded when that is the last chunk and prefill_pad_width names a width,
+ * split as before otherwise. Returns how many PROMPT tokens it consumed, 0 if
+ * nothing ran (no width left, or the batch refused), with the width that ran
+ * in *ran and the pad rows it carried added to *pad.
+ */
+static int prefill_chunk(struct llama_state *st, const struct llama_model *m,
+			 const int32_t *ids, int rem, int chunk, int *ran,
+			 int *pad)
+{
+	int w = rem <= chunk ? prefill_pad_width(rem, chunk) : 0;
+	int c;
+
+	/* the pad rows are written to the cache, so they must fit in it */
+	if (w && st->pos + w <= st->n_ctx) {
+		int32_t *buf = malloc((size_t)w * sizeof(*buf));
+		int i, rc;
+
+		if (buf) {
+			memcpy(buf, ids, (size_t)rem * sizeof(*buf));
+			/* a real token, so every row is an ordinary row; it is
+			 * never read, the head and the cache stop at rem */
+			for (i = rem; i < w; i++)
+				buf[i] = ids[rem - 1];
+			rc = llama_prefill_batch_keep(st, m, buf, w, st->pos,
+						      rem);
+			free(buf);
+			if (rc)
+				return 0;
+			*ran = w;
+			*pad += w - rem;
+			return rem;
+		}
+	}
+	c = prefill_width(rem, chunk);
+	if (c < 2 || llama_prefill_batch(st, m, ids, c, st->pos))
+		return 0;
+	*ran = c;
+	return c;
+}
+
 struct prefill_widths {
 	int w[6];
 	int n[6];
@@ -203,6 +278,33 @@ static void prefill_say_widths(const struct prefill_widths *pw)
 		fprintf(stderr, "%s)", pw->over ? "+.." : "");
 }
 
+/*
+ * CHARSIU_SPEC / --spec: "auto" is the policy, a number is that many drafts
+ * a pass (0 off), and an empty value is off, as charsiu_env_flag reads one.
+ * ANYTHING ELSE IS SAID AND MEANS OFF: atoi("on") is 0, and a switch whose
+ * misspelling silently meant "off" would be read as speculation gaining
+ * nothing.
+ */
+#define SPEC_AUTO (-5)
+
+static int spec_parse(const char *v)
+{
+	char *end;
+	long k;
+
+	if (!v || !*v)
+		return 0;
+	if (!strcmp(v, "auto"))
+		return SPEC_AUTO;
+	k = strtol(v, &end, 10);
+	if (*end || k < 0) {
+		fprintf(stderr, "charsiu: speculation \"%s\" is not auto, 0 or"
+			" a draft count; not speculating\n", v);
+		return 0;
+	}
+	return (int)k;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -224,7 +326,11 @@ static void usage(void)
 "  --bos         prepend it even if the file says not to\n"
 "  --show-special  print control tokens instead of hiding them\n"
 "  --ignore-eos  keep going past end-of-generation, for a longer diff\n"
-"  --spec K      speculate K tokens a pass (1..5; greedy only, text identical)\n"
+"  --spec K      speculate: auto by default, which decides a pass at a\n"
+"                 time from measured costs; 0 is off; 1..5 is that many\n"
+"                 drafts every pass. Greedy only; a sampler runs plain.\n"
+"                 The text is the plain loop's: a verify row computes the\n"
+"                 same bits as a single step.\n"
 "  --repeat N     run the same prompt N times in ONE process, so a rate\n"
 "                 question does not pay for N model loads. The cache is\n"
 "                 reset between them and each is separated by a marker\n"
@@ -321,11 +427,30 @@ int main(int argc, char **argv)
 	int ignore_eos = 0;
 	/*
 	 * --spec K, or CHARSIU_SPEC=K: prompt-lookup drafts verified in one
-	 * batched pass. Off unless asked, because a pass at m = 4 has not been
-	 * priced on the board yet; the acceptance it reports is a property of
-	 * the model and is measured anywhere.
+	 * batched pass.
+	 *
+	 * AUTO BY DEFAULT, BECAUSE THE TEXT CANNOT MOVE. Auto runs the cost
+	 * policy in llama.c (the note over spec_policy): it speculates only
+	 * where this run's own timings and acceptance say it pays, and backs
+	 * off when a pass loses. 0 is off -- the plain loop, untouched; K > 0
+	 * is K drafts every pass, no policy.
+	 *
+	 * It was off for a day because on the NPU it changed the text of one
+	 * prompt of 21 (Qwen3-0.6B, a short story, from token 39). The cause
+	 * was the batched gather adding K-slice partials in device order while
+	 * the one-row path adds them in slot order; npudev.c now adds them in
+	 * the one-row order whatever the deal. Since then charsiu_ppl prints a
+	 * hash of every logit, and on the CM5 the token loop and --batch at
+	 * widths 2, 4, 6 and 80 print the same hash on Qwen3-0.6B, Llama-3.2-1B
+	 * and Qwen3-1.7B (the old order prints another, on all three). Against
+	 * CHARSIU_SPEC=0, auto kept the text of all 21 prompts and was slower
+	 * on none: 1.06-1.08x on short chat, 1.2-2.4x on copy-heavy prompts.
+	 *
+	 * The board scripts pin 0 anyway (tests/board_clk.sh) and spell the
+	 * policy CHARSIU_SPEC=auto when they want it.
 	 */
-	int spec_k = getenv("CHARSIU_SPEC") ? atoi(getenv("CHARSIU_SPEC")) : 0;
+	int spec_k = getenv("CHARSIU_SPEC") ? spec_parse(getenv("CHARSIU_SPEC"))
+					  : SPEC_AUTO;
 	struct llama_spec spec;
 	int spec_on = 0;
 	unsigned batch_probe = 0;
@@ -389,7 +514,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--bos")) add_bos = 1;
 		else if (!strcmp(a, "--show-special")) show_special = 1;
 		else if (!strcmp(a, "--ignore-eos")) ignore_eos = 1;
-		else if (!strcmp(a, "--spec")) spec_k = atoi(NEXT());
+		else if (!strcmp(a, "--spec")) spec_k = spec_parse(NEXT());
 		/*
 		 * AFTER STAGING AND INSTEAD OF GENERATING. The question is
 		 * what batching buys on this board's own weights, and a token
@@ -986,7 +1111,24 @@ int main(int argc, char **argv)
 		 *
 		 * CHARSIU_PREFILL_ONECHUNK=0 still turns the whole thing off.
 		 */
-		if (onechunk_on() && n_ids > chunk && n_ids <= cap &&
+		/*
+		 * AND NOW A WRONG RESIDUE IS PADDED RATHER THAN DECLINED,
+		 * when CHARSIU_PREFILL_PAD allows: 131 tokens run as one chunk
+		 * of 132 with a pad row, where they ran 80 + 50 and a token
+		 * through the token loop -- 835 ms on the board against 650
+		 * for 124 in one chunk. See prefill_pad_width.
+		 */
+		int onepad = (onechunk_on() && n_ids > chunk && n_ids <= cap)
+			   ? prefill_pad_width(n_ids, cap) : 0;
+
+		if (onepad) {
+			if (charsiu_diag())
+				fprintf(stderr, "charsiu: the whole prompt (%d) "
+					"fits under this model's ceiling (%d), "
+					"so it goes in one chunk padded to %d\n",
+					n_ids, cap, onepad);
+			chunk = onepad;
+		} else if (onechunk_on() && n_ids > chunk && n_ids <= cap &&
 		    ((n_ids & ~1) & 3) == 0) {
 			if (charsiu_diag())
 				fprintf(stderr, "charsiu: the whole prompt (%d) "
@@ -1002,6 +1144,7 @@ int main(int argc, char **argv)
 					chunk);
 		}
 		int done = 0;
+		int npad = 0;           /* pad rows the batched chunks carried */
 		/* which widths ran, for the line at the bottom of this block */
 		struct prefill_widths pw = { { 0 }, { 0 }, 0, 0 };
 
@@ -1077,9 +1220,12 @@ int main(int argc, char **argv)
 			 * about. RUNNING OUT of width is not a refusal: it
 			 * happens with at most one token left, and that token
 			 * was always going to the token loop.
+			 *
+			 * AND WITH CHARSIU_PREFILL_PAD THAT ONE TOKEN IS
+			 * GONE TOO: the last chunk is padded up to a multiple
+			 * of four (prefill_chunk), so a prompt that ends on an
+			 * odd remainder no longer pays a decode step for it.
 			 */
-			int probe = prefill_width(n_ids, chunk);
-
 			/* the only thing in the library that needs to know
 			 * how long the whole prompt is, rather than how long
 			 * this chunk is: CHARSIU_ATTN_NPU=auto. Said before
@@ -1088,22 +1234,26 @@ int main(int argc, char **argv)
 			 * mirror built for a prompt that will not use it
 			 * costs 107 ms of upkeep it never earns back. */
 			llama_prefill_hint(st, n_ids);
-			if (probe >= 2 &&
-			    !llama_prefill_batch(st, &m, ids, probe, st->pos)) {
-				done = probe;
-				prefill_note_width(&pw, probe);
-				while (done < n_ids) {
-					int c = prefill_width(n_ids - done,
-							      chunk);
+			{
+				int ran = 0;
+				int c = prefill_chunk(st, &m, ids, n_ids, chunk,
+						      &ran, &npad);
 
-					if (c < 2 ||
-					    llama_prefill_batch(st, &m,
-							ids + done, c, st->pos))
-						break;
-					done += c;
-					prefill_note_width(&pw, c);
+				if (c > 0) {
+					done = c;
+					prefill_note_width(&pw, ran);
+					while (done < n_ids) {
+						c = prefill_chunk(st, &m,
+							ids + done,
+							n_ids - done, chunk,
+							&ran, &npad);
+						if (c <= 0)
+							break;
+						done += c;
+						prefill_note_width(&pw, ran);
+					}
+					logits = st->logits;
 				}
-				logits = st->logits;
 			}
 		}
 		/* the hint was about this prompt and it is over */
@@ -1149,12 +1299,18 @@ int main(int argc, char **argv)
 					"tokens in chunks of %d",
 					n_ids, chunk);
 				prefill_say_widths(&pw);
+				if (npad)
+					fprintf(stderr, " (%d pad row%s)", npad,
+						npad == 1 ? "" : "s");
 				fprintf(stderr, "%s\n", forced);
 			} else if (done > 0) {
 				fprintf(stderr, "charsiu: prompt batched for "
 					"%d of %d tokens, the rest a token at "
 					"a time", done, n_ids);
 				prefill_say_widths(&pw);
+				if (npad)
+					fprintf(stderr, " (%d pad row%s)", npad,
+						npad == 1 ? "" : "s");
 				fprintf(stderr, "%s\n", forced);
 			} else if (charsiu_env_flag("CHARSIU_NO_BATCH_PREFILL", 0)) {
 				fprintf(stderr, "charsiu: prompt a token at a "
@@ -1260,7 +1416,31 @@ int main(int argc, char **argv)
 	 * a different fact.
 	 */
 	spec_on = 0;
-	if (spec_k > 0) {
+	/*
+	 * AUTO SAYS LESS THAN FORCED. Nobody asked auto to speculate, so a
+	 * sampled run stays quiet -- sampling is plain, as it always was --
+	 * and a refused model is said once, because "speculation gained
+	 * nothing" and "speculation never ran" still read the same in a log.
+	 */
+	if (spec_k == SPEC_AUTO) {
+		const char *why = llama_batch_why_not(&m);
+
+		if (temp > 0.0f)
+			;
+		else if (why) {
+			if (!quiet)
+				fprintf(stderr, "charsiu: speculation (auto) "
+					"off, the batched forward refuses "
+					"this model (%s)\n", why);
+		} else if (llama_spec_init(&spec, &m, spec_k, st->n_ctx))
+			fprintf(stderr, "charsiu: speculation off, no "
+				"memory\n");
+		else {
+			for (i = 0; i < n_ids; i++)
+				llama_spec_push(&spec, ids[i]);
+			spec_on = 1;
+		}
+	} else if (spec_k > 0) {
 		const char *why = llama_batch_why_not(&m);
 
 		if (temp > 0.0f)
@@ -1327,6 +1507,8 @@ int main(int argc, char **argv)
 	 */
 	int32_t pend[16];
 	int npend = 0, ipend = 0;
+	int gen_pos0 = st->pos;
+	int32_t last_tok = -1;
 
 	for (i = 0; i < n_gen; i++) {
 		int32_t tok = ipend < npend ? pend[ipend++]
@@ -1436,6 +1618,7 @@ int main(int argc, char **argv)
 			}
 		}
 next:
+		last_tok = tok;
 
 		if (st->pos >= st->n_ctx)
 			break;
@@ -1451,6 +1634,26 @@ next:
 		logits = llama_forward(st, tok, st->pos);
 		if (!logits)
 			break;
+	}
+	/*
+	 * THE CACHE ENDS WHERE THE PLAIN LOOP'S WOULD. That loop forwards
+	 * every token it produces, so it stops at gen_pos0 + produced. A
+	 * speculative run can stop past it -- drafts accepted but not yet
+	 * printed when -n ran out or the model ended its turn -- or one short,
+	 * the last correction being the next pass's row 0 and not in the
+	 * cache. A single shot run never reads the cache again, but the next
+	 * turn of a conversation does: on the CM5, Qwen3-0.6B's second turn
+	 * started two unprinted tokens late and its text left the plain
+	 * loop's.
+	 */
+	if (spec_on) {
+		int want = gen_pos0 + produced;
+
+		if (st->pos > want)
+			llama_cache_truncate(st, want);
+		else if (st->pos + 1 == want && last_tok >= 0 &&
+			 st->pos < st->n_ctx)
+			llama_forward(st, last_tok, st->pos);
 	}
 
 	{
@@ -1564,7 +1767,7 @@ next:
 		 * to split N answers out of one stream. Without it a comparison
 		 * would see one long string and call every repeat identical.
 		 */
-		st->pos = 0;
+		llama_cache_truncate(st, 0);
 		printf("\n--- charsiu repeat %d ---\n", turn + 2);
 		fflush(stdout);
 		continue;

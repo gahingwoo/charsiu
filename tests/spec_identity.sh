@@ -17,6 +17,26 @@
 #   junk        --spec 3 with CHARSIU_SPEC_JUNK=1            must match, AND
 #                                                            must have accepted
 #                                                            (almost) nothing
+#   auto        CHARSIU_SPEC=auto: the cost policy           must match, and
+#                                                            must say what it
+#                                                            did
+#   auto x0.3   CHARSIU_SPEC=auto, passes priced at 0.3     must match, AND
+#                                                            must have accepted
+#                                                            something
+#
+# THE PLAIN ARM IS CHARSIU_SPEC=0 BY NAME, because unset is auto: it is
+# the arm the whole test is measured against. Every arm must match it, on
+# the desk and on the board: a verify row computes the same bits as a
+# single step (charsiu_ppl's logits hash, token loop against --batch), so a
+# mismatch anywhere is a broken verifier, not a near tie.
+#
+# WHY auto x0.3. With no NPU a pass runs its rows one at a time and costs
+# w plain steps, so on the desk the policy correctly stops after its first
+# probes and the unscaled auto arm is nearly plain. Pricing the passes at 0.3
+# (CHARSIU_SPEC_VERIFY_SCALE) makes them look like the board's, so the paths
+# that resume, choose a width and back off are the ones running, and their
+# text still has to match. On the board the scale is not needed for that, and
+# is harmless.
 #
 # The prompt asks for repetition so that prompt lookup has something to find:
 # on open prose it mostly proposes nothing and this test could pass with an
@@ -108,7 +128,7 @@ for mdl in "$DIR"/*.gguf; do
 		EXTRA="--ignore-eos"
 		spec=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 $EXTRA 2>"$ERR")
 	fi
-	plain=$("$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
+	plain=$(CHARSIU_SPEC=0 "$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
 	if grep -q "refuses this model\|speculation is off" "$ERR"; then
 		printf '  -- %-40s refused: %s\n' "$name" \
 		    "$(sed -n 's/.*(\(.*\)).*/\1/p' "$ERR" | head -1)"
@@ -116,6 +136,8 @@ for mdl in "$DIR"/*.gguf; do
 		continue
 	fi
 	junk=$(CHARSIU_SPEC_JUNK=1 "$RUN" "$mdl" -p "$PROMPT" -n "$N" --spec 3 $EXTRA 2>/dev/null)
+	auto=$(CHARSIU_SPEC=auto "$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
+	autos=$(CHARSIU_SPEC=auto CHARSIU_SPEC_VERIFY_SCALE=0.3 "$RUN" "$mdl" -p "$PROMPT" -n "$N" $EXTRA 2>/dev/null)
 
 	tp=$(printf '%s' "$plain" | text)
 	ts=$(printf '%s' "$spec" | text)
@@ -124,6 +146,11 @@ for mdl in "$DIR"/*.gguf; do
 	lj=$(printf '%s' "$junk" | specline)
 	as=$(printf '%s' "$ls" | accepted); as=${as:-0}
 	aj=$(printf '%s' "$lj" | accepted); aj=${aj:-0}
+	ta=$(printf '%s' "$auto" | text)
+	tq=$(printf '%s' "$autos" | text)
+	la=$(printf '%s' "$auto" | grep '^\[spec k=auto.*; policy: ' | head -1)
+	lq=$(printf '%s' "$autos" | grep '^\[spec k=auto.*; policy: ' | head -1)
+	aq=$(printf '%s' "$autos" | specline | accepted); aq=${aq:-0}
 
 	ok=1
 	if [ "$tp" != "$ts" ]; then
@@ -147,10 +174,31 @@ for mdl in "$DIR"/*.gguf; do
 		echo "  $name: junk drafts were accepted $aj times"
 		ok=0
 	fi
+	if [ "$tp" != "$ta" ]; then
+		echo "  $name: text under the DEFAULT (auto) DIFFERS from plain"
+		printf '     plain: %.100s\n     auto:  %.100s\n' "$tp" "$ta"
+		ok=0
+	fi
+	if [ "$tp" != "$tq" ]; then
+		echo "  $name: text under auto x0.3 DIFFERS from plain"
+		printf '     plain: %.100s\n     auto:  %.100s\n' "$tp" "$tq"
+		ok=0
+	fi
+	if [ -z "$la" ] || [ -z "$lq" ]; then
+		echo "  $name: an auto arm printed no [spec k=auto ...; policy: ...] line"
+		ok=0
+	elif [ "$aq" -lt 1 ]; then
+		echo "  $name: auto x0.3 accepted ZERO drafts -- its resume path never ran"
+		echo "     $lq"
+		ok=0
+	fi
 	if [ $ok = 1 ]; then
-		printf '  %-40s identical x3   %s%s\n' "$name" \
+		printf '  %-40s identical x5   %s%s\n' "$name" \
 		    "$(printf '%s' "$ls" | sed 's/^\[spec k=3: //; s/\]$//')" \
 		    "${EXTRA:+   (past its own end)}"
+		printf '     auto:      %s\n     auto x0.3: %s\n' \
+		    "$(printf '%s' "$la" | sed 's/.*; policy: //; s/; step.*//')" \
+		    "$(printf '%s' "$lq" | sed 's/.*; policy: //; s/; step.*//')"
 	else
 		bad=$((bad + 1))
 	fi

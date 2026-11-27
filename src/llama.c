@@ -24,6 +24,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 
 #include "charsiu.h"
 #include "charsiu_llm.h"
@@ -86,6 +89,56 @@ static int attn_perhead(void)
 
 	if (v < 0)
 		v = charsiu_env_flag("CHARSIU_ATTN_PERHEAD", 0);
+	return v;
+}
+
+static int kv_v_chan(void);
+
+/*
+ * CHARSIU_KV16: AN fp16 COPY OF THE KV CACHE FOR THE CPU ATTENTION OF DECODE
+ * AND OF THE VERIFY ROWS. OFF, because it changes numerics: every K and V
+ * element goes through one round to nearest even into fp16 on the way in, and
+ * the arithmetic after that is the fp32 arithmetic of today, exactly. What that
+ * rounding costs in quality is a perplexity question and only the board's
+ * measurement of it can turn this on. See attn_gqa_group for the kernel and
+ * for why this is a second cache and not the NPU's fp16 mirror.
+ *
+ * It refuses CHARSIU_KV_V_AXIS=chan, which rewrites EARLIER positions of the
+ * float V cache when a channel's scale grows; nothing copies those rewrites
+ * into the half cache, so the two would silently disagree.
+ */
+static int kv16_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		v = charsiu_env_flag("CHARSIU_KV16", 0);
+		if (v && kv_v_chan()) {
+			fprintf(stderr, "charsiu: CHARSIU_KV16 refused: "
+				"CHARSIU_KV_V_AXIS=chan rewrites earlier V "
+				"positions the half cache does not follow\n");
+			v = 0;
+		}
+	}
+	return v;
+}
+
+/*
+ * CHARSIU_ATTN_GQA: THE GROUPED DECODE KERNEL OVER THE FLOAT CACHE. ON. It is
+ * bit identical to attn_heads (tests/dattn_exact.c holds it there at every
+ * shape it walks), so what turned it on was a timing and a text md5. On the
+ * CM5, three models, interleaved: text the same on all 21 short prompts and
+ * the 6 long ones, slower on none, 1.13-1.18x decode at 1400 tokens of
+ * context on the two Qwen3s. CHARSIU_ATTN_GQA=0 is the old kernel.
+ * CHARSIU_KV16 uses this kernel whatever this says, because it is the only
+ * one that reads halves.
+ */
+static int attn_gqa_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_GQA", 1) || kv16_on();
 	return v;
 }
 
@@ -347,10 +400,186 @@ struct pool {
 	 * prices it: the static split is what every number to date was taken
 	 * with. `chunk` is 0 for the static split.
 	 */
-	uint64_t next, chunk;
+	uint64_t chunk;
+	/*
+	 * THE CURSOR EVERY THREAD WRITES, ON A LINE OF ITS OWN. It shared one
+	 * with nrows and chunk, which every thread reads on every take, so
+	 * each fetch_add pulled the line away from the readers.
+	 */
+	_Alignas(64) uint64_t next;
+
+	/*
+	 * THE FAST DISPATCH (CHARSIU_POOL_FAST), and why it exists. The pool
+	 * above is a mutex, a condition variable and a broadcast, and the
+	 * caller sleeps on a second condition variable while the workers run.
+	 * Every dispatch therefore pays a futex wake per worker, a mutex the
+	 * workers queue on twice, and a wake of the caller; and the caller --
+	 * one of the cores the job was sized for -- does none of the work.
+	 *
+	 * In the fast form the pool has n - 1 threads and the CALLER is the
+	 * n-th share, the generation is a lone atomic the workers spin on for
+	 * a bounded time before they park on a futex, and the fan in is an
+	 * atomic count the caller spins on. Which rows a thread takes moves;
+	 * what is computed for each row does not, so the bits cannot.
+	 */
+	_Alignas(64) unsigned fgen;
+	_Alignas(64) unsigned fdone;
+	_Alignas(64) int fsleepers;     /* workers parked on fgen */
+	int fcaller_sleep;              /* the caller parked on fdone */
+	_Alignas(64) int fast;          /* fixed at pool_start */
+	int nw;                         /* worker threads: n, or n - 1 fast */
+	uint64_t spin_ticks;            /* how long a worker spins, in ticks */
 };
 
 static struct pool g_pool;
+
+/* ---- the fast dispatch's primitives -------------------------------------- */
+
+static long futex_op(unsigned *addr, int op, unsigned val)
+{
+	return syscall(SYS_futex, addr, op, val, NULL, NULL, 0);
+}
+
+static inline uint64_t pool_ticks(void)
+{
+#if defined(__aarch64__)
+	uint64_t v;
+
+	__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(v));
+	return v;
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static uint64_t pool_ticks_per_us(void)
+{
+#if defined(__aarch64__)
+	uint64_t f;
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+	return f / 1000000u ? f / 1000000u : 1;
+#else
+	return 1000;
+#endif
+}
+
+static inline uint64_t pool_spin_now(void)
+{
+	return __atomic_load_n(&g_pool.spin_ticks, __ATOMIC_RELAXED);
+}
+
+static inline void pool_relax(void)
+{
+#if defined(__aarch64__)
+	__asm__ volatile("yield" ::: "memory");
+#endif
+}
+
+static int pool_fast_on(void)
+{
+	return charsiu_env_flag("CHARSIU_POOL_FAST", 1);
+}
+
+/*
+ * HOW LONG A WORKER SPINS BEFORE IT PARKS, in microseconds. It is the gap
+ * between two dispatches it can bridge without a futex wake; past it the
+ * worker sleeps exactly as before. 0 parks at once.
+ *
+ * tools/pool_bench on the CM5, 4 threads, caller on 4-7: an empty dispatch
+ * of 64 items is 21 us on the condition variable pool (102 us with the
+ * prompt's pool on 0-7), 14 us fast with no spin, 1.5 us spinning; 64 units
+ * of 60 us take 1514 us against 962. A wake out of a park is still ~75 us,
+ * and the prompt's gaps include the NPU fence, so inside a batched prompt
+ * chunk the workers spin for 20 ms -- in practice the whole chunk, since
+ * llama_prefill_scope(0) drops the bound back the moment it ends. Qwen3-0.6B
+ * at 115..139 tokens, prompt ms: 200 us 446..558, 2000 us 458..555, 5000 us
+ * 442..545, 20000 us 441..544. Decode spins 200, which beat 0 on all four
+ * chat prompts.
+ */
+static unsigned pool_spin_us(void)
+{
+	const char *e = getenv("CHARSIU_POOL_SPIN_US");
+
+	return e && *e ? (unsigned)strtoul(e, NULL, 0) : 20000;
+}
+
+/* the same outside a batched prompt chunk: decode, the verify, the towers */
+static unsigned pool_spin_decode_us(void)
+{
+	const char *e = getenv("CHARSIU_POOL_SPIN_DECODE_US");
+
+	return e && *e ? (unsigned)strtoul(e, NULL, 0) : 200;
+}
+
+/*
+ * CHARSIU_POOL_STATS=1: every dispatch counted by callback, with the
+ * caller's wall time inside it, printed at exit. The callbacks are printed
+ * as addresses; `nm` on the same binary names them.
+ */
+#define POOL_NSTAT 64
+static struct {
+	void *fn;
+	int prompt;                     /* inside a batched prompt chunk */
+	uint64_t count, items;
+	double us;
+} g_pstat[POOL_NSTAT];
+static int g_pstat_on = -1, g_pstat_prompt;
+
+static void pool_stats_print(void)
+{
+	double tot = 0;
+	uint64_t cnt = 0;
+
+	for (int i = 0; i < POOL_NSTAT; i++) {
+		if (!g_pstat[i].fn)
+			continue;
+		fprintf(stderr, "charsiu: pool %s %p  %8llu dispatches  %10llu "
+			"items  %9.1f ms  %6.1f us each\n",
+			g_pstat[i].prompt ? "prompt" : "other ", g_pstat[i].fn,
+			(unsigned long long)g_pstat[i].count,
+			(unsigned long long)g_pstat[i].items,
+			g_pstat[i].us / 1000.0,
+			g_pstat[i].us / (double)g_pstat[i].count);
+		tot += g_pstat[i].us;
+		cnt += g_pstat[i].count;
+	}
+	fprintf(stderr, "charsiu: pool total %llu dispatches, %.1f ms (fast %d,"
+		" spin %u us, %u outside a prompt, %d workers + %s)\n",
+		(unsigned long long)cnt, tot / 1000.0, g_pool.fast,
+		pool_spin_us(), pool_spin_decode_us(), g_pool.nw,
+		g_pool.fast ? "the caller" : "a sleeping caller");
+}
+
+static int pool_stats_on(void)
+{
+	if (g_pstat_on < 0) {
+		g_pstat_on = charsiu_env_flag("CHARSIU_POOL_STATS", 0);
+		if (g_pstat_on)
+			atexit(pool_stats_print);
+	}
+	return g_pstat_on;
+}
+
+static void pool_stat_add(void *fn, uint64_t items, double us)
+{
+	unsigned h = (unsigned)((((uintptr_t)fn >> 2) + (unsigned)g_pstat_prompt)
+				% POOL_NSTAT);
+
+	for (int k = 0; k < POOL_NSTAT; k++, h = (h + 1) % POOL_NSTAT)
+		if (!g_pstat[h].fn || (g_pstat[h].fn == fn &&
+				       g_pstat[h].prompt == g_pstat_prompt)) {
+			g_pstat[h].fn = fn;
+			g_pstat[h].prompt = g_pstat_prompt;
+			g_pstat[h].count++;
+			g_pstat[h].items += items;
+			g_pstat[h].us += us;
+			return;
+		}
+}
 
 static int pool_dynamic(void)
 {
@@ -415,14 +644,156 @@ static void pool_do(uint64_t r0, uint64_t n)
 		gguf_matvec(g_pool.w, g_pool.a, g_pool.y, r0, n);
 }
 
+/* one thread's whole part of the current job: share `id` of g_pool.n */
+static void pool_share(long id)
+{
+	uint64_t per, r0, n;
+
+	if (g_pool.chunk) {
+		while ((r0 = __atomic_fetch_add(&g_pool.next, g_pool.chunk,
+						__ATOMIC_RELAXED)) < g_pool.nrows) {
+			n = g_pool.nrows - r0;
+			if (n > g_pool.chunk)
+				n = g_pool.chunk;
+			pool_do(r0, n);
+		}
+	} else {
+		per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
+		r0 = per * (uint64_t)id;
+		n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
+		if (n > per)
+			n = per;
+		if (n)
+			pool_do(r0, n);
+	}
+}
+
+static void *worker_fast(void *arg)
+{
+	long id = (long)arg;
+	unsigned mygen = 0;
+
+	for (;;) {
+		unsigned g = __atomic_load_n(&g_pool.fgen, __ATOMIC_ACQUIRE);
+
+		if (g == mygen) {
+			uint64_t t0 = pool_ticks();
+			unsigned k = 0;
+
+			while ((g = __atomic_load_n(&g_pool.fgen,
+						    __ATOMIC_ACQUIRE)) == mygen) {
+				pool_relax();
+				if ((++k & 63) == 0 &&
+				    pool_ticks() - t0 >= pool_spin_now())
+					break;
+			}
+			if (g == mygen) {
+				/*
+				 * PARK. The count goes up BEFORE the
+				 * generation is read again, and the caller
+				 * bumps the generation BEFORE it reads the
+				 * count -- both sequentially consistent -- so
+				 * one of the two always sees the other, and
+				 * futex_wait returns at once if the
+				 * generation moved in between.
+				 */
+				__atomic_fetch_add(&g_pool.fsleepers, 1,
+						   __ATOMIC_SEQ_CST);
+				while ((g = __atomic_load_n(&g_pool.fgen,
+						__ATOMIC_SEQ_CST)) == mygen)
+					futex_op(&g_pool.fgen,
+						 FUTEX_WAIT_PRIVATE, mygen);
+				__atomic_fetch_sub(&g_pool.fsleepers, 1,
+						   __ATOMIC_SEQ_CST);
+			}
+		}
+		mygen = g;
+		pool_share(id);
+		if (__atomic_add_fetch(&g_pool.fdone, 1, __ATOMIC_SEQ_CST)
+		    == (unsigned)g_pool.nw &&
+		    __atomic_load_n(&g_pool.fcaller_sleep, __ATOMIC_SEQ_CST))
+			futex_op(&g_pool.fdone, FUTEX_WAKE_PRIVATE, 1);
+	}
+	return NULL;
+}
+
+/*
+ * The fan out and fan in of the fast form. The job's fields are written and
+ * pool_arm has run; the release of the generation publishes them.
+ */
+static void pool_go_fast(void)
+{
+	unsigned d;
+
+	__atomic_store_n(&g_pool.fdone, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&g_pool.fgen, g_pool.fgen + 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&g_pool.fsleepers, __ATOMIC_SEQ_CST))
+		futex_op(&g_pool.fgen, FUTEX_WAKE_PRIVATE, INT_MAX);
+
+	/* the caller is the last share */
+	pool_share(g_pool.n - 1);
+
+	/*
+	 * THE TAIL. The caller spins: it is one of the n threads the job was
+	 * sized for, so its core is its own. Past the spin it parks too.
+	 */
+	{
+		uint64_t t0 = pool_ticks();
+		unsigned k = 0;
+
+		while ((d = __atomic_load_n(&g_pool.fdone, __ATOMIC_ACQUIRE))
+		       != (unsigned)g_pool.nw) {
+			pool_relax();
+			if ((++k & 63) == 0 &&
+			    pool_ticks() - t0 >= pool_spin_now())
+				break;
+		}
+	}
+	if (d != (unsigned)g_pool.nw) {
+		__atomic_store_n(&g_pool.fcaller_sleep, 1, __ATOMIC_SEQ_CST);
+		while ((d = __atomic_load_n(&g_pool.fdone, __ATOMIC_SEQ_CST))
+		       != (unsigned)g_pool.nw)
+			futex_op(&g_pool.fdone, FUTEX_WAIT_PRIVATE, d);
+		__atomic_store_n(&g_pool.fcaller_sleep, 0, __ATOMIC_RELAXED);
+	}
+	/* acquire: every worker's writes are visible from here */
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+
+/*
+ * Run the job whose fields are set, on whichever form the pool is.
+ */
+static void pool_go(void)
+{
+	double t0 = 0;
+	int st = pool_stats_on();
+
+	if (st)
+		t0 = (double)pool_ticks();
+	if (g_pool.fast) {
+		pool_go_fast();
+	} else {
+		pthread_mutex_lock(&g_pool.mu);
+		g_pool.gen++;
+		pthread_cond_broadcast(&g_pool.cv_work);
+		while (g_pool.done < g_pool.n)
+			pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
+		pthread_mutex_unlock(&g_pool.mu);
+	}
+	if (st)
+		pool_stat_add(g_pool.fn ? (void *)g_pool.fn
+			      : g_pool.nt ? (void *)npu_matvec
+			      : (void *)gguf_matvec, g_pool.nrows,
+			      ((double)pool_ticks() - t0)
+			      / (double)pool_ticks_per_us());
+}
+
 static void *worker(void *arg)
 {
 	long id = (long)arg;
 	int mygen = 0;
 
 	for (;;) {
-		uint64_t per, r0, n;
-
 		pthread_mutex_lock(&g_pool.mu);
 		while (g_pool.gen == mygen && !g_pool.stop)
 			pthread_cond_wait(&g_pool.cv_work, &g_pool.mu);
@@ -433,23 +804,7 @@ static void *worker(void *arg)
 		mygen = g_pool.gen;
 		pthread_mutex_unlock(&g_pool.mu);
 
-		if (g_pool.chunk) {
-			while ((r0 = __atomic_fetch_add(&g_pool.next, g_pool.chunk,
-							__ATOMIC_RELAXED)) < g_pool.nrows) {
-				n = g_pool.nrows - r0;
-				if (n > g_pool.chunk)
-					n = g_pool.chunk;
-				pool_do(r0, n);
-			}
-		} else {
-			per = (g_pool.nrows + (uint64_t)g_pool.n - 1) / (uint64_t)g_pool.n;
-			r0 = per * (uint64_t)id;
-			n = r0 >= g_pool.nrows ? 0 : g_pool.nrows - r0;
-			if (n > per)
-				n = per;
-			if (n)
-				pool_do(r0, n);
-		}
+		pool_share(id);
 
 		pthread_mutex_lock(&g_pool.mu);
 		if (++g_pool.done == g_pool.n)
@@ -774,12 +1129,26 @@ static void cpus_pin(void)
 	cpu_clock_report(&set);
 }
 
+/*
+ * THE POOL'S OWN MASK, AND THE ONE A PROMPT GETS.
+ *
+ * g_pool_narrow is what the workers were left with when pool_start finished
+ * -- the caller's cluster, CHARSIU_POOL_CPUS, or the inherited mask -- and it
+ * is what decode and the spec verify keep. g_pool_wide is the process mask
+ * as it was before anything here pinned, which is the whole machine unless an
+ * operator ran taskset, and then it is theirs.
+ */
+static cpu_set_t g_proc_mask, g_pool_narrow;
+static int g_proc_mask_ok, g_pool_narrow_ok, g_pool_wide_now;
+
 static void pool_start(int nthreads)
 {
 	const char *env = getenv("CHARSIU_THREADS");
 
 	if (g_pool.n)
 		return;
+	if (!sched_getaffinity(0, sizeof(g_proc_mask), &g_proc_mask))
+		g_proc_mask_ok = 1;
 	cpus_pin();
 	if (nthreads < 1 && env)
 		nthreads = atoi(env);
@@ -795,9 +1164,13 @@ static void pool_start(int nthreads)
 	pthread_mutex_init(&g_pool.mu, NULL);
 	pthread_cond_init(&g_pool.cv_work, NULL);
 	pthread_cond_init(&g_pool.cv_done, NULL);
-	g_pool.th = calloc((size_t)nthreads, sizeof(*g_pool.th));
-	for (long i = 0; i < nthreads; i++)
-		pthread_create(&g_pool.th[i], NULL, worker, (void *)i);
+	g_pool.fast = pool_fast_on();
+	g_pool.nw = g_pool.fast ? nthreads - 1 : nthreads;
+	g_pool.spin_ticks = (uint64_t)pool_spin_decode_us() * pool_ticks_per_us();
+	g_pool.th = calloc((size_t)g_pool.nw, sizeof(*g_pool.th));
+	for (long i = 0; i < g_pool.nw; i++)
+		pthread_create(&g_pool.th[i], NULL,
+			       g_pool.fast ? worker_fast : worker, (void *)i);
 	{
 		const char *pspec = getenv("CHARSIU_POOL_CPUS");
 		cpu_set_t pset;
@@ -814,7 +1187,7 @@ static void pool_start(int nthreads)
 		 */
 		if ((!pspec || !*pspec) && g_cpus_autopinned &&
 		    CPU_COUNT(&g_cpus_inherited) > 0) {
-			for (long i = 0; i < nthreads; i++)
+			for (long i = 0; i < g_pool.nw; i++)
 				bad |= pthread_setaffinity_np(
 					g_pool.th[i],
 					sizeof(g_cpus_inherited),
@@ -828,7 +1201,7 @@ static void pool_start(int nthreads)
 					CPU_COUNT(&g_cpus_inherited));
 		} else if (pspec && *pspec &&
 			   (n = cpus_parse(pspec, &pset)) > 0) {
-			for (long i = 0; i < nthreads; i++)
+			for (long i = 0; i < g_pool.nw; i++)
 				bad |= pthread_setaffinity_np(g_pool.th[i],
 							      sizeof(pset),
 							      &pset) != 0;
@@ -841,6 +1214,90 @@ static void pool_start(int nthreads)
 					pspec, n);
 		}
 	}
+	if (!pthread_getaffinity_np(g_pool.th[0], sizeof(g_pool_narrow),
+				    &g_pool_narrow))
+		g_pool_narrow_ok = 1;
+}
+
+/*
+ * THE WHOLE MACHINE FOR A PROMPT, THE FAST CLUSTER FOR EVERYTHING ELSE.
+ *
+ * CHARSIU_POOL_CPUS=0-7 took about 40 ms off a 124 token Qwen3-0.6B prompt
+ * (fence, read and scale all moved) and made decode BIMODAL at the same time:
+ * decode's pool work is small and latency bound, and a worker that lands on
+ * an A53 holds the barrier. The two want different masks, so a batched
+ * PROMPT chunk gets the wide one and is handed back the narrow one before its
+ * head runs. A spec verify pass is decode's and never widens.
+ *
+ * NOTHING ABOUT THE ARITHMETIC MOVES. Which thread takes which chunk was
+ * already a race under the dynamic split; every unit writes its own outputs
+ * from its own inputs, so the bits are the same on any mask.
+ *
+ * CHARSIU_PREFILL_WIDE=0 is the control. CHARSIU_PREFILL_POOL_CPUS picks the
+ * wide set; by default it is the mask the process started with.
+ */
+static int prefill_wide_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_PREFILL_WIDE", 1);
+	return v;
+}
+
+static void pool_prefill(int on)
+{
+	static cpu_set_t wide;
+	static int wide_ok = -1;
+	int bad = 0;
+
+	if (g_pool.n <= 1 || !g_pool_narrow_ok || !prefill_wide_on())
+		return;
+	if (wide_ok < 0) {
+		const char *spec = getenv("CHARSIU_PREFILL_POOL_CPUS");
+
+		wide_ok = 0;
+		if (spec && *spec) {
+			if (cpus_parse(spec, &wide) > 0)
+				wide_ok = 1;
+		} else if (g_proc_mask_ok) {
+			wide = g_proc_mask;
+			wide_ok = 1;
+		}
+		/* the same mask is not a change, and saying so per chunk
+		 * would be two syscalls a worker for nothing */
+		if (wide_ok && CPU_EQUAL(&wide, &g_pool_narrow))
+			wide_ok = 0;
+		if (wide_ok && charsiu_diag())
+			fprintf(stderr, "charsiu: a batched prompt runs the "
+				"pool on %d CPUs, decode on %d "
+				"(CHARSIU_PREFILL_WIDE=0 to keep one mask)\n",
+				CPU_COUNT(&wide), CPU_COUNT(&g_pool_narrow));
+	}
+	if (!wide_ok || on == g_pool_wide_now)
+		return;
+	for (int i = 0; i < g_pool.nw; i++)
+		bad |= pthread_setaffinity_np(g_pool.th[i], sizeof(wide),
+					      on ? &wide : &g_pool_narrow) != 0;
+	g_pool_wide_now = on;
+	if (bad) {
+		static int said;
+
+		if (!said++)
+			fprintf(stderr, "charsiu: the prompt's pool mask did "
+				"not apply\n");
+	}
+}
+
+void llama_prefill_scope(int n)
+{
+	g_pstat_prompt = n > 0;
+	pool_prefill(n > 0);
+	if (g_pool.fast)
+		__atomic_store_n(&g_pool.spin_ticks, (uint64_t)(n > 0
+				 ? pool_spin_us() : pool_spin_decode_us())
+				 * pool_ticks_per_us(), __ATOMIC_RELAXED);
+	charsiu_pool_prewarm_m = n > 0 ? (unsigned)n : 0;
 }
 
 /*
@@ -848,23 +1305,28 @@ static void pool_start(int nthreads)
  * inline rather than paying a broadcast and a condition variable to reach
  * itself.
  */
-static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
-		     uint64_t n, unsigned grain)
+static void pool_run_chunk(void (*fn)(void *, uint64_t, uint64_t),
+			   void *ctx, uint64_t n, unsigned grain, int one)
 {
 	if (g_pool.n <= 1) {
 		fn(ctx, 0, n);
 		return;
 	}
-	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = fn;
 	g_pool.ctx = ctx;
 	pool_arm(n, grain);
-	g_pool.gen++;
-	pthread_cond_broadcast(&g_pool.cv_work);
-	while (g_pool.done < g_pool.n)
-		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
+	/* one item a take, for a job whose items are few, ordered largest
+	 * first and of very different cost */
+	if (one && g_pool.chunk)
+		g_pool.chunk = 1;
+	pool_go();
 	g_pool.fn = NULL;
-	pthread_mutex_unlock(&g_pool.mu);
+}
+
+static void pool_run(void (*fn)(void *, uint64_t, uint64_t), void *ctx,
+		     uint64_t n, unsigned grain)
+{
+	pool_run_chunk(fn, ctx, n, grain, 0);
 }
 
 void charsiu_parallel_for(void (*fn)(void *ctx, uint64_t r0, uint64_t n),
@@ -2405,9 +2867,6 @@ static void matvec_pair(struct llama_state *s, const float *x,
 
 	if (s->pool.dev && !group_off() && npu_mode() && s->act.npu_ok &&
 	    npu_call_worth(mac, wa->name)) {
-		/* int8 takes q1; int4 takes the float and never looks */
-		if (charsiu_npu_needs_q1(s->pool.dev))
-			act_q1_timed(&s->act);
 		for (i = 0; i < n; i++) {
 			nt[i] = npu_get(s, w[i]);
 			ids[i] = -1;
@@ -2420,6 +2879,11 @@ static void matvec_pair(struct llama_state *s, const float *x,
 			if (ids[i] < 0)
 				break;
 		}
+		/* int8 takes q1; int4 takes the float and never looks. Asked
+		 * of the group's first id: a group across the two widths is
+		 * refused, and the fallback below asks per tensor. */
+		if (i == n && charsiu_npu_needs_q1_id(s->pool.dev, ids[0]))
+			act_q1_timed(&s->act);
 		if (i == n &&
 		    !charsiu_npu_matvec_group(s->pool.dev, ids, n, &s->act, y))
 			return;
@@ -2459,7 +2923,7 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		 * CPU still finishes and still reports which shape stopped
 		 * answering, which is worth more than either a hang or a crash.
 		 */
-		if (id >= 0 && charsiu_npu_needs_q1(s->pool.dev))
+		if (id >= 0 && charsiu_npu_needs_q1_id(s->pool.dev, id))
 			act_q1_timed(a);
 		if (id >= 0 && !charsiu_npu_matvec(s->pool.dev, id, a, y)) {
 			npu_quantise_output((struct npu_tensor *)nt, y, nt->n,
@@ -2493,18 +2957,13 @@ static void matvec_again(struct llama_state *s, const struct gguf_tensor *w,
 		return;
 	}
 
-	pthread_mutex_lock(&g_pool.mu);
 	g_pool.fn = NULL;
 	g_pool.w = w;
 	g_pool.nt = nt;
 	g_pool.a = a;
 	g_pool.y = y;
 	pool_arm(w->ne[1], 1);
-	g_pool.gen++;
-	pthread_cond_broadcast(&g_pool.cv_work);
-	while (g_pool.done < g_pool.n)
-		pthread_cond_wait(&g_pool.cv_done, &g_pool.mu);
-	pthread_mutex_unlock(&g_pool.mu);
+	pool_go();
 
 	/* after the fan in, because the scale is a property of the whole vector */
 	if (nt)
@@ -3853,6 +4312,21 @@ struct llama_state *llama_state_new(const struct llama_model *m, int n_ctx)
 	kvn = (size_t)m->n_layer * (size_t)s->n_ctx * m->n_head_kv * m->head_dim;
 	s->kcache = calloc(kvn, sizeof(float));
 	s->vcache = calloc(kvn, sizeof(float));
+	/*
+	 * HALF AS MUCH AGAIN, NOT INSTEAD. The batched prompt's attention,
+	 * the NPU mirror's catch-up and the KV_BITS simulation all read the
+	 * float cache, so it stays; this is +50% of the KV memory when the
+	 * switch is on (235 MB on Qwen3-0.6B at -c 2048) and nothing when it
+	 * is off.
+	 */
+	if (kv16_on()) {
+		s->kc16 = calloc(kvn, sizeof(uint16_t));
+		s->vc16 = calloc(kvn, sizeof(uint16_t));
+		if (!s->kc16 || !s->vc16) {
+			llama_state_free(s);
+			return NULL;
+		}
+	}
 	s->x   = calloc(m->n_embd, sizeof(float));
 	/*
 	 * xb IS BOTH the normalised embedding and the attention output, and
@@ -3997,6 +4471,7 @@ void llama_state_free(struct llama_state *s)
 	if (!s)
 		return;
 	free(s->kcache); free(s->vcache);
+	free(s->kc16); free(s->vc16);
 	free(s->x); free(s->xb); free(s->xb2);
 	free(s->hb); free(s->hb2);
 	free(s->q); free(s->k); free(s->v);
@@ -4770,6 +5245,684 @@ static void attn_heads(void *vj, uint64_t h0, uint64_t nh)
 }
 
 /*
+ * ---- THE GROUPED DECODE KERNEL: CHARSIU_ATTN_GQA, AND CHARSIU_KV16 ----
+ *
+ * WHAT attn_heads COSTS, AND WHY IT IS NOT THE BYTES. On the CM5, Qwen3-0.6B,
+ * decode attention is 77 ms a token at 1480 positions, 63% of the token, over a
+ * float cache of 229 kB a position: 4.4 GB/s, several times under what the
+ * board's memory gives. attn_heads already reads each kv row once per GROUP
+ * (the paragraph above it), so the shortfall is not repeated reads. It is the
+ * shape of the two inner calls. attn_dot is one position against one query in
+ * two accumulator chains, so it waits on the fma latency sixteen times a
+ * position; attn_axpy loads and stores the whole output row for every
+ * position. Both are the forms attn_block_heads already replaced for the
+ * batched prompt with attn_dot4 and attn_axpy8 -- four positions a pass, eight
+ * positions per load and store of the output -- and decode never got them.
+ *
+ * SO THIS IS THOSE KERNELS, PLUS THE GROUP. For one kv head it takes every
+ * query that reads it (the gqa heads of a decode row; the gqa heads of every
+ * row of a speculative verify pass, m <= 8) and walks K once in blocks of four
+ * positions and V once in blocks of eight, with the two heads of one row going
+ * through pair kernels that share each K and V load between them.
+ *
+ * AND IT IS BIT IDENTICAL TO attn_heads, not close to it. Per (query,
+ * position) the score is attn_dot's arithmetic exactly: the same two lane
+ * accumulators split at i % 8 < 4, the same horizontal add, the same scalar
+ * tail, the same `* scale` afterwards. The softmax is softmax() over the same
+ * window. The output is o += round(p * v) in ascending t, separately rounded,
+ * which is attn_axpy's arithmetic and attn_axpy8's. Only the issue order of
+ * independent operations moves. tests/dattn_exact.c compares the two kernels
+ * bit for bit over head sizes, group sizes, lengths, windows and verify rows.
+ *
+ * CHARSIU_KV16 IS THE SAME KERNEL READING HALVES. The blocks of four K rows and
+ * eight V rows are widened to fp32 into a stack scratch that stays in L1 and
+ * then go through the same arithmetic, so a half cache gives exactly what the
+ * float kernel gives on a float cache whose values were rounded through fp16
+ * -- which is what tests/dattn_exact.c checks for that arm, and is why the
+ * only question CHARSIU_KV16 asks the board is the rounding's perplexity.
+ *
+ * WHY A SECOND CACHE AND NOT THE NPU's fp16 MIRROR (struct attn_npu). Four
+ * reasons, each enough:
+ *   1. it exists only when CHARSIU_ATTN_NPU took the prompt on an NPU build,
+ *      and the decode attention has to work on every run;
+ *   2. it is in the hardware's weight tiling, and the V surface is TRANSPOSED
+ *      (a position is one element of each of head_dim output channels, in
+ *      groups of 16 channels by a k group of positions) with a reduction extent
+ *      that moves on the doubling ladder and repacks;
+ *   3. decode was deliberately taken OFF it: appending to it every token was
+ *      priced on the board at 24.63 -> 20.84 tok/s on Qwen3, and
+ *      attn_npu_catchup fills the hole lazily on the next batched layer. Reading
+ *      it from decode would put that append back, plus a whole buffer object
+ *      marked dirty for the next sync, every token;
+ *   4. it is a DRM buffer object whose CPU mapping attribute nothing in this
+ *      tree has measured, and a cache read through a write combined mapping
+ *      would be many times slower than the float cache it replaces.
+ * The price of the second cache is memory, +50% of the KV (see
+ * llama_state_new). The float cache stays, because the batched prompt, the
+ * mirror's catch-up and the KV_BITS simulations read it.
+ */
+#define GQA_HDMAX 512    /* gemma4's full layers; a larger head falls back */
+#define GQA_QMAX 16      /* queries a pass over one kv head's cache */
+
+static inline uint16_t kv16_f2h(float f)
+{
+	/*
+	 * ROUND TO NEAREST EVEN, subnormals kept: what FCVTN does under the
+	 * FPCR Linux gives a process, so the CHARSIU_NO_NEON build stores the
+	 * same bits as the vector one (tests/dattn_exact.c checks the two
+	 * against each other). charsiu_f2h TRUNCATES and is the NPU's packer;
+	 * it is not reused here on purpose.
+	 */
+	uint32_t u, sign;
+	uint16_t o;
+
+	memcpy(&u, &f, 4);
+	sign = u & 0x80000000u;
+	u ^= sign;
+	if (u >= 0x47800000u) {                 /* >= 65536, inf, nan */
+		o = u > 0x7f800000u ? 0x7e00 : 0x7c00;
+	} else if (u < 0x38800000u) {           /* a half subnormal or 0 */
+		float t;
+
+		memcpy(&t, &u, 4);
+		t += 0.5f;
+		memcpy(&u, &t, 4);
+		o = (uint16_t)(u - 0x3f000000u);
+	} else {
+		uint32_t odd = (u >> 13) & 1u;
+
+		u += 0xc8000fffu;                   /* rebias, and half an ulp */
+		u += odd;
+		o = (uint16_t)(u >> 13);
+	}
+	return (uint16_t)(o | (sign >> 16));
+}
+
+static inline float kv16_h2f(uint16_t h)
+{
+	uint32_t u = (uint32_t)(h & 0x7fff) << 13, e = u & 0x0f800000u;
+	float f;
+
+	u += 0x38000000u;
+	if (e == 0x0f800000u) {
+		u += 0x38000000u;                   /* inf, nan */
+	} else if (e == 0) {
+		float m;
+		uint32_t mu = 0x38800000u;
+
+		u += 0x00800000u;
+		memcpy(&f, &u, 4);
+		memcpy(&m, &mu, 4);
+		f -= m;
+		memcpy(&u, &f, 4);
+	}
+	u |= (uint32_t)(h & 0x8000) << 16;
+	memcpy(&f, &u, 4);
+	return f;
+}
+
+static void kv16_put(uint16_t *d, const float *x, uint32_t n)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	for (; i + 4 <= n; i += 4)
+		vst1_u16(d + i, vreinterpret_u16_f16(
+				 vcvt_f16_f32(vld1q_f32(x + i))));
+#endif
+	for (; i < n; i++)
+		d[i] = kv16_f2h(x[i]);
+}
+
+static void kv16_get(float *d, const uint16_t *x, uint32_t n)
+{
+	uint32_t i = 0;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	for (; i + 8 <= n; i += 8) {
+		float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(x + i));
+
+		vst1q_f32(d + i, vcvt_f32_f16(vget_low_f16(h)));
+		vst1q_f32(d + i + 4, vcvt_high_f32_f16(h));
+	}
+#endif
+	for (; i < n; i++)
+		d[i] = kv16_h2f(x[i]);
+}
+
+/*
+ * attn_dot4 FOR TWO QUERIES, the K loads shared. Per (query, position) the
+ * same operations in the same order as attn_dot4, and so as attn_dot.
+ */
+static inline void attn_dot4x2(const float *qa, const float *qb,
+			       const float *k0, const float *k1,
+			       const float *k2, const float *k3, uint32_t hd,
+			       float *oa, float *ob)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn()) {
+		float32x4_t a0 = vdupq_n_f32(0.0f), a0h = vdupq_n_f32(0.0f);
+		float32x4_t a1 = vdupq_n_f32(0.0f), a1h = vdupq_n_f32(0.0f);
+		float32x4_t a2 = vdupq_n_f32(0.0f), a2h = vdupq_n_f32(0.0f);
+		float32x4_t a3 = vdupq_n_f32(0.0f), a3h = vdupq_n_f32(0.0f);
+		float32x4_t b0 = vdupq_n_f32(0.0f), b0h = vdupq_n_f32(0.0f);
+		float32x4_t b1 = vdupq_n_f32(0.0f), b1h = vdupq_n_f32(0.0f);
+		float32x4_t b2 = vdupq_n_f32(0.0f), b2h = vdupq_n_f32(0.0f);
+		float32x4_t b3 = vdupq_n_f32(0.0f), b3h = vdupq_n_f32(0.0f);
+		float s[8];
+		uint32_t i = 0;
+
+		for (; i + 8 <= hd; i += 8) {
+			float32x4_t xa = vld1q_f32(qa + i), xah = vld1q_f32(qa + i + 4);
+			float32x4_t xb = vld1q_f32(qb + i), xbh = vld1q_f32(qb + i + 4);
+			float32x4_t k, kh;
+
+			k = vld1q_f32(k0 + i); kh = vld1q_f32(k0 + i + 4);
+			a0 = vfmaq_f32(a0, xa, k); a0h = vfmaq_f32(a0h, xah, kh);
+			b0 = vfmaq_f32(b0, xb, k); b0h = vfmaq_f32(b0h, xbh, kh);
+			k = vld1q_f32(k1 + i); kh = vld1q_f32(k1 + i + 4);
+			a1 = vfmaq_f32(a1, xa, k); a1h = vfmaq_f32(a1h, xah, kh);
+			b1 = vfmaq_f32(b1, xb, k); b1h = vfmaq_f32(b1h, xbh, kh);
+			k = vld1q_f32(k2 + i); kh = vld1q_f32(k2 + i + 4);
+			a2 = vfmaq_f32(a2, xa, k); a2h = vfmaq_f32(a2h, xah, kh);
+			b2 = vfmaq_f32(b2, xb, k); b2h = vfmaq_f32(b2h, xbh, kh);
+			k = vld1q_f32(k3 + i); kh = vld1q_f32(k3 + i + 4);
+			a3 = vfmaq_f32(a3, xa, k); a3h = vfmaq_f32(a3h, xah, kh);
+			b3 = vfmaq_f32(b3, xb, k); b3h = vfmaq_f32(b3h, xbh, kh);
+		}
+		s[0] = vaddvq_f32(vaddq_f32(a0, a0h));
+		s[1] = vaddvq_f32(vaddq_f32(a1, a1h));
+		s[2] = vaddvq_f32(vaddq_f32(a2, a2h));
+		s[3] = vaddvq_f32(vaddq_f32(a3, a3h));
+		s[4] = vaddvq_f32(vaddq_f32(b0, b0h));
+		s[5] = vaddvq_f32(vaddq_f32(b1, b1h));
+		s[6] = vaddvq_f32(vaddq_f32(b2, b2h));
+		s[7] = vaddvq_f32(vaddq_f32(b3, b3h));
+		for (; i < hd; i++) {
+			s[0] += qa[i] * k0[i];
+			s[1] += qa[i] * k1[i];
+			s[2] += qa[i] * k2[i];
+			s[3] += qa[i] * k3[i];
+			s[4] += qb[i] * k0[i];
+			s[5] += qb[i] * k1[i];
+			s[6] += qb[i] * k2[i];
+			s[7] += qb[i] * k3[i];
+		}
+		memcpy(oa, s, 4 * sizeof(float));
+		memcpy(ob, s + 4, 4 * sizeof(float));
+		return;
+	}
+#endif
+	attn_dot4(qa, k0, k1, k2, k3, hd, oa);
+	attn_dot4(qb, k0, k1, k2, k3, hd, ob);
+}
+
+/*
+ * attn_axpy8 FOR TWO OUTPUTS, the V loads shared. Each output element still
+ * takes its eight products in ascending t, each multiply and add separately
+ * rounded, the barrier keeping the compiler from fusing them.
+ */
+static inline void attn_axpy8x2(float *oa, float *ob, const float *pa,
+				const float *pb, const float *v,
+				size_t vstride, uint32_t hd)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain()) {
+		float32x4_t wa[8], wb[8];
+		uint32_t i = 0;
+		unsigned q;
+
+		for (q = 0; q < 8; q++) {
+			wa[q] = vdupq_n_f32(pa[q]);
+			wb[q] = vdupq_n_f32(pb[q]);
+		}
+		for (; i + 4 <= hd; i += 4) {
+			float32x4_t xa = vld1q_f32(oa + i), xb = vld1q_f32(ob + i);
+
+			for (q = 0; q < 8; q++) {
+				float32x4_t vv = vld1q_f32(v + q * vstride + i);
+				float32x4_t ta = vmulq_f32(wa[q], vv);
+				float32x4_t tb = vmulq_f32(wb[q], vv);
+
+				__asm__("" : "+w"(ta), "+w"(tb));
+				xa = vaddq_f32(xa, ta);
+				xb = vaddq_f32(xb, tb);
+			}
+			vst1q_f32(oa + i, xa);
+			vst1q_f32(ob + i, xb);
+		}
+		for (; i < hd; i++) {
+			float x = oa[i], y = ob[i];
+
+			for (q = 0; q < 8; q++) {
+				x += pa[q] * v[q * vstride + i];
+				y += pb[q] * v[q * vstride + i];
+			}
+			oa[i] = x;
+			ob[i] = y;
+		}
+		return;
+	}
+#endif
+	attn_axpy8(oa, pa, v, vstride, hd);
+	attn_axpy8(ob, pb, v, vstride, hd);
+}
+
+/*
+ * THE SAME TWO PAIR KERNELS READING HALVES, widened in registers.
+ *
+ * Widening a block into a scratch first and then running the float kernels
+ * on it was the first version, and on the desk it was SLOWER than the float
+ * cache it halves (0.85x at 512 positions): every element was stored to L1
+ * and loaded back once per query on top of the conversion. Here each 8 halves
+ * are loaded once and widened once into two registers that both queries use.
+ * The widening is exact, so the arithmetic after it is the float kernels'
+ * to the bit and tests/dattn_exact.c holds the two together. Only the full
+ * blocks come here; a block a query only partly sees still goes through the
+ * scratch and the single position kernels.
+ */
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+static inline void h8(const uint16_t *p, float32x4_t *lo, float32x4_t *hi)
+{
+	float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(p));
+
+	*lo = vcvt_f32_f16(vget_low_f16(h));
+	*hi = vcvt_high_f32_f16(h);
+}
+#endif
+
+/*
+ * G IS 1 OR 2 AND ALWAYS A CONSTANT AT THE CALL, so the loops over it unroll
+ * and the accumulators stay in registers: a single query (an odd group, or a
+ * model with no GQA) does not pay for a second one it would throw away.
+ */
+static inline __attribute__((always_inline)) void
+attn_dot4_hg(const float *const *qs, unsigned G, const uint16_t *k0,
+	     size_t ks, uint32_t hd, float *const *os)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn() && hd % 8 == 0) {
+		float32x4_t lo[2][4], hi[2][4];
+		uint32_t i;
+		unsigned r, g;
+
+		for (g = 0; g < G; g++)
+			for (r = 0; r < 4; r++)
+				lo[g][r] = hi[g][r] = vdupq_n_f32(0.0f);
+		for (i = 0; i < hd; i += 8) {
+			float32x4_t xl[2], xh[2];
+
+			for (g = 0; g < G; g++) {
+				xl[g] = vld1q_f32(qs[g] + i);
+				xh[g] = vld1q_f32(qs[g] + i + 4);
+			}
+			for (r = 0; r < 4; r++) {
+				float32x4_t k, kh;
+
+				h8(k0 + r * ks + i, &k, &kh);
+				for (g = 0; g < G; g++) {
+					lo[g][r] = vfmaq_f32(lo[g][r], xl[g], k);
+					hi[g][r] = vfmaq_f32(hi[g][r], xh[g], kh);
+				}
+			}
+		}
+		for (g = 0; g < G; g++)
+			for (r = 0; r < 4; r++)
+				os[g][r] = vaddvq_f32(vaddq_f32(lo[g][r],
+								hi[g][r]));
+		return;
+	}
+#endif
+	{
+		float buf[4 * GQA_HDMAX];
+		unsigned r, g;
+
+		for (r = 0; r < 4; r++)
+			kv16_get(buf + r * hd, k0 + r * ks, hd);
+		for (g = 0; g < G; g++)
+			attn_dot4(qs[g], buf, buf + hd, buf + 2 * hd,
+				  buf + 3 * hd, hd, os[g]);
+	}
+}
+
+static inline __attribute__((always_inline)) void
+attn_axpy8_hg(float *const *os, const float *const *ps, unsigned G,
+	      const uint16_t *v, size_t vs, uint32_t hd)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (!cpu_plain() && hd % 8 == 0) {
+		uint32_t i;
+		unsigned q, g;
+
+		for (i = 0; i < hd; i += 8) {
+			float32x4_t xl[2], xh[2];
+
+			for (g = 0; g < G; g++) {
+				xl[g] = vld1q_f32(os[g] + i);
+				xh[g] = vld1q_f32(os[g] + i + 4);
+			}
+			for (q = 0; q < 8; q++) {
+				float32x4_t vl, vh;
+
+				h8(v + q * vs + i, &vl, &vh);
+				for (g = 0; g < G; g++) {
+					float32x4_t t0 = vmulq_n_f32(vl, ps[g][q]);
+					float32x4_t t1 = vmulq_n_f32(vh, ps[g][q]);
+
+					__asm__("" : "+w"(t0), "+w"(t1));
+					xl[g] = vaddq_f32(xl[g], t0);
+					xh[g] = vaddq_f32(xh[g], t1);
+				}
+			}
+			for (g = 0; g < G; g++) {
+				vst1q_f32(os[g] + i, xl[g]);
+				vst1q_f32(os[g] + i + 4, xh[g]);
+			}
+		}
+		return;
+	}
+#endif
+	{
+		float buf[8 * GQA_HDMAX];
+		unsigned r, g;
+
+		for (r = 0; r < 8; r++)
+			kv16_get(buf + r * hd, v + r * vs, hd);
+		for (g = 0; g < G; g++)
+			attn_axpy8(os[g], ps[g], buf, hd, hd);
+	}
+}
+
+/* one query of a group: where it reads, where it writes, what it may see */
+struct gqa_q {
+	const float *q;   /* hd floats, roped */
+	float *sc;        /* its scores, indexed by ABSOLUTE position */
+	float *out;       /* hd floats */
+	int tlo, pos;     /* the window, inclusive at both ends */
+};
+
+/* the next query shares this one's window, so the pair kernels may take both */
+static inline int gqa_paired(const struct gqa_q *Q, unsigned i, unsigned nq)
+{
+	return i + 1 < nq && Q[i + 1].tlo == Q[i].tlo
+	    && Q[i + 1].pos == Q[i].pos;
+}
+
+/*
+ * EVERY QUERY OF ONE KV HEAD, ONE PASS OVER ITS K AND ONE OVER ITS V.
+ *
+ * kf/vf is the float cache of this kv head at position 0, or kh/vh the half
+ * one; exactly one pair is non NULL. ks is the stride between two positions
+ * in whichever it is. The blocks are aligned on the lowest position any query
+ * sees; a block a query only partly sees goes position by position through
+ * attn_dot and attn_axpy, which is not a different answer (see attn_block_heads,
+ * which makes the same split).
+ */
+/*
+ * CHARSIU_ATTN_PF=N: prefetch the float cache N positions ahead of the K and
+ * V walks of the grouped decode kernel (0, the default, is off). The two
+ * walks are sequential streams, but a single A72 thread reached 3.6 GB/s on
+ * them against 8.6 for a bare reader, and four threads 5.8 against ~11: the
+ * loop is waiting on the line it is about to use. A prefetch reads nothing
+ * the kernel does not read and changes no arithmetic.
+ *
+ * MEASURED SLOWER, so off: 16 positions ahead took Qwen3-0.6B's attention
+ * from 6.27 to 6.92 ms a token in both rounds. The hardware prefetcher was
+ * already on these streams; the software one only adds issue slots.
+ */
+static int attn_pf_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_PF");
+
+		v = e && *e ? atoi(e) : 0;
+		if (v < 0)
+			v = 0;
+	}
+	return v;
+}
+
+static inline void attn_pf(const float *base, size_t ks, int t0, int nt,
+			   int tmax, uint32_t hd)
+{
+	for (int t = t0; t < t0 + nt && t <= tmax; t++) {
+		const char *p = (const char *)(base + (size_t)t * ks);
+
+		for (uint32_t o = 0; o < hd * 4u; o += 64)
+			__builtin_prefetch(p + o, 0, 3);
+	}
+}
+
+static void attn_gqa_group(const struct gqa_q *Q, unsigned nq,
+			   const float *kf, const float *vf,
+			   const uint16_t *kh, const uint16_t *vh, size_t ks,
+			   uint32_t hd, float scale)
+{
+	float buf[8 * GQA_HDMAX];
+	int tmin = Q[0].tlo, tmax = Q[0].pos;
+	unsigned i;
+	/*
+	 * WIDEN IN REGISTERS FOR ONE PAIR, INTO L1 FOR MORE. In registers
+	 * each half is widened once per pair that reads it, which is once for
+	 * a decode row and six times for a six row verify pass -- and on the
+	 * desk that made the verify pass 0.55x of the float kernel. With more
+	 * than one pair the block is widened once into buf and every pair runs
+	 * the float kernels on it. Either way is exact; this is only cost.
+	 */
+	int inreg = nq <= 2;
+	int pf = kf ? attn_pf_rows() : 0;
+
+	for (i = 1; i < nq; i++) {
+		if (Q[i].tlo < tmin)
+			tmin = Q[i].tlo;
+		if (Q[i].pos > tmax)
+			tmax = Q[i].pos;
+	}
+
+	if (pf)
+		attn_pf(kf, ks, tmin, pf, tmax, hd);
+	for (int t = tmin; t <= tmax; t += 4) {
+		int nt = tmax - t + 1 < 4 ? tmax - t + 1 : 4;
+		const uint16_t *kb = kh ? kh + (size_t)t * ks : NULL;
+		const float *k[4];
+		int r, conv = 0;
+
+		if (pf)
+			attn_pf(kf, ks, t + pf, 4, tmax, hd);
+
+		if (kb && !inreg) {
+			for (r = 0; r < nt; r++)
+				kv16_get(buf + (size_t)r * hd,
+					 kb + (size_t)r * ks, hd);
+			kb = NULL;
+			conv = 1;
+		}
+
+		for (r = 0; r < 4; r++)
+			k[r] = kf ? kf + (size_t)(t + (r < nt ? r : 0)) * ks
+				  : buf + (size_t)(r < nt ? r : 0) * hd;
+		for (i = 0; i < nq; i++) {
+			const struct gqa_q *a = &Q[i];
+
+			if (nt == 4 && t >= a->tlo && t + 3 <= a->pos) {
+				float o[4], p[4];
+				int two = gqa_paired(Q, i, nq);
+				const struct gqa_q *b = two ? &Q[i + 1] : a;
+
+				if (kb) {
+					const float *qs[2] = { a->q, b->q };
+					float *os[2] = { o, p };
+
+					if (two)
+						attn_dot4_hg(qs, 2, kb, ks, hd, os);
+					else
+						attn_dot4_hg(qs, 1, kb, ks, hd, os);
+				} else if (two) {
+					attn_dot4x2(a->q, b->q, k[0], k[1],
+						    k[2], k[3], hd, o, p);
+				} else {
+					attn_dot4(a->q, k[0], k[1], k[2], k[3],
+						  hd, o);
+				}
+				for (r = 0; r < 4; r++)
+					a->sc[t + r] = o[r] * scale;
+				if (two) {
+					for (r = 0; r < 4; r++)
+						b->sc[t + r] = p[r] * scale;
+					i++;
+				}
+				continue;
+			}
+			/* a partial block: the halves widened once, here */
+			if (kb && !conv) {
+				for (r = 0; r < nt; r++)
+					kv16_get(buf + (size_t)r * hd,
+						 kb + (size_t)r * ks, hd);
+				conv = 1;
+			}
+			for (r = 0; r < nt; r++)
+				if (t + r >= a->tlo && t + r <= a->pos)
+					a->sc[t + r] =
+						attn_dot(a->q, k[r], hd) * scale;
+		}
+	}
+
+	if (pf && vf)
+		attn_pf(vf, ks, tmin, pf, tmax, hd);
+	for (i = 0; i < nq; i++) {
+		softmax(Q[i].sc + Q[i].tlo, Q[i].pos + 1 - Q[i].tlo);
+		memset(Q[i].out, 0, hd * sizeof(float));
+	}
+
+	for (int t = tmin; t <= tmax; t += 8) {
+		int nt = tmax - t + 1 < 8 ? tmax - t + 1 : 8;
+		const uint16_t *vb = vh ? vh + (size_t)t * ks : NULL;
+		const float *v = vf ? vf + (size_t)t * ks : buf;
+		size_t vs = vf ? ks : hd;
+		int r, conv = 0;
+
+		if (pf && vf)
+			attn_pf(vf, ks, t + pf, 8, tmax, hd);
+
+		if (vb && !inreg) {
+			for (r = 0; r < nt; r++)
+				kv16_get(buf + (size_t)r * hd,
+					 vb + (size_t)r * ks, hd);
+			vb = NULL;
+			conv = 1;
+		}
+
+		for (i = 0; i < nq; i++) {
+			const struct gqa_q *a = &Q[i];
+
+			if (nt == 8 && t >= a->tlo && t + 7 <= a->pos) {
+				int two = gqa_paired(Q, i, nq);
+				const struct gqa_q *b = two ? &Q[i + 1] : a;
+
+				if (vb) {
+					float *os[2] = { a->out, b->out };
+					const float *ps[2] = { a->sc + t,
+							       b->sc + t };
+
+					if (two)
+						attn_axpy8_hg(os, ps, 2, vb, ks, hd);
+					else
+						attn_axpy8_hg(os, ps, 1, vb, ks, hd);
+				} else if (two) {
+					attn_axpy8x2(a->out, b->out, a->sc + t,
+						     b->sc + t, v, vs, hd);
+				} else {
+					attn_axpy8(a->out, a->sc + t, v, vs, hd);
+				}
+				if (two)
+					i++;
+				continue;
+			}
+			if (vb && !conv) {
+				for (r = 0; r < nt; r++)
+					kv16_get(buf + (size_t)r * hd,
+						 vb + (size_t)r * ks, hd);
+				conv = 1;
+			}
+			for (r = 0; r < nt; r++)
+				if (t + r >= a->tlo && t + r <= a->pos)
+					attn_axpy(a->out, a->sc[t + r],
+						  v + (size_t)r * vs, hd);
+		}
+	}
+}
+
+/*
+ * Where one kv head's cache starts, in whichever cache this run reads. The
+ * half cache is head major whatever CHARSIU_KV_POSMAJOR says.
+ */
+static void gqa_bases(struct llama_state *s, uint32_t l, uint32_t kvh,
+		      uint32_t hd, uint32_t hdmax, uint32_t kvdim,
+		      uint32_t nkv, const float **kf, const float **vf,
+		      const uint16_t **kh, const uint16_t **vh, size_t *ks)
+{
+	if (s->kc16 && kv16_on()) {
+		size_t b = (size_t)(l * nkv + kvh) * s->n_ctx * hdmax;
+
+		*kf = *vf = NULL;
+		*kh = s->kc16 + b;
+		*vh = s->vc16 + b;
+		*ks = hdmax;
+		return;
+	}
+	*kh = *vh = NULL;
+	if (kv_posmajor()) {
+		size_t b = (size_t)l * s->n_ctx * kvdim + (size_t)kvh * hd;
+
+		*kf = s->kcache + b;
+		*vf = s->vcache + b;
+		*ks = kvdim;
+	} else {
+		size_t b = (size_t)(l * nkv + kvh) * s->n_ctx * hdmax;
+
+		*kf = s->kcache + b;
+		*vf = s->vcache + b;
+		*ks = hdmax;
+	}
+}
+
+/*
+ * THE TOKEN LOOP'S ENTRY, the same contract as attn_heads: a range of query
+ * heads, the scores in s->att, the output in s->xb. A range that cuts a group
+ * takes the part of the group inside it, as attn_heads does.
+ */
+static void attn_gqa_heads(void *vj, uint64_t h0, uint64_t nh)
+{
+	const struct attn_job *j = vj;
+	struct llama_state *s = j->s;
+	uint64_t h = h0, end = h0 + nh;
+
+	while (h < end) {
+		uint32_t kvh = (uint32_t)h / j->gqa;
+		uint64_t g1 = (uint64_t)(kvh + 1) * j->gqa;
+		struct gqa_q Q[GQA_QMAX];
+		const float *kf, *vf;
+		const uint16_t *kh, *vh;
+		size_t ks;
+		unsigned n = 0;
+
+		if (g1 > end)
+			g1 = end;
+		if (g1 - h > GQA_QMAX)
+			g1 = h + GQA_QMAX;
+		gqa_bases(s, j->l, kvh, j->hd, j->hdmax, j->kvdim, j->nkv,
+			  &kf, &vf, &kh, &vh, &ks);
+		for (; h < g1; h++, n++)
+			Q[n] = (struct gqa_q){ j->q + h * j->hd,
+					       s->att + (size_t)h * s->n_ctx,
+					       s->xb + h * j->hd, j->t0, j->pos };
+		attn_gqa_group(Q, n, kf, vf, kh, vh, ks, j->hd, j->scale);
+	}
+}
+
+/*
  * THE BATCHED PROMPT'S ATTENTION, SEVERAL ROWS A PASS OVER THE CACHE.
  *
  * Phase 9 on the board, 2026-09-03, a 915 token prompt: attention was 72% of
@@ -4885,6 +6038,9 @@ struct attn_block_job {
 	const float *q;      /* [n][n_head * hd], roped */
 	float *out;          /* [n][n_head * hd] */
 	int R;               /* rows a pass over the cache */
+	int kv_rows;         /* attn_kv_units: rows of the chunk a unit */
+	int kv_stride;       /* and its scores rows' stride in floats */
+	int kv_failed;       /* a worker could not get its scratch */
 };
 
 /*
@@ -4927,6 +6083,278 @@ static int attn_hr(void)
 	return v;
 }
 
+/*
+ * THE ROWS OF A BLOCK THROUGH THE KERNELS TOGETHER: CHARSIU_ATTN_TILE.
+ *
+ * The board's split of a 124 token Qwen3 prompt (2026-11-25): attention 1.31
+ * ms a row, 162 of 654 ms, about 22 GFLOP/s over four A72s -- a sixth of what
+ * their fmas can do. What the kernels ask of a core, counted from the code
+ * and not measured on the board: attn_dot4 is five vector loads for every
+ * four fmas, one q and four K; attn_axpy8 loads and stores the output row once
+ * per eight positions, nine loads and a store for sixteen multiplies and
+ * adds, and chains its eight adds through one register.
+ *
+ * Both halves of a block of rows read the same K and V, so this is the
+ * register tile:
+ *
+ *   scores  three rows against one quad of keys: seven loads for twelve
+ *           fmas, 24 accumulators laid out as attn_dot4 lays them;
+ *   values  four rows over every position they all see, eight output floats
+ *           a row held in registers from the first position to the last:
+ *           three loads for sixteen multiplies and sixteen adds, eight
+ *           independent add chains, no output traffic between positions.
+ *
+ * ON THE DESK, NOT THE BOARD (tests/attn_tile.c --bench, one thread, the
+ * Qwen3 shape at 124 rows, 28 layers): scores 17.2 -> 11.3 ms, softmax 3.1
+ * either way, values 18.5 -> 15.1, the whole 38.9 -> 29.8, 1.31x. The values
+ * half there is at 93% of what the desk's core multiplies and adds at, and
+ * the multiply and the add have to stay two rounded operations, so the desk
+ * cannot show 2x at all: even both halves at the core's peak leave 24 ms.
+ * What the board gives is the board's to say, against CHARSIU_ATTN_TILE=0.
+ *
+ * AND NO OUTPUT MOVES A BIT. Per (row, position) the score is attn_dot4's lane
+ * -- the two accumulators split at i % 8 < 4, the same horizontal add, the
+ * same `* scale` after -- and so attn_dot's. The softmax is the same call over
+ * the same window. Each output element is o += round(a * v) in ascending t,
+ * separately rounded, exactly as attn_axpy8 and attn_axpy add it; a float32
+ * kept in a register across positions is the same float32 that the old loop
+ * stored and loaded back between eights. tests/attn_tile.c holds the two
+ * against each other with memcmp, every arm.
+ *
+ * CHARSIU_ATTN_TILE=0 is the untiled kernel, in the same binary.
+ */
+static int attn_tile_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_TILE", 1);
+	return v;
+}
+
+#define ATTN_QK_ROWS 3
+#define ATTN_PV_ROWS 4
+
+/*
+ * attn_dot4 FOR UP TO THREE ROWS, every K and q load shared, each row's four
+ * scores scaled into os[g]. M IS ALWAYS A CONSTANT AT THE CALL, as in
+ * attn_dot4_hg, so the loops over it unroll and the accumulators stay in
+ * registers (the pragmas are what makes -O2 do that; without them the tile
+ * lived on the stack and the desk ran it 2.4x SLOWER than the kernel it
+ * replaced). A
+ * ragged head (hd % 8) and the exact arm take attn_dot4 itself, a row at a
+ * time.
+ */
+static inline __attribute__((always_inline)) void
+attn_dot4_rows(const float *const *qs, unsigned M, const float *k0,
+	       size_t ks, uint32_t hd, float scale, float *const *os)
+{
+	unsigned g, r;
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	if (fast_attn() && hd % 8 == 0) {
+		float32x4_t lo[ATTN_QK_ROWS][4], hi[ATTN_QK_ROWS][4];
+		const float *k1 = k0 + ks, *k2 = k1 + ks, *k3 = k2 + ks;
+		uint32_t i;
+
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++)
+			_Pragma("GCC unroll 4")
+			for (r = 0; r < 4; r++)
+				lo[g][r] = hi[g][r] = vdupq_n_f32(0.0f);
+		for (i = 0; i < hd; i += 8) {
+			float32x4_t x[ATTN_QK_ROWS], k;
+
+#define QK(ACC, KR, OFF)						\
+			k = vld1q_f32((KR) + i + (OFF));		\
+			_Pragma("GCC unroll 4")				\
+			for (g = 0; g < M; g++)				\
+				ACC = vfmaq_f32(ACC, x[g], k);
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				x[g] = vld1q_f32(qs[g] + i);
+			QK(lo[g][0], k0, 0) QK(lo[g][1], k1, 0)
+			QK(lo[g][2], k2, 0) QK(lo[g][3], k3, 0)
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				x[g] = vld1q_f32(qs[g] + i + 4);
+			QK(hi[g][0], k0, 4) QK(hi[g][1], k1, 4)
+			QK(hi[g][2], k2, 4) QK(hi[g][3], k3, 4)
+#undef QK
+		}
+		/*
+		 * THE HORIZONTAL ADD, FOUR AT ONCE. vaddvq_f32 is two faddp,
+		 * (l0 + l1) + (l2 + l3); two levels of pairwise adds across the
+		 * four sums put exactly that in each lane. The `* scale` is
+		 * then one multiply a lane, rounded as the scalar one is.
+		 */
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++) {
+			float32x4_t s0 = vaddq_f32(lo[g][0], hi[g][0]);
+			float32x4_t s1 = vaddq_f32(lo[g][1], hi[g][1]);
+			float32x4_t s2 = vaddq_f32(lo[g][2], hi[g][2]);
+			float32x4_t s3 = vaddq_f32(lo[g][3], hi[g][3]);
+			float32x4_t z = vpaddq_f32(vpaddq_f32(s0, s1),
+						   vpaddq_f32(s2, s3));
+
+			vst1q_f32(os[g], vmulq_n_f32(z, scale));
+		}
+		return;
+	}
+#endif
+	for (g = 0; g < M; g++) {
+		float o[4];
+
+		attn_dot4(qs[g], k0, k0 + ks, k0 + 2 * ks, k0 + 3 * ks, hd, o);
+		for (r = 0; r < 4; r++)
+			os[g][r] = o[r] * scale;
+	}
+}
+
+/* the rows queued against one quad of keys, and what each of them sees */
+struct attn_qk_tile {
+	const float *q[ATTN_QK_ROWS];
+	float *sr[ATTN_QK_ROWS];
+	int tlo[ATTN_QK_ROWS], pos[ATTN_QK_ROWS];
+	unsigned m;
+};
+
+static void attn_qk_flush(struct attn_qk_tile *T, const float *k0, size_t ks,
+			  int t, uint32_t hd, float scale)
+{
+	float tmp[ATTN_QK_ROWS][4], *dst[ATTN_QK_ROWS];
+	unsigned g;
+	int c;
+
+	/* a row that sees the whole quad is written in place */
+	for (g = 0; g < T->m; g++)
+		dst[g] = t >= T->tlo[g] && t + 3 <= T->pos[g]
+		       ? T->sr[g] + t : tmp[g];
+	switch (T->m) {
+	case 3: attn_dot4_rows(T->q, 3, k0, ks, hd, scale, dst); break;
+	case 2: attn_dot4_rows(T->q, 2, k0, ks, hd, scale, dst); break;
+	case 1: attn_dot4_rows(T->q, 1, k0, ks, hd, scale, dst); break;
+	default: return;
+	}
+	/*
+	 * ONLY THE POSITIONS THE ROW SEES ARE STORED. A row whose window
+	 * covers part of the quad was computed for all four, which is free in
+	 * a tile, and a lane of attn_dot4 is attn_dot to the bit, so the ones
+	 * it keeps are what the single position call gave. The others were
+	 * never read, so computing them changes nothing either: all four keys
+	 * are at or below the block's last position, which this chunk wrote.
+	 */
+	for (g = 0; g < T->m; g++)
+		if (dst[g] == tmp[g])
+			for (c = 0; c < 4; c++)
+				if (t + c >= T->tlo[g] && t + c <= T->pos[g])
+					T->sr[g][t + c] = tmp[g][c];
+	T->m = 0;
+}
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+/*
+ * THE VALUES OF UP TO FOUR ROWS OVER c CONSECUTIVE POSITIONS THEY ALL SEE.
+ * ps[g] is row g's weight at the first of them, v that position's V row.
+ * Eight output floats a row stay in registers over all c positions, each
+ * taking its products in ascending t. The multiply is by a lane of the
+ * weights, the same single rounding of the same product as attn_axpy8's
+ * broadcast, and it is written in asm for two reasons: GCC turns the lane
+ * intrinsic back into a broadcast held in a register per weight, which for
+ * four rows is sixteen registers and spilled the tile; and an asm result
+ * cannot be contracted into an fmla, which is the barrier attn_axpy8 needs.
+ * Sixteen floats a row was the first version and spilled four accumulators
+ * to the stack every pass. hd % 8 == 0 only.
+ */
+#define PV_MUL(P, X, W, L)						\
+	__asm__("fmul %0.4s, %1.4s, %2.s[" #L "]" : "=w"(P) : "w"(X), "w"(W))
+
+static inline __attribute__((always_inline)) void
+attn_pv_rows(float *const *os, const float *const *ps, unsigned M,
+	     const float *v, size_t vs, int c, uint32_t hd)
+{
+	unsigned g;
+	uint32_t i;
+	int q;
+
+	for (i = 0; i < hd; i += 8) {
+		float32x4_t o0[ATTN_PV_ROWS], o1[ATTN_PV_ROWS];
+
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++) {
+			o0[g] = vld1q_f32(os[g] + i);
+			o1[g] = vld1q_f32(os[g] + i + 4);
+		}
+#define PV(L, Q)							\
+		{							\
+			const float *vq = v + (size_t)(Q) * vs + i;	\
+			float32x4_t x0 = vld1q_f32(vq);			\
+			float32x4_t x1 = vld1q_f32(vq + 4);		\
+									\
+			_Pragma("GCC unroll 4")				\
+			for (g = 0; g < M; g++) {			\
+				float32x4_t p0, p1;			\
+									\
+				PV_MUL(p0, x0, w[g], L);		\
+				PV_MUL(p1, x1, w[g], L);		\
+				o0[g] = vaddq_f32(o0[g], p0);		\
+				o1[g] = vaddq_f32(o1[g], p1);		\
+			}						\
+		}
+		for (q = 0; q + 4 <= c; q += 4) {
+			float32x4_t w[ATTN_PV_ROWS];
+
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				w[g] = vld1q_f32(ps[g] + q);
+			PV(0, q) PV(1, q + 1) PV(2, q + 2) PV(3, q + 3)
+		}
+		for (; q < c; q++) {
+			float32x4_t w[ATTN_PV_ROWS];
+
+			_Pragma("GCC unroll 4")
+			for (g = 0; g < M; g++)
+				w[g] = vld1q_dup_f32(ps[g] + q);
+			PV(0, q)
+		}
+#undef PV
+		_Pragma("GCC unroll 4")
+		for (g = 0; g < M; g++) {
+			vst1q_f32(os[g] + i, o0[g]);
+			vst1q_f32(os[g] + i + 4, o1[g]);
+		}
+	}
+}
+#undef PV_MUL
+
+static void attn_pv_tile(float *const *os, const float *const *ps,
+			 unsigned m, const float *v, size_t vs, int c,
+			 uint32_t hd)
+{
+	if (c <= 0)
+		return;
+	switch (m) {
+	case 4: attn_pv_rows(os, ps, 4, v, vs, c, hd); break;
+	case 3: attn_pv_rows(os, ps, 3, v, vs, c, hd); break;
+	case 2: attn_pv_rows(os, ps, 2, v, vs, c, hd); break;
+	case 1: attn_pv_rows(os, ps, 1, v, vs, c, hd); break;
+	default: break;
+	}
+}
+#endif
+
+static int attn_pv_tiled(uint32_t hd)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	return attn_tile_on() && attn_axpy8_on() && !cpu_plain()
+	       && hd % 8 == 0;
+#else
+	(void)hd;
+	return 0;
+#endif
+}
+
+/* the tiles above when CHARSIU_ATTN_TILE is on, the kernels below them when not */
 static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 {
 	struct attn_block_job *j = ctx;
@@ -4936,6 +6364,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 	size_t qstride = (size_t)j->n_head * hd;
 	int timed = stage_on > 0 && !attn_block_pool();
 	int nblk = attn_hr() ? (n + R - 1) / R : 1;
+	int tile = attn_tile_on(), pvtile = attn_pv_tiled(hd);
 	uint64_t u;
 
 	for (u = u0; u < u0 + nu; u++) {
@@ -4975,7 +6404,9 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 			for (int t = tlo_first; t <= tmax; t += 4) {
 				const float *k0 = kbase + (size_t)t * kstride;
 				int quad = t + 3 <= tmax;
+				struct attn_qk_tile T;
 
+				T.m = 0;
 				for (int r = rb; r < re; r++) {
 					int pos = j->pos0 + r;
 					int tlo = j->swa && pos + 1 > j->n_swa
@@ -4983,6 +6414,20 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 					const float *qh = j->q + (size_t)r * qstride + h * hd;
 					float *sr = sc + (size_t)(r - rb) * s->n_ctx;
 
+					/* a whole quad in the cache: the row
+					 * joins a tile if it sees any of it */
+					if (tile && quad) {
+						if (t + 3 < tlo || t > pos)
+							continue;
+						T.q[T.m] = qh;
+						T.sr[T.m] = sr;
+						T.tlo[T.m] = tlo;
+						T.pos[T.m] = pos;
+						if (++T.m == ATTN_QK_ROWS)
+							attn_qk_flush(&T, k0, kstride,
+								      t, hd, j->scale);
+						continue;
+					}
 					if (quad && t >= tlo && t + 3 <= pos) {
 						float o[4];
 
@@ -5002,6 +6447,7 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 								 hd) * j->scale;
 					}
 				}
+				attn_qk_flush(&T, k0, kstride, t, hd, j->scale);
 			}
 			if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
 			for (int r = rb; r < re; r++) {
@@ -5015,7 +6461,67 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 				       hd * sizeof(float));
 			}
 			if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
-			{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+			/*
+			 * FOUR CONSECUTIVE ROWS AT A TIME. Their windows are
+			 * [tlo, pos] with both ends rising by row, so all four
+			 * see [lo, hi] = [the last row's tlo, the first row's
+			 * pos], and each row's own positions are a few before
+			 * that (a sliding window) and a few after. Each row
+			 * takes them in the order before, shared, after, which
+			 * is ascending t.
+			 */
+			for (int r0 = rb; pvtile && r0 < re; r0 += ATTN_PV_ROWS) {
+				int r1 = r0 + ATTN_PV_ROWS < re ? r0 + ATTN_PV_ROWS : re;
+				int lo = 0, hi = tmax;
+				float *os[ATTN_PV_ROWS];
+				const float *ps[ATTN_PV_ROWS];
+				unsigned m = 0;
+
+				for (int r = r0; r < r1; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+
+					if (tlo > lo)
+						lo = tlo;
+					if (pos < hi)
+						hi = pos;
+				}
+				for (int r = r0; r < r1; r++) {
+					int pos = j->pos0 + r;
+					int tlo = j->swa && pos + 1 > j->n_swa
+						? pos + 1 - j->n_swa : 0;
+					float *out = j->out + (size_t)r * qstride + h * hd;
+					const float *sr = sc + (size_t)(r - rb) * s->n_ctx;
+					/* the positions before the shared run,
+					 * or all of them when there is none */
+					int b = lo <= hi ? lo - 1 : pos;
+					const float *pa = sr + tlo;
+
+					attn_pv_tile(&out, &pa, 1,
+						     vbase + (size_t)tlo * kstride,
+						     kstride, b - tlo + 1, hd);
+					os[m] = out;
+					ps[m++] = sr + lo;
+				}
+				if (lo > hi)
+					continue;
+				attn_pv_tile(os, ps, m, vbase + (size_t)lo * kstride,
+					     kstride, hi - lo + 1, hd);
+				for (int r = r0; r < r1; r++) {
+					int pos = j->pos0 + r;
+					float *out = os[r - r0];
+					const float *pa = sc + (size_t)(r - rb) * s->n_ctx
+							+ hi + 1;
+
+					attn_pv_tile(&out, &pa, 1,
+						     vbase + (size_t)(hi + 1) * kstride,
+						     kstride, pos - hi, hd);
+				}
+			}
+#endif
+			if (!pvtile) {
 			int step = attn_axpy8_on() ? 8 : 4;
 
 			for (int t = tlo_first; t <= tmax; t += step) {
@@ -5061,6 +6567,460 @@ static void attn_block_heads(void *ctx, uint64_t u0, uint64_t nu)
 			if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
 		}
 	}
+}
+
+/*
+ * THE UNIT IS A KV HEAD: CHARSIU_ATTN_KV.
+ *
+ * attn_block_heads walks one query head over a block of eight rows. On the
+ * A72 the tiles in it bought nothing (2026-11-25), and what the board's
+ * cores were doing instead of arithmetic is where the bytes go:
+ *
+ *   - both query heads of a GQA group read the same K and V, once each;
+ *   - the values tile runs every head-dim slice over every position, so a
+ *     head's V (62 KB at 124 positions) comes in from L2 again for every
+ *     four rows;
+ *   - the scores rows sit n_ctx floats apart, 4, 8 or 16 KB -- the A72's
+ *     L1 way is 16 KB, so at n_ctx 4096 every row of a block is one set.
+ *
+ * So the unit here is (kv head, block of rows), every query head of the
+ * group inside it; the scores tile is up to ATTN_KV_M rows against
+ * ATTN_KV_P keys with each q and each key loaded once for the tile; the
+ * values loop goes a block of ATTN_KV_TB positions at a time with every row
+ * of the unit inside it, so a block of V is read into L1 once per unit; and
+ * the scores live in a scratch per thread, its rows an odd number of cache
+ * lines apart.
+ *
+ * WHAT THE A72 SAID (2026-11-25, tests/attn_tile.c --bench on the board,
+ * Qwen3-0.6B's shape, 124 rows in a 1024 cache, ms a row): one core, scores
+ * 1.28 -> 1.05, values 1.58 -> 1.32, softmax 0.24 -> 0.22; four cores 1.25 ->
+ * 0.86-0.93, and at 244 rows 2.52 -> 1.53-1.71. Its core issues ONE 128 bit
+ * FP operation a cycle (fmla, fmul and fadd alike, measured), so the values
+ * half, which may not fuse, is the floor: two operations for four products.
+ *
+ * AND NO OUTPUT MOVES A BIT. A score is attn_dot4's lane: the lo chain over
+ * i % 8 < 4 and the hi chain over the rest, each an fma from zero in
+ * ascending i, added lo + hi, reduced (s0 + s1) + (s2 + s3), then `* scale`.
+ * Here the lo chain runs first and is parked while the hi chain runs, which
+ * moves a store and a load and no arithmetic. The softmax is the same call
+ * over the same window. Each output element is the same sequence of
+ * separately rounded o += a * v in ascending t: the position blocks go in
+ * ascending order, inside a block a row takes the positions before the shared
+ * run, the shared run, the positions after it, and between blocks the float
+ * goes to memory and back unchanged. Only which unit does it and when moves.
+ *
+ * The units go largest first in chunks of one, because a unit's cost is its
+ * last row's position and the dynamic split otherwise ends on a big one.
+ *
+ * CHARSIU_ATTN_KV=0 is attn_block_heads, in the same binary, and
+ * tests/attn_tile.c holds the two against each other with memcmp.
+ */
+static int attn_kv_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV", 1);
+	return v;
+}
+
+/*
+ * THE BLOCK OF K OR V A UNIT IS ON, COPIED TO ROWS hd + 8 FLOATS APART.
+ * The cache's rows are hdmax floats apart, 512 bytes on every model with a
+ * 128 head, and the A72 ran the same scores loop 16% slower over keys 512
+ * bytes apart than over keys 544 apart (0.750 against 0.628 ns an fmla, one
+ * core, all of it in L1, 2026-11-25). Every row of the unit reads the block,
+ * so the copy is paid once for up to ATTN_KV_QMAX of them. A copy moves no
+ * value. CHARSIU_ATTN_KV_PACK=0 reads the cache in place.
+ */
+static int attn_kv_pack(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_ATTN_KV_PACK", 1);
+	return v;
+}
+
+/* rows of the chunk a unit takes, before the group multiplies them */
+static int attn_kv_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_KV_ROWS");
+
+		v = e ? atoi(e) : 16;
+		if (v < 1)
+			v = 1;
+		if (v > 64)
+			v = 64;
+	}
+	return v;
+}
+
+/* positions of V a values block reads into L1 */
+static int attn_kv_tb(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ATTN_KV_TB");
+
+		v = e ? atoi(e) : 32;
+		if (v < 4)
+			v = 4;
+	}
+	return v;
+}
+
+#define ATTN_KV_M 4
+#define ATTN_KV_P 5
+#define ATTN_KV_QMAX 256     /* query rows a unit: rows times the group */
+
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+/*
+ * M rows against P consecutive keys, both constants at the call. The lo chain
+ * of every (row, key) first, parked in `lo`, then the hi chain; the sum and
+ * the reduction are attn_dot4_rows' to the instruction.
+ */
+static inline __attribute__((always_inline)) void
+attn_kv_qk(const float *const *qs, unsigned M, const float *k0, size_t ks,
+	   unsigned P, uint32_t hd, float scale, float *const *os)
+{
+	float32x4_t lo[ATTN_KV_M][ATTN_KV_P], acc[ATTN_KV_M][ATTN_KV_P];
+	unsigned g, p;
+	uint32_t i;
+
+#define KV_PASS(OFF)							\
+	_Pragma("GCC unroll 8")						\
+	for (g = 0; g < M; g++)						\
+		_Pragma("GCC unroll 8")					\
+		for (p = 0; p < P; p++)					\
+			acc[g][p] = vdupq_n_f32(0.0f);			\
+	for (i = (OFF); i < hd; i += 8) {				\
+		float32x4_t x[ATTN_KV_M];				\
+									\
+		_Pragma("GCC unroll 8")					\
+		for (g = 0; g < M; g++)					\
+			x[g] = vld1q_f32(qs[g] + i);			\
+		_Pragma("GCC unroll 8")					\
+		for (p = 0; p < P; p++) {				\
+			float32x4_t k = vld1q_f32(k0 + p * ks + i);	\
+									\
+			_Pragma("GCC unroll 8")				\
+			for (g = 0; g < M; g++)				\
+				acc[g][p] = vfmaq_f32(acc[g][p], x[g], k);\
+		}							\
+	}
+	KV_PASS(0)
+	_Pragma("GCC unroll 8")
+	for (g = 0; g < M; g++)
+		_Pragma("GCC unroll 8")
+		for (p = 0; p < P; p++)
+			lo[g][p] = acc[g][p];
+	KV_PASS(4)
+#undef KV_PASS
+	_Pragma("GCC unroll 8")
+	for (g = 0; g < M; g++) {
+		_Pragma("GCC unroll 8")
+		for (p = 0; p + 4 <= P; p += 4) {
+			float32x4_t s0 = vaddq_f32(lo[g][p], acc[g][p]);
+			float32x4_t s1 = vaddq_f32(lo[g][p + 1], acc[g][p + 1]);
+			float32x4_t s2 = vaddq_f32(lo[g][p + 2], acc[g][p + 2]);
+			float32x4_t s3 = vaddq_f32(lo[g][p + 3], acc[g][p + 3]);
+			float32x4_t z = vpaddq_f32(vpaddq_f32(s0, s1),
+						   vpaddq_f32(s2, s3));
+
+			vst1q_f32(os[g] + p, vmulq_n_f32(z, scale));
+		}
+		_Pragma("GCC unroll 8")
+		for (p = P & ~3u; p < P; p++)
+			os[g][p] = vaddvq_f32(vaddq_f32(lo[g][p], acc[g][p]))
+				 * scale;
+	}
+}
+
+#define KVQK_1(MM, PP)							\
+	case PP:							\
+		if (PP <= ATTN_KV_P)					\
+			attn_kv_qk(qs, MM, k0, ks, PP > ATTN_KV_P ? 1 : PP,\
+				   hd, scale, os);			\
+		break;
+#define KVQK_P(MM)							\
+	switch (P) {							\
+	KVQK_1(MM, 1) KVQK_1(MM, 2) KVQK_1(MM, 3) KVQK_1(MM, 4)	\
+	KVQK_1(MM, 5) KVQK_1(MM, 6)					\
+	default: break;							\
+	}
+#define KVQK_M(MM)							\
+	case MM:							\
+		if (MM <= ATTN_KV_M) {					\
+			KVQK_P(MM > ATTN_KV_M ? 1 : MM)			\
+		}							\
+		break;
+
+static void attn_kv_qk_tile(const float *const *qs, unsigned M,
+			    const float *k0, size_t ks, unsigned P,
+			    uint32_t hd, float scale, float *const *os)
+{
+	switch (M) {
+	KVQK_M(1) KVQK_M(2) KVQK_M(3) KVQK_M(4) KVQK_M(5) KVQK_M(6)
+	default: break;
+	}
+}
+#undef KVQK_M
+#undef KVQK_1
+#undef KVQK_P
+
+/* the thread's scores scratch, kept for the next unit */
+static __thread float *attn_kv_sc;
+static __thread size_t attn_kv_cap;
+static __thread float *attn_kv_kp;   /* the packed block of K or V */
+static __thread size_t attn_kv_kpcap;
+
+struct attn_kv_q {
+	const float *q;
+	float *sr;           /* this row's scores, indexed by position */
+	float *out;
+	int tlo, pos;
+};
+
+static void attn_kv_units(void *ctx, uint64_t u0, uint64_t nu)
+{
+	struct attn_block_job *j = ctx;
+	struct llama_state *s = j->s;
+	uint32_t hd = j->hd, gqa = j->gqa, nkv = j->nkv;
+	int RB = j->kv_rows, n = j->n, S = j->kv_stride;
+	int nblk = (n + RB - 1) / RB, TB = attn_kv_tb();
+	size_t qstride = (size_t)j->n_head * hd;
+	size_t need = (size_t)RB * gqa * S;
+	int timed = stage_on > 0 && !attn_block_pool();
+	int pack = attn_kv_pack(), KB = ATTN_KV_P * 4;
+	size_t PS = (size_t)hd + 8;
+	size_t kpneed = (size_t)(TB > KB ? TB : KB) * PS;
+	struct attn_kv_q Q[ATTN_KV_QMAX];
+	uint64_t u;
+
+	if (attn_kv_cap < need) {
+		free(attn_kv_sc);
+		attn_kv_sc = malloc(need * sizeof(float));
+		attn_kv_cap = attn_kv_sc ? need : 0;
+		if (!attn_kv_sc) {
+			__atomic_store_n(&j->kv_failed, 1, __ATOMIC_RELAXED);
+			return;
+		}
+	}
+	if (pack && attn_kv_kpcap < kpneed) {
+		free(attn_kv_kp);
+		attn_kv_kp = malloc(kpneed * sizeof(float));
+		attn_kv_kpcap = attn_kv_kp ? kpneed : 0;
+		if (!attn_kv_kp) {
+			__atomic_store_n(&j->kv_failed, 1, __ATOMIC_RELAXED);
+			return;
+		}
+	}
+	for (u = u0; u < u0 + nu; u++) {
+		/* largest first: the last row block of every kv head */
+		int b = nblk - 1 - (int)(u / nkv);
+		uint32_t kvh = (uint32_t)(u % nkv);
+		int rb = b * RB, re = rb + RB < n ? rb + RB : n;
+		int tlo_first = j->swa && j->pos0 + rb + 1 > j->n_swa
+			      ? j->pos0 + rb + 1 - j->n_swa : 0;
+		int tmax = j->pos0 + re - 1;
+		const float *kbase, *vbase;
+		size_t kstride;
+		int nq = 0, a, lo_q, hi_q, t;
+		double t0 = timed ? now_ms() : 0.0, t1;
+
+		if (kv_posmajor()) {
+			size_t base = (size_t)j->l * s->n_ctx * j->kvdim
+				    + (size_t)kvh * hd;
+
+			kbase = s->kcache + base;
+			vbase = s->vcache + base;
+			kstride = j->kvdim;
+		} else {
+			size_t base = (size_t)(j->l * nkv + kvh) * s->n_ctx
+				    * j->hdmax;
+
+			kbase = s->kcache + base;
+			vbase = s->vcache + base;
+			kstride = j->hdmax;
+		}
+		/* row major, the group inside: windows never fall with qi */
+		for (int r = rb; r < re; r++) {
+			int pos = j->pos0 + r;
+			int tlo = j->swa && pos + 1 > j->n_swa
+				? pos + 1 - j->n_swa : 0;
+
+			for (uint32_t g = 0; g < gqa; g++, nq++) {
+				uint32_t h = kvh * gqa + g;
+
+				Q[nq].q = j->q + (size_t)r * qstride + h * hd;
+				Q[nq].sr = attn_kv_sc + (size_t)nq * S;
+				Q[nq].out = j->out + (size_t)r * qstride + h * hd;
+				Q[nq].tlo = tlo;
+				Q[nq].pos = pos;
+			}
+		}
+
+		/*
+		 * SCORES. Every row whose window meets [t, t + P) joins the
+		 * tile and gets all P scores stored; the ones outside its
+		 * window land in its own scratch row below tmax and are never
+		 * read.
+		 */
+		lo_q = 0;
+		hi_q = -1;
+		for (int kb0 = tlo_first; kb0 <= tmax; kb0 += KB) {
+		int kb1 = kb0 + KB - 1 < tmax ? kb0 + KB - 1 : tmax;
+		const float *kb = kbase + (size_t)kb0 * kstride;
+		size_t kst = kstride;
+
+		if (pack) {
+			for (int c = 0; c <= kb1 - kb0; c++)
+				memcpy(attn_kv_kp + (size_t)c * PS,
+				       kb + (size_t)c * kstride,
+				       hd * sizeof(float));
+			kb = attn_kv_kp;
+			kst = PS;
+		}
+		for (t = kb0; t <= kb1; t += ATTN_KV_P) {
+			unsigned P = t + ATTN_KV_P - 1 <= kb1
+				   ? ATTN_KV_P : (unsigned)(kb1 - t + 1);
+			const float *k0 = kb + (size_t)(t - kb0) * kst;
+
+			while (lo_q < nq && Q[lo_q].pos < t)
+				lo_q++;
+			while (hi_q + 1 < nq && Q[hi_q + 1].tlo <= t + (int)P - 1)
+				hi_q++;
+			for (a = lo_q; a <= hi_q; a += ATTN_KV_M) {
+				unsigned m = hi_q - a + 1 < ATTN_KV_M
+					   ? (unsigned)(hi_q - a + 1) : ATTN_KV_M;
+				const float *qs[ATTN_KV_M];
+				float *os[ATTN_KV_M];
+
+				for (unsigned g = 0; g < m; g++) {
+					qs[g] = Q[a + g].q;
+					os[g] = Q[a + g].sr + t;
+				}
+				attn_kv_qk_tile(qs, m, k0, kst, P, hd,
+						j->scale, os);
+			}
+		}
+		}
+		if (timed) { t1 = now_ms(); battn_ms[0] += t1 - t0; t0 = t1; }
+		for (a = 0; a < nq; a++) {
+			softmax(Q[a].sr + Q[a].tlo, Q[a].pos + 1 - Q[a].tlo);
+			memset(Q[a].out, 0, hd * sizeof(float));
+		}
+		if (timed) { t1 = now_ms(); battn_ms[1] += t1 - t0; t0 = t1; }
+
+		/*
+		 * VALUES, a block of positions at a time, every row of the unit
+		 * inside it, four rows a tile. Inside a block a row's positions
+		 * are [s, e]; the tile shares [max s, min e] and each row takes
+		 * its own before and after alone, which is ascending t.
+		 */
+		for (int b0 = tlo_first; b0 <= tmax; b0 += TB) {
+			int b1 = b0 + TB - 1 < tmax ? b0 + TB - 1 : tmax;
+			/* position t of this block's V is vb + (t - b0) * vst */
+			const float *vb = vbase + (size_t)b0 * kstride;
+			size_t vst = kstride;
+
+			if (pack) {
+				for (int c = 0; c <= b1 - b0; c++)
+					memcpy(attn_kv_kp + (size_t)c * PS,
+					       vb + (size_t)c * kstride,
+					       hd * sizeof(float));
+				vb = attn_kv_kp;
+				vst = PS;
+			}
+
+			for (a = 0; a < nq; a += ATTN_PV_ROWS) {
+				int m = nq - a < ATTN_PV_ROWS ? nq - a : ATTN_PV_ROWS;
+				int sv[ATTN_PV_ROWS], ev[ATTN_PV_ROWS];
+				int lo = b0, hi = b1, any = 0;
+				float *os[ATTN_PV_ROWS];
+				const float *ps[ATTN_PV_ROWS];
+
+				for (int g = 0; g < m; g++) {
+					sv[g] = Q[a + g].tlo > b0 ? Q[a + g].tlo : b0;
+					ev[g] = Q[a + g].pos < b1 ? Q[a + g].pos : b1;
+					if (sv[g] <= ev[g])
+						any = 1;
+					if (sv[g] > lo)
+						lo = sv[g];
+					if (ev[g] < hi)
+						hi = ev[g];
+				}
+				if (!any)
+					continue;
+				if (lo > hi) {
+					for (int g = 0; g < m; g++) {
+						float *out = Q[a + g].out;
+						const float *pa = Q[a + g].sr + sv[g];
+
+						attn_pv_tile(&out, &pa, 1,
+							     vb + (size_t)(sv[g] - b0) * vst,
+							     vst, ev[g] - sv[g] + 1, hd);
+					}
+					continue;
+				}
+				for (int g = 0; g < m; g++) {
+					float *out = Q[a + g].out;
+					const float *pa = Q[a + g].sr + sv[g];
+
+					attn_pv_tile(&out, &pa, 1,
+						     vb + (size_t)(sv[g] - b0) * vst,
+						     vst, lo - sv[g], hd);
+					os[g] = out;
+					ps[g] = Q[a + g].sr + lo;
+				}
+				attn_pv_tile(os, ps, (unsigned)m,
+					     vb + (size_t)(lo - b0) * vst,
+					     vst, hi - lo + 1, hd);
+				for (int g = 0; g < m; g++) {
+					float *out = os[g];
+					const float *pa = Q[a + g].sr + hi + 1;
+
+					attn_pv_tile(&out, &pa, 1,
+						     vb + (size_t)(hi + 1 - b0) * vst,
+						     vst, ev[g] - hi, hd);
+				}
+			}
+		}
+		if (timed) { t1 = now_ms(); battn_ms[2] += t1 - t0; }
+	}
+}
+#endif
+
+/*
+ * Whether this job can take the kv unit, and its shape if so. The scores
+ * scratch's row stride is the chunk's extent rounded to 16 floats and made an
+ * odd number of 64 byte lines, so consecutive rows walk through the L1 sets.
+ */
+static int attn_kv_plan(struct attn_block_job *j)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	int RB = attn_kv_rows(), S;
+
+	if (!attn_kv_on() || !attn_tile_on() || !attn_hr() || !fast_attn()
+	    || !attn_pv_tiled(j->hd) || j->gqa == 0
+	    || (size_t)RB * j->gqa > ATTN_KV_QMAX)
+		return 0;
+	S = ((j->pos0 + j->n + 15) / 16) * 16;
+	if ((S / 16) % 2 == 0)
+		S += 16;
+	j->kv_rows = RB;
+	j->kv_stride = S;
+	j->kv_failed = 0;
+	return 1;
+#else
+	(void)j;
+	return 0;
+#endif
 }
 
 /*
@@ -6385,8 +8345,12 @@ static void attn_npu_append(struct llama_state *s, uint32_t l, uint32_t kh,
 			       (unsigned)pos, v);
 	a->dirty[l] = 1;
 	/* ON THE LAST KV HEAD, because a position is only mirrored once
-	 * every head of it is, and the catch-up below trusts this number */
-	if (kh + 1 == a->nkv && a->packed[l] < (unsigned)pos + 1)
+	 * every head of it is, and the catch-up below trusts this number.
+	 * AND ONLY WHEN IT IS THE NEXT ONE: decode and verify passes do not
+	 * append, so the first chunk of a later prompt arrives above a gap,
+	 * and moving the mark over it would tell the catch-up the generated
+	 * positions were already packed. */
+	if (kh + 1 == a->nkv && a->packed[l] == (unsigned)pos)
 		a->packed[l] = (unsigned)pos + 1;
 }
 
@@ -7336,6 +9300,42 @@ static int row_pool(void)
 }
 
 /*
+ * THE FEWEST ROWS WORTH A FAN OUT, for the per row stages of the batched
+ * loop: the two norms with their residuals, the rope and silu * up.
+ *
+ * A charsiu_parallel_for is a broadcast, a wakeup per worker and a barrier
+ * that waits for the slowest core (an A53), against a stage whose work at
+ * m = 6 is six rows of n_embd. A verify pass makes five of these a layer, 140
+ * on Qwen3, and npudev.c's read back already lost to the pool for exactly
+ * this reason -- too little work a dispatch. Its price HERE has not been
+ * measured, which is why this is a knob.
+ *
+ * A THRESHOLD AND NOT A GUESS: the default is 2, which is exactly the old
+ * `n > 1`, so nothing moves until the board has measured where the crossover
+ * is (CHARSIU_ROW_POOL_MIN=9 runs every verify pass inline). Inline or pooled
+ * cannot change a value: every row is computed by the same function, start
+ * to end, on one thread either way, and no row reads another.
+ */
+static unsigned row_pool_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_ROW_POOL_MIN");
+
+		v = e && *e ? atoi(e) : 2;
+		if (v < 2)
+			v = 2;
+	}
+	return (unsigned)v;
+}
+
+static int row_pool_for(int n)
+{
+	return row_pool() && n > 1 && (unsigned)n >= row_pool_min();
+}
+
+/*
  * THE ROPE STAGE FOR EVERY ROW, ON THE POOL.
  *
  * IT IS ONLY PARALLEL BECAUSE THE ROPE STOPPED GOING THROUGH A SHARED
@@ -7499,6 +9499,9 @@ static void rope_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+/* the CPU attention time inside verify passes, for CHARSIU_SPEC_TRACE */
+static double verify_attn_ms;
+
 static int attn_block(struct attn_block_job *j)
 {
 	int R = attn_block_rows(), n = j->n;
@@ -7510,6 +9513,14 @@ static int attn_block(struct attn_block_job *j)
 	/* BEFORE either arm runs: the CPU one sizes its scores buffer from
 	 * j->R, and the check arm calls it directly */
 	j->R = R;
+	/* a verify pass stays on the CPU arm: see in_verify */
+	if (j->s->in_verify) {
+		double t0 = now_ms();
+		int rc = attn_block_cpu(j);
+
+		verify_attn_ms += now_ms() - t0;
+		return rc;
+	}
 	/*
 	 * THIS IS NOT A BIT EXACT SUBSTITUTION AND MUST NOT BE CHECKED AS
 	 * ONE. Every matmul the group runs was proved identical to the same
@@ -7562,11 +9573,99 @@ static int attn_block(struct attn_block_job *j)
 	return attn_block_cpu(j);
 }
 
+/*
+ * THE VERIFY ROWS THROUGH THE GROUPED KERNEL. A speculative pass is 2 to 8
+ * rows at consecutive positions over one cache, so every query of every row
+ * that reads a kv head goes through ONE pass over that head's K and V, where
+ * attn_block_heads makes one pass a query head. Row r of the chunk sees
+ * [tlo(r), pos0 + r], the two heads of one row share it and pair.
+ *
+ * The unit is (kv head, a slice of the rows). With at least as many kv heads
+ * as threads a unit is a whole kv head and the cache is read once; with fewer
+ * (gemma-3-1b has one) the rows are split so the threads have work, and each
+ * slice reads the head again -- the trade attn_block_heads makes per head.
+ */
+#define GQA_VERIFY_ROWS 8
+
+struct gqa_rows_job {
+	struct attn_block_job *j;
+	unsigned split;      /* row slices a kv head */
+};
+
+static void attn_gqa_rows(void *ctx, uint64_t u0, uint64_t nu)
+{
+	struct gqa_rows_job *g = ctx;
+	struct attn_block_job *j = g->j;
+	struct llama_state *s = j->s;
+	size_t qstride = (size_t)j->n_head * j->hd;
+	uint64_t u;
+
+	for (u = u0; u < u0 + nu; u++) {
+		uint32_t kvh = (uint32_t)(u / g->split);
+		unsigned part = (unsigned)(u % g->split);
+		int r0 = (int)(part * (unsigned)j->n / g->split);
+		int r1 = (int)((part + 1) * (unsigned)j->n / g->split);
+		const float *kf, *vf;
+		const uint16_t *kh, *vh;
+		size_t ks;
+		struct gqa_q Q[GQA_QMAX];
+		unsigned n = 0;
+
+		gqa_bases(s, j->l, kvh, j->hd, j->hdmax, j->kvdim, j->nkv,
+			  &kf, &vf, &kh, &vh, &ks);
+		for (int r = r0; r < r1; r++) {
+			int pos = j->pos0 + r;
+			int tlo = j->swa && pos + 1 > j->n_swa
+				? pos + 1 - j->n_swa : 0;
+
+			for (uint32_t h = kvh * j->gqa; h < (kvh + 1) * j->gqa;
+			     h++) {
+				if (n == GQA_QMAX) {
+					attn_gqa_group(Q, n, kf, vf, kh, vh, ks,
+						       j->hd, j->scale);
+					n = 0;
+				}
+				/* the scores where attn_block_heads keeps
+				 * them: unit h, row r of its one block */
+				Q[n++] = (struct gqa_q){
+					j->q + (size_t)r * qstride + h * j->hd,
+					s->batt + ((size_t)h * j->R + r)
+						  * s->n_ctx,
+					j->out + (size_t)r * qstride + h * j->hd,
+					tlo, pos };
+			}
+		}
+		if (n)
+			attn_gqa_group(Q, n, kf, vf, kh, vh, ks, j->hd,
+				       j->scale);
+	}
+}
+
 static int attn_block_cpu(struct attn_block_job *j)
 {
 	struct llama_state *s = j->s;
 	int R = j->R;
+	int verify = attn_gqa_on() && j->n <= GQA_VERIFY_ROWS && R == j->n
+		     && j->hd <= GQA_HDMAX;
 
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	/*
+	 * A PROMPT CHUNK THROUGH THE KV UNIT, when it can take it; a worker
+	 * that could not get its scratch leaves the job to the head kernel
+	 * below, which rewrites every output it touched.
+	 */
+	if (!verify && attn_kv_plan(j)) {
+		int RB = j->kv_rows;
+		uint64_t nu = (uint64_t)j->nkv * ((j->n + RB - 1) / RB);
+
+		if (attn_block_pool())
+			pool_run_chunk(attn_kv_units, j, nu, 1, 1);
+		else
+			attn_kv_units(j, 0, nu);
+		if (!j->kv_failed)
+			return 0;
+	}
+#endif
 	/* scores: [n_head][R][n_ctx], each head's block its own */
 	{
 		/* THE SCRATCH IS PER UNIT NOW, and the unit is (head, row
@@ -7586,6 +9685,27 @@ static int attn_block_cpu(struct attn_block_job *j)
 			}
 			s->batt_rows = (unsigned)R;
 			s->batt_units = (size_t)j->n_head * nblk;
+		}
+		/*
+		 * A VERIFY PASS, OR A PROMPT CHUNK THAT SHORT, through the
+		 * grouped kernel. R == n here (attn_block clamps it), so the
+		 * scratch above is one block a head and attn_gqa_rows indexes
+		 * it the way attn_block_heads would.
+		 */
+		if (verify) {
+			unsigned th = (unsigned)charsiu_threads();
+			struct gqa_rows_job g = { j, 1 };
+
+			if (attn_block_pool() && th > j->nkv)
+				g.split = (th + j->nkv - 1) / j->nkv;
+			if (g.split > (unsigned)j->n)
+				g.split = (unsigned)j->n;
+			if (attn_block_pool())
+				charsiu_parallel_for(attn_gqa_rows, &g,
+						     (uint64_t)j->nkv * g.split);
+			else
+				attn_gqa_rows(&g, 0, (uint64_t)j->nkv * g.split);
+			return 0;
 		}
 		if (attn_block_pool())
 			charsiu_parallel_for(attn_block_heads, j,
@@ -7778,6 +9898,50 @@ static int matmul_rows(struct llama_state *s, const struct gguf_tensor *w,
 	return matmul_rows_x(s, w, X, n, Y, k, nout, 0);
 }
 
+/*
+ * THE OUTPUT HEAD OF A GREEDY VERIFY, WHERE ONLY THE ARGMAX OF A ROW SURVIVES.
+ * best[r] is llama_argmax of row r after the softcap, on either path; Y is
+ * scratch. On the hardware the tail scale, the softcap and the argmax are one
+ * read of Y (src/argmaxrow.h); on the CPU it is the full logits, the softcap
+ * over all of them and llama_argmax, which is exactly what the caller did
+ * before, so the fallback cannot differ from it. Stage accounting is
+ * matmul_rows_x's, line for line.
+ */
+static int matmul_rows_argmax(struct llama_state *s,
+			      const struct gguf_tensor *w, const float *X,
+			      int n, float *Y, uint32_t k, uint32_t nout,
+			      float cap, int32_t *best)
+{
+	double t0 = stage_on > 0 ? now_ms() : 0.0, w0;
+	int id = npu_id_for(s, w);
+
+	bmm_calls++;
+	if (id >= 0) {
+		w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+		if (!charsiu_npu_matmul_argmax(s->pool.dev, id, X, (unsigned)n,
+					       Y, cap, best)) {
+			if (stage_on > 0) {
+				double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+				bmm_entry_ms += dw;
+				bmm_dev = s->pool.dev;
+				bmm_wrap_ms += now_ms() - t0 - dw;
+			}
+			return 1;
+		}
+	}
+	if (stage_on > 0)
+		bmm_fell_rows += (unsigned long)n;
+	for (int r = 0; r < n; r++)
+		matvec(s, w, X + (size_t)r * k, Y + (size_t)r * nout);
+	softcap_logits(Y, (size_t)n * nout, cap);
+	for (int r = 0; r < n; r++)
+		best[r] = llama_argmax(Y + (size_t)r * nout, nout);
+	if (stage_on > 0)
+		bmm_fell_ms += now_ms() - t0;
+	return 0;
+}
+
 static int matmul_rows_defer(struct llama_state *s,
 			     const struct gguf_tensor *w, const float *X,
 			     int n, float *Y, uint32_t k, uint32_t nout)
@@ -7937,6 +10101,69 @@ static int matmul_rows_split(struct llama_state *s,
 		matmul_rows_defer(s, w, X, h, Y, k, nout);
 	return matmul_rows_defer(s, w, X + (size_t)h * k, n - h,
 				 Y + (size_t)h * nout, k, nout);
+}
+
+/*
+ * q/k/v OR gate/up AS ONE NPU CALL: charsiu_npu_matmul_group.
+ *
+ * ON BY DEFAULT since the board A/B of 2026-11-24 (CM5, Qwen3-0.6B int4):
+ * faster than the per tensor calls in every speculative run, 0 fall backs,
+ * plain decode untouched (m = 1 never comes here). CHARSIU_NPU_BATCH_GROUP=0
+ * restores the per tensor calls. UNMEASURED ON BATCHED PREFILL, which goes
+ * through here too at its own widths. It is for the speculative verify pass, m = 2..8 rows, where each of
+ * these projections is one slot on Qwen3-0.6B and one slot is one core: the
+ * per tensor calls below keep one core busy at a time and pay a pack and a
+ * fence each. The group packs X once a device, submits both devices and
+ * fences once. The arithmetic is the same slots on the same cores, so the
+ * text must not move; the board says whether the time does.
+ *
+ * Returns 1 when the hardware did every member, all of Ys written, and 0
+ * when it did NONE of them usefully -- switched off, a tensor not staged,
+ * any member refused at this width -- and the caller must then run its per
+ * tensor calls exactly as it does with the switch off. Nothing is deferred:
+ * the caller's charsiu_npu_flush after it is a no-op, and harmless.
+ *
+ * NOT TOGETHER WITH CHARSIU_NPU_ROWSPLIT, which is a different experiment on
+ * the same calls; with that set this always says 0.
+ */
+static int batch_group(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_BATCH_GROUP", 1);
+	return v;
+}
+
+static int matmul_rows_group(struct llama_state *s,
+			     const struct gguf_tensor *const *ws,
+			     float *const *Ys, unsigned nt, const float *X,
+			     int n)
+{
+	int ids[4];
+	double t0, w0;
+
+	if (!batch_group() || rowsplit_min() || nt < 2 || nt > 4 || n < 2)
+		return 0;
+	t0 = stage_on > 0 ? now_ms() : 0.0;
+	for (unsigned i = 0; i < nt; i++) {
+		ids[i] = npu_id_for(s, ws[i]);   /* stages on first use */
+		if (ids[i] < 0)
+			return 0;
+	}
+	w0 = stage_on > 0 ? charsiu_npu_batch_wall(s->pool.dev, 0) : 0.0;
+	if (charsiu_npu_matmul_group(s->pool.dev, ids, nt, X, (unsigned)n, Ys))
+		return 0;
+	/* ONE ENTRY, so one call: the count is what this is meant to cut */
+	bmm_calls++;
+	if (stage_on > 0) {
+		double dw = charsiu_npu_batch_wall(s->pool.dev, 0) - w0;
+
+		bmm_entry_ms += dw;
+		bmm_dev = s->pool.dev;
+		bmm_wrap_ms += now_ms() - t0 - dw;
+	}
+	return 1;
 }
 
 /*
@@ -8390,7 +10617,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(norm1_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8447,6 +10674,17 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			matmul_rows(s, L->wq, s->bxb, n, s->bq, m->n_embd,
 				    m->n_head * hd);
 		} else if (!prefill_grouped() || will_batch(s, L->wq)) {
+			/* CHARSIU_NPU_BATCH_GROUP (on by default): q, k
+			 * and v -- or q and k where the layer has no attn_v --
+			 * in one NPU call. 0 means it did nothing usable and
+			 * the three calls below run exactly as without it.
+			 * The gate is the group's RETURN, not a flag that skips
+			 * a call: see "ASKED, NOT TRIED" above. */
+			const struct gguf_tensor *gw[3] = { L->wq, L->wk, L->wv };
+			float *gy[3] = { s->bq, s->bk, s->bv };
+
+			if (!matmul_rows_group(s, gw, gy, L->wv ? 3u : 2u,
+					       s->bxb, n)) {
 			/* nothing writes bxb between these three: the
 			 * declaration below is only true because of that --
 			 * and it is also what makes the deferral legal. q's
@@ -8463,6 +10701,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						  m->n_embd,
 						  m->n_head_kv * hd, 'v', 1,
 						  'q');
+			}
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -8514,7 +10753,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * residuals, the norms -- so an arm using it measures
 			 * all of them and calls the answer the rope's. This
 			 * one moves only the rope. */
-			if (rope_pool() && row_pool() && n > 1)
+			if (rope_pool() && row_pool_for(n))
 				charsiu_parallel_for(rope_rows, &rj,
 						     (uint64_t)n);
 			else
@@ -8571,12 +10810,28 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 						memcpy(s->vcache + off, vs,
 						       hd * sizeof(float));
 					}
+					/* the half cache, from the same
+					 * numbers the float one now holds */
+					if (s->kc16) {
+						kv16_put(s->kc16 + off, ks, hd);
+						kv16_put(s->vc16 + off, vs, hd);
+					}
 					/* the fp16 mirror is written HERE and
 					 * not from the float cache: the same
 					 * source, the same instant, so the two
 					 * cannot drift by a rope or a norm */
-					attn_npu_append(s, l, kh, hd, pos,
-							ks, vs);
+					/* NOT FROM A VERIFY PASS: nothing in
+					 * it reads the mirror, its rejected
+					 * rows are rolled back, and the first
+					 * one past the prompt's rung repacked
+					 * every surface -- 690 ms at 1448
+					 * tokens, Qwen3-1.7B on the CM5.
+					 * attn_npu_catchup fills these
+					 * positions from the float cache when
+					 * a batched layer next needs them. */
+					if (!s->in_verify)
+						attn_npu_append(s, l, kh, hd,
+								pos, ks, vs);
 				}
 			if (attn_block_rows() > 0) {
 				/*
@@ -8636,7 +10891,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 				pos0, n, swa, (int)m->n_swa,
 				hd, hdmax, m->n_head_kv * hdmax, gqa,
 				m->n_head_kv, m->n_head, scale,
-				s->bq, s->bao, 0
+				s->bq, s->bao, 0, 0, 0, 0
 			};
 
 			if (attn_block(&bj))
@@ -8652,7 +10907,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(res1_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8667,10 +10922,16 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 			 * other, which is the only condition the deferral has.
 			 * The flush below covers the case where up is refused
 			 * and never reaches the hardware to do it. */
+			/* and the same group switch for gate and up */
+			const struct gguf_tensor *gw[2] = { L->gate, L->up };
+			float *gy[2] = { s->bhb, s->bhb2 };
+
+			if (!matmul_rows_group(s, gw, gy, 2, s->bxb, n)) {
 			matmul_rows_split(s, L->gate, s->bxb, n, s->bhb,
 					  m->n_embd, nff, 0, 0, 'f');
 			matmul_rows_split(s, L->up, s->bxb, n, s->bhb2,
 					  m->n_embd, nff, 'u', 1, 'f');
+			}
 			charsiu_npu_flush(s->pool.dev);
 		} else {
 			for (int r = 0; r < n; r++)
@@ -8683,7 +10944,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct silu_rows_job sj = { s, m->ffn_gelu, nff };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(silu_rows, &sj,
 						     (uint64_t)n);
 			else
@@ -8702,7 +10963,7 @@ static int batch_layers(struct llama_state *s, const struct llama_model *m,
 		{
 			struct norm_rows_job nj = { s, m, L };
 
-			if (row_pool() && n > 1)
+			if (row_pool_for(n))
 				charsiu_parallel_for(res2_rows, &nj,
 						     (uint64_t)n);
 			else
@@ -8927,14 +11188,74 @@ void llama_prefill_hint(struct llama_state *s, int total)
 int llama_prefill_batch(struct llama_state *s, const struct llama_model *m,
 			const int32_t *toks, int n, int pos0)
 {
-	if (batch_layers(s, m, toks, n, pos0))
+	return llama_prefill_batch_keep(s, m, toks, n, pos0, n);
+}
+
+/*
+ * A CHUNK OF n ROWS OF WHICH ONLY THE FIRST keep ARE THE PROMPT.
+ *
+ * The rows past keep are padding, there so the chunk is a width the hardware
+ * batches well rather than an odd one it cannot express at all. Attention is
+ * causal, so no real row reads a pad row; the pad rows write the cache at
+ * pos0 + keep .. pos0 + n - 1 like any row does, and that is the only trace
+ * they leave. The head runs on row keep - 1, the last REAL row, and the cache
+ * is then truncated to pos0 + keep, which is where the next token goes and
+ * what every "how far is this valid" mark must say.
+ */
+int llama_prefill_batch_keep(struct llama_state *s,
+			     const struct llama_model *m, const int32_t *toks,
+			     int n, int pos0, int keep)
+{
+	int rc;
+
+	if (keep < 1 || keep > n)
 		return -1;
-	rmsnorm(s->xb, s->bx + (size_t)(n - 1) * m->n_embd, m->out_norm,
+	llama_prefill_scope(n);
+	rc = batch_layers(s, m, toks, n, pos0);
+	llama_prefill_scope(0);
+	if (rc)
+		return -1;
+	rmsnorm(s->xb, s->bx + (size_t)(keep - 1) * m->n_embd, m->out_norm,
 		m->n_embd, m->rms_eps);
 	matvec(s, m->output, s->xb, s->logits);
 	softcap_logits(s->logits, m->n_vocab, m->final_softcap);
 	s->pos = pos0 + n;
+	if (keep < n)
+		llama_cache_truncate(s, pos0 + keep);
 	return 0;
+}
+
+/*
+ * THE CACHE ENDS AT pos, AND EVERY MARK OF HOW FAR IT IS VALID SAYS SO.
+ *
+ * The float caches and kc16/vc16 need nothing: nothing reads a position at or
+ * above s->pos, and the next write to one overwrites it. The fp16 attention
+ * mirror is different, because it keeps its own mark -- packed[l], the
+ * positions already mirrored -- and attn_npu_catchup trusts it. A pass that
+ * wrote rows the cache then gives back (a padded chunk, a verify pass, a kept
+ * prefix) would leave the mark above pos, and the next prompt would read
+ * whatever those rows held instead of re-packing what decode put there. That
+ * is the second-turn garbage of 4dce18c by another road.
+ */
+void llama_cache_truncate(struct llama_state *s, int pos)
+{
+	struct attn_npu *a;
+	unsigned l;
+
+	if (!s)
+		return;
+	if (pos < 0)
+		pos = 0;
+	if (pos < s->pos)
+		s->pos = pos;
+	/* not attn_npu_get: an "off" mirror can still hold marks, and one
+	 * that failed half way through being built has no array yet */
+	a = s->anpu;
+	if (!a || !a->packed)
+		return;
+	for (l = 0; l < a->n_layer; l++)
+		if (a->packed[l] > (unsigned)pos)
+			a->packed[l] = (unsigned)pos;
 }
 
 /*
@@ -8971,10 +11292,107 @@ int llama_verify_batch(struct llama_state *s, const struct llama_model *m,
 }
 
 /*
+ * THE SAME PASS FOR A VERIFIER THAT ONLY ASKS WHICH TOKEN. Everything up to
+ * the head is llama_verify_batch's; the head returns each row's argmax and
+ * never stores a scaled logit (matmul_rows_argmax). CHARSIU_SPEC_ARGMAX=1
+ * routes llama_spec_step here; anything that needs the logits themselves --
+ * charsiu_ppl --batch, a sampler -- keeps llama_verify_batch.
+ */
+int llama_verify_batch_argmax(struct llama_state *s,
+			      const struct llama_model *m, const int32_t *toks,
+			      int n, int pos0, float *scratch, int32_t *best)
+{
+	if (batch_layers(s, m, toks, n, pos0))
+		return -1;
+	for (int r = 0; r < n; r++)
+		rmsnorm(s->bxb + (size_t)r * m->n_embd,
+			s->bx + (size_t)r * m->n_embd, m->out_norm,
+			m->n_embd, m->rms_eps);
+	matmul_rows_argmax(s, m->output, s->bxb, n, scratch, m->n_embd,
+			   m->n_vocab, m->final_softcap, best);
+	s->pos = pos0 + n;
+	return 0;
+}
+
+/*
  * ONE CALL, THEN IT CLEARS ITSELF. A left-over embd_in would silently turn
  * the next real token into the previous picture, which is a fluent answer about
  * nothing that was asked.
  */
+/*
+ * ---- THE OUTPUT PROJECTION STARTS WHILE ATTENTION IS STILL RUNNING ----
+ *
+ * CHARSIU_NPU_WO_PARTS. charsiu_npu_kparts in npudev.c is the hardware half;
+ * this is where the heads are split to match it. o proj's first K slice reads
+ * the first heads' outputs and nothing else, so once those heads are done
+ * their core can stream its half of the weights while the CPU finishes the
+ * rest. Per head the attention is the same kernel on the same range of
+ * positions, and per output element the gather is the same, so the tokens
+ * and the logits do not move; only the order in which independent work
+ * starts does.
+ *
+ * Off, and measured as no gain: see charsiu_npu_kparts.
+ */
+static int wo_parts_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_WO_PARTS", 0);
+	return v;
+}
+
+/* the npu id of wo when the call can go in two parts, and the first head of
+ * part 1; -1 when it cannot. Expects s->act already set from s->xb. */
+static int wo_parts_id(struct llama_state *s, const struct llama_layer *L,
+		       uint32_t nhead, uint32_t hd, uint32_t gqa,
+		       uint32_t *hsplit)
+{
+	const struct gguf_tensor *w = L->wo;
+	unsigned kcol = 0;
+	int id;
+
+	if (!wo_parts_on() || !w || !s->pool.dev || !s->act.npu_ok ||
+	    (uint64_t)nhead * hd != w->ne[0])
+		return -1;
+	if (!npu_call_worth((uint64_t)w->ne[0] * (uint64_t)w->ne[1], w->name))
+		return -1;
+	id = npu_id_for(s, w);
+	if (id < 0 || charsiu_npu_needs_q1_id(s->pool.dev, id) ||
+	    !charsiu_npu_kparts(s->pool.dev, id, &kcol))
+		return -1;
+	if (!kcol || kcol % hd || (kcol / hd) % gqa || kcol / hd >= nhead)
+		return -1;
+	*hsplit = kcol / hd;
+	return id;
+}
+
+struct attn_off {
+	void (*fn)(void *, uint64_t, uint64_t);
+	void *aj;
+	uint64_t base;
+};
+
+static void attn_off_fn(void *c, uint64_t h0, uint64_t nh)
+{
+	const struct attn_off *o = c;
+
+	o->fn(o->aj, o->base + h0, nh);
+}
+
+/* heads [h0, h1) through fn, on the pool when the position says so */
+static void attn_range(void (*fn)(void *, uint64_t, uint64_t), void *aj,
+		       uint64_t h0, uint64_t h1, int pos, unsigned grain)
+{
+	if (attn_pool_for(pos)) {
+		struct attn_off o = { fn, aj, h0 };
+
+		pool_run(attn_off_fn, &o, h1 - h0, grain);
+	} else {
+		fn(aj, h0, h1 - h0);
+	}
+}
+
 const float *llama_forward_embd(struct llama_state *s, const float *embd,
 				int pos)
 {
@@ -9149,6 +11567,8 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 		 */
 		int tlo = swa && pos + 1 > (int)m->n_swa ?
 			  pos + 1 - (int)m->n_swa : 0;
+		int wo_id = -1;
+		uint32_t wo_split = 0;
 
 		rmsnorm(s->xb, s->x, L->attn_norm, m->n_embd, m->rms_eps);
 		STAGE(ST_NORM1);
@@ -9239,6 +11659,17 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 			memcpy(s->kcache + off, s->k, kvdim * sizeof(float));
 			memcpy(s->vcache + off, s->v, kvdim * sizeof(float));
+			if (s->kc16)
+				for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
+					size_t o16 = ((size_t)(l * m->n_head_kv
+						      + kh) * s->n_ctx + pos)
+						     * hdmax;
+
+					kv16_put(s->kc16 + o16, s->k + kh * hd,
+						 hd);
+					kv16_put(s->vc16 + o16, s->v + kh * hd,
+						 hd);
+				}
 		} else {
 			for (uint32_t kh = 0; kh < m->n_head_kv; kh++) {
 				size_t off = ((size_t)(l * m->n_head_kv + kh)
@@ -9268,6 +11699,14 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 				       hd * sizeof(float));
 				memcpy(s->vcache + off, s->v + kh * hd,
 				       hd * sizeof(float));
+				}
+				/* FROM THE FLOAT CACHE JUST WRITTEN, so a
+				 * KV_BITS rounding reaches the halves too */
+				if (s->kc16) {
+					kv16_put(s->kc16 + off,
+						 s->kcache + off, hd);
+					kv16_put(s->vc16 + off,
+						 s->vcache + off, hd);
 				}
 				/*
 				 * THE DECODE PATH NO LONGER WRITES THE
@@ -9311,12 +11750,45 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 			 * context and 38 positions is not where this question
 			 * gets settled. CHARSIU_ATTN_POOL turns it on.
 			 */
-			if (attn_pool_for(pos)) {
+			/*
+			 * THE GROUPED KERNEL takes the same job and the same
+			 * pool rule; the grain keeps a dynamic chunk to whole
+			 * groups. The 64 position threshold was measured for
+			 * attn_heads, and a kernel that does the same work
+			 * faster has a later break even -- unmeasured, which is
+			 * why CHARSIU_ATTN_POOL_MIN is the knob a board round
+			 * sweeps for it.
+			 */
+			void (*fn)(void *, uint64_t, uint64_t) =
+				attn_gqa_on() && hd <= GQA_HDMAX
+				? attn_gqa_heads : attn_heads;
+
+			unsigned grain = fn == attn_heads ? 1 : gqa;
+
+			act_set_timed(&s->act, s->xb, (int)L->wo->ne[0]);
+			wo_id = wo_parts_id(s, L, m->n_head, hd, gqa,
+					    &wo_split);
+			if (wo_id >= 0) {
+				charsiu_note("attention: the heads o proj's first"
+					     " part reads", cur_layer,
+					     (unsigned long)wo_split);
+				attn_range(fn, &aj, 0, wo_split, pos, grain);
+				if (!charsiu_npu_part_go(s->pool.dev, wo_id,
+							 &s->act, 0)) {
+					attn_range(fn, &aj, wo_split, m->n_head,
+						   pos, grain);
+					charsiu_npu_part_go(s->pool.dev, wo_id,
+							    &s->act, 1);
+				} else {
+					attn_range(fn, &aj, wo_split, m->n_head,
+						   pos, grain);
+				}
+			} else if (attn_pool_for(pos)) {
 				charsiu_note("attention over the pool",
 					     cur_layer, (unsigned long)g_pool.n);
-				pool_run(attn_heads, &aj, m->n_head, 1);
+				pool_run(fn, &aj, m->n_head, grain);
 			} else {
-				attn_heads(&aj, 0, m->n_head);
+				fn(&aj, 0, m->n_head);
 			}
 			charsiu_note("attention: done", cur_layer,
 				     (unsigned long)pos);
@@ -9324,7 +11796,10 @@ const float *llama_forward(struct llama_state *s, int32_t token, int pos)
 
 		STAGE(ST_ATTN);
 
-		matvec(s, L->wo, s->xb, s->xb2);
+		/* a failed part leaves the ordinary call to do the work */
+		if (wo_id < 0 ||
+		    charsiu_npu_part_end(s->pool.dev, wo_id, s->xb2))
+			matvec(s, L->wo, s->xb, s->xb2);
 		STAGE(ST_WO);
 		/*
 		 * ON THE BRANCH, BEFORE THE RESIDUAL ADD. Normalising after
@@ -9544,12 +12019,14 @@ int32_t llama_sample(const float *logits, uint32_t n, float temp, float top_p,
  * WHAT THIS DOES NOT DO. Sampling at a temperature is left to the plain
  * loop: lossless speculative SAMPLING exists (accept with p_target(d), else
  * draw from the residual) and is not written here, so with --temp the runner
- * says so once and does not speculate. And a pass at m = 4 has never been
- * PRICED on the board -- the argument that it costs about one decode step is
- * an argument about bytes, and the fence and the read back both grow with m.
+ * says so once and does not speculate. And the argument that a pass costs
+ * about one decode step was an argument about bytes, and the board says
+ * otherwise: the fence and the read back both grow with m, and a pass costs
+ * between two and three plain steps (the cost policy below has the numbers).
  * The acceptance statistics this prints are a property of the model and the
  * prompt and are measured on any machine; the pass cost is the one number
- * that needs the hardware.
+ * that needs the hardware -- which is why the policy measures it in the run
+ * rather than carrying it as a constant.
  */
 
 static void spec_push(struct llama_spec *sp, int32_t tok)
@@ -9558,10 +12035,198 @@ static void spec_push(struct llama_spec *sp, int32_t tok)
 		sp->hist[sp->n_hist++] = tok;
 }
 
+/*
+ * THE COST POLICY: SPECULATE ONLY WHERE THIS RUN HAS MEASURED IT PAYS.
+ *
+ * The board priced the pass on 2026-11-24 (CM5, Qwen3-0.6B int4, grouped
+ * submit): about 120 ms for a pass against 41-50 ms for a plain token, so a
+ * pass has to commit about 2.5 tokens to break even, and with the chat
+ * template prompt lookup managed 1.86, 1.34 and 1.15 tokens a pass on three
+ * prompts -- +12%, -4% and -22% against plain. A fixed k is a bet on the
+ * prompt. This makes the bet a pass at a time, from three measured things:
+ *
+ *   t_plain     a plain step, timed here (running mean, 1/8 weight)
+ *   t_ver[w]    a pass at width 2, 4 or 6, timed here the same way
+ *   alpha_i     how often draft i is right given drafts 0..i-1 were, as
+ *               counts decayed by 0.9 an observation (a window of about ten)
+ *
+ * and the rule: send d' of the d drafts, choosing d' to maximise
+ * E(d') / t_ver[width(d')], where E(d') = 1 + a0 + a0 a1 + ... is the tokens
+ * a pass is expected to commit; and only if E * t_plain > t_ver, i.e. only
+ * if that rate beats one token per t_plain. Otherwise the step is plain.
+ *
+ * THE ACCEPTANCE IS MEASURED ON PLAIN STEPS TOO, AT NO COST. A plain step
+ * still asks the drafter, keeps what it proposed, and checks it against the
+ * tokens greedy then actually produces -- which is exactly the test a pass
+ * would have applied, because greedy is deterministic. So a run that stopped
+ * speculating keeps measuring, and starts again the moment a copy-heavy
+ * stretch makes the drafts right, without paying a pass to find out.
+ *
+ * A WIDTH NOT YET MEASURED IS ESTIMATED OPTIMISTICALLY, so that it gets
+ * tried: between two measured widths it is interpolated; above the widest
+ * measured one it costs what that one does (a wider pass costs at least as
+ * much, and a batched pass is mostly fixed cost -- a line through a narrow
+ * pass and the plain step, which is a different code path, put width 6 at
+ * twice what the board measures); below the narrowest it is on the line from
+ * (1, t_plain); and with nothing measured it is t_plain * (1 + SPEC_SLOPE0
+ * a row after the first), 0.35 being about the board's (120 - 45) / 5 / 45.
+ * The guess only decides whether a width is TRIED. The first sample at every
+ * width, and of the plain step, is discarded as cold, so a width is tried
+ * at most twice on a guess before its own number replaces it -- six passes
+ * in a run at most, each of them still behind the gate and the ledger.
+ *
+ * THE BACK-OFF IS FOR WHEN THE ESTIMATE IS WRONG. Every pass is priced after
+ * the fact against what plain would have cost for the tokens it committed
+ * (nc * t_plain - its own time) and the result added to a ledger, capped at
+ * one plain step of credit. A pass that loses and leaves the ledger negative
+ * stops speculation for `backoff` plain tokens, which doubles each time this
+ * happens (8, 16, ... 256) and returns to 8 once the ledger has earned its
+ * cap again. So a stretch of speculation loses at most one pass's excess
+ * over plain plus one step of credit before it is stopped, and the stops are
+ * spaced exponentially: if the estimate were wrong every time, the loss would
+ * still tend to about (t_ver - t_plain + t_plain) / (256 t_plain), under 1.5%
+ * at the board's numbers, plus the ramp. On top of that the gate only opens
+ * where the measured numbers say the expected gain is positive.
+ *
+ * WHAT IT DOES NOT CHANGE: which tokens. Every committed token is still the
+ * plain loop's token; the policy only decides how many drafts a pass carries
+ * and whether there is a pass. Forced k (k > 0 to llama_spec_init) runs none
+ * of this and sends every draft, as before; only the timing is recorded, for
+ * the report.
+ */
+#define SPEC_DECAY        0.9
+#define SPEC_PRIOR_N      1.0   /* pseudo-observations, at mean 0.5 */
+#define SPEC_EWMA         0.125
+#define SPEC_SLOPE0       0.35  /* rows after the first, in plain steps */
+#define SPEC_BACKOFF0     8
+#define SPEC_BACKOFF_MAX  256
+#define SPEC_LEDGER_CAP   1.0   /* in plain steps */
+
+/* the width a pass of d drafts runs at, as 0, 1, 2 for 2, 4, 6 rows */
+static int spec_wi(int d)
+{
+	int n = 1 + d;
+
+	n += n & 1;
+	return n / 2 - 1;
+}
+
+/* THE FIRST SAMPLE IS COLD and is not kept: see "A WIDTH NOT YET MEASURED" */
+static void spec_mean(double *v, int *n, double x)
+{
+	if (*n == 1)
+		*v = x;
+	else if (*n > 1)
+		*v += SPEC_EWMA * (x - *v);
+	(*n)++;
+}
+
+static double spec_alpha(const struct llama_spec *sp, int i)
+{
+	return (sp->hit[i] + 0.5 * SPEC_PRIOR_N) / (sp->reach[i] + SPEC_PRIOR_N);
+}
+
+static void spec_obs(struct llama_spec *sp, int i, int ok)
+{
+	sp->reach[i] = SPEC_DECAY * sp->reach[i] + 1.0;
+	sp->hit[i] = SPEC_DECAY * sp->hit[i] + (ok ? 1.0 : 0.0);
+}
+
+/* one committed token, against the drafts a plain step did not send */
+static void spec_feed(struct llama_spec *sp, int32_t x)
+{
+	if (!sp->sh_n)
+		return;
+	if (sp->sh[sp->sh_i] == x) {
+		spec_obs(sp, sp->sh_i, 1);
+		if (++sp->sh_i == sp->sh_n)
+			sp->sh_n = 0;
+	} else {
+		spec_obs(sp, sp->sh_i, 0);
+		sp->sh_n = 0;
+	}
+}
+
+static double spec_tver(const struct llama_spec *sp, int wi)
+{
+	int lo = -1, hi = -1;
+
+	if (sp->n_tver[wi] >= 2)
+		return sp->t_ver[wi];
+	for (int j = wi - 1; j >= 0 && lo < 0; j--)
+		if (sp->n_tver[j] >= 2)
+			lo = j;
+	for (int j = wi + 1; j < 3 && hi < 0; j++)
+		if (sp->n_tver[j] >= 2)
+			hi = j;
+	if (lo >= 0 && hi >= 0) {
+		double x0 = 2.0 * (lo + 1), x1 = 2.0 * (hi + 1);
+
+		return sp->t_ver[lo] + (sp->t_ver[hi] - sp->t_ver[lo])
+		       * (2.0 * (wi + 1) - x0) / (x1 - x0);
+	}
+	if (lo >= 0)
+		return sp->t_ver[lo];   /* a wider pass costs at least this */
+	if (hi >= 0)                    /* the plain step is width 1 */
+		return sp->t_plain + (sp->t_ver[hi] - sp->t_plain)
+		       * (2.0 * (wi + 1) - 1.0) / (2.0 * (hi + 1) - 1.0);
+	return sp->t_plain * (1.0 + SPEC_SLOPE0 * (2.0 * (wi + 1) - 1.0));
+}
+
+/* how many of the d drafts to send, or 0 for a plain step */
+static int spec_policy(struct llama_spec *sp, int d)
+{
+	double best = 0.0, e = 1.0, p = 1.0;
+	int bd = 0;
+
+	int wmax = 0;
+
+	if (sp->n_tplain < 2)
+		return 0;               /* nothing to compare a pass with yet */
+	/*
+	 * PROBE NARROWEST FIRST. A width is a candidate only once every
+	 * narrower one has been measured: an unmeasured width is priced from
+	 * a prior, and on a model that accepts little the prior sent the
+	 * first probes at six rows, two plain steps each. A model that
+	 * accepts reaches six rows a few passes later.
+	 *
+	 * IT DID NOT REMOVE THE LONG PROMPT LOSS, and the probes were not its
+	 * cause: the first verify pass of a run repacked the fp16 attention
+	 * mirror (see the append in batch_layers).
+	 */
+	while (wmax < 2 && sp->n_tver[wmax] >= 2)
+		wmax++;
+	for (int dd = 1; dd <= d; dd++) {
+		double t, r;
+
+		if (spec_wi(dd) > wmax)
+			break;
+		p *= spec_alpha(sp, dd - 1);
+		e += p;
+		t = spec_tver(sp, spec_wi(dd));
+		r = e / (t > 1e-6 ? t : 1e-6);
+		if (r > best) {
+			best = r;
+			bd = dd;
+		}
+	}
+	if (best * sp->t_plain <= 1.0)
+		return 0;
+	if (sp->n_tver[spec_wi(bd)] < 2)
+		sp->n_probe++;
+	return bd;
+}
+
 int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 		    int n_ctx)
 {
+	const char *e = getenv("CHARSIU_SPEC_VERIFY_SCALE");
+
 	memset(sp, 0, sizeof(*sp));
+	if (k < 0) {
+		sp->autok = 1;
+		k = -k;
+	}
 	if (k < 1)
 		k = 1;
 	/*
@@ -9580,6 +12245,17 @@ int llama_spec_init(struct llama_spec *sp, const struct llama_model *m, int k,
 	/* k drafts, row 0, and one row of padding to keep the width even */
 	sp->logits_all = malloc((size_t)(k + 2) * m->n_vocab * sizeof(float));
 	sp->junk = charsiu_env_flag("CHARSIU_SPEC_JUNK", 0);
+	/*
+	 * A DESK KNOB, NOT A BOARD ONE. On a machine with no NPU a pass runs
+	 * its rows one at a time and costs w plain steps, so the policy rightly
+	 * never speculates there and the paths that resume and choose a width
+	 * are never run. Scaling the pass's measured time (0.3 makes a desk
+	 * pass look like a board one) exercises them; the text must not move.
+	 */
+	sp->vscale = e && *e ? atof(e) : 1.0;
+	if (!(sp->vscale > 0.0))
+		sp->vscale = 1.0;
+	sp->backoff = SPEC_BACKOFF0;
 	if (!sp->hist || !sp->logits_all) {
 		llama_spec_free(sp);
 		return -1;
@@ -9645,24 +12321,76 @@ static int spec_draft(const struct llama_spec *sp, int32_t *out, int k)
 	return 0;
 }
 
+/* CHARSIU_SPEC_TRACE=1: one stderr line a speculative pass, its width,
+ * acceptance and time, to see where a run's pass time goes */
+static int spec_trace(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_SPEC_TRACE", 0);
+	return v;
+}
+
+static int spec_argmax(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_SPEC_ARGMAX", 0);
+	return v;
+}
+
 int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 		    const struct llama_model *m, int32_t tok, int32_t *out,
 		    int max_out)
 {
 	int32_t rows[8], drafts[8];
-	int d, n, a, nc, pos0 = s->pos;
+	int d, nd, n, a, nc, wi, cold, pos0 = s->pos;
+	double t0, dt;
 
 	spec_push(sp, tok);
 	d = sp->off ? 0 : spec_draft(sp, drafts, sp->k);
 	/* every row must fit the cache, or the pass would write past it */
 	if (d && pos0 + 1 + d + 1 > s->n_ctx)
 		d = 0;
+	nd = d;
+	/*
+	 * THE FOUR WAYS A STEP IS PLAIN under the policy, counted apart so the
+	 * report can say which one a run spent its plain tokens on.
+	 */
+	if (sp->autok) {
+		if (sp->backoff_left > 0) {
+			sp->backoff_left--;
+			sp->n_hold++;
+			d = 0;
+		} else if (!d) {
+			sp->n_nodraft++;
+		} else if (!(d = spec_policy(sp, d))) {
+			sp->n_gate++;
+		}
+	}
 	if (d == 0) {
-		const float *lg = llama_forward(s, tok, s->pos);
+		const float *lg;
 
+		t0 = now_ms();
+		lg = llama_forward(s, tok, s->pos);
 		if (!lg)
 			return -1;
 		out[0] = llama_argmax(lg, m->n_vocab);
+		dt = now_ms() - t0;
+		spec_mean(&sp->t_plain, &sp->n_tplain, dt);
+		sp->ms_plain += dt;
+		if (sp->autok) {
+			/* the drafts it did not send, checked for free */
+			if (!sp->sh_n && nd) {
+				memcpy(sp->sh, drafts,
+				       (size_t)nd * sizeof(*drafts));
+				sp->sh_n = nd;
+				sp->sh_i = 0;
+			}
+			spec_feed(sp, out[0]);
+		}
 		sp->passes++;
 		sp->plain++;
 		return 1;
@@ -9678,7 +12406,26 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	 */
 	if (n & 1)
 		rows[n++] = drafts[d - 1];
-	if (llama_verify_batch(s, m, rows, n, pos0, sp->logits_all)) {
+	/*
+	 * ONLY THE INDEX OF EACH ROW IS READ BELOW, so under
+	 * CHARSIU_SPEC_ARGMAX=1 the head hands back just that: best[i] is
+	 * llama_argmax of the row llama_verify_batch would have stored, and
+	 * logits_all becomes scratch. Off by default until the board has run
+	 * both arms; the desk holds the kernel against the three passes it
+	 * replaces (tests/argmax_fused.c).
+	 */
+	int32_t best[8];
+	int vrc;
+
+	t0 = now_ms();
+	s->in_verify = 1;
+	vrc = spec_argmax()
+		  ? llama_verify_batch_argmax(s, m, rows, n, pos0,
+					      sp->logits_all, best)
+		  : llama_verify_batch(s, m, rows, n, pos0, sp->logits_all);
+	s->in_verify = 0;
+
+	if (vrc) {
 		/*
 		 * REFUSED, AND SAID ONCE. batch_layers refuses before it
 		 * touches the cache, so nothing needs undoing; the rest of the
@@ -9691,13 +12438,16 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 				"batched forward refused this model (%s)\n",
 				llama_batch_why_not(m));
 		sp->off = 1;
-		s->pos = pos0;
+		llama_cache_truncate(s, pos0);
 		return llama_spec_step(sp, s, m, tok, out, max_out);
 	}
+	/* the default arm still scans only the rows it reaches, as it did */
+#define ROW_BEST(i) (spec_argmax() ? best[i]                                 \
+		     : llama_argmax(sp->logits_all + (size_t)(i) * m->n_vocab, \
+				    m->n_vocab))
 	a = 0;
 	for (int i = 0; i < d; i++) {
-		int32_t x = llama_argmax(sp->logits_all
-					 + (size_t)i * m->n_vocab, m->n_vocab);
+		int32_t x = ROW_BEST(i);
 
 		if (x != drafts[i])
 			break;
@@ -9713,13 +12463,54 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 	for (int i = 0; i < a && nc < max_out; i++)
 		out[nc++] = drafts[i];
 	if (nc < max_out)
-		out[nc++] = llama_argmax(sp->logits_all + (size_t)a * m->n_vocab,
-					 m->n_vocab);
+		out[nc++] = ROW_BEST(a);
+#undef ROW_BEST
+	dt = now_ms() - t0;
+	sp->ms_spec += dt;
+	wi = spec_wi(d);
+	cold = sp->n_tver[wi] == 0;
+	if (spec_trace())
+		fprintf(stderr, "charsiu: spec pass at %d, %d rows, %d of %d "
+			"accepted, %.1f ms, attention %.1f ms%s\n", pos0, n,
+			a, d, dt, verify_attn_ms, cold ? " (cold)" : "");
+	verify_attn_ms = 0.0;
+	spec_mean(&sp->t_ver[wi], &sp->n_tver[wi], dt * sp->vscale);
+	if (sp->autok) {
+		double cap = SPEC_LEDGER_CAP * sp->t_plain;
+		double gain = nc * sp->t_plain - dt * sp->vscale;
+
+		for (int i = 0; i < a; i++)
+			spec_obs(sp, i, 1);
+		if (a < d)
+			spec_obs(sp, a, 0);
+		for (int i = 0; i < nc; i++)
+			spec_feed(sp, out[i]);
+		/*
+		 * A COLD PASS IS THE PRICE OF MEASURING, not evidence that the
+		 * estimate was wrong: its time was thrown away above and it is
+		 * kept out of the ledger for the same reason.
+		 */
+		if (!cold) {
+			sp->ledger += gain;
+			if (sp->ledger > cap)
+				sp->ledger = cap;
+			if (gain < 0.0 && sp->ledger < 0.0) {
+				sp->backoff_left = sp->backoff;
+				sp->n_stops++;
+				sp->backoff *= 2;
+				if (sp->backoff > SPEC_BACKOFF_MAX)
+					sp->backoff = SPEC_BACKOFF_MAX;
+				sp->ledger = 0.0;
+			} else if (sp->ledger >= cap) {
+				sp->backoff = SPEC_BACKOFF0;
+			}
+		}
+	}
 	/*
 	 * Rows 1..a hold accepted tokens and their cache entries are right.
 	 * The correction is not in the cache yet: it is the next pass's row 0.
 	 */
-	s->pos = pos0 + 1 + a;
+	llama_cache_truncate(s, pos0 + 1 + a);
 	/*
 	 * EVERY TOKEN ENTERS THE HISTORY EXACTLY ONCE. The caller feeds the
 	 * LAST committed token back as the next pass's `tok`, which pushes it
@@ -9737,11 +12528,16 @@ int llama_spec_step(struct llama_spec *sp, struct llama_state *s,
 void llama_spec_report(const struct llama_spec *sp, FILE *out)
 {
 	unsigned long spec_passes = sp->passes - sp->plain;
+	char kk[16], w[3][16];
 
-	fprintf(out, "[spec k=%d: %lu passes, %lu plain, %lu speculative; "
+	if (sp->autok)
+		snprintf(kk, sizeof(kk), "auto<=%d", sp->k);
+	else
+		snprintf(kk, sizeof(kk), "%d", sp->k);
+	fprintf(out, "[spec k=%s: %lu passes, %lu plain, %lu speculative; "
 		"drafted %lu, accepted %lu (%.0f%%), committed %lu; "
-		"%.2f tok/pass%s%s]\n",
-		sp->k, sp->passes, sp->plain, spec_passes,
+		"%.2f tok/pass%s%s",
+		kk, sp->passes, sp->plain, spec_passes,
 		sp->drafted, sp->accepted,
 		sp->drafted ? 100.0 * sp->accepted / sp->drafted : 0.0,
 		sp->committed + sp->plain,
@@ -9749,4 +12545,42 @@ void llama_spec_report(const struct llama_spec *sp, FILE *out)
 			   : 0.0,
 		sp->off ? ", REFUSED by the batched forward" : "",
 		sp->junk ? ", JUNK drafts (control)" : "");
+	/*
+	 * THE FORCED LINE IS THE OLD LINE, closed where it always closed:
+	 * board_verify.sh and spec_identity.sh read it, and its costs go on a
+	 * line of their own, which does not start "[spec " because board_verify
+	 * greps that and takes every line it finds. Auto is ONE line: the old fields and then the
+	 * policy's, so the same readers find their numbers in it.
+	 *
+	 * THE TIMES ARE THE ONES THE POLICY USED: running means with the cold
+	 * first sample dropped, scaled by CHARSIU_SPEC_VERIFY_SCALE when that
+	 * is set. The plain and pass means are of every step, unscaled.
+	 */
+	for (int i = 0; i < 3; i++) {
+		if (sp->n_tver[i] >= 2)
+			snprintf(w[i], sizeof(w[i]), "%.1f", sp->t_ver[i]);
+		else
+			snprintf(w[i], sizeof(w[i]), "-");
+	}
+	if (sp->autok)
+		fprintf(out, "; policy: %lu tok speculative, %lu tok plain "
+			"(%lu no draft, %lu cost gate, %lu backing off), "
+			"%lu back-offs, next %d, %lu probes",
+			sp->committed, sp->plain, sp->n_nodraft, sp->n_gate,
+			sp->n_hold, sp->n_stops, sp->backoff, sp->n_probe);
+	else
+		fprintf(out, "]\n[pass costs: %lu tok speculative, %lu tok "
+			"plain", sp->committed, sp->plain);
+	fprintf(out, "; step %.1f ms, pass w2 %s w4 %s w6 %s ms; mean plain "
+		"%.1f, mean pass %.1f ms",
+		sp->n_tplain >= 2 ? sp->t_plain : 0.0, w[0], w[1], w[2],
+		sp->plain ? sp->ms_plain / sp->plain : 0.0,
+		spec_passes ? sp->ms_spec / spec_passes : 0.0);
+	if (sp->autok)
+		fprintf(out, "; accept %.2f %.2f %.2f %.2f %.2f",
+			spec_alpha(sp, 0), spec_alpha(sp, 1), spec_alpha(sp, 2),
+			spec_alpha(sp, 3), spec_alpha(sp, 4));
+	if (sp->vscale != 1.0)
+		fprintf(out, "; passes scaled x%.2f", sp->vscale);
+	fprintf(out, "]\n");
 }
