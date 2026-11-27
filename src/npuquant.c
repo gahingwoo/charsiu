@@ -407,12 +407,7 @@ static void wc_prefetch(const void *p, uint64_t n)
 #endif
 
 #ifdef _WIN32
-static struct {
-	const void *p;
-	uint64_t n;
-	volatile LONG done;     /* 0 none, 1 running, 2 finished */
-	double t0, ms;
-} wc_ra;
+static double wc_ra_ms = -1.0;  /* the whole-file read-ahead, when it ran */
 
 static double wc_now_ms(void)
 {
@@ -421,34 +416,6 @@ static double wc_now_ms(void)
 	QueryPerformanceCounter(&c);
 	QueryPerformanceFrequency(&f);
 	return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
-}
-
-static DWORD WINAPI wc_ra_main(LPVOID unused)
-{
-	(void)unused;
-	wc_prefetch(wc_ra.p, wc_ra.n);
-	wc_ra.ms = wc_now_ms() - wc_ra.t0;
-	InterlockedExchange(&wc_ra.done, 2);
-	return 0;
-}
-
-static void wc_prefetch_async(const void *p, uint64_t n)
-{
-	HANDLE h;
-
-	if (InterlockedCompareExchange(&wc_ra.done, 1, 0) != 0)
-		return;         /* one read-ahead a process; a restage is warm */
-	wc_ra.p = p;
-	wc_ra.n = n;
-	wc_ra.t0 = wc_now_ms();
-	h = CreateThread(NULL, 0, wc_ra_main, NULL, 0, NULL);
-	if (!h) {
-		wc_prefetch(p, n);      /* the old way rather than none */
-		wc_ra.ms = wc_now_ms() - wc_ra.t0;
-		InterlockedExchange(&wc_ra.done, 2);
-		return;
-	}
-	CloseHandle(h);
 }
 #endif
 
@@ -514,21 +481,25 @@ static const uint8_t *wc_map_file(FILE *f, const char *path, uint64_t *size)
 		 * is hinted again just before it is used (wc_record_in).
 		 */
 		/*
-		 * AND ON A THREAD OF ITS OWN. PrefetchVirtualMemory waits for
-		 * its reads: on a cold cache (TaishanPi, 2026-11-28, the file
-		 * evicted by a server that had just run) it held the first
-		 * tensor 9.3 s, the whole file at the eMMC's speed, before the
-		 * first heartbeat's clock had even started. On a thread the
-		 * reads run while the packer works through what has arrived, a
-		 * record's own hint (wc_record_in) waits only for that record,
-		 * and charsiu_wcache_use says how long the read-ahead took.
+		 * AND WAITED FOR, NOT OVERLAPPED. PrefetchVirtualMemory waits for
+		 * its reads. Run on a thread of its own so that packing could go
+		 * on beside it, the first start after a reboot took 18.5 s, 16.4 s
+		 * of it in the driver's CREATE_BO (21.7 ms a buffer on device 0,
+		 * against 0.2 ms warm) while 620 MB of page-ins competed with the
+		 * buffer allocations for free pages (TaishanPi, 2026-11-28). Done
+		 * first and waited for, the same cold file took 11.3 s, CREATE_BO
+		 * 0.3 s. The "reading" line says how long it took.
 		 */
 		{
 			MEMORYSTATUSEX ms;
 
 			ms.dwLength = sizeof(ms);
-			if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys > 2 * sz)
-				wc_prefetch_async(base, sz);
+			if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys > 2 * sz) {
+				double t0 = wc_now_ms();
+
+				wc_prefetch(base, sz);
+				wc_ra_ms = wc_now_ms() - t0;
+			}
 		}
 	}
 #else
@@ -624,17 +595,6 @@ void charsiu_wcache_use(const char *path, const char *stamp)
 	}
 	wc_record_in(NULL, 0);  /* the last record out of the working set */
 	wc_prev = NULL;
-#ifdef _WIN32
-	{
-		static int said;
-
-		if (wc.map && wc_ra.done && !said++)
-			fprintf(stderr, "charsiu: weight cache read ahead (%.0f MB): %s "
-				"%.0f ms after it started\n", wc_ra.n / 1e6,
-				wc_ra.done == 2 ? "finished" : "still running",
-				wc_ra.done == 2 ? wc_ra.ms : wc_now_ms() - wc_ra.t0);
-	}
-#endif
 	wc.writing = 0;
 	wc.checked = 0;
 	wc.map = NULL;
@@ -720,10 +680,15 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 			wc.map = wc_map_file(wc.f, path, &wc.map_size);
 			clock_gettime(CLOCK_MONOTONIC, &c);
 			fprintf(stderr, "charsiu: weight cache %s, reading "
-				"(%u tensors in it%s; index %.0f ms, map %.0f ms)\n",
+				"(%u tensors in it%s; index %.0f ms, map and read "
+				"ahead %.0f ms%s)\n",
 				path, wc_nix, wc.map ? ", mapped" : "",
 				(b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6,
-				(c.tv_sec - b.tv_sec) * 1e3 + (c.tv_nsec - b.tv_nsec) / 1e6);
+				(c.tv_sec - b.tv_sec) * 1e3 + (c.tv_nsec - b.tv_nsec) / 1e6,
+#ifdef _WIN32
+				wc.map && wc_ra_ms < 0 ? ", no read ahead: short of memory" :
+#endif
+				"");
 			return;
 		}
 		fclose(wc.f);
