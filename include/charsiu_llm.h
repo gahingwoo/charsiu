@@ -223,6 +223,8 @@ struct npu_tensor {
 			    * width, not of the process. It used to be
 			    * npu_q_packed(), one global bool, which is why
 			    * mixing widths meant nothing packed at all. */
+	int q_mapped;      /* q points into the weight cache's file mapping,
+			    * read only, and is not freed */
 	float *scale;      /* n * ngroup, per output channel per k group */
 	uint64_t kgroup;   /* k per scale; 0 or k means one scale a row */
 	float *kscale;     /* k, a factor shared by every channel; NULL when off */

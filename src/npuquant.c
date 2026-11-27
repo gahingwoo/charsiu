@@ -19,6 +19,9 @@
  * the per channel weight sum the coefficient buffer needs.
  */
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L        /* fileno, mmap, posix_madvise */
+#endif
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,6 +29,17 @@
 #include <string.h>
 
 #include "charsiu_llm.h"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
@@ -291,6 +305,8 @@ static struct {
 	char path[512];
 	char stamp[64];
 	int overridden;
+	const uint8_t *map;     /* the reading file, mapped (wc_map_file) */
+	uint64_t map_size;
 } wc;
 
 /*
@@ -322,6 +338,123 @@ static int wc_said_missing;
 #define wc_tell(f) ((int64_t)ftell(f))
 #define wc_end(f) fseek((f), 0, SEEK_END)
 #endif
+
+/*
+ * A CACHED START READS THE CACHE THROUGH A MAPPING ON WINDOWS.
+ *
+ * fread put every record into a fresh malloc: 620 MB of private memory for
+ * Llama-3.2-1B, demand-zero faulted a page at a time, beside the same 620 MB
+ * in the file cache, and the decode then never reads it again (the buffer
+ * objects hold what the NPU uses; q is the CPU fallback's). On a 4 GB board
+ * that second copy is what pushed the cache file out of memory before the
+ * next run, so every "cached" start read it from the eMMC again: 12 to 15 s
+ * of the TaishanPi's staging on 2026-11-26, against 0.1 s on a desk.
+ *
+ * Mapped, q IS the file's pages. Nothing is copied, nothing is private, a
+ * page the memory manager wants back is dropped rather than written to the
+ * page file, and the pages that survive the run are still in memory for the
+ * next one. The scales and wsum are small and are still copied, so only q
+ * ever points into the view, read only, which the cache path never writes.
+ * A view is kept for the life of the process (a tensor may outlive the
+ * staging that made it) and reused by a second staging of the same file.
+ *
+ * Windows only by default. Windows refuses to truncate a file with a view
+ * open, so another process rewriting the cache fails to open it and stays
+ * uncached; on Linux the same rewrite would truncate under this process and
+ * the next touch of q would be SIGBUS. CHARSIU_WCACHE_MAP=1 asks for it on
+ * Linux anyway (the host tests use it), =0 is the fread control on Windows.
+ */
+static struct {
+	char path[512];
+	const uint8_t *base;
+	uint64_t size;
+} wc_map;
+
+static int wc_map_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+#ifdef _WIN32
+		v = charsiu_env_flag("CHARSIU_WCACHE_MAP", 1);
+#else
+		v = charsiu_env_flag("CHARSIU_WCACHE_MAP", 0);
+#endif
+	}
+	return v;
+}
+
+/* the open cache file, mapped whole; NULL (and fread, as before) if not */
+static const uint8_t *wc_map_file(FILE *f, const char *path, uint64_t *size)
+{
+	const uint8_t *base = NULL;
+	uint64_t sz = 0;
+
+	if (!wc_map_on())
+		return NULL;
+#ifdef _WIN32
+	{
+		HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+		LARGE_INTEGER li;
+		HANDLE m;
+
+		if (h == INVALID_HANDLE_VALUE || !GetFileSizeEx(h, &li) || li.QuadPart <= 0)
+			return NULL;
+		sz = (uint64_t)li.QuadPart;
+		if (wc_map.base && wc_map.size == sz && !strcmp(wc_map.path, path)) {
+			*size = sz;
+			return wc_map.base;
+		}
+		m = CreateFileMappingW(h, NULL, PAGE_READONLY, 0, 0, NULL);
+		if (!m)
+			return NULL;
+		base = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+		CloseHandle(m);         /* the view holds the section */
+		if (!base)
+			return NULL;
+		/*
+		 * ONE HINT FOR THE WHOLE FILE: large reads queued now, instead of
+		 * a fault's small read at a time when the packer first touches a
+		 * page. Windows 8 and later; looked up, so an older kernel32 just
+		 * goes without.
+		 */
+		{
+			typedef struct { PVOID va; SIZE_T n; } wc_range;
+			typedef BOOL (WINAPI *pvm_fn)(HANDLE, ULONG_PTR, wc_range *, ULONG);
+			pvm_fn pvm = (pvm_fn)(void (*)(void))GetProcAddress(
+				GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+			wc_range r = { (PVOID)base, (SIZE_T)sz };
+
+			if (pvm)
+				(void)pvm(GetCurrentProcess(), 1, &r, 0);
+		}
+	}
+#else
+	{
+		struct stat st;
+		void *p;
+
+		if (fstat(fileno(f), &st) || st.st_size <= 0)
+			return NULL;
+		sz = (uint64_t)st.st_size;
+		if (wc_map.base && wc_map.size == sz && !strcmp(wc_map.path, path)) {
+			*size = sz;
+			return wc_map.base;
+		}
+		p = mmap(NULL, (size_t)sz, PROT_READ, MAP_SHARED, fileno(f), 0);
+		if (p == MAP_FAILED)
+			return NULL;
+		(void)posix_madvise(p, (size_t)sz, POSIX_MADV_WILLNEED);
+		base = p;
+	}
+#endif
+	/* an older view of another file stays mapped: its tensors may live */
+	snprintf(wc_map.path, sizeof(wc_map.path), "%s", path);
+	wc_map.base = base;
+	wc_map.size = sz;
+	*size = sz;
+	return base;
+}
 
 /* the payload of one record: q as it is held, then the scales, then wsum */
 static uint64_t wc_payload(uint64_t n, uint64_t k, uint64_t ngrp, int packed)
@@ -389,6 +522,8 @@ void charsiu_wcache_use(const char *path, const char *stamp)
 	}
 	wc.writing = 0;
 	wc.checked = 0;
+	wc.map = NULL;
+	wc.map_size = 0;
 	free(wc_ix);
 	wc_ix = NULL;
 	wc_nix = wc_next = 0;
@@ -463,8 +598,10 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 
 		if (got && !memcmp(&h, &want, sizeof(h))) {
 			wc_index(npu_q_packed());
+			wc.map = wc_map_file(wc.f, path, &wc.map_size);
 			fprintf(stderr, "charsiu: weight cache %s, reading "
-				"(%u tensors in it)\n", path, wc_nix);
+				"(%u tensors in it%s)\n", path, wc_nix,
+				wc.map ? ", mapped" : "");
 			return;
 		}
 		fclose(wc.f);
@@ -552,6 +689,18 @@ static int wcache_read(struct npu_tensor *t, const char *name)
 		return 0;
 	}
 	qb = wcache_qbytes(t);
+	if (wc.map && (uint64_t)r->off + wc_payload(r->n, r->k, r->ngrp, t->packed)
+			<= wc.map_size) {
+		const uint8_t *p = wc.map + r->off;
+
+		free(t->q);
+		t->q = (int8_t *)(uintptr_t)p;
+		t->q_mapped = 1;
+		memcpy(t->scale, p + qb, (size_t)(t->n * ngrp) * sizeof(float));
+		memcpy(t->wsum, p + qb + (size_t)(t->n * ngrp) * sizeof(float),
+		       (size_t)t->n * sizeof(int32_t));
+		return 1;
+	}
 	if (wc_seek(wc.f, r->off) ||
 	    fread(t->q, 1, qb, wc.f) != qb ||
 	    fread(t->scale, sizeof(float), (size_t)(t->n * ngrp), wc.f)
@@ -1645,7 +1794,8 @@ void npu_tensor_free(struct npu_tensor *t)
 {
 	if (!t)
 		return;
-	free(t->q);
+	if (!t->q_mapped)       /* a view of the weight cache (wc_map_file) */
+		free(t->q);
 	free(t->scale);
 	free(t->kscale);
 	free(t->astat);
