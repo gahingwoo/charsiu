@@ -384,6 +384,50 @@ static int wc_map_on(void)
 	return v;
 }
 
+#ifdef _WIN32
+/* PrefetchVirtualMemory, Windows 8 and later; looked up, so an older
+ * kernel32 just goes without */
+static void wc_prefetch(const void *p, uint64_t n)
+{
+	typedef struct { PVOID va; SIZE_T n; } wc_range;
+	typedef BOOL (WINAPI *pvm_fn)(HANDLE, ULONG_PTR, wc_range *, ULONG);
+	static pvm_fn pvm;
+	static int looked;
+	wc_range r = { (PVOID)(uintptr_t)p, (SIZE_T)n };
+
+	if (!looked) {
+		pvm = (pvm_fn)(void (*)(void))GetProcAddress(
+			GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+		looked = 1;
+	}
+	if (pvm && n)
+		(void)pvm(GetCurrentProcess(), 1, &r, 0);
+}
+#endif
+
+/*
+ * ONE RECORD AT A TIME, IN AND THEN OUT. Before a record's q is handed out
+ * its range is hinted in as large reads (resident pages cost nothing), and
+ * the record handed out before it, which the packer has finished with, is
+ * taken out of the working set. VirtualUnlock on pages that were never
+ * locked does exactly that: they go to the standby list, still cached for
+ * a CPU fallback and for the next run, but no longer the working set the
+ * memory manager has to trim when the board is short.
+ */
+static const void *wc_prev;
+static uint64_t wc_prev_n;
+
+static void wc_record_in(const void *p, uint64_t n)
+{
+#ifdef _WIN32
+	if (wc_prev)
+		(void)VirtualUnlock((LPVOID)(uintptr_t)wc_prev, (SIZE_T)wc_prev_n);
+	wc_prefetch(p, n);
+#endif
+	wc_prev = p;
+	wc_prev_n = n;
+}
+
 /* the open cache file, mapped whole; NULL (and fread, as before) if not */
 static const uint8_t *wc_map_file(FILE *f, const char *path, uint64_t *size)
 {
@@ -413,20 +457,21 @@ static const uint8_t *wc_map_file(FILE *f, const char *path, uint64_t *size)
 		if (!base)
 			return NULL;
 		/*
-		 * ONE HINT FOR THE WHOLE FILE: large reads queued now, instead of
-		 * a fault's small read at a time when the packer first touches a
-		 * page. Windows 8 and later; looked up, so an older kernel32 just
-		 * goes without.
+		 * THE WHOLE FILE AHEAD ONLY WHEN IT FITS. Large reads queued now
+		 * beat a fault's small read when the packer first touches a page
+		 * -- but on a board short of memory (the TaishanPi's first run
+		 * after a server exited, 128 MB free, 2026-11-28) 620 MB read
+		 * ahead is repurposed before it is used and every page is read
+		 * again, a fault at a time: 35.8 s of "adding". So the whole file
+		 * is hinted only with twice its size available, and each record
+		 * is hinted again just before it is used (wc_record_in).
 		 */
 		{
-			typedef struct { PVOID va; SIZE_T n; } wc_range;
-			typedef BOOL (WINAPI *pvm_fn)(HANDLE, ULONG_PTR, wc_range *, ULONG);
-			pvm_fn pvm = (pvm_fn)(void (*)(void))GetProcAddress(
-				GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-			wc_range r = { (PVOID)base, (SIZE_T)sz };
+			MEMORYSTATUSEX ms;
 
-			if (pvm)
-				(void)pvm(GetCurrentProcess(), 1, &r, 0);
+			ms.dwLength = sizeof(ms);
+			if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys > 2 * sz)
+				wc_prefetch(base, sz);
 		}
 	}
 #else
@@ -520,6 +565,8 @@ void charsiu_wcache_use(const char *path, const char *stamp)
 		fclose(wc.f);
 		wc.f = NULL;
 	}
+	wc_record_in(NULL, 0);  /* the last record out of the working set */
+	wc_prev = NULL;
 	wc.writing = 0;
 	wc.checked = 0;
 	wc.map = NULL;
@@ -693,6 +740,7 @@ static int wcache_read(struct npu_tensor *t, const char *name)
 			<= wc.map_size) {
 		const uint8_t *p = wc.map + r->off;
 
+		wc_record_in(p, qb);
 		free(t->q);
 		t->q = (int8_t *)(uintptr_t)p;
 		t->q_mapped = 1;
