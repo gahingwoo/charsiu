@@ -169,6 +169,19 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 			       const uint8_t *src, uint8_t *dst,
 			       unsigned n0, unsigned nrows);
 
+/*
+ * The same int4 bytes as charsiu_pack_weights_rows, read straight out of
+ * codes already held two to a byte (npuquant's packed q: row major, low
+ * nibble first). Row nn of the slice is q + nn * qstride, its first code in
+ * the low nibble of that byte, so the slice must start on an even K. Then
+ * every pair the layout packs is one byte of q, and a 32 code block is 16
+ * bytes copied. -1 (and nothing written) where that does not hold: not
+ * int4, or odd K padding the caller should leave to the general packer.
+ */
+int charsiu_pack_weights_rows_q4(const struct charsiu_matmul *mm,
+				 const uint8_t *q, size_t qstride, uint8_t *dst,
+				 unsigned n0, unsigned nrows);
+
 void charsiu_pack_weights(const struct charsiu_matmul *mm,
 			  const uint8_t *src, uint8_t *dst);
 
@@ -179,7 +192,7 @@ void charsiu_pack_weights(const struct charsiu_matmul *mm,
  * registers are exact and dense -- 0x101c = ic*oc*2, 0x1020 = ic*2, both the
  * true byte count over all 8308 dispatches that write them -- but a grouping
  * does not change a total, so the byte ORDER inside a kernel is invisible from
- * outside. docs/vendor-dispatch.md has the whole read.
+ * outside. the vendor-dispatch notes (git history) has the whole read.
  *
  * So this takes the layout as an argument instead of picking one, and the
  * board decides. `src` is B[n][k] row major, float; `dst` holds
@@ -355,6 +368,59 @@ static inline uint16x4_t charsiu_f2h_x4(float32x4_t x)
 	return vmovn_u32(r);
 }
 
+/*
+ * EIGHT AT A TIME, AND THE HARDWARE CONVERT AFTER ALL -- on an input it can
+ * only get right.
+ *
+ * The paragraph above is why vcvt_f16_f32 cannot replace charsiu_f2h: it
+ * rounds, keeps subnormals and turns overflow into the largest finite half
+ * where charsiu_f2h truncates, flushes and saturates to infinity. All three
+ * differences live in places this can mask:
+ *
+ *   - CLEAR THE 13 MANTISSA BITS A HALF DOES NOT HAVE FIRST. In the half's
+ *     normal range the float is then exactly representable, so the convert
+ *     has nothing to round and returns charsiu_f2h's truncation in every
+ *     rounding mode.
+ *   - |x| < 2^-14 (0x38800000) is charsiu_f2h's `exp <= 0`: the sign alone.
+ *   - |x| >= 2^16 (0x47800000), infinities and NaNs included, is its
+ *     `exp >= 0x1f`: sign | 0x7c00. The two masks cannot both be set.
+ *
+ * On the board's A72 the integer form is the packer's compute bound, 1.34
+ * GB/s of halves out of a hot cache on one core; this is about half the
+ * vector operations. tests/pack2.c walks all 2^32 float bit patterns against
+ * charsiu_f2h_x4. aarch64 only: the half vector types are not in armv7's NEON.
+ */
+#if defined(__aarch64__)
+static inline uint16x8_t charsiu_f2h_x8(const float *p)
+{
+	const uint32x4_t tm = vdupq_n_u32(0xffffe000u);
+	const uint32x4_t am = vdupq_n_u32(0x7fffffffu);
+	uint32x4_t ua = vreinterpretq_u32_f32(vld1q_f32(p));
+	uint32x4_t ub = vreinterpretq_u32_f32(vld1q_f32(p + 4));
+	float16x8_t h = vcvt_high_f16_f32(
+		vcvt_f16_f32(vreinterpretq_f32_u32(vandq_u32(ua, tm))),
+		vreinterpretq_f32_u32(vandq_u32(ub, tm)));
+	uint32x4_t aa = vandq_u32(ua, am), ab = vandq_u32(ub, am);
+	uint16x8_t sm = vuzp1q_u16(
+		vreinterpretq_u16_u32(vcltq_u32(aa, vdupq_n_u32(0x38800000u))),
+		vreinterpretq_u16_u32(vcltq_u32(ab, vdupq_n_u32(0x38800000u))));
+	uint16x8_t bg = vuzp1q_u16(
+		vreinterpretq_u16_u32(vcgeq_u32(aa, vdupq_n_u32(0x47800000u))),
+		vreinterpretq_u16_u32(vcgeq_u32(ab, vdupq_n_u32(0x47800000u))));
+	uint16x8_t r = vreinterpretq_u16_f16(h);
+	uint16x8_t sg = vandq_u16(r, vdupq_n_u16(0x8000));
+
+	r = vbslq_u16(bg, vorrq_u16(sg, vdupq_n_u16(0x7c00)), r);
+	return vbslq_u16(sm, sg, r);
+}
+#else
+static inline uint16x8_t charsiu_f2h_x8(const float *p)
+{
+	return vcombine_u16(charsiu_f2h_x4(vld1q_f32(p)),
+			    charsiu_f2h_x4(vld1q_f32(p + 4)));
+}
+#endif
+
 static inline void charsiu_f2h_run(uint16_t *d, const float *x, size_t n)
 {
 	size_t e = 0;
@@ -449,6 +515,10 @@ void charsiu_pack_input_f16_edges(const struct charsiu_matmul *mm,
 void charsiu_pack_input_f16_groups(const struct charsiu_matmul *mm,
 				   const float *src, size_t src_stride,
 				   uint8_t *dst, unsigned g0, unsigned ng);
+/* the same bytes for rows [r0, r0 + nr) of every group, rows outermost */
+void charsiu_pack_input_f16_rows(const struct charsiu_matmul *mm,
+				 const float *src, size_t src_stride,
+				 uint8_t *dst, unsigned r0, unsigned nr);
 
 void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 				   const float *src, size_t src_stride,
@@ -608,6 +678,7 @@ void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo);
 int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo,
 		    int64_t timeout_ns);
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo);
+int charsiu_bo_poll(struct charsiu_device *dev, struct charsiu_bo *bo);
 
 /*
  * One task is one register stream. Tasks inside a job are chained on a single

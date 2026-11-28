@@ -4,7 +4,7 @@
  * The register command stream for a matmul, as a 1x1 convolution.
  *
  * Every value here is either read off the vendor's own dispatches in a .rkllm
- * (tools/rkllm_regcmd.py, docs/vendor-dispatch.md) or established on hardware in
+ * (tools/rkllm_regcmd.py, the vendor-dispatch notes (git history)) or established on hardware in
  * the driver work at github.com/gahingwoo/linux-rk3576-npu. Where the two agree
  * the comment says so, because agreement between a vendor LLM dispatch and a
  * rule derived from vendor CONVOLUTION compiles is the strongest evidence this
@@ -851,6 +851,75 @@ void charsiu_pack_input_f16_groups(const struct charsiu_matmul *mm,
 #endif
 }
 
+/*
+ * ROWS [r0, r0 + nr) OF THE BATCHED ACTIVATION, EVERY GROUP, FOUR ROWS AT A
+ * TIME. The same bytes charsiu_pack_input_f16_groups writes for those rows --
+ * the same converter on the same eight floats into the same sixteen bytes --
+ * in the other order.
+ *
+ * The group order reads eight floats out of each of m rows and then comes
+ * back for the next eight: m live source streams a K row apart, 4 KB at
+ * k = 1024 and 12 KB for a slice read out of a 3072 wide row, each on its own
+ * page, which no prefetcher follows and which at m = 124 are more pages than
+ * the L1 TLB holds. Here four rows are walked side by side from k = 0 to the
+ * end, so the source is four sequential streams and the destination a 64 byte
+ * run per group, m * 16 apart.
+ *
+ * THE BOARD, not the desk, chose it. The desk's host runs both orders at 20+
+ * GB/s and cannot tell them apart; the CM5's A72s, one core, Qwen3-0.6B's
+ * slices at m = 124 straight out of X (tools/pack2_bench and its variants),
+ * ms for a prompt's worth:
+ *
+ *   order                        integer convert   charsiu_f2h_x8
+ *   groups (the old order)            313              270
+ *   two groups a pass                 187              154
+ *   rows, 4 at a time                 137              108
+ *   rows, 8 / 16 at a time         193 / 196        138 / 149
+ *   tiles of 8 or 16 groups        130 / 126        100 /  97
+ *
+ * The tiles tie the rows at four threads (75 against 75 ms) and are more
+ * code, so the rows are what is here. dc zva on each 64 byte run before the
+ * stores, to skip the line fill, was a loss on the board (89 against 81 ms)
+ * and is not carried.
+ *
+ * A row owns its 16 bytes in every group and nothing else, so a row split is
+ * as disjoint as the group split. The caller owns the edges, as for groups.
+ */
+void charsiu_pack_input_f16_rows(const struct charsiu_matmul *mm,
+				 const float *src, size_t src_stride,
+				 uint8_t *dst, unsigned r0, unsigned nr)
+{
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	unsigned ng = mm->k / 8, g, r = r0;
+	size_t step = (size_t)mm->m * 16;
+
+	for (; r + 4 <= r0 + nr; r += 4) {
+		const float *s0 = src + (size_t)r * src_stride;
+		const float *s1 = s0 + src_stride;
+		const float *s2 = s1 + src_stride;
+		const float *s3 = s2 + src_stride;
+		uint8_t *d = dst + (size_t)r * 16;
+
+		for (g = 0; g < ng; g++, d += step,
+		     s0 += 8, s1 += 8, s2 += 8, s3 += 8) {
+			vst1q_u16((uint16_t *)d, charsiu_f2h_x8(s0));
+			vst1q_u16((uint16_t *)(d + 16), charsiu_f2h_x8(s1));
+			vst1q_u16((uint16_t *)(d + 32), charsiu_f2h_x8(s2));
+			vst1q_u16((uint16_t *)(d + 48), charsiu_f2h_x8(s3));
+		}
+	}
+	for (; r < r0 + nr; r++) {
+		const float *s = src + (size_t)r * src_stride;
+		uint8_t *d = dst + (size_t)r * 16;
+
+		for (g = 0; g < ng; g++, d += step, s += 8)
+			vst1q_u16((uint16_t *)d, charsiu_f2h_x8(s));
+	}
+#else
+	(void)mm; (void)src; (void)src_stride; (void)dst; (void)r0; (void)nr;
+#endif
+}
+
 void charsiu_pack_input_f16_stride(const struct charsiu_matmul *mm,
 				   const float *src, size_t src_stride,
 				   uint8_t *dst, size_t dst_size)
@@ -1085,6 +1154,52 @@ void charsiu_pack_weights_rows(const struct charsiu_matmul *mm,
 		for (k = 0; k < mm->k; k++)
 			dst[w_group_index(mm, n, k)] =
 				(uint8_t)(src[(size_t)n * mm->k + k] - 0x80);
+}
+
+/*
+ * THE int4 PACK WITHOUT THE ROUND TRIP. Staging used to unpack each packed
+ * code to a byte (npudev's pack_rows) and then pack the bytes two to a byte
+ * again here, in the same low-nibble-first order. For a slice that starts on
+ * an even K the two cancel: the byte the loop above builds from codes kk + c
+ * and kk + c + 1 is byte (kk + c) / 2 of the packed row. So each 32 code
+ * block is a 16 byte copy, and only an odd last code is a nibble. Same
+ * layout, same guard, same bytes (tests/pack_q4.c holds it to the loop
+ * above at every edge it can reach); on a cached start it was most of what
+ * the board's "adding" time was.
+ */
+int charsiu_pack_weights_rows_q4(const struct charsiu_matmul *mm,
+				 const uint8_t *q, size_t qstride, uint8_t *dst,
+				 unsigned n0, unsigned nrows)
+{
+	unsigned ke = charsiu_k_eff(mm);
+	size_t cap;
+	unsigned kb, kmax, nn, kk;
+
+	if (mm->wdtype != CHARSIU_INT4)
+		return -1;
+	cap = charsiu_weight_bytes(mm);
+	kb = ALIGN_UP(ke, 32);
+	kmax = mm->k < ke ? mm->k : ke;
+	for (nn = n0; nn < n0 + nrows; nn++) {
+		size_t nbase = (size_t)(nn / 16) * 512 * (kb / 32)
+			     + (size_t)(nn % 16) * 32;
+		const uint8_t *row = q + (size_t)nn * qstride;
+
+		for (kk = 0; kk < kmax; kk += 32) {
+			size_t i = nbase + (size_t)(kk / 32) * 512;
+			unsigned run = kmax - kk < 32 ? kmax - kk : 32;
+			uint8_t *d;
+
+			if ((i + run - 1) >> 1 >= cap)
+				break;
+			d = dst + (i >> 1);
+			memcpy(d, row + kk / 2, run / 2);
+			if (run & 1)
+				d[run / 2] = (uint8_t)((d[run / 2] & 0xf0) |
+						       (row[(kk + run - 1) / 2] & 0xf));
+		}
+	}
+	return 0;
 }
 
 /*

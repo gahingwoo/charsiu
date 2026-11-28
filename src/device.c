@@ -373,6 +373,23 @@ void charsiu_spin_report(void)
 		charsiu_spin_lost ? (double)charsiu_spin_lost_us / charsiu_spin_lost : 0.0);
 }
 
+/*
+ * ONE POLL AND NOTHING ELSE: 0 when every fence on the buffer has signalled
+ * (and the CPU now owns it, as after charsiu_bo_prep), -EBUSY while one has
+ * not. For the decode call profiler, which needs to see WHEN each core's job
+ * finished rather than when the waiter got round to asking.
+ */
+int charsiu_bo_poll(struct charsiu_device *dev, struct charsiu_bo *bo)
+{
+	struct drm_rocket_prep_bo req = { 0 };
+
+	req.handle = bo->handle;
+	req.timeout_ns = 1;	/* long past: a poll */
+	if (!ioctl(dev->fd, DRM_IOCTL_ROCKET_PREP_BO, &req))
+		return 0;
+	return -errno;
+}
+
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)
 {
 	struct drm_rocket_fini_bo req = { 0 };
@@ -416,11 +433,27 @@ int charsiu_submit_jobs(struct charsiu_device *dev,
 	if (!total)
 		return -EINVAL;
 
-	kj = calloc(job_count, sizeof(*kj));
-	kt = calloc(total, sizeof(*kt));
-	if (!kj || !kt) {
-		free(kj); free(kt);
-		return -ENOMEM;
+	/*
+	 * ON THE STACK WHEN IT FITS. Decode submits one job of one to ten
+	 * tasks twice a call, 226 times a token, and two callocs and two frees
+	 * each were the only allocations left on that path.
+	 */
+	struct drm_rocket_job kj_s[2];
+	struct drm_rocket_task kt_s[32];
+	int heap = job_count > 2 || total > 32;
+
+	if (heap) {
+		kj = calloc(job_count, sizeof(*kj));
+		kt = calloc(total, sizeof(*kt));
+		if (!kj || !kt) {
+			free(kj); free(kt);
+			return -ENOMEM;
+		}
+	} else {
+		memset(kj_s, 0, sizeof(kj_s));
+		memset(kt_s, 0, sizeof(kt_s));
+		kj = kj_s;
+		kt = kt_s;
 	}
 
 	for (i = 0; i < job_count; i++) {
@@ -451,8 +484,10 @@ int charsiu_submit_jobs(struct charsiu_device *dev,
 	submit.job_struct_size = sizeof(*kj);
 	if (ioctl(dev->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit))
 		ret = -errno;
-	free(kj);
-	free(kt);
+	if (heap) {
+		free(kj);
+		free(kt);
+	}
 	return ret;
 }
 

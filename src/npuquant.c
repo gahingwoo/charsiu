@@ -19,13 +19,28 @@
  * the per channel weight sum the coefficient buffer needs.
  */
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L        /* fileno, mmap, posix_madvise */
+#endif
 #include <math.h>
+#include <time.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "charsiu_llm.h"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 
 #if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
 #include <arm_neon.h>
@@ -291,6 +306,8 @@ static struct {
 	char path[512];
 	char stamp[64];
 	int overridden;
+	const uint8_t *map;     /* the reading file, mapped (wc_map_file) */
+	uint64_t map_size;
 } wc;
 
 /*
@@ -322,6 +339,268 @@ static int wc_said_missing;
 #define wc_tell(f) ((int64_t)ftell(f))
 #define wc_end(f) fseek((f), 0, SEEK_END)
 #endif
+
+/*
+ * A CACHED START READS THE CACHE THROUGH A MAPPING ON WINDOWS.
+ *
+ * fread put every record into a fresh malloc: 620 MB of private memory for
+ * Llama-3.2-1B, demand-zero faulted a page at a time, beside the same 620 MB
+ * in the file cache, and the decode then never reads it again (the buffer
+ * objects hold what the NPU uses; q is the CPU fallback's). On a 4 GB board
+ * that second copy is what pushed the cache file out of memory before the
+ * next run, so every "cached" start read it from the eMMC again: 12 to 15 s
+ * of the TaishanPi's staging on 2026-11-26, against 0.1 s on a desk.
+ *
+ * Mapped, q IS the file's pages. Nothing is copied, nothing is private, a
+ * page the memory manager wants back is dropped rather than written to the
+ * page file, and the pages that survive the run are still in memory for the
+ * next one. The scales and wsum are small and are still copied, so only q
+ * ever points into the view, read only, which the cache path never writes.
+ * A view is kept for the life of the process (a tensor may outlive the
+ * staging that made it) and reused by a second staging of the same file.
+ *
+ * Windows only by default. Windows refuses to truncate a file with a view
+ * open, so another process rewriting the cache fails to open it and stays
+ * uncached; on Linux the same rewrite would truncate under this process and
+ * the next touch of q would be SIGBUS. CHARSIU_WCACHE_MAP=1 asks for it on
+ * Linux anyway (the host tests use it), =0 is the fread control on Windows.
+ */
+static struct {
+	char path[512];
+	const uint8_t *base;
+	uint64_t size;
+} wc_map;
+
+static int wc_map_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+#ifdef _WIN32
+		v = charsiu_env_flag("CHARSIU_WCACHE_MAP", 1);
+#else
+		v = charsiu_env_flag("CHARSIU_WCACHE_MAP", 0);
+#endif
+	}
+	return v;
+}
+
+#ifdef _WIN32
+/* PrefetchVirtualMemory, Windows 8 and later; looked up, so an older
+ * kernel32 just goes without */
+static void wc_prefetch(const void *p, uint64_t n)
+{
+	typedef struct { PVOID va; SIZE_T n; } wc_range;
+	typedef BOOL (WINAPI *pvm_fn)(HANDLE, ULONG_PTR, wc_range *, ULONG);
+	static pvm_fn pvm;
+	static int looked;
+	wc_range r = { (PVOID)(uintptr_t)p, (SIZE_T)n };
+
+	if (!looked) {
+		pvm = (pvm_fn)(void (*)(void))GetProcAddress(
+			GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+		looked = 1;
+	}
+	if (pvm && n)
+		(void)pvm(GetCurrentProcess(), 1, &r, 0);
+}
+#endif
+
+#ifdef _WIN32
+static double wc_now_ms(void)
+{
+	LARGE_INTEGER c, f;
+
+	QueryPerformanceCounter(&c);
+	QueryPerformanceFrequency(&f);
+	return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+/*
+ * A RECORD IS READ IN THE WAY fread READ IT, THEN USED THROUGH THE MAP.
+ *
+ * Hints did not read fast enough. PrefetchVirtualMemory over the whole
+ * file ran at about 47 MB/s on the TaishanPi's eMMC after a reboot (13.3 s
+ * for 620 MB), where the old build's fread of each record, a large
+ * sequential cached read, finished a whole cold staging in 15.3 s; the
+ * first start was 2.8 s slower than the build it replaced (2026-11-28).
+ * And a hint for the whole file had to be waited for before any buffer was
+ * allocated, or it starved CREATE_BO of free pages (16.4 s of it, the run
+ * before).
+ *
+ * So each record, just before it is handed out, is read with ReadFile on
+ * a handle of its own (FILE_FLAG_SEQUENTIAL_SCAN) into a 4 MB scratch
+ * that is thrown away. A cached read fills the same pages the view maps,
+ * so the packer then takes soft faults only, and the disk sees what it saw
+ * from fread: one record at a time, front to back, in large reads, with
+ * nothing else allocating meanwhile. A record already in memory costs two
+ * 1 MB probe reads (its first and last MB, timed) and nothing more, which
+ * is what keeps a warm start where it was.
+ */
+#define WC_CHUNK   ((DWORD)4 << 20)
+#define WC_PROBE   ((DWORD)1 << 20)
+#define WC_WARM_MS 3.0          /* a 1 MB read faster than this was memory */
+
+static HANDLE wc_seq = INVALID_HANDLE_VALUE;
+static uint8_t *wc_scratch;
+static struct {
+	unsigned served, resident;
+	double bytes, ms;
+	int said;
+} wc_in;
+
+static double wc_pread(uint64_t off, DWORD n)
+{
+	OVERLAPPED o;
+	DWORD got = 0;
+	double t0 = wc_now_ms();
+
+	memset(&o, 0, sizeof(o));
+	o.Offset = (DWORD)off;
+	o.OffsetHigh = (DWORD)(off >> 32);
+	if (!ReadFile(wc_seq, wc_scratch, n, &got, &o))
+		return -1.0;
+	return wc_now_ms() - t0;
+}
+
+static void wc_warm(const uint8_t *p, uint64_t n)
+{
+	uint64_t off, end, at;
+	double t0, a, b;
+	DWORD first;
+
+	if (!p || !n || !wc_map.base)
+		return;
+	if (wc_seq == INVALID_HANDLE_VALUE || !wc_scratch) {
+		wc_prefetch(p, n);
+		return;
+	}
+	off = (uint64_t)(p - wc_map.base);
+	end = off + n;
+	first = n < WC_PROBE ? (DWORD)n : WC_PROBE;
+	t0 = wc_now_ms();
+	a = wc_pread(off, first);
+	b = n > 2ull * WC_PROBE ? wc_pread(end - WC_PROBE, WC_PROBE) : 0.0;
+	if (a >= 0.0 && b >= 0.0 && a < WC_WARM_MS && b < WC_WARM_MS) {
+		wc_in.resident++;
+		return;
+	}
+	for (at = off + first; at < end; at += WC_CHUNK) {
+		DWORD c = end - at < WC_CHUNK ? (DWORD)(end - at) : WC_CHUNK;
+
+		if (wc_pread(at, c) < 0.0)
+			break;
+	}
+	wc_in.bytes += (double)n;
+	wc_in.ms += wc_now_ms() - t0;
+}
+
+static void wc_open_seq(const char *path)
+{
+	wchar_t w[1024];
+
+	if (wc_seq != INVALID_HANDLE_VALUE) {
+		CloseHandle(wc_seq);
+		wc_seq = INVALID_HANDLE_VALUE;
+	}
+	if (!wc_scratch)
+		wc_scratch = VirtualAlloc(NULL, WC_CHUNK, MEM_COMMIT | MEM_RESERVE,
+					  PAGE_READWRITE);
+	if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, (int)(sizeof(w) / sizeof(w[0]))))
+		return;
+	wc_seq = CreateFileW(w, GENERIC_READ,
+			     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			     NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+}
+#endif
+
+/*
+ * ONE RECORD AT A TIME, IN AND THEN OUT. Before a record's q is handed out
+ * it is read in (wc_warm), and the record handed out before it, which the
+ * packer has finished with, is taken out of the working set. VirtualUnlock
+ * on pages that were never locked does exactly that: they go to the
+ * standby list, still cached for a CPU fallback and for the next run, but
+ * no longer the working set the memory manager has to trim when the board
+ * is short.
+ */
+static const void *wc_prev;
+static uint64_t wc_prev_n;
+
+static void wc_record_in(const void *p, uint64_t n)
+{
+#ifdef _WIN32
+	if (wc_prev)
+		(void)VirtualUnlock((LPVOID)(uintptr_t)wc_prev, (SIZE_T)wc_prev_n);
+	if (p) {
+		wc_warm(p, n);
+		if (++wc_in.served == wc_nix && !wc_in.said++)
+			fprintf(stderr, "charsiu: weight cache read in: %.0f MB from "
+				"disk in %.0f ms (%.0f MB/s), %u of %u records "
+				"already in memory\n", wc_in.bytes / 1e6, wc_in.ms,
+				wc_in.ms > 0 ? wc_in.bytes / 1e3 / wc_in.ms : 0.0,
+				wc_in.resident, wc_in.served);
+	}
+#endif
+	wc_prev = p;
+	wc_prev_n = n;
+}
+
+/* the open cache file, mapped whole; NULL (and fread, as before) if not */
+static const uint8_t *wc_map_file(FILE *f, const char *path, uint64_t *size)
+{
+	const uint8_t *base = NULL;
+	uint64_t sz = 0;
+
+	if (!wc_map_on())
+		return NULL;
+#ifdef _WIN32
+	{
+		HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+		LARGE_INTEGER li;
+		HANDLE m;
+
+		if (h == INVALID_HANDLE_VALUE || !GetFileSizeEx(h, &li) || li.QuadPart <= 0)
+			return NULL;
+		sz = (uint64_t)li.QuadPart;
+		if (wc_map.base && wc_map.size == sz && !strcmp(wc_map.path, path)) {
+			*size = sz;
+			return wc_map.base;
+		}
+		m = CreateFileMappingW(h, NULL, PAGE_READONLY, 0, 0, NULL);
+		if (!m)
+			return NULL;
+		base = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+		CloseHandle(m);         /* the view holds the section */
+		if (!base)
+			return NULL;
+		wc_open_seq(path);
+	}
+#else
+	{
+		struct stat st;
+		void *p;
+
+		if (fstat(fileno(f), &st) || st.st_size <= 0)
+			return NULL;
+		sz = (uint64_t)st.st_size;
+		if (wc_map.base && wc_map.size == sz && !strcmp(wc_map.path, path)) {
+			*size = sz;
+			return wc_map.base;
+		}
+		p = mmap(NULL, (size_t)sz, PROT_READ, MAP_SHARED, fileno(f), 0);
+		if (p == MAP_FAILED)
+			return NULL;
+		(void)posix_madvise(p, (size_t)sz, POSIX_MADV_WILLNEED);
+		base = p;
+	}
+#endif
+	/* an older view of another file stays mapped: its tensors may live */
+	snprintf(wc_map.path, sizeof(wc_map.path), "%s", path);
+	wc_map.base = base;
+	wc_map.size = sz;
+	*size = sz;
+	return base;
+}
 
 /* the payload of one record: q as it is held, then the scales, then wsum */
 static uint64_t wc_payload(uint64_t n, uint64_t k, uint64_t ngrp, int packed)
@@ -387,8 +666,12 @@ void charsiu_wcache_use(const char *path, const char *stamp)
 		fclose(wc.f);
 		wc.f = NULL;
 	}
+	wc_record_in(NULL, 0);  /* the last record out of the working set */
+	wc_prev = NULL;
 	wc.writing = 0;
 	wc.checked = 0;
+	wc.map = NULL;
+	wc.map_size = 0;
 	free(wc_ix);
 	wc_ix = NULL;
 	wc_nix = wc_next = 0;
@@ -462,9 +745,18 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 		int got = fread(&h, sizeof(h), 1, wc.f) == 1;
 
 		if (got && !memcmp(&h, &want, sizeof(h))) {
+			struct timespec a, b, c;
+
+			clock_gettime(CLOCK_MONOTONIC, &a);
 			wc_index(npu_q_packed());
+			clock_gettime(CLOCK_MONOTONIC, &b);
+			wc.map = wc_map_file(wc.f, path, &wc.map_size);
+			clock_gettime(CLOCK_MONOTONIC, &c);
 			fprintf(stderr, "charsiu: weight cache %s, reading "
-				"(%u tensors in it)\n", path, wc_nix);
+				"(%u tensors in it%s; index %.0f ms, map %.0f ms)\n",
+				path, wc_nix, wc.map ? ", mapped" : "",
+				(b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6,
+				(c.tv_sec - b.tv_sec) * 1e3 + (c.tv_nsec - b.tv_nsec) / 1e6);
 			return;
 		}
 		fclose(wc.f);
@@ -552,6 +844,19 @@ static int wcache_read(struct npu_tensor *t, const char *name)
 		return 0;
 	}
 	qb = wcache_qbytes(t);
+	if (wc.map && (uint64_t)r->off + wc_payload(r->n, r->k, r->ngrp, t->packed)
+			<= wc.map_size) {
+		const uint8_t *p = wc.map + r->off;
+
+		wc_record_in(p, wc_payload(r->n, r->k, r->ngrp, t->packed));
+		free(t->q);
+		t->q = (int8_t *)(uintptr_t)p;
+		t->q_mapped = 1;
+		memcpy(t->scale, p + qb, (size_t)(t->n * ngrp) * sizeof(float));
+		memcpy(t->wsum, p + qb + (size_t)(t->n * ngrp) * sizeof(float),
+		       (size_t)t->n * sizeof(int32_t));
+		return 1;
+	}
 	if (wc_seek(wc.f, r->off) ||
 	    fread(t->q, 1, qb, wc.f) != qb ||
 	    fread(t->scale, sizeof(float), (size_t)(t->n * ngrp), wc.f)
@@ -1103,7 +1408,7 @@ int npu_tensor_build(struct npu_tensor *t, const struct gguf_tensor *w)
 	 * than either side and reproduces on a second, independent passage.
 	 * So the curve has more than one local extremum, a coarse grid cannot
 	 * be interpolated, and the good region is what is established rather
-	 * than a point inside it. docs/lab-notebook.md has the tables.
+	 * than a point inside it. the lab notebook (git history) has the tables.
 	 */
 	double alpha = getenv("CHARSIU_NPU_AWQ")
 		? atof(getenv("CHARSIU_NPU_AWQ")) : 0.0;
@@ -1645,7 +1950,8 @@ void npu_tensor_free(struct npu_tensor *t)
 {
 	if (!t)
 		return;
-	free(t->q);
+	if (!t->q_mapped)       /* a view of the weight cache (wc_map_file) */
+		free(t->q);
 	free(t->scale);
 	free(t->kscale);
 	free(t->astat);

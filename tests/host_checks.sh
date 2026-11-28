@@ -29,8 +29,10 @@ fail=0
 
 # name:reason. These need something a bare checkout does not have.
 EXCEPT="arch_sanity.sh:needs a directory of models and built binaries
+fake_charsiu_run.sh:a stand-in binary that board_arms.sh runs, not a test
 host_awq.sh:takes a model file as argv[1]
 neon_control.sh:takes a binary and a board directory
+pad_identity.sh:takes a binary, a model and a text
 prefill_control.sh:needs a board directory of models
 spec_identity.sh:takes a binary and a board directory
 vattn_sweep.sh:a timing sweep, not a pass or fail

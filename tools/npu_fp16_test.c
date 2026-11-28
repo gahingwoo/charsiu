@@ -5,7 +5,7 @@
  * model file cannot say: what order the bytes of a 16 bit weight buffer go in.
  *
  * Everything else is already read off the file and written down in
- * docs/vendor-dispatch.md -- the register set is the same as int4's, five
+ * the vendor-dispatch notes (git history) -- the register set is the same as int4's, five
  * values differ, and the buffer is ic*oc*2 bytes with ic*2 per output channel.
  * A tiling does not change a total, so the byte ORDER is invisible from
  * outside and this asks the silicon.

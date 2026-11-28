@@ -34,6 +34,7 @@
 #include <math.h>
 
 #include "reusekey.h"
+#include "argmaxrow.h"
 #include "kslice.h"
 #include "overlap.h"
 #include "charsiu.h"
@@ -129,6 +130,9 @@ struct npu_slot {
 struct npu_entry {
 	const struct npu_tensor *t;
 	struct charsiu_bo out[2];  /* ITS OWN, one per device */
+	/* CHARSIU_NPU_EARLY_DONE: bit d set while every word of this entry's
+	 * output slots on device d holds the sentinel in DRAM */
+	unsigned armed;
 	/*
 	 * THE STRIDE BETWEEN THIS ENTRY'S OUTPUT SLOTS, which used to be
 	 * g->out_stride for every tensor in the model. See out_fit_stride.
@@ -198,6 +202,25 @@ struct npu_entry {
 	 */
 	unsigned n_npu;            /* rows [0, n_npu) go to the hardware */
 	uint8_t *cq;               /* rows [n_npu, n), nibble packed */
+	/*
+	 * THE BATCHED GATHER HAS TO WAIT FOR THE LAST DEVICE, set at staging.
+	 *
+	 * batch_read_device is called a device at a time, device 0 first, and
+	 * sums each device's slots in index order. That is ascending K for one
+	 * n range only if the range's slices are dealt to non-decreasing
+	 * devices. Where they are not -- K = 3072 dealt k0@d0 k1@d1 k2@d0 --
+	 * the batched sum is (p0 + p2) + p1 where the m = 1 path computes
+	 * (p0 + p1) + p2. Measured on the CM5, 2026-11-25, tools/npu_rowpure:
+	 * blk.13.ffn_down of Qwen3-0.6B was the ONE tensor where batched !=
+	 * m = 1, by up to 9.5e-07, and re-summing the hardware's own partials
+	 * in m = 1 order gave m = 1 exactly; under CHARSIU_NPU_ONEDEV=1 every
+	 * tensor was bit equal. That difference is what moved the text under
+	 * speculative decoding. gmix = 1 makes the read of every device but
+	 * gdev_last a no-op and has gdev_last's call gather ALL the slots in
+	 * index order, each from its own device's buffer.
+	 */
+	int gmix;
+	unsigned gdev_last;
 	/*
 	 * WHAT EACH DEVICE WAS GIVEN, WORKED OUT ONCE WHERE IT IS DECIDED.
 	 *
@@ -288,6 +311,30 @@ struct npu_outbuf {
 	 * read owns it until npu_flush_pending runs, and batch_outbuf must not
 	 * hand it to another tensor before then */
 	unsigned pending;
+	/* sized for m <= CHARSIU_NPU_SMALL_M and handed only to such calls;
+	 * see small_m() */
+	unsigned small;
+	/* the row block width of a tiled call (npu_mtile_run), 0 for every
+	 * other call: a block's buffer is sized for the block, so its whole
+	 * object prep and fini are not charged on the call's full m */
+	unsigned tile;
+};
+
+/*
+ * THE PARKED HALF OF THE BATCHED INPUT STATE, one field for every field of
+ * struct charsiu_npu that is sized by the largest m the batched path has seen.
+ * bank_select swaps the two sets whole; nothing reads this struct directly.
+ */
+struct npu_inbank {
+	struct charsiu_bo *bin[2];
+	unsigned bin_nks;
+	struct charsiu_bo breg[2];
+	unsigned bm, bnks, bnslots;
+	size_t bd1_n, bin_stride;
+	struct reuse_key bin_key[2];
+	float *bscr;
+	uint8_t *bq;
+	float *bd1;
 };
 
 struct charsiu_npu {
@@ -356,6 +403,40 @@ struct charsiu_npu {
 	 * entirely, which is 10.1 ms of a 153 ms token on the CPU side.
 	 */
 	int w4;
+	/*
+	 * THE EIGHT BIT LAYERS OF A MIXED MODEL, ON A DEVICE OF THEIR OWN.
+	 *
+	 * CHARSIU_NPU_INT8_LAYERS keeps some blocks at eight bits on a model
+	 * whose device is opened for four, and charsiu_npu_add refuses those
+	 * tensors (see the note there: lifting the refusal on ONE device was
+	 * tried on hardware and computed garbage). Refused, they ran on the
+	 * CPU, one prompt row at a time: Llama-3.2-1B's two eight bit layers
+	 * took its 124 token prompt from 926 ms to 2963 and its decode from
+	 * 18.5 tok/s to 13.2, where their bytes are worth about 12%.
+	 *
+	 * So a four bit device opens a second one, `alt`, at eight bits, and
+	 * stages there exactly the tensors it would have refused. An id from
+	 * alt is handed out as NPU_ALT_ID + its own id, and every public entry
+	 * that takes an id sends it to the device it belongs to.
+	 *
+	 * `exact8` IS WHAT MAKES THAT A SPEED CHANGE AND NOT A TEXT CHANGE.
+	 * alt does the CPU fallback's arithmetic, not the int8 device's usual
+	 * one: each row quantised ONCE over its whole K the way charsiu_act_q1
+	 * does it (the batched pack normally takes a range per K slice), the K
+	 * slices' raw int32 accumulators summed as integers, and the
+	 * dequantise in double in npu_matvec's order, acc * scale * d1. Every
+	 * step of that is exact or is the same rounding in the same order, so
+	 * the answer is the answer the CPU gave, bit for bit -- and anything
+	 * alt refuses still falls back to that same CPU code.
+	 *
+	 * CHARSIU_NPU_INT8_ALT=0 does not open it, which is the control: the
+	 * refusal and the CPU path exactly as before, in the same binary.
+	 */
+	struct charsiu_npu *alt;
+	int exact8;
+	unsigned in_ks;            /* K slices g->in has room for */
+	float *bd1x;               /* exact8: each row's whole-K d1 */
+	unsigned bd1x_n;
 	/*
 	 * CHARSIU_NPU_W4_MIDRISE: the vendor's grid, w = (s + 0.5) * d, with no
 	 * code for zero. The hardware still computes sum(s * a), so the half
@@ -501,6 +582,21 @@ struct charsiu_npu {
 	 * described neither.
 	 */
 	struct reuse_key bin_key[2];   /* the rule is in reusekey.h */
+	/* the other input bank and which one is live: see bank_select */
+	struct npu_inbank bank_other;
+	/* the two input banks a row tiled call alternates between, swapped
+	 * in and out around each block; see npu_mtile_run */
+	struct npu_inbank bank_tile[2];
+	unsigned long btile_calls, btile_blocks;
+	/* the read order tables for two more widths than the live one: a tiled
+	 * call reads at its block width, the head and anything untiled at m */
+	struct bmap_park {
+		uint32_t *bmap;
+		unsigned m, n4, w4;
+		int b4, b2;
+	} bmap_park[2];
+	unsigned bank_small;
+	unsigned long bank_swaps;
 	int reuse_ask;
 	unsigned long reuse_hits, reuse_misses;
 	/*
@@ -640,7 +736,15 @@ struct charsiu_npu {
 	int packpool;
 	unsigned packpool_min;
 	unsigned long bpack_pooled, bpack_serial;
+	/* CHARSIU_NPU_PACK2: the K slices each device was packed with in THIS
+	 * call (bit ki), so the second device copies the first one's bytes
+	 * instead of packing X again; and how many slices went each way */
+	uint32_t bpk_mask[2];
+	unsigned long bpack_copied, bpack_direct;
 	int readfuse;
+	/* CHARSIU_NPU_GATHER_OLD=1: the batched gather in device order again,
+	 * the timing control for the K order one. See npu_entry.gmix. */
+	int gather_old;
 	unsigned long bfused_groups, bfused_slices;
 	/*
 	 * PACK HAD NO PARTS. Phase 9 on the board, 2026-09-04, Qwen3 at chunk
@@ -680,8 +784,18 @@ struct charsiu_npu {
 	 */
 	double bscale_us;       /* the per channel scale an ungrouped tensor
 				 * takes at the end, over the whole of Y */
-	unsigned char *bseen;	/* which n slices of Y have been written */
+	/* charsiu_npu_matmul_argmax: this call's own tail scale is left to
+	 * the fused argmax pass, which charges bscale_us instead */
+	int tail_skip;
+	/*
+	 * HOW MANY K slices of each n range of Y have been read back, not
+	 * just whether one has: 0 is still "the first write assigns", and the
+	 * count reaching the tensor's K slices is the LAST write, which is the
+	 * one that can carry the tail scale (btailf; see tail_fuse_for).
+	 */
+	unsigned char *bseen;
 	unsigned bseen_n;
+	int btailf;		/* this call's tail scale rides on its last read */
 	/*
 	 * THE ONE TENSOR WHOSE ANSWER IS STILL IN A DEVICE BUFFER.
 	 *
@@ -713,6 +827,7 @@ struct charsiu_npu {
 		unsigned m, dmask;
 		unsigned char *bseen;
 		unsigned bseen_n;
+		int btailf;	/* the deferred tensor's own, as bseen is */
 		/* how many entries of it are this tensor's own: g->bseen_n is
 		 * a high water mark and can GROW between the defer and the
 		 * flush, and copying that many would read past the snapshot */
@@ -751,8 +866,13 @@ struct charsiu_npu {
 	} pend;
 	unsigned long defer_bad, defer_cmp;
 	unsigned long bdefer_n, bdefer_done;
+	/* charsiu_npu_matmul_group: calls taken, their members, calls that
+	 * returned -1 and left the members to the per-tensor path */
+	unsigned long bgroup_n, bgroup_members, bgroup_fell;
 	double balloc_us;	/* the output BO allocation, inside prep */
 	unsigned balloc_n;
+	double bprewarm_us;	/* the same, done at staging by charsiu_npu_prewarm */
+	unsigned bprewarm_n;
 	float *bd1;                /* each row's own quantisation scale */
 	unsigned long submits;
 	double weight_mb;          /* summed over submits, for the report */
@@ -836,7 +956,7 @@ struct charsiu_npu {
 	 * busy_us covers a window the two submits SHARED while g->submits
 	 * counted two of them. Every "us a submit" this project has printed is
 	 * therefore a call's wall clock divided by the core count, and the fit
-	 * recorded in PLAN.md as `us a submit = 102.7 * MB + 112` is describing
+	 * recorded in the old PLAN.md as `us a submit = 102.7 * MB + 112` is describing
 	 * a call whose fixed cost is 224 us, not 112.
 	 *
 	 * ITS PRODUCT IS RIGHT, WHICH IS WORSE THAN BEING WRONG OUTRIGHT:
@@ -920,7 +1040,7 @@ struct charsiu_npu {
 	 * fit its own line, on its own shapes, for nine adds a call.
 	 *
 	 * AND THE OBVIOUS FIX IS STILL NOT FREE, FOR A SECOND REASON NOW.
-	 * PLAN.md already records that raising KMAX to cut the task count
+	 * the old PLAN.md already records that raising KMAX to cut the task count
 	 * coarsens int4, because the K slice must BE the quantisation group.
 	 * The geometry said it also COSTS A CORE: slices were dealt as
 	 * `di = (ki * ns + ni) & 1`, which restarts at 0 for every tensor, so a
@@ -1147,6 +1267,8 @@ struct charsiu_npu {
 	double slow_worst;
 	unsigned slow_worst_k, slow_worst_n;
 	int strikes, dead, nochain, slowed, nofini, inprep, plain;
+	unsigned long kparts_calls;   /* charsiu_npu_part_end, for the report */
+	unsigned long in_user_cleans; /* CHARSIU_NPU_USER_CLEAN */
 	int poolread_set, packpool_set;
 	int gfit;         /* CHARSIU_NPU_W4_GROUP_FIT, see eff_kmax() */
 	int kfit;
@@ -1403,6 +1525,52 @@ static void scaled_add(float *acc, const float *fo, const float *sc, unsigned n)
 #endif
 
 /*
+ * ---- ONE PASS FOR AN UNGROUPED int4 TENSOR OF ONE K SLICE ----
+ *
+ * CHARSIU_NPU_FAST_CONVERT (default on, =0 the control). q, k, v, gate, up
+ * and the head of a K = 1024 model are ungrouped (one scale a row, kgroup ==
+ * K) and one K slice each, and their gather was three passes: zero accf, add
+ * the slice into it, then y = (float)(((double)accf + 0.0) * scale). On the
+ * CM5 that was 38 us of gate+up's 50 us tail.
+ *
+ * It is one multiply. accf = 0.0f + fo is fo with -0 made +0; adding a double
+ * +0.0 to that changes nothing; and the double product of two floats is EXACT
+ * (24 + 24 significand bits < 53), so rounding it to float once is precisely
+ * the correctly rounded float product -- including overflow to inf and a
+ * subnormal result, since there is only the one rounding. So y = (0.0f + fo)
+ * * scale in float, vectorised, gives the same bits, and the zero add stays
+ * (behind a barrier the compiler cannot fold away).
+ */
+static int fast_convert_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_FAST_CONVERT", 1);
+	return v;
+}
+
+static void convert_one(float *y, const float *fo, const float *sc, unsigned n)
+{
+	unsigned j = 0;
+#if defined(__ARM_NEON) && !defined(CHARSIU_NO_NEON)
+	float32x4_t z = vdupq_n_f32(0.0f);
+
+	__asm__("" : "+w"(z));
+	for (; j + 4 <= n; j += 4) {
+		float32x4_t a = vaddq_f32(z, vld1q_f32(fo + j));
+
+		vst1q_f32(y + j, vmulq_f32(a, vld1q_f32(sc + j)));
+	}
+#endif
+	for (; j < n; j++) {
+		volatile float a = 0.0f + fo[j];
+
+		y[j] = (float)((double)a * (double)sc[j]);
+	}
+}
+
+/*
  * THE CPU'S SHARE OF A PROJECTION, run in the window the calling thread
  * currently spends BLOCKED in prep_bo.
  *
@@ -1575,6 +1743,16 @@ static int tensor_grouped(const struct charsiu_npu *g, const struct npu_tensor *
 	       (t->k % t->kgroup) == 0 && t->kgroup <= (uint64_t)g->kmax;
 }
 
+/* see convert_one */
+static int convert_one_for(const struct charsiu_npu *g,
+			   const struct npu_entry *e)
+{
+	return fast_convert_on() && w4_for(g, e->t) && !tensor_grouped(g, e->t)
+	       && !g->plain && !g->midrise && !g->exact8 && !e->cq &&
+	       e->k_slices == 1 && e->n_npu == (unsigned)e->t->n;
+}
+
+
 /*
  * THE SLICE WIDTH FOR THIS TENSOR, which is not always KMAX.
  *
@@ -1683,6 +1861,63 @@ struct charsiu_npu *charsiu_npu_open(unsigned max_k, unsigned max_n,
  */
 /* defined after charsiu_npu_close, where the hold is dropped too */
 static void qos_hold(struct charsiu_npu *g, int say);
+
+/*
+ * A SECOND, EIGHT BIT DEVICE FOR CHARSIU_NPU_INT8_LAYERS (see `alt`), unless
+ * CHARSIU_NPU_INT8_ALT=0. The same parse as layer_in_range's: unset or empty
+ * means no eight bit layers, so no device.
+ */
+static int mixed_alt_wanted(void)
+{
+	const char *e = getenv("CHARSIU_NPU_INT8_LAYERS");
+
+	/*
+	 * AND NOT UNDER THE TWO SWITCHES THAT CHANGE npu_matvec's FORMULA FOR
+	 * EVERY TENSOR: A16 dots the float activation, and the midrise grid
+	 * adds a half step. exact8 reproduces the plain formula only.
+	 */
+	return e && *e && charsiu_env_flag("CHARSIU_NPU_INT8_ALT", 1) &&
+	       !charsiu_env_flag("CHARSIU_NPU_A16", 0) &&
+	       !charsiu_env_flag("CHARSIU_NPU_W4_MIDRISE", 0);
+}
+
+/* an id alt handed out, as the main device hands it on; see `alt` */
+#define NPU_ALT_ID 0x100000
+
+/*
+ * IS THIS ONE OF alt's IDS? Then it goes to alt, under alt's own number.
+ *
+ * A batched call that goes to alt first writes out the main device's deferred
+ * gather, if it owes one. It reads another Y and another buffer, so this is
+ * only earlier than the flush the caller already owes, never different.
+ */
+static int alt_id(const struct charsiu_npu *g, int id)
+{
+	return g && g->alt && id >= NPU_ALT_ID;
+}
+
+/*
+ * exact8's dequantise, which is npu_matvec's for a tensor with one scale a
+ * row, written the same way: acc = 0.0 + part * scale, then (float)(acc * d1).
+ * The 0.0 is kept because npu_matvec starts its accumulator there, and
+ * 0.0 + -0.0 is +0.0.
+ */
+static inline float exact8_y(int32_t acc, float scale, float d1)
+{
+	double v = 0.0;
+
+	v += (double)acc * scale;
+	return (float)(v * d1);
+}
+
+static int alt_ids(const struct charsiu_npu *g, const int *ids, unsigned n)
+{
+	unsigned i, k = 0;
+
+	for (i = 0; i < n; i++)
+		k += alt_id(g, ids[i]) ? 1u : 0u;
+	return k == 0 ? 0 : k == n ? 1 : -1;    /* -1: a group across both */
+}
 
 struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 					  unsigned max_tensors, int want_w4)
@@ -2130,6 +2365,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * board prices it: it trades sequential Y round trips for several
 	 * scattered source streams at once. */
 	g->readfuse = charsiu_env_flag("CHARSIU_NPU_READ_FUSE", 0);
+	g->gather_old = charsiu_env_flag("CHARSIU_NPU_GATHER_OLD", 0);
 	/*
 	 * OFF. The host said 1.4 to 2.2x faster and THE BOARD SAID 2.3x
 	 * SLOWER, on every one of eight models, same night (phase 9,
@@ -2180,6 +2416,22 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	ns = (max_n + g->nmax - 1) / g->nmax;
 	ks = (max_k + g->kmax - 1) / g->kmax;
 	/*
+	 * AND ROOM FOR A GROUP NARROWER THAN KMAX, which tensor_grouped has
+	 * allowed since kgroup == kmax became kgroup <= kmax -- while this
+	 * still sized the input buffer for K / KMAX slices. KMAX 1024 with
+	 * CHARSIU_NPU_W4_GROUP=256 slices Llama's ffn_down into 32 and its
+	 * activation was packed into an object that holds 8: the 2026-11-25
+	 * arms with group 256 and 128 printed nothing at all. Unchanged
+	 * whenever the group is KMAX, which is every default.
+	 */
+	{
+		const char *ge = getenv("CHARSIU_NPU_W4_GROUP");
+		unsigned grp = ge && *ge ? (unsigned)atoi(ge) : 0;
+
+		if (g->w4 && grp > 0 && grp < g->kmax)
+			ks = (max_k + grp - 1) / grp;
+	}
+	/*
 	 * ROOM FOR A NARROWER SLICE. With CHARSIU_NPU_W4_GROUP_FIT a grouped
 	 * tensor slices at its own group rather than at KMAX, so it can need
 	 * more slots than this: the widest divisor of 5632 under 1024 is 512,
@@ -2190,6 +2442,7 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 */
 	if (charsiu_env_flag("CHARSIU_NPU_W4_GROUP_FIT", 0))
 		ks *= 2;
+	g->in_ks = ks;
 	g->max_slices = ns * ks;
 	g->slot_cap = max_tensors * g->max_slices;
 
@@ -2261,6 +2514,18 @@ struct charsiu_npu *charsiu_npu_open_mode(unsigned max_k, unsigned max_n,
 	 * board has; without it this says so once and carries on.
 	 */
 	qos_hold(g, 1);
+	/* see the note over `alt` in struct charsiu_npu */
+	if (g->w4 && mixed_alt_wanted()) {
+		g->alt = charsiu_npu_open_mode(max_k, max_n, max_tensors, 0);
+		if (g->alt) {
+			g->alt->exact8 = 1;
+			g->alt->readfuse = 0;
+		} else {
+			fprintf(stderr, "charsiu: the eight bit device for "
+				"CHARSIU_NPU_INT8_LAYERS would not open; those "
+				"layers stay on the CPU\n");
+		}
+	}
 	return g;
 
 fail:
@@ -2328,6 +2593,7 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 {
 	if (!g)
 		return;
+	charsiu_npu_idle(g->alt, idle);
 	if (idle) {
 		if (g->qos_fd >= 0) {
 			close(g->qos_fd);      /* the CPUs may sleep deeply again */
@@ -2339,8 +2605,105 @@ void charsiu_npu_idle(struct charsiu_npu *g, int idle)
 }
 
 static int npu_flush_pending(struct charsiu_npu *g);
+static unsigned mtile_n(void);
+static int mtile_sync(void);
 static int defer_read_on(void);
 static int defer_check(void);
+
+/*
+ * A VERIFY PASS PAID FOR THE PROMPT'S BUFFERS.
+ *
+ * Every batched buffer object is sized by the LARGEST m this pool has seen --
+ * the input objects by batch_bufs, the output objects by batch_outbuf -- and
+ * never shrinks. The per call costs on them are not per byte USED, they are
+ * per byte OWNED: PREP_BO and FINI_BO take a handle and no range (see the note
+ * on the output slot stride), and the f16 pack's edge memset zeroes from the
+ * end of this call's rows to the end of the object. So after one 80 row
+ * prefill chunk, a speculative verify pass of 6 rows invalidates, cleans and
+ * zeroes buffers thirteen times larger than its own rows -- on every one of
+ * the ~200 calls a pass makes. A --batch-probe at m = 6, whose buffers are
+ * sized for 6, measured fence 35 and pack 17 ms against 64 and 27 in a real
+ * pass on the board.
+ *
+ * So calls at m <= CHARSIU_NPU_SMALL_M (default 8; 0 restores one pool for
+ * everything) get buffers of their own, sized by the largest SMALL m: a
+ * second input bank, swapped in whole by bank_select, and output buffers
+ * flagged `small` in the same geometry pool.
+ *
+ * IT CANNOT MOVE A VALUE. The layout inside each buffer is a function of the
+ * call's own m and not of the buffer's size: bout_stride is wide * m * 4 per
+ * call, the input slice sits at offset 0 with its rows packed at this m, and
+ * the bytes past the data are zero up to the object's end plus the 4096 pad
+ * either way. A small bank is exactly the geometry a process whose prompt
+ * never went past 8 rows has always used -- a short prompt, or the probe.
+ *
+ * THE SWAP FLUSHES A DEFERRED GATHER FIRST. npu_flush_pending restores
+ * pend.bd1 into g->bd1 only when pend.bd1_n covers g->bd1_n, and after a swap
+ * g->bd1 is the OTHER bank's array: an int8 tensor's deferred read would get
+ * the wrong per row scales, which is a fluent wrong answer. Flushing early is
+ * always legal -- CHARSIU_NPU_DEFER_READ=2 does it on every call.
+ */
+static unsigned small_m(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_SMALL_M");
+
+		v = e && *e ? atoi(e) : 8;
+		if (v < 0)
+			v = 0;
+	}
+	return (unsigned)v;
+}
+
+static unsigned is_small_m(unsigned m)
+{
+	return small_m() && m <= small_m();
+}
+
+#define BANK_SWAP_FIELD(f) do { __typeof__(g->f) t_ = g->f;           \
+		g->f = o->f; o->f = t_; } while (0)
+static void bank_swap_with(struct charsiu_npu *g, struct npu_inbank *o)
+{
+	for (unsigned d = 0; d < 2; d++) {
+		BANK_SWAP_FIELD(bin[d]);
+		BANK_SWAP_FIELD(breg[d]);
+		BANK_SWAP_FIELD(bin_key[d]);
+	}
+	BANK_SWAP_FIELD(bin_nks);
+	BANK_SWAP_FIELD(bm);
+	BANK_SWAP_FIELD(bnks);
+	BANK_SWAP_FIELD(bnslots);
+	BANK_SWAP_FIELD(bd1_n);
+	BANK_SWAP_FIELD(bin_stride);
+	BANK_SWAP_FIELD(bscr);
+	BANK_SWAP_FIELD(bq);
+	BANK_SWAP_FIELD(bd1);
+}
+#undef BANK_SWAP_FIELD
+
+static void bank_swap(struct charsiu_npu *g)
+{
+	bank_swap_with(g, &g->bank_other);
+}
+
+static int bank_select(struct charsiu_npu *g, unsigned m)
+{
+	unsigned want = is_small_m(m);
+
+	if (want == g->bank_small)
+		return 0;
+	if (npu_flush_pending(g))
+		return -1;
+	bank_swap(g);
+	g->bank_small = want;
+	/* what the incoming bank's keys describe was packed before the other
+	 * bank ran; the caller's "unchanged" was about the other bank */
+	reuse_keys_drop(g->bin_key, 2);
+	g->bank_swaps++;
+	return 0;
+}
 
 /*
  * THE BISECTION. CHARSIU_NPU_DEFER_READ selects WHERE the previous tensor's
@@ -2362,19 +2725,54 @@ static int flush_at(struct charsiu_npu *g, int pos)
 	return defer_read_on() == pos ? npu_flush_pending(g) : 0;
 }
 
+static void ed_drop_all(const struct charsiu_npu *g);
+
 void charsiu_npu_close(struct charsiu_npu *g)
 {
 	if (!g)
 		return;
+	charsiu_npu_close(g->alt);
+	g->alt = NULL;
 	/* a deferred gather owns a buffer this is about to free, and the
 	 * caller's Y is still unwritten. Finish it before anything goes. */
 	npu_flush_pending(g);
+	/*
+	 * AND A JOB WHOSE ANSWER WAS READ BEFORE ITS FENCE (early done) may
+	 * still be in the kernel's completion path, holding no reference on
+	 * the weight objects it named nowhere (lean handles). Its hardware
+	 * finished, but nothing is freed until every fence has signalled.
+	 */
+	if (!g->dead)
+		for (unsigned i = 0; i < g->n_ent; i++)
+			for (unsigned d = 0; d < g->ndev; d++)
+				if (g->ent[i].out[d].map)
+					charsiu_bo_prep(g->dev[d],
+							&g->ent[i].out[d],
+							2000000000);
+	ed_drop_all(g);
 	/* ZERO AND NEVER RAN LOOK THE SAME, so say how many were compared */
 	if (defer_check())
 		fprintf(stderr, "charsiu: the deferred gather was compared on"
 			" %lu tensors, %lu differed; %lu deferred, %lu"
 			" flushed\n", g->defer_cmp, g->defer_bad,
 			g->bdefer_n, g->bdefer_done);
+	/* THE POSITIVE TELL that the grouped arm ran, since its text is meant
+	 * to be identical to the control's. Only nonzero when llama.c was asked
+	 * for groups, which it is unless CHARSIU_NPU_BATCH_GROUP=0. */
+	if (g->btile_calls)
+		fprintf(stderr, "charsiu: row tiles: %lu batched calls in %lu"
+			" blocks (CHARSIU_NPU_MTILE=%u%s)\n", g->btile_calls,
+			g->btile_blocks, mtile_n(),
+			mtile_sync() ? ", each block fenced alone" : "");
+	if (g->bgroup_n || g->bgroup_fell)
+		fprintf(stderr, "charsiu: grouped batches: %lu calls of %lu"
+			" members, %lu fell back to one tensor a call\n",
+			g->bgroup_n, g->bgroup_members, g->bgroup_fell);
+	/* THE POSITIVE TELL for the small-m bank, under the stage clock only:
+	 * zero swaps on a run that verified means every call shared one bank */
+	if (charsiu_env_flag("CHARSIU_STAGES", 0) && small_m())
+		fprintf(stderr, "charsiu: small-m buffers (m <= %u): %lu bank"
+			" swaps\n", small_m(), g->bank_swaps);
 	free(g->pend.shadow);
 	free(g->pend.bseen);
 	free(g->pend.bd1);
@@ -2401,6 +2799,29 @@ void charsiu_npu_close(struct charsiu_npu *g)
 		for (unsigned i = 0; i < g->n_obuf; i++)
 			for (unsigned d = 0; d < g->ndev; d++)
 			charsiu_bo_free(g->dev[d], &g->obuf[i].bo[d]);
+		/* the parked input banks first, while the devices are open;
+		 * the live one goes in the loop below as it always has */
+		for (unsigned b = 0; b < 3; b++) {
+			struct npu_inbank *o = b ? &g->bank_tile[b - 1]
+						 : &g->bank_other;
+
+			bank_swap_with(g, o);
+			for (unsigned d = 0; d < g->ndev; d++) {
+				for (unsigned ki = 0; ki < g->bin_nks; ki++)
+					charsiu_bo_free(g->dev[d],
+							&g->bin[d][ki]);
+				free(g->bin[d]);
+				g->bin[d] = NULL;
+				charsiu_bo_free(g->dev[d], &g->breg[d]);
+			}
+			free(g->bscr);
+			free(g->bq);
+			free(g->bd1);
+			g->bscr = NULL;
+			g->bq = NULL;
+			g->bd1 = NULL;
+			bank_swap_with(g, o);
+		}
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_bo_free(g->dev[d], &g->in[d]);
 			/* the batched path's, which a decode never allocates.
@@ -2425,11 +2846,14 @@ void charsiu_npu_close(struct charsiu_npu *g)
 	free(g->bq);
 	free(g->bd1);
 	free(g->bmap);
+	free(g->bmap_park[0].bmap);
+	free(g->bmap_park[1].bmap);
 	free(g->obuf);
 	free(g->bseen);
 	free(g->asum);
 	free(g->tasks);
 	free(g->handles);
+	free(g->bd1x);
 	free(g);
 }
 
@@ -2454,7 +2878,18 @@ unsigned long charsiu_npu_submits(const struct charsiu_npu *g)
  */
 int charsiu_npu_needs_q1(const struct charsiu_npu *g)
 {
-	return !g || !g->w4;
+	/* alt's tensors read q1 and llama.c asks this of the main device */
+	return !g || !g->w4 || g->alt;
+}
+
+/*
+ * THE SAME QUESTION FOR ONE TENSOR. With alt open the answer above is yes for
+ * every call, and realising q1 for a four bit tensor that never reads it is a
+ * pass over K per call for nothing.
+ */
+int charsiu_npu_needs_q1_id(const struct charsiu_npu *g, int id)
+{
+	return !g || !g->w4 || alt_id(g, id);
 }
 
 /*
@@ -2522,6 +2957,9 @@ static int solve3(double m[3][3], double *v, double *x)
 	return 0;
 }
 
+static void cp_report(void);
+static void ed_report(void);
+
 void charsiu_npu_report(const struct charsiu_npu *g)
 {
 	if (!g)
@@ -2537,6 +2975,8 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		g->w4 ? "int4" : "int8", g->ndev);
 	/* silent unless CHARSIU_NPU_SPIN_US asked for the poll */
 	charsiu_spin_report();
+	cp_report();
+	ed_report();
 	fprintf(stderr,
 		"charsiu NPU: %u tensors, %lu slices, %lu submits, %.2f MB per "
 		"submit%s\n",
@@ -2791,6 +3231,11 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 				g->packpool == 1 ? "CHARSIU_NPU_PACK_POOL=1, always" :
 				g->packpool == 0 ? "CHARSIU_NPU_PACK_POOL=0, never" :
 				"pooled from CHARSIU_NPU_PACK_POOL_MIN groups");
+		if (g->bpack_copied + g->bpack_direct)
+			fprintf(stderr, "charsiu NPU: pack2: %lu slices copied"
+				" from the other device's object, %lu packed"
+				" straight out of X with no gather\n",
+				g->bpack_copied, g->bpack_direct);
 		if (g->bread_pooled + g->bread_serial)
 			fprintf(stderr, "charsiu NPU: read back %lu slots on the pool"
 				" and %lu one thread (%s)\n",
@@ -2879,6 +3324,12 @@ void charsiu_npu_report(const struct charsiu_npu *g)
 		fprintf(stderr,
 			"charsiu NPU: NOTHING RAN ON THE HARDWARE. Every number "
 			"in this run came from the CPU.\n");
+	if (g->alt) {
+		fprintf(stderr, "charsiu NPU: the eight bit layers "
+			"(CHARSIU_NPU_INT8_LAYERS), on their own device, %u "
+			"tensors:\n", g->alt->n_ent);
+		charsiu_npu_report(g->alt);
+	}
 }
 
 /*
@@ -2893,10 +3344,76 @@ struct wrows {
 	unsigned n0, k0, k;
 };
 
+/*
+ * THE COPY INTO THE BUFFER OBJECT ON THE POOL. Once the pack is a copy too
+ * (CHARSIU_NPU_PACK_DIRECT), this one sequential memcpy of the slice, on the
+ * staging thread, is what is left of a cached start's CPU time: 620 MB for
+ * Llama-3.2-1B on one core. In 256 KiB pieces each thread still writes
+ * sequentially, which is what the comment at the copy asks of a buffer
+ * object's mapping. CHARSIU_NPU_COPY_POOL=0 is the one-thread control.
+ */
+struct wtcopy {
+	uint8_t *dst;
+	const uint8_t *src;
+	size_t bytes;
+};
+
+#define WT_COPY_PIECE ((size_t)256 << 10)
+
+static void wt_copy_rows(void *vc, uint64_t r0, uint64_t nr)
+{
+	const struct wtcopy *c = vc;
+	size_t a = (size_t)r0 * WT_COPY_PIECE, b = (size_t)(r0 + nr) * WT_COPY_PIECE;
+
+	if (b > c->bytes)
+		b = c->bytes;
+	if (a < b)
+		memcpy(c->dst + a, c->src + a, b - a);
+}
+
+static void wt_copy(struct charsiu_npu *g, void *dst, size_t bytes)
+{
+	static int pool = -1;
+	struct wtcopy c = { dst, g->wpack, bytes };
+
+	if (pool < 0)
+		pool = charsiu_env_flag("CHARSIU_NPU_COPY_POOL", 1);
+	if (!pool || g->serialpack || bytes < 2 * WT_COPY_PIECE) {
+		memcpy(dst, g->wpack, bytes);
+		return;
+	}
+	charsiu_parallel_for(wt_copy_rows, &c,
+			     (bytes + WT_COPY_PIECE - 1) / WT_COPY_PIECE);
+}
+
+/*
+ * CHARSIU_NPU_PACK_DIRECT (default on, =0 the control): an int4 slice whose
+ * codes are already packed two to a byte, starting on an even K, is copied
+ * into the layout sixteen bytes at a time by charsiu_pack_weights_rows_q4
+ * instead of being unpacked to one byte a code here and packed again there.
+ * The same bytes by construction (tests/pack_q4.c). It is the CPU half of a
+ * start from the weight cache, which reads q and does nothing else to it.
+ */
+static int pack_direct_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PACK_DIRECT", 1);
+	return v;
+}
+
 static void pack_rows(void *vw, uint64_t r0, uint64_t nr)
 {
 	const struct wrows *w = vw;
 	struct charsiu_npu *g = w->g;
+
+	if (w->t->packed && w4_for(g, w->t) && !(w->k0 & 1) && pack_direct_on() &&
+	    !charsiu_pack_weights_rows_q4(w->mm,
+			(const uint8_t *)w->t->q + (size_t)w->n0 * npu_q_stride_t(w->t)
+				+ w->k0 / 2,
+			npu_q_stride_t(w->t), g->wpack, (unsigned)r0, (unsigned)nr))
+		return;
 	/*
 	 * TWO SEPARATE QUESTIONS, and they used to be one. pk is how the
 	 * weight is STORED and g->w4 is what the device wants HANDED to it: an
@@ -3341,7 +3858,7 @@ static int add_slice(struct charsiu_npu *g, unsigned di,
 	 * nearly sequential. The copy afterwards is one sequential pass.
 	 */
 	charsiu_bo_prep(g->dev[di], &s->wt, 1000000000);
-	memcpy(s->wt.map, g->wpack, charsiu_weight_bytes(&s->job.mm));
+	wt_copy(g, s->wt.map, charsiu_weight_bytes(&s->job.mm));
 	charsiu_bo_fini(g->dev[di], &s->wt);
 
 	bias = calloc(n, sizeof(*bias));
@@ -3483,6 +4000,19 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * and not to anything on the host.
 	 */
 	if (g->w4 && !t->packed) {
+		/*
+		 * THE SECOND DEVICE TAKES THEM INSTEAD, when there is one --
+		 * see `alt` in struct charsiu_npu. Only a tensor whose CPU
+		 * arithmetic exact8 reproduces: one scale a row (npuquant
+		 * writes that for every eight bit tensor) and no AWQ factor,
+		 * which the CPU quantises its activation through.
+		 */
+		if (g->alt && !t->kscale &&
+		    (!t->kgroup || t->kgroup >= t->k)) {
+			int aid = charsiu_npu_add(g->alt, t);
+
+			return aid < 0 ? -1 : aid + NPU_ALT_ID;
+		}
 		whine(g, "eight bit weights on a device opened for four",
 		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
@@ -3561,6 +4091,14 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	}
 	if (ns * ks > g->max_slices || first + ns * ks > g->slot_cap) {
 		whine(g, "no slice slots left", (unsigned)t->k, (unsigned)t->n);
+		return -1;
+	}
+	/* the backstop for the sizing at open: g->in holds in_ks slices.
+	 * Asked only of a group narrower than KMAX, the case it was missing;
+	 * nothing a default run stages can reach it. */
+	if (ks > g->in_ks && tensor_grouped(g, t) && t->kgroup < g->kmax) {
+		whine(g, "more K slices than the input buffer was opened for",
+		      (unsigned)t->k, (unsigned)t->n);
 		return -1;
 	}
 
@@ -3762,6 +4300,18 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
 	 * inside charsiu_npu_add, and whatever is left of the wall clock between
 	 * heartbeats belongs to npu_tensor_build, which is the quantiser.
 	 */
+	/* the deal is final here: add_slice is the only writer of s->di */
+	for (unsigned ni = 0; ni < e->n_slices; ni++)
+		for (unsigned ki = 0; ki < e->k_slices; ki++) {
+			const struct npu_slot *s =
+				&g->slot[e->first + ki * e->n_slices + ni];
+
+			if (s->di > e->gdev_last)
+				e->gdev_last = s->di;
+			if (ki && s->di < g->slot[e->first + (ki - 1)
+						   * e->n_slices + ni].di)
+				e->gmix = 1;
+		}
 	g->add_us += now_us() - t_add;
 	if ((g->n_ent % 16) == 15) {
 		fprintf(stderr,
@@ -3794,6 +4344,269 @@ int charsiu_npu_add(struct charsiu_npu *g, const struct npu_tensor *t)
  * mistake that made every int4 GB/s in this project double the real figure for
  * three rounds.
  */
+/*
+ * ---- CHARSIU_NPU_CALLPROF: WHERE ONE DECODE CALL'S TIME GOES, BY SITE ----
+ *
+ * The fit on `calls` reads 131 us a call before a byte moves and its own
+ * report calls the fit flaky, and every other figure for a call's overhead
+ * in this tree is a residual. This measures it instead: for each decode call
+ * it stamps the pack, each device's submit, and the moment each device's job
+ * is SEEN complete -- by polling both devices in turn rather than waiting on
+ * one and then asking the other, which would only bound the second -- then
+ * the read back. Keyed by the first tensor's name with the layer stripped, so
+ * q/k/v, o, gate/up, down and the head each get a line.
+ *
+ * DIAGNOSTIC ONLY. The poll replaces the waiter's spin for the duration of
+ * the call; the bytes and the arithmetic are untouched (the same prep runs
+ * afterwards and returns at once), so the text cannot move, but the timing of
+ * the arm that turns it on is not the shipping timing. Off by default.
+ */
+#define CP_SITES 12
+static struct cp_site {
+	char name[40];
+	unsigned long calls;
+	double pack, sub[2], done[2], tail, total, gap, mb[2], spread, prep;
+	unsigned long tasks[2], sent[2];
+} cp_tab[CP_SITES];
+static int cp_flag = -1;
+static double cp_last_end, cp_tprep;
+
+static int callprof(void)
+{
+	if (cp_flag < 0)
+		cp_flag = (int)env_u("CHARSIU_NPU_CALLPROF", 0);
+	return cp_flag;
+}
+
+static struct cp_site *cp_site(const char *tname)
+{
+	char nm[40];
+	const char *p = tname;
+	size_t l;
+	unsigned i;
+
+	if (!strncmp(p, "blk.", 4)) {
+		p += 4;
+		while (*p >= '0' && *p <= '9')
+			p++;
+		if (*p == '.')
+			p++;
+	}
+	snprintf(nm, sizeof(nm), "%s", p);
+	l = strlen(nm);
+	if (l > 7 && !strcmp(nm + l - 7, ".weight"))
+		nm[l - 7] = 0;
+	for (i = 0; i < CP_SITES; i++) {
+		if (!cp_tab[i].name[0]) {
+			snprintf(cp_tab[i].name, sizeof(cp_tab[i].name), "%s", nm);
+			return &cp_tab[i];
+		}
+		if (!strcmp(cp_tab[i].name, nm))
+			return &cp_tab[i];
+	}
+	return NULL;
+}
+
+/* poll each sent device's first output until all have finished; done[d] is
+ * the moment device d was seen complete */
+static void cp_wait(struct charsiu_npu *g, unsigned sent,
+		    struct charsiu_bo *const *bo, double *done)
+{
+	unsigned pend = sent;
+	double t0 = now_us();
+
+	while (pend) {
+		for (unsigned d = 0; d < g->ndev; d++) {
+			if (!(pend & (1u << d)))
+				continue;
+			int rc = charsiu_bo_poll(g->dev[d], bo[d]);
+
+			if (!rc || (rc != -EBUSY && rc != -EINTR)) {
+				done[d] = now_us();
+				pend &= ~(1u << d);
+			}
+		}
+		if (pend && now_us() - t0 > 2e6)
+			break;     /* the ordinary prep below takes over */
+	}
+}
+
+/*
+ * CHARSIU_NPU_CALLPROF=2 ALSO ASKS THE MEMORY. Every output word of the call
+ * is set to a NaN the hardware never writes and cleaned out to DRAM before the
+ * submit; the wait then polls both the fence AND the words (clean+invalidate
+ * from EL0, then read), and records when each device's words stopped being
+ * the sentinel and when its fence was seen. The difference is what the
+ * completion path -- interrupt, irq thread, IOMMU detach, fence signal, our
+ * poll -- costs after the data is already there. Small tensors only (the head
+ * would be 600 kB a poll).
+ */
+#define CP_SENT 0x7fbadbadu
+#define CP_NREG 32
+static struct { uint32_t *p; unsigned n, d; } cp_reg[CP_NREG];
+static unsigned cp_nreg;
+static double cp_memlead[2], cp_memlead_n[2], cp_memlate;
+
+static void cp_fill(struct charsiu_npu *g, const int *ids, unsigned n)
+{
+	cp_nreg = 0;
+	for (unsigned i = 0; i < n; i++) {
+		struct npu_entry *e = &g->ent[ids[i]];
+		unsigned used = 0;
+
+		if (e->t->n > 16384)
+			continue;
+		for (unsigned j = 0; j < e->count && cp_nreg < CP_NREG; j++) {
+			const struct npu_slot *sl = &g->slot[e->first + j];
+			uint32_t *w = (uint32_t *)((uint8_t *)e->out[sl->di].map
+				      + sl->out_slot * e->out_stride);
+
+			for (unsigned q = 0; q < sl->job.mm.n; q++)
+				w[q] = CP_SENT;
+			cp_reg[cp_nreg].p = w;
+			cp_reg[cp_nreg].n = sl->job.mm.n;
+			cp_reg[cp_nreg].d = sl->di;
+			cp_nreg++;
+			used |= 1u << sl->di;
+		}
+		for (unsigned d = 0; d < g->ndev; d++)
+			if (used & (1u << d))
+				charsiu_bo_fini(g->dev[d], &e->out[d]);
+	}
+}
+
+static int cp_mem_done(unsigned d)
+{
+	int any = 0;
+
+	for (unsigned r = 0; r < cp_nreg; r++) {
+		const uint32_t *w = cp_reg[r].p;
+
+		if (cp_reg[r].d != d)
+			continue;
+		any = 1;
+#if defined(__aarch64__)
+		for (unsigned q = 0; q < cp_reg[r].n; q += 16)
+			__asm__ volatile("dc civac, %0" :: "r"(w + q) : "memory");
+		__asm__ volatile("dsb ish" ::: "memory");
+#endif
+		for (unsigned q = 0; q < cp_reg[r].n; q++)
+			if (__atomic_load_n(&w[q], __ATOMIC_RELAXED) == CP_SENT)
+				return 0;
+	}
+	return any;
+}
+
+static void cp_wait2(struct charsiu_npu *g, unsigned sent,
+		     struct charsiu_bo *const *bo, double *done)
+{
+	unsigned pend = sent, mpend = sent;
+	double tm[2] = { 0, 0 }, t0 = now_us();
+
+	while (pend) {
+		for (unsigned d = 0; d < g->ndev; d++) {
+			if ((mpend & (1u << d)) && cp_mem_done(d)) {
+				tm[d] = now_us();
+				mpend &= ~(1u << d);
+			}
+			if (!(pend & (1u << d)))
+				continue;
+			int rc = charsiu_bo_poll(g->dev[d], bo[d]);
+
+			if (!rc || (rc != -EBUSY && rc != -EINTR)) {
+				done[d] = now_us();
+				pend &= ~(1u << d);
+			}
+		}
+		if (pend && now_us() - t0 > 2e6)
+			break;
+	}
+	for (unsigned d = 0; d < g->ndev; d++) {
+		if (!(sent & (1u << d)) || !cp_nreg)
+			continue;
+		if (mpend & (1u << d)) {
+			/* the fence came first, check the words once more */
+			if (!cp_mem_done(d))
+				cp_memlate++;
+			continue;
+		}
+		cp_memlead[d] += done[d] - tm[d];
+		cp_memlead_n[d]++;
+	}
+}
+
+static void cp_record(const char *tname, double tcall, double tpacked,
+		      const double *sub0, const double *sub1,
+		      const double *done, unsigned sent,
+		      const unsigned *tasks, const double *mb, double tend)
+{
+	struct cp_site *c = cp_site(tname);
+	double last = 0.0, first = 1e300;
+
+	if (!c)
+		return;
+	c->calls++;
+	c->pack += tpacked - tcall;
+	for (unsigned d = 0; d < 2; d++) {
+		if (!(sent & (1u << d)))
+			continue;
+		c->sent[d]++;
+		c->sub[d] += sub1[d] - sub0[d];
+		c->done[d] += done[d] - sub1[d];
+		c->tasks[d] += tasks[d];
+		c->mb[d] += mb[d];
+		if (done[d] > last)
+			last = done[d];
+		if (done[d] < first)
+			first = done[d];
+	}
+	if (last > 0.0) {
+		c->tail += tend - last;
+		if (cp_tprep > last)
+			c->prep += cp_tprep - last;
+		c->spread += last - first;
+	}
+	c->total += tend - tcall;
+	if (cp_last_end > 0.0 && tcall - cp_last_end < 50000.0)
+		c->gap += tcall - cp_last_end;
+	cp_last_end = tend;
+}
+
+static void cp_report(void)
+{
+	if (callprof() <= 0)
+		return;
+	fprintf(stderr, "charsiu callprof (us a call; done = submit returned"
+		" -> job seen complete, per device; tail = last done -> return;"
+		" gap = CPU time since the previous call ended)\n");
+	fprintf(stderr, "  %-18s %6s %6s %6s %6s %7s %7s %6s %6s %6s %6s %5s"
+		" %5s %6s\n", "site", "calls", "gap", "pack", "sub0", "done0",
+		"done1", "sub1", "spread", "tail", "total", "tsk0", "tsk1",
+		"MB0/1 prep");
+	if (callprof() == 2)
+		fprintf(stderr, "  the words were all written %.1f us (core 0, %.0f"
+			" calls) / %.1f us (core 1, %.0f) before the fence was seen;"
+			" %.0f calls had words missing AFTER the fence\n",
+			cp_memlead_n[0] ? cp_memlead[0] / cp_memlead_n[0] : 0.0,
+			cp_memlead_n[0],
+			cp_memlead_n[1] ? cp_memlead[1] / cp_memlead_n[1] : 0.0,
+			cp_memlead_n[1], cp_memlate);
+	for (unsigned i = 0; i < CP_SITES && cp_tab[i].name[0]; i++) {
+		const struct cp_site *c = &cp_tab[i];
+		double n = (double)c->calls;
+		double n0 = c->sent[0] ? (double)c->sent[0] : 1.0;
+		double n1 = c->sent[1] ? (double)c->sent[1] : 1.0;
+
+		fprintf(stderr, "  %-18s %6lu %6.1f %6.1f %6.1f %7.1f %7.1f %6.1f"
+			" %6.1f %6.1f %6.1f %5.2f %5.2f %.2f/%.2f %.1f\n", c->name,
+			c->calls, c->gap / n, c->pack / n, c->sub[0] / n0,
+			c->done[0] / n0, c->done[1] / n1, c->sub[1] / n1,
+			c->spread / n, c->tail / n, c->total / n,
+			c->tasks[0] / n0, c->tasks[1] / n1, c->mb[0] / n0,
+			c->mb[1] / n1, c->prep / n);
+	}
+}
+
 static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
 			 double us)
 {
@@ -3848,6 +4661,587 @@ static void account_call(struct charsiu_npu *g, const int *ids, unsigned n,
 	g->f_yy += us * us;
 }
 
+/*
+ * ---- CHARSIU_NPU_EARLY_DONE: SEE THE ANSWER, NOT THE FENCE ----
+ *
+ * CHARSIU_NPU_CALLPROF=2 measured it: every output word of a decode call is
+ * in DRAM 25.6 us (core 0) and 26.9 us (core 1) before the fence is seen,
+ * over 14336 calls, and never once after. That is the completion path -- the
+ * interrupt on CPU0, the irq thread, the IOMMU detach, dma_fence_signal, and
+ * the poll that notices -- and it sits between the hardware finishing and the
+ * CPU starting on every one of the 112 calls of a Qwen3-0.6B token.
+ *
+ * So the waiter watches the words. An armed entry's output slots hold a NaN
+ * the hardware never writes (ED_SENT), cleaned out to DRAM; the wait cleans
+ * and invalidates those lines from EL0 and reads them, and a device is done
+ * when none of its words is the sentinel any more -- or when its fence is
+ * seen, whichever is first, so a real output that happened to equal the
+ * sentinel costs the old latency and nothing else. The prep_bo that would
+ * have waited for the fence is skipped for a device finished this way: its
+ * only other job is the invalidate, and the poll has just done that line by
+ * line. The kernel's completion still runs, beside the CPU's next work; the
+ * next job on that core queues behind its fence in the scheduler as before.
+ *
+ * WHAT MAKES IT EXACT is that a decode task writes each output word once,
+ * with its final value -- the accumulation is inside the core -- so a word
+ * that is not the sentinel is the answer. The bytes the gather reads are the
+ * bytes prep_bo would have handed it, and the logits hash is the proof.
+ *
+ * RE-ARMING IS OFF THE CRITICAL PATH. After a call has read its outputs it
+ * queues the entry; later waits write the sentinel back and clean it, a few
+ * slots at a time, while they wait on their own hardware. An entry not yet
+ * re-armed takes the ordinary prep path, so correctness never depends on
+ * when the re-arm happens.
+ *
+ * Tensors up to CHARSIU_NPU_EARLY_DONE_MAXN rows (16384) are polled whole;
+ * a wider one -- the output head -- slice by slice (CHARSIU_NPU_EARLY_BIG,
+ * see ed_big).
+ *
+ * ON BY DEFAULT; CHARSIU_NPU_EARLY_DONE=0 is the control. CM5, Qwen3-0.6B,
+ * 124 token prompt, 64 tokens, spec 0, stage clock, same boot: 41.6-42.1 ms a
+ * token -> 38.0-38.2, every projection row shorter (q k v 7.3 -> 6.6, o 5.3 ->
+ * 4.4, gate+up 9.0 -> 7.7, down 6.5 -> 5.8 ms a token), text identical, and
+ * the logits fnv64 of Qwen3-0.6B, Llama-3.2-1B and Qwen3-1.7B over long.txt
+ * -n 400 unchanged in the token loop (the only one of the three ppl modes
+ * that reaches this path; --batch and --verify were run too).
+ */
+#define ED_SENT 0x7fbadbadu
+#define ED_QMAX 16
+static struct {
+	struct charsiu_npu *g;
+	int id;
+	unsigned next, used;      /* slots armed so far, and their devices */
+} ed_q[ED_QMAX];
+static unsigned ed_nq;
+static unsigned long ed_early[2], ed_fence[2], ed_plain;
+
+/*
+ * ---- THE ACTIVATION'S WAY IN, FOR A DECODE CALL ----
+ *
+ * CHARSIU_NPU_PACK_NEEDED (default on, =0 the control): pack into each
+ * device's input object only the K
+ * slices that device's tasks read, and skip a device with none. Every device
+ * used to get every K slice, so o proj (two K slices, one a core) and down
+ * (three, two and one) packed twice what their cores read. The bytes a task
+ * reads are packed exactly as before, at the same offsets.
+ *
+ * CHARSIU_NPU_USER_CLEAN (default on, =0 the control): make those bytes
+ * visible to the device with DC
+ * CVAC over exactly the packed slices instead of DRM_ROCKET_FINI_BO, which is
+ * an ioctl that cleans the WHOLE object (it takes a handle and no range).
+ * The kernel's fini is dma_sync_sgtable_for_device, which on arm64 is the
+ * same clean to the point of coherency followed by a dsb; EL0 may issue DC
+ * CVAC (SCTLR_EL1.UCI), so this is the same maintenance on fewer lines with
+ * no syscall.
+ *
+ * Together with CHARSIU_NPU_LEAN_HANDLES, on top of early done: 38.1 -> 37.7
+ * ms a token (o proj 4.37 -> 4.15, down 5.85 -> 5.71), both rounds, text
+ * identical.
+ */
+static int pack_needed_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PACK_NEEDED", 1);
+	return v;
+}
+
+static int user_clean_on(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+#if defined(__aarch64__)
+		v = charsiu_env_flag("CHARSIU_NPU_USER_CLEAN", 1);
+#else
+		v = 0;
+#endif
+	}
+	return v;
+}
+
+/*
+ * CHARSIU_NPU_LEAN_HANDLES (default on, =0 the control): a decode submit
+ * lists the input and output objects only. The weight and coefficient objects of every slice were in
+ * the in list too, two a task, and the kernel looks each one up, locks its
+ * reservation, reserves a fence slot and walks its fences for an implicit
+ * dependency -- for objects nothing ever writes after staging and that this
+ * process holds for its whole life. The register stream objects have never
+ * been listed, which is the precedent: rocket maps an object into the fd's
+ * IOMMU domain when it is created, not when a job names it. The weights are
+ * held by this process until charsiu_npu_close, which waits on every fence
+ * before freeing anything.
+ */
+static int submit_order_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_SUBMIT_ORDER", 1);
+	return v;
+}
+
+static int lean_handles_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_LEAN_HANDLES", 1);
+	return v;
+}
+
+/* the K slices of entry e that device d's tasks read, as a mask; all ones
+ * when there are more K slices than bits */
+static uint64_t kmask_for(const struct charsiu_npu *g,
+			  const struct npu_entry *e, unsigned d)
+{
+	uint64_t m = 0;
+
+	if (e->k_slices > 64 || !e->n_slices)
+		return ~0ull;
+	for (unsigned j = 0; j < e->count; j++)
+		if (g->slot[e->first + j].di == d)
+			m |= 1ull << (j / e->n_slices);
+	return m;
+}
+
+/* hand device d the K slices in mask m of its input object */
+static void in_flush(struct charsiu_npu *g, unsigned d, uint64_t m,
+		     unsigned k_slices)
+{
+#if defined(__aarch64__)
+	if (m == ~0ull && k_slices < 64)
+		m = (1ull << k_slices) - 1;
+	if (user_clean_on() && m != ~0ull) {
+		const char *base = (const char *)g->in[d].map;
+
+		for (unsigned ki = 0; ki < k_slices; ki++) {
+			const char *p;
+
+			if (!(m & (1ull << ki)))
+				continue;
+			p = base + (size_t)ki * g->in_stride;
+			for (size_t o = 0; o < g->in_stride; o += 64)
+				__asm__ volatile("dc cvac, %0" :: "r"(p + o)
+						 : "memory");
+		}
+		__asm__ volatile("dsb sy" ::: "memory");
+		g->in_user_cleans++;
+		return;
+	}
+#endif
+	(void)m; (void)k_slices;
+	charsiu_bo_fini(g->dev[d], &g->in[d]);
+}
+
+static int early_done_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_EARLY_DONE", 1);
+	return v;
+}
+
+static unsigned early_done_maxn(void)
+{
+	static unsigned v;
+	static int set;
+
+	if (!set) {
+		v = env_u("CHARSIU_NPU_EARLY_DONE_MAXN", 16384);
+		set = 1;
+	}
+	return v;
+}
+
+static inline uint32_t *ed_region(const struct npu_entry *e,
+				  const struct npu_slot *sl)
+{
+	return (uint32_t *)((uint8_t *)e->out[sl->di].map
+			    + sl->out_slot * e->out_stride);
+}
+
+static inline void ed_civac(const void *p, size_t bytes)
+{
+#if defined(__aarch64__)
+	const char *c = p;
+
+	for (size_t o = 0; o < bytes; o += 64)
+		__asm__ volatile("dc civac, %0" :: "r"(c + o) : "memory");
+	__asm__ volatile("dsb ish" ::: "memory");
+#else
+	(void)p; (void)bytes;
+#endif
+}
+
+/*
+ * CHARSIU_NPU_EARLY_BIG (default on with early done, =0 the control): the
+ * same for a tensor too wide to poll whole -- the output head. Its slices finish one at a time over 4.6 ms, so instead
+ * of waiting for the last and then gathering 151936 rows, each slice is
+ * watched on its own and gathered the moment its words are all there, in
+ * the same order per output element (K slice ascending, into the same zeroed
+ * accumulator, then the same conversion). At the end only the last slice is
+ * left to add. Needs CHARSIU_NPU_EARLY_DONE. Qwen3-0.6B's head row 5.26 ->
+ * 4.65 ms a token, both rounds.
+ */
+static int ed_big_ok(const struct charsiu_npu *g, const struct npu_entry *e)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_EARLY_BIG", 1);
+	return v && w4_for(g, e->t) && !g->plain && !g->midrise &&
+	       !g->exact8 && e->n_npu == (unsigned)e->t->n &&
+	       e->count == e->k_slices * e->n_slices && e->n_slices <= 64 &&
+	       e->k_slices <= 64;
+}
+
+static int ed_entry_ok(const struct charsiu_npu *g, const struct npu_entry *e)
+{
+#if defined(__aarch64__)
+	return early_done_on() && g->ndev <= 2 && !e->cq &&
+	       (e->t->n <= early_done_maxn() || ed_big_ok(g, e));
+#else
+	(void)g; (void)e;
+	return 0;
+#endif
+}
+
+/* the sentinel over one slot's words, cleaned to DRAM (no barrier) */
+static size_t ed_arm_slot(struct npu_entry *e, const struct npu_slot *sl)
+{
+	uint32_t *w = ed_region(e, sl);
+	size_t bytes = (size_t)sl->job.mm.n * 4u;
+
+	for (unsigned q = 0; q < sl->job.mm.n; q++)
+		w[q] = ED_SENT;
+#if defined(__aarch64__)
+	for (size_t o = 0; o < bytes; o += 64)
+		__asm__ volatile("dc cvac, %0" :: "r"((char *)w + o) : "memory");
+#endif
+	return bytes;
+}
+
+/*
+ * The queued re-arms, a few slots at a time, run while the caller waits on
+ * something else. NEVER an entry of the call in flight: its device may be
+ * writing those very words. ed_drop removes those first; the call queues them
+ * again once it has read them. An entry is marked armed only when every slot
+ * is done and the barrier has run, so a half armed entry takes the ordinary
+ * path and is merely written over.
+ */
+static void ed_drop(struct charsiu_npu *g, const int *ids, unsigned n)
+{
+	unsigned w = 0;
+
+	for (unsigned i = 0; i < ed_nq; i++) {
+		int busy = 0;
+
+		if (ed_q[i].g == g)
+			for (unsigned k = 0; k < n; k++)
+				if (ids[k] == ed_q[i].id)
+					busy = 1;
+		if (busy)
+			g->ent[ed_q[i].id].armed = 0;
+		else
+			ed_q[w++] = ed_q[i];
+	}
+	ed_nq = w;
+}
+
+/* forget every queued re-arm of g, which is going away */
+static void ed_drop_all(const struct charsiu_npu *g)
+{
+	unsigned w = 0;
+
+	for (unsigned i = 0; i < ed_nq; i++)
+		if (ed_q[i].g != g)
+			ed_q[w++] = ed_q[i];
+	ed_nq = w;
+}
+
+/* arm up to `budget` bytes of the queue; returns whether it is empty */
+static int ed_step(size_t budget)
+{
+	size_t done = 0;
+
+	while (ed_nq && done < budget) {
+		struct charsiu_npu *g = ed_q[0].g;
+		struct npu_entry *e = &g->ent[ed_q[0].id];
+
+		while (ed_q[0].next < e->count && done < budget) {
+			const struct npu_slot *sl =
+				&g->slot[e->first + ed_q[0].next];
+
+			done += ed_arm_slot(e, sl);
+			ed_q[0].used |= 1u << sl->di;
+			ed_q[0].next++;
+		}
+		if (ed_q[0].next < e->count)
+			break;
+#if defined(__aarch64__)
+		__asm__ volatile("dsb ish" ::: "memory");
+#endif
+		e->armed = ed_q[0].used;
+		memmove(&ed_q[0], &ed_q[1], (ed_nq - 1) * sizeof(ed_q[0]));
+		ed_nq--;
+	}
+	return !ed_nq;
+}
+
+static void ed_queue(struct charsiu_npu *g, int id)
+{
+	if (!ed_entry_ok(g, &g->ent[id]))
+		return;
+	g->ent[id].armed = 0;
+	for (unsigned i = 0; i < ed_nq; i++)
+		if (ed_q[i].g == g && ed_q[i].id == id)
+			return;
+	if (ed_nq == ED_QMAX)
+		return;          /* stays unarmed: the ordinary path */
+	ed_q[ed_nq].g = g;
+	ed_q[ed_nq].id = id;
+	ed_q[ed_nq].next = 0;
+	ed_q[ed_nq].used = 0;
+	ed_nq++;
+}
+
+/* whether every word of the call's slots on device d is written */
+static int ed_mem_done(const struct charsiu_npu *g, const int *ids,
+		       unsigned n, unsigned d)
+{
+	/* the last line of every slot first: cheap, and the likely laggard */
+	for (unsigned i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+
+		for (unsigned j = 0; j < e->count; j++) {
+			const struct npu_slot *sl = &g->slot[e->first + j];
+			const uint32_t *w;
+			unsigned nw = sl->job.mm.n, q0;
+
+			if (sl->di != d)
+				continue;
+			w = ed_region(e, sl);
+			q0 = nw > 16 ? nw - 16 : 0;
+			ed_civac(w + q0, (size_t)(nw - q0) * 4u);
+			for (unsigned q = q0; q < nw; q++)
+				if (__atomic_load_n(&w[q], __ATOMIC_RELAXED)
+				    == ED_SENT)
+					return 0;
+		}
+	}
+	for (unsigned i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+
+		for (unsigned j = 0; j < e->count; j++) {
+			const struct npu_slot *sl = &g->slot[e->first + j];
+			const uint32_t *w;
+
+			if (sl->di != d)
+				continue;
+			w = ed_region(e, sl);
+			ed_civac(w, (size_t)sl->job.mm.n * 4u);
+			for (unsigned q = 0; q < sl->job.mm.n; q++)
+				if (__atomic_load_n(&w[q], __ATOMIC_RELAXED)
+				    == ED_SENT)
+					return 0;
+		}
+	}
+	return 1;
+}
+
+/*
+ * The wait for a call whose every entry is armed on every device it sent to.
+ * Returns with each sent device either seen complete in memory (no prep, the
+ * lines are already invalidated) or by its fence, in which case every BO of
+ * the call on that device is prepped as before. Entries are disarmed either
+ * way: their words are the answer now.
+ */
+static int ed_wait(struct charsiu_npu *g, const int *ids, unsigned n,
+		   unsigned sent)
+{
+	unsigned pend = sent;
+	double t0 = now_us();
+	int drained = 0;
+
+	ed_drop(g, ids, n);
+
+	while (pend) {
+		for (unsigned d = 0; d < g->ndev; d++) {
+			const struct npu_entry *e0 = NULL;
+
+			if (!(pend & (1u << d)))
+				continue;
+			if (ed_mem_done(g, ids, n, d)) {
+				pend &= ~(1u << d);
+				ed_early[d]++;
+				continue;
+			}
+			for (unsigned i = 0; i < n && !e0; i++)
+				if (g->ent[ids[i]].armed & (1u << d))
+					e0 = &g->ent[ids[i]];
+			if (e0 && !charsiu_bo_poll(g->dev[d],
+					(struct charsiu_bo *)&e0->out[d])) {
+				for (unsigned i = 0; i < n; i++)
+					if (g->ent[ids[i]].armed & (1u << d))
+						charsiu_bo_prep(g->dev[d],
+							&g->ent[ids[i]].out[d],
+							2000000000);
+				pend &= ~(1u << d);
+				ed_fence[d]++;
+			}
+		}
+		if (pend && !drained)
+			drained = ed_step(16384);
+		if (pend && now_us() - t0 > 2e6) {
+			/* the ordinary wait, with its own timeout */
+			for (unsigned d = 0; d < g->ndev; d++)
+				if (pend & (1u << d))
+					for (unsigned i = 0; i < n; i++)
+						if (charsiu_bo_prep(g->dev[d],
+							&g->ent[ids[i]].out[d],
+							2000000000))
+							return -1;
+			break;
+		}
+	}
+	for (unsigned i = 0; i < n; i++)
+		g->ent[ids[i]].armed = 0;
+	return 0;
+}
+
+static void ed_report(void)
+{
+	if (early_done_on())
+		fprintf(stderr, "charsiu NPU: early done: %lu+%lu device waits"
+			" ended on the words, %lu+%lu on the fence, %lu calls"
+			" took the ordinary wait (CHARSIU_NPU_EARLY_DONE)\n",
+			ed_early[0], ed_early[1], ed_fence[0], ed_fence[1],
+			ed_plain);
+}
+
+static int ed_slot_done(const struct npu_entry *e, const struct npu_slot *sl)
+{
+	const uint32_t *w = ed_region(e, sl);
+	unsigned nw = sl->job.mm.n, q0 = nw > 16 ? nw - 16 : 0;
+
+	ed_civac(w + q0, (size_t)(nw - q0) * 4u);
+	for (unsigned q = q0; q < nw; q++)
+		if (__atomic_load_n(&w[q], __ATOMIC_RELAXED) == ED_SENT)
+			return 0;
+	ed_civac(w, (size_t)q0 * 4u);
+	for (unsigned q = 0; q < q0; q++)
+		if (__atomic_load_n(&w[q], __ATOMIC_RELAXED) == ED_SENT)
+			return 0;
+	return 1;
+}
+
+/* wait for a big armed entry and gather it slice by slice into y */
+static int ed_big(struct charsiu_npu *g, int id, float *y, unsigned sent)
+{
+	struct npu_entry *e = &g->ent[id];
+	unsigned ns = e->n_slices, ks = e->k_slices, left = ns, fenced = 0;
+	unsigned char nxt[64];
+	int grp = tensor_grouped(g, e->t), drained = 0;
+	int fastc = convert_one_for(g, e);
+	float *af = grp ? y : g->accf;
+	double hs = 0.0, t0 = now_us();
+
+	ed_drop(g, &id, 1);
+	memset(nxt, 0, sizeof(nxt));
+	while (left) {
+		int prog = 0;
+
+		for (unsigned ni = 0; ni < ns; ni++) {
+			while (nxt[ni] < ks) {
+				const struct npu_slot *sl = &g->slot[e->first
+						+ nxt[ni] * ns + ni];
+				const float *fo;
+
+				if (!(fenced & (1u << sl->di)) &&
+				    !ed_slot_done(e, sl))
+					break;
+				fo = (const float *)ed_region(e, sl);
+				if (fastc) {
+					convert_one(y + sl->n0, fo,
+						    e->t->scale + sl->n0,
+						    sl->job.mm.n);
+					nxt[ni]++;
+					prog = 1;
+					left--;
+					continue;
+				}
+				if (nxt[ni] == 0)
+					memset(af + sl->n0, 0,
+					       (size_t)sl->job.mm.n * sizeof(*af));
+				if (grp) {
+					scaled_add(af + sl->n0, fo, sl->sc,
+						   sl->job.mm.n);
+				} else {
+					for (unsigned q = 0; q < sl->job.mm.n; q++)
+						af[sl->n0 + q] += fo[q];
+				}
+				nxt[ni]++;
+				prog = 1;
+				if (nxt[ni] < ks)
+					continue;
+				left--;
+				if (!grp)
+					for (unsigned q = sl->n0;
+					     q < sl->n0 + sl->job.mm.n; q++)
+						y[q] = (float)(((double)g->accf[q]
+							+ hs) * e->t->scale[q]);
+			}
+		}
+		if (!left || prog)
+			continue;
+		for (unsigned d = 0; d < g->ndev; d++)
+			if ((sent & (1u << d)) && !(fenced & (1u << d)) &&
+			    !charsiu_bo_poll(g->dev[d], &e->out[d])) {
+				fenced |= 1u << d;
+				ed_fence[d]++;
+			}
+		if (!drained)
+			drained = ed_step(16384);
+		if (now_us() - t0 > 2e6) {
+			for (unsigned d = 0; d < g->ndev; d++)
+				if ((sent & (1u << d)) && !(fenced & (1u << d))) {
+					if (charsiu_bo_prep(g->dev[d], &e->out[d],
+							    2000000000))
+						return -1;
+					fenced |= 1u << d;
+				}
+		}
+	}
+	for (unsigned d = 0; d < g->ndev; d++)
+		if ((sent & (1u << d)) && !(fenced & (1u << d)))
+			ed_early[d]++;
+	e->armed = 0;
+	return 0;
+}
+
+/* every entry armed on every device the call sends to */
+static int ed_ready(const struct charsiu_npu *g, const int *ids, unsigned n,
+		    unsigned sent)
+{
+	if (!early_done_on() || callprof() > 0)
+		return 0;
+	for (unsigned i = 0; i < n; i++) {
+		const struct npu_entry *e = &g->ent[ids[i]];
+		unsigned need = 0;
+
+		if (!ed_entry_ok(g, e))
+			return 0;
+		for (unsigned j = 0; j < e->count; j++)
+			need |= 1u << g->slot[e->first + j].di;
+		if ((e->armed & need) != need || (need & ~sent))
+			return 0;
+	}
+	return 1;
+}
+
 int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		       const struct charsiu_act *a, float *y)
 {
@@ -3856,8 +5250,14 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	const int32_t *out;
 	unsigned nh = 0, i;
 	double t0, tpack, tcall = now_us();
+	double cp_s0[2] = { 0, 0 }, cp_s1[2] = { 0, 0 }, cp_d[2] = { 0, 0 };
+	double cp_mb[2] = { 0, 0 }, tpacked = 0.0;
+	unsigned cp_nt[2] = { 0, 0 };
+	int big_done = 0;
 	float *af;
 
+	if (alt_id(g, id))
+		return charsiu_npu_matvec(g->alt, id - NPU_ALT_ID, a, y);
 	if (g->dead || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
 	charsiu_note("a matvec on one tensor", (unsigned long)id,
@@ -3884,11 +5284,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 */
 	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
+	uint64_t kneed = pack_needed_on() ? kmask_for(g, e, d) : ~0ull;
+
+	if (!kneed)
+		continue;               /* no task of this tensor on d */
 	if (g->inprep)
 		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
 
+		if (ki < 64 && !(kneed & (1ull << ki)))
+			continue;
 		if (w4_for(g, e->t)) {
 			const float *src = a->f + s->k0;
 			const float *ks = e->t->kscale;
@@ -3943,12 +5349,13 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev[d], &g->in[d]);
+	in_flush(g, d, kneed, e->k_slices);
 	g->infini_b += g->in[d].size;
 	g->inneed_b += (uint64_t)e->k_slices * g->in_stride;
 	g->infini_n++;
 	}
-	g->pack_us += now_us() - tpack;
+	tpacked = now_us();
+	g->pack_us += tpacked - tpack;
 	/*
 	 * WHICH DEVICES WERE ACTUALLY GIVEN WORK, because the sync below
 	 * used to ask both regardless.
@@ -3990,6 +5397,8 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * slices of this tensor alternate between the devices, so a projection
 	 * that is not part of a group still uses both cores.
 	 */
+	if (callprof() == 2)
+		cp_fill(g, &id, 1);
 	t0 = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
 		unsigned nt = 0;
@@ -4004,12 +5413,18 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			g->tasks[nt].regcmd = (uint32_t)s->regcmd.dma_address;
 			g->tasks[nt].regcmd_count = s->nreg;
 			nt++;
-			g->handles[nh++] = s->wt.handle;
-			g->handles[nh++] = s->coef.handle;
+			if (!lean_handles_on()) {
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+			}
+			cp_mb[d] += slice_mb(w4_for(g, e->t), s->job.mm.k,
+					     s->job.mm.n);
 		}
 		if (!nt)
 			continue;
 		sent |= 1u << d;
+		cp_nt[d] = nt;
+		cp_s0[d] = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
 		jl.in_handles = g->handles;
@@ -4020,6 +5435,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			g->strikes = 3;
 			break;
 		}
+		cp_s1[d] = now_us();
 		g->submits++;
 	}
 	g->submit_us += now_us() - t0;
@@ -4043,6 +5459,30 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	if (g->strikes < 3) {
 		double t1 = now_us();
 
+		if (callprof() > 0) {
+			struct charsiu_bo *cpb[2] = { &e->out[0], &e->out[1] };
+
+			if (callprof() == 2)
+				cp_wait2(g, sent, cpb, cp_d);
+			else
+				cp_wait(g, sent, cpb, cp_d);
+		}
+		if (ed_ready(g, &id, 1, sent)) {
+			if (e->t->n > early_done_maxn()) {
+				if (ed_big(g, id, y, sent))
+					g->strikes = 3;
+				else
+					big_done = 1;
+			} else if (ed_wait(g, &id, 1, sent)) {
+				g->strikes = 3;
+			}
+		} else {
+		if (early_done_on()) {
+			ed_drop(g, &id, 1);
+			e->armed = 0;
+			ed_plain++;
+			ed_step(65536);
+		}
 		for (unsigned d = 0; d < g->ndev; d++)
 			if (sent & (1u << d)) {
 				charsiu_bo_prep(g->dev[d], &e->out[d],
@@ -4050,6 +5490,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 				g->outprep_b += e->out[d].size;
 				g->outprep_n++;
 			}
+		}
 		/* and what the same slots would need at their own widths */
 		for (i = 0; i < e->count; i++) {
 			const struct npu_slot *s_ = &g->slot[e->first + i];
@@ -4060,6 +5501,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		}
 		g->fence_us += now_us() - t1;
 		t1 = now_us();
+		cp_tprep = t1;
 		int grp = tensor_grouped(g, e->t);
 
 		/*
@@ -4075,6 +5517,19 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		 * written for no reason.
 		 */
 		af = (w4_for(g, e->t) && grp && !g->plain) ? y : g->accf;
+		if (big_done)
+			goto gathered;
+		if (convert_one_for(g, e)) {
+			for (i = 0; i < e->count; i++) {
+				const struct npu_slot *s = &g->slot[e->first + i];
+
+				convert_one(y + s->n0, (const float *)((const
+					    uint8_t *)e->out[s->di].map
+					    + s->out_slot * e->out_stride),
+					    e->t->scale + s->n0, s->job.mm.n);
+			}
+			goto gathered;
+		}
 		/* the hardware's rows only: the CPU's are already written */
 		if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
@@ -4117,6 +5572,7 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			for (unsigned j = 0; j < s->job.mm.n; j++)
 				g->acc[s->n0 + j] += out[j];
 		}
+gathered:
 		g->copy_us += now_us() - t1;
 		t1 = now_us();
 		/* the same mask: a buffer nobody prepped must not be finied,
@@ -4198,11 +5654,17 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 	 * returns sum_k code(n,k) * a(k) in float and only the weight scale is
 	 * left. int8 took a->q1 and needs both.
 	 */
+	if (callprof() > 0)
+		cp_record(e->t->name, tcall, tpacked, cp_s0, cp_s1, cp_d, sent,
+			  cp_nt, cp_mb, now_us());
+	if (early_done_on())
+		ed_queue(g, id);
 	{
 		int grp = tensor_grouped(g, e->t);
 		double hs = 0.0;
 
-		if (w4_for(g, e->t) && grp && !g->plain) {
+		if ((w4_for(g, e->t) && grp && !g->plain) || big_done ||
+		    convert_one_for(g, e)) {
 			g->call_us += now_us() - tcall;
 			charsiu_note("something outside the NPU code", 0, 0);
 	return 0;              /* it was summed into y */
@@ -4210,6 +5672,11 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 		if (g->midrise && !grp)
 			for (unsigned ki = 0; ki < e->k_slices; ki++)
 				hs += 0.5 * g->asum[ki];
+		if (g->exact8) {
+			for (i = 0; i < (unsigned)e->t->n; i++)
+				y[i] = exact8_y(g->acc[i], e->t->scale[i],
+						a->d1);
+		} else
 		for (i = 0; i < (unsigned)e->t->n; i++)
 			y[i] = w4_for(g, e->t)
 			     ? (grp ? g->accf[i]
@@ -4218,6 +5685,237 @@ int charsiu_npu_matvec(struct charsiu_npu *g, int id,
 			     : (float)g->acc[i] * a->d1 * e->t->scale[i];
 	}
 	g->call_us += now_us() - tcall;
+	charsiu_note("something outside the NPU code", 0, 0);
+	return 0;
+}
+
+/*
+ * ---- ONE PROJECTION IN TWO PARTS, EACH PART ONE CORE'S K SLICES ----
+ *
+ * The callprof table says what a decode layer spends between attention and
+ * its output projection: attention is 220-260 us of CPU with both cores
+ * idle, and then o proj is a 0.52 MB job on EACH core (K = 2048 at KMAX 1024
+ * is two K slices, dealt one to a core) that cannot start until the last head
+ * is written. But the first K slice only reads the first half of the heads.
+ *
+ * So this splits the call where the deal already split it: when every K
+ * slice lives on one device and each device's slices are one contiguous run
+ * of K, part 0 is the first device's run and part 1 the second's. The caller
+ * finishes the heads part 0 reads, hands them over with charsiu_npu_part_go,
+ * and that core streams its weights while the CPU computes the rest of the
+ * heads; part 1 goes when they are done, and charsiu_npu_part_end waits and
+ * sums.
+ *
+ * NOTHING ABOUT THE ARITHMETIC MOVES. Each device reads exactly the slices
+ * of the activation it read before, packed by the same packer at the same
+ * offsets; the jobs are the same register streams; and the gather below is
+ * the gather in charsiu_npu_matvec, slot by slot in the same order into the
+ * same zeroed accumulator, so every output element is summed over its K
+ * slices in m1 order exactly as before. Only WHEN each core starts changes.
+ *
+ * Narrow on purpose: int4, grouped scales, no CPU rows, no midrise/plain
+ * controls, one main device (no alt). Anything else answers 0 from
+ * charsiu_npu_kparts and the caller takes the ordinary call.
+ *
+ * AND IT BUYS NOTHING, MEASURED. CM5, Qwen3-0.6B, two rounds: attention
+ * 6.6 -> 8.6 ms a token and o proj 5.3 -> 3.2, the sum unchanged to 0.1 ms.
+ * Only part 0's core is hidden behind the second half of the heads; part 1
+ * still starts after the last head with its whole job latency ahead of it,
+ * and the extra pack, submit and second fan-out of the heads eat what part 0
+ * saved. CHARSIU_NPU_WO_PARTS stays off; it is the instrument, not a win.
+ */
+static struct {
+	int id;                 /* the entry in flight, -1 when none */
+	unsigned sent;          /* devices submitted */
+	unsigned dev[2];        /* the device of part 0 and of part 1 */
+	unsigned kcut;          /* the first K slice of part 1 */
+	double tcall, t0;
+} kp = { -1, 0, { 0, 0 }, 0, 0.0, 0.0 };
+
+int charsiu_npu_kparts(const struct charsiu_npu *g, int id, unsigned *kcol)
+{
+	const struct npu_entry *e;
+	unsigned ki, ni, cut = 0, d0;
+
+	if (!g || g->dead || g->ndev != 2 || id < 0 || alt_id(g, id) ||
+	    (unsigned)id >= g->n_ent)
+		return 0;
+	e = &g->ent[id];
+	if (!w4_for(g, e->t) || !tensor_grouped(g, e->t) || g->plain ||
+	    g->midrise || e->cq || e->t->kscale || e->k_slices < 2 ||
+	    e->n_npu != (unsigned)e->t->n ||
+	    e->count != e->k_slices * e->n_slices)
+		return 0;
+	d0 = g->slot[e->first].di;
+	for (ki = 0; ki < e->k_slices; ki++) {
+		unsigned dk = g->slot[e->first + ki * e->n_slices].di;
+
+		for (ni = 1; ni < e->n_slices; ni++)
+			if (g->slot[e->first + ki * e->n_slices + ni].di != dk)
+				return 0;   /* a K slice split across cores */
+		if (dk != d0 && !cut)
+			cut = ki;
+		if (cut && dk == d0)
+			return 0;           /* not one run a device */
+	}
+	if (!cut)
+		return 0;                   /* all on one core */
+	if (kcol)
+		*kcol = g->slot[e->first + cut * e->n_slices].k0;
+	return 1;
+}
+
+int charsiu_npu_part_go(struct charsiu_npu *g, int id,
+			const struct charsiu_act *a, unsigned part)
+{
+	struct npu_entry *e;
+	struct charsiu_joblist jl;
+	unsigned d, ki, k_lo, k_hi, nt = 0, nh = 0, i;
+	double tpack;
+
+	if (part == 0) {
+		unsigned kc;
+
+		if (kp.id >= 0 || !charsiu_npu_kparts(g, id, &kc))
+			return -1;
+		e = &g->ent[id];
+		if (early_done_on())
+			ed_drop(g, &id, 1);
+		kp.id = id;
+		kp.sent = 0;
+		kp.dev[0] = g->slot[e->first].di;
+		kp.dev[1] = kp.dev[0] ^ 1u;
+		for (ki = 0; ki < e->k_slices; ki++)
+			if (g->slot[e->first + ki * e->n_slices].k0 == kc)
+				break;
+		kp.kcut = ki;
+		kp.tcall = now_us();
+	} else if (part != 1 || kp.id != id) {
+		return -1;
+	}
+	e = &g->ent[id];
+	if (g->dead || (unsigned)a->n != e->t->k)
+		return -1;
+	d = kp.dev[part];
+	k_lo = part ? kp.kcut : 0;
+	k_hi = part ? e->k_slices : kp.kcut;
+
+	charsiu_note("a projection part: packing", (unsigned long)id,
+		     (unsigned long)part);
+	tpack = now_us();
+	if (g->inprep)
+		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
+	for (ki = k_lo; ki < k_hi; ki++) {
+		const struct npu_slot *s = &g->slot[e->first + ki * e->n_slices];
+
+		charsiu_pack_input_f16(&s->job.mm, a->f + s->k0,
+				       (uint8_t *)g->in[d].map
+				       + ki * g->in_stride, g->in_stride);
+	}
+	{
+		uint64_t km = 0;
+
+		for (ki = k_lo; ki < k_hi && ki < 64; ki++)
+			km |= 1ull << ki;
+		in_flush(g, d, e->k_slices <= 64 ? km : ~0ull, e->k_slices);
+	}
+	g->infini_b += g->in[d].size;
+	g->inneed_b += (uint64_t)(k_hi - k_lo) * g->in_stride;
+	g->infini_n++;
+	g->pack_us += now_us() - tpack;
+
+	g->handles[nh++] = g->in[d].handle;
+	for (i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+
+		if (s->di != d)
+			continue;
+		g->tasks[nt].regcmd = (uint32_t)s->regcmd.dma_address;
+		g->tasks[nt].regcmd_count = s->nreg;
+		nt++;
+		if (!lean_handles_on()) {
+			g->handles[nh++] = s->wt.handle;
+			g->handles[nh++] = s->coef.handle;
+		}
+	}
+	jl.tasks = g->tasks;
+	jl.task_count = nt;
+	jl.in_handles = g->handles;
+	jl.in_count = nh;
+	jl.out_handles = &e->out[d].handle;
+	jl.out_count = 1;
+	tpack = now_us();
+	if (part == 0)
+		kp.t0 = tpack;
+	if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+		g->strikes = 3;
+		return -1;
+	}
+	g->submit_us += now_us() - tpack;
+	g->submits++;
+	kp.sent |= 1u << d;
+	return 0;
+}
+
+int charsiu_npu_part_end(struct charsiu_npu *g, int id, float *y)
+{
+	struct npu_entry *e;
+	unsigned sent = kp.sent, i;
+	int ok;
+	double t1, took;
+
+	if (kp.id != id || id < 0)
+		return -1;
+	e = &g->ent[id];
+	kp.id = -1;
+	kp.sent = 0;
+	e->armed = 0;           /* the device has written over any sentinel */
+	ok = sent == 3u && g->strikes < 3;
+
+	/* WAIT FOR WHATEVER WENT, even on failure: the input buffers are
+	 * about to be rewritten by the fallback */
+	t1 = now_us();
+	for (unsigned d = 0; d < g->ndev; d++)
+		if (sent & (1u << d)) {
+			if (charsiu_bo_prep(g->dev[d], &e->out[d], 2000000000))
+				ok = 0;
+			g->outprep_b += e->out[d].size;
+			g->outprep_n++;
+		}
+	g->fence_us += now_us() - t1;
+	if (!ok) {
+		if (g->strikes >= 3 && !g->dead) {
+			g->dead = 1;
+			fprintf(stderr, "charsiu: the NPU stopped answering on a "
+				"projection in parts (K=%u N=%u); everything from "
+				"here runs on the CPU\n", (unsigned)e->t->k,
+				(unsigned)e->t->n);
+		}
+		return -1;
+	}
+
+	/* the gather of charsiu_npu_matvec's grouped int4 branch, verbatim */
+	t1 = now_us();
+	memset(y, 0, (size_t)e->n_npu * sizeof(*y));
+	for (i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+		const float *fo = (const float *)((const uint8_t *)
+				  e->out[s->di].map + s->out_slot * e->out_stride);
+
+		scaled_add(y + s->n0, fo, s->sc, s->job.mm.n);
+	}
+	g->copy_us += now_us() - t1;
+	if (!g->nofini)
+		for (unsigned d = 0; d < g->ndev; d++)
+			charsiu_bo_fini(g->dev[d], &e->out[d]);
+	g->weight_mb += e->weight_mb;
+	took = now_us() - kp.t0;
+	g->busy_us += took;
+	g->mv_busy_us += took;
+	account_call(g, &id, 1, took);
+	g->strikes = 0;
+	g->call_us += now_us() - kp.tcall;
+	g->kparts_calls++;
 	charsiu_note("something outside the NPU code", 0, 0);
 	return 0;
 }
@@ -4561,6 +6259,9 @@ static int batch_bufs(struct charsiu_npu *g, unsigned m, unsigned nks,
 {
 	size_t ins, regs;
 
+	/* which bank first: everything below is about the live one */
+	if (bank_select(g, m))
+		return -1;
 	if (g->bm >= m && g->bnks >= nks && g->bnslots >= nslots)
 		return 0;
 	reuse_keys_drop(g->bin_key, 2);   /* BOs replaced */
@@ -4741,7 +6442,9 @@ void charsiu_npu_batch_pack_split(struct charsiu_npu *g, double *emit,
 
 double charsiu_npu_batch_wall(struct charsiu_npu *g, int reset)
 {
-	double v = g->bwall_us / 1e3;
+	/* alt's calls are inside the main device's callers' clocks too */
+	double v = g->bwall_us / 1e3
+		 + (g->alt ? charsiu_npu_batch_wall(g->alt, reset) : 0.0);
 
 	if (reset)
 		g->bwall_us = 0.0;
@@ -4765,6 +6468,13 @@ double charsiu_npu_batch_scale(struct charsiu_npu *g, int reset)
 	if (reset)
 		g->bscale_us = 0.0;
 	return v;
+}
+
+double charsiu_npu_batch_prewarmed(const struct charsiu_npu *g, unsigned *n)
+{
+	if (n)
+		*n = g ? g->bprewarm_n : 0;
+	return g ? g->bprewarm_us / 1e3 : 0.0;
 }
 
 double charsiu_npu_batch_alloc(struct charsiu_npu *g, unsigned *n, int reset)
@@ -4925,6 +6635,40 @@ static int batch_serial_for(unsigned m)
 	return !(parallel_min_m() && m >= parallel_min_m());
 }
 
+/*
+ * THE SERIAL PAIR, PIPELINED ON THE CPU SIDE. CHARSIU_NPU_MM_PIPE=0 is the
+ * old order.
+ *
+ * Serialised (batch_serial_for), a batched call used to run strictly in
+ * series: pack d0 | hw d0 | pack d1 | hw d1 | read d0 | read d1 | scale.
+ * The guard is about the two CORES never computing at the same time, and
+ * says nothing about the CPU, so with this on it runs
+ *
+ *   pack d0 | hw d0              | hw d1                    |
+ *           | pack d1 (CPU)      | read d0, scale d0-only   | read d1 | scale
+ *
+ * and device 1 is still not submitted until device 0's fence has returned.
+ * Every read is the same batch_read_device on the same buffer with the same
+ * first-write flags, in the same ascending device order, so the sums are the
+ * same sums: this moves WHEN a read runs, never what it adds or in what
+ * order. CHARSIU_NPU_SUBMIT_FIRST=1 reverses the submit order and would put
+ * device 1's read before device 0's, so it keeps the old order.
+ */
+static int mm_pipe(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_MM_PIPE", 1);
+	return v;
+}
+
+static int mm_pipe_for(const struct charsiu_npu *g, unsigned m)
+{
+	return g->ndev == 2 && batch_serial_for(m) && !submit_first() &&
+	       mm_pipe();
+}
+
 /* CHARSIU_NPU_PACK_GATHER=1: gather every K slice into scratch before packing,
  * which is what this did before the stride, and the control for measuring it */
 static int pack_gather(void)
@@ -4978,8 +6722,19 @@ static int batch_zero(void)
  * pool is zeroed as it grows: charsiu_bo_free returns immediately on a NULL
  * map, and every path into the allocation below frees before it allocates.
  */
+static struct npu_outbuf *batch_outbuf_t(struct charsiu_npu *g, unsigned wide,
+					 unsigned slots, unsigned m,
+					 unsigned tile);
+
 static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 				       unsigned slots, unsigned m)
+{
+	return batch_outbuf_t(g, wide, slots, m, 0);
+}
+
+static struct npu_outbuf *batch_outbuf_t(struct charsiu_npu *g, unsigned wide,
+					 unsigned slots, unsigned m,
+					 unsigned tile)
 {
 	struct npu_outbuf *ob = NULL;
 	double ta;
@@ -4994,6 +6749,8 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 	 */
 	for (unsigned i = 0; i < g->n_obuf; i++)
 		if (g->obuf[i].wide == wide && g->obuf[i].slots == slots &&
+		    g->obuf[i].small == is_small_m(m) &&
+		    g->obuf[i].tile == tile &&
 		    !g->obuf[i].pending) {
 			ob = &g->obuf[i];
 			break;
@@ -5017,6 +6774,8 @@ static struct npu_outbuf *batch_outbuf(struct charsiu_npu *g, unsigned wide,
 		ob = &g->obuf[g->n_obuf++];
 		ob->wide = wide;
 		ob->slots = slots;
+		ob->small = is_small_m(m);
+		ob->tile = tile;
 	}
 	/*
 	 * WAIT FOR ANYTHING STILL WRITING IT BEFORE HANDING IT ON.
@@ -5205,6 +6964,23 @@ static double fence_bo(struct charsiu_npu *g, unsigned d, struct charsiu_bo *bo)
  * was measured 37% slower once and attributed to the index deal that has since
  * been fixed, and has not been re-measured against the deal that replaced it.
  */
+/*
+ * WHAT THE FIRST K SLICE OF A RANGE IS ADDED TO, and why it is not assigned.
+ *
+ * charsiu_npu_matvec clears its accumulator and adds every slice to it, so
+ * its first slice lands as 0.0f + v, which is v except that -0 becomes +0
+ * (and its accumulator is never -0 after that). The batched gather used to
+ * ASSIGN the first slice and so kept a -0 the m = 1 path never produces.
+ * Adding to +0 is the m = 1 arithmetic exactly. CHARSIU_NPU_GATHER_OLD=1
+ * returns -0, and -0.0f + v is v bit for bit, so the old assign is back
+ * without a second copy of every loop. One add an element of the first
+ * slice only; the loops are bound by the scattered reads, not by adds.
+ */
+static inline float first_zero(const struct charsiu_npu *g)
+{
+	return g->gather_old ? -0.0f : 0.0f;
+}
+
 struct read_rows {
 	struct charsiu_npu *g;
 	const struct npu_entry *e;
@@ -5214,6 +6990,9 @@ struct read_rows {
 	float *Y;
 	unsigned m, sn, ki;
 	int grp, firstw;
+	/* the last K slice of this range: y = (y + v) * ts[j] */
+	int lastw;
+	const float *ts;	/* e->t->scale + s->n0 when lastw */
 };
 
 /*
@@ -5232,6 +7011,7 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned sn = c->sn, n4 = sn / 4, j;
 	int firstw = c->firstw;
+	const float z0 = first_zero(g);
 	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
 	if (g->read4 != 2 || !w4_for(g, e->t) || !g->bmap2 || r0 % 2 || nr % 2)
@@ -5240,6 +7020,55 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
 		float *y0 = Y + (size_t)r * e->t->n + s->n0;
 		float *y1 = y0 + e->t->n;
+
+		/*
+		 * THE LAST SLICE CARRIES THE TAIL SCALE: the same add the
+		 * branch below does, then the same multiply tail_scale_rows
+		 * would have done on the stored value, in that order and
+		 * rounded at each step. Ungrouped only (sc is NULL), so the
+		 * plain branch's `fp * 1.0f` is fp exactly.
+		 */
+		if (c->lastw && !sc) {
+			const float *ts = c->ts;
+
+			for (j = 0; j < n4; j++) {
+				const float *fp = fo + mp[j];
+				unsigned q = j * 4;
+
+				if (firstw) {
+					y0[q + 0] = (z0 + fp[0]) * ts[q + 0];
+					y0[q + 1] = (z0 + fp[1]) * ts[q + 1];
+					y0[q + 2] = (z0 + fp[2]) * ts[q + 2];
+					y0[q + 3] = (z0 + fp[3]) * ts[q + 3];
+					y1[q + 0] = (z0 + fp[4]) * ts[q + 0];
+					y1[q + 1] = (z0 + fp[5]) * ts[q + 1];
+					y1[q + 2] = (z0 + fp[6]) * ts[q + 2];
+					y1[q + 3] = (z0 + fp[7]) * ts[q + 3];
+				} else {
+					y0[q + 0] = (y0[q + 0] + fp[0]) * ts[q + 0];
+					y0[q + 1] = (y0[q + 1] + fp[1]) * ts[q + 1];
+					y0[q + 2] = (y0[q + 2] + fp[2]) * ts[q + 2];
+					y0[q + 3] = (y0[q + 3] + fp[3]) * ts[q + 3];
+					y1[q + 0] = (y1[q + 0] + fp[4]) * ts[q + 0];
+					y1[q + 1] = (y1[q + 1] + fp[5]) * ts[q + 1];
+					y1[q + 2] = (y1[q + 2] + fp[6]) * ts[q + 2];
+					y1[q + 3] = (y1[q + 3] + fp[7]) * ts[q + 3];
+				}
+			}
+			for (j = n4 * 4; j < sn; j++) {
+				unsigned base = mp[j / 4] + j % 4;
+				float v0 = fo[base], v1 = fo[base + 4];
+
+				if (firstw) {
+					y0[j] = (z0 + v0) * ts[j];
+					y1[j] = (z0 + v1) * ts[j];
+				} else {
+					y0[j] = (y0[j] + v0) * ts[j];
+					y1[j] = (y1[j] + v1) * ts[j];
+				}
+			}
+			continue;
+		}
 
 #define ROW2(OP, S0, S1, S2, S3)                                             \
 		for (j = 0; j < n4; j++) {                                   \
@@ -5251,10 +7080,10 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 			y1[q + 2] OP fp[6] * S2; y1[q + 3] OP fp[7] * S3;    \
 		}
 		if (sc) {
-			if (firstw) { ROW2(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			if (firstw) { ROW2(= z0 +, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 			else        { ROW2(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 		} else {
-			if (firstw) { ROW2(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			if (firstw) { ROW2(= z0 +, 1.0f, 1.0f, 1.0f, 1.0f) }
 			else        { ROW2(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
 		}
 #undef ROW2
@@ -5263,7 +7092,7 @@ static int read_rows2(struct read_rows *c, uint64_t r0, uint64_t nr)
 			float s0 = sc ? sc[j] : 1.0f;
 			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0;
 
-			if (firstw) { y0[j] = v0; y1[j] = v1; }
+			if (firstw) { y0[j] = z0 + v0; y1[j] = z0 + v1; }
 			else        { y0[j] += v0; y1[j] += v1; }
 		}
 	}
@@ -5306,9 +7135,13 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned sn = c->sn, n4 = sn / 4, j;
 	int firstw = c->firstw;
+	const float z0 = first_zero(g);
 	const float *sc = w4_for(g, e->t) && c->grp ? s->sc : NULL;
 
 	if (g->read4 != 4 || !w4_for(g, e->t) || !g->bmap4 || r0 % 4 || nr % 4)
+		return 0;
+	/* the four row form has no fused tail; the row loop has one */
+	if (c->lastw)
 		return 0;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r += 4) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -5329,10 +7162,10 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 			y3[q + 2] OP fp[14] * S2; y3[q + 3] OP fp[15] * S3;  \
 		}
 		if (sc) {
-			if (firstw) { ROW4(=,  sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
+			if (firstw) { ROW4(= z0 +, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 			else        { ROW4(+=, sc[j * 4], sc[j * 4 + 1], sc[j * 4 + 2], sc[j * 4 + 3]) }
 		} else {
-			if (firstw) { ROW4(=,  1.0f, 1.0f, 1.0f, 1.0f) }
+			if (firstw) { ROW4(= z0 +, 1.0f, 1.0f, 1.0f, 1.0f) }
 			else        { ROW4(+=, 1.0f, 1.0f, 1.0f, 1.0f) }
 		}
 #undef ROW4
@@ -5343,7 +7176,7 @@ static int read_rows4(struct read_rows *c, uint64_t r0, uint64_t nr)
 			float v0 = fo[base] * s0, v1 = fo[base + 4] * s0,
 			      v2 = fo[base + 8] * s0, v3 = fo[base + 12] * s0;
 
-			if (firstw) { y0[j] = v0; y1[j] = v1; y2[j] = v2; y3[j] = v3; }
+			if (firstw) { y0[j] = z0 + v0; y1[j] = z0 + v1; y2[j] = z0 + v2; y3[j] = z0 + v3; }
 			else        { y0[j] += v0; y1[j] += v1; y2[j] += v2; y3[j] += v3; }
 		}
 	}
@@ -5447,6 +7280,7 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 	const struct npu_entry *e = c->e;
 	unsigned sn = c->sn, n4 = sn / 4, j, t;
 	int firstw = c->firstw;
+	const float z0 = first_zero(g);
 
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
 		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
@@ -5493,8 +7327,8 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 				}
 			}
 			if (firstw) {
-				yr[j * 4 + 0] = v0; yr[j * 4 + 1] = v1;
-				yr[j * 4 + 2] = v2; yr[j * 4 + 3] = v3;
+				yr[j * 4 + 0] = z0 + v0; yr[j * 4 + 1] = z0 + v1;
+				yr[j * 4 + 2] = z0 + v2; yr[j * 4 + 3] = z0 + v3;
 			} else {
 				yr[j * 4 + 0] += v0; yr[j * 4 + 1] += v1;
 				yr[j * 4 + 2] += v2; yr[j * 4 + 3] += v3;
@@ -5519,11 +7353,103 @@ static void read_fused_rows(void *ctx, uint64_t r0, uint64_t nr)
 				v = t ? v + u : u;
 			}
 			if (firstw)
-				yr[j] = v;
+				yr[j] = z0 + v;
 			else
 				yr[j] += v;
 		}
 	}
+}
+
+/*
+ * CHARSIU_NPU_PACK2, THE SECOND ACTIVATION PACK. Default on; =0 is the pack
+ * exactly as it was. The three parts have their own controls so one binary
+ * can price each in one session (the board drifts between sessions):
+ *
+ *   CHARSIU_NPU_PACK2_COPY=0    the second device packs X again
+ *   CHARSIU_NPU_PACK2_DIRECT=0  a cut tensor's slice is gathered into bscr
+ *   CHARSIU_NPU_PACK2_ROWS=0    the pool splits the packer by groups
+ *
+ * Every one of them writes the same bytes into the input object; see
+ * batch_pack_slice and tests/pack2.c.
+ *
+ * WHY THE OLD PACK MOVED 0.3 GB/s. Not the ioctls and not the pool: on the
+ * CM5's A72 the integer fp16 converter alone tops out at 1.34 GB/s of halves
+ * from a hot cache on one core, the group order read m rows a page apart for
+ * every eight floats, and a cut tensor's slice was first copied into bscr and
+ * read back. Qwen3-0.6B, 124 rows in one chunk, CHARSIU_STAGES ms a row,
+ * three interleaved runs:
+ *
+ *   arm              gather   packer   pack (with emit, fini)
+ *   final6           0.20     0.69-0.71   1.08-1.13
+ *   PACK2=0          0.21     0.66-0.71   1.06-1.12
+ *   PACK2            0.00     0.44-0.46   0.63-0.69
+ *   PACK2_COPY=0     0.00     0.48-0.49   0.64-0.67
+ *
+ * The copy is the smallest part: with the cores overlapped most K slices
+ * live on one device only (227 of 787 slices were copies).
+ */
+static int pack2_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PACK2", 1);
+	return v;
+}
+
+static int pack2_copy(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = pack2_on() ? charsiu_env_flag("CHARSIU_NPU_PACK2_COPY", 1)
+			       : 0;
+	return v;
+}
+
+static int pack2_direct(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = pack2_on() ? charsiu_env_flag("CHARSIU_NPU_PACK2_DIRECT", 1)
+			       : 0;
+	return v;
+}
+
+static int pack2_rows(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = pack2_on() ? charsiu_env_flag("CHARSIU_NPU_PACK2_ROWS", 1)
+			       : 0;
+	return v;
+}
+
+/* a new call: no device holds this call's X yet */
+static void pack2_call_reset(struct charsiu_npu *g)
+{
+	g->bpk_mask[0] = g->bpk_mask[1] = 0;
+}
+
+struct pack_copy_job {
+	const uint8_t *src;
+	uint8_t *dst;
+	size_t n;
+};
+
+#define PACK_COPY_CHUNK 16384
+
+static void pack_copy_worker(void *ctx, uint64_t c0, uint64_t nc)
+{
+	const struct pack_copy_job *j = ctx;
+	size_t a = (size_t)c0 * PACK_COPY_CHUNK;
+	size_t b = (size_t)(c0 + nc) * PACK_COPY_CHUNK;
+
+	if (b > j->n)
+		b = j->n;
+	memcpy(j->dst + a, j->src + a, b - a);
 }
 
 struct pack_groups_job {
@@ -5551,7 +7477,7 @@ static void pack_groups_worker(void *ctx, uint64_t g0, uint64_t ng)
  *   int8   pack 2.66  submit 0.09  fence 0.93  read 0.97  scale 0.25
  *
  * int8's fence and read are BOTH SMALLER -- its hardware path really is
- * faster, which is what PLAN.md has claimed since March -- and pack alone,
+ * faster, which is what the old PLAN.md had claimed since March -- and pack alone,
  * 3.1x wider, eats the whole advantage and 1.08 ms a row more. The tail scale
  * everybody suspected is 0.06 of it.
  *
@@ -5577,6 +7503,79 @@ struct qpack_job {
 	float *d1out;
 	unsigned sk;
 };
+
+/*
+ * exact8: EACH ROW'S d1 OVER ITS WHOLE K, ONCE A CALL, as charsiu_act_q1
+ * takes it for the row loop this replaces -- same comparison, same divide.
+ * The pack below reads it for every K slice of the row.
+ */
+struct exact8_job {
+	const float *X;
+	float *d1;
+	unsigned k;
+};
+
+static void exact8_rows_w(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct exact8_job *j = ctx;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const float *x = j->X + (size_t)r * j->k;
+		float amax = 0.0f;
+
+		for (unsigned i = 0; i < j->k; i++) {
+			float av = x[i] < 0.0f ? -x[i] : x[i];
+
+			if (av > amax)
+				amax = av;
+		}
+		j->d1[r] = amax / 127.0f;
+	}
+}
+
+static int exact8_rows(struct charsiu_npu *g, const float *X, unsigned m,
+		       unsigned k)
+{
+	struct exact8_job j;
+
+	if (g->bd1x_n < m) {
+		float *t = realloc(g->bd1x, (size_t)m * sizeof(*t));
+
+		if (!t)
+			return -1;
+		g->bd1x = t;
+		g->bd1x_n = m;
+	}
+	j.X = X;
+	j.d1 = g->bd1x;
+	j.k = k;
+	if (g->packpool && (size_t)m * k >= 65536)
+		charsiu_parallel_for(exact8_rows_w, &j, m);
+	else
+		exact8_rows_w(&j, 0, m);
+	return 0;
+}
+
+/* and the codes, through charsiu_act_q1's reciprocal and lrintf */
+static void exact8_qpack_w(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct qpack_job *j = ctx;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		const float *row = j->src + (size_t)r * j->sk;
+		uint8_t *out = j->dst + (size_t)r * j->sk;
+		float d = j->d1out[r];
+		float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+		for (unsigned kk = 0; kk < j->sk; kk++) {
+			int v = (int)lrintf(row[kk] * id);
+
+			if (v > 127) v = 127;
+			if (v < -127) v = -127;
+			out[kk] = (uint8_t)(v + 128);
+		}
+	}
+}
 
 static int qpack_plain(void)
 {
@@ -5656,6 +7655,14 @@ static void qpack_rows(void *ctx, uint64_t r0, uint64_t nr)
 	}
 }
 
+static void pack_rows_worker(void *ctx, uint64_t r0, uint64_t nr)
+{
+	struct pack_groups_job *j = ctx;
+
+	charsiu_pack_input_f16_rows(j->mm, j->src, j->stride, j->dst,
+				    (unsigned)r0, (unsigned)nr);
+}
+
 static void pack_f16_pooled(struct charsiu_npu *g,
 			    const struct charsiu_matmul *mm,
 			    const float *src, size_t stride,
@@ -5668,12 +7675,45 @@ static void pack_f16_pooled(struct charsiu_npu *g,
 		struct pack_groups_job pj = { mm, src, stride, dst };
 
 		charsiu_pack_input_f16_edges(mm, src, stride, dst, dst_size);
-		charsiu_parallel_for(pack_groups_worker, &pj, ng);
+		if (pack2_rows())
+			charsiu_parallel_for_grain(pack_rows_worker, &pj,
+						   mm->m, 4);
+		else
+			charsiu_parallel_for(pack_groups_worker, &pj, ng);
 		g->bpack_pooled++;
 		return;
 	}
 	charsiu_pack_input_f16_stride(mm, src, stride, dst, dst_size);
 	g->bpack_serial++;
+}
+
+/*
+ * exact8's gather: the K slices' raw accumulators summed AS INTEGERS, held in
+ * Y's own bytes until tail_scale_apply turns each into exact8_y. Integer adds
+ * do not round, so the order the slices arrive in cannot move the sum, and it
+ * is the int32 npu_matvec's idot sums to. memcpy, not a cast: Y is float.
+ */
+static void read_rows_exact8(struct read_rows *c, uint64_t r0, uint64_t nr)
+{
+	struct charsiu_npu *g = c->g;
+	const struct npu_entry *e = c->e;
+	const struct npu_slot *s = c->s;
+	unsigned sn = c->sn, j;
+
+	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
+		const uint32_t *mp = g->bmap + (size_t)r * g->bmap_n4;
+		float *yr = c->Y + (size_t)r * e->t->n + s->n0;
+
+		for (j = 0; j < sn; j++) {
+			int32_t v = c->io[mp[j / 4] + j % 4], o;
+
+			if (!c->firstw) {
+				memcpy(&o, yr + j, sizeof(o));
+				v += o;
+			}
+			memcpy(yr + j, &v, sizeof(v));
+		}
+	}
 }
 
 static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
@@ -5683,6 +7723,10 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 	const struct npu_entry *e = c->e;
 	const struct npu_slot *s = c->s;
 
+	if (g->exact8) {
+		read_rows_exact8(c, r0, nr);
+		return;
+	}
 	if (read_rows2(c, r0, nr) || read_rows4(c, r0, nr))
 		return;
 	const float *fo = c->fo;
@@ -5690,6 +7734,7 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 	float *Y = c->Y;
 	unsigned m = c->m, sn = c->sn, ki = c->ki;
 	int grp = c->grp, firstw = c->firstw;
+	const float z0 = first_zero(g);
 
 	(void)m; (void)ki; (void)grp; (void)io; (void)fo;
 	for (unsigned r = (unsigned)r0; r < (unsigned)(r0 + nr); r++) {
@@ -5761,7 +7806,17 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						yp[2] SC_##OP v2;            \
 						yp[3] SC_##OP v3;            \
 					}
-#define SC_ASSIGN  =
+#define GATHER4T(FIRST, VAL)                                                 \
+					for (j = 0; j < n4; j++) {           \
+						float *yp = yr + j * 4;      \
+						const float *tq = ts + j * 4; \
+						VAL;                         \
+						yp[0] = ((FIRST ? z0 : yp[0]) + v0) * tq[0]; \
+						yp[1] = ((FIRST ? z0 : yp[1]) + v1) * tq[1]; \
+						yp[2] = ((FIRST ? z0 : yp[2]) + v2) * tq[2]; \
+						yp[3] = ((FIRST ? z0 : yp[3]) + v3) * tq[3]; \
+					}
+#define SC_ASSIGN  = z0 +
 #define SC_ADD     +=
 #define W4G  const float *fp = fo + mp[j], *cp = s->sc + j * 4;              \
 	     float v0 = fp[0]*cp[0], v1 = fp[1]*cp[1],                       \
@@ -5779,8 +7834,21 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						for (j = n4 * 4; j < sn; j++) {
 							float v = fo[mp[j / 4] + j % 4] * sc[j];
 
-							if (firstw) yr[j] = v;
+							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
+						}
+					} else if (w4_for(g, e->t) && c->lastw) {
+						/* (z0 + v) * ts, (y + v) * ts:
+						 * the add, then the tail's
+						 * multiply on the stored value */
+						const float *ts = c->ts;
+
+						if (firstw) { GATHER4T(1, W4) }
+						else        { GATHER4T(0, W4) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = fo[mp[j / 4] + j % 4];
+
+							yr[j] = ((firstw ? z0 : yr[j]) + v) * ts[j];
 						}
 					} else if (w4_for(g, e->t)) {
 						if (firstw) { GATHER4(ASSIGN, W4) }
@@ -5788,8 +7856,22 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						for (j = n4 * 4; j < sn; j++) {
 							float v = fo[mp[j / 4] + j % 4];
 
-							if (firstw) yr[j] = v;
+							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
+						}
+					} else if (c->lastw) {
+						/* d1 inside v as always, the
+						 * channel scale after the add:
+						 * never d1 * ts premultiplied */
+						const float *ts = c->ts;
+						float d1 = g->bd1[(size_t)ki * m + r];
+
+						if (firstw) { GATHER4T(1, I8) }
+						else        { GATHER4T(0, I8) }
+						for (j = n4 * 4; j < sn; j++) {
+							float v = (float)io[mp[j / 4] + j % 4] * d1;
+
+							yr[j] = ((firstw ? z0 : yr[j]) + v) * ts[j];
 						}
 					} else {
 						float d1 = g->bd1[(size_t)ki * m + r];
@@ -5799,11 +7881,12 @@ static void read_rows(void *ctx, uint64_t r0, uint64_t nr)
 						for (j = n4 * 4; j < sn; j++) {
 							float v = (float)io[mp[j / 4] + j % 4] * d1;
 
-							if (firstw) yr[j] = v;
+							if (firstw) yr[j] = z0 + v;
 							else        yr[j] += v;
 						}
 					}
 #undef GATHER4
+#undef GATHER4T
 #undef SC_ASSIGN
 #undef SC_ADD
 #undef W4G
@@ -5883,6 +7966,165 @@ static int npu_noread(void)
 }
 
 /*
+ * THE TAIL SCALE ON THE LAST READ, NOT AS ITS OWN PASS.
+ *
+ * An ungrouped tensor's per channel scale was one more full read and write
+ * of Y after the gather -- 'scale' in the stage table, 0.26 to 0.31 ms a row
+ * on Qwen3-0.6B, where every k = 1024 projection is ungrouped. The gather
+ * already holds each element in a register for its last add, so the multiply
+ * rides on that store: y = (y + v) * scale[j] is exactly the add the read
+ * did, rounded, then the multiply tail_scale_rows did on the stored value,
+ * rounded -- -std=c11 does not contract it into an fma (the read's own note
+ * measured that), and d1 * scale is never formed.
+ *
+ * ONLY THE LAST SLICE CARRIES IT, which is what bseen counting tells the
+ * read: when a range's count reaches the tensor's K slices, that read is the
+ * last. A cut that put the multiply on every pass made the read 118 -> 152
+ * ms for nothing back. The count is order free -- device order, the pipe,
+ * the K order read and the deferred flush all just add -- and the deferred
+ * tensor keeps its own decision (pend.btailf) as it keeps its own bseen.
+ *
+ * NOT FUSED, the separate pass as before: grouped w4 (nothing to scale), the
+ * fused verify argmax (tail_skip: its pass scales), READ_FUSE (its own loop,
+ * off), the NO_READ ceiling, TAIL_PLAIN's control loop, and a grid the count
+ * cannot hold. CHARSIU_NPU_TAIL_FUSE=0 is the control.
+ */
+static int tail_fuse_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_TAIL_FUSE", 1);
+	return v;
+}
+
+static int tail_fuse_for(const struct charsiu_npu *g, const struct npu_entry *e)
+{
+	if (!tail_fuse_on() || g->tail_skip || g->readfuse || npu_noread() ||
+	    tail_plain() || g->exact8)
+		return 0;
+	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
+		return 0;
+	if (!e->n_slices || e->count % e->n_slices ||
+	    e->count / e->n_slices >= 255)
+		return 0;
+	return 1;
+}
+
+/*
+ * THE READ ORDER TABLE for width m, built where the read first needs it or
+ * earlier by charsiu_npu_prewarm. Keyed on m and the format alone; see the
+ * notes inside.
+ */
+static int bmap_build(struct charsiu_npu *g, const struct npu_entry *e,
+		      unsigned m)
+{
+	if (g->bmap_m != m ||
+	    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
+		unsigned n4 = (g->nmax + 3) / 4;
+		/*
+		 * A TABLE FOR ANOTHER WIDTH MAY BE PARKED. A row tiled call
+		 * reads at its block width and anything untiled at the call's
+		 * own, and one live table rebuilt between them would be built
+		 * on every call. The tables are the same function of
+		 * (m, w4) either way; parking only keeps them.
+		 */
+		struct bmap_park live = { g->bmap, g->bmap_m, g->bmap_n4,
+					  g->bmap_w4, g->bmap4, g->bmap2 }, t;
+
+		for (unsigned p = 0; p < 2; p++) {
+			struct bmap_park *q = &g->bmap_park[p];
+
+			if (q->bmap && q->m == m && q->n4 == n4 &&
+			    q->w4 == (unsigned)w4_for(g, e->t)) {
+				t = *q;
+				*q = live;
+				g->bmap = t.bmap;
+				g->bmap_m = t.m;
+				g->bmap_n4 = t.n4;
+				g->bmap_w4 = t.w4;
+				g->bmap4 = t.b4;
+				g->bmap2 = t.b2;
+				return 0;
+			}
+		}
+		/* park the live one, and build into the oldest parked one's
+		 * allocation */
+		t = g->bmap_park[1];
+		g->bmap_park[1] = g->bmap_park[0];
+		g->bmap_park[0] = live;
+		g->bmap = t.bmap;
+		g->bmap_m = 0;
+		g->bmap_w4 = 0;
+		uint32_t *t2 = realloc(g->bmap,
+			(size_t)m * n4 * sizeof(*t2));
+
+		if (!t2) {
+			whine(g, "the read order table would not allocate",
+			      m, g->nmax);
+			return -1;
+		}
+		g->bmap = t2;
+		g->bmap_n4 = n4;
+		/*
+		 * CHARSIU_NPU_READ_FLAT=1 BUILDS THE IDENTITY,
+		 * which is what this table would hold if the
+		 * accumulator came back row major.
+		 *
+		 * The gather through this permutation is the largest
+		 * single line in a prompt -- r407 put it at 1.96 ms a
+		 * row against the 1.82 of fence it waits behind -- and
+		 * every lever on the gather ITSELF is measured and
+		 * lost. The note above says why that is not the end of
+		 * it: "the read is at its floor FOR THIS ACCUMULATOR
+		 * LAYOUT", and the fp16 path at the same m and n comes
+		 * back FLAT.
+		 *
+		 * On the shipped stream reading flat is WRONG, and
+		 * that is the positive control: it says the knob
+		 * reaches the read. Paired with CHARSIU_W4_F16DPU it
+		 * asks whether any register that differs between the
+		 * fp16 and int4 output stages puts the answer there.
+		 */
+		{
+			int flat = charsiu_env_flag(
+				"CHARSIU_NPU_READ_FLAT", 0);
+
+			for (unsigned r = 0; r < m; r++)
+				for (unsigned j = 0; j < n4; j++)
+					g->bmap[(size_t)r * n4 + j] =
+					  flat
+					  ? (uint32_t)((size_t)r
+						* g->nmax + j * 4)
+					  : (uint32_t)charsiu_acc_index(r, j * 4, m,
+						w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
+		}
+		g->bmap_m = m;
+		g->bmap_w4 = (unsigned)w4_for(g, e->t);
+		/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
+		g->bmap2 = m % 2 == 0;
+		for (unsigned r = 0; g->bmap2 && r < m; r += 2)
+			for (unsigned j = 0; g->bmap2 && j < n4; j++)
+				if (g->bmap[(size_t)(r + 1) * n4 + j] !=
+				    g->bmap[(size_t)r * n4 + j] + 4) {
+					g->bmap2 = 0;
+					break;
+				}
+		/* read_rows4's premise, read off the table just built */
+		g->bmap4 = m % 4 == 0;
+		for (unsigned r = 0; g->bmap4 && r < m; r += 4)
+			for (unsigned j = 0; g->bmap4 && j < n4; j++)
+				for (unsigned lo = 1; lo < 4; lo++)
+					if (g->bmap[(size_t)(r + lo) * n4 + j] !=
+					    g->bmap[(size_t)r * n4 + j] + lo * 4) {
+						g->bmap4 = 0;
+						break;
+					}
+	}
+	return 0;
+}
+
+/*
  * ONE DEVICE'S ANSWER, GATHERED OUT OF THE ACCUMULATOR -- AND IT IS A
  * FUNCTION SO THAT IT CAN RUN LATER THAN THE FENCE THAT RELEASED IT.
  *
@@ -5909,8 +8151,28 @@ static int batch_read_device(struct charsiu_npu *g,
 			     unsigned m)
 {
 	double tf;
-	unsigned nt;
+	unsigned ntd[2] = { 0, 0 };
+	/*
+	 * IN K ORDER, WHICHEVER DEVICE HOLDS WHICH SLICE. See npu_entry.gmix:
+	 * for an entry whose deal is not monotone in K the reads of the earlier
+	 * devices are put off to the last one, which walks every slot in index
+	 * order -- K slice major, i = ki * n_slices + ni, so ascending K within
+	 * each n range, the order charsiu_npu_matvec sums in -- reading each
+	 * from its own device's buffer. Every caller fences each device before
+	 * reading it and reads them in ascending order, so all the buffers are
+	 * fenced by the time the last device is read. The fused pass is skipped
+	 * for such an entry: it fuses one device's slices only.
+	 */
+	const int korder = e->gmix && !g->gather_old;
+	unsigned finimask = 1u << d;
 
+	if (korder) {
+		if (d != e->gdev_last)
+			return 0;   /* read, and finied, with the last device */
+		finimask = 0;
+		for (unsigned i = 0; i < e->count; i++)
+			finimask |= 1u << g->slot[e->first + i].di;
+	}
 	tf = now_us();
 	if (npu_noread()) {
 		/* the ceiling arm: no gather, and Y is garbage */
@@ -5937,74 +8199,8 @@ static int batch_read_device(struct charsiu_npu *g,
 		 * dominant cost of a batched projection now that the
 		 * hardware part is right.
 		 */
-		if (g->bmap_m != m ||
-		    g->bmap_w4 != (unsigned)w4_for(g, e->t)) {
-			unsigned n4 = (g->nmax + 3) / 4;
-			uint32_t *t2 = realloc(g->bmap,
-				(size_t)m * n4 * sizeof(*t2));
-
-			if (!t2) {
-				whine(g, "the read order table would not allocate",
-				      m, g->nmax);
-				return -1;
-			}
-			g->bmap = t2;
-			g->bmap_n4 = n4;
-			/*
-			 * CHARSIU_NPU_READ_FLAT=1 BUILDS THE IDENTITY,
-			 * which is what this table would hold if the
-			 * accumulator came back row major.
-			 *
-			 * The gather through this permutation is the largest
-			 * single line in a prompt -- r407 put it at 1.96 ms a
-			 * row against the 1.82 of fence it waits behind -- and
-			 * every lever on the gather ITSELF is measured and
-			 * lost. The note above says why that is not the end of
-			 * it: "the read is at its floor FOR THIS ACCUMULATOR
-			 * LAYOUT", and the fp16 path at the same m and n comes
-			 * back FLAT.
-			 *
-			 * On the shipped stream reading flat is WRONG, and
-			 * that is the positive control: it says the knob
-			 * reaches the read. Paired with CHARSIU_W4_F16DPU it
-			 * asks whether any register that differs between the
-			 * fp16 and int4 output stages puts the answer there.
-			 */
-			{
-				int flat = charsiu_env_flag(
-					"CHARSIU_NPU_READ_FLAT", 0);
-
-				for (unsigned r = 0; r < m; r++)
-					for (unsigned j = 0; j < n4; j++)
-						g->bmap[(size_t)r * n4 + j] =
-						  flat
-						  ? (uint32_t)((size_t)r
-							* g->nmax + j * 4)
-						  : (uint32_t)charsiu_acc_index(r, j * 4, m,
-							w4_for(g, e->t) && charsiu_m_axis_wide_for(1));
-			}
-			g->bmap_m = m;
-			g->bmap_w4 = (unsigned)w4_for(g, e->t);
-			/* read_rows2's premise: rows 2h, 2h+1 at index, +4 */
-			g->bmap2 = m % 2 == 0;
-			for (unsigned r = 0; g->bmap2 && r < m; r += 2)
-				for (unsigned j = 0; g->bmap2 && j < n4; j++)
-					if (g->bmap[(size_t)(r + 1) * n4 + j] !=
-					    g->bmap[(size_t)r * n4 + j] + 4) {
-						g->bmap2 = 0;
-						break;
-					}
-			/* read_rows4's premise, read off the table just built */
-			g->bmap4 = m % 4 == 0;
-			for (unsigned r = 0; g->bmap4 && r < m; r += 4)
-				for (unsigned j = 0; g->bmap4 && j < n4; j++)
-					for (unsigned lo = 1; lo < 4; lo++)
-						if (g->bmap[(size_t)(r + lo) * n4 + j] !=
-						    g->bmap[(size_t)r * n4 + j] + lo * 4) {
-							g->bmap4 = 0;
-							break;
-						}
-		}
+		if (bmap_build(g, e, m))
+			return -1;
 		/*
 		 * NOT ON THE POOL. THIS HAS BEEN TRIED TWICE AND
 		 * LOST TWICE.
@@ -6034,7 +8230,7 @@ static int batch_read_device(struct charsiu_npu *g,
 		 */
 		unsigned fused_ni = 0;
 
-		if (g->readfuse && !g->read4 && g->bmap) {
+		if (g->readfuse && !g->read4 && g->bmap && !korder) {
 			unsigned ni;
 
 			for (ni = 0; ni < e->n_slices; ni++) {
@@ -6096,29 +8292,31 @@ static int batch_read_device(struct charsiu_npu *g,
 							     &c, m);
 				else
 					read_fused_rows(&c, 0, m);
-				g->bseen[c.s0->n0 / g->nmax] = 1;
+				g->bseen[c.s0->n0 / g->nmax] += cnt;
 				g->bfused_groups++;
 				g->bfused_slices += cnt;
 				fused_ni |= 1u << ni;
 			}
 		}
-		nt = 0;
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
 			unsigned sn = s->job.mm.n, ki = i / e->n_slices;
 
 			if (s->di == d && ((fused_ni >> (i % e->n_slices)) & 1u)) {
-				nt++;
+				ntd[d]++;
 				continue;   /* the fused pass took it */
 			}
 			const float *fo;
 			const int32_t *io;
 			int grp = tensor_grouped(g, e->t);
 
-			if (s->di != d)
+			if (s->di != d && !korder)
 				continue;
-			fo = (const float *)((uint8_t *)ob->bo[d].map
-					     + (size_t)nt * g->bout_stride);
+			/* the slot's rank among ITS device's slots, which is
+			 * where the submit put its output */
+			fo = (const float *)((uint8_t *)ob->bo[s->di].map
+					     + (size_t)ntd[s->di]
+					       * g->bout_stride);
 			io = (const int32_t *)fo;
 			/*
 			 * THE TABLE IS BUILT AT `wide` AND A SLICE
@@ -6135,13 +8333,16 @@ static int batch_read_device(struct charsiu_npu *g,
 				unsigned ni = s->n0 / g->nmax;
 				struct read_rows rr = {
 					g, e, s, fo, io, Y, m, sn, ki,
-					grp, !g->bseen[ni]
+					grp, !g->bseen[ni],
+					g->btailf && (unsigned)g->bseen[ni] + 1
+						== e->count / e->n_slices,
+					e->t->scale + s->n0
 				};
 
 				g->bread_passes++;
-				if (!((g->bseen_dev >> (d * 16)) & (1u << ni)))
+				if (!((g->bseen_dev >> (s->di * 16)) & (1u << ni)))
 					g->bread_ranges++;
-				g->bseen_dev |= (uint64_t)1 << (d * 16 + ni);
+				g->bseen_dev |= (uint64_t)1 << (s->di * 16 + ni);
 				if (g->poolread == 1 ||
 				    (g->poolread == 2 &&
 				     (size_t)m * sn >= poolread_min(g))) {
@@ -6190,14 +8391,17 @@ static int batch_read_device(struct charsiu_npu *g,
 			/* AFTER the row loop: every row of this slot
 			 * shares the flag, and setting it inside would
 			 * make row 0 assign and rows 1.. accumulate onto
-			 * whatever was in the caller's buffer. */
-			g->bseen[s->n0 / g->nmax] = 1;
-			nt++;
+			 * whatever was in the caller's buffer. A COUNT,
+			 * so the last slice can be told from the rest. */
+			g->bseen[s->n0 / g->nmax]++;
+			ntd[s->di]++;
 		}
 	}
 	g->bread_us += now_us() - tf;
 	if (!g->nofini)
-		charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+		for (unsigned dd = 0; dd < g->ndev; dd++)
+			if (finimask & (1u << dd))
+				charsiu_bo_fini(g->dev[dd], &ob->bo[dd]);
 	return 0;
 }
 
@@ -6222,10 +8426,52 @@ static int batch_read_device(struct charsiu_npu *g,
  * tensor_grouped depends on the tensor and on g->kmax, both fixed for the life
  * of the pool, so asking it again at flush time gives the same answer.
  */
-static void tail_scale_apply(struct charsiu_npu *g,
-			     const struct npu_entry *e, float *Y, unsigned m)
+/* exact8: the integers read_rows_exact8 left in Y, made floats in place */
+struct exact8_tail_job {
+	float *Y;
+	const float *scale, *d1;
+	unsigned n;
+};
+
+static void exact8_tail_rows(void *ctx, uint64_t r0, uint64_t nr)
 {
+	const struct exact8_tail_job *j = ctx;
+
+	for (uint64_t r = r0; r < r0 + nr; r++) {
+		float *y = j->Y + (size_t)r * j->n;
+		float d1 = j->d1[r];
+
+		for (unsigned i = 0; i < j->n; i++) {
+			int32_t v;
+
+			memcpy(&v, y + i, sizeof(v));
+			y[i] = exact8_y(v, j->scale[i], d1);
+		}
+	}
+}
+
+static void tail_scale_apply(struct charsiu_npu *g,
+			     const struct npu_entry *e, float *Y, unsigned m,
+			     int fused)
+{
+	if (g->exact8) {
+		struct exact8_tail_job tj = { Y, e->t->scale, g->bd1x,
+					      (unsigned)e->t->n };
+		double ts = now_us();
+
+		if (g->poolread == 1 ||
+		    (g->poolread == 2 &&
+		     (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(exact8_tail_rows, &tj, m);
+		else
+			exact8_tail_rows(&tj, 0, m);
+		g->bscale_us += now_us() - ts;
+		return;
+	}
 	if (w4_for(g, e->t) && tensor_grouped(g, e->t))
+		return;
+	/* the last read of every range already multiplied; see tail_fuse_for */
+	if (fused)
 		return;
 	{
 		struct tail_scale_job tj = { Y, e->t->scale,
@@ -6265,7 +8511,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	unsigned char *save;
 	float *d1save = NULL;
 	unsigned d;
-	int rc = 0;
+	int rc = 0, tailf_save;
 
 	if (!g->pend.live)
 		return 0;
@@ -6281,6 +8527,8 @@ static int npu_flush_pending(struct charsiu_npu *g)
 		memcpy(save, g->bseen, g->bseen_n);
 		memcpy(g->bseen, g->pend.bseen, nb);
 		g->bout_stride = g->pend.bout_stride;
+		tailf_save = g->btailf;
+		g->btailf = g->pend.btailf;
 		/* int8's read multiplies by this and the next tensor's pack
 		 * has already overwritten the live one */
 		if (g->bd1 && g->pend.bd1 && g->pend.bd1_n &&
@@ -6302,6 +8550,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 						      g->pend.Y, g->pend.m))
 					rc = -1;
 		g->bout_stride = stride;
+		g->btailf = tailf_save;
 		if (d1save) {
 			memcpy(g->bd1, d1save, g->bd1_n * sizeof(*d1save));
 			free(d1save);
@@ -6312,7 +8561,7 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	/* AND THE PER CHANNEL SCALE, which used to run at the end of the
 	 * DEFERRING call with Y still unwritten. This is the moment it
 	 * belongs at: the gather above has just filled Y. */
-	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m);
+	tail_scale_apply(g, g->pend.e, g->pend.Y, g->pend.m, g->pend.btailf);
 	if (defer_check() && g->pend.shadow) {
 		size_t n = (size_t)g->pend.m * g->pend.e->t->n, i;
 
@@ -6346,18 +8595,262 @@ static int npu_flush_pending(struct charsiu_npu *g)
 	return rc;
 }
 
-static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
-			    unsigned m, float *Y, int defer)
+/*
+ * ONE K SLICE OF X PACKED INTO DEVICE d's INPUT OBJECT, lifted out of
+ * npu_matmul_inner unchanged so a grouped call packs exactly as a single one
+ * does. s is any slot of K slice ki on device d: the pack reads only its K
+ * range and the zero point, which every slot of that K column shares.
+ */
+static void batch_pack_slice(struct charsiu_npu *g, const struct npu_entry *e,
+			     const struct npu_slot *s, unsigned ki, unsigned d,
+			     const float *X, unsigned m, const float *ks)
 {
-	struct npu_entry *e;
-	struct npu_outbuf *ob;
-	struct charsiu_joblist jl;
-	double t0, tprep = now_us();
+	unsigned sk = s->job.mm.k;
+	struct charsiu_matmul mm = s->job.mm;
+	uint8_t *dst = (uint8_t *)g->bin[d][bin_idx(g, ki)].map
+		     + bin_off(g, ki);
+	int direct;
 
-	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
-		return -1;
-	if (flush_at(g, 3))
-		return -1;
+	mm.m = m;
+	/*
+	 * THE OTHER DEVICE ALREADY HOLDS THESE BYTES. Both cores read their
+	 * own object, so a K slice both of them compute was packed twice out
+	 * of the same X -- the gather, the convert and the strided read all
+	 * paid a second time for bytes that come out identical. Every byte of
+	 * [0, bin_stride) is a function of (X, m, the slice, ks, zp) alone --
+	 * the data, then the tail memset or the fill -- and all of those are
+	 * fixed for the call (a group shares K slicing and zp, and passes no
+	 * ks), so copying the first object IS packing the second. int8's d1
+	 * is per K slice and was written by the first pack; it is the same
+	 * d1 the second would have computed.
+	 *
+	 * f16 copies only the data and its k % 8 row block and zeroes the rest,
+	 * which is what the edges memset wrote there: a bank sized for a wider
+	 * m than this call's would otherwise copy its zeros.
+	 */
+	if (pack2_copy() && g->ndev == 2 && ki < 32 &&
+	    ((g->bpk_mask[d ^ 1u] >> ki) & 1u)) {
+		double tc = now_us();
+		const uint8_t *src = (const uint8_t *)
+			g->bin[d ^ 1u][bin_idx(g, ki)].map + bin_off(g, ki);
+		size_t n = g->bin_stride, used = n;
+
+		if (w4_for(g, e->t)) {
+			used = (size_t)(sk / 8) * m * 16
+			     + (sk % 8 ? (size_t)m * 16 : 0);
+			if (used > n)
+				used = n;
+		}
+		if (g->packpool && used >= 4 * PACK_COPY_CHUNK) {
+			struct pack_copy_job cj = { src, dst, used };
+
+			charsiu_parallel_for(pack_copy_worker, &cj,
+				(used + PACK_COPY_CHUNK - 1) / PACK_COPY_CHUNK);
+		} else {
+			memcpy(dst, src, used);
+		}
+		if (n > used)
+			memset(dst + used, 0, n - used);
+		g->bpk_mask[d] |= 1u << ki;
+		g->bpack_copied++;
+		g->bpackcall_us += now_us() - tc;
+		return;
+	}
+	/*
+	 * AND A CUT TENSOR'S SLICE IS PACKED STRAIGHT OUT OF X. The gather
+	 * below copied columns [k0, k0 + sk) of every row into bscr so the
+	 * packer read rows sk apart; the rows packer walks four rows from k0
+	 * to the end, which is the same four sequential streams whatever the
+	 * row stride is, so the copy buys nothing it reads. Same floats, so
+	 * the same halves. Not with AWQ (ks): the scaled copy has to live
+	 * somewhere, and that is the gather's other job.
+	 */
+	direct = pack2_direct() && pack2_rows() && w4_for(g, e->t) && !ks &&
+		 !pack_gather() && sk != e->t->k;
+	/*
+	 * PACK OUT OF X ONLY WHEN THE SLICE IS THE WHOLE
+	 * ROW, AND THE BOARD IS WHY.
+	 *
+	 * A K slice is columns [k0, k0 + sk) of every row, and
+	 * this used to copy them into g->bscr so the packer
+	 * could read contiguous rows: fourteen bytes moved per
+	 * element packed. Handing the packer X and a row
+	 * stride removes that round trip, and on a tensor whose
+	 * K fits one slice it is free money -- Qwen2.5-1.5B,
+	 * whose K is 1536 against a 2048 slice, went from 2628
+	 * to 2215 ms of packing.
+	 *
+	 * On a tensor that is CUT it is a loss, and a large
+	 * one. Phi-3.5's K is 3072, so a 2048 slice and a 1024
+	 * slice, and the packer walks groups outermost with m
+	 * strided reads a group. Reading X the stride is the
+	 * whole row, so every line fetched carries columns the
+	 * slice does not want and the working set is the whole
+	 * activation; reading bscr the stride is the slice, the
+	 * lines are all wanted, and the buffer was written
+	 * sequentially a moment earlier. Measured on the board:
+	 * packing 4384 ms with the gather, 6583 without it, and
+	 * the whole matmul entry 21312 against 23724.
+	 *
+	 * So the gather stays wherever the tensor is sliced,
+	 * and int8 keeps it always: it takes a per row maximum
+	 * over the slice and quantises into g->bq, which is a
+	 * pass over the slice either way.
+	 */
+	/*
+	 * THE ARM, BECAUSE THE FIRST TWO ROUNDS OF THIS WERE
+	 * NOISE. Three board runs of phase 9 disagreed by more
+	 * than the change: Phi-3.5 packed 4384, 6583 and 3158
+	 * ms on paths that should have been the same twice,
+	 * and Qwen2.5 2628, 2215 and 3497. Phase 9 runs under
+	 * the ondemand governor and packing is CPU work, so a
+	 * build against a build measures the governor.
+	 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
+	 * binary can run both arms in one session.
+	 */
+	/*
+	 * AND ALWAYS WHEN AWQ IS ON, because the scaled
+	 * activation has to live somewhere and X is the
+	 * caller's. This is the gather's other job: it is the
+	 * only buffer on this path that the pack may write
+	 * through, so the factor goes on as the columns are
+	 * copied rather than in a pass of its own.
+	 */
+	if (!direct &&
+	    (!w4_for(g, e->t) || sk != e->t->k || pack_gather() || ks)) {
+		double tg = now_us();
+
+		for (unsigned r = 0; r < m; r++) {
+			const float *xr = X + (size_t)r * e->t->k
+					+ s->k0;
+			float *dr = g->bscr + (size_t)r * sk;
+
+			if (!ks) {
+				memcpy(dr, xr,
+				       sk * sizeof(*dr));
+				continue;
+			}
+			for (unsigned kk = 0; kk < sk; kk++)
+				dr[kk] = xr[kk] * ks[s->k0 + kk];
+		}
+		g->bgather_us += now_us() - tg;
+	}
+	double tpc = now_us();
+	if (!w4_for(g, e->t)) {
+		/*
+		 * int8's scale is per row and taken over THIS K
+		 * slice's own range, so it is kept per K slice
+		 * for the read back.
+		 *
+		 * AND IT MULTIPLIES BY THE RECIPROCAL BECAUSE
+		 * charsiu_act_q1 DOES. x * (1/d) and x / d are
+		 * not the same float: the reciprocal rounds
+		 * once and the product rounds again, the divide
+		 * rounds once, and a value sitting halfway
+		 * between two codes comes out one code apart.
+		 * This path divided and the row loop multiplied,
+		 * so a batch and its own row-by-row reference
+		 * disagreed on a handful of near-zero channels
+		 * -- 127 of 49152 on the vision tower's own
+		 * shape, one row of 64, mean got/want 1.0007.
+		 * Small enough to look like noise and stable
+		 * enough to look like structure, which is how it
+		 * cost a board round to tell apart.
+		 *
+		 * THIS ONLY MAKES THE TWO IDENTICAL ON A SINGLE
+		 * SLICE. q1's amax is over the whole row and this
+		 * one is over sk, so a multi-slice int8 tensor is
+		 * quantised FINER here on purpose and cannot
+		 * match the row loop to 0.1% -- and should not
+		 * be asked to.
+		 */
+		if (g->exact8) {
+			/* d1 is the row's, from exact8_rows; the read back
+			 * does not take it from bd1 at all */
+			struct qpack_job qj = { g->bscr, g->bq, g->bd1x, sk };
+
+			memcpy(g->bd1 + (size_t)ki * m, g->bd1x,
+			       (size_t)m * sizeof(*g->bd1));
+			if (g->packpool == 1 ||
+			    (g->packpool == 2 && m > 1))
+				charsiu_parallel_for(exact8_qpack_w, &qj, m);
+			else
+				exact8_qpack_w(&qj, 0, m);
+		} else if (qpack_plain()) {
+			for (unsigned r = 0; r < m; r++) {
+				float mx = 0.0f, d1, id1;
+
+				for (unsigned kk = 0; kk < sk; kk++) {
+					float v = fabsf(g->bscr[(size_t)r * sk + kk]);
+
+					if (v > mx)
+						mx = v;
+				}
+				d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
+				id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
+				g->bd1[(size_t)ki * m + r] = d1;
+				for (unsigned kk = 0; kk < sk; kk++) {
+					int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
+
+					if (q > 127) q = 127;
+					if (q < -127) q = -127;
+					g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
+				}
+			}
+		} else {
+			struct qpack_job qj = {
+				g->bscr, g->bq,
+				g->bd1 + (size_t)ki * m, sk
+			};
+
+			/* the rows are independent -- each has
+			 * its own d1 -- so the pool needs no
+			 * grain and the order cannot change */
+			if (g->packpool == 1 ||
+			    (g->packpool == 2 && m > 1))
+				charsiu_parallel_for(qpack_rows,
+						     &qj, m);
+			else
+				qpack_rows(&qj, 0, m);
+		}
+		charsiu_pack_input(&mm, g->bq, dst,
+				   g->bin_stride, s->job.input_zero_point);
+	} else if (direct) {
+		pack_f16_pooled(g, &mm, X + s->k0, e->t->k, dst,
+				g->bin_stride);
+		g->bpack_direct++;
+	} else if (sk == e->t->k && !pack_gather() && !ks) {
+		/* the slice is the whole row, so k0 is 0.
+		 * !ks BECAUSE THIS IS NO LONGER THE
+		 * COMPLEMENT OF THE GATHER ABOVE: with AWQ on
+		 * the gather ran and wrote the scaled copy,
+		 * and this branch would pack the caller's
+		 * unscaled X straight past it. */
+		pack_f16_pooled(g, &mm, X, e->t->k,
+				(uint8_t *)g->bin[d][bin_idx(g, ki)].map
+				+ bin_off(g, ki),
+				g->bin_stride);
+	} else {
+		pack_f16_pooled(g, &mm, g->bscr, mm.k,
+				(uint8_t *)g->bin[d][bin_idx(g, ki)].map
+				+ bin_off(g, ki),
+				g->bin_stride);
+	}
+	g->bpackcall_us += now_us() - tpc;
+	if (ki < 32)
+		g->bpk_mask[d] |= 1u << ki;
+}
+
+/*
+ * THE REFUSALS OF THE BATCHED PATH, lifted out of npu_matmul_inner unchanged
+ * so that charsiu_npu_matmul_group can put every member of a group through
+ * them before anything is packed or submitted. 0 means this tensor batches
+ * at m rows; -1 means it does not, and the reason has been whined.
+ */
+static int batch_refused(struct charsiu_npu *g, int id, unsigned m)
+{
+	const struct npu_entry *e = &g->ent[id];
+
 	/*
 	 * int8 IS THE PATH THAT DOES MORE THAN ONE ROW, and that is not a
 	 * preference, it is the only thing on this board with evidence.
@@ -6474,32 +8967,6 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		      (unsigned)g->ent[id].t->k, (unsigned)g->ent[id].t->n);
 		return -1;
 	}
-	e = &g->ent[id];
-	/*
-	 * AN int8 TENSOR MAY NOT DEFER ITS GATHER, and this cost two
-	 * board rounds to find.
-	 *
-	 * The int8 read back multiplies each accumulator by g->bd1[ki*m + r],
-	 * the per ROW activation scale that the same call's PACK computed --
-	 * and `bd1` is one array on the pool, sized for one call. Defer the
-	 * gather and the NEXT tensor's pack overwrites it before the deferred
-	 * read gets there. The w4 branch of that same loop reads a per channel
-	 * scale off the SLOT and does not care.
-	 *
-	 * It is a wrong answer with nothing reporting one, and it is data
-	 * dependent: it bites only when the deferred tensor is the int8 kind,
-	 * so tests/board_text_all.sh caught it at five models of nine while
-	 * Llama-3.2-1B, whose tensors at these call sites are all w4, passed
-	 * every single-model check.
-	 *
-	 * THE DIAGNOSTIC THAT NAMED IT: CHARSIU_NPU_DEFER_READ=2 records the
-	 * deferral and then flushes it before returning, so the same
-	 * record-and-restore machinery runs at the moment the plain path would
-	 * have. 0 of 9 differing there against 5 of 9 at =1 -- which proved the
-	 * machinery right and put the fault in what changes BETWEEN the two
-	 * calls. After that the field is found by reading the list rather than
-	 * by guessing.
-	 */
 	/*
 	 * THE INPUT SURFACE HAS A CEILING AND WE FOUND IT BY GOING OVER IT.
 	 *
@@ -6669,6 +9136,86 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		      (unsigned)e->t->k, (unsigned)e->t->n);
 		return -1;
 	}
+	return 0;
+}
+
+/*
+ * AN EARLY RETURN WITH A DEVICE STILL COMPUTING. The pipe leaves one device
+ * submitted across the next device's pack and read; a fault in between must
+ * not hand the next call an input buffer the hardware is still reading. One
+ * prep is the wait; the fini hands the buffer back, as batch_outbuf does.
+ */
+static void pipe_drain_one(struct charsiu_npu *g, struct npu_outbuf *ob,
+			   int d)
+{
+	if (d < 0 || !(ob->busy & (1u << d)))
+		return;
+	charsiu_bo_prep(g->dev[d], &ob->bo[d], 2000000000);
+	charsiu_bo_fini(g->dev[d], &ob->bo[d]);
+	ob->busy &= ~(1u << d);
+}
+
+static int npu_mtile_try(struct charsiu_npu *g, const int *ids, unsigned n,
+			 const float *X, unsigned m, float *const *Ys);
+
+static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
+			    unsigned m, float *Y, int defer)
+{
+	struct npu_entry *e;
+	struct npu_outbuf *ob;
+	struct charsiu_joblist jl;
+	double t0, tprep = now_us();
+
+	if (g->dead || id < 0 || (unsigned)id >= g->n_ent || m < 2)
+		return -1;
+	if (flush_at(g, 3))
+		return -1;
+	/* every refusal the batched path makes, in one place so a grouped
+	 * call can ask the same questions of each member before it packs */
+	if (batch_refused(g, id, m))
+		return -1;
+	e = &g->ent[id];
+	/* exact8 packs every call from X and reads every call itself */
+	if (g->exact8) {
+		defer = 0;
+		g->reuse_ask = 0;
+		if (exact8_rows(g, X, m, (unsigned)e->t->k))
+			return -1;
+	}
+	/* ROW TILES, when asked and when this call can take them; 1 is a
+	 * decline with nothing done. A deferred read keeps the untiled call:
+	 * the deferral machinery is one tensor's one buffer. */
+	if (!defer && !g->exact8) {
+		int tr = npu_mtile_try(g, &id, 1, X, m, &Y);
+
+		if (tr <= 0)
+			return tr;
+	}
+	/*
+	 * AN int8 TENSOR MAY NOT DEFER ITS GATHER, and this cost two
+	 * board rounds to find.
+	 *
+	 * The int8 read back multiplies each accumulator by g->bd1[ki*m + r],
+	 * the per ROW activation scale that the same call's PACK computed --
+	 * and `bd1` is one array on the pool, sized for one call. Defer the
+	 * gather and the NEXT tensor's pack overwrites it before the deferred
+	 * read gets there. The w4 branch of that same loop reads a per channel
+	 * scale off the SLOT and does not care.
+	 *
+	 * It is a wrong answer with nothing reporting one, and it is data
+	 * dependent: it bites only when the deferred tensor is the int8 kind,
+	 * so tests/board_text_all.sh caught it at five models of nine while
+	 * Llama-3.2-1B, whose tensors at these call sites are all w4, passed
+	 * every single-model check.
+	 *
+	 * THE DIAGNOSTIC THAT NAMED IT: CHARSIU_NPU_DEFER_READ=2 records the
+	 * deferral and then flushes it before returning, so the same
+	 * record-and-restore machinery runs at the moment the plain path would
+	 * have. 0 of 9 differing there against 5 of 9 at =1 -- which proved the
+	 * machinery right and put the fault in what changes BETWEEN the two
+	 * calls. After that the field is found by reading the list rather than
+	 * by guessing.
+	 */
 	{
 		unsigned nslots[2] = { 0, 0 }, wide = 0, most;
 
@@ -6752,6 +9299,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		g->bseen_n = e->n_slices;
 	}
 	memset(g->bseen, 0, e->n_slices);
+	g->btailf = tail_fuse_for(g, e);
 	/*
 	 * THE CONTROL FOR ALL OF THE ABOVE, because assign-on-first-write
 	 * is the one thing here that can hand back a caller's stale buffer.
@@ -6809,6 +9357,14 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	if (flush_at(g, 5))
 		return -1;
+
+	/* see mm_pipe: fly is the device submitted and not yet fenced, fenced
+	 * and readd the devices the loop has already fenced and read */
+	const int pipe = mm_pipe_for(g, m);
+	int fly = -1;
+	unsigned fenced = 0, readd = 0;
+
+	pack2_call_reset(g);
 
 	for (unsigned dd = 0; dd < g->ndev; dd++) {
 		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
@@ -6904,168 +9460,12 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 */
 		for (unsigned i = 0; i < e->count; i++) {
 			const struct npu_slot *s = &g->slot[e->first + i];
-			unsigned sk = s->job.mm.k, ki = i / e->n_slices;
-			struct charsiu_matmul mm = s->job.mm;
+			unsigned ki = i / e->n_slices;
 
 			if (reuse || s->di != d || ((done_ki >> ki) & 1u))
 				continue;
 			done_ki |= 1u << ki;
-			mm.m = m;
-			/*
-			 * PACK OUT OF X ONLY WHEN THE SLICE IS THE WHOLE
-			 * ROW, AND THE BOARD IS WHY.
-			 *
-			 * A K slice is columns [k0, k0 + sk) of every row, and
-			 * this used to copy them into g->bscr so the packer
-			 * could read contiguous rows: fourteen bytes moved per
-			 * element packed. Handing the packer X and a row
-			 * stride removes that round trip, and on a tensor whose
-			 * K fits one slice it is free money -- Qwen2.5-1.5B,
-			 * whose K is 1536 against a 2048 slice, went from 2628
-			 * to 2215 ms of packing.
-			 *
-			 * On a tensor that is CUT it is a loss, and a large
-			 * one. Phi-3.5's K is 3072, so a 2048 slice and a 1024
-			 * slice, and the packer walks groups outermost with m
-			 * strided reads a group. Reading X the stride is the
-			 * whole row, so every line fetched carries columns the
-			 * slice does not want and the working set is the whole
-			 * activation; reading bscr the stride is the slice, the
-			 * lines are all wanted, and the buffer was written
-			 * sequentially a moment earlier. Measured on the board:
-			 * packing 4384 ms with the gather, 6583 without it, and
-			 * the whole matmul entry 21312 against 23724.
-			 *
-			 * So the gather stays wherever the tensor is sliced,
-			 * and int8 keeps it always: it takes a per row maximum
-			 * over the slice and quantises into g->bq, which is a
-			 * pass over the slice either way.
-			 */
-			/*
-			 * THE ARM, BECAUSE THE FIRST TWO ROUNDS OF THIS WERE
-			 * NOISE. Three board runs of phase 9 disagreed by more
-			 * than the change: Phi-3.5 packed 4384, 6583 and 3158
-			 * ms on paths that should have been the same twice,
-			 * and Qwen2.5 2628, 2215 and 3497. Phase 9 runs under
-			 * the ondemand governor and packing is CPU work, so a
-			 * build against a build measures the governor.
-			 * CHARSIU_NPU_PACK_GATHER=1 forces the gather, so one
-			 * binary can run both arms in one session.
-			 */
-			/*
-			 * AND ALWAYS WHEN AWQ IS ON, because the scaled
-			 * activation has to live somewhere and X is the
-			 * caller's. This is the gather's other job: it is the
-			 * only buffer on this path that the pack may write
-			 * through, so the factor goes on as the columns are
-			 * copied rather than in a pass of its own.
-			 */
-			if (!w4_for(g, e->t) || sk != e->t->k || pack_gather() || ks) {
-				double tg = now_us();
-
-				for (unsigned r = 0; r < m; r++) {
-					const float *xr = X + (size_t)r * e->t->k
-							+ s->k0;
-					float *dr = g->bscr + (size_t)r * sk;
-
-					if (!ks) {
-						memcpy(dr, xr,
-						       sk * sizeof(*dr));
-						continue;
-					}
-					for (unsigned kk = 0; kk < sk; kk++)
-						dr[kk] = xr[kk] * ks[s->k0 + kk];
-				}
-				g->bgather_us += now_us() - tg;
-			}
-			double tpc = now_us();
-			if (!w4_for(g, e->t)) {
-				/*
-				 * int8's scale is per row and taken over THIS K
-				 * slice's own range, so it is kept per K slice
-				 * for the read back.
-				 *
-				 * AND IT MULTIPLIES BY THE RECIPROCAL BECAUSE
-				 * charsiu_act_q1 DOES. x * (1/d) and x / d are
-				 * not the same float: the reciprocal rounds
-				 * once and the product rounds again, the divide
-				 * rounds once, and a value sitting halfway
-				 * between two codes comes out one code apart.
-				 * This path divided and the row loop multiplied,
-				 * so a batch and its own row-by-row reference
-				 * disagreed on a handful of near-zero channels
-				 * -- 127 of 49152 on the vision tower's own
-				 * shape, one row of 64, mean got/want 1.0007.
-				 * Small enough to look like noise and stable
-				 * enough to look like structure, which is how it
-				 * cost a board round to tell apart.
-				 *
-				 * THIS ONLY MAKES THE TWO IDENTICAL ON A SINGLE
-				 * SLICE. q1's amax is over the whole row and this
-				 * one is over sk, so a multi-slice int8 tensor is
-				 * quantised FINER here on purpose and cannot
-				 * match the row loop to 0.1% -- and should not
-				 * be asked to.
-				 */
-				if (qpack_plain()) {
-					for (unsigned r = 0; r < m; r++) {
-						float mx = 0.0f, d1, id1;
-
-						for (unsigned kk = 0; kk < sk; kk++) {
-							float v = fabsf(g->bscr[(size_t)r * sk + kk]);
-
-							if (v > mx)
-								mx = v;
-						}
-						d1 = mx > 0.0f ? mx / 127.0f : 1.0f;
-						id1 = d1 != 0.0f ? 1.0f / d1 : 0.0f;
-						g->bd1[(size_t)ki * m + r] = d1;
-						for (unsigned kk = 0; kk < sk; kk++) {
-							int q = (int)lrintf(g->bscr[(size_t)r * sk + kk] * id1);
-
-							if (q > 127) q = 127;
-							if (q < -127) q = -127;
-							g->bq[(size_t)r * sk + kk] = (uint8_t)(q + 128);
-						}
-					}
-				} else {
-					struct qpack_job qj = {
-						g->bscr, g->bq,
-						g->bd1 + (size_t)ki * m, sk
-					};
-
-					/* the rows are independent -- each has
-					 * its own d1 -- so the pool needs no
-					 * grain and the order cannot change */
-					if (g->packpool == 1 ||
-					    (g->packpool == 2 && m > 1))
-						charsiu_parallel_for(qpack_rows,
-								     &qj, m);
-					else
-						qpack_rows(&qj, 0, m);
-				}
-				charsiu_pack_input(&mm, g->bq,
-						   (uint8_t *)g->bin[d][bin_idx(g, ki)].map
-						   + bin_off(g, ki),
-						   g->bin_stride, s->job.input_zero_point);
-			} else if (sk == e->t->k && !pack_gather() && !ks) {
-				/* the slice is the whole row, so k0 is 0.
-				 * !ks BECAUSE THIS IS NO LONGER THE
-				 * COMPLEMENT OF THE GATHER ABOVE: with AWQ on
-				 * the gather ran and wrote the scaled copy,
-				 * and this branch would pack the caller's
-				 * unscaled X straight past it. */
-				pack_f16_pooled(g, &mm, X, e->t->k,
-						(uint8_t *)g->bin[d][bin_idx(g, ki)].map
-						+ bin_off(g, ki),
-						g->bin_stride);
-			} else {
-				pack_f16_pooled(g, &mm, g->bscr, mm.k,
-						(uint8_t *)g->bin[d][bin_idx(g, ki)].map
-						+ bin_off(g, ki),
-						g->bin_stride);
-			}
-			g->bpackcall_us += now_us() - tpc;
+			batch_pack_slice(g, e, s, ki, d, X, m, ks);
 		}
 
 		double tpe = now_us();
@@ -7094,6 +9494,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 						charsiu_bo_fini(g->dev[d],
 							&g->bin[d][kj]);
 				charsiu_bo_fini(g->dev[d], &g->breg[d]);
+				pipe_drain_one(g, ob, fly);
 				return -1;
 			}
 			g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
@@ -7127,6 +9528,18 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				      done_ki, ksh);
 		if (!nt)
 			continue;
+		/* THE PIPE: the other core finishes before this one starts,
+		 * which is the guard below, only fenced after this device's
+		 * pack instead of before it */
+		if (pipe && fly >= 0) {
+			double w = fence_bo(g, (unsigned)fly, &ob->bo[fly]);
+
+			fence_width(g, (unsigned)(g->bout_stride
+						  / ((size_t)m * 4)),
+				    w, mac_for_dev(g, e, (unsigned)fly, m));
+			ob->busy &= ~(1u << fly);
+			fenced |= 1u << fly;
+		}
 		tp = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = nt;
@@ -7145,6 +9558,19 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 		 * fence below clears it again */
 		ob->busy |= 1u << d;
 		g->bsub_us += now_us() - tp;
+		if (pipe) {
+			/* and the fenced device is read while this one runs */
+			if (fly >= 0 && !defer) {
+				if (batch_read_device(g, e, ob, (unsigned)fly,
+						      Y, m)) {
+					pipe_drain_one(g, ob, (int)d);
+					return -1;
+				}
+				readd |= 1u << fly;
+			}
+			fly = (int)d;
+			continue;
+		}
 		/*
 		 * THE CORE PAIR, AND THE ONE KNOB THAT REMOVES IT.
 		 *
@@ -7209,7 +9635,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 	 * still owes one.
 	 */
 	for (unsigned d = 0; d < g->ndev; d++) {
-		{
+		if (!((fenced >> d) & 1u)) {
 			double w = fence_bo(g, d, &ob->bo[d]);
 
 			/* the WHOLE fence of this device is charged to this
@@ -7221,7 +9647,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 				    w, mac_for_dev(g, e, d, m));
 		}
 		ob->busy &= ~(1u << d);
-		if (!defer && batch_read_device(g, e, ob, d, Y, m))
+		if (!defer && !((readd >> d) & 1u) &&
+		    batch_read_device(g, e, ob, d, Y, m))
 			return -1;
 	}
 	/*
@@ -7257,7 +9684,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			for (d2 = 0; d2 < g->ndev; d2++)
 				batch_read_device(g, e, ob, d2,
 						  g->pend.shadow, m);
-			tail_scale_apply(g, e, g->pend.shadow, m);
+			tail_scale_apply(g, e, g->pend.shadow, m, g->btailf);
 			memcpy(g->bseen, sv, g->bseen_n);
 		}
 		free(sv);
@@ -7303,6 +9730,7 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 			g->pend.e = e; g->pend.Y = Y;
 			g->pend.m = m;
 			g->pend.bout_stride = g->bout_stride;
+			g->pend.btailf = g->btailf;
 			g->pend.dmask = (1u << g->ndev) - 1u;
 			g->pend.live = 1;
 			ob->pending = 1;
@@ -7329,8 +9757,8 @@ static int npu_matmul_inner(struct charsiu_npu *g, int id, const float *X,
 
 	/* NOT WHEN THE READ HAS NOT HAPPENED. npu_flush_pending applies it
 	 * after the deferred gather instead; see tail_scale_apply. */
-	if (!defer)
-		tail_scale_apply(g, e, Y, m);
+	if (!defer && !g->tail_skip)
+		tail_scale_apply(g, e, Y, m, g->btailf);
 	return 0;
 }
 
@@ -7340,8 +9768,77 @@ int charsiu_npu_matmul(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	if (alt_id(g, id))
+		return npu_flush_pending(g) ? -1
+		     : charsiu_npu_matmul(g->alt, id - NPU_ALT_ID, X, m, Y);
 	g->reuse_ask = 0;
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+/*
+ * THE OUTPUT HEAD OF A GREEDY VERIFY PASS: the index of each row's maximum,
+ * and Y left holding the UNSCALED, UNCAPPED read back -- scratch, not logits.
+ * argmaxrow.h has why the index is bit identical to scale, softcap, then
+ * llama_argmax over the stored rows.
+ *
+ * THE SKIP IS THIS CALL'S TAIL AND NOTHING ELSE. npu_matmul_inner can flush
+ * an EARLIER tensor's deferred gather, and that one's tail_scale_apply runs
+ * inside npu_flush_pending, which tail_skip does not reach: only the line at
+ * the end of the inner call reads it.
+ */
+struct argmax_job {
+	const float *Y;
+	const float *scale;
+	unsigned n;
+	float cap;
+	int32_t *best;
+};
+
+static void argmax_rows(void *ctx, uint64_t r0, uint64_t nr)
+{
+	const struct argmax_job *a = ctx;
+	uint64_t r;
+
+	for (r = r0; r < r0 + nr; r++)
+		a->best[r] = charsiu_argmax_scaled(a->Y + r * a->n, a->scale,
+						   a->n, a->cap);
+}
+
+int charsiu_npu_matmul_argmax(struct charsiu_npu *g, int id, const float *X,
+			      unsigned m, float *Y, float cap, int32_t *best)
+{
+	double t0 = now_us();
+	int rc;
+
+	/* exact8 converts in the tail this skips; and it is never the head */
+	if (alt_id(g, id) || g->exact8)
+		return -1;
+	g->reuse_ask = 0;
+	g->tail_skip = 1;
+	rc = npu_matmul_inner(g, id, X, m, Y, 0);
+	g->tail_skip = 0;
+	if (!rc) {
+		const struct npu_entry *e = &g->ent[id];
+		/* the same condition tail_scale_apply returns early on */
+		struct argmax_job aj = {
+			Y, w4_for(g, e->t) && tensor_grouped(g, e->t)
+			   ? NULL : e->t->scale,
+			(unsigned)e->t->n, cap, best
+		};
+		double ts = now_us();
+
+		/* rows are independent and a row is one thread's whole
+		 * scan, so the pool cannot change an index */
+		if (g->poolread == 1 ||
+		    (g->poolread == 2 &&
+		     (size_t)m * e->t->n >= poolread_min(g)))
+			charsiu_parallel_for(argmax_rows, &aj, m);
+		else
+			argmax_rows(&aj, 0, m);
+		g->bscale_us += now_us() - ts;
+	}
 	g->bwall_us += now_us() - t0;
 	return rc;
 }
@@ -7434,6 +9931,9 @@ int charsiu_npu_matmul_defer(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 neither defers nor reuses: the plain call */
+	if (alt_id(g, id))
+		return charsiu_npu_matmul(g, id, X, m, Y);
 	g->reuse_ask = 0;
 	rc = npu_matmul_inner(g, id, X, m, Y, defer_read_on());
 	g->bwall_us += now_us() - t0;
@@ -7446,6 +9946,9 @@ int charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 neither defers nor reuses: the plain call */
+	if (alt_id(g, id))
+		return charsiu_npu_matmul(g, id, X, m, Y);
 	g->reuse_ask = reuse_enabled();
 	rc = npu_matmul_inner(g, id, X, m, Y, defer_read_on());
 	g->bwall_us += now_us() - t0;
@@ -7455,6 +9958,8 @@ int charsiu_npu_matmul_same_defer(struct charsiu_npu *g, int id,
 /* every deferred answer written out; safe to call when there are none */
 int charsiu_npu_flush(struct charsiu_npu *g)
 {
+	if (g && g->alt && npu_flush_pending(g->alt))
+		return -1;
 	return g ? npu_flush_pending(g) : 0;
 }
 
@@ -7464,9 +9969,955 @@ int charsiu_npu_matmul_same(struct charsiu_npu *g, int id, const float *X,
 	double t0 = now_us();
 	int rc;
 
+	/* exact8 neither defers nor reuses: the plain call */
+	if (alt_id(g, id))
+		return charsiu_npu_matmul(g, id, X, m, Y);
 	g->reuse_ask = reuse_enabled();
 	rc = npu_matmul_inner(g, id, X, m, Y, 0);
 	g->reuse_ask = 0;
+	g->bwall_us += now_us() - t0;
+	return rc;
+}
+
+/*
+ * A GROUPED BATCHED MATMUL: q/k/v, or gate/up, for m rows in ONE call.
+ *
+ * ON BY DEFAULT since the board A/B of 2026-11-24. llama.c calls this unless
+ * CHARSIU_NPU_BATCH_GROUP=0; with that every batched projection goes through
+ * npu_matmul_inner one tensor at a time, exactly as before.
+ *
+ * WHY. A speculative verify pass is m = 2..8 rows, and at those widths
+ * Qwen3-0.6B's q, k, v, gate and up are each ONE slot (KMAX = W4 group =
+ * 1024, NMAX 8192), which runs on ONE core. One call per tensor therefore
+ * keeps one of the two cores busy at a time and pays a fence and a pack per
+ * tensor: r-verify measured ~64 ms of fence and ~27 of pack for a ~6 row
+ * pass, against ~35 and ~17 for the same work as single calls in
+ * --batch-probe. Decode (m = 1) already groups these in
+ * charsiu_npu_matvec_group; this is the same shape for m > 1:
+ *
+ *   - every member is put through batch_refused FIRST, and a group with
+ *     any refused member, or members that do not share K, the K slicing or
+ *     the zero point, or any AWQ factor, returns -1 having touched nothing
+ *     -- the caller then runs its per-tensor calls, so a refused shape
+ *     behaves exactly as it did;
+ *   - a deferred gather from an earlier call is flushed before anything is
+ *     allocated: this call defers nothing and owes no flush of its own;
+ *   - X is packed ONCE PER DEVICE per K slice (batch_pack_slice, the same
+ *     code the single call runs), for the K slices any member's slot on that
+ *     device reads;
+ *   - the slots keep the device the staging deal gave them (deal_pick over
+ *     g->deal_load, across tensors), so q on one core and k on the other
+ *     now run together, one submit per device;
+ *   - each member has its OWN output buffer out of the pool. k and v (and
+ *     gate and up) are the same geometry and batch_outbuf would hand both
+ *     the same one, so each is claimed with `pending` while the others are
+ *     taken and released before the submit;
+ *   - each member is gathered into its own Y with its own first-write flags,
+ *     which are per member and carried across the two devices' reads.
+ *
+ * THE OVERLAP GUARD HOLDS. When batch_serial_for(m) says the two cores must
+ * not run together, each device's submit is fenced before the next device
+ * is submitted, as in npu_matmul_inner -- the group just makes it two
+ * submits a group instead of two a tensor.
+ *
+ * NOT RUN ON THE DESK: the desk has no NPU and llama.c never gets an id to
+ * pass. Everything here is the board's to price and to check.
+ */
+#define NPU_GROUP_MAX 4
+
+/* one member's read of one device, with that member's own first-write flags
+ * swapped in and out of g->bseen around it */
+static int group_read_member(struct charsiu_npu *g, const struct npu_entry *e,
+			     struct npu_outbuf *ob, unsigned d, float *Y,
+			     unsigned m, unsigned char *seen, uint64_t *sdev,
+			     size_t stride)
+{
+	int bad, tailf = g->btailf;
+
+	memcpy(g->bseen, seen, e->n_slices);
+	g->bseen_dev = *sdev;
+	g->bout_stride = stride;
+	/* the member's own: its tail_scale_apply asks the same question */
+	g->btailf = tail_fuse_for(g, e);
+	bad = batch_read_device(g, e, ob, d, Y, m);
+	g->btailf = tailf;
+	memcpy(seen, g->bseen, e->n_slices);
+	*sdev = g->bseen_dev;
+	return bad;
+}
+
+/*
+ * ROW TILES: PACK ONE BLOCK OF ROWS WHILE THE NPU COMPUTES ANOTHER.
+ *
+ * A batched call is pack | submit | fence | read, and the two halves on the
+ * CPU never run beside the hardware except across the two devices. Rows are
+ * independent (tools/npu_rowpure: a batched row is a pure function of that
+ * row), so the call's m rows can go as T blocks, each its own job on the same
+ * slots, and the order becomes
+ *
+ *   pack 0 | pack 1      | read 0 , pack 2 | read 1 | ...
+ *          | hw 0        | hw 1            | hw 2   |
+ *
+ * Every block is a whole call of its own width: its input bank (two of
+ * them, alternated, swapped in whole like the small bank), its output
+ * buffers (keyed by the block width so the whole object prep and fini are
+ * charged on the block, not on m), its own first-write counts, and its rows
+ * of Y. The sums in a block are the sums of the untiled call's rows, slice
+ * by slice in the same order, because the read of a block is
+ * group_read_member over the same slots in the same ascending device order.
+ *
+ * NOT ROWSPLIT (llama.c), which deferred only the read and fenced each half
+ * before packing the next, and lost to per call costs this does not have
+ * (the f16 pack zeroes to the end of a bank sized for the block; the read
+ * order table for the block width is parked, not rebuilt).
+ *
+ * Each block re-streams every weight it touches, so the hardware does more
+ * work; CHARSIU_NPU_MTILE_SYNC=1 fences and reads each block before the next
+ * is packed, which prices exactly that. CHARSIU_NPU_MTILE=1 is the untiled
+ * call. Not with the cores serialised (the pair must not overlap and the
+ * tile pipeline overlaps them), not with AWQ, a deferred read, the fused
+ * verify argmax, or a block that would be small enough for the small bank.
+ */
+#define MTILE_MAX 4
+
+static unsigned mtile_n(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_MTILE");
+
+		v = e && *e ? atoi(e) : 3;
+		if (v < 1)
+			v = 1;
+		if (v > MTILE_MAX)
+			v = MTILE_MAX;
+	}
+	return (unsigned)v;
+}
+
+static unsigned mtile_min(void)
+{
+	static int v = -1;
+
+	if (v < 0) {
+		const char *e = getenv("CHARSIU_NPU_MTILE_MIN");
+
+		v = e && *e ? atoi(e) : 38;
+		if (v < 2)
+			v = 2;
+	}
+	return (unsigned)v;
+}
+
+static int mtile_sync(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_MTILE_SYNC", 0);
+	return v;
+}
+
+/*
+ * EVEN BLOCKS, AS EQUAL AS EVEN ALLOWS, WIDEST FIRST: w4 refuses an odd
+ * width, and the pair read wants even ranges. 124 in three is 42 + 42 + 40,
+ * 140 is 48 + 46 + 46. Returns the block count, 1 for untiled.
+ *
+ * THE DEFAULT IS THREE BLOCKS, NONE NARROWER THAN 38 ROWS, stepping down to
+ * two when three would be narrower (CM5, Qwen3-0.6B, final10 2026-11-26,
+ * interleaved, text identical in every rep). Wins: three blocks of 38 to 46
+ * rows (prompts of 115 to 139 tokens) 404-449 against 438-540 ms untiled;
+ * two of 42 and 40 (82 tokens) 287-303 against 312-334; and in board_arms
+ * the 244, 397 and 1406 token prompts of Llama-3.2-1B and Qwen3-1.7B
+ * 1.05-1.13x. Losses, which 38 excludes: three blocks of 34/32/32 (98
+ * tokens) 449 against 383, two of 34/32 (66 tokens) 313 against 260. Not
+ * stepping down at all (a build of this note's first draft) kept the
+ * losses away but gave back every board_arms win above.
+ */
+static unsigned mtile_plan(unsigned m, unsigned *rows)
+{
+	unsigned t = mtile_n(), p, extra;
+
+	if (m % 2)
+		return 1;
+	while (t > 1 && m / t < mtile_min())
+		t--;
+	if (t < 2)
+		return 1;
+	p = m / 2;              /* pairs of rows */
+	extra = p % t;
+	for (unsigned b = 0; b < t; b++)
+		rows[b] = 2 * (p / t + (b < extra ? 1u : 0u));
+	return t;
+}
+
+struct mtile_blk {
+	unsigned r0, mb, bank, live, claimed;
+	unsigned obi[NPU_GROUP_MAX];
+	uint64_t sdev[NPU_GROUP_MAX];
+	size_t stride[NPU_GROUP_MAX];
+	unsigned char *seen;
+};
+
+struct mtile_call {
+	struct charsiu_npu *g;
+	struct npu_entry *const *es;
+	unsigned n;
+	const float *X;
+	float *const *Ys;
+	unsigned nsl[NPU_GROUP_MAX][2], wide[NPU_GROUP_MAX];
+	size_t soff[NPU_GROUP_MAX], stot;
+	unsigned nslots[2], mbmax;
+	int cur;                /* the tile bank swapped in, or -1 */
+};
+
+static void mtile_bank_in(struct mtile_call *c, unsigned bank)
+{
+	bank_swap_with(c->g, &c->g->bank_tile[bank]);
+	c->cur = (int)bank;
+}
+
+static void mtile_bank_out(struct mtile_call *c)
+{
+	if (c->cur >= 0)
+		bank_swap_with(c->g, &c->g->bank_tile[c->cur]);
+	c->cur = -1;
+}
+
+static int mtile_issue(struct mtile_call *c, struct mtile_blk *B)
+{
+	struct charsiu_npu *g = c->g;
+	struct npu_entry *const *es = c->es;
+	const float *Xb = c->X + (size_t)B->r0 * es[0]->t->k;
+	struct charsiu_joblist jl;
+	unsigned i, j;
+
+	mtile_bank_in(c, B->bank);
+	for (i = 0; i < c->n; i++) {
+		unsigned mo = c->nsl[i][0] > c->nsl[i][1] ? c->nsl[i][0]
+							  : c->nsl[i][1];
+		struct npu_outbuf *ob = batch_outbuf_t(g, c->wide[i], mo,
+						       B->mb, c->mbmax);
+
+		if (!ob)
+			return -1;
+		B->obi[i] = (unsigned)(ob - g->obuf);
+		ob->pending = 1;
+		B->claimed = i + 1;
+		B->stride[i] = (size_t)c->wide[i] * B->mb * 4;
+		B->sdev[i] = 0;
+	}
+	/* the bank holds rows the caller never declared anything about */
+	reuse_keys_drop(g->bin_key, 2);
+	pack2_call_reset(g);
+	for (unsigned d = 0; d < g->ndev; d++) {
+		unsigned nt = 0, nh = 0, no = 0, done_ki = 0, use_ki = 0;
+		uint32_t outh[NPU_GROUP_MAX];
+		double tp = now_us(), tpe;
+
+		if (!c->nslots[d])
+			continue;
+		for (i = 0; i < c->n; i++)
+			for (j = 0; j < es[i]->count; j++)
+				if (g->slot[es[i]->first + j].di == d)
+					use_ki |= 1u << (j / es[i]->n_slices);
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, use_ki))
+				g->handles[nh++] = g->bin[d][ki].handle;
+		for (i = 0; i < c->n; i++)
+			for (j = 0; j < es[i]->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[es[i]->first + j];
+				unsigned ki = j / es[i]->n_slices;
+
+				if (s->di != d || ((done_ki >> ki) & 1u))
+					continue;
+				done_ki |= 1u << ki;
+				batch_pack_slice(g, es[i], s, ki, d, Xb, B->mb,
+						 NULL);
+			}
+		tpe = now_us();
+		for (i = 0; i < c->n; i++) {
+			struct npu_outbuf *ob = &g->obuf[B->obi[i]];
+			unsigned nti = 0;
+
+			for (j = 0; j < es[i]->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[es[i]->first + j];
+				unsigned ki = j / es[i]->n_slices;
+				struct charsiu_job job = s->job;
+				size_t nreg;
+
+				if (s->di != d)
+					continue;
+				job.mm.m = B->mb;
+				job.input_addr = (uint32_t)g->bin[d][bin_idx(g, ki)].dma_address
+					       + (uint32_t)bin_off(g, ki);
+				job.output_addr = (uint32_t)ob->bo[d].dma_address
+						+ (uint32_t)(nti * B->stride[i]);
+				nreg = charsiu_emit_job(&job,
+					(uint64_t *)((uint8_t *)g->breg[d].map
+						     + (size_t)nt * 4096),
+					4096 / 8);
+				if (!nreg) {
+					whine(g, "the batched register stream "
+					      "came back empty",
+					      (unsigned)job.mm.k,
+					      (unsigned)job.mm.n);
+					return -1;
+				}
+				g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
+						    + (uint32_t)(nt * 4096);
+				g->tasks[nt].regcmd_count = (unsigned)nreg;
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+				nt++;
+				nti++;
+				g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
+			}
+			if (nti)
+				outh[no++] = ob->bo[d].handle;
+		}
+		/* ONE HANDLE ONCE: rocket drops a job that lists a BO twice */
+		{
+			unsigned w = 0;
+
+			for (unsigned a = 0; a < nh; a++) {
+				unsigned b;
+
+				for (b = 0; b < w; b++)
+					if (g->handles[b] == g->handles[a])
+						break;
+				if (b == w)
+					g->handles[w++] = g->handles[a];
+			}
+			nh = w;
+		}
+		g->bpack_emit_us += now_us() - tpe;
+		tpe = now_us();
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, done_ki))
+				charsiu_bo_fini(g->dev[d], &g->bin[d][ki]);
+		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_fini_us += now_us() - tpe;
+		g->bpack_us += now_us() - tp;
+		if (!nt)
+			continue;
+		tp = now_us();
+		jl.tasks = g->tasks;
+		jl.task_count = nt;
+		jl.in_handles = g->handles;
+		jl.in_count = nh;
+		jl.out_handles = outh;
+		jl.out_count = no;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			g->dead = 1;
+			return -1;
+		}
+		g->submits++;
+		B->live = 1;
+		for (i = 0; i < c->n; i++)
+			if (c->nsl[i][d])
+				g->obuf[B->obi[i]].busy |= 1u << d;
+		g->bsub_us += now_us() - tp;
+	}
+	mtile_bank_out(c);
+	return 0;
+}
+
+/* fence and read one block, device by device in ascending order, then its
+ * scale; the bank goes back in first because an int8 read takes its row
+ * scales out of the bank's d1 */
+static int mtile_complete(struct mtile_call *c, struct mtile_blk *B)
+{
+	struct charsiu_npu *g = c->g;
+	unsigned i;
+
+	mtile_bank_in(c, B->bank);
+	for (unsigned d = 0; d < g->ndev; d++)
+		for (i = 0; i < c->n; i++) {
+			struct npu_outbuf *ob = &g->obuf[B->obi[i]];
+			double w;
+
+			if (!c->nsl[i][d])
+				continue;
+			w = fence_bo(g, d, &ob->bo[d]);
+			fence_width(g, c->wide[i], w,
+				    mac_for_dev(g, c->es[i], d, B->mb));
+			ob->busy &= ~(1u << d);
+			if (group_read_member(g, c->es[i], ob, d,
+					      c->Ys[i] + (size_t)B->r0
+							 * c->es[i]->t->n,
+					      B->mb, B->seen + c->soff[i],
+					      &B->sdev[i], B->stride[i]))
+				return -1;
+		}
+	for (i = 0; i < c->n; i++)
+		tail_scale_apply(g, c->es[i],
+				 c->Ys[i] + (size_t)B->r0 * c->es[i]->t->n,
+				 B->mb, tail_fuse_for(g, c->es[i]));
+	B->live = 0;
+	for (i = 0; i < B->claimed; i++)
+		g->obuf[B->obi[i]].pending = 0;
+	B->claimed = 0;
+	mtile_bank_out(c);
+	return 0;
+}
+
+/*
+ * 1 when it declined and did nothing (the caller runs its untiled call), 0
+ * when every member's Y is written, -1 on a fault. Every refusal comes before
+ * the first side effect; past that, a fault drains every block still in
+ * flight and releases every buffer it claimed.
+ */
+static int npu_mtile_try(struct charsiu_npu *g, const int *ids, unsigned n,
+			 const float *X, unsigned m, float *const *Ys)
+{
+	struct npu_entry *es[NPU_GROUP_MAX];
+	struct mtile_blk blk[MTILE_MAX];
+	struct mtile_call c;
+	unsigned rows[MTILE_MAX], T, i, j, most, maxns = 0;
+	unsigned char *seen = NULL;
+	double t0, tprep = now_us();
+	int rc = -1;
+
+	if (mtile_n() < 2 || n < 1 || n > NPU_GROUP_MAX || g->ndev > 2 ||
+	    g->tail_skip || (g->ndev > 1 && batch_serial_for(m)))
+		return 1;
+	T = mtile_plan(m, rows);
+	if (T < 2 || is_small_m(rows[T - 1]))
+		return 1;
+	memset(&c, 0, sizeof(c));
+	c.g = g; c.es = es; c.n = n; c.X = X; c.Ys = Ys; c.cur = -1;
+	c.mbmax = rows[0];
+	for (i = 0; i < n; i++) {
+		es[i] = &g->ent[ids[i]];
+		if (es[i]->t->kscale || es[i]->k_slices > 32)
+			return 1;
+		/* every block width must batch on its own; asked once a
+		 * width, and the plan has at most two */
+		if (batch_refused(g, ids[i], rows[0]) ||
+		    (rows[T - 1] != rows[0] &&
+		     batch_refused(g, ids[i], rows[T - 1])))
+			return 1;
+		c.wide[i] = 0;
+		for (j = 0; j < es[i]->count; j++) {
+			const struct npu_slot *s = &g->slot[es[i]->first + j];
+
+			c.nsl[i][s->di]++;
+			c.nslots[s->di]++;
+			if (s->job.mm.n > c.wide[i])
+				c.wide[i] = (unsigned)s->job.mm.n;
+		}
+		if (es[i]->n_slices > maxns)
+			maxns = es[i]->n_slices;
+		c.soff[i] = c.stot;
+		c.stot += es[i]->n_slices;
+	}
+	most = c.nslots[0] > c.nslots[1] ? c.nslots[0] : c.nslots[1];
+	if (most > 4 * g->max_slices ||
+	    (size_t)es[0]->k_slices + 2 * (size_t)most >
+	    (size_t)9 * g->max_slices + 8)
+		return 1;
+
+	/* from here nothing declines */
+	if (npu_flush_pending(g))
+		return -1;
+	/* the large bank live, so neither swap below crosses the small one */
+	if (bank_select(g, m))
+		return -1;
+	for (unsigned b = 0; b < 2; b++) {
+		int bad;
+
+		mtile_bank_in(&c, b);
+		bad = batch_bufs(g, c.mbmax, es[0]->k_slices, most);
+		mtile_bank_out(&c);
+		if (bad)
+			return -1;
+	}
+	if (g->bseen_n < maxns) {
+		unsigned char *t2 = realloc(g->bseen, maxns);
+
+		if (!t2)
+			return -1;
+		g->bseen = t2;
+		g->bseen_n = maxns;
+	}
+	seen = calloc((size_t)T * (c.stot ? c.stot : 1), 1);
+	if (!seen)
+		return -1;
+	memset(blk, 0, sizeof(blk));
+	for (unsigned b = 0, r0 = 0; b < T; b++) {
+		blk[b].r0 = r0;
+		blk[b].mb = rows[b];
+		blk[b].bank = b & 1u;
+		blk[b].seen = seen + (size_t)b * c.stot;
+		r0 += rows[b];
+	}
+	/* the main bank's keys describe an X this call may be overwriting the
+	 * meaning of: a later "unchanged" must not match them */
+	reuse_keys_drop(g->bin_key, 2);
+	g->last_ob = NULL;
+	if (batch_zero())
+		for (i = 0; i < n; i++)
+			memset(Ys[i], 0, (size_t)m * es[i]->t->n * sizeof(float));
+	g->bprep_us += now_us() - tprep;
+	t0 = now_us();
+
+	if (mtile_sync()) {
+		for (unsigned b = 0; b < T; b++)
+			if (mtile_issue(&c, &blk[b]) ||
+			    mtile_complete(&c, &blk[b]))
+				goto out;
+	} else {
+		if (mtile_issue(&c, &blk[0]) || mtile_issue(&c, &blk[1]))
+			goto out;
+		for (unsigned b = 0; b < T; b++) {
+			if (mtile_complete(&c, &blk[b]))
+				goto out;
+			if (b + 2 < T && mtile_issue(&c, &blk[b + 2]))
+				goto out;
+		}
+	}
+	g->busy_us += now_us() - t0;
+	g->btile_calls++;
+	g->btile_blocks += T;
+	rc = 0;
+out:
+	mtile_bank_out(&c);
+	for (unsigned b = 0; b < T; b++) {
+		for (i = 0; i < blk[b].claimed; i++) {
+			struct npu_outbuf *ob = &g->obuf[blk[b].obi[i]];
+
+			for (unsigned d = 0; d < g->ndev; d++)
+				pipe_drain_one(g, ob, (int)d);
+			ob->pending = 0;
+		}
+		blk[b].claimed = 0;
+	}
+	free(seen);
+	return rc;
+}
+
+static int npu_matmul_group_inner(struct charsiu_npu *g, const int *ids,
+				  unsigned n, const float *X, unsigned m,
+				  float *const *Ys)
+{
+	struct npu_entry *es[NPU_GROUP_MAX];
+	struct npu_outbuf *obs[NPU_GROUP_MAX];
+	unsigned obi[NPU_GROUP_MAX], wide[NPU_GROUP_MAX];
+	unsigned nsl[NPU_GROUP_MAX][2];
+	size_t stride[NPU_GROUP_MAX], soff[NPU_GROUP_MAX], stot = 0;
+	uint64_t sdev[NPU_GROUP_MAX];
+	unsigned nslots[2] = { 0, 0 }, most, maxns = 0, i, j;
+	unsigned char *seen = NULL;
+	struct charsiu_joblist jl;
+	double t0, tprep = now_us();
+	uint8_t zp;
+	int rc = -1, pipe = 0, fly = -1;
+	unsigned rd[NPU_GROUP_MAX], scaled = 0;
+
+	if (!g || g->dead || n < 2 || n > NPU_GROUP_MAX || m < 2 ||
+	    g->ndev > 2)
+		return -1;
+	for (i = 0; i < n; i++) {
+		if (ids[i] < 0 || (unsigned)ids[i] >= g->n_ent)
+			return -1;
+		for (j = 0; j < i; j++)
+			if (ids[j] == ids[i] || Ys[j] == Ys[i])
+				return -1;
+	}
+	/*
+	 * EVERY REFUSAL BEFORE ANY WORK. Nothing below this block may refuse
+	 * a shape: past it a -1 is a fault, and the caller's fallback still
+	 * rewrites every Y, but a refusal found halfway would have flushed
+	 * and packed for nothing.
+	 */
+	for (i = 0; i < n; i++) {
+		if (batch_refused(g, ids[i], m))
+			return -1;
+		es[i] = &g->ent[ids[i]];
+	}
+	for (i = 0; i < n; i++) {
+		const struct npu_entry *e = es[i];
+
+		/* AWQ's factor goes on in the pack, per tensor: the single
+		 * call carries it and a shared pack would have to prove the
+		 * factors equal. Not worth it here; the members run alone. */
+		if (e->t->kscale) {
+			whine(g, "a grouped batch does not carry AWQ factors, "
+			      "so its members run one at a time",
+			      (unsigned)e->t->k, (unsigned)e->t->n);
+			return -1;
+		}
+		/* done_ki / use_ki are u32 bitmaps, see npu_matmul_inner */
+		if (e->k_slices > 32 || e->k_slices != es[0]->k_slices ||
+		    e->t->k != es[0]->t->k) {
+			whine(g, "a grouped batch needs one K and one K "
+			      "slicing across its members",
+			      (unsigned)e->t->k, (unsigned)e->t->n);
+			return -1;
+		}
+		/* ONE PACK SERVES ALL OF THEM ONLY IF EVERY K COLUMN IS THE
+		 * SAME COLUMNS OF X with the same zero point; slice_k can
+		 * depend on the tensor (KFIT), so ask the slots */
+		for (unsigned ki = 0; ki < e->k_slices; ki++) {
+			const struct npu_slot *a = &g->slot[e->first +
+							    ki * e->n_slices];
+			const struct npu_slot *b = &g->slot[es[0]->first +
+							    ki * es[0]->n_slices];
+
+			if (a->k0 != b->k0 || a->job.mm.k != b->job.mm.k ||
+			    a->job.input_zero_point != b->job.input_zero_point) {
+				whine(g, "a grouped batch needs its members' K "
+				      "slices to cover the same columns",
+				      (unsigned)e->t->k, (unsigned)e->t->n);
+				return -1;
+			}
+		}
+		nsl[i][0] = nsl[i][1] = 0;
+		wide[i] = 0;
+		for (j = 0; j < e->count; j++) {
+			const struct npu_slot *s = &g->slot[e->first + j];
+
+			nsl[i][s->di]++;
+			nslots[s->di]++;
+			if (s->job.mm.n > wide[i])
+				wide[i] = (unsigned)s->job.mm.n;
+		}
+		if (e->n_slices > maxns)
+			maxns = e->n_slices;
+		soff[i] = stot;
+		stot += e->n_slices;
+	}
+	most = nslots[0] > nslots[1] ? nslots[0] : nslots[1];
+	/* what g->tasks and g->handles were sized for at open: one tensor's
+	 * worth of slices times a margin, which a group can exceed */
+	if (most > 4 * g->max_slices ||
+	    (size_t)es[0]->k_slices + 2 * (size_t)most >
+	    (size_t)9 * g->max_slices + 8) {
+		whine(g, "a grouped batch has more slots than one submit "
+		      "has room for", (unsigned)es[0]->t->k, most);
+		return -1;
+	}
+
+	/* ROW TILES: every member checked above, so the tiled run asks only
+	 * its own questions; 1 is a decline with nothing done */
+	{
+		int tr = npu_mtile_try(g, ids, n, X, m, Ys);
+
+		if (tr < 0)
+			return -1;
+		if (!tr) {
+			g->bgroup_n++;
+			g->bgroup_members += n;
+			return 0;
+		}
+	}
+	/* from here nothing refuses. An earlier call's deferred answer is
+	 * written out first: this call reuses its buffer pool and its g->bseen,
+	 * and owes the caller no deferral of its own. */
+	if (npu_flush_pending(g))
+		return -1;
+	/* the members share X and K, so one set of row scales serves all */
+	if (g->exact8 && exact8_rows(g, X, m, (unsigned)es[0]->t->k))
+		return -1;
+	if (batch_bufs(g, m, es[0]->k_slices, most))
+		return -1;
+	/*
+	 * ONE OUTPUT BUFFER PER MEMBER. Claimed with `pending` so the next
+	 * member of the same geometry is handed a different one, and kept as
+	 * INDICES while the pool may still grow: batch_outbuf reallocs
+	 * g->obuf, which would leave an earlier member's pointer dangling.
+	 * The claims are released before anything can return, since nothing
+	 * after the loop asks the pool for a buffer.
+	 */
+	for (i = 0; i < n; i++) {
+		unsigned mo = nsl[i][0] > nsl[i][1] ? nsl[i][0] : nsl[i][1];
+		struct npu_outbuf *ob = batch_outbuf(g, wide[i], mo, m);
+
+		if (!ob)
+			break;
+		obi[i] = (unsigned)(ob - g->obuf);
+		ob->pending = 1;
+	}
+	for (j = 0; j < i; j++)
+		g->obuf[obi[j]].pending = 0;
+	if (i < n)
+		return -1;
+	for (i = 0; i < n; i++) {
+		obs[i] = &g->obuf[obi[i]];
+		stride[i] = (size_t)wide[i] * m * 4;
+		sdev[i] = 0;
+	}
+	g->last_ob = obs[n - 1];
+	g->last_id = ids[n - 1];
+
+	/* the first-write flags, one set per member, and g->bseen big enough
+	 * to hold any one of them while it is read */
+	seen = calloc(stot ? stot : 1, 1);
+	if (!seen)
+		return -1;
+	if (g->bseen_n < maxns) {
+		unsigned char *t2 = realloc(g->bseen, maxns);
+
+		if (!t2)
+			goto out;
+		g->bseen = t2;
+		g->bseen_n = maxns;
+	}
+	if (batch_zero())
+		for (i = 0; i < n; i++)
+			memset(Ys[i], 0, (size_t)m * es[i]->t->n * sizeof(float));
+	g->bprep_us += now_us() - tprep;
+	t0 = now_us();
+
+	zp = g->slot[es[0]->first].job.input_zero_point;
+	/* a LEADER: X is new everywhere, whatever the keys say (reusekey.h) */
+	reuse_keys_drop(g->bin_key, sizeof(g->bin_key) / sizeof(g->bin_key[0]));
+
+	/* see mm_pipe; rd[i] is the devices member i has been read from */
+	pipe = mm_pipe_for(g, m);
+	for (i = 0; i < n; i++)
+		rd[i] = 0;
+	pack2_call_reset(g);
+
+	for (unsigned dd = 0; dd < g->ndev; dd++) {
+		unsigned d = g->ndev == 2 && submit_first() ? dd ^ 1u : dd;
+		unsigned nt = 0, nh = 0, no = 0, done_ki = 0, use_ki = 0;
+		uint32_t outh[NPU_GROUP_MAX];
+		double tp = now_us();
+
+		if (!nslots[d])
+			continue;
+		for (i = 0; i < n; i++)
+			for (j = 0; j < es[i]->count; j++)
+				if (g->slot[es[i]->first + j].di == d)
+					use_ki |= 1u << (j / es[i]->n_slices);
+		if (g->inprep) {
+			for (unsigned ki = 0; ki < g->bin_nks; ki++)
+				if (bin_used(g, ki, use_ki))
+					charsiu_bo_prep(g->dev[d],
+							&g->bin[d][ki],
+							1000000000);
+			charsiu_bo_prep(g->dev[d], &g->breg[d], 1000000000);
+		}
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, use_ki))
+				g->handles[nh++] = g->bin[d][ki].handle;
+		/* ONCE PER K SLICE FOR THE WHOLE GROUP: that is the point */
+		for (i = 0; i < n; i++)
+			for (j = 0; j < es[i]->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[es[i]->first + j];
+				unsigned ki = j / es[i]->n_slices;
+
+				if (s->di != d || ((done_ki >> ki) & 1u))
+					continue;
+				done_ki |= 1u << ki;
+				batch_pack_slice(g, es[i], s, ki, d, X, m,
+						 NULL);
+			}
+
+		double tpe = now_us();
+
+		for (i = 0; i < n; i++) {
+			unsigned nti = 0;   /* this member's region on d */
+
+			for (j = 0; j < es[i]->count; j++) {
+				const struct npu_slot *s =
+					&g->slot[es[i]->first + j];
+				unsigned ki = j / es[i]->n_slices;
+				struct charsiu_job job = s->job;
+				size_t nreg;
+
+				if (s->di != d)
+					continue;
+				job.mm.m = m;
+				job.input_addr = (uint32_t)g->bin[d][bin_idx(g, ki)].dma_address
+					       + (uint32_t)bin_off(g, ki);
+				/* the SAME rank batch_read_device walks:
+				 * the slot's position among this member's
+				 * slots on this device */
+				job.output_addr = (uint32_t)obs[i]->bo[d].dma_address
+						+ (uint32_t)(nti * stride[i]);
+				nreg = charsiu_emit_job(&job,
+					(uint64_t *)((uint8_t *)g->breg[d].map
+						     + (size_t)nt * 4096),
+					4096 / 8);
+				if (!nreg) {
+					whine(g, "the batched register stream "
+					      "came back empty",
+					      (unsigned)job.mm.k,
+					      (unsigned)job.mm.n);
+					for (unsigned kj = 0; kj < g->bin_nks; kj++)
+						if (bin_used(g, kj, done_ki))
+							charsiu_bo_fini(g->dev[d],
+								&g->bin[d][kj]);
+					charsiu_bo_fini(g->dev[d], &g->breg[d]);
+					goto out;
+				}
+				g->tasks[nt].regcmd = (uint32_t)g->breg[d].dma_address
+						    + (uint32_t)(nt * 4096);
+				g->tasks[nt].regcmd_count = (unsigned)nreg;
+				g->handles[nh++] = s->wt.handle;
+				g->handles[nh++] = s->coef.handle;
+				nt++;
+				nti++;
+				g->weight_mb += (double)charsiu_weight_bytes(&s->job.mm) / 1e6;
+			}
+			if (nti)
+				outh[no++] = obs[i]->bo[d].handle;
+		}
+		g->bpack_emit_us += now_us() - tpe;
+		tpe = now_us();
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			if (bin_used(g, ki, done_ki))
+				charsiu_bo_fini(g->dev[d], &g->bin[d][ki]);
+		charsiu_bo_fini(g->dev[d], &g->breg[d]);
+		g->bpack_fini_us += now_us() - tpe;
+		g->bpack_us += now_us() - tp;
+		if (done_ki)
+			reuse_key_set(&g->bin_key[d], X, m, es[0]->t->k, zp,
+				      done_ki, 0);
+		if (!nt)
+			continue;
+		/* THE PIPE: the device in flight is fenced only now, after
+		 * this one's pack, and still before this one is submitted */
+		if (pipe && fly >= 0)
+			for (i = 0; i < n; i++) {
+				if (!nsl[i][fly])
+					continue;
+				double w = fence_bo(g, (unsigned)fly,
+						    &obs[i]->bo[fly]);
+
+				fence_width(g, wide[i], w,
+					    mac_for_dev(g, es[i],
+							(unsigned)fly, m));
+				obs[i]->busy &= ~(1u << fly);
+			}
+		tp = now_us();
+		jl.tasks = g->tasks;
+		jl.task_count = nt;
+		jl.in_handles = g->handles;
+		jl.in_count = nh;
+		jl.out_handles = outh;
+		jl.out_count = no;
+		if (charsiu_submit_jobs(g->dev[d], &jl, 1)) {
+			g->strikes = 3;
+			g->dead = 1;
+			goto out;
+		}
+		g->submits++;
+		for (i = 0; i < n; i++)
+			if (nsl[i][d])
+				obs[i]->busy |= 1u << d;
+		g->bsub_us += now_us() - tp;
+		if (pipe) {
+			/* the fenced device's members are read while this one
+			 * computes, and a member that device finished is
+			 * scaled too: its sum is complete */
+			if (fly >= 0)
+				for (i = 0; i < n; i++) {
+					if (!nsl[i][fly])
+						continue;
+					if (group_read_member(g, es[i], obs[i],
+							(unsigned)fly, Ys[i], m,
+							seen + soff[i], &sdev[i],
+							stride[i]))
+						goto out;
+					rd[i] |= 1u << fly;
+					if (!nsl[i][d]) {
+						tail_scale_apply(g, es[i],
+								 Ys[i], m,
+								 tail_fuse_for(g, es[i]));
+						scaled |= 1u << i;
+					}
+				}
+			fly = (int)d;
+			continue;
+		}
+		/* THE CORE PAIR: see npu_matmul_inner. Serialised, this
+		 * device finishes before the other is submitted. */
+		if (batch_serial_for(m) && g->ndev > 1)
+			for (i = 0; i < n; i++) {
+				if (!nsl[i][d])
+					continue;
+				double w = fence_bo(g, d, &obs[i]->bo[d]);
+
+				fence_width(g, wide[i], w,
+					    mac_for_dev(g, es[i], d, m));
+				obs[i]->busy &= ~(1u << d);
+			}
+	}
+
+	/*
+	 * FENCE A DEVICE, GATHER EVERY MEMBER IT HOLDS, THEN THE NEXT, so the
+	 * first device's gather runs while the second is still computing. One
+	 * job covers all of a device's members: the first member's fence
+	 * carries the wait and the rest find it signalled (and still pay the
+	 * whole-buffer invalidate of their own buffer, as a single call would).
+	 * A member with no slot on a device is neither fenced nor read there.
+	 */
+	for (unsigned d = 0; d < g->ndev; d++)
+		for (i = 0; i < n; i++) {
+			if (!nsl[i][d] || ((rd[i] >> d) & 1u))
+				continue;
+			{
+				double w = fence_bo(g, d, &obs[i]->bo[d]);
+
+				fence_width(g, wide[i], w,
+					    mac_for_dev(g, es[i], d, m));
+			}
+			obs[i]->busy &= ~(1u << d);
+			if (group_read_member(g, es[i], obs[i], d, Ys[i], m,
+					      seen + soff[i], &sdev[i],
+					      stride[i]))
+				goto out;
+		}
+	g->busy_us += now_us() - t0;
+	for (i = 0; i < n; i++)
+		if (!((scaled >> i) & 1u))
+			tail_scale_apply(g, es[i], Ys[i], m,
+					 tail_fuse_for(g, es[i]));
+	g->bgroup_n++;
+	g->bgroup_members += n;
+	rc = 0;
+out:
+	/* a fault with a device still computing: see pipe_drain_one */
+	if (rc)
+		for (i = 0; i < n; i++)
+			for (unsigned d = 0; d < g->ndev; d++)
+				pipe_drain_one(g, obs[i], (int)d);
+	free(seen);
+	return rc;
+}
+
+int charsiu_npu_matmul_group(struct charsiu_npu *g, const int *ids,
+			     unsigned n, const float *X, unsigned m,
+			     float *const *Ys)
+{
+	double t0 = now_us();
+	int rc;
+
+	if (!g)
+		return -1;
+	if (alt_ids(g, ids, n)) {
+		int aids[NPU_GROUP_MAX];
+
+		if (alt_ids(g, ids, n) < 0 || n > NPU_GROUP_MAX ||
+		    npu_flush_pending(g))
+			return -1;
+		for (unsigned i = 0; i < n; i++)
+			aids[i] = ids[i] - NPU_ALT_ID;
+		return charsiu_npu_matmul_group(g->alt, aids, n, X, m, Ys);
+	}
+	g->reuse_ask = 0;
+	rc = npu_matmul_group_inner(g, ids, n, X, m, Ys);
+	if (rc)
+		g->bgroup_fell++;
 	g->bwall_us += now_us() - t0;
 	return rc;
 }
@@ -7499,6 +10950,9 @@ int charsiu_npu_slot_deal(const struct charsiu_npu *g, int id, unsigned i,
 	const struct npu_entry *e;
 	const struct npu_slot *s;
 
+	if (alt_id(g, id))
+		return charsiu_npu_slot_deal(g->alt, id - NPU_ALT_ID, i, di, ki,
+					     n0, n1);
 	if (!g || id < 0 || (unsigned)id >= g->n_ent)
 		return -1;
 	e = &g->ent[id];
@@ -7538,6 +10992,9 @@ int charsiu_npu_slot_word(struct charsiu_npu *g, int id, unsigned i, unsigned r,
 	const uint8_t *base;
 	unsigned nt = 0, d, cc, idx, ki;
 
+	if (alt_id(g, id))
+		return charsiu_npu_slot_word(g->alt, id - NPU_ALT_ID, i, r, c,
+					     fresh, raw, contrib, final);
 	if (!g || id < 0 || (unsigned)id >= g->n_ent || !g->last_ob ||
 	    g->last_id != id || !g->bmap)
 		return -1;
@@ -7634,7 +11091,20 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	uint32_t outh[8];
 	unsigned nh = 0, ntask = 0, i, j;
 	double t0, t1, tpack, fspent = 0.0, tcall = now_us();
+	double cp_s0[2] = { 0, 0 }, cp_s1[2] = { 0, 0 }, cp_d[2] = { 0, 0 };
+	double cp_mb[2] = { 0, 0 }, tpacked = 0.0;
+	unsigned cp_nt[2] = { 0, 0 }, cp_sent = 0;
+	struct charsiu_bo *cpb[2] = { NULL, NULL };
 
+	if (alt_ids(g, ids, n)) {
+		int aids[8];
+
+		if (alt_ids(g, ids, n) < 0 || n > 8)
+			return -1;
+		for (i = 0; i < n; i++)
+			aids[i] = ids[i] - NPU_ALT_ID;
+		return charsiu_npu_matvec_group(g->alt, aids, n, a, ys);
+	}
 	if (g->dead || !n || n > 8)
 		return -1;
 	for (i = 0; i < n; i++)
@@ -7704,6 +11174,15 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 
 	tpack = now_us();
 	for (unsigned d = 0; d < g->ndev; d++) {
+		uint64_t kneed = ~0ull;
+
+		if (pack_needed_on()) {
+			kneed = 0;
+			for (unsigned gi = 0; gi < n; gi++)
+				kneed |= kmask_for(g, &g->ent[ids[gi]], d);
+			if (!kneed)
+				continue;
+		}
 		nd++;
 	charsiu_note("a group: packing the activation", (unsigned long)d,
 		     (unsigned long)e0->k_slices);
@@ -7711,6 +11190,9 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		charsiu_bo_prep(g->dev[d], &g->in[d], 1000000000);
 	for (unsigned ki = 0; ki < e0->k_slices; ki++) {
 		const struct npu_slot *s = &g->slot[e0->first + ki * e0->n_slices];
+
+		if (ki < 64 && !(kneed & (1ull << ki)))
+			continue;
 
 		if (w4_for(g, e0->t)) {
 			const float *src = a->f + s->k0;
@@ -7751,9 +11233,10 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					   s->job.input_zero_point);
 		}
 	}
-	charsiu_bo_fini(g->dev[d], &g->in[d]);
+	in_flush(g, d, kneed, e0->k_slices);
 	}
-	g->pack_us += now_us() - tpack;
+	tpacked = now_us();
+	g->pack_us += tpacked - tpack;
 	(void)nd;
 	}
 
@@ -7769,8 +11252,42 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	 * the only place in the decode where a second core can be worth
 	 * anything.
 	 */
+	if (callprof() == 2)
+		cp_fill(g, ids, n);
+	/*
+	 * CHARSIU_NPU_SUBMIT_ORDER (default on, =0 the control): the core
+	 * with more to do goes first. The
+	 * second submit starts its core about 10 us after the first, and on
+	 * Qwen3-0.6B's q/k/v it is core 1 that carries two tasks (k and v)
+	 * against core 0's one (q) -- so the call waited on the late starter.
+	 * Which core starts first changes nothing either core computes.
+	 * Measured +0.4..1.3% decode in three paired rounds, every pair the
+	 * same sign -- inside the arm's own 3% spread, so it is on because it
+	 * cannot be worse, not because it is proven better.
+	 */
+	unsigned sorder[2] = { 0, 1 };
+
+	if (g->ndev == 2 && submit_order_on()) {
+		double c[2] = { 0.0, 0.0 };
+
+		for (i = 0; i < n; i++) {
+			const struct npu_entry *e = &g->ent[ids[i]];
+
+			for (j = 0; j < e->count; j++) {
+				const struct npu_slot *sl = &g->slot[e->first + j];
+
+				c[sl->di] += 25.0 + 115.0 * slice_mb(w4_for(g, e->t),
+						sl->job.mm.k, sl->job.mm.n);
+			}
+		}
+		if (c[1] > c[0]) {
+			sorder[0] = 1;
+			sorder[1] = 0;
+		}
+	}
 	t0 = now_us();
-	for (unsigned d = 0; d < g->ndev; d++) {
+	for (unsigned dd = 0; dd < g->ndev; dd++) {
+		unsigned d = g->ndev == 2 ? sorder[dd] : dd;
 		unsigned no = 0;
 
 		charsiu_note("a group: building the joblist", (unsigned long)d,
@@ -7797,15 +11314,25 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					(uint32_t)s->regcmd.dma_address;
 				g->tasks[ntask].regcmd_count = s->nreg;
 				ntask++;
-				g->handles[nh++] = s->wt.handle;
-				g->handles[nh++] = s->coef.handle;
+				if (!lean_handles_on()) {
+					g->handles[nh++] = s->wt.handle;
+					g->handles[nh++] = s->coef.handle;
+				}
+				cp_mb[d] += slice_mb(w4_for(g, e->t),
+						     s->job.mm.k, s->job.mm.n);
 				any = 1;
 			}
-			if (any)
+			if (any) {
+				if (!cpb[d])
+					cpb[d] = &e->out[d];
 				outh[no++] = e->out[d].handle;
+			}
 		}
 		if (!no)
 			continue;
+		cp_sent |= 1u << d;
+		cp_nt[d] = ntask;
+		cp_s0[d] = now_us();
 		jl.tasks = g->tasks;
 		jl.task_count = ntask;
 		jl.in_handles = g->handles;
@@ -7821,6 +11348,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 				"failed on device %u\n", ntask, d);
 			return -1;
 		}
+		cp_s1[d] = now_us();
 		g->submits++;
 	}
 	g->submit_us += now_us() - t0;
@@ -7854,6 +11382,23 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	}
 
 	t1 = now_us();
+	if (callprof() == 2)
+		cp_wait2(g, cp_sent, cpb, cp_d);
+	else if (callprof() > 0)
+		cp_wait(g, cp_sent, cpb, cp_d);
+	if (ed_ready(g, ids, n, cp_sent)) {
+		if (ed_wait(g, ids, n, cp_sent)) {
+			g->dead = 1;
+			return -1;
+		}
+	} else {
+	if (early_done_on()) {
+		ed_drop(g, ids, n);
+		for (i = 0; i < n; i++)
+			g->ent[ids[i]].armed = 0;
+		ed_plain++;
+		ed_step(65536);
+	}
 	for (i = 0; i < n; i++)
 		for (unsigned d = 0; d < g->ndev; d++) {
 			charsiu_note("a group: waiting on the fence",
@@ -7861,9 +11406,11 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			charsiu_bo_prep(g->dev[d], &g->ent[ids[i]].out[d],
 					2000000000);
 		}
+	}
 	g->fence_us += now_us() - t1;
 
 	t1 = now_us();
+	cp_tprep = t1;
 	for (i = 0; i < n; i++) {
 		struct npu_entry *e = &g->ent[ids[i]];
 		const int32_t *out;
@@ -7883,9 +11430,13 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		 * and nothing else.
 		 */
 		/* the hardware's rows only: the CPU's are already written */
+		int fastc = convert_one_for(g, e);
+
 		charsiu_note("a group: clearing the accumulator",
 			     (unsigned long)e->t->n, (unsigned long)e->n_npu);
-		if (w4_for(g, e->t))
+		if (fastc)
+			;       /* convert_one writes every row once */
+		else if (w4_for(g, e->t))
 			memset(af, 0, (size_t)e->n_npu * sizeof(*af));
 		else
 			memset(g->acc, 0, (size_t)e->t->n * sizeof(*g->acc));
@@ -7944,6 +11495,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			if (w4_for(g, e->t)) {
 				const float *fo = (const float *)base;
 
+				if (fastc) {
+					convert_one(ys[i] + s->n0, fo,
+						    e->t->scale + s->n0,
+						    s->job.mm.n);
+					continue;
+				}
 				if (grp) {
 					double hs = g->midrise
 						  ? 0.5 * g->asum[s->k0 / g->kmax]
@@ -7983,7 +11540,7 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 					charsiu_bo_fini(g->dev[d], &e->out[d]);
 			fspent += now_us() - tf;
 		}
-		if (af != ys[i]) {
+		if (af != ys[i] && !fastc) {
 			double hsu = 0.0;
 
 			charsiu_note("a group: converting to the caller's rows",
@@ -8001,6 +11558,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 			 * the control a wrong answer, which is worse than
 			 * having no control.
 			 */
+			if (g->exact8)
+				for (unsigned q = 0; q < (unsigned)e->t->n; q++)
+					ys[i][q] = exact8_y(g->acc[q],
+							    e->t->scale[q],
+							    a->d1);
+			else
 			for (unsigned q = 0; q < (unsigned)e->t->n; q++)
 				ys[i][q] = w4_for(g, e->t)
 					 ? (grp ? g->accf[q]
@@ -8029,6 +11592,12 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 		account_call(g, ids, n, took);
 	}
 	g->call_us += now_us() - tcall;
+	if (early_done_on())
+		for (i = 0; i < n; i++)
+			ed_queue(g, ids[i]);
+	if (callprof() > 0)
+		cp_record(e0->t->name, tcall, tpacked, cp_s0, cp_s1, cp_d,
+			  cp_sent, cp_nt, cp_mb, now_us());
 	/*
 	 * CLEAR THE BREADCRUMB ON THE WAY OUT, or it outlives the function
 	 * and every crash in the CALLER is reported against the last thing
@@ -8038,4 +11607,159 @@ int charsiu_npu_matvec_group(struct charsiu_npu *g, const int *ids, unsigned n,
 	 */
 	charsiu_note("something outside the NPU code", 0, 0);
 	return 0;
+}
+
+/*
+ * THE FIRST PROMPT PAID FOR THE BUFFERS, AND THE VENDOR'S DOES NOT.
+ *
+ * Every batched geometry allocates its output objects, the input objects and
+ * the scratch on its first call, and the stage table counted it: 13 batch
+ * buffer allocations, 11.5 ms, inside `prep` of a 124 token Qwen3-0.6B
+ * prompt, plus the page faults the first CPU touch of each mapping takes
+ * inside `read` and `pack`, plus the read order table for the new width.
+ * rkllm does all of that in rkllm_init, before its prompt clock starts.
+ *
+ * So a tensor that is staged while a batched chunk of m rows is running gets
+ * them here, at m, inside the staging clock -- the same buffers, the same
+ * pool and the same keys batch_outbuf and batch_bufs would have built a
+ * moment later, so the first call finds them and allocates nothing. Two
+ * output buffers a geometry when the gather may be deferred, because gate
+ * and up are the same geometry and the second one would otherwise allocate
+ * its own while the first still owes a read (see batch_outbuf).
+ *
+ * IT MOVES THE COST, it does not remove it: a one shot run pays it in
+ * `staging` instead of `prompt`. Nothing about the arithmetic changes; the
+ * buffers are read only after the hardware writes them, the touch below is a
+ * READ (a dirty CPU line over an output object would be written back over
+ * the device's answer), and the prep before every read invalidates.
+ *
+ * CHARSIU_NPU_PREWARM=0 is the control.
+ */
+static int prewarm_on(void)
+{
+	static int v = -1;
+
+	if (v < 0)
+		v = charsiu_env_flag("CHARSIU_NPU_PREWARM", 1);
+	return v;
+}
+
+static void prewarm_touch(const struct charsiu_bo *bo)
+{
+	const volatile uint8_t *p = bo->map;
+	uint8_t sink = 0;
+
+	if (!p)
+		return;
+	for (size_t o = 0; o < bo->size; o += 4096)
+		sink ^= p[o];
+	(void)sink;
+}
+
+int charsiu_npu_prewarm(struct charsiu_npu *g, int id, unsigned m)
+{
+	const struct npu_entry *e;
+	unsigned nslots[2] = { 0, 0 }, wide = 0, most, need, got = 0, a_n;
+	unsigned claimed[2];
+	double a_us;
+
+	if (alt_id(g, id))
+		return charsiu_npu_prewarm(g->alt, id - NPU_ALT_ID, m);
+	if (!g || g->dead || !prewarm_on() || id < 0 ||
+	    (unsigned)id >= g->n_ent || m < 2 || is_small_m(m))
+		return 0;
+	e = &g->ent[id];
+	if (batch_refused(g, id, m))
+		return 0;
+	for (unsigned i = 0; i < e->count; i++) {
+		const struct npu_slot *s = &g->slot[e->first + i];
+
+		nslots[s->di]++;
+		if (s->job.mm.n > wide)
+			wide = (unsigned)s->job.mm.n;
+	}
+	most = nslots[0] > nslots[1] ? nslots[0] : nslots[1];
+	if (batch_bufs(g, m, e->k_slices, most))
+		return -1;
+	need = defer_read_on() ? 2 : 1;
+	/* charged to its own counter: batch_outbuf adds to balloc, which the
+	 * stage table prints as "inside prep" -- and this is not */
+	a_us = g->balloc_us;
+	a_n = g->balloc_n;
+	while (got < need) {
+		struct npu_outbuf *ob = batch_outbuf(g, wide, most, m);
+
+		if (!ob)
+			break;
+		for (unsigned d = 0; d < g->ndev; d++)
+			prewarm_touch(&ob->bo[d]);
+		claimed[got++] = (unsigned)(ob - g->obuf);
+		ob->pending = 1;
+	}
+	for (unsigned i = 0; i < got; i++)
+		g->obuf[claimed[i]].pending = 0;
+	g->bprewarm_us += g->balloc_us - a_us;
+	g->bprewarm_n += g->balloc_n - a_n;
+	g->balloc_us = a_us;
+	g->balloc_n = a_n;
+	for (unsigned d = 0; d < g->ndev; d++) {
+		for (unsigned ki = 0; ki < g->bin_nks; ki++)
+			prewarm_touch(&g->bin[d][ki]);
+		prewarm_touch(&g->breg[d]);
+	}
+	/*
+	 * AND THE ROW TILES' OWN, when this width will be tiled: both tile
+	 * banks at the widest block, four output buffers per geometry at the
+	 * block width (two blocks in flight, and gate and up -- or k and v --
+	 * share a geometry), and the read order table for each block width,
+	 * parked. The m table is built last so it is the live one, as before.
+	 */
+	if (mtile_n() > 1 && !e->t->kscale &&
+	    !(g->ndev > 1 && batch_serial_for(m))) {
+		unsigned rows[MTILE_MAX], T = mtile_plan(m, rows);
+
+		if (T > 1 && !is_small_m(rows[T - 1])) {
+			unsigned tc[4], tg = 0;
+
+			for (unsigned b = 0; b < 2; b++) {
+				int bad;
+
+				bank_swap_with(g, &g->bank_tile[b]);
+				bad = batch_bufs(g, rows[0], e->k_slices, most);
+				if (!bad)
+					for (unsigned d = 0; d < g->ndev; d++) {
+						for (unsigned ki = 0;
+						     ki < g->bin_nks; ki++)
+							prewarm_touch(&g->bin[d][ki]);
+						prewarm_touch(&g->breg[d]);
+					}
+				bank_swap_with(g, &g->bank_tile[b]);
+				if (bad)
+					return -1;
+			}
+			a_us = g->balloc_us;
+			a_n = g->balloc_n;
+			while (tg < 4) {
+				struct npu_outbuf *ob = batch_outbuf_t(g, wide,
+						most, rows[0], rows[0]);
+
+				if (!ob)
+					break;
+				for (unsigned d = 0; d < g->ndev; d++)
+					prewarm_touch(&ob->bo[d]);
+				tc[tg++] = (unsigned)(ob - g->obuf);
+				ob->pending = 1;
+			}
+			for (unsigned i = 0; i < tg; i++)
+				g->obuf[tc[i]].pending = 0;
+			g->bprewarm_us += g->balloc_us - a_us;
+			g->bprewarm_n += g->balloc_n - a_n;
+			g->balloc_us = a_us;
+			g->balloc_n = a_n;
+			if (bmap_build(g, e, rows[T - 1]) ||
+			    bmap_build(g, e, rows[0]))
+				return -1;
+		}
+	}
+	return bmap_build(g, e, m);
 }

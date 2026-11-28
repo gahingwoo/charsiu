@@ -6,6 +6,8 @@
 # a refuted number with an unmeasured one.  It is on the board list."  This is
 # that round.  Both arms are the same md5; only the environment moves.
 set -u
+# the plain loop, by name: charsiu_run speculates by default now (board_clk.sh)
+CHARSIU_SPEC="${CHARSIU_SPEC-0}"; export CHARSIU_SPEC
 BIN="${1:-/opt/charsiu/charsiu_run_minmac}"
 N="${2:-4}"
 E="CHARSIU_NPU=1 CHARSIU_NPU_QUANT=1 CHARSIU_NPU_W4V=1 CHARSIU_COEF_ELEMS=65536"
