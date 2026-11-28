@@ -407,8 +407,6 @@ static void wc_prefetch(const void *p, uint64_t n)
 #endif
 
 #ifdef _WIN32
-static double wc_ra_ms = -1.0;  /* the whole-file read-ahead, when it ran */
-
 static double wc_now_ms(void)
 {
 	LARGE_INTEGER c, f;
@@ -417,16 +415,113 @@ static double wc_now_ms(void)
 	QueryPerformanceFrequency(&f);
 	return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
 }
+
+/*
+ * A RECORD IS READ IN THE WAY fread READ IT, THEN USED THROUGH THE MAP.
+ *
+ * Hints did not read fast enough. PrefetchVirtualMemory over the whole
+ * file ran at about 47 MB/s on the TaishanPi's eMMC after a reboot (13.3 s
+ * for 620 MB), where the old build's fread of each record, a large
+ * sequential cached read, finished a whole cold staging in 15.3 s; the
+ * first start was 2.8 s slower than the build it replaced (2026-11-28).
+ * And a hint for the whole file had to be waited for before any buffer was
+ * allocated, or it starved CREATE_BO of free pages (16.4 s of it, the run
+ * before).
+ *
+ * So each record, just before it is handed out, is read with ReadFile on
+ * a handle of its own (FILE_FLAG_SEQUENTIAL_SCAN) into a 4 MB scratch
+ * that is thrown away. A cached read fills the same pages the view maps,
+ * so the packer then takes soft faults only, and the disk sees what it saw
+ * from fread: one record at a time, front to back, in large reads, with
+ * nothing else allocating meanwhile. A record already in memory costs two
+ * 1 MB probe reads (its first and last MB, timed) and nothing more, which
+ * is what keeps a warm start where it was.
+ */
+#define WC_CHUNK   ((DWORD)4 << 20)
+#define WC_PROBE   ((DWORD)1 << 20)
+#define WC_WARM_MS 3.0          /* a 1 MB read faster than this was memory */
+
+static HANDLE wc_seq = INVALID_HANDLE_VALUE;
+static uint8_t *wc_scratch;
+static struct {
+	unsigned served, resident;
+	double bytes, ms;
+	int said;
+} wc_in;
+
+static double wc_pread(uint64_t off, DWORD n)
+{
+	OVERLAPPED o;
+	DWORD got = 0;
+	double t0 = wc_now_ms();
+
+	memset(&o, 0, sizeof(o));
+	o.Offset = (DWORD)off;
+	o.OffsetHigh = (DWORD)(off >> 32);
+	if (!ReadFile(wc_seq, wc_scratch, n, &got, &o))
+		return -1.0;
+	return wc_now_ms() - t0;
+}
+
+static void wc_warm(const uint8_t *p, uint64_t n)
+{
+	uint64_t off, end, at;
+	double t0, a, b;
+	DWORD first;
+
+	if (!p || !n || !wc_map.base)
+		return;
+	if (wc_seq == INVALID_HANDLE_VALUE || !wc_scratch) {
+		wc_prefetch(p, n);
+		return;
+	}
+	off = (uint64_t)(p - wc_map.base);
+	end = off + n;
+	first = n < WC_PROBE ? (DWORD)n : WC_PROBE;
+	t0 = wc_now_ms();
+	a = wc_pread(off, first);
+	b = n > 2ull * WC_PROBE ? wc_pread(end - WC_PROBE, WC_PROBE) : 0.0;
+	if (a >= 0.0 && b >= 0.0 && a < WC_WARM_MS && b < WC_WARM_MS) {
+		wc_in.resident++;
+		return;
+	}
+	for (at = off + first; at < end; at += WC_CHUNK) {
+		DWORD c = end - at < WC_CHUNK ? (DWORD)(end - at) : WC_CHUNK;
+
+		if (wc_pread(at, c) < 0.0)
+			break;
+	}
+	wc_in.bytes += (double)n;
+	wc_in.ms += wc_now_ms() - t0;
+}
+
+static void wc_open_seq(const char *path)
+{
+	wchar_t w[1024];
+
+	if (wc_seq != INVALID_HANDLE_VALUE) {
+		CloseHandle(wc_seq);
+		wc_seq = INVALID_HANDLE_VALUE;
+	}
+	if (!wc_scratch)
+		wc_scratch = VirtualAlloc(NULL, WC_CHUNK, MEM_COMMIT | MEM_RESERVE,
+					  PAGE_READWRITE);
+	if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, (int)(sizeof(w) / sizeof(w[0]))))
+		return;
+	wc_seq = CreateFileW(w, GENERIC_READ,
+			     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			     NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+}
 #endif
 
 /*
  * ONE RECORD AT A TIME, IN AND THEN OUT. Before a record's q is handed out
- * its range is hinted in as large reads (resident pages cost nothing), and
- * the record handed out before it, which the packer has finished with, is
- * taken out of the working set. VirtualUnlock on pages that were never
- * locked does exactly that: they go to the standby list, still cached for
- * a CPU fallback and for the next run, but no longer the working set the
- * memory manager has to trim when the board is short.
+ * it is read in (wc_warm), and the record handed out before it, which the
+ * packer has finished with, is taken out of the working set. VirtualUnlock
+ * on pages that were never locked does exactly that: they go to the
+ * standby list, still cached for a CPU fallback and for the next run, but
+ * no longer the working set the memory manager has to trim when the board
+ * is short.
  */
 static const void *wc_prev;
 static uint64_t wc_prev_n;
@@ -436,7 +531,15 @@ static void wc_record_in(const void *p, uint64_t n)
 #ifdef _WIN32
 	if (wc_prev)
 		(void)VirtualUnlock((LPVOID)(uintptr_t)wc_prev, (SIZE_T)wc_prev_n);
-	wc_prefetch(p, n);
+	if (p) {
+		wc_warm(p, n);
+		if (++wc_in.served == wc_nix && !wc_in.said++)
+			fprintf(stderr, "charsiu: weight cache read in: %.0f MB from "
+				"disk in %.0f ms (%.0f MB/s), %u of %u records "
+				"already in memory\n", wc_in.bytes / 1e6, wc_in.ms,
+				wc_in.ms > 0 ? wc_in.bytes / 1e3 / wc_in.ms : 0.0,
+				wc_in.resident, wc_in.served);
+	}
 #endif
 	wc_prev = p;
 	wc_prev_n = n;
@@ -470,37 +573,7 @@ static const uint8_t *wc_map_file(FILE *f, const char *path, uint64_t *size)
 		CloseHandle(m);         /* the view holds the section */
 		if (!base)
 			return NULL;
-		/*
-		 * THE WHOLE FILE AHEAD ONLY WHEN IT FITS. Large reads queued now
-		 * beat a fault's small read when the packer first touches a page
-		 * -- but on a board short of memory (the TaishanPi's first run
-		 * after a server exited, 128 MB free, 2026-11-28) 620 MB read
-		 * ahead is repurposed before it is used and every page is read
-		 * again, a fault at a time: 35.8 s of "adding". So the whole file
-		 * is hinted only with twice its size available, and each record
-		 * is hinted again just before it is used (wc_record_in).
-		 */
-		/*
-		 * AND WAITED FOR, NOT OVERLAPPED. PrefetchVirtualMemory waits for
-		 * its reads. Run on a thread of its own so that packing could go
-		 * on beside it, the first start after a reboot took 18.5 s, 16.4 s
-		 * of it in the driver's CREATE_BO (21.7 ms a buffer on device 0,
-		 * against 0.2 ms warm) while 620 MB of page-ins competed with the
-		 * buffer allocations for free pages (TaishanPi, 2026-11-28). Done
-		 * first and waited for, the same cold file took 11.3 s, CREATE_BO
-		 * 0.3 s. The "reading" line says how long it took.
-		 */
-		{
-			MEMORYSTATUSEX ms;
-
-			ms.dwLength = sizeof(ms);
-			if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys > 2 * sz) {
-				double t0 = wc_now_ms();
-
-				wc_prefetch(base, sz);
-				wc_ra_ms = wc_now_ms() - t0;
-			}
-		}
+		wc_open_seq(path);
 	}
 #else
 	{
@@ -680,15 +753,10 @@ static void wcache_setup(unsigned bits, uint64_t grp)
 			wc.map = wc_map_file(wc.f, path, &wc.map_size);
 			clock_gettime(CLOCK_MONOTONIC, &c);
 			fprintf(stderr, "charsiu: weight cache %s, reading "
-				"(%u tensors in it%s; index %.0f ms, map and read "
-				"ahead %.0f ms%s)\n",
+				"(%u tensors in it%s; index %.0f ms, map %.0f ms)\n",
 				path, wc_nix, wc.map ? ", mapped" : "",
 				(b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6,
-				(c.tv_sec - b.tv_sec) * 1e3 + (c.tv_nsec - b.tv_nsec) / 1e6,
-#ifdef _WIN32
-				wc.map && wc_ra_ms < 0 ? ", no read ahead: short of memory" :
-#endif
-				"");
+				(c.tv_sec - b.tv_sec) * 1e3 + (c.tv_nsec - b.tv_nsec) / 1e6);
 			return;
 		}
 		fclose(wc.f);
@@ -780,7 +848,7 @@ static int wcache_read(struct npu_tensor *t, const char *name)
 			<= wc.map_size) {
 		const uint8_t *p = wc.map + r->off;
 
-		wc_record_in(p, qb);
+		wc_record_in(p, wc_payload(r->n, r->k, r->ngrp, t->packed));
 		free(t->q);
 		t->q = (int8_t *)(uintptr_t)p;
 		t->q_mapped = 1;
